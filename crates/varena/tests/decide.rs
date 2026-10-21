@@ -99,7 +99,7 @@ fn apply(t: &mut Table, actions: &[Action], run: &mut Run, tried: &mut Tried, cl
                 r.room = *room;
                 r.measured = *measured;
             }
-            Action::Shrink { .. } | Action::Cut { .. } | Action::Relax { .. } | Action::Propose { .. } | Action::Park(_) => {}
+            Action::Shrink { .. } | Action::Cut { .. } | Action::CutOutside { .. } | Action::Relax { .. } | Action::Propose { .. } | Action::Park(_) => {}
         }
     }
     remote
@@ -365,7 +365,7 @@ fn any_oom_sequence_ends_within_pages_plus_cuts_plus_two() {
     loop {
         answers += 1;
         assert!(answers <= pages + cut_levels + 2, "{answers} answers");
-        let site = (cuts < cut_levels).then(|| OomSite { name: "ffn".into(), collective: false, finest: cut_levels });
+        let site = (cuts < cut_levels).then(|| OomSite { name: "ffn".into(), collective: false, finest: cut_levels, shape: "1x8".into() });
         let a = demand(&mut t, Trigger::Oom { req: 1, set: Some(0), need: Some(64 * MB), site, tried: Tried::default() }, &mut run, &mut clock);
         match a.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::Park(_) | Action::Exhausted { .. })) {
             Some(Action::Cut { .. }) => cuts += 1,
@@ -380,15 +380,15 @@ fn any_oom_sequence_ends_within_pages_plus_cuts_plus_two() {
 
 #[test]
 fn admission_counts_each_byte_once() {
-    let row = |remaining, running, unmeasured| Admitted { context: GB, outside: 0, remaining, running, unmeasured };
-    assert!(fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(12 * GB)));
-    assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(13 * GB + 1)));
-    assert!(!fits(24 * GB, 2 * GB, &[row(10 * GB, 1, 0)], &[], Some(12 * GB)), "foreign bytes are taken off");
-    assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[Some(4 * GB)], Some(12 * GB)), "a dispatched request counts");
+    let row = |remaining, running, unmeasured| Admitted { context: GB, outside: 0, remaining, running, unmeasured, yielded: 0, family: 0 };
+    assert!(fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(12 * GB), None));
+    assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(13 * GB + 1), None));
+    assert!(!fits(24 * GB, 2 * GB, &[row(10 * GB, 1, 0)], &[], Some(12 * GB), None), "foreign bytes are taken off");
+    assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[Some(4 * GB)], Some(12 * GB), None), "a dispatched request counts");
     // Unmeasured: only on an idle GPU.
-    assert!(!fits(24 * GB, 0, &[row(GB, 1, 0)], &[], None));
-    assert!(fits(24 * GB, 0, &[row(0, 0, 0)], &[], None));
-    assert!(!fits(24 * GB, 0, &[row(GB, 1, 1)], &[], Some(GB)));
+    assert!(!fits(24 * GB, 0, &[row(GB, 1, 0)], &[], None, None));
+    assert!(fits(24 * GB, 0, &[row(0, 0, 0)], &[], None, None));
+    assert!(!fits(24 * GB, 0, &[row(GB, 1, 1)], &[], Some(GB), None));
 }
 
 // ---- regressions from review 1
@@ -414,7 +414,7 @@ fn an_oom_counts_its_own_unmaps_after_an_ask() {
 #[test]
 fn an_idle_gpu_admits_a_model_larger_than_the_card() {
     let idle = Admitted { context: GB, ..Admitted::default() };
-    assert!(fits(8 * GB, 0, &[idle], &[], Some(20 * GB)));
+    assert!(fits(8 * GB, 0, &[idle], &[], Some(20 * GB), None));
     let (mut t, rooms) = h3(8 * GB);
     play(&mut t, &rooms, false);
     let r = &t.requests[0];
@@ -459,7 +459,7 @@ fn collective_sites_change_only_by_agreement() {
     let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(4 * MB), unmeasured: 0, tried: Tried::default() });
     assert!(!a.iter().any(|a| matches!(a, Action::Cut { .. })), "{a:?}");
     assert!(a.contains(&Action::Lower(1)));
-    let a = decide(&t, &Trigger::Oom { req: 1, set: Some(0), need: Some(MB), site: Some(OomSite { name: "ffn".into(), collective: true, finest: 4 }), tried: Tried::default() });
+    let a = decide(&t, &Trigger::Oom { req: 1, set: Some(0), need: Some(MB), site: Some(OomSite { name: "ffn".into(), collective: true, finest: 4, shape: "1x8".into() }), tried: Tried::default() });
     assert!(a.iter().any(|a| matches!(a, Action::Propose { req: 1, set: 0, site, level: 1, failed_at: Some(_) } if site == "ffn")), "{a:?}");
     assert!(!a.iter().any(|a| matches!(a, Action::Cut { .. })), "{a:?}");
 }

@@ -21,6 +21,25 @@ unsafe impl Sync for Map {}
 /// A message on a service stream: JSON bytes and, maybe, one handle.
 pub(crate) type Message = (Vec<u8>, Option<Owned>);
 
+static NAMESPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Tests only: a process-wide prefix for every table and service name (custody, the tier, the
+/// wake, the asks), so a test's never meet a machine's. Set once, before any open; false when
+/// another prefix was set first.
+pub fn namespace(prefix: &str) -> bool {
+    NAMESPACE.get_or_init(|| prefix.to_string()) == prefix
+}
+
+/// `name` within this process's namespace.
+fn named(name: &str) -> String {
+    format!("{}{name}", NAMESPACE.get().map_or("", String::as_str))
+}
+
+/// Tests only: removes the table of `gpu` (a test's own, in its namespace).
+pub fn remove_table(gpu: &str) {
+    unlink(gpu);
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use std::io::{Read, Write};
@@ -43,7 +62,7 @@ mod imp {
     pub(crate) fn shared(name: &str, create: bool) -> Result<Owned> {
         // SAFETY: geteuid reads a process attribute.
         let uid = unsafe { libc::geteuid() };
-        let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+        let clean: String = super::named(name).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
         let path = format!("/dev/shm/cozy-varena-{uid}-{clean}");
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(create);
@@ -189,6 +208,12 @@ mod imp {
         match std::os::unix::net::UnixDatagram::bind_addr(&address(ns, &format!("wake-{name}"))?) {
             Ok(s) => {
                 s.set_nonblocking(true).map_err(|e| Error::io("wake", e))?;
+                // Each datagram carries its sender's credentials: only accepted users wake it.
+                let one: libc::c_int = 1;
+                // SAFETY: an int option on a socket we hold.
+                if unsafe { libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PASSCRED, (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t) } != 0 {
+                    return Err(Error::io("wake credentials", std::io::Error::last_os_error()));
+                }
                 Ok(Some(s.into()))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
@@ -211,11 +236,48 @@ mod imp {
         let _ = s.send_to_addr(&[1], &addr);
     }
 
-    /// Clears every wake received so far.
-    pub(crate) fn wake_clear(endpoint: &Owned) {
-        let mut buf = [0u8; 64];
-        // SAFETY: nonblocking reads into our buffer until the queue is empty.
-        while unsafe { libc::recv(endpoint.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) } > 0 {}
+    /// Clears every wake received so far; true when one came from an accepted user.
+    pub(crate) fn wake_clear(endpoint: &Owned) -> bool {
+        let mut any = false;
+        loop {
+            let mut buf = [0u8; 8];
+            let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+            // SAFETY: CMSG_SPACE is a size computation.
+            let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::ucred>() as u32) } as usize;
+            let mut control = vec![0u8; space];
+            // SAFETY: a zeroed header we fill below.
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = space;
+            // SAFETY: a nonblocking receive into buffers that outlive the call.
+            if unsafe { libc::recvmsg(endpoint.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) } < 0 {
+                return any;
+            }
+            // SAFETY: the kernel filled the control buffer; the header walks only within it.
+            let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+            // SAFETY: a credentials message of the size the kernel wrote.
+            let uid = (!cmsg.is_null() && unsafe { (*cmsg).cmsg_type } == libc::SCM_CREDENTIALS).then(|| unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::ucred).uid });
+            any |= uid.is_some_and(|u| u == euid() || ACCEPTED.lock().contains(&u));
+        }
+    }
+
+    /// Blocks until an accepted user wakes the endpoint, clearing every wake so far.
+    pub(crate) fn wake_await(endpoint: &Owned) -> Result<()> {
+        loop {
+            let mut poll = libc::pollfd { fd: endpoint.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: one live descriptor.
+            if unsafe { libc::poll(&mut poll, 1, -1) } < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(Error::io("poll", e));
+                }
+            }
+            if wake_clear(endpoint) {
+                return Ok(());
+            }
+        }
     }
 
     /// Blocks until `event` is readable, then clears it.
@@ -239,7 +301,7 @@ mod imp {
     /// A service's name in the namespace of user `ns` (the table owner's: a granted executor
     /// finds its TensorD's services there).
     fn address(ns: u32, name: &str) -> Result<SocketAddr> {
-        SocketAddr::from_abstract_name(format!("cozy-varena-{ns}-{name}")).map_err(|e| Error::io("socket name", e))
+        SocketAddr::from_abstract_name(format!("cozy-varena-{ns}-{}", super::named(name))).map_err(|e| Error::io("socket name", e))
     }
 
     /// Binds the service name: `None` while another process holds it. The bound name is the
@@ -390,6 +452,11 @@ mod imp {
     }
 
 
+    /// Ends both directions of a stream (its peer reads its end).
+    pub(crate) fn close(stream: &Stream) {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
     pub(crate) fn dup(h: &Owned) -> Result<Owned> {
         h.try_clone().map_err(|e| Error::io("dup", e))
     }
@@ -420,7 +487,7 @@ mod imp {
     pub(crate) fn unlink(name: &str) {
         // SAFETY: geteuid reads a process attribute.
         let uid = unsafe { libc::geteuid() };
-        let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+        let clean: String = super::named(name).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
         let _ = std::fs::remove_file(format!("/dev/shm/cozy-varena-{uid}-{clean}"));
     }
 }
@@ -503,7 +570,12 @@ mod imp {
         Err(later())
     }
     pub(crate) fn wake(_: &Owned, _: u32, _: &str) {}
-    pub(crate) fn wake_clear(_: &Owned) {}
+    pub(crate) fn wake_clear(_: &Owned) -> bool {
+        false
+    }
+    pub(crate) fn wake_await(_: &Owned) -> Result<()> {
+        Err(later())
+    }
     pub(crate) fn await_event(_: &Owned) -> Result<()> {
         Err(later())
     }
@@ -526,6 +598,9 @@ mod imp {
         match *s {}
     }
     pub(crate) fn recv(s: &Stream) -> Result<Option<Message>> {
+        match *s {}
+    }
+    pub(crate) fn close(s: &Stream) {
         match *s {}
     }
     pub(crate) fn dup(_: &Owned) -> Result<Owned> {

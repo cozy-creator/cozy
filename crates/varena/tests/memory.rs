@@ -13,12 +13,32 @@ use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Nex
 
 const MB: u64 = 1 << 20;
 
-fn open(case: &str, memory: u64) -> (varena::Ledger, Memory, GpuId) {
+fn open(case: &str, memory: u64) -> (Scope, varena::Ledger, Memory, GpuId) {
     let g = GpuId { uuid: format!("m{}-{case}", std::process::id()), model: "host".into(), memory };
+    let _scope = Scope::new(&g.uuid);
+    let scope = Scope::new(&g.uuid);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(memory))).unwrap();
-    (ledger, mem, g)
+    (scope, ledger, mem, g)
 }
+
+/// This binary's namespace for tables and service names (never a machine's), and the test's
+/// table removed when it ends.
+struct Scope(String);
+
+impl Scope {
+    fn new(uuid: &str) -> Scope {
+        assert!(varena::os::namespace(&format!("test{}-", std::process::id())));
+        Scope(uuid.to_string())
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        varena::os::remove_table(&self.0);
+    }
+}
+
 
 fn set(dir: &Path, name: &str, regions: u64, uuid: &str) -> SetSpec {
     let path = dir.join(format!("{name}.bin"));
@@ -62,7 +82,7 @@ fn room(mem: &Memory, id: varena::SetId, name: &str, shape: &str, pages: u64, me
 #[test]
 fn a_new_shape_is_bounded_by_a_measured_one() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("shape", 64 * MB);
+    let (_scope, _l, mem, g) = open("shape", 64 * MB);
     let id = mem.load(set(dir.path(), "s", 1, &g.uuid), Level::Ram).unwrap();
     let pages = REGION_ALIGN;
     // Unmeasured: no room but the largest context growth (none yet).
@@ -75,30 +95,30 @@ fn a_new_shape_is_bounded_by_a_measured_one() {
 #[test]
 fn an_oom_at_a_cut_site_cuts_and_a_collective_one_waits_for_the_next_pass() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("cut", 4 * MB);
+    let (_scope, _l, mem, g) = open("cut", 4 * MB);
     let id = mem.load(set(dir.path(), "c", 2, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", plan("c")).unwrap();
     let pass = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
     let pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
-    let site = Some(Site { name: "ffn", collective: false, finest: 4 });
+    let site = Some(Site { name: "ffn", collective: false, finest: 4, shape: "1x8" });
     // The free bytes went to the pages; every page is pinned: the op cuts, level by level.
     assert!(!pass.measured() && !r.measured(), "no room measured at this shape yet");
     assert!(matches!(r.oom(Some(id), Some(MB), site, Torch::default()), Next::Cut(1)));
-    assert_eq!(r.cut(Some(id), "ffn"), 1);
+    assert_eq!(r.cut(Some(id), "ffn", "1x8"), 1);
     assert!(matches!(r.oom(Some(id), Some(MB), site, Torch::default()), Next::Cut(2)));
     // Review 1, finding 4: a collective site never cuts mid-pass. It recovers locally, its
     // finer level is proposed, and it takes effect when the ranks agree at the next pass.
-    let collective = Some(Site { name: "allgather", collective: true, finest: 4 });
+    let collective = Some(Site { name: "allgather", collective: true, finest: 4, shape: "1x8" });
     let next = r.oom(Some(id), Some(MB), collective, Torch::default());
     assert!(matches!(next, Next::Park(_) | Next::Exhausted(_)), "{next:?}");
-    assert_eq!(r.cut(Some(id), "allgather"), 0, "unchanged within the pass");
+    assert_eq!(r.cut(Some(id), "allgather", "1x8"), 0, "unchanged within the pass");
     drop(pins);
     drop(pass);
     let next = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
     assert_eq!(next.levels(), vec![("allgather".to_string(), 1)], "proposed for the agreement");
-    assert_eq!(r.cut(Some(id), "allgather"), 0);
+    assert_eq!(r.cut(Some(id), "allgather", "1x8"), 0);
     next.agree(vec![("allgather".into(), 2)]);
-    assert_eq!(r.cut(Some(id), "allgather"), 2, "the ranks' maximum");
+    assert_eq!(r.cut(Some(id), "allgather", "1x8"), 2, "the ranks' maximum");
 }
 
 /// Review 1, finding 11: dropping an earlier pass after the next one started keeps the next
@@ -106,7 +126,7 @@ fn an_oom_at_a_cut_site_cuts_and_a_collective_one_waits_for_the_next_pass() {
 #[test]
 fn a_late_dropped_pass_leaves_the_next_one() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("late", 16 * MB);
+    let (_scope, _l, mem, g) = open("late", 16 * MB);
     let id = mem.load(set(dir.path(), "l", 2, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/l".into()], passes: 2 }] }).unwrap();
     let first = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
@@ -123,6 +143,7 @@ fn a_late_dropped_pass_leaves_the_next_one() {
 fn a_dropped_custody_holder_leaves_no_zombie_row() {
     let dir = tempfile::tempdir().unwrap();
     let g = GpuId { uuid: format!("m{}-zombie", std::process::id()), model: "host".into(), memory: 16 * MB };
+    let _scope = Scope::new(&g.uuid);
     let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
     mem.load(set(dir.path(), "z", 2, &g.uuid), Level::Gpu).unwrap();
     let ledger = varena::Ledger::create(&g, None).unwrap();
@@ -136,7 +157,7 @@ fn a_dropped_custody_holder_leaves_no_zombie_row() {
 #[test]
 fn orphans_show_as_class_o() {
     let dir = tempfile::tempdir().unwrap();
-    let (ledger, mem, g) = open("orphans", 16 * MB);
+    let (_scope, ledger, mem, g) = open("orphans", 16 * MB);
     mem.load(set(dir.path(), "o", 2, &g.uuid), Level::Gpu).unwrap();
     drop(mem);
     // The custody service sees the connection end on its own thread; it rings the ledger.
@@ -148,13 +169,13 @@ fn orphans_show_as_class_o() {
 /// S5: `fits(package, "")` means the package's widest measured shape.
 #[test]
 fn an_empty_shape_fits_by_the_widest_measured() {
-    let (ledger, mem, _g) = open("widest", 16 * MB);
+    let (_scope, ledger, mem, _g) = open("widest", 16 * MB);
     ledger.restore(&[varena::Peak::Request { key: "pkg|1x1".into(), bytes: 2 * MB }, varena::Peak::Request { key: "pkg|4x4".into(), bytes: 17 * MB }]).unwrap();
     let busy = mem.request("busy", Plan::default()).unwrap();
-    assert!(ledger.fits("pkg", "1x1"));
-    assert!(!ledger.fits("pkg", ""), "the widest (17 MB) beside a running request does not fit");
+    assert!(ledger.fits("pkg", "1x1", None));
+    assert!(!ledger.fits("pkg", "", None), "the widest (17 MB) beside a running request does not fit");
     drop(busy);
-    assert!(ledger.fits("pkg", ""), "an idle GPU fits anything");
+    assert!(ledger.fits("pkg", "", None), "an idle GPU fits anything");
 }
 
 /// Round 2, finding 4: in a joint step an OOM names its set, and cuts only that set's site,
@@ -162,17 +183,17 @@ fn an_empty_shape_fits_by_the_widest_measured() {
 #[test]
 fn a_joint_steps_oom_cuts_only_its_own_sets_site() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("joint", 4 * MB);
+    let (_scope, _l, mem, g) = open("joint", 4 * MB);
     let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
     let b = mem.load(set(dir.path(), "b", 1, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/a".into(), "pkg@1/b".into()], passes: 1 }] }).unwrap();
     let pa = r.pass(a, "fwd", "1x8", Torch::default()).unwrap();
     let pb = r.pass(b, "fwd", "1x8", Torch::default()).unwrap();
     let pins = [mem.bind(a, 0, 0).unwrap(), mem.bind(b, 0, 0).unwrap()];
-    let site = Some(Site { name: "ffn", collective: false, finest: 4 });
+    let site = Some(Site { name: "ffn", collective: false, finest: 4, shape: "1x8" });
     assert!(matches!(r.oom(Some(a), Some(MB), site, Torch::default()), Next::Cut(1)));
-    assert_eq!(r.cut(Some(a), "ffn"), 1, "a's pass cut");
-    assert_eq!(r.cut(Some(b), "ffn"), 0, "b's pass, started last, untouched");
+    assert_eq!(r.cut(Some(a), "ffn", "1x8"), 1, "a's pass cut");
+    assert_eq!(r.cut(Some(b), "ffn", "1x8"), 0, "b's pass, started last, untouched");
     drop(pins);
     drop((pa, pb));
 }
@@ -184,7 +205,7 @@ fn a_joint_steps_oom_cuts_only_its_own_sets_site() {
 #[test]
 fn rooms_count_what_earlier_steps_left_allocated() {
     let dir = tempfile::tempdir().unwrap();
-    let (ledger, mem, g) = open("units", 16 * MB);
+    let (_scope, ledger, mem, g) = open("units", 16 * MB);
     let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
     let b = mem.load(set(dir.path(), "b", 2, &g.uuid), Level::Ram).unwrap();
     let page = REGION_ALIGN;
@@ -223,7 +244,7 @@ fn rooms_count_what_earlier_steps_left_allocated() {
 #[test]
 fn collective_levels_relax_by_agreement() {
     let dir = tempfile::tempdir().unwrap();
-    let (ledger, mem, g) = open("relax", 16 * MB);
+    let (_scope, ledger, mem, g) = open("relax", 16 * MB);
     let c = mem.load(set(dir.path(), "c", 1, &g.uuid), Level::Ram).unwrap();
     let x = mem.load(set(dir.path(), "x", 4, &g.uuid), Level::Ram).unwrap();
     let ag = |peak| varena::SitePeak { name: "ag".into(), peak, collective: true, finest: 4 };
@@ -236,7 +257,7 @@ fn collective_levels_relax_by_agreement() {
     assert_eq!(p.levels(), vec![("ag".to_string(), 0)], "known collective from its measured room");
     // An OOM at it while the card is tight: the finer level is proposed, for the next pass.
     let pins: Vec<_> = (0..4).map(|b| mem.bind(x, b, 0).unwrap()).collect();
-    r.oom(Some(c), Some(MB), Some(Site { name: "ag", collective: true, finest: 4 }), Torch::default());
+    r.oom(Some(c), Some(MB), Some(Site { name: "ag", collective: true, finest: 4, shape: "1x8" }), Torch::default());
     p.end(measured(4 * MB, ag(2 * MB)), Torch::default());
     drop(pins);
     mem.unload(x);
@@ -247,20 +268,20 @@ fn collective_levels_relax_by_agreement() {
     let p = r.pass(c, "fwd", "1x8", Torch::default()).unwrap();
     assert_eq!(p.levels(), vec![("ag".to_string(), 1)]);
     p.agree(vec![("ag".into(), 1)]);
-    assert_eq!(r.cut(Some(c), "ag"), 1);
+    assert_eq!(r.cut(Some(c), "ag", "1x8"), 1);
     p.end(measured(3 * MB, ag(MB)), Torch::default());
     // With room to spare this rank proposes the coarser level; another rank still needs the
     // finer one: the maximum stays.
     let p = r.pass(c, "fwd", "1x8", Torch::default()).unwrap();
     assert_eq!(p.levels(), vec![("ag".to_string(), 0)], "relaxed, proposed");
     p.agree(vec![("ag".into(), 1)]);
-    assert_eq!(r.cut(Some(c), "ag"), 1, "the ranks' maximum");
+    assert_eq!(r.cut(Some(c), "ag", "1x8"), 1, "the ranks' maximum");
     p.end(measured(3 * MB, ag(MB)), Torch::default());
     // Every rank proposes it: relaxed.
     let p = r.pass(c, "fwd", "1x8", Torch::default()).unwrap();
     assert_eq!(p.levels(), vec![("ag".to_string(), 0)]);
     p.agree(vec![("ag".into(), 0)]);
-    assert_eq!(r.cut(Some(c), "ag"), 0, "a transient OOM does not cut forever");
+    assert_eq!(r.cut(Some(c), "ag", "1x8"), 0, "a transient OOM does not cut forever");
 }
 
 /// S5 review, 1: a restarted TensorD drops the dispatches it finds (a dead TensorD's), so the
@@ -268,6 +289,7 @@ fn collective_levels_relax_by_agreement() {
 #[test]
 fn a_restarted_tensord_drops_stale_dispatches() {
     let g = GpuId { uuid: format!("m{}-dispatch", std::process::id()), model: "host".into(), memory: 16 * MB };
+    let _scope = Scope::new(&g.uuid);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     ledger.dispatch("r1", "pkg", "1x1").unwrap();
     assert_eq!(ledger.status().dispatched.len(), 1);
@@ -281,7 +303,7 @@ fn a_restarted_tensord_drops_stale_dispatches() {
 #[test]
 fn rooms_interpolate_within_their_entry() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("entry", 64 * MB);
+    let (_scope, _l, mem, g) = open("entry", 64 * MB);
     let id = mem.load(set(dir.path(), "e", 1, &g.uuid), Level::Ram).unwrap();
     let room = |entry: &str, shape: &str, measured: Option<u64>| {
         let r = mem.request(&format!("{entry}-{shape}"), plan("e")).unwrap();
@@ -303,16 +325,16 @@ fn rooms_interpolate_within_their_entry() {
 #[test]
 fn a_site_at_its_finest_takes_the_next_rung() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("finest", 4 * MB);
+    let (_scope, _l, mem, g) = open("finest", 4 * MB);
     let id = mem.load(set(dir.path(), "f", 2, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", plan("f")).unwrap();
     let _pass = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
     let _pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
-    let site = Some(Site { name: "ffn", collective: false, finest: 1 });
+    let site = Some(Site { name: "ffn", collective: false, finest: 1, shape: "1x8" });
     assert!(matches!(r.oom(Some(id), Some(MB), site, Torch::default()), Next::Cut(1)));
     let next = r.oom(Some(id), Some(MB), site, Torch::default());
     assert!(matches!(next, Next::Park(_) | Next::Exhausted(_)), "{next:?}");
-    assert_eq!(r.cut(Some(id), "ffn"), 1);
+    assert_eq!(r.cut(Some(id), "ffn", "1x8"), 1);
 }
 
 /// S8: an OOM in the package's own code between passes is answered from the demand order (a
@@ -320,7 +342,7 @@ fn a_site_at_its_finest_takes_the_next_rung() {
 #[test]
 fn an_oom_between_passes_evicts_cold_pages() {
     let dir = tempfile::tempdir().unwrap();
-    let (ledger, mem, g) = open("between", 8 * MB);
+    let (_scope, ledger, mem, g) = open("between", 8 * MB);
     let a = mem.load(set(dir.path(), "a", 2, &g.uuid), Level::Ram).unwrap();
     mem.load(set(dir.path(), "n", 1, &g.uuid), Level::Gpu).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/a".into()], passes: 2 }] }).unwrap();
@@ -333,7 +355,7 @@ fn an_oom_between_passes_evicts_cold_pages() {
     assert_eq!(ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum::<u64>(), 0, "n went");
     let pass = r.pass(a, "fwd", "1x8", Torch::default()).unwrap();
     assert!(!mem.bind(a, 1, 0).unwrap().fresh);
-    assert_eq!(r.cut(Some(a), "ffn"), 0, "nothing was cut");
+    assert_eq!(r.cut(Some(a), "ffn", "1x8"), 0, "nothing was cut");
     pass.end(Measured::default(), Torch::default());
     assert!(!r.stats().lowered, "nothing was lowered");
 }
@@ -344,17 +366,23 @@ fn an_oom_between_passes_evicts_cold_pages() {
 #[test]
 fn a_site_outside_any_pass_has_the_requests_memo() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("outside", 4 * MB);
+    let (_scope, _l, mem, g) = open("outside", 4 * MB);
     let id = mem.load(set(dir.path(), "o", 2, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", plan("o")).unwrap();
     let _pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
-    let split = Some(Site { name: "split", collective: false, finest: 2 });
+    let split = Some(Site { name: "split", collective: false, finest: 2, shape: "1x8" });
     assert!(matches!(r.oom(None, Some(MB), split, Torch::default()), Next::Cut(1)));
-    assert_eq!(r.cut(None, "split"), 1);
+    assert_eq!(r.cut(None, "split", "1x8"), 1);
     assert!(matches!(r.oom(None, Some(MB), split, Torch::default()), Next::Cut(2)));
     let next = r.oom(None, Some(MB), split, Torch::default());
     assert!(matches!(next, Next::Park(_) | Next::Exhausted(_)), "at its finest the next rung: {next:?}");
-    assert_eq!(r.cut(None, "split"), 2);
+    assert_eq!(r.cut(None, "split", "1x8"), 2);
+    // Review 4, NEW-4: the memo is per (site, shape): the same op at another shape is whole.
+    assert_eq!(r.cut(None, "split", "1x16"), 0);
+    let wide = Some(Site { name: "split", collective: false, finest: 2, shape: "1x16" });
+    r.parked(1);
+    assert!(matches!(r.oom(None, Some(MB), wide, Torch::default()), Next::Cut(1)));
+    assert_eq!((r.cut(None, "split", "1x16"), r.cut(None, "split", "1x8")), (1, 2));
 }
 
 /// Review 3, N7: a room is the latest completed measurement (it comes down when a pass needs
@@ -363,7 +391,7 @@ fn a_site_outside_any_pass_has_the_requests_memo() {
 #[test]
 fn the_latest_measured_room_wins() {
     let dir = tempfile::tempdir().unwrap();
-    let (ledger, mem, g) = open("latest", 64 * MB);
+    let (_scope, ledger, mem, g) = open("latest", 64 * MB);
     let id = mem.load(set(dir.path(), "l", 1, &g.uuid), Level::Ram).unwrap();
     let pages = REGION_ALIGN;
     room(&mem, id, "l", "1x8", pages, Some(8 * MB));
@@ -386,3 +414,40 @@ fn the_latest_measured_room_wins() {
     assert_eq!(room(&mem, id, "l", "1x8", pages, None), 6 * MB, "this run's measurement is newer");
 }
 
+
+/// The vertical slice: a cold request's record carries the fills of the loads before it, by
+/// source, so its cold cost shows; a warm one after it carries none.
+#[test]
+fn a_cold_requests_record_carries_its_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("loadstats", 16 * MB);
+    let id = mem.load(set(dir.path(), "ls", 2, &g.uuid), Level::Gpu).unwrap();
+    let cold = mem.request("cold", plan("ls")).unwrap();
+    let s = cold.stats();
+    assert_eq!(s.moved.store.bytes, 2 * REGION_ALIGN, "the load's fills, from the store");
+    assert_eq!(s.trace.iter().filter(|r| r.origin == varena::Origin::Store).count(), 2, "{:?}", s.trace);
+    let pass = cold.pass(id, "fwd", "1x8", Torch::default()).unwrap();
+    drop(mem.bind(id, 0, 0).unwrap());
+    drop(pass);
+    let s = cold.end();
+    assert_eq!(s.moved.store.bytes, 2 * REGION_ALIGN);
+    assert_eq!(s.trace.len(), 3, "two load fills and one bind: {:?}", s.trace);
+    let warm = mem.request("warm", plan("ls")).unwrap();
+    assert_eq!(warm.stats().moved.store.bytes, 0, "nothing filled since");
+}
+
+/// The vertical slice: lifting a limit raises the capacity. TensorD sets it exactly at create;
+/// a standalone opener only lowers it.
+#[test]
+fn tensord_sets_the_capacity_a_standalone_opener_lowers_it() {
+    let g = GpuId { uuid: format!("m{}-limit", std::process::id()), model: "host".into(), memory: 64 * MB };
+    let _scope = Scope::new(&g.uuid);
+    let capacity = |l: &varena::Ledger| l.status().capacity;
+    let ledger = varena::Ledger::create(&g, Some(12 * MB)).unwrap();
+    assert_eq!(capacity(&ledger), 12 * MB);
+    drop(ledger);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    assert_eq!(capacity(&ledger), 64 * MB, "the limit lifted: the card's");
+    drop(varena::Grant::open(&g, Some(8 * MB)).unwrap());
+    assert_eq!(capacity(&ledger), 8 * MB, "a standalone cap lowers it");
+}

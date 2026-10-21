@@ -248,11 +248,14 @@ pub struct Req {
     pub rooms: Vec<Option<u64>>,
     /// The cut sites of each set's current pass (a joint step runs several).
     pub sites: BTreeMap<u32, Vec<CutSite>>,
-    /// Cut levels of op sites outside any pass (the package's own code): the request's memo.
-    pub outside: BTreeMap<String, u32>,
+    /// Cut levels of op sites outside any pass (the package's own code) by (site, op shape):
+    /// the request's memo.
+    pub outside: BTreeMap<(String, String), u32>,
     /// Waiting on a child call: the room it gave back, retaken when the wait ends. Meanwhile
     /// its current step's pages are a later use (D) and it has no remaining W.
     pub yielded: Option<u64>,
+    /// The family it waits for while yielded (`crate::ledger` publishes it; 0: none).
+    pub family: u64,
     pub episode: Episode,
 }
 
@@ -337,6 +340,9 @@ pub struct Table {
     /// Bytes of kept pages this process unmapped whose Withdraw custody has not had yet: its
     /// handle still holds them (pinned, P).
     pub pending: u64,
+    /// Bytes of pages being unmapped by the mechanism thread: still this process's on the
+    /// device (P to others), already spent on the creates queued after them (not to itself).
+    pub inflight: u64,
     /// Torch's allocator, as last measured (pass start and end, every OOM).
     pub allocated: u64,
     pub reserved: u64,
@@ -403,7 +409,7 @@ impl Table {
     pub fn classes(&self) -> [u64; 7] {
         let mut out = [0u64; 7];
         if let Some(p) = out.get_mut(Class::P.index()) {
-            *p = self.pending;
+            *p = self.pending + self.inflight;
         }
         for (key, page) in self.pages() {
             if let Some(slot) = self.class(key).and_then(|c| out.get_mut(c.index())) {
@@ -491,6 +497,14 @@ impl Table {
                 room.map(|room| self.held_pages(req, sets) + room)
             })
             .try_fold(0, |m, w| w.map(|w| m.max(w)))
+    }
+
+    /// A yielded request's remaining W as it will be when its wait ends (0 when not yielded):
+    /// admission counts it for everyone but its family's child.
+    pub fn yielded_w(&self, req: &Req) -> u64 {
+        let Some(room) = req.yielded else { return 0 };
+        let back = Req { room, yielded: None, ..req.clone() };
+        self.remaining(&back).unwrap_or_else(|| self.w(&back))
     }
 
     /// Pinned bytes outside every open request's current step (counted apart by `fits`).

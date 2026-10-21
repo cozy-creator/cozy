@@ -17,6 +17,9 @@ use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Leve
 
 const MB: u64 = 1 << 20;
 
+/// The tables the running case made: removed when it ends, passed or failed.
+static TABLES: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -32,7 +35,7 @@ fn main() {
     }
     let filter: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
     type Case = (&'static str, fn(&Path));
-    let cases: [Case; 20] = [
+    let cases: [Case; 23] = [
         ("an_idle_holder_answers_an_ask", an_idle_holder_answers_an_ask),
         ("a_killed_holder_leaves_orphans_a_successor_imports", a_killed_holder_leaves_orphans_a_successor_imports),
         ("a_failed_request_frees_everything", a_failed_request_frees_everything),
@@ -53,6 +56,9 @@ fn main() {
         ("an_oom_counts_its_own_unmaps_after_an_ask", an_oom_counts_its_own_unmaps_after_an_ask),
         ("a_standalone_process_wakes_tensord", a_standalone_process_wakes_tensord),
         ("the_tier_comes_back_after_a_release", the_tier_comes_back_after_a_release),
+        ("a_reload_fills_from_the_tier", a_reload_fills_from_the_tier),
+        ("held_layouts_outlive_a_tier_restart", held_layouts_outlive_a_tier_restart),
+        ("a_yielded_parent_is_its_familys_alone_and_waits_for_its_room", a_yielded_parent_is_its_familys_alone_and_waits_for_its_room),
     ];
     let dir = tempfile::tempdir().unwrap();
     let mut failed = vec![];
@@ -64,7 +70,9 @@ fn main() {
         std::fs::create_dir(&path).unwrap();
         print!("test {name} ... ");
         std::io::stdout().flush().unwrap();
-        match std::panic::catch_unwind(|| case(&path)) {
+        let outcome = std::panic::catch_unwind(|| case(&path));
+        TABLES.lock().drain(..).for_each(|t| varena::os::remove_table(&t));
+        match outcome {
             Ok(()) => println!("ok"),
             Err(_) => {
                 println!("FAILED");
@@ -79,7 +87,9 @@ fn main() {
 }
 
 fn gpu(case: &str, memory: u64) -> GpuId {
-    GpuId { uuid: format!("t{}-{case}", std::process::id()), model: "host".into(), memory }
+    let uuid = format!("t{}-{case}", std::process::id());
+    TABLES.lock().push(uuid.clone());
+    GpuId { uuid, model: "host".into(), memory }
 }
 
 /// A byte of set `seed`'s file at `offset`.
@@ -353,14 +363,14 @@ fn agent() {
                 Next::Park(b) => format!("park {b}"),
                 Next::Exhausted(e) => format!("exhausted {} {}", e.stats.request, e.need),
             },
-            ["yield", req] => {
-                yielded.insert(req.to_string(), requests[*req].yielding());
+            ["yield", req, family] => {
+                yielded.insert(req.to_string(), requests[*req].yielding(family));
                 "ok".into()
             }
-            ["unyield", req] => {
-                yielded.remove(*req);
-                "ok".into()
-            }
+            ["unyield", req] => match yielded.remove(*req).map(varena::Yielded::end) {
+                Some(Err(e)) => format!("err {}", e.code()),
+                _ => "ok".into(),
+            },
             ["parked", req, bytes] => {
                 requests[*req].parked(bytes.parse().unwrap());
                 "ok".into()
@@ -376,6 +386,10 @@ fn agent() {
                 format!("ok leftover={} kept={} tier={} store={} evicted={:?} spec={}", s.leftover, s.moved.kept.bytes, s.moved.tier.bytes, s.moved.store.bytes, s.evicted, s.moved.speculative)
             }
             ["limit"] => format!("ok {}", mem.as_ref().unwrap().torch_limit()),
+            ["settle"] => {
+                mem.as_ref().unwrap().settle();
+                "ok".into()
+            }
             ["fault", point] => {
                 varena::faults::arm(if *point == "decide" { varena::faults::Point::Decide } else { varena::faults::Point::Fill });
                 "ok".into()
@@ -465,6 +479,16 @@ impl Agent {
     }
 }
 
+impl Drop for Agent {
+    /// A case that failed leaves no child holding its rows.
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// A holder with every page of its set mapped and nothing running answers an ask: the
 /// demander's pass and binds get its pages' room.
 fn an_idle_holder_answers_an_ask(dir: &Path) {
@@ -502,6 +526,7 @@ fn a_killed_holder_leaves_orphans_a_successor_imports(dir: &Path) {
     let mut a = Agent::spawn();
     a.ok(&format!("open {} {}", g.uuid, g.memory));
     a.ok(&format!("load k {} stored gpu", path.display()));
+    a.ok("settle");
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     ledger.reap(a.child.id());
@@ -516,7 +541,7 @@ fn a_killed_holder_leaves_orphans_a_successor_imports(dir: &Path) {
     for block in 0..4 {
         assert_eq!(b.ok(&format!("exact k {block}")), "true", "block {block} bit-exact");
     }
-    assert_eq!(b.ok("trace r"), "Hit,Hit,Hit,Hit", "imported at load, not copied");
+    assert_eq!(b.ok("trace r"), "Kept,Kept,Kept,Kept,Hit,Hit,Hit,Hit", "imported at load (its fills in the record), not copied");
     b.ok("unpin");
     let end = b.ok("end r");
     assert!(end.contains("tier=0 store=0"), "{end}");
@@ -679,6 +704,7 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
     a.ok("unpin");
     a.ok(&format!("endpass r {}", MB));
     a.ok("end r");
+    a.ok("settle");
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     ledger.reap(a.child.id());
@@ -690,7 +716,7 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
     for block in 0..3 {
         assert_eq!(b.ok(&format!("exact s {block}")), "true");
     }
-    assert_eq!(b.ok("trace r"), "Hit,Hit,Hit", "every page kept, none copied");
+    assert_eq!(b.ok("trace r"), "Kept,Kept,Kept,Hit,Hit,Hit", "every page kept, none copied");
     b.ok("unpin");
     let end = b.ok("end r");
     assert!(end.contains("tier=0 store=0"), "{end}");
@@ -755,6 +781,7 @@ fn binds_outlive_the_custody_holder(dir: &Path) {
     let mut b = Agent::spawn();
     b.ok(&format!("open {} {}", g.uuid, g.memory));
     b.ok(&format!("load hy {} stored ram", y_path.display()));
+    a.ok("settle");
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     b.ok("request r hy");
@@ -891,7 +918,7 @@ fn a_child_runs_while_its_parent_yields(dir: &Path) {
     let held = |pid: &str| ledger.status().rows.iter().find(|r| r.pid.to_string() == pid).map_or(0, |r| r.classes.iter().sum::<u64>());
     assert_eq!(held(&parent_pid), 4 * MB);
     // The parent calls its child and waits on it.
-    parent.ok("yield r");
+    parent.ok("yield r fam");
     let mut child = Agent::granted(ledger.grant(std::process::id()).unwrap());
     child.ok(&format!("grant {} {}", g.uuid, g.memory));
     child.ok(&format!("load yc {} stored ram", c_path.display()));
@@ -1090,4 +1117,97 @@ fn the_tier_comes_back_after_a_release(dir: &Path) {
     y.ok("unpin");
     y.ok("end r");
     y.exit();
+}
+
+/// The vertical slice's reload: an executor that ended (its kept pages gone with custody, here
+/// none kept for it) leaves its layout in the tier; the next one's load fills from there.
+fn a_reload_fills_from_the_tier(dir: &Path) {
+    let g = gpu("reload", 64 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let tier = varena::Tier::serve(varena::Pressure::Headroom).unwrap().expect("this namespace's tier");
+    let path = write_set(dir, "rl", 2);
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {} {}", g.uuid, g.memory));
+    a.ok(&format!("load rl {} undeclared ram", path.display()));
+    a.exit();
+    let mut b = Agent::spawn();
+    b.ok(&format!("open {} {}", g.uuid, g.memory));
+    b.ok(&format!("load rl {} undeclared gpu", path.display()));
+    b.ok("request r rl");
+    assert_eq!(b.ok("trace r"), "Tier,Tier", "the load filled from the tier, not the store");
+    b.exit();
+    drop(tier);
+}
+
+/// The vertical slice's TensorD restart: the tier's server goes and comes back; the executors
+/// that hold its layouts hand them (their files, ready regions and all) to the new one, so the
+/// next load still fills from the tier.
+fn held_layouts_outlive_a_tier_restart(dir: &Path) {
+    let g = gpu("tierback", 64 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let first = varena::Tier::serve(varena::Pressure::Headroom).unwrap().expect("this namespace's tier");
+    let (p, q) = (write_set(dir, "hp", 2), write_set(dir, "hq", 1));
+    let digest = format!("layout-hp-{}", g.uuid);
+    let mut c = Agent::spawn();
+    c.ok(&format!("open {} {}", g.uuid, g.memory));
+    c.ok(&format!("load hp {} undeclared ram", p.display()));
+    // The tier's server restarts.
+    drop(first);
+    let second = varena::Tier::serve(varena::Pressure::Headroom).unwrap().expect("the tier again");
+    // c's next tier call finds the new tier, and hands it what it holds.
+    c.ok(&format!("load hq {} undeclared ram", q.display()));
+    second.await_uses(|u| u.iter().any(|(d, _)| *d == digest));
+    let mut d = Agent::spawn();
+    d.ok(&format!("open {} {}", g.uuid, g.memory));
+    d.ok(&format!("load hp {} undeclared gpu", p.display()));
+    d.ok("request r hp");
+    assert_eq!(d.ok("trace r"), "Tier,Tier", "filled from the layout c handed over");
+    d.exit();
+    c.exit();
+}
+
+/// Review 4, NEW-3: a yielded parent is no stranger's: admission counts its remaining W for
+/// every request but its own family's child; and its wait's end waits for its room (the
+/// table's changes wake it), never Exhausted while the card can hold it.
+fn a_yielded_parent_is_its_familys_alone_and_waits_for_its_room(dir: &Path) {
+    let g = gpu("family", 8 * MB);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let (p_path, c_path) = (write_set(dir, "fp", 2), write_set(dir, "fc", 4));
+    let mut parent = Agent::granted(ledger.grant(std::process::id()).unwrap());
+    let parent_pid = parent.ok(&format!("grant {} {}", g.uuid, g.memory));
+    parent.ok(&format!("load fp {} stored ram", p_path.display()));
+    parent.ok("request r fp");
+    parent.ok("pass r fp 1x1");
+    parent.ok("bind fp 0");
+    parent.ok("bind fp 1");
+    parent.ok("unpin");
+    parent.ok("yield r fam");
+    ledger.restore(&[varena::Peak::Request { key: "child|1x1".into(), bytes: 6 * MB }]).unwrap();
+    assert!(!ledger.fits("child", "1x1", None), "a stranger counts the parent's W");
+    assert!(ledger.fits("child", "1x1", Some("fam")), "its family's child does not");
+    // The child takes the whole card, pinned.
+    let mut child = Agent::granted(ledger.grant(std::process::id()).unwrap());
+    child.ok(&format!("grant {} {}", g.uuid, g.memory));
+    child.ok(&format!("load fc {} stored ram", c_path.display()));
+    child.ok("request c fc");
+    child.ok("pass c fc 1x1");
+    for block in 0..4 {
+        child.ok(&format!("bind fc {block}"));
+    }
+    assert_eq!(ledger.status().free, 0, "the card is the child's");
+    // The wait ends while the card is the child's: the parent waits for its room.
+    parent.send("unyield r");
+    while !ledger.status().rows.iter().any(|r| r.pid.to_string() == parent_pid && r.waiting) {
+        ledger.await_event().unwrap();
+    }
+    child.ok("unpin");
+    child.ok("end c");
+    child.exit();
+    assert_eq!(parent.reply(), "ok", "its room came back once the child gave the card up");
+    for block in 0..2 {
+        assert_eq!(parent.ok(&format!("exact fp {block}")), "true");
+    }
+    parent.ok("unpin");
+    parent.ok("end r");
+    parent.exit();
 }
