@@ -70,8 +70,10 @@ PUT  B/refs/<org>/<name>.json   If-Match: <etag> | If-None-Match: *
 
 - `If-None-Match: *` creates the document; `If-Match` replaces the version the client read. Without either a server
   answers `428`.
-- On `412` the client reads the document again, applies its change to it and retries. A retry after a lost answer
-  that gets `412` reads it again: when it equals what was sent, the write succeeded.
+- On `412` the client reads the document again, applies its change to it and retries, for as long as another writer
+  made progress: the document it reads differs from the one its write was based on. A `412` on an unchanged document
+  is a conflict no writer moved, and the write fails. A retry after a lost answer that gets `412` reads it again: when
+  it equals what was sent, the write succeeded.
 - Uploading makes a commit on top of a tag, as git does: the tag's current tree (none when the tag is new), minus
   the paths the client's delete patterns match, plus the uploaded files, added or replaced; a file the commit sets is
   never deleted. The tag then moves to it. Publishing creates or moves a public tag, or makes a private one public;
