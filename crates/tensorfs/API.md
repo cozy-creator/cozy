@@ -130,6 +130,9 @@ Missing or denied source objects fail the operation.
 expands encoded tensors into their logical dtypes; `false` retains supported encodings.
 Decoding into the native cozytensors format returns `Invalid` before source preparation.
 
+A `format::ClassRef::new(library, version, name)` records a class and its library version;
+`ClassRef::default()` is the unknown record. It is metadata, not an import path.
+
 A `Writer` also has `pipeline(class, config)`, `component(name, class, config, config_file)`
 (`config_file` names the file the config exports as, such as `scheduler_config.json`; `None`
 keeps a reopened or base component's, else `config.json`),
@@ -198,7 +201,7 @@ declared chunks and component assets, not its enclosing repository files; checki
 shared chunk hashes that whole object. Other local I/O failures remain
 typed errors rather than being classified as corruption.
 
-A `Component` provides `name()`, `class()`, `config()`, `config_file()`, `tensors()` and
+A `Component` provides `name()`, `cls()` (`&format::ClassRef`), `config()`, `config_file()`, `tensors()` and
 `assets()` metadata views. `config_file()` is the file name the config exports as
 (`config.json` unless the writer named another, such as `scheduler_config.json`). Its
 `read(key)` returns the tensor as stored, as Python's `decode=False`: `Read::Plain(Vec<u8>)`,

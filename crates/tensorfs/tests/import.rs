@@ -992,8 +992,8 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
 /// network: Hugging Face. A pipeline's components take their library and class from
 /// `model_index.json` as written, even where the component's own config names another
 /// (`T5Tokenizer`, `architectures`) or none (a preprocessor config). A version is the config's
-/// own, else the model's for that library; `stable_diffusion` (a Diffusers pipeline module)
-/// records none, so its version is `""`.
+/// own, else the model's for that library; `stable_diffusion` is a Diffusers pipeline module, so
+/// the safety checker is Diffusers' at the model's version.
 #[test]
 fn model_index_names_every_component_class() {
     let dir = scratch("model-index-classes");
@@ -1006,7 +1006,7 @@ fn model_index_names_every_component_class() {
     };
     let sd = classes("tiny-stable-diffusion-pipe-variants-all-kinds");
     let class = ClassRef::new;
-    assert_eq!(sd["safety_checker"], class("stable_diffusion", "", "StableDiffusionSafetyChecker"));
+    assert_eq!(sd["safety_checker"], class("diffusers", "0.15.0.dev0", "StableDiffusionSafetyChecker"));
     assert_eq!(sd["feature_extractor"], class("transformers", "4.28.0.dev0", "CLIPFeatureExtractor"));
     assert_eq!(sd["tokenizer"], class("transformers", "4.28.0.dev0", "CLIPTokenizer"));
     let flux = classes("tiny-flux-pipe");
@@ -1043,10 +1043,26 @@ fn a_class_version_is_its_configs_else_the_models_else_the_references() {
         c("diffusers", "0.30.0", "P"),
         c("diffusers", "0.31.0", "U"),
         c("transformers", "4.40.0", "T"),
-        c("stable_diffusion", "", "S"),
+        c("diffusers", "0.30.0", "S"),
         c("transformers", "4.40.0", "K"),
     ]);
     assert_eq!(classes(&Default::default())[2], c("transformers", "", "T"));
+    // A pair's library is itself when installed (a version some config records), else a
+    // Diffusers pipeline module.
+    let versions = import::Versions::from([("diffusers".into(), "0.35.1".into()), ("acme".into(), "2.0".into())]);
+    let pair = |library, name| import::class_of(library, name, &versions, true);
+    assert_eq!(pair("kandinsky", "K"), c("diffusers", "0.35.1", "K"));
+    assert_eq!(pair("acme", "A"), c("acme", "2.0", "A"));
+    assert_eq!(pair("transformers", "T"), c("transformers", "", "T"));
+    // A dotted library is a module path of a package library: its top-level package.
+    assert_eq!(pair("minimax_h3.pipeline", "X"), c("minimax_h3", "", "X"));
+    assert_eq!(pair("acme.models.unet", "U"), c("acme", "2.0", "U"));
+    // Any other source keeps its library as written: an unknown one never becomes diffusers.
+    let other = |library, name| import::class_of(library, name, &versions, false);
+    assert_eq!(other("stable_diffusion", "S"), c("stable_diffusion", "", "S"));
+    assert_eq!(other("comfy", "Model"), c("comfy", "", "Model"));
+    assert_eq!(other("minimax_h3.pipeline", "X"), c("minimax_h3.pipeline", "", "X"));
+    assert_eq!(other("", "X"), ClassRef::default(), "no library is the unknown class");
 }
 
 /// network: Hugging Face (configs only, no weights). The same on the full-size repos.
@@ -1078,7 +1094,7 @@ fn full_size_pipelines_take_model_index_classes() {
     };
     let sd = classes("hf://stable-diffusion-v1-5/stable-diffusion-v1-5");
     let class = ClassRef::new;
-    assert_eq!(sd["safety_checker"], class("stable_diffusion", "", "StableDiffusionSafetyChecker"));
+    assert_eq!(sd["safety_checker"], class("diffusers", "0.6.0", "StableDiffusionSafetyChecker"));
     assert_eq!(sd["feature_extractor"], class("transformers", "4.22.0.dev0", "CLIPImageProcessor"));
     let lite = classes("hf://Freepik/flux.1-lite-8B");
     assert_eq!(lite["tokenizer_2"], class("transformers", "4.47.1", "T5TokenizerFast"));

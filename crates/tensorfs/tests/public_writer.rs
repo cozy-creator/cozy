@@ -731,7 +731,7 @@ async fn endpoint_commit_resolves_a_tag_a_header_and_an_untagged_commit() {
     for weight in [b"aaaa", b"bbbb"] {
         let options = WriterOptions { repo_id: Some("acme/commits"), revision: Some("draft"), ..WriterOptions::default() };
         let mut writer = client.writer(options).unwrap();
-        (writer.component("model", "test.Model", Default::default(), None).unwrap())
+        (writer.component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None).unwrap())
             .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(weight))
             .unwrap();
         let checkpoint = writer.commit().await.unwrap();
