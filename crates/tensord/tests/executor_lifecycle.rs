@@ -88,6 +88,8 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
             memory_mode: tensord::device_executor::MemoryMode::Shared,
         },
         DeviceCommand::Load {
+            tensorfs: None,
+            actor: String::new(),
             construction: "lifecycle".into(),
             devices: String::new(),
             sequence_parallel_degree: 1,
@@ -133,6 +135,11 @@ fn invoke(
     assert!(prepared.ok, "{prepared:?}");
     executor.command(
         &DeviceCommand::Invoke {
+            tensorfs: None,
+            weights: Default::default(),
+            destination: String::new(),
+            actor: String::new(),
+            operation: String::new(),
             max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
             request_id: id.into(),
             construction: "lifecycle".into(),
@@ -144,7 +151,6 @@ fn invoke(
             inputs: Default::default(),
             trees: Default::default(),
             sources: Default::default(),
-            weights: Default::default(),
         },
         &mut Baseline,
     )
@@ -484,6 +490,8 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
             memory_mode: tensord::device_executor::MemoryMode::Shared,
         },
         DeviceCommand::Load {
+            tensorfs: None,
+            actor: String::new(),
             construction: "lifecycle".into(),
             devices: String::new(),
             sequence_parallel_degree: 1,
@@ -529,6 +537,11 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
     let reply = executor
         .command(
             &DeviceCommand::Invoke {
+                tensorfs: None,
+                weights: Default::default(),
+                destination: String::new(),
+                actor: String::new(),
+                operation: String::new(),
                 max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
                 request_id: "probe".into(),
                 construction: "lifecycle".into(),
@@ -540,7 +553,6 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 attention_kernel: String::new(),
                 bits: 0,
                 sources: Default::default(),
-                weights: Default::default(),
             },
             &mut Baseline,
         )

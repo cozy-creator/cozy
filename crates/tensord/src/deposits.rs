@@ -104,13 +104,6 @@ fn reopen(_: &File) -> Option<File> {
     None
 }
 
-/// The SHA-256 (hex) of chunk objects in order, one `<sha256>:<length>\n` line each: what a
-/// `read_grant` of chunk files names in place of the list.
-pub fn objects_digest(objects: &[tensorfs::format::ObjectRef]) -> String {
-    let lines: String = objects.iter().map(|o| format!("{}:{}\n", o.sha256, o.length)).collect();
-    tensorfs::sha256::hex_digest(lines.as_bytes())
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

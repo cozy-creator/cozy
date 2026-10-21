@@ -10,7 +10,7 @@ use protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{PackageRef, release_order};
+use super::PackageRef;
 use crate::{
     Context,
     machine::{Notices, route, until_ready},
@@ -113,24 +113,8 @@ pub async fn install_directory(
     on: On,
     detach: bool,
 ) -> Result<ExitCode, Error> {
-    let in_place = matches!(&on, On::Machine(name) if name.eq_ignore_ascii_case("local"));
-    let local = super::local::source(ctx, path, in_place).await?;
-    let warm = spec(
-        v1::RunKind::Warm,
-        Source::Local(local.source.clone()),
-        String::new(),
-    );
-    let ask = SubmitRun {
-        agreed: None,
-        on,
-        hub: ctx.hub()?.origin.into(),
-        kind: calcifer::Kind::Warm,
-        target: local.package.clone(),
-        spec: warm,
-        inputs: local.inputs.clone(),
-        out: None,
-        warnings: vec![],
-    };
+    let local = super::local::source(ctx, path, &on).await?;
+    let ask = run::local::install_run(&ctx.home, &ctx.hub()?.origin, on, &local);
     let submitted = run::submit(ctx, ask, None).await?.run;
     installed(ctx, submitted, &local.package, detach).await
 }
@@ -529,7 +513,10 @@ pub async fn update(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
         };
         for env in held
             .iter()
-            .filter(|env| release_order(&env.release) < release_order(&row.to))
+            .filter(|env| {
+                let older = [env.release.as_str(), row.to.as_str()];
+                env.release != row.to && tensorfs::format::newest_by(older, |r| *r) == Some(row.to.as_str())
+            })
         {
             let source = Source::Installation(env.installation.clone());
             let target = format!("{package}@{}", env.release);

@@ -4,7 +4,6 @@
 
 use std::ffi::{c_void, CStr};
 #[cfg(feature = "store")]
-use std::fs::File;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
@@ -13,21 +12,18 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use pyo3::{create_exception, ffi};
 #[cfg(feature = "store")]
-use tensorfs::ids::ObjectRef;
 use varena::ledger::{Admit, Facts, Ledger, Row, RowFacts, State, Victim};
 use varena::ceiling::Copy;
 use varena::memory::{Counters, GpuStats, Part, SetStats};
 use varena::{Error, Gpu, Host, HostPinned, HostSet, Pinned, WeightSet};
 
-use crate::errors::to_py;
 #[cfg(feature = "store")]
 use crate::store::PyCheckpoint;
 
-/// What varena reads of a `tensorfs.Checkpoint`: its header, and the stored checkpoint when a
-/// store holds it (a parsed header reads only a grant's files or a sealed layout).
+/// The open checkpoint behind a `tensorfs.Checkpoint`.
 #[cfg(feature = "store")]
-fn ck_of(ck: &PyCheckpoint) -> varena::checkpoint::Ck<'_> {
-    varena::checkpoint::Ck { header: &ck.header, stored: ck.stored.as_ref().map(|(c, _)| c) }
+fn ck_of(py: Python<'_>, ck: &PyCheckpoint) -> PyResult<tensorfs::Checkpoint> {
+    ck.core(py)
 }
 
 create_exception!(tensorfs.varena, VarenaError, PyException, "A varena error; `.code` names its class.");
@@ -51,7 +47,7 @@ impl<T> OrRaise<T> for varena::Result<T> {
     fn or_raise(self, py: Python<'_>) -> PyResult<T> {
         self.map_err(|e| {
             let x = match &e {
-                Error::Source(r) => return to_py(py, r),
+                Error::Source(failure) => return crate::errors::raise(py, failure.clone()),
                 Error::DeviceFull { .. } => DeviceFull::new_err(e.to_string()),
                 Error::Cuda { .. } => CudaError::new_err(e.to_string()),
                 Error::CudaUnavailable(_) => CudaUnavailable::new_err(e.to_string()),
@@ -134,6 +130,25 @@ fn copies() -> Vec<PyCopy> {
     varena::ceiling::take().into_iter().map(Into::into).collect()
 }
 
+record!(PyCeiling = "Ceiling" from tensorfs::io::Ceiling {
+    disk_gbps: f64, disk_direct: bool, h2d_gbps: Option<f64>, streams: Option<u32>
+});
+
+/// What reads can reach, measured unless kept this boot: `path`'s volume (default: the TensorFS
+/// cache) and, with `device`, pinned H2D to that GPU. Reads never measure; they log against this.
+#[pyfunction]
+#[pyo3(signature = (device=None, path=None))]
+fn ceiling(py: Python<'_>, device: Option<i32>, path: Option<std::path::PathBuf>) -> PyResult<PyCeiling> {
+    let path = match path {
+        Some(path) => path,
+        None => tensorfs::home::resolve(None).map_err(|e| IoError::new_err(e.to_string()))?,
+    };
+    py.detach(|| tensorfs::io::ceiling(device, &path)).map(Into::into).map_err(|e| match e.kind() {
+        std::io::ErrorKind::Unsupported => Unsupported::new_err(e.to_string()),
+        _ => IoError::new_err(e.to_string()),
+    })
+}
+
 #[pyclass(name = "Part", module = "tensorfs.varena", frozen, get_all)]
 pub struct PyPart {
     component: String,
@@ -147,17 +162,6 @@ pub struct PyPart {
 }
 
 // ---------------------------------------------------------------- cores
-
-/// A grant's chunk files, `(sha256, length, fd)` each: every fd duplicated, the caller's kept.
-#[cfg(feature = "store")]
-fn granted(py: Python<'_>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<Option<Vec<(ObjectRef, File)>>> {
-    let dup = |(sha256, length, fd): (String, u64, i32)| -> varena::Result<(ObjectRef, File)> {
-        // SAFETY: a descriptor the caller holds for the duration of this call.
-        let own = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map_err(|e| Error::Io(format!("dup chunk fd {fd}: {e}")));
-        Ok((ObjectRef { sha256, length }, File::from(own?)))
-    };
-    files.map(|f| f.into_iter().map(dup).collect::<varena::Result<_>>()).transpose().or_raise(py)
-}
 
 #[pyclass(name = "Gpu", module = "tensorfs.varena", frozen)]
 pub struct PyGpu(Arc<Gpu>);
@@ -181,18 +185,18 @@ impl PyGpu {
     }
 
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
-    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
-        let (ck, files) = (ck_of(&ck), granted(py, files)?);
-        Ok(PyWeightSet::new(SetRef::Gpu(detached(py, || self.0.register(&name, ck, &regions, host_fd, files))?)))
+    #[pyo3(signature = (name, ck, regions, host_fd = None))]
+    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>) -> PyResult<PyWeightSet> {
+        let ck = ck_of(py, &ck)?;
+        Ok(PyWeightSet::new(SetRef::Gpu(detached(py, || self.0.register(&name, &ck, &regions, host_fd))?)))
     }
 
     /// The sealed host layout `host_fd` registered from the regions it carries, before any module.
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, host_fd, files = None))]
-    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
-        let (ck, files) = (ck_of(&ck), granted(py, files)?);
-        Ok(PyWeightSet::new(SetRef::Gpu(detached(py, || self.0.adopt(&name, ck, host_fd, files))?)))
+    #[pyo3(signature = (name, ck, host_fd))]
+    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32) -> PyResult<PyWeightSet> {
+        let ck = ck_of(py, &ck)?;
+        Ok(PyWeightSet::new(SetRef::Gpu(detached(py, || self.0.adopt(&name, &ck, host_fd))?)))
     }
 
     fn trim(&self, py: Python<'_>) -> PyResult<u64> {
@@ -238,17 +242,17 @@ impl PyHost {
     }
 
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
-    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
-        let (ck, files) = (ck_of(&ck), granted(py, files)?);
-        Ok(PyWeightSet::new(SetRef::Host(detached(py, || Host.register(&name, ck, &regions, host_fd, files))?)))
+    #[pyo3(signature = (name, ck, regions, host_fd = None))]
+    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>) -> PyResult<PyWeightSet> {
+        let ck = ck_of(py, &ck)?;
+        Ok(PyWeightSet::new(SetRef::Host(detached(py, || Host.register(&name, &ck, &regions, host_fd))?)))
     }
 
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, host_fd, files = None))]
-    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
-        let (ck, files) = (ck_of(&ck), granted(py, files)?);
-        Ok(PyWeightSet::new(SetRef::Host(detached(py, || Host.adopt(&name, ck, host_fd, files))?)))
+    #[pyo3(signature = (name, ck, host_fd))]
+    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32) -> PyResult<PyWeightSet> {
+        let ck = ck_of(py, &ck)?;
+        Ok(PyWeightSet::new(SetRef::Host(detached(py, || Host.adopt(&name, &ck, host_fd))?)))
     }
 }
 
@@ -358,26 +362,31 @@ impl PyWeightSet {
     }
 
     /// Landed home regions not handed out yet, kept past this process: `(region, span, fd)`,
-    /// each fd the caller's to deposit with TensorD and close.
-    fn kept(&self, py: Python<'_>) -> PyResult<Vec<(u32, u64, i32)>> {
+    /// each fd the caller's to deposit with TensorD and close. `filled`: only regions a page-in
+    /// transform already filled.
+    #[pyo3(signature = (filled = false))]
+    fn kept(&self, py: Python<'_>, filled: bool) -> PyResult<Vec<(u32, u64, i32)>> {
         let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
-        Ok(detached(py, || w.kept())?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
+        Ok(detached(py, || w.kept(filled))?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
     }
 
     /// As `kept`, after admission is stopped and every use is drained; cached graph pins stay.
-    fn kept_quiescent(&self, py: Python<'_>) -> PyResult<Vec<(u32, u64, i32)>> {
+    #[pyo3(signature = (filled = false))]
+    fn kept_quiescent(&self, py: Python<'_>, filled: bool) -> PyResult<Vec<(u32, u64, i32)>> {
         let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
-        Ok(detached(py, || w.kept_quiescent())?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
+        Ok(detached(py, || w.kept_quiescent(filled))?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
     }
 
     /// Home regions mapped from kept pages `(region, fd)`; each fd duplicated, the caller's
-    /// kept. Returns the bytes adopted.
-    fn adopt_pages(&self, py: Python<'_>, pages: Vec<(u32, i32)>) -> PyResult<u64> {
-        let Some(w) = self.gpu(py)? else { return Ok(0) };
+    /// kept. `filled`: pages a page-in transform filled, whose filling the caller proved: they
+    /// map as filled. Returns the regions adopted.
+    #[pyo3(signature = (pages, filled = false))]
+    fn adopt_pages(&self, py: Python<'_>, pages: Vec<(u32, i32)>, filled: bool) -> PyResult<Vec<u32>> {
+        let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
         // SAFETY: descriptors the caller holds for the duration of this call.
         let dup = |(r, fd): (u32, i32)| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map(|fd| (r, fd));
         let pages = pages.into_iter().map(dup).collect::<std::io::Result<Vec<_>>>().map_err(|e| Error::Io(format!("dup kept pages: {e}"))).or_raise(py)?;
-        detached(py, || w.adopt_pages(pages))
+        detached(py, || w.adopt_pages(pages, filled))
     }
 
     #[pyo3(signature = (regions = None))]
@@ -608,15 +617,14 @@ fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
     detached(py, || varena::host::release_hold(unsafe { OwnedFd::from_raw_fd(hold) }))
 }
 
-/// `regions` of a v2 checkpoint in a sealed host layout, filled in this process from its chunk
-/// files (`files`, else the checkpoint's paths): what `register(host_fd=)` adopts. Returns the
-/// memfd (the caller's).
+/// `regions` of a checkpoint in a sealed host layout, filled in this process from its chunks:
+/// what `register(host_fd=)` adopts. Returns the memfd (the caller's).
 #[cfg(feature = "store")]
 #[pyfunction]
-#[pyo3(signature = (ck, regions, name, threads = 8, files = None))]
-fn seal(py: Python<'_>, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, name: String, threads: usize, files: Option<Vec<(String, u64, i32)>>) -> PyResult<i32> {
-    let (ck, files) = (ck_of(&ck), granted(py, files)?);
-    detached(py, || varena::memory::seal(ck, &regions, &name, threads, files)).map(IntoRawFd::into_raw_fd)
+#[pyo3(signature = (ck, regions, name, threads = 8))]
+fn seal(py: Python<'_>, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, name: String, threads: usize) -> PyResult<i32> {
+    let ck = ck_of(py, &ck)?;
+    detached(py, || varena::memory::seal(&ck, &regions, &name, threads)).map(IntoRawFd::into_raw_fd)
 }
 
 // ---------------------------------------------------------------- the ledger
@@ -856,11 +864,13 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
             $(m.add(stringify!($e), py.get_type::<$e>())?;)*
         };
     }
-    add!(PyGpu, PyHost, PyWeightSet, PyPinned, PyPart, PyCounters, PySetStats, PyGpuStats, PyCopy, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
-        copies, hold_tier, release_tier;
+    add!(PyGpu, PyHost, PyWeightSet, PyPinned, PyPart, PyCounters, PySetStats, PyGpuStats, PyCopy, PyCeiling, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
+        copies, ceiling, hold_tier, release_tier;
         VarenaError, DeviceFull, CudaError, CudaUnavailable, Invalid, IoError, Closed, Unsupported, LedgerError);
     #[cfg(feature = "store")]
     add!(; seal;);
+    #[cfg(feature = "store")]
+    m.add_function(wrap_pyfunction!(crate::store::regions, &m)?)?;
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
 }

@@ -7,6 +7,7 @@ The host tier functions are the machine's (TensorD's) half.
 """
 
 from .._ext.varena import (
+    Ceiling,
     Closed,
     Copy,
     Counters,
@@ -24,14 +25,17 @@ from .._ext.varena import (
     Unsupported,
     VarenaError,
     WeightSet,
+    ceiling,
     copies,
     hold_tier,
     release_tier,
+    regions,
     seal,
 )
 from .._ext.varena import Admit, Ledger, LedgerError, Row, RowFacts, Victim
 
 __all__ = [
+    "Ceiling",
     "Closed",
     "Copy",
     "Counters",
@@ -49,9 +53,11 @@ __all__ = [
     "Unsupported",
     "VarenaError",
     "WeightSet",
+    "ceiling",
     "copies",
     "hold_tier",
     "release_tier",
+    "regions",
     "seal",
 ]
 __all__ += ["Admit", "Ledger", "LedgerError", "Row", "RowFacts", "Victim"]

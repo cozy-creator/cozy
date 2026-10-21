@@ -12,7 +12,7 @@ use std::process::Command;
 use tensorfs::err::Code;
 use tensorfs::format::{decode, Body, Dtype, Encoding, PartBytes, SCHEMES};
 use tensorfs::import::{Access, Request};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 
 struct Scratch(PathBuf);
 
@@ -100,14 +100,14 @@ fn import(store: &Store, source: &Path) -> tensorfs::err::Result<Checkpoint> {
     let req = Request {
         sources: &[source.display().to_string()],
         converter: None,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &tmp,
         progress: &|_, _, _| {},
         stop: None,
     };
-    let manifest = store.import(&req, None)?;
-    Ok(store.checkpoint(&manifest).unwrap())
+    let (header, _) = store.import(&req, None)?;
+    Ok(store.checkpoint(&header).unwrap())
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<u16> {
@@ -146,8 +146,6 @@ struct Want {
 const NVFP4_MODELOPT: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "low_first", scale_layout: "row_major"}"#;
 const NVFP4_CT: &str = r#"nvfp4 {block_size: 16, global_scale: "divide", nibble_order: "low_first", scale_layout: "row_major"}"#;
 const NVFP4_COMFY: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "high_first", scale_layout: "cublas_128x4"}"#;
-const NVFP4_COMFY_AWQ: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "high_first", pre_quant_scale_dtype: "BF16", scale_layout: "cublas_128x4"}"#;
-const NVFP4_MODELOPT_AWQ: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "low_first", pre_quant_scale_dtype: "BF16", scale_layout: "row_major"}"#;
 const MXFP8_ROWS: &str = r#"mxfp8 {block_size: 32, scale_layout: "row_major"}"#;
 const MXFP8_TILES: &str = r#"mxfp8 {block_size: 32, scale_layout: "cublas_128x4"}"#;
 
@@ -348,7 +346,6 @@ fn modelopt_nvfp4_awq_keeps_pre_quant_scale() {
         nvfp4!("mlp.up_proj", 96, 64),
         nvfp4!("mlp.down_proj", 64, 96),
     ];
-    wants[3].encoding = NVFP4_MODELOPT_AWQ;
     wants[3].parts = &[
         ("weight", "F4", &[64, 64], "weight"),
         ("scale", "F8_E4M3", &[64, 4], "weight_scale"),
@@ -519,7 +516,7 @@ fn comfy_fp8_tensorwise_rowwise_and_legacy() {
         &[
             Want {
                 key: "attn.to_q.weight",
-                encoding: r#"fp8.tensorwise {scale_dtype: "F32"}"#,
+                encoding: r#"fp8.tensorwise {}"#,
                 parts: &[
                     ("weight", "F8_E4M3", &[32, 64], "weight"),
                     ("scale", "F32", &[], "weight_scale"),
@@ -530,7 +527,7 @@ fn comfy_fp8_tensorwise_rowwise_and_legacy() {
             },
             Want {
                 key: "attn.to_k.weight",
-                encoding: r#"fp8.rowwise {axis: 0, scale_dtype: "F32"}"#,
+                encoding: r#"fp8.rowwise {}"#,
                 parts: &[
                     ("weight", "F8_E4M3", &[32, 64], "weight"),
                     ("scale", "F32", &[32, 1], "weight_scale"),
@@ -545,7 +542,7 @@ fn comfy_fp8_tensorwise_rowwise_and_legacy() {
         "comfy-scaled-fp8",
         &[Want {
             key: "attn.to_v.weight",
-            encoding: r#"fp8.tensorwise {scale_dtype: "F32"}"#,
+            encoding: r#"fp8.tensorwise {}"#,
             parts: &[
                 ("weight", "F8_E4M3", &[32, 64], "weight"),
                 ("scale", "F32", &[1], "scale_weight"),
@@ -567,7 +564,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
         &[
             Want {
                 key: "ff.up.weight",
-                encoding: r#"int8.tensorwise {scale_dtype: "F32"}"#,
+                encoding: r#"int8.tensorwise {}"#,
                 parts: &[
                     ("weight", "I8", &[32, 64], "weight"),
                     ("scale", "F32", &[], "weight_scale"),
@@ -577,7 +574,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
             },
             Want {
                 key: "ff.gate.weight",
-                encoding: r#"int8.rowwise {axis: 0, scale_dtype: "F32"}"#,
+                encoding: r#"int8.rowwise {}"#,
                 parts: &[
                     ("weight", "I8", &[32, 64], "weight"),
                     ("scale", "F32", &[32, 1], "weight_scale"),
@@ -587,7 +584,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
             },
             Want {
                 key: "ff.down.weight",
-                encoding: r#"int8.convrot {rotation: "hadamard", rotation_size: 64, scale_dtype: "F32"}"#,
+                encoding: r#"int8.convrot {rotation: "kron_regular_h4", rotation_size: 64}"#,
                 parts: &[
                     ("weight", "I8", &[16, 128], "weight"),
                     ("scale", "F32", &[16, 1], "weight_scale"),
@@ -710,7 +707,6 @@ fn every_carrier_names_a_complete_encoding() {
     use tensorfs::format::{GlobalScale::*, NibbleOrder::*, ScaleLayout::*};
     use tensorfs::import::carriers::{carriers, Producer};
     for c in carriers() {
-        let awq = |e: Encoding| e.with_pre_quant_scale(&Dtype::F32);
         if c.from_config {
             // The producer's config names the width: every width it may name is a scheme here.
             let widths: &[u32] = match c.producer {
@@ -725,36 +721,30 @@ fn every_carrier_names_a_complete_encoding() {
             continue;
         }
         let want = match (c.encoding.scheme.as_str(), c.producer) {
-            ("nvfp4", Producer::Modelopt) => awq(Encoding::nvfp4(Multiply, LowFirst, RowMajor)),
+            ("nvfp4", Producer::Modelopt) => Encoding::nvfp4(Multiply, LowFirst, RowMajor),
             ("nvfp4", Producer::CompressedTensors) => Encoding::nvfp4(Divide, LowFirst, RowMajor),
-            ("nvfp4", Producer::Comfy) => awq(Encoding::nvfp4(Multiply, HighFirst, Cublas128x4)),
+            ("nvfp4", Producer::Comfy) => Encoding::nvfp4(Multiply, HighFirst, Cublas128x4),
             ("mxfp8", Producer::Comfy) => Encoding::mxfp8(Cublas128x4),
             ("mxfp8", _) => Encoding::mxfp8(RowMajor),
-            ("fp8.tensorwise", _) => Encoding::fp8_tensorwise(&Dtype::F32),
-            ("fp8.rowwise", _) => Encoding::fp8_rowwise(0, &Dtype::F32),
-            ("int8.tensorwise", _) => Encoding::int8_tensorwise(&Dtype::F32),
-            ("int8.rowwise", _) => Encoding::int8_rowwise(0, &Dtype::F32),
-            ("int8.convrot", _) => Encoding::int8_convrot(256, &Dtype::F32),
-            ("fp8.blockwise", _) => Encoding::fp8_blockwise(128, 128, &Dtype::F32),
+            ("fp8.tensorwise", _) => Encoding::fp8_tensorwise(),
+            ("fp8.rowwise", _) => Encoding::fp8_rowwise(),
+            ("int8.tensorwise", _) => Encoding::int8_tensorwise(),
+            ("int8.rowwise", _) => Encoding::int8_rowwise(),
+            ("int8.convrot", _) => Encoding::int8_convrot(256),
+            ("fp8.blockwise", _) => Encoding::fp8_blockwise(128, 128),
             ("mxfp4", Producer::GptOss) => Encoding::mxfp4(true),
             ("mxfp4", _) => Encoding::mxfp4(false),
             ("comfy.asym_w4a8_int8", _) => Encoding::comfy_asym_w4a8_int8(16, 256),
             ("comfy.w6a8_int8", _) => Encoding::comfy_w6a8_int8(16, 256),
-            ("comfy.convrot_w4a4", _) => Encoding::comfy_convrot_w4a4(256),
+            ("int4.convrot", _) => Encoding::int4_convrot(256),
             other => panic!("{other:?}"),
         };
         let mut encoding = c.encoding.clone();
         for param in c.config_params.keys() {
-            encoding.params.insert(
-                param.clone(),
-                tensorfs::format::Value::List(vec![128u64.into(), 128u64.into()]),
-            );
+            encoding.params.insert(param.clone(), tensorfs::format::Value::List(vec![128u64.into(), 128u64.into()]));
         }
         for (param, (_, default)) in &c.marker_params {
             encoding.params.insert(param.clone(), (*default).into());
-        }
-        for param in c.dtype_params.keys() {
-            encoding.params.insert(param.clone(), "F32".into());
         }
         assert_eq!(encoding, want, "{:?} {:?}", c.producer, c.formats);
     }
@@ -780,13 +770,13 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
     };
     let source = fixtures().join("comfy-nvfp4");
     tfs(&[
-        "import",
+        "convert",
         source.to_str().unwrap(),
         "--name",
-        "acme/comfy-nvfp4",
+        "local/comfy-nvfp4@1",
     ]);
     let doc: serde_json::Value =
-        serde_json::from_str(tfs(&["--json", "inspect", "acme/comfy-nvfp4"]).trim()).unwrap();
+        serde_json::from_str(tfs(&["--json", "inspect", "local/comfy-nvfp4@1"]).trim()).unwrap();
     let tensors = doc["components"][0]["tensors"].as_array().unwrap();
     let qkv = tensors
         .iter()
@@ -796,7 +786,7 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
         qkv,
         &serde_json::json!({"key": "blocks.0.attn.qkv.weight", "dtype": "BF16", "shape": [144, 80], "encoding": NVFP4_COMFY})
     );
-    let human = tfs(&["inspect", "acme/comfy-nvfp4"]);
+    let human = tfs(&["inspect", "local/comfy-nvfp4@1"]);
     assert!(
         human.contains(&format!("    2 × {NVFP4_COMFY}\n")),
         "{human}"
@@ -1138,13 +1128,13 @@ fn real_int_checkpoints_import_and_decode() {
         (
             "real-ct-int8-channel",
             "BF16",
-            r#"int8.rowwise {axis: 0, scale_dtype: "BF16"}"#,
+            r#"int8.rowwise {}"#,
             0.02,
         ),
         (
             "real-ct-fp8-channel",
             "BF16",
-            r#"fp8.rowwise {axis: 0, scale_dtype: "BF16"}"#,
+            r#"fp8.rowwise {}"#,
             0.03,
         ),
     ];
@@ -1291,7 +1281,7 @@ fn comfy_marker_params_are_read_or_refused() {
     };
     assert_eq!(
         encoding.to_string(),
-        r#"int8.convrot {rotation: "hadamard", rotation_size: 64, scale_dtype: "F32"}"#
+        r#"int8.convrot {rotation: "kron_regular_h4", rotation_size: 64}"#
     );
 }
 
@@ -1364,7 +1354,7 @@ fn real_bytes_from_comfyui_and_modelopt() {
     let Body::Encoded { encoding, parts } = &t.body else {
         panic!()
     };
-    assert_eq!(encoding.to_string(), NVFP4_COMFY_AWQ);
+    assert_eq!(encoding.to_string(), NVFP4_COMFY);
     let roles: Vec<&str> = parts.iter().map(|p| p.role.as_str()).collect();
     assert_eq!(roles, ["weight", "scale", "scale_2", "pre_quant_scale"]);
     let source = read_safetensors(&fixtures().join("real-comfy-nvfp4-awq.expect.safetensors"));
@@ -1400,11 +1390,7 @@ fn real_bytes_from_comfyui_and_modelopt() {
         })
         .collect();
     views.remove("pre_quant_scale");
-    let mut without = encoding.clone();
-    without.params.remove("pre_quant_scale_dtype");
-    let wrong = error(&bf16s(
-        &decode(&t.dtype, &t.shape, &without, &views).unwrap(),
-    ));
+    let wrong = error(&bf16s(&decode(&t.dtype, &t.shape, encoding, &views).unwrap()));
     assert!(wrong > 0.30, "without pre_quant_scale: {wrong}");
     // ModelOpt's post-processed export carries both declarations: refused until the rule that
     // reads it (xs-049) lands.
@@ -1414,9 +1400,9 @@ fn real_bytes_from_comfyui_and_modelopt() {
     assert_eq!(e.code, Code::AMBIGUOUS_CLASSIFICATION, "{}", e.detail);
 }
 
-const W4A8: &str = "comfy.asym_w4a8_int8 {group_size: 16, rotation_size: 256}";
-const W6A8: &str = "comfy.w6a8_int8 {group_size: 32, rotation_size: 256}";
-const W4A4: &str = "comfy.convrot_w4a4 {rotation_size: 256}";
+const W4A8: &str = r#"comfy.asym_w4a8_int8 {group_size: 16, rotation: "kron_regular_h4", rotation_size: 256}"#;
+const W6A8: &str = r#"comfy.w6a8_int8 {group_size: 32, rotation: "kron_regular_h4", rotation_size: 256}"#;
+const W4A4: &str = r#"int4.convrot {rotation: "kron_regular_h4", rotation_size: 256}"#;
 
 /// xs-049 U7's real bytes (`comfy-provenance.json`: 64 rows × 512 columns of MiniMax-H3 linears,
 /// with Comfy-Org's bf16 weights): each ComfyUI integer format imports at its marker's params and
@@ -1431,9 +1417,9 @@ fn comfy_w4a8_w6a8_w4a4_from_real_files() {
             encoding: W4A8,
             parts: &[
                 ("weight", "I8", &[64, 256], "weight"),
-                ("weight_s_rel", "F8_E4M3", &[64, 32], "weight_s_rel"),
-                ("weight_s_channel", "F32", &[64], "weight_s_channel"),
-                ("weight_codebook", "F32", &[16], "weight_codebook"),
+                ("group_scale", "F8_E4M3", &[64, 32], "weight_s_rel"),
+                ("scale", "F32", &[64], "weight_s_channel"),
+                ("codebook", "F32", &[16], "weight_codebook"),
             ],
             meets: Meets::Exactly,
             error: 0.08,
@@ -1446,8 +1432,8 @@ fn comfy_w4a8_w6a8_w4a4_from_real_files() {
             encoding: W6A8,
             parts: &[
                 ("weight", "I8", &[64, 384], "weight"),
-                ("weight_s_rel", "F8_E4M3", &[64, 16], "weight_s_rel"),
-                ("weight_s_channel", "F32", &[64], "weight_s_channel"),
+                ("group_scale", "F8_E4M3", &[64, 16], "weight_s_rel"),
+                ("scale", "F32", &[64], "weight_s_channel"),
             ],
             meets: Meets::Exactly,
             error: 0.03,
@@ -1460,7 +1446,7 @@ fn comfy_w4a8_w6a8_w4a4_from_real_files() {
             encoding: W4A4,
             parts: &[
                 ("weight", "I8", &[64, 256], "weight"),
-                ("weight_scale", "F32", &[64], "weight_scale"),
+                ("scale", "F32", &[64], "weight_scale"),
             ],
             meets: Meets::Exactly,
             error: 0.25,
@@ -1561,4 +1547,87 @@ fn comfy_int_markers_and_shapes_are_read_or_refused() {
         s.2 = vec![8, 8];
     };
     refusal("real-comfy-w4a4", &group_scales, "not [64] or [64]+[1]");
+}
+
+#[test]
+fn comfy_empty_packed_rows_recover_large_widths_without_overflow() {
+    // These headers contain no weight bytes. Multiplying their physical widths by eight
+    // overflows even though the logical widths and every part's zero byte count fit.
+    let columns = 1u64 << 63;
+    for (format, bits, group) in [
+        ("convrot_w4a4", 4, None),
+        ("asym_w4a8_int8", 4, Some(16)),
+        ("w6a8_int8", 6, Some(32)),
+    ] {
+        let width = if bits == 4 {
+            columns / 2
+        } else {
+            (columns / 4) * 3
+        };
+        let (_dir, ck) = edited("empty-comfy-width", &|t, _, _| {
+            let conf = match group {
+                Some(g) => serde_json::json!({
+                    "format": format, "convrot_groupsize": 256, "group_size": g
+                }),
+                None => serde_json::json!({
+                    "format": format, "convrot_groupsize": 256
+                }),
+            };
+            t.push(marker("proj", conf));
+            t.push(("norm.weight".into(), "BF16".into(), vec![1], vec![0; 2]));
+            t.push(("proj.weight".into(), "I8".into(), vec![0, width], vec![]));
+            match group {
+                None => t.push(("proj.weight_scale".into(), "F32".into(), vec![0], vec![])),
+                Some(g) => {
+                    t.push((
+                        "proj.weight_s_rel".into(),
+                        "F32".into(),
+                        vec![0, columns / g],
+                        vec![],
+                    ));
+                    t.push((
+                        "proj.weight_s_channel".into(),
+                        "F32".into(),
+                        vec![0],
+                        vec![],
+                    ));
+                }
+            }
+        });
+        assert_eq!(
+            ck.tensor("model", "proj.weight").unwrap().shape,
+            [0, columns]
+        );
+    }
+    for (format, width, why) in [
+        ("convrot_w4a4", 1u64 << 63, "packed logical width overflow"),
+        (
+            "w6a8_int8",
+            (1u64 << 62) * 3,
+            "packed logical width overflow",
+        ),
+        ("w6a8_int8", 1u64 << 61, "not 6-bit rows"),
+    ] {
+        let e = refused("invalid-comfy-width", &|t, _, _| {
+            t.push(marker(
+                "proj",
+                serde_json::json!({"format": format, "convrot_groupsize": 256}),
+            ));
+            t.push(("norm.weight".into(), "BF16".into(), vec![1], vec![0; 2]));
+            t.push(("proj.weight".into(), "I8".into(), vec![0, width], vec![]));
+            if format == "convrot_w4a4" {
+                t.push(("proj.weight_scale".into(), "F32".into(), vec![0], vec![]));
+            } else {
+                t.push(("proj.weight_s_rel".into(), "F32".into(), vec![0, 1], vec![]));
+                t.push((
+                    "proj.weight_s_channel".into(),
+                    "F32".into(),
+                    vec![0],
+                    vec![],
+                ));
+            }
+        });
+        assert_eq!(e.code, Code::MISSING_COMPANION_ROLE, "{}", e.detail);
+        assert!(e.detail.contains(why), "{format}: {}", e.detail);
+    }
 }

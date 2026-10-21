@@ -7,7 +7,7 @@ use protocol::{
 };
 use serde::Serialize;
 
-use super::{PackageRef, release_order, stamp};
+use super::{PackageRef, newest_first, stamp};
 use crate::{
     Context,
     context::hub_error,
@@ -104,7 +104,7 @@ pub async fn info(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
         .await
         .map_err(|e| missing(hub_error(e), package, hub.label()))?
         .into_inner();
-    let mut releases: Vec<Release> = card
+    let releases: Vec<Release> = card
         .releases
         .into_iter()
         .map(|r| Release {
@@ -113,7 +113,7 @@ pub async fn info(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
             release: r.release,
         })
         .collect();
-    releases.sort_by_key(|r| std::cmp::Reverse(release_order(&r.release)));
+    let mut releases = newest_first(releases, |r| r.release.as_str());
     // A named release: its row alone, and what its publish warned of.
     let mut warned = vec![];
     if let Some(release) = &package.release {

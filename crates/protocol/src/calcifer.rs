@@ -177,11 +177,9 @@ pub struct Call {
     pub memoized: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Reason {
-    pub code: String,
-    pub message: String,
-}
+/// Why a run or call did not succeed, as its machine said it (with its traceback) or as
+/// Calcifer did.
+pub use crate::machine::Reason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -214,16 +212,15 @@ pub struct OutputItem {
     /// Why this revision's bytes will not land (its machine ended, or holds them no more).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_error: Option<String>,
+    /// A checkpoint already written to TensorFS; it has no output bytes to export here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<crate::machine::CheckpointRef>,
 }
 
-/// A weights output's media type: its bytes are a checkpoint's manifest.
-pub const CHECKPOINT: &str = "application/vnd.cozy.model-manifest";
-
 impl OutputItem {
-    /// A checkpoint (a weights output) stays on the machine that wrote it, which uploads it to
-    /// the Hub; it is never saved to this computer, so it is final as soon as it is done.
+    /// A checkpoint reference needs no local byte export.
     pub fn is_checkpoint(&self) -> bool {
-        self.media_type == CHECKPOINT
+        self.checkpoint.is_some()
     }
 }
 
@@ -276,6 +273,8 @@ pub enum Event {
         length: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         appended_from: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint: Option<crate::machine::CheckpointRef>,
     },
     #[serde(rename = "output_item.done")]
     OutputDone {
@@ -937,5 +936,31 @@ mod tests {
         for on in ["local", "any", "new", "new:h100", "kiyui"] {
             assert_eq!(On::from(on.to_owned()).to_string(), on);
         }
+    }
+
+    #[test]
+    fn old_output_json_still_reads_and_checkpoint_references_round_trip() {
+        let json = serde_json::json!({
+            "id": "1/image", "name": "image", "index": 0, "rev": 1,
+            "length": 10, "media_type": "image/png", "status": "completed"
+        });
+        let mut item: OutputItem = serde_json::from_value(json).unwrap();
+        assert!(item.checkpoint.is_none());
+        assert!(
+            serde_json::to_value(&item)
+                .unwrap()
+                .get("checkpoint")
+                .is_none()
+        );
+        item.checkpoint = Some(crate::machine::CheckpointRef {
+            repo_id: "local/derived".into(),
+            revision: "sha256:tree".into(),
+            variant: String::new(),
+            tag: format!("replay-{}", "c".repeat(64)),
+        });
+        assert_eq!(
+            serde_json::from_value::<OutputItem>(serde_json::to_value(&item).unwrap()).unwrap(),
+            item
+        );
     }
 }

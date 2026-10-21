@@ -20,7 +20,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use crate::{stop::Stop, storage::Store};
+use crate::{cas::Cas, stop::Stop};
 use tensorfs::{format::ObjectRef, sha256};
 
 /// The manifest object (JSON). Members are objects the same signer wrote.
@@ -110,7 +110,7 @@ impl Drop for Holder<'_> {
 pub struct LocalSources {
     pub objects: Arc<Objects>,
     pub installer: InstallerConfig,
-    pub store: Arc<Store>,
+    pub cas: Cas,
     /// Each signer's packages: remote `source-<manifest>/{tree,env-*}`, direct paths `env-*`.
     editable: PathBuf,
     installing: Mutex<()>,
@@ -206,12 +206,12 @@ fn open_manifest(
 }
 
 impl LocalSources {
-    pub fn new(objects: Arc<Objects>, installer: InstallerConfig, store: Arc<Store>) -> Self {
+    pub fn new(objects: Arc<Objects>, installer: InstallerConfig) -> Self {
         Self {
             editable: installer.generations.with_file_name("editable"),
+            cas: objects.cas().clone(),
             objects,
             installer,
-            store,
             installing: Mutex::new(()),
             holder: Mutex::new(None),
         }
@@ -283,7 +283,7 @@ impl LocalSources {
             let object = written_member(&self.objects, actor, file)?;
             fs::create_dir_all(target.parent().expect("a file inside the tree"))?;
             let incoming = home.join(".incoming");
-            fs::copy(self.store.path(&object).map_err(crate::storage::io_error)?, &incoming)?;
+            fs::copy(self.cas.path(&object)?, &incoming)?;
             platform::durable::set_mode(&incoming, if file.executable { 0o755 } else { 0o644 }).map_err(std::io::Error::from)?;
             fs::rename(&incoming, &target)?;
         }
@@ -352,7 +352,7 @@ impl LocalSources {
                     return Err(refused("local_source_invalid", format!("{:?} is not a wheel file name", wheel.name)));
                 }
                 let object = written_member(&self.objects, actor, wheel)?;
-                fs::copy(self.store.path(&object).map_err(crate::storage::io_error)?, carried.join(&wheel.name))?;
+                fs::copy(self.cas.path(&object)?, carried.join(&wheel.name))?;
                 wheels.push(carried.join(&wheel.name));
             }
         }
@@ -492,13 +492,13 @@ impl LocalSources {
         let requirements = match &manifest.requirements {
             Some(m) => {
                 let object = member(m)?;
-                fs::read(self.store.path(&object).map_err(crate::storage::io_error)?)?
+                fs::read(self.cas.path(&object)?)?
             }
             None => Vec::new(),
         };
         let (source_name, mut files) = match &manifest.source {
             Some(source) => ("source.tar".to_string(), vec![UploadedFile::held(
-                "source.tar".into(), &member(source)?, self.store.clone(),
+                "source.tar".into(), &member(source)?, self.cas.clone(),
             )]),
             None => (String::new(), vec![]),
         };
@@ -512,7 +512,7 @@ impl LocalSources {
             files.push(UploadedFile::held(
                 wheel.name.clone(),
                 &member(wheel)?,
-                self.store.clone(),
+                self.cas.clone(),
             ));
         }
         let uploaded = UploadedPackage {
@@ -592,7 +592,7 @@ mod tests {
     struct Machine {
         root: PathBuf,
         service: Arc<Service>,
-        store: Arc<Store>,
+        cas: Cas,
         objects: Arc<Objects>,
         installer: InstallerConfig,
     }
@@ -615,10 +615,8 @@ mod tests {
         ]));
         let state = root.join("state");
         let service = Service::open(&state, &root.join("generations"), 1).unwrap();
-        let store = crate::storage::open(&state.join("tensorfs")).unwrap();
-        let objects = Arc::new(
-            Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
-        );
+        let cas = service.engine.cas();
+        let objects = Arc::new(Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
         let installer = InstallerConfig {
             helper_python: helper.into(),
             helper_engine: None,
@@ -631,7 +629,7 @@ mod tests {
             seed_cache: None,
             runtime_build: String::new(),
         };
-        Machine { root, service, store, objects, installer }
+        Machine { root, service, cas, objects, installer }
     }
 
     /// The fixtures' author surface needs the Runtime of this cohort: a dev wheel
@@ -734,9 +732,9 @@ mod tests {
     /// The real installer from objects the signer wrote; the same manifest reopens it.
     #[test]
     fn a_written_local_package_reuses_its_environment() {
-        let Machine { root, service, store, objects, installer } = machine("cm-local");
+        let Machine { root, service, objects, installer, .. } = machine("cm-local");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let sources = LocalSources::new(objects.clone(), installer, store);
+        let sources = LocalSources::new(objects.clone(), installer);
         let fixture = repo.join("tests/fixtures/cpu_input");
         let tree = archive(&fixture, &["pyproject.toml", "package.toml", "cpu_input/__init__.py"]);
         let source = write(&objects, "alice", &tree);
@@ -775,7 +773,7 @@ mod tests {
     #[test]
     fn remote_edits_keep_prior_sources_and_direct_paths_stay_live() {
         let m = machine("cm-live");
-        let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
+        let sources = LocalSources::new(m.objects.clone(), m.installer.clone());
         let project = m.root.join("project");
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_input");
         fs::create_dir_all(project.join("cpu_input")).unwrap();
@@ -904,7 +902,7 @@ mod tests {
         }
 
         let m = machine("cm-live-libraries");
-        let sources = LocalSources::new(m.objects.clone(), m.installer.clone(), m.store.clone());
+        let sources = LocalSources::new(m.objects.clone(), m.installer.clone());
         let project = m.root.join("project");
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         fs::create_dir_all(project.join("cpu_input")).unwrap();
@@ -953,7 +951,7 @@ mod tests {
         // missing object before acceptance; doing so reopens the exact existing generation.
         let old = write(&m.objects, "alice", b"VALUE = 'old-code'\n");
         let old_object = ObjectRef { sha256: old.digest.trim_start_matches("sha256:").into(), length: 19 };
-        let old_path = m.store.path(&old_object).unwrap();
+        let old_path = m.cas.path(&old_object).unwrap();
         fs::remove_file(old_path).unwrap();
         assert_eq!(sources.written("alice", &first).unwrap_err().code, "local_source_incomplete");
         write(&m.objects, "alice", b"VALUE = 'old-code'\n");
@@ -968,7 +966,7 @@ mod tests {
     #[test]
     fn a_live_tree_carries_the_locked_wheels_its_machine_cannot_fetch() {
         let m = machine("cm-carried");
-        let sources = LocalSources::new(m.objects.clone(), current_runtime(&m.installer), m.store.clone());
+        let sources = LocalSources::new(m.objects.clone(), current_runtime(&m.installer));
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let (project, index) = (m.root.join("project"), m.root.join("index"));
         fs::create_dir_all(project.join("cpu_caller")).unwrap();
@@ -1018,7 +1016,7 @@ mod tests {
             }
         }
         let m = machine("cm-indexes");
-        let sources = LocalSources::new(m.objects.clone(), current_runtime(&m.installer), m.store.clone());
+        let sources = LocalSources::new(m.objects.clone(), current_runtime(&m.installer));
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let (project, served) = (m.root.join("project"), m.root.join("served"));
         fs::create_dir_all(project.join("cpu_caller")).unwrap();
@@ -1073,7 +1071,7 @@ mod tests {
     #[test]
     fn an_edited_path_dependency_is_built_again() {
         let m = machine("cm-beside");
-        let sources = LocalSources::new(m.objects.clone(), current_runtime(&m.installer), m.store.clone());
+        let sources = LocalSources::new(m.objects.clone(), current_runtime(&m.installer));
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let project = m.root.join("live");
         for (fixture, to) in [("cpu_caller", ""), ("cpu_memo", "deps/cpu_memo")] {
@@ -1118,7 +1116,6 @@ mod tests {
         let sources = LocalSources::new(
             m.objects.clone(),
             InstallerConfig { seed_cache: Some(seed.clone()), ..m.installer.clone() },
-            m.store.clone(),
         );
         // As `cozy run ./dir` captures it: the project's wheel and its locked requirements.
         let fixture = repo.join("tests/fixtures/cpu_input");
@@ -1147,7 +1144,6 @@ mod tests {
         let sources = LocalSources::new(
             m.objects.clone(),
             InstallerConfig { seed_cache: Some(seed.clone()), ..current_runtime(&m.installer) },
-            m.store.clone(),
         );
         let wheel_of = |fixture: &str| {
             let out = m.root.join(fixture);
@@ -1205,18 +1201,19 @@ mod tests {
         let _ = fs::remove_dir_all(m.root);
     }
 
-    /// A package pinning a vendored dev Runtime (how unreleased Runtime code is tested; it is
-    /// never published) runs that Runtime where the machine's own pair is refused by its pin, and
-    /// every run says so. Both capture shapes the CLI sends; runs 5252/5274/5276 failed here.
+    /// A package whose lock holds another Runtime than the machine's (here a vendored dev build,
+    /// pinned exactly) runs on the machine's own pair: version skew is allowed. uv's check of its
+    /// pin is the run's warning, never a refusal (card I: an old-pair lock refused, runs
+    /// 12795-12810). A dev Runtime is a machine's through `--runtime-wheel`. Every capture shape
+    /// the CLI sends.
     #[test]
-    fn a_vendored_dev_runtime_runs_where_its_pin_refuses_the_machine_pair() {
+    fn a_lock_of_another_runtime_runs_on_the_machines_pair_with_a_warning() {
         let m = machine("cm-vendored");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let pair = sdk_pair(&m.root);
         let sources = LocalSources::new(
             m.objects.clone(),
             InstallerConfig { sdk: pair.clone(), ..m.installer.clone() },
-            m.store.clone(),
         );
         let project = m.root.join("project");
         let fixture = repo.join("tests/fixtures/cpu_input");
@@ -1270,18 +1267,19 @@ mod tests {
         for digest in [source, carried, live] {
             let installed = sources.install(&m.service, "alice", &digest, None, "", &|_| ()).unwrap();
             let held = m.service.catalog.resolve(&installed.generation).unwrap();
-            let versions = installed_sdk(&held.record.python);
-            assert!(versions.starts_with(&format!("{dev} ")), "{versions}");
+            assert_eq!(installed_sdk(&held.record.python), format!("{runtime} {}", wheel_version(&pair[1])));
             let why = &held.record.sdk_fallback;
-            assert!(why.contains(&format!("requires `cozy-runtime=={dev}`, but `{runtime}` is installed")), "{why}");
-            assert!(why.ends_with(&format!("it runs the package's own cozy-runtime=={dev}, tensorfs=={}", &versions[dev.len() + 1..])), "{why}");
+            assert!(why.starts_with("uv pip check: ") && why.contains(&format!("requires `cozy-runtime=={dev}`, but `{runtime}` is installed")), "{why}");
+            run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_input"]));
         }
 
-        // A refusal carries its reason: a typed one as itself, a failed operation in uv's words.
-        let refused = |digest: &str| sources.install(&m.service, "alice", digest, None, "", &|_| ()).err().unwrap().message;
+        // Without its vendored wheel it installs all the same: the machine's pair stands in for it.
         let absent = manifest(serde_json::json!({"source": member("source.tar", &archive(&project, &files))}));
-        let why = refused(&absent);
-        assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains(&format!("vendor/cozy_runtime-{runtime}")), "{why}");
+        let installed = sources.install(&m.service, "alice", &absent, None, "", &|_| ()).unwrap();
+        let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        assert_eq!(installed_sdk(&held.record.python), format!("{runtime} {}", wheel_version(&pair[1])));
+        // A refusal carries its reason, a typed one as itself.
+        let refused = |digest: &str| sources.install(&m.service, "alice", digest, None, "", &|_| ()).err().unwrap().message;
         let python = manifest(serde_json::json!({"source": member("source.tar", &tree), "python_requires": ">=4"}));
         let why = refused(&python);
         assert!(why.starts_with("package_python_unavailable: configured interpreter does not satisfy"), "{why}");
@@ -1306,7 +1304,6 @@ mod tests {
         let sources = LocalSources::new(
             m.objects.clone(),
             InstallerConfig { sdk: vec![wheel, pair[1].clone()], runtime_build: build.clone(), ..m.installer.clone() },
-            m.store.clone(),
         );
         // An unlocked project, as the CLI makes of a script, pinned to PyPI's Runtime.
         let project = m.root.join("project");
@@ -1325,7 +1322,7 @@ mod tests {
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         assert_eq!(installed_sdk(&held.record.python), format!("{dev} {}", wheel_version(&pair[1])));
         assert_eq!(held.record.sdk_fallback, format!(
-            "The package `tensord-cpu-input` requires `cozy-runtime=={runtime}`, but `{dev}` is installed; \
+            "uv pip check: The package `tensord-cpu-input` requires `cozy-runtime=={runtime}`, but `{dev}` is installed; \
              this machine's development Runtime {build} (`--runtime-wheel`) runs it regardless"));
         let _ = fs::remove_dir_all(&m.root);
     }

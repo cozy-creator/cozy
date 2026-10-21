@@ -1,5 +1,5 @@
 //! `tfs export --gguf`: every GGUF a checkpoint was imported from, rebuilt from its record
-//! (`<file>.json`, `import::gguf`): the KV and tensor infos in the source's order, then each
+//! (`<file>.json`, an asset of its component, `import::gguf`): the KV and tensor infos in the source's order, then each
 //! tensor's bytes from its stored parts (concatenated, llama's Q/K rows re-permuted), padded to
 //! the alignment as llama.cpp and gguf-py write them.
 
@@ -7,25 +7,29 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::client::io;
+use super::io;
 use crate::failure::{fail, Kind, Result};
 use crate::format::decode::gguf::Type;
 use crate::format::Body;
 use crate::import::gguf::{self, Meta};
-use crate::store2::Checkpoint;
+use crate::import::ROOT_COMPONENT;
+use crate::store::Checkpoint;
 
 /// Writes each GGUF of `ck` into `dir`; the paths written, relative.
 pub fn gguf(ck: &Checkpoint, dir: &Path) -> Result<Vec<String>> {
-    let records: Vec<String> = (ck.manifest().files.keys())
-        .filter(|p| p.to_ascii_lowercase().ends_with(".gguf.json"))
-        .cloned()
+    let records: Vec<(&str, &str, String)> = (ck.header().assets())
+        .filter(|(_, name, _)| name.to_ascii_lowercase().ends_with(".gguf.json"))
+        .map(|(c, name, _)| match (ck.header().pipeline(), c) {
+            (None, ROOT_COMPONENT) => (c, name, name.to_owned()),
+            _ => (c, name, format!("{c}/{name}")),
+        })
         .collect();
     if records.is_empty() {
         return fail(Kind::Invalid, "the checkpoint was not imported from a GGUF");
     }
     let mut written = Vec::new();
-    for record in records {
-        let meta: Meta = match serde_json::from_slice(&ck.file(&record)?) {
+    for (component, name, record) in records {
+        let meta: Meta = match serde_json::from_slice(&ck.asset(component, name)?) {
             Ok(meta) => meta,
             Err(e) => return fail(Kind::Invalid, format!("{record}: {e}")),
         };

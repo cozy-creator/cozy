@@ -13,7 +13,7 @@ impl Area {
     fn uploads(&self) -> Arc<WorkspaceUploads> {
         WorkspaceUploads::open(
             &self.0.join("uploads"),
-            tensord::storage::open(&self.0.join("store")).unwrap(),
+            tensord::cas::Cas::new(self.0.join("objects")),
         )
         .unwrap()
     }
@@ -148,7 +148,7 @@ fn resumed_prefix_is_durable_owner_scoped_and_root_descriptor_immutable() {
 }
 
 #[test]
-fn source_archive_is_statically_inspected_and_imported_into_tensorfs() {
+fn source_archive_is_statically_inspected_and_held() {
     let area = Area::new();
     let uploads = area.uploads();
     let bytes = archive("fixture.py", tar::EntryType::file());
@@ -173,8 +173,8 @@ fn source_archive_is_statically_inspected_and_imported_into_tensorfs() {
         .read_to_end(&mut read)
         .unwrap();
     assert_eq!(read, bytes);
-    let native = tensord::storage::open(&area.0.join("store")).unwrap();
-    assert!(tensord::storage::present(&native, &package.files[0].object.reference()));
+    let held = tensord::cas::Cas::new(area.0.join("objects"));
+    assert!(held.reuse(&package.files[0].object.reference()).unwrap());
     assert_eq!(package.root.source_archive, "source.tar");
     uploads
         .release_after_install(actor(1), "static-source")

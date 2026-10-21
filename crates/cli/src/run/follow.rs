@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use protocol::{
     calcifer::{
         Adjustment, Event, Machine, MachineState, On, OutputItem, Progress, Run, RunQuote, Status,
@@ -17,7 +18,6 @@ use protocol::{
     },
     error::{Error, Kind},
 };
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::{
     Context,
@@ -253,16 +253,13 @@ pub(crate) fn record(ctx: &Context, run: &Run) {
     next(ctx, run);
 }
 
-/// A checkpoint as a record shows it: its digest, the machine it stays on, and how to publish it.
-fn checkpoint(run: &Run, item: &OutputItem) -> String {
-    let digest = item
-        .sha256
-        .map_or_else(|| "not final yet".into(), |d| d.to_string());
-    let on = run.machine.as_deref().unwrap_or("its machine");
-    format!(
-        "checkpoint {digest} on {on} (`cozy run upload {}#{} <org/model>`)",
-        run.number, item.name
-    )
+/// A checkpoint's TensorFS reference, or the location of its legacy manifest bytes.
+fn checkpoint(reference: &protocol::machine::CheckpointRef) -> String {
+    let mut shown = format!("checkpoint {}@{}", reference.repo_id, reference.revision);
+    if !reference.variant.is_empty() {
+        let _ = write!(shown, " (variant {})", reference.variant);
+    }
+    shown
 }
 
 /// The record's fields, for a person.
@@ -280,10 +277,13 @@ pub(super) fn fields(ctx: &Context, run: &Run) -> output::Record {
     }
     if let Some(reason) = &run.reason {
         record = record.field("reason", format!("{} ({})", reason.message, reason.code));
+        if !reason.detail.is_empty() {
+            record = record.field("traceback", &reason.detail);
+        }
     }
     for item in &run.output {
         let shown = match (&item.path, &item.export_error) {
-            _ if item.is_checkpoint() => checkpoint(run, item),
+            _ if let Some(reference) = &item.checkpoint => checkpoint(reference),
             (Some(path), _) => output::link(ctx, path),
             (None, Some(error)) => format!("not saved: {error}"),
             (None, None) => output::bytes(item.length),
@@ -487,13 +487,10 @@ impl View {
             Event::OutputDone { item, .. } => {
                 if let Some(error) = &item.export_error {
                     self.line(&format!("  {}  not saved: {error}", item_name(item)));
-                } else if item.is_checkpoint() && self.named.insert(item.id.clone()) {
-                    let on = self.machine.as_deref().unwrap_or("its machine");
-                    let digest = item.sha256.map(|d| d.to_string()).unwrap_or_default();
-                    self.line(&format!(
-                        "  {}  checkpoint {digest} on {on}",
-                        item_name(item)
-                    ));
+                } else if let Some(reference) = &item.checkpoint
+                    && self.named.insert(item.id.clone())
+                {
+                    self.line(&format!("  {}  {}", item_name(item), checkpoint(reference)));
                 }
             }
             Event::Log { level, text, .. } if !matches!(level.as_str(), "info" | "debug") => {
@@ -626,10 +623,7 @@ fn rate(moving: &mut (String, VecDeque<(Instant, u64)>), stage: &str, done: u64,
 
 #[cfg(test)]
 mod tests {
-    use protocol::{
-        calcifer::{CHECKPOINT, ItemStatus},
-        ids::RunId,
-    };
+    use protocol::{calcifer::ItemStatus, ids::RunId};
 
     use super::*;
 
@@ -654,6 +648,7 @@ mod tests {
                 sha256: None,
                 path: path.map(Into::into),
                 export_error: error.map(Into::into),
+                checkpoint: None,
             })
             .collect();
         run
@@ -682,13 +677,41 @@ mod tests {
                 false,
                 false,
             ),
-            (("fp8", CHECKPOINT, None, None), false, true),
+            (("fp8", "", None, None), false, true),
             (("image", image, None, None), true, false),
         ];
         for (output, owes, saves) in cases {
-            let run = run(&[output]);
+            let mut run = run(&[output]);
+            if output.0 == "fp8" {
+                run.output[0].checkpoint = Some(protocol::machine::CheckpointRef {
+                    repo_id: "local/derived".into(),
+                    revision: "sha256:tree".into(),
+                    variant: "fp8".into(),
+                    ..Default::default()
+                });
+            }
             assert_eq!(owed(&run), owes, "{output:?}");
             assert_eq!(saved(run).is_ok(), saves, "{output:?}");
         }
+    }
+
+    #[test]
+    fn a_tensorfs_checkpoint_is_shown_as_a_reference_without_a_byte_export() {
+        let mut run = run(&[("weights", "", None, None)]);
+        run.output[0].checkpoint = Some(protocol::machine::CheckpointRef {
+            repo_id: "local/derived".into(),
+            revision: "sha256:tree".into(),
+            variant: String::new(),
+            tag: String::new(),
+        });
+        assert!(!owed(&run));
+        let shown = |run: &Run| checkpoint(run.output[0].checkpoint.as_ref().unwrap());
+        assert_eq!(shown(&run), "checkpoint local/derived@sha256:tree");
+        run.output[0].checkpoint.as_mut().unwrap().variant = "fp8".into();
+        assert_eq!(
+            shown(&run),
+            "checkpoint local/derived@sha256:tree (variant fp8)"
+        );
+        assert!(saved(run).is_ok());
     }
 }

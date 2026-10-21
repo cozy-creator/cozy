@@ -6,10 +6,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use tensorfs::err::{Code, Result};
-use tensorfs::format::{Dtype, Encoding};
+use tensorfs::format::{ClassRef, Dtype, Encoding, Metadata, Value};
+use tensorfs::store::Checkpoint;
 use tensorfs::import::engine::{self, Ops, Reading, TensorReader};
 use tensorfs::import::source::{Group, SourceSet};
-use tensorfs::import::{self, Access, Imported, Part, Request, Sink};
+use tensorfs::import::{self, Access, Imported, Layout, Part, Request, Sink};
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tfs-import-{name}-{}", std::process::id()));
@@ -19,12 +20,20 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn vectors() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensorfs/vectors")
 }
 
 /// A safetensors file of `(key, dtype, shape, bytes)`.
 fn safetensors(path: &Path, tensors: &[(&str, &str, Vec<u64>, Vec<u8>)]) {
+    safetensors_with(path, tensors, serde_json::json!({}));
+}
+
+/// A safetensors file with `__metadata__` `metadata` (string values).
+fn safetensors_with(path: &Path, tensors: &[(&str, &str, Vec<u64>, Vec<u8>)], metadata: serde_json::Value) {
     let mut head = serde_json::Map::new();
+    if metadata.as_object().is_some_and(|m| !m.is_empty()) {
+        head.insert("__metadata__".into(), metadata);
+    }
     let mut data = Vec::new();
     for (key, dtype, shape, bytes) in tensors {
         let start = data.len();
@@ -66,11 +75,16 @@ struct Collect {
     tensors: Tensors,
     /// (component, key) in the order the import put them.
     order: Vec<(String, String)>,
-    files: BTreeMap<String, Vec<u8>>,
+    layout: Layout,
+    metadata: Metadata,
     imported: Option<Imported>,
 }
 
 impl Sink for Collect {
+    fn begin(&mut self, _: &str, layout: &Layout) -> Result<()> {
+        self.layout = layout.clone();
+        Ok(())
+    }
     fn put(
         &mut self,
         component: &str,
@@ -104,12 +118,8 @@ impl Sink for Collect {
         self.order.push((component.into(), key.into()));
         Ok(())
     }
-    fn file(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
-        self.files.insert(path.into(), bytes.to_vec());
-        Ok(())
-    }
-    fn commit(&mut self, imported: &Imported) -> Result<()> {
-        self.imported = Some(imported.clone());
+    fn commit(&mut self, metadata: Metadata) -> Result<()> {
+        self.metadata = metadata;
         Ok(())
     }
 }
@@ -117,18 +127,16 @@ impl Sink for Collect {
 fn run(tmp: &Path, sources: &[String], converter: Option<&str>) -> Result<Collect> {
     let mut sink = Collect::default();
     let access = Access::default();
-    import::import(
-        &Request {
-            sources,
-            converter,
-            variant: None,
-            access: &access,
-            tmp,
-            progress: &|_, _, _| {},
-            stop: None,
-        },
-        &mut sink,
-    )?;
+    let req = Request {
+        sources,
+        converter,
+        source_variant: None,
+        access: &access,
+        tmp,
+        progress: &|_, _, _| {},
+        stop: None,
+    };
+    sink.imported = Some(import::convert(&req, &mut sink)?);
     // Sources never outlive the import, and never land anywhere but its tmp area.
     assert_eq!(areas(tmp), 0);
     Ok(sink)
@@ -866,6 +874,138 @@ fn sdxl_lora_lands_on_the_canonical_modules() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A PEFT adapter folder: keys unwrapped to the base model's module names, `alpha_pattern` (and
+/// rsLoRA) folded into per-module `.alpha`, and `adapter_config.json` the component's config.
+#[test]
+fn a_peft_adapter_becomes_module_keys_and_its_config() {
+    let dir = scratch("peft-lora");
+    let folder = dir.join("in/adapter");
+    let factors = |rank: u64| {
+        let mut t = Vec::new();
+        for (m, r) in [("blocks.0.attn.to_q", rank), ("blocks.0.attn.to_k", 4)] {
+            t.push((format!("base_model.model.{m}.lora_A.weight"), "F32", vec![r, 8], f32s(r * 8, 1)));
+            t.push((format!("base_model.model.{m}.lora_B.weight"), "F32", vec![8, r], f32s(8 * r, 2)));
+        }
+        t
+    };
+    let write = |config: serde_json::Value| {
+        let t = factors(2);
+        let views: Vec<_> = t.iter().map(|(k, d, s, b)| (k.as_str(), *d, s.clone(), b.clone())).collect();
+        safetensors(&folder.join("adapter_model.safetensors"), &views);
+        fs::write(folder.join("adapter_config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    };
+    let sources = [folder.display().to_string()];
+    let config = serde_json::json!({
+        "peft_type": "LORA", "r": 2, "lora_alpha": 4, "base_model_name_or_path": "acme/base",
+        "target_modules": ["to_q", "to_k"], "rank_pattern": {"to_k": 4}, "alpha_pattern": {"attn.to_k": 16},
+    });
+    write(config.clone());
+    let out = run(&dir.join("tmp"), &sources, None).unwrap();
+    let keys: Vec<&str> = out.order.iter().map(|(_, k)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        [
+            "blocks.0.attn.to_q.lora_A.weight",
+            "blocks.0.attn.to_q.lora_B.weight",
+            "blocks.0.attn.to_k.lora_A.weight",
+            "blocks.0.attn.to_k.lora_B.weight",
+            "blocks.0.attn.to_k.alpha",
+        ]
+    );
+    let alpha = |out: &Collect, m: &str| out.tensors.get(&("model".into(), format!("blocks.0.attn.{m}.alpha"))).cloned();
+    assert_eq!(alpha(&out, "to_k"), Some((Dtype::F32, vec![], 16f32.to_le_bytes().to_vec())));
+    assert_eq!(alpha(&out, "to_q"), None, "the config's lora_alpha applies");
+    let model = &out.layout.components[0];
+    assert_eq!((model.name.as_str(), model.config_file.as_deref()), ("model", Some("adapter_config.json")));
+    let mut want = config.as_object().unwrap().clone();
+    want.insert("rank_pattern".into(), serde_json::json!({}));
+    want.insert("alpha_pattern".into(), serde_json::json!({}));
+    assert_eq!(model.config, want);
+    assert!(model.assets.is_empty() && !out.layout.files.contains_key("adapter_config.json"));
+    let imported = out.imported.unwrap();
+    assert!(imported.normalized);
+    assert_eq!(imported.converters, ["peft.lora"]);
+
+    // rsLoRA's α/√r is α·√r over r: every module states it.
+    write(serde_json::json!({"peft_type": "LORA", "r": 2, "lora_alpha": 4, "use_rslora": true}));
+    let out = run(&dir.join("tmp"), &sources, None).unwrap();
+    assert_eq!(alpha(&out, "to_q").unwrap().2, (4.0 * 2f32.sqrt()).to_le_bytes().to_vec());
+    assert_eq!(alpha(&out, "to_k").unwrap().2, 8f32.to_le_bytes().to_vec());
+    assert_eq!(out.layout.components[0].config["use_rslora"], false);
+
+    for (config, code) in [
+        (serde_json::json!({"peft_type": "LORA", "use_dora": true}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LOHA"}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LORA", "alpha_pattern": {".*to_k": 2}}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LORA", "alpha_pattern": {"to_k": 2, "attn.to_k": 3}}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LORA", "lora_alpha": "4"}), Code::WRONG_TYPE),
+    ] {
+        write(config.clone());
+        assert_eq!(run(&dir.join("tmp"), &sources, None).err().unwrap().code, code, "{config}");
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The header-level rules a migration shares: PEFT's key spelling and its adapter config.
+#[test]
+fn lora_keys_and_adapter_configs_follow_one_rule() {
+    use tensorfs::import::lora::{adapter_config, peft_key};
+    for (key, want) in [
+        ("lora_unet_x.lora_down.weight", Some("lora_unet_x.lora_A.weight")),
+        ("lora_unet_x.lora_up", Some("lora_unet_x.lora_B.weight")),
+        ("base_model.model.a.b.lora_A.default.weight", Some("a.b.lora_A.weight")),
+        ("a.b.lora_B.weight", Some("a.b.lora_B.weight")),
+        ("base_model.model.a.alpha", Some("a.alpha")),
+        ("a.lora_B.bias", None),
+        ("a.weight", None),
+    ] {
+        assert_eq!(peft_key(key).as_deref(), want, "{key}");
+    }
+    let none = BTreeMap::new();
+    let mixed = [("a".to_owned(), 4), ("b".to_owned(), 8), ("c".to_owned(), 4)];
+    assert_eq!(
+        serde_json::Value::Object(adapter_config(mixed.clone(), &none, None, Some("acme/base"))),
+        serde_json::json!({"peft_type": "LORA", "r": 4, "target_modules": ["a", "b", "c"],
+                           "base_model_name_or_path": "acme/base"}),
+        "ranks differ: no lora_alpha, each module's own r is its α"
+    );
+    let source = serde_json::json!({"lora_alpha": 16, "r": 8, "base_model_name_or_path": "x"});
+    let config = adapter_config(mixed, &none, source.as_object(), None);
+    assert_eq!((&config["lora_alpha"], &config["r"], &config["base_model_name_or_path"]), (&16.into(), &8.into(), &"x".into()));
+    let uniform = adapter_config([("a".to_owned(), 2)], &none, None, None);
+    assert_eq!(uniform["lora_alpha"], 2);
+}
+
+/// Kohya's training metadata is PEFT's config of each LoRA component; its `.alpha` stays.
+#[test]
+fn a_kohya_lora_maps_its_metadata_to_the_adapter_config() {
+    let dir = scratch("kohya-config");
+    let file = dir.join("in/eyes.safetensors");
+    let stem = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn2_to_k";
+    safetensors_with(
+        &file,
+        &[
+            (&format!("{stem}.lora_down.weight"), "F32", vec![4, 2048], f32s(4 * 2048, 4)),
+            (&format!("{stem}.lora_up.weight"), "F32", vec![640, 4], f32s(640 * 4, 3)),
+            (&format!("{stem}.alpha"), "F32", vec![], 2f32.to_le_bytes().to_vec()),
+        ],
+        serde_json::json!({"ss_network_dim": "4", "ss_network_alpha": "2.5", "ss_sd_model_name": "sd_xl_base_1.0.safetensors"}),
+    );
+    let out = run(&dir.join("tmp"), &[file.display().to_string()], None).unwrap();
+    let unet = out.layout.components.iter().find(|c| c.name == "unet").unwrap();
+    assert_eq!(unet.config_file.as_deref(), Some("adapter_config.json"));
+    assert_eq!(
+        serde_json::Value::Object(unet.config.clone()),
+        serde_json::json!({
+            "peft_type": "LORA", "r": 4, "lora_alpha": 2.5, "base_model_name_or_path": "sd_xl_base_1.0.safetensors",
+            "target_modules": ["down_blocks.1.attentions.0.transformer_blocks.0.attn2.to_k"],
+        })
+    );
+    let module = "down_blocks.1.attentions.0.transformer_blocks.0.attn2.to_k";
+    assert_eq!(out.tensors[&("unet".into(), format!("{module}.alpha"))].2, 2f32.to_le_bytes().to_vec());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 /// network: Hugging Face.
 #[test]
 fn a_tiny_hf_sdxl_imports_end_to_end() {
@@ -881,23 +1021,45 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
         components.into_iter().collect::<Vec<_>>(),
         ["text_encoder", "text_encoder_2", "unet", "vae"]
     );
-    for file in [
-        "model_index.json",
-        "unet/config.json",
-        "scheduler/scheduler_config.json",
-        "tokenizer/vocab.json",
-        "text_encoder_2/config.json",
-    ] {
-        assert!(
-            out.files.contains_key(file),
-            "{file}: {:?}",
-            out.files.keys().collect::<Vec<_>>()
-        );
-    }
-    assert!(!out
-        .files
-        .keys()
-        .any(|f| f.contains(".safetensors") || f.ends_with(".bin") || f.ends_with(".onnx")));
+    // D10: the pipeline, every component with its class, config and run files; README and
+    // .gitattributes are repo files.
+    let layout = &out.layout;
+    let pipeline = layout.pipeline.as_ref().unwrap();
+    // Each class's version is its own config's; the tokenizers record none and take their
+    // library's from the text encoders.
+    assert_eq!(pipeline.class, ClassRef::new("diffusers", "0.25.0", "StableDiffusionXLPipeline"));
+    let classes: Vec<(&str, [&str; 3], Option<&str>)> = (layout.components.iter())
+        .map(|c| {
+            let class = [c.class.library.as_str(), &c.class.version, &c.class.name];
+            (c.name.as_str(), class, c.config_file.as_deref())
+        })
+        .collect();
+    let (d, t) = (["diffusers", "0.25.0"], ["transformers", "4.36.2"]);
+    assert_eq!(
+        classes,
+        [
+            ("text_encoder", [t[0], t[1], "CLIPTextModel"], None),
+            ("text_encoder_2", [t[0], t[1], "CLIPTextModelWithProjection"], None),
+            ("unet", [d[0], d[1], "UNet2DConditionModel"], None),
+            ("vae", [d[0], d[1], "AutoencoderKL"], None),
+            ("scheduler", [d[0], d[1], "DDIMScheduler"], Some("scheduler_config.json")),
+            ("tokenizer", [t[0], t[1], "CLIPTokenizer"], Some("tokenizer_config.json")),
+            ("tokenizer_2", [t[0], t[1], "CLIPTokenizer"], Some("tokenizer_config.json")),
+        ]
+    );
+    let tokenizer = &layout.components[5];
+    assert_eq!(
+        tokenizer.assets.keys().collect::<Vec<_>>(),
+        ["merges.txt", "special_tokens_map.json", "vocab.json"]
+    );
+    assert_eq!(
+        layout.files.keys().collect::<Vec<_>>(),
+        [".gitattributes", "README.md"]
+    );
+    assert_eq!(
+        out.metadata["source"],
+        tensorfs::format::Value::Str(imported.sources[0].clone())
+    );
     // Bit-identical to the repository's own files, landed separately.
     let access = Access::default();
     let listing = import::remote::list(
@@ -967,6 +1129,117 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
 /// The generated references order a source's sorted keys into the constructor order that the
 /// converter tables (generated from the same classes' state_dict) list, for every SDXL and
 /// Anima component: two independent generators agree.
+/// network: Hugging Face. A pipeline's components take their library and class from
+/// `model_index.json` as written, even where the component's own config names another
+/// (`T5Tokenizer`, `architectures`) or none (a preprocessor config). A version is the config's
+/// own, else the model's for that library; `stable_diffusion` is a Diffusers pipeline module, so
+/// the safety checker is Diffusers' at the model's version.
+#[test]
+fn model_index_names_every_component_class() {
+    let dir = scratch("model-index-classes");
+    let classes = |repo: &str| {
+        let source = format!("hf://hf-internal-testing/{repo}");
+        let out = run(&dir.join("tmp"), &[source], None).unwrap();
+        (out.layout.components.iter())
+            .map(|c| (c.name.clone(), c.class.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let sd = classes("tiny-stable-diffusion-pipe-variants-all-kinds");
+    let class = ClassRef::new;
+    assert_eq!(sd["safety_checker"], class("diffusers", "0.15.0.dev0", "StableDiffusionSafetyChecker"));
+    assert_eq!(sd["feature_extractor"], class("transformers", "4.28.0.dev0", "CLIPFeatureExtractor"));
+    assert_eq!(sd["tokenizer"], class("transformers", "4.28.0.dev0", "CLIPTokenizer"));
+    let flux = classes("tiny-flux-pipe");
+    assert_eq!(flux["tokenizer_2"], class("transformers", "4.40.2", "T5TokenizerFast"));
+    assert_eq!(flux["text_encoder_2"], class("transformers", "4.40.2", "T5EncoderModel"));
+    assert_eq!(flux["scheduler"], class("diffusers", "0.30.0.dev0", "FlowMatchEulerDiscreteScheduler"));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A class's version: its own config's for its library, else another config's of the model,
+/// else the converter reference's, else `""`. No network.
+#[test]
+fn a_class_version_is_its_configs_else_the_models_else_the_references() {
+    let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+    let files = BTreeMap::from([
+        ("model_index.json".to_owned(), json(serde_json::json!({"_class_name": "P", "_diffusers_version": "0.30.0",
+            "unet": ["diffusers", "U"], "text_encoder": ["transformers", "T"], "tokenizer": ["transformers", "K"],
+            "safety_checker": ["stable_diffusion", "S"]}))),
+        ("unet/config.json".to_owned(), json(serde_json::json!({"_diffusers_version": "0.31.0"}))),
+        ("text_encoder/config.json".to_owned(), json(serde_json::json!({"transformers_version": null}))),
+        ("tokenizer/tokenizer_config.json".to_owned(), json(serde_json::json!({}))),
+        ("safety_checker/config.json".to_owned(), json(serde_json::json!({}))),
+    ]);
+    let tensored = ["unet".to_owned(), "text_encoder".to_owned(), "safety_checker".to_owned()];
+    let classes = |reference: &import::Versions| {
+        let layout = import::layout(files.clone(), &tensored, reference).unwrap();
+        let mut out = vec![layout.pipeline.unwrap().class];
+        out.extend(layout.components.into_iter().map(|c| c.class));
+        out
+    };
+    let c = ClassRef::new;
+    let reference = import::Versions::from([("transformers".into(), "4.40.0".into())]);
+    assert_eq!(classes(&reference), [
+        c("diffusers", "0.30.0", "P"),
+        c("diffusers", "0.31.0", "U"),
+        c("transformers", "4.40.0", "T"),
+        c("diffusers", "0.30.0", "S"),
+        c("transformers", "4.40.0", "K"),
+    ]);
+    assert_eq!(classes(&Default::default())[2], c("transformers", "", "T"));
+    // A pair's library is itself when installed (a version some config records), else a
+    // Diffusers pipeline module.
+    let versions = import::Versions::from([("diffusers".into(), "0.35.1".into()), ("acme".into(), "2.0".into())]);
+    let pair = |library, name| import::class_of(library, name, &versions, true);
+    assert_eq!(pair("kandinsky", "K"), c("diffusers", "0.35.1", "K"));
+    assert_eq!(pair("acme", "A"), c("acme", "2.0", "A"));
+    assert_eq!(pair("transformers", "T"), c("transformers", "", "T"));
+    // A dotted library is a module path of a package library: its top-level package.
+    assert_eq!(pair("minimax_h3.pipeline", "X"), c("minimax_h3", "", "X"));
+    assert_eq!(pair("acme.models.unet", "U"), c("acme", "2.0", "U"));
+    // Any other source keeps its library as written: an unknown one never becomes diffusers.
+    let other = |library, name| import::class_of(library, name, &versions, false);
+    assert_eq!(other("stable_diffusion", "S"), c("stable_diffusion", "", "S"));
+    assert_eq!(other("comfy", "Model"), c("comfy", "", "Model"));
+    assert_eq!(other("minimax_h3.pipeline", "X"), c("minimax_h3.pipeline", "", "X"));
+    assert_eq!(other("", "X"), ClassRef::default(), "no library is the unknown class");
+}
+
+/// network: Hugging Face (configs only, no weights). The same on the full-size repos.
+#[test]
+fn full_size_pipelines_take_model_index_classes() {
+    let access = Access::default();
+    let classes = |source: &str| {
+        let listing = import::remote::list(&import::remote::parse(source).unwrap(), &access).unwrap();
+        let members = import::remote::select(listing, None, import::remote::Files::All, &|m| {
+            import::remote::read_small(m, &access)
+        })
+        .unwrap();
+        let mut files = BTreeMap::new();
+        let mut tensored = Vec::new();
+        for m in &members {
+            let folder = m.path.rsplit_once('/').map_or("", |(f, _)| f).to_owned();
+            if import::remote::weights(&m.path) {
+                if !tensored.contains(&folder) {
+                    tensored.push(folder);
+                }
+            } else if m.length.unwrap_or(0) < 4 << 20 {
+                files.insert(m.path.clone(), import::remote::read_small(m, &access).unwrap());
+            }
+        }
+        let layout = import::layout(files, &tensored, &Default::default()).unwrap();
+        (layout.components.iter())
+            .map(|c| (c.name.clone(), c.class.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let sd = classes("hf://stable-diffusion-v1-5/stable-diffusion-v1-5");
+    let class = ClassRef::new;
+    assert_eq!(sd["safety_checker"], class("diffusers", "0.6.0", "StableDiffusionSafetyChecker"));
+    assert_eq!(sd["feature_extractor"], class("transformers", "4.22.0.dev0", "CLIPImageProcessor"));
+    let lite = classes("hf://Freepik/flux.1-lite-8B");
+    assert_eq!(lite["tokenizer_2"], class("transformers", "4.47.1", "T5TokenizerFast"));
+}
+
 #[test]
 fn references_reproduce_the_tables_constructor_order() {
     let class = |table: &str, component: &str| match (table, component) {
@@ -1218,11 +1491,14 @@ fn h3_native_real_bytes_equal_the_diffusers_packaging() {
 #[derive(Default)]
 struct Count {
     tensors: BTreeMap<(String, String), (Dtype, Vec<u64>)>,
-    files: Vec<String>,
-    imported: Option<Imported>,
+    layout: Layout,
 }
 
 impl Sink for Count {
+    fn begin(&mut self, _: &str, layout: &Layout) -> Result<()> {
+        self.layout = layout.clone();
+        Ok(())
+    }
     fn put(
         &mut self,
         component: &str,
@@ -1242,12 +1518,7 @@ impl Sink for Count {
         );
         Ok(())
     }
-    fn file(&mut self, path: &str, _: &[u8]) -> Result<()> {
-        self.files.push(path.into());
-        Ok(())
-    }
-    fn commit(&mut self, imported: &Imported) -> Result<()> {
-        self.imported = Some(imported.clone());
+    fn commit(&mut self, _: Metadata) -> Result<()> {
         Ok(())
     }
 }
@@ -1266,20 +1537,16 @@ fn a_single_file_sdxl_becomes_the_upstream_layout() {
     let access = Access::default();
     let sources = [file.display().to_string()];
     let tmp = dir.join("tmp");
-    import::import(
-        &Request {
-            sources: &sources,
-            converter: None,
-            variant: None,
-            access: &access,
-            tmp: &tmp,
-            progress: &|_, _, _| {},
-            stop: None,
-        },
-        &mut sink,
-    )
-    .unwrap();
-    let imported = sink.imported.unwrap();
+    let req = Request {
+        sources: &sources,
+        converter: None,
+        source_variant: None,
+        access: &access,
+        tmp: &tmp,
+        progress: &|_, _, _| {},
+        stop: None,
+    };
+    let imported = import::convert(&req, &mut sink).unwrap();
     assert!(imported.normalized);
     assert_eq!(imported.converters, ["sdxl.single_file"]);
     for (component, banked) in [
@@ -1312,21 +1579,25 @@ fn a_single_file_sdxl_becomes_the_upstream_layout() {
             .collect();
         assert_eq!(got, want, "{component}");
     }
-    sink.files.sort();
-    for file in [
-        "model_index.json",
-        "scheduler/scheduler_config.json",
-        "text_encoder/config.json",
-        "tokenizer_2/vocab.json",
-        "unet/config.json",
-        "vae/config.json",
-    ] {
-        assert!(
-            sink.files.iter().any(|f| f == file),
-            "{file}: {:?}",
-            sink.files
-        );
+    // The reference fills the pipeline, the configs and the tokenizers, and says so.
+    let layout = &sink.layout;
+    assert_eq!(
+        layout.pipeline.as_ref().unwrap().class,
+        ClassRef::new("diffusers", "0.19.0.dev0", "StableDiffusionXLPipeline")
+    );
+    let folders: BTreeMap<&str, &import::Folder> =
+        layout.components.iter().map(|c| (c.name.as_str(), c)).collect();
+    let unet = ClassRef::new("diffusers", "0.19.0.dev0", "UNet2DConditionModel");
+    assert_eq!(folders["unet"].class, unet);
+    let tokenizer = ClassRef::new("transformers", "4.32.0.dev0", "CLIPTokenizer");
+    assert_eq!(folders["tokenizer_2"].class, tokenizer, "the text encoders' version");
+    assert_eq!(folders["scheduler"].config_file.as_deref(), Some("scheduler_config.json"));
+    assert!(folders["tokenizer_2"].assets.contains_key("vocab.json"));
+    for c in ["text_encoder", "unet", "vae"] {
+        assert!(!folders[c].config.is_empty() && folders[c].config_file.is_none(), "{c}");
     }
+    let (from, files) = &imported.filled[0];
+    assert!(from.starts_with("hf://") && files.iter().any(|f| f == "unet/config.json"));
     assert_eq!(areas(&tmp), 0);
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -1396,99 +1667,6 @@ fn sources_parse_and_pin() {
     );
 }
 
-/// Each reference against the owner's real v1 lanes (read-only), whose headers keep the
-/// construction order their producer wrote: from a lane's keys sorted (as a safetensors file
-/// lists them), the class's reference restores the lane's order (weight before bias, blocks by
-/// number) for every key it holds. Keys the reference lacks (v1 names that differ from
-/// upstream's) are counted, not ordered.
-#[test]
-#[ignore = "reads the owner's ~/.tensorfs v1 lanes"]
-fn references_match_real_lanes() {
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".tensorfs");
-    let blob = |sha: &str| {
-        fs::read(
-            home.join("blobs")
-                .join(&sha[..2])
-                .join(&sha[2..4])
-                .join(sha),
-        )
-        .unwrap()
-    };
-    let mut held = 0;
-    // (lane, manifest prefix, the class of components whose config does not name one)
-    for (lane, prefix, unnamed) in [
-        ("sdxl", "77cac5a0f4a5", None),
-        ("anima bf16", "5d6a05188427", None),
-        ("qwen-image-2.1 int8", "e7c79ee942b8", None),
-        (
-            "qwen3.5-9b int8",
-            "e0f61ce1ab03",
-            Some("Qwen3_5ForConditionalGeneration"),
-        ),
-    ] {
-        let dir = home
-            .join("manifests")
-            .join(&prefix[..2])
-            .join(&prefix[2..4]);
-        let manifest = (fs::read_dir(&dir).unwrap().flatten())
-            .find(|e| e.file_name().to_string_lossy().starts_with(prefix))
-            .unwrap()
-            .path();
-        let doc: serde_json::Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
-        let entry = (doc["entries"].as_array().unwrap().iter())
-            .find(|e| e["kind"] == "cozytensors")
-            .unwrap();
-        let v1 =
-            tensorfs::header::Header::parse(&blob(entry["blob"]["sha256"].as_str().unwrap()))
-                .unwrap();
-        for (component, tensors) in &v1.components {
-            let class = (v1.configs.iter())
-                .find(|(name, _)| name == component)
-                .and_then(|(_, bytes)| {
-                    let config: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-                    let class = config
-                        .get("_class_name")
-                        .or_else(|| config.get("architectures")?.get(0));
-                    class?.as_str().map(str::to_owned)
-                })
-                .or(unnamed.map(str::to_owned));
-            let Some(class) = class
-                .clone()
-                .filter(|c| import::order::classes().any(|k| k == c))
-            else {
-                println!("{lane}/{component}: {class:?} has no reference");
-                continue;
-            };
-            let built: Vec<&str> = tensors.iter().map(|(k, _)| k.as_str()).collect();
-            let mut stored = built.clone();
-            stored.sort_unstable();
-            let keys: Vec<(&str, usize)> =
-                stored.iter().enumerate().map(|(i, k)| (*k, i)).collect();
-            let ordered = import::constructor_order(Some(&class), &keys);
-            let lacking: Vec<&str> = ordered.unknown.iter().map(|i| keys[*i].0).collect();
-            let got: Vec<&str> = (ordered.order.iter())
-                .map(|i| keys[*i].0)
-                .filter(|k| !lacking.contains(k))
-                .collect();
-            let want: Vec<&str> = built
-                .iter()
-                .copied()
-                .filter(|k| !lacking.contains(k))
-                .collect();
-            println!(
-                "{lane}/{component} ({class}): {} of {} keys held, order {}; lacking e.g. {:?}",
-                want.len(),
-                built.len(),
-                if got == want { "matches" } else { "DIFFERS" },
-                &lacking[..lacking.len().min(2)]
-            );
-            assert_eq!(got, want, "{lane}/{component}");
-            held += want.len();
-        }
-    }
-    assert!(held > 5000, "{held}");
-}
-
 /// Every file under `root`, by its path relative to `root`.
 fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
@@ -1511,144 +1689,178 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-/// network: Hugging Face. An import loses nothing an export can carry: four real repositories
-/// at pinned revisions (a Diffusers pipeline, a Transformers model with its tokenizer, a sharded
-/// model, a sharded fp16 variant imported as `fp16`) export with every non-weight file of the
-/// repository byte for byte, an index only of shards that exist, and their weights' data and
-/// `__metadata__`; and import is idempotent: the export, imported, has the same tensors, files
-/// and metadata, and exported and imported again, the same checkpoint.
+/// Every tensor of a safetensors file: key → (dtype, shape, bytes).
+fn safetensors_tensors(bytes: &[u8]) -> BTreeMap<String, (String, Vec<u64>, Vec<u8>)> {
+    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let head: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&bytes[8..8 + n]).unwrap();
+    (head.into_iter().filter(|(k, _)| k != "__metadata__"))
+        .map(|(k, t)| {
+            let at: Vec<usize> = serde_json::from_value(t["data_offsets"].clone()).unwrap();
+            let shape = serde_json::from_value(t["shape"].clone()).unwrap();
+            let data = bytes[8 + n + at[0]..8 + n + at[1]].to_vec();
+            (k, (t["dtype"].as_str().unwrap().to_owned(), shape, data))
+        })
+        .collect()
+}
+
+/// Every tensor of a folder's safetensors files: (folder, key) → (dtype, shape, bytes).
+type FolderTensor = (String, Vec<u64>, Vec<u8>);
+
+fn folder_tensors(files: &BTreeMap<String, Vec<u8>>) -> BTreeMap<(String, String), FolderTensor> {
+    let mut out = BTreeMap::new();
+    for (path, bytes) in files.iter().filter(|(p, _)| p.ends_with(".safetensors")) {
+        let folder = path.rsplit_once('/').map_or("", |(f, _)| f).to_owned();
+        for (key, t) in safetensors_tensors(bytes) {
+            assert!(out.insert((folder.clone(), key), t).is_none(), "{path}");
+        }
+    }
+    out
+}
+
+/// network: Hugging Face. Convert keeps everything an export can carry, in the D10 layout: four
+/// real repositories at pinned revisions (a Diffusers pipeline, a Transformers model with its
+/// tokenizer, a sharded model, a sharded fp16 variant) convert into a plain folder whose
+/// cozytensors holds the pipeline, configs and run files, and whose README and .gitattributes
+/// are repo files beside it. Exported, every repository file comes back: weights and assets and
+/// repo files byte-exact, configs equal as parsed JSON. Converting the export, and again its
+/// export, is a fixed point.
 #[test]
-fn an_import_survives_export() {
+fn a_convert_survives_export() {
     let access = Access::default();
+    // (repo, weights variant, files a current safetensors wrote: reproduced byte for byte; an
+    // older writer padded its header otherwise).
     let cases = [
-        ("hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2", None),
-        ("hf-internal-testing/tiny-random-LlamaForCausalLM@9fb191250dd56d0ba7ec9785a025ed29c03d5998", None),
-        ("hf-internal-testing/tiny-random-bert-sharded-safetensors@3157eb8d4addc30b6e95a8000f2e3f0f6114bf5a", None),
+        ("hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2", None, true),
+        ("hf-internal-testing/tiny-random-LlamaForCausalLM@9fb191250dd56d0ba7ec9785a025ed29c03d5998", None, true),
+        ("hf-internal-testing/tiny-random-bert-sharded-safetensors@3157eb8d4addc30b6e95a8000f2e3f0f6114bf5a", None, false),
         (
             "hf-internal-testing/tiny-stable-diffusion-pipe-variants-right-format@5017a45b0389efbe1710fe4cf6df15ec8237e49b",
             Some("fp16"),
+            false,
         ),
     ];
-    for (repo, variant) in cases {
+    for (repo, variant, current) in cases {
         let dir = scratch(&repo[..repo.find('@').unwrap()].replace('/', "-"));
-        let store = tensorfs::store2::Store::open(dir.join("store")).unwrap();
-        let tmp = dir.join("store").join("tmp");
-        let imported = |source: &str, variant: Option<&str>| {
+        let tmp = dir.join("tmp");
+        let convert = |source: &str, variant: Option<&str>, into: &Path| {
             let sources = [source.to_owned()];
             let req = Request {
                 sources: &sources,
                 converter: None,
-                variant,
+                source_variant: variant,
                 access: &access,
                 tmp: &tmp,
                 progress: &|_, _, _| {},
                 stop: None,
             };
-            store
-                .checkpoint(&store.import(&req, None).unwrap())
-                .unwrap()
+            let _ = fs::remove_dir_all(into);
+            let header = import::convert_folder(&req, into).unwrap();
+            let ck = Checkpoint::folder(into, None, None).unwrap();
+            assert_eq!(ck.id(), &header);
+            ck
         };
-        let out = dir.join("out");
-        let export = |ck: &tensorfs::store2::Checkpoint| {
-            let _ = fs::remove_dir_all(&out);
-            tensorfs::export::safetensors(ck, &out, None).unwrap();
-            tree(&out)
+        let export = |ck: &Checkpoint, folder: &Path, out: &Path| {
+            let repo: BTreeMap<String, PathBuf> = (tree(folder).into_keys())
+                .filter(|p| !p.starts_with("chunks/") && !p.ends_with(".cozytensors"))
+                .map(|p| (p.clone(), folder.join(p)))
+                .collect();
+            let _ = fs::remove_dir_all(out);
+            tensorfs::export::safetensors(ck, &repo, out, false).unwrap();
+            tree(out)
         };
         let source = format!("hf://{repo}");
-        let first = imported(&source, variant);
-        let exported = export(&first);
+        let first = convert(&source, variant, &dir.join("first"));
+        let header = first.header();
+        assert!(header.metadata["source"] == Value::Str(source.clone()), "{repo}");
+        // Repo files are the folder's, never the cozytensors'.
+        let folder = tree(&dir.join("first"));
+        assert!(folder.contains_key(".gitattributes"), "{repo}");
+        assert!(header.assets().all(|(_, name, _)| !name.contains("README") && name != ".gitattributes"));
+        let exported = export(&first, &dir.join("first"), &dir.join("out"));
 
-        // Every non-weight file of the repository, byte for byte; nothing else but weights.
-        let listing =
-            import::remote::list(&import::remote::parse(&source).unwrap(), &access).unwrap();
-        let other = |p: &str| {
-            [".bin", ".onnx", ".msgpack", ".h5"]
-                .iter()
-                .any(|e| p.ends_with(e))
-                || p.contains(".bin.index")
-        };
-        let mut files = BTreeMap::new();
-        for m in listing
-            .members
-            .iter()
-            .filter(|m| !m.path.contains(".safetensors") && !other(&m.path))
-        {
-            let local =
-                import::remote::land(m, &dir.join("upstream").join(&m.path), &access).unwrap();
-            files.insert(m.path.clone(), fs::read(local).unwrap());
+        // Upstream as selected: every non-weight file, and the weights convert takes.
+        let listing = import::remote::list(&import::remote::parse(&source).unwrap(), &access).unwrap();
+        let selected = import::remote::select(listing, variant, import::remote::Files::All, &|m| {
+            import::remote::read_small(m, &access)
+        })
+        .unwrap();
+        let mut upstream = BTreeMap::new();
+        for m in &selected {
+            let local = import::remote::land(m, &dir.join("upstream").join(&m.path), &access).unwrap();
+            upstream.insert(m.path.clone(), fs::read(local).unwrap());
         }
-        let kept: BTreeMap<String, Vec<u8>> = exported
-            .iter()
-            .filter(|(p, _)| !p.contains(".safetensors"))
-            .map(|(p, b)| (p.clone(), b.clone()))
+        let configs: Vec<String> = (header.pipeline().map(|_| "model_index.json".to_owned()))
+            .into_iter()
+            .chain(header.components().iter().filter(|c| !c.config.is_empty()).map(|c| {
+                match (header.pipeline(), c.name.as_str()) {
+                    (None, "model") => c.config_name().to_owned(),
+                    _ => format!("{}/{}", c.name, c.config_name()),
+                }
+            }))
             .collect();
-        assert_eq!(
-            kept.keys().collect::<Vec<_>>(),
-            files.keys().collect::<Vec<_>>(),
-            "{repo}"
-        );
-        assert!(kept == files, "{repo}: a file differs from upstream's");
-        // An index names only the shards written.
-        for (path, bytes) in exported
-            .iter()
-            .filter(|(p, _)| p.contains(".safetensors.index"))
-        {
-            let index: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-            let folder = path
-                .rsplit_once('/')
-                .map_or(String::new(), |(f, _)| format!("{f}/"));
-            for shard in index["weight_map"].as_object().unwrap().values() {
-                assert!(
-                    exported.contains_key(&format!("{folder}{}", shard.as_str().unwrap())),
-                    "{repo}: {path}"
-                );
-            }
-        }
-
-        // The export imports as the same tensors, files and metadata; again, as the same checkpoint.
-        let second = imported(out.to_str().unwrap(), None);
-        let tensors = |ck: &tensorfs::store2::Checkpoint| -> Tensors {
-            ck.tensors()
-                .map(|(c, t)| {
-                    (
-                        (c.to_owned(), t.key.clone()),
-                        (
-                            t.dtype.clone(),
-                            t.shape.clone(),
-                            ck.read(c, &t.key).unwrap(),
-                        ),
-                    )
-                })
+        let documents = |files: &BTreeMap<String, Vec<u8>>| -> BTreeMap<String, Vec<u8>> {
+            (files.iter().filter(|(p, _)| !p.contains(".safetensors")))
+                .map(|(p, b)| (p.clone(), b.clone()))
                 .collect()
         };
-        assert!(tensors(&first) == tensors(&second), "{repo}: the tensors");
-        assert_eq!(
-            first.manifest().files.len(),
-            second.manifest().files.len(),
-            "{repo}"
-        );
-        for (path, object) in &first.manifest().files {
-            if path != "model.cozytensors" {
-                assert_eq!(
-                    Some(object),
-                    second.manifest().files.get(path),
-                    "{repo}: {path}"
-                );
+        let (theirs, ours) = (documents(&upstream), documents(&exported));
+        assert_eq!(ours.keys().collect::<Vec<_>>(), theirs.keys().collect::<Vec<_>>(), "{repo}");
+        for (path, bytes) in &theirs {
+            match configs.contains(path) {
+                true => {
+                    let parsed = |b: &[u8]| serde_json::from_slice::<serde_json::Value>(b).unwrap();
+                    assert_eq!(parsed(&ours[path]), parsed(bytes), "{repo}: {path}");
+                }
+                false => assert!(ours[path] == *bytes, "{repo}: {path} differs from upstream's"),
             }
         }
-        let meta = import::FILE_METADATA;
-        assert_eq!(
-            first.header().metadata.get(meta),
-            second.header().metadata.get(meta),
-            "{repo}"
-        );
-        export(&second);
-        let third = imported(out.to_str().unwrap(), None);
-        assert_eq!(
-            third.id(),
-            second.id(),
-            "{repo}: import of an export is a fixed point"
-        );
+        // Weights: every upstream tensor, and a file a current safetensors wrote, byte for byte.
+        assert!(folder_tensors(&upstream) == folder_tensors(&exported), "{repo}: the tensors");
+        let weights = |files: &BTreeMap<String, Vec<u8>>, folder: &str| -> Vec<Vec<u8>> {
+            (files.iter())
+                .filter(|(p, _)| p.ends_with(".safetensors") && p.rsplit_once('/').map_or("", |(f, _)| f) == folder)
+                .map(|(_, b)| b.clone())
+                .collect()
+        };
+        for folder in header.components().iter().map(|c| match (header.pipeline(), c.name.as_str()) {
+            (None, "model") => "",
+            (_, name) => name,
+        }) {
+            if let ([theirs], [ours], true) = (&weights(&upstream, folder)[..], &weights(&exported, folder)[..], current) {
+                assert!(theirs == ours, "{repo}: {folder} weights are not byte for byte");
+            }
+        }
+        // An index names only the shards written.
+        for (path, bytes) in exported.iter().filter(|(p, _)| p.contains(".safetensors.index")) {
+            let index: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let folder = path.rsplit_once('/').map_or(String::new(), |(f, _)| format!("{f}/"));
+            for shard in index["weight_map"].as_object().unwrap().values() {
+                assert!(exported.contains_key(&format!("{folder}{}", shard.as_str().unwrap())), "{repo}: {path}");
+            }
+        }
+
+        // The export converts to the same model (its tensors in any order: a class without an
+        // order reference keeps its source's data order); its export, again, to the same
+        // cozytensors.
+        let out = dir.join("out");
+        let second = convert(out.to_str().unwrap(), None, &dir.join("second"));
+        let model = |ck: &Checkpoint| {
+            let tensors: BTreeMap<_, _> = (ck.tensors())
+                .map(|(c, t)| ((c.to_owned(), t.key.clone()), (t.dtype.clone(), t.shape.clone(), ck.read(c, &t.key).unwrap())))
+                .collect();
+            let h = ck.header();
+            let assets: Vec<_> = h.assets().map(|(c, n, r)| (c.to_owned(), n.to_owned(), r.clone())).collect();
+            let specs: Vec<_> = (h.components().iter())
+                .map(|c| (c.name.clone(), c.class.clone(), c.config.clone(), c.config_file.clone()))
+                .collect();
+            (tensors, assets, specs, h.pipeline().cloned(), h.metadata.get(import::FILE_METADATA).cloned())
+        };
+        let (a, b) = (model(&first), model(&second));
+        assert!(a.0 == b.0, "{repo}: the tensors");
+        assert_eq!((&a.1, &a.2, &a.3, &a.4), (&b.1, &b.2, &b.3, &b.4), "{repo}: the model");
+        export(&second, &dir.join("second"), &out);
+        let third = convert(out.to_str().unwrap(), None, &dir.join("third"));
+        assert_eq!(third.id(), second.id(), "{repo}: convert of an export is a fixed point");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

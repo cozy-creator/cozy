@@ -1,11 +1,9 @@
 # TensorFS Rust API
 
 Create a client, perform an operation, then use the checkpoint, component or byte data
-it returns. This guide covers the complete planned application-facing Rust API by task.
-
-This is the **0.13 target**, currently being integrated. The implementation on `master`
-can still expose the preceding interface. The [Python API](../tensorfs-py/API.md) and
-[technical file-format specification](spec/cozytensors.md) are separate documents.
+it returns. This guide covers the application-facing Rust API by task. The
+[Python API](../tensorfs-py/API.md) and [file-format specification](spec/cozytensors.md)
+are separate documents.
 
 - [Create a client and read a model](#rust-create-a-client-and-read-a-model)
 - [Write, convert and publish](#rust-write-convert-and-publish)
@@ -13,7 +11,7 @@ can still expose the preceding interface. The [Python API](../tensorfs-py/API.md
 - [Decode existing host or GPU buffers](#advanced-decode-existing-host-or-gpu-buffers)
 - [Errors and value types](#errors-and-value-types)
 
-The [temporary type-declaration dump](API-TYPES.md) is available for signature and naming review.
+[API-TYPES.md](API-TYPES.md) lists every declaration.
 
 ## Rust: create a client and read a model
 
@@ -35,7 +33,7 @@ checkpoint.download(&Download {
 }).await?;
 
 let unet = checkpoint.component("unet")?;
-let bytes = unet.read("conv_in.weight")?;
+let bytes = unet.read_decoded("conv_in.weight")?;
 println!("{} bytes", bytes.len());
 ```
 
@@ -46,8 +44,8 @@ available locally before returning. This does not unpack weights, load a GPU or 
 snapshot folder.
 
 Rust network operations use your runtime. With a lazy checkpoint, call `download` for
-the required selection before synchronous `read`, `asset`, `chunk` or `export_files`
-operations. There is no hidden core Tokio runtime.
+the required selection before synchronous `read`, `asset` or `export_files` operations.
+Only the placement `source` fetches on its own, on the process runtime.
 
 A borrowed component follows Rust's ordinary borrow rules. Clone the `Component` if it
 must outlive the parent checkpoint; owned child handles retain their source and data holds.
@@ -56,7 +54,7 @@ must outlive the parent checkpoint; owned child handles retain their source and 
 
 ```rust
 use std::path::Path;
-use tensorfs::{format::Dtype, WriterOptions};
+use tensorfs::{format::{ClassRef, Dtype}, WriterOptions};
 
 let mut writer = client.writer(WriterOptions {
     dest: Some(Path::new("./model.cozytensors")),
@@ -65,28 +63,28 @@ let mut writer = client.writer(WriterOptions {
 let bytes: Vec<u8> = [1.0_f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
 let mut input = bytes.as_slice();
 {
-    let mut model = writer.component("model", "", Default::default())?;
+    let mut model = writer.component("model", ClassRef::default(), Default::default(), None)?;
     model.put("weight", Dtype::F32, &[2], &mut input)?;
 }
 let saved = writer.commit().await?;
 println!("saved {}", saved.id().id());
 ```
 
-A file destination writes only the header; data is retained in the shared content-addressed
-store before the header is atomically published. Store roots and endpoint configuration are
-not embedded as paths in the file. A native portable export writes a complete folder with
-chunks; ordinary file saving does not.
+A `.cozytensors` file is a small handle into the shared local store, not a self-contained
+file: `dest` gets only the header, and the tensor and asset bytes stay in the store. The
+store keeps them while that file exists and holds this header; opening a header file by path
+holds its data the same way, so a moved or copied file is held once it is opened. Otherwise
+local copies expire 7 days after their last use, least recently used first when the disk runs
+low. Open checkpoints keep their bytes in the meantime. To copy a checkpoint to another machine,
+write the portable form with `saved.materialize(dir, Format::Cozytensors, false)`.
 
 `dest` is the exact filename; TensorFS does not append a variant or create a directory.
-Leave `variant` unset for a file destination. Variant labels belong to repository trees;
-setting both `dest` and `variant` is invalid. With no destination, the writer retains the
-checkpoint in the shared store and may assign a repository variant.
-A file destination also cannot be combined with `repo_id`.
+`dest` and `repo_id` exclude each other. `variant` names `model.<variant>.cozytensors` in a
+`repo_id` upload and is `Invalid` without `repo_id`. With no destination, the writer keeps
+the checkpoint in the shared store as a cache entry.
 
 A standalone header identifies one checkpoint. It does not contain its enclosing tree,
-release label, README or LICENSE. Moving or copying it preserves that checkpoint identity;
-repository context is available only when separately known. Deleting or replacing the
-file does not release its saved data automatically.
+release label, README or LICENSE; repository context is available only when separately known.
 
 The component borrows its writer while being filled. `commit(&mut self)` is async for both
 local and remote writes. After an upload failure, `writer.committed()` can return the strong
@@ -99,7 +97,7 @@ exact remote tree.
 | `open(name_or_path, &Open)` | Open metadata, optionally waiting for all checkpoint data with `lazy: false`; returns `Result<Checkpoint>`. |
 | `materialize(&Ref, &Download, local_dir, local_files_only)` | Make selected repository content available as a normal folder; returns `Result<PathBuf>`. |
 | `download_file(&Ref, filename, local_dir, local_files_only)` | Fetch one repository file; returns `Result<PathBuf>`. |
-| `upload_folder(&Ref, folder, progress)` | Publish the folder; returns `Result<ObjectRef>`. |
+| `upload_folder(&Ref, folder, delete_patterns, progress)` | Commit the folder's files on top of the tag `Ref.revision` (default `main`, private when new): the tag's tree minus paths matching `delete_patterns` (fnmatch globs), plus these files. Returns the commit, `Result<ObjectRef>`. |
 | `convert_to_cozytensors(&[String], &Convert)` | Convert pinned sources; returns `Result<Checkpoint>`. |
 | `writer(WriterOptions)` | Begin a write; returns `Result<Writer>`. |
 
@@ -112,10 +110,10 @@ let model: Ref = "me/model@1.0/bf16".parse()?;
 let folder = client.materialize(&model, &Download::default(), None, false).await?;
 println!("downloaded to {}", folder.display());
 
-saved.materialize(Path::new("./portable"), Format::Cozytensors, None).await?;
-let destination: Ref = "me/output".parse()?;
-let tree = client.upload_folder(&destination, Path::new("./portable"), None).await?;
-println!("published {}", tree.id());
+saved.materialize(Path::new("./portable"), Format::Cozytensors, false).await?;
+let destination: Ref = "me/output@draft".parse()?;
+let commit = client.upload_folder(&destination, Path::new("./portable"), &[], None).await?;
+println!("me/output@draft is {}", commit.id());
 ```
 
 Checkpoint materialization includes that checkpoint and any known repository files.
@@ -124,15 +122,16 @@ variant is selected. A standalone header cannot supply unknown repository files 
 metadata.
 
 All operations involving network/source resolution above are async except construction and
-`writer`. `checkpoint.materialize(directory, format, dequantize).await` returns
+`writer`. `checkpoint.materialize(directory, format, decode).await` returns
 `Result<PathBuf>`; choose `Format::Safetensors` or `Format::Cozytensors`. It first makes
 the required checkpoint data and known repository files available, then writes the folder.
-Missing or denied source objects fail the operation.
-`Format::Cozytensors` requires `None` for `dequantize`; `Format::Safetensors` accepts
-`Some(Dtype::F32)`, `Some(Dtype::BF16)` or `Some(Dtype::F16)`, or `None`.
-Other combinations return `Invalid` before source preparation.
+Missing or denied source objects fail the operation. `decode: true` writes each encoded tensor
+in its logical dtype and needs `Format::Safetensors`; `false` keeps the stored encoding.
+`Format::Cozytensors` with `decode: true` returns `Invalid` before source preparation.
 
-A `Writer` also has `pipeline(class, config)`, `component(name, class, config)`,
+A `Writer` also has `pipeline(class, config)`, `component(name, class, config, config_file)`
+(`config_file` names the file the config exports as, such as `scheduler_config.json`; `None`
+keeps a reopened or base component's, else `config.json`),
 `component_writer(name)`, `set_metadata(key, Value)`, `has(component, key)`, `committed()`
 and `abandon(self)`. `component_writer` reopens a declared component without changing
 its class or configuration. `ComponentWriter` supports `put(key, Dtype, shape, &mut Read)`,
@@ -148,7 +147,7 @@ below; normal model consumers do not need it.
 
 | Type | Fields / use |
 |---|---|
-| `Config` | `endpoint: String`, `cache_dir: PathBuf`, `mirror: Option<PathBuf>`, `token: Option<Arc<dyn TokenProvider>>`, `ca_der: Option<Vec<u8>>`. `Config::from_env()` returns configuration; `Client::new` validates it. Debug output redacts access material. |
+| `Config` | `endpoint: String`, `cache_dir: PathBuf`, `mirror: Option<PathBuf>`, `token: Option<Arc<dyn TokenProvider>>`, `ca_der: Option<Vec<u8>>` (a private CA trusted on top of the system roots, for every operation of the client). `Config::from_env()` returns configuration; `Client::new` validates it. Debug output redacts access material. |
 | `Ref` | `repo_id`, optional `revision`, `variant`, `endpoint`; implements `FromStr`. Use explicit fields/options when names contain shorthand separators. |
 | `Open` | Optional `revision`, `variant`, `endpoint`, plus `local_files_only` and `lazy`; defaults to `lazy: true`. |
 | `Selection` | `All`, `Components(Vec<String>)`, `Tensors { component, keys }`, `Part { component, key, role: Option<String>, range: Option<Range<u64>> }`, or `Assets { component, names: Option<Vec<String>> }`. Part ranges are stored byte ranges; absent asset names selects all assets. |
@@ -156,12 +155,13 @@ below; normal model consumers do not need it.
 | `Fetched` | Byte counts `local`, `volume`, `origin`. |
 | `VerificationReport` | Separate `missing` and `corrupt` object-reference vectors; `is_ok()` checks both are empty. |
 | `Convert` | Optional `converter`, `variant`, borrowed conversion-progress callback. |
-| `WriterOptions` | Optional `dest`, `variant`, `base`, `resume`, `repo_id`, `endpoint`, `token`, `ca_der`; implements `Default`. |
+| `WriterOptions` | Optional `dest`, `variant` (only with `repo_id`), `base`, `resume`, `repo_id`, `endpoint`, `token`; implements `Default`. |
+| `ReadInto` | `role: Option<&str>`, `decode: bool`, `offset: u64` for `Component::read_into`; implements `Default`. |
 | `Format` | `Safetensors` or native portable `Cozytensors` export. |
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).
 `ConvertProgress` additionally receives a stage string. A callback can stop remaining work
-by returning an error. The final `upload_folder` progress callback runs after publication:
+by returning an error. The final `upload_folder` progress callback runs after the tag moved:
 its error is returned to the caller but does not undo the repository update. Configured
 providers supply ordinary credentials; construction does not create a separate
 worker-permission mechanism.
@@ -181,11 +181,13 @@ worker-permission mechanism.
 | `components()` | `&[Component]`. |
 | `component(name)` | `Result<&Component>`. |
 | `verify(&Selection)` | `Result<VerificationReport>`, separating absent objects from length/digest failures. |
-| `view()` | An owned `io::view::View` for byte-engine/placement integration. |
-| `chunk(index)` | `Result<File>`; the returned file owns its descriptor. |
+| `spans(regions)` | `Result<Vec<io::Span>>`: the stored byte spans of the named parts, for placement. |
+| `stored_part(name)` | `Option<io::StoredPart>`: a part's stored dtype and shape. |
+| `source(direct_io)` | An `io::source::Source` over the chunks for the read engine; absent chunks are fetched on the process runtime. |
 | `missing(&Selection)` | `Result<Vec<ObjectRef>>`. |
 | `download(&Download).await` | `Result<Fetched>`. |
-| `materialize(directory, Format, dequantize).await` | `Result<PathBuf>` for the complete checkpoint folder. |
+| `materialize(directory, Format, decode).await` | `Result<PathBuf>` for the complete checkpoint folder. |
+| `open_file()` | `Result<CheckpointFile>`: the checkpoint as one read-only, seekable file (`Read + Seek`, `len()`): its header, then its chunks and assets in header order at 4 KiB-aligned offsets (spec §11), assembled from the store on demand; nothing is written. It holds what it may read until dropped, and fetches what it lacks when the checkpoint may fetch, so read it outside an async context. |
 
 `download` completes when the selected chunks and supporting files are verified and locally
 available; the open checkpoint retains them. `missing` is optional availability inspection.
@@ -196,14 +198,25 @@ declared chunks and component assets, not its enclosing repository files; checki
 shared chunk hashes that whole object. Other local I/O failures remain
 typed errors rather than being classified as corruption.
 
-A `Component` provides `name()`, `class()`, `config()`, `tensors()` and
-`assets()` metadata views. Its `read(key)` returns decoded `Vec<u8>`;
-`read_part_into(key, role, offset, &mut [u8])` fills a stored byte range;
-`asset(name)` returns `Vec<u8>`. These direct configuration, file and tensor reads are the
-normal cozytensors integration path. `export_files(directory)` is only a convenience for
-legacy libraries that require filenames: it explicitly writes configuration and supporting
-files and returns `PathBuf`, without exporting weights. Native consumers, including our
-Runtime, do not need that step. The I/O calls return `Result`.
+A `Component` provides `name()`, `cls()`, `config()`, `config_file()`, `tensors()` and
+`assets()` metadata views. `config_file()` is the file name the config exports as
+(`config.json` unless the writer named another, such as `scheduler_config.json`). Its
+`read(key)` returns the tensor as stored, as Python's `decode=False`: `Read::Plain(Vec<u8>)`,
+or `Read::Encoded { dtype, shape, encoding, parts }` with the logical dtype and shape and
+each stored part's bytes by role. `read_decoded(key)` returns logical bytes in the tensor's
+dtype, as `decode=True`. `asset(name)` returns `Vec<u8>`.
+
+`read_into(key, &mut out, &ReadInto { role, decode, offset })` fills `out` from byte
+`offset`, as Python's `read_into`. A plain tensor gives its data. A `role` selects that stored
+part, and `decode: true` an encoded tensor's logical bytes. An encoded tensor with neither
+returns `Invalid` naming its roles; a role with `decode` is also `Invalid`.
+
+These direct configuration, file and tensor reads are the normal cozytensors integration
+path. `export_files(Some(directory))` is only a convenience for libraries that require
+filenames: it writes configuration and supporting files, never weights, and returns
+`PathBuf`. `export_files(None)` writes them to a folder the cache manages and evicts like its
+other entries. Native consumers, including our Runtime, do not need that step. The I/O calls
+return `Result`.
 Selections control exactly which component/tensor/part/asset bytes are fetched, including
 when other model data happens to be present in the cache.
 
@@ -221,16 +234,10 @@ on a conflict. `Endpoint::new("local", ...)` addresses local repository referenc
 `Request` contains borrowed `method`, `url`, existing `headers`, and optional body-digest
 `payload`. The public result uses the same error families as the other client operations.
 
-`DPoP` is a cloneable `TokenProvider` for callers using proof-of-possession credentials.
-`DPoP::token(key, access_token, resource, endpoint)` wraps an already issued token;
-`DPoP::grant(&config, key, JwtBearer { token_endpoint, client_id, resource, claims })`
-configures a lazy JWT-bearer exchange. The key is a private P-256 JWK. Clones share the
-same native token state. `issued_token().await` returns `Option<String>` without starting
-an exchange. These provider operations use the common `Failure` families.
-
 `ObjectRef` has `sha256: String` and `length: u64`; `of(bytes)` hashes content, `id()` returns
 `sha256:…` and `key()` gives its object-storage key. `Metadata` is `BTreeMap<String, Value>`.
-`format::Pipeline` contains `class` and JSON `config`; `format::Tensor` contains the key,
+`format::ClassRef` is a class as `{library, version, name}` (`ClassRef::default()` is the unknown
+class); `format::Pipeline` contains `class` and JSON `config`; `format::Tensor` contains the key,
 logical dtype/shape and plain location or encoding/parts. `Encoding` holds scheme and
 parameters. Format metadata structures are described in the [format spec](spec/cozytensors.md).
 The lower-level I/O/codec interfaces used by in-tree integrations are separate from this
@@ -267,7 +274,7 @@ placement, lengths, alignment and input/output overlap before writing.
 
 All-host spans use the CPU decoder. All-CUDA spans must share one device and use a
 supported resident-input scheme; the initial target covers `comfy.asym_w4a8_int8`,
-`comfy.w6a8_int8` and `comfy.convrot_w4a4`. Mixed host/device input, file/zero sources and
+`comfy.w6a8_int8` and `int4.convrot`. Mixed host/device input, file/zero sources and
 implicit transfers are refused. Keep input allocations alive, the output exclusively
 writable, and producer/output streams valid in that device's primary context on the
 calling thread. Rust's raw pointers do not enforce these requirements for you.
@@ -277,10 +284,7 @@ until `io::drain` for the device and every producer stream report checked comple
 an error alone does not establish quiescence. Descriptor and overlap refusals precede
 writes; after a runtime or value error the output contents are unspecified.
 
-The [exact declarations](API-TYPES.md#advanced-resident-buffer-decoding) are a
-source-reviewed 0.13 target, pinned to the Rust wrapper at
-`5fc6f2320b803212037de90e38fe0d0ce0e10d9f`. Its combined native and GPU gates are still
-pending; the existing 25a1 native-wheel results do not qualify this new interface.
+The [exact declarations](API-TYPES.md#advanced-resident-buffer-decoding) list the types.
 
 ## Errors and value types
 

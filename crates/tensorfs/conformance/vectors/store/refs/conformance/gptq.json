@@ -1,1 +1,1 @@
-{"format":"tensorfs.repo/1","name":"Conformance/gptq","releases":[{"lanes":{"all":{"length":253,"sha256":"40eb1cddb853180dcbdff0b3fd7c1f4c039a1809d86678687d8205ec395c7492"}},"version":"1"}]}
+{"format":"cozytensors.repo/1","name":"Conformance/gptq","tags":[{"commit":{"length":256,"sha256":"6ef6b82018560d84d7ca89158fb5c40074801f549405c5b1258eff8879bd2452"},"name":"1","public":true}]}

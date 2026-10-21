@@ -19,7 +19,7 @@ import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Protocol, TypeAlias, TypeVar
 
 import torch
 from torch import Tensor, nn
@@ -32,11 +32,12 @@ from torch.utils._python_dispatch import (
 )
 
 aten = torch.ops.aten
-type Args = Sequence[object]
-type Kwargs = Mapping[str, object]
-type Band = Callable[[int, int], Tensor]
-type Rule = Callable[[OpOverload, Args, Kwargs], _Plan | None]
-type Attention = Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor]
+_T = TypeVar("_T")
+Args: TypeAlias = "Sequence[object]"
+Kwargs: TypeAlias = "Mapping[str, object]"
+Band: TypeAlias = "Callable[[int, int], Tensor]"
+Rule: TypeAlias = "Callable[[OpOverload, Args, Kwargs], _Plan | None]"
+Attention: TypeAlias = "Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor]"
 
 #: Free bytes a retry asks beyond the failed allocation: the allocator's rounding, a workspace.
 SLACK = 64 << 20
@@ -184,6 +185,12 @@ def serve(memo: Memo, rungs: Rungs) -> None:
     _served.memo, _served.rungs = memo, rungs
 
 
+def available(device: torch.device) -> int:
+    """What one allocation on `device` may take now (0: no memory serves it), for a caller that
+    sizes its own pieces, such as a context-parallel exchange."""
+    return _served.rungs.available(device)
+
+
 @dataclass(eq=False, slots=True)
 class _Scope:
     finer: bool = False
@@ -276,8 +283,8 @@ def _capturing() -> bool:
     return torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
 
 
-def _settle[T](
-    run: Callable[[int], T],
+def _settle(
+    run: Callable[[int], _T],
     size: int,
     finest: int,
     shrink: Callable[[int], int],
@@ -285,9 +292,9 @@ def _settle[T](
     name: str,
     key: tuple[object, ...] | None = None,
     again: bool | None = None,
-    before: Callable[[int], T | None] | None = None,
-    last: Callable[[], T | None] | None = None,
-) -> tuple[int, T]:
+    before: Callable[[int], _T | None] | None = None,
+    last: Callable[[], _T | None] | None = None,
+) -> tuple[int, _T]:
     """`run(size)` until it fits, each try strictly smaller: room made (rungs 1-2), each `shrink`
     down to `finest`, the first and the finest size tried again with room made, `before` (an
     op's cut) once, then rung 4 while it makes the room, then `last` (rung 5), else
@@ -347,7 +354,7 @@ def _settle[T](
     return size, out
 
 
-def launch[T](device: torch.device, name: str, run: Callable[[], T]) -> T:
+def launch(device: torch.device, name: str, run: Callable[[], _T]) -> _T:
     """A launch torch's dispatch never sees (a Triton kernel's): out of memory it did not run, so
     it runs again as an op does, with room made (rungs 1-2, other processes asked), then after
     rung 4 while that makes room (12586: a glue kernel on a full GPU, after a collective)."""
@@ -569,7 +576,7 @@ def _attributes(module: nn.Module | None) -> dict[tuple[int, str], object]:
 
 #: an op's traits: the arguments it writes, whether it draws from a generator, whether its
 #: results are new tensors, its band rule
-type Trait = tuple[tuple[tuple[int, str], ...], bool, bool, Rule | None]
+Trait: TypeAlias = "tuple[tuple[tuple[int, str], ...], bool, bool, Rule | None]"
 
 
 @functools.cache
@@ -1206,9 +1213,9 @@ def _attend(
     return out
 
 
-def split[T](
-    name: str, key: str, device: torch.device, total: int, finest: int, run: Callable[[int], T]
-) -> T:
+def split(
+    name: str, key: str, device: torch.device, total: int, finest: int, run: Callable[[int], _T]
+) -> _T:
     """A package's `split` loop (`cozy_runtime.author.split`): `run(most)` runs it in windows of
     at most `most` of its `total` elements, `finest` the least one can take."""
     halve = functools.partial(_halve, 1)

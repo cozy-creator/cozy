@@ -113,6 +113,13 @@ impl Repo {
     }
 }
 
+/// An upload's destination, `org/name[@tag]`: a Hub repository and the private tag the upload
+/// moves, `main` unless named. Sent as `org/name@tag`.
+pub(crate) fn destination(raw: &str) -> Result<String, Error> {
+    let (name, tag) = raw.trim().split_once('@').unwrap_or((raw.trim(), "main"));
+    Ok(format!("{}@{}", Repo::hub(name)?, label("tag", tag)?))
+}
+
 impl fmt::Display for Repo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.org, self.name)
@@ -271,5 +278,14 @@ mod tests {
             assert_eq!(error.kind, Kind::Usage, "{raw}");
         }
         assert_eq!(Repo::hub("local/x").unwrap_err().code, "model_local_destination");
+    }
+
+    #[test]
+    fn an_upload_moves_main_unless_it_names_a_tag() {
+        assert_eq!(destination("Paul/SDXL").unwrap(), "paul/sdxl@main");
+        assert_eq!(destination("paul/sdxl@fp8-draft").unwrap(), "paul/sdxl@fp8-draft");
+        for raw in ["local/x", "paul/sdxl@", "paul/sdxl@a/b", "sdxl@main"] {
+            assert_eq!(destination(raw).unwrap_err().kind, Kind::Usage, "{raw}");
+        }
     }
 }

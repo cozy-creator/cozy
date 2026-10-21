@@ -4,11 +4,17 @@
 //!
 //! `TENSORD_GPU_TENANCY` names a JSON plan: `state`, `store`, `generations`, `gpu_config`,
 //! `entrypoint`, `input`, `output` (JSON lines) and `packages`: two published packages
-//! (`{package, release}`) of different publishers that bind the same checkpoint. On a card
-//! with room for both executors.
+//! (`{package, release, generation, models}`: its installed environment and its slots'
+//! choices among the store's models) of different publishers that bind the same checkpoint.
+//! On a card with room for both executors.
+#[path = "common/held.rs"]
+mod held;
 use tensord::{
+    api::domain::ModelChoice,
     gpu_service::{GpuConfig, Pool},
-    journal::{Execution, Preparation, State, SubmissionContext},
+    journal::{Execution, State, SubmissionContext},
+    origin::Machine,
+    published::Publisher,
     service::{Call, Service},
 };
 use serde::Deserialize;
@@ -27,6 +33,9 @@ use std::{
 struct Package {
     package: String,
     release: String,
+    generation: String,
+    #[serde(default)]
+    models: Vec<ModelChoice>,
 }
 #[derive(Deserialize)]
 struct Plan {
@@ -44,6 +53,7 @@ struct Pod {
     plan: Plan,
     service: Arc<Service>,
     gpu: Arc<Pool>,
+    publisher: Arc<Publisher>,
     output: File,
     salt: String,
     submitted: u32,
@@ -51,23 +61,12 @@ struct Pod {
 impl Pod {
     /// `actor` submits one request (its own prompt and seed) to a package; (plan id, record).
     fn run(&mut self, actor: &str, package: usize, input: Option<Value>) -> (String, Execution) {
-        let (gpu, service, n) = (&self.gpu, &self.service, self.submitted);
+        let (service, n) = (&self.service, self.submitted);
         self.submitted += 1;
         let chosen = &self.plan.packages[package];
-        let installed = gpu
-            .published_installation(service, actor, &chosen.package, &chosen.release)
-            .unwrap()
-            .expect("published package mapped in the GPU config");
-        let prepared = gpu
-            .prepare_root(&installed, &self.plan.entrypoint, &[], &[], 1)
-            .unwrap();
-        let preparation = Preparation {
-            actor: actor.into(),
-            id: prepared.id.clone(),
-            installation: installed.alias.clone(),
-            document: serde_json::to_vec(&prepared).unwrap(),
-        };
-        service.engine.bind_preparation(preparation).unwrap();
+        let named = (chosen.package.as_str(), chosen.release.as_str(), chosen.generation.as_str());
+        let (installed, prepared) =
+            held::prepare(service, &self.publisher, actor, named, &self.plan.entrypoint, &chosen.models);
         let input = input.unwrap_or_else(|| {
             let mut input = self.plan.input.clone();
             input["prompt"] = json!(format!("a lighthouse at dawn, study {}-{n}", self.salt));
@@ -129,9 +128,12 @@ fn submitters_share_a_packages_executor_and_packages_keep_their_own() {
     let service = Service::open(&plan.state, &plan.generations, 1).unwrap();
     let store = tensord::storage::open(&plan.store).unwrap();
     let config = GpuConfig::load(&plan.gpu_config).unwrap();
+    let publisher = Publisher::new(&plan.state.join("published"), Default::default(),
+        Machine::new(store.clone(), None).unwrap()).unwrap();
     let gpu = Pool::new(&plan.state.join("gpu"), config, store).unwrap();
     service.configure_pool(gpu.clone()).unwrap();
     let mut pod = Pod {
+        publisher,
         output: File::create(&plan.output).unwrap(),
         plan,
         service,

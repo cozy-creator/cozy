@@ -3,10 +3,11 @@
 //! never answered through that whole idle window, so it ends itself at its provider and billing
 //! stops: the real binary, a stand-in provider API, and a Hub that cannot be reached. The
 //! provider key it ends itself with is the machine's alone: gone from every process environment
-//! and from the files the provider copies it into. A TensorD a pre-cohort update activated is
-//! retired, never run. A rental is a Linux pod.
+//! and from the files the provider copies it into. A rental is a Linux pod.
 #![cfg(target_os = "linux")]
 mod common;
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use std::{
@@ -39,6 +40,7 @@ fn launch_idle(root: &Path, port: u16, provider: u16, idle: u32) -> Machine {
     let home = root.join("home/.cozy");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("config.toml"), format!("[machine]\nrental_idle_seconds = {idle}\n")).unwrap();
+    named_runtime::image(root);
     Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .env_clear()
@@ -248,38 +250,6 @@ fn environments_holding(pid: u32, needle: &str) -> Vec<u32> {
         }
     }
     held
-}
-
-/// A machine root a pre-cohort update left an activated TensorD in (`agent/current`, the one its
-/// Runtime wheel bundled): the machine serves as itself, removes the activation and never runs it.
-#[test]
-fn a_pre_cohort_activation_is_retired_never_run() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/machine-older-service")
-        .join(std::process::id().to_string());
-    let _ = std::fs::remove_dir_all(&root);
-    let agent = root.join("var/lib/cozy/tensord/agent");
-    std::fs::create_dir_all(&agent).unwrap();
-    let older = agent.join("older");
-    std::fs::write(
-        &older,
-        "#!/bin/sh\n[ \"$1\" = version ] && echo '{\"name\":\"tensord\",\"capabilities\":[]}' && exit 0\nls /proc/$$/fd > \"$COZY_MACHINE_ROOT/service-fds.part\" && mv \"$COZY_MACHINE_ROOT/service-fds.part\" \"$COZY_MACHINE_ROOT/service-fds\"\nexec sleep 60\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&older, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    std::os::unix::fs::symlink(&older, agent.join("current")).unwrap();
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let (provider_port, _received) = provider();
-    let mut machine = launch(&root, port, provider_port);
-    ready(&mut machine, &root, port);
-    assert!(!root.join("service-fds").exists(), "the activated TensorD ran");
-    assert!(!agent.exists(), "the activation was kept");
-    drop(machine);
-    std::fs::remove_dir_all(&root).unwrap();
 }
 
 /// Long enough for a fresh boot to prove readiness on a loaded host before its window ends.

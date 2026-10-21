@@ -136,16 +136,7 @@ pub fn hub_error(error: impl Into<hub_client::Error>) -> Error {
             message,
             remedy,
         } => {
-            let kind = match status {
-                401 => Kind::Credential,
-                403 => Kind::Forbidden,
-                404 => Kind::NotFound,
-                409 | 410 => Kind::Conflict,
-                429 => Kind::Unavailable,
-                400..=499 => Kind::Validation,
-                _ => Kind::Unavailable,
-            };
-            let mut error = Error::new(kind, code.clone(), message).cause(code);
+            let mut error = Error::new(Kind::of_http(status), code.clone(), message).cause(code);
             if !remedy.is_empty() {
                 error = error.remedy(remedy);
             }

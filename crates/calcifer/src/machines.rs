@@ -70,6 +70,8 @@ pub struct Machines {
     pub(crate) renting: Mutex<HashSet<RunId>>,
     /// Told when a rental appears or is ready: `any` runs may fit it.
     pub(crate) placing: Notify,
+    /// The machines sent this computer's bearer at each Hub, which get each one minted after.
+    pub(crate) bearers: Mutex<HashMap<config::Origin, HashSet<String>>>,
     tasks: Mutex<JoinSet<()>>,
 }
 
@@ -106,6 +108,7 @@ impl Machines {
             booting: Mutex::default(),
             renting: Mutex::default(),
             placing: Notify::new(),
+            bearers: Mutex::default(),
             tasks: Mutex::default(),
             calcifer,
         });
@@ -377,7 +380,7 @@ impl Machines {
     }
 
     /// A machine and its connection, which it has only once it has an endpoint.
-    fn linked(&self, text: &str) -> Result<(MachineRow, Link), Error> {
+    pub(crate) fn linked(&self, text: &str) -> Result<(MachineRow, Link), Error> {
         let row = self
             .store()
             .find_machine(text)
@@ -603,7 +606,7 @@ impl Machines {
     /// (it could only fail once it was), and without the quote its renter agreed to.
     pub(crate) fn admit(&self, submit: &SubmitRun) -> Result<(), Error> {
         let signed_out = || {
-            config::Origin::parse(&submit.hub).is_ok_and(|hub| self.device_key(&hub).is_err())
+            config::Origin::parse(&submit.hub).is_ok_and(|hub| self.hubs.client(&hub).is_err())
         };
         match &submit.on {
             On::New(_) if signed_out() => Err(crate::rentals::signed_out(&submit.hub)),
@@ -872,7 +875,7 @@ pub(crate) async fn run_quote(
     body: Bytes,
 ) -> Result<Json<wire::RunQuote>, Refusal> {
     let submit = parse::<SubmitRun>(&body)?;
-    if config::Origin::parse(&submit.hub).is_ok_and(|hub| api.machines.device_key(&hub).is_err()) {
+    if config::Origin::parse(&submit.hub).is_ok_and(|hub| api.machines.hubs.client(&hub).is_err()) {
         return Err(Refusal(crate::rentals::signed_out(&submit.hub)));
     }
     Ok(Json(api.machines.run_quote(&submit).await.map_err(Refusal)?))

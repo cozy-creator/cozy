@@ -18,18 +18,15 @@ use calcifer::{
     store::{Batch, NewRun, Store},
 };
 use common::{Tensord, installing_machine, package_run};
+use futures_util::StreamExt as _;
 use platform::{lock::LockFile, paths::Home};
 use protocol::{
-    calcifer::{
-        CHECKPOINT, Event, Holder, Kind, MachinesEvent, OutputItem, Run, RunsEvent, Status,
-        SubmitRun,
-    },
+    calcifer::{Event, Holder, Kind, MachinesEvent, OutputItem, Run, RunsEvent, Status, SubmitRun},
     config::{Config, Loaded},
     error::Envelope,
     ids::{Digest, RunId},
     machine as v1,
 };
-use futures_util::StreamExt as _;
 use reqwest::{Client, RequestBuilder, StatusCode, header};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -899,10 +896,30 @@ async fn every_output_ends_landed_kept_or_lost_and_a_checkpoint_waits_on_nothing
     store.accept(kept.as_str(), "c", &state).unwrap();
     let outcome = v1::Outcome {
         status: "succeeded".into(),
-        outputs: vec![v1::Product {
-            media_type: CHECKPOINT.into(),
-            ..product("fp8", 0, 1, br#"{"entries":[]}"#)
-        }],
+        outputs: vec![
+            v1::Product {
+                output: "fp8".into(),
+                rev: 1,
+                checkpoint: Some(v1::CheckpointRef {
+                    repo_id: "local/quantized".into(),
+                    revision: "sha256:fp8".into(),
+                    variant: "fp8".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            v1::Product {
+                output: "published".into(),
+                rev: 1,
+                checkpoint: Some(v1::CheckpointRef {
+                    repo_id: "local/derived".into(),
+                    revision: "sha256:tree".into(),
+                    variant: String::new(),
+                    tag: String::new(),
+                }),
+                ..Default::default()
+            },
+        ],
         ..Default::default()
     };
     store.settle(kept.as_str(), &outcome, 1 << 32).unwrap();
@@ -933,6 +950,19 @@ async fn every_output_ends_landed_kept_or_lost_and_a_checkpoint_waits_on_nothing
         "{fp8:?}"
     );
     let route = served.get(&format!("/v1/runs/{kept}/outputs/fp8")).send();
+    assert_eq!(
+        code(route.await.unwrap()).await,
+        (StatusCode::CONFLICT, "output_is_a_checkpoint".into())
+    );
+    let published = &run.output[1];
+    assert!(published.is_checkpoint() && published.checkpoint.is_some());
+    assert!(
+        published.sha256.is_none() && published.path.is_none() && published.export_error.is_none()
+    );
+    assert_eq!(published.length, 0);
+    let route = served
+        .get(&format!("/v1/runs/{kept}/outputs/published"))
+        .send();
     assert_eq!(
         code(route.await.unwrap()).await,
         (StatusCode::CONFLICT, "output_is_a_checkpoint".into())

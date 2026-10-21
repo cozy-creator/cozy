@@ -24,9 +24,10 @@ jobs:
     with:
       ref: ${{ github.sha }}
       build: tensorfs
-      # Until Runtime0.30.0 is on PyPI, build the exact current-cohort source whose dependency
-      # range accepts this TensorFS0.12 wheel. The public Runtime relock remains a separate gate.
-      runtime_ref: 1d44cb8f8f7884c17ca41ef9a580d87d6a89454d
+      # The Runtime integrator's TensorFS 0.13 class-record branch (xs053/runtime-classref,
+      # cozy-runtime #1646): Runtime 0.30 on the hard cut. Source pins distinguish development
+      # wheels of one version.
+      runtime_ref: 01966eb8d08b567eaae41f79673f40dee62adc7b
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below. varena's
       # placement under a declared plan runs first, on the wheel with CPU torch.
       test: >-
@@ -50,7 +51,6 @@ jobs:
     uses: ./.github/workflows/owner-day.yml
     secrets: inherit
     with:
-      # U11 current-release Hub and rehearsal harness; switch to master after this source lands.
-      tensorhub_ref: 7654cba98f6f594014fc4bcedc4776d7773e279b
-      # The tests' Runtime and TensorFS pair; this line goes when Runtime 0.30.0 and tensorfs 0.12 are on PyPI.
-      runtime_ref: 1d44cb8f8f7884c17ca41ef9a580d87d6a89454d
+      # Hub v0.33.0 (tags and the class record) and the Runtime above, until they are released.
+      tensorhub_ref: e0c6592f6aacb4c0a18369c6a9060ee1da3d873d
+      runtime_ref: 01966eb8d08b567eaae41f79673f40dee62adc7b

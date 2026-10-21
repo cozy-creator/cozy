@@ -1,42 +1,51 @@
-//! The store (design §4): one host, the filesystem only.
+//! The store (design §2): the local cache of cozytensors that any process reads and writes.
 //!
-//! `<root>/{format, blobs/<aa>/<bb>/<sha256>, refs/<org>/<name>.json, pins/<id>.json, tmp/}`
+//! `<root>/{format, blobs/<aa>/<bb>/<sha256>, refs/<org>/<name>.json, holds/, files/, uses/,
+//! snapshots/<name>/, tmp/}`
 //!
+//! - Objects are trees, cozytensors headers, chunks, assets and repo files. A ref names a
+//!   model's tags of commits (trees). A cozytensors is opened by its header ([`Store::checkpoint`]) or
+//!   a tree's variant ([`Store::variant`]); a plain folder enters by [`Store::admit_folder`] and
+//!   leaves by [`Store::snapshot`].
 //! - One door admits objects ([`Store::admit`], [`Store::put`]): streamed into `tmp/`, hashed,
 //!   checked, flushed per [`Durability`] and renamed into `blobs/`. An object is verified there
 //!   once and trusted after; [`Store::verify`] rehashes on demand.
-//! - Refs name models; pins are the one retention record (`records.rs`).
-//! - GC marks from refs and pins and sweeps unmarked objects older than the grace (`gc.rs`). So
-//!   whatever newly references an object makes it young first: `put` and `reuse` touch it, and
-//!   `pin` and `update_ref` touch their new roots' closures.
+//! - One retention regime (`retention.rs`): holds, header files and `local/` refs root objects;
+//!   all else is cache, kept for a TTL after its last use and evicted least recently used first
+//!   when the disk runs low. GC marks and sweeps (`gc.rs`) what is older than the grace, so
+//!   whatever newly references an object makes it young first: `put` and `reuse` touch it.
 //! - Processes share a store with no leases, markers or boot-time rehash: a torn write never has
 //!   a name, and an open descriptor outlives an unlink.
 
 mod checkpoint;
+mod folder;
 mod gc;
 mod records;
+pub(crate) mod retention;
 
-pub use checkpoint::{Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
-pub use gc::{Collected, PinUsage, Usage};
+pub use checkpoint::{wanted, Checkpoint};
+pub use gc::Collected;
 pub(crate) use records::is_name;
-pub use records::Pin;
+pub use retention::TTL;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use platform::durable::{self, DiskClass, FileId};
 
 use crate::err::{Code, Refusal};
 use crate::fetch;
-use crate::format::{self, ObjectRef};
+use crate::format::{self, is_digest, ObjectRef};
 use crate::sha256::{hex, Sha256};
 
-const FORMAT: &str = "tensorfs.store/2";
-const LAYOUT: [&str; 4] = ["blobs", "refs", "pins", "tmp"];
+/// [`crate::STORE_FORMAT`] as the store's `format` record.
+/// The store format this TensorFS reads and writes (its `format` record).
+pub const FORMAT: &str = "tensorfs.store/3";
+const LAYOUT: [&str; 6] = ["blobs", "refs", "holds", "files", "uses", "tmp"];
 
 /// How long an unreferenced object outlives its last write or reuse.
 pub const GRACE: Duration = Duration::from_secs(3600);
@@ -151,10 +160,6 @@ pub(crate) fn invalid(path: impl Into<PathBuf>, why: impl ToString) -> Error {
     }
 }
 
-fn is_digest(text: &str) -> bool {
-    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 /// `family/major[.minor]`: the same family and major as `want`.
 pub(crate) fn same_major(tag: &str, want: &str) -> bool {
     fn split(tag: &str) -> Option<(&str, &str)> {
@@ -166,12 +171,6 @@ pub(crate) fn same_major(tag: &str, want: &str) -> bool {
 
 pub(crate) fn same_family(tag: &str, want: &str) -> bool {
     tag.split_once('/').map(|t| t.0) == want.split_once('/').map(|w| w.0)
-}
-
-pub(crate) fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +187,7 @@ impl Store {
     pub fn open(root: impl Into<PathBuf>) -> Result<Store> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(fail("create", &root))?;
+        let root = fs::canonicalize(&root).map_err(fail("resolve", &root))?;
         let record = root.join("format");
         match fs::read(&record) {
             Ok(bytes) => {
@@ -197,6 +197,14 @@ impl Store {
                 }
                 match serde_json::from_slice::<Record>(&bytes) {
                     Ok(found) if same_major(&found.format, FORMAT) => {}
+                    Ok(found) if same_family(&found.format, FORMAT) => {
+                        let why = format!(
+                            "is a {} store from an older TensorFS, which this one cannot read: \
+                             remove it and pull again (tensorfs.store/3 holds trees and D10 headers)",
+                            found.format
+                        );
+                        return Err(invalid(&record, why));
+                    }
                     _ => {
                         let found = String::from_utf8_lossy(&bytes);
                         return Err(invalid(&record, format!("is {found:?}, not {FORMAT}")));
@@ -278,7 +286,11 @@ impl Store {
         if let Some(expect) = expect {
             self.path(expect)?;
         }
+        if !self.maintain(expect.map_or(0, |object| object.length))? {
+            return Err(Error::Full { op: "admit", path: self.root.clone() });
+        }
         let (temp, file) = self.temp("put")?;
+        platform::lock::share(&file).map_err(platform("lock", &temp))?;
         Ok(Admission {
             store: self.clone(),
             expect: expect.cloned(),
@@ -321,7 +333,7 @@ impl Store {
     /// True when `object` is here, and then it is young for GC: call it before referencing an
     /// object this process did not just put.
     pub fn reuse(&self, object: &ObjectRef) -> Result<bool> {
-        let Some(file) = self.hold(&object.sha256)? else {
+        let Some(file) = self.young(&object.sha256)? else {
             return Ok(false);
         };
         let length = file
@@ -351,6 +363,7 @@ impl Store {
             }
             Err(error) => return Err(fail("open", &path)(error)),
         };
+        file.lock_shared().map_err(fail("lock", &path))?;
         let length = file.metadata().map_err(fail("stat", &path))?.len();
         if length != object.length {
             return Err(Error::Mismatch {
@@ -368,38 +381,6 @@ impl Store {
             .read_to_end(&mut bytes)
             .map_err(fail("read", &path))?;
         Ok(bytes)
-    }
-
-    /// Rehashes `object`. A copy that no longer matches is removed, to be fetched again.
-    pub fn verify(&self, object: &ObjectRef) -> Result<bool> {
-        let path = self.path(object)?;
-        let mut file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(fail("open", &path)(error)),
-        };
-        let mut hash = Sha256::new();
-        let mut length = 0u64;
-        let mut buffer = vec![0; 1 << 20];
-        loop {
-            match file.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    hash.update(&buffer[..n]);
-                    length += n as u64;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(fail("read", &path)(error)),
-            }
-        }
-        if length == object.length && hex(&hash.finish()) == object.sha256 {
-            return Ok(true);
-        }
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(fail("remove", &path)(error)),
-        }
     }
 
     /// Makes every object this handle admitted durable. Ephemeral: one `syncfs`, which the
@@ -443,7 +424,7 @@ impl Store {
     /// Opens object `sha256` and makes it young; `None` when it is gone. One a sweep is moving
     /// right now is taken back from GC's trash. It is held only once, after the touch, its name
     /// names it again: a sweep that moves it from then on finds it young and puts it back.
-    fn hold(&self, sha256: &str) -> Result<Option<File>> {
+    fn young(&self, sha256: &str) -> Result<Option<File>> {
         let blob = self.blob(sha256)?;
         let trash = self.trash(sha256);
         loop {
@@ -475,7 +456,7 @@ impl Store {
 
     /// Names a finished temp `blob`, unless a copy is there already, which is kept young.
     fn install(&self, temp: &Path, blob: &Path, sha256: &str) -> Result<()> {
-        if self.hold(sha256)?.is_some() {
+        if self.young(sha256)?.is_some() {
             let _ = fs::remove_file(temp);
             return Ok(());
         }
@@ -502,10 +483,10 @@ impl Store {
     fn commit(&self, path: &Path, bytes: &[u8], flush: bool) -> Result<()> {
         let flush = flush && self.flushes();
         let (temp, mut file) = self.temp("record")?;
+        platform::lock::share(&file).map_err(platform("lock", &temp))?;
         let written = file
             .write_all(bytes)
             .and_then(|()| if flush { file.sync_data() } else { Ok(()) });
-        drop(file);
         if let Err(error) = written {
             let _ = fs::remove_file(&temp);
             return Err(fail("write", &temp)(error));

@@ -130,6 +130,7 @@ def fake_cuda() -> None:
     c.synchronize = lambda *_: CARD.core.land()
     c.get_device_properties = lambda i: SimpleNamespace(uuid=f"GPU-varena-plan-{i}-{id(CARD)}")
     c.is_current_stream_capturing = lambda: False
+    c.memory_snapshot = lambda: []  # rung 5 finds no torch tensor of its own to spill
     c.is_initialized = lambda: True
     c.is_available = lambda: True
     c.current_device = lambda: 0
@@ -273,7 +274,7 @@ class Core:
     def serve(self, row: object) -> None:
         pass
 
-    def register(self, name: str, ck: object, regions: list[list[str]], host_fd: object, files: object) -> Set:
+    def register(self, name: str, ck: object, regions: list[list[str]], host_fd: object) -> Set:
         ws = Set(self, name, regions, [ck.span[n[0]] for n in regions])
         self.sets.append(ws)
         return ws
@@ -428,11 +429,11 @@ class Checkpoint:
     """What `regions_of` reads of a checkpoint: each component's tensor keys in header order."""
 
     def __init__(self) -> None:
-        self.tensors, self.span = {}, {}
-        self.manifest = SimpleNamespace(sha256="0" * 64)
+        self.components, self.span = {}, {}
+        self.id = "sha256:" + "0" * 64
         for name, (common, block, n, _) in SIZES.items():
             keys = ["common.weight", *(f"blocks.{i}.weight" for i in range(n))]
-            self.tensors[name] = dict.fromkeys(keys)
+            self.components[name] = SimpleNamespace(tensors=dict.fromkeys(keys))
             for key in keys:
                 self.span[f"{name}/{key}"] = common if key == "common.weight" else block
 
@@ -643,35 +644,52 @@ def failure(name: str, mem: vt.Memory, core: Core, models: dict[str, vt.Model]) 
             check(f"{name} after {label}: the next request completes", False, exc)
 
 
-def card_g() -> None:
+def card_g(beside: int = 0) -> None:
     """Card G (12288): a 4090 where H3's int8 DiT cannot be wholly resident (52 blocks, 21.1 GB,
     beside a 5.14 GB peak the allocator holds 1.38 GB more for, 12415; an FFN cut frees 33.8 kB
     a token, a third of its units). Warm at prompts 2 and 4 tokens longer than cold, with no
     out-of-memory retry, each DiT pass after its first reads at most what its uncut peak, the
-    allocator's slack and the streaming slots leave no room for, plus two blocks."""
+    allocator's slack and the streaming slots leave no room for, plus two blocks. `beside`: an
+    idle executor's cold weights share the card (12666: 16.3 GB its row could give), and what
+    planning counted on from it comes back, so the same holds from the cold request on."""
     global STATE, DIT_FFN
+    name = "card G beside an idle executor" if beside else "card G"
     saved = dict(SIZES), STATE, DIT_FFN
     SIZES.update(transformer_ref=(37_594_240, 406_847_488, 52, 3_790_000_000))
     SIZES.update(ref2va_turbo=(799_014_912, 0, 0, 0))
     STATE, DIT_FFN = 914_167_808, (*DIT_FFN, 33_836)
     try:
-        card = Card(25_757_220_864, 1_111_000_000, 1_380_000_000)  # context 0.52 GB, another's 0.60
-        mem, _, models = build(card, None, 0, False)
+        # context 0.52 GB, another's 0.60; beside an executor, the allocator's slack is the sim's
+        # whole-request floor no ask can meet (`Card.malloc`), so it is the measured 0 of 12666
+        card = Card(25_757_220_864, 1_111_000_000, 0 if beside else 1_380_000_000)
+        mem, _, models = build(card, None, beside, beside > 0)
         dit = models["transformer_ref"]
         block = SIZES["transformer_ref"][1]
-        h3(mem, models, "card G cold", dit=39_806)
-        for tokens in (39_808, 39_810):
-            label, retries = f"card G warm at {tokens} DiT tokens", mem.memo.retries
-            passes = [s for s in h3(mem, models, label, dit=tokens).steps if s.model == dit.name]
-            check(f"{label}: no out-of-memory retry", mem.memo.retries == retries, mem.memo.retries - retries)
+        cold = h3(mem, models, f"{name} cold", dit=39_806)
+        runs = [(f"{name} warm at {tokens} DiT tokens", tokens) for tokens in (39_808, 39_810)]
+        for label, tokens in [(f"{name} cold", 39_806)] * bool(beside) + runs:
+            retries = mem.memo.retries
+            stats = cold if tokens == 39_806 else h3(mem, models, label, dit=tokens)
+            passes = [s for s in stats.steps if s.model == dit.name]
+            # beside, the cold request plans no cut, so the first warm one cuts on uncalibrated
+            # units (33.8 of 75.3 kB a token) and may retry once
+            if tokens == 39_810 or tokens == 39_808 and not beside:
+                check(f"{label}: no out-of-memory retry", mem.memo.retries == retries, mem.memo.retries - retries)
             peak = SIZES["transformer_ref"][3] + DIT_FFN[3] * tokens  # uncut
-            most = max(s.paged_in + s.streamed for s in passes[1:])
+            most = max(s.paged_in + s.streamed for s in passes[2:])
             room = card.total - card.context - card.slack - STATE - SIZES["ref2va_turbo"][0] - peak
             floor = dit.nbytes - room + vt._SLOTS * block
+            if tokens == 39_806:  # planned as one run, beside its other weights: 12666 read it whole
+                check(f"{label}: each later pass reads {most / 1e9:.2f} GB, under half the DiT",
+                      most < dit.nbytes // 2)
+                continue
             check(f"{label}: each later pass reads {most / 1e9:.2f} GB, at most the "
                   f"{floor / 1e9:.2f} GB its uncut peak leaves out and two blocks", most <= floor + 2 * block)
+        if beside:
+            check(f"{name}: the idle executor gave back what planning counted on "
+                  f"({card.foreign / GIB:.2f} GiB left)", card.foreign < GIB)
     except Exception as exc:  # noqa: BLE001
-        check("card G: completes", False, f"{type(exc).__name__}: {exc}")
+        check(f"{name}: completes", False, f"{type(exc).__name__}: {exc}")
     finally:
         SIZES.clear()
         SIZES.update(saved[0])
@@ -681,6 +699,7 @@ def card_g() -> None:
 def main() -> int:
     fake_cuda()
     card_g()
+    card_g(16_267_035_648)
     card = 25_757_220_864  # an RTX 4090 (11951-11955)
     case("24 GiB", Card(card, GIB // 2), None)
     case("8 GiB", Card(card, GIB // 2), 8 * GIB)

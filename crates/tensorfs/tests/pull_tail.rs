@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pull_support::*;
-use tensorfs::fetch::{Config, Fetcher, HttpOrigin, ObjectStore, Origin, Want};
+use tensorfs::fetch::{Config, Fetcher, Endpoint, ObjectStore, Origin, Want};
 
 async fn pull(server: &Server, name: &str, config: Config) -> (Duration, Fetcher, Scratch) {
     let root = temporary(&format!("{}-store", name.replace('/', "-")));
@@ -21,7 +21,7 @@ async fn pull(server: &Server, name: &str, config: Config) -> (Duration, Fetcher
         None,
         config,
     );
-    let origin: Arc<dyn Origin> = Arc::new(HttpOrigin::new(&client(), &server.base).unwrap());
+    let origin: Arc<dyn Origin> = Arc::new(Endpoint::new(&client(), &server.base, None).unwrap().anonymous());
     let started = Instant::now();
     let pulled = fetcher
         .pull(&origin, name, None, Some("int8"), &Want::default())

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mines vectors/cases/comfy.json: comfy.asym_w4a8_int8, comfy.w6a8_int8 and comfy.convrot_w4a4.
+"""Mines vectors/cases/comfy.json: comfy.asym_w4a8_int8, comfy.w6a8_int8 and int4.convrot (kitchen's convrot_w4a4).
 
 Producers, on CPU (PyTorch 2.14.1, one thread):
 - comfy-kitchen 0.2.39's eager quantizers: quantize_w4a8_int8_weight at 4 and 6 bits (its defaults, as ComfyUI
@@ -65,6 +65,10 @@ def part(role, t_or_dtype, shape=None, bits=None):
     return {"bits": b64(bits), "dtype": t_or_dtype, "role": role, "shape": list(shape)}
 
 
+def rot(b):
+    return {"rotation": "kron_regular_h4", "rotation_size": b}
+
+
 def case(key, scheme, dtype, shape, params, parts, expect=None, **extra):
     c = {"component": scheme if expect is not None else "refuse", "dtype": dtype,
          "encoding": {"params": params, "scheme": scheme}, "key": key, "parts": parts, "shape": list(shape)}
@@ -76,7 +80,7 @@ def case(key, scheme, dtype, shape, params, parts, expect=None, **extra):
 # ------------------------------------------------------------------ the spec's decode
 
 
-def hadamard(b):
+def kron_regular_h4(b):
     h4 = torch.tensor([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=torch.int64)
     h = h4
     while h.shape[0] < b:
@@ -88,7 +92,7 @@ def spec(L, q8, s, b, corr=None, g=None) -> bytes:
     """round_L(((y x s[i]) + z) x 2^-k), y = q8 . H_B exact, z = sum_b corr(i, b) x M_b left to right."""
     r, c = q8.shape
     k = b.bit_length() // 2
-    h = hadamard(b)
+    h = kron_regular_h4(b)
     v = (q8.long().reshape(r, c // b, b) @ h).float() * s.float().reshape(r, 1, 1)
     if corr is not None:
         ct, z = corr.float().t(), torch.empty_like(v)
@@ -137,14 +141,14 @@ def grouped(key, L, n, k, gs, b, bits=4, seed=1, heavy=False, **opts):
     expect = spec(L, q8, s_ch, b, corr, gs)
     kit = dequantize_w4a8_int8_weight(qd, s_rel, s_ch, cb, corr, gs, b, TORCH[L])
     print(f"{key}: against kitchen's dequantize in {L}: {differ(L, expect, raw(kit))}")
-    parts = [part("weight", qd), part("weight_s_rel", s_rel), part("weight_s_channel", s_ch)]
+    parts = [part("weight", qd), part("group_scale", s_rel), part("scale", s_ch)]
     if cb is not None:
-        parts.append(part("weight_codebook", cb))
+        parts.append(part("codebook", cb))
     if corr is not None:
-        parts.append(part("weight_correction", corr))
+        parts.append(part("correction", corr))
     source = b64(raw(w.float()))
     extra = {"source": source} if not opts else {"kitchen": dict(opts, source=source)}
-    return case(key, scheme, L, [n, k], {"group_size": gs, "rotation_size": b}, parts, expect, **extra)
+    return case(key, scheme, L, [n, k], {"group_size": gs, **rot(b)}, parts, expect, **extra)
 
 
 def w4a4(key, L, n, k, b, seed):
@@ -153,8 +157,8 @@ def w4a4(key, L, n, k, b, seed):
     expect = spec(L, _unpack_int4_row_major(qd), s, b)
     kit = dequantize_convrot_w4a4_weight(qd, s, b, 64, TORCH[L])
     print(f"{key}: against kitchen's dequantize in {L}: {differ(L, expect, raw(kit))}")
-    return case(key, "comfy.convrot_w4a4", L, [n, k], {"rotation_size": b},
-                [part("weight", qd), part("weight_scale", s)], expect, source=b64(raw(w.float())))
+    return case(key, "int4.convrot", L, [n, k], rot(b),
+                [part("weight", qd), part("scale", s)], expect, source=b64(raw(w.float())))
 
 
 # ------------------------------------------------------------------ real files
@@ -182,13 +186,13 @@ def real(fmt):
     w = h[f"{module}.weight"]
     width = w["shape"][1]
     q = rows("weight", width).reshape(-1, width)
-    scheme, b = "comfy." + fmt, 256
+    scheme, b = "int4.convrot" if fmt == "convrot_w4a4" else "comfy." + fmt, 256
     if fmt == "convrot_w4a4":
         qd = q[:, :COLS // 2].contiguous().view(torch.int8)
         s = rows("weight_scale", 4).view(torch.float32)
         expect = spec("BF16", _unpack_int4_row_major(qd), s, b)
         kit = dequantize_convrot_w4a4_weight(qd, s, b, 64, torch.bfloat16)
-        parts, params = [part("weight", qd), part("weight_scale", s)], {"rotation_size": b}
+        parts, params = [part("weight", qd), part("scale", s)], rot(b)
     else:
         k = width * 8 // (4 if fmt == "asym_w4a8_int8" else 6)
         g = k // h[f"{module}.weight_s_rel"]["shape"][1]
@@ -203,9 +207,9 @@ def real(fmt):
                                                 base + t["data_offsets"][1])), dtype=torch.float32)
         expect = spec("BF16", _dequant_int4_grouped_to_int8(qd, s_rel, cb, g), s_ch, b)
         kit = dequantize_w4a8_int8_weight(qd, s_rel, s_ch, cb, None, g, b, torch.bfloat16)
-        parts = [part("weight", qd), part("weight_s_rel", s_rel), part("weight_s_channel", s_ch)]
-        parts += [part("weight_codebook", cb)] if cb is not None else []
-        params = {"group_size": g, "rotation_size": b}
+        parts = [part("weight", qd), part("group_scale", s_rel), part("scale", s_ch)]
+        parts += [part("codebook", cb)] if cb is not None else []
+        params = {"group_size": g, **rot(b)}
     key = f"real-{fmt.replace('_', '-')}"
     print(f"{key} ({repo}@{rev[:9]} {module} rows {r0}..{r1}): against kitchen: {differ('BF16', expect, raw(kit))}")
     return case(key, scheme, "BF16", [r1 - r0, COLS], params, parts, expect)
@@ -231,31 +235,34 @@ def refusals(lut, corr, w6, w4) -> list:
         return [new if p["role"] == role else p for p in base["parts"] if new is not None or p["role"] != role]
 
     z = lambda n: bytes(n)  # noqa: E731
-    asym = {"group_size": 48, "rotation_size": 16}
-    red("uneven-groups", lut, asym, [part("weight", "I8", [8, 32], z(256)), part("weight_s_rel", "F8_E4M3", [8, 2], z(16)),
-                                     part("weight_s_channel", "F32", [8], z(32))], [8, 64])
-    red("partial-rotation-block", lut, {"group_size": 16, "rotation_size": 256},
-        [part("weight", "I8", [8, 160], z(1280)), part("weight_s_rel", "F8_E4M3", [8, 20], z(160)),
-         part("weight_s_channel", "F32", [8], z(32))], [8, 320])
-    red("group-size-12", lut, {"group_size": 12, "rotation_size": 256})
-    red("codebook-8", lut, parts=swap(lut, "weight_codebook", part("weight_codebook", "F32", [8], z(32))))
+    asym = {"group_size": 48, **rot(16)}
+    red("uneven-groups", lut, asym, [part("weight", "I8", [8, 32], z(256)), part("group_scale", "F8_E4M3", [8, 2], z(16)),
+                                     part("scale", "F32", [8], z(32))], [8, 64])
+    red("partial-rotation-block", lut, {"group_size": 16, **rot(256)},
+        [part("weight", "I8", [8, 160], z(1280)), part("group_scale", "F8_E4M3", [8, 20], z(160)),
+         part("scale", "F32", [8], z(32))], [8, 320])
+    red("group-size-12", lut, {"group_size": 12, **rot(256)})
+    red("rotation-missing", lut, {"group_size": 16, "rotation_size": 256})
+    red("codebook-8", lut, parts=swap(lut, "codebook", part("codebook", "F32", [8], z(32))))
     rows = corr["shape"][0]
-    red("correction-row-major", corr, parts=swap(corr, "weight_correction",
-                                                 part("weight_correction", "BF16", [rows, 16], z(rows * 32))))
-    sr = next(p for p in lut["parts"] if p["role"] == "weight_s_rel")
-    red("s-rel-bf16", lut, parts=swap(lut, "weight_s_rel", part("weight_s_rel", "BF16", sr["shape"], z(2 * np.prod(sr["shape"])))))
+    red("correction-row-major", corr, parts=swap(corr, "correction",
+                                                 part("correction", "BF16", [rows, 16], z(rows * 32))))
+    sr = next(p for p in lut["parts"] if p["role"] == "group_scale")
+    red("s-rel-bf16", lut, parts=swap(lut, "group_scale", part("group_scale", "BF16", sr["shape"], z(2 * np.prod(sr["shape"])))))
     nan = bytearray(base64.b64decode(sr["bits"]))
     nan[5] = 0x7F
-    red("s-rel-nan", lut, parts=swap(lut, "weight_s_rel", dict(sr, bits=b64(nan))))
+    red("s-rel-nan", lut, parts=swap(lut, "group_scale", dict(sr, bits=b64(nan))))
     red("mma-packed", lut, dict(lut["encoding"]["params"], mma_packed=True))
     red("w6a8-group-8", w6, dict(w6["encoding"]["params"], group_size=8))
     n, k = w6["shape"]
     red("w6a8-nibble-width", w6, parts=swap(w6, "weight", part("weight", "I8", [n, k // 2], z(n * k // 2))))
-    red("w6a8-codebook", w6, parts=w6["parts"] + [part("weight_codebook", "F32", [16], z(64))])
+    red("w6a8-codebook", w6, parts=w6["parts"] + [part("codebook", "F32", [16], z(64))])
     n, k = w4["shape"]
-    red("w4a4-group-scales", w4, parts=swap(w4, "weight_scale", part("weight_scale", "F32", [n, k // 64], z(4 * n * k // 64))))
+    red("w4a4-group-scales", w4, parts=swap(w4, "scale", part("scale", "F32", [n, k // 64], z(4 * n * k // 64))))
     red("w4a4-quant-group-size", w4, dict(w4["encoding"]["params"], quant_group_size=64))
-    red("w4a4-scale-bf16", w4, parts=swap(w4, "weight_scale", part("weight_scale", "BF16", [n], z(2 * n))))
+    red("w4a4-scale-bf16", w4, parts=swap(w4, "scale", part("scale", "BF16", [n], z(2 * n))))
+    red("w4a4-weight-scale-role", w4, parts=swap(w4, "scale", dict(next(p for p in w4["parts"] if p["role"] == "scale"),
+                                                                   role="weight_scale")))
     return reds
 
 
@@ -263,7 +270,7 @@ def experts(c) -> dict:
     """A stack [2, R/2, C] of the same parts: leading axes are rows."""
     n, k = c["shape"]
     stack = lambda p, last: dict(p, shape=[2, n // 2, last])  # noqa: E731
-    parts = [stack(p, p["shape"][-1]) if p["role"] in ("weight", "weight_s_rel") else p for p in c["parts"]]
+    parts = [stack(p, p["shape"][-1]) if p["role"] in ("weight", "group_scale") else p for p in c["parts"]]
     out = dict(c, key=c["key"].replace("lut", "experts"), shape=[2, n // 2, k], parts=parts)
     out.pop("source", None)
     return out

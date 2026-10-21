@@ -25,17 +25,14 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
 
-use tensorfs::ids::ObjectRef;
 use platform::shm::{self, Region, RESIZE_SEALS, WRITE_SEALS};
 
-use crate::ceiling::Copy;
-use crate::cuda;
 use crate::io::{IoTally, Mode, Source};
-use crate::layout::{ItemSource, Layout, PART_ALIGN};
+use tensorfs::io::{Dst, pins::PinnedRanges};
+use crate::layout::{Layout, PART_ALIGN};
 use crate::{lock, Error, Result};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN03");
@@ -52,13 +49,6 @@ const FAILED: u32 = 2;
 /// adopter waits for it; it reads the weight set's object files instead. The machine may stage
 /// it later (`OpenFill::stage`), which clears the bit before the first byte lands.
 const HOLE: u32 = 4;
-
-/// A region's page lock in this process (`HostMem::pin_region`): never copied, registered,
-/// refused, copied once unlocked.
-const PIN_NONE: u8 = 0;
-const PIN_YES: u8 = 1;
-const PIN_REFUSED: u8 = 2;
-const PIN_ONCE: u8 = 3;
 
 fn ext_off(regions: usize) -> usize {
     (WORDS_OFF + 4 * regions).next_multiple_of(8)
@@ -294,12 +284,8 @@ pub struct HostMem {
     regions: usize,
     /// A sealed layout, mapped read-only: never written, never punched by this process.
     sealed: bool,
-    /// Registered ranges (offset, context as an address): unregistered at drop at the latest,
-    /// since unmapping a registered range leaves the driver a stale pinned range at that VA.
-    registered: Mutex<Vec<(u64, usize)>>,
-    /// Each region's page lock (`pin_region`); taken under `pinning`.
-    pinned: Vec<AtomicU8>,
-    pinning: Mutex<()>,
+    /// TensorFS registrations end before this mapping is punched or unmapped.
+    registrations: PinnedRanges,
     /// A streamed layout: its slots hold the regions; None, the regions sit at their offsets.
     window: Option<Window>,
     /// This process's readers per region of a streamed layout: one claim per description, held
@@ -489,9 +475,8 @@ impl HostMem {
             map_len,
             regions,
             sealed,
-            registered: Mutex::new(Vec::new()),
-            pinned: (0..regions).map(|_| AtomicU8::new(PIN_NONE)).collect(),
-            pinning: Mutex::new(()),
+            // SAFETY: HostMem owns the live mapping and clears guards before unmapping it.
+            registrations: unsafe { PinnedRanges::new(ptr as *mut u8, data, regions, sealed) },
             window,
             readers: Mutex::new(HashMap::new()),
         })
@@ -647,9 +632,8 @@ impl HostMem {
             map_len,
             regions,
             sealed,
-            registered: Mutex::new(Vec::new()),
-            pinned: (0..regions).map(|_| AtomicU8::new(PIN_NONE)).collect(),
-            pinning: Mutex::new(()),
+            // SAFETY: HostMem owns the live mapping and clears guards before unmapping it.
+            registrations: unsafe { PinnedRanges::new(ptr as *mut u8, data, regions, sealed) },
             window: None,
             readers: Mutex::new(HashMap::new()),
         };
@@ -770,105 +754,29 @@ impl HostMem {
         let _ = self.lock(r, Region::Unlock, false);
     }
 
-    /// Page-lock `[off, off+len)` for DMA from every context (PORTABLE). The caller binds a
-    /// context first.
+    /// TensorFS owns every page lock; this mapping owns the guards' lifetime.
     pub fn register(&self, off: u64, len: u64) -> Result<()> {
-        let d = cuda::driver()?;
-        // SAFETY: the range lies inside our live mapping and is page aligned.
-        let rc = unsafe {
-            (d.mem_host_register)(
-                self.ptr.add(off as usize) as *mut libc::c_void,
-                len as usize,
-                cuda::MEMHOSTREGISTER_PORTABLE | if self.sealed { cuda::MEMHOSTREGISTER_READ_ONLY } else { 0 },
-            )
-        };
-        if rc == cuda::ERROR_HOST_MEMORY_ALREADY_REGISTERED {
-            return Ok(());
-        }
-        cuda::check("cuMemHostRegister", rc)?;
-        let mut ctx: cuda::CUcontext = std::ptr::null_mut();
-        // SAFETY: out-param.
-        unsafe { (d.ctx_get_current)(&mut ctx) };
-        lock(&self.registered).push((off, ctx as usize));
-        Ok(())
+        self.registrations.register(off, len).map_err(Into::into)
     }
+    pub fn pin_region(&self, region: u32, off: u64, len: u64) -> bool {
+        if crate::faults::hit("pin").is_err() { return false; }
+        self.registrations.pin_region(region, off, len)
+    }
+    pub fn unpin_region(&self, region: u32, off: u64) -> Result<()> {
+        self.registrations.unpin_region(region, off).map_err(Into::into)
+    }
+    pub fn unpin_all(&self) -> Result<()> { self.registrations.clear().map_err(Into::into) }
+    pub fn unregister(&self, off: u64) -> Result<()> { self.registrations.unregister(off).map_err(Into::into) }
 
-    /// Whether region `r` (`[off, off + len)`) copies to a device as one DMA: page-locked on
-    /// its second copy, and kept until `unpin_region` or the layout closes. A first copy (a
-    /// refill) goes through the staging buffers: locking 4 KiB pages runs at about 15 GB/s and
-    /// does not scale with threads (4090 host, run 11942), below a GPU's H2D ceiling; a region
-    /// copied again (streamed) pays it once. A refused region is never asked again. A sealed
-    /// layout is mapped read-only, so only a driver that locks read-only memory can lock it (an
-    /// RTX 4070 or 4090 answers NOT_SUPPORTED): that answer holds for the whole layout. Only a
-    /// region whose bytes exist (Ready). The caller binds a context first.
-    pub fn pin_region(&self, r: u32, off: u64, len: u64) -> bool {
-        let state = &self.pinned[r as usize];
-        let _g = lock(&self.pinning);
-        match state.load(Ordering::Acquire) {
-            PIN_YES => true,
-            PIN_REFUSED => false,
-            PIN_NONE => {
-                state.store(PIN_ONCE, Ordering::Release);
-                false
-            }
-            _ => match crate::faults::hit("pin").and_then(|_| self.register(off, len)) {
-                Ok(()) => {
-                    state.store(PIN_YES, Ordering::Release);
-                    true
-                }
-                Err(Error::Cuda { code: cuda::ERROR_NOT_SUPPORTED, .. }) if self.sealed => {
-                    self.pinned.iter().for_each(|s| s.store(PIN_REFUSED, Ordering::Release));
-                    false
-                }
-                Err(_) => {
-                    state.store(PIN_REFUSED, Ordering::Release);
-                    false
-                }
-            },
-        }
-    }
-
-    /// Unlock region `r` before its RAM is punched; a refill locks it again. The caller binds a
-    /// context first.
-    pub fn unpin_region(&self, r: u32, off: u64) -> Result<()> {
-        let _g = lock(&self.pinning);
-        if self.pinned[r as usize].swap(PIN_NONE, Ordering::AcqRel) == PIN_YES {
-            self.unregister(off)?;
-        }
-        Ok(())
-    }
-
-    /// Unlock every region this process locked (a plane closing, while its context lives).
-    pub fn unpin_all(&self) -> Result<()> {
-        let _g = lock(&self.pinning);
-        let offsets: Vec<u64> = lock(&self.registered).iter().map(|r| r.0).collect();
-        for off in offsets {
-            self.unregister(off)?;
-        }
-        for state in &self.pinned {
-            state.store(PIN_NONE, Ordering::Release);
-        }
-        Ok(())
-    }
-
-    pub fn unregister(&self, off: u64) -> Result<()> {
-        let d = cuda::driver()?;
-        // SAFETY: `off` is the start of a range this process registered.
-        cuda::check("cuMemHostUnregister", unsafe {
-            (d.mem_host_unregister)(self.ptr.add(off as usize) as *mut libc::c_void)
-        })?;
-        lock(&self.registered).retain(|r| r.0 != off);
-        Ok(())
-    }
 }
 
 impl Drop for HostMem {
     fn drop(&mut self) {
-        // A plane that never closed (poisoned) still owns registrations: end them first.
-        for (off, ctx) in std::mem::take(self.registered.get_mut().unwrap()) {
-            if let Ok(_g) = cuda::CtxGuard::enter(ctx as cuda::CUcontext) {
-                let _ = self.unregister(off);
-            }
+        if let Err(error) = self.registrations.clear() {
+            // A failed unregister still names these pages. Keep the mapping alive rather
+            // than leave the driver with a stale address; the process owns it until exit.
+            tracing::warn!("varena: retained host mapping after unregister failure: {error}");
+            return;
         }
         // SAFETY: unmapping our own mapping, now unregistered.
         unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.map_len) };
@@ -1012,85 +920,16 @@ impl OpenFill {
         Ok(taken.iter().map(|&r| layout.regions[r as usize].span).sum())
     }
 
-    /// Logged as a `disk` copy run against the volume's ceiling.
+    /// TensorFS fills each region before its placement READY word is published.
     fn copy(&self, layout: &Layout, wanted: &[u32], source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
-        let (t, host) = (Instant::now(), &self.host);
-        let counts = || [&tally.cached_bytes, &tally.direct_bytes, &tally.buffered_bytes, &tally.inline_bytes].map(|c| c.load(Ordering::Relaxed));
-        let before = counts();
-        let mut region_of = Vec::new();
-        for &r in wanted {
-            region_of.extend(std::iter::repeat_n(r as usize, layout.regions[r as usize].items.len()));
+        for &region in wanted {
+            let layout = &layout.regions[region as usize];
+            // SAFETY: each selected region is exclusively owned by this fill until READY.
+            let ptr = unsafe { self.host.base().add(layout.offset as usize) };
+            unsafe { source.read_items(&layout.items, layout.offset,
+                Dst::Host { ptr, len: layout.nbytes as usize }, threads, Mode::Cache, tally) }?;
+            self.host.set_ready(region, true);
         }
-        let pending: Vec<AtomicUsize> = layout.regions.iter().map(|r| AtomicUsize::new(r.items.len())).collect();
-        for &r in wanted {
-            if layout.regions[r as usize].items.is_empty() {
-                host.set_ready(r, true);
-            }
-        }
-        let items: Vec<_> = wanted.iter().flat_map(|&r| layout.regions[r as usize].items.iter()).collect();
-        let mut index: HashMap<&str, usize> = HashMap::new();
-        let mut objects: Vec<&ObjectRef> = Vec::new();
-        let owner: Vec<Option<usize>> = items
-            .iter()
-            .map(|it| match &it.source {
-                ItemSource::Object(o) => Some(*index.entry(o.obj.sha256.as_str()).or_insert_with(|| {
-                    objects.push(&o.obj);
-                    objects.len() - 1
-                })),
-                ItemSource::Inline(_) => None,
-            })
-            .collect();
-        let left: Vec<AtomicUsize> = (0..objects.len()).map(|_| AtomicUsize::new(0)).collect();
-        for o in owner.iter().flatten() {
-            left[*o].fetch_add(1, Ordering::Relaxed);
-        }
-        let resident: Vec<OnceLock<bool>> = (0..objects.len()).map(|_| OnceLock::new()).collect();
-        let next = AtomicUsize::new(0);
-        let failed: Mutex<Option<Error>> = Mutex::new(None);
-        std::thread::scope(|s| {
-            for _ in 0..threads.clamp(1, items.len().max(1)) {
-                s.spawn(|| loop {
-                    let k = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(it) = items.get(k) else { return };
-                    let mode = match owner[k] {
-                        Some(o) if *resident[o].get_or_init(|| source.resident(objects[o], tally).unwrap_or(false)) => Mode::Cached,
-                        Some(_) => Mode::Cache,
-                        None => Mode::Cached,
-                    };
-                    // SAFETY: each item's range (and its padding) is this thread's alone; the layout
-                    // keeps items disjoint inside the live mapping.
-                    let dst = unsafe { host.base().add(it.offset as usize) };
-                    if let Err(e) = unsafe { source.read_item(it, dst, mode, tally) } {
-                        lock(&failed).get_or_insert(e);
-                        next.store(items.len(), Ordering::Relaxed);
-                        return;
-                    }
-                    if let Some(o) = owner[k] {
-                        if left[o].fetch_sub(1, Ordering::AcqRel) == 1 {
-                            source.close_object(&objects[o].sha256);
-                        }
-                    }
-                    // The region's last item: its bytes are all in, so adopters may use it.
-                    let r = region_of[k];
-                    if pending[r].fetch_sub(1, Ordering::AcqRel) == 1 {
-                        host.set_ready(r as u32, true);
-                    }
-                });
-            }
-        });
-        if let Some(e) = failed.into_inner().unwrap() {
-            return Err(e);
-        }
-        let moved = counts().iter().zip(before).map(|(a, b)| a - b).collect::<Vec<_>>();
-        crate::ceiling::record(Copy {
-            kind: "disk",
-            gpu: -1,
-            bytes: moved.iter().sum(),
-            ns: t.elapsed().as_nanos() as u64,
-            ceiling: source.disk_ceiling(&objects, tally).unwrap_or(0.0),
-            cached: moved[0],
-            ..Default::default()
-        });
         Ok(())
     }
 }

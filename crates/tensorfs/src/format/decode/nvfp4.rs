@@ -1,13 +1,14 @@
 //! `nvfp4` (spec §6 `nvfp4`): NVIDIA's NVFP4, an E2M1 element per weight, an E4M3 scale per 16
 //! elements of a row, a global scale per matrix and optionally AWQ's per-column factor.
 
-use super::affine::{Codes, Fill, Order, Packing};
+use super::affine::{Fill, Order, Packing, BYTES};
 use super::grid::Grid;
-use super::mxfp8::{SCALE_LAYOUT, blocks};
-use super::{Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View, elem, logical, one, table};
+use super::mxfp8::{blocks, SCALE_LAYOUT};
+use super::plan::{Codes, Core, Elems, Post};
+use super::{elem, logical, one, Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View};
 use crate::format::Result;
 
-const F32: Dtypes = Dtypes::Of(&["F32"]);
+const F32: Dtypes = &["F32"];
 
 pub const NVFP4: Scheme = Scheme {
     name: "nvfp4",
@@ -26,24 +27,16 @@ pub const NVFP4: Scheme = Scheme {
             allowed: Allowed::Text(&["low_first", "high_first"]),
         },
         SCALE_LAYOUT,
-        Param {
-            key: "pre_quant_scale_dtype",
-            allowed: Allowed::PartDtype("pre_quant_scale", &["F32", "BF16", "F16"]),
-        },
     ],
     parts: &[
-        Part::req("weight", Dtypes::Of(&["F4"]), logical),
-        Part::req("scale", Dtypes::Of(&["F8_E4M3"]), |c| {
+        Part::req("weight", &["F4"], logical),
+        Part::req("scale", &["F8_E4M3"], |c| {
             whole_blocks(c)?;
             blocks(c).shape(c)
         }),
         Part::req("scale_2", F32, |c| per_matrix(c, "scale_2")),
         Part::opt("input_scale", F32, |c| per_matrix(c, "input_scale")),
-        Part::opt(
-            "pre_quant_scale",
-            Dtypes::Param("pre_quant_scale_dtype"),
-            |c| Grid::Col.shape(c),
-        ),
+        Part::opt("pre_quant_scale", &["F32", "BF16", "F16"], |c| Grid::Col.shape(c)),
     ],
     decode,
 };
@@ -65,41 +58,32 @@ fn per_matrix(c: &Ctx, role: &str) -> Result<Shape> {
 
 /// Matrix by matrix with its own `g`: `multiply` `((table[q] × s) × g) × p`; `divide`
 /// `(table[q] × (s ÷ g)) × p`, `p` the `pre_quant_scale` of the column where there is one.
-fn decode(c: &Ctx) -> Result<Vec<f32>> {
+fn decode<'a>(c: &Ctx<'a>) -> Result<Plan<'a>> {
     let order = match c.text("nibble_order") {
         "low_first" => Order::LowFirst,
         _ => Order::HighFirst,
     };
     let packing = Packing {
         bits: 4,
-        word: 8,
-        transposed: false,
-        axis: 1,
         fill: Fill::Word,
         order,
-        codes: Codes::Unsigned(0),
+        ..BYTES
     };
-    let q = packing.unpack(c.part("weight").bytes, c.rows, c.cols)?;
-    let e2m1: Vec<f32> = (0..16).map(elem::e2m1).collect();
-    let (s, g) = (c.floats("scale"), c.floats("scale_2"));
-    let divide = c.text("global_scale") == "divide";
-    let (n, matrices) = table::matrices(c, &q, &s);
-    let mut out = Vec::with_capacity(c.rows * c.cols);
-    for (m, (q, s)) in matrices.into_iter().enumerate() {
-        let g = g[if g.len() == 1 { 0 } else { m }];
-        if divide {
-            let s: Vec<f32> = s.iter().map(|v| v / g).collect();
-            out.extend(table::decode(q, &e2m1, &s, &blocks(c), n, c.cols)?);
-        } else {
-            let v = table::decode(q, &e2m1, s, &blocks(c), n, c.cols)?;
-            out.extend(v.into_iter().map(|v| v * g));
-        }
-    }
-    if c.has("pre_quant_scale") {
-        let p = c.floats("pre_quant_scale");
-        out.iter_mut()
-            .enumerate()
-            .for_each(|(k, v)| *v *= p[k % c.cols]);
-    }
-    Ok(out)
+    let global = (
+        Elems::part(c.part("scale_2")),
+        c.text("global_scale") == "divide",
+    );
+    let codes = Codes {
+        table: Some((0..16).map(elem::e2m1).collect()),
+        global: Some(global),
+        ..Codes::new(c.part("weight").bytes, packing, c.part("scale"), blocks(c))
+    };
+    let post = match c.has("pre_quant_scale") {
+        true => Post::Cols(Elems::part(c.part("pre_quant_scale"))),
+        false => Post::None,
+    };
+    Ok(Plan {
+        core: Core::Codes(codes),
+        post,
+    })
 }

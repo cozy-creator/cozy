@@ -198,6 +198,10 @@ impl Engine {
     pub fn workspace_id(&self) -> String {
         self.journal.lock().unwrap().workspace_id().into()
     }
+    /// The run objects' store (`cas`), beside the journal.
+    pub fn cas(&self) -> crate::cas::Cas {
+        crate::cas::Cas::new(self.root.join("objects"))
+    }
     pub fn installation(
         &self,
         actor: &str,
@@ -1238,17 +1242,8 @@ impl Drop for Spool {
 /// Walk relative components using openat+NOFOLLOW: no symlink or parent escape races.
 /// A tree manifest's members: each file's (sha256 hex, length).
 pub(crate) fn tree_members(manifest: &[u8]) -> io::Result<Vec<(String, u64)>> {
-    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "tree manifest has an invalid entry");
-    let document: Value = serde_json::from_slice(manifest).map_err(|_| invalid())?;
-    document["entries"]
-        .as_array()
-        .ok_or_else(invalid)?
-        .iter()
-        .map(|entry| {
-            let sha = entry["blob"]["sha256"].as_str().filter(|h| h.len() == 64).ok_or_else(invalid)?;
-            Ok((sha.to_string(), entry["blob"]["length"].as_u64().ok_or_else(invalid)?))
-        })
-        .collect()
+    let files = crate::trees::parse(manifest)?;
+    Ok(files.into_values().map(|o| (o.sha256, o.length)).collect())
 }
 
 pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
@@ -1471,7 +1466,7 @@ mod tests {
         let sha = tensorfs::sha256::hex_digest(member);
         fs::write(spool.0.join(format!("sha256-{sha}")), member).unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({"entries": [
-            {"path": "member.txt", "blob": {"sha256": sha, "length": member.len()}}
+            {"kind": "file", "path": "member.txt", "blob": {"sha256": sha, "length": member.len()}}
         ]})).unwrap();
         fs::write(spool.0.join("tree-manifest"), &manifest).unwrap();
         let tree = crate::journal::AssetBinding {
@@ -1499,7 +1494,7 @@ mod tests {
         let disk = || Ok(crate::reclaim::Disk { capacity: 1 << 30, available: 0, inodes: 0, available_inodes: 0 });
         let swept = crate::reclaim::sweep(&crate::reclaim::Caches {
             engine: &engine, catalog: &catalog, bound: &bound, kernels: None, memo: None,
-            uv_cache: None, store: None, disk: &disk,
+            uv_cache: None, disk: &disk,
         }).unwrap();
         assert_eq!(swept.results, 0);
         assert_eq!(held.len(), 3);

@@ -83,54 +83,40 @@ def conflicts(interpreter: Path, step: subprocess.CompletedProcess | None = None
     return {line for line in lines if line.startswith("The package") and not line.endswith("was built for a different platform")}
 
 
-SDK = {"cozy-runtime", "tensorfs"}
-
-
-def pair_bound(finding: str) -> bool:
-    """Whether a check finding (`The package `x` requires `tensorfs==0.10.0`, but ...`) is a
-    bound on the Runtime or TensorFS."""
-    required = finding.partition("` requires `")[2]
-    return canonicalize_name("".join(itertools.takewhile(lambda c: c.isalnum() or c in "-_.", required)) or "-") in SDK
-
-
-def machine_sdk(interpreter: Path, sdk: list[Path], capture, runtime_build: str = "") -> str:
-    """The machine's own Runtime/TensorFS pair over the captured closure, every other selected
-    version constrained, where every installed requirement admits it (uv's check). Else the
-    capture's own pair (a vendored dev Runtime, say) is restored: a package's bounds are never
-    overridden, except by a development Runtime an update named (`--runtime-wheel`,
-    `runtime_build`): the operator's choice runs whatever the package's bounds on the pair, which
-    the warning names, and one that cannot install refuses the package, as for a release.
-    Returns "" for the machine's pair, else why and what runs instead; never silent."""
+def machine_sdk(interpreter: Path, sdk: list[Path]) -> str:
+    """This machine's own Runtime/TensorFS pair over the captured closure, always: version skew
+    is allowed. Every other selected version stays exact: the closure's versions constrain the
+    install, and one the pair's own requirements reject is kept while the pair goes in without
+    its dependencies, which is the warning returned ("" when there is none)."""
     pair = {canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk}
-    # A conflict the capture already has is not the pair's doing: the pair is refused only for one it adds.
-    before = conflicts(interpreter)
     kept = interpreter.parents[2] / "sdk-constraints.txt"
     kept.write_text("".join(f"{row.name}=={row.version}\n" for row in inventory(interpreter)
                             if canonicalize_name(row.name) not in pair))
-    step = subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(kept), *map(str, sdk)],
-                          stderr=subprocess.PIPE, text=True)
+    install = ["uv", "pip", "install", *COPY, "--python", str(interpreter), *map(str, sdk)]
+    step = subprocess.run([*install, "-c", str(kept)], stderr=subprocess.PIPE, text=True)
     sys.stderr.write(step.stderr)
     if step.returncode == 0:
-        step = subprocess.run(["uv", "pip", "check", "--python", str(interpreter)], capture_output=True, text=True)
-        added = conflicts(interpreter, step) - before
-        if step.returncode == 0 or not added:
-            return ""
-        if runtime_build and all(map(pair_bound, added)):
-            regardless = (f"{'; '.join(sorted(added))}; this machine's development Runtime {runtime_build} "
-                          "(`--runtime-wheel`) runs it regardless")
-            print(regardless, file=sys.stderr)
-            return regardless
-    reason = [line.strip() for line in ((step.stdout or "") + step.stderr).splitlines()
-              if line.strip() and not line.startswith(("Using Python", "Checked "))][-12:]
-    if runtime_build:
-        raise PackageError("package_installation_uv_failed",
-                           f"this machine's development Runtime {runtime_build} cannot run this package: {' | '.join(reason)[:2000]}")
-    capture()
-    own = ", ".join(f"{row.name}=={row.version}" for row in inventory(interpreter) if canonicalize_name(row.name) in pair)
-    fallback = (f"this machine's own Runtime and TensorFS did not install ({' '.join(map(str, step.args[:3]))}: "
-                f"{' | '.join(reason)[:2000]}); it runs the package's own {own}")
-    print(fallback, file=sys.stderr)
-    return fallback
+        return ""
+    reason = " | ".join([line.strip() for line in step.stderr.splitlines() if line.strip()][-12:])[:1000]
+    bare = subprocess.run([*install, "--no-deps"], stderr=subprocess.PIPE, text=True)
+    sys.stderr.write(bare.stderr)
+    if bare.returncode != 0:
+        raise PackageError("package_installation_uv_failed", f"this machine's Runtime and TensorFS do not install here: {reason}")
+    return f"this machine's Runtime and TensorFS want versions the captured lock does not hold, which it keeps ({reason})"
+
+
+def checked(interpreter: Path, note: str, runtime_build: str = "") -> str:
+    """The run's warning: `note`, then every requirement an installed version misses (uv's check,
+    the package's bounds on the pair included), never a refusal; a development Runtime an update
+    named (`--runtime-wheel`) says it runs regardless. "" when there is nothing to say."""
+    found = sorted(conflicts(interpreter))
+    warnings = [*([note] if note else []), *(["uv pip check: " + "; ".join(found)] if found else [])]
+    if warnings and runtime_build:
+        warnings.append(f"this machine's development Runtime {runtime_build} (`--runtime-wheel`) runs it regardless")
+    warning = "; ".join(warnings)[:4000]
+    if warning:
+        print(warning, file=sys.stderr)
+    return warning
 
 
 def interpreter_for(python: str, python_requires: str, python_version: str) -> str:
@@ -161,18 +147,15 @@ def without(requirements: Path, names: set[str], out: Path) -> Path:
     return out
 
 
-def add_client(interpreter: Path, constraints: Path, client_wheel: Path, runtime_build: str = "") -> None:
+def add_client(interpreter: Path, constraints: Path, client_wheel: Path) -> None:
     """The machine client beside a selected closure: it may add its own dependencies only
-    without changing one already selected package or SDK version (uv reports any conflict). A
-    development Runtime's misses of the package's bounds on the pair are the operator's choice."""
+    without changing one already selected package or SDK version."""
     locked = inventory(interpreter)
     constraints.write_text("".join(f"{row.name}=={row.version}\n" for row in locked))
     subprocess.run(["uv", "pip", "install", *COPY, "--python", str(interpreter), "-c", str(constraints), str(client_wheel)], check=True)
     after = {canonicalize_name(row.name): row.version for row in inventory(interpreter)}
     if any(after.get(canonicalize_name(row.name)) != row.version for row in locked):
         raise PackageError("package_lock_changed", "client installation changed the captured dependency closure")
-    if found := sorted(f for f in conflicts(interpreter) if not (runtime_build and pair_bound(f))):
-        raise PackageError("package_dependency_conflict", "; ".join(found)[:2000])
 
 
 def live_paths(environment: Path) -> None:
@@ -213,8 +196,7 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
             """The project's own selection, without the `machine` SDK distributions the machine's pair
             replaces next (the lock's may not install here: TensorFS has no aarch64 wheel on PyPI).
             An unlocked project resolves with the pair's wheels offered, where its bounds admit
-            them: PyPI's may not install here either (no macOS TensorFS wheel). Run again with
-            none, it restores what the machine's pair replaced."""
+            them: PyPI's may not install here either (no macOS TensorFS wheel)."""
             if (project / "uv.lock").is_file():
                 # Each carried distribution at the version the lock selected, from its own
                 # files (uv picks the one this platform takes); the lock installs the rest,
@@ -246,9 +228,9 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
             live_paths(environment)
 
         capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
-        fallback = machine_sdk(interpreter, sdk, capture, runtime_build) if sdk else ""
-        add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel, runtime_build)
-        ready.write_text(fallback)
+        note = machine_sdk(interpreter, sdk) if sdk else ""
+        add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel)
+        ready.write_text(checked(interpreter, note, runtime_build))
     generations.mkdir(parents=True, exist_ok=True)
     root = generations.resolve() / uuid.uuid4().hex
     root.mkdir(); (root / ".hold").touch()
@@ -304,8 +286,7 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
 
         def capture(machine: set[str] = frozenset()):
             """The capture's own selection, without the `machine` SDK distributions the machine's pair
-            installs next: the pair is installed once, never the capture's first and then replaced.
-            Run again with none, it restores what the machine's pair replaced."""
+            installs next: the pair is installed once, never the capture's first and then replaced."""
             offered = [str(wheel) for wheel in sdk] if machine else []
             if frozen:
                 # UV_PROJECT_ENVIRONMENT is a standard destination configuration value.
@@ -345,9 +326,9 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
                     subprocess.run(install, check=True)
 
         capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
-        fallback = machine_sdk(interpreter, sdk, capture, runtime_build) if sdk else ""
-        add_client(interpreter, root / "captured-constraints.txt", client_wheel, runtime_build)
-        return publish_generation(root, metadata, None, callees, fallback)
+        note = machine_sdk(interpreter, sdk) if sdk else ""
+        add_client(interpreter, root / "captured-constraints.txt", client_wheel)
+        return publish_generation(root, metadata, None, callees, checked(interpreter, note, runtime_build))
     except BaseException:
         shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched
         raise

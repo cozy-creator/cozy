@@ -1,4 +1,4 @@
-//! Rentals and run capabilities at a real Tensorhub, which Tensorhub's dev-build `cozy_ref` job
+//! Rentals and runs' Hub access at a real Tensorhub, which Tensorhub's dev-build `cozy_ref` job
 //! starts: TENSORHUB_ORIGIN is its https origin (the job's SSL_CERT_FILE trusts it), TENSORHUB_LOG
 //! where it writes emailed codes; COZY_TEST_TENSORD the machine. No rental is bought here, and
 //! nothing is spent.
@@ -12,7 +12,7 @@ use protocol::{
     calcifer::{Agreed, Kind, On, SubmitRun},
     config, machine as v1,
 };
-use hub_client::{Client, Credential, DeviceKey, P256Key, RunToken, UserSession, testing, types};
+use hub_client::{Client, Credential, DeviceKey, UserSession, testing, types};
 use sha2::{Digest as _, Sha256};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -149,11 +149,11 @@ async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing(
     calcifer.close();
 }
 
-/// A run that publishes carries its owner's capability, minted at the send for its machine's TLS
-/// leaf: the machine (here the test, holding that leaf's key) trades it at the Hub's token
-/// endpoint and publishes into the run's destination, and nowhere else.
+/// A run reads its Hub where the Hub says machines read it, under any spelling of that Hub, and a
+/// run that publishes gets its owner's access there. Local code's org-relative references name
+/// this computer's account at the Hub.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
+async fn a_run_reads_its_hub_where_the_hub_says() {
     let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
     // The job's SSL_CERT_FILE trusts the Hub's origin, which machines read too.
     let (Some(url), Some(log)) = (var("TENSORHUB_ORIGIN"), var("TENSORHUB_LOG")) else {
@@ -187,7 +187,6 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     .await
     .unwrap();
 
-    // The machine: a real TensorD, whose leaf key the test reads to act as it at the Hub.
     let tensord = common::Machine::start();
     let calcifer =
         Calcifer::open(&home.path().join("calcifer"), &home.path().join("outputs")).unwrap();
@@ -220,24 +219,18 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         .unwrap()
         .run
         .id;
-    let access = machines.hub_access(&publishes, "m").await.unwrap().unwrap();
-    assert!(!access.capability.is_empty() && !access.token_endpoint.is_empty());
+    let access = machines.hub_access(&publishes).await.unwrap().unwrap();
     assert_eq!(
         access.origin, origin,
         "where machines read this Hub, as it says"
     );
     let public_only = submit("k-public", String::new()).await.unwrap().run.id;
-    let public_access = machines
-        .hub_access(&public_only, "m")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(public_access.origin, access.origin);
-    assert!(public_access.capability.is_empty() && public_access.token_endpoint.is_empty());
+    let public_access = machines.hub_access(&public_only).await.unwrap().unwrap();
+    assert_eq!(public_access, access);
 
     // A machine writes its installations' Hub its own way (`https://tensorhub.com:443`), and
-    // `package update` submits under that spelling: the run is still this Hub's, read with the
-    // sign-in and object hosts a run under the configured spelling gets.
+    // `package update` submits under that spelling: the run is still this Hub's, read as a run
+    // under the configured spelling reads it.
     let respelled = calcifer
         .submit(
             "k-respelled",
@@ -266,42 +259,13 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         .unwrap()
         .unwrap();
     assert_eq!(row.hub.as_deref(), Some(origin.as_str()));
-    let respelled_access = machines.hub_access(&respelled.id, "m").await.unwrap();
+    let respelled_access = machines.hub_access(&respelled.id).await.unwrap();
     assert_eq!(
-        respelled_access.map(|a| (a.origin, a.object_hosts)),
-        Some((
-            public_access.origin.clone(),
-            public_access.object_hosts.clone()
-        )),
+        respelled_access,
+        Some(public_access),
         "the run reads its Hub as a run under the configured spelling does"
     );
 
-    // As the machine: trade it with the leaf's key, then publish where it names, and only there.
-    let leaf = Arc::new(P256Key::from_pkcs8(&tensord.leaf_key()).unwrap());
-    let token = RunToken::new(&access.capability, &access.token_endpoint, leaf).unwrap();
-    let machine = Client::connect(
-        &origin,
-        reqwest::Client::new(),
-        Credential::Run(Arc::new(token)),
-    );
-    let declared = types::PublicationDeclaration {
-        objects: vec![types::DeclaredObject {
-            object_id: format!("sha256:{:x}", Sha256::digest(b"weights")),
-            length: 7,
-        }],
-    };
-    machine
-        .open_model_publication(&account, "model", "op-calcifer", &declared)
-        .await
-        .unwrap();
-    let elsewhere = machine
-        .open_model_publication(&account, "other", "op-other", &declared)
-        .await
-        .map_err(hub_client::Error::from);
-    assert!(
-        matches!(elsewhere, Err(hub_client::Error::Hub { status: 403, .. })),
-        "{elsewhere:?}"
-    );
     // Local code's org-relative references name this account: the machine got the run so.
     let (staged, local) = common::local_spec(home.path());
     let run = SubmitRun {
