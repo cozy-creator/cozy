@@ -2521,15 +2521,16 @@ impl Pool {
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
             let starting = Instant::now();
-            // Each GPU's grant (its table) follows the Start, in lane order: every rank claims its
-            // own row. Granted to the executor, whose exit reaps them.
+            // Each GPU's grant (its table, and a description for its row's lock) follows the
+            // Start, in lane order: every rank claims its own row. Granted to the executor, whose
+            // exit reaps them.
             let grants = match gpus.iter().all(|d| d.memory.is_some()) {
                 true => gpus.iter().filter_map(|d| d.memory.as_ref())
                     .map(|m| m.ledger.grant(session.executor.birth.pid).map_err(io::Error::other))
                     .collect::<io::Result<Vec<_>>>()?,
                 false => vec![],
             };
-            let ledgers: Vec<File> = grants.into_iter().map(|grant| File::from(grant.table)).collect();
+            let ledgers: Vec<File> = grants.into_iter().flat_map(|grant| [File::from(grant.table), File::from(grant.row)]).collect();
             // Rank 0 spawns and forms every follower inside this command; its watch meters
             // the whole group's work, so formation ends only on measured lack of progress.
             let started = command_ok(session.executor.command_with(
@@ -2541,7 +2542,7 @@ impl Pool {
                     import_only: false,
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions: constructions(&plan),
-                    ledgers: ledgers.len() as u32,
+                    ledgers: (ledgers.len() / 2) as u32,
                     memory_mode: self.config.host.mode.into(),
                 },
                 &ledgers,
