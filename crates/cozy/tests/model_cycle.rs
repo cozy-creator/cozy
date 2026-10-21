@@ -244,7 +244,8 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     // The package's quantizer runs on the machine and uploads the fp8 lane to the model.
     publish_quantizer(&home);
     let package = format!("{account}/tiny-quantizer");
-    let pinned = format!("{model}@1.0.0/f32");
+    // The release's only lane: the import's unnamed variant.
+    let pinned = format!("{model}@1.0.0");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "quantize", &pinned, "--fp8", "--package", &package, "--on", "m1"]));
     println!("quantize run: {run}");
     let written = run["output"].as_array().into_iter().flatten().find(|item| item["name"] == "fp8");
