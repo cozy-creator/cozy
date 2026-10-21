@@ -406,8 +406,9 @@ def main() -> int:
     capacity = base * (2 if CUDA else 1) + sum(spans) * 3 // 2 + room
     w, memory = two(ck, store, f"{tag}-two", capacity, reference)
     gone(memory, "two processes")
-    # Below the working set varena measured, by half the blocks: it must stream.
-    capacity = base + w - sum(blocks) // 2
+    # One block below the working set varena measured: it must stream, with room to spare for
+    # what streaming needs (the pass's room, common and its slots).
+    capacity = base + w - max(blocks)
     gone(capped(ck, f"{tag}-short", capacity, base, spans, reference, ceiling), "short")
     gone(baked(ck, plain, f"{tag}-fill", capacity), "fill")
     print(f"{sum(results)}/{len(results)} checks passed")
