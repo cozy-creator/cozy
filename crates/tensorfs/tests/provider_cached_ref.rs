@@ -206,7 +206,7 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
         .await
         .unwrap();
     let tree = producer
-        .upload_folder(&"acme/provider@1".parse().unwrap(), &folder, None)
+        .upload_folder(&"acme/provider@1".parse().unwrap(), &folder, &[], None)
         .await
         .unwrap();
     // Release 1: the default an unversioned open resolves.

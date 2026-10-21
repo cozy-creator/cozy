@@ -316,7 +316,7 @@ fn a_thin_folder_fetches_what_it_lacks_and_offline_refuses() {
     let (want, starts, _) = expected(&folder);
     let mirror = format!("file://{}", scratch.0.join("mirror").display());
     let producer = client(&scratch.0.join("producer"), &mirror);
-    block_on(producer.upload_folder(&"acme/file@1".parse().unwrap(), &folder, None)).unwrap();
+    block_on(producer.upload_folder(&"acme/file@1".parse().unwrap(), &folder, &[], None)).unwrap();
 
     let thin = scratch.0.join("thin");
     fs::create_dir_all(thin.join("chunks")).unwrap();

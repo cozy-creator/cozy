@@ -118,7 +118,30 @@ def e2e(work: pathlib.Path) -> pathlib.Path:
             assert checkpoint.verify().ok, variant
     print(f"e2e: me/model@1.0 (bf16, int8) published to {url}; opened from an empty store and from its "
           "cozytensors folder, every tensor reads as written and verifies", flush=True)
+    commits(work, folder, store)
     return endpoint
+
+
+def commits(work: pathlib.Path, folder: pathlib.Path, store: pathlib.Path) -> None:
+    """upload_folder commits on top of its tag: a second upload keeps the first's files, and
+    delete_patterns is the only delete."""
+    (endpoint := work / "commits").mkdir()
+    (notes := work / "notes").mkdir()
+    (notes / "NOTES.md").write_text("notes\n")
+    url, fresh = endpoint.as_uri(), work / "commits-reader"
+    tensorfs.upload_folder(repo_id="me/commits", folder_path=folder, endpoint=url, cache_dir=store)
+    tensorfs.upload_folder(repo_id="me/commits", folder_path=notes, delete_patterns="*.int8.cozytensors",
+                           endpoint=url, cache_dir=store)
+    got = pathlib.Path(tensorfs.download_file("me/commits", "NOTES.md", revision="main", endpoint=url, cache_dir=fresh))
+    assert got.read_text() == "notes\n"
+    assert tensorfs.open("me/commits", revision="main", variant="bf16", endpoint=url, cache_dir=fresh).verify().ok
+    try:
+        tensorfs.open("me/commits", revision="main", variant="int8", endpoint=url, cache_dir=fresh)
+        raise AssertionError("delete_patterns left the int8 variant")
+    except tensorfs.NotFoundError:
+        pass
+    print("e2e: upload_folder committed on top of main (bf16, README and LICENSE kept, NOTES.md added); "
+          "delete_patterns removed int8", flush=True)
 
 
 def placeholders() -> dict:

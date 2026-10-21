@@ -274,7 +274,7 @@ async fn eager_open_downloads_checkpoint_bytes_without_materializing_a_repositor
     ))
     .unwrap();
     let tree = producer
-        .upload_folder(&"account/eager@1".parse().unwrap(), &data.folder, None)
+        .upload_folder(&"account/eager@1".parse().unwrap(), &data.folder, &[], None)
         .await
         .unwrap();
     let http = Http::new(origin);
@@ -323,7 +323,7 @@ async fn eager_local_header_honors_offline_before_using_its_configured_origin() 
     ))
     .unwrap();
     producer
-        .upload_folder(&"account/local@1".parse().unwrap(), &data.folder, None)
+        .upload_folder(&"account/local@1".parse().unwrap(), &data.folder, &[], None)
         .await
         .unwrap();
     let http = Http::new(origin);
@@ -357,7 +357,7 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     let producer = Client::new(config(&scratch.0.join("producer"), &file_origin)).unwrap();
     let reference: Ref = "account/model@1".parse().unwrap();
     let tree = producer
-        .upload_folder(&reference, &data.folder, None)
+        .upload_folder(&reference, &data.folder, &[], None)
         .await
         .unwrap();
     drop(producer);
@@ -593,7 +593,7 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
     ))
     .unwrap();
     let tree = producer
-        .upload_folder(&"account/model@1".parse().unwrap(), &data.folder, None)
+        .upload_folder(&"account/model@1".parse().unwrap(), &data.folder, &[], None)
         .await
         .unwrap();
     drop(producer);
@@ -813,7 +813,7 @@ async fn public_provider_headers_and_retry_failures_survive_metadata_and_payload
     ))
     .unwrap();
     producer
-        .upload_folder(&"account/model@1".parse().unwrap(), &data.folder, None)
+        .upload_folder(&"account/model@1".parse().unwrap(), &data.folder, &[], None)
         .await
         .unwrap();
     let http = Http::new(origin);
@@ -869,7 +869,7 @@ async fn supplied_provider_error_and_local_unreleased_semantics_are_public() {
     let client = Client::new(options).unwrap();
     let reference: Ref = "local/unreleased".parse().unwrap();
     let tree = client
-        .upload_folder(&reference, &data.folder, None)
+        .upload_folder(&reference, &data.folder, &[], None)
         .await
         .unwrap();
     let local = Endpoint::with_config(
@@ -917,7 +917,7 @@ async fn public_names_match_the_generic_format_with_unicode_reserved_characters_
         assert_eq!(reference.repo_id, name);
         reference.revision = Some("1".into());
         let tree = client
-            .upload_folder(&reference, &data.folder, None)
+            .upload_folder(&reference, &data.folder, &[], None)
             .await
             .unwrap();
         let (repo, _) = endpoint.repo(name).await.unwrap().unwrap();
@@ -963,7 +963,7 @@ async fn public_names_match_the_generic_format_with_unicode_reserved_characters_
         endpoint: None,
     };
     let tree = client
-        .upload_folder(&typed, &data.folder, None)
+        .upload_folder(&typed, &data.folder, &[], None)
         .await
         .unwrap();
     assert_eq!(
@@ -991,7 +991,7 @@ async fn advanced_exact_object_fetch_does_not_widen_the_window_and_uses_the_exis
     ))
     .unwrap();
     let tree = producer
-        .upload_folder(&"acme/exact".parse().unwrap(), &data.folder, None)
+        .upload_folder(&"acme/exact".parse().unwrap(), &data.folder, &[], None)
         .await
         .unwrap();
     let http = Http::new(origin);

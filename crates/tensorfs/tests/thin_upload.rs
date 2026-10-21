@@ -62,7 +62,7 @@ async fn a_thin_folder_uploads_from_the_store_or_what_the_endpoint_holds() {
     assert!(!folder.join(CHUNKS_DIR).exists());
 
     let model: Ref = "acme/thin@1".parse().unwrap();
-    let tree = a.upload_folder(&model, &folder, None).await.unwrap();
+    let tree = a.upload_folder(&model, &folder, &[], None).await.unwrap();
     let b = client(&dir.0.join("b"), &origin);
     let pulled = b.open("acme/thin@1", &Open { lazy: false, ..Default::default() }).await.unwrap();
     assert_eq!((pulled.id(), pulled.tree()), (saved.id(), Some(&tree)));
@@ -71,13 +71,13 @@ async fn a_thin_folder_uploads_from_the_store_or_what_the_endpoint_holds() {
     // Store `c` holds none of it; the endpoint does.
     let c = client(&dir.0.join("c"), &origin);
     let again: Ref = "acme/again@1".parse().unwrap();
-    assert_eq!(c.upload_folder(&again, &folder, None).await.unwrap(), tree);
+    assert_eq!(c.upload_folder(&again, &folder, &[], None).await.unwrap(), tree);
 
     // Neither store `d` nor a fresh endpoint holds the chunk; a local repo needs it here too.
     let d = client(&dir.0.join("d"), &other);
-    let refused = d.upload_folder(&model, &folder, None).await.unwrap_err();
+    let refused = d.upload_folder(&model, &folder, &[], None).await.unwrap_err();
     assert_eq!(refused.kind, Kind::NotFound, "{}", refused.detail);
     let local: Ref = "local/thin@1".parse().unwrap();
-    let refused = d.upload_folder(&local, &folder, None).await.unwrap_err();
+    let refused = d.upload_folder(&local, &folder, &[], None).await.unwrap_err();
     assert_eq!(refused.kind, Kind::NotFound, "{}", refused.detail);
 }

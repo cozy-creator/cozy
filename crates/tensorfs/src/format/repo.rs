@@ -105,6 +105,67 @@ impl Tree {
     pub fn set_variant(&mut self, variant: &str, header: ObjectRef) {
         self.files.insert(variant_path(variant), header);
     }
+
+    /// A commit on top of this tree, as Hugging Face's `upload_folder`: the paths a `delete`
+    /// pattern matches ([`fnmatch`]) removed, then `files` added or replaced.
+    pub fn commit(&self, files: &BTreeMap<String, ObjectRef>, delete: &[&str]) -> Tree {
+        let mut files_kept = self.files.clone();
+        files_kept.retain(|path, _| !delete.iter().any(|pattern| fnmatch(pattern, path)));
+        files_kept.extend(files.iter().map(|(p, r)| (p.clone(), r.clone())));
+        Tree { files: files_kept }
+    }
+}
+
+/// Python's `fnmatch` (Hugging Face's `delete_patterns`): `*` any run of characters, `/`
+/// included; `?` one; `[set]`, `[!set]` and ranges one of a set; a pattern ending in `/` matches
+/// everything under it.
+pub fn fnmatch(pattern: &str, path: &str) -> bool {
+    let mut p: Vec<char> = pattern.chars().collect();
+    if pattern.ends_with('/') {
+        p.push('*');
+    }
+    let s: Vec<char> = path.chars().collect();
+    let (mut pi, mut si, mut star) = (0, 0, None);
+    while si < s.len() {
+        if p.get(pi) == Some(&'*') {
+            star = Some((pi, si));
+            pi += 1;
+        } else if let Some(next) = (pi < p.len()).then(|| one(&p, pi, s[si])).flatten() {
+            (pi, si) = (next, si + 1);
+        } else if let Some((at, from)) = star {
+            (pi, si) = (at + 1, from + 1);
+            star = Some((at, from + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+/// Where the token of `p` at `at` ends when it matches `c`.
+fn one(p: &[char], at: usize, c: char) -> Option<usize> {
+    let set = (p[at] == '[').then(|| {
+        let negate = p.get(at + 1) == Some(&'!');
+        let first = at + 1 + negate as usize;
+        let close = (first + 1..p.len()).find(|&i| p[i] == ']')?;
+        let mut hit = false;
+        let mut i = first;
+        while i < close {
+            if i + 2 < close && p[i + 1] == '-' {
+                hit |= p[i] <= c && c <= p[i + 2];
+                i += 3;
+            } else {
+                hit |= p[i] == c;
+                i += 1;
+            }
+        }
+        Some((hit != negate, close + 1))
+    });
+    match set.flatten() {
+        Some((true, next)) => Some(next),
+        Some((false, _)) => None,
+        None => (p[at] == '?' || p[at] == c).then_some(at + 1),
+    }
 }
 
 /// `refs/<org>/<name>.json`, ASCII-lowercased: repo names are case-insensitive, one identity.
