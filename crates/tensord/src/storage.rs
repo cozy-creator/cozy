@@ -18,10 +18,38 @@ use tensorfs::{
     format::{ObjectRef, Resolution, Tree},
 };
 
-/// Opens (or creates) the machine store at `root`; one in an older format is refused (its
-/// models pull again into a new one).
+/// Opens (or creates) a current-format store. Machine startup uses [`open_owned`] to
+/// upgrade a stopped pre-0.12 store before opening it.
 pub fn open(root: &Path) -> io::Result<Arc<Store>> {
     Store::open(root).map(Arc::new).map_err(io_error)
+}
+
+
+/// Claims the machine's store, upgrading a stopped pre-0.12 store before opening it. The
+/// converter hands its exact owner descriptor forward: no other machine can take the store
+/// between the old namespace's cutover and the current-format open.
+pub fn open_owned(root: &Path) -> io::Result<(std::fs::File, Arc<Store>)> {
+    let upgrade = tensorfs::migrate::store1::migrate(root).map_err(migration_error)?;
+    let store = open(root)?;
+    let owner = match upgrade {
+        Some(upgrade) => {
+            tracing::info!(store = %root.display(), report = ?upgrade.report, "upgraded TensorFS store");
+            upgrade.owner
+        }
+        None => claim(store.root())?,
+    };
+    Ok((owner, store))
+}
+
+pub(crate) fn migration_error(error: tensorfs::Failure) -> io::Error {
+    let kind = match error.kind {
+        tensorfs::Kind::Conflict => io::ErrorKind::AlreadyExists,
+        tensorfs::Kind::NotFound => io::ErrorKind::NotFound,
+        tensorfs::Kind::Full => io::ErrorKind::StorageFull,
+        tensorfs::Kind::Io => io::ErrorKind::Other,
+        _ => io::ErrorKind::InvalidData,
+    };
+    io::Error::new(kind, error)
 }
 
 /// The machine's claim on its store: `owner.lock` at the store's real path, held exclusively

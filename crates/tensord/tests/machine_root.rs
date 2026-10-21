@@ -222,3 +222,35 @@ async fn the_named_store_is_the_machines_store() {
     drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// Normal service startup performs the same offline conversion as tfs before opening
+/// the named store, then keeps its converter's owner claim until the service stops.
+#[test]
+fn startup_upgrades_a_stopped_store_once_and_keeps_its_owner_claim() {
+    let scratch = scratch("machine-store-upgrade");
+    let named = scratch.join("old-store");
+    for dir in ["repos", "manifests", "blobs"] {
+        std::fs::create_dir_all(named.join(dir)).unwrap();
+    }
+    std::fs::write(named.join("format"), b"store-format 1\nclaim-protocol 1\n").unwrap();
+    let bytes = b"payload from the old installed SDK";
+    let object = ObjectRef::of(bytes);
+    let blob = named.join("blobs").join(&object.sha256[..2]).join(&object.sha256[2..4]).join(&object.sha256);
+    std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    std::fs::write(&blob, bytes).unwrap();
+    let root = scratch.join("machine");
+    let port = free_port();
+    let mut machine = boot(&root, port, Some(&named));
+    ready(&mut machine, &root, port);
+    assert_eq!(std::fs::read(&blob).unwrap(), bytes);
+    assert!(named.join("manifests").is_file());
+    assert!(storage::claim(&named).unwrap_err().to_string().contains("STORE_BUSY"));
+    assert!(Store::open(&named).unwrap().get_ref("local/absent").unwrap().is_none());
+    child::stop(&mut machine.0);
+    let port = free_port();
+    let mut again = boot(&root, port, Some(&named));
+    ready(&mut again, &root, port);
+    assert_eq!(std::fs::read(&blob).unwrap(), bytes);
+    drop(again);
+    std::fs::remove_dir_all(scratch).unwrap();
+}

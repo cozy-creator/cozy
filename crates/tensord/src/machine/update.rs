@@ -193,6 +193,10 @@ struct Pending {
     /// The activated binary arrived by a dev update.
     #[serde(default)]
     dev: bool,
+    /// This activation may start the one-time store cutover. A previous cut is never
+    /// recorded here: later same-format activations retain their normal rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_migration: Option<PathBuf>,
 }
 
 /// The binary an update activates: its launch path, its release, and the dev file placed there
@@ -280,6 +284,20 @@ pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<Recovered> {
     let Some(pending) = read_pending(paths)? else {
         return Ok(Recovered::Nothing);
     };
+    if let Some(store) = &pending.store_migration {
+        if tensorfs::migrate::store1::cutover_started(store).map_err(crate::storage::migration_error)? {
+            // The old store namespace has retired. Keep the selected SDK/binary and the
+            // starting record so an interrupted conversion resumes forward on next start.
+            return Err(io::Error::other(Coded {
+                code: "store_migration_requires_current_sdk",
+                message: format!(
+                    "{cause}; {} has started its store upgrade: keeping the current software; \
+                     restart it to finish the lossless conversion",
+                    store.display()
+                ),
+            }));
+        }
+    }
     let mut status = latest(paths, pending.status)?;
     status.error = cause.into();
     status.enter("rolled_back");
@@ -299,6 +317,21 @@ pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<Recovered> {
         Some(launch) => Recovered::Exec(launch),
         None => Recovered::Restored,
     })
+}
+
+/// Before opening a service's store, attach a possible one-time cutover to its existing
+/// activation. This is durable before the converter can retire the legacy namespace.
+pub(crate) fn protect_store_migration(paths: &Paths, store: &Path) -> io::Result<()> {
+    let Some(mut pending) = read_pending(paths)? else { return Ok(()) };
+    if pending.store_migration.is_some() || !store.exists() {
+        return Ok(());
+    }
+    let store = fs::canonicalize(store)?;
+    if tensorfs::migrate::store1::cutover_started(&store).map_err(crate::storage::migration_error)? {
+        return Ok(());
+    }
+    pending.store_migration = Some(store);
+    write_json(&paths.update("pending.json"), &pending)
 }
 
 /// `pair` as this binary runs it.
@@ -767,6 +800,7 @@ impl Updates {
             sdk_before: previous_link(&self.paths.current_sdk_link())?,
             binary: binary.as_ref().map(|b| b.launch.clone()),
             dev: dev.is_some(),
+            store_migration: None,
         };
         let publication = (|| {
             write_json(&self.paths.update("pending.json"), &pending)?;
@@ -1332,6 +1366,7 @@ mod tests {
                 sdk_before: Some(old.clone()),
                 binary: None,
                 dev: false,
+                store_migration: None,
             },
         )
         .unwrap();
@@ -1533,6 +1568,7 @@ mod tests {
                 sdk_before: Some(old.clone()),
                 binary: None,
                 dev: false,
+                store_migration: None,
             }).unwrap();
             Self { root, paths, old, new }
         }
@@ -1547,6 +1583,50 @@ mod tests {
     }
     impl Drop for Activation {
         fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); }
+    }
+
+    #[test]
+    fn a_store_cutover_keeps_the_selected_sdk_and_can_resume_forward() {
+        let transaction = Activation::prepare();
+        transaction.state("starting");
+        relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
+        let store = transaction.root.join("tensorfs");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("format"), b"store-format 1\nclaim-protocol 1\n").unwrap();
+        protect_store_migration(&transaction.paths, &store).unwrap();
+        let pending = fs::read(transaction.paths.update("pending.json")).unwrap();
+        assert_eq!(read_pending(&transaction.paths).unwrap().unwrap().store_migration, Some(store.canonicalize().unwrap()));
+
+        // The converter has retired the old namespace but has not written format/3 yet.
+        // Even this interrupted cut must not relaunch the old SDK against that store.
+        fs::create_dir_all(store.join(".store1-migration/legacy-manifests")).unwrap();
+        let error = rollback_pending(&transaction.paths, "candidate exited").unwrap_err();
+        assert!(error.to_string().contains("keeping the current software"), "{error}");
+        transaction.links(&transaction.new);
+        assert_eq!(fs::read(transaction.paths.update("pending.json")).unwrap(), pending);
+        let status: Status = serde_json::from_slice(&fs::read(transaction.paths.update("status.json")).unwrap()).unwrap();
+        assert_eq!(status.state, "starting", "no false rolled_back report");
+        assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Nothing);
+        transaction.links(&transaction.new);
+    }
+
+    #[test]
+    fn validation_failures_and_later_same_format_updates_can_still_roll_back() {
+        for previous_cut in [false, true] {
+            let transaction = Activation::prepare();
+            transaction.state("starting");
+            relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
+            let store = transaction.root.join("tensorfs");
+            fs::create_dir_all(&store).unwrap();
+            if previous_cut {
+                fs::create_dir_all(store.join(".store1-migration/legacy-manifests")).unwrap();
+                fs::write(store.join("format"), br#"{"format":"tensorfs.store/3"}"#).unwrap();
+            }
+            protect_store_migration(&transaction.paths, &store).unwrap();
+            assert_eq!(read_pending(&transaction.paths).unwrap().unwrap().store_migration.is_none(), previous_cut);
+            assert_eq!(rollback_pending(&transaction.paths, "candidate failed before cutover").unwrap(), Recovered::Restored);
+            transaction.links(&transaction.old);
+        }
     }
 
     #[test]
