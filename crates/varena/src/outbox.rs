@@ -100,6 +100,13 @@ impl<C> Outbox<C> {
         self.queue.lock().pending
     }
 
+    /// Takes every call not yet sent (their sender is gone).
+    pub fn drain(&self) -> Vec<C> {
+        let mut q = self.queue.lock();
+        q.pending = 0;
+        q.calls.drain(..).map(|(.., c)| c).collect()
+    }
+
     /// No more calls: the sender sends what is queued, then ends.
     pub fn close(&self) {
         self.queue.lock().closed = true;

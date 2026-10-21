@@ -337,6 +337,9 @@ pub struct Table {
     /// Bytes of kept pages this process unmapped whose Withdraw custody has not had yet: its
     /// handle still holds them (pinned, P).
     pub pending: u64,
+    /// Bytes of pages being unmapped by the mechanism thread: still this process's on the
+    /// device (P to others), already spent on the creates queued after them (not to itself).
+    pub inflight: u64,
     /// Torch's allocator, as last measured (pass start and end, every OOM).
     pub allocated: u64,
     pub reserved: u64,
@@ -403,7 +406,7 @@ impl Table {
     pub fn classes(&self) -> [u64; 7] {
         let mut out = [0u64; 7];
         if let Some(p) = out.get_mut(Class::P.index()) {
-            *p = self.pending;
+            *p = self.pending + self.inflight;
         }
         for (key, page) in self.pages() {
             if let Some(slot) = self.class(key).and_then(|c| out.get_mut(c.index())) {

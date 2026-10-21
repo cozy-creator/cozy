@@ -44,6 +44,11 @@ struct Events {
     lands: AtomicU64,
     /// The process's own bytes cannot be measured (WDDM); open measured this context.
     unmeasured: AtomicU64,
+    /// The next unmap waits (as a card's does on queued work) until the gate opens.
+    hold_unmap: AtomicBool,
+    unmap_gate: Gate,
+    /// Opened when a held unmap is waiting.
+    unmap_waits: Gate,
 }
 
 /// Closed until opened.
@@ -118,6 +123,10 @@ impl Backend for Stream {
         self.host.protect(va, offset, len, access)
     }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> {
+        if self.events.hold_unmap.swap(false, Ordering::SeqCst) {
+            self.events.unmap_waits.open();
+            self.events.unmap_gate.pass();
+        }
         self.events.unmaps.fetch_add(1, Ordering::Relaxed);
         self.host.unmap(va, offset, len)
     }
@@ -203,7 +212,7 @@ fn a_page_is_kept_only_after_its_transform_completes() {
     let dir = tempfile::tempdir().unwrap();
     let g = GpuId { uuid: format!("order-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
     let _scope = Scope::new(&g.uuid);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let ledger = varena::Ledger::create(&g, None).unwrap();
     let events = Arc::new(Events::default());
     let backend = Stream { host: HostBackend::new(g.memory), events: events.clone() };
     let mem = Memory::open(g.clone(), None, Box::new(backend)).unwrap();
@@ -227,6 +236,10 @@ fn a_page_is_kept_only_after_its_transform_completes() {
     drop(again);
     events.done.lock().insert(transform);
     mem.torch_limit();
+    // The mechanism makes it read-only, then exports it.
+    while events.kept.lock().len() < 2 {
+        ledger.await_event().unwrap();
+    }
     assert_eq!(*events.kept.lock(), vec!["protect", "export"], "read-only, then exported, once complete");
     pass.end(Default::default(), Torch::default());
     drop(r);
@@ -239,7 +252,7 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     let dir = tempfile::tempdir().unwrap();
     let g = GpuId { uuid: format!("consumer-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
     let _scope = Scope::new(&g.uuid);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let ledger = varena::Ledger::create(&g, None).unwrap();
     let events = Arc::new(Events::default());
     let backend = Stream { host: HostBackend::new(g.memory), events: events.clone() };
     let mem = Memory::open(g.clone(), None, Box::new(backend)).unwrap();
@@ -256,6 +269,9 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     assert_eq!(events.unmaps.load(Ordering::Relaxed), 0, "unmapped while its consumer's stream ran");
     events.done.lock().insert(release);
     mem.torch_limit();
+    while events.unmaps.load(Ordering::Relaxed) == 0 {
+        ledger.await_event().unwrap();
+    }
     assert_eq!(events.unmaps.load(Ordering::Relaxed), 1, "gone once the consumer finished");
     let again = mem.bind(id, 0, 1).unwrap();
     assert!(again.fresh, "filled again, fresh for the transform");
@@ -710,9 +726,11 @@ fn an_unmeasurable_process_keeps_its_opened_context() {
     drop(mem);
 }
 
-/// Review 3, N6: a kept page whose fill identity changed is not overwritten in place while
-/// custody still holds it under the old key: the fill waits until custody has let go, so a
-/// successor (after a kill -9 at any point) never imports new bytes under the old key.
+/// Review 3, N6 / review 4, NEW-1, NEW-2: a kept page whose fill identity changed is never
+/// written again: a fresh page takes its place (no re-protect), so custody's copy under the old
+/// key keeps the old bytes whatever happens (a kill -9 at any point imports old bytes or
+/// nothing), and the refill never waits on custody.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_kept_page_is_never_overwritten_under_its_old_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -731,7 +749,7 @@ fn a_kept_page_is_never_overwritten_under_its_old_key() {
     let pin = mem.bind(id, 0, 1).unwrap();
     // SAFETY: a fresh host page bound to this test alone.
     unsafe { std::ptr::write_bytes(pin.ptr as *mut u8, 0xab, pin.len as usize) };
-    let (ptr, len) = (pin.ptr, pin.len as usize);
+    let len = pin.len as usize;
     pin.filled();
     events.done.lock().insert(events.next.load(Ordering::Relaxed));
     mem.torch_limit();
@@ -742,17 +760,19 @@ fn a_kept_page_is_never_overwritten_under_its_old_key() {
     let mut b = spec;
     b.fingerprint.fill = Fill::Declared("lora-b".into());
     mem.load(b, Level::Ram).unwrap();
-    let binder = {
-        let mem = mem.clone();
-        std::thread::spawn(move || mem.bind(id, 0, 2).unwrap().fresh)
-    };
-    log.await_call(|(_, c)| c.contains("Withdraw") && c.contains(&old));
-    // SAFETY: the page stays mapped in place; read only.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-    assert!(bytes.iter().all(|b| *b == 0xab), "overwritten while custody kept it under the old key");
+    let fresh = mem.bind(id, 0, 2).unwrap().fresh;
+    assert!(fresh, "refilled for lora-b while custody answered nothing");
+    // Custody still holds the old key (its Withdraw waits at the gate), over the old bytes.
+    let kept = log.kept.lock().get(&(old.clone(), 0)).map(|h| h.try_clone().unwrap()).expect("custody still keeps the old key");
+    // SAFETY: a read-only shared mapping of custody's handle, unmapped below.
+    let view = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, std::os::fd::AsRawFd::as_raw_fd(&kept), 0) };
+    assert_ne!(view, libc::MAP_FAILED);
+    // SAFETY: the mapping above, `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(view as *const u8, len) };
+    assert!(bytes.iter().all(|b| *b == 0xab), "custody's copy under the old key was overwritten");
+    // SAFETY: our mapping.
+    unsafe { libc::munmap(view, len) };
     gate.open();
-    assert!(binder.join().unwrap(), "filled again, fresh for lora-b");
-    assert!(!log.kept.lock().keys().any(|(fp, _)| *fp == old));
 }
 
 /// S3 gpu5: a capped table beside other occupants of the card. Their bytes take from the card,
@@ -826,4 +846,31 @@ fn a_bind_on_its_own_threads_pin_fails_at_once() {
     assert!(matches!(mem.bind(id, 0, 0), Err(varena::Error::Held(_))), "another identity under its own hold");
     drop((fresh, hold));
     assert!(mem.bind(id, 0, 0).unwrap().fresh, "unheld, it fills again");
+}
+
+/// Review 4, NEW-1: the device's VMM calls (which may wait on queued device work) run off the
+/// state lock: while an eviction's unmap waits, its binder sleeps on varena's condvar and
+/// another thread's calls go through.
+#[test]
+fn a_waiting_unmap_holds_no_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("unmapwait-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    mem.load(stored(dir.path(), &uuid, "a", 1), Level::Gpu).unwrap();
+    let b = mem.load(stored(dir.path(), &uuid, "b", 1), Level::Ram).unwrap();
+    // b's page needs a's: a's unmap is held, as on a card with work queued.
+    events.hold_unmap.store(true, Ordering::SeqCst);
+    let binder = {
+        let mem = mem.clone();
+        std::thread::spawn(move || drop(mem.bind(b, 0, 0).unwrap()))
+    };
+    events.unmap_waits.pass();
+    // The unmap waits; the state lock is free.
+    mem.torch_limit();
+    events.unmap_gate.open();
+    binder.join().unwrap();
 }
