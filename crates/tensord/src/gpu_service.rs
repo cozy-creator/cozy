@@ -18,6 +18,7 @@ use crate::{
     },
     launch_identity::Seal,
     memory::{GpuLedger, MemoryConfig},
+    process::Gpus,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -3329,21 +3330,18 @@ fn unsettled(reply: &Frame, lost: &str) -> Refused {
     Refused { code, detail }
 }
 
-/// Work on `gpus` (kernels or copies), as a count of readings that saw it; None without GPUs
-/// or while NVML cannot tell.
+/// What `gpus` did since the last reading; None without GPUs or while NVML cannot tell.
 fn gpu_work(gpus: &[Device]) -> Option<crate::process::Activity> {
     let opened = gpus.iter().map(|gpu| platform::gpu::Device::open(&gpu.entry).ok());
     let devices: Vec<_> = opened.collect::<Option<_>>().filter(|devices: &Vec<_>| !devices.is_empty())?;
-    let state = Mutex::new((vec![0; devices.len()], 0));
+    let seen = Mutex::new(vec![0; devices.len()]);
     Some(Arc::new(move || {
-        let mut state = state.lock().unwrap();
-        let (seen, readings) = &mut *state;
-        let mut worked = false;
-        for (device, seen) in devices.iter().zip(seen.iter_mut()) {
-            worked |= device.worked_since(seen).ok()?;
+        let (mut kernels, mut memory) = (false, false);
+        for (device, seen) in devices.iter().zip(seen.lock().unwrap().iter_mut()) {
+            let (ran, moved) = device.worked_since(seen).ok()?;
+            (kernels, memory) = (kernels || ran, memory || moved);
         }
-        *readings += u64::from(worked);
-        Some(*readings)
+        Some(if memory { Gpus::Moved } else if kernels { Gpus::Stuck } else { Gpus::Idle })
     }))
 }
 

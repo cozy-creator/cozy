@@ -2,9 +2,8 @@
 //! (births, exact handles, groups, meters) is `platform::process`. Nothing here kills
 //! because time passed. Callers kill on a measured wedge (`Pace`), an owner restart, or a launch
 //! that never reached authored code.
-use platform::process::{Birth, Exact, State, gone, group_members, meter, read_bytes, threads};
+use platform::process::{Birth, Exact, State, gone, group_members, meter, read_bytes};
 use std::{
-    collections::HashMap,
     fs::File,
     io,
     process::{Child, ExitStatus},
@@ -127,15 +126,24 @@ pub enum Meter {
     Burn,
     /// Frames of the running invocation; a canceled one must stop within its pace's patience.
     Frames,
-    /// A GPU invocation's work, judged while it runs: frames, bytes moved, GPU kernels and
-    /// copies, or CPU on more than one thread. One spinning thread is not progress (runs 11818,
-    /// 11822).
+    /// A GPU invocation's work, judged while it runs: frames, bytes moved, GPU memory traffic,
+    /// or CPU other than a wait on a stuck GPU.
     Work,
 }
 
-/// GPU work seen so far (a count of busy readings); None while it cannot be read, which judges
-/// nothing.
-pub type Activity = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+/// What a call's GPUs did since the last reading.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Gpus {
+    Idle,
+    /// Device memory moved: kernels' traffic, copies, peer writes.
+    Moved,
+    /// A kernel stayed resident with no memory traffic: a collective whose peer is gone, or a
+    /// kernel spinning on a flag. A host spinning meanwhile waits on it.
+    Stuck,
+}
+
+/// Its GPUs' readings; None while they cannot be read, which judges nothing.
+pub type Activity = Arc<dyn Fn() -> Option<Gpus> + Send + Sync>;
 
 /// A measured wedge's verdict, as the error of the command it ended.
 #[derive(Debug)]
@@ -178,9 +186,9 @@ impl Watch {
             Meter::Frames | Meter::Work => Pace::seeded(worst_gap),
             Meter::Burn => Pace::default(),
         };
-        // A GPU call's samples whose CPU ran on more than one thread, and each thread's last
-        // reading.
-        let (mut breadth, mut last) = (0, std::collections::HashMap::new());
+        // A GPU call's samples with memory traffic, its CPU other than stuck-GPU waits, and its
+        // last CPU reading.
+        let (mut moves, mut ran, mut last_cpu) = (0, 0, None);
         let mut state = self.state.lock().unwrap();
         while !state.done {
             let now = Instant::now();
@@ -203,19 +211,12 @@ impl Watch {
             let reading = match self.meter {
                 Meter::Burn => group_burn(exact.birth()),
                 Meter::Frames => Some(state.frames),
-                Meter::Work => self.activity.as_ref().and_then(|activity| activity()).map(|gpu| {
-                    let (_, moved) = group_meter(exact.birth()).unwrap_or_default();
-                    // CPU counts by its breadth, never as cores: two or more threads each ran at
-                    // least half as much as the busiest, however much CPU the machine had to give.
-                    // Real CPU phases (torch intra-op, ffmpeg, BLAS) run many threads, a spin one,
-                    // and a missed kill beats killing a real run.
-                    let members = group_members(exact.birth()).into_iter().map(|member| member.pid);
-                    let ran: HashMap<u32, u64> = std::iter::once(exact.birth().pid).chain(members).filter_map(threads).flatten().collect();
-                    let deltas: Vec<u64> = ran.iter().filter_map(|(tid, ns)| Some(ns.saturating_sub(*last.get(tid)?))).collect();
-                    let busiest = deltas.iter().copied().max().unwrap_or_default();
-                    breadth += u64::from(busiest > 0 && deltas.iter().filter(|ns| **ns * 2 >= busiest).count() > 1);
-                    last = ran;
-                    gpu + state.frames + moved + breadth
+                Meter::Work => self.activity.as_ref().and_then(|activity| activity()).map(|gpus| {
+                    let (cpu, moved) = group_meter(exact.birth()).unwrap_or_default();
+                    let since = cpu.saturating_sub(last_cpu.replace(cpu).unwrap_or(cpu));
+                    ran += if gpus == Gpus::Stuck { 0 } else { since };
+                    moves += u64::from(gpus == Gpus::Moved);
+                    state.frames + moved + moves + ran
                 }),
             };
             pace.observe(reading, now);
@@ -230,7 +231,7 @@ impl Watch {
                 let still = now - since;
                 if still > pace.patience(floor) {
                     let measures = match self.meter {
-                        Meter::Work => " (frames, bytes moved, GPU kernels and copies, CPU on more than one thread)",
+                        Meter::Work => " (frames, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)",
                         _ => "",
                     };
                     let verdict = format!("wedged during {what}: {}{measures}", pace.verdict(still, floor));
@@ -554,22 +555,24 @@ mod tests {
         assert!(group_members(&birth).is_empty());
     }
 
-    /// A GPU call is judged while it runs on its work: one spinning on one thread with no frames,
-    /// no bytes and idle GPUs is killed (runs 11818, 11822); one that moves bytes, whose GPUs
-    /// work, whose GPUs cannot be read or that runs on more than one thread is not.
+    /// A GPU call is judged while it runs on its work: one blocked with idle GPUs, or spinning
+    /// while its GPU holds a kernel that moves no memory (a collective whose peer is gone), is
+    /// killed; one that computes on any number of threads, moves bytes, or whose GPUs move
+    /// memory or cannot be read is not.
     #[cfg(unix)]
     #[test]
-    fn a_gpu_call_spinning_without_work_is_killed_and_working_ones_are_not() {
-        let cases: [(&str, &str, Option<Activity>, bool); 5] = [
-            ("spins", "while :; do :; done", Some(Arc::new(|| Some(0))), true),
-            ("moves bytes", "while :; do echo work; done > /dev/null", Some(Arc::new(|| Some(0))), false),
-            ("GPU works", "while :; do :; done", {
-                let busy = std::sync::atomic::AtomicU64::new(0);
-                Some(Arc::new(move || Some(busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed))))
-            }, false),
-            ("GPU unread", "while :; do :; done", Some(Arc::new(|| None)), false),
-            // However little CPU a loaded machine gives them, two threads share it.
-            ("spins on two threads", "while :; do :; done & while :; do :; done", Some(Arc::new(|| Some(0))), false),
+    fn a_gpu_call_blocked_or_waiting_on_a_stuck_gpu_is_killed_and_working_ones_are_not() {
+        let gpus = |reading: Option<Gpus>| -> Option<Activity> { Some(Arc::new(move || reading)) };
+        let spin = "while :; do :; done";
+        let cases = [
+            ("blocked", "sleep 600", gpus(Some(Gpus::Idle)), true),
+            ("waits on a stuck GPU", spin, gpus(Some(Gpus::Stuck)), true),
+            ("computes on one thread", spin, gpus(Some(Gpus::Idle)), false),
+            // However little CPU a loaded machine gives them.
+            ("computes on two threads", "while :; do :; done & while :; do :; done", gpus(Some(Gpus::Idle)), false),
+            ("moves bytes while its GPU is stuck", "while :; do echo work; done > /dev/null", gpus(Some(Gpus::Stuck)), false),
+            ("its GPU moves memory", "sleep 600", gpus(Some(Gpus::Moved)), false),
+            ("its GPU is unread", "sleep 600", gpus(None), false),
         ];
         // A shell can fork a CPU spinner. Always end its group, including on an assertion
         // failure: Child::kill only ends the shell and leaves that spinner running.
@@ -599,7 +602,7 @@ mod tests {
             if killed {
                 let verdict = verdict.unwrap();
                 assert!(verdict.contains("wedged during invoke: no measurable progress"), "{case}");
-                assert!(verdict.contains("(frames, bytes moved, GPU kernels and copies, CPU on more than one thread)"), "{verdict}");
+                assert!(verdict.contains("(frames, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)"), "{verdict}");
             }
             drop(group);
             assert!(group_members(&birth).iter().all(|member| member.ended().unwrap()), "{case}: the test left a process running");
