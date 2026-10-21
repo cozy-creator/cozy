@@ -59,7 +59,7 @@ jobs:
       - name: Rust build and lint (compiles tests too)
         id: rust
         continue-on-error: true
-        run: cargo clippy --workspace --all-targets --locked $IMPORTED -- -D warnings 2>&1 | tee rust.txt; exit "${PIPESTATUS[0]}"
+        run: cargo clippy --workspace --all-targets --locked --keep-going $IMPORTED -- -D warnings 2>&1 | tee rust.txt; exit "${PIPESTATUS[0]}"
 
       - name: TensorD and TensorFS (reported)
         id: imported

@@ -259,6 +259,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     fn write_repo(path: &Path, repo: &Repo) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, repo.to_json().unwrap()).unwrap();
