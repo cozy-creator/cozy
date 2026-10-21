@@ -11,8 +11,8 @@ use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle, ThreadId};
 
 use parking_lot::{Condvar, Mutex};
-use tensorfs::io::ReadStats;
 use tensorfs::io::source::Source;
+use tensorfs::io::ReadStats;
 
 use crate::gpu::{BindState, FillAttempt, FillPhase, FillPin, Gpu, Pin};
 use crate::layout::Layout;
@@ -3111,11 +3111,9 @@ mod gpu_tests {
     fn failed_begin_rolls_back_and_reuses_the_request_identity() {
         let placement = Placement::open(0, None).expect("real CUDA placement");
         let uuid = assigned_gpu(&placement.gpu);
-        assert!(
-            placement
-                .begin(7, vec![vec![999]], "test".into(), "shape".into())
-                .is_err()
-        );
+        assert!(placement
+            .begin(7, vec![vec![999]], "test".into(), "shape".into())
+            .is_err());
         assert!(
             placement.stats(7).is_err(),
             "failed begin must not retain request state"
@@ -3388,14 +3386,12 @@ mod gpu_tests {
                 bytes, [11; 32],
                 "the callback must read the actual other model"
             );
-            assert!(
-                placement
-                    .stats(9)
-                    .unwrap()
-                    .events
-                    .iter()
-                    .any(|event| event.kind == "lower")
-            );
+            assert!(placement
+                .stats(9)
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event.kind == "lower"));
             active.store(false, Ordering::Release);
             drop(pin);
             placement.gpu.wait_pending().unwrap();
@@ -3652,9 +3648,11 @@ mod gpu_tests {
         // Exercise allocator slack with actual CUDA allocations, not synthetic
         // resident bytes. A live 4MiB owner later joins the idle 12MiB cache.
         let live = tensorfs::io::DeviceBuffer::new(0, 4 << 20).unwrap();
-        let idle = Arc::new(Mutex::new(vec![
-            tensorfs::io::DeviceBuffer::new(0, 12 << 20).unwrap(),
-        ]));
+        let idle = Arc::new(Mutex::new(vec![tensorfs::io::DeviceBuffer::new(
+            0,
+            12 << 20,
+        )
+        .unwrap()]));
         let attempts = Arc::new(AtomicU64::new(0));
         let (entered, waiting) = mpsc::channel();
         let (release, finish) = mpsc::channel();
@@ -4336,14 +4334,12 @@ mod gpu_tests {
         };
         assert!(matches!(error, Error::DeviceFull { .. }), "{error}");
         assert_eq!(calls.load(Ordering::Acquire), 3);
-        assert!(
-            placement
-                .gpu
-                .facts()
-                .unwrap()
-                .iter()
-                .any(|(id, bytes, _, _)| *id == victim && *bytes == 0)
-        );
+        assert!(placement
+            .gpu
+            .facts()
+            .unwrap()
+            .iter()
+            .any(|(id, bytes, _, _)| *id == victim && *bytes == 0));
         let stats = placement.end(1).expect("failed request ends normally");
         assert_eq!(stats.copies.len(), 3);
         assert!(placement.inner.lock().requests.is_empty());
