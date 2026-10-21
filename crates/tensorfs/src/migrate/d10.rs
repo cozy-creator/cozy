@@ -284,11 +284,12 @@ impl<'t> Migrator<'t> {
     }
 
     /// The repo document `doc` in D10, its old objects read by `read`: each release a public tag,
-    /// each checkpoint a private one. A tag naming a tree stays as it is; a release of lanes
+    /// each checkpoint a private one. Existing trees keep their files and names, replacing
+    /// only headers with TEXT classes and the refs that name them. A release of lanes
     /// becomes one tree (`model.<lane>.cozytensors` each, repo files merged, the first lane's
     /// kept where they differ), yanked or not; an old checkpoint a tree of its own
-    /// (`model.cozytensors`), named `v1-`/`v2-` and its manifest's first 12 hex (16 where two
-    /// share 12), the name the Hub's view of a v1 model gives it.
+    /// (`model.cozytensors`), named `v1-`/`v2-` and its immutable digest prefix, lengthened
+    /// when needed to avoid any existing name or another unnamed checkpoint.
     pub fn repo(&mut self, doc: &[u8], read: Read) -> Result<Migrated> {
         let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
         let name = old.name.clone();
@@ -365,8 +366,7 @@ impl<'t> Migrator<'t> {
                     let tree = tree_at(c)?;
                     let file_only = !tree && self.offline && v1::files_only(&bytes)?.is_some();
                     let kind = if !tree && (file_only || v1::manifest(&bytes)?.is_some()) { "v1" } else { "v2" };
-                    let derived = private_name(kind, &c.sha256, &unnamed, &reserved);
-                    derived
+                    private_name(kind, &c.sha256, &unnamed, &reserved)
                 }
                 (Some(n), _) => n,
                 (None, _) => return fail(Kind::Invalid, format!("{name}: an unnamed tag")),
@@ -430,7 +430,12 @@ impl<'t> Migrator<'t> {
         })?;
         let header = Header::from_cbor(&neutral)?;
         if names.values().all(String::is_empty) { return Ok(neutral); }
-        let reference = match upstream { Some(u) => self.reference(u.from)?, None => Versions::new() };
+        let mut reference = match upstream { Some(u) => self.reference(u.from)?, None => Versions::new() };
+        for class in header.pipeline().map(|p| &p.class).into_iter().chain(header.components().iter().map(|c| &c.class)) {
+            if !class.is_unknown() && !class.version.is_empty() {
+                reference.entry(class.library.clone()).or_insert_with(|| class.version.clone());
+            }
+        }
         let mut files = BTreeMap::new();
         if let Some(pipeline) = header.pipeline() {
             files.insert("model_index.json".to_owned(), serde_json::to_vec(&pipeline.config).map_err(|e| invalid(e.to_string()))?);
@@ -456,7 +461,6 @@ impl<'t> Migrator<'t> {
                 family_class(model, component, &versions)
                     .or_else(|| inferred.components.iter().find(|c| c.name == component).map(|c| c.class.clone()))
             };
-            if let Some(class) = found.filter(|c| !c.is_unknown() && c.name == name) { return Ok(class); }
             // An explicit qualified source names its own library; retain the rest of its
             // namespace, rather than guessing the library of an unqualified class.
             if let Some((library, class)) = name.split_once('.') {
@@ -465,6 +469,7 @@ impl<'t> Migrator<'t> {
                     return Ok(ClassRef::new(library, versions.get(library).map_or("", String::as_str), class));
                 }
             }
+            if let Some(class) = found.filter(|c| !c.is_unknown() && c.name == name) { return Ok(class); }
             fail(Kind::Unsupported, format!("{component:?} TEXT class {name:?} has no verified library/class record"))
         })?;
         Header::from_cbor(&out)?;

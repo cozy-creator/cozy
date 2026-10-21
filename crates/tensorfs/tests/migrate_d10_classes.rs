@@ -167,6 +167,17 @@ fn ambiguous_text_class_refuses_before_any_endpoint_write() {
     let doc = serde_json::to_vec(&json!({"name": "acme/ambiguous", "checkpoints": [old]})).unwrap();
     std::fs::create_dir_all(root.join("refs/acme")).unwrap();
     std::fs::write(root.join("refs/acme/ambiguous.json"), &doc).unwrap();
+    fn files(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut found = BTreeMap::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found.extend(files(&path));
+            } else { found.insert(path.clone(), std::fs::read(path).unwrap()); }
+        }
+        found
+    }
+    let before = files(&root);
     let scratch = Store::open(dir.join("scratch")).unwrap();
     let client = Client::new(SourcePolicy::default());
     let endpoint = Arc::new(Endpoint::new(&client, &root.to_string_lossy(), None).unwrap());
@@ -174,6 +185,7 @@ fn ambiguous_text_class_refuses_before_any_endpoint_write() {
     assert_eq!(error.kind, tensorfs::failure::Kind::Unsupported);
     assert!(error.detail.contains("Ambiguous") && error.detail.contains("verified library"), "{error}");
     assert_eq!(std::fs::read(root.join("refs/acme/ambiguous.json")).unwrap(), doc);
+    assert_eq!(files(&root), before, "no endpoint object or ref was written");
     let store = Store::open(&root).unwrap();
     for (at, bytes) in objects { assert_eq!(store.read(&at).unwrap(), bytes); }
     std::fs::remove_dir_all(dir).unwrap();
@@ -181,14 +193,16 @@ fn ambiguous_text_class_refuses_before_any_endpoint_write() {
 
 #[test]
 fn approved_family_and_qualified_names_work_without_inventing_versions() {
-    for (model, class, want) in [
-        ("acme/birefnet", "BiRefNet", ClassRef::new("birefnet", "0.4.0", "BiRefNet")),
-        ("acme/qualified", "example.deep.Model", ClassRef::new("example", "", "deep.Model")),
-        ("acme/unknown", "", ClassRef::default()),
+    for (model, class, metadata, want) in [
+        ("acme/birefnet", "BiRefNet", json!({}), ClassRef::new("birefnet", "0.4.0", "BiRefNet")),
+        ("acme/configured", "PlainModel", json!({"architectures": ["PlainModel"]}), ClassRef::new("transformers", "", "PlainModel")),
+        ("acme/qualified", "example.deep.Model", json!({"_class_name": "example.deep.Model", "_diffusers_version": "0.41.0"}), ClassRef::new("example", "", "deep.Model")),
+        ("acme/versioned", "example.deep.Model", json!({"_example_version": "1.2"}), ClassRef::new("example", "1.2", "deep.Model")),
+        ("acme/unknown", "", json!({}), ClassRef::default()),
     ] {
         let header = Header::new(vec![], None, vec![Component { name: "model".into(),
             class: if class.is_empty() { ClassRef::default() } else { ClassRef::new("source", "", class) },
-            ..Default::default() }], Default::default()).unwrap();
+            config: config(metadata), ..Default::default() }], Default::default()).unwrap();
         let mut objects = Objects::new(); let old = tree(&mut objects, &header, true, b"source");
         let doc = serde_json::to_vec(&json!({"name": model, "checkpoints": [old]})).unwrap();
         let planned = Migrator::new(Access::default(), &[]).repo(&doc, &|at| Ok(objects[at].clone())).unwrap();
