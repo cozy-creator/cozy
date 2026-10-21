@@ -229,15 +229,15 @@ fn reference(
 #[pymethods]
 impl PyClient {
     #[new]
-    #[pyo3(signature = (root, *, endpoint = None, token = None, ca_der = None))]
+    #[pyo3(signature = (root = None, *, endpoint = None, token = None, ca_der = None))]
     fn new(
         py: Python<'_>,
-        root: PathBuf,
+        root: Option<PathBuf>,
         endpoint: Option<String>,
         token: Option<&Bound<'_, PyAny>>,
         ca_der: Option<Vec<u8>>,
     ) -> PyResult<Self> {
-        let config = crate::credentials::config(endpoint, Some(root), token, ca_der)?;
+        let config = crate::credentials::config(endpoint, root, token, ca_der)?;
         let client = py.detach(|| Client::new(config)).or_raise(py)?;
         Ok(Self { client })
     }

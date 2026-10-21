@@ -18,12 +18,15 @@ def configure(*, endpoint=None, cache_dir=None, token=None, ca_der=None) -> None
     _settings = {**_settings, **{k: v for k, v in locals().items() if v is not None}}
 
 
-def _cache(cache_dir=None) -> Path:
-    return Path(cache_dir or _settings.get("cache_dir") or os.environ.get("TENSORFS_HOME") or Path.home() / ".cache/tensorfs").expanduser()
+# What the caller named; None leaves the store and endpoint to the native rule (TENSORFS_HOME,
+# TENSORFS_ENDPOINT and their defaults), the one every TensorFS surface follows.
+def _cache(cache_dir=None) -> Path | None:
+    root = cache_dir or _settings.get("cache_dir")
+    return None if root is None else Path(root).expanduser()
 
 
 def _endpoint(endpoint=None):
-    return endpoint or _settings.get("endpoint") or os.environ.get("TENSORFS_ENDPOINT", "https://tensorhub.com")
+    return endpoint or _settings.get("endpoint")
 
 
 def _client(cache_dir=None, endpoint=None, token=None, *, configured_token=True):
@@ -118,7 +121,7 @@ class CheckpointFile(io.RawIOBase):
 
 class Endpoint:
     def __init__(self, url, token=None, *, ca_der=None, cache_dir=None):
-        self._native = _ext.Endpoint(url, token, ca_der=ca_der, cache_dir=_cache(cache_dir) if url == "local" or cache_dir is not None else None)
+        self._native = _ext.Endpoint(url, token, ca_der=ca_der, cache_dir=_cache(cache_dir))
 
     def repo(self, repo_id):
         return self._native.repo(repo_id)

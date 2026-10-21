@@ -13,7 +13,6 @@ pub use failure::{Failure, Kind, Result};
 #[cfg(feature = "store")]
 pub mod fetch;
 pub mod format;
-#[cfg(feature = "store")]
 pub mod home;
 #[cfg(feature = "store")]
 pub mod import;

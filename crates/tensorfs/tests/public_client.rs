@@ -1125,3 +1125,22 @@ async fn advanced_exact_object_fetch_does_not_widen_the_window_and_uses_the_exis
     .unwrap();
     assert_eq!(fs::read(cache.join(repo_object.key())).unwrap(), readme);
 }
+
+/// Python names no store or endpoint of its own: an empty `TENSORFS_HOME` refuses and an empty
+/// `TENSORFS_ENDPOINT` is the default, as in Rust.
+#[test]
+fn python_takes_the_store_and_endpoint_by_the_native_rule() {
+    let Ok(python) = std::env::var("TENSORFS_TEST_PYTHON") else {
+        eprintln!("skipped: TENSORFS_TEST_PYTHON is required for the Python binding proof");
+        return;
+    };
+    let scratch = Scratch::new();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensorfs-py/scripts/home_endpoint.py");
+    let out = std::process::Command::new(python).arg(script).arg(&scratch.0).output().unwrap();
+    assert!(
+        out.status.success(),
+        "Python store and endpoint proof: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

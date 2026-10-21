@@ -20,7 +20,7 @@ pub(crate) mod view;
 
 pub use device::DeviceBuffer;
 pub use plan::Target;
-pub use probe::{ceiling, disk, Ceiling};
+pub use probe::{ceiling, disk, keep_ceilings_in, Ceiling};
 #[cfg(feature = "store")]
 pub use view::{Span, StoredPart};
 

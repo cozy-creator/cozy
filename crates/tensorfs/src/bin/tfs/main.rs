@@ -195,6 +195,7 @@ async fn run(args: &Args) -> Done {
     let config = config(args)?;
     let root = config.cache_dir.clone();
     let client = Client::new(config)?;
+    tensorfs::io::keep_ceilings_in(&root);
     match pos.as_slice() {
         ["convert", sources @ ..] if !sources.is_empty() => {
             let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
