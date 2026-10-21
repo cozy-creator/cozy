@@ -1,13 +1,13 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["cozy-runtime>=0.27.4"]
+# dependencies = ["cozy-runtime>=0.27.4", "torch", "diffusers"]
 # ///
 """varena-standalone.py on a rental's GPU:
 `cozy run varena-rental.py --on <rental> --gpus 1 --asset wheel=<tensorfs wheel> --asset script=varena-standalone.py`.
 
-The script runs in a fresh process of the Runtime's interpreter (its torch), with the given
-TensorFS wheel, and diffusers when the image lacks it, installed into a directory ahead of the
-Runtime's own packages. Its output holds the script's log; the log's last line counts the checks.
+The script runs in a fresh process of this script's interpreter (its environment has torch and
+diffusers), with the given TensorFS wheel installed into a directory ahead of the environment's
+own TensorFS. Its output holds the script's log.
 """
 import os
 import shutil
@@ -40,8 +40,6 @@ def main(*, wheel: Annotated[FileAsset, AssetBound(max_bytes=1 << 27)],
     test.write_bytes(script.read_bytes())
     text = install(site, "--no-deps", str(root / WHEEL))
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(site), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)}
-    if subprocess.run([sys.executable, "-c", "import diffusers"], env=env, capture_output=True).returncode:
-        text += install(site, "diffusers")
     run = subprocess.run([sys.executable, str(test)], env=env, capture_output=True, text=True, cwd=root)
     text += f"$ {sys.executable} varena-standalone.py: exit {run.returncode}\n{run.stdout}{run.stderr}"
     (logs / "log.txt").write_text(text)
