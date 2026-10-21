@@ -2,4 +2,5 @@
 //! is the last v1 reader, deleted with it.
 
 pub mod d10;
+pub mod store1;
 pub mod v1;
