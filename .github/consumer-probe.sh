@@ -78,8 +78,8 @@ rec "run locally: sdxl" $bound "$cozy" run fidika/sdxl/generate prompt='a lighth
 rec "birefnet functions" 120 "$cozy" run fidika/birefnet
 # Your own code: a script with the Runtime, local on every OS (cohort wheels for macOS and Windows).
 printf '%s\n' '# /// script' '# requires-python = ">=3.12"' '# dependencies = ["cozy-runtime"]' '# [tool.cozy]' \
-  '# accelerator = false' '# ///' 'def main(name: str = "you") -> str:' '    return f"hello, {name}"' > greet.py
-rec "run a local script" 900 "$cozy" run ./greet.py name=consumer
+  '# accelerator = false' '# ///' 'def main() -> str:' '    return "hello from a script"' > greet.py
+rec "run a local script" 900 "$cozy" run ./greet.py
 rec "run list after" 60 "$cozy" run list
 rec "bad input name" 120 "$cozy" run fidika/sdxl/generate nosuch=1 prompt=x
 rec "bad input value" 120 "$cozy" run fidika/sdxl/generate prompt=x seed=abc
