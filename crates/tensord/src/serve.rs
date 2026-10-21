@@ -522,6 +522,7 @@ fn start_api(
     }));
     crate::calls::Calls::configure(service, machine.clone(), backend.runs.as_ref())?;
     if let Some(runs) = &backend.runs {
+        runs.restore_warm_sets()?;
         crate::api::machine_runs::resume(runs)?;
     }
     listener.set_nonblocking(true)?;
