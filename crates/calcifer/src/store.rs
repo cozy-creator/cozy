@@ -818,10 +818,7 @@ impl Store {
                 .reason
                 .as_ref()
                 .filter(|_| status != Status::Completed)
-                .map(|r| Reason {
-                    code: r.code.clone(),
-                    message: r.message.clone(),
-                });
+                .cloned();
             tx.execute(
                 "UPDATE runs SET cursor = MAX(cursor, ?2), outcome = ?3 WHERE id = ?1",
                 params![
@@ -876,6 +873,7 @@ impl Store {
                     let reason = Reason {
                         code: "canceled".into(),
                         message: "canceled before it was sent".into(),
+                        ..Default::default()
                     };
                     end(tx, id, Status::Canceled, Some(reason))
                 }
@@ -907,7 +905,7 @@ impl Store {
                 let row = row?;
                 let id = row.id.to_string();
                 let ended = if row.cancel_requested {
-                    let reason = Reason { code: "canceled".into(), message: format!("canceled; {reason}") };
+                    let reason = Reason { code: "canceled".into(), message: format!("canceled; {reason}"), ..Default::default() };
                     end(tx, &id, Status::Canceled, Some(reason))?
                 } else if row.state != State::Accepted && !row.pinned && served {
                     tx.execute(
@@ -921,7 +919,7 @@ impl Store {
                         State::Accepted => format!("its machine {machine} ended mid-run, and the run was not retried: {reason}"),
                         _ => format!("its machine {machine} ended before it accepted the run: {reason}"),
                     };
-                    end(tx, &id, Status::Failed, Some(Reason { code: "machine_lost".into(), message }))?
+                    end(tx, &id, Status::Failed, Some(Reason { code: "machine_lost".into(), message, ..Default::default() }))?
                 };
                 events.extend(ended.into_iter().map(|event| (row.id.clone(), event)));
             }
@@ -1268,7 +1266,7 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             },
             reason: reason_code
                 .zip(reason)
-                .map(|(code, message)| Reason { code, message }),
+                .map(|(code, message)| Reason { code, message, ..Default::default() }),
             state_seq: r.get::<_, i64>(16)? as u64,
             created_at_ms: r.get(17)?,
             accepted_at_ms: r.get(18)?,
@@ -1708,7 +1706,12 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
         },
         cancel_requested: row.cancel_requested,
         machine_state: row.machine_state.clone(),
-        reason: row.reason.clone(),
+        // The machine's own reason, with its traceback, when it is the run's.
+        reason: row.reason.clone().map(|reason| {
+            (row.outcome.as_ref().and_then(|o| o.reason.clone()))
+                .filter(|full| full.code == reason.code)
+                .unwrap_or(reason)
+        }),
         output: items.collect::<rusqlite::Result<_>>()?,
         created_at_ms: row.created_at_ms,
         accepted_at_ms: row.accepted_at_ms,

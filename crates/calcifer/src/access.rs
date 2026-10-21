@@ -338,6 +338,7 @@ fn hub_denied(origin: &Origin, error: hub_client::Error) -> Denied {
         true => Denied::Refused(Reason {
             code: error.cause.unwrap_or(error.code),
             message: error.message,
+            ..Default::default()
         }),
         false => unreachable(error.message),
     }
@@ -394,6 +395,7 @@ fn refused(code: &str, message: String) -> Denied {
     Denied::Refused(Reason {
         code: code.into(),
         message,
+        ..Default::default()
     })
 }
 

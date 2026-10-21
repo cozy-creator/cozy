@@ -164,11 +164,9 @@ pub struct Call {
     pub memoized: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Reason {
-    pub code: String,
-    pub message: String,
-}
+/// Why a run or call did not succeed, as its machine said it (with its traceback) or as
+/// Calcifer did.
+pub use crate::machine::Reason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
