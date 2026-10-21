@@ -5,8 +5,10 @@
 //! but the device's facts: a page's id is its `CUmemGenericAllocationHandle`, an event's its
 //! `CUevent`.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr};
 
+use parking_lot::Mutex;
 use platform::handles::Owned;
 use tensorfs::io::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUdevice, CUevent, CUstream, CtxGuard};
 use tensorfs::io::Dst;
@@ -55,6 +57,8 @@ impl Drop for Primary {
 
 /// One CUDA device's VMM mechanism.
 pub struct CudaBackend {
+    /// Host registrations (`register_host`) by address. They go before the context does.
+    hosts: Mutex<HashMap<usize, cuda::HostPin>>,
     ordinal: i32,
     /// Varena's copy stream: fills are ordered on it. Dropped (synchronized) before the context.
     stream: cuda::Stream,
@@ -97,7 +101,7 @@ impl CudaBackend {
         let (mut free, mut total) = (0usize, 0usize);
         call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
         drop(_ctx);
-        Ok(CudaBackend { ordinal, stream, primary, prop, granularity: granularity as u64, capacity: total as u64, nvml, before })
+        Ok(CudaBackend { hosts: Mutex::new(HashMap::new()), ordinal, stream, primary, prop, granularity: granularity as u64, capacity: total as u64, nvml, before })
     }
 
     pub fn ordinal(&self) -> i32 {
@@ -334,6 +338,25 @@ impl Backend for CudaBackend {
     fn drain(&self) -> Result<()> {
         self.stream.drain()?;
         Ok(tensorfs::io::drain(self.ordinal)?)
+    }
+
+    /// Read-only (the tier's mapping is), in the primary context, so TensorFS's reads see
+    /// registered memory and copy directly.
+    unsafe fn register_host(&self, ptr: *const u8, len: u64) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        // SAFETY: the caller keeps the range mapped until `unregister_host`.
+        let pin = unsafe { cuda::pin_region(ptr.cast_mut(), len as usize, true) }?;
+        self.hosts.lock().insert(ptr as usize, pin);
+        Ok(())
+    }
+
+    /// A failed release keeps the registration, so its owner keeps the memory mapped and retries.
+    fn unregister_host(&self, ptr: *const u8) -> Result<()> {
+        let mut hosts = self.hosts.lock();
+        let pin = hosts.get_mut(&(ptr as usize)).ok_or_else(|| Error::Invalid(format!("{ptr:?} is not registered")))?;
+        pin.release()?;
+        hosts.remove(&(ptr as usize));
+        Ok(())
     }
 }
 
