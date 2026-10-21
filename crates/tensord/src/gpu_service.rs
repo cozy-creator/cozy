@@ -40,7 +40,8 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// A slot's model as the run's preparation resolved it (`published`).
+#[derive(Clone, Debug)]
 pub struct ModelGrant {
     pub package: String,
     pub slot: String,
@@ -49,14 +50,6 @@ pub struct ModelGrant {
     pub lane: String,
     pub manifest: String,
     pub components: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct PublishedPackage {
-    pub package: String,
-    pub distribution: String,
-    pub release: String,
-    pub generation: String,
 }
 
 /// How the machine shares its host and GPUs.
@@ -97,13 +90,6 @@ pub struct GpuConfig {
     /// `OMP_NUM_THREADS` the seal imposes. torch's allocator is the Runtime's, set in code.
     #[serde(default = "threads")]
     pub threads: u32,
-    /// Explicit authority for already verified cached catalog bytes, for runs without a
-    /// Hub. Published runs resolve under the owner's Hub access instead; a cache hit alone
-    /// grants no private model.
-    #[serde(default)]
-    pub models: Vec<ModelGrant>,
-    #[serde(default)]
-    pub packages: Vec<PublishedPackage>,
     #[serde(default)]
     pub host: HostOptions,
     /// Keep one import-only executor per installed GPU generation and fork executors from
@@ -1435,48 +1421,6 @@ impl Pool {
             self.retire_returned(&plan, start, width, &[birth]);
         }
     }
-    pub fn published_installation(
-        &self,
-        service: &crate::service::Service,
-        actor: &str,
-        package: &str,
-        release: &str,
-    ) -> io::Result<Option<crate::journal::Installation>> {
-        let Some(selected) = self
-            .config
-            .packages
-            .iter()
-            .find(|p| p.package == package && p.release == release)
-        else {
-            return Ok(None);
-        };
-        let held = service.catalog.resolve(&selected.generation)?;
-        if held.record.package != selected.distribution || held.record.version != release {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "published catalog mapping differs from actual held package",
-            ));
-        }
-        let alias = format!(
-            "published-{}",
-            tensorfs::sha256::hex_digest(
-                format!("{package}\0{release}\0{}", selected.generation).as_bytes()
-            )
-        );
-        service
-            .engine
-            .bind_installation(crate::journal::Installation {
-                actor: actor.into(),
-                alias,
-                generation: selected.generation.clone(),
-                package: package.into(),
-                release: release.into(),
-                interface: serde_json::to_vec(&held.record.interface)?,
-                hub: String::new(),
-            })
-            .map(Some)
-    }
-
     /// A call's degree as its declaration and this machine set it: 0 for `accelerator=False`
     /// or a machine with no GPU, else its constructed slots' group, or the GPUs a call that
     /// constructs nothing asks for (one by default); more than the machine has is refused.
@@ -1496,16 +1440,16 @@ impl Pool {
     }
 
     /// Derive each model slot's binding from the installed SDK's real static interface and
-    /// the models the Hub resolved under the owner's access (`resolved`, one per slot), or
-    /// configured cached byte authority: a constructed slot becomes the plan's construction, a
-    /// `Weights[M]` one its source. `degree` 0 takes the widest group every constructed slot
-    /// declares on this machine. No model code executes during description/preparation.
+    /// the model the run's preparation resolved for it (`grants`, one per slot, `published`):
+    /// a constructed slot becomes the plan's construction, a `Weights[M]` one its source.
+    /// `degree` 0 takes the widest group every constructed slot declares on this machine. No
+    /// model code executes during description/preparation.
     pub fn prepare_root(
         &self,
         installed: &crate::journal::Installation,
         entrypoint: &str,
         choices: &[crate::api::domain::ModelChoice],
-        resolved: &[ModelGrant],
+        grants: &[ModelGrant],
         degree: u32,
     ) -> io::Result<Plan> {
         let invalid = |detail: &str| io::Error::new(io::ErrorKind::InvalidData, detail.to_string());
@@ -1547,16 +1491,6 @@ impl Pool {
                     "model choice does not name a declared root slot",
                 ));
             }
-            // Hub-resolved grants already carry a slot's adapters (as its adapter view);
-            // configured cached authority has no resolution step to apply them.
-            if (!choice.source.is_empty() || !choice.profiles.is_empty() || !choice.adapters.is_empty())
-                && resolved.is_empty()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "provider sources and adapters need the run's preparation (configured grants take neither)",
-                ));
-            }
         }
         let degree = self.degree(entry, degree)?;
         let (mut planned, mut sources) = (vec![], vec![]);
@@ -1568,41 +1502,10 @@ impl Pool {
             let chosen = choices
                 .iter()
                 .find(|c| c.parameter == *path || c.parameter == *parameter);
-            // A model passed by value (a ModelArtifact a run here produced) is held here.
-            let passed = chosen
-                .filter(|c| resolved.is_empty() && c.repository.is_empty())
-                .and_then(|c| c.manifest.as_ref())
-                .map(|reference| self.held_grant(&installed.package, path, reference))
-                .transpose()?;
-            let authority: Vec<&ModelGrant> = match (&passed, resolved.is_empty()) {
-                (Some(passed), _) => vec![passed],
-                (None, true) => self.config.models.iter().collect(),
-                (None, false) => resolved.iter().collect(),
-            };
-            let grants: Vec<_> = authority
-                .into_iter()
-                .filter(|grant| {
-                    grant.package == installed.package
-                        && grant.slot == *path
-                        // A resolved grant was resolved from the choice itself.
-                        && (!resolved.is_empty() || chosen.is_none_or(|choice| {
-                            (choice.repository.is_empty() || choice.repository == grant.repository)
-                                && (choice.release.is_empty() || choice.release == grant.release)
-                                && (choice.lane.is_empty() || choice.lane == grant.lane)
-                                && choice.manifest.as_ref().is_none_or(|reference| {
-                                    tensorfs::sha256::hex(&reference.digest)
-                                        == grant.manifest.trim_start_matches("sha256:")
-                                })
-                        }))
-                })
-                .collect();
-            if grants.len() != 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("cached model selection for {path} has no unique configured authority"),
-                ));
-            }
-            let grant = grants[0];
+            let grant = grants
+                .iter()
+                .find(|grant| grant.package == installed.package && grant.slot == *path)
+                .ok_or_else(|| invalid(&format!("no model was resolved for {path}")))?;
             if !constructed(model) {
                 let length = crate::storage::held(&self.store, &grant.manifest)
                     .map_err(|_| invalid(&format!("the checkpoint of {path} is not held here")))?
@@ -1719,21 +1622,6 @@ impl Pool {
     }
     pub fn plan(&self, preparation: &Preparation) -> io::Result<Plan> {
         Plan::of(preparation)
-    }
-    /// A slot's checkpoint this machine's store holds, by its header or its tree.
-    fn held_grant(&self, package: &str, path: &str, reference: &crate::api::domain::Ref) -> io::Result<ModelGrant> {
-        let sha = tensorfs::sha256::hex(&reference.digest);
-        let absent = |why: String| io::Error::new(io::ErrorKind::NotFound, format!("checkpoint_absent: {path} names sha256:{sha}: {why}"));
-        let checkpoint = crate::storage::checkpoint(&self.store, &sha).map_err(|e| absent(e.to_string()))?;
-        Ok(ModelGrant {
-            package: package.into(),
-            slot: path.into(),
-            repository: String::new(),
-            release: String::new(),
-            lane: String::new(),
-            manifest: checkpoint.id().id(),
-            components: checkpoint.header().components().iter().map(|c| c.name.clone()).collect(),
-        })
     }
     fn permit(
         self: &Arc<Self>,

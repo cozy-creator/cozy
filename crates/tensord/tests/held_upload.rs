@@ -99,10 +99,9 @@ impl Fixture {
         let runs = Arc::new(Runs {
             service,
             objects,
-            publisher: Some(publisher),
+            publisher,
             local: None,
             own_hub: None,
-           
             contexts: Default::default(),
         });
         Self {

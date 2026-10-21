@@ -1201,8 +1201,20 @@ mod v1_api {
         client: &Client,
         cap: &str,
         manifest: &str,
+        named: (&str, &str),
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        call_choosing(client, cap, manifest, named, payload, vec![]).await
+    }
+
+    /// `call` with model choices.
+    async fn call_choosing(
+        client: &Client,
+        cap: &str,
+        manifest: &str,
         (id, function): (&str, &str),
         payload: serde_json::Value,
+        models: Vec<v1::ModelChoice>,
     ) -> serde_json::Value {
         let spec = v1::RunSpec {
             kind: v1::RunKind::Call,
@@ -1210,6 +1222,7 @@ mod v1_api {
             entrypoint: function.into(),
             payload: raw(&payload),
             owner: "alice".into(),
+            models,
             ..Default::default()
         };
         let request = authorized(RunRequest { id: id.into(), after: 0, spec: Some(spec) }, cap);
@@ -1290,14 +1303,12 @@ mod v1_api {
         let config = tools.join("gpu.json");
         let mut args = installing_args(&tools);
         args.extend(["--gpu-config".into(), config.clone().into_os_string()]);
+        // The children's model is one this machine holds (`local/tiny`): no Hub resolves it.
         let machine = Machine::start_args(|state, _| {
             let store = tensorfs::store::Store::open(state.join("tensorfs")).unwrap();
-            let manifest = constructible(&store, 2048);
+            tensord::storage::set_local(&store, "tiny", &constructible(&store, 2048), &Default::default()).unwrap();
             fs::write(&config, serde_json::json!({"devices": "0,1", "environment": {
-                "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
-                "models": [{"package": "local/tensord-gpu-calls", "slot": "modeled.models.model",
-                    "repository": "local/tiny", "release": "1", "lane": "f32",
-                    "manifest": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
+                "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home}}).to_string()).unwrap();
         }, &args).await;
         let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
@@ -1310,6 +1321,8 @@ mod v1_api {
                 payload: raw(&serde_json::json!({"hold_s": hold_s})),
                 owner: "alice".into(),
                 gpus,
+                models: vec![v1::ModelChoice { parameter: "modeled.models.model".into(),
+                    repository: "local/tiny".into(), ..Default::default() }],
                 ..Default::default()
             };
             let request = authorized(RunRequest { id: id.into(), after: 0, spec: Some(spec) }, &all);
@@ -1325,7 +1338,7 @@ mod v1_api {
                 if let v1::Event::Call(call) = &event.event {
                     let measured = json(&call.measurements);
                     assert_eq!((&measured["models"][0]["repository"], &measured["models"][0]["lane"]),
-                        (&"local/tiny".into(), &"f32".into()), "{measured}");
+                        (&"local/tiny".into(), &"".into()), "{measured}");
                 }
             }
         }
@@ -1368,11 +1381,9 @@ mod v1_api {
         let machine = Machine::start_args(|state, _| {
             let store = tensorfs::store::Store::open(state.join("tensorfs")).unwrap();
             let manifest = constructible(&store, (WEIGHT_MIB << 18) as usize);
+            tensord::storage::set_local(&store, "weight", &manifest, &Default::default()).unwrap();
             fs::write(&config, serde_json::json!({"devices": "0", "environment": {
-                "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
-                "models": [{"package": "local/tensord-gpu-calls", "slot": "resident.models.model",
-                    "repository": "local/weight", "release": "1", "lane": "f32",
-                    "manifest": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
+                "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home}}).to_string()).unwrap();
         }, &args).await;
         let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
@@ -1381,8 +1392,10 @@ mod v1_api {
         let idle_fds = driver_fds(pid);
 
         // The second call ends with its executor's weights offered to custody, if the first did not.
+        let weight = || vec![v1::ModelChoice { parameter: "resident.models.model".into(),
+            repository: "local/weight".into(), ..Default::default() }];
         for id in ["resident-1", "resident-2"] {
-            let ran = call(&client, &all, &manifest, (id, "resident"), serde_json::json!({})).await;
+            let ran = call_choosing(&client, &all, &manifest, (id, "resident"), serde_json::json!({}), weight()).await;
             assert_eq!(ran["device"], "cuda:0", "{ran}");
         }
         assert!(driver_fds(pid) > idle_fds, "custody kept none of the executor's weights");

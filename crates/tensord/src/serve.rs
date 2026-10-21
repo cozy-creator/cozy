@@ -482,7 +482,7 @@ fn start_api(
     let publisher =
         crate::published::Publisher::new(&root.join("published"), sdk, machine.clone())?;
     service.configure_publisher(publisher.clone());
-    backend.publisher = Some(publisher);
+    backend.publisher = Some(publisher.clone());
     // Local packages install only with the helper; package environments get the client either way.
     backend.installer = match (helper, wheel) {
         (Some(helper_python), Some(client_wheel)) => Some(api::install::InstallerConfig {
@@ -510,7 +510,7 @@ fn start_api(
     backend.runs = Some(Arc::new(crate::runs::Runs {
         service: service.clone(),
         objects: objects.clone(),
-        publisher: backend.publisher.clone(),
+        publisher,
         local: backend.installer.clone().map(|installer| {
             Arc::new(crate::local_source::LocalSources::new(objects, installer))
         }),
