@@ -1,10 +1,10 @@
-//! A rental booting over a store in an older format (a live rental updated in place) refuses
-//! it, saying to remove it and pull again: nothing in it is read or touched. The real binary.
+//! A rental booting over a store in an older format (an image's, a live rental's updated in
+//! place) serves on a new store in its place; with no update in flight the older one is gone at
+//! once (an update's set-aside, commit and rollback: `machine_update_run`). The real binary.
 #![cfg(target_os = "linux")]
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use std::{
-    io::{BufRead, BufReader},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -61,16 +61,21 @@ fn launch(root: &Path, port: u16, store: Option<&Path>, stderr: Stdio) -> Machin
 }
 
 #[test]
-fn a_rental_refuses_a_store_in_an_older_format() {
+fn a_rental_on_an_older_store_serves_on_a_new_one_in_its_place() {
     let (root, port) = (root("rental-older-store"), port());
     let store = root.join("var/lib/tensorfs");
     older(&store);
-    let mut machine = launch(&root, port, None, Stdio::piped());
-    // Its refusal, as it says it: the hang bound is the reader's end of stderr.
-    let refused = BufReader::new(machine.0.stderr.take().unwrap())
-        .lines()
-        .map_while(Result::ok)
-        .any(|line| line.contains("pull again"));
-    assert!(refused, "the rental never refused the older store");
-    assert!(store.join("blobs/ab/cd/abcd").exists(), "the older store was touched");
+    let mut machine = launch(&root, port, None, Stdio::null());
+    let (start, served) = (std::time::Instant::now(), || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+    while !served() {
+        assert!(machine.0.try_wait().unwrap().is_none(), "the rental exited on an older store");
+        assert!(start.elapsed() < std::time::Duration::from_secs(120), "the rental never listened");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let format = std::fs::read_to_string(store.join("format")).unwrap();
+    assert!(format.contains(tensorfs::store::FORMAT), "{format}");
+    assert!(!store.join("blobs/ab/cd/abcd").exists() && !store.join("tmp/older-store").exists(), "the older store stayed");
+    assert!(machine.0.try_wait().unwrap().is_none());
+    drop(machine);
+    let _ = std::fs::remove_dir_all(root);
 }

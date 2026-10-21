@@ -388,33 +388,41 @@ impl Endpoint {
             }
         };
         let url = format!("{base}/{}", object.key());
-        let head = |method| Ask { method, url: &url, headers: vec![], body: None, payload: None, auth: true };
-        let reply = self.exchange(head("HEAD")).await?;
-        match reply.status {
-            200 => return held(&reply, object).map(|()| false),
-            404 | 410 => {}
-            _ => return Err(refusal(&reply, "HEAD")),
-        }
-        // A writer's HEAD of an absent object may say where to PUT it (a presigned URL).
-        let target = reply.header("location").map(|at| join(&url.parse::<Uri>().expect("sent"), at));
-        let auth = target.as_deref().is_none_or(|t| same_origin(t, &url));
-        let target = target.unwrap_or_else(|| url.clone());
-        let checksum = STANDARD.encode(decode_hex(&object.sha256));
-        let headers = vec![
-            ("content-length".to_owned(), object.length.to_string()),
-            ("x-amz-checksum-sha256".to_owned(), checksum),
-            ("if-none-match".to_owned(), "*".to_owned()),
-        ];
-        let ask = Ask { method: "PUT", url: &target, headers, body: Some(payload), payload: Some(&object.sha256), auth };
-        let put = self.exchange(ask).await?;
-        if !matches!(put.status, 200 | 201 | 204 | 412) {
-            return Err(refusal(&put, "PUT"));
-        }
-        // The confirming HEAD: where a redirecting server verifies what it was sent.
-        let confirm = self.exchange(head("HEAD")).await?;
-        match confirm.status {
-            200 => held(&confirm, object).map(|()| true),
-            _ => Err(refusal(&confirm, "the confirming HEAD")),
+        let head = || Ask { method: "HEAD", url: &url, headers: vec![], body: None, payload: None, auth: true };
+        let mut reply = self.exchange(head()).await?;
+        // Places the bytes went, without their signatures. A confirming HEAD (where a redirecting
+        // server verifies what it was sent) may name another place, as when another account's
+        // copy landed first and this writer proves it holds the bytes: they go there too.
+        let mut sent: Vec<String> = vec![];
+        loop {
+            match reply.status {
+                200 => return held(&reply, object).map(|()| !sent.is_empty()),
+                404 | 410 => {}
+                _ => return Err(refusal(&reply, if sent.is_empty() { "HEAD" } else { "the confirming HEAD" })),
+            }
+            // A writer's HEAD of an absent object may say where to PUT it (a presigned URL).
+            let target = match reply.header("location") {
+                Some(at) => join(&url.parse::<Uri>().expect("sent"), at),
+                None => url.clone(),
+            };
+            let place = target.split('?').next().unwrap_or_default().to_owned();
+            if sent.contains(&place) {
+                return Err(refusal(&reply, "the confirming HEAD"));
+            }
+            let checksum = STANDARD.encode(decode_hex(&object.sha256));
+            let headers = vec![
+                ("content-length".to_owned(), object.length.to_string()),
+                ("x-amz-checksum-sha256".to_owned(), checksum),
+                ("if-none-match".to_owned(), "*".to_owned()),
+            ];
+            let auth = same_origin(&target, &url);
+            let ask = Ask { method: "PUT", url: &target, headers, body: Some(payload), payload: Some(&object.sha256), auth };
+            let put = self.exchange(ask).await?;
+            if !matches!(put.status, 200 | 201 | 204 | 412) {
+                return Err(refusal(&put, "PUT"));
+            }
+            sent.push(place);
+            reply = self.exchange(head()).await?;
         }
     }
 

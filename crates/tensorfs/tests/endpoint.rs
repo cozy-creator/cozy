@@ -360,3 +360,71 @@ fn a_directory_and_a_static_server_conform() {
     let warned: Vec<&str> = (cases.iter()).filter(|c| c["ok"] == false).filter_map(|c| c["case"].as_str()).collect();
     assert_eq!(warned, ["refs: an ETag", "refs: If-None-Match is 304", "blobs: Range gives 206 with that byte (or redirects)"]);
 }
+
+/// A redirecting writer server as a Hub answers two accounts uploading the same bytes: the first
+/// HEAD names the shared place, where the other account's copy lands first (412); the confirming
+/// HEAD then names this writer's proof place. With `stuck`, every HEAD names the shared place.
+struct ProofServer(Child, String);
+
+impl ProofServer {
+    fn start(length: u64, stuck: bool) -> ProofServer {
+        let mut child = Command::new("python3")
+            .args(["-u", "-c", r#"
+import http.server, sys
+length, stuck, state = int(sys.argv[1]), sys.argv[2] == 'true', {'shared': False, 'proven': False, 'n': 0}
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def reply(self, status, location=None, size=0):
+        self.send_response(status)
+        if location: self.send_header('Location', location)
+        self.send_header('Content-Length', str(size))
+        self.end_headers()
+    def do_HEAD(self):
+        state['n'] += 1
+        sha = self.path.rsplit('/', 1)[1]
+        if state['proven']: return self.reply(200, size=length)
+        place = 'proof' if state['shared'] and not stuck else 'shared'
+        self.reply(404, f"/{place}/{sha}?signature={state['n']}")
+    def do_PUT(self):
+        body = self.rfile.read(int(self.headers['Content-Length']))
+        if self.path.startswith('/shared/') and not stuck:
+            state['shared'] = True
+            return self.reply(412)
+        state['proven'] = self.path.startswith('/proof/') and len(body) == length
+        self.reply(201)
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+print(server.server_port, flush=True)
+server.serve_forever()
+"#])
+            .arg(length.to_string())
+            .arg(stuck.to_string())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut port = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut port).unwrap();
+        ProofServer(child, format!("http://127.0.0.1:{}", port.trim()))
+    }
+}
+
+impl Drop for ProofServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn a_confirming_head_that_names_another_place_gets_the_bytes_there() {
+    let bytes = b"bytes another account sent first";
+    let object = ObjectRef::of(bytes);
+    let payload = || Ok(Payload::Bytes(bytes[..].into()));
+    let server = ProofServer::start(object.length, false);
+    let endpoint = Endpoint::new(&client(), &server.1, None).unwrap();
+    assert!(endpoint.upload(&object, &payload).await.unwrap(), "sent to its proof place");
+
+    let stuck = ProofServer::start(object.length, true);
+    let endpoint = Endpoint::new(&client(), &stuck.1, None).unwrap();
+    let refused = endpoint.upload(&object, &payload).await.unwrap_err();
+    assert_eq!(refused.code, Code::REF_NOT_FOUND, "the same place twice: {refused}");
+}

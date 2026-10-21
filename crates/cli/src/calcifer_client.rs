@@ -278,6 +278,7 @@ impl Client {
     async fn start(&self) -> Result<Holder, Error> {
         let home = &self.0.home;
         let installed = installed(home)?;
+        let spec = self.spec(installed.clone());
         let failed = |e: platform::Error| {
             Error::new(Kind::Unavailable, "calcifer_start_failed", e.to_string())
         };
@@ -299,7 +300,7 @@ impl Client {
         // defined for the installed cozy, else runs the installed one detached.
         let exe = std::env::current_exe().and_then(|exe| exe.canonicalize());
         let ours = matches!((exe, installed.canonicalize()), (Ok(exe), Ok(it)) if exe == it);
-        let managed = services.available() && (ours || services.current(&self.spec()));
+        let managed = services.available() && (ours || services.current(&spec));
         // Started detached for want of systemctl: no login starts it again.
         let path: Vec<_> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
@@ -311,7 +312,7 @@ impl Client {
             output::warn(&warning);
         }
         if managed && ours {
-            let wrote = services.ensure(&self.spec()).map_err(failed)?;
+            let wrote = services.ensure(&spec).map_err(failed)?;
             steps.done(match wrote {
                 true => "wrote Calcifer's service and reloaded its manager",
                 false => "found Calcifer's service current",
@@ -325,8 +326,8 @@ impl Client {
             // Calcifer that was stopping, which held the lock until it went.
             if child.is_none() && self.lock_free() {
                 match managed {
-                    true => services.start(&self.spec()).map_err(failed)?,
-                    false => child = Some(self.spawn().map_err(failed)?),
+                    true => services.start(&spec).map_err(failed)?,
+                    false => child = Some(spawn(&spec).map_err(failed)?),
                 }
                 if !std::mem::replace(&mut asked, true) {
                     steps.done("started Calcifer");
@@ -366,19 +367,14 @@ impl Client {
         }
     }
 
-    fn spec(&self) -> ServiceSpec {
+    /// Calcifer's service: the installed cozy's `cozy calcifer`.
+    fn spec(&self, installed: PathBuf) -> ServiceSpec {
         ServiceSpec {
             name: "calcifer".into(),
-            program: self.0.home.binary(),
+            program: installed,
             args: vec!["calcifer".into()],
             log: Some(self.0.home.calcifer_log()),
         }
-    }
-
-    /// `cozy calcifer`, detached, saying anything before its own log opens into that log.
-    fn spawn(&self) -> platform::Result<Detached> {
-        let spec = self.spec();
-        process::detach(&spec.program, &spec.args, spec.log.as_deref())
     }
 
     /// Sends one request, starting Calcifer when it is gone, reading its record again when a
@@ -672,6 +668,11 @@ impl Sse {
 }
 
 /// A path from segments, each percent-encoded.
+/// `cozy calcifer`, detached, saying anything before its own log opens into that log.
+fn spawn(spec: &ServiceSpec) -> platform::Result<Detached> {
+    process::detach(&spec.program, &spec.args, spec.log.as_deref())
+}
+
 pub fn path(segments: &[&str]) -> String {
     let mut url = url::Url::parse("http://calcifer/").expect("a base URL");
     url.path_segments_mut()
@@ -680,20 +681,27 @@ pub fn path(segments: &[&str]) -> String {
     url.path().to_owned()
 }
 
-/// The home's installed `cozy`, the only one Calcifer and the machine run.
+/// The home's installed `cozy`, the only one Calcifer and the machine run: the path the home
+/// records. With none recorded, or a recorded file gone (a package manager moved it), it is the
+/// installer's `<home>/bin/cozy` when that is there, else this cozy (Homebrew, winget, a distro
+/// package), and that is recorded. One rule for every installer; another cozy never replaces a
+/// recorded one that is there.
 pub(crate) fn installed(home: &Home) -> Result<PathBuf, Error> {
-    let binary = home.binary();
-    let message = format!("Calcifer runs only {}, which is missing", binary.display());
-    match binary.is_file() {
-        true => Ok(binary),
-        false => Err(Error::new(Kind::NotFound, "cozy_not_installed", message).next(INSTALL)),
+    let record = home.installed();
+    let recorded = std::fs::read_to_string(&record).ok().map(|text| PathBuf::from(text.trim_end()));
+    if let Some(recorded) = recorded.filter(|path| path.is_file()) {
+        return Ok(recorded);
     }
+    let failed = |e: String| Error::new(Kind::Internal, "installed_unrecorded", e);
+    let chosen = match home.binary() {
+        binary if binary.is_file() => binary,
+        _ => std::env::current_exe().map_err(|e| failed(e.to_string()))?,
+    };
+    home.open().map_err(|e| failed(e.to_string()))?;
+    platform::durable::replace(&record, chosen.to_string_lossy().as_bytes(), 0o600)
+        .map_err(|e| failed(e.to_string()))?;
+    Ok(chosen)
 }
-
-const INSTALL: &str = match cfg!(windows) {
-    true => "irm https://tensorhub.com/install.ps1 | iex",
-    false => "curl -LsSf https://tensorhub.com/install.sh | sh",
-};
 
 /// The refusal a Calcifer that could not start left.
 fn refusal(path: &Path) -> Option<Error> {

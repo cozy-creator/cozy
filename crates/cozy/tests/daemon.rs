@@ -70,7 +70,8 @@ fn calcifer_starts_on_demand_and_down_stops_it() {
 
 /// Calcifer runs the home's installed `cozy`, whichever `cozy` finds it down: another (a build, a
 /// copy elsewhere) has the installed one start it, so a stray build never becomes Calcifer or
-/// writes its service. With none installed, nothing starts and the refusal names the installer.
+/// writes its service. The installed cozy is the path the home records: with none there (a
+/// package manager's install, or one it moved), the cozy that finds Calcifer down is recorded.
 #[cfg(target_os = "linux")]
 #[test]
 fn another_cozy_starts_the_installed_one() {
@@ -85,17 +86,23 @@ fn another_cozy_starts_the_installed_one() {
     assert_eq!(runs, installed.canonicalize().unwrap(), "{up}");
     assert_eq!(home.json(["down", "--json"])["changed"], true);
 
+    // The installed cozy gone (a package manager moved it), or never in the home (Homebrew,
+    // winget): the cozy that finds Calcifer down is installed, recorded, and Calcifer runs it.
     std::fs::remove_file(&installed).unwrap();
-    let out = home.cozy(["up", "--json"]);
-    let refusal = out.refusal();
-    assert_eq!(
-        (out.code, refusal["code"].as_str()),
-        (1, Some("cozy_not_installed")),
-        "{out:?}"
-    );
-    let next = refusal["next"][0].as_str().unwrap();
-    assert!(next.contains("install.sh"), "{refusal}");
-    assert_eq!(calcifer(&home, "status")["running"], false);
+    let up = calcifer(&home, "up");
+    let runs = std::fs::read_link(format!("/proc/{}/exe", up["pid"])).unwrap();
+    assert_eq!(runs, stray.canonicalize().unwrap(), "{up}");
+    let recorded = std::fs::read_to_string(home.root().join("installed")).unwrap();
+    assert_eq!(std::fs::canonicalize(recorded).unwrap(), stray.canonicalize().unwrap());
+    assert_eq!(home.json(["down", "--json"])["changed"], true);
+
+    // A recorded cozy that is there keeps Calcifer, whichever cozy finds it down.
+    std::fs::copy(&stray, &installed).unwrap();
+    home.use_binary(&installed);
+    let up = calcifer(&home, "up");
+    let runs = std::fs::read_link(format!("/proc/{}/exe", up["pid"])).unwrap();
+    assert_eq!(runs, stray.canonicalize().unwrap(), "{up}");
+    assert_eq!(home.json(["down", "--json"])["changed"], true);
 }
 
 /// Without systemctl, `cozy up` starts Calcifer detached and says once that no login will start

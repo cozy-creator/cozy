@@ -285,14 +285,14 @@ source .venv/bin/activate
 uv pip install tensorfs
 
 tfs convert hf://hf-internal-testing/tiny-sdxl-pipe --name local/example@1
-tfs inspect local/example
-tfs export local/example ./example --safetensors
+tfs inspect local/example@1
+tfs export local/example@1 ./example --safetensors
 ```
 
 ```python
 import tensorfs
 
-checkpoint = tensorfs.open("local/example", local_files_only=True)
+checkpoint = tensorfs.open("local/example", revision="1", local_files_only=True)
 unet = checkpoint.components["unet"]
 info = unet.tensors["conv_in.weight"]
 value = unet.tensors.read("conv_in.weight", decode=True)

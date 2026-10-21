@@ -104,7 +104,8 @@ struct Lane {
     bytes: i64,
     components: Vec<String>,
     component_bytes: BTreeMap<String, i64>,
-    checkpoint: String,
+    /// The commit (tree) the lane names, as `org/name#sha256:…`.
+    commit: String,
 }
 
 #[derive(Serialize)]
@@ -150,7 +151,7 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
                     bytes: l.bytes,
                     components: l.components.clone().unwrap_or_default(),
                     component_bytes: l.component_bytes.clone().into_iter().collect(),
-                    checkpoint: format!("{repo}#{}", l.manifest_id),
+                    commit: format!("{repo}#{}", l.manifest_id),
                 })
                 .collect(),
         })
@@ -176,9 +177,9 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
         let yanked = if release.yanked { ", yanked" } else { "" };
         let revision = release.revision.map(|r| format!("revision {r}")).unwrap_or_default();
         anstream::println!("\n{repo}@{} ({revision}{yanked})", release.release);
-        let mut table = Table::new(ctx, ["lane", "bytes", "checkpoint"]);
+        let mut table = Table::new(ctx, ["lane", "bytes", "commit"]);
         for lane in &release.lanes {
-            table = table.row([lane.lane.clone(), output::bytes(lane.bytes as u64), lane.checkpoint.clone()]);
+            table = table.row([lane.lane.clone(), output::bytes(lane.bytes as u64), lane.commit.clone()]);
         }
         table.print();
     }

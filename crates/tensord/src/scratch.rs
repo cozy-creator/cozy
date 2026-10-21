@@ -4,13 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Removes a test's scratch root. Windows deletes no file a handle holds open, and a test's
-/// background threads (a pool's, a dispatched run's) may still hold its journal: there a held
-/// root is left to the temp directory. Unix deletes it either way.
+/// Removes a test's scratch root. A test's background threads (a pool's, a dispatched run's)
+/// may still hold its journal (Windows deletes no file a handle holds open) or write a file into
+/// it as it goes (a directory then is not empty): such a root is left to the temp directory.
 pub(crate) fn remove(root: &Path) {
     const SHARING_VIOLATION: i32 = 32;
     match fs::remove_dir_all(root) {
         Err(error) if cfg!(windows) && error.raw_os_error() == Some(SHARING_VIOLATION) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
         removed => removed.unwrap(),
     }
 }

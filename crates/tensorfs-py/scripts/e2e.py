@@ -102,7 +102,21 @@ def e2e(work: pathlib.Path) -> pathlib.Path:
     (folder / "README.md").write_text(f"# me/model\n\n{SOURCE} converted by TensorFS, in bf16 and int8 variants.\n")
     (folder / "LICENSE").write_text(f"The terms of https://huggingface.co/{REPO} apply.\n")
     url = endpoint.as_uri()
-    tensorfs.upload_folder(repo_id="me/model", revision="1.0", folder_path=folder, endpoint=url, cache_dir=store)
+    tree = tensorfs.upload_folder(repo_id="me/model", revision="1.0", folder_path=folder, endpoint=url, cache_dir=store)
+    remote = tensorfs.Endpoint(url, cache_dir=store)
+
+    def publish(doc: dict | None) -> dict:
+        assert doc is not None and len(doc["tags"]) == 1
+        tag = doc["tags"][0]
+        assert tag["name"] == "1.0" and f"sha256:{tag['commit']['sha256']}" == tree
+        assert not tag.get("public", False) and not tag.get("yanked", False), "uploads create a private tag"
+        tag["public"] = True
+        return doc
+
+    # The docs describe a readable, published version. Upload is private by default;
+    # publish this fixture explicitly through the same conditional Repo API as a user.
+    remote.update_repo("me/model", publish)
+    assert remote.commit("me/model", "1.0") == (tree, "1.0"), "publication keeps the immutable commit"
 
     fresh = work / "fresh"
     opened = {v: tensorfs.open("me/model", revision="1.0", variant=v, endpoint=url, cache_dir=fresh) for v in written}

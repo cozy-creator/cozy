@@ -1,5 +1,5 @@
 //! The machine lifetime: its boot id and TLS leaf, persisted with the root so a restarted
-//! service is the same machine. Files and formats are the Go agent's (`layout.go`).
+//! service is the same machine.
 use platform::{
     lock::{Kind, LockFile},
     process::{Birth, State},
@@ -23,9 +23,8 @@ pub struct Lifetime {
     pub cert_der: Vec<u8>,
 }
 
-/// One machine per root. Every machine on a root holds this lock for its life, and a launcher
-/// probes it before it starts or replaces one: the Go agent's `agent.lock`, so each agent
-/// excludes the other. The kernel releases it when the last machine process is gone. A
+/// One machine per root. Every machine on a root holds this lock (`agent.lock`) for its life,
+/// and the launcher (`cozy machine`) probes it before it starts or replaces one. The kernel releases it when the last machine process is gone. A
 /// killed predecessor's service holds it a moment longer, exiting (perhaps in uninterruptible
 /// sleep, its descriptors already closed): a live holder refuses the root, and a lock only
 /// dying processes or none hold is waited out until the kernel releases it.
@@ -50,8 +49,7 @@ pub fn hold(layout: &Layout) -> io::Result<()> {
     Ok(())
 }
 
-/// Mints or reopens this root's lifetime. A root booted by the Go agent keeps its boot id
-/// and leaf; so does a later Go agent on a root this service booted.
+/// Mints or reopens this root's lifetime.
 pub fn open(layout: &Layout) -> io::Result<Lifetime> {
     for dir in [&layout.bootstrap, &layout.state] {
         fs::create_dir_all(dir)?;
@@ -61,12 +59,7 @@ pub fn open(layout: &Layout) -> io::Result<Lifetime> {
         Ok(text) if !text.trim().is_empty() => text.trim().to_owned(),
         Ok(_) => return Err(invalid("the persisted boot id is empty")),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let inherited =
-                fs::read_to_string(layout.bootstrap.join("pod-boot-id")).unwrap_or_default();
-            let boot_id = match inherited.trim() {
-                "" => URL_SAFE_NO_PAD.encode(random::<32>()?),
-                kept => kept.to_owned(),
-            };
+            let boot_id = URL_SAFE_NO_PAD.encode(random::<32>()?);
             write_atomic(&path, boot_id.as_bytes(), 0o400)?;
             boot_id
         }
@@ -77,11 +70,6 @@ pub fn open(layout: &Layout) -> io::Result<Lifetime> {
             "the persisted boot id is not unpadded base64url for 32 bytes",
         ));
     }
-    write_atomic(
-        &layout.bootstrap.join("pod-boot-id"),
-        format!("{boot_id}\n").as_bytes(),
-        0o444,
-    )?;
     let (cert_path, key_path) = (
         layout.bootstrap.join("tls.crt"),
         layout.bootstrap.join("tls.key"),
@@ -207,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn lifetime_survives_restart_and_adopts_a_go_booted_root() {
+    fn lifetime_survives_restart() {
         let root = std::env::temp_dir().join(format!(
             "tensord-identity-{}",
             URL_SAFE_NO_PAD.encode(random::<9>().unwrap())
@@ -232,16 +220,6 @@ mod tests {
             .map(|n| format!("{n}"))
             .collect();
         assert_eq!(names, ["DNSName(cozy-worker)"]);
-        // A root the Go agent booted: its boot id is adopted, never replaced.
-        fs::remove_file(layout.state.join("boot-id")).unwrap();
-        let go = URL_SAFE_NO_PAD.encode([7u8; 32]);
-        write_atomic(
-            &layout.bootstrap.join("pod-boot-id"),
-            format!("{go}\n").as_bytes(),
-            0o444,
-        )
-        .unwrap();
-        assert_eq!(open(&layout).unwrap().boot_id, go);
         fs::remove_dir_all(root).unwrap();
     }
 }

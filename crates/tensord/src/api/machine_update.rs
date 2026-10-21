@@ -321,7 +321,10 @@ fn observation_error(update: &Update) -> Option<Error> {
 
 fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::Event {
     let outcome = |status: &str, code: &str| {
-        let result = serde_json::json!({"from": update.from, "to": update.to});
+        let mut result = serde_json::json!({"from": update.from, "to": update.to});
+        if !update.notes.is_empty() {
+            result["notes"] = serde_json::json!(update.notes);
+        }
         v1::Event::Outcome(v1::Outcome {
             status: status.into(),
             reason: (!code.is_empty()).then(|| v1::Reason {

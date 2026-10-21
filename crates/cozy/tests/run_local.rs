@@ -1453,6 +1453,7 @@ fn a_second_run_reuses_the_video_and_image_its_machine_holds() {
     machine.restart(&[common::tensord::key_to_authorize(&add())]);
     let added = add();
     assert_eq!(added.code, 0, "{added:?}");
+    common::tensord::on_named_runtime(&home, "m1");
 
     let work = home.path().join("work");
     copy(

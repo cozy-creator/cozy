@@ -186,11 +186,16 @@ pub fn added_on(
     env: &[(&str, &str)],
 ) -> Tensord {
     let machine = joined(home, name, port, env);
+    on_named_runtime(home, name);
+    machine
+}
+
+/// `name` updated to the job's named Runtime (`COZY_TEST_RUNTIME_WHEEL`), when it names one.
+pub fn on_named_runtime(home: &super::Home, name: &str) {
     if std::env::var_os("COZY_TEST_RUNTIME_WHEEL").is_some() {
         named_runtime(home, name);
         PROBED.get_or_init(probe);
     }
-    machine
 }
 
 /// A TensorD added as `name` without the job's named Runtime: the software a machine has before

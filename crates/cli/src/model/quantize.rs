@@ -52,12 +52,20 @@ async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef) -> Result<(Strin
                     .next(format!("cozy model info {repo}"))
             })?;
             let lanes: Vec<_> = found.lanes.iter().filter(|l| lane.as_ref().is_none_or(|want| &l.lane == want)).collect();
+            let names: Vec<_> = found.lanes.iter().map(|l| format!("{:?}", l.lane)).collect();
             let [one] = lanes.as_slice() else {
-                let names: Vec<_> = found.lanes.iter().map(|l| l.lane.as_str()).collect();
-                return Err(Error::new(Kind::Usage, "model_lane_unnamed", format!("{repo}@{} has lanes {}: name the one to quantize", found.release, names.join(", ")))
-                    .remedy(format!("write {repo}@{}/<lane>", found.release)));
+                let (kind, code, why) = match lane {
+                    Some(want) => (Kind::NotFound, "model_lane_not_found", format!("has no lane {want:?}; its lanes: {}", names.join(", "))),
+                    None => (Kind::Usage, "model_lane_unnamed", format!("has lanes {}: name the one to quantize", names.join(", "))),
+                };
+                return Err(Error::new(kind, code, format!("{repo}@{} {why}", found.release)).next(format!("cozy model info {repo}@{}", found.release)));
             };
-            Ok((format!("{repo}@{}/{}", found.release, one.lane), one.components.clone().unwrap_or_default(), repo.clone()))
+            // The unnamed lane (a model's only variant) is the release itself.
+            let target = match one.lane.as_str() {
+                "" => format!("{repo}@{}", found.release),
+                named => format!("{repo}@{}/{named}", found.release),
+            };
+            Ok((target, one.components.clone().unwrap_or_default(), repo.clone()))
         }
         ModelRef::Local(_) | ModelRef::Provider(_) => Err(Error::new(Kind::Usage, "model_quantize_source", format!("{model} is not on the Hub: quantize reads a Hub model"))
             .next(format!("cozy model upload {model} <org/name>"))),
@@ -133,12 +141,12 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
                     record = record.field("variant", &reference.variant);
                 }
                 record.print(ctx);
-                // The release it was made from moves to the tag that now holds its variant too.
-                let (into, tag) = destination.split_once('@').expect("a destination names its tag");
+                // The release it was made from moves to the commit the machine wrote, which holds
+                // its variant too: exactly that one, wherever its tag moves next.
+                let into = destination.split_once('@').map_or(destination.as_str(), |(into, _)| into);
                 let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
                 let release = pinned.filter(|_| into == repo.to_string()).unwrap_or("<version>");
-                let tag = Some(reference.tag.as_str()).filter(|t| !t.is_empty()).unwrap_or(tag);
-                output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tag}")]);
+                output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tree}")]);
             }
             Some(WrittenCheckpoint::Header(header)) => {
                 Record::new().field("checkpoint header", header).print(ctx);

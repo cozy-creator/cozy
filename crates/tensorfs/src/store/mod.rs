@@ -43,7 +43,8 @@ use crate::format::{self, is_digest, ObjectRef};
 use crate::sha256::{hex, Sha256};
 
 /// [`crate::STORE_FORMAT`] as the store's `format` record.
-const FORMAT: &str = "tensorfs.store/3";
+/// The store format this TensorFS reads and writes (its `format` record).
+pub const FORMAT: &str = "tensorfs.store/3";
 const LAYOUT: [&str; 6] = ["blobs", "refs", "holds", "files", "uses", "tmp"];
 
 /// How long an unreferenced object outlives its last write or reuse.

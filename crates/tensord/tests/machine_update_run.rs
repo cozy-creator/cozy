@@ -303,7 +303,7 @@ async fn an_update_run_installs_its_pair_in_place_and_an_unresolvable_one_ends_f
     let failed = outcome(&log);
     assert_eq!(failed.status, "failed", "{log:?}");
     assert_eq!(failed.reason.unwrap().code, "update_failed");
-    assert_eq!(status(&root, port).await.runtime, "0.18.103");
+    assert_eq!(self::status(&root, port).await.runtime, "0.18.103");
     assert!(
         machine.0.try_wait().unwrap().is_none(),
         "the machine keeps running after a failed update"
@@ -465,4 +465,140 @@ async fn startup_recovers_interrupted_publication_before_selecting_the_service()
         stop(&mut machine);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+/// A store in TensorFS 0.12's format at `store`, with an object.
+fn older_store(store: &Path) {
+    std::fs::create_dir_all(store.join("blobs/ab/cd")).unwrap();
+    std::fs::write(store.join("format"), br#"{"format":"tensorfs.store/2"}"#).unwrap();
+    std::fs::write(store.join("blobs/ab/cd/abcd"), b"an old object").unwrap();
+}
+
+/// The update's record as its machine last wrote it, once `done` says it has settled.
+fn settled(updates: &Path, machine: &mut Machine, done: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+    let start = Instant::now();
+    loop {
+        let status: serde_json::Value = std::fs::read(updates.join("status.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default();
+        if done(&status) {
+            return status;
+        }
+        assert!(machine.0.try_wait().unwrap().is_none(), "the machine exited: {status}");
+        // A hang bound for a machine that never settles; the product waits without one.
+        assert!(start.elapsed() < Duration::from_secs(180), "the update never settled: {status}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// An update that meets a store in an older format (an image's, upgraded in place) sets it aside
+/// and serves on a new one; once the update commits the older one is deleted, and the update's
+/// notes say what that reclaimed. Never two stores past the update.
+#[tokio::test]
+async fn an_older_store_an_update_set_aside_is_deleted_when_it_commits() {
+    use std::os::unix::fs::symlink;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/machine-update-older-store").join(uuid::Uuid::new_v4().to_string());
+    let (image, engine) = (root.join("opt/cozy/wheels"), root.join("var/lib/cozy/tensord"));
+    let (candidate, updates, store) = (engine.join("sdk/candidate"), engine.join("update"), root.join("var/lib/tensorfs"));
+    for dir in [&image, &candidate, &updates] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for (dir, version) in [(&image, "0.18.102"), (&candidate, "0.18.103")] {
+        for (name, bytes) in [wheel("cozy_runtime", version, None), wheel("tensorfs", "0.3.94", None)] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+    }
+    let status = serde_json::json!({
+        "operation": "to-0.13", "state": "starting",
+        "from": {"runtime": "0.18.102", "tensorfs": "0.3.94"}, "to": {"runtime": "0.18.103", "tensorfs": "0.3.94"},
+    });
+    let mut pending = status.clone();
+    pending["state"] = "installing".into();
+    std::fs::write(updates.join("pending.json"), serde_json::to_vec(&serde_json::json!({"status": pending, "sdk_before": null})).unwrap()).unwrap();
+    std::fs::write(updates.join("status.json"), serde_json::to_vec(&status).unwrap()).unwrap();
+    symlink(&candidate, engine.join("sdk/current")).unwrap();
+    older_store(&store);
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut machine = launch(&root, port, Some([7; 32]), true);
+    let committed = settled(&updates, &mut machine, |s| s["state"] == "succeeded");
+    let notes = committed["notes"].to_string();
+    assert!(notes.contains("deleted the older-format TensorFS store set aside at") && notes.contains("GB reclaimed"), "{committed}");
+    let format = std::fs::read_to_string(store.join("format")).unwrap();
+    assert!(format.contains(tensorfs::store::FORMAT), "{format}");
+    assert!(!store.join("tmp/older-store").exists() && !store.join("blobs/ab").exists(), "the older store stayed");
+    assert_eq!(self::status(&root, port).await.runtime, "0.18.103");
+    stop(&mut machine);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A binary update whose new TensorD met an older store, then never proved readiness (here its
+/// port is taken), is rolled back: the older store is restored as it was for the binary it
+/// replaced, which runs again, and the rollback's reason ends with the service's own last error.
+#[test]
+fn a_rolled_back_binary_finds_its_older_store_restored() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/machine-update-older-rollback").join(uuid::Uuid::new_v4().to_string());
+    let (image, engine, bin) = (root.join("opt/cozy/wheels"), root.join("var/lib/cozy/tensord"), root.join("bin"));
+    let (updates, store) = (engine.join("update"), root.join("var/lib/tensorfs"));
+    for dir in [&image, &updates, &bin] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for (name, bytes) in [wheel("cozy_runtime", "0.18.102", None), wheel("tensorfs", "0.3.94", None)] {
+        std::fs::write(image.join(name), bytes).unwrap();
+    }
+    // The new binary at the launch path; the one it replaced (it only waits) beside it.
+    let launch_path = bin.join("tensord");
+    std::fs::copy(env!("CARGO_BIN_EXE_tensord"), &launch_path).unwrap();
+    let previous = bin.join(".cozy-previous");
+    std::fs::write(&previous, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    std::fs::set_permissions(&previous, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let pair = serde_json::json!({"runtime": "0.18.102", "tensorfs": "0.3.94"});
+    let status = serde_json::json!({"operation": "binary-0.13", "state": "starting", "from": pair, "to": pair});
+    let mut pending = status.clone();
+    pending["state"] = "installing".into();
+    std::fs::write(updates.join("pending.json"), serde_json::to_vec(&serde_json::json!({
+        "status": pending, "sdk_before": null, "binary": launch_path,
+    })).unwrap()).unwrap();
+    std::fs::write(updates.join("status.json"), serde_json::to_vec(&status).unwrap()).unwrap();
+    older_store(&store);
+
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let owner = SigningKey::from_bytes(&OWNER).verifying_key();
+    let mut machine = Machine(
+        Command::new(&launch_path)
+            .env_clear()
+            .arg("--persistent")
+            .env("PATH", "/usr/bin:/bin")
+            .env("COZY_MACHINE_ROOT", &root)
+            .env("HOME", root.join("home"))
+            .env("TENSORFS_HOME", &store)
+            .env("COZY_WORKER_ID", WORKER)
+            .env("COZY_WORKER_INTERNAL_PORT", port.to_string())
+            .env("COZY_LISTEN_HOST", "127.0.0.1")
+            .env("COZY_AUTHORIZED_KEYS", URL_SAFE_NO_PAD.encode(owner.as_bytes()))
+            .env("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL", URL_SAFE_NO_PAD.encode([7; 32]))
+            .env("CUDA_VISIBLE_DEVICES", "")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let rolled = settled(&updates, &mut machine, |s| s["state"] == "rolled_back");
+    let error = rolled["error"].as_str().unwrap_or_default();
+    assert!(error.starts_with("the service exited twice before readiness (1): ") && error.contains("in use"), "{rolled}");
+    assert!(rolled["notes"].to_string().contains("restored the older-format TensorFS store"), "{rolled}");
+    assert_eq!(std::fs::read(store.join("format")).unwrap(), br#"{"format":"tensorfs.store/2"}"#);
+    assert_eq!(std::fs::read(store.join("blobs/ab/cd/abcd")).unwrap(), b"an old object");
+    assert!(!store.join("tmp/older-store").exists(), "the set-aside copy stayed");
+    // The binary it replaced comes back to the launch path, after the decision is recorded.
+    let start = Instant::now();
+    while std::fs::read(&launch_path).unwrap() != b"#!/bin/sh\nexec sleep 600\n" {
+        assert!(start.elapsed() < Duration::from_secs(60), "the replaced binary never came back");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop((machine, taken));
+    std::fs::remove_dir_all(root).unwrap();
 }

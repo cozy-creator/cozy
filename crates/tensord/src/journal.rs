@@ -441,7 +441,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS executions (
               id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE,
               invocation TEXT NOT NULL, record TEXT NOT NULL, state TEXT NOT NULL,
-              updated_ms INTEGER NOT NULL);
+              updated_ms INTEGER NOT NULL, actor TEXT, request_id TEXT, submission_id TEXT);
             CREATE INDEX IF NOT EXISTS executions_nonterminal ON executions(id)
               WHERE state IN ('queued','starting','running');
             CREATE INDEX IF NOT EXISTS executions_active ON executions(id)
@@ -451,25 +451,18 @@ impl Journal {
             CREATE INDEX IF NOT EXISTS executions_updated ON executions(updated_ms);",
             )
             .map_err(db_error)?;
-        // Add consumed index columns without rewriting any older private records.
-        let columns: Vec<String> = {
-            let mut statement = connection
-                .prepare("PRAGMA table_info(executions)")
-                .map_err(db_error)?;
-            let rows = statement
-                .query_map([], |row| row.get(1))
-                .map_err(db_error)?;
-            rows.collect::<Result<_, _>>().map_err(db_error)?
+        // A journal from before TensorD's 0.12 cohort lacks columns its runs are read by: refused
+        // with what to do, as an older store is (`storage::open`), never migrated.
+        let columns = |table: &str| -> io::Result<Vec<String>> {
+            let mut statement = connection.prepare(&format!("SELECT name FROM pragma_table_info('{table}')")).map_err(db_error)?;
+            let rows = statement.query_map([], |row| row.get(0)).map_err(db_error)?;
+            rows.collect::<Result<_, _>>().map_err(db_error)
         };
-        for column in ["actor", "request_id", "submission_id"] {
-            if !columns.iter().any(|existing| existing == column) {
-                connection
-                    .execute(
-                        &format!("ALTER TABLE executions ADD COLUMN {column} TEXT"),
-                        [],
-                    )
-                    .map_err(db_error)?;
-            }
+        let held_memos = columns("held_memos")?;
+        if !columns("executions")?.iter().any(|c| c == "actor") || !(held_memos.is_empty() || held_memos.iter().any(|c| c == "used_ms")) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "{} is a journal from before TensorD's 0.12 cohort, which this one cannot read: move it aside to start fresh (its runs are gone either way)",
+                root.display())));
         }
         connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS machine_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS update_run_ids(actor TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(actor,id));
@@ -492,23 +485,12 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS run_objects(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(execution,sha256));
             CREATE INDEX IF NOT EXISTS run_objects_digest ON run_objects(sha256);
             CREATE TABLE IF NOT EXISTS run_specs(execution INTEGER PRIMARY KEY REFERENCES executions(id),spec BLOB NOT NULL);
-            DROP TABLE IF EXISTS job_contexts;
             CREATE TABLE IF NOT EXISTS held_memos(actor TEXT NOT NULL,computation TEXT NOT NULL,record BLOB NOT NULL,used_ms INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(actor,computation));
             CREATE TABLE IF NOT EXISTS held_memo_objects(actor TEXT NOT NULL,computation TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(actor,computation,sha256));
             CREATE INDEX IF NOT EXISTS held_memo_objects_digest ON held_memo_objects(sha256);
-            DROP TABLE IF EXISTS checkpoints;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL; COMMIT;").map_err(db_error)?;
-        // A journal from before held memos kept their use (#148's builds) gains the column.
-        let used: bool = connection
-            .query_row("SELECT COUNT(*) FROM pragma_table_info('held_memos') WHERE name='used_ms'", [], |r| r.get(0))
-            .map_err(db_error)?;
-        if !used {
-            connection
-                .execute("ALTER TABLE held_memos ADD COLUMN used_ms INTEGER NOT NULL DEFAULT 0", [])
-                .map_err(db_error)?;
-        }
         let existing: Option<String> = connection
             .query_row(
                 "SELECT value FROM machine_metadata WHERE key='workspace_id'",
@@ -766,20 +748,10 @@ impl Journal {
     pub fn bind_installation(&mut self, record: Installation) -> io::Result<Installation> {
         validate_scope(&record.actor, &record.alias, &record.generation)?;
         if let Some(prior) = self.installation(&record.actor, &record.alias)? {
-            if prior == record {
-                return Ok(prior);
-            }
-            // A record from before installations named their Hub is the same installation.
-            if !prior.hub.is_empty() || (Installation { hub: record.hub.clone(), ..prior }) != record {
-                return Err(admission(AdmissionError::BindingConflict));
-            }
-            self.connection
-                .execute(
-                    "UPDATE installations SET record=?3 WHERE actor=?1 AND alias=?2",
-                    params![record.actor, record.alias, encoded(&record)?],
-                )
-                .map_err(db_error)?;
-            return Ok(record);
+            return match prior == record {
+                true => Ok(prior),
+                false => Err(admission(AdmissionError::BindingConflict)),
+            };
         }
         self.connection
             .execute(
@@ -1458,24 +1430,19 @@ impl Journal {
     }
 
     /// A restarted machine holds no preparation: a preparing run it kept the spec of prepares
-    /// again (`interrupted`); any other ends FAILED (nothing of it was started). A job an older
-    /// machine parked to wait ends FAILED with the reason it waited on.
+    /// again (`interrupted`); any other ends FAILED (nothing of it was started).
     pub(crate) fn interrupt_preparations(&mut self) -> io::Result<()> {
-        let waiting: Vec<(String, String)> = {
+        let preparing: Vec<String> = {
             let mut statement = self
                 .connection
-                .prepare("SELECT id, json_extract(record,'$.waiting_reason') FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason') IS NOT NULL AND id NOT IN (SELECT execution FROM run_specs)")
+                .prepare("SELECT id FROM executions WHERE state='queued' AND json_extract(record,'$.waiting_reason')=?1 AND id NOT IN (SELECT execution FROM run_specs)")
                 .map_err(db_error)?;
             let rows = statement
-                .query_map([], |row| Ok((row.get::<_, i64>(0)?.to_string(), row.get::<_, String>(1)?)))
+                .query_map([PREPARING], |row| Ok(row.get::<_, i64>(0)?.to_string()))
                 .map_err(db_error)?;
             rows.collect::<Result<_, _>>().map_err(db_error)?
         };
-        let (preparing, parked): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|(_, reason)| reason == PREPARING);
-        for (id, reason) in parked {
-            self.fail_unstarted(&id, Failure::machine("environment_unavailable", reason))?;
-        }
-        for (id, _) in preparing {
+        for id in preparing {
             let failure = Failure {
                 status: 3,
                 cause: 7,
@@ -2580,5 +2547,26 @@ mod failure_message_tests {
         let accepted = Failure::executor("failed", "runtime", "device_out_of_memory", "GPU full");
         assert_eq!(accepted.code, "accepted_envelope_breach");
         assert_eq!(accepted.message, "device_out_of_memory: GPU full");
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    /// A journal from before the 0.12 cohort (its executions without the index columns) is
+    /// refused with what to do, never migrated and never a database error.
+    #[test]
+    fn a_journal_from_before_the_cohort_is_refused_with_what_to_do() {
+        let root = std::env::temp_dir().join(format!("cm-old-journal-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        Connection::open(root.join(FILE)).unwrap().execute_batch("CREATE TABLE executions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE,
+            invocation TEXT NOT NULL, record TEXT NOT NULL, state TEXT NOT NULL, updated_ms INTEGER NOT NULL);").unwrap();
+        let Err(refused) = Journal::open(&root) else { panic!("an older journal is not opened") };
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        let text = refused.to_string();
+        assert!(text.starts_with(&root.display().to_string()) && text.contains("move it aside to start fresh"), "{text}");
+        let _ = fs::remove_dir_all(root);
     }
 }

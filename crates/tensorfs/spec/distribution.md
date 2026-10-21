@@ -59,7 +59,9 @@ HEAD B/blobs/<aa>/<bb>/<hex>            200: the object is confirmed
 - A server MUST store an object only when its bytes match the digest. `412` means it is already there, which is
   success: objects are content-addressed.
 - The PUT always carries the three headers, so a presigned URL that signed them takes the same request. A server
-  that redirects uploads verifies the object at the confirming HEAD.
+  that redirects uploads verifies the object at the confirming HEAD. A confirming `404` with a `Location` the client
+  has not sent to asks for the bytes there too (a second writer of stored bytes proving it holds them); one naming a
+  place already sent to fails the upload.
 
 ## 4. Publishing
 
