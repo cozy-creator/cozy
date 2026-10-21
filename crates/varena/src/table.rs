@@ -325,7 +325,8 @@ impl Remote {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Table {
     pub capacity: u64,
-    /// Bytes on the device no row accounts for, measured.
+    /// Bytes on the device no row accounts for, measured, beyond what the card leaves outside
+    /// the table's cap (`capacity`): `capacity - foreign` is min(cap, card - foreign bytes).
     pub foreign: u64,
     /// This process's driver context.
     pub context: u64,

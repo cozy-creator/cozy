@@ -917,12 +917,13 @@ fn a_child_runs_while_its_parent_yields(dir: &Path) {
 }
 
 /// Round 2, finding 2: the tier never waits on an executor. It asks a stopped executor for its
-/// layout and goes on serving; the executor's death is its answer. Once nothing is left to
-/// give back and the host is still short, it raises the host-short event for TensorD.
+/// layout and goes on serving; the executor's death is its answer. Review 3, N2: the ask is
+/// marked in the asked row, so TensorD sees the stopped user stalled, and under pressure with
+/// nothing else to give the tier says the host is short meanwhile.
 fn the_tier_waits_on_no_executor_and_says_when_the_host_is_short(dir: &Path) {
     use std::os::fd::FromRawFd;
     let g = gpu("short", 64 * MB);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let ledger = varena::Ledger::create(&g, None).unwrap();
     // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
     let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
     let signal = event.try_clone().unwrap();
@@ -945,21 +946,25 @@ fn the_tier_waits_on_no_executor_and_says_when_the_host_is_short(dir: &Path) {
         libc::waitpid(pid, &mut status, libc::WUNTRACED);
     }
     pressure();
-    // The ask to y is out and unanswered; the tier serves another executor meanwhile.
+    while ledger.stalled() != vec![pid as u32] {
+        ledger.await_event().unwrap();
+    }
+    assert!(tier.held().contains(&digest("s1")), "nothing punched before its user answered");
+    // Nothing else to give while s1 waits on its stalled user: the host is short.
+    pressure();
+    tier.await_short().unwrap();
+    // The tier serves another executor meanwhile.
     let mut z = Agent::spawn();
     z.ok(&format!("open {} {}", g.uuid, g.memory));
     z.ok(&format!("load s2 {} stored ram", s2.display()));
-    assert!(tier.held().contains(&digest("s1")), "nothing punched before its user answered");
+    // TensorD ends the stalled user: its death is its answer.
     y.child.kill().unwrap();
     y.child.wait().unwrap();
     tier.await_releases(1);
-    assert!(!tier.held().contains(&digest("s1")), "its death was its answer");
+    assert!(!tier.held().contains(&digest("s1")), "released once its user died");
     pressure();
     tier.await_releases(2);
     assert!(tier.held().iter().all(|d| !d.ends_with(&g.uuid)), "{:?}", tier.held());
-    // Nothing left in the tier, and the host still short.
-    pressure();
-    tier.await_short().unwrap();
     z.exit();
 }
 

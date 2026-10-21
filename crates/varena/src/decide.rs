@@ -484,7 +484,8 @@ fn answer(t: &Table, ceiling: Class, bytes: u64) -> Vec<Action> {
     if ceiling >= Class::D {
         d.evict(Class::D);
     }
-    if t.requests.is_empty() && !d.enough() {
+    // Idle, or every request waiting on a child call: its trim and caches answer too.
+    if t.requests.iter().all(|r| r.yielded.is_some()) && !d.enough() {
         if t.slack() > 0 {
             d.out.push(Action::Trim(t.slack()));
         }
