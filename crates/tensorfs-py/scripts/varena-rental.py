@@ -2,8 +2,8 @@
 # requires-python = ">=3.12"
 # dependencies = ["cozy-runtime>=0.27.4", "torch", "diffusers"]
 # ///
-"""varena-standalone.py on a rental's GPU:
-`cozy run varena-rental.py --on <rental> --gpus 1 --asset wheel=<tensorfs wheel> --asset script=varena-standalone.py`.
+"""A varena test script (varena-standalone.py, varena-sdxl-cap.py) on a rental's GPU:
+`cozy run varena-rental.py --on <rental> --gpus 1 --asset wheel=<tensorfs wheel> --asset script=<script>`.
 
 The script runs in a fresh process of this script's interpreter (its environment has torch and
 diffusers), with the given TensorFS wheel installed into a directory ahead of the environment's
@@ -36,7 +36,7 @@ def main(*, wheel: Annotated[FileAsset, AssetBound(max_bytes=1 << 27)],
     logs, site = root / "out", root / "site"
     logs.mkdir()
     (root / WHEEL).write_bytes(wheel.read_bytes())
-    test = root / "varena-standalone.py"
+    test = root / "script.py"
     test.write_bytes(script.read_bytes())
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(site), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)}
     with (logs / "log.txt").open("w") as log:

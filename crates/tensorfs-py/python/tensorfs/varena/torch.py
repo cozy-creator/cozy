@@ -170,12 +170,16 @@ class _Pass:
     """An open pass and what it measured so far; `open` holds each running site's peak."""
 
     native: Pass
+    request: Request
     #: its model's set
     set: int
     #: the module its forward entered: its path in the model ("" the root)
     entry: str
     #: its tensor arguments' dims, joined by `x`
     shape: str
+    #: torch's allocated bytes, and its allocator's churn counters, at its start
+    start: int = 0
+    churned: dict[str, int] = field(default_factory=dict)
     peak: int = 0
     reserved_peak: int = 0
     #: each cut site's allocated peak, whether it is a collective's, and its finest level
@@ -201,8 +205,10 @@ class Model:
         #: per thread: its forwards' depth, and the pass the outermost opened
         self.local = threading.local()
         self.holds: list[Hold] = []
-        #: its last measured pass: `(shape, allocated peak, slack)` as sent to varena
-        self.last: tuple[str, int, int] | None = None
+        #: its last measured pass: `(entry|shape, allocated peak, slack, allocator churn)`
+        self.last: tuple[str, int, int, dict[str, int]] | None = None
+        #: (entry, shape) -> (allocated growth, slack) of its last completed pass there
+        self.rooms: dict[tuple[str, str], tuple[int, int]] = {}
         #: the fill identity its pages were last declared under
         self.identity: str | None = declared.fill.identity if declared.fill is not None else None
 
@@ -283,6 +289,8 @@ class Memory:
         #: every open pass on the device, of every thread: a reset folds into each first
         self.passes: list[_Pass] = []
         self.measuring = threading.Lock()
+        #: the bytes torch's allocator is capped at now
+        self.capped: int | None = None
         if device.type != "cpu":
             native.trim_with(self.torch.trim)
 
@@ -417,9 +425,16 @@ class Memory:
 
     # -- the torch allocator
 
-    def _cap(self) -> None:
-        """torch's allocator may hold `torch_limit` bytes from now on."""
-        self.torch.cap(self.native.torch_limit())
+    def _cap(self, room: int = 0, start: bool = False) -> None:
+        """torch's allocator cap. At a pass's start, the larger of `torch_limit` and the pass's
+        measured `room`; otherwise, or beside another running pass, it only rises: a pass that
+        got its room never has its allocator churn against a smaller cap."""
+        want = max(self.native.torch_limit(), room)
+        if not start or self.passes:
+            want = max(want, self.capped or 0)
+        if want != self.capped:
+            self.capped = want
+            self.torch.cap(want)
 
     def _fold(self, discard: _Pass | None = None) -> None:
         """The allocator's peaks since the last reset into every open pass and its open sites,
@@ -452,8 +467,10 @@ class Memory:
                     hold.shed()
                 model.identity = identity
             self.native.fill(model.id, _fill(model.fill))
-            p = _Pass(r.native.pass_(model.id, entry, shape, *self.torch.now()), model.id, entry, shape)
-            self._cap()
+            allocated, reserved = self.torch.now()
+            p = _Pass(r.native.pass_(model.id, entry, shape, allocated, reserved), r, model.id, entry, shape, allocated, self.torch.churn())
+            growth, slack = model.rooms.get((entry, shape), (0, 0))
+            self._cap(allocated + growth + slack if growth or slack else 0, start=True)
             p.entered = sys.exc_info()[1]
             self._fold()  # the passes open already keep what ran before; this one starts here
             with self.measuring:
@@ -484,8 +501,13 @@ class Memory:
         if sys.exc_info()[1] is not p.entered:
             return  # torch runs this hook in its handler of the forward's raise: unended, it records nothing
         sites = [(name, *site) for name, site in p.sites.items()]
-        model.last = (f"{p.entry}|{p.shape}", p.peak, max(p.reserved_peak - p.peak, 0))
-        p.native.end(model.last[1], model.last[2], sites, *self.torch.now())
+        slack, now = max(p.reserved_peak - p.peak, 0), self.torch.churn()
+        churn = {k: now[k] - p.churned.get(k, 0) for k in now}
+        for k, n in churn.items():
+            p.request.churn[k] = p.request.churn.get(k, 0) + n
+        model.rooms[(p.entry, p.shape)] = (max(p.peak - p.start, 0), slack)
+        model.last = (f"{p.entry}|{p.shape}", p.peak, slack, churn)
+        p.native.end(p.peak, slack, sites, *self.torch.now())
 
     # -- blocks
 
@@ -531,6 +553,8 @@ class Request:
     def __init__(self, memory: Memory, native: NativeRequest) -> None:
         self.memory, self.native = memory, native
         self.ended: Stats | None = None
+        #: torch's allocator churn over its passes (retries, device allocs and frees, syncs)
+        self.churn: dict[str, int] = {}
 
     def plan(self, steps: Sequence[object]) -> None:
         """Replaces the plan (as `Memory.request` takes it); its cursor starts over."""
@@ -618,6 +642,10 @@ class Cache:
 # ------------------------------------------------------------------------------ helpers
 
 
+#: torch's allocator counters a capped pass's churn shows in.
+CHURN = ("num_alloc_retries", "num_device_alloc", "num_device_free", "num_sync_all_streams")
+
+
 class _Allocator:
     """torch's allocator on the memory's device: its bytes, peaks, cap and trim. CUDA's keeps
     peaks. MPS's keeps none, so its peak is what each fold reads. The CPU's is the host's
@@ -646,6 +674,12 @@ class _Allocator:
     def reset(self) -> None:
         if self.kind == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
+
+    def churn(self) -> dict[str, int]:
+        """The counters of the allocator working against its cap: retries after freeing its
+        cache, device allocations and frees, and the syncs they cost (CUDA's; zero elsewhere)."""
+        stats = torch.cuda.memory_stats(self.device) if self.kind == "cuda" else {}
+        return {k: int(stats.get(k, 0)) for k in CHURN}
 
     def cap(self, limit: int) -> None:
         if self.kind == "cuda":
