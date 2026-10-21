@@ -235,6 +235,13 @@ impl Backend for Stream {
     fn drain(&self) -> Result<()> {
         Ok(())
     }
+    unsafe fn register_host(&self, ptr: *const u8, len: u64) -> Result<()> {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.host.register_host(ptr, len) }
+    }
+    fn unregister_host(&self, ptr: *const u8) -> Result<()> {
+        self.host.unregister_host(ptr)
+    }
 }
 
 fn set(dir: &std::path::Path, uuid: &str) -> SetSpec {
