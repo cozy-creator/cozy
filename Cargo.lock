@@ -4720,10 +4720,16 @@ name = "varena"
 version = "0.13.0"
 dependencies = [
  "libc",
+ "parking_lot",
  "platform",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tensorfs",
  "thiserror 2.0.21",
  "tracing",
+ "varena",
 ]
 
 [[package]]
