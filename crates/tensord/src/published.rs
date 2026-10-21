@@ -22,8 +22,8 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Condvar, Mutex},
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 use crate::{
     held_models::Pulled,
@@ -124,21 +124,11 @@ pub struct Prepared {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone)]
-pub enum Progress {
-    Preparing {
-        stage: String,
-        moved: u64,
-        total: u64,
-    },
-    Ready(Arc<Prepared>),
-    Failed(&'static str, String),
-}
-
 pub struct Request {
     /// The run this prepares for: a run waiting on its install is told so by this id.
     pub run: String,
-    pub source: hub::Source,
+    /// The run's Hub: a release and a Hub-named model need it; held code and models do not.
+    pub source: Option<hub::Source>,
     pub package: String,
     /// Empty: the Hub's newest, as it named it under `catalog_revision`.
     pub release: String,
@@ -159,6 +149,19 @@ pub struct Request {
     /// A call's: its imports start as soon as it installs. A warm run imports only when its
     /// level asks (`downloaded` never does).
     pub imports: bool,
+}
+
+impl Request {
+    /// The run's Hub, for `what`: refused when the run carries no Hub access.
+    fn hub(&self, what: &str) -> Result<&hub::Source, Failure> {
+        let absent = || ("hub_access_absent", format!("{what} needs the run's Hub access, and this run carries none"));
+        self.source.as_ref().ok_or_else(absent)
+    }
+
+    /// Its Hub's origin key; empty without one.
+    fn origin(&self) -> String {
+        self.source.as_ref().and_then(|source| hub::origin_key(&source.origin)).unwrap_or_default()
+    }
 }
 
 /// A Hub checkpoint as a run names it (th-245): `repository` at `release` (empty: the newest) in
@@ -228,8 +231,8 @@ pub type Observer = Box<dyn Fn(&str, u64, u64) + Send + Sync>;
 
 #[derive(Default)]
 struct Job {
-    progress: Mutex<Progress>,
-    changed: Condvar,
+    /// The stage its byte counts are reported under.
+    stage: Mutex<String>,
     observer: Option<Observer>,
     /// Its run's stop: a cancel ends its downloads and installs.
     stop: Option<Stop>,
@@ -238,24 +241,12 @@ struct Job {
     caller: String,
     waiting: Option<Box<dyn Fn(Option<String>) + Send + Sync>>,
 }
-impl Default for Progress {
-    fn default() -> Self {
-        Progress::Preparing {
-            stage: String::new(),
-            moved: 0,
-            total: 0,
-        }
-    }
-}
 impl Job {
-    fn set(&self, progress: Progress) {
-        if let (Some(observe), Progress::Preparing { stage, moved, total }) =
-            (&self.observer, &progress)
-        {
-            observe(stage, *moved, *total);
+    fn set(&self, stage: String, moved: u64, total: u64) {
+        if let Some(observe) = &self.observer {
+            observe(&stage, moved, total);
         }
-        *self.progress.lock().unwrap() = progress;
-        self.changed.notify_all();
+        *self.stage.lock().unwrap() = stage;
     }
     fn waiting(&self, reason: Option<String>) {
         if let Some(waiting) = &self.waiting {
@@ -263,23 +254,11 @@ impl Job {
         }
     }
     fn stage(&self, stage: String) {
-        self.set(Progress::Preparing {
-            stage,
-            moved: 0,
-            total: 0,
-        });
+        self.set(stage, 0, 0);
     }
     fn bytes(&self, moved: u64, total: u64) {
-        if let Progress::Preparing {
-            stage,
-            moved: m,
-            total: t,
-        } = &mut *self.progress.lock().unwrap()
-        {
-            (*m, *t) = (moved, total);
-            if let Some(observe) = &self.observer {
-                observe(stage, moved, total);
-            }
+        if let Some(observe) = &self.observer {
+            observe(&self.stage.lock().unwrap(), moved, total);
         }
     }
 }
@@ -311,7 +290,6 @@ pub struct Publisher {
     sdk: PackageSdk,
     machine: Arc<Machine>,
     store: Arc<Store>,
-    jobs: Mutex<HashMap<String, Arc<Job>>>,
     /// One maker per source: a second asker waits, then finds it held (runs 5393/5394).
     making: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// The run building each environment identity, which a second run waits for.
@@ -334,79 +312,9 @@ impl Publisher {
             sdk,
             store: machine.store().clone(),
             machine,
-            jobs: Mutex::new(HashMap::new()),
             making: Mutex::new(HashMap::new()),
             building: Mutex::new(HashMap::new()),
         }))
-    }
-
-    /// What one submission's preparation has reached. A held installation and resolution
-    /// answer at once; otherwise preparation runs in the background and this waits for its
-    /// next stage, its end, or a short while, so the client can show progress and ask again.
-    pub fn prepare(
-        self: &Arc<Self>,
-        service: &Arc<Service>,
-        actor: &str,
-        submission: &str,
-        request: Request,
-    ) -> Progress {
-        if let Ok(Some(prepared)) = self.held(service, actor, &request) {
-            return Progress::Ready(Arc::new(prepared));
-        }
-        let key = format!("{actor}\0{submission}");
-        let job = {
-            let mut jobs = self.jobs.lock().unwrap();
-            jobs.entry(key.clone())
-                .or_insert_with(|| {
-                    let job = Arc::new(Job {
-                        progress: Mutex::new(Progress::Preparing {
-                            stage: match &request.installed {
-                                Some(installed) => format!("preparing {}", installed.package),
-                                None => format!("preparing {}@{}", request.package, request.release),
-                            },
-                            moved: 0,
-                            total: 0,
-                        }),
-                        ..Default::default()
-                    });
-                    let (this, service, actor, worker) = (
-                        self.clone(),
-                        service.clone(),
-                        actor.to_string(),
-                        job.clone(),
-                    );
-                    std::thread::spawn(move || {
-                        // An update does not activate while this installs or downloads for a run.
-                        let _preparing = service.preparing();
-                        let result = this.work(&service, &actor, &request, &worker);
-                        worker.set(match result {
-                            Ok(prepared) => Progress::Ready(Arc::new(prepared)),
-                            Err((code, detail)) => Progress::Failed(code, detail),
-                        });
-                    });
-                    job
-                })
-                .clone()
-        };
-        let started = Instant::now();
-        let mut progress = job.progress.lock().unwrap();
-        let first = stage_of(&progress);
-        while matches!(&*progress, Progress::Preparing { .. })
-            && stage_of(&progress) == first
-            && started.elapsed() < Duration::from_secs(20)
-        {
-            progress = job
-                .changed
-                .wait_timeout(progress, Duration::from_secs(2))
-                .unwrap()
-                .0;
-        }
-        let answer = progress.clone();
-        drop(progress);
-        if !matches!(answer, Progress::Preparing { .. }) {
-            self.jobs.lock().unwrap().remove(&key);
-        }
-        answer
     }
 
     /// One run's preparation on the calling thread, reported through `observe`: a held
@@ -457,11 +365,7 @@ impl Publisher {
             ));
         }
         let made = self.make(&choice.source, &choice.profiles, providers, job.stop.as_ref(), &|stage, moved, total| {
-            job.set(Progress::Preparing {
-                stage: format!("{stage} for {path}"),
-                moved,
-                total,
-            })
+            job.set(format!("{stage} for {path}"), moved, total)
         })?;
         Ok(ModelGrant {
             package: installation.package.clone(),
@@ -698,7 +602,7 @@ impl Publisher {
     /// An earlier environment of this release here, which kept its card beside it (`CARD`): an
     /// exact release never changes, so its environment for another SDK reads nothing from the Hub.
     fn earlier(&self, service: &Service, actor: &str, request: &Request, release: &str) -> Option<PathBuf> {
-        let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
+        let origin = request.origin();
         service.engine.installations(actor).ok()?.into_iter()
             .filter(|i| i.package == request.package && i.release == release && i.hub == origin)
             .map(|i| service.catalog.root().join(&i.generation))
@@ -721,7 +625,7 @@ impl Publisher {
 
     /// The installation of `release` of the request's package at its Hub, by this machine's SDK.
     fn release_alias(&self, request: &Request, release: &str) -> String {
-        let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
+        let origin = request.origin();
         let sdk = format!(
             "{:?}{:?}{:?}",
             self.sdk.requirements, self.sdk.find_links, self.sdk.client_wheel
@@ -764,7 +668,7 @@ impl Publisher {
                 ])
             })
             .collect();
-        let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
+        let origin = request.origin();
         let package = request.installed.as_ref().map(|i| i.package.as_str()).unwrap_or(&request.package);
         let release = request.installed.as_ref().map(|i| i.release.as_str()).unwrap_or(&request.release);
         let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"catalog":request.catalog_revision,"entrypoint":request.entrypoint,"choices":choices,"row":gpus,"gpus":request.gpus,"bits":request.bits});
@@ -882,7 +786,8 @@ impl Publisher {
             "release_root_invalid",
             "package must be org/name".to_string(),
         ))?;
-        let catalog = || Catalog::new(&request.source).map_err(|e| ("catalog_read_failed", e.0));
+        let source = request.hub("a release")?;
+        let catalog = || Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0));
         let release = match request.release.is_empty() {
             true => self.newest(service, request, &catalog()?, org, name)?,
             false => request.release.clone(),
@@ -902,19 +807,19 @@ impl Publisher {
             Some(card) => card,
             None => hub_card(&catalog()?, &request.package, &release, &self.sdk.python)?,
         };
-        let locked = read_lock(&card.pyproject, &card.lock, &request.source)?;
+        let locked = read_lock(&card.pyproject, &card.lock, source)?;
         let before = earlier.and_then(|dir| fs::read(dir.join("generation.json")).ok())
             .and_then(|raw| serde_json::from_slice::<crate::catalog::Generation>(&raw).ok())
             .map(|record| record.dependencies.into_iter().map(|d| (normalized(&d.name), d.version)).collect());
         let stage = install_stage(&request.package, &release, before.as_ref(), &self.planned_pair(&locked));
         let wheels: Vec<&str> = card.wheels.iter().map(|wheel| wheel.sha256.as_str()).collect();
-        let identity = sha256::hex_digest(json!({"package":request.package,"release":release,"pyproject":card.pyproject,"lock":card.lock,"wheels":wheels,"python":card.python,"hub":hub::origin_key(&request.source.origin),"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
+        let identity = sha256::hex_digest(json!({"package":request.package,"release":release,"pyproject":card.pyproject,"lock":card.lock,"wheels":wheels,"python":card.python,"hub":hub::origin_key(&source.origin),"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
         let wanted = Environment {
             card: &card,
             locked: &locked,
             package: &request.package,
             release: &release,
-            source: &request.source,
+            source,
             stage: &stage,
         };
         self.generation(service.catalog.root(), &identity, &wanted, job)?;
@@ -937,7 +842,7 @@ impl Publisher {
                 release,
                 interface: serde_json::to_vec(&held.record.interface)
                     .map_err(|e| io_failure(io::Error::other(e)))?,
-                hub: hub::origin_key(&request.source.origin).unwrap_or_default(),
+                hub: request.origin(),
             })
             .map_err(io_failure)
     }
@@ -1380,7 +1285,7 @@ impl Publisher {
             let bits = tolerances.bits(request.bits, short);
             let ruled = named.lane.is_empty() && named.tree.is_none();
             let lanes = if ruled { tolerances.lanes(bits, &gpus) } else { vec![] };
-            let named = self.resolve(service, &request.source, named, &lanes, &request.catalog_revision)?;
+            let named = self.resolve(service, request.hub(&format!("the model for {path}"))?, named, &lanes, &request.catalog_revision)?;
             let model = format!("{}@{}", named.repository, named.release);
             let warnings = if ruled { tolerances.warnings(bits, &gpus, &model, &named.lane) } else { vec![] };
             let grant = ModelGrant {
@@ -1395,8 +1300,13 @@ impl Publisher {
             Ok((grant, (!named.repository.starts_with("local/")).then_some(named), warnings))
         };
         // Each checkpoint lands as its structure: what of it comes, and when, its calls direct.
+        // Only a Hub names a checkpoint here (`pick` refused it without the run's access).
         let land = |picked: &[(ModelGrant, Option<Named>, Vec<String>)]| {
-            self.structure(&request.source, &distinct(picked.iter().filter_map(|(_, named, _)| named.as_ref())), job)
+            let named = distinct(picked.iter().filter_map(|(_, named, _)| named.as_ref()));
+            match named.is_empty() {
+                true => Ok(()),
+                false => self.structure(request.hub("a Hub model")?, &named, job),
+            }
         };
         let mut picked: Vec<_> = slots.iter().map(|slot| pick(slot, false)).collect::<Result<_, _>>()?;
         land(&picked)?;
@@ -1446,8 +1356,8 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                let resolve = |named| self.resolve(service, &request.source, named, &[], &request.catalog_revision);
-                apply_adapters(self, &request.source, &resolve, choice, grant, &request.providers, job)?;
+                let resolve = |source: &hub::Source, named| self.resolve(service, source, named, &[], &request.catalog_revision);
+                apply_adapters(self, request.source.as_ref(), &resolve, choice, grant, &request.providers, job)?;
             }
         }
         job.stage(format!("preparing {}", request.package));
@@ -1624,8 +1534,8 @@ fn refused(code: &'static str, refusal: tensorfs::err::Refusal) -> Failure {
 /// adapter view composed (`adapter::compose`); the grant then names the view.
 fn apply_adapters(
     publisher: &Publisher,
-    source: &hub::Source,
-    resolve: &dyn Fn(Named) -> Result<Named, Failure>,
+    source: Option<&hub::Source>,
+    resolve: &dyn Fn(&hub::Source, Named) -> Result<Named, Failure>,
     choice: &domain::ModelChoice,
     grant: &mut ModelGrant,
     providers: &Providers,
@@ -1648,7 +1558,9 @@ fn apply_adapters(
             }
             let tree = (!adapter.manifest.is_empty())
                 .then(|| ObjectRef { sha256: adapter.manifest.trim_start_matches("sha256:").into(), length: 0 });
-            let named = resolve(Named {
+            let source = source.ok_or_else(|| ("hub_access_absent",
+                format!("an adapter of {} names a Hub model, and this run carries no Hub access", grant.slot)))?;
+            let named = resolve(source, Named {
                 repository: adapter.model.clone(),
                 release: adapter.release.clone(),
                 lane: adapter.lane.clone(),
@@ -1661,11 +1573,7 @@ fn apply_adapters(
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.
             let made = publisher.make(&adapter.source, &adapter.profiles, providers, job.stop.as_ref(), &|stage, moved, total| {
-                job.set(Progress::Preparing {
-                    stage: format!("{stage} for an adapter of {}", grant.slot),
-                    moved,
-                    total,
-                })
+                job.set(format!("{stage} for an adapter of {}", grant.slot), moved, total)
             })?;
             made.header.id()
         };
@@ -1688,7 +1596,7 @@ fn apply_adapters(
     }
     // The view re-packs the base's small parts: its chunks come first (its load reads them anyway).
     let base = object(&grant.manifest)?;
-    if let Some(pulled) = publisher.pulled(&base).map_err(io_failure)? {
+    if let (Some(pulled), Some(source)) = (publisher.pulled(&base).map_err(io_failure)?, source) {
         publisher.ensure(source, &pulled, job.stop.as_ref(), &|d, t| job.bytes(d, t))?;
     }
     // The view is the store's to keep from here: the call that reads it holds it open.
@@ -1699,8 +1607,6 @@ fn apply_adapters(
     Ok(())
 }
 
-/// The newest release of `org/name` at the Hub (a run naming none): the newest final release
-/// by version, else the newest pre-release; yanked ones never.
 /// A catalog read the Hub answered 404 to is the thing named absent there; any other failure
 /// is the read's.
 /// The Hub's own 404 names an absence; one without its envelope (`http_404`: a tunnel or proxy
@@ -1733,7 +1639,7 @@ fn install_stage(package: &str, release: &str, before: Option<&BTreeMap<String, 
 
 /// The journal name of an unnamed release of the request's package at its Hub.
 fn newest_key(request: &Request) -> String {
-    json!(["newest", hub::origin_key(&request.source.origin), request.package]).to_string()
+    json!(["newest", request.origin(), request.package]).to_string()
 }
 
 /// A checkpoint named by its hash, with what a hash alone does not say: its length (the Hub's) and
@@ -1823,6 +1729,8 @@ fn keep_card(generation: &Path, card: &Card) {
     }
 }
 
+/// The newest release of `org/name` at the Hub (a run naming none), by the one version ordering
+/// (`newest_by`): the newest final release, else the newest pre-release; yanked ones never.
 fn newest_release(catalog: &Catalog, org: &str, name: &str) -> Result<String, Failure> {
     let card = catalog
         .package(org, name)
@@ -1831,13 +1739,6 @@ fn newest_release(catalog: &Catalog, org: &str, name: &str) -> Result<String, Fa
     tensorfs::format::newest_by(open, |row| row.release.as_str())
         .map(|row| row.release.clone())
         .ok_or(("release_absent", format!("{org}/{name} has no release that is not yanked")))
-}
-
-fn stage_of(progress: &Progress) -> String {
-    match progress {
-        Progress::Preparing { stage, .. } => stage.clone(),
-        _ => String::new(),
-    }
 }
 
 /// A wheel the run's Hub hosts, downloaded by its digest (`fetch_hub`) and installed from disk.
@@ -1926,7 +1827,7 @@ fn model_slots(interface: &Value, entrypoint: &str) -> Option<Vec<Value>> {
         .cloned()
 }
 
-pub fn declares_models(installation: &Installation, entrypoint: &str) -> bool {
+fn declares_models(installation: &Installation, entrypoint: &str) -> bool {
     serde_json::from_slice(&installation.interface)
         .ok()
         .and_then(|i: Value| model_slots(&i, entrypoint))
@@ -2129,6 +2030,7 @@ pub(crate) mod names_hub;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// A release locked for Linux alone tells a Mac or Windows machine where it runs, at once.
     #[test]
@@ -2237,6 +2139,16 @@ pub(crate) mod tests {
                                 answer.extend_from_slice(&body[first..=last]);
                             }
                             answer
+                        }
+                        // A package card: one with finals, a pre-release and a yanked release, and
+                        // one with pre-releases only.
+                        ["", "v1", "packages", "acme", name @ ("pre" | "only-pre")] => {
+                            let releases = match *name {
+                                "pre" => r#"[{"release":"1.0.0"},{"release":"1.1.0rc1"},{"release":"1.2.0","yanked":true},{"release":"0.9.0"}]"#,
+                                _ => r#"[{"release":"1.0.0rc1"},{"release":"1.0.0rc2"}]"#,
+                            };
+                            let body = format!(r#"{{"package":{{"org":"acme","name":"{name}","created_at":"2026-10-01T00:00:00Z"}},"releases":{releases}}}"#);
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
                         }
                         // The Hub's own refusal: its envelope names the absence.
                         _ => {
@@ -2402,6 +2314,15 @@ pub(crate) mod tests {
         let (code, message) = newest_release(&catalog, "acme", "nope").unwrap_err();
         assert_eq!(code, "package_absent");
         assert!(message.starts_with("acme/nope is not published at http://127.0.0.1:"), "{message}");
+    }
+
+    /// The newest release is a final before any pre-release, and never a yanked one.
+    #[test]
+    fn the_newest_release_is_a_final_before_any_pre_release() {
+        let origin = file_door(HashMap::new(), Arc::new(Mutex::new(vec![])), None);
+        let catalog = Catalog::new(&hub::Source::new(&origin, None, None).unwrap()).unwrap();
+        assert_eq!(newest_release(&catalog, "acme", "pre").unwrap(), "1.0.0");
+        assert_eq!(newest_release(&catalog, "acme", "only-pre").unwrap(), "1.0.0rc2");
     }
 
     /// The machine's own Runtime goes into an environment whose packages admit it; one whose
@@ -2644,7 +2565,7 @@ pub(crate) mod tests {
     fn an_explicit_gpu_count_and_bits_have_their_own_preparation_cache_key() {
         let mut request = Request {
             run: String::new(),
-            source: hub::Source::new("https://hub.example", None, None).unwrap(),
+            source: Some(hub::Source::new("https://hub.example", None, None).unwrap()),
             package: "org/package".into(), release: "1".into(), installed: None,
             owner: "org".into(), catalog_revision: String::new(), providers: Providers::default(),
             entrypoint: "render".into(), choices: vec![], gpus: 0, bits: 0, imports: true,
@@ -3026,7 +2947,7 @@ pub(crate) mod tests {
         pub publisher: Arc<Publisher>,
         pub installation: Installation,
         pub hub: hub::Source,
-        heard: names_hub::Heard,
+        pub heard: names_hub::Heard,
         /// Each published manifest's lane.
         pub lanes: HashMap<String, String>,
     }
@@ -3078,7 +2999,7 @@ pub(crate) mod tests {
 
         /// `render` prepared for `acme`'s run at `bits` with `choices`.
         fn prepare(&self, bits: u32, choices: Vec<domain::ModelChoice>) -> Prepared {
-            let request = Request { run: String::new(), source: self.hub.clone(), package: self.installation.package.clone(), release: "1.0.0".into(),
+            let request = Request { run: String::new(), source: Some(self.hub.clone()), package: self.installation.package.clone(), release: "1.0.0".into(),
                 installed: Some(self.installation.clone()), owner: "acme".into(), catalog_revision: "r1".into(),
                 providers: Providers::default(), entrypoint: "render".into(), choices, gpus: 0, bits, imports: false };
             self.publisher.prepare_now(&self.service, "alice", &request, None, None).unwrap()
@@ -3117,7 +3038,7 @@ pub(crate) mod tests {
     }
 
     fn local_alias_request(machine: &Machine, choices: Vec<domain::ModelChoice>) -> Request {
-        Request { run: String::new(), source: machine.hub.clone(), package: machine.installation.package.clone(),
+        Request { run: String::new(), source: Some(machine.hub.clone()), package: machine.installation.package.clone(),
             release: "1.0.0".into(), installed: Some(machine.installation.clone()), owner: "acme".into(),
             catalog_revision: "same-catalog".into(), providers: Providers::default(), entrypoint: "render".into(),
             choices, gpus: 0, bits: 0, imports: false }

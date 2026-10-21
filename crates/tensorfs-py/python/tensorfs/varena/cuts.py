@@ -57,6 +57,9 @@ class _DeviceOutput:
 #: Free bytes a retry asks beyond the failed allocation: the allocator's rounding, a workspace.
 SLACK = 64 << 20
 _ALLOCATE = re.compile(r"Tried to allocate ([\d.]+) (B|KiB|MiB|GiB|TiB)")
+#: Allocation refusals from Torch, the CUDA driver, Triton and CUDA libraries.
+_REFUSED = ("CUDA error: out of memory", "CUDA driver error: out of memory", "[CUDA]: out of memory",
+            "_ALLOC_FAILED")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40}
 #: diffusers' token-wise feed-forwards and the activation projections inside them
 _FFN = frozenset({"FeedForward", "GELU", "GEGLU", "SwiGLU", "ApproximateGELU", "LinearActivation"})
@@ -226,7 +229,7 @@ def short(exc: BaseException, first: bool = False) -> int | None:
     text = str(exc)
     if isinstance(exc, torch.AcceleratorError):
         return 0 if getattr(exc, "error_code", None) == 2 or "out of memory" in text else None
-    failed = "CUDA error: out of memory" in text or "_ALLOC_FAILED" in text
+    failed = any(mark in text for mark in _REFUSED)
     failed |= first and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
     return 0 if isinstance(exc, RuntimeError) and failed else None
 
@@ -312,6 +315,11 @@ def _settle(
         memo.sizes[key] = size
         _note(name, size)
     return size, out
+
+
+def launch(device: torch.device, name: str, run: Callable[[], T]) -> T:
+    """Retry an allocation-refused launch outside Torch dispatch through the ordinary rungs."""
+    return _settle(lambda _: run(), 1, 1, int, device, name)[1]
 
 
 def finer(shape: Shape | None) -> bool:

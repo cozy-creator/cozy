@@ -178,7 +178,9 @@ def ffn_cut() -> None:
 
 def relax() -> None:
     """Planning relaxes a cut (`cuts.coarser`): never run uncut, twice its size a step needing
-    twice its peak, back to whole; run uncut before, whole at once needing that peak."""
+    the peak plus its FFN bytes per token over the tokens it adds, back to whole, which forgets
+    the size (a prompt two tokens longer runs whole, 12288); a cut measured beside whole bounds
+    those bytes; run uncut before, whole at once needing that peak."""
     torch.manual_seed(0)
     x = torch.randn(2, 300, 64)
     ff = FeedForward(64, mult=4, activation_fn="gelu").eval()
@@ -190,23 +192,34 @@ def relax() -> None:
     with card, torch.no_grad():
         out = cuts.run(s, ff, (x,), {})
     cut = {k: v for k, v in memo.sizes.items() if k[0] == "ffn"}
+    total = {k: shape.scopes[k][0] for k in cut}
+    step = lambda t, v: -(-t // ((-(-t // v) + 1) // 2))  # noqa: E731  (half the pieces)
+    grow = sum(shape.units[k] * (step(total[k], v) - v) for k, v in cut.items() if v < total[k])
     needs, steps, doubled = [cuts.relaxing(shape, 10)], 0, True
     while needs[-1] is not None:
-        before = {k: memo.sizes[k] for k in cut}
+        before = {k: memo.sizes.get(k, total[k]) for k in cut}
         cuts.coarser(shape)
-        doubled &= all(memo.sizes[k] <= 2 * v for k, v in before.items())
+        doubled &= all(memo.sizes.get(k, total[k]) <= 2 * v for k, v in before.items())
         steps += 1
         needs.append(cuts.relaxing(shape, 10))
-    relaxed = all(memo.sizes[k] >= shape.scopes[k][0] for k in cut)  # each scope's whole
+    relaxed = not any(k in memo.sizes for k in cut)  # each scope's whole, no size left
     check("a cut relaxes back to whole", same(out, whole) and cut and relaxed, (cut, memo.sizes))
-    doubled &= needs[0] == 20
-    check("never uncut, a step doubles at most, needing twice the peak", steps and doubled, needs)
-    cuts.peaked(s.track, 7)  # a pass ran uncut: its peak is the shape's whole
+    doubled &= grow > 0 and needs[0] == 10 + grow
+    check("never uncut, a step doubles at most, needing its FFN units more", steps and doubled, needs)
+    with torch.no_grad():
+        longer = cuts.run(s, ff, (torch.randn(2, 302, 64),), {})
+    check("relaxed whole, a shape 2 tokens longer runs uncut", cuts.relaxing(shape, 10) is None
+          and not shape.cuts and longer.shape == (2, 302, 64), (memo.sizes, shape.cuts))  # fmt: skip
+    cuts.peaked(s.track, 7 << 20)  # a pass ran uncut: its peak is the shape's whole
+    outer = next(k for k in cut if k[1] == "FeedForward")
+    memo.sizes[outer] = cut[outer]  # one FFN cut, measured to free 10 B a token
+    cuts.peaked(s.track, (7 << 20) - 10 * (shape.scopes[outer][0] - cut[outer]))
+    check("a cut's measured saving bounds its FFN's bytes per token", shape.units[outer] == 10, shape.units)
     memo.sizes.update(cut)
     need = cuts.relaxing(shape, 3)
     cuts.coarser(shape)
-    at_once = all(memo.sizes[k] >= shape.scopes[k][0] for k in cut) and shape.peak == -1
-    check("run uncut before, it relaxes whole at once, needing that peak", need == 7 and at_once)
+    at_once = not any(k in memo.sizes for k in cut) and shape.peak == -1
+    check("run uncut before, it relaxes whole at once, needing that peak", need == 7 << 20 and at_once)
     seen = weakref.ref(x)
     del x
     gc.collect()
@@ -669,8 +682,42 @@ def lattice() -> None:
     )
 
 
+def launches() -> None:
+    """A launch outside torch's dispatch (a Triton kernel's) out of memory runs again with room
+    made, and again after rung 4; anything else, or no room left, is its own failure."""
+    failures = ["Triton Error [CUDA]: out of memory"] * 2
+    ran = []
+
+    def launch() -> str:
+        if failures:
+            raise RuntimeError(failures.pop())
+        ran.append(1)
+        return "ran"
+
+    memo, _, room = fresh(1 << 40, frees=1 << 20, lowers=1, step=1 << 20)
+    out = cuts.launch(CPU, "glue", launch)
+    check(
+        "a Triton launch out of memory runs again: room made, then a block lower",
+        out == "ran" and ran == [1] and memo.retries == 2 and room.made == 2 and room.lowered == 1,
+        (out, memo.retries, room.made, room.lowered),
+    )
+    memo, _, room = fresh(1 << 40)
+    failures[:] = ["Triton Error [CUDA]: out of memory"]
+    try:
+        cuts.launch(CPU, "glue", launch)
+        check("with no room to make, the launch fails typed", False)
+    except MemoryError as exc:
+        check("with no room to make, the launch fails typed", "glue" in str(exc), exc)
+    failures[:] = ["Triton Error [CUDA]: an illegal memory access was encountered"]
+    try:
+        cuts.launch(CPU, "glue", launch)
+        check("another launch error is its own", False)
+    except RuntimeError as exc:
+        check("another launch error is its own", "illegal" in str(exc) and memo.retries == 1, exc)
+
+
 def main() -> int:
-    for test in (ffn_cut, relax, plans, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, lattice):
+    for test in (ffn_cut, relax, plans, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, launches, lattice):
         test()
     print(f"{sum(results)}/{len(results)} passed", flush=True)
     return 0 if all(results) else 1

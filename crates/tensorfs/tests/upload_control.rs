@@ -89,6 +89,7 @@ fn a_refused_commit_keeps_admitted_blobs_for_the_same_public_uploader_to_retry()
             &f.tree,
             &f.store,
             "main",
+            &[],
             &control
         ))
         .is_err());
@@ -97,7 +98,7 @@ fn a_refused_commit_keeps_admitted_blobs_for_the_same_public_uploader_to_retry()
         .block_on(f.endpoint.repo("owner/model"))
         .unwrap()
         .is_none());
-    assert!(runtime.block_on(f.endpoint.has(&f.tree)).unwrap());
+    assert!(!runtime.block_on(f.endpoint.has(&f.tree)).unwrap(), "the commit is made past the gate");
     let rows = progress.lock().unwrap();
     assert_eq!(rows.first().unwrap().0, 0);
     assert_eq!(rows.last().unwrap().0, rows.last().unwrap().1);
@@ -113,7 +114,7 @@ fn a_refused_commit_keeps_admitted_blobs_for_the_same_public_uploader_to_retry()
             "main",
         ))
         .unwrap();
-    assert_eq!(retry.sent, 0);
+    assert_eq!(retry.sent, 1, "only the commit");
     assert!(
         !retry.converged,
         "deduplicated blobs do not mean the ref was already published"
@@ -157,6 +158,7 @@ fn cancellation_before_the_gate_never_commits_and_cancel_after_acceptance_cannot
             &f.tree,
             &f.store,
             "main",
+            &[],
             &control
         ))
         .is_err());
@@ -182,6 +184,7 @@ fn cancellation_before_the_gate_never_commits_and_cancel_after_acceptance_cannot
             &f.tree,
             &f.store,
             "main",
+            &[],
             &control,
         ))
         .unwrap();

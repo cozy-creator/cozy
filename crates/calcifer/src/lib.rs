@@ -110,7 +110,9 @@ enum Stop {
 impl From<LinkError> for Stop {
     fn from(e: LinkError) -> Self {
         match e {
-            LinkError::Refused { code, message } => Stop::Refused(Reason { code, message }),
+            LinkError::Refused { code, message } => {
+                Stop::Refused(Reason { code, message, ..Default::default() })
+            }
             LinkError::Released(message) => Stop::Released(message),
             LinkError::NotFound => Stop::Unreachable("the machine does not know the run".into()),
             LinkError::Unreachable(message) | LinkError::Unauthorized(message) => {
@@ -761,10 +763,7 @@ impl Calcifer {
                         finished_at_ms: call.finished_at_ms,
                         measurements: (call.measurements.as_ref())
                             .and_then(|m| serde_json::from_str(m.get()).ok()),
-                        reason: call.reason.map(|r| Reason {
-                            code: r.code,
-                            message: r.message,
-                        }),
+                        reason: call.reason,
                         memoized: call.memoized,
                     };
                     let text = serde_json::to_string(&call).expect("serializes");

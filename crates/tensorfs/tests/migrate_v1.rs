@@ -15,7 +15,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
 use tensorfs::fetch::{Client as FetchClient, Endpoint, SourcePolicy};
-use tensorfs::format::{Body, Config, ObjectRef, Repo, Value};
+use tensorfs::format::{Body, ClassRef, Config, ObjectRef, Repo, Value};
 use tensorfs::import::Access;
 use tensorfs::migrate::d10::{self, Migrator, UNKNOWN, UPSTREAMS};
 use tensorfs::store::Store;
@@ -30,6 +30,11 @@ struct Lane {
     configs: BTreeMap<String, Json>,
     /// By D10 `component/key`.
     tensors: BTreeMap<String, Want>,
+    /// Each component's class, `[library, version, name]`, where its own config states it.
+    classes: BTreeMap<String, [String; 3]>,
+    /// A LoRA component's PEFT adapter config.
+    #[serde(default)]
+    adapters: BTreeMap<String, Json>,
 }
 
 #[derive(Deserialize)]
@@ -182,9 +187,21 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
             }
         }
 
+        // Classes: the library, version and name the lane's configs state; a LoRA's adapter config
+        // is PEFT's.
+        for (c, [library, version, name]) in &lane.classes {
+            assert_eq!(ck.component(c).unwrap().cls(), &ClassRef::new(library, version, name), "{}: {c}", lane.name);
+        }
+        for (c, adapter) in &lane.adapters {
+            let component = ck.component(c).unwrap();
+            assert_eq!((component.config(), component.config_file()), (&as_config(adapter), "adapter_config.json"), "{}: {c}", lane.name);
+        }
+
         // Sources: the table's row where one names the model, else `unknown`, never filled.
         let source = ck.metadata().get("source").cloned();
-        if lane.name == "paul/d1-gate5-sdxl-b" {
+        if lane.name == "acme/minimax-h3-lightx2v-source" {
+            assert!(source.as_ref().and_then(Value::as_str).is_some_and(|s| s.starts_with("hf://lightx2v/")), "{source:?}");
+        } else if lane.name == "paul/d1-gate5-sdxl-b" {
             assert_eq!(source, Some(Value::Str(UPSTREAMS[0].from.into())));
             assert_eq!(ck.pipeline().unwrap().class.name, "StableDiffusionXLPipeline");
             assert!(ck.component("tokenizer").is_ok() && ck.component("tokenizer_2").is_ok());

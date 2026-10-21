@@ -120,7 +120,7 @@ def build(root: Path, dim: int, blocks: int) -> tuple[tensorfs.Checkpoint, dict[
     reference = Net(dim, blocks)
     tensors = {k: v.detach().contiguous() for k, v in reference.state_dict().items()}
     w = tensorfs.Writer(cache_dir=root)
-    net = w.component("net", cls=("test", "", "Net"), config={})
+    net = w.component("net", cls=("test", "1.0", "Net"), config={})
     for key, t in tensors.items():
         net.put(key, t.view(torch.uint8).numpy().tobytes(), dtype="BF16", shape=list(t.shape))
     return w.commit(), tensors
@@ -552,7 +552,7 @@ def relaxes(root: Path, dev: torch.device) -> None:
     torch.manual_seed(0)
     plain = WideNet(dim, count).bfloat16()
     w = tensorfs.Writer(cache_dir=root / "wide")
-    wide = w.component("wide", cls=("test", "", "WideNet"), config={})
+    wide = w.component("wide", cls=("test", "1.0", "WideNet"), config={})
     for key, t in plain.state_dict().items():
         t = t.detach().contiguous()
         wide.put(key, t.view(torch.uint8).numpy().tobytes(), dtype="BF16", shape=list(t.shape))

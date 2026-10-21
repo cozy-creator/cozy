@@ -18,7 +18,7 @@ use tensorfs::{fetch, Checkpoint, Client, Config, Convert, Download, Format, Ope
 const VERBS: &[&str] = &[
     "convert <source>... [--converter <c>] [--source-variant <v>] [--name local/<name>[@tag]]",
     "download <ref> [--dir <dir>]",
-    "upload <folder> <org/name>[@tag]           moves the tag (main) to the new commit; the token is $TENSORFS_TOKEN",
+    "upload <folder> <org/name>[@tag] [--delete <glob>]...  commits the folder onto the tag (main); the token is $TENSORFS_TOKEN",
     "export <ref> <dir> [--safetensors [--decode] | --gguf]",
     "inspect <ref>",
     "verify <ref>",
@@ -53,7 +53,7 @@ else $TENSORFS_HOME, else ~/.cache/tensorfs.",
 const SWITCHES: &[&str] = &["help", "json", "safetensors", "decode", "gguf", "plain", "no-configs", "write"];
 const VALUED: &[&str] = &[
     "store", "endpoint", "name", "converter", "variant", "source-variant", "blocks", "scale",
-    "token-env", "dir", "gpu",
+    "token-env", "dir", "gpu", "delete",
 ];
 
 struct Args {
@@ -94,6 +94,10 @@ impl Args {
 
     fn get(&self, name: &str) -> Option<&str> {
         self.flags.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+    }
+
+    fn all(&self, name: &str) -> Vec<&str> {
+        self.flags.iter().filter(|(n, _)| n == name).map(|(_, v)| v.as_str()).collect()
     }
 
     fn on(&self, name: &str) -> bool {
@@ -226,7 +230,7 @@ async fn run(args: &Args) -> Done {
             let ck = client.convert_to_cozytensors(&sources, &options).await?;
             if let Some(name) = args.get("name") {
                 let tree = ck.tree().expect("a conversion names its tree").clone();
-                name_locally(&Store::open(&root)?, name, &tree)?;
+                name_locally(&root, &Store::open(&root)?, name, &tree).await?;
             }
             Ok(Some((Json::Object(identity(&ck)), format!("converted sha256:{}", ck.id().sha256))))
         }
@@ -238,7 +242,7 @@ async fn run(args: &Args) -> Done {
         }
         ["upload", folder, reference] => {
             let reference: Ref = reference.parse()?;
-            let commit = client.upload_folder(&reference, Path::new(folder), None).await?;
+            let commit = client.upload_folder(&reference, Path::new(folder), &args.all("delete"), None).await?;
             let tag = reference.revision.as_deref().unwrap_or(fetch::MAIN);
             let human = format!("uploaded sha256:{}, {}@{tag}", commit.sha256, reference.repo_id);
             Ok(Some((json!({"commit": object(&commit), "tag": tag}), human)))
@@ -302,26 +306,26 @@ async fn run(args: &Args) -> Done {
             tree.set_variant(if plain { "bf16" } else { "mixed" }, header.clone());
             let tree = store.put_tree(&tree)?;
             let name = args.get("name").unwrap_or("local/ckpt@1");
-            name_locally(&store, name, &tree)?;
+            let commit = name_locally(&root, &store, name, &tree).await?;
             let objects = store.closure(&tree)?;
-            let doc = json!({"header": object(&header), "tree": object(&tree), "name": name, "objects": objects.iter().map(object).collect::<Vec<_>>()});
+            let doc = json!({"header": object(&header), "tree": object(&tree), "commit": object(&commit), "name": name, "objects": objects.iter().map(object).collect::<Vec<_>>()});
             Ok(Some((doc, format!("wrote {name}: sha256:{} ({} objects)", header.sha256, objects.len()))))
         }
         _ => Ok(None),
     }
 }
 
-/// Makes `tree` a commit of the local repo `local/<name>[@tag]`, moving that tag (none: `main`)
-/// to it; a new tag is private.
-fn name_locally(store: &Store, name: &str, tree: &ObjectRef) -> Result<()> {
+/// Commits `tree`'s files on top of tag `@tag` (none: `main`) of the local repo
+/// `local/<name>`, through the store's own endpoint: the one commit path. The commit.
+async fn name_locally(root: &Path, store: &Store, name: &str, tree: &ObjectRef) -> Result<ObjectRef> {
     let named: Ref = name.parse()?;
     let tag = named.revision.as_deref().unwrap_or(fetch::MAIN);
     if !named.repo_id.starts_with("local/") || named.variant.is_some() || !tensorfs::format::tag_name(tag) {
         return fail(Kind::Invalid, format!("--name {name:?}: a local name is local/<name>[@tag]"));
     }
-    let repo = named.repo_id.as_str();
-    store.update_ref(repo, |old| Some(fetch::with_tag(old, repo, tag, tree)))?;
-    Ok(())
+    let root = std::path::absolute(root).map_err(Failure::from)?;
+    let local = fetch::Endpoint::new(&fetch::Client::new(fetch::SourcePolicy::default()), &root.to_string_lossy(), None)?;
+    Ok(fetch::upload_tree(&local, &named.repo_id, tree, store, tag).await?.commit)
 }
 
 fn listing(dir: &Path) -> Result<Vec<String>> {

@@ -32,7 +32,8 @@ weight = checkpoint.components["unet"].tensors.read("conv_in.weight")
 In these examples `me/model` stands for a repository you can read, with `bf16` and `int8` variants.
 
 `open` returns a `Checkpoint`. By default (`lazy=True`), it loads metadata; reading
-tensors then downloads the objects those tensors need. `revision` selects a release or immutable reference;
+tensors then downloads the objects those tensors need. `revision` names a tag, a commit (`sha256:<tree>`) or a
+variant header (`sha256:<header>`), resolved once at open; without one, the newest public final release;
 `variant` selects a representation such as `bf16` or `int8`. Without a variant, a
 single-variant tree is unambiguous; a multi-variant tree requires a choice. No separate
 download call is required. The same `open` accepts a local `.cozytensors` header or an
@@ -70,7 +71,7 @@ A `Pipeline` has `cls` and `config`. A `Component` exposes:
 | Attribute or call | What you get |
 |---|---|
 | `name` | Component name, such as `unet`. |
-| `cls` | Model class identifier. |
+| `cls` | The model class, a `ClassRef` with `library`, `version` and `name` (`ClassRef("", "", "")` when unknown). |
 | `config` | Parsed JSON configuration as a dictionary. |
 | `config_file` | The file name `config` exports as: `config.json` unless the writer named another. |
 | `tensors` | A `Tensors` mapping, described below. |
@@ -264,9 +265,9 @@ Additional checkpoint properties and operations:
 | Attribute or call | Meaning |
 |---|---|
 | `id` | Header identity, a `sha256:…` string. |
-| `tree` | Repository-tree identity, a `sha256:…` string, when known. |
+| `tree` | Commit identity (the repository tree), a `sha256:…` string, when known. |
 | `repo_id` | Repository name, when known. |
-| `revision` | Release label, when known. |
+| `revision` | Tag name, when opened through one. |
 | `variant` | Selected repository variant, when known. A standalone header does not store this label. |
 | `pipeline`, `components` | Pipeline description and ordered component mapping. |
 | `metadata` | Loading/provenance metadata. |
@@ -362,12 +363,12 @@ raw.decode_into(
     memoryview(out),
     dtype="F32",
     shape=[2, 4],
-    params={"axis": 0},
+    params={},
 )
 ```
 
 Host inputs and a host destination use the existing CPU decoder. The initial resident
-CUDA path supports `comfy.convrot_w4a4`, `comfy.asym_w4a8_int8` and `comfy.w6a8_int8`,
+CUDA path supports `int4.convrot`, `comfy.asym_w4a8_int8` and `comfy.w6a8_int8`,
 with F32, BF16 or F16 output. All parts and the destination must be on the same CUDA
 device. Mixed host/device placement and other resident CUDA schemes raise
 `UnsupportedError`; there is no CPU fallback or implicit weight upload. Device metadata
@@ -458,7 +459,7 @@ Its options and members are:
 | `cache_dir` | Choose the local store/cache. |
 | `metadata` | Mutable loading/provenance metadata dictionary. |
 | `local_checkpoint` | A committed local result retained after an upload failure, if one exists. |
-| `pipeline(cls, config)` | Set the pipeline description. |
+| `pipeline(cls, config)` | Set the pipeline description; `cls` is a `ClassRef` or a `(library, version, name)` tuple. |
 | `component(name, cls=..., config=..., config_file=None)` | Create or reopen a component and return its `ComponentWriter`. `config_file` names the file its config exports as (`scheduler_config.json`); the default keeps a reopened or base component's, else `config.json`. |
 | `has(component, key)` | Check a current/resumed write, excluding untouched tensors inherited from the base. |
 | `commit()` | Finish and return the checkpoint; a first commit error is cached and re-raised. |
@@ -562,9 +563,9 @@ repo_folder = tensorfs.materialize("me/model", revision="1.0", local_dir="./repo
 The default `format="cozytensors"` writes a native portable folder: `model.cozytensors`
 (or its named variant) plus `chunks/`, retaining the same header bytes and content hashes.
 `format="safetensors"` writes Safetensors weights with ordinary configuration and supporting
-files. It can retain supported encoded representations, or use `decode=True` to write
-ordinary weights in each tensor's logical dtype. Native cozytensors materialization
-preserves encodings and requires `decode=False`.
+files. It retains supported encoded representations, or with `decode=True` writes each
+tensor in its logical dtype. Native cozytensors materialization preserves encodings and rejects
+`decode=True`.
 
 Materialization fetches required missing objects or fails; it does not silently create an
 incomplete output. A checkpoint produces its own data and any known repository files.
@@ -605,16 +606,17 @@ needed.
 
 ```python
 license_path = tensorfs.download_file("me/model", "LICENSE")
-tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", token=my_token)
+commit = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", token=my_token)
 ```
 
 `download_file` returns one file path and accepts revision, location and authentication
 options, without component or variant selection.
 
-`upload_folder` returns the exact published tree id. Its options are `revision`, `token`,
-`endpoint` and `cache_dir`. Without a revision it appends an unreleased checkpoint;
-it does not create a public release. Repository files such as README and LICENSE are
-ordinary files in the uploaded folder.
+`upload_folder` commits the folder on top of the tag `revision` (default `main`, private when new),
+as Hugging Face's does: the tag's current files stay, the folder's files are added or replaced, and
+only paths matching `delete_patterns` (fnmatch globs such as `"*.int8.cozytensors"`) are removed.
+It returns the commit id. It never publishes: making a tag public is `cozy model publish`.
+Repository files such as README and LICENSE are ordinary files in the uploaded folder.
 
 ### Work directly with repository references
 
@@ -639,7 +641,7 @@ A conflict can cause the callback to run again, so it must tolerate retries.
 | `convert_to_cozytensors` | `Checkpoint` |
 | `materialize` | Local folder path; native cozytensors or Safetensors output |
 | `download_file` | Local file path |
-| `upload_folder` | Published tree id |
+| `upload_folder` | The commit id |
 
 Normal loading uses `open` followed by component tensor reads. Use
 `checkpoint.download(components=...)` to preload data into the shared store;

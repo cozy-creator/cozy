@@ -136,9 +136,9 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     let k = |s: &str| format!("down_blocks.0.{s}");
     let want = [
         ("fp8.tensorwise", k("attn1.to_v.weight"), [1024, 1024], r#"{}"#),
-        ("fp8.rowwise", k("attn1.to_q.weight"), [1024, 1024], r#"{axis: 0}"#),
+        ("fp8.rowwise", k("attn1.to_q.weight"), [1024, 1024], r#"{}"#),
         ("int8.tensorwise", k("attn2.to_v.weight"), [1024, 1024], r#"{}"#),
-        ("int8.rowwise", k("attn2.to_k.weight"), [1024, 1024], r#"{axis: 0}"#),
+        ("int8.rowwise", k("attn2.to_k.weight"), [1024, 1024], r#"{}"#),
         ("int8.convrot", k("attn1.to_k.weight"), [1024, 1024], r#"{rotation: "kron_regular_h4", rotation_size: 256}"#),
         ("mxfp8", k("attn2.to_q.weight"), [1024, 1024], r#"{block_size: 32, scale_layout: "row_major"}"#),
         ("nvfp4", k("ff.net.0.proj.weight"), [1024, 4096], r#"{block_size: 16, global_scale: "multiply", nibble_order: "low_first", scale_layout: "row_major"}"#),

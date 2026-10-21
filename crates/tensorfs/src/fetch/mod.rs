@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub use endpoint::{upload_tree, upload_tree_with, with_tag, Endpoint, Fresh, Payload, Stream, UploadControl, Uploaded, MAIN};
+pub use endpoint::{commit_onto, upload_tree, upload_tree_with, with_tag, Committed, Endpoint, Fresh, Payload, Stream, UploadControl, Uploaded, MAIN};
 pub use net::Client;
 pub(crate) use net::GetError;
 pub use origin::{choose, pick_variant, resolve, variant_of_tree, Chosen, Location, Origin};

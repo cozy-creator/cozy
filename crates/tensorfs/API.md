@@ -97,7 +97,7 @@ exact remote tree.
 | `open(name_or_path, &Open)` | Open metadata, optionally waiting for all checkpoint data with `lazy: false`; returns `Result<Checkpoint>`. |
 | `materialize(&Ref, &Download, local_dir, local_files_only)` | Make selected repository content available as a normal folder; returns `Result<PathBuf>`. |
 | `download_file(&Ref, filename, local_dir, local_files_only)` | Fetch one repository file; returns `Result<PathBuf>`. |
-| `upload_folder(&Ref, folder, progress)` | Publish the folder; returns `Result<ObjectRef>`. |
+| `upload_folder(&Ref, folder, delete_patterns, progress)` | Commit the folder's files on top of the tag `Ref.revision` (default `main`, private when new): the tag's tree minus paths matching `delete_patterns` (fnmatch globs), plus these files. Returns the commit, `Result<ObjectRef>`. |
 | `convert_to_cozytensors(&[String], &Convert)` | Convert pinned sources; returns `Result<Checkpoint>`. |
 | `writer(WriterOptions)` | Begin a write; returns `Result<Writer>`. |
 
@@ -111,9 +111,9 @@ let folder = client.materialize(&model, &Download::default(), None, false).await
 println!("downloaded to {}", folder.display());
 
 saved.materialize(Path::new("./portable"), Format::Cozytensors, false).await?;
-let destination: Ref = "me/output".parse()?;
-let tree = client.upload_folder(&destination, Path::new("./portable"), None).await?;
-println!("published {}", tree.id());
+let destination: Ref = "me/output@draft".parse()?;
+let commit = client.upload_folder(&destination, Path::new("./portable"), &[], None).await?;
+println!("me/output@draft is {}", commit.id());
 ```
 
 Checkpoint materialization includes that checkpoint and any known repository files.
@@ -165,7 +165,7 @@ below; normal model consumers do not need it.
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).
 `ConvertProgress` additionally receives a stage string. A callback can stop remaining work
-by returning an error. The final `upload_folder` progress callback runs after publication:
+by returning an error. The final `upload_folder` progress callback runs after the tag moved:
 its error is returned to the caller but does not undo the repository update. Configured
 providers supply ordinary credentials; construction does not create a separate
 worker-permission mechanism.
@@ -191,6 +191,7 @@ worker-permission mechanism.
 | `missing(&Selection)` | `Result<Vec<ObjectRef>>`. |
 | `download(&Download).await` | `Result<Fetched>`. |
 | `materialize(directory, Format, decode).await` | `Result<PathBuf>` for the complete checkpoint folder. |
+| `open_file()` | `Result<CheckpointFile>`: the checkpoint as one read-only, seekable file (`Read + Seek`, `len()`): its header, then its chunks and assets in header order at 4 KiB-aligned offsets (spec §11), assembled from the store on demand; nothing is written. It holds what it may read until dropped, and fetches what it lacks when the checkpoint may fetch, so read it outside an async context. |
 
 `download` completes when the selected chunks and supporting files are verified and locally
 available; the open checkpoint retains them. `missing` is optional availability inspection.
@@ -239,7 +240,8 @@ on a conflict. `Endpoint::new("local", ...)` addresses local repository referenc
 
 `ObjectRef` has `sha256: String` and `length: u64`; `of(bytes)` hashes content, `id()` returns
 `sha256:…` and `key()` gives its object-storage key. `Metadata` is `BTreeMap<String, Value>`.
-`format::Pipeline` contains `class` and JSON `config`; `format::Tensor` contains the key,
+`format::ClassRef` is a class as `{library, version, name}` (`ClassRef::default()` is the unknown
+class); `format::Pipeline` contains `class` and JSON `config`; `format::Tensor` contains the key,
 logical dtype/shape and plain location or encoding/parts. `Encoding` holds scheme and
 parameters. Format metadata structures are described in the [format spec](spec/cozytensors.md).
 The lower-level I/O/codec interfaces used by in-tree integrations are separate from this
@@ -276,7 +278,7 @@ placement, lengths, alignment and input/output overlap before writing.
 
 All-host spans use the CPU decoder. All-CUDA spans must share one device and use a
 supported resident-input scheme; the initial target covers `comfy.asym_w4a8_int8`,
-`comfy.w6a8_int8` and `comfy.convrot_w4a4`. Mixed host/device input, file/zero sources and
+`comfy.w6a8_int8` and `int4.convrot`. Mixed host/device input, file/zero sources and
 implicit transfers are refused. Keep input allocations alive, the output exclusively
 writable, and producer/output streams valid in that device's primary context on the
 calling thread. Rust's raw pointers do not enforce these requirements for you.

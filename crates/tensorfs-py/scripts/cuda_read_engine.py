@@ -32,7 +32,7 @@ try:
         "quantized", dtype="F32", shape=[2, 16], scheme="fp8.rowwise",
         parts={"weight": ("F8_E4M3", [2, 16], bytes([0x38]) * 32),
                "scale": ("F32", [2], np.array([0.5, 2.0], dtype=np.float32))},
-        params={"axis": 0},
+        params={},
     )
     ck = writer.commit()
     tensors = ck.components["model"].tensors

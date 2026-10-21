@@ -420,7 +420,7 @@ fn role(t: &V1Tensor, scheme: &str, roles: &[(&str, &str)], p: &V1Part) -> std::
 /// The encoding of `scheme` (U12's mapping); each part keeps the dtype v1 stored it in.
 fn encoding(scheme: &str) -> Encoding {
     match scheme {
-        "fp8.rowwise" => Encoding::fp8_rowwise(0),
+        "fp8.rowwise" => Encoding::fp8_rowwise(),
         "fp8.tensorwise" => Encoding::fp8_tensorwise(),
         "int8.convrot" => Encoding::int8_convrot(256),
         "mxfp8" => Encoding::mxfp8(ScaleLayout::RowMajor),

@@ -87,9 +87,11 @@ impl Client {
         &self, reference: &Ref, filename: &str,
         local_dir: Option<&Path>, local_files_only: bool,
     ) -> Result<PathBuf>;
-    pub async fn upload_folder(&self, reference: &Ref, folder: &Path,
+    // Commits the folder on top of the tag reference.revision (default "main", private when new):
+    // the tag's tree minus paths matching delete_patterns (fnmatch), plus the folder's files.
+    pub async fn upload_folder(&self, reference: &Ref, folder: &Path, delete_patterns: &[&str],
         progress: Option<&Progress<'_>>) -> Result<ObjectRef>;
-    // The final progress callback runs after publication; its error cannot undo that update.
+    // The final progress callback runs after the tag moved; its error cannot undo that update.
 }
 // Python components= maps to Selection::Components. Asset selection does not fetch tensor chunks.
 
@@ -114,9 +116,16 @@ impl Checkpoint {
     pub fn component(&self, name: &str) -> Result<&Component>;
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
     pub async fn download(&self, want: &Download<'_>) -> Result<Fetched>;
-    // Cozytensors requires false; Safetensors true decodes into each tensor's logical dtype.
-    pub async fn materialize(&self, dir: &Path, format: Format,
-        decode: bool) -> Result<PathBuf>;
+    // decode writes logical-dtype weights and needs Safetensors; Cozytensors with decode is Invalid.
+    pub async fn materialize(&self, dir: &Path, format: Format, decode: bool) -> Result<PathBuf>;
+    // Header, then chunks and assets in header order at 4 KiB-aligned offsets (spec §11).
+    pub fn open_file(&self) -> Result<CheckpointFile>;
+}
+// Read + Seek over the logical file; holds what it may read until dropped.
+pub struct CheckpointFile;
+impl CheckpointFile {
+    pub fn len(&self) -> u64;
+    pub fn is_empty(&self) -> bool;
 }
 // Open.lazy=false downloads this checkpoint's data before returning.
 // Synchronous chunk/read/asset/folder operations use bytes made available by download().
@@ -126,7 +135,7 @@ impl Checkpoint {
 pub struct Component { /* owns shared checkpoint source; immutable metadata view */ }
 impl Component {
     pub fn name(&self) -> &str;
-    pub fn class(&self) -> &str;
+    pub fn cls(&self) -> &format::ClassRef; // [library, version, name]
     pub fn config(&self) -> &format::Config;
     pub fn config_file(&self) -> &str; // the config's export name; config.json by default
     pub fn tensors(&self) -> &[format::Tensor];
@@ -160,6 +169,8 @@ impl Endpoint {
         &self, repo_id: &str,
         change: impl FnMut(Option<Repo>) -> Result<Option<Repo>>,
     ) -> Result<Repo>;
+    // A revision (tag, commit or variant header) to its commit, and the tag it went through.
+    pub async fn commit(&self, repo_id: &str, revision: &str) -> Result<(ObjectRef, Option<String>)>;
 }
 // Endpoint("local") resolves default cache root; with_config supplies explicit
 // cache_dir/CA/provider. No callback changes a different repo or bypasses native CAS.
@@ -191,7 +202,8 @@ pub fn bearer(token: impl Into<String>) -> Arc<dyn TokenProvider>;
 #[derive(Default)]
 pub struct Convert<'a> {
     pub converter: Option<&'a str>,
-    pub variant: Option<&'a str>,
+    // The source's Diffusers weights variant (`fp16`), when a folder has several.
+    pub source_variant: Option<&'a str>,
     pub progress: Option<&'a ConvertProgress<'a>>,
 }
 impl Client {
@@ -205,14 +217,14 @@ pub struct WriterOptions<'a> {
     // dest and repo_id exclude each other; variant needs repo_id.
     pub dest: Option<&'a Path>, pub variant: Option<&'a str>,
     pub base: Option<&'a Checkpoint>, pub resume: Option<&'a str>,
-    pub repo_id: Option<&'a str>, pub endpoint: Option<&'a str>,
+    pub repo_id: Option<&'a str>, pub revision: Option<&'a str>, pub endpoint: Option<&'a str>,
     pub token: Option<Arc<dyn TokenProvider>>,
 }
 pub struct Writer { /* owned local and optional remote write state */ }
 impl Writer {
-    pub fn pipeline(&mut self, class: &str, config: format::Config) -> Result<()>;
+    pub fn pipeline(&mut self, class: format::ClassRef, config: format::Config) -> Result<()>;
     // config_file: the file the config exports as; None keeps a reopened or base one's.
-    pub fn component(&mut self, name: &str, class: &str, config: format::Config,
+    pub fn component(&mut self, name: &str, class: format::ClassRef, config: format::Config,
         config_file: Option<&str>) -> Result<ComponentWriter<'_>>;
     // Reopen a declared component without changing its class or config.
     pub fn component_writer(&mut self, name: &str) -> Result<ComponentWriter<'_>>;

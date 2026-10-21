@@ -76,7 +76,7 @@ def write(source: tensorfs.Checkpoint, dest: pathlib.Path, variant: str, store: 
                     weight = np.clip(np.round(values / scale[:, None]), -127, 127).astype(np.int8)
                     parts = {"weight": ("I8", shape, weight.tobytes()), "scale": ("F32", shape[:1], scale.astype(np.float32).tobytes())}
                     out.put_encoded(key, dtype="BF16", shape=shape, scheme="int8.rowwise",
-                                    params={"axis": 0}, parts=parts)
+                                    params={}, parts=parts)
                 else:
                     bits = values.view(np.uint32)
                     out.put(key, ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16).tobytes(), dtype="BF16", shape=shape)
@@ -132,7 +132,30 @@ def e2e(work: pathlib.Path) -> pathlib.Path:
             assert checkpoint.verify().ok, variant
     print(f"e2e: me/model@1.0 (bf16, int8) published to {url}; opened from an empty store and from its "
           "cozytensors folder, every tensor reads as written and verifies", flush=True)
+    commits(work, folder, store)
     return endpoint
+
+
+def commits(work: pathlib.Path, folder: pathlib.Path, store: pathlib.Path) -> None:
+    """upload_folder commits on top of its tag: a second upload keeps the first's files, and
+    delete_patterns is the only delete."""
+    (endpoint := work / "commits").mkdir()
+    (notes := work / "notes").mkdir()
+    (notes / "NOTES.md").write_text("notes\n")
+    url, fresh = endpoint.as_uri(), work / "commits-reader"
+    tensorfs.upload_folder(repo_id="me/commits", folder_path=folder, endpoint=url, cache_dir=store)
+    tensorfs.upload_folder(repo_id="me/commits", folder_path=notes, delete_patterns="*.int8.cozytensors",
+                           endpoint=url, cache_dir=store)
+    got = pathlib.Path(tensorfs.download_file("me/commits", "NOTES.md", revision="main", endpoint=url, cache_dir=fresh))
+    assert got.read_text() == "notes\n"
+    assert tensorfs.open("me/commits", revision="main", variant="bf16", endpoint=url, cache_dir=fresh, lazy=False).verify().ok
+    try:
+        tensorfs.open("me/commits", revision="main", variant="int8", endpoint=url, cache_dir=fresh)
+        raise AssertionError("delete_patterns left the int8 variant")
+    except tensorfs.NotFoundError:
+        pass
+    print("e2e: upload_folder committed on top of main (bf16, README and LICENSE kept, NOTES.md added); "
+          "delete_patterns removed int8", flush=True)
 
 
 def placeholders() -> dict:

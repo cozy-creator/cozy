@@ -18,7 +18,10 @@ use protocol::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
-/// Version 7 combines checkpoint output references and rental-price agreements.
+/// The store's version (`PRAGMA user_version`), and the schema a new store is made with. A store
+/// at an older version is from before cozy 0.9.4, which this cozy does not read. Two lines of
+/// development each called their addition 6 (`runs.agreed`, `outputs.checkpoint`), so a store at
+/// 5, 6 or 7 gains whichever of the two it lacks.
 const VERSION: i64 = 7;
 const SCHEMA: &str = "
     CREATE TABLE machines (
@@ -313,24 +316,24 @@ impl Store {
                 tx.pragma_update(None, "user_version", VERSION)?;
                 tx.commit()?;
             }
-            5 | 6 => {
+            version @ 5..=VERSION => {
                 let tx = writer.transaction()?;
-                // Public v6 added agreements; the TensorFS candidate v6 added checkpoints.
-                // Either store must retain its records while gaining the other column.
+                let mut changed = version != VERSION;
                 for (table, column) in [("runs", "agreed"), ("outputs", "checkpoint")] {
-                    let exists: bool = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
-                        params![table, column],
-                        |row| row.get(0),
-                    )?;
-                    if !exists {
+                    let names: Vec<String> = tx
+                        .prepare(&format!("PRAGMA table_info({table})"))?
+                        .query_map([], |r| r.get(1))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    if !names.iter().any(|name| name == column) {
                         tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"))?;
+                        changed = true;
                     }
                 }
-                tx.pragma_update(None, "user_version", VERSION)?;
-                tx.commit()?;
+                if changed {
+                    tx.pragma_update(None, "user_version", VERSION)?;
+                    tx.commit()?;
+                }
             }
-            VERSION => {}
             other => return Err(StoreError::Version(other)),
         }
         let reader = Connection::open(path)?;
@@ -844,10 +847,7 @@ impl Store {
                 .reason
                 .as_ref()
                 .filter(|_| status != Status::Completed)
-                .map(|r| Reason {
-                    code: r.code.clone(),
-                    message: r.message.clone(),
-                });
+                .cloned();
             tx.execute(
                 "UPDATE runs SET cursor = MAX(cursor, ?2), outcome = ?3 WHERE id = ?1",
                 params![
@@ -902,6 +902,7 @@ impl Store {
                     let reason = Reason {
                         code: "canceled".into(),
                         message: "canceled before it was sent".into(),
+                        ..Default::default()
                     };
                     end(tx, id, Status::Canceled, Some(reason))
                 }
@@ -933,7 +934,7 @@ impl Store {
                 let row = row?;
                 let id = row.id.to_string();
                 let ended = if row.cancel_requested {
-                    let reason = Reason { code: "canceled".into(), message: format!("canceled; {reason}") };
+                    let reason = Reason { code: "canceled".into(), message: format!("canceled; {reason}"), ..Default::default() };
                     end(tx, &id, Status::Canceled, Some(reason))?
                 } else if row.state != State::Accepted && !row.pinned && served {
                     tx.execute(
@@ -947,7 +948,7 @@ impl Store {
                         State::Accepted => format!("its machine {machine} ended mid-run, and the run was not retried: {reason}"),
                         _ => format!("its machine {machine} ended before it accepted the run: {reason}"),
                     };
-                    end(tx, &id, Status::Failed, Some(Reason { code: "machine_lost".into(), message }))?
+                    end(tx, &id, Status::Failed, Some(Reason { code: "machine_lost".into(), message, ..Default::default() }))?
                 };
                 events.extend(ended.into_iter().map(|event| (row.id.clone(), event)));
             }
@@ -1295,7 +1296,7 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             },
             reason: reason_code
                 .zip(reason)
-                .map(|(code, message)| Reason { code, message }),
+                .map(|(code, message)| Reason { code, message, ..Default::default() }),
             state_seq: r.get::<_, i64>(16)? as u64,
             created_at_ms: r.get(17)?,
             accepted_at_ms: r.get(18)?,
@@ -1737,7 +1738,12 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
         },
         cancel_requested: row.cancel_requested,
         machine_state: row.machine_state.clone(),
-        reason: row.reason.clone(),
+        // The machine's own reason, with its traceback, when it is the run's.
+        reason: row.reason.clone().map(|reason| {
+            (row.outcome.as_ref().and_then(|o| o.reason.clone()))
+                .filter(|full| full.code == reason.code)
+                .unwrap_or(reason)
+        }),
         output: items.collect::<rusqlite::Result<_>>()?,
         created_at_ms: row.created_at_ms,
         accepted_at_ms: row.accepted_at_ms,
@@ -1773,4 +1779,50 @@ pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store at 5, or at either line's 6, reaches 7 with both columns and its rows.
+    #[test]
+    fn a_store_at_5_or_either_6_reaches_7_with_both_columns_and_its_rows() {
+        let shapes: [(i64, &[(&str, &str)]); 3] = [
+            (5, &[("runs", "agreed"), ("outputs", "checkpoint")]),
+            (6, &[("outputs", "checkpoint")]),
+            (6, &[("runs", "agreed")]),
+        ];
+        for (n, (from, dropped)) in shapes.into_iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!("calcifer-store-{}-{n}-{}", std::process::id(), now_ms()));
+            let path = dir.join("state.db");
+            std::mem::drop(Store::open(&path).unwrap());
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO runs (id, number, idempotency_key, digest, hub, kind, target, pinned, spec, out_dir, state, created_at)
+                     VALUES ('r', 1, 'k', 'd', 'h', 'call', 't', 0, x'00', '', 'queued', 0);
+                 INSERT INTO outputs (run, name, idx, rev, length, digest, media_type, created_seq, seq)
+                     VALUES ('r', 'o', 0, 1, 1, 'd', 'm', 1, 1);",
+            )
+            .unwrap();
+            for (table, column) in dropped {
+                conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}")).unwrap();
+            }
+            conn.pragma_update(None, "user_version", from).unwrap();
+            std::mem::drop(conn);
+            std::mem::drop(Store::open(&path).unwrap());
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), VERSION);
+            for (table, column) in [("runs", "agreed"), ("outputs", "checkpoint")] {
+                let has: i64 = conn
+                    .query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(has, 1, "{from} without {dropped:?}: {table}.{column}");
+                let rows: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+                assert_eq!(rows, 1, "{from} without {dropped:?}: {table}'s row");
+            }
+            std::mem::drop(conn);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }

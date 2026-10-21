@@ -9,7 +9,7 @@ objects are as in [cozytensors.md](cozytensors.md). The key words are as in RFC 
 An endpoint is a base URL `B`. It has two resources, and nothing lists either:
 
 ```text
-B/refs/<org>/<name>.json        the repo document (tensorfs.repo/1)
+B/refs/<org>/<name>.json        the repo document (cozytensors.repo/1)
 B/blobs/<aa>/<bb>/<sha256>      an object: a tree, a cozytensors header, a chunk, an asset or a repo file
 ```
 
@@ -28,8 +28,10 @@ GET  B/blobs/<aa>/<bb>/<hex>    [Range: bytes=a-b]          200 | 206 | 302/303/
 HEAD B/blobs/<aa>/<bb>/<hex>                                200 + Content-Length | 404
 ```
 
-- A client walks repo → tree → its repo files and the chosen variant's header → that header's chunks and assets. It
-  MUST check every object's length and SHA-256 before it admits it.
+- A client walks repo → tag → commit (tree) → its repo files and the chosen variant's header → that header's chunks
+  and assets. It MUST check every object's length and SHA-256 before it admits it.
+- A server serves private tags (cozytensors.md §7) only to a reader who may write the repo; to any other it serves the
+  document without them, with an ETag over the bytes it serves. Their commits' objects are likewise the writers'.
 - A read-only server SHOULD send an `ETag` with a repo document and answer `304` to a matching `If-None-Match`.
   A server that accepts repo updates MUST send a strong ETag on successful repo GET and PUT responses. Weak
   validators cannot satisfy the strong comparison required by `If-Match`
@@ -68,14 +70,19 @@ PUT  B/refs/<org>/<name>.json   If-Match: <etag> | If-None-Match: *
 
 - `If-None-Match: *` creates the document; `If-Match` replaces the version the client read. Without either a server
   answers `428`.
-- On `412` the client reads the document again, applies its change to it and retries. A retry after a lost answer
-  that gets `412` reads it again: when it equals what was sent, the write succeeded.
-- A model is deleted by a document with no releases and no checkpoints. There is no DELETE.
+- On `412` the client reads the document again, applies its change to it and retries, for as long as another writer
+  made progress: the document it reads differs from the one its write was based on. A `412` on an unchanged document
+  is a conflict no writer moved, and the write fails. A retry after a lost answer that gets `412` reads it again: when
+  it equals what was sent, the write succeeded.
+- Uploading makes a commit on top of a tag, as git does: the tag's current tree (none when the tag is new), minus
+  the paths the client's delete patterns match, plus the uploaded files, added or replaced; a file the commit sets is
+  never deleted. The tag then moves to it. Publishing creates or moves a public tag, or makes a private one public;
+  yanking sets `yanked`. Each is one PUT of the edited document; on `412` an upload reads the tag's tree again and
+  re-applies its files. A model is deleted by a document with no tags. There is no DELETE.
 - A server checks:
-  - the body is a canonical `tensorfs.repo/1` document (cozytensors.md §9) whose `name` folds to the path;
-  - every tree it cites has its closure present and readable by the writer, else `409 closure_incomplete` with up to
-    1,000 missing digests in `detail.missing`;
-  - a release that changed has `revision` = old + 1, an unchanged one keeps it, and a new one starts at 0;
+  - the body is a canonical `cozytensors.repo/1` document (cozytensors.md §9) whose `name` folds to the path;
+  - every commit it cites has its closure present and readable by the writer, else `409 closure_incomplete` with up
+    to 1,000 missing digests in `detail.missing`;
   - anything else is the server's policy: `409 policy`, `detail.reason` naming the server's own code.
 
 ## 5. Authorization

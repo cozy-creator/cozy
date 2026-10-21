@@ -143,7 +143,7 @@ row_scales = scales.squeeze(1)
 # weights_i8 and row_scales are ready for a matching rowwise-INT8 kernel.
 ```
 
-This target representation is `int8.rowwise` with `axis=0` and `scale_dtype="F32"`.
+This target representation is `int8.rowwise` with an `F32` `scale` part per row.
 TensorFS handles the source encoding; the target quantizer above is ordinary PyTorch code.
 TensorFS has no re-encoding call: `ComponentWriter.put_encoded(...)` stores already-encoded arrays.
 Prepare this once when loading, rather than on every forward pass. Re-quantizing can add error;
@@ -316,14 +316,16 @@ The header contains a pipeline class/config and named components with class/conf
 is self-contained; README, LICENSE, images and code remain ordinary repository files.
 
 ```text
-repo → release → tree
-                  ├─ model.int8.cozytensors → header → chunks and assets
-                  ├─ model.bf16.cozytensors → header → chunks and assets
-                  └─ README.md, LICENSE, …
+repo → tag → commit (tree)
+               ├─ model.int8.cozytensors → header → chunks and assets
+               ├─ model.bf16.cozytensors → header → chunks and assets
+               └─ README.md, LICENSE, …
 ```
 
-A release names a `tensorfs.tree/1` tree. `variant=` selects a cozytensors file; `open` requires an explicit variant
-when there is more than one. `revision="sha256:…"` can select an unpublished tree or header. Opening downloads
+A repo is commits and tags, as in git. A commit is an immutable `cozytensors.tree/1` tree; a tag is a movable name
+for one. Public tags are releases, named by versions; private tags are the owner's. `revision=` names a tag, a commit
+(`sha256:<tree>`) or a variant header (`sha256:<header>`); without one, `open` takes the newest public final release.
+`variant=` selects a cozytensors file; `open` requires an explicit variant when there is more than one. Opening downloads
 metadata by default; each tensor read fetches only the objects it needs. Set `lazy=False` to wait for the whole
 checkpoint in the shared store, or call `checkpoint.download(components=["unet"])` to preload a selection.
 `materialize` returns a plain folder, including all variants by default, while `download_file` returns one
@@ -334,7 +336,7 @@ repository file. These folder/file operations are optional compatibility tools.
 `convert_to_cozytensors` accepts files, directories, `hf://`, `civitai://` and HTTPS sources. It pins upstream revisions and records
 source metadata. Recognized source layouts use converter tables; `converter=` declares a layout that cannot be
 inferred safely. `materialize(checkpoint, local_dir=directory, format="safetensors")` writes ordinary Hugging Face filenames, configs and assets.
-Encoded tensors retain their parts unless `dequantize=` requests ordinary values.
+Encoded tensors retain their parts unless `decode=True` writes them in their logical dtypes.
 
 ```python
 from array import array
@@ -348,7 +350,7 @@ with tensorfs.Writer("./model.cozytensors") as writer:
 checkpoint = writer.commit()
 tensorfs.materialize(checkpoint, local_dir="./portable", format="cozytensors")
 
-tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path="./portable")
+tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path="./portable")  # private tag "draft"
 tensorfs.upload_folder(repo_id="acme/example", folder_path="./portable", endpoint=Path("origin").absolute().as_uri())
 ```
 
@@ -357,10 +359,13 @@ header, and its tensors and supporting-file bytes stay in the store while that f
 overwrite the file and the data expires like any other local copy. The copy for another machine is
 `materialize(checkpoint, local_dir=…)`: `model.cozytensors` (or a named variant) plus complete `chunks/<sha256>`
 objects. `Writer()` without a destination keeps the checkpoint in the store as a cache entry. `base=` reuses
-unchanged tensors and `resume=` journals local work. `Writer(repo_id=…, endpoint=…, token=…)` streams new objects
-and appends an unreleased tree, named `model.<variant>.cozytensors` by `variant=`, which needs `repo_id`. Its
-successful checkpoint carries the exact published tree; an upload failure keeps `writer.local_checkpoint`, which
-can be published again for 7 days, and remains an error.
+unchanged tensors and `resume=` journals local work. `Writer(repo_id=…, revision=…, endpoint=…, token=…)` streams
+new objects, makes a commit and moves the private tag `revision` (default `main`) to it; `variant=` names the file
+`model.<variant>.cozytensors` and needs `repo_id`. The commit goes on top of the tag: its other variants and files
+stay, so a bf16 and then an int8 writer to `main` leave both. `upload_folder` does the same for a folder (removing
+only what `delete_patterns` names) and returns the commit.
+Publishing (making a tag public, a release) is the CLI's `cozy model publish`. A successful checkpoint carries the exact
+commit; an upload failure keeps `writer.local_checkpoint`, which can be uploaded again for 7 days, and remains an error.
 
 The default endpoint is `https://tensorhub.com`; `configure(endpoint=…)` or `TENSORFS_ENDPOINT` changes it.
 `token=` accepts a string, a callable, or an object with `headers(method, url, headers,

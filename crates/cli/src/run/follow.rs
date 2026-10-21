@@ -295,6 +295,9 @@ pub(super) fn fields(ctx: &Context, run: &Run) -> output::Record {
     }
     if let Some(reason) = &run.reason {
         record = record.field("reason", format!("{} ({})", reason.message, reason.code));
+        if !reason.detail.is_empty() {
+            record = record.field("traceback", &reason.detail);
+        }
     }
     for item in &run.output {
         let shown = match (&item.path, &item.export_error) {

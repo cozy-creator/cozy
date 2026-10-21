@@ -274,6 +274,7 @@ mod tests {
         failed.reason = Some(Reason {
             code: "uv_failed".into(),
             message: "no solution".into(),
+            ..Default::default()
         });
         let error = installed(failed).err().unwrap();
         assert_eq!(

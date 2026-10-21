@@ -19,7 +19,7 @@ from tensorfs import varena
 
 def main(root: Path) -> None:
     w = tensorfs.Writer(cache_dir=root)
-    unet = w.component("unet", cls=("test", "", "Unet"), config={})
+    unet = w.component("unet", cls=("test", "1.0", "Unet"), config={})
     want: dict[str, bytes] = {}
     for b in range(3):
         for p in range(4):

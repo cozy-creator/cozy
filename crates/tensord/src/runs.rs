@@ -10,10 +10,10 @@ use crate::{
     execution::Stoppable,
     gpu_service::{without_gpus, KeptMember, Level, Member},
     hub,
-    journal::{CallMemo, Execution, Failure, InputFile, Installation, Outcome, Preparation, ResultRecord},
+    journal::{CallMemo, Execution, Failure, InputFile, Installation, Outcome, ResultRecord},
     local_source::LocalSources,
     objects::{Objects, Refused},
-    published::{declares_models, Providers, Publisher, Request},
+    published::{Providers, Publisher, Request},
     service::{Call, Service},
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -93,7 +93,8 @@ pub struct Spec {
 pub struct Runs {
     pub service: Arc<Service>,
     pub objects: Arc<Objects>,
-    pub publisher: Option<Arc<Publisher>>,
+    /// The one resolver of a run's code and models.
+    pub publisher: Arc<Publisher>,
     pub local: Option<Arc<LocalSources>>,
     /// On a rental: its own Hub, where a run that names none reads anonymously.
     pub own_hub: Option<hub::Source>,
@@ -255,19 +256,13 @@ impl Runs {
                 continue;
             }
             // A tree's files were written too: each its manifest names.
-            let manifest: Value = serde_json::from_slice(&std::fs::read(path)?)
-                .map_err(|_| refused("invalid_request", format!("input tree {} has no readable manifest", input.input_id)))?;
-            for entry in manifest["entries"].as_array().into_iter().flatten() {
-                let (Some(sha), Some(length)) = (entry["blob"]["sha256"].as_str(), entry["blob"]["length"].as_u64()) else {
-                    return Err(refused("invalid_request", format!("input tree {} names a file without its blob", input.input_id)));
-                };
-                if self.objects.path(actor, &format!("sha256:{sha}"))?.is_none_or(|(_, held)| held != length) {
-                    return Err(unwritten(&format!("{}/{}", input.input_id, entry["path"].as_str().unwrap_or_default())));
+            let files = crate::trees::parse(&std::fs::read(path)?)
+                .map_err(|e| refused("invalid_request", format!("input tree {}: {e}", input.input_id)))?;
+            for (member, object) in files {
+                if self.objects.path(actor, &format!("sha256:{}", object.sha256))?.is_none_or(|(_, held)| held != object.length) {
+                    return Err(unwritten(&format!("{}/{member}", input.input_id)));
                 }
-                references.push(ObjectRef {
-                    sha256: sha.into(),
-                    length,
-                });
+                references.push(object);
             }
         }
         // A local source is refused here, not accepted to fail: the run takes custody of its
@@ -414,9 +409,7 @@ impl Runs {
         if spec.models.is_empty() {
             return Ok(vec![]);
         }
-        let publisher = self.publisher.as_ref().ok_or_else(|| {
-            refused("capability_unavailable", "this machine prepares no models")
-        })?;
+        let publisher = &self.publisher;
         let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
         let hub_access = || {
             hub.as_ref().ok_or_else(|| {
@@ -506,7 +499,7 @@ impl Runs {
                     endpoint = endpoint.anonymous();
                 }
                 let runtime = tensorfs::fetch::runtime().map_err(|error| refused("upload_failed", error.to_string()))?;
-                let uploaded = runtime.block_on(upload_tree_with(&endpoint, repository, &tree, publisher.store(), tag, &UploadControl {
+                let uploaded = runtime.block_on(upload_tree_with(&endpoint, repository, &tree, publisher.store(), tag, &[], &UploadControl {
                     cancelled: &|| stoppable.stop.is_cancelled(),
                     progress: &|done, total| observe(&stage, done, total),
                     commit: &|| stoppable.commit(),
@@ -514,7 +507,7 @@ impl Runs {
                     true => refused(crate::published::CANCELED, "the upload was canceled before its ref update; admitted objects remain available"),
                     false => refused("upload_failed", error.to_string()),
                 })?;
-                row["published"] = json!({"destination": destination, "tree": tree.id(), "tag": tag,
+                row["published"] = json!({"destination": destination, "tree": uploaded.commit.id(), "tag": tag,
                     "checkpoint": header.id(), "converged": uploaded.converged});
             }
             models.push(row);
@@ -630,9 +623,9 @@ impl Runs {
         // warm run imports only when its level asks (`downloaded` never does).
         let mut ahead = None;
         if let (false, Some(gpu)) = (spec.warm, self.service.gpu()) {
-            ahead = plan.as_ref().zip(self.publisher.as_ref()).map(|(plan, publisher)| {
+            ahead = plan.as_ref().map(|plan| {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
-                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), order);
+                let fetch = crate::access::Fetch::new(self.publisher.machine().clone(), hub.clone(), order);
                 if let Err(error) = fetch.ahead(&plan.upfront()) {
                     tracing::warn!("run {id}: its weights' early fetch: {error}");
                 }
@@ -685,8 +678,8 @@ impl Runs {
             };
             // A function's warm run ends holding what its constructions read (`downloaded`).
             let mut moved = (0, 0);
-            if let (Some(plan), Some(publisher)) = (&plan, &self.publisher) {
-                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), u64::MAX);
+            if let Some(plan) = &plan {
+                let fetch = crate::access::Fetch::new(self.publisher.machine().clone(), hub.clone(), u64::MAX);
                 let report = |done, total| observe("downloading its weights", done, total);
                 moved = fetch.download(&plan.upfront(), &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
                     true => refused(crate::published::CANCELED, "the run was canceled while it downloaded"),
@@ -865,8 +858,8 @@ impl Runs {
                 .map_err(io::Error::other)?);
                 let held = self.service.catalog.resolve(&installation.generation)?;
                 // A member's weights come under its owner's newest bearer, after every run's.
-                let fetch = self.publisher.as_ref().filter(|_| plan.is_some()).map(|publisher| {
-                    crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), u64::MAX)
+                let fetch = plan.is_some().then(|| {
+                    crate::access::Fetch::new(self.publisher.machine().clone(), hub.clone(), u64::MAX)
                 });
                 members.push(Member::new(held, plan, item.level, fetch));
             }
@@ -988,10 +981,10 @@ impl Runs {
         Ok(())
     }
 
-    /// The run's installation, model plan and precision warnings: through the Hub when it needs
-    /// one (a release, or held code declaring models), else held code with the operator's
-    /// configured grants. Unobserved, it is a hint's: its downloads go behind the ones calls
-    /// wait on.
+    /// The run's installation, model plan and precision warnings, from the one resolver
+    /// (`Publisher`): a release and a Hub-named model need the run's Hub access; held code and
+    /// the models this machine holds (`local/` aliases, checkpoints by hash) do not. Unobserved,
+    /// it is a hint's: its downloads go behind the ones calls wait on.
     #[allow(clippy::too_many_arguments)]
     fn resolve(
         &self,
@@ -1007,43 +1000,27 @@ impl Runs {
         observe: Option<crate::published::Observer>,
         stop: Option<&Stop>,
     ) -> Result<(Installation, Option<crate::gpu_service::Plan>, Vec<String>), Refused> {
-        let needs_hub = held
-            .as_ref()
-            .is_none_or(|installed| declares_models(installed, entrypoint));
-        match (hub, &self.publisher) {
-            (Some(source), Some(publisher)) if needs_hub => {
-                let (package, release) = release.unwrap_or_default();
-                let request = Request {
-                    run: id.into(),
-                    source,
-                    package,
-                    release,
-                    installed: held,
-                    owner: spec.owner.clone(),
-                    catalog_revision: spec.catalog_revision.clone(),
-                    providers: spec.providers.clone(),
-                    entrypoint: entrypoint.into(),
-                    choices: choices.to_vec(),
-                    gpus: spec.gpus,
-                    bits,
-                    imports: !spec.warm,
-                };
-                let prepared = publisher
-                    .prepare_now(&self.service, actor, &request, observe, stop)
-                    .map_err(|(code, message)| refused(code, message))?;
-                Ok((prepared.installation, prepared.plan, prepared.warnings))
-            }
-            _ => {
-                let installed = held.ok_or_else(|| {
-                    refused(
-                        "hub_access_absent",
-                        "a release runs with the run's Hub access, and this run carries none",
-                    )
-                })?;
-                let plan = self.configured(actor, &installed, entrypoint, choices, spec.gpus)?;
-                Ok((installed, plan, vec![]))
-            }
-        }
+        let (package, release) = release.unwrap_or_default();
+        let request = Request {
+            run: id.into(),
+            source: hub,
+            package,
+            release,
+            installed: held,
+            owner: spec.owner.clone(),
+            catalog_revision: spec.catalog_revision.clone(),
+            providers: spec.providers.clone(),
+            entrypoint: entrypoint.into(),
+            choices: choices.to_vec(),
+            gpus: spec.gpus,
+            bits,
+            imports: !spec.warm,
+        };
+        let prepared = self
+            .publisher
+            .prepare_now(&self.service, actor, &request, observe, stop)
+            .map_err(|(code, message)| refused(code, message))?;
+        Ok((prepared.installation, prepared.plan, prepared.warnings))
     }
 
     /// A child call of a running attempt: a run `<request>` under its parent's signer,
@@ -1198,10 +1175,8 @@ impl Runs {
                         Ok(held) => {
                             // Its weights come after its root's own, under the child's access.
                             let hub = spec.hub.clone().or_else(|| runs.own_hub.clone());
-                            if let Some(publisher) = &runs.publisher {
-                                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub, root);
-                                gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone(), fetch)
-                            }
+                            let fetch = crate::access::Fetch::new(runs.publisher.machine().clone(), hub, root);
+                            gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone(), fetch)
                         }
                         Err(error) => tracing::warn!("prefetch of {entrypoint}: {error}"),
                     }
@@ -1248,39 +1223,6 @@ impl Runs {
     /// A run ended: its children prepare no more, and its access is forgotten.
     pub fn end(&self, id: &str) {
         self.contexts.lock().unwrap().remove(id);
-    }
-
-    /// Without a Hub, held code's models come from the operator's configured grants.
-    fn configured(
-        &self,
-        actor: &str,
-        installed: &Installation,
-        entrypoint: &str,
-        choices: &[domain::ModelChoice],
-        gpus: u32,
-    ) -> Result<Option<crate::gpu_service::Plan>, Refused> {
-        if !declares_models(installed, entrypoint) {
-            if !choices.is_empty() {
-                return Err(refused(
-                    "invalid_request",
-                    "model choices name no declared model slot",
-                ));
-            }
-            return Ok(None);
-        }
-        let pool = self.service.pool().ok_or_else(|| {
-            refused("capability_unavailable", "this machine runs no functions")
-        })?;
-        let plan = pool
-            .prepare_root(installed, entrypoint, choices, &[], gpus)
-            .map_err(|e| refused("model_preparation_failed", e.to_string()))?;
-        self.service.engine.bind_preparation(Preparation {
-            actor: actor.into(),
-            id: plan.id.clone(),
-            installation: installed.alias.clone(),
-            document: serde_json::to_vec(&plan).map_err(io::Error::other)?,
-        })?;
-        Ok(Some(plan))
     }
 }
 
@@ -1346,7 +1288,7 @@ mod tests {
         let machine = crate::published::tests::Machine::with("acme/pkg", &[("8.9", 24 << 30)], entrypoints, &["bf16"]);
         let store = machine.publisher.store().clone();
         let objects = Arc::new(Objects::new(&machine.root.join("writes"), machine.service.engine.clone()).unwrap());
-        let runs = Runs { service: machine.service.clone(), objects, publisher: Some(machine.publisher.clone()), local: None,
+        let runs = Runs { service: machine.service.clone(), objects, publisher: machine.publisher.clone(), local: None,
             own_hub: None, contexts: Default::default() };
         let mut warm = spec(Source::Models, true, "set");
         (warm.hub, warm.owner, warm.catalog_revision) = (Some(machine.hub.clone()), "acme".into(), "r1".into());
@@ -1363,6 +1305,40 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(60), "generate's model never reached the disk");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// This computer's machine has no Hub of its own, so a script's run may carry no Hub access.
+    /// Its models resolve as a run with access does: a `local/` model it names, the one its slot
+    /// declares as its default, a checkpoint by hash; only a model a Hub names is refused. The
+    /// configured-grant path this replaced failed all three ("no unique configured authority").
+    #[test]
+    fn a_run_without_hub_access_resolves_the_models_its_machine_holds() {
+        use crate::adapter::tests::{checkpoint, f32s};
+        let entrypoints = json!([{"name": "render", "accelerator": false, "models": [
+            {"path": "render.models.source", "class": "M", "weights": true, "default": "local/seed"}]}]);
+        let machine = crate::published::tests::Machine::with("acme/pkg", &[], entrypoints, &[]);
+        let store = machine.publisher.store();
+        let header = checkpoint(store, "seed", "model", &[("weight", vec![4], f32s(4, 3.0))]);
+        crate::storage::set_local(store, "seed", &header, &Default::default()).unwrap();
+        let objects = Arc::new(Objects::new(&machine.root.join("writes"), machine.service.engine.clone()).unwrap());
+        let runs = Runs { service: machine.service.clone(), objects, publisher: machine.publisher.clone(), local: None,
+            own_hub: None, contexts: Default::default() };
+        let call = spec(Source::Installation(machine.installation.alias.clone()), false, "call");
+        let resolve = |choice: Option<domain::ModelChoice>| {
+            let choices: Vec<_> = choice.into_iter().map(|c| domain::ModelChoice { parameter: "source".into(), ..c }).collect();
+            runs.resolve("alice", "call", Some(machine.installation.clone()), None, None, &call, "render", &choices, 0, None, None)
+                .map(|(_, plan, _)| plan.unwrap().sources[0].clone())
+        };
+        let defaulted = resolve(None).unwrap();
+        assert_eq!((defaulted.repository.as_str(), &defaulted.manifest), ("local/seed", &header.id()));
+        let named = resolve(Some(domain::ModelChoice { repository: "local/seed".into(), ..Default::default() })).unwrap();
+        assert_eq!(named.manifest, header.id());
+        let digest = tensorfs::sha256::digest(&store.read(&header).unwrap()).to_vec();
+        let by_hash = domain::ModelChoice { manifest: Some(domain::Ref { digest, length: header.length }), ..Default::default() };
+        assert_eq!(resolve(Some(by_hash)).unwrap().manifest, header.id());
+        let hub_model = domain::ModelChoice { repository: "acme/model".into(), release: "1.0.0".into(), ..Default::default() };
+        assert_eq!(resolve(Some(hub_model)).err().unwrap().code, "hub_access_absent");
+        assert!(machine.heard.lock().unwrap().is_empty(), "a run without Hub access asks no Hub");
     }
 
     #[test]
@@ -1389,7 +1365,7 @@ mod tests {
             hub: String::new(),
         }).unwrap();
         let objects = Arc::new(Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
-        let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
+        let runs = Runs { service: service.clone(), objects, publisher: resolver(&root), local: None,
             own_hub: None, contexts: Default::default() };
         let root_call = spec(Source::Installation("installed".into()), true, "root");
         let refused = runs.prepare("alice", "root", root_call, &runs.service.engine.stoppable("root")).err().unwrap();
@@ -1531,6 +1507,13 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The one resolver over a store of its own under `root`.
+    fn resolver(root: &Path) -> Arc<crate::published::Publisher> {
+        let store = crate::storage::open(&root.join("resolver-store")).unwrap();
+        crate::published::Publisher::new(&root.join("published"), Default::default(),
+            crate::origin::Machine::new(store, None).unwrap()).unwrap()
+    }
+
     /// Runs that install local code with this repository's client and the real uv installer.
     fn local_runs(root: &Path) -> (Arc<Runs>, Arc<Objects>) {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1585,13 +1568,14 @@ mod tests {
                 runtime_build,
             },
         );
+        let publisher = crate::published::Publisher::new(&root.join("published"), Default::default(),
+            crate::origin::Machine::new(store.clone(), None).unwrap()).unwrap();
         let runs = Arc::new(Runs {
             service: service.clone(),
             objects: objects.clone(),
-            publisher: None,
+            publisher,
             local: Some(Arc::new(local)),
             own_hub: None,
-           
             contexts: Default::default(),
         });
         let config = crate::gpu_service::GpuConfig::deviceless(&root.join("home")).unwrap();
@@ -1786,7 +1770,7 @@ mod tests {
                 "application":"callee:app","interface":callee}]
         }).to_string()).unwrap();
         let objects = Arc::new(Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
-        let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
+        let runs = Runs { service: service.clone(), objects, publisher: resolver(&root), local: None,
             own_hub: None, contexts: Default::default() };
         let installed = service.engine.bind_installation(Installation {
             actor:"alice".into(),alias:"caller".into(),generation:generation.clone(),

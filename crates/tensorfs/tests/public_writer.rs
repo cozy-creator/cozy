@@ -148,7 +148,7 @@ async fn public_export_requires_selected_repo_bytes_and_owns_them_after_client_d
     let writer = client(&scratch.0.join("source-cache"), &endpoint);
     let reference: Ref = "acme/tiny".parse().unwrap();
     let tree = writer
-        .upload_folder(&reference, &folder, None)
+        .upload_folder(&reference, &folder, &[], None)
         .await
         .unwrap();
     let reader = client(&scratch.0.join("reader-cache"), &endpoint);
@@ -213,11 +213,11 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     let endpoint = scratch.0.join("endpoint");
     let source = client(&scratch.0.join("source-cache"), &endpoint);
     let first_tree = source
-        .upload_folder(&"acme/first".parse().unwrap(), &first, None)
+        .upload_folder(&"acme/first".parse().unwrap(), &first, &[], None)
         .await
         .unwrap();
     let second_tree = source
-        .upload_folder(&"acme/second".parse().unwrap(), &second, None)
+        .upload_folder(&"acme/second".parse().unwrap(), &second, &[], None)
         .await
         .unwrap();
     let reader = client(&scratch.0.join("reader-cache"), &endpoint);
@@ -251,7 +251,7 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     );
     assert_eq!(
         reader
-            .upload_folder(&"local/roundtrip".parse().unwrap(), &a_folder, None)
+            .upload_folder(&"local/roundtrip".parse().unwrap(), &a_folder, &[], None)
             .await
             .unwrap(),
         *a.tree().unwrap()
@@ -656,7 +656,7 @@ async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_
     let endpoint = scratch.0.join("endpoint");
     let producer = client(&scratch.0.join("source-cache"), &endpoint);
     producer
-        .upload_folder(&"acme/source".parse().unwrap(), &folder, None)
+        .upload_folder(&"acme/source".parse().unwrap(), &folder, &[], None)
         .await
         .unwrap();
     let header = scratch.0.join("only-header.cozytensors");
@@ -988,7 +988,7 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
         .unwrap();
     assert_eq!(fs::read(portable.join("README.md")).unwrap(), README);
     let tree = client
-        .upload_folder(&"local/converted".parse().unwrap(), &portable, None)
+        .upload_folder(&"local/converted".parse().unwrap(), &portable, &[], None)
         .await
         .unwrap();
     assert_eq!(checkpoint.tree(), Some(&tree));
@@ -1261,7 +1261,7 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
         .await
         .unwrap();
     let tree = producer
-        .upload_folder(&"acme/integrity".parse().unwrap(), &folder, None)
+        .upload_folder(&"acme/integrity".parse().unwrap(), &folder, &[], None)
         .await
         .unwrap();
     let cache = scratch.0.join("reader-cache");

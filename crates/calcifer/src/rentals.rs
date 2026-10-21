@@ -350,6 +350,7 @@ impl Machines {
                         let reason = Reason {
                             code: "rental_refused".into(),
                             message: reason,
+                            ..Default::default()
                         };
                         self.calcifer.fail(run, reason).map_err(internal)?;
                     }
@@ -405,6 +406,7 @@ impl Machines {
                             let reason = Reason {
                                 code: "rental_refused".into(),
                                 message: reason.clone(),
+                                ..Default::default()
                             };
                             self.calcifer.fail(run, reason).map_err(internal)?;
                         }
@@ -495,6 +497,7 @@ impl Machines {
                 let reason = Reason {
                     code: error.code,
                     message: error.message,
+                    ..Default::default()
                 };
                 if let Err(e) = me.calcifer.fail(&run.id, reason) {
                     warn!(run = %run.id, "failing it: {e}");

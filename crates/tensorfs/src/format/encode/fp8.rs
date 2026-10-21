@@ -6,8 +6,12 @@ impl Encoding {
     pub fn fp8_tensorwise() -> Encoding {
         encoding("fp8.tensorwise", &[])
     }
-    /// `axis` 0: a scale per row; 1: per column.
-    pub fn fp8_rowwise(axis: u64) -> Encoding {
-        encoding("fp8.rowwise", &[("axis", axis.into())])
+    /// A scale per row.
+    pub fn fp8_rowwise() -> Encoding {
+        encoding("fp8.rowwise", &[])
+    }
+    /// A scale per column.
+    pub fn fp8_columnwise() -> Encoding {
+        encoding("fp8.columnwise", &[])
     }
 }

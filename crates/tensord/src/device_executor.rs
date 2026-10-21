@@ -1149,18 +1149,24 @@ impl Codec {
             output: std::io::BufReader::new(output),
         })
     }
-    fn encode(&self, spool: &Path, reply: &Frame) -> io::Result<PostReply> {
+    /// Encodes `frames` with the SDK's `encode_frame`, each into its owned spool name: the
+    /// media type of each, by handle.
+    fn encode(&self, spool: &Path, frames: &[HostFrame]) -> io::Result<BTreeMap<String, String>> {
         use std::io::BufRead;
+        #[derive(Serialize)]
+        struct Encode<'a> {
+            #[serde(flatten)]
+            frame: &'a HostFrame,
+            name: String,
+        }
+        let frames = (frames.iter())
+            .map(|frame| Ok(Encode { frame, name: spool_name(&frame.handle)? }))
+            .collect::<io::Result<Vec<_>>>()?;
         let mut helper = self.helper.lock().unwrap();
         if helper.is_none() {
             *helper = Some(self.spawn()?);
         }
-        let request = PostRequest {
-            spool,
-            frames: &reply.frames,
-            outputs: &reply.outputs,
-            max_output_bytes: reply.max_output_bytes,
-        };
+        let request = serde_json::json!({"spool": spool, "frames": frames});
         let mut line = serde_json::to_vec(&request)?;
         line.push(b'\n');
         let mut answer = String::new();
@@ -1183,11 +1189,11 @@ impl Codec {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Answer {
-            Done(PostReply),
+            Done { media: BTreeMap<String, String> },
             Refused { error: String },
         }
         match serde_json::from_str::<Answer>(&answer).map_err(io::Error::other)? {
-            Answer::Done(post) => Ok(post),
+            Answer::Done { media } => Ok(media),
             Answer::Refused { error } => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("selected SDK encoder refused: {error}"),
@@ -1204,17 +1210,6 @@ pub struct AssetBinding {
     pub kind: String,
     pub media_type: String,
     pub length: u64,
-}
-#[derive(Debug, Deserialize)]
-struct PostReply {
-    bindings: Vec<AssetBinding>,
-}
-#[derive(Serialize)]
-struct PostRequest<'a> {
-    spool: &'a Path,
-    frames: &'a [HostFrame],
-    outputs: &'a [Output],
-    max_output_bytes: Option<u64>,
 }
 
 /// Rows a run keeps, and the characters of each of their texts.
@@ -1269,14 +1264,16 @@ pub fn postprocess(
         outputs: files,
         ..reply.clone()
     };
-    let mut post = match encode_native(spool, reply)? {
-        Some(bindings) => PostReply { bindings },
-        None => codec.encode(spool, reply)?,
+    // Every frame is encoded by the SDK's one encoder, the one an author's test runs.
+    let media = match reply.frames.is_empty() {
+        true => BTreeMap::new(),
+        false => codec.encode(spool, &reply.frames)?,
     };
+    let mut bindings = bind(spool, reply, &media)?;
     for tree in &trees {
-        post.bindings.push(tree_binding(spool, tree)?);
+        bindings.push(tree_binding(spool, tree)?);
     }
-    Ok((result, post.bindings))
+    Ok((result, bindings))
 }
 /// An output tree as the machine holds it: each regular file of its spool directory linked as
 /// the spool's `sha256-<hex>`, and a manifest naming them by path (`gpu_service::TREE_MEDIA`),
@@ -1300,7 +1297,7 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
                 return Err(invalid("its reference names no spool directory"));
             };
             let directory = format!("tree-{n}");
-            let mut entries = vec![];
+            let mut files = std::collections::BTreeMap::new();
             let mut pending = vec![std::path::PathBuf::new()];
             while let Some(relative) = pending.pop() {
                 for entry in fs::read_dir(spool.join(&directory).join(&relative))? {
@@ -1319,15 +1316,13 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
                         _ => (),
                     }
                     let path = path.to_str().ok_or_else(|| invalid("a path is not UTF-8"))?;
-                    entries.push(serde_json::json!({"kind": "file", "path": path,
-                        "blob": {"sha256": sha, "length": length}}));
+                    files.insert(path.to_owned(), tensorfs::format::ObjectRef { sha256: sha, length });
                 }
             }
-            if entries.is_empty() {
+            if files.is_empty() {
                 return Err(invalid("it holds no file"));
             }
-            entries.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-            let manifest = crate::boundary_json::exact(&serde_json::json!({"entries": entries}));
+            let manifest = crate::trees::document(&files);
             let name = format!("{directory}-manifest");
             fs::write(spool.join(&name), manifest)?;
             name
@@ -1335,15 +1330,14 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
     };
     let mut bytes = Vec::new();
     open_artifact(spool, Path::new(&name))?.read_to_end(&mut bytes)?;
-    let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| invalid("its manifest is not JSON"))?;
+    let files = crate::trees::parse(&bytes).map_err(|e| invalid(&e.to_string()))?;
     let mut content = 0;
-    for entry in manifest["entries"].as_array().ok_or_else(|| invalid("no entries"))? {
-        let member = format!("sha256-{}", entry["blob"]["sha256"].as_str().unwrap_or_default());
-        let length = open_artifact(spool, Path::new(&member))?.metadata()?.len();
-        if length != entry["blob"]["length"].as_u64().unwrap_or(u64::MAX) {
+    for object in files.values() {
+        let member = format!("sha256-{}", object.sha256);
+        if open_artifact(spool, Path::new(&member))?.metadata()?.len() != object.length {
             return Err(invalid("a member differs from its manifest"));
         }
-        content += entry["blob"]["length"].as_u64().unwrap_or_default();
+        content += object.length;
     }
     if output.size_bytes.is_some_and(|size| size != content) {
         return Err(invalid("its files differ from the size the SDK reported"));
@@ -1369,104 +1363,29 @@ impl Write for HashWriter<'_> {
     }
 }
 
-/// A registered image frame's pixel layout: its `mode` fact, RGB when an older SDK sent none.
-fn layout(frame: &HostFrame) -> Option<(u64, png::ColorType, image_webp::ColorType)> {
-    match frame.facts.get("mode").map(Value::as_str) {
-        None | Some(Some("RGB")) => Some((3, png::ColorType::Rgb, image_webp::ColorType::Rgb8)),
-        Some(Some("RGBA")) => Some((4, png::ColorType::Rgba, image_webp::ColorType::Rgba8)),
-        _ => None,
+/// The spool file an output's reference names: a file a child returned, which this run hands
+/// on as its own (`jobs::grant`), else `<kind>-<name>`.
+fn spool_name(reference: &str) -> io::Result<String> {
+    if let Some(hex) = (reference.strip_prefix("sha256:"))
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Ok(format!("sha256-{hex}"));
+    }
+    match reference.rsplitn(3, '/').collect::<Vec<_>>().as_slice() {
+        [name, kind, _] if !name.is_empty() && !name.contains(['/', '\0']) && *name != "." && *name != ".." => {
+            Ok(format!("{kind}-{name}"))
+        }
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "SDK output has no owned spool binding")),
     }
 }
 
-/// Encodes registered PNG/WebP frames in this process exactly as the SDK's post thread
-/// does (lossless RGB or RGBA; PNG at zlib's fastest level, WebP lossless) and binds every
-/// output to its spool file. None when a frame needs a codec or layout only the SDK has.
-fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBinding>>> {
-    let Some(layouts) = reply
-        .frames
-        .iter()
-        .map(|f| matches!(f.codec.as_str(), "png" | "webp").then_some(f).and_then(layout))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Ok(None);
-    };
+/// Binds every output to its spool file, its frames' media types from `media`.
+fn bind(spool: &Path, reply: &Frame, media: &BTreeMap<String, String>) -> io::Result<Vec<AssetBinding>> {
     let invalid = |detail: &str| io::Error::new(io::ErrorKind::InvalidData, detail.to_string());
-    let blob = |reference: &str| -> io::Result<String> {
-        // A file a child returned, which this run hands on as its own (`jobs::grant`).
-        if let Some(hex) = reference.strip_prefix("sha256:").filter(|h| {
-            h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
-        }) {
-            return Ok(format!("sha256-{hex}"));
-        }
-        let tail: Vec<_> = reference.rsplitn(3, '/').collect();
-        match tail.as_slice() {
-            [name, kind, _]
-                if !name.is_empty()
-                    && !name.contains(['/', '\0'])
-                    && *name != "."
-                    && *name != ".." =>
-            {
-                Ok(format!("{kind}-{name}"))
-            }
-            _ => Err(invalid("SDK output has no owned spool binding")),
-        }
-    };
-    let mut media = BTreeMap::new();
-    for (frame, (channels, png_color, webp_color)) in reply.frames.iter().zip(layouts) {
-        let mut raw = Vec::new();
-        open_artifact(spool, Path::new(&frame.raw))?.read_to_end(&mut raw)?;
-        let dimension = |name: &str| {
-            frame
-                .facts
-                .get(name)
-                .and_then(Value::as_u64)
-                .filter(|v| *v > 0 && *v <= u32::MAX as u64)
-                .map(|v| v as u32)
-        };
-        let (Some(width), Some(height)) = (dimension("width"), dimension("height")) else {
-            return Err(invalid("registered frame has no dimensions"));
-        };
-        if raw.len() as u64 != frame.raw_bytes
-            || raw.len() as u64 != width as u64 * height as u64 * channels
-        {
-            return Err(invalid("registered raw frame length changed"));
-        }
-        let mut encoded = Vec::new();
-        if frame.codec == "png" {
-            let mut encoder = png::Encoder::new(&mut encoded, width, height);
-            encoder.set_color(png_color);
-            encoder.set_depth(png::BitDepth::Eight);
-            encoder.set_compression(png::Compression::Fast);
-            encoder
-                .write_header()
-                .and_then(|mut w| w.write_image_data(&raw))
-                .map_err(io::Error::other)?;
-        } else {
-            image_webp::WebPEncoder::new(&mut encoded)
-                .encode(&raw, width, height, webp_color)
-                .map_err(io::Error::other)?;
-        }
-        let name = blob(&frame.handle)?;
-        let temporary = spool.join(format!(".codec-{}", uuid::Uuid::new_v4().simple()));
-        let mut file = platform::durable::open_nofollow(
-            &temporary,
-            OpenOptions::new().write(true).create_new(true).mode(0o600),
-        )?;
-        file.write_all(&encoded)?;
-        fs::rename(&temporary, spool.join(&name))?;
-        media.insert(
-            frame.handle.clone(),
-            if frame.codec == "png" {
-                "image/png"
-            } else {
-                "image/webp"
-            },
-        );
-    }
     let mut total = 0u64;
     let mut bindings = vec![];
     for output in &reply.outputs {
-        let name = blob(&output.asset_ref)?;
+        let name = spool_name(&output.asset_ref)?;
         // Its bytes are read once, by custody; here only their length is bound.
         let length = open_artifact(spool, Path::new(&name))?.metadata()?.len();
         if output.size_bytes.is_some_and(|n| n != length) {
@@ -1483,14 +1402,11 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
             asset_ref: output.asset_ref.clone(),
             name,
             kind: output.kind.clone(),
-            media_type: media
-                .get(&output.asset_ref)
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| output.media_type.clone()),
+            media_type: media.get(&output.asset_ref).unwrap_or(&output.media_type).clone(),
             length,
         });
     }
-    Ok(Some(bindings))
+    Ok(bindings)
 }
 
 impl DeviceExecutor {
@@ -2538,6 +2454,7 @@ mod codec_tests {
                     facts: BTreeMap::from([
                         ("width".into(), 4.into()),
                         ("height".into(), 2.into()),
+                        ("mode".into(), "RGB".into()),
                     ]),
                 }],
                 outputs: vec![Output {
@@ -2550,25 +2467,29 @@ mod codec_tests {
                 ..Default::default()
             }
         };
-        let first = codec.encode(&spool, &reply(1, 24)).unwrap();
+        let encode = |reply: &Frame| {
+            let media = codec.encode(&spool, &reply.frames)?;
+            bind(&spool, reply, &media)
+        };
+        let first = encode(&reply(1, 24)).unwrap();
         let helper = pid(&codec);
-        let second = codec.encode(&spool, &reply(2, 24)).unwrap();
+        let second = encode(&reply(2, 24)).unwrap();
         assert_eq!(
             pid(&codec),
             helper,
             "one encoder process serves the executor's outputs"
         );
-        for (post, name) in [(first, "image-0001"), (second, "image-0002")] {
+        for (bindings, name) in [(first, "image-0001"), (second, "image-0002")] {
             let bytes = fs::read(spool.join(name)).unwrap();
-            assert_eq!(post.bindings[0].name, name);
-            assert_eq!(post.bindings[0].media_type, "image/png");
-            assert_eq!(post.bindings[0].length, bytes.len() as u64);
+            assert_eq!(bindings[0].name, name);
+            assert_eq!(bindings[0].media_type, "image/png");
+            assert_eq!(bindings[0].length, bytes.len() as u64);
             assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         }
         // A refused output is that output's failure; the encoder keeps serving.
-        assert!(codec.encode(&spool, &reply(3, 25)).is_err());
+        assert!(encode(&reply(3, 25)).is_err());
         assert_eq!(pid(&codec), helper);
-        codec.encode(&spool, &reply(4, 24)).unwrap();
+        encode(&reply(4, 24)).unwrap();
         drop(codec);
         fs::remove_dir_all(root).unwrap();
     }

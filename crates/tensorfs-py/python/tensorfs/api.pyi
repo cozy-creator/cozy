@@ -29,10 +29,13 @@ def download_file(repo_id: str, filename: str, *, revision: str | None = None,
                  local_files_only: bool = False, token: Token | None = None,
                  endpoint: str | None = None) -> str: ...
 def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str = "main",
+                  delete_patterns: str | Sequence[str] | None = None,
                   token: Token | None = None, endpoint: str | None = None,
                   cache_dir: StrPath | None = None) -> str:
-    """Makes the folder a commit of `repo_id` and moves tag `revision` to it (a new tag is private,
-    an existing one keeps its flags). The commit's id, `sha256:<tree hex>`."""
+    """Commits the folder's files on top of tag `revision` of `repo_id`, as Hugging Face's
+    `upload_folder`: the tag's other files stay, the paths a `delete_patterns` glob (fnmatch)
+    matches go, and the folder's files are added or replaced. A new tag is private, an existing
+    one keeps its flags. The commit's id, `sha256:<tree hex>`."""
 def convert_to_cozytensors(source: str | Sequence[str], *, converter: str | None = None, source_variant: str | None = None,
             cache_dir: StrPath | None = None, token: Token | None = None,
             progress: Callable[[str, int, int], object] | None = None) -> Checkpoint: ...
@@ -73,8 +76,9 @@ class Writer:
                  token: Token | None = None, cache_dir: StrPath | None = None) -> None:
         """`dest` is a header file, a handle into the shared local store that roots its data while
         it holds this header; `materialize` makes the portable copy. With `repo_id`, `commit()`
-        makes a commit of that repo and moves tag `revision` (default `main`; a new tag is private)
-        to it; `variant` names `model.<variant>.cozytensors` in it. Both need `repo_id`."""
+        commits `model.<variant>.cozytensors` (and its repo files) on top of tag `revision` (default
+        `main`; a new tag is private) of that repo, keeping the tag's other files. Both need
+        `repo_id`."""
     def __enter__(self) -> Writer: ...
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
                  traceback: TracebackType | None) -> None: ...

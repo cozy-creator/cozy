@@ -1,1 +1,5 @@
+<<<<<<<< HEAD:crates/tensorfs/conformance/vectors/store/blobs/55/79/5579cd2f39b2d4f7d6aa5520eebcf23b9198a79a554b1949ff1e19e29d33db5a
 {"files":{"LICENSE":{"length":4,"sha256":"adc37366f403835c1470ab2df93d3837d4719372fc1ef8593d922e06f033f8b2"},"model.all.cozytensors":{"length":2466,"sha256":"f712c78e0aef2f43f2e9d0e3cb60220a28f0ce36a8c59488610c6ebcc069c1b1"}},"format":"cozytensors.tree/1"}
+========
+{"files":{"LICENSE":{"length":4,"sha256":"adc37366f403835c1470ab2df93d3837d4719372fc1ef8593d922e06f033f8b2"},"model.all.cozytensors":{"length":4315,"sha256":"43dcd19f915a098a69f69d5b4ee8d2c7d00ede4587046d2d86c8ff3728cc77f8"}},"format":"cozytensors.tree/1"}
+>>>>>>>> e98e4ed232683ef1cff530c72e94572635152ea5:crates/tensorfs/conformance/vectors/store/blobs/3b/e0/3be052f745dbf1434bd5e89923bede2f361cfcfad1bfaf30acabc98e7ee6101a

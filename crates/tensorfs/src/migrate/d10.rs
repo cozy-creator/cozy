@@ -22,7 +22,7 @@ use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
 use crate::format::decode::{check_metadata, PartMetadata};
 use crate::format::{Body, ClassRef, Component, Config, Header, Metadata, ObjectRef, Repo, Tag, Tensor, Tree, Value, HEADER_PATH, TREE_FORMAT};
-use crate::import::{layout, remote, Versions};
+use crate::import::{layout, lora, remote, Versions};
 use crate::store::Store;
 
 use super::v1;
@@ -172,10 +172,46 @@ const CLASSES: &[(&[&str], &str, [&str; 3])] = &[
     (&["*/minimax-h3-vsa-gate"], "model", ["minimax_h3", "1.43.2", "GateStack"]),
     (&["*/flux-3-klein-upsampler", "*/qwen3.5-9b"], "model", ["transformers", "", "Qwen3_5ForConditionalGeneration"]),
 ];
+/// LoRA lanes' base models, for their adapter configs.
+const LORA_BASES: &[(&[&str], &str)] = &[(&["*/minimax-h3-*"], H3), (&["paul/d1-*"], SDXL)];
+/// The α a LoRA lane lost that its source states: lightx2v's safetensors metadata `alpha` 8
+/// (`*_8step_v1.0*_bf16`, matched to both lanes by tensor bytes).
+const LORA_ALPHA: &[(&str, u64)] = &[("*/minimax-h3-lightx2v-source", 8)];
+
+/// LoRA components (every key a LoRA factor or `.alpha`) in PEFT's spelling, header only: each
+/// one's modules and ranks.
+fn peft(tensors: &mut [(String, Vec<Tensor>)]) -> BTreeMap<String, Vec<(String, u64)>> {
+    let mut out = BTreeMap::new();
+    for (name, ts) in tensors.iter_mut() {
+        let keys: Option<Vec<String>> = ts.iter().map(|t| lora::peft_key(&t.key)).collect();
+        let Some(keys) = keys.filter(|k| k.iter().any(|k| k.ends_with(".lora_A.weight"))) else { continue };
+        let mut modules = Vec::new();
+        for (t, key) in ts.iter_mut().zip(keys) {
+            if let Some(m) = key.strip_suffix(".lora_A.weight") {
+                modules.push((m.to_owned(), t.shape.first().copied().unwrap_or(0)));
+            }
+            t.key = key;
+        }
+        out.insert(name.clone(), modules);
+    }
+    out
+}
 
 /// Releases that become private tags (a public tag is a PEP 440 version): model and version, by
-/// ruling (2026-10-20: an audit artifact). Any other release not a version refuses its repo.
-pub const PRIVATE: &[(&str, &str)] = &[("fidika/minimax-h3-turbo-lora", "1.0.0-audit.1")];
+/// ruling (2026-10-20: audit, proof and recovery artifacts, production's and 8819's). Any other
+/// release not a version refuses its repo.
+pub const PRIVATE: &[(&str, &str)] = &[
+    ("fidika/minimax-h3-turbo-lora", "1.0.0-audit.1"),
+    ("paul/cache-persistence-proof", "0.0.1-cacheproof.20260924"),
+    ("paul/cozy-mixed-input-proof", "0.0.0-rental-audit.20260913"),
+    ("paul/creator-output-b93c35ccecf8c183", "0.0.0-recovery-source-config.20260906"),
+    ("paul/creator-output-b93c35ccecf8c183", "0.0.0-recovery-source.20260906"),
+    ("paul/d1-g5r32-sdxl", "0.0.1-d1"),
+    ("paul/d1-gate5-sdxl", "0.0.1-d1"),
+    ("paul/d1-gate5c-sdxl", "0.0.1-d1"),
+    ("paul/minimax-h3", "1.0.0-h3-audit.1"),
+    ("paul/minimax-h3-turbo-lora", "1.0.0-audit.1"),
+];
 
 /// A repo document before D10, whatever wrote it: 0.12's `releases` of lanes and `checkpoints`
 /// (U11), or `tags` (the Hub's view of a v1 model: a release's `lanes`, an unreleased
@@ -490,7 +526,7 @@ impl<'t> Migrator<'t> {
                 return Ok(Lane { header: None, files, report: json!({"old": manifest.id(), "files_only": true}) });
             }
         }
-        let (chunks, tensors, mut metadata, mut bytes, v1_report) = match v1::manifest(&raw)? {
+        let (chunks, mut tensors, mut metadata, mut bytes, v1_report) = match v1::manifest(&raw)? {
             Some(m) => {
                 let v = v1::lane(&m, &read(&m.header)?)?;
                 let mut bytes = BTreeMap::new();
@@ -522,7 +558,7 @@ impl<'t> Migrator<'t> {
                 }
                 let mut tensors = Vec::new();
                 for c in old.components() {
-                    let ts = c.tensors.iter().cloned().map(|t| part_dtypes(&c.name, t)).collect::<Result<_>>()?;
+                    let ts = c.tensors.iter().cloned().map(|t| d10_encoding(&c.name, t)).collect::<Result<_>>()?;
                     tensors.push((c.name.clone(), ts));
                 }
                 (old.chunks.clone(), tensors, old.metadata.clone(), bytes, None)
@@ -538,16 +574,24 @@ impl<'t> Migrator<'t> {
                 }
             }
         }
+        let adapters = peft(&mut tensors);
         let tensored: Vec<String> = tensors.iter().map(|(name, _)| name.clone()).collect();
         let reference = match upstream {
             Some(u) => self.reference(u.from)?,
             None => Versions::new(),
         };
         let mut l = layout(bytes.clone(), &tensored, &reference)?;
+        let mut classed = Vec::new();
         for f in &mut l.components {
-            if f.class.is_unknown() {
+            if let Some(modules) = adapters.get(&f.name) {
+                let base = LORA_BASES.iter().find(|(m, _)| m.iter().any(|p| matches(p, model))).map(|(_, b)| *b);
+                let alpha = LORA_ALPHA.iter().find(|(p, _)| matches(p, model)).map(|(_, a)| [("lora_alpha".to_owned(), json!(a))].into_iter().collect::<Config>());
+                f.config = lora::adapter_config(modules.iter().cloned(), &BTreeMap::new(), alpha.as_ref(), base);
+                f.config_file = Some(lora::ADAPTER_CONFIG.into());
+            } else if f.class.is_unknown() {
                 if let Some(class) = family_class(model, &f.name, &reference) {
                     f.class = class;
+                    classed.push(f.name.clone());
                 }
             }
         }
@@ -598,6 +642,12 @@ impl<'t> Migrator<'t> {
         }
         if !unwrapped.is_empty() {
             report["unwrapped"] = json!(unwrapped);
+        }
+        if !adapters.is_empty() {
+            report["lora"] = json!(adapters.keys().collect::<Vec<_>>());
+        }
+        if !classed.is_empty() {
+            report["classed"] = json!(classed);
         }
         if let Some(v1) = v1_report {
             report["from_v1"] = v1;
@@ -837,10 +887,29 @@ fn check(chunks: &[ObjectRef], tensors: &[(String, Vec<Tensor>)], new: &Header, 
 /// 0.12's encodings named their scales' dtypes; D10 takes each from its part (owner,
 /// 2026-10-20), and its decoder refuses the params. Each goes once it agrees with its part.
 const DTYPE_PARAMS: [(&str, &str); 2] = [("scale_dtype", "scale"), ("pre_quant_scale_dtype", "pre_quant_scale")];
+/// 0.12 param values D10 renamed, the bytes' meaning unchanged: ConvRot's rotation was always the
+/// Kronecker power of the regular H4, misnamed "hadamard" (3253cbd2e).
+const RENAMED: [(&str, &str, &str, &str); 1] = [("int8.convrot", "rotation", "hadamard", "kron_regular_h4")];
 
-fn part_dtypes(component: &str, mut t: Tensor) -> Result<Tensor> {
+/// A 0.12 tensor's encoding in D10's terms, checked by D10's decoder.
+fn d10_encoding(component: &str, mut t: Tensor) -> Result<Tensor> {
     let Body::Encoded { encoding, parts } = &mut t.body else { return Ok(t) };
     let what = format!("{component}/{}", t.key);
+    for (scheme, key, from, to) in RENAMED {
+        if encoding.scheme == scheme && encoding.params.get(key).and_then(Value::as_str) == Some(from) {
+            encoding.params.insert(key.into(), Value::Str(to.into()));
+        }
+    }
+    // A row's scales are `*.rowwise`, a column's `*.columnwise`: `axis` goes (owner, 2026-10-20).
+    for (rowwise, columnwise) in [("fp8.rowwise", "fp8.columnwise"), ("int8.rowwise", "int8.columnwise")] {
+        if encoding.scheme == rowwise {
+            match encoding.params.remove("axis").map(|a| a.as_u64()) {
+                None | Some(Some(0)) => {}
+                Some(Some(1)) => encoding.scheme = columnwise.into(),
+                Some(axis) => return fail(Kind::Invalid, format!("{what}: {rowwise} axis {axis:?}")),
+            }
+        }
+    }
     for (param, role) in DTYPE_PARAMS {
         let Some(named) = encoding.params.remove(param) else { continue };
         let part = parts.iter().find(|p| p.role == role).map(|p| p.dtype.name());

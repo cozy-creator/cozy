@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 use tensorfs::format::{
-    variant_of, variant_path, Body, ClassRef, Component, Config, ConfigValue, Dtype, Encoding, Header,
-    Location, ObjectRef, Part, Pipeline, Repo, Tensor, Tree, Value, HEADER_PATH,
+    variant_of, variant_path, Body, ClassRef, Component, Config, ConfigValue, Dtype, Encoding,
+    Header, Location, ObjectRef, Part, Pipeline, Repo, Tensor, Tree, Value, HEADER_PATH,
 };
 use tensorfs::writer::{Data, Source, Writer};
 
@@ -33,7 +33,7 @@ fn tensors() -> Vec<Tensor> {
         dtype: Dtype::F32,
         shape: vec![4, 1024],
         body: Body::Encoded {
-            encoding: Encoding::fp8_rowwise(0),
+            encoding: Encoding::fp8_rowwise(),
             parts: vec![
                 part("weight", Dtype::F8_E4M3, vec![4, 1024], 0, 4096, 4096),
                 part("scale", Dtype::F32, vec![4], 1, 0, 16),

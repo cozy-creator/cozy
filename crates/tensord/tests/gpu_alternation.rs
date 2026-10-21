@@ -3,13 +3,20 @@
 //! Hub are not in this path, so it is not ordinary-CLI proof.
 //!
 //! `TENSORD_GPU_ALTERNATION` names a JSON plan: `state`, `store`, `generations`,
-//! `gpu_config`, `actor`, `models: {name: {package, release, entrypoint, input}}`, `order`
+//! `gpu_config`, `actor`, `models: {name: {package, release, generation, models, entrypoint,
+//! input}}` (`generation`: its installed environment; `models`: its slots' choices among the
+//! store's models), `order`
 //! (model names), `output` (JSON lines), and optional `squeeze: {at, start, release}`: before
 //! request `at`, run `start` (a ballast taking device memory while the call runs) and create
 //! `release` once that request ends.
+#[path = "common/held.rs"]
+mod held;
 use tensord::{
+    api::domain::ModelChoice,
     gpu_service::{GpuConfig, Pool},
-    journal::{Preparation, State, SubmissionContext},
+    journal::{State, SubmissionContext},
+    origin::Machine,
+    published::Publisher,
     service::Service,
 };
 use serde::Deserialize;
@@ -27,6 +34,9 @@ use std::{
 struct Model {
     package: String,
     release: String,
+    generation: String,
+    #[serde(default)]
+    models: Vec<ModelChoice>,
     entrypoint: String,
     input: Value,
 }
@@ -56,6 +66,8 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
     let plan: Plan = serde_json::from_reader(File::open(path).unwrap()).unwrap();
     let service = Service::open(&plan.state, &plan.generations, 1).unwrap();
     let store = tensord::storage::open(&plan.store).unwrap();
+    let publisher = Publisher::new(&plan.state.join("published"), Default::default(),
+        Machine::new(store.clone(), None).unwrap()).unwrap();
     let gpu = Pool::new(
         &plan.state.join("gpu"),
         GpuConfig::load(&plan.gpu_config).unwrap(),
@@ -68,22 +80,9 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
     let mut failed = vec![];
     for (n, name) in plan.order.iter().enumerate() {
         let model = &plan.models[name];
-        let installed = gpu
-            .published_installation(&service, &plan.actor, &model.package, &model.release)
-            .unwrap()
-            .expect("published package mapped in the GPU config");
-        let prepared = gpu
-            .prepare_root(&installed, &model.entrypoint, &[], &[], 1)
-            .unwrap();
-        service
-            .engine
-            .bind_preparation(Preparation {
-                actor: plan.actor.clone(),
-                id: prepared.id.clone(),
-                installation: installed.alias.clone(),
-                document: serde_json::to_vec(&prepared).unwrap(),
-            })
-            .unwrap();
+        let named = (model.package.as_str(), model.release.as_str(), model.generation.as_str());
+        let (installed, prepared) =
+            held::prepare(&service, &publisher, &plan.actor, named, &model.entrypoint, &model.models);
         // A unique prompt and seed per request; every other field as the plan states it.
         let mut input = model.input.clone();
         input["prompt"] = json!(format!(

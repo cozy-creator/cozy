@@ -313,16 +313,18 @@ impl PyClient {
         .or_raise(py)
     }
 
-    #[pyo3(signature = (folder_path, repo_id, revision = None))]
+    #[pyo3(signature = (folder_path, repo_id, revision = None, delete_patterns = Vec::new()))]
     fn upload_folder(
         &self,
         py: Python<'_>,
         folder_path: PathBuf,
         repo_id: &str,
         revision: Option<String>,
+        delete_patterns: Vec<String>,
     ) -> PyResult<String> {
         let reference = reference(repo_id, revision, None).or_raise(py)?;
-        py.detach(|| block_on(self.client.upload_folder(&reference, &folder_path, None)))
+        let delete: Vec<&str> = delete_patterns.iter().map(String::as_str).collect();
+        py.detach(|| block_on(self.client.upload_folder(&reference, &folder_path, &delete, None)))
             .map(|tree| tree.id())
             .or_raise(py)
     }

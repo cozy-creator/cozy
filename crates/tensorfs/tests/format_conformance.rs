@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 use tensorfs::format::layout::{self, Item};
 use tensorfs::format::{
-    newest, newest_by, repo_key, Body, ClassRef, Component, Config, Dtype, Encoding, Error, Header, Location, ObjectRef, Part,
-    Pipeline, Repo, Resolution, Tag, Tensor, Tree, HEADER_FORMAT,
+    newest, newest_by, repo_key, Body, ClassRef, Component, Config, Dtype, Encoding, Error, Header,
+    Location, ObjectRef, Part, Pipeline, Repo, Resolution, Tag, Tensor, Tree, HEADER_FORMAT,
 };
 
 #[derive(Deserialize)]

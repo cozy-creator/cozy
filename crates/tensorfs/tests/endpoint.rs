@@ -135,9 +135,12 @@ async fn a_tree_goes_up_to_a_directory_and_down_over_http() {
     let drafted = upload_tree(&endpoint, "acme/tiny", &notes, &source, "main").await.unwrap().repo;
     let tags: Vec<(&str, &ObjectRef, bool)> = drafted.tags.iter().map(|t| (t.name.as_str(), &t.commit, t.public)).collect();
     assert_eq!(tags, [("1.0", &tree, true), ("main", &notes, false)], "a new tag goes last");
-    let moved = upload_tree(&endpoint, "acme/tiny", &notes, &source, "1.0").await.unwrap().repo;
-    let tag = moved.tag("1.0").unwrap();
-    assert_eq!((&tag.commit, tag.public, moved.tags.len()), (&notes, true, 2), "the tag moves and keeps its flags");
+    let moved = upload_tree(&endpoint, "acme/tiny", &notes, &source, "1.0").await.unwrap();
+    let tag = moved.repo.tag("1.0").unwrap();
+    assert_eq!((&tag.commit, tag.public, moved.repo.tags.len()), (&moved.commit, true, 2), "the tag moves and keeps its flags");
+    let mut onto = source.tree(&tree).unwrap();
+    onto.files.insert("README.md".into(), ObjectRef::of(b"notes"));
+    assert_eq!(moved.commit, ObjectRef::of(&onto.to_json().unwrap()), "the notes go on top of 1.0's tree");
     endpoint.update_repo("acme/tiny", |_| Ok(Some(published.clone()))).await.unwrap();
 
     let (_, etag) = endpoint.repo("acme/tiny").await.unwrap().unwrap();

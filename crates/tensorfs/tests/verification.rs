@@ -272,7 +272,7 @@ async fn verification_all_checks_only_the_selected_checkpoint_not_its_repository
     let client = Client::new(config.clone()).unwrap();
     let reference = "local/verify".parse().unwrap();
     let tree = client
-        .upload_folder(&reference, &f.folder, None)
+        .upload_folder(&reference, &f.folder, &[], None)
         .await
         .unwrap();
     let ck = client
@@ -321,7 +321,7 @@ async fn verification_uses_gc_trash_only_after_not_found_and_never_restores_it()
     let client = Client::new(config.clone()).unwrap();
     let reference = "local/trash-check".parse().unwrap();
     let tree = client
-        .upload_folder(&reference, &f.folder, None)
+        .upload_folder(&reference, &f.folder, &[], None)
         .await
         .unwrap();
     let ck = client.open(&tree.id(), &Open::default()).await.unwrap();

@@ -34,10 +34,10 @@ def digest(label: str) -> dict:
 
 
 ENCODINGS = [
-    ["fp8.rowwise", {"axis": 0}],
+    ["fp8.rowwise", {}],
     ["fp8.tensorwise", {}],
     ["int8.convrot", {"rotation": "kron_regular_h4", "rotation_size": 256}],
-    ["int8.rowwise", {"axis": 0}],
+    ["int8.rowwise", {}],
     ["mxfp8", {"block_size": 32, "scale_layout": "row_major"}],
     ["nvfp4", {"block_size": 16, "global_scale": "multiply", "nibble_order": "low_first",
                "scale_layout": "row_major"}],
@@ -262,7 +262,7 @@ def reds() -> dict[str, bytes]:
         "short-root": encode(BASIC[:4]),
         "float-later-field": encode([*BASIC, 1.5]),
         "float-asset-length": encode(edit((*ASSETS, "vocab.json", 1), 1059962.0)),
-        "null-params": encode(edit((2, 0, 1, "axis"), None)),
+        "null-params": encode(edit((2, 2, 1, "rotation"), None)),
         "null-class": encode(edit((*VAE, 1), None)),
         "nan": swap(good, b"\xf9\x70\xe2", b"\xf9\x7e\x00"),
         "infinity": swap(good, b"\xf9\x70\xe2", b"\xf9\x7c\x00"),
@@ -288,7 +288,7 @@ def reds() -> dict[str, bytes]:
         "past-chunks": encode(edit((*VAE, 3, 0, 4), [2, 0, 576])),
         "location-short": encode(edit((*NORM, 4), [1, 4096])),
         "encoding-index": encode(edit((*Q, 3), 8)),
-        "encoding-unused": encode(edit((2, 7), ["fp8.rowwise", {"axis": 1}])),
+        "encoding-unused": encode(edit((2, 7), ["fp8.columnwise", {}])),
         "encoding-repeated": encode(edit((2, 6), ENCODINGS[0])),
         "encoding-first-use": encode(edit((*Q, 3), 2)),
         "scheme-empty": encode(edit((2, 0, 0), "")),
