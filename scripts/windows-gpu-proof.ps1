@@ -121,6 +121,9 @@ Step 'machine facts' {
     $f.os = "$($os.Caption) $($os.Version)"
     $f.cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim()
     $f.elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators')
+    # A consumer's cozy runs in an interactive logon session (1 or more); 0 is the services' session.
+    $f.session_id = (Get-Process -Id $PID).SessionId
+    $f.interactive = [Environment]::UserInteractive
     $f.ram_gb = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
     # \Memory\Committed Bytes and \Memory\Commit Limit, read locale-independently.
     $f.committed_gb = [math]::Round($memory.CommittedBytes / 1GB, 1)
