@@ -160,9 +160,9 @@ pub enum DeviceCommand {
         /// Each constructed slot's checkpoint, so Runtime schedules fetches before it imports.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         constructions: Vec<Construction>,
-        /// One grant per GPU of `devices`, in order, follows the frame (its table, one
-        /// descriptor; the GPU's wake is by name): rank 0 opens its memory with the first and
-        /// hands follower r the r-th (design varena-slim §3).
+        /// One grant per GPU of `devices`, in order, follows the frame (two descriptors: its
+        /// table, then one for its row's lock; the GPU's wake is by name): rank 0 opens its
+        /// memory with the first and hands follower r the r-th (design varena-slim §3).
         #[serde(skip_serializing_if = "is_zero")]
         ledgers: u32,
         memory_mode: MemoryMode,
