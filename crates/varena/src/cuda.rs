@@ -55,6 +55,16 @@ impl Drop for Primary {
     }
 }
 
+/// `SECURITY_ATTRIBUTES` (minwinbase.h): with no descriptor, an exported page's NT handle gets
+/// the creator's default security; it crosses to a peer by `DuplicateHandle`, never by name.
+#[cfg(windows)]
+#[repr(C)]
+struct SecurityAttributes {
+    length: u32,
+    descriptor: *mut c_void,
+    inherit: i32,
+}
+
 /// One CUDA device's VMM mechanism.
 pub struct CudaBackend {
     /// Host registrations (`register_host`) by address. They go before the context does.
@@ -67,12 +77,17 @@ pub struct CudaBackend {
     granularity: u64,
     capacity: u64,
     nvml: Option<platform::gpu::Device>,
-    /// The device's used bytes just before `open` made the context.
-    before: Option<u64>,
+    /// The device's used bytes `open` measured across making the context.
+    context: u64,
+    /// The device page-locks host memory it may only read (attribute 113).
+    read_only_register: bool,
+    /// What `prop`'s WIN32 metadata points at, for as long as pages are created.
+    #[cfg(windows)]
+    _security: Box<SecurityAttributes>,
 }
 
 // SAFETY: driver handles are opaque and every use enters their context; `prop`'s only pointer is
-// the null WIN32 metadata.
+// the WIN32 metadata, owned by the backend and never written.
 unsafe impl Send for CudaBackend {}
 unsafe impl Sync for CudaBackend {}
 
@@ -94,14 +109,44 @@ impl CudaBackend {
         let (_, ctx) = cuda::primary_context(ordinal)?;
         let primary = Primary { device, ctx: ctx as usize };
         let stream = cuda::Stream::new(ordinal)?;
-        let prop = AllocationProp::device(device, HANDLES);
+        // A context that existed before `open` (a framework made it) measures 0 here.
+        let context = used(nvml.as_ref()).zip(before).map_or(0, |(after, before)| after.saturating_sub(before));
+        let read_only_register = cuda::attribute(device, cuda::ATTR_READ_ONLY_HOST_REGISTER_SUPPORTED)? != 0;
+        #[allow(unused_mut)]
+        let mut prop = AllocationProp::device(device, HANDLES);
+        #[cfg(windows)]
+        let security = Box::new(SecurityAttributes { length: std::mem::size_of::<SecurityAttributes>() as u32, descriptor: std::ptr::null_mut(), inherit: 0 });
+        #[cfg(windows)]
+        {
+            prop.win32_handle_meta_data = (&*security as *const SecurityAttributes).cast_mut().cast();
+        }
         let _ctx = primary.enter()?;
         let mut granularity = 0usize;
         call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut granularity, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
         let (mut free, mut total) = (0usize, 0usize);
         call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
         drop(_ctx);
-        Ok(CudaBackend { hosts: Mutex::new(HashMap::new()), ordinal, stream, primary, prop, granularity: granularity as u64, capacity: total as u64, nvml, before })
+        Ok(CudaBackend {
+            hosts: Mutex::new(HashMap::new()),
+            ordinal,
+            stream,
+            primary,
+            prop,
+            granularity: granularity as u64,
+            capacity: total as u64,
+            nvml,
+            context,
+            read_only_register,
+            #[cfg(windows)]
+            _security: security,
+        })
+    }
+
+    /// This process's context as `open` measured it: the device's used bytes across making it.
+    /// Where the driver has no per-process numbers, the context is this and grows by nothing the
+    /// backend can see.
+    pub fn opened_context(&self) -> u64 {
+        self.context
     }
 
     pub fn ordinal(&self) -> i32 {
@@ -169,16 +214,15 @@ impl Backend for CudaBackend {
     }
 
     /// NVML's figure for this pid. Where the driver names no process of ours (WDDM has no
-    /// per-process numbers; a container's pids are the host's), the device's used bytes since
-    /// just before `open` made the context, which also move with other processes.
+    /// per-process numbers; a container whose pids are the host's) there is none: an error, and
+    /// the context stays as `open` measured it (`opened_context`).
     fn process_used(&self) -> Result<u64> {
-        let (Some(nvml), Some(before)) = (&self.nvml, self.before) else {
-            return Err(Error::Io("NVML is unavailable: no process bytes".into()));
-        };
+        let nvml = self.nvml.as_ref().ok_or_else(|| Error::Io("NVML is unavailable: no process bytes".into()))?;
         let reading = nvml.read()?;
-        Ok(match reading.processes.as_ref().and_then(|p| p.get(&std::process::id())) {
-            Some(&bytes) => bytes,
-            None => reading.total.saturating_sub(reading.free).saturating_sub(before),
+        reading.processes.as_ref().and_then(|p| p.get(&std::process::id()).copied()).ok_or_else(|| Error::Device {
+            op: "process_used",
+            code: -1,
+            name: "the driver names no process of ours (WDDM, or another pid namespace)".into(),
         })
     }
 
@@ -328,6 +372,11 @@ impl Backend for CudaBackend {
         Ok(call!("cuStreamWaitEvent", stream_wait_event(stream as CUstream, raw(event), 0))?)
     }
 
+    fn synchronize(&self, stream: usize) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        Ok(call!("cuStreamSynchronize", stream_synchronize(stream as CUstream))?)
+    }
+
     fn retire(&self, event: Event) {
         if event != Event::DONE {
             // An event still pending is freed by the driver once it completes.
@@ -340,13 +389,22 @@ impl Backend for CudaBackend {
         Ok(tensorfs::io::drain(self.ordinal)?)
     }
 
-    /// Read-only (the tier's mapping is), in the primary context, so TensorFS's reads see
-    /// registered memory and copy directly.
+    /// Read-only where the device can (attribute 113), else read-write, which a read-only mapping
+    /// refuses: the caller then stages. A range already registered by another owner is refused,
+    /// never borrowed; one this backend holds stays as it is.
     fn register_host(&self, ptr: u64, len: u64) -> Result<()> {
         let _ctx = self.primary.enter()?;
+        let mut hosts = self.hosts.lock();
+        if hosts.contains_key(&(ptr as usize)) {
+            return Ok(());
+        }
+        // SAFETY: a lookup of the driver's registrations; no memory is touched.
+        if unsafe { cuda::registered(ptr as *const u8) }? {
+            return Err(Error::Invalid(format!("{ptr:#x} is registered by another owner")));
+        }
         // SAFETY: the tier keeps the range mapped until `unregister_host`.
-        let pin = unsafe { cuda::pin_region(ptr as *mut u8, len as usize, true) }?;
-        self.hosts.lock().insert(ptr as usize, pin);
+        let pin = unsafe { cuda::pin_region(ptr as *mut u8, len as usize, self.read_only_register) }?;
+        hosts.insert(ptr as usize, pin);
         Ok(())
     }
 
