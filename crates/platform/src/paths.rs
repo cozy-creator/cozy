@@ -40,8 +40,15 @@ impl Home {
         self.root.join("bin")
     }
 
+    /// Where the installer puts `cozy`.
     pub fn binary(&self) -> PathBuf {
         self.bin().join(exe("cozy"))
+    }
+
+    /// The path of the installed `cozy`, which Calcifer and the machine run, wherever its
+    /// installer put it.
+    pub fn installed(&self) -> PathBuf {
+        self.root.join("installed")
     }
 
     pub fn config(&self) -> PathBuf {
