@@ -350,8 +350,9 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
                 serde_json::from_reader(file).map_err(io::Error::other)?;
             config.as_object_mut().expect("an object").extend(settings);
         }
-        let config: crate::gpu_service::GpuConfig =
-            serde_json::from_value(config).map_err(io::Error::other)?;
+        let config = serde_json::from_value::<crate::gpu_service::GpuConfig>(config)
+            .map_err(io::Error::other)?
+            .checked()?;
         let store = store.clone();
         service.configure_pool(crate::gpu_service::Pool::new(
             &engine.join("gpu"),

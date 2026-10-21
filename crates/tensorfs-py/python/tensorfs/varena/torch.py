@@ -722,7 +722,8 @@ class Memory:
         spread set; one run once takes only free room. Unmeasured, a repeating model stays at
         home and one run once keeps only what is resident. Within a request it never rises.
         Planning cuts only FFN tokens, to the fewest pieces that make a repeating model wholly
-        resident (`cuts.planned`); else it streams. Other cuts in force relax (`cuts.coarser`)
+        resident (`cuts.planned`), else as far as each doubling brings a block home; the rest
+        streams. Other cuts in force relax (`cuts.coarser`)
         whenever the peak the relaxed pass needs (its peak measured uncut, else twice the cut
         one) still leaves the model two streaming slots, and any cut whose peak is no lower
         than whole goes. Measured, a pass's working set gets its room before it runs."""
@@ -757,14 +758,14 @@ class Memory:
             room -= model.reserve
             fits = whole <= room
             if not fits and repeating:
-                cut = cuts.planned(shape, whole - room)
+                saved = cuts.planned(shape, whole - room, max(sizes))
                 ffn = sum(v * shape.scopes[k][0] for k, v in shape.units.items()) if shape else 0
                 mapped, context = spare.mapped, self.context  # what the room leaves out
                 self.noted(4, f"{model.component} short {whole - room} B of resident, "
-                           f"{'cut' if cut else 'uncut'}: {terms} reserve {model.reserve} "
+                           f"ffn cut saves {saved}: {terms} reserve {model.reserve} "
                            f"ffn {ffn} mapped {mapped} context {context}", 0)
-                if cut:
-                    model.reserve, fits = model.reserve - (whole - room), True
+                model.reserve, room = model.reserve - saved, room + saved
+                fits = whole <= room
             want = set(model.order if fits else _spread(model.order, sizes, room - 2 * max(sizes)))
         if self.active:
             want &= model.home
@@ -1406,7 +1407,7 @@ class Memory:
             torch.cuda.synchronize(self.gpu)
             torch._C._cuda_clearCublasWorkspaces()  # cuBLAS keeps one per stream: not the request's
             torch.cuda.empty_cache()
-            if cuts.hosted_end():  # rung 5's page-locked blocks go back to the host
+            if cuts.hosted_end(self.device):  # rung 5's page-locked blocks go back to the host
                 torch.accelerator.empty_host_cache()
             tail = torch.cuda.max_memory_allocated(self.gpu) - request.start
             request.peak = max(request.peak, tail)

@@ -10,7 +10,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use protocol::{calcifer::StagedInput, error::Error, ids::Digest, machine as v1};
+use protocol::{
+    calcifer::{On, StagedInput},
+    error::Error,
+    ids::Digest,
+    machine as v1,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -61,9 +66,10 @@ pub(crate) struct Local {
     _manifest: tempfile::TempDir,
 }
 
-/// `path` (a project directory or a PEP 723 script) as a machine installs it. `in_place`: the
-/// machine is this computer's, which reads the files where they are.
-pub(crate) async fn source(ctx: &Context, path: &Path, in_place: bool) -> Result<Local, Error> {
+/// `path` (a project directory or a PEP 723 script) as the machine `on` installs it. This
+/// computer's machine reads the files where they are; another is sent them.
+pub(crate) async fn source(ctx: &Context, path: &Path, on: &On) -> Result<Local, Error> {
+    let in_place = matches!(on, On::Machine(name) if name.eq_ignore_ascii_case("local"));
     let path = fs::canonicalize(path)
         .map_err(|e| refuse("project_unreadable", format!("{}: {e}", path.display())))?;
     let project_dir = match path.is_file() {
