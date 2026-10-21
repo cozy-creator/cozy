@@ -826,9 +826,15 @@ pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &
         let landed = match rt.block_on(endpoint.put_repo_bytes(name, after.clone(), Some(&etag))) {
             Ok(landed) => landed,
             // A write can land after its answer was given up on (the Hub checks the new commits
-            // before it answers): what the endpoint now holds decides.
+            // before it answers): what the endpoint now holds decides. A landed document is then
+            // written once more, unchanged, under its own ETag: the Hub may have stopped indexing
+            // it when the answer was dropped, and every write indexes (8819: a release's commit
+            // left without its public marks).
             Err(e) => match rt.block_on(endpoint.repo_bytes(name, None))? {
-                Fresh::Doc(now, _) if now == after => {
+                Fresh::Doc(now, etag) if now == after => {
+                    if !rt.block_on(endpoint.put_repo_bytes(name, after.clone(), Some(&etag)))? {
+                        return fail(Kind::Conflict, format!("{name}: changed by another writer after it landed"));
+                    }
                     m.report["landed_late"] = json!(Failure::from(e).detail);
                     true
                 }
