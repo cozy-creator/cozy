@@ -3,13 +3,18 @@
 //! followed run is over once it ended and each output's last revision landed here (checked
 //! against its digest) or failed; an output not saved fails the follow. Ctrl-C stops following
 //! and never cancels: the run is Calcifer's, and `cozy run watch` reattaches.
-use std::{collections::HashSet, fmt::Write as _, process::ExitCode, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    fmt::Write as _,
+    process::ExitCode,
+    time::{Duration, Instant},
+};
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use protocol::{
     calcifer::{
-        Adjustment, Event, Machine, MachineState, OutputItem, Progress, Run, Status, SubmitRun,
-        Submitted,
+        Adjustment, Event, Machine, MachineState, On, OutputItem, Progress, Run, RunQuote, Status,
+        SubmitRun, Submitted,
     },
     error::{Error, Kind},
 };
@@ -21,14 +26,24 @@ use crate::{
     output,
 };
 
-/// Submits under `key`, or a fresh one: one key names one submission forever.
+/// Submits under `key`, or a fresh one: one key names one submission forever. A run that rents
+/// carries the quote its renter agreed to (`machine::agree`).
 pub(crate) async fn submit(
     ctx: &Context,
-    run: SubmitRun,
+    mut run: SubmitRun,
     key: Option<&str>,
 ) -> Result<Submitted, Error> {
     let key = key.map_or_else(mint_key, str::to_owned);
-    let submitted = ctx.calcifer().await?.submit(&key, &run).await?;
+    let calcifer = ctx.calcifer().await?;
+    if matches!(run.on, On::New(_)) && run.agreed.is_none() {
+        let quoted: RunQuote = calcifer.post("/v1/run-quotes", &run, None).await?;
+        let said = crate::machine::price(&quoted.sku, quoted.gpus.unwrap_or(1), &quoted.quote);
+        if !crate::machine::agree(ctx, &said)? {
+            return Err(Error::new(Kind::Usage, "quote_declined", "nothing was rented and the run was not sent"));
+        }
+        run.agreed = Some(quoted.quote.agreed());
+    }
+    let submitted = calcifer.submit(&key, &run).await?;
     if submitted.replay {
         output::say(
             ctx,
@@ -410,6 +425,8 @@ struct View {
     status: Option<Status>,
     /// The output items already named.
     named: HashSet<String>,
+    /// The stage moving bytes, and its last few seconds of (when, bytes moved): its rate.
+    moving: (String, VecDeque<(Instant, u64)>),
 }
 
 impl View {
@@ -433,6 +450,7 @@ impl View {
             waiting: None,
             status: None,
             named: HashSet::new(),
+            moving: (String::new(), VecDeque::new()),
         };
         view.lifecycle(run);
         view
@@ -563,13 +581,21 @@ impl View {
         if progress.total > 0 {
             let _ = write!(text, " {}/{}", progress.completed, progress.total);
         }
-        if progress.bytes_total > 0 {
-            let _ = write!(
-                text,
-                " {}/{}",
-                output::bytes(progress.bytes_done),
-                output::bytes(progress.bytes_total)
-            );
+        // Bytes moved, of how many when that is known, at what rate, and so how long is left:
+        // a download that crawls says so.
+        let (done, total) = (progress.bytes_done, progress.bytes_total);
+        if done > 0 || total > 0 {
+            let _ = write!(text, " {}", output::bytes(done));
+            if total > 0 {
+                let _ = write!(text, "/{}", output::bytes(total));
+            }
+            if let Some(rate) = rate(&mut self.moving, &progress.stage, done, Instant::now()) {
+                let _ = write!(text, " at {}/s", output::bytes(rate as u64));
+                if total > done && rate >= 1.0 {
+                    let left = ((total - done) as f64 / rate) as i64;
+                    let _ = write!(text, ", {} left", output::span(left));
+                }
+            }
         }
         if progress.step_ms > 0.0 {
             let _ = write!(text, " {:.2}s/step", progress.step_ms / 1000.0);
@@ -597,6 +623,22 @@ impl View {
             bar.finish_and_clear();
         }
     }
+}
+
+/// A stage's bytes a second over its last 10 s (and at least its last two counts), once a second
+/// of them is seen. A new stage, or a count that went back, starts again.
+fn rate(moving: &mut (String, VecDeque<(Instant, u64)>), stage: &str, done: u64, now: Instant) -> Option<f64> {
+    let (name, seen) = moving;
+    if name != stage || seen.back().is_some_and(|(_, last)| done < *last) {
+        (*name, *seen) = (stage.to_owned(), VecDeque::new());
+    }
+    seen.push_back((now, done));
+    while seen.len() > 2 && seen.front().is_some_and(|(at, _)| now - *at > Duration::from_secs(10)) {
+        seen.pop_front();
+    }
+    let (at, first) = *seen.front()?;
+    let secs = (now - at).as_secs_f64();
+    (secs >= 1.0).then(|| (done - first) as f64 / secs)
 }
 
 #[cfg(test)]
@@ -633,6 +675,17 @@ mod tests {
             })
             .collect();
         run
+    }
+
+    #[test]
+    fn a_download_says_its_rate() {
+        let (mut moving, t0, mib) = ((String::new(), VecDeque::new()), Instant::now(), 1 << 20);
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert_eq!(rate(&mut moving, "installing", 0, at(0)), None, "no second seen yet");
+        assert_eq!(rate(&mut moving, "installing", 4 * mib, at(2)), Some(2.0 * mib as f64));
+        // Only recent counts count: a crawl after a fast start reads as a crawl.
+        assert_eq!(rate(&mut moving, "installing", 4 * mib + 20, at(22)), Some(1.0));
+        assert_eq!(rate(&mut moving, "loading", 5, at(23)), None, "a new stage starts again");
     }
 
     /// Each output kind's terminal state: a landed file, a lost one and a checkpoint end a

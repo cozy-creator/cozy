@@ -50,6 +50,21 @@ impl Error {
     }
 }
 
+impl Error {
+    /// A call that got no answer, in a person's words: where it went and the innermost cause
+    /// (`dns error: …`, `Connection refused`), not reqwest's "error sending request for url (…)".
+    pub fn unanswered(error: &reqwest::Error) -> Self {
+        let mut cause: &dyn std::error::Error = error;
+        while let Some(next) = cause.source() {
+            cause = next;
+        }
+        Self::Call(match error.url() {
+            Some(url) => format!("no answer from {}: {cause}", url.origin().ascii_serialization()),
+            None => format!("no answer: {cause}"),
+        })
+    }
+}
+
 impl<E: serde::Serialize + std::fmt::Debug> From<progenitor_client::Error<E>> for Error {
     fn from(error: progenitor_client::Error<E>) -> Self {
         if let progenitor_client::Error::ErrorResponse(answer) = &error {
@@ -79,6 +94,7 @@ impl<E: serde::Serialize + std::fmt::Debug> From<progenitor_client::Error<E>> fo
         }
         match error {
             progenitor_client::Error::Custom(why) => Self::Credential(why),
+            progenitor_client::Error::CommunicationError(e) => Self::unanswered(&e),
             other => Self::Call(other.to_string()),
         }
     }

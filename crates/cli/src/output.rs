@@ -201,7 +201,11 @@ pub fn age(at_ms: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
-    let s = (now - at_ms).max(0) / 1000;
+    span((now - at_ms).max(0) / 1000)
+}
+
+/// `s` seconds in their two largest units: `42s`, `3m12s`, `5h3m`, `2d4h`.
+pub fn span(s: i64) -> String {
     match s {
         0..60 => format!("{s}s"),
         60..3600 => format!("{}m{}s", s / 60, s % 60),

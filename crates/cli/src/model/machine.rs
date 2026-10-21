@@ -96,6 +96,7 @@ async fn warm(
         ..Default::default()
     };
     let submit = SubmitRun {
+        agreed: None,
         on: placement.on(),
         hub: ctx.hub()?.origin.into(),
         kind: RunKind::Warm,

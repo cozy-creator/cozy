@@ -209,6 +209,7 @@ async fn a_refreshed_bearer_reaches_the_machine_mid_run() {
         ..Default::default()
     };
     let submit = SubmitRun {
+        agreed: None,
         on: On::Machine("m".into()),
         hub: origin.clone(),
         kind: Kind::Warm,

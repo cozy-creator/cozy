@@ -170,9 +170,6 @@ pub(crate) struct Yank {
 pub(crate) struct Delete {
     /// org/name, or org/name@tag for one tag.
     model: String,
-    /// Confirm: a deletion cannot be undone.
-    #[arg(long)]
-    yes: bool,
 }
 
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {

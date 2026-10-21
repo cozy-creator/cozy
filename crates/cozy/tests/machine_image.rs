@@ -12,7 +12,7 @@ use serde_json::Value;
 
 /// A rental of `cpu` with `extra`, ready: its name, its id, and how `machine list` lists it.
 fn rent(home: &Home, extra: &[&str]) -> (String, String, Value) {
-    let rented = home.cozy(["machine", "rent", "cpu"].iter().chain(extra));
+    let rented = home.cozy(["machine", "rent", "cpu", "--yes"].iter().chain(extra));
     assert_eq!(rented.code, 0, "{rented:?}");
     let name = rented
         .stdout

@@ -13,8 +13,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use platform::paths::Home;
 use protocol::{
     calcifer::{
-        Agreed, Ended, HubListing, HubProblem, Machine, MachineKind, MachineState, Quote, Reason,
-        Rental, Rented, Warning,
+        Agreed, Ended, HubListing, HubProblem, Machine, MachineKind, MachineState, On, Quote,
+        Reason, Rental, Rented, RunQuote, SubmitRun, Warning,
     },
     config,
     error::{Error, Kind},
@@ -465,6 +465,7 @@ impl Machines {
                 let hub = run.hub.as_deref().unwrap_or_default();
                 let shape = Shape {
                     gpus,
+                    agreed: run.agreed,
                     ..Shape::default()
                 };
                 let asked = me.ask_rent(&key, hub, &sku, shape, Some(run.id.clone()));
@@ -505,7 +506,18 @@ impl Machines {
     /// Asks the run's Hub where to run it: the product to rent and its GPU count. The answer is
     /// kept on the run as a warning naming the product, its price and why.
     async fn placed(&self, run: &RunRow) -> Result<(String, Option<u32>), Error> {
-        let spec = &run.spec;
+        let hub = run.hub.as_deref().unwrap_or_default();
+        let (sku, gpus, message) = self.placement(hub, &run.spec).await?;
+        let warning = Warning {
+            code: "placement".into(),
+            message,
+        };
+        self.calcifer.warn(&run.id, &warning).map_err(internal)?;
+        Ok((sku, gpus))
+    }
+
+    /// What `hub` places a run of `spec` on: the product, its GPU count, and why, in words.
+    async fn placement(&self, hub: &str, spec: &v1::RunSpec) -> Result<(String, Option<u32>, String), Error> {
         let Some(v1::Source::Release(release)) = &spec.source else {
             return Err(Error::new(
                 Kind::Usage,
@@ -524,7 +536,6 @@ impl Machines {
                 .map_err(|e| Error::new(Kind::Validation, "bits_invalid", e.to_string()))?,
             gpus: std::num::NonZeroU64::new(spec.gpus.into()),
         };
-        let hub = run.hub.as_deref().unwrap_or_default();
         let client = self.hubs.client(hub)?;
         let placement = match client.place_rental(&request).await {
             Ok(placement) => placement.into_inner(),
@@ -562,12 +573,24 @@ impl Machines {
             placement.weight_bytes / 1_000_000_000,
             placement.bits,
         );
-        let warning = Warning {
-            code: "placement".into(),
-            message,
+        Ok((top.name.clone(), u32::try_from(top.accelerator_count).ok(), message))
+    }
+
+    /// What a `new` run would rent and its price, as `rent_for` would ask it: nothing is rented.
+    pub async fn run_quote(&self, submit: &SubmitRun) -> Result<RunQuote, Error> {
+        let On::New(sku) = &submit.on else {
+            return Err(Error::new(Kind::Usage, "quote_needs_new", "only a run with `--on new` rents"));
         };
-        self.calcifer.warn(&run.id, &warning).map_err(internal)?;
-        Ok((top.name.clone(), u32::try_from(top.accelerator_count).ok()))
+        let gpus = (submit.spec.gpus > 0).then_some(submit.spec.gpus);
+        let (sku, gpus) = match sku {
+            Some(sku) => (sku.clone(), gpus),
+            None => {
+                let (sku, gpus, _) = self.placement(&submit.hub, &submit.spec).await?;
+                (sku, gpus)
+            }
+        };
+        let quote = self.quote(&submit.hub, &sku, Shape { gpus, ..Shape::default() }).await?;
+        Ok(RunQuote { sku, gpus, quote })
     }
 
     /// Asks again what a Calcifer that stopped had asked a Hub and not heard back. A run asked

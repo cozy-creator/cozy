@@ -111,6 +111,7 @@ fn submission(run: &Run, item: &OutputItem, machine: String, destination: &str) 
         ..Default::default()
     };
     SubmitRun {
+        agreed: None,
         on: On::Machine(machine),
         hub: run.hub.clone(),
         kind: RunKind::Warm,

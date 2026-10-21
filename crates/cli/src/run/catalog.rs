@@ -24,6 +24,12 @@ pub struct Card {
 }
 
 impl Card {
+    /// What the package does in a line: its pyproject description, as the Hub read it from the
+    /// release's wheel ("" for a release committed before the Hub kept it).
+    pub fn summary(&self) -> &str {
+        self.document["summary"].as_str().unwrap_or_default()
+    }
+
     /// A callable's request struct as its card spells it, with `accelerator: false` for a CPU
     /// function: what `--describe --json` prints.
     pub fn request(&self, name: &str) -> Value {

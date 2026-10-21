@@ -602,14 +602,19 @@ impl Machines {
         }
     }
 
-    /// Refuses `new` from a computer not signed in to the run's Hub before the run is recorded:
-    /// it could only fail once it was.
+    /// Refuses `new` before the run is recorded from a computer not signed in to the run's Hub
+    /// (it could only fail once it was), and without the quote its renter agreed to.
     pub(crate) fn admit(&self, submit: &SubmitRun) -> Result<(), Error> {
         let signed_out = || {
             config::Origin::parse(&submit.hub).is_ok_and(|hub| self.hubs.client(&hub).is_err())
         };
         match &submit.on {
             On::New(_) if signed_out() => Err(crate::rentals::signed_out(&submit.hub)),
+            On::New(_) if submit.agreed.is_none() => Err(Error::new(
+                Kind::Usage,
+                "quote_unagreed",
+                "a run that rents names the quote its renter agreed to (POST /v1/run-quotes)",
+            )),
             _ => Ok(()),
         }
     }
@@ -861,6 +866,19 @@ pub(crate) async fn quote(
         agreed: None,
     };
     Ok(Json(api.machines.quote(&hub, &sku, shape).await.map_err(Refusal)?))
+}
+
+/// `POST /v1/run-quotes`: what a `new` run (a `SubmitRun`) would rent and its price, from the same
+/// placement its rental asks. Nothing is rented or recorded.
+pub(crate) async fn run_quote(
+    State(api): State<Arc<Api>>,
+    body: Bytes,
+) -> Result<Json<wire::RunQuote>, Refusal> {
+    let submit = parse::<SubmitRun>(&body)?;
+    if config::Origin::parse(&submit.hub).is_ok_and(|hub| api.machines.hubs.client(&hub).is_err()) {
+        return Err(Refusal(crate::rentals::signed_out(&submit.hub)));
+    }
+    Ok(Json(api.machines.run_quote(&submit).await.map_err(Refusal)?))
 }
 
 /// Rents one under the request's `Idempotency-Key` (202, or 200 when the key had), or adds

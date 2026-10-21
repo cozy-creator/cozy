@@ -673,6 +673,7 @@ mod tests {
                 "public",
                 "d",
                 NewRun {
+                    agreed: None,
                     id: RunId::mint([31; 12]),
                     kind: protocol::calcifer::Kind::Call,
                     target: "public/read".into(),
@@ -782,6 +783,7 @@ mod tests {
                 "ordinary",
                 "submission-digest",
                 NewRun {
+                    agreed: None,
                     id: id.clone(),
                     kind: protocol::calcifer::Kind::Call,
                     target: "ordinary/writer".into(),
@@ -961,6 +963,7 @@ mod tests {
                 "warm",
                 "d",
                 NewRun {
+                    agreed: None,
                     id: RunId::mint([23; 12]),
                     kind: protocol::calcifer::Kind::Warm,
                     target: "public/flux/generate".into(),

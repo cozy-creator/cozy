@@ -203,12 +203,29 @@ impl Interface {
         Ok(out)
     }
 
-    /// The public callables' names: GPU functions first (a package's main work, before its
-    /// CPU conversions), each group sorted.
+    /// The public callables' names: the package's own work first (GPU before CPU), then its
+    /// conversions, each group sorted.
     pub fn public(&self) -> Vec<&str> {
         let mut public: Vec<&Callable> = self.callables.iter().filter(|c| !c.internal).collect();
-        public.sort_unstable_by_key(|c| (c.accelerator == Some(false), c.name.as_str()));
+        public.sort_unstable_by_key(|c| (c.is_conversion(), c.accelerator == Some(false), c.name.as_str()));
         public.into_iter().map(|c| c.name.as_str()).collect()
+    }
+}
+
+impl Interface {
+    /// Whether `callable` runs on a GPU: its own body, or the package's internal GPU functions a
+    /// CPU function that loads no model orchestrates (H3's ref2va and long_form). Tensorhub's
+    /// placement (`runplacement`) reads a function the same way.
+    pub fn gpu(&self, callable: &Callable) -> bool {
+        callable.accelerator != Some(false) || self.orchestrates(callable)
+    }
+
+    /// A CPU function that loads no model, in a package with internal GPU functions: it calls them.
+    pub fn orchestrates(&self, callable: &Callable) -> bool {
+        callable.accelerator == Some(false)
+            && callable.models.is_empty()
+            && (self.callables.iter())
+                .any(|c| c.internal && c.accelerator != Some(false) && !c.models.is_empty())
     }
 }
 
@@ -445,6 +462,31 @@ pub(crate) mod tests {
         let echo = &read.callables[0];
         assert!(echo.models.is_empty() && echo.weights_outputs.is_empty() && !echo.is_conversion());
         assert_eq!(echo.field("text").unwrap().wire, Wire::Optional);
+    }
+
+    /// H3's shape: a CPU `render` that loads nothing calls an internal GPU `generate`; it runs on
+    /// a GPU, as Tensorhub places it. A CPU function of a package with no internal GPU one does not.
+    #[test]
+    fn a_cpu_function_that_calls_internal_gpu_ones_runs_on_a_gpu() {
+        let invocable = serde_json::json!({"capabilities": [], "context": "", "defaults": {}, "enum_members": {},
+            "export": "f", "memoize": false, "module": "m", "parameters": [], "type_names": {}});
+        let model = serde_json::json!([{"path": "generate.models.model", "class": "M", "default": "m@1"}]);
+        let entry = |name: &str, extra: Value| {
+            let mut e = serde_json::json!({"name": name, "invocable": invocable, "request": {"fields": []}, "result": {"fields": []}});
+            e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            e
+        };
+        let read = |entrypoints: Vec<Value>| {
+            Interface::parse(&serde_json::json!({"application": "m:app", "format": "cozy.package.interface/1", "entrypoints": entrypoints})).unwrap()
+        };
+        let h3 = read(vec![
+            entry("generate", serde_json::json!({"internal": true, "models": model})),
+            entry("render", serde_json::json!({"accelerator": false})),
+        ]);
+        let render = h3.callables.iter().find(|c| c.name == "render").unwrap();
+        assert!(h3.orchestrates(render) && h3.gpu(render));
+        let plain = read(vec![entry("render", serde_json::json!({"accelerator": false}))]);
+        assert!(!plain.gpu(&plain.callables[0]));
     }
 
     #[test]

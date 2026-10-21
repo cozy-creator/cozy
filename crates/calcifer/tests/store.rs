@@ -24,6 +24,7 @@ fn new_run(n: u8, machine: Option<&str>, pinned: bool) -> NewRun {
         warnings: vec![],
         inputs: vec![],
         wants: None,
+        agreed: None,
     }
 }
 

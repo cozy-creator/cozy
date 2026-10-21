@@ -1113,10 +1113,20 @@ impl Publisher {
         }
         let wheels = dir.join("wheels");
         fs::create_dir_all(&wheels).map_err(io_failure)?;
+        // Bytes as each file lands, of all of them: a person sees an install that crawls.
+        let total: u64 = files.iter().map(|file| file.length).sum();
+        let moved = std::sync::atomic::AtomicU64::new(0);
         std::thread::scope(|scope| {
             let handles: Vec<_> = files
                 .iter()
-                .map(|file| scope.spawn(|| self.hub_wheel(file, source, &wheels, job.stop.as_ref())))
+                .map(|file| {
+                    scope.spawn(|| -> Result<PathBuf, Failure> {
+                        let path = self.hub_wheel(file, source, &wheels, job.stop.as_ref())?;
+                        let landed = moved.fetch_add(file.length, std::sync::atomic::Ordering::Relaxed);
+                        job.bytes(landed + file.length, total);
+                        Ok(path)
+                    })
+                })
                 .collect();
             handles
                 .into_iter()
@@ -1252,8 +1262,11 @@ impl Publisher {
         let mut command = Command::new(&self.sdk.uv);
         command.args(args).env_clear().envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         platform::process::own_group(&mut command);
-        for name in ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG"] {
-            if let Some(value) = protocol::config::environment().get(name) {
+        // Windows spells its names in any case (`Path`), and resolves no host name for a
+        // process without `SystemRoot`; TEMP and TMP are its temporary directory.
+        const KEPT: [&str; 7] = ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG", "SYSTEMROOT", "TEMP", "TMP"];
+        for (name, value) in protocol::config::environment() {
+            if KEPT.iter().any(|kept| kept.eq_ignore_ascii_case(name)) {
                 command.env(name, value);
             }
         }
@@ -2000,6 +2013,8 @@ fn read_lock(pyproject: &str, lock: &str, source: &hub::Source) -> Result<Locked
     struct Lock {
         #[serde(default)]
         package: Vec<Row>,
+        #[serde(default, rename = "supported-markers")]
+        supported: Vec<String>,
     }
     #[derive(serde::Deserialize)]
     struct Row {
@@ -2028,7 +2043,14 @@ fn read_lock(pyproject: &str, lock: &str, source: &hub::Source) -> Result<Locked
     }
     let invalid = |what: &str, e: toml::de::Error| ("package_prepare_lock_invalid", format!("the release's {what} does not parse: {e}"));
     let project = toml::from_str::<Pyproject>(pyproject).map_err(|e| invalid("pyproject.toml", e))?.project.name;
-    let rows = toml::from_str::<Lock>(lock).map_err(|e| invalid("uv.lock", e))?.package;
+    let lock = toml::from_str::<Lock>(lock).map_err(|e| invalid("uv.lock", e))?;
+    // Refused before anything is fetched: a Mac or Windows computer told at once where it runs.
+    if let Some(there) = elsewhere(&lock.supported, uv_platform()) {
+        let here = format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH);
+        return Err(("release_platform_unsupported",
+            format!("this release runs on {there}, not this machine ({here}): `--on new` rents a machine for it")));
+    }
+    let rows = lock.package;
     let mut locked = Locked { distribution: project, ..Default::default() };
     for row in rows {
         let name = normalized(&row.name);
@@ -2043,6 +2065,35 @@ fn read_lock(pyproject: &str, lock: &str, source: &hub::Source) -> Result<Locked
         locked.packages.insert(name, row.version);
     }
     Ok(locked)
+}
+
+/// This machine's `sys_platform`, as a lock's markers spell it.
+fn uv_platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        os => os,
+    }
+}
+
+/// Where a lock's `supported-markers` say it runs, when none of them is `here`'s OS: `Linux
+/// x86_64, Linux aarch64`. A lock without them, or one naming no OS, runs anywhere uv resolves it.
+fn elsewhere(markers: &[String], here: &str) -> Option<String> {
+    let value = |marker: &str, key: &str| Some(marker.split(&format!("{key} == '")).nth(1)?.split('\'').next()?.to_owned());
+    let platforms: Vec<Option<String>> = markers.iter().map(|m| value(m, "sys_platform")).collect();
+    if platforms.is_empty() || platforms.iter().any(|os| os.as_deref().is_none_or(|os| os == here)) {
+        return None;
+    }
+    let named = |marker: &String| {
+        let os = match value(marker, "sys_platform").as_deref() {
+            Some("linux") => "Linux".to_owned(),
+            Some("darwin") => "macOS".to_owned(),
+            Some("win32") => "Windows".to_owned(),
+            os => os.unwrap_or_default().to_owned(),
+        };
+        value(marker, "platform_machine").map_or(os.clone(), |arch| format!("{os} {arch}"))
+    };
+    Some(markers.iter().map(named).collect::<Vec<_>>().join(", "))
 }
 
 /// A lock this machine's platform is outside of, in uv's words: its author's to fix, by adding
@@ -2069,6 +2120,18 @@ pub(crate) mod names_hub;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A release locked for Linux alone tells a Mac or Windows machine where it runs, at once.
+    #[test]
+    fn a_lock_names_where_it_runs_when_it_is_not_here() {
+        let linux = ["platform_machine == 'x86_64' and sys_platform == 'linux'".to_owned(),
+            "platform_machine == 'aarch64' and sys_platform == 'linux'".to_owned()];
+        assert_eq!(elsewhere(&linux, "darwin").as_deref(), Some("Linux x86_64, Linux aarch64"));
+        assert_eq!(elsewhere(&linux, "win32").as_deref(), Some("Linux x86_64, Linux aarch64"));
+        assert_eq!(elsewhere(&linux, "linux"), None);
+        assert_eq!(elsewhere(&[], "darwin"), None, "no markers: anywhere uv resolves it");
+        assert_eq!(elsewhere(&["python_full_version >= '3.12'".to_owned()], "darwin"), None);
+    }
 
     /// A wheel with nothing but its metadata: `name` `version`, requiring `requires`.
     fn tiny_wheel(dir: &Path, name: &str, version: &str, requires: &[&str]) -> PathBuf {
@@ -2443,8 +2506,8 @@ pub(crate) mod tests {
             "updating fidika/minimax-h3 1.40.0 on this machine: Runtime 0.26.3 → 0.26.4");
     }
 
-    /// A machine whose platform the release's lock leaves out is refused as the author's to fix,
-    /// in uv's words. Real uv and lock; no network.
+    /// A machine whose OS the release's lock leaves out is refused before anything is fetched,
+    /// naming where it runs. Real uv and lock; no network.
     #[test]
     fn a_platform_the_lock_leaves_out_is_refused() {
         let root = std::env::temp_dir().join(format!("cm-platform-{}", uuid::Uuid::new_v4()));
@@ -2459,7 +2522,8 @@ pub(crate) mod tests {
         let publisher = Publisher::new(&root.join("published"), sdk, crate::origin::Machine::new(store, None).unwrap()).unwrap();
         let (code, why) = generate(&publisher, &root.join("generations"), "elsewhere", &card(pyproject, lock)).unwrap_err();
         assert_eq!(code, "release_platform_unsupported", "{why}");
-        assert!(why.starts_with("acme/app@1.0 is not locked for this machine") && why.contains(elsewhere), "{why}");
+        let named = if cfg!(target_os = "macos") { "Linux" } else { "macOS" };
+        assert!(why.starts_with(&format!("this release runs on {named}, not this machine")) && why.contains("--on new"), "{why}");
         let _ = fs::remove_dir_all(root);
     }
 

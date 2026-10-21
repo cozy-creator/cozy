@@ -19,9 +19,6 @@ use crate::{Context, machine, output};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// Remove without asking.
-    #[arg(long)]
-    yes: bool,
     /// Remove the machine's model store too.
     #[arg(long)]
     all: bool,
@@ -86,7 +83,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     let rc: Vec<PathBuf> = (rc_files(ctx).into_iter())
         .filter(|file| unsourced(file).is_some())
         .collect();
-    if !args.yes {
+    if !ctx.yes {
         if !ctx.json {
             plan(ctx, &removed, &kept, &rc);
         }

@@ -211,7 +211,7 @@ pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Erro
         _ => return Err(usage("model_ref_invalid", format!("{:?}: delete takes org/name or org/name@tag", args.model))),
     };
     let hub = ctx.hub()?;
-    if !args.yes {
+    if !ctx.yes {
         return Err(usage("model_delete_unconfirmed", format!("deleting {} from {} cannot be undone", args.model, hub.origin))
             .remedy("run it again with --yes"));
     }

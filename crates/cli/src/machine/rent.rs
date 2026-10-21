@@ -28,9 +28,6 @@ pub struct Rent {
     /// Return once the Hub accepts the order, without following the boot.
     #[arg(long, requires = "sku")]
     detach: bool,
-    /// Rent at the Hub's quote without asking: on a terminal it asks first.
-    #[arg(long, short = 'y', requires = "sku")]
-    yes: bool,
     /// Resume this paid order instead of placing a new one.
     #[arg(long, requires = "sku")]
     idempotency_key: Option<String>,
@@ -71,19 +68,13 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         agreed,
     };
     let calcifer = ctx.calcifer().await?;
-    // The Hub's price for exactly this order, before it is placed; a resumed order was agreed.
-    let agreed = match minted {
-        true => {
-            let quote: Quote = calcifer.post("/v1/rental-quotes", &ask(None), None).await?;
-            output::say(ctx, &price(&sku, gpus, &quote));
-            if !(rent.yes || ctx.json || agreed_here()) {
-                output::say(ctx, "nothing was rented");
-                return Ok(ExitCode::SUCCESS);
-            }
-            Some(quote.agreed())
-        }
-        false => None,
-    };
+    // The Hub's price for exactly this order, agreed before it is placed or resumed.
+    let quote: Quote = calcifer.post("/v1/rental-quotes", &ask(None), None).await?;
+    if !agree(ctx, &price(&sku, gpus, &quote))? {
+        output::say(ctx, "nothing was rented");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let agreed = Some(quote.agreed());
     let rented: Rented = match calcifer.post("/v1/machines", &ask(agreed), Some(&key)).await {
         // An answer lost on the way back may still have placed the order: only its key resumes it.
         Err(e) if minted && matches!(e.kind, Kind::Unavailable | Kind::Internal) => {
@@ -94,9 +85,6 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         }
         answer => answer?,
     };
-    if agreed.is_none() {
-        output::say(ctx, &price(&sku, gpus, &rented.quote));
-    }
     let mut notices = Notices::default();
     for note in notices.fresh(&rented.machine) {
         output::say(ctx, note);
@@ -175,7 +163,7 @@ impl Notices {
 
 /// The price the order is held to, in the catalog's terms: $/HOUR (the machine and its disk) and
 /// EXPECTED (the Hub's assumed hours and download, with its traffic).
-fn price(sku: &str, gpus: u32, q: &Quote) -> String {
+pub(crate) fn price(sku: &str, gpus: u32, q: &Quote) -> String {
     let mut line = format!(
         "{sku} ×{gpus}: {}/h ({} GPU + {} for a {} GB disk)",
         usd(q.hourly()),
@@ -194,18 +182,25 @@ fn price(sku: &str, gpus: u32, q: &Quote) -> String {
     )
 }
 
-/// A person's yes to the quote on a terminal; without one, the command is the yes.
-fn agreed_here() -> bool {
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        return true;
+/// The renter's yes to the quote `said`: `--yes`, else a person's on a terminal (a no is `false`).
+/// With neither nothing is rented, and the refusal carries the quote, in text and JSON.
+pub(crate) fn agree(ctx: &Context, said: &str) -> Result<bool, Error> {
+    if ctx.yes {
+        output::say(ctx, said);
+        return Ok(true);
     }
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Err(Error::new(Kind::Usage, "quote_unagreed", format!("{said}; nothing was rented"))
+            .remedy("to rent at this quote, run the same command with --yes"));
+    }
+    anstream::eprintln!("{said}");
     anstream::eprint!("Rent it? [Y/n] ");
     let _ = std::io::stderr().flush();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
+        return Ok(false);
     }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes"))
 }
 
 /// Follows the boot over Calcifer's machine events until the machine is ready, saying the Hub's

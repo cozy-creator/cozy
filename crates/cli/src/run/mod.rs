@@ -401,7 +401,7 @@ async fn call_code(
             if let Some(warning) = bound.warning(&target) {
                 output::warn(&warning);
             }
-            gpuless(ctx, &on, callable, &target, call.bits).await;
+            gpuless(ctx, &on, code.interface, callable, &target, call.bits).await;
             let out = args.out.as_ref().map(|dir| terms.cwd.join(dir));
             (call.spec(&bound)?, Some(bound), out)
         }
@@ -436,8 +436,8 @@ fn terms(ctx: &Context, args: &RunArgs) -> Result<Terms, Error> {
 fn gpu_count(text: &str) -> Result<u32, String> {
     match text.parse::<u32>() {
         Ok(0) => Err(
-            "a run uses the CPU when its function declares accelerator=False or its \
-             machine has no GPU: `--on new:cpu` rents a machine with none"
+            "a function that needs no GPU runs on the CPU by itself, as does every run on a \
+             machine without one: `--on new:cpu` rents a machine with none"
                 .into(),
         ),
         Ok(n) => Ok(n),
@@ -482,9 +482,16 @@ async fn send(ctx: &Context, submission: SubmitRun, key: &str, detach: bool) -> 
 /// Warns that a run sent to a ready machine with no supported GPU runs on its CPU (a GPU
 /// function slowly) and that its models take their 16-bit lanes whatever `--bits` asked (a CPU
 /// runs no 8- or 4-bit format), and how to rent one instead.
-pub(crate) async fn gpuless(ctx: &Context, on: &On, callable: &Callable, target: &str, bits: u32) {
+pub(crate) async fn gpuless(
+    ctx: &Context,
+    on: &On,
+    interface: &Interface,
+    callable: &Callable,
+    target: &str,
+    bits: u32,
+) {
     let On::Machine(name) = on else { return };
-    let (slow, narrow) = (callable.accelerator != Some(false), matches!(bits, 4 | 8));
+    let (slow, narrow) = (interface.gpu(callable), matches!(bits, 4 | 8));
     if !slow && !narrow {
         return;
     }
@@ -615,41 +622,54 @@ fn quoted(input: &str) -> String {
 fn functions(ctx: &Context, package: &str, resolved: &Resolved) {
     let from = resolved.from.to_string();
     let card = &resolved.card;
-    functions_of(ctx, package, &card.release, Some(&from), &card.interface);
+    functions_of(ctx, package, (&card.release, card.summary()), Some(&from), &card.interface);
 }
 
 /// A package's public functions, and where each runs.
 fn functions_of(
     ctx: &Context,
     package: &str,
-    release: &str,
+    (release, summary): (&str, &str),
     from: Option<&str>,
     interface: &Interface,
 ) {
     let public = interface.public();
-    let runs_on = |name: &str| {
-        let cpu = interface
-            .callables
-            .iter()
-            .any(|c| c.name == name && c.accelerator == Some(false));
-        if cpu { "CPU" } else { "GPU" }
+    let callable = |name: &str| interface.callables.iter().find(|c| c.name == name);
+    let runs_on = |name: &str| match callable(name) {
+        Some(c) if interface.orchestrates(c) => "GPU, through its calls",
+        Some(c) if c.accelerator == Some(false) => "CPU",
+        _ => "GPU",
     };
+    let conversion = |name: &&str| callable(name).is_some_and(Callable::is_conversion);
     if ctx.json {
-        let rows: Vec<_> = public
-            .iter()
-            .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name)}))
+        let rows: Vec<_> = (public.iter())
+            .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name), "conversion": conversion(name)}))
             .collect();
         output::json(&serde_json::json!({
-            "package": package, "release": release, "release_from": from, "functions": rows,
+            "package": package, "release": release, "release_from": from, "summary": summary,
+            "functions": rows,
         }));
         return;
     }
+    // Conversions write model lanes: model authors' work, named below the functions a run uses.
+    let (conversions, public): (Vec<&str>, Vec<&str>) = public.iter().copied().partition(conversion);
+    let public = match public.is_empty() {
+        true => conversions.clone(),
+        false => public,
+    };
     let mut table = output::Table::new(ctx, ["FUNCTION", "RUNS ON"]);
     for name in &public {
         table = table.row([*name, runs_on(name)]);
     }
+    if public != conversions && !conversions.is_empty() {
+        table = table.note(format!("for model authors: {} (conversions)", conversions.join(", ")));
+    }
     let from = from.map(|from| format!(" ({from})")).unwrap_or_default();
-    table.note(format!("{package} {release}{from}")).print();
+    let summary = match summary.is_empty() {
+        true => String::new(),
+        false => format!(": {summary}"),
+    };
+    table.note(format!("{package} {release}{from}{summary}")).print();
     let next: Vec<String> = public
         .iter()
         .take(2)
