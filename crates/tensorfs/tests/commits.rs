@@ -4,7 +4,9 @@
 #![cfg(feature = "store")]
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tensorfs::format::{fnmatch, repo_key, ClassRef, Dtype, ObjectRef, Repo, Tree};
@@ -191,3 +193,74 @@ async fn concurrent_commits_to_one_tag_all_land() {
     want.sort();
     assert_eq!(paths(&tree(&endpoint, "acme/many", "main")), want);
 }
+
+/// A real HTTP server over a directory endpoint with one bug: it refuses every repo document
+/// write with `412` while the document stays as it is.
+struct Refusing(Child, String);
+impl Refusing {
+    fn start(root: &Path) -> Self {
+        let script = r#"
+import hashlib, http.server, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def reply(self, status, data=b'', tag=None, length=None):
+        self.send_response(status)
+        self.send_header('Content-Length', str(len(data) if length is None else length))
+        if tag: self.send_header('ETag', tag)
+        self.end_headers()
+        if self.command != 'HEAD': self.wfile.write(data)
+    def do_GET(self):
+        path = root / self.path.lstrip('/')
+        if not path.is_file(): return self.reply(404)
+        data = path.read_bytes()
+        self.reply(200, data, '"sha256:' + hashlib.sha256(data).hexdigest() + '"')
+    def do_HEAD(self):
+        path = root / self.path.lstrip('/')
+        if not path.is_file(): return self.reply(404)
+        self.reply(200, length=path.stat().st_size)
+    def do_PUT(self):
+        data = self.rfile.read(int(self.headers['Content-Length']))
+        if self.path.startswith('/refs/'): return self.reply(412)
+        path = root / self.path.lstrip('/')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        self.reply(201)
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+print(server.server_port, flush=True)
+server.serve_forever()
+"#;
+        let mut child = (Command::new("python3").args(["-u", "-c", script]).arg(root))
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut port = String::new();
+        BufReader::new(child.stdout.take().unwrap()).read_line(&mut port).unwrap();
+        Self(child, format!("http://127.0.0.1:{}", port.trim()))
+    }
+}
+impl Drop for Refusing {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Retries last only while writers make progress: a 412 over a document that has not changed
+/// fails at once, with that reason, and moves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_write_without_progress_fails_with_that_reason() {
+    let scratch = Scratch::new();
+    let root = scratch.0.join("endpoint");
+    let make = client(&scratch.0.join("maker"), &root);
+    write(&make, "acme/stuck", "main", "bf16", b"bf16").await;
+    let at = folder(&make, &scratch.0.join("f"), Some("int8"), b"int8", &[]).await;
+    let before = fs::read(root.join(repo_key("acme/stuck"))).unwrap();
+    let server = Refusing::start(&root);
+    let http = client(&scratch.0.join("cache"), Path::new(&server.1));
+    let main: Ref = "acme/stuck@main".parse().unwrap();
+    let refused = http.upload_folder(&main, &at, &[], None).await.unwrap_err();
+    assert!(refused.detail.contains("no writer made progress"), "{}", refused.detail);
+    assert_eq!(fs::read(root.join(repo_key("acme/stuck"))).unwrap(), before, "nothing moved");
+}
+
