@@ -196,6 +196,11 @@ mod imp {
         }
     }
 
+    /// Every connection the service accepts, for its life.
+    pub(crate) fn incoming(listener: Listener) -> impl Iterator<Item = Stream> {
+        std::iter::repeat_with(move || listener.accept()).filter_map(|c| c.ok().map(|(s, _)| s))
+    }
+
     /// Connects to the service; `None` when nobody serves it.
     pub(crate) fn connect(name: &str) -> Result<Option<Stream>> {
         match UnixStream::connect_addr(&address(name)?) {
@@ -307,7 +312,6 @@ mod imp {
         Err(later())
     }
     pub(crate) fn wait(_: &AtomicU32, _: u32) {}
-    pub(crate) fn wake(_: &AtomicU32) {}
     pub(crate) fn ring(_: &AtomicU32) {}
     pub(crate) fn event() -> Result<Owned> {
         Err(later())
@@ -318,6 +322,9 @@ mod imp {
     }
     pub(crate) fn listen(_: &str) -> Result<Option<Listener>> {
         Err(later())
+    }
+    pub(crate) fn incoming(listener: Listener) -> std::iter::Empty<Stream> {
+        match listener {}
     }
     pub(crate) fn connect(_: &str) -> Result<Option<Stream>> {
         Err(later())

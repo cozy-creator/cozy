@@ -24,6 +24,8 @@ pub enum Pressure {
     Host(platform::contain::host_pressure::Pressure),
     /// A descriptor that turns readable on pressure (an eventfd).
     Events(Owned),
+    /// No event source: only the headroom check at every host decision.
+    Headroom,
 }
 
 const NAME: &str = "tier";
@@ -131,6 +133,9 @@ impl Tier {
     /// Binds the machine's tier name and serves it; `None` when another participant does.
     pub fn serve(pressure: Pressure) -> Result<Option<Tier>> {
         let Some(tier) = Tier::bind()? else { return Ok(None) };
+        if matches!(pressure, Pressure::Headroom) {
+            return Ok(Some(tier));
+        }
         let state = tier.state.clone();
         std::thread::Builder::new()
             .name("varena-pressure".into())
@@ -138,6 +143,7 @@ impl Tier {
                 let woke = match &pressure {
                     Pressure::Host(p) => p.wait().map_err(Error::from),
                     Pressure::Events(e) => os::await_event(e),
+                    Pressure::Headroom => return,
                 };
                 if woke.is_err() {
                     return;
@@ -150,7 +156,6 @@ impl Tier {
         Ok(Some(tier))
     }
 
-    /// Serves without a pressure source: headroom checks only.
     fn bind() -> Result<Option<Tier>> {
         let Some(listener) = os::listen(NAME)? else { return Ok(None) };
         let state = Arc::new((Mutex::new(State::default()), Condvar::new()));
@@ -158,7 +163,7 @@ impl Tier {
         std::thread::Builder::new()
             .name("varena-tier".into())
             .spawn(move || {
-                for stream in listener.incoming().flatten() {
+                for stream in os::incoming(listener) {
                     let s = s.clone();
                     let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s));
                 }
@@ -353,7 +358,7 @@ impl Client {
             let mode = platform::contain::host_pressure::HostMode::Shared;
             service = match platform::contain::host_pressure::Pressure::arm(mode) {
                 Ok(p) => Tier::serve(Pressure::Host(p))?,
-                Err(_) => Tier::bind()?,
+                Err(_) => Tier::serve(Pressure::Headroom)?,
             };
         }
     }

@@ -72,7 +72,7 @@ fn start(gpu: &str, row: Arc<Row>) -> Result<bool> {
     std::thread::Builder::new()
         .name("varena-custody".into())
         .spawn(move || {
-            for stream in listener.incoming().flatten() {
+            for stream in os::incoming(listener) {
                 let (s, r) = (state.clone(), row.clone());
                 let _ = std::thread::Builder::new().name("varena-custody-conn".into()).spawn(move || serve(stream, &s, &r));
             }

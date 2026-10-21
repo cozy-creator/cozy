@@ -60,12 +60,13 @@ struct RowRec {
     pid: AtomicU32,
     /// The ask thread's wait word, rung by askers.
     bell: AtomicU32,
-    /// The askers' wait word, rung by each answer and by a reap.
-    answered: AtomicU32,
-    _pad: u32,
-    /// Asks rung, and the count the ask thread last woke for: rung > ran twice is a stall.
+    _pad: [u32; 2],
+    /// Asks rung, and the ask thread's wakes.
     rung: AtomicU64,
     ran: AtomicU64,
+    /// `ran + 1` as an asker saw it when it rang again and the thread had not run since its
+    /// first ring; the row is stalled while `ran` has not moved past it.
+    suspect: AtomicU64,
     /// Cumulative bytes asked and handled, per ceiling (N, D).
     asked: [AtomicU64; 2],
     handled: [AtomicU64; 2],
@@ -136,8 +137,7 @@ pub(crate) struct RowView {
     pub facts: Facts,
     pub orphans: u64,
     pub want: u64,
-    pub rung: u64,
-    pub ran: u64,
+    pub stalled: bool,
 }
 
 /// The table mapped in this process.
@@ -351,7 +351,7 @@ impl Shared {
         let at = self.alloc(ROW_CELLS, ROW, |m, at| {
             if let Some(r) = row(m, at) {
                 r.pid.store(pid, Relaxed);
-                [&r.rung, &r.ran, &r.freed, &r.orphans, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
+                [&r.rung, &r.ran, &r.suspect, &r.freed, &r.orphans, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
                 r.asked.iter().chain(&r.handled).chain(r.latch.iter().flatten()).for_each(|a| a.store(0, Relaxed));
             }
         })?;
@@ -374,7 +374,9 @@ impl Shared {
             let r = row(m, at)?;
             let facts = Facts::of(latch_read(&r.seq, &r.latch));
             let want = r.asked.iter().zip(&r.handled).map(|(a, h)| a.load(Acquire).saturating_sub(h.load(Acquire))).sum();
-            Some(RowView { off: at, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), want, rung: r.rung.load(Acquire), ran: r.ran.load(Acquire) })
+            let suspect = r.suspect.load(Acquire);
+            let stalled = suspect != 0 && suspect == r.ran.load(Acquire) + 1;
+            Some(RowView { off: at, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), want, stalled })
         })?;
         views.into_iter().map(|mut v| -> Result<RowView> {
             v.live = os::held(&self.fd, v.off, ROW_CELLS * CELL)?;
@@ -388,9 +390,7 @@ impl Shared {
         for r in self.rows()? {
             if !r.live && pid.is_none_or(|p| p == r.pid) {
                 let m = self.map()?;
-                if let Some(rec) = row(&m, r.off) {
-                    os::ring(&rec.answered);
-                }
+                let _ = m;
                 self.free(r.off)?;
                 any = true;
             }
@@ -411,15 +411,34 @@ impl Shared {
         Ok(until)
     }
 
-    /// Waits for the row's answer (its Rust thread, never Python), or its death.
+    /// Waits for the row's answer (its Rust thread, never Python), or its death, woken by any
+    /// ledger event. Each wake without an answer rings again; when the thread has not run
+    /// across two such rings the row is marked, for TensorD's `stalled`.
     pub fn answered(&self, at: u64, ceiling: Class, until: u64) -> Result<u64> {
         let m = self.map()?;
         let r = row(&m, at).ok_or_else(|| Error::Invalid("no such row".into()))?;
         let freed = r.freed.load(Acquire);
-        os::until(&r.answered, || {
+        let mut ran = r.ran.load(Acquire);
+        let (mut woke, mut misses) = (false, 0);
+        os::until(&header(&m).freed, || {
             let done = by_ceiling(&r.handled, ceiling).load(Acquire) >= until || r.word.load(Acquire) & 0xff != READY;
-            let dead = || !os::held(&self.fd, at, ROW_CELLS * CELL).unwrap_or(false);
-            (done || dead()).then_some(())
+            if done || !os::held(&self.fd, at, ROW_CELLS * CELL).unwrap_or(false) {
+                return Some(());
+            }
+            if std::mem::replace(&mut woke, true) {
+                let now = r.ran.load(Acquire);
+                misses = if now == ran { misses + 1 } else { 0 };
+                ran = now;
+                if misses >= 2 {
+                    r.suspect.store(ran + 1, Release);
+                }
+                r.rung.fetch_add(1, AcqRel);
+                os::ring(&r.bell);
+                if let Some(e) = &self.events {
+                    os::signal(e);
+                }
+            }
+            None
         });
         Ok(r.freed.load(Acquire).saturating_sub(freed))
     }
@@ -520,7 +539,7 @@ impl Row {
         let Ok(m) = self.shared.map() else { return vec![] };
         let Some(r) = row(&m, self.at) else { return vec![] };
         os::until(&r.bell, || {
-            r.ran.store(r.rung.load(Acquire), Release);
+            r.ran.fetch_add(1, AcqRel);
             if stop.load(Acquire) {
                 return Some(vec![]);
             }
@@ -541,11 +560,9 @@ impl Row {
         self.rec(|r| {
             r.freed.fetch_add(freed, AcqRel);
             by_ceiling(&r.handled, ceiling).fetch_max(asked, AcqRel);
-            os::ring(&r.answered);
         });
-        if freed > 0 {
-            self.shared.ring();
-        }
+        // Askers wait on the ledger's events.
+        self.shared.ring();
     }
 
     /// Wakes the ask thread (to stop it).
@@ -558,7 +575,6 @@ impl Drop for Row {
     fn drop(&mut self) {
         // A clean exit frees the row now; a killed process leaves it for a reap.
         if self.shared.free(self.at).is_ok() {
-            self.rec(|r| os::ring(&r.answered));
             self.shared.ring();
         }
     }
@@ -744,8 +760,6 @@ pub struct Ledger {
     _row: Arc<Row>,
     events: Owned,
     custody: custody::Client,
-    /// `status`'s last look at each row's asks: a row rung twice at the same count is stalled.
-    looks: Mutex<HashMap<u64, u64>>,
 }
 
 impl Ledger {
@@ -759,7 +773,7 @@ impl Ledger {
         shared.reap(None)?;
         let row = Arc::new(shared.claim(std::process::id())?);
         let custody = custody::Client::open(&shared.name, &row)?;
-        Ok(Ledger { shared, _row: row, events, custody, looks: Mutex::new(HashMap::new()) })
+        Ok(Ledger { shared, _row: row, events, custody })
     }
 
     /// The descriptors executor `pid` opens its memory with.
@@ -855,9 +869,7 @@ impl Ledger {
         let Ok(rows) = self.shared.rows() else { return Status::default() };
         let capacity = self.shared.capacity().unwrap_or(0);
         let foreign = self.shared.foreign().unwrap_or(0);
-        let mut looks = self.looks.lock();
-        let stalled = rows.iter().filter(|r| r.live && r.rung > r.ran && looks.get(&r.off) == Some(&r.rung)).map(|r| r.pid).collect();
-        *looks = rows.iter().filter(|r| r.rung > r.ran).map(|r| (r.off, r.rung)).collect();
+        let stalled = rows.iter().filter(|r| r.live && r.stalled).map(|r| r.pid).collect();
         let dispatched = self.shared.facts("dispatch/").unwrap_or_default();
         Status {
             capacity,
@@ -870,6 +882,12 @@ impl Ledger {
             dispatched: dispatched.into_iter().map(|(k, v)| (k.trim_start_matches("dispatch/").to_string(), String::from_utf8_lossy(&v).into_owned())).collect(),
             stalled,
         }
+    }
+
+    /// Executors whose ask thread did not run when an asker rang it twice: TensorD ends them.
+    /// No side effect: any caller may read it at any time.
+    pub fn stalled(&self) -> Vec<u32> {
+        self.shared.rows().unwrap_or_default().into_iter().filter(|r| r.live && r.stalled).map(|r| r.pid).collect()
     }
 
     /// Readable when room frees, a row dies or a peak is recorded; reading it clears it.
