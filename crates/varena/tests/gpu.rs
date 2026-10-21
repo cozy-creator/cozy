@@ -60,6 +60,20 @@ fn unload(b: &CudaBackend, va: Va, offset: u64, page: Physical) {
     b.destroy(page);
 }
 
+/// The native runner's idle reference: a process with this backend open and nothing to do. The
+/// CPU it uses is what an idle CUDA process uses; a case using no more is stuck.
+#[test]
+#[ignore = "native GPU: the runner's idle reference"]
+fn role_idle() {
+    if role().as_deref() != Some("idle") {
+        return;
+    }
+    let _open = gpu();
+    println!("@ ready");
+    std::io::stdout().flush().unwrap();
+    std::io::stdin().lock().read_to_end(&mut Vec::new()).unwrap();
+}
+
 /// This binary again, running `test` as `role`, with `stdin` (a socket to pass handles on).
 fn child(test: &str, role: &str, stdin: Stdio) -> Child {
     Command::new(std::env::current_exe().unwrap())
