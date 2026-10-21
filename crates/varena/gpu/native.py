@@ -44,9 +44,10 @@ def group_cpu(group: int) -> tuple[int, int]:
     return ns, procs
 
 
-def run_case(program: Path, case: str, log: Path, interval: float | None, idle: int) -> tuple[int, bool]:
+def run_case(program: Path, case: str, log: Path, interval: float | None, idle: int, cancelled) -> tuple[int, bool]:
     """Runs one case to its end or, looked at every `interval`, until two looks in a row find its
-    processes using no more CPU than idle CUDA processes (`idle`'s group) and writing nothing."""
+    processes using no more CPU than idle CUDA processes (`idle`'s group) and writing nothing, or
+    the run is cancelled (killed: its finished cases' logs still land)."""
     with log.open("w") as out:
         proc = subprocess.Popen([str(program), "--ignored", "--exact", case, "--nocapture", "--test-threads=1"],
                                 stdout=out, stderr=subprocess.STDOUT, cwd=program.parent, start_new_session=True)
@@ -60,7 +61,7 @@ def run_case(program: Path, case: str, log: Path, interval: float | None, idle: 
                 if last is not None:
                     busy = used - last[0] > procs * (reference - last[1])
                     still = 0 if busy or size != last[2] else still + 1
-                if still == 2:
+                if still == 2 or cancelled():
                     os.killpg(proc.pid, signal.SIGKILL)
                     return proc.wait(), True
                 last = (used, reference, size)
@@ -91,9 +92,12 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
     passed, failed, stalled, gpus, took = [], [], [], set(), {}
     for case in cases:
         log = logs / f"{case}.log"
-        ctx.log(f"START {case}")
+        if ctx.cancelled:
+            break
+        ctx.log(f"START {case}", level="warn")
         start = time.monotonic()
-        code, stuck = run_case(program, case, log, seconds.get(case) or max(seconds.values(), default=None), idle.pid)
+        code, stuck = run_case(program, case, log, seconds.get(case) or max(seconds.values(), default=None), idle.pid,
+                              lambda: ctx.cancelled)
         took[case] = seconds[case] = round(time.monotonic() - start, 3)
         text = log.read_text(errors="replace")
         summary = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", text)
@@ -104,11 +108,12 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
         (passed if ok else failed).append(case)
         gpus.update(named if ok else [])
         verdict = "PASS" if ok else "STALLED" if stuck else "FAIL"
-        ctx.log(f"{verdict} {case} in {took[case]} s", level="info" if ok else "error")
+        ctx.log(f"{verdict} {case} in {took[case]} s", level="warn" if ok else "error")
     idle.stdin.close()
     idle.wait()
     result = {"label": label, "cases": cases, "passed": passed, "failed": failed, "stalled": stalled,
-              "seconds": took, "gpus": sorted(gpus), "ok": not failed and len(gpus) == 1,
+              "seconds": took, "gpus": sorted(gpus), "ok": not failed and len(gpus) == 1 and not ctx.cancelled,
+              "cancelled": ctx.cancelled,
               "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
     (logs / "result.json").write_text(json.dumps(result, indent=2))
     ctx.log(f"native suite {label}: passed {len(passed)}, failed {failed}, GPUs {sorted(gpus)}")
