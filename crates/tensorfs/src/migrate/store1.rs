@@ -326,7 +326,7 @@ fn prepare(root: &Path, work: &Path, original_format: Option<Vec<u8>>) -> Result
         let bytes = fs::read(&path)?;
         let o = ObjectRef::of(&bytes);
         if path.file_stem().and_then(|n| n.to_str()) != Some(o.sha256.as_str())
-            || super::v1::manifest(&bytes)?.is_none()
+            || (super::v1::files_only(&bytes)?.is_none() && super::v1::manifest(&bytes)?.is_none())
         {
             return invalid(format!(
                 "{} is not a digest-named v1 checkpoint manifest",

@@ -407,6 +407,55 @@ fn a_user_alias_at_the_retention_name_is_never_overwritten() {
 }
 
 #[test]
+fn file_only_and_model_checkpoints_share_the_existing_tree_retention_path() {
+    let scratch = Scratch::new();
+    let root = scratch.0.join("store");
+    corpus(&root);
+    let payload = b"unchanged local document\0\xff";
+    let file = ObjectRef::of(payload);
+    write(
+        &root.join(format!(
+            "blobs/{}/{}/{}",
+            &file.sha256[..2],
+            &file.sha256[2..4],
+            file.sha256
+        )),
+        payload,
+    );
+    let raw = serde_json::to_vec(
+        &json!({"entries":[{"blob":file,"kind":"file","path":"nested/data.bin"}]}),
+    )
+    .unwrap();
+    let manifest = ObjectRef::of(&raw);
+    write(
+        &root.join(format!(
+            "manifests/{}/{}/{}.json",
+            &manifest.sha256[..2],
+            &manifest.sha256[2..4],
+            manifest.sha256
+        )),
+        &raw,
+    );
+    old_repo(&root, "local/files", &manifest, true);
+    let before = snapshot(&root);
+    let upgrade = store1::migrate(&root).unwrap().unwrap();
+    let tree = &upgrade
+        .report
+        .checkpoints
+        .iter()
+        .find(|c| c.manifest == manifest)
+        .unwrap()
+        .tree;
+    let store = Store::open(&root).unwrap().with_grace(Duration::ZERO);
+    store.collect(u64::MAX, Duration::ZERO).unwrap();
+    let tree = store.tree(tree).unwrap();
+    assert_eq!(tree.variants().count(), 0);
+    assert_eq!(tree.files["nested/data.bin"], file);
+    assert_eq!(store.read(&file).unwrap(), payload);
+    assert_preserved(&root, &before);
+}
+
+#[test]
 fn unknown_encoding_keeps_the_original_checkpoint_and_never_cuts_over() {
     let scratch = Scratch::new();
     let root = scratch.0.join("store");
@@ -773,4 +822,128 @@ fn published_0_10_store_converts_and_old_clients_cannot_recreate_manifests() {
         assert_preserved(&root, &before);
         drop(upgrade);
     }
+}
+
+#[test]
+#[ignore = "requires the explicitly supplied published TensorFS 0.10.0 SDK"]
+fn published_0_10_file_only_checkpoint_becomes_an_unchanged_ordinary_tree() {
+    let old = PathBuf::from(std::env::var_os("STORE1_TEST_LEGACY_TFS").expect("supply0.10.0 tfs"));
+    let python = old.parent().unwrap().join("python");
+    let scratch = Scratch::new();
+    let root = scratch.0.join("old-files");
+    let payload = scratch.0.join("payload.bin");
+    let bytes = (0..8193).map(|i| (i * 17 % 251) as u8).collect::<Vec<_>>();
+    fs::write(&payload, &bytes).unwrap();
+    let empty = scratch.0.join("empty.txt");
+    fs::write(&empty, []).unwrap();
+    let result = Command::new(&python).arg("-c").arg(r#"
+import json,sys,tensorfs
+assert tensorfs.__version__ == '0.10.0'
+store=tensorfs.Store.ensure(sys.argv[1])
+entries=[]
+for path,source in [('empty.txt',sys.argv[3]),('nested/payload.bin',sys.argv[2])]:
+    put=store.put_file(source)
+    entries.append({'blob':{'length':put['length'],'sha256':put['id'].removeprefix('sha256:')},'kind':'file','path':path})
+raw=json.dumps({'entries':entries},sort_keys=True,separators=(',',':')).encode()
+made=store.put_manifest(raw)
+print(json.dumps({'length':made['length'],'sha256':made['id'].removeprefix('sha256:')}))
+"#).arg(&root).arg(&payload).arg(&empty).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let manifest: ObjectRef = serde_json::from_slice(&result.stdout).unwrap();
+    let raw = fs::read(root.join(format!(
+        "manifests/{}/{}/{}.json",
+        &manifest.sha256[..2],
+        &manifest.sha256[2..4],
+        manifest.sha256
+    )))
+    .unwrap();
+    let original: Value = serde_json::from_slice(&raw).unwrap();
+    let alias = old_repo(&root, "local/files", &manifest, true);
+    let inspected = Command::new(&old)
+        .args(["repo", "inspect"])
+        .arg(root.join("repos/local/files.json"))
+        .arg("--rows")
+        .arg(scratch.0.join("file-rows.jsonl"))
+        .output()
+        .unwrap();
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let before = snapshot(&root);
+    // The remote model migrator still requires a real header; this extension is offline only.
+    let remote = tensorfs::migrate::d10::Migrator::new(tensorfs::import::Access::default(), &[])
+        .repo(
+            &serde_json::to_vec(&json!({"name":"acme/files","checkpoints":[&manifest]})).unwrap(),
+            &|o| {
+                assert_eq!(o, &manifest);
+                Ok(raw.clone())
+            },
+        )
+        .err()
+        .unwrap();
+    assert!(remote.detail.contains("no header"));
+    let upgrade = store1::migrate(&root).unwrap().unwrap();
+    assert_eq!(upgrade.report.checkpoints.len(), 1);
+    assert_eq!(upgrade.report.checkpoints[0].manifest, manifest);
+    let store = Store::open(&root).unwrap().with_grace(Duration::ZERO);
+    let tree = store.tree(&upgrade.report.checkpoints[0].tree).unwrap();
+    assert_eq!(tree.variants().count(), 0, "a tensor header was fabricated");
+    assert_eq!(tree.files.len(), 2);
+    for e in original["entries"].as_array().unwrap() {
+        let expected: ObjectRef = serde_json::from_value(e["blob"].clone()).unwrap();
+        assert_eq!(tree.files[e["path"].as_str().unwrap()], expected);
+    }
+    store.collect(u64::MAX, Duration::ZERO).unwrap();
+    assert_eq!(
+        store.read(&tree.files["nested/payload.bin"]).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        store.read(&tree.files["empty.txt"]).unwrap(),
+        Vec::<u8>::new()
+    );
+    assert_eq!(
+        fs::read(root.join("repos/local/files.json")).unwrap(),
+        alias
+    );
+    let repo = store.get_ref("local/files").unwrap().unwrap();
+    assert!(repo.tags.iter().all(|t| !t.public));
+    assert_eq!(
+        repo.tag("main").unwrap().commit,
+        upgrade.report.checkpoints[0].tree
+    );
+    let client = tensorfs::Client::new(tensorfs::Config {
+        cache_dir: root.clone(),
+        endpoint: "local".into(),
+        ..tensorfs::Config::from_env()
+    })
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let destination = scratch.0.join("materialized");
+    runtime
+        .block_on(client.materialize(
+            &"local/files@main".parse().unwrap(),
+            &tensorfs::Download::default(),
+            Some(&destination),
+            true,
+        ))
+        .unwrap();
+    assert_eq!(
+        fs::read(destination.join("nested/payload.bin")).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        fs::metadata(destination.join("empty.txt")).unwrap().len(),
+        0
+    );
+    assert_preserved(&root, &before);
 }
