@@ -45,7 +45,7 @@ impl Tensor {
     }
     fn encoded() -> tensorfs::format::Tensor {
         tensorfs::format::Tensor { key: "encoded".into(), dtype: Dtype::F32, shape: vec![4, 1024],
-            body: Body::Encoded { encoding: Encoding::fp8_rowwise(0), parts: vec![
+            body: Body::Encoded { encoding: Encoding::fp8_rowwise(), parts: vec![
                 Part { role: "weight".into(), dtype: Dtype::F8_E4M3, shape: vec![4, 1024], chunk: 0, offset: 4096, length: 4096 },
                 Part { role: "scale".into(), dtype: Dtype::F32, shape: vec![4], chunk: 1, offset: 0, length: 16 },
             ] } }
