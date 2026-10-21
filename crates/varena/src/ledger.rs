@@ -1152,15 +1152,15 @@ impl Ledger {
         &self.events
     }
 
-    pub fn clear_events(&self) {
-        os::wake_clear(&self.events);
+    /// Clears every event so far; true when one came from an accepted user (another user's
+    /// signals are not events).
+    pub fn clear_events(&self) -> bool {
+        os::wake_clear(&self.events)
     }
 
-    /// Blocks until the next event, and clears every one so far.
+    /// Blocks until the next event from an accepted user, and clears every one so far.
     pub fn await_event(&self) -> Result<()> {
-        os::await_event(&self.events)?;
-        os::wake_clear(&self.events);
-        Ok(())
+        os::wake_await(&self.events)
     }
 
     /// A GPU fault or sticky error: the GPU's kept pages go.
@@ -1253,8 +1253,7 @@ mod tests {
         assert!(std::path::Path::new(&path).exists());
         drop(mem);
         while std::path::Path::new(&path).exists() {
-            os::await_event(&wake).unwrap();
-            os::wake_clear(&wake);
+            os::wake_await(&wake).unwrap();
         }
     }
 }

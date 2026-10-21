@@ -13,12 +13,32 @@ use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Nex
 
 const MB: u64 = 1 << 20;
 
-fn open(case: &str, memory: u64) -> (varena::Ledger, Memory, GpuId) {
+fn open(case: &str, memory: u64) -> (Scope, varena::Ledger, Memory, GpuId) {
     let g = GpuId { uuid: format!("m{}-{case}", std::process::id()), model: "host".into(), memory };
+    let _scope = Scope::new(&g.uuid);
+    let scope = Scope::new(&g.uuid);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(memory))).unwrap();
-    (ledger, mem, g)
+    (scope, ledger, mem, g)
 }
+
+/// This binary's namespace for tables and service names (never a machine's), and the test's
+/// table removed when it ends.
+struct Scope(String);
+
+impl Scope {
+    fn new(uuid: &str) -> Scope {
+        assert!(varena::os::namespace(&format!("test{}-", std::process::id())));
+        Scope(uuid.to_string())
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        varena::os::remove_table(&self.0);
+    }
+}
+
 
 fn set(dir: &Path, name: &str, regions: u64, uuid: &str) -> SetSpec {
     let path = dir.join(format!("{name}.bin"));
@@ -62,7 +82,7 @@ fn room(mem: &Memory, id: varena::SetId, name: &str, shape: &str, pages: u64, me
 #[test]
 fn a_new_shape_is_bounded_by_a_measured_one() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("shape", 64 * MB);
+    let (_scope, _l, mem, g) = open("shape", 64 * MB);
     let id = mem.load(set(dir.path(), "s", 1, &g.uuid), Level::Ram).unwrap();
     let pages = REGION_ALIGN;
     // Unmeasured: no room but the largest context growth (none yet).
@@ -75,7 +95,7 @@ fn a_new_shape_is_bounded_by_a_measured_one() {
 #[test]
 fn an_oom_at_a_cut_site_cuts_and_a_collective_one_waits_for_the_next_pass() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("cut", 4 * MB);
+    let (_scope, _l, mem, g) = open("cut", 4 * MB);
     let id = mem.load(set(dir.path(), "c", 2, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", plan("c")).unwrap();
     let pass = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
@@ -106,7 +126,7 @@ fn an_oom_at_a_cut_site_cuts_and_a_collective_one_waits_for_the_next_pass() {
 #[test]
 fn a_late_dropped_pass_leaves_the_next_one() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("late", 16 * MB);
+    let (_scope, _l, mem, g) = open("late", 16 * MB);
     let id = mem.load(set(dir.path(), "l", 2, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/l".into()], passes: 2 }] }).unwrap();
     let first = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
@@ -123,6 +143,7 @@ fn a_late_dropped_pass_leaves_the_next_one() {
 fn a_dropped_custody_holder_leaves_no_zombie_row() {
     let dir = tempfile::tempdir().unwrap();
     let g = GpuId { uuid: format!("m{}-zombie", std::process::id()), model: "host".into(), memory: 16 * MB };
+    let _scope = Scope::new(&g.uuid);
     let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
     mem.load(set(dir.path(), "z", 2, &g.uuid), Level::Gpu).unwrap();
     let ledger = varena::Ledger::create(&g, None).unwrap();
@@ -136,7 +157,7 @@ fn a_dropped_custody_holder_leaves_no_zombie_row() {
 #[test]
 fn orphans_show_as_class_o() {
     let dir = tempfile::tempdir().unwrap();
-    let (ledger, mem, g) = open("orphans", 16 * MB);
+    let (_scope, ledger, mem, g) = open("orphans", 16 * MB);
     mem.load(set(dir.path(), "o", 2, &g.uuid), Level::Gpu).unwrap();
     drop(mem);
     // The custody service sees the connection end on its own thread; it rings the ledger.
@@ -148,7 +169,7 @@ fn orphans_show_as_class_o() {
 /// S5: `fits(package, "")` means the package's widest measured shape.
 #[test]
 fn an_empty_shape_fits_by_the_widest_measured() {
-    let (ledger, mem, _g) = open("widest", 16 * MB);
+    let (_scope, ledger, mem, _g) = open("widest", 16 * MB);
     ledger.restore(&[varena::Peak::Request { key: "pkg|1x1".into(), bytes: 2 * MB }, varena::Peak::Request { key: "pkg|4x4".into(), bytes: 17 * MB }]).unwrap();
     let busy = mem.request("busy", Plan::default()).unwrap();
     assert!(ledger.fits("pkg", "1x1"));
@@ -162,7 +183,7 @@ fn an_empty_shape_fits_by_the_widest_measured() {
 #[test]
 fn a_joint_steps_oom_cuts_only_its_own_sets_site() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("joint", 4 * MB);
+    let (_scope, _l, mem, g) = open("joint", 4 * MB);
     let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
     let b = mem.load(set(dir.path(), "b", 1, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/a".into(), "pkg@1/b".into()], passes: 1 }] }).unwrap();
@@ -184,7 +205,7 @@ fn a_joint_steps_oom_cuts_only_its_own_sets_site() {
 #[test]
 fn rooms_count_what_earlier_steps_left_allocated() {
     let dir = tempfile::tempdir().unwrap();
-    let (ledger, mem, g) = open("units", 16 * MB);
+    let (_scope, ledger, mem, g) = open("units", 16 * MB);
     let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
     let b = mem.load(set(dir.path(), "b", 2, &g.uuid), Level::Ram).unwrap();
     let page = REGION_ALIGN;
@@ -223,7 +244,7 @@ fn rooms_count_what_earlier_steps_left_allocated() {
 #[test]
 fn collective_levels_relax_by_agreement() {
     let dir = tempfile::tempdir().unwrap();
-    let (ledger, mem, g) = open("relax", 16 * MB);
+    let (_scope, ledger, mem, g) = open("relax", 16 * MB);
     let c = mem.load(set(dir.path(), "c", 1, &g.uuid), Level::Ram).unwrap();
     let x = mem.load(set(dir.path(), "x", 4, &g.uuid), Level::Ram).unwrap();
     let ag = |peak| varena::SitePeak { name: "ag".into(), peak, collective: true, finest: 4 };
@@ -268,6 +289,7 @@ fn collective_levels_relax_by_agreement() {
 #[test]
 fn a_restarted_tensord_drops_stale_dispatches() {
     let g = GpuId { uuid: format!("m{}-dispatch", std::process::id()), model: "host".into(), memory: 16 * MB };
+    let _scope = Scope::new(&g.uuid);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     ledger.dispatch("r1", "pkg", "1x1").unwrap();
     assert_eq!(ledger.status().dispatched.len(), 1);
@@ -281,7 +303,7 @@ fn a_restarted_tensord_drops_stale_dispatches() {
 #[test]
 fn rooms_interpolate_within_their_entry() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("entry", 64 * MB);
+    let (_scope, _l, mem, g) = open("entry", 64 * MB);
     let id = mem.load(set(dir.path(), "e", 1, &g.uuid), Level::Ram).unwrap();
     let room = |entry: &str, shape: &str, measured: Option<u64>| {
         let r = mem.request(&format!("{entry}-{shape}"), plan("e")).unwrap();
@@ -303,7 +325,7 @@ fn rooms_interpolate_within_their_entry() {
 #[test]
 fn a_site_at_its_finest_takes_the_next_rung() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("finest", 4 * MB);
+    let (_scope, _l, mem, g) = open("finest", 4 * MB);
     let id = mem.load(set(dir.path(), "f", 2, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", plan("f")).unwrap();
     let _pass = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
@@ -320,7 +342,7 @@ fn a_site_at_its_finest_takes_the_next_rung() {
 #[test]
 fn an_oom_between_passes_evicts_cold_pages() {
     let dir = tempfile::tempdir().unwrap();
-    let (ledger, mem, g) = open("between", 8 * MB);
+    let (_scope, ledger, mem, g) = open("between", 8 * MB);
     let a = mem.load(set(dir.path(), "a", 2, &g.uuid), Level::Ram).unwrap();
     mem.load(set(dir.path(), "n", 1, &g.uuid), Level::Gpu).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/a".into()], passes: 2 }] }).unwrap();
@@ -344,7 +366,7 @@ fn an_oom_between_passes_evicts_cold_pages() {
 #[test]
 fn a_site_outside_any_pass_has_the_requests_memo() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("outside", 4 * MB);
+    let (_scope, _l, mem, g) = open("outside", 4 * MB);
     let id = mem.load(set(dir.path(), "o", 2, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", plan("o")).unwrap();
     let _pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
@@ -363,7 +385,7 @@ fn a_site_outside_any_pass_has_the_requests_memo() {
 #[test]
 fn the_latest_measured_room_wins() {
     let dir = tempfile::tempdir().unwrap();
-    let (ledger, mem, g) = open("latest", 64 * MB);
+    let (_scope, ledger, mem, g) = open("latest", 64 * MB);
     let id = mem.load(set(dir.path(), "l", 1, &g.uuid), Level::Ram).unwrap();
     let pages = REGION_ALIGN;
     room(&mem, id, "l", "1x8", pages, Some(8 * MB));
@@ -386,3 +408,24 @@ fn the_latest_measured_room_wins() {
     assert_eq!(room(&mem, id, "l", "1x8", pages, None), 6 * MB, "this run's measurement is newer");
 }
 
+
+/// The vertical slice: a cold request's record carries the fills of the loads before it, by
+/// source, so its cold cost shows; a warm one after it carries none.
+#[test]
+fn a_cold_requests_record_carries_its_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("loadstats", 16 * MB);
+    let id = mem.load(set(dir.path(), "ls", 2, &g.uuid), Level::Gpu).unwrap();
+    let cold = mem.request("cold", plan("ls")).unwrap();
+    let s = cold.stats();
+    assert_eq!(s.moved.store.bytes, 2 * REGION_ALIGN, "the load's fills, from the store");
+    assert_eq!(s.trace.iter().filter(|r| r.origin == varena::Origin::Store).count(), 2, "{:?}", s.trace);
+    let pass = cold.pass(id, "fwd", "1x8", Torch::default()).unwrap();
+    drop(mem.bind(id, 0, 0).unwrap());
+    drop(pass);
+    let s = cold.end();
+    assert_eq!(s.moved.store.bytes, 2 * REGION_ALIGN);
+    assert_eq!(s.trace.len(), 3, "two load fills and one bind: {:?}", s.trace);
+    let warm = mem.request("warm", plan("ls")).unwrap();
+    assert_eq!(warm.stats().moved.store.bytes, 0, "nothing filled since");
+}

@@ -142,8 +142,10 @@ pub struct StepStats {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Stats {
     pub request: String,
+    /// Every fill since the previous request ended (loads included) and during this one.
     pub moved: Moved,
-    /// One entry per bind.
+    /// One entry per bind, after one per fill made before it opened (its loads: step 0, with
+    /// the fill's origin).
     pub trace: Vec<Ref>,
     pub steps: Vec<StepStats>,
     /// Time binds waited on fills in flight (a demand miss, or a prefetch not yet landed).
@@ -318,7 +320,8 @@ struct State {
     sets: Vec<Option<SetMech>>,
     homes: HashMap<Key, Home>,
     /// Pin → (page, request).
-    pins: HashMap<u64, (Key, Option<u64>)>,
+    /// Pin → (page, request, the thread that holds it).
+    pins: HashMap<u64, (Key, Option<u64>, std::thread::ThreadId)>,
     releasing: BTreeSet<Key>,
     /// Ids and the logical clock.
     clock: u64,
@@ -344,6 +347,8 @@ struct State {
     /// The room each cut configuration failed at.
     failed_at: HashMap<String, u64>,
     stats: HashMap<u64, Stats>,
+    /// Fills no open request made (loads): the next request's record opens with them.
+    unclaimed: Stats,
     last: Option<Stats>,
     /// Passes running, per (request, set): a joint step's sets each have their own.
     active: HashMap<(u64, u32), Active>,
@@ -379,7 +384,7 @@ impl State {
     /// The table's page facts from the mechanism's.
     fn sync(&mut self, key: Key) {
         let home = self.homes.get(&key).map(|h| (h.filled, h.filling, h.speculative, h.exported));
-        let pins: Vec<u64> = self.pins.iter().filter(|(_, (k, _))| *k == key).map(|(id, _)| *id).collect();
+        let pins: Vec<u64> = self.pins.iter().filter(|(_, (k, ..))| *k == key).map(|(id, _)| *id).collect();
         if let Some(p) = self.table.page_mut(key) {
             p.mapped = home.is_some();
             p.filled = home.is_some_and(|h| h.0);
@@ -394,6 +399,19 @@ impl State {
 
     fn stats(&mut self, req: Option<u64>) -> Option<&mut Stats> {
         self.stats.get_mut(&req?)
+    }
+
+    /// Where a fill is recorded: its request's record, else (a load's, or one with no request
+    /// open) the next request's, which opens with them.
+    fn fills(&mut self, req: Option<u64>, key: Key, bytes: u64, origin: Origin) -> &mut Stats {
+        match req.filter(|r| self.stats.contains_key(r)) {
+            Some(r) => self.stats.entry(r).or_default(),
+            None => {
+                let set = self.sets.get(key.0 as usize).and_then(Option::as_ref).map(|m| m.spec.name.clone()).unwrap_or_default();
+                self.unclaimed.trace.push(Ref { step: 0, set, block: key.1, bytes, origin, speculative: false });
+                &mut self.unclaimed
+            }
+        }
     }
 
     fn step_stats(&mut self, req: u64) -> Option<&mut StepStats> {
@@ -972,10 +990,9 @@ impl Inner {
             let gen = st.tick();
             st.homes.insert(key, Home { phys, ready: Event::DONE, gen, filled: true, filling: false, fresh: false, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false });
             st.sync(key);
-            if let Some(s) = st.stats(req) {
-                s.moved.kept.bytes += span;
-                s.moved.kept.ns += start.elapsed().as_nanos() as u64;
-            }
+            let s = st.fills(req, key, span, Origin::Kept);
+            s.moved.kept.bytes += span;
+            s.moved.kept.ns += start.elapsed().as_nanos() as u64;
             adopted += span;
             self.publish(&st);
             self.unlock(st);
@@ -1129,6 +1146,7 @@ impl Inner {
             self.store(&spec.source, &region.items, region.offset, dst)?;
             Ok((Origin::Store, self.backend.fence()?))
         });
+        let mut sticky = false;
         let ns = start.elapsed().as_nanos() as u64;
         let mut st = self.state.lock();
         if st.homes.get(&job.key).is_none_or(|h| h.gen != job.gen) {
@@ -1150,13 +1168,12 @@ impl Inner {
                     h.origin = origin;
                 }
                 st.sync(job.key);
-                if let Some(s) = st.stats(job.req) {
-                    let f = if origin == Origin::Tier { &mut s.moved.tier } else { &mut s.moved.store };
-                    f.bytes += span;
-                    f.ns += ns;
-                    if speculative {
-                        s.moved.speculative += span;
-                    }
+                let s = st.fills(job.req, job.key, span, origin);
+                let f = if origin == Origin::Tier { &mut s.moved.tier } else { &mut s.moved.store };
+                f.bytes += span;
+                f.ns += ns;
+                if speculative {
+                    s.moved.speculative += span;
                 }
                 if stored {
                     self.keep(&mut st, job.key);
@@ -1164,12 +1181,7 @@ impl Inner {
             }
             Err(e) => {
                 tracing::warn!("varena: filling {:?} failed: {e}", job.key);
-                // A sticky error ends the process, and the GPU's kept pages go with it.
-                if e.is_sticky() {
-                    if let Some(c) = &self.custody {
-                        let _ = c.fault();
-                    }
-                }
+                sticky = e.is_sticky();
                 if let Some(h) = st.homes.get_mut(&job.key) {
                     h.filling = false;
                 }
@@ -1183,6 +1195,13 @@ impl Inner {
         self.publish(&st);
         self.unlock(st);
         self.landed.notify_all();
+        // A sticky error ends the process, and the GPU's kept pages go with it (a custody call:
+        // off the state lock).
+        if sticky {
+            if let Some(c) = &self.custody {
+                let _ = c.fault();
+            }
+        }
     }
 
     /// A fill thread's job failed outside its copy (a panic): its page goes, its binder fails.
@@ -1579,7 +1598,9 @@ impl Inner {
             self.shared.put(&key, None)?;
         }
         st.table.requests.push(Req { id: rid, name: id.to_string(), steps, rooms, ..Req::default() });
-        st.stats.insert(rid, Stats { request: id.to_string(), ..Stats::default() });
+        // A cold request's record carries the fills since the last one ended (its loads).
+        let earlier = std::mem::take(&mut st.unclaimed);
+        st.stats.insert(rid, Stats { request: id.to_string(), moved: earlier.moved, trace: earlier.trace, ..Stats::default() });
         self.publish(&st);
         self.unlock(st);
         Ok(rid)
@@ -1600,11 +1621,17 @@ impl Inner {
             }
             let identity = st.mech(set)?.spec.fingerprint.key();
             let pinned = st.table.page(key).is_some_and(|p| !p.pins.is_empty());
+            // Waiting on pins only this thread holds would wait on itself.
+            let me = std::thread::current().id();
+            let mine = pinned && st.pins.values().filter(|(k, ..)| *k == key).all(|(.., t)| *t == me);
             match st.homes.get(&key) {
                 // Not the set's weights now, and unpinned: filled again in place.
                 Some(h) if h.identity != identity && !h.filling && !pinned => {
                     hit = false;
                     self.refill_in_place(&mut st, key, req)?;
+                }
+                Some(h) if (h.identity != identity || h.transforming) && !h.filling && mine => {
+                    return Err(Error::Held(format!("block {block} of set {set} is pinned by this thread alone")));
                 }
                 // Still pinned or filling: its pin's drop or its fill wakes the binder.
                 Some(h) if h.identity != identity => {
@@ -1650,7 +1677,7 @@ impl Inner {
             h.transforming = true;
         }
         let (ready, origin) = (h.ready, if hit { Origin::Hit } else { h.origin });
-        st.pins.insert(id, (key, req));
+        st.pins.insert(id, (key, req, std::thread::current().id()));
         if let Some(p) = st.table.page_mut(key) {
             p.last_use = now;
         }
@@ -2017,7 +2044,7 @@ impl Inner {
         let owned: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name).map(|c| c.id).collect();
         let holding: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name && c.bytes > 0).map(|c| c.id).collect();
         let shrinks: Vec<(u32, u64, Shrink)> = holding.iter().filter_map(|id| st.shrinks.get(id).map(|s| (*id, u64::MAX, s.clone()))).collect();
-        let leftover: u64 = st.pins.values().filter(|(_, r)| *r == Some(req)).filter_map(|(k, _)| st.table.page(*k)).map(|p| p.bytes).sum();
+        let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
         let mut stats = st.stats.remove(&req).unwrap_or_default();
         if let Some(key) = st.peaks.remove(&req) {
             let _ = ledger::record_peak(&self.shared, &key, stats.peak);
