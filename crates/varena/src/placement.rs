@@ -4756,9 +4756,8 @@ mod gpu_tests {
         let events = platform::handles::recv_fd(&control).unwrap();
         let channel = platform::handles::recv_fd(&control).unwrap();
         let requester = Placement::open(0, Some((table, events, channel))).unwrap();
-        requester
-            .begin(1, vec![], "foreign-requester".into(), "shape".into())
-            .unwrap();
+        // A weightless request has an unknown future footprint. Keep this real
+        // row idle while the independent owner warms its fixture weights.
         println!(
             "@ready {} {}",
             std::process::id(),
@@ -4767,6 +4766,12 @@ mod gpu_tests {
         std::io::stdout().flush().unwrap();
         for line in std::io::stdin().lock().lines() {
             match line.unwrap().as_str() {
+                "begin" => {
+                    requester
+                        .begin(1, vec![], "foreign-requester".into(), "shape".into())
+                        .unwrap();
+                    println!("@begun");
+                }
                 "status" => println!(
                     "@status {} {}",
                     requester.available().unwrap(),
@@ -4826,7 +4831,15 @@ mod gpu_tests {
                     None,
                 )
                 .unwrap();
-            owner.load(1, Tier::Gpu).unwrap();
+            assert_eq!(owner.load(1, Tier::Gpu).unwrap(), Relief::Complete);
+            owner
+                .settle()
+                .expect("checked completion of actual warm fills");
+            assert_eq!(
+                owner.resident().unwrap()[0].1,
+                16 * MIB,
+                "the fixture must warm all four real CUDA regions before pressure"
+            );
             let retained = owner.gpu.bind(pages[0], 0).unwrap();
             owner.refresh().unwrap();
             let slack = Arc::new(Mutex::new(Some(
@@ -4851,6 +4864,8 @@ mod gpu_tests {
                 Ok(0)
             }));
             owner.allocator(0, 0, 4 * MIB).unwrap();
+            requester.send("begin");
+            assert_eq!(requester.reply(), "begun");
             let (available, budget) = requester.status();
             assert_eq!(available, 4 * MIB);
             assert_eq!(budget, available);
