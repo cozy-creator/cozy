@@ -141,35 +141,6 @@ impl Feedback {
     }
 }
 
-/// What shared mode leaves the host's other programs beyond their use now: the most they used
-/// recently. Raised to their use at every reading and every stall; each bring-back pass that
-/// found no stall since the previous one halves the excess, so a spike that caused no pressure
-/// (a compile, a browser burst) holds warming back for a few calls, not until a restart.
-/// Measured, never a constant. Dedicated mode leaves nothing.
-#[derive(Debug, Default)]
-pub struct Reserve {
-    peak: u64,
-}
-
-impl Reserve {
-    /// The other programs use `others` bytes now: the bytes discretionary holdings must leave.
-    pub fn observe(&mut self, others: u64) -> u64 {
-        self.peak = self.peak.max(others);
-        self.peak - others
-    }
-
-    /// A bring-back pass with no stall since the last one: the excess halves.
-    pub fn quiet(&mut self, others: u64) {
-        self.peak = others.max(self.peak - self.peak.saturating_sub(others) / 2);
-    }
-}
-
-/// Bytes the host's other programs use: everything in use but what the machine holds.
-pub fn others(host: &super::host_memory::HostMemory, total: u64, ours: u64) -> Option<u64> {
-    let available = u64::try_from(host.mem_available).ok()?;
-    Some(total.saturating_sub(available).saturating_sub(ours))
-}
-
 #[cfg_attr(target_os = "linux", path = "host_pressure_linux.rs")]
 #[cfg_attr(not(target_os = "linux"), path = "host_pressure_unsupported.rs")]
 mod trigger;
