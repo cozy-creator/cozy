@@ -823,7 +823,19 @@ pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &
             return Ok(Done { report: m.report, before, after });
         }
         let sent = rt.block_on(upload(endpoint, &m.objects))?;
-        if rt.block_on(endpoint.put_repo_bytes(name, after.clone(), Some(&etag)))? {
+        let landed = match rt.block_on(endpoint.put_repo_bytes(name, after.clone(), Some(&etag))) {
+            Ok(landed) => landed,
+            // A write can land after its answer was given up on (the Hub checks the new commits
+            // before it answers): what the endpoint now holds decides.
+            Err(e) => match rt.block_on(endpoint.repo_bytes(name, None))? {
+                Fresh::Doc(now, _) if now == after => {
+                    m.report["landed_late"] = json!(Failure::from(e).detail);
+                    true
+                }
+                _ => return Err(e.into()),
+            },
+        };
+        if landed {
             m.report["sent"] = json!({"objects": sent.0, "bytes": sent.1});
             return Ok(Done { report: m.report, before, after });
         }
