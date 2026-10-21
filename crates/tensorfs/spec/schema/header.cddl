@@ -7,17 +7,16 @@
 
 header     = [format: tstr, chunks: [* object], encodings: [* encoding], pipeline: pipeline,
               components: [* component], metadata: {* tstr => value}, * any]
-; format: "cozytensors/1" or "cozytensors/1.<minor>"; a reader takes any minor. A root of
-; exactly five elements is a pre-cut layout, refused as such.
+; format: a writer writes exactly "cozytensors/1"; a reader also takes "cozytensors/1.<minor>".
+; A root of exactly five elements is a pre-cut layout, refused as such.
 
 object     = [sha256: bstr .size 32, length: uint, * any]
 
 encoding   = [scheme: tstr .size (1..), params: {* tstr => value}, * any]
 ; Each distinct [scheme, params] once, in order of first citation. The scheme and its
 ; params define the decode (spec §6): every param the decode reads is required, and a
-; decoder refuses a param it does not know (params are not later fields), and a param that
-; repeats a part's dtype and disagrees with it. A scale whose dtype the scheme leaves free
-; (tensorwise, rowwise, convrot) names it in scale_dtype: "F32", "BF16" or "F16".
+; decoder refuses a param it does not know (params are not later fields). A part's own
+; dtype is authoritative: no param repeats it.
 
 pipeline   = [] / [class: tstr, config: config, * any]
 ; What model_index.json held. class is "<library>.<Class>", or "" when unknown.

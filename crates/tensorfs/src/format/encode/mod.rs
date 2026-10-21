@@ -35,7 +35,10 @@ mod gptq;
 mod bnb;
 
 // comfy
+mod comfy;
 
+pub use comfy::{quantize_with, Kitchen};
+pub use fp8_blockwise::quantize_fp8_blockwise;
 pub use nvfp4::{GlobalScale, NibbleOrder};
 
 /// Every scheme's encoders, one row each.
@@ -82,6 +85,9 @@ pub static ENCODERS: &[&Encoder] = &[
     &bnb::INT8,
 
     // comfy.*
+    &comfy::ASYM_W4A8_INT8,
+    &comfy::W6A8_INT8,
+    &comfy::CONVROT_W4A4,
 ];
 
 /// An encoder: the parts of `input.encoding`, in the scheme's part order.

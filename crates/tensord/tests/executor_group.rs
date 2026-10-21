@@ -80,6 +80,7 @@ fn start(
     generation: &Generation,
 ) -> DeviceCommand {
     DeviceCommand::Start {
+        authorized_device_limit_bytes: None,
         devices: devices.into(),
         application: generation.application.clone(),
         package_interface: root.join("package-interface.json"),
@@ -233,6 +234,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
     let imported = parent
         .command(
             &DeviceCommand::Start {
+                authorized_device_limit_bytes: None,
                 devices: "0".into(),
                 application: generation.application.clone(),
                 package_interface: interface.clone(),
@@ -288,6 +290,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
     let reply = child
         .command(
             &DeviceCommand::Start {
+                authorized_device_limit_bytes: None,
                 devices: "0,1".into(),
                 application: generation.application.clone(),
                 package_interface: interface.clone(),

@@ -10,5 +10,4 @@ uv venv --python 3.12 "$work/venv"
 UV_TORCH_BACKEND=cpu uv pip install --python "$work/venv/bin/python" "$wheel" \
   torch==2.8.0 diffusers==0.35.1 transformers==4.56.1 numpy==2.3.3
 cd "$work"
-venv/bin/python "$here/stub_conform.py"
-venv/bin/python -I "$here/e2e.py" "$work/run"
+venv/bin/python -I "$here/standalone_e2e.py" "$work/run"

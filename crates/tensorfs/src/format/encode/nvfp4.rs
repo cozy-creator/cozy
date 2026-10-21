@@ -4,7 +4,7 @@
 
 use super::affine::pack as pack_words;
 use super::elem::{e2m1, e4m3};
-use super::{Encoder, Input, OwnedPart, encoding};
+use super::{encoding, Encoder, Input, OwnedPart};
 use crate::format::decode::affine::{Codes, Fill, Order, Packing};
 use crate::format::decode::elem::floats;
 use crate::format::decode::grid::Grid;
@@ -53,13 +53,6 @@ impl Encoding {
             ("scale_layout", layout.name().into()),
         ];
         encoding("nvfp4", &p)
-    }
-
-    /// The same encoding with AWQ's `pre_quant_scale`, stored in `dtype`.
-    pub fn with_pre_quant_scale(mut self, dtype: &Dtype) -> Encoding {
-        let key = "pre_quant_scale_dtype".to_string();
-        self.params.insert(key, dtype.name().into());
-        self
     }
 }
 
@@ -118,26 +111,10 @@ fn array(input: &Input, role: &str, dtypes: &[Dtype], count: &[usize]) -> Result
     Ok(Some(floats(a.dtype, a.bytes)))
 }
 
-/// `pre_quant_scale`, there exactly when the encoding names its dtype.
+/// AWQ's `pre_quant_scale`, when given: stored in its own dtype.
 fn pre_quant_scale(input: &Input, v: &View) -> Result<Option<Vec<f32>>> {
-    let dtype = input
-        .encoding
-        .params
-        .get("pre_quant_scale_dtype")
-        .and_then(|d| d.as_str());
-    let p = array(
-        input,
-        "pre_quant_scale",
-        &[Dtype::F32, Dtype::BF16, Dtype::F16],
-        &[v.cols],
-    )?;
-    match (dtype, &p) {
-        (Some(d), Some(_)) if input.arrays["pre_quant_scale"].dtype.name() == d => Ok(p),
-        (None, None) => Ok(None),
-        _ => Err(fail(
-            "pre_quant_scale and the pre_quant_scale_dtype param go together, and agree",
-        )),
-    }
+    let dtypes = [Dtype::F32, Dtype::BF16, Dtype::F16];
+    array(input, "pre_quant_scale", &dtypes, &[v.cols])
 }
 
 /// Round to nearest as ModelOpt 0.47.0 does (`get_weights_scaling_factor_2`,
@@ -297,9 +274,8 @@ fn layout(
             };
             let mut out = vec![0u8; (v.rows / v.n.max(1)) * rows * blocks];
             for (i, row) in scales.chunks_exact(w.max(1)).enumerate() {
-                let base = i / v.n * rows * blocks;
                 for (b, s) in row.iter().enumerate() {
-                    out[base + grid.at(v.n, w, i % v.n, b)] = *s;
+                    out[grid.at(v.rows, w, v.n, i, b)] = *s;
                 }
             }
             ([v.stack, &[rows as u64, blocks as u64]].concat(), out)

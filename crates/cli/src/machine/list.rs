@@ -266,6 +266,13 @@ pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
         }
         fields.push((format!("GPU {}", gpu.index), cell));
     }
+    // Beside each card's own size, so a limited card is not mistaken for a smaller one.
+    let limited: Vec<_> = status.gpus.iter().filter(|g| g.memory_limit_bytes > 0).collect();
+    if let Some(first) = limited.first() {
+        let cards: Vec<String> = limited.iter().map(|g| format!("GPU {}'s {} GiB", g.index, g.memory_bytes >> 30)).collect();
+        let limit = crate::output::bytes(first.memory_limit_bytes);
+        fields.push(("gpu memory limit".into(), format!("{limit} of {}", cards.join(", "))));
+    }
     if status.disk_total_bytes > 0 {
         fields.push((
             "disk free".into(),

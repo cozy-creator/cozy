@@ -1,8 +1,6 @@
-//! The machine's downloader and the executor's fetch channel against a real static origin: a
-//! store's own tree (`refs/`, `blobs/`) served by `python3 -m http.server`.
-use platform::ipc::LocalStream;
+//! The machine's downloader against a real static origin: a store's own tree (`refs/`,
+//! `blobs/`) served by `python3 -m http.server`.
 use std::{
-    collections::BTreeMap,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -10,19 +8,15 @@ use std::{
     sync::Arc,
 };
 
-use serde_json::{json, Value};
 use tensorfs::{
-    fetch::HttpOrigin,
-    format::{Dtype, ObjectRef, Release, Repo},
-    store2::Store,
+    fetch::Endpoint,
+    format::{Dtype, ObjectRef, Repo, Tree},
+    store::Store,
     writer::{Data, Source},
 };
 
-use super::{priority, serve, Grant, Machine, Remote};
-use crate::{
-    frame::{Channel, Frame},
-    stop::Stop,
-};
+use super::{priority, Machine, Remote};
+use crate::stop::Stop;
 
 struct Scratch(PathBuf);
 
@@ -72,25 +66,29 @@ fn bytes(n: usize, seed: u8) -> Vec<u8> {
     (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
 }
 
-/// A checkpoint of two components (a 17 MiB tensor on the grid, small packed ones, a config),
-/// published in the store's refs as `acme/model@1.0` lane `bf16`.
+/// A checkpoint of two components (a 17 MiB tensor on the grid, small packed ones, a tokenizer),
+/// variant `bf16` of `acme/model@1.0` in the store's refs: its header.
 fn checkpoint(store: &Store) -> ObjectRef {
     let mut writer = store.writer(None, Some("origin-test")).unwrap();
     let f32 = Dtype::parse("F32");
     for (component, key, n, seed) in [("unet", "big.weight", 17 << 20, 1), ("unet", "a.bias", 4096, 2), ("vae", "z.weight", 8192, 3)] {
         let data = bytes(n, seed);
-        writer.put(component, key, &f32, &[(n / 4) as u64], Data::Plain(Source::Read(&mut &data[..]))).unwrap();
+        writer.get(component).put(key, &f32, &[(n / 4) as u64], Data::Plain(Source::Read(&mut &data[..]))).unwrap();
     }
-    writer.file("unet/config.json", br#"{"layers":2}"#).unwrap();
-    let manifest = writer.commit().unwrap();
-    let release = Release { version: "1.0".into(), lanes: BTreeMap::from([("bf16".into(), manifest.clone())]), ..Default::default() };
-    store.update_ref("acme/model", |_| Some(Repo { name: "acme/model".into(), releases: vec![release], checkpoints: vec![] })).unwrap();
-    manifest
+    writer.get("unet").asset("tokenizer.json", br#"{"layers":2}"#).unwrap();
+    let header = writer.commit().unwrap();
+    let mut tree = Tree::default();
+    tree.set_variant("bf16", header.clone());
+    let mut repo = Repo::new("acme/model");
+    repo.set_tag("1.0", store.put_tree(&tree).unwrap());
+    repo.tags[0].public = true;
+    store.update_ref("acme/model", |_| Some(repo)).unwrap();
+    header
 }
 
 fn remote(machine: &Machine, base: &str) -> Remote {
     let client = machine.client(None, true).unwrap();
-    Remote { origin: Arc::new(HttpOrigin::new(&client, base).unwrap()), trust: None, local: true }
+    Remote { origin: Arc::new(Endpoint::new(&client, base, None).unwrap().anonymous()), trust: None, local: true }
 }
 
 fn same(a: &Store, b: &Store, object: &ObjectRef) -> bool {
@@ -126,56 +124,6 @@ fn a_pull_takes_the_components_asked_then_the_rest_bit_identical() {
     let other = Machine::new(fresh, None).unwrap();
     let refused = other.pull(&self::remote(&other, &python.base), &manifest, None, priority::NOW, None, &stopped);
     assert_eq!(refused.unwrap_err().detail, "stopped");
-}
-
-fn ask(channel: &mut Channel<LocalStream>, request: Value) -> Value {
-    channel.send(&request).unwrap();
-    match channel.receive().unwrap() {
-        Some(Frame::Json(answer)) => answer,
-        other => panic!("{other:?}"),
-    }
-}
-
-fn rows(objects: &[ObjectRef]) -> Value {
-    objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect()
-}
-
-#[test]
-fn the_fetch_channel_schedules_waits_and_answers_presence_for_its_checkpoints_only() {
-    let (dir, there) = (scratch("channel"), scratch("channel-there"));
-    let origin = Arc::new(Store::open(there.0.join("store")).unwrap());
-    let manifest = checkpoint(&origin);
-    let python = Python::serve(origin.root());
-    let store = Arc::new(Store::open(dir.0.join("store")).unwrap());
-    let machine = Machine::new(store.clone(), None).unwrap();
-    let remote = remote(&machine, &python.base);
-    let closure = origin.closure(&manifest).unwrap();
-    let id = format!("sha256:{}", manifest.sha256);
-
-    let (client, server) = platform::ipc::pair().unwrap();
-    let grant = Grant { run: 7, checkpoints: vec![(manifest.clone(), remote)], stop: Stop::default() };
-    let served = {
-        let machine = machine.clone();
-        std::thread::spawn(move || serve(&machine, grant, server))
-    };
-    let mut channel = Channel(client);
-    let present = ask(&mut channel, json!({"id": 1, "op": "present", "manifest": id, "objects": rows(&closure)}));
-    assert_eq!(present, json!({"id": 1, "result": vec![false; closure.len()]}));
-    let scheduled = ask(&mut channel, json!({"id": 2, "op": "schedule", "manifest": id, "objects": rows(&closure[..1]), "rank": 3}));
-    assert_eq!(scheduled, json!({"id": 2, "result": null}));
-    let waited = ask(&mut channel, json!({"id": 3, "op": "wait", "manifest": id, "objects": rows(&closure)}));
-    assert_eq!(waited, json!({"id": 3, "result": null}));
-    assert!(closure.iter().all(|o| same(&origin, &store, o)));
-    let present = ask(&mut channel, json!({"id": 4, "op": "present", "manifest": id, "objects": rows(&closure)}));
-    assert_eq!(present["result"], json!(vec![true; closure.len()]));
-
-    let other = format!("sha256:{}", "ab".repeat(32));
-    let refused = ask(&mut channel, json!({"id": 5, "op": "wait", "manifest": other, "objects": []}));
-    assert_eq!(refused["error"], "SOURCE_NOT_ALLOWED");
-    let unknown = ask(&mut channel, json!({"id": 6, "op": "present", "manifest": id, "objects": [], "rank": 1}));
-    assert_eq!((unknown["id"].clone(), unknown["error"].clone()), (json!(6), json!("UNKNOWN_FIELD")));
-    drop(channel);
-    served.join().unwrap().unwrap();
 }
 
 #[test]

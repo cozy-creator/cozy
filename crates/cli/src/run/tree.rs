@@ -1,5 +1,6 @@
-//! A local directory given to a Tree input: its files, and the TensorFS manifest naming them that
-//! the machine materializes the tree from. Both are sent with the run like any input file. The
+//! A local directory given to a Tree input: its files, and the tree document naming them that the
+//! machine materializes the tree from (TensorD's `trees::document`). Both are sent with the run
+//! like any input file. The
 //! manifests are a cache that keeps itself: each is touched when staged, one unused for `UNUSED`
 //! goes when another is staged, and none is kept while the disk is low.
 use std::{
@@ -14,10 +15,7 @@ use protocol::{
     error::{Error, Kind},
     ids::Digest,
 };
-use tensorfs::{
-    ids::{Doc, ObjectRef},
-    manifest::Manifest,
-};
+use serde_json::json;
 
 /// How a run's spec marks an input that is a tree's manifest.
 pub const MEDIA: &str = "application/vnd.cozy.tree-manifest";
@@ -44,21 +42,15 @@ pub fn stage(root: &Path, memo: Option<&Path>, manifests: &Path) -> Result<Stage
             .len();
         let digest = super::digests::of(memo, &path)?;
         let sha256 = hex::encode(digest.bytes());
-        entries.push((name, ObjectRef { sha256, length }));
+        entries.push(json!({"blob": {"length": length, "sha256": sha256}, "kind": "file", "path": name}));
         files.push(StagedInput {
             path,
             digest,
             length,
         });
     }
-    let manifest = Manifest::from_files(entries).map_err(|e| {
-        Error::new(
-            Kind::Validation,
-            "tree_invalid",
-            format!("{}: {e}", root.display()),
-        )
-    })?;
-    let bytes = manifest.canonical_bytes();
+    // Keys sorted (serde_json's map is ordered) and entries by path: one document per tree.
+    let bytes = serde_json::to_vec(&json!({ "entries": entries })).expect("a JSON value serializes");
     let digest = Digest::of(&bytes);
     let path = keep(manifests, &hex::encode(digest.bytes()), &bytes)
         .map_err(|e| unreadable(manifests, e))?;

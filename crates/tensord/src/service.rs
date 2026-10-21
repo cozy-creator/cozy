@@ -141,7 +141,11 @@ impl Service {
                     .unwrap()
                     .insert(record.id.clone(), held.retention());
             }
-            if let Some(birth) = record.process {
+            if let Some(pending) = record.pending_completion {
+                for birth in pending.processes {
+                    service.engine.end_orphan(birth)?;
+                }
+            } else if let Some(birth) = record.process {
                 service.engine.end_orphan(birth)?;
             }
         }
@@ -184,12 +188,24 @@ impl Service {
         births.len()
     }
     pub fn configure_pool(&self, pool: Arc<Pool>) -> io::Result<()> {
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        self.configure_pool_with(pool, runtime.as_ref())
+    }
+    /// Production setup runs outside Tokio's entered context, just like dispatch.
+    /// Use its existing runtime explicitly; synchronous bookkeeping fixtures need none.
+    pub fn configure_pool_on(&self, pool: Arc<Pool>, runtime: &tokio::runtime::Handle) -> io::Result<()> {
+        self.configure_pool_with(pool, Some(runtime))
+    }
+    fn configure_pool_with(&self, pool: Arc<Pool>, runtime: Option<&tokio::runtime::Handle>) -> io::Result<()> {
         let mut current = self.pool.lock().unwrap();
         if current.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "the executor pool is already configured",
             ));
+        }
+        if let Some(runtime) = runtime {
+            pool.watch_memory(&self.engine, runtime)?;
         }
         *current = Some(pool.clone());
         drop(current);
@@ -403,11 +419,8 @@ impl Service {
     }
     /// Caches manage themselves (`reclaim`): a TTL and a low disk, never a purge verb.
     pub fn reclaim(&self) -> crate::reclaim::Swept {
-        // Released Write roots first, so the store's GC can collect their bytes.
+        // Run objects no unfinished run needs go first.
         if let Some(calls) = self.calls() {
-            if let Err(error) = calls.sweep_canceled_outputs(&self.engine) {
-                tracing::warn!("reclaim canceled native outputs: {error}");
-            }
             if let Err(error) = calls.sweep_objects() {
                 tracing::warn!("reclaim object roots: {error}");
             }
@@ -430,14 +443,6 @@ impl Service {
                 kernels: kernels.as_ref(),
                 memo: pool.as_ref().map(|pool| pool.memo()),
                 uv_cache: uv_cache.as_deref(),
-                store: match publisher.as_ref().map(|publisher| publisher.caches(self)) {
-                    Some(Ok(caches)) => Some(caches),
-                    Some(Err(error)) => {
-                        tracing::warn!("reclaim: no store GC this pass, its keep list failed: {error}");
-                        None
-                    }
-                    None => None,
-                },
                 disk: &|| crate::reclaim::measure(&self.engine.root),
             })
         };

@@ -6,9 +6,139 @@ use crate::device_executor::{Frame, PlaneFacts, Shortfall};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Per-request facts emitted by Varena, distinct from legacy process counters.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RequestMemory {
+    pub leftover: u64,
+    pub paged_in: u64,
+    pub steps: BTreeMap<String, Vec<u64>>,
+    pub rows: Vec<MemoryStep>,
+    pub evictions: Vec<MemoryEviction>,
+    pub peaks: Vec<MemoryPeak>,
+    pub retries: u64,
+    pub leftover_by_gpu: Vec<(i32, u64)>,
+    pub plan: Vec<Vec<String>>,
+    pub copies: Vec<MemoryCopy>,
+    pub proofs: Vec<TransferProof>,
+    // Serialized once at CallMemory.trace, not duplicated inside stats.
+    #[serde(skip_serializing)]
+    pub trace: Vec<TraceEvent>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MemoryStep {
+    pub model: String,
+    pub gpu: i32,
+    pub step: u64,
+    pub home: u64,
+    pub resident: u64,
+    pub paged_in: u64,
+    pub streamed: u64,
+    pub stall_ns: u64,
+    pub activations: i64,
+    pub allocated: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MemoryEviction {
+    pub model: String,
+    pub gpu: i32,
+    pub rung: u64,
+    pub reason: String,
+    pub nbytes: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MemoryPeak {
+    pub model: String,
+    pub shape: String,
+    pub peak: i64,
+    pub cuts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MemoryCopy {
+    pub kind: String,
+    pub gpu: i32,
+    pub bytes: u64,
+    pub seconds: f64,
+    pub gbps: f64,
+    pub ceiling: f64,
+    pub pct: Option<f64>,
+    pub link: String,
+    pub busy_s: f64,
+    pub pin_s: f64,
+    pub staged: u64,
+    pub cached: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TraceEvent {
+    pub sequence: u64,
+    pub request: String,
+    pub step: u64,
+    pub pass_index: u64,
+    pub page: u64,
+    pub gpu: i32,
+    pub rank: u32,
+    pub kind: String,
+    pub reason: String,
+    pub bytes: u64,
+    pub capacity: u64,
+    pub resident: u64,
+    pub orphan_bytes: u64,
+    pub model: Option<String>,
+    #[serde(rename = "class")]
+    pub class: String,
+    pub working_set: Option<u64>,
+    pub speculative_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill: Option<FillResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FillResult {
+    pub phase: String,
+    pub outcome: String,
+    pub error: Option<String>,
+    pub io_runs: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProofPage {
+    pub page: u64,
+    pub content: String,
+    pub payload: u64,
+    pub mapped: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TransferProof {
+    pub request: String,
+    pub gpu: i32,
+    pub rank: u32,
+    pub version: u32,
+    pub complete: bool,
+    pub isolated: bool,
+    pub capacity: u64,
+    pub pages: Vec<ProofPage>,
+    pub initial: Vec<u64>,
+    pub invalid: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CallMemory {
+    pub stats: Option<RequestMemory>,
+    pub trace: Vec<TraceEvent>,
     /// torch's high-water marks: live tensors, and the segments it reserved for them.
     pub peak_allocated_bytes: Option<u64>,
     pub peak_reserved_bytes: Option<u64>,
@@ -47,7 +177,11 @@ pub struct CallMemory {
 impl CallMemory {
     /// `since` is the plane's counts at the executor's previous call. None: nothing measured.
     pub fn of(reply: &Frame, since: &PlaneFacts) -> Option<Self> {
-        if reply.metrics.is_none() && reply.plane.is_none() && reply.shortfall.is_none() {
+        if reply.metrics.is_none()
+            && reply.plane.is_none()
+            && reply.shortfall.is_none()
+            && reply.memory.is_none()
+        {
             return None;
         }
         let metrics = reply.metrics.clone().unwrap_or_default();
@@ -56,6 +190,12 @@ impl CallMemory {
             of(&plane).map(|now| now.saturating_sub(of(since).unwrap_or(0)))
         };
         Some(Self {
+            stats: reply.memory.clone(),
+            trace: reply
+                .memory
+                .as_ref()
+                .map(|memory| memory.trace.clone())
+                .unwrap_or_default(),
             peak_allocated_bytes: known(metrics.peak_vram_bytes),
             peak_reserved_bytes: known(metrics.peak_reserved_bytes),
             activation_peak_bytes: known(plane.activation_peak_bytes)
@@ -100,6 +240,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_measurements_and_native_trace_reach_the_public_result() {
+        let measured = serde_json::json!({
+            "leftover": 0, "paged_in": 8192,
+            "steps": {"dit": [4096, 4096]},
+            "rows": [{"model": "dit", "gpu": 0, "step": 1, "home": 4096,
+                "resident": 4096, "paged_in": 4096, "streamed": 0,
+                "stall_ns": 25, "activations": 2048, "allocated": 4096}],
+            "evictions": [{"model": "vae", "gpu": 0, "rung": 0,
+                "reason": "orphan", "nbytes": 4096}],
+            "peaks": [{"model": "dit", "shape": "64x64", "peak": 2048, "cuts": []}],
+            "retries": 1, "leftover_by_gpu": [[0, 0]], "plan": [["dit"], ["vae"]],
+            "proofs": [{"request": "request-1", "gpu": 0, "rank": 1, "version": 1,
+                "complete": true, "isolated": true, "capacity": 8192,
+                "pages": [{"page": 3, "content": "fingerprint/0", "payload": 3072, "mapped": 4096}],
+                "initial": [3], "invalid": []}],
+            "copies": [{"kind": "h2d", "gpu": 0, "bytes": 8192, "seconds": 0.1,
+                "gbps": 0.00008192, "ceiling": 0.0001, "pct": 81.92, "link": "PCIe"}],
+            "trace": [{"sequence": 1, "request": "request-1", "step": 0,
+                "pass_index": 0,
+                "page": 3, "gpu": 0, "rank": 1, "kind": "bind", "reason": "working",
+                "bytes": 4096, "capacity": 8192, "resident": 4096, "orphan_bytes": 0,
+                "model": "dit", "class": "working", "working_set": 4096,
+                "speculative_budget": 0}]
+        });
+        let reply: Frame = serde_json::from_value(serde_json::json!({"memory": measured})).unwrap();
+        let result = CallMemory::of(&reply, &PlaneFacts::default()).unwrap();
+        let public = serde_json::to_value(result).unwrap();
+        assert_eq!(public["stats"]["paged_in"], 8192);
+        assert_eq!(public["stats"]["steps"], measured["steps"]);
+        assert_eq!(public["stats"]["rows"], measured["rows"]);
+        assert_eq!(public["stats"]["evictions"], measured["evictions"]);
+        assert_eq!(public["stats"]["peaks"], measured["peaks"]);
+        assert_eq!(public["stats"]["plan"], measured["plan"]);
+        assert_eq!(public["stats"]["copies"][0]["pct"], 81.92);
+        assert_eq!(public["stats"]["proofs"], measured["proofs"]);
+        assert_eq!(public["trace"], measured["trace"]);
+        assert!(public["stats"].get("trace").is_none());
+    }
+
+    #[test]
+    fn request_byte_counts_cannot_wrap_negative_input() {
+        for memory in [
+            serde_json::json!({"paged_in": -1}),
+            serde_json::json!({"copies": [{"bytes": -1}]}),
+            serde_json::json!({"trace": [{"bytes": -1}]}),
+        ] {
+            assert!(
+                serde_json::from_value::<Frame>(serde_json::json!({"memory": memory})).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn fill_outcomes_survive_the_reply_to_public_trace_boundary() {
+        let fill = serde_json::json!({"phase": "allocate", "outcome": "refused",
+            "error": "DEVICE_FULL", "io_runs": 0});
+        let reply: Frame = serde_json::from_value(serde_json::json!({"memory": {"trace": [
+            {"kind": "fill-refused", "fill": fill}, {"kind": "bind"}
+        ]}}))
+        .unwrap();
+        let public =
+            serde_json::to_value(CallMemory::of(&reply, &PlaneFacts::default()).unwrap()).unwrap();
+        assert_eq!(public["trace"][0]["fill"], fill);
+        assert!(public["trace"][1].get("fill").is_none());
+        let invalid = serde_json::json!({"memory": {"trace": [{"fill": {
+            "phase": "allocate", "outcome": "refused", "error": "DEVICE_FULL", "io_runs": -1
+        }}]}});
+        assert!(serde_json::from_value::<Frame>(invalid).is_err());
+    }
+
+    #[test]
     fn a_call_counts_what_moved_since_the_executors_previous_call() {
         let reply: Frame = serde_json::from_value(serde_json::json!({
             "metrics": {"peak_vram_bytes": 900, "peak_reserved_bytes": 1000,
@@ -110,13 +321,23 @@ mod tests {
                 "request_shape": "vae.decode"}
         }))
         .unwrap();
-        let before = PlaneFacts { h2d_bytes: Some(3000), evictions: Some(2), ..Default::default() };
+        let before = PlaneFacts {
+            h2d_bytes: Some(3000),
+            evictions: Some(2),
+            ..Default::default()
+        };
         let memory = CallMemory::of(&reply, &before).unwrap();
         assert_eq!(memory.peak_reserved_bytes, Some(1000));
         assert_eq!(memory.activation_peak_bytes, Some(350));
         assert_eq!(memory.stage_peaks["vae.decode"], 300);
-        assert_eq!((memory.paged_in_bytes, memory.evictions), (Some(2000), Some(5)));
-        assert_eq!((memory.weights_bytes, memory.context_bytes), (Some(500), None));
+        assert_eq!(
+            (memory.paged_in_bytes, memory.evictions),
+            (Some(2000), Some(5))
+        );
+        assert_eq!(
+            (memory.weights_bytes, memory.context_bytes),
+            (Some(500), None)
+        );
         assert_eq!(memory.paged_out, None);
         assert_eq!(memory.shortfall.unwrap().needed_bytes, 1200);
         assert!(CallMemory::of(&Frame::default(), &before).is_none());

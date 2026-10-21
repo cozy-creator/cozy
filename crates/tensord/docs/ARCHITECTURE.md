@@ -1,32 +1,32 @@
 # Architecture
 
 TensorD (executable `tensord`) is the persistent Rust daemon that owns the API, execution journal,
-node scheduling, memory budgets and executor supervision. Package code runs in Python
-executors (cozy-runtime) inside each package environment. TensorFS is a library embedded in
-TensorD and used inside Runtime; it is not a separate daemon. TensorD has no CUDA context:
-executors own device contexts and operations. NVML is read on each configured GPU's sampler
-thread (`memory`).
+node scheduling and executor supervision. Package code runs in Python executors (cozy-runtime)
+inside each package environment. TensorFS is a library embedded in TensorD and used inside
+Runtime; it is not a separate daemon. TensorD has no CUDA context: executors own device
+contexts and operations, and varena in each executor decides its GPU bytes through one ledger
+per GPU through `memory::slim`. The child clamps its shared capacity to CUDA usable memory;
+TensorD keeps physical inventory and listens for library eventfd changes.
 
 Model loading spans storage, shared CPU buffers and executor GPU memory:
 
 | Representation | TensorD's responsibility | Runtime's responsibility |
 | --- | --- | --- |
 | Stored weight bytes and metadata | Use TensorFS to acquire/retain manifests, headers, assets and tensor objects; bind available data to the selected model components | Request the selected header/assets, inspect tensor layouts, and construct Python/PyTorch models |
-| Shared CPU weight buffers | Fill and retain sealed layouts or streaming windows through TensorFS; coordinate host budgets and release unused buffers | Adopt granted layouts and descriptors through its TensorFS weight plane; read ready regions and manage its pinned staging within the host budget |
-| GPU-resident tensor storage | Coordinate device budgets and eviction; retain eligible executor-exported allocation handles and their leases | Allocate, transfer, map and unmap through TensorFS's plane/device APIs in the executor's CUDA context; attach those tensors to the model |
+| Shared CPU weight buffers | Forward library grants and host demand | The shared library HostCache warms raw regions asynchronously; a fill uses ready RAM or the verified disk path immediately |
+| GPU-resident tensor storage | Create each GPU's ledger; admit executor starts, reap exited rows, end stalled ones | Varena maps, evicts and asks other rows for room; Runtime binds those pages to the model |
 
-Runtime reports each rank's needs and measured use. TensorD decides budgets and eviction
-across workloads; Runtime and its TensorFS weight plane perform the concrete device operations
-within those grants. A model source carries access to selected weight bytes, metadata and assets, not
-just a repository name. A host-buffer fill does not construct a PyTorch model, and retaining a
-GPU handle does not create a CUDA context in TensorD.
+Each executor's row in its GPU's ledger states what it holds; asks between rows make room.
+Allocator/context facts are published by their actual owners. A model source carries access to selected weight
+bytes, metadata and assets, not just a repository name. A host-buffer fill does not construct a
+PyTorch model.
 
 TensorFS `Store::ensure_owned` retains the store claim through live handles and read leases,
 coordinates GC pins and excludes outside collectors. Cooperating ordinary processes can
 still share its store for reads and writes. Its
-[TensorFS storage guide](../../tensorfs/README.md#storage-and-ownership)
-describes storage and retention. TensorD retains the node-specific sealed memfd cache, host
-tiers, GPU-region custody and peer/process leases. [Recovery](RECOVERY.md) distinguishes
+[TensorFS storage guide](../../tensorfs-py/README.md#storage-and-ownership)
+describes storage and retention. TensorD retains the node-specific sealed memfd cache and
+peer/process leases. [Recovery](RECOVERY.md) distinguishes
 executor replacement, daemon restart and software activation guarantees.
 
 Plan of record and workstream IDs (A–F):
@@ -44,8 +44,8 @@ Calcifer ──HTTPS (Cozy-Cap)──> api::http ─> machine_api::NativeBackend
                           gpu_service::Pool ─> device_executor::DeviceExecutor
                             (retained executors per plan: deviceless, one GPU or a group,
                              via the Runtime trampoline)
-                            memory::GpuMemory: admission, process caps, eviction, floor
-                            answers budget-cell, device-room, model-source and sealed-tier requests
+                            memory::slim::Memory: per-GPU library grants, fits, reap, eventfd
+                            answers model-source requests; library channels own RAM and GPU custody
                           calls::Calls: child calls and each attempt's weights grant
 ```
 
@@ -57,9 +57,9 @@ pool places it on. Progress, outputs and terminal state are written
 by `Engine`; outputs are kept in native custody until the client acknowledges collection.
 
 Tenancy: a pod has one owner, a package one publisher, and many users submit. A GPU plan (and so
-its executor and its memory-policy tenant) is the package's generation, entrypoint, bound models
-and group, never the submitter: every submitter of a construction is served by one executor, one
-request at a time. Degree 2 holdings are per GPU and layout, shared by every executor on the pod.
+its executor and its ledger rows) is the package's generation, entrypoint, bound models and
+group, never the submitter: every submitter of a construction is served by one executor, one
+request at a time. Raw host regions are shared across GPU ledgers. GPU custody is separate per device and content/fill identity; live pins and consumer fences protect it.
 What belongs to a submitter is in the journal and the API: installations, preparations, runs,
 inputs, outputs, triage and controls are read by actor; a run's spool lives only for its call,
 and a failure quotes only the stderr its own request wrote.
@@ -88,13 +88,12 @@ code is still not sandboxed.
 | `machine_api.rs` | `MachineBackend` implementation: submit, events, collect, list, inventory | `NativeBackend` | D1 |
 | `products.rs` | Run output log: `Outputs.publish` custody and `product` events (SET/APPEND, composite parts) | `publish`, `retain`, `document` | G |
 | `triage.rs` | One bounded triage bundle per failed attempt, named by its outcome | `TriageRef`, `Facts` | G |
-| `hub.rs` | Hub access (th-241, th-245): anonymous reads by name (catalog, closure); a run's capability traded once for a DPoP-bound token (JWT-bearer, leaf-signed assertion) and presented only on the private operations it names | `Leaf`, `Capability`, `Source`, `Catalog`, `Op` | D1 |
-| `published.rs` | Package and model preparation: releases from the Hub, each model's checkpoint chosen (choice or declared default, name+release+lane → manifest) and landed as its structure only, provider-source models via TensorFS `source_model`, held per release and resolution | `Publisher`, `Request`, `Prepared` | D1 |
+| `hub.rs` | Hub access (th-245): the package catalog read anonymously; models through TensorFS's distribution `Endpoint` under the owner's newest bearer (`Bearer`: per signer and Hub, from requests and `PUT /v1/bearer`, forwarded to the executors given it, memory only), else anonymously | `Source`, `Catalog`, `Bearer`, `Refusal` | D1 |
+| `published.rs` | Package and model preparation: releases from the Hub, each model's checkpoint chosen (choice or declared default, name+tag+variant → commit (tree)/header, or a `#sha256:` commit or header) and landed as its structure only, provider-source models via TensorFS `source_model`, held per release and resolution | `Publisher`, `Request`, `Prepared` | D1 |
 | `precision.rs` | The lane rule (xs-042): a slot's bits and lane order from the GPUs' compute capability, the request's bits and the slot's `min_bits`, `phase` and `encoded_leaves`; its fallback warnings | `Row`, `Gpus`, `Slot` | D1 |
-| `access.rs` | What a call's weights are fetched under: origins and their Hub access (the run's capability for the owner's checkpoint by hash), readers' waits (Now), the executor's `fetch_channel` (TensorFS `fetch::serve`) and a warm member's `downloaded` ticket, all ended with the call or its run's cancel | `Fetch` | D1 |
-| `adapter_views.rs` | Caller LoRA adapters as a zero-copy TensorFS derivation | — | D1 |
-| `runs.rs` | Run sources and preparation inside a run: accepted at once, install/download as its progress, the Hub capability in memory only. A warm run with no entrypoint installs and fetches its choices; one with no code makes provider sources and uploads to its weights destination | `Runs`, `Spec`, `Source` | D1 |
-| `weights.rs` | An attempt's weights: `weights_writer` sources and outputs over TensorFS's native channels; an adopted output kept in a local repository, recorded as a manifest product, published to the run's weights destination | `Weights`, `Grant` | D1 |
+| `access.rs` | What a call's weights are fetched under: origins and their Hub access (the owner's newest bearer, for the owner's checkpoint by hash), readers' waits (Now) and a warm member's `downloaded` ticket, all ended with the call or its run's cancel | `Fetch` | D1 |
+| `adapter.rs` | Caller LoRA adapters as a zero-copy TensorFS component-writer composition | `compose` | D1 |
+| `runs.rs` | Run sources and preparation inside a run: accepted at once, install/download as its progress, its bearer kept as the owner's newest (`hub::Bearer`). A warm run with no entrypoint installs and fetches its choices; one with no code makes provider sources and uploads to its weights destination | `Runs`, `Spec`, `Source` | D1 |
 | `objects.rs` | Uploaded objects: byte ranges in any order, resumable, verified once whole into the store, per signer | `Objects`, `Upload` | D1 |
 | `local_source.rs` | A run's local source: each remote manifest owns its source tree and editable environment; explicit local paths read the directory in place | `LocalSources`, `Manifest` | D1 |
 | `machine/` | Launch grant, lifetime identity, readiness receipt, rental lifecycle, supervision, SSH, runtime update, the direct player endpoint (`player.rs`), the embedded Python client and installer helper (`client.rs`) | `Grant`, `Readiness`, `Lifecycle` | D2 |
@@ -105,7 +104,7 @@ code is still not sandboxed.
 | `execution.rs` | Acceptance, attempt supervision, cancellation, progress coalescing, output custody, reconcile | `Engine` | E |
 | `journal.rs` | SQLite journal: executions, installations, preparations, receipts, process births | `Journal`, `Execution`, `State`, `ProcessBirth` | E |
 | `gpu_service.rs` | Executor pool (degree 0, 1 or n): published package/model mapping, executor retention, request callbacks; GPU groups (a degree-K plan on the first K GPUs, one memory decision per GPU), one call slot per GPU and one-GPU replicas and multi-slot plans | `Pool`, `GpuConfig`, `Plan`, `PlanSlot`, `PlanSource`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping), I (groups, slots) |
-| `memory/` | Per-GPU ledger and decisions (`policy`), NVML sampler thread (`nvml`), floor watchdog, per-host pinned budgets (`host`) | `GpuMemory`, `policy::Gpu`, `Step`, `Decision` | B2 |
+| `memory/` | Thin library grants, admission, exact-birth reaping and eventfd forwarding (`slim`); measured request records (`call`) and learned peaks | `Memory`, `CallMemory` | xs-046 B4 |
 | `device_executor.rs` | Typed control seam to the Runtime device executor, per-request output encoding | `DeviceExecutor`, `ExecutorConfig`, `DeviceCommand`, `Frame`, `Answer` | E |
 | `launch_identity.rs` | Runtime trampoline command, the executor environment seal, optional UID/GID | `LaunchIdentity`, `Seal`, `trampoline` | E |
 | `process.rs` | Exact process births, kill (scope and group), the progress meter and watch (leader plus process-group members), reaping (`reap_group`) | `Exact`, `Pace`, `Watching`, `Reaped` | E, I |
@@ -114,10 +113,6 @@ code is still not sandboxed.
 | `child_launcher.rs` | Pool-owned spawn thread (PDEATHSIG follows the creating thread) | `ChildLauncher` | E |
 | `os.rs` | memfd, seals, peer credentials (`SO_PEERPIDFD`, `pidfd_open` fallback), pidfd exit | — | E |
 | `protocol.rs` | Length-prefixed frames of the executor seam | `read_body`, `write_body` | E |
-| `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom; a region's absent objects are fetched (Now) and copied as they land | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
-| `host_memory.rs` | Live host headroom (cgroup v1/v2 path, `MemAvailable`) | `HostMemory` | B1 |
-| `model_sources.rs` | Selected model headers/assets as verified bytes and sealed read-only descriptors; component byte facts for planning | `ModelSources`, `SelectedManifest` | B1 |
-| `resident_custody.rs` | Degree 2: executor-exported GPU regions kept as driver fds (no CUDA), leases, revocation | `ResidentCustody`, `HoldingKey`, `SharedRegion` | C |
 | `boundary_json.rs` | Strict JSON parse (no duplicate keys) for boundary records | — | D1 |
 
 
@@ -132,40 +127,21 @@ code is still not sandboxed.
 
 | Path | Use | Owner |
 |---|---|---|
-| `src/bin/degree2-pilot.rs` | Degree 2 on a rental: stock executors share GPU weights through `ResidentCustody` (replacement, count-once, revoke, output equality) | C |
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
 | `scripts/gate/` | Matched ComfyUI vs TensorD gate through ordinary `cozy run` | F |
-| `scripts/benchmarks/permission_probe.py` | CPU executor permission probe | E |
 
 ## Contracts
 
-Native storage grants belong to one durable run attempt. Pausing and resuming a run
-creates a fresh grant; an earlier attempt cannot regain authority when the run becomes
-active again. Closing a source/output channel fences that writer attempt but does not
-abandon its transaction or release committed custody. TensorFS persists resumable parts
-and committed receipts independently of channel acknowledgments.
+Runtime reads and writes weights directly through public TensorFS in the shared store
+sealed as `TENSORFS_HOME`. TensorD passes immutable source references, declared output byte
+bounds, actor/operation identity and destination. Optional `tensorfs` connection settings
+carry an endpoint, an already supplied token and optional CA data; TensorD does not acquire
+credentials. Supplied tokens remain in the request's memory context and diagnostics redact them.
 
-Replaying or adopting a derived result requires retained native custody and a verified
-model closure. Receipt metadata alone cannot recreate a disposed result. Adoption compares
-the transaction, declaration and immutable manifest identity, then records the owner's
-native facts; additional peer observations do not change authority. Independent consumers
-retain their own roots, so releasing one consumer cannot make another's data collectible.
-See [tracker #341](https://github.com/cozy-creator/tracker/issues/341).
-
-Before native begin, the existing execution journal records only the run, output slot and
-transaction association, atomically with current-attempt admission. Explicit cancellation
-uses that association to fence and abandon unfinished work, or dispose a committed result
-that still has only pending custody. Acknowledged native adoption and independent consumer
-roots survive. Cleanup is idempotent and retried at startup/reclamation; observer
-disconnect and ordinary failure do not authorize abandonment. Older unbound transactions
-are never guessed to belong to a canceled run.
-
-TensorFS allocates writer epochs from its durable transaction fence through
-`channel::Writer::begin_next`. Reopening after a restart or an old clock-derived high epoch
-creates a new writer attempt of the same transaction; stale channel closure cannot fence
-its replacement. Payload writes and publication remain concurrent; only local custody
-metadata transitions are coordinated with cancellation.
+Runtime owns keyed Writer replay, local checkpoint commit and ordinary upload. TensorD has
+no weights writer/source/fetch channel server or derived-output transaction journal. It records
+the checkpoint reference Runtime reports; failed uploads leave Runtime's local commit available.
 
 - [Durable execution](DURABLE-EXECUTION.md): journal states, acceptance, cancellation, custody.
 - [Recovery](RECOVERY.md): executor and daemon lifetimes, update publication and rollback.
@@ -173,8 +149,6 @@ metadata transitions are coordinated with cancellation.
 - [Package bridge](PACKAGE-BRIDGE.md): generation description and install.
 - [Device executor](DEVICE-EXECUTOR.md): executor launch and control seam.
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.
-- [Host tier](HOST-TIER.md), [model sources](MODEL-SOURCES.md): Degree 1.
-- [Resident custody](RESIDENT-CUSTODY.md): Degree 2 foundation.
 - [Matched gate](../scripts/gate/README.md): ComfyUI vs TensorD, ordinary CLI.
 
 ## Build and test

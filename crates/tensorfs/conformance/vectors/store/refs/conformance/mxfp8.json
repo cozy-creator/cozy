@@ -1,1 +1,1 @@
-{"format":"tensorfs.repo/1","name":"Conformance/mxfp8","releases":[{"lanes":{"all":{"length":253,"sha256":"88040c4f8b3ff4c4f885f835b5631c5e6c9adf6fb383dd91ada7f88f8db7ccf9"}},"version":"1"}]}
+{"format":"cozytensors.repo/1","name":"Conformance/mxfp8","tags":[{"commit":{"length":256,"sha256":"feef595498a5473017814fe307054e7dcf20ffabb3f765f60de5c47cf7a1d432"},"name":"1","public":true}]}

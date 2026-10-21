@@ -8,7 +8,7 @@ use std::io::Read;
 
 use tensorfs::failure::Result;
 use tensorfs::format::{Dtype, Encoding, GlobalScale, NibbleOrder, ObjectRef, ScaleLayout};
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 use tensorfs::writer::{Data, PartData, Source};
 
 pub struct Noise {
@@ -217,21 +217,32 @@ fn plan(blocks: u64, scale: u64, plain: bool) -> Vec<Item> {
     v
 }
 
-const FILES: [(&str, &str); 3] = [
+/// The configs: (component, class, config).
+const CONFIGS: [(&str, &str, &str); 2] = [
     (
-        "unet/config.json",
+        "unet",
+        "diffusers.UNet2DConditionModel",
         r#"{"_class_name":"UNet2DConditionModel","block_out_channels":[320,640,1280],"in_channels":4}"#,
     ),
     (
-        "text_encoder/config.json",
+        "text_encoder",
+        "transformers.CLIPTextModel",
         r#"{"architectures":["CLIPTextModel"],"hidden_size":2048}"#,
     ),
-    ("tokenizer/vocab.txt", "<pad>0</pad>\n<pad>1</pad>\n"),
 ];
 
-/// Writes the checkpoint; its manifest, pinned under its digest.
+/// Writes the cozytensors; its header, pinned under its digest.
 pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) -> Result<ObjectRef> {
     let mut w = store.writer(None, None)?;
+    if files {
+        for (component, class, config) in CONFIGS {
+            let config = serde_json::from_str(config).expect("a config");
+            w.component(component, class, config, None)?;
+        }
+        let vocab = "<pad>0</pad>\n<pad>1</pad>\n";
+        w.component("tokenizer", "transformers.CLIPTokenizer", Default::default(), None)?
+            .asset("vocab.txt", vocab.as_bytes())?;
+    }
     for it in plan(blocks, scale, plain) {
         let (rows, cols) = (it.shape[0], it.shape.get(1).copied().unwrap_or(1));
         let seed = |role: &str| format!("{}#{role}", it.seed);
@@ -246,8 +257,7 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                     .byte_len(&it.shape)
                     .expect("plan sizes are whole bytes");
                 let mut noise = Noise::new(&seed(""), len);
-                w.put(
-                    it.component,
+                w.get(it.component).put(
                     &it.key,
                     &it.dtype,
                     &it.shape,
@@ -257,8 +267,8 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
             }
             Scheme::Fp8Rowwise | Scheme::Fp8Tensorwise => (
                 match it.scheme {
-                    Scheme::Fp8Rowwise => Encoding::fp8_rowwise(0, &Dtype::F32),
-                    _ => Encoding::fp8_tensorwise(&Dtype::F32),
+                    Scheme::Fp8Rowwise => Encoding::fp8_rowwise(0),
+                    _ => Encoding::fp8_tensorwise(),
                 },
                 vec![
                     part(
@@ -299,9 +309,9 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
             ),
             Scheme::Int8Tensorwise | Scheme::Int8Rowwise | Scheme::Int8Convrot => (
                 match it.scheme {
-                    Scheme::Int8Tensorwise => Encoding::int8_tensorwise(&Dtype::F32),
-                    Scheme::Int8Rowwise => Encoding::int8_rowwise(0, &Dtype::F32),
-                    _ => Encoding::int8_convrot(256, &Dtype::F32),
+                    Scheme::Int8Tensorwise => Encoding::int8_tensorwise(),
+                    Scheme::Int8Rowwise => Encoding::int8_rowwise(0),
+                    _ => Encoding::int8_convrot(256),
                 },
                 vec![
                     part(
@@ -359,18 +369,12 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
                 data: Source::Read(bytes),
             })
             .collect();
-        w.put(
-            it.component,
+        w.get(it.component).put(
             &it.key,
             &it.dtype,
             &it.shape,
             Data::Encoded { encoding, parts },
         )?;
-    }
-    if files {
-        for (path, text) in FILES {
-            w.file(path, text.as_bytes())?;
-        }
     }
     Ok(w.commit()?)
 }

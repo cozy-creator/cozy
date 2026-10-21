@@ -15,9 +15,8 @@ cli.workspace = true
 tensord.workspace = true
 
 [features]
-# Dev builds only (xs-045 U12): `cozy model migrate` and the machine's migration runs. Never in
-# a release.
-migrate = ["cli/migrate", "tensord/migrate"]
+# Dev builds only (xs-053 A11): `cozy model migrate-headers`. Never in a release.
+migrate = ["cli/migrate"]
 
 [dev-dependencies]
 base64.workspace = true

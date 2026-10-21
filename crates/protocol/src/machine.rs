@@ -29,6 +29,8 @@ pub mod path {
     pub const OBJECT: &str = "/v1/objects/{digest}";
     /// `POST` a [`super::HeldRequest`]: what the machine holds of many objects, in one request.
     pub const OBJECTS_HELD: &str = "/v1/objects/held";
+    /// `PUT` a [`super::TensorFSOptions`]: the signer's newest bearer at a Hub.
+    pub const BEARER: &str = "/v1/bearer";
 }
 
 /// The header naming the byte ranges of an object the machine holds: `0-1048575,2097152-4194303`
@@ -282,12 +284,15 @@ pub struct RunSpec {
     /// org/name: the requester's repository for the call's weights outputs, or a warm run's
     /// source model.
     pub weights_destination: String,
-    /// Where the run reads, and its capability there.
+    /// The Hub the run reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub: Option<HubAccess>,
+    /// Ordinary TensorFS connection settings supplied by the caller, forwarded to Runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tensorfs: Option<TensorFSOptions>,
     /// The account that org-relative references of local code name.
     pub owner: String,
-    /// Provider tokens for source models, memory only like `hub`.
+    /// Provider tokens for source models, kept in memory only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub providers: Option<ProviderAccess>,
     /// `warm/2`: the caller's whole warm set, replacing its previous one; no items clears it.
@@ -303,20 +308,41 @@ pub struct RunSpec {
     pub bits: u32,
 }
 
-/// Dev builds only (xs-045 U12): the profile that makes a warm run's model choice a migration
-/// of checkpoints from before TensorFS's format cut, which every Calcifer passes through. With a
-/// repository and manifest: that old checkpoint at the run's Hub, rewritten on the machine and
-/// put in the run's weights destination. With a `source`: every `local/` model of the pre-cut
-/// store at that path on the machine, into the machine's own store.
-#[cfg(feature = "migrate")]
-pub const MIGRATE: &str = "migrate";
-
 /// The caller's provider tokens, for models a run makes from a provider source.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct ProviderAccess {
     pub huggingface: String,
     pub civitai: String,
+}
+
+/// Public TensorFS transport options. TensorD forwards a supplied token without acquiring one.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct TensorFSOptions {
+    pub endpoint: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub token: String,
+    /// When `token` expires; 0: unknown.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub expires_unix_ms: i64,
+    /// An endpoint's private CA, base64 DER on the wire.
+    #[serde(with = "base64_bytes", skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = String, format = Byte)]
+    pub ca_der: Vec<u8>,
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+impl std::fmt::Debug for TensorFSOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TensorFSOptions")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 /// A published release by name (th-245): a machine that holds no installation of it reads its
@@ -409,15 +435,6 @@ pub struct HubAccess {
     #[serde(with = "base64_bytes", skip_serializing_if = "Vec::is_empty")]
     #[schema(value_type = String, format = Byte)]
     pub ca_der: Vec<u8>,
-    /// The Hub's object-storage hosts downloads may follow.
-    pub object_hosts: Vec<String>,
-    /// The owner's capability for this run's private operations (th-241): a compact JWS its
-    /// device key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),
-    /// naming each operation in `authorization_details`. The machine trades it once, at the run's
-    /// first private operation, at `token_endpoint`. Empty: a public-only run.
-    pub capability: String,
-    /// The Hub's authorization server's, as its metadata names it.
-    pub token_endpoint: String,
 }
 
 /// One entry of a run's log, as `GET /v1/runs/{id}/events` sends it: SSE `event: <variant>`,
@@ -507,12 +524,25 @@ pub struct Progress {
     pub stage_fraction: Option<f64>,
 }
 
-/// One revision of an output: a single output is replaced by each, a list output grows. Its bytes
-/// are `GET /v1/runs/{id}/outputs/{output}`.
+/// A checkpoint stored by Runtime. `revision` names its commit (`sha256:<tree>`); `tag` the
+/// tag the Runtime moved to it (empty: none).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct CheckpointRef {
+    pub repo_id: String,
+    pub revision: String,
+    pub variant: String,
+    pub tag: String,
+}
+
+/// One revision of an output: a single output is replaced by each, a list output grows. Byte
+/// outputs use `GET /v1/runs/{id}/outputs/{output}`; checkpoints are immutable references.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct Product {
     pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointRef>,
     /// A list item's 1-based index; 0 for a single output.
     pub index: u32,
     pub rev: u64,
@@ -765,6 +795,8 @@ pub struct Gpu {
     pub family: String,
     /// discrete, coherent (GH200, GB200), unified (GB10); empty: unread.
     pub memory_class: String,
+    /// Effective memory offered by this machine; zero means the whole physical card.
+    pub memory_limit_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]

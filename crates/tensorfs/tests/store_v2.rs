@@ -1,8 +1,8 @@
-//! The v2 store through real processes and files: SIGKILL at each kill point of a put, a record
-//! commit and a GC, then reopen and check; a writer racing a collector; exact usage over shared
-//! chunks; and the two durability classes, counted by strace.
+//! The store through real processes and files: SIGKILL at each kill point of a put, a record
+//! commit and a GC, then reopen and check; a writer racing a collector; least recently used
+//! first over shared chunks; and the two durability classes, counted by strace.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -12,10 +12,9 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tensorfs::format::{
-    Body, Component, Dtype, Header, Location, Manifest, ObjectRef, Release, Repo, Tensor,
-    HEADER_PATH,
+    variant_of, Body, Component, Dtype, Header, Location, ObjectRef, Repo, Tag, Tensor, Tree,
 };
-use tensorfs::store2::{fault, Durability, Pin, Store};
+use tensorfs::store::{fault, Durability, Store};
 
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -55,7 +54,7 @@ fn bytes(tag: &str, n: usize) -> Vec<u8> {
         .collect()
 }
 
-/// A checkpoint: its chunks, a header over them, `files`, and the manifest; the manifest's ref.
+/// A tree: its variant `int8`'s chunks and header over them, and the repo `files`; its ref.
 fn checkpoint(store: &Store, chunks: &[Vec<u8>], files: &[(&str, Vec<u8>)]) -> ObjectRef {
     let chunks: Vec<ObjectRef> = chunks.iter().map(|c| store.put_bytes(c).unwrap()).collect();
     let tensors = chunks
@@ -78,40 +77,39 @@ fn checkpoint(store: &Store, chunks: &[Vec<u8>], files: &[(&str, Vec<u8>)]) -> O
     let unet = Component {
         name: "unet".into(),
         tensors,
+        ..Default::default()
     };
-    let header = Header::new(chunks, vec![unet], Default::default()).unwrap();
-    let mut manifest = Manifest::default();
-    let header = store.put_bytes(&header.to_cbor().unwrap()).unwrap();
-    manifest.files.insert(HEADER_PATH.into(), header);
+    let header = Header::new(chunks, None, vec![unet], Default::default()).unwrap();
+    let mut tree = Tree::default();
+    tree.set_variant("int8", store.put_bytes(&header.to_cbor().unwrap()).unwrap());
     for (path, file) in files {
-        manifest
-            .files
+        tree.files
             .insert((*path).into(), store.put_bytes(file).unwrap());
     }
-    store.put_bytes(&manifest.to_json().unwrap()).unwrap()
+    store.put_tree(&tree).unwrap()
 }
 
-fn repo(name: &str, manifest: ObjectRef) -> Repo {
+fn repo(name: &str, tree: ObjectRef) -> Repo {
     Repo {
         name: name.into(),
-        releases: vec![Release {
-            version: "1.0".into(),
-            lanes: BTreeMap::from([("int8".into(), manifest)]),
-            ..Default::default()
+        tags: vec![Tag {
+            name: "1.0".into(),
+            commit: tree,
+            public: true,
+            yanked: false,
         }],
-        ..Default::default()
     }
 }
 
-/// `root`, and when it is a manifest, its files and its header's chunks: walked here, apart from
-/// the store's own GC.
+/// `root`, and when it is a tree, its files and its headers' chunks: walked here, apart from the
+/// store's own GC.
 fn closure(store: &Store, root: &ObjectRef) -> BTreeSet<ObjectRef> {
     let mut reach = BTreeSet::from([root.clone()]);
-    let Ok(manifest) = store.read(root).map(|b| Manifest::from_json(&b)) else {
+    let Ok(Ok(tree)) = store.read(root).map(|b| Tree::from_json(&b)) else {
         return reach;
     };
-    for (path, file) in manifest.into_iter().flat_map(|m| m.files) {
-        if path == HEADER_PATH {
+    for (path, file) in tree.files {
+        if variant_of(&path).is_some() {
             let header = Header::from_cbor(&store.read(&file).unwrap()).unwrap();
             reach.extend(header.chunks);
         }
@@ -120,20 +118,18 @@ fn closure(store: &Store, root: &ObjectRef) -> BTreeSet<ObjectRef> {
     reach
 }
 
-/// Everything a pin or a ref reaches.
+/// Everything a `local/` ref reaches.
 fn live(store: &Store) -> BTreeSet<ObjectRef> {
-    let mut roots: Vec<ObjectRef> = store
-        .pins()
-        .unwrap()
-        .into_iter()
-        .flat_map(|p| p.1.roots)
-        .collect();
-    for repo in store.refs().unwrap() {
-        for release in repo.releases {
-            roots.extend(release.lanes.into_values());
-        }
-    }
+    let local = store.refs().unwrap().into_iter().filter(|r| r.name.starts_with("local/"));
+    let roots: Vec<ObjectRef> = local.flat_map(|r| r.tags).map(|t| t.commit).collect();
     roots.iter().flat_map(|root| closure(store, root)).collect()
+}
+
+/// Roots `objects` under the local repo `name`: a tree of them, released.
+fn name_locally(store: &Store, name: &str, objects: &[ObjectRef]) {
+    let files = objects.iter().enumerate().map(|(i, o)| (format!("{i}.bin"), o.clone()));
+    let tree = store.put_tree(&Tree { files: files.collect() }).unwrap();
+    store.update_ref(name, |_| Some(repo(name, tree))).unwrap();
 }
 
 /// Every object under `blobs/`, as named on disk.
@@ -206,17 +202,16 @@ struct Request {
 #[derive(Serialize, Deserialize)]
 enum Job {
     Put(Vec<u8>),
-    Pin(String, Vec<ObjectRef>),
     Ref(String, ObjectRef),
     Gc,
-    /// Each round: a fresh object and a reused old one, pinned together, and a loose object.
+    /// Each round: a fresh object and a reused old one, rooted together, and a loose object.
     Writer {
         rounds: usize,
         old: Vec<Vec<u8>>,
     },
     /// One GC per line on stdin, until it closes.
     Collector,
-    /// Puts each object, pins them twice, touches the first pin.
+    /// Puts each object and a tree of them, and names that tree in two refs.
     Classes(Vec<Vec<u8>>),
 }
 
@@ -251,7 +246,6 @@ fn child() {
         Job::Put(object) => {
             store.put_bytes(&object).unwrap();
         }
-        Job::Pin(id, roots) => store.pin(&id, &Pin::new(roots)).unwrap(),
         Job::Ref(name, manifest) => {
             store
                 .update_ref(&name, |_| Some(repo(&name, manifest)))
@@ -266,9 +260,7 @@ fn child() {
                     .put_bytes(&bytes(&format!("fresh-{i}"), 3000))
                     .unwrap();
                 let again = store.put_bytes(&old[i % old.len()]).unwrap();
-                store
-                    .pin(&format!("w-{i}"), &Pin::new(vec![fresh, again]))
-                    .unwrap();
+                name_locally(&store, &format!("local/w-{i}"), &[fresh, again]);
                 store
                     .put_bytes(&bytes(&format!("loose-{i}"), 2000))
                     .unwrap();
@@ -288,9 +280,9 @@ fn child() {
                 .iter()
                 .map(|o| store.put_bytes(o).unwrap())
                 .collect();
-            store.pin("a", &Pin::new(roots.clone())).unwrap();
-            store.pin("b", &Pin::new(roots)).unwrap();
-            assert!(store.touch_pin("a").unwrap());
+            name_locally(&store, "local/a", &roots);
+            let tree = store.get_ref("local/a").unwrap().unwrap().tags[0].commit.clone();
+            store.update_ref("local/b", |_| Some(repo("local/b", tree))).unwrap();
         }
     }
     println!("DONE");
@@ -423,9 +415,6 @@ fn kill_during_a_record_commit_keeps_the_old_record_or_the_new() {
     let scratch = Scratch::here("records");
     let root = scratch.root();
     let store = Store::open(&root).unwrap();
-    let a = store.put_bytes(b"a").unwrap();
-    let b = store.put_bytes(b"b").unwrap();
-    store.pin("p", &Pin::new(vec![a.clone()])).unwrap();
     let first = checkpoint(&store, &[bytes("one", 5000)], &[]);
     let second = checkpoint(
         &store,
@@ -433,32 +422,28 @@ fn kill_during_a_record_commit_keeps_the_old_record_or_the_new() {
         &[("config.json", b"{}".to_vec())],
     );
     store
-        .update_ref("acme/model", |_| Some(repo("acme/model", first.clone())))
+        .update_ref("local/model", |_| Some(repo("local/model", first.clone())))
         .unwrap();
-    let nowhere = Pin::new(vec![ObjectRef::of(b"nowhere")]);
+    let nowhere = ObjectRef::of(b"nowhere");
     assert_eq!(
-        store.pin("q", &nowhere).unwrap_err().code(),
+        store
+            .update_ref("local/q", |_| Some(repo("local/q", nowhere)))
+            .unwrap_err()
+            .code(),
         "absent",
         "a root must be here"
     );
 
-    let both = Job::Pin("p".into(), vec![a.clone(), b.clone()]);
-    kill_at(&request(&root, Some("record.written"), both));
-    check(&store);
-    assert_eq!(store.get_pin("p").unwrap().unwrap().roots, vec![a.clone()]);
-    let both = Job::Pin("p".into(), vec![a.clone(), b.clone()]);
-    kill_at(&request(&root, Some("record.renamed"), both));
-    check(&store);
-    assert_eq!(store.get_pin("p").unwrap().unwrap().roots, vec![a, b]);
-
     let lane = |store: &Store| {
-        store.get_ref("ACME/Model").unwrap().unwrap().releases[0].lanes["int8"].clone()
+        store.get_ref("LOCAL/Model").unwrap().unwrap().tags[0]
+            .commit
+            .clone()
     };
-    let job = Job::Ref("acme/model".into(), second.clone());
+    let job = Job::Ref("local/model".into(), second.clone());
     kill_at(&request(&root, Some("record.written"), job));
     check(&store);
     assert_eq!(lane(&store), first);
-    let job = Job::Ref("acme/model".into(), second.clone());
+    let job = Job::Ref("local/model".into(), second.clone());
     kill_at(&request(&root, Some("record.renamed"), job));
     check(&store);
     assert_eq!(lane(&store), second);
@@ -469,15 +454,14 @@ fn kill_during_a_record_commit_keeps_the_old_record_or_the_new() {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect()
     };
-    assert_eq!(names("pins"), ["p.json"]);
-    assert_eq!(names("refs/acme"), ["model.json"]);
-    assert_eq!(tmp_files(&store).len(), 2, "two dead commits' temps");
+    assert_eq!(names("refs/local"), ["model.json"]);
+    assert_eq!(tmp_files(&store).len(), 1, "the dead commit's temp");
     store.clone().with_grace(Duration::ZERO).gc().unwrap();
     assert!(tmp_files(&store).is_empty());
     check(&store);
 }
 
-/// A ref'd checkpoint, a pinned blob, and five garbage objects; all of it two hours old.
+/// A ref'd checkpoint, a rooted blob, and five garbage objects; all of it two hours old.
 fn populated(root: &Path) -> (Store, Vec<ObjectRef>) {
     let store = Store::open(root).unwrap();
     let chunks: Vec<Vec<u8>> = (0..3)
@@ -489,10 +473,10 @@ fn populated(root: &Path) -> (Store, Vec<ObjectRef>) {
         &[("unet/config.json", b"{\"a\":1}".to_vec())],
     );
     store
-        .update_ref("acme/sdxl", |_| Some(repo("acme/sdxl", manifest)))
+        .update_ref("local/sdxl", |_| Some(repo("local/sdxl", manifest)))
         .unwrap();
     let media = store.put_bytes(&bytes("media", 50_000)).unwrap();
-    store.pin("run-1", &Pin::new(vec![media])).unwrap();
+    name_locally(&store, "local/run-1", &[media]);
     let garbage: Vec<ObjectRef> = (0..5)
         .map(|i| {
             store
@@ -513,8 +497,8 @@ fn kill_during_gc_never_loses_a_live_object() {
         let kept = live(&store);
         assert_eq!(
             kept.len(),
-            7,
-            "3 chunks, header, config, manifest; the pinned blob"
+            8,
+            "3 chunks, header, config, tree; the rooted blob and its tree"
         );
 
         kill_at(&request(&root, Some(point), Job::Gc));
@@ -537,7 +521,6 @@ fn kill_during_gc_never_loses_a_live_object() {
             garbage.len(),
             "{point}"
         );
-        assert_eq!(store.usage().unwrap().unreferenced, 0);
     }
 }
 
@@ -568,10 +551,36 @@ fn an_object_reused_while_gc_sweeps_it_survives() {
         let mut gc = Child::spawn(&request(&root, Some("gc.trashed"), Job::Gc));
         gc.wait_for("FAULT gc.trashed");
         assert_eq!(trash(&store), 1);
-        assert_eq!(
-            store.read(&object).unwrap(),
-            reused,
-            "it still reads mid-sweep"
+        // The collector holds an exclusive inode fence until it finishes its trash decision.
+        // A real reader waits for that fence. Keep the controller free to restore the
+        // namespace and resume GC; a synchronous read here would deadlock the fixture.
+        let (sent, received) = std::sync::mpsc::channel();
+        let (started, waiting) = std::sync::mpsc::sync_channel(0);
+        let reading = store.clone();
+        let read_object = object.clone();
+        let reader = std::thread::spawn(move || {
+            if started.send(()).is_ok() {
+                let _ = sent.send(reading.read(&read_object));
+            }
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reader thread never started");
+        let probe = File::open(root.join("tmp/gc").join(&object.sha256)).unwrap();
+        assert!(
+            matches!(
+                probe.try_lock_shared(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
+            "GC did not hold the actual trash inode's exclusive fence"
+        );
+        drop(probe);
+        assert!(
+            matches!(
+                received.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the reader completed while GC held the exclusive inode fence"
         );
         if put {
             assert_eq!(store.put_bytes(&reused).unwrap(), object);
@@ -580,13 +589,22 @@ fn an_object_reused_while_gc_sweeps_it_survives() {
         }
         assert_eq!(trash(&store), 0);
         gc.resume();
+        let read = received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reader stayed blocked after GC resumed");
+        reader.join().expect("the reader thread panicked");
+        assert_eq!(
+            read.unwrap(),
+            reused,
+            "the concurrent reader gets the exact bytes"
+        );
         gc.finish();
         assert!(store.verify(&object).unwrap());
     }
 }
 
 #[test]
-fn a_writer_racing_a_collector_loses_nothing_young_or_pinned() {
+fn a_writer_racing_a_collector_loses_nothing_young_or_rooted() {
     let scratch = Scratch::here("gc-writer");
     let root = scratch.root();
     let store = Store::open(&root).unwrap();
@@ -615,10 +633,11 @@ fn a_writer_racing_a_collector_loses_nothing_young_or_pinned() {
     store.gc().unwrap();
     check(&store);
     for i in 0..rounds {
-        let pin = store.get_pin(&format!("w-{i}")).unwrap().unwrap();
-        assert_eq!(pin.roots[1], reused[i % 20]);
-        for root in &pin.roots {
-            assert!(store.verify(root).unwrap(), "pinned object lost");
+        let named = store.get_ref(&format!("local/w-{i}")).unwrap().unwrap();
+        let files = store.tree(&named.tags[0].commit).unwrap().files;
+        assert_eq!(files["1.bin"], reused[i % 20]);
+        for object in files.values() {
+            assert!(store.verify(object).unwrap(), "rooted object lost");
         }
         let loose = ObjectRef::of(&bytes(&format!("loose-{i}"), 2000));
         assert!(store.verify(&loose).unwrap(), "a young object was swept");
@@ -628,9 +647,11 @@ fn a_writer_racing_a_collector_loses_nothing_young_or_pinned() {
     }
 }
 
+/// Uses go least recently used first, until enough would be free, and only those unused for
+/// long enough; what a root keeps never goes.
 #[test]
-fn usage_counts_shared_objects_once_and_collect_drops_the_least_recent_pin() {
-    let scratch = Scratch::here("usage");
+fn collect_drops_the_least_recently_used_first_and_never_a_root() {
+    let scratch = Scratch::here("lru");
     let store = Store::open(scratch.root()).unwrap();
     let chunk = |name: &str, n: usize| bytes(name, n);
     let config = ("unet/config.json", b"{\"layers\":4}".to_vec());
@@ -645,74 +666,46 @@ fn usage_counts_shared_objects_once_and_collect_drops_the_least_recent_pin() {
         std::slice::from_ref(&config),
     );
     let m3 = checkpoint(&store, &[chunk("C", 400)], &[]);
-    let e = store.put_bytes(&chunk("E", 1600)).unwrap();
+    let e = checkpoint(&store, &[chunk("E", 1600)], &[]);
     let g = store.put_bytes(&chunk("G", 3200)).unwrap();
     store
-        .update_ref("acme/m3", |_| Some(repo("acme/m3", m3.clone())))
+        .update_ref("local/m3", |_| Some(repo("local/m3", m3.clone())))
         .unwrap();
-    let pin = |id: &str, roots: Vec<ObjectRef>, last_use: u64| {
-        let pin = Pin {
-            last_use,
-            owner: Some("tensord".into()),
-            roots,
-        };
-        store.pin(id, &pin).unwrap();
-    };
-    pin("p1", vec![m1.clone(), m1.clone()], 1_000);
-    pin("p2", vec![m2.clone()], 2_000);
-    pin("p3", vec![e.clone()], 3_000);
+    // One use of each but m3, the oldest first.
+    for (tree, hours) in [(&m1, 3), (&m2, 2), (&e, 1)] {
+        drop(store.variant(tree, None).unwrap());
+        let used = File::open(store.root().join("uses").join(&tree.sha256)).unwrap();
+        used.set_modified(SystemTime::now() - hours * HOUR).unwrap();
+    }
+    age(&store, blobs(&store), 2 * HOUR);
 
     let size = |objects: &BTreeSet<ObjectRef>| objects.iter().map(|o| o.length).sum::<u64>();
-    let (c1, c2, c3) = (
+    let (c1, c2, c3, ce) = (
         closure(&store, &m1),
         closure(&store, &m2),
         closure(&store, &m3),
+        closure(&store, &e),
     );
-    let only =
-        |mine: &BTreeSet<ObjectRef>, others: &[&BTreeSet<ObjectRef>]| -> BTreeSet<ObjectRef> {
-            mine.iter()
-                .filter(|o| others.iter().all(|s| !s.contains(*o)))
-                .cloned()
-                .collect()
-        };
-    let p1_only = only(&c1, &[&c2, &c3]);
-    assert_eq!(p1_only.len(), 3, "M1, its header, and A");
-    let all = blobs(&store);
-    assert_eq!(
-        all.len(),
-        13,
-        "6 blobs, 3 headers, 1 shared config, 3 manifests"
-    );
+    let only = |mine: &BTreeSet<ObjectRef>, others: &[&BTreeSet<ObjectRef>]| -> BTreeSet<ObjectRef> {
+        let shared = |o: &&ObjectRef| others.iter().any(|s| s.contains(*o));
+        mine.iter().filter(|o| !shared(o)).cloned().collect()
+    };
+    let m1_only = only(&c1, &[&c2, &c3, &ce]);
+    assert_eq!(m1_only.len(), 3, "its tree, its header, and A");
 
-    let usage = store.usage().unwrap();
-    assert_eq!(usage.objects, 13);
-    assert_eq!(usage.bytes, size(&all));
-    assert_eq!(usage.refs, size(&c3));
-    assert_eq!(usage.unreferenced, g.length);
-    assert_eq!(usage.pins["p1"].bytes, size(&c1));
-    assert_eq!(usage.pins["p1"].marginal, size(&p1_only));
-    assert_eq!(usage.pins["p2"].bytes, size(&c2));
-    assert_eq!(usage.pins["p2"].marginal, size(&only(&c2, &[&c1, &c3])));
-    assert_eq!(usage.pins["p3"].marginal, 1600);
-    assert_eq!(usage.pins["p3"].owner.as_deref(), Some("tensord"));
-    let sum: u64 =
-        usage.pins.values().map(|p| p.marginal).sum::<u64>() + usage.refs + usage.unreferenced;
-    assert!(sum < usage.bytes, "shared objects belong to no single pin");
-
-    age(&store, all, 2 * HOUR);
     let collected = store.collect(g.length + 1, Duration::ZERO).unwrap();
-    assert_eq!(collected.pins, ["p1"]);
-    assert_eq!(collected.objects, 4, "G and p1's own three");
-    assert_eq!(collected.bytes, g.length + size(&p1_only));
-    let left = store.usage().unwrap();
-    assert_eq!(left.pins.keys().collect::<Vec<_>>(), ["p2", "p3"]);
-    assert_eq!(left.bytes, usage.bytes - collected.bytes);
+    assert_eq!(collected.uses, std::slice::from_ref(&m1.sha256));
+    assert_eq!(collected.objects, 4, "G and m1's own three");
+    assert_eq!(collected.bytes, g.length + size(&m1_only));
     check(&store);
 
-    assert!(store.touch_pin("p2").unwrap());
-    let stale = store.collect(u64::MAX, HOUR).unwrap();
-    assert_eq!(stale.pins, ["p3"], "a pin used within the hour stays");
-    assert_eq!(stale.bytes, 1600);
+    let stale = store.collect(u64::MAX, HOUR * 3 / 2).unwrap();
+    assert_eq!(stale.uses, std::slice::from_ref(&m2.sha256), "a use within the hour and a half stays");
+    let m2_only = only(&c2, &[&c3, &ce]);
+    assert_eq!((stale.objects, stale.bytes), (m2_only.len() as u64, size(&m2_only)));
+    for object in c3.union(&ce) {
+        assert!(store.verify(object).unwrap(), "{} is kept", object.sha256);
+    }
     check(&store);
 }
 
@@ -760,10 +753,15 @@ fn open_creates_only_in_an_empty_place_and_refuses_another_format() {
     fs::write(busy.join("notes.txt"), "mine").unwrap();
     assert_eq!(Store::open(&busy).unwrap_err().code(), "invalid");
     assert!(!busy.join("blobs").exists());
+    let old = scratch.0.join("old");
+    fs::create_dir_all(&old).unwrap();
+    fs::write(old.join("format"), r#"{"format":"tensorfs.store/2"}"#).unwrap();
+    let refused = Store::open(&old).unwrap_err();
+    assert!(refused.to_string().contains("pull again"), "{refused}");
     let fresh = Store::open(scratch.root()).unwrap();
     assert_eq!(
         fs::read_to_string(fresh.root().join("format")).unwrap(),
-        r#"{"format":"tensorfs.store/2"}"#
+        r#"{"format":"tensorfs.store/3"}"#
     );
     Store::open(scratch.root()).unwrap();
 }
@@ -795,8 +793,8 @@ fn durable_flushes_each_object_and_ephemeral_syncs_once() {
     Child::traced(&job, &log).finish();
     assert_eq!(
         calls(&log, "fdatasync"),
-        5,
-        "3 objects and 2 pins; a touch is not flushed"
+        6,
+        "3 objects, their tree and 2 refs"
     );
     assert!(calls(&log, "fsync") >= 5, "each one's directory");
     assert_eq!(calls(&log, "syncfs"), 0);
@@ -814,7 +812,7 @@ fn durable_flushes_each_object_and_ephemeral_syncs_once() {
     assert_eq!(
         calls(&log, "syncfs"),
         1,
-        "one syncfs, before the first pin names the objects"
+        "one syncfs, before the first ref names the objects"
     );
     check(&store);
 }
@@ -829,7 +827,7 @@ fn children_forked_meanwhile_never_make_the_store_busy() {
     let store = Store::open(&root).unwrap();
     let anchor = store.put_bytes(b"anchor").unwrap();
     store
-        .update_ref("acme/fork", |_| Some(repo("acme/fork", anchor)))
+        .update_ref("local/fork", |_| Some(repo("local/fork", anchor)))
         .unwrap();
     let stop = std::sync::atomic::AtomicBool::new(false);
     let rounds = 150;
@@ -857,12 +855,9 @@ fn children_forked_meanwhile_never_make_the_store_busy() {
         let other = Child::spawn(&request(&root, None, writer));
         for i in 0..rounds {
             let object = store.put_bytes(&bytes(&format!("fork-{i}"), 1500)).unwrap();
+            name_locally(&store, &format!("local/f-{}", i % 8), std::slice::from_ref(&object));
             store
-                .pin(&format!("f-{}", i % 8), &Pin::new(vec![object.clone()]))
-                .unwrap();
-            assert!(store.touch_pin(&format!("f-{}", i % 8)).unwrap());
-            store
-                .update_ref("acme/fork", |_| Some(repo("acme/fork", object)))
+                .update_ref("local/fork", |_| Some(repo("local/fork", object)))
                 .unwrap();
         }
         other.finish();

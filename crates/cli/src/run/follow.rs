@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use protocol::{
     calcifer::{
         Adjustment, Event, Machine, MachineState, OutputItem, Progress, Run, Status, SubmitRun,
@@ -17,7 +18,6 @@ use protocol::{
     },
     error::{Error, Kind},
 };
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::{
     Context,
@@ -243,8 +243,11 @@ pub(crate) fn record(ctx: &Context, run: &Run) {
     next(ctx, run);
 }
 
-/// A checkpoint as a record shows it: its digest, the machine it stays on, and how to publish it.
+/// A checkpoint's TensorFS reference, or the location of its legacy manifest bytes.
 fn checkpoint(run: &Run, item: &OutputItem) -> String {
+    if let Some(reference) = &item.checkpoint {
+        return checkpoint_reference(reference);
+    }
     let digest = item
         .sha256
         .map_or_else(|| "not final yet".into(), |d| d.to_string());
@@ -253,6 +256,14 @@ fn checkpoint(run: &Run, item: &OutputItem) -> String {
         "checkpoint {digest} on {on} (`cozy run upload {}#{} <org/model>`)",
         run.number, item.name
     )
+}
+
+fn checkpoint_reference(reference: &protocol::machine::CheckpointRef) -> String {
+    let mut shown = format!("checkpoint {}@{}", reference.repo_id, reference.revision);
+    if !reference.variant.is_empty() {
+        let _ = write!(shown, " (variant {})", reference.variant);
+    }
+    shown
 }
 
 /// The record's fields, for a person.
@@ -478,12 +489,15 @@ impl View {
                 if let Some(error) = &item.export_error {
                     self.line(&format!("  {}  not saved: {error}", item_name(item)));
                 } else if item.is_checkpoint() && self.named.insert(item.id.clone()) {
-                    let on = self.machine.as_deref().unwrap_or("its machine");
-                    let digest = item.sha256.map(|d| d.to_string()).unwrap_or_default();
-                    self.line(&format!(
-                        "  {}  checkpoint {digest} on {on}",
-                        item_name(item)
-                    ));
+                    let shown = match &item.checkpoint {
+                        Some(reference) => checkpoint_reference(reference),
+                        None => {
+                            let on = self.machine.as_deref().unwrap_or("its machine");
+                            let digest = item.sha256.map(|d| d.to_string()).unwrap_or_default();
+                            format!("checkpoint {digest} on {on}")
+                        }
+                    };
+                    self.line(&format!("  {}  {shown}", item_name(item)));
                 }
             }
             Event::Log { level, text, .. } if !matches!(level.as_str(), "info" | "debug") => {
@@ -644,6 +658,7 @@ mod tests {
                 sha256: None,
                 path: path.map(Into::into),
                 export_error: error.map(Into::into),
+                checkpoint: None,
             })
             .collect();
         run
@@ -680,5 +695,27 @@ mod tests {
             assert_eq!(owed(&run), owes, "{output:?}");
             assert_eq!(saved(run).is_ok(), saves, "{output:?}");
         }
+    }
+
+    #[test]
+    fn a_tensorfs_checkpoint_is_shown_as_a_reference_without_a_byte_export() {
+        let mut run = run(&[("weights", "", None, None)]);
+        run.output[0].checkpoint = Some(protocol::machine::CheckpointRef {
+            repo_id: "local/derived".into(),
+            revision: "sha256:tree".into(),
+            variant: String::new(),
+            tag: String::new(),
+        });
+        assert!(!owed(&run));
+        assert_eq!(
+            checkpoint(&run, &run.output[0]),
+            "checkpoint local/derived@sha256:tree"
+        );
+        run.output[0].checkpoint.as_mut().unwrap().variant = "fp8".into();
+        assert_eq!(
+            checkpoint(&run, &run.output[0]),
+            "checkpoint local/derived@sha256:tree (variant fp8)"
+        );
+        assert!(saved(run).is_ok());
     }
 }

@@ -3,7 +3,8 @@
 //! block strategy).
 
 use super::grid::Grid;
-use super::{elem, logical, table, Allowed, Ctx, Dtypes, Param, Part, Scheme, View};
+use super::plan::Codes;
+use super::{logical, Allowed, Ctx, Param, Part, Scheme, View};
 use crate::format::Value;
 
 pub const BLOCKWISE: Scheme = Scheme {
@@ -14,21 +15,12 @@ pub const BLOCKWISE: Scheme = Scheme {
             key: "block_size",
             allowed: Allowed::Check(block_size, "[rows, cols], each a positive integer"),
         },
-        Param {
-            key: "scale_dtype",
-            allowed: Allowed::Text(&["F32", "BF16", "F16", "F8_E8M0"]),
-        },
     ],
     parts: &[
-        Part::req("weight", Dtypes::Of(&["F8_E4M3"]), logical),
-        Part::req("scale", Dtypes::Param("scale_dtype"), |c| tiles(c).shape(c)),
+        Part::req("weight", &["F8_E4M3"], logical),
+        Part::req("scale", &["F32", "BF16", "F16", "F8_E8M0"], |c| tiles(c).shape(c)),
     ],
-    decode: |c| {
-        let w = c.part("weight");
-        let t = elem::table(w.dtype).expect("an 8-bit element format");
-        let codes = table::bytes(w.bytes);
-        table::decode(&codes, &t, &c.floats("scale"), &tiles(c), c.rows, c.cols)
-    },
+    decode: |c| Ok(Codes::elements(c.part("weight"), c.part("scale"), tiles(c)).into()),
 };
 
 fn block_size(v: &Value) -> bool {
@@ -36,7 +28,7 @@ fn block_size(v: &Value) -> bool {
 }
 
 /// The tile grid of `block_size` over each matrix.
-fn tiles(c: &Ctx) -> Grid<'static> {
+fn tiles(c: &Ctx) -> Grid {
     let Value::List(b) = c.param("block_size") else {
         unreachable!("checked against the row")
     };
@@ -44,6 +36,5 @@ fn tiles(c: &Ctx) -> Grid<'static> {
     Grid::Tiles {
         rows: n(0),
         cols: n(1),
-        height: c.shape[c.shape.len() - 2] as usize,
     }
 }

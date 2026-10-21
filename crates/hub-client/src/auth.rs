@@ -6,15 +6,12 @@ use std::sync::Arc;
 
 use crate::Client;
 use crate::device::UserSession;
-use crate::run::RunToken;
 
 #[derive(Clone)]
 pub enum Credential {
     Anonymous,
     /// A signed-in user: a Bearer from device-key login, minted again when stale or refused.
     User(Arc<UserSession>),
-    /// A run on a machine: the owner's capability, traded once for a DPoP-bound token.
-    Run(Arc<RunToken>),
     /// A fixed Bearer: an enrollment's email-proven token, for the calls only it may make.
     Bearer(String),
     /// A rental pod's worker capability, on the worker edge.
@@ -35,7 +32,6 @@ impl std::fmt::Debug for Auth {
         let kind = match &self.credential {
             Credential::Anonymous => "anonymous",
             Credential::User(_) => "user",
-            Credential::Run(_) => "run",
             Credential::Bearer(_) => "bearer",
             Credential::Worker { .. } => "worker",
         };
@@ -65,20 +61,8 @@ impl Client {
             Credential::Anonymous => vec![],
             Credential::User(session) => {
                 // Login is itself a call through this client: boxed, as the future recurses.
-                let token = Box::pin(session.bearer(&self.anonymous())).await?;
+                let token = Box::pin(session.bearer(&self.anonymous())).await?.token;
                 vec![("authorization", format!("Bearer {token}"))]
-            }
-            Credential::Run(run) => {
-                let token = run.token(self.client()).await?;
-                let method = request.method().as_str().to_string();
-                let url = request.url();
-                run.present(
-                    &token,
-                    &method,
-                    url.host_str().unwrap_or_default(),
-                    url.path(),
-                )
-                .into()
             }
             Credential::Bearer(token) => vec![("authorization", format!("Bearer {token}"))],
             Credential::Worker { id, token } => {
@@ -110,9 +94,9 @@ impl ClientHooks<Auth> for Client {
             .map_err(|e| CallError::Custom(e.to_string()))
     }
 
-    /// Sends the request; a refused Bearer logs in again and a new DPoP nonce re-proves, each
-    /// once. The first answer stands when the second credential cannot be had. A refusal
-    /// without the Hub's envelope (a proxy's page, an empty body) keeps its status.
+    /// Sends the request; a refused Bearer logs in again, once. The first answer stands when the
+    /// second Bearer cannot be had. A refusal without the Hub's envelope (a proxy's page, an
+    /// empty body) keeps its status.
     async fn exec(
         &self,
         request: reqwest::Request,
@@ -134,16 +118,9 @@ impl Client {
         let (Some(mut again), Some(token)) = (again, token) else {
             return Ok(response);
         };
-        let retry = match &self.inner().credential {
-            Credential::User(session) if response.status() == 401 => {
-                session.refused(&token).await;
-                true
-            }
-            Credential::Run(run) => run.answered(again.url(), &token, &response),
-            _ => false,
-        };
-        if !retry {
-            return Ok(response);
+        match &self.inner().credential {
+            Credential::User(session) if response.status() == 401 => session.refused(&token).await,
+            _ => return Ok(response),
         }
         match self.present(&mut again).await {
             Ok(_) => self.client().execute(again).await,
@@ -217,7 +194,7 @@ async fn enveloped(response: reqwest::Response) -> reqwest::Result<reqwest::Resp
     Ok(rebuilt.into())
 }
 
-/// The token a request carries, Bearer or DPoP.
+/// The Bearer a request carries.
 fn presented(request: &reqwest::Request) -> Option<String> {
     let value = request.headers().get("authorization")?.to_str().ok()?;
     let (_, token) = value.split_once(' ')?;

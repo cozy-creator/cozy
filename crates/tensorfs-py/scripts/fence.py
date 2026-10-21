@@ -2,9 +2,9 @@
 """The two architecture fences boundaries.md actually mandates.
 
 1. forbidden dependencies — core is torch/CUDA/server-DB/hub-free. The one HTTP client
-   (`src/fetch/net.rs`, xs-045) is the one exception, beside the v1 `src/transport/` until
-   TensorD leaves it: every other HTTP/TLS stack stays denied everywhere so a second byte
-   mover cannot grow beside it.
+   (`src/fetch/net.rs`, xs-045) is the one exception: every other HTTP/TLS stack stays denied
+   everywhere, tests included, so a second byte mover cannot grow beside it. Other modules
+   name HTTP types through net.rs.
 2. no upward imports    — core < py; a crate may name only lower ranks
 
 Everything else that lived here was a word blacklist over source text: it could not tell
@@ -23,7 +23,7 @@ DENY = ["torch", "cudarc", "cust", "tch", "reqwest", "hyper", "ureq", "curl", "o
         "rustls", "native-tls", "webpki", "sqlx", "postgres", "tensorhub-v2",
         "cozy-creator-v2", "cozy-runtime-v2"]
 #: The one client's carve-out: these tokens are legal ONLY here.
-CLIENT = ("tensorfs/Cargo.toml", "tensorfs/src/fetch/net.rs", "tensorfs/src/transport/")
+CLIENT = ("tensorfs/Cargo.toml", "tensorfs/src/fetch/net.rs")
 ALLOW = {"rustls": CLIENT, "webpki": CLIENT, "hyper": CLIENT}
 RANK = {"tensorfs": 0, "varena": 1, "tensorfs-py": 2}
 SCAN = [f"{crate}/{files}" for crate in RANK for files in ("Cargo.toml", "src/**/*.rs")]

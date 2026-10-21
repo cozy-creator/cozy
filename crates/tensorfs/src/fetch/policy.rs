@@ -204,15 +204,6 @@ impl std::fmt::Debug for Resolved {
 }
 
 impl Resolved {
-    /// Answers a test hands the policy for a name, as a resolver would.
-    #[cfg(test)]
-    pub(crate) fn seed(&self, host: &str, port: u16, addrs: Vec<SocketAddr>) {
-        self.0
-            .lock()
-            .unwrap()
-            .insert((host.to_string(), port), Arc::new(Mutex::new(Some(addrs))));
-    }
-
     fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
         let slot = Arc::clone(
             self.0

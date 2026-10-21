@@ -2,11 +2,12 @@
 //! codes offset by `2^(b−1)` and packed along K in `I32` words, a scale (and, asymmetric, a zero
 //! point packed along N) per group of inputs.
 
-use super::affine::{dequant, Codes, Fill, Offset, Order, Packing};
+use super::affine::{Codes, Fill, Order, Packing};
 use super::gptq::{bits, ints, I32};
 use super::grid::{Grid, ScaleLayout};
-use super::{Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
-use crate::format::Result;
+use super::plan::{self, Elems, Term};
+use super::{Allowed, Ctx, Param, Part, Plan, Scheme, Shape, View};
+use crate::format::{Dtype, Result};
 
 pub const INT1: Scheme = scheme("ct.int1");
 pub const INT2: Scheme = scheme("ct.int2");
@@ -50,7 +51,7 @@ const PARTS: &[Part] = &[
     Part::req("weight_packed", I32, |c| {
         packing(c, 1).shape(c.lead(), c.rows, c.cols)
     }),
-    Part::req("weight_scale", Dtypes::Of(&["F32", "BF16", "F16"]), |c| {
+    Part::req("weight_scale", &["F32", "BF16", "F16"], |c| {
         blocks(c, None).shape(c)
     }),
     Part::opt("weight_zero_point", I32, |c| {
@@ -59,7 +60,7 @@ const PARTS: &[Part] = &[
         };
         Ok(Shape::Exact([matrices_lead(c), &one[..]].concat()))
     }),
-    Part::req("weight_shape", Dtypes::Of(&["I32", "I64"]), |c| {
+    Part::req("weight_shape", &["I32", "I64"], |c| {
         Ok(Shape::Exact(vec![c.shape.len() as u64]))
     }),
     Part::opt("weight_g_idx", I32, |c| {
@@ -102,7 +103,7 @@ pub fn words(bits: u32, fill: Fill, axis: usize) -> Packing<'static> {
     }
 }
 
-fn blocks<'a>(c: &Ctx, index: Option<&'a [u32]>) -> Grid<'a> {
+fn blocks(c: &Ctx, index: Option<Vec<u32>>) -> Grid {
     Grid::Blocks {
         size: c.uint("group_size"),
         layout: ScaleLayout::RowMajor,
@@ -111,7 +112,7 @@ fn blocks<'a>(c: &Ctx, index: Option<&'a [u32]>) -> Grid<'a> {
 }
 
 /// `(q − zp) × s(i, b)`, or `q × s(i, b)` when symmetric; `b` is `⌊j/g⌋`, or `weight_g_idx[j]`.
-fn decode(c: &Ctx) -> Result<Vec<f32>> {
+fn decode<'a>(c: &Ctx<'a>) -> Result<Plan<'a>> {
     let stored = c.part("weight_shape");
     let stated: Vec<i64> = match stored.dtype.name() {
         "I32" => ints(stored.bytes).into_iter().map(i64::from).collect(),
@@ -133,28 +134,32 @@ fn decode(c: &Ctx) -> Result<Vec<f32>> {
     if c.flag("symmetric") == c.has("weight_zero_point") {
         return Err(c.fail("weight_zero_point is present exactly when not symmetric"));
     }
-    let q = packing(c, 1).unpack(c.part("weight_packed").bytes, c.rows, c.cols)?;
-    let mut z = Vec::new();
+    let mut term = Term::None;
     if c.has("weight_zero_point") {
-        // Each matrix's `[N, W]` zero points, packed along N.
+        // Each matrix's `[N, W]` zero points, packed along N: `I8` codes.
         let (p, n) = (packing(c, 0), height(c));
         let matrix = p.words(n)? * w * 4;
+        let mut z = Vec::new();
         for m in c.part("weight_zero_point").bytes.chunks(matrix.max(1)) {
-            z.extend(p.unpack(m, n, w)?.into_iter().map(|v| v as f32));
+            z.extend(p.unpack(m, n, w)?.into_iter().map(|v| v as i8 as u8));
         }
+        term = Term::Zero(Elems {
+            dtype: Dtype::I8,
+            bytes: z.into(),
+        });
     }
     let index = match c.has("weight_g_idx") {
         true => act_order(c, g, w)?,
         false => None,
     };
-    let grid = blocks(c, index.as_deref());
+    let grid = blocks(c, index);
     grid.check(c)?;
-    let s = c.floats("weight_scale");
-    let offset = match c.has("weight_zero_point") {
-        true => Offset::Zero(&z),
-        false => Offset::None,
-    };
-    Ok(dequant(&q, &s, offset, &grid, c.rows, c.cols))
+    let weight = c.part("weight_packed").bytes;
+    Ok(plan::Codes {
+        term,
+        ..plan::Codes::new(weight, packing(c, 1), c.part("weight_scale"), grid)
+    }
+    .into())
 }
 
 /// `weight_g_idx` as each column's group. compressed-tensors groups the columns sorted by it in

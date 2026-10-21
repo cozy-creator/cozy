@@ -22,10 +22,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use platform::durable::Mode;
 
-use super::origin::{pick, split_name, Location, Origin};
+use super::origin::{parse_repo, split_name, Location, Origin};
 use super::ObjectStore;
 use crate::err::{Code, Refusal, Result};
-use crate::format::{repo_key, ObjectRef};
+use crate::format::{repo_key, ObjectRef, Repo};
 
 /// Bytes per read or write call into the volume: each call is progress.
 pub(crate) const STEP: usize = 8 << 20;
@@ -264,12 +264,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
 
 #[async_trait]
 impl Origin for VolumeOrigin {
-    async fn resolve(
-        &self,
-        name: &str,
-        release: Option<&str>,
-        lane: Option<&str>,
-    ) -> Result<ObjectRef> {
+    async fn repo_of(&self, name: &str) -> Result<Repo> {
         split_name(name)?;
         let path = self.0.root.join(repo_key(name));
         let read =
@@ -286,7 +281,7 @@ impl Origin for VolumeOrigin {
             },
             detail: format!("{}: {error}", path.display()),
         })?;
-        pick(name, &bytes, release, lane)
+        parse_repo(name, &bytes)
     }
 
     async fn locate(&self, objects: &[ObjectRef]) -> Result<Vec<Location>> {

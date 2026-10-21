@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use tensorfs::fetch::{Client, SourcePolicy};
 use tensorfs::format::{
-    Body, Component, Dtype, Header, Location, Manifest, ObjectRef, Release, Repo, Tensor,
+    Body, Component, Dtype, Header, Location, ObjectRef, Repo, Tensor, Tree,
 };
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 
 pub const MIB: usize = 1 << 20;
 
@@ -93,10 +93,12 @@ pub fn blobs(root: &Path) -> BTreeMap<String, Vec<u8>> {
 // ------------------------------------------------------------------ a checkpoint
 
 pub struct Model {
-    pub manifest: ObjectRef,
+    pub tree: ObjectRef,
     pub header: ObjectRef,
     /// Chunk refs by component.
     pub chunks: BTreeMap<String, Vec<ObjectRef>>,
+    /// The tokenizer component's asset.
+    pub assets: Vec<ObjectRef>,
     /// Every object of the closure.
     pub objects: Vec<ObjectRef>,
 }
@@ -127,13 +129,13 @@ fn put(origin: &Path, bytes: &[u8]) -> ObjectRef {
     object
 }
 
-/// `name` at release 1.0, lane `int8`, written into `origin` as a static origin: per component,
-/// chunks of the given sizes, each holding one U8 tensor (the first component's first tensor
-/// spans its first two chunks), plus a config per component and a tokenizer file.
+/// `name` at release 1.0, variant `int8`, written into `origin` as a static origin: per
+/// component, chunks of the given sizes, each holding one U8 tensor (the first component's first
+/// tensor spans its first two chunks), and a config; a tokenizer component with one asset; a
+/// README beside the variant in the tree.
 pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u64) -> Model {
     let (mut objects, mut parsed) = (Vec::new(), Vec::new());
     let mut chunks = BTreeMap::new();
-    let mut files = BTreeMap::new();
     for (c, (component, sizes)) in components.iter().enumerate() {
         let mut tensors = Vec::new();
         let first = objects.len();
@@ -160,51 +162,43 @@ pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u
             });
         }
         chunks.insert(component.to_string(), objects[first..].to_vec());
+        let config = serde_json::json!({"component": component, "seed": seed});
         parsed.push(Component {
             name: component.to_string(),
+            config: config.as_object().unwrap().clone(),
             tensors,
-        });
-        files.insert(
-            format!("{component}/config.json"),
-            put(
-                origin,
-                format!("{{\"component\":\"{component}\",\"seed\":{seed}}}").as_bytes(),
-            ),
-        );
-    }
-    files.insert(
-        "tokenizer/vocab.json".into(),
-        put(origin, &noise(seed + 7, 3000)),
-    );
-    let header = Header::new(objects, parsed, Default::default()).unwrap();
-    let header_ref = put(origin, &header.to_cbor().unwrap());
-    files.insert("model.cozytensors".into(), header_ref.clone());
-    let manifest = Manifest {
-        files,
-        ..Default::default()
-    };
-    let manifest_ref = put(origin, &manifest.to_json().unwrap());
-    let repo = Repo {
-        name: name.into(),
-        releases: vec![Release {
-            version: "1.0".into(),
-            lanes: [("int8".to_string(), manifest_ref.clone())].into(),
             ..Default::default()
-        }],
+        });
+    }
+    let vocab = put(origin, &noise(seed + 7, 3000));
+    parsed.push(Component {
+        name: "tokenizer".into(),
+        class: "transformers.CLIPTokenizer".into(),
+        assets: [("vocab.json".to_string(), vocab.clone())].into(),
         ..Default::default()
-    };
+    });
+    let header = Header::new(objects, None, parsed, Default::default()).unwrap();
+    let header_ref = put(origin, &header.to_cbor().unwrap());
+    let mut tree = Tree::default();
+    tree.files.insert("README.md".into(), put(origin, format!("# {name}\n").as_bytes()));
+    tree.set_variant("int8", header_ref.clone());
+    let tree_ref = put(origin, &tree.to_json().unwrap());
+    let mut repo = Repo::new(name);
+    repo.set_tag("1.0", tree_ref.clone());
+    repo.tags[0].public = true;
     let path = origin.join(repo.key());
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, repo.to_json().unwrap()).unwrap();
-    let mut objects: Vec<ObjectRef> = manifest.files.values().cloned().collect();
-    objects.extend(header.chunks.iter().cloned());
-    objects.push(manifest_ref.clone());
+    let mut objects: Vec<ObjectRef> = tree.files.values().cloned().collect();
+    objects.extend(header.objects().cloned());
+    objects.push(tree_ref.clone());
     objects.sort();
     objects.dedup();
     Model {
-        manifest: manifest_ref,
+        tree: tree_ref,
         header: header_ref,
         chunks,
+        assets: vec![vocab],
         objects,
     }
 }

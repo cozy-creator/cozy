@@ -37,7 +37,7 @@ pub(crate) struct Hubs {
     home: Home,
     pub(crate) configured: Vec<config::Hub>,
     listings: Mutex<HashMap<String, Listing>>,
-    /// This computer's account at each Hub, for runs' capabilities.
+    /// This computer's account at each Hub and where machines read it, for runs' access.
     pub(crate) facts: Mutex<HashMap<config::Origin, crate::access::Facts>>,
 }
 
@@ -857,7 +857,7 @@ impl Machines {
                             ask.hub
                         )));
                     }
-                    Err(hub_client::Error::Hub { status, .. }) if status < 500 => released = true,
+                    Err(e) if e.refused() => released = true,
                     Err(e) => warn!(rental = id, "releasing it: {e}"),
                 }
             }
@@ -935,13 +935,9 @@ enum Asked {
 }
 
 fn asked(origin: &str, e: hub_client::Error) -> Asked {
-    match &e {
-        hub_client::Error::Hub { status, .. }
-            if *status < 500 && *status != 408 && *status != 429 =>
-        {
-            Asked::Refused(hub_refusal(origin, e))
-        }
-        _ => Asked::Unanswered(hub_refusal(origin, e)),
+    match e.refused() {
+        true => Asked::Refused(hub_refusal(origin, e)),
+        false => Asked::Unanswered(hub_refusal(origin, e)),
     }
 }
 
@@ -954,14 +950,8 @@ pub(crate) fn hub_refusal(origin: &str, e: hub_client::Error) -> Error {
             message,
             remedy,
         } => {
-            let kind = match status {
-                400 | 422 => Kind::Validation,
-                401 | 403 => Kind::Credential,
-                404 => Kind::NotFound,
-                402 | 409 => Kind::Conflict,
-                _ => Kind::Unavailable,
-            };
-            let error = Error::new(kind, "hub_refused", format!("{origin}: {message}")).cause(code);
+            let error = Error::new(Kind::of_http(status), "hub_refused", format!("{origin}: {message}"))
+                .cause(code);
             if remedy.is_empty() {
                 error
             } else {

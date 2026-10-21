@@ -1,7 +1,7 @@
-//! The `tfs` binary on v2 stores: a synthetic checkpoint with every scheme exports to
-//! safetensors bit-identical to its stored parts (and to the reference decode with
-//! `--dequantize`), exports as a static origin that pulls into a second store byte-identical,
-//! and `verify` removes a corrupted object that the next pull fetches again.
+//! The `tfs` binary: a synthetic checkpoint with every scheme exports to safetensors
+//! bit-identical to its stored parts (and to the reference decode with `--decode`),
+//! uploads to a directory endpoint that a second store downloads byte-identical, and `verify`
+//! reports a corrupted object.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value as Json;
-use tensorfs::client::regions;
-use tensorfs::format::{decode, Body, Dtype, PartBytes};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::raw::regions;
+use tensorfs::format::{decode, Body, PartBytes};
+use tensorfs::store::{Checkpoint, Store};
 
 struct Scratch(PathBuf);
 
@@ -110,26 +110,19 @@ fn blobs(root: &Path) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
+fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     let dir = Scratch::new("round-trip");
     let (a, b) = (dir.0.join("a"), dir.0.join("b"));
     let written = ok(
         &a,
         &[
-            "dev", "ckpt", "--blocks", "2", "--scale", "2", "--name", "acme/syn",
+            "dev", "ckpt", "--blocks", "2", "--scale", "2", "--name", "local/syn@1",
         ],
     );
-    assert_eq!(
-        (
-            written["name"].as_str(),
-            written["release"].as_str(),
-            written["lane"].as_str()
-        ),
-        (Some("acme/syn"), Some("1"), Some("mixed"))
-    );
+    assert_eq!(written["name"], "local/syn@1");
 
-    let inspected = ok(&a, &["inspect", "acme/syn"]);
-    assert_eq!(inspected["manifest"], written["manifest"]);
+    let inspected = ok(&a, &["inspect", "local/syn@1"]);
+    assert_eq!(inspected["header"], written["header"]);
     let unet = &inspected["components"][0];
     assert_eq!(unet["name"], "unet");
     // One tensor of each scheme: its encoding, complete, at a glance.
@@ -142,11 +135,11 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     };
     let k = |s: &str| format!("down_blocks.0.{s}");
     let want = [
-        ("fp8.tensorwise", k("attn1.to_v.weight"), [1024, 1024], r#"{scale_dtype: "F32"}"#),
-        ("fp8.rowwise", k("attn1.to_q.weight"), [1024, 1024], r#"{axis: 0, scale_dtype: "F32"}"#),
-        ("int8.tensorwise", k("attn2.to_v.weight"), [1024, 1024], r#"{scale_dtype: "F32"}"#),
-        ("int8.rowwise", k("attn2.to_k.weight"), [1024, 1024], r#"{axis: 0, scale_dtype: "F32"}"#),
-        ("int8.convrot", k("attn1.to_k.weight"), [1024, 1024], r#"{rotation: "hadamard", rotation_size: 256, scale_dtype: "F32"}"#),
+        ("fp8.tensorwise", k("attn1.to_v.weight"), [1024, 1024], r#"{}"#),
+        ("fp8.rowwise", k("attn1.to_q.weight"), [1024, 1024], r#"{axis: 0}"#),
+        ("int8.tensorwise", k("attn2.to_v.weight"), [1024, 1024], r#"{}"#),
+        ("int8.rowwise", k("attn2.to_k.weight"), [1024, 1024], r#"{axis: 0}"#),
+        ("int8.convrot", k("attn1.to_k.weight"), [1024, 1024], r#"{rotation: "kron_regular_h4", rotation_size: 256}"#),
         ("mxfp8", k("attn2.to_q.weight"), [1024, 1024], r#"{block_size: 32, scale_layout: "row_major"}"#),
         ("nvfp4", k("ff.net.0.proj.weight"), [1024, 4096], r#"{block_size: 16, global_scale: "multiply", nibble_order: "low_first", scale_layout: "row_major"}"#),
     ];
@@ -158,7 +151,7 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     let out = Command::new(env!("CARGO_BIN_EXE_tfs"))
         .arg("--store")
         .arg(&a)
-        .args(["inspect", "acme/syn"])
+        .args(["inspect", "local/syn@1"])
         .output()
         .unwrap();
     let human = String::from_utf8(out.stdout).unwrap();
@@ -168,8 +161,8 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     assert!(human.contains("    6 × plain\n"), "{human}");
 
     let store = Store::open(&a).unwrap();
-    let manifest = serde_json::from_value(written["manifest"].clone()).unwrap();
-    let ck = store.checkpoint(&manifest).unwrap();
+    let header = serde_json::from_value(written["header"].clone()).unwrap();
+    let ck = store.checkpoint(&header).unwrap();
     // A standalone part (the 32 MiB embedding) and packs, never across components.
     assert!(ck.header().chunks.iter().any(|c| c.length == 32 << 20));
     let grouped = regions(ck.header(), 4 << 20, &[], &[]);
@@ -190,17 +183,15 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     let out = dir.0.join("out");
     let exported = ok(
         &a,
-        &["export", "acme/syn", out.to_str().unwrap(), "--safetensors"],
+        &["export", "local/syn@1", out.to_str().unwrap(), "--safetensors"],
     );
     assert!(exported["files"]
         .as_array()
         .unwrap()
         .iter()
         .any(|f| f == "unet/diffusion_pytorch_model.safetensors"));
-    assert_eq!(
-        fs::read(out.join("unet/config.json")).unwrap(),
-        ck.file("unet/config.json").unwrap()
-    );
+    let config: Json = serde_json::from_slice(&fs::read(out.join("unet/config.json")).unwrap()).unwrap();
+    assert_eq!(config, Json::Object(ck.component("unet").unwrap().config.clone()));
     let files = [
         ("unet", "unet/diffusion_pytorch_model.safetensors"),
         ("text_encoder", "text_encoder/model.safetensors"),
@@ -250,17 +241,16 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     }
     assert!(checked > 20);
 
-    // Dequantized: each encoded tensor is the reference decode, rounded once to BF16.
+    // Decoded: each encoded tensor is the reference decode, in its logical dtype.
     let deq = dir.0.join("deq");
     ok(
         &a,
         &[
             "export",
-            "acme/syn",
+            "local/syn@1",
             deq.to_str().unwrap(),
             "--safetensors",
-            "--dequantize",
-            "bf16",
+            "--decode",
         ],
     );
     let (tensors, meta) = safetensors(&deq.join("unet/diffusion_pytorch_model.safetensors"));
@@ -285,49 +275,42 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
                     )
                 })
                 .collect();
-            let want = decode(&Dtype::BF16, &t.shape, encoding, &views).unwrap();
+            let want = decode(&t.dtype, &t.shape, encoding, &views).unwrap();
             assert_eq!(
                 tensors[key],
-                ("BF16".to_owned(), t.shape.clone(), want),
+                (t.dtype.name().to_owned(), t.shape.clone(), want),
                 "{key}"
             );
         }
     }
 
-    // A static origin, pulled into a second store byte-identical.
-    let origin = dir.0.join("origin");
-    ok(
-        &a,
-        &["export", "acme/syn", origin.to_str().unwrap(), "--origin"],
-    );
-    let pulled = ok(&b, &["pull", origin.to_str().unwrap(), "acme/syn@1"]);
-    assert_eq!(pulled["manifest"], written["manifest"]);
-    assert_eq!(blobs(&b), blobs(&a));
-    assert_eq!(
-        fs::read(b.join("refs/acme/syn.json")).unwrap(),
-        fs::read(a.join("refs/acme/syn.json")).unwrap()
-    );
-    assert_eq!(ok(&b, &["verify"])["corrupt"], serde_json::json!([]));
+    // Uploaded to a directory endpoint and downloaded into a second store byte-identical.
+    let portable = dir.0.join("portable");
+    ok(&a, &["export", "local/syn@1", portable.to_str().unwrap()]);
+    let origin = format!("file://{}", dir.0.join("origin").display());
+    let endpoint = |store: &Path, args: &[&str]| ok(store, &[&["--endpoint", origin.as_str()], args].concat());
+    let uploaded = endpoint(&a, &["upload", portable.to_str().unwrap(), "acme/syn@1"]);
+    assert_eq!((&uploaded["commit"], &uploaded["tag"]), (&written["tree"], &serde_json::json!("1")));
+    endpoint(&b, &["download", "acme/syn@1"]);
+    assert_eq!(endpoint(&b, &["inspect", "acme/syn@1"])["header"], written["header"]);
+    let theirs = blobs(&b);
+    assert!(blobs(&a).iter().all(|(k, v)| theirs.get(k).is_none_or(|t| t == v)));
+    assert!(ck.header().chunks.iter().all(|c| theirs.contains_key(&c.sha256)));
+    endpoint(&b, &["verify", "acme/syn@1"]);
 
-    // A corrupted object is found, removed, and fetched again.
+    // A corrupted object is reported.
     let chunk = &ck.header().chunks[0];
     let path = Store::open(&b).unwrap().path(chunk).unwrap();
     let mut bytes = fs::read(&path).unwrap();
     bytes[100] ^= 0xff;
     fs::remove_file(&path).unwrap();
     fs::write(&path, &bytes).unwrap();
-    let (success, verified) = tfs(&b, &["verify", "acme/syn"]);
+    let (success, verified) = tfs(&b, &["--endpoint", origin.as_str(), "verify", "acme/syn@1"]);
     assert!(!success);
     assert_eq!(verified["error"]["code"], "integrity");
-    assert_eq!(verified["corrupt"], serde_json::json!([chunk.sha256]));
-    assert!(!path.exists());
-    let again = ok(&b, &["pull", origin.to_str().unwrap(), "acme/syn"]);
-    assert_eq!(again["fetched"], chunk.length);
-    assert_eq!(blobs(&b), blobs(&a));
 
     // Typed failures.
-    let (success, missing) = tfs(&b, &["inspect", "acme/none"]);
+    let (success, missing) = tfs(&b, &["inspect", "local/none"]);
     assert!(!success);
     assert_eq!(missing["error"]["code"], "not_found");
-    assert_eq!(ok(&a, &["gc"])["objects"], 0, "everything is referenced");
 }

@@ -1,6 +1,7 @@
 //! One root, one machine, one store: the real binary as this computer's launcher starts it.
 //! A second machine on the root refuses, a holder of the Go agent's lock excludes it, and the
-//! store the launcher names is the store it fills, with what another writer left there.
+//! store the launcher names is the store it serves, with what another writer left there; run
+//! objects stay in the machine's own store.
 #[path = "common/child.rs"]
 mod child;
 use child::BareEnv;
@@ -169,6 +170,13 @@ fn one_store_runs_one_machine() {
     std::fs::remove_dir_all(&scratch).unwrap();
 }
 
+/// Whether a file named `name` is anywhere under `dir`.
+fn found(dir: &Path, name: &str) -> bool {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|entry| {
+        entry.file_name() == name || (entry.file_type().is_ok_and(|t| t.is_dir()) && found(&entry.path(), name))
+    })
+}
+
 #[tokio::test]
 async fn the_named_store_is_the_machines_store() {
     let root = scratch("machine-root-store");
@@ -180,7 +188,8 @@ async fn the_named_store_is_the_machines_store() {
     let blob = {
         let store = storage::open(&named).unwrap();
         store.put_bytes(&kept).unwrap();
-        storage::hold(&store, &storage::pin::object(&kept_hex), vec![object.clone()], None).unwrap();
+        let tree = store.put_tree(&tensorfs::format::Tree { files: [("weights.bin".to_string(), object.clone())].into() }).unwrap();
+        store.update_ref("local/box", |old| Some(tensorfs::fetch::with_tag(old, "local/box", "v1", &tree))).unwrap();
         store.path(&object).unwrap()
     };
     let inode = FileId::at(&blob).unwrap();
@@ -191,7 +200,7 @@ async fn the_named_store_is_the_machines_store() {
     let mut machine = boot(&machine_root, port, Some(&named));
     ready(&mut machine, &machine_root, port);
 
-    // What the owner writes lands in the named store, beside what it held.
+    // What the owner writes is a run object: the machine's own, never the named store's.
     let owner = Auth::Key { key: Arc::new(SigningKey::from_bytes(&OWNER)), worker: WORKER.into() };
     let client = common::client(&machine_root, port, owner);
     let written = b"an input this run uploads".to_vec();
@@ -202,7 +211,8 @@ async fn the_named_store_is_the_machines_store() {
 
     let store = Store::open(&named).unwrap();
     let written = ObjectRef { sha256: written_hex, length };
-    assert!(storage::present(&store, &written), "the write went elsewhere");
+    assert!(!storage::present(&store, &written), "a run object went into the TensorFS store");
+    assert!(found(&machine_root, &written.sha256), "the write went nowhere");
     assert_eq!(std::fs::read(&blob).unwrap(), kept);
     assert_eq!(FileId::at(&blob).unwrap(), inode);
     assert!(

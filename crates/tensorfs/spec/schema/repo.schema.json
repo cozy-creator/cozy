@@ -1,18 +1,18 @@
 {
  "$schema": "https://json-schema.org/draft/2020-12/schema",
  "$id": "https://github.com/cozy-creator/cozy-creator/crates/tensorfs/spec/schema/repo.schema.json",
- "title": "tensorfs.repo/1",
- "description": "Structure only; byte-length, bounds and duplicate-key rules are in spec/cozytensors.md. Unknown fields are allowed.",
+ "title": "cozytensors.repo/1",
+ "description": "Structure only; byte-length, bounds, duplicate-key and tag rules (unique names, public names are PEP 440 versions) are in spec/cozytensors.md. Unknown fields are allowed.",
  "type": "object",
  "required": [
   "format",
   "name",
-  "releases"
+  "tags"
  ],
  "properties": {
   "format": {
    "type": "string",
-   "pattern": "^tensorfs\\.repo/1(\\.[0-9]+)?$",
+   "pattern": "^cozytensors\\.repo/1(\\.[0-9]+)?$",
    "not": {
     "pattern": "[\\r\\n]"
    }
@@ -21,38 +21,33 @@
    "type": "string",
    "pattern": "^(?!\\.\\.?/)[^/\\\\\\u0000]+/(?!\\.\\.?$)[^/\\\\\\u0000]+$"
   },
-  "releases": {
+  "tags": {
    "type": "array",
+   "description": "Tags in creation order, each naming a commit (a cozytensors.tree/1).",
    "items": {
     "type": "object",
     "required": [
-     "version",
-     "tree"
+     "name",
+     "commit"
     ],
     "properties": {
-     "version": {
+     "name": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^(?!sha256:)(?!\\.\\.?$)[^/\\\\\\u0000]+$"
      },
-     "tree": {
+     "commit": {
       "$ref": "#/$defs/objectRef",
-      "description": "The release's tensorfs.tree/1."
+      "description": "The commit: a cozytensors.tree/1."
+     },
+     "public": {
+      "type": "boolean",
+      "description": "A release; its name is a PEP 440 version."
      },
      "yanked": {
       "type": "boolean"
-     },
-     "revision": {
-      "$ref": "#/$defs/u64"
      }
     }
    }
-  },
-  "checkpoints": {
-   "type": "array",
-   "items": {
-    "$ref": "#/$defs/objectRef"
-   },
-   "description": "Trees no release names yet."
   }
  },
  "$defs": {

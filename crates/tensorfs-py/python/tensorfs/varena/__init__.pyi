@@ -1,0 +1,109 @@
+"""Native marshalling for the slim page manager."""
+
+import os
+from collections.abc import Callable
+from typing import Any
+
+import tensorfs
+
+class Ceiling:
+    disk_gbps: float
+    disk_direct: bool
+    h2d_gbps: float | None
+    streams: int | None
+
+def ceiling(device: int | None = ..., path: str | os.PathLike[str] | None = ...) -> Ceiling:
+    """Measure through TensorFS explicitly; normal reads never run a probe."""
+    ...
+
+class VarenaError(Exception):
+    code: str
+    sticky: bool
+
+class Unsupported(VarenaError): ...
+
+class Part:
+    component: str
+    key: str
+    role: str
+    dtype: str
+    shape: tuple[int, ...]
+    region: int
+    offset: int
+    nbytes: int
+
+class Pinned:
+    ptr: int
+    nbytes: int
+    def __dlpack__(
+        self,
+        *,
+        stream: int | None = ...,
+        max_version: Any = ...,
+        dl_device: Any = ...,
+        copy: bool | None = ...,
+    ) -> Any: ...
+    def __dlpack_device__(self) -> tuple[int, int]: ...
+
+class WeightSet:
+    id: int
+    name: str
+    nbytes: int
+    spans: list[int]
+    regions: list[list[str]]
+    parts: list[Part]
+
+class Copy:
+    kind: str
+    gpu: int
+    bytes: int
+    ns: int
+    ceiling: float
+    link: str
+    busy_ns: int
+    pin_ns: int
+    staged: int
+    cached: int
+
+class Plane:
+    def __init__(
+        self, device: int, grant: tuple[int, int, int] | None = ...
+    ) -> None: ...
+    def mapped_output(
+        self, shape: tuple[int, ...], dtype: str, stream: int
+    ) -> tensorfs.Array | None:
+        """Fresh host-admitted CUDA output; unavailable during capture or without host room."""
+        ...
+    def register(
+        self,
+        name: str,
+        ck: tensorfs.Checkpoint,
+        regions: list[list[str]],
+        fingerprint: str,
+        fill: Callable[[int, Pinned, int], None] | None = ...,
+    ) -> WeightSet: ...
+    def begin(
+        self, request: int, plan: list[list[int]], package: str, shape: str
+    ) -> None: ...
+    def declare(self, request: int, plan: list[list[int]]) -> None: ...
+    def enter(self, request: int, model: int) -> tuple[str, int]: ...
+    def bind(self, request: int, model: int, region: int, stream: int) -> Pinned: ...
+    def leave(self, request: int, peak: int) -> None: ...
+    def stats(self, request: int) -> dict[str, Any]: ...
+    def end(self, request: int) -> dict[str, Any]: ...
+    def relief(self, request: int, need: int, lower: bool) -> tuple[str, int]: ...
+    def load(self, model: int, level: str) -> None: ...
+    def resident(self) -> dict[str, int]: ...
+    def allocator(self, context: int, allocated: int, reserved: int) -> None: ...
+    def allocator_budget(self) -> int: ...
+    def available(self) -> int: ...
+    def trim_with(self, callback: Callable[[int], int]) -> None: ...
+    def cache(self, nbytes: int, shrink: Callable[[int], int]) -> int: ...
+    def cache_bytes(self, cache: int, nbytes: int) -> None: ...
+    def cache_active(self, cache: int, active: bool) -> None: ...
+    def retained_bind(self, request: int, model: int) -> None: ...
+    def close_cache(self, cache: int) -> None: ...
+    def close_model(self, model: int) -> None: ...
+    def close(self) -> None: ...
+
+def copies() -> list[Copy]: ...

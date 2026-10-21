@@ -7,6 +7,8 @@
 //! retired, never run. A rental is a Linux pod.
 #![cfg(target_os = "linux")]
 mod common;
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use std::{
@@ -39,6 +41,7 @@ fn launch_idle(root: &Path, port: u16, provider: u16, idle: u32) -> Machine {
     let home = root.join("home/.cozy");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("config.toml"), format!("[machine]\nrental_idle_seconds = {idle}\n")).unwrap();
+    named_runtime::image(root);
     Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .env_clear()

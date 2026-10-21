@@ -28,10 +28,6 @@ tokio-rustls.workspace = true
 url.workspace = true
 utoipa.workspace = true
 
-[features]
-# Dev builds only (xs-045 U12): `RunSpec::migrate`. Never in a release.
-migrate = []
-
 [dev-dependencies]
 axum = { workspace = true, features = ["http2"] }
 hyper-util = { workspace = true, features = ["server-auto", "service", "http1", "http2"] }

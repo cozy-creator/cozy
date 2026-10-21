@@ -1,7 +1,7 @@
 //! The reference CPU decode (spec §6): a registry with one row per scheme, the checks every
-//! row shares, and the cores schemes are built from (`elem`, `grid`, `affine`, `table`,
-//! `blocks`). Each element is computed in f32 by the scheme's formula, then rounded once to the
-//! logical dtype (`round_L`). The Runtime's GPU decoders match it bit for bit.
+//! row shares, and the cores schemes are built from (`elem`, `grid`, `affine`, `blocks`). A row
+//! returns its decode as a `plan`: here each element is computed in f32 by the scheme's formula,
+//! then rounded once to the logical dtype (`round_L`); TensorFS's GPU kernels run the same plan.
 //!
 //! Adding a scheme: one family file holding its `Scheme` row and decode fn, one row in
 //! `SCHEMES` (and its `mod` line), nothing else here.
@@ -10,12 +10,13 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use super::{Dtype, Encoding, Error, Result, Value};
+pub use plan::Plan;
 
 pub mod affine;
 pub mod blocks;
 pub mod elem;
 pub mod grid;
-pub mod table;
+pub mod plan;
 
 mod fp8;
 mod int8;
@@ -38,6 +39,7 @@ pub(crate) mod gptq;
 pub(crate) mod bnb;
 
 // comfy
+mod comfy;
 
 /// Every scheme this reader decodes, one row each. A plain tensor needs no scheme.
 pub static SCHEMES: &[&Scheme] = &[
@@ -51,7 +53,6 @@ pub static SCHEMES: &[&Scheme] = &[
     // fp8.blockwise, mxfp4
     &fp8_blockwise::BLOCKWISE,
     &mxfp4::MXFP4,
-
     // gguf.*
     &gguf::Q4_0,
     &gguf::Q4_1,
@@ -85,8 +86,10 @@ pub static SCHEMES: &[&Scheme] = &[
     &bnb::NF4,
     &bnb::FP4,
     &bnb::INT8,
-
     // comfy.*
+    &comfy::ASYM_W4A8_INT8,
+    &comfy::W6A8_INT8,
+    &comfy::CONVROT_W4A4,
 ];
 
 /// A scheme: its params, its parts and its decode, as spec §6 lists them.
@@ -96,8 +99,9 @@ pub struct Scheme {
     /// Every param the decode reads; all are required, none has a default.
     pub params: &'static [Param],
     pub parts: &'static [Part],
-    /// The tensor's elements in f32, row-major; `decode` rounds them to the logical dtype.
-    pub decode: fn(&Ctx) -> Result<Vec<f32>>,
+    /// The decode's plan: the CPU computes its f32 elements, row-major, and `decode` rounds them
+    /// to the logical dtype; the GPU kernels run the same plan.
+    pub decode: for<'a> fn(&Ctx<'a>) -> Result<Plan<'a>>,
 }
 
 /// How a scheme views the logical tensor.
@@ -123,8 +127,6 @@ pub enum Allowed {
     Bool,
     /// Values `check` accepts, as `what` describes them.
     Check(fn(&Value) -> bool, &'static str),
-    /// The dtype an optional part is stored in, one of these: present exactly when the part is.
-    PartDtype(&'static str, &'static [&'static str]),
 }
 
 pub struct Part {
@@ -154,11 +156,8 @@ impl Part {
     }
 }
 
-/// A part's allowed dtypes, by name: listed, or the one a text param names.
-pub enum Dtypes {
-    Of(&'static [&'static str]),
-    Param(&'static str),
-}
+/// A part's allowed dtypes, by name: the part's own dtype is authoritative.
+pub type Dtypes = &'static [&'static str];
 
 /// A part's required stored shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +185,17 @@ pub struct PartBytes<'a> {
     pub bytes: &'a [u8],
 }
 
+/// Stored part metadata, independent of whether its bytes live on the Host or a device.
+#[derive(Clone, Copy, Debug)]
+pub struct PartMetadata<'a> {
+    pub role: &'a str,
+    pub dtype: &'a Dtype,
+    pub shape: &'a [u64],
+    pub len: usize,
+}
+
+type Slots<'a> = BTreeMap<&'a str, (usize, usize)>;
+
 /// What a decode fn sees: the view, the checked params and the checked parts.
 pub struct Ctx<'a> {
     pub scheme: &'static str,
@@ -195,6 +205,7 @@ pub struct Ctx<'a> {
     pub cols: usize,
     params: &'a BTreeMap<String, Value>,
     parts: &'a BTreeMap<&'a str, PartBytes<'a>>,
+    slots: Option<&'a Slots<'a>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -224,6 +235,19 @@ impl<'a> Ctx<'a> {
     pub fn part(&self, role: &str) -> PartBytes<'a> {
         self.parts[role]
     }
+    /// The SAME checked scheme mapping can refer to an engine-bound input slot.
+    pub(crate) fn source(&self, role: &str) -> plan::Bytes<'a> {
+        match self.slots.and_then(|s| s.get(role)) {
+            Some(&(index, len)) => plan::Bytes::slot(index, len),
+            None => self.part(role).bytes.into(),
+        }
+    }
+    pub(crate) fn elements(&self, role: &str) -> plan::Elems<'a> {
+        plan::Elems {
+            dtype: self.part(role).dtype.clone(),
+            bytes: self.source(role),
+        }
+    }
     /// A present part's elements as f32 (`elem::floats`).
     pub fn floats(&self, role: &str) -> Vec<f32> {
         let p = self.part(role);
@@ -233,6 +257,25 @@ impl<'a> Ctx<'a> {
     pub fn lead(&self) -> &'a [u64] {
         &self.shape[..self.shape.len().saturating_sub(1)]
     }
+    /// The rows of one matrix: the second-last extent of a matrix view, else `R`.
+    pub fn height(&self) -> usize {
+        match self.shape {
+            [.., n, _] if self.cols > 0 && self.rows > 0 && self.shape.len() >= 2 => *n as usize,
+            _ => self.rows,
+        }
+        .max(1)
+    }
+}
+
+/// Where a plan's values go: the `[R, C]` view with `height` rows to a matrix. `swap`: the parts
+/// hold the logical tensor with its last two axes swapped (`transposed: true`), so the values are
+/// swapped back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Geometry {
+    pub rows: usize,
+    pub cols: usize,
+    pub height: usize,
+    pub swap: bool,
 }
 
 /// The logical tensor's bytes from its encoded parts.
@@ -242,7 +285,14 @@ pub fn decode(
     encoding: &Encoding,
     parts: &BTreeMap<&str, PartBytes>,
 ) -> Result<Vec<u8>> {
-    checked(dtype, shape, encoding, parts, true)
+    planned(dtype, shape, encoding, parts, true, |plan, g| {
+        let out = plan.values(g.rows, g.cols, g.height)?;
+        let out = match g.swap {
+            true => swap_last_two(&out, g.height, g.cols),
+            false => out,
+        };
+        Ok(round(dtype, &out))
+    })
 }
 
 /// Refuses what `decode` would refuse before reading a byte: the scheme, its params, the logical
@@ -253,34 +303,131 @@ pub fn check(
     encoding: &Encoding,
     parts: &BTreeMap<&str, PartBytes>,
 ) -> Result<()> {
-    checked(dtype, shape, encoding, parts, false).map(drop)
+    planned(dtype, shape, encoding, parts, false, |_, _| Ok(()))
 }
 
-fn checked(
+/// `f` with the tensor's checked plan (built when `read`, else `Values` of nothing) and its
+/// geometry; a refusal names the scheme.
+pub fn planned<R>(
     dtype: &Dtype,
     shape: &[u64],
     encoding: &Encoding,
     parts: &BTreeMap<&str, PartBytes>,
     read: bool,
-) -> Result<Vec<u8>> {
+    f: impl FnOnce(Plan, Geometry) -> Result<R>,
+) -> Result<R> {
     let name = encoding.scheme.as_str();
     let Some(scheme) = SCHEMES.iter().find(|s| s.name == name) else {
         return Err(Error::UnknownScheme(name.into()));
     };
-    run(scheme, dtype, shape, &encoding.params, parts, read).map_err(|e| match e {
+    run(
+        scheme,
+        (dtype, shape),
+        &encoding.params,
+        parts,
+        None,
+        read,
+        f,
+    )
+    .map_err(|e| match e {
         Error::Decode(detail) => Error::Decode(format!("{name}: {detail}")),
         e => e,
     })
 }
 
-fn run(
-    scheme: &'static Scheme,
+/// Metadata preflight using the existing registry; no data is read or device initialized.
+pub fn check_metadata(
     dtype: &Dtype,
     shape: &[u64],
+    encoding: &Encoding,
+    parts: &[PartMetadata<'_>],
+) -> Result<()> {
+    inputs(dtype, shape, encoding, parts, false, |_, _| Ok(()))
+}
+
+#[cfg(feature = "store")]
+pub(crate) fn supports_sources(encoding: &Encoding) -> bool {
+    SCHEMES
+        .iter()
+        .any(|scheme| scheme.name == encoding.scheme && comfy::supports_sources(scheme))
+}
+
+/// Plan external sources with the SAME U7 Scheme::decode functions used by Host reads.
+#[cfg(feature = "store")]
+pub(crate) fn planned_sources<R>(
+    dtype: &Dtype,
+    shape: &[u64],
+    encoding: &Encoding,
+    parts: &[PartMetadata<'_>],
+    f: impl FnOnce(Plan, Geometry) -> Result<R>,
+) -> Result<R> {
+    inputs(dtype, shape, encoding, parts, true, f)
+}
+
+fn inputs<R>(
+    dtype: &Dtype,
+    shape: &[u64],
+    encoding: &Encoding,
+    parts: &[PartMetadata<'_>],
+    read: bool,
+    f: impl FnOnce(Plan, Geometry) -> Result<R>,
+) -> Result<R> {
+    let name = encoding.scheme.as_str();
+    let scheme = SCHEMES
+        .iter()
+        .find(|s| s.name == name)
+        .copied()
+        .ok_or_else(|| Error::UnknownScheme(name.into()))?;
+    if read && !comfy::supports_sources(scheme) {
+        return Err(Error::Decode(format!(
+            "{name}: resident sources have no device plan"
+        )));
+    }
+    let (mut metadata, mut slots) = (BTreeMap::new(), BTreeMap::new());
+    for (index, p) in parts.iter().enumerate() {
+        if metadata
+            .insert(
+                p.role,
+                PartBytes {
+                    dtype: p.dtype,
+                    shape: p.shape,
+                    bytes: &[],
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::Decode(format!(
+                "{name}: duplicate part {:?}",
+                p.role
+            )));
+        }
+        slots.insert(p.role, (index, p.len));
+    }
+    run(
+        scheme,
+        (dtype, shape),
+        &encoding.params,
+        &metadata,
+        Some(&slots),
+        read,
+        f,
+    )
+    .map_err(|e| match e {
+        Error::Decode(d) => Error::Decode(format!("{name}: {d}")),
+        e => e,
+    })
+}
+
+fn run<R>(
+    scheme: &'static Scheme,
+    logical: (&Dtype, &[u64]),
     params: &BTreeMap<String, Value>,
     parts: &BTreeMap<&str, PartBytes>,
+    slots: Option<&Slots>,
     read: bool,
-) -> Result<Vec<u8>> {
+    f: impl FnOnce(Plan, Geometry) -> Result<R>,
+) -> Result<R> {
+    let (dtype, shape) = logical;
     let fail = Error::Decode;
     for role in parts.keys() {
         if !scheme.parts.iter().any(|p| p.role == *role) {
@@ -298,11 +445,7 @@ fn run(
         return Err(fail(format!("unknown param {key:?}")));
     }
     for p in scheme.params {
-        let ok = match (&p.allowed, params.get(p.key)) {
-            (Allowed::PartDtype(role, _), v) if !parts.contains_key(role) => v.is_none(),
-            (a, v) => v.is_some_and(|v| allowed(a, v)),
-        };
-        if !ok {
+        if !params.get(p.key).is_some_and(|v| allowed(&p.allowed, v)) {
             return Err(fail(format!(
                 "param {} is not {}",
                 p.key,
@@ -333,7 +476,7 @@ fn run(
         _ => {
             return Err(fail(format!(
                 "logical shape {shape:?} is not rank 2 or more"
-            )))
+            )));
         }
     };
     let ctx = Ctx {
@@ -344,44 +487,49 @@ fn run(
         cols,
         params,
         parts,
+        slots,
     };
     for rule in scheme.parts {
         let Some(p) = parts.get(rule.role) else {
             continue;
         };
-        let ok = match rule.dtypes {
-            Dtypes::Of(names) => names.contains(&p.dtype.name()),
-            Dtypes::Param(key) => ctx.text(key) == p.dtype.name(),
-        };
-        if !ok {
-            return Err(fail(format!("part {} is {}", rule.role, p.dtype)));
+        if !rule.dtypes.contains(&p.dtype.name()) {
+            let allowed = rule.dtypes.join(", ");
+            return Err(fail(format!("part {} is {}, not {allowed}", rule.role, p.dtype)));
         }
         let fits = match (rule.shape)(&ctx)? {
             Shape::Exact(want) => p.shape == want.as_slice(),
             Shape::Count(n) => p.shape.iter().try_fold(1u64, |a, b| a.checked_mul(*b)) == Some(n),
         };
-        if !fits || (read && p.dtype.byte_len(p.shape) != Some(p.bytes.len() as u64)) {
+        let len = slots
+            .and_then(|s| s.get(rule.role))
+            .map(|(_, len)| *len)
+            .or_else(|| read.then_some(p.bytes.len()));
+        if !fits || len.is_some_and(|len| p.dtype.byte_len(p.shape) != Some(len as u64)) {
             return Err(fail(format!("part {} has shape {:?}", rule.role, p.shape)));
         }
     }
-    if !read {
-        return Ok(Vec::new());
-    }
-    let out = (scheme.decode)(&ctx)?;
-    debug_assert_eq!(out.len(), rows * cols);
-    let out = match transposed {
-        true => swap_last_two(&out, shape),
-        false => out,
+    let g = Geometry {
+        rows,
+        cols,
+        height: ctx.height(),
+        swap: transposed,
     };
-    Ok(round(dtype, &out))
+    let plan = match read {
+        true => (scheme.decode)(&ctx)?,
+        false => Plan {
+            core: plan::Core::Values(Vec::new()),
+            post: plan::Post::None,
+        },
+    };
+    f(plan, g)
 }
 
-/// Values of a `[lead…, r, c]` tensor, row-major, as `[lead…, c, r]`.
-pub fn swap_last_two(x: &[f32], shape: &[u64]) -> Vec<f32> {
-    let (r, c) = match *shape {
-        [.., r, c] if r * c > 0 => (r as usize, c as usize),
-        _ => return x.to_vec(),
-    };
+/// Values of matrices of `r × c`, row-major, as `c × r`.
+pub fn swap_last_two(x: &[f32], r: usize, c: usize) -> Vec<f32> {
+    if r * c == 0 {
+        return x.to_vec();
+    }
     let mut out = x.to_vec();
     for (m, mat) in x.chunks(r * c).enumerate() {
         for (k, v) in mat.iter().enumerate() {
@@ -398,7 +546,6 @@ fn allowed(a: &Allowed, v: &Value) -> bool {
         Allowed::Range(lo, hi) => v.as_u64().is_some_and(|n| (*lo..=*hi).contains(&n)),
         Allowed::Bool => matches!(v, Value::Bool(_)),
         Allowed::Check(check, _) => check(v),
-        Allowed::PartDtype(_, list) => v.as_str().is_some_and(|s| list.contains(&s)),
     }
 }
 
@@ -409,13 +556,12 @@ fn describe(a: &Allowed) -> String {
         Allowed::Range(lo, hi) => format!("an integer in {lo}..={hi}"),
         Allowed::Bool => "a boolean".into(),
         Allowed::Check(_, what) => what.to_string(),
-        Allowed::PartDtype(role, list) => format!("one of {list:?} with part {role}, else absent"),
     }
 }
 
 /// `round_L`: little-endian bytes of `xs` in `dtype` (F32, BF16 or F16), nearest even, NaN
 /// canonical.
-fn round(dtype: &Dtype, xs: &[f32]) -> Vec<u8> {
+pub(crate) fn round(dtype: &Dtype, xs: &[f32]) -> Vec<u8> {
     match dtype {
         Dtype::F32 => xs
             .iter()
