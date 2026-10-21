@@ -255,8 +255,7 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let human = cozy(&home, None, &["model", "quantize", &pinned, "--fp8", "--package", &package, "--on", "m1"]);
     assert_eq!(human.code, 0, "{human:?}");
     assert!(human.stdout.contains(&format!("{model}@{fp8}")), "{human:?}");
-    // The release it was made from moves to the tag the variant went onto.
-    let next = format!("cozy model publish {model} --release 1.0.0 --commit main");
+    let next = format!("cozy model publish {model} --release 1.0.0 --commit {fp8}");
     assert!(human.stdout.contains(&next), "{human:?}");
 
     // The machine holds the package now: quantize finds its quantizer there, and none for int8.

@@ -141,12 +141,12 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
                     record = record.field("variant", &reference.variant);
                 }
                 record.print(ctx);
-                // The release it was made from moves to the tag that now holds its variant too.
-                let (into, tag) = destination.split_once('@').expect("a destination names its tag");
+                // The release it was made from moves to the commit the machine wrote, which holds
+                // its variant too: exactly that one, wherever its tag moves next.
+                let into = destination.split_once('@').map_or(destination.as_str(), |(into, _)| into);
                 let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
                 let release = pinned.filter(|_| into == repo.to_string()).unwrap_or("<version>");
-                let tag = Some(reference.tag.as_str()).filter(|t| !t.is_empty()).unwrap_or(tag);
-                output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tag}")]);
+                output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tree}")]);
             }
             Some(WrittenCheckpoint::Header(header)) => {
                 Record::new().field("checkpoint header", header).print(ctx);
