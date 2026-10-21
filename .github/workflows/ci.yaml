@@ -34,6 +34,7 @@ jobs:
         uv pip install --python "$TENSORFS_TEST_PYTHON" --no-deps diffusers==0.41.0
         "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/rmsnorm_bands.py
         "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/request_failure_boundary.py
+        "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/mutating_oom.py
         "$TENSORFS_TEST_PYTHON" -m pytest -q .runtime/tests/test_weight_source_loading.py .runtime/tests/test_retention_quiescence.py
 
   # The library suites do not install or launch a Runtime, so they need no release wheel.
