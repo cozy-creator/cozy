@@ -112,6 +112,7 @@ header    = [format, chunks: [* object], encodings: [* encoding], pipeline, comp
 object    = [sha256: bytes(32), length]
 encoding  = [scheme, params: {* name => value}]
 pipeline  = [] / [class, config]
+class     = [library, version, name]
 component = [name, class, config, tensors: [* tensor], assets: {* path => object}, ? config_file]
 config    = {* name => config-value}
 tensor    = [key, dtype, shape, 0, location]                 ; plain
@@ -121,13 +122,19 @@ location  = [chunk_index, offset, length]
 ```
 
 - **Pipeline:** what `model_index.json` held, as its class and config; `[]` for a model with no pipeline.
-- **Class:** a descriptive `<library>.<Class>` identifier (`diffusers.StableDiffusionXLPipeline`,
-  `diffusers.UNet2DConditionModel`, `transformers.CLIPTextModel`), or `""` when unknown. The pipeline's is
-  `diffusers.<_class_name>`. With a pipeline, a component's class is its `model_index.json` entry `[library, Class]`
-  as written (`stable_diffusion.StableDiffusionSafetyChecker`: `stable_diffusion` is a Diffusers pipeline module),
-  and `""` where the entry is `[null, null]` or absent. Without one, it is what the component's config names:
-  Transformers' `architectures[0]`, Diffusers' `_class_name`, or a tokenizer config's `tokenizer_class`. Reading
-  this format does not require importing or executing that class.
+- **Class:** `[library, version, name]`, exactly three texts, the same shape for any library or implementation and
+  never an import path: `["diffusers", "0.35.1", "SD3Transformer2DModel"]`, `["transformers", "4.57.0",
+  "CLIPTextModel"]`. The contract: a component's tensors are exactly that class's `state_dict` at that library
+  version (where a version is recorded). `["", "", ""]` is an unknown model, the only class with an empty `library`; a
+  reader MUST refuse a class that is not three texts or has an empty `library` with a `name` or `version`. `version`
+  MAY be `""` where nothing records it (a local folder); a writer warns then. The pipeline's is `diffusers` and its
+  `_class_name`. With a pipeline, a component's library and name are its `model_index.json` entry `[library, Class]` as
+  written (`stable_diffusion`, a Diffusers pipeline module, for its safety checker), and the unknown class where the
+  entry is `[null, null]` or absent. Without one, they are what the component's config names: Transformers'
+  `architectures[0]`, Diffusers' `_class_name`, or a tokenizer config's `tokenizer_class`. The version is the
+  component's own config's for its library (`_diffusers_version`, `transformers_version`), else one another config of
+  the model records for that library, else the converter reference's; configs stay as written. Reading this format
+  never requires importing or executing that class.
 - **Config:** the parsed JSON of the component's config file, as a structured map, never a file. Its values, and
   only those, MAY also be finite floats and `null` (`config-value` is a value, a float or `null`, lists and maps of
   them; §9). A component without a config file has an empty config.

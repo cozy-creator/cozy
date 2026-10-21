@@ -44,7 +44,7 @@ fn header_configs_preserve_nested_json_null() {
     let header = Header::new(
         vec![],
         Some(Pipeline {
-            class: String::new(),
+            class: Default::default(),
             config: config.clone(),
         }),
         vec![Component {

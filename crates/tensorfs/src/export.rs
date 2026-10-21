@@ -285,7 +285,7 @@ pub fn safetensors(
 
 /// `diffusion_pytorch_model` for a Diffusers component, `model` for any other.
 fn weights_name(c: &Component) -> String {
-    match c.class.starts_with("diffusers.") || c.config.contains_key("_diffusers_version") {
+    match c.class.library == "diffusers" || c.config.contains_key("_diffusers_version") {
         true => "diffusion_pytorch_model",
         false => "model",
     }

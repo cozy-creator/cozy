@@ -23,7 +23,7 @@ assert torch.cuda.is_available(), "this gate requires an actual CUDA GPU"
 tmp = tempfile.TemporaryDirectory()
 try:
     writer = tensorfs.Writer(cache_dir=Path(tmp.name) / "store")
-    component = writer.component("model", cls="test.Model", config={})
+    component = writer.component("model", cls=("test", "1.0", "Model"), config={})
     plain = np.arange(12, dtype=np.float32).reshape(3, 4)
     component.put("plain", plain)
     component.put("empty", b"", dtype="U8", shape=[0])

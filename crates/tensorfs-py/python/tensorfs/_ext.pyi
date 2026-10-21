@@ -161,12 +161,26 @@ class Tensors(Mapping[str, TensorMetadata]):
         one stored part (`role`), or with `decode=True` an encoded tensor's logical bytes. An
         encoded tensor with neither raises `InvalidError` naming its roles."""
 
+class ClassRef:
+    """A class as `(library, version, name)`, for any implementation and never an import path:
+    `ClassRef("diffusers", "0.35.1", "SD3Transformer2DModel")`. `ClassRef("", "", "")` is an
+    unknown model; `version` is `""` when nothing records it. A component's tensors are that
+    class's `state_dict` at that version. Iterates as the 3-tuple; equal and hashable by value."""
+
+    def __init__(self, library: str, version: str, name: str) -> None: ...
+    @property
+    def library(self) -> str: ...
+    @property
+    def version(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    def __iter__(self) -> Iterator[str]: ...
+
 class Pipeline:
     """What `model_index.json` held."""
 
     @property
-    def cls(self) -> str:
-        """`diffusers.<Class>`, `""` when unknown."""
+    def cls(self) -> ClassRef: ...
     @property
     def config(self) -> dict[str, Any]: ...
 
@@ -176,8 +190,7 @@ class Component:
     @property
     def name(self) -> str: ...
     @property
-    def cls(self) -> str:
-        """`<library>.<Class>`, `""` when unknown."""
+    def cls(self) -> ClassRef: ...
     @property
     def config(self) -> dict[str, Any]: ...
     @property
@@ -271,9 +284,9 @@ class Writer:
                  base: Checkpoint | None = None, resume: str | None = None,
                  cache_dir: StrPath | None = None, repo_id: str | None = None, revision: str | None = None,
                  endpoint: str | None = None, token: _Token | None = None, ca_der: bytes | None = None) -> None: ...
-    def pipeline(self, cls: str, config: Mapping[str, Any]) -> None: ...
+    def pipeline(self, cls: ClassRef | tuple[str, str, str], config: Mapping[str, Any]) -> None: ...
     def component(
-        self, name: str, cls: str = "", config: Mapping[str, Any] | None = None,
+        self, name: str, cls: ClassRef | tuple[str, str, str] | None = None, config: Mapping[str, Any] | None = None,
         config_file: str | None = None,
     ) -> ComponentWriter:
         """Declares a component (again: class and config change, tensors stay)."""

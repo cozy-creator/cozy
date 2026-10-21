@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use tensorfs::err::{Code, Result};
-use tensorfs::format::{Dtype, Encoding, Metadata, Value};
+use tensorfs::format::{ClassRef, Dtype, Encoding, Metadata, Value};
 use tensorfs::store::Checkpoint;
 use tensorfs::import::engine::{self, Ops, Reading, TensorReader};
 use tensorfs::import::source::{Group, SourceSet};
@@ -885,20 +885,26 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
     // .gitattributes are repo files.
     let layout = &out.layout;
     let pipeline = layout.pipeline.as_ref().unwrap();
-    assert_eq!(pipeline.class, "diffusers.StableDiffusionXLPipeline");
-    let classes: Vec<(&str, &str, Option<&str>)> = (layout.components.iter())
-        .map(|c| (c.name.as_str(), c.class.as_str(), c.config_file.as_deref()))
+    // Each class's version is its own config's; the tokenizers record none and take their
+    // library's from the text encoders.
+    assert_eq!(pipeline.class, ClassRef::new("diffusers", "0.25.0", "StableDiffusionXLPipeline"));
+    let classes: Vec<(&str, [&str; 3], Option<&str>)> = (layout.components.iter())
+        .map(|c| {
+            let class = [c.class.library.as_str(), &c.class.version, &c.class.name];
+            (c.name.as_str(), class, c.config_file.as_deref())
+        })
         .collect();
+    let (d, t) = (["diffusers", "0.25.0"], ["transformers", "4.36.2"]);
     assert_eq!(
         classes,
         [
-            ("text_encoder", "transformers.CLIPTextModel", None),
-            ("text_encoder_2", "transformers.CLIPTextModelWithProjection", None),
-            ("unet", "diffusers.UNet2DConditionModel", None),
-            ("vae", "diffusers.AutoencoderKL", None),
-            ("scheduler", "diffusers.DDIMScheduler", Some("scheduler_config.json")),
-            ("tokenizer", "transformers.CLIPTokenizer", Some("tokenizer_config.json")),
-            ("tokenizer_2", "transformers.CLIPTokenizer", Some("tokenizer_config.json")),
+            ("text_encoder", [t[0], t[1], "CLIPTextModel"], None),
+            ("text_encoder_2", [t[0], t[1], "CLIPTextModelWithProjection"], None),
+            ("unet", [d[0], d[1], "UNet2DConditionModel"], None),
+            ("vae", [d[0], d[1], "AutoencoderKL"], None),
+            ("scheduler", [d[0], d[1], "DDIMScheduler"], Some("scheduler_config.json")),
+            ("tokenizer", [t[0], t[1], "CLIPTokenizer"], Some("tokenizer_config.json")),
+            ("tokenizer_2", [t[0], t[1], "CLIPTokenizer"], Some("tokenizer_config.json")),
         ]
     );
     let tokenizer = &layout.components[5];
@@ -983,9 +989,11 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
 /// The generated references order a source's sorted keys into the constructor order that the
 /// converter tables (generated from the same classes' state_dict) list, for every SDXL and
 /// Anima component: two independent generators agree.
-/// network: Hugging Face. A pipeline's components take their classes from `model_index.json`
-/// as written, even where the component's own config names another (`T5Tokenizer`,
-/// `architectures`) or none (a preprocessor config).
+/// network: Hugging Face. A pipeline's components take their library and class from
+/// `model_index.json` as written, even where the component's own config names another
+/// (`T5Tokenizer`, `architectures`) or none (a preprocessor config). A version is the config's
+/// own, else the model's for that library; `stable_diffusion` (a Diffusers pipeline module)
+/// records none, so its version is `""`.
 #[test]
 fn model_index_names_every_component_class() {
     let dir = scratch("model-index-classes");
@@ -997,14 +1005,48 @@ fn model_index_names_every_component_class() {
             .collect::<BTreeMap<_, _>>()
     };
     let sd = classes("tiny-stable-diffusion-pipe-variants-all-kinds");
-    assert_eq!(sd["safety_checker"], "stable_diffusion.StableDiffusionSafetyChecker");
-    assert_eq!(sd["feature_extractor"], "transformers.CLIPFeatureExtractor");
-    assert_eq!(sd["tokenizer"], "transformers.CLIPTokenizer");
+    let class = ClassRef::new;
+    assert_eq!(sd["safety_checker"], class("stable_diffusion", "", "StableDiffusionSafetyChecker"));
+    assert_eq!(sd["feature_extractor"], class("transformers", "4.28.0.dev0", "CLIPFeatureExtractor"));
+    assert_eq!(sd["tokenizer"], class("transformers", "4.28.0.dev0", "CLIPTokenizer"));
     let flux = classes("tiny-flux-pipe");
-    assert_eq!(flux["tokenizer_2"], "transformers.T5TokenizerFast");
-    assert_eq!(flux["text_encoder_2"], "transformers.T5EncoderModel");
-    assert_eq!(flux["scheduler"], "diffusers.FlowMatchEulerDiscreteScheduler");
+    assert_eq!(flux["tokenizer_2"], class("transformers", "4.40.2", "T5TokenizerFast"));
+    assert_eq!(flux["text_encoder_2"], class("transformers", "4.40.2", "T5EncoderModel"));
+    assert_eq!(flux["scheduler"], class("diffusers", "0.30.0.dev0", "FlowMatchEulerDiscreteScheduler"));
     fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A class's version: its own config's for its library, else another config's of the model,
+/// else the converter reference's, else `""`. No network.
+#[test]
+fn a_class_version_is_its_configs_else_the_models_else_the_references() {
+    let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+    let files = BTreeMap::from([
+        ("model_index.json".to_owned(), json(serde_json::json!({"_class_name": "P", "_diffusers_version": "0.30.0",
+            "unet": ["diffusers", "U"], "text_encoder": ["transformers", "T"], "tokenizer": ["transformers", "K"],
+            "safety_checker": ["stable_diffusion", "S"]}))),
+        ("unet/config.json".to_owned(), json(serde_json::json!({"_diffusers_version": "0.31.0"}))),
+        ("text_encoder/config.json".to_owned(), json(serde_json::json!({"transformers_version": null}))),
+        ("tokenizer/tokenizer_config.json".to_owned(), json(serde_json::json!({}))),
+        ("safety_checker/config.json".to_owned(), json(serde_json::json!({}))),
+    ]);
+    let tensored = ["unet".to_owned(), "text_encoder".to_owned(), "safety_checker".to_owned()];
+    let classes = |reference: &import::Versions| {
+        let layout = import::layout(files.clone(), &tensored, reference).unwrap();
+        let mut out = vec![layout.pipeline.unwrap().class];
+        out.extend(layout.components.into_iter().map(|c| c.class));
+        out
+    };
+    let c = ClassRef::new;
+    let reference = import::Versions::from([("transformers".into(), "4.40.0".into())]);
+    assert_eq!(classes(&reference), [
+        c("diffusers", "0.30.0", "P"),
+        c("diffusers", "0.31.0", "U"),
+        c("transformers", "4.40.0", "T"),
+        c("stable_diffusion", "", "S"),
+        c("transformers", "4.40.0", "K"),
+    ]);
+    assert_eq!(classes(&Default::default())[2], c("transformers", "", "T"));
 }
 
 /// network: Hugging Face (configs only, no weights). The same on the full-size repos.
@@ -1029,16 +1071,17 @@ fn full_size_pipelines_take_model_index_classes() {
                 files.insert(m.path.clone(), import::remote::read_small(m, &access).unwrap());
             }
         }
-        let layout = import::layout(files, &tensored).unwrap();
+        let layout = import::layout(files, &tensored, &Default::default()).unwrap();
         (layout.components.iter())
             .map(|c| (c.name.clone(), c.class.clone()))
             .collect::<BTreeMap<_, _>>()
     };
     let sd = classes("hf://stable-diffusion-v1-5/stable-diffusion-v1-5");
-    assert_eq!(sd["safety_checker"], "stable_diffusion.StableDiffusionSafetyChecker");
-    assert_eq!(sd["feature_extractor"], "transformers.CLIPImageProcessor");
+    let class = ClassRef::new;
+    assert_eq!(sd["safety_checker"], class("stable_diffusion", "", "StableDiffusionSafetyChecker"));
+    assert_eq!(sd["feature_extractor"], class("transformers", "4.22.0.dev0", "CLIPImageProcessor"));
     let lite = classes("hf://Freepik/flux.1-lite-8B");
-    assert_eq!(lite["tokenizer_2"], "transformers.T5TokenizerFast");
+    assert_eq!(lite["tokenizer_2"], class("transformers", "4.47.1", "T5TokenizerFast"));
 }
 
 #[test]
@@ -1384,10 +1427,14 @@ fn a_single_file_sdxl_becomes_the_upstream_layout() {
     let layout = &sink.layout;
     assert_eq!(
         layout.pipeline.as_ref().unwrap().class,
-        "diffusers.StableDiffusionXLPipeline"
+        ClassRef::new("diffusers", "0.19.0.dev0", "StableDiffusionXLPipeline")
     );
     let folders: BTreeMap<&str, &import::Folder> =
         layout.components.iter().map(|c| (c.name.as_str(), c)).collect();
+    let unet = ClassRef::new("diffusers", "0.19.0.dev0", "UNet2DConditionModel");
+    assert_eq!(folders["unet"].class, unet);
+    let tokenizer = ClassRef::new("transformers", "4.32.0.dev0", "CLIPTokenizer");
+    assert_eq!(folders["tokenizer_2"].class, tokenizer, "the text encoders' version");
     assert_eq!(folders["scheduler"].config_file.as_deref(), Some("scheduler_config.json"));
     assert!(folders["tokenizer_2"].assets.contains_key("vocab.json"));
     for c in ["text_encoder", "unet", "vae"] {

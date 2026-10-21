@@ -431,7 +431,7 @@ impl<'t> Migrator<'t> {
             }
         }
         let tensored: Vec<String> = tensors.iter().map(|(name, _)| name.clone()).collect();
-        let l = layout(bytes.clone(), &tensored)?;
+        let l = layout(bytes.clone(), &tensored, &Default::default())?;
         let mut keep = |b: Vec<u8>| add(objects, b);
         let components = (l.components.into_iter())
             .map(|f| Component {
@@ -619,7 +619,7 @@ fn part_dtypes(component: &str, mut t: Tensor) -> Result<Tensor> {
 }
 
 /// A five-field header in D10's layout, every byte kept: no pipeline, each component
-/// `[name, "", {}, tensors, {}]`. D10's reader then reads it.
+/// `[name, ["", "", ""], {}, tensors, {}]` (the unknown class). D10's reader then reads it.
 fn upgrade(old: &[u8]) -> Result<Header> {
     let bad = |e: minicbor::decode::Error| invalid(format!("old header: {e}"));
     let mut d = Decoder::new(old);
@@ -645,7 +645,7 @@ fn upgrade(old: &[u8]) -> Result<Header> {
         }
         out.push(0x85);
         copy(&mut d, &mut out)?;
-        out.extend([0x60, 0xa0]);
+        out.extend([0x83, 0x60, 0x60, 0x60, 0xa0]);
         copy(&mut d, &mut out)?;
         out.push(0xa0);
     }

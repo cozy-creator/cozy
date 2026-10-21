@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::{
-    Config, ConfigValue, Dtype, Encoding, Metadata, ObjectRef, Pipeline, Value, CONFIG_FILE,
+    ClassRef, Config, ConfigValue, Dtype, Encoding, Metadata, ObjectRef, Pipeline, Value,
+    CONFIG_FILE,
 };
 use crate::store::Error;
 use crate::writer::{Data, PartData, Source, Writer};
@@ -70,11 +71,11 @@ pub trait Sink {
 impl Sink for Writer {
     fn begin(&mut self, _: &str, layout: &Layout) -> Result<()> {
         if let Some(p) = &layout.pipeline {
-            self.pipeline(&p.class, p.config.clone());
+            self.pipeline(p.class.clone(), p.config.clone());
         }
         for c in &layout.components {
             let config_file = c.config_file.as_deref();
-            let mut w = (self.component(&c.name, &c.class, c.config.clone(), config_file))
+            let mut w = (self.component(&c.name, c.class.clone(), c.config.clone(), config_file))
                 .map_err(Error::refusal)?;
             for (name, bytes) in &c.assets {
                 w.asset(name, bytes).map_err(Error::refusal)?;
@@ -166,8 +167,7 @@ pub fn convert_folder(req: &Request, dir: &Path) -> Result<ObjectRef> {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Folder {
     pub name: String,
-    /// `<library>.<Class>`, `""` when unknown.
-    pub class: String,
+    pub class: ClassRef,
     pub config: Config,
     /// The config's file name when it isn't `config.json`.
     pub config_file: Option<String>,
@@ -327,21 +327,30 @@ fn is_gguf(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".gguf")
 }
 
+/// Library versions by library, as configs record them.
+pub type Versions = BTreeMap<String, String>;
+
 /// Lands `docs` (a pinned reference's) and adds each at `into/<path>` where `files` has none;
-/// the paths added.
+/// the paths added. Every library version a landed config records joins `versions`.
 fn fill(
     docs: &[remote::Member],
     into: &str,
     area: &Path,
     req: &Request,
     files: &mut BTreeMap<String, Vec<u8>>,
+    versions: &mut Versions,
 ) -> Result<Vec<String>> {
     let mut added = Vec::new();
     for (path, local) in land(docs, area, req)? {
         let path = join(into, &path);
+        let bytes = std::fs::read(&local)
+            .map_err(|e| crate::err::classify_io(format!("read {path}"), e))?;
+        if let Ok(config) = serde_json::from_slice::<Config>(&bytes) {
+            for (library, version) in recorded(&config) {
+                versions.entry(library).or_insert(version);
+            }
+        }
         if !files.contains_key(&path) {
-            let bytes = std::fs::read(&local)
-                .map_err(|e| crate::err::classify_io(format!("read {path}"), e))?;
             files.insert(path.clone(), bytes);
             added.push(path);
         }
@@ -358,6 +367,7 @@ fn gguf_documents(
     req: &Request,
     area: &Path,
     files: &mut BTreeMap<String, Vec<u8>>,
+    versions: &mut Versions,
 ) -> Result<(String, Vec<String>)> {
     let listing = remote::Scope::new(req.access, req.stop).list(&remote::parse(reference)?)?;
     let pin = listing.pinned.clone();
@@ -366,15 +376,16 @@ fn gguf_documents(
         .into_iter()
         .filter(|m| !remote::weights(&m.path) && folder(&m.path).is_empty())
         .collect();
-    let added = fill(&docs, into, &area.join("gguf-reference"), req, files)?;
+    let added = fill(&docs, into, &area.join("gguf-reference"), req, files, versions)?;
     Ok((pin, added))
 }
 
 /// The model's files: every non-weight file of the source, byte-exact at its path, except a
 /// converted folder's `config.json` (the foreign layout's); each table's reference (its index,
 /// the produced components' configs and the asset folders) where the source has none; the
-/// tables' inline files. With each reference that filled some, and the paths.
-type Documents = (BTreeMap<String, Vec<u8>>, Vec<(String, Vec<String>)>);
+/// tables' inline files. With each reference that filled some, and the paths, and the library
+/// versions the references record.
+type Documents = (BTreeMap<String, Vec<u8>>, Vec<(String, Vec<String>)>, Versions);
 
 fn documents(
     set: &source::SourceSet,
@@ -407,7 +418,7 @@ fn documents(
         }
     }
     let produced: Vec<&str> = planned.iter().map(|p| p.component.as_str()).collect();
-    let mut filled = Vec::new();
+    let (mut filled, mut versions) = (Vec::new(), Versions::new());
     for t in &recognized.tables {
         let table = &tables[*t];
         if let Some(reference) = &table.reference {
@@ -430,7 +441,7 @@ fn documents(
                 })
                 .cloned()
                 .collect();
-            let added = fill(&docs, "", &area.join("reference"), req, &mut files)?;
+            let added = fill(&docs, "", &area.join("reference"), req, &mut files, &mut versions)?;
             if !added.is_empty() {
                 filled.push((pin, added));
             }
@@ -439,37 +450,46 @@ fn documents(
             files.insert(path.clone(), serde_json::to_vec(doc).expect("a JSON value"));
         }
     }
-    Ok((files, filled))
+    Ok((files, filled, versions))
 }
 
 /// Maps a source's non-weight `files` to D10 for the components `tensored` (in construction
 /// order):
-/// - `model_index.json` is the pipeline: class `diffusers.<_class_name>`, config the parsed JSON.
+/// - `model_index.json` is the pipeline: class `diffusers` `_class_name`, config the parsed JSON.
 ///   Each entry `name: [library, Class]` is a component in folder `name`, tensors or not
-///   (schedulers, tokenizers, processors), of class `<library>.<Class>` as written; a component
-///   it names no class for has class `""`.
+///   (schedulers, tokenizers, processors), of that library and class as written; a component
+///   it names no class for has the unknown class.
 /// - Without one, a component named [`ROOT_COMPONENT`] owns the root (a Transformers folder),
-///   and a component's class is its config's ([`class_of`]).
+///   and a component's class is its config's ([`config_class`]).
+/// - A pair's library is its package for a dotted module path, and `diffusers` for a Diffusers
+///   pipeline module (`stable_diffusion`) ([`class_of`]). A class's version is its own config's
+///   for its library (`_diffusers_version`, `transformers_version`), else one another config of
+///   the model records for that library, else `reference`'s (the converter's pinned reference
+///   configs), else `""`.
 /// - In a component's folder, the first of [`CONFIGS`] is its config, and the other run files
 ///   ([`run_data`]) its assets.
 /// - Every other file is a repo file. A component with no tensors, config or assets is none.
-pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Result<Layout> {
-    let pipeline = match files.remove(PIPELINE_FILE) {
+pub fn layout(
+    mut files: BTreeMap<String, Vec<u8>>,
+    tensored: &[String],
+    reference: &Versions,
+) -> Result<Layout> {
+    let mut pipeline = match files.remove(PIPELINE_FILE) {
         Some(bytes) => {
             let config = parse_config(PIPELINE_FILE, &bytes)?;
             let class = (config.get("_class_name").and_then(ConfigValue::as_str))
-                .map_or_else(String::new, |c| format!("diffusers.{c}"));
+                .map_or_else(ClassRef::default, |c| ClassRef::new("diffusers", "", c));
             Some(Pipeline { class, config })
         }
         None => None,
     };
-    let listed: BTreeMap<String, String> = (pipeline.iter())
+    let listed: BTreeMap<String, ClassRef> = (pipeline.iter())
         .flat_map(|p| &p.config)
         .filter(|(name, _)| !name.starts_with('_'))
         .filter_map(|(name, row)| match row.as_array()?.as_slice() {
             [library, class, ..] => Some((
                 name.clone(),
-                format!("{}.{}", library.as_str()?, class.as_str()?),
+                ClassRef::new(library.as_str()?, "", class.as_str()?),
             )),
             _ => None,
         })
@@ -510,8 +530,8 @@ pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Resu
         }
         let class = match (&pipeline, file) {
             (Some(_), _) => listed.get(&name).cloned().unwrap_or_default(),
-            (None, Some(f)) => class_of(f, &config),
-            (None, None) => String::new(),
+            (None, Some(f)) => config_class(f, &config),
+            (None, None) => ClassRef::default(),
         };
         components.push(Folder {
             class,
@@ -521,10 +541,54 @@ pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Resu
             assets,
         });
     }
+    let mut versions = Versions::new();
+    let configs = pipeline.iter().map(|p| &p.config).chain(components.iter().map(|c| &c.config));
+    for (library, version) in configs.flat_map(recorded).chain(reference.clone()) {
+        versions.entry(library).or_insert(version);
+    }
+    let pipeline_read = pipeline.is_some();
+    let classes = (pipeline.iter_mut().map(|p| (&mut p.class, &p.config)))
+        .chain(components.iter_mut().map(|c| (&mut c.class, &c.config)));
+    for (class, config) in classes.filter(|(class, _)| !class.is_unknown()) {
+        let model = class_of(&class.library, &class.name, &versions, pipeline_read);
+        let mut own = recorded(config).filter(|(library, _)| *library == model.library);
+        let version = own.next().map_or(model.version, |(_, version)| version);
+        *class = ClassRef { version, ..model };
+    }
     Ok(Layout {
         pipeline,
         components,
         files,
+    })
+}
+
+/// A class from its library and name, at the version `versions` (the model's: its configs'
+/// records, then the converter reference's) holds for that library, else `""`. An empty library
+/// is the unknown class.
+///
+/// Only a Diffusers `model_index.json` pair (`model_index`) is reinterpreted: a dotted module
+/// path is its top-level package (`minimax_h3.pipeline` is `minimax_h3`), and a library that is
+/// not installed (`diffusers`, `transformers`, or one `versions` holds) is a Diffusers pipeline
+/// module (`stable_diffusion`, `kandinsky`), so `diffusers`. Any other source keeps its library
+/// as written: an unknown library never becomes `diffusers`.
+pub fn class_of(library: &str, name: &str, versions: &Versions, model_index: bool) -> ClassRef {
+    let installed = matches!(library, "diffusers" | "transformers") || versions.contains_key(library);
+    let library = match (model_index, library.split_once('.')) {
+        _ if library.is_empty() => return ClassRef::default(),
+        (true, Some((package, _))) => package,
+        (true, None) if !installed => "diffusers",
+        _ => library,
+    };
+    ClassRef::new(library, versions.get(library).map_or("", String::as_str), name)
+}
+
+/// The library versions a config records: `_<library>_version` or `<library>_version` keys
+/// (`_diffusers_version`, `transformers_version`).
+fn recorded(config: &Config) -> impl Iterator<Item = (String, String)> + '_ {
+    config.iter().filter_map(|(key, value)| {
+        let library = key.strip_suffix("_version")?;
+        let library = library.strip_prefix('_').unwrap_or(library);
+        Some((library.to_owned(), value.as_str()?.to_owned())).filter(|(l, v)| !l.is_empty() && !v.is_empty())
     })
 }
 
@@ -561,17 +625,17 @@ fn parse_config(path: &str, bytes: &[u8]) -> Result<Config> {
 }
 
 /// A component's class without a pipeline, from its config file: Transformers'
-/// `architectures[0]`, Diffusers' `_class_name`, a tokenizer config's `tokenizer_class`; `""`
-/// when it names none.
-fn class_of(file: &str, config: &Config) -> String {
+/// `architectures[0]`, Diffusers' `_class_name`, a tokenizer config's `tokenizer_class`; the
+/// unknown class when it names none. [`layout`] adds the version.
+fn config_class(file: &str, config: &Config) -> ClassRef {
     let text = |key: &str| config.get(key).and_then(ConfigValue::as_str);
     let first = (config.get("architectures").and_then(ConfigValue::as_array))
         .and_then(|a| a.first()?.as_str());
     match (first, text("_class_name"), text("tokenizer_class")) {
-        (Some(c), _, _) => format!("transformers.{c}"),
-        (_, Some(c), _) => format!("diffusers.{c}"),
-        (_, _, Some(c)) if file == "tokenizer_config.json" => format!("transformers.{c}"),
-        _ => String::new(),
+        (Some(c), _, _) => ClassRef::new("transformers", "", c),
+        (_, Some(c), _) => ClassRef::new("diffusers", "", c),
+        (_, _, Some(c)) if file == "tokenizer_config.json" => ClassRef::new("transformers", "", c),
+        _ => ClassRef::default(),
     }
 }
 
@@ -644,7 +708,7 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     };
     let identity = |g: &source::Group| component(&g.folder, &g.stem);
     let planned = engine::plan(&set, tables, &recognized, &identity)?;
-    let (mut files, mut filled) = documents(&set, &recognized, &planned, req, &area)?;
+    let (mut files, mut filled, mut versions) = documents(&set, &recognized, &planned, req, &area)?;
     let (mut converters, mut normalized) = (converters, normalized);
     let mut ggufs_planned = Vec::new();
     for p in &ggufs {
@@ -659,7 +723,8 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         let record = serde_json::to_vec(&plan.meta).expect("the record serializes");
         files.insert(format!("{}.json", p.path), record);
         if let Some(reference) = &plan.reference {
-            let (pin, added) = gguf_documents(reference, folder(&p.path), req, &area, &mut files)?;
+            let into = folder(&p.path);
+            let (pin, added) = gguf_documents(reference, into, req, &area, &mut files, &mut versions)?;
             filled.extend((!added.is_empty()).then_some((pin, added)));
         }
         ggufs_planned.push((p.file, component, plan));
@@ -690,7 +755,7 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
             )
         }));
     stopped(req)?;
-    sink.begin(&main_variant(stored), &layout(files, &tensored)?)?;
+    sink.begin(&main_variant(stored), &layout(files, &tensored, &versions)?)?;
     let opened: Vec<File> = set
         .files
         .iter()
