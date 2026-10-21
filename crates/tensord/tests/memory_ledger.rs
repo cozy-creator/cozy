@@ -14,6 +14,8 @@ use std::{
     time::Duration,
 };
 use tensord::{
+    execution::Engine,
+    journal::Invocation,
     machine::receipt,
     memory::{self, Gpu, MemoryLog, Peaks},
 };
@@ -25,8 +27,11 @@ const MIB: u64 = 1 << 20;
 /// Three regions of one part each: a set the host backend maps page by page.
 const PARTS: [&str; 3] = ["c/w0", "c/w1", "c/w2"];
 const PACKAGE: &str = "s5/package@1";
-/// The room the stand-in's pass measures.
+/// The room a pass at shape `8` measures: two such requests fit on the card.
 const ROOM: u64 = 6 * MIB;
+/// A shape whose pass measures more than half the card beside its weights: two never fit.
+const BIG: &str = "64";
+const BIG_ROOM: u64 = 40 * MIB;
 
 /// A failure backstop only: every wait below ends on the event it waits for.
 const BACKSTOP: Duration = Duration::from_secs(60);
@@ -65,14 +70,15 @@ fn spec(gpu: &GpuId) -> SetSpec {
 }
 
 fn plan() -> Plan {
-    Plan { steps: vec![Step { sets: vec![format!("{PACKAGE}/c")], passes: 1 }] }
+    Plan { steps: vec![Step { sets: vec![format!("{PACKAGE}/c")], passes: 2 }] }
 }
 
 /// An executor stand-in: run by `StandIn::spawn` with its control socket at stdin. It opens its
 /// memory with the two descriptors that arrive first and loads the set at its level (`gpu`:
 /// warmed, `ram`: in the RAM tier only), then answers one line per command: `load` (a request
-/// binding every block: `<origins> <kept bytes> <store bytes>`), `run <id>` (a request whose
-/// pass starts, unmeasured) and `end` (that pass measured, the request ended).
+/// binding every block: `<origins> <kept bytes> <store bytes>`), `open <id>` (a request),
+/// `pass <shape>` (its next pass starts), `done <room>` (that pass measured at `room`) and
+/// `close` (the request ends); `run <id> <shape>` is open and pass, `end <room>` done and close.
 #[test]
 #[ignore = "memory_ledger's tests run it as an executor"]
 fn executor_stand_in() {
@@ -86,33 +92,48 @@ fn executor_stand_in() {
     let memory = Memory::open(gpu.clone(), Some(Grant { table, events }), Box::new(HostBackend::new(gpu.memory))).unwrap();
     let set = memory.load(spec(&gpu), if level == "gpu" { Level::Gpu } else { Level::Ram }).unwrap();
     let (mut out, lines) = (control.try_clone().unwrap(), BufReader::new(control).lines());
-    let mut running = None;
+    let (mut request, mut pass) = (None, None);
     for line in lines.map_while(Result::ok) {
-        let reply = match line.split_once(' ').unwrap_or((&line, "")) {
-            ("load", _) => {
-                let request = memory.request(&format!("load-{}", std::process::id()), plan()).unwrap();
-                let pass = request.pass(set, "1", Torch::default()).unwrap();
-                let pins: Vec<_> = (0..PARTS.len() as u32).map(|block| memory.bind(set, block, 0).unwrap()).collect();
-                drop(pins);
-                pass.end(Measured::default(), Torch::default());
-                let stats = request.end();
-                let origins: Vec<String> = stats.trace.iter().map(|bind| format!("{:?}", bind.origin)).collect();
-                format!("{} {} {}", origins.join(","), stats.moved.kept.bytes, stats.moved.store.bytes)
+        let commands: Vec<(String, String)> = match line.split_once(' ').unwrap_or((&line, "")) {
+            ("run", args) => {
+                let (id, shape) = args.split_once(' ').unwrap();
+                vec![("open".into(), id.into()), ("pass".into(), shape.into())]
             }
-            ("run", id) => {
-                let request = memory.request(id, plan()).unwrap();
-                let pass = request.pass(set, "8", Default::default()).unwrap();
-                running = Some((request, pass));
-                "passing".into()
-            }
-            ("end", _) => {
-                let (request, pass) = running.take().unwrap();
-                pass.end(Measured { allocated_peak: ROOM, ..Default::default() }, Torch::default());
-                request.end();
-                "ended".into()
-            }
-            (other, _) => panic!("unknown command {other}"),
+            ("end", room) => vec![("done".into(), room.into()), ("close".into(), String::new())],
+            (command, args) => vec![(command.into(), args.into())],
         };
+        let mut reply = String::new();
+        for (command, args) in commands {
+            reply = match (command.as_str(), args.as_str()) {
+                ("load", _) => {
+                    let request = memory.request(&format!("load-{}", std::process::id()), plan()).unwrap();
+                    let pass = request.pass(set, "1", Torch::default()).unwrap();
+                    let pins: Vec<_> = (0..PARTS.len() as u32).map(|block| memory.bind(set, block, 0).unwrap()).collect();
+                    drop(pins);
+                    pass.end(Measured::default(), Torch::default());
+                    let stats = request.end();
+                    let origins: Vec<String> = stats.trace.iter().map(|bind| format!("{:?}", bind.origin)).collect();
+                    format!("{} {} {}", origins.join(","), stats.moved.kept.bytes, stats.moved.store.bytes)
+                }
+                ("open", id) => {
+                    request = Some(memory.request(id, plan()).unwrap());
+                    "open".into()
+                }
+                ("pass", shape) => {
+                    pass = Some(request.as_ref().unwrap().pass(set, shape, Torch::default()).unwrap());
+                    "passing".into()
+                }
+                ("done", room) => {
+                    pass.take().unwrap().end(Measured { allocated_peak: room.parse().unwrap(), ..Default::default() }, Torch::default());
+                    "done".into()
+                }
+                ("close", _) => {
+                    request.take().unwrap().end();
+                    "ended".into()
+                }
+                (other, _) => panic!("unknown command {other}"),
+            };
+        }
         writeln!(out, "{reply}").unwrap();
     }
 }
@@ -202,21 +223,21 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
 
     // An unmeasured run fits nothing beside it.
     assert!(varena::Ledger::admit(&[&gpu.ledger], "unmeasured", PACKAGE, "8").unwrap(), "an idle GPU admits it");
-    assert_eq!(first.ask("run unmeasured"), "passing");
+    assert_eq!(first.ask("run unmeasured 8"), "passing");
     assert!(gpu.running());
     assert!(!gpu.ledger.fits(PACKAGE, "8"));
     assert!(!gpu.ledger.fits("s5/other@1", "4"));
     while wakes.try_recv().is_ok() {}
-    assert_eq!(first.ask("end"), "ended");
+    assert_eq!(first.ask(&format!("end {ROOM}")), "ended");
     gpu.ledger.undispatch("unmeasured");
     wakes.recv_timeout(BACKSTOP).expect("a recorded peak signals");
     assert!(gpu.ledger.peaks().iter().any(|peak| peak.key == format!("{PACKAGE}|8")));
 
     // Measured, a second request of that shape fits beside a running one.
     assert!(varena::Ledger::admit(&[&gpu.ledger], "measured", PACKAGE, "8").unwrap());
-    assert_eq!(first.ask("run measured"), "passing");
+    assert_eq!(first.ask("run measured 8"), "passing");
     assert!(gpu.ledger.fits(PACKAGE, "8"), "two measured requests fit on the card");
-    assert_eq!(first.ask("end"), "ended");
+    assert_eq!(first.ask(&format!("end {ROOM}")), "ended");
     gpu.ledger.undispatch("measured");
 
     // kill -9, waitpid, reap: what it kept is the table's orphans, and the next executor of the
@@ -239,4 +260,63 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
     let restored = Gpu::create("0", &[inventory(&other)], None, &Peaks::at(dir.path().join("peaks")), &log).unwrap();
     assert!(restored.ledger.peaks().iter().any(|peak| peak.key == format!("{PACKAGE}|8")));
     drop(second);
+}
+
+/// A request whose measured working set does not fit beside a running one waits for it to end,
+/// woken by the ledger's events, and never runs beside it; a cancel ends a wait.
+#[test]
+fn a_request_that_does_not_fit_waits_until_the_running_one_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
+    let id = gpu_id("wait");
+    let gpu = Gpu::create("0", &[inventory(&id)], None, &peaks, &log).unwrap();
+    let engine = Engine::open(&dir.path().join("engine")).unwrap();
+    let woken = engine.clone();
+    let _events = memory::react(&[&gpu.ledger], move || woken.notify_activity()).unwrap();
+    let request = |key: &str| engine.submit(key, Invocation::default()).unwrap().id;
+    let admit = |id: &str| memory::admit(&engine, &[&gpu.ledger], id, PACKAGE, BIG).unwrap();
+    let mut a = StandIn::spawn(&gpu, &id, "gpu");
+    let a_pid = a.pid();
+    let running = |gpu: &Gpu| gpu.status().rows.iter().any(|row| row.pid == a_pid && (row.remaining > 0 || row.unmeasured > 0));
+
+    // Measured once: more than half the card.
+    let first = request("first");
+    assert!(admit(&first), "an idle GPU admits it");
+    assert_eq!(a.ask(&format!("run {first} {BIG}")), "passing");
+    assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
+    gpu.ledger.undispatch(&first);
+    let second = request("second");
+    assert!(admit(&second), "alone, it fits");
+    assert_eq!(a.ask(&format!("run {second} {BIG}")), "passing");
+    assert!(!gpu.ledger.fits(PACKAGE, BIG), "two do not fit");
+
+    let third = request("third");
+    std::thread::scope(|scope| {
+        let (done, admitted) = mpsc::channel();
+        let (gpu, third, admit) = (&gpu, &third, &admit);
+        scope.spawn(move || {
+            let ok = admit(third);
+            done.send((ok, running(gpu))).unwrap();
+        });
+        engine.notify_activity(); // a wake that frees nothing
+        assert!(admitted.try_recv().is_err(), "it waits while the second runs");
+        assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
+        let (ok, overlapped) = admitted.recv_timeout(BACKSTOP).expect("the second's end wakes it");
+        assert!(ok && !overlapped, "admitted once the second ended, never beside it");
+    });
+    gpu.ledger.undispatch(&third);
+
+    // Waiting again behind a running one, it leaves when canceled.
+    let fourth = request("fourth");
+    assert!(admit(&fourth));
+    assert_eq!(a.ask(&format!("run {fourth} {BIG}")), "passing");
+    let fifth = request("fifth");
+    std::thread::scope(|scope| {
+        let (fifth, admit) = (&fifth, &admit);
+        let waiting = scope.spawn(move || admit(fifth));
+        engine.cancel(fifth, "test").unwrap();
+        assert!(!waiting.join().unwrap(), "a cancel ends the wait, not admitted");
+    });
+    assert!(!gpu.status().dispatched.iter().any(|(request, _)| *request == fifth));
+    assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
 }
