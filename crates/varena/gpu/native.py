@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["cozy-runtime>=0.30.0"]
+# dependencies = ["cozy-runtime>=0.27.4"]
 # ///
 """varena's native GPU suite on a rental: `cozy run native.py --on <rental> --gpus 1
 --asset binary=<the gpu test binary> --asset suite=<suite.json>`.
