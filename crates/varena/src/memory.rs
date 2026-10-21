@@ -474,6 +474,7 @@ struct Inner {
     backend: Box<dyn Backend>,
     shared: Arc<Shared>,
     row: Arc<Row>,
+    _device: Device,
     custody: Option<Arc<custody::Client>>,
     tier: Option<Arc<tier::Client>>,
     state: Mutex<State>,
@@ -505,6 +506,8 @@ impl Memory {
             if !crate::layout::REGION_ALIGN.is_multiple_of(backend.granularity().max(1)) {
                 return Err(Error::Invalid(format!("granularity {} does not divide a region", backend.granularity())));
             }
+            // A row is a process: one Memory per device per process.
+            let device = Device::open(&gpu.uuid)?;
             let grant = match grant {
                 Some(g) => g,
                 None => Grant::open(&gpu, None)?,
@@ -526,6 +529,7 @@ impl Memory {
                 backend,
                 shared,
                 row: row.clone(),
+                _device: device,
                 custody,
                 tier,
                 state: Mutex::new(State { table, holder, ..State::default() }),
@@ -875,8 +879,12 @@ impl Inner {
         st.table.shared = self.shared.shared_mode()?;
         st.table.pending = self.to_custody.pending();
         let others: u64 = st.table.others.iter().map(crate::table::Remote::held).sum();
-        let used = self.backend.capacity().saturating_sub(self.backend.free()?);
-        st.table.foreign = used.saturating_sub(others + orphans + st.table.held());
+        let card = self.backend.capacity();
+        let used = card.saturating_sub(self.backend.free()?);
+        // Foreign bytes take from the card, not from the table's cap: they count only beyond the
+        // card's room outside the cap (capacity = min(cap, card - foreign)).
+        let foreign = used.saturating_sub(others + orphans + st.table.held());
+        st.table.foreign = foreign.saturating_sub(card.saturating_sub(st.table.capacity));
         self.shared.set_foreign(st.table.foreign)?;
         Ok(())
     }
@@ -884,7 +892,8 @@ impl Inner {
     fn publish(&self, st: &State) {
         let t = &st.table;
         let remaining: Vec<Option<u64>> = t.requests.iter().map(|r| t.remaining(r)).collect();
-        let idle = t.requests.is_empty();
+        // Every request waiting on a child call: idle for others, its slack and caches theirs.
+        let idle = t.requests.iter().all(|r| r.yielded.is_some());
         self.row.publish(&Facts {
             context: t.context,
             torch: t.torch() + st.claims.values().sum::<u64>(),
@@ -892,7 +901,7 @@ impl Inner {
             classes: t.classes(),
             remaining: remaining.iter().flatten().sum(),
             unmeasured: remaining.iter().filter(|r| r.is_none()).count() as u64,
-            running: t.requests.len() as u64,
+            running: t.requests.iter().filter(|r| r.yielded.is_none()).count() as u64,
             outside: t.outside(),
         });
     }
@@ -1109,7 +1118,7 @@ impl Inner {
                     return Ok((Origin::Tier, self.backend.fence()?));
                 }
                 // Staged through the tier when the host has the room (the tier's decision).
-                if self.tier.as_ref().is_some_and(|t| t.room(span).unwrap_or(false)) {
+                if self.tier.as_ref().is_some_and(|t| t.room(span)) {
                     held.fill(job.key.1, |host| self.store(&spec.source, &region.items, region.offset, host))?;
                     pin(held)?;
                     if read(held)? {
@@ -1532,7 +1541,7 @@ impl Inner {
         };
         let (Some(held), Some(tier)) = (held, &self.tier) else { return Ok(()) };
         for (r, region) in spec.layout.regions.iter().enumerate() {
-            if !tier.room(region.span)? {
+            if !tier.room(region.span) {
                 break;
             }
             held.fill(r as u32, |host| self.store(&spec.source, &region.items, region.offset, host))?;
@@ -2105,6 +2114,27 @@ impl Inner {
     }
 }
 
+/// This process's open devices: one Memory each.
+static OPEN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// A device this process has open, given back when its Memory goes.
+struct Device(String);
+
+impl Device {
+    fn open(uuid: &str) -> Result<Device> {
+        if !OPEN.lock().insert(uuid.to_string()) {
+            return Err(Error::Invalid(format!("{uuid} is already open in this process")));
+        }
+        Ok(Device(uuid.to_string()))
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        OPEN.lock().remove(&self.0);
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -2326,7 +2356,7 @@ impl Request {
             self.inner.shared.ring();
             Ok(())
         });
-        Yielded { inner: self.inner.clone(), req: self.id }
+        Yielded { wait: Some((self.inner.clone(), self.id)) }
     }
 
     pub fn stats(&self) -> Stats {
@@ -2433,7 +2463,13 @@ impl Inner {
             back.zip(set)
         };
         if let Some(((room, measured), set)) = back {
-            self.demand(Trigger::Pass { req, set, room: measured.then_some(room), unmeasured: room, tried: Tried::default() }, Some(req))?;
+            let actions = self.demand(Trigger::Pass { req, set, room: measured.then_some(room), unmeasured: room, tried: Tried::default() }, Some(req))?;
+            if let Some(Action::Exhausted { need }) = actions.last() {
+                let st = self.lock();
+                let stats = st.stats.get(&req).cloned().unwrap_or_default();
+                self.unlock(st);
+                return Err(Error::Exhausted(exhausted(*need, None, stats)));
+            }
         }
         Ok(())
     }
@@ -2477,13 +2513,25 @@ impl Inner {
 
 /// A request waiting on a child call ([`Request::yielding`]); dropped, the wait is over.
 pub struct Yielded {
-    inner: Arc<Inner>,
-    req: u64,
+    wait: Option<(Arc<Inner>, u64)>,
+}
+
+impl Yielded {
+    /// The wait is over: the room is taken back as a pass start takes it, `Exhausted` when it
+    /// cannot be (the caller handles it as at a pass start). Dropping it does the same, quietly.
+    pub fn end(mut self) -> Result<()> {
+        match self.wait.take() {
+            Some((inner, req)) => inner.guard(|| inner.unyield(req)),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Drop for Yielded {
     fn drop(&mut self) {
-        let _ = self.inner.guard(|| self.inner.unyield(self.req));
+        if let Some((inner, req)) = self.wait.take() {
+            let _ = inner.guard(|| inner.unyield(req));
+        }
     }
 }
 

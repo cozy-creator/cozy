@@ -223,7 +223,7 @@ fn rooms_count_what_earlier_steps_left_allocated() {
 #[test]
 fn collective_levels_relax_by_agreement() {
     let dir = tempfile::tempdir().unwrap();
-    let (_l, mem, g) = open("relax", 16 * MB);
+    let (ledger, mem, g) = open("relax", 16 * MB);
     let c = mem.load(set(dir.path(), "c", 1, &g.uuid), Level::Ram).unwrap();
     let x = mem.load(set(dir.path(), "x", 4, &g.uuid), Level::Ram).unwrap();
     let ag = |peak| varena::SitePeak { name: "ag".into(), peak, collective: true, finest: 4 };
@@ -240,6 +240,10 @@ fn collective_levels_relax_by_agreement() {
     p.end(measured(4 * MB, ag(2 * MB)), Torch::default());
     drop(pins);
     mem.unload(x);
+    // x's kept pages are free once custody has their Withdraws (they read as P until then).
+    while ledger.status().rows.iter().any(|r| r.classes[varena::table::Class::P.index()] > 0) {
+        ledger.await_event().unwrap();
+    }
     let p = r.pass(c, "fwd", "1x8", Torch::default()).unwrap();
     assert_eq!(p.levels(), vec![("ag".to_string(), 1)]);
     p.agree(vec![("ag".into(), 1)]);
@@ -381,3 +385,4 @@ fn the_latest_measured_room_wins() {
     ledger.restore(&[saved.unwrap()]).unwrap();
     assert_eq!(room(&mem, id, "l", "1x8", pages, None), 6 * MB, "this run's measurement is newer");
 }
+
