@@ -13,7 +13,7 @@ use tensorfs::format::ObjectRef;
 use tensorfs::io::source::Source;
 use tensorfs::io::{ItemSource, ObjectRange};
 use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
-use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Next, Pass, Pin, Plan, Request, SetId, SetSpec, Step, Torch};
+use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Next, Pass, Physical, Pin, Plan, Request, SetId, SetSpec, Step, Torch, Va};
 
 const MB: u64 = 1 << 20;
 
@@ -32,7 +32,7 @@ fn main() {
     }
     let filter: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
     type Case = (&'static str, fn(&Path));
-    let cases: [Case; 14] = [
+    let cases: [Case; 20] = [
         ("an_idle_holder_answers_an_ask", an_idle_holder_answers_an_ask),
         ("a_killed_holder_leaves_orphans_a_successor_imports", a_killed_holder_leaves_orphans_a_successor_imports),
         ("a_failed_request_frees_everything", a_failed_request_frees_everything),
@@ -47,6 +47,12 @@ fn main() {
         ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
         ("a_joint_step_runs_a_pass_per_set", a_joint_step_runs_a_pass_per_set),
         ("a_child_runs_while_its_parent_yields", a_child_runs_while_its_parent_yields),
+        ("the_tier_waits_on_no_executor_and_says_when_the_host_is_short", the_tier_waits_on_no_executor_and_says_when_the_host_is_short),
+        ("a_silent_asker_holds_up_no_answer", a_silent_asker_holds_up_no_answer),
+        ("a_reaper_with_a_stale_view_frees_nothing", a_reaper_with_a_stale_view_frees_nothing),
+        ("an_oom_counts_its_own_unmaps_after_an_ask", an_oom_counts_its_own_unmaps_after_an_ask),
+        ("a_standalone_process_wakes_tensord", a_standalone_process_wakes_tensord),
+        ("the_tier_comes_back_after_a_release", the_tier_comes_back_after_a_release),
     ];
     let dir = tempfile::tempdir().unwrap();
     let mut failed = vec![];
@@ -119,6 +125,89 @@ fn spec(name: &str, path: &Path, fill: Fill, uuid: &str) -> SetSpec {
 
 // ---- the child
 
+/// The host backend, recording which host ranges are page-locked for the copy engine now.
+struct Recording {
+    host: HostBackend,
+    registered: Arc<parking_lot::Mutex<std::collections::HashSet<u64>>>,
+}
+
+impl Backend for Recording {
+    fn capacity(&self) -> u64 {
+        self.host.capacity()
+    }
+    fn free(&self) -> varena::Result<u64> {
+        self.host.free()
+    }
+    fn process_used(&self) -> varena::Result<u64> {
+        self.host.process_used()
+    }
+    fn granularity(&self) -> u64 {
+        self.host.granularity()
+    }
+    fn reserve(&self, len: u64) -> varena::Result<Va> {
+        self.host.reserve(len)
+    }
+    fn release(&self, va: Va) {
+        self.host.release(va)
+    }
+    fn create(&self, len: u64) -> varena::Result<Physical> {
+        self.host.create(len)
+    }
+    fn destroy(&self, page: Physical) {
+        self.host.destroy(page)
+    }
+    fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> varena::Result<()> {
+        self.host.map(va, offset, page, access)
+    }
+    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> {
+        self.host.protect(va, offset, len, access)
+    }
+    fn unmap(&self, va: Va, offset: u64, len: u64) -> varena::Result<()> {
+        self.host.unmap(va, offset, len)
+    }
+    fn export(&self, page: &Physical) -> varena::Result<platform::handles::Owned> {
+        self.host.export(page)
+    }
+    fn import(&self, handle: platform::handles::Owned, len: u64) -> varena::Result<Physical> {
+        self.host.import(handle, len)
+    }
+    fn target(&self, va: Va, offset: u64, len: u64) -> tensorfs::io::Dst {
+        self.host.target(va, offset, len)
+    }
+    fn fence(&self) -> varena::Result<Event> {
+        self.host.fence()
+    }
+    fn record(&self, stream: usize) -> varena::Result<Event> {
+        self.host.record(stream)
+    }
+    fn query(&self, event: Event) -> varena::Result<bool> {
+        self.host.query(event)
+    }
+    fn elapsed(&self, from: Event, to: Event) -> varena::Result<Option<u64>> {
+        self.host.elapsed(from, to)
+    }
+    fn wait(&self, event: Event, stream: usize) -> varena::Result<()> {
+        self.host.wait(event, stream)
+    }
+    fn synchronize(&self, stream: usize) -> varena::Result<()> {
+        self.host.synchronize(stream)
+    }
+    fn register_host(&self, ptr: u64, _: u64) -> varena::Result<()> {
+        self.registered.lock().insert(ptr);
+        Ok(())
+    }
+    fn unregister_host(&self, ptr: u64) -> varena::Result<()> {
+        self.registered.lock().remove(&ptr);
+        Ok(())
+    }
+    fn retire(&self, event: Event) {
+        self.host.retire(event)
+    }
+    fn drain(&self) -> varena::Result<()> {
+        self.host.drain()
+    }
+}
+
 /// Runs commands over one Memory until stdin ends. Every command answers one line.
 fn agent() {
     let mut mem: Option<Memory> = None;
@@ -128,6 +217,7 @@ fn agent() {
     let mut passes: HashMap<String, Pass> = HashMap::new();
     let mut pins: Vec<Pin> = vec![];
     let mut yielded: HashMap<String, varena::Yielded> = HashMap::new();
+    let registered = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
     let shrunk = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut out = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
@@ -151,6 +241,14 @@ fn agent() {
                 mem = Some(Memory::open(g, None, Box::new(HostBackend::new(memory))).unwrap());
                 format!("ok {}", std::process::id())
             }
+            ["openrec", id, memory] => {
+                uuid = id.to_string();
+                let memory: u64 = memory.parse().unwrap();
+                let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory };
+                mem = Some(Memory::open(g, None, Box::new(Recording { host: HostBackend::new(memory), registered: registered.clone() })).unwrap());
+                format!("ok {}", std::process::id())
+            }
+            ["registered"] => format!("ok {}", registered.lock().len()),
             ["load", name, path, fill, level] => {
                 let fill = match *fill {
                     "stored" => Fill::Stored,
@@ -599,8 +697,10 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
 /// Review 1, finding 2: an ask to a victim whose ask thread cannot run (stopped) waits on the
 /// victim itself: when it dies, the asker goes on, with no timer. Review 2, finding 3: TensorD
 /// sees it stalled only while an ask is pending to it, and the ask is in the asker's own row.
+/// Finding 11: while the ask is out, the asker claims what it asked and what it unmapped of its
+/// own for the same demand.
 fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
-    let g = gpu("stop", 8 * MB);
+    let g = gpu("stop", 10 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     // TensorD serves the tier too: a stopped executor must not be the one serving it.
     let _tier = varena::Tier::serve(varena::Pressure::Headroom).unwrap();
@@ -609,8 +709,9 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     a.ok(&format!("grant {} {}", g.uuid, g.memory));
     a.ok(&format!("load va {} stored gpu", a_path.display()));
     let mut b = Agent::granted(ledger.grant(0).unwrap());
-    b.ok(&format!("grant {} {}", g.uuid, g.memory));
+    let b_pid = b.ok(&format!("grant {} {}", g.uuid, g.memory));
     b.ok(&format!("load vb {} stored ram", b_path.display()));
+    b.ok(&format!("load vn {} stored gpu", write_set(dir, "vn", 1).display()));
     // Earlier events (rows claimed, pages mapped) are not the ask's.
     ledger.clear_events();
     b.ok("request r vb");
@@ -629,6 +730,8 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
         ledger.await_event().unwrap();
     }
     assert_eq!(ledger.stalled(), vec![pid as u32], "asked and its ask thread stopped: measured, not counted");
+    let torch = ledger.status().rows.iter().find(|r| r.pid.to_string() == b_pid).map(|r| r.torch);
+    assert_eq!(torch, Some(2 * MB + 2 * MB), "b claims its own unmapped page and the asked bytes meanwhile");
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     assert_eq!(b.reply(), "ok", "the asker went on when the victim died");
@@ -713,11 +816,12 @@ fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
     let (p1, p2) = (write_set(dir, "p1", 2), write_set(dir, "p2", 2));
     let digest = |n: &str| format!("layout-{n}-{}", g.uuid);
     let mut y = Agent::spawn();
-    y.ok(&format!("open {} {}", g.uuid, g.memory));
+    y.ok(&format!("openrec {} {}", g.uuid, g.memory));
     y.ok(&format!("load p1 {} stored ram", p1.display()));
     y.ok(&format!("load p2 {} stored ram", p2.display()));
     // A device page filled from the tier: the region is mapped and page-locked in y.
     assert_eq!(y.ok("exact p1 0"), "true");
+    assert_eq!(y.ok("registered"), "1", "the region a fill read is page-locked");
     let resident = |d: &str| tier.resident().into_iter().find(|(k, _)| k == d).map_or(0, |(_, b)| b);
     // Each layout's file: its ready words' page and its two regions.
     assert!(resident(&digest("p1")) >= 4 * MB && resident(&digest("p2")) >= 4 * MB);
@@ -727,6 +831,8 @@ fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
     assert!(resident(&digest("p1")) < REGION_ALIGN, "the pinned layout's regions returned: {}", resident(&digest("p1")));
     assert!(resident(&digest("p2")) >= 4 * MB, "the next one is untouched");
     assert_eq!(tier.acked(), REGION_ALIGN, "y unpinned the one region it had page-locked, when asked");
+    // Review 2, finding 13: y unlocked it before it answered, so before the tier punched it.
+    assert_eq!(y.ok("registered"), "0", "unlocked before the punch");
     assert_eq!(y.ok("exact p1 1"), "true", "y goes on from the store");
     y.ok("unpin");
     y.exit();
@@ -805,4 +911,175 @@ fn a_child_runs_while_its_parent_yields(dir: &Path) {
     parent.ok("unpin");
     parent.ok("end r");
     parent.exit();
+}
+
+/// Round 2, finding 2: the tier never waits on an executor. It asks a stopped executor for its
+/// layout and goes on serving; the executor's death is its answer. Once nothing is left to
+/// give back and the host is still short, it raises the host-short event for TensorD.
+fn the_tier_waits_on_no_executor_and_says_when_the_host_is_short(dir: &Path) {
+    use std::os::fd::FromRawFd;
+    let g = gpu("short", 64 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
+    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
+    let signal = event.try_clone().unwrap();
+    let pressure = || {
+        // SAFETY: an 8-byte write to our eventfd.
+        unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
+    };
+    let tier = varena::Tier::serve(varena::Pressure::Events(event)).unwrap().expect("this namespace's tier");
+    let (s1, s2) = (write_set(dir, "s1", 2), write_set(dir, "s2", 2));
+    let digest = |n: &str| format!("layout-{n}-{}", g.uuid);
+    let mut y = Agent::spawn();
+    y.ok(&format!("open {} {}", g.uuid, g.memory));
+    y.ok(&format!("load s1 {} stored ram", s1.display()));
+    assert_eq!(y.ok("exact s1 0"), "true");
+    let pid = y.child.id() as i32;
+    let mut status = 0;
+    // SAFETY: a signal to our own child, then waiting until it has stopped.
+    unsafe {
+        libc::kill(pid, libc::SIGSTOP);
+        libc::waitpid(pid, &mut status, libc::WUNTRACED);
+    }
+    pressure();
+    // The ask to y is out and unanswered; the tier serves another executor meanwhile.
+    let mut z = Agent::spawn();
+    z.ok(&format!("open {} {}", g.uuid, g.memory));
+    z.ok(&format!("load s2 {} stored ram", s2.display()));
+    assert!(tier.held().contains(&digest("s1")), "nothing punched before its user answered");
+    y.child.kill().unwrap();
+    y.child.wait().unwrap();
+    tier.await_releases(1);
+    assert!(!tier.held().contains(&digest("s1")), "its death was its answer");
+    pressure();
+    tier.await_releases(2);
+    assert!(tier.held().iter().all(|d| !d.ends_with(&g.uuid)), "{:?}", tier.held());
+    // Nothing left in the tier, and the host still short.
+    pressure();
+    tier.await_short().unwrap();
+    z.exit();
+}
+
+/// Round 2, finding 9: a row's ask thread serves every asker at once: one connected and
+/// silent (mid-message) holds up nobody else's answer.
+fn a_silent_asker_holds_up_no_answer(dir: &Path) {
+    use std::os::linux::net::SocketAddrExt;
+    let g = gpu("silent", 8 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let (a_path, b_path) = (write_set(dir, "sa", 4), write_set(dir, "sb", 2));
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {} {}", g.uuid, g.memory));
+    a.ok(&format!("load sa {} stored gpu", a_path.display()));
+    // a's ask socket, as the kernel lists it.
+    let sockets = std::fs::read_to_string("/proc/net/unix").unwrap();
+    let name = sockets.split_whitespace().find_map(|w| w.strip_prefix('@').filter(|n| n.contains(&format!("-ask-{}-", g.uuid)))).unwrap().to_string();
+    let mut silent = std::os::unix::net::UnixStream::connect_addr(&std::os::unix::net::SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+    silent.write_all(&[9, 0]).unwrap();
+    let mut b = Agent::spawn();
+    b.ok(&format!("open {} {}", g.uuid, g.memory));
+    b.ok(&format!("load sb {} stored ram", b_path.display()));
+    b.ok("request r sb");
+    b.ok("pass r sb 1x1");
+    assert_eq!(b.ok("exact sb 1"), "true", "a answered b beside the silent asker");
+    drop(silent);
+    b.ok("unpin");
+    b.ok("end r");
+    a.exit();
+    b.exit();
+}
+
+/// Round 2, finding 17: a reaper that read a row before it died and frees it after a new
+/// process took its offset frees nothing: the free compares the whole word.
+fn a_reaper_with_a_stale_view_frees_nothing(_dir: &Path) {
+    let g = gpu("stalereap", 8 * MB);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {} {}", g.uuid, g.memory));
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    let mut b = Agent::spawn();
+    varena::faults::hold(varena::faults::Point::Reap);
+    std::thread::scope(|s| {
+        // TensorD reads the rows (a's dead) and stops there.
+        let reaper = s.spawn(|| ledger.reap(a.child.id()));
+        varena::faults::reached();
+        // b opens: it reaps a's row itself and takes its offset.
+        b.ok(&format!("open {} {}", g.uuid, g.memory));
+        varena::faults::release();
+        reaper.join().unwrap();
+    });
+    let pid = b.child.id();
+    assert!(ledger.status().rows.iter().any(|r| r.pid == pid && r.live), "the new row survived the stale reap");
+    b.exit();
+}
+
+/// Round 2, finding 17 (review 1, finding 5, through Memory): an OOM whose own N unmap and
+/// another row's answer together cover the need retries with both counted, evicting no D page.
+fn an_oom_counts_its_own_unmaps_after_an_ask(dir: &Path) {
+    let g = gpu("ownask", 6 * REGION_ALIGN);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let path = |n: &str, r| write_set(dir, n, r);
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {} {}", g.uuid, g.memory));
+    a.ok(&format!("load on {} stored gpu", path("on", 1).display()));
+    let mut b = Agent::spawn();
+    let b_pid = b.ok(&format!("open {} {}", g.uuid, g.memory));
+    b.ok(&format!("load ow {} stored ram", path("ow", 2).display()));
+    b.ok(&format!("load od {} stored gpu", path("od", 2).display()));
+    b.ok(&format!("load ox {} stored gpu", path("ox", 1).display()));
+    b.ok("request r ow;od");
+    b.ok("pass r ow 1x1");
+    b.ok("bind ow 0");
+    b.ok("bind ow 1");
+    // The card is full: b's own N page and a's N page together are the need.
+    assert_eq!(b.say(&format!("oom r ow {}", 2 * REGION_ALIGN)), "retry");
+    let row = |pid: &str| ledger.status().rows.into_iter().find(|r| r.pid.to_string() == pid).unwrap();
+    assert_eq!(row(&b_pid).classes[varena::table::Class::D.index()], 2 * REGION_ALIGN, "no D page went");
+    assert_eq!(row(&a.child.id().to_string()).classes.iter().sum::<u64>(), 0, "a gave its page");
+    b.ok("unpin");
+    b.ok("end r");
+    a.exit();
+    b.exit();
+}
+
+/// S5 review, 6: a standalone process's frees reach TensorD: the wake is the GPU's, by name.
+fn a_standalone_process_wakes_tensord(_dir: &Path) {
+    let g = gpu("wake", 8 * MB);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let mut a = Agent::spawn();
+    let pid = a.ok(&format!("open {} {}", g.uuid, g.memory));
+    ledger.clear_events();
+    a.exit();
+    ledger.await_event().unwrap();
+    assert!(ledger.status().rows.iter().all(|r| r.pid.to_string() != pid));
+}
+
+/// Round 2, finding 8: after the tier took a layout back, the set opens it again at its next
+/// pass start, and fills stage through it again.
+fn the_tier_comes_back_after_a_release(dir: &Path) {
+    use std::os::fd::FromRawFd;
+    let g = gpu("back", 64 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
+    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
+    let signal = event.try_clone().unwrap();
+    let tier = varena::Tier::serve(varena::Pressure::Events(event)).unwrap().expect("this namespace's tier");
+    let path = write_set(dir, "tb", 2);
+    let digest = format!("layout-tb-{}", g.uuid);
+    let mut y = Agent::spawn();
+    y.ok(&format!("open {} {}", g.uuid, g.memory));
+    y.ok(&format!("load tb {} stored ram", path.display()));
+    assert_eq!(y.ok("exact tb 0"), "true");
+    // SAFETY: an 8-byte write to our eventfd.
+    unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
+    tier.await_releases(1);
+    assert!(!tier.held().contains(&digest));
+    y.ok("unpin");
+    y.ok("request r tb");
+    y.ok("pass r tb 1x1");
+    assert_eq!(y.ok("exact tb 1"), "true");
+    assert!(tier.held().contains(&digest), "the region staged through the tier again");
+    y.ok("unpin");
+    y.ok("end r");
+    y.exit();
 }

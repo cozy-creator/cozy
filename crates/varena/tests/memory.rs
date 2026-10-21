@@ -216,3 +216,58 @@ fn rooms_count_what_earlier_steps_left_allocated() {
     let stats = second.end();
     assert_eq!(stats.evicted[varena::table::Class::D.index()], 0, "{stats:?}");
 }
+
+/// Round 2, finding 5: a collective site's flag is kept with its measured room, so a first
+/// pass offers it for agreement; and a collective level relaxes only by agreement, when this
+/// rank's surplus allows (it proposes the coarser level, the ranks' maximum is in effect).
+#[test]
+fn collective_levels_relax_by_agreement() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_l, mem, g) = open("relax", 16 * MB);
+    let c = mem.load(set(dir.path(), "c", 1, &g.uuid), Level::Ram).unwrap();
+    let x = mem.load(set(dir.path(), "x", 4, &g.uuid), Level::Ram).unwrap();
+    let ag = |peak| varena::SitePeak { name: "ag".into(), peak, collective: true };
+    let measured = |peak, site| Measured { allocated_peak: peak, slack: 0, sites: vec![site] };
+    let first = mem.request("first", plan("c")).unwrap();
+    first.pass(c, "1x8", Torch::default()).unwrap().end(measured(4 * MB, ag(2 * MB)), Torch::default());
+    drop(first);
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/c".into()], passes: 4 }] }).unwrap();
+    let p = r.pass(c, "1x8", Torch::default()).unwrap();
+    assert_eq!(p.levels(), vec![("ag".to_string(), 0)], "known collective from its measured room");
+    // An OOM at it while the card is tight: the finer level is proposed, for the next pass.
+    let pins: Vec<_> = (0..4).map(|b| mem.bind(x, b, 0).unwrap()).collect();
+    r.oom(c, Some(MB), Some(Site { name: "ag", collective: true }), Torch::default());
+    p.end(measured(4 * MB, ag(2 * MB)), Torch::default());
+    drop(pins);
+    mem.unload(x);
+    let p = r.pass(c, "1x8", Torch::default()).unwrap();
+    assert_eq!(p.levels(), vec![("ag".to_string(), 1)]);
+    p.agree(vec![("ag".into(), 1)]);
+    assert_eq!(r.cut(c, "ag"), 1);
+    p.end(measured(3 * MB, ag(MB)), Torch::default());
+    // With room to spare this rank proposes the coarser level; another rank still needs the
+    // finer one: the maximum stays.
+    let p = r.pass(c, "1x8", Torch::default()).unwrap();
+    assert_eq!(p.levels(), vec![("ag".to_string(), 0)], "relaxed, proposed");
+    p.agree(vec![("ag".into(), 1)]);
+    assert_eq!(r.cut(c, "ag"), 1, "the ranks' maximum");
+    p.end(measured(3 * MB, ag(MB)), Torch::default());
+    // Every rank proposes it: relaxed.
+    let p = r.pass(c, "1x8", Torch::default()).unwrap();
+    assert_eq!(p.levels(), vec![("ag".to_string(), 0)]);
+    p.agree(vec![("ag".into(), 0)]);
+    assert_eq!(r.cut(c, "ag"), 0, "a transient OOM does not cut forever");
+}
+
+/// S5 review, 1: a restarted TensorD drops the dispatches it finds (a dead TensorD's), so the
+/// GPU never reads as busy forever.
+#[test]
+fn a_restarted_tensord_drops_stale_dispatches() {
+    let g = GpuId { uuid: format!("m{}-dispatch", std::process::id()), model: "host".into(), memory: 16 * MB };
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    ledger.dispatch("r1", "pkg", "1x1").unwrap();
+    assert_eq!(ledger.status().dispatched.len(), 1);
+    drop(ledger);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    assert!(ledger.status().dispatched.is_empty());
+}

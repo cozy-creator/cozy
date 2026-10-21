@@ -35,6 +35,9 @@ struct Events {
     fences: Mutex<Vec<u64>>,
     hold_fence: AtomicBool,
     fence_gate: Gate,
+    /// The next event record fails (a driver error), and the streams synchronized instead.
+    fail_record: AtomicBool,
+    syncs: Mutex<Vec<usize>>,
 }
 
 /// Closed until opened.
@@ -124,6 +127,9 @@ impl Backend for Stream {
     }
     /// A stream event: pending until the test completes it.
     fn record(&self, _: usize) -> Result<Event> {
+        if self.events.fail_record.swap(false, Ordering::SeqCst) {
+            return Err(varena::Error::Device { op: "record", code: 999, name: "CUDA_ERROR_UNKNOWN".into() });
+        }
         Ok(Event(self.events.next.fetch_add(1, Ordering::Relaxed) + 1))
     }
     fn query(&self, event: Event) -> Result<bool> {
@@ -138,7 +144,8 @@ impl Backend for Stream {
         }
         Ok(())
     }
-    fn synchronize(&self, _: usize) -> Result<()> {
+    fn synchronize(&self, stream: usize) -> Result<()> {
+        self.events.syncs.lock().push(stream);
         Ok(())
     }
     fn register_host(&self, _: u64, _: u64) -> Result<()> {
@@ -284,13 +291,40 @@ fn a_binder_never_waits_on_a_release_event() {
 
 /// A custody whose answers wait for `gate`.
 fn gated_custody(gpu: &str, gate: Arc<Gate>) {
+    serve_custody(gpu, gate, Arc::new(Log::default()));
+}
+
+/// The calls a fake custody served, per connection, and its connections (to cut them).
+#[derive(Default)]
+struct Log {
+    calls: Mutex<Vec<(usize, String)>>,
+    seen: Condvar,
+    streams: Mutex<Vec<std::os::unix::net::UnixStream>>,
+}
+
+impl Log {
+    fn await_call(&self, f: impl Fn(&(usize, String)) -> bool) {
+        let mut calls = self.calls.lock();
+        while !calls.iter().any(&f) {
+            self.seen.wait(&mut calls);
+        }
+    }
+
+    /// Every connection breaks, as when the holder exits.
+    fn cut(&self) {
+        self.streams.lock().drain(..).for_each(|s| drop(s.shutdown(std::net::Shutdown::Both)));
+    }
+}
+
+fn serve_custody(gpu: &str, gate: Arc<Gate>, log: Arc<Log>) {
     let uid = unsafe { libc::geteuid() };
     let addr = SocketAddr::from_abstract_name(format!("cozy-varena-{uid}-custody-{gpu}")).unwrap();
     let listener = UnixListener::bind_addr(&addr).unwrap();
     std::thread::spawn(move || {
-        for s in listener.incoming() {
+        for (conn, s) in listener.incoming().enumerate() {
             let mut s = s.unwrap();
-            let gate = gate.clone();
+            log.streams.lock().push(s.try_clone().unwrap());
+            let (gate, log) = (gate.clone(), log.clone());
             std::thread::spawn(move || loop {
                 let mut head = [0u8; 5];
                 if s.read_exact(&mut head).is_err() {
@@ -305,6 +339,8 @@ fn gated_custody(gpu: &str, gate: Arc<Gate>) {
                 }
                 gate.pass();
                 let call = String::from_utf8_lossy(&body).to_string();
+                log.calls.lock().push((conn, call.clone()));
+                log.seen.notify_all();
                 let reply = if call.contains("Import") { r#"{"Imported":{"found":false}}"# } else if call.contains("Release") { r#"{"Released":{"freed":0}}"# } else { r#""Done""# };
                 let mut out = (reply.len() as u32).to_le_bytes().to_vec();
                 out.push(0);
@@ -361,4 +397,50 @@ fn no_call_waits_on_custody() {
     x.join().unwrap();
     // Everything returned with custody still answering nothing.
     custody.open();
+}
+
+/// Round 2, finding 12: when custody's holder changes (a TensorD restart), every kept page is
+/// exported again to the new one.
+#[test]
+fn kept_pages_go_to_a_new_custody_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("holder-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 64 << 20 };
+    let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
+    gate.open();
+    serve_custody(&uuid, gate, log.clone());
+    let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: Arc::new(Events::default()) })).unwrap();
+    let named = |name: &str| {
+        let mut s = set(dir.path(), &uuid);
+        let mut layout = (*s.layout).clone();
+        layout.digest = format!("layout-{name}-{uuid}");
+        s.name = name.into();
+        s.fingerprint = Fingerprint::new(&layout, &[], Fill::Stored, "release-1", "0/1", &uuid);
+        s.layout = Arc::new(layout);
+        s
+    };
+    let a = named("a");
+    let key = a.fingerprint.key();
+    mem.load(a, Level::Gpu).unwrap();
+    log.await_call(|(conn, call)| *conn == 0 && call.contains("Export") && call.contains(&key));
+    // The holder goes; the next call reaches a new one.
+    log.cut();
+    mem.load(named("b"), Level::Ram).unwrap();
+    log.await_call(|(conn, call)| *conn > 0 && call.contains("Export") && call.contains(&key));
+}
+
+/// S2 review, 6a: a release whose event cannot be recorded never reads as complete: that one
+/// pin's stream is synchronized.
+#[test]
+fn a_release_without_an_event_synchronizes_its_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = GpuId { uuid: format!("record-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
+    let id = mem.load(set(dir.path(), &g.uuid), Level::Ram).unwrap();
+    let pin = mem.bind(id, 0, 7).unwrap();
+    events.fail_record.store(true, Ordering::SeqCst);
+    drop(pin);
+    assert_eq!(*events.syncs.lock(), vec![7]);
 }

@@ -1157,4 +1157,41 @@ mod tests {
         drop(second);
         os::unlink(&gpu.uuid);
     }
+
+    /// Review 2, finding 14: concurrent writers of one fact merge (the larger stays), whatever
+    /// their order.
+    #[test]
+    fn concurrent_peaks_merge_to_the_largest() {
+        let gpu = GpuId { uuid: format!("unit-{}-merge", std::process::id()), model: "host".into(), memory: 1 << 30 };
+        let shared = Arc::new(Shared::adopt(os::shared(&gpu.uuid, true).unwrap(), &gpu, gpu.memory).unwrap());
+        let writers: Vec<_> = (1..=8u64)
+            .map(|i| {
+                let shared = shared.clone();
+                std::thread::spawn(move || (0..16).for_each(|_| record_peak(&shared, "pkg|1x1", i << 20).unwrap()))
+            })
+            .collect();
+        writers.into_iter().for_each(|w| w.join().unwrap());
+        let bytes = shared.fact("peak/pkg|1x1").unwrap().map(|v| u64::from_le_bytes(v.try_into().unwrap()));
+        assert_eq!(bytes, Some(8 << 20));
+        assert_eq!(shared.facts("peak/").unwrap().len(), 1, "one record per key");
+        os::unlink(&gpu.uuid);
+    }
+
+    /// Review 2, finding 14: a standalone engine's table is unlinked when its last row leaves
+    /// (custody stops once nobody is connected and nothing is kept).
+    #[test]
+    fn a_standalone_table_goes_with_its_last_row() {
+        let gpu = GpuId { uuid: format!("unit-{}-unlink", std::process::id()), model: "host".into(), memory: 1 << 30 };
+        // TensorD's wake, without a TensorD holding the table open.
+        let wake = os::wake_bind(&gpu.uuid).unwrap().unwrap();
+        let mem = crate::Memory::open(gpu.clone(), None, Box::new(crate::HostBackend::new(gpu.memory))).unwrap();
+        // SAFETY: geteuid reads a process attribute.
+        let path = format!("/dev/shm/cozy-varena-{}-{}", unsafe { libc::geteuid() }, gpu.uuid);
+        assert!(std::path::Path::new(&path).exists());
+        drop(mem);
+        while std::path::Path::new(&path).exists() {
+            os::await_event(&wake).unwrap();
+            os::wake_clear(&wake);
+        }
+    }
 }
