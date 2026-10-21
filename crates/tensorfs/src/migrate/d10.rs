@@ -926,7 +926,8 @@ fn convert(rt: &tokio::runtime::Runtime, endpoint: &Arc<Endpoint>, client: &Clie
 /// What [`migrate`] would do to repo `name`, sending nothing: the D10 document and the objects
 /// it would offer the endpoint (those the endpoint holds are skipped there).
 pub fn plan(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &Store, migrator: &mut Migrator) -> Result<Done> {
-    let (doc, _, mut m) = convert(&fetch::runtime()?, endpoint, client, name, scratch, migrator)?;
+    let rt = fetch::runtime()?;
+    let (doc, _, mut m) = convert(&rt, endpoint, client, name, scratch, migrator)?;
     let after = m.repo.to_json()?;
     if after != doc {
         m.report["would_offer"] = json!({"objects": m.objects.len(), "bytes": m.objects.iter().map(|(o, _)| o.length).sum::<u64>()});
