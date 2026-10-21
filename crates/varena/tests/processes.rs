@@ -141,6 +141,9 @@ impl Backend for Recording {
     fn process_used(&self) -> varena::Result<u64> {
         self.host.process_used()
     }
+    fn opened_context(&self) -> u64 {
+        self.host.opened_context()
+    }
     fn granularity(&self) -> u64 {
         self.host.granularity()
     }

@@ -92,6 +92,8 @@ fn apply(t: &mut Table, actions: &[Action], run: &mut Run, tried: &mut Tried, cl
                 tried.trimmed = true;
                 remote = true;
             }
+            // Custody lets go at once here.
+            Action::Settle => remote = true,
             Action::Reserve { req, room, measured } => {
                 let r = t.request_mut(*req).unwrap();
                 r.room = *room;
