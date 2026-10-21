@@ -463,9 +463,10 @@ fn documents(
 /// - Without one, a component named [`ROOT_COMPONENT`] owns the root (a Transformers folder),
 ///   and a component's class is its config's ([`config_class`]).
 /// - A pair's library is its package for a dotted module path, and `diffusers` for a Diffusers
-///   pipeline module (`stable_diffusion`) ([`class_of`]). A class's version is its own config's for its library (`_diffusers_version`,
-///   `transformers_version`), else one another config of the model records for that library,
-///   else `reference`'s (the converter's pinned reference configs), else `""`.
+///   pipeline module (`stable_diffusion`) ([`class_of`]). A class's version is its own config's
+///   for its library (`_diffusers_version`, `transformers_version`), else one another config of
+///   the model records for that library, else `reference`'s (the converter's pinned reference
+///   configs), else `""`.
 /// - In a component's folder, the first of [`CONFIGS`] is its config, and the other run files
 ///   ([`run_data`]) its assets.
 /// - Every other file is a repo file. A component with no tensors, config or assets is none.
@@ -546,10 +547,11 @@ pub fn layout(
     for (library, version) in configs.flat_map(recorded).chain(reference.clone()) {
         versions.entry(library).or_insert(version);
     }
+    let pipeline_read = pipeline.is_some();
     let classes = (pipeline.iter_mut().map(|p| (&mut p.class, &p.config)))
         .chain(components.iter_mut().map(|c| (&mut c.class, &c.config)));
     for (class, config) in classes.filter(|(class, _)| !class.is_unknown()) {
-        let model = class_of(&class.library, &class.name, &versions);
+        let model = class_of(&class.library, &class.name, &versions, pipeline_read);
         let mut own = recorded(config).filter(|(library, _)| *library == model.library);
         let version = own.next().map_or(model.version, |(_, version)| version);
         *class = ClassRef { version, ..model };
@@ -561,18 +563,22 @@ pub fn layout(
     })
 }
 
-/// A class from a `model_index.json` pair's library and name. The library is:
-/// - a dotted module path's top-level package (`minimax_h3.pipeline` is `minimax_h3`);
-/// - itself when installed: `diffusers`, `transformers`, or one `versions` holds;
-/// - else a Diffusers pipeline module (`stable_diffusion`, `kandinsky`), so `diffusers`.
+/// A class from its library and name, at the version `versions` (the model's: its configs'
+/// records, then the converter reference's) holds for that library, else `""`. An empty library
+/// is the unknown class.
 ///
-/// The version is the one `versions` holds for that library, else `""`. `versions` is the
-/// model's: its configs' records, then the converter reference's.
-pub fn class_of(library: &str, name: &str, versions: &Versions) -> ClassRef {
-    let library = match library.split_once('.') {
-        Some((package, _)) => package,
-        None if matches!(library, "diffusers" | "transformers") || versions.contains_key(library) => library,
-        None => "diffusers",
+/// Only a Diffusers `model_index.json` pair (`model_index`) is reinterpreted: a dotted module
+/// path is its top-level package (`minimax_h3.pipeline` is `minimax_h3`), and a library that is
+/// not installed (`diffusers`, `transformers`, or one `versions` holds) is a Diffusers pipeline
+/// module (`stable_diffusion`, `kandinsky`), so `diffusers`. Any other source keeps its library
+/// as written: an unknown library never becomes `diffusers`.
+pub fn class_of(library: &str, name: &str, versions: &Versions, model_index: bool) -> ClassRef {
+    let installed = matches!(library, "diffusers" | "transformers") || versions.contains_key(library);
+    let library = match (model_index, library.split_once('.')) {
+        _ if library.is_empty() => return ClassRef::default(),
+        (true, Some((package, _))) => package,
+        (true, None) if !installed => "diffusers",
+        _ => library,
     };
     ClassRef::new(library, versions.get(library).map_or("", String::as_str), name)
 }
