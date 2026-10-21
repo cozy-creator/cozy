@@ -86,6 +86,10 @@ fn apply(t: &mut Table, actions: &[Action], run: &mut Run, tried: &mut Tried, cl
                 r.claimed += bytes;
                 r.episode.claimed_free = true;
             }
+            Action::Trim(_) => {
+                tried.trimmed = true;
+                remote = true;
+            }
             Action::Shrink { .. } | Action::Cut { .. } | Action::Park(_) => {}
         }
     }

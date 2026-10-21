@@ -48,8 +48,9 @@ pub trait Backend: Send + Sync {
     /// Free bytes as the driver measures them now. Only foreign bytes derive from it (the
     /// device's used bytes less every row's); placement never sizes from it.
     fn free(&self) -> Result<u64>;
-    /// Bytes this process's driver context holds outside pages and the allocator, measured.
-    fn context(&self) -> u64;
+    /// Device bytes this process holds now, measured (NVML per process; on WDDM a device-wide
+    /// delta). Its context is this less torch's reserved bytes and its mapped pages.
+    fn process_used(&self) -> Result<u64>;
     /// Physical pages and their offsets are multiples of this.
     fn granularity(&self) -> u64;
     fn reserve(&self, len: u64) -> Result<Va>;
@@ -95,18 +96,22 @@ pub struct HostBackend {
 #[derive(Default)]
 struct Pages {
     next: u64,
-    /// id → (handle, bytes it counts against the limit: 0 for an imported page).
-    live: HashMap<u64, (Owned, u64)>,
+    /// id → (handle, bytes it counts against the limit (0 for an imported page), its bytes).
+    live: HashMap<u64, (Owned, u64, u64)>,
 }
 
 impl Pages {
     fn created(&self) -> u64 {
-        self.live.values().map(|(_, n)| n).sum()
+        self.live.values().map(|(_, n, _)| n).sum()
+    }
+
+    fn held(&self) -> u64 {
+        self.live.values().map(|(.., len)| len).sum()
     }
 
     fn insert(&mut self, handle: Owned, counted: u64, len: u64) -> Physical {
         self.next += 1;
-        self.live.insert(self.next, (handle, counted));
+        self.live.insert(self.next, (handle, counted, len));
         Physical { id: self.next, len }
     }
 }
@@ -144,8 +149,9 @@ mod host {
             Ok(self.limit.saturating_sub(self.pages.lock().created()))
         }
 
-        fn context(&self) -> u64 {
-            0
+        /// Its pages are all it holds: the context is 0.
+        fn process_used(&self) -> Result<u64> {
+            Ok(self.pages.lock().held())
         }
 
         fn granularity(&self) -> u64 {
@@ -187,7 +193,7 @@ mod host {
 
         fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()> {
             let pages = self.pages.lock();
-            let (fd, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
+            let (fd, ..) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
             if offset.saturating_add(page.len) > va.len {
                 return Err(Error::Invalid("map outside the reservation".into()));
             }
@@ -220,7 +226,7 @@ mod host {
 
         fn export(&self, page: &Physical) -> Result<Owned> {
             let pages = self.pages.lock();
-            let (fd, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
+            let (fd, ..) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
             Ok(platform::shm::reopen(fd.as_fd(), false)?)
         }
 
@@ -276,8 +282,8 @@ mod host {
         fn free(&self) -> Result<u64> {
             Ok(self.limit.saturating_sub(self.pages.lock().created()))
         }
-        fn context(&self) -> u64 {
-            0
+        fn process_used(&self) -> Result<u64> {
+            Ok(self.pages.lock().held())
         }
         /// VirtualAlloc's allocation granularity.
         fn granularity(&self) -> u64 {

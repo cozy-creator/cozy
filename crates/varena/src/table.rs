@@ -43,10 +43,11 @@ pub struct PartId {
     pub dtype: String,
 }
 
-/// What a filled page's bytes are: sha256 over the layout digest, each part's stored name,
-/// encoding and dtype, the fill identity, the package release (the bake code's identity), the
-/// rank shard and the GPU UUID. Kept pages are found
-/// by it, so two pages with one fingerprint hold the same bytes.
+/// What a filled page's bytes are. `digest` covers the layout digest, each part's stored name,
+/// encoding and dtype, the package release (the bake code's identity), the rank shard and the
+/// GPU UUID; [`Fingerprint::key`] adds the fill identity, which may change between passes
+/// ([`crate::Memory::fill`]). Kept pages are found by the key, so two pages with one key hold the
+/// same bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Fingerprint {
     pub digest: String,
@@ -68,25 +69,35 @@ impl Fingerprint {
             field(p.encoding.as_bytes());
             field(p.dtype.as_bytes());
         }
-        match &fill {
-            Fill::Stored => field(b"stored"),
-            Fill::Declared(id) => {
-                field(b"declared");
-                field(id.as_bytes());
-            }
-            Fill::Undeclared => field(b"undeclared"),
-        }
         field(release.as_bytes());
         field(shard.as_bytes());
         field(gpu.as_bytes());
-        let digest = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        Fingerprint { digest, fill }
+        Fingerprint { digest: hex(h.finalize().as_slice()), fill }
+    }
+
+    /// The kept pages' key: the digest and the current fill identity.
+    pub fn key(&self) -> String {
+        let mut h = Sha256::new();
+        h.update(self.digest.as_bytes());
+        match &self.fill {
+            Fill::Stored => h.update(b"\0stored"),
+            Fill::Declared(id) => {
+                h.update(b"\0declared\0");
+                h.update(id.as_bytes());
+            }
+            Fill::Undeclared => h.update(b"\0undeclared"),
+        }
+        hex(h.finalize().as_slice())
     }
 
     /// Its pages may be kept, and fetched before a declared use.
     pub fn declared(&self) -> bool {
         self.fill != Fill::Undeclared
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A weight set: its layout (one page per region), where its bytes come from, and what they are.
@@ -268,7 +279,7 @@ pub struct Remote {
     pub running: bool,
     pub context: u64,
     pub torch: u64,
-    /// Of `torch`, what its caches and the allocator's slack give back when idle.
+    /// Of `torch`, what its trim hook and caches give back when it is idle.
     pub caches: u64,
     pub classes: [u64; 7],
 }
@@ -297,6 +308,9 @@ pub struct Table {
     pub orphans: u64,
     /// Host bytes available now, for parking.
     pub headroom: u64,
+    /// Torch's allocator, as last measured (pass start and end, every OOM).
+    pub allocated: u64,
+    pub reserved: u64,
     /// Indexed by set id; `None` once unloaded.
     pub sets: Vec<Option<Set>>,
     pub requests: Vec<Req>,
@@ -368,13 +382,16 @@ impl Table {
         self.pages().filter(|(_, p)| p.mapped).map(|(_, p)| p.bytes).sum()
     }
 
-    /// Torch's bytes as this row counts them: the open requests' rooms and claims, else (idle)
-    /// what its caches hold.
+    /// Torch's bytes as this row counts them: the open requests' rooms and claims, or what the
+    /// allocator holds when that is more.
     pub fn torch(&self) -> u64 {
-        match self.requests.is_empty() {
-            true => self.caches.iter().map(|c| c.bytes).sum(),
-            false => self.requests.iter().map(|r| r.room + r.claimed).sum(),
-        }
+        self.requests.iter().map(|r| r.room + r.claimed).sum::<u64>().max(self.reserved)
+    }
+
+    /// The allocator's slack beyond what the rooms need: free once the trim hook runs (F).
+    pub fn slack(&self) -> u64 {
+        let rooms: u64 = self.requests.iter().map(|r| r.room + r.claimed).sum();
+        self.reserved.saturating_sub(rooms.max(self.allocated))
     }
 
     pub fn held(&self) -> u64 {

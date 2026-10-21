@@ -150,13 +150,8 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// `gpu`'s table, created when absent with `capacity`.
-    pub fn open(gpu: &GpuId, capacity: u64, events: Option<Owned>) -> Result<Shared> {
-        let (fd, _) = os::shared(&gpu.uuid, true)?;
-        Shared::adopt(fd, gpu, capacity, events)
-    }
-
-    /// The table behind `fd` (a grant's), initialised if it is new.
+    /// The table behind `fd` (a grant's), initialised if it is new. The first opener sets the
+    /// capacity; a later one can only lower it.
     pub fn adopt(fd: Owned, gpu: &GpuId, capacity: u64, events: Option<Owned>) -> Result<Shared> {
         let fd = os::reopen(&fd, true)?;
         // Initialisation is one writer's: the heap lock serialises it.
@@ -178,6 +173,7 @@ impl Shared {
                 fence(Release);
                 h.magic = MAGIC;
             }
+            h.capacity.fetch_min(capacity, AcqRel);
             Ok(map)
         })();
         os::unlock(&fd, 0, 8)?;
@@ -205,12 +201,6 @@ impl Shared {
     pub fn capacity(&self) -> Result<u64> {
         let m = self.map()?;
         Ok(header(&m).capacity.load(Acquire))
-    }
-
-    pub fn set_capacity(&self, bytes: u64) -> Result<()> {
-        let m = self.map()?;
-        header(&m).capacity.store(bytes, Release);
-        Ok(())
     }
 
     pub fn foreign(&self) -> Result<u64> {
@@ -676,6 +666,20 @@ pub struct Grant {
     pub events: Owned,
 }
 
+impl Grant {
+    /// `gpu`'s table by name, created when absent, for a standalone engine: no TensorD reads
+    /// its events. `limit` lowers the capacity (the first opener sets it, a later one can only
+    /// lower it).
+    pub fn open(gpu: &GpuId, limit: Option<u64>) -> Result<Grant> {
+        let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
+        let (table, _) = os::shared(&gpu.uuid, true)?;
+        let events = os::event()?;
+        let shared = Shared::adopt(os::dup(&table)?, gpu, capacity, None)?;
+        drop(shared);
+        Ok(Grant { table, events })
+    }
+}
+
 /// One row as [`Ledger::status`] shows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowStatus {
@@ -750,8 +754,8 @@ impl Ledger {
     pub fn create(gpu: &GpuId, limit: Option<u64>) -> Result<Ledger> {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
         let events = os::event()?;
-        let shared = Arc::new(Shared::open(gpu, capacity, Some(os::dup(&events)?))?);
-        shared.set_capacity(capacity)?;
+        let (table, _) = os::shared(&gpu.uuid, true)?;
+        let shared = Arc::new(Shared::adopt(table, gpu, capacity, Some(os::dup(&events)?))?);
         shared.reap(None)?;
         let row = Arc::new(shared.claim(std::process::id())?);
         let custody = custody::Client::open(&shared.name, &row)?;

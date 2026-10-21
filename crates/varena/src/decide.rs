@@ -11,6 +11,8 @@ use crate::table::{Class, Key, Table};
 /// Remote rungs already tried in this demand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tried {
+    /// The trim hook ran.
+    pub trimmed: bool,
     pub orphans: bool,
     /// (row, ceiling) asked.
     pub asked: BTreeSet<(u32, Class)>,
@@ -36,6 +38,8 @@ pub enum Trigger {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
+    /// Run the trim hook: the allocator's slack (part of F) becomes free, before any eviction.
+    Trim(u64),
     /// Unmap an own page, of this class now.
     Unmap { page: Key, class: Class },
     /// Ask custody to drop this many orphan bytes, least recently used first.
@@ -257,6 +261,10 @@ impl<'a> Demand<'a> {
             self.evict(Class::W);
             return self.enough().then_some(Done::Enough);
         }
+        if !self.tried.trimmed && self.t.slack() > 0 {
+            self.out.push(Action::Trim((self.need - self.got).min(self.t.slack())));
+            return Some(Done::Remote);
+        }
         if !self.tried.orphans && self.t.orphans > 0 {
             self.out.push(Action::ReleaseOrphans((self.need - self.got).min(self.t.orphans)));
             return Some(Done::Remote);
@@ -332,17 +340,21 @@ impl<'a> Demand<'a> {
 }
 
 /// The own ask thread's answer: S, then N (least recently used), then under a D ceiling the
-/// furthest D; caches only when no request is open here. Never W or P.
+/// furthest D. With no request open here, the trim hook and the caches go first. Never W or P.
 fn answer(t: &Table, ceiling: Class, bytes: u64) -> Vec<Action> {
     let tried = Tried::default();
     let mut d = Demand { got: 0, ..Demand::new(t, bytes, None, None, &tried) };
+    if t.requests.is_empty() {
+        if t.slack() > 0 {
+            d.out.push(Action::Trim(t.slack().min(bytes)));
+            d.got += t.slack().min(bytes);
+        }
+        d.shrink();
+    }
     d.evict(Class::S);
     d.evict(Class::N);
     if ceiling >= Class::D {
         d.evict(Class::D);
-    }
-    if t.requests.is_empty() {
-        d.shrink();
     }
     d.out
 }
