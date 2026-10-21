@@ -755,13 +755,29 @@ class Memory:
                     self._shrink(cache, cache.nbytes)
                 self._evict(model, "refill", 0)
             model.filled = version
-            model.identity = getattr(model.fill, "identity", lambda: None)()
+            model.identity = self._identity(model)
         if model.claimed is not None:  # pages filled under another identity, or none proven, go
             (regions, fingerprint), model.claimed = model.claimed, None
-            if model.identity is None or fingerprint != _fingerprint(
+            proven = model.identity is not None and fingerprint == _fingerprint(
                 model.key, model.ws, model.identity
-            ):
+            )
+            if not proven:
                 model.ws.evict(regions)
+            why = "proven: they map" if proven else "not proven: they refill"
+            self.noted(0, f"{model.component} {len(regions)} kept filled regions {why}", 0)
+
+    def _identity(self, model: Model) -> str | None:
+        """What its fill names its pages by in every process (`Fill.identity`); None, noted,
+        when it names none or naming fails: its filled pages are then never kept."""
+        try:
+            named = getattr(model.fill, "identity", lambda: None)()
+        except Exception as exc:  # noqa: BLE001  unprovable, never a failed request
+            named, why = None, f"{type(exc).__name__}: {exc}"
+        else:
+            why = "it names none"
+        if named is None and model.fill is not None:
+            self.noted(0, f"{model.component} filled pages are not kept: {why}"[:300], 0)
+        return named
 
     def _plan(self, model: Model, measured: bool = False) -> None:
         """The watermark as a pass starts, from the measured reserve: a repeating model wholly at
