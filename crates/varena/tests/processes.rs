@@ -24,13 +24,18 @@ fn main() {
     }
     let filter: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
     type Case = (&'static str, fn(&Path));
-    let cases: [Case; 6] = [
+    let cases: [Case; 11] = [
         ("an_idle_holder_answers_an_ask", an_idle_holder_answers_an_ask),
         ("a_killed_holder_leaves_orphans_a_successor_imports", a_killed_holder_leaves_orphans_a_successor_imports),
         ("a_failed_request_frees_everything", a_failed_request_frees_everything),
         ("a_panic_fails_the_request_not_the_process", a_panic_fails_the_request_not_the_process),
         ("exhausted_carries_stats", exhausted_carries_stats),
         ("the_tier_gives_back_in_order", the_tier_gives_back_in_order),
+        ("kept_pages_survive_a_holder_that_served", kept_pages_survive_a_holder_that_served),
+        ("an_ask_to_a_stopped_victim_ends_when_it_dies", an_ask_to_a_stopped_victim_ends_when_it_dies),
+        ("binds_outlive_the_custody_holder", binds_outlive_the_custody_holder),
+        ("a_table_with_live_rows_outlives_tensord", a_table_with_live_rows_outlives_tensord),
+        ("a_stale_reader_never_frees_a_newer_row", a_stale_reader_never_frees_a_newer_row),
     ];
     let dir = tempfile::tempdir().unwrap();
     let mut failed = vec![];
@@ -117,6 +122,16 @@ fn agent() {
         let line = line.unwrap();
         let w: Vec<&str> = line.split_whitespace().collect();
         let reply: String = match w.as_slice() {
+            ["grant", id, memory] => {
+                use std::os::fd::FromRawFd;
+                uuid = id.to_string();
+                let memory: u64 = memory.parse().unwrap();
+                let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory };
+                // SAFETY: descriptors 3 and 4 are the grant the parent handed this process.
+                let grant = unsafe { varena::Grant { table: platform::handles::Owned::from_raw_fd(3), events: platform::handles::Owned::from_raw_fd(4) } };
+                mem = Some(Memory::open(g, Some(grant), Box::new(HostBackend::new(memory))).unwrap());
+                format!("ok {}", std::process::id())
+            }
             ["open", id, memory] => {
                 uuid = id.to_string();
                 let memory: u64 = memory.parse().unwrap();
@@ -171,6 +186,12 @@ fn agent() {
             ["endpass", req] => {
                 if let Some(p) = passes.remove(*req) {
                     p.end(Measured::default(), Torch::default());
+                }
+                "ok".into()
+            }
+            ["endpass", req, peak] => {
+                if let Some(p) = passes.remove(*req) {
+                    p.end(Measured { allocated_peak: peak.parse().unwrap(), ..Measured::default() }, Torch::default());
                 }
                 "ok".into()
             }
@@ -246,18 +267,50 @@ struct Agent {
 
 impl Agent {
     fn spawn() -> Agent {
-        let mut child = Command::new(std::env::current_exe().unwrap()).arg("child").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        Agent::start(Command::new(std::env::current_exe().unwrap()))
+    }
+
+    /// A child holding TensorD's grant as descriptors 3 and 4.
+    fn granted(grant: varena::Grant) -> Agent {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let (table, events) = (grant.table.as_raw_fd(), grant.events.as_raw_fd());
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        // SAFETY: only async-signal-safe dup2 calls between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(table, 3) < 0 || libc::dup2(events, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let agent = Agent::start(command);
+        drop(grant);
+        agent
+    }
+
+    fn start(mut command: Command) -> Agent {
+        let mut child = command.arg("child").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
         let to = child.stdin.take().unwrap();
         let from = BufReader::new(child.stdout.take().unwrap());
         Agent { child, to, from }
     }
 
-    fn raw(&mut self, line: &str) -> String {
+    fn send(&mut self, line: &str) {
         writeln!(self.to, "{line}").unwrap();
         self.to.flush().unwrap();
+    }
+
+    fn reply(&mut self) -> String {
         let mut reply = String::new();
         self.from.read_line(&mut reply).unwrap();
         reply.trim().to_string()
+    }
+
+    fn raw(&mut self, line: &str) -> String {
+        self.send(line);
+        self.reply()
     }
 
     fn say(&mut self, line: &str) -> String {
@@ -318,18 +371,21 @@ fn a_killed_holder_leaves_orphans_a_successor_imports(dir: &Path) {
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     ledger.reap(a.child.id());
+    let orphans: u64 = ledger.status().rows.iter().map(|r| r.classes[1]).sum();
+    assert_eq!(orphans, 8 * MB, "S5: class O shows the orphans");
     let mut b = Agent::spawn();
     b.ok(&format!("open {} {}", g.uuid, g.memory));
+    // One load path: its load imports what custody keeps, at any level.
     b.ok(&format!("load k {} stored ram", path.display()));
     b.ok("request r k");
     b.ok("pass r k 1x1");
     for block in 0..4 {
         assert_eq!(b.ok(&format!("exact k {block}")), "true", "block {block} bit-exact");
     }
-    assert_eq!(b.ok("trace r"), "Kept,Kept,Kept,Kept", "imported, not copied");
+    assert_eq!(b.ok("trace r"), "Hit,Hit,Hit,Hit", "imported at load, not copied");
     b.ok("unpin");
     let end = b.ok("end r");
-    assert!(end.contains(&format!("kept={}", 8 * MB)) && end.contains("store=0"), "{end}");
+    assert!(end.contains("tier=0 store=0"), "{end}");
     b.exit();
     // A fingerprint mismatch (another fill identity) refills from the store or tier.
     let mut c = Agent::spawn();
@@ -467,4 +523,149 @@ fn the_tier_gives_back_in_order(dir: &Path) {
     }
     y.ok("end r");
     y.exit();
+}
+
+/// S5's finding: a holder that served a request (its pass measured, so a successor's pass
+/// needs room) and was then killed still leaves its kept pages to its successor: they are
+/// adopted before any demand could release them as orphans.
+fn kept_pages_survive_a_holder_that_served(dir: &Path) {
+    let g = gpu("served", 8 * MB);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let path = write_set(dir, "s", 3);
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {} {}", g.uuid, g.memory));
+    a.ok(&format!("load s {} stored gpu", path.display()));
+    a.ok("request r s");
+    a.ok("pass r s 1x1");
+    for block in 0..3 {
+        a.ok(&format!("bind s {block}"));
+    }
+    a.ok("unpin");
+    a.ok(&format!("endpass r {}", MB));
+    a.ok("end r");
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    ledger.reap(a.child.id());
+    let mut b = Agent::spawn();
+    b.ok(&format!("open {} {}", g.uuid, g.memory));
+    b.ok(&format!("load s {} stored ram", path.display()));
+    b.ok("request r s");
+    b.ok("pass r s 1x1");
+    for block in 0..3 {
+        assert_eq!(b.ok(&format!("exact s {block}")), "true");
+    }
+    assert_eq!(b.ok("trace r"), "Hit,Hit,Hit", "every page kept, none copied");
+    b.ok("unpin");
+    assert!(b.ok("end r").contains("tier=0 store=0"));
+    b.exit();
+}
+
+/// Review 1, finding 2: an ask to a victim whose ask thread cannot run (stopped) waits on the
+/// victim itself: when it dies, the asker goes on, with no timer. TensorD sees it stalled.
+fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
+    let g = gpu("stop", 8 * MB);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    // TensorD serves the tier too: a stopped executor must not be the one serving it.
+    let _tier = varena::Tier::serve(varena::Pressure::Headroom).unwrap();
+    let (a_path, b_path) = (write_set(dir, "va", 4), write_set(dir, "vb", 2));
+    let mut a = Agent::granted(ledger.grant(0).unwrap());
+    a.ok(&format!("grant {} {}", g.uuid, g.memory));
+    a.ok(&format!("load va {} stored gpu", a_path.display()));
+    let mut b = Agent::granted(ledger.grant(0).unwrap());
+    b.ok(&format!("grant {} {}", g.uuid, g.memory));
+    b.ok(&format!("load vb {} stored ram", b_path.display()));
+    // Earlier events (rows claimed, pages mapped) are not the ask's.
+    let mut drained = [0u8; 8];
+    // SAFETY: a nonblocking 8-byte read from the ledger's eventfd.
+    unsafe { libc::read(std::os::fd::AsRawFd::as_raw_fd(ledger.events()), drained.as_mut_ptr().cast(), 8) };
+    b.ok("request r vb");
+    let pid = a.child.id() as i32;
+    // SAFETY: a signal to our own child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    b.send("pass r vb 1x1");
+    // TensorD's events thread looks at each ledger event; the ask rang one. Across its looks
+    // the victim's ask thread never ran.
+    let fd = std::os::fd::AsRawFd::as_raw_fd(ledger.events());
+    let stalled = loop {
+        let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut event = [0u8; 8];
+        // SAFETY: one live descriptor waited on with no timeout, then its counter read.
+        unsafe {
+            assert_eq!(libc::poll(&mut poll, 1, -1), 1);
+            libc::read(fd, event.as_mut_ptr().cast(), 8);
+        }
+        let looks: Vec<Vec<u32>> = (0..3).map(|_| ledger.stalled()).collect();
+        if let Some(s) = looks.into_iter().last().filter(|s| !s.is_empty()) {
+            break s;
+        }
+    };
+    assert_eq!(stalled, vec![pid as u32]);
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    assert_eq!(b.reply(), "ok", "the asker went on when the victim died");
+    b.ok("bind vb 0");
+    b.ok("unpin");
+    b.ok("end r");
+    b.exit();
+}
+
+/// Review 1, finding 9: when custody's holder exits, binds go on: the next call reconnects,
+/// serving custody from this process.
+fn binds_outlive_the_custody_holder(dir: &Path) {
+    let g = gpu("holder", 16 * MB);
+    let (x_path, y_path) = (write_set(dir, "hx", 2), write_set(dir, "hy", 2));
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {} {}", g.uuid, g.memory));
+    a.ok(&format!("load hx {} stored gpu", x_path.display()));
+    let mut b = Agent::spawn();
+    b.ok(&format!("open {} {}", g.uuid, g.memory));
+    b.ok(&format!("load hy {} stored ram", y_path.display()));
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    b.ok("request r hy");
+    b.ok("pass r hy 1x1");
+    assert_eq!(b.ok("exact hy 1"), "true");
+    b.ok("unpin");
+    b.ok("end r");
+    b.exit();
+    // The table goes with the last of its rows.
+    drop(varena::Ledger::create(&g, None).unwrap());
+}
+
+/// Review 1, finding 10: TensorD's exit keeps a table an executor still uses, and a restarted
+/// TensorD reopens it.
+fn a_table_with_live_rows_outlives_tensord(dir: &Path) {
+    let g = gpu("restart", 8 * MB);
+    let first = varena::Ledger::create(&g, None).unwrap();
+    let path = write_set(dir, "rt", 1);
+    let mut a = Agent::spawn();
+    let pid: u32 = a.ok(&format!("open {} {}", g.uuid, g.memory)).parse().unwrap();
+    a.ok(&format!("load rt {} stored gpu", path.display()));
+    drop(first);
+    let second = varena::Ledger::create(&g, None).unwrap();
+    let row = second.status().rows.into_iter().find(|r| r.pid == pid);
+    assert!(row.is_some_and(|r| r.live && r.classes[3] == 2 * MB), "the executor's row is still there");
+    a.exit();
+    drop(second);
+}
+
+/// Review 1, finding 1: a row reaped from a stale view is never freed again once its offset is
+/// reused; the new holder's row stays.
+fn a_stale_reader_never_frees_a_newer_row(dir: &Path) {
+    let g = gpu("stale", 8 * MB);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let path = write_set(dir, "st", 1);
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {} {}", g.uuid, g.memory));
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    // Two reapers saw the dead row; the first frees it and a new process reuses its offset.
+    ledger.reap(a.child.id());
+    let mut b = Agent::spawn();
+    let pid: u32 = b.ok(&format!("open {} {}", g.uuid, g.memory)).parse().unwrap();
+    b.ok(&format!("load st {} stored gpu", path.display()));
+    ledger.reap(a.child.id());
+    ledger.reap(pid);
+    assert!(ledger.status().rows.iter().any(|r| r.pid == pid && r.live), "the new row survived stale reaps");
+    b.exit();
 }

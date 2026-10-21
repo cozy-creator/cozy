@@ -80,6 +80,10 @@ pub trait Backend: Send + Sync {
     fn elapsed(&self, from: Event, to: Event) -> Result<Option<u64>>;
     /// Orders `stream` (a `CUstream`; 0 the default) after `event`, without a host wait.
     fn wait(&self, event: Event, stream: usize) -> Result<()>;
+    /// Page-locks `len` bytes of read-only host memory at `ptr` for the copy engine
+    /// (`cuMemHostRegister`): a RAM-tier region, once, so every fill from it is a pinned copy.
+    fn register_host(&self, ptr: u64, len: u64) -> Result<()>;
+    fn unregister_host(&self, ptr: u64) -> Result<()>;
     fn retire(&self, event: Event);
     /// After a device error: proves the copy stream's work complete or fails.
     fn drain(&self) -> Result<()>;
@@ -258,6 +262,15 @@ mod host {
             Ok(())
         }
 
+        /// Host copies need no page lock.
+        fn register_host(&self, _: u64, _: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn unregister_host(&self, _: u64) -> Result<()> {
+            Ok(())
+        }
+
         fn retire(&self, _: Event) {}
 
         fn drain(&self) -> Result<()> {
@@ -330,6 +343,12 @@ mod host {
             Ok(Some(0))
         }
         fn wait(&self, _: Event, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn register_host(&self, _: u64, _: u64) -> Result<()> {
+            Ok(())
+        }
+        fn unregister_host(&self, _: u64) -> Result<()> {
             Ok(())
         }
         fn retire(&self, _: Event) {}

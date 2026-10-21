@@ -22,6 +22,7 @@ struct Events {
     done: Mutex<HashSet<u64>>,
     /// Calls that make a page read-only or hand it out.
     kept: Mutex<Vec<&'static str>>,
+    unmaps: AtomicU64,
 }
 
 struct Stream {
@@ -62,6 +63,7 @@ impl Backend for Stream {
         self.host.protect(va, offset, len, access)
     }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> {
+        self.events.unmaps.fetch_add(1, Ordering::Relaxed);
         self.host.unmap(va, offset, len)
     }
     fn export(&self, page: &Physical) -> Result<Owned> {
@@ -88,6 +90,12 @@ impl Backend for Stream {
         Ok(Some(0))
     }
     fn wait(&self, _: Event, _: usize) -> Result<()> {
+        Ok(())
+    }
+    fn register_host(&self, _: u64, _: u64) -> Result<()> {
+        Ok(())
+    }
+    fn unregister_host(&self, _: u64) -> Result<()> {
         Ok(())
     }
     fn retire(&self, _: Event) {}
@@ -148,4 +156,32 @@ fn a_page_is_kept_only_after_its_transform_completes() {
     assert_eq!(*events.kept.lock(), vec!["protect", "export"], "read-only, then exported, once complete");
     pass.end(Default::default(), Torch::default());
     drop(r);
+}
+
+/// Review 1, finding 12: a page released with its transform undone goes, but only after the
+/// release event of the stream that last read it completes.
+#[test]
+fn a_page_unmaps_only_after_its_last_consumer() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = GpuId { uuid: format!("consumer-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let backend = Stream { host: HostBackend::new(g.memory), events: events.clone() };
+    let mem = Memory::open(g.clone(), None, Box::new(backend)).unwrap();
+    let id = mem.load(set(dir.path(), &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["lora".into()], passes: 1 }] }).unwrap();
+    let _pass = r.pass(id, "1x1", Torch::default()).unwrap();
+    let pin = mem.bind(id, 0, 1).unwrap();
+    assert!(pin.fresh);
+    drop(pin);
+    let release = events.next.load(Ordering::Relaxed);
+    for _ in 0..3 {
+        mem.torch_limit();
+    }
+    assert_eq!(events.unmaps.load(Ordering::Relaxed), 0, "unmapped while its consumer's stream ran");
+    events.done.lock().insert(release);
+    mem.torch_limit();
+    assert_eq!(events.unmaps.load(Ordering::Relaxed), 1, "gone once the consumer finished");
+    let again = mem.bind(id, 0, 1).unwrap();
+    assert!(again.fresh, "filled again, fresh for the transform");
 }

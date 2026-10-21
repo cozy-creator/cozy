@@ -1,10 +1,13 @@
 //! The GPU's shared table, named per GPU and user so a standalone engine opens it without
 //! TensorD. One file of shared memory: a header, then a heap of records on 256-byte cells that
-//! grows with the file. A row (one per process) is held by an OFD lock that dies with it; its
-//! bytes by class are a two-copy latch, published from its own table's derivation; asks are
-//! cumulative counters per class ceiling, answered by the row's Rust thread. Facts (peaks,
-//! rooms, dispatches) are immutable records, a newer version superseding an older one. Every
-//! allocation or free moves the header's `shape`, so a reader that saw it move reads again.
+//! grows with the file. Each record's word carries its size, a generation, its kind and state,
+//! and a record is only ever freed by comparing that word under the heap lock, so a stale
+//! reader can never free a newer record at the same offset. A row (one per process) is held by
+//! an OFD lock that dies with it; its bytes by class are a two-copy latch, published from its
+//! own table's derivation. Asks go to a row's own ask thread over a socket named by the row's
+//! offset and generation: the answer or the victim's death ends the wait, and a reused offset
+//! reads as gone. Facts (peaks, rooms, dispatches) are immutable records, a newer version
+//! superseding an older one.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
@@ -13,15 +16,16 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 use platform::handles::Owned;
+use serde::{Deserialize, Serialize};
 
 use crate::custody;
 use crate::decide::{self, Admitted};
-use crate::os::{self, Map};
+use crate::os::{self, Listener, Map};
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledger5");
-/// The header's page: the heap starts after it.
+const MAGIC: u64 = u64::from_le_bytes(*b"vledger6");
+/// The header's page: the heap starts after it, and grows from there.
 const HEADER: u64 = 4096;
 /// The heap's unit: rows take two, a fact as many as its bytes need.
 const CELL: u64 = 256;
@@ -43,36 +47,25 @@ struct Header {
     capacity: AtomicU64,
     /// The heap's end, a byte offset; the file is at least this long.
     end: AtomicU64,
-    /// Moves on every allocation or free.
+    /// Moves on every allocation or free; its low bits are a new record's generation.
     shape: AtomicU64,
     /// Device bytes no row accounts for, as the last executor decision measured them.
     foreign: AtomicU64,
-    /// A futex word rung when room frees, a row dies or a peak is recorded.
-    freed: AtomicU32,
-    _pad: u32,
-    uuid_len: u64,
-    uuid: [u8; 64],
+    /// 0: shared (the machine's owner uses it too), 1: dedicated.
+    mode: AtomicU32,
 }
 
 #[repr(C)]
 struct RowRec {
     word: AtomicU64,
     pid: AtomicU32,
-    /// The ask thread's wait word, rung by askers.
-    bell: AtomicU32,
-    _pad: [u32; 2],
-    /// Asks rung, and the ask thread's wakes.
+    _pad: u32,
+    /// Asks rung at it, and asks its thread answered: TensorD's `stalled` compares them.
     rung: AtomicU64,
     ran: AtomicU64,
-    /// `ran + 1` as an asker saw it when it rang again and the thread had not run since its
-    /// first ring; the row is stalled while `ran` has not moved past it.
-    suspect: AtomicU64,
-    /// Cumulative bytes asked and handled, per ceiling (N, D).
-    asked: [AtomicU64; 2],
-    handled: [AtomicU64; 2],
-    /// Cumulative bytes freed by answers.
-    freed: AtomicU64,
-    /// Kept pages no live process maps (the custody holder's row).
+    /// Bytes asked of it and not yet answered (display).
+    asked: AtomicU64,
+    /// Kept pages no live process maps (the custody service's row).
     orphans: AtomicU64,
     seq: AtomicU64,
     latch: [[AtomicU64; WORDS]; 2],
@@ -89,14 +82,37 @@ struct FactRec {
 const _: () = assert!(size_of::<RowRec>() as u64 <= ROW_CELLS * CELL && size_of::<Header>() as u64 <= HEADER);
 const _: () = assert!(size_of::<FactRec>() as u64 == FACT_HEAD);
 
-fn word(cells: u64, kind: u64, state: u64) -> u64 {
-    cells << 32 | kind << 8 | state
+fn word(cells: u64, gen: u64, kind: u64, state: u64) -> u64 {
+    cells << 32 | (gen & 0xffff) << 16 | kind << 8 | state
 }
 
-/// The counter of `pair` for asks under `c`: N's, or D's.
-fn by_ceiling(pair: &[AtomicU64; 2], c: Class) -> &AtomicU64 {
-    let [n, d] = pair;
-    if c >= Class::D { d } else { n }
+fn cells(w: u64) -> u64 {
+    w >> 32
+}
+
+fn gen(w: u64) -> u64 {
+    (w >> 16) & 0xffff
+}
+
+fn kind(w: u64) -> u64 {
+    (w >> 8) & 0xff
+}
+
+fn state(w: u64) -> u64 {
+    w & 0xff
+}
+
+/// A row's id in [`Remote::row`]: its offset and generation.
+fn row_id(off: u64, w: u64) -> u64 {
+    (off / CELL) << 16 | gen(w)
+}
+
+/// The machine's sharing mode, as TensorD sets it ([`Ledger::set_mode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Someone else uses the machine too: speculation never grows a process's footprint.
+    Shared,
+    Dedicated,
 }
 
 /// One row's published facts.
@@ -132,12 +148,32 @@ impl Facts {
 #[derive(Clone, Debug)]
 pub(crate) struct RowView {
     pub off: u64,
+    pub word: u64,
     pub pid: u32,
     pub live: bool,
     pub facts: Facts,
     pub orphans: u64,
-    pub want: u64,
-    pub stalled: bool,
+    pub asked: u64,
+    pub rung: u64,
+    pub ran: u64,
+}
+
+impl RowView {
+    pub fn id(&self) -> u64 {
+        row_id(self.off, self.word)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Ask {
+    /// Class::N or Class::D, as its index.
+    ceiling: usize,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Answer {
+    freed: u64,
 }
 
 /// The table mapped in this process.
@@ -154,20 +190,18 @@ impl Shared {
     /// capacity; a later one can only lower it.
     pub fn adopt(fd: Owned, gpu: &GpuId, capacity: u64, events: Option<Owned>) -> Result<Shared> {
         let fd = os::reopen(&fd, true)?;
+        os::own(&fd)?;
         // Initialisation is one writer's: the heap lock serialises it.
         os::lock(&fd, 0, 8, true)?;
         let init = (|| -> Result<Map> {
-            if os::size(&fd)? < HEADER + CELL {
-                os::resize(&fd, HEADER + 64 * CELL)?;
+            if os::size(&fd)? < HEADER {
+                os::resize(&fd, HEADER)?;
             }
             let map = os::map(&fd, os::size(&fd)? as usize, true)?;
-            // SAFETY: the header page is mapped, aligned, and its fields are atomics or written
-            // once under the heap lock below.
+            // SAFETY: the header page is mapped and aligned; its fields are atomics or written
+            // once under the heap lock before `magic`.
             let h = unsafe { &mut *(map.base as *mut Header) };
             if h.magic != MAGIC {
-                let uuid = gpu.uuid.as_bytes();
-                h.uuid.iter_mut().zip(uuid).for_each(|(d, s)| *d = *s);
-                h.uuid_len = uuid.len().min(64) as u64;
                 h.capacity.store(capacity, Relaxed);
                 h.end.store(HEADER, Relaxed);
                 fence(Release);
@@ -214,17 +248,25 @@ impl Shared {
         Ok(())
     }
 
-    /// Room freed, a row died or a peak was recorded: wake waiters and TensorD.
+    pub fn shared_mode(&self) -> Result<bool> {
+        let m = self.map()?;
+        Ok(header(&m).mode.load(Acquire) == 0)
+    }
+
+    fn set_mode(&self, mode: Mode) -> Result<()> {
+        let m = self.map()?;
+        header(&m).mode.store(u32::from(mode == Mode::Dedicated), Release);
+        Ok(())
+    }
+
+    /// Room freed, a row died or a peak was recorded: TensorD's event.
     pub fn ring(&self) {
-        if let Ok(m) = self.map() {
-            os::ring(&header(&m).freed);
-        }
         if let Some(e) = &self.events {
             os::signal(e);
         }
     }
 
-    /// Every record: (offset, word), read again if the heap's shape moved meanwhile.
+    /// Every READY record, read again if the heap's shape moved meanwhile.
     fn records<T>(&self, mut f: impl FnMut(&Map, u64, u64) -> Option<T>) -> Result<Vec<T>> {
         loop {
             let m = self.map()?;
@@ -237,15 +279,14 @@ impl Shared {
             while at < end {
                 let Some(w) = atomic(&m, at) else { break };
                 let w = w.load(Acquire);
-                let cells = w >> 32;
-                if cells == 0 || at + cells * CELL > end {
+                if cells(w) == 0 || at + cells(w) * CELL > end {
                     torn = true;
                     break;
                 }
-                if w & 0xff == READY {
+                if state(w) == READY {
                     out.extend(f(&m, at, w));
                 }
-                at += cells * CELL;
+                at += cells(w) * CELL;
             }
             fence(Acquire);
             if h.shape.load(Acquire) == shape {
@@ -259,28 +300,28 @@ impl Shared {
         }
     }
 
-    /// Allocates `cells` under the heap lock: the first free run that fits, else the end.
-    fn alloc(&self, cells: u64, kind: u64, init: impl FnOnce(&Map, u64)) -> Result<u64> {
+    /// Allocates `n` cells under the heap lock: the first free run that fits, else the end.
+    /// Returns the record's offset and its READY word.
+    fn alloc(&self, n: u64, kind: u64, init: impl FnOnce(&Map, u64)) -> Result<(u64, u64)> {
         os::lock(&self.fd, 0, 8, true)?;
-        let at = self.alloc_locked(cells, kind, init);
+        let at = self.alloc_locked(n, kind, init);
         os::unlock(&self.fd, 0, 8)?;
         at
     }
 
-    fn alloc_locked(&self, cells: u64, kind: u64, init: impl FnOnce(&Map, u64)) -> Result<u64> {
+    fn alloc_locked(&self, n: u64, kind: u64, init: impl FnOnce(&Map, u64)) -> Result<(u64, u64)> {
         let m = self.map()?;
-        let h = header(&m);
-        let end = h.end.load(Acquire);
+        let end = header(&m).end.load(Acquire);
         // First fit over free runs, merging neighbours as it walks.
         let (mut at, mut run_start, mut run) = (HEADER, None, 0u64);
         let mut found = None;
         while at < end {
             let w = atomic(&m, at).ok_or_else(|| Error::Internal("ledger heap outside its map".into()))?.load(Acquire);
-            let n = (w >> 32).max(1);
-            if w & 0xff == FREE {
+            let size = cells(w).max(1);
+            if state(w) == FREE {
                 let start = *run_start.get_or_insert(at);
-                run += n;
-                if run >= cells {
+                run += size;
+                if run >= n {
                     found = Some(start);
                     break;
                 }
@@ -288,16 +329,17 @@ impl Shared {
                 run_start = None;
                 run = 0;
             }
-            at += n * CELL;
+            at += size * CELL;
         }
         let mut grown = None;
         let m = match found {
             Some(_) => m,
             None => {
                 let start = run_start.unwrap_or(end);
-                let need = start + cells * CELL;
+                let need = start + n * CELL;
                 let size = os::size(&self.fd)?;
                 if need > size {
+                    // Doubling keeps growth to a logarithmic number of remaps.
                     os::resize(&self.fd, need.max(size * 2))?;
                 }
                 found = Some(start);
@@ -313,34 +355,38 @@ impl Shared {
         };
         let start = found.unwrap_or(end);
         let h = header(&m);
-        // A free run longer than asked keeps its tail free.
-        let tail = run.saturating_sub(cells);
+        let tail = run.saturating_sub(n);
         if tail > 0 {
-            let w = atomic(&m, start + cells * CELL).ok_or_else(|| Error::Internal("ledger tail".into()))?;
-            w.store(word(tail, 0, FREE), Release);
+            let w = atomic(&m, start + n * CELL).ok_or_else(|| Error::Internal("ledger tail".into()))?;
+            w.store(word(tail, 0, 0, FREE), Release);
         }
+        let g = h.shape.load(Acquire) % 0xffff + 1;
         let w = atomic(&m, start).ok_or_else(|| Error::Internal("ledger record".into()))?;
-        w.store(word(cells, kind, CLAIMING), Release);
+        w.store(word(n, g, kind, CLAIMING), Release);
         init(&m, start);
         if let Some(end) = grown {
             h.end.store(end, Release);
         }
         h.shape.fetch_add(1, AcqRel);
-        Ok(start)
+        Ok((start, word(n, g, kind, READY)))
     }
 
-    fn free(&self, at: u64) -> Result<()> {
+    /// Frees the record at `at` if its word is still `seen` (and, `dead`, no one holds its row
+    /// lock): a stale reader frees nothing newer.
+    fn free(&self, at: u64, seen: u64, dead: bool) -> Result<bool> {
         os::lock(&self.fd, 0, 8, true)?;
-        let m = self.map();
-        if let Ok(m) = &m {
-            if let Some(w) = atomic(m, at) {
-                let cells = w.load(Acquire) >> 32;
-                w.store(word(cells, 0, FREE), Release);
-                header(m).shape.fetch_add(1, AcqRel);
+        let freed = (|| -> Result<bool> {
+            let m = self.map()?;
+            let Some(w) = atomic(&m, at) else { return Ok(false) };
+            if w.load(Acquire) != seen || (dead && os::held(&self.fd, at, ROW_CELLS * CELL)?) {
+                return Ok(false);
             }
-        }
+            w.store(word(cells(seen), 0, 0, FREE), Release);
+            header(&m).shape.fetch_add(1, AcqRel);
+            Ok(true)
+        })();
         os::unlock(&self.fd, 0, 8)?;
-        m.map(|_| ())
+        freed
     }
 
     // ---- rows
@@ -348,51 +394,49 @@ impl Shared {
     /// A row for `pid`, held by an OFD lock on a description of its own.
     pub fn claim(self: &Arc<Self>, pid: u32) -> Result<Row> {
         let lock = os::reopen(&self.fd, true)?;
-        let at = self.alloc(ROW_CELLS, ROW, |m, at| {
+        let (at, ready) = self.alloc(ROW_CELLS, ROW, |m, at| {
             if let Some(r) = row(m, at) {
                 r.pid.store(pid, Relaxed);
-                [&r.rung, &r.ran, &r.suspect, &r.freed, &r.orphans, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
-                r.asked.iter().chain(&r.handled).chain(r.latch.iter().flatten()).for_each(|a| a.store(0, Relaxed));
+                [&r.rung, &r.ran, &r.asked, &r.orphans, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
+                r.latch.iter().flatten().for_each(|a| a.store(0, Relaxed));
             }
         })?;
-        let locked = os::lock(&lock, at, ROW_CELLS * CELL, false);
+        let claiming = ready & !0xff | CLAIMING;
+        if !matches!(os::lock(&lock, at, ROW_CELLS * CELL, false), Ok(true)) {
+            self.free(at, claiming, false)?;
+            return Err(Error::Internal("ledger row lock refused".into()));
+        }
         let m = self.map()?;
         let rec = row(&m, at).ok_or_else(|| Error::Internal("ledger row".into()))?;
-        if !matches!(locked, Ok(true)) {
-            self.free(at)?;
-            return Err(Error::Internal(format!("ledger row lock: {:?}", locked.err())));
-        }
-        rec.word.store(word(ROW_CELLS, ROW, READY), Release);
-        Ok(Row { shared: self.clone(), at, _lock: lock, words: Mutex::new([0; WORDS]) })
+        rec.word.store(ready, Release);
+        Ok(Row { shared: self.clone(), at, word: ready, _lock: lock, words: Mutex::new([0; WORDS]) })
     }
 
     pub fn rows(&self) -> Result<Vec<RowView>> {
         let views = self.records(|m, at, w| {
-            if (w >> 8) & 0xff != ROW {
+            if kind(w) != ROW {
                 return None;
             }
             let r = row(m, at)?;
             let facts = Facts::of(latch_read(&r.seq, &r.latch));
-            let want = r.asked.iter().zip(&r.handled).map(|(a, h)| a.load(Acquire).saturating_sub(h.load(Acquire))).sum();
-            let suspect = r.suspect.load(Acquire);
-            let stalled = suspect != 0 && suspect == r.ran.load(Acquire) + 1;
-            Some(RowView { off: at, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), want, stalled })
+            let (rung, ran) = (r.rung.load(Acquire), r.ran.load(Acquire));
+            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), asked: r.asked.load(Acquire), rung, ran })
         })?;
-        views.into_iter().map(|mut v| -> Result<RowView> {
-            v.live = os::held(&self.fd, v.off, ROW_CELLS * CELL)?;
-            Ok(v)
-        }).collect()
+        views
+            .into_iter()
+            .map(|mut v| -> Result<RowView> {
+                v.live = os::held(&self.fd, v.off, ROW_CELLS * CELL)?;
+                Ok(v)
+            })
+            .collect()
     }
 
-    /// Frees dead rows (of `pid`, or any): their holders are gone, so the lock is free.
+    /// Frees dead rows (of `pid`, or any): their holders are gone, so their locks are free.
     pub fn reap(&self, pid: Option<u32>) -> Result<bool> {
         let mut any = false;
         for r in self.rows()? {
             if !r.live && pid.is_none_or(|p| p == r.pid) {
-                let m = self.map()?;
-                let _ = m;
-                self.free(r.off)?;
-                any = true;
+                any |= self.free(r.off, r.word, true)?;
             }
         }
         if any {
@@ -401,46 +445,27 @@ impl Shared {
         Ok(any)
     }
 
-    /// Asks the row at `at` for `bytes` under `ceiling`; returns what its `handled` must reach.
-    pub fn ask(&self, at: u64, ceiling: Class, bytes: u64) -> Result<u64> {
+    /// Asks row `id` for `bytes` under `ceiling`: its ask thread answers from its pages at once.
+    /// Returns what it freed; a dead or reused row frees nothing.
+    pub fn ask(&self, id: u64, ceiling: Class, bytes: u64) -> Result<u64> {
+        let at = (id >> 16) * CELL;
         let m = self.map()?;
-        let r = row(&m, at).ok_or_else(|| Error::Invalid("no such row".into()))?;
-        let until = by_ceiling(&r.asked, ceiling).fetch_add(bytes, AcqRel) + bytes;
+        let Some(r) = row(&m, at) else { return Ok(0) };
+        let w = r.word.load(Acquire);
+        if state(w) != READY || kind(w) != ROW || row_id(at, w) != id {
+            return Ok(0);
+        }
         r.rung.fetch_add(1, AcqRel);
-        os::ring(&r.bell);
-        Ok(until)
-    }
-
-    /// Waits for the row's answer (its Rust thread, never Python), or its death, woken by any
-    /// ledger event. Each wake without an answer rings again; when the thread has not run
-    /// across two such rings the row is marked, for TensorD's `stalled`.
-    pub fn answered(&self, at: u64, ceiling: Class, until: u64) -> Result<u64> {
-        let m = self.map()?;
-        let r = row(&m, at).ok_or_else(|| Error::Invalid("no such row".into()))?;
-        let freed = r.freed.load(Acquire);
-        let mut ran = r.ran.load(Acquire);
-        let (mut woke, mut misses) = (false, 0);
-        os::until(&header(&m).freed, || {
-            let done = by_ceiling(&r.handled, ceiling).load(Acquire) >= until || r.word.load(Acquire) & 0xff != READY;
-            if done || !os::held(&self.fd, at, ROW_CELLS * CELL).unwrap_or(false) {
-                return Some(());
-            }
-            if std::mem::replace(&mut woke, true) {
-                let now = r.ran.load(Acquire);
-                misses = if now == ran { misses + 1 } else { 0 };
-                ran = now;
-                if misses >= 2 {
-                    r.suspect.store(ran + 1, Release);
-                }
-                r.rung.fetch_add(1, AcqRel);
-                os::ring(&r.bell);
-                if let Some(e) = &self.events {
-                    os::signal(e);
-                }
-            }
-            None
-        });
-        Ok(r.freed.load(Acquire).saturating_sub(freed))
+        r.asked.fetch_add(bytes, AcqRel);
+        if let Some(e) = &self.events {
+            os::signal(e);
+        }
+        let freed = match os::connect(&ask_name(&self.name, id))? {
+            Some(stream) => os::call::<_, Answer>(&stream, &Ask { ceiling: ceiling.index(), bytes }, None).map_or(0, |(a, _)| a.freed),
+            None => 0,
+        };
+        r.asked.fetch_sub(bytes, AcqRel);
+        Ok(freed)
     }
 
     // ---- facts
@@ -448,14 +473,14 @@ impl Shared {
     /// The newest value of each key under `prefix`.
     pub fn facts(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let found = self.records(|m, at, w| {
-            if (w >> 8) & 0xff != FACT {
+            if kind(w) != FACT {
                 return None;
             }
             let (key, value, version) = fact(m, at)?;
-            key.starts_with(prefix).then_some((key, value, version, at))
+            key.starts_with(prefix).then_some((key, value, version))
         })?;
         let mut newest: HashMap<String, (u64, Vec<u8>)> = HashMap::new();
-        for (key, value, version, _) in found {
+        for (key, value, version) in found {
             if newest.get(&key).is_none_or(|(v, _)| *v < version) {
                 newest.insert(key, (version, value));
             }
@@ -471,18 +496,19 @@ impl Shared {
 
     /// Writes `key` (a newer version supersedes the old record); `None` deletes it.
     pub fn put(&self, key: &str, value: Option<&[u8]>) -> Result<()> {
-        let old: Vec<(u64, u64)> = self.records(|m, at, w| {
-            if (w >> 8) & 0xff != FACT {
+        let old: Vec<(u64, u64, u64)> = self.records(|m, at, w| {
+            if kind(w) != FACT {
                 return None;
             }
             let (k, _, version) = fact(m, at)?;
-            (k == key).then_some((at, version))
+            (k == key).then_some((at, w, version))
         })?;
         if let Some(value) = value {
-            let version = old.iter().map(|(_, v)| *v).max().unwrap_or(0) + 1;
+            let version = old.iter().map(|(.., v)| *v).max().unwrap_or(0) + 1;
             let bytes = FACT_HEAD + key.len() as u64 + value.len() as u64;
-            let at = self.alloc(bytes.div_ceil(CELL), FACT, |m, at| {
-                // SAFETY: a CLAIMING record of `bytes.div_ceil(CELL)` cells inside the map: no reader parses it.
+            let (at, ready) = self.alloc(bytes.div_ceil(CELL), FACT, |m, at| {
+                // SAFETY: a CLAIMING record of `bytes.div_ceil(CELL)` cells inside the map: no
+                // reader parses it.
                 unsafe {
                     let rec = m.base.add(at as usize) as *mut FactRec;
                     (*rec).version = version;
@@ -494,20 +520,25 @@ impl Shared {
                 }
             })?;
             let m = self.map()?;
-            let w = atomic(&m, at).ok_or_else(|| Error::Internal("ledger fact".into()))?;
-            w.store(word(bytes.div_ceil(CELL), FACT, READY), Release);
+            atomic(&m, at).ok_or_else(|| Error::Internal("ledger fact".into()))?.store(ready, Release);
         }
-        for (at, _) in old {
-            self.free(at)?;
+        for (at, w, _) in old {
+            self.free(at, w, false)?;
         }
         Ok(())
     }
 }
 
-/// One process's row. Dropping it drops the lock: the row reads dead until reaped.
+fn ask_name(gpu: &str, id: u64) -> String {
+    format!("ask-{gpu}-{id}")
+}
+
+/// One process's row. Dropping it publishes zeros, closes its asks and frees it; a killed
+/// process's row reads dead until reaped.
 pub(crate) struct Row {
     shared: Arc<Shared>,
     at: u64,
+    word: u64,
     _lock: Owned,
     /// The latch's words as last written; one writer at a time.
     words: Mutex<[u64; WORDS]>,
@@ -516,6 +547,10 @@ pub(crate) struct Row {
 impl Row {
     pub fn at(&self) -> u64 {
         self.at
+    }
+
+    pub fn id(&self) -> u64 {
+        row_id(self.at, self.word)
     }
 
     fn rec<T>(&self, f: impl FnOnce(&RowRec) -> T) -> Option<T> {
@@ -533,48 +568,34 @@ impl Row {
         self.rec(|r| r.orphans.store(bytes, Release));
     }
 
-    /// Blocks until something is asked of this row or `stop` says so; returns (ceiling, bytes)
-    /// per ceiling asked.
-    pub fn wait_asked(&self, stop: &std::sync::atomic::AtomicBool) -> Vec<(Class, u64, u64)> {
-        let Ok(m) = self.shared.map() else { return vec![] };
-        let Some(r) = row(&m, self.at) else { return vec![] };
-        os::until(&r.bell, || {
-            r.ran.fetch_add(1, AcqRel);
-            if stop.load(Acquire) {
-                return Some(vec![]);
-            }
-            let wants: Vec<(Class, u64, u64)> = [Class::N, Class::D]
-                .into_iter()
-                .filter_map(|c| {
-                    let asked = by_ceiling(&r.asked, c).load(Acquire);
-                    let want = asked.saturating_sub(by_ceiling(&r.handled, c).load(Acquire));
-                    (want > 0).then_some((c, want, asked))
-                })
-                .collect();
-            (!wants.is_empty()).then_some(wants)
-        })
+    /// Binds this row's ask socket: its owner's ask thread serves it.
+    pub fn listen(&self) -> Result<Listener> {
+        os::listen(&ask_name(&self.shared.name, self.id()))?.ok_or_else(|| Error::Internal("a row's ask socket is taken".into()))
     }
 
-    /// Answers asks up to `asked` under `ceiling`, having freed `freed` bytes.
-    pub fn answer(&self, ceiling: Class, asked: u64, freed: u64) {
-        self.rec(|r| {
-            r.freed.fetch_add(freed, AcqRel);
-            by_ceiling(&r.handled, ceiling).fetch_max(asked, AcqRel);
-        });
-        // Askers wait on the ledger's events.
+    /// Wakes an ask thread blocked in its accept (to stop it).
+    pub fn knock(&self) {
+        let _ = os::connect(&ask_name(&self.shared.name, self.id()));
+    }
+
+    /// Serves one asker: reads its ask and replies with what `answer(ceiling, bytes)` freed.
+    pub fn serve(&self, stream: &os::Stream, answer: impl FnOnce(Class, u64) -> u64) -> Result<()> {
+        let Some((bytes, _)) = os::recv(stream)? else { return Ok(()) };
+        let ask: Ask = os::decode(&bytes)?;
+        let ceiling = if ask.ceiling >= Class::D.index() { Class::D } else { Class::N };
+        let freed = answer(ceiling, ask.bytes);
+        self.rec(|r| r.ran.fetch_add(1, AcqRel));
+        os::send(stream, &(os::encode(&Answer { freed })?, None))?;
         self.shared.ring();
-    }
-
-    /// Wakes the ask thread (to stop it).
-    pub fn wake(&self) {
-        self.rec(|r| os::ring(&r.bell));
+        Ok(())
     }
 }
 
 impl Drop for Row {
     fn drop(&mut self) {
-        // A clean exit frees the row now; a killed process leaves it for a reap.
-        if self.shared.free(self.at).is_ok() {
+        self.publish(&Facts::default());
+        self.set_orphans(0);
+        if self.shared.free(self.at, self.word, false).unwrap_or(false) {
             self.shared.ring();
         }
     }
@@ -645,14 +666,14 @@ fn latch_read(seq: &AtomicU64, copies: &[[AtomicU64; WORDS]; 2]) -> [u64; WORDS]
     }
 }
 
-/// The other rows as the decision procedure reads them, plus orphan and held totals.
+/// The other rows as the decision procedure reads them, and the orphan bytes.
 pub(crate) fn remotes(rows: &[RowView], own: u64) -> (Vec<Remote>, u64) {
     let orphans = rows.iter().map(|r| r.orphans).sum();
     let others = rows
         .iter()
         .filter(|r| r.off != own)
         .map(|r| Remote {
-            row: (r.off / CELL) as u32,
+            row: r.id(),
             running: r.facts.running > 0 || !r.live,
             context: r.facts.context,
             torch: r.facts.torch,
@@ -661,11 +682,6 @@ pub(crate) fn remotes(rows: &[RowView], own: u64) -> (Vec<Remote>, u64) {
         })
         .collect();
     (others, orphans)
-}
-
-/// A row's offset from its id in [`Remote::row`].
-pub(crate) fn row_offset(id: u32) -> u64 {
-    id as u64 * CELL
 }
 
 /// Every row's held bytes, for foreign bytes.
@@ -688,10 +704,9 @@ impl Grant {
     /// lower it).
     pub fn open(gpu: &GpuId, limit: Option<u64>) -> Result<Grant> {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
-        let (table, _) = os::shared(&gpu.uuid, true)?;
+        let table = os::shared(&gpu.uuid, true)?;
         let events = os::event()?;
-        let shared = Shared::adopt(os::dup(&table)?, gpu, capacity, None)?;
-        drop(shared);
+        drop(Shared::adopt(os::dup(&table)?, gpu, capacity, None)?);
         Ok(Grant { table, events })
     }
 }
@@ -702,7 +717,7 @@ pub struct RowStatus {
     pub pid: u32,
     pub live: bool,
     pub context: u64,
-    /// Bytes by class (F unused, O, S, N, D, W, P).
+    /// Bytes by class (F unused, O, S, N, D, W, P); O is on the custody service's row.
     pub classes: [u64; 7],
     /// The largest remaining working set of each running request, summed.
     pub remaining: u64,
@@ -712,7 +727,7 @@ pub struct RowStatus {
     pub asked: u64,
 }
 
-/// The table at a glance (display only).
+/// The table at a glance (display only; reading it changes nothing).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Status {
     pub capacity: u64,
@@ -722,8 +737,6 @@ pub struct Status {
     pub rows: Vec<RowStatus>,
     /// Request id → `<package>|<shape>`.
     pub dispatched: Vec<(String, String)>,
-    /// Rows whose ask thread did not run when rung.
-    pub stalled: Vec<u32>,
 }
 
 /// A measured peak, as TensorD persists it per GPU model.
@@ -756,24 +769,29 @@ impl Room {
 /// TensorD's handle on one GPU's table.
 pub struct Ledger {
     shared: Arc<Shared>,
-    /// TensorD's own row: custody's orphans are published in it.
-    _row: Arc<Row>,
     events: Owned,
     custody: custody::Client,
+    /// `stalled`'s previous look at each row with unanswered asks: (ran, looks).
+    looks: Mutex<HashMap<u64, (u64, u32)>>,
 }
 
 impl Ledger {
-    /// The GPU's table, named per GPU and user; capacity = min(card, limit). TensorD serves
-    /// custody when it holds the service lock (it does when it starts first).
+    /// The GPU's table, named per GPU and user; capacity = min(card, limit), never raised by a
+    /// later opener. A restarted TensorD reopens the same table. TensorD serves custody when
+    /// it holds the service lock (it does when it starts first).
     pub fn create(gpu: &GpuId, limit: Option<u64>) -> Result<Ledger> {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
         let events = os::event()?;
-        let (table, _) = os::shared(&gpu.uuid, true)?;
+        let table = os::shared(&gpu.uuid, true)?;
         let shared = Arc::new(Shared::adopt(table, gpu, capacity, Some(os::dup(&events)?))?);
         shared.reap(None)?;
-        let row = Arc::new(shared.claim(std::process::id())?);
-        let custody = custody::Client::open(&shared.name, &row)?;
-        Ok(Ledger { shared, _row: row, events, custody })
+        let custody = custody::Client::open(&shared)?;
+        Ok(Ledger { shared, events, custody, looks: Mutex::new(HashMap::new()) })
+    }
+
+    /// The machine's sharing mode (shared until TensorD says dedicated).
+    pub fn set_mode(&self, mode: Mode) -> Result<()> {
+        self.shared.set_mode(mode)
     }
 
     /// The descriptors executor `pid` opens its memory with.
@@ -799,12 +817,19 @@ impl Ledger {
         Ok((self.shared.capacity()?, self.shared.foreign()?, admitted, dispatched))
     }
 
+    /// A request's measured peak at `<package>|<shape>`; an empty shape means the package's
+    /// widest measured one.
     fn peak(&self, key: &str) -> Result<Option<u64>> {
-        let v = self.shared.fact(&format!("peak/{key}"))?;
-        Ok(v.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes))
+        let bytes = |v: Vec<u8>| v.try_into().ok().map(u64::from_le_bytes);
+        if key.ends_with('|') {
+            let all = self.shared.facts(&format!("peak/{key}"))?;
+            return Ok(all.into_iter().filter_map(|(_, v)| bytes(v)).max());
+        }
+        Ok(self.shared.fact(&format!("peak/{key}"))?.and_then(bytes))
     }
 
-    /// Whether a request of `package` at `shape` can start now beside everything running.
+    /// Whether a request of `package` at `shape` (empty: its widest measured shape) can start
+    /// now beside everything running.
     pub fn fits(&self, package: &str, shape: &str) -> bool {
         let fit = || -> Result<bool> {
             let (capacity, foreign, rows, dispatched) = self.admitted()?;
@@ -814,13 +839,16 @@ impl Ledger {
     }
 
     /// A multi-GPU group: dispatches `request` on every GPU of `group` if it fits on all, else
-    /// on none.
+    /// on none (an error part-way undoes the dispatches made).
     pub fn admit(group: &[&Ledger], request: &str, package: &str, shape: &str) -> Result<bool> {
         if !group.iter().all(|l| l.fits(package, shape)) {
             return Ok(false);
         }
-        for l in group {
-            l.dispatch(request, package, shape)?;
+        for (i, l) in group.iter().enumerate() {
+            if let Err(e) = l.dispatch(request, package, shape) {
+                group.iter().take(i).for_each(|done| done.undispatch(request));
+                return Err(e);
+            }
         }
         Ok(true)
     }
@@ -869,25 +897,46 @@ impl Ledger {
         let Ok(rows) = self.shared.rows() else { return Status::default() };
         let capacity = self.shared.capacity().unwrap_or(0);
         let foreign = self.shared.foreign().unwrap_or(0);
-        let stalled = rows.iter().filter(|r| r.live && r.stalled).map(|r| r.pid).collect();
         let dispatched = self.shared.facts("dispatch/").unwrap_or_default();
+        let classes = |r: &RowView| {
+            let mut c = r.facts.classes;
+            if let Some(o) = c.get_mut(Class::O.index()) {
+                *o += r.orphans;
+            }
+            c
+        };
         Status {
             capacity,
             free: capacity.saturating_sub(foreign + held(&rows)),
             foreign,
             rows: rows
                 .iter()
-                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: r.facts.classes, remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, asked: r.want })
+                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, asked: r.asked })
                 .collect(),
             dispatched: dispatched.into_iter().map(|(k, v)| (k.trim_start_matches("dispatch/").to_string(), String::from_utf8_lossy(&v).into_owned())).collect(),
-            stalled,
         }
     }
 
-    /// Executors whose ask thread did not run when an asker rang it twice: TensorD ends them.
-    /// No side effect: any caller may read it at any time.
+    /// Executors whose ask thread answered nothing across three of TensorD's looks while asks
+    /// stayed unanswered (two ledger events with no answer): TensorD ends them. Only TensorD's
+    /// events thread calls it, once per ledger event; its memory of looks is its own.
     pub fn stalled(&self) -> Vec<u32> {
-        self.shared.rows().unwrap_or_default().into_iter().filter(|r| r.live && r.stalled).map(|r| r.pid).collect()
+        let rows = self.shared.rows().unwrap_or_default();
+        let mut looks = self.looks.lock();
+        let mut next = HashMap::new();
+        let mut stalled = vec![];
+        for r in rows.iter().filter(|r| r.live && r.rung > r.ran) {
+            let seen = match looks.get(&r.id()) {
+                Some((ran, n)) if *ran == r.ran => n + 1,
+                _ => 1,
+            };
+            if seen >= 3 {
+                stalled.push(r.pid);
+            }
+            next.insert(r.id(), (r.ran, seen));
+        }
+        *looks = next;
+        stalled
     }
 
     /// Readable when room frees, a row dies or a peak is recorded; reading it clears it.
@@ -903,7 +952,11 @@ impl Ledger {
 }
 
 impl Drop for Ledger {
+    /// A table with a live row of another process stays: a restarted TensorD reopens it.
     fn drop(&mut self) {
-        os::unlink(&self.shared.name);
+        let me = std::process::id();
+        if self.shared.rows().is_ok_and(|rows| rows.iter().all(|r| !r.live || r.pid == me)) {
+            os::unlink(&self.shared.name);
+        }
     }
 }

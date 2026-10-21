@@ -1,9 +1,10 @@
 //! Kept pages. An executor exports each filled, read-only page into custody while it maps it,
-//! and withdraws it when it unmaps it; custody holds the handles by (fingerprint, page). When an
-//! exporter's connection ends (it died, or TensorD reaped it), what it held becomes orphans
-//! (class O), which the next process to load that fingerprint imports instead of copying: one
-//! load path. Custody runs in whichever participant binds the GPU's service name (TensorD when
-//! it exists), so a standalone engine runs the same code.
+//! and withdraws it when it unmaps it; custody holds the handles by (fingerprint key, page).
+//! When an exporter's connection ends (it died, or TensorD reaped it), what it held becomes
+//! orphans (class O), which the next process to load that fingerprint imports instead of
+//! copying: one load path. Custody runs in whichever participant binds the GPU's service name
+//! (TensorD when it exists), under a row of its own that publishes the orphans, so a
+//! standalone engine runs the same code and no executor's row outlives it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use parking_lot::Mutex;
 use platform::handles::Owned;
 use serde::{Deserialize, Serialize};
 
-use crate::ledger::Row;
+use crate::ledger::{Row, Shared};
 use crate::os::{self, Stream};
 use crate::{Error, Result};
 
@@ -21,6 +22,8 @@ enum Call {
     Export { fp: String, page: u32, len: u64 },
     Withdraw { fp: String, page: u32 },
     Import { fp: String, page: u32 },
+    /// An import this process did not use goes back to orphans.
+    Disown { fp: String, page: u32 },
     Release { bytes: u64 },
     Reap { pid: u32 },
     Fault,
@@ -64,10 +67,11 @@ fn name(gpu: &str) -> String {
     format!("custody-{gpu}")
 }
 
-/// Binds the GPU's custody name and serves it from this process while it lives; false when
-/// another participant does. Its orphan bytes are published in `row`.
-fn start(gpu: &str, row: Arc<Row>) -> Result<bool> {
-    let Some(listener) = os::listen(&name(gpu))? else { return Ok(false) };
+/// Binds the GPU's custody name and serves it from this process while it lives, under a row of
+/// its own; false when another participant serves it.
+fn start(shared: &Arc<Shared>) -> Result<bool> {
+    let Some(listener) = os::listen(&name(&shared.name))? else { return Ok(false) };
+    let row = Arc::new(shared.claim(std::process::id())?);
     let state = Arc::new(Mutex::new(State::default()));
     std::thread::Builder::new()
         .name("varena-custody".into())
@@ -82,7 +86,8 @@ fn start(gpu: &str, row: Arc<Row>) -> Result<bool> {
 }
 
 fn serve(stream: Stream, state: &Mutex<State>, row: &Row) {
-    let pid = os::peer(&stream).unwrap_or(0);
+    // Only this user's processes: an abstract name has no permissions of its own.
+    let Ok(pid) = os::peer(&stream) else { return };
     let conn = {
         let mut s = state.lock();
         s.clock += 1;
@@ -105,6 +110,12 @@ fn serve(stream: Stream, state: &Mutex<State>, row: &Row) {
             Call::Withdraw { fp, page } => {
                 if s.pages.get(&(fp.clone(), page)).is_some_and(|k| k.owner == Some(conn)) {
                     s.pages.remove(&(fp, page));
+                }
+                (Reply::Done, None)
+            }
+            Call::Disown { fp, page } => {
+                if let Some(k) = s.pages.get_mut(&(fp, page)).filter(|k| k.owner == Some(conn)) {
+                    k.owner = None;
                 }
                 (Reply::Done, None)
             }
@@ -155,40 +166,70 @@ fn serve(stream: Stream, state: &Mutex<State>, row: &Row) {
     row.set_orphans(s.orphans());
 }
 
-/// A participant's connection to custody.
+/// A participant's connection to custody. A broken connection reconnects (serving custody when
+/// nobody does); a call that still fails means "no kept page", never a failed bind.
 pub(crate) struct Client {
-    stream: Mutex<Stream>,
+    shared: Arc<Shared>,
+    stream: Mutex<Option<Stream>>,
 }
 
 impl Client {
     /// Connects to the GPU's custody, serving it from this process when nobody does.
-    pub fn open(gpu: &str, row: &Arc<Row>) -> Result<Client> {
+    pub fn open(shared: &Arc<Shared>) -> Result<Client> {
+        let client = Client { shared: shared.clone(), stream: Mutex::new(None) };
+        *client.stream.lock() = Some(client.connect()?);
+        Ok(client)
+    }
+
+    fn connect(&self) -> Result<Stream> {
         loop {
-            if let Some(stream) = os::connect(&name(gpu))? {
-                return Ok(Client { stream: Mutex::new(stream) });
+            if let Some(stream) = os::connect(&name(&self.shared.name))? {
+                return Ok(stream);
             }
             // Nobody serves it: bind it; a racer that bound first is connected to next.
-            start(gpu, row.clone())?;
+            start(&self.shared)?;
         }
     }
 
-    fn call(&self, call: &Call, handle: Option<Owned>) -> Result<(Reply, Option<Owned>)> {
-        os::call(&self.stream.lock(), call, handle)
+    /// One call; a broken connection is replaced once (the service's holder exited).
+    fn call(&self, call: &Call, handle: Option<&Owned>) -> Result<(Reply, Option<Owned>)> {
+        let mut stream = self.stream.lock();
+        let mut last = Error::Closed("custody".into());
+        for _ in 0..2 {
+            let s = match stream.take() {
+                Some(s) => s,
+                None => self.connect()?,
+            };
+            let handle = handle.map(os::dup).transpose()?;
+            match os::call(&s, call, handle) {
+                Ok(reply) => {
+                    *stream = Some(s);
+                    return Ok(reply);
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 
     pub fn export(&self, fp: &str, page: u32, len: u64, handle: Owned) -> Result<()> {
-        self.call(&Call::Export { fp: fp.into(), page, len }, Some(handle)).map(|_| ())
+        self.call(&Call::Export { fp: fp.into(), page, len }, Some(&handle)).map(|_| ())
     }
 
     pub fn withdraw(&self, fp: &str, page: u32) -> Result<()> {
         self.call(&Call::Withdraw { fp: fp.into(), page }, None).map(|_| ())
     }
 
-    /// The orphan kept under (fingerprint, page), now this process's.
-    pub fn import(&self, fp: &str, page: u32) -> Result<Option<Owned>> {
-        match self.call(&Call::Import { fp: fp.into(), page }, None)? {
-            (Reply::Imported { found: true }, Some(h)) => Ok(Some(h)),
-            _ => Ok(None),
+    pub fn disown(&self, fp: &str, page: u32) -> Result<()> {
+        self.call(&Call::Disown { fp: fp.into(), page }, None).map(|_| ())
+    }
+
+    /// The orphan kept under (fingerprint key, page), now this process's; `None` when custody
+    /// has none (or cannot be reached).
+    pub fn import(&self, fp: &str, page: u32) -> Option<Owned> {
+        match self.call(&Call::Import { fp: fp.into(), page }, None) {
+            Ok((Reply::Imported { found: true }, Some(h))) => Some(h),
+            _ => None,
         }
     }
 
@@ -203,10 +244,10 @@ impl Client {
     }
 
     /// Drops orphans, least recently used first, until `bytes`; returns what it freed.
-    pub fn release(&self, bytes: u64) -> Result<u64> {
-        match self.call(&Call::Release { bytes }, None)? {
-            (Reply::Released { freed }, _) => Ok(freed),
-            _ => Ok(0),
+    pub fn release(&self, bytes: u64) -> u64 {
+        match self.call(&Call::Release { bytes }, None) {
+            Ok((Reply::Released { freed }, _)) => freed,
+            _ => 0,
         }
     }
 }

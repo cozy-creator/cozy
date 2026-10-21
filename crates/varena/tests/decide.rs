@@ -40,6 +40,7 @@ fn apply(t: &mut Table, actions: &[Action], run: &mut Run, tried: &mut Tried, cl
         match a {
             Action::Unmap { page, class } => {
                 run.evicted.push((*page, *class));
+                tried.freed += t.page(*page).unwrap().bytes;
                 let p = t.page_mut(*page).unwrap();
                 p.mapped = false;
                 p.filled = false;
@@ -78,6 +79,7 @@ fn apply(t: &mut Table, actions: &[Action], run: &mut Run, tried: &mut Tried, cl
                     let take = left.min(r.classes[c.index()]);
                     r.classes[c.index()] -= take;
                     left -= take;
+                    tried.freed += take;
                 }
                 remote = true;
             }
@@ -90,7 +92,12 @@ fn apply(t: &mut Table, actions: &[Action], run: &mut Run, tried: &mut Tried, cl
                 tried.trimmed = true;
                 remote = true;
             }
-            Action::Shrink { .. } | Action::Cut { .. } | Action::Park(_) => {}
+            Action::Reserve { req, room, measured } => {
+                let r = t.request_mut(*req).unwrap();
+                r.room = *room;
+                r.measured = *measured;
+            }
+            Action::Shrink { .. } | Action::Cut { .. } | Action::Relax { .. } | Action::Propose { .. } | Action::Park(_) => {}
         }
     }
     remote
@@ -102,14 +109,14 @@ fn demand(t: &mut Table, mut trigger: Trigger, run: &mut Run, clock: &mut u64) -
         let actions = decide(t, &trigger);
         let mut tried = match &trigger {
             Trigger::Bind { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } => tried.clone(),
-            Trigger::Ask { .. } => Tried::default(),
+            Trigger::Ask { .. } | Trigger::Load { .. } => Tried::default(),
         };
         if !apply(t, &actions, run, &mut tried, clock) {
             return actions;
         }
         match &mut trigger {
             Trigger::Bind { tried: t, .. } | Trigger::Pass { tried: t, .. } | Trigger::Oom { tried: t, .. } | Trigger::Speculate { tried: t, .. } => *t = tried,
-            Trigger::Ask { .. } => return actions,
+            Trigger::Ask { .. } | Trigger::Load { .. } => return actions,
         }
     }
 }
@@ -134,11 +141,10 @@ fn play(t: &mut Table, rooms: &[u64], speculate: bool) -> Run {
                 r.cursor.next.insert(s, 0);
                 r.speculated.clear();
                 let room = rooms[i];
-                let a = demand(t, Trigger::Pass { req: 1, room, tried: Tried::default() }, &mut run, &mut clock);
+                let a = demand(t, Trigger::Pass { req: 1, room: Some(room), unmeasured: 0, tried: Tried::default() }, &mut run, &mut clock);
                 if matches!(a.last(), Some(Action::Exhausted { .. })) {
                     return run;
                 }
-                t.requests[0].room = room;
                 let blocks = t.sets[s as usize].as_ref().unwrap().pages.len() as u32;
                 for b in 0..blocks {
                     let key = (s, b);
@@ -275,15 +281,15 @@ fn every_rung_of_the_demand_order() {
     let mut t3 = t2.clone();
     t3.others.clear();
     t3.requests[0].sites = vec![
-        varena::table::CutSite { name: "ffn".into(), level: 0, peak: 3 * MB, stuck: false },
-        varena::table::CutSite { name: "attn".into(), level: 0, peak: 2 * MB, stuck: false },
+        varena::table::CutSite { name: "ffn".into(), peak: 3 * MB, ..Default::default() },
+        varena::table::CutSite { name: "attn".into(), peak: 2 * MB, ..Default::default() },
     ];
-    let a = decide(&t3, &Trigger::Pass { req: 1, room: 4 * MB, tried: Tried::default() });
-    assert_eq!(a.last(), Some(&Action::Cut { req: 1, site: "ffn".into() }));
+    let a = decide(&t3, &Trigger::Pass { req: 1, room: Some(4 * MB), unmeasured: 0, tried: Tried::default() });
+    assert!(a.iter().any(|a| matches!(a, Action::Cut { site, .. } if site == "ffn")), "{a:?}");
     // Lower: no cut left, the request lowers and streams its own W (but never the page bound).
     let mut tried = Tried::default();
     tried.cut.extend(["ffn".to_string(), "attn".to_string()]);
-    let a = decide(&t3, &Trigger::Pass { req: 1, room: MB, tried });
+    let a = decide(&t3, &Trigger::Pass { req: 1, room: Some(MB), unmeasured: 0, tried });
     assert!(a.contains(&Action::Lower(1)), "{a:?}");
     // Park, then Exhausted, at an OOM with nothing left.
     let mut t4 = t3.clone();
@@ -291,7 +297,7 @@ fn every_rung_of_the_demand_order() {
     t4.requests[0].lowered = true;
     t4.requests[0].episode.claimed_free = true;
     t4.headroom = GB;
-    let oom = |t: &Table| decide(t, &Trigger::Oom { req: 1, need: Some(MB), site: None, tried: Tried::default() });
+    let oom = |t: &Table| decide(t, &Trigger::Oom { req: 1, need: Some(MB), site: None, collective: false, tried: Tried::default() });
     assert_eq!(oom(&t4).last(), Some(&Action::Park(1)));
     t4.requests[0].episode.parked = true;
     assert!(matches!(oom(&t4).last(), Some(Action::Exhausted { .. })));
@@ -355,7 +361,7 @@ fn any_oom_sequence_ends_within_pages_plus_cuts_plus_two() {
         answers += 1;
         assert!(answers <= pages + cut_levels + 2, "{answers} answers");
         let site = (cuts < cut_levels).then(|| "ffn".to_string());
-        let a = demand(&mut t, Trigger::Oom { req: 1, need: Some(64 * MB), site, tried: Tried::default() }, &mut run, &mut clock);
+        let a = demand(&mut t, Trigger::Oom { req: 1, need: Some(64 * MB), site, collective: false, tried: Tried::default() }, &mut run, &mut clock);
         match a.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::Park(_) | Action::Exhausted { .. })) {
             Some(Action::Cut { .. }) => cuts += 1,
             Some(Action::Exhausted { .. }) => break,
@@ -378,4 +384,89 @@ fn admission_counts_each_byte_once() {
     assert!(!fits(24 * GB, 0, &[row(GB, 1, 0)], &[], None));
     assert!(fits(24 * GB, 0, &[row(0, 0, 0)], &[], None));
     assert!(!fits(24 * GB, 0, &[row(GB, 1, 1)], &[], Some(GB)));
+}
+
+// ---- regressions from review 1
+
+/// Review 1, finding 5 (the reviewer's probe): an OOM whose own N unmap and another row's
+/// answer together cover the need re-decides with both counted, and evicts no D page.
+#[test]
+fn an_oom_counts_its_own_unmaps_after_an_ask() {
+    let g = 1 << 30;
+    let page = || Page { bytes: g, mapped: true, filled: true, ..Page::default() };
+    let set = |name: &str, n: usize| Some(Set { name: name.into(), pages: (0..n).map(|_| page()).collect(), declared: true });
+    let mut req = Req { id: 1, name: "r".into(), steps: vec![(vec![0], 1), (vec![1], 1)], rooms: vec![Some(0), Some(0)], measured: true, ..Req::default() };
+    req.episode.claimed_free = true;
+    let mut t = Table { capacity: 6 * g, sets: vec![set("w", 2), set("d", 2), set("n", 1)], requests: vec![req], others: vec![Remote { row: 99, running: true, classes: [0, 0, 0, g, 0, 0, 0], ..Remote::default() }], ..Table::default() };
+    let (mut run, mut clock) = (Run::default(), 0);
+    let a = demand(&mut t, Trigger::Oom { req: 1, need: Some(2 * g), site: None, collective: false, tried: Tried::default() }, &mut run, &mut clock);
+    assert!(run.evicted.iter().all(|(_, c)| *c != Class::D), "evicted a D page: {:?}", run.evicted);
+    assert!(a.iter().any(|a| matches!(a, Action::Claim { bytes, .. } if *bytes == 2 * g)), "{a:?}");
+}
+
+/// Review 1, finding 6: an idle GPU admits anything (it streams), and a lowered request's
+/// remaining W counts its streaming slots, not all its pages.
+#[test]
+fn an_idle_gpu_admits_a_model_larger_than_the_card() {
+    let idle = Admitted { context: GB, ..Admitted::default() };
+    assert!(fits(8 * GB, 0, &[idle], &[], Some(20 * GB)));
+    let (mut t, rooms) = h3(8 * GB);
+    play(&mut t, &rooms, false);
+    let r = &t.requests[0];
+    assert!(r.lowered);
+    let remaining = t.remaining(r).unwrap();
+    assert!(remaining < 8 * GB, "a streamed step's W is its room and slots: {remaining}");
+}
+
+fn cut_table(level: u32, coarser: Option<(u64, Option<u64>)>, collective: bool) -> Table {
+    let mut t = table(16 * MB, vec![set("dit", 4, MB)], vec![(vec![0], 1)]);
+    t.requests[0].cursor.passes.insert(0, 1);
+    t.requests[0].sites = vec![varena::table::CutSite { name: "ffn".into(), level, peak: 4 * MB, collective, finer: Some(2 * MB), coarser, ..Default::default() }];
+    t
+}
+
+/// Review 1, finding 7: a cut relaxes only into what is left once the pass has its room and
+/// its step's pages, and never back to a room it failed at.
+#[test]
+fn relaxing_takes_only_the_surplus_and_remembers_failures() {
+    let pass = |t: &Table, room: u64| decide(t, &Trigger::Pass { req: 1, room: Some(room), unmeasured: 0, tried: Tried::default() });
+    // 16 MB: 4 MB of pages unmapped, a 4 MB room; coarser needs 6 MB: 8 MB spare, so it relaxes.
+    let t = cut_table(1, Some((6 * MB, None)), false);
+    assert!(pass(&t, 4 * MB).contains(&Action::Relax { req: 1, site: "ffn".into() }));
+    // The same with the coarser room larger than the spare: it stays cut.
+    let t = cut_table(1, Some((13 * MB, None)), false);
+    assert!(!pass(&t, 4 * MB).iter().any(|a| matches!(a, Action::Relax { .. })));
+    // It failed at 12 MB of room before; 12 MB is all there is: it stays cut.
+    let t = cut_table(1, Some((6 * MB, Some(12 * MB))), false);
+    assert!(!pass(&t, 4 * MB).iter().any(|a| matches!(a, Action::Relax { .. })));
+    // Relaxing never evicts: with the pages taking the surplus it waits.
+    let mut t = cut_table(1, Some((6 * MB, None)), false);
+    t.capacity = 9 * MB;
+    assert!(!pass(&t, 4 * MB).iter().any(|a| matches!(a, Action::Relax { .. } | Action::Unmap { .. })));
+}
+
+/// Review 1, finding 4: a pass start never cuts a collective site on its own, and an OOM at one
+/// proposes its finer level for the next pass instead of cutting mid-pass.
+#[test]
+fn collective_sites_change_only_by_agreement() {
+    let mut t = cut_table(0, None, true);
+    t.capacity = 5 * MB;
+    let a = decide(&t, &Trigger::Pass { req: 1, room: Some(4 * MB), unmeasured: 0, tried: Tried::default() });
+    assert!(!a.iter().any(|a| matches!(a, Action::Cut { .. })), "{a:?}");
+    assert!(a.contains(&Action::Lower(1)));
+    let a = decide(&t, &Trigger::Oom { req: 1, need: Some(MB), site: Some("ffn".into()), collective: true, tried: Tried::default() });
+    assert!(a.contains(&Action::Propose { req: 1, site: "ffn".into() }));
+    assert!(!a.iter().any(|a| matches!(a, Action::Cut { .. })), "{a:?}");
+}
+
+/// Review 1, finding 8: a pass's room is set by the same decision, in the same apply, as the
+/// evictions that made it.
+#[test]
+fn a_pass_reserves_its_room_with_its_evictions() {
+    let mut t = table(4 * MB, vec![set("a", 2, MB), set("n", 2, MB)], vec![(vec![0], 1)]);
+    map(&mut t, (1, 0));
+    map(&mut t, (1, 1));
+    let a = decide(&t, &Trigger::Pass { req: 1, room: Some(2 * MB), unmeasured: 0, tried: Tried::default() });
+    assert_eq!(a.last(), Some(&Action::Reserve { req: 1, room: 2 * MB, measured: true }));
+    assert_eq!(a.iter().filter(|a| matches!(a, Action::Unmap { class: Class::N, .. })).count(), 2, "{a:?}");
 }
