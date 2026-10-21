@@ -180,6 +180,15 @@ pub(super) fn meter(pid: u32) -> Option<(u64, u64)> {
 }
 
 /// `rchar`.
+/// Each live thread's time on a CPU (`schedstat`, nanoseconds), by thread id.
+pub(super) fn threads(pid: u32) -> Option<Vec<(u32, u64)>> {
+    let tasks = fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    Some(tasks.flatten().filter_map(|task| {
+        let ran = fs::read_to_string(task.path().join("schedstat")).ok()?;
+        Some((task.file_name().to_str()?.parse().ok()?, ran.split_whitespace().next()?.parse().ok()?))
+    }).collect())
+}
+
 pub(super) fn read_bytes(pid: u32) -> Option<u64> {
     fs::read_to_string(format!("/proc/{pid}/io"))
         .ok()?

@@ -231,6 +231,10 @@ pub(super) fn meter(pid: u32) -> Option<(u64, u64)> {
     Some((cpu, usage.ri_diskio_bytesread.saturating_add(usage.ri_diskio_byteswritten)))
 }
 
+pub(super) fn threads(_: u32) -> Option<Vec<(u32, u64)>> {
+    None
+}
+
 /// Disk bytes read.
 pub(super) fn read_bytes(pid: u32) -> Option<u64> {
     Some(rusage(pid)?.ri_diskio_bytesread)
