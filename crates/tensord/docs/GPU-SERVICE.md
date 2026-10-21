@@ -77,8 +77,9 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   (`cozy machine logs <name> memory`; `local` names this computer's). Each call's own memory is
   the run's `memory` measurements (`cozy run show`): torch's peaks and varena's record of the
   request (`stats`, kept whole), which the merge gate reads as `measurements.memory.stats`.
-- A child call whose lane holds a GPU its family calls on is admitted under its family's
-  admission (its parent is blocked on it): dispatched under its own key, with no `fits`.
+- Admission names the call's family (`Execution::family`), which Invoke also carries: while a
+  parent waits on a child call it yields under its family (varena `Request::yielding`), so its
+  working set is left out for its family's child and counts for every stranger.
 - The RAM tier's host-short event (it gave back all it may, the host is still short) ends one
   idle process, least recently used first: a deviceless executor, else an import-only parent
   with no live child, else an idle GPU executor (outside every warm set first) whose lane's call
