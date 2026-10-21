@@ -16,6 +16,7 @@ mod credits;
 mod daemon;
 mod doctor;
 mod hub;
+mod launch;
 mod machine;
 mod model;
 pub mod output;

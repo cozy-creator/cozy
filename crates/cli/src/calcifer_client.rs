@@ -14,7 +14,6 @@ use std::{
 use platform::{
     lock::{Kind as LockKind, LockFile},
     paths::Home,
-    process::{self, Detached},
     service::{ServiceSpec, Services},
     tools,
 };
@@ -26,7 +25,11 @@ use protocol::{
 use reqwest::{RequestBuilder, Response, StatusCode, header};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{Context, output};
+use crate::{
+    Context,
+    launch::{self, Ended, Launch},
+    output,
+};
 
 /// How often a wait looks again: a sampling period, never a deadline.
 const SAMPLE: Duration = Duration::from_millis(50);
@@ -318,53 +321,44 @@ impl Client {
                 false => "found Calcifer's service current",
             });
         }
-        let (mut child, mut asked) = (None, false);
-        let began = Instant::now();
-        let mut reported = began;
-        loop {
-            // Nobody holds the home: start one. Again too when the last start lost to a
-            // Calcifer that was stopping, which held the lock until it went.
-            if child.is_none() && self.lock_free() {
-                match managed {
-                    true => services.start(&spec).map_err(failed)?,
-                    false => child = Some(spawn(&spec).map_err(failed)?),
+        let mut launch = Launch::new(managed.then_some(&services), &spec);
+        let mut asked = false;
+        launch::until(
+            self.0.json,
+            "Calcifer",
+            "`cozy logs calcifer`",
+            async || {
+                // Nobody holds the home: start one. Again too when the last start lost to a Calcifer
+                // that was stopping, which held the lock until it went.
+                if self.lock_free() {
+                    launch.start().map_err(failed)?;
+                    if !std::mem::replace(&mut asked, true) {
+                        steps.done("started Calcifer");
+                    }
                 }
-                if !std::mem::replace(&mut asked, true) {
-                    steps.done("started Calcifer");
+                if let Some(error) = refusal(&refused) {
+                    return Err(error);
                 }
-            }
-            tokio::time::sleep(SAMPLE).await;
-            if let Some(error) = refusal(&refused) {
-                return Err(error);
-            }
-            if let Some(holder) = self.live().await {
-                steps.done("Calcifer answered");
-                return Ok(holder);
-            }
-            if let Some(tree) = child.as_mut()
-                && let Some(status) = tree.try_wait().map_err(failed)?
-            {
-                if !status.success() {
-                    return Err(refusal(&refused).unwrap_or_else(|| {
+                if let Some(holder) = self.live().await {
+                    steps.done("Calcifer answered");
+                    return Ok(Some(holder));
+                }
+                match launch.ended() {
+                    // Another Calcifer held the lock: wait for its record, or for it to let go.
+                    None | Some(Ended::Yielded) => Ok(None),
+                    Some(Ended::Failed(why)) => Err(refusal(&refused).unwrap_or_else(|| {
                         Error::new(
                             Kind::Unavailable,
                             "calcifer_start_failed",
-                            format!("Calcifer exited ({status}) before it served"),
+                            format!("Calcifer: {why}"),
                         )
+                        .remedy("the next cozy command starts it again")
                         .next("cozy logs calcifer")
-                    }));
+                    })),
                 }
-                // Another Calcifer held the lock: wait for its record, or for it to let go.
-                child = None;
-            }
-            if reported.elapsed() >= REPORT {
-                reported = Instant::now();
-                self.say(&format!(
-                    "waiting for Calcifer to start ({}s so far); `cozy logs calcifer` shows what it is doing",
-                    began.elapsed().as_secs()
-                ));
-            }
-        }
+            },
+        )
+        .await
     }
 
     /// Calcifer's service: the installed cozy's `cozy calcifer`.
@@ -668,11 +662,6 @@ impl Sse {
 }
 
 /// A path from segments, each percent-encoded.
-/// `cozy calcifer`, detached, saying anything before its own log opens into that log.
-fn spawn(spec: &ServiceSpec) -> platform::Result<Detached> {
-    process::detach(&spec.program, &spec.args, spec.log.as_deref())
-}
-
 pub fn path(segments: &[&str]) -> String {
     let mut url = url::Url::parse("http://calcifer/").expect("a base URL");
     url.path_segments_mut()
