@@ -21,10 +21,7 @@ use common::{Tensord, installing_machine, package_run};
 use futures_util::StreamExt as _;
 use platform::{lock::LockFile, paths::Home};
 use protocol::{
-    calcifer::{
-        CHECKPOINT, Event, Holder, Kind, MachinesEvent, OutputItem, Run, RunsEvent, Status,
-        SubmitRun,
-    },
+    calcifer::{Event, Holder, Kind, MachinesEvent, OutputItem, Run, RunsEvent, Status, SubmitRun},
     config::{Config, Loaded},
     error::Envelope,
     ids::{Digest, RunId},
@@ -901,8 +898,15 @@ async fn every_output_ends_landed_kept_or_lost_and_a_checkpoint_waits_on_nothing
         status: "succeeded".into(),
         outputs: vec![
             v1::Product {
-                media_type: CHECKPOINT.into(),
-                ..product("fp8", 0, 1, br#"{"entries":[]}"#)
+                output: "fp8".into(),
+                rev: 1,
+                checkpoint: Some(v1::CheckpointRef {
+                    repo_id: "local/quantized".into(),
+                    revision: "sha256:fp8".into(),
+                    variant: "fp8".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
             },
             v1::Product {
                 output: "published".into(),

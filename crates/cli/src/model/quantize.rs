@@ -143,10 +143,6 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
             Some(WrittenCheckpoint::Header(header)) => {
                 Record::new().field("checkpoint header", header).print(ctx);
             }
-            Some(WrittenCheckpoint::Legacy(digest)) => {
-                let into = destination.split('@').next().unwrap_or(&destination);
-                Record::new().field("checkpoint", format!("{into}#{digest}")).print(ctx);
-            }
             None => {}
         }
     }
@@ -156,21 +152,16 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
 enum WrittenCheckpoint<'a> {
     Reference(&'a protocol::machine::CheckpointRef),
     Header(&'a str),
-    Legacy(&'a str),
 }
 
-/// A typed output names the repository TREE. The result's new checkpoint field names only a
-/// HEADER; the nested manifest form belongs to older saved results.
+/// A typed output names the repository TREE; the result's checkpoint field names only a HEADER.
 fn written_checkpoint<'a>(run: &'a Run, lane: &str) -> Option<WrittenCheckpoint<'a>> {
     if let Some(reference) = run.output.iter().filter(|item| item.name == lane)
         .find_map(|item| item.checkpoint.as_ref()) {
         return Some(WrittenCheckpoint::Reference(reference));
     }
     let result = run.result.as_ref()?;
-    if let Some(header) = result["checkpoint"].as_str() {
-        return Some(WrittenCheckpoint::Header(header));
-    }
-    result["manifest"]["digest"].as_str().map(WrittenCheckpoint::Legacy)
+    result["checkpoint"].as_str().map(WrittenCheckpoint::Header)
 }
 
 #[cfg(test)]
@@ -202,7 +193,7 @@ mod tests {
             "id": protocol::ids::RunId::mint([7; 12]), "number": 7, "kind": "call",
             "target": "quantize", "hub": "https://tensorhub.com", "status": "completed",
             "created_at_ms": 1,
-            "result": {"checkpoint": "sha256:header", "manifest": {"digest": "sha256:legacy"}},
+            "result": {"checkpoint": "sha256:header"},
             "output": [{
                 "id": "7/fp8", "name": "fp8", "index": 0, "rev": 1, "length": 0,
                 "media_type": "", "status": "completed",
@@ -213,7 +204,5 @@ mod tests {
             if reference.repo_id == "actual/output" && reference.revision == "sha256:tree"));
         run.output.clear();
         assert!(matches!(written_checkpoint(&run, "fp8"), Some(WrittenCheckpoint::Header("sha256:header"))));
-        run.result = Some(serde_json::json!({"manifest": {"digest": "sha256:legacy"}}));
-        assert!(matches!(written_checkpoint(&run, "fp8"), Some(WrittenCheckpoint::Legacy("sha256:legacy"))));
     }
 }

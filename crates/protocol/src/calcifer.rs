@@ -217,13 +217,10 @@ pub struct OutputItem {
     pub checkpoint: Option<crate::machine::CheckpointRef>,
 }
 
-/// A weights output's media type: its bytes are a checkpoint's manifest.
-pub const CHECKPOINT: &str = "application/vnd.cozy.model-manifest";
-
 impl OutputItem {
-    /// A checkpoint reference, or a legacy checkpoint manifest, needs no local byte export.
+    /// A checkpoint reference needs no local byte export.
     pub fn is_checkpoint(&self) -> bool {
-        self.checkpoint.is_some() || self.media_type == CHECKPOINT
+        self.checkpoint.is_some()
     }
 }
 

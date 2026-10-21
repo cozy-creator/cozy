@@ -9,8 +9,8 @@ use std::{
 
 use protocol::{
     calcifer::{
-        Agreed, CHECKPOINT, Call, Event, ItemStatus, Kind, Machine, MachineKind, MachineState,
-        OutputItem, Reason, Run, Status, Warning,
+        Agreed, Call, Event, ItemStatus, Kind, Machine, MachineKind, MachineState, OutputItem,
+        Reason, Run, Status, Warning,
     },
     config::Origin,
     ids::{Digest, RunId},
@@ -1010,11 +1010,11 @@ impl Store {
             let mut statement = conn.prepare(
                 "SELECT DISTINCT runs.id, runs.number FROM outputs JOIN runs ON runs.id = outputs.run
                  WHERE outputs.exported_rev IS NOT outputs.rev AND outputs.failed_rev IS NOT outputs.rev
-                   AND outputs.media_type IS NOT ?1 AND outputs.checkpoint IS NULL
+                   AND outputs.checkpoint IS NULL
                  ORDER BY runs.number",
             )?;
             let rows = statement
-                .query_map([CHECKPOINT], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows.into_iter()
                 .map(|(id, number)| Ok((RunId::try_from(id).map_err(|e| StoreError::Corrupt(e.into()))?, number)))
@@ -1030,12 +1030,11 @@ impl Store {
                 "SELECT runs.id, runs.number, outputs.name, outputs.idx, outputs.length
                  FROM outputs JOIN runs ON runs.id = outputs.run
                  WHERE runs.machine = ?1 AND outputs.exported_rev IS NOT outputs.rev
-                   AND outputs.failed_rev IS NOT outputs.rev AND outputs.media_type IS NOT ?2
-                   AND outputs.checkpoint IS NULL
+                   AND outputs.failed_rev IS NOT outputs.rev AND outputs.checkpoint IS NULL
                  ORDER BY runs.number, outputs.created_seq",
             )?;
             let rows = statement
-                .query_map([machine, CHECKPOINT], |r| {
+                .query_map([machine], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, i64>(1)? as u64,
@@ -1066,10 +1065,10 @@ impl Store {
         self.read(|conn| {
             let mut statement = conn.prepare(&format!(
                 "SELECT {OUTPUT_COLUMNS} FROM outputs WHERE run = ?1 AND exported_rev IS NOT rev
-                 AND failed_rev IS NOT rev AND media_type IS NOT ?2 AND checkpoint IS NULL ORDER BY created_seq"
+                 AND failed_rev IS NOT rev AND checkpoint IS NULL ORDER BY created_seq"
             ))?;
             Ok(statement
-                .query_map([run, CHECKPOINT], output_row)?
+                .query_map([run], output_row)?
                 .collect::<rusqlite::Result<_>>()?)
         })
     }
