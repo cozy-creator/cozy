@@ -546,13 +546,14 @@ impl PyRequest {
     }
 
     /// An op of `set`'s pass (None: outside any pass) ran out of memory, `need` more bytes when
-    /// known, at cut site `site` (None: the op cannot be cut), cut no finer than `finest`, with
-    /// torch's bytes now; a `collective` site's finer level waits for the next pass's agreement.
-    #[pyo3(signature = (set, allocated, reserved, need = None, site = None, collective = false, finest = 0))]
+    /// known, at cut site `site` (None: the op cannot be cut) whose op has shape key `shape`, cut
+    /// no finer than `finest`, with torch's bytes now; a `collective` site's finer level waits
+    /// for the next pass's agreement.
+    #[pyo3(signature = (set, allocated, reserved, need = None, site = None, collective = false, finest = 0, shape = ""))]
     #[allow(clippy::too_many_arguments)]
-    fn oom(&self, py: Python<'_>, set: Option<u32>, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool, finest: u32) -> PyResult<PyNext> {
+    fn oom(&self, py: Python<'_>, set: Option<u32>, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool, finest: u32, shape: &str) -> PyResult<PyNext> {
         let r = self.get(py)?;
-        let site = site.map(|name| Site { name, collective, finest });
+        let site = site.map(|name| Site { name, collective, finest, shape });
         Ok(match detached(py, &self.gpu, || Ok(r.oom(set.map(SetId), need, site, Torch { allocated, reserved })))? {
             Next::Retry => PyNext::Retry(),
             Next::Cut(level) => PyNext::Cut { level },
@@ -568,17 +569,18 @@ impl PyRequest {
     }
 
     /// The cut level of `set`'s current pass for op site `site` (0: whole); with no set (outside
-    /// any pass) the request's own memo of that site.
-    fn cut(&self, py: Python<'_>, set: Option<u32>, site: &str) -> PyResult<u32> {
+    /// any pass) the request's own memo of that site at the op's shape key `shape`.
+    #[pyo3(signature = (set, site, shape = ""))]
+    fn cut(&self, py: Python<'_>, set: Option<u32>, site: &str, shape: &str) -> PyResult<u32> {
         let r = self.get(py)?;
-        detached(py, &self.gpu, || Ok(r.cut(set.map(SetId), site)))
+        detached(py, &self.gpu, || Ok(r.cut(set.map(SetId), site, shape)))
     }
 
-    /// The request waits on a child call: until the guard ends it gives back its reserved room
-    /// and its step's pages may be asked for; ended, it takes its room back.
-    fn yielding(&self, py: Python<'_>) -> PyResult<PyYielded> {
+    /// The request waits on a call of its `family` (a child): until the guard ends it gives back
+    /// its reserved room to that family alone; ended, it waits for its room back.
+    fn yielding(&self, py: Python<'_>, family: &str) -> PyResult<PyYielded> {
         let r = self.get(py)?;
-        Ok(PyYielded(Mutex::new(Some(detached(py, &self.gpu, || Ok(r.yielding()))?))))
+        Ok(PyYielded(Mutex::new(Some(detached(py, &self.gpu, || Ok(r.yielding(family)))?))))
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<PyStats> {
@@ -745,10 +747,29 @@ struct DLManagedTensor {
     deleter: Option<unsafe extern "C" fn(*mut DLManagedTensor)>,
 }
 
-/// What a consumer's tensor owns: its shape and stride cells, and the pin.
+/// What a consumer's tensor owns: its shape and stride cells, and the pin (none for a window's).
 struct Tensor {
     dims: [i64; 2],
-    _pin: Arc<Held>,
+    _pin: Option<Arc<Held>>,
+}
+
+/// A uint8 DLPack capsule of `len` bytes at `ptr` on `dl`, owning `pin` while any tensor of it lives.
+fn capsule<'p>(py: Python<'p>, ptr: u64, len: u64, dl: (i32, i32), pin: Option<Arc<Held>>) -> PyResult<Bound<'p, PyAny>> {
+    let held = Box::into_raw(Box::new(Tensor { dims: [len as i64, 1], _pin: pin }));
+    // SAFETY: `held` is live until the deleter runs.
+    let dims = unsafe { (*held).dims.as_mut_ptr() };
+    let (device, dtype) = (DLDevice { device_type: dl.0, device_id: dl.1 }, DLDataType { code: KDL_UINT, bits: 8, lanes: 1 });
+    let dl_tensor = DLTensor { data: ptr as *mut c_void, device, ndim: 1, dtype, shape: dims, strides: unsafe { dims.add(1) }, byte_offset: 0 };
+    let t = Box::into_raw(Box::new(DLManagedTensor { dl_tensor, manager_ctx: held as *mut c_void, deleter: Some(deleter) }));
+    // SAFETY: the capsule takes the leaked tensor; on failure it is freed here.
+    unsafe {
+        let cap = ffi::PyCapsule_New(t as *mut c_void, DLTENSOR.as_ptr(), Some(capsule_destructor));
+        if cap.is_null() {
+            deleter(t);
+            return Err(PyErr::fetch(py));
+        }
+        Ok(Bound::from_owned_ptr(py, cap))
+    }
 }
 
 unsafe extern "C" fn deleter(t: *mut DLManagedTensor) {
@@ -795,21 +816,44 @@ impl PyPin {
         if !ordered {
             return Err(PyBufferError::new_err(format!("a pin is consumed on the stream it was bound on ({}), not {stream:?}", self.stream)));
         }
-        let held = Box::into_raw(Box::new(Tensor { dims: [self.len as i64, 1], _pin: self.pin.clone() }));
-        // SAFETY: `held` is live until the deleter runs.
-        let dims = unsafe { (*held).dims.as_mut_ptr() };
-        let (device, dtype) = (DLDevice { device_type: self.dl.0, device_id: self.dl.1 }, DLDataType { code: KDL_UINT, bits: 8, lanes: 1 });
-        let dl_tensor = DLTensor { data: self.ptr as *mut c_void, device, ndim: 1, dtype, shape: dims, strides: unsafe { dims.add(1) }, byte_offset: 0 };
-        let t = Box::into_raw(Box::new(DLManagedTensor { dl_tensor, manager_ctx: held as *mut c_void, deleter: Some(deleter) }));
-        // SAFETY: the capsule takes the leaked tensor; on failure it is freed here.
-        unsafe {
-            let cap = ffi::PyCapsule_New(t as *mut c_void, DLTENSOR.as_ptr(), Some(capsule_destructor));
-            if cap.is_null() {
-                deleter(t);
-                return Err(PyErr::fetch(py));
-            }
-            Ok(Bound::from_owned_ptr(py, cap))
+        capsule(py, self.ptr, self.len, self.dl, Some(self.pin.clone()))
+    }
+
+    fn __dlpack_device__(&self) -> (i32, i32) {
+        self.dl
+    }
+
+    /// The same bytes as a window that holds no pin: tensors made from it stay valid only while
+    /// the block is bound (an adapter keeps them across binds of one mapping and installs them
+    /// only under a pin).
+    fn window(&self) -> PyWindow {
+        PyWindow { ptr: self.ptr, len: self.len, dl: self.dl }
+    }
+}
+
+/// A block's bytes without a pin (`Pin.window`): its tensors are valid only while it is bound.
+#[pyclass(name = "Window", module = "tensorfs.varena", frozen)]
+pub struct PyWindow {
+    #[pyo3(get)]
+    ptr: u64,
+    #[pyo3(get)]
+    len: u64,
+    dl: (i32, i32),
+}
+
+#[pymethods]
+impl PyWindow {
+    /// A uint8 tensor of `len` bytes; the pin that binds the block orders its consumers.
+    #[pyo3(signature = (*, stream = None, max_version = None, dl_device = None, copy = None))]
+    fn __dlpack__<'p>(&self, py: Python<'p>, stream: Option<i64>, max_version: Option<Bound<'p, PyAny>>, dl_device: Option<(i32, i32)>, copy: Option<bool>) -> PyResult<Bound<'p, PyAny>> {
+        let _ = (stream, max_version);
+        if copy == Some(true) {
+            return Err(PyBufferError::new_err("a window is never copied"));
         }
+        if dl_device.is_some_and(|d| d != self.dl) {
+            return Err(PyBufferError::new_err(format!("a window lives on {:?}", self.dl)));
+        }
+        capsule(py, self.ptr, self.len, self.dl, None)
     }
 
     fn __dlpack_device__(&self) -> (i32, i32) {
@@ -834,6 +878,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPass>()?;
     m.add_class::<PyYielded>()?;
     m.add_class::<PyPin>()?;
+    m.add_class::<PyWindow>()?;
     m.add_class::<PyNext>()?;
     m.add_class::<PyFills>()?;
     m.add_class::<PyMoved>()?;

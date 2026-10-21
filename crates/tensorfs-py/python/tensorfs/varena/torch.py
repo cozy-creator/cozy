@@ -163,6 +163,11 @@ class _Block:
     stream: torch.cuda.Stream | None = None
     pin: Pin | None = None
     written: list[tuple[_Site, Tensor | None]] = field(default_factory=list)
+    #: its mapping's address, the part views of it and the module tensors made of them: kept
+    #: across binds of that mapping (they hold no pin and are installed only under one)
+    at: int | None = None
+    views: dict[str, dict[str, Tensor]] | None = None
+    assign: list[tuple[_Site, Tensor]] | None = None
 
 
 @dataclass(eq=False, slots=True)
@@ -184,6 +189,8 @@ class _Pass:
     reserved_peak: int = 0
     #: each cut site's allocated peak, whether it is a collective's, and its finest level
     sites: dict[str, tuple[int, bool, int]] = field(default_factory=dict)
+    #: cut levels read in this pass per (site, shape), until an oom answer or an agreement
+    cuts: dict[tuple[str, str], int] = field(default_factory=dict)
     open: list[list[object]] = field(default_factory=list)
     #: the exception being handled where it opened: another at its close is a raise
     entered: BaseException | None = None
@@ -236,6 +243,9 @@ class Model:
         for h in self.handles:
             h.remove()
         self.handles.clear()
+        for b in (self.common, *self.blocks.values()):
+            if b is not None:
+                b.views = b.assign = None
         self.memory.models.pop(self.module, None)
         self.memory.native.unload(self.id)
 
@@ -532,16 +542,29 @@ class Memory:
     def _bind(self, block: _Block, stream: torch.cuda.Stream | None) -> None:
         model = block.model
         pin = self.native.bind(model.id, block.region, stream.cuda_stream if stream is not None else 0)
-        base = torch.from_dlpack(pin)
-        if pin.fresh and model.fill is not None:
-            model.fill(block.path, _views(block, base))  # on the pin's own bytes, before any copy
-            pin.filled()
-        if base.device != self.device:
-            base = base.to(self.device)  # MPS: host pages are copied in for the block's run
-        views = _views(block, base)
+        if self.torch.kind in ("cpu", "cuda"):
+            if block.views is None or block.at != pin.ptr:  # a new mapping: its views once
+                block.views, block.at, block.assign = _views(block, torch.from_dlpack(pin.window())), pin.ptr, None
+            views = block.views
+            if pin.fresh and model.fill is not None:
+                model.fill(block.path, views)  # in place: the views alias the page
+                pin.filled()
+        else:  # MPS: the host bytes are baked, then copied in for the block's run
+            base = torch.from_dlpack(pin)
+            if pin.fresh and model.fill is not None:
+                model.fill(block.path, _views(block, base))
+                pin.filled()
+            views, block.assign = _views(block, base.to(self.device)), None
         block.pin, block.stream = pin, stream
         try:
-            _write(block, views)
+            assign = block.assign
+            if assign is None:
+                assign, kept = _assign(block, views)
+                if kept and views is block.views:
+                    block.assign = assign
+            for site, value in assign:
+                block.written.append((site, site.table[site.attr]))
+                site.table[site.attr] = value
         except BaseException:
             _unbind(block)
             raise
@@ -560,13 +583,15 @@ class Request:
         """Replaces the plan (as `Memory.request` takes it); its cursor starts over."""
         self.native.plan(self.memory._plan(steps))
 
-    def oom(self, need: int | None = None, site: str | None = None, collective: bool = False, finest: int = 0) -> Next:
+    def oom(self, need: int | None = None, site: str | None = None, collective: bool = False, finest: int = 0, shape: str = "") -> Next:
         """An op ran out of memory: varena's answer, with torch's cap applied after it. `site` is
-        its cut site (None: it cannot be cut), cut no finer than `finest`; a `collective` site's
-        finer level waits for the next pass's agreement. Outside any pass (package code between
-        passes) varena answers with demand and Park, never a Cut."""
+        its cut site (None: it cannot be cut), `shape` the op's shape key, cut no finer than
+        `finest`; a `collective` site's finer level waits for the next pass's agreement. Outside
+        any pass (package code between passes) the request's memo of (site, shape) answers."""
         p = _pass.get()
-        answer = self.native.oom(p.set if p else None, *self.memory.torch.now(), need, site, collective, finest)
+        answer = self.native.oom(p.set if p else None, *self.memory.torch.now(), need, site, collective, finest, shape)
+        if p is not None:
+            p.cuts.clear()
         # The failed attempt's peak is not the pass's: when it ran in its site, it is dropped, and
         # the retry is measured afresh from here.
         attempt = p is not None and bool(p.open) and p.open[-1][0] == site
@@ -578,11 +603,17 @@ class Request:
         """The bytes a `Next.Park(budget)` answer moved to the host."""
         self.native.parked(nbytes)
 
-    def cut(self, site: str) -> int:
-        """The current pass's level for cut site `site` (0: whole); outside any pass (a split in
-        package code) the request's own memo of it."""
+    def cut(self, site: str, shape: str = "") -> int:
+        """The current pass's level for cut site `site` (0: whole) at the op's shape key
+        `shape`, read from varena once a pass per (site, shape) until an oom answer or an
+        agreement; outside any pass (a split in package code) the request's memo of it."""
         p = _pass.get()
-        return self.native.cut(p.set if p else None, site)
+        if p is None:
+            return self.native.cut(None, site, shape)
+        level = p.cuts.get((site, shape))
+        if level is None:
+            level = p.cuts[(site, shape)] = self.native.cut(p.set, site, shape)
+        return level
 
     def levels(self) -> list[tuple[str, int]]:
         """The current pass's proposed `(site, level)` for its collective cut sites; the group
@@ -591,17 +622,19 @@ class Request:
 
     def agree(self, levels: list[tuple[str, int]]) -> None:
         """The levels every rank uses for the current pass's collective sites."""
-        _open_pass().native.agree(levels)
+        p = _open_pass()
+        p.cuts.clear()
+        p.native.agree(levels)
 
     def measured(self) -> bool:
         """Whether the current pass's room came from a measurement (False with no pass open)."""
         p = _pass.get()
         return p is not None and p.native.measured()
 
-    def yielding(self) -> Yielded:
-        """`with r.yielding():` while the request waits on a child call: its room goes back
-        until the wait ends."""
-        return self.native.yielding()
+    def yielding(self, family: str) -> Yielded:
+        """`with r.yielding(family):` while the request waits on a call of its `family` (a
+        child): its room goes to that family alone until the wait ends."""
+        return self.native.yielding(family)
 
     @contextmanager
     def site(self, name: str, collective: bool = False, finest: int = 0) -> Iterator[None]:
@@ -799,9 +832,10 @@ def _paired(sub: nn.Module, enter: Callable[..., None], exit: Callable[[], None]
     return [sub.register_forward_pre_hook(pre, with_kwargs=True), sub.register_forward_hook(post, always_call=True)]
 
 
-def _write(block: _Block, views: Mapping[str, Mapping[str, Tensor]]) -> None:
-    """The block's module tensors become its views, through the model's `bind`."""
-    model = block.model
+def _assign(block: _Block, views: Mapping[str, Mapping[str, Tensor]]) -> tuple[list[tuple[_Site, Tensor]], bool]:
+    """What the block's module tensors become, through the model's `bind`; and whether every one
+    is a view itself (not a tensor made from one), so it can be kept with the views."""
+    model, out, kept = block.model, [], True
     for key, parts in views.items():
         if model.bind is not None:
             made = model.bind(key, parts)
@@ -810,16 +844,17 @@ def _write(block: _Block, views: Mapping[str, Mapping[str, Tensor]]) -> None:
         else:
             raise Unbound(f"{model.name}: {key} is encoded ({sorted(parts)}) and no bind was given")
         for name, value in made.items():
+            kept = kept and any(value is part for part in parts.values())
             for site in model.sites.get(name, ()):
                 held = site.table[site.attr]
-                block.written.append((site, held))
                 if held is not None and held.dtype != value.dtype:
-                    value = value.to(held.dtype)  # a converted module (`module.to(dtype)`)
-                site.table[site.attr] = nn.Parameter(value, requires_grad=False) if site.parameter else value
+                    value, kept = value.to(held.dtype), False  # a converted module (`module.to(dtype)`)
+                out.append((site, nn.Parameter(value, requires_grad=False) if site.parameter else value))
+    return out, kept
 
 
 def _unbind(block: _Block) -> None:
-    """Placeholders back; the views go, and with the last of them the pin."""
+    """Placeholders back, and the pin goes (the kept views own none)."""
     for site, held in reversed(block.written):
         site.table[site.attr] = held
     block.written.clear()

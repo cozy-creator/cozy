@@ -181,22 +181,23 @@ class Request:
         site: str | None = None,
         collective: bool = False,
         finest: int = 0,
+        shape: str = "",
     ) -> Next:
-        """An op of `set`'s pass (None: outside any pass: demand, then Park, never Cut) ran out
-        of memory (`need` more bytes when known) at cut site `site` (None: it cannot be cut), cut
-        no finer than `finest`, with torch's bytes now; a `collective` site's finer level waits
-        for the next pass's agreement."""
+        """An op of `set`'s pass (None: outside any pass) ran out of memory (`need` more bytes
+        when known) at cut site `site` (None: it cannot be cut) whose op has shape key `shape`,
+        cut no finer than `finest`, with torch's bytes now; a `collective` site's finer level
+        waits for the next pass's agreement."""
 
     def parked(self, nbytes: int) -> None:
         """The bytes a `Park` answer moved to the host (0: none, and the next `oom` is Exhausted)."""
 
-    def cut(self, set: int | None, site: str) -> int:
+    def cut(self, set: int | None, site: str, shape: str = "") -> int:
         """The cut level of `set`'s current pass for `site` (0: whole); with no set (outside any
-        pass) the request's own memo of that site."""
+        pass) the request's own memo of that site at the op's shape key `shape`."""
 
-    def yielding(self) -> Yielded:
-        """The request waits on a child call: until the guard ends it gives back its reserved
-        room and its step's pages may be asked for; ended, it takes its room back."""
+    def yielding(self, family: str) -> Yielded:
+        """The request waits on a call of its `family` (a child): until the guard ends it gives
+        back its reserved room to that family alone; ended, it waits for its room back."""
 
     def stats(self) -> Stats: ...
     def end(self) -> Stats:
@@ -236,6 +237,26 @@ class Pin:
         """Its bytes were just copied: a set with a fill runs it, then `filled()`."""
 
     def filled(self) -> None: ...
+    def __dlpack__(
+        self,
+        *,
+        stream: int | None = None,
+        max_version: tuple[int, int] | None = None,
+        dl_device: tuple[int, int] | None = None,
+        copy: bool | None = None,
+    ) -> object: ...
+    def __dlpack_device__(self) -> tuple[int, int]: ...
+    def window(self) -> Window:
+        """The same bytes holding no pin: valid only while the block is bound."""
+
+class Window:
+    """A block's bytes without a pin (`Pin.window`): its tensors are valid only while the block is
+    bound, and the pin that binds it orders their consumers."""
+
+    @property
+    def ptr(self) -> int: ...
+    @property
+    def len(self) -> int: ...
     def __dlpack__(
         self,
         *,

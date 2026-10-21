@@ -321,6 +321,72 @@ def capping(mem: Memory, unet: UNet2DConditionModel) -> None:
     check("cap: within a pass it never falls", len(caps) == 6 and rising, seen)
 
 
+def costs(mem: Memory, unet: UNet2DConditionModel) -> None:
+    """Microseconds per warm bind and per pass, varena's and the adapter's (a warm bind attaches
+    the views it kept; a pass is varena's pass_ and end, and the adapter's open and close)."""
+    model, n = mem.models[unet], 200
+    block = max(model.blocks.values(), key=lambda b: len(b.tensors))
+    stream = torch.cuda.current_stream(mem.device).cuda_stream if CUDA else 0
+    mem._enter(block)
+    mem._exit(block)
+
+    def each(f: object) -> float:
+        began = time.perf_counter_ns()
+        for _ in range(n):
+            f()  # type: ignore[operator]
+        return (time.perf_counter_ns() - began) / n / 1e3
+
+    native_bind = each(lambda: mem.native.bind(model.id, block.region, stream))
+    adapter_bind = each(lambda: (mem._enter(block), mem._exit(block)))
+    with mem.request("costs", plan=[unet]) as r:
+        def native_pass() -> None:
+            r.native.pass_(model.id, "costs", "1", *mem.torch.now()).end(0, 0, [], *mem.torch.now())
+
+        def adapter_pass() -> None:
+            mem._open(model, "costs", (), {})
+            mem._close(model)
+
+        varena_pass, open_close = each(native_pass), each(adapter_pass)
+    print(f"COST warm bind {native_bind:.0f} us varena, {adapter_bind:.0f} us through the adapter ({len(block.tensors)} tensors); "
+          f"pass {varena_pass:.0f} us varena, {open_close:.0f} us through the adapter (its common's bind included)", flush=True)
+
+
+def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> weakref.ref[Memory]:
+    """On host pages (the same bytes, the same kernels), a warm forward through the adapter costs
+    at most 10% more CPU than the plain model's. Its own table and model, every block a hit;
+    the best of several tries each, interleaved, so the shared machine's load is not the
+    measurement."""
+    mem = opened(f"{tag}-overhead", 1 << 31)
+    unet = loaded(ck, mem)
+    x, text = inputs(torch.device("cpu"), 0)
+
+    def plain_run() -> None:
+        with torch.no_grad():
+            for _ in range(3):
+                plain(x, 3, encoder_hidden_states=text)
+
+    def served() -> None:
+        with mem.request("overhead", plan=[unet] * 3) as r, torch.no_grad():
+            for _ in range(3):
+                unet(x, 3, encoder_hidden_states=text)
+        origins.update(ref.origin for ref in r.stats().trace)
+
+    origins: set[str] = set()
+    plain_run()
+    served()
+    origins.clear()
+    best = [float("inf"), float("inf")]
+    for _ in range(11):
+        for i, run_ in enumerate((plain_run, served)):
+            began = time.process_time()
+            run_()
+            best[i] = min(best[i], time.process_time() - began)
+    costs(mem, unet)
+    ratio = best[1] / best[0]
+    check(f"overhead: a warm forward through the adapter costs {100 * (ratio - 1):+.1f}% CPU over plain (at most +10%)", ratio <= 1.10 and origins == {"hit"}, (best, origins))
+    return weakref.ref(mem)
+
+
 def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tuple[list[torch.Tensor], list[int], int, int, weakref.ref[Memory]]:
     """Room for it all: against the plain model, held, entries, identity, concurrency, attempts.
     Returns the reference outputs, the region spans, the measured room, the base (contexts and
@@ -346,7 +412,7 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
             measured.append(r.measured())
 
         probe = unet.conv_in.register_forward_pre_hook(seen)
-        with r.yielding():  # a wait on a child call gives the request's room back meanwhile
+        with r.yielding("standalone"):  # a wait on a child call gives the request's room back meanwhile
             x, _ = inputs(mem.device, 0)
         with torch.no_grad():
             got = unet.conv_in(x).cpu()
@@ -358,7 +424,7 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     check("entries: each entry is its own pass key", keys == ["conv_in", ""], keys)
     steps = r.stats().steps
     with mem.request("between") as between:
-        level = between.cut("split")  # package code between passes: the request's memo answers
+        level = between.cut("split", "1x4x8x8")  # package code between passes: the request's memo answers
         answer = between.oom(None, None)  # and an OOM there has no pass to cut
     check("between passes: a cut is answered from the request's memo", level == 0, level)
     check("between passes: an OOM is answered, never refused", isinstance(answer, native.Next), answer)
@@ -377,6 +443,8 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     concurrent(mem, ck)
     attempts(mem, ck)
     capping(mem, unet)
+    if CUDA:
+        costs(mem, unet)
     spans = model.set.spans
     return reference, spans, stats.peak - sum(spans), base, weakref.ref(mem)
 
@@ -425,6 +493,8 @@ def main() -> int:
     tag = f"varena-standalone-{os.getpid()}"
     reference, spans, room, base, memory = ample(ck, plain, tag)
     gone(memory, "ample")
+    if not CUDA:
+        gone(overhead(ck, plain, tag), "overhead")
     ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
     blocks = sorted(spans[1:])
     # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.
