@@ -28,11 +28,11 @@ jobs:
       # cozy-runtime #1646): Runtime 0.30 on the hard cut. Source pins distinguish development
       # wheels of one version.
       runtime_ref: e3feaa744f31baf8e7a67e55dcbe2dd09ef52111
-      # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below. varena's
-      # placement under a declared plan runs first, on the wheel with CPU torch.
+      # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below. varena
+      # standalone under Diffusers runs first, on the wheel with CPU torch.
       test: >-
-        uv pip install --python "$TENSORFS_TEST_PYTHON" torch &&
-        "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/varena-plan.py &&
+        uv pip install --python "$TENSORFS_TEST_PYTHON" --torch-backend cpu torch diffusers &&
+        "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/varena-standalone.py &&
         python3 scripts/cargo-test-binaries.py --self-test &&
         python3 scripts/cargo-test-binaries.py
 

@@ -1,10 +1,9 @@
 //! tensorfs-py: the `tensorfs` wheel's compiled half. It marshals; every byte-level fact comes
 //! from `tensorfs` and `varena`. Torch stays outside: tensors cross as DLPack.
 
+mod ceiling;
 mod cleanup;
 mod errors;
-#[cfg_attr(windows, path = "varena_windows.rs")]
-mod varena;
 #[cfg(feature = "store")]
 mod classref;
 #[cfg(feature = "store")]
@@ -21,6 +20,8 @@ mod dlpack_source;
 mod verification;
 #[cfg(feature = "store")]
 mod resident_decode;
+#[cfg(feature = "store")]
+mod varena;
 
 use pyo3::prelude::*;
 
@@ -38,6 +39,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     errors::install(m)?;
     cleanup::install(m)?;
+    ceiling::install(m)?;
     m.add("__version__", python_distribution_version())?;
     // The store format every process on the machine shares.
     m.add("STORE_FORMAT", tensorfs::STORE_FORMAT)?;
@@ -45,5 +47,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     store::install(m)?;
     #[cfg(feature = "store")]
     credentials::install(m)?;
-    varena::install(m)
+    #[cfg(feature = "store")]
+    varena::install(m)?;
+    Ok(())
 }
