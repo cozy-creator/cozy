@@ -19,12 +19,15 @@ its capacity is lowered by the standalone limit, and the uncapped GPU run is the
 from __future__ import annotations
 
 import ast
+import faulthandler
 import gc
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import tensorfs
@@ -56,6 +59,18 @@ results: list[bool] = []
 def check(name: str, ok: object, detail: object = "") -> None:
     results.append(bool(ok))
     print(f"{'PASS' if ok else 'FAIL'} {name}" + ("" if ok else f": {detail}"), flush=True)
+
+
+def watch() -> None:
+    """Diagnostics only, never a failure: every thread's Python stack after a minute with no new
+    check (a minute: far above any one check's time here, and few enough dumps to read)."""
+    seen = -1
+    while True:
+        time.sleep(60)
+        if len(results) == seen:
+            print(f"STALL no check in 60 s after {seen}; every thread's stack:", flush=True)
+            faulthandler.dump_traceback(file=sys.stdout, all_threads=True)
+        seen = len(results)
 
 
 def build(store: Path) -> tuple[UNet2DConditionModel, tensorfs.Checkpoint]:
@@ -199,13 +214,20 @@ def main() -> int:
         run(mem, unet, reference[:1], "held", SAME)
     check("hold: released, placeholders are back", isinstance(unet.down_blocks[0].attentions[0].proj_in.weight, Placeholder))
     keys: list[str] = []
-    probe = unet.conv_in.register_forward_pre_hook(lambda *_: keys.append(adapter._pass.get().shape))
-    with mem.request("entries", plan=[unet, unet]):
-        x, _ = inputs(mem.device, 0)
+    measured: list[bool] = []
+    with mem.request("entries", plan=[unet, unet]) as r:
+        def seen(*_: object) -> None:
+            keys.append(adapter._pass.get().shape)
+            measured.append(r.measured())
+
+        probe = unet.conv_in.register_forward_pre_hook(seen)
+        with r.yielding():  # a wait on a child call gives the request's room back meanwhile
+            x, _ = inputs(mem.device, 0)
         with torch.no_grad():
             got = unet.conv_in(x).cpu()
         forward(unet, mem.device, 0)
     probe.remove()
+    check("entries: a new entry's room is estimated, a measured shape's is measured", measured == [False, True], measured)
     diff = (got - plain.conv_in(x.cpu()).detach()).abs().max().item()
     check(f"entries: a direct child's forward runs bound (max diff {diff:.2e})", diff <= ACROSS, diff)
     check("entries: each entry is its own pass key", len(keys) == 2 and keys[0].startswith("conv_in|") and keys[1].startswith("|"), keys)
@@ -252,4 +274,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    threading.Thread(target=watch, daemon=True).start()
     sys.exit(child(*sys.argv[2:4], int(sys.argv[4]), sys.argv[5]) if sys.argv[1:2] == ["child"] else main())
