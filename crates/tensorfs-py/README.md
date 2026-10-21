@@ -49,13 +49,55 @@ ecosystem, but they are not part of the safetensors format. To a generic safeten
 the metadata entries above are just arrays with arbitrary names, with no standard relationship
 to the weights they describe.
 
+These conventions grew up one producer at a time:
+
+- **January 2023:** Kohya's sd-scripts [v0.4.0](https://github.com/kohya-ss/sd-scripts/releases/tag/v0.4.0)
+  saves each LoRA module's `alpha`, which sets its scale `alpha / rank`, as a scalar `<module>.alpha` tensor.
+- **April 2023:** bitsandbytes 0.38.0 ([#159](https://github.com/bitsandbytes-foundation/bitsandbytes/pull/159))
+  saves LLM.int8() row scales as `<layer>.SCB` tensors.
+- **November 2023:** bitsandbytes 0.41.2 ([#753](https://github.com/bitsandbytes-foundation/bitsandbytes/pull/753))
+  adds the 4-bit `quant_state.bitsandbytes__nf4` (or `__fp4`), `absmax` and `quant_map` tensors.
+  Transformers [v4.37.0](https://github.com/huggingface/transformers/releases/tag/v4.37.0) saves and loads
+  4-bit models with them from January 2024 ([#26037](https://github.com/huggingface/transformers/pull/26037)).
+- **October 2024:** ComfyUI v0.2.4 [reads scaled FP8 checkpoints](https://github.com/Comfy-Org/ComfyUI/commit/a68bbafddb93d6f111af3d1fc22d3e38ce8186de):
+  per-layer `scale_weight` tensors, flagged by an empty `scaled_fp8` tensor.
+- **November–December 2025:** ComfyUI v0.3.68's [mixed-precision system](https://github.com/Comfy-Org/ComfyUI/pull/10498)
+  records each layer's format as `_quantization_metadata` JSON in the file header; v0.4.0
+  [stores it](https://github.com/Comfy-Org/ComfyUI/pull/11000) in a `<layer>.comfy_quant` tensor instead.
+
 Two tools can both support safetensors and still disagree about how to reconstruct the model.
 A valid file is not enough: compatibility depends on finding a loader that implements the
 writer's conventions. A matching loader can read it reliably; a different loader may reject
 it or misinterpret its contents. The `.safetensors` extension alone does not establish that
 shared contract.
 
-cozytensors makes that meaning part of the format: each logical tensor declares its encoding,
+These mismatches have caused real failures. In each case below the tensors were readable; the
+code using them assumed a different convention from the one they were stored in.
+
+**Layout:** the names, arrangement and orientation of the arrays.
+
+| Convention | What went wrong | Why the file could not tell |
+|---|---|---|
+| Llama's per-head Q/K row permutation for rotary embeddings | llama.cpp's NVFP4 converter skipped the permutation its BF16 path applies; models produced gibberish, perplexity 4,419 instead of 43.9 ([#22611](https://github.com/ggml-org/llama.cpp/pull/22611)). | Permuted rows have the same shape and dtype. |
+| Modulation order: BFL's `[shift, scale]`, Diffusers' `[scale, shift]` | Diffusers' Kohya Flux LoRA converter swapped the halves of both LoRA factors, not just `lora_B`, silently corrupting the final layer's modulation ([#14001](https://github.com/huggingface/diffusers/pull/14001)). | Both halves have the same shape. |
+| GPT-2's `Conv1D` stores weights `[in, out]`, the transpose of `nn.Linear` | Importers such as [nanoGPT](https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L246-L247) transpose them. PEFT's DoRA unmerge omitted the transpose and silently corrupted square weights such as `c_proj` ([#3531](https://github.com/huggingface/peft/issues/3531)). | A square matrix and its transpose have the same shape. |
+| gpt-oss fuses gate and up projections, interleaved | slime's converter emitted separate `gate_proj`/`up_proj` and an untransposed `down_proj`; SGLang then generated gibberish ([#1840](https://github.com/THUDM/slime/issues/1840)). | In gpt-oss-20b, `down_proj` is square (2880×2880). |
+| gpt-oss expert names | torchtitan exported unquantized experts under the MXFP4 `*_blocks` names; Transformers re-initialized every routed expert at random, reported only in its load warnings ([#4996](https://github.com/pytorch/torchtitan/issues/4996)). | Only the tensor names indicate which of the two layouts a file uses. |
+| LoRA key names (Kohya, Diffusers, PEFT) | ComfyUI did not recognize Diffusers-trained SD3 LoRA keys and skipped them with "lora key not loaded" warnings ([#3701](https://github.com/Comfy-Org/ComfyUI/issues/3701)) until [support was added](https://github.com/Comfy-Org/ComfyUI/commit/ac151ac1698624bc4e321addb8c126069aced4b0). | Key naming is a trainer's convention. |
+
+**Quantization:** how stored values become weights.
+
+| Convention | What went wrong | Why the file could not tell |
+|---|---|---|
+| GPTQ zero points: v1 stores `zero − 1`, v2 stores `zero` | vLLM read GPTQ v2 checkpoints as v1 and generated repeated `!!!` ([#26343](https://github.com/vllm-project/vllm/issues/26343), fixed in [#26092](https://github.com/vllm-project/vllm/pull/26092)). | Both pack zero points into `int32` `qzeros`; only `quantize_config.json` names the format. |
+| NVFP4 scales without ComfyUI's markers | ComfyUI loaded LTX-2.5's official NVFP4 checkpoint as unquantized, discarded its 3,528 scale tensors as unexpected keys, and failed at the first attention projection ([#15511](https://github.com/Comfy-Org/ComfyUI/issues/15511)). | ComfyUI recognizes quantized layers by its own `comfy_quant` keys, which this file did not have. |
+
+cozytensors settles layout once, at import: each component is stored in its class's canonical
+layout, the names, arrangement and orientation of that class's own `state_dict`
+([canonical names](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/spec/cozytensors.md#canonical-names)).
+Readers do not repeat those conversions.
+
+It also makes quantization meaning part of the format: each logical tensor declares its encoding,
 parameters and stored arrays, with specified decoding rules. TensorFS can preserve the encoded
 representation for a compatible compute kernel or decode a supported encoding into ordinary
 tensors. Components, configuration and supporting assets are described in the same checkpoint,
