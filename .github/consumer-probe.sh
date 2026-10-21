@@ -116,8 +116,26 @@ else
   rec "install v0.10.1" 600 env -u COZY_DOWNLOAD_URL sh -c "curl -LsSf $old/cozy-installer.sh | sh"
 fi
 rec "old version" 30 "$cozy" --version
+# A used 0.10.1 Calcifer store: a machine, a run with an output, a failed run.
+rec "0.10.1 machine enable" 600 "$cozy" machine enable
+printf '%s\n' '# /// script' '# requires-python = ">=3.12"' '# dependencies = ["cozy-runtime"]' '# [tool.cozy]' \
+  '# accelerator = false' '# ///' 'from cozy_runtime.author import FileAsset, Outputs' '' \
+  'def main(*, out: Outputs) -> FileAsset:' '    return out.save_bytes(b"a small file", media_type="text/plain")' > small.py
+rec "0.10.1 run with an output" 900 "$cozy" run ./small.py
+rec "0.10.1 failed run" 300 "$cozy" run fidika/sdxl/generate prompt=x seed=1
+rec "0.10.1 run list" 60 "$cozy" run list
 rec "update" 600 "$cozy" update
 rec "new version" 30 "$cozy" --version
 rec "status after update" 120 "$cozy" status
+rec "run list after update" 60 "$cozy" run list
+python=python3; [ $win = 1 ] && python=python
+rec "store after update" 60 $python -I -c '
+import os, sqlite3
+db = sqlite3.connect(os.path.expanduser("~/.cozy/calcifer/state.db"))
+cols = lambda t: [r[1] for r in db.execute(f"PRAGMA table_info({t})")]
+print("user_version", db.execute("PRAGMA user_version").fetchone()[0])
+print("runs.agreed", "agreed" in cols("runs"), "outputs.checkpoint", "checkpoint" in cols("outputs"))
+print("runs", db.execute("SELECT count(*) FROM runs").fetchone()[0], "outputs", db.execute("SELECT count(*) FROM outputs").fetchone()[0])'
+rec "machine after update" 120 "$cozy" machine show local
 rec "uninstall after upgrade" 300 "$cozy" uninstall --yes
 exit 0
