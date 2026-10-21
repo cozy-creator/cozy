@@ -450,7 +450,7 @@ fn fidelity(term: &str) -> Result<String, String> {
 
 /// Submits, then follows the run (or prints it at once with `detach`).
 async fn send(ctx: &Context, submission: SubmitRun, key: &str, detach: bool) -> Result<Run, Error> {
-    let submitted = submit(ctx, submission, Some(key)).await?;
+    let submitted = submit(ctx, submission, Some(key), detach).await?;
     follow(ctx, submitted.run, detach).await
 }
 

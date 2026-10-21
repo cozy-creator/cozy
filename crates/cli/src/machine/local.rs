@@ -474,7 +474,7 @@ async fn adopting(ctx: &Context, version: &str) -> Result<Adopted, Error> {
         out: None,
         warnings: vec![],
     };
-    let run = crate::run::submit(ctx, submit, None).await?.run;
+    let run = crate::run::submit(ctx, submit, None, false).await?.run;
     let mut events = calcifer.events(run.id.as_str(), 0);
     while let Some(event) = events.next().await {
         match event? {

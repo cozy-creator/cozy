@@ -44,7 +44,7 @@ pub async fn exec(
         .next("cozy login <email>"));
     }
     let submission = submission(&run, item, machine, &destination);
-    let submitted = submit(ctx, submission, None).await?;
+    let submitted = submit(ctx, submission, None, false).await?;
     Ok(exit_code(&follow(ctx, submitted.run, detach).await?))
 }
 

@@ -139,7 +139,7 @@ async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Inst
         out: None,
         warnings: vec![],
     };
-    let submitted = submit(ctx, submission, None).await?;
+    let submitted = submit(ctx, submission, None, false).await?;
     let run = settle(ctx, submitted.run).await?;
     let result = run.result.clone().unwrap_or_default();
     let installed = installed(run)?;

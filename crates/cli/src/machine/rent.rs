@@ -56,81 +56,21 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         return catalog(ctx, &hub).await;
     };
     let gpus = rent.gpus.unwrap_or(1);
-    admit(ctx, &hub, &sku, gpus).await?;
-    let mut minted = rent.idempotency_key.is_none();
-    let mut key = rent.idempotency_key.unwrap_or_else(mint_key);
-    let ask = |agreed| NewMachine::Rent {
-        sku: sku.clone(),
-        hub: hub.origin.to_string(),
+    let order = Order {
+        sku,
         gpus: rent.gpus,
         disk_gb: rent.disk_gb,
-        image: rent.image_digest.clone(),
-        agreed,
+        image: rent.image_digest,
+        key: rent.idempotency_key,
+        detach: rent.detach,
     };
-    let calcifer = ctx.calcifer().await?;
-    let (rented, machine) = loop {
-        // The Hub's price for exactly this order, agreed before it is placed or resumed.
-        let quote: Quote = calcifer.post("/v1/rental-quotes", &ask(None), None).await?;
-        if !agree(ctx, &price(&sku, gpus, &quote))? {
+    let (rented, machine) = match self::order(ctx, &hub, order).await? {
+        Ordered::Placed(rented, machine) => (rented, machine),
+        Ordered::Declined => {
             output::say(ctx, "nothing was rented");
             return Ok(ExitCode::SUCCESS);
         }
-        let agreed = Some(quote.agreed());
-        let rented: Rented = match calcifer
-            .post("/v1/machines", &ask(agreed), Some(&key))
-            .await
-        {
-            // An answer lost on the way back may still have placed the order: only its key resumes it.
-            Err(e) if minted && matches!(e.kind, Kind::Unavailable | Kind::Internal) => {
-                return Err(e.remedy(format!(
-                    "the order may stand; resume it (never a second one) with \
-                     `cozy machine rent {sku} --idempotency-key {key}`"
-                )));
-            }
-            answer => answer?,
-        };
-        let mut notices = Notices::default();
-        for note in notices.fresh(&rented.machine) {
-            output::say(ctx, note);
-        }
-        if let Some(asked) = rent.disk_gb.filter(|asked| rented.quote.disk_gb < *asked) {
-            output::warn(&format!(
-                "the Hub plans a {} GB disk, below the {asked} GB asked",
-                rented.quote.disk_gb
-            ));
-        }
-        if rented.replay {
-            output::say(ctx, "this order was placed already; following it");
-        }
-        if rent.detach {
-            let machine = rented.machine.clone();
-            break (rented, machine);
-        }
-        match follow(ctx, rented.machine.clone(), notices).await {
-            Ok(Some(machine)) => break (rented, machine),
-            Ok(None) => return Ok(ExitCode::SUCCESS),
-            // Every machine at the agreed price went before one was bought. An agreed price is
-            // never exceeded: a person agrees to a new quote, and `--yes` fails carrying it.
-            Err(e) if e.code == QUOTE_EXCEEDED => {
-                let gone = format!(
-                    "every {sku} ×{gpus} at the agreed price was taken before one was bought; \
-                     nothing was billed"
-                );
-                if ctx.yes {
-                    let now: Quote = calcifer.post("/v1/rental-quotes", &ask(None), None).await?;
-                    let now = price(&sku, gpus, &now);
-                    return Err(Error::new(
-                        Kind::Conflict,
-                        QUOTE_EXCEEDED,
-                        format!("{gone}. Now: {now}"),
-                    )
-                    .remedy("to rent at the new quote, run the same command again"));
-                }
-                output::say(ctx, &format!("{gone}; a new quote:"));
-                (minted, key) = (true, mint_key());
-            }
-            Err(e) => return Err(e),
-        }
+        Ordered::Unwatched => return Ok(ExitCode::SUCCESS),
     };
     if ctx.json {
         output::json(&Rented { machine, ..rented });
@@ -166,6 +106,110 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// One rental order: what `cozy machine rent` places, and a run `--on new` before it is sent.
+pub(crate) struct Order {
+    pub sku: String,
+    pub gpus: Option<u32>,
+    pub disk_gb: Option<u32>,
+    pub image: Option<String>,
+    /// Resumes the order it names, never a second one; none mints one.
+    pub key: Option<String>,
+    /// Return once the Hub accepts it, without following the boot.
+    pub detach: bool,
+}
+
+pub(crate) enum Ordered {
+    /// The renter said no: nothing was rented.
+    Declined,
+    /// Ctrl-C while it booted: the order goes on, unwatched.
+    Unwatched,
+    /// Accepted (`detach`), else ready.
+    Placed(Rented, Machine),
+}
+
+/// Places `order` at the quote its renter agrees to and, unless detached, follows it until its
+/// machine is ready. When every machine at the agreed price goes before one is bought, a person
+/// is asked again at a fresh quote; `--yes` fails carrying it, never exceeding an agreed price.
+pub(crate) async fn order(ctx: &Context, hub: &Hub, order: Order) -> Result<Ordered, Error> {
+    let Order { sku, gpus: asked_gpus, disk_gb, image, key, detach } = order;
+    let gpus = asked_gpus.unwrap_or(1);
+    admit(ctx, hub, &sku, gpus).await?;
+    let mut minted = key.is_none();
+    let mut key = key.unwrap_or_else(mint_key);
+    let ask = |agreed| NewMachine::Rent {
+        sku: sku.clone(),
+        hub: hub.origin.to_string(),
+        gpus: asked_gpus,
+        disk_gb,
+        image: image.clone(),
+        agreed,
+    };
+    let calcifer = ctx.calcifer().await?;
+    loop {
+        // The Hub's price for exactly this order, agreed before it is placed or resumed.
+        let quote: Quote = calcifer.post("/v1/rental-quotes", &ask(None), None).await?;
+        if !agree(ctx, &price(&sku, gpus, &quote))? {
+            return Ok(Ordered::Declined);
+        }
+        let agreed = Some(quote.agreed());
+        let rented: Rented = match calcifer
+            .post("/v1/machines", &ask(agreed), Some(&key))
+            .await
+        {
+            // An answer lost on the way back may still have placed the order: only its key resumes it.
+            Err(e) if minted && matches!(e.kind, Kind::Unavailable | Kind::Internal) => {
+                return Err(e.remedy(format!(
+                    "the order may stand; resume it (never a second one) with \
+                     `cozy machine rent {sku} --idempotency-key {key}`"
+                )));
+            }
+            answer => answer?,
+        };
+        let mut notices = Notices::default();
+        for note in notices.fresh(&rented.machine) {
+            output::say(ctx, note);
+        }
+        if let Some(asked) = disk_gb.filter(|asked| rented.quote.disk_gb < *asked) {
+            output::warn(&format!(
+                "the Hub plans a {} GB disk, below the {asked} GB asked",
+                rented.quote.disk_gb
+            ));
+        }
+        if rented.replay {
+            output::say(ctx, "this order was placed already; following it");
+        }
+        if detach {
+            let machine = rented.machine.clone();
+            return Ok(Ordered::Placed(rented, machine));
+        }
+        match follow(ctx, rented.machine.clone(), notices).await {
+            Ok(Some(machine)) => return Ok(Ordered::Placed(rented, machine)),
+            Ok(None) => return Ok(Ordered::Unwatched),
+            // Every machine at the agreed price went before one was bought. An agreed price is
+            // never exceeded: a person agrees to a new quote, and `--yes` fails carrying it.
+            Err(e) if e.code == QUOTE_EXCEEDED => {
+                let gone = format!(
+                    "every {sku} ×{gpus} at the agreed price was taken before one was bought; \
+                     nothing was billed"
+                );
+                if ctx.yes {
+                    let now: Quote = calcifer.post("/v1/rental-quotes", &ask(None), None).await?;
+                    let now = price(&sku, gpus, &now);
+                    return Err(Error::new(
+                        Kind::Conflict,
+                        QUOTE_EXCEEDED,
+                        format!("{gone}. Now: {now}"),
+                    )
+                    .remedy("to rent at the new quote, run the same command again"));
+                }
+                output::say(ctx, &format!("{gone}; a new quote:"));
+                (minted, key) = (true, mint_key());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// What the Hub says of a rental for a person to know: why it runs off the requester's continent,
 /// and, to an admin, that its prepaid provider account runs low. The Hub places a rental after it
 /// accepts the order, so a follower says each once it appears.
@@ -190,7 +234,7 @@ impl Notices {
 
 /// The price the order is held to, in the catalog's terms: $/HOUR (the machine and its disk) and
 /// EXPECTED (the Hub's assumed hours and download, with its traffic).
-pub(crate) fn price(sku: &str, gpus: u32, q: &Quote) -> String {
+fn price(sku: &str, gpus: u32, q: &Quote) -> String {
     let mut line = format!(
         "{sku} ×{gpus}: {}/h ({} GPU + {} for a {} GB disk)",
         usd(q.hourly()),
@@ -211,7 +255,7 @@ pub(crate) fn price(sku: &str, gpus: u32, q: &Quote) -> String {
 
 /// The renter's yes to the quote `said`: `--yes`, else a person's on a terminal (a no is `false`).
 /// With neither nothing is rented, and the refusal carries the quote, in text and JSON.
-pub(crate) fn agree(ctx: &Context, said: &str) -> Result<bool, Error> {
+fn agree(ctx: &Context, said: &str) -> Result<bool, Error> {
     if ctx.yes {
         output::say(ctx, said);
         return Ok(true);

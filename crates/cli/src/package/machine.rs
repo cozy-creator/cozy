@@ -41,6 +41,7 @@ async fn submit(
     kind: calcifer::Kind,
     target: String,
     spec: v1::RunSpec,
+    detach: bool,
 ) -> Result<Run, Error> {
     let ask = SubmitRun {
         agreed: None,
@@ -53,7 +54,7 @@ async fn submit(
         out: None,
         warnings: vec![],
     };
-    Ok(run::submit(ctx, ask, None).await?.run)
+    Ok(run::submit(ctx, ask, None, detach).await?.run)
 }
 
 /// Waits for `run` to settle, quietly: the verb reports the outcome itself.
@@ -101,7 +102,7 @@ pub async fn install(
     };
     let warm = spec(v1::RunKind::Warm, release(&name, &chosen), String::new());
     let target = format!("{name}@{chosen}");
-    let submitted = submit(ctx, on, &hub.origin, calcifer::Kind::Warm, target, warm).await?;
+    let submitted = submit(ctx, on, &hub.origin, calcifer::Kind::Warm, target, warm, detach).await?;
     installed(ctx, submitted, &name, detach).await
 }
 
@@ -131,7 +132,7 @@ pub async fn install_directory(
         out: None,
         warnings: vec![],
     };
-    let submitted = run::submit(ctx, ask, None).await?.run;
+    let submitted = run::submit(ctx, ask, None, detach).await?.run;
     installed(ctx, submitted, &local.package, detach).await
 }
 
@@ -406,6 +407,7 @@ pub async fn remove(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
                 calcifer::Kind::Remove,
                 package.to_owned(),
                 spec,
+                false,
             )
             .await?,
         )
@@ -509,6 +511,7 @@ pub async fn update(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
                 calcifer::Kind::Warm,
                 package.to_owned(),
                 warm,
+                false,
             )
             .await?,
         )
@@ -536,7 +539,7 @@ pub async fn update(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
             let removal = spec(v1::RunKind::Remove, source, String::new());
             let ran = settle(
                 ctx,
-                submit(ctx, on(), hub, calcifer::Kind::Remove, target, removal).await?,
+                submit(ctx, on(), hub, calcifer::Kind::Remove, target, removal, false).await?,
             )
             .await?;
             row.status = "updated";

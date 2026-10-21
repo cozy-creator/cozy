@@ -71,7 +71,7 @@ async fn run(ctx: &Context, args: &Args, target: String, spec: RunSpec) -> Resul
         out: None,
         warnings: vec![],
     };
-    let submitted = crate::run::submit(ctx, submit, None).await?;
+    let submitted = crate::run::submit(ctx, submit, None, false).await?;
     crate::run::follow(ctx, submitted.run, false).await
 }
 

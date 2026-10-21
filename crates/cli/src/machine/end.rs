@@ -311,7 +311,7 @@ pub async fn update(
         out: None,
         warnings: vec![],
     };
-    let submitted = crate::run::submit(ctx, submit, None).await?;
+    let submitted = crate::run::submit(ctx, submit, None, false).await?;
     let run = crate::run::follow(ctx, submitted.run, false).await?;
     if dev && m.kind == MachineKind::Local && run.status == calcifer::Status::Completed {
         // `local` runs the installed cozy, the dev binary now: Calcifer runs it too.
@@ -366,7 +366,7 @@ pub async fn toolchain(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
         out: None,
         warnings: vec![],
     };
-    let submitted = crate::run::submit(ctx, submit, None).await?;
+    let submitted = crate::run::submit(ctx, submit, None, false).await?;
     let run = crate::run::follow(ctx, submitted.run, false).await?;
     Ok(crate::run::exit_code(&run))
 }

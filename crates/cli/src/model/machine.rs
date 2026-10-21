@@ -106,7 +106,7 @@ async fn warm(
         out: None,
         warnings: vec![],
     };
-    let submitted = crate::run::submit(ctx, submit, None).await?;
+    let submitted = crate::run::submit(ctx, submit, None, detach).await?;
     let run = crate::run::follow(ctx, submitted.run, detach).await?;
     made(ctx, &run);
     Ok(crate::run::exit_code(&run))

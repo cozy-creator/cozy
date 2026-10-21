@@ -174,6 +174,36 @@ fn a_rent_says_its_quote_before_it_is_placed() {
     assert_eq!(ended["machine"]["state"], "ended", "{ended}");
 }
 
+/// A run `--on new` rents as `cozy machine rent` does, through the same order: the same quote and
+/// question on a terminal, and a no rents nothing and sends no run. On the Hub's docker provider.
+#[cfg(unix)]
+#[test]
+fn a_run_that_rents_is_asked_as_a_rent_is() {
+    let Some(home) = Home::with_hub() else { return };
+    home.sign_in("run-rents@example.com");
+    let package = common::package::publish(&home, "tiny", "0.1.0");
+    let mut command = home.command();
+    command.args(["run", &format!("{package}/echo"), "text=hi", "--on", "new:cpu"]);
+    let mut asked = common::pty::Pty::spawn(&command);
+    let screen = asked.until("the quote and its question", |s| s.contains("Rent it? [Y/n]"));
+    assert!(
+        screen.contains("cpu ×1: $") && screen.contains("; expected $"),
+        "{screen}"
+    );
+    asked.key("n\r");
+    assert!(!asked.wait().success());
+    assert!(
+        asked.screen().contains("nothing was rented and the run was not sent"),
+        "{}",
+        asked.screen()
+    );
+    let listed = home.json(["machine", "list", "--json"]);
+    let machines = listed["machines"].as_array().unwrap();
+    assert!(!machines.iter().any(|m| m["kind"] == "rental"), "{listed}");
+    let runs = home.json(["run", "list", "--json"]);
+    assert_eq!(runs["runs"].as_array().map(Vec::len), Some(0), "{runs}");
+}
+
 /// With the Hub's docker provider (Tensorhub's dev-build `hub_set`), a CPU rental is quoted and asked
 /// once under its key, seen booting, and ended only when the Hub affirms its container gone. Nothing
 /// is bought from a provider.

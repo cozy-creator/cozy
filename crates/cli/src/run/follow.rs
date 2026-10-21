@@ -19,29 +19,28 @@ use protocol::{
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
+use sha2::{Digest as _, Sha256};
+
 use crate::{
     Context,
     calcifer_client::Client,
-    machine::{Following, Notices, route},
+    machine::{Following, Notices, Order, Ordered, route},
     output,
 };
 
-/// Submits under `key`, or a fresh one: one key names one submission forever. A run that rents
-/// carries the quote its renter agreed to (`machine::agree`).
+/// Submits under `key`, or a fresh one: one key names one submission forever. A run `--on new`
+/// first rents its machine as `cozy machine rent` does (`machine::order`), then is sent to it.
 pub(crate) async fn submit(
     ctx: &Context,
     mut run: SubmitRun,
     key: Option<&str>,
+    detach: bool,
 ) -> Result<Submitted, Error> {
     let key = key.map_or_else(mint_key, str::to_owned);
     let calcifer = ctx.calcifer().await?;
-    if matches!(run.on, On::New(_)) && run.agreed.is_none() {
-        let quoted: RunQuote = calcifer.post("/v1/run-quotes", &run, None).await?;
-        let said = crate::machine::price(&quoted.sku, quoted.gpus.unwrap_or(1), &quoted.quote);
-        if !crate::machine::agree(ctx, &said)? {
-            return Err(Error::new(Kind::Usage, "quote_declined", "nothing was rented and the run was not sent"));
-        }
-        run.agreed = Some(quoted.quote.agreed());
+    if let On::New(sku) = &run.on {
+        let machine = rent(ctx, &calcifer, &run, sku.clone(), &key, detach).await?;
+        (run.on, run.agreed) = (On::Machine(machine), None);
     }
     let submitted = calcifer.submit(&key, &run).await?;
     if submitted.replay {
@@ -54,6 +53,49 @@ pub(crate) async fn submit(
         );
     }
     Ok(submitted)
+}
+
+/// Rents the machine a `new` run is sent to: the product it names, else the one the Hub places
+/// the run on. The rental's key derives from the run's, so a retried submission resumes its
+/// rental rather than buying another. Ready unless `detach`: a booting one queues the run.
+async fn rent(
+    ctx: &Context,
+    calcifer: &Client,
+    run: &SubmitRun,
+    sku: Option<String>,
+    key: &str,
+    detach: bool,
+) -> Result<String, Error> {
+    let gpus = (run.spec.gpus > 0).then_some(run.spec.gpus);
+    let (sku, gpus) = match sku {
+        Some(sku) => (sku, gpus),
+        None => {
+            let placed: RunQuote = calcifer.post("/v1/run-quotes", run, None).await?;
+            (placed.sku, placed.gpus)
+        }
+    };
+    let order = Order {
+        sku,
+        gpus,
+        disk_gb: None,
+        image: None,
+        key: Some(format!("run-{}", &hex::encode(Sha256::digest(key))[..32])),
+        detach,
+    };
+    match crate::machine::order(ctx, &ctx.hub()?, order).await? {
+        Ordered::Placed(_, machine) => Ok(machine.name),
+        Ordered::Declined => Err(Error::new(
+            Kind::Usage,
+            "quote_declined",
+            "nothing was rented and the run was not sent",
+        )),
+        Ordered::Unwatched => Err(Error::new(
+            Kind::Usage,
+            "run_unsent",
+            "stopped watching the rental before it was ready; the run was not sent",
+        )
+        .next("cozy machine list")),
+    }
 }
 
 /// A fresh idempotency key.
