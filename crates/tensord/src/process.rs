@@ -2,8 +2,9 @@
 //! (births, exact handles, groups, meters) is `platform::process`. Nothing here kills
 //! because time passed. Callers kill on a measured wedge (`Pace`), an owner restart, or a launch
 //! that never reached authored code.
-use platform::process::{Birth, Exact, State, gone, group_members, meter, read_bytes};
+use platform::process::{Birth, Exact, State, gone, group_members, meter, read_bytes, threads};
 use std::{
+    collections::HashMap,
     fs::File,
     io,
     process::{Child, ExitStatus},
@@ -127,7 +128,8 @@ pub enum Meter {
     /// Frames of the running invocation; a canceled one must stop within its pace's patience.
     Frames,
     /// A GPU invocation's work, judged while it runs: frames, bytes moved, GPU kernels and
-    /// copies, or CPU above 1.5 cores. One spinning core is not progress (runs 11818, 11822).
+    /// copies, or CPU on more than one thread. One spinning thread is not progress (runs 11818,
+    /// 11822).
     Work,
 }
 
@@ -176,8 +178,9 @@ impl Watch {
             Meter::Frames | Meter::Work => Pace::seeded(worst_gap),
             Meter::Burn => Pace::default(),
         };
-        // A GPU call's samples whose group CPU ran above one core, and its last CPU reading.
-        let (mut cores, mut last_cpu) = (0, None);
+        // A GPU call's samples whose CPU ran on more than one thread, and each thread's last
+        // reading.
+        let (mut breadth, mut last) = (0, std::collections::HashMap::new());
         let mut state = self.state.lock().unwrap();
         while !state.done {
             let now = Instant::now();
@@ -201,14 +204,18 @@ impl Watch {
                 Meter::Burn => group_burn(exact.birth()),
                 Meter::Frames => Some(state.frames),
                 Meter::Work => self.activity.as_ref().and_then(|activity| activity()).map(|gpu| {
-                    let (cpu, moved) = group_meter(exact.birth()).unwrap_or_default();
-                    // CPU on more than one core is work (1.5 cores leaves room for sampling skew):
-                    // real CPU phases (torch intra-op, ffmpeg, BLAS) run many threads, a spin one,
+                    let (_, moved) = group_meter(exact.birth()).unwrap_or_default();
+                    // CPU counts by its breadth, never as cores: two or more threads each ran at
+                    // least half as much as the busiest, however much CPU the machine had to give.
+                    // Real CPU phases (torch intra-op, ffmpeg, BLAS) run many threads, a spin one,
                     // and a missed kill beats killing a real run.
-                    if let Some((before, at)) = last_cpu.replace((cpu, now)) {
-                        cores += u64::from(u128::from(cpu.saturating_sub(before)) * 2 > (now - at).as_nanos() * 3);
-                    }
-                    gpu + state.frames + moved + cores
+                    let members = group_members(exact.birth()).into_iter().map(|member| member.pid);
+                    let ran: HashMap<u32, u64> = std::iter::once(exact.birth().pid).chain(members).filter_map(threads).flatten().collect();
+                    let deltas: Vec<u64> = ran.iter().filter_map(|(tid, ns)| Some(ns.saturating_sub(*last.get(tid)?))).collect();
+                    let busiest = deltas.iter().copied().max().unwrap_or_default();
+                    breadth += u64::from(busiest > 0 && deltas.iter().filter(|ns| **ns * 2 >= busiest).count() > 1);
+                    last = ran;
+                    gpu + state.frames + moved + breadth
                 }),
             };
             pace.observe(reading, now);
@@ -223,7 +230,7 @@ impl Watch {
                 let still = now - since;
                 if still > pace.patience(floor) {
                     let measures = match self.meter {
-                        Meter::Work => " (frames, bytes moved, GPU kernels and copies, CPU beyond one core)",
+                        Meter::Work => " (frames, bytes moved, GPU kernels and copies, CPU on more than one thread)",
                         _ => "",
                     };
                     let verdict = format!("wedged during {what}: {}{measures}", pace.verdict(still, floor));
@@ -547,9 +554,9 @@ mod tests {
         assert!(group_members(&birth).is_empty());
     }
 
-    /// A GPU call is judged while it runs on its work: one spinning on one core with no frames,
+    /// A GPU call is judged while it runs on its work: one spinning on one thread with no frames,
     /// no bytes and idle GPUs is killed (runs 11818, 11822); one that moves bytes, whose GPUs
-    /// work, whose GPUs cannot be read or that runs on more than one core is not.
+    /// work, whose GPUs cannot be read or that runs on more than one thread is not.
     #[cfg(unix)]
     #[test]
     fn a_gpu_call_spinning_without_work_is_killed_and_working_ones_are_not() {
@@ -561,9 +568,8 @@ mod tests {
                 Some(Arc::new(move || Some(busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed))))
             }, false),
             ("GPU unread", "while :; do :; done", Some(Arc::new(|| None)), false),
-            // Four spinners: on a runner shared with another test harness, two may get only one
-            // core between them, and that is a spin on one core.
-            ("spins on many cores", "for i in 1 2 3; do (while :; do :; done) & done; while :; do :; done", Some(Arc::new(|| Some(0))), false),
+            // However little CPU a loaded machine gives them, two threads share it.
+            ("spins on two threads", "while :; do :; done & while :; do :; done", Some(Arc::new(|| Some(0))), false),
         ];
         // A shell can fork a CPU spinner. Always end its group, including on an assertion
         // failure: Child::kill only ends the shell and leaves that spinner running.
@@ -593,7 +599,7 @@ mod tests {
             if killed {
                 let verdict = verdict.unwrap();
                 assert!(verdict.contains("wedged during invoke: no measurable progress"), "{case}");
-                assert!(verdict.contains("(frames, bytes moved, GPU kernels and copies, CPU beyond one core)"), "{verdict}");
+                assert!(verdict.contains("(frames, bytes moved, GPU kernels and copies, CPU on more than one thread)"), "{verdict}");
             }
             drop(group);
             assert!(group_members(&birth).iter().all(|member| member.ended().unwrap()), "{case}: the test left a process running");
