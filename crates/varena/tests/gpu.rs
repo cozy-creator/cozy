@@ -115,6 +115,45 @@ fn context_is_measured_and_free_is_the_drivers() {
 
 #[test]
 #[ignore = "native GPU: a rental only"]
+fn process_used_counts_this_processes_pages_and_allocations() {
+    let (b, uuid) = gpu();
+    let reading = platform::gpu::Device::open(&uuid).unwrap().read().unwrap();
+    let how = match reading.processes.is_some_and(|p| p.contains_key(&std::process::id())) {
+        true => "NVML per process",
+        false => "device delta since open",
+    };
+    let len = 64 * b.granularity();
+    let start = b.process_used().unwrap();
+    assert!(start > 0, "this process holds a context");
+    let va = b.reserve(len).unwrap();
+    let page = b.create(len).unwrap();
+    b.map(va, 0, &page, Access::ReadWrite).unwrap();
+    let paged = b.process_used().unwrap();
+    assert!(paged - start >= len, "a {len} byte page moved process bytes by {}", paged - start);
+    let pressure = Pressure::take(len);
+    let allocated = b.process_used().unwrap();
+    assert!(allocated - paged >= len, "a {len} byte allocation moved process bytes by {}", allocated - paged);
+    drop(pressure);
+    unload(&b, va, 0, page);
+    b.release(va);
+    let (mut control, theirs) = UnixStream::pair().unwrap();
+    let mut holder = child("role_holder", "holder", Stdio::from(OwnedFd::from(theirs)));
+    let (kept, len) = receive(&mut control);
+    marked(&mut holder, "HOLDER ");
+    let before = b.process_used().unwrap();
+    let page = b.import(kept, len).unwrap();
+    let va = b.reserve(len).unwrap();
+    b.map(va, 0, &page, Access::Read).unwrap();
+    let imported = b.process_used().unwrap() as i64 - before as i64;
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    unload(&b, va, 0, page);
+    b.release(va);
+    println!("PASS process bytes ({how}) count pages and allocations; a {len} byte imported page moved them {imported} {uuid}");
+}
+
+#[test]
+#[ignore = "native GPU: a rental only"]
 fn pages_fill_protect_unmap_and_survive_a_clean_owner_exit() {
     let (b, uuid) = gpu();
     let len = 2 * b.granularity();
@@ -257,6 +296,17 @@ impl Pressure {
             }
         }
         pressure
+    }
+}
+
+impl Pressure {
+    /// One allocation of `len` bytes.
+    fn take(len: u64) -> Pressure {
+        let (_, ctx) = cuda::primary_context(0).unwrap();
+        let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+        let mut ptr = 0;
+        cuda::check("cuMemAlloc", unsafe { (cuda::driver().unwrap().mem_alloc)(&mut ptr, len as usize) }).unwrap();
+        Pressure { ctx, taken: vec![ptr] }
     }
 }
 
