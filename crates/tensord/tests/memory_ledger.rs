@@ -227,9 +227,11 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
     wakes.recv_timeout(BACKSTOP).expect("a reaped row signals");
     assert!(!gpu.status().rows.iter().any(|row| row.pid == pid && row.live));
     assert!(orphans(&gpu) >= set_bytes, "its kept pages are orphans");
+    // One load path: its load imports what custody keeps, at any level; its binds are hits.
     let mut second = StandIn::spawn(&gpu, &id, "ram");
-    assert_eq!(second.load(), ("Kept,Kept,Kept".into(), set_bytes, 0), "every page imported by fingerprint");
-    assert_eq!(orphans(&gpu), 0);
+    assert_eq!(second.load(), ("Hit,Hit,Hit".into(), 0, 0), "imported at load, not copied");
+    assert_eq!(orphans(&gpu), 0, "every orphan imported by fingerprint");
+    assert!(gpu.maps(second.pid()));
 
     // Peaks persist per GPU model: another GPU of the model starts with them.
     peaks.save(&id.model, std::iter::once(&gpu.ledger));
