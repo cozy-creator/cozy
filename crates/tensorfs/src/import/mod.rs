@@ -461,8 +461,9 @@ fn documents(
 ///   (schedulers, tokenizers, processors), of that library and class as written; a component
 ///   it names no class for has the unknown class.
 /// - Without one, a component named [`ROOT_COMPONENT`] owns the root (a Transformers folder),
-///   and a component's class is its config's ([`class_of`]).
-/// - A class's version is its own config's for its library (`_diffusers_version`,
+///   and a component's class is its config's ([`config_class`]).
+/// - A pair's library is its package for a dotted module path, and `diffusers` for a Diffusers
+///   pipeline module (`stable_diffusion`) ([`class_of`]). A class's version is its own config's for its library (`_diffusers_version`,
 ///   `transformers_version`), else one another config of the model records for that library,
 ///   else `reference`'s (the converter's pinned reference configs), else `""`.
 /// - In a component's folder, the first of [`CONFIGS`] is its config, and the other run files
@@ -529,7 +530,7 @@ pub fn layout(
         }
         let class = match (&pipeline, file) {
             (Some(_), _) => listed.get(&name).cloned().unwrap_or_default(),
-            (None, Some(f)) => class_of(f, &config),
+            (None, Some(f)) => config_class(f, &config),
             (None, None) => ClassRef::default(),
         };
         components.push(Folder {
@@ -540,25 +541,40 @@ pub fn layout(
             assets,
         });
     }
-    let mut model = Versions::new();
+    let mut versions = Versions::new();
     let configs = pipeline.iter().map(|p| &p.config).chain(components.iter().map(|c| &c.config));
-    for (library, version) in configs.flat_map(recorded) {
-        model.entry(library).or_insert(version);
+    for (library, version) in configs.flat_map(recorded).chain(reference.clone()) {
+        versions.entry(library).or_insert(version);
     }
     let classes = (pipeline.iter_mut().map(|p| (&mut p.class, &p.config)))
         .chain(components.iter_mut().map(|c| (&mut c.class, &c.config)));
     for (class, config) in classes.filter(|(class, _)| !class.is_unknown()) {
-        let mut own = recorded(config).filter(|(library, _)| *library == class.library);
-        class.version = (own.next().map(|(_, version)| version))
-            .or_else(|| model.get(&class.library).cloned())
-            .or_else(|| reference.get(&class.library).cloned())
-            .unwrap_or_default();
+        let model = class_of(&class.library, &class.name, &versions);
+        let mut own = recorded(config).filter(|(library, _)| *library == model.library);
+        let version = own.next().map_or(model.version, |(_, version)| version);
+        *class = ClassRef { version, ..model };
     }
     Ok(Layout {
         pipeline,
         components,
         files,
     })
+}
+
+/// A class from a `model_index.json` pair's library and name. The library is:
+/// - a dotted module path's top-level package (`minimax_h3.pipeline` is `minimax_h3`);
+/// - itself when installed: `diffusers`, `transformers`, or one `versions` holds;
+/// - else a Diffusers pipeline module (`stable_diffusion`, `kandinsky`), so `diffusers`.
+///
+/// The version is the one `versions` holds for that library, else `""`. `versions` is the
+/// model's: its configs' records, then the converter reference's.
+pub fn class_of(library: &str, name: &str, versions: &Versions) -> ClassRef {
+    let library = match library.split_once('.') {
+        Some((package, _)) => package,
+        None if matches!(library, "diffusers" | "transformers") || versions.contains_key(library) => library,
+        None => "diffusers",
+    };
+    ClassRef::new(library, versions.get(library).map_or("", String::as_str), name)
 }
 
 /// The library versions a config records: `_<library>_version` or `<library>_version` keys
@@ -606,7 +622,7 @@ fn parse_config(path: &str, bytes: &[u8]) -> Result<Config> {
 /// A component's class without a pipeline, from its config file: Transformers'
 /// `architectures[0]`, Diffusers' `_class_name`, a tokenizer config's `tokenizer_class`; the
 /// unknown class when it names none. [`layout`] adds the version.
-fn class_of(file: &str, config: &Config) -> ClassRef {
+fn config_class(file: &str, config: &Config) -> ClassRef {
     let text = |key: &str| config.get(key).and_then(ConfigValue::as_str);
     let first = (config.get("architectures").and_then(ConfigValue::as_array))
         .and_then(|a| a.first()?.as_str());
