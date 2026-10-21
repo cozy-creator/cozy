@@ -50,11 +50,13 @@ pub const ATTR_PCI_BUS_ID: c_int = 33;
 pub const ATTR_PCI_DEVICE_ID: c_int = 34;
 pub const ATTR_PCI_DOMAIN_ID: c_int = 50;
 pub const ATTR_POSIX_FD_SUPPORTED: c_int = 103;
+pub const ATTR_WIN32_HANDLE_SUPPORTED: c_int = 104;
 
 pub const MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const MEM_LOCATION_TYPE_DEVICE: u32 = 1;
 pub const MEM_HANDLE_TYPE_NONE: u32 = 0;
 pub const MEM_HANDLE_TYPE_POSIX_FD: u32 = 1;
+pub const MEM_HANDLE_TYPE_WIN32: u32 = 2;
 pub const MEM_ACCESS_PROT_READ: u32 = 1;
 pub const MEM_ACCESS_PROT_READWRITE: u32 = 3;
 pub const MEM_GRANULARITY_MINIMUM: u32 = 0;
@@ -118,6 +120,7 @@ pub struct Driver {
     pub device_get_count: F<*mut c_int>,
     pub device_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, CUdevice) -> CUresult,
     pub device_get_uuid: unsafe extern "C" fn(*mut [u8; 16], CUdevice) -> CUresult,
+    pub device_get_name: unsafe extern "C" fn(*mut c_char, c_int, CUdevice) -> CUresult,
     pub primary_ctx_retain: unsafe extern "C" fn(*mut CUcontext, CUdevice) -> CUresult,
     pub ctx_get_current: F<*mut CUcontext>,
     pub ctx_set_current: F<CUcontext>,
@@ -246,6 +249,7 @@ impl Driver {
             device_get_count: load!(lib, b"cuDeviceGetCount"),
             device_get_attribute: load!(lib, b"cuDeviceGetAttribute"),
             device_get_uuid: load!(lib, b"cuDeviceGetUuid_v2"),
+            device_get_name: load!(lib, b"cuDeviceGetName"),
             primary_ctx_retain: load!(lib, b"cuDevicePrimaryCtxRetain"),
             ctx_get_current: load!(lib, b"cuCtxGetCurrent"),
             ctx_set_current: load!(lib, b"cuCtxSetCurrent"),
