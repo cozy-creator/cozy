@@ -546,13 +546,14 @@ impl PyRequest {
     }
 
     /// An op of `set`'s pass (None: outside any pass) ran out of memory, `need` more bytes when
-    /// known, at cut site `site` (None: the op cannot be cut), cut no finer than `finest`, with
-    /// torch's bytes now; a `collective` site's finer level waits for the next pass's agreement.
-    #[pyo3(signature = (set, allocated, reserved, need = None, site = None, collective = false, finest = 0))]
+    /// known, at cut site `site` (None: the op cannot be cut) whose op has shape key `shape`, cut
+    /// no finer than `finest`, with torch's bytes now; a `collective` site's finer level waits
+    /// for the next pass's agreement.
+    #[pyo3(signature = (set, allocated, reserved, need = None, site = None, collective = false, finest = 0, shape = ""))]
     #[allow(clippy::too_many_arguments)]
-    fn oom(&self, py: Python<'_>, set: Option<u32>, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool, finest: u32) -> PyResult<PyNext> {
+    fn oom(&self, py: Python<'_>, set: Option<u32>, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool, finest: u32, shape: &str) -> PyResult<PyNext> {
         let r = self.get(py)?;
-        let site = site.map(|name| Site { name, collective, finest });
+        let site = site.map(|name| Site { name, collective, finest, shape });
         Ok(match detached(py, &self.gpu, || Ok(r.oom(set.map(SetId), need, site, Torch { allocated, reserved })))? {
             Next::Retry => PyNext::Retry(),
             Next::Cut(level) => PyNext::Cut { level },
@@ -568,17 +569,18 @@ impl PyRequest {
     }
 
     /// The cut level of `set`'s current pass for op site `site` (0: whole); with no set (outside
-    /// any pass) the request's own memo of that site.
-    fn cut(&self, py: Python<'_>, set: Option<u32>, site: &str) -> PyResult<u32> {
+    /// any pass) the request's own memo of that site at the op's shape key `shape`.
+    #[pyo3(signature = (set, site, shape = ""))]
+    fn cut(&self, py: Python<'_>, set: Option<u32>, site: &str, shape: &str) -> PyResult<u32> {
         let r = self.get(py)?;
-        detached(py, &self.gpu, || Ok(r.cut(set.map(SetId), site)))
+        detached(py, &self.gpu, || Ok(r.cut(set.map(SetId), site, shape)))
     }
 
-    /// The request waits on a child call: until the guard ends it gives back its reserved room
-    /// and its step's pages may be asked for; ended, it takes its room back.
-    fn yielding(&self, py: Python<'_>) -> PyResult<PyYielded> {
+    /// The request waits on a call of its `family` (a child): until the guard ends it gives back
+    /// its reserved room to that family alone; ended, it waits for its room back.
+    fn yielding(&self, py: Python<'_>, family: &str) -> PyResult<PyYielded> {
         let r = self.get(py)?;
-        Ok(PyYielded(Mutex::new(Some(detached(py, &self.gpu, || Ok(r.yielding()))?))))
+        Ok(PyYielded(Mutex::new(Some(detached(py, &self.gpu, || Ok(r.yielding(family)))?))))
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<PyStats> {

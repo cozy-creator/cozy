@@ -189,8 +189,8 @@ class _Pass:
     reserved_peak: int = 0
     #: each cut site's allocated peak, whether it is a collective's, and its finest level
     sites: dict[str, tuple[int, bool, int]] = field(default_factory=dict)
-    #: cut levels read in this pass, until an oom answer or an agreement changes them
-    cuts: dict[str, int] = field(default_factory=dict)
+    #: cut levels read in this pass per (site, shape), until an oom answer or an agreement
+    cuts: dict[tuple[str, str], int] = field(default_factory=dict)
     open: list[list[object]] = field(default_factory=list)
     #: the exception being handled where it opened: another at its close is a raise
     entered: BaseException | None = None
@@ -583,13 +583,13 @@ class Request:
         """Replaces the plan (as `Memory.request` takes it); its cursor starts over."""
         self.native.plan(self.memory._plan(steps))
 
-    def oom(self, need: int | None = None, site: str | None = None, collective: bool = False, finest: int = 0) -> Next:
+    def oom(self, need: int | None = None, site: str | None = None, collective: bool = False, finest: int = 0, shape: str = "") -> Next:
         """An op ran out of memory: varena's answer, with torch's cap applied after it. `site` is
-        its cut site (None: it cannot be cut), cut no finer than `finest`; a `collective` site's
-        finer level waits for the next pass's agreement. Outside any pass (package code between
-        passes) varena answers with demand and Park, never a Cut."""
+        its cut site (None: it cannot be cut), `shape` the op's shape key, cut no finer than
+        `finest`; a `collective` site's finer level waits for the next pass's agreement. Outside
+        any pass (package code between passes) the request's memo of (site, shape) answers."""
         p = _pass.get()
-        answer = self.native.oom(p.set if p else None, *self.memory.torch.now(), need, site, collective, finest)
+        answer = self.native.oom(p.set if p else None, *self.memory.torch.now(), need, site, collective, finest, shape)
         if p is not None:
             p.cuts.clear()
         # The failed attempt's peak is not the pass's: when it ran in its site, it is dropped, and
@@ -603,16 +603,16 @@ class Request:
         """The bytes a `Next.Park(budget)` answer moved to the host."""
         self.native.parked(nbytes)
 
-    def cut(self, site: str) -> int:
-        """The current pass's level for cut site `site` (0: whole), read from varena once a pass
-        until an oom answer or an agreement; outside any pass (a split in package code) the
-        request's own memo of it."""
+    def cut(self, site: str, shape: str = "") -> int:
+        """The current pass's level for cut site `site` (0: whole) at the op's shape key
+        `shape`, read from varena once a pass per (site, shape) until an oom answer or an
+        agreement; outside any pass (a split in package code) the request's memo of it."""
         p = _pass.get()
         if p is None:
-            return self.native.cut(None, site)
-        level = p.cuts.get(site)
+            return self.native.cut(None, site, shape)
+        level = p.cuts.get((site, shape))
         if level is None:
-            level = p.cuts[site] = self.native.cut(p.set, site)
+            level = p.cuts[(site, shape)] = self.native.cut(p.set, site, shape)
         return level
 
     def levels(self) -> list[tuple[str, int]]:
@@ -631,10 +631,10 @@ class Request:
         p = _pass.get()
         return p is not None and p.native.measured()
 
-    def yielding(self) -> Yielded:
-        """`with r.yielding():` while the request waits on a child call: its room goes back
-        until the wait ends."""
-        return self.native.yielding()
+    def yielding(self, family: str) -> Yielded:
+        """`with r.yielding(family):` while the request waits on a call of its `family` (a
+        child): its room goes to that family alone until the wait ends."""
+        return self.native.yielding(family)
 
     @contextmanager
     def site(self, name: str, collective: bool = False, finest: int = 0) -> Iterator[None]:
