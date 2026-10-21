@@ -132,6 +132,71 @@ pub fn venv_site_packages(venv: &Path) -> Option<PathBuf> {
         .find(|site| site.is_dir())
 }
 
+/// The PATH every executor starts from: this OS's own program directories, never the machine's
+/// PATH. On Windows that is System32 (a current driver's `nvidia-smi` and `nvml.dll`), the Windows
+/// directory and Program Files' `NVIDIA Corporation\NVSMI` (an older driver's).
+pub fn executor_path() -> String {
+    std::env::join_paths(programs::dirs())
+        .expect("a system directory holds no path separator")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(not(windows))]
+mod programs {
+    pub(super) fn dirs() -> Vec<std::path::PathBuf> {
+        ["/usr/local/bin", "/usr/bin", "/bin"].into_iter().map(Into::into).collect()
+    }
+}
+
+#[cfg(windows)]
+mod programs {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+    use windows_sys::Win32::{
+        System::{
+            Com::CoTaskMemFree,
+            SystemInformation::{GetSystemDirectoryW, GetSystemWindowsDirectoryW},
+        },
+        UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath},
+    };
+
+    pub(super) fn dirs() -> Vec<PathBuf> {
+        let nvsmi = program_files().map(|dir| dir.join("NVIDIA Corporation").join("NVSMI"));
+        [read(GetSystemDirectoryW), read(GetSystemWindowsDirectoryW), nvsmi]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn read(get: unsafe extern "system" fn(*mut u16, u32) -> u32) -> Option<PathBuf> {
+        // SAFETY: a size query: no buffer.
+        let size = unsafe { get(std::ptr::null_mut(), 0) };
+        let mut wide = vec![0u16; size as usize];
+        // SAFETY: a buffer of `size` wide characters; the answer is the length written.
+        let len = unsafe { get(wide.as_mut_ptr(), size) } as usize;
+        (len > 0 && len < wide.len()).then(|| PathBuf::from(OsString::from_wide(&wide[..len])))
+    }
+
+    fn program_files() -> Option<PathBuf> {
+        let mut path = std::ptr::null_mut();
+        // SAFETY: a known folder's id and a pointer the call fills with memory we free.
+        let status = unsafe {
+            SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut path)
+        };
+        let dir = (status == 0).then(|| {
+            // SAFETY: the NUL-terminated string the call allocated.
+            let wide = unsafe {
+                let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+                std::slice::from_raw_parts(path, len)
+            };
+            PathBuf::from(OsString::from_wide(wide))
+        });
+        // SAFETY: the call's allocation, which is ours even when it failed.
+        unsafe { CoTaskMemFree(path.cast_const().cast()) };
+        dir
+    }
+}
+
 /// This OS user's own home, from the account database (never the environment): `pw_dir` on
 /// Unix, the profile directory on Windows. `None` when it cannot be read.
 pub fn login_home() -> Option<PathBuf> {

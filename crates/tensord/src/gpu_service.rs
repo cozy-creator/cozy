@@ -135,12 +135,10 @@ impl GpuConfig {
         }
         Ok(self)
     }
-    /// A machine without GPUs: deviceless executors only, with a minimal environment whose
-    /// home is `home`.
+    /// A machine without GPUs: deviceless executors only, whose home is `home`.
     pub fn deviceless(home: &Path) -> io::Result<Self> {
         fs::create_dir_all(home)?;
-        serde_json::from_value(serde_json::json!({"devices": "",
-            "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home}}))
+        serde_json::from_value(serde_json::json!({"devices": "", "environment": environment(home)}))
             .map_err(io::Error::other)
     }
     /// The configured devices in order (`CUDA_VISIBLE_DEVICES` entries); none on a CPU machine.
@@ -151,6 +149,11 @@ impl GpuConfig {
             .filter(|d| !d.is_empty())
             .collect()
     }
+}
+
+/// What every executor starts from: this OS's program directories on PATH, and `home`.
+pub fn environment(home: &Path) -> serde_json::Value {
+    serde_json::json!({"PATH": platform::paths::executor_path(), "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home})
 }
 
 /// One declared model slot of a plan and its bound checkpoint.
@@ -2379,7 +2382,7 @@ impl Pool {
             root,
             socket,
             environment: match &self.config.toolchain {
-                Some(dir) => crate::machine::toolchain::environment(&self.config.environment, dir, ""),
+                Some(dir) => crate::machine::toolchain::environment(&self.config.environment, dir),
                 None => self.config.environment.clone(),
             },
             seal,
@@ -3729,6 +3732,23 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+
+    /// An executor's PATH is this OS's own program directories: a shell started with a sealed
+    /// executor environment finds a system program by name.
+    #[test]
+    fn an_executor_finds_this_oss_programs_on_its_path() {
+        let root = tempfile::tempdir().unwrap();
+        let config = GpuConfig::deviceless(&root.path().join("home")).unwrap();
+        let seal = Seal::prepare(root.path(), None, "path", "g", "").unwrap();
+        let (shell, args): (_, &[&str]) = match cfg!(windows) {
+            true => ("cmd.exe", &["/d", "/c", "where", "whoami"]),
+            false => ("/bin/sh", &["-c", "command -v ls"]),
+        };
+        let mut command = std::process::Command::new(shell);
+        command.args(args).env_clear().envs(seal.environment(&config.environment));
+        let found = command.output().unwrap();
+        assert!(found.status.success(), "PATH {}: {found:?}", config.environment["PATH"]);
+    }
 
     /// The `read_grant` answers Runtime's `tests/tensord_peer.py` mirrors, field for field: a
     /// held layout (whole or still filling) is one descriptor; without one, nothing follows.

@@ -56,17 +56,15 @@ pub fn wheel(distribution: &str, version: &str, dir: &Path, machine: &Machine, s
         urls: Vec<File>,
     }
     let release: Release = serde_json::from_slice(&raw).map_err(io::Error::other)?;
-    let arch = std::env::consts::ARCH;
-    let file = release
-        .urls
-        .into_iter()
-        .find(|f| {
-            f.filename.ends_with(".whl")
-                && f.filename.contains("manylinux")
-                && f.filename.contains(arch)
-                && !f.filename.contains('/')
-        })
-        .ok_or_else(|| io::Error::other(format!("PyPI has no linux {arch} wheel of {project} {version}")))?;
+    // pip's choice: the wheel built for this OS and CPU, else a pure one.
+    let rank = |f: &File| {
+        let name = f.filename.strip_suffix(".whl").filter(|name| !name.contains('/'))?;
+        platform::wheel::rank(name.rsplit('-').next()?)
+    };
+    let (_, file) = release.urls.iter().filter_map(|f| Some((rank(f)?, f))).min_by_key(|(rank, _)| *rank).ok_or_else(|| {
+        let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+        io::Error::other(format!("PyPI has no {os} {arch} wheel of {project} {version}"))
+    })?;
     let object = ObjectRef { sha256: file.digests.sha256.to_lowercase(), length: file.size };
     let blob = fetch(machine, &file.url, &object, None, stop).map_err(|e| io::Error::other(format!("{}: {e}", file.filename)))?;
     land(&blob, dir, &file.filename)
@@ -162,4 +160,31 @@ fn land(blob: &Path, dir: &Path, file: &str) -> io::Result<PathBuf> {
     let _ = fs::remove_file(&path);
     fs::hard_link(blob, &path).or_else(|_| fs::copy(blob, &path).map(drop))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env::consts::{ARCH, OS};
+
+    /// `cozy machine update --runtime <version>` lands this OS and CPU's wheel from PyPI, through
+    /// the machine's store, else the pure one: cozy-runtime 0.27.4 ships manylinux x86_64 and
+    /// pure, tensorfs 0.11.0 four platforms and no pure one.
+    #[test]
+    fn pypi_lands_this_machines_wheel_else_a_pure_one() {
+        let (tensorfs, runtime) = match (OS, ARCH) {
+            ("linux", "x86_64") => ("cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64", "cp312-abi3-manylinux_2_28_x86_64"),
+            ("linux", "aarch64") => ("cp312-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64", "py3-none-any"),
+            ("windows", "x86_64") => ("cp312-abi3-win_amd64", "py3-none-any"),
+            ("macos", "aarch64") => ("cp312-abi3-macosx_11_0_arm64", "py3-none-any"),
+            other => panic!("no published wheels to expect on {other:?}"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let machine = crate::origin::Machine::new(crate::storage::open(&dir.path().join("store")).unwrap(), None).unwrap();
+        let fetched = |distribution, version| {
+            let wheel = super::wheel(distribution, version, &dir.path().join("wheels"), &machine, &Default::default()).unwrap();
+            wheel.file_name().unwrap().to_string_lossy().into_owned()
+        };
+        assert_eq!(fetched("tensorfs", "0.11.0"), format!("tensorfs-0.11.0-{tensorfs}.whl"));
+        assert_eq!(fetched("cozy-runtime", "0.27.4"), format!("cozy_runtime-0.27.4-{runtime}.whl"));
+    }
 }

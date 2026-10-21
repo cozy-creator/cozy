@@ -37,17 +37,17 @@ fn cuda(dir: &Path) -> PathBuf {
 }
 
 /// The executors' environment over `base`: CUDA_HOME and the toolchain's binaries first on PATH,
-/// when the toolchain holds nvcc. `path` is the machine's own PATH, which `base` may not name.
-pub fn environment(base: &BTreeMap<String, String>, dir: &Path, path: &str) -> BTreeMap<String, String> {
-    let cuda = cuda(dir);
-    if !cuda.join("bin/nvcc").is_file() {
-        return base.clone();
+/// when the toolchain holds nvcc.
+pub fn environment(base: &BTreeMap<String, String>, dir: &Path) -> BTreeMap<String, String> {
+    let (cuda, mut environment) = (cuda(dir), base.clone());
+    if !cuda.join("bin").join(platform::paths::exe("nvcc")).is_file() {
+        return environment;
     }
-    let mut environment = base.clone();
-    let rest = base.get("PATH").map(String::as_str).unwrap_or(path);
-    let first = [cuda.join("bin"), dir.join("bin")].map(|p| p.display().to_string()).join(":");
-    environment.insert("PATH".into(), [first.as_str(), rest].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(":"));
-    environment.insert("CUDA_HOME".into(), cuda.display().to_string());
+    let rest = base.get("PATH").map(std::env::split_paths).into_iter().flatten();
+    if let Ok(path) = std::env::join_paths([cuda.join("bin"), dir.join("bin")].into_iter().chain(rest)) {
+        environment.insert("PATH".into(), path.to_string_lossy().into_owned());
+        environment.insert("CUDA_HOME".into(), cuda.display().to_string());
+    }
     environment
 }
 
@@ -183,14 +183,17 @@ mod tests {
     #[test]
     fn executors_find_an_installed_toolchain_first_and_nothing_else_changes() {
         let dir = tempfile::tempdir().unwrap();
-        let base = BTreeMap::from([("LANG".to_string(), "C.UTF-8".to_string())]);
-        assert_eq!(environment(&base, dir.path(), "/usr/bin"), base, "no toolchain: unchanged");
+        let system = platform::paths::executor_path();
+        let base = BTreeMap::from([("LANG".to_string(), "C.UTF-8".to_string()), ("PATH".into(), system.clone())]);
+        assert_eq!(environment(&base, dir.path()), base, "no toolchain: unchanged");
         let bin = cuda(dir.path()).join("bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("nvcc"), b"").unwrap();
-        let env = environment(&base, dir.path(), "/usr/bin:/bin");
+        fs::write(bin.join(platform::paths::exe("nvcc")), b"").unwrap();
+        let env = environment(&base, dir.path());
         assert_eq!(env["CUDA_HOME"], cuda(dir.path()).display().to_string());
-        assert_eq!(env["PATH"], format!("{}:{}:/usr/bin:/bin", bin.display(), dir.path().join("bin").display()));
+        let path: Vec<PathBuf> = std::env::split_paths(&env["PATH"]).collect();
+        assert_eq!(path[..2], [bin, dir.path().join("bin")]);
+        assert_eq!(path[2..], std::env::split_paths(&system).collect::<Vec<_>>());
         assert_eq!(env["LANG"], "C.UTF-8");
     }
 

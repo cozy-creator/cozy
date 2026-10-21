@@ -338,7 +338,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
             "inventory": gpus,
             "authorized_device_limit_bytes": null,
             "gpu_memory_limit": gpu_memory_limit,
-            "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home},
+            "environment": crate::gpu_service::environment(&home),
             // A rented pod is the machine's alone (its grant says so); anywhere else it is a guest.
             "host": {"mode": if rental { "dedicated" } else { "shared" }},
             "image_kernels": (!gpus.is_empty()).then(|| image_kernels(&layout.root, &paths.sdk())).flatten(),

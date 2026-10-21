@@ -18,6 +18,7 @@ pub mod shm;
 pub mod tail;
 pub mod tools;
 pub mod watch;
+pub mod wheel;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
