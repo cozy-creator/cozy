@@ -513,9 +513,9 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     // A folder outside the store gets copies: editing one never reaches a stored object.
     let outside = scratch.0.join("outside");
     client.materialize(&reference, &selected, Some(&outside), false).await.unwrap();
-    let chunk = |dir: &Path| fs::metadata(dir.join("chunks").join(&data.chunks[0].sha256)).unwrap();
-    assert_eq!(std::os::unix::fs::MetadataExt::nlink(&chunk(&outside)), 1);
-    assert!(std::os::unix::fs::MetadataExt::nlink(&chunk(&snapshot)) > 1, "the store's own snapshot links");
+    let chunk = |dir: &Path| dir.join("chunks").join(&data.chunks[0].sha256);
+    assert_eq!(platform::durable::links(&chunk(&outside)).unwrap(), 1);
+    assert!(platform::durable::links(&chunk(&snapshot)).unwrap() > 1, "the store's own snapshot links");
     let readme = client
         .download_file(
             &reference,
