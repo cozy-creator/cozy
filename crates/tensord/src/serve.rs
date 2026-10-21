@@ -168,7 +168,7 @@ pub fn dev(args: Dev) -> io::Result<()> {
     let service = crate::service::Service::open(&root, &generations, args.cpu_parallelism)?;
     let pool = match args.gpu_config {
         Some(config) => crate::gpu_service::GpuConfig::load(&config)?,
-        None => crate::gpu_service::GpuConfig::deviceless(&root.join("cpu").join("home"))?,
+        None => crate::gpu_service::GpuConfig::deviceless(&root.join("cpu").join("home"), &root.join("tools"))?,
     };
     service.configure_pool(crate::gpu_service::Pool::new(&root.join("gpu"), pool, store.clone())?)?;
     // A Runtime wheel named here is the operator's choice, as an update's `--runtime-wheel` is: it
@@ -338,7 +338,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
             "inventory": gpus,
             "authorized_device_limit_bytes": null,
             "gpu_memory_limit": gpu_memory_limit,
-            "environment": crate::gpu_service::environment(&home),
+            "environment": crate::gpu_service::environment(&home, &grant.home.tools()),
             // A rented pod is the machine's alone (its grant says so); anywhere else it is a guest.
             "host": {"mode": if rental { "dedicated" } else { "shared" }},
             "image_kernels": (!gpus.is_empty()).then(|| image_kernels(&layout.root, &paths.sdk())).flatten(),

@@ -136,9 +136,9 @@ impl GpuConfig {
         Ok(self)
     }
     /// A machine without GPUs: deviceless executors only, whose home is `home`.
-    pub fn deviceless(home: &Path) -> io::Result<Self> {
+    pub fn deviceless(home: &Path, tools: &Path) -> io::Result<Self> {
         fs::create_dir_all(home)?;
-        serde_json::from_value(serde_json::json!({"devices": "", "environment": environment(home)}))
+        serde_json::from_value(serde_json::json!({"devices": "", "environment": environment(home, tools)}))
             .map_err(io::Error::other)
     }
     /// The configured devices in order (`CUDA_VISIBLE_DEVICES` entries); none on a CPU machine.
@@ -151,9 +151,10 @@ impl GpuConfig {
     }
 }
 
-/// What every executor starts from: this OS's program directories on PATH, and `home`.
-pub fn environment(home: &Path) -> serde_json::Value {
-    serde_json::json!({"PATH": platform::paths::executor_path(), "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home})
+/// What every executor starts from: cozy's pinned `tools` and this OS's programs on PATH, and `home`.
+pub fn environment(home: &Path, tools: &Path) -> serde_json::Value {
+    let path = platform::paths::executor_path(tools);
+    serde_json::json!({"PATH": path, "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home})
 }
 
 /// One declared model slot of a plan and its bound checkpoint.
@@ -3733,12 +3734,15 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
 
-    /// An executor's PATH is this OS's own program directories: a shell started with a sealed
-    /// executor environment finds a system program by name.
+    /// An executor's PATH is cozy's pinned tools, then this OS's own program directories: a shell
+    /// started with a sealed executor environment finds a system program by name.
     #[test]
     fn an_executor_finds_this_oss_programs_on_its_path() {
         let root = tempfile::tempdir().unwrap();
-        let config = GpuConfig::deviceless(&root.path().join("home")).unwrap();
+        let tools = root.path().join("tools");
+        let config = GpuConfig::deviceless(&root.path().join("home"), &tools).unwrap();
+        let path: Vec<PathBuf> = std::env::split_paths(&config.environment["PATH"]).collect();
+        assert_eq!(path[..2], platform::tools::pinned_dirs(&tools));
         let seal = Seal::prepare(root.path(), None, "path", "g", "").unwrap();
         let (shell, args): (_, &[&str]) = match cfg!(windows) {
             true => ("cmd.exe", &["/d", "/c", "where", "whoami"]),

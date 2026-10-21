@@ -132,11 +132,12 @@ pub fn venv_site_packages(venv: &Path) -> Option<PathBuf> {
         .find(|site| site.is_dir())
 }
 
-/// The PATH every executor starts from: this OS's own program directories, never the machine's
-/// PATH. On Windows that is System32 (a current driver's `nvidia-smi` and `nvml.dll`), the Windows
-/// directory and Program Files' `NVIDIA Corporation\NVSMI` (an older driver's).
-pub fn executor_path() -> String {
-    std::env::join_paths(programs::dirs())
+/// The PATH every executor starts from, never the machine's PATH: the tools cozy pinned in `tools`
+/// (`Home::tools`), then this OS's own program directories. On Windows those are System32 (a
+/// current driver's `nvidia-smi` and `nvml.dll`), the Windows directory and Program Files'
+/// `NVIDIA Corporation\NVSMI` (an older driver's).
+pub fn executor_path(tools: &Path) -> String {
+    std::env::join_paths(crate::tools::pinned_dirs(tools).into_iter().chain(programs::dirs()))
         .expect("a system directory holds no path separator")
         .to_string_lossy()
         .into_owned()

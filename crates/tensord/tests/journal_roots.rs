@@ -102,7 +102,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
         own_hub: None,
         contexts: Default::default(),
     });
-    let config = GpuConfig::deviceless(&root.join("home")).unwrap();
+    let config = GpuConfig::deviceless(&root.join("home"), &root.join("tools")).unwrap();
     service.configure_pool(Pool::new(&root.join("pool"), config, store.clone()).unwrap()).unwrap();
     Calls::configure(&service, machine, Some(&runs)).unwrap();
     Machine {

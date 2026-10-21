@@ -97,7 +97,7 @@ impl Machine {
         let (generations, _) = lifecycle();
         let service = Service::open(&root.join("state"), generations, 1).unwrap();
         let store = tensord::storage::open(&root.join("store")).unwrap();
-        let config = GpuConfig::deviceless(&root.join("home")).unwrap();
+        let config = GpuConfig::deviceless(&root.join("home"), &root.join("tools")).unwrap();
         service.configure_pool(Pool::new(&root.join("pool"), config, store).unwrap()).unwrap();
         Self { root, service }
     }
@@ -400,7 +400,7 @@ fn cancel_before_dispatch_is_durable_and_never_executes_package() {
     drop(journal);
     // The machine that opens it next never starts it.
     let service = Service::open(&root.join("state"), &lifecycle().0, 1).unwrap();
-    let config = GpuConfig::deviceless(&root.join("home")).unwrap();
+    let config = GpuConfig::deviceless(&root.join("home"), &root.join("tools")).unwrap();
     let store = tensord::storage::open(&root.join("store")).unwrap();
     service.configure_pool(Pool::new(&root.join("pool"), config, store).unwrap()).unwrap();
     service.engine.notify_activity();

@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn executors_find_an_installed_toolchain_first_and_nothing_else_changes() {
         let dir = tempfile::tempdir().unwrap();
-        let system = platform::paths::executor_path();
+        let system = platform::paths::executor_path(&dir.path().join("tools"));
         let base = BTreeMap::from([("LANG".to_string(), "C.UTF-8".to_string()), ("PATH".into(), system.clone())]);
         assert_eq!(environment(&base, dir.path()), base, "no toolchain: unchanged");
         let bin = cuda(dir.path()).join("bin");

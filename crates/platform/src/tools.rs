@@ -334,6 +334,11 @@ pub fn ffmpeg_dir(tools: &Path) -> PathBuf {
     tools.join("ffmpeg").join(FFMPEG_VERSION)
 }
 
+/// Every pinned tool's directory under `tools`.
+pub fn pinned_dirs(tools: &Path) -> [PathBuf; 2] {
+    [ffmpeg_dir(tools), uv_dir(tools)]
+}
+
 /// ffmpeg and ffprobe together: the pinned build in `tools`, else the pair on `path`.
 pub fn ffmpeg(tools: &Path, path: &[PathBuf]) -> Option<(Found, PathBuf)> {
     let pinned = ffmpeg_dir(tools);

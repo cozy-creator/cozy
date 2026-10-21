@@ -1663,7 +1663,7 @@ mod tests {
             own_hub: None,
             contexts: Default::default(),
         });
-        let config = crate::gpu_service::GpuConfig::deviceless(&root.join("home")).unwrap();
+        let config = crate::gpu_service::GpuConfig::deviceless(&root.join("home"), &root.join("tools")).unwrap();
         service.configure_pool(crate::gpu_service::Pool::new(&root.join("pool"), config, store.clone()).unwrap()).unwrap();
         crate::calls::Calls::configure(&service, crate::origin::Machine::new(store, None).unwrap(), Some(&runs)).unwrap();
         (runs, objects)
