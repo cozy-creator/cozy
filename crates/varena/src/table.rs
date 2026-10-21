@@ -248,8 +248,9 @@ pub struct Req {
     pub rooms: Vec<Option<u64>>,
     /// The cut sites of each set's current pass (a joint step runs several).
     pub sites: BTreeMap<u32, Vec<CutSite>>,
-    /// Cut levels of op sites outside any pass (the package's own code): the request's memo.
-    pub outside: BTreeMap<String, u32>,
+    /// Cut levels of op sites outside any pass (the package's own code) by (site, op shape):
+    /// the request's memo.
+    pub outside: BTreeMap<(String, String), u32>,
     /// Waiting on a child call: the room it gave back, retaken when the wait ends. Meanwhile
     /// its current step's pages are a later use (D) and it has no remaining W.
     pub yielded: Option<u64>,

@@ -99,7 +99,7 @@ fn apply(t: &mut Table, actions: &[Action], run: &mut Run, tried: &mut Tried, cl
                 r.room = *room;
                 r.measured = *measured;
             }
-            Action::Shrink { .. } | Action::Cut { .. } | Action::Relax { .. } | Action::Propose { .. } | Action::Park(_) => {}
+            Action::Shrink { .. } | Action::Cut { .. } | Action::CutOutside { .. } | Action::Relax { .. } | Action::Propose { .. } | Action::Park(_) => {}
         }
     }
     remote
@@ -365,7 +365,7 @@ fn any_oom_sequence_ends_within_pages_plus_cuts_plus_two() {
     loop {
         answers += 1;
         assert!(answers <= pages + cut_levels + 2, "{answers} answers");
-        let site = (cuts < cut_levels).then(|| OomSite { name: "ffn".into(), collective: false, finest: cut_levels });
+        let site = (cuts < cut_levels).then(|| OomSite { name: "ffn".into(), collective: false, finest: cut_levels, shape: "1x8".into() });
         let a = demand(&mut t, Trigger::Oom { req: 1, set: Some(0), need: Some(64 * MB), site, tried: Tried::default() }, &mut run, &mut clock);
         match a.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::Park(_) | Action::Exhausted { .. })) {
             Some(Action::Cut { .. }) => cuts += 1,
@@ -459,7 +459,7 @@ fn collective_sites_change_only_by_agreement() {
     let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(4 * MB), unmeasured: 0, tried: Tried::default() });
     assert!(!a.iter().any(|a| matches!(a, Action::Cut { .. })), "{a:?}");
     assert!(a.contains(&Action::Lower(1)));
-    let a = decide(&t, &Trigger::Oom { req: 1, set: Some(0), need: Some(MB), site: Some(OomSite { name: "ffn".into(), collective: true, finest: 4 }), tried: Tried::default() });
+    let a = decide(&t, &Trigger::Oom { req: 1, set: Some(0), need: Some(MB), site: Some(OomSite { name: "ffn".into(), collective: true, finest: 4, shape: "1x8".into() }), tried: Tried::default() });
     assert!(a.iter().any(|a| matches!(a, Action::Propose { req: 1, set: 0, site, level: 1, failed_at: Some(_) } if site == "ffn")), "{a:?}");
     assert!(!a.iter().any(|a| matches!(a, Action::Cut { .. })), "{a:?}");
 }

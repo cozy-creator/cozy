@@ -51,6 +51,8 @@ pub struct OomSite {
     pub collective: bool,
     /// The finest level the op has: never proposed or cut beyond.
     pub finest: u32,
+    /// The op's shape key: outside any pass the request's memo is per (site, shape).
+    pub shape: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,9 +79,12 @@ pub enum Action {
     Claim { req: u64, bytes: u64 },
     /// The pass's room, set in the same apply as the evictions that made it.
     Reserve { req: u64, room: u64, measured: bool },
-    /// Cut `site` of the pass over `set` (`None`: a site outside any pass, the request's own)
-    /// one level finer; the cut level last had `failed_at` bytes of room.
-    Cut { req: u64, set: Option<u32>, site: String, failed_at: u64 },
+    /// Cut `site` of the pass over `set` one level finer; the cut level last had `failed_at`
+    /// bytes of room.
+    Cut { req: u64, set: u32, site: String, failed_at: u64 },
+    /// Cut op site `site` outside any pass one level finer at the op's `shape` (the request's
+    /// memo).
+    CutOutside { req: u64, site: String, shape: String },
     /// Relax `site` one level: its measured room fits the surplus.
     Relax { req: u64, set: u32, site: String },
     /// A collective site's level proposed for the next agreement: finer after an OOM (whose
@@ -153,7 +158,7 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
         let fresh = |s: &&CutSite| !s.stuck && !s.collective && s.peak > 0 && s.level < s.finest && !cut.contains(s.name.as_str());
         if let Some(site) = sites.iter().filter(fresh).max_by_key(|s| (s.peak, std::cmp::Reverse(s.name.clone()))) {
             cut.insert(&site.name);
-            d.out.push(Action::Cut { req, set: Some(set), site: site.name.clone(), failed_at: d.got + held });
+            d.out.push(Action::Cut { req, set, site: site.name.clone(), failed_at: d.got + held });
             (room, measured) = match site.finer {
                 Some(finer) => (finer, true),
                 None => (unmeasured, false),
@@ -203,13 +208,13 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
 fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&OomSite>, tried: &Tried) -> Vec<Action> {
     let Some(r) = t.request(req) else { return vec![Action::Exhausted { need: need.unwrap_or(0) }] };
     let sites = set.and_then(|s| r.sites.get(&s)).map(Vec::as_slice).unwrap_or_default();
-    let level = |name: &str| match set {
-        Some(_) => sites.iter().find(|s| s.name == name).map_or(0, |s| s.level),
-        None => r.outside.get(name).copied().unwrap_or(0),
+    let level = |s: &OomSite| match set {
+        Some(_) => sites.iter().find(|x| x.name == s.name).map_or(0, |x| x.level),
+        None => r.outside.get(&(s.name.clone(), s.shape.clone())).copied().unwrap_or(0),
     };
     // A site at its finest level is not cut or proposed further: the next rung follows.
-    let outside = site.filter(|s| set.is_none() && !s.collective && level(&s.name) < s.finest);
-    let site = set.zip(site).filter(|(_, s)| level(&s.name) < s.finest);
+    let outside = site.filter(|s| set.is_none() && !s.collective && level(s) < s.finest);
+    let site = set.zip(site).filter(|(_, s)| level(s) < s.finest);
     // Unknown: any page's worth is progress.
     let mut d = Demand::new(t, need.unwrap_or(1), Some(req), None, tried);
     d.oom = true;
@@ -219,7 +224,7 @@ fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&O
     let mut out = vec![];
     if let Some((set, s)) = site.filter(|(_, s)| s.collective) {
         if !tried.cut.contains(&s.name) {
-            out.push(Action::Propose { req, set, site: s.name.clone(), level: level(&s.name) + 1, failed_at: Some(r.room + r.claimed + t.free()) });
+            out.push(Action::Propose { req, set, site: s.name.clone(), level: level(s) + 1, failed_at: Some(r.room + r.claimed + t.free()) });
         }
     }
     match d.run(Rungs::Oom) {
@@ -229,14 +234,14 @@ fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&O
         }
         Some(Done::Enough) => {}
         Some(Done::Lowered) | None if set.is_none() => match outside {
-            Some(s) => d.out.push(Action::Cut { req, set: None, site: s.name.clone(), failed_at: r.room + r.claimed + t.free() }),
+            Some(s) => d.out.push(Action::CutOutside { req, site: s.name.clone(), shape: s.shape.clone() }),
             None if d.got == 0 => d.park_or_exhaust(r.episode.parked),
             None => {}
         },
         Some(Done::Lowered) | None => {
             let cuttable = site.filter(|(_, s)| !s.collective && !sites.iter().any(|x| x.name == s.name && x.stuck));
             if let Some((set, s)) = cuttable {
-                d.out.push(Action::Cut { req, set: Some(set), site: s.name.clone(), failed_at: r.room + r.claimed + t.free() });
+                d.out.push(Action::Cut { req, set, site: s.name.clone(), failed_at: r.room + r.claimed + t.free() });
             } else {
                 if !r.lowered {
                     d.out.push(Action::Lower(req));

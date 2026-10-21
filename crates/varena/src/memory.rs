@@ -178,6 +178,9 @@ pub struct Site<'a> {
     pub collective: bool,
     /// The finest level the op has: never proposed or answered beyond it.
     pub finest: u32,
+    /// The op's shape key: outside any pass the request's memo is per (site, shape); a pass's
+    /// own sites go by the pass's shape.
+    pub shape: &'a str,
 }
 
 /// One process's memory on one device.
@@ -1351,7 +1354,7 @@ impl Inner {
             };
             tried.freed += freed;
             for a in &actions {
-                if let Action::Cut { site, .. } | Action::Propose { site, .. } = a {
+                if let Action::Cut { site, .. } | Action::CutOutside { site, .. } | Action::Propose { site, .. } = a {
                     tried.cut.insert(site.clone());
                 }
             }
@@ -1422,15 +1425,15 @@ impl Inner {
                     r.measured = *measured;
                 }
             }
-            Action::Cut { req, set: None, site, .. } => {
+            Action::CutOutside { req, site, shape } => {
                 if let Some(r) = st.table.request_mut(*req) {
-                    *r.outside.entry(site.clone()).or_insert(0) += 1;
+                    *r.outside.entry((site.clone(), shape.clone())).or_insert(0) += 1;
                 }
                 if let Some(s) = st.stats(Some(*req)) {
                     s.cuts += 1;
                 }
             }
-            Action::Cut { req, set: Some(set), site, failed_at } => {
+            Action::Cut { req, set, site, failed_at } => {
                 if let Some(shape) = st.active.get(&(*req, *set)).map(|a| a.shape.clone()) {
                     let name = st.mech(*set)?.spec.name.clone();
                     let key = room_key(&name, &shape, &st.levels(*set, &shape));
@@ -2034,17 +2037,17 @@ impl Inner {
             }
             self.unlock(st);
         }
-        let site_of = site.map(|s| crate::decide::OomSite { name: s.name.to_string(), collective: s.collective, finest: s.finest });
+        let site_of = site.map(|s| crate::decide::OomSite { name: s.name.to_string(), collective: s.collective, finest: s.finest, shape: s.shape.to_string() });
         let trigger = Trigger::Oom { req, set, need, site: site_of, tried: Tried::default() };
         let actions = self.demand(trigger, Some(req))?;
         let mut st = self.lock();
         let stats = |st: &State| st.stats.get(&req).cloned().unwrap_or_default();
-        let next = match actions.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::Park(_) | Action::Exhausted { .. })) {
-            Some(Action::Cut { set: Some(set), site, .. }) => {
+        let next = match actions.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::CutOutside { .. } | Action::Park(_) | Action::Exhausted { .. })) {
+            Some(Action::Cut { set, site, .. }) => {
                 let level = st.active.get(&(req, *set)).and_then(|a| st.cuts.get(&(*set, a.shape.clone()))).and_then(|c| c.get(site).copied());
                 Next::Cut(level.unwrap_or(1))
             }
-            Some(Action::Cut { set: None, site, .. }) => Next::Cut(st.table.request(req).and_then(|r| r.outside.get(site).copied()).unwrap_or(1)),
+            Some(Action::CutOutside { site, shape, .. }) => Next::Cut(st.table.request(req).and_then(|r| r.outside.get(&(site.clone(), shape.clone())).copied()).unwrap_or(1)),
             Some(Action::Park(_)) => {
                 if let Some(r) = st.table.request_mut(req) {
                     r.episode.parked = true;
@@ -2424,14 +2427,15 @@ impl Request {
     }
 
     /// The cut level for op site `site` (0: whole) in the pass over `set`; a collective site's
-    /// is the level the ranks agreed. `None`: a site outside any pass, the request's own memo.
-    pub fn cut(&self, set: Option<SetId>, site: &str) -> u32 {
+    /// is the level the ranks agreed. `None`: a site outside any pass, the request's own memo
+    /// at the op's `shape` (a pass's own sites go by the pass's shape).
+    pub fn cut(&self, set: Option<SetId>, site: &str, shape: &str) -> u32 {
         self.inner
             .guard(|| {
                 let st = self.inner.lock();
                 let level = match set {
                     Some(set) => st.active.get(&(self.id, set.0)).and_then(|a| st.cuts.get(&(set.0, a.shape.clone()))).and_then(|c| c.get(site)).copied(),
-                    None => st.table.request(self.id).and_then(|r| r.outside.get(site).copied()),
+                    None => st.table.request(self.id).and_then(|r| r.outside.get(&(site.to_string(), shape.to_string())).copied()),
                 }
                 .unwrap_or(0);
                 self.inner.unlock(st);

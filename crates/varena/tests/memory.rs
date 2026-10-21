@@ -100,25 +100,25 @@ fn an_oom_at_a_cut_site_cuts_and_a_collective_one_waits_for_the_next_pass() {
     let r = mem.request("r", plan("c")).unwrap();
     let pass = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
     let pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
-    let site = Some(Site { name: "ffn", collective: false, finest: 4 });
+    let site = Some(Site { name: "ffn", collective: false, finest: 4, shape: "1x8" });
     // The free bytes went to the pages; every page is pinned: the op cuts, level by level.
     assert!(!pass.measured() && !r.measured(), "no room measured at this shape yet");
     assert!(matches!(r.oom(Some(id), Some(MB), site, Torch::default()), Next::Cut(1)));
-    assert_eq!(r.cut(Some(id), "ffn"), 1);
+    assert_eq!(r.cut(Some(id), "ffn", "1x8"), 1);
     assert!(matches!(r.oom(Some(id), Some(MB), site, Torch::default()), Next::Cut(2)));
     // Review 1, finding 4: a collective site never cuts mid-pass. It recovers locally, its
     // finer level is proposed, and it takes effect when the ranks agree at the next pass.
-    let collective = Some(Site { name: "allgather", collective: true, finest: 4 });
+    let collective = Some(Site { name: "allgather", collective: true, finest: 4, shape: "1x8" });
     let next = r.oom(Some(id), Some(MB), collective, Torch::default());
     assert!(matches!(next, Next::Park(_) | Next::Exhausted(_)), "{next:?}");
-    assert_eq!(r.cut(Some(id), "allgather"), 0, "unchanged within the pass");
+    assert_eq!(r.cut(Some(id), "allgather", "1x8"), 0, "unchanged within the pass");
     drop(pins);
     drop(pass);
     let next = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
     assert_eq!(next.levels(), vec![("allgather".to_string(), 1)], "proposed for the agreement");
-    assert_eq!(r.cut(Some(id), "allgather"), 0);
+    assert_eq!(r.cut(Some(id), "allgather", "1x8"), 0);
     next.agree(vec![("allgather".into(), 2)]);
-    assert_eq!(r.cut(Some(id), "allgather"), 2, "the ranks' maximum");
+    assert_eq!(r.cut(Some(id), "allgather", "1x8"), 2, "the ranks' maximum");
 }
 
 /// Review 1, finding 11: dropping an earlier pass after the next one started keeps the next
@@ -190,10 +190,10 @@ fn a_joint_steps_oom_cuts_only_its_own_sets_site() {
     let pa = r.pass(a, "fwd", "1x8", Torch::default()).unwrap();
     let pb = r.pass(b, "fwd", "1x8", Torch::default()).unwrap();
     let pins = [mem.bind(a, 0, 0).unwrap(), mem.bind(b, 0, 0).unwrap()];
-    let site = Some(Site { name: "ffn", collective: false, finest: 4 });
+    let site = Some(Site { name: "ffn", collective: false, finest: 4, shape: "1x8" });
     assert!(matches!(r.oom(Some(a), Some(MB), site, Torch::default()), Next::Cut(1)));
-    assert_eq!(r.cut(Some(a), "ffn"), 1, "a's pass cut");
-    assert_eq!(r.cut(Some(b), "ffn"), 0, "b's pass, started last, untouched");
+    assert_eq!(r.cut(Some(a), "ffn", "1x8"), 1, "a's pass cut");
+    assert_eq!(r.cut(Some(b), "ffn", "1x8"), 0, "b's pass, started last, untouched");
     drop(pins);
     drop((pa, pb));
 }
@@ -257,7 +257,7 @@ fn collective_levels_relax_by_agreement() {
     assert_eq!(p.levels(), vec![("ag".to_string(), 0)], "known collective from its measured room");
     // An OOM at it while the card is tight: the finer level is proposed, for the next pass.
     let pins: Vec<_> = (0..4).map(|b| mem.bind(x, b, 0).unwrap()).collect();
-    r.oom(Some(c), Some(MB), Some(Site { name: "ag", collective: true, finest: 4 }), Torch::default());
+    r.oom(Some(c), Some(MB), Some(Site { name: "ag", collective: true, finest: 4, shape: "1x8" }), Torch::default());
     p.end(measured(4 * MB, ag(2 * MB)), Torch::default());
     drop(pins);
     mem.unload(x);
@@ -268,20 +268,20 @@ fn collective_levels_relax_by_agreement() {
     let p = r.pass(c, "fwd", "1x8", Torch::default()).unwrap();
     assert_eq!(p.levels(), vec![("ag".to_string(), 1)]);
     p.agree(vec![("ag".into(), 1)]);
-    assert_eq!(r.cut(Some(c), "ag"), 1);
+    assert_eq!(r.cut(Some(c), "ag", "1x8"), 1);
     p.end(measured(3 * MB, ag(MB)), Torch::default());
     // With room to spare this rank proposes the coarser level; another rank still needs the
     // finer one: the maximum stays.
     let p = r.pass(c, "fwd", "1x8", Torch::default()).unwrap();
     assert_eq!(p.levels(), vec![("ag".to_string(), 0)], "relaxed, proposed");
     p.agree(vec![("ag".into(), 1)]);
-    assert_eq!(r.cut(Some(c), "ag"), 1, "the ranks' maximum");
+    assert_eq!(r.cut(Some(c), "ag", "1x8"), 1, "the ranks' maximum");
     p.end(measured(3 * MB, ag(MB)), Torch::default());
     // Every rank proposes it: relaxed.
     let p = r.pass(c, "fwd", "1x8", Torch::default()).unwrap();
     assert_eq!(p.levels(), vec![("ag".to_string(), 0)]);
     p.agree(vec![("ag".into(), 0)]);
-    assert_eq!(r.cut(Some(c), "ag"), 0, "a transient OOM does not cut forever");
+    assert_eq!(r.cut(Some(c), "ag", "1x8"), 0, "a transient OOM does not cut forever");
 }
 
 /// S5 review, 1: a restarted TensorD drops the dispatches it finds (a dead TensorD's), so the
@@ -330,11 +330,11 @@ fn a_site_at_its_finest_takes_the_next_rung() {
     let r = mem.request("r", plan("f")).unwrap();
     let _pass = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
     let _pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
-    let site = Some(Site { name: "ffn", collective: false, finest: 1 });
+    let site = Some(Site { name: "ffn", collective: false, finest: 1, shape: "1x8" });
     assert!(matches!(r.oom(Some(id), Some(MB), site, Torch::default()), Next::Cut(1)));
     let next = r.oom(Some(id), Some(MB), site, Torch::default());
     assert!(matches!(next, Next::Park(_) | Next::Exhausted(_)), "{next:?}");
-    assert_eq!(r.cut(Some(id), "ffn"), 1);
+    assert_eq!(r.cut(Some(id), "ffn", "1x8"), 1);
 }
 
 /// S8: an OOM in the package's own code between passes is answered from the demand order (a
@@ -355,7 +355,7 @@ fn an_oom_between_passes_evicts_cold_pages() {
     assert_eq!(ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum::<u64>(), 0, "n went");
     let pass = r.pass(a, "fwd", "1x8", Torch::default()).unwrap();
     assert!(!mem.bind(a, 1, 0).unwrap().fresh);
-    assert_eq!(r.cut(Some(a), "ffn"), 0, "nothing was cut");
+    assert_eq!(r.cut(Some(a), "ffn", "1x8"), 0, "nothing was cut");
     pass.end(Measured::default(), Torch::default());
     assert!(!r.stats().lowered, "nothing was lowered");
 }
@@ -370,13 +370,19 @@ fn a_site_outside_any_pass_has_the_requests_memo() {
     let id = mem.load(set(dir.path(), "o", 2, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", plan("o")).unwrap();
     let _pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
-    let split = Some(Site { name: "split", collective: false, finest: 2 });
+    let split = Some(Site { name: "split", collective: false, finest: 2, shape: "1x8" });
     assert!(matches!(r.oom(None, Some(MB), split, Torch::default()), Next::Cut(1)));
-    assert_eq!(r.cut(None, "split"), 1);
+    assert_eq!(r.cut(None, "split", "1x8"), 1);
     assert!(matches!(r.oom(None, Some(MB), split, Torch::default()), Next::Cut(2)));
     let next = r.oom(None, Some(MB), split, Torch::default());
     assert!(matches!(next, Next::Park(_) | Next::Exhausted(_)), "at its finest the next rung: {next:?}");
-    assert_eq!(r.cut(None, "split"), 2);
+    assert_eq!(r.cut(None, "split", "1x8"), 2);
+    // Review 4, NEW-4: the memo is per (site, shape): the same op at another shape is whole.
+    assert_eq!(r.cut(None, "split", "1x16"), 0);
+    let wide = Some(Site { name: "split", collective: false, finest: 2, shape: "1x16" });
+    r.parked(1);
+    assert!(matches!(r.oom(None, Some(MB), wide, Torch::default()), Next::Cut(1)));
+    assert_eq!((r.cut(None, "split", "1x16"), r.cut(None, "split", "1x8")), (1, 2));
 }
 
 /// Review 3, N7: a room is the latest completed measurement (it comes down when a pass needs
