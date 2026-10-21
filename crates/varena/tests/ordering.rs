@@ -1,14 +1,18 @@
 //! Ordering against device events: a page whose transform is still running on the bind stream
-//! is never made read-only or exported, and a pin's release is not complete before its event.
-//! Host pages fill synchronously, so the backend here is the host backend with stream events
-//! that complete only when the test says (as a card's do when their work finishes).
+//! is never made read-only or exported, a pin's release is not complete before its event, and
+//! no host thread waits on a device event or on custody. Host pages fill synchronously, so the
+//! backend here is the host backend with stream events that complete only when the test says
+//! (as a card's do when their work finishes), and with the stream waits it was asked for.
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{Read, Write};
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::net::{SocketAddr, UnixListener};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use platform::handles::Owned;
 use tensorfs::format::ObjectRef;
 use tensorfs::io::source::Source;
@@ -23,6 +27,37 @@ struct Events {
     /// Calls that make a page read-only or hand it out.
     kept: Mutex<Vec<&'static str>>,
     unmaps: AtomicU64,
+    /// In-stream waits asked for, in order: (event, stream).
+    waits: Mutex<Vec<(u64, usize)>>,
+    /// Fences are pending events too (a card's copy), and a fence may hold its fill thread
+    /// until a gate opens (a long copy).
+    pending_fences: AtomicBool,
+    fences: Mutex<Vec<u64>>,
+    hold_fence: AtomicBool,
+    fence_gate: Gate,
+}
+
+/// Closed until opened.
+#[derive(Default)]
+struct Gate {
+    open: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Gate {
+    fn open(&self) {
+        *self.open.lock() = true;
+        self.cv.notify_all();
+    }
+    fn close(&self) {
+        *self.open.lock() = false;
+    }
+    fn pass(&self) {
+        let mut open = self.open.lock();
+        while !*open {
+            self.cv.wait(&mut open);
+        }
+    }
 }
 
 struct Stream {
@@ -77,7 +112,15 @@ impl Backend for Stream {
         self.host.target(va, offset, len)
     }
     fn fence(&self) -> Result<Event> {
-        Ok(Event::DONE)
+        if self.events.hold_fence.swap(false, Ordering::SeqCst) {
+            self.events.fence_gate.pass();
+        }
+        if !self.events.pending_fences.load(Ordering::SeqCst) {
+            return Ok(Event::DONE);
+        }
+        let e = self.events.next.fetch_add(1, Ordering::Relaxed) + 1;
+        self.events.fences.lock().push(e);
+        Ok(Event(e))
     }
     /// A stream event: pending until the test completes it.
     fn record(&self, _: usize) -> Result<Event> {
@@ -89,7 +132,10 @@ impl Backend for Stream {
     fn elapsed(&self, _: Event, _: Event) -> Result<Option<u64>> {
         Ok(Some(0))
     }
-    fn wait(&self, _: Event, _: usize) -> Result<()> {
+    fn wait(&self, event: Event, stream: usize) -> Result<()> {
+        if event != Event::DONE {
+            self.events.waits.lock().push((event.0, stream));
+        }
         Ok(())
     }
     fn register_host(&self, _: u64, _: u64) -> Result<()> {
@@ -184,4 +230,132 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     assert_eq!(events.unmaps.load(Ordering::Relaxed), 1, "gone once the consumer finished");
     let again = mem.bind(id, 0, 1).unwrap();
     assert!(again.fresh, "filled again, fresh for the transform");
+}
+
+/// Round 2, the GPU bind hang (run 12818): a binder of a page whose release event is pending
+/// never waits on the host for it. The page is filled again in place: the copy stream waits on
+/// the release in-stream, and the binder's stream on the fill. The event completes later on
+/// another thread, and no other varena call happens meanwhile.
+#[test]
+fn a_binder_never_waits_on_a_release_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = GpuId { uuid: format!("hang-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let backend = Stream { host: HostBackend::new(g.memory), events: events.clone() };
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(backend)).unwrap());
+    let id = mem.load(set(dir.path(), &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["lora".into()], passes: 1 }] }).unwrap();
+    let _pass = r.pass(id, "1x1", Torch::default()).unwrap();
+    // Released fresh with its transform undone: its bytes are not the weights, and the stream
+    // that read it has not finished.
+    drop(mem.bind(id, 0, 1).unwrap());
+    let release = events.next.load(Ordering::Relaxed);
+    events.pending_fences.store(true, Ordering::SeqCst);
+    let gate = Arc::new(Gate::default());
+    let completes = {
+        let (gate, events) = (gate.clone(), events.clone());
+        std::thread::spawn(move || {
+            gate.pass();
+            events.done.lock().insert(release);
+        })
+    };
+    let binder = {
+        let mem = mem.clone();
+        std::thread::spawn(move || {
+            let pin = mem.bind(id, 0, 2).unwrap();
+            (pin.fresh, pin.ready)
+        })
+    };
+    // Joined with the release still pending: the binder never waited on it.
+    let (fresh, ready) = binder.join().unwrap();
+    assert!(!events.done.lock().contains(&release));
+    assert!(fresh, "filled again, fresh for the transform");
+    assert_eq!(events.unmaps.load(Ordering::Relaxed), 0, "reused in place, never unmapped");
+    let fill = *events.fences.lock().first().unwrap();
+    assert_eq!(ready, Event(fill));
+    assert_eq!(*events.waits.lock(), vec![(release, 0), (fill, 2)], "the copy after the release, the binder after the copy: in-stream");
+    gate.open();
+    completes.join().unwrap();
+}
+
+/// A custody whose answers wait for `gate`.
+fn gated_custody(gpu: &str, gate: Arc<Gate>) {
+    let uid = unsafe { libc::geteuid() };
+    let addr = SocketAddr::from_abstract_name(format!("cozy-varena-{uid}-custody-{gpu}")).unwrap();
+    let listener = UnixListener::bind_addr(&addr).unwrap();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let mut s = s.unwrap();
+            let gate = gate.clone();
+            std::thread::spawn(move || loop {
+                let mut head = [0u8; 5];
+                if s.read_exact(&mut head).is_err() {
+                    return;
+                }
+                let len = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
+                let mut body = vec![0u8; len];
+                s.read_exact(&mut body).unwrap();
+                if head[4] == 1 {
+                    let mut marker = [0u8; 1];
+                    let _ = s.read(&mut marker);
+                }
+                gate.pass();
+                let call = String::from_utf8_lossy(&body).to_string();
+                let reply = if call.contains("Import") { r#"{"Imported":{"found":false}}"# } else if call.contains("Release") { r#"{"Released":{"freed":0}}"# } else { r#""Done""# };
+                let mut out = (reply.len() as u32).to_le_bytes().to_vec();
+                out.push(0);
+                out.extend_from_slice(reply.as_bytes());
+                if s.write_all(&out).is_err() {
+                    return;
+                }
+            });
+        }
+    });
+}
+
+/// Round 2, finding 1 (the reviewer's deadlock): with custody answering nothing, a binder on a
+/// filling page while exports queue, and an unload whose withdraw queues behind them, both
+/// return. Exports and withdraws go to one sender thread and no caller waits on them; no thread
+/// holds the state lock with another. (A load's import is a question it waits on custody for.)
+#[test]
+fn no_call_waits_on_custody() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("deadlock-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 64 << 20 };
+    let custody = Arc::new(Gate::default());
+    custody.open();
+    gated_custody(&uuid, custody.clone());
+    let events = Arc::new(Events::default());
+    let backend = Stream { host: HostBackend::new(g.memory), events: events.clone() };
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(backend)).unwrap());
+    let named = |name: &str| {
+        let mut s = set(dir.path(), &uuid);
+        let mut layout = (*s.layout).clone();
+        layout.digest = format!("layout-{name}-{uuid}");
+        s.name = name.into();
+        s.fingerprint = Fingerprint::new(&layout, &[], Fill::Stored, "release-1", "0/1", &uuid);
+        s.layout = Arc::new(layout);
+        s
+    };
+    let c = mem.load(named("c"), Level::Gpu).unwrap();
+    let a = mem.load(named("a"), Level::Ram).unwrap();
+    let b = mem.load(named("b"), Level::Ram).unwrap();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["b".into(), "a".into()], passes: 1 }] }).unwrap();
+    let _pass = r.pass(b, "1x1", Torch::default()).unwrap();
+    // Custody stops answering. A's page is filled and kept: its export holds the sender thread.
+    custody.close();
+    drop(mem.bind(a, 0, 0).unwrap());
+    // X binds B, whose fill holds in its fence (a long copy): X waits for the fill.
+    events.hold_fence.store(true, Ordering::SeqCst);
+    let x = {
+        let mem = mem.clone();
+        std::thread::spawn(move || drop(mem.bind(b, 0, 0).unwrap()))
+    };
+    // Meanwhile C is unloaded: its withdraw queues too.
+    mem.unload(c);
+    events.fence_gate.open();
+    x.join().unwrap();
+    // Everything returned with custody still answering nothing.
+    custody.open();
 }

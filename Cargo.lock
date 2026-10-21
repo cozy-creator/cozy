@@ -4719,6 +4719,7 @@ dependencies = [
 name = "varena"
 version = "0.13.0"
 dependencies = [
+ "crossbeam-channel",
  "libc",
  "parking_lot",
  "platform",

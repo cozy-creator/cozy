@@ -7,20 +7,27 @@
 //! own table's derivation. Asks go to a row's own ask thread over a socket named by the row's
 //! offset and generation: the answer or the victim's death ends the wait, and a reused offset
 //! reads as gone. Facts (peaks, rooms, dispatches) are immutable records, a newer version
-//! superseding an older one.
+//! superseding an older one; a write merges with the newest under the heap lock.
+//!
+//! Locks: the heap lock (this process's threads by a mutex, other processes by an OFD lock) and
+//! a row's ask and latch locks are leaves: nothing else is locked while one is held (the heap
+//! maps the table afresh rather than through the shared handle). Every process with the table
+//! open holds a read lock on [`OPEN`]; the last row to leave unlinks the name only when it can
+//! take that lock for writing, so nobody is left holding a table nobody else can find.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{fence, AtomicU32, AtomicU64};
-use std::sync::Arc;
+use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64};
+use std::sync::{Arc, Weak};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use platform::handles::Owned;
 use serde::{Deserialize, Serialize};
 
 use crate::custody;
 use crate::decide::{self, Admitted};
 use crate::os::{self, Listener, Map};
+use crate::memory::SitePeak;
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
@@ -31,6 +38,9 @@ const HEADER: u64 = 4096;
 const CELL: u64 = 256;
 const ROW_CELLS: u64 = 2;
 const FACT_HEAD: u64 = 24;
+/// The header bytes every opener read-locks while it has the table open (the heap lock is the
+/// eight before them).
+const OPEN: u64 = 8;
 
 const FREE: u64 = 0;
 const CLAIMING: u64 = 1;
@@ -61,7 +71,9 @@ struct RowRec {
     pid: AtomicU32,
     /// Its ask thread's id: TensorD's `stalled` reads that thread's state.
     tid: AtomicU32,
-    /// Bytes asked of it and not yet answered (display).
+    /// The row this one is asking now (its id; 0: none) and the bytes: the asker's own record,
+    /// never the victim's.
+    asking: AtomicU64,
     asked: AtomicU64,
     /// Kept pages no live process maps (the custody service's row).
     orphans: AtomicU64,
@@ -151,6 +163,8 @@ pub(crate) struct RowView {
     pub live: bool,
     pub facts: Facts,
     pub orphans: u64,
+    /// The row it is asking now (0: none) and the bytes.
+    pub asking: u64,
     pub asked: u64,
     pub tid: u32,
 }
@@ -177,11 +191,39 @@ struct Answer {
 
 /// The table mapped in this process.
 pub(crate) struct Shared {
-    /// This process's description: mapped and used for the heap lock, never for a row lock.
+    /// This process's description: mapped and used for the heap and open locks, never for a
+    /// row lock.
     fd: Owned,
     map: RwLock<Arc<Map>>,
+    /// The heap lock's half for this process's threads: an OFD lock is per description, so it
+    /// excludes only other processes.
+    heap: Mutex<()>,
     pub name: String,
     events: Option<Owned>,
+}
+
+/// The heap lock, held.
+struct Heap<'a> {
+    fd: &'a Owned,
+    _threads: MutexGuard<'a, ()>,
+}
+
+impl Drop for Heap<'_> {
+    fn drop(&mut self) {
+        let _ = os::unlock(self.fd, 0, 8);
+    }
+}
+
+/// Takes the table's name for a new user: read-locked open, so the last row leaving does not
+/// unlink it under them; a name unlinked meanwhile is taken again.
+fn open_named(name: &str) -> Result<Owned> {
+    loop {
+        let table = os::shared(name, true)?;
+        os::share(&table, OPEN, 8, true)?;
+        if os::linked(&table)? {
+            return Ok(table);
+        }
+    }
 }
 
 impl Shared {
@@ -190,6 +232,10 @@ impl Shared {
     pub fn adopt(fd: Owned, gpu: &GpuId, capacity: u64, events: Option<Owned>) -> Result<Shared> {
         let fd = os::reopen(&fd, true)?;
         os::own(&fd)?;
+        os::share(&fd, OPEN, 8, true)?;
+        if !os::linked(&fd)? {
+            return Err(Error::Closed(format!("the table of {} was unlinked", gpu.uuid)));
+        }
         // Initialisation is one writer's: the heap lock serialises it.
         os::lock(&fd, 0, 8, true)?;
         let init = (|| -> Result<Map> {
@@ -211,11 +257,25 @@ impl Shared {
         })();
         os::unlock(&fd, 0, 8)?;
         let map = init?;
-        Ok(Shared { fd, map: RwLock::new(Arc::new(map)), name: gpu.uuid.clone(), events })
+        Ok(Shared { fd, map: RwLock::new(Arc::new(map)), heap: Mutex::new(()), name: gpu.uuid.clone(), events })
     }
 
     pub fn descriptor(&self) -> Result<Owned> {
         os::reopen(&self.fd, true)
+    }
+
+    fn heap(&self) -> Result<Heap<'_>> {
+        let threads = self.heap.lock();
+        os::lock(&self.fd, 0, 8, true)?;
+        Ok(Heap { fd: &self.fd, _threads: threads })
+    }
+
+    /// `m`, or under the heap lock a mapping of its own when `m` ends before `len`.
+    fn covering(&self, m: Arc<Map>, len: u64) -> Result<Arc<Map>> {
+        if m.len as u64 >= len {
+            return Ok(m);
+        }
+        Ok(Arc::new(os::map(&self.fd, os::size(&self.fd)? as usize, true)?))
     }
 
     /// The current mapping, remapped when the heap outgrew it.
@@ -271,23 +331,7 @@ impl Shared {
             let m = self.map()?;
             let h = header(&m);
             let shape = h.shape.load(Acquire);
-            let end = h.end.load(Acquire).min(m.len as u64);
-            let mut out = vec![];
-            let mut at = HEADER;
-            let mut torn = false;
-            while at < end {
-                let Some(w) = atomic(&m, at) else { break };
-                let w = w.load(Acquire);
-                if cells(w) == 0 || at + cells(w) * CELL > end {
-                    torn = true;
-                    break;
-                }
-                if state(w) == READY {
-                    out.extend(f(&m, at, w));
-                }
-                at += cells(w) * CELL;
-            }
-            fence(Acquire);
+            let (out, torn, at) = scan(&m, &mut f);
             if h.shape.load(Acquire) == shape {
                 // A record is written before the end moves past it: torn at a steady shape is a
                 // broken table, not a race.
@@ -302,14 +346,14 @@ impl Shared {
     /// Allocates `n` cells under the heap lock: the first free run that fits, else the end.
     /// Returns the record's offset and its READY word.
     fn alloc(&self, n: u64, kind: u64, init: impl FnOnce(&Map, u64)) -> Result<(u64, u64)> {
-        os::lock(&self.fd, 0, 8, true)?;
-        let at = self.alloc_locked(n, kind, init);
-        os::unlock(&self.fd, 0, 8)?;
-        at
+        let m = self.map()?;
+        let _heap = self.heap()?;
+        self.alloc_locked(m, n, kind, init).map(|(at, ready, _)| (at, ready))
     }
 
-    fn alloc_locked(&self, n: u64, kind: u64, init: impl FnOnce(&Map, u64)) -> Result<(u64, u64)> {
-        let m = self.map()?;
+    /// Under the heap lock; also returns a mapping that covers the record.
+    fn alloc_locked(&self, m: Arc<Map>, n: u64, kind: u64, init: impl FnOnce(&Map, u64)) -> Result<(u64, u64, Arc<Map>)> {
+        let m = self.covering(m.clone(), header(&m).end.load(Acquire))?;
         let end = header(&m).end.load(Acquire);
         // First fit over free runs, merging neighbours as it walks.
         let (mut at, mut run_start, mut run) = (HEADER, None, 0u64);
@@ -343,13 +387,7 @@ impl Shared {
                 }
                 found = Some(start);
                 grown = (need > end).then_some(need);
-                if m.len as u64 >= need {
-                    m
-                } else {
-                    let mut slot = self.map.write();
-                    *slot = Arc::new(os::map(&self.fd, os::size(&self.fd)? as usize, true)?);
-                    slot.clone()
-                }
+                self.covering(m, need)?
             }
         };
         let start = found.unwrap_or(end);
@@ -367,25 +405,37 @@ impl Shared {
             h.end.store(end, Release);
         }
         h.shape.fetch_add(1, AcqRel);
-        Ok((start, word(n, g, kind, READY)))
+        Ok((start, word(n, g, kind, READY), m))
     }
 
     /// Frees the record at `at` if its word is still `seen` (and, `dead`, no one holds its row
     /// lock): a stale reader frees nothing newer.
     fn free(&self, at: u64, seen: u64, dead: bool) -> Result<bool> {
-        os::lock(&self.fd, 0, 8, true)?;
-        let freed = (|| -> Result<bool> {
-            let m = self.map()?;
-            let Some(w) = atomic(&m, at) else { return Ok(false) };
-            if w.load(Acquire) != seen || (dead && os::held(&self.fd, at, ROW_CELLS * CELL)?) {
-                return Ok(false);
-            }
-            w.store(word(cells(seen), 0, 0, FREE), Release);
-            header(&m).shape.fetch_add(1, AcqRel);
-            Ok(true)
-        })();
-        os::unlock(&self.fd, 0, 8)?;
-        freed
+        let m = self.map()?;
+        let _heap = self.heap()?;
+        self.free_locked(m, at, seen, dead)
+    }
+
+    fn free_locked(&self, m: Arc<Map>, at: u64, seen: u64, dead: bool) -> Result<bool> {
+        let m = self.covering(m, at + cells(seen) * CELL)?;
+        let Some(w) = atomic(&m, at) else { return Ok(false) };
+        if w.load(Acquire) != seen || (dead && os::held(&self.fd, at, ROW_CELLS * CELL)?) {
+            return Ok(false);
+        }
+        w.store(word(cells(seen), 0, 0, FREE), Release);
+        header(&m).shape.fetch_add(1, AcqRel);
+        Ok(true)
+    }
+
+    /// After a row left: with no row left and nobody else holding the table open, its name
+    /// goes (a standalone engine's table, its last user gone).
+    fn leave(&self) -> Result<()> {
+        if !self.rows()?.is_empty() || !os::lock(&self.fd, OPEN, 8, false)? {
+            return Ok(());
+        }
+        os::unlink(&self.name);
+        os::share(&self.fd, OPEN, 8, false)?;
+        Ok(())
     }
 
     // ---- rows
@@ -397,7 +447,7 @@ impl Shared {
             if let Some(r) = row(m, at) {
                 r.pid.store(pid, Relaxed);
                 r.tid.store(0, Relaxed);
-                [&r.asked, &r.orphans, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
+                [&r.asking, &r.asked, &r.orphans, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
                 r.latch.iter().flatten().for_each(|a| a.store(0, Relaxed));
             }
         })?;
@@ -409,7 +459,7 @@ impl Shared {
         let m = self.map()?;
         let rec = row(&m, at).ok_or_else(|| Error::Internal("ledger row".into()))?;
         rec.word.store(ready, Release);
-        Ok(Row { shared: self.clone(), at, word: ready, _lock: lock, words: Mutex::new([0; WORDS]) })
+        Ok(Row { shared: self.clone(), at, word: ready, _lock: lock, latch: Mutex::new(()), asking: Mutex::new(()) })
     }
 
     pub fn rows(&self) -> Result<Vec<RowView>> {
@@ -419,7 +469,7 @@ impl Shared {
             }
             let r = row(m, at)?;
             let facts = Facts::of(latch_read(&r.seq, &r.latch));
-            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), asked: r.asked.load(Acquire), tid: r.tid.load(Acquire) })
+            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), asking: r.asking.load(Acquire), asked: r.asked.load(Acquire), tid: r.tid.load(Acquire) })
         })?;
         views
             .into_iter()
@@ -444,26 +494,14 @@ impl Shared {
         Ok(any)
     }
 
-    /// Asks row `id` for `bytes` under `ceiling`: its ask thread answers from its pages at once.
-    /// Returns what it freed; a dead or reused row frees nothing.
-    pub fn ask(&self, id: u64, ceiling: Class, bytes: u64) -> Result<u64> {
+    /// Whether `id` still names a live row record (a reused offset is another row).
+    fn names(&self, id: u64) -> Result<bool> {
         let at = (id >> 16) * CELL;
         let m = self.map()?;
-        let Some(r) = row(&m, at) else { return Ok(0) };
-        let w = r.word.load(Acquire);
-        if state(w) != READY || kind(w) != ROW || row_id(at, w) != id {
-            return Ok(0);
-        }
-        r.asked.fetch_add(bytes, AcqRel);
-        if let Some(e) = &self.events {
-            os::signal(e);
-        }
-        let freed = match os::connect(&ask_name(&self.name, id))? {
-            Some(stream) => os::call::<_, Answer>(&stream, &Ask::Room { ceiling: ceiling.index(), bytes }, None).map_or(0, |(a, _)| a.freed),
-            None => 0,
-        };
-        r.asked.fetch_sub(bytes, AcqRel);
-        Ok(freed)
+        Ok(row(&m, at).is_some_and(|r| {
+            let w = r.word.load(Acquire);
+            state(w) == READY && kind(w) == ROW && row_id(at, w) == id
+        }))
     }
 
     // ---- facts
@@ -494,17 +532,32 @@ impl Shared {
 
     /// Writes `key` (a newer version supersedes the old record); `None` deletes it.
     pub fn put(&self, key: &str, value: Option<&[u8]>) -> Result<()> {
-        let old: Vec<(u64, u64, u64)> = self.records(|m, at, w| {
+        self.merge(key, |_| value.map(<[u8]>::to_vec))
+    }
+
+    /// Writes `key` as `f` makes it from its newest value, atomically across processes (under
+    /// the heap lock): concurrent writers merge rather than overwrite. `None` deletes it.
+    pub fn merge(&self, key: &str, f: impl FnOnce(Option<&[u8]>) -> Option<Vec<u8>>) -> Result<()> {
+        let m = self.map()?;
+        let _heap = self.heap()?;
+        let m = self.covering(m.clone(), header(&m).end.load(Acquire))?;
+        // The heap's shape cannot move under its lock: one scan is a steady one.
+        let (old, ..) = scan(&m, &mut |m: &Map, at, w| {
             if kind(w) != FACT {
                 return None;
             }
-            let (k, _, version) = fact(m, at)?;
-            (k == key).then_some((at, w, version))
-        })?;
+            let (k, value, version) = fact(m, at)?;
+            (k == key).then_some((at, w, version, value))
+        });
+        let newest = old.iter().max_by_key(|(_, _, v, _)| *v);
+        let value = f(newest.map(|(.., v)| v.as_slice()));
+        if value.as_ref() == newest.map(|(.., v)| v) && old.len() <= 1 {
+            return Ok(());
+        }
         if let Some(value) = value {
-            let version = old.iter().map(|(.., v)| *v).max().unwrap_or(0) + 1;
+            let version = newest.map_or(0, |(_, _, v, _)| *v) + 1;
             let bytes = FACT_HEAD + key.len() as u64 + value.len() as u64;
-            let (at, ready) = self.alloc(bytes.div_ceil(CELL), FACT, |m, at| {
+            let (at, ready, m) = self.alloc_locked(m.clone(), bytes.div_ceil(CELL), FACT, |m, at| {
                 // SAFETY: a CLAIMING record of `bytes.div_ceil(CELL)` cells inside the map: no
                 // reader parses it.
                 unsafe {
@@ -517,14 +570,33 @@ impl Shared {
                     std::ptr::copy_nonoverlapping(value.as_ptr(), body.add(key.len()), value.len());
                 }
             })?;
-            let m = self.map()?;
             atomic(&m, at).ok_or_else(|| Error::Internal("ledger fact".into()))?.store(ready, Release);
         }
-        for (at, w, _) in old {
-            self.free(at, w, false)?;
+        for (at, w, ..) in old {
+            self.free_locked(m.clone(), at, w, false)?;
         }
         Ok(())
     }
+}
+
+/// Merges a request's peak into `peak/<key>`: the larger stays, whoever writes last.
+pub(crate) fn record_peak(shared: &Shared, key: &str, bytes: u64) -> Result<()> {
+    shared.merge(&format!("peak/{key}"), |old| {
+        let known = old.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes);
+        Some(known.map_or(bytes, |k| k.max(bytes)).to_le_bytes().to_vec())
+    })
+}
+
+/// Merges a pass's room into `room/<key>`, field by field the larger; returns the merged room.
+pub(crate) fn record_room(shared: &Shared, key: &str, room: &Room) -> Result<Room> {
+    let mut merged = room.clone();
+    shared.merge(&format!("room/{key}"), |old| {
+        if let Some(known) = old.and_then(|v| serde_json::from_slice::<Room>(v).ok()) {
+            merged = known.max(room);
+        }
+        serde_json::to_vec(&merged).ok()
+    })?;
+    Ok(merged)
 }
 
 fn ask_name(gpu: &str, id: u64) -> String {
@@ -547,8 +619,10 @@ pub(crate) struct Row {
     at: u64,
     word: u64,
     _lock: Owned,
-    /// The latch's words as last written; one writer at a time.
-    words: Mutex<[u64; WORDS]>,
+    /// One latch writer at a time.
+    latch: Mutex<()>,
+    /// One ask out at a time: the record names one victim.
+    asking: Mutex<()>,
 }
 
 impl Row {
@@ -566,9 +640,11 @@ impl Row {
     }
 
     pub fn publish(&self, facts: &Facts) {
-        let mut words = self.words.lock();
-        *words = facts.words();
-        self.rec(|r| latch_write(&r.seq, &r.latch, &words));
+        // Mapped first: the latch lock is a leaf.
+        let Ok(m) = self.shared.map() else { return };
+        let Some(r) = row(&m, self.at) else { return };
+        let _one = self.latch.lock();
+        latch_write(&r.seq, &r.latch, &facts.words());
     }
 
     /// The custody service's orphans; a change is a ledger event.
@@ -576,6 +652,31 @@ impl Row {
         if self.rec(|r| r.orphans.swap(bytes, AcqRel) != bytes).unwrap_or(false) {
             self.shared.ring();
         }
+    }
+
+    /// Asks row `id` for `bytes` under `ceiling`: its ask thread answers from its pages at once.
+    /// Returns what it freed; a dead or reused row frees nothing. What is asked is in this row's
+    /// own record while the ask is out; one ask at a time per row.
+    pub fn ask(&self, id: u64, ceiling: Class, bytes: u64) -> Result<u64> {
+        if !self.shared.names(id)? {
+            return Ok(0);
+        }
+        // Mapped first: the ask lock is a leaf (held across the call, it locks nothing else).
+        let m = self.shared.map()?;
+        let rec = row(&m, self.at).ok_or_else(|| Error::Internal("ledger row".into()))?;
+        let _one = self.asking.lock();
+        rec.asked.store(bytes, Release);
+        rec.asking.store(id, Release);
+        if let Some(e) = &self.shared.events {
+            os::signal(e);
+        }
+        let freed = match os::connect(&ask_name(&self.shared.name, id)) {
+            Ok(Some(stream)) => os::call::<_, Answer>(&stream, &Ask::Room { ceiling: ceiling.index(), bytes }, None).map_or(0, |(a, _)| a.freed),
+            _ => 0,
+        };
+        rec.asking.store(0, Release);
+        rec.asked.store(0, Release);
+        Ok(freed)
     }
 
     /// Binds this row's ask socket: its owner's ask thread serves it.
@@ -599,13 +700,20 @@ impl Row {
         let _ = os::connect(&ask_name(&self.shared.name, self.id()));
     }
 
-    /// Serves one asker: reads its ask and replies with what `answer` freed.
-    pub fn serve(&self, stream: &os::Stream, answer: impl FnOnce(Ask) -> u64) -> Result<()> {
-        let Some((bytes, _)) = os::recv(stream)? else { return Ok(()) };
-        let freed = answer(os::decode(&bytes)?);
-        os::send(stream, &(os::encode(&Answer { freed })?, None))?;
-        self.shared.ring();
-        Ok(())
+    /// Serves this row's asks until `stop`: every asker (of this user only) at once, each
+    /// answered with what `answer` freed. A silent or stopped asker holds up nobody's answer.
+    pub fn serve_asks(listener: os::Listener, stop: &AtomicBool, row: &Weak<Row>, mut answer: impl FnMut(Ask) -> u64) {
+        os::serve_all(listener, stop, |body| {
+            let freed = os::decode::<Ask>(body).map_or(0, &mut answer);
+            if let Some(r) = row.upgrade() {
+                r.shared.ring();
+            }
+            let reply = os::encode(&Answer { freed }).unwrap_or_default();
+            let mut framed = (reply.len() as u32).to_le_bytes().to_vec();
+            framed.push(0);
+            framed.extend_from_slice(&reply);
+            framed
+        });
     }
 }
 
@@ -615,8 +723,29 @@ impl Drop for Row {
         self.set_orphans(0);
         if self.shared.free(self.at, self.word, false).unwrap_or(false) {
             self.shared.ring();
+            let _ = self.shared.leave();
         }
     }
+}
+
+/// The READY records of `m` through `f`, whether the walk was torn, and where it stopped.
+fn scan<T>(m: &Map, f: &mut impl FnMut(&Map, u64, u64) -> Option<T>) -> (Vec<T>, bool, u64) {
+    let end = header(m).end.load(Acquire).min(m.len as u64);
+    let mut out = vec![];
+    let mut at = HEADER;
+    while at < end {
+        let Some(w) = atomic(m, at) else { break };
+        let w = w.load(Acquire);
+        if cells(w) == 0 || at + cells(w) * CELL > end {
+            return (out, true, at);
+        }
+        if state(w) == READY {
+            out.extend(f(m, at, w));
+        }
+        at += cells(w) * CELL;
+    }
+    fence(Acquire);
+    (out, false, at)
 }
 
 fn header(m: &Map) -> &Header {
@@ -702,6 +831,11 @@ pub(crate) fn remotes(rows: &[RowView], own: u64) -> (Vec<Remote>, u64) {
     (others, orphans)
 }
 
+/// Bytes the live rows are asking of row `id` now (each asker's own record).
+fn asked_of(rows: &[RowView], id: u64) -> u64 {
+    rows.iter().filter(|r| r.live && r.asking == id).map(|r| r.asked).sum()
+}
+
 /// Every row's held bytes, for foreign bytes.
 pub(crate) fn held(rows: &[RowView]) -> u64 {
     rows.iter().map(|r| r.facts.held() + r.orphans).sum()
@@ -722,7 +856,8 @@ impl Grant {
     /// lower it).
     pub fn open(gpu: &GpuId, limit: Option<u64>) -> Result<Grant> {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
-        let table = os::shared(&gpu.uuid, true)?;
+        // Read-locked open while the grant lives.
+        let table = open_named(&gpu.uuid)?;
         let events = os::event()?;
         drop(Shared::adopt(os::dup(&table)?, gpu, capacity, None)?);
         Ok(Grant { table, events })
@@ -763,24 +898,41 @@ pub struct Peak {
     /// `<package>|<shape>` (a request's largest working set) or `<set>|<shape>|<cuts>` (a
     /// pass's room and its sites).
     pub key: String,
+    /// A request's largest working set; a pass's room beyond its start allocation.
     pub bytes: u64,
-    /// Each cut site's peak, for a pass.
-    pub sites: Vec<(String, u64)>,
+    /// A pass's allocation at its start (what earlier steps left allocated); 0 for a request.
+    pub start: u64,
+    /// Each cut site's peak and collective flag, for a pass.
+    pub sites: Vec<SitePeak>,
 }
 
-/// A pass's measured room, as the ledger keeps it under `room/<set>|<shape>|<cuts>`.
+/// A pass's measured room, as the ledger keeps it under `room/<set>|<shape>|<cuts>`. One unit
+/// everywhere: the absolute room is the start allocation plus [`Room::bytes`], with the start
+/// measured per (set, shape); a running pass uses its own start allocation instead.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Room {
+    pub start: u64,
     /// Allocated peak less what was allocated at the pass's start.
     pub delta: u64,
     pub slack: u64,
     pub context: u64,
-    pub sites: Vec<(String, u64)>,
+    pub sites: Vec<SitePeak>,
 }
 
 impl Room {
+    /// Beyond the start allocation.
     pub fn bytes(&self) -> u64 {
         self.delta + self.slack + self.context
+    }
+
+    pub fn absolute(&self) -> u64 {
+        self.start + self.bytes()
+    }
+
+    /// Each field's larger, and the newer sites when they were measured.
+    pub fn max(&self, newer: &Room) -> Room {
+        let sites = if newer.sites.is_empty() { self.sites.clone() } else { newer.sites.clone() };
+        Room { start: self.start.max(newer.start), delta: self.delta.max(newer.delta), slack: self.slack.max(newer.slack), context: self.context.max(newer.context), sites }
     }
 }
 
@@ -798,7 +950,7 @@ impl Ledger {
     pub fn create(gpu: &GpuId, limit: Option<u64>) -> Result<Ledger> {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
         let events = os::event()?;
-        let table = os::shared(&gpu.uuid, true)?;
+        let table = open_named(&gpu.uuid)?;
         let shared = Arc::new(Shared::adopt(table, gpu, capacity, Some(os::dup(&events)?))?);
         shared.reap(None)?;
         let custody = custody::Client::open(&shared)?;
@@ -884,11 +1036,11 @@ impl Ledger {
         let mut out = vec![];
         for (key, v) in self.shared.facts("peak/").unwrap_or_default() {
             let bytes = v.try_into().map(u64::from_le_bytes).unwrap_or(0);
-            out.push(Peak { key: key.trim_start_matches("peak/").to_string(), bytes, sites: vec![] });
+            out.push(Peak { key: key.trim_start_matches("peak/").to_string(), bytes, start: 0, sites: vec![] });
         }
         for (key, v) in self.shared.facts("room/").unwrap_or_default() {
             if let Ok(room) = serde_json::from_slice::<Room>(&v) {
-                out.push(Peak { key: key.trim_start_matches("room/").to_string(), bytes: room.bytes(), sites: room.sites });
+                out.push(Peak { key: key.trim_start_matches("room/").to_string(), bytes: room.bytes(), start: room.start, sites: room.sites });
             }
         }
         out
@@ -899,10 +1051,10 @@ impl Ledger {
     pub fn restore(&self, peaks: &[Peak]) -> Result<()> {
         for p in peaks {
             match p.key.matches('|').count() {
-                1 => self.shared.put(&format!("peak/{}", p.key), Some(&p.bytes.to_le_bytes()))?,
+                1 => record_peak(&self.shared, &p.key, p.bytes)?,
                 _ => {
-                    let room = Room { delta: p.bytes, slack: 0, context: 0, sites: p.sites.clone() };
-                    self.shared.put(&format!("room/{}", p.key), Some(&os::encode(&room)?))?;
+                    let room = Room { start: p.start, delta: p.bytes, slack: 0, context: 0, sites: p.sites.clone() };
+                    record_room(&self.shared, &p.key, &room)?;
                 }
             }
         }
@@ -927,18 +1079,19 @@ impl Ledger {
             foreign,
             rows: rows
                 .iter()
-                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, asked: r.asked })
+                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, asked: asked_of(&rows, r.id()) })
                 .collect(),
             dispatched: dispatched.into_iter().map(|(k, v)| (k.trim_start_matches("dispatch/").to_string(), String::from_utf8_lossy(&v).into_owned())).collect(),
         }
     }
 
-    /// Executors whose ask thread cannot answer, by its measured state: stopped (`T`, `t`) or
-    /// its process a zombie. A running or sleeping thread is never stalled; nothing is counted
-    /// or timed. Off Linux nothing is reported. TensorD ends what it returns.
+    /// Executors with an ask pending to them whose ask thread cannot answer, by its measured
+    /// state: stopped (`T`, `t`) or its process a zombie. A running or sleeping thread is never
+    /// stalled, nor a stopped one nobody is asking; nothing is counted or timed. Off Linux
+    /// nothing is reported. TensorD ends what it returns.
     pub fn stalled(&self) -> Vec<u32> {
         let rows = self.shared.rows().unwrap_or_default();
-        rows.iter().filter(|r| r.tid != 0 && os::stalled(r.pid, r.tid)).map(|r| r.pid).collect()
+        rows.iter().filter(|r| r.tid != 0 && asked_of(&rows, r.id()) > 0 && os::stalled(r.pid, r.tid)).map(|r| r.pid).collect()
     }
 
     /// Readable when room frees, a row dies or a peak is recorded; reading it clears it.
@@ -989,7 +1142,7 @@ mod tests {
         shared.put("k", Some(b"2")).unwrap();
         assert_eq!(shared.fact("k").unwrap(), Some(b"2".to_vec()));
         // An ask to the freed row's id reads it as gone, never a hang.
-        assert_eq!(shared.ask(row_id(at, stale), Class::N, 1).unwrap(), 0);
+        assert_eq!(second.ask(row_id(at, stale), Class::N, 1).unwrap(), 0);
         drop(second);
         os::unlink(&gpu.uuid);
     }

@@ -28,12 +28,14 @@ pub struct Tried {
 pub enum Trigger {
     /// A bind of an unmapped page, for `req` when a request's pass binds it.
     Bind { page: Key, req: Option<u64>, tried: Tried },
-    /// A pass of `req` starts needing `room` (measured at its cut levels), or, unmeasured, the
-    /// reserve `unmeasured` sets aside: the room and its step's unmapped pages must fit.
-    Pass { req: u64, room: Option<u64>, unmeasured: u64, tried: Tried },
-    /// An op of `req` ran short by `need` (at least one page's worth when unknown) at `site`;
-    /// a collective site recovers locally and proposes its finer level for the next pass.
-    Oom { req: u64, need: Option<u64>, site: Option<String>, collective: bool, tried: Tried },
+    /// A pass of `req` over `set` starts needing `room` (measured at its cut levels), or,
+    /// unmeasured, the reserve `unmeasured` sets aside: the room and its step's unmapped pages
+    /// must fit.
+    Pass { req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried: Tried },
+    /// An op of `req`'s pass over `set` ran short by `need` (at least one page's worth when
+    /// unknown) at `site`; a collective site recovers locally and proposes its finer level for
+    /// the next pass.
+    Oom { req: u64, set: u32, need: Option<u64>, site: Option<String>, collective: bool, tried: Tried },
     /// Another row asks for `bytes` under `ceiling`.
     Ask { ceiling: Class, bytes: u64 },
     /// Fetch ahead for `req` into the surplus.
@@ -63,12 +65,14 @@ pub enum Action {
     Claim { req: u64, bytes: u64 },
     /// The pass's room, set in the same apply as the evictions that made it.
     Reserve { req: u64, room: u64, measured: bool },
-    /// Cut `site` one level finer; the cut level last had `failed_at` bytes of room.
-    Cut { req: u64, site: String, failed_at: u64 },
+    /// Cut `site` of the pass over `set` one level finer; the cut level last had `failed_at`
+    /// bytes of room.
+    Cut { req: u64, set: u32, site: String, failed_at: u64 },
     /// Relax `site` one level: its measured room fits the surplus.
-    Relax { req: u64, site: String },
-    /// A collective site's finer level, proposed for the next pass's agreement.
-    Propose { req: u64, site: String },
+    Relax { req: u64, set: u32, site: String },
+    /// A collective site's level proposed for the next agreement: finer after an OOM (whose
+    /// room was `failed_at`), or one coarser when its measured room fits the surplus.
+    Propose { req: u64, set: u32, site: String, level: u32, failed_at: Option<u64> },
     /// Lower the request's watermark for the rest of it: its W becomes evictable.
     Lower(u64),
     Park(u64),
@@ -89,8 +93,8 @@ pub fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> {
             }
             d.out
         }
-        Trigger::Pass { req, room, unmeasured, tried } => pass(t, *req, *room, *unmeasured, tried),
-        Trigger::Oom { req, need, site, collective, tried } => oom(t, *req, *need, site.as_deref(), *collective, tried),
+        Trigger::Pass { req, set, room, unmeasured, tried } => pass(t, *req, *set, *room, *unmeasured, tried),
+        Trigger::Oom { req, set, need, site, collective, tried } => oom(t, *req, *set, *need, site.as_deref(), *collective, tried),
         Trigger::Ask { ceiling, bytes } => answer(t, *ceiling, *bytes),
         Trigger::Speculate { req, tried } => speculate(t, *req, tried),
         Trigger::Load { set } => {
@@ -110,11 +114,13 @@ pub fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> {
 
 /// A pass start: its room and its step's unmapped pages (one page, lowered) must fit. When
 /// eviction can't, the uncut site with the highest measured peak is cut (never a collective
-/// one: ranks change those together), the room becoming the measured room at the finer level
-/// or, unmeasured there, the reserve; then the request lowers. With room to spare, a cut
-/// relaxes one level when its measured room fits and beats the room it failed at.
-fn pass(t: &Table, req: u64, room: Option<u64>, unmeasured: u64, tried: &Tried) -> Vec<Action> {
+/// one, nor one whose flag is unknown: ranks change those together), the room becoming the
+/// measured room at the finer level or, unmeasured there, the reserve; then the request lowers.
+/// With room to spare, a cut relaxes one level when its measured room fits and beats the room it
+/// failed at; a collective one is proposed one level coarser for the ranks' agreement.
+fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried: &Tried) -> Vec<Action> {
     let Some(r) = t.request(req) else { return vec![] };
+    let sites = r.sites.get(&set).map(Vec::as_slice).unwrap_or_default();
     let held = r.room + r.claimed;
     let unmapped = |lowered: bool| {
         let step = r.steps.get(r.cursor.step as usize);
@@ -133,9 +139,9 @@ fn pass(t: &Table, req: u64, room: Option<u64>, unmeasured: u64, tried: &Tried) 
             _ => {}
         }
         let fresh = |s: &&CutSite| !s.stuck && !s.collective && s.peak > 0 && !cut.contains(s.name.as_str());
-        if let Some(site) = r.sites.iter().filter(fresh).max_by_key(|s| (s.peak, std::cmp::Reverse(s.name.clone()))) {
+        if let Some(site) = sites.iter().filter(fresh).max_by_key(|s| (s.peak, std::cmp::Reverse(s.name.clone()))) {
             cut.insert(&site.name);
-            d.out.push(Action::Cut { req, site: site.name.clone(), failed_at: d.got + held });
+            d.out.push(Action::Cut { req, set, site: site.name.clone(), failed_at: d.got + held });
             (room, measured) = match site.finer {
                 Some(finer) => (finer, true),
                 None => (unmeasured, false),
@@ -158,11 +164,14 @@ fn pass(t: &Table, req: u64, room: Option<u64>, unmeasured: u64, tried: &Tried) 
     }
     // Relaxing is speculation: only into what is left once this pass has its room.
     let spare = d.got - d.need;
-    let coarser = r.sites.iter().filter(|s| s.level > 0 && !s.collective).filter_map(|s| s.coarser.map(|c| (s, c)));
+    let coarser = sites.iter().filter(|s| s.level > 0).filter_map(|s| s.coarser.map(|c| (s, c)));
     let fitting = |(_, (c, failed)): &(&CutSite, (u64, Option<u64>))| c.saturating_sub(room) <= spare && failed.is_none_or(|f| room + spare > f);
     let relax = coarser.filter(fitting).min_by_key(|(s, (c, _))| (*c, s.name.clone()));
     if let (true, Some((site, (coarse, _)))) = (measured, relax) {
-        d.out.push(Action::Relax { req, site: site.name.clone() });
+        d.out.push(match site.collective {
+            true => Action::Propose { req, set, site: site.name.clone(), level: site.level - 1, failed_at: None },
+            false => Action::Relax { req, set, site: site.name.clone() },
+        });
         room = room.max(coarse);
     }
     d.out.push(Action::Reserve { req, room, measured });
@@ -173,8 +182,9 @@ fn pass(t: &Table, req: u64, room: Option<u64>, unmeasured: u64, tried: &Tried) 
 /// what this demand freed. Then the demand order; at its end, a cut of the op's site (never a
 /// collective's mid-pass: its finer level is proposed for the next pass), lowering, parking,
 /// exhaustion. Each answer is progress, so a sequence ends.
-fn oom(t: &Table, req: u64, need: Option<u64>, site: Option<&str>, collective: bool, tried: &Tried) -> Vec<Action> {
+fn oom(t: &Table, req: u64, set: u32, need: Option<u64>, site: Option<&str>, collective: bool, tried: &Tried) -> Vec<Action> {
     let Some(r) = t.request(req) else { return vec![Action::Exhausted { need: need.unwrap_or(0) }] };
+    let sites = r.sites.get(&set).map(Vec::as_slice).unwrap_or_default();
     // Unknown: any page's worth is progress.
     let mut d = Demand::new(t, need.unwrap_or(1), Some(req), None, tried);
     d.oom = true;
@@ -184,7 +194,8 @@ fn oom(t: &Table, req: u64, need: Option<u64>, site: Option<&str>, collective: b
     let mut out = vec![];
     if let (Some(site), true) = (site, collective) {
         if !tried.cut.contains(site) {
-            out.push(Action::Propose { req, site: site.to_string() });
+            let level = sites.iter().find(|s| s.name == site).map_or(0, |s| s.level) + 1;
+            out.push(Action::Propose { req, set, site: site.to_string(), level, failed_at: Some(r.room + r.claimed + t.free()) });
         }
     }
     match d.run(Rungs::Oom) {
@@ -194,9 +205,9 @@ fn oom(t: &Table, req: u64, need: Option<u64>, site: Option<&str>, collective: b
         }
         Some(Done::Enough) => {}
         Some(Done::Lowered) | None => {
-            let cuttable = site.filter(|s| !collective && !r.sites.iter().any(|x| x.name == *s && x.stuck));
+            let cuttable = site.filter(|s| !collective && !sites.iter().any(|x| x.name == *s && x.stuck));
             if let Some(site) = cuttable {
-                d.out.push(Action::Cut { req, site: site.to_string(), failed_at: r.room + r.claimed + t.free() });
+                d.out.push(Action::Cut { req, set, site: site.to_string(), failed_at: r.room + r.claimed + t.free() });
             } else {
                 if !r.lowered {
                     d.out.push(Action::Lower(req));

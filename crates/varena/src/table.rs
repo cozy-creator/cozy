@@ -242,8 +242,11 @@ pub struct Req {
     pub speculated: BTreeSet<Key>,
     /// The largest known pass room per step (None: unmeasured), for the remaining W.
     pub rooms: Vec<Option<u64>>,
-    /// The current pass's cut sites.
-    pub sites: Vec<CutSite>,
+    /// The cut sites of each set's current pass (a joint step runs several).
+    pub sites: BTreeMap<u32, Vec<CutSite>>,
+    /// Waiting on a child call: the room it gave back, retaken when the wait ends. Meanwhile
+    /// its current step's pages are a later use (D) and it has no remaining W.
+    pub yielded: Option<u64>,
     pub episode: Episode,
 }
 
@@ -253,7 +256,13 @@ impl Req {
     }
 
     /// How far `key`'s next use is: (steps, passes, blocks) ahead; None when the plan has none.
+    /// A yielded request uses nothing now: its current step is one step ahead.
     pub fn distance(&self, key: Key) -> Option<(u32, u32, u32)> {
+        let d = self.plan_distance(key)?;
+        Some(if self.yielded.is_some() && d.0 == 0 { (1, d.1, d.2) } else { d })
+    }
+
+    fn plan_distance(&self, key: Key) -> Option<(u32, u32, u32)> {
         let (set, block) = key;
         let (sets, passes) = self.step(self.cursor.step)?;
         if sets.contains(&set) {
@@ -430,25 +439,45 @@ impl Table {
         sets.iter().filter_map(|s| self.sets.get(*s as usize)?.as_ref()).flat_map(|s| s.pages.iter()).map(|p| p.bytes).sum()
     }
 
-    /// A step's pages as the request holds them: all, or, lowered, its streaming slots.
+    /// A step's pages as the request holds them: all, or, lowered, every one it holds mapped
+    /// plus the streaming slots (never more than all).
     fn held_pages(&self, req: &Req, sets: &[u32]) -> u64 {
         let all = self.step_pages(sets);
         if !req.lowered {
             return all;
         }
-        let largest = sets.iter().filter_map(|s| self.sets.get(*s as usize)?.as_ref()).flat_map(|s| s.pages.iter()).map(|p| p.bytes).max().unwrap_or(0);
-        all.min(largest * SLOTS)
+        let pages = || sets.iter().filter_map(|s| self.sets.get(*s as usize)?.as_ref()).flat_map(|s| s.pages.iter());
+        let largest = pages().map(|p| p.bytes).max().unwrap_or(0);
+        let mapped: u64 = pages().filter(|p| p.mapped).map(|p| p.bytes).sum();
+        all.min(mapped + largest * SLOTS)
     }
 
-    /// The request's working set now: its current step's pages (or slots, lowered) plus its room.
+    /// The request's working set now: its current step's pages (as it holds them) plus its
+    /// room; all absolute bytes.
     pub fn w(&self, req: &Req) -> u64 {
-        req.step(req.cursor.step).map_or(0, |(sets, _)| self.held_pages(req, sets)) + req.room + req.claimed
+        self.step_held(req) + req.room + req.claimed
     }
 
-    /// The largest W left in the request's plan; `None` while a remaining step is unmeasured.
+    /// The current step's pages as the request holds them.
+    pub fn step_held(&self, req: &Req) -> u64 {
+        req.step(req.cursor.step).map_or(0, |(sets, _)| self.held_pages(req, sets))
+    }
+
+    /// The largest W left in the request's plan (absolute: each step's pages plus its room as
+    /// started from its measured start allocation, the current step's at least its room now);
+    /// `None` while a remaining step is unmeasured. A yielded request has none.
     pub fn remaining(&self, req: &Req) -> Option<u64> {
-        let steps = req.steps.iter().zip(&req.rooms).skip(req.cursor.step as usize);
-        steps.map(|((sets, _), room)| room.map(|room| self.held_pages(req, sets) + room)).try_fold(0, |m, w| w.map(|w| m.max(w)))
+        if req.yielded.is_some() {
+            return Some(0);
+        }
+        let now = req.measured.then_some(req.room + req.claimed);
+        let steps = req.steps.iter().zip(&req.rooms).enumerate().skip(req.cursor.step as usize);
+        steps
+            .map(|(i, ((sets, _), room))| {
+                let room = if i == req.cursor.step as usize { (*room).max(now) } else { *room };
+                room.map(|room| self.held_pages(req, sets) + room)
+            })
+            .try_fold(0, |m, w| w.map(|w| m.max(w)))
     }
 
     /// Pinned bytes outside every open request's current step (counted apart by `fits`).

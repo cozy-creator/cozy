@@ -6,6 +6,7 @@ publish.workspace = true
 description = "The memory of the processes computing with model weights: one GPU table, one decision procedure, kept pages and the RAM tier."
 
 [dependencies]
+crossbeam-channel = "0.5.17"
 libc.workspace = true
 parking_lot = "0.12.5"
 platform.workspace = true
