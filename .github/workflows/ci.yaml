@@ -27,7 +27,7 @@ jobs:
       # The Runtime integrator's TensorFS 0.13 class-record branch (xs053/runtime-classref,
       # cozy-runtime #1646): Runtime 0.30 on the hard cut. Source pins distinguish development
       # wheels of one version.
-      runtime_ref: 8cbf51d40bc5b6734bcacae88fec9373c0d6d6e3
+      runtime_ref: d47b972c276ec2ca0290f54f37a227dffcfd6656
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below. varena's
       # placement under a declared plan runs first, on the wheel with CPU torch.
       test: >-
@@ -53,4 +53,4 @@ jobs:
     with:
       # Hub v0.33.0 (tags and the class record) and the Runtime above, until they are released.
       tensorhub_ref: e0c6592f6aacb4c0a18369c6a9060ee1da3d873d
-      runtime_ref: 8cbf51d40bc5b6734bcacae88fec9373c0d6d6e3
+      runtime_ref: d47b972c276ec2ca0290f54f37a227dffcfd6656
