@@ -349,7 +349,8 @@ fn answer(t: &Table, ceiling: Class, bytes: u64) -> Vec<Action> {
 
 /// Prefetch for `req` into the surplus: F, then orphans, then own N, never anything with a
 /// declared use. Needs a measured pass, a declared fill and no starvation; each page once per
-/// step, nearest use first.
+/// pass, nearest use first. A page for a later step leaves that step's extra room free, so a
+/// prefetch never makes a step's room come from D or W: demand evicts what it would without it.
 fn speculate(t: &Table, req: u64, tried: &Tried) -> Vec<Action> {
     let Some(r) = t.request(req) else { return vec![] };
     if !r.measured || r.starved || t.requests.iter().any(|o| !o.measured) {
@@ -362,13 +363,18 @@ fn speculate(t: &Table, req: u64, tried: &Tried) -> Vec<Action> {
         .filter_map(|(k, p)| r.distance(k).map(|d| (k, p.bytes, d)))
         .collect();
     wanted.sort_by_key(|(k, _, d)| (*d, *k));
+    // The extra room each step ahead needs beyond the current one; `None`: unmeasured.
+    let reserve = |ahead: u32| -> Option<u64> {
+        (1..=ahead).map(|i| r.rooms.get((r.cursor.step + i) as usize).copied().flatten().map(|room| room.saturating_sub(r.room))).try_fold(0, |m, x| x.map(|x| m.max(x)))
+    };
     let mut d = Demand { got: t.free(), ..Demand::new(t, 0, Some(req), None, tried) };
     let n: Vec<(Key, u64)> = d.own(Class::N);
     let mut n = n.into_iter();
-    for (page, bytes, _) in wanted {
-        while d.got < bytes {
+    for (page, bytes, distance) in wanted {
+        let Some(keep) = reserve(distance.0) else { return d.out };
+        while d.got < bytes + keep {
             if !d.tried.orphans && t.orphans > 0 {
-                d.out.push(Action::ReleaseOrphans(bytes - d.got));
+                d.out.push(Action::ReleaseOrphans(bytes + keep - d.got));
                 return d.out;
             }
             let Some((victim, b)) = n.next() else { return d.out };

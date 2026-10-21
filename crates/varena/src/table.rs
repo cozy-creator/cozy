@@ -218,7 +218,7 @@ pub struct Req {
     pub claimed: u64,
     pub starved: bool,
     pub lowered: bool,
-    /// Pages fetched speculatively during the current step.
+    /// Pages fetched speculatively during the current pass.
     pub speculated: BTreeSet<Key>,
     /// The largest known pass room per step (None: unmeasured), for the remaining W.
     pub rooms: Vec<Option<u64>>,

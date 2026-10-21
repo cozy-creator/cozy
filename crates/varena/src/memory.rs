@@ -1173,8 +1173,9 @@ impl Inner {
         let begun = r.cursor.passes.get(&set).copied().unwrap_or(0);
         let later = (i + 1..r.steps.len() as u32).find(|j| r.steps.get(*j as usize).is_some_and(|(s, _)| s.contains(&set)));
         let first = begun == 0 && r.cursor.passes.is_empty();
-        if let Some(passes) = current.filter(|p| begun < *p || later.is_none()) {
-            let _ = passes;
+        // Each page is fetched ahead at most once per pass.
+        r.speculated.clear();
+        if current.is_some_and(|p| begun < p || later.is_none()) {
             r.cursor.passes.insert(set, begun + 1);
             r.cursor.next.insert(set, 0);
             return Ok(first);
@@ -1190,7 +1191,6 @@ impl Inner {
         };
         r.cursor = crate::table::Cursor { step: j, passes: BTreeMap::from([(set, 1)]), next: BTreeMap::from([(set, 0)]) };
         r.starved = false;
-        r.speculated.clear();
         Ok(true)
     }
 
