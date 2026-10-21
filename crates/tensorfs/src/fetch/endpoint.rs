@@ -7,8 +7,8 @@
 //!   present. [`upload_tree`] sends chunks, assets and repo files, then headers, then the tree
 //!   (the commit), then moves a tag to it.
 //! - **Refs.** [`Endpoint::update_repo`] PUTs the whole document under `If-Match` or
-//!   `If-None-Match: *` and, on `412`, reads it again and re-applies the change, a bounded number
-//!   of times.
+//!   `If-None-Match: *` and, on `412`, reads it again: another writer's progress is re-applied
+//!   onto; a `412` over a document that has not changed is refused (no one made progress).
 //! - **A directory** writes through a store over it: objects verified, temp and rename; refs under
 //!   the store's record lock, read and replaced inside it.
 //! - **Weather** (transport failures, 408/425/429/5xx) is asked again at `Retry-After` or a
@@ -39,9 +39,6 @@ use crate::store::Store;
 
 /// The tag an upload moves when none is named.
 pub const MAIN: &str = "main";
-/// Conditional writes of one repo document lost to other writers before refusing: each loss is
-/// another writer's progress, so only a crowd this large outlasts it.
-const REPO_WRITES: usize = 64;
 /// The most bytes a repo document may have.
 const REPO_BYTES: usize = 16 << 20;
 /// The Fetcher's tick, and its floor for stillness (120 ticks): nothing moving for less is no
@@ -263,14 +260,15 @@ impl Endpoint {
 
     /// Changes the repo document `name` to what `change` makes of it (`None`: a document with
     /// no tags, which deletes the model): a conditional write, with `change` applied again to
-    /// the document as it is whenever another writer won, up to [`REPO_WRITES`] times.
+    /// the document as it is whenever another writer won. A refusal (`412`) while the document is
+    /// still the one the write was based on is no one's progress: it fails with that reason.
     pub async fn update_repo(
         &self,
         name: &str,
         mut change: impl FnMut(Option<Repo>) -> Result<Option<Repo>>,
     ) -> Result<Repo> {
-        let mut sent: Option<Repo> = None;
-        for _ in 0..REPO_WRITES {
+        let (mut sent, mut based): (Option<Repo>, Option<Option<String>>) = (None, None);
+        loop {
             let (old, etag) = match self.repo(name).await? {
                 Some((repo, etag)) => (Some(repo), Some(etag)),
                 None => (None, None),
@@ -278,6 +276,10 @@ impl Endpoint {
             // A lost answer, or another writer that wrote the same: it is there.
             if let Some(applied) = sent.as_ref().filter(|applied| old.as_ref() == Some(*applied)) {
                 return Ok(applied.clone());
+            }
+            if based.as_ref() == Some(&etag) {
+                let at = etag.as_deref().unwrap_or("absent");
+                return refuse(Code::REPOSITORY_CONFLICT, format!("{name}: the write was refused (412) though the document is still {at}: no writer made progress"));
             }
             let new = change(old.clone())?.unwrap_or_else(|| Repo::new(name));
             if !new.name.eq_ignore_ascii_case(name) {
@@ -290,9 +292,8 @@ impl Endpoint {
             if self.put_repo_bytes(name, bytes, etag.as_deref()).await? {
                 return Ok(new);
             }
-            sent = Some(new);
+            (sent, based) = (Some(new), Some(etag));
         }
-        refuse(Code::REPOSITORY_CONFLICT, format!("{name}: {REPO_WRITES} conditional writes lost to other writers"))
     }
 
     /// An object named by digest, including its length, or `None` when absent or unreadable.
@@ -615,13 +616,14 @@ pub struct Committed {
 
 /// The one commit path (git's rule, as Hugging Face's `upload_folder`): tag `tag` of repo `name`
 /// moves to its current tree (none: empty) with the paths a `delete` pattern matches removed and
-/// `files` added or replaced. Every object `files` cite must be at the endpoint already. A lost
-/// conditional write re-reads the tag's tree and applies the change again.
+/// `files` added or replaced. Every object `files` cite must be at the endpoint already. When
+/// another writer moved the tag first, its tree is the new parent and the change is applied
+/// again, for as long as writers make progress ([`Endpoint::update_repo`]).
 pub async fn commit_onto(endpoint: &Endpoint, name: &str, tag: &str, files: &BTreeMap<String, ObjectRef>, delete: &[&str]) -> Result<Committed> {
     if !crate::format::tag_name(tag) {
         return refuse(Code::KEY_GRAMMAR, format!("{tag:?} is not a tag name"));
     }
-    for _ in 0..REPO_WRITES {
+    loop {
         let parent = endpoint.repo(name).await?.and_then(|(r, _)| Some(r.tag(tag)?.commit.clone()));
         let base = match &parent {
             Some(commit) => Tree::from_json(&endpoint.document(commit).await?).map_err(|e| invalid_tree(commit, e))?,
@@ -647,7 +649,6 @@ pub async fn commit_onto(endpoint: &Endpoint, name: &str, tag: &str, files: &BTr
             Err(e) => return Err(e),
         }
     }
-    refuse(Code::REPOSITORY_CONFLICT, format!("{name}@{tag}: {REPO_WRITES} commits lost to other writers"))
 }
 
 fn invalid_tree(commit: &ObjectRef, e: crate::format::Error) -> Refusal {
