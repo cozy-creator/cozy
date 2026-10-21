@@ -3,8 +3,8 @@
 An op out of device memory runs again, each try strictly smaller (no timers; freed bytes are not
 progress): rungs 1-2, the innermost cut around it finer, its own bands, rung 4, else `exhausted`.
 Cuts are exact and keep results on the device; the size that fit is remembered per shape key
-(the memo) and applied up front after. A block whose first run wrote no tensor that existed before
-it and changed none of its attributes runs bare; out of memory it gets its generators and declared
+(the memo) and applied up front after. A block whose first run used no mutating ops
+and changed none of its attributes runs bare; out of memory it gets its generators and declared
 state back and runs again under the dispatch layer, which catches other blocks' ops at the op.
 """
 
@@ -216,6 +216,8 @@ def short(exc: BaseException, first: bool = False) -> int | None:
     """The bytes a device allocation failure asked for (0: not said); None for any other. A
     `first` failure counts a cuBLAS or cuDNN status too (its own allocation may be behind it): it
     runs once more with room made, and a second is the library's own."""
+    if getattr(exc, "_tensorfs_no_retry", False):
+        return None
     if type(exc).__module__ == "tensorfs.varena" and getattr(exc, "code", None) == "DEVICE_FULL":
         return int(getattr(exc, "deficit", getattr(exc, "need", 0)))
     if isinstance(exc, torch.OutOfMemoryError):
@@ -465,24 +467,18 @@ def _trait(func: OpOverload) -> Trait:
 
 @dataclass(eq=False, slots=True)
 class _Journal:
-    """A block's first run: the storages its ops made, whether one wrote into any other, and
-    the generators its seeded ops drew from."""
+    """A block's first run: whether any op writes, and its seeded generators."""
 
-    made: set[int] = field(default_factory=set)
     wrote: bool = False
     generators: dict[int, torch.Generator] = field(default_factory=dict)
 
     def before(self, func: OpOverload, args: Args, kwargs: Kwargs) -> None:
         writes, seeded, _, _ = _trait(func)
-        if writes and not self.wrote:
-            written = [args[i] if i < len(args) else kwargs.get(n) for i, n in writes]
-            self.wrote = any(p and p not in self.made for p in map(_storage, _tensors(written)))
+        # Even an empty out tensor can be resized before its allocation fails. Keep
+        # such blocks under dispatch on warm calls too, rather than replaying bare.
+        self.wrote |= bool(writes)
         if seeded:
             self.generators.update((id(g), g) for g in _generators(func, args, kwargs))
-
-    def after(self, func: OpOverload, out: object) -> None:
-        if _trait(func)[2]:
-            self.made.update(p for p in map(_storage, _tensors(out)) if p)
 
 
 class Layer(TorchDispatchMode):
@@ -504,14 +500,20 @@ class Layer(TorchDispatchMode):
         kwargs = kwargs or {}
         for journal in self.journals:
             journal.before(func, args, kwargs)
-        out = self._run(func, args, kwargs)
-        for journal in self.journals:
-            journal.after(func, out)
-        return out
+        return self._run(func, args, kwargs)
 
     def _run(self, func: OpOverload, args: Args, kwargs: Kwargs) -> object:
         memo, rungs, name = _served.memo, _served.rungs, str(func)
-        _, draws, _, rule = _trait(func)
+        writes, draws, _, rule = _trait(func)
+        if writes:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                # A failed resize/out/in-place op may have changed its destination.
+                # Keep the original exception, and prevent enclosing cuts from
+                # retrying the callable containing that same partial mutation.
+                setattr(exc, "_tensorfs_no_retry", True)
+                raise
         key = _op_key(func, args, kwargs) if rule is not None else ()
         if func in memo.banded and (size := memo.sizes.get(key)):
             if (plan := rule(func, args, kwargs)) is not None:  # type: ignore[misc]
@@ -569,13 +571,6 @@ class Layer(TorchDispatchMode):
 def _band(plan: _Plan, out: Output, at: int, height: int, rows: int) -> None:
     stop = min(at + rows, height)
     out.write_band(plan.band(at, stop), plan.axis, at)
-
-
-def _storage(t: Tensor) -> int:
-    try:
-        return int(t.untyped_storage().data_ptr())
-    except RuntimeError:  # a wrapper with no storage (a weight placeholder)
-        return 0
 
 
 def _tensors(value: object, depth: int = 3) -> list[Tensor]:
