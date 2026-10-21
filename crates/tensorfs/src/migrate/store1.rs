@@ -360,6 +360,12 @@ fn prepare(root: &Path, work: &Path, original_format: Option<Vec<u8>>) -> Result
                 detail: "store1 repo has no name".into(),
             })?;
         let name = format!("{org}/{model}");
+        if path != root.join(format!("repos/{name}.json")) {
+            return invalid(format!(
+                "{} does not match repository {name}",
+                path.display()
+            ));
+        }
         if !names.insert(name.to_ascii_lowercase()) {
             return invalid(format!("duplicate store1 repository {name}"));
         }
@@ -379,9 +385,24 @@ fn prepare(root: &Path, work: &Path, original_format: Option<Vec<u8>>) -> Result
             .iter()
             .map(|c| object(&c["manifest"], &name))
             .collect::<Result<Vec<_>>>()?;
+        if roots.iter().collect::<BTreeSet<_>>().len() != roots.len()
+            || checkpoints.iter().any(|c| !c["published"].is_boolean())
+        {
+            return invalid(format!(
+                "{name}: duplicate checkpoint or invalid published fact"
+            ));
+        }
         cited.extend(roots.iter().cloned());
         let mut versions = Vec::new();
         for r in releases {
+            if !r["version"].is_string()
+                || !r["yanked"].is_boolean()
+                || !r["revision"].as_u64().is_some_and(|r| r > 0)
+            {
+                return invalid(format!(
+                    "{name}: invalid release version, revision or yanked fact"
+                ));
+            }
             let mut lanes = BTreeMap::new();
             for l in r["lanes"]
                 .as_array()
@@ -395,7 +416,10 @@ fn prepare(root: &Path, work: &Path, original_format: Option<Vec<u8>>) -> Result
                     detail: format!("{name}: lane has no name"),
                 })?;
                 let o = object(&l["manifest"], &name)?;
-                if !roots.contains(&o) || lanes.insert(lane, o).is_some() {
+                if !checkpoints.iter().any(|c| {
+                    c["published"] == true && object(&c["manifest"], &name).is_ok_and(|m| m == o)
+                }) || lanes.insert(lane, o).is_some()
+                {
                     return invalid(format!(
                         "{name}: duplicate lane or unretained release checkpoint"
                     ));
@@ -567,6 +591,7 @@ fn publish(root: &Path, work: &Path, p: &Prepared) -> Result<()> {
     }
     for (relative, bytes) in &p.records {
         if relative.is_absolute()
+            || !(relative.starts_with("refs") || relative.starts_with("uses"))
             || relative
                 .components()
                 .any(|c| !matches!(c, std::path::Component::Normal(_)))
