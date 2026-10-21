@@ -162,9 +162,6 @@ fn config(args: &Args) -> Result<Config> {
     if let Some(url) = args.get("endpoint") {
         config.endpoint = url.to_owned();
     }
-    if let Some(token) = std::env::var("TENSORFS_TOKEN").ok().filter(|t| !t.is_empty()) {
-        config.token = Some(tensorfs::bearer(token));
-    }
     Ok(config)
 }
 

@@ -112,23 +112,8 @@ pub async fn install_directory(
     on: On,
     detach: bool,
 ) -> Result<ExitCode, Error> {
-    let in_place = matches!(&on, On::Machine(name) if name.eq_ignore_ascii_case("local"));
-    let local = super::local::source(ctx, path, in_place).await?;
-    let warm = spec(
-        v1::RunKind::Warm,
-        Source::Local(local.source.clone()),
-        String::new(),
-    );
-    let ask = SubmitRun {
-        on,
-        hub: ctx.hub()?.origin.into(),
-        kind: calcifer::Kind::Warm,
-        target: local.package.clone(),
-        spec: warm,
-        inputs: local.inputs.clone(),
-        out: None,
-        warnings: vec![],
-    };
+    let local = super::local::source(ctx, path, &on).await?;
+    let ask = run::local::install_run(&ctx.home, &ctx.hub()?.origin, on, &local);
     let submitted = run::submit(ctx, ask, None).await?.run;
     installed(ctx, submitted, &local.package, detach).await
 }

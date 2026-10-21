@@ -123,6 +123,21 @@ impl Kind {
             Kind::Internal => 500,
         }
     }
+
+    /// What a peer's (the Hub's) HTTP refusal names. A timeout, rate limit or server failure is
+    /// `Unavailable`: asking again may be answered.
+    pub fn of_http(status: u16) -> Kind {
+        match status {
+            401 => Kind::Credential,
+            403 => Kind::Forbidden,
+            404 => Kind::NotFound,
+            402 | 409 | 410 => Kind::Conflict,
+            408 | 429 => Kind::Unavailable,
+            400..=499 => Kind::Validation,
+            507 => Kind::Capacity,
+            _ => Kind::Unavailable,
+        }
+    }
 }
 
 #[cfg(test)]
