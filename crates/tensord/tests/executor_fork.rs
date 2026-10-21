@@ -164,6 +164,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                     destination: String::new(),
                     actor: String::new(),
                     operation: String::new(),
+                    family: String::new(),
                     max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
                     request_id: "forked".into(),
                     construction: "lifecycle".into(),
