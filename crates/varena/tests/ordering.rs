@@ -138,6 +138,9 @@ impl Backend for Stream {
         }
         Ok(())
     }
+    fn synchronize(&self, _: usize) -> Result<()> {
+        Ok(())
+    }
     fn register_host(&self, _: u64, _: u64) -> Result<()> {
         Ok(())
     }

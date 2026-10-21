@@ -139,8 +139,8 @@ fn agent() {
                 uuid = id.to_string();
                 let memory: u64 = memory.parse().unwrap();
                 let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory };
-                // SAFETY: descriptors 3 and 4 are the grant the parent handed this process.
-                let grant = unsafe { varena::Grant { table: platform::handles::Owned::from_raw_fd(3), events: platform::handles::Owned::from_raw_fd(4) } };
+                // SAFETY: descriptor 3 is the grant the parent handed this process.
+                let grant = unsafe { varena::Grant { table: platform::handles::Owned::from_raw_fd(3) } };
                 mem = Some(Memory::open(g, Some(grant), Box::new(HostBackend::new(memory))).unwrap());
                 format!("ok {}", std::process::id())
             }
@@ -303,16 +303,16 @@ impl Agent {
         Agent::start(Command::new(std::env::current_exe().unwrap()))
     }
 
-    /// A child holding TensorD's grant as descriptors 3 and 4.
+    /// A child holding TensorD's grant as descriptor 3.
     fn granted(grant: varena::Grant) -> Agent {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
-        let (table, events) = (grant.table.as_raw_fd(), grant.events.as_raw_fd());
+        let table = grant.table.as_raw_fd();
         let mut command = Command::new(std::env::current_exe().unwrap());
-        // SAFETY: only async-signal-safe dup2 calls between fork and exec.
+        // SAFETY: only an async-signal-safe dup2 call between fork and exec.
         unsafe {
             command.pre_exec(move || {
-                if libc::dup2(table, 3) < 0 || libc::dup2(events, 4) < 0 {
+                if libc::dup2(table, 3) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -612,9 +612,7 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     b.ok(&format!("grant {} {}", g.uuid, g.memory));
     b.ok(&format!("load vb {} stored ram", b_path.display()));
     // Earlier events (rows claimed, pages mapped) are not the ask's.
-    let mut drained = [0u8; 8];
-    // SAFETY: a nonblocking 8-byte read from the ledger's eventfd.
-    unsafe { libc::read(std::os::fd::AsRawFd::as_raw_fd(ledger.events()), drained.as_mut_ptr().cast(), 8) };
+    ledger.clear_events();
     b.ok("request r vb");
     let pid = a.child.id() as i32;
     assert!(ledger.stalled().is_empty(), "a running or sleeping ask thread is never stalled");
@@ -627,15 +625,8 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     assert!(ledger.stalled().is_empty(), "stopped, but nobody asks it: not stalled");
     b.send("pass r vb 1x1");
     // The ask is a ledger event: wait for it, until the stopped victim's row is asked.
-    let fd = std::os::fd::AsRawFd::as_raw_fd(ledger.events());
     while !ledger.status().rows.iter().any(|r| r.pid == pid as u32 && r.asked > 0) {
-        let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        let mut event = [0u8; 8];
-        // SAFETY: one live descriptor waited on with no timeout, then its counter read.
-        unsafe {
-            libc::poll(&mut poll, 1, -1);
-            libc::read(fd, event.as_mut_ptr().cast(), 8);
-        }
+        ledger.await_event().unwrap();
     }
     assert_eq!(ledger.stalled(), vec![pid as u32], "asked and its ask thread stopped: measured, not counted");
     a.child.kill().unwrap();
@@ -765,7 +756,12 @@ fn a_joint_step_runs_a_pass_per_set(dir: &Path) {
     a.ok("end r");
     a.exit();
     let peaks = ledger.peaks();
-    let peak = |set: &str| peaks.iter().find(|p| p.key.starts_with(&format!("{set}|"))).map(|p| p.bytes);
+    let peak = |set: &str| {
+        peaks.iter().find_map(|p| match p {
+            varena::Peak::Pass { key, room } if key.starts_with(&format!("{set}|")) => Some(room.delta),
+            _ => None,
+        })
+    };
     assert_eq!((peak("ja"), peak("jb")), (Some(3 * MB), Some(5 * MB)), "{peaks:?}");
 }
 

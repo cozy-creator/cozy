@@ -140,15 +140,8 @@ fn orphans_show_as_class_o() {
     mem.load(set(dir.path(), "o", 2, &g.uuid), Level::Gpu).unwrap();
     drop(mem);
     // The custody service sees the connection end on its own thread; it rings the ledger.
-    let fd = std::os::fd::AsRawFd::as_raw_fd(ledger.events());
     while ledger.status().rows.iter().map(|r| r.classes[1]).sum::<u64>() < 4 * MB {
-        let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        let mut event = [0u8; 8];
-        // SAFETY: one live descriptor waited on with no timeout, then its counter read.
-        unsafe {
-            libc::poll(&mut poll, 1, -1);
-            libc::read(fd, event.as_mut_ptr().cast(), 8);
-        }
+        ledger.await_event().unwrap();
     }
 }
 
@@ -156,7 +149,7 @@ fn orphans_show_as_class_o() {
 #[test]
 fn an_empty_shape_fits_by_the_widest_measured() {
     let (ledger, mem, _g) = open("widest", 16 * MB);
-    ledger.restore(&[varena::Peak { key: "pkg|1x1".into(), bytes: 2 * MB, start: 0, sites: vec![] }, varena::Peak { key: "pkg|4x4".into(), bytes: 17 * MB, start: 0, sites: vec![] }]).unwrap();
+    ledger.restore(&[varena::Peak::Request { key: "pkg|1x1".into(), bytes: 2 * MB }, varena::Peak::Request { key: "pkg|4x4".into(), bytes: 17 * MB }]).unwrap();
     let busy = mem.request("busy", Plan::default()).unwrap();
     assert!(ledger.fits("pkg", "1x1"));
     assert!(!ledger.fits("pkg", ""), "the widest (17 MB) beside a running request does not fit");
