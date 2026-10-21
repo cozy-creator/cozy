@@ -192,7 +192,7 @@ fn read_direct(d: &File, buf: &mut [u8], at: u64, need: usize) -> io::Result<()>
     Ok(())
 }
 
-pub(super) fn read_exact_at(f: &File, mut buf: &mut [u8], mut at: u64) -> io::Result<()> {
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut at: u64) -> io::Result<()> {
     while !buf.is_empty() {
         match read_at(f, buf, at) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("the file ends at {at}"))),

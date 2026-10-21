@@ -85,26 +85,47 @@ impl Drop for Event {
     }
 }
 
+/// One pinned allocation staging slots are cut from: one `cuMemHostAlloc` per block, not per
+/// slot (each call cost ~3.5 ms on an EPYC 7282; 16 were 60 ms of a process's first read).
+struct Block {
+    ptr: *mut u8,
+    ctx: CUcontext,
+}
+
+// SAFETY: pinned host memory of the engine's context, freed with it entered.
+unsafe impl Send for Block {}
+unsafe impl Sync for Block {}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        if let (Ok(d), Ok(_ctx)) = (cuda::driver(), CtxGuard::enter(self.ctx)) {
+            unsafe { (d.mem_free_host)(self.ptr.cast()) };
+        }
+    }
+}
+
 struct Slot {
     ptr: *mut u8,
     done: Event,
     pending: bool,
     recorded: bool,
+    block: Arc<Block>,
 }
 
 impl Slot {
-    fn new(ctx: CUcontext) -> cuda::Result<Slot> {
-        let done = Event::new(ctx, false)?;
+    /// `n` slots of one new block, pinned on the calling thread's node.
+    fn block(ctx: CUcontext, n: usize) -> cuda::Result<Vec<Slot>> {
         let mut ptr = std::ptr::null_mut();
         cuda::check("cuMemHostAlloc", unsafe {
-            (cuda::driver()?.mem_host_alloc)(&mut ptr, PIECE, cuda::MEMHOSTALLOC_PORTABLE)
+            (cuda::driver()?.mem_host_alloc)(&mut ptr, n * PIECE, cuda::MEMHOSTALLOC_PORTABLE)
         })?;
-        Ok(Slot {
-            ptr: ptr.cast(),
-            done,
-            pending: false,
-            recorded: false,
-        })
+        let block = Arc::new(Block { ptr: ptr.cast(), ctx });
+        (0..n)
+            .map(|i| {
+                let (ptr, done) = (block.ptr.wrapping_add(i * PIECE), Event::new(ctx, false)?);
+                Ok(Slot { ptr, done, pending: false, recorded: false, block: block.clone() })
+            })
+            .collect()
     }
 }
 
@@ -113,13 +134,10 @@ unsafe impl Send for Slot {}
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        if let (Ok(d), Ok(_ctx)) = (cuda::driver(), CtxGuard::enter(self.done.ctx)) {
-            if self.pending && (!self.recorded || self.done.sync().is_err()) {
-                // The driver may still touch this allocation. Retain it until process exit
-                // rather than free an unproved in-flight stage during unwinding.
-                return;
-            }
-            unsafe { (d.mem_free_host)(self.ptr.cast()) };
+        if self.pending && (!self.recorded || self.done.sync().is_err()) {
+            // The driver may still touch this slot: its block stays allocated until process exit
+            // rather than free an unproved in-flight stage during unwinding.
+            std::mem::forget(self.block.clone());
         }
     }
 }
@@ -354,7 +372,7 @@ impl Engine {
             queues: (0..STREAMS).map(|_| Mutex::new(())).collect(),
             near: Near::of(device),
             free: Mutex::new(Vec::new()),
-            learned: Mutex::new(Learned::default()),
+            learned: Mutex::new(Learned::seeded(device)),
             serial: Mutex::new(()),
             held: Mutex::new(Vec::new()),
             staged: Mutex::new(Vec::new()),
@@ -440,21 +458,28 @@ impl Engine {
         self.free.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A reader's slots: free ones, else new ones pinned on this thread's (the GPU's) node.
-    fn ring(&self) -> cuda::Result<Vec<Slot>> {
-        let mut ring = {
-            let mut free = self.free();
-            let at = free.len().saturating_sub(RING);
-            free.split_off(at)
-        };
-        while ring.len() < RING {
-            match Slot::new(self.ctx) {
-                Ok(slot) => ring.push(slot),
-                Err(e) if ring.is_empty() => return Err(e),
-                Err(_) => break,
-            }
+    /// Free slots for at least `readers` rings: the shortfall as one block pinned on the GPU's node.
+    fn stock(&self, readers: usize) -> cuda::Result<()> {
+        let short = (readers * RING).saturating_sub(self.free().len());
+        if short > 0 {
+            let block = std::thread::scope(|s| {
+                let pin = s.spawn(|| {
+                    self.near.enter();
+                    let _ctx = CtxGuard::enter(self.ctx)?;
+                    Slot::block(self.ctx, short)
+                });
+                pin.join().expect("pinning staging does not panic")
+            })?;
+            self.free().extend(block);
         }
-        Ok(ring)
+        Ok(())
+    }
+
+    /// A reader's slots, from the free ones.
+    fn ring(&self) -> Vec<Slot> {
+        let mut free = self.free();
+        let at = free.len().saturating_sub(RING);
+        free.split_off(at)
     }
 
     fn hold_slot(&self, slot: Slot) {
@@ -469,6 +494,7 @@ impl Engine {
         copies: &[(usize, Copy)],
         opts: &ReadOpts,
         staged_host: bool,
+        fixed: bool,
     ) -> Result<ReadStats, Error> {
         let _serial = self.serial.lock().unwrap_or_else(|e| e.into_inner());
         let first = copies[0].0;
@@ -552,13 +578,21 @@ impl Engine {
             let next = AtomicUsize::new(0);
             let stopped = AtomicBool::new(false);
             let error = Mutex::new(None);
-            let cap = opts
-                .threads
-                .clamp(1, self.near.cpus())
-                .min(jobs.len().max(1));
-            let learned = *self.learned.lock().unwrap_or_else(|e| e.into_inner());
+            let cap = opts.threads.clamp(1, self.near.cpus()).min(jobs.len().max(1));
+            let learned = match fixed {
+                true => Learned { readers: [cap; 2], settled: [true; 2], last: 0 },
+                false => *self.learned.lock().unwrap_or_else(|e| e.into_inner()),
+            };
+            #[cfg(unix)]
             let h2d = super::metrics::h2d_kept(self.device).unwrap_or(0.0);
+            #[cfg(not(unix))]
+            let h2d = 0.0;
             let mut grow = Grow::new(learned, cap, h2d);
+            if let Err(e) = self.stock(grow.readers) {
+                if self.free().len() < RING {
+                    return Err(failed(first, e));
+                }
+            }
             let (allowed, running) = (AtomicUsize::new(grow.readers), AtomicUsize::new(0));
             // Leaves one reader when more run than `allowed`.
             let surplus = || {
@@ -571,19 +605,14 @@ impl Engine {
                 }
                 false
             };
-            // A reader that could pin no slot leaves the jobs to the others, if any.
-            let starved = Mutex::new(None);
             let work = |tx: &mpsc::Sender<Read>| {
                 self.near.enter();
-                let ring = CtxGuard::enter(self.ctx).and_then(|_ctx| self.ring());
-                let mut ring = match ring {
-                    Ok(ring) => ring,
-                    Err(e) => {
-                        running.fetch_sub(1, Relaxed);
-                        starved.lock().unwrap().get_or_insert(failed(first, e));
-                        return;
-                    }
-                };
+                let mut ring = self.ring();
+                if ring.is_empty() {
+                    // No slot left to stage through: the other readers take the jobs.
+                    running.fetch_sub(1, Relaxed);
+                    return;
+                }
                 let mut turn = 0;
                 loop {
                     if surplus() {
@@ -642,7 +671,8 @@ impl Engine {
                         }
                         Err(_) => break,
                     };
-                    if let Some(readers) = change {
+                    // A step whose slots cannot be pinned runs at the readers it has.
+                    if let Some(readers) = change.filter(|&n| n < target || self.stock(n).is_ok()) {
                         allowed.store(readers, Relaxed);
                         if readers > target {
                             spawn(readers - target);
@@ -652,11 +682,12 @@ impl Engine {
                     }
                 }
             });
-            grow.learn(&mut self.learned.lock().unwrap_or_else(|e| e.into_inner()));
+            if !fixed {
+                grow.learn(&mut self.learned.lock().unwrap_or_else(|e| e.into_inner()));
+            }
             if next.load(Relaxed) < jobs.len() {
-                if let Some(starved) = starved.into_inner().unwrap() {
-                    error.lock().unwrap().get_or_insert(starved);
-                }
+                let lost = io::Error::other("no pinned staging slot was free");
+                error.lock().unwrap().get_or_insert(Error { copy: first, source: lost });
             }
             let mut busy_ns = 0;
             let mut all_complete = true;
@@ -832,6 +863,19 @@ struct Learned {
     last: usize,
 }
 
+impl Learned {
+    /// Cached reads start, settled, at the readers this boot's copy probe found best.
+    fn seeded(device: i32) -> Learned {
+        let mut learned = Learned::default();
+        #[cfg(unix)]
+        if let Some(readers) = super::metrics::copy_kept(device) {
+            (learned.readers[0], learned.settled[0]) = (readers, true);
+        }
+        let _ = device;
+        learned
+    }
+}
+
 impl Default for Learned {
     fn default() -> Learned {
         Learned { readers: [READERS; 2], settled: [false; 2], last: 0 }
@@ -947,16 +991,15 @@ impl Grow {
     }
 }
 
-/// Page cache → pinned staging GB/s on GPU `device`'s readers, and the readers that reached it:
-/// a memfd's pages read into each reader's ring as staging reads a cached file, the readers
-/// doubling while that helped, up to the CPUs they may use. Slots beyond what the best count
-/// (or a run's start) needs are freed again.
+/// Page cache → GPU GB/s through pinned staging on GPU `device`, and the readers that reached it:
+/// a memfd's cached pages read to the GPU as a warm read reads them, at a fixed reader count
+/// that doubles while that helped, up to the CPUs readers may use. The copy and the GPU's DMA
+/// share host memory: copying alone measured 23.8 GB/s on an EPYC 7282 where warm reads to its
+/// RTX 4090 (H2D 22.1) reached 14.3. The best count becomes the engine's for cached reads.
 #[cfg(target_os = "linux")]
 pub(super) fn copy_ceiling(device: i32) -> io::Result<(f64, u32)> {
     use std::os::fd::FromRawFd;
     use std::os::unix::fs::FileExt;
-    let engine = Engine::get(device).map_err(io::Error::other)?;
-    let _serial = engine.serial.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a fresh anonymous file, owned below. The syscall, not glibc's wrapper (2.27+): the
     // `tfs` binary links against manylinux2014's glibc 2.17.
     let fd = unsafe { libc::syscall(libc::SYS_memfd_create, c"tensorfs-copy-probe".as_ptr(), libc::MFD_CLOEXEC) };
@@ -969,67 +1012,32 @@ pub(super) fn copy_ceiling(device: i32) -> io::Result<(f64, u32)> {
     for at in (0..COPY_PROBE).step_by(PIECE) {
         file.write_all_at(&block, at as u64)?;
     }
+    let gpu = DeviceBuffer::new(device, COPY_PROBE).map_err(io::Error::other)?;
+    let (engine, dst) = (&gpu.engine, Dst::Device { device, ptr: gpu.ptr, len: COPY_PROBE, stream: 0 });
+    let copy = [(0, Copy { src: Src::File(&file, 0), dst })];
     let (cpus, mut best, mut readers, mut n) = (engine.near.cpus(), 0.0, 0, 1);
-    let measured = loop {
-        match engine.copy_rate(&file, n) {
-            Ok(gbps) if gbps > best => (best, readers) = (gbps, n),
-            Ok(_) => break Ok(()),
-            Err(e) => break Err(e),
+    loop {
+        let start = Instant::now();
+        engine.run(&copy, &ReadOpts { threads: n, ..ReadOpts::default() }, false, true).map_err(|e| e.source)?;
+        let gbps = COPY_PROBE as f64 / start.elapsed().as_nanos().max(1) as f64;
+        if gbps <= best {
+            break;
         }
-        match n == cpus {
-            true => break Ok(()),
-            false => n = (n * 2).min(cpus),
+        (best, readers) = (gbps, n);
+        if n == cpus {
+            break;
         }
-    };
+        n = (n * 2).min(cpus);
+    }
     engine.free().truncate(RING * readers.max(READERS));
-    measured.map(|()| (best, readers as u32))
+    let mut learned = engine.learned.lock().unwrap_or_else(|e| e.into_inner());
+    (learned.readers[0], learned.settled[0]) = (readers, true);
+    Ok((best, readers as u32))
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(super) fn copy_ceiling(_: i32) -> io::Result<(f64, u32)> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "no host copy probe on this platform"))
-}
-
-impl Engine {
-    /// GB/s `readers` reach reading all of `file` (cached) into their rings, timed from when every
-    /// reader holds its slots. Caller holds `serial`.
-    #[cfg(target_os = "linux")]
-    fn copy_rate(&self, file: &std::fs::File, readers: usize) -> io::Result<f64> {
-        let (next, ready) = (AtomicUsize::new(0), std::sync::Barrier::new(readers + 1));
-        let read = || -> io::Result<()> {
-            self.near.enter();
-            let ring = CtxGuard::enter(self.ctx).and_then(|_ctx| self.ring());
-            ready.wait();
-            let mut ring = ring.map_err(io::Error::other)?;
-            let result = (|| {
-                for turn in 0.. {
-                    let at = next.fetch_add(1, Relaxed);
-                    if at >= COPY_PROBE / PIECE {
-                        break;
-                    }
-                    let n = ring.len();
-                    let slot = &mut ring[turn % n];
-                    if std::mem::take(&mut slot.pending) {
-                        slot.done.sync().map_err(io::Error::other)?;
-                    }
-                    // SAFETY: the slot's PIECE bytes, with no copy in flight from them.
-                    let buf = unsafe { std::slice::from_raw_parts_mut(slot.ptr, PIECE) };
-                    host::read_exact_at(file, buf, (at * PIECE) as u64)?;
-                }
-                Ok(())
-            })();
-            self.free().extend(ring);
-            result
-        };
-        let start = std::thread::scope(|s| {
-            let readers: Vec<_> = (0..readers).map(|_| s.spawn(read)).collect();
-            ready.wait();
-            let start = Instant::now();
-            readers.into_iter().try_for_each(|r| r.join().expect("a probe reader does not panic"))?;
-            io::Result::Ok(start)
-        })?;
-        Ok(COPY_PROBE as f64 / start.elapsed().as_nanos().max(1) as f64)
-    }
 }
 
 /// Same bounded B7 staging, with checked completion and retained native resources on error.
@@ -1067,7 +1075,7 @@ pub(super) unsafe fn fill(
     for ((device, kind), copies) in groups {
         let engine = Engine::get(device).map_err(|e| failed(copies[0].0, e))?;
         let start = Instant::now();
-        let stats = engine.run(&copies, opts, staged_host)?;
+        let stats = engine.run(&copies, opts, staged_host, false)?;
         #[cfg(unix)]
         {
             let ns = start.elapsed().as_nanos() as u64;
@@ -1135,12 +1143,7 @@ mod tests {
     }
 
     /// Feeds `grow` staged pieces at `gbps(readers)`: the reader counts it switches to.
-    fn drive(
-        grow: &mut Grow,
-        gbps: impl Fn(usize) -> f64,
-        pieces: usize,
-        cached: bool,
-    ) -> Vec<usize> {
+    fn drive(grow: &mut Grow, gbps: impl Fn(usize) -> f64, pieces: usize, cached: bool) -> Vec<usize> {
         let (mut now, mut readers, mut changes) = (0, grow.target, Vec::new());
         for _ in 0..pieces {
             now += (PIECE as f64 / gbps(readers)).ceil() as u64;
@@ -1158,14 +1161,7 @@ mod tests {
         assert_eq!(changes, [10, 12, 15, 18, 15]);
         let mut learned = Learned::default();
         grow.learn(&mut learned);
-        assert_eq!(
-            learned,
-            Learned {
-                readers: [15, READERS],
-                settled: [true, false],
-                last: 0
-            }
-        );
+        assert_eq!(learned, Learned { readers: [15, READERS], settled: [true, false], last: 0 });
     }
 
     #[test]
@@ -1174,23 +1170,12 @@ mod tests {
         assert_eq!(drive(&mut grow, |_| 20.0, 4000, false), [10, READERS]);
         let mut learned = Learned::default();
         grow.learn(&mut learned);
-        assert_eq!(
-            learned,
-            Learned {
-                readers: [READERS; 2],
-                settled: [false, true],
-                last: 1
-            }
-        );
+        assert_eq!(learned, Learned { readers: [READERS; 2], settled: [false, true], last: 1 });
     }
 
     #[test]
     fn a_settled_source_switches_once_and_the_link_ceiling_or_cap_stops_growth() {
-        let learned = Learned {
-            readers: [12, READERS],
-            settled: [true, false],
-            last: 1,
-        };
+        let learned = Learned { readers: [12, READERS], settled: [true, false], last: 1 };
         let mut grow = Grow::new(learned, 64, 0.0);
         assert_eq!(drive(&mut grow, |n| 2.0 * n as f64, 4000, true), [12]);
         assert_eq!(grow.phase, Phase::Done);

@@ -192,18 +192,19 @@ pub fn h2d(device: i32) -> Option<(f64, u32)> {
     if let Some(&[gbps, streams]) = probe::known(&key).as_deref() {
         return Some((gbps, streams as u32));
     }
-    let (dev, ctx) = cuda::primary_context(device).ok()?;
-    let retained = PrimaryContext(dev);
+    // Retained for the process, as the read engine's streams retain it: a read after the probe
+    // does not create the context again (168 ms on an EPYC 7282 with an RTX 4090).
+    let (_, ctx) = cuda::primary_context(device).ok()?;
     let _c = cuda::CtxGuard::enter(ctx).ok()?;
-    let (gbps, streams) = measure_h2d(device, ctx, retained)
+    let (gbps, streams) = measure_h2d(device, ctx)
         .inspect_err(|e| tracing::warn!("tensorfs: no H2D ceiling: {e}"))
         .ok()?;
     probe::keep(&key, &[gbps, streams as f64]);
     Some((gbps, streams))
 }
 
-/// Page cache → pinned staging GB/s for GPU `device`'s readers, and the readers that reached it:
-/// kept this boot, else measured (`device::copy_ceiling`).
+/// Page cache → GPU GB/s through pinned staging on GPU `device`, and the readers that reached
+/// it: kept this boot, else measured (`device::copy_ceiling`).
 pub fn copy(device: i32) -> Option<(f64, u32)> {
     let key = gpu_key("copy", device)?;
     if let Some(&[gbps, readers]) = probe::known(&key).as_deref() {
@@ -214,6 +215,11 @@ pub fn copy(device: i32) -> Option<(f64, u32)> {
         .ok()?;
     probe::keep(&key, &[gbps, readers as f64]);
     Some((gbps, readers))
+}
+
+/// The readers GPU `device`'s copy probe found best this boot, without measuring.
+pub(crate) fn copy_kept(device: i32) -> Option<usize> {
+    probe::known(&gpu_key("copy", device)?).and_then(|kept| kept.get(1).map(|&r| r as usize))
 }
 
 /// GPU `device`'s kept H2D GB/s this boot, without measuring.
@@ -235,20 +241,9 @@ fn gpu_key(kind: &str, device: i32) -> Option<String> {
     ))
 }
 
-struct PrimaryContext(i32);
-impl Drop for PrimaryContext {
-    fn drop(&mut self) {
-        if let Ok(driver) = cuda::driver() {
-            // Balances this probe's successful primary-context retain.
-            unsafe { (driver.primary_ctx_release)(self.0) };
-        }
-    }
-}
-
-/// Actual probe owners, including the context lease. A failed completion check retains the
-/// entire owner box for process lifetime; no failed stream or allocation is ever reused.
+/// Actual probe owners. A failed completion check retains the entire owner box for process
+/// lifetime; no failed stream or allocation is ever reused.
 struct ProbeResources {
-    _context: PrimaryContext,
     ctx: cuda::CUcontext,
     host: *mut c_void,
     dev: u64,
@@ -275,8 +270,8 @@ impl Drop for Probe {
             .drain()
             .and_then(|()| cuda::CtxGuard::enter(owners.ctx));
         let Ok(_context) = drained else {
-            // Keep the owned streams, both allocations AND the primary-context lease.
-            // Dropping raw pointer identities alone would not preserve their ownership.
+            // Keep the owned streams and both allocations. Dropping raw pointer identities alone
+            // would not preserve their ownership.
             std::mem::forget(owners);
             return;
         };
@@ -293,15 +288,14 @@ impl Drop for Probe {
                 (driver.mem_free_host)(owners.host);
             }
         }
-        // Stream owners and the retained primary context release after the buffers.
+        // Stream owners release after the buffers.
         drop(owners);
     }
 }
 
-fn measure_h2d(device: i32, ctx: cuda::CUcontext, retained: PrimaryContext) -> Result<(f64, u32)> {
+fn measure_h2d(device: i32, ctx: cuda::CUcontext) -> Result<(f64, u32)> {
     let driver = cuda::driver()?;
     let mut probe = Probe(Some(Box::new(ProbeResources {
-        _context: retained,
         ctx,
         host: std::ptr::null_mut(),
         dev: 0,
