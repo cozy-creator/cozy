@@ -362,26 +362,31 @@ impl PyWeightSet {
     }
 
     /// Landed home regions not handed out yet, kept past this process: `(region, span, fd)`,
-    /// each fd the caller's to deposit with TensorD and close.
-    fn kept(&self, py: Python<'_>) -> PyResult<Vec<(u32, u64, i32)>> {
+    /// each fd the caller's to deposit with TensorD and close. `filled`: only regions a page-in
+    /// transform already filled.
+    #[pyo3(signature = (filled = false))]
+    fn kept(&self, py: Python<'_>, filled: bool) -> PyResult<Vec<(u32, u64, i32)>> {
         let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
-        Ok(detached(py, || w.kept())?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
+        Ok(detached(py, || w.kept(filled))?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
     }
 
     /// As `kept`, after admission is stopped and every use is drained; cached graph pins stay.
-    fn kept_quiescent(&self, py: Python<'_>) -> PyResult<Vec<(u32, u64, i32)>> {
+    #[pyo3(signature = (filled = false))]
+    fn kept_quiescent(&self, py: Python<'_>, filled: bool) -> PyResult<Vec<(u32, u64, i32)>> {
         let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
-        Ok(detached(py, || w.kept_quiescent())?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
+        Ok(detached(py, || w.kept_quiescent(filled))?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
     }
 
     /// Home regions mapped from kept pages `(region, fd)`; each fd duplicated, the caller's
-    /// kept. Returns the bytes adopted.
-    fn adopt_pages(&self, py: Python<'_>, pages: Vec<(u32, i32)>) -> PyResult<u64> {
-        let Some(w) = self.gpu(py)? else { return Ok(0) };
+    /// kept. `filled`: pages a page-in transform filled, whose filling the caller proved: they
+    /// map as filled. Returns the regions adopted.
+    #[pyo3(signature = (pages, filled = false))]
+    fn adopt_pages(&self, py: Python<'_>, pages: Vec<(u32, i32)>, filled: bool) -> PyResult<Vec<u32>> {
+        let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
         // SAFETY: descriptors the caller holds for the duration of this call.
         let dup = |(r, fd): (u32, i32)| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map(|fd| (r, fd));
         let pages = pages.into_iter().map(dup).collect::<std::io::Result<Vec<_>>>().map_err(|e| Error::Io(format!("dup kept pages: {e}"))).or_raise(py)?;
-        detached(py, || w.adopt_pages(pages))
+        detached(py, || w.adopt_pages(pages, filled))
     }
 
     #[pyo3(signature = (regions = None))]
