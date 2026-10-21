@@ -1,6 +1,6 @@
 //! B7's bounded pinned staging and reuse policy, independent of varena's placement types.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -193,7 +193,6 @@ struct Engine {
     free: Mutex<Vec<Slot>>,
     learned: Mutex<Learned>,
     serial: Mutex<()>,
-    seen: Mutex<VecDeque<(usize, usize)>>,
     held: Mutex<Vec<Retained>>,
     staged: Mutex<Vec<Slot>>,
 }
@@ -248,7 +247,6 @@ impl Drop for DeviceBuffer {
 #[derive(Default)]
 struct Retained {
     slots: Vec<Slot>,
-    pins: Vec<cuda::HostPin>,
     events: Vec<Event>,
     streams: Vec<cuda::Stream>,
     _buffers: Vec<DeviceBuffer>,
@@ -358,24 +356,11 @@ impl Engine {
             free: Mutex::new(Vec::new()),
             learned: Mutex::new(Learned::default()),
             serial: Mutex::new(()),
-            seen: Mutex::new(VecDeque::new()),
             held: Mutex::new(Vec::new()),
             staged: Mutex::new(Vec::new()),
         });
         engines.insert(device, engine.clone());
         Ok(engine)
-    }
-
-    fn reused(&self, ptr: usize, len: usize) -> bool {
-        let mut seen = self.seen.lock().unwrap();
-        if seen.contains(&(ptr, len)) {
-            return true;
-        }
-        if seen.len() >= 256 {
-            seen.pop_front();
-        }
-        seen.push_back((ptr, len));
-        false
     }
 
     fn wait(&self, event: &Event, streams: usize) -> cuda::Result<()> {
@@ -403,16 +388,10 @@ impl Engine {
     }
 
     fn checked_release(&self, owners: &mut [Retained], complete: bool) -> cuda::Result<()> {
-        if !complete {
-            self.synchronize(owners)?;
+        match complete {
+            true => Ok(()),
+            false => self.synchronize(owners),
         }
-        let mut first = None;
-        for pin in owners.iter_mut().flat_map(|r| &mut r.pins) {
-            if let Err(error) = pin.release() {
-                first.get_or_insert(error);
-            }
-        }
-        first.map_or(Ok(()), Err)
     }
 
     fn released(&self, owners: Vec<Retained>) {
@@ -540,24 +519,12 @@ impl Engine {
                     (c.src, c.dst),
                     (Src::Device { .. } | Src::Zero, Dst::Device { .. })
                 );
-                if !staged_host {
-                    if let (Src::Host(ptr), Dst::Device { .. }) = (c.src, c.dst) {
-                        let reused = self.reused(ptr as usize, c.dst.len());
-                        if unsafe { cuda::registered(ptr) }.map_err(|e| failed(copy, e))? {
-                            direct = true;
-                        } else if reused {
-                            let start = Instant::now();
-                            let pin =
-                                unsafe { cuda::pin_region(ptr.cast_mut(), c.dst.len(), true) };
-                            tally
-                                .pin_ns
-                                .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
-                            if let Ok(pin) = pin {
-                                owners.pins.push(pin);
-                                direct = true;
-                            }
-                        }
-                    }
+                // A host range its owner keeps registered (`pins::PinnedRanges`) copies directly;
+                // any other is staged. Registering one for a single read cost more than it saved
+                // (cuMemHostRegister + unregister ~100 ms/GiB: 25% of the link against 70% staged).
+                if let (Src::Host(ptr), Dst::Device { len, .. }, false) = (c.src, c.dst, staged_host) {
+                    let registered = |p| unsafe { cuda::registered(p) }.map_err(|e| failed(copy, e));
+                    direct = len > 0 && registered(ptr)? && registered(ptr.wrapping_add(len - 1))?;
                 }
                 let step = if direct { c.dst.len() } else { PIECE };
                 for at in (0..c.dst.len()).step_by(step.max(1)) {
@@ -632,13 +599,10 @@ impl Engine {
                     let n = ring.len();
                     let slot = &mut ring[turn % n];
                     match self.piece(job, at % streams, opts, &tally, slot) {
-                        Ok(cached) if !job.direct => {
-                            let _ = tx.send(Read::Piece {
-                                bytes: job.len as u64,
-                                cached,
-                            });
+                        Ok(Some(cached)) => {
+                            let _ = tx.send(Read::Piece { bytes: job.len as u64, cached });
                         }
-                        Ok(_) => {}
+                        Ok(None) => {}
                         Err(failure) => {
                             error.lock().unwrap().get_or_insert(failure);
                             stopped.store(true, Relaxed);
@@ -720,7 +684,6 @@ impl Engine {
                 direct: tally.direct.load(Relaxed),
                 cached: tally.cached.load(Relaxed),
                 bounced: tally.bounced.load(Relaxed),
-                pin_ns: tally.pin_ns.load(Relaxed),
                 staged: tally.staged.load(Relaxed),
                 busy_ns,
                 readers: grow.readers as u64,
@@ -733,7 +696,8 @@ impl Engine {
         Ok(stats)
     }
 
-    /// One job; for a staged file piece, whether the page cache held all of it.
+    /// One job; for a staged file piece, whether the page cache held all of it (growth reads only
+    /// those).
     fn piece(
         &self,
         job: &Job,
@@ -741,7 +705,7 @@ impl Engine {
         opts: &ReadOpts,
         tally: &Tally,
         slot: &mut Slot,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<bool>, Error> {
         let _ctx = CtxGuard::enter(self.ctx).map_err(|e| failed(job.copy, e))?;
         let d = cuda::driver().map_err(|e| failed(job.copy, e))?;
         let stream = self.streams[lane].raw() as CUstream;
@@ -767,14 +731,14 @@ impl Engine {
                 _ => unreachable!(),
             };
             return cuda::check("cuMemcpyAsync", result)
-                .map(|()| false)
+                .map(|()| None)
                 .map_err(|e| failed(job.copy, e));
         }
         if slot.pending {
             slot.done.sync().map_err(|e| failed(job.copy, e))?;
             slot.pending = false;
         }
-        let mut cached = false;
+        let mut cached = None;
         match job.c.src {
             Src::File(file, offset) => {
                 let copy = Copy {
@@ -795,7 +759,7 @@ impl Engine {
                 tally.direct.fetch_add(stats.direct, Relaxed);
                 tally.cached.fetch_add(stats.cached, Relaxed);
                 tally.bounced.fetch_add(stats.bounced, Relaxed);
-                cached = stats.direct == 0;
+                cached = Some(stats.direct == 0);
             }
             Src::Host(ptr) => unsafe {
                 std::ptr::copy_nonoverlapping(ptr.add(job.at), slot.ptr, job.len)
@@ -841,7 +805,6 @@ struct Tally {
     direct: AtomicU64,
     cached: AtomicU64,
     bounced: AtomicU64,
-    pin_ns: AtomicU64,
     staged: AtomicU64,
 }
 
