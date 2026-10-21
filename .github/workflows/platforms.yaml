@@ -1,7 +1,7 @@
 name: platforms
 # The Rust workspace builds, lints and passes the platform seams on every release runner, Linux x86_64
-# as the control; the job's verdict is that. TensorD and TensorFS are reported, not judged, where they are
-# not ported yet (xs-043 T, X, WM, AP).
+# as the control; the job's verdict is that. TensorD and TensorFS are judged on Linux and windows-2025
+# (whose tests run here: Linux runs them in ci.yaml) and reported elsewhere, not ported yet (xs-043 T, X, WM, AP).
 # Every PR and every push to master, and per question:
 #   gh workflow run platforms.yaml -R cozy-creator/cozy-creator --ref <branch> [-f os='["windows-2025"]'] [-f test='cargo test -p <crate>']
 # A release (release.yml) needs a green run on its commit covering every release runner (release-gate.yml).
@@ -40,11 +40,10 @@ jobs:
   build:
     name: ${{ matrix.os }}
     env:
-      # TensorD and TensorFS are judged where they build (Linux); elsewhere reported until ported.
-      IMPORTED: ${{ !startsWith(matrix.os, 'ubuntu') && '--exclude tensord --exclude tensorfs --exclude varena --exclude tensorfs-py' || '' }}
+      IMPORTED: ${{ !(startsWith(matrix.os, 'ubuntu') || matrix.os == 'windows-2025') && '--exclude tensord --exclude tensorfs --exclude varena --exclude tensorfs-py' || '' }}
     runs-on: ${{ matrix.os }}
     # Hang bound, not a work budget.
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +72,12 @@ jobs:
         id: seams
         continue-on-error: true
         run: cargo test -p platform --test seams --locked -- --include-ignored 2>&1 | tee seams.txt; exit "${PIPESTATUS[0]}"
+
+      - name: TensorD and TensorFS tests
+        id: tests
+        if: matrix.os == 'windows-2025'
+        continue-on-error: true
+        run: cargo test -p tensord -p tensorfs --locked --no-fail-fast 2>&1 | tee tests.txt; exit "${PIPESTATUS[0]}"
 
       # The committed machine API spec is what protocol's types generate (xs-044): drift fails the run.
       - name: Machine API spec
@@ -123,10 +128,10 @@ jobs:
         run: |
           {
             echo "## ${{ matrix.os }}"
-            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} spec=${{ steps.spec.outcome }} test=${{ steps.test.outcome }} imported=${{ steps.imported.outcome }}"
+            echo "rust=${{ steps.rust.outcome }} seams=${{ steps.seams.outcome }} tests=${{ steps.tests.outcome }} spec=${{ steps.spec.outcome }} test=${{ steps.test.outcome }} imported=${{ steps.imported.outcome }}"
             echo '```'
             # The tail of each: where errors are. `head` would end the pipe early (SIGPIPE under pipefail).
-            for f in rust.txt imported.txt seams.txt spec.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
+            for f in rust.txt imported.txt seams.txt tests.txt spec.txt; do [ ! -f "$f" ] || tail -n 50 "$f"; done
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -138,6 +143,7 @@ jobs:
             rust.txt
             imported.txt
             seams.txt
+            tests.txt
             spec.txt
             test.txt
           if-no-files-found: ignore
@@ -145,7 +151,7 @@ jobs:
 
       - name: Verdict
         if: always()
-        run: test "${{ steps.rust.outcome }}/${{ steps.seams.outcome }}" = success/success && test "${{ steps.test.outcome }}" != failure && test "${{ steps.spec.outcome }}" != failure
+        run: test "${{ steps.rust.outcome }}/${{ steps.seams.outcome }}" = success/success && test "${{ steps.tests.outcome }}" != failure && test "${{ steps.test.outcome }}" != failure && test "${{ steps.spec.outcome }}" != failure
 
   # Generated data CI regenerates and compares byte for byte: TensorFS's constructor orders and
   # converter tables, from pinned Diffusers/Transformers on the meta device (CPU, no weights).
