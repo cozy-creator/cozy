@@ -680,20 +680,27 @@ pub fn path(segments: &[&str]) -> String {
     url.path().to_owned()
 }
 
-/// The home's installed `cozy`, the only one Calcifer and the machine run.
+/// The home's installed `cozy`, the only one Calcifer and the machine run: the path the home
+/// records. With none recorded, or a recorded file gone (a package manager moved it), it is the
+/// installer's `<home>/bin/cozy` when that is there, else this cozy (Homebrew, winget, a distro
+/// package), and that is recorded. One rule for every installer; another cozy never replaces a
+/// recorded one that is there.
 pub(crate) fn installed(home: &Home) -> Result<PathBuf, Error> {
-    let binary = home.binary();
-    let message = format!("Calcifer runs only {}, which is missing", binary.display());
-    match binary.is_file() {
-        true => Ok(binary),
-        false => Err(Error::new(Kind::NotFound, "cozy_not_installed", message).next(INSTALL)),
+    let record = home.installed();
+    let recorded = std::fs::read_to_string(&record).ok().map(|text| PathBuf::from(text.trim_end()));
+    if let Some(recorded) = recorded.filter(|path| path.is_file()) {
+        return Ok(recorded);
     }
+    let failed = |e: String| Error::new(Kind::Internal, "installed_unrecorded", e);
+    let chosen = match home.binary() {
+        binary if binary.is_file() => binary,
+        _ => std::env::current_exe().map_err(|e| failed(e.to_string()))?,
+    };
+    home.open().map_err(|e| failed(e.to_string()))?;
+    platform::durable::replace(&record, chosen.to_string_lossy().as_bytes(), 0o600)
+        .map_err(|e| failed(e.to_string()))?;
+    Ok(chosen)
 }
-
-const INSTALL: &str = match cfg!(windows) {
-    true => "irm https://tensorhub.com/install.ps1 | iex",
-    false => "curl -LsSf https://tensorhub.com/install.sh | sh",
-};
 
 /// The refusal a Calcifer that could not start left.
 fn refusal(path: &Path) -> Option<Error> {
