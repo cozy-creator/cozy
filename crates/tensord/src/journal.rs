@@ -451,6 +451,19 @@ impl Journal {
             CREATE INDEX IF NOT EXISTS executions_updated ON executions(updated_ms);",
             )
             .map_err(db_error)?;
+        // A journal from before TensorD's 0.12 cohort lacks columns its runs are read by: refused
+        // with what to do, as an older store is (`storage::open`), never migrated.
+        let columns = |table: &str| -> io::Result<Vec<String>> {
+            let mut statement = connection.prepare(&format!("SELECT name FROM pragma_table_info('{table}')")).map_err(db_error)?;
+            let rows = statement.query_map([], |row| row.get(0)).map_err(db_error)?;
+            rows.collect::<Result<_, _>>().map_err(db_error)
+        };
+        let held_memos = columns("held_memos")?;
+        if !columns("executions")?.iter().any(|c| c == "actor") || !(held_memos.is_empty() || held_memos.iter().any(|c| c == "used_ms")) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "{} is a journal from before TensorD's 0.12 cohort, which this one cannot read: move it aside to start fresh (its runs are gone either way)",
+                root.display())));
+        }
         connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS machine_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS update_run_ids(actor TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(actor,id));
             CREATE TABLE IF NOT EXISTS installations(actor TEXT NOT NULL,alias TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(actor,alias));
@@ -2534,5 +2547,26 @@ mod failure_message_tests {
         let accepted = Failure::executor("failed", "runtime", "device_out_of_memory", "GPU full");
         assert_eq!(accepted.code, "accepted_envelope_breach");
         assert_eq!(accepted.message, "device_out_of_memory: GPU full");
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    /// A journal from before the 0.12 cohort (its executions without the index columns) is
+    /// refused with what to do, never migrated and never a database error.
+    #[test]
+    fn a_journal_from_before_the_cohort_is_refused_with_what_to_do() {
+        let root = std::env::temp_dir().join(format!("cm-old-journal-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        Connection::open(root.join(FILE)).unwrap().execute_batch("CREATE TABLE executions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE,
+            invocation TEXT NOT NULL, record TEXT NOT NULL, state TEXT NOT NULL, updated_ms INTEGER NOT NULL);").unwrap();
+        let Err(refused) = Journal::open(&root) else { panic!("an older journal is not opened") };
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
+        let text = refused.to_string();
+        assert!(text.starts_with(&root.display().to_string()) && text.contains("move it aside to start fresh"), "{text}");
+        let _ = fs::remove_dir_all(root);
     }
 }
