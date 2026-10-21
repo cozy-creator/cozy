@@ -46,33 +46,43 @@ impl Store {
         Ok((self.put_tree(&tree)?, absent))
     }
 
-    /// The tree `tree` as a plain folder in `dir`: its repo files, the headers of `variants`
-    /// (all when `None`), and those headers' objects this store holds, hard-linked when it can.
-    /// Headers go last.
+    /// The tree `tree` as a plain folder in `dir`: the headers of `variants` (all when `None`)
+    /// and those headers' objects this store holds.
     pub fn snapshot(&self, tree: &ObjectRef, dir: &Path, variants: Option<&[String]>) -> Result<()> {
         let tree = self.tree(tree)?;
+        let chosen: Vec<(&str, &ObjectRef)> = (tree.variants())
+            .filter(|(v, _)| variants.is_none_or(|want| want.iter().any(|w| w == v)))
+            .collect();
+        let mut payload = Vec::new();
+        for (_, header) in &chosen {
+            for object in Header::from_cbor(&self.read(header)?)?.objects() {
+                if self.reuse(object)? {
+                    payload.push(object.clone());
+                }
+            }
+        }
+        self.write_folder(&tree, dir, &chosen, &payload)
+    }
+
+    /// `tree` as a plain folder in `dir`: its repo files, `payload` under `chunks/`, then
+    /// `headers` last, so a folder never has a header without what it names.
+    pub fn write_folder(&self, tree: &Tree, dir: &Path, headers: &[(&str, &ObjectRef)], payload: &[ObjectRef]) -> Result<()> {
         let chunks = dir.join(CHUNKS_DIR);
         fs::create_dir_all(&chunks).map_err(fail("create", &chunks))?;
         for (path, object) in tree.repo_files() {
             self.materialize(object, &dir.join(path))?;
         }
-        let chosen: Vec<(&str, &ObjectRef)> = (tree.variants())
-            .filter(|(v, _)| variants.is_none_or(|want| want.iter().any(|w| w == v)))
-            .collect();
-        for (_, header) in &chosen {
-            for object in Header::from_cbor(&self.read(header)?)?.objects() {
-                if self.reuse(object)? {
-                    self.materialize(object, &chunks.join(&object.sha256))?;
-                }
-            }
+        for object in payload {
+            self.materialize(object, &chunks.join(&object.sha256))?;
         }
-        for (variant, header) in chosen {
+        for (variant, header) in headers {
             self.materialize(header, &dir.join(crate::format::variant_path(variant)))?;
         }
         Ok(())
     }
 
-    /// `object` at `dest`, unless a file of its length is there.
+    /// `object` at `dest`, unless a file of its length is there: hard-linked inside this store,
+    /// copied into a folder its caller owns, where an edit must not reach the stored object.
     pub fn materialize(&self, object: &ObjectRef, dest: &Path) -> Result<()> {
         if fs::metadata(dest).is_ok_and(|m| m.len() == object.length) {
             return Ok(());
@@ -82,7 +92,7 @@ impl Store {
         let temp = parent.join(format!(".{}.tmp-{}", object.sha256, std::process::id()));
         let _ = fs::remove_file(&temp);
         let src = self.path(object)?;
-        if fs::hard_link(&src, &temp).is_err() {
+        if !dest.starts_with(self.root()) || fs::hard_link(&src, &temp).is_err() {
             io::copy(&mut self.file(object)?, &mut File::create(&temp).map_err(fail("create", &temp))?)
                 .map_err(fail("copy", &temp))?;
         }

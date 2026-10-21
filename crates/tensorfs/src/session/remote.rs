@@ -293,26 +293,11 @@ impl Remote {
         let dest = local_dir
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.store.root().join("snapshots").join(identity));
-        // Materialize the selected closure, not every payload that happens to be
-        // present in the shared cache. Existing materialize owns all copying.
-        std::fs::create_dir_all(dest.join(crate::format::CHUNKS_DIR))
-            .map_err(|e| io_failure(dest.display(), e))?;
-        for (name, object) in tree.repo_files() {
-            self.store.materialize(object, &dest.join(name))?;
-        }
-        for (variant, header) in tree
-            .variants()
+        // The selected closure, not every payload that happens to be in the shared cache.
+        let chosen: Vec<_> = (tree.variants())
             .filter(|(v, _)| wanted.as_deref().is_none_or(|want| want == *v))
-        {
-            self.store
-                .materialize(header, &dest.join(crate::format::variant_path(variant)))?;
-        }
-        for object in &payload {
-            self.store.materialize(
-                object,
-                &dest.join(crate::format::CHUNKS_DIR).join(&object.sha256),
-            )?;
-        }
+            .collect();
+        self.store.write_folder(&tree, &dest, &chosen, &payload)?;
         self.store.maintain(0)?;
         Ok(dest)
     }
