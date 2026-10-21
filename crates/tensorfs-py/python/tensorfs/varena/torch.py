@@ -37,7 +37,7 @@ from . import Request as NativeRequest
 from . import Set
 
 __all__ = [
-    "Bind", "Cache", "Declared", "Exhausted", "Filling", "GpuId", "Grant", "Level", "Memory", "Model",
+    "Bind", "Cache", "Declared", "Exhausted", "Filling", "GpuId", "Grant", "Hold", "Level", "Memory", "Model",
     "Next", "Placeholder", "Request", "Stats", "Unbound", "VarenaError", "Weights", "blocks_of",
 ]
 
@@ -191,6 +191,22 @@ class Model:
         self.depth = 0
         self.passing: _Pass | None = None
 
+    def hold(self) -> Hold:
+        """Every block bound, pins and param views, until the hold's release (a CUDA graph's
+        fixed addresses). Register the graph as a `mem.cache` whose shrink drops it and releases
+        this."""
+        blocks = [b for b in (self.common, *self.blocks.values()) if b is not None]
+        held: list[_Block] = []
+        try:
+            for b in blocks:
+                self.memory._enter(b)
+                held.append(b)
+        except BaseException:
+            for b in reversed(held):
+                self.memory._exit(b)
+            raise
+        return Hold(self.memory, held)
+
     def close(self) -> None:
         """Unhooks the module and unloads its set."""
         for h in self.handles:
@@ -198,6 +214,24 @@ class Model:
         self.handles.clear()
         self.memory.models.pop(self.module, None)
         self.memory.native.unload(self.id)
+
+
+class Hold:
+    """A model's blocks held bound (`Model.hold`); `release`, or leaving its `with`, lets them go."""
+
+    def __init__(self, memory: Memory, blocks: list[_Block]) -> None:
+        self.memory, self.blocks = memory, blocks
+
+    def release(self) -> None:
+        blocks, self.blocks = self.blocks, []
+        for b in reversed(blocks):
+            self.memory._exit(b)
+
+    def __enter__(self) -> Hold:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.release()
 
 
 # -------------------------------------------------------------------------- the memory
@@ -391,14 +425,14 @@ class Memory:
         with block.model.lock:
             if block.count == 0:
                 self._bind(block, stream)
-            elif stream is not None and stream != block.stream:
-                stream.wait_stream(block.stream)  # type: ignore[arg-type]
+            elif stream is not None and stream != block.stream and not torch.cuda.is_current_stream_capturing():
+                stream.wait_stream(block.stream)  # type: ignore[arg-type]  # a capture binds under a hold
             block.count += 1
 
     def _exit(self, block: _Block) -> None:
         stream = torch.cuda.current_stream(self.device) if self.cuda else None
         with block.model.lock:
-            if stream is not None and block.stream not in (None, stream):
+            if stream is not None and block.stream not in (None, stream) and not torch.cuda.is_current_stream_capturing():
                 block.stream.wait_stream(stream)  # type: ignore[union-attr]
             block.count -= 1
             if block.count == 0:
@@ -451,6 +485,15 @@ class Request:
         """The current pass's level for cut site `site` (0: whole)."""
         return self.native.cut(site)
 
+    def levels(self) -> list[tuple[str, int]]:
+        """The current pass's proposed `(site, level)` for its collective cut sites; the group
+        agrees them (cozy-runtime's all-reduce) and hands them to `agree` before any exchange."""
+        return _current_pass().native.levels()
+
+    def agree(self, levels: list[tuple[str, int]]) -> None:
+        """The levels every rank uses for the current pass's collective sites."""
+        _current_pass().native.agree(levels)
+
     @contextmanager
     def site(self, name: str) -> Iterator[None]:
         """Measures cut site `name`'s op: its allocated peak goes into the open pass's sites and
@@ -494,6 +537,13 @@ def _torch(memory: Memory) -> tuple[int, int]:
     if not memory.cuda:
         return 0, 0
     return torch.cuda.memory_allocated(memory.device), torch.cuda.memory_reserved(memory.device)
+
+
+def _current_pass() -> _Pass:
+    p = _pass.get()
+    if p is None:
+        raise Unbound("no pass is open: a model's forward opens one")
+    return p
 
 
 def _fill(fill: Filling | None) -> Fill:

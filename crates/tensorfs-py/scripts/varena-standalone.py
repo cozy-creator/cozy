@@ -4,7 +4,7 @@
 A tiny `UNet2DConditionModel` is written into a TensorFS store; the same model built on meta is
 loaded through `tensorfs.varena.torch.Memory` (blocks from `_no_split_modules`) and run under
 `mem.request`, then compared with the plain model:
-  - with room for it all;
+  - with room for it all, and with every block held bound (a CUDA graph's hold);
   - in two processes on one table, the idle one making room for the other;
   - with a capacity below its size, so it streams, and so with a declared fill on fresh pages.
 First, the compiled `tensorfs._ext.varena` matches its stub name for name.
@@ -30,7 +30,7 @@ import torch
 from diffusers import UNet2DConditionModel
 from tensorfs._ext import varena as native
 from tensorfs.varena import GpuId
-from tensorfs.varena.torch import Declared, Memory, Weights
+from tensorfs.varena.torch import Declared, Memory, Placeholder, Weights
 
 CONFIG = dict(
     sample_size=8,
@@ -165,6 +165,11 @@ def main() -> int:
     mem = Memory.open(0) if cuda else opened(f"{tag}-ample", 1 << 30)
     unet = loaded(ck, mem)
     stats = run(mem, unet, plain, "ample", 2)
+    with mem.models[unet].hold():
+        weight = unet.down_blocks[0].attentions[0].proj_in.weight
+        check("hold: every block stays bound", not isinstance(weight, Placeholder), type(weight))
+        run(mem, unet, plain, "held", 1)
+    check("hold: released, placeholders are back", isinstance(unet.down_blocks[0].attentions[0].proj_in.weight, Placeholder))
     spans = mem.models[unet].set.spans
     room = stats.peak - sum(spans)  # the passes' measured room beside the weights
     common, blocks = spans[0], sorted(spans[1:])
