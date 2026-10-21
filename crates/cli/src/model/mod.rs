@@ -24,7 +24,7 @@ pub struct Args {
 enum Verb {
     /// Search the Hub's models: one row per model with its newest available release.
     Search(Search),
-    /// A model's releases, their lanes, sizes and checkpoints.
+    /// A model's releases, their lanes, sizes and commits.
     Info(Info),
     /// Set or clear a model's discovery family.
     Family(Family),

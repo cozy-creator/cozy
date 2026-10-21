@@ -150,6 +150,15 @@ fn closure(root: &Path, manifest: &str) -> Vec<(String, Vec<u8>)> {
     objects
 }
 
+/// Asset `name` of the root `model` component of checkpoint `header` in the store at `root`.
+fn asset(root: &Path, header: &str, name: &str) -> Vec<u8> {
+    let store = Store::open(root).unwrap();
+    let sha256 = header.trim_start_matches("sha256:").to_string();
+    let length = std::fs::metadata(store.path(&ObjectRef { sha256: sha256.clone(), length: 0 }).unwrap()).unwrap().len();
+    let checkpoint = store.checkpoint(&ObjectRef { sha256, length }).unwrap();
+    checkpoint.asset("model", name).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
 /// TensorFS end to end (xs-045 U9a): one machine imports a Hugging Face model into its store
 /// and puts it in the Hub's custody; a second, fresh machine pulls it by its digest under the
 /// run's owner bearer, and the library's distribution `Endpoint` pulls it into a third store
@@ -177,6 +186,15 @@ fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
     let (made, pulled) = (closure(&first.store(), &header), closure(&second.store(), &header));
     assert!(made.len() >= 2, "a header and its chunks: {}", made.len());
     assert!(made == pulled, "the pulled checkpoint differs from the uploaded one");
+    // The tokenizer files are the root component's assets: they travel with the checkpoint.
+    for (name, sha256) in [
+        ("tokenizer.json", "e62fc5f642751cf5d0bf542adb6aba88624b696f26f5f40aff7e4a53788eb85c"),
+        ("vocab.json", "eda8bd11b5763cec815aa93b5524cf7aeed42b49c772134355451460f46c299c"),
+        ("merges.txt", "150ce8950a91d89c2711cc5d0ca54895236a479a36913137409ac254806bf468"),
+    ] {
+        let (made, pulled) = (asset(&first.store(), &header, name), asset(&second.store(), &header, name));
+        assert!(made == pulled && tensorfs::sha256::hex_digest(&pulled) == sha256, "{name} differs");
+    }
     let made = closure(&first.store(), &source);
 
     let ca = std::fs::read(std::env::var("TENSORHUB_CA").expect("the Hub's CA")).unwrap();
@@ -217,7 +235,7 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let release = json(&home, &["--json", "model", "publish", &model, "--release", "1.0.0", "--commit", &source]);
     assert_eq!((release["commit"].as_str(), &release["changed"]), (Some(source.as_str()), &Value::Bool(true)), "{release}");
     let info = json(&home, &["--json", "model", "info", &model]);
-    assert_eq!(info["releases"][0]["lanes"][0]["checkpoint"], format!("{model}#{source}"), "{info}");
+    assert_eq!(info["releases"][0]["lanes"][0]["commit"], format!("{model}#{source}"), "{info}");
 
     json(&home, &["--json", "model", "family", &model, "cycle-test"]);
     let found = json(&home, &["--json", "model", "search", "--family", "cycle-test"]);

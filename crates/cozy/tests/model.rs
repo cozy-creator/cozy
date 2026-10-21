@@ -34,9 +34,9 @@ fn search_and_info_read_the_public_catalog() {
     assert!(!lanes.is_empty(), "{info}");
     for lane in lanes {
         assert!(lane["bytes"].as_i64().unwrap() > 0, "{lane}");
-        assert!(lane["checkpoint"].as_str().unwrap().starts_with("fidika/sdxl#sha256:"), "{lane}");
+        assert!(lane["commit"].as_str().unwrap().starts_with("fidika/sdxl#sha256:"), "{lane}");
     }
-    let first = lanes[0]["checkpoint"].as_str().unwrap().to_owned();
+    let first = lanes[0]["commit"].as_str().unwrap().to_owned();
 
     let pinned = home.json(["--json", "model", "info", &format!("fidika/sdxl@{release}")]);
     assert_eq!(pinned["releases"].as_array().unwrap().len(), 1, "{pinned}");

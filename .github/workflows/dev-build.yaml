@@ -86,7 +86,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         if: inputs.test != '' || inputs.runtime_ref != '' || inputs.tensorfs_run != '' || contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
       # The Rust workspace: rust-toolchain.toml's toolchain installs on first use. target/manylinux
-      # is the TensorFS wheel's container build.
+      # holds the manylinux_2_28 builds (tensord, the dev cozy); target/manylinux2014 the TensorFS
+      # wheel's, whose older glibc cannot run build scripts the 2_28 container compiled.
       - uses: Swatinem/rust-cache@v2
         if: inputs.test != '' || contains(inputs.build, 'tensor') || contains(inputs.build, 'cozy')
         with:
@@ -95,6 +96,7 @@ jobs:
           workspaces: |
             . -> target
             . -> target/manylinux
+            . -> target/manylinux2014
       - uses: arduino/setup-task@v2
         if: contains(inputs.build, 'tensord')
         with:
@@ -165,12 +167,12 @@ jobs:
           target: x86_64
           manylinux: auto
           working-directory: crates/tensorfs-py
-          args: --release --locked --target-dir ../../target/manylinux --out dist -i python3.11
+          args: --release --locked --target-dir ../../target/manylinux2014 --out dist -i python3.11
           docker-options: -e TENSORFS_REQUIRE_AOT=1
           before-script-linux: |
             # Match maturin's explicit target so the CLI and extension share dependency builds.
-            cargo build --release --locked --target x86_64-unknown-linux-gnu --target-dir ../../target/manylinux -p tensorfs --bin tfs
-            install -D -m 755 ../../target/manylinux/x86_64-unknown-linux-gnu/release/tfs wheel-data/scripts/tfs
+            cargo build --release --locked --target x86_64-unknown-linux-gnu --target-dir ../../target/manylinux2014 -p tensorfs --bin tfs
+            install -D -m 755 ../../target/manylinux2014/x86_64-unknown-linux-gnu/release/tfs wheel-data/scripts/tfs
       # The container leaves root-owned files the tests and the cache post-step write.
       - if: always() && contains(inputs.build, 'tensorfs')
         run: sudo chown -R "$(id -u):$(id -g)" target crates/tensorfs-py
