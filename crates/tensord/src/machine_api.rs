@@ -1191,9 +1191,8 @@ print(json.dumps({"identity": generation.identity}))
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let output = Command::new("uv")
             .current_dir(repo)
-            .args([
-                "run", "--locked", "--extra", "installer", "python", "-c", INSTALL,
-            ])
+            .args(named_runtime::helper())
+            .args(["python", "-c", INSTALL])
             .arg(repo.join("tests/fixtures").join(name))
             .arg(root)
             // The named Runtime, as a machine runs it.

@@ -2441,7 +2441,8 @@ pub(crate) mod tests {
             ("UV_CACHE_DIR", at("c")), ("UV_PYTHON_INSTALL_DIR", at("p"))]);
         for env in [&defaults, &named] {
             let asked = |what: &str| {
-                let out = Command::new("uv").args([what, "dir"]).env_clear().envs(env).output().unwrap();
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                let out = Command::new("uv").args([what, "dir"]).env_clear().env("PATH", path).envs(env).output().unwrap();
                 PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
             };
             let env: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();

@@ -17,7 +17,7 @@ meta = next(n for n in archive.namelist() if n.endswith('.dist-info/METADATA'))
 req = next(l[15:].split(';')[0].replace(' ', '') for l in archive.read(meta).decode().splitlines()
            if re.match(r'Requires-Dist: tensorfs[^A-Za-z0-9._-]', l))
 subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--only-binary=:all:', '--python-version', '3.12',
-                '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
+                '-d', str(out), req], check=True)
 print(next(out.glob('tensorfs-*.whl')))
 ";
 
@@ -36,6 +36,20 @@ pub fn pair() -> &'static [PathBuf] {
         });
         vec![runtime, tensorfs]
     })
+}
+
+/// `uv run` arguments for the repository's helper Python, which describes packages with the
+/// Runtime: the installer with the named pair, else the `test` extra's (PyPI's newest).
+pub fn helper() -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec!["run".into(), "--locked".into(), "--extra".into()];
+    match pair() {
+        [] => args.push("test".into()),
+        pair => {
+            args.push("installer".into());
+            args.extend(pair.iter().flat_map(|wheel| ["--with".into(), wheel.into()]));
+        }
+    }
+    args
 }
 
 /// The named pair as the image's (`<root>/opt/cozy/wheels`), so a machine started on `root` runs
