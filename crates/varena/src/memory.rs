@@ -301,6 +301,8 @@ enum Call {
     Withdraw { fp: String, page: u32 },
     Disown { fp: String, page: u32 },
     Use { digest: String, distance: Option<u32> },
+    /// A layout this process holds, handed to a tier that may not know it (a restarted one).
+    Readopt { digest: String, regions: Vec<(u64, u64)>, ask: String, file: Owned },
     /// A closing set's tier regions are unlocked, off the state lock.
     Unpin(Arc<tier::Held>),
     Close { digest: String },
@@ -362,6 +364,8 @@ struct State {
     claims: HashMap<u64, u64>,
     /// The custody connection the kept pages were exported over.
     holder: u64,
+    /// The tier connection this process's layouts were opened or handed over on.
+    tier_holder: u64,
 }
 
 impl State {
@@ -541,6 +545,7 @@ impl Memory {
             let (release_tx, releases) = unbounded();
             let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
             let holder = custody.as_ref().map_or(0, |c| c.holder());
+            let tier_holder = tier.as_ref().map_or(0, |t| t.holder());
             let context = backend.process_used().unwrap_or_else(|_| backend.opened_context());
             let table = Table { capacity: shared.capacity()?, context, ..Table::default() };
             let inner = Arc::new(Inner {
@@ -550,7 +555,7 @@ impl Memory {
                 _device: device,
                 custody,
                 tier,
-                state: Mutex::new(State { table, holder, ..State::default() }),
+                state: Mutex::new(State { table, holder, tier_holder, ..State::default() }),
                 landed: Condvar::new(),
                 to_custody,
                 to_tier,
@@ -747,7 +752,7 @@ impl Inner {
     fn post(&self, call: Call) {
         match call {
             Call::Export { .. } | Call::Withdraw { .. } | Call::Disown { .. } => self.to_custody.post(call, 0),
-            Call::Use { .. } | Call::Unpin(_) | Call::Close { .. } => self.to_tier.post(call, 0),
+            Call::Use { .. } | Call::Readopt { .. } | Call::Unpin(_) | Call::Close { .. } => self.to_tier.post(call, 0),
         };
     }
 
@@ -820,6 +825,19 @@ impl Inner {
                 *k
             }).collect();
             kept.into_iter().for_each(|k| self.keep(st, k));
+        }
+        if let Some(h) = self.tier.as_ref().map(|t| t.holder()).filter(|h| *h != st.tier_holder) {
+            // A new tier (its server restarted) knows none of the layouts this process holds:
+            // they go to it with their files, ready regions and all.
+            st.tier_holder = h;
+            let ask = self.row.ask_name();
+            let held: Vec<Call> = st
+                .sets
+                .iter()
+                .flatten()
+                .filter_map(|m| m.held.as_ref().and_then(|h| h.handover().ok()).map(|(file, regions)| Call::Readopt { digest: m.spec.layout.digest.clone(), regions, ask: ask.clone(), file }))
+                .collect();
+            held.into_iter().for_each(|c| self.post(c));
         }
         self.drop_stale(st);
         self.close_sets(st);
@@ -2226,12 +2244,13 @@ fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>,
 /// holder takes the state lock alone after, so every kept page is exported to it again.
 fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Option<&tier::Client>, inner: &Weak<Inner>) {
     while let Some((ticket, bytes, call)) = outbox.next() {
-        let holder = custody.map(custody::Client::holder);
+        let holder = (custody.map(custody::Client::holder), tier.map(tier::Client::holder));
         let _ = match call {
             Call::Export { fp, page, len, handle } => custody.map(|c| c.export(&fp, page, len, handle)),
             Call::Withdraw { fp, page } => custody.map(|c| c.withdraw(&fp, page)),
             Call::Disown { fp, page } => custody.map(|c| c.disown(&fp, page)),
             Call::Use { digest, distance } => tier.map(|t| t.use_layout(&digest, distance)),
+            Call::Readopt { digest, regions, ask, file } => tier.map(|t| t.adopt_layout(&digest, regions, &ask, file)),
             Call::Unpin(held) => {
                 if let Some(me) = inner.upgrade() {
                     held.unpin(|p| me.backend.unregister_host(p));
@@ -2241,11 +2260,11 @@ fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Opt
             Call::Close { digest } => tier.map(|t| t.close(&digest)),
         };
         outbox.sent(ticket, bytes);
-        let moved = holder != custody.map(custody::Client::holder);
+        let moved = holder != (custody.map(custody::Client::holder), tier.map(tier::Client::holder));
         if moved || bytes > 0 {
             if let Some(me) = inner.upgrade() {
-                // A new holder gets every kept page again (the drain does it); withdrawn bytes
-                // are free for the next decision.
+                // A new custody holder gets every kept page again, a new tier every held
+                // layout (the drain does it); withdrawn bytes are free for the next decision.
                 let mut st = me.lock();
                 st.table.pending = me.to_custody.pending();
                 me.publish(&st);

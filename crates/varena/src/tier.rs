@@ -9,8 +9,8 @@
 //! unmap it, so the pages really return when the tier punches them out.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::Ordering::{Acquire, Release};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
@@ -37,6 +37,9 @@ const NAME: &str = "tier";
 enum Call {
     /// Regions as (offset, span) in the layout; `ask` names the opener's ask socket.
     Open { digest: String, regions: Vec<(u64, u64)>, ask: String },
+    /// A layout this user holds, handed (with its file) to a tier that does not know it (a
+    /// restarted one): its ready regions are the tier's again.
+    Adopt { digest: String, regions: Vec<(u64, u64)>, ask: String },
     /// This process's next use of the layout, in steps; `None`: no declared use.
     Use { digest: String, distance: Option<u32> },
     Close { digest: String },
@@ -192,6 +195,8 @@ struct State {
     acked: u64,
     /// The host-short event's signalling end: nothing is left to give back.
     short: Option<Owned>,
+    /// Its users' open connections: a tier that stops serving closes them.
+    conns: HashMap<u64, Stream>,
 }
 
 type Shared = Arc<(Mutex<State>, Condvar)>;
@@ -286,13 +291,21 @@ pub struct Tier {
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// The host-short event's waiting end.
     short: Owned,
+    /// The accept loop: the name is free once it ends.
+    accepting: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Tier {
-    /// Gives the name back: the accept loop wakes, sees the stop, and drops its listener.
+    /// Gives the name back (the accept loop wakes, sees the stop, and drops its listener) and
+    /// closes its users' connections, as its process's end would.
     fn drop(&mut self) {
         self.stop.store(true, Release);
         let _ = os::connect(os::euid(), NAME);
+        if let Some(accepting) = self.accepting.take() {
+            let _ = accepting.join();
+        }
+        let conns = std::mem::take(&mut self.state.0.lock().conns);
+        conns.values().for_each(os::close);
     }
 }
 
@@ -328,7 +341,7 @@ impl Tier {
         let state = Arc::new((Mutex::new(State { short: Some(signal), ..State::default() }), Condvar::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (s, halt) = (state.clone(), stop.clone());
-        std::thread::Builder::new()
+        let accepting = std::thread::Builder::new()
             .name("varena-tier".into())
             .spawn(move || {
                 for stream in os::incoming(listener) {
@@ -340,7 +353,7 @@ impl Tier {
                 }
             })
             .map_err(|e| Error::io("spawn tier", e))?;
-        Ok(Some(Tier { state, stop, short }))
+        Ok(Some(Tier { state, stop, short, accepting: Some(accepting) }))
     }
 
     /// The layouts holding any ready region (status).
@@ -418,9 +431,13 @@ fn serve(stream: Stream, state: &Shared) {
     let conn = {
         let mut s = lock.lock();
         s.clock += 1;
-        s.clock
+        let conn = s.clock;
+        if let Ok(c) = stream.try_clone() {
+            s.conns.insert(conn, c);
+        }
+        conn
     };
-    while let Ok(Some((bytes, _))) = os::recv(&stream) {
+    while let Ok(Some((bytes, fd))) = os::recv(&stream) {
         let Ok(call) = os::decode::<Call>(&bytes) else { break };
         let mut s = lock.lock();
         s.clock += 1;
@@ -436,6 +453,19 @@ fn serve(stream: Stream, state: &Shared) {
                 }
                 Err(_) => (Reply::Room { ok: false }, None),
             },
+            Call::Adopt { digest, regions, ask } => {
+                if !s.layouts.contains_key(&digest) {
+                    if let Some(Ok(l)) = fd.map(|f| Layout::adopt(f, regions)) {
+                        s.layouts.insert(digest.clone(), l);
+                    }
+                }
+                if let Some(l) = s.layouts.get_mut(&digest) {
+                    l.users.insert(conn, (None, ask));
+                    l.used = clock;
+                }
+                cv.notify_all();
+                (Reply::Done, None)
+            }
             Call::Use { digest, distance } => {
                 if let Some((d, _)) = s.layouts.get_mut(&digest).and_then(|l| {
                     l.used = clock;
@@ -468,6 +498,7 @@ fn serve(stream: Stream, state: &Shared) {
         }
     }
     let mut s = lock.lock();
+    s.conns.remove(&conn);
     s.layouts.values_mut().for_each(|l| {
         l.users.remove(&conn);
     });
@@ -478,8 +509,7 @@ fn open(s: &mut State, digest: &str, regions: Vec<(u64, u64)>) -> Result<(u64, O
     if let Some(l) = s.layouts.get(digest) {
         return Ok((l.data, os::dup(&l.fd)?));
     }
-    let page = platform_page();
-    let data = ((regions.len() as u64 * 4).max(1)).div_ceil(page) * page;
+    let data = words_bytes(&regions);
     let end = regions.iter().map(|(o, s)| o + s).max().unwrap_or(0);
     let fd = os::memfd(&format!("varena-tier-{digest}"))?;
     os::resize(&fd, data + end)?;
@@ -487,6 +517,21 @@ fn open(s: &mut State, digest: &str, regions: Vec<(u64, u64)>) -> Result<(u64, O
     let handed = os::dup(&fd)?;
     s.layouts.insert(digest.to_string(), Layout { fd, words, regions, data, users: HashMap::new(), used: 0, pending: None });
     Ok((data, handed))
+}
+
+/// The layout file's ready-words page(s) ahead of its data.
+fn words_bytes(regions: &[(u64, u64)]) -> u64 {
+    let page = platform_page();
+    ((regions.len() as u64 * 4).max(1)).div_ceil(page) * page
+}
+
+impl Layout {
+    /// A layout from its file, its ready words as they are.
+    fn adopt(fd: Owned, regions: Vec<(u64, u64)>) -> Result<Layout> {
+        let data = words_bytes(&regions);
+        let words = os::map(&fd, data as usize, true)?;
+        Ok(Layout { fd, words, regions, data, users: HashMap::new(), used: 0, pending: None })
+    }
 }
 
 fn platform_page() -> u64 {
@@ -518,6 +563,11 @@ struct Pins {
 }
 
 impl Held {
+    /// Its file and regions, to hand to a tier that does not know the layout.
+    pub fn handover(&self) -> Result<(Owned, Vec<(u64, u64)>)> {
+        Ok((os::dup(&self.fd)?, self.regions.clone()))
+    }
+
     fn ptr(&self, r: u32) -> Result<(u64, u64)> {
         let (off, span) = self.region(r)?;
         Ok((self.ro.base as u64 + self.data + off, span))
@@ -650,6 +700,9 @@ pub(crate) struct Client {
     ns: u32,
     /// The tier this client serves from this process, when it found none.
     service: Mutex<Option<Tier>>,
+    /// Connections made: a new one may be a new tier (its server restarted), which knows none
+    /// of this user's layouts, so its user hands them over again.
+    holder: AtomicU64,
 }
 
 impl Client {
@@ -658,22 +711,39 @@ impl Client {
     /// user's; another user's tier is its TensorD's, never ours.
     pub fn open(ns: u32) -> Result<Client> {
         let (stream, service) = connect(ns)?;
-        Ok(Client { stream: Mutex::new(stream), ns, service: Mutex::new(service) })
+        Ok(Client { stream: Mutex::new(stream), ns, service: Mutex::new(service), holder: AtomicU64::new(1) })
+    }
+
+    /// Which connection this is (it changes when the tier may have).
+    pub fn holder(&self) -> u64 {
+        self.holder.load(Acquire)
+    }
+
+    /// Hands layout `digest` (this user's file of it) to the tier, which takes it as it is
+    /// unless it knows it.
+    pub fn adopt_layout(&self, digest: &str, regions: Vec<(u64, u64)>, ask: &str, file: Owned) -> Result<()> {
+        self.call_with(&Call::Adopt { digest: digest.into(), regions, ask: ask.into() }, Some(file)).map(|_| ())
     }
 
     /// One call; a broken connection (its tier's server went) is replaced once. The stream's
     /// lock is a leaf: connecting (which may start a tier) happens outside it.
     fn call(&self, call: &Call) -> Result<(Reply, Option<Owned>)> {
-        if let Ok(reply) = os::call(&self.stream.lock(), call, None) {
+        self.call_with(call, None)
+    }
+
+    fn call_with(&self, call: &Call, file: Option<Owned>) -> Result<(Reply, Option<Owned>)> {
+        let handle = file.as_ref().map(os::dup).transpose()?;
+        if let Ok(reply) = os::call(&self.stream.lock(), call, handle) {
             return Ok(reply);
         }
         let (stream, service) = connect(self.ns)?;
         if let Some(service) = service {
             *self.service.lock() = Some(service);
         }
+        self.holder.fetch_add(1, AcqRel);
         let mut current = self.stream.lock();
         *current = stream;
-        os::call(&current, call, None)
+        os::call(&current, call, file)
     }
 
     /// Maps `digest`'s layout; the tier asks `ask` (this process's row) to give it back.

@@ -452,6 +452,11 @@ mod imp {
     }
 
 
+    /// Ends both directions of a stream (its peer reads its end).
+    pub(crate) fn close(stream: &Stream) {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
     pub(crate) fn dup(h: &Owned) -> Result<Owned> {
         h.try_clone().map_err(|e| Error::io("dup", e))
     }
@@ -593,6 +598,9 @@ mod imp {
         match *s {}
     }
     pub(crate) fn recv(s: &Stream) -> Result<Option<Message>> {
+        match *s {}
+    }
+    pub(crate) fn close(s: &Stream) {
         match *s {}
     }
     pub(crate) fn dup(_: &Owned) -> Result<Owned> {

@@ -32,7 +32,7 @@ fn main() {
     }
     let filter: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
     type Case = (&'static str, fn(&Path));
-    let cases: [Case; 20] = [
+    let cases: [Case; 22] = [
         ("an_idle_holder_answers_an_ask", an_idle_holder_answers_an_ask),
         ("a_killed_holder_leaves_orphans_a_successor_imports", a_killed_holder_leaves_orphans_a_successor_imports),
         ("a_failed_request_frees_everything", a_failed_request_frees_everything),
@@ -53,6 +53,8 @@ fn main() {
         ("an_oom_counts_its_own_unmaps_after_an_ask", an_oom_counts_its_own_unmaps_after_an_ask),
         ("a_standalone_process_wakes_tensord", a_standalone_process_wakes_tensord),
         ("the_tier_comes_back_after_a_release", the_tier_comes_back_after_a_release),
+        ("a_reload_fills_from_the_tier", a_reload_fills_from_the_tier),
+        ("held_layouts_outlive_a_tier_restart", held_layouts_outlive_a_tier_restart),
     ];
     let dir = tempfile::tempdir().unwrap();
     let mut failed = vec![];
@@ -1090,4 +1092,51 @@ fn the_tier_comes_back_after_a_release(dir: &Path) {
     y.ok("unpin");
     y.ok("end r");
     y.exit();
+}
+
+/// The vertical slice's reload: an executor that ended (its kept pages gone with custody, here
+/// none kept for it) leaves its layout in the tier; the next one's load fills from there.
+fn a_reload_fills_from_the_tier(dir: &Path) {
+    let g = gpu("reload", 64 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let tier = varena::Tier::serve(varena::Pressure::Headroom).unwrap().expect("this namespace's tier");
+    let path = write_set(dir, "rl", 2);
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {} {}", g.uuid, g.memory));
+    a.ok(&format!("load rl {} undeclared ram", path.display()));
+    a.exit();
+    let mut b = Agent::spawn();
+    b.ok(&format!("open {} {}", g.uuid, g.memory));
+    b.ok(&format!("load rl {} undeclared gpu", path.display()));
+    b.ok("request r rl");
+    assert_eq!(b.ok("trace r"), "Tier,Tier", "the load filled from the tier, not the store");
+    b.exit();
+    drop(tier);
+}
+
+/// The vertical slice's TensorD restart: the tier's server goes and comes back; the executors
+/// that hold its layouts hand them (their files, ready regions and all) to the new one, so the
+/// next load still fills from the tier.
+fn held_layouts_outlive_a_tier_restart(dir: &Path) {
+    let g = gpu("tierback", 64 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let first = varena::Tier::serve(varena::Pressure::Headroom).unwrap().expect("this namespace's tier");
+    let (p, q) = (write_set(dir, "hp", 2), write_set(dir, "hq", 1));
+    let digest = format!("layout-hp-{}", g.uuid);
+    let mut c = Agent::spawn();
+    c.ok(&format!("open {} {}", g.uuid, g.memory));
+    c.ok(&format!("load hp {} undeclared ram", p.display()));
+    // The tier's server restarts.
+    drop(first);
+    let second = varena::Tier::serve(varena::Pressure::Headroom).unwrap().expect("the tier again");
+    // c's next tier call finds the new tier, and hands it what it holds.
+    c.ok(&format!("load hq {} undeclared ram", q.display()));
+    second.await_uses(|u| u.iter().any(|(d, _)| *d == digest));
+    let mut d = Agent::spawn();
+    d.ok(&format!("open {} {}", g.uuid, g.memory));
+    d.ok(&format!("load hp {} undeclared gpu", p.display()));
+    d.ok("request r hp");
+    assert_eq!(d.ok("trace r"), "Tier,Tier", "filled from the layout c handed over");
+    d.exit();
+    c.exit();
 }
