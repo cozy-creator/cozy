@@ -6,8 +6,10 @@
 --asset binary=<the gpu test binary> --asset suite=<suite.json>`.
 
 `suite.json` is `{"label": "...", "cases": ["name", ...]}`. Each case runs in a fresh process of
-the binary; it passes when the harness reports 1 passed, 0 failed, 0 ignored and it printed a
-`PASS ... <GPU UUID>` line. Every case must name the same physical GPU.
+the binary, one after another; it passes when the harness reports 1 passed, 0 failed, 0 ignored
+and it printed `PASS ... <GPU UUID>` (libtest may put it on its `test <name> ... ` line). Every
+case must name the same physical GPU. The outputs hold each case's log (stdout and stderr) and
+result.json, whichever cases failed: the caller judges the suite from result.json.
 """
 from pathlib import Path
 import json
@@ -43,15 +45,14 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=1 << 28)],
         (logs / f"{case}.log").write_text(text)
         print(text, flush=True)
         summary = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", text)
-        named = [m for line in text.splitlines() if line.startswith("PASS ") for m in UUID.findall(line)[-1:]]
+        named = [m for line in text.splitlines() if "PASS " in line for m in UUID.findall(line)[-1:]]
         if run.returncode or summary[-1:] != [("1", "0", "0")] or not named:
             failed.append(case)
             continue
         gpus.update(named)
         passed.append(case)
     result = {"label": label, "cases": cases, "passed": passed, "failed": failed, "gpus": sorted(gpus),
-              "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+              "ok": not failed and len(gpus) == 1, "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
     (logs / "result.json").write_text(json.dumps(result, indent=2))
-    if failed or len(gpus) != 1:
-        raise RuntimeError(f"native suite {label}: failed {failed}, GPUs {sorted(gpus)}")
+    print(f"native suite {label}: passed {len(passed)}, failed {failed}, GPUs {sorted(gpus)}", flush=True)
     return out.save_tree(logs)
