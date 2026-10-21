@@ -95,10 +95,10 @@ jobs:
           target: x86_64
           manylinux: auto
           working-directory: .cozy-src/crates/tensorfs-py
-          args: --release --locked --target-dir ../../target/manylinux --out dist
+          args: --release --locked --target-dir ../../target/manylinux --out dist -i python3.11
           before-script-linux: |
-            cargo build --release --locked --target-dir ../../target/manylinux -p tensorfs --bin tfs
-            install -D -m 755 ../../target/manylinux/release/tfs wheel-data/scripts/tfs
+            cargo build --release --locked --target x86_64-unknown-linux-gnu --target-dir ../../target/manylinux -p tensorfs --bin tfs
+            install -D -m 755 ../../target/manylinux/x86_64-unknown-linux-gnu/release/tfs wheel-data/scripts/tfs
       - if: inputs.runtime_ref != ''
         run: |
           sudo chown -R "$(id -u):$(id -g)" .cozy-src/target .cozy-src/crates/tensorfs-py

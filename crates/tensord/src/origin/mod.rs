@@ -3,12 +3,8 @@
 //! GETs, every object verified as the store admits it. TensorD's threads are synchronous; each
 //! call here blocks on the fetch runtime and ends early when its [`Stop`] is cancelled.
 //!
-//! - [`hub`]: TensorFS's `TensorhubOrigin` under the run's Cozy credentials.
-//! - [`publish`]: a checkpoint put in a Hub repository's custody.
-//! - [`serve`]: the executor's fetch channel.
+//! - [`hub`]: TensorFS's distribution `Endpoint` at the run's Hub, under its request's bearer.
 mod hub;
-mod publish;
-mod serve;
 
 use std::{
     future::Future,
@@ -21,15 +17,16 @@ use std::{
 use tensorfs::{
     err::{refuse, Code, Refusal, Result},
     fetch::{Client, Config, Fetcher, Landed, Origin, Progress, Pulled, SourcePolicy, VolumeOrigin, Want},
-    format::ObjectRef,
-    store2::Store,
+    format::{ObjectRef, Tree},
+    store::Store,
 };
 
-pub use hub::{remote, resolve_hash, resolve_named, Resolved};
-pub use publish::{Publication, Published};
-pub use serve::{serve, Grant};
+pub use hub::{object, release, remote};
 
-use crate::{stop::Stop, storage};
+use crate::stop::Stop;
+
+/// How long the datacenter volume keeps what nobody reads.
+const VOLUME_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// How often a blocked call looks at its stop.
 const TICK: Duration = Duration::from_millis(100);
@@ -69,7 +66,7 @@ impl Machine {
     /// Fetches into `store`, reading the datacenter volume mounted at `volume` first.
     pub fn new(store: Arc<Store>, volume: Option<&Path>) -> io::Result<Arc<Machine>> {
         let runtime = tensorfs::fetch::runtime().map_err(io::Error::other)?;
-        let volume = volume.and_then(|path| VolumeOrigin::mounted(path, storage::TTL));
+        let volume = volume.and_then(|path| VolumeOrigin::mounted(path, VOLUME_TTL));
         Ok(Arc::new(Machine { store, runtime, volume, fetchers: Mutex::default() }))
     }
 
@@ -77,7 +74,7 @@ impl Machine {
         &self.store
     }
 
-    /// The client objects of a remote with this trust are fetched over (for an `HttpOrigin`).
+    /// The client objects of a remote with this trust are fetched over (for an `Endpoint`).
     pub fn client(&self, trust: Option<&Arc<Vec<u8>>>, local: bool) -> Result<Client> {
         Ok(self.fetcher(&(trust.cloned(), local))?.client().clone())
     }
@@ -125,31 +122,40 @@ impl Machine {
         answer.recv().unwrap_or_else(|_| refuse(Code::TRANSFER_FAILED, "the fetch runtime ended"))
     }
 
-    /// `manifest`'s checkpoint, the `components` given (all when `None`): manifest, header,
-    /// files, then, once the disk has room for them, the chunks the components read.
+    /// The tree document `tree`, landed here (its repo files are not: nothing on a machine reads
+    /// them).
+    pub fn tree(&self, remote: &Remote, tree: &ObjectRef, stop: &Stop) -> Result<Tree> {
+        let (fetcher, store, origin) = (self.of(remote)?, self.store.clone(), remote.origin.clone());
+        let tree = tree.clone();
+        self.block(stop, async move {
+            fetcher.objects(&origin, std::slice::from_ref(&tree), &Want { priority: priority::NOW, ..Want::default() }).await?;
+            tokio::task::spawn_blocking(move || store.tree(&tree).map_err(|e| e.refusal()))
+                .await
+                .map_err(|e| Refusal { code: Code::IO_FAILED, detail: e.to_string() })?
+        })
+    }
+
+    /// The cozytensors whose header is `header`, the `components` given (all when `None`): its
+    /// header, then the chunks and assets the components read (the store refuses what its
+    /// disk cannot take).
     pub fn pull(
         &self,
         remote: &Remote,
-        manifest: &ObjectRef,
+        header: &ObjectRef,
         components: Option<&[String]>,
         priority: u64,
         progress: Option<Arc<Progress>>,
         stop: &Stop,
     ) -> Result<Pulled> {
-        let (fetcher, store, origin) = (self.of(remote)?, self.store.clone(), remote.origin.clone());
-        let (manifest, components) = (manifest.clone(), components.map(<[String]>::to_vec));
+        let (fetcher, origin) = (self.of(remote)?, remote.origin.clone());
+        let (header, components) = (header.clone(), components.map(<[String]>::to_vec));
         self.block(stop, async move {
             let want = |components| Want { components, priority, progress: progress.as_deref() };
-            let structure = fetcher.pull_manifest(&origin, &manifest, &want(Some(&[]))).await?;
+            let structure = fetcher.pull_header(&origin, &header, &want(Some(&[]))).await?;
             if components.as_deref() == Some(&[]) {
                 return Ok(structure);
             }
-            let (held, id) = (store.clone(), manifest.clone());
-            let checkpoint = tokio::task::spawn_blocking(move || held.checkpoint(&id).map_err(|e| e.refusal()))
-                .await
-                .map_err(|e| Refusal { code: Code::IO_FAILED, detail: e.to_string() })??;
-            admit(&store, &tensorfs::fetch::chunks(checkpoint.header(), components.as_deref())?)?;
-            let mut pulled = fetcher.pull_manifest(&origin, &manifest, &want(components.as_deref())).await?;
+            let mut pulled = fetcher.pull_header(&origin, &header, &want(components.as_deref())).await?;
             (pulled.landed.origin, pulled.landed.volume) =
                 (pulled.landed.origin + structure.landed.origin, pulled.landed.volume + structure.landed.volume);
             Ok(pulled)
@@ -158,10 +164,9 @@ impl Machine {
 
     /// Each of `objects` here, fetched from `remote` when absent.
     pub fn objects(&self, remote: &Remote, objects: &[ObjectRef], priority: u64, stop: &Stop) -> Result<Landed> {
-        let (fetcher, store, origin) = (self.of(remote)?, self.store.clone(), remote.origin.clone());
+        let (fetcher, origin) = (self.of(remote)?, remote.origin.clone());
         let objects = objects.to_vec();
         self.block(stop, async move {
-            admit(&store, &objects)?;
             fetcher.objects(&origin, &objects, &Want { priority, ..Want::default() }).await
         })
     }
@@ -192,15 +197,6 @@ pub fn watched<T>(progress: &Progress, report: &(dyn Fn(u64, u64) + Sync), work:
         done.cancel();
         answer
     })
-}
-
-/// Room on the store's disk for the absent `objects`, past the reserve.
-fn admit(store: &Store, objects: &[ObjectRef]) -> Result<()> {
-    let absent: u64 = objects.iter().filter(|o| !store.reuse(o).unwrap_or(false)).map(|o| o.length).sum();
-    match absent {
-        0 => Ok(()),
-        bytes => storage::admits(store, bytes).map_err(|e| Refusal { code: Code::CAPACITY_EXHAUSTED, detail: e.to_string() }),
-    }
 }
 
 #[cfg(test)]

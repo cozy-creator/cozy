@@ -32,6 +32,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+tensorfs = { workspace = true, features = ["store"] }
 hub-client = { workspace = true, features = ["testing"] }
 reqwest = { workspace = true, features = ["json"] }
 tokio = { workspace = true, features = ["test-util"] }

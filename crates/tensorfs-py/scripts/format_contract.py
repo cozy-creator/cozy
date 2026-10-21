@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""The store format and claim protocol this tree speaks, against the newest tensorfs on PyPI (design §2).
+"""The store format this tree speaks, against the newest tensorfs on PyPI (design §2).
 
 The `cozy` binary's TensorFS and a machine's tensorfs wheel share stores, so both must speak one
-STORE_FORMAT and CLAIM_PROTOCOL:
+STORE_FORMAT:
 
     format_contract.py binary [--wheel W]  the newest published wheel (or wheel file W) speaks this tree's
                                            integers; prints its version
@@ -22,7 +22,7 @@ import tomllib
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-NAMES = ("STORE_FORMAT", "CLAIM_PROTOCOL")
+NAMES = ("STORE_FORMAT",)
 
 
 def source() -> tuple[int, ...]:
@@ -60,7 +60,7 @@ def main() -> int:
         mode = ""
     ours = source()
     version, theirs = speaks(str(pathlib.Path(wheel).resolve())) if wheel else published()
-    said = lambda ints: "nothing" if ints is None else f"store format {ints[0]}, claim protocol {ints[1]}"
+    said = lambda ints: "nothing" if ints is None else f"store format {ints[0]}"
     if mode == "binary":
         if theirs != ours:
             which = f"the wheel {wheel}" if wheel else "the newest on PyPI"

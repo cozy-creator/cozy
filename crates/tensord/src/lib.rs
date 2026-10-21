@@ -2,18 +2,18 @@
 // costs nothing worth boxing it for.
 #![allow(clippy::result_large_err)]
 pub mod access;
+pub mod adapter;
 mod archive;
 pub mod api;
 mod boundary_json;
 mod call_memo;
+pub mod cas;
 pub mod catalog;
 pub mod config;
-pub mod derive;
 pub mod child_launcher;
 pub mod deposits;
 pub mod device_executor;
 pub mod execution;
-pub mod frame;
 mod gpu_allocation;
 pub mod gpu_service;
 pub mod held_models;
@@ -26,9 +26,6 @@ pub mod machine;
 pub mod machine_api;
 pub mod memo;
 pub mod memory;
-#[cfg(feature = "migrate")]
-mod migrate;
-pub mod model_sources;
 pub mod native_inputs;
 pub mod objects;
 pub mod origin;
@@ -40,7 +37,6 @@ pub mod seam;
 pub mod published;
 pub mod reclaim;
 pub mod runs;
-pub mod weights;
 #[cfg(test)]
 mod scratch;
 #[cfg(test)]

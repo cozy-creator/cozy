@@ -11,9 +11,8 @@ use std::sync::Arc;
 use std::thread;
 
 use common::*;
-use tensorfs::read;
 use varena::host::HostMem;
-use varena::io::{IoTally, Source};
+use varena::io::IoTally;
 use varena::layout::Layout;
 use varena::window::open_window;
 
@@ -66,10 +65,13 @@ impl Served {
 }
 
 fn serve(fx: &Fixture, slots: usize) -> (std::os::fd::OwnedFd, Layout, Served) {
-    let layout = Layout::build(&fx.plan(), &regions()).unwrap();
+    serve_regions(fx, slots, &regions())
+}
+
+fn serve_regions(fx: &Fixture, slots: usize, regions: &[Vec<String>]) -> (std::os::fd::OwnedFd, Layout, Served) {
+    let layout = Layout::build(&fx.ck.spans(regions).unwrap(), regions).unwrap();
     let (fd, window) = open_window("unet", &layout, slots).unwrap();
-    let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-    let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let source = fx.source();
     let stop = Arc::new(AtomicBool::new(false));
     let (l, s) = (layout.clone(), stop.clone());
     let thread = thread::spawn(move || window.serve(&l, &source, 3, &IoTally::default(), &s));
@@ -138,19 +140,29 @@ fn concurrent_adopters_never_see_a_slot_refilled_under_them() {
 #[test]
 fn a_region_the_machine_cannot_read_fails_its_readers_and_only_them() {
     let fx = Fixture::new("window-gone");
-    let (fd, layout, served) = serve(&fx, 2);
-    // The object behind region 2 (c.weight) vanishes after the lease (a disk fault): its stage
-    // fails, the others still stream.
+    // b.weight last: the packs hold the small tensors, so only its chunks are its own.
+    let unet = |keys: &[&str]| keys.iter().map(|k| format!("unet/{k}")).collect::<Vec<_>>();
+    let rs = [unet(&["a.weight", "a.bias"]), unet(&["c.weight", "c.norm"]), unet(&["b.weight"])];
+    let (fd, layout, served) = serve_regions(&fx, 2, &rs);
+    // An object behind region 2 vanishes (a disk fault): the stages that read it fail, the
+    // others still stream.
     let object = layout.regions[2].items.iter().find_map(|it| match &it.source {
-        varena::layout::ItemSource::Object(o) => Some(o.obj.sha256.clone()),
+        varena::layout::ItemSource::Object(o) => Some(o.obj.clone()),
         _ => None,
     });
-    std::fs::remove_file(fx.store.blob_path(&object.unwrap())).unwrap();
+    let object = object.unwrap();
+    let uses = |r: usize| {
+        let mut items = layout.regions[r].items.iter();
+        items.any(|it| matches!(&it.source, varena::layout::ItemSource::Object(o) if o.obj == object))
+    };
+    assert!(!uses(0) && !uses(1));
+    std::fs::remove_file(fx.path(&object)).unwrap();
     let want = expected(&layout);
     let host = HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();
-    read_region(&host, 0, &want[0]).unwrap();
-    assert!(read_region(&host, 2, &want[2]).is_err(), "a region its machine could not read is never read");
-    read_region(&host, 1, &want[1]).unwrap();
+    for r in [0, 2, 1] {
+        let read = read_region(&host, r as u32, &want[r]);
+        assert_eq!(read.is_err(), uses(r), "region {r}: a region its machine could not read is never read");
+    }
     served.end().unwrap();
 }
 

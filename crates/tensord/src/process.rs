@@ -126,14 +126,24 @@ pub enum Meter {
     Burn,
     /// Frames of the running invocation; a canceled one must stop within its pace's patience.
     Frames,
-    /// A GPU invocation's work, judged while it runs: frames, bytes moved, GPU kernels and
-    /// copies, or CPU above 1.5 cores. One spinning core is not progress (runs 11818, 11822).
+    /// A GPU invocation's work, judged while it runs: frames, bytes moved, GPU memory traffic,
+    /// or CPU other than a wait on a stuck GPU.
     Work,
 }
 
-/// GPU work seen so far (a count of busy readings); None while it cannot be read, which judges
-/// nothing.
-pub type Activity = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+/// What a call's GPUs did since the last reading.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Gpus {
+    Idle,
+    /// Device memory moved: kernels' traffic, copies, peer writes.
+    Moved,
+    /// A kernel stayed resident with no memory traffic: a collective whose peer is gone, or a
+    /// kernel spinning on a flag. A host spinning meanwhile waits on it.
+    Stuck,
+}
+
+/// Its GPUs' readings; None while they cannot be read, which judges nothing.
+pub type Activity = Arc<dyn Fn() -> Option<Gpus> + Send + Sync>;
 
 /// A measured wedge's verdict, as the error of the command it ended.
 #[derive(Debug)]
@@ -176,8 +186,9 @@ impl Watch {
             Meter::Frames | Meter::Work => Pace::seeded(worst_gap),
             Meter::Burn => Pace::default(),
         };
-        // A GPU call's samples whose group CPU ran above one core, and its last CPU reading.
-        let (mut cores, mut last_cpu) = (0, None);
+        // A GPU call's samples with memory traffic, its CPU other than stuck-GPU waits, and its
+        // last CPU reading.
+        let (mut moves, mut ran, mut last_cpu) = (0, 0, None);
         let mut state = self.state.lock().unwrap();
         while !state.done {
             let now = Instant::now();
@@ -200,15 +211,12 @@ impl Watch {
             let reading = match self.meter {
                 Meter::Burn => group_burn(exact.birth()),
                 Meter::Frames => Some(state.frames),
-                Meter::Work => self.activity.as_ref().and_then(|activity| activity()).map(|gpu| {
+                Meter::Work => self.activity.as_ref().and_then(|activity| activity()).map(|gpus| {
                     let (cpu, moved) = group_meter(exact.birth()).unwrap_or_default();
-                    // CPU on more than one core is work (1.5 cores leaves room for sampling skew):
-                    // real CPU phases (torch intra-op, ffmpeg, BLAS) run many threads, a spin one,
-                    // and a missed kill beats killing a real run.
-                    if let Some((before, at)) = last_cpu.replace((cpu, now)) {
-                        cores += u64::from(u128::from(cpu.saturating_sub(before)) * 2 > (now - at).as_nanos() * 3);
-                    }
-                    gpu + state.frames + moved + cores
+                    let since = cpu.saturating_sub(last_cpu.replace(cpu).unwrap_or(cpu));
+                    ran += if gpus == Gpus::Stuck { 0 } else { since };
+                    moves += u64::from(gpus == Gpus::Moved);
+                    state.frames + moved + moves + ran
                 }),
             };
             pace.observe(reading, now);
@@ -223,7 +231,7 @@ impl Watch {
                 let still = now - since;
                 if still > pace.patience(floor) {
                     let measures = match self.meter {
-                        Meter::Work => " (frames, bytes moved, GPU kernels and copies, CPU beyond one core)",
+                        Meter::Work => " (frames, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)",
                         _ => "",
                     };
                     let verdict = format!("wedged during {what}: {}{measures}", pace.verdict(still, floor));
@@ -547,21 +555,24 @@ mod tests {
         assert!(group_members(&birth).is_empty());
     }
 
-    /// A GPU call is judged while it runs on its work: one spinning on one core with no frames,
-    /// no bytes and idle GPUs is killed (runs 11818, 11822); one that moves bytes, whose GPUs
-    /// work, whose GPUs cannot be read or that runs on more than one core is not.
+    /// A GPU call is judged while it runs on its work: one blocked with idle GPUs, or spinning
+    /// while its GPU holds a kernel that moves no memory (a collective whose peer is gone), is
+    /// killed; one that computes on any number of threads, moves bytes, or whose GPUs move
+    /// memory or cannot be read is not.
     #[cfg(unix)]
     #[test]
-    fn a_gpu_call_spinning_without_work_is_killed_and_working_ones_are_not() {
-        let cases: [(&str, &str, Option<Activity>, bool); 5] = [
-            ("spins", "while :; do :; done", Some(Arc::new(|| Some(0))), true),
-            ("moves bytes", "while :; do echo work; done > /dev/null", Some(Arc::new(|| Some(0))), false),
-            ("GPU works", "while :; do :; done", {
-                let busy = std::sync::atomic::AtomicU64::new(0);
-                Some(Arc::new(move || Some(busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed))))
-            }, false),
-            ("GPU unread", "while :; do :; done", Some(Arc::new(|| None)), false),
-            ("spins on two cores", "while :; do :; done & while :; do :; done", Some(Arc::new(|| Some(0))), false),
+    fn a_gpu_call_blocked_or_waiting_on_a_stuck_gpu_is_killed_and_working_ones_are_not() {
+        let gpus = |reading: Option<Gpus>| -> Option<Activity> { Some(Arc::new(move || reading)) };
+        let spin = "while :; do :; done";
+        let cases = [
+            ("blocked", "sleep 600", gpus(Some(Gpus::Idle)), true),
+            ("waits on a stuck GPU", spin, gpus(Some(Gpus::Stuck)), true),
+            ("computes on one thread", spin, gpus(Some(Gpus::Idle)), false),
+            // However little CPU a loaded machine gives them.
+            ("computes on two threads", "while :; do :; done & while :; do :; done", gpus(Some(Gpus::Idle)), false),
+            ("moves bytes while its GPU is stuck", "while :; do echo work; done > /dev/null", gpus(Some(Gpus::Stuck)), false),
+            ("its GPU moves memory", "sleep 600", gpus(Some(Gpus::Moved)), false),
+            ("its GPU is unread", "sleep 600", gpus(None), false),
         ];
         // A shell can fork a CPU spinner. Always end its group, including on an assertion
         // failure: Child::kill only ends the shell and leaves that spinner running.
@@ -591,7 +602,7 @@ mod tests {
             if killed {
                 let verdict = verdict.unwrap();
                 assert!(verdict.contains("wedged during invoke: no measurable progress"), "{case}");
-                assert!(verdict.contains("(frames, bytes moved, GPU kernels and copies, CPU beyond one core)"), "{verdict}");
+                assert!(verdict.contains("(frames, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)"), "{verdict}");
             }
             drop(group);
             assert!(group_members(&birth).iter().all(|member| member.ended().unwrap()), "{case}: the test left a process running");

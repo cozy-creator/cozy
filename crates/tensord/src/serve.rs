@@ -83,10 +83,8 @@ fn run(lifetime: Lifetime, service_ready: Option<u64>) -> io::Result<()> {
             tracing::warn!("{error}");
         }
     }
-    let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
-    update::retire_agent(&paths);
     #[cfg(unix)]
-    let ready = supervise::supervise(&paths, grant.provider.clone())?;
+    let ready = supervise::supervise(&update::Paths::new(&grant.layout.engine(), &grant.layout.root), grant.provider.clone())?;
     config.gpu_memory_limit = config::gpu_memory_limit()?;
     run_machine(config, ready)
 }
@@ -110,17 +108,15 @@ fn hold_handed_descriptors() {
     }
 }
 
-/// The machine's one async runtime: its API, its lifecycle and TensorFS's transport, where every
-/// object request in flight is a task, never a thread. Made in the service, after the stable
-/// parent's fork and before anything fetches.
+/// The machine's async runtime: its API and its lifecycle, where every request in flight is a
+/// task, never a thread. Made in the service, after the stable parent's fork. TensorFS fetches
+/// on its own runtime (`fetch::runtime`).
 fn machine_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     if let Some(runtime) = RUNTIME.get() {
         return Ok(runtime);
     }
-    // The API's two threads and the transport's two, together.
-    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("tensord").enable_all().build()?;
-    tensorfs::transport::use_runtime(runtime.handle().clone());
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("tensord").enable_all().build()?;
     Ok(RUNTIME.get_or_init(|| runtime))
 }
 
@@ -283,10 +279,6 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     let engine = layout.engine();
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
-    // A rental's own store only: never the datacenter volume or an operator-named root.
-    if rental && layout.own_store() {
-        crate::storage::drop_pre_cut(&layout.store)?;
-    }
     let (_owned, store) = own(&engine, &layout.store)?;
     // The machine's one downloader, held for its life: it reads the datacenter volume before the
     // Hub and fills it. A variable naming no mount point (the volume was not delivered) is none.
@@ -356,8 +348,9 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
                 serde_json::from_reader(file).map_err(io::Error::other)?;
             config.as_object_mut().expect("an object").extend(settings);
         }
-        let config: crate::gpu_service::GpuConfig =
-            serde_json::from_value(config).map_err(io::Error::other)?;
+        let config = serde_json::from_value::<crate::gpu_service::GpuConfig>(config)
+            .map_err(io::Error::other)?
+            .checked()?;
         let store = store.clone();
         service.configure_pool(crate::gpu_service::Pool::new(
             &engine.join("gpu"),
@@ -487,7 +480,7 @@ fn start_api(
     let publisher =
         crate::published::Publisher::new(&root.join("published"), sdk, machine.clone())?;
     service.configure_publisher(publisher.clone());
-    backend.publisher = Some(publisher);
+    backend.publisher = Some(publisher.clone());
     // Local packages install only with the helper; package environments get the client either way.
     backend.installer = match (helper, wheel) {
         (Some(helper_python), Some(client_wheel)) => Some(api::install::InstallerConfig {
@@ -510,34 +503,24 @@ fn start_api(
         }
         _ => None,
     };
-    let objects = Arc::new(crate::objects::Objects::new(
-        &root.join("writes"),
-        store.clone(),
-        service.engine.clone(),
-    )?);
+    let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), service.engine.clone())?);
     service.engine.hold_memos(&objects);
-    // The leaf the CLI pins is the key a run's capability names (th-241).
-    let leaf = crate::hub::Leaf::from_pem(&identity.key_pem).map_err(|e| io::Error::other(e.0))?;
     backend.runs = Some(Arc::new(crate::runs::Runs {
         service: service.clone(),
         objects: objects.clone(),
-        publisher: backend.publisher.clone(),
+        publisher,
         local: backend.installer.clone().map(|installer| {
-            Arc::new(crate::local_source::LocalSources::new(
-                objects,
-                installer,
-                store.clone(),
-            ))
+            Arc::new(crate::local_source::LocalSources::new(objects, installer))
         }),
         own_hub: own_hub
-            .map(|hub| crate::hub::Source::new(&hub.origin, hub.ca_der, hub.object_hosts, None))
+            .map(|hub| crate::hub::Source::new(&hub.origin, hub.ca_der, None))
             .transpose()
             .map_err(|e| io::Error::other(e.0))?,
-        leaf: Some(Arc::new(leaf)),
         contexts: Default::default(),
     }));
     crate::calls::Calls::configure(service, machine.clone(), backend.runs.as_ref())?;
     if let Some(runs) = &backend.runs {
+        runs.restore_warm_sets()?;
         crate::api::machine_runs::resume(runs)?;
     }
     listener.set_nonblocking(true)?;

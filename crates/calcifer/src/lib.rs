@@ -110,7 +110,9 @@ enum Stop {
 impl From<LinkError> for Stop {
     fn from(e: LinkError) -> Self {
         match e {
-            LinkError::Refused { code, message } => Stop::Refused(Reason { code, message }),
+            LinkError::Refused { code, message } => {
+                Stop::Refused(Reason { code, message, ..Default::default() })
+            }
             LinkError::Released(message) => Stop::Released(message),
             LinkError::NotFound => Stop::Unreachable("the machine does not know the run".into()),
             LinkError::Unreachable(message) | LinkError::Unauthorized(message) => {
@@ -217,6 +219,16 @@ impl Calcifer {
         key: &str,
         submit: SubmitRun,
     ) -> Result<Submitted, Error> {
+        if submit
+            .spec
+            .tensorfs
+            .as_ref()
+            .is_some_and(|options| !options.token.is_empty())
+        {
+            return Err(Error::Invalid(
+                "a stored submission cannot contain a TensorFS token; omit tensorfs options to use this computer's Hub sign-in at send time".into(),
+            ));
+        }
         // The same run asked again is the same submission whatever price it was quoted since.
         let asked = SubmitRun {
             agreed: None,
@@ -382,14 +394,14 @@ impl Calcifer {
         let _ = self.granting.set(Arc::downgrade(machines));
     }
 
-    /// What the run's send carries besides its spec: its Hub access and model-source tokens,
-    /// minted now. Without machines (a bare core) it carries the run's Hub origin only.
-    async fn access(&self, run: &RunRow, machine: &str) -> Result<access::Access, Stop> {
+    /// What the send of `run` as `spec` carries besides it: its Hub access and model-source
+    /// tokens, minted now. Without machines (a bare core) it carries the run's Hub origin only.
+    async fn access(&self, run: &RunRow, spec: &v1::RunSpec) -> Result<access::Access, Stop> {
         let Some(machines) = self.granting.get().and_then(Weak::upgrade) else {
             return Ok(access::Access::default());
         };
         machines
-            .access(run, machine)
+            .access(run, spec)
             .await
             .map_err(|denied| match denied {
                 access::Denied::Refused(reason) => Stop::Refused(reason),
@@ -627,13 +639,6 @@ impl Calcifer {
         pause: &mut Pause,
     ) -> Result<(), Stop> {
         let id = run.id.as_str();
-        // The spec as sent: finished under the machine's send lock, so a warm set merges into what
-        // the machine reported after the runs sent before it.
-        let spec = |access| {
-            let mut spec = run.spec.clone();
-            self.finish_spec(run, &mut spec, access);
-            Ok::<_, Stop>(spec)
-        };
         let mut canceled = false;
         let (state, stream) = match run.state {
             State::Settled => return Ok(()),
@@ -641,7 +646,7 @@ impl Calcifer {
                 self.write_inputs(link, run, machine).await?;
                 let _turn = sending.lock().await;
                 self.known_warm(run, machine, link).await?;
-                let spec = spec(self.access(run, machine).await?)?;
+                let spec = self.sent_spec(run).await?;
                 if !self.store.mark_sent(id, machine)? {
                     return Ok(());
                 }
@@ -658,7 +663,7 @@ impl Calcifer {
                         self.write_inputs(link, run, machine).await?;
                         let _turn = sending.lock().await;
                         self.known_warm(run, machine, link).await?;
-                        let spec = spec(self.access(run, machine).await?)?;
+                        let spec = self.sent_spec(run).await?;
                         (link.submit(id, spec).await?, None)
                     }
                     attached => {
@@ -758,10 +763,7 @@ impl Calcifer {
                         finished_at_ms: call.finished_at_ms,
                         measurements: (call.measurements.as_ref())
                             .and_then(|m| serde_json::from_str(m.get()).ok()),
-                        reason: call.reason.map(|r| Reason {
-                            code: r.code,
-                            message: r.message,
-                        }),
+                        reason: call.reason,
                         memoized: call.memoized,
                     };
                     let text = serde_json::to_string(&call).expect("serializes");
@@ -920,9 +922,26 @@ impl Calcifer {
         Ok(())
     }
 
-    /// The spec as the machine is sent it: the Hub access and model-source tokens minted for
-    /// this send, else the run's Hub origin unless the spec names one; a warm set merged.
+    /// The spec as the machine is sent it, under the machine's send lock: a warm set merged into
+    /// what the machine reported after the runs sent before it, then the access minted for it.
+    async fn sent_spec(&self, run: &RunRow) -> Result<v1::RunSpec, Stop> {
+        let mut spec = run.spec.clone();
+        if let Some(machine) = &run.machine
+            && let Some(warm) = lock(&self.warm).get_mut(machine)
+        {
+            machines::merge_warm(warm, &mut spec);
+        }
+        let access = self.access(run, &spec).await?;
+        self.finish_spec(run, &mut spec, access);
+        Ok(spec)
+    }
+
+    /// `spec` with the Hub access and model-source tokens minted for this send, else the run's
+    /// Hub origin unless the spec names one.
     fn finish_spec(&self, run: &RunRow, spec: &mut v1::RunSpec, access: access::Access) {
+        if spec.tensorfs.is_none() {
+            spec.tensorfs = access.tensorfs;
+        }
         if access.providers.is_some() {
             spec.providers = access.providers;
         }
@@ -943,10 +962,8 @@ impl Calcifer {
                 ..Default::default()
             });
         }
-        if let Some(machine) = &run.machine
-            && let Some(warm) = lock(&self.warm).get_mut(machine)
-        {
-            machines::merge_warm(warm, spec);
+        if spec.tensorfs.is_none() {
+            spec.tensorfs = access::anonymous_tensorfs(spec);
         }
     }
 

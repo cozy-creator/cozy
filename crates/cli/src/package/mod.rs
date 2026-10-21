@@ -214,24 +214,17 @@ pub(crate) fn stamp(at: &str) -> String {
     }
 }
 
-/// Releases in version order: finals after pre-releases of the same numbers, then by each number
-/// (the order TensorD picks the newest by).
-pub(crate) fn release_order(release: &str) -> (Vec<u64>, bool, Vec<u64>) {
-    let numbers = |text: &str| -> Vec<u64> {
-        text.split(|c: char| !c.is_ascii_digit())
-            .filter(|part| !part.is_empty())
-            .map(|part| part.parse().unwrap_or(u64::MAX))
-            .collect()
-    };
-    let (version, tag) = match release.find(|c: char| !(c.is_ascii_digit() || c == '.')) {
-        Some(at) => (&release[..at], Some(&release[at..])),
-        None => (release, None),
-    };
-    (
-        numbers(version),
-        tag.is_none(),
-        tag.map(numbers).unwrap_or_default(),
-    )
+/// `items` newest first by TensorFS's one version ordering (`format::newest_by`); those whose
+/// version does not parse last, as given.
+pub(crate) fn newest_first<T>(mut items: Vec<T>, version: impl Fn(&T) -> &str) -> Vec<T> {
+    let mut sorted = Vec::with_capacity(items.len());
+    loop {
+        let versions = items.iter().enumerate().map(|(i, item)| (i, version(item)));
+        let Some((newest, _)) = tensorfs::format::newest_by(versions, |(_, v)| *v) else { break };
+        sorted.push(items.remove(newest));
+    }
+    sorted.extend(items);
+    sorted
 }
 
 #[cfg(test)]
@@ -246,9 +239,9 @@ mod tests {
         );
         assert!(PackageRef::parse("sdxl").is_err());
         assert!(directory("sdxl").is_none() && directory("./sdxl").is_some());
-        let mut releases = ["2.9.0", "2.10.0", "2.10.0-rc.1", "1.37.2"];
-        releases.sort_by_key(|r| release_order(r));
-        assert_eq!(releases, ["1.37.2", "2.9.0", "2.10.0-rc.1", "2.10.0"]);
+        let releases = vec!["2.9.0", "2.10.0rc1", "2.10.0", "nightly", "1.37.2", "2.10.0.post1"];
+        let sorted = newest_first(releases, |r| *r);
+        assert_eq!(sorted, ["2.10.0.post1", "2.10.0", "2.9.0", "1.37.2", "2.10.0rc1", "nightly"]);
         assert_eq!(stamp("2026-10-16T09:34:25.879488Z"), "2026-10-16T09:34:25Z");
         assert_eq!(
             stamp("2026-10-16T09:34:25+02:00"),

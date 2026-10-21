@@ -13,7 +13,7 @@ use protocol::machine::{ModelChoice, RunKind as SpecKind, RunSpec};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-use super::refs::{ModelRef, Repo};
+use super::refs::{self, ModelRef, Repo};
 use super::{Download, List, Upload};
 use crate::Context;
 use crate::output::{self, Record, Table};
@@ -123,7 +123,7 @@ fn made(ctx: &Context, run: &Run) {
     }
     let text = |key: &str| model[key].as_str().filter(|s| !s.is_empty());
     let mut record = Record::new();
-    for key in ["repository", "release", "lane", "manifest", "resolved"] {
+    for key in ["repository", "release", "lane", "checkpoint", "resolved"] {
         if let Some(value) = text(key) {
             record = record.field(key, value);
         }
@@ -131,13 +131,15 @@ fn made(ctx: &Context, run: &Run) {
     let published = &model["published"];
     let (destination, checkpoint) = (published["destination"].as_str(), published["checkpoint"].as_str());
     if let (Some(destination), Some(checkpoint)) = (destination, checkpoint) {
-        record = record.field("checkpoint", format!("{destination}#{checkpoint}"));
+        record = record.field("published", format!("{destination}#{checkpoint}"));
     }
     record.print(ctx);
     if let (Some(destination), Some(checkpoint)) = (destination, checkpoint)
         && !destination.starts_with("local/")
     {
-        output::next(ctx, &[&format!("cozy model publish {destination} --release <release> --lane <lane>={checkpoint}")]);
+        let model = destination.split('@').next().unwrap_or(destination);
+        let at = published["tag"].as_str().filter(|t| !t.is_empty()).unwrap_or(checkpoint);
+        output::next(ctx, &[&format!("cozy model publish {model} --release <version> --commit {at}")]);
     }
 }
 
@@ -155,7 +157,7 @@ pub(crate) async fn download(ctx: &Context, args: Download) -> Result<ExitCode, 
 }
 
 pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Error> {
-    let destination = Repo::hub(&args.destination)?;
+    let destination = refs::destination(&args.destination)?;
     let made = source(&args.source, &args.profiles)?;
     if !ctx.signed_in(&ctx.hub()?) {
         // The machine publishes under this computer's sign-in; refuse before anything is made.
@@ -163,7 +165,7 @@ pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Erro
             .next(ctx.login(&ctx.hub()?)));
     }
     let target = format!("{} → {destination}", args.source);
-    warm(ctx, &args.placement, args.detach, target, made, destination.to_string()).await
+    warm(ctx, &args.placement, args.detach, target, made, destination).await
 }
 
 /// One checkpoint a machine holds, and its repository's bytes there.

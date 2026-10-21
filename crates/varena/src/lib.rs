@@ -3,16 +3,13 @@
 //! `memory` places a weight set's regions on a GPU (home pages, scratch slots, pins as tensor
 //! lifetimes, eviction of what nothing uses); `Host` serves them from host memory where there
 //! is no GPU. The host tier (`host`, `window`) is the machine's: sealed memfds a TensorD fills
-//! and executors adopt read-only. `tensorfs` supplies verified bytes and stays CUDA-free.
+//! and executors adopt read-only. `tensorfs` owns parsing, source custody and every host/device byte transfer.
 //!
 //! The host tier is Linux-only and answers [`Error::Unsupported`] elsewhere. On Windows the
 //! crate is empty until its tier exists (xs-043 unit WM).
 #![cfg(unix)]
 
-#[cfg(feature = "store")]
-pub mod checkpoint;
-pub mod ceiling;
-pub mod cuda;
+pub use tensorfs::io::{cuda, metrics as ceiling};
 pub mod faults;
 pub mod host;
 pub mod io;
@@ -45,7 +42,7 @@ pub enum Error {
     #[error("io: {0}")]
     Io(String),
     #[error("source: {0}")]
-    Source(#[from] tensorfs::err::Refusal),
+    Source(#[from] tensorfs::failure::Failure),
     /// What closed: a weight set, a source.
     #[error("closed: {0}")]
     Closed(String),
@@ -98,4 +95,33 @@ pub fn caught<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 /// `m`'s guard though a holder panicked: one panic never makes the state unusable.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl From<tensorfs::err::Refusal> for Error {
+    fn from(error: tensorfs::err::Refusal) -> Error { Error::Source(error.into()) }
+}
+
+impl From<tensorfs::io::cuda::Error> for Error {
+    fn from(error: tensorfs::io::cuda::Error) -> Error {
+        match error {
+            tensorfs::io::cuda::Error::Cuda { op, code, name } => Error::Cuda { op, code, name },
+            tensorfs::io::cuda::Error::CudaUnavailable(detail) => Error::CudaUnavailable(detail),
+        }
+    }
+}
+impl From<tensorfs::io::Error> for Error {
+    fn from(error: tensorfs::io::Error) -> Error {
+        match error.cuda().cloned() {
+            Some(cuda) => cuda.into(),
+            None => Error::Io(error.to_string()),
+        }
+    }
+}
+impl From<tensorfs::io::source::Error> for Error {
+    fn from(error: tensorfs::io::source::Error) -> Error {
+        match error {
+            tensorfs::io::source::Error::Read(error) => error.into(),
+            tensorfs::io::source::Error::Source(error) => error.into(),
+        }
+    }
 }

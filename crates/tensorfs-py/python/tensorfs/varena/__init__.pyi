@@ -7,15 +7,23 @@ long as any tensor made from it. Eviction unmaps only unpinned pages whose fill 
 events completed. Copies run on varena's own stream; the bind stream waits on an event and the
 host never syncs. `Host` is the CPU core: the same sets, as host memory, and it never loads
 libcuda.
-
-`scripts/stub_conform.py` holds this stub against the compiled `tensorfs._ext.varena`, name for
-name and parameter for parameter.
 """
 
+import os
 from collections.abc import Sequence
 from typing import Literal
 
 from .._ext import Checkpoint
+
+def regions(
+    ck: Checkpoint,
+    max_bytes: int = ...,
+    boundaries: Sequence[str] | None = None,
+    only: Sequence[str] | None = None,
+) -> list[list[str]]:
+    """`<component>/<key>` regions: chunk-sharing tensors together, up to `max_bytes` each, never
+    across a `<component>/<key prefix>` boundary (a block) unless a shared chunk does. `only`
+    (blocks or tensors, in the same form) limits the result to them and tensors sharing their chunks."""
 
 class VarenaError(Exception):
     code: str
@@ -180,7 +188,7 @@ class Pinned:
 
 class WeightSet:
     """A checkpoint's regions on one GPU (or the host). The regions are
-    `tensorfs.regions(ck, max_bytes, boundaries)`."""
+    `tensorfs.varena.regions(ck, max_bytes, boundaries)`."""
 
     @property
     def name(self) -> str: ...
@@ -220,17 +228,20 @@ class WeightSet:
     def shareable(self) -> bool:
         """Home regions map as one shareable allocation each from now on, so their pages can be
         kept past this process (`kept`); False where the device cannot share them."""
-    def kept(self) -> list[tuple[int, int, int]]:
+    def kept(self, filled: bool = False) -> list[tuple[int, int, int]]:
         """Landed home regions not handed out yet: `(region, span, fd)`, each fd a container of
         the region's pages for TensorD to hold, the caller's to close. Unmapping a region here
-        frees it at once; only this process's death leaves its pages to TensorD."""
-    def kept_quiescent(self) -> list[tuple[int, int, int]]:
+        frees it at once; only this process's death leaves its pages to TensorD. `filled`: only
+        regions a page-in transform (a LoRA bake) already filled."""
+    def kept_quiescent(self, filled: bool = False) -> list[tuple[int, int, int]]:
         """As kept after the caller stops admission and drains every use of these weights.
         Lifetime graph pins and addresses remain; incomplete fills cannot be exported."""
-    def adopt_pages(self, pages: Sequence[tuple[int, int]]) -> int:
+    def adopt_pages(self, pages: Sequence[tuple[int, int]], filled: bool = False) -> list[int]:
         """Home regions `(region, fd)` mapped from pages a dead process kept: imported, no copy.
         Each fd is duplicated; the caller closes its own. A page that will not map fills as
-        usual. Returns the bytes adopted."""
+        usual. `filled`: pages a page-in transform filled, mapped as filled (never filled again,
+        not checked against the host layout): the caller proves what filled them before use.
+        Returns the regions adopted."""
     def evict(self, regions: Sequence[int] | None = None) -> int:
         """Unmap these regions at home (all when None): only those unpinned whose fill and
         release events completed. Returns the bytes unmapped. The chunks go idle; past a small
@@ -255,23 +266,18 @@ class Gpu:
         ck: Checkpoint,
         regions: Sequence[Sequence[str]],
         host_fd: int | None = None,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
-        """`regions`: `tensorfs.regions(ck, max_bytes, boundaries, only)`; the set is the parts
+        """`regions`: `tensorfs.varena.regions(ck, max_bytes, boundaries, only)`; the set is the parts
         they name and nothing else of the checkpoint. `host_fd`: a sealed host layout of exactly
-        these regions, filled by the owner (TensorD) with the same layout function (`seal()`
-        here, Rust `varena::memory::open_checkpoint` + `host::open_sealed`). Its digest is
-        checked; a layout of other regions is refused. Copies come from it, and a region its
-        owner left a hole comes from the chunk files. Without `host_fd`, every copy comes from
-        the chunk files through the page cache. `files`: the chunk files a grant hands over,
-        `(sha256, length, fd)` each, the only ones read; without it, the store's chunk files.
-        The core duplicates every descriptor it keeps and closes nothing the caller passed."""
+        these regions (`seal()`). Its digest is checked; a layout of other regions is refused.
+        Copies come from it, and a region left a hole comes from the checkpoint's chunks, read
+        by TensorFS (fetched when absent). The core duplicates every descriptor it keeps and
+        closes nothing the caller passed."""
     def adopt(
         self,
         name: str,
         ck: Checkpoint,
         host_fd: int,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """`register` of the sealed host layout `host_fd` with the regions it carries, before
         any module exists: `prefetch` starts its copies while the module is built. A module
@@ -301,23 +307,22 @@ class Host:
         ck: Checkpoint,
         regions: Sequence[Sequence[str]],
         host_fd: int | None = None,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """As `Gpu.register`. Binds are views of the sealed layout (read-only), or private
-        memory read once from the chunk files."""
+        memory read once from the chunks."""
     def adopt(
         self,
         name: str,
         ck: Checkpoint,
         host_fd: int,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """As `Gpu.adopt`."""
 
 class Copy:
     """A run of weight copies: `h2d`, a GPU's copy stream from its first job to its last
     landing; `disk`, a host layout filled from chunk files. `ceiling` is the measured GB/s it
-    is held against (pinned H2D on that GPU, the volume's O_DIRECT read), 0 when unmeasured."""
+    is held against (pinned H2D on that GPU, the volume's O_DIRECT read), 0 when unmeasured
+    (see `ceiling`) or, for `disk`, when the page cache served part of the run."""
 
     @property
     def kind(self) -> str: ...
@@ -343,6 +348,25 @@ class Copy:
 def copies() -> list[Copy]:
     """Every copy run since the last call."""
 
+class Ceiling:
+    """What reads can reach: the volume's sequential GB/s (`disk_direct`: past the page cache)
+    and, when a GPU was named, its pinned H2D GB/s and the streams that reached it."""
+
+    @property
+    def disk_gbps(self) -> float: ...
+    @property
+    def disk_direct(self) -> bool: ...
+    @property
+    def h2d_gbps(self) -> float | None: ...
+    @property
+    def streams(self) -> int | None: ...
+
+def ceiling(device: int | None = None, path: str | os.PathLike[str] | None = None) -> Ceiling:
+    """Measures the ceilings `Copy.ceiling` holds runs against, unless kept this boot: `path`'s
+    volume (default: the TensorFS cache) and, with `device`, pinned H2D to that GPU. Reads never
+    measure; a `Copy` is unmeasured (ceiling 0) until this runs, and a run faster than its
+    ceiling raises it."""
+
 def hold_tier(fd: int) -> int:
     """A claim on every region of the host-tier memfd `fd`, for an owner that maps none of it
     (TensorD). Returns a new descriptor. End it with `release_tier`."""
@@ -356,10 +380,9 @@ def seal(
     regions: Sequence[Sequence[str]],
     name: str,
     threads: int = 8,
-    files: Sequence[tuple[str, int, int]] | None = None,
 ) -> int:
-    """`regions` of a v2 checkpoint in a sealed host layout, filled in this process from its
-    chunk files (`files`, as in `register`, else the checkpoint's own paths). The result is what
+    """`regions` of a checkpoint in a sealed host layout, filled in this process from its
+    chunks. The result is what
     `register(host_fd=)` adopts, the same layout by construction; deposit it with TensorD as an
     opaque fd. Returns the memfd (the caller's)."""
 

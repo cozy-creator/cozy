@@ -3,8 +3,8 @@
 
     python varena-gpu.py [workdir]
 
-A layer-structured v2 checkpoint (written here by the v2 writer) is registered from its chunk
-files and from a sealed host layout. The script checks, and prints one JSON line of facts:
+A layer-structured checkpoint (written here) is registered from its chunks (read by TensorFS)
+and from a sealed host layout. The script checks, and prints one JSON line of facts:
   a. map, fill and bind: every part is bit-exact with the checkpoint, at home and after refault;
   b. a view a caller keeps blocks its page's eviction; once it dies, eviction frees the bytes;
   c. layers streamed through slots with prefetch: bit-exact with all-home; stall < copy time;
@@ -42,20 +42,20 @@ MiB = 1 << 20
 
 
 def write(root: Path) -> tensorfs.Checkpoint:
-    store = tensorfs.Store(root)
-    w = store.writer()
+    w = tensorfs.Writer(cache_dir=root)
+    model, blocks = (w.component(name, cls=("test", "1.0", "Model"), config={}) for name in ("model", "blocks"))
     g = torch.Generator().manual_seed(7)
     for i in range(LAYERS):
-        w.put("model", f"layers.{i}.weight", "F16", [DIM, DIM], (torch.randn(DIM, DIM, generator=g) / DIM**0.5).half().numpy())
+        model.put(f"layers.{i}.weight", (torch.randn(DIM, DIM, generator=g) / DIM**0.5).half().numpy(), dtype="F16", shape=[DIM, DIM])
     for b in range(BLOCKS):
         for p in range(PARAMS):
-            w.put("blocks", f"{b}.p{p}", "BF16", [512, 1024], torch.randn(512, 1024, generator=g).bfloat16().view(torch.int16).numpy())
-    return store.checkpoint(w.commit())
+            blocks.put(f"{b}.p{p}", torch.randn(512, 1024, generator=g).bfloat16().view(torch.int16).numpy().tobytes(), dtype="BF16", shape=[512, 1024])
+    return w.commit()
 
 
 def regions(ck: tensorfs.Checkpoint) -> list[list[str]]:
     cuts = [f"model/layers.{i}" for i in range(LAYERS)] + [f"blocks/{b}" for b in range(BLOCKS)]
-    return tensorfs.regions(ck, 64 * MiB, cuts)
+    return varena.regions(ck, 64 * MiB, cuts)
 
 
 def views(pin: varena.Pinned, parts: list[varena.Part]) -> dict[str, torch.Tensor]:
@@ -78,7 +78,7 @@ def exact(ws: varena.WeightSet, ck: tensorfs.Checkpoint, stream: int) -> int:
         pin = ws.bind(r, stream)
         t = torch.from_dlpack(pin)
         for p in parts:
-            want = torch.frombuffer(bytearray(ck.read(p.component, p.key).tobytes()), dtype=torch.uint8)
+            want = torch.frombuffer(bytearray(ck.components[p.component].tensors.read(p.key).tobytes()), dtype=torch.uint8)
             assert torch.equal(t[p.offset : p.offset + p.nbytes].cpu(), want), f"{p.component}/{p.key} differs"
             n += p.nbytes
     return n
@@ -247,6 +247,7 @@ def test_costs(ck, rs, host_fd, stream, facts):
 
 
 def test_ceiling(ck, rs, host_fd, stream, facts):
+    varena.ceiling(device=0)  # reads never measure: the H2D ceiling is measured first
     gpu = varena.Gpu(0)
     ws = gpu.register("ceiling", ck, rs, host_fd)
     varena.copies()
@@ -311,10 +312,10 @@ def access(pin: varena.Pinned) -> int:
     return flags.value
 
 
-def keeper(store: str, sha256: str, fd: int) -> None:
+def keeper(store: str, identity: str, fd: int) -> None:
     """h's first process: every region filled at home, its pages handed over, then it waits for
     its kill."""
-    ck = tensorfs.Store(Path(store)).checkpoint(f"sha256:{sha256}")
+    ck = tensorfs.open(identity, cache_dir=store, local_files_only=True)
     ws = varena.Gpu(0).register("kept-a", ck, regions(ck))
     assert ws.shareable(), "this card shares VMM pages by fd"
     stream = torch.cuda.current_stream().cuda_stream
@@ -343,7 +344,7 @@ def keeper(store: str, sha256: str, fd: int) -> None:
 
 def test_survive(gpu, ck, rs, store, stream, facts):
     ours, theirs = socket.socketpair()
-    argv = [sys.executable, __file__, "--keep", str(store), ck.manifest.sha256, str(theirs.fileno())]
+    argv = [sys.executable, __file__, "--keep", str(store), ck.id, str(theirs.fileno())]
     child = subprocess.Popen(argv, pass_fds=[theirs.fileno()])
     theirs.close()
     try:
@@ -369,8 +370,7 @@ def test_survive(gpu, ck, rs, store, stream, facts):
     facts["h_adopt_ms"] = round((time.perf_counter() - t0) * 1e3, 2)
     for _, f in pages:
         os.close(f)
-    want = sum(p.nbytes for p in ws.parts)
-    assert adopted >= want, f"adopted {adopted} of {want}"
+    assert sorted(adopted) == sorted(r for r, _ in pages), f"adopted {adopted} of {len(pages)}"
     facts["h_exact_bytes"] = exact(ws, ck, stream)
     for r, _ in meta:
         pin = ws.bind(r, stream)

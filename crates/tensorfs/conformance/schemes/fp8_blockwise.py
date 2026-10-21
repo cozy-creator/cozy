@@ -20,8 +20,8 @@ def decode(c):
 
 
 SCHEMES = (
-    Scheme("fp8.blockwise", {"block_size": block_size, "scale_dtype": ("F32", "BF16", "F16", "F8_E8M0")},
+    Scheme("fp8.blockwise", {"block_size": block_size},
            (Part("weight", ("F8_E4M3",), logical),
-            Part("scale", "scale_dtype", lambda c: grid.shape(tiles(c), c))),
+            Part("scale", ("F32", "BF16", "F16", "F8_E8M0"), lambda c: grid.shape(tiles(c), c))),
            decode),
 )

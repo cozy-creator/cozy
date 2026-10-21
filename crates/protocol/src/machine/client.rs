@@ -24,8 +24,8 @@ use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use super::{
-    Event, HELD, HeldAnswer, HeldBytes, HeldObject, HeldRequest, LogLines, OutputTarget, Ranges, RunEvent,
-    RunRequest, RunState, StatusFrame, parse_held, path,
+    Event, HELD, HeldAnswer, HeldBytes, HeldObject, HeldRequest, LogLines, OutputTarget, Ranges,
+    RunEvent, RunRequest, RunState, StatusFrame, TensorFSOptions, parse_held, path,
 };
 use crate::{
     capability,
@@ -299,6 +299,13 @@ impl Machine {
             .json(&ask);
         let answer: HeldAnswer = json(send(request).await?).await?;
         Ok(answer.held)
+    }
+
+    /// Gives the machine this signer's newest bearer at the Hub `bearer.endpoint` names.
+    pub async fn bearer(&self, bearer: &TensorFSOptions) -> Result<(), Error> {
+        send(self.request(Method::PUT, path::BEARER, &[]).json(bearer))
+            .await
+            .map(drop)
     }
 
     fn request(&self, method: Method, template: &str, args: &[&str]) -> RequestBuilder {

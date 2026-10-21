@@ -1,6 +1,6 @@
 [package]
 name = "varena"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 publish.workspace = true
 description = "The memory of the process computing with model weights: GPU pages, slots and pins; the sealed host tier."
@@ -9,8 +9,6 @@ description = "The memory of the process computing with model weights: GPU pages
 platform.workspace = true
 tensorfs.workspace = true
 libc.workspace = true
-# libcuda is dlopen'd at first use: the workspace builds and tests with no CUDA toolkit.
-libloading = "0.9"
 thiserror.workspace = true
 tracing.workspace = true
 

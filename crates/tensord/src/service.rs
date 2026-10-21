@@ -4,12 +4,12 @@ use platform::process::Birth;
 use crate::{
     catalog::Catalog,
     execution::Engine,
-    gpu_service::{KeptMember, Level, Member, Plan, Pool},
+    gpu_service::{Plan, Pool},
     journal::{Execution, SubmissionContext},
 };
 use serde_json::Value;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fs::File,
     io,
     path::Path,
@@ -208,28 +208,12 @@ impl Service {
             for held in self.catalog.installed() {
                 pool.kernel_boot(held);
             }
-            self.restore_warm_sets(&pool)?;
         }
         self.changed_environment()
     }
-    /// Each caller's warm set as the journal keeps it, brought up again in the background: a
-    /// restarted machine re-warms without its controller. A member whose installation is gone
-    /// leaves the set.
-    fn restore_warm_sets(&self, gpu: &Arc<Pool>) -> io::Result<()> {
-        let kept = self.engine.with_journal(|journal| journal.warm_sets())?;
-        let actors: BTreeSet<&String> = kept.iter().map(|(actor, _)| actor).collect();
-        for actor in actors {
-            let all = kept.iter().filter(|(of, _)| of == actor);
-            let (records, members): (Vec<String>, Vec<Arc<Member>>) = all
-                .clone()
-                .filter_map(|(_, record)| Some((record.clone(), self.restore_member(gpu, actor, record)?)))
-                .unzip();
-            if records.len() < all.count() {
-                self.engine.with_journal(|journal| journal.replace_warm_set(actor, &records))?;
-            }
-            gpu.set_members(actor, members);
-        }
-        // A previous run's executors still exiting fence it, as they fence requests.
+    /// Brings restored warm sets up (`Runs::restore_warm_sets`) once a previous run's executors
+    /// still exiting are gone: they fence it, as they fence requests.
+    pub(crate) fn rewarm(&self, gpu: &Arc<Pool>) -> io::Result<()> {
         let (fence, started) = (self.startup_gpu_births.lock().unwrap().clone(), self.started_ticks);
         let (gpu, engine) = (gpu.clone(), self.engine.clone());
         std::thread::Builder::new().name("warm-set-restore".into()).spawn(move || {
@@ -243,19 +227,6 @@ impl Service {
             gpu.keep_all(&engine);
         })?;
         Ok(())
-    }
-
-    /// One kept member, with its plan as it was bound while the store still holds its weights.
-    fn restore_member(&self, gpu: &Pool, actor: &str, record: &str) -> Option<Arc<Member>> {
-        let kept: KeptMember = serde_json::from_str(record).ok()?;
-        let installed = self.engine.installation(actor, &kept.installation).ok()??;
-        let held = self.catalog.resolve(&installed.generation).ok()?;
-        let bound = match kept.preparation.as_str() {
-            "" => None,
-            id => self.engine.preparation(actor, id).ok()?,
-        };
-        let plan = bound.and_then(|bound| gpu.plan(&bound).ok()).filter(|plan| gpu.holds(plan));
-        Some(Member::new(held, plan, Level::named(&kept.level)?, None))
     }
 
     pub fn submit(
@@ -421,21 +392,15 @@ impl Service {
     }
     /// Caches manage themselves (`reclaim`): a TTL and a low disk, never a purge verb.
     pub fn reclaim(&self) -> crate::reclaim::Swept {
-        // Released Write roots first, so the store's GC can collect their bytes.
+        // Run objects no unfinished run needs go first.
         if let Some(calls) = self.calls() {
-            if let Err(error) = calls.sweep_canceled_outputs(&self.engine) {
-                tracing::warn!("reclaim canceled native outputs: {error}");
-            }
             if let Err(error) = calls.sweep_objects() {
                 tracing::warn!("reclaim object roots: {error}");
             }
         }
         let sweep = || -> io::Result<crate::reclaim::Swept> {
             let pool = self.pool();
-            let mut bound = self.engine.bound_generations()?;
-            if let Some(pool) = &pool {
-                bound.extend(pool.config().packages.iter().map(|p| p.generation.clone()));
-            }
+            let bound = self.engine.bound_generations()?;
             let kernels = self.gpu().map(|gpu| gpu.kernel_caches());
             let publisher = self.publisher.lock().unwrap().clone();
             let uv_cache = publisher
@@ -448,14 +413,6 @@ impl Service {
                 kernels: kernels.as_ref(),
                 memo: pool.as_ref().map(|pool| pool.memo()),
                 uv_cache: uv_cache.as_deref(),
-                store: match publisher.as_ref().map(|publisher| publisher.caches(self)) {
-                    Some(Ok(caches)) => Some(caches),
-                    Some(Err(error)) => {
-                        tracing::warn!("reclaim: no store GC this pass, its keep list failed: {error}");
-                        None
-                    }
-                    None => None,
-                },
                 disk: &|| crate::reclaim::measure(&self.engine.root),
             })
         };

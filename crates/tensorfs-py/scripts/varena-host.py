@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """varena's host core through the installed wheel, CPU only, no third-party packages.
 
-A v2 checkpoint is registered from its chunk files, from a grant's chunk-file descriptors (closed
-by the caller before any read: the core keeps its own) and from a sealed host layout this process
-filled from a grant (`seal`), and that layout adopted from the regions it carries. Every part
+A checkpoint is registered from its chunks (read by TensorFS) and from a sealed host layout this
+process filled (`seal`), and that layout adopted from the regions it carries. Every part
 is read back through `Pinned.ptr`. Freshness, close and the GPU core's refusals are checked.
 
     python varena-host.py [workdir]
 """
 
 import ctypes
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -20,32 +18,23 @@ from tensorfs import varena
 
 
 def main(root: Path) -> None:
-    store = tensorfs.Store(root)
-    w = store.writer()
+    w = tensorfs.Writer(cache_dir=root)
+    unet = w.component("unet", cls=("test", "1.0", "Unet"), config={})
     want: dict[str, bytes] = {}
     for b in range(3):
         for p in range(4):
             data = bytes((b * 31 + p * 7 + i) % 251 for i in range(4096 * (p + 1) + 5))
-            w.put("unet", f"blocks.{b}.p{p}", "U8", [len(data)], data)
+            unet.put(f"blocks.{b}.p{p}", data, dtype="U8", shape=[len(data)])
             want[f"blocks.{b}.p{p}"] = data
-    ck = store.checkpoint(w.commit())
-    rs = tensorfs.regions(ck, 1 << 20, [f"unet/blocks.{b}" for b in range(3)])
-    def grant() -> list[tuple[str, int, int]]:
-        return [(sha, n, os.open(p, os.O_RDONLY)) for (sha, n), p in zip(ck.chunks, ck.chunk_paths, strict=True)]
-
-    sealed_from = grant()
-    fd = varena.seal(ck, rs, "host-smoke", files=sealed_from)
-    for _, _, f in sealed_from:
-        os.close(f)
-    for name, host_fd in (("files", None), ("granted", None), ("sealed", fd), ("adopted", fd)):
-        grant_fds = grant() if name == "granted" else None
+    ck = w.commit()
+    rs = varena.regions(ck, 1 << 20, [f"unet/blocks.{b}" for b in range(3)])
+    fd = varena.seal(ck, rs, "host-smoke")
+    for name, host_fd in (("chunks", None), ("sealed", fd), ("adopted", fd)):
         if name == "adopted":
             ws = varena.Host().adopt(name, ck, fd)
             assert ws.regions == rs, "a sealed layout carries the regions it was built from"
         else:
-            ws = varena.Host().register(name, ck, rs, host_fd, grant_fds)
-        for _, _, f in grant_fds or ():
-            os.close(f)
+            ws = varena.Host().register(name, ck, rs, host_fd)
         assert ws.device is None and len(ws.spans) == len(rs) and len(ws.parts) == len(want)
         assert ws.kept() == ws.kept_quiescent() == [], "host sets retain no GPU pages"
         for r in range(len(rs)):
@@ -68,7 +57,7 @@ def main(root: Path) -> None:
         raise AssertionError("chunks are whole 2 MiB pages")
     except varena.Invalid as e:
         assert e.code == "INVALID"
-    print("varena host core: every part exact, from the chunk files, a grant, a sealed layout and its adoption")
+    print("varena host core: every part exact, from the chunks, a sealed layout and its adoption")
 
 
 if __name__ == "__main__":

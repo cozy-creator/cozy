@@ -57,9 +57,6 @@ pub struct Carrier {
     /// Params a module's marker states: param -> (marker key, the producer's own default).
     #[serde(default)]
     pub marker_params: BTreeMap<String, (String, u64)>,
-    /// Params naming a part's stored dtype: param -> part role (`scale_dtype` -> `scale`).
-    #[serde(default)]
-    pub dtype_params: BTreeMap<String, String>,
     /// Marker keys whose value this carrier decodes, and that value.
     #[serde(default)]
     pub marker_values: BTreeMap<String, Json>,
@@ -708,17 +705,21 @@ fn geometry(
         },
         Geometry::Tiles(n) => {
             let (stack, rows) = lead.split_at(lead.len() - 1);
-            let want = [
-                stack,
-                &[rows[0].div_ceil(128) * 128, blocks(n).div_ceil(4) * 4],
-            ]
-            .concat();
+            let want = [stack, &[rows[0].div_ceil(128) * 128, blocks(n).div_ceil(4) * 4]].concat();
             match t.shape == want {
                 true => want,
                 false => return Err(format!("{:?}, not cuBLAS tiles {want:?}", t.shape)),
             }
         }
-        Geometry::Packed(bits) => [lead, &[c * bits / 8]].concat(),
+        Geometry::Packed(bits) => {
+            let width = match bits {
+                4 if c.is_multiple_of(2) => Some(c / 2),
+                6 if c.is_multiple_of(4) => (c / 4).checked_mul(3),
+                _ => None,
+            }
+            .ok_or_else(|| format!("{c} columns are not whole {bits}-bit rows"))?;
+            [lead, &[width]].concat()
+        }
         Geometry::Count(n) => match numel(&t.shape) == n {
             true => t.shape.clone(),
             false => return Err(format!("{:?}, not {n} elements", t.shape)),
@@ -786,9 +787,15 @@ fn fit(
             }
             if let Some(last) = shape.last_mut() {
                 *last = match data.shape {
-                    Geometry::Packed(bits) if (*last * 8).is_multiple_of(bits) => *last * 8 / bits,
                     Geometry::Packed(bits) => {
-                        return Err(format!(".{}: not {bits}-bit rows", data.suffix))
+                        let expanded = match bits {
+                            4 => last.checked_mul(2),
+                            6 if last.is_multiple_of(3) => (*last / 3).checked_mul(4),
+                            _ => return Err(format!(".{}: not {bits}-bit rows", data.suffix)),
+                        };
+                        expanded.ok_or_else(|| {
+                            format!(".{}: packed logical width overflow", data.suffix)
+                        })?
                     }
                     _ => *last * from / to,
                 };
@@ -858,16 +865,6 @@ fn fit(
     }
     if let (Producer::Comfy, Some(conf)) = (carrier.producer, conf) {
         marker_keys(carrier, conf)?;
-    }
-    // A param naming an optional part's dtype is there exactly when the part is.
-    for (param, role) in &carrier.dtype_params {
-        match parts.iter().find(|p| p.role == *role) {
-            Some(part) => encoding
-                .params
-                .insert(param.clone(), Value::from(part.dtype.name())),
-            None if carrier.parts.iter().any(|r| r.role == *role && r.optional) => continue,
-            None => return Err(format!("no {role} part for {param}")),
-        };
     }
     Ok(Folded {
         encoding,

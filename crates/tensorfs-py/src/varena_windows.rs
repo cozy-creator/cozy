@@ -18,7 +18,7 @@ create_exception!(tensorfs.varena, Unsupported, VarenaError);
 create_exception!(tensorfs.varena, LedgerError, PyException, "A ledger error; `.code` names its class.");
 
 fn unsupported(py: Python<'_>) -> PyErr {
-    let error = Unsupported::new_err("varena has no Windows tier yet; read objects through Store leases");
+    let error = Unsupported::new_err("varena has no Windows tier yet; read tensors through tensorfs.open");
     let _ = error.value(py).setattr("code", "UNSUPPORTED");
     error
 }
@@ -40,8 +40,8 @@ macro_rules! unconstructible {
 }
 
 unconstructible!(Gpu = "Gpu", Host = "Host", WeightSet = "WeightSet", Pinned = "Pinned", Part = "Part",
-    Counters = "Counters", SetStats = "SetStats", GpuStats = "GpuStats", Copy = "Copy", Row = "Row", Victim = "Victim",
-    Admit = "Admit", RowFacts = "RowFacts");
+    Counters = "Counters", SetStats = "SetStats", GpuStats = "GpuStats", Copy = "Copy", Ceiling = "Ceiling", Row = "Row",
+    Victim = "Victim", Admit = "Admit", RowFacts = "RowFacts");
 
 #[pyclass(name = "Ledger", module = "tensorfs.varena", frozen)]
 struct Ledger;
@@ -71,7 +71,7 @@ macro_rules! refused {
     )*};
 }
 
-refused!(hold_tier, release_tier, seal);
+refused!(hold_tier, release_tier, seal, ceiling);
 
 /// No GPU tier, so no weight copies to report.
 #[pyfunction]
@@ -91,6 +91,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SetStats>()?;
     m.add_class::<GpuStats>()?;
     m.add_class::<Copy>()?;
+    m.add_class::<Ceiling>()?;
     m.add_class::<Ledger>()?;
     m.add_class::<Row>()?;
     m.add_class::<Victim>()?;
@@ -100,6 +101,9 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(seal, &m)?)?;
     m.add_function(wrap_pyfunction!(copies, &m)?)?;
+    m.add_function(wrap_pyfunction!(ceiling, &m)?)?;
+    #[cfg(feature = "store")]
+    m.add_function(wrap_pyfunction!(crate::store::regions, &m)?)?;
     macro_rules! add_errors {
         ($($e:ident),*) => { $(m.add(stringify!($e), py.get_type::<$e>())?;)* };
     }

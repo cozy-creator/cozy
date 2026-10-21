@@ -1,28 +1,20 @@
-//! Where objects come from. An origin names a model's manifest (`resolve`) and says where its
-//! objects can be read (`locate`); the Fetcher downloads, verifies and admits them.
+//! Where objects come from. An origin serves a model's repo document (`repo_of`) and says where
+//! its objects can be read (`locate`); the Fetcher downloads, verifies and admits them.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 
-use super::net::Client;
+use super::token::TokenProvider;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{repo_key, ObjectRef, Repo};
-
-/// The most bytes a refs document may have.
-const REPO_BYTES: u64 = 16 << 20;
+use crate::format::{ObjectRef, Repo, Resolution, Tag, Tree};
 
 #[async_trait]
 pub trait Origin: Send + Sync {
-    /// The manifest of `name` (`<org>/<model>`) at `release` (the latest when `None`) and
-    /// `lane` (the release's only lane when `None`).
-    async fn resolve(
-        &self,
-        name: &str,
-        release: Option<&str>,
-        lane: Option<&str>,
-    ) -> Result<ObjectRef>;
+    /// The repo document of `name` (`<org>/<model>`); `REF_NOT_FOUND` when there is none.
+    async fn repo_of(&self, name: &str) -> Result<Repo>;
 
     /// Where each of `objects` can be read, in order. The Fetcher asks once per object as it
     /// starts it, and again when a location expires or is refused; an origin whose answer
@@ -35,7 +27,7 @@ pub trait Origin: Send + Sync {
 }
 
 /// Where one object can be read.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Location {
     /// An HTTP(S) GET, with the headers it needs, valid until `expires`.
     Url {
@@ -43,154 +35,122 @@ pub enum Location {
         headers: Vec<(String, String)>,
         expires: Option<SystemTime>,
     },
+    /// A provider presents each GET afresh, including same-origin redirects and restarts.
+    Authenticated {
+        url: String,
+        provider: Arc<dyn TokenProvider>,
+    },
     /// A file on a mounted volume.
     File(PathBuf),
+}
+
+pub(crate) struct HttpLocation<'a> {
+    pub url: &'a str,
+    pub headers: &'a [(String, String)],
+    pub provider: Option<&'a dyn TokenProvider>,
 }
 
 impl Location {
     pub(crate) fn expired(&self) -> bool {
         matches!(self, Location::Url { expires: Some(at), .. } if *at <= SystemTime::now())
     }
-}
 
-/// `<org>/<model>`, each a plain path segment.
-pub(crate) fn split_name(name: &str) -> Result<(&str, &str)> {
-    let plain = |s: &str| {
-        !s.is_empty()
-            && !s.starts_with('.')
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-    };
-    match name.split_once('/') {
-        Some((org, model)) if plain(org) && plain(model) => Ok((org, model)),
-        _ => refuse(Code::KEY_GRAMMAR, format!("{name:?} is not <org>/<model>")),
+    pub(crate) fn http(&self) -> Option<HttpLocation<'_>> {
+        match self {
+            Self::Url { url, headers, .. } => Some(HttpLocation { url, headers, provider: None }),
+            Self::Authenticated { url, provider } => Some(HttpLocation { url, headers: &[], provider: Some(provider.as_ref()) }),
+            Self::File(_) => None,
+        }
     }
 }
 
-/// A refs document's manifest for `release` and `lane`.
-pub(crate) fn pick(
-    name: &str,
-    bytes: &[u8],
-    release: Option<&str>,
-    lane: Option<&str>,
-) -> Result<ObjectRef> {
-    let repo = Repo::from_json(bytes).map_err(|error| Refusal {
+impl std::fmt::Debug for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => f.debug_tuple("File").field(path).finish(),
+            Self::Url { url, expires, .. } => f.debug_struct("Url").field("url", url).field("expires", expires).finish_non_exhaustive(),
+            Self::Authenticated { url, .. } => f.debug_struct("Authenticated").field("url", url).finish_non_exhaustive(),
+        }
+    }
+}
+
+/// A refs document `bytes` of `name`.
+pub(crate) fn parse_repo(name: &str, bytes: &[u8]) -> Result<Repo> {
+    Repo::from_json(bytes).map_err(|error| Refusal {
         code: Code::UNKNOWN_FORMAT,
         detail: format!("{name}: {error}"),
-    })?;
-    Ok(choose(&repo, release, lane)?.2)
+    })
 }
 
-/// `release` of `repo` (the newest not yanked when `None`), its lane `lane` (the only one when `None`) and
-/// that lane's manifest.
-pub fn choose(
+/// `revision` of `repo` resolved once (spec §7): its tag and, for a header digest, the variant
+/// that names it (`REVISION_ABSENT` when nothing does). `tree` reads a commit's tree, only for a
+/// header digest.
+pub async fn resolve<E: From<Refusal>>(
     repo: &Repo,
-    release: Option<&str>,
-    lane: Option<&str>,
-) -> Result<(String, String, ObjectRef)> {
-    let name = &repo.name;
-    let releases = || {
-        repo.releases
-            .iter()
-            .map(|r| r.version.as_str())
-            .collect::<Vec<_>>()
-    };
-    let Some(chosen) = repo.release(release) else {
-        let wanted = release.unwrap_or("that is not yanked");
-        return refuse(
-            Code::RELEASE_ABSENT,
-            format!("{name} has no release {wanted} (has {:?})", releases()),
-        );
-    };
-    if chosen.yanked {
-        tracing::warn!("{name}@{} is yanked", chosen.version);
-    }
-    let lanes = || chosen.lanes.keys().cloned().collect::<Vec<_>>();
-    let lane = match lane {
-        Some(lane) => lane.to_string(),
-        None if chosen.lanes.len() == 1 => lanes().remove(0),
-        None => {
-            return refuse(
-                Code::REF_NOT_FOUND,
-                format!("{name}@{}: name a lane (has {:?})", chosen.version, lanes()),
-            )
+    revision: Option<&str>,
+    mut tree: impl AsyncFnMut(&ObjectRef) -> std::result::Result<Tree, E>,
+) -> std::result::Result<(Tag, Option<String>), E> {
+    let found = match repo.resolve(revision) {
+        Some(Resolution::Tag(tag)) => Some((tag, None)),
+        Some(Resolution::Header(sha256, tags)) => {
+            let mut found = None;
+            for tag in tags {
+                if let Some(variant) = tree(&tag.commit).await?.cites(&sha256) {
+                    found = Some((tag, Some(variant.to_owned())));
+                    break;
+                }
+            }
+            found
         }
+        None => None,
     };
-    match chosen.lanes.get(&lane) {
-        Some(manifest) => Ok((chosen.version.clone(), lane, manifest.clone())),
-        None => refuse(
-            Code::REF_NOT_FOUND,
-            format!(
-                "{name}@{} has no lane {lane:?} (has {:?})",
-                chosen.version,
-                lanes()
-            ),
-        ),
+    let Some((tag, variant)) = found else {
+        let has: Vec<&str> = repo.tags.iter().map(|t| t.name.as_str()).collect();
+        let wanted = revision.unwrap_or("default (no public, non-yanked version)");
+        return Err(Refusal { code: Code::REVISION_ABSENT, detail: format!("{} has no revision {wanted} (tags {has:?})", repo.name) }.into());
+    };
+    if tag.yanked {
+        tracing::warn!("{}@{} is yanked", repo.name, tag.name);
+    }
+    Ok((tag.clone(), variant))
+}
+
+/// `variant` of `tree` (its only one when `None`): its name and header.
+pub fn variant_of_tree(tree: &Tree, variant: Option<&str>) -> Result<(String, ObjectRef)> {
+    match tree.variant(variant) {
+        Ok((v, header)) => Ok((v.to_owned(), header.clone())),
+        Err(e) => refuse(Code::REF_NOT_FOUND, e.to_string()),
     }
 }
 
-/// A static origin over HTTP: `{base}/refs/<org>/<model>.json` (lowercase) and `{base}/blobs/<aa>/<bb>/<sha256>`.
-/// Any HTTP server, bucket or repository holding that layout serves it.
-pub struct HttpOrigin {
-    client: Client,
-    base: String,
-    bearer: Option<String>,
+/// What a name resolves to: a tag, its commit, and the chosen variant's header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chosen {
+    pub tag: Tag,
+    pub variant: String,
+    pub header: ObjectRef,
 }
 
-impl HttpOrigin {
-    pub fn new(client: &Client, base: &str) -> Result<HttpOrigin> {
-        let base = base.trim_end_matches('/').to_string();
-        client.policy().admit(&base)?;
-        Ok(HttpOrigin {
-            client: client.clone(),
-            base,
-            bearer: None,
-        })
-    }
-
-    /// Sends `Authorization: Bearer <token>`; the origin is then private.
-    pub fn bearer(mut self, token: impl Into<String>) -> HttpOrigin {
-        self.bearer = Some(token.into());
-        self
-    }
-
-    fn headers(&self) -> Vec<(String, String)> {
-        self.bearer
-            .iter()
-            .map(|token| ("authorization".to_string(), format!("Bearer {token}")))
-            .collect()
-    }
+/// `revision` of `repo` resolved once, and `variant` of its commit (its only one when `None`;
+/// for a header digest, the variant naming it). `tree` reads a commit's tree.
+pub async fn choose<E: From<Refusal>>(
+    repo: &Repo,
+    revision: Option<&str>,
+    variant: Option<&str>,
+    mut tree: impl AsyncFnMut(&ObjectRef) -> std::result::Result<Tree, E>,
+) -> std::result::Result<Chosen, E> {
+    let (tag, cited) = resolve(repo, revision, &mut tree).await?;
+    let variant = pick_variant(revision, cited, variant)?;
+    let (variant, header) = variant_of_tree(&tree(&tag.commit).await?, variant.as_deref())?;
+    Ok(Chosen { tag, variant, header })
 }
 
-#[async_trait]
-impl Origin for HttpOrigin {
-    async fn resolve(
-        &self,
-        name: &str,
-        release: Option<&str>,
-        lane: Option<&str>,
-    ) -> Result<ObjectRef> {
-        split_name(name)?;
-        let url = format!("{}/{}", self.base, repo_key(name));
-        let bytes = self
-            .client
-            .document(&url, &self.headers(), REPO_BYTES)
-            .await?;
-        pick(name, &bytes, release, lane)
-    }
-
-    async fn locate(&self, objects: &[ObjectRef]) -> Result<Vec<Location>> {
-        let headers = self.headers();
-        Ok((objects.iter())
-            .map(|object| Location::Url {
-                url: format!("{}/{}", self.base, object.key()),
-                headers: headers.clone(),
-                expires: None,
-            })
-            .collect())
-    }
-
-    fn public(&self) -> bool {
-        self.bearer.is_none()
+/// The variant to open: the one a header digest named (an explicit one must agree), else `asked`.
+pub fn pick_variant(revision: Option<&str>, cited: Option<String>, asked: Option<&str>) -> Result<Option<String>> {
+    match (cited, asked) {
+        (Some(cited), Some(asked)) if cited != asked => {
+            refuse(Code::REF_NOT_FOUND, format!("{} is variant {cited:?}, not {asked:?}", revision.unwrap_or_default()))
+        }
+        (cited, asked) => Ok(cited.or(asked.map(str::to_owned))),
     }
 }

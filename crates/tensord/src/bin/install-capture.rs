@@ -34,8 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&output)?;
     let archive = archive.ok_or("--archive is required")?;
     let length = fs::metadata(&archive)?.len();
-    let store = tensord::storage::open(&output.join("store"))?;
-    let uploads = WorkspaceUploads::open(&output.join("uploads"), store)?;
+    let uploads = WorkspaceUploads::open(&output.join("uploads"), tensord::cas::Cas::new(output.join("objects")))?;
     let actor = VerifiedActor {
         public_key: [19; 32],
     };

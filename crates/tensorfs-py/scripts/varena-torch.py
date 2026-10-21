@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -115,15 +116,15 @@ class Net(nn.Module):
 
 
 def build(root: Path, dim: int, blocks: int) -> tuple[tensorfs.Checkpoint, dict[str, torch.Tensor]]:
-    """The model's weights in a v2 store, in construction order; and the tensors."""
+    """The model's weights in a store, in construction order; and the tensors."""
     torch.manual_seed(0)
     reference = Net(dim, blocks)
     tensors = {k: v.detach().contiguous() for k, v in reference.state_dict().items()}
-    store = tensorfs.Store(root)
-    w = store.writer()
+    w = tensorfs.Writer(cache_dir=root)
+    net = w.component("net", cls=("test", "1.0", "Net"), config={})
     for key, t in tensors.items():
-        w.put("net", key, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
-    return store.checkpoint(w.commit()), tensors
+        net.put(key, t.view(torch.uint8).numpy().tobytes(), dtype="BF16", shape=list(t.shape))
+    return w.commit(), tensors
 
 
 def meta(dim: int, blocks: int) -> Net:
@@ -453,8 +454,8 @@ def main() -> int:
 
 
 class Touch:
-    def __init__(self) -> None:
-        self.fills = 0
+    def __init__(self, identity: str | None = None) -> None:
+        self.fills, self.named = 0, identity
 
     def __call__(self, block: object, parts: dict[str, dict[str, torch.Tensor]]) -> None:
         for roles in parts.values():
@@ -465,10 +466,14 @@ class Touch:
     def prepare(self) -> int:
         return 0
 
+    def identity(self) -> str | None:
+        return self.named
+
 
 def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespace, want: torch.Tensor, x: torch.Tensor) -> None:
     """A held deposit loads as a fresh one does, with no seal; the pages a gone process kept
-    of it map as a cache hit, and a fill model never maps them."""
+    of it map as a cache hit; a fill model serves them only when they were filled under the
+    identity its fill names, else refills."""
     grant = WeightGrant(ck, "net", "sha256:" + "2" * 64, host_fd=held)
     net = meta(a.dim, a.blocks)
     net._varena = Declared(grant)
@@ -514,14 +519,12 @@ def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespa
         net = meta(a.dim, a.blocks)
         net._varena = Declared(kept, fill=touch)
         model = mem.load(net)
-        pin = model.ws.bind(0, torch.cuda.current_stream().cuda_stream)
-        assert pin.writable, "a fill never maps kept pages: its own are writable"
-        del pin
         with torch.no_grad(), mem.request("kept-fill"):
-            check("a fill beside kept pages serves correctly", torch.equal(net(x), want))
+            check("a fill beside unfilled kept pages serves correctly", torch.equal(net(x), want))
         check("the fill ran on its own pages", touch.fills > 0)
-        check("filled pages are never retained", not model.kept()[1])
+        check("pages filled under no identity are never retained", not model.kept()[1])
         model.close()
+        filled_pages(mem, grant, a, want, x, copied)
         net = meta(a.dim, a.blocks)
         net._varena = Declared(kept)
         model = mem.load(net)
@@ -545,18 +548,54 @@ def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespa
     model.close()
 
 
+def filled_pages(mem: Memory, grant: WeightGrant, a: argparse.Namespace, want: torch.Tensor, x: torch.Tensor, copied: Callable[[object], int]) -> None:
+    """Pages a fill wrote outlive their process under its identity: the next model whose fill
+    names the same maps them, with no copy and no fill; one that names another refills."""
+    touch = Touch("touch/1")
+    net = meta(a.dim, a.blocks)
+    net._varena = Declared(grant, fill=touch)
+    model = mem.load(net)
+    with torch.no_grad(), mem.request("filled"):
+        check("a filled model equals the reference", torch.equal(net(x), want))
+    fingerprint, containers = model.kept()
+    check("pages filled under an identity are retained", bool(containers))
+    pages = []
+    for region, _, fd in containers:
+        with socket.socket(fileno=fd) as container:
+            pages.append((region, socket.recv_fds(container, 1, 1)[1][0]))
+    model.close()
+    filled = replace(grant, pages=tuple(pages), fingerprint=fingerprint)
+    try:
+        for name, same in (("touch/1", True), ("touch/2", False)):
+            touch = Touch(name)
+            net = meta(a.dim, a.blocks)
+            net._varena = Declared(filled, fill=touch)
+            model = mem.load(net)
+            with torch.no_grad(), mem.request(f"filled-{name}"):
+                check(f"{name}: serves exact bytes", torch.equal(net(x), want))
+            if same:
+                check("the same identity maps them with no fill", touch.fills == 0, str(touch.fills))
+                check("and no copy", copied(model) < sum(model.ws.spans), str(copied(model)))
+            else:
+                check("another identity refills", touch.fills > 0, str(touch.fills))
+            model.close()
+    finally:
+        for _, fd in pages:
+            os.close(fd)
+
+
 def relaxes(root: Path, dev: torch.device) -> None:
     """A model whose peak fits beside its whole home only cut finer: its out-of-memory cuts
     (rung 3 before rung 4), then planning relaxes the cut and streams instead of cutting."""
     dim, count, tokens = 4096, 16, 4096
     torch.manual_seed(0)
     plain = WideNet(dim, count).bfloat16()
-    store = tensorfs.Store(root / "wide")
-    w = store.writer()
+    w = tensorfs.Writer(cache_dir=root / "wide")
+    wide = w.component("wide", cls=("test", "1.0", "WideNet"), config={})
     for key, t in plain.state_dict().items():
         t = t.detach().contiguous()
-        w.put("wide", key, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
-    ck = store.checkpoint(w.commit())
+        wide.put(key, t.view(torch.uint8).numpy().tobytes(), dtype="BF16", shape=list(t.shape))
+    ck = w.commit()
     weights = sum(t.numel() * t.element_size() for t in plain.state_dict().values())
     coarse = tokens * dim * Wide.WIDE * 2  # the temporary of one uncut window
     x = torch.randn(tokens, dim, generator=torch.Generator().manual_seed(3)).bfloat16().to(dev)

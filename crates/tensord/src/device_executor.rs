@@ -168,6 +168,11 @@ pub enum DeviceCommand {
     },
     Load {
         construction: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tensorfs: Option<protocol::machine::TensorFSOptions>,
+        /// The request's signer: the Runtime keeps its bearer per signer and endpoint.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        actor: String,
         devices: String,
         sequence_parallel_degree: u32,
         binding: Box<Binding>,
@@ -197,6 +202,8 @@ pub enum DeviceCommand {
         input_metadata: BTreeMap<String, Value>,
     },
     Invoke {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tensorfs: Option<Box<protocol::machine::TensorFSOptions>>,
         /// Retained asset capacity derived from the actual installed result schema.
         max_output_bytes: u64,
         request_id: String,
@@ -214,12 +221,19 @@ pub enum DeviceCommand {
         /// Input trees by reference: (read-only directory, manifest digest).
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         trees: BTreeMap<String, (PathBuf, String)>,
-        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`), read through `weights_writer`.
+        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`, its header), which the
+        /// Runtime opens from the store itself.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         sources: BTreeMap<String, String>,
-        /// The weights outputs this attempt may write: output id to its byte bound.
+        /// Declared outputs and bounds, enforced by Runtime's public Writer.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         weights: BTreeMap<String, u64>,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        destination: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        actor: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        operation: String,
     },
     /// Warming: the loaded construction's models are loaded at `level` (`gpu` or `ram`, varena
     /// filling them), nothing run.
@@ -238,6 +252,12 @@ pub enum DeviceCommand {
         socket: PathBuf,
         root: PathBuf,
         environment: BTreeMap<String, String>,
+    },
+    /// `actor`'s newest bearer at `tensorfs.endpoint`, sent outside any exchange (`Line`) and
+    /// answered by nothing: the executor's reads and uploads there present it from now on.
+    Bearer {
+        actor: String,
+        tensorfs: protocol::machine::TensorFSOptions,
     },
 }
 
@@ -288,6 +308,7 @@ impl DeviceCommand {
             Self::Unload { .. } => "unload",
             Self::Probe { .. } => "probe",
             Self::Fork { .. } => "fork",
+            Self::Bearer { .. } => "bearer",
         }
     }
 }
@@ -304,14 +325,15 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    ModelSource,
-    /// One weight set's bytes: its sealed host layout, or its chunk files.
+    /// One weight set's held bytes: the sealed host layout deposited for it, else nothing.
     ReadGrant,
     /// A sealed host layout the executor filled, for the next executor of its weights.
     Deposit,
     /// GPU pages of weight regions the executor kept, held past its end (`descriptors` follow).
     KeepPages,
     Publish,
+    /// A weights output's TensorFS reference, which Runtime committed or uploaded.
+    CheckpointItem,
     StageMemoLookup,
     StageMemoStore,
     Progress,
@@ -323,10 +345,6 @@ pub enum Kind {
     ChildEvents,
     GpuRelease,
     ModelPrefetch,
-    /// An attempt's weights: one source read, one output written, or an output adopted.
-    WeightsWriter,
-    /// A fresh channel over the call's checkpoints held in part (`access::Fetch::channel`).
-    FetchChannel,
     /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
     Log,
     #[default]
@@ -516,10 +534,11 @@ pub struct Frame {
     pub numerics: String,
     pub local: String,
     pub cost_ms: f64,
-    /// `weights_writer`: `source`, `output` or `adopt`, its output and its transaction.
-    pub operation: String,
-    pub output_slot: String,
-    pub transaction: String,
+    /// `checkpoint_item`: the immutable TensorFS reference Runtime committed or uploaded.
+    pub repo_id: String,
+    pub revision: String,
+    pub variant: String,
+    pub tag: String,
 }
 
 impl Frame {
@@ -598,17 +617,6 @@ pub struct Answer {
     /// A failed child call's raising traceback, whole (its triage's).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub traceback: String,
-    /// `Opened` (a weights output) and `Adopted`: its transaction, run and manifest.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub transaction: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub request_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub manifest: String,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub manifest_length: u64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub receipt_digest: String,
     /// A memo hit: the entry's verified copy in the run's spool, and what producing it cost.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub local: String,
@@ -622,11 +630,6 @@ pub struct Answer {
     pub stored: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
-    /// `read_grant` without a sealed layout: the SHA-256 of the chunk objects whose fds
-    /// follow, sorted by digest (`deposits::objects_digest`), in place of the list (SDXL's
-    /// UNet: about 1,700 objects).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub objects_sha256: String,
     /// A held `read_grant`: GPU pages kept for it, whose fds follow the layout's.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub fingerprint: String,
@@ -657,17 +660,11 @@ impl Answer {
             byte_grants: Vec::new(),
             progress: None,
             traceback: String::new(),
-            transaction: String::new(),
-            request_id: String::new(),
-            manifest: String::new(),
-            manifest_length: 0,
-            receipt_digest: String::new(),
             local: String::new(),
             cost_ms: 0.0,
             disputed: false,
             stored: false,
             reason: String::new(),
-            objects_sha256: String::new(),
             fingerprint: String::new(),
             pages: Vec::new(),
         }
@@ -719,12 +716,52 @@ pub trait Services {
 pub struct Baseline;
 impl Services for Baseline {}
 
+/// The executor's seam for frames sent outside any command's exchange, under the lock every
+/// command and answer is written with. Gone with the executor.
+#[derive(Clone)]
+pub struct Line(std::sync::Weak<Mutex<LocalStream>>);
+impl Line {
+    /// Sends `command`, answered by nothing; false once the executor is gone.
+    pub fn send(&self, command: &DeviceCommand) -> bool {
+        let Some(writer) = self.0.upgrade() else {
+            return false;
+        };
+        let bytes = command_bytes(command, false);
+        bytes.and_then(|bytes| seam::write_body(&mut writer.lock().unwrap(), &bytes)).is_ok()
+    }
+    pub fn same(&self, other: &Line) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+
+/// `command`'s wire bytes. Only the typed TensorFS options may carry supplied access: the bytes
+/// keep the token, every other field is scanned.
+fn command_bytes(command: &DeviceCommand, memo: bool) -> io::Result<Vec<u8>> {
+    let mut value = serde_json::to_value(command)?;
+    // The executor's memoized stages go to the machine tier.
+    if matches!(command, DeviceCommand::Start { .. }) && memo {
+        value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
+    }
+    let bytes = serde_json::to_vec(&value)?;
+    if let (true, Some(options)) = (
+        matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. }
+            | DeviceCommand::Bearer { .. }),
+        value.get_mut("tensorfs").and_then(Value::as_object_mut),
+    ) {
+        options.remove("token");
+    }
+    scan(&value)?;
+    Ok(bytes)
+}
+
 pub struct DeviceExecutor {
     child: Option<Child>,
     /// Forked from an import-only executor (`fork/1`), which is its parent and reaps it.
     forked: bool,
     exact: Exact,
+    /// Read here; written only through `writer`, which a `Line` shares.
     stream: LocalStream,
+    writer: Arc<Mutex<LocalStream>>,
     pub birth: Birth,
     pub hello: Hello,
     /// Sampling resolution of the wedge rule. Tests shorten it; nothing else changes it.
@@ -992,18 +1029,24 @@ impl Codec {
             output: std::io::BufReader::new(output),
         })
     }
-    fn encode(&self, spool: &Path, reply: &Frame) -> io::Result<PostReply> {
+    /// Encodes `frames` with the SDK's `encode_frame`, each into its owned spool name: the
+    /// media type of each, by handle.
+    fn encode(&self, spool: &Path, frames: &[HostFrame]) -> io::Result<BTreeMap<String, String>> {
         use std::io::BufRead;
+        #[derive(Serialize)]
+        struct Encode<'a> {
+            #[serde(flatten)]
+            frame: &'a HostFrame,
+            name: String,
+        }
+        let frames = (frames.iter())
+            .map(|frame| Ok(Encode { frame, name: spool_name(&frame.handle)? }))
+            .collect::<io::Result<Vec<_>>>()?;
         let mut helper = self.helper.lock().unwrap();
         if helper.is_none() {
             *helper = Some(self.spawn()?);
         }
-        let request = PostRequest {
-            spool,
-            frames: &reply.frames,
-            outputs: &reply.outputs,
-            max_output_bytes: reply.max_output_bytes,
-        };
+        let request = serde_json::json!({"spool": spool, "frames": frames});
         let mut line = serde_json::to_vec(&request)?;
         line.push(b'\n');
         let mut answer = String::new();
@@ -1026,11 +1069,11 @@ impl Codec {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Answer {
-            Done(PostReply),
+            Done { media: BTreeMap<String, String> },
             Refused { error: String },
         }
         match serde_json::from_str::<Answer>(&answer).map_err(io::Error::other)? {
-            Answer::Done(post) => Ok(post),
+            Answer::Done { media } => Ok(media),
             Answer::Refused { error } => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("selected SDK encoder refused: {error}"),
@@ -1047,17 +1090,6 @@ pub struct AssetBinding {
     pub kind: String,
     pub media_type: String,
     pub length: u64,
-}
-#[derive(Debug, Deserialize)]
-struct PostReply {
-    bindings: Vec<AssetBinding>,
-}
-#[derive(Serialize)]
-struct PostRequest<'a> {
-    spool: &'a Path,
-    frames: &'a [HostFrame],
-    outputs: &'a [Output],
-    max_output_bytes: Option<u64>,
 }
 
 /// Rows a run keeps, and the characters of each of their texts.
@@ -1112,14 +1144,16 @@ pub fn postprocess(
         outputs: files,
         ..reply.clone()
     };
-    let mut post = match encode_native(spool, reply)? {
-        Some(bindings) => PostReply { bindings },
-        None => codec.encode(spool, reply)?,
+    // Every frame is encoded by the SDK's one encoder, the one an author's test runs.
+    let media = match reply.frames.is_empty() {
+        true => BTreeMap::new(),
+        false => codec.encode(spool, &reply.frames)?,
     };
+    let mut bindings = bind(spool, reply, &media)?;
     for tree in &trees {
-        post.bindings.push(tree_binding(spool, tree)?);
+        bindings.push(tree_binding(spool, tree)?);
     }
-    Ok((result, post.bindings))
+    Ok((result, bindings))
 }
 /// An output tree as the machine holds it: each regular file of its spool directory linked as
 /// the spool's `sha256-<hex>`, and a manifest naming them by path (`gpu_service::TREE_MEDIA`),
@@ -1143,7 +1177,7 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
                 return Err(invalid("its reference names no spool directory"));
             };
             let directory = format!("tree-{n}");
-            let mut entries = vec![];
+            let mut files = std::collections::BTreeMap::new();
             let mut pending = vec![std::path::PathBuf::new()];
             while let Some(relative) = pending.pop() {
                 for entry in fs::read_dir(spool.join(&directory).join(&relative))? {
@@ -1162,15 +1196,13 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
                         _ => (),
                     }
                     let path = path.to_str().ok_or_else(|| invalid("a path is not UTF-8"))?;
-                    entries.push(serde_json::json!({"kind": "file", "path": path,
-                        "blob": {"sha256": sha, "length": length}}));
+                    files.insert(path.to_owned(), tensorfs::format::ObjectRef { sha256: sha, length });
                 }
             }
-            if entries.is_empty() {
+            if files.is_empty() {
                 return Err(invalid("it holds no file"));
             }
-            entries.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-            let manifest = crate::boundary_json::exact(&serde_json::json!({"entries": entries}));
+            let manifest = crate::trees::document(&files);
             let name = format!("{directory}-manifest");
             fs::write(spool.join(&name), manifest)?;
             name
@@ -1178,15 +1210,14 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
     };
     let mut bytes = Vec::new();
     open_artifact(spool, Path::new(&name))?.read_to_end(&mut bytes)?;
-    let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| invalid("its manifest is not JSON"))?;
+    let files = crate::trees::parse(&bytes).map_err(|e| invalid(&e.to_string()))?;
     let mut content = 0;
-    for entry in manifest["entries"].as_array().ok_or_else(|| invalid("no entries"))? {
-        let member = format!("sha256-{}", entry["blob"]["sha256"].as_str().unwrap_or_default());
-        let length = open_artifact(spool, Path::new(&member))?.metadata()?.len();
-        if length != entry["blob"]["length"].as_u64().unwrap_or(u64::MAX) {
+    for object in files.values() {
+        let member = format!("sha256-{}", object.sha256);
+        if open_artifact(spool, Path::new(&member))?.metadata()?.len() != object.length {
             return Err(invalid("a member differs from its manifest"));
         }
-        content += entry["blob"]["length"].as_u64().unwrap_or_default();
+        content += object.length;
     }
     if output.size_bytes.is_some_and(|size| size != content) {
         return Err(invalid("its files differ from the size the SDK reported"));
@@ -1212,104 +1243,29 @@ impl Write for HashWriter<'_> {
     }
 }
 
-/// A registered image frame's pixel layout: its `mode` fact, RGB when an older SDK sent none.
-fn layout(frame: &HostFrame) -> Option<(u64, png::ColorType, image_webp::ColorType)> {
-    match frame.facts.get("mode").map(Value::as_str) {
-        None | Some(Some("RGB")) => Some((3, png::ColorType::Rgb, image_webp::ColorType::Rgb8)),
-        Some(Some("RGBA")) => Some((4, png::ColorType::Rgba, image_webp::ColorType::Rgba8)),
-        _ => None,
+/// The spool file an output's reference names: a file a child returned, which this run hands
+/// on as its own (`jobs::grant`), else `<kind>-<name>`.
+fn spool_name(reference: &str) -> io::Result<String> {
+    if let Some(hex) = (reference.strip_prefix("sha256:"))
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Ok(format!("sha256-{hex}"));
+    }
+    match reference.rsplitn(3, '/').collect::<Vec<_>>().as_slice() {
+        [name, kind, _] if !name.is_empty() && !name.contains(['/', '\0']) && *name != "." && *name != ".." => {
+            Ok(format!("{kind}-{name}"))
+        }
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "SDK output has no owned spool binding")),
     }
 }
 
-/// Encodes registered PNG/WebP frames in this process exactly as the SDK's post thread
-/// does (lossless RGB or RGBA; PNG at zlib's fastest level, WebP lossless) and binds every
-/// output to its spool file. None when a frame needs a codec or layout only the SDK has.
-fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBinding>>> {
-    let Some(layouts) = reply
-        .frames
-        .iter()
-        .map(|f| matches!(f.codec.as_str(), "png" | "webp").then_some(f).and_then(layout))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Ok(None);
-    };
+/// Binds every output to its spool file, its frames' media types from `media`.
+fn bind(spool: &Path, reply: &Frame, media: &BTreeMap<String, String>) -> io::Result<Vec<AssetBinding>> {
     let invalid = |detail: &str| io::Error::new(io::ErrorKind::InvalidData, detail.to_string());
-    let blob = |reference: &str| -> io::Result<String> {
-        // A file a child returned, which this run hands on as its own (`jobs::grant`).
-        if let Some(hex) = reference.strip_prefix("sha256:").filter(|h| {
-            h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
-        }) {
-            return Ok(format!("sha256-{hex}"));
-        }
-        let tail: Vec<_> = reference.rsplitn(3, '/').collect();
-        match tail.as_slice() {
-            [name, kind, _]
-                if !name.is_empty()
-                    && !name.contains(['/', '\0'])
-                    && *name != "."
-                    && *name != ".." =>
-            {
-                Ok(format!("{kind}-{name}"))
-            }
-            _ => Err(invalid("SDK output has no owned spool binding")),
-        }
-    };
-    let mut media = BTreeMap::new();
-    for (frame, (channels, png_color, webp_color)) in reply.frames.iter().zip(layouts) {
-        let mut raw = Vec::new();
-        open_artifact(spool, Path::new(&frame.raw))?.read_to_end(&mut raw)?;
-        let dimension = |name: &str| {
-            frame
-                .facts
-                .get(name)
-                .and_then(Value::as_u64)
-                .filter(|v| *v > 0 && *v <= u32::MAX as u64)
-                .map(|v| v as u32)
-        };
-        let (Some(width), Some(height)) = (dimension("width"), dimension("height")) else {
-            return Err(invalid("registered frame has no dimensions"));
-        };
-        if raw.len() as u64 != frame.raw_bytes
-            || raw.len() as u64 != width as u64 * height as u64 * channels
-        {
-            return Err(invalid("registered raw frame length changed"));
-        }
-        let mut encoded = Vec::new();
-        if frame.codec == "png" {
-            let mut encoder = png::Encoder::new(&mut encoded, width, height);
-            encoder.set_color(png_color);
-            encoder.set_depth(png::BitDepth::Eight);
-            encoder.set_compression(png::Compression::Fast);
-            encoder
-                .write_header()
-                .and_then(|mut w| w.write_image_data(&raw))
-                .map_err(io::Error::other)?;
-        } else {
-            image_webp::WebPEncoder::new(&mut encoded)
-                .encode(&raw, width, height, webp_color)
-                .map_err(io::Error::other)?;
-        }
-        let name = blob(&frame.handle)?;
-        let temporary = spool.join(format!(".codec-{}", uuid::Uuid::new_v4().simple()));
-        let mut file = platform::durable::open_nofollow(
-            &temporary,
-            OpenOptions::new().write(true).create_new(true).mode(0o600),
-        )?;
-        file.write_all(&encoded)?;
-        fs::rename(&temporary, spool.join(&name))?;
-        media.insert(
-            frame.handle.clone(),
-            if frame.codec == "png" {
-                "image/png"
-            } else {
-                "image/webp"
-            },
-        );
-    }
     let mut total = 0u64;
     let mut bindings = vec![];
     for output in &reply.outputs {
-        let name = blob(&output.asset_ref)?;
+        let name = spool_name(&output.asset_ref)?;
         // Its bytes are read once, by custody; here only their length is bound.
         let length = open_artifact(spool, Path::new(&name))?.metadata()?.len();
         if output.size_bytes.is_some_and(|n| n != length) {
@@ -1326,14 +1282,11 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
             asset_ref: output.asset_ref.clone(),
             name,
             kind: output.kind.clone(),
-            media_type: media
-                .get(&output.asset_ref)
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| output.media_type.clone()),
+            media_type: media.get(&output.asset_ref).unwrap_or(&output.media_type).clone(),
             length,
         });
     }
-    Ok(Some(bindings))
+    Ok(bindings)
 }
 
 impl DeviceExecutor {
@@ -1536,6 +1489,7 @@ impl DeviceExecutor {
             child: None,
             forked: unready.child.is_none(),
             exact,
+            writer: Arc::new(Mutex::new(stream.try_clone()?)),
             stream,
             birth,
             hello: Hello::default(),
@@ -1599,6 +1553,9 @@ impl DeviceExecutor {
     /// much as its triage bundle keeps.
     pub fn stderr_tail(&self) -> String {
         crate::process::tail_from(&self.root.join("stderr.log"), self.log_from, crate::triage::MAX_STDERR)
+    }
+    pub fn line(&self) -> Line {
+        Line(Arc::downgrade(&self.writer))
     }
     pub fn cancellation(&self) -> Cancellation {
         Cancellation {
@@ -1673,15 +1630,13 @@ impl DeviceExecutor {
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
-        let mut value = serde_json::to_value(command)?;
-        // The executor's memoized stages go to the machine tier.
-        if matches!(command, DeviceCommand::Start { .. }) && self.memo.is_some() {
-            value["memo"] =
-                serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
-        }
-        write_frame(&mut self.stream, &value)?;
-        for fd in fds {
-            platform::handles::send_fd(&self.stream, fd)?;
+        let bytes = command_bytes(command, self.memo.is_some())?;
+        {
+            let mut writer = self.writer.lock().unwrap();
+            seam::write_body(&mut writer, &bytes)?;
+            for fd in fds {
+                platform::handles::send_fd(&writer, fd)?;
+            }
         }
         loop {
             let frame = read_frame(&mut self.stream)?
@@ -1691,7 +1646,7 @@ impl DeviceExecutor {
             watch.frame();
             match frame.event {
                 Some(Event::Request) if !frame.malformed.is_empty() => {
-                    refuse_malformed(&mut self.stream, &frame)?
+                    refuse_malformed(&mut self.writer.lock().unwrap(), &frame)?
                 }
                 Some(Event::Progress) if !frame.malformed.is_empty() => (),
                 Some(Event::Progress) => services.progress(&frame),
@@ -1705,7 +1660,7 @@ impl DeviceExecutor {
                         _ => Answer::unavailable(frame.seq),
                     };
                     watch.serving(false);
-                    write_frame(&mut self.stream, &answer)?;
+                    write_frame(&mut self.writer.lock().unwrap(), &answer)?;
                 }
                 Some(Event::Request) if frame.kind == Kind::ReadGrant => {
                     let plan = if frame.descriptor {
@@ -1721,9 +1676,10 @@ impl DeviceExecutor {
                     answer.seq = frame.seq;
                     answer.descriptor = false;
                     answer.descriptors = out.len() as u64;
-                    write_frame(&mut self.stream, &answer)?;
+                    let mut writer = self.writer.lock().unwrap();
+                    write_frame(&mut writer, &answer)?;
                     for file in &out {
-                        platform::handles::send_fd(&self.stream, file)?;
+                        platform::handles::send_fd(&writer, file)?;
                     }
                 }
                 Some(Event::Request) if frame.kind == Kind::KeepPages => {
@@ -1732,7 +1688,7 @@ impl DeviceExecutor {
                     let pages = pages.collect::<Result<Vec<_>, _>>()?;
                     let answer = services.keep_pages(&frame, pages);
                     watch.serving(false);
-                    write_frame(&mut self.stream, &answer)?;
+                    write_frame(&mut self.writer.lock().unwrap(), &answer)?;
                 }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.
@@ -1743,6 +1699,8 @@ impl DeviceExecutor {
                 }
                 Some(Event::Unknown) => (),
                 None if frame.reply == command.name() => return Ok(frame),
+                // A Runtime without the `bearer` handler refuses it as a command.
+                None if frame.reply == "bearer" => (),
                 None => return Err(io::Error::other("out-of-order stock executor reply")),
             }
         }
@@ -1758,9 +1716,10 @@ impl DeviceExecutor {
         answer.event = "answer";
         answer.seq = frame.seq;
         answer.descriptor = descriptor.is_some();
-        write_frame(&mut self.stream, &answer)?;
+        let mut writer = self.writer.lock().unwrap();
+        write_frame(&mut writer, &answer)?;
         if let Some(descriptor) = descriptor {
-            platform::handles::send_fd(&self.stream, &descriptor)?;
+            platform::handles::send_fd(&writer, &descriptor)?;
         }
         Ok(())
     }
@@ -2065,6 +2024,12 @@ mod codec_tests {
     fn a_credential_never_crosses_and_a_changed_result_is_refused() {
         let refused = scan(&serde_json::json!({"payload": [{"Credential": "x"}]})).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        // Only a typed TensorFS option carries the owner's bearer, and only that field.
+        let options = protocol::machine::TensorFSOptions { endpoint: "https://e.test".into(), token: "bearer-x".into(), ..Default::default() };
+        let bearer = command_bytes(&DeviceCommand::Bearer { actor: "signer".into(), tensorfs: options.clone() }, false).unwrap();
+        assert!(String::from_utf8(bearer).unwrap().contains("bearer-x"));
+        let nested = DeviceCommand::Fork { socket: "s".into(), root: "r".into(), environment: BTreeMap::from([("token".into(), "x".into())]) };
+        assert_eq!(command_bytes(&nested, false).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         let spool = tempfile::tempdir().unwrap();
         let bytes = br#"{"predictions":[0,2,1]}"#;
         fs::write(spool.path().join(RESULT_DOCUMENT), bytes).unwrap();
@@ -2205,51 +2170,6 @@ mod codec_tests {
         assert_eq!((next.kind, next.seq, next.length), (Kind::ReadGrant, 10, 5));
     }
 
-    /// An RGBA frame (Qwen-Image 2.1's transparent output) encodes natively with its alpha
-    /// exact, beside an RGB frame from an SDK that names no mode; a layout this encoder does
-    /// not know goes to the SDK's.
-    #[test]
-    fn an_rgba_frame_keeps_its_alpha() {
-        let spool = tempfile::tempdir().unwrap();
-        let rgba: Vec<u8> = vec![255, 0, 0, 255, 0, 255, 0, 0, 0, 0, 255, 128, 9, 8, 7, 0];
-        let frame = |index: usize, codec: &str, mode: Option<&str>, raw: &[u8]| {
-            fs::write(spool.path().join(format!("image-{index}.raw")), raw).unwrap();
-            let mut facts = BTreeMap::from([("width".into(), 2.into()), ("height".into(), 2.into())]);
-            if let Some(mode) = mode {
-                facts.insert("mode".into(), mode.into());
-            }
-            let output = Output { output_id: format!("out-{index}"), asset_ref: format!("asset/image/{index}"),
-                kind: "image".into(), media_type: String::new(), size_bytes: None };
-            let frame = HostFrame { handle: format!("asset/image/{index}"), codec: codec.into(),
-                raw: format!("image-{index}.raw"), raw_bytes: raw.len() as u64, media_type: String::new(), facts };
-            (frame, output)
-        };
-        let frames = [frame(1, "png", Some("RGBA"), &rgba), frame(2, "webp", Some("RGBA"), &rgba),
-            frame(3, "png", None, &rgba[..12])];
-        let reply = Frame { frames: frames.iter().map(|f| f.0.clone()).collect(),
-            outputs: frames.iter().map(|f| f.1.clone()).collect(), ..Default::default() };
-        let bindings = encode_native(spool.path(), &reply).unwrap().unwrap();
-        assert_eq!(bindings.iter().map(|b| b.media_type.as_str()).collect::<Vec<_>>(),
-            ["image/png", "image/webp", "image/png"]);
-        let png = |name: &str| {
-            let mut reader = png::Decoder::new(io::Cursor::new(fs::read(spool.path().join(name)).unwrap()))
-                .read_info().unwrap();
-            let mut pixels = vec![0; reader.output_buffer_size()];
-            let info = reader.next_frame(&mut pixels).unwrap();
-            (info.color_type, pixels[..info.buffer_size()].to_vec())
-        };
-        assert_eq!(png("image-1"), (png::ColorType::Rgba, rgba.clone()));
-        assert_eq!(png("image-3"), (png::ColorType::Rgb, rgba[..12].to_vec()));
-        let mut webp = image_webp::WebPDecoder::new(io::Cursor::new(fs::read(spool.path().join("image-2")).unwrap()))
-            .unwrap();
-        assert!(webp.has_alpha());
-        let mut pixels = vec![0; webp.output_buffer_size().unwrap()];
-        webp.read_image(&mut pixels).unwrap();
-        assert_eq!(pixels, rgba);
-        let unknown = Frame { frames: vec![frame(4, "png", Some("CMYK"), &rgba).0], ..Default::default() };
-        assert!(encode_native(spool.path(), &unknown).unwrap().is_none());
-    }
-
     fn pid(codec: &Codec) -> Option<u32> {
         codec.helper.lock().unwrap().as_ref().map(|h| h.child.id())
     }
@@ -2286,6 +2206,7 @@ mod codec_tests {
                     facts: BTreeMap::from([
                         ("width".into(), 4.into()),
                         ("height".into(), 2.into()),
+                        ("mode".into(), "RGB".into()),
                     ]),
                 }],
                 outputs: vec![Output {
@@ -2298,25 +2219,29 @@ mod codec_tests {
                 ..Default::default()
             }
         };
-        let first = codec.encode(&spool, &reply(1, 24)).unwrap();
+        let encode = |reply: &Frame| {
+            let media = codec.encode(&spool, &reply.frames)?;
+            bind(&spool, reply, &media)
+        };
+        let first = encode(&reply(1, 24)).unwrap();
         let helper = pid(&codec);
-        let second = codec.encode(&spool, &reply(2, 24)).unwrap();
+        let second = encode(&reply(2, 24)).unwrap();
         assert_eq!(
             pid(&codec),
             helper,
             "one encoder process serves the executor's outputs"
         );
-        for (post, name) in [(first, "image-0001"), (second, "image-0002")] {
+        for (bindings, name) in [(first, "image-0001"), (second, "image-0002")] {
             let bytes = fs::read(spool.join(name)).unwrap();
-            assert_eq!(post.bindings[0].name, name);
-            assert_eq!(post.bindings[0].media_type, "image/png");
-            assert_eq!(post.bindings[0].length, bytes.len() as u64);
+            assert_eq!(bindings[0].name, name);
+            assert_eq!(bindings[0].media_type, "image/png");
+            assert_eq!(bindings[0].length, bytes.len() as u64);
             assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         }
         // A refused output is that output's failure; the encoder keeps serving.
-        assert!(codec.encode(&spool, &reply(3, 25)).is_err());
+        assert!(encode(&reply(3, 25)).is_err());
         assert_eq!(pid(&codec), helper);
-        codec.encode(&spool, &reply(4, 24)).unwrap();
+        encode(&reply(4, 24)).unwrap();
         drop(codec);
         fs::remove_dir_all(root).unwrap();
     }

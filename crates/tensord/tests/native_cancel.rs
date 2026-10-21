@@ -11,6 +11,7 @@ use tensord::{
     journal::{Invocation, Journal, Outcome, ResultRecord, State},
     machine_api::{actor_id, NativeBackend},
     objects::Objects,
+    published::Publisher,
     runs::Runs,
     service::Service,
 };
@@ -86,7 +87,7 @@ impl Server {
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let store = tensord::storage::open(&root.join("store")).unwrap();
         let objects = Arc::new(
-            Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
+            Objects::new(&root.join("writes"), service.engine.clone()).unwrap(),
         );
         let mut identity = MachineIdentity::ephemeral(
             "cancel-proof".into(),
@@ -102,14 +103,14 @@ impl Server {
             tensord::machine::update::Updates::open(paths, Box::new(|| true), None, None).unwrap(),
         );
         let pin = tensorfs::sha256::digest(&identity.cert_der);
+        let machine = tensord::origin::Machine::new(store.clone(), None).unwrap();
         let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store);
         backend.runs = Some(Arc::new(Runs {
             service: service.clone(),
             objects,
-            publisher: None,
+            publisher: Publisher::new(&root.join("published"), Default::default(), machine).unwrap(),
             local: None,
             own_hub: None,
-            leaf: None,
             contexts: Default::default(),
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

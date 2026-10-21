@@ -2,18 +2,11 @@
 
 TensorFS (Tensor Filesystem) is a library written in Rust, with python bindings, for downloading, storing, and loading tensors into memory efficiently. It uses an alternative storage-format we call `cozytensors`, designed to address safetensors' shortcomings.
 
-### Problem 1: Safetensors does not describe quantization encodings
+### Problem 1: Safetensors is Not Self-Describing
 
-Safetensors records named arrays, their dtypes and shapes, and their byte offsets.
-It does not specify how packed weights, scales and other arrays combine into a
-logical quantized tensor: which scale applies to which values, which codebook to
-use, how bits are ordered, or whether a rotation must be undone.
+Safetensors' header gives a list of keys, their names, dtypes, shapes, and where to find them in the file using byte offsets, but does not describe how those bytes form a quantized tensor.
 
-A quantized checkpoint's loader therefore needs the producer's conventions. The
-bytes can reach GPU memory intact, with valid dtypes and shapes, but be decoded
-incorrectly.
-
-Trivial examples:
+For example, all the bytes can reach GPU memory intact, with valid dtypes and shapes, and still be interpreted incorrectly:
 
 - **Scaling the wrong axis.** Suppose an INT8 matrix is `[[10, 20], [30, 40]]` and its
   scales are `[0.1, 0.2]`. Scaling each row gives weights `[[1, 2], [6, 8]]`; scaling each
@@ -26,36 +19,15 @@ Trivial examples:
   assigns them to the wrong input channels. With input `[1, 10]`, the dot product becomes
   `12` instead of `21`.
 
-Real world examples:
+The file is readable in both cases. Across a model, these mistakes can turn otherwise
+successful inference into nonsense. What is missing is the agreed meaning of its arrays:
+the scale axis, packing order and other encoding rules.
 
-1. **FP8 values whose scale information is missed.** An FP8 tensor can hold values
-   directly, or values that require separate weight scales. In an actual
-   [ComfyUI WAN regression](https://github.com/Comfy-Org/ComfyUI/issues/13238), inference
-   produced noise while `scaled_fp8`, `scale_input` and `scale_weight` appeared as
-   unexpected keys. The arrays were readable; the loader had not applied their quantization convention correctly.
-
-2. **NVFP4 scales stored in different layouts.** The
-   [ModelOpt/BFL layout supported by Diffusers](https://huggingface.co/docs/diffusers/main/api/quantization#bflquantizationconfig)
-   describes block scales as `[N, K/16]`.
-   [Comfy Quants' NVFP4 format](https://github.com/Comfy-Org/comfy-quants/blob/main/docs/formats/nvfp4.md)
-   stores them in a padded, rearranged cuBLAS layout. Both use NVFP4, but a reader
-   cannot treat the scale arrays as interchangeable: it would apply scales to the
-   wrong weight blocks, or reject the layout.
-
-3. **NF4 and FP4 packed into the same storage dtype.** Diffusers' bitsandbytes backend
-   supports both formats, normally packed into `uint8` arrays. Their four-bit codes
-   use different value tables, so the same code does not necessarily represent the
-   same number. The [quantization configuration](https://huggingface.co/docs/diffusers/main/api/quantization#bitsandbytesconfig)
-   selects the format and whether the scales themselves are quantized again. A
-   decoder using the wrong table or scale convention reconstructs different weights,
-   despite reading every stored byte correctly.
-
-Correct dequantization therefore depends on the producer and reader agreeing on
-array roles, packed-value order, scale layouts and quantization parameters. An INT8
-or FP8 dtype alone does not establish that agreement, and the `.safetensors`
-extension does not specify it.
-
-#### Metadata hidden in tensor names
+It does not
+standardize how those arrays form a quantized tensor. An INT8 weight and a scale array do not
+tell a reader which axis to scale, how values were packed, or whether a rotation must be
+undone. Its optional metadata can carry conventions, but the reader must already understand
+them.
 
 Each ecosystem therefore supplies its own rules, sometimes reserving tensor names for entries
 that are actually metadata rather than model weights:
@@ -70,40 +42,29 @@ that are actually metadata rather than model weights:
   and unpacks the metadata to recover properties such as the logical dtype and block size.
   Transformers also publishes [quantization configuration alongside the weights](https://huggingface.co/docs/transformers/main/en/quantization/bitsandbytes).
 
-Quantized checkpoint loading therefore relies on agreements between producers and
-loaders: reserved tensor names, metadata keys, scale shapes and decoding rules. These
-agreements can be documented and reliable within one ecosystem, but they are not
-part of the safetensors format. To a generic safetensors reader, the metadata entries
-above are arrays with arbitrary names, with no standard relationship to the weights
-they describe.
+Much of the model-loading ecosystem is therefore held together by agreements between producers
+and loaders: expected filenames, tensor names, metadata keys, configuration schemas and code
+that knows how to interpret them. These agreements can be documented and reliable within one
+ecosystem, but they are not part of the safetensors format. To a generic safetensors reader,
+the metadata entries above are just arrays with arbitrary names, with no standard relationship
+to the weights they describe.
 
-Two tools can both support safetensors and still disagree about how to reconstruct a
-quantized tensor. A matching loader can read it reliably; another may reject it or
-interpret its encoding incorrectly.
+Two tools can both support safetensors and still disagree about how to reconstruct the model.
+A valid file is not enough: compatibility depends on finding a loader that implements the
+writer's conventions. A matching loader can read it reliably; a different loader may reject
+it or misinterpret its contents. The `.safetensors` extension alone does not establish that
+shared contract.
 
-cozytensors makes the quantization meaning part of the format: each logical tensor
-declares its encoding, parameters and stored arrays, with specified decoding rules.
-TensorFS can preserve the encoded representation for a compatible compute kernel or
-decode a supported encoding into ordinary tensors. Readers do not need to infer
-quantization from filenames or producer-specific tensor keys.
-
-#### The model's computation still relies on convention
-
-This self-description covers tensor encodings, not the complete model computation.
-The header records component classes, configurations and tensor names, but their
-model-specific meaning still depends on the consuming implementation. Diffusers or
-ComfyUI must support that architecture and interpret its configuration and parameters
-correctly. TensorFS does not define every model's operators, connections or forward
-function, and it does not automatically correct model-layout mistakes.
-
-Supported importers can translate known source layouts, but this is separate from
-encoding self-description. Computation-graph support is deferred to
-[xs-057](https://github.com/cozy-creator/tracker/blob/master/tracker/cross-cutting/xs-057-computation-graph-evaluation.md).
+cozytensors makes that meaning part of the format: each logical tensor declares its encoding,
+parameters and stored arrays, with specified decoding rules. TensorFS can preserve the encoded
+representation for a compatible compute kernel or decode a supported encoding into ordinary
+tensors. Components, configuration and supporting assets are described in the same checkpoint,
+so consumers do not have to reverse-engineer filenames and producer-specific tensor names.
 
 #### Why the exact encoding matters
 
 These are concrete cases from our format and importer work, captured by the
-[encoding definitions](../tensorfs/spec/cozytensors.md):
+[encoding definitions](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/spec/cozytensors.md):
 
 | Case | Why dtype, shape or names were not enough | What cozytensors records |
 |---|---|---|
@@ -130,19 +91,27 @@ confirmed that correcting it resolved the problem. cozytensors makes that settin
 group-index mapping part of the GPTQ encoding. A format cannot eliminate buggy kernels or bad
 weights, but it can specify what the bytes mean instead of leaving that agreement implicit.
 
+ComfyUI has also had a [WAN 2.2 regression](https://github.com/Comfy-Org/ComfyUI/issues/13238)
+where inference ran but produced noise, with `scaled_fp8`, `scale_input` and `scale_weight`
+reported as unexpected keys. The [fix](https://github.com/Comfy-Org/ComfyUI/commit/e2ddf28d78f190b27d136668a7dc15c7f0ec75dc)
+re-ran legacy quantization conversion after stripping the checkpoint's tensor-name prefix;
+the reporter confirmed that it resolved the problem. The arrays were readable, but the
+conventions carrying their quantization meaning had not been applied correctly.
+
 #### Choose the representation your runtime needs
 
-For a quantized matrix named `proj.weight`, inspect and retain its stored encoding when your
-runtime has a matching compute kernel:
+In these examples `me/model` stands for a repository you can read, here with `int8` and `bf16`
+variants. For a quantized matrix, inspect and retain its stored encoding when your runtime has a
+matching compute kernel:
 
 ```python
 import tensorfs
 
-checkpoint = tensorfs.open("owner/model", variant="int8")
+checkpoint = tensorfs.open("me/model", variant="int8")
 tensors = checkpoint.components["unet"].tensors
-stored = tensors.read("proj.weight", device="cuda:0", decode=False)
+stored = tensors.read("time_embedding.linear_1.weight", decode=False)
 print(stored.scheme, stored.params)
-# stored.parts contains the GPU arrays for that encoding's compute kernel.
+# stored.parts holds the encoded arrays; device="cuda:0" puts them on the GPU for that kernel.
 ```
 
 A runtime that expects ordinary floating-point weights can instead request decoding:
@@ -150,13 +119,13 @@ A runtime that expects ordinary floating-point weights can instead request decod
 ```python
 import torch
 
-dense = tensors.read("proj.weight", device="cuda:0", decode=True)
+dense = tensors.read("time_embedding.linear_1.weight", decode=True)
 weight = torch.from_dlpack(dense)  # ordinary values; no input-format-specific unpacker
 weight = weight.to(torch.bfloat16)  # only if this runtime requires BF16
 ```
 
 `decode=True` reconstructs the header's declared logical dtype; it does not always mean BF16.
-The same call can decode supported ConvRot, GPTQ, NF4 or other stored schemes. Selecting CUDA
+The same call can decode supported ConvRot, GPTQ, NF4 or other stored schemes. `device="cuda:0"`
 chooses the destination, not a different quantization.
 
 #### Convert to another quantization at load time
@@ -166,9 +135,7 @@ the target encoder. For example, a runtime that expects symmetric, per-row INT8 
 weights decoded from ConvRot or another supported encoding as follows:
 
 ```python
-values = torch.from_dlpack(
-    tensors.read("proj.weight", device="cuda:0", decode=True)
-).float()
+values = torch.from_dlpack(tensors.read("time_embedding.linear_1.weight", decode=True)).float()
 scales = values.abs().amax(dim=1, keepdim=True) / 127
 scales = torch.where(scales == 0, torch.ones_like(scales), scales)
 weights_i8 = (values / scales).round().clamp(-127, 127).to(torch.int8)
@@ -176,17 +143,16 @@ row_scales = scales.squeeze(1)
 # weights_i8 and row_scales are ready for a matching rowwise-INT8 kernel.
 ```
 
-This target representation is `int8.rowwise` with `axis=0` and `scale_dtype="F32"`.
+This target representation is `int8.rowwise` with an `F32` `scale` part per row.
 TensorFS handles the source encoding; the target quantizer above is ordinary PyTorch code.
-The current Python API does not yet expose a general re-encoding call.
-`ComponentWriter.put_encoded(...)` can store already-encoded arrays, but does not quantize them.
+TensorFS has no re-encoding call: `ComponentWriter.put_encoded(...)` stores already-encoded arrays.
 Prepare this once when loading, rather than on every forward pass. Re-quantizing can add error;
 methods requiring calibration need their own calibration step, not merely a dtype cast.
 
-### Problem 2: A weights file is not a self-contained model package
+### Problem 2: The weights file is not a complete model package
 
-A usable model needs more than its weight arrays: component configurations,
-a description of its pipeline, and supporting data such as tokenizer vocabularies.
+A usable model needs more than its weight arrays: its architecture and configuration,
+the components in its pipeline, and supporting data such as tokenizer vocabularies.
 Safetensors does not standardize how to package those together. The diffusion ecosystem has
 two common [layouts](https://huggingface.co/docs/diffusers/main/en/using-diffusers/other-formats):
 
@@ -218,14 +184,18 @@ keys and obtain configuration from a known base-model repository, or require an 
 `config` argument. A locally available weights file alone does not guarantee a fully local,
 self-contained load.
 
+A [confirmed Transformers regression](https://github.com/huggingface/transformers/pull/47988)
+illustrates the consequence: OLMo loaded and ran, but produced repetitive nonsense because
+`tokenizer.json` and `tokenizer_config.json` disagreed about end-of-sequence handling and a
+loader change stopped applying the override. The weights were not the problem; interpretation
+of the accompanying metadata was.
+
 cozytensors puts the component descriptions, class names, parsed configurations and asset
 references in its header. `checkpoint.components["unet"].config` reads the configuration
 directly; a tokenizer's `asset("tokenizer.json")` reads its supporting data. Consumers do not
 need to discover that structure by walking a particular folder layout. The header supplies
 the manifest while payloads remain in the shared store, and the consuming library supplies
 the model code. Exporting ordinary folders is a compatibility convenience.
-Self-contained here means the model data is described by the header and its referenced
-objects; the model implementation still comes from the consuming library.
 
 ### Problem 3: Safetensors has no built-in de-duplication
 
@@ -254,20 +224,10 @@ ordinary file for the model loader; deduplication sits underneath that file inte
 
 TensorFS uses the shared chunk store as the model's native storage. A `.cozytensors` header
 references immutable chunks; checkpoints sharing a chunk keep one copy on disk, and readers
-load directly from that store without reconstructing a separate full model file. This gives
-two practical benefits:
-
-- **Smaller incremental saves and transfers.** A fine-tune reuses its base checkpoint's
-  unchanged chunks and writes new chunks only where the stored bytes differ. For example,
-  changing the UNet does not require saving another copy of unchanged text encoders or the
-  VAE. Uploads and downloads transfer only chunks missing from the destination store.
-- **Lightweight checkpoint references.** A small `.cozytensors` file holds the metadata and
-  content references; the weight bytes remain in the shared store. Another checkpoint can
-  reference those same bytes without creating a full model folder or copying its payload.
-  Missing chunks can be fetched when needed.
-
-This saves local disk space as well as transfer bytes on an ordinary workstation, without
-requiring a deduplicating filesystem or a hosted storage service.
+load directly from that store without reconstructing a separate full model file. A fine-tune
+can reuse its base checkpoint's unchanged chunks and add only new ones. This saves local disk
+space as well as transfer bytes on an ordinary workstation, without requiring a deduplicating
+filesystem or a hosted storage service.
 
 TensorFS also divides large payloads, but the tensor-to-chunk references are part of the
 checkpoint format. Readers follow those references directly; they do not need a separate
@@ -278,11 +238,8 @@ framework-specific shard index or numbered shard filenames to locate each tensor
 | What safetensors leaves to the application | How TensorFS addresses it |
 |---|---|
 | Quantization meaning: how scales, packed weights and producer-specific transforms reconstruct a tensor. These are conventions beyond the standard tensor declarations. | **cozytensors** declares named encodings, complete parameters and stored parts, with specified decoding math. |
-| Packaging model data: configurations, component descriptions and supporting assets live outside the array container. | The header describes those items together and references the objects containing their data. Model computation still comes from the consuming library. |
 | Reusing unchanged bytes across checkpoints: the file format defines no content-addressed chunks shared between files. | Immutable chunks identified by SHA-256 and length are shared across models and precision lanes; pulls fetch missing objects. |
-
-Each downloaded chunk is verified independently before use, so a selected component can be
-fetched and checked without downloading the whole checkpoint.
+| Verifying partial downloads: tensor offsets permit selective reads, but the format includes no per-chunk content hashes. | Each downloaded chunk is verified independently before use, so a selected component can be fetched and checked without downloading the whole checkpoint. |
 
 TensorFS combines that format with a local store, fetcher and Rust/Python readers. It packs small
 parts into aligned chunks and preserves construction order for efficient reads. Safetensors remains
@@ -290,7 +247,7 @@ an import/export format, so existing Diffusers and Transformers workflows can us
 
 Use TensorFS through its Rust API, Python library or `tfs` command-line tool. It works with local
 files, static origins and Tensorhub, without requiring Cozy, a Tensorhub account or PyTorch.
-The [cozytensors specification](../tensorfs/spec/cozytensors.md) defines the format and exact decoding rules.
+The [cozytensors specification](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/spec/cozytensors.md) defines the format and exact decoding rules.
 
 ## Timing versus safetensors
 
@@ -311,32 +268,31 @@ loads and cold blocks; `safetensors 0.8.0`'s `safe_open` CPU→CUDA path for war
 payload-cache eviction with `POSIX_FADV_DONTNEED`; warm is the immediate second read. Chunk boundaries
 make the selected-block reads 211 MB and 227 MB respectively.
 
-These receipts predate the 0.13 API. They are separate runs and reader revisions: the full-load run predates the final CBOR header
-and lazy window registration; the block run includes them. They measure serialized-byte loading,
+They measure serialized-byte loading,
 excluding dequantization, model construction and inference. Hardware and cache conditions affect
-results. [Measurements and provenance](gates/speed/measurements.json) include the earlier failed
+results. [Measurements and provenance](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs-py/gates/speed/measurements.json) include the earlier failed
 window cell; [the recorded harness](https://github.com/cozy-creator/cozy-creator/blob/0a6e71ee2c919db3e6e9b5844c8234ca9749cedb/crates/tensorfs/gates/speed/speedgate.py)
 defines the workloads. Download projections are separate from these measured timings.
 
 ## Get started
 
-The target TensorFS 0.13 interface uses the component API and hard-cut header/tree format. Python 3.12 or later is
-required; the current master implementation is still being integrated. The wheel includes the Python module and `tfs`:
+It needs CPython 3.10 or later. Wheels for Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows
+(x86_64, arm64) include the Python module and the `tfs` command:
 
 ```bash
-uv venv --python 3.12
+uv venv
 source .venv/bin/activate
 uv pip install tensorfs
 
-tfs import hf://hf-internal-testing/tiny-sdxl-pipe --name local/example
-tfs inspect local/example
-tfs export local/example ./example --safetensors
+tfs convert hf://hf-internal-testing/tiny-sdxl-pipe --name local/example@1
+tfs inspect local/example@1
+tfs export local/example@1 ./example --safetensors
 ```
 
 ```python
 import tensorfs
 
-checkpoint = tensorfs.open("local/example", local_files_only=True)
+checkpoint = tensorfs.open("local/example", revision="1", local_files_only=True)
 unet = checkpoint.components["unet"]
 info = unet.tensors["conv_in.weight"]
 value = unet.tensors.read("conv_in.weight", decode=True)
@@ -349,7 +305,8 @@ and quantized tensors return their encoded arrays and parameters. Use `decode=Tr
 above, when the consumer needs ordinary floating-point weights. Frameworks wrap arrays
 through their DLPack entry point. DLPack is the memory-sharing protocol, not a separate
 array library to install. `component.config` is structured JSON, `component.asset(name)` reads an asset,
-and explicit `component.export_files(directory)` is only a compatibility convenience for legacy path-only loaders.
+and `component.export_files()` (a cache-managed folder, or the directory you name) is only a convenience for
+path-only loaders.
 
 ## Checkpoints and repositories
 
@@ -358,14 +315,16 @@ The header contains a pipeline class/config and named components with class/conf
 is self-contained; README, LICENSE, images and code remain ordinary repository files.
 
 ```text
-repo → release → tree
-                  ├─ model.int8.cozytensors → header → chunks and assets
-                  ├─ model.bf16.cozytensors → header → chunks and assets
-                  └─ README.md, LICENSE, …
+repo → tag → commit (tree)
+               ├─ model.int8.cozytensors → header → chunks and assets
+               ├─ model.bf16.cozytensors → header → chunks and assets
+               └─ README.md, LICENSE, …
 ```
 
-A release names a `tensorfs.tree/1` tree. `variant=` selects a cozytensors file; `open` requires an explicit variant
-when there is more than one. `revision="sha256:…"` can select an unpublished tree or header. Opening downloads
+A repo is commits and tags, as in git. A commit is an immutable `cozytensors.tree/1` tree; a tag is a movable name
+for one. Public tags are releases, named by versions; private tags are the owner's. `revision=` names a tag, a commit
+(`sha256:<tree>`) or a variant header (`sha256:<header>`); without one, `open` takes the newest public final release.
+`variant=` selects a cozytensors file; `open` requires an explicit variant when there is more than one. Opening downloads
 metadata by default; each tensor read fetches only the objects it needs. Set `lazy=False` to wait for the whole
 checkpoint in the shared store, or call `checkpoint.download(components=["unet"])` to preload a selection.
 `materialize` returns a plain folder, including all variants by default, while `download_file` returns one
@@ -376,56 +335,64 @@ repository file. These folder/file operations are optional compatibility tools.
 `convert_to_cozytensors` accepts files, directories, `hf://`, `civitai://` and HTTPS sources. It pins upstream revisions and records
 source metadata. Recognized source layouts use converter tables; `converter=` declares a layout that cannot be
 inferred safely. `materialize(checkpoint, local_dir=directory, format="safetensors")` writes ordinary Hugging Face filenames, configs and assets.
-Encoded tensors retain their parts unless `dequantize=` requests ordinary values.
+Encoded tensors retain their parts unless `decode=True` writes them in their logical dtypes.
 
 ```python
 from array import array
+from pathlib import Path
 import tensorfs
 
 with tensorfs.Writer("./model.cozytensors") as writer:
-    component = writer.component("model", cls="", config={"width": 2})
+    component = writer.component("model", cls=("", "", ""), config={"width": 2})
     component.put("weight", array("f", [1, 2]), dtype="F32", shape=[2])
     component.asset("tokenizer.json", b"{}")
 checkpoint = writer.commit()
 tensorfs.materialize(checkpoint, local_dir="./portable", format="cozytensors")
 
-tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path="./portable")
-tensorfs.upload_folder(repo_id="acme/example", folder_path="./portable", endpoint="file:///srv/origin")
+tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path="./portable")  # private tag "draft"
+tensorfs.upload_folder(repo_id="acme/example", folder_path="./portable", endpoint=Path("origin").absolute().as_uri())
 ```
 
-A normal save writes one .cozytensors header file, with its tensors and supporting-file bytes retained in
-the shared store. The file contains content hashes, not physical store paths. `Writer()` without a destination
-keeps the checkpoint in the store without writing a user-visible header file. An explicit native portable export
-writes `model.cozytensors` (or a named variant) plus complete `chunks/<sha256>` objects. `base=` reuses unchanged
-tensors and `resume=` journals local work. `Writer(repo_id=…, endpoint=…, token=…)` streams new objects
-and appends an unreleased tree. Its successful checkpoint carries the exact published tree; an upload failure keeps
-`writer.local_checkpoint` and remains an error.
+A `.cozytensors` file is a small handle into the shared local store, not a self-contained file: a save writes the
+header, and its tensors and supporting-file bytes stay in the store while that file holds this header. Delete or
+overwrite the file and the data expires like any other local copy. The copy for another machine is
+`materialize(checkpoint, local_dir=…)`: `model.cozytensors` (or a named variant) plus complete `chunks/<sha256>`
+objects. `Writer()` without a destination keeps the checkpoint in the store as a cache entry. `base=` reuses
+unchanged tensors and `resume=` journals local work. `Writer(repo_id=…, revision=…, endpoint=…, token=…)` streams
+new objects, makes a commit and moves the private tag `revision` (default `main`) to it; `variant=` names the file
+`model.<variant>.cozytensors` and needs `repo_id`. The commit goes on top of the tag: its other variants and files
+stay, so a bf16 and then an int8 writer to `main` leave both. `upload_folder` does the same for a folder (removing
+only what `delete_patterns` names) and returns the commit.
+Publishing (making a tag public, a release) is the CLI's `cozy model publish`. A successful checkpoint carries the exact
+commit; an upload failure keeps `writer.local_checkpoint`, which can be uploaded again for 7 days, and remains an error.
 
 The default endpoint is `https://tensorhub.com`; `configure(endpoint=…)` or `TENSORFS_ENDPOINT` changes it.
-`token=` accepts a string, a native DPoP provider, a callable, or an object with `headers(method, url, headers,
+`token=` accepts a string, a callable, or an object with `headers(method, url, headers,
 payload)` and optional `retry(method, url, headers, payload, status, response_headers)`. The payload is its SHA-256
 hex digest when known. Credentials are presented afresh per request and removed on redirects to another origin.
-Public data needs no account. [Distribution](../tensorfs/spec/distribution.md) defines endpoint routes and publication.
+Public data needs no account. [Distribution](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/spec/distribution.md) defines endpoint routes and publication.
 
 ## Storage and ownership
 
 The shared local store is internal. Its default root is `~/.cache/tensorfs`; `cache_dir=` and `TENSORFS_HOME` override it. Processes
 share immutable objects and coordinated records. Admission hashes bytes before installing them by rename; ordinary
-opens check lengths. Saved local roots are retained separately from evictable download-cache entries; deleting a header file only removes that handle. Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
+opens check lengths. Local copies expire 7 days after their last use, least recently used first when the disk runs low;
+header files (written by `Writer(dest)` or opened by path) and `local/` references keep their data while they exist.
+Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
 
 Runtime and TensorD use this same public API. Callers read and write the shared store and upload with a supplied
 credential. TensorFS owns I/O and decoding; varena owns memory placement. Installing the wheel does
 not grant access to private data or managed executions.
 
-The [usage guide](../tensorfs/README.md) summarizes the target public calls. The
-[native type declarations](python/tensorfs/_ext.pyi) describe the checked-in implementation while the 0.13 bindings are integrated. Every format, storage and transport failure derives from `tensorfs.Error`; `.code` identifies one of
+The [Python API](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs-py/API.md) and [Rust API](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/API.md) guides cover every call; the
+wheel ships type declarations. Every format, storage and transport failure derives from `tensorfs.Error`; `.code` identifies one of
 twelve families, including `denied` and `conflict`. Unknown encodings remain inspectable and transferable; decoding
 requires that scheme's implementation.
 
 ## Format and development
 
-The [cozytensors specification](../tensorfs/spec/cozytensors.md) is the format contract. The header is deterministic CBOR;
+The [cozytensors specification](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/spec/cozytensors.md) is the format contract. The header is deterministic CBOR;
 trees and repository documents are canonical JSON. Construction order contributes to identity. The
-[conformance corpus](../tensorfs/conformance/) checks independent readers, and the [source fixtures](../tensorfs/vectors/) retain source
-provenance without model payloads. The [standalone end-to-end check](scripts/e2e.sh) converts a tiny public model,
-exports it for Diffusers, compares its render and downloads the same bytes through an ordinary endpoint.
+[conformance corpus](https://github.com/cozy-creator/cozy-creator/tree/master/crates/tensorfs/conformance) checks independent readers, and the [source fixtures](https://github.com/cozy-creator/cozy-creator/tree/master/crates/tensorfs/vectors) retain source
+provenance without model payloads. The [end to end check](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs-py/scripts/e2e.py) converts a tiny
+public model, publishes and reopens it, and runs every example in these documents against it in CI.

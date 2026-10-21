@@ -1,14 +1,14 @@
 //! `cozy model quantize`: the serving package's quantizer, run as an ordinary conversion call
-//! (`cozy run <package>/<fn> <model> <org/name>`). The package owns the recipe; the machine writes
-//! the lane and uploads it as a private checkpoint.
+//! (`cozy run <package>/<fn> <model> <org/name>`). The package owns the recipe; Runtime writes
+//! the lane through Runtime's TensorFS store and returns its checkpoint reference.
 use std::process::ExitCode;
 
-use protocol::calcifer::{On, Status};
+use protocol::calcifer::{On, Run, Status};
 use protocol::config::{Hub, Origin};
 use protocol::error::{Error, Kind};
 
 use super::Quantize;
-use super::refs::{ModelRef, Repo};
+use super::refs::{self, ModelRef, Repo};
 use crate::Context;
 use crate::context::hub_answer;
 use crate::output::{self, Record};
@@ -40,10 +40,13 @@ async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef) -> Result<(Strin
         }
         ModelRef::Hub { repo, release, lane } => {
             let card = hub_answer(client.get_model(&repo.org, &repo.name).await)?;
-            let found = card.releases.iter().find(|r| match release {
-                Some(want) => &r.release == want,
-                None => r.yanked != Some(true) && r.yanked_at.as_deref().is_none_or(str::is_empty),
-            });
+            let found = match release {
+                Some(want) => card.releases.iter().find(|r| &r.release == want),
+                None => {
+                    let live = card.releases.iter().filter(|r| r.yanked != Some(true) && r.yanked_at.as_deref().is_none_or(str::is_empty));
+                    tensorfs::format::newest_by(live, |r| r.release.as_str())
+                }
+            };
             let found = found.ok_or_else(|| {
                 Error::new(Kind::NotFound, "model_release_not_found", format!("{repo} has no release {}", release.as_deref().unwrap_or("available")))
                     .next(format!("cozy model info {repo}"))
@@ -113,22 +116,52 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
         _ => "nvfp4",
     };
     let model = ModelRef::parse(&args.model)?;
-    let destination = args.destination.as_deref().map(Repo::hub).transpose()?;
+    let destination = args.destination.as_deref().map(refs::destination).transpose()?;
     let hub = ctx.hub()?;
     let (source, components, repo) = checkpoint(ctx, &hub, &model).await?;
-    let destination = destination.unwrap_or_else(|| repo.clone());
+    // The variant goes onto the tag's tree (main unless named): publishing the tag releases all.
+    let destination = destination.unwrap_or_else(|| format!("{repo}@main"));
     let (package, release, function) = quantizer(ctx, &hub, &args, lane, &components).await?;
-    let inputs = vec![source.clone(), destination.to_string()];
+    let inputs = vec![source.clone(), destination.clone()];
     let run = crate::run::call(ctx, &package, Some(&release), &function, inputs, &args.placement, args.detach).await?;
-    // The lane the machine wrote (`result` is the quantizer's artifact), and how to publish it.
-    let digest = run.result.as_ref().and_then(|r| r["manifest"]["digest"].as_str());
-    if let (false, Status::Completed, Some(digest)) = (ctx.json, run.status, digest) {
-        let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
-        let release = pinned.filter(|_| destination == repo).unwrap_or("<release>");
-        Record::new().field("checkpoint", format!("{destination}#{digest}")).print(ctx);
-        output::next(ctx, &[&format!("cozy model publish {destination} --release {release} --lane {lane}={digest}")]);
+    if !ctx.json && run.status == Status::Completed {
+        match written_checkpoint(&run, lane) {
+            Some(WrittenCheckpoint::Reference(reference)) => {
+                let (model, tree) = (&reference.repo_id, &reference.revision);
+                let mut record = Record::new().field("checkpoint", format!("{model}@{tree}"));
+                if !reference.variant.is_empty() {
+                    record = record.field("variant", &reference.variant);
+                }
+                record.print(ctx);
+                // The release it was made from moves to the tag that now holds its variant too.
+                let (into, tag) = destination.split_once('@').expect("a destination names its tag");
+                let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
+                let release = pinned.filter(|_| into == repo.to_string()).unwrap_or("<version>");
+                let tag = Some(reference.tag.as_str()).filter(|t| !t.is_empty()).unwrap_or(tag);
+                output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tag}")]);
+            }
+            Some(WrittenCheckpoint::Header(header)) => {
+                Record::new().field("checkpoint header", header).print(ctx);
+            }
+            None => {}
+        }
     }
     Ok(crate::run::exit_code(&run))
+}
+
+enum WrittenCheckpoint<'a> {
+    Reference(&'a protocol::machine::CheckpointRef),
+    Header(&'a str),
+}
+
+/// A typed output names the repository TREE; the result's checkpoint field names only a HEADER.
+fn written_checkpoint<'a>(run: &'a Run, lane: &str) -> Option<WrittenCheckpoint<'a>> {
+    if let Some(reference) = run.output.iter().filter(|item| item.name == lane)
+        .find_map(|item| item.checkpoint.as_ref()) {
+        return Some(WrittenCheckpoint::Reference(reference));
+    }
+    let result = run.result.as_ref()?;
+    result["checkpoint"].as_str().map(WrittenCheckpoint::Header)
 }
 
 #[cfg(test)]
@@ -152,5 +185,24 @@ mod tests {
         let parts: Vec<String> = ["text_encoder", "text_encoder_2", "unet", "vae"].map(String::from).into();
         assert_eq!(names(quantizers(&sdxl, "fp8", &parts)), ["fp8"]);
         assert!(quantizers(&sdxl, "int8", &parts[..3]).is_empty(), "a checkpoint without its vae");
+    }
+
+    #[test]
+    fn typed_output_trees_take_precedence_over_result_headers_and_old_manifests() {
+        let mut run: Run = serde_json::from_value(serde_json::json!({
+            "id": protocol::ids::RunId::mint([7; 12]), "number": 7, "kind": "call",
+            "target": "quantize", "hub": "https://tensorhub.com", "status": "completed",
+            "created_at_ms": 1,
+            "result": {"checkpoint": "sha256:header"},
+            "output": [{
+                "id": "7/fp8", "name": "fp8", "index": 0, "rev": 1, "length": 0,
+                "media_type": "", "status": "completed",
+                "checkpoint": {"repo_id": "actual/output", "revision": "sha256:tree", "variant": "fp8"}
+            }]
+        })).unwrap();
+        assert!(matches!(written_checkpoint(&run, "fp8"), Some(WrittenCheckpoint::Reference(reference))
+            if reference.repo_id == "actual/output" && reference.revision == "sha256:tree"));
+        run.output.clear();
+        assert!(matches!(written_checkpoint(&run, "fp8"), Some(WrittenCheckpoint::Header("sha256:header"))));
     }
 }

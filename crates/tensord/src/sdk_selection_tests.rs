@@ -129,7 +129,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
     let service = Service::open(&engine, &generations, 1).unwrap();
     let store = crate::storage::open(&root.join("tensorfs")).unwrap();
     let objects = Arc::new(
-        Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
+        Objects::new(&root.join("writes"), service.engine.clone()).unwrap(),
     );
     let write = |bytes: &[u8]| {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
@@ -171,7 +171,6 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
                 seed_cache: None,
                 runtime_build: String::new(),
             },
-            store.clone(),
         )
     };
     let provenance = |generation: &str| {

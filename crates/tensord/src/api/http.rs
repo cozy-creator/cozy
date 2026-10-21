@@ -88,6 +88,7 @@ pub(super) fn router<B: MachineBackend>(identity: Arc<MachineIdentity>, backend:
         .route(path::LOG, get(log::<B>))
         .route(path::OBJECT, put(put_object::<B>).head(head_object::<B>).get(follow_object::<B>))
         .route(path::OBJECTS_HELD, post(held_objects::<B>).layer(DefaultBodyLimit::max(16 << 20)))
+        .route(path::BEARER, put(bearer::<B>))
         .route(path::HEALTH, get(health))
         .fallback(|| async { Refusal::from(Error::not_found("route_not_found", "this machine serves no such path")) })
         .method_not_allowed_fallback(|| async {
@@ -241,6 +242,26 @@ async fn keepalive<B: MachineBackend>(State(m): State<Machine<B>>, headers: Head
         .renew()?;
     let frame = super::machine_status::frame(&m.identity, &m.backend, caller.actor).await?;
     Ok(json(StatusCode::OK, &frame))
+}
+
+/// `PUT /v1/bearer`: the signer's newest ordinary bearer at the Hub `endpoint` names. Every later
+/// read there under its owner's access presents it, until one that expires later comes, and the
+/// executors given the one it replaces hear of it.
+async fn bearer<B: MachineBackend>(State(m): State<Machine<B>>, headers: HeaderMap, body: Bytes) -> Answer {
+    let caller = m.caller(&headers)?;
+    caller.machine()?;
+    let given: v1::TensorFSOptions = serde_json::from_slice(&body)
+        .map_err(|e| Error::validation("invalid_request", format!("the bearer is not JSON: {e}")))?;
+    if !crate::hub::valid_origin(&given.endpoint) || given.token.is_empty() {
+        return Err(Error::validation("invalid_bearer", "a bearer names its Hub's origin and a token").into());
+    }
+    let actor = crate::machine_api::actor_id(caller.actor);
+    blocking(&m.backend, move |_| {
+        crate::hub::Bearer::offer(&actor, &given.endpoint, &given.token, given.expires_unix_ms);
+        Ok(())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 fn run_id(id: &str) -> Result<(), Error> {
@@ -766,7 +787,7 @@ mod tests {
                 routed += 1;
             }
         }
-        assert_eq!(routed, 13, "the spec's routes");
+        assert_eq!(routed, 14, "the spec's routes");
     }
 
     /// A read from any offset answers exactly the bytes after it, across parts, and reads

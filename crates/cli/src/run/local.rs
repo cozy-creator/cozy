@@ -22,7 +22,7 @@ use super::{
     interface::Interface,
     spec,
 };
-use crate::{Context, output, package::local::Local};
+use crate::{Context, package::local::Local};
 
 /// What the machine installed: the package's interface and where the call must go.
 struct Installed {
@@ -33,7 +33,7 @@ struct Installed {
     machine: Option<String>,
 }
 
-pub async fn run(
+pub(super) async fn run(
     ctx: &Context,
     path: &Path,
     function: Option<String>,
@@ -48,9 +48,7 @@ pub async fn run(
     }
     let hub = ctx.hub()?;
     let on = args.placement.on();
-    // This computer's machine reads the files in place; any other is sent them.
-    let in_place = on == On::Machine("local".into());
-    let local = crate::package::local::source(ctx, path, in_place).await?;
+    let local = crate::package::local::source(ctx, path, &on).await?;
     // A warm set names the machine's installation, which only an install answers.
     let installed = match kept(&ctx.home, &local).filter(|_| args.warm.is_none()) {
         Some(interface) => Installed {
@@ -71,46 +69,27 @@ pub async fn run(
             return Ok(ExitCode::SUCCESS);
         }
     };
-    let callable = super::callable(&local.package, &installed.interface, &function)?;
-    let target = format!("{}/{}", local.package, callable.name);
     if args.describe {
-        anstream::print!(
-            "{}",
-            describe::contract(&target, &installed.interface, callable)
-        );
+        let callable = super::callable(&local.package, &installed.interface, &function)?;
+        let target = format!("{}/{}", local.package, callable.name);
+        let contract = describe::contract(&target, &installed.interface, callable);
+        anstream::print!("{contract}");
         return Ok(ExitCode::SUCCESS);
     }
-    let terms = super::terms(ctx, &args)?;
-    let bound = super::bind::bind(&target, None, callable, &terms)?;
-    if let Some(warning) = bound.warning(&target) {
-        output::warn(&warning);
-    }
-    let call = spec::Call {
+    let code = super::Code {
         package: &local.package,
+        interface: &installed.interface,
+        release: None,
         source: spec::Source::Local {
             source: &local.source,
             installation: installed.installation.as_deref(),
         },
-        callable,
-        gpus: args.gpus.unwrap_or(0),
-        bits: super::bits(&args),
-        attention_kernel: args.attention_kernel.as_deref().unwrap_or_default(),
+        files: &local.inputs,
     };
     // The call goes where the code was installed, with its files once more: a machine that
     // dropped them meanwhile is sent only what it lacks, and installs them in the call.
     let on = installed.machine.map_or(on, On::Machine);
-    let spec = match args.warm {
-        Some(level) => call.warm(level, &bound.models)?,
-        None => call.spec(&bound)?,
-    };
-    if args.warm.is_none() {
-        super::gpuless(ctx, &on, &installed.interface, callable, &target, call.bits).await;
-    }
-    let bound = args.warm.is_none().then_some(&bound);
-    let out = args.out.as_ref().map(|dir| terms.cwd.join(dir));
-    let mut submission = call.submission(on, &hub.origin, &spec, bound, out);
-    submission.inputs.extend(local.inputs.iter().cloned());
-    let run = super::send(ctx, submission, &terms.key, args.detach).await?;
+    let run = super::call_code(ctx, code, &function, on, args).await?;
     Ok(super::exit_code(&run))
 }
 
@@ -119,7 +98,17 @@ pub async fn run(
 /// when the environment's inputs (metadata, lock, path dependencies) are new here, else a sync of
 /// the changed source.
 async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Installed, Error> {
-    let target = match synced(&ctx.home, local) {
+    let submitted = submit(ctx, install_run(&ctx.home, hub, on, local), None).await?;
+    let run = settle(ctx, submitted.run).await?;
+    let result = run.result.clone().unwrap_or_default();
+    let installed = installed(run)?;
+    keep(&ctx.home, local, &result["interface"]);
+    Ok(installed)
+}
+
+/// The run that installs local code `on` a machine: a WARM run naming no function.
+pub(crate) fn install_run(home: &Home, hub: &str, on: On, local: &Local) -> SubmitRun {
+    let target = match synced(home, local) {
         true => format!("sync {} (source changed)", local.package),
         false => format!("install {}", local.package),
     };
@@ -128,7 +117,7 @@ async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Inst
         source: Some(v1::Source::Local(local.source.clone())),
         ..Default::default()
     };
-    let submission = SubmitRun {
+    SubmitRun {
         agreed: None,
         on,
         hub: hub.to_owned(),
@@ -138,13 +127,7 @@ async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Inst
         inputs: local.inputs.clone(),
         out: None,
         warnings: vec![],
-    };
-    let submitted = submit(ctx, submission, None).await?;
-    let run = settle(ctx, submitted.run).await?;
-    let result = run.result.clone().unwrap_or_default();
-    let installed = installed(run)?;
-    keep(&ctx.home, local, &result["interface"]);
-    Ok(installed)
+    }
 }
 
 /// Where local code's interfaces are kept, beside release cards: one file per source manifest,
@@ -285,6 +268,7 @@ mod tests {
         failed.reason = Some(Reason {
             code: "uv_failed".into(),
             message: "no solution".into(),
+            ..Default::default()
         });
         let error = installed(failed).err().unwrap();
         assert_eq!(
