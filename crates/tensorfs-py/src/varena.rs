@@ -567,10 +567,11 @@ impl PyRequest {
         done(py, &self.gpu, || r.parked(nbytes))
     }
 
-    /// The cut level of `set`'s current pass for op site `site` (0: whole).
-    fn cut(&self, py: Python<'_>, set: u32, site: &str) -> PyResult<u32> {
+    /// The cut level of `set`'s current pass for op site `site` (0: whole); with no set (outside
+    /// any pass) the request's own memo of that site.
+    fn cut(&self, py: Python<'_>, set: Option<u32>, site: &str) -> PyResult<u32> {
         let r = self.get(py)?;
-        detached(py, &self.gpu, || Ok(r.cut(SetId(set), site)))
+        detached(py, &self.gpu, || Ok(r.cut(set.map(SetId), site)))
     }
 
     /// The request waits on a child call: until the guard ends it gives back its reserved room

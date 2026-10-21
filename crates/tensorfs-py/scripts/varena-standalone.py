@@ -258,7 +258,8 @@ def opened(table: str, capacity: int) -> Memory:
 
 
 def child(store: str, table: str, capacity: int, reference: str) -> int:
-    """The second process: its request needs the room the idle first one holds."""
+    """The second process: two passes, so a block it ran has a declared later use (D), which
+    varena keeps over another process's idle pages (N): the idle first gives room."""
     _, ck = build(Path(store))
     mem = opened(table, capacity)
     stats, _ = run(mem, loaded(ck, mem), torch.load(reference), "child", SAME)
@@ -301,6 +302,9 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     foreign bytes) and the memory."""
     expected = [forward(plain, torch.device("cpu"), n) for n in range(2)]
     mem = Memory.open(0) if CUDA else opened(f"{tag}-ample", 1 << 31)
+    again = Memory.open(0) if CUDA else opened(f"{tag}-ample", 1 << 31)
+    check("one Memory per device: opening it again returns it", again is mem, again)
+    del again
     unet = loaded(ck, mem)
     stats, reference = run(mem, unet, expected, "ample", ACROSS if CUDA else SAME)
     model = mem.models[unet]
@@ -329,7 +333,9 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     check("entries: each entry is its own pass key", keys == ["conv_in", ""], keys)
     steps = r.stats().steps
     with mem.request("between") as between:
-        answer = between.oom(None, None)  # package code between passes: no pass to cut
+        level = between.cut("split")  # package code between passes: the request's memo answers
+        answer = between.oom(None, None)  # and an OOM there has no pass to cut
+    check("between passes: a cut is answered from the request's memo", level == 0, level)
     check("between passes: an OOM is answered, never refused", isinstance(answer, native.Next), answer)
     # The capacity varena ran a step against is the card less contexts (grown by now: cuDNN,
     # cuBLAS) and foreign bytes; the limits later are that much plus what they mean to hold.
@@ -352,7 +358,7 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
 def two(ck: tensorfs.Checkpoint, store: Path, table: str, capacity: int, reference: list[torch.Tensor]) -> weakref.ref[Memory]:
     """Two processes on one table, the idle first making room for the second."""
     saved = store.parent / "reference.pt"
-    torch.save(reference[:1], saved)
+    torch.save(reference, saved)  # the child runs two passes: its run blocks have a declared later use
     mem = opened(table, capacity)
     unet = loaded(ck, mem)
     run(mem, unet, reference[:1], "first", SAME)
