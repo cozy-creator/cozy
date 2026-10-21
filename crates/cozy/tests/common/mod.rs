@@ -21,8 +21,8 @@ use std::{
 
 pub struct Home {
     dir: tempfile::TempDir,
-    /// The `cozy` it runs: this build's or COZY_TEST_BINARY, unless a test chose another
-    /// (`use_binary`).
+    /// The `cozy` it runs: this build's or COZY_TEST_BINARY, installed in the home as the
+    /// installer puts it, unless a test chose another (`use_binary`).
     binary: std::cell::RefCell<PathBuf>,
     /// The signed-in account's bearer token (`sign_in`).
     token: std::cell::RefCell<String>,
@@ -67,9 +67,16 @@ impl Home {
         // COZY_TEST_BINARY: a release's own `cozy` (owner-day.yml, called by release.yml).
         let binary = std::env::var_os("COZY_TEST_BINARY")
             .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_cozy")), PathBuf::from);
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let installed = platform::paths::Home::under(dir.path()).binary();
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        // A link where it can be: the build is large. Nothing writes the file in place.
+        std::fs::hard_link(&binary, &installed)
+            .or_else(|_| std::fs::copy(&binary, &installed).map(drop))
+            .unwrap();
         Some(Self {
-            dir: tempfile::tempdir().expect("a temp dir"),
-            binary: binary.into(),
+            dir,
+            binary: installed.into(),
             token: std::cell::RefCell::default(),
         })
     }
@@ -211,6 +218,11 @@ impl Home {
 
     pub fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// The home's installed `cozy`, which Calcifer and the machine run.
+    pub fn installed(&self) -> PathBuf {
+        platform::paths::Home::at(self.root()).binary()
     }
 
     /// Runs `binary` (another release's `cozy`) from now on.

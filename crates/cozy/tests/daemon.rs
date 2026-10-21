@@ -68,6 +68,36 @@ fn calcifer_starts_on_demand_and_down_stops_it() {
     assert_ne!(calcifer(&home, "up")["pid"], up["pid"]);
 }
 
+/// Calcifer runs the home's installed `cozy`, whichever `cozy` finds it down: another (a build, a
+/// copy elsewhere) has the installed one start it, so a stray build never becomes Calcifer or
+/// writes its service. With none installed, nothing starts and the refusal names the installer.
+#[cfg(target_os = "linux")]
+#[test]
+fn another_cozy_starts_the_installed_one() {
+    let Some(home) = Home::new() else { return };
+    let installed = home.installed();
+    let stray = home.path().join("outputs/cozy");
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::copy(&installed, &stray).unwrap();
+    home.use_binary(&stray);
+    let up = calcifer(&home, "up");
+    let runs = std::fs::read_link(format!("/proc/{}/exe", up["pid"])).unwrap();
+    assert_eq!(runs, installed.canonicalize().unwrap(), "{up}");
+    assert_eq!(home.json(["down", "--json"])["changed"], true);
+
+    std::fs::remove_file(&installed).unwrap();
+    let out = home.cozy(["up", "--json"]);
+    let refusal = out.refusal();
+    assert_eq!(
+        (out.code, refusal["code"].as_str()),
+        (1, Some("cozy_not_installed")),
+        "{out:?}"
+    );
+    let next = refusal["next"][0].as_str().unwrap();
+    assert!(next.contains("install.sh"), "{refusal}");
+    assert_eq!(calcifer(&home, "status")["running"], false);
+}
+
 /// Without systemctl, `cozy up` starts Calcifer detached and says once that no login will start
 /// it; an `up` that finds it running says nothing of it.
 #[cfg(target_os = "linux")]

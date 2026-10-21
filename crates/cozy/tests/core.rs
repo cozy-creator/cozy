@@ -31,7 +31,7 @@ fn hub_contexts_select_the_current_hub() {
     assert_eq!(fresh.len(), 1);
     assert_eq!(fresh[0]["url"], "https://tensorhub.com");
     assert_eq!(current(&fresh), ["tensorhub"]);
-    assert!(!home.root().exists(), "a read created the home");
+    assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1, "a read created the home");
 
     home.json(["hub", "add", "Local", "http://127.0.0.1:1/", "--json"]);
     home.json([
@@ -187,7 +187,7 @@ fn completion_answers_from_the_grammar_and_the_hubs() {
     };
     let verbs = complete(&["cozy", "hu"]);
     assert!(verbs.lines().any(|l| l.starts_with("hub")), "{verbs}");
-    assert!(!home.root().exists(), "completion created the home");
+    assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1, "completion created the home");
     home.json(["hub", "add", "local", "http://127.0.0.1:1", "--json"]);
     let before = home.config();
     let names = complete(&["cozy", "hub", "use", "lo"]);

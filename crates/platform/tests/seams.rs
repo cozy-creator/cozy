@@ -626,6 +626,7 @@ fn a_user_service_starts_and_stops() {
         ],
         log: Some(odd.join("service.log")),
     };
+    services.ensure(&spec).unwrap();
     services.start(&spec).unwrap();
     let running = started(&file, None);
     services.start(&spec).unwrap();
@@ -684,6 +685,7 @@ fn a_service_that_exited_starts_again_at_once() {
         ],
         log: Some(dir.join("service.log")),
     };
+    services.ensure(&spec).unwrap();
     // Asked again until it runs, as the CLI starts Calcifer.
     let ran = || {
         let asked = std::time::Instant::now();

@@ -172,7 +172,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     keep_previous(&binary).map_err(|e| local("keep the binary it replaces", e))?;
     self_replace::self_replace(&new).map_err(|e| local("replace this binary", e))?;
 
-    let calcifer = match crate::daemon::restart(ctx, &binary).await {
+    let calcifer = match crate::daemon::restart(ctx).await {
         Ok(true) => Step::Restarted,
         Ok(false) => Step::NotRunning,
         Err(e) if e.code == "not_ported" => Step::NotPorted,

@@ -45,13 +45,15 @@ fn uninstall_removes_what_cozy_made_and_keeps_the_model_store_unless_all() {
     let Some(home) = Home::new() else { return };
     let user = home.path();
     let bin = home.root().join("bin");
-    let installed = bin.join(platform::paths::exe("cozy"));
+    let installed = home.installed();
     let install = || {
         let built = std::env::var_os("COZY_TEST_BINARY").map_or_else(
             || env!("CARGO_BIN_EXE_cozy").into(),
             std::path::PathBuf::from,
         );
         fs::create_dir_all(&bin).unwrap();
+        // The harness's may be a link to the build, which a copy onto it would overwrite.
+        let _ = fs::remove_file(&installed);
         fs::copy(built, &installed).unwrap();
         write(
             &user.join(".config/cozy/env.sh"),
@@ -59,7 +61,6 @@ fn uninstall_removes_what_cozy_made_and_keeps_the_model_store_unless_all() {
         );
     };
     install();
-    home.use_binary(&installed);
     let mine = "alias ll='ls -l'\n";
     write(
         &user.join(".bashrc"),
