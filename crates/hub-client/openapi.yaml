@@ -1269,6 +1269,23 @@ paths:
         4XX: {$ref: '#/components/responses/Error'}
         5XX: {$ref: '#/components/responses/Error'}
 
+  /v1/worker/rental/stalled:
+    post:
+      operationId: report_worker_install_stalled
+      tags: [machine]
+      summary: A ready machine's package install made no progress; its offer is marked suspect.
+      security: [{worker: []}]
+      parameters:
+      - {name: X-Cozy-Worker-ID, in: header, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/WorkerReleaseRequest'}}
+      responses:
+        '204': {description: The offer is marked.}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
 components:
   securitySchemes:
     bearer:

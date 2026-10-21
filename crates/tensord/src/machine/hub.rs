@@ -133,6 +133,18 @@ impl Hub {
         }
     }
 
+    /// Tells the Hub a preparation here made no progress, so it marks the offer this rental was
+    /// bought on suspect; acceptance is its 204.
+    pub async fn report_stalled(&self) -> Result<(), Refusal> {
+        let request = types::WorkerReleaseRequest {
+            worker_id: self.grant.worker_id.clone(),
+        };
+        let answer = self
+            .call(self.client.report_worker_install_stalled(&self.grant.worker_id, &request))
+            .await;
+        self.heard(answer.map(drop))
+    }
+
     /// Ends this rental's allocation; acceptance is the Hub's 204.
     pub async fn release(&self) -> Result<(), Refusal> {
         let request = types::WorkerReleaseRequest {
