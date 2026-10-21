@@ -1152,14 +1152,17 @@ fn watch<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, budget: std::time:
     }
 }
 
-/// While a forward runs on the card (a kernel on a stream that reads a set's pages), another
-/// set's pages are bound (each evicting idle pages), released and unloaded. None of those driver
-/// calls may wait for the forward: the binder's wall time stays below the forward's, against the
-/// same sequence timed with the card idle.
+/// While a forward runs on the card (a kernel on a stream that reads a set's pages), the bind and
+/// pass paths run on the host: binds that evict idle pages, releases, a pass start, the torch cap,
+/// an unload, and the backend's own calls (free, process bytes, events). None may wait for the
+/// forward: each one's wall time stays below the forward's, which is ten times the bind sequence
+/// on an idle card (a call that waited would take at least that long). Every time is reported.
 #[test]
 #[ignore = "native GPU: a rental only"]
-fn vmm_calls_do_not_wait_for_a_running_forward() {
+fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     let (b, g, uuid) = card("forward");
+    step!();
+    let probe = CudaBackend::open(0).unwrap();
     step!();
     let _ledger = Ledger::create(&g, None).unwrap();
     let mem = memory(b, &g);
@@ -1171,12 +1174,14 @@ fn vmm_calls_do_not_wait_for_a_running_forward() {
     step!();
     let (b1, b2) = (mem.load(bulk("b1", pages, &g.uuid), Level::Ram).unwrap(), mem.load(bulk("b2", pages, &g.uuid), Level::Ram).unwrap());
     step!();
+    let c = mem.load(set("c", 1, Fill::Stored, &g.uuid, |b| block(21, b)), Level::Ram).unwrap();
+    step!();
     let _crowd = crowd();
     mem.load(bulk("idle", more_than_free(), &g.uuid), Level::Gpu).unwrap();
     step!();
-    let r = mem.request("r", plan(&[&["a", "b1", "b2"]])).unwrap();
+    let r = mem.request("r", plan(&[&["a", "b1", "b2", "c"]])).unwrap();
     step!();
-    let passes: Vec<Pass> = [a, b1, b2].iter().map(|s| r.pass(*s, "main", "1", Torch::default()).unwrap()).collect();
+    let mut passes: Vec<Pass> = [a, b1, b2].iter().map(|s| r.pass(*s, "main", "1", Torch::default()).unwrap()).collect();
     step!();
     let sequence = |set: SetId| {
         let start = std::time::Instant::now();
@@ -1187,11 +1192,11 @@ fn vmm_calls_do_not_wait_for_a_running_forward() {
     step!();
     let idle = sequence(b1);
     step!();
-    // A forward ten times as long as that sequence: a binder that waited for it would take at
-    // least that long.
     let forward = idle * 10;
     step!();
     let stream = cuda::Stream::new(0).unwrap();
+    step!();
+    let other = cuda::Stream::new(0).unwrap();
     step!();
     let pins: Vec<Pin> = (0..4).map(|b| mem.bind(a, b, stream.raw()).unwrap()).collect();
     step!();
@@ -1201,14 +1206,40 @@ fn vmm_calls_do_not_wait_for_a_running_forward() {
     step!();
     drop(pins);
     step!();
-    let start = std::time::Instant::now();
+    let mut times: Vec<(&str, std::time::Duration)> = vec![];
     step!();
-    let busy = sequence(b2);
+    let mut time = |what: &'static str, f: &mut dyn FnMut()| {
+        let start = std::time::Instant::now();
+        f();
+        times.push((what, start.elapsed()));
+    };
     step!();
-    mem.unload(b1);
+    time("binds+evictions", &mut || {
+        sequence(b2);
+    });
     step!();
-    let _ = mem.torch_limit();
-    let binder = start.elapsed();
+    time("pass start", &mut || passes.push(r.pass(c, "main", "1", Torch::default()).unwrap()));
+    step!();
+    time("torch_limit", &mut || {
+        mem.torch_limit();
+    });
+    step!();
+    time("unload", &mut || mem.unload(b1));
+    step!();
+    time("free", &mut || {
+        probe.free().unwrap();
+    });
+    step!();
+    time("process_used", &mut || {
+        let _ = probe.process_used();
+    });
+    step!();
+    time("record+query+wait", &mut || {
+        let e = probe.record(stream.raw()).unwrap();
+        assert!(!probe.query(e).unwrap(), "the forward is still running");
+        probe.wait(e, other.raw()).unwrap();
+        probe.retire(e);
+    });
     step!();
     stream.drain().unwrap();
     step!();
@@ -1216,15 +1247,18 @@ fn vmm_calls_do_not_wait_for_a_running_forward() {
     step!();
     assert!(ran >= forward, "the forward ran {ran:?}, asked {forward:?}");
     step!();
-    assert!(binder < forward, "the binder took {binder:?} under a {forward:?} forward: its driver calls waited for it");
+    let report: Vec<String> = times.iter().map(|(w, t)| format!("{w} {t:?}")).collect();
     step!();
+    println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}): {}", report.join(", "));
+    step!();
+    for (what, took) in &times {
+        assert!(*took < forward, "{what} took {took:?} under a {forward:?} forward: it waited for it");
+    }
     drop(passes);
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
-    println!("FORWARD binds+evictions of {pages} pages: {idle:?} with the card idle, {busy:?} (plus an unload: {binder:?}) under a {ran:?} forward");
-    step!();
-    println!("PASS VMM calls do not wait for a running forward {uuid}");
+    println!("PASS the bind and pass paths do not wait for a running forward {uuid}");
     step!();
 }
 
