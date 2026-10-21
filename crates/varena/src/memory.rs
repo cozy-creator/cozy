@@ -49,17 +49,57 @@ pub enum Next {
     Exhausted(Box<Exhausted>),
 }
 
-/// Bytes moved, by where they came from.
+/// Where a bound block's bytes came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Already mapped and filled.
+    Hit,
+    /// A kept page imported by fingerprint: no copy.
+    Kept,
+    Tier,
+    Store,
+}
+
+/// One bind: the page-reference trace the gate computes Belady MIN from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ref {
+    pub step: u32,
+    pub set: String,
+    pub block: u32,
+    pub bytes: u64,
+    pub origin: Origin,
+    /// It was prefetched before this bind.
+    pub speculative: bool,
+}
+
+/// Bytes filled from one source and the time the fills took, summed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fills {
+    pub bytes: u64,
+    pub ns: u64,
+}
+
+/// Bytes moved, by source: fill time over bytes against the measured ceiling gives the %.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Moved {
-    /// Kept pages imported by fingerprint: no copy.
-    pub kept: u64,
-    pub tier: u64,
-    pub store: u64,
-    /// Of the above, filled speculatively.
+    /// Kept pages imported by fingerprint (no copy; `ns` is the import).
+    pub kept: Fills,
+    pub tier: Fills,
+    pub store: Fills,
+    /// Of the above, bytes filled speculatively.
     pub speculative: u64,
-    /// Time the fills took, summed.
-    pub fill_ns: u64,
+}
+
+/// One step of a request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepStats {
+    /// The capacity the step ran against (the device's, less foreign bytes, other rows and
+    /// contexts), measured at its start.
+    pub capacity: u64,
+    /// Its working set: weights plus the largest pass room.
+    pub w: u64,
+    /// Bytes evicted during the step, by class (F, O, S, N, D, W, P).
+    pub evicted: [u64; 7],
 }
 
 /// One request's record (the design's §5 bar).
@@ -67,6 +107,11 @@ pub struct Moved {
 pub struct Stats {
     pub request: String,
     pub moved: Moved,
+    /// One entry per bind.
+    pub trace: Vec<Ref>,
+    pub steps: Vec<StepStats>,
+    /// Device-timed time binding streams waited on fills.
+    pub stall_ns: u64,
     /// Bytes evicted for this request, by class (F, O, S, N, D, W, P).
     pub evicted: [u64; 7],
     /// Of the W evictions, those made after lowering (the only W evictions allowed).

@@ -5,7 +5,6 @@
 //! pages). [`Ledger`] is the GPU's shared table, run by TensorD or opened by name by a
 //! standalone engine; [`custody`] keeps filled pages across a process's death; [`Tier`] is the
 //! machine's RAM tier. TensorFS's `io` moves every byte.
-#![cfg(unix)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 pub mod backend;
@@ -21,7 +20,7 @@ pub mod tier;
 
 pub use backend::{Access, Backend, Event, HostBackend, Physical, Va};
 pub use ledger::{Grant, Ledger, Peak, RowStatus, Status};
-pub use memory::{CacheId, Measured, Memory, Moved, Next, Pass, Pin, Request, SetId, Stats, Torch};
+pub use memory::{CacheId, Fills, Measured, Memory, Moved, Next, Origin, Pass, Pin, Ref, Request, SetId, Stats, StepStats, Torch};
 pub use table::{Fill, Fingerprint, Level, PartId, Plan, SetSpec, Step};
 pub use tier::{Pressure, Tier};
 
@@ -119,6 +118,7 @@ impl From<tensorfs::io::Error> for Error {
     }
 }
 
+#[cfg(unix)]
 impl From<tensorfs::io::source::Error> for Error {
     fn from(e: tensorfs::io::source::Error) -> Error {
         match e {

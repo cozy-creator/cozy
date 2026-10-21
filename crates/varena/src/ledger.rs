@@ -3,15 +3,15 @@
 //! and their answers; measured peaks; TensorD's dispatches. Named per GPU and user, so a
 //! standalone engine opens it without TensorD.
 
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use platform::handles::Owned;
 
 use crate::{Error, GpuId, Result};
 
 /// What TensorD hands an executor for its [`crate::Memory`]: the table and TensorD's eventfd.
 /// Fields are public so a spawner can pass them across exec.
 pub struct Grant {
-    pub table: OwnedFd,
-    pub events: OwnedFd,
+    pub table: Owned,
+    pub events: Owned,
 }
 
 /// One row as [`Ledger::status`] shows it.
@@ -57,7 +57,7 @@ pub struct Peak {
 
 /// TensorD's handle on one GPU's table.
 pub struct Ledger {
-    events: OwnedFd,
+    events: Owned,
 }
 
 impl Ledger {
@@ -118,8 +118,8 @@ impl Ledger {
     }
 
     /// Readable when room frees, a row dies or a peak is recorded; reading it clears it.
-    pub fn events(&self) -> BorrowedFd<'_> {
-        self.events.as_fd()
+    pub fn events(&self) -> &Owned {
+        &self.events
     }
 
     /// A GPU fault or sticky error: the GPU's kept pages go.

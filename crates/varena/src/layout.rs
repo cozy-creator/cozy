@@ -3,8 +3,10 @@
 //! each maps independently; parts start on a 4 KiB boundary so O_DIRECT lands in place and a
 //! region moves in one copy.
 
+#[cfg(feature = "store")]
 use std::collections::{HashMap, HashSet};
 
+#[cfg(feature = "store")]
 use tensorfs::io::Span;
 
 use crate::{Error, Result};
@@ -18,7 +20,19 @@ pub fn align_up(x: u64, a: u64) -> u64 {
     x.div_ceil(a) * a
 }
 
-pub use tensorfs::io::source::{Item, ItemSource};
+pub use tensorfs::io::ItemSource;
+#[cfg(unix)]
+pub use tensorfs::io::source::Item;
+
+/// TensorFS's `source::Item`, which is Unix's so far.
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct Item {
+    pub offset: u64,
+    pub len: u64,
+    pub source: ItemSource,
+    pub part_end: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct Part {
@@ -51,6 +65,7 @@ pub struct Layout {
     pub names: Vec<Vec<String>>,
 }
 
+#[cfg(feature = "store")]
 fn tensor_of(what: &str) -> &str {
     what.rsplit_once('#').map_or(what, |(t, _)| t)
 }
@@ -59,6 +74,7 @@ impl Layout {
     /// `regions[r]` names the tensors ("component/key", every role) or single parts
     /// ("component/key#role") of region `r`. Every part of `spans` belongs to exactly one
     /// region; a region's parts keep their (construction) order.
+    #[cfg(feature = "store")]
     pub fn build(spans: &[Span], regions: &[Vec<String>]) -> Result<Layout> {
         let mut owner: HashMap<&str, u32> = HashMap::new();
         for (r, tensors) in regions.iter().enumerate() {

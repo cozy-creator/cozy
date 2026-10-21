@@ -3,7 +3,7 @@
 //! lock (TensorD when present). Under pressure it gives back staging, then orphaned layouts
 //! (least recently used), then unused layouts, then the furthest declared, never one in flight.
 
-use std::os::fd::OwnedFd;
+use platform::handles::Owned;
 
 use crate::{Error, Result};
 
@@ -12,7 +12,7 @@ pub enum Pressure {
     /// The host's PSI trigger and cgroup events.
     Host(platform::contain::host_pressure::Pressure),
     /// A descriptor that turns readable on pressure (an eventfd).
-    Events(OwnedFd),
+    Events(Owned),
 }
 
 /// The machine's RAM-tier service, served from this process while it lives.

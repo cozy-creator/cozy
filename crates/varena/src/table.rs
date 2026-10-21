@@ -5,7 +5,12 @@
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use tensorfs::io::source::Source;
+#[cfg(unix)]
+pub use tensorfs::io::source::Source;
+
+/// TensorFS's sources are Unix's so far: no set loads on Windows until they exist there.
+#[cfg(windows)]
+pub enum Source {}
 
 use crate::layout::Layout;
 
