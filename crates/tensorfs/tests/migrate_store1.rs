@@ -328,8 +328,8 @@ fn published_orphan_facts_remain_verbatim_and_owner_reachable() {
     fs::write(&path, &bytes).unwrap();
     let upgrade = store1::migrate(&root).unwrap().unwrap();
     assert_eq!(
-        upgrade.report.published_orphans["acme/model"],
-        [manifest.clone()]
+        upgrade.report.published_orphans["acme/model"].as_slice(),
+        std::slice::from_ref(&manifest)
     );
     assert_eq!(fs::read(&path).unwrap(), bytes);
     let store = Store::open(&root).unwrap().with_grace(Duration::ZERO);
