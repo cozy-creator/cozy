@@ -445,16 +445,17 @@ fn checkpoints_differing_only_in_dropped_metadata_share_one_tree() {
 fn a_release_that_is_no_version_is_private_by_ruling_or_refused() {
     let dir = scratch("no-version");
     let manifest = put(&dir, &serde_json::to_vec(&json!({"format": "tensorfs.manifest/1", "files": lane_files(&dir, GPT2_FULL)})).unwrap());
+    let (model, version) = d10::PRIVATE[0];
     let doc = |name: &str| {
-        let tags = json!([{"name": "1.0.0-audit.1", "lanes": {"f32": manifest}, "public": true, "yanked": true}]);
+        let tags = json!([{"name": version, "lanes": {"f32": manifest}, "public": true, "yanked": true}]);
         serde_json::to_vec(&json!({"format": "cozytensors.repo/1", "name": name, "tags": tags})).unwrap()
     };
     let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let read = |o: &ObjectRef| Ok(std::fs::read(dir.join(o.key()))?);
-    let ruled = migrator.repo(&doc(d10::PRIVATE[0].0), &read).unwrap();
+    let ruled = migrator.repo(&doc(model), &read).unwrap();
     let tag = &ruled.repo.tags[0];
-    assert_eq!((tag.name.as_str(), tag.public, tag.yanked), (d10::PRIVATE[0].1, false, true));
-    assert_eq!(ruled.report["made_private"], json!([d10::PRIVATE[0].1]));
+    assert_eq!((tag.name.as_str(), tag.public, tag.yanked), (version, false, true));
+    assert_eq!(ruled.report["made_private"], json!([version]));
     let refused = migrator.repo(&doc("acme/audit"), &read).err().unwrap();
     assert!(refused.detail.contains("PEP 440"), "{}", refused.detail);
     std::fs::remove_dir_all(dir).unwrap();
