@@ -209,6 +209,14 @@ impl From<varena::Stats> for PyStats {
     }
 }
 
+#[pymethods]
+impl PyStats {
+    /// The record as JSON, field for field (what a Runtime relays).
+    fn json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.raw).map_err(|e| VarenaError::new_err(e.to_string()))
+    }
+}
+
 /// What turns a page's stored bytes into its weights (varena's `Fill`).
 #[pyclass(name = "Fill", module = "tensorfs.varena", frozen)]
 pub enum PyFill {
@@ -548,6 +556,19 @@ impl PyRequest {
     fn parked(&self, py: Python<'_>, nbytes: u64) -> PyResult<()> {
         let r = self.get(py)?;
         done(py, &self.gpu, || r.parked(nbytes))
+    }
+
+    /// The current pass's collective sites' proposed `(site, level)`: the level in effect, or a
+    /// finer one an OOM proposed.
+    fn levels(&self, py: Python<'_>) -> PyResult<Vec<(String, u32)>> {
+        let r = self.get(py)?;
+        detached(py, &self.gpu, || Ok(r.levels()))
+    }
+
+    /// The levels the ranks agreed (the maximum of their proposals), in effect for the current pass.
+    fn agree(&self, py: Python<'_>, levels: Vec<(String, u32)>) -> PyResult<()> {
+        let r = self.get(py)?;
+        done(py, &self.gpu, || r.agree(levels))
     }
 
     /// The current pass's cut level for op site `site` (0: whole).

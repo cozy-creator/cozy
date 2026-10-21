@@ -489,11 +489,11 @@ class Request:
     def levels(self) -> list[tuple[str, int]]:
         """The current pass's proposed `(site, level)` for its collective cut sites; the group
         agrees them (cozy-runtime's all-reduce) and hands them to `agree` before any exchange."""
-        return _current_pass().native.levels()
+        return self.native.levels()
 
     def agree(self, levels: list[tuple[str, int]]) -> None:
         """The levels every rank uses for the current pass's collective sites."""
-        _current_pass().native.agree(levels)
+        self.native.agree(levels)
 
     @contextmanager
     def site(self, name: str) -> Iterator[None]:
@@ -538,13 +538,6 @@ def _torch(memory: Memory) -> tuple[int, int]:
     if not memory.cuda:
         return 0, 0
     return torch.cuda.memory_allocated(memory.device), torch.cuda.memory_reserved(memory.device)
-
-
-def _current_pass() -> _Pass:
-    p = _pass.get()
-    if p is None:
-        raise Unbound("no pass is open: a model's forward opens one")
-    return p
 
 
 def _fill(fill: Filling | None) -> Fill:

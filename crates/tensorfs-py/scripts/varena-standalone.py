@@ -102,6 +102,7 @@ def run(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel, id
             check(f"{id}: pass {n} equals the plain model", torch.allclose(got, want, atol=1e-5), (got - want).abs().max())
     stats = r.stats()
     check(f"{id}: leaves nothing behind", stats.leftover == 0, stats.leftover)
+    check(f"{id}: its record crosses as JSON", json.loads(stats.json())["request"] == id, stats.json())
     return stats
 
 

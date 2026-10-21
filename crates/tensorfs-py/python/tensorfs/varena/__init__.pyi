@@ -184,6 +184,13 @@ class Request:
     def parked(self, nbytes: int) -> None:
         """The bytes a `Park` answer moved to the host (0: none, and the next `oom` is Exhausted)."""
 
+    def levels(self) -> list[tuple[str, int]]:
+        """The current pass's collective sites' proposed `(site, level)`: the level in effect, or
+        a finer one an OOM proposed."""
+
+    def agree(self, levels: list[tuple[str, int]]) -> None:
+        """The levels the ranks agreed (the maximum of their proposals), for the current pass."""
+
     def cut(self, site: str) -> int:
         """The current pass's cut level for `site` (0: whole)."""
 
@@ -316,3 +323,5 @@ class Stats:
     def peak(self) -> int: ...
     @property
     def leftover(self) -> int: ...
+    def json(self) -> str:
+        """The record as JSON, field for field (what a Runtime relays)."""
