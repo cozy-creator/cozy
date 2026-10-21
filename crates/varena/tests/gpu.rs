@@ -690,11 +690,11 @@ fn exact(pin: &Pin, want: &[u8], stream: usize) -> bool {
 
 /// An activation of `len` bytes taken as torch takes one: on each real OOM, `r.oom` answers. The
 /// design bounds the answers: pages + cut levels + 2. Returns them.
-fn activation(r: &Request, p: &mut Pressure, len: u64, pages: u32) -> Vec<String> {
+fn activation(r: &Request, set: SetId, p: &mut Pressure, len: u64, pages: u32) -> Vec<String> {
     let mut answers = vec![];
     while let Err(code) = p.try_take(len) {
         assert_eq!(code, cuda::ERROR_OUT_OF_MEMORY);
-        let next = r.oom(Some(len), None, p.torch());
+        let next = r.oom(set, Some(len), None, p.torch());
         answers.push(format!("{next:?}").split('(').next().unwrap_or_default().to_string());
         assert!(matches!(next, Next::Retry), "idle pages answer Retry: {answers:?}");
         assert!(answers.len() <= pages as usize + 2, "the OOM ladder must end: {answers:?}");
@@ -773,7 +773,7 @@ fn first_run(mem: &Memory, m: SetId, idle: u32) -> (Vec<String>, Stats) {
     let pass = r.pass(m, "1x8", Torch::default()).unwrap();
     let pins: Vec<Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
     let mut p = Pressure::none();
-    let answers = activation(&r, &mut p, ROOM / 2, idle);
+    let answers = activation(&r, m, &mut p, ROOM / 2, idle);
     for (b, pin) in pins.iter().enumerate() {
         assert!(exact(pin, &block(3, b as u32), 0), "pins outlive the OOM");
     }
