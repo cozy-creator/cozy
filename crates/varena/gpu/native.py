@@ -18,7 +18,9 @@ stuck: a step's line can land just after one look, so only a second quiet look s
 quiet step. It is then killed and fails as stalled. A case with no earlier run is never killed:
 it runs unjudged. Each start
 and verdict goes to the run log as it happens; a cancel kills the running case and returns the
-logs so far. The outputs hold every case's log and result.json; the caller judges from it.
+logs so far. A case that fails also puts its log's tail in the run log, which reaches the caller
+even when a cancelled run's outputs do not. The outputs hold every case's log and result.json;
+the caller judges from it.
 """
 from pathlib import Path
 import json
@@ -148,6 +150,9 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
         gpus.update(named if ok else [])
         verdict = "PASS" if ok else (end or "FAIL").upper()
         ctx.log(f"{verdict} {case} in {took[case]} s, longest step {longest[case]} s", level="warn" if ok else "error")
+        if not ok:
+            # The run log reaches the caller even when a cancelled run's outputs do not.
+            ctx.log(f"TAIL {case}:\n" + "\n".join(text.splitlines()[-40:]), level="error")
     monitor.close()
     result = {"label": label, "cases": cases, "passed": passed, "failed": failed, "ended": ended, "unjudged": unjudged,
               "seconds": took, "steps": {c: s for c, s in longest.items() if s}, "gpus": sorted(gpus),
