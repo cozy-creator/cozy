@@ -697,7 +697,7 @@ impl Pool {
         let peaks = memory::Peaks::at(root.join("peaks"));
         let devices: Vec<Device> = envelope.iter().map(|entry| Device {
             entry: entry.clone(),
-            memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, &peaks, &notes),
+            memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, &peaks, &notes),
         }).collect();
         let tier = memory::HostTier::serve(config.host.mode);
         let launcher = crate::child_launcher::ChildLauncher::new()?;
