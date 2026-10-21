@@ -16,6 +16,7 @@ pub mod layout;
 pub mod ledger;
 pub mod memory;
 mod os;
+mod outbox;
 pub mod table;
 pub mod tier;
 
