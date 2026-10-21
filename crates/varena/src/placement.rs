@@ -2752,13 +2752,13 @@ mod gpu_tests {
             .unwrap();
         assert_eq!(inner.requests[&9].steps, steps);
         assert!(inner.table.pages.iter().all(|page| page.uses.is_empty()));
-        let facts = &mut inner.table.requests[0];
-        facts.position = Position { step: 1, order: 37 };
-        facts.model_positions.insert(2, 42);
         Placement::declare_locked(&mut inner, 9, steps, BTreeSet::from([1]), true).unwrap();
-        let facts = &inner.table.requests[0];
-        assert_eq!(facts.position, Position { step: 1, order: 37 });
-        assert_eq!(facts.model_positions[&2], 42);
+        assert_eq!(
+            inner.table.requests[0].position,
+            Position { step: 0, order: 0 }
+        );
+        inner.table.requests[0].entered(1, 2);
+        assert_eq!(inner.table.requests[0].position.step, 1);
         assert!(inner.table.pages[0].uses.is_empty());
         assert_eq!(inner.table.pages[1].uses[0].position.step, 1);
     }
@@ -2772,7 +2772,19 @@ mod gpu_tests {
         assert_eq!(inner.requests[&9].steps, [vec![1, 2]]);
         assert_eq!(inner.table.pages[0].uses.len(), 2);
         assert!(inner.table.pages[1].uses.is_empty());
-        inner.table.requests[0].model_positions.insert(1, 1);
+        for page in &mut inner.table.pages {
+            page.tier = Tier::Disk;
+        }
+        inner.table.requests[0].working_sets[0] = Some(0);
+        let actions = plan::decide(&inner.table, Trigger::StepStart(9));
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, Action::Fill { page: 1, .. })));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::Fill { page: 2, .. })));
+        inner.table.pages[0].tier = Tier::Gpu;
+        inner.table.bound(9, 1);
         Placement::declare_locked(&mut inner, 9, steps, BTreeSet::new(), true).unwrap();
         let facts = &inner.table.requests[0];
         assert_eq!(facts.model_positions[&1], 1);
