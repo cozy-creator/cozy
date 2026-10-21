@@ -109,7 +109,7 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 - Each GPU's ledger (`Ledger::create`, capacity min(card, `gpu_memory_limit`)) is granted to an
   executor at its spawn and reaps its rows once its exit is proven. One thread blocks on every
   ledger's events (room freed, a row died, a peak recorded), with no timeout: each wake has the
-  engine's dispatch ask `fits` again (`notify_activity`), ends the rows `status` names stalled,
+  engine's dispatch ask `fits` again (`notify_activity`), ends the rows the ledger names stalled,
   and saves changed peaks to `<pool>/peaks/<GPU model>.json`, restored when a ledger is created.
   A device fault (an unsettled call) drops the GPU's kept pages (`Ledger::fault`). The machine's
   RAM tier is served from TensorD on the host's pressure trigger (`varena::Tier`): TensorD keeps
