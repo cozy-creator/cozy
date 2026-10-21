@@ -774,7 +774,8 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
     let layout = Layout { parts: vec![], regions: vec![Region { offset: 0, nbytes: span, span, items }], nbytes: span, digest: format!("huge-{}", g.uuid), names: vec![] };
     let fingerprint = Fingerprint::new(&layout, &[], Fill::Stored, "release-1", "0/1", &g.uuid);
     let source = Arc::new(Source::files(vec![], false, 0));
-    let huge = mem.load(SetSpec { name: "huge".into(), layout: Arc::new(layout), source, fingerprint }, Level::Ram).unwrap();
+    // To the GPU: it maps only into free bytes, so the page is never filled (the RAM tier would be).
+    let huge = mem.load(SetSpec { name: "huge".into(), layout: Arc::new(layout), source, fingerprint }, Level::Gpu).unwrap();
     io::metrics::take();
     let r = mem.request("r", plan(&[&["huge"]])).unwrap();
     let pass = r.pass(huge, "1", Torch::default());
