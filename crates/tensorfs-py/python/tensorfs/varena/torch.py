@@ -74,7 +74,8 @@ class Filling(Protocol):
     """A transform of a fresh block's bytes (a LoRA bake), writing in place. `identity` covers
     what it writes (LoRA digests, scales, recipe, torch/GPU arch); None: never kept."""
 
-    identity: str | None
+    @property
+    def identity(self) -> str | None: ...
 
     def __call__(self, block: str, parts: Mapping[str, Mapping[str, Tensor]], /) -> None: ...
 
