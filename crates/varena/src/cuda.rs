@@ -62,7 +62,6 @@ pub struct CudaBackend {
     prop: AllocationProp,
     granularity: u64,
     capacity: u64,
-    context: u64,
     nvml: Option<platform::gpu::Device>,
     /// The device's used bytes just before `open` made the context.
     before: Option<u64>,
@@ -74,10 +73,8 @@ unsafe impl Send for CudaBackend {}
 unsafe impl Sync for CudaBackend {}
 
 impl CudaBackend {
-    /// Device `ordinal` as CUDA enumerates it (after `CUDA_VISIBLE_DEVICES`). Its context is
-    /// measured as the device's used bytes across this call, so open the backend before a
-    /// framework initializes CUDA: a context that already exists measures 0, and its bytes count
-    /// as foreign (still off capacity).
+    /// Device `ordinal` as CUDA enumerates it (after `CUDA_VISIBLE_DEVICES`), on its primary
+    /// context, retained while the backend lives.
     pub fn open(ordinal: i32) -> Result<CudaBackend> {
         let mut device: CUdevice = 0;
         call!("cuDeviceGet", device_get(&mut device, ordinal))?;
@@ -87,13 +84,12 @@ impl CudaBackend {
             }
         }
         let nvml = platform::gpu::Device::open(&cuda::uuid(device)?)
-            .inspect_err(|e| tracing::warn!(target: "varena", "NVML: {e}: no context or process bytes measured"))
+            .inspect_err(|e| tracing::warn!(target: "varena", "NVML: {e}: no process bytes measured"))
             .ok();
         let before = used(nvml.as_ref());
         let (_, ctx) = cuda::primary_context(ordinal)?;
         let primary = Primary { device, ctx: ctx as usize };
         let stream = cuda::Stream::new(ordinal)?;
-        let context = used(nvml.as_ref()).zip(before).map_or(0, |(after, before)| after.saturating_sub(before));
         let prop = AllocationProp::device(device, HANDLES);
         let _ctx = primary.enter()?;
         let mut granularity = 0usize;
@@ -101,21 +97,7 @@ impl CudaBackend {
         let (mut free, mut total) = (0usize, 0usize);
         call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
         drop(_ctx);
-        Ok(CudaBackend { ordinal, stream, primary, prop, granularity: granularity as u64, capacity: total as u64, context, nvml, before })
-    }
-
-    /// This process's device bytes: NVML's figure for its pid. Where the driver names no process
-    /// of ours (WDDM has no per-process numbers; a container's pids are not the driver's), the
-    /// device's used bytes since just before `open`, which also moves with other processes.
-    pub fn process_used(&self) -> Result<u64> {
-        let (Some(nvml), Some(before)) = (&self.nvml, self.before) else {
-            return Err(Error::Io("NVML is unavailable: no process bytes".into()));
-        };
-        let reading = nvml.read()?;
-        Ok(match reading.processes.as_ref().and_then(|p| p.get(&std::process::id())) {
-            Some(&bytes) => bytes,
-            None => reading.total.saturating_sub(reading.free).saturating_sub(before),
-        })
+        Ok(CudaBackend { ordinal, stream, primary, prop, granularity: granularity as u64, capacity: total as u64, nvml, before })
     }
 
     pub fn ordinal(&self) -> i32 {
@@ -182,8 +164,18 @@ impl Backend for CudaBackend {
         Ok(free as u64)
     }
 
-    fn context(&self) -> u64 {
-        self.context
+    /// NVML's figure for this pid. Where the driver names no process of ours (WDDM has no
+    /// per-process numbers; a container's pids are the host's), the device's used bytes since
+    /// just before `open` made the context, which also move with other processes.
+    fn process_used(&self) -> Result<u64> {
+        let (Some(nvml), Some(before)) = (&self.nvml, self.before) else {
+            return Err(Error::Io("NVML is unavailable: no process bytes".into()));
+        };
+        let reading = nvml.read()?;
+        Ok(match reading.processes.as_ref().and_then(|p| p.get(&std::process::id())) {
+            Some(&bytes) => bytes,
+            None => reading.total.saturating_sub(reading.free).saturating_sub(before),
+        })
     }
 
     fn granularity(&self) -> u64 {
