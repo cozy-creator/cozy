@@ -136,9 +136,34 @@ printf '%s\n' '# /// script' '# requires-python = ">=3.12"' '# dependencies = ["
 rec "0.10.1 run with an output" 900 "$cozy" run ./small.py
 rec "0.10.1 failed run" 300 "$cozy" run fidika/sdxl/generate prompt=x seed=1
 rec "0.10.1 run list" 60 "$cozy" run list
+# Real bytes in the 0.10.1 store (~550 MB), so a store kept beside its successor shows.
+rec "0.10.1 model download --help" 30 "$cozy" model download --help
+rec "0.10.1 model download" 900 "$cozy" model download hf://openai-community/gpt2
+# The home's TensorFS stores (a `format` record naming tensorfs.store/N) with their sizes, and the
+# home's total. After the update the 0.10.x store must be gone (removed at the update's commit, the
+# space it freed logged), and the home must not double (owner, 10-21).
+cat > stores.sh <<'SH'
+stores=0
+for f in $(find "$HOME/.cozy" -name format -type f 2>/dev/null); do
+  grep -q 'tensorfs.store/' "$f" || continue
+  size=$(du -sk "$(dirname "$f")" | cut -f1); stores=$((stores + size))
+  echo "$(dirname "$f") $(cat "$f") $size KiB"
+done
+echo "stores $stores KiB, home $(du -sk "$HOME/.cozy" | cut -f1) KiB"
+if [ "${1:-}" = after ] && [ -s stores-before ]; then
+  before=$(cat stores-before)
+  echo "stores before the update $before KiB, after $stores KiB: $([ "$stores" -lt $((before * 2)) ] && echo 'not doubled' || echo 'DOUBLED')"
+  grep -qs 'tensorfs.store/2' $(find "$HOME/.cozy" -name format -type f 2>/dev/null) /dev/null && echo 'OLD STORE REMAINS' || echo 'no tensorfs.store/2 left'
+else
+  echo "$stores" > stores-before
+fi
+SH
+rec "stores before update" 120 bash stores.sh before
 rec "update" 600 "$cozy" update
 rec "new version" 30 "$cozy" --version
 rec "status after update" 120 "$cozy" status
+rec "stores after update" 120 bash stores.sh after
+rec "old store removal logged" 60 sh -c "grep -rIi -e reclaim -e 'tensorfs.store/2' -e 'older TensorFS' \"\$HOME/.cozy\" --include='*.log*' | tail -20; \"$cozy\" machine logs local 2>&1 | grep -i -e reclaim -e 'store/2' | tail -10"
 rec "run list after update" 60 "$cozy" run list
 python=python3; [ $win = 1 ] && python=python
 rec "store after update" 60 $python -I -c '
