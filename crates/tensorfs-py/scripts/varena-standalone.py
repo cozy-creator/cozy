@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from pathlib import Path
 
 import tensorfs
@@ -287,13 +288,18 @@ def attempts(mem: Memory, ck: tensorfs.Checkpoint) -> None:
         check("attempts: a pass records the completed attempt's peak, not the failed one's", last is not None and retried <= last[1] < failed, last)
 
 
-def main() -> int:
-    stub_matches()
-    store = Path(tempfile.mkdtemp(prefix="varena-standalone-")) / "store"
-    plain, ck = build(store)
-    tag = f"varena-standalone-{os.getpid()}"
-    expected = [forward(plain, torch.device("cpu"), n) for n in range(2)]
+def gone(memory: weakref.ref[Memory], phase: str) -> None:
+    """One Memory per device in a process: a phase's goes before the next opens (on a GPU they
+    share the card's table, and each would count the other's pages as its own context)."""
+    gc.collect()
+    check(f"{phase}: its memory is gone before the next phase opens one", memory() is None, gc.get_referrers(memory()) if memory() else "")
 
+
+def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tuple[list[torch.Tensor], list[int], int, int, weakref.ref[Memory]]:
+    """Room for it all: against the plain model, held, entries, identity, concurrency, attempts.
+    Returns the reference outputs, the region spans, the measured room, the base (contexts and
+    foreign bytes) and the memory."""
+    expected = [forward(plain, torch.device("cpu"), n) for n in range(2)]
     mem = Memory.open(0) if CUDA else opened(f"{tag}-ample", 1 << 31)
     unet = loaded(ck, mem)
     stats, reference = run(mem, unet, expected, "ample", ACROSS if CUDA else SAME)
@@ -326,7 +332,7 @@ def main() -> int:
         answer = between.oom(None, None)  # package code between passes: no pass to cut
     check("between passes: an OOM is answered, never refused", isinstance(answer, native.Next), answer)
     # The capacity varena ran a step against is the card less contexts (grown by now: cuDNN,
-    # cuBLAS) and foreign bytes; the limits below are that much plus what they mean to hold.
+    # cuBLAS) and foreign bytes; the limits later are that much plus what they mean to hold.
     base = mem.gpu.memory - min(step.capacity for step in steps)
 
     shed: list[bool] = []
@@ -340,14 +346,11 @@ def main() -> int:
     concurrent(mem, ck)
     attempts(mem, ck)
     spans = model.set.spans
-    room = stats.peak - sum(spans)  # the passes' measured room beside the weights
-    common, blocks = spans[0], sorted(spans[1:])
-    del mem, unet, model
-    gc.collect()
-    ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
+    return reference, spans, stats.peak - sum(spans), base, weakref.ref(mem)
 
-    # Capacities only fall on one GPU's table: the largest first.
-    table, capacity = f"{tag}-two", base * (2 if CUDA else 1) + sum(spans) * 3 // 2 + room  # a GPU child's context is about ours
+
+def two(ck: tensorfs.Checkpoint, store: Path, table: str, capacity: int, reference: list[torch.Tensor]) -> weakref.ref[Memory]:
+    """Two processes on one table, the idle first making room for the second."""
     saved = store.parent / "reference.pt"
     torch.save(reference[:1], saved)
     mem = opened(table, capacity)
@@ -360,20 +363,42 @@ def main() -> int:
     check("two processes: the second completes beside the idle first", done.returncode == 0, done.returncode)
     stats, _ = run(mem, unet, reference[:1], "first again", SAME)
     check("two processes: the first gave room and reads again", any(r.origin != "hit" for r in stats.trace), [r.origin for r in stats.trace])
-    del mem, unet
-    gc.collect()
+    return weakref.ref(mem)
 
-    capacity = base + common + sum(blocks) // 2 + room
-    mem = opened(f"{tag}-short", capacity)
+
+def capped(ck: tensorfs.Checkpoint, table: str, capacity: int, base: int, spans: list[int], reference: list[torch.Tensor], ceiling: tensorfs.Ceiling) -> weakref.ref[Memory]:
+    """Below its size it streams, its outputs the uncapped run's; its fills against the ceiling."""
+    mem = opened(table, capacity)
     stats, _ = run(mem, loaded(ck, mem), reference, "short", SAME)
     check(f"short: below its {sum(spans)} B it streams in {capacity - base} B", sum(stats.evicted) > 0, stats.evicted)
     fills(stats, ceiling)
     print(f"STATS_JSON {stats.json()}", flush=True)
+    return weakref.ref(mem)
 
-    mem = opened(f"{tag}-fill", capacity)
+
+def baked(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, capacity: int) -> weakref.ref[Memory]:
+    """A declared fill while it streams: each fresh page baked once."""
+    mem = opened(table, capacity)
     stats, _ = run(mem, loaded(ck, mem, Scale(2)), scaled(plain, 2), "fill", ACROSS if CUDA else SAME)
     check("fill: each fresh page is filled once", sum(r.origin != "hit" for r in stats.trace) > 0, stats.trace)
+    return weakref.ref(mem)
 
+
+def main() -> int:
+    stub_matches()
+    store = Path(tempfile.mkdtemp(prefix="varena-standalone-")) / "store"
+    plain, ck = build(store)
+    tag = f"varena-standalone-{os.getpid()}"
+    reference, spans, room, base, memory = ample(ck, plain, tag)
+    gone(memory, "ample")
+    ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
+    common, blocks = spans[0], sorted(spans[1:])
+    # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.
+    capacity = base * (2 if CUDA else 1) + sum(spans) * 3 // 2 + room
+    gone(two(ck, store, f"{tag}-two", capacity, reference), "two processes")
+    capacity = base + common + sum(blocks) // 2 + room
+    gone(capped(ck, f"{tag}-short", capacity, base, spans, reference, ceiling), "short")
+    gone(baked(ck, plain, f"{tag}-fill", capacity), "fill")
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
 
