@@ -154,18 +154,30 @@ if [ "${1:-}" = after ] && [ -s stores-before ]; then
   before=$(cat stores-before)
   echo "stores before the update $before KiB, after $stores KiB: $([ "$stores" -lt $((before * 2)) ] && echo 'not doubled' || echo 'DOUBLED')"
   grep -qs 'tensorfs.store/2' $(find "$HOME/.cozy" -name format -type f 2>/dev/null) /dev/null && echo 'OLD STORE REMAINS' || echo 'no tensorfs.store/2 left'
+  aside=$(find "$HOME/.cozy" -path '*/tmp/older-store' 2>/dev/null)
+  [ -n "$aside" ] && echo "ASIDE REMAINS: $aside $(du -sk $aside | cut -f1) KiB" || echo 'no older-store aside left'
 else
   echo "$stores" > stores-before
 fi
 SH
 rec "stores before update" 120 bash stores.sh before
+python=python3; [ $win = 1 ] && python=python
 rec "update" 600 "$cozy" update
 rec "new version" 30 "$cozy" --version
 rec "status after update" 120 "$cozy" status
 rec "stores after update" 120 bash stores.sh after
-rec "old store removal logged" 60 sh -c "grep -rIi -e reclaim -e 'tensorfs.store/2' -e 'older TensorFS' \"\$HOME/.cozy\" --include='*.log*' | tail -20; \"$cozy\" machine logs local 2>&1 | grep -i -e reclaim -e 'store/2' | tail -10"
+# TensorD's WARN lines: set aside at its start, deleted at the update's commit with the GB reclaimed.
+rec "old store set aside and deleted (TensorD log)" 60 sh -c "\"$cozy\" machine logs local -n 0 2>&1 | grep -e 'store from an older TensorFS' -e 'deleted the older-format TensorFS store' -e 'restored the older-format TensorFS store'"
+rec "update run notes" 120 $python -I -c '
+import json, subprocess, sys
+cozy = sys.argv[1]
+ask = lambda *a: json.loads(subprocess.run([cozy, *a, "--json"], capture_output=True, text=True).stdout or "{}")
+for r in ask("run", "list").get("runs", []):
+    if r.get("kind") == "update":
+        shown = ask("run", "show", str(r["number"]))
+        result = shown.get("result") or shown.get("run", {}).get("result") or {}
+        print(r["number"], r.get("status"), json.dumps(result.get("notes")))' "$cozy"
 rec "run list after update" 60 "$cozy" run list
-python=python3; [ $win = 1 ] && python=python
 rec "store after update" 60 $python -I -c '
 import os, sqlite3
 db = sqlite3.connect(os.path.expanduser("~/.cozy/calcifer/state.db"))
