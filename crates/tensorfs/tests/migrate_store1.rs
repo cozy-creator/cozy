@@ -227,7 +227,14 @@ fn local_and_public_roots_preserve_bytes_alias_privacy_and_old_metadata() {
     );
     assert_preserved(&root, &before);
     // A collection can remove old unrooted blob names, but cannot destroy retained legacy bytes.
-    store.gc().unwrap();
+    store.collect(u64::MAX, Duration::ZERO).unwrap();
+    assert!(
+        store.tree(&current).is_ok(),
+        "normal local retention lost a migrated tree"
+    );
+    let retained = store.get_ref("local/store1-recovered").unwrap().unwrap();
+    assert!(retained.tags.iter().all(|t| !t.public));
+    assert_eq!(retained.tag(&old.sha256).unwrap().commit, current);
     assert_preserved(&root, &before);
     drop(upgrade);
     let current_files = snapshot(&root);
@@ -306,6 +313,96 @@ fn invalid_public_version_and_ambiguous_alias_refuse_before_cutover() {
         for (path, bytes) in before {
             assert_eq!(fs::read(root.join(path)).unwrap(), bytes);
         }
+    }
+}
+
+#[test]
+fn published_orphan_facts_remain_verbatim_and_owner_reachable() {
+    let scratch = Scratch::new();
+    let root = scratch.0.join("store");
+    let manifest = corpus(&root);
+    let path = root.join("repos/acme/model.json");
+    let mut original: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    original["releases"] = json!([]);
+    let bytes = serde_json::to_vec(&original).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let upgrade = store1::migrate(&root).unwrap().unwrap();
+    assert_eq!(
+        upgrade.report.published_orphans["acme/model"],
+        [manifest.clone()]
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let store = Store::open(&root).unwrap().with_grace(Duration::ZERO);
+    let repo = store.get_ref("acme/model").unwrap().unwrap();
+    assert!(repo.tags.iter().all(|t| !t.public));
+    store.collect(u64::MAX, Duration::ZERO).unwrap();
+    let retained = store.get_ref("local/store1-recovered").unwrap().unwrap();
+    let tree = &retained.tag(&manifest.sha256).unwrap().commit;
+    assert!(store.tree(tree).is_ok());
+    let client = tensorfs::Client::new(tensorfs::Config {
+        cache_dir: root.clone(),
+        endpoint: "local".into(),
+        ..tensorfs::Config::from_env()
+    })
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(client.open(
+            &format!("local/store1-recovered@{}", manifest.sha256),
+            &tensorfs::Open {
+                local_files_only: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    runtime
+        .block_on(client.open(
+            "local/mine@main",
+            &tensorfs::Open {
+                local_files_only: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+}
+
+#[test]
+fn owner_approved_audit_version_uses_existing_private_a11_rule() {
+    let scratch = Scratch::new();
+    let root = scratch.0.join("store");
+    let manifest = corpus(&root);
+    let path = root.join("repos/fidika/minimax-h3-turbo-lora.json");
+    let bytes = old_repo(&root, "fidika/minimax-h3-turbo-lora", &manifest, false);
+    let mut original: Value = serde_json::from_slice(&bytes).unwrap();
+    original["releases"][0]["version"] = json!("1.0.0-audit.1");
+    let bytes = serde_json::to_vec(&original).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let _upgrade = store1::migrate(&root).unwrap().unwrap();
+    let store = Store::open(&root).unwrap();
+    let repo = store
+        .get_ref("fidika/minimax-h3-turbo-lora")
+        .unwrap()
+        .unwrap();
+    assert!(!repo.tag("1.0.0-audit.1").unwrap().public);
+    assert!(repo.tag("1.0.0").unwrap().public);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn a_user_alias_at_the_retention_name_is_never_overwritten() {
+    let scratch = Scratch::new();
+    let root = scratch.0.join("store");
+    let manifest = corpus(&root);
+    old_repo(&root, "local/store1-recovered", &manifest, true);
+    let before = snapshot(&root);
+    let error = store1::migrate(&root).err().unwrap();
+    assert_eq!(error.kind, Kind::Conflict);
+    assert!(!store1::cutover_started(&root).unwrap());
+    for (path, bytes) in before {
+        assert_eq!(fs::read(root.join(path)).unwrap(), bytes);
     }
 }
 
@@ -588,6 +685,30 @@ fn published_0_10_store_converts_and_old_clients_cannot_recreate_manifests() {
             !root.join("format").exists(),
             "real published0.10 fixture is unstamped"
         );
+        let blob = files(&root.join("blobs"))[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let readable = Command::new(&old)
+            .arg("get")
+            .arg(&root)
+            .arg(&blob)
+            .output()
+            .unwrap();
+        assert!(readable.status.success(), "old CLI baseline read failed");
+        let python = old.parent().unwrap().join("python");
+        for method in ["open", "ensure"] {
+            let opened = Command::new(&python).arg("-c")
+                .arg(format!("import sys,tensorfs; assert tensorfs.__version__ == '0.10.0'; tensorfs.Store.{method}(sys.argv[1])"))
+                .arg(&root).output().unwrap();
+            assert!(
+                opened.status.success(),
+                "old {method} baseline: {}",
+                String::from_utf8_lossy(&opened.stderr)
+            );
+        }
         let before = snapshot(&root);
         let upgrade = store1::migrate(&root).unwrap().unwrap();
         assert_eq!(upgrade.report.checkpoints.len(), 1);
@@ -602,13 +723,13 @@ fn published_0_10_store_converts_and_old_clients_cannot_recreate_manifests() {
             .tags
             .iter()
             .all(|t| !t.public));
-        // Real old Store::open (get), Store::init and ensure-equivalent write must all refuse.
+        // The exact same known-present blob must now fail at Store::open, not data lookup.
         let header = fs::read(&manifests[0]).err();
         assert!(header.is_some(), "old namespace still readable");
         for mut old_command in [
             {
                 let mut c = Command::new(&old);
-                c.arg("get").arg(&root).arg(&manifest.sha256);
+                c.arg("get").arg(&root).arg(&blob);
                 c
             },
             {
@@ -626,6 +747,27 @@ fn published_0_10_store_converts_and_old_clients_cannot_recreate_manifests() {
         ] {
             let output = old_command.output().unwrap();
             assert!(!output.status.success(), "old CLI reopened converted store");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("STORE_ERA"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(root.join("manifests").is_file());
+        }
+        // Exercise all three actual old native constructors, including ensure's creation path.
+        for method in ["open", "init", "ensure"] {
+            let opened = Command::new(&python).arg("-c")
+                .arg(format!("import sys,tensorfs; assert tensorfs.__version__ == '0.10.0'; tensorfs.Store.{method}(sys.argv[1])"))
+                .arg(&root).output().unwrap();
+            assert!(
+                !opened.status.success(),
+                "old {method} recreated the old namespace"
+            );
+            assert!(
+                String::from_utf8_lossy(&opened.stderr).contains("STORE_ERA"),
+                "{}",
+                String::from_utf8_lossy(&opened.stderr)
+            );
             assert!(root.join("manifests").is_file());
         }
         assert_preserved(&root, &before);
