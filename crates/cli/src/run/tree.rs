@@ -42,7 +42,9 @@ pub fn stage(root: &Path, memo: Option<&Path>, manifests: &Path) -> Result<Stage
             .len();
         let digest = super::digests::of(memo, &path)?;
         let sha256 = hex::encode(digest.bytes());
-        entries.push(json!({"blob": {"length": length, "sha256": sha256}, "kind": "file", "path": name}));
+        entries.push(
+            json!({"blob": {"length": length, "sha256": sha256}, "kind": "file", "path": name}),
+        );
         files.push(StagedInput {
             path,
             digest,
@@ -50,7 +52,8 @@ pub fn stage(root: &Path, memo: Option<&Path>, manifests: &Path) -> Result<Stage
         });
     }
     // Keys sorted (serde_json's map is ordered) and entries by path: one document per tree.
-    let bytes = serde_json::to_vec(&json!({ "entries": entries })).expect("a JSON value serializes");
+    let bytes =
+        serde_json::to_vec(&json!({ "entries": entries })).expect("a JSON value serializes");
     let digest = Digest::of(&bytes);
     let path = keep(manifests, &hex::encode(digest.bytes()), &bytes)
         .map_err(|e| unreadable(manifests, e))?;

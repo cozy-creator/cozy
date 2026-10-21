@@ -207,7 +207,13 @@ impl Interface {
     /// conversions, each group sorted.
     pub fn public(&self) -> Vec<&str> {
         let mut public: Vec<&Callable> = self.callables.iter().filter(|c| !c.internal).collect();
-        public.sort_unstable_by_key(|c| (c.is_conversion(), c.accelerator == Some(false), c.name.as_str()));
+        public.sort_unstable_by_key(|c| {
+            (
+                c.is_conversion(),
+                c.accelerator == Some(false),
+                c.name.as_str(),
+            )
+        });
         public.into_iter().map(|c| c.name.as_str()).collect()
     }
 }
@@ -470,22 +476,31 @@ pub(crate) mod tests {
     fn a_cpu_function_that_calls_internal_gpu_ones_runs_on_a_gpu() {
         let invocable = serde_json::json!({"capabilities": [], "context": "", "defaults": {}, "enum_members": {},
             "export": "f", "memoize": false, "module": "m", "parameters": [], "type_names": {}});
-        let model = serde_json::json!([{"path": "generate.models.model", "class": "M", "default": "m@1"}]);
+        let model =
+            serde_json::json!([{"path": "generate.models.model", "class": "M", "default": "m@1"}]);
         let entry = |name: &str, extra: Value| {
             let mut e = serde_json::json!({"name": name, "invocable": invocable, "request": {"fields": []}, "result": {"fields": []}});
-            e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            e.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
             e
         };
         let read = |entrypoints: Vec<Value>| {
             Interface::parse(&serde_json::json!({"application": "m:app", "format": "cozy.package.interface/1", "entrypoints": entrypoints})).unwrap()
         };
         let h3 = read(vec![
-            entry("generate", serde_json::json!({"internal": true, "models": model})),
+            entry(
+                "generate",
+                serde_json::json!({"internal": true, "models": model}),
+            ),
             entry("render", serde_json::json!({"accelerator": false})),
         ]);
         let render = h3.callables.iter().find(|c| c.name == "render").unwrap();
         assert!(h3.orchestrates(render) && h3.gpu(render));
-        let plain = read(vec![entry("render", serde_json::json!({"accelerator": false}))]);
+        let plain = read(vec![entry(
+            "render",
+            serde_json::json!({"accelerator": false}),
+        )]);
         assert!(!plain.gpu(&plain.callables[0]));
     }
 

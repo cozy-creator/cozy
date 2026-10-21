@@ -39,7 +39,11 @@ pub(crate) async fn submit(
         let quoted: RunQuote = calcifer.post("/v1/run-quotes", &run, None).await?;
         let said = crate::machine::price(&quoted.sku, quoted.gpus.unwrap_or(1), &quoted.quote);
         if !crate::machine::agree(ctx, &said)? {
-            return Err(Error::new(Kind::Usage, "quote_declined", "nothing was rented and the run was not sent"));
+            return Err(Error::new(
+                Kind::Usage,
+                "quote_declined",
+                "nothing was rented and the run was not sent",
+            ));
         }
         run.agreed = Some(quoted.quote.agreed());
     }
@@ -624,13 +628,22 @@ impl View {
 
 /// A stage's bytes a second over its last 10 s (and at least its last two counts), once a second
 /// of them is seen. A new stage, or a count that went back, starts again.
-fn rate(moving: &mut (String, VecDeque<(Instant, u64)>), stage: &str, done: u64, now: Instant) -> Option<f64> {
+fn rate(
+    moving: &mut (String, VecDeque<(Instant, u64)>),
+    stage: &str,
+    done: u64,
+    now: Instant,
+) -> Option<f64> {
     let (name, seen) = moving;
     if name != stage || seen.back().is_some_and(|(_, last)| done < *last) {
         (*name, *seen) = (stage.to_owned(), VecDeque::new());
     }
     seen.push_back((now, done));
-    while seen.len() > 2 && seen.front().is_some_and(|(at, _)| now - *at > Duration::from_secs(10)) {
+    while seen.len() > 2
+        && seen
+            .front()
+            .is_some_and(|(at, _)| now - *at > Duration::from_secs(10))
+    {
         seen.pop_front();
     }
     let (at, first) = *seen.front()?;
@@ -678,11 +691,25 @@ mod tests {
     fn a_download_says_its_rate() {
         let (mut moving, t0, mib) = ((String::new(), VecDeque::new()), Instant::now(), 1 << 20);
         let at = |s: u64| t0 + Duration::from_secs(s);
-        assert_eq!(rate(&mut moving, "installing", 0, at(0)), None, "no second seen yet");
-        assert_eq!(rate(&mut moving, "installing", 4 * mib, at(2)), Some(2.0 * mib as f64));
+        assert_eq!(
+            rate(&mut moving, "installing", 0, at(0)),
+            None,
+            "no second seen yet"
+        );
+        assert_eq!(
+            rate(&mut moving, "installing", 4 * mib, at(2)),
+            Some(2.0 * mib as f64)
+        );
         // Only recent counts count: a crawl after a fast start reads as a crawl.
-        assert_eq!(rate(&mut moving, "installing", 4 * mib + 20, at(22)), Some(1.0));
-        assert_eq!(rate(&mut moving, "loading", 5, at(23)), None, "a new stage starts again");
+        assert_eq!(
+            rate(&mut moving, "installing", 4 * mib + 20, at(22)),
+            Some(1.0)
+        );
+        assert_eq!(
+            rate(&mut moving, "loading", 5, at(23)),
+            None,
+            "a new stage starts again"
+        );
     }
 
     /// Each output kind's terminal state: a landed file, a lost one and a checkpoint end a

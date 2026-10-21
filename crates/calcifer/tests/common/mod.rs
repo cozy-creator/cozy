@@ -11,13 +11,13 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use calcifer::store::{Endpoint, MachineRow};
+use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey as _};
 use platform::durable;
 use protocol::{
     calcifer::{Event, Kind, MachineKind, MachineState, On, StagedInput, SubmitRun},
     ids::{Digest, RunId},
     machine as v1,
 };
-use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey as _};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::broadcast;
 

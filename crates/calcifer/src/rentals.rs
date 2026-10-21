@@ -10,6 +10,8 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::SigningKey;
+use hub_client::{Client, Credential, DeviceKey, UserSession, types};
 use platform::paths::Home;
 use protocol::{
     calcifer::{
@@ -21,8 +23,6 @@ use protocol::{
     ids::RunId,
     machine as v1,
 };
-use ed25519_dalek::SigningKey;
-use hub_client::{Client, Credential, DeviceKey, UserSession, types};
 use sha2::{Digest as _, Sha256};
 use tracing::warn;
 
@@ -163,7 +163,11 @@ impl Hubs {
 
     /// Every Hub the config names and every Hub a rental was asked of.
     fn origins(&self, rows: &[MachineRow]) -> Vec<String> {
-        let mut origins: Vec<String> = self.configured.iter().map(|h| h.origin.to_string()).collect();
+        let mut origins: Vec<String> = self
+            .configured
+            .iter()
+            .map(|h| h.origin.to_string())
+            .collect();
         for row in rows
             .iter()
             .filter(|r| r.kind == MachineKind::Rental && r.state != MachineState::Ended)
@@ -514,7 +518,11 @@ impl Machines {
     }
 
     /// What `hub` places a run of `spec` on: the product, its GPU count, and why, in words.
-    async fn placement(&self, hub: &str, spec: &v1::RunSpec) -> Result<(String, Option<u32>, String), Error> {
+    async fn placement(
+        &self,
+        hub: &str,
+        spec: &v1::RunSpec,
+    ) -> Result<(String, Option<u32>, String), Error> {
         let Some(v1::Source::Release(release)) = &spec.source else {
             return Err(Error::new(
                 Kind::Usage,
@@ -570,13 +578,21 @@ impl Machines {
             placement.weight_bytes / 1_000_000_000,
             placement.bits,
         );
-        Ok((top.name.clone(), u32::try_from(top.accelerator_count).ok(), message))
+        Ok((
+            top.name.clone(),
+            u32::try_from(top.accelerator_count).ok(),
+            message,
+        ))
     }
 
     /// What a `new` run would rent and its price, as `rent_for` would ask it: nothing is rented.
     pub async fn run_quote(&self, submit: &SubmitRun) -> Result<RunQuote, Error> {
         let On::New(sku) = &submit.on else {
-            return Err(Error::new(Kind::Usage, "quote_needs_new", "only a run with `--on new` rents"));
+            return Err(Error::new(
+                Kind::Usage,
+                "quote_needs_new",
+                "only a run with `--on new` rents",
+            ));
         };
         let gpus = (submit.spec.gpus > 0).then_some(submit.spec.gpus);
         let (sku, gpus) = match sku {
@@ -586,7 +602,16 @@ impl Machines {
                 (sku, gpus)
             }
         };
-        let quote = self.quote(&submit.hub, &sku, Shape { gpus, ..Shape::default() }).await?;
+        let quote = self
+            .quote(
+                &submit.hub,
+                &sku,
+                Shape {
+                    gpus,
+                    ..Shape::default()
+                },
+            )
+            .await?;
         Ok(RunQuote { sku, gpus, quote })
     }
 
@@ -973,8 +998,12 @@ pub(crate) fn hub_refusal(origin: &str, e: hub_client::Error) -> Error {
             message,
             remedy,
         } => {
-            let error = Error::new(Kind::of_http(status), "hub_refused", format!("{origin}: {message}"))
-                .cause(code);
+            let error = Error::new(
+                Kind::of_http(status),
+                "hub_refused",
+                format!("{origin}: {message}"),
+            )
+            .cause(code);
             if remedy.is_empty() {
                 error
             } else {
@@ -1108,7 +1137,9 @@ fn request(sku: &str, shape: Shape) -> Result<(types::RentalRequest, String, Sig
         development: None,
         excluded_provider_machines: vec![],
         image: (shape.image.map(|image| image.try_into()).transpose()).map_err(
-            |e: types::error::ConversionError| Error::new(Kind::Usage, "image_invalid", e.to_string()),
+            |e: types::error::ConversionError| {
+                Error::new(Kind::Usage, "image_invalid", e.to_string())
+            },
         )?,
         // The Hub holds a media plane's token hash; machines serve bytes over Read instead.
         media_token_sha256: hex::encode(Sha256::digest(&random[4..36])),

@@ -34,7 +34,9 @@ struct Measurements {
 
 /// A field of a shape this CLI does not read (`null`, a newer one) reads as empty: it never
 /// takes the other measurements with it.
-fn lenient<'de, D: serde::Deserializer<'de>, T: Default + serde::de::DeserializeOwned>(d: D) -> Result<T, D::Error> {
+fn lenient<'de, D: serde::Deserializer<'de>, T: Default + serde::de::DeserializeOwned>(
+    d: D,
+) -> Result<T, D::Error> {
     Ok(T::deserialize(serde_json::Value::deserialize(d)?).unwrap_or_default())
 }
 
@@ -267,12 +269,19 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
     );
     gpus.print(ctx, "attention kernels");
     let memory = grid(
-        &["MODEL", "GPU", "STEPS", "RESIDENT", "PAGED IN", "STREAMED", "STALL", "PEAK"],
+        &[
+            "MODEL", "GPU", "STEPS", "RESIDENT", "PAGED IN", "STREAMED", "STALL", "PEAK",
+        ],
         &measured,
         memory_rows,
     );
     memory.print(ctx, "memory");
-    grid(&["MODEL", "RUNG", "REASON", "COUNT", "BYTES"], &measured, eviction_rows).print(ctx, "evictions");
+    grid(
+        &["MODEL", "RUNG", "REASON", "COUNT", "BYTES"],
+        &measured,
+        eviction_rows,
+    )
+    .print(ctx, "evictions");
     grid(&["MODEL", "SHAPE", "PEAK", "CUTS"], &measured, peak_rows).print(ctx, "activation peaks");
     if !run.calls.is_empty() {
         anstream::println!("\ncalls");
@@ -580,7 +589,11 @@ fn memory_rows(measured: &Measured) -> Vec<Vec<String>> {
     let mut rows: Vec<Vec<String>> = order
         .into_iter()
         .map(|(model, gpu)| {
-            let steps: Vec<&Step> = memory.rows.iter().filter(|s| s.model == model && s.gpu == gpu).collect();
+            let steps: Vec<&Step> = memory
+                .rows
+                .iter()
+                .filter(|s| s.model == model && s.gpu == gpu)
+                .collect();
             let sum = |f: fn(&Step) -> u64| steps.iter().map(|s| f(s)).sum::<u64>();
             vec![
                 model.into(),
@@ -594,9 +607,22 @@ fn memory_rows(measured: &Measured) -> Vec<Vec<String>> {
             ]
         })
         .collect();
-    for (gpu, bytes) in memory.leftover_by_gpu.iter().filter(|(_, bytes)| *bytes > 0) {
+    for (gpu, bytes) in memory
+        .leftover_by_gpu
+        .iter()
+        .filter(|(_, bytes)| *bytes > 0)
+    {
         let dash = || "-".to_string();
-        rows.push(vec!["leftover".into(), gpu.to_string(), dash(), output::bytes(*bytes), dash(), dash(), dash(), dash()]);
+        rows.push(vec![
+            "leftover".into(),
+            gpu.to_string(),
+            dash(),
+            output::bytes(*bytes),
+            dash(),
+            dash(),
+            dash(),
+            dash(),
+        ]);
     }
     rows
 }
@@ -609,14 +635,27 @@ fn eviction_rows(measured: &Measured) -> Vec<Vec<String>> {
         *entry = (entry.0 + 1, entry.1 + e.nbytes);
     }
     let row = |((model, rung, reason), (count, bytes)): ((&str, u32, &str), (u64, u64))| {
-        vec![model.into(), rung.to_string(), reason.into(), count.to_string(), output::bytes(bytes)]
+        vec![
+            model.into(),
+            rung.to_string(),
+            reason.into(),
+            count.to_string(),
+            output::bytes(bytes),
+        ]
     };
     counted.into_iter().map(row).collect()
 }
 
 /// The activation peak each model measured at each shape key, and the cuts in force there.
 fn peak_rows(measured: &Measured) -> Vec<Vec<String>> {
-    let row = |p: &Peak| vec![p.model.clone(), p.shape.clone(), output::bytes(p.peak), or_dash(&p.cuts.join(", "))];
+    let row = |p: &Peak| {
+        vec![
+            p.model.clone(),
+            p.shape.clone(),
+            output::bytes(p.peak),
+            or_dash(&p.cuts.join(", ")),
+        ]
+    };
     measured.m.memory.stats.peaks.iter().map(row).collect()
 }
 
@@ -703,17 +742,32 @@ mod tests {
             "leftover_by_gpu": [[0, 512], [1, 0]]
         }}}))
         .unwrap();
-        let measured = Measured { who: "run".into(), span: None, m };
+        let measured = Measured {
+            who: "run".into(),
+            span: None,
+            m,
+        };
         let memory = grid(&["MODEL"], std::slice::from_ref(&measured), memory_rows);
-        assert_eq!(rows(&memory), [
-            vec!["h3/te", "0", "1", "1.0 KiB", "1.0 KiB", "0 B", "0ms", "0 B"],
-            vec!["h3/dit", "0", "2", "2.0 KiB", "0 B", "1.0 KiB", "3ms", "4.0 KiB"],
-            vec!["leftover", "0", "-", "512 B", "-", "-", "-", "-"],
-        ]);
+        assert_eq!(
+            rows(&memory),
+            [
+                vec!["h3/te", "0", "1", "1.0 KiB", "1.0 KiB", "0 B", "0ms", "0 B"],
+                vec![
+                    "h3/dit", "0", "2", "2.0 KiB", "0 B", "1.0 KiB", "3ms", "4.0 KiB"
+                ],
+                vec!["leftover", "0", "-", "512 B", "-", "-", "-", "-"],
+            ]
+        );
         let evictions = grid(&["MODEL"], std::slice::from_ref(&measured), eviction_rows);
-        assert_eq!(rows(&evictions), [vec!["h3/te", "2", "asked", "2", "2.0 KiB"]]);
+        assert_eq!(
+            rows(&evictions),
+            [vec!["h3/te", "2", "asked", "2", "2.0 KiB"]]
+        );
         let peaks = grid(&["MODEL"], std::slice::from_ref(&measured), peak_rows);
-        assert_eq!(rows(&peaks), [vec!["h3/dit", "832x480x121", "4.0 KiB", "ffn:2"]]);
+        assert_eq!(
+            rows(&peaks),
+            [vec!["h3/dit", "832x480x121", "4.0 KiB", "ffn:2"]]
+        );
     }
 
     #[test]

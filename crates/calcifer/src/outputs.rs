@@ -21,6 +21,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
+use futures_util::StreamExt as _;
 use protocol::{
     calcifer::{CHECKPOINT, Event, MachineState},
     error::Kind,
@@ -30,7 +31,6 @@ use protocol::{
         client::{self, Bulk},
     },
 };
-use futures_util::StreamExt as _;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::{

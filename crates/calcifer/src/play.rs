@@ -7,13 +7,13 @@ use axum::{
     Json,
     extract::{Path, Query, State, rejection::QueryRejection},
 };
+use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as _};
 use protocol::{
     calcifer::Play,
     capability::{self, Grant},
     error::{Error, Kind},
     ids::RunId,
 };
-use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as _};
 use serde::Deserialize;
 
 use crate::{

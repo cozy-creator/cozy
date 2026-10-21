@@ -24,6 +24,11 @@ use axum::{
     },
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{
+    SigningKey,
+    pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _},
+};
+use futures_util::{Stream, StreamExt as _};
 use platform::{durable, paths::Home};
 use protocol::{
     calcifer::{
@@ -35,11 +40,6 @@ use protocol::{
     ids::{Digest, RunId},
     machine as v1,
 };
-use ed25519_dalek::{
-    SigningKey,
-    pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _},
-};
-use futures_util::{Stream, StreamExt as _};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tokio::{
@@ -339,10 +339,7 @@ impl Machines {
     /// Starts a rental's 15-minute idle clock over, once the machine acknowledges it.
     pub async fn keepalive(&self, text: &str) -> Result<Keepalive, Error> {
         let (row, link) = self.linked(text)?;
-        let frame = link
-            .keepalive()
-            .await
-            .map_err(|e| refusal(&row.name, e))?;
+        let frame = link.keepalive().await.map_err(|e| refusal(&row.name, e))?;
         let idle_deadline_ms = deadline(&frame);
         self.observe(&row.name, frame);
         Ok(Keepalive {
@@ -606,7 +603,8 @@ impl Machines {
     /// (it could only fail once it was), and without the quote its renter agreed to.
     pub(crate) fn admit(&self, submit: &SubmitRun) -> Result<(), Error> {
         let signed_out = || {
-            config::Origin::parse(&submit.hub).is_ok_and(|hub| self.hubs.client(hub.as_str()).is_err())
+            config::Origin::parse(&submit.hub)
+                .is_ok_and(|hub| self.hubs.client(hub.as_str()).is_err())
         };
         match &submit.on {
             On::New(_) if signed_out() => Err(crate::rentals::signed_out(&submit.hub)),
@@ -865,7 +863,12 @@ pub(crate) async fn quote(
         image,
         agreed: None,
     };
-    Ok(Json(api.machines.quote(&hub, &sku, shape).await.map_err(Refusal)?))
+    Ok(Json(
+        api.machines
+            .quote(&hub, &sku, shape)
+            .await
+            .map_err(Refusal)?,
+    ))
 }
 
 /// `POST /v1/run-quotes`: what a `new` run (a `SubmitRun`) would rent and its price, from the same
@@ -878,7 +881,9 @@ pub(crate) async fn run_quote(
     if config::Origin::parse(&submit.hub).is_ok_and(|hub| api.machines.device_key(&hub).is_err()) {
         return Err(Refusal(crate::rentals::signed_out(&submit.hub)));
     }
-    Ok(Json(api.machines.run_quote(&submit).await.map_err(Refusal)?))
+    Ok(Json(
+        api.machines.run_quote(&submit).await.map_err(Refusal)?,
+    ))
 }
 
 /// Rents one under the request's `Idempotency-Key` (202, or 200 when the key had), or adds
@@ -935,7 +940,9 @@ pub(crate) async fn create(
         }
         NewMachine::Local { root } => {
             let ready = root.join("var/lib/cozy/tensord/api-ready.json");
-            let local = api.machines.put_local(endpoint_of(&ready).map_err(Refusal)?);
+            let local = api
+                .machines
+                .put_local(endpoint_of(&ready).map_err(Refusal)?);
             Ok(Json(local.map_err(Refusal)?).into_response())
         }
     }

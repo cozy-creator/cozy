@@ -12,6 +12,8 @@ use std::{
     time::Instant,
 };
 
+use ed25519_dalek::SigningKey;
+use futures_util::{Stream, StreamExt as _, TryStreamExt as _};
 use protocol::{
     ids::Digest,
     machine::{
@@ -19,8 +21,6 @@ use protocol::{
         client::{Auth, Bulk, Error, Machine},
     },
 };
-use ed25519_dalek::SigningKey;
-use futures_util::{Stream, StreamExt as _, TryStreamExt as _};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
 use crate::{
@@ -126,7 +126,12 @@ impl Link {
     /// The run's log after `after`: its state first, then its events until its outcome. Closing
     /// it never cancels.
     pub async fn events(&self, id: &str, after: u64) -> Result<Live<v1::RunEvent>, LinkError> {
-        Ok(Box::pin(self.machine.events(id, after).await?.map_err(LinkError::from)))
+        Ok(Box::pin(
+            self.machine
+                .events(id, after)
+                .await?
+                .map_err(LinkError::from),
+        ))
     }
 
     /// Attaches to the run: its state, and its events after `after`. `NotFound` when the machine
@@ -156,7 +161,9 @@ impl Link {
 
     /// The machine's picture, then again whenever it changes.
     pub async fn watch(&self) -> Result<Live<v1::StatusFrame>, LinkError> {
-        Ok(Box::pin(self.machine.watch().await?.map_err(LinkError::from)))
+        Ok(Box::pin(
+            self.machine.watch().await?.map_err(LinkError::from),
+        ))
     }
 
     /// Gives the machine this computer's newest bearer at the Hub `bearer.endpoint` names.
@@ -255,7 +262,14 @@ impl Link {
             let parts = lanes::parts(&held, length, UPLOAD_LANES, PART);
             let sent = lanes::transfer(parts, UPLOAD_LANES, |leg| {
                 let lane = self.lane(leg.lane, leg.fresh);
-                put(lane, name.clone(), path.to_owned(), length, leg, landed.clone())
+                put(
+                    lane,
+                    name.clone(),
+                    path.to_owned(),
+                    length,
+                    leg,
+                    landed.clone(),
+                )
             });
             let tell = async {
                 // The machine says what it holds as bytes land; a machine that cannot say so is
@@ -322,12 +336,17 @@ async fn put(
         .map_err(unreadable)?;
     let length = leg.end - leg.first;
     let at = leg.at.clone();
-    let body = tokio_util::io::ReaderStream::with_capacity(file.take(length), FRAME)
-        .inspect_ok(move |bytes| {
+    let body = tokio_util::io::ReaderStream::with_capacity(file.take(length), FRAME).inspect_ok(
+        move |bytes| {
             at.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        });
+        },
+    );
     match lane
-        .put(&digest, (leg.first, length, total), reqwest::Body::wrap_stream(body))
+        .put(
+            &digest,
+            (leg.first, length, total),
+            reqwest::Body::wrap_stream(body),
+        )
         .await
     {
         Ok(held) => {
