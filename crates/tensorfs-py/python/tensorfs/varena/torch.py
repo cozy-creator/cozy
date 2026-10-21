@@ -168,6 +168,8 @@ class _Pass:
     """An open pass and what it measured so far; `open` holds each running site's peak."""
 
     native: Pass
+    #: `<entry>|<dims>`: the entry module's path in the model ("" the root) and its tensors' dims
+    shape: str
     peak: int = 0
     reserved_peak: int = 0
     sites: dict[str, int] = field(default_factory=dict)
@@ -381,17 +383,19 @@ class Memory:
 
     # -- passes
 
-    def _open(self, model: Model, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
-        """The outermost forward of `model` (its root or a direct child) is a pass."""
+    def _open(self, model: Model, entry: str, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
+        """The outermost forward of `model` (its root or a direct child, `entry`) is a pass, keyed
+        by its entry and its tensor arguments' dims: each entry point has its own measured room."""
         with model.lock:
             model.depth += 1
             if model.depth > 1:
                 return
             try:
                 r = self._current()
-                shape = "x".join(str(d) for t in tree_leaves((args, kwargs)) if isinstance(t, Tensor) for d in t.shape)
+                dims = "x".join(str(d) for t in tree_leaves((args, kwargs)) if isinstance(t, Tensor) for d in t.shape)
+                shape = f"{entry}|{dims}"
                 self.native.fill(model.id, _fill(model.fill))
-                p = _Pass(r.native.pass_(model.id, shape, *_torch(self)))
+                p = _Pass(r.native.pass_(model.id, shape, *_torch(self)), shape)
                 self._cap()
                 p.entered = sys.exc_info()[1]
                 if self.cuda:
@@ -596,8 +600,9 @@ def _hook(model: Model) -> None:
     """The root's or a direct child's outermost forward is a pass (its hooks run first); a block
     binds while it runs."""
     memory = model.memory
-    for sub in (model.module, *model.module.children()):
-        model.handles += _paired(sub, lambda args, kwargs: memory._open(model, args, kwargs), lambda: memory._close(model))
+    for entry, sub in (("", model.module), *model.module.named_children()):
+        opened = lambda args, kwargs, entry=entry: memory._open(model, entry, args, kwargs)  # noqa: E731
+        model.handles += _paired(sub, opened, lambda: memory._close(model))
     for block in model.blocks.values():
         sub = model.module.get_submodule(block.path)
         model.handles += _paired(sub, lambda *_, b=block: memory._enter(b), lambda b=block: memory._exit(b))

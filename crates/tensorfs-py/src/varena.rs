@@ -523,8 +523,8 @@ impl PyRequest {
 
 #[pymethods]
 impl PyRequest {
-    /// Starts a pass of `set` at `shape` (dims joined by `x`) with torch's bytes now; returns
-    /// once its measured room is free.
+    /// Starts a pass of `set` at `shape` (`<entry>|<dims>`) with torch's bytes now; returns once
+    /// its measured room is free.
     #[pyo3(name = "pass_")]
     fn pass_(&self, py: Python<'_>, set: u32, shape: &str, allocated: u64, reserved: u64) -> PyResult<PyPass> {
         let r = self.get(py)?;

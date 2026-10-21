@@ -163,8 +163,9 @@ class Memory:
 
 class Request:
     def pass_(self, set: int, shape: str, allocated: int, reserved: int) -> Pass:
-        """A pass of `set` at `shape` (dims joined by `x`) with torch's bytes now; returns once its
-        measured room is free."""
+        """A pass of `set` at `shape` (`<entry>|<dims>`: the entry module's path, "" the root, and
+        its tensors' dims joined by `x`) with torch's bytes now; returns once its measured room is
+        free."""
 
     def plan(self, plan: list[tuple[list[str], int]]) -> None:
         """Replaces the plan; its cursor starts over."""
