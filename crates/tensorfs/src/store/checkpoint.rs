@@ -262,12 +262,18 @@ impl Checkpoint {
         }
     }
 
-    /// True when `object` can be read here.
+    /// True when `object` can be read here; a copy of another length cannot (a fetch replaces it).
     pub fn holds(&self, object: &ObjectRef) -> Result<bool> {
-        match &self.objects {
+        let held = match &self.objects {
             Objects::Store(store) => store.reuse(object),
-            Objects::Folder { dir, cache } => Ok(folder_file(dir, object)?.is_some()
-                || cache.as_ref().map(|c| c.reuse(object)).transpose()?.unwrap_or(false)),
+            Objects::Folder { dir, cache } => folder_file(dir, object).and_then(|own| match own {
+                Some(_) => Ok(true),
+                None => cache.as_ref().map_or(Ok(false), |c| c.reuse(object)),
+            }),
+        };
+        match held {
+            Err(Error::Mismatch { .. }) => Ok(false),
+            held => held,
         }
     }
 

@@ -453,11 +453,15 @@ impl Store {
         }
     }
 
-    /// Names a finished temp `blob`, unless a copy is there already, which is kept young.
+    /// Names a finished temp `blob`, unless a copy of its length is there already, which is kept
+    /// young; one of another length is damaged, and the temp replaces it.
     fn install(&self, temp: &Path, blob: &Path, sha256: &str) -> Result<()> {
-        if self.young(sha256)?.is_some() {
-            let _ = fs::remove_file(temp);
-            return Ok(());
+        let length = fs::metadata(temp).map_err(fail("stat", temp))?.len();
+        if let Some(held) = self.young(sha256)? {
+            if held.metadata().map_err(fail("stat", blob))?.len() == length {
+                let _ = fs::remove_file(temp);
+                return Ok(());
+            }
         }
         let shard = blob.parent().expect("a blob has a shard");
         let created = !shard.is_dir();

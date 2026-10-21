@@ -303,13 +303,19 @@ async fn eager_open_downloads_checkpoint_bytes_without_materializing_a_repositor
         .open("account/eager", &Open { lazy: false, local_files_only: true, ..options.clone() })
         .await
         .is_ok());
-    fs::remove_file(cache.join(data.chunks[0].key())).unwrap();
-    assert_eq!(client
-        .open("account/eager", &Open { lazy: false, local_files_only: true, ..options })
-        .await
-        .unwrap_err()
-        .kind, Kind::NotFound);
+    let blob = cache.join(data.chunks[0].key());
+    fs::remove_file(&blob).unwrap();
+    let offline = Open { lazy: false, local_files_only: true, ..options.clone() };
+    assert_eq!(client.open("account/eager", &offline).await.unwrap_err().kind, Kind::NotFound);
     assert_eq!(http.requests.lock().unwrap().len(), requests);
+    // A copy of another length is not held: offline it is not cached, as a missing one is;
+    // online it is fetched again and replaced.
+    fs::write(&blob, b"damaged").unwrap();
+    let refused = client.open("account/eager", &offline).await.unwrap_err();
+    assert_eq!((refused.kind, refused.detail.ends_with("is not cached")), (Kind::NotFound, true), "{refused}");
+    client.open("account/eager", &Open { lazy: false, ..options }).await.unwrap();
+    assert_eq!(fs::metadata(&blob).unwrap().len(), data.chunks[0].length);
+    assert!(client.open("account/eager", &offline).await.is_ok());
 }
 
 #[tokio::test(flavor = "current_thread")]

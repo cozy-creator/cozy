@@ -37,32 +37,28 @@ impl Remote {
         if let Some(report) = want.progress {
             report(0, total)?;
         }
-        if self.offline && self.mirror.is_none() {
-            for object in &objects {
-                if !self.store.reuse(object)? {
-                    return fail(Kind::NotFound, format!("{} is not cached", object.id()));
-                }
-            }
+        // The Fetcher's own local check, in every mode: a copy of another length is not held. What
+        // is held needs no Fetcher, nor a runtime; offline with no mirror, nothing else is.
+        let (held, missing): (Vec<_>, Vec<_>) = objects.into_iter().partition(|o| ObjectStore::has(&self.store, o));
+        let local: u64 = held.iter().map(|o| o.length).sum();
+        if let Some(first) = missing.first().filter(|_| self.offline && self.mirror.is_none()) {
+            return fail(Kind::NotFound, format!("{} is not cached", first.id()));
+        }
+        if missing.is_empty() {
             if let Some(report) = want.progress {
                 report(total, total)?;
             }
-            return Ok(Fetched {
-                local: total,
-                ..Fetched::default()
-            });
+            return Ok(Fetched { local, ..Fetched::default() });
         }
         let store: Arc<dyn ObjectStore> = Arc::new(self.store.clone());
         let mirror = self
             .mirror
             .as_ref()
             .map(|p| VolumeOrigin::new(p, Duration::from_secs(24 * 60 * 60)));
-        let (origin, volume): (Arc<dyn Origin>, _) = if self.offline {
-            // A configured mirror is a local-files source, not permission to
-            // contact the remote endpoint. Use the existing verified downloader
-            // with a file-only origin and no network fallback.
-            (Arc::new(mirror.expect("offline source has a mirror")), None)
-        } else {
-            (self.endpoint.inner.clone(), mirror)
+        // A configured mirror is a local-files origin offline, not permission to contact the endpoint.
+        let (origin, volume): (Arc<dyn Origin>, _) = match (self.offline, mirror) {
+            (true, mirror) => (Arc::new(mirror.expect("offline with something missing has a mirror")), None),
+            (false, mirror) => (self.endpoint.inner.clone(), mirror),
         };
         // Constructing/dropping this fetcher scopes cancellation to this operation.
         // All network tasks run on the caller's Tokio runtime, never a nested one.
@@ -78,15 +74,15 @@ impl Remote {
             progress: Some(&progress),
             ..Want::default()
         };
-        let mut work = std::pin::pin!(fetcher.objects(&origin, &objects, &selected));
+        let mut work = std::pin::pin!(fetcher.objects(&origin, &missing, &selected));
         let mut tick = tokio::time::interval(Duration::from_millis(250));
-        let result = loop {
+        let mut result = loop {
             tokio::select! {
                 biased;
                 result = &mut work => break result.map_err(from_native)?,
                 _ = tick.tick(), if want.progress.is_some() => {
                     if let Some(report) = want.progress {
-                        report(progress.held.load(Ordering::Relaxed), total)?;
+                        report(local + progress.held.load(Ordering::Relaxed), total)?;
                     }
                 }
             }
@@ -95,6 +91,7 @@ impl Remote {
         if let Some(report) = want.progress {
             report(total, total)?;
         }
+        result.local += local;
         Ok(result)
     }
 
