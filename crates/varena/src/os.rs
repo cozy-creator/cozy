@@ -52,16 +52,36 @@ mod imp {
         Ok(file.into())
     }
 
-    /// Refuses a table this user does not own, or that others may write.
-    pub(crate) fn own(fd: &Owned) -> Result<()> {
+    /// The table's owner: this user, or root (a TensorD running as root grants its tables to
+    /// executors of another uid). Any other owner, or a table others may write, is refused.
+    pub(crate) fn own(fd: &Owned) -> Result<u32> {
         use std::os::unix::fs::MetadataExt;
         let file = std::fs::File::from(fd.try_clone().map_err(|e| Error::io("dup", e))?);
         let meta = file.metadata().map_err(|e| Error::io("stat", e))?;
-        // SAFETY: geteuid reads a process attribute.
-        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+        if (meta.uid() != euid() && meta.uid() != 0) || meta.mode() & 0o022 != 0 {
             return Err(Error::Invalid("the shared table belongs to someone else".into()));
         }
-        Ok(())
+        Ok(meta.uid())
+    }
+
+    pub(crate) fn euid() -> u32 {
+        // SAFETY: geteuid reads a process attribute.
+        unsafe { libc::geteuid() }
+    }
+
+    /// Peers of these uids are served and served by, beside this process's own: the owners of
+    /// the tables it adopted, and the executors its ledger granted.
+    static ACCEPTED: parking_lot::Mutex<std::collections::BTreeSet<u32>> = parking_lot::Mutex::new(std::collections::BTreeSet::new());
+
+    pub(crate) fn accept_uid(uid: u32) {
+        ACCEPTED.lock().insert(uid);
+    }
+
+    /// The effective uid of `pid`, from `/proc`.
+    pub(crate) fn uid_of(pid: u32) -> Result<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).map_err(|e| Error::io("read a process's status", e))?;
+        let uids = status.lines().find_map(|l| l.strip_prefix("Uid:")).ok_or_else(|| Error::Invalid(format!("no uid for {pid}")))?;
+        uids.split_whitespace().nth(1).and_then(|u| u.parse().ok()).ok_or_else(|| Error::Invalid(format!("no uid for {pid}")))
     }
 
     pub(crate) fn size(fd: &Owned) -> Result<u64> {
@@ -165,8 +185,8 @@ mod imp {
     /// The GPU's wake endpoint, bound by its TensorD: a datagram socket named for the GPU that
     /// every participant signals, so a standalone process's frees reach it too. `None` while
     /// another process holds it.
-    pub(crate) fn wake_bind(name: &str) -> Result<Option<Owned>> {
-        match std::os::unix::net::UnixDatagram::bind_addr(&address(&format!("wake-{name}"))?) {
+    pub(crate) fn wake_bind(ns: u32, name: &str) -> Result<Option<Owned>> {
+        match std::os::unix::net::UnixDatagram::bind_addr(&address(ns, &format!("wake-{name}"))?) {
             Ok(s) => {
                 s.set_nonblocking(true).map_err(|e| Error::io("wake", e))?;
                 Ok(Some(s.into()))
@@ -185,8 +205,8 @@ mod imp {
 
     /// Signals the GPU's wake; nobody bound (no TensorD), a full queue (a wake is pending
     /// already) and a bad name are all no signal needed.
-    pub(crate) fn wake(sender: &Owned, name: &str) {
-        let Ok(addr) = address(&format!("wake-{name}")) else { return };
+    pub(crate) fn wake(sender: &Owned, ns: u32, name: &str) {
+        let Ok(addr) = address(ns, &format!("wake-{name}")) else { return };
         let Ok(s) = sender.try_clone().map(std::os::unix::net::UnixDatagram::from) else { return };
         let _ = s.send_to_addr(&[1], &addr);
     }
@@ -216,16 +236,16 @@ mod imp {
         }
     }
 
-    fn address(name: &str) -> Result<SocketAddr> {
-        // SAFETY: geteuid reads a process attribute.
-        let uid = unsafe { libc::geteuid() };
-        SocketAddr::from_abstract_name(format!("cozy-varena-{uid}-{name}")).map_err(|e| Error::io("socket name", e))
+    /// A service's name in the namespace of user `ns` (the table owner's: a granted executor
+    /// finds its TensorD's services there).
+    fn address(ns: u32, name: &str) -> Result<SocketAddr> {
+        SocketAddr::from_abstract_name(format!("cozy-varena-{ns}-{name}")).map_err(|e| Error::io("socket name", e))
     }
 
     /// Binds the service name: `None` while another process holds it. The bound name is the
     /// service lock, released by the kernel when its holder dies.
-    pub(crate) fn listen(name: &str) -> Result<Option<Listener>> {
-        match UnixListener::bind_addr(&address(name)?) {
+    pub(crate) fn listen(ns: u32, name: &str) -> Result<Option<Listener>> {
+        match UnixListener::bind_addr(&address(ns, name)?) {
             Ok(l) => Ok(Some(l)),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
             Err(e) => Err(Error::io("bind service", e)),
@@ -313,10 +333,10 @@ mod imp {
         buf.get(5..5 + len).map_or(Frame::Partial, Frame::Whole)
     }
 
-    /// Connects to the service; `None` when nobody serves it. A service of another user is
-    /// refused.
-    pub(crate) fn connect(name: &str) -> Result<Option<Stream>> {
-        match UnixStream::connect_addr(&address(name)?) {
+    /// Connects to the service; `None` when nobody serves it. A service of a user not accepted
+    /// is refused.
+    pub(crate) fn connect(ns: u32, name: &str) -> Result<Option<Stream>> {
+        match UnixStream::connect_addr(&address(ns, name)?) {
             Ok(s) => {
                 peer(&s)?;
                 Ok(Some(s))
@@ -326,9 +346,14 @@ mod imp {
         }
     }
 
-    /// The peer's pid; a peer of another user is refused (abstract names have no permissions).
+    /// The peer's pid; a peer of a user not accepted is refused (abstract names have no
+    /// permissions).
     pub(crate) fn peer(stream: &Stream) -> Result<u32> {
-        Ok(platform::handles::peer_credentials(stream)?.pid)
+        let p = platform::handles::peer(stream).map_err(|e| Error::io("peer", e))?;
+        if p.uid != euid() && !ACCEPTED.lock().contains(&p.uid) {
+            return Err(Error::Invalid(format!("a peer of uid {} is not accepted", p.uid)));
+        }
+        Ok(p.pid)
     }
 
     pub(crate) fn send(stream: &Stream, (bytes, handle): &Message) -> Result<()> {
@@ -418,7 +443,14 @@ mod imp {
     pub(crate) fn shared(_: &str, _: bool) -> Result<Owned> {
         Err(later())
     }
-    pub(crate) fn own(_: &Owned) -> Result<()> {
+    pub(crate) fn euid() -> u32 {
+        0
+    }
+    pub(crate) fn accept_uid(_: u32) {}
+    pub(crate) fn uid_of(_: u32) -> Result<u32> {
+        Err(later())
+    }
+    pub(crate) fn own(_: &Owned) -> Result<u32> {
         Err(later())
     }
     pub(crate) fn size(_: &Owned) -> Result<u64> {
@@ -464,18 +496,18 @@ mod imp {
         Err(later())
     }
     pub(crate) fn signal(_: &Owned) {}
-    pub(crate) fn wake_bind(_: &str) -> Result<Option<Owned>> {
+    pub(crate) fn wake_bind(_: u32, _: &str) -> Result<Option<Owned>> {
         Err(later())
     }
     pub(crate) fn wake_sender() -> Result<Owned> {
         Err(later())
     }
-    pub(crate) fn wake(_: &Owned, _: &str) {}
+    pub(crate) fn wake(_: &Owned, _: u32, _: &str) {}
     pub(crate) fn wake_clear(_: &Owned) {}
     pub(crate) fn await_event(_: &Owned) -> Result<()> {
         Err(later())
     }
-    pub(crate) fn listen(_: &str) -> Result<Option<Listener>> {
+    pub(crate) fn listen(_: u32, _: &str) -> Result<Option<Listener>> {
         Err(later())
     }
     pub(crate) fn incoming(listener: Listener) -> std::iter::Empty<Stream> {
@@ -484,7 +516,7 @@ mod imp {
     pub(crate) fn serve_all(listener: Listener, _: &std::sync::atomic::AtomicBool, _: impl FnMut(&[u8]) -> Vec<u8>) {
         match listener {}
     }
-    pub(crate) fn connect(_: &str) -> Result<Option<Stream>> {
+    pub(crate) fn connect(_: u32, _: &str) -> Result<Option<Stream>> {
         Err(later())
     }
     pub(crate) fn peer(s: &Stream) -> Result<u32> {

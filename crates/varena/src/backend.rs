@@ -41,6 +41,10 @@ pub enum Access {
     Read,
 }
 
+/// The code [`Backend::create`] fails with when the device has no memory for the page
+/// (`CUDA_ERROR_OUT_OF_MEMORY`; the host backend answers the same at its limit).
+pub const OUT_OF_MEMORY: i32 = 2;
+
 /// One device's mechanism. Every call is short: no call waits on another process or a fill.
 pub trait Backend: Send + Sync {
     /// The device's total bytes (the card, or a host device's limit).

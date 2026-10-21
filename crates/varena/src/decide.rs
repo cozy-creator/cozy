@@ -32,16 +32,25 @@ pub enum Trigger {
     /// unmeasured, the reserve `unmeasured` sets aside: the room and its step's unmapped pages
     /// must fit.
     Pass { req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried: Tried },
-    /// An op of `req`'s pass over `set` ran short by `need` (at least one page's worth when
-    /// unknown) at `site`; a collective site recovers locally and proposes its finer level for
-    /// the next pass.
-    Oom { req: u64, set: u32, need: Option<u64>, site: Option<String>, collective: bool, tried: Tried },
+    /// An op of `req`'s pass over `set` (`None`: outside any pass) ran short by `need` (at
+    /// least one page's worth when unknown) at `site`; a collective site recovers locally and
+    /// proposes its finer level for the next pass.
+    Oom { req: u64, set: Option<u32>, need: Option<u64>, site: Option<OomSite>, tried: Tried },
     /// Another row asks for `bytes` under `ceiling`.
     Ask { ceiling: Class, bytes: u64 },
     /// Fetch ahead for `req` into the surplus.
     Speculate { req: u64, tried: Tried },
     /// Place a loaded set's unmapped pages into free bytes, evicting nothing.
     Load { set: u32 },
+}
+
+/// The op site an OOM happened at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OomSite {
+    pub name: String,
+    pub collective: bool,
+    /// The finest level the op has: never proposed or cut beyond.
+    pub finest: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,7 +103,7 @@ pub fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> {
             d.out
         }
         Trigger::Pass { req, set, room, unmeasured, tried } => pass(t, *req, *set, *room, *unmeasured, tried),
-        Trigger::Oom { req, set, need, site, collective, tried } => oom(t, *req, *set, *need, site.as_deref(), *collective, tried),
+        Trigger::Oom { req, set, need, site, tried } => oom(t, *req, *set, *need, site.as_ref(), tried),
         Trigger::Ask { ceiling, bytes } => answer(t, *ceiling, *bytes),
         Trigger::Speculate { req, tried } => speculate(t, *req, tried),
         Trigger::Load { set } => {
@@ -138,7 +147,7 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
             Some(Done::Remote) => return d.out,
             _ => {}
         }
-        let fresh = |s: &&CutSite| !s.stuck && !s.collective && s.peak > 0 && !cut.contains(s.name.as_str());
+        let fresh = |s: &&CutSite| !s.stuck && !s.collective && s.peak > 0 && s.level < s.finest && !cut.contains(s.name.as_str());
         if let Some(site) = sites.iter().filter(fresh).max_by_key(|s| (s.peak, std::cmp::Reverse(s.name.clone()))) {
             cut.insert(&site.name);
             d.out.push(Action::Cut { req, set, site: site.name.clone(), failed_at: d.got + held });
@@ -182,9 +191,14 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
 /// what this demand freed. Then the demand order; at its end, a cut of the op's site (never a
 /// collective's mid-pass: its finer level is proposed for the next pass), lowering, parking,
 /// exhaustion. Each answer is progress, so a sequence ends.
-fn oom(t: &Table, req: u64, set: u32, need: Option<u64>, site: Option<&str>, collective: bool, tried: &Tried) -> Vec<Action> {
+/// Outside any pass (no set) there is no site to cut and no running W to lower: the demand
+/// order, then a park, then exhaustion.
+fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&OomSite>, tried: &Tried) -> Vec<Action> {
     let Some(r) = t.request(req) else { return vec![Action::Exhausted { need: need.unwrap_or(0) }] };
-    let sites = r.sites.get(&set).map(Vec::as_slice).unwrap_or_default();
+    let sites = set.and_then(|s| r.sites.get(&s)).map(Vec::as_slice).unwrap_or_default();
+    let level = |name: &str| sites.iter().find(|s| s.name == name).map_or(0, |s| s.level);
+    // A site at its finest level is not cut or proposed further: the next rung follows.
+    let site = set.zip(site).filter(|(_, s)| level(&s.name) < s.finest);
     // Unknown: any page's worth is progress.
     let mut d = Demand::new(t, need.unwrap_or(1), Some(req), None, tried);
     d.oom = true;
@@ -192,10 +206,9 @@ fn oom(t: &Table, req: u64, set: u32, need: Option<u64>, site: Option<&str>, col
         d.got = t.free().min(tried.freed);
     }
     let mut out = vec![];
-    if let (Some(site), true) = (site, collective) {
-        if !tried.cut.contains(site) {
-            let level = sites.iter().find(|s| s.name == site).map_or(0, |s| s.level) + 1;
-            out.push(Action::Propose { req, set, site: site.to_string(), level, failed_at: Some(r.room + r.claimed + t.free()) });
+    if let Some((set, s)) = site.filter(|(_, s)| s.collective) {
+        if !tried.cut.contains(&s.name) {
+            out.push(Action::Propose { req, set, site: s.name.clone(), level: level(&s.name) + 1, failed_at: Some(r.room + r.claimed + t.free()) });
         }
     }
     match d.run(Rungs::Oom) {
@@ -204,10 +217,15 @@ fn oom(t: &Table, req: u64, set: u32, need: Option<u64>, site: Option<&str>, col
             return out;
         }
         Some(Done::Enough) => {}
+        Some(Done::Lowered) | None if set.is_none() => {
+            if d.got == 0 {
+                d.park_or_exhaust(r.episode.parked);
+            }
+        }
         Some(Done::Lowered) | None => {
-            let cuttable = site.filter(|s| !collective && !sites.iter().any(|x| x.name == *s && x.stuck));
-            if let Some(site) = cuttable {
-                d.out.push(Action::Cut { req, set, site: site.to_string(), failed_at: r.room + r.claimed + t.free() });
+            let cuttable = site.filter(|(_, s)| !s.collective && !sites.iter().any(|x| x.name == s.name && x.stuck));
+            if let Some((set, s)) = cuttable {
+                d.out.push(Action::Cut { req, set, site: s.name.clone(), failed_at: r.room + r.claimed + t.free() });
             } else {
                 if !r.lowered {
                     d.out.push(Action::Lower(req));

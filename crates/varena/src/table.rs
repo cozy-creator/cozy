@@ -191,6 +191,8 @@ pub struct Set {
 pub struct CutSite {
     pub name: String,
     pub level: u32,
+    /// The finest level its op has: never cut beyond.
+    pub finest: u32,
     /// Its measured peak at this level.
     pub peak: u64,
     /// A finer level did not lower the pass's allocated peak: not cut further at this shape.
