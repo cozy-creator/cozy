@@ -318,8 +318,10 @@ class Host:
 class Copy:
     """A run of weight copies: `h2d`, a GPU's copy stream from its first job to its last
     landing; `disk`, a host layout filled from chunk files. `ceiling` is the measured GB/s it
-    is held against (pinned H2D on that GPU, the volume's O_DIRECT read), 0 when unmeasured
-    (see `ceiling`) or, for `disk`, when the page cache served part of the run."""
+    is held against, 0 when unmeasured (see `ceiling`) or, for `disk`, when the page cache served
+    part of the run. An `h2d` run is held against its slowest stage, named by `bound`: `disk`
+    (the volume's O_DIRECT read, for bytes read past the page cache), `copy` (page cache to
+    pinned staging, for cached bytes) or `h2d` (pinned H2D on that GPU)."""
 
     @property
     def kind(self) -> str: ...
@@ -332,6 +334,8 @@ class Copy:
     @property
     def ceiling(self) -> float: ...
     @property
+    def bound(self) -> str: ...
+    @property
     def link(self) -> str: ...
     @property
     def busy_ns(self) -> int: ...
@@ -341,13 +345,16 @@ class Copy:
     def staged(self) -> int: ...
     @property
     def cached(self) -> int: ...
+    @property
+    def readers(self) -> int: ...
 
 def copies() -> list[Copy]:
     """Every copy run since the last call."""
 
 class Ceiling:
     """What reads can reach: the volume's sequential GB/s (`disk_direct`: past the page cache)
-    and, when a GPU was named, its pinned H2D GB/s and the streams that reached it."""
+    and, when a GPU was named, its pinned H2D GB/s and the streams that reached it, and its
+    readers' page cache to pinned copy GB/s and the readers that reached it."""
 
     @property
     def disk_gbps(self) -> float: ...
@@ -357,10 +364,15 @@ class Ceiling:
     def h2d_gbps(self) -> float | None: ...
     @property
     def streams(self) -> int | None: ...
+    @property
+    def copy_gbps(self) -> float | None: ...
+    @property
+    def copy_readers(self) -> int | None: ...
 
 def ceiling(device: int | None = None, path: str | os.PathLike[str] | None = None) -> Ceiling:
     """Measures the ceilings `Copy.ceiling` holds runs against, unless kept this boot: `path`'s
-    volume (default: the TensorFS cache) and, with `device`, pinned H2D to that GPU. Reads never
+    volume (default: the TensorFS cache) and, with `device`, pinned H2D to that GPU and its
+    readers' page cache to pinned copy. Reads never
     measure; a `Copy` is unmeasured (ceiling 0) until this runs, and a run faster than its
     ceiling raises it."""
 

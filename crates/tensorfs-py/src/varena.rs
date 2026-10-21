@@ -120,7 +120,8 @@ record!(PyGpuStats = "GpuStats" from GpuStats {
 });
 
 record!(PyCopy = "Copy" from Copy {
-    kind: String, gpu: i32, bytes: u64, ns: u64, ceiling: f64, link: String, busy_ns: u64, pin_ns: u64, staged: u64, cached: u64
+    kind: String, gpu: i32, bytes: u64, ns: u64, ceiling: f64, bound: String, link: String, busy_ns: u64, pin_ns: u64, staged: u64, cached: u64,
+    readers: u64
 });
 
 /// Every run of weight copies since the last call (`h2d`: a GPU's copy stream from its first job
@@ -131,7 +132,8 @@ fn copies() -> Vec<PyCopy> {
 }
 
 record!(PyCeiling = "Ceiling" from tensorfs::io::Ceiling {
-    disk_gbps: f64, disk_direct: bool, h2d_gbps: Option<f64>, streams: Option<u32>
+    disk_gbps: f64, disk_direct: bool, h2d_gbps: Option<f64>, streams: Option<u32>, copy_gbps: Option<f64>,
+    copy_readers: Option<u32>
 });
 
 /// What reads can reach, measured unless kept this boot: `path`'s volume (default: the TensorFS

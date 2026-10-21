@@ -277,10 +277,14 @@ async fn run(args: &Args) -> Done {
                 kind: if e.kind() == std::io::ErrorKind::Unsupported { Kind::Unsupported } else { Kind::Io },
                 detail: format!("{}: {e}", path.display()),
             })?;
-            let doc = json!({"disk_gbps": c.disk_gbps, "disk_direct": c.disk_direct, "h2d_gbps": c.h2d_gbps, "streams": c.streams});
+            let doc = json!({"disk_gbps": c.disk_gbps, "disk_direct": c.disk_direct, "h2d_gbps": c.h2d_gbps, "streams": c.streams,
+                "copy_gbps": c.copy_gbps, "copy_readers": c.copy_readers});
             let mut human = format!("disk {:.2} GB/s{}", c.disk_gbps, if c.disk_direct { "" } else { " (through the page cache)" });
             if let Some(h2d) = c.h2d_gbps {
                 human += &format!("\nh2d {h2d:.2} GB/s on {} streams", c.streams.unwrap_or(1));
+            }
+            if let Some(copy) = c.copy_gbps {
+                human += &format!("\ncopy {copy:.2} GB/s on {} readers (page cache to pinned)", c.copy_readers.unwrap_or(1));
             }
             Ok(Some((doc, human)))
         }
