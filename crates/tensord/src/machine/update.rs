@@ -260,20 +260,6 @@ impl Paths {
     }
 }
 
-/// A pre-cohort machine update may have activated the TensorD its Runtime wheel bundled
-/// (`agent/current`). This machine is the cozy binary and never runs another: the activation
-/// is removed, once.
-pub fn retire_agent(paths: &Paths) {
-    let agent = paths.engine.join("agent");
-    if fs::symlink_metadata(&agent).is_err() {
-        return;
-    }
-    match fs::remove_dir_all(&agent) {
-        Ok(()) => tracing::info!("retired the TensorD a pre-cohort update activated ({})", agent.display()),
-        Err(error) => tracing::warn!("{}: {error}; it is never run", agent.display()),
-    }
-}
-
 /// Restores what a failed activation replaced: the SDK link, and a binary activation's previous
 /// binary, renamed back over the launch path.
 pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<Recovered> {
