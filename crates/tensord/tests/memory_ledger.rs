@@ -13,6 +13,7 @@ use std::{
     sync::{mpsc, Arc},
     time::Duration,
 };
+use platform::contain::host_pressure::HostMode;
 use tensord::{
     execution::Engine,
     journal::Invocation,
@@ -208,7 +209,7 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("a");
-    let gpu = Gpu::create("0", &[inventory(&id)], None, &peaks, &log).expect("a ledger for an inventoried GPU");
+    let gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).expect("a ledger for an inventoried GPU");
     let (woke, wakes) = mpsc::channel();
     let _events = memory::react(&[&gpu.ledger], move || {
         let _ = woke.send(());
@@ -257,9 +258,23 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
     // Peaks persist per GPU model: another GPU of the model starts with them.
     peaks.save(&id.model, std::iter::once(&gpu.ledger));
     let other = gpu_id("b");
-    let restored = Gpu::create("0", &[inventory(&other)], None, &Peaks::at(dir.path().join("peaks")), &log).unwrap();
+    let restored = Gpu::create("0", &[inventory(&other)], None, HostMode::Dedicated, &Peaks::at(dir.path().join("peaks")), &log).unwrap();
     assert!(restored.ledger.peaks().iter().any(|peak| peak.key == format!("{PACKAGE}|8")));
     drop(second);
+}
+
+/// Two requests at `BIG`: the first measures its pass's room, the second its working set (more
+/// than half the card).
+fn measure(a: &mut StandIn, request: &dyn Fn(&str) -> String, admit: &dyn Fn(&str) -> bool, gpu: &Gpu) {
+    for key in ["measure-room", "measure-set"] {
+        let id = request(key);
+        assert!(admit(&id), "an idle GPU admits it");
+        assert_eq!(a.ask(&format!("run {id} {BIG}")), "passing");
+        assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
+        gpu.ledger.undispatch(&id);
+    }
+    let set = gpu.ledger.peaks().into_iter().find(|peak| peak.key == format!("{PACKAGE}|{BIG}")).map(|peak| peak.bytes);
+    assert!(set.is_some_and(|bytes| bytes > gpu.status().capacity / 2), "{set:?}");
 }
 
 /// A request whose measured working set does not fit beside a running one waits for it to end,
@@ -269,7 +284,7 @@ fn a_request_that_does_not_fit_waits_until_the_running_one_ends() {
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("wait");
-    let gpu = Gpu::create("0", &[inventory(&id)], None, &peaks, &log).unwrap();
+    let gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap();
     let engine = Engine::open(&dir.path().join("engine")).unwrap();
     let woken = engine.clone();
     let _events = memory::react(&[&gpu.ledger], move || woken.notify_activity()).unwrap();
@@ -279,12 +294,7 @@ fn a_request_that_does_not_fit_waits_until_the_running_one_ends() {
     let a_pid = a.pid();
     let running = |gpu: &Gpu| gpu.status().rows.iter().any(|row| row.pid == a_pid && (row.remaining > 0 || row.unmeasured > 0));
 
-    // Measured once: more than half the card.
-    let first = request("first");
-    assert!(admit(&first), "an idle GPU admits it");
-    assert_eq!(a.ask(&format!("run {first} {BIG}")), "passing");
-    assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
-    gpu.ledger.undispatch(&first);
+    measure(&mut a, &request, &admit, &gpu);
     let second = request("second");
     assert!(admit(&second), "alone, it fits");
     assert_eq!(a.ask(&format!("run {second} {BIG}")), "passing");
@@ -319,4 +329,40 @@ fn a_request_that_does_not_fit_waits_until_the_running_one_ends() {
     });
     assert!(!gpu.status().dispatched.iter().any(|(request, _)| *request == fifth));
     assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
+}
+
+/// A child call on its family's own lane is its family's: its parent, blocked on it between
+/// passes, still counts its remaining working set, so `fits` refuses the child (waiting would
+/// never end). Dispatched under its own key, the child runs and the parent completes.
+#[test]
+fn a_child_on_its_familys_lane_runs_while_its_parent_waits_on_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
+    let id = gpu_id("family");
+    let gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap();
+    let engine = Engine::open(&dir.path().join("engine")).unwrap();
+    let request = |key: &str| engine.submit(key, Invocation::default()).unwrap().id;
+    let admit = |id: &str| memory::admit(&engine, &[&gpu.ledger], id, PACKAGE, BIG).unwrap();
+    let mut parent = StandIn::spawn(&gpu, &id, "gpu");
+    measure(&mut parent, &request, &admit, &gpu);
+    let call = request("parent");
+    assert!(admit(&call));
+    assert_eq!(parent.ask(&format!("open {call}")), "open");
+    assert_eq!(parent.ask(&format!("pass {BIG}")), "passing");
+    assert_eq!(parent.ask(&format!("done {BIG_ROOM}")), "done");
+
+    // Blocked on its child between its two passes: the child does not fit beside it.
+    const CHILD: &str = "s5/child@1";
+    assert!(!gpu.ledger.fits(CHILD, BIG) && !gpu.ledger.fits(PACKAGE, BIG));
+    let mut child = StandIn::spawn(&gpu, &id, "ram");
+    memory::dispatch(&[&gpu.ledger], "child", CHILD, BIG);
+    assert_eq!(child.ask(&format!("run child {BIG}")), "passing");
+    assert_eq!(child.ask(&format!("end {BIG_ROOM}")), "ended");
+    gpu.ledger.undispatch("child");
+    assert!(gpu.ledger.peaks().iter().any(|peak| peak.key == format!("{CHILD}|{BIG}")), "its own key's peak");
+
+    assert_eq!(parent.ask(&format!("pass {BIG}")), "passing");
+    assert_eq!(parent.ask(&format!("done {BIG_ROOM}")), "done");
+    assert_eq!(parent.ask("close"), "ended", "the parent completes");
+    gpu.ledger.undispatch(&call);
 }
