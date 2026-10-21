@@ -447,11 +447,20 @@ class Request:
         self.memory, self.native = memory, native
         self.ended: Stats | None = None
 
-    def oom(self, need: int | None = None, site: str | None = None) -> Next:
-        """An op ran out of memory: varena's answer, with torch's cap applied after it."""
-        answer = self.native.oom(need, site)
+    def plan(self, steps: Sequence[object]) -> None:
+        """Replaces the plan (as `Memory.request` takes it); its cursor starts over."""
+        self.native.plan(self.memory._plan(steps))
+
+    def oom(self, need: int | None = None, site: str | None = None, collective: bool = False) -> Next:
+        """An op ran out of memory: varena's answer, with torch's cap applied after it. A
+        `collective` site's finer level waits for the next pass's agreement."""
+        answer = self.native.oom(need, site, collective)
         self.memory._cap()
         return answer
+
+    def parked(self, nbytes: int) -> None:
+        """The bytes a `Next.Park(budget)` answer moved to the host."""
+        self.native.parked(nbytes)
 
     def cut(self, site: str) -> int:
         """The current pass's level for cut site `site` (0: whole)."""

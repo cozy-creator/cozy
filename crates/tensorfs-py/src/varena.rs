@@ -14,7 +14,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use tensorfs::format::Body;
 use varena::layout::Layout;
-use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, Next, Origin, Pass, Pin, Plan, Request, SetId, SetSpec, Step, Torch};
+use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, Next, Origin, Pass, Pin, Plan, Request, SetId, SetSpec, Site, Step, Torch};
 
 use crate::store::PyCheckpoint;
 
@@ -46,6 +46,14 @@ fn caught<T>(f: impl FnOnce() -> varena::Result<T>) -> varena::Result<T> {
 /// `f` off the GIL, its panic an `INTERNAL` error.
 fn detached<T: Send>(py: Python<'_>, gpu: &str, f: impl Send + FnOnce() -> varena::Result<T>) -> PyResult<T> {
     py.detach(|| caught(f)).map_err(|e| error(py, gpu, e))
+}
+
+/// `detached` for a call with nothing to return.
+fn done(py: Python<'_>, gpu: &str, f: impl Send + FnOnce()) -> PyResult<()> {
+    detached(py, gpu, || {
+        f();
+        Ok(())
+    })
 }
 
 /// Drops `x` off the GIL: a native drop may wait for varena's lock, whose holder may call back
@@ -134,6 +142,7 @@ pub struct PyStats {
     retries: u32,
     cuts: u32,
     parks: u32,
+    parked: u64,
     lowered: bool,
     peak: u64,
     leftover: u64,
@@ -166,6 +175,7 @@ impl From<varena::Stats> for PyStats {
             retries: s.retries,
             cuts: s.cuts,
             parks: s.parks,
+            parked: s.parked,
             lowered: s.lowered,
             peak: s.peak,
             leftover: s.leftover,
@@ -195,7 +205,8 @@ pub enum PyLevel {
 pub enum PyNext {
     Retry(),
     Cut { level: u32 },
-    Park(),
+    /// Move idle activations, up to `budget` bytes, to the host; report them with `parked`.
+    Park { budget: u64 },
     /// `error` is the `Exhausted` to raise.
     Exhausted { error: Py<PyAny> },
 }
@@ -378,7 +389,7 @@ impl PyMemory {
     }
 
     fn unload(&self, py: Python<'_>, set: u32) -> PyResult<()> {
-        detached(py, &self.gpu.uuid, || Ok(self.memory().unload(SetId(set))))
+        done(py, &self.gpu.uuid, || self.memory().unload(SetId(set)))
     }
 
     /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id.
@@ -396,17 +407,16 @@ impl PyMemory {
     }
 
     fn cached(&self, py: Python<'_>, cache: u32, nbytes: u64) -> PyResult<()> {
-        detached(py, &self.gpu.uuid, || Ok(self.memory().cached(varena::CacheId(cache), nbytes)))
+        done(py, &self.gpu.uuid, || self.memory().cached(varena::CacheId(cache), nbytes))
     }
 
     fn uncache(&self, py: Python<'_>, cache: u32) -> PyResult<()> {
-        detached(py, &self.gpu.uuid, || Ok(self.memory().uncache(varena::CacheId(cache))))
+        done(py, &self.gpu.uuid, || self.memory().uncache(varena::CacheId(cache)))
     }
 
     /// Opens request `id` with its plan: `(set names, passes)` per step.
     fn request(&self, py: Python<'_>, id: &str, plan: Vec<(Vec<String>, u32)>) -> PyResult<PyRequest> {
-        let plan = Plan { steps: plan.into_iter().map(|(sets, passes)| Step { sets, passes }).collect() };
-        let r = detached(py, &self.gpu.uuid, || self.memory().request(id, plan))?;
+        let r = detached(py, &self.gpu.uuid, || self.memory().request(id, steps(plan)))?;
         Ok(PyRequest { request: Mutex::new(Some(Arc::new(r))), gpu: self.gpu.uuid.clone() })
     }
 
@@ -430,6 +440,10 @@ impl PyMemory {
 }
 
 // ---------------------------------------------------------------- requests and passes
+
+fn steps(plan: Vec<(Vec<String>, u32)>) -> Plan {
+    Plan { steps: plan.into_iter().map(|(sets, passes)| Step { sets, passes }).collect() }
+}
 
 /// A request in flight; `end` (or leaving its `with`) ends it.
 #[pyclass(name = "Request", module = "tensorfs.varena", frozen)]
@@ -461,17 +475,30 @@ impl PyRequest {
         Ok(PyPass(Mutex::new(Some(pass))))
     }
 
-    /// An op ran out of memory, `need` more bytes when known, at cut site `site` (None: the op
-    /// cannot be cut).
-    #[pyo3(signature = (need = None, site = None))]
-    fn oom(&self, py: Python<'_>, need: Option<u64>, site: Option<&str>) -> PyResult<PyNext> {
+    /// Replaces the plan: `(set names, passes)` per step.
+    fn plan(&self, py: Python<'_>, plan: Vec<(Vec<String>, u32)>) -> PyResult<()> {
         let r = self.get(py)?;
+        done(py, &self.gpu, || r.plan(steps(plan)))
+    }
+
+    /// An op ran out of memory, `need` more bytes when known, at cut site `site` (None: the op
+    /// cannot be cut); a `collective` site's finer level waits for the next pass's agreement.
+    #[pyo3(signature = (need = None, site = None, collective = false))]
+    fn oom(&self, py: Python<'_>, need: Option<u64>, site: Option<&str>, collective: bool) -> PyResult<PyNext> {
+        let r = self.get(py)?;
+        let site = site.map(|name| Site { name, collective });
         Ok(match detached(py, &self.gpu, || Ok(r.oom(need, site)))? {
             Next::Retry => PyNext::Retry(),
             Next::Cut(level) => PyNext::Cut { level },
-            Next::Park => PyNext::Park(),
+            Next::Park(budget) => PyNext::Park { budget },
             Next::Exhausted(x) => PyNext::Exhausted { error: error(py, &self.gpu, Error::Exhausted(x)).into_value(py).into_any() },
         })
+    }
+
+    /// The bytes a `Park` answer moved to the host (0: none, and the next `oom` is Exhausted).
+    fn parked(&self, py: Python<'_>, nbytes: u64) -> PyResult<()> {
+        let r = self.get(py)?;
+        done(py, &self.gpu, || r.parked(nbytes))
     }
 
     /// The current pass's cut level for op site `site` (0: whole).
@@ -514,7 +541,7 @@ impl PyPass {
     /// and each cut site's own allocated peak.
     fn end(&self, py: Python<'_>, allocated_peak: u64, slack: u64, context: u64, sites: Vec<(String, u64)>) -> PyResult<()> {
         let Some(pass) = lock(&self.0).take() else { return Ok(()) };
-        detached(py, "", || Ok(pass.end(Measured { allocated_peak, slack, context, sites })))
+        done(py, "", || pass.end(Measured { allocated_peak, slack, context, sites }))
     }
 }
 
@@ -623,7 +650,7 @@ impl PyPin {
     /// The caller's fill (a LoRA bake) of a fresh pin completed: its pages may now be kept.
     fn filled(&self, py: Python<'_>) -> PyResult<()> {
         let pin = self.pin.clone();
-        detached(py, &self.gpu, || Ok(if let Some(p) = &pin.0 { p.filled() }))
+        done(py, &self.gpu, || pin.0.iter().for_each(Pin::filled))
     }
 
     /// A uint8 tensor of `len` bytes, consumed on the stream the pin was bound on.

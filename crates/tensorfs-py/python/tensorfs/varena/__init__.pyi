@@ -155,9 +155,15 @@ class Request:
         """A pass of `set` at `shape` (dims joined by `x`) with torch's bytes now; returns once its
         measured room is free."""
 
-    def oom(self, need: int | None = None, site: str | None = None) -> Next:
+    def plan(self, plan: list[tuple[list[str], int]]) -> None:
+        """Replaces the plan; its cursor starts over."""
+
+    def oom(self, need: int | None = None, site: str | None = None, collective: bool = False) -> Next:
         """An op ran out of memory (`need` more bytes when known) at cut site `site` (None: it
-        cannot be cut)."""
+        cannot be cut); a `collective` site's finer level waits for the next pass's agreement."""
+
+    def parked(self, nbytes: int) -> None:
+        """The bytes a `Park` answer moved to the host (0: none, and the next `oom` is Exhausted)."""
 
     def cut(self, site: str) -> int:
         """The current pass's cut level for `site` (0: whole)."""
@@ -204,7 +210,11 @@ class Next:
         def level(self) -> int: ...
 
     class Park(Next):
-        def __init__(self) -> None: ...
+        """Move idle activations, up to `budget` bytes, to the host; report them with `parked`."""
+
+        def __init__(self, budget: int) -> None: ...
+        @property
+        def budget(self) -> int: ...
 
     class Exhausted(Next):
         """`error` is the `Exhausted` to raise."""
@@ -278,6 +288,8 @@ class Stats:
     def cuts(self) -> int: ...
     @property
     def parks(self) -> int: ...
+    @property
+    def parked(self) -> int: ...
     @property
     def lowered(self) -> bool: ...
     @property
