@@ -1193,6 +1193,9 @@ fn a_class_version_is_its_configs_else_the_models_else_the_references() {
     assert_eq!(import::class_of("kandinsky", "K", &versions), c("diffusers", "0.35.1", "K"));
     assert_eq!(import::class_of("acme", "A", &versions), c("acme", "2.0", "A"));
     assert_eq!(import::class_of("transformers", "T", &versions), c("transformers", "", "T"));
+    // A dotted library is a module path of a package library: its top-level package.
+    assert_eq!(import::class_of("minimax_h3.pipeline", "X", &versions), c("minimax_h3", "", "X"));
+    assert_eq!(import::class_of("acme.models.unet", "U", &versions), c("acme", "2.0", "U"));
 }
 
 /// network: Hugging Face (configs only, no weights). The same on the full-size repos.
