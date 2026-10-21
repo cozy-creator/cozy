@@ -2943,8 +2943,8 @@ fn shape(features: &BTreeMap<String, serde_json::Value>) -> String {
     dims.collect::<Vec<_>>().join("x")
 }
 
-/// The shape a call is placed at before its executor normalizes its request: none. A package
-/// with no shape axes is measured there; any other is unmeasured, which fits only on an idle GPU.
+/// The shape a call is placed at before its executor normalizes its request: the ledger reads it
+/// as the package's widest measured shape; none measured, it fits only on an idle GPU.
 const UNPREPARED: &str = "";
 
 /// A request admitted on every GPU of its lane under `<package>|<shape>` (the key its peak is
