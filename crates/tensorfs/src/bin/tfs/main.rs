@@ -25,6 +25,7 @@ const VERBS: &[&str] = &[
     "ceiling [<path>] [--gpu <n>]              measure what reads from <path>'s volume (and to GPU n) reach",
     "conform endpoint <url> [--write] [--token-env <VAR>]",
     "dev ckpt [--name local/<name>[@tag]] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]",
+    "migrate-store                           upgrades a stopped pre-0.12 store in place, without downloading weights",
     "version",
 ];
 
@@ -190,6 +191,19 @@ async fn run(args: &Args) -> Done {
     }
     let config = config(args)?;
     let root = config.cache_dir.clone();
+    // Maintenance must precede Client::new: that opens the current store format.
+    if pos.first() == Some(&"migrate-store") {
+        if pos.len() != 1 {
+            return Ok(None);
+        }
+        let upgrade = tensorfs::migrate::store1::migrate(&root)?;
+        let migrated = upgrade.is_some();
+        let report = upgrade.as_ref().map(|u| &u.report);
+        return Ok(Some((
+            json!({"store": root, "migrated": migrated, "report": report}),
+            format!("{} {}", if migrated { "migrated" } else { "unchanged" }, root.display()),
+        )));
+    }
     let client = Client::new(config)?;
     match pos.as_slice() {
         ["convert", sources @ ..] if !sources.is_empty() => {

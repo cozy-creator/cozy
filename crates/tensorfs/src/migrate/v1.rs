@@ -64,6 +64,26 @@ pub fn manifest(bytes: &[u8]) -> Result<Option<Manifest>> {
     }
 }
 
+/// File-only v1 checkpoints are ordinary trees in the offline store transition. Keep this
+/// separate from the model reader: remote A11 must retain its existing required-header guard.
+pub(crate) fn files_only(bytes: &[u8]) -> Result<Option<BTreeMap<String, ObjectRef>>> {
+    let Ok(doc) = serde_json::from_slice::<Json>(bytes) else { return Ok(None) };
+    let Some(entries) = doc.get("entries").and_then(Json::as_array) else { return Ok(None) };
+    if entries.iter().any(|e| e["kind"] == "cozytensors") { return Ok(None); }
+    if entries.is_empty() { return bad("v1 file-only manifest is empty"); }
+    let mut files = BTreeMap::new();
+    for e in entries {
+        let Some(path) = e["path"].as_str() else { return bad("v1 file-only entry has no path") };
+        if e["kind"] != "file" { return bad(format!("v1 file-only entry {path:?} has unsupported kind")); }
+        let object: ObjectRef = serde_json::from_value(e["blob"].clone()).map_err(|e| crate::failure::Failure { kind: Kind::Invalid, detail: e.to_string() })?;
+        if files.insert(path.to_owned(), object).is_some() { return bad(format!("two v1 files at {path}")); }
+    }
+    let tree = crate::format::Tree { files };
+    // Existing tree grammar, including reserved paths and object identities; no new dialect.
+    let parsed = crate::format::Tree::from_json(&tree.to_json()?)?;
+    Ok(Some(parsed.files))
+}
+
 fn bad<T>(detail: impl Into<String>) -> Result<T> {
     fail(Kind::Invalid, detail)
 }

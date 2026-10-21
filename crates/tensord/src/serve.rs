@@ -163,7 +163,7 @@ pub fn dev(args: Dev) -> io::Result<()> {
     machine_runtime()?;
     let root = args.state;
     let generations = args.generations.unwrap_or_else(|| root.join("generations"));
-    let (_owned, store) = own(&root, &root.join("tensorfs"))?;
+    let (_owned, store) = own(&root, &root.join("tensorfs"), None)?;
     let machine = Machine::new(store.clone(), None)?;
     let service = crate::service::Service::open(&root, &generations, args.cpu_parallelism)?;
     let pool = match args.gpu_config {
@@ -205,16 +205,21 @@ pub fn dev(args: Dev) -> io::Result<()> {
 
 /// The state root's one owner: its lock held while the process lives, and the TensorFS store it
 /// serves (which may live outside `root`), claimed for this machine alone.
-fn own(root: &std::path::Path, store: &std::path::Path) -> io::Result<((std::fs::File, std::fs::File), Arc<Store>)> {
+fn own(
+    root: &std::path::Path,
+    store: &std::path::Path,
+    activation: Option<&crate::machine::update::Paths>,
+) -> io::Result<((std::fs::File, std::fs::File), Arc<Store>)> {
     std::fs::create_dir_all(root)?;
     let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .open(root.join("owner.lock"))?;
     lock.try_lock_exclusive()
         .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "state already has a machine owner"))?;
     platform::durable::set_mode(root, 0o700)?;
-    let store = crate::storage::open(store)?;
-    // The store is this machine's alone, whatever path another machine names it by.
-    let claim = crate::storage::claim(store.root())?;
+    if let Some(paths) = activation {
+        crate::machine::update::protect_store_migration(paths, store)?;
+    }
+    let (claim, store) = crate::storage::open_owned(store)?;
     Ok(((lock, claim), store))
 }
 
@@ -281,7 +286,8 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     let engine = layout.engine();
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
-    let (_owned, store) = own(&engine, &layout.store)?;
+    let paths = crate::machine::update::Paths::new(&engine, &layout.root);
+    let (_owned, store) = own(&engine, &layout.store, Some(&paths))?;
     // The machine's one downloader, held for its life: it reads the datacenter volume before the
     // Hub and fills it. A variable naming no mount point (the volume was not delivered) is none.
     let machine = Machine::new(store.clone(), layout.cache.as_deref())?;
@@ -290,7 +296,6 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     // reports the true deadline from the first frame.
     let (working, ended_ms) = service.engine.jobs(0)?;
     lifecycle.observe(crate::machine::lifecycle::Jobs { working, ended_ms }, lifecycle.epoch());
-    let paths = crate::machine::update::Paths::new(&engine, &layout.root);
     // An update's activation holds queued runs; one that ends without its restart lets them start.
     let (activating, executions) = (lifecycle.clone(), service.engine.clone());
     service.hold_while(move || activating.activating());

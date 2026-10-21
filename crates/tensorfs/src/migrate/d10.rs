@@ -237,7 +237,7 @@ pub struct Migrated {
 
 /// A lane in D10: its header, repo files and report.
 struct Lane {
-    header: ObjectRef,
+    header: Option<ObjectRef>,
     files: BTreeMap<String, ObjectRef>,
     report: Json,
 }
@@ -258,11 +258,18 @@ pub struct Migrator<'t> {
     table: &'t [Upstream],
     listings: HashMap<String, Vec<remote::Member>>,
     fetched: HashMap<String, Vec<u8>>,
+    offline: bool,
 }
 
 impl<'t> Migrator<'t> {
     pub fn new(access: remote::Access, table: &'t [Upstream]) -> Migrator<'t> {
-        Migrator { access, table, listings: HashMap::new(), fetched: HashMap::new() }
+        Migrator { access, table, listings: HashMap::new(), fetched: HashMap::new(), offline: false }
+    }
+
+    /// A local store transition preserves exactly the files it already has. Recorded source
+    /// provenance remains metadata; it neither authorizes a network request nor fills files.
+    pub(crate) fn offline() -> Migrator<'static> {
+        Migrator { offline: true, ..Migrator::new(remote::Access::default(), &[]) }
     }
 
     /// The repo document `doc` in D10, its old objects read by `read`: each release a public tag,
@@ -300,7 +307,7 @@ impl<'t> Migrator<'t> {
                             lanes.insert(manifest.clone(), lane);
                         }
                         let lane = &lanes[manifest];
-                        tree.set_variant(lane_name, lane.header.clone());
+                        if let Some(header) = &lane.header { tree.set_variant(lane_name, header.clone()); }
                         for (path, file) in &lane.files {
                             match tree.files.get(path) {
                                 Some(kept) if kept != file => conflicts.push(json!({"path": path, "dropped": lane_name, "object": file.id()})),
@@ -322,7 +329,7 @@ impl<'t> Migrator<'t> {
                     }
                     let lane = &lanes[c];
                     let mut tree = Tree { files: lane.files.clone() };
-                    tree.set_variant("", lane.header.clone());
+                    if let Some(header) = &lane.header { tree.set_variant("", header.clone()); }
                     let at = put(&mut objects, &tree)?;
                     unreleased.push(json!({"old": c.id(), "tree": at.id(), "lane": lane.report}));
                     at
@@ -336,7 +343,9 @@ impl<'t> Migrator<'t> {
             let tag = match (t.name, &t.commit) {
                 (Some(n), _) if t.public => n,
                 (n, Some(c)) if unnamed.contains(&c.sha256) => {
-                    let kind = if v1::manifest(&read(c)?)?.is_some() { "v1" } else { "v2" };
+                    let bytes = read(c)?;
+                    let file_only = self.offline && v1::files_only(&bytes)?.is_some();
+                    let kind = if file_only || v1::manifest(&bytes)?.is_some() { "v1" } else { "v2" };
                     let derived = format!("{kind}-{}", &c.sha256[..width(&c.sha256)]);
                     if n.as_ref().is_some_and(|n| *n != derived) {
                         return fail(Kind::Invalid, format!("{name}: checkpoint {} is tagged {n:?}, A11 names it {derived}", c.id()));
@@ -366,6 +375,13 @@ impl<'t> Migrator<'t> {
     /// repo files; every lane file is checked to have landed in one of them.
     fn lane(&mut self, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut Objects) -> Result<Lane> {
         let raw = read(manifest)?;
+        if self.offline {
+            if let Some(files) = v1::files_only(&raw)? {
+                // The same immutable blob references, no synthesized tensor header, network
+                // access or reading/repacking potentially large file payloads.
+                return Ok(Lane { header: None, files, report: json!({"old": manifest.id(), "files_only": true}) });
+            }
+        }
         let (chunks, tensors, mut metadata, mut bytes, v1_report) = match v1::manifest(&raw)? {
             Some(m) => {
                 let v = v1::lane(&m, &read(&m.header)?)?;
@@ -463,13 +479,13 @@ impl<'t> Migrator<'t> {
         if let Some(v1) = v1_report {
             report["from_v1"] = v1;
         }
-        Ok(Lane { header: at, files: repo_files, report })
+        Ok(Lane { header: Some(at), files: repo_files, report })
     }
 
     /// A claimed source resolves where it says (`hf://…@commit`, `civitai://<version>`):
     /// listed once. `local` and `unknown` are markers, not claims.
     fn verify(&mut self, source: &str) -> Result<()> {
-        if [LOCAL, UNKNOWN].contains(&source) || self.listings.contains_key(source) {
+        if self.offline || [LOCAL, UNKNOWN].contains(&source) || self.listings.contains_key(source) {
             return Ok(());
         }
         let listing = remote::list(&remote::parse(source)?, &self.access)?;
