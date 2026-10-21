@@ -51,6 +51,11 @@ impl Drop for Scratch {
 }
 
 /// Deterministic noise: equal only where the seed is.
+/// `object` reads through the store as its own bytes.
+fn intact(store: &Store, object: &ObjectRef) -> bool {
+    store.read(object).is_ok_and(|bytes| ObjectRef::of(&bytes) == *object)
+}
+
 fn noise(seed: u64, n: usize) -> Vec<u8> {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut out = Vec::with_capacity(n + 8);
@@ -926,7 +931,7 @@ fn a_two_variant_repo_shares_chunks_and_files_and_gc_keeps_its_closure() {
         assert!(!store.path(o).unwrap().exists(), "{} is swept", o.sha256);
     }
     for o in &closure {
-        assert!(store.verify(o).unwrap(), "{} is kept", o.sha256);
+        assert!(intact(&store, o), "{} is kept", o.sha256);
     }
 
     assert_eq!(store.variant(&at, Some("int8")).unwrap().id(), int8.id());

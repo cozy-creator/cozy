@@ -29,8 +29,7 @@ struct RefWire {
 impl TryFrom<RefWire> for ObjectRef {
     type Error = Error;
     fn try_from(w: RefWire) -> Result<Self> {
-        let hex = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
-        if w.sha256.len() != 64 || !w.sha256.bytes().all(hex) {
+        if !is_digest(&w.sha256) {
             return invalid(format!(
                 "sha256 {:?} is not 64 lowercase hex digits",
                 w.sha256
@@ -530,7 +529,13 @@ impl Header {
     }
 }
 
-pub(super) fn segment(s: &str) -> bool {
+/// 64 lowercase hex digits: a sha256 as objects are named.
+pub(crate) fn is_digest(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A path segment: not empty, `.` or `..`, and no separator or NUL.
+pub(crate) fn segment(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
 }
 

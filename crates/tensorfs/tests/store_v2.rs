@@ -149,18 +149,23 @@ fn blobs(store: &Store) -> BTreeSet<ObjectRef> {
     found
 }
 
+/// `object` reads through the store as its own bytes.
+fn intact(store: &Store, object: &ObjectRef) -> bool {
+    store.read(object).is_ok_and(|bytes| ObjectRef::of(&bytes) == *object)
+}
+
 /// The invariants after any crash: no object is torn, and everything live is whole.
 fn check(store: &Store) {
     for object in blobs(store) {
         assert!(
-            store.verify(&object).unwrap(),
+            intact(store, &object),
             "torn object {}",
             object.sha256
         );
     }
     for object in live(store) {
         assert!(
-            store.verify(&object).unwrap(),
+            intact(store, &object),
             "live object {} lost",
             object.sha256
         );
@@ -402,7 +407,7 @@ fn kill_during_put_leaves_no_torn_object() {
         Job::Put(object.clone()),
     ));
     check(&store);
-    assert!(store.verify(&expect).unwrap());
+    assert!(intact(&store, &expect));
     assert_eq!(store.put_bytes(&object).unwrap(), expect);
 
     let collected = store.clone().with_grace(Duration::ZERO).gc().unwrap();
@@ -539,7 +544,7 @@ fn an_object_reused_while_gc_sweeps_it_survives() {
     assert_eq!(store.put_bytes(&reused).unwrap(), object);
     gc.resume();
     gc.finish();
-    assert!(store.verify(&object).unwrap());
+    assert!(intact(&store, &object));
     assert!(
         !store.reuse(&other).unwrap(),
         "the untouched one is collected"
@@ -599,7 +604,7 @@ fn an_object_reused_while_gc_sweeps_it_survives() {
             "the concurrent reader gets the exact bytes"
         );
         gc.finish();
-        assert!(store.verify(&object).unwrap());
+        assert!(intact(&store, &object));
     }
 }
 
@@ -637,10 +642,10 @@ fn a_writer_racing_a_collector_loses_nothing_young_or_rooted() {
         let files = store.tree(&named.tags[0].commit).unwrap().files;
         assert_eq!(files["1.bin"], reused[i % 20]);
         for object in files.values() {
-            assert!(store.verify(object).unwrap(), "rooted object lost");
+            assert!(intact(&store, object), "rooted object lost");
         }
         let loose = ObjectRef::of(&bytes(&format!("loose-{i}"), 2000));
-        assert!(store.verify(&loose).unwrap(), "a young object was swept");
+        assert!(intact(&store, &loose), "a young object was swept");
     }
     for object in abandoned {
         assert!(!store.reuse(object).unwrap(), "old garbage outlived GC");
@@ -704,13 +709,13 @@ fn collect_drops_the_least_recently_used_first_and_never_a_root() {
     let m2_only = only(&c2, &[&c3, &ce]);
     assert_eq!((stale.objects, stale.bytes), (m2_only.len() as u64, size(&m2_only)));
     for object in c3.union(&ce) {
-        assert!(store.verify(object).unwrap(), "{} is kept", object.sha256);
+        assert!(intact(&store, object), "{} is kept", object.sha256);
     }
     check(&store);
 }
 
 #[test]
-fn admission_refuses_other_bytes_and_verify_removes_a_corrupt_copy() {
+fn admission_refuses_other_bytes() {
     let scratch = Scratch::here("admit");
     let store = Store::open(scratch.root()).unwrap();
     let good = bytes("good", 5000);
@@ -731,14 +736,6 @@ fn admission_refuses_other_bytes_and_verify_removes_a_corrupt_copy() {
 
     assert_eq!(store.put(&good[..], Some(&expect)).unwrap(), expect);
     assert_eq!(store.read(&expect).unwrap(), good);
-    let path = store.path(&expect).unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    permissions.set_readonly(false);
-    fs::set_permissions(&path, permissions).unwrap();
-    fs::write(&path, &other).unwrap();
-    assert!(!store.verify(&expect).unwrap());
-    assert_eq!(store.file(&expect).unwrap_err().code(), "absent");
 }
 
 #[test]

@@ -39,7 +39,7 @@ use platform::durable::{self, DiskClass, FileId};
 
 use crate::err::{Code, Refusal};
 use crate::fetch;
-use crate::format::{self, ObjectRef};
+use crate::format::{self, is_digest, ObjectRef};
 use crate::sha256::{hex, Sha256};
 
 /// [`crate::STORE_FORMAT`] as the store's `format` record.
@@ -157,10 +157,6 @@ pub(crate) fn invalid(path: impl Into<PathBuf>, why: impl ToString) -> Error {
         path: path.into(),
         why: why.to_string(),
     }
-}
-
-fn is_digest(text: &str) -> bool {
-    text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// `family/major[.minor]`: the same family and major as `want`.
@@ -384,38 +380,6 @@ impl Store {
             .read_to_end(&mut bytes)
             .map_err(fail("read", &path))?;
         Ok(bytes)
-    }
-
-    /// Rehashes `object`. A copy that no longer matches is removed, to be fetched again.
-    pub fn verify(&self, object: &ObjectRef) -> Result<bool> {
-        let path = self.path(object)?;
-        let mut file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(fail("open", &path)(error)),
-        };
-        let mut hash = Sha256::new();
-        let mut length = 0u64;
-        let mut buffer = vec![0; 1 << 20];
-        loop {
-            match file.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    hash.update(&buffer[..n]);
-                    length += n as u64;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(fail("read", &path)(error)),
-            }
-        }
-        if length == object.length && hex(&hash.finish()) == object.sha256 {
-            return Ok(true);
-        }
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(fail("remove", &path)(error)),
-        }
     }
 
     /// Makes every object this handle admitted durable. Ephemeral: one `syncfs`, which the

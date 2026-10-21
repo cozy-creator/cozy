@@ -18,7 +18,9 @@ pub use doc::{
 };
 pub use repo::{fnmatch, newest, newest_by, repo_key, tag_name, Repo, Resolution, Tag, Tree, CHUNKS_DIR};
 #[cfg(feature = "store")]
-pub(crate) use repo::check_file;
+pub(crate) use doc::{is_digest, segment};
+#[cfg(feature = "store")]
+pub(crate) use repo::{check_file, repo_name};
 pub use dtype::Dtype;
 pub use encode::{GlobalScale, NibbleOrder};
 pub use doc::{Pipeline, CONFIG_FILE};

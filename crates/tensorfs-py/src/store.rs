@@ -1991,35 +1991,6 @@ impl PyComponentWriter {
         })
     }
 
-    #[pyo3(signature = (key, source, from_component = None, from_key = None))]
-    fn copy(
-        &self,
-        py: Python<'_>,
-        key: String,
-        source: &PyCheckpoint,
-        from_component: Option<String>,
-        from_key: Option<String>,
-    ) -> PyResult<()> {
-        let access = source.access(py)?;
-        let component = from_component.unwrap_or_else(|| self.name.clone());
-        let from_key = from_key.unwrap_or_else(|| key.clone());
-        access.fetch_tensors(
-            py,
-            &component,
-            &[FetchTensor {
-                key: &from_key,
-                role: None,
-                range: None,
-            }],
-        )?;
-        let source = access.component(&component).or_raise(py)?.clone();
-        self.w.get().with(py, |writer| {
-            writer
-                .component_writer(&self.name)?
-                .copy(&from_key, &source, Some(&key))
-        })
-    }
-
     fn asset(&self, py: Python<'_>, name: String, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes = Bytes::of(data)?;
         self.w.get().with(py, |writer| {

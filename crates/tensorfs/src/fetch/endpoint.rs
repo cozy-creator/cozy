@@ -33,7 +33,7 @@ use super::origin::{Location, Origin};
 use super::policy::is_loopback_origin;
 use super::token::{default_for, s3_base, Request, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{repo_key, Header, ObjectRef, Repo, Tree};
+use crate::format::{is_digest, repo_key, repo_name, Header, ObjectRef, Repo, Tree};
 use crate::sha256::{digest, hex, hex_digest};
 use crate::store::Store;
 
@@ -299,7 +299,7 @@ impl Endpoint {
     /// An object named by digest, including its length, or `None` when absent or unreadable.
     pub async fn object(&self, sha256: &str) -> Result<Option<ObjectRef>> {
         let sha256 = sha256.strip_prefix("sha256:").unwrap_or(sha256);
-        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        if !is_digest(sha256) {
             return refuse(Code::MALFORMED_DIGEST, "an object digest must be 64 lowercase hex digits");
         }
         let mut object = ObjectRef { sha256: sha256.to_owned(), length: 0 };
@@ -881,10 +881,9 @@ impl Drop for Stream {
 
 // Generic endpoints use format segments, independent of a Hub's catalog name policy.
 fn check_repo_name(name: &str) -> Result<()> {
-    let segment = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0']);
-    match name.split_once('/') {
-        Some((org, name)) if segment(org) && segment(name) => Ok(()),
-        _ => refuse(Code::KEY_GRAMMAR, format!("{name:?} is not <org>/<name>")),
+    match repo_name(name) {
+        true => Ok(()),
+        false => refuse(Code::KEY_GRAMMAR, format!("{name:?} is not <org>/<name>")),
     }
 }
 

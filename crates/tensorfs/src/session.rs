@@ -27,7 +27,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::failure::{fail, Failure, Kind, Result};
-use crate::format::ObjectRef;
+use crate::format::{is_digest, repo_name, ObjectRef};
 use crate::store::Store;
 
 /// Locations and an ordinary supplied provider. Credentials are never formatted.
@@ -104,11 +104,8 @@ impl FromStr for Ref {
                 "a digest is sha256: followed by 64 lowercase hex digits",
             );
         }
-        if digest.is_none() {
-            let parts: Vec<_> = name.split('/').collect();
-            if parts.len() != 2 || parts.iter().any(|s| !segment(s)) {
-                return fail(Kind::Invalid, "a repository is <org>/<name>");
-            }
+        if digest.is_none() && !repo_name(name) {
+            return fail(Kind::Invalid, "a repository is <org>/<name>");
         }
         Ok(Self {
             repo_id: name.to_owned(),
@@ -117,16 +114,6 @@ impl FromStr for Ref {
             endpoint: None,
         })
     }
-}
-
-fn segment(s: &str) -> bool {
-    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
-}
-
-fn is_digest(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
 #[derive(Clone, Debug)]
