@@ -245,12 +245,6 @@ impl Allocations {
         }
         Some(Permit { table: self.clone(), devices })
     }
-    /// Another call of the family calling on `devices` holds one of them: a child on (part of)
-    /// its family's lane.
-    pub(crate) fn shared(&self, devices: Range<usize>) -> bool {
-        let table = self.table.lock().unwrap();
-        devices.clone().any(|d| table.gpus.get(d).is_some_and(|gpu| gpu.calling > 1))
-    }
     /// Machine upkeep on `devices` (ending idle executors): no call there.
     pub(crate) fn upkeep(self: &Arc<Self>, devices: Range<usize>) -> Option<Permit> {
         let mut table = self.table.lock().unwrap();
@@ -355,22 +349,9 @@ mod tests {
         assert!(gpus.call(Some(8), Some("8"), 0..1, &[None]).is_none(), "another root waits");
         assert!(gpus.call(Some(7), None, 0..1, &[None]).is_none(), "an unrelated call waits");
         let child = gpus.call(Some(7), Some("7"), 0..1, &[None]).unwrap();
-        assert!(gpus.shared(0..1), "the child runs on its family's own lane");
         drop(parent);
-        assert!(!gpus.shared(0..1), "alone there now");
         assert!(gpus.upkeep(0..1).is_none(), "the child still calls there");
         drop(child);
         assert!(gpus.call(Some(8), Some("8"), 0..1, &[None]).is_some());
-    }
-
-    #[test]
-    fn a_child_whose_lane_partly_overlaps_its_familys_is_its_familys() {
-        let gpus = Allocations::new(2);
-        let parent = gpus.call(Some(9), Some("9"), 0..1, &[None, None]).unwrap();
-        let child = gpus.call(Some(9), Some("9"), 0..2, &[None, None]).unwrap();
-        assert!(gpus.shared(0..2), "one GPU of its lane is its family's");
-        drop(parent);
-        assert!(!gpus.shared(0..2));
-        drop(child);
     }
 }
