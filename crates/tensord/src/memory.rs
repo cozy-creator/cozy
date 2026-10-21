@@ -35,9 +35,9 @@ pub struct Gpu {
 
 impl Gpu {
     /// `entry`'s ledger, sized by the inventory's memory (an integrated GPU's is the host's) and
-    /// never above `limit`, with the peaks this machine measured on its model. None when the
-    /// inventory does not name it or its table cannot be made.
-    pub fn create(entry: &str, inventory: &[receipt::Gpu], limit: Option<u64>, peaks: &Peaks, log: &MemoryLog) -> Option<Gpu> {
+    /// never above `limit`, in the machine's sharing `mode`, with the peaks this machine measured
+    /// on its model. None when the inventory does not name it or its table cannot be made.
+    pub fn create(entry: &str, inventory: &[receipt::Gpu], limit: Option<u64>, mode: HostMode, peaks: &Peaks, log: &MemoryLog) -> Option<Gpu> {
         let row = inventory.iter().find(|g| g.device_index.to_string() == entry || g.device_uuid == entry)?;
         let id = GpuId { uuid: row.device_uuid.clone(), model: row.device_name.clone(), memory: row.memory_bytes };
         let ledger = match Ledger::create(&id, limit) {
@@ -47,6 +47,13 @@ impl Gpu {
                 return None;
             }
         };
+        let mode = match mode {
+            HostMode::Shared => varena::ledger::Mode::Shared,
+            HostMode::Dedicated => varena::ledger::Mode::Dedicated,
+        };
+        if let Err(error) = ledger.set_mode(mode) {
+            tracing::warn!("memory: GPU {entry} stays shared: {error}");
+        }
         peaks.restore(&id.model, &ledger);
         log.note(serde_json::json!({"event": "ledger", "gpu": entry, "card": id.memory, "capacity": ledger.status().capacity}));
         Some(Gpu { ledger, model: id.model })
