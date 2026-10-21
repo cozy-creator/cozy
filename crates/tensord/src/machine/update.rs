@@ -70,6 +70,9 @@ pub struct Status {
     /// Every state it passed through: the update's run log.
     #[serde(default)]
     pub history: Vec<Step>,
+    /// What the update did besides its software (an older store deleted or restored).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Step {
@@ -243,7 +246,7 @@ impl Paths {
             config: platform::paths::Home::under(&home).config(),
         }
     }
-    fn update(&self, name: &str) -> PathBuf {
+    pub(crate) fn update(&self, name: &str) -> PathBuf {
         self.engine.join("update").join(name)
     }
     fn current_sdk_link(&self) -> PathBuf {
@@ -268,6 +271,15 @@ pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<Recovered> {
     };
     let mut status = latest(paths, pending.status)?;
     status.error = cause.into();
+    // The software rolled back to finds its store; one that cannot come back pulls again.
+    match super::older_store::restore(paths) {
+        Ok(true) => status.notes.push("restored the older-format TensorFS store for the software rolled back to".into()),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!("cannot restore the older-format TensorFS store: {error}");
+            status.notes.push(format!("the older-format TensorFS store was not restored: {error}"));
+        }
+    }
     status.enter("rolled_back");
     // Persist the decision before changing the link. A crash during rollback then resumes
     // rollback, even when the candidate had already published its starting marker.
@@ -350,6 +362,49 @@ fn remove_pending(paths: &Paths) -> io::Result<()> {
     fs::remove_file(paths.update("pending.json"))?;
     platform::durable::sync_dir(&paths.update("")).map_err(io::Error::from)
 }
+
+/// Whether an activation is in flight: a rollback may still return to the software before it.
+pub(crate) fn in_flight(paths: &Paths) -> io::Result<bool> {
+    Ok(fs::symlink_metadata(paths.update("pending.json")).is_ok())
+}
+
+/// A small durable record beside the update's (`older-store`, `service-error`).
+pub(crate) fn write_marker(paths: &Paths, name: &str, text: &str) -> io::Result<()> {
+    fs::create_dir_all(paths.update(""))?;
+    super::identity::write_atomic(&paths.update(name), text.as_bytes(), 0o600)
+}
+
+pub(crate) fn read_marker(paths: &Paths, name: &str) -> io::Result<Option<String>> {
+    match fs::read_to_string(paths.update(name)) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn remove_marker(paths: &Paths, name: &str) -> io::Result<()> {
+    match fs::remove_file(paths.update(name)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// The service's own last words before it exited unready, for its parent's rollback reason.
+pub fn service_failed(paths: &Paths, error: &dyn std::fmt::Display) {
+    let line = error.to_string().lines().last().unwrap_or_default().chars().take(1000).collect::<String>();
+    if let Err(write) = write_marker(paths, SERVICE_ERROR, &line) {
+        tracing::warn!("cannot record the service's error for its parent: {write}");
+    }
+}
+
+/// What the last service that failed said, taken (each is read once).
+pub fn service_error(paths: &Paths) -> Option<String> {
+    let line = read_marker(paths, SERVICE_ERROR).ok().flatten()?;
+    let _ = remove_marker(paths, SERVICE_ERROR);
+    Some(line).filter(|l| !l.trim().is_empty())
+}
+
+const SERVICE_ERROR: &str = "service-error";
 
 /// The activation's status as last written (its later steps), else as it was when pending.
 /// A missing status has its pending fallback; an unreadable status must not commit by accident.
@@ -464,6 +519,11 @@ impl Updates {
         }
         status.to = this_binary(identified(&self.paths.sdk())?);
         status.error.clear();
+        // Nothing rolls back to an older store now: it goes.
+        if let Some(note) = super::older_store::reclaim(&self.paths)? {
+            tracing::warn!("{note}");
+            status.notes.push(note);
+        }
         status.enter("succeeded");
         if let Some(launch) = &pending.binary {
             let marker = self.paths.engine.join(DEV);
@@ -1615,6 +1675,19 @@ mod tests {
         fs::create_dir(transaction.paths.update("pending.json")).unwrap();
         assert!(recover_activation(&transaction.paths).is_err());
         assert!(rollback_pending(&transaction.paths, "test").is_err());
+    }
+
+    /// A service that exits unready leaves its last error line for its parent's rollback
+    /// reason, read once.
+    #[test]
+    fn a_failed_service_leaves_its_last_error_line_for_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(&dir.path().join("engine"), dir.path());
+        assert_eq!(service_error(&paths), None);
+        let error = io::Error::other("opening the store\n/var/lib/tensorfs/format: is a tensorfs.store/2 store");
+        service_failed(&paths, &error);
+        assert_eq!(service_error(&paths).as_deref(), Some("/var/lib/tensorfs/format: is a tensorfs.store/2 store"));
+        assert_eq!(service_error(&paths), None);
     }
 
     #[test]

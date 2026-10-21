@@ -72,7 +72,8 @@ pub fn supervise(
         }
         failures_before_ready = if ready { 0 } else { failures_before_ready + 1 };
         if failures_before_ready >= 2 {
-            let cause = format!("the service exited twice before readiness ({code})");
+            let said = super::update::service_error(paths).map(|line| format!(": {line}")).unwrap_or_default();
+            let cause = format!("the service exited twice before readiness ({code}){said}");
             if let Recovered::Nothing = super::update::rollback_pending(paths, &cause)? {
                 tracing::error!("{cause}; stopping");
                 std::process::exit(code);
@@ -151,7 +152,8 @@ pub fn supervise(paths: &super::update::Paths, provider: Option<ProviderSelf>) -
         }
         failures_before_ready = if ready { 0 } else { failures_before_ready + 1 };
         if failures_before_ready >= 2 {
-            let cause = format!("the service exited twice before readiness ({code})");
+            let said = super::update::service_error(paths).map(|line| format!(": {line}")).unwrap_or_default();
+            let cause = format!("the service exited twice before readiness ({code}){said}");
             match super::update::rollback_pending(paths, &cause)? {
                 Recovered::Nothing => {
                     tracing::error!("{cause}; stopping");

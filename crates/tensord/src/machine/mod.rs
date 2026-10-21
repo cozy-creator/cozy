@@ -7,6 +7,7 @@ pub mod grant;
 pub mod hub;
 pub mod identity;
 pub mod lifecycle;
+pub mod older_store;
 pub mod net;
 pub mod player;
 pub mod probe;

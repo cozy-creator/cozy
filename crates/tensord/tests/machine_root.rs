@@ -222,3 +222,28 @@ async fn the_named_store_is_the_machines_store() {
     drop(machine);
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// A machine whose store an older TensorFS left (`tensorfs.store/2`, as an image or a laptop
+/// upgraded from 0.10 holds) starts and serves on a new store in the same place. With no update
+/// in flight nothing can roll back to the old one: it is gone, never a second store on disk.
+#[test]
+fn a_store_from_an_older_tensorfs_gives_way_to_a_new_one() {
+    let root = scratch("machine-older-store");
+    let store = root.join("box/tensorfs");
+    for (path, bytes) in [("format", &br#"{"format":"tensorfs.store/2"}"#[..]), ("blobs/ab/cd/abcd", &[7; 4096][..]), ("refs/local/m.json", b"{}")] {
+        std::fs::create_dir_all(store.join(path).parent().unwrap()).unwrap();
+        std::fs::write(store.join(path), bytes).unwrap();
+    }
+    let machine_root = root.join("machine");
+    std::fs::create_dir_all(&machine_root).unwrap();
+    let port = free_port();
+    let mut machine = boot(&machine_root, port, Some(&store));
+    ready(&mut machine, &machine_root, port);
+
+    let format = std::fs::read_to_string(store.join("format")).unwrap();
+    assert!(format.contains(tensorfs::store::FORMAT), "{format}");
+    assert!(!store.join("blobs/ab").exists() && !store.join("tmp/older-store").exists(), "the older store stayed");
+    assert!(Store::open(&store).unwrap().put_bytes(b"a new object").is_ok());
+    drop(machine);
+    std::fs::remove_dir_all(&root).unwrap();
+}
