@@ -6,8 +6,8 @@ use std::{
 
 use protocol::{
     calcifer::{
-        self, Ended, Keepalive, Machine, MachineKind, MachineList, MachineState, On, RunsEvent,
-        StagedInput, SubmitRun,
+        self, Ended, Keepalive, Machine, MachineKind, MachineList, MachineState, MachineStatus, On,
+        RunsEvent, StagedInput, SubmitRun,
     },
     error::{Error, Kind},
     ids::Digest,
@@ -209,7 +209,8 @@ pub async fn keepalive(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
 /// Updates a machine's Runtime and TensorFS: to wheels when named (a local file is written to the
 /// machine with the run; an `https://…#sha256=<hex>` URL the machine fetches itself; a TensorFS not
 /// named is the machine's own, or the one uv resolves for the Runtime), else to its Hub's target. A numbered run of kind update, which
-/// waits for the work the machine accepted and is followed like any run.
+/// waits for the work the machine accepted and is followed like any run; once it succeeds, the
+/// machine must report what it asked for.
 pub async fn update(
     ctx: &Context,
     name: &str,
@@ -219,7 +220,7 @@ pub async fn update(
     gpu_memory_limit: Option<u64>,
 ) -> Result<ExitCode, Error> {
     let mut payload = serde_json::Map::new();
-    let (mut staged, mut inputs, mut named) = (vec![], vec![], vec![]);
+    let (mut staged, mut inputs, mut named, mut want) = (vec![], vec![], vec![], vec![]);
     let dev = tensord.is_some();
     // An empty distribution: the dev `cozy` binary.
     for (member, distribution, path) in [
@@ -230,11 +231,13 @@ pub async fn update(
         let Some(path) = path else { continue };
         if let Some(at) = path.to_str().filter(|p| p.contains("://")) {
             let (file, fetched) = fetched(at, distribution)?;
+            want.push(reports(member, &file));
             named.push(format!("{member} {file}"));
             payload.insert(member.into(), fetched);
             continue;
         }
         let (file, input) = wheel(&path, distribution)?;
+        want.push(reports(member, &file));
         named.push(format!("{member} {file}"));
         inputs.push(v1::InputFile {
             field: member.into(),
@@ -288,6 +291,8 @@ pub async fn update(
         }
         named.push(format!("runtime {}", target.runtime));
         named.push(format!("tensorfs {}", target.tensorfs));
+        want.push(("runtime", target.runtime.as_str().into()));
+        want.push(("tensorfs", target.tensorfs.as_str().into()));
         payload.insert("runtime".into(), target.runtime.into());
         payload.insert("tensorfs".into(), target.tensorfs.into());
     }
@@ -312,6 +317,9 @@ pub async fn update(
     };
     let submitted = crate::run::submit(ctx, submit, None).await?;
     let run = crate::run::follow(ctx, submitted.run, false).await?;
+    if run.status == calcifer::Status::Completed && !want.is_empty() {
+        verify(ctx, &m.name, run.id.as_str(), &want).await?;
+    }
     if dev && m.kind == MachineKind::Local && run.status == calcifer::Status::Completed {
         // `local` runs the installed cozy, the dev binary now: Calcifer runs it too.
         crate::daemon::restart(ctx).await?;
@@ -322,6 +330,52 @@ pub async fn update(
         ));
     }
     Ok(crate::run::exit_code(&run))
+}
+
+/// What a machine running `file` as an update's `member` reports: a wheel's version, or a dev cozy.
+fn reports(member: &'static str, file: &str) -> (&'static str, serde_json::Value) {
+    match member {
+        "binary" => ("dev", true.into()),
+        _ => (member, file.split('-').nth(1).unwrap_or_default().into()),
+    }
+}
+
+/// A succeeded update must leave the machine reporting what it asked for (`want`): one that
+/// ignored what it could not carry out fails here, with its log's line about the update.
+async fn verify(ctx: &Context, name: &str, run: &str, want: &[(&str, serde_json::Value)]) -> Result<(), Error> {
+    let m = machine(ctx, name).await?;
+    let status = m.status.unwrap_or_default();
+    if m.unreachable.is_none() && runs(&status, want) {
+        return Ok(());
+    }
+    let log = format!("{}/logs/tensord?lines=1000", route(name)?);
+    let log = ctx.calcifer().await?.text(&log).await.unwrap_or_default();
+    let line = m.unreachable.or_else(|| log.lines().rfind(|l| l.contains(run)).map(str::to_owned));
+    Err(unapplied(name, &status, want, line.as_deref()))
+}
+
+fn runs(status: &MachineStatus, want: &[(&str, serde_json::Value)]) -> bool {
+    let status = serde_json::to_value(status).unwrap_or_default();
+    want.iter().all(|(field, value)| status[*field] == *value)
+}
+
+fn unapplied(name: &str, s: &MachineStatus, want: &[(&str, serde_json::Value)], line: Option<&str>) -> Error {
+    let asked: Vec<String> = (want.iter())
+        .map(|(field, value)| match (*field, value.as_str()) {
+            ("runtime", Some(version)) => format!("cozy-runtime {version}"),
+            (field, Some(version)) => format!("{field} {version}"),
+            _ => "dev build".into(),
+        })
+        .collect();
+    let build = if s.dev { "dev build" } else { "release" };
+    let mut message = format!(
+        "{name}'s update succeeded but it runs cozy {} ({build} {}), cozy-runtime {}, tensorfs {}, not the requested {}",
+        s.version, s.commit.get(..12).unwrap_or(&s.commit), s.runtime, s.tensorfs, asked.join(", ")
+    );
+    if let Some(line) = line {
+        message = format!("{message}: {}", line.trim());
+    }
+    Error::new(Kind::Conflict, "update_unapplied", message).next(format!("cozy machine logs {name}"))
 }
 
 /// `cozy machine toolchain install`: CUDA's compiler, headers and ninja onto a machine, as an
@@ -450,4 +504,29 @@ fn up_to_date(ctx: &Context, m: &Machine, target: &str) -> Result<ExitCode, Erro
 fn newer(a: &str, b: &str) -> bool {
     let parts = |v: &str| -> Vec<u64> { v.split('.').map_while(|p| p.parse().ok()).collect() };
     parts(a) > parts(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TensorD 0.10.1 ignores an update's `binary` and succeeds unapplied: the update fails, typed,
+    /// naming what it asked for, what runs, and the machine's own line about it.
+    #[test]
+    fn an_update_that_succeeded_unapplied_fails_naming_requested_and_running() {
+        let old = MachineStatus {
+            version: "0.10.1".into(), commit: "3f2a1b9c4d5e6f708192".into(), runtime: "0.27.4".into(),
+            tensorfs: "0.10.0".into(), ..Default::default()
+        };
+        let want = [reports("binary", "cozy"), reports("runtime", "cozy_runtime-0.30.1-py3-none-any.whl")];
+        assert!(!runs(&old, &want));
+        let line = r#"WARN update r1: ignoring unknown payload field "binary""#;
+        let error = unapplied("pod", &old, &want, Some(line));
+        assert_eq!((error.kind, error.code.as_str()), (Kind::Conflict, "update_unapplied"));
+        assert_eq!(error.message, "pod's update succeeded but it runs cozy 0.10.1 (release 3f2a1b9c4d5e), \
+            cozy-runtime 0.27.4, tensorfs 0.10.0, not the requested dev build, cozy-runtime 0.30.1: \
+            WARN update r1: ignoring unknown payload field \"binary\"");
+        let new = MachineStatus { dev: true, runtime: "0.30.1".into(), ..old };
+        assert!(runs(&new, &want));
+    }
 }
