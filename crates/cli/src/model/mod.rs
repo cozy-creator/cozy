@@ -186,9 +186,6 @@ pub(crate) struct Yank {
 pub(crate) struct Delete {
     /// org/name, or org/name#sha256:… for one unreleased checkpoint.
     model: String,
-    /// Confirm: a deletion cannot be undone.
-    #[arg(long)]
-    yes: bool,
 }
 
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {

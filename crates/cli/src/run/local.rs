@@ -65,7 +65,13 @@ pub(super) async fn run(
         (None, [only]) if script => (*only).to_owned(),
         (None, _) => {
             super::unnamed(&local.package, None, &installed.interface, &args)?;
-            super::functions_of(ctx, &local.package, "local", None, &installed.interface);
+            super::functions_of(
+                ctx,
+                &local.package,
+                ("local", ""),
+                None,
+                &installed.interface,
+            );
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -118,6 +124,7 @@ pub(crate) fn install_run(home: &Home, hub: &str, on: On, local: &Local) -> Subm
         ..Default::default()
     };
     SubmitRun {
+        agreed: None,
         on,
         hub: hub.to_owned(),
         kind: RunKind::Warm,

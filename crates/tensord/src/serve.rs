@@ -370,6 +370,16 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     if let Some(hub) = grant.hub.clone().filter(|_| rental) {
         identity.hubs = vec![(hub.origin.clone(), hub.worker_id.clone())];
         let hub = Arc::new(crate::machine::hub::Hub::new(hub)?);
+        let (reporter, handle) = (hub.clone(), runtime.handle().clone());
+        service.on_stall(move || {
+            let hub = reporter.clone();
+            handle.spawn(async move {
+                match hub.report_stalled().await {
+                    Ok(()) => tracing::info!("told the Hub a preparation here made no progress"),
+                    Err(error) => tracing::warn!("the stalled preparation's report: {error}"),
+                }
+            });
+        });
         let service = service.clone();
         let provider = grant.provider.clone();
         std::thread::Builder::new()

@@ -18,6 +18,8 @@ use crate::{calcifer_client::Client, output::Term};
 #[derive(Debug)]
 pub struct Context {
     pub json: bool,
+    /// `--yes`: agreed without being asked.
+    pub yes: bool,
     pub config: Config,
     pub home: Home,
     /// The user's home directory: services and `~` are relative to it.
@@ -27,9 +29,10 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(json: bool, loaded: Loaded, term: Term) -> Self {
+    pub fn new(json: bool, yes: bool, loaded: Loaded, term: Term) -> Self {
         Self {
             json,
+            yes,
             config: loaded.config,
             home: loaded.home,
             user_home: loaded.user_home,
@@ -139,7 +142,8 @@ pub fn hub_error(error: impl Into<hub_client::Error>) -> Error {
             }
             error
         }
-        Hub::Call(message) => Error::new(Kind::Unavailable, "hub_unreachable", message),
+        Hub::Call(message) => Error::new(Kind::Unavailable, "hub_unreachable", message)
+            .remedy("check this computer's internet connection, then try again"),
         Hub::Credential(message) | Hub::Key(message) => {
             Error::new(Kind::Credential, "hub_credential", message).next("cozy login <email>")
         }

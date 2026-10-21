@@ -55,6 +55,7 @@ fn rental(name: &str, id: &str, machine: Option<&Tensord>, key: &Path) -> Machin
 
 fn submit(on: &str, spec: v1::RunSpec) -> SubmitRun {
     SubmitRun {
+        agreed: None,
         on: on.to_owned().into(),
         hub: "https://tensorhub.com".into(),
         kind: Kind::Warm,

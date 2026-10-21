@@ -28,19 +28,19 @@ use std::{
     time::Duration,
 };
 
+use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as _};
+use futures_util::{Stream, StreamExt as _};
 use protocol::{
     calcifer::{Event, On, Progress, Reason, Run, StagedInput, SubmitRun, Submitted},
     config::Origin,
     ids::{Digest, RunId},
     machine as v1,
 };
-use ed25519_dalek::{SigningKey, pkcs8::DecodePrivateKey as _};
 use sha2::{Digest as _, Sha256};
 use tokio::{
     sync::{Notify, broadcast, watch},
     task::JoinSet,
 };
-use futures_util::{Stream, StreamExt as _};
 use tracing::warn;
 
 pub use link::{Link, LinkError};
@@ -227,10 +227,15 @@ impl Calcifer {
                 "a stored submission cannot contain a TensorFS token; omit tensorfs options to use this computer's Hub sign-in at send time".into(),
             ));
         }
+        // The same run asked again is the same submission whatever price it was quoted since.
+        let asked = SubmitRun {
+            agreed: None,
+            ..submit.clone()
+        };
         let digest = format!(
             "sha256:{}",
             hex::encode(Sha256::digest(
-                serde_json::to_vec(&submit).expect("serializes")
+                serde_json::to_vec(&asked).expect("serializes")
             ))
         );
         if !self.store.recorded(key)?
@@ -262,6 +267,7 @@ impl Calcifer {
             warnings: submit.warnings,
             inputs: vec![],
             wants,
+            agreed: submit.agreed,
         };
         let (me, key, given) = (self.clone(), key.to_owned(), submit.inputs);
         let (row, fresh) = tokio::task::spawn_blocking(move || {

@@ -43,6 +43,7 @@ async fn submit(
     spec: v1::RunSpec,
 ) -> Result<Run, Error> {
     let ask = SubmitRun {
+        agreed: None,
         on,
         hub: hub.to_owned(),
         kind,

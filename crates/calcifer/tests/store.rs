@@ -24,6 +24,7 @@ fn new_run(n: u8, machine: Option<&str>, pinned: bool) -> NewRun {
         warnings: vec![],
         inputs: vec![],
         wants: None,
+        agreed: None,
     }
 }
 
@@ -433,7 +434,17 @@ fn checkpoint_references_replay_across_restarts_without_byte_exports() {
 }
 
 #[test]
-fn version_five_migrates_without_rewriting_run_or_media_history() {
+fn old_schemas_migrate_without_rewriting_run_or_media_history() {
+    for schema in [
+        "ALTER TABLE outputs DROP COLUMN checkpoint; ALTER TABLE runs DROP COLUMN agreed; PRAGMA user_version = 5;",
+        "ALTER TABLE outputs DROP COLUMN checkpoint; PRAGMA user_version = 6;",
+        "ALTER TABLE runs DROP COLUMN agreed; PRAGMA user_version = 6;",
+    ] {
+        assert_history_survives_upgrade(schema);
+    }
+}
+
+fn assert_history_survives_upgrade(schema: &str) {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
     store
@@ -479,10 +490,9 @@ fn version_five_migrates_without_rewriting_run_or_media_history() {
     let before = store.detail(&store.run(id).unwrap().unwrap()).unwrap();
     let events = store.events_after(id, 0).unwrap();
     drop(store);
-    // Reproduce the real v5 schema; no migration changes any existing column or stored JSON.
+    // Reproduce each old schema; retain every existing column and stored JSON.
     let db = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
-    db.execute_batch("ALTER TABLE outputs DROP COLUMN checkpoint; PRAGMA user_version = 5;")
-        .unwrap();
+    db.execute_batch(schema).unwrap();
     drop(db);
 
     let store = open(dir.path());
@@ -507,7 +517,7 @@ fn version_five_migrates_without_rewriting_run_or_media_history() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        7
     );
 }
 

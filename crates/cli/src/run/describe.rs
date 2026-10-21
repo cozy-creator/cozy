@@ -118,11 +118,7 @@ fn bounds(c: &Constraints) -> Option<String> {
 pub fn contract(target: &str, interface: &Interface, callable: &Callable) -> String {
     let mut out = target.to_owned();
     if callable.accelerator == Some(false) {
-        // An internal function exists only to be called: a CPU function of a package with
-        // internal GPU ones orchestrates them (H3's ref2va and long_form).
-        let gpu_calls =
-            (interface.callables.iter()).any(|c| c.internal && c.accelerator != Some(false));
-        out.push_str(match gpu_calls {
+        out.push_str(match interface.orchestrates(callable) {
             true => "\n  runs on: CPU; calls the package's GPU functions",
             false => "\n  runs on: CPU",
         });

@@ -203,6 +203,7 @@ fn an_unversioned_install_takes_the_hubs_newest_release() {
     let holder: protocol::calcifer::Holder =
         serde_json::from_slice(&lock.holder().unwrap().expect("Calcifer runs")).unwrap();
     let ask = SubmitRun {
+        agreed: None,
         on: On::Machine("t1".into()),
         hub: first["run"]["hub"].as_str().unwrap().into(),
         kind: Kind::Warm,
@@ -257,7 +258,7 @@ fn package_verbs_sent_to_a_booting_rental_wait_for_it() {
     // R's sequence for each verb: rent, then the verb at once, while the rental boots. The CI
     // Hub's docker provider boots one container at a time, so each rental ends before the next.
     let sent = |verb: &[&str], after: &dyn Fn(&str)| {
-        let rented = json(&home, &dir, &["machine", "rent", "cpu", "--detach"]);
+        let rented = json(&home, &dir, &["machine", "rent", "cpu", "--yes", "--detach"]);
         assert_eq!(rented["machine"]["state"], "booting", "{rented}");
         let rental = rented["machine"]["rental_id"].as_str().unwrap().to_owned();
         eprintln!("{verb:?} --on {rental}, booting");
@@ -312,7 +313,7 @@ fn a_local_package_with_empty_files_installs_on_a_rental_and_imports_them() {
     let dir = package::project(&home, "tiny");
     with_empty_subpackage(&dir.join("tiny"));
     let src = dir.parent().unwrap();
-    let rented = json(&home, src, &["machine", "rent", "cpu", "--detach"]);
+    let rented = json(&home, src, &["machine", "rent", "cpu", "--yes", "--detach"]);
     let rental = rented["machine"]["rental_id"].as_str().unwrap().to_owned();
 
     let install = cozy(

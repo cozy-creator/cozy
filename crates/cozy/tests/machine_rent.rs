@@ -123,8 +123,8 @@ fn machine_usage_refusals() {
 }
 
 /// The Hub's quote for exactly the order comes before it is placed, in the catalog's terms: on a
-/// terminal it asks, and a no rents nothing; without one the command is the yes, and the rental
-/// costs what was quoted. On the Hub's docker provider: nothing is bought from a provider.
+/// terminal it asks, and a no rents nothing; without one only `--yes` agrees (a refusal carries the
+/// quote), and the rental costs what was quoted. On the Hub's docker provider: nothing is bought.
 #[cfg(unix)]
 #[test]
 fn a_rent_says_its_quote_before_it_is_placed() {
@@ -147,8 +147,16 @@ fn a_rent_says_its_quote_before_it_is_placed() {
         machines.filter(|m| m["kind"] == "rental").cloned().collect()
     };
     assert!(rentals(&home).is_empty(), "a no rented nothing");
+    let unagreed = home.cozy(["machine", "rent", "cpu", "--detach", "--json"]);
+    let refusal = unagreed.refusal();
+    let message = refusal["message"].as_str().unwrap_or_default();
+    assert!(
+        unagreed.code == 2 && refusal["code"] == "quote_unagreed" && message.starts_with("cpu ×1: $"),
+        "{unagreed:?}"
+    );
+    assert!(rentals(&home).is_empty(), "no yes rented nothing");
 
-    let out = home.cozy(["machine", "rent", "cpu", "--detach"]);
+    let out = home.cozy(["machine", "rent", "cpu", "--yes", "--detach"]);
     assert_eq!(out.code, 0, "{out:?}");
     let quoted = out.stderr.lines().find(|l| l.starts_with("cpu ×1: $"));
     let quoted = quoted.unwrap_or_else(|| panic!("no quote: {out:?}"));
@@ -182,6 +190,7 @@ fn a_rental_is_asked_once_per_key_and_ends_with_the_hubs_proof() {
         "machine",
         "rent",
         "cpu",
+        "--yes",
         "--detach",
         "--idempotency-key",
         "rent-test-1",
@@ -243,7 +252,7 @@ fn a_run_sent_to_a_booting_rental_completes_on_it_and_the_rental_ends() {
     let Some(home) = Home::with_hub() else { return };
     home.sign_in("cycle@cozy.test");
     let package = common::package::publish(&home, "tiny", "0.1.0");
-    let rented = home.json(["machine", "rent", "cpu", "--detach", "--json"]);
+    let rented = home.json(["machine", "rent", "cpu", "--yes", "--detach", "--json"]);
     let machine = rented["machine"]["name"].as_str().unwrap().to_string();
     let id = rented["machine"]["rental_id"].as_str().unwrap().to_string();
     assert_eq!(rented["machine"]["state"], "booting", "{rented}");

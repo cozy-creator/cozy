@@ -462,6 +462,7 @@ async fn adopting(ctx: &Context, version: &str) -> Result<Adopted, Error> {
     };
     let payload = serde_json::json!({ "cozy": version });
     let submit = SubmitRun {
+        agreed: None,
         on: On::Machine(local.name),
         hub: hub.origin.to_string(),
         kind: calcifer::Kind::Update,

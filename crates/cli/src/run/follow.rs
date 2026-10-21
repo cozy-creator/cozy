@@ -13,8 +13,8 @@ use std::{
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use protocol::{
     calcifer::{
-        Adjustment, Event, Machine, MachineState, OutputItem, Progress, Run, Status, SubmitRun,
-        Submitted,
+        Adjustment, Event, Machine, MachineState, On, OutputItem, Progress, Run, RunQuote, Status,
+        SubmitRun, Submitted,
     },
     error::{Error, Kind},
 };
@@ -26,14 +26,24 @@ use crate::{
     output,
 };
 
-/// Submits under `key`, or a fresh one: one key names one submission forever.
+/// Submits under `key`, or a fresh one: one key names one submission forever. A run that rents
+/// carries the quote its renter agreed to (`machine::agree`).
 pub(crate) async fn submit(
     ctx: &Context,
-    run: SubmitRun,
+    mut run: SubmitRun,
     key: Option<&str>,
 ) -> Result<Submitted, Error> {
     let key = key.map_or_else(mint_key, str::to_owned);
-    let submitted = ctx.calcifer().await?.submit(&key, &run).await?;
+    let calcifer = ctx.calcifer().await?;
+    if matches!(run.on, On::New(_)) && run.agreed.is_none() {
+        let quoted: RunQuote = calcifer.post("/v1/run-quotes", &run, None).await?;
+        let said = crate::machine::price(&quoted.sku, quoted.gpus.unwrap_or(1), &quoted.quote);
+        if !crate::machine::agree(ctx, &said)? {
+            return Err(Error::new(Kind::Usage, "quote_declined", "nothing was rented and the run was not sent"));
+        }
+        run.agreed = Some(quoted.quote.agreed());
+    }
+    let submitted = calcifer.submit(&key, &run).await?;
     if submitted.replay {
         output::say(
             ctx,

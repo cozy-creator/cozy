@@ -34,6 +34,7 @@ fn submit(
     inputs: Vec<protocol::calcifer::StagedInput>,
 ) -> SubmitRun {
     SubmitRun {
+        agreed: None,
         on: On::from(on.to_owned()),
         hub: "https://tensorhub.com".into(),
         kind: Kind::Warm,
@@ -275,6 +276,7 @@ async fn a_sent_run_its_machine_never_got_is_sent_again_after_a_restart() {
         ..Default::default()
     };
     let submitted = SubmitRun {
+        agreed: None,
         hub: hub.origin(),
         ..submit("m", spec, vec![])
     };

@@ -9,8 +9,8 @@ use std::{
 
 use protocol::{
     calcifer::{
-        CHECKPOINT, Call, Event, ItemStatus, Kind, Machine, MachineKind, MachineState, OutputItem,
-        Reason, Run, Status, Warning,
+        Agreed, CHECKPOINT, Call, Event, ItemStatus, Kind, Machine, MachineKind, MachineState,
+        OutputItem, Reason, Run, Status, Warning,
     },
     config::Origin,
     ids::{Digest, RunId},
@@ -18,8 +18,8 @@ use protocol::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
-/// Version 6 adds checkpoint references to version 5's JSON specs and outcomes.
-const VERSION: i64 = 6;
+/// Version 7 combines checkpoint output references and rental-price agreements.
+const VERSION: i64 = 7;
 const SCHEMA: &str = "
     CREATE TABLE machines (
         name TEXT PRIMARY KEY,
@@ -66,7 +66,8 @@ const SCHEMA: &str = "
         settled_at INTEGER,
         warnings TEXT NOT NULL DEFAULT '[]',
         inputs TEXT NOT NULL DEFAULT '[]',
-        wants TEXT
+        wants TEXT,
+        agreed TEXT
     ) STRICT;
     CREATE INDEX runs_owed ON runs (machine) WHERE state <> 'settled';
     CREATE TABLE outputs (
@@ -173,6 +174,8 @@ pub struct RunRow {
     pub outcome: Option<v1::Outcome>,
     /// Where an unplaced run goes: `any`, or `new[:sku]` to rent one.
     pub wants: String,
+    /// The quote a `new` run's renter agreed to.
+    pub agreed: Option<Agreed>,
 }
 
 /// Which runs a listing answers, newest first.
@@ -201,6 +204,8 @@ pub struct NewRun {
     pub inputs: Vec<(Digest, u64)>,
     /// Where an unpinned run may go: `any`, `new` or `new:<sku>`.
     pub wants: Option<String>,
+    /// The quote a `new` run's renter agreed to.
+    pub agreed: Option<Agreed>,
 }
 
 /// How to reach a machine: the id its caps name, its address and its TLS leaf's sha256.
@@ -308,9 +313,20 @@ impl Store {
                 tx.pragma_update(None, "user_version", VERSION)?;
                 tx.commit()?;
             }
-            5 => {
+            5 | 6 => {
                 let tx = writer.transaction()?;
-                tx.execute_batch("ALTER TABLE outputs ADD COLUMN checkpoint TEXT")?;
+                // Public v6 added agreements; the TensorFS candidate v6 added checkpoints.
+                // Either store must retain its records while gaining the other column.
+                for (table, column) in [("runs", "agreed"), ("outputs", "checkpoint")] {
+                    let exists: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                        params![table, column],
+                        |row| row.get(0),
+                    )?;
+                    if !exists {
+                        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"))?;
+                    }
+                }
                 tx.pragma_update(None, "user_version", VERSION)?;
                 tx.commit()?;
             }
@@ -551,7 +567,11 @@ impl Store {
     /// Whether a run is recorded under `key`.
     pub fn recorded(&self, key: &str) -> Result<bool> {
         self.read(|db| {
-            let found = db.query_row("SELECT 1 FROM runs WHERE idempotency_key = ?1", [key], |_| Ok(()));
+            let found = db.query_row(
+                "SELECT 1 FROM runs WHERE idempotency_key = ?1",
+                [key],
+                |_| Ok(()),
+            );
             Ok(found.optional()?.is_some())
         })
     }
@@ -582,9 +602,9 @@ impl Store {
             };
             tx.execute(
                 "INSERT INTO runs (id, number, idempotency_key, digest, hub, kind, target, machine, pinned, spec,
-                     out_dir, state, created_at, warnings, inputs, wants)
+                     out_dir, state, created_at, warnings, inputs, wants, agreed)
                  VALUES (?1, (SELECT COALESCE(MAX(number), 0) + 1 FROM runs), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                     ?10, 'queued', ?11, ?12, ?13, ?14)",
+                     ?10, 'queued', ?11, ?12, ?13, ?14, ?15)",
                 params![
                     new.id.as_str(),
                     key,
@@ -600,6 +620,7 @@ impl Store {
                     serde_json::to_string(&new.warnings).expect("serializes"),
                     serde_json::to_string(&new.inputs).expect("serializes"),
                     new.wants,
+                    new.agreed.map(|agreed| serde_json::to_string(&agreed).expect("serializes")),
                 ],
             )?;
             Ok((new.id.to_string(), true))
@@ -795,7 +816,12 @@ impl Store {
                 "INSERT INTO run_logs (run, seq, at_ms, level, text) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![id, seq as i64, at_ms, level, text],
             )?;
-            Ok(vec![log_event(seq, at_ms, level.to_owned(), text.to_owned())])
+            Ok(vec![log_event(
+                seq,
+                at_ms,
+                level.to_owned(),
+                text.to_owned(),
+            )])
         })
     }
 
@@ -1218,7 +1244,7 @@ fn put_machine_in(tx: &Transaction, machine: &MachineRow) -> Result<()> {
 
 const RUN_COLUMNS: &str = "id, number, kind, target, hub, machine, pinned, spec, out_dir, state, cancel_requested,
     cursor, machine_state, status, reason_code, reason, state_seq, created_at, accepted_at, settled_at, warnings,
-    inputs, outcome, wants";
+    inputs, outcome, wants, agreed";
 
 fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let id: String = r.get(0)?;
@@ -1234,6 +1260,7 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let spec: Vec<u8> = r.get(7)?;
     let outcome: Option<Vec<u8>> = r.get(22)?;
     let wants: Option<String> = r.get(23)?;
+    let agreed: Option<String> = r.get(24)?;
     Ok((|| {
         Ok(RunRow {
             id: RunId::try_from(id).map_err(|_| corrupt("a run id"))?,
@@ -1282,6 +1309,8 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
                 None => None,
             },
             wants: wants.unwrap_or_else(|| "any".into()),
+            agreed: (agreed.as_deref().map(serde_json::from_str).transpose())
+                .map_err(|_| corrupt("a run's agreed price"))?,
         })
     })())
 }

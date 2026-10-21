@@ -561,7 +561,7 @@ fn a_rental_ended_the_moment_its_run_returns_loses_nothing() {
         skus.as_array().unwrap().iter().any(|s| s["name"] == "cpu"),
         "the CI Hub offers no cpu product (its docker provider is off): {skus}"
     );
-    let rented = home.json(["machine", "rent", "cpu", "--detach", "--json"]);
+    let rented = home.json(["machine", "rent", "cpu", "--yes", "--detach", "--json"]);
     let name = rented["machine"]["name"].as_str().unwrap().to_owned();
     let id = rented["machine"]["rental_id"].as_str().unwrap().to_owned();
     let (shoot, expected) = shoot(&home);
