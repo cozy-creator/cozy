@@ -22,10 +22,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use platform::durable::Mode;
 
-use super::origin::{parse_repo, split_name, Location, Origin};
+use super::origin::{parse_repo, Location, Origin};
 use super::ObjectStore;
 use crate::err::{Code, Refusal, Result};
-use crate::format::{repo_key, ObjectRef, Repo};
+use crate::format::{repo_key, repo_name, ObjectRef, Repo};
 
 /// Bytes per read or write call into the volume: each call is progress.
 pub(crate) const STEP: usize = 8 << 20;
@@ -265,7 +265,9 @@ pub(crate) async fn blocking<T: Send + 'static>(
 #[async_trait]
 impl Origin for VolumeOrigin {
     async fn repo_of(&self, name: &str) -> Result<Repo> {
-        split_name(name)?;
+        if !repo_name(name) {
+            return Err(Refusal { code: Code::KEY_GRAMMAR, detail: format!("{name:?} is not <org>/<model>") });
+        }
         let path = self.0.root.join(repo_key(name));
         let read =
             tokio::task::spawn_blocking(move || fs::read(&path).map_err(|error| (path, error)))

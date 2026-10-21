@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use platform::lock;
 
 use super::{fail, invalid, platform, Error, Result, Store};
-use crate::format::{ObjectRef, Repo};
+use crate::format::{repo_name, ObjectRef, Repo};
 
 /// ASCII letters, digits, `.`, `_` and `-`, not leading `.`.
 pub(crate) fn is_name(text: &str, max: usize) -> bool {
@@ -70,13 +70,10 @@ impl Store {
 
     /// Case-folded local filenames; nonportable segments use a prefix absent from legacy names.
     fn ref_path(&self, name: &str) -> Result<PathBuf> {
-        // Match the generic repository segments accepted by the format and public Ref.
-        // is_name remains the stricter grammar for writer keys.
-        let segment = |part: &str| {
-            !part.is_empty() && part != "." && part != ".." && !part.contains(['/', '\\', '\0'])
-        };
+        // The format's repository name, as the public Ref takes it; is_name remains the
+        // stricter grammar for writer keys.
         match name.split_once('/') {
-            Some((org, model)) if segment(org) && segment(model) => Ok(self
+            Some((org, model)) if repo_name(name) => Ok(self
                 .root
                 .join("refs")
                 .join(ref_segment(org))

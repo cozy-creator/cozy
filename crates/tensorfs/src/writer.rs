@@ -37,8 +37,8 @@ use crate::err;
 use crate::fetch::Stream;
 use crate::format::layout::{self, GRID, STANDALONE};
 use crate::format::{
-    self, variant_path, Body, ClassRef, Component, Config, Dtype, Encoding, Header, Metadata,
-    ObjectRef, Part, Pipeline, Tensor, Value, CHUNKS_DIR, CONFIG_FILE,
+    self, segment, variant_path, Body, ClassRef, Component, Config, Dtype, Encoding, Header,
+    Metadata, ObjectRef, Part, Pipeline, Tensor, Value, CHUNKS_DIR, CONFIG_FILE,
 };
 use crate::import;
 use crate::store::retention::{self, Hold};
@@ -1457,10 +1457,6 @@ fn pour(src: &mut dyn Read, dst: &mut dyn Write, mut n: u64, buf: &mut [u8], wha
         n -= got as u64;
     }
     Ok(())
-}
-
-fn segment(s: &str) -> bool {
-    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
 }
 
 fn asset_name(component: &str, name: &str) -> Result<()> {

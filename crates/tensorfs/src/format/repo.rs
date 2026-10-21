@@ -8,7 +8,7 @@ use pep440_rs::Version;
 
 use serde::{Deserialize, Serialize};
 
-use super::doc::{path, segment};
+use super::doc::{is_digest, path, segment};
 use super::{check_format, invalid, json, variant_of, variant_path, Error, ObjectRef, Result};
 use super::{REPO_FORMAT, TREE_FORMAT};
 
@@ -237,6 +237,11 @@ pub fn newest<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Option<&'a Tag> {
     newest_by(tags.into_iter().filter(|t| t.public && !t.yanked), |t| t.name.as_str())
 }
 
+/// A repository name: `<org>/<name>`, two segments.
+pub(crate) fn repo_name(name: &str) -> bool {
+    name.split_once('/').is_some_and(|(org, name)| segment(org) && segment(name))
+}
+
 /// A tag name: a segment that cannot be read as a digest.
 pub fn tag_name(name: &str) -> bool {
     segment(name) && !name.starts_with("sha256:")
@@ -293,9 +298,8 @@ impl Repo {
     }
 
     fn check(&self) -> Result<()> {
-        match self.name.split_once('/') {
-            Some((org, name)) if segment(org) && segment(name) => {}
-            _ => return invalid(format!("repo name {:?} is not <org>/<name>", self.name)),
+        if !repo_name(&self.name) {
+            return invalid(format!("repo name {:?} is not <org>/<name>", self.name));
         }
         let mut seen = HashSet::new();
         for t in &self.tags {
@@ -332,7 +336,7 @@ impl Repo {
         let Some(sha256) = revision.strip_prefix("sha256:") else {
             return self.tag(revision).map(Resolution::Tag);
         };
-        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        if !is_digest(sha256) {
             return None;
         }
         // The default's commit first, then the last created.

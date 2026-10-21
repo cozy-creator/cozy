@@ -74,20 +74,6 @@ impl std::fmt::Debug for Location {
     }
 }
 
-/// `<org>/<model>`, each a plain path segment.
-pub(crate) fn split_name(name: &str) -> Result<(&str, &str)> {
-    let plain = |s: &str| {
-        !s.is_empty()
-            && !s.starts_with('.')
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-    };
-    match name.split_once('/') {
-        Some((org, model)) if plain(org) && plain(model) => Ok((org, model)),
-        _ => refuse(Code::KEY_GRAMMAR, format!("{name:?} is not <org>/<model>")),
-    }
-}
-
 /// A refs document `bytes` of `name`.
 pub(crate) fn parse_repo(name: &str, bytes: &[u8]) -> Result<Repo> {
     Repo::from_json(bytes).map_err(|error| Refusal {

@@ -170,9 +170,14 @@ fn age(store: &Store) {
         SystemTime::now() - Duration::from_secs(7200),
     );
 }
+/// `object` reads through the store as its own bytes.
+fn intact(store: &Store, object: &ObjectRef) -> bool {
+    store.read(object).is_ok_and(|bytes| ObjectRef::of(&bytes) == *object)
+}
+
 fn present(store: &Store, objects: &[ObjectRef]) {
     for object in objects {
-        assert!(store.verify(object).unwrap(), "lost {}", object.sha256);
+        assert!(intact(store, object), "lost {}", object.sha256);
     }
 }
 fn collected(store: &Store, objects: &[ObjectRef]) {
@@ -342,7 +347,7 @@ fn lazy_source_keeps_unread_and_future_selected_objects_across_process_gc() {
         "an unselected payload was kept"
     );
     assert!(
-        store.verify(&f.local).unwrap(),
+        intact(&store, &f.local),
         "local repository ref was evicted"
     );
     owner.send("read");
@@ -351,7 +356,7 @@ fn lazy_source_keeps_unread_and_future_selected_objects_across_process_gc() {
     owner.expect("released");
     pressure(&store);
     collected(&store, &f.held);
-    assert!(store.verify(&f.local).unwrap());
+    assert!(intact(&store, &f.local));
     owner.finish();
 }
 
@@ -393,7 +398,7 @@ fn process_death_releases_idle_writer_roots_without_drop_cleanup() {
     pressure(&store);
     collected(&store, &f.held);
     collected(&store, &[f.reused, ObjectRef::of(NEW)]);
-    assert!(store.verify(&f.local).unwrap());
+    assert!(intact(&store, &f.local));
     store.sweep_writers(Duration::ZERO).unwrap();
     assert_eq!(
         fs::read_dir(store.root().join("tmp/writers"))
@@ -631,7 +636,7 @@ fn writer_results_expire_but_local_replays_remain() {
             assert_eq!(repo.tags.len(), 2);
             for tag in repo.tags {
                 for object in remote.closure(&tag.commit).unwrap() {
-                    assert!(remote.verify(&object).unwrap());
+                    assert!(intact(&remote, &object));
                 }
             }
         }
@@ -714,7 +719,7 @@ fn failed_stream_retains_local_bytes_until_the_last_holder() {
         .clone();
     expire(&store); // The failed Writer is the only holder at this point.
     assert!(
-        store.verify(&id).unwrap(),
+        intact(&store, &id),
         "failed Writer lost its committed header before an error checkpoint was opened"
     );
     let ck = store.checkpoint(&id).unwrap();
