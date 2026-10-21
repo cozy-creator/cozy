@@ -140,6 +140,9 @@ impl Backend for Stream {
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
         self.host.target(va, offset, len)
     }
+    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> {
+        self.host.save(va, offset, host, after)
+    }
     fn fence(&self) -> Result<Event> {
         if self.events.hold_fence.swap(false, Ordering::SeqCst) {
             self.events.fence_gate.pass();
@@ -631,6 +634,9 @@ impl Backend for Driver {
     }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
         self.host.target(va, offset, len)
+    }
+    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> {
+        self.host.save(va, offset, host, after)
     }
     fn fence(&self) -> Result<Event> {
         self.host.fence()

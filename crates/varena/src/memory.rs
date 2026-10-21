@@ -127,6 +127,8 @@ pub struct Moved {
     pub store: Fills,
     /// Of the above, bytes filled speculatively.
     pub speculative: u64,
+    /// Filled pages copied into the RAM tier afterwards: speculation, off every bind's path.
+    pub saved: Fills,
 }
 
 /// One step of a request.
@@ -233,8 +235,19 @@ type Trim = Arc<dyn Fn() -> u64 + Send + Sync>;
 struct SetMech {
     spec: SetSpec,
     va: Va,
+    /// The RAM tier's name for its pages' bytes ([`tier_name`]) and its layout there.
+    tier: String,
     held: Option<Arc<tier::Held>>,
     closing: bool,
+}
+
+/// The RAM tier's name for the bytes a set's pages hold: the store's (stored, or transformed
+/// after each fill), or a declared transform's under its identity.
+fn tier_name(spec: &SetSpec) -> String {
+    match &spec.fingerprint.fill {
+        Fill::Declared(id) => tensorfs::sha256::hex_digest(format!("{}\0declared\0{id}", spec.layout.digest).as_bytes()),
+        Fill::Stored | Fill::Undeclared => spec.layout.digest.clone(),
+    }
 }
 
 struct Home {
@@ -321,16 +334,31 @@ struct Jobs {
 struct Copying {
     key: Key,
     dst: Dst,
-    span: u64,
     out: Option<Result<Origin>>,
 }
 
-/// Bytes filled since the fill threads were last all idle, and the batches in flight (its lock
-/// is a leaf).
+/// The fill threads' work: jobs queued, batches running, the bytes filled since they were last
+/// all idle, and whether the Memory is gone. Its lock is a leaf; its condvar wakes the tier
+/// copies when the fills are idle.
 #[derive(Default)]
 struct Burst {
-    bytes: u64,
+    queued: u64,
     batches: u32,
+    bytes: u64,
+    closed: bool,
+}
+
+impl Burst {
+    fn idle(&self) -> bool {
+        self.queued == 0 && self.batches == 0
+    }
+}
+
+/// A filled page to copy into the RAM tier (`gen`: as it was filled) for request `req`.
+struct Save {
+    key: Key,
+    gen: u64,
+    req: Option<u64>,
 }
 
 struct Release {
@@ -404,6 +432,8 @@ struct State {
     /// Passes running, per (request, set): a joint step's sets each have their own.
     active: HashMap<(u64, u32), Active>,
     failed: HashMap<Key, Error>,
+    /// The page a tier copy holds now (pinned, like a consumer).
+    saving: Option<Key>,
     /// Request → the `<package>|<shape>` its peak is recorded under.
     peaks: HashMap<u64, String>,
     /// Requests whose last step is one their plan did not declare.
@@ -563,7 +593,9 @@ struct Inner {
     /// Fill jobs; the fill threads hold the receiving ends and a weak reference to the rest,
     /// so dropping the Memory ends them. The trim thread's work likewise.
     jobs: Jobs,
-    burst: Mutex<Burst>,
+    burst: Arc<(Mutex<Burst>, Condvar)>,
+    /// Filled pages to copy into the RAM tier, for its one thread.
+    saves: Arc<Outbox<Save>>,
     wanted: Arc<(Mutex<Wanted>, Condvar)>,
     stop: Arc<AtomicBool>,
     #[cfg(unix)]
@@ -619,7 +651,8 @@ impl Memory {
                 release_tx,
                 releases,
                 jobs: Jobs { demand, ahead },
-                burst: Mutex::new(Burst::default()),
+                burst: Arc::new((Mutex::new(Burst::default()), Condvar::new())),
+                saves: Arc::new(Outbox::default()),
                 wanted: Arc::new((Mutex::new(Wanted::default()), Condvar::new())),
                 stop: Arc::new(AtomicBool::new(false)),
                 #[cfg(unix)]
@@ -642,6 +675,8 @@ impl Memory {
             std::thread::Builder::new().name("varena-ask".into()).spawn(move || ask_loop(listener, &row, &weak, &stop)).map_err(|e| Error::io("spawn ask", e))?;
             let (weak, wanted) = (Arc::downgrade(&inner), inner.wanted.clone());
             std::thread::Builder::new().name("varena-trim".into()).spawn(move || trim_loop(&wanted, &weak)).map_err(|e| Error::io("spawn trim", e))?;
+            let (weak, saves, burst) = (Arc::downgrade(&inner), inner.saves.clone(), inner.burst.clone());
+            std::thread::Builder::new().name("varena-tier-copies".into()).spawn(move || save_loop(&saves, &burst, &weak)).map_err(|e| Error::io("spawn tier copies", e))?;
             let st = inner.lock();
             inner.publish(&st);
             inner.unlock(st);
@@ -769,6 +804,7 @@ impl Memory {
         self.inner.mech.settle();
         self.inner.to_custody.settle();
         self.inner.to_tier.settle();
+        self.inner.saves.settle();
     }
 
     /// The record of the request that ended last.
@@ -904,7 +940,7 @@ impl Inner {
                 .sets
                 .iter()
                 .flatten()
-                .filter_map(|m| m.held.as_ref().and_then(|h| h.handover().ok()).map(|(file, regions)| Call::Readopt { digest: m.spec.layout.digest.clone(), regions, ask: ask.clone(), file }))
+                .filter_map(|m| m.held.as_ref().and_then(|h| h.handover().ok()).map(|(file, regions)| Call::Readopt { digest: m.tier.clone(), regions, ask: ask.clone(), file }))
                 .collect();
             held.into_iter().for_each(|c| self.post(c));
         }
@@ -963,7 +999,7 @@ impl Inner {
                 if let Some(held) = m.held {
                     self.post(Call::Unpin(held));
                 }
-                self.post(Call::Close { digest: m.spec.layout.digest.clone() });
+                self.post(Call::Close { digest: m.tier.clone() });
             }
             if let Some(slot) = st.table.sets.get_mut(set as usize) {
                 *slot = None;
@@ -1136,7 +1172,7 @@ impl Inner {
         }
         // Read-write and nobody else's: filled again in place, after its consumers in-stream.
         self.backend.retire(old);
-        self.jobs.demand.send(Job { after, ..job }).map_err(|_| Error::Closed("the fill threads".into()))
+        self.queue_fill(Job { after, ..job }, false)
     }
 
     /// Exports a filled page of a declared set into custody, read-only, only once its ready
@@ -1168,8 +1204,8 @@ impl Inner {
         self.mech.post(Mech::Keep { key, gen: home.gen, va, off, span, phys: phys.0, len: phys.1 }, 0);
     }
 
-    /// A fill thread's batch: each page from the tier, else the store (through the tier when it
-    /// has room), in as few engine reads as its sets allow; then each page's ready event.
+    /// A fill thread's batch: each page from the tier, else the store, in as few engine reads as
+    /// its sets allow; then each page's ready event.
     fn fill(&self, jobs: &[Job]) {
         self.fill_batch(jobs);
         // Their fills' events follow them in-stream (or were dropped): nobody needs them now.
@@ -1212,12 +1248,15 @@ impl Inner {
             }
             match landed {
                 Ok((origin, ready)) => {
-                    let stored = sets.get(&job.key.0).is_some_and(|(spec, _)| spec.fingerprint.fill == Fill::Stored);
+                    // Stored bytes are the weights; a declared set's tier holds its transformed
+                    // bytes.
+                    let fill = sets.get(&job.key.0).map(|(spec, _)| &spec.fingerprint.fill);
+                    let filled = matches!(fill, Some(Fill::Stored)) || (origin == Origin::Tier && matches!(fill, Some(Fill::Declared(_))));
                     let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
                     if let Some(h) = st.homes.get_mut(&job.key) {
                         h.ready = ready;
                         h.filling = false;
-                        h.filled = stored;
+                        h.filled = filled;
                         h.fresh = true;
                         h.origin = origin;
                     }
@@ -1230,8 +1269,11 @@ impl Inner {
                     if speculative {
                         s.moved.speculative += span;
                     }
-                    if stored {
+                    if filled {
                         self.keep(&mut st, job.key);
+                    }
+                    if filled && origin == Origin::Store {
+                        self.save_later(&st, job.key, job.req);
                     }
                 }
                 Err(e) => {
@@ -1260,8 +1302,8 @@ impl Inner {
         }
     }
 
-    /// The batch's copies: from the tier where ready, else staged through it when the host has
-    /// room, else straight from the store; one engine read for each of those per set. Each
+    /// The batch's copies: from the tier where ready, else straight from the store (the tier
+    /// gets its copy from the filled page afterwards); one engine read for each per set. Each
     /// page's origin, or its error.
     #[allow(clippy::type_complexity)]
     fn copy(&self, sets: &BTreeMap<u32, (SetSpec, Option<Arc<tier::Held>>)>, pages: &[(&Job, (Va, u64, u64))]) -> Vec<Result<Origin>> {
@@ -1278,7 +1320,7 @@ impl Inner {
                     Dst::Host { .. } => 0,
                 };
                 let out = job.after.iter().try_for_each(|e| self.backend.wait(*e, stream)).err().map(Err);
-                Copying { key: job.key, dst, span: *span, out }
+                Copying { key: job.key, dst, out }
             })
             .collect();
         let unregister = |p| self.backend.unregister_host(p);
@@ -1287,7 +1329,7 @@ impl Inner {
             if let Some(held) = held {
                 // A copy from the tier, each region settled after (unlocked if the tier asked
                 // for it).
-                let read = |copies: &mut [Copying], origin: Origin| {
+                let read = |copies: &mut [Copying]| {
                     for c in copies.iter_mut().filter(|c| todo(c)) {
                         if let Err(e) = held.pin(c.key.1, |p, l| self.backend.register_host(p, l), unregister) {
                             c.out = Some(Err(e));
@@ -1297,20 +1339,11 @@ impl Inner {
                     let copied = held.read(&from.iter().map(|c| (c.key.1, c.dst)).collect::<Vec<_>>());
                     from.iter().for_each(|c| held.settle(c.key.1, unregister));
                     match copied {
-                        Ok(copied) => from.iter_mut().zip(copied).filter(|(_, ok)| *ok).for_each(|(c, _)| c.out = Some(Ok(origin))),
+                        Ok(copied) => from.iter_mut().zip(copied).filter(|(_, ok)| *ok).for_each(|(c, _)| c.out = Some(Ok(Origin::Tier))),
                         Err(e) => from.iter_mut().for_each(|c| c.out = Some(Err(e.clone()))),
                     }
                 };
-                read(&mut copies, Origin::Tier);
-                // Staged through the tier when the host has the room (the tier's decision).
-                let blocks: Vec<u32> = copies.iter().filter(|c| todo(c)).map(|c| c.key.1).collect();
-                let bytes = copies.iter().filter(|c| todo(c)).map(|c| c.span).sum();
-                if !blocks.is_empty() && self.tier.as_ref().is_some_and(|t| t.room(bytes)) {
-                    match held.fill(&blocks, |hosts| self.store(spec, hosts)) {
-                        Ok(()) => read(&mut copies, Origin::Store),
-                        Err(e) => copies.iter_mut().filter(|c| todo(c)).for_each(|c| c.out = Some(Err(e.clone()))),
-                    }
-                }
+                read(&mut copies);
             }
             let direct: Vec<(u32, Dst)> = copies.iter().filter(|c| todo(c)).map(|c| (c.key.1, c.dst)).collect();
             if !direct.is_empty() {
@@ -1344,7 +1377,7 @@ impl Inner {
     fn batch(&self, first: Job, demand: &Receiver<Job>, ahead: &Receiver<Job>) -> Vec<Job> {
         let engine = tensorfs::io::ReadOpts::default();
         let budget = {
-            let mut b = self.burst.lock();
+            let mut b = self.burst.0.lock();
             b.batches += 1;
             b.bytes.max((engine.threads * engine.request) as u64)
         };
@@ -1355,18 +1388,97 @@ impl Inner {
             bytes += job.span;
             jobs.push(job);
         }
+        let mut b = self.burst.0.lock();
+        b.queued = b.queued.saturating_sub(jobs.len() as u64);
         jobs
+    }
+
+    /// Queues a page's fill: a demand miss, or `ahead` of its use.
+    fn queue_fill(&self, job: Job, ahead: bool) -> Result<()> {
+        self.burst.0.lock().queued += 1;
+        let queue = if ahead { &self.jobs.ahead } else { &self.jobs.demand };
+        queue.send(job).map_err(|_| {
+            self.burst.0.lock().queued -= 1;
+            Error::Closed("the fill threads".into())
+        })
     }
 
     /// A batch is done: its bytes count for its burst, which ends when nothing is queued or
     /// filling.
     fn batched(&self, jobs: &[Job]) {
-        let mut b = self.burst.lock();
+        let mut b = self.burst.0.lock();
         b.batches = b.batches.saturating_sub(1);
         b.bytes += jobs.iter().map(|j| j.span).sum::<u64>();
-        if b.batches == 0 && self.jobs.demand.is_empty() && self.jobs.ahead.is_empty() {
+        if b.idle() {
             b.bytes = 0;
+            self.burst.1.notify_all();
         }
+    }
+
+    /// Waits until no page is decided to fill (one being mapped or queued counts); false once
+    /// the Memory is going.
+    fn after_fills(&self) -> bool {
+        let mut st = self.lock();
+        while !self.burst.0.lock().closed && st.homes.values().any(|h| h.filling) {
+            self.wait(&mut st);
+        }
+        !self.burst.0.lock().closed
+    }
+
+    /// Queues a copy of a page just filled with its tier's bytes into the RAM tier, unless it
+    /// has no tier layout or the tier holds it.
+    fn save_later(&self, st: &State, key: Key, req: Option<u64>) {
+        let held = st.mech(key.0).ok().and_then(|m| m.held.as_ref());
+        let Some(gen) = st.homes.get(&key).map(|h| h.gen).filter(|_| held.is_some_and(|h| !h.holds(key.1))) else { return };
+        self.saves.post(Save { key, gen, req }, 0);
+    }
+
+    /// Copies a filled page into the RAM tier when the host has the room: speculation, so it
+    /// soft-fails. The page is pinned meanwhile (a consumer: never unmapped under the copy); one
+    /// unmapped or changed since it was queued is not copied.
+    fn save(&self, s: &Save) {
+        let (pin, held, (va, off, span), ready) = {
+            let mut st = self.lock();
+            let home = st.homes.get(&s.key).filter(|h| h.gen == s.gen && h.filled && !h.filling && !h.transforming).map(|h| h.ready);
+            let held = st.mech(s.key.0).ok().and_then(|m| m.held.clone()).filter(|h| !h.holds(s.key.1));
+            let (Some(ready), Some(held), Ok(place)) = (home, held, st.place(s.key)) else { return };
+            let pin = st.tick();
+            st.pins.insert(pin, (s.key, None, std::thread::current().id()));
+            st.saving = Some(s.key);
+            st.sync(s.key);
+            self.unlock(st);
+            (pin, held, place, ready)
+        };
+        let start = Instant::now();
+        let saved = self.tier.as_ref().is_some_and(|t| t.room(span))
+            && held
+                .fill(&[s.key.1], |regions| {
+                    regions.iter().try_for_each(|(_, dst)| match dst {
+                        // SAFETY: the region is mapped writable for its `len` bytes and
+                        // write-locked by this process.
+                        Dst::Host { ptr, len } => self.backend.save(va, off, unsafe { std::slice::from_raw_parts_mut(*ptr, (*len).min(span as usize)) }, ready),
+                        Dst::Device { .. } => Err(Error::Internal("a tier region is host memory".into())),
+                    })
+                })
+                .map_err(|e| tracing::warn!("varena: copying {:?} into the RAM tier failed: {e}", s.key))
+                .is_ok();
+        let ns = start.elapsed().as_nanos() as u64;
+        let mut st = self.lock();
+        st.pins.remove(&pin);
+        st.saving = None;
+        st.sync(s.key);
+        // Its class while pinned may have been published meanwhile: no longer.
+        self.publish(&st);
+        if saved {
+            let stats = match s.req.filter(|r| st.stats.contains_key(r)) {
+                Some(r) => st.stats.entry(r).or_default(),
+                None => &mut st.unclaimed,
+            };
+            stats.moved.saved.bytes += span;
+            stats.moved.saved.ns += ns;
+        }
+        self.unlock(st);
+        self.landed.notify_all();
     }
 
     /// The set's regions from its store into their destinations, in one engine read.
@@ -1441,6 +1553,15 @@ impl Inner {
                 if actions.iter().any(|a| matches!(a, Action::Cut { .. })) && !remote.is_empty() {
                     (*room, *unmeasured) = self.pass_room(&mut st, r, *set)?;
                 }
+            }
+            // A tier copy in flight holds its page like a consumer: a decision short of bytes
+            // waits for it, then decides again.
+            if remote.is_empty() && st.saving.is_some() && matches!(actions.last(), Some(Action::Exhausted { .. } | Action::Park(_))) {
+                while st.saving.is_some() {
+                    self.wait(&mut st);
+                }
+                self.unlock(st);
+                continue;
             }
             self.publish(&st);
             self.unlock(st);
@@ -1630,7 +1751,7 @@ impl Inner {
                     let pages = layout.regions.iter().map(|r| Page { bytes: r.span, ..Page::default() }).collect();
                     let set = Set { name: spec.name.clone(), pages, declared: spec.fingerprint.declared() };
                     let i = st.sets.len() as u32;
-                    st.sets.push(Some(SetMech { spec, va, held: None, closing: false }));
+                    st.sets.push(Some(SetMech { tier: tier_name(&spec), spec, va, held: None, closing: false }));
                     st.table.sets.push(Some(set));
                     (i, false)
                 }
@@ -1680,13 +1801,13 @@ impl Inner {
         let layout = {
             let st = self.lock();
             let m = st.mech(set)?;
-            let l = (m.held.is_none()).then(|| m.spec.layout.clone());
+            let l = (m.held.is_none()).then(|| (m.spec.layout.clone(), m.tier.clone()));
             self.unlock(st);
             l
         };
-        let Some(layout) = layout else { return Ok(()) };
+        let Some((layout, name)) = layout else { return Ok(()) };
         let regions: Vec<(u64, u64)> = layout.regions.iter().map(|r| (r.offset, r.span)).collect();
-        let held = tier.open_layout(&layout.digest, regions, &self.row.ask_name()).map_err(|e| tracing::warn!("varena: tier: {e}")).ok().map(Arc::new);
+        let held = tier.open_layout(&name, regions, &self.row.ask_name()).map_err(|e| tracing::warn!("varena: tier: {e}")).ok().map(Arc::new);
         let mut st = self.lock();
         if let Some(Some(m)) = st.sets.get_mut(set as usize) {
             if m.held.is_none() {
@@ -1697,8 +1818,10 @@ impl Inner {
         Ok(())
     }
 
-    /// Fills the set's layout in the RAM tier as host headroom allows: everything left in one
-    /// read when it has the room, else half as much, until a region does not fit.
+    /// Fills the set's layout in the RAM tier from the store as host headroom allows:
+    /// everything left in one read when it has the room, else half as much, until a region does
+    /// not fit. A declared set's tier holds its transformed bytes: only its filled pages go
+    /// there.
     fn load_ram(&self, set: u32) -> Result<()> {
         let (spec, held) = {
             let st = self.lock();
@@ -1707,7 +1830,7 @@ impl Inner {
             self.unlock(st);
             out
         };
-        let (Some(held), Some(tier)) = (held, &self.tier) else { return Ok(()) };
+        let (Some(held), Some(tier), false) = (held, &self.tier, matches!(spec.fingerprint.fill, Fill::Declared(_))) else { return Ok(()) };
         let regions = &spec.layout.regions;
         let (mut at, mut want) = (0, regions.len());
         while want > 0 {
@@ -2059,7 +2182,7 @@ impl Inner {
             return;
         }
         let Some(r) = st.table.request(req) else { return };
-        let uses: Vec<Call> = st.sets.iter().enumerate().filter_map(|(i, m)| m.as_ref().map(|m| Call::Use { digest: m.spec.layout.digest.clone(), distance: r.distance((i as u32, 0)).map(|d| d.0) })).collect();
+        let uses: Vec<Call> = st.sets.iter().enumerate().filter_map(|(i, m)| m.as_ref().map(|m| Call::Use { digest: m.tier.clone(), distance: r.distance((i as u32, 0)).map(|d| d.0) })).collect();
         uses.into_iter().for_each(|c| self.post(c));
     }
 
@@ -2215,7 +2338,7 @@ impl Inner {
         stats.leftover = leftover;
         st.last = Some(stats.clone());
         self.publish(&st);
-        let uses: Vec<Call> = st.sets.iter().flatten().map(|m| Call::Use { digest: m.spec.layout.digest.clone(), distance: None }).collect();
+        let uses: Vec<Call> = st.sets.iter().flatten().map(|m| Call::Use { digest: m.tier.clone(), distance: None }).collect();
         if self.tier.is_some() {
             uses.into_iter().for_each(|c| self.post(c));
         }
@@ -2271,7 +2394,7 @@ impl Inner {
     fn release_tier(&self, digest: &str) -> u64 {
         let held: Vec<Arc<tier::Held>> = {
             let mut st = self.state.lock();
-            st.sets.iter_mut().flatten().filter(|m| m.spec.layout.digest == digest).filter_map(|m| m.held.take()).collect()
+            st.sets.iter_mut().flatten().filter(|m| m.tier == digest).filter_map(|m| m.held.take()).collect()
         };
         held.iter().map(|h| h.release(|p| self.backend.unregister_host(p))).sum()
     }
@@ -2321,8 +2444,17 @@ impl Drop for Device {
 }
 
 impl Drop for Memory {
-    /// The mechanism's calls finish first: the row and its pages go when the drop returns.
+    /// The mechanism's calls finish first and no tier copy is left to run: the row and its
+    /// pages go when the drop returns.
     fn drop(&mut self) {
+        self.inner.saves.close();
+        self.inner.saves.drain();
+        self.inner.burst.0.lock().closed = true;
+        self.inner.burst.1.notify_all();
+        // Under the state lock: a tier copy waiting on the fills sees it closed or is woken.
+        drop(self.inner.state.lock());
+        self.inner.landed.notify_all();
+        self.inner.saves.settle();
         self.inner.mech.settle();
     }
 }
@@ -2335,6 +2467,9 @@ impl Drop for Inner {
         self.row.knock();
         self.wanted.0.lock().closed = true;
         self.wanted.1.notify_all();
+        self.saves.close();
+        self.burst.0.lock().closed = true;
+        self.burst.1.notify_all();
         // The mechanism's thread is gone with the Memory: what it was still to do happens here.
         self.mech.close();
         for op in self.mech.drain() {
@@ -2388,6 +2523,23 @@ fn fill_loop(demand: &Receiver<Job>, ahead: &Receiver<Job>, inner: &Weak<Inner>)
             me.fail(&batch, Error::Internal(format!("panic: {}", msg.unwrap_or_default())));
         }
         me.batched(&batch);
+    }
+}
+
+/// The RAM tier's copies of filled pages, one at a time and only while the fill threads are
+/// idle: never ahead of a fill, never on a bind's path.
+fn save_loop(saves: &Outbox<Save>, burst: &(Mutex<Burst>, Condvar), inner: &Weak<Inner>) {
+    while let Some((ticket, bytes, save)) = saves.next() {
+        let mut b = burst.0.lock();
+        while !b.closed && !b.idle() {
+            burst.1.wait(&mut b);
+        }
+        let closed = b.closed;
+        drop(b);
+        if let Some(me) = inner.upgrade().filter(|me| !closed && me.after_fills()) {
+            me.save(&save);
+        }
+        saves.sent(ticket, bytes);
     }
 }
 
@@ -2636,6 +2788,10 @@ impl Pin {
             }
             st.sync(self.key);
             self.inner.keep(&mut st, self.key);
+            if matches!(st.mech(self.key.0).map(|m| &m.spec.fingerprint.fill), Ok(Fill::Declared(_))) {
+                let req = st.binding(self.key.0);
+                self.inner.save_later(&st, self.key, req);
+            }
             self.inner.publish(&st);
             self.inner.unlock(st);
             self.inner.landed.notify_all();
@@ -2782,8 +2938,7 @@ impl Inner {
                     h.phys = Some(p);
                 }
                 drop(st);
-                let queue = if speculative { &self.jobs.ahead } else { &self.jobs.demand };
-                if queue.send(job).is_err() {
+                if self.queue_fill(job, speculative).is_err() {
                     tracing::warn!("varena: the fill threads are gone");
                 }
             }

@@ -72,7 +72,7 @@ fn load(path: &Path, run: usize) -> f64 {
     rate
 }
 
-/// The owner's bar: a cold load of 50 pages runs at ≥ 70% of the disk's measured ceiling.
+/// The owner's bar: a cold load of 50 pages, the RAM tier enabled, runs at ≥ 75% of the disk's measured ceiling.
 #[test]
 fn a_cold_load_fills_near_the_disk_ceiling() {
     assert!(varena::os::namespace(&format!("fill{}-", std::process::id())));
@@ -88,5 +88,5 @@ fn a_cold_load_fills_near_the_disk_ceiling() {
     }
     let share = fill / disk;
     println!("fill {fill:.2} GB/s of a {disk:.2} GB/s disk ceiling: {:.0}%", share * 100.0);
-    assert!(share >= 0.7, "fills at {:.0}% of the disk ceiling", share * 100.0);
+    assert!(share >= 0.75, "fills at {:.0}% of the disk ceiling", share * 100.0);
 }
