@@ -3,7 +3,7 @@
 //! its row is reaped once its exit is proven, and admission is its `fits` (`admit`: a group on
 //! all of its GPUs or none). TensorD holds no byte count and decides no eviction: kept-page
 //! custody runs inside the ledger and the RAM tier ([`Tier`]) in this process. One thread blocks
-//! on every ledger's events; on each wake the dispatch queue asks again, the rows `status` names
+//! on every ledger's events; on each wake the dispatch queue asks again, the rows the ledger names
 //! stalled end, and changed peaks are saved.
 use crate::machine::receipt;
 use platform::contain::host_pressure::{self, HostMode};
@@ -157,31 +157,19 @@ pub fn react(ledgers: &[&Ledger], wake: impl Fn() + Send + 'static) -> io::Resul
     Ok(held)
 }
 
-/// The machine's RAM tier, served from this process on the host's pressure trigger. Where the
-/// host has none, its source is a socket this process holds and never writes: the tier then
-/// gives way only at its own headroom checks.
+/// The machine's RAM tier, served from this process while it lives: on the host's pressure
+/// trigger, else (no trigger here) at its headroom check at every host decision.
 pub struct HostTier {
     _tier: Option<Tier>,
-    _quiet: Option<UnixStream>,
 }
 
 impl HostTier {
     pub fn serve(mode: HostMode) -> Self {
-        let served = (|| {
-            let (pressure, quiet) = match host_pressure::Pressure::arm(mode) {
-                Ok(pressure) => (Pressure::Host(pressure), None),
-                Err(error) => {
-                    tracing::warn!("memory: no host pressure trigger ({error}); the RAM tier gives way at its headroom checks");
-                    let (quiet, source) = UnixStream::pair()?;
-                    (Pressure::Events(source.into()), Some(quiet))
-                }
-            };
-            io::Result::Ok(Self { _tier: Tier::serve(pressure).map_err(io::Error::other)?, _quiet: quiet })
-        })();
-        served.unwrap_or_else(|error| {
-            tracing::warn!("memory: no RAM tier: {error}");
-            Self { _tier: None, _quiet: None }
-        })
+        let pressure = host_pressure::Pressure::arm(mode).map(Pressure::Host).unwrap_or_else(|error| {
+            tracing::warn!("memory: no host pressure trigger ({error}); the RAM tier gives way at its headroom checks");
+            Pressure::Headroom
+        });
+        Self { _tier: Tier::serve(pressure).map_err(|error| tracing::warn!("memory: no RAM tier: {error}")).ok().flatten() }
     }
 }
 
