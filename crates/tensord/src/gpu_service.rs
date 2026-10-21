@@ -3852,6 +3852,26 @@ mod tests {
         crate::scratch::remove(&root);
     }
 
+    /// TD-1: one placement path for every degree. A group goes to the lane its executor holds,
+    /// as one GPU does, for a request and for warming alike; a waiting one claims that lane.
+    #[test]
+    fn a_group_runs_on_the_lane_its_executor_holds() {
+        let (root, pool, engine) = pool_of(4);
+        let film = plan("film", 2);
+        mark_serving(&pool, "film", 2);
+        let (gpu, warming) = pool.place(&engine, &film, (None, None), None, &mut [None; 4]).unwrap();
+        assert_eq!(gpu, 2, "warming loads where its executor is");
+        drop(warming);
+        let (gpu, call) = pool.place(&engine, &film, (Some(1), None), None, &mut [None; 4]).unwrap();
+        assert_eq!(gpu, 2, "not a cold load on the first free lane");
+        // Busy there, the next call is a replica on a free lane where it fits.
+        let (gpu, replica) = pool.place(&engine, &film, (Some(2), None), None, &mut [None; 4]).unwrap();
+        assert_eq!(gpu, 0);
+        drop((call, replica));
+        pool.stop().unwrap();
+        crate::scratch::remove(&root);
+    }
+
     #[test]
     fn independent_two_gpu_requests_use_disjoint_lanes() {
         let (root, pool, engine) = pool_of(4);
