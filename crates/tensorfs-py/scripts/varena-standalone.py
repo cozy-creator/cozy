@@ -195,7 +195,7 @@ def run(mem: Memory, unet: UNet2DConditionModel, want: list[torch.Tensor], id: s
         raise
     stats = r.stats()
     # Each step's capacity and working set (weights plus its largest measured pass room).
-    print(f"STEPS {id}: " + " ".join(f"(capacity {t.capacity}, w {t.w})" for t in stats.steps) + f"; last pass {mem.models[unet].last}", flush=True)
+    print(f"STEPS {id}: " + " ".join(f"(capacity {t.capacity}, w {t.w})" for t in stats.steps) + f"; last pass {mem.models[unet].last}; churn {r.churn}", flush=True)
     check(f"{id}: leaves nothing behind", stats.leftover == 0, stats.leftover)
     check(f"{id}: its record crosses as JSON", json.loads(stats.json())["request"] == id, stats.json())
     return stats, got
@@ -297,6 +297,30 @@ def gone(memory: weakref.ref[Memory], phase: str) -> None:
     check(f"{phase}: its memory is gone before the next phase opens one", memory() is None, gc.get_referrers(memory()) if memory() else "")
 
 
+def capping(mem: Memory, unet: UNet2DConditionModel) -> None:
+    """torch's cap: at each pass's start at least `torch_limit` (and the pass's measured room);
+    within the pass, oom answers only ever raise it."""
+    seen: list[tuple[str, int, int]] = []
+
+    def op(*_: object) -> None:
+        r = mem._current()
+        seen.append(("start", mem.capped or 0, mem.native.torch_limit()))
+        for _ in range(2):
+            r.oom(None, None)
+            seen.append(("oom", mem.capped or 0, mem.native.torch_limit()))
+
+    hook = unet.conv_in.register_forward_pre_hook(op)
+    with mem.request("capping", plan=[unet, unet]):
+        forward(unet, mem.device, 0)
+        forward(unet, mem.device, 1)
+    hook.remove()
+    starts = [cap >= limit for kind, cap, limit in seen if kind == "start"]
+    caps = [cap for _, cap, _ in seen]
+    rising = all(a <= b for pass_ in (caps[:3], caps[3:]) for a, b in zip(pass_, pass_[1:]))
+    check("cap: a pass starts at least at torch_limit", len(starts) == 2 and all(starts), seen)
+    check("cap: within a pass it never falls", len(caps) == 6 and rising, seen)
+
+
 def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tuple[list[torch.Tensor], list[int], int, int, weakref.ref[Memory]]:
     """Room for it all: against the plain model, held, entries, identity, concurrency, attempts.
     Returns the reference outputs, the region spans, the measured room, the base (contexts and
@@ -352,6 +376,7 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     check("identity: a pass under a new identity shed the hold of the old bake", shed == [True] and not mem.models[filled].holds, (shed, hold.blocks))
     concurrent(mem, ck)
     attempts(mem, ck)
+    capping(mem, unet)
     spans = model.set.spans
     return reference, spans, stats.peak - sum(spans), base, weakref.ref(mem)
 
