@@ -60,6 +60,20 @@ fn unload(b: &CudaBackend, va: Va, offset: u64, page: Physical) {
     b.destroy(page);
 }
 
+/// The native runner's idle reference: a process with this backend open and nothing to do. The
+/// CPU it uses is what an idle CUDA process uses; a case using no more is stuck.
+#[test]
+#[ignore = "native GPU: the runner's idle reference"]
+fn role_idle() {
+    if role().as_deref() != Some("idle") {
+        return;
+    }
+    let _open = gpu();
+    println!("@ ready");
+    std::io::stdout().flush().unwrap();
+    std::io::stdin().lock().read_to_end(&mut Vec::new()).unwrap();
+}
+
 /// This binary again, running `test` as `role`, with `stdin` (a socket to pass handles on).
 fn child(test: &str, role: &str, stdin: Stdio) -> Child {
     Command::new(std::env::current_exe().unwrap())
@@ -1218,6 +1232,40 @@ fn binds_outlive_the_custody_holder() {
     // The table goes with the last of its rows.
     drop(Ledger::create(&g, None).unwrap());
     println!("PASS binds outlive the custody holder {uuid}");
+}
+
+/// Under a pressure event, a RAM-tier layout an executor maps and has page-locked with the card
+/// (`register_host`) is asked back first: the executor unregisters and unmaps it, then the tier
+/// punches it out, so its bytes really return. The executor goes on from the store.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn the_tier_takes_back_a_pinned_layout() {
+    use std::os::fd::FromRawFd;
+    let (ledger, g, uuid) = tensord("pinned");
+    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
+    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
+    let signal = event.try_clone().unwrap();
+    let tier = varena::Tier::serve(varena::Pressure::Events(event)).unwrap().expect("no other participant serves this user's RAM tier");
+    let digest = |n: &str| format!("{n}-2-{}", g.uuid);
+    let resident = |d: &str| tier.resident().into_iter().find(|(k, _)| *k == d).map_or(0, |(_, b)| b);
+    let mut y = Agent::spawn();
+    y.ok(&format!("open {}", g.uuid));
+    y.ok("load p1 2 17 stored ram");
+    y.ok("load p2 2 18 stored ram");
+    // A device page filled from the tier: the region is mapped and page-locked in y.
+    assert_eq!(y.ok("exact p1 0 17"), "true");
+    assert!(resident(&digest("p1")) >= 2 * REGION_ALIGN && resident(&digest("p2")) >= 2 * REGION_ALIGN);
+    // SAFETY: an 8-byte write to our eventfd.
+    unsafe { libc::write(signal.as_raw_fd(), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
+    tier.await_releases(1);
+    assert!(resident(&digest("p1")) < REGION_ALIGN, "the pinned layout's regions returned: {}", resident(&digest("p1")));
+    assert!(resident(&digest("p2")) >= 2 * REGION_ALIGN, "the next one is untouched");
+    assert!(tier.acked() >= 2 * REGION_ALIGN, "y unregistered and unmapped it when asked: {}", tier.acked());
+    assert_eq!(y.ok("exact p1 1 17"), "true", "y goes on from the store");
+    y.ok("unpin");
+    y.exit();
+    drop(ledger);
+    println!("PASS the tier takes back a pinned layout ({} bytes acked) {uuid}", tier.acked());
 }
 
 #[test]
