@@ -190,8 +190,9 @@ class Request:
     def parked(self, nbytes: int) -> None:
         """The bytes a `Park` answer moved to the host (0: none, and the next `oom` is Exhausted)."""
 
-    def cut(self, set: int, site: str) -> int:
-        """The cut level of `set`'s current pass for `site` (0: whole)."""
+    def cut(self, set: int | None, site: str) -> int:
+        """The cut level of `set`'s current pass for `site` (0: whole); with no set (outside any
+        pass) the request's own memo of that site."""
 
     def yielding(self) -> Yielded:
         """The request waits on a child call: until the guard ends it gives back its reserved

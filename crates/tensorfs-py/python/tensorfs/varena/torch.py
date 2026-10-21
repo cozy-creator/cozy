@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import weakref
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -261,6 +262,10 @@ class Hold:
 
 # -------------------------------------------------------------------------- the memory
 
+#: This process's Memory of each device, while something holds it.
+_memories: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
+_opening = threading.Lock()
+
 #: The request a forward runs in, and the pass a site op runs in.
 _request: ContextVar[Request | None] = ContextVar("varena_request", default=None)
 _pass: ContextVar[_Pass | None] = ContextVar("varena_pass", default=None)
@@ -287,14 +292,24 @@ class Memory:
         name, its capacity lowered to `limit` (the first opener sets it, a later one can only
         lower it). On CUDA the backend opens first and measures this process's context, so open
         it before torch initializes CUDA, or torch's context counts as foreign bytes. CPU and MPS
-        use host pages on the machine's table `host` (its RAM); a `GpuId` names a host table."""
-        if isinstance(gpu, GpuId):
-            return cls(Native.host(gpu, grant, limit), torch.device("cpu"))
-        device = torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
+        use host pages on the machine's table `host` (its RAM); a `GpuId` names a host table.
+        A process has one Memory per device: while it lives, opening the device again returns it."""
+        device = torch.device("cpu") if isinstance(gpu, GpuId) else torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
         if device.type == "cuda":
-            return cls(Native.cuda(device.index or 0, grant, limit), torch.device("cuda", device.index or 0))
-        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        return cls(Native.host(GpuId("host", device.type, ram), grant, limit), device)
+            device = torch.device("cuda", device.index or 0)
+        key = gpu.uuid if isinstance(gpu, GpuId) else str(device)
+        with _opening:
+            memory = _memories.get(key)
+            if memory is None:  # one Memory per device and process: a second open is the first
+                if isinstance(gpu, GpuId):
+                    native = Native.host(gpu, grant, limit)
+                elif device.type == "cuda":
+                    native = Native.cuda(device.index or 0, grant, limit)
+                else:
+                    ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                    native = Native.host(GpuId("host", device.type, ram), grant, limit)
+                memory = _memories[key] = cls(native, device)
+        return memory
 
     @property
     def gpu(self) -> GpuId:
@@ -540,8 +555,10 @@ class Request:
         self.native.parked(nbytes)
 
     def cut(self, site: str) -> int:
-        """The current pass's level for cut site `site` (0: whole)."""
-        return self.native.cut(_open_pass().set, site)
+        """The current pass's level for cut site `site` (0: whole); outside any pass (a split in
+        package code) the request's own memo of it."""
+        p = _pass.get()
+        return self.native.cut(p.set if p else None, site)
 
     def levels(self) -> list[tuple[str, int]]:
         """The current pass's proposed `(site, level)` for its collective cut sites; the group
