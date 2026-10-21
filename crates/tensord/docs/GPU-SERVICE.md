@@ -92,8 +92,8 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   and forms its followers inside `Start` (Runtime `RankGroup`); the machine never talks to a follower.
   Every command's watch meters rank 0 plus its process-group members, so formation ends only on
   measured lack of progress. A group is admitted on all of its GPUs or none (`Ledger::admit`).
-  `Start` carries each GPU's grant (its table, granted to rank 0's pid) in lane order; rank 0
-  hands follower r its grant, and each rank claims its own row. Followers' pids from `Start` are their GPUs' tenants: a stalled one
+  `Start` carries each GPU's grant (its table and its row's lock description, granted to rank
+  0's pid) in lane order; rank 0 hands follower r its grant, and each rank claims its own row. Followers' pids from `Start` are their GPUs' tenants: a stalled one
   is ended by pid.
   Teardown waits for every group member's exit. Startup fences GPU dispatch until a previous
   machine's leaders and their followers are gone. A refusal or poisoned group call fails the run
