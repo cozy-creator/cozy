@@ -564,8 +564,11 @@ impl Row {
         self.rec(|r| latch_write(&r.seq, &r.latch, &words));
     }
 
+    /// The custody service's orphans; a change is a ledger event.
     pub fn set_orphans(&self, bytes: u64) {
-        self.rec(|r| r.orphans.store(bytes, Release));
+        if self.rec(|r| r.orphans.swap(bytes, AcqRel) != bytes).unwrap_or(false) {
+            self.shared.ring();
+        }
     }
 
     /// Binds this row's ask socket: its owner's ask thread serves it.
@@ -958,5 +961,37 @@ impl Drop for Ledger {
         if self.shared.rows().is_ok_and(|rows| rows.iter().all(|r| !r.live || r.pid == me)) {
             os::unlink(&self.shared.name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    /// Review 1, finding 1: a reaper or writer acting on a stale view frees nothing once the
+    /// offset holds a newer record: the free compares the whole word, generation included.
+    #[test]
+    fn a_stale_word_frees_nothing_newer() {
+        let gpu = GpuId { uuid: format!("unit-{}-stale", std::process::id()), model: "host".into(), memory: 1 << 30 };
+        let shared = Arc::new(Shared::adopt(os::shared(&gpu.uuid, true).unwrap(), &gpu, gpu.memory, None).unwrap());
+        let first = shared.claim(1).unwrap();
+        let (at, stale) = (first.at, first.word);
+        drop(first);
+        let second = shared.claim(2).unwrap();
+        assert_eq!(second.at, at, "the offset is reused");
+        assert_ne!(second.word, stale, "with a new generation");
+        assert!(!shared.free(at, stale, true).unwrap(), "a stale reaper frees nothing");
+        assert!(!shared.free(at, stale, false).unwrap(), "nor a stale writer");
+        assert!(shared.rows().unwrap().iter().any(|r| r.off == at && r.pid == 2 && r.live));
+        // Facts: a superseded version is freed by its own word only.
+        shared.put("k", Some(b"1")).unwrap();
+        shared.put("k", Some(b"2")).unwrap();
+        assert_eq!(shared.fact("k").unwrap(), Some(b"2".to_vec()));
+        // An ask to the freed row's id reads it as gone, never a hang.
+        assert_eq!(shared.ask(row_id(at, stale), Class::N, 1).unwrap(), 0);
+        drop(second);
+        os::unlink(&gpu.uuid);
     }
 }

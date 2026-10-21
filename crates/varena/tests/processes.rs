@@ -19,10 +19,18 @@ const MB: u64 = 1 << 20;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("child") {
-        return agent();
+    match args.first().map(String::as_str) {
+        Some("child") => return agent(),
+        Some("isolated") => {}
+        // The services' names are per user and network namespace: a namespace of its own keeps
+        // these processes' custody, tier and ask sockets apart from any other on the machine.
+        _ => {
+            let exe = std::env::current_exe().unwrap();
+            let status = Command::new("unshare").args(["--user", "--net"]).arg(exe).arg("isolated").args(&args).status().expect("unshare (util-linux) runs these tests in a namespace of their own");
+            std::process::exit(status.code().unwrap_or(1));
+        }
     }
-    let filter: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let filter: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
     type Case = (&'static str, fn(&Path));
     let cases: [Case; 11] = [
         ("an_idle_holder_answers_an_ask", an_idle_holder_answers_an_ask),
@@ -239,7 +247,7 @@ fn agent() {
             ["end", req] => {
                 passes.remove(*req);
                 let s = requests.remove(*req).unwrap().end();
-                format!("ok leftover={} kept={} tier={} store={}", s.leftover, s.moved.kept.bytes, s.moved.tier.bytes, s.moved.store.bytes)
+                format!("ok leftover={} kept={} tier={} store={} evicted={:?} spec={}", s.leftover, s.moved.kept.bytes, s.moved.tier.bytes, s.moved.store.bytes, s.evicted, s.moved.speculative)
             }
             ["limit"] => format!("ok {}", mem.as_ref().unwrap().torch_limit()),
             ["fault", point] => {
@@ -556,7 +564,8 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
     }
     assert_eq!(b.ok("trace r"), "Hit,Hit,Hit", "every page kept, none copied");
     b.ok("unpin");
-    assert!(b.ok("end r").contains("tier=0 store=0"));
+    let end = b.ok("end r");
+    assert!(end.contains("tier=0 store=0"), "{end}");
     b.exit();
 }
 

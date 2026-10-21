@@ -470,3 +470,22 @@ fn a_pass_reserves_its_room_with_its_evictions() {
     assert_eq!(a.last(), Some(&Action::Reserve { req: 1, room: 2 * MB, measured: true }));
     assert_eq!(a.iter().filter(|a| matches!(a, Action::Unmap { class: Class::N, .. })).count(), 2, "{a:?}");
 }
+
+/// The tier's order, pure: orphaned layouts first (least recently used), then unused, then the
+/// furthest declared; a region in flight is never given back.
+#[test]
+fn the_tier_never_releases_a_region_in_flight() {
+    use varena::tier::{host_decide, HostAction, HostLayout, HostTrigger};
+    let layout = |digest: &str, users: Vec<Option<u32>>, used: u64, regions: Vec<(u64, bool, bool)>| HostLayout { digest: digest.into(), regions, users, used };
+    let layouts = vec![
+        layout("near", vec![Some(1)], 1, vec![(MB, true, false)]),
+        layout("orphan", vec![], 9, vec![(MB, true, true), (MB, true, false)]),
+        layout("unused", vec![None], 5, vec![(MB, true, false)]),
+        layout("far", vec![Some(4)], 2, vec![(MB, true, false)]),
+    ];
+    let first = host_decide(&layouts, HostTrigger::Pressure);
+    assert_eq!(first, vec![HostAction::Release { digest: "orphan".into(), region: 1 }], "the region in flight stays, so the layout stays");
+    let room = host_decide(&layouts, HostTrigger::Room { bytes: 4 * MB, headroom: 0 });
+    let order: Vec<&str> = room.iter().map(|a| match a { HostAction::Release { digest, .. } | HostAction::Forget(digest) => digest.as_str() }).collect();
+    assert_eq!(order, vec!["orphan", "unused", "far", "near"]);
+}
