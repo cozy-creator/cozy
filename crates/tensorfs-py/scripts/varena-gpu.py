@@ -369,8 +369,7 @@ def test_survive(gpu, ck, rs, store, stream, facts):
     facts["h_adopt_ms"] = round((time.perf_counter() - t0) * 1e3, 2)
     for _, f in pages:
         os.close(f)
-    want = sum(p.nbytes for p in ws.parts)
-    assert adopted >= want, f"adopted {adopted} of {want}"
+    assert sorted(adopted) == sorted(r for r, _ in pages), f"adopted {adopted} of {len(pages)}"
     facts["h_exact_bytes"] = exact(ws, ck, stream)
     for r, _ in meta:
         pin = ws.bind(r, stream)

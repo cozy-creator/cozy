@@ -134,11 +134,17 @@ type Bind = Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]]
 
 class Fill(Protocol):
     """A page-in transform (a LoRA bake) on fresh bytes. `prepare()`, as each forward starts,
-    readies the module and names what filling adds; pages filled under another name refill."""
+    readies the module and names what filling adds; pages filled under another name refill.
+    `identity()` names it the same in every process, complete: the content ids of what it
+    reads, module paths, scales, encodings, and the recipe with its seed rule. Pages filled
+    under an identity outlive the process and map, unfilled again, into the next executor
+    that names the same one; None (unprovable) keeps none."""
 
     def __call__(self, block: Block, parts: Mapping[str, Mapping[str, Tensor]], /) -> None: ...
 
     def prepare(self) -> Hashable: ...
+
+    def identity(self) -> str | None: ...
 
 
 class Shrink(Protocol):
@@ -385,6 +391,11 @@ class Model:
         #: the epochs of its latest plan and of a request whose first pass ran unmeasured
         self.planned = self.rose = -1
         self.filled: Hashable | None = None
+        #: what its pages were filled under (`Fill.identity`); a gone executor's filled pages
+        #: mapped at load, unused until its first forward proves them (`Memory._fresh`): their
+        #: regions and the fingerprint they were kept under
+        self.identity: str | None = None
+        self.claimed: tuple[list[int], str] | None = None
         #: torch bytes its passes allocated above their start in its last request; -1 unmeasured
         self.reserve = -1
         #: what torch's allocator held beyond the allocated peak in its latest uncut pass
@@ -419,15 +430,17 @@ class Model:
         they hold: `(region, span, fd)`, each fd the caller's. None when a fill (a LoRA bake)
         writes them. `quiescent` is only for an executor that stopped admission and drained
         all work: lifetime graph pins can remain without excluding their pages."""
-        if self.fill is not None or self.host or not self.memory.granted:
+        filled = self.fill is not None
+        if self.host or not self.memory.granted or filled and self.identity is None:
             return "", []
         with self.memory.lock:
             if quiescent and (
                 self.memory.active or any(m.flight for m in self.memory.models.values())
             ):
                 raise Unbound("quiescent retention requires no active request or forward")
-            pages = self.ws.kept_quiescent() if quiescent else self.ws.kept()
-            return (_fingerprint(self.key, self.ws) if pages else ""), pages
+            kept = self.ws.kept_quiescent if quiescent else self.ws.kept
+            pages = kept(filled=filled)  # filled: only pages its fill wrote
+            return (_fingerprint(self.key, self.ws, self.identity) if pages else ""), pages
 
 
 class Hold:
@@ -600,6 +613,8 @@ class Memory:
         with self.lock:
             model = self.by_module.get(module) or self._register(module)
             model.level = level
+            if model.claimed is not None:
+                self._headroom_from(model)
             if self.cuda:
                 model.ws.warm(level is Level.GPU)
                 if level is Level.GPU and not self.active:
@@ -610,9 +625,25 @@ class Memory:
     def _share(self, ws: WeightSet, grant: WeightGrant) -> None:
         """Under TensorD, a set's home pages can be kept past this process; pages a gone
         executor kept for it map now, no copy, when they hold what this set holds."""
-        if self.cuda and self.granted and ws.shareable() and grant.pages:
-            if grant.fingerprint == _fingerprint(grant.key, ws):
-                ws.adopt_pages(list(grant.pages))
+        if self._shared(ws, grant) and grant.fingerprint == _fingerprint(grant.key, ws):
+            ws.adopt_pages(list(grant.pages))
+
+    def _headroom_from(self, model: Model) -> None:
+        """Filled pages a gone executor kept leave the headroom a load leaves (D9: a restart's
+        first request found the device full), its last blocks going first."""
+        assert model.claimed is not None
+        regions = set(model.claimed[0])
+        for b in reversed(model.order):
+            if self._free() >= self._headroom():
+                return
+            gone = [r for r in model.blocks[b].regions if r in regions]
+            if gone:
+                model.ws.evict(gone)
+
+    def _shared(self, ws: WeightSet, grant: WeightGrant) -> bool:
+        return self.cuda and self.granted and ws.shareable() and bool(grant.pages)
+
+
 
     def _name(self, key: str) -> str:
         taken = set(self.models)
@@ -653,6 +684,8 @@ class Memory:
         if declared.fill is None:
             self._share(ws, grant)
         model = Model(self, ws.name, grant.key, module, ws, declared)
+        if declared.fill is not None and self._shared(ws, grant):
+            model.claimed = ws.adopt_pages(list(grant.pages), filled=True), grant.fingerprint
         if sealed is not None:
             self.deposits.append((model, sealed))
         _layout(model, f"{grant.component}/", paths, regions)
@@ -712,7 +745,9 @@ class Memory:
         self._publish()
 
     def _fresh(self, model: Model) -> None:
-        """Pages filled under another `prepare()` refill; the caches holding them shrink first."""
+        """Pages filled under another `prepare()` refill; the caches holding them shrink first.
+        The first proves the filled pages a gone executor kept: they stay only when filled under
+        the identity its fill names now, and nothing bound them before."""
         version = model.fill.prepare() if model.fill is not None else None
         if version != model.filled:
             if model.filled is not None:
@@ -720,6 +755,13 @@ class Memory:
                     self._shrink(cache, cache.nbytes)
                 self._evict(model, "refill", 0)
             model.filled = version
+            model.identity = getattr(model.fill, "identity", lambda: None)()
+        if model.claimed is not None:  # pages filled under another identity, or none proven, go
+            (regions, fingerprint), model.claimed = model.claimed, None
+            if model.identity is None or fingerprint != _fingerprint(
+                model.key, model.ws, model.identity
+            ):
+                model.ws.evict(regions)
 
     def _plan(self, model: Model, measured: bool = False) -> None:
         """The watermark as a pass starts, from the measured reserve: a repeating model wholly at
@@ -837,6 +879,7 @@ class Memory:
         model, block.stream = block.model, stream
         views: dict[str, dict[str, Tensor]] = {}
         fresh: dict[str, dict[str, Tensor]] = {}
+        filling: list[int] = []
         try:
             for region in block.regions:
                 pinned = self._pin(model, region, stream.cuda_stream)
@@ -846,6 +889,7 @@ class Memory:
                 views.update(parts)
                 if pinned.fresh:
                     fresh.update(parts)
+                    filling.append(region)
             if fresh and model.fill is not None:
                 with cuts.own_layer():  # its own allocations are caught at the op, never waiting
                     self.local.binding = True
@@ -859,6 +903,9 @@ class Memory:
             self._cap()
         except BaseException:
             _unbind(block)
+            if filling and model.fill is not None:  # a fill cut short leaves no page filled
+                pinned = base = parts = fresh = views = None  # noqa: F841
+                model.ws.evict(filling)
             raise
 
     def _pin(self, model: Model, region: int, stream: int) -> Pinned:
@@ -1673,14 +1720,15 @@ def _declared(module: nn.Module) -> Declared:
     return found if isinstance(found, Declared) else Declared()
 
 
-def _fingerprint(key: str, ws: WeightSet) -> str:
-    """What `ws`'s kept pages hold: its checkpoint and component, and each part's place and
-    encoding."""
+def _fingerprint(key: str, ws: WeightSet, filled: str | None = None) -> str:
+    """What `ws`'s kept pages hold: its checkpoint and component, each part's place and
+    encoding, and what filled them (`Fill.identity`)."""
     parts = sorted(
         (p.region, p.offset, p.nbytes, p.component, p.key, p.role, p.dtype, tuple(p.shape))
         for p in ws.parts
     )
-    return hashlib.sha256(repr((key, ws.spans, parts)).encode()).hexdigest()
+    held = (key, ws.spans, parts) if filled is None else (key, ws.spans, parts, filled)
+    return hashlib.sha256(repr(held).encode()).hexdigest()
 
 
 def blocks_of(module: nn.Module) -> list[str]:
