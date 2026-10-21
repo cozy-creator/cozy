@@ -101,12 +101,15 @@ fn role_monitor() {
     cuda::check("cuDeviceGet", unsafe { (cuda::driver().unwrap().device_get)(&mut device, 0) }).unwrap();
     let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
     let mut seen = 0;
-    nvml.worked_since(&mut seen).unwrap();
+    let _ = nvml.worked_since(&mut seen);
     println!("@ ready");
     std::io::stdout().flush().unwrap();
     for _ in std::io::stdin().lock().lines() {
-        let (kernels, memory) = nvml.worked_since(&mut seen).unwrap();
-        println!("@ {kernels} {memory}");
+        // NVML answers "not found" when it has taken no sample since the last look: no signal.
+        match nvml.worked_since(&mut seen) {
+            Ok((kernels, memory)) => println!("@ {kernels} {memory}"),
+            Err(e) => println!("@ unknown {e}"),
+        }
         std::io::stdout().flush().unwrap();
     }
 }
