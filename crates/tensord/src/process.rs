@@ -561,7 +561,9 @@ mod tests {
                 Some(Arc::new(move || Some(busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed))))
             }, false),
             ("GPU unread", "while :; do :; done", Some(Arc::new(|| None)), false),
-            ("spins on two cores", "while :; do :; done & while :; do :; done", Some(Arc::new(|| Some(0))), false),
+            // Four spinners: on a runner shared with another test harness, two may get only one
+            // core between them, and that is a spin on one core.
+            ("spins on many cores", "for i in 1 2 3; do (while :; do :; done) & done; while :; do :; done", Some(Arc::new(|| Some(0))), false),
         ];
         // A shell can fork a CPU spinner. Always end its group, including on an assertion
         // failure: Child::kill only ends the shell and leaves that spinner running.
