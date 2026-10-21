@@ -645,51 +645,70 @@ impl Held {
         self.regions.get(r as usize).copied().ok_or_else(|| Error::Invalid(format!("region {r}")))
     }
 
-    /// Copies region `r` into `dst` if it is ready, under its read lock; false when it is not.
-    /// The caller settles the region afterwards ([`Held::settle`]).
-    pub fn read(&self, r: u32, dst: tensorfs::io::Dst) -> Result<bool> {
-        let (off, span) = self.region(r)?;
-        self.pins.lock().reading.insert(r);
-        os::share(&self.fd, self.data + off, span, true)?;
-        let copied = (|| {
-            if self.ready(r).is_none_or(|w| w.load(Acquire) != 1) {
-                return Ok(false);
+    /// Copies each ready region into its destination, all in one engine read, under their
+    /// read locks; whether each was copied. The caller settles each afterwards
+    /// ([`Held::settle`]).
+    pub fn read(&self, regions: &[(u32, tensorfs::io::Dst)]) -> Result<Vec<bool>> {
+        let spans = regions.iter().map(|(r, dst)| self.region(*r).and_then(|(off, span)| if dst.len() as u64 > span { Err(Error::Invalid("tier read past its region".into())) } else { Ok((off, span)) })).collect::<Result<Vec<_>>>()?;
+        self.pins.lock().reading.extend(regions.iter().map(|(r, _)| *r));
+        self.locked(regions.iter().map(|(r, _)| *r), false, || {
+            let ready: Vec<bool> = regions.iter().map(|(r, _)| self.ready(*r).is_some_and(|w| w.load(Acquire) == 1)).collect();
+            // SAFETY: each ready region is read-locked (nobody frees it), inside our mapping.
+            let src = |off: u64| tensorfs::io::Src::Host(unsafe { self.ro.base.add((self.data + off) as usize) });
+            let copies: Vec<_> = regions.iter().zip(&spans).zip(&ready).filter(|(_, ready)| **ready).map(|(((_, dst), (off, _)), _)| tensorfs::io::Copy { src: src(*off), dst: *dst }).collect();
+            if !copies.is_empty() {
+                // SAFETY: the caller owns each `dst` exclusively for this call.
+                unsafe { tensorfs::io::read(&copies, &tensorfs::io::ReadOpts::default()) }?;
             }
-            let len = dst.len() as u64;
-            if len > span {
-                return Err(Error::Invalid("tier read past its region".into()));
-            }
-            // SAFETY: the region is ready and read-locked (nobody frees it), inside our mapping.
-            let src = unsafe { self.ro.base.add((self.data + off) as usize) };
-            let copy = tensorfs::io::Copy { src: tensorfs::io::Src::Host(src), dst };
-            // SAFETY: the caller owns `dst` exclusively for this call.
-            unsafe { tensorfs::io::read(&[copy], &tensorfs::io::ReadOpts::default()) }?;
-            Ok(true)
-        })();
-        os::unlock(&self.fd, self.data + off, span)?;
-        copied
+            Ok(ready)
+        })
     }
 
-    /// Fills region `r` from `fill` (which writes the region's host bytes) unless it is ready.
-    pub fn fill(&self, r: u32, fill: impl FnOnce(tensorfs::io::Dst) -> Result<()>) -> Result<()> {
-        let (off, span) = self.region(r)?;
-        os::lock(&self.fd, self.data + off, span, true)?;
-        let done = (|| {
-            if self.ready(r).is_some_and(|w| w.load(Acquire) == 1) {
+    /// Fills the regions not ready, all at once through `fill` (given each one's host bytes),
+    /// under their write locks; then they are ready.
+    pub fn fill(&self, regions: &[u32], fill: impl FnOnce(&[(u32, tensorfs::io::Dst)]) -> Result<()>) -> Result<()> {
+        self.locked(regions.iter().copied(), true, || {
+            let todo: Vec<u32> = regions.iter().copied().filter(|r| self.ready(*r).is_none_or(|w| w.load(Acquire) != 1)).collect();
+            if todo.is_empty() {
                 return Ok(());
             }
-            let rw = os::map_at(&self.fd, self.data + off, span as usize, true)?;
-            fill(tensorfs::io::Dst::Host { ptr: rw.base, len: span as usize })?;
-            drop(rw);
-            // The words page is the service's to write; the region lock orders this store.
+            let maps = todo.iter().map(|r| self.region(*r).and_then(|(off, span)| os::map_at(&self.fd, self.data + off, span as usize, true))).collect::<Result<Vec<_>>>()?;
+            let dsts: Vec<_> = todo.iter().zip(&maps).map(|(r, m)| (*r, tensorfs::io::Dst::Host { ptr: m.base, len: m.len })).collect();
+            fill(&dsts)?;
+            drop(maps);
+            // The words page is the service's to write; the region locks order these stores.
             let words = os::map_at(&self.fd, 0, self.data as usize, true)?;
-            // SAFETY: inside the words page, aligned to 4.
-            let word = unsafe { &*(words.base.add(r as usize * 4) as *const AtomicU32) };
-            word.store(1, Release);
+            for r in todo {
+                // SAFETY: inside the words page, aligned to 4.
+                let word = unsafe { &*(words.base.add(r as usize * 4) as *const AtomicU32) };
+                word.store(1, Release);
+            }
             Ok(())
+        })
+    }
+
+    /// Runs `f` with the regions locked (write, or read), each unlocked after. They are taken
+    /// in ascending order, as every holder takes them, so no two holders wait on each other.
+    fn locked<T>(&self, regions: impl Iterator<Item = u32>, write: bool, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let mut order: Vec<u32> = regions.collect();
+        order.sort_unstable();
+        order.dedup();
+        let mut held = vec![];
+        let out = (|| {
+            for r in &order {
+                let (off, span) = self.region(*r)?;
+                match write {
+                    true => os::lock(&self.fd, self.data + off, span, true)?,
+                    false => os::share(&self.fd, self.data + off, span, true)?,
+                };
+                held.push((off, span));
+            }
+            f()
         })();
-        os::unlock(&self.fd, self.data + off, span)?;
-        done
+        for (off, span) in held {
+            os::unlock(&self.fd, self.data + off, span)?;
+        }
+        out
     }
 }
 

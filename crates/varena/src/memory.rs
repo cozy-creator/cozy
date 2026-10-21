@@ -25,11 +25,14 @@ use std::time::Instant;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use platform::handles::Owned;
 
+use tensorfs::io::source::Placement;
+use tensorfs::io::Dst;
+
 use crate::backend::{Access, Backend, Event, Physical, Va};
 use crate::custody;
 use crate::decide::{decide, Action, Trigger, Tried};
 use crate::ledger::{self, Facts, Grant, Room, Row, Shared};
-use crate::table::{Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Source, Table};
+use crate::table::{Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
 use crate::tier;
 use crate::{Error, Exhausted, GpuId, Result};
 
@@ -301,6 +304,8 @@ struct Job {
     key: Key,
     gen: u64,
     req: Option<u64>,
+    /// The page's bytes: a batch is cut by them.
+    span: u64,
     /// The page's earlier consumers (release events) a refill in place writes after: the copy
     /// stream waits on them in-stream, and they are retired once the fill's event follows them.
     after: Vec<Event>,
@@ -310,6 +315,22 @@ struct Job {
 struct Jobs {
     demand: Sender<Job>,
     ahead: Sender<Job>,
+}
+
+/// One page of a fill batch: where it goes, and how its copy ended.
+struct Copying {
+    key: Key,
+    dst: Dst,
+    span: u64,
+    out: Option<Result<Origin>>,
+}
+
+/// Bytes filled since the fill threads were last all idle, and the batches in flight (its lock
+/// is a leaf).
+#[derive(Default)]
+struct Burst {
+    bytes: u64,
+    batches: u32,
 }
 
 struct Release {
@@ -542,6 +563,7 @@ struct Inner {
     /// Fill jobs; the fill threads hold the receiving ends and a weak reference to the rest,
     /// so dropping the Memory ends them. The trim thread's work likewise.
     jobs: Jobs,
+    burst: Mutex<Burst>,
     wanted: Arc<(Mutex<Wanted>, Condvar)>,
     stop: Arc<AtomicBool>,
     #[cfg(unix)]
@@ -597,6 +619,7 @@ impl Memory {
                 release_tx,
                 releases,
                 jobs: Jobs { demand, ahead },
+                burst: Mutex::new(Burst::default()),
                 wanted: Arc::new((Mutex::new(Wanted::default()), Condvar::new())),
                 stop: Arc::new(AtomicBool::new(false)),
                 #[cfg(unix)]
@@ -1079,7 +1102,7 @@ impl Inner {
         // the unmaps decided before it, then queues its fill.
         st.homes.insert(key, Home { phys: None, ready: Event::DONE, gen, filled: false, filling: true, fresh: false, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false });
         st.sync(key);
-        self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, after: vec![] }, speculative, decided }, 0);
+        self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, speculative, decided }, 0);
         Ok(true)
     }
 
@@ -1100,7 +1123,7 @@ impl Inner {
         *h = Home { phys: h.phys.take(), ready: Event::DONE, gen, filled: false, filling: true, fresh: false, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
-        let job = Job { key, gen, req, after: vec![] };
+        let job = Job { key, gen, req, span, after: vec![] };
         if kept {
             // Read-only and kept under its old identity: never written or protected again. Custody
             // gives the old key up; a fresh page takes its place once its consumers are done.
@@ -1145,103 +1168,83 @@ impl Inner {
         self.mech.post(Mech::Keep { key, gen: home.gen, va, off, span, phys: phys.0, len: phys.1 }, 0);
     }
 
-    /// A fill thread's job: tier, else store (through the tier when it has room), then the
-    /// page's ready event.
-    fn fill(&self, job: &Job) {
-        self.fill_job(job);
-        // Its fill's event follows them in-stream (or it was dropped): nobody needs them now.
-        job.after.iter().for_each(|e| self.backend.retire(*e));
+    /// A fill thread's batch: each page from the tier, else the store (through the tier when it
+    /// has room), in as few engine reads as its sets allow; then each page's ready event.
+    fn fill(&self, jobs: &[Job]) {
+        self.fill_batch(jobs);
+        // Their fills' events follow them in-stream (or were dropped): nobody needs them now.
+        jobs.iter().flat_map(|j| &j.after).for_each(|e| self.backend.retire(*e));
     }
 
-    fn fill_job(&self, job: &Job) {
-        let prepared = {
+    fn fill_batch(&self, jobs: &[Job]) {
+        // Under one lock: each live job's place, and its set's spec and tier layout.
+        let (sets, pages) = {
             let st = self.state.lock();
-            match (st.homes.get(&job.key), st.mech(job.key.0), st.place(job.key)) {
-                (Some(h), Ok(m), Ok(place)) if h.gen == job.gen => Some((m.spec.clone(), m.held.clone(), place)),
-                _ => None,
+            let mut sets: BTreeMap<u32, (SetSpec, Option<Arc<tier::Held>>)> = BTreeMap::new();
+            let mut pages = vec![];
+            for job in jobs {
+                let (Some(h), Ok(m), Ok(place)) = (st.homes.get(&job.key), st.mech(job.key.0), st.place(job.key)) else { continue };
+                if h.gen == job.gen {
+                    sets.entry(job.key.0).or_insert_with(|| (m.spec.clone(), m.held.clone()));
+                    pages.push((job, place));
+                }
             }
+            (sets, pages)
         };
-        let Some((spec, held, (va, off, span))) = prepared else { return };
-        let start = Instant::now();
-        let result = crate::caught(|| {
-            #[cfg(feature = "faults")]
-            crate::faults::hit(crate::faults::Point::Fill);
-            let dst = self.backend.target(va, off, span);
-            // A refill in place writes after the page's last consumers, in-stream (a host page
-            // has no stream: 0).
-            let copy = match &dst {
-                tensorfs::io::Dst::Device { stream, .. } => *stream,
-                tensorfs::io::Dst::Host { .. } => 0,
-            };
-            job.after.iter().try_for_each(|e| self.backend.wait(*e, copy))?;
-            let region = spec.layout.region(job.key.1)?;
-            let pin = |held: &tier::Held| held.pin(job.key.1, |p, l| self.backend.register_host(p, l), |p| self.backend.unregister_host(p));
-            // A copy from the tier, its region settled after (unlocked if the tier asked for it).
-            let read = |held: &tier::Held| {
-                let copied = held.read(job.key.1, dst);
-                held.settle(job.key.1, |p| self.backend.unregister_host(p));
-                copied
-            };
-            if let Some(held) = &held {
-                pin(held)?;
-                if read(held)? {
-                    return Ok((Origin::Tier, self.backend.fence()?));
-                }
-                // Staged through the tier when the host has the room (the tier's decision).
-                if self.tier.as_ref().is_some_and(|t| t.room(span)) {
-                    held.fill(job.key.1, |host| self.store(&spec.source, &region.items, region.offset, host))?;
-                    pin(held)?;
-                    if read(held)? {
-                        return Ok((Origin::Store, self.backend.fence()?));
-                    }
-                }
-            }
-            self.store(&spec.source, &region.items, region.offset, dst)?;
-            Ok((Origin::Store, self.backend.fence()?))
-        });
-        let mut sticky = false;
-        let ns = start.elapsed().as_nanos() as u64;
-        let mut st = self.state.lock();
-        if st.homes.get(&job.key).is_none_or(|h| h.gen != job.gen) {
-            // The page changed under the fill: its event is nobody's.
-            if let Ok((_, ready)) = result {
-                self.backend.retire(ready);
-            }
+        if pages.is_empty() {
             return;
         }
-        match result {
-            Ok((origin, ready)) => {
-                let stored = spec.fingerprint.fill == Fill::Stored;
-                let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
-                if let Some(h) = st.homes.get_mut(&job.key) {
-                    h.ready = ready;
-                    h.filling = false;
-                    h.filled = stored;
-                    h.fresh = true;
-                    h.origin = origin;
+        let start = Instant::now();
+        let copied = crate::caught(|| Ok(self.copy(&sets, &pages))).unwrap_or_else(|e| vec![Err(e); pages.len()]);
+        // An event per page, after every copy so far.
+        let landed: Vec<Result<(Origin, Event)>> = copied.into_iter().map(|c| c.and_then(|origin| Ok((origin, self.backend.fence()?)))).collect();
+        let (ns, bytes) = (start.elapsed().as_nanos() as u64, pages.iter().map(|(_, (.., span))| span).sum::<u64>().max(1));
+        let mut sticky = false;
+        let mut st = self.state.lock();
+        for ((job, (.., span)), landed) in pages.iter().zip(landed) {
+            let span = *span;
+            if st.homes.get(&job.key).is_none_or(|h| h.gen != job.gen) {
+                // The page changed under the fill: its event is nobody's.
+                if let Ok((_, ready)) = landed {
+                    self.backend.retire(ready);
                 }
-                st.sync(job.key);
-                let s = st.fills(job.req, job.key, span, origin);
-                let f = if origin == Origin::Tier { &mut s.moved.tier } else { &mut s.moved.store };
-                f.bytes += span;
-                f.ns += ns;
-                if speculative {
-                    s.moved.speculative += span;
-                }
-                if stored {
-                    self.keep(&mut st, job.key);
-                }
+                continue;
             }
-            Err(e) => {
-                tracing::warn!("varena: filling {:?} failed: {e}", job.key);
-                sticky = e.is_sticky();
-                if let Some(h) = st.homes.get_mut(&job.key) {
-                    h.filling = false;
+            match landed {
+                Ok((origin, ready)) => {
+                    let stored = sets.get(&job.key.0).is_some_and(|(spec, _)| spec.fingerprint.fill == Fill::Stored);
+                    let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
+                    if let Some(h) = st.homes.get_mut(&job.key) {
+                        h.ready = ready;
+                        h.filling = false;
+                        h.filled = stored;
+                        h.fresh = true;
+                        h.origin = origin;
+                    }
+                    st.sync(job.key);
+                    let s = st.fills(job.req, job.key, span, origin);
+                    let f = if origin == Origin::Tier { &mut s.moved.tier } else { &mut s.moved.store };
+                    f.bytes += span;
+                    // The batch's time, shared by its bytes.
+                    f.ns += (u128::from(ns) * u128::from(span) / u128::from(bytes)) as u64;
+                    if speculative {
+                        s.moved.speculative += span;
+                    }
+                    if stored {
+                        self.keep(&mut st, job.key);
+                    }
                 }
-                let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
-                let _ = self.unmap(&mut st, job.key, Class::P, None, true);
-                if !speculative {
-                    st.failed.insert(job.key, e);
+                Err(e) => {
+                    tracing::warn!("varena: filling {:?} failed: {e}", job.key);
+                    sticky |= e.is_sticky();
+                    if let Some(h) = st.homes.get_mut(&job.key) {
+                        h.filling = false;
+                    }
+                    let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
+                    let _ = self.unmap(&mut st, job.key, Class::P, None, true);
+                    if !speculative {
+                        st.failed.insert(job.key, e);
+                    }
                 }
             }
         }
@@ -1257,31 +1260,128 @@ impl Inner {
         }
     }
 
-    /// A fill thread's job failed outside its copy (a panic): its page goes, its binder fails.
-    fn fail(&self, job: &Job, e: Error) {
-        let mut st = self.state.lock();
-        if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen) {
-            if let Some(h) = st.homes.get_mut(&job.key) {
-                h.filling = false;
+    /// The batch's copies: from the tier where ready, else staged through it when the host has
+    /// room, else straight from the store; one engine read for each of those per set. Each
+    /// page's origin, or its error.
+    #[allow(clippy::type_complexity)]
+    fn copy(&self, sets: &BTreeMap<u32, (SetSpec, Option<Arc<tier::Held>>)>, pages: &[(&Job, (Va, u64, u64))]) -> Vec<Result<Origin>> {
+        #[cfg(feature = "faults")]
+        crate::faults::hit(crate::faults::Point::Fill);
+        let mut copies: Vec<Copying> = pages
+            .iter()
+            .map(|(job, (va, off, span))| {
+                let dst = self.backend.target(*va, *off, *span);
+                // A refill in place writes after the page's last consumers, in-stream (a host
+                // page has no stream: 0).
+                let stream = match dst {
+                    Dst::Device { stream, .. } => stream,
+                    Dst::Host { .. } => 0,
+                };
+                let out = job.after.iter().try_for_each(|e| self.backend.wait(*e, stream)).err().map(Err);
+                Copying { key: job.key, dst, span: *span, out }
+            })
+            .collect();
+        let unregister = |p| self.backend.unregister_host(p);
+        for (set, (spec, held)) in sets {
+            let todo = |c: &Copying| c.key.0 == *set && c.out.is_none();
+            if let Some(held) = held {
+                // A copy from the tier, each region settled after (unlocked if the tier asked
+                // for it).
+                let read = |copies: &mut [Copying], origin: Origin| {
+                    for c in copies.iter_mut().filter(|c| todo(c)) {
+                        if let Err(e) = held.pin(c.key.1, |p, l| self.backend.register_host(p, l), unregister) {
+                            c.out = Some(Err(e));
+                        }
+                    }
+                    let mut from: Vec<&mut Copying> = copies.iter_mut().filter(|c| todo(c)).collect();
+                    let copied = held.read(&from.iter().map(|c| (c.key.1, c.dst)).collect::<Vec<_>>());
+                    from.iter().for_each(|c| held.settle(c.key.1, unregister));
+                    match copied {
+                        Ok(copied) => from.iter_mut().zip(copied).filter(|(_, ok)| *ok).for_each(|(c, _)| c.out = Some(Ok(origin))),
+                        Err(e) => from.iter_mut().for_each(|c| c.out = Some(Err(e.clone()))),
+                    }
+                };
+                read(&mut copies, Origin::Tier);
+                // Staged through the tier when the host has the room (the tier's decision).
+                let blocks: Vec<u32> = copies.iter().filter(|c| todo(c)).map(|c| c.key.1).collect();
+                let bytes = copies.iter().filter(|c| todo(c)).map(|c| c.span).sum();
+                if !blocks.is_empty() && self.tier.as_ref().is_some_and(|t| t.room(bytes)) {
+                    match held.fill(&blocks, |hosts| self.store(spec, hosts)) {
+                        Ok(()) => read(&mut copies, Origin::Store),
+                        Err(e) => copies.iter_mut().filter(|c| todo(c)).for_each(|c| c.out = Some(Err(e.clone()))),
+                    }
+                }
             }
-            let _ = self.unmap(&mut st, job.key, Class::P, None, true);
-            st.failed.insert(job.key, e);
+            let direct: Vec<(u32, Dst)> = copies.iter().filter(|c| todo(c)).map(|c| (c.key.1, c.dst)).collect();
+            if !direct.is_empty() {
+                let stored = self.store(spec, &direct).map(|()| Origin::Store);
+                copies.iter_mut().filter(|c| todo(c)).for_each(|c| c.out = Some(stored.clone()));
+            }
+        }
+        copies.into_iter().map(|c| c.out.unwrap_or_else(|| Err(Error::Internal("a page left unfilled".into())))).collect()
+    }
+
+    /// A fill thread's batch failed outside its copies (a panic): its pages go, their binders fail.
+    fn fail(&self, jobs: &[Job], e: Error) {
+        let mut st = self.state.lock();
+        for job in jobs {
+            if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen) {
+                if let Some(h) = st.homes.get_mut(&job.key) {
+                    h.filling = false;
+                }
+                let _ = self.unmap(&mut st, job.key, Class::P, None, true);
+                st.failed.insert(job.key, e.clone());
+            }
         }
         self.unlock(st);
         self.landed.notify_all();
     }
 
+    /// `first` and the jobs queued behind it (demand misses first), up to the burst's bytes so
+    /// far: batches double, so the first pages are ready soonest and a few reads carry the
+    /// rest. Never less than the engine keeps in flight (its threads' requests): a smaller read
+    /// leaves its threads idle.
+    fn batch(&self, first: Job, demand: &Receiver<Job>, ahead: &Receiver<Job>) -> Vec<Job> {
+        let engine = tensorfs::io::ReadOpts::default();
+        let budget = {
+            let mut b = self.burst.lock();
+            b.batches += 1;
+            b.bytes.max((engine.threads * engine.request) as u64)
+        };
+        let mut bytes = first.span;
+        let mut jobs = vec![first];
+        while bytes < budget {
+            let Ok(job) = demand.try_recv().or_else(|_| ahead.try_recv()) else { break };
+            bytes += job.span;
+            jobs.push(job);
+        }
+        jobs
+    }
+
+    /// A batch is done: its bytes count for its burst, which ends when nothing is queued or
+    /// filling.
+    fn batched(&self, jobs: &[Job]) {
+        let mut b = self.burst.lock();
+        b.batches = b.batches.saturating_sub(1);
+        b.bytes += jobs.iter().map(|j| j.span).sum::<u64>();
+        if b.batches == 0 && self.jobs.demand.is_empty() && self.jobs.ahead.is_empty() {
+            b.bytes = 0;
+        }
+    }
+
+    /// The set's regions from its store into their destinations, in one engine read.
     #[cfg(unix)]
-    fn store(&self, source: &Source, items: &[crate::layout::Item], origin: u64, dst: tensorfs::io::Dst) -> Result<()> {
+    fn store(&self, spec: &SetSpec, regions: &[(u32, Dst)]) -> Result<()> {
+        let placements = regions.iter().map(|(r, dst)| spec.layout.region(*r).map(|region| Placement { items: &region.items, origin: region.offset, dst: *dst })).collect::<Result<Vec<_>>>()?;
         let threads = tensorfs::io::ReadOpts::default().threads;
-        // SAFETY: `dst` is a mapped page (or a locked tier region) only this fill writes.
-        unsafe { source.read_items(items, origin, dst, threads, tensorfs::io::source::Mode::Cache, &self.tally) }?;
+        // SAFETY: each `dst` is a mapped page (or a locked tier region) only this fill writes.
+        unsafe { spec.source.read_placements(&placements, threads, tensorfs::io::source::Mode::Cache, &self.tally) }?;
         Ok(())
     }
 
     #[cfg(windows)]
-    fn store(&self, source: &Source, _: &[crate::layout::Item], _: u64, _: tensorfs::io::Dst) -> Result<()> {
-        match *source {}
+    fn store(&self, spec: &SetSpec, _: &[(u32, Dst)]) -> Result<()> {
+        match *spec.source {}
     }
 
     // ---- demands
@@ -1597,7 +1697,8 @@ impl Inner {
         Ok(())
     }
 
-    /// Fills the set's layout in the RAM tier, region by region, as host headroom allows.
+    /// Fills the set's layout in the RAM tier as host headroom allows: everything left in one
+    /// read when it has the room, else half as much, until a region does not fit.
     fn load_ram(&self, set: u32) -> Result<()> {
         let (spec, held) = {
             let st = self.lock();
@@ -1607,11 +1708,18 @@ impl Inner {
             out
         };
         let (Some(held), Some(tier)) = (held, &self.tier) else { return Ok(()) };
-        for (r, region) in spec.layout.regions.iter().enumerate() {
-            if !tier.room(region.span) {
-                break;
+        let regions = &spec.layout.regions;
+        let (mut at, mut want) = (0, regions.len());
+        while want > 0 {
+            let batch: Vec<u32> = (at..at + want).map(|r| r as u32).collect();
+            let bytes = regions.iter().skip(at).take(want).map(|r| r.span).sum();
+            if !tier.room(bytes) {
+                want /= 2;
+                continue;
             }
-            held.fill(r as u32, |host| self.store(&spec.source, &region.items, region.offset, host))?;
+            held.fill(&batch, |hosts| self.store(&spec, hosts))?;
+            at += want;
+            want = regions.len() - at;
         }
         Ok(())
     }
@@ -2273,11 +2381,13 @@ fn fill_loop(demand: &Receiver<Job>, ahead: &Receiver<Job>, inner: &Weak<Inner>)
         };
         let Ok(job) = job else { return };
         let Some(me) = inner.upgrade() else { return };
-        // A panic outside the copy fails the job's binder; the thread keeps serving.
-        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.fill(&job))) {
+        let batch = me.batch(job, demand, ahead);
+        // A panic outside the copies fails the batch's binders; the thread keeps serving.
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.fill(&batch))) {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
-            me.fail(&job, Error::Internal(format!("panic: {}", msg.unwrap_or_default())));
+            me.fail(&batch, Error::Internal(format!("panic: {}", msg.unwrap_or_default())));
         }
+        me.batched(&batch);
     }
 }
 
