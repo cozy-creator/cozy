@@ -1324,6 +1324,55 @@ mod tests {
         let _ = fs::remove_dir_all(&m.root);
     }
 
+    /// A carried closure uv's check faults (a wheel installed beside it whose requirement the
+    /// closure misses) installs all the same: the generation records what uv found, which every
+    /// run of it then says (`runs`), and a real import failure would surface as itself.
+    #[test]
+    fn a_closure_uvs_check_faults_installs_and_records_what_it_found() {
+        let m = machine("cm-findings");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sources = LocalSources::new(m.objects.clone(), m.installer.clone());
+        let project = m.root.join("project");
+        let fixture = repo.join("tests/fixtures/cpu_input");
+        fs::create_dir_all(project.join("cpu_input")).unwrap();
+        for name in ["pyproject.toml", "package.toml", "cpu_input/__init__.py"] {
+            fs::copy(fixture.join(name), project.join(name)).unwrap();
+        }
+        run(Command::new("uv").args(["lock", "--python", "3.12", "--project"]).arg(&project));
+        let wheels = m.root.join("wheels");
+        run(Command::new("uv").args(["build", "--wheel", "--out-dir"]).arg(&wheels).arg(&project));
+        // A library whose bound the closure's msgspec misses.
+        let old = m.root.join("needs-old");
+        fs::create_dir_all(old.join("needs_old")).unwrap();
+        fs::write(old.join("needs_old/__init__.py"), "").unwrap();
+        fs::write(old.join("pyproject.toml"), "[build-system]\nrequires = [\"uv_build>=0.12.7,<0.13\"]\n\
+            build-backend = \"uv_build\"\n[project]\nname = \"needs-old\"\nversion = \"1.0\"\n\
+            dependencies = [\"msgspec<0.1\"]\n[tool.uv.build-backend]\nmodule-root = \"\"\n").unwrap();
+        run(Command::new("uv").args(["build", "--wheel", "--out-dir"]).arg(&wheels).arg(&old));
+        let requirements = run(Command::new("uv").args([
+            "export", "--frozen", "--no-dev", "--no-emit-project", "--project",
+        ]).arg(&project));
+        let member = |name: &str, bytes: &[u8]| {
+            let written = write(&m.objects, "alice", bytes);
+            serde_json::json!({"name": name, "digest": written.digest, "length": written.length})
+        };
+        let carried = |name: &str| member(name, &fs::read(wheels.join(name)).unwrap());
+        let manifest = serde_json::json!({
+            "package": "local/tensord-cpu-input", "release": "0.1.0", "python_version": "3.12",
+            "wheels": [carried("tensord_cpu_input-0.1.0-py3-none-any.whl"), carried("needs_old-1.0-py3-none-any.whl")],
+            "requirements": member("requirements.txt", requirements.as_bytes()),
+        });
+        let digest = write(&m.objects, "alice", manifest.to_string().as_bytes()).digest;
+        let installed = sources.install(&m.service, "alice", &digest, None, "", &|_| ()).unwrap();
+        let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        assert!(
+            held.record.findings.iter().any(|f| f.starts_with("The package `needs-old` requires `msgspec<0.1`")),
+            "{:?}",
+            held.record.findings
+        );
+        let _ = fs::remove_dir_all(&m.root);
+    }
+
     /// Rewrites a wheel at another version: what a developer's local Runtime build is.
     const REVERSION: &str = r#"
 import base64, hashlib, pathlib, sys, zipfile

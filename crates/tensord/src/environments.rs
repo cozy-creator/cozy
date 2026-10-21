@@ -143,17 +143,15 @@ pub(crate) fn add_client(uv: Uv, py: &str, client: &Path, constraints: &Path, co
     uv(&["pip", "install", "--no-config", "--python", py, compile, "--constraints", &constraints, &client])
 }
 
-/// Refuses an environment where an installed requirement misses (uv's check), but for a bound
-/// on the pair the machine's development Runtime runs regardless (`runtime_build`).
-pub(crate) fn refuse_conflicts(uv: Uv, py: &str, runtime_build: &str) -> Result<(), Failure> {
-    let found: Vec<String> = check(uv, py)?
+/// uv's check of the finished environment: each installed requirement a version misses, but a
+/// bound on the pair the machine's development Runtime runs regardless (`runtime_build`, said
+/// in `sdk_fallback`). A finding never refuses an install (version skew is allowed): the install
+/// log and every run say it, and a real import failure surfaces as itself.
+pub(crate) fn findings(uv: Uv, py: &str, runtime_build: &str) -> Result<Vec<String>, Failure> {
+    Ok(check(uv, py)?
         .into_iter()
         .filter(|finding| runtime_build.is_empty() || !pair_bound(finding))
-        .collect();
-    match found.is_empty() {
-        true => Ok(()),
-        false => Err(("package_dependency_conflict", crate::triage::ends(&found.join("; "), 2000))),
-    }
+        .collect())
 }
 
 /// uv's check of an environment: one line per installed requirement a version misses (`The
@@ -353,23 +351,22 @@ mod tests {
     /// uv's real check of an environment holding both (NVIDIA's aarch64 cusparseLt wheel says
     /// sbsa): the platform tag stands, the missed requirement is a finding.
     #[test]
-    fn a_wheel_tagged_for_another_platform_stands_and_a_missed_requirement_refuses() {
+    fn a_wheel_tagged_for_another_platform_stands_and_a_missed_requirement_is_a_finding() {
         let root = std::env::temp_dir().join(format!("cm-env-check-{}", uuid::Uuid::new_v4()));
         let py = holding(&root, &[
             ("numpy", "2.0.0", "cp312-cp312-manylinux_2_17_x86_64", ""),
             ("conflicted_app", "0.1.0", "py3-none-any", "numpy==1.0.0"),
             ("nvidia_cusparselt_cu12", "0.6.3", "py3-none-manylinux2014_sbsa", ""),
         ]);
-        let found = check(&uv, &py).unwrap();
-        assert_eq!(found, BTreeSet::from(["The package `conflicted-app` requires `numpy==1.0.0`, but `2.0.0` is installed".to_string()]));
-        let (code, detail) = refuse_conflicts(&uv, &py, "").unwrap_err();
-        assert_eq!(code, "package_dependency_conflict");
-        assert!(detail.contains("conflicted-app") && detail.contains("numpy==1.0.0"), "{detail}");
+        let missed = "The package `conflicted-app` requires `numpy==1.0.0`, but `2.0.0` is installed".to_string();
+        assert_eq!(check(&uv, &py).unwrap(), BTreeSet::from([missed.clone()]));
+        // The environment installs all the same, and says what uv found.
+        assert_eq!(findings(&uv, &py, "").unwrap(), [missed]);
         let _ = fs::remove_dir_all(root);
     }
 
-    /// A bound on the pair stands where the machine's development Runtime runs regardless; any
-    /// other miss still refuses.
+    /// A bound on the pair the machine's development Runtime runs regardless is its warning
+    /// (`sdk_fallback`), no finding; any other miss is one.
     #[test]
     fn a_development_runtime_runs_a_package_whose_pair_bound_it_misses() {
         let root = std::env::temp_dir().join(format!("cm-env-dev-{}", uuid::Uuid::new_v4()));
@@ -377,8 +374,8 @@ mod tests {
             ("cozy_runtime", "0.30.1", "py3-none-any", ""),
             ("script", "0.1.0", "py3-none-any", "cozy-runtime==0.30.0"),
         ]);
-        refuse_conflicts(&uv, &py, "0.30.1+0123abcd").unwrap();
-        assert_eq!(refuse_conflicts(&uv, &py, "").unwrap_err().0, "package_dependency_conflict");
+        assert!(findings(&uv, &py, "0.30.1+0123abcd").unwrap().is_empty());
+        assert_eq!(findings(&uv, &py, "").unwrap().len(), 1);
         assert_eq!(
             installed(&root.join("env")).into_iter().map(|d| (d.name, d.version)).collect::<Vec<_>>(),
             [("cozy-runtime".to_string(), "0.30.1".to_string()), ("script".to_string(), "0.1.0".to_string())]

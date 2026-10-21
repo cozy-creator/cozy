@@ -636,7 +636,10 @@ impl Runs {
         }
         let fallback = (!generation.record.sdk_fallback.is_empty())
             .then(|| format!("{} {}: {}", installation.package, installation.release, generation.record.sdk_fallback));
-        for warning in fallback.into_iter().chain(precision) {
+        // What uv's check found when it was installed: the run proceeds, and says so.
+        let findings = generation.record.findings.iter()
+            .map(|finding| format!("{} {}: uv pip check: {finding}", installation.package, installation.release));
+        for warning in fallback.into_iter().chain(findings).chain(precision) {
             if let Err(error) = self.service.engine.append_warning(id, &warning) {
                 tracing::warn!("run {id}: {warning} ({error})");
             }

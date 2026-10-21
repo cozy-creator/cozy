@@ -18,9 +18,10 @@ take one path once their own closure is in place (`environments.rs`):
   where `uv pip check` admits it. Else the closure's own pair is restored and `sdk_fallback` says
   why; every run of it logs that warning. A development Runtime an update named (`--runtime-wheel`)
   runs whatever the package's bounds on the pair, and `runtime_build` names it.
-- The client wheel is installed under the same constraints. Then `uv pip check` refuses any
-  missed requirement (`package_dependency_conflict`) but a pair bound the development Runtime
-  runs regardless. A wheel tagged for another platform stands.
+- The client wheel is installed under the same constraints. Then `uv pip check`'s findings
+  (each missed requirement, but a pair bound the development Runtime runs regardless) are
+  recorded in `findings`: never a refusal (version skew is allowed); the install log and every
+  run say them. A wheel tagged for another platform is no finding.
 - The client describes the environment inside it with `python -I -S` (no `.pth` execution): its
   source digest, its callees, and a local package's interface (a live project's from its directory).
 

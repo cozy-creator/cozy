@@ -970,7 +970,12 @@ impl Publisher {
             environments::add_client(&uv, &py, wheel, &constraints, compile(true))?;
         }
         let runtime_build = if machine_pair { self.sdk.runtime_build.clone() } else { String::new() };
-        environments::refuse_conflicts(&uv, &py, &runtime_build)?;
+        let findings = environments::findings(&uv, &py, &runtime_build)?;
+        if !findings.is_empty() {
+            let said = findings.join("; ");
+            tracing::warn!("package {package} {release}: uv pip check: {said}");
+            job.stage(format!("warning: uv pip check: {said}"));
+        }
         let interface = &card.interface;
         let application = interface.get("application").and_then(Value::as_str).ok_or((
             "package_prepare_interface_invalid",
@@ -998,6 +1003,7 @@ impl Publisher {
             callees: described.callees,
             sdk_fallback,
             runtime_build,
+            findings,
         };
         environments::publish(&dir, generations, &record)
     }

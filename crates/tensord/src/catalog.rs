@@ -43,6 +43,10 @@ pub struct Generation {
     /// empty for a published Runtime.
     #[serde(default)]
     pub runtime_build: String,
+    /// uv's check of the environment when it was installed: each installed requirement a
+    /// version misses. Never a refusal (version skew is allowed); every run says them.
+    #[serde(default)]
+    pub findings: Vec<String>,
 }
 /// Another package's App installed in an environment: its calls run as child runs of its own
 /// package, from the caller's environment.

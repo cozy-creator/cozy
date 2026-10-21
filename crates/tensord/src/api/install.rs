@@ -221,12 +221,14 @@ struct Live<'a> {
     claim: &'a Path,
 }
 
-/// What the machine keeps of a live environment once it is ready (`.ready`): its pair's warning
-/// and the development Runtime it holds.
+/// What the machine keeps of a live environment once it is ready (`.ready`): its pair's warning,
+/// the development Runtime it holds and what uv's check found.
 #[derive(Default, Deserialize, serde::Serialize)]
 struct Ready {
     sdk_fallback: String,
     runtime_build: String,
+    #[serde(default)]
+    findings: Vec<String>,
 }
 
 /// One local package's environment at a new generation: the helper captures the package's own
@@ -292,8 +294,11 @@ fn prepare(
                 }
                 environments::add_client(&uv, &py, &config.client_wheel, &constraints, "--compile-bytecode").map_err(failure)?;
                 let runtime_build = if machine { config.runtime_build.clone() } else { String::new() };
-                environments::refuse_conflicts(&uv, &py, &runtime_build).map_err(failure)?;
-                let ready = Ready { sdk_fallback, runtime_build };
+                let findings = environments::findings(&uv, &py, &runtime_build).map_err(failure)?;
+                if !findings.is_empty() {
+                    tracing::warn!("package {}: uv pip check: {}", root.package, findings.join("; "));
+                }
+                let ready = Ready { sdk_fallback, runtime_build, findings };
                 if let Some(live) = &live {
                     let kept = serde_json::to_vec(&ready).map_err(|e| storage(std::io::Error::other(e)))?;
                     fs::write(live.environment.join(".ready"), kept).map_err(storage)?;
@@ -323,6 +328,7 @@ fn prepare(
             callees: described.callees,
             sdk_fallback: ready.sdk_fallback,
             runtime_build: ready.runtime_build,
+            findings: ready.findings,
         };
         environments::publish(&dir, &generations, &record).map_err(failure)?;
         Ok(PreparedGeneration { record, interface_bytes: interface.get().as_bytes().to_vec(), hold: Arc::new(hold) })
