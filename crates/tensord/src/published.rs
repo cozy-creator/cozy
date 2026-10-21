@@ -3044,8 +3044,10 @@ pub(crate) mod tests {
             let store = crate::storage::open(&root.join("store")).unwrap();
             let machine = crate::origin::Machine::new(store.clone(), None).unwrap();
             let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), machine).unwrap();
+            // Each fixture is a different machine/card. Managed ledgers correctly refuse a
+            // second coordinator for one UUID, even when parallel tests use separate roots.
             let inventory: Vec<Value> = gpus.iter().enumerate().map(|(at, (cc, memory))| json!({"device_index": at,
-                "device_name": "GPU", "device_uuid": format!("GPU-{at}"), "driver_version": "1", "memory_bytes": memory,
+                "device_name": "GPU", "device_uuid": format!("GPU-precision-{}-{at}", uuid::Uuid::new_v4()), "driver_version": "1", "memory_bytes": memory,
                 "pci_bus_id": format!("{at}"), "compute_cap": cc})).collect();
             let devices: Vec<String> = (0..gpus.len()).map(|at| at.to_string()).collect();
             let config = json!({"devices": devices.join(","), "inventory": inventory, "authorized_device_limit_bytes": null, "prespawn": false});

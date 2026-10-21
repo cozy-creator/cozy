@@ -1,10 +1,10 @@
-//! A rental booting over a store in an older format (a live rental updated in place) refuses
-//! it, saying to remove it and pull again: nothing in it is read or touched. The real binary.
+//! The normal rental startup converts supported store1, and refuses unsupported store2
+//! before changing any existing data. This uses the real binary, without a provider.
 #![cfg(target_os = "linux")]
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use std::{
-    io::{BufRead, BufReader},
+    io::Read,
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -61,16 +61,19 @@ fn launch(root: &Path, port: u16, store: Option<&Path>, stderr: Stdio) -> Machin
 }
 
 #[test]
-fn a_rental_refuses_a_store_in_an_older_format() {
+fn a_rental_refuses_unsupported_store2_without_changing_its_contents() {
     let (root, port) = (root("rental-older-store"), port());
     let store = root.join("var/lib/tensorfs");
     older(&store);
     let mut machine = launch(&root, port, None, Stdio::piped());
-    // Its refusal, as it says it: the hang bound is the reader's end of stderr.
-    let refused = BufReader::new(machine.0.stderr.take().unwrap())
-        .lines()
-        .map_while(Result::ok)
-        .any(|line| line.contains("pull again"));
-    assert!(refused, "the rental never refused the older store");
+    // Read through process exit: the supervisor must stop after refused startup,
+    // not silently start on another store or leave a partial conversion serving.
+    let mut refused = String::new();
+    machine.0.stderr.take().unwrap().read_to_string(&mut refused).unwrap();
+    assert!(refused.contains("not a store1 format record"), "the rental never refused unsupported store2: {refused}");
+    assert!(!machine.0.wait().unwrap().success(), "an unsupported store was accepted");
     assert!(store.join("blobs/ab/cd/abcd").exists(), "the older store was touched");
+    assert_eq!(std::fs::read(store.join("format")).unwrap(), br#"{"format":"tensorfs.store/2"}"#);
+    assert_eq!(std::fs::read(store.join("blobs/ab/cd/abcd")).unwrap(), b"an old object");
+    assert!(!store.join(".store1-migration").exists(), "unsupported data entered conversion");
 }
