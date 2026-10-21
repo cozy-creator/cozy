@@ -33,7 +33,10 @@ pub fn open_owned(root: &Path) -> io::Result<(std::fs::File, Arc<Store>)> {
     let store = open(root)?;
     let owner = match upgrade {
         Some(upgrade) => {
-            tracing::info!(store = %root.display(), report = ?upgrade.report, "upgraded TensorFS store");
+            tracing::info!(
+                store = %root.display(), repos = upgrade.report.repos,
+                checkpoints = upgrade.report.checkpoints.len(), "upgraded TensorFS store"
+            );
             upgrade.owner
         }
         None => claim(store.root())?,
