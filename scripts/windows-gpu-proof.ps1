@@ -154,7 +154,7 @@ for ($i = 0; $gpu -and $i -lt $Runs.Count; $i++) {
         if ($fields.seed -and -not ($inputs -like 'seed=*')) { $inputs += "seed=$(Get-Random -Maximum 2147483647)" }
         $source = $null
         foreach ($field in $fields.Values | Where-Object { $_.type.asset -eq 'image' -and -not $_.PSObject.Properties['default'] }) {
-            if (-not $image) { throw "its input $($field.name) is an image, and no earlier run made one" }
+            if (-not $image) { throw "it takes an image ($($field.name)), and no earlier run made one" }
             $source = $image
             $inputs += '--asset', "$($field.name)=$($image.path)"
         }
@@ -210,7 +210,10 @@ if (Test-Path $cozy) {
 }
 
 Write-Host "`n== summary"
-$report.runs | ForEach-Object { Write-Host ("{0}: run {1}, {2}, {3} s wall, {4} s executing" -f $_.target, $_.run, $_.status, $_.wall_s, $_.execution_s) }
+$report.runs | ForEach-Object {
+    if ($_.run) { Write-Host ("{0}: run {1} {2}, {3} s wall, {4} s executing" -f $_.target, $_.run, $_.status, $_.wall_s, $_.execution_s) }
+    else { Write-Host "$($_.target): not submitted" }
+}
 if ($failures.Count) { $failures | ForEach-Object { Write-Host "FAILED $_" } } else { Write-Host 'every step passed' }
 $report | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 "$Out\report.json"
 Stop-Transcript | Out-Null
