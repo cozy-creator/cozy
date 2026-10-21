@@ -204,8 +204,9 @@ for ($i = 0; $gpu -and $i -lt $Runs.Count; $i++) {
         Write-Host "run $($run.number) ($($run.id)): $target $inputs"
         # Followed by `cozy run watch`; its state is read every 30 s, and a run whose state, stage, steps or bytes
         # do not move for 15 min is canceled (the owner's idle rule).
+        $watched = "$Out\logs\run-$($run.number)-watch"
         $watch = Start-Process $cozy -ArgumentList 'run', 'watch', $run.number -NoNewWindow -PassThru `
-            -RedirectStandardOutput "$dir.watch.out" -RedirectStandardError "$dir.watch.err"
+            -RedirectStandardOutput "$watched.out" -RedirectStandardError "$watched.err"
         $null = $watch.Handle
         $last = $null; $moved = Get-Date; $said = Get-Date
         try {
@@ -221,7 +222,7 @@ for ($i = 0; $gpu -and $i -lt $Runs.Count; $i++) {
                     throw "no_progress: run $($run.number) did not move for 15 min ($state); canceled"
                 }
             }
-            Get-Content "$dir.watch.out", "$dir.watch.err" | Write-Host
+            Get-Content "$watched.out", "$watched.err" | Write-Host
             if ($watch.ExitCode) { throw "cozy run watch $($run.number) exited $($watch.ExitCode)" }
         } finally {
             $entry.wall_s = [math]::Round($clock.Elapsed.TotalSeconds, 1)
