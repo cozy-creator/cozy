@@ -5,20 +5,27 @@
 //! is no GPU. The host tier (`host`, `window`) is the machine's: sealed memfds a TensorD fills
 //! and executors adopt read-only. `tensorfs` owns parsing, source custody and every host/device byte transfer.
 //!
-//! The host tier is Linux-only and answers [`Error::Unsupported`] elsewhere. On Windows the
-//! crate is empty until its tier exists (xs-043 unit WM).
-#![cfg(unix)]
+//! The host tier is Linux-only and answers [`Error::Unsupported`] elsewhere. Off Unix only the
+//! host-only core exists until Windows has a GPU tier (xs-061 W8).
 
-pub use tensorfs::io::{cuda, metrics as ceiling};
+pub use tensorfs::io::cuda;
+#[cfg(unix)]
+pub use tensorfs::io::metrics as ceiling;
+#[cfg(unix)]
 pub mod faults;
+#[cfg(unix)]
 pub mod host;
 pub mod io;
 pub mod layout;
+#[cfg(unix)]
 pub mod ledger;
 pub mod memory;
+#[cfg(unix)]
 pub mod window;
 
-pub use memory::{Gpu, GpuStats, Host, HostPinned, HostSet, Pinned, WeightSet};
+pub use memory::{GpuStats, Host, HostPinned, HostSet};
+#[cfg(unix)]
+pub use memory::{Gpu, Pinned, WeightSet};
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -55,6 +62,7 @@ pub enum Error {
 }
 
 /// An OS seam's failure, named by what was attempted.
+#[cfg(unix)]
 pub(crate) fn os(what: &'static str) -> impl FnOnce(platform::Error) -> Error {
     move |error| {
         if error.is_unsupported() {

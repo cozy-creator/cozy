@@ -1,23 +1,18 @@
 //! Stored byte descriptions for placement. Header details and chunk opens stay here; callers
 //! see them through `Checkpoint::{spans, stored_part, source}`.
 
-#[cfg(unix)]
 use std::collections::BTreeMap;
-#[cfg(unix)]
 use std::fs::File;
 use std::sync::Arc;
 
 use super::{ItemSource, ObjectRange};
 use crate::failure::{Kind, Result};
 use crate::format::Header;
-#[cfg(unix)]
 use crate::{format::ObjectRef, store::Checkpoint};
 
-#[cfg(unix)]
 type Fetch = dyn Fn(&[crate::format::ObjectRef]) -> Result<()> + Send + Sync;
 
-/// A checkpoint's chunks as a placement source (`io::source`, Unix).
-#[cfg(unix)]
+/// A checkpoint's chunks as a placement source (`io::source`).
 #[derive(Clone)]
 pub(crate) struct View {
     header: Arc<Header>,
@@ -42,14 +37,12 @@ pub struct StoredPart {
     pub shape: Vec<u64>,
 }
 
-#[cfg(unix)]
 impl From<&Checkpoint> for View {
     fn from(checkpoint: &Checkpoint) -> View {
         View::new(checkpoint.header().clone(), checkpoint.clone())
     }
 }
 
-#[cfg(unix)]
 impl View {
     fn new(header: Header, stored: Checkpoint) -> Self {
         let chunks = header

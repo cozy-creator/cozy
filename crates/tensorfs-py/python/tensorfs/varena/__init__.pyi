@@ -44,8 +44,8 @@ class Closed(VarenaError):
     """The weight set was closed."""
 
 class Unsupported(VarenaError):
-    """There is no such mechanism on this OS: the sealed host tier off Linux, all of varena on
-    Windows."""
+    """There is no such mechanism on this OS: the sealed host tier off Linux; on Windows all but
+    the host core (`Host`)."""
 
 class Part:
     """One stored part: a plain tensor's data (`role` is `""`) or an encoded tensor's part."""

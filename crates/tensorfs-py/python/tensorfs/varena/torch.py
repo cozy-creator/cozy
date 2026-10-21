@@ -13,14 +13,15 @@ used together. Under declared plans, pages not in use go by their next declared 
 every planned request in the process; none declared goes first) and come back in declared order
 on the copy stream. With none, bytes rank in use > warm (loaded at GPU level) > idle, least
 recently used first within each, and nothing is restored beyond an explicit `load`. Room is made
-in §5.2's order; the hot watermark falls only within a request. On a CPU or Apple device every
-weight binds once.
+in §5.2's order; the hot watermark falls only within a request. On a CPU, an Apple device, or a
+GPU this OS has no varena tier for, every weight binds once.
 """
 
 from __future__ import annotations
 
 import gc
 import hashlib
+import logging
 import math
 import threading
 import time
@@ -39,7 +40,9 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.hooks import RemovableHandle
 
 from . import Copy as CopyRun
-from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, copies, cuts, seal
+from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, Unsupported, WeightSet, copies, cuts, seal
+
+_LOG = logging.getLogger(__name__)
 
 #: Blocks copied ahead of the one entered, in the recorded order.
 _AHEAD = 2
@@ -521,7 +524,11 @@ class Memory:
     ) -> None:
         cuda = device.type == "cuda"
         self.mode, self.device, self.gpu = mode, device, (device.index or 0) if cuda else -1
-        self.core: Gpu | Host = Gpu(self.gpu) if cuda else Host()
+        try:
+            self.core: Gpu | Host = Gpu(self.gpu) if cuda else Host()
+        except Unsupported:  # no GPU tier here: the host core, its regions copied in once
+            _LOG.warning("varena: no GPU tier on this OS: %s binds each weight once, by copy", device)
+            self.gpu, self.core = -1, Host()
         #: this process's device bytes outside torch and the weights (its CUDA context)
         self.context = self.last_use = self.clock = self.epoch = self.evictions = 0
         #: this process's device bytes: what is neither torch's nor varena's (context, NCCL,

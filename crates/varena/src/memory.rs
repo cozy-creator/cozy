@@ -4,34 +4,55 @@
 //! takes only unpinned pages whose fill and release events completed. Copies run on our own
 //! stream; consumers wait on events, the host never syncs.
 
+#[cfg(unix)]
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(unix)]
 use std::ffi::{c_int, c_void};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-#[cfg(feature = "store")]
+#[cfg(all(unix, feature = "store"))]
 use std::os::fd::RawFd;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::sync::{Condvar, MutexGuard, PoisonError, Weak};
+#[cfg(unix)]
 use std::thread::JoinHandle;
+#[cfg(unix)]
 use std::time::Instant;
 
 #[cfg(feature = "store")]
 use tensorfs::Checkpoint;
+#[cfg(unix)]
 use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream, CtxGuard, Handle};
+#[cfg(unix)]
 use crate::host::HostMem;
 use crate::io::{IoTally, Mode, Source};
-use crate::layout::{align_up, Layout, PART_ALIGN, REGION_ALIGN};
-use tensorfs::io::{self as byte_io, Copy, Dst, ReadOpts, Src};
+use crate::layout::{align_up, Layout, PART_ALIGN};
+#[cfg(unix)]
+use crate::layout::REGION_ALIGN;
+use tensorfs::io::Dst;
+#[cfg(unix)]
+use tensorfs::io::{self as byte_io, Copy, ReadOpts, Src};
 use crate::{lock, Error, Result};
 
-#[cfg(test)]
+/// Off Unix only the host-only core exists (xs-061 W1): no GPU core, no sealed host layouts.
+#[cfg(all(not(unix), feature = "store"))]
+type RawFd = std::ffi::c_int;
+
+#[cfg(all(test, unix))]
 mod tests;
 
 /// Scratch slots kept while a region streams; more exist only while every one is pinned.
+#[cfg(unix)]
 const SLOTS: usize = 3;
 /// Idle chunks kept after an eviction for the next map; the rest go back to the driver.
+#[cfg(unix)]
 const IDLE_KEEP: u64 = 64 << 20;
 
 /// A checked driver call on handles this core made, in its context.
+#[cfg(unix)]
 macro_rules! call {
     ($op:literal, $f:ident($($a:expr),* $(,)?)) => {
         // SAFETY: live handles of our context; out-params point at live locals.
@@ -39,15 +60,20 @@ macro_rules! call {
     };
 }
 
+#[cfg(unix)]
 struct Ev {
     raw: CUevent,
     timing: bool,
     pool: Arc<Events>,
 }
+#[cfg(unix)]
 unsafe impl Send for Ev {}
+#[cfg(unix)]
 unsafe impl Sync for Ev {}
+#[cfg(unix)]
 type EvRef = Arc<Ev>;
 
+#[cfg(unix)]
 impl Ev {
     fn done(&self) -> Result<bool> {
         // SAFETY: a live event of our context.
@@ -70,6 +96,7 @@ impl Ev {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Ev {
     fn drop(&mut self) {
         lock(&self.pool.free)[self.timing as usize].push(self.raw);
@@ -77,13 +104,17 @@ impl Drop for Ev {
 }
 
 /// Reused events: a dropped one's waits are already enqueued, so reuse is safe.
+#[cfg(unix)]
 struct Events {
     ctx: CUcontext,
     free: Mutex<[Vec<CUevent>; 2]>,
 }
+#[cfg(unix)]
 unsafe impl Send for Events {}
+#[cfg(unix)]
 unsafe impl Sync for Events {}
 
+#[cfg(unix)]
 impl Events {
     /// An event recorded on `stream` now.
     fn record(self: &Arc<Self>, stream: CUstream, timing: bool) -> Result<EvRef> {
@@ -102,6 +133,7 @@ impl Events {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Events {
     fn drop(&mut self) {
         if let Ok(d) = cuda::driver() {
@@ -114,11 +146,13 @@ impl Drop for Events {
 }
 
 /// Wait on `ev` in `stream` (enqueued; the host does not wait).
+#[cfg(unix)]
 fn wait_in(stream: CUstream, ev: &Ev) -> Result<()> {
     call!("cuStreamWaitEvent", stream_wait_event(stream, ev.raw, 0))
 }
 
 /// Keeps the events not yet passed; true when none is left.
+#[cfg(unix)]
 fn passed(events: &mut Vec<EvRef>) -> Result<bool> {
     let mut err = None;
     events.retain(|e| match e.done() {
@@ -192,6 +226,7 @@ pub struct Weights {
     pub layout: Layout,
     pub parts: Vec<Part>,
     source: Source,
+    #[cfg(unix)]
     host: Option<HostMem>,
 }
 
@@ -200,11 +235,17 @@ impl Weights {
     /// Copies come from `host_fd`'s sealed layout if given, else the checkpoint's chunks.
     fn open(name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>) -> Result<Weights> {
         let (layout, source) = open_checkpoint(ck, regions, false)?;
+        #[cfg(not(unix))]
+        if host_fd.is_some() {
+            return Err(Error::Unsupported("a sealed host layout off Unix".into()));
+        }
+        #[cfg(unix)]
         let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
+        #[cfg(unix)]
         if host.as_ref().is_some_and(|h| h.window().is_some()) {
             return Err(Error::Invalid("a streamed host layout: register takes a whole sealed layout".into()));
         }
-        Ok(Weights { name: name.into(), parts: parts(ck, &layout), layout, source, host })
+        Ok(Weights { name: name.into(), parts: parts(ck, &layout), layout, source, #[cfg(unix)] host })
     }
 }
 
@@ -219,6 +260,7 @@ fn parts(ck: &Checkpoint, layout: &Layout) -> Vec<Part> {
     }).collect()
 }
 
+#[cfg(unix)]
 #[derive(Clone)]
 enum Filled {
     Ready(EvRef),
@@ -227,11 +269,13 @@ enum Filled {
 }
 
 /// A failed fill is reclaimable only after its producer stream completed.
+#[cfg(unix)]
 struct Fill {
     state: Mutex<Option<Filled>>,
     cv: Condvar,
 }
 
+#[cfg(unix)]
 impl Fill {
     fn set(&self, r: Filled) {
         *lock(&self.state) = Some(r);
@@ -268,6 +312,7 @@ impl Fill {
     }
 }
 
+#[cfg(unix)]
 struct Job {
     set: usize,
     w: Arc<Weights>,
@@ -278,17 +323,20 @@ struct Job {
 }
 
 /// The copy stream busy from its first job to its last copy landing.
+#[cfg(unix)]
 #[derive(Default)]
 struct Run {
     copies: Vec<(EvRef, EvRef)>,
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct Jobs {
     q: VecDeque<Job>,
     stop: bool,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 struct Chunk {
     handle: Handle,
@@ -298,6 +346,7 @@ struct Chunk {
 }
 
 /// Chunks mapped at `va`, the fill that put bytes there, and the pins on them.
+#[cfg(unix)]
 #[derive(Default)]
 struct Mapping {
     va: u64,
@@ -316,6 +365,7 @@ struct Mapping {
     read_only: bool,
 }
 
+#[cfg(unix)]
 impl Mapping {
     fn settled(&self) -> bool {
         self.pins == 0 && self.fill.as_ref().is_none_or(|f| !f.busy())
@@ -344,11 +394,13 @@ impl Mapping {
     }
 }
 
+#[cfg(unix)]
 struct Reg {
     home: bool,
     map: Option<Mapping>,
 }
 
+#[cfg(unix)]
 struct Set {
     w: Arc<Weights>,
     /// Every submitted source read until positively completed, independent of slot reassignment.
@@ -367,6 +419,7 @@ struct Set {
     shared: bool,
 }
 
+#[cfg(unix)]
 impl Set {
     fn track_fill(&mut self, fill: Arc<Fill>) {
         self.pending.push(fill);
@@ -387,6 +440,7 @@ impl Set {
     }
 }
 
+#[cfg(unix)]
 struct Slot {
     m: Mapping,
     /// (set, region) whose bytes it holds or is filling.
@@ -397,6 +451,7 @@ struct Slot {
 }
 
 /// A GPU-timed interval, read into `field` once both events completed.
+#[cfg(unix)]
 struct Timing {
     set: usize,
     step: u64,
@@ -405,6 +460,7 @@ struct Timing {
     b: EvRef,
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct State {
     idle: BTreeMap<u64, Vec<Handle>>,
@@ -418,6 +474,7 @@ struct State {
     timings: Vec<Timing>,
 }
 
+#[cfg(unix)]
 impl State {
     fn close_fences(&self, id: usize) -> Option<(Vec<Arc<Fill>>, Vec<EvRef>)> {
         let set = self.sets.get(id)?.as_ref()?;
@@ -487,6 +544,7 @@ impl State {
 
 // ---------------------------------------------------------------- the GPU
 
+#[cfg(unix)]
 #[derive(Default)]
 struct Custody {
     error: Option<Error>,
@@ -495,6 +553,7 @@ struct Custody {
     releases: Vec<EvRef>,
 }
 
+#[cfg(unix)]
 struct Inner {
     ordinal: i32,
     ctx: CUcontext,
@@ -510,15 +569,19 @@ struct Inner {
     owner: Mutex<Weak<Gpu>>,
     custody: Mutex<Custody>,
 }
+#[cfg(unix)]
 unsafe impl Send for Inner {}
+#[cfg(unix)]
 unsafe impl Sync for Inner {}
 
 /// One GPU of this process: its VA, chunk cache, copy stream and scratch slots.
+#[cfg(unix)]
 pub struct Gpu {
     inner: Arc<Inner>,
     mover: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl Gpu {
     /// CUDA device `ordinal`, mapping in physical chunks of `chunk` bytes (a multiple of 2 MiB).
     pub fn open(ordinal: i32, chunk: u64) -> Result<Arc<Gpu>> {
@@ -688,6 +751,7 @@ impl Gpu {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Gpu {
     fn drop(&mut self) {
         lock(&self.inner.jobs.0).stop = true;
@@ -698,6 +762,7 @@ impl Drop for Gpu {
     }
 }
 
+#[cfg(unix)]
 impl Inner {
     fn reap_fills(&self, st: &mut State, id: usize) -> Result<()> {
         st.set(id).reap_fills().map_err(|e| self.poison(e))
@@ -1145,6 +1210,7 @@ impl Inner {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Inner {
     fn drop(&mut self) {
         if self.check().is_err() {
@@ -1176,6 +1242,7 @@ impl Drop for Inner {
     }
 }
 
+#[cfg(unix)]
 impl Inner {
     /// The final owner cannot manufacture completion from a destructor error. Keep the actual
     /// source/mapping/buffer/event objects until process exit; the primary context lives as long.
@@ -1187,6 +1254,7 @@ impl Inner {
 }
 
 /// One weight set on one GPU. Dropping it waits for its copies and releases, then unmaps it.
+#[cfg(unix)]
 pub struct WeightSet {
     gpu: Arc<Gpu>,
     id: usize,
@@ -1194,6 +1262,7 @@ pub struct WeightSet {
     pub weights: Arc<Weights>,
 }
 
+#[cfg(unix)]
 impl WeightSet {
     pub fn device(&self) -> i32 {
         self.gpu.inner.ordinal
@@ -1468,6 +1537,7 @@ impl WeightSet {
     }
 }
 
+#[cfg(unix)]
 impl Drop for WeightSet {
     fn drop(&mut self) {
         let g = &self.gpu.inner;
@@ -1524,12 +1594,14 @@ impl Drop for WeightSet {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum At {
     Home,
     Slot(usize),
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ConsumerStream {
     raw: u64,
@@ -1537,6 +1609,7 @@ struct ConsumerStream {
     origin: Option<std::thread::ThreadId>,
 }
 
+#[cfg(unix)]
 impl ConsumerStream {
     fn current(raw: u64) -> Self {
         Self { raw, origin: (raw == 2).then(|| std::thread::current().id()) }
@@ -1551,6 +1624,7 @@ impl ConsumerStream {
 }
 
 /// A bound region: its pages stay mapped while it lives; dropping it fences every admitted stream.
+#[cfg(unix)]
 pub struct Pinned {
     ws: Arc<WeightSet>,
     at: At,
@@ -1565,6 +1639,7 @@ pub struct Pinned {
     ready: EvRef,
 }
 
+#[cfg(unix)]
 impl Pinned {
     pub fn home(&self) -> bool {
         matches!(self.at, At::Home)
@@ -1618,6 +1693,7 @@ impl Pinned {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Pinned {
     fn drop(&mut self) {
         let g = &self.ws.gpu.inner;
@@ -1654,7 +1730,7 @@ impl Host {
     }
 
     /// `Gpu::adopt` on the host: a sealed layout registered from the regions it carries.
-    #[cfg(feature = "store")]
+    #[cfg(all(unix, feature = "store"))]
     pub fn adopt(&self, name: &str, ck: &Checkpoint, host_fd: RawFd) -> Result<Arc<HostSet>> {
         self.register(name, ck, &crate::host::sealed_regions(host_fd)?, Some(host_fd))
     }
@@ -1665,11 +1741,12 @@ impl HostSet {
         let (w, mut regs) = (&self.weights, lock(&self.regs));
         let reg = w.layout.region(region)?;
         let (buf, bound) = &mut regs[region as usize];
-        let sealed = w.host.as_ref().filter(|h| !h.hole(region) && h.wait_ready(region).is_ok());
+        #[cfg(unix)]
+        let sealed = w.host.as_ref().filter(|h| !h.hole(region) && h.wait_ready(region).is_ok()).map(|h| h.base() as u64 + reg.offset);
+        #[cfg(not(unix))]
+        let sealed: Option<u64> = None;
         let (ptr, buf) = match sealed {
-            Some(h) => {
-                (h.base() as u64 + reg.offset, None)
-            }
+            Some(ptr) => (ptr, None),
             None => {
                 if buf.is_none() {
                     *buf = Some(Arc::new(Anon::read(w, region)?));
@@ -1682,7 +1759,7 @@ impl HostSet {
     }
 }
 
-/// A region read from the chunk files into private anonymous memory.
+/// A region read from the chunk files into private anonymous memory (heap memory off Unix).
 struct Anon {
     ptr: *mut u8,
     len: usize,
@@ -1695,9 +1772,18 @@ impl Anon {
         let reg = w.layout.region(r)?;
         let len = align_up(reg.nbytes.max(1), PART_ALIGN) as usize;
         // SAFETY: a fresh private anonymous mapping.
+        #[cfg(unix)]
         let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        #[cfg(unix)]
         if ptr == libc::MAP_FAILED {
             return Err(Error::Io(format!("map {len} bytes: {}", std::io::Error::last_os_error())));
+        }
+        // SAFETY: a non-zero size; read_items writes every byte, gaps as zeros.
+        #[cfg(not(unix))]
+        let ptr = unsafe { std::alloc::alloc(anon_layout(len)) }.cast::<std::ffi::c_void>();
+        #[cfg(not(unix))]
+        if ptr.is_null() {
+            return Err(Error::Io(format!("allocate {len} bytes")));
         }
         let a = Anon { ptr: ptr as *mut u8, len };
         // SAFETY: all items lie in this fresh exclusive mapping.
@@ -1710,8 +1796,17 @@ impl Anon {
 impl Drop for Anon {
     fn drop(&mut self) {
         // SAFETY: our mapping, no view of it left.
+        #[cfg(unix)]
         unsafe { libc::munmap(self.ptr as *mut c_void, self.len) };
+        // SAFETY: our allocation, no view of it left.
+        #[cfg(not(unix))]
+        unsafe { std::alloc::dealloc(self.ptr, anon_layout(self.len)) };
     }
+}
+
+#[cfg(not(unix))]
+fn anon_layout(len: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(len, PART_ALIGN as usize).expect("a region's length is page-aligned")
 }
 
 /// A region's host bytes; they live as long as this does.
@@ -1734,7 +1829,7 @@ fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool) ->
 }
 
 /// `regions` of `ck` in a sealed host layout filled here: the memfd `register(host_fd=)` adopts.
-#[cfg(feature = "store")]
+#[cfg(all(unix, feature = "store"))]
 pub fn seal(ck: &Checkpoint, regions: &[Vec<String>], name: &str, threads: usize) -> Result<OwnedFd> {
     let (layout, source) = open_checkpoint(ck, regions, true)?;
     let (fd, fill) = crate::host::open_sealed(name, &layout, None, None)?;
@@ -1750,6 +1845,7 @@ pub fn seal(ck: &Checkpoint, regions: &[Vec<String>], name: &str, threads: usize
 
 /// `fd` in a socket's queue, the sending end closed: whoever holds the other end can take it
 /// once, and it lives while any holder does.
+#[cfg(unix)]
 fn contain(fd: OwnedFd) -> Result<UnixStream> {
     let io = |e: std::io::Error| Error::Io(format!("contain kept pages: {e}"));
     let (tx, rx) = UnixStream::pair().map_err(io)?;
@@ -1757,12 +1853,14 @@ fn contain(fd: OwnedFd) -> Result<UnixStream> {
     Ok(rx)
 }
 
+#[cfg(unix)]
 fn reserve_va(size: u64) -> Result<u64> {
     let mut base = 0u64;
     call!("cuMemAddressReserve", mem_address_reserve(&mut base, size as usize, REGION_ALIGN as usize, 0, 0))?;
     Ok(base)
 }
 
+#[cfg(unix)]
 fn free_va(base: u64, size: u64) -> Result<()> {
     call!("cuMemAddressFree", mem_address_free(base, size as usize))
 }

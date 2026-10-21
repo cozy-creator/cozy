@@ -3,8 +3,9 @@
 
 mod cleanup;
 mod errors;
-#[cfg_attr(windows, path = "varena_windows.rs")]
 mod varena;
+#[cfg(not(unix))]
+mod varena_windows;
 #[cfg(feature = "store")]
 mod classref;
 #[cfg(feature = "store")]

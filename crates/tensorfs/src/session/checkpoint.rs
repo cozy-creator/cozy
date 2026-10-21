@@ -405,12 +405,10 @@ impl Checkpoint {
 
     /// This checkpoint's chunks as a read-engine source. A read fetches the chunks it needs
     /// and lacks on the process runtime, so call it from outside an async context.
-    #[cfg(unix)]
     pub fn source(&self, direct_io: bool) -> crate::io::source::Source {
         crate::io::source::Source::checkpoint(&self.view(), direct_io)
     }
 
-    #[cfg(unix)]
     fn view(&self) -> crate::io::view::View {
         let checkpoint = self.clone();
         crate::io::view::View::from(&self.data.raw).with_fetch(move |objects| {

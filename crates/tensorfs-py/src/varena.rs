@@ -3,7 +3,7 @@
 //! region crosses as a uint8 DLPack tensor whose deleter releases the pin.
 
 use std::ffi::{c_void, CStr};
-#[cfg(feature = "store")]
+#[cfg(all(unix, feature = "store"))]
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
@@ -11,11 +11,11 @@ use pyo3::exceptions::{PyBufferError, PyException};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use pyo3::{create_exception, ffi};
-#[cfg(feature = "store")]
+#[cfg(all(unix, feature = "store"))]
 use varena::ledger::{Admit, Facts, Ledger, Row, RowFacts, State, Victim};
-use varena::ceiling::Copy;
-use varena::memory::{Counters, GpuStats, Part, SetStats};
-use varena::{Error, Gpu, Host, HostPinned, HostSet, Pinned, WeightSet};
+#[cfg(unix)]
+use varena::{ceiling::Copy, memory::{Counters, GpuStats, SetStats}, Gpu, Pinned, WeightSet};
+use varena::{memory::Part, Error, Host, HostPinned, HostSet};
 
 #[cfg(feature = "store")]
 use crate::store::PyCheckpoint;
@@ -40,6 +40,7 @@ trait OrRaise<T> {
     /// The core's errors: a class per kind, and source refusals as the usual `tensorfs.errors`.
     fn or_raise(self, py: Python<'_>) -> PyResult<T>;
     /// The ledger's: `LedgerError`.
+    #[cfg(unix)]
     fn or_ledger(self, py: Python<'_>) -> PyResult<T>;
 }
 
@@ -66,6 +67,7 @@ impl<T> OrRaise<T> for varena::Result<T> {
         })
     }
 
+    #[cfg(unix)]
     fn or_ledger(self, py: Python<'_>) -> PyResult<T> {
         self.map_err(|e| {
             let x = LedgerError::new_err(e.to_string());
@@ -82,6 +84,7 @@ fn detached<T: Send>(py: Python<'_>, f: impl Send + FnOnce() -> varena::Result<T
 }
 
 /// `detached` for a call that only reads or flips a flag: it keeps the GIL.
+#[cfg(unix)]
 fn held<T>(py: Python<'_>, f: impl FnOnce() -> varena::Result<T>) -> PyResult<T> {
     varena::caught(f).or_raise(py)
 }
@@ -107,24 +110,29 @@ macro_rules! record {
     };
 }
 
+#[cfg(unix)]
 record!(PyCounters = "Counters" from Counters {
     binds: u64, faults: u64, paged_in: u64, streamed_bytes: u64, evicted: u64, copy_ns: u64, stall_ns: u64, map_ns: u64
 });
+#[cfg(unix)]
 record!(PySetStats = "SetStats" from SetStats {
     name: String, nbytes: u64, regions: u32, home: u64, resident: u64, pinned: u64, pins: u32, slot_bytes: u64,
     step: PyCounters, last: PyCounters, total: PyCounters
 });
+#[cfg(unix)]
 record!(PyGpuStats = "GpuStats" from GpuStats {
     device: i32, chunk: u64, steps: u64, mapped: u64, idle: u64, slots: u32, slot_bytes: u64, slot_span: u64,
     driver_free: u64, driver_total: u64; sets: PySetStats
 });
 
+#[cfg(unix)]
 record!(PyCopy = "Copy" from Copy {
     kind: String, gpu: i32, bytes: u64, ns: u64, ceiling: f64, link: String, busy_ns: u64, pin_ns: u64, staged: u64, cached: u64
 });
 
 /// Every run of weight copies since the last call (`h2d`: a GPU's copy stream from its first job
 /// to its last landing; `disk`: a host layout filled from chunk files), with its ceiling in GB/s.
+#[cfg(unix)]
 #[pyfunction]
 fn copies() -> Vec<PyCopy> {
     varena::ceiling::take().into_iter().map(Into::into).collect()
@@ -163,9 +171,11 @@ pub struct PyPart {
 
 // ---------------------------------------------------------------- cores
 
+#[cfg(unix)]
 #[pyclass(name = "Gpu", module = "tensorfs.varena", frozen)]
 pub struct PyGpu(Arc<Gpu>);
 
+#[cfg(unix)]
 #[pymethods]
 impl PyGpu {
     #[new]
@@ -248,7 +258,7 @@ impl PyHost {
         Ok(PyWeightSet::new(SetRef::Host(detached(py, || Host.register(&name, &ck, &regions, host_fd))?)))
     }
 
-    #[cfg(feature = "store")]
+    #[cfg(all(unix, feature = "store"))]
     #[pyo3(signature = (name, ck, host_fd))]
     fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32) -> PyResult<PyWeightSet> {
         let ck = ck_of(py, &ck)?;
@@ -260,6 +270,7 @@ impl PyHost {
 
 #[derive(Clone)]
 enum SetRef {
+    #[cfg(unix)]
     Gpu(Arc<WeightSet>),
     Host(Arc<HostSet>),
 }
@@ -283,6 +294,7 @@ pub struct PyWeightSet {
 impl PyWeightSet {
     fn new(set: SetRef) -> Self {
         let (w, device) = match &set {
+            #[cfg(unix)]
             SetRef::Gpu(ws) => (&*ws.weights, Some(ws.device())),
             SetRef::Host(hs) => (&hs.weights, None),
         };
@@ -296,16 +308,22 @@ impl PyWeightSet {
         set.ok_or_else(|| Error::Closed(format!("weight set {:?}", self.name))).or_raise(py)
     }
 
-    /// The GPU set; None on the host, where the watermark, prefetch and eviction do nothing.
-    fn gpu(&self, py: Python<'_>) -> PyResult<Option<Arc<WeightSet>>> {
-        Ok(match self.set(py)? {
-            SetRef::Gpu(w) => Some(w),
-            SetRef::Host(_) => None,
-        })
-    }
+}
+
+/// `$gpu` with the GPU set `$w`, else `$host`: on the host the watermark, prefetch and eviction
+/// do nothing.
+macro_rules! on_gpu {
+    ($set:expr, $host:expr, |$w:ident| $gpu:expr) => {{
+        #[cfg(unix)]
+        if let SetRef::Gpu($w) = $set {
+            return $gpu;
+        }
+        Ok($host)
+    }};
 }
 
 #[pymethods]
+#[cfg_attr(not(unix), allow(unused_variables))]
 impl PyWeightSet {
     #[getter]
     fn parts(&self, py: Python<'_>) -> PyResult<Vec<PyPart>> {
@@ -318,39 +336,39 @@ impl PyWeightSet {
     }
 
     fn home(&self, py: Python<'_>, regions: Vec<u32>) -> PyResult<()> {
-        self.gpu(py)?.map_or(Ok(()), |w| detached(py, || w.home(&regions)))
+        on_gpu!(self.set(py)?, (), |w| detached(py, || w.home(&regions)))
     }
 
     #[pyo3(signature = (region, stream = 0))]
     fn bind(&self, py: Python<'_>, region: u32, stream: u64) -> PyResult<PyPinned> {
         Ok(match self.set(py)? {
+            #[cfg(unix)]
             SetRef::Gpu(w) => PyPinned::gpu(detached(py, || w.bind(region, stream))?),
             SetRef::Host(h) => PyPinned::host(detached(py, || h.bind(region))?),
         })
     }
 
     fn prefetch(&self, py: Python<'_>, region: u32) -> PyResult<()> {
-        self.gpu(py)?.map_or(Ok(()), |w| detached(py, || w.prefetch(region)))
+        on_gpu!(self.set(py)?, (), |w| detached(py, || w.prefetch(region)))
     }
 
     /// GPU: mapped at home with bytes there or on their way. Host: always.
     fn resident(&self, py: Python<'_>, region: u32) -> PyResult<bool> {
-        match self.gpu(py)? {
-            Some(w) => held(py, || w.resident(region)),
-            None if (region as usize) < self.spans.len() => Ok(true),
-            None => Err(Error::Invalid(format!("region {region} of {}", self.spans.len()))).or_raise(py),
+        if (region as usize) >= self.spans.len() {
+            return Err(Error::Invalid(format!("region {region} of {}", self.spans.len()))).or_raise(py);
         }
+        on_gpu!(self.set(py)?, true, |w| held(py, || w.resident(region)))
     }
 
     fn warm(&self, py: Python<'_>, warm: bool) -> PyResult<()> {
-        self.gpu(py)?.map_or(Ok(()), |w| held(py, || {
+        on_gpu!(self.set(py)?, (), |w| held(py, || {
             w.warm(warm);
             Ok(())
         }))
     }
 
     fn busy(&self, py: Python<'_>, busy: bool) -> PyResult<()> {
-        self.gpu(py)?.map_or(Ok(()), |w| held(py, || {
+        on_gpu!(self.set(py)?, (), |w| held(py, || {
             w.busy(busy);
             Ok(())
         }))
@@ -358,7 +376,7 @@ impl PyWeightSet {
 
     /// Home regions map as one shareable allocation each from now on; false where they cannot.
     fn shareable(&self, py: Python<'_>) -> PyResult<bool> {
-        self.gpu(py)?.map_or(Ok(false), |w| held(py, || Ok(w.shareable())))
+        on_gpu!(self.set(py)?, false, |w| held(py, || Ok(w.shareable())))
     }
 
     /// Landed home regions not handed out yet, kept past this process: `(region, span, fd)`,
@@ -366,15 +384,13 @@ impl PyWeightSet {
     /// transform already filled.
     #[pyo3(signature = (filled = false))]
     fn kept(&self, py: Python<'_>, filled: bool) -> PyResult<Vec<(u32, u64, i32)>> {
-        let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
-        Ok(detached(py, || w.kept(filled))?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
+        on_gpu!(self.set(py)?, vec![], |w| Ok(detached(py, || w.kept(filled))?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect()))
     }
 
     /// As `kept`, after admission is stopped and every use is drained; cached graph pins stay.
     #[pyo3(signature = (filled = false))]
     fn kept_quiescent(&self, py: Python<'_>, filled: bool) -> PyResult<Vec<(u32, u64, i32)>> {
-        let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
-        Ok(detached(py, || w.kept_quiescent(filled))?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
+        on_gpu!(self.set(py)?, vec![], |w| Ok(detached(py, || w.kept_quiescent(filled))?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect()))
     }
 
     /// Home regions mapped from kept pages `(region, fd)`; each fd duplicated, the caller's
@@ -382,16 +398,17 @@ impl PyWeightSet {
     /// map as filled. Returns the regions adopted.
     #[pyo3(signature = (pages, filled = false))]
     fn adopt_pages(&self, py: Python<'_>, pages: Vec<(u32, i32)>, filled: bool) -> PyResult<Vec<u32>> {
-        let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
-        // SAFETY: descriptors the caller holds for the duration of this call.
-        let dup = |(r, fd): (u32, i32)| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map(|fd| (r, fd));
-        let pages = pages.into_iter().map(dup).collect::<std::io::Result<Vec<_>>>().map_err(|e| Error::Io(format!("dup kept pages: {e}"))).or_raise(py)?;
-        detached(py, || w.adopt_pages(pages, filled))
+        on_gpu!(self.set(py)?, vec![], |w| {
+            // SAFETY: descriptors the caller holds for the duration of this call.
+            let dup = |(r, fd): (u32, i32)| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map(|fd| (r, fd));
+            let pages = pages.into_iter().map(dup).collect::<std::io::Result<Vec<_>>>().map_err(|e| Error::Io(format!("dup kept pages: {e}"))).or_raise(py)?;
+            detached(py, || w.adopt_pages(pages, filled))
+        })
     }
 
     #[pyo3(signature = (regions = None))]
     fn evict(&self, py: Python<'_>, regions: Option<Vec<u32>>) -> PyResult<u64> {
-        self.gpu(py)?.map_or(Ok(0), |w| detached(py, || w.evict(regions.as_deref())))
+        on_gpu!(self.set(py)?, 0, |w| detached(py, || w.evict(regions.as_deref())))
     }
 
     /// Lets the set go: its VA and pages are released now, or when its last pin dies.
@@ -412,6 +429,7 @@ impl PyWeightSet {
 
 /// The pin a Python handle and every tensor made from it share.
 struct Pin {
+    #[cfg(unix)]
     gpu: Option<Pinned>,
     host: Option<HostPinned>,
 }
@@ -419,7 +437,10 @@ struct Pin {
 impl Drop for Pin {
     /// Also run by the DLPack deleter, where an unwinding panic aborts the process.
     fn drop(&mut self) {
+        #[cfg(unix)]
         let pins = (self.gpu.take(), self.host.take());
+        #[cfg(not(unix))]
+        let pins = self.host.take();
         let _ = varena::caught(|| {
             drop(pins);
             Ok(())
@@ -448,6 +469,7 @@ pub struct PyPinned {
 }
 
 impl PyPinned {
+    #[cfg(unix)]
     fn gpu(p: Pinned) -> Self {
         let (home, dl) = (p.home(), (KDL_CUDA, p.device()));
         PyPinned { region: p.region, ptr: p.ptr, nbytes: p.nbytes, home, fresh: p.fresh, writable: p.writable, dl, pin: Arc::new(Pin { gpu: Some(p), host: None }) }
@@ -455,7 +477,8 @@ impl PyPinned {
 
     fn host(p: HostPinned) -> Self {
         let (region, ptr, nbytes, fresh, writable) = (p.region, p.ptr, p.nbytes, p.fresh, p.writable);
-        PyPinned { region, ptr, nbytes, home: true, fresh, writable, dl: (KDL_CPU, 0), pin: Arc::new(Pin { gpu: None, host: Some(p) }) }
+        let pin = Arc::new(Pin { #[cfg(unix)] gpu: None, host: Some(p) });
+        PyPinned { region, ptr, nbytes, home: true, fresh, writable, dl: (KDL_CPU, 0), pin }
     }
 }
 
@@ -535,6 +558,7 @@ unsafe extern "C" fn capsule_destructor(capsule: *mut ffi::PyObject) {
 }
 
 #[pymethods]
+#[cfg_attr(not(unix), allow(unused_variables))]
 impl PyPinned {
     /// `stream`: the consumer's, which also waits for the bytes (the bind stream already does).
     #[pyo3(signature = (*, stream = None, max_version = None, dl_device = None, copy = None))]
@@ -547,6 +571,7 @@ impl PyPinned {
             return Err(PyBufferError::new_err(format!("a bound region lives on {:?}", self.dl)));
         }
         let stream = dlpack_stream(self.dl.0, stream).map_err(PyBufferError::new_err)?;
+        #[cfg(unix)]
         if let (Some(p), Some(s)) = (&self.pin.gpu, stream) {
             detached(py, || p.wait_on(s))?;
         }
@@ -604,6 +629,7 @@ mod stream_tests {
 
 /// A whole-tier claim on a host-tier memfd for an owner that maps none of it (TensorD): a new
 /// descriptor the caller owns; closing it ends the claim.
+#[cfg(unix)]
 #[pyfunction]
 fn hold_tier(py: Python<'_>, fd: i32) -> PyResult<i32> {
     detached(py, || varena::host::hold(fd)).map(IntoRawFd::into_raw_fd)
@@ -611,6 +637,7 @@ fn hold_tier(py: Python<'_>, fd: i32) -> PyResult<i32> {
 
 /// Ends a `hold_tier` claim: punches every Ready region nobody claims, closes `hold`, and
 /// returns the bytes punched.
+#[cfg(unix)]
 #[pyfunction]
 fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
     // SAFETY: the caller hands over the descriptor `hold_tier` returned.
@@ -619,7 +646,7 @@ fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
 
 /// `regions` of a checkpoint in a sealed host layout, filled in this process from its chunks:
 /// what `register(host_fd=)` adopts. Returns the memfd (the caller's).
-#[cfg(feature = "store")]
+#[cfg(all(unix, feature = "store"))]
 #[pyfunction]
 #[pyo3(signature = (ck, regions, name, threads = 8))]
 fn seal(py: Python<'_>, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, name: String, threads: usize) -> PyResult<i32> {
@@ -629,9 +656,11 @@ fn seal(py: Python<'_>, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, 
 
 // ---------------------------------------------------------------- the ledger
 
+#[cfg(unix)]
 #[pyclass(name = "Ledger", module = "tensorfs.varena", frozen)]
 pub struct PyLedger(Ledger);
 
+#[cfg(unix)]
 #[pymethods]
 impl PyLedger {
     #[staticmethod]
@@ -753,6 +782,7 @@ impl PyLedger {
     }
 }
 
+#[cfg(unix)]
 #[pyclass(name = "Victim", module = "tensorfs.varena", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyVictim {
@@ -765,10 +795,12 @@ pub struct PyVictim {
     v: Victim,
 }
 
+#[cfg(unix)]
 fn victims(vs: Vec<Victim>) -> Vec<PyVictim> {
     vs.into_iter().map(|v| PyVictim { slot: v.slot, pid: v.pid, bytes: v.bytes, v }).collect()
 }
 
+#[cfg(unix)]
 #[pyclass(name = "Admit", module = "tensorfs.varena", frozen, get_all)]
 pub struct PyAdmit {
     now: bool,
@@ -777,6 +809,7 @@ pub struct PyAdmit {
 }
 
 /// `Row.publish`'s keywords and `RowFacts`' properties: the ledger's `Facts`, field for field.
+#[cfg(unix)]
 macro_rules! facts {
     ($($f:ident),*) => {
         #[pyclass(name = "Row", module = "tensorfs.varena", frozen)]
@@ -849,6 +882,7 @@ macro_rules! facts {
     };
 }
 
+#[cfg(unix)]
 facts!(context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use, waiting);
 
 // ---------------------------------------------------------------- the module
@@ -864,11 +898,15 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
             $(m.add(stringify!($e), py.get_type::<$e>())?;)*
         };
     }
-    add!(PyGpu, PyHost, PyWeightSet, PyPinned, PyPart, PyCounters, PySetStats, PyGpuStats, PyCopy, PyCeiling, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
-        copies, ceiling, hold_tier, release_tier;
+    add!(PyHost, PyWeightSet, PyPinned, PyPart, PyCeiling; ceiling;
         VarenaError, DeviceFull, CudaError, CudaUnavailable, Invalid, IoError, Closed, Unsupported, LedgerError);
-    #[cfg(feature = "store")]
+    #[cfg(unix)]
+    add!(PyGpu, PyCounters, PySetStats, PyGpuStats, PyCopy, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
+        copies, hold_tier, release_tier;);
+    #[cfg(all(unix, feature = "store"))]
     add!(; seal;);
+    #[cfg(not(unix))]
+    crate::varena_windows::install(&m)?;
     #[cfg(feature = "store")]
     m.add_function(wrap_pyfunction!(crate::store::regions, &m)?)?;
     parent.add_submodule(&m)?;
