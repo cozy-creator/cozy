@@ -38,6 +38,10 @@ struct Events {
     /// The next event record fails (a driver error), and the streams synchronized instead.
     fail_record: AtomicBool,
     syncs: Mutex<Vec<usize>>,
+    /// Another process's bytes on the device, and bytes that land there at the next create
+    /// (between a decision and its page).
+    foreign: AtomicU64,
+    lands: AtomicU64,
 }
 
 /// Closed until opened.
@@ -73,7 +77,7 @@ impl Backend for Stream {
         self.host.capacity()
     }
     fn free(&self) -> Result<u64> {
-        self.host.free()
+        Ok(self.host.free()?.saturating_sub(self.events.foreign.load(Ordering::SeqCst)))
     }
     fn process_used(&self) -> Result<u64> {
         self.host.process_used()
@@ -88,6 +92,11 @@ impl Backend for Stream {
         self.host.release(va)
     }
     fn create(&self, len: u64) -> Result<Physical> {
+        let landed = self.events.lands.swap(0, Ordering::SeqCst);
+        let foreign = self.events.foreign.fetch_add(landed, Ordering::SeqCst) + landed;
+        if self.host.free()? < len + foreign {
+            return Err(varena::Error::Device { op: "create", code: varena::backend::OUT_OF_MEMORY, name: "out of memory".into() });
+        }
         self.host.create(len)
     }
     fn destroy(&self, page: Physical) {
@@ -191,7 +200,7 @@ fn a_page_is_kept_only_after_its_transform_completes() {
     let mem = Memory::open(g.clone(), None, Box::new(backend)).unwrap();
     let id = mem.load(set(dir.path(), &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["lora".into()], passes: 1 }] }).unwrap();
-    let pass = r.pass(id, "1x1", Torch::default()).unwrap();
+    let pass = r.pass(id, "fwd", "1x1", Torch::default()).unwrap();
     let pin = mem.bind(id, 0, 1).unwrap();
     assert!(pin.fresh, "a declared fill comes back fresh");
     pin.filled();
@@ -226,7 +235,7 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     let mem = Memory::open(g.clone(), None, Box::new(backend)).unwrap();
     let id = mem.load(set(dir.path(), &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["lora".into()], passes: 1 }] }).unwrap();
-    let _pass = r.pass(id, "1x1", Torch::default()).unwrap();
+    let _pass = r.pass(id, "fwd", "1x1", Torch::default()).unwrap();
     let pin = mem.bind(id, 0, 1).unwrap();
     assert!(pin.fresh);
     drop(pin);
@@ -256,7 +265,7 @@ fn a_binder_never_waits_on_a_release_event() {
     let mem = Arc::new(Memory::open(g.clone(), None, Box::new(backend)).unwrap());
     let id = mem.load(set(dir.path(), &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["lora".into()], passes: 1 }] }).unwrap();
-    let _pass = r.pass(id, "1x1", Torch::default()).unwrap();
+    let _pass = r.pass(id, "fwd", "1x1", Torch::default()).unwrap();
     // Released fresh with its transform undone: its bytes are not the weights, and the stream
     // that read it has not finished.
     drop(mem.bind(id, 0, 1).unwrap());
@@ -381,7 +390,7 @@ fn no_call_waits_on_custody() {
     let a = mem.load(named("a"), Level::Ram).unwrap();
     let b = mem.load(named("b"), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["b".into(), "a".into()], passes: 1 }] }).unwrap();
-    let _pass = r.pass(b, "1x1", Torch::default()).unwrap();
+    let _pass = r.pass(b, "fwd", "1x1", Torch::default()).unwrap();
     // Custody stops answering. A's page is filled and kept: its export holds the sender thread.
     custody.close();
     drop(mem.bind(a, 0, 0).unwrap());
@@ -443,4 +452,45 @@ fn a_release_without_an_event_synchronizes_its_stream() {
     events.fail_record.store(true, Ordering::SeqCst);
     drop(pin);
     assert_eq!(*events.syncs.lock(), vec![7]);
+}
+
+/// Python review 1, item 2: a page's create that finds the device fuller than the table (a
+/// foreign allocation landed between the decision and the create) is decided again on fresh
+/// measurements, never a device error: here the cold page goes and the bind succeeds; with
+/// nothing left the bind ends exhausted.
+#[test]
+fn a_create_short_of_memory_decides_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("create-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
+    let named = |name: &str, regions: u64| {
+        let path = dir.path().join(format!("{name}.bin"));
+        std::fs::write(&path, vec![7u8; (regions * REGION_ALIGN) as usize]).unwrap();
+        let obj = ObjectRef { sha256: format!("obj-{name}"), length: regions * REGION_ALIGN };
+        let region = |r: u64| Region { offset: r * REGION_ALIGN, nbytes: REGION_ALIGN, span: REGION_ALIGN, items: vec![Item { offset: r * REGION_ALIGN, len: REGION_ALIGN, source: ItemSource::Object(ObjectRange { obj: obj.clone(), off: r * REGION_ALIGN, len: REGION_ALIGN }), part_end: true }] };
+        let layout = Layout {
+            parts: (0..regions).map(|r| Part { what: format!("t{r}"), region: r as u32, offset: r * REGION_ALIGN, nbytes: REGION_ALIGN }).collect(),
+            regions: (0..regions).map(region).collect(),
+            nbytes: regions * REGION_ALIGN,
+            digest: format!("layout-{name}-{uuid}"),
+            names: (0..regions).map(|r| vec![format!("t{r}")]).collect(),
+        };
+        let source = Source::files(vec![(obj.clone(), File::open(&path).unwrap())], false, 0);
+        let fingerprint = Fingerprint::new(&layout, &[], Fill::Stored, "release-1", "0/1", &uuid);
+        SetSpec { name: name.into(), layout: Arc::new(layout), source: Arc::new(source), fingerprint }
+    };
+    let a = mem.load(named("a", 2), Level::Ram).unwrap();
+    mem.load(named("n", 1), Level::Gpu).unwrap();
+    // 3 pages free in the table's view; at the create, 2.5 land elsewhere.
+    events.lands.store(2 * REGION_ALIGN + REGION_ALIGN / 2, Ordering::SeqCst);
+    let pin = mem.bind(a, 0, 0).unwrap();
+    let cold: u64 = ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum();
+    assert_eq!(cold, 0, "the cold page went for it");
+    drop(pin);
+    // Everything else lands: nothing is left to give, and the bind says so.
+    events.lands.store(4 * REGION_ALIGN, Ordering::SeqCst);
+    assert!(matches!(mem.bind(a, 1, 0), Err(varena::Error::Exhausted(_))));
 }

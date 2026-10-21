@@ -2,7 +2,7 @@
 //! the speculation invariant and termination. A small simulator applies the actions the way
 //! the applier does (maps fill at once; asks free what the other row offers).
 
-use varena::decide::{decide, fits, Action, Admitted, Trigger, Tried};
+use varena::decide::{decide, fits, Action, Admitted, OomSite, Trigger, Tried};
 use varena::table::{Class, Key, Page, Remote, Req, Set, Table};
 
 const MB: u64 = 1 << 20;
@@ -283,8 +283,8 @@ fn every_rung_of_the_demand_order() {
     t3.requests[0].sites.insert(
         1,
         vec![
-            varena::table::CutSite { name: "ffn".into(), peak: 3 * MB, ..Default::default() },
-            varena::table::CutSite { name: "attn".into(), peak: 2 * MB, ..Default::default() },
+            varena::table::CutSite { name: "ffn".into(), peak: 3 * MB, finest: 4, ..Default::default() },
+            varena::table::CutSite { name: "attn".into(), peak: 2 * MB, finest: 4, ..Default::default() },
         ],
     );
     let a = decide(&t3, &Trigger::Pass { req: 1, set: 1, room: Some(4 * MB), unmeasured: 0, tried: Tried::default() });
@@ -300,7 +300,7 @@ fn every_rung_of_the_demand_order() {
     t4.requests[0].lowered = true;
     t4.requests[0].episode.claimed_free = true;
     t4.headroom = GB;
-    let oom = |t: &Table| decide(t, &Trigger::Oom { req: 1, set: 1, need: Some(MB), site: None, collective: false, tried: Tried::default() });
+    let oom = |t: &Table| decide(t, &Trigger::Oom { req: 1, set: Some(1), need: Some(MB), site: None, tried: Tried::default() });
     assert_eq!(oom(&t4).last(), Some(&Action::Park(1)));
     t4.requests[0].episode.parked = true;
     assert!(matches!(oom(&t4).last(), Some(Action::Exhausted { .. })));
@@ -363,8 +363,8 @@ fn any_oom_sequence_ends_within_pages_plus_cuts_plus_two() {
     loop {
         answers += 1;
         assert!(answers <= pages + cut_levels + 2, "{answers} answers");
-        let site = (cuts < cut_levels).then(|| "ffn".to_string());
-        let a = demand(&mut t, Trigger::Oom { req: 1, set: 0, need: Some(64 * MB), site, collective: false, tried: Tried::default() }, &mut run, &mut clock);
+        let site = (cuts < cut_levels).then(|| OomSite { name: "ffn".into(), collective: false, finest: cut_levels });
+        let a = demand(&mut t, Trigger::Oom { req: 1, set: Some(0), need: Some(64 * MB), site, tried: Tried::default() }, &mut run, &mut clock);
         match a.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::Park(_) | Action::Exhausted { .. })) {
             Some(Action::Cut { .. }) => cuts += 1,
             Some(Action::Exhausted { .. }) => break,
@@ -402,7 +402,7 @@ fn an_oom_counts_its_own_unmaps_after_an_ask() {
     req.episode.claimed_free = true;
     let mut t = Table { capacity: 6 * g, sets: vec![set("w", 2), set("d", 2), set("n", 1)], requests: vec![req], others: vec![Remote { row: 99, running: true, classes: [0, 0, 0, g, 0, 0, 0], ..Remote::default() }], ..Table::default() };
     let (mut run, mut clock) = (Run::default(), 0);
-    let a = demand(&mut t, Trigger::Oom { req: 1, set: 0, need: Some(2 * g), site: None, collective: false, tried: Tried::default() }, &mut run, &mut clock);
+    let a = demand(&mut t, Trigger::Oom { req: 1, set: Some(0), need: Some(2 * g), site: None, tried: Tried::default() }, &mut run, &mut clock);
     assert!(run.evicted.iter().all(|(_, c)| *c != Class::D), "evicted a D page: {:?}", run.evicted);
     assert!(a.iter().any(|a| matches!(a, Action::Claim { bytes, .. } if *bytes == 2 * g)), "{a:?}");
 }
@@ -424,7 +424,7 @@ fn an_idle_gpu_admits_a_model_larger_than_the_card() {
 fn cut_table(level: u32, coarser: Option<(u64, Option<u64>)>, collective: bool) -> Table {
     let mut t = table(16 * MB, vec![set("dit", 4, MB)], vec![(vec![0], 1)]);
     t.requests[0].cursor.passes.insert(0, 1);
-    t.requests[0].sites.insert(0, vec![varena::table::CutSite { name: "ffn".into(), level, peak: 4 * MB, collective, finer: Some(2 * MB), coarser, ..Default::default() }]);
+    t.requests[0].sites.insert(0, vec![varena::table::CutSite { name: "ffn".into(), level, finest: 4, peak: 4 * MB, collective, finer: Some(2 * MB), coarser, ..Default::default() }]);
     t
 }
 
@@ -457,7 +457,7 @@ fn collective_sites_change_only_by_agreement() {
     let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(4 * MB), unmeasured: 0, tried: Tried::default() });
     assert!(!a.iter().any(|a| matches!(a, Action::Cut { .. })), "{a:?}");
     assert!(a.contains(&Action::Lower(1)));
-    let a = decide(&t, &Trigger::Oom { req: 1, set: 0, need: Some(MB), site: Some("ffn".into()), collective: true, tried: Tried::default() });
+    let a = decide(&t, &Trigger::Oom { req: 1, set: Some(0), need: Some(MB), site: Some(OomSite { name: "ffn".into(), collective: true, finest: 4 }), tried: Tried::default() });
     assert!(a.iter().any(|a| matches!(a, Action::Propose { req: 1, set: 0, site, level: 1, failed_at: Some(_) } if site == "ffn")), "{a:?}");
     assert!(!a.iter().any(|a| matches!(a, Action::Cut { .. })), "{a:?}");
 }

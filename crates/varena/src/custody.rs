@@ -72,11 +72,11 @@ fn name(gpu: &str) -> String {
 /// Binds the GPU's custody name and serves it from this process, under a row of its own, until
 /// nobody is connected and nothing is kept; false when another participant serves it.
 fn start(shared: &Arc<Shared>) -> Result<bool> {
-    let Some(listener) = os::listen(&name(&shared.name))? else { return Ok(false) };
+    let Some(listener) = os::listen(shared.ns, &name(&shared.name))? else { return Ok(false) };
     let row = Arc::new(shared.claim(std::process::id())?);
     let state = Arc::new(Mutex::new(State::default()));
     let stop = Arc::new(AtomicBool::new(false));
-    let gpu = shared.name.clone();
+    let (gpu, ns) = (shared.name.clone(), shared.ns);
     std::thread::Builder::new()
         .name("varena-custody".into())
         .spawn(move || {
@@ -89,7 +89,7 @@ fn start(shared: &Arc<Shared>) -> Result<bool> {
                 let _ = std::thread::Builder::new().name("varena-custody-conn".into()).spawn(move || {
                     if serve(stream, &s, &r) {
                         halt.store(true, Release);
-                        let _ = os::connect(&name(&gpu));
+                        let _ = os::connect(ns, &name(&gpu));
                     }
                 });
             }
@@ -209,9 +209,13 @@ impl Client {
 
     fn connect(&self) -> Result<Stream> {
         loop {
-            if let Some(stream) = os::connect(&name(&self.shared.name))? {
+            if let Some(stream) = os::connect(self.shared.ns, &name(&self.shared.name))? {
                 self.holder.fetch_add(1, AcqRel);
                 return Ok(stream);
+            }
+            // Another user's table (a TensorD's grant): its custody is the TensorD's, never ours.
+            if self.shared.ns != os::euid() {
+                return Err(Error::Closed("custody (its TensorD serves none)".into()));
             }
             // Nobody serves it: bind it; a racer that bound first is connected to next.
             start(&self.shared)?;

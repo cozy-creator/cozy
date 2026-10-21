@@ -285,7 +285,7 @@ impl Drop for Tier {
     /// Gives the name back: the accept loop wakes, sees the stop, and drops its listener.
     fn drop(&mut self) {
         self.stop.store(true, Release);
-        let _ = os::connect(NAME);
+        let _ = os::connect(os::euid(), NAME);
     }
 }
 
@@ -315,7 +315,7 @@ impl Tier {
     }
 
     fn bind() -> Result<Option<Tier>> {
-        let Some(listener) = os::listen(NAME)? else { return Ok(None) };
+        let Some(listener) = os::listen(os::euid(), NAME)? else { return Ok(None) };
         let short = os::event()?;
         let signal = os::dup(&short)?;
         let state = Arc::new((Mutex::new(State { short: Some(signal), ..State::default() }), Condvar::new()));
@@ -639,17 +639,23 @@ impl Held {
 /// An executor's connection to the machine's tier.
 pub(crate) struct Client {
     stream: Mutex<Stream>,
+    /// The namespace of the tier it found (the table owner's).
+    ns: u32,
     _service: Option<Tier>,
 }
 
 impl Client {
-    /// Connects to the tier, serving it from this process (with the host's pressure trigger
-    /// when it arms) when nobody does.
-    pub fn open() -> Result<Client> {
+    /// Connects to the tier in user `ns`'s namespace (the table owner's), serving it from this
+    /// process (with the host's pressure trigger when it arms) when nobody does and it is this
+    /// user's; another user's tier is its TensorD's, never ours.
+    pub fn open(ns: u32) -> Result<Client> {
         let mut service = None;
         loop {
-            if let Some(stream) = os::connect(NAME)? {
-                return Ok(Client { stream: Mutex::new(stream), _service: service });
+            if let Some(stream) = os::connect(ns, NAME)? {
+                return Ok(Client { stream: Mutex::new(stream), ns, _service: service });
+            }
+            if ns != os::euid() {
+                return Err(Error::Closed("the RAM tier (its TensorD serves none)".into()));
             }
             let mode = platform::contain::host_pressure::HostMode::Shared;
             service = match platform::contain::host_pressure::Pressure::arm(mode) {
@@ -684,7 +690,7 @@ impl Client {
     /// Host headroom for `bytes`, the tier giving back in order; false when it cannot now. A
     /// connection of its own: a fill never waits behind another call.
     pub fn room(&self, bytes: u64) -> Result<bool> {
-        let Some(stream) = os::connect(NAME)? else { return Ok(false) };
+        let Some(stream) = os::connect(self.ns, NAME)? else { return Ok(false) };
         Ok(matches!(os::call::<_, Reply>(&stream, &Call::Room { bytes }, None)?.0, Reply::Room { ok: true }))
     }
 }
