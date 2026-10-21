@@ -5,12 +5,14 @@
 """varena's native GPU suite on a rental: `cozy run native.py --on <rental> --gpus 1
 --asset binary=<the gpu test binary> --asset suite=<suite.json>`.
 
-`suite.json` is `{"label": "...", "cases": ["name", ...]}`. Each case runs in a fresh process of
-the binary, one after another; it passes when the harness reports 1 passed, 0 failed, 0 ignored
-and it printed `PASS ... <GPU UUID>` (libtest may put it on its `test <name> ... ` line). Every
-case must name the same physical GPU. A case whose processes use no CPU across a whole STALL
-window is stuck (a deadlock): it is killed and fails as stalled. The outputs hold each case's
-log (stdout and stderr) and result.json, whichever cases failed: the caller judges from it.
+`suite.json` is `{"label": "...", "cases": ["name", ...], "seconds": {"name": s, ...}}`, `seconds`
+being each case's runtime on an earlier run. Each case runs in a fresh process of the binary, one
+after another; it passes when the harness reports 1 passed, 0 failed, 0 ignored and it printed
+`PASS ... <GPU UUID>` (libtest may put it on its `test <name> ... ` line). Every case must name the
+same physical GPU. A case is looked at every interval of its own earlier runtime (else the longest
+runtime known); one whose process group used no CPU and wrote nothing across two looks is stuck,
+killed, and fails as stalled. Each verdict goes to the run log as the case ends. The outputs hold
+each case's log (stdout and stderr) and result.json with every runtime: the caller judges from it.
 """
 from pathlib import Path
 import json
@@ -19,14 +21,12 @@ import re
 import signal
 import subprocess
 import tempfile
+import time
 from typing import Annotated
 
-from cozy_runtime.author import AssetBound, FileAsset, Outputs, Tree
+from cozy_runtime.author import AssetBound, FileAsset, Outputs, ScriptContext, Tree
 
 UUID = re.compile(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
-# Seconds: a case's longest wait (a gate, a fill, a child's start) lasts milliseconds to seconds,
-# so a window this long with no CPU tick in its process group is a deadlock, not a wait.
-STALL = 60
 
 
 def cpu(group: int) -> int:
@@ -42,53 +42,56 @@ def cpu(group: int) -> int:
     return ticks
 
 
-def run_case(program: Path, case: str, log: Path) -> tuple[int, bool]:
-    """Runs one case to its end, or kills it once its process group stops using CPU."""
+def run_case(program: Path, case: str, log: Path, interval: float | None) -> tuple[int, bool]:
+    """Runs one case to its end or, looked at every `interval`, until two looks find no progress."""
     with log.open("w") as out:
         proc = subprocess.Popen([str(program), "--ignored", "--exact", case, "--nocapture", "--test-threads=1"],
                                 stdout=out, stderr=subprocess.STDOUT, cwd=program.parent, start_new_session=True)
-        seen = None
+        seen, idle = None, 0
         while True:
             try:
-                return proc.wait(timeout=STALL), False
+                return proc.wait(timeout=interval), False
             except subprocess.TimeoutExpired:
-                now = cpu(proc.pid)
-                if now == seen:
+                now = (cpu(proc.pid), log.stat().st_size)
+                idle = idle + 1 if now == seen else 0
+                if idle == 2:
                     os.killpg(proc.pid, signal.SIGKILL)
                     return proc.wait(), True
                 seen = now
 
 
-def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=1 << 28)],
+def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_bytes=1 << 28)],
          suite: Annotated[FileAsset, AssetBound(max_bytes=1 << 16)], out: Outputs) -> Tree:
     selection = json.loads(suite.read_bytes())
-    label, cases = selection["label"], selection["cases"]
+    label, cases, seconds = selection["label"], selection["cases"], dict(selection.get("seconds", {}))
     if not cases or len(set(cases)) != len(cases):
         raise ValueError("the suite names distinct cases")
-    print(f"native suite {label}: {len(cases)} cases", flush=True)
+    ctx.log(f"native suite {label}: {len(cases)} cases")
     root = Path(tempfile.mkdtemp(prefix="varena-gpu-"))
     program = root / "gpu"
     program.write_bytes(binary.read_bytes())
     program.chmod(0o700)
     logs = root / "logs"
     logs.mkdir()
-    passed, failed, stalled, gpus = [], [], [], set()
+    passed, failed, stalled, gpus, took = [], [], [], set(), {}
     for case in cases:
         log = logs / f"{case}.log"
-        code, stuck = run_case(program, case, log)
+        start = time.monotonic()
+        code, stuck = run_case(program, case, log, seconds.get(case) or max(seconds.values(), default=None))
+        took[case] = seconds[case] = round(time.monotonic() - start, 3)
         text = log.read_text(errors="replace")
-        print(text, flush=True)
         summary = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", text)
         named = [m for line in text.splitlines() if "PASS " in line for m in UUID.findall(line)[-1:]]
         if stuck:
             stalled.append(case)
-        if code or summary[-1:] != [("1", "0", "0")] or not named:
-            failed.append(case)
-            continue
-        gpus.update(named)
-        passed.append(case)
-    result = {"label": label, "cases": cases, "passed": passed, "failed": failed, "stalled": stalled, "gpus": sorted(gpus),
-              "ok": not failed and len(gpus) == 1, "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+        ok = not code and summary[-1:] == [("1", "0", "0")] and bool(named)
+        (passed if ok else failed).append(case)
+        gpus.update(named if ok else [])
+        verdict = "PASS" if ok else "STALLED" if stuck else "FAIL"
+        ctx.log(f"{verdict} {case} in {took[case]} s", level="info" if ok else "error")
+    result = {"label": label, "cases": cases, "passed": passed, "failed": failed, "stalled": stalled,
+              "seconds": took, "gpus": sorted(gpus), "ok": not failed and len(gpus) == 1,
+              "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
     (logs / "result.json").write_text(json.dumps(result, indent=2))
-    print(f"native suite {label}: passed {len(passed)}, failed {failed}, GPUs {sorted(gpus)}", flush=True)
+    ctx.log(f"native suite {label}: passed {len(passed)}, failed {failed}, GPUs {sorted(gpus)}")
     return out.save_tree(logs)
