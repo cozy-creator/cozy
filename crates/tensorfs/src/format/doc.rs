@@ -88,19 +88,48 @@ impl PartialEq for Header {
     }
 }
 
+/// A class as `[library, version, name]`: a library, its version and the class's name in it
+/// (`["diffusers", "0.35.1", "SD3Transformer2DModel"]`), for any implementation and never an
+/// import path. `["", "", ""]` is an unknown model, the only class with an empty library;
+/// `version` is `""` when nothing records it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct ClassRef {
+    pub library: String,
+    pub version: String,
+    pub name: String,
+}
+
+impl ClassRef {
+    pub fn new(library: &str, version: &str, name: &str) -> ClassRef {
+        let text = str::to_owned;
+        ClassRef { library: text(library), version: text(version), name: text(name) }
+    }
+
+    /// An unknown model's class, `["", "", ""]`.
+    pub fn is_unknown(&self) -> bool {
+        self.library.is_empty()
+    }
+
+    /// Refuses an empty library with a name or version.
+    pub(crate) fn check(&self, what: &str) -> Result<()> {
+        if self.is_unknown() && (!self.version.is_empty() || !self.name.is_empty()) {
+            return invalid(format!("{what}: a class with a name or version names its library"));
+        }
+        Ok(())
+    }
+}
+
 /// What `model_index.json` held.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Pipeline {
-    /// `<library>.<Class>` (`diffusers.StableDiffusionXLPipeline`), `""` when unknown.
-    pub class: String,
+    pub class: ClassRef,
     pub config: Config,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Component {
     pub name: String,
-    /// `<library>.<Class>` (`transformers.CLIPTextModel`), `""` when unknown.
-    pub class: String,
+    pub class: ClassRef,
     pub config: Config,
     pub tensors: Vec<Tensor>,
     /// Run data in the component's folder (`tokenizer.json`, `vocab.json`, ...), by path
@@ -238,8 +267,12 @@ impl Header {
             })
             .collect();
         rooms.reverse();
+        if let Some(p) = &header.pipeline {
+            p.class.check("the pipeline")?;
+        }
         for (ci, component) in components.iter().enumerate() {
             let name = &component.name;
+            component.class.check(name)?;
             if !segment(name) {
                 return invalid(format!(
                     "component name {name:?} is not one plain path segment"

@@ -6,11 +6,19 @@ use std::time::Duration;
 
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Fetcher, ObjectStore, Origin, VolumeOrigin, Want};
-use crate::format::{Header, ObjectRef, Tree};
+use crate::format::{Header, ObjectRef, Repo, Tag, Tree};
 use crate::store::Store;
 
 use super::provider::from_native;
 use super::{io_failure, Checkpoint, Endpoint, Download, Fetched, Ref};
+
+/// What a reference names: the root object (a commit, or a bare header), the tag it resolved
+/// through, and the variant a header digest names.
+struct Root {
+    object: ObjectRef,
+    tag: Option<Tag>,
+    variant: Option<String>,
+}
 
 #[derive(Clone)]
 pub(super) struct Remote {
@@ -90,79 +98,32 @@ impl Remote {
         Ok(result)
     }
 
-    async fn root(&self, reference: &Ref) -> Result<(ObjectRef, Option<String>)> {
-        let digest = reference
-            .revision
-            .as_deref()
-            .filter(|r| r.starts_with("sha256:"))
-            .or_else(|| {
-                reference
-                    .repo_id
-                    .starts_with("sha256:")
-                    .then_some(reference.repo_id.as_str())
-            });
-        if let Some(digest) = digest {
-            let hex = digest.trim_start_matches("sha256:");
-            if !super::is_digest(hex) {
-                return fail(Kind::Invalid, "invalid SHA256 reference");
-            }
-            let path = self.store.path(&ObjectRef {
-                sha256: hex.to_owned(),
-                length: 0,
-            })?;
-            match std::fs::metadata(&path) {
-                Ok(metadata) => {
-                    return Ok((
-                        ObjectRef {
-                            sha256: hex.to_owned(),
-                            length: metadata.len(),
-                        },
-                        None,
-                    ))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(io_failure(path.display(), error)),
-            }
-            if self.offline {
-                if let Some(mirror) = &self.mirror {
-                    let object = ObjectRef {
-                        sha256: hex.to_owned(),
-                        length: 0,
-                    };
-                    let path = mirror.join(object.key());
-                    let metadata = std::fs::metadata(&path)
-                        .map_err(|error| io_failure(path.display(), error))?;
-                    return Ok((
-                        ObjectRef {
-                            length: metadata.len(),
-                            ..object
-                        },
-                        None,
-                    ));
-                }
-                return fail(Kind::NotFound, format!("{digest} is not cached"));
-            }
-            let object = self
-                .endpoint
-                .inner
-                .object(hex)
-                .await
-                .map_err(from_native)?
-                .ok_or_else(|| Failure {
-                    kind: Kind::NotFound,
-                    detail: format!("no object {digest}"),
-                })?;
-            return Ok((object, None));
+    /// A commit's tree, fetched into the store.
+    async fn tree(&self, commit: &ObjectRef) -> Result<Tree> {
+        self.fetch(std::slice::from_ref(commit), &Download::default()).await?;
+        Ok(self.store.tree(commit)?)
+    }
+
+    /// What `reference` names: a bare object (`sha256:` repo id), or its revision resolved once
+    /// through the repo document (spec §7).
+    async fn root(&self, reference: &Ref) -> Result<Root> {
+        if let Some(hex) = reference.repo_id.strip_prefix("sha256:") {
+            return Ok(Root { object: self.object(hex).await?, tag: None, variant: None });
         }
-        let cached = || -> Result<Option<(ObjectRef, Option<String>)>> {
+        let revision = reference.revision.as_deref();
+        // The local record of tags this store resolved before; its trees are held.
+        let cached = || -> Result<Option<Root>> {
             let Some(repo) = self.store.get_ref(&reference.repo_id)? else {
                 return Ok(None);
             };
-            Ok(fetch::release_of(&repo, reference.revision.as_deref())
-                .ok()
-                .map(|(version, tree)| (tree, Some(version))))
+            let found = repo.resolve(revision).map(|r| r.find(|commit| self.store.tree(commit)));
+            Ok(match found {
+                Some(Ok(Some((tag, variant)))) => Some(Root { object: tag.commit.clone(), tag: Some(tag.clone()), variant }),
+                _ => None,
+            })
         };
-        if reference.revision.is_some() || self.offline {
+        // A digest names immutable content; a tag moves, so only offline is it read from the record.
+        if self.offline || revision.is_some_and(|r| r.starts_with("sha256:")) {
             if let Some(found) = cached()? {
                 return Ok(found);
             }
@@ -170,25 +131,14 @@ impl Remote {
         let local;
         let endpoint = if self.offline {
             let Some(mirror) = &self.mirror else {
-                return fail(
-                    Kind::NotFound,
-                    format!("{} is not cached", reference.repo_id),
-                );
+                return fail(Kind::NotFound, format!("{} is not cached", reference.repo_id));
             };
-            // Keep release selection and parsing in the existing endpoint. An
-            // absolute directory cannot be interpreted as an HTTP endpoint, and
-            // carries no provider even if Config supplies one for the Hub.
-            let path =
-                std::path::absolute(mirror).map_err(|error| io_failure(mirror.display(), error))?;
-            let path = path.to_str().ok_or_else(|| Failure {
-                kind: Kind::Invalid,
-                detail: "mirror path is not UTF-8".into(),
-            })?;
+            // An absolute directory cannot be interpreted as an HTTP endpoint, and carries no
+            // provider even if Config supplies one for the Hub.
+            let path = std::path::absolute(mirror).map_err(|error| io_failure(mirror.display(), error))?;
+            let path = path.to_str().ok_or_else(|| Failure { kind: Kind::Invalid, detail: "mirror path is not UTF-8".into() })?;
             local = Endpoint {
-                inner: Arc::new(
-                    fetch::Endpoint::new(&self.endpoint.transport, path, None)
-                        .map_err(from_native)?,
-                ),
+                inner: Arc::new(fetch::Endpoint::new(&self.endpoint.transport, path, None).map_err(from_native)?),
                 transport: self.endpoint.transport.clone(),
             };
             &local
@@ -203,7 +153,7 @@ impl Remote {
                 let error = from_native(error.refusal());
                 if transport && error.kind == Kind::Network {
                     if let Some(found) = cached()? {
-                        if self.store.reuse(&found.0)? {
+                        if self.store.reuse(&found.object)? {
                             return Ok(found);
                         }
                     }
@@ -211,34 +161,56 @@ impl Remote {
                 return Err(error);
             }
         };
-        let (version, tree) =
-            fetch::release_of(&repo, reference.revision.as_deref()).map_err(from_native)?;
-        Ok((tree, Some(version)))
+        let (tag, variant) = fetch::resolve(&repo, revision, async |commit: &ObjectRef| self.tree(commit).await).await?;
+        Ok(Root { object: tag.commit.clone(), tag: Some(tag), variant })
     }
 
-    fn remember(&self, reference: &Ref, root: &ObjectRef, version: Option<&str>) -> Result<()> {
-        if let Some(version) = version {
+    /// A bare object by digest: from the store, the offline mirror, or the endpoint.
+    async fn object(&self, hex: &str) -> Result<ObjectRef> {
+        let at = |length| ObjectRef { sha256: hex.to_owned(), length };
+        let path = self.store.path(&at(0))?;
+        match std::fs::metadata(&path) {
+            Ok(metadata) => return Ok(at(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_failure(path.display(), error)),
+        }
+        if self.offline {
+            let Some(mirror) = &self.mirror else {
+                return fail(Kind::NotFound, format!("sha256:{hex} is not cached"));
+            };
+            let path = mirror.join(at(0).key());
+            let metadata = std::fs::metadata(&path).map_err(|error| io_failure(path.display(), error))?;
+            return Ok(at(metadata.len()));
+        }
+        let object = self.endpoint.inner.object(hex).await.map_err(from_native)?;
+        object.ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no object sha256:{hex}") })
+    }
+
+    /// Records the tag a remote resolution went through, so the store resolves it again offline.
+    fn remember(&self, reference: &Ref, tag: Option<&Tag>) -> Result<()> {
+        if let Some(tag) = tag.filter(|_| !reference.repo_id.starts_with("local/")) {
             self.store.update_ref(&reference.repo_id, |old| {
-                Some(fetch::with_tree(
-                    old,
-                    &reference.repo_id,
-                    root,
-                    Some(version),
-                ))
+                let mut repo = old.unwrap_or_else(|| Repo::new(&reference.repo_id));
+                match repo.tag_mut(&tag.name) {
+                    Some(held) => *held = tag.clone(),
+                    None => repo.tags.push(tag.clone()),
+                }
+                Some(repo)
             })?;
         }
         Ok(())
     }
 
     pub async fn open(&self, mut reference: Ref) -> Result<Checkpoint> {
-        let (root, version) = self.root(&reference).await?;
+        let Root { object: root, tag, variant } = self.root(&reference).await?;
+        let wanted = fetch::pick_variant(reference.revision.as_deref(), variant, reference.variant.as_deref())?;
         let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let bytes = self.store.read(&root)?;
         let (tree, header, variant, mut extra) = match Tree::from_json(&bytes) {
             Ok(tree) => {
-                let (variant, header) = tree.variant(reference.variant.as_deref())?;
+                let (variant, header) = tree.variant(wanted.as_deref())?;
                 let extra = tree.repo_files().map(|(_, r)| r.clone()).collect();
                 (
                     Some(root.clone()),
@@ -260,9 +232,9 @@ impl Remote {
             None => self.store.checkpoint(&header)?,
         };
         if tree.is_some() {
-            self.remember(&reference, &root, version.as_deref())?;
+            self.remember(&reference, tag.as_ref())?;
         }
-        reference.revision = version.or(reference.revision);
+        reference.revision = tag.map(|t| t.name).or(reference.revision);
         reference.variant = variant;
         if let Some(tree) = &tree {
             extra.push(tree.clone());
@@ -286,12 +258,13 @@ impl Remote {
         want: &Download<'_>,
         local_dir: Option<&Path>,
     ) -> Result<PathBuf> {
-        let (root, version) = self.root(reference).await?;
+        let Root { object: root, tag, variant } = self.root(reference).await?;
+        let wanted = fetch::pick_variant(reference.revision.as_deref(), variant, reference.variant.as_deref())?;
         let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let tree = self.store.tree(&root)?;
-        let headers: Vec<_> = match reference.variant.as_deref() {
+        let headers: Vec<_> = match wanted.as_deref() {
             Some(variant) => vec![tree.variant(Some(variant))?.1.clone()],
             None => tree.variants().map(|(_, h)| h.clone()).collect(),
         };
@@ -308,15 +281,11 @@ impl Remote {
         objects.extend(payload.iter().cloned());
         let _object_hold = self.store.hold(&objects)?;
         self.fetch(&objects, want).await?;
-        self.remember(reference, &root, version.as_deref())?;
+        self.remember(reference, tag.as_ref())?;
         let identity = match &want.selection {
             super::Selection::All => root.sha256.clone(),
             _ => crate::sha256::hex_digest(
-                format!(
-                    "{}:{:?}:{:?}",
-                    root.sha256, reference.variant, want.selection
-                )
-                .as_bytes(),
+                format!("{}:{:?}:{:?}", root.sha256, wanted, want.selection).as_bytes(),
             ),
         };
         let used = std::iter::once(&root).chain(&headers).chain(&objects);
@@ -333,7 +302,7 @@ impl Remote {
         }
         for (variant, header) in tree
             .variants()
-            .filter(|(v, _)| reference.variant.as_deref().is_none_or(|want| want == *v))
+            .filter(|(v, _)| wanted.as_deref().is_none_or(|want| want == *v))
         {
             self.store
                 .materialize(header, &dest.join(crate::format::variant_path(variant)))?;
@@ -354,7 +323,7 @@ impl Remote {
         filename: &str,
         local_dir: Option<&Path>,
     ) -> Result<PathBuf> {
-        let (root, version) = self.root(reference).await?;
+        let Root { object: root, tag, .. } = self.root(reference).await?;
         let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
@@ -366,7 +335,7 @@ impl Remote {
         let _object_hold = self.store.hold(std::slice::from_ref(object))?;
         self.fetch(std::slice::from_ref(object), &Download::default())
             .await?;
-        self.remember(reference, &root, version.as_deref())?;
+        self.remember(reference, tag.as_ref())?;
         self.store.used(&root.sha256, [&root, object])?;
         let folder = local_dir
             .map(Path::to_path_buf)

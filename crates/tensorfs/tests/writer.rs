@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tensorfs::format::ClassRef;
 use tensorfs::format::layout::{self, Item, STANDALONE};
 use tensorfs::format::{
     decode, Body, Config, ConfigValue, Dtype, Encoding, Location, ObjectRef, PartBytes, Repo, Tree,
@@ -78,13 +79,13 @@ fn logical_config_edits_preserve_imported_filename_for_explicit_export() {
     let scratch = Scratch::new("config-filename");
     let store = scratch.store("store");
     let mut writer = store.writer(None, None).unwrap();
-    writer.component("tokenizer", "transformers.Tokenizer", config("{\"version\":1}"), Some("tokenizer_config.json")).unwrap();
+    writer.component("tokenizer", ClassRef::new("transformers", "4.57.0", "Tokenizer"), config("{\"version\":1}"), Some("tokenizer_config.json")).unwrap();
     writer.get("tokenizer").asset("vocab.txt", b"hello\n").unwrap();
     let base = store.checkpoint(&writer.commit().unwrap()).unwrap();
 
     let mut edited = store.writer(Some(&base), None).unwrap();
-    edited.component("tokenizer", "transformers.Tokenizer", config("{\"version\":2}"), None).unwrap();
-    edited.component("tokenizer", "transformers.Tokenizer", config("{\"version\":3}"), None).unwrap();
+    edited.component("tokenizer", ClassRef::new("transformers", "4.57.0", "Tokenizer"), config("{\"version\":2}"), None).unwrap();
+    edited.component("tokenizer", ClassRef::new("transformers", "4.57.0", "Tokenizer"), config("{\"version\":3}"), None).unwrap();
     let checkpoint = store.checkpoint(&edited.commit().unwrap()).unwrap();
     let exported = checkpoint.export_component_files("tokenizer", &scratch.0.join("support")).unwrap();
     assert_eq!(fs::read(exported.join("vocab.txt")).unwrap(), b"hello\n");
@@ -94,7 +95,7 @@ fn logical_config_edits_preserve_imported_filename_for_explicit_export() {
 
     // The raw importer retains an explicit way to replace the known source filename.
     let mut reset = store.writer(Some(&checkpoint), None).unwrap();
-    reset.component("tokenizer", "transformers.Tokenizer", Config::new(), Some("config.json")).unwrap();
+    reset.component("tokenizer", ClassRef::new("transformers", "4.57.0", "Tokenizer"), Config::new(), Some("config.json")).unwrap();
     let checkpoint = store.checkpoint(&reset.commit().unwrap()).unwrap();
     assert_eq!(checkpoint.component("tokenizer").unwrap().config_file, None);
 }
@@ -264,7 +265,7 @@ fn copy_and_a_base_share_the_large_parts_objects() {
     let store = scratch.store("store");
     let a_tensors = lane_a();
     let mut w = store.writer(None, None).unwrap();
-    w.component("transformer", "diffusers.Transformer", config(r#"{"layers":3}"#), None)
+    w.component("transformer", ClassRef::new("diffusers", "0.35.1", "Transformer"), config(r#"{"layers":3}"#), None)
         .unwrap();
     for (component, key, bytes) in &a_tensors {
         plain(&mut w, component, key, bytes);
@@ -298,7 +299,7 @@ fn copy_and_a_base_share_the_large_parts_objects() {
     let scale: Vec<u8> = (0..rows)
         .flat_map(|r| (1.0f32 / (r + 1) as f32).to_le_bytes())
         .collect();
-    let encoding = Encoding::fp8_rowwise(0);
+    let encoding = Encoding::fp8_rowwise();
     let (mut weight_src, mut scale_src) = (&weight[..], &scale[..]);
     let parts = vec![
         PartData {
@@ -322,7 +323,7 @@ fn copy_and_a_base_share_the_large_parts_objects() {
         .unwrap();
     let renorm = noise(11, 5 * MIB);
     plain(&mut w, "transformer", "blocks.1.norm.weight", &renorm);
-    w.component("transformer", "diffusers.Transformer", config(r#"{"layers":3}"#), None)
+    w.component("transformer", ClassRef::new("diffusers", "0.35.1", "Transformer"), config(r#"{"layers":3}"#), None)
         .unwrap();
     let b = store.checkpoint(&w.commit().unwrap()).unwrap();
     assert_layout(&b);
@@ -513,7 +514,7 @@ fn kill_model() -> Vec<(String, Vec<u8>)> {
 
 /// Writes the kill model, skipping what the writer already has; returns how many it skipped.
 fn write_kill_model(w: &mut Writer) -> usize {
-    w.component("unet", "diffusers.UNet2DConditionModel", config(r#"{"blocks":24}"#), None)
+    w.component("unet", ClassRef::new("diffusers", "0.35.1", "UNet2DConditionModel"), config(r#"{"blocks":24}"#), None)
         .unwrap();
     let mut skipped = 0;
     for (key, bytes) in kill_model() {
@@ -849,21 +850,21 @@ fn a_two_variant_repo_shares_chunks_and_files_and_gc_keeps_its_closure() {
     let store = scratch.store("store");
     let mut w = store.writer(None, None).unwrap();
     let index = r#"{"_class_name":"StableDiffusionXLPipeline","unet":["diffusers","UNet2DConditionModel"]}"#;
-    w.pipeline("diffusers.StableDiffusionXLPipeline", config(index));
+    w.pipeline(ClassRef::new("diffusers", "0.35.1", "StableDiffusionXLPipeline"), config(index));
     let unet = r#"{"in_channels":4,"scaling_factor":0.13025,"act":null,"blocks":[1,2.5]}"#;
-    w.component("unet", "diffusers.UNet2DConditionModel", config(unet), None).unwrap();
+    w.component("unet", ClassRef::new("diffusers", "0.35.1", "UNet2DConditionModel"), config(unet), None).unwrap();
     let tensors = [("down.weight", noise(1, 20 * MIB)), ("mid.weight", noise(2, 18 * MIB)), ("norm.weight", noise(3, 4096))];
     for (key, bytes) in &tensors {
         plain(&mut w, "unet", key, bytes);
     }
     let vocab = br#"{"<pad>":0}"#;
     let tokenizer = r#"{"model_max_length":77}"#;
-    (w.component("tokenizer", "transformers.CLIPTokenizer", config(tokenizer), Some("tokenizer_config.json")))
+    (w.component("tokenizer", ClassRef::new("transformers", "4.57.0", "CLIPTokenizer"), config(tokenizer), Some("tokenizer_config.json")))
         .unwrap()
         .asset("vocab.json", vocab)
         .unwrap();
     let scheduler = r#"{"beta_end":0.012,"_class_name":"EulerDiscreteScheduler"}"#;
-    w.component("scheduler", "diffusers.EulerDiscreteScheduler", config(scheduler), Some("scheduler_config.json"))
+    w.component("scheduler", ClassRef::new("diffusers", "0.35.1", "EulerDiscreteScheduler"), config(scheduler), Some("scheduler_config.json"))
         .unwrap();
     let bf16 = store.checkpoint(&w.commit().unwrap()).unwrap();
 
@@ -902,7 +903,7 @@ fn a_two_variant_repo_shares_chunks_and_files_and_gc_keeps_its_closure() {
     let at = store.put_tree(&tree).unwrap();
     let named = |at: ObjectRef| move |_: Option<Repo>| {
         let mut repo = Repo::new("Local/SDXL");
-        repo.set_release("1.0", at.clone());
+        repo.set_tag("1.0", at.clone());
         Some(repo)
     };
     store.update_ref("local/sdxl", named(at.clone())).unwrap();
@@ -965,12 +966,12 @@ fn a_plain_folder_round_trips_through_the_store() {
     let dir = scratch.0.join("sdxl");
     let tensors = [("big.weight", noise(21, 70 * MIB)), ("small.weight", noise(22, 3 * MIB))];
     let mut w = Writer::folder(&dir, "bf16", None, false).unwrap();
-    w.component("unet", "diffusers.UNet2DConditionModel", config(r#"{"in_channels":4}"#), None).unwrap();
+    w.component("unet", ClassRef::new("diffusers", "0.35.1", "UNet2DConditionModel"), config(r#"{"in_channels":4}"#), None).unwrap();
     for (key, bytes) in &tensors {
         plain(&mut w, "unet", key, bytes);
     }
     let vocab = b"a\nb\n";
-    (w.component("tokenizer", "transformers.CLIPTokenizer", Config::new(), None)).unwrap().asset("vocab.txt", vocab).unwrap();
+    (w.component("tokenizer", ClassRef::new("transformers", "4.57.0", "CLIPTokenizer"), Config::new(), None)).unwrap().asset("vocab.txt", vocab).unwrap();
     w.repo_file("README.md", b"# sdxl\n").unwrap();
     assert!(!dir.join("model.bf16.cozytensors").exists(), "the header comes last");
     let header = w.commit().unwrap();

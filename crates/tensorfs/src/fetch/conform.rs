@@ -1,5 +1,5 @@
 //! `tfs conform endpoint`: a black-box check of an endpoint against `spec/distribution.md`, over
-//! a fixture repo ([`FIXTURE`], release `1`) built the same way every time. With `write` it
+//! a fixture repo ([`FIXTURE`], public tag `1`) built the same way every time. With `write` it
 //! uploads the fixture and checks the write side first; without, the fixture must be there (a
 //! `write` run over the same storage seeds it). A case is a MUST or a SHOULD; buckets and static
 //! servers fail some SHOULDs (no `428`, no closure check, no Range) by design.
@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 
 use base64::engine::{general_purpose::STANDARD, Engine as _};
-use super::endpoint::{upload_tree, with_tree, Endpoint, Fresh, Payload};
+use super::endpoint::{upload_tree, with_tag, Endpoint, Fresh, Payload};
 use super::{Client, Config, Fetcher, ObjectStore, Origin, Want};
 use crate::err::{Code, Refusal, Result};
 use crate::format::{repo_key, Config as HeaderConfig, Dtype, ObjectRef, Repo, Tree};
@@ -62,7 +62,7 @@ fn fixture(scratch: &Path) -> Result<(Store, ObjectRef)> {
     let mut w = store.writer(None, None).map_err(failed)?;
     let bytes: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
     let config: HeaderConfig = serde_json::from_str(r#"{"conformance":1}"#).unwrap();
-    let mut c = w.component("model", "conformance.Fixture", config, None).map_err(failed)?;
+    let mut c = w.component("model", Default::default(), config, None).map_err(failed)?;
     c.put("w", &Dtype::U8, &[bytes.len() as u64], Data::Plain(Source::Read(&mut &bytes[..]))).map_err(failed)?;
     let header = w.commit().map_err(failed)?;
     let mut tree = Tree::default();
@@ -77,16 +77,20 @@ pub async fn endpoint(endpoint: Arc<Endpoint>, client: &Client, write: bool, scr
     let (store, tree) = fixture(scratch)?;
     let mut cases = Cases(Vec::new());
     let nonce = hex_digest(format!("{:?}", SystemTime::now()).as_bytes());
-    if write && !write_side(&endpoint, &store, &tree, &nonce, &mut cases).await? {
+    if write && !write_side(&endpoint, client, &store, &tree, &nonce, &mut cases).await? {
         return Ok(cases.0);
     }
     read_side(&endpoint, client, &store, &tree, &nonce, scratch, &mut cases).await?;
     Ok(cases.0)
 }
 
-async fn write_side(endpoint: &Arc<Endpoint>, store: &Store, tree: &ObjectRef, nonce: &str, cases: &mut Cases) -> Result<bool> {
-    let up = upload_tree(endpoint, FIXTURE, tree, store, Some("1")).await;
-    let up = up.map(drop).map_err(|e| e.to_string());
+async fn write_side(endpoint: &Arc<Endpoint>, client: &Client, store: &Store, tree: &ObjectRef, nonce: &str, cases: &mut Cases) -> Result<bool> {
+    let up = upload_tree(endpoint, FIXTURE, tree, store, "1").await;
+    let published = endpoint.update_repo(FIXTURE, |old| Ok(old.map(|mut r| (r.tag_mut("1").map(|t| t.public = true), r).1)));
+    let up = match up {
+        Ok(_) => published.await.map(drop).map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
     if !cases.record("upload: HEAD 404 → PUT → HEAD 200, then the ref", true, Some(up)) {
         return Ok(false);
     }
@@ -126,10 +130,11 @@ async fn write_side(endpoint: &Arc<Endpoint>, store: &Store, tree: &ObjectRef, n
     let outcome = bare.map(|(status, ..)| expect(status == 428, || format!("answered {status}")));
     cases.record("refs: no precondition is 428 (servers)", false, outcome);
 
-    // A document citing a tree nobody uploaded; restored at once wherever it was taken.
+    // A document citing a commit nobody uploaded; restored at once wherever it was taken.
     let missing = ObjectRef::of(format!("absent tree {nonce}").as_bytes());
+    let absent = format!("conformance-absent-{}", &nonce[..12]);
     let mut cited = Repo::from_json(&doc).map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?;
-    cited.checkpoints.push(missing.clone());
+    cited.set_tag(&absent, missing.clone());
     let cited = cited.to_json().map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?;
     let mut matched = json.clone();
     matched.push(("if-match".to_owned(), etag.clone()));
@@ -139,7 +144,18 @@ async fn write_side(endpoint: &Arc<Endpoint>, store: &Store, tree: &ObjectRef, n
         expect(status == 409 && body.contains("closure_incomplete") && body.contains(&missing.sha256), || format!("answered {status} {body}"))
     });
     cases.record("refs: an incomplete closure is 409 closure_incomplete (servers)", false, outcome);
-    endpoint.update_repo(FIXTURE, |old| Ok(old.map(|mut r| (r.checkpoints.retain(|c| *c != missing), r).1))).await?;
+    endpoint.update_repo(FIXTURE, |old| Ok(old.map(|mut r| (r.tags.retain(|t| t.name != absent), r).1))).await?;
+
+    // A private tag: the writer reads it, an anonymous reader does not.
+    let private = format!("conformance-private-{}", &nonce[..12]);
+    endpoint.update_repo(FIXTURE, |old| Ok(Some(with_tag(old, FIXTURE, &private, tree)))).await?;
+    let seen = |repo: Option<(Repo, String)>| repo.is_some_and(|(r, _)| r.tag(&private).is_some());
+    let writer = seen(endpoint.repo(FIXTURE).await?);
+    let anonymous = seen(Endpoint::new(client, endpoint.url(), None)?.repo(FIXTURE).await?);
+    let directory = endpoint.raw("HEAD", &repo_key(FIXTURE), vec![], None).await?.is_none();
+    let outcome = expect(writer && !anonymous, || format!("the writer sees it: {writer}, an anonymous reader: {anonymous}"));
+    cases.record("refs: a private tag is served only to writers (servers)", false, (!directory).then_some(outcome));
+    endpoint.update_repo(FIXTURE, |old| Ok(old.map(|mut r| (r.tags.retain(|t| t.name != private), r).1))).await?;
 
     let mut trees = Vec::new();
     for i in 0..8 {
@@ -152,16 +168,17 @@ async fn write_side(endpoint: &Arc<Endpoint>, store: &Store, tree: &ObjectRef, n
         }
         trees.push(t);
     }
-    let writers = trees.iter().cloned().map(|t| {
+    let tags: Vec<String> = (0..trees.len()).map(|i| format!("conformance-writer-{i}-{}", &nonce[..12])).collect();
+    let writers = trees.iter().cloned().zip(tags.clone()).map(|(t, tag)| {
         let endpoint = Arc::clone(endpoint);
-        tokio::spawn(async move { endpoint.update_repo(FIXTURE, |old| Ok(Some(with_tree(old, FIXTURE, &t, None)))).await })
+        tokio::spawn(async move { endpoint.update_repo(FIXTURE, |old| Ok(Some(with_tag(old, FIXTURE, &tag, &t)))).await })
     });
     let landed = futures::future::join_all(writers).await;
     let repo = endpoint.repo(FIXTURE).await?.map(|(r, _)| r).unwrap_or_default();
-    let all = trees.iter().all(|t| repo.checkpoints.contains(t));
+    let all = trees.iter().zip(&tags).all(|(t, tag)| repo.tag(tag).is_some_and(|found| found.commit == *t));
     let outcome = expect(all && landed.iter().all(|l| matches!(l, Ok(Ok(_)))), || format!("{landed:?}"));
     cases.record("refs: 8 concurrent writers all land through the 412 loop", true, Some(outcome));
-    endpoint.update_repo(FIXTURE, |old| Ok(old.map(|mut r| (r.checkpoints.retain(|c| !trees.contains(c)), r).1))).await?;
+    endpoint.update_repo(FIXTURE, |old| Ok(old.map(|mut r| (r.tags.retain(|t| !tags.contains(&t.name)), r).1))).await?;
     Ok(true)
 }
 
@@ -176,7 +193,7 @@ async fn read_side(
 ) -> Result<()> {
     let fixture = endpoint.repo(FIXTURE).await?;
     let read = match &fixture {
-        Some((repo, _)) => expect(repo.release(Some("1")).is_some_and(|r| r.tree == *tree), || format!("release 1 is not the fixture: {repo:?}")),
+        Some((repo, _)) => expect(repo.tag("1").is_some_and(|t| t.commit == *tree && t.public), || format!("public tag 1 is not the fixture: {repo:?}")),
         None => Err(format!("{FIXTURE} is absent: seed it with a --write run over the same storage")),
     };
     if !cases.record("refs: GET is 200 with the document", true, Some(read)) {

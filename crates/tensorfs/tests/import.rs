@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use tensorfs::err::{Code, Result};
-use tensorfs::format::{Dtype, Encoding, Metadata, Value};
+use tensorfs::format::{ClassRef, Dtype, Encoding, Metadata, Value};
 use tensorfs::store::Checkpoint;
 use tensorfs::import::engine::{self, Ops, Reading, TensorReader};
 use tensorfs::import::source::{Group, SourceSet};
@@ -25,7 +25,15 @@ fn vectors() -> PathBuf {
 
 /// A safetensors file of `(key, dtype, shape, bytes)`.
 fn safetensors(path: &Path, tensors: &[(&str, &str, Vec<u64>, Vec<u8>)]) {
+    safetensors_with(path, tensors, serde_json::json!({}));
+}
+
+/// A safetensors file with `__metadata__` `metadata` (string values).
+fn safetensors_with(path: &Path, tensors: &[(&str, &str, Vec<u64>, Vec<u8>)], metadata: serde_json::Value) {
     let mut head = serde_json::Map::new();
+    if metadata.as_object().is_some_and(|m| !m.is_empty()) {
+        head.insert("__metadata__".into(), metadata);
+    }
     let mut data = Vec::new();
     for (key, dtype, shape, bytes) in tensors {
         let start = data.len();
@@ -866,6 +874,138 @@ fn sdxl_lora_lands_on_the_canonical_modules() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A PEFT adapter folder: keys unwrapped to the base model's module names, `alpha_pattern` (and
+/// rsLoRA) folded into per-module `.alpha`, and `adapter_config.json` the component's config.
+#[test]
+fn a_peft_adapter_becomes_module_keys_and_its_config() {
+    let dir = scratch("peft-lora");
+    let folder = dir.join("in/adapter");
+    let factors = |rank: u64| {
+        let mut t = Vec::new();
+        for (m, r) in [("blocks.0.attn.to_q", rank), ("blocks.0.attn.to_k", 4)] {
+            t.push((format!("base_model.model.{m}.lora_A.weight"), "F32", vec![r, 8], f32s(r * 8, 1)));
+            t.push((format!("base_model.model.{m}.lora_B.weight"), "F32", vec![8, r], f32s(8 * r, 2)));
+        }
+        t
+    };
+    let write = |config: serde_json::Value| {
+        let t = factors(2);
+        let views: Vec<_> = t.iter().map(|(k, d, s, b)| (k.as_str(), *d, s.clone(), b.clone())).collect();
+        safetensors(&folder.join("adapter_model.safetensors"), &views);
+        fs::write(folder.join("adapter_config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    };
+    let sources = [folder.display().to_string()];
+    let config = serde_json::json!({
+        "peft_type": "LORA", "r": 2, "lora_alpha": 4, "base_model_name_or_path": "acme/base",
+        "target_modules": ["to_q", "to_k"], "rank_pattern": {"to_k": 4}, "alpha_pattern": {"attn.to_k": 16},
+    });
+    write(config.clone());
+    let out = run(&dir.join("tmp"), &sources, None).unwrap();
+    let keys: Vec<&str> = out.order.iter().map(|(_, k)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        [
+            "blocks.0.attn.to_q.lora_A.weight",
+            "blocks.0.attn.to_q.lora_B.weight",
+            "blocks.0.attn.to_k.lora_A.weight",
+            "blocks.0.attn.to_k.lora_B.weight",
+            "blocks.0.attn.to_k.alpha",
+        ]
+    );
+    let alpha = |out: &Collect, m: &str| out.tensors.get(&("model".into(), format!("blocks.0.attn.{m}.alpha"))).cloned();
+    assert_eq!(alpha(&out, "to_k"), Some((Dtype::F32, vec![], 16f32.to_le_bytes().to_vec())));
+    assert_eq!(alpha(&out, "to_q"), None, "the config's lora_alpha applies");
+    let model = &out.layout.components[0];
+    assert_eq!((model.name.as_str(), model.config_file.as_deref()), ("model", Some("adapter_config.json")));
+    let mut want = config.as_object().unwrap().clone();
+    want.insert("rank_pattern".into(), serde_json::json!({}));
+    want.insert("alpha_pattern".into(), serde_json::json!({}));
+    assert_eq!(model.config, want);
+    assert!(model.assets.is_empty() && !out.layout.files.contains_key("adapter_config.json"));
+    let imported = out.imported.unwrap();
+    assert!(imported.normalized);
+    assert_eq!(imported.converters, ["peft.lora"]);
+
+    // rsLoRA's α/√r is α·√r over r: every module states it.
+    write(serde_json::json!({"peft_type": "LORA", "r": 2, "lora_alpha": 4, "use_rslora": true}));
+    let out = run(&dir.join("tmp"), &sources, None).unwrap();
+    assert_eq!(alpha(&out, "to_q").unwrap().2, (4.0 * 2f32.sqrt()).to_le_bytes().to_vec());
+    assert_eq!(alpha(&out, "to_k").unwrap().2, 8f32.to_le_bytes().to_vec());
+    assert_eq!(out.layout.components[0].config["use_rslora"], false);
+
+    for (config, code) in [
+        (serde_json::json!({"peft_type": "LORA", "use_dora": true}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LOHA"}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LORA", "alpha_pattern": {".*to_k": 2}}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LORA", "alpha_pattern": {"to_k": 2, "attn.to_k": 3}}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LORA", "lora_alpha": "4"}), Code::WRONG_TYPE),
+    ] {
+        write(config.clone());
+        assert_eq!(run(&dir.join("tmp"), &sources, None).err().unwrap().code, code, "{config}");
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The header-level rules a migration shares: PEFT's key spelling and its adapter config.
+#[test]
+fn lora_keys_and_adapter_configs_follow_one_rule() {
+    use tensorfs::import::lora::{adapter_config, peft_key};
+    for (key, want) in [
+        ("lora_unet_x.lora_down.weight", Some("lora_unet_x.lora_A.weight")),
+        ("lora_unet_x.lora_up", Some("lora_unet_x.lora_B.weight")),
+        ("base_model.model.a.b.lora_A.default.weight", Some("a.b.lora_A.weight")),
+        ("a.b.lora_B.weight", Some("a.b.lora_B.weight")),
+        ("base_model.model.a.alpha", Some("a.alpha")),
+        ("a.lora_B.bias", None),
+        ("a.weight", None),
+    ] {
+        assert_eq!(peft_key(key).as_deref(), want, "{key}");
+    }
+    let none = BTreeMap::new();
+    let mixed = [("a".to_owned(), 4), ("b".to_owned(), 8), ("c".to_owned(), 4)];
+    assert_eq!(
+        serde_json::Value::Object(adapter_config(mixed.clone(), &none, None, Some("acme/base"))),
+        serde_json::json!({"peft_type": "LORA", "r": 4, "target_modules": ["a", "b", "c"],
+                           "base_model_name_or_path": "acme/base"}),
+        "ranks differ: no lora_alpha, each module's own r is its α"
+    );
+    let source = serde_json::json!({"lora_alpha": 16, "r": 8, "base_model_name_or_path": "x"});
+    let config = adapter_config(mixed, &none, source.as_object(), None);
+    assert_eq!((&config["lora_alpha"], &config["r"], &config["base_model_name_or_path"]), (&16.into(), &8.into(), &"x".into()));
+    let uniform = adapter_config([("a".to_owned(), 2)], &none, None, None);
+    assert_eq!(uniform["lora_alpha"], 2);
+}
+
+/// Kohya's training metadata is PEFT's config of each LoRA component; its `.alpha` stays.
+#[test]
+fn a_kohya_lora_maps_its_metadata_to_the_adapter_config() {
+    let dir = scratch("kohya-config");
+    let file = dir.join("in/eyes.safetensors");
+    let stem = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn2_to_k";
+    safetensors_with(
+        &file,
+        &[
+            (&format!("{stem}.lora_down.weight"), "F32", vec![4, 2048], f32s(4 * 2048, 4)),
+            (&format!("{stem}.lora_up.weight"), "F32", vec![640, 4], f32s(640 * 4, 3)),
+            (&format!("{stem}.alpha"), "F32", vec![], 2f32.to_le_bytes().to_vec()),
+        ],
+        serde_json::json!({"ss_network_dim": "4", "ss_network_alpha": "2.5", "ss_sd_model_name": "sd_xl_base_1.0.safetensors"}),
+    );
+    let out = run(&dir.join("tmp"), &[file.display().to_string()], None).unwrap();
+    let unet = out.layout.components.iter().find(|c| c.name == "unet").unwrap();
+    assert_eq!(unet.config_file.as_deref(), Some("adapter_config.json"));
+    assert_eq!(
+        serde_json::Value::Object(unet.config.clone()),
+        serde_json::json!({
+            "peft_type": "LORA", "r": 4, "lora_alpha": 2.5, "base_model_name_or_path": "sd_xl_base_1.0.safetensors",
+            "target_modules": ["down_blocks.1.attentions.0.transformer_blocks.0.attn2.to_k"],
+        })
+    );
+    let module = "down_blocks.1.attentions.0.transformer_blocks.0.attn2.to_k";
+    assert_eq!(out.tensors[&("unet".into(), format!("{module}.alpha"))].2, 2f32.to_le_bytes().to_vec());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 /// network: Hugging Face.
 #[test]
 fn a_tiny_hf_sdxl_imports_end_to_end() {
@@ -885,20 +1025,26 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
     // .gitattributes are repo files.
     let layout = &out.layout;
     let pipeline = layout.pipeline.as_ref().unwrap();
-    assert_eq!(pipeline.class, "diffusers.StableDiffusionXLPipeline");
-    let classes: Vec<(&str, &str, Option<&str>)> = (layout.components.iter())
-        .map(|c| (c.name.as_str(), c.class.as_str(), c.config_file.as_deref()))
+    // Each class's version is its own config's; the tokenizers record none and take their
+    // library's from the text encoders.
+    assert_eq!(pipeline.class, ClassRef::new("diffusers", "0.25.0", "StableDiffusionXLPipeline"));
+    let classes: Vec<(&str, [&str; 3], Option<&str>)> = (layout.components.iter())
+        .map(|c| {
+            let class = [c.class.library.as_str(), &c.class.version, &c.class.name];
+            (c.name.as_str(), class, c.config_file.as_deref())
+        })
         .collect();
+    let (d, t) = (["diffusers", "0.25.0"], ["transformers", "4.36.2"]);
     assert_eq!(
         classes,
         [
-            ("text_encoder", "transformers.CLIPTextModel", None),
-            ("text_encoder_2", "transformers.CLIPTextModelWithProjection", None),
-            ("unet", "diffusers.UNet2DConditionModel", None),
-            ("vae", "diffusers.AutoencoderKL", None),
-            ("scheduler", "diffusers.DDIMScheduler", Some("scheduler_config.json")),
-            ("tokenizer", "transformers.CLIPTokenizer", Some("tokenizer_config.json")),
-            ("tokenizer_2", "transformers.CLIPTokenizer", Some("tokenizer_config.json")),
+            ("text_encoder", [t[0], t[1], "CLIPTextModel"], None),
+            ("text_encoder_2", [t[0], t[1], "CLIPTextModelWithProjection"], None),
+            ("unet", [d[0], d[1], "UNet2DConditionModel"], None),
+            ("vae", [d[0], d[1], "AutoencoderKL"], None),
+            ("scheduler", [d[0], d[1], "DDIMScheduler"], Some("scheduler_config.json")),
+            ("tokenizer", [t[0], t[1], "CLIPTokenizer"], Some("tokenizer_config.json")),
+            ("tokenizer_2", [t[0], t[1], "CLIPTokenizer"], Some("tokenizer_config.json")),
         ]
     );
     let tokenizer = &layout.components[5];
@@ -983,9 +1129,11 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
 /// The generated references order a source's sorted keys into the constructor order that the
 /// converter tables (generated from the same classes' state_dict) list, for every SDXL and
 /// Anima component: two independent generators agree.
-/// network: Hugging Face. A pipeline's components take their classes from `model_index.json`
-/// as written, even where the component's own config names another (`T5Tokenizer`,
-/// `architectures`) or none (a preprocessor config).
+/// network: Hugging Face. A pipeline's components take their library and class from
+/// `model_index.json` as written, even where the component's own config names another
+/// (`T5Tokenizer`, `architectures`) or none (a preprocessor config). A version is the config's
+/// own, else the model's for that library; `stable_diffusion` (a Diffusers pipeline module)
+/// records none, so its version is `""`.
 #[test]
 fn model_index_names_every_component_class() {
     let dir = scratch("model-index-classes");
@@ -997,14 +1145,48 @@ fn model_index_names_every_component_class() {
             .collect::<BTreeMap<_, _>>()
     };
     let sd = classes("tiny-stable-diffusion-pipe-variants-all-kinds");
-    assert_eq!(sd["safety_checker"], "stable_diffusion.StableDiffusionSafetyChecker");
-    assert_eq!(sd["feature_extractor"], "transformers.CLIPFeatureExtractor");
-    assert_eq!(sd["tokenizer"], "transformers.CLIPTokenizer");
+    let class = ClassRef::new;
+    assert_eq!(sd["safety_checker"], class("stable_diffusion", "", "StableDiffusionSafetyChecker"));
+    assert_eq!(sd["feature_extractor"], class("transformers", "4.28.0.dev0", "CLIPFeatureExtractor"));
+    assert_eq!(sd["tokenizer"], class("transformers", "4.28.0.dev0", "CLIPTokenizer"));
     let flux = classes("tiny-flux-pipe");
-    assert_eq!(flux["tokenizer_2"], "transformers.T5TokenizerFast");
-    assert_eq!(flux["text_encoder_2"], "transformers.T5EncoderModel");
-    assert_eq!(flux["scheduler"], "diffusers.FlowMatchEulerDiscreteScheduler");
+    assert_eq!(flux["tokenizer_2"], class("transformers", "4.40.2", "T5TokenizerFast"));
+    assert_eq!(flux["text_encoder_2"], class("transformers", "4.40.2", "T5EncoderModel"));
+    assert_eq!(flux["scheduler"], class("diffusers", "0.30.0.dev0", "FlowMatchEulerDiscreteScheduler"));
     fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A class's version: its own config's for its library, else another config's of the model,
+/// else the converter reference's, else `""`. No network.
+#[test]
+fn a_class_version_is_its_configs_else_the_models_else_the_references() {
+    let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+    let files = BTreeMap::from([
+        ("model_index.json".to_owned(), json(serde_json::json!({"_class_name": "P", "_diffusers_version": "0.30.0",
+            "unet": ["diffusers", "U"], "text_encoder": ["transformers", "T"], "tokenizer": ["transformers", "K"],
+            "safety_checker": ["stable_diffusion", "S"]}))),
+        ("unet/config.json".to_owned(), json(serde_json::json!({"_diffusers_version": "0.31.0"}))),
+        ("text_encoder/config.json".to_owned(), json(serde_json::json!({"transformers_version": null}))),
+        ("tokenizer/tokenizer_config.json".to_owned(), json(serde_json::json!({}))),
+        ("safety_checker/config.json".to_owned(), json(serde_json::json!({}))),
+    ]);
+    let tensored = ["unet".to_owned(), "text_encoder".to_owned(), "safety_checker".to_owned()];
+    let classes = |reference: &import::Versions| {
+        let layout = import::layout(files.clone(), &tensored, reference).unwrap();
+        let mut out = vec![layout.pipeline.unwrap().class];
+        out.extend(layout.components.into_iter().map(|c| c.class));
+        out
+    };
+    let c = ClassRef::new;
+    let reference = import::Versions::from([("transformers".into(), "4.40.0".into())]);
+    assert_eq!(classes(&reference), [
+        c("diffusers", "0.30.0", "P"),
+        c("diffusers", "0.31.0", "U"),
+        c("transformers", "4.40.0", "T"),
+        c("stable_diffusion", "", "S"),
+        c("transformers", "4.40.0", "K"),
+    ]);
+    assert_eq!(classes(&Default::default())[2], c("transformers", "", "T"));
 }
 
 /// network: Hugging Face (configs only, no weights). The same on the full-size repos.
@@ -1029,16 +1211,17 @@ fn full_size_pipelines_take_model_index_classes() {
                 files.insert(m.path.clone(), import::remote::read_small(m, &access).unwrap());
             }
         }
-        let layout = import::layout(files, &tensored).unwrap();
+        let layout = import::layout(files, &tensored, &Default::default()).unwrap();
         (layout.components.iter())
             .map(|c| (c.name.clone(), c.class.clone()))
             .collect::<BTreeMap<_, _>>()
     };
     let sd = classes("hf://stable-diffusion-v1-5/stable-diffusion-v1-5");
-    assert_eq!(sd["safety_checker"], "stable_diffusion.StableDiffusionSafetyChecker");
-    assert_eq!(sd["feature_extractor"], "transformers.CLIPImageProcessor");
+    let class = ClassRef::new;
+    assert_eq!(sd["safety_checker"], class("stable_diffusion", "", "StableDiffusionSafetyChecker"));
+    assert_eq!(sd["feature_extractor"], class("transformers", "4.22.0.dev0", "CLIPImageProcessor"));
     let lite = classes("hf://Freepik/flux.1-lite-8B");
-    assert_eq!(lite["tokenizer_2"], "transformers.T5TokenizerFast");
+    assert_eq!(lite["tokenizer_2"], class("transformers", "4.47.1", "T5TokenizerFast"));
 }
 
 #[test]
@@ -1384,10 +1567,14 @@ fn a_single_file_sdxl_becomes_the_upstream_layout() {
     let layout = &sink.layout;
     assert_eq!(
         layout.pipeline.as_ref().unwrap().class,
-        "diffusers.StableDiffusionXLPipeline"
+        ClassRef::new("diffusers", "0.19.0.dev0", "StableDiffusionXLPipeline")
     );
     let folders: BTreeMap<&str, &import::Folder> =
         layout.components.iter().map(|c| (c.name.as_str(), c)).collect();
+    let unet = ClassRef::new("diffusers", "0.19.0.dev0", "UNet2DConditionModel");
+    assert_eq!(folders["unet"].class, unet);
+    let tokenizer = ClassRef::new("transformers", "4.32.0.dev0", "CLIPTokenizer");
+    assert_eq!(folders["tokenizer_2"].class, tokenizer, "the text encoders' version");
     assert_eq!(folders["scheduler"].config_file.as_deref(), Some("scheduler_config.json"));
     assert!(folders["tokenizer_2"].assets.contains_key("vocab.json"));
     for c in ["text_encoder", "unet", "vae"] {

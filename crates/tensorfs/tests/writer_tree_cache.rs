@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+use tensorfs::format::ClassRef;
 use tensorfs::format::{Dtype, ObjectRef};
 use tensorfs::{Client, Config, Open, WriterOptions};
 
@@ -52,7 +53,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
     let mut writer = producer.writer(WriterOptions::default()).unwrap();
     {
         let mut model = writer
-            .component("model", "test.Model", Default::default(), None)
+            .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
             .unwrap();
         model.put("w", Dtype::U8, &[4], &mut &WEIGHT[..]).unwrap();
         model.asset("vocab.bin", ASSET).unwrap();

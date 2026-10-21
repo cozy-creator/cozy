@@ -193,6 +193,8 @@ fn plan(base: &Checkpoint, adapters: &[(Selection, Checkpoint)]) -> io::Result<(
             ));
         };
         let (source_component, factors) = (&found.name, &keyed(found));
+        // PEFT's adapter_config, the LoRA component's config: α where a module has no `.alpha`.
+        let lora_alpha = found.config.get("lora_alpha").and_then(serde_json::Value::as_f64);
         if factors.is_empty() {
             return Err(refuse("empty", "adapter contains no factors"));
         }
@@ -241,7 +243,7 @@ fn plan(base: &Checkpoint, adapters: &[(Selection, Checkpoint)]) -> io::Result<(
                 return Err(refuse("shape", format!("{component}.{path}: factors do not fit the base projection")));
             }
             let rank = a.shape[0];
-            let alpha = scalars.get(&path).copied().unwrap_or(rank as f64);
+            let alpha = scalars.get(&path).copied().or(lora_alpha).unwrap_or(rank as f64);
             if !(alpha / rank as f64 * selection.strength).is_finite() {
                 return Err(refuse("scale", format!("{component}.{path}: effective scale is not finite")));
             }
@@ -304,10 +306,10 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
     let graph = serde_json_canonicalizer::to_vec(&graph).map_err(io::Error::other)?;
     let mut writer = store.writer(None, Some(&id)).map_err(storage::io_error)?;
     if let Some(pipeline) = base.pipeline() {
-        writer.pipeline(&pipeline.class, pipeline.config.clone());
+        writer.pipeline(pipeline.class.clone(), pipeline.config.clone());
     }
     for component in base.components() {
-        let mut declared = (writer.component(&component.name, &component.class, component.config.clone(), component.config_file.as_deref()))
+        let mut declared = (writer.component(&component.name, component.class.clone(), component.config.clone(), component.config_file.as_deref()))
             .map_err(storage::io_error)?;
         for (name, object) in &component.assets {
             declared.reuse_asset(name, object).map_err(storage::io_error)?;
@@ -336,7 +338,11 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
 pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
-    use tensorfs::format::{Config, ConfigValue, Value};
+    use tensorfs::format::{ClassRef, Config, ConfigValue, Value};
+
+    fn unet_class() -> ClassRef {
+        ClassRef::new("diffusers", "0.35.1", "UNet2DConditionModel")
+    }
     use tensorfs::writer::{Data, Source};
 
     pub(crate) fn f32s(n: usize, seed: f32) -> Vec<u8> {
@@ -346,9 +352,13 @@ pub(crate) mod tests {
     /// A real checkpoint through the writer: one component of F32 tensors, its config and a
     /// tokenizer.
     pub(crate) fn checkpoint(store: &Store, key: &str, component: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> ObjectRef {
-        let mut writer = store.writer(None, Some(key)).unwrap();
         let config = Config::from_iter([("a".to_string(), ConfigValue::from(1))]);
-        let mut declared = writer.component(component, "diffusers.UNet2DConditionModel", config, None).unwrap();
+        written(store, key, component, config, tensors)
+    }
+
+    fn written(store: &Store, key: &str, component: &str, config: Config, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> ObjectRef {
+        let mut writer = store.writer(None, Some(key)).unwrap();
+        let mut declared = writer.component(component, unet_class(), config, None).unwrap();
         for (name, shape, bytes) in tensors {
             declared.put(name, &Dtype::F32, shape, Data::Plain(Source::Read(&mut bytes.as_slice()))).unwrap();
         }
@@ -389,7 +399,7 @@ pub(crate) mod tests {
         assert!(composed.tensor("unet", "proj.weight").is_err());
         assert_eq!(objects(composed, "unet", "proj.base_layer.weight"), objects(&held, "unet", "proj.weight"));
         let unet = composed.component("unet").unwrap();
-        assert_eq!((unet.class.as_str(), &unet.config), ("diffusers.UNet2DConditionModel", &held.component("unet").unwrap().config));
+        assert_eq!((&unet.class, &unet.config), (&unet_class(), &held.component("unet").unwrap().config));
         assert_eq!(composed.asset("unet", "tokenizer.json").unwrap(), b"{}");
         assert_eq!(composed.header().metadata.get("normalized"), Some(&Value::Bool(true)));
         let graph: serde_json::Value = serde_json::from_slice(&composed.asset("unet", GRAPH_FILE).unwrap()).unwrap();
@@ -410,6 +420,28 @@ pub(crate) mod tests {
         assert_eq!(held.read("unet", "proj.weight").unwrap(), weight, "the open base did not");
         assert_eq!(compose(&store, &base, &selection).unwrap().checkpoint.id(), &id, "composed again, identically");
         drop((held, adapter));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// α (spec §4): the module's `.alpha`, else the LoRA component config's `lora_alpha` (PEFT's
+    /// adapter_config), else the rank.
+    #[test]
+    fn alpha_is_the_modules_else_the_adapter_configs_else_the_rank() {
+        let root = std::env::temp_dir().join(format!("adapter-alpha-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&root).unwrap().with_grace(Duration::ZERO);
+        let base = checkpoint(&store, "base", "unet", &[("proj.weight", vec![8, 8], f32s(64, 0.5))]);
+        let held = store.checkpoint(&base).unwrap();
+        let factors = [("proj.lora_A.weight", vec![2, 8], f32s(16, 0.1)), ("proj.lora_B.weight", vec![8, 2], f32s(16, 0.2))];
+        let alpha = |key: &str, config: Config| {
+            let lora = written(&store, key, "adapter", config, &factors);
+            let selection = [Selection { checkpoint: lora, component: String::new(), source_component: String::new(), strength: 1.0 }];
+            let view = compose(&store, &base, &selection).unwrap();
+            let graph: serde_json::Value = serde_json::from_slice(&view.checkpoint.asset("unet", GRAPH_FILE).unwrap()).unwrap();
+            graph["layers"][0]["alpha"].as_f64().unwrap()
+        };
+        assert_eq!(alpha("peft", Config::from_iter([("lora_alpha".to_string(), ConfigValue::from(8))])), 8.0);
+        assert_eq!(alpha("bare", Config::new()), 2.0, "the rank");
+        drop(held);
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -9,8 +9,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use super::{
-    check_format, invalid, Body, Component, ConfigValue, Dtype, Encoding, Error, Header, Location,
-    Metadata, ObjectRef, Part, Pipeline, Result, Tensor, Value, CONFIG_FILE, HEADER_FORMAT,
+    check_format, invalid, Body, ClassRef, Component, ConfigValue, Dtype, Encoding, Error, Header,
+    Location, Metadata, ObjectRef, Part, Pipeline, Result, Tensor, Value, CONFIG_FILE, HEADER_FORMAT,
 };
 
 /// The deepest nesting a value may use.
@@ -68,6 +68,10 @@ impl Writer {
         self.uint(at.chunk);
         self.uint(at.offset);
         self.uint(at.length);
+    }
+    fn class(&mut self, c: &ClassRef) {
+        self.array(3);
+        [&c.library, &c.version, &c.name].into_iter().for_each(|t| self.text(t));
     }
     fn object(&mut self, r: &ObjectRef) {
         self.array(2);
@@ -188,7 +192,7 @@ pub(crate) fn write(h: &Header) -> Result<Vec<u8>> {
         None => w.array(0),
         Some(p) => {
             w.array(2);
-            w.text(&p.class);
+            w.class(&p.class);
             w.map(&p.config, Writer::config)?;
         }
     }
@@ -196,7 +200,7 @@ pub(crate) fn write(h: &Header) -> Result<Vec<u8>> {
     for c in h.components() {
         w.array(5 + c.config_file.is_some() as usize);
         w.text(&c.name);
-        w.text(&c.class);
+        w.class(&c.class);
         w.map(&c.config, Writer::config)?;
         w.array(c.tensors.len());
         for t in &c.tensors {
@@ -312,6 +316,14 @@ impl<'a> Reader<'a> {
         let at = self.at;
         std::str::from_utf8(self.take(len(n)?)?)
             .or_else(|_| invalid(format!("{what}: invalid UTF-8 at byte {at}")))
+    }
+    /// `[library, version, name]`, exactly.
+    fn class(&mut self, what: &str) -> Result<ClassRef> {
+        if self.list(what)? != 3 {
+            return invalid(format!("{what}: not [library, version, name]"));
+        }
+        let mut text = || self.text(what).map(str::to_owned);
+        Ok(ClassRef { library: text()?, version: text()?, name: text()? })
     }
     /// A record of at least `n` fields; the count of fields after them, to [`Reader::skip`].
     fn record(&mut self, n: u64, what: &str) -> Result<u64> {
@@ -555,7 +567,7 @@ fn parse(bytes: &[u8]) -> Result<Header> {
         0 => None,
         1 => return invalid("the pipeline: 1 field, not 0 or at least 2"),
         n => {
-            let class = r.text("the pipeline's class")?.to_owned();
+            let class = r.class("the pipeline's class")?;
             let config = r.map(1, Reader::config)?.into_iter().collect();
             r.skip(n - 2, 2)?;
             Some(Pipeline { class, config })
@@ -567,7 +579,7 @@ fn parse(bytes: &[u8]) -> Result<Header> {
     for _ in 0..n {
         let mut fields = r.record(5, "a component")?;
         let name = r.text("a component name")?.to_owned();
-        let class = r.text("a component class")?.to_owned();
+        let class = r.class("a component class")?;
         let config = r.map(2, Reader::config)?.into_iter().collect();
         let n = r.list("tensors")?;
         let mut tensors = Vec::with_capacity(room(n));

@@ -228,6 +228,7 @@ pub fn checkpoint(engine: &Engine, generation: &Generation, id: &str, frame: &Fr
         crate::storage::check_digest("checkpoint revision", &frame.revision, true).map_err(storage)?;
         let reference = protocol::machine::CheckpointRef {
             repo_id: frame.repo_id.clone(), revision: frame.revision.clone(), variant: frame.variant.clone(),
+            tag: frame.tag.clone(),
         };
         let product = domain::RunProduct {
             output: frame.output.clone(), checkpoint: Some(reference.clone()),
@@ -439,7 +440,8 @@ mod tests {
         }).unwrap();
         let mut frame = Frame {
             seq: 1, output: "weights".into(), repo_id: "local/derived".into(),
-            revision: format!("sha256:{}", "a".repeat(64)), variant: "bf16".into(), ..Default::default()
+            revision: format!("sha256:{}", "a".repeat(64)), variant: "bf16".into(),
+            tag: format!("replay-{}", "c".repeat(64)), ..Default::default()
         };
         assert!(checkpoint(&engine, &generation, &record.id, &frame).ok);
         assert_eq!(checkpoint(&engine, &generation, &record.id, &frame).sequence, 0);
@@ -462,6 +464,7 @@ mod tests {
         let document = document(&remote).unwrap();
         assert!(document.get("content").is_none());
         assert_eq!(document["checkpoint"]["revision"], frame.revision);
+        assert_eq!(document["checkpoint"]["tag"], frame.tag);
         assert!(!shown(&[local], &remote));
         drop(reopened);
         crate::scratch::remove(&root);

@@ -36,13 +36,11 @@ enum Verb {
     Upload(Upload),
     /// Write a model's int8, fp8 or nvfp4 lane with the package that serves it.
     Quantize(Quantize),
-    /// Set or remove a release's lanes.
+    /// Release a commit: a public tag named by a version, created, moved, or a private one made public.
     Publish(Publish),
-    /// Point one existing release lane at another checkpoint.
-    Retarget(Retarget),
-    /// Yank a release.
+    /// Yank a release: only its exact version resolves it; --undo takes it back.
     Yank(Yank),
-    /// Delete a model whose releases are yanked, or one unreleased checkpoint.
+    /// Delete one tag, or the whole model.
     Delete(Delete),
     /// Dev builds only: move models from before D10 onto it, header-only.
     #[cfg(feature = "migrate")]
@@ -147,30 +145,13 @@ pub(crate) struct Quantize {
 pub(crate) struct Publish {
     /// org/name.
     model: String,
-    /// The release label.
+    /// The release: a PEP 440 version.
     #[arg(long)]
     release: String,
-    /// Set a lane: name=sha256:<checkpoint>; repeatable.
-    #[arg(long = "lane", value_name = "NAME=CHECKPOINT")]
-    lanes: Vec<String>,
-    /// Remove a lane by name; repeatable.
-    #[arg(long = "remove-lane", value_name = "NAME")]
-    remove: Vec<String>,
-}
-
-#[derive(clap::Args, Debug)]
-pub(crate) struct Retarget {
-    /// org/name.
-    model: String,
-    /// The release label.
-    #[arg(long)]
-    release: String,
-    /// The existing lane to move.
-    #[arg(long)]
-    lane: String,
-    /// The checkpoint (sha256:<hex>) it points at next.
-    #[arg(long, value_name = "CHECKPOINT")]
-    to: String,
+    /// The commit it names: a tag, or sha256:<hex> of a commit or a variant header; default: the
+    /// release's own tag.
+    #[arg(long, value_name = "COMMIT")]
+    commit: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -180,11 +161,14 @@ pub(crate) struct Yank {
     /// The release to yank.
     #[arg(long)]
     release: String,
+    /// Un-yank it instead.
+    #[arg(long)]
+    undo: bool,
 }
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Delete {
-    /// org/name, or org/name#sha256:… for one unreleased checkpoint.
+    /// org/name, or org/name@tag for one tag.
     model: String,
     /// Confirm: a deletion cannot be undone.
     #[arg(long)]
@@ -197,7 +181,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Verb::Info(args) => catalog::info(ctx, args).await,
         Verb::Family(args) => catalog::family(ctx, args).await,
         Verb::Publish(args) => releases::publish(ctx, args).await,
-        Verb::Retarget(args) => releases::retarget(ctx, args).await,
         Verb::Yank(args) => releases::yank(ctx, args).await,
         Verb::Delete(args) => releases::delete(ctx, args).await,
         Verb::List(args) => machine::list(ctx, args).await,

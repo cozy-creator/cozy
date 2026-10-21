@@ -8,11 +8,11 @@ without TensorFS, Cozy or Tensorhub. Library APIs, cache policy and GPU executio
 
 cozytensors/1 describes model weights as immutable, content-addressed objects. One **header** describes one model
 variant: its pipeline, components, plain or encoded tensors, and the chunks and assets those components use.
-A **tree** groups variant headers with shared repository files such as README and LICENSE. A **repo** document
-is the mutable index of releases and unreleased trees.
+A **tree** groups variant headers with shared repository files such as README and LICENSE; it is a repo's commit. A
+**repo** document is the mutable list of tags naming commits: public tags are releases, private ones the owner's.
 
 ```text
-repo -> release or unreleased tree -> variant header -> tensor chunks and component assets
+repo -> tag -> commit (tree) -> variant header -> tensor chunks and component assets
                                   -> shared repository files
 ```
 
@@ -20,7 +20,8 @@ Everything required to locate and decode a tensor is in its header and this spec
 depend on a repository name, release label, filename, Python package or particular model engine.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. §1–§8 define meaning; §9 defines the byte encoding
-of documents; §10 is informative writer guidance. Appendix A holds the schemes' fixed tables.
+of documents; §10 is informative writer guidance; §11 defines a checkpoint's logical file. Appendix A holds the
+schemes' fixed tables.
 
 ## 1. Objects
 
@@ -48,9 +49,9 @@ spelling. A reader also accepts `<kind>/1.<minor>`, the minor one or more decima
 
 | Document | `format` kind | Encoding (§9) | Usual name |
 |---|---|---|---|
-| tree | `tensorfs.tree` | JSON object | an object, cited by a repo |
+| tree | `cozytensors.tree` | JSON object | an object, cited by a repo |
 | header | `cozytensors` | CBOR array | the tree file `model.<variant>.cozytensors` |
-| repo | `tensorfs.repo` | JSON object | `refs/<org>/<name>.json` |
+| repo | `cozytensors.repo` | JSON object | `refs/<org>/<name>.json` |
 
 The schemas describe structure; they do not replace the rules below for canonical encoding, duplicate keys,
 value domains, arithmetic bounds and reference closure.
@@ -69,7 +70,7 @@ or more segments joined by `/`.
 ## 3. Tree
 
 ```
-{format: "tensorfs.tree/1", files: {path: object-ref}}
+{format: "cozytensors.tree/1", files: {path: object-ref}}
 ```
 
 - Every key of `files` MUST be a path whose first segment is not `chunks` (a plain folder's chunk directory).
@@ -112,6 +113,7 @@ header    = [format, chunks: [* object], encodings: [* encoding], pipeline, comp
 object    = [sha256: bytes(32), length]
 encoding  = [scheme, params: {* name => value}]
 pipeline  = [] / [class, config]
+class     = [library, version, name]
 component = [name, class, config, tensors: [* tensor], assets: {* path => object}, ? config_file]
 config    = {* name => config-value}
 tensor    = [key, dtype, shape, 0, location]                 ; plain
@@ -121,13 +123,19 @@ location  = [chunk_index, offset, length]
 ```
 
 - **Pipeline:** what `model_index.json` held, as its class and config; `[]` for a model with no pipeline.
-- **Class:** a descriptive `<library>.<Class>` identifier (`diffusers.StableDiffusionXLPipeline`,
-  `diffusers.UNet2DConditionModel`, `transformers.CLIPTextModel`), or `""` when unknown. The pipeline's is
-  `diffusers.<_class_name>`. With a pipeline, a component's class is its `model_index.json` entry `[library, Class]`
-  as written (`stable_diffusion.StableDiffusionSafetyChecker`: `stable_diffusion` is a Diffusers pipeline module),
-  and `""` where the entry is `[null, null]` or absent. Without one, it is what the component's config names:
-  Transformers' `architectures[0]`, Diffusers' `_class_name`, or a tokenizer config's `tokenizer_class`. Reading
-  this format does not require importing or executing that class.
+- **Class:** `[library, version, name]`, exactly three texts, the same shape for any library or implementation and
+  never an import path: `["diffusers", "0.35.1", "SD3Transformer2DModel"]`, `["transformers", "4.57.0",
+  "CLIPTextModel"]`. The contract: a component's tensors are exactly that class's `state_dict` at that library
+  version (where a version is recorded). `["", "", ""]` is an unknown model, the only class with an empty `library`; a
+  reader MUST refuse a class that is not three texts or has an empty `library` with a `name` or `version`. `version`
+  MAY be `""` where nothing records it (a local folder); a writer warns then. The pipeline's is `diffusers` and its
+  `_class_name`. With a pipeline, a component's library and name are its `model_index.json` entry `[library, Class]` as
+  written (`stable_diffusion`, a Diffusers pipeline module, for its safety checker), and the unknown class where the
+  entry is `[null, null]` or absent. Without one, they are what the component's config names: Transformers'
+  `architectures[0]`, Diffusers' `_class_name`, or a tokenizer config's `tokenizer_class`. The version is the
+  component's own config's for its library (`_diffusers_version`, `transformers_version`), else one another config of
+  the model records for that library, else the converter reference's; configs stay as written. Reading this format
+  never requires importing or executing that class.
 - **Config:** the parsed JSON of the component's config file, as a structured map, never a file. Its values, and
   only those, MAY also be finite floats and `null` (`config-value` is a value, a float or `null`, lists and maps of
   them; §9). A component without a config file has an empty config.
@@ -175,7 +183,16 @@ read them.
 - Component folders, layer names and tensor keys are the upstream on-disk names: the component's Diffusers or
   Transformers folder (`unet`, `text_encoder`, `transformer`, `vae`) and the keys of its upstream `*.safetensors`
   state dict, unchanged.
-- LoRAs are stored under the upstream module names they adapt, with PEFT's `lora_A` and `lora_B` keys.
+- LoRAs are stored under the upstream module names they adapt, with PEFT's `lora_A` and `lora_B` keys:
+  `<module>.lora_A.weight` `[r, in]` and `<module>.lora_B.weight` `[out, r]`, `r` being `lora_A`'s rows. A module
+  adapts its base weight `W [out, in]` as `W' = W + (α / r) · (B · A)`. `α` is the module's scalar `<module>.alpha`
+  when the component has one, else the component config's `lora_alpha`, else `r` (a scale of 1).
+- A LoRA component's config is PEFT's `adapter_config.json` (`config_file`; `peft_type: "LORA"`,
+  `base_model_name_or_path`, `r`, `lora_alpha`, `target_modules`, …). A converter normalizes the scale at ingest:
+  PEFT's `alpha_pattern` (and rsLoRA's `α / √r`) become each module's `.alpha`, its `rank_pattern` is each
+  `lora_A`'s rows already, and both are left empty in the config. Kohya's `<module>.alpha` stays as it is, and its
+  training metadata maps to the config (`ss_network_dim` is `r`, `ss_network_alpha` `lora_alpha`,
+  `ss_sd_model_name` the base model).
 - A writer MUST NOT deviate from these names unless the deviation is listed below with its written, measured reason.
 
 | Model | Upstream name | Stored name | Measured reason |
@@ -228,12 +245,12 @@ formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`, `fp8.blockw
 is `producer.type` with the producer's type name verbatim (`gguf.q4_k`, `gptq.int4`, `awq.int4`, `ct.int4`,
 `bnb.nf4`), and a vendor-neutral standard keeps its bare name (`mxfp4`, `mxfp8`, `nvfp4`).
 
-**Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
-`global_scale`, `nibble_order`, `scale_layout`, `scale_dtype`). Every param the decode reads is required and none has a
-default, so the encoding shows the whole recipe. Only schemes whose parameter lists include `scale_dtype` carry
-that parameter: `F32`, `BF16` or `F16` (and `F8_E8M0` for `fp8.blockwise`), as specified by that scheme. Where a
-parameter repeats a part's dtype, a reader MUST refuse a mismatch. Otherwise the scheme's allowed part dtypes
-apply directly; readers MUST NOT require an undeclared `scale_dtype` parameter.
+**Params** are snake_case keys in the producer's vocabulary (`block_size`, `rotation`, `rotation_size`,
+`global_scale`, `nibble_order`, `scale_layout`). Every param the decode reads is required and none has a default, so
+the encoding shows the whole recipe. A param never repeats a part's dtype: each part carries its own (§4), the
+scheme lists the dtypes it allows, and the part's dtype is the one the decode reads. Nor does a param choose what a
+part means: a scale on the rows and one on the columns are two schemes (`fp8.rowwise`, `fp8.columnwise`). Roles
+name what a part is (`weight`, `scale`, `group_scale`, `codebook`, `correction`), the same across schemes.
 
 **Four rules** bring any format in without new grammar:
 1. *Keep the producer's bytes.* Parts are the producer's packed bytes (int words, nibbles, block structs, swizzled
@@ -333,31 +350,31 @@ the framework's key and shape. `mxfp4` has the param.
 
 ### `fp8.tensorwise`
 
-- Params: `scale_dtype`.
-- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`
-  (optional).
+- Params: none.
+- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, `BF16` or `F16`, one element.
+  `input_scale` (optional).
 - Decode, any shape: `round_L(weight × scale)`.
 
-### `fp8.rowwise`
+### `fp8.rowwise`, `fp8.columnwise`
 
-- Params: `axis`: `0` or `1`; `scale_dtype`.
-- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `scale_dtype`, on the row grid (`axis: 0`) or
-  the column grid (`axis: 1`).
+- Params: none.
+- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, `BF16` or `F16`, on the row grid
+  (`rowwise`) or the column grid (`columnwise`).
 - Decode: `round_L(weight[i, j] × s(i, j))`.
 
 ### `int8.tensorwise`
 
 - Params, parts and decode as `fp8.tensorwise`, with `weight` `I8`.
 
-### `int8.rowwise`
+### `int8.rowwise`, `int8.columnwise`
 
-- Params, parts and decode as `fp8.rowwise`, with `weight` `I8`.
+- Params, parts and decode as `fp8.rowwise` and `fp8.columnwise`, with `weight` `I8`.
 
 ### `int8.convrot`
 
-- Params: `rotation: "kron_regular_h4"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8` (256 in practice);
-  `scale_dtype`.
-- Parts: `weight`: `I8`, the logical shape; `C` MUST be a multiple of `B`. `scale`: `scale_dtype`, on the row grid.
+- Params: `rotation: "kron_regular_h4"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8` (256 in practice).
+- Parts: `weight`: `I8`, the logical shape; `C` MUST be a multiple of `B`. `scale`: `F32`, `BF16` or `F16`, on the row
+  grid.
 - Decode: `value[i, gB + j] = round_L((y[i, g, j] × scale[i]) × 2^−k)`, with
   `y[i, g, ·] = weight[i, gB : gB + B] · H_B`.
 
@@ -367,6 +384,17 @@ Kronecker power of `[[1, 1], [1, −1]]`: the two differ in every row. `H_B` is 
 `H_B · H_B = B · I`, so `2^−k · H_B` is the orthonormal rotation ComfyUI's ConvRot applies before quantizing each
 row. `y` is an exact integer (|y| ≤ 128·B ≤ 2^23), so its conversion to f32 is exact. One way to compute it: view
 each group of `B` as `k` base-4 digits (most significant first) and apply `H₄` along every digit.
+
+### `int4.convrot`
+
+`int8.convrot` with signed 4-bit codes: comfy-kitchen's `TensorCoreConvRotW4A4Layout`, which ComfyUI stores as
+`<key>.weight` and `.weight_scale` with the marker's `convrot_groupsize` (format `convrot_w4a4`).
+- Params: `rotation: "kron_regular_h4"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
+- Parts: `weight`: `I8 [lead…, C/2]`, `C` a multiple of `B`: 4-bit codes packed as `comfy.asym_w4a8_int8`'s, each a
+  two's-complement integer (−8 … 7). `scale`: `F32` on the row grid.
+- Decode: `round_L((y[i, g, j] × scale[i]) × 2^−k)`, `y` as `int8.convrot`'s with these codes as `weight`.
+
+The marker's `quant_group_size` (64) is the activations' group and enters no decode.
 
 ### `mxfp8`
 
@@ -382,12 +410,11 @@ may be short).
 NVIDIA's NVFP4: an E2M1 element per weight, an E4M3 scale per 16 consecutive elements of a row, a global scale per
 matrix, and optionally AWQ's per-column factor.
 - Params: `block_size: 16`; `global_scale`: `multiply` or `divide`; `nibble_order`: `low_first` or `high_first`;
-  `scale_layout`: `row_major` or `cublas_128x4`; `pre_quant_scale_dtype`: `F32`, `BF16` or `F16`, present exactly
-  when the `pre_quant_scale` part is.
+  `scale_layout`: `row_major` or `cublas_128x4`.
 - Parts: `weight`: `F4`, the logical shape, `C` a multiple of 16; its bytes are 4-bit codes packed `word`-fill in `U8`
   words along the last axis, `nibble_order` being the order (`low_first` is §5's `F4` packing). `scale`: `F8_E4M3` on
   row blocks of 16, stored `scale_layout`. `scale_2`: `F32`, one element, or `M` elements, one per matrix of the
-  logical shape `[…stack, N, C]` (`M = R/N`; any shape). `pre_quant_scale` (optional): `pre_quant_scale_dtype` on the
+  logical shape `[…stack, N, C]` (`M = R/N`; any shape). `pre_quant_scale` (optional): `F32`, `BF16` or `F16` on the
   column grid. `input_scale` (optional): one element or `M`.
 - Decode, with `T` the 16 E2M1 values (§5), `g` the element of `scale_2` for row `i` (its only one, or element
   `⌊i/N⌋`) and `p` the factor `pre_quant_scale[j]`: `multiply`: `round_L(((T[q] × s(i, j)) × g) × p)`; `divide`:
@@ -414,9 +441,9 @@ export (`[E, C/2, N]`, blocks along the second-to-last axis) is not this scheme.
 
 FP8 elements and one scale per tile of each matrix (DeepSeek-V3 and later, Qwen3-FP8, Kimi-K2, MiniMax-M2, GLM-5-FP8;
 compressed-tensors' block strategy).
-- Params: `block_size: [Bᵣ, B_c]`, two positive integers (`[128, 128]` in practice); `scale_dtype`: `F32`, `BF16`,
-  `F16` or `F8_E8M0`, as the producer stored the scale.
-- Parts: `weight`: `F8_E4M3`, the logical shape. `scale`: `scale_dtype`, on tiles of `Bᵣ × B_c`.
+- Params: `block_size: [Bᵣ, B_c]`, two positive integers (`[128, 128]` in practice).
+- Parts: `weight`: `F8_E4M3`, the logical shape. `scale`: `F32`, `BF16`, `F16` or `F8_E8M0`, as the producer stored
+  it, on tiles of `Bᵣ × B_c`.
 - Decode: `round_L(weight[i, j] × s(i, j))`.
 
 The scale multiplies. DeepSeek's and transformers' `weight_scale_inv` (the inverse of the factor the weight was
@@ -577,45 +604,36 @@ LLM.int8() weights (Transformers' `load_in_8bit`), one absmax per output row.
 
 ### `comfy.asym_w4a8_int8`, `comfy.w6a8_int8`
 
-comfy-kitchen's `AsymW4A8Int8Layout` at 4 and 6 bits, as ComfyUI stores it (`<key>.weight`, `.weight_s_rel`,
-`.weight_s_channel`, `.weight_codebook`, `.weight_correction`; the marker's `group_size` and `convrot_groupsize`):
-`b`-bit codes (`b` is 4 or 6) in the rotated basis, requantized to int8 by a scale per group of `g` inputs, then
-rotated back by `kron_regular_h4` per block of `B` inputs and scaled per row.
+comfy-kitchen's `AsymW4A8Int8Layout` at 4 and 6 bits: `b`-bit codes (`b` is 4 or 6) in the rotated basis,
+requantized to int8 by a scale per group of `g` inputs, then rotated back by `kron_regular_h4` per block of `B`
+inputs and scaled per row. The split-plane packing, codebook and correction are kitchen's own, so the names stay.
+ComfyUI stores the parts as `<key>.weight`, `.weight_s_channel` (`scale`), `.weight_s_rel` (`group_scale`),
+`.weight_codebook` (`codebook`) and `.weight_correction` (`correction`), with the marker's `group_size` and
+`convrot_groupsize`.
 - Params: `group_size`: `g`, for `asym_w4a8_int8` 4, 8 or a multiple of 16, for `w6a8_int8` a multiple of 16;
-  `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
+  `rotation: "kron_regular_h4"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
 - Parts:
   - `weight`: `I8 [lead…, C·b/8]`, `C` a multiple of `B` and of `g`. A row is `C/2` bytes of unsigned 4-bit codes,
     column `j` in bits `4·(j mod 2)` of byte `⌊j/2⌋`; at 6 bits, then `C/4` bytes of each code's two high bits,
     column `j` in bits `2·(j mod 4)` of byte `C/2 + ⌊j/4⌋`.
-  - `weight_s_rel`: `F8_E4M3` or `F32` on row blocks of `g`, `row_major`.
-  - `weight_s_channel`: `F32` on the row grid.
-  - `weight_codebook` (optional, `asym_w4a8_int8` only): `F32`, 16 elements, any shape.
-  - `weight_correction` (optional, `asym_w4a8_int8` only): `F32`, `BF16` or `F16` on row blocks of `g`,
-    `transposed` (`[C/g, R]`).
+  - `group_scale`: `F8_E4M3` or `F32` on row blocks of `g`, `row_major`.
+  - `scale`: `F32` on the row grid.
+  - `codebook` (optional, `asym_w4a8_int8` only): `F32`, 16 elements, any shape.
+  - `correction` (optional, `asym_w4a8_int8` only): `F32`, `BF16` or `F16` on row blocks of `g`, `transposed`
+    (`[C/g, R]`).
 - Decode, with `y` and `k` as `int8.convrot`:
-  1. The level: `v = weight_codebook[q]`, or `q − 2^(b−1)` without a codebook.
-  2. `q8[i, j] = clamp(round(v × s_rel(i, j)), −127, 127)`, the product one f32 multiply rounded to nearest, ties to
-     even; a NaN product refuses the decode.
+  1. The level: `v = codebook[q]`, or `q − 2^(b−1)` without a codebook.
+  2. `q8[i, j] = clamp(round(v × group_scale(i, j)), −127, 127)`, the product one f32 multiply rounded to nearest,
+     ties to even; a NaN product refuses the decode.
   3. `y[i, g, ·] = q8[i, gB : gB + B] · H_B`, exact.
-  4. `value[i, gB + j] = round_L(((y[i, g, j] × s_channel[i]) + z(i, gB + j)) × 2^−k)`, with `+ z` only where there
-     is a `weight_correction`: `z(i, c) = Σ_h corr(i, h) × M_h(c)` over the groups `h` that meet `c`'s block, in
+  4. `value[i, gB + j] = round_L(((y[i, g, j] × scale[i]) + z(i, gB + j)) × 2^−k)`, with `+ z` only where there
+     is a `correction`: `z(i, c) = Σ_h corr(i, h) × M_h(c)` over the groups `h` that meet `c`'s block, in
      ascending order, summed left to right from the first term. `M_h(c)` is the exact integer sum of column
      `c mod B` of `H_B` over the rows of the block that group `h` covers.
 
 The codebook is kitchen's 16 levels (a frozen Lloyd-Max table, or one fitted to the layer); without one the grid is
-uniform. `weight_correction` is kitchen's asymmetric grid's per-group offset in the rotated basis, which the
-rotation carries back with the block.
-
-### `comfy.convrot_w4a4`
-
-comfy-kitchen's `TensorCoreConvRotW4A4Layout` (`<key>.weight`, `.weight_scale`; the marker's `convrot_groupsize`):
-`int8.convrot` with signed 4-bit codes.
-- Params: `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
-- Parts: `weight`: `I8 [lead…, C/2]`, `C` a multiple of `B`: 4-bit codes packed as `asym_w4a8_int8`'s, each a
-  two's-complement integer (−8 … 7). `weight_scale`: `F32` on the row grid.
-- Decode: `round_L((y[i, g, j] × weight_scale[i]) × 2^−k)`, `y` as `int8.convrot`'s with these codes as `weight`.
-
-The marker's `quant_group_size` (64) is the activations' group and enters no decode.
+uniform. `correction` is kitchen's asymmetric grid's per-group offset in the rotated basis, which the rotation
+carries back with the block.
 
 ### Plain tensors
 
@@ -632,28 +650,39 @@ or source-tree layout.
 ## 7. Repo, store and origin
 
 ```
-{format: "tensorfs.repo/1", name: "<org>/<name>",
- releases: [{version, tree: object-ref, yanked?, revision?}], checkpoints?: [object-ref]}
+{format: "cozytensors.repo/1", name: "<org>/<name>",
+ tags: [{name, commit: object-ref, public?, yanked?}]}
 ```
 
-- `name` is two segments. Versions MUST be non-empty and unique. Each release names a tree (§3); its variants are
-  the tree's files. Releases are listed in publication order, newest last.
-- `yanked` (boolean, default `false`) withdraws a release from unversioned lookups. `revision` (non-negative integer,
-  default 0) is the release's expected-revision counter: every change to the release increments it, and a writer
-  that changes a release conditions the change on the revision it read.
-- `checkpoints` (default empty) lists trees uploaded but not yet in any release.
-- **Resolution.** An unversioned lookup takes the newest release that is not yanked; an explicit version takes that
-  release, yanked or not (a reader MAY warn). The variant is then looked up in that release's tree. Without an
-  explicit variant, exactly one variant is selected automatically; zero gives no variant and more than one
-  requires an explicit choice. The unnamed variant has no implicit priority over other variants.
-- **Roots.** Every release's tree, yanked included, and every checkpoint are referenced roots of this repo document.
-  Keeping a complete copy of the repo requires keeping their closures. Local cache eviction policy is not part
-  of the document format.
+A repo is a set of **commits** and the **tags** that point at them, as in git:
+
+- A **commit** is an immutable repo state: a tree (§3). Its id is the tree's object ref. Every upload makes one.
+- A **tag** is a movable name for a commit. `tags` lists them in creation order: moving a tag keeps its place, a new
+  one is appended, a deleted one is removed. Names MUST be unique segments (§2) that do not start with `sha256:`.
+- `public` (boolean, default `false`): a public tag is a release, and its name MUST be a version (PEP 440). A private
+  tag is the owner's: a server serves it only to readers who may write the repo (distribution.md §4).
+- `yanked` (boolean, default `false`) withdraws a tag from unversioned lookups.
+- Any change is a new document: a writer conditions it on the whole document it read (its ETag, distribution.md §4).
+  Nothing in it counts edits.
+- **Resolution** of a `revision`, once, to a commit:
+  - none: among public, non-yanked tags, the highest final version in PEP 440 order; a pre-release (`a`, `b`,
+    `rc`, `.dev`) only when no final version exists; of equal versions (`1.0`, `1.0.0`), the later-created tag;
+  - `sha256:<hex>`: the tag commit with that digest; else a variant header with that digest, at the commit that cites
+    it (the default's if it does, else the last-created tag's whose commit does); else not found;
+  - otherwise the tag of that name, yanked or not (a reader MAY warn); else not found.
+
+  The variant is then looked up in that commit's tree. Without an explicit variant, exactly one variant is selected
+  automatically; zero gives no variant and more than one requires an explicit choice. The unnamed variant has no
+  implicit priority over other variants. A commit id and a header digest name immutable content; a tag moves,
+  and a commit no tag names is collected (below).
+- **Roots.** The tags' commits, yanked or private included, are this repo's referenced roots; nothing else is. Keeping
+  a complete copy of the repo requires keeping their closures. Local cache eviction policy is not part of the
+  document format.
 - Repo names are case-insensitive: `Acme/SDXL` and `acme/sdxl` are one repo. Keys and paths use the name with ASCII
   `A`–`Z` lowered (`refs/acme/sdxl.json`); the document's `name` keeps the writer's spelling.
 - A **store** or **static origin** is a directory, bucket or HTTP prefix holding `refs/<org>/<name>.json` and
-  `blobs/…` (§1). A reader resolves name → release → tree → variant header → chunks and assets, verifying every object
-  where it enters.
+  `blobs/…` (§1). A reader resolves name → tag → commit (tree) → variant header → chunks and assets, verifying every
+  object where it enters.
 - Reading and publishing at an endpoint over HTTP, S3 or a directory: [distribution.md](distribution.md).
 
 **Closure.** A cozytensors' closure is its header's closure (§4): the header and every object it cites, its `chunks`
@@ -711,7 +740,7 @@ wrong JSON type. Whitespace between tokens is allowed. A writer MUST produce the
 - strings with `"` and `\` escaped as `\"` and `\\`, the controls U+0008, U+0009, U+000A, U+000C and U+000D as `\b`,
   `\t`, `\n`, `\f`, `\r`, other controls below U+0020 as `\u00XX` (lowercase hex), and every other character as its
   UTF-8 bytes (Python: `json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`);
-- optional fields at their default omitted: empty `checkpoints`, `yanked: false`, `revision: 0`.
+- optional fields at their default omitted: `public: false`, `yanked: false`; `tags` is always written.
 
 ## 10. Chunks (informative)
 
@@ -741,12 +770,26 @@ construction order. A reference can be applied structurally:
 - a child the reference does not hold, or every key of a class without a reference, keeps the source's data order
   after the known children, and is reported.
 
+## 11. Logical file
+
+A `.cozytensors` file holds only its header (§4); nothing packs a checkpoint into one stored file. A checkpoint's
+**logical file** is all of its bytes as one read-only byte string, for a consumer that wants a single file. A reader
+assembles it from the objects on demand:
+
+- offset 0: the header's bytes;
+- then each object of `chunks` in order, then every component's assets (components in header order, each
+  component's in its asset map's encoded key order, §9), each object starting at the next multiple of 4096 after the
+  previous one ends; an object cited twice appears twice;
+- gaps are zero bytes, and the file ends where its last object ends.
+
+The layout depends only on the header, so every object's offset follows from it.
+
 ## Appendix A. Fixed tables
 
 A scheme's constants (rule 2). Each table is listed in row-major order with its dtype and shape; its SHA-256 is that
 of its little-endian bytes in that dtype, and a reader MAY check its copy against it.
 
-### A.1 `H₄` (`kron_regular_h4`: `int8.convrot`, `comfy.*`)
+### A.1 `H₄` (`kron_regular_h4`: `int8.convrot`, `int4.convrot`, `comfy.*`)
 
 `I8 [4, 4]`, SHA-256 `8f2b2e629d1df5e0be97981cbf4b4d117c320dfec29a7cd72b2f497dcb680cea`:
 

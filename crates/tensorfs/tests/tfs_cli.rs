@@ -121,7 +121,7 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     );
     assert_eq!(written["name"], "local/syn@1");
 
-    let inspected = ok(&a, &["inspect", "local/syn"]);
+    let inspected = ok(&a, &["inspect", "local/syn@1"]);
     assert_eq!(inspected["header"], written["header"]);
     let unet = &inspected["components"][0];
     assert_eq!(unet["name"], "unet");
@@ -136,9 +136,9 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     let k = |s: &str| format!("down_blocks.0.{s}");
     let want = [
         ("fp8.tensorwise", k("attn1.to_v.weight"), [1024, 1024], r#"{}"#),
-        ("fp8.rowwise", k("attn1.to_q.weight"), [1024, 1024], r#"{axis: 0}"#),
+        ("fp8.rowwise", k("attn1.to_q.weight"), [1024, 1024], r#"{}"#),
         ("int8.tensorwise", k("attn2.to_v.weight"), [1024, 1024], r#"{}"#),
-        ("int8.rowwise", k("attn2.to_k.weight"), [1024, 1024], r#"{axis: 0}"#),
+        ("int8.rowwise", k("attn2.to_k.weight"), [1024, 1024], r#"{}"#),
         ("int8.convrot", k("attn1.to_k.weight"), [1024, 1024], r#"{rotation: "kron_regular_h4", rotation_size: 256}"#),
         ("mxfp8", k("attn2.to_q.weight"), [1024, 1024], r#"{block_size: 32, scale_layout: "row_major"}"#),
         ("nvfp4", k("ff.net.0.proj.weight"), [1024, 4096], r#"{block_size: 16, global_scale: "multiply", nibble_order: "low_first", scale_layout: "row_major"}"#),
@@ -151,7 +151,7 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     let out = Command::new(env!("CARGO_BIN_EXE_tfs"))
         .arg("--store")
         .arg(&a)
-        .args(["inspect", "local/syn"])
+        .args(["inspect", "local/syn@1"])
         .output()
         .unwrap();
     let human = String::from_utf8(out.stdout).unwrap();
@@ -183,7 +183,7 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     let out = dir.0.join("out");
     let exported = ok(
         &a,
-        &["export", "local/syn", out.to_str().unwrap(), "--safetensors"],
+        &["export", "local/syn@1", out.to_str().unwrap(), "--safetensors"],
     );
     assert!(exported["files"]
         .as_array()
@@ -247,7 +247,7 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
         &a,
         &[
             "export",
-            "local/syn",
+            "local/syn@1",
             deq.to_str().unwrap(),
             "--safetensors",
             "--decode",
@@ -286,11 +286,11 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
 
     // Uploaded to a directory endpoint and downloaded into a second store byte-identical.
     let portable = dir.0.join("portable");
-    ok(&a, &["export", "local/syn", portable.to_str().unwrap()]);
+    ok(&a, &["export", "local/syn@1", portable.to_str().unwrap()]);
     let origin = format!("file://{}", dir.0.join("origin").display());
     let endpoint = |store: &Path, args: &[&str]| ok(store, &[&["--endpoint", origin.as_str()], args].concat());
     let uploaded = endpoint(&a, &["upload", portable.to_str().unwrap(), "acme/syn@1"]);
-    assert_eq!(uploaded["tree"], written["tree"]);
+    assert_eq!((&uploaded["commit"], &uploaded["tag"]), (&written["tree"], &serde_json::json!("1")));
     endpoint(&b, &["download", "acme/syn@1"]);
     assert_eq!(endpoint(&b, &["inspect", "acme/syn@1"])["header"], written["header"]);
     let theirs = blobs(&b);

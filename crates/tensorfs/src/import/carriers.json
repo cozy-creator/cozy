@@ -95,7 +95,7 @@
         {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3", "F8_E5M2"], "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
       ],
-      "encoding": {"scheme": "fp8.rowwise", "params": {"axis": 0}}
+      "encoding": {"scheme": "fp8.rowwise", "params": {}}
     },
     {
       "producer": "comfy",
@@ -123,7 +123,7 @@
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
       ],
-      "encoding": {"scheme": "int8.rowwise", "params": {"axis": 0}}
+      "encoding": {"scheme": "int8.rowwise", "params": {}}
     },
     {
       "producer": "comfy",
@@ -259,7 +259,7 @@
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
       ],
-      "encoding": {"scheme": "int8.rowwise", "params": {"axis": 0}}
+      "encoding": {"scheme": "int8.rowwise", "params": {}}
     },
     {
       "producer": "compressed-tensors",
@@ -268,7 +268,7 @@
         {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3"], "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
       ],
-      "encoding": {"scheme": "fp8.rowwise", "params": {"axis": 0}}
+      "encoding": {"scheme": "fp8.rowwise", "params": {}}
     },
     {
       "producer": "comfy",
@@ -276,12 +276,12 @@
       "rotated": true,
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": {"packed": 4}},
-        {"suffix": "weight_s_rel", "role": "weight_s_rel", "dtypes": ["F8_E4M3", "U8"], "as": "F8_E4M3", "shape": "groups"},
-        {"suffix": "weight_s_channel", "role": "weight_s_channel", "dtypes": ["F32"], "shape": "rows"},
-        {"suffix": "weight_codebook", "role": "weight_codebook", "dtypes": ["F32"], "shape": {"count": 16}, "optional": true},
-        {"suffix": "weight_correction", "role": "weight_correction", "dtypes": ["F32", "BF16", "F16"], "shape": "groups_transposed", "optional": true}
+        {"suffix": "weight_s_rel", "role": "group_scale", "dtypes": ["F8_E4M3", "U8"], "as": "F8_E4M3", "shape": "groups"},
+        {"suffix": "weight_s_channel", "role": "scale", "dtypes": ["F32"], "shape": "rows"},
+        {"suffix": "weight_codebook", "role": "codebook", "dtypes": ["F32"], "shape": {"count": 16}, "optional": true},
+        {"suffix": "weight_correction", "role": "correction", "dtypes": ["F32", "BF16", "F16"], "shape": "groups_transposed", "optional": true}
       ],
-      "encoding": {"scheme": "comfy.asym_w4a8_int8", "params": {}},
+      "encoding": {"scheme": "comfy.asym_w4a8_int8", "params": {"rotation": "kron_regular_h4"}},
       "marker_params": {"group_size": ["group_size", 16], "rotation_size": ["convrot_groupsize", 256]}
     },
     {
@@ -290,12 +290,12 @@
       "rotated": true,
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": {"packed": 4}},
-        {"suffix": "weight_s_rel", "role": "weight_s_rel", "dtypes": ["F32"], "shape": "groups"},
-        {"suffix": "weight_s_channel", "role": "weight_s_channel", "dtypes": ["F32"], "shape": "rows"},
-        {"suffix": "weight_codebook", "role": "weight_codebook", "dtypes": ["F32"], "shape": {"count": 16}, "optional": true},
-        {"suffix": "weight_correction", "role": "weight_correction", "dtypes": ["F32", "BF16", "F16"], "shape": "groups_transposed", "optional": true}
+        {"suffix": "weight_s_rel", "role": "group_scale", "dtypes": ["F32"], "shape": "groups"},
+        {"suffix": "weight_s_channel", "role": "scale", "dtypes": ["F32"], "shape": "rows"},
+        {"suffix": "weight_codebook", "role": "codebook", "dtypes": ["F32"], "shape": {"count": 16}, "optional": true},
+        {"suffix": "weight_correction", "role": "correction", "dtypes": ["F32", "BF16", "F16"], "shape": "groups_transposed", "optional": true}
       ],
-      "encoding": {"scheme": "comfy.asym_w4a8_int8", "params": {}},
+      "encoding": {"scheme": "comfy.asym_w4a8_int8", "params": {"rotation": "kron_regular_h4"}},
       "marker_params": {"group_size": ["group_size", 16], "rotation_size": ["convrot_groupsize", 256]}
     },
     {
@@ -304,10 +304,10 @@
       "rotated": true,
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": {"packed": 6}},
-        {"suffix": "weight_s_rel", "role": "weight_s_rel", "dtypes": ["F8_E4M3", "U8"], "as": "F8_E4M3", "shape": "groups"},
-        {"suffix": "weight_s_channel", "role": "weight_s_channel", "dtypes": ["F32"], "shape": "rows"}
+        {"suffix": "weight_s_rel", "role": "group_scale", "dtypes": ["F8_E4M3", "U8"], "as": "F8_E4M3", "shape": "groups"},
+        {"suffix": "weight_s_channel", "role": "scale", "dtypes": ["F32"], "shape": "rows"}
       ],
-      "encoding": {"scheme": "comfy.w6a8_int8", "params": {}},
+      "encoding": {"scheme": "comfy.w6a8_int8", "params": {"rotation": "kron_regular_h4"}},
       "marker_params": {"group_size": ["group_size", 16], "rotation_size": ["convrot_groupsize", 256]}
     },
     {
@@ -316,10 +316,10 @@
       "rotated": true,
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": {"packed": 6}},
-        {"suffix": "weight_s_rel", "role": "weight_s_rel", "dtypes": ["F32"], "shape": "groups"},
-        {"suffix": "weight_s_channel", "role": "weight_s_channel", "dtypes": ["F32"], "shape": "rows"}
+        {"suffix": "weight_s_rel", "role": "group_scale", "dtypes": ["F32"], "shape": "groups"},
+        {"suffix": "weight_s_channel", "role": "scale", "dtypes": ["F32"], "shape": "rows"}
       ],
-      "encoding": {"scheme": "comfy.w6a8_int8", "params": {}},
+      "encoding": {"scheme": "comfy.w6a8_int8", "params": {"rotation": "kron_regular_h4"}},
       "marker_params": {"group_size": ["group_size", 16], "rotation_size": ["convrot_groupsize", 256]}
     },
     {
@@ -328,9 +328,9 @@
       "rotated": true,
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": {"packed": 4}},
-        {"suffix": "weight_scale", "role": "weight_scale", "dtypes": ["F32"], "shape": "rows"}
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32"], "shape": "rows"}
       ],
-      "encoding": {"scheme": "comfy.convrot_w4a4", "params": {}},
+      "encoding": {"scheme": "int4.convrot", "params": {"rotation": "kron_regular_h4"}},
       "marker_params": {"rotation_size": ["convrot_groupsize", 256]},
       "marker_values": {"quant_group_size": 64}
     }

@@ -21,7 +21,7 @@ def main() -> None:
     tensorfs.configure(cache_dir=work / "store")
     weight = array("f", [1.5, -2.0])
     with tensorfs.Writer(work / "model.cozytensors") as writer:
-        component = writer.component("model", cls="example.Model", config={"width": 2})
+        component = writer.component("model", cls=("example", "1.0", "Model"), config={"width": 2})
         component.put("weight", weight, dtype="F32", shape=[2])
         component.asset("vocab.txt", b"one\ntwo\n")
     saved = writer.commit()
@@ -30,7 +30,16 @@ def main() -> None:
     model = checkpoint.components["model"]
     value = model.tensors.read("weight")
     assert checkpoint.id == saved.id, (checkpoint.id, saved.id)
-    assert (model.cls, model.config) == ("example.Model", {"width": 2}), (model.cls, model.config)
+    assert (tuple(model.cls), model.config) == (("example", "1.0", "Model"), {"width": 2}), (model.cls, model.config)
+    assert model.cls == tensorfs.ClassRef("example", "1.0", "Model") and model.cls.name == "Model"
+    assert repr(model.cls) == "ClassRef('example', '1.0', 'Model')"
+    assert {model.cls: 1}[tensorfs.ClassRef("example", "1.0", "Model")] == 1, "hashed and equal by value"
+    try:
+        tensorfs.Writer(work / "bad.cozytensors").component("m", cls=("", "1.0", "M"), config={})
+    except tensorfs.InvalidError:
+        pass
+    else:
+        raise AssertionError("a class with a version but no library was written")
     assert (value.dtype, value.shape, value.tobytes()) == ("F32", (2,), weight.tobytes()), value
     assert model.asset("vocab.txt") == b"one\ntwo\n"
 

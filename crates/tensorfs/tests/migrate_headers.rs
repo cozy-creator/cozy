@@ -167,10 +167,9 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
 
     // A release of lanes is one tree, yanked or not.
     let tiny = &repos["acme/tiny"];
-    let releases: Vec<(&str, bool)> = tiny.releases.iter().map(|r| (r.version.as_str(), r.yanked)).collect();
-    assert_eq!(releases, [("0.9.0", true), ("1.0.0", false), ("1.1.0", false)]);
-    assert!(tiny.checkpoints.is_empty(), "every old checkpoint is in a release");
-    let (tree, headers) = variants(&tiny.releases[1].tree);
+    let releases: Vec<(&str, bool, bool)> = tiny.tags.iter().map(|t| (t.name.as_str(), t.public, t.yanked)).collect();
+    assert_eq!(releases, [("0.9.0", true, true), ("1.0.0", true, false), ("1.1.0", true, false)], "every old checkpoint is in a release");
+    let (tree, headers) = variants(&tiny.tags[1].commit);
     assert_eq!(headers.keys().collect::<Vec<_>>(), ["ft", "full"]);
     let full = same(&fixture, &store, FULL, &headers["full"], &tree);
     let ft = same(&fixture, &store, FT, &headers["ft"], &tree);
@@ -186,7 +185,7 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
         .collect();
     assert_eq!(files, expect);
     assert_eq!(ft.pipeline(), full.pipeline());
-    assert_eq!(ft.pipeline().unwrap().class, "diffusers.StableDiffusionXLPipeline");
+    assert_eq!(ft.pipeline().unwrap().class.name, "StableDiffusionXLPipeline");
     for name in ["tokenizer", "tokenizer_2", "scheduler", "unet"] {
         assert_eq!(ft.component(name), full.component(name), "{name}");
     }
@@ -195,7 +194,7 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     assert!(full.metadata.contains_key("safetensors_metadata"));
 
     // 1.1.0's lanes disagree on README.md: the first lane's stays, and the report says so.
-    let (tree, _) = variants(&tiny.releases[2].tree);
+    let (tree, _) = variants(&tiny.tags[2].commit);
     assert_eq!(tree.files["README.md"], full_files["README.md"]);
     let conflicts = report["repos"].as_array().unwrap().iter().find(|r| r["model"] == "acme/tiny").unwrap()["releases"][2]["conflicts"].clone();
     assert_eq!(conflicts[0]["path"], "README.md");
@@ -203,8 +202,8 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
 
     // An unreleased checkpoint is a tree of its own; the root component takes the filled file.
     let gpt2 = &repos["acme/gpt2"];
-    assert!(gpt2.releases.is_empty());
-    let (tree, headers) = variants(&gpt2.checkpoints[0]);
+    assert!(gpt2.tags.len() == 1 && !gpt2.tags[0].public, "a private tag");
+    let (tree, headers) = variants(&gpt2.tags[0].commit);
     assert_eq!(headers.keys().collect::<Vec<_>>(), [""]);
     let (gpt2_files, _) = manifest(&fixture, GPT2_FULL);
     let h = Header::from_cbor(&store.read(&headers[""]).unwrap()).unwrap();
@@ -214,13 +213,13 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
 
     // local/ models: their own lanes, no upstream, the old pinned source kept.
     let local = &repos["local/tiny-sdxl"];
-    assert_eq!(local.releases[0].version, "1");
-    let (tree, headers) = variants(&local.releases[0].tree);
+    assert_eq!(local.tags[0].name, "1");
+    let (tree, headers) = variants(&local.tags[0].commit);
     let h = same(&fixture, &store, FULL, &headers["f32"], &tree);
     assert_eq!(h.metadata.get("source"), Some(&Value::Str(SDXL.into())));
     assert_eq!(filled(&h), None);
     let local = &repos["local/tiny-gpt2"];
-    let (tree, headers) = variants(&local.releases[0].tree);
+    let (tree, headers) = variants(&local.tags[0].commit);
     let h = same(&fixture, &store, GPT2_FULL, &headers["f32"], &tree);
     assert_eq!(h.component("model").unwrap().config["model_type"], "gpt2");
 
@@ -262,7 +261,7 @@ fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
     let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
-    let tree = Tree::from_json(&read(&migrated.repo.releases[0].tree)).unwrap();
+    let tree = Tree::from_json(&read(&migrated.repo.tags[0].commit)).unwrap();
     let header = Header::from_cbor(&read(tree.variant(Some("full")).unwrap().1)).unwrap();
     assert_eq!(header.component("tokenizer").unwrap().assets["vocab.json"], expected);
     assert_eq!(filled(&header).unwrap().1, BTreeSet::from([missing.to_owned(), "unet/config.json".to_owned()]));
@@ -307,7 +306,7 @@ fn migrate_lane(dir: &Path, name: &str, files: BTreeMap<String, ObjectRef>) -> (
     let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
     let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
-    let tree = Tree::from_json(&read(&migrated.repo.releases[0].tree)).unwrap();
+    let tree = Tree::from_json(&read(&migrated.repo.tags[0].commit)).unwrap();
     let header = Header::from_cbor(&read(tree.variant(Some("lane")).unwrap().1)).unwrap();
     (header, tree, migrated.report["releases"][0]["lanes"]["lane"].clone())
 }
@@ -359,7 +358,7 @@ fn a_component_config_wrapper_becomes_its_files_and_records_its_source() {
         let (name, _) = path.split_once('/').unwrap();
         assert_eq!(h.component(name).unwrap().config, parse(&blob(&dir, &full[path].sha256)), "{path}");
     }
-    assert_eq!(h.pipeline().unwrap().class, "diffusers.StableDiffusionXLPipeline");
+    assert_eq!(h.pipeline().unwrap().class.name, "StableDiffusionXLPipeline");
     assert_eq!(tree.files["processor/tokenizer.json"], ObjectRef::of(&vocab));
     assert_eq!(tree.files["processor/chat_template.jinja"], ObjectRef::of(b"{{ x }}"));
     assert!(!tree.files.contains_key("config.json"));
@@ -426,7 +425,7 @@ fn checkpoints_differing_only_in_dropped_metadata_become_one_tree() {
     let doc = serde_json::to_vec(&json!({"name": "acme/gpt2", "releases": [], "checkpoints": manifests})).unwrap();
     let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
-    assert_eq!(migrated.repo.checkpoints.len(), 1);
+    assert_eq!(migrated.repo.tags.len(), 1);
     assert_eq!(migrated.report["checkpoints"].as_array().unwrap().len(), 2);
     std::fs::remove_dir_all(dir).unwrap();
 }

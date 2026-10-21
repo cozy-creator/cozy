@@ -133,8 +133,8 @@ fn encoders_refuse_what_kitchen_refuses() {
         Encoding::comfy_asym_w4a8_int8(32, 16),
         Encoding::comfy_asym_w4a8_int8(12, 16),
         Encoding::comfy_w6a8_int8(16, 16),
-        Encoding::comfy_convrot_w4a4(16),
-        Encoding::comfy_convrot_w4a4(8),
+        Encoding::int4_convrot(16),
+        Encoding::int4_convrot(8),
     ] {
         let input = Input {
             dtype: &Dtype::BF16,
@@ -176,7 +176,7 @@ fn encodings() -> [Encoding; 3] {
     [
         Encoding::comfy_asym_w4a8_int8(16, 256),
         Encoding::comfy_w6a8_int8(16, 256),
-        Encoding::comfy_convrot_w4a4(256),
+        Encoding::int4_convrot(256),
     ]
 }
 
@@ -226,7 +226,7 @@ fn public_kitchen_dispatch_refuses_unknown_schemes_and_params() {
     }
     // This is the unchanged corpus's w4a4-quant-group-size refusal: an import-only marker,
     // never an Encoding param.
-    let mut encoding = Encoding::comfy_convrot_w4a4(256);
+    let mut encoding = Encoding::int4_convrot(256);
     encoding
         .params
         .insert("quant_group_size".into(), 64u64.into());
@@ -253,7 +253,7 @@ fn w6_cannot_emit_the_four_bit_correction_role() {
     let parts = with_values(&Dtype::F32, &shape, &encoding, &bytes, &Kitchen::default()).unwrap();
     assert_eq!(
         parts.iter().map(|p| p.role.as_str()).collect::<Vec<_>>(),
-        ["weight", "weight_s_rel", "weight_s_channel"]
+        ["weight", "group_scale", "scale"]
     );
     let options = Kitchen {
         symmetric: false,

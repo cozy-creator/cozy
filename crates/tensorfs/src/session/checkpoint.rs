@@ -474,7 +474,7 @@ impl Component {
     pub fn name(&self) -> &str {
         &self.name
     }
-    pub fn class(&self) -> &str {
+    pub fn cls(&self) -> &format::ClassRef {
         &self.metadata().class
     }
     pub fn config(&self) -> &format::Config {

@@ -1,1 +1,1 @@
-{"format":"cozytensors.repo/1","name":"Conformance/fp8","releases":[{"tree":{"length":256,"sha256":"339297065efbf08dd65f3630ac3e77b076a3520325798181ef4ac666b02ca256"},"version":"1"}]}
+{"format":"cozytensors.repo/1","name":"Conformance/fp8","tags":[{"commit":{"length":256,"sha256":"dda2e78f33f7499e32fe9c0422727342fde23efada26aa26f991b143aaaaae88"},"name":"1","public":true}]}

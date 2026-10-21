@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 use tensorfs::format::layout::{self, Item};
 use tensorfs::format::{
-    repo_key, Body, Component, Config, Dtype, Encoding, Error, Header, Location, ObjectRef, Part,
-    Pipeline, Release, Repo, Tensor, Tree, HEADER_FORMAT,
+    newest, newest_by, repo_key, Body, ClassRef, Component, Config, Dtype, Encoding, Error, Header,
+    Location, ObjectRef, Part, Pipeline, Repo, Resolution, Tag, Tensor, Tree, HEADER_FORMAT,
 };
 
 #[derive(Deserialize)]
@@ -178,15 +178,11 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
 
     // Variant "spans" (core): one plain tensor at offset 4096 of chunk 0, continuing through
     // chunk 2; release 2 swaps the variants and is yanked, so unversioned lookups land on 1.
+    let release = |name: &str, commit, yanked| Tag { name: name.into(), commit, public: true, yanked };
     let Some(span) = cases.iter().find(|c| c.lane == "spans") else {
         let repo = Repo {
             name: repo_name(family),
-            releases: vec![Release {
-                version: "1".into(),
-                tree: tree(&mut put, &[("all", &variants["all"])]),
-                yanked: false,
-            }],
-            checkpoints: vec![],
+            tags: vec![release("1", tree(&mut put, &[("all", &variants["all"])]), false)],
         };
         files.insert(repo.key(), repo.to_json().unwrap());
         return;
@@ -218,16 +214,10 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
     let (all, spans) = (&variants["all"], &variants["spans"]);
     let first = tree(&mut put, &[("all", all), ("spans", spans)]);
     let swapped = tree(&mut put, &[("all", spans), ("spans", all)]);
-    let checkpoints = vec![tree(&mut put, &[("spans", spans)])];
-    let release = |version: &str, tree, yanked| Release {
-        version: version.into(),
-        tree,
-        yanked,
-    };
+    let main = Tag { name: "main".into(), commit: tree(&mut put, &[("spans", spans)]), public: false, yanked: false };
     let repo = Repo {
         name: repo_name(family),
-        releases: vec![release("1", first, false), release("2", swapped, true)],
-        checkpoints,
+        tags: vec![release("1", first, false), release("2", swapped, true), main],
     };
     files.insert(repo.key(), repo.to_json().unwrap());
 }
@@ -297,14 +287,18 @@ fn reader_decodes_every_case() {
         assert_eq!(repo_key(&name), format!("refs/conformance/{family}.json"));
         let repo = Repo::from_json(&fs::read(root.join(repo_key(&name))).unwrap()).unwrap();
         assert_eq!(repo.name, name);
-        let tree = |version| Tree::from_json(&blob(&root, &repo.release(version).unwrap().tree)).unwrap();
+        let tree = |revision| {
+            let Some(Resolution::Tag(tag)) = repo.resolve(revision) else { panic!("{revision:?}") };
+            Tree::from_json(&blob(&root, &tag.commit)).unwrap()
+        };
         if family == "core" {
-            assert_eq!(repo.release(None).unwrap().version, "1", "release 2 is yanked");
+            assert_eq!(repo.default_tag().unwrap().name, "1", "release 2 is yanked");
             assert_eq!(
                 tree(Some("2")).header("all"),
                 tree(None).header("spans"),
                 "an explicit version still resolves"
             );
+            assert_eq!(tree(Some("main")).variants().count(), 1, "a private tag");
             assert_eq!(repo.roots().count(), 3);
         }
         for c in cases {
@@ -325,6 +319,56 @@ fn reader_decodes_every_case() {
         }
     }
     assert!(checked >= 80, "{checked}");
+}
+
+#[derive(Deserialize)]
+struct Resolutions {
+    repo: Json,
+    trees: Vec<Json>,
+    cases: Vec<ResolveCase>,
+    defaults: Vec<DefaultCase>,
+}
+
+#[derive(Deserialize)]
+struct DefaultCase {
+    why: String,
+    repo: Json,
+    default: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResolveCase {
+    why: String,
+    revision: Option<String>,
+    commit: Option<ObjectRef>,
+    variant: Option<String>,
+}
+
+/// `vectors/resolve.json`: each revision resolves once, to its commit (and for a header, the
+/// variant naming it), reading a candidate's tree only for a header digest.
+#[test]
+fn revisions_resolve_to_commits() {
+    let doc: Resolutions = serde_json::from_slice(&fs::read(vectors().join("resolve.json")).unwrap()).unwrap();
+    let repo = Repo::from_json(&serde_json::to_vec(&doc.repo).unwrap()).unwrap();
+    let trees: BTreeMap<ObjectRef, Tree> = (doc.trees.iter())
+        .map(|t| {
+            let tree = Tree::from_json(&serde_json::to_vec(t).unwrap()).unwrap();
+            (ObjectRef::of(&tree.to_json().unwrap()), tree)
+        })
+        .collect();
+    for case in doc.defaults {
+        let repo = Repo::from_json(&serde_json::to_vec(&case.repo).unwrap()).unwrap();
+        assert_eq!(newest(&repo.tags).map(|t| &t.name), case.default.as_ref(), "{}", case.why);
+        assert_eq!(repo.default_tag(), newest(&repo.tags));
+        // The string core over plain rows, filtered by the caller.
+        let rows = repo.tags.iter().filter(|t| t.public && !t.yanked).map(|t| t.name.clone());
+        assert_eq!(newest_by(rows, |v| v.as_str()).as_ref(), case.default.as_ref(), "{}", case.why);
+    }
+    for case in doc.cases {
+        let found = repo.resolve(case.revision.as_deref()).map(|r| r.find(|c| Ok::<_, ()>(trees[c].clone())).unwrap());
+        let got = found.flatten().map(|(tag, variant)| (tag.commit.clone(), variant));
+        assert_eq!(got, case.commit.map(|c| (c, case.variant)), "{}", case.why);
+    }
 }
 
 /// Real prebuilt execution, not a mock driver or a Triton runtime. Run only on an allocated
@@ -369,6 +413,10 @@ fn from_projection(p: &Json) -> (Header, bool) {
     let list = |v: &Json| v.as_array().unwrap().clone();
     let uint = |v: &Json| v.as_u64().unwrap();
     let text = |v: &Json| v.as_str().unwrap().to_owned();
+    let class = |v: &Json| match list(v).as_slice() {
+        [library, version, name] => ClassRef { library: text(library), version: text(version), name: text(name) },
+        _ => panic!("a class is [library, version, name]"),
+    };
     let config = |v: &Json| serde_json::from_value::<Config>(v.clone()).unwrap();
     let root = list(p);
     let mut later = root.len() > 6 || root[0] != HEADER_FORMAT;
@@ -392,7 +440,7 @@ fn from_projection(p: &Json) -> (Header, bool) {
     let pipeline = list(&root[3]);
     later |= pipeline.len() > 2;
     let pipeline = (!pipeline.is_empty()).then(|| Pipeline {
-        class: text(&pipeline[0]),
+        class: class(&pipeline[0]),
         config: config(&pipeline[1]),
     });
     let mut encodings = Vec::new();
@@ -455,7 +503,7 @@ fn from_projection(p: &Json) -> (Header, bool) {
         }
         Component {
             name: text(&c[0]),
-            class: text(&c[1]),
+            class: class(&c[1]),
             config: config(&c[2]),
             tensors,
             assets,

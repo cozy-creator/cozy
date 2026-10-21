@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::failure::{fail, Failure, Kind, Result};
-use crate::format::{Config, Dtype, Encoding, ObjectRef, Tree, Value};
+use crate::format::{ClassRef, Config, Dtype, Encoding, ObjectRef, Tree, Value};
 use crate::store::Store;
 use crate::writer::{self as native, Data, Source};
 
@@ -25,6 +25,8 @@ pub struct WriterOptions<'a> {
     pub base: Option<&'a Checkpoint>,
     pub resume: Option<&'a str>,
     pub repo_id: Option<&'a str>,
+    /// The tag a `repo_id` commit moves (none: `main`).
+    pub revision: Option<&'a str>,
     pub endpoint: Option<&'a str>,
     pub token: Option<Arc<dyn TokenProvider>>,
 }
@@ -76,11 +78,15 @@ impl Client {
                 "a Writer names a header file or an endpoint repository",
             );
         }
-        if options.variant.is_some() && options.repo_id.is_none() {
+        if (options.variant.is_some() || options.revision.is_some()) && options.repo_id.is_none() {
             return fail(
                 Kind::Invalid,
-                "variant names model.<variant>.cozytensors in a repo_id upload; it needs repo_id",
+                "variant and revision name a commit of a repo_id upload; they need repo_id",
             );
+        }
+        let tag = options.revision.unwrap_or(crate::fetch::MAIN);
+        if !crate::format::tag_name(tag) {
+            return fail(Kind::Invalid, format!("{tag:?} is not a tag name"));
         }
         let variant = options.variant.unwrap_or("").to_owned();
         crate::format::check_file(&crate::format::variant_path(&variant))?;
@@ -131,7 +137,7 @@ impl Client {
             })?;
             let stream = Arc::new(crate::fetch::Stream::new(endpoint.inner, runtime));
             store
-                .streaming_writer_resumable(stream, repo_id, &variant, base, options.resume)
+                .streaming_writer_resumable(stream, repo_id, tag, &variant, base, options.resume)
                 .map_err(from_writer)?
         } else {
             store.writer(base, options.resume).map_err(from_writer)?
@@ -244,7 +250,7 @@ impl Writer {
         }
     }
 
-    pub fn pipeline(&mut self, class: &str, config: Config) -> Result<()> {
+    pub fn pipeline(&mut self, class: ClassRef, config: Config) -> Result<()> {
         self.with(|raw| {
             raw.pipeline(class, config);
             Ok(())
@@ -255,7 +261,7 @@ impl Writer {
     pub fn component(
         &mut self,
         name: &str,
-        class: &str,
+        class: ClassRef,
         config: Config,
         config_file: Option<&str>,
     ) -> Result<ComponentWriter<'_>> {

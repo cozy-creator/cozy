@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tensorfs::format::ClassRef;
 use tensorfs::format::{Dtype, ObjectRef, Repo};
 use tensorfs::{
     Client, Config, Download, Endpoint, Failure, Format, Kind, Open, Request, TokenProvider,
@@ -194,7 +195,7 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
     .unwrap();
     let mut writer = producer.writer(WriterOptions::default()).unwrap();
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut &WEIGHT[..])
         .unwrap();
@@ -206,6 +207,16 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
         .unwrap();
     let tree = producer
         .upload_folder(&"acme/provider@1".parse().unwrap(), &folder, None)
+        .await
+        .unwrap();
+    // Release 1: the default an unversioned open resolves.
+    Endpoint::new(origin.to_str().unwrap(), None)
+        .unwrap()
+        .update_repo("acme/provider", |old| {
+            let mut repo = old.unwrap();
+            repo.tag_mut("1").unwrap().public = true;
+            Ok(Some(repo))
+        })
         .await
         .unwrap();
     let http = Http::new(origin);
@@ -235,7 +246,7 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
         &fs::read(cache.join("refs/acme/provider.json")).expect("first open did not cache a repo"),
     )
     .unwrap();
-    assert_eq!(repo.release(None).unwrap().tree, tree);
+    assert_eq!(repo.default_tag().unwrap().commit, tree);
     drop(warm);
 
     // Independent ordinary anonymous read proves the endpoint is still healthy. This does

@@ -40,10 +40,13 @@ async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef) -> Result<(Strin
         }
         ModelRef::Hub { repo, release, lane } => {
             let card = hub_answer(client.get_model(&repo.org, &repo.name).await)?;
-            let found = card.releases.iter().find(|r| match release {
-                Some(want) => &r.release == want,
-                None => r.yanked != Some(true) && r.yanked_at.as_deref().is_none_or(str::is_empty),
-            });
+            let found = match release {
+                Some(want) => card.releases.iter().find(|r| &r.release == want),
+                None => {
+                    let live = card.releases.iter().filter(|r| r.yanked != Some(true) && r.yanked_at.as_deref().is_none_or(str::is_empty));
+                    tensorfs::format::newest_by(live, |r| r.release.as_str())
+                }
+            };
             let found = found.ok_or_else(|| {
                 Error::new(Kind::NotFound, "model_release_not_found", format!("{repo} has no release {}", release.as_deref().unwrap_or("available")))
                     .next(format!("cozy model info {repo}"))
@@ -123,23 +126,22 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
     if !ctx.json && run.status == Status::Completed {
         match written_checkpoint(&run, lane) {
             Some(WrittenCheckpoint::Reference(reference)) => {
-                let mut record = Record::new().field(
-                    "checkpoint",
-                    format!("{}@{}", reference.repo_id, reference.revision),
-                );
+                let (model, tree) = (&reference.repo_id, &reference.revision);
+                let mut record = Record::new().field("checkpoint", format!("{model}@{tree}"));
                 if !reference.variant.is_empty() {
                     record = record.field("variant", &reference.variant);
                 }
                 record.print(ctx);
+                // The release it was made from moves to the commit that adds its variant.
+                let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
+                let release = pinned.filter(|_| destination == repo).unwrap_or("<version>");
+                output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tree}")]);
             }
             Some(WrittenCheckpoint::Header(header)) => {
                 Record::new().field("checkpoint header", header).print(ctx);
             }
             Some(WrittenCheckpoint::Legacy(digest)) => {
-                let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
-                let release = pinned.filter(|_| destination == repo).unwrap_or("<release>");
                 Record::new().field("checkpoint", format!("{destination}#{digest}")).print(ctx);
-                output::next(ctx, &[&format!("cozy model publish {destination} --release {release} --lane {lane}={digest}")]);
             }
             None => {}
         }

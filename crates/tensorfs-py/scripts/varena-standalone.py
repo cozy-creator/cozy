@@ -74,7 +74,7 @@ def main() -> int:
     torch.manual_seed(0)
     plain = UNet2DConditionModel(**CONFIG).eval()
     w = tensorfs.Writer(cache_dir=Path(tempfile.mkdtemp(prefix="varena-standalone-")) / "store")
-    unet = w.component("unet", cls="diffusers.UNet2DConditionModel", config=CONFIG)
+    unet = w.component("unet", cls=("diffusers", "0.35.1", "UNet2DConditionModel"), config=CONFIG)
     for key, t in plain.state_dict().items():
         t = t.detach().contiguous()
         unet.put(key, t.view(torch.uint8).numpy().tobytes(), dtype="F32", shape=list(t.shape))

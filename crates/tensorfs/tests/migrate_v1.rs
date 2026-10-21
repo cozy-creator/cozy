@@ -98,8 +98,8 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
         let report = &done.report["checkpoints"][0];
         assert_eq!(report["old"], lane.manifest.id().as_str());
         let repo = Repo::from_json(&fs::read(root.join(format!("refs/{}.json", lane.name))).unwrap()).unwrap();
-        assert_eq!(repo.checkpoints.len(), 1);
-        trees.insert(lane.name.clone(), (repo.checkpoints[0].clone(), report.clone()));
+        assert_eq!(repo.tags.len(), 1);
+        trees.insert(lane.name.clone(), (repo.tags[0].commit.clone(), report.clone()));
     }
 
     let uploaded: BTreeSet<String> = blobs(&root).difference(&held).cloned().collect();
@@ -169,7 +169,7 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
         let source = ck.metadata().get("source").cloned();
         if lane.name == "paul/d1-gate5-sdxl-b" {
             assert_eq!(source, Some(Value::Str(UPSTREAMS[0].from.into())));
-            assert_eq!(ck.pipeline().unwrap().class, "diffusers.StableDiffusionXLPipeline");
+            assert_eq!(ck.pipeline().unwrap().class.name, "StableDiffusionXLPipeline");
             assert!(ck.component("tokenizer").is_ok() && ck.component("tokenizer_2").is_ok());
         } else {
             assert_eq!(source, Some(Value::Str(UNKNOWN.into())), "{}", lane.name);

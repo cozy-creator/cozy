@@ -12,7 +12,7 @@ pub enum Kind {
     Invalid,
     /// Another document kind or major version.
     Format,
-    /// No such ref, release, lane, component, tensor, file or object.
+    /// No such ref, revision, component, tensor, file or object.
     NotFound,
     /// Bytes that do not match their digest or length.
     Integrity,
@@ -88,7 +88,7 @@ impl From<Refusal> for Failure {
         use Code::*;
         let kind = match r.code {
             UNKNOWN_FORMAT | STORE_ERA => Kind::Format,
-            OBJECT_ABSENT | REF_NOT_FOUND | RELEASE_ABSENT | REPOSITORY_ABSENT
+            OBJECT_ABSENT | REF_NOT_FOUND | REVISION_ABSENT | REPOSITORY_ABSENT
             | CHECKPOINT_ABSENT | MISSING_TENSOR | MISSING_COMPONENT | STORE_ROOT_ABSENT
             | ROOT_ABSENT => Kind::NotFound,
             OBJECT_ID_MISMATCH

@@ -20,7 +20,7 @@ use serde_json::{json, Value as Json};
 
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
-use crate::format::{Component, Config, Header, Metadata, ObjectRef, Release, Repo, Tensor, Tree, Value, HEADER_PATH};
+use crate::format::{Component, Config, Header, Metadata, ObjectRef, Repo, Tag, Tensor, Tree, Value, HEADER_PATH};
 use crate::import::{layout, remote};
 use crate::store::Store;
 
@@ -240,7 +240,7 @@ impl<'t> Migrator<'t> {
         for r in &old.releases {
             let named = match (&r.tree, &r.lanes) {
                 (Some(tree), _) => {
-                    releases.push(Release { version: r.version.clone(), tree: tree.clone(), yanked: r.yanked });
+                    releases.push(release(&r.version, tree.clone(), r.yanked));
                     continue;
                 }
                 (None, Some(named)) => named,
@@ -263,8 +263,8 @@ impl<'t> Migrator<'t> {
                 }
                 report.insert(name.clone(), lane.report.clone());
             }
-            let release = Release { version: r.version.clone(), tree: put(&mut objects, &tree)?, yanked: r.yanked };
-            reports.push(json!({"version": release.version, "tree": release.tree.id(), "yanked": release.yanked,
+            let release = release(&r.version, put(&mut objects, &tree)?, r.yanked);
+            reports.push(json!({"version": release.name, "tree": release.commit.id(), "yanked": release.yanked,
                 "lanes": report, "conflicts": conflicts}));
             releases.push(release);
         }
@@ -286,7 +286,9 @@ impl<'t> Migrator<'t> {
                 checkpoints.push(at);
             }
         }
-        let repo = Repo { name: old.name.clone(), releases, checkpoints };
+        // An unreleased checkpoint keeps a private tag, its commit's hex, or it would be collected.
+        let private = checkpoints.into_iter().map(|c| Tag { name: c.sha256.clone(), commit: c, public: false, yanked: false });
+        let repo = Repo { name: old.name.clone(), tags: releases.into_iter().chain(private).collect() };
         let report = json!({"model": old.name, "upstream": upstream.map(|u| u.from), "releases": reports, "checkpoints": unreleased});
         Ok(Migrated { repo, objects, report })
     }
@@ -340,7 +342,7 @@ impl<'t> Migrator<'t> {
             }
         }
         let tensored: Vec<String> = tensors.iter().map(|(name, _)| name.clone()).collect();
-        let l = layout(bytes.clone(), &tensored)?;
+        let l = layout(bytes.clone(), &tensored, &Default::default())?;
         let mut keep = |b: Vec<u8>| add(objects, b);
         let components = (l.components.into_iter())
             .map(|f| Component {
@@ -660,4 +662,9 @@ pub fn store(root: &Path, migrator: &mut Migrator) -> Result<Json> {
         }
     }
     Ok(json!({"store": root, "repos": repos, "pins_dropped": dropped}))
+}
+
+/// An old release: a public tag named by its version.
+fn release(version: &str, commit: ObjectRef, yanked: bool) -> Tag {
+    Tag { name: version.to_owned(), commit, public: true, yanked }
 }

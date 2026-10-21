@@ -13,6 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tensorfs::format::ClassRef;
 use tensorfs::format::{self, Body, Dtype, Header, Location, ObjectRef, Tensor};
 use tensorfs::{
     bearer, Client, Config, Endpoint, Failure, Download, Kind, Open, Ref, Request, Selection,
@@ -81,7 +82,7 @@ fn fixture(root: &Path) -> Fixture {
         vec![
             format::Component {
                 name: "model".into(),
-                class: "test.Tiny".into(),
+                class: ClassRef::new("test", "1.0", "Tiny"),
                 config: serde_json::from_str("{\"width\":16,\"eps\":0.001,\"activation\":null}")
                     .unwrap(),
                 tensors: vec![Tensor {
@@ -514,16 +515,24 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
         b"local fixture, no downloaded model\n"
     );
 
+    // A tag moves, so naming one reads the repo document; a digest names immutable content.
+    let before = http.count();
+    let tagged = client
+        .open("account/model@1", &Open::default())
+        .await
+        .unwrap();
+    assert_eq!(http.count(), before + 1, "a tag costs one read of the refs");
+    drop(tagged);
     let before = http.count();
     let warm = client
-        .open("account/model@1", &Open::default())
+        .open(&format!("account/model@{}", data.header.id()), &Open::default())
         .await
         .unwrap();
     warm.download(&Download::default()).await.unwrap();
     assert_eq!(
         http.count(),
         before,
-        "warm explicit revision contacted the origin"
+        "a warm header digest contacted the origin"
     );
     assert!(http
         .requests
@@ -562,6 +571,17 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     }
 }
 
+/// Makes tag `tag` of `repo_id` at `url` public: a release.
+async fn publish(url: &str, repo_id: &str, tag: &str) {
+    let endpoint = Endpoint::new(url, None).unwrap();
+    let published = endpoint.update_repo(repo_id, |old| {
+        let mut repo = old.unwrap();
+        repo.tag_mut(tag).unwrap().public = true;
+        Ok(Some(repo))
+    });
+    published.await.unwrap();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects() {
     let scratch = Scratch::new();
@@ -577,6 +597,7 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
         .await
         .unwrap();
     drop(producer);
+    publish(&format!("file://{}", mirror.display()), "account/model", "1").await;
     let http = Http::new(mirror.clone());
     let thin = scratch.0.join("thin");
     fs::create_dir_all(thin.join("chunks")).unwrap();
@@ -857,7 +878,7 @@ async fn supplied_provider_error_and_local_unreleased_semantics_are_public() {
     )
     .unwrap();
     let repo = local.repo("local/unreleased").await.unwrap().unwrap().0;
-    assert!(repo.releases.is_empty() && repo.checkpoints == [tree.clone()]);
+    assert!(repo.tags.len() == 1 && repo.tag("main").is_some_and(|t| t.commit == tree && !t.public), "a private main");
     assert_eq!(
         client
             .open("local/unreleased", &Open::default())
@@ -900,7 +921,7 @@ async fn public_names_match_the_generic_format_with_unicode_reserved_characters_
             .await
             .unwrap();
         let (repo, _) = endpoint.repo(name).await.unwrap().unwrap();
-        assert_eq!(repo.release(Some("1")).unwrap().tree, tree);
+        assert_eq!(repo.tag("1").unwrap().commit, tree);
         let checkpoint = client
             .open(
                 name,
@@ -952,9 +973,9 @@ async fn public_names_match_the_generic_format_with_unicode_reserved_characters_
             .unwrap()
             .unwrap()
             .0
-            .release(Some("1"))
+            .tag("1")
             .unwrap()
-            .tree,
+            .commit,
         tree
     );
 }

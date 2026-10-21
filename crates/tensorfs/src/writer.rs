@@ -21,7 +21,7 @@
 //!   rename: a folder without the header is unfinished. Objects its base's store holds are
 //!   referenced, not copied (a thin folder).
 //! - A streaming writer sends each object to an endpoint as it seals it ([`Stream`]) and, at
-//!   commit, the header and a tree of it, which becomes an unreleased checkpoint of its repo.
+//!   commit, the header and a tree of it, a commit of its repo that a tag moves to.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -37,8 +37,8 @@ use crate::err;
 use crate::fetch::Stream;
 use crate::format::layout::{self, GRID, STANDALONE};
 use crate::format::{
-    self, variant_path, Body, Component, Config, Dtype, Encoding, Header, Metadata, ObjectRef,
-    Part, Pipeline, Tensor, Value, CHUNKS_DIR, CONFIG_FILE,
+    self, variant_path, Body, ClassRef, Component, Config, Dtype, Encoding, Header, Metadata,
+    ObjectRef, Part, Pipeline, Tensor, Value, CHUNKS_DIR, CONFIG_FILE,
 };
 use crate::import;
 use crate::store::retention::{self, Hold};
@@ -168,7 +168,7 @@ enum Line {
 #[derive(Clone, Debug, Default)]
 struct Spec {
     name: String,
-    class: String,
+    class: ClassRef,
     config: Config,
     config_file: Option<String>,
 }
@@ -184,11 +184,13 @@ enum Dest {
         variant: String,
         cache: Option<Store>,
     },
-    /// Objects sent as they seal; at commit the header and tree, a checkpoint of repo `name`.
+    /// Objects sent as they seal; at commit the header and tree, a commit of repo `name` that
+    /// tag `tag` moves to.
     Endpoint {
         store: Store,
         stream: Arc<Stream>,
         name: String,
+        tag: String,
         variant: String,
     },
 }
@@ -249,18 +251,21 @@ impl Store {
         Writer::open(Dest::Store(self.clone()), writers.join(name), key, base)
     }
 
-    /// A writer of `variant` whose objects go to `stream` as they seal and whose commit adds a
-    /// tree of it (with its repo files) to repo `name`'s checkpoints there. The local checkpoint
-    /// commits first and remains available when the upload fails.
-    pub fn streaming_writer(&self, stream: Arc<Stream>, name: &str, variant: &str, base: Option<&Checkpoint>) -> Result<Writer> {
-        self.streaming_writer_resumable(stream, name, variant, base, None)
+    /// A writer of `variant` whose objects go to `stream` as they seal and whose commit makes a
+    /// tree of it (with its repo files) a commit of repo `name` there, moving tag `tag` to it.
+    /// The local checkpoint commits first and remains available when the upload fails.
+    pub fn streaming_writer(&self, stream: Arc<Stream>, name: &str, tag: &str, variant: &str, base: Option<&Checkpoint>) -> Result<Writer> {
+        self.streaming_writer_resumable(stream, name, tag, variant, base, None)
     }
 
-    pub(crate) fn streaming_writer_resumable(&self, stream: Arc<Stream>, name: &str, variant: &str, base: Option<&Checkpoint>, key: Option<&str>) -> Result<Writer> {
+    pub(crate) fn streaming_writer_resumable(&self, stream: Arc<Stream>, name: &str, tag: &str, variant: &str, base: Option<&Checkpoint>, key: Option<&str>) -> Result<Writer> {
         format::check_file(&variant_path(variant))?;
+        if !format::tag_name(tag) {
+            return Err(bad(format!("{tag:?} is not a tag name")));
+        }
         // Reuse the existing keyed journal, kernel fence, replay and retention machinery.
         let mut writer = self.writer(base, key)?;
-        writer.dest = Dest::Endpoint { store: self.clone(), stream, name: name.to_owned(), variant: variant.to_owned() };
+        writer.dest = Dest::Endpoint { store: self.clone(), stream, name: name.to_owned(), tag: tag.to_owned(), variant: variant.to_owned() };
         Ok(writer)
     }
 
@@ -382,12 +387,10 @@ impl Writer {
         Ok(writer)
     }
 
-    /// What `model_index.json` held: the pipeline's class (`diffusers.<Class>`) and config.
-    pub fn pipeline(&mut self, class: &str, config: Config) {
-        self.pipeline = Some(Pipeline {
-            class: class.to_owned(),
-            config,
-        });
+    /// What `model_index.json` held: the pipeline's class and config.
+    pub fn pipeline(&mut self, class: ClassRef, config: Config) {
+        unversioned("the pipeline", &class);
+        self.pipeline = Some(Pipeline { class, config });
     }
 
     /// Declares component `name` (again: its class and config change, its tensors stay) and
@@ -395,13 +398,15 @@ impl Writer {
     pub fn component(
         &mut self,
         name: &str,
-        class: &str,
+        class: ClassRef,
         config: Config,
         config_file: Option<&str>,
     ) -> Result<ComponentWriter<'_>> {
         if !segment(name) {
             return Err(bad(format!("component name {name:?} is not one plain path segment")));
         }
+        class.check(name)?;
+        unversioned(name, &class);
         let config_file = match config_file {
             Some(file) => (file != CONFIG_FILE).then(|| file.to_owned()),
             None => match self.specs.iter().find(|spec| spec.name == name) {
@@ -413,7 +418,7 @@ impl Writer {
         };
         let spec = Spec {
             name: name.to_owned(),
-            class: class.to_owned(),
+            class,
             config,
             config_file,
         };
@@ -602,11 +607,11 @@ impl Writer {
                 durable::replace(&at, &header, 0o644).map_err(|e| fail("write", &at)(e.into()))?;
                 ObjectRef::of(&header)
             }
-            Dest::Endpoint { store, stream, name, variant } => {
+            Dest::Endpoint { store, stream, name, tag, variant } => {
                 let id = self.admit_header(store, &header)?;
                 store.used(&id.sha256, std::iter::once(&id).chain(&objects).chain(self.repo.values()))?;
                 self.committed = Some(id.clone());
-                self.published = Some(stream.commit(name, variant, header, &self.repo).map_err(sent)?);
+                self.published = Some(stream.commit(name, tag, variant, header, &self.repo).map_err(sent)?);
                 id
             }
         };
@@ -1461,6 +1466,14 @@ fn asset_name(component: &str, name: &str) -> Result<()> {
         return Err(bad(format!("{component:?}/{name:?} cannot name an asset")));
     }
     Ok(())
+}
+
+/// A known library without a version leaves the class's state_dict contract open: warned, kept.
+fn unversioned(what: &str, class: &ClassRef) {
+    if !class.is_unknown() && class.version.is_empty() {
+        let (library, name) = (&class.library, &class.name);
+        tracing::warn!("{what}: class {library} {name} records no {library} version");
+    }
 }
 
 fn bad(detail: impl Into<String>) -> Error {

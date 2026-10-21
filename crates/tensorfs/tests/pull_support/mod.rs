@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tensorfs::format::ClassRef;
 use tensorfs::fetch::{Client, SourcePolicy};
 use tensorfs::format::{
     Body, Component, Dtype, Header, Location, ObjectRef, Repo, Tensor, Tree,
@@ -173,7 +174,7 @@ pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u
     let vocab = put(origin, &noise(seed + 7, 3000));
     parsed.push(Component {
         name: "tokenizer".into(),
-        class: "transformers.CLIPTokenizer".into(),
+        class: ClassRef::new("transformers", "4.57.0", "CLIPTokenizer"),
         assets: [("vocab.json".to_string(), vocab.clone())].into(),
         ..Default::default()
     });
@@ -184,7 +185,8 @@ pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u
     tree.set_variant("int8", header_ref.clone());
     let tree_ref = put(origin, &tree.to_json().unwrap());
     let mut repo = Repo::new(name);
-    repo.set_release("1.0", tree_ref.clone());
+    repo.set_tag("1.0", tree_ref.clone());
+    repo.tags[0].public = true;
     let path = origin.join(repo.key());
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, repo.to_json().unwrap()).unwrap();

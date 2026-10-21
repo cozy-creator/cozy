@@ -35,7 +35,7 @@ def allocation(ptr):
 tmp = tempfile.TemporaryDirectory()
 try:
     writer = tensorfs.Writer(cache_dir=Path(tmp.name) / "store")
-    component = writer.component("model", cls="test.Model", config={})
+    component = writer.component("model", cls=("test", "1.0", "Model"), config={})
     plain = np.arange(12, dtype=np.float32).reshape(3, 4)
     component.put("plain", plain)
     component.put("empty", b"", dtype="U8", shape=[0])
@@ -44,7 +44,7 @@ try:
         "quantized", dtype="F32", shape=[2, 16], scheme="fp8.rowwise",
         parts={"weight": ("F8_E4M3", [2, 16], bytes([0x38]) * 32),
                "scale": ("F32", [2], np.array([0.5, 2.0], dtype=np.float32))},
-        params={"axis": 0},
+        params={},
     )
     ck = writer.commit()
     tensors = ck.components["model"].tensors

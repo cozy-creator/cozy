@@ -20,6 +20,7 @@ use tensorfs::{
 };
 
 pub(crate) use crate::errors::raise;
+use crate::classref::{class, PyClassRef};
 use crate::tensors::{PyEncoded, PyTensors};
 
 pub(crate) fn invalid(py: Python<'_>, detail: impl Into<String>) -> PyErr {
@@ -424,10 +425,10 @@ impl Drop for CheckpointAccess {
     }
 }
 
-/// What `model_index.json` held: `cls` (`diffusers.<Class>`) and `config`.
+/// What `model_index.json` held: `cls` and `config`.
 #[pyclass(name = "Pipeline", module = "tensorfs", frozen, get_all)]
 pub struct PyPipeline {
-    cls: String,
+    cls: Py<PyClassRef>,
     config: Py<PyDict>,
 }
 
@@ -436,9 +437,8 @@ pub struct PyPipeline {
 pub struct PyComponent {
     #[pyo3(get)]
     name: String,
-    /// `<library>.<Class>`, `""` when unknown.
     #[pyo3(get)]
-    cls: String,
+    cls: Py<PyClassRef>,
     #[pyo3(get)]
     config: Py<PyDict>,
     /// The file name `config` exports as: `config.json` unless the writer named another.
@@ -817,7 +817,7 @@ impl PyCheckpoint {
         (self.header.pipeline())
             .map(|p| {
                 Ok(PyPipeline {
-                    cls: p.class.clone(),
+                    cls: Py::new(py, PyClassRef::from(&p.class))?,
                     config: config_dict(py, &p.config)?.unbind(),
                 })
             })
@@ -846,7 +846,7 @@ impl PyCheckpoint {
             }
             let component = PyComponent {
                 name: c.name.clone(),
-                cls: c.class.clone(),
+                cls: Py::new(py, PyClassRef::from(&c.class))?,
                 config: config_dict(py, &c.config)?.unbind(),
                 config_file: c.config_name().to_owned(),
                 tensors: Py::new(
@@ -1722,7 +1722,7 @@ impl Drop for PyWriter {
 #[pymethods]
 impl PyWriter {
     #[new]
-    #[pyo3(signature = (dest = None, *, variant = None, base = None, resume = None, cache_dir = None, repo_id = None, endpoint = None, token = None, ca_der = None))]
+    #[pyo3(signature = (dest = None, *, variant = None, base = None, resume = None, cache_dir = None, repo_id = None, revision = None, endpoint = None, token = None, ca_der = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1732,6 +1732,7 @@ impl PyWriter {
         resume: Option<String>,
         cache_dir: Option<PathBuf>,
         repo_id: Option<String>,
+        revision: Option<String>,
         endpoint: Option<String>,
         token: Option<&Bound<'_, PyAny>>,
         ca_der: Option<Vec<u8>>,
@@ -1747,6 +1748,7 @@ impl PyWriter {
                     base: base.as_ref(),
                     resume: resume.as_deref(),
                     repo_id: repo_id.as_deref(),
+                    revision: revision.as_deref(),
                     ..WriterOptions::default()
                 };
                 block_on(async { client.writer(options) })
@@ -1757,20 +1759,21 @@ impl PyWriter {
         })
     }
 
-    fn pipeline(&self, py: Python<'_>, cls: String, config: &Bound<'_, PyDict>) -> PyResult<()> {
-        let config = config_map(config)?;
-        self.with(py, |writer| writer.pipeline(&cls, config))
+    fn pipeline(&self, py: Python<'_>, cls: &Bound<'_, PyAny>, config: &Bound<'_, PyDict>) -> PyResult<()> {
+        let (cls, config) = (class(cls)?, config_map(config)?);
+        self.with(py, |writer| writer.pipeline(cls, config))
     }
 
-    #[pyo3(signature = (name, cls = "", config = None, config_file = None))]
+    #[pyo3(signature = (name, cls = None, config = None, config_file = None))]
     fn component(
         slf: &Bound<'_, Self>,
         name: String,
-        cls: &str,
+        cls: Option<&Bound<'_, PyAny>>,
         config: Option<&Bound<'_, PyDict>>,
         config_file: Option<&str>,
     ) -> PyResult<PyComponentWriter> {
         let py = slf.py();
+        let cls = cls.map(class).transpose()?.unwrap_or_default();
         let config = config.map(config_map).transpose()?.unwrap_or_default();
         slf.get()
             .with(py, |writer| writer.component(&name, cls, config, config_file).map(drop))?;
@@ -2072,6 +2075,7 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCheckpoint>()?;
     m.add_class::<crate::file::PyCheckpointFile>()?;
     m.add_class::<PyPipeline>()?;
+    m.add_class::<PyClassRef>()?;
     m.add_class::<PyComponent>()?;
     m.add_class::<PyComponentWriter>()?;
     m.add_class::<PyTensorMetadata>()?;
