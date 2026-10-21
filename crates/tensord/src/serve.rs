@@ -83,10 +83,8 @@ fn run(lifetime: Lifetime, service_ready: Option<u64>) -> io::Result<()> {
             tracing::warn!("{error}");
         }
     }
-    let paths = update::Paths::new(&grant.layout.engine(), &grant.layout.root);
-    update::retire_agent(&paths);
     #[cfg(unix)]
-    let ready = supervise::supervise(&paths, grant.provider.clone())?;
+    let ready = supervise::supervise(&update::Paths::new(&grant.layout.engine(), &grant.layout.root), grant.provider.clone())?;
     config.gpu_memory_limit = config::gpu_memory_limit()?;
     run_machine(config, ready)
 }

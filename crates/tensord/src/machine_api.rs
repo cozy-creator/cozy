@@ -726,8 +726,7 @@ impl MachineBackend for NativeBackend {
                 }
             }
             let sent = STANDARD.decode(&kept.item).map_err(corrupt)?;
-            // A member kept before the cohort (protobuf) is not reported; the next set replaces it.
-            let Ok(mut item) = serde_json::from_slice::<v1::WarmItem>(&sent) else { continue };
+            let mut item: v1::WarmItem = serde_json::from_slice(&sent).map_err(corrupt)?;
             (item.holds, item.held_back) = (level.name().into(), held_back.into());
             items.push(item);
             last = Some((kept.item, level));
