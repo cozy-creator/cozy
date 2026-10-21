@@ -32,7 +32,7 @@ fn main() {
     }
     let filter: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
     type Case = (&'static str, fn(&Path));
-    let cases: [Case; 11] = [
+    let cases: [Case; 13] = [
         ("an_idle_holder_answers_an_ask", an_idle_holder_answers_an_ask),
         ("a_killed_holder_leaves_orphans_a_successor_imports", a_killed_holder_leaves_orphans_a_successor_imports),
         ("a_failed_request_frees_everything", a_failed_request_frees_everything),
@@ -44,6 +44,8 @@ fn main() {
         ("binds_outlive_the_custody_holder", binds_outlive_the_custody_holder),
         ("a_table_with_live_rows_outlives_tensord", a_table_with_live_rows_outlives_tensord),
         ("a_stale_reader_never_frees_a_newer_row", a_stale_reader_never_frees_a_newer_row),
+        ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
+        ("a_joint_step_runs_a_pass_per_set", a_joint_step_runs_a_pass_per_set),
     ];
     let dir = tempfile::tempdir().unwrap();
     let mut failed = vec![];
@@ -191,6 +193,19 @@ fn agent() {
                 }
                 Err(e) => format!("err {}", e.code()),
             },
+            ["passas", req, set, shape, name] => match requests[*req].pass(sets[*set].0, shape, Torch::default()) {
+                Ok(p) => {
+                    passes.insert(name.to_string(), p);
+                    "ok".into()
+                }
+                Err(e) => format!("err {}", e.code()),
+            },
+            ["endpassas", name, peak] => {
+                if let Some(p) = passes.remove(*name) {
+                    p.end(Measured { allocated_peak: peak.parse().unwrap(), ..Measured::default() }, Torch::default());
+                }
+                "ok".into()
+            }
             ["endpass", req] => {
                 if let Some(p) = passes.remove(*req) {
                     p.end(Measured::default(), Torch::default());
@@ -589,26 +604,26 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     unsafe { libc::read(std::os::fd::AsRawFd::as_raw_fd(ledger.events()), drained.as_mut_ptr().cast(), 8) };
     b.ok("request r vb");
     let pid = a.child.id() as i32;
-    // SAFETY: a signal to our own child.
-    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    assert!(ledger.stalled().is_empty(), "a running or sleeping ask thread is never stalled");
+    let mut status = 0;
+    // SAFETY: a signal to our own child, then waiting until it has stopped.
+    unsafe {
+        libc::kill(pid, libc::SIGSTOP);
+        libc::waitpid(pid, &mut status, libc::WUNTRACED);
+    }
+    assert_eq!(ledger.stalled(), vec![pid as u32], "its ask thread is stopped: measured, not counted");
     b.send("pass r vb 1x1");
-    // TensorD's events thread looks at each ledger event; the ask rang one. Across its looks
-    // the victim's ask thread never ran.
+    // The ask is a ledger event: wait for it, until the stopped victim's row is asked.
     let fd = std::os::fd::AsRawFd::as_raw_fd(ledger.events());
-    let stalled = loop {
+    while !ledger.status().rows.iter().any(|r| r.pid == pid as u32 && r.asked > 0) {
         let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
         let mut event = [0u8; 8];
         // SAFETY: one live descriptor waited on with no timeout, then its counter read.
         unsafe {
-            assert_eq!(libc::poll(&mut poll, 1, -1), 1);
+            libc::poll(&mut poll, 1, -1);
             libc::read(fd, event.as_mut_ptr().cast(), 8);
         }
-        let looks: Vec<Vec<u32>> = (0..3).map(|_| ledger.stalled()).collect();
-        if let Some(s) = looks.into_iter().last().filter(|s| !s.is_empty()) {
-            break s;
-        }
-    };
-    assert_eq!(stalled, vec![pid as u32]);
+    }
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     assert_eq!(b.reply(), "ok", "the asker went on when the victim died");
@@ -677,4 +692,65 @@ fn a_stale_reader_never_frees_a_newer_row(dir: &Path) {
     ledger.reap(pid);
     assert!(ledger.status().rows.iter().any(|r| r.pid == pid && r.live), "the new row survived stale reaps");
     b.exit();
+}
+
+/// Under an injected pressure event, a layout an executor maps and has page-locked is asked
+/// back from it first (it unpins and unmaps it), then punched out: its bytes really return
+/// before the next layout is touched. The executor goes on from the store.
+fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
+    use std::os::fd::FromRawFd;
+    let g = gpu("pinned", 64 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
+    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
+    let signal = event.try_clone().unwrap();
+    let tier = varena::Tier::serve(varena::Pressure::Events(event)).unwrap().expect("this namespace's tier");
+    let (p1, p2) = (write_set(dir, "p1", 2), write_set(dir, "p2", 2));
+    let digest = |n: &str| format!("layout-{n}-{}", g.uuid);
+    let mut y = Agent::spawn();
+    y.ok(&format!("open {} {}", g.uuid, g.memory));
+    y.ok(&format!("load p1 {} stored ram", p1.display()));
+    y.ok(&format!("load p2 {} stored ram", p2.display()));
+    // A device page filled from the tier: the region is mapped and page-locked in y.
+    assert_eq!(y.ok("exact p1 0"), "true");
+    let resident = |d: &str| tier.resident().into_iter().find(|(k, _)| k == d).map_or(0, |(_, b)| b);
+    // Each layout's file: its ready words' page and its two regions.
+    assert!(resident(&digest("p1")) >= 4 * MB && resident(&digest("p2")) >= 4 * MB);
+    // SAFETY: an 8-byte write to our eventfd.
+    unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
+    tier.await_releases(1);
+    assert!(resident(&digest("p1")) < REGION_ALIGN, "the pinned layout's regions returned: {}", resident(&digest("p1")));
+    assert!(resident(&digest("p2")) >= 4 * MB, "the next one is untouched");
+    assert!(tier.acked() >= 4 * MB, "y unpinned and unmapped it when asked: {}", tier.acked());
+    assert_eq!(y.ok("exact p1 1"), "true", "y goes on from the store");
+    y.ok("unpin");
+    y.exit();
+}
+
+/// A joint step ({a, b}): each set runs its own pass; interleaved binds land in their own
+/// passes, and each pass's peak is recorded under its own set.
+fn a_joint_step_runs_a_pass_per_set(dir: &Path) {
+    let g = gpu("joint", 32 * MB);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let (ja, jb) = (write_set(dir, "ja", 2), write_set(dir, "jb", 2));
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {} {}", g.uuid, g.memory));
+    a.ok(&format!("load ja {} stored ram", ja.display()));
+    a.ok(&format!("load jb {} stored ram", jb.display()));
+    a.ok("request r ja,jb");
+    a.ok("passas r ja 1x1 ja");
+    a.ok("passas r jb 1x1 jb");
+    for (set, block) in [("ja", 0), ("jb", 0), ("ja", 1), ("jb", 1)] {
+        assert_eq!(a.ok(&format!("exact {set} {block}")), "true");
+    }
+    let trace = a.ok("trace r");
+    assert_eq!(trace.split(',').count(), 4, "every bind is the request's: {trace}");
+    a.ok("unpin");
+    a.ok(&format!("endpassas ja {}", 3 * MB));
+    a.ok(&format!("endpassas jb {}", 5 * MB));
+    a.ok("end r");
+    a.exit();
+    let peaks = ledger.peaks();
+    let peak = |set: &str| peaks.iter().find(|p| p.key.starts_with(&format!("{set}|"))).map(|p| p.bytes);
+    assert_eq!((peak("ja"), peak("jb")), (Some(3 * MB), Some(5 * MB)), "{peaks:?}");
 }

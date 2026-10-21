@@ -131,6 +131,12 @@ mod imp {
         Ok(platform::shm::punch(fd.as_fd(), offset, len)?)
     }
 
+    /// The bytes a file really holds (its allocated blocks).
+    pub(crate) fn allocated(fd: &Owned) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fd.try_clone().ok().and_then(|f| std::fs::File::from(f).metadata().ok()).map_or(0, |m| m.blocks() * 512)
+    }
+
     pub(crate) fn memfd(name: &str) -> Result<Owned> {
         Ok(platform::shm::memfd_named(name)?)
     }
@@ -249,6 +255,22 @@ mod imp {
         h.try_clone().map_err(|e| Error::io("dup", e))
     }
 
+    /// The calling thread's id.
+    pub(crate) fn tid() -> u32 {
+        // SAFETY: gettid has no arguments and cannot fail.
+        unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+    }
+
+    /// Thread `tid` of `pid` cannot run: it is stopped, or its process is a zombie. A thread
+    /// or process that is gone is not stalled (its row reads dead).
+    pub(crate) fn stalled(pid: u32, tid: u32) -> bool {
+        // The state follows the parenthesised name, which may itself hold spaces and ')'.
+        let state = |path: String| std::fs::read_to_string(path).ok().and_then(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string)));
+        let process = state(format!("/proc/{pid}/stat"));
+        let thread = state(format!("/proc/{pid}/task/{tid}/stat"));
+        process.as_deref() == Some("Z") || matches!(thread.as_deref(), Some("T" | "t"))
+    }
+
     pub(crate) fn unlink(name: &str) {
         // SAFETY: geteuid reads a process attribute.
         let uid = unsafe { libc::geteuid() };
@@ -311,6 +333,9 @@ mod imp {
     pub(crate) fn punch(_: &Owned, _: u64, _: u64) -> Result<()> {
         Err(later())
     }
+    pub(crate) fn allocated(_: &Owned) -> u64 {
+        0
+    }
     pub(crate) fn memfd(_: &str) -> Result<Owned> {
         Err(later())
     }
@@ -341,6 +366,12 @@ mod imp {
     }
     pub(crate) fn dup(_: &Owned) -> Result<Owned> {
         Err(later())
+    }
+    pub(crate) fn tid() -> u32 {
+        0
+    }
+    pub(crate) fn stalled(_: u32, _: u32) -> bool {
+        false
     }
     pub(crate) fn unlink(_: &str) {}
 }

@@ -59,10 +59,8 @@ struct Header {
 struct RowRec {
     word: AtomicU64,
     pid: AtomicU32,
-    _pad: u32,
-    /// Asks rung at it, and asks its thread answered: TensorD's `stalled` compares them.
-    rung: AtomicU64,
-    ran: AtomicU64,
+    /// Its ask thread's id: TensorD's `stalled` reads that thread's state.
+    tid: AtomicU32,
     /// Bytes asked of it and not yet answered (display).
     asked: AtomicU64,
     /// Kept pages no live process maps (the custody service's row).
@@ -154,8 +152,7 @@ pub(crate) struct RowView {
     pub facts: Facts,
     pub orphans: u64,
     pub asked: u64,
-    pub rung: u64,
-    pub ran: u64,
+    pub tid: u32,
 }
 
 impl RowView {
@@ -164,11 +161,13 @@ impl RowView {
     }
 }
 
+/// What a row's ask thread is asked.
 #[derive(Debug, Serialize, Deserialize)]
-struct Ask {
-    /// Class::N or Class::D, as its index.
-    ceiling: usize,
-    bytes: u64,
+pub(crate) enum Ask {
+    /// Device bytes under a ceiling (Class::N or Class::D, as its index).
+    Room { ceiling: usize, bytes: u64 },
+    /// The RAM tier gives back a host layout: unpin and unmap it.
+    Host { digest: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -397,7 +396,8 @@ impl Shared {
         let (at, ready) = self.alloc(ROW_CELLS, ROW, |m, at| {
             if let Some(r) = row(m, at) {
                 r.pid.store(pid, Relaxed);
-                [&r.rung, &r.ran, &r.asked, &r.orphans, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
+                r.tid.store(0, Relaxed);
+                [&r.asked, &r.orphans, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
                 r.latch.iter().flatten().for_each(|a| a.store(0, Relaxed));
             }
         })?;
@@ -419,8 +419,7 @@ impl Shared {
             }
             let r = row(m, at)?;
             let facts = Facts::of(latch_read(&r.seq, &r.latch));
-            let (rung, ran) = (r.rung.load(Acquire), r.ran.load(Acquire));
-            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), asked: r.asked.load(Acquire), rung, ran })
+            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), asked: r.asked.load(Acquire), tid: r.tid.load(Acquire) })
         })?;
         views
             .into_iter()
@@ -455,13 +454,12 @@ impl Shared {
         if state(w) != READY || kind(w) != ROW || row_id(at, w) != id {
             return Ok(0);
         }
-        r.rung.fetch_add(1, AcqRel);
         r.asked.fetch_add(bytes, AcqRel);
         if let Some(e) = &self.events {
             os::signal(e);
         }
         let freed = match os::connect(&ask_name(&self.name, id))? {
-            Some(stream) => os::call::<_, Answer>(&stream, &Ask { ceiling: ceiling.index(), bytes }, None).map_or(0, |(a, _)| a.freed),
+            Some(stream) => os::call::<_, Answer>(&stream, &Ask::Room { ceiling: ceiling.index(), bytes }, None).map_or(0, |(a, _)| a.freed),
             None => 0,
         };
         r.asked.fetch_sub(bytes, AcqRel);
@@ -533,6 +531,15 @@ fn ask_name(gpu: &str, id: u64) -> String {
     format!("ask-{gpu}-{id}")
 }
 
+/// Asks the row whose ask socket is `name` to give back host layout `digest`; returns the bytes
+/// it unpinned and unmapped. Its reply or its death ends the wait.
+pub(crate) fn release_host(name: &str, digest: &str) -> u64 {
+    match os::connect(name) {
+        Ok(Some(stream)) => os::call::<_, Answer>(&stream, &Ask::Host { digest: digest.into() }, None).map_or(0, |(a, _)| a.freed),
+        _ => 0,
+    }
+}
+
 /// One process's row. Dropping it publishes zeros, closes its asks and frees it; a killed
 /// process's row reads dead until reaped.
 pub(crate) struct Row {
@@ -573,7 +580,18 @@ impl Row {
 
     /// Binds this row's ask socket: its owner's ask thread serves it.
     pub fn listen(&self) -> Result<Listener> {
-        os::listen(&ask_name(&self.shared.name, self.id()))?.ok_or_else(|| Error::Internal("a row's ask socket is taken".into()))
+        os::listen(&self.ask_name())?.ok_or_else(|| Error::Internal("a row's ask socket is taken".into()))
+    }
+
+    /// Its ask socket's name, for services that ask it (the RAM tier).
+    pub fn ask_name(&self) -> String {
+        ask_name(&self.shared.name, self.id())
+    }
+
+    /// The calling thread is this row's ask thread.
+    pub fn ask_thread(&self) {
+        let tid = os::tid();
+        self.rec(|r| r.tid.store(tid, Release));
     }
 
     /// Wakes an ask thread blocked in its accept (to stop it).
@@ -581,13 +599,10 @@ impl Row {
         let _ = os::connect(&ask_name(&self.shared.name, self.id()));
     }
 
-    /// Serves one asker: reads its ask and replies with what `answer(ceiling, bytes)` freed.
-    pub fn serve(&self, stream: &os::Stream, answer: impl FnOnce(Class, u64) -> u64) -> Result<()> {
+    /// Serves one asker: reads its ask and replies with what `answer` freed.
+    pub fn serve(&self, stream: &os::Stream, answer: impl FnOnce(Ask) -> u64) -> Result<()> {
         let Some((bytes, _)) = os::recv(stream)? else { return Ok(()) };
-        let ask: Ask = os::decode(&bytes)?;
-        let ceiling = if ask.ceiling >= Class::D.index() { Class::D } else { Class::N };
-        let freed = answer(ceiling, ask.bytes);
-        self.rec(|r| r.ran.fetch_add(1, AcqRel));
+        let freed = answer(os::decode(&bytes)?);
         os::send(stream, &(os::encode(&Answer { freed })?, None))?;
         self.shared.ring();
         Ok(())
@@ -774,8 +789,6 @@ pub struct Ledger {
     shared: Arc<Shared>,
     events: Owned,
     custody: custody::Client,
-    /// `stalled`'s previous look at each row with unanswered asks: (ran, looks).
-    looks: Mutex<HashMap<u64, (u64, u32)>>,
 }
 
 impl Ledger {
@@ -789,7 +802,7 @@ impl Ledger {
         let shared = Arc::new(Shared::adopt(table, gpu, capacity, Some(os::dup(&events)?))?);
         shared.reap(None)?;
         let custody = custody::Client::open(&shared)?;
-        Ok(Ledger { shared, events, custody, looks: Mutex::new(HashMap::new()) })
+        Ok(Ledger { shared, events, custody })
     }
 
     /// The machine's sharing mode (shared until TensorD says dedicated).
@@ -920,26 +933,12 @@ impl Ledger {
         }
     }
 
-    /// Executors whose ask thread answered nothing across three of TensorD's looks while asks
-    /// stayed unanswered (two ledger events with no answer): TensorD ends them. Only TensorD's
-    /// events thread calls it, once per ledger event; its memory of looks is its own.
+    /// Executors whose ask thread cannot answer, by its measured state: stopped (`T`, `t`) or
+    /// its process a zombie. A running or sleeping thread is never stalled; nothing is counted
+    /// or timed. Off Linux nothing is reported. TensorD ends what it returns.
     pub fn stalled(&self) -> Vec<u32> {
         let rows = self.shared.rows().unwrap_or_default();
-        let mut looks = self.looks.lock();
-        let mut next = HashMap::new();
-        let mut stalled = vec![];
-        for r in rows.iter().filter(|r| r.live && r.rung > r.ran) {
-            let seen = match looks.get(&r.id()) {
-                Some((ran, n)) if *ran == r.ran => n + 1,
-                _ => 1,
-            };
-            if seen >= 3 {
-                stalled.push(r.pid);
-            }
-            next.insert(r.id(), (r.ran, seen));
-        }
-        *looks = next;
-        stalled
+        rows.iter().filter(|r| r.tid != 0 && os::stalled(r.pid, r.tid)).map(|r| r.pid).collect()
     }
 
     /// Readable when room frees, a row dies or a peak is recorded; reading it clears it.

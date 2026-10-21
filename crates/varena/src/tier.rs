@@ -1,10 +1,12 @@
 //! The machine's RAM tier: one host layout per layout digest, a ready word per region, mapped
-//! read-only by executors, held by whichever participant binds the machine's tier name
-//! (TensorD when present). An executor fills a region it misses through `io::read` under the
-//! region's write lock, and copies from a ready region under its read lock, so a region in
-//! flight is locked. Under pressure (an event, or a headroom check before a fill) the tier
-//! gives back, one layout per rung: orphaned layouts (least recently used), then layouts with
-//! no declared use, then the furthest declared; never a region in flight.
+//! read-only (and page-locked, region by region) by executors, held by whichever participant
+//! binds the machine's tier name (TensorD when present). An executor fills a region it misses
+//! through `io::read` under the region's write lock, and copies from a ready region under its
+//! read lock, so a region in flight is locked. Under pressure (an event, or a headroom check
+//! before a fill) [`host_decide`] picks what goes: orphaned layouts (least recently used), then
+//! layouts with no declared use, then the furthest declared; never a region in flight. Each
+//! executor mapping a chosen layout is asked first, through its row's ask thread, to unpin and
+//! unmap it, so the pages really return when the tier punches them out.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering::{Acquire, Release};
@@ -15,6 +17,7 @@ use parking_lot::{Condvar, Mutex};
 use platform::handles::Owned;
 use serde::{Deserialize, Serialize};
 
+use crate::ledger;
 use crate::os::{self, Map, Stream};
 use crate::{Error, Result};
 
@@ -32,8 +35,8 @@ const NAME: &str = "tier";
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Call {
-    /// Regions as (offset, span) in the layout.
-    Open { digest: String, regions: Vec<(u64, u64)> },
+    /// Regions as (offset, span) in the layout; `ask` names the opener's ask socket.
+    Open { digest: String, regions: Vec<(u64, u64)>, ask: String },
     /// This process's next use of the layout, in steps; `None`: no declared use.
     Use { digest: String, distance: Option<u32> },
     Close { digest: String },
@@ -54,8 +57,8 @@ struct Layout {
     words: Map,
     regions: Vec<(u64, u64)>,
     data: u64,
-    /// Connection → its declared distance.
-    users: HashMap<u64, Option<u32>>,
+    /// Connection → its declared distance and its ask socket.
+    users: HashMap<u64, (Option<u32>, String)>,
     used: u64,
 }
 
@@ -84,7 +87,7 @@ impl Layout {
                 (*span, ready, in_flight)
             })
             .collect();
-        HostLayout { digest: digest.to_string(), regions, users: self.users.values().copied().collect(), used: self.used }
+        HostLayout { digest: digest.to_string(), regions, users: self.users.values().map(|(d, _)| *d).collect(), used: self.used }
     }
 
     /// Gives back region `r` unless a copy took it meanwhile.
@@ -176,32 +179,61 @@ struct State {
     layouts: HashMap<String, Layout>,
     clock: u64,
     releases: u64,
+    /// Bytes executors reported unpinned and unmapped when asked.
+    acked: u64,
 }
 
-impl State {
-    /// Applies the host decision for `trigger`; returns the bytes given back.
-    fn relieve(&mut self, trigger: HostTrigger) -> u64 {
-        let facts: Vec<HostLayout> = self.layouts.iter().map(|(d, l)| l.facts(d)).collect();
+/// Applies the host decision for `trigger`: the users of each chosen layout unpin and unmap it
+/// first (the lock released while they answer: a reply, or their death), then its regions are
+/// punched out. Returns the bytes given back.
+fn relieve(state: &(Mutex<State>, Condvar), trigger: HostTrigger) -> u64 {
+    let (lock, cv) = state;
+    let (actions, asks) = {
+        let s = lock.lock();
+        let facts: Vec<HostLayout> = s.layouts.iter().map(|(d, l)| l.facts(d)).collect();
         let actions = host_decide(&facts, trigger);
-        let mut gave = 0;
-        for a in actions {
-            match a {
-                HostAction::Release { digest, region } => gave += self.layouts.get(&digest).map_or(0, |l| l.release(region)),
-                HostAction::Forget(digest) => {
-                    self.layouts.remove(&digest);
-                }
+        let mut chosen: Vec<&String> = actions.iter().map(|a| match a { HostAction::Release { digest, .. } | HostAction::Forget(digest) => digest }).collect();
+        chosen.dedup();
+        let asks: Vec<(String, u64, String)> = chosen.into_iter().filter_map(|d| s.layouts.get(d).map(|l| (d, l))).flat_map(|(d, l)| l.users.iter().map(move |(conn, (_, ask))| (d.clone(), *conn, ask.clone()))).collect();
+        (actions, asks)
+    };
+    let acked: u64 = asks.iter().map(|(digest, _, ask)| ledger::release_host(ask, digest)).sum();
+    let mut s = lock.lock();
+    s.acked += acked;
+    for (digest, conn, _) in &asks {
+        if let Some(l) = s.layouts.get_mut(digest) {
+            l.users.remove(conn);
+        }
+    }
+    let mut gave = 0;
+    for a in actions {
+        match a {
+            HostAction::Release { digest, region } => gave += s.layouts.get(&digest).map_or(0, |l| l.release(region)),
+            HostAction::Forget(digest) => {
+                s.layouts.remove(&digest);
             }
         }
-        if gave > 0 {
-            self.releases += 1;
-        }
-        gave
     }
+    if gave > 0 {
+        s.releases += 1;
+    }
+    drop(s);
+    cv.notify_all();
+    gave
 }
 
-/// The machine's RAM-tier service, served from this process while it lives.
+/// The machine's RAM-tier service, served from this process until dropped.
 pub struct Tier {
     state: Arc<(Mutex<State>, Condvar)>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Tier {
+    /// Gives the name back: the accept loop wakes, sees the stop, and drops its listener.
+    fn drop(&mut self) {
+        self.stop.store(true, Release);
+        let _ = os::connect(NAME);
+    }
 }
 
 impl Tier {
@@ -211,7 +243,7 @@ impl Tier {
         if matches!(pressure, Pressure::Headroom) {
             return Ok(Some(tier));
         }
-        let state = tier.state.clone();
+        let (state, stop) = (tier.state.clone(), tier.stop.clone());
         std::thread::Builder::new()
             .name("varena-pressure".into())
             .spawn(move || loop {
@@ -220,12 +252,10 @@ impl Tier {
                     Pressure::Events(e) => os::await_event(e),
                     Pressure::Headroom => return,
                 };
-                if woke.is_err() {
+                if woke.is_err() || stop.load(Acquire) {
                     return;
                 }
-                let (lock, cv) = &*state;
-                lock.lock().relieve(HostTrigger::Pressure);
-                cv.notify_all();
+                relieve(&state, HostTrigger::Pressure);
             })
             .map_err(|e| Error::io("spawn pressure", e))?;
         Ok(Some(tier))
@@ -234,17 +264,21 @@ impl Tier {
     fn bind() -> Result<Option<Tier>> {
         let Some(listener) = os::listen(NAME)? else { return Ok(None) };
         let state = Arc::new((Mutex::new(State::default()), Condvar::new()));
-        let s = state.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (s, halt) = (state.clone(), stop.clone());
         std::thread::Builder::new()
             .name("varena-tier".into())
             .spawn(move || {
                 for stream in os::incoming(listener) {
+                    if halt.load(Acquire) {
+                        return;
+                    }
                     let s = s.clone();
                     let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s));
                 }
             })
             .map_err(|e| Error::io("spawn tier", e))?;
-        Ok(Some(Tier { state }))
+        Ok(Some(Tier { state, stop }))
     }
 
     /// The layouts holding any ready region (status).
@@ -252,6 +286,19 @@ impl Tier {
         let mut out: Vec<String> = self.state.0.lock().layouts.iter().filter(|(_, l)| l.holds()).map(|(d, _)| d.clone()).collect();
         out.sort();
         out
+    }
+
+    /// Each held layout's resident bytes: what its file really holds (status).
+    pub fn resident(&self) -> Vec<(String, u64)> {
+        let s = self.state.0.lock();
+        let mut out: Vec<(String, u64)> = s.layouts.iter().map(|(d, l)| (d.clone(), os::allocated(&l.fd))).collect();
+        out.sort();
+        out
+    }
+
+    /// Bytes executors unpinned and unmapped when the tier asked them to (status).
+    pub fn acked(&self) -> u64 {
+        self.state.0.lock().acked
     }
 
     /// Blocks until the tier has given back `n` rungs since it started; returns the count.
@@ -282,10 +329,10 @@ fn serve(stream: Stream, state: &(Mutex<State>, Condvar)) {
         s.clock += 1;
         let clock = s.clock;
         let (reply, out) = match call {
-            Call::Open { digest, regions } => match open(&mut s, &digest, regions) {
+            Call::Open { digest, regions, ask } => match open(&mut s, &digest, regions) {
                 Ok((data, fd)) => {
                     if let Some(l) = s.layouts.get_mut(&digest) {
-                        l.users.insert(conn, None);
+                        l.users.insert(conn, (None, ask));
                         l.used = clock;
                     }
                     (Reply::Opened { data }, Some(fd))
@@ -293,9 +340,11 @@ fn serve(stream: Stream, state: &(Mutex<State>, Condvar)) {
                 Err(_) => (Reply::Room { ok: false }, None),
             },
             Call::Use { digest, distance } => {
-                if let Some(l) = s.layouts.get_mut(&digest) {
-                    l.users.insert(conn, distance);
+                if let Some((d, _)) = s.layouts.get_mut(&digest).and_then(|l| {
                     l.used = clock;
+                    l.users.get_mut(&conn)
+                }) {
+                    *d = distance;
                 }
                 (Reply::Done, None)
             }
@@ -306,9 +355,11 @@ fn serve(stream: Stream, state: &(Mutex<State>, Condvar)) {
                 (Reply::Done, None)
             }
             Call::Room { bytes } => {
+                drop(s);
                 let headroom = u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0);
-                let gave = if headroom >= bytes { 0 } else { s.relieve(HostTrigger::Room { bytes, headroom }) };
+                let gave = if headroom >= bytes { 0 } else { relieve(state, HostTrigger::Room { bytes, headroom }) };
                 cv.notify_all();
+                s = lock.lock();
                 (Reply::Room { ok: headroom + gave >= bytes }, None)
             }
         };
@@ -353,18 +404,64 @@ pub(crate) struct Held {
     ro: Map,
     data: u64,
     regions: Vec<(u64, u64)>,
-    /// Regions page-locked for the copy engine (once each, while ready).
-    registered: parking_lot::Mutex<std::collections::HashSet<u32>>,
+    /// Regions page-locked for the copy engine (once each, while ready), regions a copy is
+    /// reading now, and whether the tier asked for the layout back.
+    pins: parking_lot::Mutex<Pins>,
+}
+
+#[derive(Default)]
+struct Pins {
+    registered: std::collections::HashSet<u32>,
+    reading: std::collections::HashSet<u32>,
+    released: bool,
+    /// Regions still read when the layout was released: unlocked when their copy ends.
+    deferred: Vec<u32>,
 }
 
 impl Held {
-    /// Page-locks region `r` once it is ready, so fills from it are pinned copies; a region
-    /// the tier gave back is unlocked first.
-    pub fn pin(&self, r: u32, register: impl FnOnce(u64, u64) -> Result<()>, unregister: impl FnOnce(u64) -> Result<()>) -> Result<()> {
+    fn ptr(&self, r: u32) -> Result<(u64, u64)> {
         let (off, span) = self.region(r)?;
-        let ptr = self.ro.base as u64 + self.data + off;
+        Ok((self.ro.base as u64 + self.data + off, span))
+    }
+
+    /// The tier wants the layout back: every region not being read is unlocked now, the rest
+    /// when their copy ends; the mapping goes with the last holder. Returns the layout's bytes.
+    pub fn release(&self, mut unregister: impl FnMut(u64) -> Result<()>) -> u64 {
+        let mut pins = self.pins.lock();
+        pins.released = true;
+        let regions: Vec<u32> = pins.registered.drain().collect();
+        for r in regions {
+            if pins.reading.contains(&r) {
+                pins.deferred.push(r);
+            } else if let Ok((ptr, _)) = self.ptr(r) {
+                let _ = unregister(ptr);
+            }
+        }
+        self.ro.len as u64
+    }
+
+    /// After a copy from region `r`: unlocks it if the layout was released meanwhile.
+    pub fn settle(&self, r: u32, unregister: impl FnOnce(u64) -> Result<()>) {
+        let mut pins = self.pins.lock();
+        pins.reading.remove(&r);
+        if let Some(i) = pins.deferred.iter().position(|d| *d == r) {
+            pins.deferred.swap_remove(i);
+            if let Ok((ptr, _)) = self.ptr(r) {
+                let _ = unregister(ptr);
+            }
+        }
+    }
+
+    /// Page-locks region `r` once it is ready, so fills from it are pinned copies; a region
+    /// the tier gave back is unlocked first. A released layout is never locked again.
+    pub fn pin(&self, r: u32, register: impl FnOnce(u64, u64) -> Result<()>, unregister: impl FnOnce(u64) -> Result<()>) -> Result<()> {
+        let (ptr, span) = self.ptr(r)?;
         let ready = self.ready(r).is_some_and(|w| w.load(Acquire) == 1);
-        let mut registered = self.registered.lock();
+        let mut pins = self.pins.lock();
+        if pins.released {
+            return Ok(());
+        }
+        let registered = &mut pins.registered;
         match (ready, registered.contains(&r)) {
             (true, false) => {
                 register(ptr, span)?;
@@ -380,12 +477,8 @@ impl Held {
     }
 
     /// Unlocks every region (the layout is closing).
-    pub fn unpin(&self, mut unregister: impl FnMut(u64) -> Result<()>) {
-        for r in self.registered.lock().drain() {
-            if let Ok((off, _)) = self.region(r) {
-                let _ = unregister(self.ro.base as u64 + self.data + off);
-            }
-        }
+    pub fn unpin(&self, unregister: impl FnMut(u64) -> Result<()>) {
+        self.release(unregister);
     }
     fn ready(&self, r: u32) -> Option<&AtomicU32> {
         let at = r as usize * 4;
@@ -400,8 +493,10 @@ impl Held {
     }
 
     /// Copies region `r` into `dst` if it is ready, under its read lock; false when it is not.
+    /// The caller settles the region afterwards ([`Held::settle`]).
     pub fn read(&self, r: u32, dst: tensorfs::io::Dst) -> Result<bool> {
         let (off, span) = self.region(r)?;
+        self.pins.lock().reading.insert(r);
         os::share(&self.fd, self.data + off, span, true)?;
         let copied = (|| {
             if self.ready(r).is_none_or(|w| w.load(Acquire) != 1) {
@@ -472,13 +567,14 @@ impl Client {
         os::call(&self.stream.lock(), call, None)
     }
 
-    pub fn open_layout(&self, digest: &str, regions: Vec<(u64, u64)>) -> Result<Held> {
-        let (reply, fd) = self.call(&Call::Open { digest: digest.into(), regions: regions.clone() })?;
+    /// Maps `digest`'s layout; the tier asks `ask` (this process's row) to give it back.
+    pub fn open_layout(&self, digest: &str, regions: Vec<(u64, u64)>, ask: &str) -> Result<Held> {
+        let (reply, fd) = self.call(&Call::Open { digest: digest.into(), regions: regions.clone(), ask: ask.into() })?;
         let (Reply::Opened { data }, Some(fd)) = (reply, fd) else { return Err(Error::Io("the tier refused a layout".into())) };
         let fd = os::reopen(&fd, true)?;
         let len = data + regions.iter().map(|(o, s)| o + s).max().unwrap_or(0);
         let ro = os::map(&fd, len as usize, false)?;
-        Ok(Held { fd, ro, data, regions, registered: Default::default() })
+        Ok(Held { fd, ro, data, regions, pins: Default::default() })
     }
 
     pub fn use_layout(&self, digest: &str, distance: Option<u32>) -> Result<()> {
