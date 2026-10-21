@@ -98,6 +98,7 @@ rec "down (offline Calcifer)" 120 "$cozy" down
 unset HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY
 
 section "Uninstall"
+pm=$HOME/pm/bin/$(basename "$cozy"); mkdir -p "$(dirname "$pm")"; cp "$cozy" "$pm"
 rec "machine disable" 300 "$cozy" machine disable
 rec "uninstall --yes" 300 "$cozy" uninstall --yes
 rec "left behind" 30 sh -c 'ls -la ~/.cozy ~/.config/cozy 2>&1; grep -n cozy ~/.profile ~/.bashrc ~/.bash_profile ~/.zshrc ~/.zshenv 2>/dev/null; true'
@@ -106,6 +107,17 @@ if [ $win = 1 ]; then
 else
   rec "login shell after" 30 env -i HOME="$HOME" PATH=/usr/bin:/bin sh -lc 'command -v cozy || echo gone'
 fi
+
+section "Installed elsewhere (a package manager's path, no ~/.cozy/bin/cozy)"
+rec "elsewhere: status" 120 "$pm" status
+rec "elsewhere: the recorded cozy" 30 sh -c 'cat ~/.cozy/installed; echo; ls ~/.cozy/bin 2>&1'
+rec "elsewhere: machine enable" 600 "$pm" machine enable
+rec "elsewhere: machine show local" 60 "$pm" machine show local
+rec "elsewhere: run a local script" 900 "$pm" run ./greet.py
+rec "elsewhere: down, then up again" 120 sh -c "'$pm' down && '$pm' status"
+rec "elsewhere: machine disable" 300 "$pm" machine disable
+rec "elsewhere: uninstall --yes" 300 "$pm" uninstall --yes
+rec "elsewhere: the package manager's cozy stays" 30 sh -c "ls -la '$pm'; ls -la ~/.cozy 2>&1"
 
 [ -n "${DEV_BINARY:-}" ] && exit 0
 section "Upgrade from v0.10.1"
