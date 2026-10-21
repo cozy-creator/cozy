@@ -5,7 +5,7 @@ use std::{path::Path, sync::Arc};
 
 use calcifer::store::{Acceptance, Batch, NewRun, RunFilter, State, Store, StoreError};
 use protocol::{
-    calcifer::{Call, Event, ItemStatus, Kind, Status, Warning},
+    calcifer::{Agreed, Call, Event, ItemStatus, Kind, Status, Warning},
     config::Origin,
     ids::{Digest, RunId},
     machine as v1,
@@ -435,23 +435,41 @@ fn checkpoint_references_replay_across_restarts_without_byte_exports() {
 
 #[test]
 fn old_schemas_migrate_without_rewriting_run_or_media_history() {
-    for schema in [
-        "ALTER TABLE outputs DROP COLUMN checkpoint; ALTER TABLE runs DROP COLUMN agreed; PRAGMA user_version = 5;",
-        "ALTER TABLE outputs DROP COLUMN checkpoint; PRAGMA user_version = 6;",
-        "ALTER TABLE runs DROP COLUMN agreed; PRAGMA user_version = 6;",
+    for (schema, has_agreed, has_checkpoint) in [
+        ("ALTER TABLE outputs DROP COLUMN checkpoint; ALTER TABLE runs DROP COLUMN agreed; PRAGMA user_version = 5;", false, false),
+        ("ALTER TABLE outputs DROP COLUMN checkpoint; PRAGMA user_version = 6;", true, false),
+        ("ALTER TABLE runs DROP COLUMN agreed; PRAGMA user_version = 6;", false, true),
     ] {
-        assert_history_survives_upgrade(schema);
+        assert_history_survives_upgrade(schema, has_agreed, has_checkpoint);
     }
 }
 
-fn assert_history_survives_upgrade(schema: &str) {
+fn assert_history_survives_upgrade(schema: &str, has_agreed: bool, has_checkpoint: bool) {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
     store
         .put_machine(&common::machine("m", None, Path::new("/k")))
         .unwrap();
+    let agreed = has_agreed.then_some(Agreed {
+        usd_micros_per_hour: 750_000,
+        usd_micros_per_gb: 12_500,
+    });
+    let mut products = vec![product("image", 0, 1)];
+    if has_checkpoint {
+        let mut weights = checkpoint(&format!("sha256:{}", "cd".repeat(32)), 1);
+        weights.checkpoint.as_mut().unwrap().tag = "main".into();
+        products.push(weights);
+    }
+    let reference = products.iter().find_map(|p| p.checkpoint.clone());
     let first = store
-        .submit("old", "old-digest", new_run(1, Some("m"), true))
+        .submit(
+            "old",
+            "old-digest",
+            NewRun {
+                agreed,
+                ..new_run(1, Some("m"), true)
+            },
+        )
         .unwrap()
         .0;
     let id = first.id.as_str();
@@ -463,7 +481,7 @@ fn assert_history_survives_upgrade(schema: &str) {
             Batch {
                 cursor: 12,
                 logs: vec![(5, "info".into(), "old log".into())],
-                products: vec![product("image", 0, 1)],
+                products: products.clone(),
                 ..Default::default()
             },
         )
@@ -473,7 +491,7 @@ fn assert_history_survives_upgrade(schema: &str) {
             id,
             &v1::Outcome {
                 status: "succeeded".into(),
-                outputs: vec![product("image", 0, 1)],
+                outputs: products,
                 result: v1::Json::parse(r#"{"caption":"saved"}"#).ok(),
                 measurements: v1::Json::parse(r#"{"execution":{}}"#).ok(),
                 ..Default::default()
@@ -493,11 +511,46 @@ fn assert_history_survives_upgrade(schema: &str) {
     // Reproduce each old schema; retain every existing column and stored JSON.
     let db = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
     db.execute_batch(schema).unwrap();
+    // Preserve bytes as well as decoded values. Pretty JSON detects a migration that
+    // silently parses and rewrites an existing column instead of leaving it untouched.
+    let agreed_json = agreed
+        .as_ref()
+        .map(|a| serde_json::to_string_pretty(a).unwrap());
+    let checkpoint_json = reference
+        .as_ref()
+        .map(|r| serde_json::to_string_pretty(r).unwrap());
+    if let Some(json) = &agreed_json {
+        assert_eq!(
+            db.execute(
+                "UPDATE runs SET agreed = ?1 WHERE id = ?2",
+                rusqlite::params![json, id]
+            )
+            .unwrap(),
+            1
+        );
+    }
+    if let Some(json) = &checkpoint_json {
+        assert_eq!(
+            db.execute(
+                "UPDATE outputs SET checkpoint = ?1 WHERE run = ?2 AND name = 'weights'",
+                rusqlite::params![json, id]
+            )
+            .unwrap(),
+            1
+        );
+    }
     drop(db);
 
     let store = open(dir.path());
     let row = store.run(id).unwrap().unwrap();
     assert_eq!(row.cursor, 13);
+    assert_eq!(row.agreed, agreed);
+    if has_checkpoint {
+        assert_eq!(
+            store.output(id, "weights", 0).unwrap().unwrap().checkpoint,
+            reference
+        );
+    }
     assert_eq!(store.detail(&row).unwrap(), before);
     assert_eq!(store.events_after(id, 0).unwrap(), events);
     let (replayed, fresh) = store
@@ -509,11 +562,31 @@ fn assert_history_survives_upgrade(schema: &str) {
     assert!(store.exports_owed().unwrap().is_empty());
     drop(store);
     let store = open(dir.path());
-    assert_eq!(
-        store.detail(&store.run(id).unwrap().unwrap()).unwrap(),
-        before
-    );
+    let reopened = store.run(id).unwrap().unwrap();
+    assert_eq!(reopened.agreed, agreed);
+    if has_checkpoint {
+        assert_eq!(
+            store.output(id, "weights", 0).unwrap().unwrap().checkpoint,
+            reference
+        );
+    }
+    assert_eq!(store.detail(&reopened).unwrap(), before);
+    assert_eq!(store.events_after(id, 0).unwrap(), events);
     let db = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+    let saved_agreed: Option<String> = db
+        .query_row("SELECT agreed FROM runs WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(saved_agreed, agreed_json);
+    if has_checkpoint {
+        let saved_checkpoint: Option<String> = db
+            .query_row(
+                "SELECT checkpoint FROM outputs WHERE run = ?1 AND name = 'weights'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_checkpoint, checkpoint_json);
+    }
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
