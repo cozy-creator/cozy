@@ -198,9 +198,11 @@ fn peft(tensors: &mut [(String, Vec<Tensor>)]) -> BTreeMap<String, Vec<(String, 
 }
 
 /// Releases that become private tags (a public tag is a PEP 440 version): model and version, by
-/// ruling (2026-10-20: audit, proof and recovery artifacts, production's and 8819's). Any other
+/// ruling (2026-10-20/21: audit, proof, recovery and experiment artifacts, production's and 8819's). Any other
 /// release not a version refuses its repo.
 pub const PRIVATE: &[(&str, &str)] = &[
+    ("fidika/minimax-h3-turbo-exp", "0.1.0-lx2v-s12"),
+    ("fidika/minimax-h3-turbo-exp", "0.1.0-pdd-s6"),
     ("fidika/minimax-h3-turbo-lora", "1.0.0-audit.1"),
     ("paul/cache-persistence-proof", "0.0.1-cacheproof.20260924"),
     ("paul/cozy-mixed-input-proof", "0.0.0-rental-audit.20260913"),
