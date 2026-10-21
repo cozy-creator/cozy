@@ -323,10 +323,16 @@ pub fn rollback_pending(paths: &Paths, cause: &str) -> io::Result<Recovered> {
 /// activation. This is durable before the converter can retire the legacy namespace.
 pub(crate) fn protect_store_migration(paths: &Paths, store: &Path) -> io::Result<()> {
     let Some(mut pending) = read_pending(paths)? else { return Ok(()) };
-    if pending.store_migration.is_some() || !store.exists() {
+    if !store.exists() {
         return Ok(());
     }
     let store = fs::canonicalize(store)?;
+    if let Some(previous) = &pending.store_migration {
+        if previous != &store {
+            return Err(invalid("the store changed during its pending software activation"));
+        }
+        return Ok(());
+    }
     if tensorfs::migrate::store1::cutover_started(&store).map_err(crate::storage::migration_error)? {
         return Ok(());
     }
@@ -1593,9 +1599,19 @@ mod tests {
         let store = transaction.root.join("tensorfs");
         fs::create_dir_all(&store).unwrap();
         fs::write(store.join("format"), b"store-format 1\nclaim-protocol 1\n").unwrap();
+        let launch = transaction.root.join("cozy");
+        fs::write(&launch, b"selected binary").unwrap();
+        fs::write(super::super::binary::previous(&launch), b"previous binary").unwrap();
+        let mut activation = read_pending(&transaction.paths).unwrap().unwrap();
+        activation.binary = Some(launch.clone());
+        write_json(&transaction.paths.update("pending.json"), &activation).unwrap();
         protect_store_migration(&transaction.paths, &store).unwrap();
         let pending = fs::read(transaction.paths.update("pending.json")).unwrap();
         assert_eq!(read_pending(&transaction.paths).unwrap().unwrap().store_migration, Some(store.canonicalize().unwrap()));
+        let other = transaction.root.join("another-store");
+        fs::create_dir(&other).unwrap();
+        assert!(protect_store_migration(&transaction.paths, &other).unwrap_err().to_string().contains("store changed"));
+        assert_eq!(fs::read(transaction.paths.update("pending.json")).unwrap(), pending);
 
         // The converter has retired the old namespace but has not written format/3 yet.
         // Even this interrupted cut must not relaunch the old SDK against that store.
@@ -1603,10 +1619,12 @@ mod tests {
         let error = rollback_pending(&transaction.paths, "candidate exited").unwrap_err();
         assert!(error.to_string().contains("keeping the current software"), "{error}");
         transaction.links(&transaction.new);
+        assert_eq!(fs::read(&launch).unwrap(), b"selected binary");
+        assert_eq!(fs::read(super::super::binary::previous(&launch)).unwrap(), b"previous binary");
         assert_eq!(fs::read(transaction.paths.update("pending.json")).unwrap(), pending);
         let status: Status = serde_json::from_slice(&fs::read(transaction.paths.update("status.json")).unwrap()).unwrap();
         assert_eq!(status.state, "starting", "no false rolled_back report");
-        assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Nothing);
+        assert!(matches!(recover_activation(&transaction.paths).unwrap(), Recovered::Nothing | Recovered::Exec(_)));
         transaction.links(&transaction.new);
     }
 
