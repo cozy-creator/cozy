@@ -144,12 +144,14 @@ pub fn react(ledgers: &[&Ledger], wake: impl Fn() + Send + 'static) -> io::Resul
                 return;
             }
             for fd in ledgers.iter_mut().filter(|fd| fd.revents != 0) {
-                let mut count = [0u8; 8];
-                // SAFETY: a read into a local buffer from a descriptor poll found readable.
-                let read = fd.revents & libc::POLLIN != 0 && unsafe { libc::read(fd.fd, count.as_mut_ptr().cast(), count.len()) } > 0;
-                if !read {
+                if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
                     fd.fd = -1; // closed or failed: poll skips it from now on
+                    continue;
                 }
+                let mut count = [0u8; 8];
+                // SAFETY: a nonblocking read into a local buffer (it clears the event; another
+                // reader may have cleared it first).
+                unsafe { libc::read(fd.fd, count.as_mut_ptr().cast(), count.len()) };
             }
             wake();
         }
