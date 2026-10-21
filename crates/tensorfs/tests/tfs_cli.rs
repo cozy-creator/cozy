@@ -314,3 +314,23 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     assert!(!success);
     assert_eq!(missing["error"]["code"], "not_found");
 }
+
+/// `tfs --store X ceiling` keeps its measurement in X, not in the home store.
+#[test]
+fn a_named_store_keeps_its_ceilings() {
+    let scratch = Scratch::new("ceilings");
+    let (root, home) = (scratch.0.join("store"), scratch.0.join("home"));
+    Store::open(&root).unwrap();
+    // Past the probe's keep threshold (256 MiB), sparse: no disk traffic.
+    fs::File::create(root.join("probe")).unwrap().set_len(300 << 20).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .env("TENSORFS_HOME", &home)
+        .arg("--store")
+        .arg(&root)
+        .args(["--json", "ceiling"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(root.join("tmp/ceilings/table").is_file(), "the named store kept nothing");
+    assert!(!home.exists(), "the home store was written");
+}

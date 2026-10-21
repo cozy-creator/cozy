@@ -1,6 +1,6 @@
 //! The hardware ceilings copies are measured against (design §13): a volume's O_DIRECT
 //! sequential read rate here, a GPU's pinned H2D rate in `metrics`. Each is kept per boot in
-//! the TensorFS cache (`$TENSORFS_HOME`, else `~/.cache/tensorfs`) at `tmp/ceilings/table`,
+//! the TensorFS store ([`keep_ceilings_in`]'s, else [`crate::home::resolve`]'s) at `tmp/ceilings/table`,
 //! tab-separated `key value…` lines; a key's highest first value wins, so a probe taken at a
 //! contended moment, or a copy that ran faster than it, never leaves a ceiling stuck low.
 
@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use platform::durable;
@@ -175,13 +175,21 @@ fn boot() -> Option<String> {
     platform::process::boot_id().ok().filter(|s| !s.is_empty())
 }
 
-/// `tmp/ceilings/table` in the TensorFS cache. A directory in `tmp/` is its maker's: GC leaves it.
+static STORE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keeps this process's ceilings in the store at `root` (the one `tfs --store` names), not the
+/// home one; the first root named holds.
+pub fn keep_ceilings_in(root: &Path) {
+    let _ = STORE.set(root.to_path_buf());
+}
+
+/// `tmp/ceilings/table` in the TensorFS store. A directory in `tmp/` is its maker's: GC leaves it.
 fn table() -> Option<PathBuf> {
-    let home = match std::env::var_os("TENSORFS_HOME").filter(|h| !h.is_empty()) {
-        Some(home) => PathBuf::from(home),
-        None => platform::paths::login_home()?.join(".cache").join("tensorfs"),
+    let store = match STORE.get() {
+        Some(root) => root.clone(),
+        None => crate::home::resolve(None).ok()?,
     };
-    Some(home.join("tmp").join("ceilings").join("table"))
+    Some(store.join("tmp").join("ceilings").join("table"))
 }
 
 /// The values of `key`'s line with the highest positive, finite first value.

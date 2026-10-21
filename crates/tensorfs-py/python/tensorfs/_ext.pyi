@@ -290,7 +290,7 @@ class Writer:
 
 class _Client:
     """Internal marshaling adapter over the public Rust session."""
-    def __init__(self, root: StrPath, *, endpoint: str | None = None,
+    def __init__(self, root: StrPath | None = None, *, endpoint: str | None = None,
                  token: _Token | None = None, ca_der: bytes | None = None) -> None: ...
     def open(self, name_or_path: str, *, revision: str | None = None,
              variant: str | None = None, local_files_only: bool = False,

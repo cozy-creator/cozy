@@ -179,7 +179,8 @@ pub struct Client {
 impl Client {
     pub fn new(config: Config) -> Result<Self> {
         if config.cache_dir.as_os_str().is_empty() {
-            return fail(Kind::Invalid, "name cache_dir or set TENSORFS_HOME/HOME");
+            let why = crate::home::resolve(None).err().map_or_else(|| "it is empty".into(), |e| e.detail);
+            return fail(Kind::Invalid, format!("name cache_dir: {why}"));
         }
         let store = Store::open(&config.cache_dir)?;
         Ok(Self {
