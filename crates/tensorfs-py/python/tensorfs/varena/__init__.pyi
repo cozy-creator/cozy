@@ -40,10 +40,10 @@ class GpuId:
     def memory(self) -> int: ...
 
 class Grant:
-    """TensorD's table descriptor (a handle on Windows) for this process's memory; ownership
-    passes."""
+    """TensorD's descriptors (handles on Windows) for this process's memory: the table and its
+    row lock's own description; ownership passes."""
 
-    def __init__(self, table: int) -> None: ...
+    def __init__(self, table: int, row: int) -> None: ...
     @staticmethod
     def open(gpu: GpuId, limit: int | None = None) -> Grant:
         """A standalone engine's grant: `gpu`'s table by name; `limit` lowers its capacity (the
@@ -164,26 +164,28 @@ class Memory:
         """The record of the request that ended last."""
 
 class Request:
-    def pass_(self, set: int, shape: str, allocated: int, reserved: int) -> Pass:
-        """A pass of `set` at `shape` (`<entry>|<dims>`: the entry module's path, "" the root, and
-        its tensors' dims joined by `x`) with torch's bytes now; returns once its measured room is
-        free."""
+    def pass_(self, set: int, entry: str, shape: str, allocated: int, reserved: int) -> Pass:
+        """A pass of `set` entered at `entry` (the module's path in the model, "" the root) at
+        `shape` (its tensors' dims joined by `x`), with torch's bytes now; returns once its
+        measured room is free. Rooms match on (set, entry) and interpolate over shapes."""
 
     def plan(self, plan: list[tuple[list[str], int]]) -> None:
         """Replaces the plan; its cursor starts over."""
 
     def oom(
         self,
-        set: int,
+        set: int | None,
         allocated: int,
         reserved: int,
         need: int | None = None,
         site: str | None = None,
         collective: bool = False,
+        finest: int = 0,
     ) -> Next:
-        """An op of `set`'s pass ran out of memory (`need` more bytes when known) at cut site
-        `site` (None: it cannot be cut), with torch's bytes now; a `collective` site's finer
-        level waits for the next pass's agreement."""
+        """An op of `set`'s pass (None: outside any pass: demand, then Park, never Cut) ran out
+        of memory (`need` more bytes when known) at cut site `site` (None: it cannot be cut), cut
+        no finer than `finest`, with torch's bytes now; a `collective` site's finer level waits
+        for the next pass's agreement."""
 
     def parked(self, nbytes: int) -> None:
         """The bytes a `Park` answer moved to the host (0: none, and the next `oom` is Exhausted)."""
@@ -200,10 +202,10 @@ class Request:
         """Ends it: its pins, rooms and caches go."""
 
 class Pass:
-    def end(self, allocated_peak: int, slack: int, sites: list[tuple[str, int, bool]], allocated: int, reserved: int) -> None:
+    def end(self, allocated_peak: int, slack: int, sites: list[tuple[str, int, bool, int]], allocated: int, reserved: int) -> None:
         """Records what the pass measured (torch's absolute allocated peak, the allocator's slack
-        at it, each cut site's `(name, peak, collective)`) and torch's bytes now; dropping it
-        unended records nothing."""
+        at it, each cut site's `(name, peak, collective, finest)`) and torch's bytes now;
+        dropping it unended records nothing."""
 
     def measured(self) -> bool:
         """Whether its room is the one measured for its set, shape and cut levels."""

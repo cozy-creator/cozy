@@ -298,7 +298,7 @@ def main() -> int:
     measured: list[bool] = []
     with mem.request("entries", plan=[unet, unet]) as r:
         def seen(*_: object) -> None:
-            keys.append(adapter._pass.get().shape)
+            keys.append(adapter._pass.get().entry)
             measured.append(r.measured())
 
         probe = unet.conv_in.register_forward_pre_hook(seen)
@@ -311,10 +311,14 @@ def main() -> int:
     check("entries: a new entry's room is estimated, a measured shape's is measured", measured == [False, True], measured)
     diff = (got - plain.conv_in(x.cpu()).detach()).abs().max().item()
     check(f"entries: a direct child's forward runs bound (max diff {diff:.2e})", diff <= ACROSS, diff)
-    check("entries: each entry is its own pass key", len(keys) == 2 and keys[0].startswith("conv_in|") and keys[1].startswith("|"), keys)
+    check("entries: each entry is its own pass key", keys == ["conv_in", ""], keys)
+    steps = r.stats().steps
+    with mem.request("between") as between:
+        answer = between.oom(None, None)  # package code between passes: no pass to cut
+    check("between passes: an OOM is answered, never refused", isinstance(answer, native.Next), answer)
     # The capacity varena ran a step against is the card less contexts (grown by now: cuDNN,
     # cuBLAS) and foreign bytes; the limits below are that much plus what they mean to hold.
-    base = mem.gpu.memory - min(step.capacity for step in r.stats().steps)
+    base = mem.gpu.memory - min(step.capacity for step in steps)
 
     shed: list[bool] = []
     scale = Scale(2)

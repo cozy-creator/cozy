@@ -250,16 +250,17 @@ pub enum PyNext {
     Exhausted { error: Py<PyAny> },
 }
 
-/// TensorD's table descriptor for this process's memory; `Memory.open` takes it.
+/// TensorD's descriptors for this process's memory: the table and its row lock's own description;
+/// `Memory.open` takes them.
 #[pyclass(name = "Grant", module = "tensorfs.varena", frozen)]
 pub struct PyGrant(Mutex<Option<Grant>>);
 
 #[pymethods]
 impl PyGrant {
-    /// Takes ownership of the table's descriptor (a handle on Windows).
+    /// Takes ownership of the table's and the row's descriptors (handles on Windows).
     #[new]
-    fn new(table: i64) -> Self {
-        PyGrant(Mutex::new(Some(Grant { table: owned(table) })))
+    fn new(table: i64, row: i64) -> Self {
+        PyGrant(Mutex::new(Some(Grant { table: owned(table), row: owned(row) })))
     }
 
     /// A standalone engine's grant: `gpu`'s table by name; `limit` lowers its capacity (the first
@@ -528,12 +529,13 @@ impl PyRequest {
 
 #[pymethods]
 impl PyRequest {
-    /// Starts a pass of `set` at `shape` (`<entry>|<dims>`) with torch's bytes now; returns once
-    /// its measured room is free.
+    /// Starts a pass of `set` entered at `entry` (the module's path in the model, "" the root) at
+    /// `shape` (its tensors' dims joined by `x`), with torch's bytes now; returns once its
+    /// measured room is free.
     #[pyo3(name = "pass_")]
-    fn pass_(&self, py: Python<'_>, set: u32, shape: &str, allocated: u64, reserved: u64) -> PyResult<PyPass> {
+    fn pass_(&self, py: Python<'_>, set: u32, entry: &str, shape: &str, allocated: u64, reserved: u64) -> PyResult<PyPass> {
         let r = self.get(py)?;
-        let pass = detached(py, &self.gpu, || r.pass(SetId(set), shape, Torch { allocated, reserved }))?;
+        let pass = detached(py, &self.gpu, || r.pass(SetId(set), entry, shape, Torch { allocated, reserved }))?;
         Ok(PyPass(Mutex::new(Some(pass))))
     }
 
@@ -543,15 +545,15 @@ impl PyRequest {
         done(py, &self.gpu, || r.plan(steps(plan)))
     }
 
-    /// An op of `set`'s pass ran out of memory, `need` more bytes when known, at cut site `site`
-    /// (None: the op cannot be cut), with torch's bytes now; a `collective` site's finer level
-    /// waits for the next pass's agreement.
-    #[pyo3(signature = (set, allocated, reserved, need = None, site = None, collective = false))]
+    /// An op of `set`'s pass (None: outside any pass) ran out of memory, `need` more bytes when
+    /// known, at cut site `site` (None: the op cannot be cut), cut no finer than `finest`, with
+    /// torch's bytes now; a `collective` site's finer level waits for the next pass's agreement.
+    #[pyo3(signature = (set, allocated, reserved, need = None, site = None, collective = false, finest = 0))]
     #[allow(clippy::too_many_arguments)]
-    fn oom(&self, py: Python<'_>, set: u32, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool) -> PyResult<PyNext> {
+    fn oom(&self, py: Python<'_>, set: Option<u32>, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool, finest: u32) -> PyResult<PyNext> {
         let r = self.get(py)?;
-        let site = site.map(|name| Site { name, collective });
-        Ok(match detached(py, &self.gpu, || Ok(r.oom(SetId(set), need, site, Torch { allocated, reserved })))? {
+        let site = site.map(|name| Site { name, collective, finest });
+        Ok(match detached(py, &self.gpu, || Ok(r.oom(set.map(SetId), need, site, Torch { allocated, reserved })))? {
             Next::Retry => PyNext::Retry(),
             Next::Cut(level) => PyNext::Cut { level },
             Next::Park(budget) => PyNext::Park { budget },
@@ -618,10 +620,10 @@ impl PyPass {
 #[pymethods]
 impl PyPass {
     /// torch's allocated peak (absolute), the allocator's slack at it and each cut site's own
-    /// `(name, allocated peak, collective)`; then torch's bytes now.
-    fn end(&self, py: Python<'_>, allocated_peak: u64, slack: u64, sites: Vec<(String, u64, bool)>, allocated: u64, reserved: u64) -> PyResult<()> {
+    /// `(name, allocated peak, collective, finest level)`; then torch's bytes now.
+    fn end(&self, py: Python<'_>, allocated_peak: u64, slack: u64, sites: Vec<(String, u64, bool, u32)>, allocated: u64, reserved: u64) -> PyResult<()> {
         let Some(pass) = lock(&self.0).take() else { return Ok(()) };
-        let sites = sites.into_iter().map(|(name, peak, collective)| SitePeak { name, peak, collective }).collect();
+        let sites = sites.into_iter().map(|(name, peak, collective, finest)| SitePeak { name, peak, collective, finest }).collect();
         done(py, "", || pass.end(Measured { allocated_peak, slack, sites }, Torch { allocated, reserved }))
     }
 
