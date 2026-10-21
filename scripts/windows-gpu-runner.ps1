@@ -21,7 +21,7 @@ $dir = "$env:LOCALAPPDATA\cozy-gpu-runner"
 $release = Invoke-RestMethod https://api.github.com/repos/actions/runner/releases/latest
 $version = $release.tag_name.TrimStart('v')
 $zip = "$env:TEMP\actions-runner-win-x64-$version.zip"
-Invoke-WebRequest "https://github.com/actions/runner/releases/download/v$version/actions-runner-win-x64-$version.zip" -OutFile $zip
+Invoke-WebRequest -UseBasicParsing "https://github.com/actions/runner/releases/download/v$version/actions-runner-win-x64-$version.zip" -OutFile $zip
 $sha256 = [regex]::Match($release.body, '<!-- BEGIN SHA win-x64 -->([0-9a-f]{64})').Groups[1].Value
 if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $sha256) { throw "$zip does not match the release's sha256 $sha256" }
 if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }

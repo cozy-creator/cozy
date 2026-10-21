@@ -54,7 +54,7 @@ function CozyJson {
     ($lines -join "`n") | ConvertFrom-Json
 }
 # An image decoded (WebP through cozy's ffmpeg: System.Drawing reads PNG, JPEG, BMP, GIF and TIFF), with
-# its size and the spread of its channel values over a 32x32 grid of pixels (0 for one colour).
+# its size and the largest standard deviation of one channel over a 32x32 grid of pixels (0 for one colour).
 function Measure-Image([string]$Path) {
     if ($Path -match '\.webp$') {
         if (-not $script:ffmpeg) {
@@ -67,13 +67,15 @@ function Measure-Image([string]$Path) {
     }
     $bitmap = New-Object Drawing.Bitmap $Path
     try {
-        $values = foreach ($y in 0..31) { foreach ($x in 0..31) {
-            $p = $bitmap.GetPixel([math]::Floor(($x + .5) * $bitmap.Width / 32), [math]::Floor(($y + .5) * $bitmap.Height / 32))
-            $p.R; $p.G; $p.B; $p.A
+        $pixels = foreach ($y in 0..31) { foreach ($x in 0..31) {
+            $bitmap.GetPixel([math]::Floor(($x + .5) * $bitmap.Width / 32), [math]::Floor(($y + .5) * $bitmap.Height / 32))
         } }
-        $mean = ($values | Measure-Object -Average).Average
-        $variance = ($values | ForEach-Object { ($_ - $mean) * ($_ - $mean) } | Measure-Object -Average).Average
-        [pscustomobject]@{ Width = $bitmap.Width; Height = $bitmap.Height; Spread = [math]::Round([math]::Sqrt($variance), 1) }
+        $spread = ('R', 'G', 'B', 'A' | ForEach-Object {
+            $channel = $_; $values = $pixels | ForEach-Object { $_.$channel }
+            $mean = ($values | Measure-Object -Average).Average
+            [math]::Sqrt(($values | ForEach-Object { ($_ - $mean) * ($_ - $mean) } | Measure-Object -Average).Average)
+        } | Measure-Object -Maximum).Maximum
+        [pscustomobject]@{ Width = $bitmap.Width; Height = $bitmap.Height; Spread = [math]::Round($spread, 1) }
     } finally { $bitmap.Dispose() }
 }
 
@@ -82,7 +84,7 @@ Step 'machine facts' {
     $os = Get-CimInstance Win32_OperatingSystem
     $memory = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory
     $f.os = "$($os.Caption) $($os.Version)"
-    $f.cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+    $f.cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim()
     $f.elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators')
     $f.ram_gb = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
     # \Memory\Committed Bytes and \Memory\Commit Limit, read locale-independently.
@@ -214,4 +216,4 @@ $report | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 "$Out\report.json
 Stop-Transcript | Out-Null
 Compress-Archive -Force -Path "$Out\*" -DestinationPath "$Out.zip"
 Write-Host "bundle: $Out ($Out.zip)"
-if ($failures.Count) { exit 1 }
+exit [int]($failures.Count -gt 0)
