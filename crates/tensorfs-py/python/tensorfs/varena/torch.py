@@ -370,12 +370,11 @@ class Memory:
                 p.entered = sys.exc_info()[1]
                 if self.cuda:
                     torch.cuda.reset_peak_memory_stats(self.device)
-                model.passing, p.token = p, _pass.set(p)
                 if model.common is not None:
                     self._enter(model.common)
+                model.passing, p.token = p, _pass.set(p)
             except BaseException:
                 model.depth -= 1
-                model.passing = None
                 raise
 
     def _close(self, model: Model) -> None:
@@ -403,9 +402,8 @@ class Memory:
     # -- blocks
 
     def _enter(self, block: _Block) -> None:
-        model = block.model
         stream = torch.cuda.current_stream(self.device) if self.cuda else None
-        with model.lock:
+        with block.model.lock:
             if block.count == 0:
                 self._bind(block, stream)
             elif stream is not None and stream != block.stream:
@@ -571,13 +569,41 @@ def _hook(model: Model) -> None:
     binds while it runs."""
     memory = model.memory
     for sub in (model.module, *model.module.children()):
-        opened = sub.register_forward_pre_hook(lambda _, args, kwargs: memory._open(model, args, kwargs), with_kwargs=True)
-        model.handles.append(opened)
-        model.handles.append(sub.register_forward_hook(lambda *_: memory._close(model), always_call=True))
+        model.handles += _paired(sub, lambda args, kwargs: memory._open(model, args, kwargs), lambda: memory._close(model))
     for block in model.blocks.values():
         sub = model.module.get_submodule(block.path)
-        model.handles.append(sub.register_forward_pre_hook(lambda *_, b=block: memory._enter(b)))
-        model.handles.append(sub.register_forward_hook(lambda *_, b=block: memory._exit(b), always_call=True))
+        model.handles += _paired(sub, lambda *_, b=block: memory._enter(b), lambda b=block: memory._exit(b))
+
+
+_threads = threading.local()
+
+
+def _owed() -> dict[object, int]:
+    """Per thread, the `exit`s each hook pair owes."""
+    owed = getattr(_threads, "owed", None)
+    if owed is None:
+        owed = _threads.owed = {}
+    return owed
+
+
+def _paired(sub: nn.Module, enter: Callable[..., None], exit: Callable[[], None]) -> list[torch.utils.hooks.RemovableHandle]:
+    """`enter(args, kwargs)` before `sub`'s forward and `exit()` after it, even when it raises.
+    torch also runs an always-call hook when a pre-hook raised: `exit` runs only after its
+    `enter` completed."""
+    key = object()
+
+    def pre(_: nn.Module, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
+        enter(args, kwargs)
+        owed = _owed()
+        owed[key] = owed.get(key, 0) + 1
+
+    def post(*_: object) -> None:
+        owed = _owed()
+        if owed.get(key):
+            owed[key] -= 1
+            exit()
+
+    return [sub.register_forward_pre_hook(pre, with_kwargs=True), sub.register_forward_hook(post, always_call=True)]
 
 
 def _write(block: _Block, views: Mapping[str, Mapping[str, Tensor]]) -> None:
