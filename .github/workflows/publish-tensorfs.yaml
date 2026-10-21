@@ -149,6 +149,7 @@ jobs:
         working-directory: crates/tensorfs-py
     steps:
       - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
       - if: matrix.cuda
         uses: actions/download-artifact@v4
         with:
@@ -181,8 +182,8 @@ jobs:
             install -D -m 755 ../../target/release/tfs wheel-data/scripts/tfs
       - if: runner.os != 'Linux'
         run: |
-          cargo build --release --locked -p tensorfs --bin tfs
-          cp ../../target/release/tfs$([ "$RUNNER_OS" = Windows ] && echo .exe) wheel-data/scripts/
+          cargo build --release --locked --target "${{ matrix.target }}" -p tensorfs --bin tfs
+          cp "../../target/${{ matrix.target }}/release/tfs$([ "$RUNNER_OS" = Windows ] && echo .exe)" wheel-data/scripts/
       - if: runner.os != 'Linux'
         uses: PyO3/maturin-action@v1
         with:
