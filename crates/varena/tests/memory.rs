@@ -429,3 +429,19 @@ fn a_cold_requests_record_carries_its_loads() {
     let warm = mem.request("warm", plan("ls")).unwrap();
     assert_eq!(warm.stats().moved.store.bytes, 0, "nothing filled since");
 }
+
+/// The vertical slice: lifting a limit raises the capacity. TensorD sets it exactly at create;
+/// a standalone opener only lowers it.
+#[test]
+fn tensord_sets_the_capacity_a_standalone_opener_lowers_it() {
+    let g = GpuId { uuid: format!("m{}-limit", std::process::id()), model: "host".into(), memory: 64 * MB };
+    let _scope = Scope::new(&g.uuid);
+    let capacity = |l: &varena::Ledger| l.status().capacity;
+    let ledger = varena::Ledger::create(&g, Some(12 * MB)).unwrap();
+    assert_eq!(capacity(&ledger), 12 * MB);
+    drop(ledger);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    assert_eq!(capacity(&ledger), 64 * MB, "the limit lifted: the card's");
+    drop(varena::Grant::open(&g, Some(8 * MB)).unwrap());
+    assert_eq!(capacity(&ledger), 8 * MB, "a standalone cap lowers it");
+}

@@ -302,6 +302,13 @@ impl Shared {
         Ok(slot.clone())
     }
 
+    /// TensorD's: the capacity is exactly this (a lifted limit raises it).
+    fn set_capacity(&self, capacity: u64) -> Result<()> {
+        let m = self.map()?;
+        header(&m).capacity.store(capacity, Release);
+        Ok(())
+    }
+
     pub fn capacity(&self) -> Result<u64> {
         let m = self.map()?;
         Ok(header(&m).capacity.load(Acquire))
@@ -1000,6 +1007,9 @@ impl Ledger {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
         let table = open_named(&gpu.uuid)?;
         let shared = Arc::new(Shared::adopt(table, gpu, capacity)?);
+        // TensorD is the capacity's authority: min(card, limit) exactly, raised when a limit is
+        // lifted (standalone openers may only lower it).
+        shared.set_capacity(capacity)?;
         let events = os::wake_bind(shared.ns, &gpu.uuid)?.ok_or_else(|| Error::Invalid(format!("another TensorD holds {}", gpu.uuid)))?;
         shared.reap(None)?;
         for (key, _) in shared.facts("dispatch/")? {
