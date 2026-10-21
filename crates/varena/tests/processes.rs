@@ -378,6 +378,10 @@ fn agent() {
                 format!("ok leftover={} kept={} tier={} store={} evicted={:?} spec={}", s.leftover, s.moved.kept.bytes, s.moved.tier.bytes, s.moved.store.bytes, s.evicted, s.moved.speculative)
             }
             ["limit"] => format!("ok {}", mem.as_ref().unwrap().torch_limit()),
+            ["settle"] => {
+                mem.as_ref().unwrap().settle();
+                "ok".into()
+            }
             ["fault", point] => {
                 varena::faults::arm(if *point == "decide" { varena::faults::Point::Decide } else { varena::faults::Point::Fill });
                 "ok".into()
@@ -504,6 +508,7 @@ fn a_killed_holder_leaves_orphans_a_successor_imports(dir: &Path) {
     let mut a = Agent::spawn();
     a.ok(&format!("open {} {}", g.uuid, g.memory));
     a.ok(&format!("load k {} stored gpu", path.display()));
+    a.ok("settle");
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     ledger.reap(a.child.id());
@@ -681,6 +686,7 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
     a.ok("unpin");
     a.ok(&format!("endpass r {}", MB));
     a.ok("end r");
+    a.ok("settle");
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     ledger.reap(a.child.id());
@@ -757,6 +763,7 @@ fn binds_outlive_the_custody_holder(dir: &Path) {
     let mut b = Agent::spawn();
     b.ok(&format!("open {} {}", g.uuid, g.memory));
     b.ok(&format!("load hy {} stored ram", y_path.display()));
+    a.ok("settle");
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     b.ok("request r hy");
