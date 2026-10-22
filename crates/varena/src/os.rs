@@ -490,6 +490,31 @@ mod imp {
         let clean: String = super::named(name).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
         let _ = std::fs::remove_file(format!("/dev/shm/cozy-varena-{uid}-{clean}"));
     }
+
+    /// `/proc/<pid>/status` fields in bytes (`VmHWM`, `RssAnon`, …).
+    fn status(pid: &str, names: &[&str]) -> Option<Vec<u64>> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(':')?.split_whitespace().next()?.parse::<u64>().ok()).map(|kib| kib * 1024);
+        names.iter().map(|n| field(n)).collect()
+    }
+
+    /// This process's anonymous high-water: its resident peak less the file and shared pages it
+    /// maps now (shared: the RAM tier's layouts and host pages), at least its anonymous bytes.
+    pub(crate) fn high_water() -> Option<u64> {
+        let v = status("self", &["VmHWM", "RssFile", "RssShmem", "RssAnon"])?;
+        let (peak, file, shmem, anon) = (*v.first()?, *v.get(1)?, *v.get(2)?, *v.get(3)?);
+        Some(peak.saturating_sub(file + shmem).max(anon))
+    }
+
+    /// Starts this process's resident high-water over from its use now (`clear_refs` 5).
+    pub(crate) fn reset_high_water() {
+        let _ = std::fs::write("/proc/self/clear_refs", b"5");
+    }
+
+    /// `pid`'s anonymous bytes now.
+    pub(crate) fn anon(pid: u32) -> Option<u64> {
+        status(&pid.to_string(), &["RssAnon"])?.first().copied()
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -616,6 +641,13 @@ mod imp {
         Err(later())
     }
     pub(crate) fn unlink(_: &str) {}
+    pub(crate) fn high_water() -> Option<u64> {
+        None
+    }
+    pub(crate) fn reset_high_water() {}
+    pub(crate) fn anon(_: u32) -> Option<u64> {
+        None
+    }
 }
 
 pub(crate) use imp::*;

@@ -34,6 +34,7 @@ use crate::custody;
 use crate::decide::{decide, Action, Trigger, Tried};
 use crate::ledger::{self, Facts, Grant, Room, Row, Shared};
 use crate::table::{Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
+use crate::os;
 use crate::tier;
 use crate::{Error, Exhausted, GpuId, Result};
 
@@ -172,6 +173,11 @@ pub struct Stats {
     pub peak: u64,
     /// The largest room a step had beside its weights (its compute bytes).
     pub room: u64,
+    /// The process's anonymous host high-water over it (the RAM tier's and file mappings
+    /// aside); `None` where it cannot be read.
+    pub host: Option<u64>,
+    /// The RAM tier's resident host bytes when it ended (all layouts, this user's tier).
+    pub tier: u64,
     /// Bytes the request still held when it ended (pins, rooms, caches): 0.
     pub leftover: u64,
 }
@@ -458,6 +464,8 @@ struct State {
     saving: Option<Key>,
     /// The latest unmap's mechanism ticket: whoever counts on its bytes settles up to it.
     last_unmap: Option<u64>,
+    /// Request → its recorded host high-water (`None`: unmeasured).
+    host: HashMap<u64, Option<u64>>,
     /// Request → the `<package>|<shape>` its peak is recorded under.
     peaks: HashMap<u64, String>,
     /// Requests whose last step is one their plan did not declare.
@@ -651,7 +659,12 @@ impl Memory {
             let listener = row.listen()?;
             let room_wake = row.endpoint()?;
             let custody = custody::Client::open(&shared).map_err(|e| tracing::warn!("varena: no custody: {e}")).ok().map(Arc::new);
-            let tier = tier::Client::open(shared.ns).map_err(|e| tracing::warn!("varena: no RAM tier: {e}")).ok().map(Arc::new);
+            // Serving the tier here, it keeps this GPU's running requests' host growth free.
+            let need: tier::Need = Arc::new({
+                let shared = shared.clone();
+                move || ledger::host_need(&shared)
+            });
+            let tier = tier::Client::open(shared.ns, need).map_err(|e| tracing::warn!("varena: no RAM tier: {e}")).ok().map(Arc::new);
             let (to_custody, to_tier, mech) = (Arc::new(Outbox::default()), Arc::new(Outbox::default()), Arc::new(Outbox::default()));
             let (release_tx, releases) = unbounded();
             let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
@@ -1092,6 +1105,8 @@ impl Inner {
             outside: t.outside(),
             yielded: t.requests.iter().map(|r| t.yielded_w(r)).sum(),
             family: t.requests.iter().find(|r| r.yielded.is_some()).map_or(0, |r| r.family),
+            host_peak: st.host.values().flatten().copied().max().unwrap_or(0),
+            host_unmeasured: st.host.values().filter(|h| h.is_none()).count() as u64,
         });
     }
 
@@ -1926,6 +1941,15 @@ impl Inner {
             st.peaks.insert(rid, String::from_utf8_lossy(&peak).into_owned());
             self.shared.put(&key, None)?;
         }
+        // Its host high-water is measured from its start (the process's, when it runs alone).
+        if st.table.requests.is_empty() {
+            os::reset_high_water();
+        }
+        let host = match st.peaks.get(&rid) {
+            Some(key) => self.shared.fact(&format!("host/{key}"))?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes),
+            None => None,
+        };
+        st.host.insert(rid, host);
         st.table.requests.push(Req { id: rid, name: id.to_string(), steps, rooms, ..Req::default() });
         // A cold request's record carries the fills since the last one ended (its loads).
         let earlier = std::mem::take(&mut st.unclaimed);
@@ -2386,12 +2410,19 @@ impl Inner {
         let shrinks: Vec<(u32, u64, Shrink)> = holding.iter().filter_map(|id| st.shrinks.get(id).map(|s| (*id, u64::MAX, s.clone()))).collect();
         let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
         let mut stats = st.stats.remove(&req).unwrap_or_default();
+        st.host.remove(&req);
+        // Its host high-water (the process's since the first open request started).
+        stats.host = os::high_water();
         if let Some(key) = st.peaks.remove(&req) {
             let _ = ledger::record_peak(&self.shared, &format!("peak/{key}"), stats.peak);
             let _ = ledger::record_compute(&self.shared, &key, stats.room);
+            if let Some(h) = stats.host {
+                let _ = ledger::record_host(&self.shared, &key, h);
+            }
         }
         self.unlock(st);
         self.shrink(shrinks);
+        stats.tier = self.tier.as_ref().map_or(0, |t| t.resident());
         let mut st = self.lock();
         st.table.caches.retain(|c| !owned.contains(&c.id));
         owned.iter().for_each(|id| {

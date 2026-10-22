@@ -32,7 +32,7 @@ use crate::memory::SitePeak;
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledger8");
+const MAGIC: u64 = u64::from_le_bytes(*b"vledger9");
 /// The header's page: the heap starts after it, and grows from there.
 const HEADER: u64 = 4096;
 /// The heap's unit: rows take two, a fact as many as its bytes need.
@@ -50,8 +50,8 @@ const ROW: u64 = 1;
 const FACT: u64 = 2;
 
 /// The latch: context, torch, caches, classes (7), remaining, unmeasured, running, outside,
-/// yielded, family.
-const WORDS: usize = 16;
+/// yielded, family, host_peak, host_unmeasured.
+const WORDS: usize = 18;
 
 #[repr(C)]
 struct Header {
@@ -147,17 +147,21 @@ pub(crate) struct Facts {
     /// (a hash; 0: none): only that family's child is admitted beside it as if it were gone.
     pub yielded: u64,
     pub family: u64,
+    /// Its running requests' largest measured host high-water, and how many have none
+    /// measured: the RAM tier keeps their growth free, and fills nothing beside an unmeasured one.
+    pub host_peak: u64,
+    pub host_unmeasured: u64,
 }
 
 impl Facts {
     fn words(&self) -> [u64; WORDS] {
         let c = self.classes;
-        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family]
+        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family, self.host_peak, self.host_unmeasured]
     }
 
     fn of(w: [u64; WORDS]) -> Facts {
-        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family] = w;
-        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family }
+        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured] = w;
+        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured }
     }
 
     fn held(&self) -> u64 {
@@ -640,6 +644,26 @@ impl Shared {
     }
 }
 
+/// A request's host high-water at `host/<package>|<shape>`: the larger stays.
+pub(crate) fn record_host(shared: &Shared, key: &str, bytes: u64) -> Result<()> {
+    record_peak(shared, &format!("host/{key}"), bytes)
+}
+
+/// What the host must keep free for the requests running on this GPU: each live row's
+/// measured host high-water less its process's anonymous bytes now. `None`: a running request
+/// is unmeasured (the RAM tier fills nothing beside it).
+pub(crate) fn host_need(shared: &Shared) -> Option<u64> {
+    let rows = shared.rows().ok()?;
+    let mut need = 0u64;
+    for r in rows.iter().filter(|r| r.live && r.facts.running > 0) {
+        if r.facts.host_unmeasured > 0 {
+            return None;
+        }
+        need = need.saturating_add(r.facts.host_peak.saturating_sub(os::anon(r.pid).unwrap_or(0)));
+    }
+    Some(need)
+}
+
 /// A request's compute room (beside its weights) at `compute/<package>|<shape>`: the latest
 /// run's replaces what was there, as a pass's room does (one large run never pins it).
 pub(crate) fn record_compute(shared: &Shared, key: &str, bytes: u64) -> Result<()> {
@@ -1025,6 +1049,9 @@ pub enum Peak {
     Pass { key: String, room: Room },
     /// A set's resident bytes (its layout's span), by set name.
     Set { key: String, bytes: u64 },
+    /// A request's host high-water at `<package>|<shape>` (anonymous bytes; the RAM tier's and
+    /// file mappings aside).
+    Host { key: String, bytes: u64 },
 }
 
 /// A pass's measured room, as the ledger keeps it under `room/<set>|<shape>|<cuts>`. One unit
@@ -1197,6 +1224,12 @@ impl Ledger {
         Ok(decide::place(&rooms, &bytes))
     }
 
+    /// What the host must keep free for the requests running on this GPU (`None`: one is
+    /// unmeasured): TensorD's RAM tier sums its GPUs' ([`crate::Tier::serve`]).
+    pub fn host_need(&self) -> Option<u64> {
+        host_need(&self.shared)
+    }
+
     /// Names the `<package>|<shape>` a request's peak is recorded under, before it runs. The
     /// executor consumes it when the request opens.
     pub fn dispatch(&self, request: &str, package: &str, shape: &str) -> Result<()> {
@@ -1220,6 +1253,11 @@ impl Ledger {
                 out.push(Peak::Pass { key: key.trim_start_matches("room/").to_string(), room });
             }
         }
+        for (key, v) in self.shared.facts("host/").unwrap_or_default() {
+            if let Ok(bytes) = v.try_into().map(u64::from_le_bytes) {
+                out.push(Peak::Host { key: key.trim_start_matches("host/").to_string(), bytes });
+            }
+        }
         for (key, v) in self.shared.facts("compute/").unwrap_or_default() {
             if let Ok(bytes) = v.try_into().map(u64::from_le_bytes) {
                 out.push(Peak::Compute { key: key.trim_start_matches("compute/").to_string(), bytes });
@@ -1241,6 +1279,7 @@ impl Ledger {
                 Peak::Request { key, bytes } => restore_fact(&self.shared, &format!("peak/{key}"), bytes.to_le_bytes().to_vec())?,
                 Peak::Pass { key, room } => restore_fact(&self.shared, &format!("room/{key}"), os::encode(room)?)?,
                 Peak::Set { key, bytes } => record_set(&self.shared, key, *bytes)?,
+                Peak::Host { key, bytes } => record_host(&self.shared, key, *bytes)?,
                 Peak::Compute { key, bytes } => restore_fact(&self.shared, &format!("compute/{key}"), bytes.to_le_bytes().to_vec())?,
             }
         }

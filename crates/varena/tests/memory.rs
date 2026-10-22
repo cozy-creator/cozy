@@ -487,13 +487,17 @@ fn one(dir: &Path, uuid: &str, name: &str, fill: Fill) -> SetSpec {
 }
 
 /// One page of room: binds `set`'s block in its own request (after `other` took the page),
-/// bakes it to `bake` when it comes back fresh, and returns (fresh, its first byte).
-fn rebind(mem: &Memory, set: varena::SetId, other: varena::SetId, bake: u8) -> (bool, u8) {
+/// bakes it to `bake` when it comes back fresh, and returns (fresh, its first byte). Its
+/// requests are measured calls (a host peak recorded), so the RAM tier takes their copies.
+fn rebind(ledger: &varena::Ledger, mem: &Memory, set: varena::SetId, other: varena::SetId, bake: u8) -> (bool, u8) {
+    ledger.restore(&[varena::Peak::Host { key: "pkg|1x1".into(), bytes: 0 }]).unwrap();
+    ledger.dispatch("other", "pkg", "1x1").unwrap();
     let r = mem.request("other", Plan { steps: vec![Step { sets: vec!["pkg@1/other".into()], passes: 1 }] }).unwrap();
     let pass = r.pass(other, "fwd", "1x1", Torch::default()).unwrap();
     drop(mem.bind(other, 0, 0).unwrap());
     pass.end(Measured::default(), Torch::default());
     r.end();
+    ledger.dispatch("lora", "pkg", "1x1").unwrap();
     let r = mem.request("lora", plan("lora")).unwrap();
     let pass = r.pass(set, "fwd", "1x1", Torch::default()).unwrap();
     let pin = mem.bind(set, 0, 0).unwrap();
@@ -520,18 +524,18 @@ fn rebind(mem: &Memory, set: varena::SetId, other: varena::SetId, bake: u8) -> (
 #[test]
 fn the_tier_keeps_baked_pages_by_identity_and_never_hands_them_out_fresh() {
     let dir = tempfile::tempdir().unwrap();
-    let (_scope, _l, mem, g) = open("baked", REGION_ALIGN);
+    let (_scope, ledger, mem, g) = open("baked", REGION_ALIGN);
     let lora = mem.load(one(dir.path(), &g.uuid, "lora", Fill::Declared("a".into())), Level::Ram).unwrap();
     let other = mem.load(one(dir.path(), &g.uuid, "other", Fill::Stored), Level::Ram).unwrap();
-    assert_eq!(rebind(&mem, lora, other, 0x11), (true, 7), "first use: the store's bytes, baked to a");
+    assert_eq!(rebind(&ledger, &mem, lora, other, 0x11), (true, 7), "first use: the store's bytes, baked to a");
     assert!(mem.stats().unwrap().moved.saved.bytes > 0, "the baked page went to the tier");
-    assert_eq!(rebind(&mem, lora, other, 0x11), (false, 0x11), "a tier hit holds a's weights: not baked again");
+    assert_eq!(rebind(&ledger, &mem, lora, other, 0x11), (false, 0x11), "a tier hit holds a's weights: not baked again");
     mem.fill(lora, Fill::Declared("b".into()));
     mem.settle();
-    assert_eq!(rebind(&mem, lora, other, 0x22), (true, 7), "b: the store's bytes, fresh, never a's");
+    assert_eq!(rebind(&ledger, &mem, lora, other, 0x22), (true, 7), "b: the store's bytes, fresh, never a's");
     mem.fill(lora, Fill::Declared("a".into()));
     mem.settle();
-    assert_eq!(rebind(&mem, lora, other, 0x33), (false, 0x11), "a's layout is untouched");
+    assert_eq!(rebind(&ledger, &mem, lora, other, 0x33), (false, 0x11), "a's layout is untouched");
 }
 
 /// Review 4, L1: placement keeps only the package's compute room free on GPU 0, so measuring a
@@ -584,4 +588,29 @@ fn an_impossible_need_is_exhausted_at_once() {
     drop(mem.bind(id, 1, 0).unwrap());
     assert_eq!(r.stats().trace.last().map(|t| t.origin), Some(varena::Origin::Hit));
     pass.end(Measured::default(), Torch::default());
+}
+
+/// Host-OOM, the varena side: a request records its host high-water (Peak::Host, its
+/// anonymous bytes; the tier's and file mappings aside); while a request runs unmeasured the
+/// GPU's host need is unknown, and once measured it is that high-water less what the process
+/// holds now.
+#[test]
+fn a_request_records_its_host_high_water() {
+    let (_scope, ledger, mem, _g) = open("host", 8 * MB);
+    ledger.dispatch("first", "pkg", "1x1").unwrap();
+    let r = mem.request("first", Plan { steps: vec![] }).unwrap();
+    assert_eq!(ledger.host_need(), None, "a running request with no host peak");
+    let held: Vec<u8> = vec![1; (64 * MB) as usize];
+    let stats = r.end();
+    assert!(stats.host.is_some_and(|h| h >= 64 * MB), "{:?}", stats.host);
+    let recorded = ledger.peaks().into_iter().find_map(|p| match p {
+        varena::Peak::Host { key, bytes } if key == "pkg|1x1" => Some(bytes),
+        _ => None,
+    });
+    assert!(recorded.is_some_and(|b| b >= 64 * MB), "{recorded:?}");
+    ledger.dispatch("second", "pkg", "1x1").unwrap();
+    let r = mem.request("second", Plan { steps: vec![] }).unwrap();
+    assert!(ledger.host_need().is_some(), "measured now");
+    drop(held);
+    r.end();
 }
