@@ -33,7 +33,7 @@ use crate::backend::{Access, Backend, Event, Physical, Va};
 use crate::custody;
 use crate::decide::{decide, Action, Trigger, Tried};
 use crate::ledger::{self, Facts, Grant, PhysicalChange, Room, Row, Shared};
-use crate::table::{Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
+use crate::table::{Aside, Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
 use crate::tier;
 use crate::{Error, Exhausted, GpuId, Result};
 
@@ -1934,7 +1934,8 @@ impl Inner {
             yielded: yielded_by_family(t),
             host_peak: st.host.values().flatten().copied().max().unwrap_or(0),
             host_unmeasured: st.host.values().filter(|h| h.is_none()).count() as u64,
-            returning: t.returning,
+            // Retiring bytes, and the caches' shrinks queued or asked (torch's bytes coming).
+            returning: t.returning + t.caches.iter().map(|c| c.coming).sum::<u64>(),
         }
     }
 
@@ -2730,7 +2731,7 @@ impl Inner {
             self.publish(&mut st);
             drop(admission);
             self.unlock(st);
-            self.shrink(shrinks);
+            self.shrink(shrinks, false);
             if remote.is_empty() {
                 return Ok(actions);
             }
@@ -2775,7 +2776,7 @@ impl Inner {
             Trigger::Oom { need, .. } => ("oom", need.unwrap_or(0)),
             Trigger::Prepare { pages, .. } => ("prepare", pages.iter().filter_map(|k| st.table.page(*k)).filter(|p| !p.mapped).map(|p| p.bytes).sum()),
             Trigger::Workspace { bytes, .. } => ("workspace", *bytes),
-            Trigger::Outside { room, .. } => ("outside", room.unwrap_or(0)),
+            Trigger::Outside { req, .. } => ("outside", st.table.request(*req).and_then(|r| r.aside.bytes()).unwrap_or(0)),
             Trigger::Speculate { .. } | Trigger::Ask { .. } | Trigger::Load { .. } => return,
         };
         let step = st.table.request(req).map_or(0, |r| r.cursor.step);
@@ -2915,13 +2916,17 @@ impl Inner {
     }
 
     /// Runs caches' shrink callbacks, the lock released (they are the caller's code).
-    fn shrink(&self, shrinks: Vec<(u32, u64, Shrink)>) {
+    /// Runs caches' shrinks, the lock released (the caller's code). `announced`: an answer to a
+    /// peer marked the bytes coming beforehand (review 6, C2); they now are what is still to
+    /// come.
+    fn shrink(&self, shrinks: Vec<(u32, u64, Shrink)>, announced: bool) {
         for (id, bytes, f) in shrinks {
             let shrunk = crate::caught(|| Ok(f(bytes))).unwrap_or_default();
             let mut st = self.state.lock();
             if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == id) {
                 c.bytes = c.bytes.saturating_sub(shrunk.freed + shrunk.coming);
-                c.coming += shrunk.coming;
+                let before = if announced { c.coming.saturating_sub(bytes) } else { c.coming };
+                c.coming = before + shrunk.coming;
             }
         }
     }
@@ -3128,9 +3133,20 @@ impl Inner {
         };
         st.host.insert(rid, host);
         // Its room outside its passes, as measured for its dispatch key.
+        // As measured for its key, else the largest of its package's at any shape (review 6, C3).
+        let bytes = |v: Vec<u8>| v.try_into().ok().map(u64::from_le_bytes);
         let aside = match st.peaks.get(&rid) {
-            Some(key) => self.shared.fact(&format!("aside/{key}"))?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes),
-            None => None,
+            None => Aside::Unknown,
+            Some(key) => match self.shared.fact(&format!("aside/{key}"))?.and_then(bytes) {
+                Some(b) => Aside::Measured(b),
+                None => {
+                    let package = key.split('|').next().unwrap_or_default();
+                    match self.shared.facts(&format!("aside/{package}|"))?.into_iter().filter_map(|(_, v)| bytes(v)).max() {
+                        Some(b) => Aside::Measured(b),
+                        None => Aside::Unmeasured,
+                    }
+                }
+            },
         };
         st.table.requests.push(Req { id: rid, name: id.to_string(), steps, rooms, aside, ..Req::default() });
         // Its plan reclassifies pages (N to D): the stock is offered again.
@@ -3148,12 +3164,7 @@ impl Inner {
     /// at each pass end), outside the allocator callback: its kept idle pages lent to the
     /// callback as the room needs (all of them while it is unmeasured), never evicted for it.
     fn prepare_outside(&self, req: u64) -> Result<()> {
-        let room = {
-            let st = self.lock();
-            let Some(r) = st.table.request(req) else { return Ok(()) };
-            r.aside
-        };
-        self.demand(Trigger::Outside { req, room, tried: Tried::default() }, Some(req)).map(|_| ())
+        self.demand(Trigger::Outside { req, tried: Tried::default() }, Some(req)).map(|_| ())
     }
 
     fn bind(self: &Arc<Self>, set: u32, block: u32, stream: usize) -> Result<Pin> {
@@ -3691,7 +3702,7 @@ impl Inner {
             }
         }
         self.unlock(st);
-        self.shrink(shrinks);
+        self.shrink(shrinks, false);
         stats.tier = self.tier.as_ref().map_or(0, |t| t.resident());
         let mut st = self.lock();
         st.table.caches.retain(|c| !owned.contains(&c.id));
@@ -3754,7 +3765,14 @@ impl Inner {
                         self.unmap(&mut st, *page, *class, None, true)?;
                     }
                     Action::Trim(_) => wanted.trim = true,
-                    Action::Shrink { cache, bytes } => wanted.shrinks.push((*cache, *bytes)),
+                    // Its trim thread shrinks it after the reply; the bytes are coming meanwhile
+                    // (published), so the asker waits for them rather than escalating (C2).
+                    Action::Shrink { cache, bytes } => {
+                        if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == *cache) {
+                            c.coming += *bytes;
+                        }
+                        wanted.shrinks.push((*cache, *bytes));
+                    }
                     _ => {}
                 }
             }
@@ -3835,7 +3853,7 @@ impl Inner {
             let st = self.state.lock();
             wanted.shrinks.iter().filter_map(|(id, b)| st.shrinks.get(id).map(|s| (*id, *b, s.clone()))).collect()
         };
-        self.shrink(shrinks);
+        self.shrink(shrinks, true);
         let mut st = self.state.lock();
         self.publish(&mut st);
         drop(st);

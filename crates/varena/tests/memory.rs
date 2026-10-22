@@ -868,3 +868,29 @@ fn a_retry_mark_survives_the_failed_tries_pass_end() {
     assert!(matches!(next, Next::Cut(1)), "the outside cut goes finer, no second Retry: {next:?}");
 }
 
+/// Review 6, C3: a request's room outside its passes is its package's largest measured one at
+/// any shape when its own shape has none, so it lends only what that room needs; the idle-GPU
+/// rule is for a package never measured.
+#[test]
+fn an_outside_room_is_its_packages_largest_at_any_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("aside-package", 16 * MB);
+    let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
+    mem.load(set(dir.path(), "big", 10, &g.uuid), Level::Gpu).unwrap();
+    mem.settle();
+    // Never measured: every idle page is lent, so a large first allocation finds them all.
+    assert!(varena::Ledger::admit(&[&ledger], "first", "pkg", "1x8", None).unwrap());
+    let r = mem.request("first", plan("a")).unwrap();
+    assert_eq!(r.reclaim_allocation(REGION_ALIGN).unwrap(), REGION_ALIGN);
+    r.outside(2 * REGION_ALIGN);
+    r.pass(a, "fwd", "1x8", Torch::default()).unwrap().end(Measured::default(), Torch::default());
+    r.end();
+    mem.settle();
+    // Another shape of the package: its room is the package's 2 pages, of which one is free (the
+    // page the first allocation took): one page is lent, and a callback finds no more.
+    assert!(varena::Ledger::admit(&[&ledger], "second", "pkg", "2x8", None).unwrap());
+    let r = mem.request("second", plan("a")).unwrap();
+    assert_eq!(r.reclaim_allocation(4 * REGION_ALIGN).unwrap(), REGION_ALIGN, "only what the measured room needs is lent");
+    r.end();
+}
+

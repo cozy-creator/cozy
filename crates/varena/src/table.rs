@@ -257,13 +257,35 @@ pub struct Req {
     /// The family it waits for while yielded (`crate::ledger` publishes it; 0: none).
     pub family: u64,
     pub episode: Episode,
-    /// Its room outside its passes (its setup, between passes) as measured for its dispatch
-    /// key; `None`: unmeasured (every idle byte is its, as for an unmeasured pass).
-    pub aside: Option<u64>,
+    /// Its room outside its passes (its setup, between passes).
+    pub aside: Aside,
     /// The last OOM answered Retry, by site: a second one there with no progress past it
     /// escalates (lead, v6 13592: the whole decode re-ran at one level three times). A pass's
     /// end does not clear it: a failed try ends its passes too (S4's tiled decode).
     pub retried: Option<Retried>,
+}
+
+/// A request's room outside its passes (its setup, between passes), as its dispatch key's
+/// records give it (review 6, C3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Aside {
+    /// Measured: for its key, else the largest of its package's at any shape.
+    Measured(u64),
+    /// Its package was never measured: every idle byte is its (the idle-GPU rule, peers'
+    /// idle pages included).
+    Unmeasured,
+    /// No dispatch key (a standalone call): its own idle pages, lent.
+    #[default]
+    Unknown,
+}
+
+impl Aside {
+    pub fn bytes(self) -> Option<u64> {
+        match self {
+            Aside::Measured(b) => Some(b),
+            Aside::Unmeasured | Aside::Unknown => None,
+        }
+    }
 }
 
 /// Where an OOM answered Retry failed: its site, op shape, the site's level then, and how far
@@ -462,7 +484,7 @@ impl Table {
         let mut held = 0u64;
         for r in &self.requests {
             let next = r.rooms.get(r.cursor.step as usize).copied().flatten();
-            match (r.aside, next) {
+            match (r.aside.bytes(), next) {
                 (Some(aside), Some(room)) => held = held.saturating_add(aside).saturating_add(room),
                 _ => return u64::MAX,
             }
@@ -553,7 +575,8 @@ impl Table {
     /// Unique backing already retiring. It remains charged until its owners finish; neither
     /// overlapping mechanism/custody tickets nor ownership-lost quarantines add reclaim credit.
     pub fn returning(&self) -> u64 {
-        self.returning.min(self.vmm) + self.transient + self.caches.iter().map(|c| c.coming).sum::<u64>() + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
+        // A peer's: its retiring pages (P) and its caches' bytes coming (torch's).
+        self.returning.min(self.vmm) + self.transient + self.caches.iter().map(|c| c.coming).sum::<u64>() + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0) + r.torch)).sum::<u64>()
     }
 
     fn others_held(&self) -> u64 {
