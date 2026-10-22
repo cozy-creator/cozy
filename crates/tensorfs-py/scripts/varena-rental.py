@@ -2,7 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["cozy-runtime>=0.27.4", "torch", "diffusers"]
 # ///
-"""A varena test script (varena-standalone.py, varena-sdxl-cap.py) on a rental's GPU:
+"""A varena test script (varena-standalone.py, varena-mempool.py) on a rental's GPU:
 `cozy run varena-rental.py --on <rental> --gpus 1 --asset wheel=<tensorfs wheel> --asset script=<script>`.
 
 The script runs in a fresh process of this script's interpreter (its environment has torch and
