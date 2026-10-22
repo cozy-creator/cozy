@@ -573,3 +573,30 @@ pub fn fits(capacity: u64, foreign: u64, rows: &[Admitted], dispatched: &[Option
     let dispatched: u64 = dispatched.iter().flatten().sum();
     rows + dispatched + w.unwrap_or(0) <= capacity.saturating_sub(foreign)
 }
+
+/// Where each set of a group's package lives, as an index into the group's GPUs. `rooms[g]` is
+/// what GPU g holds beside what cannot move there (on GPU 0, the package's measured working set
+/// too); `sets[i]` is set i's bytes, `None` when unknown. Largest first: GPU 0 keeps a set that
+/// fits there, else the GPU with the most room that holds it takes it, else it stays on GPU 0
+/// (it pages there). An unknown set goes where the most room is left.
+pub fn place(rooms: &[u64], sets: &[Option<u64>]) -> Vec<u32> {
+    let mut left = rooms.to_vec();
+    let mut out = vec![0; sets.len()];
+    let mut order: Vec<usize> = (0..sets.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(sets.get(i).copied().flatten().map_or(0, |b| b + 1)));
+    let most = |left: &[u64], holds: &dyn Fn(u64) -> bool| left.iter().enumerate().filter(|(_, r)| holds(**r)).max_by_key(|(g, r)| (**r, std::cmp::Reverse(*g))).map(|(g, _)| g);
+    for i in order {
+        let g = match sets.get(i).copied().flatten() {
+            Some(bytes) if left.first().is_some_and(|r| *r >= bytes) => 0,
+            Some(bytes) => most(&left, &|r| r >= bytes).unwrap_or(0),
+            None => most(&left, &|_| true).unwrap_or(0),
+        };
+        if let (Some(r), Some(bytes)) = (left.get_mut(g), sets.get(i).copied().flatten()) {
+            *r = r.saturating_sub(bytes);
+        }
+        if let Some(o) = out.get_mut(i) {
+            *o = g as u32;
+        }
+    }
+    out
+}

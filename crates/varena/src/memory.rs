@@ -1749,6 +1749,8 @@ impl Inner {
                 Some(_) => return Err(Error::Invalid(format!("set {} is loaded with another layout or release", spec.name))),
                 None => {
                     let layout = &spec.layout;
+                    // Its resident bytes, for placement: exact, from its layout.
+                    ledger::record_set(&self.shared, &spec.name, layout.nbytes)?;
                     let va = self.backend.reserve(layout.nbytes)?;
                     let pages = layout.regions.iter().map(|r| Page { bytes: r.span, ..Page::default() }).collect();
                     let set = Set { name: spec.name.clone(), pages, declared: spec.fingerprint.declared() };

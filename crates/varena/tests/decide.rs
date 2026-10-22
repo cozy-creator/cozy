@@ -494,3 +494,16 @@ fn the_tier_never_releases_a_region_in_flight() {
     let order: Vec<&str> = room.iter().map(|a| match a { HostAction::Release { digest, .. } | HostAction::Forget(digest) => digest.as_str() }).collect();
     assert_eq!(order, vec!["orphan", "unused", "far", "near"]);
 }
+
+/// S5 r3: largest first; GPU 0 keeps what fits beside the working set, else the GPU with the
+/// most room that holds it, else GPU 0 (it pages there); an unknown set goes where the most
+/// room is left.
+#[test]
+fn sets_place_largest_first_and_stay_on_gpu_0_when_they_fit() {
+    use varena::decide::place;
+    assert_eq!(place(&[10 * MB, 20 * MB], &[Some(4 * MB), Some(6 * MB)]), vec![0, 0], "both fit on GPU 0");
+    assert_eq!(place(&[8 * MB, 20 * MB], &[Some(4 * MB), Some(6 * MB)]), vec![1, 0], "the larger first: GPU 0 keeps 6, the 4 moves");
+    assert_eq!(place(&[2 * MB, 5 * MB, 7 * MB], &[Some(4 * MB)]), vec![2], "the most room that holds it");
+    assert_eq!(place(&[2 * MB, 3 * MB], &[Some(4 * MB)]), vec![0], "nowhere holds it: GPU 0 pages it");
+    assert_eq!(place(&[2 * MB, 9 * MB, 3 * MB], &[None, Some(4 * MB)]), vec![1, 1], "known first; the unknown where the most is left");
+}

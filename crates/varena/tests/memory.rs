@@ -451,3 +451,28 @@ fn tensord_sets_the_capacity_a_standalone_opener_lowers_it() {
     drop(varena::Grant::open(&g, Some(8 * MB)).unwrap());
     assert_eq!(capacity(&ledger), 8 * MB, "a standalone cap lowers it");
 }
+
+/// S5 r3: a load records its set's bytes (its layout's span) on its GPU's table, persisted as
+/// Peak::Set; placement homes a set that does not fit beside GPU 0's pinned pages on the GPU
+/// with room, and keeps it on GPU 0 once they let go.
+#[test]
+fn a_set_goes_where_it_fits_and_stays_on_gpu_0_when_it_can() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("place0", 8 * MB);
+    let other = GpuId { uuid: format!("m{}-place1", std::process::id()), model: "host".into(), memory: 8 * MB };
+    let _other_scope = Scope::new(&other.uuid);
+    let second = varena::Ledger::create(&other, None).unwrap();
+    let big = mem.load(set(dir.path(), "big", 3, &g.uuid), Level::Ram).unwrap();
+    mem.load(set(dir.path(), "te", 2, &g.uuid), Level::Ram).unwrap();
+    assert!(ledger.peaks().contains(&varena::Peak::Set { key: "pkg@1/te".into(), bytes: 2 * REGION_ALIGN }));
+    let r = mem.request("r", plan("big")).unwrap();
+    let pass = r.pass(big, "fwd", "1x8", Torch::default()).unwrap();
+    let pins: Vec<_> = (0..3).map(|b| mem.bind(big, b, 0).unwrap()).collect();
+    let te = [("pkg@1/te", None)];
+    assert_eq!(varena::Ledger::place(&[&ledger, &second], "pkg", "", None, &te).unwrap(), vec![1], "GPU 0 holds 2 MB beside the running pass");
+    drop(pins);
+    pass.end(Measured::default(), Torch::default());
+    r.end();
+    assert_eq!(varena::Ledger::place(&[&ledger, &second], "pkg", "", None, &te).unwrap(), vec![0], "idle, GPU 0 keeps it");
+    assert_eq!(varena::Ledger::place(&[&ledger, &second], "pkg", "", None, &[("pkg@1/te", Some(6 * MB))]).unwrap(), vec![0], "a layout's bytes, given");
+}

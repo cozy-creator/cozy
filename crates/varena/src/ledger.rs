@@ -648,6 +648,14 @@ pub(crate) fn record_peak(shared: &Shared, key: &str, bytes: u64) -> Result<()> 
     })
 }
 
+/// A set's resident bytes at `set/<name>`, from its layout: the larger stays.
+pub(crate) fn record_set(shared: &Shared, name: &str, bytes: u64) -> Result<()> {
+    shared.merge(&format!("set/{name}"), |old| {
+        let known = old.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes);
+        Some(known.map_or(bytes, |k| k.max(bytes)).to_le_bytes().to_vec())
+    })
+}
+
 /// A pass's room at `room/<key>`: the latest measurement replaces what was there (a room comes
 /// down when a pass measures less).
 pub(crate) fn record_room(shared: &Shared, key: &str, room: &Room) -> Result<()> {
@@ -1006,6 +1014,8 @@ pub enum Peak {
     Request { key: String, bytes: u64 },
     /// A pass's room at `<set>|<shape>|<cuts>`, every field as measured.
     Pass { key: String, room: Room },
+    /// A set's resident bytes (its layout's span), by set name.
+    Set { key: String, bytes: u64 },
 }
 
 /// A pass's measured room, as the ledger keeps it under `room/<set>|<shape>|<cuts>`. One unit
@@ -1132,6 +1142,43 @@ impl Ledger {
         Ok(true)
     }
 
+    /// The GPU of `group` (an index) that keeps each set of `package`'s request at `shape`
+    /// ([`decide::place`]). A set's bytes are its layout's when the caller has it (`Some`),
+    /// else as its load recorded them on any GPU of the group, else unknown. Each GPU's room is
+    /// its capacity less foreign bytes and every live row's unmovable bytes (context, torch,
+    /// W, P, and a yielded parent's W unless it waits for `family`); GPU 0's less the
+    /// package's measured working set too.
+    pub fn place(group: &[&Ledger], package: &str, shape: &str, family: Option<&str>, sets: &[(&str, Option<u64>)]) -> Result<Vec<u32>> {
+        let family = family.map(family_id);
+        let mut rooms = Vec::with_capacity(group.len());
+        for (g, l) in group.iter().enumerate() {
+            // A yielded parent's W comes back, except to its own family's child.
+            let unmovable = |f: &Facts| f.context + f.torch + [Class::W, Class::P].iter().filter_map(|c| f.classes.get(c.index())).sum::<u64>() + if family == Some(f.family) { 0 } else { f.yielded };
+            let held: u64 = l.shared.rows()?.iter().filter(|r| r.live).map(|r| unmovable(&r.facts)).sum();
+            let working = match g {
+                0 => l.peak(&format!("{package}|{shape}"))?.unwrap_or(0),
+                _ => 0,
+            };
+            rooms.push(l.shared.capacity()?.saturating_sub(l.shared.foreign()? + held + working));
+        }
+        let mut bytes = Vec::with_capacity(sets.len());
+        for (name, known) in sets {
+            let recorded = || -> Result<Option<u64>> {
+                let mut most = None;
+                for l in group {
+                    let b = l.shared.fact(&format!("set/{name}"))?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes);
+                    most = most.max(b);
+                }
+                Ok(most)
+            };
+            bytes.push(match known {
+                Some(b) => Some(*b),
+                None => recorded()?,
+            });
+        }
+        Ok(decide::place(&rooms, &bytes))
+    }
+
     /// Names the `<package>|<shape>` a request's peak is recorded under, before it runs. The
     /// executor consumes it when the request opens.
     pub fn dispatch(&self, request: &str, package: &str, shape: &str) -> Result<()> {
@@ -1155,6 +1202,11 @@ impl Ledger {
                 out.push(Peak::Pass { key: key.trim_start_matches("room/").to_string(), room });
             }
         }
+        for (key, v) in self.shared.facts("set/").unwrap_or_default() {
+            if let Ok(bytes) = v.try_into().map(u64::from_le_bytes) {
+                out.push(Peak::Set { key: key.trim_start_matches("set/").to_string(), bytes });
+            }
+        }
         out
     }
 
@@ -1165,6 +1217,7 @@ impl Ledger {
             match p {
                 Peak::Request { key, bytes } => restore_fact(&self.shared, &format!("peak/{key}"), bytes.to_le_bytes().to_vec())?,
                 Peak::Pass { key, room } => restore_fact(&self.shared, &format!("room/{key}"), os::encode(room)?)?,
+                Peak::Set { key, bytes } => record_set(&self.shared, key, *bytes)?,
             }
         }
         Ok(())
