@@ -100,7 +100,7 @@ impl Server {
         let paths =
             tensord::machine::update::Paths::new(&root.join("state"), &root.join("image"));
         identity.updates = Some(
-            tensord::machine::update::Updates::open(paths, Box::new(|| true), None, None).unwrap(),
+            tensord::machine::update::Updates::open(paths, "3.12".into(), Box::new(|| true), None, None).unwrap(),
         );
         let pin = tensorfs::sha256::digest(&identity.cert_der);
         let machine = tensord::origin::Machine::new(store.clone(), None).unwrap();
