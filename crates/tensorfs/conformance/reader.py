@@ -173,13 +173,14 @@ def version(name: str) -> Version | None:
 
 def default_tag(repo: dict) -> dict | None:
     """Of the public, non-yanked tags, the highest final version, else the highest pre-release
-    (a, b, rc, .dev); of equal versions, the last created."""
+    (a, b, rc, .dev); of equal versions, the last created. Else `main` unless yanked."""
     best, key = None, None
     for t in repo["tags"]:
         v = version(t["name"]) if t["public"] and not t["yanked"] else None
         if v is not None and (best is None or (not v.is_prerelease, v) >= key):
             best, key = t, (not v.is_prerelease, v)
-    return best
+    main = next((t for t in repo["tags"] if t["name"] == "main" and not t["yanked"]), None)
+    return best or main
 
 
 def resolve(repo: dict, revision: str | None, tree) -> tuple[dict, str | None] | None:

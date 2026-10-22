@@ -1,4 +1,4 @@
-//! `tfs`: the Python verbs on the command line (`convert`, `download`, `upload`, `export`,
+//! `tfs`: the Python verbs on the command line (`import`, `download`, `upload`, `export`,
 //! `inspect`, `verify`), plus `ceiling`, `conform endpoint`, `dev ckpt` and `version`.
 
 mod dev;
@@ -16,7 +16,7 @@ use tensorfs::store::Store;
 use tensorfs::{fetch, Checkpoint, Client, Config, Convert, Download, Format, Open, Ref, Selection};
 
 const VERBS: &[&str] = &[
-    "convert <source>... [--converter <c>] [--source-variant <v>] [--name local/<name>[@tag]]",
+    "import <source>... [--converter <c>] [--source-variant <v>] [--name local/<name>[@tag]]",
     "download <ref> [--dir <dir>]",
     "upload <folder> <org/name>[@tag] [--delete <glob>]...  commits the folder onto the tag (main); the token is $TENSORFS_TOKEN",
     "export <ref> <dir> [--safetensors [--decode] | --gguf]",
@@ -29,11 +29,12 @@ const VERBS: &[&str] = &[
 ];
 
 fn known(verb: &str) -> bool {
-    VERBS.iter().any(|l| l.split(' ').next() == Some(verb))
+    verb == "convert" || VERBS.iter().any(|l| l.split(' ').next() == Some(verb))
 }
 
 /// The usage of `verb`, or of every verb when it names none.
 fn usage(verb: Option<&str>) -> String {
+    let verb = verb.map(|v| if v == "convert" { "import" } else { v });
     let verb = verb.filter(|v| known(v));
     let mut text = String::from("usage: tfs [--store <dir>] [--endpoint <url>] [--json] <verb>");
     for line in VERBS.iter().filter(|l| verb.is_none_or(|v| l.split(' ').next() == Some(v))) {
@@ -42,7 +43,7 @@ fn usage(verb: Option<&str>) -> String {
     }
     text.push_str(
         "\n<ref> is org/name[@revision][/variant], sha256:<hex>, a .cozytensors file or a folder; a revision is
-a tag, or sha256:<hex> of a commit or a variant header, and none is the highest public version;
+a tag, or sha256:<hex> of a commit or a variant header, and none is the highest public version, else main;
 --variant picks a variant; --source-variant a source's weights variant (fp16). The store is --store,
 else $TENSORFS_HOME, else ~/.cache/tensorfs.",
     );
@@ -197,7 +198,7 @@ async fn run(args: &Args) -> Done {
     let client = Client::new(config)?;
     tensorfs::io::keep_ceilings_in(&root);
     match pos.as_slice() {
-        ["convert", sources @ ..] if !sources.is_empty() => {
+        ["import" | "convert", sources @ ..] if !sources.is_empty() => {
             let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
             let quiet = args.on("json");
             let last = Mutex::new((String::new(), Instant::now()));

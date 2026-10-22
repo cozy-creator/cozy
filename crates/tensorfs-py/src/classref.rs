@@ -21,8 +21,11 @@ impl From<&ClassRef> for PyClassRef {
     }
 }
 
-/// A `ClassRef` or a `(library, version, name)` tuple of strings.
+/// A `ClassRef`, a `(library, version, name)` tuple, or an empty/omitted unknown class.
 pub(crate) fn class(obj: &Bound<'_, PyAny>) -> PyResult<ClassRef> {
+    if obj.is_none() || obj.extract::<String>().is_ok_and(|name| name.is_empty()) {
+        return Ok(ClassRef::default());
+    }
     let (library, version, name) = match obj.cast::<PyClassRef>() {
         Ok(c) => {
             let c = c.get();
