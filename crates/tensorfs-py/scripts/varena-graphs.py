@@ -84,7 +84,7 @@ def main():
                     del warm
                 before = allocator_stats(0, pool.id)
                 start = time.perf_counter()
-                with torch.cuda.graph(graph, pool=pool, stream=stream):
+                with mem.allocating(pool, route=False), torch.cuda.graph(graph, pool=pool, stream=stream):
                     output = torch.nn.functional.linear(static, layer.weight)
                 capture_ms += (time.perf_counter() - start) * 1000
                 assert allocator_stats(0, pool.id)[1] == before[1], "capture must not grow the preseeded pool"
@@ -97,10 +97,10 @@ def main():
             mem.native.load(placed.set, Level.RAM)  # release backing; graph+VA stay live
             print(f"CAPTURE {i + 1}/{DEPTH} ptr={address:#x} pool={pool.id}", flush=True)
 
-    def run(label, value):
+    def run(label, value, force_evict):
         moved = None
         start = time.perf_counter()
-        with torch.inference_mode(), mem.request(label, plan=[model] * DEPTH) as request:
+        with torch.inference_mode(), mem.request(label, plan=[model]) as request, placed.passing("", (value,), {}):
             x = value.to(mem.device)
             for i, (binding, graph, pool, static, output, address) in enumerate(records):
                 with binding.prepare(stream):
@@ -108,16 +108,17 @@ def main():
                     static.copy_(x)
                     graph.replay()  # the exact instance captured before backing eviction
                     x = output.clone()
-                torch.cuda.synchronize()
-                mem.native.load(placed.set, Level.RAM)
+                if force_evict:
+                    torch.cuda.synchronize()
+                    mem.native.load(placed.set, Level.RAM)
             actual = x.cpu()
             moved = request.stats().moved
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
         print(json.dumps({"run": label, "ms": (time.perf_counter() - start) * 1000, "store_bytes": moved.store.bytes, "tier_bytes": moved.tier.bytes}), flush=True)
         return actual
 
-    run("graph-refill-1", source)
-    run("graph-refill-2", source)
+    run("graph-refill-1", source, True)
+    run("graph-streaming-automatic", source, False)
 
     # One graph instance's lock covers its input copies and output materialization too.
     binding, graph, pool, static, output, address = records[0]
@@ -143,7 +144,7 @@ def main():
     with mem.request("capture-growth-refused"):
         try:
             bad = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(bad, pool=empty, stream=stream):
+            with mem.allocating(empty, route=False), torch.cuda.graph(bad, pool=empty, stream=stream):
                 torch.empty(8 << 20, dtype=torch.uint8, device=mem.device)
         except (torch.OutOfMemoryError, RuntimeError):
             failed = True

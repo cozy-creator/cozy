@@ -18,7 +18,7 @@ use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostB
 
 use crate::store::PyCheckpoint;
 
-create_exception!(tensorfs.varena, VarenaError, PyException, "A varena error: `.code` names its class; `.cuda_code` is the driver's CUresult for a device error; `.sticky` means the device context is gone.");
+create_exception!(tensorfs.varena, VarenaError, PyException, "A varena error: `.code` names its class; `.cuda_code` is the driver's CUresult for a device error; `.sticky` means the executor must retire (device failure or unproven ownership).");
 create_exception!(tensorfs.varena, StaleBinding, VarenaError, "The retained dependency identity changed; discard this graph before recapture.");
 create_exception!(tensorfs.varena, Exhausted, VarenaError, "The one memory error: `.gpu`, `.need`, `.site`, `.stats`.");
 
@@ -1001,6 +1001,24 @@ fn allocator_stats(device: Option<i32>, pool: Option<(u64, u64)>) -> (u64, u64, 
     crate::allocator::stats(device, pool)
 }
 
+/// A lost completion/release quarantines its segment and retires this executor at a safe
+/// Python boundary; it must not masquerade as a recoverable capacity failure.
+#[pyfunction]
+fn allocator_check(py: Python<'_>, device: i32) -> PyResult<()> {
+    if let Some(reason) = crate::allocator::fault_message(device) {
+        let err = VarenaError::new_err(format!("native allocation ownership is unproven: {reason}"));
+        err.value(py).setattr("code", "OWNERSHIP")?;
+        err.value(py).setattr("sticky", true)?;
+        err.value(py).setattr("cuda_code", py.None())?;
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Native segments no longer in torch's counters, still physically held until GPU completion.
+#[pyfunction]
+fn allocator_pending(device: i32) -> u64 { crate::allocator::pending(device) }
+
 /// The trims and cache shrinks varena reached on a thread inside the allocator (answered 0).
 #[pyfunction]
 fn allocator_reentries() -> (u64, u64) {
@@ -1035,6 +1053,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStats>()?;
     m.add_function(wrap_pyfunction!(allocated, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_stats, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_pending, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_check, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_reentries, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;

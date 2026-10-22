@@ -28,6 +28,8 @@ from .._ext.varena import (
     allocated,
     allocator_reentries,
     allocator_stats,
+    allocator_pending,
+    allocator_check,
 )
 
 __all__ = [
@@ -57,4 +59,6 @@ __all__ = [
     "allocated",
     "allocator_reentries",
     "allocator_stats",
+    "allocator_pending",
+    "allocator_check",
 ]

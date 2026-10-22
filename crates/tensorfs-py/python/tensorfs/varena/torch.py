@@ -38,6 +38,8 @@ from . import Exhausted, Fill, GpuId, Grant, Level, Next, Pass, Pin, Stats, Vare
 from . import Memory as Native
 from .._ext.varena import allocated as _allocated
 from .._ext.varena import allocator_stats as _allocator_stats
+from .._ext.varena import allocator_pending as _allocator_pending
+from .._ext.varena import allocator_check as _allocator_check
 from .. import _ext
 from . import Request as NativeRequest
 from . import Set
@@ -424,11 +426,10 @@ class Memory:
         self.escaped: dict[tuple[str, str], int] = {}
         #: the bytes torch's allocator is capped at now
         self.capped: int | None = None
-        if device.type != "cpu":
-            native.trim_with(self.torch.trim)
         #: Request allocations use the native callback, which reclaims completed local pages
         #: on shortfall without replaying package code.
-        self._pools = threading.local()
+        self._pools: dict[int, torch.cuda.MemPool] = {}
+        self._pool_guard = threading.RLock()
         #: Native pooling is the default; diagnostics may compare an explicit eager baseline.
         self.pooling = pool
         #: the largest torch reserve a pass held outside the pool (other threads' allocations)
@@ -436,7 +437,9 @@ class Memory:
         #: Cross-stream consumers joined back into the binding stream.
         self.crossed = 0
         if pool and self.cuda:
-            self._pools.pool = self.new_pool()
+            self._pools[threading.get_ident()] = self.new_pool()
+        if device.type != "cpu":
+            native.trim_with(self._trim)
 
     @property
     def pool(self) -> torch.cuda.MemPool | None:
@@ -444,10 +447,22 @@ class Memory:
         # keeps its own reusable pool; the native cap/accounting still covers the entire device.
         if not self.cuda or not self.pooling:
             return None
-        pool = getattr(self._pools, "pool", None)
-        if pool is None:
-            pool = self._pools.pool = self.new_pool()
-        return pool
+        with self._pool_guard:
+            thread = threading.get_ident()
+            pool = self._pools.get(thread)
+            if pool is None:
+                pool = self._pools[thread] = self.new_pool()
+            return pool
+
+    def _trim(self) -> int:
+        before = self.torch.now()[1]
+        with self._pool_guard:
+            unused = [thread for thread, pool in self._pools.items() if pool.use_count() == 1]
+            for thread in unused:
+                del self._pools[thread]
+        self.torch.trim()
+        # Pending native frees remain charged; no bytes are reported free ahead of their event.
+        return max(before - self.torch.now()[1], 0)
 
     @classmethod
     def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = True) -> Memory:
@@ -921,7 +936,8 @@ class _Allocator:
     def now(self) -> tuple[int, int]:
         """Bytes allocated and reserved now."""
         if self.kind == "cuda":
-            return torch.cuda.memory_allocated(self.device), torch.cuda.memory_reserved(self.device)
+            _allocator_check(self.device.index or 0)
+            return torch.cuda.memory_allocated(self.device), torch.cuda.memory_reserved(self.device) + _allocator_pending(self.device.index or 0)
         if self.kind == "mps":
             return torch.mps.current_allocated_memory(), torch.mps.driver_allocated_memory()
         return 0, 0
@@ -929,7 +945,7 @@ class _Allocator:
     def peaks(self) -> tuple[int, int]:
         """The allocated and reserved peaks since the last reset."""
         if self.kind == "cuda":
-            return torch.cuda.max_memory_allocated(self.device), torch.cuda.max_memory_reserved(self.device)
+            return torch.cuda.max_memory_allocated(self.device), torch.cuda.max_memory_reserved(self.device) + _allocator_pending(self.device.index or 0)
         return self.now()
 
     def reset(self) -> None:
