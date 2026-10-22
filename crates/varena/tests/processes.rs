@@ -584,11 +584,12 @@ fn a_failed_request_frees_everything(dir: &Path) {
     a.ok("bind f 0");
     a.ok("bind f 1");
     // The free bytes are claimed once (the cap was stale); with every page pinned nothing else
-    // frees: park (the host has headroom), and a park of nothing ends it.
-    assert_eq!(a.say("oom r1 f 67108864"), "retry");
-    assert!(a.say("oom r1 f 67108864").starts_with("park "));
+    // frees: park (the host has headroom), and a park of nothing ends it. (The whole card: a
+    // need beyond it is Exhausted at once.)
+    assert_eq!(a.say("oom r1 f 8388608"), "retry");
+    assert!(a.say("oom r1 f 8388608").starts_with("park "));
     a.ok("parked r1 0");
-    assert!(a.say("oom r1 f 67108864").starts_with("exhausted r1"));
+    assert!(a.say("oom r1 f 8388608").starts_with("exhausted r1"));
     a.ok("cache r1 1048576");
     a.ok("unpin");
     assert!(a.ok("end r1").starts_with("leftover=0"));
