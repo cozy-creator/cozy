@@ -779,7 +779,7 @@ impl Row {
     }
 
     /// This row's wake endpoint, signalled while it waits for room.
-    pub fn endpoint(&self) -> Result<Owned> {
+    pub fn endpoint(&self) -> Result<os::Endpoint> {
         os::wake_bind(self.shared.ns, &row_wake(&self.shared.name, self.id()))?.ok_or_else(|| Error::Internal("a row's wake is taken".into()))
     }
 

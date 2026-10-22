@@ -25,6 +25,7 @@ use std::time::Instant;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use platform::handles::Owned;
 
+#[cfg(unix)]
 use tensorfs::io::source::Placement;
 use tensorfs::io::Dst;
 
@@ -587,7 +588,7 @@ struct Inner {
     row: Arc<Row>,
     _device: Device,
     /// Signalled by every change of the table while this process waits for room.
-    room_wake: Owned,
+    room_wake: crate::os::Endpoint,
     custody: Option<Arc<custody::Client>>,
     tier: Option<Arc<tier::Client>>,
     state: Mutex<State>,
