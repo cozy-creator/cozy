@@ -486,6 +486,9 @@ fn tier_name(spec: &SetSpec) -> String {
     }
 }
 
+/// The table's pin for a page whose Keep's protect runs (no caller holds it).
+const PROTECTING: u64 = u64::MAX;
+
 struct Home {
     /// `None` while the mechanism thread creates and maps it.
     phys: Option<Physical>,
@@ -801,9 +804,12 @@ impl State {
         if !self.homes.get(&key).is_some_and(|h| h.keeping) {
             self.keep_due.remove(&key);
         }
-        // A protect in flight pins the page (P) like a fill.
-        let home = self.homes.get(&key).map(|h| (h.filled, h.filling || h.protecting, h.speculative, h.exported));
-        let pins: Vec<u64> = self.pins.iter().filter(|(_, (k, ..))| *k == key).map(|(id, _)| *id).collect();
+        let home = self.homes.get(&key).map(|h| (h.filled, h.filling, h.speculative, h.exported));
+        let mut pins: Vec<u64> = self.pins.iter().filter(|(_, (k, ..))| *k == key).map(|(id, _)| *id).collect();
+        // A protect in flight pins the page (P): nothing evicts or unmaps it meanwhile.
+        if self.homes.get(&key).is_some_and(|h| h.protecting) {
+            pins.push(PROTECTING);
+        }
         if let Some(p) = self.table.page_mut(key) {
             p.mapped = home.is_some();
             p.filled = home.is_some_and(|h| h.0);
@@ -2814,6 +2820,12 @@ impl Inner {
                 continue;
             }
             match st.homes.get(&key) {
+                // Its Keep's protect runs now: no pin (and no refill) while its access changes;
+                // the Keep's end wakes the binder.
+                Some(h) if h.protecting => {
+                    waited = true;
+                    self.wait(&mut st)?;
+                }
                 // Not the set's weights now, and unpinned: filled again in place.
                 Some(h) if h.identity != identity && !h.filling && !pinned => {
                     hit = false;
@@ -2825,12 +2837,6 @@ impl Inner {
                 // Still pinned or filling: its pin's drop or its fill wakes the binder.
                 Some(h) if h.identity != identity => {
                     hit = false;
-                    waited = true;
-                    self.wait(&mut st)?;
-                }
-                // Its Keep's protect runs now: no pin while its access changes; the Keep's end
-                // wakes the binder.
-                Some(h) if h.protecting => {
                     waited = true;
                     self.wait(&mut st)?;
                 }
