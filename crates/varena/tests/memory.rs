@@ -1,5 +1,7 @@
 //! One process's Memory over host pages: rooms bounded by measured shapes, the cut memo, and
 //! the OOM answers for cut and collective sites.
+// Its sets load from TensorFS sources, which are Unix's so far (`tensorfs::io::source`).
+#![cfg(unix)]
 
 use std::fs::File;
 use std::path::Path;
@@ -488,6 +490,7 @@ fn a_set_goes_where_it_fits_and_stays_on_gpu_0_when_it_can() {
 }
 
 /// A one-region set of `fill` (stored bytes 7).
+#[cfg(target_os = "linux")]
 fn one(dir: &Path, uuid: &str, name: &str, fill: Fill) -> SetSpec {
     let mut spec = set(dir, name, 1, uuid);
     std::fs::write(dir.join(format!("{name}.bin")), vec![7u8; REGION_ALIGN as usize]).unwrap();
@@ -498,6 +501,7 @@ fn one(dir: &Path, uuid: &str, name: &str, fill: Fill) -> SetSpec {
 /// One page of room: binds `set`'s block in its own request (after `other` took the page),
 /// bakes it to `bake` when it comes back fresh, and returns (fresh, its first byte). Its
 /// requests are measured calls (a host peak recorded), so the RAM tier takes their copies.
+#[cfg(target_os = "linux")]
 fn rebind(ledger: &varena::Ledger, mem: &Memory, set: varena::SetId, other: varena::SetId, bake: u8) -> (bool, u8) {
     ledger.restore(&[varena::Peak::Host { key: "pkg|1x1".into(), bytes: 0 }]).unwrap();
     ledger.dispatch("other", "pkg", "1x1").unwrap();
@@ -530,6 +534,8 @@ fn rebind(ledger: &varena::Ledger, mem: &Memory, set: varena::SetId, other: vare
 /// weights is never fresh, so a RAM-tier hit of a baked page is not baked again; and the tier
 /// holds bytes by identity: after LoRA a -> b, b's page comes from the store, fresh, and a's
 /// layout still gives a's baked bytes.
+// The RAM tier's files (a memfd with punched holes) are Linux's so far.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_tier_keeps_baked_pages_by_identity_and_never_hands_them_out_fresh() {
     let dir = tempfile::tempdir().unwrap();
@@ -602,7 +608,8 @@ fn an_impossible_need_is_exhausted_at_once() {
 /// Host-OOM, the varena side: a request records its host high-water (Peak::Host, its
 /// anonymous bytes; the tier's and file mappings aside); while a request runs unmeasured the
 /// GPU's host need is unknown, and once measured it is that high-water less what the process
-/// holds now.
+/// holds now. Linux: the high-water is read from `/proc` (elsewhere a request is unmeasured).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_request_records_its_host_high_water() {
     let (_scope, ledger, mem, _g) = open("host", 8 * MB);

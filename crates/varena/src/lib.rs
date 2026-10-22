@@ -104,10 +104,6 @@ impl Error {
         Error::Io(format!("{what}: {e}"))
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn os(what: &str) -> Error {
-        Error::io(what, std::io::Error::last_os_error())
-    }
 }
 
 impl From<platform::Error> for Error {
