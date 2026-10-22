@@ -343,7 +343,7 @@ fn agent() {
             ["cache", owner, bytes] => {
                 let m = mem.as_ref().unwrap();
                 let s = shrunk.clone();
-                let c = m.cache(owner, Box::new(move |want| {
+                let c = m.cache(owner, None, Box::new(move |want| {
                     s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     want
                 }));

@@ -1153,15 +1153,17 @@ impl Memory {
     }
 
     /// Registers bytes the caller holds (torch tensors) that `shrink(want) -> freed` gives back.
-    /// A cache whose `owner` is a request id ends with that request.
-    pub fn cache(&self, owner: &str, shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
+    /// A cache whose `owner` is a request id ends with that request. One serving a component
+    /// (`set`: its graph pool, its decode cache) takes that set's class and goes before its
+    /// pages; one serving none is N.
+    pub fn cache(&self, owner: &str, set: Option<SetId>, shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
         let shrink: Shrink = Arc::new(shrink);
         self.inner
             .guard(|| {
                 let mut st = self.inner.lock();
                 let id = st.tick() as u32;
                 let last_use = st.clock;
-                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), bytes: 0, last_use });
+                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), set: set.map(|s| s.0), bytes: 0, last_use });
                 st.shrinks.insert(id, shrink);
                 self.inner.unlock(st);
                 Ok(CacheId(id))
