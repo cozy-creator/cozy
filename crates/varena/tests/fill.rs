@@ -1,5 +1,7 @@
 //! Fill throughput from a real file store, against the disk's ceiling measured on the same file
 //! the same way (TensorFS's engine reading it whole, past the page cache).
+// The disk's ceiling needs the file out of the page cache: `posix_fadvise`, Linux's.
+#![cfg(target_os = "linux")]
 
 use std::fs::File;
 use std::os::fd::AsRawFd;

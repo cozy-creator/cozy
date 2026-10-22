@@ -3,11 +3,16 @@
 //! no host thread waits on a device event or on custody. Host pages fill synchronously, so the
 //! backend here is the host backend with stream events that complete only when the test says
 //! (as a card's do when their work finishes), and with the stream waits it was asked for.
+// Its sets load from TensorFS sources, which are Unix's so far (`tensorfs::io::source`).
+#![cfg(unix)]
 
 use std::collections::HashSet;
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -464,11 +469,13 @@ impl Drop for Scope {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// A custody whose answers wait for `gate`.
 fn gated_custody(gpu: &str, gate: Arc<Gate>) {
     serve_custody(gpu, gate, Arc::new(Log::default()));
 }
 
+#[cfg(target_os = "linux")]
 /// The calls a fake custody served, per connection, and its connections (to cut them).
 #[derive(Default)]
 struct Log {
@@ -479,12 +486,14 @@ struct Log {
     kept: Mutex<std::collections::HashMap<(String, u64), Owned>>,
 }
 
+#[cfg(target_os = "linux")]
 /// A call's (fingerprint key, page).
 fn kept_key(call: &serde_json::Value) -> Option<(String, u64)> {
     let body = call.as_object()?.values().next()?;
     Some((body.get("fp")?.as_str()?.to_string(), body.get("page")?.as_u64()?))
 }
 
+#[cfg(target_os = "linux")]
 impl Log {
     fn await_call(&self, f: impl Fn(&(usize, String)) -> bool) {
         let mut calls = self.calls.lock();
@@ -499,6 +508,7 @@ impl Log {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn serve_custody(gpu: &str, gate: Arc<Gate>, log: Arc<Log>) {
     let uid = unsafe { libc::geteuid() };
     let addr = SocketAddr::from_abstract_name(format!("cozy-varena-{uid}-test{}-custody-{gpu}", std::process::id())).unwrap();
@@ -545,6 +555,7 @@ fn serve_custody(gpu: &str, gate: Arc<Gate>, log: Arc<Log>) {
 /// filling page while exports queue, and an unload whose withdraw queues behind them, both
 /// return. Exports and withdraws go to one sender thread and no caller waits on them; no thread
 /// holds the state lock with another. (A load's import is a question it waits on custody for.)
+#[cfg(target_os = "linux")]
 #[test]
 fn no_call_waits_on_custody() {
     let dir = tempfile::tempdir().unwrap();
@@ -590,6 +601,7 @@ fn no_call_waits_on_custody() {
 
 /// Round 2, finding 12: when custody's holder changes (a TensorD restart), every kept page is
 /// exported again to the new one.
+#[cfg(target_os = "linux")]
 #[test]
 fn kept_pages_go_to_a_new_custody_holder() {
     let dir = tempfile::tempdir().unwrap();
@@ -714,6 +726,7 @@ fn a_create_short_of_memory_decides_again() {
     assert!(matches!(mem.bind(a, 1, 0), Err(varena::Error::Exhausted(_))));
 }
 
+#[cfg(target_os = "linux")]
 /// A card's view of memory: a page's bytes are in use while any handle to them lives, the
 /// process's own or custody's (here the fake custody's, in this process).
 struct Driver {
@@ -723,11 +736,13 @@ struct Driver {
     pages: Mutex<std::collections::HashMap<u64, (u64, u64, bool)>>,
 }
 
+#[cfg(target_os = "linux")]
 fn inode(h: &Owned) -> u64 {
     use std::os::unix::fs::MetadataExt;
     std::fs::File::from(h.try_clone().unwrap()).metadata().unwrap().ino()
 }
 
+#[cfg(target_os = "linux")]
 impl Driver {
     fn used(&self) -> u64 {
         let open: HashSet<u64> = std::fs::read_dir("/proc/self/fd").unwrap().flatten().filter_map(|e| std::fs::metadata(e.path()).ok()).map(|m| std::os::unix::fs::MetadataExt::ino(&m)).collect();
@@ -735,6 +750,7 @@ impl Driver {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Backend for Driver {
     fn capacity(&self) -> u64 {
         self.limit
@@ -852,6 +868,7 @@ fn stored(dir: &std::path::Path, uuid: &str, name: &str, regions: u64) -> SetSpe
 /// Review 3, N1: an evicted kept page's memory is custody's until its Withdraw is sent; the
 /// demand that evicted it waits for that before mapping into the bytes, so one eviction is
 /// enough and the bind succeeds.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_evicted_kept_page_is_free_once_withdrawn() {
     let dir = tempfile::tempdir().unwrap();
