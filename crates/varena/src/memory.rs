@@ -2372,7 +2372,7 @@ impl Inner {
                     })
                 })
                 .map(|()| true);
-        if let Err(e) = &result {
+        if let Some(e) = result.as_ref().err().filter(|e| !matches!(e, Error::Closed(_))) {
             tracing::warn!("varena: copying {:?} into the RAM tier failed: {e}", s.key);
             if e.is_sticky() {
                 // Publish failure while holding the same lock as condvar waiters, so none
@@ -2783,7 +2783,11 @@ impl Inner {
                 self.landed.notify_all();
                 std::mem::forget((permit, held.clone(), self.clone()));
             }
-            filled?;
+            match filled {
+                // The tier took the layout back meanwhile: the load is done with it.
+                Err(Error::Closed(_)) => return Ok(()),
+                other => other?,
+            }
             at += want;
             want = regions.len() - at;
         }
