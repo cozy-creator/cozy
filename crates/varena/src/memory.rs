@@ -32,7 +32,7 @@ use tensorfs::io::Dst;
 use crate::backend::{Access, Backend, Event, Physical, Va};
 use crate::custody;
 use crate::decide::{decide, Action, Trigger, Tried};
-use crate::ledger::{self, Facts, Grant, Room, Row, Shared};
+use crate::ledger::{self, Facts, Grant, PhysicalChange, Room, Row, Shared};
 use crate::table::{Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
 use crate::os;
 use crate::tier;
@@ -142,6 +142,14 @@ pub struct Resident {
     inner: Owner,
     bytes: u64,
 }
+impl Resident {
+    /// Marks its free before the driver call ([`Memory::physical_change`]); finish after this
+    /// token drops, and drop it unfinished if the free failed.
+    pub fn releasing(&self) -> PhysicalChange {
+        self.inner.row.physical_change()
+    }
+}
+
 impl Drop for Resident {
     fn drop(&mut self) { self.inner.native_resident.fetch_sub(self.bytes, Ordering::AcqRel); }
 }
@@ -1119,6 +1127,15 @@ impl Memory {
         })
     }
 
+    /// Marks a physical operation (a native segment's allocation) before its driver call:
+    /// until it finishes, this row's physical counts are no evidence for foreign bytes. Only
+    /// atomics: safe inside the allocator. Finish once the outcome is certain and counted
+    /// (after [`Memory::resident`], or after a failed call that allocated nothing); an uncertain
+    /// one is dropped unfinished and keeps the row's counts unproven.
+    pub fn physical_change(&self) -> PhysicalChange {
+        self.inner.row.physical_change()
+    }
+
     /// Records a successful native segment allocation. Call only after the driver succeeds;
     /// drop the returned token only after its physical free succeeds, outside allocator locks.
     pub fn resident(&self, bytes: u64) -> Resident {
@@ -1443,7 +1460,6 @@ impl Inner {
         if rows.iter().any(|r| !r.live) && self.shared.reap(None)? {
             rows = admission.rows()?;
         }
-        let known = sample.known(&rows);
         let (others, orphans) = ledger::remotes(&rows, self.row.at());
         st.table.others = others;
         st.table.orphans = orphans;
@@ -1454,10 +1470,19 @@ impl Inner {
         // Unmaps in flight are this process's still (and already spent on the creates queued
         // after them).
         st.table.inflight = self.mech.pending();
+        // This row's own bytes are known under the state lock: a retiring page stays counted
+        // (and held) until its unmap returns, so a driver free before that hides nothing; a
+        // create not yet recorded is not counted, so it reads as foreign meanwhile.
+        let own = st.table.physical;
+        let (known, proven) = (sample.known(&rows, self.row.id()) + own, sample.complete(&rows, self.row.id()));
         // Foreign bytes take from the card, not from the table's cap: they count only beyond the
         // card's room outside the cap (capacity = min(cap, card - foreign)).
         st.table.foreign = st.table.foreign_from_known(card, used, known);
-        self.shared.set_foreign(st.table.foreign)?;
+        // A row's change in flight makes this figure conservative for this decision only: the
+        // shared figure (TensorD's admission) changes on proven samples alone.
+        if proven {
+            self.shared.set_foreign(st.table.foreign)?;
+        }
         Ok(admission)
     }
 
@@ -1573,7 +1598,15 @@ impl Inner {
                 continue;
             }
             let (va, off, span) = st.place(key)?;
-            let phys = self.backend.import(handle, span)?;
+            let change = self.row.physical_change();
+            let phys = match self.backend.import(handle, span) {
+                Ok(phys) => phys,
+                Err(e) => {
+                    // Nothing was imported: certain, so the mark ends.
+                    change.finish();
+                    return Err(e);
+                }
+            };
             let gen = st.tick();
             // Pinned (filling) until the mechanism maps it.
             self.mech.post(Mech::Adopt { key, gen, va, off, phys: phys.id, len: phys.len, identity: identity.clone() }, 0);
@@ -1584,6 +1617,7 @@ impl Inner {
             s.moved.kept.ns += start.elapsed().as_nanos() as u64;
             adopted += span;
             self.publish(&mut st);
+            change.finish();
             self.unlock(st);
         }
         Ok(adopted)
@@ -3080,6 +3114,24 @@ impl Drop for Device {
     }
 }
 
+impl Memory {
+    /// Drops this handle and, once every public handle of it is gone (requests, pins,
+    /// passes), waits until its memory has retired: its row gone, TensorD woken. A process
+    /// ends after it; ending without it leaves the retirement to TensorD's reap.
+    pub fn retire(self) -> Result<()> {
+        let uuid = self.inner._device.0.clone();
+        drop(self);
+        let mut open = OPEN.lock();
+        loop {
+            match open.get(&uuid) {
+                None => return Ok(()),
+                Some(DeviceState::Quarantined) => return Err(Error::Ownership(format!("{uuid} retired with quarantined device ownership"))),
+                Some(_) => CLOSED.wait(&mut open),
+            }
+        }
+    }
+}
+
 impl Drop for Memory {
     /// Stop speculative saves. Final physical retirement is transferred by Owner, so a
     /// Python/DLPack destructor never waits for a CUDA consumer or a host callback.
@@ -3222,10 +3274,14 @@ fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>,
 fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
     while let Some((ticket, bytes, op)) = queue.next() {
         let Some(me) = inner.upgrade() else { return };
+        // An op that creates or destroys physical memory: the row's counts are no foreign-byte
+        // evidence until its outcome is published (an uncertain one never finishes).
+        let change = matches!(op, Mech::Map { .. } | Mech::Unmap { .. } | Mech::Renew { .. }).then(|| me.row.physical_change());
         me.mechanism(op);
         if me.check_ownership().is_err() {
             // The fault path retained the executor and uncertain resources. Tickets finish so
             // callers can retire it, but physical bytes are never advertised as returned.
+            drop(change); // unfinished: uncertain ownership stays unproven
             queue.sent(ticket, 0);
             continue;
         }
@@ -3235,6 +3291,9 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
         queue.returned(ticket, bytes);
         st.table.inflight = queue.pending();
         me.publish(&mut st);
+        if let Some(change) = change {
+            change.finish();
+        }
         me.unlock(st);
         me.landed.notify_all();
         // The row's facts changed (a page mapped, kept or gone).
@@ -3376,10 +3435,9 @@ impl Request {
         for key in keys {
             let completed = st.homes.get(&key).is_some_and(|h| !h.filling && !h.transforming && !h.keeping && self.inner.backend.query(h.ready).unwrap_or(false));
             if let Some(p) = view.page_mut(key) {
-                if !completed { p.pins.push(u64::MAX); }
-                // The custody's native sender is independent of Python and device streams;
-                // completed pages can withdraw their retained handle after the unmap.
-                p.kept = false;
+                // A kept page's memory is custody's: unmapping it frees nothing here (its
+                // withdraw is preparation's, as coming bytes). In the callback it is pinned.
+                if !completed || p.kept { p.pins.push(u64::MAX); }
             }
         }
         let mut tried = Tried { trimmed: true, orphans: true, ..Tried::default() };
@@ -3387,6 +3445,8 @@ impl Request {
             for class in [Class::N, Class::D] { tried.asked.insert((row.row, class)); }
         }
         let actions = decide(&view, &Trigger::Oom { req: self.id, set: set.map(|s| s.0), need: Some(need), site: None, tried });
+        // Its unmaps change physical ownership: unproven until published (an error keeps it so).
+        let change = self.inner.row.physical_change();
         let mut freed = 0;
         for action in actions {
             match action {
@@ -3429,6 +3489,7 @@ impl Request {
             }
         }
         self.inner.try_publish(&mut st);
+        change.finish();
         // Kept handles withdraw asynchronously. Their bytes remain pending until the native
         // custody sender reports completion; the allocation may retry once, but never waits
         // for that sender or reacquires state after releasing it.

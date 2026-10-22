@@ -292,8 +292,20 @@ struct PhysicalStamp {
 pub(crate) struct PhysicalSample(HashMap<u64, PhysicalStamp>);
 
 impl PhysicalSample {
-    pub fn known(&self, rows: &[RowView]) -> u64 {
-        rows.iter().filter(|r| r.live).fold(0u64, |known, row| {
+    /// Whether every other live row's physical counts held across the sample (row `own`, the
+    /// caller's, it counts exactly itself): only then is the foreign figure derived from it
+    /// evidence others may use.
+    pub fn complete(&self, rows: &[RowView], own: u64) -> bool {
+        rows.iter().filter(|r| r.live && r.id() != own).all(|row| {
+            let Some(before) = self.0.get(&row.id()) else { return false };
+            let after = row.physical;
+            before.clean && after.clean && before.born == after.born && before.epoch == after.epoch && before.facts == before.epoch && after.facts == after.epoch && before.orphans == before.epoch && after.orphans == after.epoch
+        })
+    }
+
+    /// The other live rows' physical bytes proven across the sample (row `own` excepted).
+    pub fn known(&self, rows: &[RowView], own: u64) -> u64 {
+        rows.iter().filter(|r| r.live && r.id() != own).fold(0u64, |known, row| {
             let Some(before) = self.0.get(&row.id()) else { return known };
             let after = row.physical;
             if !before.clean || !after.clean || before.born != after.born || before.epoch != after.epoch {
@@ -1045,8 +1057,8 @@ impl Row {
 
 /// An outstanding physical operation. Drop deliberately does NOT clear the dirty marker:
 /// without a checked publication/completion, old physical counts cannot become evidence.
-#[must_use = "finish only after publishing authoritative physical ownership"]
-pub(crate) struct PhysicalChange {
+#[must_use = "finish only once the operation's outcome is certain and counted"]
+pub struct PhysicalChange {
     row: Arc<Row>,
 }
 
@@ -1811,7 +1823,7 @@ mod tests {
         let gate = shared.admission().unwrap();
         publish_physical(&row, 4, 12);
         let rows = gate.rows().unwrap();
-        assert_eq!(before.known(&rows), 4);
+        assert_eq!(before.known(&rows, u64::MAX), 4);
         assert_eq!(held(&rows), 12);
     }
 
@@ -1823,14 +1835,14 @@ mod tests {
         let freeing = row.physical_change();
         // The driver has returned eight bytes, but the row still conservatively charges them.
         let rows = shared.rows().unwrap();
-        assert_eq!(before.known(&rows), 0);
+        assert_eq!(before.known(&rows, u64::MAX), 0);
         assert_eq!(held(&rows), 8);
         let during = shared.physical_sample().unwrap();
         publish_physical(&row, 0, 8);
         freeing.finish();
-        assert_eq!(during.known(&shared.rows().unwrap()), 0);
+        assert_eq!(during.known(&shared.rows().unwrap(), u64::MAX), 0);
         let after = shared.physical_sample().unwrap();
-        assert_eq!(after.known(&shared.rows().unwrap()), 0);
+        assert_eq!(after.known(&shared.rows().unwrap(), u64::MAX), 0);
     }
 
     #[test]
@@ -1848,13 +1860,13 @@ mod tests {
         let b = row.physical_change();
         row.publish(&Facts { physical: 12, physical_epoch: stale_epoch, torch: 12, ..Facts::default() });
         a.finish();
-        assert_eq!(before.known(&shared.rows().unwrap()), 0);
+        assert_eq!(before.known(&shared.rows().unwrap(), u64::MAX), 0);
         b.finish();
         let stale = shared.physical_sample().unwrap();
-        assert_eq!(stale.known(&shared.rows().unwrap()), 0, "inactive is not proof that a stale publication is current");
+        assert_eq!(stale.known(&shared.rows().unwrap(), u64::MAX), 0, "inactive is not proof that a stale publication is current");
         publish_physical(&row, 12, 12);
         let current = shared.physical_sample().unwrap();
-        assert_eq!(current.known(&shared.rows().unwrap()), 12);
+        assert_eq!(current.known(&shared.rows().unwrap(), u64::MAX), 12);
     }
 
     #[test]
@@ -1867,14 +1879,14 @@ mod tests {
             publish_physical(&row, physical, 8);
             change.finish();
         }
-        assert_eq!(before.known(&shared.rows().unwrap()), 0, "equal counts do not make an overlapping driver sample consistent");
+        assert_eq!(before.known(&shared.rows().unwrap(), u64::MAX), 0, "equal counts do not make an overlapping driver sample consistent");
         let current = shared.physical_sample().unwrap();
-        assert_eq!(current.known(&shared.rows().unwrap()), 4);
+        assert_eq!(current.known(&shared.rows().unwrap(), u64::MAX), 4);
         let uncertain = row.physical_change();
         drop(uncertain);
         publish_physical(&row, 4, 8);
         let abandoned = shared.physical_sample().unwrap();
-        assert_eq!(abandoned.known(&shared.rows().unwrap()), 0, "dropping an uncompleted marker cannot clear uncertain ownership");
+        assert_eq!(abandoned.known(&shared.rows().unwrap(), u64::MAX), 0, "dropping an uncompleted marker cannot clear uncertain ownership");
         assert_eq!(held(&shared.rows().unwrap()), 8);
     }
 
@@ -1895,15 +1907,15 @@ mod tests {
             source_change.finish();
             custody_change.finish();
         }
-        assert_eq!(before.known(&shared.rows().unwrap()), 0);
+        assert_eq!(before.known(&shared.rows().unwrap(), u64::MAX), 0);
         let transferred = shared.physical_sample().unwrap();
-        assert_eq!(transferred.known(&shared.rows().unwrap()), 8);
+        assert_eq!(transferred.known(&shared.rows().unwrap(), u64::MAX), 8);
         drop(row);
         let replacement = shared.claim(std::process::id()).unwrap();
         assert_eq!(replacement.at, old_at);
         publish_physical(&replacement, 8, 8);
-        assert_eq!(before.known(&shared.rows().unwrap()), 0, "same offset and count are not the same owner");
-        assert_eq!(transferred.known(&shared.rows().unwrap()), 8, "only the unchanged custody owner remains attributable");
+        assert_eq!(before.known(&shared.rows().unwrap(), u64::MAX), 0, "same offset and count are not the same owner");
+        assert_eq!(transferred.known(&shared.rows().unwrap(), u64::MAX), 8, "only the unchanged custody owner remains attributable");
     }
 
 }
