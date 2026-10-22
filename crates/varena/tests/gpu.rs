@@ -2196,6 +2196,9 @@ fn measured_small(mem: &Memory, m: SetId) {
 /// cuMemAlloc. Past the limit, or on a real OOM, the callback (`reclaim_allocation`) runs inside the lock, and the
 /// allocation retries while each try finds the state changed and the callback reclaimed something. None: refused.
 fn segment(mem: &Memory, r: &Request, torch: &parking_lot::Mutex<u64>, size: u64, callbacks: &Timings) -> Option<(u64, varena::memory::Resident)> {
+    // Torch's allocation context is current in the allocator.
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
     let mut held = torch.lock();
     let d = cuda::driver().unwrap();
     let mut last = None;
@@ -2227,6 +2230,8 @@ fn segment(mem: &Memory, r: &Request, torch: &parking_lot::Mutex<u64>, size: u64
 /// Frees a segment as the native allocator's worker does: after its stream's work, outside the allocator lock, then
 /// gives its bytes back to the lock's count.
 fn unsegment(torch: &parking_lot::Mutex<u64>, (ptr, resident): (u64, varena::memory::Resident), size: u64) {
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
     assert_eq!(unsafe { (cuda::driver().unwrap().mem_free)(ptr) }, cuda::SUCCESS, "cuMemFree");
     drop(resident);
     *torch.lock() -= size;
@@ -2254,7 +2259,9 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
     step!();
     let w = mem.load(set("w", 1, Fill::Stored, &g.uuid, |b| block(95, b)), Level::Ram).unwrap();
     step!();
-    let r = mem.request("r", plan(&[&["idle", "w"]])).unwrap();
+    // The idle set is no step of the plan: its pages have no declared use (N), which the callback may take; a
+    // step's pages are its working set, which it never takes.
+    let r = mem.request("r", plan(&[&["w"]])).unwrap();
     step!();
     // The idle set mapped and released: complete, never-kept pages the callback may take.
     let mut warm = std::time::Duration::ZERO;
@@ -2282,14 +2289,28 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
     let torch = parking_lot::Mutex::new(0u64);
     let callbacks = Timings::default();
     let (calls, longest, done) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(warm.as_nanos() as u64), std::sync::atomic::AtomicBool::new(false));
-    // Where each thread is: 0 between calls, 1 allocating (the allocator lock's path), 2 writing, 3 freeing.
+    // Where each thread is: 0 between calls, 1 allocating (the allocator lock's path), 2 writing and handing to the
+    // free worker.
     let phase = [std::sync::atomic::AtomicU8::new(0), std::sync::atomic::AtomicU8::new(0)];
     let at = |thread: usize, where_: u8| phase[thread].store(where_, std::sync::atomic::Ordering::Release);
     let timed = |t: std::time::Instant| {
         calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         longest.fetch_max(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::AcqRel);
     };
+    // The native allocator's free: an event on the segment's stream, handed to a worker that waits for it and frees
+    // outside the lock (a cuMemFree may wait for the device).
+    let (hand, frees) = mpsc::channel::<((u64, varena::memory::Resident), usize)>();
     let (kept, churned, waited) = std::thread::scope(|s| {
+        let worker = s.spawn(|| {
+            let (_, ctx) = cuda::primary_context(0).unwrap();
+            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+            let d = cuda::driver().unwrap();
+            for (seg, event) in frees {
+                assert_eq!(unsafe { (d.event_synchronize)(event as cuda::CUevent) }, cuda::SUCCESS);
+                unsafe { (d.event_destroy)(event as cuda::CUevent) };
+                unsegment(&torch, seg, REGION_ALIGN);
+            }
+        });
         let a = s.spawn(|| {
             let (_, ctx) = cuda::primary_context(0).unwrap();
             let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
@@ -2325,9 +2346,10 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
                     Some(seg) => {
                         at(1, 2);
                         assert_eq!(unsafe { (d.memset_d8_async)(seg.0, 9, REGION_ALIGN as usize, y.raw() as cuda::CUstream) }, cuda::SUCCESS);
-                        y.drain().unwrap();
-                        at(1, 3);
-                        unsegment(&torch, seg, REGION_ALIGN);
+                        let mut event = std::ptr::null_mut();
+                        assert_eq!(unsafe { (d.event_create)(&mut event, cuda::EVENT_DEFAULT) }, cuda::SUCCESS);
+                        assert_eq!(unsafe { (d.event_record)(event, y.raw() as cuda::CUstream) }, cuda::SUCCESS);
+                        hand.send((seg, event as usize)).unwrap();
                         churned.0 += 1;
                     }
                     None => churned.1 += 1,
@@ -2335,6 +2357,8 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
                 at(1, 0);
                 timed(t);
             }
+            // The worker ends once B, the one sender, is done.
+            drop(hand);
             churned
         });
         // Looks every interval of the longest call so far: two with no call done mean a thread waits, and where each
@@ -2350,7 +2374,11 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
                 gate.take();
             }
         }
-        (a.join().unwrap(), b.join().unwrap(), waited)
+        let out = (a.join().unwrap(), b.join().unwrap(), waited);
+        // B's frees wait on the device in the worker, outside the lock: they finish once the gate opens.
+        gate.take();
+        worker.join().unwrap();
+        out
     });
     step!();
     gate.take();
@@ -2365,12 +2393,10 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
     step!();
     let (gained, raised) = (driver_free().saturating_sub(start_free), mem.allocator_limit().unwrap().saturating_sub(start_limit));
     step!();
-    println!("CALLBACK {} callbacks ({}); B churned {} segments, refused {}; unmapped {unmapped} B; driver gained {gained} B, allocator limit raised {raised} B; waited on the gated stream (phases A, B: 1 allocating, 2 writing, 3 freeing): {waited:?}",
+    println!("CALLBACK {} callbacks ({}); B churned {} segments, refused {}; unmapped {unmapped} B; driver gained {gained} B, allocator limit raised {raised} B; waited on the gated stream (phases A, B: 1 allocating, 2 writing): {waited:?}",
         callbacks.count("reclaim_allocation"), callbacks.report(), churned.0, churned.1);
     step!();
-    // A free (cuMemFree, outside the lock, as the allocator's worker does) may wait for the device; the allocator
-    // lock's path may not.
-    assert!(!waited.is_some_and(|p| p.contains(&1)), "an allocation waited for the gated stream, inside the allocator lock: {waited:?}");
+    assert!(waited.is_none(), "a thread waited for the gated stream (on the allocator lock's path at 1): {waited:?}");
     step!();
     sx.unwrap();
     sy.unwrap();
@@ -2538,11 +2564,16 @@ fn a_measured_pass_gets_its_room_before_it_runs() {
     step!();
     let pass = r.pass(m, "k").unwrap();
     step!();
-    let mut p = Pressure::none();
+    // Lazy room: the measured room is free bytes and pages lent to the allocator callback, so the activation is
+    // allocated as the native allocator does, reclaiming through the callback; never an OOM answer.
+    let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
+    let activation = segment(&mem, &r, &torch, ROOM / 2, &callbacks);
     step!();
-    activation(&mem, &r, &mut p, ROOM / 2, idle);
+    assert!(activation.is_some(), "the pass made its measured room before it ran (callbacks: {})", callbacks.report());
     step!();
-    pass.end(ROOM / 2);
+    pass.end(Measured { allocated_peak: ROOM / 2, slack: 0, sites: vec![] }, Torch { allocated: ROOM / 2, reserved: ROOM / 2 });
+    step!();
+    activation.into_iter().for_each(|a| unsegment(&torch, a, ROOM / 2));
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
