@@ -90,3 +90,33 @@ async fn stored_variant_inspection_does_not_require_an_execution_route() {
     let named = Open { variant: Some("nested/unknown.cozytensors".into()), ..Default::default() };
     assert_eq!(client.open_variant(folder.to_str().unwrap(), &named).await.unwrap().id(), inspected.id());
 }
+
+/// xs-053 regression (0.13.4), the owner's rule (10-22): with no explicit lane a sole variant is
+/// used, a GPU-less host included; GPUs present that cannot run it, or an explicit lane it does not
+/// match, are errors. An exact id goes by the same rule: a commit's sole variant, or a header id
+/// (its own only variant). The repro: an fp8 checkpoint opened by its exact id, offline, with no GPU.
+#[tokio::test]
+async fn an_exact_ids_sole_variant_opens_on_a_gpu_less_host() {
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    let scratch = Scratch(Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("exact-id-{}", std::process::id())));
+    fs::create_dir_all(&scratch.0).unwrap();
+    let store = tensorfs::store::Store::open(scratch.0.join("cache")).unwrap();
+    let vector = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/vectors/select/fp8.cbor");
+    let header = store.put_bytes(&fs::read(vector).unwrap()).unwrap();
+    let mut tree = tensorfs::format::Tree::default();
+    tree.files.insert("model.fp8.cozytensors".into(), header.clone());
+    let commit = store.put_tree(&tree).unwrap();
+    let mut config = Config::from_env();
+    config.cache_dir = scratch.0.join("cache"); config.endpoint = scratch.0.join("origin").to_string_lossy().into(); config.token = None; config.mirror = None;
+    let client = Client::new(config).unwrap();
+    let gpu_less = Open { gpus: Some(vec![]), local_files_only: true, ..Default::default() };
+    for id in [format!("sha256:{}", commit.sha256), format!("sha256:{}", header.sha256)] {
+        let opened = client.open(&id, &gpu_less).await.unwrap();
+        assert_eq!(opened.id(), &header, "{id}");
+        let turing = Open { gpus: Some(vec!["7.5".into()]), ..gpu_less.clone() };
+        assert!(client.open(&id, &turing).await.is_err(), "{id}: GPUs present that cannot run it");
+        let sixteen = Open { bits: Some(16), ..gpu_less.clone() };
+        assert!(client.open(&id, &sixteen).await.is_err(), "{id}: an explicit lane it does not match");
+    }
+}
