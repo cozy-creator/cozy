@@ -103,6 +103,7 @@ exact remote tree.
 |---|---|
 | `Client::new(config)` | Validate configuration and create a reusable client; returns `Result<Client>`. |
 | `open(name_or_path, &Open)` | Open metadata, optionally waiting for all checkpoint data with `lazy: false`; returns `Result<Checkpoint>`. |
+| `open_variant(name_or_path, &Open)` | Open a named or sole variant for inspection/export without GPU selection; rejects `bits`/`gpus` constraints and requires a variant name when several exist. |
 | `materialize(&Ref, &Download, local_dir, local_files_only)` | Make selected repository content available as a normal folder; returns `Result<PathBuf>`. |
 | `download_file(&Ref, filename, local_dir, local_files_only)` | Fetch one repository file; returns `Result<PathBuf>`. |
 | `upload_folder(&Ref, folder, delete_patterns, progress)` | Commit the folder's files on top of the tag `Ref.revision` (default `main`, private when new): the tag's tree minus paths matching `delete_patterns` (fnmatch globs), plus these files. Returns the commit, `Result<ObjectRef>`. |

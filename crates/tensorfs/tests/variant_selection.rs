@@ -60,3 +60,26 @@ fn pinned_header_aliases_resolve_before_agreement_is_checked() {
     tree.files.insert("z.cozytensors".into(),second);
     assert!(tensorfs::fetch::pick_variant(&tree,None,cited,Some("z")).is_err(),"an exact competing path must not be redirected to the legacy alias");
 }
+
+#[tokio::test]
+async fn stored_variant_inspection_does_not_require_an_execution_route() {
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    let root = Scratch(Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("variant-inspection-{}", std::process::id())));
+    let folder = root.0.join("model");
+    fs::create_dir_all(folder.join("nested")).unwrap();
+    let vector = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/vectors/select/future.cbor");
+    fs::copy(vector, folder.join("nested/unknown.cozytensors")).unwrap();
+    let mut config = Config::from_env();
+    config.cache_dir = root.0.join("cache"); config.token = None; config.mirror = None;
+    let client = Client::new(config).unwrap();
+    let cpu = Open { gpus: Some(vec![]), ..Default::default() };
+    assert!(client.open(folder.to_str().unwrap(), &cpu).await.is_err(), "unknown execution remains refused");
+    let inspected = client.open_variant(folder.to_str().unwrap(), &Open::default()).await.unwrap();
+    assert_eq!(inspected.variant(), Some("nested/unknown.cozytensors"));
+    assert!(client.open_variant(folder.to_str().unwrap(), &cpu).await.is_err(), "explicit constraints cannot be ignored");
+    fs::copy(folder.join("nested/unknown.cozytensors"), folder.join("second.cozytensors")).unwrap();
+    assert!(client.open_variant(folder.to_str().unwrap(), &Open::default()).await.is_err(), "data inspection must not guess among variants");
+    let named = Open { variant: Some("nested/unknown.cozytensors".into()), ..Default::default() };
+    assert_eq!(client.open_variant(folder.to_str().unwrap(), &named).await.unwrap().id(), inspected.id());
+}

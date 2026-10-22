@@ -181,7 +181,7 @@ fn identity(ck: &Checkpoint) -> Map<String, Json> {
 
 async fn open(client: &Client, args: &Args, reference: &str) -> Result<Checkpoint> {
     let options = Open { variant: args.get("variant").map(str::to_owned), ..Open::default() };
-    client.open(reference, &options).await
+    client.open_variant(reference, &options).await
 }
 
 async fn run(args: &Args) -> Done {
