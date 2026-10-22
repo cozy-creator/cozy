@@ -71,7 +71,7 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
         .await
         .unwrap();
     assert_eq!((pulled.tree.as_ref(), &pulled.header), (Some(&model.tree), &model.header));
-    assert_eq!(pulled.variant, "int8");
+    assert_eq!(pulled.variant, "model.int8.cozytensors");
     assert_eq!(pulled.landed.origin, model.bytes());
     assert_eq!(
         progress.held.load(std::sync::atomic::Ordering::Relaxed),
