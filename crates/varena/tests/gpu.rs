@@ -1581,7 +1581,7 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     let report: Vec<String> = times.iter().map(|(w, t)| format!("{w} {t:?}")).collect();
     step!();
     println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}), still running at the last call: {running}: {}", report.join(", "));
-    println!("TIMINGS in all: {}", timings.report());
+    println!("TIMINGS in all: {} | driver {}", timings.report(), CALLS.report());
     step!();
     for (what, took) in &times {
         assert!(*took < forward, "{what} took {took:?} under a {forward:?} forward: it waited for it");
@@ -2174,8 +2174,21 @@ fn a_keep_protects_a_page_only_after_its_pin_and_the_kernels_reading_it_end() {
     step!();
 }
 
-/// A pass of `m` (two pinned blocks) whose one-gibibyte activation meets a real OOM: the card is
-/// crowded and the rest full of an idle set. Returns the OOM answers and the record.
+/// A pass of `m` measured at one page (on the empty card), before its activation grew: an unmeasured pass would take
+/// every idle byte before it runs and never meet an OOM.
+fn measured_small(mem: &Memory, m: SetId) {
+    let r = mem.request("seed", plan(&[&["m"]])).unwrap();
+    step!();
+    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
+    step!();
+    pass.end(Measured { allocated_peak: REGION_ALIGN, slack: 0, sites: vec![] }, Torch::default());
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+}
+
+/// A pass of `m` (two pinned blocks), measured smaller than its one-gibibyte activation, which meets a real OOM:
+/// the card is crowded and the rest full of an idle set. Returns the OOM answers and the record.
 fn first_run(mem: &Memory, m: SetId, idle: u32) -> (Vec<String>, Stats) {
     let r = mem.request("first", plan(&[&["m"]])).unwrap();
     step!();
@@ -2207,6 +2220,7 @@ fn an_oom_in_a_pass_is_recovered_in_process() {
     step!();
     let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(3, b)), Level::Ram).unwrap();
     step!();
+    measured_small(&mem, m);
     let _crowd = crowd();
     let idle = more_than_free();
     step!();
@@ -2234,6 +2248,7 @@ fn a_measured_pass_gets_its_room_before_it_runs() {
     step!();
     let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(3, b)), Level::Ram).unwrap();
     step!();
+    measured_small(&mem, m);
     let _crowd = crowd();
     let idle = more_than_free();
     step!();
