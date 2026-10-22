@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use varena::{ledger::Mode, GpuId, Ledger, Peak, Pressure, Tier};
+use varena::{ledger::Mode, GpuId, Ledger, Need, Peak, Pressure, Tier};
 
 /// Past this the memory log rotates to `memory.log.1`, so it holds at most twice this.
 const ROTATE_BYTES: u64 = 4 << 20;
@@ -227,18 +227,26 @@ pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::
 /// events (the platform's PSI trigger, else the cgroup's memory events), else, with no event
 /// source at all, only at its headroom check at every host decision (a memory-log note says
 /// so). None when another participant serves it.
-pub fn serve_tier(mode: HostMode, log: &MemoryLog) -> Option<Arc<Tier>> {
+pub fn serve_tier(mode: HostMode, need: Need, log: &MemoryLog) -> Option<Arc<Tier>> {
     let pressure = host_pressure::Pressure::arm(mode).map(Pressure::Host).unwrap_or_else(|error| {
         log.note(serde_json::json!({"event": "tier_headroom_only", "mode": format!("{mode:?}"), "why": error.to_string()}));
         Pressure::Headroom
     });
-    match Tier::serve(pressure) {
+    match Tier::serve(pressure, need) {
         Ok(tier) => tier.map(Arc::new),
         Err(error) => {
             log.note(serde_json::json!({"event": "no_tier", "why": error.to_string()}));
             None
         }
     }
+}
+
+/// What the host keeps free for the calls running on `gpus`, which the RAM tier fills only
+/// beside: varena's host need of each GPU, all of them (`None`: a running call is unmeasured,
+/// and the tier fills nothing).
+// TODO(S1): replace the sum with varena's own over a group, so TensorD adds no bytes.
+pub fn need(gpus: Vec<Arc<Gpu>>) -> Need {
+    Arc::new(move || gpus.iter().try_fold(0u64, |sum, gpu| Some(sum.saturating_add(gpu.ledger.host_need()?))))
 }
 
 fn now_ms() -> u128 {

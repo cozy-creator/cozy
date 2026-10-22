@@ -235,7 +235,7 @@ impl Drop for StandIn {
 /// A peak record's key.
 fn key(peak: &Peak) -> &str {
     match peak {
-        Peak::Request { key, .. } | Peak::Compute { key, .. } | Peak::Pass { key, .. } | Peak::Set { key, .. } => key,
+        Peak::Request { key, .. } | Peak::Compute { key, .. } | Peak::Host { key, .. } | Peak::Pass { key, .. } | Peak::Set { key, .. } => key,
     }
 }
 
@@ -580,4 +580,29 @@ fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
     gpu0.ledger.undispatch(&call);
     assert_eq!(homes(), [0], "with room on GPU 0 it stays there");
     assert_eq!(homes(), [0], "and the same placement answers the same");
+}
+
+/// The RAM tier's need is varena's host need over TensorD's GPUs: a call running unmeasured on
+/// the host makes it None (the tier fills nothing beside it); once its package and shape were
+/// measured, the same call's need is known.
+#[test]
+fn an_unmeasured_running_call_lets_the_tier_fill_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
+    let id = gpu_id("need");
+    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap());
+    let need = memory::need(vec![gpu.clone()]);
+    let engine = Engine::open(&dir.path().join("engine")).unwrap();
+    let mut a = StandIn::spawn(&gpu, &id, "gpu");
+    assert_eq!(need(), Some(0), "nothing runs");
+    for (key, measured) in [("first", false), ("again", true)] {
+        let call = engine.submit(key, Invocation::default()).unwrap().id;
+        assert!(memory::admit(&engine, &[&gpu.ledger], &call, PACKAGE, BIG, None).unwrap());
+        assert_eq!(a.ask(&format!("run {call} {BIG}")), "passing");
+        assert_eq!(need().is_some(), measured, "{key}: {:?}", need());
+        assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
+        gpu.ledger.undispatch(&call);
+        assert_eq!(need(), Some(0), "{key} ended");
+        assert!(gpu.ledger.peaks().iter().any(|peak| matches!(peak, Peak::Host { key, .. } if *key == format!("{PACKAGE}|{BIG}"))));
+    }
 }

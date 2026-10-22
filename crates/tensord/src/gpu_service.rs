@@ -711,7 +711,8 @@ impl Pool {
             entry: entry.clone(),
             memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, &peaks, &notes).map(Arc::new),
         }).collect();
-        let tier = memory::serve_tier(config.host.mode, &notes);
+        let gpus = devices.iter().filter_map(|d| d.memory.clone()).collect();
+        let tier = memory::serve_tier(config.host.mode, memory::need(gpus), &notes);
         let launcher = crate::child_launcher::ChildLauncher::new()?;
         let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
         Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
