@@ -449,20 +449,27 @@ fn a_cold_requests_record_carries_its_loads() {
     assert_eq!(warm.stats().moved.store.bytes, 0, "nothing filled since");
 }
 
-/// The vertical slice: lifting a limit raises the capacity. TensorD sets it exactly at create;
-/// a standalone opener only lowers it.
+/// v8 (a GPU test's 1 GiB limit capped every executor on the pod): TensorD sets the table's
+/// capacity exactly, whatever an earlier opener chose, and its limit never outlives it; a
+/// standalone opener's limit caps its own row only.
 #[test]
-fn tensord_sets_the_capacity_a_standalone_opener_lowers_it() {
+fn only_tensord_sets_the_capacity_and_an_openers_limit_is_its_rows() {
     let g = GpuId { uuid: format!("m{}-limit", std::process::id()), model: "host".into(), memory: 64 * MB };
     let _scope = Scope::new(&g.uuid);
     let capacity = |l: &varena::Ledger| l.status().capacity;
+    // A standalone opener with a small limit, gone before TensorD starts: nothing of it stays.
+    let small = Memory::open(g.clone(), Some(varena::Grant::open(&g, Some(8 * MB)).unwrap()), Box::new(HostBackend::new(g.memory))).unwrap();
+    assert_eq!(small.torch_limit(), 8 * MB, "its own row is capped");
+    drop(small);
     let ledger = varena::Ledger::create(&g, Some(12 * MB)).unwrap();
-    assert_eq!(capacity(&ledger), 12 * MB);
+    assert_eq!(capacity(&ledger), 12 * MB, "TensorD's limit, exactly");
     drop(ledger);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     assert_eq!(capacity(&ledger), 64 * MB, "the limit lifted: the card's");
-    drop(varena::Grant::open(&g, Some(8 * MB)).unwrap());
-    assert_eq!(capacity(&ledger), 8 * MB, "a standalone cap lowers it");
+    let executor = Memory::open(g.clone(), Some(ledger.grant(std::process::id()).unwrap()), Box::new(HostBackend::new(g.memory))).unwrap();
+    assert_eq!(executor.torch_limit(), 64 * MB, "an executor gets the whole card");
+    drop(executor);
+    // (A live joiner's limit beside a peer: processes::a_joiners_limit_leaves_its_peers_room.)
 }
 
 /// S5 r3: a load records its set's bytes (its layout's span) on its GPU's table, persisted as
@@ -703,7 +710,8 @@ fn a_grant_keeps_its_table_generation_when_the_ledger_is_dropped() {
     drop(ledger);
     drop(varena::Grant::open(&g, Some(8 * MB)).unwrap());
     let memory = Memory::open(g.clone(), Some(grant), Box::new(HostBackend::new(g.memory))).unwrap();
-    assert_eq!(memory.torch_limit(), 8 * MB, "the grant and the next opener share the same live generation");
+    // The table outlived its TensorD (whose limit went with it); the other opener's cap was its own.
+    assert_eq!(memory.torch_limit(), 64 * MB, "the grant opens the same live generation");
 }
 
 #[test]

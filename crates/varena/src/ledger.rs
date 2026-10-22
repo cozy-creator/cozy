@@ -366,8 +366,8 @@ fn openers(fd: &Owned) -> Vec<u32> {
 }
 
 impl Shared {
-    /// The table behind `fd` (a grant's), initialised if it is new. The first opener sets the
-    /// capacity; a later one can only lower it.
+    /// The table behind `fd` (a grant's), initialised at `capacity` (the card's) if it is new.
+    /// Only TensorD changes it after ([`Ledger::create`]): an opener's limit is its own row's.
     pub fn adopt(fd: Owned, gpu: &GpuId, capacity: u64) -> Result<Shared> {
         // The description handed over is this process's own (a granted executor of another uid
         // could not open the file again).
@@ -413,7 +413,6 @@ impl Shared {
                 fence(Release);
                 h.magic = MAGIC;
             }
-            h.capacity.fetch_min(capacity, AcqRel);
             Ok(map)
         })();
         os::unlock(&fd, 0, 8)?;
@@ -1332,18 +1331,20 @@ pub(crate) fn held(rows: &[RowView]) -> u64 {
 pub struct Grant {
     pub table: Owned,
     pub row: Owned,
+    /// A standalone opener's cap on its own row (never the table's: v8, a test's 1 GiB capped
+    /// every executor on the card).
+    pub limit: Option<u64>,
 }
 
 impl Grant {
-    /// `gpu`'s table by name, created when absent, for a standalone engine. `limit` lowers the
-    /// capacity (the first opener sets it, a later one can only lower it).
+    /// `gpu`'s table by name, created at the card's capacity when absent, for a standalone
+    /// engine; `limit` caps only this opener's row.
     pub fn open(gpu: &GpuId, limit: Option<u64>) -> Result<Grant> {
-        let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
         // Read-locked open while the grant lives.
         let table = open_named(&gpu.uuid)?;
-        drop(Shared::adopt(os::dup(&table)?, gpu, capacity)?);
+        drop(Shared::adopt(os::dup(&table)?, gpu, gpu.memory)?);
         let row = os::reopen(&table, true)?;
-        Ok(Grant { table, row })
+        Ok(Grant { table, row, limit })
     }
 }
 
@@ -1430,22 +1431,31 @@ impl Room {
 /// TensorD's handle on one GPU's table.
 pub struct Ledger {
     shared: Arc<Shared>,
+    /// The card's bytes: the capacity again once this TensorD goes (its limit never outlives it).
+    card: u64,
     /// The GPU's wake endpoint, bound by name: every participant signals it.
     events: os::Endpoint,
     custody: custody::Client,
 }
 
+impl Drop for Ledger {
+    fn drop(&mut self) {
+        let _ = self.shared.set_capacity(self.card);
+    }
+}
+
 impl Ledger {
-    /// The GPU's table, named per GPU and user; capacity = min(card, limit), never raised by a
-    /// later opener. A restarted TensorD reopens the same table and drops every dispatch it
-    /// finds (TensorD is the only dispatcher: they are a dead one's). TensorD serves custody when
-    /// it holds the service lock (it does when it starts first).
+    /// The GPU's table, named per GPU and user; capacity = min(card, limit), whatever an earlier
+    /// opener chose, and the card's again when this ledger goes. A restarted TensorD reopens the
+    /// same table and drops every dispatch it finds (TensorD is the only dispatcher: they are a
+    /// dead one's). TensorD serves custody when it holds the service lock (it does when it
+    /// starts first).
     pub fn create(gpu: &GpuId, limit: Option<u64>) -> Result<Ledger> {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
         let table = open_named(&gpu.uuid)?;
         let shared = Arc::new(Shared::adopt(table, gpu, capacity)?);
-        // TensorD is the capacity's authority: min(card, limit) exactly, raised when a limit is
-        // lifted (standalone openers may only lower it).
+        // TensorD is the capacity's authority: min(card, limit) exactly (an opener's limit is
+        // its own row's).
         shared.set_capacity(capacity)?;
         let events = os::wake_bind(shared.ns, &gpu.uuid)?.ok_or_else(|| Error::Invalid(format!("another TensorD holds {}", gpu.uuid)))?;
         shared.reap(None)?;
@@ -1453,7 +1463,7 @@ impl Ledger {
             shared.put(&key, None)?;
         }
         let custody = custody::Client::open(&shared)?;
-        Ok(Ledger { shared, events, custody })
+        Ok(Ledger { shared, card: gpu.memory, events, custody })
     }
 
     /// The machine's sharing mode (shared until TensorD says dedicated).
@@ -1468,7 +1478,7 @@ impl Ledger {
         let table = self.shared.descriptor()?;
         // A transferred grant owns this generation even before the child creates its row.
         os::share(&table, OPEN, 8, true)?;
-        Ok(Grant { table, row: self.shared.descriptor()? })
+        Ok(Grant { table, row: self.shared.descriptor()?, limit: None })
     }
 
     /// After `waitpid`: `pid`'s row goes, and the pages it kept become orphans.

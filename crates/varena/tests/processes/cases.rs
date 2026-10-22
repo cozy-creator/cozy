@@ -71,7 +71,7 @@ pub fn main() {
         ("kept_pages_survive_a_holder_that_served", kept_pages_survive_a_holder_that_served),
         ("binds_outlive_the_custody_holder", binds_outlive_the_custody_holder),
         ("a_table_with_live_rows_outlives_tensord", a_table_with_live_rows_outlives_tensord),
-        ("a_transferred_grant_keeps_its_cap_after_ledger_drop", a_transferred_grant_keeps_its_cap_after_ledger_drop),
+        ("a_transferred_grant_keeps_its_table_after_ledger_drop", a_transferred_grant_keeps_its_table_after_ledger_drop),
         ("a_stale_reader_never_frees_a_newer_row", a_stale_reader_never_frees_a_newer_row),
         ("a_joint_step_runs_a_pass_per_set", a_joint_step_runs_a_pass_per_set),
         ("a_child_runs_while_its_parent_yields", a_child_runs_while_its_parent_yields),
@@ -91,6 +91,7 @@ pub fn main() {
         ("an_unmeasured_pass_asks_peers_only_on_an_oom", an_unmeasured_pass_asks_peers_only_on_an_oom),
         ("a_refused_tier_copy_runs_after_a_measured_pass", a_refused_tier_copy_runs_after_a_measured_pass),
         ("a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends", a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends),
+        ("a_joiners_limit_leaves_its_peers_room", a_joiners_limit_leaves_its_peers_room),
         ("the_tier_waits_on_no_executor_and_a_pending_release_settles_first", the_tier_waits_on_no_executor_and_a_pending_release_settles_first),
         ("a_silent_asker_holds_up_no_answer", a_silent_asker_holds_up_no_answer),
         ("the_tier_comes_back_after_a_release", the_tier_comes_back_after_a_release),
@@ -294,7 +295,7 @@ fn agent() {
                 let memory: u64 = memory.parse().unwrap();
                 let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory };
                 // SAFETY: descriptors 3 and 4 are the grant the parent handed this process.
-                let grant = unsafe { varena::Grant { table: platform::handles::Owned::from_raw_fd(3), row: platform::handles::Owned::from_raw_fd(4) } };
+                let grant = unsafe { varena::Grant { table: platform::handles::Owned::from_raw_fd(3), row: platform::handles::Owned::from_raw_fd(4), limit: None } };
                 mem = Some(Memory::open(g, Some(grant), Box::new(HostBackend::new(memory))).unwrap());
                 format!("ok {}", std::process::id())
             }
@@ -303,6 +304,14 @@ fn agent() {
                 let memory: u64 = memory.parse().unwrap();
                 let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory };
                 mem = Some(Memory::open(g, None, Box::new(HostBackend::new(memory))).unwrap());
+                format!("ok {}", std::process::id())
+            }
+            ["open", id, memory, limit] => {
+                uuid = id.to_string();
+                let memory: u64 = memory.parse().unwrap();
+                let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory };
+                let grant = varena::Grant::open(&g, Some(limit.parse().unwrap())).unwrap();
+                mem = Some(Memory::open(g, Some(grant), Box::new(HostBackend::new(memory))).unwrap());
                 format!("ok {}", std::process::id())
             }
             ["openrec", id, memory] => {
@@ -868,25 +877,27 @@ fn binds_outlive_the_custody_holder(dir: &Path) {
     drop(varena::Ledger::create(&g, None).unwrap());
 }
 
-/// Review 1, finding 10: TensorD's exit keeps a table an executor still uses, and a restarted
-/// The grant survives in a real child before its Memory is opened. Dropping the parent's
-/// ledger and lowering the named cap must update that very same generation.
-fn a_transferred_grant_keeps_its_cap_after_ledger_drop(_dir: &Path) {
+/// The grant survives in a real child before its Memory is opened: dropping the parent's ledger
+/// keeps that very generation (v8: TensorD's limit goes with it, and another opener's limit caps
+/// only that opener's row).
+fn a_transferred_grant_keeps_its_table_after_ledger_drop(_dir: &Path) {
     let g = gpu("transferred-cap", 64 * MB);
     let ledger = varena::Ledger::create(&g, Some(12 * MB)).unwrap();
     let mut child = Agent::granted(ledger.grant(std::process::id()).unwrap());
     drop(ledger);
     drop(varena::Grant::open(&g, Some(8 * MB)).unwrap());
     child.ok(&format!("grant {} {}", g.uuid, g.memory));
-    assert_eq!(child.ok("limit"), (8 * MB).to_string());
+    assert_eq!(child.ok("limit"), (64 * MB).to_string(), "TensorD's limit went with it");
     let mut observer = Agent::spawn();
     observer.ok(&format!("open {} {}", g.uuid, g.memory));
-    assert_eq!(observer.ok("limit"), (8 * MB).to_string());
+    let path = write_set(_dir, "seen", 1);
+    child.ok(&format!("load seen {} stored gpu", path.display()));
+    assert_eq!(observer.ok("limit"), (64 * MB - REGION_ALIGN).to_string(), "one table: the child's page counts for the observer");
     child.exit();
-    assert_eq!(observer.ok("limit"), (8 * MB).to_string(), "the surviving opener retains the cap");
     observer.exit();
 }
 
+/// Review 1, finding 10: TensorD's exit keeps a table an executor still uses, and a restarted
 /// TensorD reopens it.
 fn a_table_with_live_rows_outlives_tensord(dir: &Path) {
     let g = gpu("restart", 8 * MB);
@@ -1019,6 +1030,23 @@ fn a_refused_tier_copy_runs_after_a_measured_pass(dir: &Path) {
     assert!(resident() >= 2 * REGION_ALIGN, "the deferred copies ran: {}", resident());
     y.ok("end r");
     y.exit();
+}
+
+/// v8: a live joiner opening with a small limit caps its own row; its peer's room and the
+/// table's capacity stay the card's.
+fn a_joiners_limit_leaves_its_peers_room(dir: &Path) {
+    let _ = dir;
+    let g = gpu("joiner", 64 * MB);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let mut peer = Agent::spawn();
+    peer.ok(&format!("open {} {}", g.uuid, g.memory));
+    let mut joiner = Agent::spawn();
+    joiner.ok(&format!("open {} {} {}", g.uuid, g.memory, 8 * MB));
+    assert_eq!(joiner.ok("limit"), (8 * MB).to_string(), "the joiner's own row is capped");
+    assert_eq!(peer.ok("limit"), (64 * MB).to_string(), "its peer's room is untouched");
+    assert_eq!(ledger.status().capacity, 64 * MB, "and the table's capacity");
+    joiner.exit();
+    peer.exit();
 }
 
 /// Review 6: a standalone call (no dispatch key: host-unmeasured, no measured pass end) has the
