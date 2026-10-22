@@ -162,13 +162,10 @@ impl Fixture {
     fn folder_spec(&self, id: &str, endpoint: &str, files: &BTreeMap<String, Vec<u8>>) -> Spec {
         let mut entries = BTreeMap::new();
         for (name, bytes) in files {
-            let object = ObjectRef::of(bytes);
-            self.runs.objects.write("owner", &object.id(), bytes).unwrap();
-            entries.insert(name.clone(), object);
+            entries.insert(name.clone(), self.write_input(bytes));
         }
         let document = tensord::trees::document(&entries);
-        let object = ObjectRef::of(&document);
-        self.runs.objects.write("owner", &object.id(), &document).unwrap();
+        let object = self.write_input(&document);
         let mut spec = self.spec(id, endpoint, domain::ModelChoice {
             parameter: "model".into(), source: "input://model".into(), ..Default::default()
         });
@@ -177,6 +174,15 @@ impl Fixture {
             media_type: "application/vnd.cozy.tree-manifest".into(), order: 0,
         });
         spec
+    }
+
+    fn write_input(&self, bytes: &[u8]) -> ObjectRef {
+        let object = ObjectRef::of(bytes);
+        if let Some(upload) = self.runs.objects.upload("owner", &object.id(), object.length).unwrap() {
+            upload.write_at(0, bytes).unwrap();
+            self.runs.objects.settle(&upload).unwrap();
+        }
+        object
     }
 
     fn settled(&self, id: &str) -> Execution {
