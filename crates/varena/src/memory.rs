@@ -1001,6 +1001,7 @@ impl Inner {
     fn unmap(&self, st: &mut State, key: Key, class: Class, req: Option<u64>, withdraw: bool) -> Result<()> {
         let Some(home) = st.homes.remove(&key) else { return Ok(()) };
         let (va, off, span) = st.place(key)?;
+        tracing::debug!(target: "varena_diag", "unmap decided {key:?} gen={} class={class:?} req={req:?} ptr={:#x} span={span} exported={} filling={} ready={:#x}", home.gen, va.base + off, home.exported, home.filling, home.ready.0);
         // Custody's handle holds the memory until the Withdraw is sent: held (P) meanwhile.
         if home.exported && withdraw && self.withdraw(home.identity.clone(), key.1, span).is_some() {
             st.table.pending += span;
@@ -1162,6 +1163,7 @@ impl Inner {
             }
         };
         let Some((spec, held, (va, off, span))) = prepared else { return };
+        tracing::debug!(target: "varena_diag", "fill begin {:?} gen={} ptr={:#x} span={span} after={} tier={}", job.key, job.gen, va.base + off, job.after.len(), held.is_some());
         let start = Instant::now();
         let result = crate::caught(|| {
             #[cfg(feature = "faults")]
@@ -1201,6 +1203,7 @@ impl Inner {
         });
         let mut sticky = false;
         let ns = start.elapsed().as_nanos() as u64;
+        tracing::debug!(target: "varena_diag", "fill end {:?} gen={} ptr={:#x} {}", job.key, job.gen, va.base + off, match &result { Ok((o, e)) => format!("ok {o:?} event={:#x}", e.0), Err(e) => format!("err {e}") });
         let mut st = self.state.lock();
         if st.homes.get(&job.key).is_none_or(|h| h.gen != job.gen) {
             // The page changed under the fill: its event is nobody's.
@@ -1745,6 +1748,7 @@ impl Inner {
         self.unlock(st);
         self.speculate(req);
         self.backend.wait(ready, stream)?;
+        tracing::debug!(target: "varena_diag", "pin {key:?} id={id} ptr={:#x} span={span} stream={stream:#x} ready={:#x}", va.base + off, ready.0);
         Ok(Pin { ptr: va.base + off, len: span, ready, fresh, inner: self.clone(), key, id, stream, transform, transformed: AtomicBool::new(false) })
     }
 
@@ -2545,6 +2549,7 @@ impl Drop for Pin {
             Event::DONE
         });
         let untransformed = self.transform && !self.transformed.load(Ordering::Acquire);
+        tracing::debug!(target: "varena_diag", "unpin {:?} id={} ptr={:#x} stream={:#x} event={:#x}", self.key, self.id, self.ptr, self.stream, event.0);
         let _ = self.inner.release_tx.send(Release { key: self.key, pin: self.id, event, untransformed });
         self.inner.landed.notify_all();
     }
@@ -2579,6 +2584,13 @@ impl Pass {
 impl Inner {
     /// Runs one mechanism call (the state lock free), then applies its result under it.
     fn mechanism(&self, op: Mech) {
+        let what = diag_mech(&op);
+        tracing::debug!(target: "varena_diag", "mech begin {what}");
+        self.mechanism_op(op);
+        tracing::debug!(target: "varena_diag", "mech end {what}");
+    }
+
+    fn mechanism_op(&self, op: Mech) {
         match op {
             Mech::Map { key, gen, va, off, span, job, speculative, decided } => self.place_page(key, gen, va, off, span, job, (!speculative).then_some(decided)),
             Mech::Renew { key, gen, va, off, span, old, after, job } => {
@@ -2798,5 +2810,17 @@ impl Drop for Pass {
         if st.active.get(&(self.req, self.set)).is_some_and(|a| a.id == self.id) {
             st.active.remove(&(self.req, self.set));
         }
+    }
+}
+
+/// SPIKE DIAG: a mechanism op, named with its page and range.
+fn diag_mech(op: &Mech) -> String {
+    match op {
+        Mech::Map { key, gen, va, off, span, speculative, .. } => format!("map {key:?} gen={gen} ptr={:#x} span={span} speculative={speculative}", va.base + off),
+        Mech::Adopt { key, gen, va, off, len, .. } => format!("adopt {key:?} gen={gen} ptr={:#x} span={len}", va.base + off),
+        Mech::Unmap { va, off, span, ready, .. } => format!("unmap ptr={:#x} span={span} ready={:#x}", va.base + off, ready.0),
+        Mech::Keep { key, gen, va, off, span, .. } => format!("keep {key:?} gen={gen} ptr={:#x} span={span}", va.base + off),
+        Mech::Renew { key, gen, va, off, span, after, .. } => format!("renew {key:?} gen={gen} ptr={:#x} span={span} after={}", va.base + off, after.len()),
+        Mech::Release(va) => format!("release va={:#x} len={}", va.base, va.len),
     }
 }

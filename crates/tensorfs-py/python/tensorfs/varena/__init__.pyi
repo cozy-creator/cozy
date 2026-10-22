@@ -210,9 +210,9 @@ class Request:
 def allocated() -> None:
     """SPIKE: this thread's pass is over for torch's pool (`Request.allocating`)."""
 
-def allocator_stats() -> tuple[int, int, int, int, int, int]:
+def allocator_stats() -> tuple[int, int, int, int, int, int, int]:
     """SPIKE: the pool's segments: (live bytes, segments made, shortfalls varena resolved, their
-    bytes, refusals, nanoseconds making segments)."""
+    bytes, refusals, nanoseconds making segments, segments freed)."""
 
 def allocator_reentries() -> tuple[int, int]:
     """SPIKE: the trims and cache shrinks varena reached on a thread inside the allocator

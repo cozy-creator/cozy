@@ -907,9 +907,9 @@ fn allocated() {
 }
 
 /// The pool's segments: (live bytes, segments made, shortfalls varena resolved, their bytes,
-/// refusals, nanoseconds making segments).
+/// refusals, nanoseconds making segments, segments freed).
 #[pyfunction]
-fn allocator_stats() -> (u64, u64, u64, u64, u64, u64) {
+fn allocator_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
     crate::allocator::stats()
 }
 

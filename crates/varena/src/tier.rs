@@ -110,6 +110,7 @@ impl Layout {
             return 0;
         }
         word.store(0, Release);
+        tracing::debug!(target: "varena_diag", "tier punch region={r} off={off} span={span}");
         let _ = os::punch(&self.fd, self.data + off, span);
         let _ = os::unlock(&self.fd, self.data + off, span);
         span
@@ -585,8 +586,10 @@ impl Held {
             let Ok((ptr, span)) = self.ptr(r) else { continue };
             bytes += span;
             if pins.reading.contains(&r) {
+                tracing::debug!(target: "varena_diag", "tier held release region={r} ptr={ptr:#x} deferred (reading)");
                 pins.deferred.push(r);
             } else {
+                tracing::debug!(target: "varena_diag", "tier held release region={r} ptr={ptr:#x} unregister");
                 let _ = unregister(ptr);
             }
         }
@@ -600,6 +603,7 @@ impl Held {
         if let Some(i) = pins.deferred.iter().position(|d| *d == r) {
             pins.deferred.swap_remove(i);
             if let Ok((ptr, _)) = self.ptr(r) {
+                tracing::debug!(target: "varena_diag", "tier settle region={r} ptr={ptr:#x} deferred unregister");
                 let _ = unregister(ptr);
             }
         }
@@ -617,10 +621,12 @@ impl Held {
         let registered = &mut pins.registered;
         match (ready, registered.contains(&r)) {
             (true, false) => {
+                tracing::debug!(target: "varena_diag", "tier pin region={r} ptr={ptr:#x} span={span} register");
                 register(ptr, span)?;
                 registered.insert(r);
             }
             (false, true) => {
+                tracing::debug!(target: "varena_diag", "tier pin region={r} ptr={ptr:#x} unregister (not ready)");
                 unregister(ptr)?;
                 registered.remove(&r);
             }
@@ -649,6 +655,7 @@ impl Held {
     /// The caller settles the region afterwards ([`Held::settle`]).
     pub fn read(&self, r: u32, dst: tensorfs::io::Dst) -> Result<bool> {
         let (off, span) = self.region(r)?;
+        tracing::debug!(target: "varena_diag", "tier read region={r} host={:#x} dst={:#x} len={}", self.ro.base as u64 + self.data + off, match dst { tensorfs::io::Dst::Device { ptr, .. } => ptr, _ => 0 }, dst.len());
         self.pins.lock().reading.insert(r);
         os::share(&self.fd, self.data + off, span, true)?;
         let copied = (|| {

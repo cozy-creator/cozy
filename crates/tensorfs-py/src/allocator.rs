@@ -42,6 +42,8 @@ static RESOLVED: AtomicU64 = AtomicU64::new(0);
 static RESOLVED_BYTES: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 static NS: AtomicU64 = AtomicU64::new(0);
+/// Segments given back to the driver.
+static FREES: AtomicU64 = AtomicU64::new(0);
 /// varena's callbacks into torch or Python reached on a thread inside the allocator (answered 0,
 /// never called): trims, cache shrinks.
 static TRIMS_INSIDE: AtomicU64 = AtomicU64::new(0);
@@ -78,9 +80,10 @@ pub fn exit() {
     ACTIVE.with(|a| a.borrow_mut().pop());
 }
 
-/// (live bytes, segments, shortfalls resolved, their bytes, refusals, ns making segments).
-pub fn stats() -> (u64, u64, u64, u64, u64, u64) {
-    (LIVE.load(Relaxed), SEGMENTS.load(Relaxed), RESOLVED.load(Relaxed), RESOLVED_BYTES.load(Relaxed), REFUSED.load(Relaxed), NS.load(Relaxed))
+/// (live bytes, segments, shortfalls resolved, their bytes, refusals, ns making segments,
+/// segments freed).
+pub fn stats() -> (u64, u64, u64, u64, u64, u64, u64) {
+    (LIVE.load(Relaxed), SEGMENTS.load(Relaxed), RESOLVED.load(Relaxed), RESOLVED_BYTES.load(Relaxed), REFUSED.load(Relaxed), NS.load(Relaxed), FREES.load(Relaxed))
 }
 
 fn segment(size: usize) -> Result<cuda::CUdeviceptr, cuda::CUresult> {
@@ -134,7 +137,10 @@ fn ask(need: u64) -> Option<Next> {
         // releases its cached blocks itself and asks again.
         let held = p.outside + LIVE.load(Relaxed);
         let torch = Torch { allocated: held, reserved: held };
-        Some(p.request.oom(p.set, Some(need), None, torch))
+        tracing::debug!(target: "varena_diag", "ask begin need={need} set={:?} held={held}", p.set);
+        let next = p.request.oom(p.set, Some(need), None, torch);
+        tracing::debug!(target: "varena_diag", "ask end need={need} next={next:?}");
+        Some(next)
     }))
 }
 
@@ -145,6 +151,7 @@ fn alloc(size: usize) -> *mut c_void {
     // means it made progress (pages unmapped, the watermark lowered); anything else refuses.
     let ptr = loop {
         let got = if fits(size as u64) { segment(size) } else { Err(cuda::ERROR_OUT_OF_MEMORY) };
+        tracing::debug!(target: "varena_diag", "alloc size={size} got={got:x?}");
         match got {
             Ok(ptr) => break ptr as *mut c_void,
             Err(cuda::ERROR_OUT_OF_MEMORY) if matches!(ask(size as u64), Some(Next::Retry)) => {
@@ -174,15 +181,20 @@ pub extern "C" fn varena_torch_alloc(size: isize, _device: c_int, _stream: *mut 
     catch_unwind(AssertUnwindSafe(|| alloc(size))).unwrap_or(std::ptr::null_mut())
 }
 
-/// The segment goes back to the driver.
+/// The segment goes back to the driver once the work queued on its stream is done (the GIL
+/// released for the wait: a host callback ahead on the stream may need it).
 #[no_mangle]
-pub extern "C" fn varena_torch_free(ptr: *mut c_void, size: usize, _device: c_int, _stream: *mut c_void) {
+pub extern "C" fn varena_torch_free(ptr: *mut c_void, size: usize, _device: c_int, stream: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        if let Ok(d) = cuda::driver() {
-            // SAFETY: a segment `varena_torch_alloc` made; torch frees each once.
-            if unsafe { (d.mem_free)(ptr as cuda::CUdeviceptr) } == cuda::SUCCESS {
-                LIVE.fetch_sub(size as u64, Relaxed);
-            }
+        let Ok(d) = cuda::driver() else { return };
+        // SAFETY: the driver ABI on torch's stream for this segment, in its current context.
+        let synced = unlocked(|| unsafe { (d.stream_synchronize)(stream as cuda::CUstream) });
+        // SAFETY: a segment `varena_torch_alloc` made; torch frees each once.
+        let freed = unsafe { (d.mem_free)(ptr as cuda::CUdeviceptr) };
+        tracing::debug!(target: "varena_diag", "free ptr={ptr:?} size={size} stream={stream:?} sync={synced} free={freed}");
+        if freed == cuda::SUCCESS {
+            LIVE.fetch_sub(size as u64, Relaxed);
+            FREES.fetch_add(1, Relaxed);
         }
     }));
 }

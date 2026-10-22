@@ -322,6 +322,8 @@ class Memory:
         self.pooling = pool
         #: the largest torch reserve a pass held outside the pool (other threads' allocations)
         self.outside = 0
+        #: SPIKE DIAG: block runs on a stream other than the one its pin was bound on
+        self.crossed = 0
         if pool and self.cuda:
             allocator = torch.cuda.memory.CUDAPluggableAllocator(_ext.__file__, "varena_torch_alloc", "varena_torch_free")
             self.pool = torch.cuda.MemPool(allocator._allocator)
@@ -566,6 +568,7 @@ class Memory:
             if block.count == 0:
                 self._bind(block, stream)
             elif stream is not None and stream != block.stream and not torch.cuda.is_current_stream_capturing():
+                self.crossed += 1  # SPIKE DIAG
                 stream.wait_stream(block.stream)  # type: ignore[arg-type]  # a capture binds under a hold
             block.count += 1
 
@@ -573,6 +576,7 @@ class Memory:
         stream = torch.cuda.current_stream(self.device) if self.cuda else None
         with block.model.lock:
             if stream is not None and block.stream not in (None, stream) and not torch.cuda.is_current_stream_capturing():
+                self.crossed += 1  # SPIKE DIAG
                 block.stream.wait_stream(stream)  # type: ignore[union-attr]
             block.count -= 1
             if block.count == 0:

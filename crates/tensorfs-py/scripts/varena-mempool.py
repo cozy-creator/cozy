@@ -16,7 +16,8 @@ OutOfMemoryError. Measured against torch's default allocator under the same cap,
   8. no deadlock when a stream host callback that takes the GIL is queued ahead of varena's
      unmaps.
 
-    python scripts/varena-mempool.py
+    python scripts/varena-mempool.py main
+    python scripts/varena-mempool.py  # SPIKE DIAG: the ILLEGAL_ADDRESS diagnostic (debugging only)
 GPU 0 only.
 """
 
@@ -24,6 +25,11 @@ from __future__ import annotations
 
 import ctypes
 import faulthandler
+import gzip
+import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -33,6 +39,7 @@ from pathlib import Path
 import tensorfs
 import torch
 from diffusers import UNet2DConditionModel
+from tensorfs import _ext
 from tensorfs.varena import VarenaError, allocator_reentries, allocator_stats
 from tensorfs.varena.torch import Declared, Memory, Weights
 
@@ -74,11 +81,11 @@ def watch() -> None:
         seen = len(results)
 
 
-def build(store: Path) -> tensorfs.Checkpoint:
+def build(store: Path, dest: Path | None = None) -> tensorfs.Checkpoint:
     """SDXL's UNet shapes in bf16, random (std 0.02): its bytes, not its pictures, matter here."""
     with torch.device("meta"):
         shapes = UNet2DConditionModel(**CONFIG).state_dict()
-    w = tensorfs.Writer(cache_dir=store)
+    w = tensorfs.Writer(dest, cache_dir=store)
     unet = w.component("unet", cls=("diffusers", "0.35.1", "UNet2DConditionModel"), config=CONFIG)
     g = torch.Generator().manual_seed(0)
     for key, meta in shapes.items():
@@ -243,16 +250,17 @@ def main() -> int:
     return 0 if all(results) else 1
 
 
-def shortfalls(mem: Memory, run: Run, ck: tensorfs.Checkpoint) -> None:
+def shortfalls(mem: Memory, run: Run, ck: tensorfs.Checkpoint, fillers: int = 2) -> None:
     """0: the allocator's own path. Two fillers occupy the card; the model's first pass at a
     shape no pass measured (so varena makes no room for its activations ahead) runs through the
     pool; then, in a pass, a buffer bigger than torch's headroom: each shortfall is resolved in
     the allocator by evictions, with no OOM raised to Python."""
     mem.pooling = True
-    second = loaded(mem, ck, "filler2")
+    second = loaded(mem, ck, "filler2") if fillers == 2 else None
     run.fill()
-    with mem.request("filler2", plan=[second]), torch.no_grad():
-        second(run.x[:, :, :64, :64], 999, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
+    if second is not None:
+        with mem.request("filler2", plan=[second]), torch.no_grad():
+            second(run.x[:, :, :64, :64], 999, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
     before = allocator_stats()
     x = run.x[:, :, :224, :224].contiguous()  # a shape no pass ran
     raised = None
@@ -293,7 +301,8 @@ def shortfalls(mem: Memory, run: Run, ck: tensorfs.Checkpoint) -> None:
     check("0: a buffer past torch's headroom is resolved in the allocator, with no OOM raised to Python",
           seen.get("ok") is True and isinstance(seen.get("resolved"), int) and seen["resolved"] > 0, seen)
     check("0: the evictions made it room", isinstance(seen.get("evicted"), int) and seen["evicted"] >= (1 << 30), seen)
-    mem.models[second].close()
+    if second is not None:
+        mem.models[second].close()
 
 
 def slack(mem: Memory, run: Run) -> None:
@@ -354,6 +363,126 @@ def host_callback(mem: Memory, run: Run) -> None:
     check("8: no deadlock with a GIL-taking host callback queued ahead of varena's unmaps", raised is None and len(times) == STEPS and len(ran) >= 2, (raised, ran))
 
 
+def diag() -> int:
+    """The ILLEGAL_ADDRESS diagnostic (debugging only, never product behaviour): gpu11's
+    configuration up to its third interleaved iteration, in a child process per variant with
+    CUDA_LAUNCH_BLOCKING=1 (the faulting call returns the error) and varena's mechanism ops
+    logged (RUST_LOG=debug): both fillers, then one. Then the pool free's ordering, in a child
+    of its own (its comparison with a bare cuMemFree may fault the context)."""
+    work = Path(tempfile.mkdtemp(prefix="varena-mempool-"))
+    dest = work / "unet.cozytensors"
+    build(work / "store", dest)
+    out = Path("out")  # the rental script's output tree
+    for label, fillers in (("both-fillers", 2), ("one-filler", 1)):
+        log = work / f"{label}.stderr.log"
+        env = {**os.environ, "CUDA_LAUNCH_BLOCKING": "1", "RUST_LOG": "debug"}
+        began = time.perf_counter()
+        with log.open("w") as err, subprocess.Popen([sys.executable, "-u", __file__, "variant", str(fillers), str(dest), str(work / "store")],
+                                                    env=env, stdout=subprocess.PIPE, stderr=err, text=True) as child:
+            for line in child.stdout or ():
+                print(f"[{label}] {line}", end="", flush=True)
+        print(f"DIAG {label}: exit {child.returncode} after {time.perf_counter() - began:.0f} s", flush=True)
+        summarize(label, log)
+        with log.open("rb") as raw, gzip.open(out / f"{label}.stderr.log.gz", "wb") as packed:
+            shutil.copyfileobj(raw, packed)
+    done = subprocess.run([sys.executable, "-u", __file__, "free"], capture_output=True, text=True)
+    print(done.stdout + done.stderr[-4000:], flush=True)
+    return 0
+
+
+def summarize(label: str, log: Path) -> None:
+    """The first fault in a variant's stderr, the mechanism ops before it, and its page's history."""
+    lines = log.read_text(errors="replace").splitlines()
+    ops = [n for n, line in enumerate(lines) if "varena_diag" in line]
+    first = next((n for n, line in enumerate(lines) if "ILLEGAL_ADDRESS" in line or "illegal memory access" in line), None)
+    print(f"DIAG {label}: {len(lines)} stderr lines, {len(ops)} mechanism ops logged, first fault at line {first}", flush=True)
+    python = [line for line in lines if not line[:4].isdigit()]
+    if first is None:
+        print(f"DIAG {label}: no fault; stderr's last Python lines:", *python[-10:], sep="\n  ", flush=True)
+        return
+    print(f"DIAG {label}: the 80 lines before the first fault and 20 after:", *(line[:400] for line in lines[max(0, first - 80):first + 20]), sep="\n  ", flush=True)
+    key = re.search(r"\((\d+), (\d+)\)", lines[first])
+    if key is not None:
+        page = f"({key[1]}, {key[2]})"
+        history = [line[:400] for line in lines[:first + 1] if page in line]
+        print(f"DIAG {label}: page {page}'s last 40 ops:", *history[-40:], sep="\n  ", flush=True)
+    print(f"DIAG {label}: stderr's Python lines (the faulting call's traceback):", *python[-60:], sep="\n  ", flush=True)
+
+
+def variant(fillers: int, ck: tensorfs.Checkpoint) -> int:
+    """gpu11's sequence: case 0 (with `fillers` fillers), case 1, then case 2's interleaved
+    default and pool runs, three iterations; the first error ends it."""
+    torch.backends.cudnn.allow_tf32 = torch.backends.cuda.matmul.allow_tf32 = False
+    mem = Memory.open(0, limit=CAP, pool=True)
+    assert mem.pool is not None
+    print(f"POOL use count outside a pass {mem.pool.use_count()}; torch {torch.__version__}", flush=True)
+    run = Run(mem, ck)
+    inside: list[int] = []
+    hook = run.unet.conv_in.register_forward_pre_hook(lambda *_: inside.append(mem.pool.use_count()) if mem.pooling else None)  # type: ignore[union-attr]
+    shortfalls(mem, run, ck, fillers)
+    run.fill()
+    times, _, _, raised = run.steps("pool beside the filler", True)
+    print(f"CASE 1: ms {[round(t) for t in times]} raised {raised!r}; allocator {allocator_stats()}", flush=True)
+    for i in range(3):
+        for pool in (False, True):
+            run.fill()
+            frees = allocator_stats()[6]
+            times, _, _, raised = run.steps("pool" if pool else "default", pool)
+            print(f"ITERATION {i + 1} {'pool' if pool else 'default'}: ms {[round(t) for t in times]} raised {raised!r}; "
+                  f"segments freed {allocator_stats()[6] - frees}; allocator {allocator_stats()}; cross-stream block runs {mem.crossed}; "
+                  f"pool use counts in its passes {sorted(set(inside))}", flush=True)
+            if raised is not None:
+                return 1
+    hook.remove()
+    print(f"POOL use count outside a pass {mem.pool.use_count()}", flush=True)
+    return 0
+
+
+def free() -> int:
+    """The pool's free waits for the work queued on its segment's stream: a 64 MiB segment
+    from varena's allocator, a sleep then a memset into it queued, then varena_torch_free; then
+    the same with the driver's bare cuMemFree, for comparison (last: it may fault)."""
+    lib, driver = ctypes.CDLL(_ext.__file__), ctypes.CDLL("libcuda.so.1")
+    lib.varena_torch_alloc.restype, lib.varena_torch_alloc.argtypes = ctypes.c_void_p, (ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p)
+    lib.varena_torch_free.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p)
+    driver.cuMemsetD8Async.argtypes = (ctypes.c_uint64, ctypes.c_ubyte, ctypes.c_size_t, ctypes.c_void_p)
+    driver.cuMemAlloc_v2.argtypes = (ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t)
+    driver.cuMemFree_v2.argtypes = (ctypes.c_uint64,)
+    torch.zeros(1, device="cuda")
+    stream, size = torch.cuda.current_stream(), 64 << 20
+    for name in ("varena_torch_free", "cuMemFree"):
+        if name == "varena_torch_free":
+            ptr = lib.varena_torch_alloc(size, 0, stream.cuda_stream)
+        else:
+            out = ctypes.c_uint64()
+            driver.cuMemAlloc_v2(ctypes.byref(out), size)
+            ptr = out.value
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record(stream)
+        torch.cuda._sleep(1 << 29)
+        rc = driver.cuMemsetD8Async(ptr, 1, size, ctypes.c_void_p(stream.cuda_stream))
+        end.record(stream)
+        began = time.perf_counter()
+        freed = lib.varena_torch_free(ptr, size, 0, stream.cuda_stream) if name == "varena_torch_free" else driver.cuMemFree_v2(ptr)
+        waited, idle = 1e3 * (time.perf_counter() - began), stream.query()
+        try:
+            torch.cuda.synchronize()
+            queue, fault = f"{start.elapsed_time(end):.0f} ms", None
+        except RuntimeError as e:
+            queue, fault = "unknown", str(e).splitlines()[0]
+        print(f"FREE {name}: memset queued rc {rc}, free rc {freed}; the free returned after {waited:.0f} ms for a {queue} queue; "
+              f"stream idle when it returned: {idle}; fault after: {fault}", flush=True)
+        if fault is not None:
+            return 1
+    print(f"FREE allocator {allocator_stats()}", flush=True)
+    return 0
+
+
 if __name__ == "__main__":
-    threading.Thread(target=watch, daemon=True).start()
-    sys.exit(main())
+    # SPIKE DIAG: with no argument (as the rental script runs it) the diagnostic; `main` for the cases.
+    mode = sys.argv[1] if len(sys.argv) > 1 else "diag"
+    if mode in ("main", "variant"):
+        threading.Thread(target=watch, daemon=True).start()
+    if mode == "variant":
+        sys.exit(variant(int(sys.argv[2]), tensorfs.open(sys.argv[3], cache_dir=sys.argv[4], local_files_only=True)))
+    sys.exit({"diag": diag, "free": free, "main": main}[mode]())
