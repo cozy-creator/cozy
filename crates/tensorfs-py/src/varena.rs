@@ -1008,6 +1008,14 @@ fn allocator_refusals(device: Option<i32>) -> Vec<crate::allocator::Refusal> {
     crate::allocator::refusals(device)
 }
 
+/// Quarantined native segments: device, pool, bytes and the last reason. They stay charged and
+/// are never reused; the device goes on.
+#[pyfunction]
+#[pyo3(signature = (device = None))]
+fn allocator_quarantined(device: Option<i32>) -> Vec<(i32, (u64, u64), u64, &'static str)> {
+    crate::allocator::quarantined(device)
+}
+
 /// A lost completion/release quarantines its segment and retires this executor at a safe
 /// Python boundary; it must not masquerade as a recoverable capacity failure.
 #[pyfunction]
@@ -1064,6 +1072,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(allocator_pending, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_check, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_reentries, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_quarantined, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;
     m.add("StaleBinding", py.get_type::<StaleBinding>())?;
