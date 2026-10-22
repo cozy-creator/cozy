@@ -1260,11 +1260,12 @@ impl Memory {
         let _ = self.inner.guard(|| {
             let mut st = self.inner.lock();
             let now = st.tick();
-            if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
-                c.bytes = bytes;
+            if let Some(c) = st.table.cache_mut(cache.0) {
                 c.last_use = now;
-                // A queued shrink's bytes arrived.
-                c.coming = 0;
+                match c.shrinking {
+                    0 => c.report(bytes),
+                    _ => c.reported = Some(bytes),
+                }
             }
             self.inner.publish(&mut st);
             self.inner.unlock(st);
@@ -1280,7 +1281,7 @@ impl Memory {
             .guard(|| {
                 let mut st = self.inner.lock();
                 let id = st.tick();
-                if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
+                if let Some(c) = st.table.cache_mut(cache.0) {
                     c.holds += 1;
                 }
                 self.inner.publish(&mut st);
@@ -1296,7 +1297,7 @@ impl Memory {
         let _ = self.inner.guard(|| {
             let event = self.inner.backend.record(stream)?;
             let mut st = self.inner.lock();
-            if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
+            if let Some(c) = st.table.cache_mut(cache.0) {
                 c.holds = c.holds.saturating_sub(1);
                 if event != Event::DONE {
                     c.releasing.push(event.0);
@@ -2921,13 +2922,24 @@ impl Inner {
     /// come.
     fn shrink(&self, shrinks: Vec<(u32, u64, Shrink)>, announced: bool) {
         for (id, bytes, f) in shrinks {
+            if let Some(c) = self.state.lock().table.cache_mut(id) {
+                c.shrinking += 1;
+            }
             let shrunk = crate::caught(|| Ok(f(bytes))).unwrap_or_default();
             let mut st = self.state.lock();
-            if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == id) {
+            if let Some(c) = st.table.cache_mut(id) {
                 c.bytes = c.bytes.saturating_sub(shrunk.freed + shrunk.coming);
                 let before = if announced { c.coming.saturating_sub(bytes) } else { c.coming };
                 c.coming = before + shrunk.coming;
+                c.shrinking = c.shrinking.saturating_sub(1);
+                // What it reported during its shrinks is the latest word on its bytes.
+                if let Some(b) = c.reported.take_if(|_| c.shrinking == 0) {
+                    c.report(b);
+                }
             }
+            self.publish(&mut st);
+            drop(st);
+            self.landed.notify_all();
         }
     }
 
@@ -3768,7 +3780,7 @@ impl Inner {
                     // Its trim thread shrinks it after the reply; the bytes are coming meanwhile
                     // (published), so the asker waits for them rather than escalating (C2).
                     Action::Shrink { cache, bytes } => {
-                        if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == *cache) {
+                        if let Some(c) = st.table.cache_mut(*cache) {
                             c.coming += *bytes;
                         }
                         wanted.shrinks.push((*cache, *bytes));

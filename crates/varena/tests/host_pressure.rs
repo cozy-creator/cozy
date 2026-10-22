@@ -280,7 +280,10 @@ fn scenario(watch: bool) {
     }
 }
 
+/// Needs a user systemd session (a hosted runner has none): run these two with `--ignored`
+/// where one is.
 #[test]
+#[ignore = "needs a user systemd session for its memory-limited scopes"]
 fn layouts_yield_to_a_growing_call_where_psi_is_denied() {
     for name in ["inside_with_nothing_watching", "inside_with_the_watcher", "inside_a_mapped_layout_is_counted_once"] {
         assert!(scope(name).success(), "{name}");
@@ -340,6 +343,7 @@ fn inside_a_mapped_layout_is_counted_once() {
 /// Where PSI is denied the watcher arms on `memory.events`, and the kernel's file-modified event
 /// wakes it as the scope reaches its limit.
 #[test]
+#[ignore = "needs a user systemd session for its memory-limited scope"]
 fn memory_events_wake_the_watcher_where_psi_is_denied() {
     assert!(scope("inside_memory_events_wake").success());
 }
