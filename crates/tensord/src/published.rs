@@ -654,8 +654,8 @@ impl Publisher {
     fn release_alias(&self, request: &Request, release: &str) -> String {
         let origin = request.origin();
         let sdk = format!(
-            "{:?}{:?}{:?}",
-            self.sdk.requirements(), self.sdk.find_links, self.sdk.client_wheel
+            "{:?}{:?}{:?}{:?}",
+            self.sdk.requirements(), self.sdk.find_links, self.sdk.client_wheel, self.sdk.runtime_build
         );
         let key = format!("{origin}\0{}\0{release}\0{sdk}", request.package);
         format!("hub-{}", &sha256::hex_digest(key.as_bytes())[..32])
@@ -840,7 +840,7 @@ impl Publisher {
             .map(|record| record.dependencies.into_iter().map(|d| (normalized(&d.name), d.version)).collect());
         let stage = install_stage(&request.package, &release, before.as_ref(), &self.planned_pair(&locked));
         let wheels: Vec<&str> = card.wheels.iter().map(|wheel| wheel.sha256.as_str()).collect();
-        let identity = sha256::hex_digest(json!({"package":request.package,"release":release,"pyproject":card.pyproject,"lock":card.lock,"wheels":wheels,"python":card.python,"hub":hub::origin_key(&source.origin),"sdk":self.sdk.requirements(),"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
+        let identity = sha256::hex_digest(json!({"package":request.package,"release":release,"pyproject":card.pyproject,"lock":card.lock,"wheels":wheels,"python":card.python,"hub":hub::origin_key(&source.origin),"sdk":self.sdk.requirements(),"runtime_build":self.sdk.runtime_build,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
         let wanted = Environment {
             card: &card,
             locked: &locked,

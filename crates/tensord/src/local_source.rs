@@ -259,7 +259,7 @@ impl LocalSources {
         let key = serde_json::json!({
             "lock": held("uv.lock"), "project": held("pyproject.toml"), "beside": beside, "wheels": carried,
             "indexes": manifest.indexes,
-            "sdk": self.installer.sdk(), "client": self.installer.client_wheel,
+            "sdk": self.installer.sdk(), "runtime_build": self.installer.runtime_build, "client": self.installer.client_wheel,
             "python": self.installer.python, "python_version": manifest.python_version,
         });
         home.join(format!("env-{}", &sha256::hex_digest(key.to_string().as_bytes())[..16]))
@@ -447,7 +447,7 @@ impl LocalSources {
         // client. The source digest alone cannot identify the environment after an update.
         let key = serde_json::json!({
             "manifest": digest,
-            "sdk": self.installer.sdk(),
+            "sdk": self.installer.sdk(), "runtime_build": self.installer.runtime_build,
             "client": self.installer.client_wheel,
             "python": self.installer.python,
         });
@@ -1203,19 +1203,17 @@ mod tests {
         let _ = fs::remove_dir_all(m.root);
     }
 
-    /// A package whose lock holds another Runtime than the machine's (here a vendored dev build,
-    /// pinned exactly) runs on the machine's own pair: version skew is allowed. uv's check of its
-    /// pin is the run's warning, never a refusal (card I: an old-pair lock refused, runs
-    /// 12795-12810). A dev Runtime is a machine's through `--runtime-wheel`. Every capture shape
-    /// the CLI sends.
+    /// Normal SDK contradictions refuse in every capture shape. Only an explicit development
+    /// override retains the existing warning, without being reused by a normal selection.
     #[test]
-    fn a_lock_of_another_runtime_runs_on_the_machines_pair_with_a_warning() {
+    fn local_sdk_bounds_refuse_except_for_an_explicit_development_override() {
         let m = machine("cm-vendored");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let pair = sdk_pair(&m.root);
+        let normal = LocalSources::new(m.objects.clone(), InstallerConfig { sdk: pair.clone(), ..m.installer.clone() });
         let sources = LocalSources::new(
             m.objects.clone(),
-            InstallerConfig { sdk: pair.clone(), ..m.installer.clone() },
+            InstallerConfig { sdk: pair.clone(), runtime_build: "explicit-fixture".into(), ..m.installer.clone() },
         );
         let project = m.root.join("project");
         let fixture = repo.join("tests/fixtures/cpu_input");
@@ -1267,6 +1265,8 @@ mod tests {
         // The live tree, file by file: the project as it is, its lock and vendor/ wheel.
         let live = manifest(serde_json::json!({"files": live_files(&m.objects, "alice", &project, &[&files[..], &[vendored.as_str()]].concat())}));
         for digest in [source, carried, live] {
+            let error = normal.install(&m.service, "alice", &digest, None, "", &|_| ()).err().unwrap();
+            assert!(error.message.contains("package_sdk_incompatible"), "{}", error.message);
             let installed = sources.install(&m.service, "alice", &digest, None, "", &|_| ()).unwrap();
             let held = m.service.catalog.resolve(&installed.generation).unwrap();
             assert_eq!(installed_sdk(&held.record.python), format!("{runtime} {}", wheel_version(&pair[1])));
