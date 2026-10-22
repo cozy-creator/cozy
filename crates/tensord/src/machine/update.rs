@@ -58,10 +58,10 @@ impl Pair {
         if band(&self.runtime).is_some_and(|v| v >= (0, 31))
             && band(&self.tensorfs).is_some_and(|v| v >= (0, 14))
         { return Ok(()); }
-        Err(coded("memory_protocol_incompatible", format!(
+        Err(io::Error::other(Coded { code: "memory_protocol_incompatible", message: format!(
             "this TensorD requires Runtime >=0.31.0 and TensorFS >=0.14.0 together; selected Runtime {:?}, TensorFS {:?}. Upgrade through cozy 0.11.4 before cozy 0.12, or stage the binary and both SDK wheels in one machine update",
             self.runtime, self.tensorfs,
-        )))
+        ) }))
     }
 }
 
