@@ -2606,6 +2606,7 @@ impl Pool {
             }).collect(),
             selections: plan.selections(),
             adopted: false,
+            admits: session.executor.hello.admits(),
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -3548,6 +3549,8 @@ struct Callbacks<'a> {
     selections: Vec<SelectedManifest>,
     /// A rank mapped GPU pages a gone executor kept (`read_grant`).
     adopted: bool,
+    /// Its Runtime and TensorFS seal only where `read_grant` says `seal` (`Hello::admits`).
+    admits: bool,
 }
 /// A call's end: a layout it was sealing and never deposited is nobody's to wait for.
 struct Sealing<'a>(&'a Deposits, &'a str);
@@ -3562,9 +3565,11 @@ impl Services for Callbacks<'_> {
     /// checkpoint), else nothing, and the Runtime reads the checkpoint through TensorFS (TensorD
     /// never fills). Without one, the asker seals it only when admitted (`seal`): a layout is
     /// speculation, so it takes only measured surplus (`HostTier::admit`). Another asker
-    /// meanwhile is told to ask again once that deposit lands.
+    /// meanwhile is told to ask again once that deposit lands. An older Runtime or TensorFS seals
+    /// unadmitted too, so it is the layout's one sealer either way.
     fn read_grant(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
         drop(plan);
+        self.pool.host.nudge();
         let (manifest, layout) = (&frame.manifest, &frame.layout);
         let (file, filling, seal, admission) = match self.deposits.grant(manifest, layout, &self.holders) {
             Some((file, filling)) => (Some(file), filling, false, None),
@@ -3574,15 +3579,17 @@ impl Services for Callbacks<'_> {
                 let selected = self.selections.iter().find(|s| id(&s.manifest) == id(manifest));
                 let bytes = selected.and_then(|s| selected_bytes(&self.pool.store, &s.manifest, &s.components).ok());
                 let mut admission = None;
-                match self.deposits.seal(manifest, layout, &format!("{}#{}", self.id, frame.rank), || {
-                    admission = bytes.map(|(bytes, _)| self.pool.host.admit(bytes));
+                let who = format!("{}#{}", self.id, frame.rank);
+                match self.deposits.seal(manifest, layout, &who, bytes.map_or(0, |(b, _)| b), !self.admits, |reserved| {
+                    admission = bytes.map(|(bytes, _)| self.pool.host.admit(bytes, reserved));
                     admission.as_ref().is_some_and(|a| a.seal)
                 }) {
                     Ok(seal) => {
                         // A concurrent deposit may have landed after the first grant lookup.
                         let granted = (!seal).then(|| self.deposits.grant(manifest, layout, &self.holders)).flatten();
                         let (file, filling) = granted.map_or((None, false), |(file, filling)| (Some(file), filling));
-                        (file, filling, seal, admission.map(|a| crate::host_tier::Admission { seal, ..a }))
+                        let why = |a: &crate::host_tier::Admission| if self.admits || a.seal { a.why } else { "an older Runtime or TensorFS seals regardless" };
+                        (file, filling, seal, admission.map(|a| crate::host_tier::Admission { seal, why: why(&a), ..a }))
                     }
                     Err(sealer) => {
                         let detail = format!("{sealer} is sealing {layout}; ask again once it deposits");
@@ -3626,6 +3633,7 @@ impl Services for Callbacks<'_> {
         Answer::ok(frame.seq)
     }
     fn progress(&mut self, frame: &Frame) {
+        self.pool.host.nudge();
         crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
     }
     fn request(
@@ -3637,6 +3645,7 @@ impl Services for Callbacks<'_> {
             // A layout varena sealed in the executor, kept for the next executor of its weights.
             let layout = descriptor.ok_or_else(|| io::Error::other("a deposit omitted its layout"))?;
             let kept = self.deposits.deposit(&frame.manifest, &frame.layout, layout, &self.holders);
+            self.pool.host.nudge();
             self.pool.notes.note(serde_json::json!({"event": "deposit", "manifest": frame.manifest,
                 "layout": frame.layout, "kept": kept.as_ref().map_or_else(ToString::to_string, |()| "yes".into())}));
             return Ok(match kept {

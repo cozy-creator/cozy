@@ -56,6 +56,28 @@ pub struct Hello {
     pub torch_loaded: bool,
 }
 
+impl Hello {
+    /// Whether its Runtime and TensorFS seal a host layout only where `read_grant` says `seal`
+    /// (Runtime 0.30.3 and TensorFS 0.13.3 on); an older pair seals every one it is not granted.
+    pub fn admits(&self) -> bool {
+        release(&self.runtime_version) >= vec![0, 30, 3] && release(&self.tensorfs_version) >= vec![0, 13, 3]
+    }
+}
+
+/// A version's leading release numbers: `0.30.3+e9baf7a4` and `0.30.3.dev1` are `[0, 30, 3]`.
+fn release(version: &str) -> Vec<u64> {
+    let mut numbers = vec![];
+    for part in version.split('.') {
+        let digits = &part[..part.bytes().take_while(u8::is_ascii_digit).count()];
+        let Ok(number) = digits.parse() else { break };
+        numbers.push(number);
+        if digits.len() < part.len() {
+            break;
+        }
+    }
+    numbers
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Adapter {
@@ -2130,6 +2152,17 @@ mod codec_tests {
     /// A frame is as large as its structure: a load reply naming every key its checkpoint
     /// skips (FLUX.3 Klein's as-is text encoder) failed the old 64 KiB frame. Only a prefix
     /// over `MAX_FRAME` is refused, before any body byte is read.
+    #[test]
+    fn only_a_runtime_and_tensorfs_that_honour_seal_admit() {
+        let hello = |runtime: &str, tensorfs: &str| Hello { runtime_version: runtime.into(), tensorfs_version: tensorfs.into(), ..Hello::default() };
+        assert!(hello("0.30.3", "0.13.3").admits());
+        assert!(hello("0.30.4+e9baf7a4", "0.14.0.dev2").admits());
+        assert!(hello("0.31.0", "0.13.7").admits());
+        assert!(!hello("0.30.1", "0.13.6").admits(), "an older Runtime seals every layout");
+        assert!(!hello("0.30.3", "0.13.0").admits(), "an older TensorFS too");
+        assert!(!hello("", "").admits(), "unknown is older");
+    }
+
     #[test]
     fn a_frame_over_64_kib_crosses_and_a_lying_prefix_is_refused() {
         let keys: Vec<String> = (0..20_000).map(|i| format!("model.visual.blocks.{i}.attn.qkv.weight")).collect();
