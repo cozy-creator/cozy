@@ -61,6 +61,8 @@ impl Event {
     }
     fn sync(&self) -> cuda::Result<()> {
         let _ctx = CtxGuard::enter(self.ctx)?;
+        // A host wait: a trace span, so a subscriber can time each.
+        let _wait = tracing::trace_span!("tensorfs cuEventSynchronize").entered();
         cuda::check("cuEventSynchronize", unsafe {
             (cuda::driver()?.event_synchronize)(self.raw)
         })
