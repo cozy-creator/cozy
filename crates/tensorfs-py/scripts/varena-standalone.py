@@ -354,6 +354,28 @@ def costs(mem: Memory, unet: UNet2DConditionModel) -> None:
     check(f"cost: a warm bind adds {adapter_bind - native_bind:.0f} us to varena's (at most 30)", adapter_bind - native_bind <= 30, (native_bind, adapter_bind))
 
 
+def threads() -> dict[int, tuple[str, float]]:
+    """Each thread's name and CPU seconds (Linux), to say where a run's CPU went."""
+    out = {}
+    for tid in os.listdir("/proc/self/task"):
+        try:
+            stat = Path(f"/proc/self/task/{tid}/stat").read_text()
+        except OSError:
+            continue
+        fields = stat[stat.rindex(")") + 2:].split()
+        out[int(tid)] = (stat[stat.index("(") + 1:stat.rindex(")")], (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"))
+    return out
+
+
+def cpu_by_thread(before: dict[int, tuple[str, float]], after: dict[int, tuple[str, float]]) -> dict[str, float]:
+    """CPU ms between two `threads()` readings: the main thread, then the others by name."""
+    main, spent = threading.get_native_id(), {}
+    for tid, (name, cpu) in after.items():
+        key = "main" if tid == main else name
+        spent[key] = round(spent.get(key, 0.0) + 1e3 * (cpu - before.get(tid, (name, 0.0))[1]), 1)
+    return {k: v for k, v in sorted(spent.items(), key=lambda kv: -kv[1]) if v}
+
+
 def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> weakref.ref[Memory]:
     """On host pages (the same bytes, the same kernels), a warm forward through the adapter costs
     at most 10% more CPU than the plain model's. Its own table and model, every block a hit;
@@ -379,13 +401,19 @@ def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> 
     served()
     origins.clear()
     best = [float("inf"), float("inf")]
+    # All runs' CPU by thread (clock ticks: too coarse for one run).
+    where: list[dict[int, tuple[str, float]]] = [{}, {}]
     for _ in range(11):
         for i, run_ in enumerate((plain_run, served)):
-            began = time.process_time()
+            before, began = threads(), time.process_time()
             run_()
             best[i] = min(best[i], time.process_time() - began)
+            for tid, (name, cpu) in threads().items():
+                where[i][tid] = (name, where[i].get(tid, (name, 0.0))[1] + cpu - before.get(tid, (name, 0.0))[1])
     costs(mem, unet)
     ratio = best[1] / best[0]
+    print(f"OVERHEAD best CPU ms: plain {1e3 * best[0]:.1f}, served {1e3 * best[1]:.1f}; all 11 runs' CPU ms by thread: "
+          f"plain {cpu_by_thread({}, where[0])}; served {cpu_by_thread({}, where[1])}", flush=True)
     check(f"overhead: a warm forward through the adapter costs {100 * (ratio - 1):+.1f}% CPU over plain (at most +10%)", ratio <= 1.10 and origins == {"hit"}, (best, origins))
     return weakref.ref(mem)
 
