@@ -680,9 +680,10 @@ A repo is a set of **commits** and the **tags** that point at them, as in git:
   The variant is then looked up in that commit's tree. Without an explicit variant, exactly one variant is selected
   automatically; zero gives no variant and more than one requires an explicit choice. The unnamed variant has no
   implicit priority over other variants. A commit id and a header digest name immutable content; a tag moves,
-  and a commit no tag names is collected (below).
-- **Roots.** The tags' commits, yanked or private included, are this repo's referenced roots; nothing else is. Keeping
-  a complete copy of the repo requires keeping their closures. Local cache eviction policy is not part of the
+  and a commit it leaves stays the repo's (below).
+- **Roots.** Every commit the repo has is a referenced root: its tags' commits, yanked or private included, and every
+  commit a tag has named, until the repo's owner deletes it. A commit no tag names is never collected on its own.
+  Keeping a complete copy of the repo requires keeping their closures. Local cache eviction policy is not part of the
   document format.
 - Repo names are case-insensitive: `Acme/SDXL` and `acme/sdxl` are one repo. Keys and paths use the name with ASCII
   `A`–`Z` lowered (`refs/acme/sdxl.json`); the document's `name` keeps the writer's spelling.
