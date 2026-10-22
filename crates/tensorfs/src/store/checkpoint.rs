@@ -13,7 +13,7 @@ use platform::durable;
 use super::retention::{self, Hold};
 use super::{fail, invalid, Error, Result, Store};
 use crate::format::{
-    self, decode, variant_of, variant_path, Body, Component, Header, Location, ObjectRef,
+    self, decode, variant_of, Body, Component, Header, Location, ObjectRef,
     PartBytes, Pipeline, Tensor, Tree, CHUNKS_DIR,
 };
 use crate::io::{Copy, Dst, ReadOpts, Src};
@@ -106,15 +106,15 @@ impl Checkpoint {
             return Self::opened(Objects::Folder { dir: parent.to_path_buf(), cache: cache.cloned() }, ObjectRef::of(&bytes), Header::from_cbor(&bytes)?, Some(dir.to_path_buf()));
         }
         let name = match variant {
-            Some(v) => variant_path(v),
+            Some(v) => {
+                let files = super::folder_files(dir, "")?.into_iter().map(|name| (name, ObjectRef::of(&[]))).collect();
+                let tree = Tree { files };
+                tree.variant(Some(v)).map_err(Error::from)?.0.to_owned()
+            },
             None => {
                 let mut found = Vec::new();
-                for entry in fs::read_dir(dir).map_err(fail("list", dir))? {
-                    let name = entry.map_err(fail("list", dir))?.file_name();
-                    let name = name.to_string_lossy().into_owned();
-                    if variant_of(&name).is_some() {
-                        found.push(name);
-                    }
+                for name in super::folder_files(dir, "")? {
+                    if variant_of(&name).is_some() { found.push(name); }
                 }
                 match <[String; 1]>::try_from(found) {
                     Ok([one]) => one,

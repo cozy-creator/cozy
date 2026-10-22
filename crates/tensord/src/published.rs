@@ -189,20 +189,36 @@ impl Named {
         Ok(self)
     }
 
-    /// Its header in its tree: the first of `lanes` the tree has (an empty lane: its only one),
-    /// the tree document landed here.
-    fn landed(mut self, machine: &Machine, source: &hub::Source, lanes: &[String]) -> Result<Self, Failure> {
+    /// Select by header profile, or by an explicit path, without reading tensor payloads.
+    fn landed(mut self, machine: &Machine, source: &hub::Source, constraints: Option<&precision::Constraints>) -> Result<Self, Failure> {
         let failed = |e| refused("model_resolution_failed", e);
         let remote = origin::remote(machine, source).map_err(failed)?;
         let tree = machine.tree(&remote, self.tree()?, &Stop::default()).map_err(failed)?;
-        let mut chosen = Err(unresolved(&self));
-        for lane in lanes {
-            chosen = tensorfs::fetch::variant_of_tree(&tree, (!lane.is_empty()).then_some(lane.as_str())).map_err(failed);
-            if chosen.is_ok() {
-                break;
+        if self.lane.is_empty() {
+            let default = precision::Constraints::default();
+            let constraints = constraints.unwrap_or(&default);
+            if let Some(answer) = origin::select(machine, source, &self.repository, &self.tree()?.id(), constraints).map_err(failed)? {
+                if answer.commit != *self.tree()? { return Err(unresolved(&self)); }
+                let path = answer.variant.ok_or_else(|| ("model_resolution_failed", "no variant fits the requested GPUs and bits".into()))?;
+                if tree.header(&path) != answer.header.as_ref() { return Err(unresolved(&self)); }
+                self.lane = path;
+            } else {
+                let headers: Vec<_> = tree.variants().map(|(_,h)| h.clone()).collect();
+                machine.objects(&remote, &headers, priority::NOW, &Stop::default()).map_err(failed)?;
+                let profiles = tree.variants().map(|(name,h)| {
+                    let header = tensorfs::format::Header::from_cbor(&machine.store().read(h).map_err(|e| ("model_resolution_failed",e.to_string()))?)
+                        .map_err(|e| ("model_resolution_failed",e.to_string()))?;
+                    Ok((name,precision::Profile::of(&header)))
+                }).collect::<Result<Vec<_>,Failure>>()?;
+                let candidates: Vec<_> = profiles.iter().map(|(n,p)| (*n,p)).collect();
+                let Some((at,_)) = constraints.select(&self.repository,&candidates).map_err(|e| ("model_resolution_failed",e.to_string()))? else {
+                    return Err(("model_resolution_failed","no variant fits the requested GPUs and bits".into()));
+                };
+                self.lane = profiles[at].0.to_owned();
             }
         }
-        (self.lane, self.header) = chosen.map(|(lane, header)| (lane, Some(header)))?;
+        let (path,header) = tree.variant(Some(&self.lane)).map_err(|e| ("model_resolution_failed",e.to_string()))?;
+        self.lane = path.to_owned(); self.header = Some(header.clone());
         Ok(self)
     }
 
@@ -529,21 +545,17 @@ impl Publisher {
     /// Hub; then the header there of its lane, else of the first of `lanes` the tree has, else of
     /// its only lane. Journaled per catalog revision so a warm run, across restarts too,
     /// asks the Hub nothing (th-245).
-    pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, lanes: &[&str], revision: &str) -> Result<Named, Failure> {
+    pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, constraints: Option<&precision::Constraints>, revision: &str) -> Result<Named, Failure> {
         if named.tree.is_some() {
-            return measured(&self.machine, service, source, named);
+            return measured(&self.machine, service, source, named, constraints);
         }
-        let asked: Vec<String> = match named.lane.is_empty() {
-            true => lanes.iter().chain(&[""]).map(|lane| lane.to_string()).collect(),
-            false => vec![named.lane.clone()],
-        };
         let origin = hub::origin_key(&source.origin).unwrap_or_default();
-        let name = json!([origin, named.repository, named.release, asked]).to_string();
+        let name = json!(["profiles-v1", origin, named.repository, named.release, named.lane, constraints]).to_string();
         let held = service.engine.with_journal(|j| j.named(&name, revision)).map_err(io_failure)?;
         if let Some((release, lane, tree, header)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
             return Ok(Named { release, lane, tree: Some(tree), header: Some(header), ..named });
         }
-        let resolved = named.at_hub(&self.machine, source)?.landed(&self.machine, source, &asked)?;
+        let resolved = named.at_hub(&self.machine, source)?.landed(&self.machine, source, constraints)?;
         let answer = json!([resolved.release, resolved.lane, resolved.tree, resolved.header]).to_string();
         service.engine.with_journal(|j| j.bind_named(&name, revision, &answer)).map_err(io_failure)?;
         Ok(resolved)
@@ -558,13 +570,13 @@ impl Publisher {
         service: &Service,
         source: &hub::Source,
         named: Named,
-        lanes: &[&str],
+        constraints: Option<&precision::Constraints>,
         revision: &str,
         stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<(Named, (u64, u64)), Refused> {
         let failed = |(code, message)| Refused { code, message };
-        let named = self.resolve(service, source, named, lanes, revision).map_err(failed)?;
+        let named = self.resolve(service, source, named, constraints, revision).map_err(failed)?;
         // A checkpoint this store already holds whole moves nothing and asks the Hub nothing.
         let moved = self.ensure(source, &named, stop, bytes).map_err(failed)?;
         Ok((named, moved))
@@ -1270,10 +1282,15 @@ impl Publisher {
             let tolerances = precision::Slot::of(slot);
             let bits = tolerances.bits(request.bits, short);
             let ruled = named.lane.is_empty() && named.tree.is_none();
-            let lanes = if ruled { tolerances.lanes(bits, &gpus) } else { vec![] };
-            let named = self.resolve(service, request.hub(&format!("the model for {path}"))?, named, &lanes, &request.catalog_revision)?;
+            let constraints = precision::Constraints { gpus: gpus.capabilities.clone(), bits: Some(if tolerances.encoded { bits } else { 16 }) };
+            let named = self.resolve(service, request.hub(&format!("the model for {path}"))?, named, Some(&constraints), &request.catalog_revision)?;
             let model = format!("{}@{}", named.repository, named.release);
-            let warnings = if ruled { tolerances.warnings(bits, &gpus, &model, &named.lane) } else { vec![] };
+            let warnings = if ruled {
+                let remote = origin::remote(&self.machine, request.hub("selected header")?).map_err(|e| refused("model_resolution_failed",e))?;
+                self.machine.objects(&remote, std::slice::from_ref(named.header()?), priority::NOW, &Stop::default()).map_err(|e| refused("model_resolution_failed",e))?;
+                let header = tensorfs::format::Header::from_cbor(&self.store.read(named.header()?).map_err(|e| ("model_resolution_failed",e.to_string()))?).map_err(|e| ("model_resolution_failed",e.to_string()))?;
+                tolerances.warnings(bits, &gpus, &model, &precision::Profile::of(&header).family)
+            } else { vec![] };
             let grant = ModelGrant {
                 package: installation.package.clone(),
                 slot: path,
@@ -1333,7 +1350,7 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                let resolve = |source: &hub::Source, named| self.resolve(service, source, named, &[], &request.catalog_revision);
+                let resolve = |source: &hub::Source, named| self.resolve(service, source, named, None, &request.catalog_revision);
                 apply_adapters(self, request.source.as_ref(), &resolve, choice, grant, &request.providers, job)?;
             }
         }
@@ -1623,12 +1640,12 @@ fn newest_key(request: &Request) -> String {
 /// its format; a tree (a commit) resolves to its lane's header, a header is the checkpoint itself.
 /// Read once under the run's access (its request's bearer for the owner's) and kept, since a hash
 /// never names other bytes.
-fn measured(machine: &Machine, service: &Service, source: &hub::Source, named: Named) -> Result<Named, Failure> {
+fn measured(machine: &Machine, service: &Service, source: &hub::Source, named: Named, constraints: Option<&precision::Constraints>) -> Result<Named, Failure> {
     if named.header.is_some() {
         return Ok(named);
     }
     let tree = named.tree()?.clone();
-    let key = json!([hub::origin_key(&source.origin).unwrap_or_default(), named.repository, tree.id(), named.lane]).to_string();
+    let key = json!([hub::origin_key(&source.origin).unwrap_or_default(), named.repository, tree.id(), named.lane, constraints]).to_string();
     let held = service.engine.with_journal(|j| j.named(&key, "")).map_err(io_failure)?;
     if let Some((tree, lane, header)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
         return Ok(Named { tree, lane, header: Some(header), ..named });
@@ -1641,9 +1658,8 @@ fn measured(machine: &Machine, service: &Service, source: &hub::Source, named: N
     let remote = origin::remote(machine, source).map_err(failed)?;
     machine.objects(&remote, std::slice::from_ref(&object), priority::NOW, &Stop::default()).map_err(failed)?;
     let commit = storage::tree_or_header(machine.store(), &object).map_err(|e| ("model_resolution_failed", e.to_string()))?.is_some();
-    let lane = named.lane.clone();
     let named = match commit {
-        true => Named { tree: Some(object), ..named }.landed(machine, source, &[lane])?,
+        true => Named { tree: Some(object), ..named }.landed(machine, source, constraints)?,
         false => Named { tree: None, header: Some(object), ..named },
     };
     let answer = json!([named.tree, named.lane, named.header]).to_string();
@@ -2751,11 +2767,11 @@ pub(crate) mod tests {
             tree: Some(ObjectRef { sha256: object.sha256.clone(), length: 0 }), ..Default::default()
         };
         let tree = held.tree.unwrap();
-        let commit = bench.publisher.resolve(&service, &hub, pin(&tree), &[], "").unwrap();
+        let commit = bench.publisher.resolve(&service, &hub, pin(&tree), None, "").unwrap();
         assert_eq!((commit.tree.as_ref(), commit.header.as_ref()), (Some(&tree), Some(&manifest)));
-        let header = bench.publisher.resolve(&service, &hub, pin(&manifest), &[], "").unwrap();
+        let header = bench.publisher.resolve(&service, &hub, pin(&manifest), None, "").unwrap();
         assert_eq!((header.tree.as_ref(), header.header.as_ref(), header.lane.as_str()), (None, Some(&manifest), "bf16"));
-        assert_eq!(bench.publisher.resolve(&service, &hub, pin(&manifest), &[], "").unwrap().header, Some(manifest.clone()));
+        assert_eq!(bench.publisher.resolve(&service, &hub, pin(&manifest), None, "").unwrap().header, Some(manifest.clone()));
         bench.publisher.structure(&hub, std::slice::from_ref(&header), &Job::default()).unwrap();
         let store = bench.publisher.store();
         let pulled = Pulled::of(store, &manifest).unwrap().unwrap();
@@ -2974,11 +2990,35 @@ pub(crate) mod tests {
             let source = crate::storage::open(&root.join("source")).unwrap();
             let model = |repository: &str, lane: &str, header| names_hub::Model { repository: repository.into(),
                 release: "1.0.0".into(), lane: lane.into(), header };
+            // These policy fixtures carry actual dtypes and quantized encodings. Their names
+            // are labels for assertions, never the production selection input.
             let mut models: Vec<_> = lanes.iter().zip(30u8..).map(|(lane, tag)| {
-                model("acme/model", lane, tensors(&source, &format!("lane-{tag}"), "unet", &[("proj.weight", vec![4, 3], f32s(12, tag.into()))]))
+                use tensorfs::{format::{encode, Dtype, Encoding, PartBytes}, writer::{Data, PartData, Source}};
+                let mut writer = source.writer(None, None).unwrap();
+                let shape = [4, 32];
+                if matches!(*lane, "int8" | "fp8" | "nvfp4") {
+                    let encoding = Encoding { scheme: match *lane { "int8" => "int8.rowwise", "fp8" => "fp8.rowwise", _ => "nvfp4" }.into(),
+                        params: if *lane == "nvfp4" { serde_json::from_value(json!({"block_size":16,"global_scale":"multiply","nibble_order":"low_first","scale_layout":"row_major"})).unwrap() } else { Default::default() } };
+                    let values = f32s(128, tag.into());
+                    let arrays = BTreeMap::from([("values", PartBytes {dtype:&Dtype::F32,shape:&shape,bytes:&values})]);
+                    let encoded = if *lane == "nvfp4" {
+                        encode::quantize(&encode::Input {dtype:&Dtype::BF16,shape:&shape,encoding:&encoding,arrays:&arrays}).unwrap()
+                    } else {
+                        // Unit codes times the per-row scale reproduce `tag` exactly.
+                        vec![encode::OwnedPart {role:"weight".into(),dtype:if *lane=="fp8" {Dtype::F8_E4M3} else {Dtype::I8},shape:shape.to_vec(),bytes:vec![if *lane=="fp8" {0x38} else {1};128]},
+                            encode::OwnedPart {role:"scale".into(),dtype:Dtype::F32,shape:vec![4],bytes:f32s(4,tag.into())}]
+                    };
+                    let mut readers: Vec<_> = encoded.iter().map(|part| std::io::Cursor::new(&part.bytes)).collect();
+                    let parts = encoded.iter().zip(&mut readers).map(|(part,reader)| PartData {role:part.role.clone(),dtype:part.dtype.clone(),shape:part.shape.clone(),data:Source::Read(reader)}).collect();
+                    writer.get("unet").put("proj.weight",&Dtype::BF16,&shape,Data::Encoded{encoding,parts}).unwrap();
+                } else {
+                    let (dtype,bytes) = if *lane == "bf16" { (Dtype::BF16,vec![0u8;256]) } else if *lane == "fp16" { (Dtype::F16,vec![0u8;256]) } else { (Dtype::F32,f32s(128,tag.into())) };
+                    writer.get("unet").put("proj.weight",&dtype,&shape,Data::Plain(Source::Read(&mut bytes.as_slice()))).unwrap();
+                }
+                model("acme/model", lane, writer.commit().unwrap())
             }).collect();
             let lanes = models.iter().map(|model| (model.header.id(), model.lane.clone())).collect();
-            let lora = [("proj.lora_A.weight", vec![2, 3], f32s(6, 0.25)), ("proj.lora_B.weight", vec![4, 2], f32s(8, 0.75))];
+            let lora = [("proj.lora_A.weight", vec![2, 32], f32s(64, 0.25)), ("proj.lora_B.weight", vec![4, 2], f32s(8, 0.75))];
             models.push(model("acme/lora", "bf16", tensors(&source, "lora", "adapter", &lora)));
             let (origin, heard) = names_hub::models(&source, models);
             let hub = hub::Source::new(&origin, None, None).unwrap();
@@ -3095,7 +3135,7 @@ pub(crate) mod tests {
             ..Default::default() }]);
         let a = machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
         assert_eq!(a.sources[0].manifest, first.id());
-        assert_eq!(a.sources[0].lane, "f32");
+        assert_eq!(a.sources[0].lane, "model.f32.cozytensors");
         for variant in ["absent", ""] {
             request.choices[0].lane = variant.into();
             assert_eq!(machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).err().unwrap().0,
@@ -3132,7 +3172,7 @@ pub(crate) mod tests {
         let hopper = Machine::new("acme/pkg", &[("9.0", 80 * GIB)], slots.clone(), &["bf16", "fp8", "int8", "nvfp4"]);
         let (lanes, warnings, asked) = hopper.run(0);
         assert_eq!((lanes, warnings), (vec!["int8".to_string(), "nvfp4".into()], vec![]));
-        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["int8", "nvfp4"]), "no lane past the first published one");
+        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["bf16", "fp8", "int8", "nvfp4"]), "a static origin supplies headers to the shared rule");
         let (lanes, _, asked) = hopper.run(0);
         assert_eq!((lanes, asked), (vec!["int8".to_string(), "nvfp4".into()], vec![]), "a warm run asks the Hub nothing");
         let (lanes, warnings, _) = hopper.run(16);
@@ -3165,7 +3205,7 @@ pub(crate) mod tests {
         let warned = ["precision 4: acme/model@1.0.0 has no nvfp4 lane for sm89; served int8".to_string()];
         let (lanes, warnings, asked) = ada.run(4);
         assert_eq!((lanes, warnings), (vec!["int8".to_string()], warned.to_vec()));
-        assert_eq!(ada.landed(&asked), std::collections::BTreeSet::from(["int8"]));
+        assert_eq!(ada.landed(&asked), std::collections::BTreeSet::from(["bf16", "int8"]));
         let (_, warnings, asked) = ada.run(4);
         assert_eq!((warnings, asked), (warned.to_vec(), vec![]), "a warm run warns again and asks nothing");
         let declines = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "refuse"}]);
@@ -3195,7 +3235,7 @@ pub(crate) mod tests {
         let lora = domain::ModelChoice { parameter: "model".into(), adapters: vec![adapter], ..Default::default() };
         let plan = hopper.prepare(0, vec![lora]).plan.unwrap();
         let asked = std::mem::take(&mut *hopper.heard.lock().unwrap());
-        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["int8"]));
+        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["bf16", "int8"]));
         assert!(asked.iter().any(|heard| heard == "GET /refs/acme/lora.json"), "{asked:?}");
         assert!(plan.slots[0].binding.model.starts_with("view-"), "{:?}", plan.slots[0].binding);
     }

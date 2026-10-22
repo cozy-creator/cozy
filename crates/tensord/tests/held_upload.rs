@@ -485,6 +485,12 @@ fn a_folder_source_must_name_its_owned_retained_tree_input() {
     let mut spec = fixture.folder_spec("local-alias", &http.origin, &files);
     spec.weights_destination = "model://local/alias".into();
     assert_eq!(fixture.runs.submit("owner", "local-alias", spec).unwrap_err().code, "model_folder_invalid");
+    for (id, bits, gpus) in [("folder-bits", 8, 0), ("folder-gpus", 0, 1)] {
+        let mut spec = fixture.folder_spec(id, &http.origin, &files);
+        spec.bits = bits;
+        spec.gpus = gpus;
+        assert_eq!(fixture.runs.submit("owner", id, spec).unwrap_err().code, "model_folder_invalid");
+    }
     let spec = fixture.folder_spec("wrong-owner", &http.origin, &files);
     assert_eq!(fixture.runs.submit("another-owner", "wrong-owner", spec).unwrap_err().code, "input_unwritten");
     assert!(!http.published());
@@ -539,7 +545,7 @@ fn a_failed_ref_update_retries_the_exact_held_tree_without_uploading_admitted_bl
     );
     let row = &result.result.as_ref().unwrap().value["models"][0];
     assert_eq!(row["tree"], fixture.tree.id());
-    assert_eq!(row["lane"], "f32");
+    assert_eq!(row["lane"], "model.f32.cozytensors");
     assert_eq!(row["published"]["tree"], fixture.tree.id());
     assert_eq!(row["published"]["checkpoint"], fixture.header.id());
     assert_eq!(row["published"]["converged"], false);

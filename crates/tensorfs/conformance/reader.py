@@ -134,7 +134,7 @@ def byte_len(dtype, shape) -> int | None:
 
 
 def parse_tree(data: bytes) -> dict:
-    """A repo revision's files; `model.<variant>.cozytensors` is a variant's header."""
+    """A repo revision's files; every *.cozytensors path is a variant header."""
     doc = load(data, TREE)
     files = field(doc, "files", dict)
     for p in files:
@@ -206,11 +206,8 @@ def resolve(repo: dict, revision: str | None, tree) -> tuple[dict, str | None] |
 
 
 def variant_of(p: str) -> str | None:
-    if p == "model.cozytensors":
-        return ""
-    if p.startswith("model.") and p.endswith(".cozytensors") and "/" not in p and len(p) > 18:
-        return p[6:-12]
-    return None
+    name = p.rsplit("/", 1)[-1]
+    return p if name.endswith(".cozytensors") else None
 
 
 # ---------------------------------------------------------------- the CBOR header
@@ -517,6 +514,10 @@ def check(vectors: Path) -> int:
         passed += ok
         if not ok:
             failures.append(f"resolve: {case['why']}")
+    from selection import check as check_selection
+    selected, selection_failures = check_selection(vectors, parse_header, BITS)
+    passed += selected
+    failures += selection_failures
     core_failures = check_cores(vectors / "cores.json")
     failures += core_failures
     passed += len(json.loads((vectors / "cores.json").read_text())["cases"]) - len(core_failures)

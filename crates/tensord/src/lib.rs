@@ -29,7 +29,7 @@ pub mod native_inputs;
 pub mod objects;
 pub mod origin;
 pub mod output_capacity;
-pub mod precision;
+pub use tensorfs::precision;
 pub mod process;
 pub mod products;
 pub mod seam;

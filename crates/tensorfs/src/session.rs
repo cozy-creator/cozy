@@ -87,7 +87,7 @@ impl FromStr for Ref {
                 let (revision, variant) = selection
                     .split_once('/')
                     .map_or((selection, None), |(r, v)| (r, Some(v)));
-                if revision.is_empty() || variant.is_some_and(|v| v.is_empty() || v.contains('/')) {
+                if revision.is_empty() || variant.is_some_and(|v| v.is_empty()) {
                     return fail(
                         Kind::Invalid,
                         "a reference needs a nonempty revision and variant",
@@ -118,6 +118,10 @@ impl FromStr for Ref {
 
 #[derive(Clone, Debug)]
 pub struct Open {
+    /// Requested precision, 4/8/16; none selects the default 8-bit preference.
+    pub bits: Option<u32>,
+    /// Compute capabilities (e.g. "8.9"); none detects visible devices, empty selects CPU.
+    pub gpus: Option<Vec<String>>,
     pub revision: Option<String>,
     pub variant: Option<String>,
     pub endpoint: Option<String>,
@@ -129,6 +133,8 @@ pub struct Open {
 impl Default for Open {
     fn default() -> Self {
         Self {
+            bits: None,
+            gpus: None,
             revision: None,
             variant: None,
             endpoint: None,
@@ -193,13 +199,40 @@ impl Client {
     /// Lazy opens return metadata only; eager opens await this checkpoint's bytes.
     pub async fn open(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint> {
         let path = Path::new(name_or_path);
+        let constraints = crate::precision::Constraints {
+            bits: options.bits,
+            gpus: match &options.gpus {
+                Some(gpus) => gpus.clone(),
+                None if options.variant.is_some() || path.is_file() => vec![],
+                None => platform::gpu::probe(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref())
+                    .map_err(|e| Failure { kind: Kind::Invalid, detail: format!("query GPUs: {e}") })?
+                    .into_iter().map(|g| g.compute_capability.map(|(a,b)| format!("{a}.{b}")).unwrap_or_default()).collect(),
+            },
+        };
+        constraints.select(name_or_path, &[])?; // Validate even an explicit variant's options.
         let checkpoint = if path.exists() {
             let path = path
                 .canonicalize()
                 .map_err(|e| io_failure(path.display(), e))?;
+            let selected = if path.is_dir() && options.variant.is_none() {
+                let mut profiles = Vec::new();
+                for name in crate::store::folder_files(&path, "")? {
+                    if crate::format::variant_of(&name).is_some() {
+                        let bytes = std::fs::read(path.join(&name)).map_err(|e| io_failure(&name, e))?;
+                        let header = crate::format::Header::from_cbor(&bytes)?;
+                        profiles.push((name, crate::precision::Profile::of(&header)));
+                    }
+                }
+                let candidates: Vec<_> = profiles.iter().map(|(n,p)| (n.as_str(),p)).collect();
+                let Some((at, reasons)) = constraints.select(name_or_path, &candidates)? else {
+                    return fail(Kind::NotFound, "no variant fits the requested GPUs and bits");
+                };
+                for reason in reasons { tracing::warn!("{reason}"); }
+                Some(profiles[at].0.clone())
+            } else { options.variant.clone() };
             let raw = crate::store::Checkpoint::folder(
                 &path,
-                options.variant.as_deref(),
+                selected.as_deref(),
                 Some(&self.store),
             )?;
             // A header file is a handle into the cache, rooted where it is opened; the cache's
@@ -227,7 +260,7 @@ impl Client {
             }
             reference.endpoint = options.endpoint.clone();
             let source = self.source(&reference, options.local_files_only)?;
-            source.open(reference).await?
+            source.open(reference, &constraints).await?
         };
         if !options.lazy {
             checkpoint.download(&Download::default()).await?;

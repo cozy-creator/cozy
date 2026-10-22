@@ -66,6 +66,13 @@ pub(crate) fn label(flag: &str, value: &str) -> Result<String, Error> {
     }
 }
 
+/// A variant's arbitrary tree path or legacy shorthand, checked by TensorFS's path grammar.
+fn variant(value: &str) -> Result<String, Error> {
+    let tree = tensorfs::format::Tree { files: std::collections::BTreeMap::from([(value.to_owned(),tensorfs::format::ObjectRef::of(b""))]) };
+    let valid = tree.to_json().and_then(|bytes| tensorfs::format::Tree::from_json(&bytes));
+    valid.map(|_| value.to_owned()).map_err(|e| usage("model_variant_invalid",format!("variant {value:?}: {e}")))
+}
+
 /// A checkpoint id: `sha256:` and 64 lowercase hex digits.
 pub(crate) fn checkpoint(value: &str) -> Result<String, Error> {
     match value.strip_prefix("sha256:") {
@@ -162,7 +169,7 @@ impl ModelRef {
         let (release, lane) = match pin.map(|p| p.split_once('/').ok_or(p)) {
             None => (None, None),
             Some(Err(release)) => (Some(label("release", release)?), None),
-            Some(Ok((release, lane))) => (Some(label("release", release)?), Some(label("lane", lane)?)),
+            Some(Ok((release, lane))) => (Some(label("release", release)?), Some(variant(lane)?)),
         };
         Ok(ModelRef::Hub {
             repo,
@@ -242,6 +249,7 @@ mod tests {
             ("Fidika/SDXL", "fidika/sdxl", ("fidika/sdxl", "", "", "", "")),
             ("fidika/sdxl@1.0.0", "fidika/sdxl@1.0.0", ("fidika/sdxl", "1.0.0", "", "", "")),
             ("fidika/sdxl@1.0.0/int8", "fidika/sdxl@1.0.0/int8", ("fidika/sdxl", "1.0.0", "int8", "", "")),
+            ("fidika/sdxl@1.0/nested/arbitrary.cozytensors", "fidika/sdxl@1.0/nested/arbitrary.cozytensors", ("fidika/sdxl", "1.0", "nested/arbitrary.cozytensors", "", "")),
             (&format!("fidika/sdxl#{HASH}"), &format!("fidika/sdxl#{HASH}"), ("fidika/sdxl", "", "", HASH, "")),
             ("local/Style", "local/style", ("local/style", "", "", "", "")),
             ("hf://Org/Repo@main/a.safetensors", "hf://Org/Repo@main/a.safetensors", ("", "", "", "", "hf://Org/Repo@main/a.safetensors")),
@@ -269,6 +277,7 @@ mod tests {
             "fidika/sdxl#",
             "fidika/sdxl@",
             "fidika/sdxl@1.0/",
+            "fidika/sdxl@1.0/../outside.cozytensors",
             "fidika/sdxl@1.0/fp8#sha256:aa",
             "local/style@1.0",
             "s3://bucket/key",

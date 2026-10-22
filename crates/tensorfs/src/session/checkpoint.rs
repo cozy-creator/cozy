@@ -663,17 +663,10 @@ fn local_header_bytes(raw: &Stored, path: &Path) -> Result<(Vec<u8>, Option<Stri
         }
         return Ok((bytes, None));
     }
-    for entry in fs::read_dir(path).map_err(|e| super::io_failure(path.display(), e))? {
-        let entry = entry.map_err(|e| super::io_failure(path.display(), e))?;
-        let name = entry.file_name();
-        let Some(variant) = name.to_str().and_then(format::variant_of) else {
-            continue;
-        };
-        let bytes =
-            fs::read(entry.path()).map_err(|e| super::io_failure(entry.path().display(), e))?;
-        if &ObjectRef::of(&bytes) == raw.id() {
-            return Ok((bytes, Some(variant.to_owned())));
-        }
+    for name in crate::store::folder_files(path, "")? {
+        let Some(variant) = format::variant_of(&name) else { continue };
+        let bytes = fs::read(path.join(&name)).map_err(|e| super::io_failure(&name, e))?;
+        if &ObjectRef::of(&bytes) == raw.id() { return Ok((bytes, Some(variant.to_owned()))); }
     }
     fail(Kind::Integrity, "the selected header changed during open")
 }

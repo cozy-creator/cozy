@@ -469,9 +469,9 @@ impl Runs {
                     .map_err(|(code, message)| refused(code, message))?;
                 let gpus = self.service.gpu().map(|gpu| gpu.gpus(gpu.width() as u32)).unwrap_or_default();
                 let any = crate::precision::Slot { min_bits: 8, decode: false, encoded: true, raw: false };
-                let lanes = any.lanes(any.bits(spec.bits, false), &gpus);
+                let constraints = crate::precision::Constraints { gpus: gpus.capabilities.clone(), bits: Some(any.bits(spec.bits, false)) };
                 let stage = format!("downloading {}", choice.repository);
-                let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &lanes, &spec.catalog_revision, stop, &|done, total| {
+                let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, Some(&constraints), &spec.catalog_revision, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let header = named.header().map_err(|(code, message)| refused(code, message))?.clone();
