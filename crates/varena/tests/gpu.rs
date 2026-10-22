@@ -2303,17 +2303,24 @@ fn resident(mem: &Memory, name: &str, pages: u32, uuid: &str, stream: usize) -> 
     set
 }
 
-/// The hook evicts the request's own pages under a 1 GiB cap. Their release events sit behind a kernel still running
-/// on their stream, and an unrelated stream is gated.
-/// - The allocation waits for the kernel, which is the pages' own release, and returns.
-/// - It never waits for the gate: no deadlock with unrelated work.
-/// - Each page is unmapped only after its consumer ended, and the driver gets exactly the evicted bytes back.
+/// The hook evicts the request's own pages under a 1 GiB cap, with review 6's F4 folded in. Two threads allocate
+/// under one lock (torch's), as the native allocator does.
+/// - Setup: the request's own pages are released behind a kernel still running on their stream. An unrelated stream
+///   is gated. A kernel sweeps a pinned page throughout.
+/// - Thread A needs half the own set beyond the budget, then keeps allocating until refused. Its first allocation must
+///   wait for the running kernel, the pages' own release, and only for that.
+/// - Thread B allocates, writes and frees through a free worker; cuMemFree waits on the device outside the lock.
+/// - Pass conditions:
+///   - No thread on the lock's path waits for the gate (no deadlock).
+///   - No page is unmapped before its consumer ended.
+///   - The pinned page is never taken and keeps its bytes. Nothing faults.
+///   - The driver gains exactly the evicted bytes.
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn the_hook_waits_on_its_pages_release_events_never_on_unrelated_work() {
     let (b, g, uuid) = card("hook");
     step!();
-    // 1 GiB: a card small enough that one activation needs the request's own pages.
+    // 1 GiB: a card small enough that the threads need the request's own pages.
     let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
     let (mem, timings) = timed_memory(b, &g);
     step!();
@@ -2321,63 +2328,179 @@ fn the_hook_waits_on_its_pages_release_events_never_on_unrelated_work() {
     let one = bulk_block();
     let w = mem.load(set("w", pages, Fill::Stored, &g.uuid, |_| one.clone()), Level::Ram).unwrap();
     step!();
-    let r = mem.request("r", plan(&[&["w"]])).unwrap();
+    let p = mem.load(set("p", 1, Fill::Stored, &g.uuid, |b| block(95, b)), Level::Ram).unwrap();
     step!();
-    let (x, gated) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
+    let r = mem.request("r", plan(&[&["w", "p"]])).unwrap();
+    step!();
+    let (x, y, swept, gated) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
     step!();
     let first = std::time::Instant::now();
-    let pins: Vec<Pin> = (0..pages).map(|p| mem.bind(w, p, x.raw()).unwrap()).collect();
+    let pins: Vec<Pin> = (0..pages).map(|b| mem.bind(w, b, x.raw()).unwrap()).collect();
     let first = first.elapsed();
     step!();
-    // The pages' consumer: ten times their binds, on their stream; each pin's release event lands behind it.
+    // The longest single call the threads make, measured before them: thread A's big allocation, cut and freed once.
+    let near = mem.allocator_limit().unwrap().saturating_sub(2 * REGION_ALIGN);
+    let warm = {
+        let (_, ctx) = cuda::primary_context(0).unwrap();
+        let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+        let d = cuda::driver().unwrap();
+        let t = std::time::Instant::now();
+        let mut ptr = 0;
+        assert_eq!(unsafe { (d.mem_alloc)(&mut ptr, near as usize) }, cuda::SUCCESS);
+        assert_eq!(unsafe { (d.mem_free)(ptr) }, cuda::SUCCESS);
+        t.elapsed().max(first)
+    };
+    step!();
+    // The own pages' consumer: ten times their binds, on their stream; each pin's release event lands behind it.
     let spin = first * 10;
     let launched = std::time::Instant::now();
     assert_eq!(launch(c"spin", &[spin.as_nanos() as u64], x.raw()), cuda::SUCCESS);
     step!();
     drop(pins);
     step!();
-    let mut gate = Some(Gate::hold(gated.raw()));
+    let pinned = mem.bind(p, 0, swept.raw()).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, 16).unwrap();
+    step!();
+    assert_eq!(launch(c"sweep", &[pinned.ptr, REGION_ALIGN / 8, (spin * 2).as_nanos() as u64, out.ptr()], swept.raw()), cuda::SUCCESS);
+    step!();
+    let _ = mem.torch_limit();
     step!();
     let (start_free, unmaps) = (driver_free(), timings.count("unmap"));
     step!();
-    // Half the set's bytes more than the hook may hold: make_room must take own pages.
-    let need = mem.allocator_limit().unwrap() + u64::from(pages / 2) * REGION_ALIGN;
-    let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
-    let (got, waited) = std::thread::scope(|s| {
-        // The kernel's own end is all the hook may wait for: then its allocation's own time.
-        let (h, waited) = watch(s, spin * 2, || segment(&mem, &r, &torch, need, &callbacks));
-        if waited != Waited::Returned {
-            gate.take();
-        }
-        (h.join().unwrap(), waited)
-    });
+    let mut gate = Some(Gate::hold(gated.raw()));
     step!();
-    let returned = std::time::Instant::now();
+    let torch = parking_lot::Mutex::new(0u64);
+    let callbacks = Timings::default();
+    // One call may wait for the own pages' release (the kernel), on top of its own time.
+    let (calls, longest, done) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new((spin + warm).as_nanos() as u64), std::sync::atomic::AtomicBool::new(false));
+    // Where each thread is: 0 between calls, 1 allocating (the allocator lock's path), 2 writing and handing to the
+    // free worker.
+    let phase = [std::sync::atomic::AtomicU8::new(0), std::sync::atomic::AtomicU8::new(0)];
+    let at = |thread: usize, where_: u8| phase[thread].store(where_, std::sync::atomic::Ordering::Release);
+    let timed = |t: std::time::Instant| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        longest.fetch_max(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::AcqRel);
+    };
+    // The native allocator's free: an event on the segment's stream, handed to a worker that waits for it and frees
+    // outside the lock (a cuMemFree may wait for the device).
+    let (hand, frees) = mpsc::channel::<((u64, varena::memory::Resident), usize)>();
+    let (kept, churned, waited, first_returned) = std::thread::scope(|s| {
+        let worker = s.spawn(|| {
+            let (_, ctx) = cuda::primary_context(0).unwrap();
+            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+            let d = cuda::driver().unwrap();
+            for (seg, event) in frees {
+                assert_eq!(unsafe { (d.event_synchronize)(event as cuda::CUevent) }, cuda::SUCCESS);
+                unsafe { (d.event_destroy)(event as cuda::CUevent) };
+                unsegment(&torch, seg, REGION_ALIGN);
+            }
+        });
+        let a = s.spawn(|| {
+            let mut kept = vec![];
+            // Half the own set beyond the budget: make_room must take own pages, waiting for their release.
+            let need = near + u64::from(pages / 2) * REGION_ALIGN;
+            let t = std::time::Instant::now();
+            at(0, 1);
+            kept.extend(segment(&mem, &r, &torch, need, &callbacks).map(|seg| (seg, need)));
+            at(0, 0);
+            let first_returned = std::time::Instant::now();
+            timed(t);
+            loop {
+                let t = std::time::Instant::now();
+                at(0, 1);
+                let got = segment(&mem, &r, &torch, REGION_ALIGN, &callbacks);
+                at(0, 0);
+                timed(t);
+                let Some(seg) = got else { break };
+                kept.push((seg, REGION_ALIGN));
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+            (kept, first_returned)
+        });
+        let b = s.spawn(|| {
+            let (_, ctx) = cuda::primary_context(0).unwrap();
+            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+            let d = cuda::driver().unwrap();
+            let mut churned = (0u64, 0u64);
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                let t = std::time::Instant::now();
+                at(1, 1);
+                match segment(&mem, &r, &torch, REGION_ALIGN, &callbacks) {
+                    Some(seg) => {
+                        at(1, 2);
+                        assert_eq!(unsafe { (d.memset_d8_async)(seg.0, 9, REGION_ALIGN as usize, y.raw() as cuda::CUstream) }, cuda::SUCCESS);
+                        let mut event = std::ptr::null_mut();
+                        assert_eq!(unsafe { (d.event_create)(&mut event, cuda::EVENT_DEFAULT) }, cuda::SUCCESS);
+                        assert_eq!(unsafe { (d.event_record)(event, y.raw() as cuda::CUstream) }, cuda::SUCCESS);
+                        hand.send((seg, event as usize)).unwrap();
+                        churned.0 += 1;
+                    }
+                    None => churned.1 += 1,
+                }
+                at(1, 0);
+                timed(t);
+            }
+            // The worker ends once B, the one sender, is done.
+            drop(hand);
+            churned
+        });
+        // Looks every interval of the longest call so far: two with no call done mean a thread waits, and where each
+        // thread is says on what. Then the gate opens, so the case ends either way.
+        let (mut seen, mut quiet, mut waited) = (0, 0, None);
+        while !(a.is_finished() && b.is_finished()) {
+            std::thread::sleep(std::time::Duration::from_nanos(longest.load(std::sync::atomic::Ordering::Acquire)));
+            let now = calls.load(std::sync::atomic::Ordering::Acquire);
+            quiet = if now == seen { quiet + 1 } else { 0 };
+            seen = now;
+            if quiet == 2 && gate.is_some() {
+                waited = Some([0, 1].map(|t| phase[t].load(std::sync::atomic::Ordering::Acquire)));
+                gate.take();
+            }
+        }
+        let ((kept, first_returned), churned) = (a.join().unwrap(), b.join().unwrap());
+        // B's frees wait on the device in the worker, outside the lock: they finish once the gate opens.
+        gate.take();
+        worker.join().unwrap();
+        (kept, churned, waited, first_returned)
+    });
     step!();
     gate.take();
     step!();
-    let (sx, sg) = (x.drain(), gated.drain());
+    let (sx, sy, ss, sg) = (x.drain(), y.drain(), swept.drain(), gated.drain());
+    step!();
+    let served = !kept.is_empty();
+    for (seg, size) in kept {
+        unsegment(&torch, seg, size);
+    }
     step!();
     let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
     step!();
-    println!("HOOK {waited:?} after {:?} (its pages' consumer: {spin:?}); make_room {}; unmapped {unmapped} B", returned - launched, callbacks.report());
+    let gained = driver_free().saturating_sub(start_free);
     step!();
-    assert_eq!(waited, Waited::Returned, "the hook waited for the gated, unrelated stream");
+    println!(
+        "HOOK the first allocation returned {:?} after the kernel's launch (its {spin:?}); make_room {}; B churned {} segments, refused {}; unmapped {unmapped} B; driver gained {gained} B; waited on the gated stream (phases A, B: 1 allocating, 2 writing): {waited:?}",
+        first_returned - launched, callbacks.report(), churned.0, churned.1
+    );
+    step!();
+    assert!(waited.is_none(), "a thread waited for the gated stream (on the allocator lock's path at 1): {waited:?}");
     step!();
     sx.unwrap();
+    sy.unwrap();
+    ss.unwrap();
     sg.unwrap();
     step!();
-    let got = got.expect("make_room served the allocation from the request's own pages");
+    assert!(served, "make_room served A's allocation from the request's own pages");
     step!();
     assert!(timings.last("unmap").is_some_and(|t| t >= launched + spin), "a page was unmapped before its consumer ended");
     step!();
-    assert!(unmapped >= u64::from(pages / 2) * REGION_ALIGN, "it took the room it needed: {unmapped} B");
+    assert!(exact(&pinned, &block(95, 0), 0), "the pinned page was never taken");
     step!();
-    unsegment(&torch, got, need);
-    step!();
-    let gained = driver_free().saturating_sub(start_free);
+    assert!(unmapped >= u64::from(pages / 2) * REGION_ALIGN && unmapped <= u64::from(pages) * REGION_ALIGN, "own pages only: {unmapped} B");
     step!();
     assert!(gained.abs_diff(unmapped) <= REGION_ALIGN, "the driver gained {gained} B for {unmapped} B unmapped");
+    step!();
+    drop(pinned);
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
