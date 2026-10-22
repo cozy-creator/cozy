@@ -120,17 +120,22 @@ impl HostTier {
     /// so its layouts of it fit together): no other call's layout fills now, every live call is
     /// measured, and the budget holds them beside what must stay free. Layouts no live executor
     /// maps make room for it, least recently granted first, when that is enough.
-    pub fn admit(&self, call: &str, bytes: u64) -> bool {
-        if self.deposits.filling_beside(call) {
-            return false;
-        }
+    pub fn admit(&self, call: &str, bytes: u64) -> Admission {
         let (need, measured) = self.need();
         let want = need.saturating_add(bytes);
-        let fits = || self.room().is_some_and(|room| room >= want);
-        if measured && !fits() && self.room().is_some_and(|room| room + self.deposits.idle_bytes() >= want) {
-            while !fits() && self.deposits.release_one() {}
-        }
-        measured && fits()
+        let why = if self.deposits.filling_beside(call) {
+            "another call's layout fills"
+        } else if !measured {
+            "a live call is unmeasured"
+        } else {
+            if self.room().is_some_and(|room| room < want && room + self.deposits.idle_bytes() >= want) {
+                while self.room().is_some_and(|room| room < want) && self.deposits.release_one() {}
+            }
+            "measured"
+        };
+        let room = self.room();
+        let seal = why == "measured" && room.is_some_and(|room| room >= want);
+        Admission { seal, why, room, need, bytes }
     }
 
     /// `call` of `construction` runs in `pids` from now until the guard drops.
@@ -220,6 +225,18 @@ impl HostTier {
     }
 }
 
+/// One read_grant's verdict on sealing a layout, as the memory log records it.
+#[derive(Debug, serde::Serialize)]
+pub struct Admission {
+    pub seal: bool,
+    /// "measured": room against need and bytes decided it.
+    pub why: &'static str,
+    /// The live budget it was measured against, and what must stay free (`need`) beside `bytes`.
+    pub room: Option<u64>,
+    pub need: u64,
+    pub bytes: u64,
+}
+
 /// A live call (`HostTier::begin`).
 pub struct Call<'a>(&'a HostTier, String);
 
@@ -267,7 +284,7 @@ mod tests {
         let mut executor = std::process::Command::new("sleep").arg("600").spawn().unwrap();
         {
             let call = tier.begin("run-a", "plan-x", vec![executor.id()]);
-            assert!(!tier.admit("run-a", 1 << 20), "its host need is unmeasured");
+            assert!(!tier.admit("run-a", 1 << 20).seal, "its host need is unmeasured");
             call.shape("s1");
             call.measured();
         }
@@ -275,15 +292,15 @@ mod tests {
         assert!(peaks["plan-x|s1"] > 0, "{peaks:?}");
         let tier = HostTier::new(dir.path(), HostMode::Dedicated, MemoryLog::default());
         let _call = tier.begin("run-b", "plan-x", vec![executor.id()]);
-        assert!(tier.admit("run-b", 1 << 20), "measured, and the budget holds it");
-        assert!(!tier.admit("run-b", u64::MAX / 2), "more than the budget");
+        assert!(tier.admit("run-b", 1 << 20).seal, "measured, and the budget holds it");
+        assert!(!tier.admit("run-b", u64::MAX / 2).seal, "more than the budget");
         let other = tier.begin("run-c", "plan-y", vec![]);
-        assert!(!tier.admit("run-b", 1 << 20), "a live call is unmeasured");
+        assert_eq!(tier.admit("run-b", 1 << 20).why, "a live call is unmeasured");
         drop(other);
         assert_eq!(tier.deposits.seal("m", "l", "run-c#0", true), Ok(true));
-        assert!(!tier.admit("run-b", 1 << 20), "another call's layout seals now");
+        assert_eq!(tier.admit("run-b", 1 << 20).why, "another call's layout fills");
         tier.deposits.ended("run-c");
-        assert!(tier.admit("run-b", 1 << 20));
+        assert!(tier.admit("run-b", 1 << 20).seal);
         executor.kill().unwrap();
         executor.wait().unwrap();
     }

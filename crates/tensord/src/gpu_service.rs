@@ -3574,16 +3574,17 @@ impl Services for Callbacks<'_> {
     fn read_grant(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
         drop(plan);
         let (manifest, layout) = (&frame.manifest, &frame.layout);
-        let (file, filling, seal) = match self.deposits.grant(manifest, layout, &self.holders) {
-            Some((file, filling)) => (Some(file), filling, false),
-            None if layout.is_empty() => (None, false, false),
+        let (file, filling, admission) = match self.deposits.grant(manifest, layout, &self.holders) {
+            Some((file, filling)) => (Some(file), filling, None),
+            None if layout.is_empty() => (None, false, None),
             None => {
                 let id = |m: &str| m.trim_start_matches("sha256:").to_string();
                 let selected = self.selections.iter().find(|s| id(&s.manifest) == id(manifest));
                 let bytes = selected.and_then(|s| selected_bytes(&self.pool.store, &s.manifest, &s.components).ok());
-                let admitted = bytes.is_some_and(|(bytes, _)| self.pool.host.admit(self.id, bytes));
+                let admission = bytes.map(|(bytes, _)| self.pool.host.admit(self.id, bytes));
+                let admitted = admission.as_ref().is_some_and(|a| a.seal);
                 match self.deposits.seal(manifest, layout, &format!("{}#{}", self.id, frame.rank), admitted) {
-                    Ok(seal) => (None, false, seal),
+                    Ok(seal) => (None, false, admission.map(|a| crate::host_tier::Admission { seal, ..a })),
                     Err(sealer) => {
                         let detail = format!("{sealer} is sealing {layout}; ask again once it deposits");
                         return Ok((Answer::refused(frame.seq, "layout_sealing", &detail), vec![]));
@@ -3592,7 +3593,7 @@ impl Services for Callbacks<'_> {
             }
         };
         let (mut answer, mut fds) = granted(frame.seq, file);
-        answer.seal = seal;
+        answer.seal = admission.as_ref().is_some_and(|a| a.seal);
         let held = answer.held;
         // GPU pages a gone executor kept of this layout follow its host layout.
         let rank = self.kept.get(frame.rank as usize).copied().flatten();
@@ -3605,7 +3606,7 @@ impl Services for Callbacks<'_> {
             (answer.fingerprint, answer.descriptors) = (fingerprint, fds.len() as u64);
         }
         self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
-            "layout": frame.layout, "held": held, "filling": filling, "seal": seal, "pages": answer.pages.len(),
+            "layout": frame.layout, "held": held, "filling": filling, "admission": admission, "pages": answer.pages.len(),
             "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "gpu": rank.map(|(_, _, gpu)| gpu)}));
         Ok((answer, fds))
     }
