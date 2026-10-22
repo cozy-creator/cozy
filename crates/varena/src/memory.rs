@@ -688,10 +688,11 @@ struct Job {
     after: Vec<Event>,
 }
 
-/// Fill jobs: a demand miss goes before any prefetch.
+/// Fill jobs, in groups: the pages the mechanism mapped together (a bind's block) reach a fill
+/// thread as one, so they read as one run. A demand miss goes before any prefetch.
 struct Jobs {
-    demand: Sender<Job>,
-    ahead: Sender<Job>,
+    demand: Sender<Vec<Job>>,
+    ahead: Sender<Vec<Job>>,
 }
 
 /// The backend's copy stream, where fills' ready events are ([`Backend::fence`]); no caller's
@@ -1079,6 +1080,9 @@ struct Inner {
     /// Fill jobs; the fill threads hold the receiving ends and a weak reference to the rest,
     /// so dropping the Memory ends them. The trim thread's work likewise.
     jobs: Jobs,
+    /// Pages the mechanism thread mapped and has not handed to the fill threads yet (demand,
+    /// ahead): it hands them over together once its queue is empty or they make a batch.
+    grouped: Mutex<(Vec<Job>, Vec<Job>)>,
     burst: Arc<(Mutex<Burst>, Condvar)>,
     /// Filled pages to copy into the RAM tier, for its one thread.
     saves: Arc<Outbox<Save>>,
@@ -1168,6 +1172,7 @@ impl Memory {
                 refund_tx,
                 refunds,
                 jobs: Jobs { demand, ahead },
+                grouped: Mutex::default(),
                 burst: Arc::new((Mutex::new(Burst::default()), Condvar::new())),
                 saves: Arc::new(Outbox::default()),
                 wanted: Arc::new((Mutex::new(Wanted::default()), Condvar::new())),
@@ -2237,7 +2242,7 @@ impl Inner {
         }
         // Read-write and nobody else's: filled again in place, after its consumers in-stream.
         self.backend.retire(old);
-        self.queue_fill(Job { after, ..job }, false)
+        self.queue_fills(vec![Job { after, ..job }], false)
     }
 
     /// Exports a filled page of a declared set into custody, read-only, only once its ready
@@ -2480,34 +2485,54 @@ impl Inner {
     /// `first` and the jobs queued behind it (demand misses first), up to the burst's bytes so
     /// far: batches double, so the first pages are ready soonest and a few reads carry the
     /// rest. Never less than the engine keeps in flight (its threads' requests): a smaller read
-    /// leaves its threads idle.
-    fn batch(&self, first: Job, demand: &Receiver<Job>, ahead: &Receiver<Job>) -> Vec<Job> {
-        let engine = tensorfs::io::ReadOpts::default();
-        let budget = {
-            let mut b = self.burst.0.lock();
-            b.batches += 1;
-            b.bytes.max((engine.threads * engine.request) as u64)
-        };
-        let mut bytes = first.span;
-        let mut jobs = vec![first];
+    /// leaves its threads idle. Groups stay whole.
+    fn batch(&self, first: Vec<Job>, demand: &Receiver<Vec<Job>>, ahead: &Receiver<Vec<Job>>) -> Vec<Job> {
+        let budget = self.fill_budget();
+        self.burst.0.lock().batches += 1;
+        let mut jobs = first;
+        let mut bytes: u64 = jobs.iter().map(|j| j.span).sum();
         while bytes < budget {
-            let Ok(job) = demand.try_recv().or_else(|_| ahead.try_recv()) else { break };
-            bytes += job.span;
-            jobs.push(job);
+            let Ok(group) = demand.try_recv().or_else(|_| ahead.try_recv()) else { break };
+            bytes += group.iter().map(|j| j.span).sum::<u64>();
+            jobs.extend(group);
         }
         let mut b = self.burst.0.lock();
         b.queued = b.queued.saturating_sub(jobs.len() as u64);
         jobs
     }
 
-    /// Queues a page's fill: a demand miss, or `ahead` of its use.
-    fn queue_fill(&self, job: Job, ahead: bool) -> Result<()> {
-        self.burst.0.lock().queued += 1;
+    /// A batch's bytes: what this burst filled so far, at least one engine round of requests.
+    fn fill_budget(&self) -> u64 {
+        let engine = tensorfs::io::ReadOpts::default();
+        self.burst.0.lock().bytes.max((engine.threads * engine.request) as u64)
+    }
+
+    /// Queues pages' fills as one group: demand misses, or `ahead` of their use.
+    fn queue_fills(&self, jobs: Vec<Job>, ahead: bool) -> Result<()> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let n = jobs.len() as u64;
+        self.burst.0.lock().queued += n;
         let queue = if ahead { &self.jobs.ahead } else { &self.jobs.demand };
-        queue.send(job).map_err(|_| {
-            self.burst.0.lock().queued -= 1;
+        queue.send(jobs).map_err(|_| {
+            self.burst.0.lock().queued -= n;
             Error::Closed("the fill threads".into())
         })
+    }
+
+    /// The mechanism thread's mapped pages go to the fill threads, demand first.
+    fn flush_fills(&self) {
+        let (demand, ahead) = std::mem::take(&mut *self.grouped.lock());
+        if self.queue_fills(demand, false).and_then(|()| self.queue_fills(ahead, true)).is_err() {
+            tracing::warn!("varena: the fill threads are gone");
+        }
+    }
+
+    /// Bytes the mechanism thread holds for the fill threads.
+    fn grouped_bytes(&self) -> u64 {
+        let g = self.grouped.lock();
+        g.0.iter().chain(&g.1).map(|j| j.span).sum()
     }
 
     /// A batch is done: its bytes count for its burst, which ends when nothing is queued or
@@ -2652,9 +2677,12 @@ impl Inner {
         self.landed.notify_all();
     }
 
-    /// The set's regions from its store into their destinations, in one engine read.
+    /// The set's regions from its store into their destinations, in one engine read, in
+    /// region order: neighbours in the file and the reservation read as one run.
     #[cfg(unix)]
     fn store(&self, spec: &SetSpec, regions: &[(u32, Dst)]) -> Result<()> {
+        let mut regions = regions.to_vec();
+        regions.sort_unstable_by_key(|(r, _)| *r);
         let placements = regions.iter().map(|(r, dst)| spec.layout.region(*r).map(|region| Placement { items: &region.items, origin: region.offset, dst: *dst })).collect::<Result<Vec<_>>>()?;
         let threads = tensorfs::io::ReadOpts::default().threads;
         // SAFETY: each `dst` is a mapped page (or a locked tier region) only this fill writes.
@@ -4079,16 +4107,16 @@ impl Drop for Inner {
     }
 }
 
-fn fill_loop(demand: &Receiver<Job>, ahead: &Receiver<Job>, inner: &Weak<Inner>) {
+fn fill_loop(demand: &Receiver<Vec<Job>>, ahead: &Receiver<Vec<Job>>, inner: &Weak<Inner>) {
     loop {
         // A demand miss first; both queues close with the Memory.
-        let job = select_biased! {
+        let group = select_biased! {
             recv(demand) -> j => j,
             recv(ahead) -> j => j,
         };
-        let Ok(job) = job else { return };
+        let Ok(group) = group else { return };
         let Some(me) = Work::of(inner) else { return };
-        let batch = me.batch(job, demand, ahead);
+        let batch = me.batch(group, demand, ahead);
         // A panic outside the copies fails the batch's binders; the thread keeps serving.
         if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.fill(&batch))) {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
@@ -4138,7 +4166,15 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
         // An op that creates or destroys physical memory: the row's counts are no foreign-byte
         // evidence until its outcome is published (an uncertain one never finishes).
         let change = matches!(op, Mech::Map { .. } | Mech::Unmap { .. } | Mech::Renew { .. }).then(|| me.row.physical_change());
+        // Consecutive maps (a bind's block) reach the fill threads as one group: handed over
+        // before any other call, once nothing waits for this thread, or once they make a batch.
+        if !matches!(op, Mech::Map { .. }) {
+            me.flush_fills();
+        }
         me.mechanism(op);
+        if queue.waiting() == 0 || me.grouped_bytes() >= me.fill_budget() {
+            me.flush_fills();
+        }
         if me.check_ownership().is_err() {
             // The fault path retained the executor and uncertain resources. Tickets finish so
             // callers can retire it, but physical bytes are never advertised as returned.
@@ -4674,9 +4710,9 @@ impl Inner {
                     h.phys = Some(p);
                 }
                 drop(st);
-                if self.queue_fill(job, speculative).is_err() {
-                    tracing::warn!("varena: the fill threads are gone");
-                }
+                // Handed over with the pages mapped beside it (`flush_fills`).
+                let mut g = self.grouped.lock();
+                if speculative { g.1.push(job) } else { g.0.push(job) }
             }
             Err(e) => {
                 st.homes.remove(&key);
