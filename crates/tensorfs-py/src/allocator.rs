@@ -304,9 +304,16 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
             Err(_) => return refuse("exhausted"),
         }
     };
-    // The segment counts from now on; the claim (room held for it, perhaps pages more) goes after.
-    let resident = active.as_ref().map(|a| a.memory.resident(bytes));
-    drop(claim);
+    // The segment counts from now on: its claim's bytes when it asked for exactly them; else
+    // counted first, then the claim (pages more, after a driver refusal) goes.
+    let resident = match (claim, active.as_ref()) {
+        (Some(claim), _) if need == bytes => Some(claim.resident()),
+        (claim, a) => {
+            let resident = a.map(|a| a.memory.resident(bytes));
+            drop(claim);
+            resident
+        }
+    };
     let mut all = accounts();
     let c = all.counts.entry(key).or_default();
     c.ns += began.elapsed().as_nanos() as u64;

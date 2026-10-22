@@ -1,7 +1,8 @@
 """varena: one process's memory for model weights on one device (design varena-slim.md).
 
-`Memory` places weight sets in pages its device's shared table shows free; a request's passes
-get their measured room before they run, and `torch_limit` is what torch's allocator may hold.
+`Memory` places weight sets in pages its device's shared table shows free; torch's segments
+for a request come from its allocator, which makes room (`make_room`: idle pages, caches, then
+the request's own pages by furthest declared use) when the row's free bytes fall short.
 A `Pin` is a block mapped and filled: a uint8 DLPack tensor that, with every tensor made from it,
 holds the block until the last one dies. Every call releases the GIL; a panic raises
 `VarenaError` with code `INTERNAL`.
