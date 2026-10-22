@@ -587,7 +587,7 @@ class Memory:
         return torch.cuda.MemPool(allocator._allocator)
 
     @contextmanager
-    def allocating(self, pool: torch.cuda.MemPool | None = None, *, route: bool = True, set_id: int | None = None) -> Iterator[None]:
+    def allocating(self, pool: torch.cuda.MemPool | None = None, *, route: bool = True) -> Iterator[None]:
         """Use the request's allocator between passes too, or a graph's dedicated scratch pool.
 
         Warm and capture must name the same graph pool. Exit the warm routing context before
@@ -595,13 +595,13 @@ class Memory:
         graph owns routing. Capture cannot grow its pool or enter pressure recovery.
         """
         selected = self.pool if pool is None and self.pooling else pool
-        r, p = _request.get(), _pass.get()
+        r = _request.get()
         if selected is None or r is None:
             yield
             return
         if self.cuda and torch.cuda.is_current_stream_capturing():
             raise Unbound("select and preseed the graph pool before capture")
-        r.native.allocating(self.native, set_id if set_id is not None else p.set if p else None, *self.torch.now(), selected.id)
+        r.native.allocating(self.native, self.torch.now()[1], selected.id)
         token = _pool.set((self, selected))
         route = route and selected.id not in _routes.get()
         routed = _routes.set(_routes.get() | {selected.id}) if route else None
@@ -614,10 +614,13 @@ class Memory:
             _pool.reset(token)
             _allocated()
 
-    def cache(self, owner: str, shrink: Callable[[int], int]) -> Cache:
+    def cache(self, owner: str, shrink: Callable[[int], int], model: nn.Module | Model | Sequence[nn.Module | Model] = ()) -> Cache:
         """Bytes the caller holds that `shrink(want) -> freed` gives back on varena's ask; a
-        cache owned by a request id ends with it."""
-        return Cache(self, self.native.cache(owner, shrink))
+        cache owned by a request id ends with it. A cache serving loaded models (a model's graph
+        pool or decode cache, one pool a serialized domain shares) takes their most protective
+        class: D while a plan declares one, N otherwise, shrunk before their own pages."""
+        served = [model] if isinstance(model, (nn.Module, Model)) else list(model)
+        return Cache(self, self.native.cache(owner, shrink, [(m if isinstance(m, Model) else self.models[m]).id for m in served]))
 
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
@@ -712,7 +715,7 @@ class Memory:
             if self.pool is not None and self.pooling and not (self.cuda and torch.cuda.is_current_stream_capturing()):  # capture owns its exact pool
                 selected = _pool.get()
                 pool = selected[1] if selected is not None and selected[0] is self else self.pool
-                p.pooled = self.allocating(pool, set_id=model.id)
+                p.pooled = self.allocating(pool)
                 p.pooled.__enter__()
             p.entered = sys.exc_info()[1]
             self._fold()  # the passes open already keep what ran before; this one starts here
@@ -960,6 +963,11 @@ class Request:
 
     def stats(self) -> Stats:
         return self.ended if self.ended is not None else self.native.stats()
+
+    def spare(self) -> int:
+        """Bytes this request could have now beside every working-set and pinned page without
+        evicting one (lock-free, the last publication's): a capture's room before it captures."""
+        return self.native.spare()
 
 
 class Cache:
