@@ -514,6 +514,10 @@ def check(vectors: Path) -> int:
         passed += ok
         if not ok:
             failures.append(f"resolve: {case['why']}")
+    from selection import check as check_selection
+    selected, selection_failures = check_selection(vectors, parse_header, BITS)
+    passed += selected
+    failures += selection_failures
     core_failures = check_cores(vectors / "cores.json")
     failures += core_failures
     passed += len(json.loads((vectors / "cores.json").read_text())["cases"]) - len(core_failures)

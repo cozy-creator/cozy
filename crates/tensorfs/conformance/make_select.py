@@ -39,6 +39,7 @@ header("future-int8",[("int8.future",64)])
 header("mixed-unsupported",[("BF16",128),("future.scheme",32)])
 header("mixed-fp8",[("int8.rowwise",128),("fp8.rowwise",32)])
 header("tie",[("F16",128),("BF16",128)])
+header("integer-mixed-int8",[("I64",128),("int8.rowwise",32)])
 paths={"weights/accurate.cozytensors":"bf16","small.cozytensors":"int8","nested/fp.cozytensors":"fp8","q4.cozytensors":"nvfp4"}
 cases=[]
 def case(why, variants, gpus, bits, chosen, reasons=(), **extra):
@@ -68,6 +69,7 @@ case("known GPU-incompatible sole variant is skipped",{"int8.cozytensors":"int8"
 case("all kinds must run",{"a.cozytensors":"mixed-unsupported","b.cozytensors":"bf16"},[],8,"b.cozytensors")
 case("a minority fp8 leaf still needs fp8",{"a.cozytensors":"mixed-fp8","b.cozytensors":"bf16"},["8.6"],8,"b.cozytensors",["precision 8: acme/model@1 has no int8 lane for sm86; served bf16"])
 case("dominant-kind tie uses lexical kind",{"tie.cozytensors":"tie"},[],8,"tie.cozytensors")
+case("integer-dominant sole variant still excludes encoded kinds at sixteen",{"index.cozytensors":"integer-mixed-int8"},["9.0"],16,None)
 case("no variants",{},["9.0"],8,None)
 case("sixteen never falls to a sole encoded profile",{"q.cozytensors":"int8"},["9.0"],16,None)
 case("sixteen excludes minority encoded leaves",{"q.cozytensors":"mixed-fp8"},["9.0"],16,None)

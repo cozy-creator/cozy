@@ -147,7 +147,7 @@ impl Slot {
         let ranked = variants.iter().enumerate().filter(|(_, (_, p))| p.kinds.iter().all(|kind| runs(kind, gpus) && ((bits != 16 && self.encoded) || !matches!(Dtype::parse(kind), Dtype::Other(_)))));
         let ranked = ranked.filter_map(|(at, (name, p))| Some(((place(p)?, !native(p), p.bytes, *name), at)));
         ranked.min().map(|(_, at)| at).or_else(|| {
-            (variants.len() == 1 && variants[0].1.family.is_empty() && variants[0].1.kinds.iter().all(|kind| runs(kind, gpus) && (self.encoded || !matches!(Dtype::parse(kind), Dtype::Other(_))))).then_some(0)
+            (variants.len() == 1 && variants[0].1.family.is_empty() && variants[0].1.kinds.iter().all(|kind| runs(kind, gpus) && ((bits != 16 && self.encoded) || !matches!(Dtype::parse(kind), Dtype::Other(_))))).then_some(0)
         })
     }
 }

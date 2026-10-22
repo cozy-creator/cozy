@@ -123,6 +123,15 @@
         "BF16",
         "F16"
       ]
+    },
+    "integer-mixed-int8": {
+      "family": "",
+      "bits": 0,
+      "bytes": 160,
+      "kinds": [
+        "I64",
+        "int8.rowwise"
+      ]
     }
   },
   "cases": [
@@ -478,6 +487,20 @@
         "bits": 8
       },
       "variant": "tie.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "integer-dominant sole variant still excludes encoded kinds at sixteen",
+      "variants": {
+        "index.cozytensors": "integer-mixed-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ],
+        "bits": 16
+      },
+      "variant": null,
       "reasons": []
     },
     {
