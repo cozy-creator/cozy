@@ -1123,7 +1123,8 @@ impl Timings {
     }
 }
 
-/// Every driver call of this process's CUDA backends (their trace spans), by name.
+/// Every driver call of this process's CUDA backends and every host wait in TensorFS's engine (their trace spans), by
+/// name.
 static CALLS: Timings = Timings::new();
 
 /// Times each of the backend's driver spans into [`CALLS`].
@@ -1151,7 +1152,7 @@ fn time_calls() {
     ONCE.call_once(|| {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Layer;
-        let only = tracing_subscriber::filter::Targets::new().with_target("varena::cuda", tracing::Level::TRACE);
+        let only = tracing_subscriber::filter::Targets::new().with_target("varena::cuda", tracing::Level::TRACE).with_target("tensorfs::io", tracing::Level::TRACE);
         let errors = tracing_subscriber::filter::Targets::new().with_target("varena::memory", tracing::Level::DEBUG);
         tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Calls.with_filter(only))
             .with(tracing_subscriber::fmt::layer().with_ansi(false).with_filter(errors))).unwrap();
@@ -1534,6 +1535,8 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     step!();
     assert_eq!(launch(c"spin", &[forward.as_nanos() as u64], stream.raw()), cuda::SUCCESS);
     step!();
+    // The driver calls from here on are those made while the forward runs.
+    CALLS.take();
     drop(pins);
     step!();
     let mut times: Vec<(&str, std::time::Duration)> = vec![];
@@ -1565,12 +1568,16 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
         let _ = probe.process_used();
     });
     step!();
-    time("record+query+wait", &mut || {
-        let e = probe.record(stream.raw()).unwrap();
-        running = !probe.query(e).unwrap();
-        probe.wait(e, other.raw()).unwrap();
-        probe.retire(e);
-    });
+    let mut event = Event::DONE;
+    time("record", &mut || event = probe.record(stream.raw()).unwrap());
+    step!();
+    time("query", &mut || running = !probe.query(event).unwrap());
+    step!();
+    time("wait", &mut || probe.wait(event, other.raw()).unwrap());
+    step!();
+    time("retire", &mut || probe.retire(event));
+    step!();
+    let during = CALLS.take();
     step!();
     stream.drain().unwrap();
     step!();
@@ -1580,7 +1587,8 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     step!();
     let report: Vec<String> = times.iter().map(|(w, t)| format!("{w} {t:?}")).collect();
     step!();
-    println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}), still running at the last call: {running}: {}", report.join(", "));
+    println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}), still running at the query: {running}: {}", report.join(", "));
+    println!("TIMINGS driver calls while the forward ran: {during}; RAM-tier unlocks during the request: {:?}", r.stats().unregisters);
     println!("TIMINGS in all: {}", timings.report());
     step!();
     for (what, took) in &times {
@@ -2174,8 +2182,21 @@ fn a_keep_protects_a_page_only_after_its_pin_and_the_kernels_reading_it_end() {
     step!();
 }
 
-/// A pass of `m` (two pinned blocks) whose one-gibibyte activation meets a real OOM: the card is
-/// crowded and the rest full of an idle set. Returns the OOM answers and the record.
+/// A pass of `m` measured at one page (on the empty card), before its activation grew: an unmeasured pass would take
+/// every idle byte before it runs and never meet an OOM.
+fn measured_small(mem: &Memory, m: SetId) {
+    let r = mem.request("seed", plan(&[&["m"]])).unwrap();
+    step!();
+    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
+    step!();
+    pass.end(Measured { allocated_peak: REGION_ALIGN, slack: 0, sites: vec![] }, Torch::default());
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+}
+
+/// A pass of `m` (two pinned blocks), measured smaller than its one-gibibyte activation, which meets a real OOM:
+/// the card is crowded and the rest full of an idle set. Returns the OOM answers and the record.
 fn first_run(mem: &Memory, m: SetId, idle: u32) -> (Vec<String>, Stats) {
     let r = mem.request("first", plan(&[&["m"]])).unwrap();
     step!();
@@ -2207,6 +2228,7 @@ fn an_oom_in_a_pass_is_recovered_in_process() {
     step!();
     let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(3, b)), Level::Ram).unwrap();
     step!();
+    measured_small(&mem, m);
     let _crowd = crowd();
     let idle = more_than_free();
     step!();
@@ -2234,6 +2256,7 @@ fn a_measured_pass_gets_its_room_before_it_runs() {
     step!();
     let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(3, b)), Level::Ram).unwrap();
     step!();
+    measured_small(&mem, m);
     let _crowd = crowd();
     let idle = more_than_free();
     step!();
@@ -2342,12 +2365,13 @@ fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_ro
     step!();
     mem.load(set("idle", 1, Fill::Stored, &g.uuid, |b| block(6, b)), Level::Gpu).unwrap();
     step!();
+    // Everything else on the card is an allocation varena cannot free; then the pass starts. An unmeasured pass takes
+    // every idle byte before it runs, so a fill after it would take the room the idle page gave.
+    let full = Pressure::fill(64 << 10);
+    step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
     let pass = r.pass(m, "main", "1", Torch::default()).unwrap();
-    step!();
-    // Everything else on the card is an allocation varena cannot free.
-    let full = Pressure::fill(64 << 10);
     step!();
     let first = mem.bind(m, 0, 0).expect("the idle page makes room");
     step!();
