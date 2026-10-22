@@ -621,7 +621,7 @@ fn a_components_cache_goes_at_its_class_turn_before_its_pages() {
     for k in [(0, 0), (1, 0), (1, 1), (2, 0)] {
         map(&mut t, k);
     }
-    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), sets: vec![1], bytes: MB, last_use: 0 });
+    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), sets: vec![1], bytes: MB, last_use: 0, ..Default::default() });
     (t.allocated, t.reserved) = (MB, MB);
     let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(2 * MB), unmeasured: 0, tried: Tried::default() });
     assert_eq!(a, vec![Action::Unmap { page: (2, 0), class: Class::N }, Action::Shrink { cache: 7, bytes: MB }, Action::Reserve { req: 1, room: 2 * MB, measured: true }]);
@@ -632,7 +632,7 @@ fn a_components_cache_goes_at_its_class_turn_before_its_pages() {
         map(&mut t, k);
         t.page_mut(k).unwrap().last_use = used;
     }
-    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), sets: vec![1], bytes: MB, last_use: 8 });
+    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), sets: vec![1], bytes: MB, last_use: 8, ..Default::default() });
     (t.allocated, t.reserved) = (MB, MB);
     let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(3 * MB), unmeasured: 0, tried: Tried::default() });
     assert_eq!(&a[..3], &[Action::Unmap { page: (2, 0), class: Class::N }, Action::Shrink { cache: 7, bytes: MB }, Action::Unmap { page: (1, 0), class: Class::N }], "{a:?}");
@@ -689,17 +689,60 @@ fn a_claim_the_driver_refused_retries_with_one_more_page() {
 }
 
 /// Lead's ruling: a pool shared by a serialized domain's components (the TE, the UNet and the
-/// VAE) takes the most protective class among them, at the nearest one's distance: D while any
-/// is declared, N once none is.
+/// VAE) takes the most protective class among them, at the nearest one's distance: W while one
+/// runs, D while any is declared, N once none is.
 #[test]
 fn a_cache_serving_several_components_takes_the_nearest_ones_class() {
     let mut t = table(8 * MB, vec![set("te", 1, MB), set("unet", 1, MB), set("vae", 1, MB)], vec![(vec![0], 1), (vec![1], 1), (vec![2], 1)]);
-    let pool = Cache { id: 3, owner: "graphs:domain".into(), sets: vec![0, 1, 2], bytes: MB, last_use: 0 };
+    let pool = Cache { id: 3, owner: "graphs:domain".into(), sets: vec![0, 1, 2], bytes: MB, last_use: 0, ..Default::default() };
     t.caches.push(pool.clone());
-    assert_eq!((t.cache_class(&pool), t.cache_distance(&pool)), (Class::D, Some((0, 1, u32::MAX))), "the TE's step runs now");
+    assert_eq!((t.cache_class(&pool), t.cache_distance(&pool)), (Class::W, Some((0, 1, u32::MAX))), "the TE's step runs now (review 6, C1)");
+    t.requests[0].cursor.step = 1;
+    assert_eq!(t.cache_class(&pool), Class::W, "the UNet's");
     t.requests[0].cursor.step = 2;
-    assert_eq!((t.cache_class(&pool), t.cache_distance(&pool)), (Class::D, Some((0, 1, u32::MAX))), "the VAE's");
+    assert_eq!((t.cache_class(&pool), t.cache_distance(&pool)), (Class::W, Some((0, 1, u32::MAX))), "the VAE's");
     t.requests[0].cursor.step = 3;
     assert_eq!(t.cache_class(&pool), Class::N, "no set of it declared any more");
+}
+
+/// Review 6, C1 (the reviewer's probes): a cache takes exactly its sets' class, W included. Mid
+/// pass, a bind of the running component short of room never shrinks its own graph pool; nor
+/// does a replay's preparation shrink the pool of the graph it prepares.
+#[test]
+fn a_running_components_own_cache_is_never_shrunk_for_it() {
+    let full = || {
+        let mut t = table(3 * MB, vec![set("unet", 3, MB)], vec![(vec![0], 1)]);
+        for k in [(0, 0), (0, 1)] {
+            map(&mut t, k);
+        }
+        t.caches.push(Cache { id: 3, owner: "graphs:unet".into(), sets: vec![0], bytes: MB, last_use: 7, ..Default::default() });
+        (t.allocated, t.reserved) = (MB, MB);
+        t
+    };
+    let mut t = full();
+    t.requests[0].cursor.passes.insert(0, 1);
+    let bind = decide(&t, &Trigger::Bind { page: (0, 2), req: Some(1), tried: Tried::default() });
+    assert!(!bind.iter().any(|a| matches!(a, Action::Shrink { cache: 3, .. })), "{bind:?}");
+    let t = full();
+    let prepare = decide(&t, &Trigger::Prepare { pages: vec![(0, 0), (0, 1), (0, 2)], req: Some(1), tried: Tried::default() });
+    assert!(!prepare.iter().any(|a| matches!(a, Action::Shrink { cache: 3, .. })), "{prepare:?}");
+}
+
+/// Review 6, C1: a held cache (a replay prepared, its GPU work not complete) is P: no demand
+/// asks it to shrink, though its sets are no plan's any more.
+#[test]
+fn a_held_cache_is_never_asked_to_shrink() {
+    let mut t = table(2 * MB, vec![set("a", 1, MB), set("b", 1, MB)], vec![(vec![0], 1)]);
+    map(&mut t, (1, 0));
+    t.caches.push(Cache { id: 4, owner: "graphs:b".into(), sets: vec![1], bytes: MB, last_use: 1, holds: 1, ..Default::default() });
+    (t.allocated, t.reserved) = (MB, MB);
+    assert_eq!(t.cache_class(&t.caches[0]), Class::P);
+    let a = decide(&t, &Trigger::Bind { page: (0, 0), req: Some(1), tried: Tried::default() });
+    assert!(!a.iter().any(|a| matches!(a, Action::Shrink { cache: 4, .. })), "{a:?}");
+    t.caches[0].holds = 0;
+    t.caches[0].releasing = vec![9];
+    assert_eq!(t.cache_class(&t.caches[0]), Class::P, "its release is pending on its stream");
+    t.caches[0].releasing.clear();
+    assert_eq!(t.cache_class(&t.caches[0]), Class::N);
 }
 

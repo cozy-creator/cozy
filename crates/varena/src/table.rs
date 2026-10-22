@@ -329,6 +329,13 @@ pub struct Cache {
     pub sets: Vec<u32>,
     pub bytes: u64,
     pub last_use: u64,
+    /// Holds out (a graph replay's preparation until its GPU completion) and the release
+    /// events still pending: held, it is P, and nothing asks it to shrink (review 6, C1).
+    pub holds: u32,
+    pub releasing: Vec<u64>,
+    /// Bytes its shrink queued and has not given back yet (the domain lock was busy): coming,
+    /// as a peer's deferred shrink is (review 6, C2).
+    pub coming: u64,
 }
 
 /// Another process's row, as it published it.
@@ -471,9 +478,18 @@ impl Table {
         self.free() + pages + self.caches.iter().map(|c| c.bytes).sum::<u64>() + self.slack()
     }
 
-    /// A cache's class: D while a plan still declares its set, N otherwise.
+    /// A cache's class, exactly its sets' (review 6, C1): P while held or its release is
+    /// pending, W while a running step uses any of its sets, D while a plan still declares one,
+    /// N otherwise.
     pub fn cache_class(&self, c: &Cache) -> Class {
-        if self.cache_distance(c).is_some() { Class::D } else { Class::N }
+        if c.holds > 0 || !c.releasing.is_empty() {
+            return Class::P;
+        }
+        match self.cache_distance(c) {
+            Some((0, ..)) => Class::W,
+            Some(_) => Class::D,
+            None => Class::N,
+        }
     }
 
     /// The request whose current step uses `key` next, nearest first.
@@ -537,7 +553,7 @@ impl Table {
     /// Unique backing already retiring. It remains charged until its owners finish; neither
     /// overlapping mechanism/custody tickets nor ownership-lost quarantines add reclaim credit.
     pub fn returning(&self) -> u64 {
-        self.returning.min(self.vmm) + self.transient + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
+        self.returning.min(self.vmm) + self.transient + self.caches.iter().map(|c| c.coming).sum::<u64>() + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
     }
 
     fn others_held(&self) -> u64 {

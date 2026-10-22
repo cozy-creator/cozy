@@ -127,13 +127,14 @@ impl Backend for Held {
 type Hook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 /// Host pages with release events that stay pending until armed; the first armed query runs
-/// `hook` on the querying thread.
+/// `hook` on the querying thread (of a pending event, or of any event when `every`).
 struct Hooked {
     host: HostBackend,
     next: std::sync::atomic::AtomicU64,
     pending: Arc<AtomicBool>,
     armed: Arc<AtomicBool>,
     hook: Hook,
+    every: bool,
 }
 
 impl Backend for Hooked {
@@ -158,11 +159,11 @@ impl Backend for Hooked {
         Ok(if self.pending.load(Ordering::SeqCst) { Event(1000 + self.next.fetch_add(1, Ordering::SeqCst)) } else { Event::DONE })
     }
     fn query(&self, event: Event) -> Result<bool> {
-        if event == Event::DONE {
-            return Ok(true);
-        }
         if !self.armed.load(Ordering::SeqCst) {
-            return Ok(false);
+            return Ok(event == Event::DONE);
+        }
+        if event == Event::DONE && !self.every {
+            return Ok(true);
         }
         if let Some(hook) = self.hook.lock().take() {
             hook();
@@ -313,7 +314,7 @@ fn a_reclaim_that_lands_before_the_binder_waits_wakes_it() {
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 * REGION_ALIGN };
     let (pending, armed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
     let hook: Hook = Arc::new(Mutex::new(None));
-    let backend = Hooked { host: HostBackend::new(g.memory), next: Default::default(), pending: pending.clone(), armed: armed.clone(), hook: hook.clone() };
+    let backend = Hooked { host: HostBackend::new(g.memory), next: Default::default(), pending: pending.clone(), armed: armed.clone(), hook: hook.clone(), every: false };
     let mem = Arc::new(Memory::open(g.clone(), None, Box::new(backend)).unwrap());
     let k = mem.load(spec(dir.path(), &uuid, "kset", Fill::Undeclared), Level::Ram).unwrap();
     let j = mem.load(spec(dir.path(), &uuid, "jset", Fill::Undeclared), Level::Ram).unwrap();
@@ -372,7 +373,7 @@ fn a_pin_dropped_before_the_binder_waits_wakes_it() {
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 * REGION_ALIGN };
     let (pending, armed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
     let hook: Hook = Arc::new(Mutex::new(None));
-    let backend = Hooked { host: HostBackend::new(g.memory), next: Default::default(), pending: pending.clone(), armed: armed.clone(), hook: hook.clone() };
+    let backend = Hooked { host: HostBackend::new(g.memory), next: Default::default(), pending: pending.clone(), armed: armed.clone(), hook: hook.clone(), every: false };
     let mem = Arc::new(Memory::open(g.clone(), None, Box::new(backend)).unwrap());
     let k = mem.load(spec(dir.path(), &uuid, "kset", Fill::Undeclared), Level::Ram).unwrap();
     let j = mem.load(spec(dir.path(), &uuid, "jset", Fill::Undeclared), Level::Ram).unwrap();
@@ -416,4 +417,43 @@ fn a_pin_dropped_before_the_binder_waits_wakes_it() {
     drop(mem);
     varena::os::remove_table(&uuid);
     assert!(first.is_ok(), "the binder slept through the pin drop's wake ({second:?} after an unrelated one)");
+}
+
+/// Review 6, G1 (the reviewer's probe): a restock re-checks the live offers in place, so an
+/// allocator callback during the re-check finds the idle N page offered (it used to find the
+/// stock empty: the offers were taken out and sent back after). The callback runs inside the
+/// re-check here, standing in for the allocator on another thread.
+#[test]
+fn a_restock_never_leaves_the_callback_an_empty_stock() {
+    assert!(varena::os::namespace(&format!("stock{}-", std::process::id())));
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("rv8restock-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 * REGION_ALIGN };
+    let (pending, armed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let hook: Hook = Arc::new(Mutex::new(None));
+    let backend = Hooked { host: HostBackend::new(g.memory), next: Default::default(), pending, armed: armed.clone(), hook: hook.clone(), every: true };
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(backend)).unwrap());
+    let k = mem.load(spec(dir.path(), &uuid, "kset", Fill::Undeclared), Level::Ram).unwrap();
+    mem.load(spec(dir.path(), &uuid, "other", Fill::Undeclared), Level::Ram).unwrap();
+    // K used and let go: offered to the callback as N.
+    use_once(&mem, k, "kset", "r0");
+    let r1 = Arc::new(mem.request("r1", plan("other")).unwrap());
+    let claimed = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    *hook.lock() = Some(Box::new({
+        let (r1, claimed) = (r1.clone(), claimed.clone());
+        move || claimed.store(r1.reclaim_allocation(REGION_ALIGN).unwrap_or(0), Ordering::SeqCst)
+    }));
+    armed.store(true, Ordering::SeqCst);
+    // A new plan restocks: the live offer of K is taken out and re-checked.
+    let r2 = mem.request("r2", plan("other")).unwrap();
+    armed.store(false, Ordering::SeqCst);
+    let during = claimed.load(Ordering::SeqCst);
+    let after = r1.reclaim_allocation(REGION_ALIGN).unwrap_or(0);
+    println!("callback during the re-check claimed {during}; right after it {after}");
+    r2.end();
+    drop(r1);
+    drop(mem);
+    varena::os::remove_table(&uuid);
+    assert_ne!(during, u64::MAX, "the hook never ran: the probe tests nothing");
+    assert_eq!(during, REGION_ALIGN, "the callback found the stock empty while an idle N page was offered");
 }

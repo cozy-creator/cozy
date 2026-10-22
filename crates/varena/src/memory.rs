@@ -503,7 +503,20 @@ pub struct Pass {
 }
 
 /// The caller's callbacks: called with no lock held, so they may call back in.
-type Shrink = Arc<dyn Fn(u64) -> u64 + Send + Sync>;
+type Shrink = Arc<dyn Fn(u64) -> Shrunk + Send + Sync>;
+
+/// What a cache's shrink gave back: `freed` now, and `coming` once a lock it could not take
+/// without deadlocking is released (it then reports the cache's bytes with
+/// [`Memory::cached`]): a demand waits for those rather than escalating (review 6, C2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shrunk {
+    pub freed: u64,
+    pub coming: u64,
+}
+
+/// A hold on a cache ([`Memory::hold_cache`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoldId(pub u64);
 type Trim = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 struct SetMech {
@@ -607,6 +620,8 @@ impl Wakes {
 struct Stocked {
     key: Key,
     gen: u64,
+    /// The stock's compaction round it was sent in: older entries are the stale ones.
+    round: u64,
     va: Va,
     off: u64,
     span: u64,
@@ -767,6 +782,8 @@ struct State {
     measure_epoch: u64,
     /// Idle pages may have changed since the last offer to the allocator callback.
     restock: bool,
+    /// The stock's compaction round ([`Stocked::round`]).
+    round: u64,
     ordinary_reserved: u64,
     physical_epoch: u64,
     retired: HashMap<(Key, u64), Retirement>,
@@ -1222,14 +1239,14 @@ impl Memory {
     /// (`sets`: a component's graph pool or decode cache, a pool shared by a serialized
     /// domain's components) takes the most protective class among them and goes before their
     /// pages; one serving none is N.
-    pub fn cache(&self, owner: &str, sets: &[SetId], shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
+    pub fn cache(&self, owner: &str, sets: &[SetId], shrink: impl Fn(u64) -> Shrunk + Send + Sync + 'static) -> CacheId {
         let shrink: Shrink = Arc::new(shrink);
         self.inner
             .guard(|| {
                 let mut st = self.inner.lock();
                 let id = st.tick() as u32;
                 let last_use = st.clock;
-                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), sets: sets.iter().map(|s| s.0).collect(), bytes: 0, last_use });
+                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), sets: sets.iter().map(|s| s.0).collect(), last_use, ..Default::default() });
                 st.shrinks.insert(id, shrink);
                 self.inner.unlock(st);
                 Ok(CacheId(id))
@@ -1245,6 +1262,44 @@ impl Memory {
             if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
                 c.bytes = bytes;
                 c.last_use = now;
+                // A queued shrink's bytes arrived.
+                c.coming = 0;
+            }
+            self.inner.publish(&mut st);
+            self.inner.unlock(st);
+            self.inner.landed.notify_all();
+            Ok(())
+        });
+    }
+
+    /// Holds a cache (a graph pool from a replay's preparation): P until released, never
+    /// asked to shrink meanwhile (review 6, C1). Holds nest.
+    pub fn hold_cache(&self, cache: CacheId) -> HoldId {
+        self.inner
+            .guard(|| {
+                let mut st = self.inner.lock();
+                let id = st.tick();
+                if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
+                    c.holds += 1;
+                }
+                self.inner.publish(&mut st);
+                self.inner.unlock(st);
+                Ok(HoldId(id))
+            })
+            .unwrap_or(HoldId(0))
+    }
+
+    /// Ends a hold once the work queued on `stream` so far completes (a replay and every
+    /// reader of its lent outputs, joined into it): until then the cache stays P.
+    pub fn release_cache(&self, cache: CacheId, _hold: HoldId, stream: usize) {
+        let _ = self.inner.guard(|| {
+            let event = self.inner.backend.record(stream)?;
+            let mut st = self.inner.lock();
+            if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
+                c.holds = c.holds.saturating_sub(1);
+                if event != Event::DONE {
+                    c.releasing.push(event.0);
+                }
             }
             self.inner.publish(&mut st);
             self.inner.unlock(st);
@@ -1672,7 +1727,19 @@ impl Inner {
     }
 
     fn drain(&self, st: &mut State) {
-        let wake = self.poll_releases(st, true);
+        let mut wake = self.poll_releases(st, true);
+        // A held cache's release completes on its stream: it is its class again.
+        for c in &mut st.table.caches {
+            let before = c.releasing.len();
+            c.releasing.retain(|e| {
+                let done = self.backend.query(Event(*e)).unwrap_or(false);
+                if done {
+                    self.backend.retire(Event(*e));
+                }
+                !done
+            });
+            wake |= c.releasing.len() != before;
+        }
         self.keeps(st);
         if let Some(h) = self.custody.as_ref().map(|c| c.holder()).filter(|h| *h != st.holder) {
             // A new custody holder knows none of the kept pages: all go to it again.
@@ -1885,27 +1952,51 @@ impl Inner {
         if !std::mem::take(&mut st.restock) {
             return;
         }
-        // Stale offers (taken or reclaimed) go. A live one whose page is no longer idle N or S
-        // (a plan made it W or D, a bind pinned it) is taken back before the callback can
-        // claim it; the rest stay.
-        let live: Vec<Stocked> = self.stock.try_iter().filter(|s| s.claim.load(Ordering::Acquire) == STOCKED).collect();
-        for s in live {
-            if self.offerable(st, s.key).is_some_and(|o| o.gen == s.gen) {
-                let _ = self.stock_tx.send(s);
-            } else if s.claim.compare_exchange(STOCKED, TAKEN, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                if let Some(h) = st.homes.get_mut(&s.key).filter(|h| h.stock.as_ref().is_some_and(|c| Arc::ptr_eq(c, &s.claim))) {
-                    h.stock = None;
+        // Revoked in place (review 6, G1): an offer whose page is no longer idle N or S (a
+        // plan made it W or D, a bind pinned it) has its claim taken back before the callback
+        // can claim it. Its entry stays in the stock, which the callback skips, so the stock is
+        // never empty while the offers are checked.
+        let stocked: Vec<Key> = st.homes.iter().filter(|(_, h)| h.stock.is_some()).map(|(k, _)| *k).collect();
+        for key in stocked {
+            let gen = st.homes.get(&key).map(|h| h.gen);
+            if self.offerable(st, key).is_some_and(|o| Some(o.gen) == gen) {
+                continue;
+            }
+            if let Some(h) = st.homes.get_mut(&key) {
+                if let Some(claim) = h.stock.take() {
+                    if claim.compare_exchange(STOCKED, TAKEN, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                        // The callback has it: the state reconciles it.
+                        h.stock = Some(claim);
+                    }
                 }
             }
         }
-        let keys: Vec<Key> = st.homes.iter().filter(|(_, h)| h.stock.is_none()).map(|(k, _)| *k).collect();
-        for key in keys {
+        let fresh: Vec<Key> = st.homes.iter().filter(|(_, h)| h.stock.is_none()).map(|(k, _)| *k).collect();
+        for key in fresh {
             let Some(offer) = self.offerable(st, key) else { continue };
             let claim = Arc::new(AtomicU8::new(STOCKED));
             if let Some(h) = st.homes.get_mut(&key) {
                 h.stock = Some(claim.clone());
             }
-            let _ = self.stock_tx.send(Stocked { claim, ..offer });
+            let _ = self.stock_tx.send(Stocked { claim, round: st.round, ..offer });
+        }
+        // Stale entries outnumbering the live ones are compacted: the live ones go in again in
+        // a new round first, then the stock's entries of older rounds are dropped, so it is
+        // never empty meanwhile.
+        let live: Vec<(Key, Arc<AtomicU8>)> = st.homes.iter().filter_map(|(k, h)| h.stock.clone().map(|c| (*k, c))).filter(|(_, c)| c.load(Ordering::Acquire) == STOCKED).collect();
+        if self.stock.len() > 2 * live.len() {
+            st.round += 1;
+            for (key, claim) in live {
+                if let Some(offer) = self.offerable(st, key) {
+                    let _ = self.stock_tx.send(Stocked { claim, round: st.round, ..offer });
+                }
+            }
+            while let Ok(s) = self.stock.try_recv() {
+                if s.round == st.round {
+                    let _ = self.stock_tx.send(s);
+                    break;
+                }
+            }
         }
     }
 
@@ -1918,7 +2009,7 @@ impl Inner {
         let h = st.homes.get(&key)?;
         let complete = !h.filling && !h.transforming && !h.keeping && !h.keep_after && !h.exported && self.backend.query(h.ready).unwrap_or(false);
         let phys = h.phys.as_ref().map(|p| p.id).filter(|_| idle && complete && matches!(class, Some(Class::N | Class::S)))?;
-        Some(Stocked { key, gen: h.gen, va, off, span, phys, claim: Arc::new(AtomicU8::new(TAKEN)) })
+        Some(Stocked { key, gen: h.gen, round: st.round, va, off, span, phys, claim: Arc::new(AtomicU8::new(TAKEN)) })
     }
 
     /// The allocator callback's reclaim from the stock, without the state lock: each page it
@@ -2825,10 +2916,11 @@ impl Inner {
     /// Runs caches' shrink callbacks, the lock released (they are the caller's code).
     fn shrink(&self, shrinks: Vec<(u32, u64, Shrink)>) {
         for (id, bytes, f) in shrinks {
-            let freed = crate::caught(|| Ok(f(bytes))).unwrap_or(0);
+            let shrunk = crate::caught(|| Ok(f(bytes))).unwrap_or_default();
             let mut st = self.state.lock();
             if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == id) {
-                c.bytes = c.bytes.saturating_sub(freed);
+                c.bytes = c.bytes.saturating_sub(shrunk.freed + shrunk.coming);
+                c.coming += shrunk.coming;
             }
         }
     }
@@ -3573,7 +3665,7 @@ impl Inner {
         st.table.requests.retain(|r| r.id != req);
         self.rekeep(&mut st);
         let owned: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name).map(|c| c.id).collect();
-        let holding: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name && c.bytes > 0).map(|c| c.id).collect();
+        let holding: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name && c.bytes > 0 && c.holds == 0 && c.releasing.is_empty()).map(|c| c.id).collect();
         let shrinks: Vec<(u32, u64, Shrink)> = holding.iter().filter_map(|id| st.shrinks.get(id).map(|s| (*id, u64::MAX, s.clone()))).collect();
         let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
         let mut stats = st.stats.remove(&req).unwrap_or_default();
@@ -3618,9 +3710,10 @@ impl Inner {
         // Withdraws: of evicted kept pages (their bytes), and of lent ones (their pages the
         // allocator callback's only once custody let go).
         self.to_custody.settle();
-        // A running tier copy's or protect's page: evictable once it ends.
+        // A running tier copy's or protect's page: evictable once it ends; a cache's queued
+        // shrink: its bytes once its lock frees (it reports them with `cached`).
         let mut st = self.lock();
-        while st.table.transient > 0 {
+        while st.table.transient > 0 || st.table.caches.iter().any(|c| c.coming > 0) {
             self.wait(&mut st)?;
         }
         self.unlock(st);
