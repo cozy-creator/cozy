@@ -47,6 +47,24 @@ pub struct Pair {
     pub cozy: String,
 }
 
+impl Pair {
+    /// Published software floors for memory protocol 1. Patch versions remain independent;
+    /// Runtime's dependency metadata and the executor Hello enforce the actual pair/ABI.
+    fn require_memory_protocol(&self) -> io::Result<()> {
+        let band = |version: &str| -> Option<(u32, u32)> {
+            let mut parts = version.split('.');
+            Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+        };
+        if band(&self.runtime).is_some_and(|v| v >= (0, 31))
+            && band(&self.tensorfs).is_some_and(|v| v >= (0, 14))
+        { return Ok(()); }
+        Err(coded("memory_protocol_incompatible", format!(
+            "this TensorD requires Runtime >=0.31.0 and TensorFS >=0.14.0 together; selected Runtime {:?}, TensorFS {:?}. Upgrade through cozy 0.11.4 before cozy 0.12, or stage the binary and both SDK wheels in one machine update",
+            self.runtime, self.tensorfs,
+        )))
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Status {
     pub operation: String,
@@ -348,6 +366,18 @@ pub fn recover_activation(paths: &Paths) -> io::Result<Recovered> {
         }
         state => Err(invalid(&format!("cannot recover update state {state}"))),
     }
+}
+
+/// Checked by the new service before it opens the store or reports readiness, including
+/// an activation requested by an older binary which did not know this memory contract.
+/// A fresh local machine without a selected SDK may still serve CPU/package operations;
+/// each GPU executor must prove the memory capability before Start.
+pub fn check_startup_pair(paths: &Paths) -> io::Result<()> {
+    let pair = pair_in(&paths.sdk());
+    if pair.runtime.is_empty() && pair.tensorfs.is_empty() && read_pending(paths)?.is_none() {
+        return Ok(());
+    }
+    pair.require_memory_protocol()
 }
 
 fn read_pending(paths: &Paths) -> io::Result<Option<Pending>> {
@@ -790,6 +820,9 @@ impl Updates {
                 None => from.clone(),
             };
             to.cozy = binary.as_ref().map_or_else(|| from.cozy.clone(), |b| b.version.clone());
+            if binary.is_some() || !to.runtime.is_empty() || !to.tensorfs.is_empty() {
+                to.require_memory_protocol()?;
+            }
             self.set(|s| s.to = to.clone())?;
             let activation = self.drain()?;
             self.set(|s| s.enter("installing"))?;
@@ -966,8 +999,10 @@ impl Updates {
                 }
             }
         }
+        let pair = identified(candidate)?;
+        pair.require_memory_protocol()?;
         platform::durable::sync_dir(candidate)?;
-        identified(candidate)
+        Ok(pair)
     }
 
     /// A Runtime named alone keeps the machine's TensorFS when the two resolve together, else takes
@@ -1276,6 +1311,34 @@ fn server(error: io::Error) -> (u16, String) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_memory_upgrade_requires_both_sdk_members_and_allows_patch_skew() {
+        for (runtime, tensorfs) in [("0.30.3", "0.13.3"), ("0.31.0", "0.13.3"), ("0.30.3", "0.14.0"), ("0.31.0", "")] {
+            let pair = Pair { runtime: runtime.into(), tensorfs: tensorfs.into(), ..Default::default() };
+            assert!(pair.require_memory_protocol().is_err(), "{pair:?}");
+        }
+        Pair { runtime: "0.31.7".into(), tensorfs: "0.14.2".into(), ..Default::default() }.require_memory_protocol().unwrap();
+    }
+
+    #[test]
+    fn a_new_service_refuses_the_old_selected_sdk_before_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(&root.path().join("engine"), root.path());
+        check_startup_pair(&paths).unwrap(); // no selected pair: CPU baseline stays available
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        wheel(&paths.image_wheels, "cozy_runtime", "0.30.3", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.13.3", None);
+        let error = check_startup_pair(&paths).unwrap_err();
+        assert!(error.to_string().contains("cozy 0.11.4"));
+        let next = root.path().join("next");
+        fs::create_dir_all(&next).unwrap();
+        wheel(&next, "cozy_runtime", "0.31.1", None);
+        wheel(&next, "tensorfs", "0.14.0", None);
+        fs::create_dir_all(paths.current_sdk_link().parent().unwrap()).unwrap();
+        relink(&paths.current_sdk_link(), Some(&next)).unwrap();
+        check_startup_pair(&paths).unwrap();
+    }
+
     /// A minimal wheel: METADATA, optionally a bundled script.
     fn wheel(dir: &Path, distribution: &str, version: &str, script: Option<&[u8]>) -> PathBuf {
         requiring(dir, distribution, version, script, "")
@@ -1411,14 +1474,14 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cm-activation-{}", uuid::Uuid::new_v4()));
         let paths = Paths::new(&root.join("engine"), &root);
         fs::create_dir_all(&paths.image_wheels).unwrap();
-        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
-        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        wheel(&paths.image_wheels, "cozy_runtime", "1.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "1.1.0", None);
         let lifecycle = super::super::lifecycle::Lifecycle::open(root.join("idle.json"), false, true, super::super::lifecycle::IDLE_GRACE_MS).unwrap();
         let earlier = lifecycle.admit().unwrap();
         let drained = lifecycle.clone();
         let idle = Box::new(move || drained.admitted() == 0);
         let updates = Updates::open(paths.clone(), idle, Some(lifecycle.clone()), None).unwrap();
-        let candidate = wheel(&root, "cozy_runtime", "0.2.0", None);
+        let candidate = wheel(&root, "cozy_runtime", "1.2.0", None);
         let file = candidate.file_name().unwrap().to_str().unwrap().to_owned();
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(&candidate).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256, ..Default::default() });
@@ -1446,13 +1509,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cm-canceled-update-{}", uuid::Uuid::new_v4()));
         let paths = Paths::new(&root.join("engine"), &root);
         fs::create_dir_all(&paths.image_wheels).unwrap();
-        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
-        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        wheel(&paths.image_wheels, "cozy_runtime", "1.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "1.1.0", None);
         let lifecycle = super::super::lifecycle::Lifecycle::open(root.join("idle.json"), false, true, super::super::lifecycle::IDLE_GRACE_MS).unwrap();
         let earlier = lifecycle.admit().unwrap();
         let drained = lifecycle.clone();
         let updates = Updates::open(paths.clone(), Box::new(move || drained.admitted() == 0), Some(lifecycle.clone()), None).unwrap();
-        let candidate = wheel(&root, "cozy_runtime", "0.2.0", None);
+        let candidate = wheel(&root, "cozy_runtime", "1.2.0", None);
         let request = update_request(&updates, "u1", &candidate);
         updates.request(request, |_| panic!("a canceled update activated")).unwrap();
         state(&updates, "u1", "waiting_activation");
@@ -1483,8 +1546,8 @@ mod tests {
         let mut paths = Paths::new(&root.join("engine"), &root);
         paths.config = root.join("home/.cozy/config.toml");
         fs::create_dir_all(&paths.image_wheels).unwrap();
-        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
-        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        wheel(&paths.image_wheels, "cozy_runtime", "1.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "1.1.0", None);
         fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
         fs::write(&paths.config, "hub = \"local\"\n[machine]\nport = 9\n").unwrap();
         for (operation, limit) in [("cap", 8u64 << 30), ("lift", 0)] {
@@ -1511,13 +1574,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cm-unchanged-update-{}", uuid::Uuid::new_v4()));
         let paths = Paths::new(&root.join("engine"), &root);
         fs::create_dir_all(&paths.image_wheels).unwrap();
-        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
-        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        wheel(&paths.image_wheels, "cozy_runtime", "1.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "1.1.0", None);
         let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
         let request = Request {
             operation: "same".into(), pin: None,
-            runtime: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
-            tensorfs: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
+            runtime: Some(Choice { version: "1.1.0".into(), ..Default::default() }),
+            tensorfs: Some(Choice { version: "1.1.0".into(), ..Default::default() }),
             cozy: None,
             binary: None,
             gpu_memory_limit: None,
@@ -1564,7 +1627,7 @@ mod tests {
             let paths = Paths::new(&root.join("engine"), &root);
             let old = root.join("engine/sdk/old");
             let new = root.join("engine/sdk/new");
-            for (dir, version) in [(&old, "0.1.0"), (&new, "0.2.0")] {
+            for (dir, version) in [(&old, "1.1.0"), (&new, "1.2.0")] {
                 fs::create_dir_all(dir).unwrap();
                 wheel(dir, "cozy_runtime", version, None);
                 wheel(dir, "tensorfs", version, None);
@@ -1706,7 +1769,7 @@ mod tests {
         assert_eq!(persisted.state, "succeeded");
         let next = Request {
             operation: "next".into(), pin: None,
-            runtime: Some(Choice { version: "0.2.0".into(), ..Default::default() }),
+            runtime: Some(Choice { version: "1.2.0".into(), ..Default::default() }),
             tensorfs: None,
             cozy: None,
             binary: None,
@@ -1755,7 +1818,7 @@ mod tests {
         rollback_pending(&transaction.paths, "fixture").unwrap();
         let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
         let original = fs::read_dir(&transaction.old).unwrap().count();
-        for (id, version) in [(".", "0.3.0"), ("..", "0.3.1")] {
+        for (id, version) in [(".", "1.3.0"), ("..", "1.3.1")] {
             let candidate = wheel(&transaction.root, "cozy_runtime", version, None);
             let request = update_request(&updates, id, &candidate);
             updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
@@ -1773,7 +1836,7 @@ mod tests {
         let transaction = Activation::prepare();
         rollback_pending(&transaction.paths, "fixture").unwrap();
         let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
-        let candidate = wheel(&transaction.root, "cozy_runtime", "0.3.0", None);
+        let candidate = wheel(&transaction.root, "cozy_runtime", "1.3.0", None);
         let request = update_request(&updates, "A", &candidate);
         updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
         state(&updates, "A", "starting");
@@ -1805,18 +1868,18 @@ mod tests {
         let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
         let rebuilt = transaction.root.join("rebuilt");
         fs::create_dir_all(&rebuilt).unwrap();
-        let candidate = wheel(&rebuilt, "cozy_runtime", "0.1.0", Some(b"rebuilt"));
+        let candidate = wheel(&rebuilt, "cozy_runtime", "1.1.0", Some(b"rebuilt"));
         let request = update_request(&updates, "rebuilt", &candidate);
         updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
         state(&updates, "rebuilt", "starting");
         updates.commit().unwrap();
         let installed = updates.update("rebuilt").unwrap();
-        assert_eq!((installed.from.runtime.as_str(), installed.to.runtime.as_str()), ("0.1.0", "0.1.0"));
+        assert_eq!((installed.from.runtime.as_str(), installed.to.runtime.as_str()), ("1.1.0", "1.1.0"));
         assert_ne!(installed.from, installed.to, "a rebuilt wheel at the running version reads unchanged");
         assert_eq!(installed.to.runtime_sha256, hex(&Sha256::digest(fs::read(&candidate).unwrap())));
         // A named wheel is a development build its runs name: by its bytes, without provenance.
         let build = fs::read_to_string(transaction.paths.sdk().join(RUNTIME_BUILD)).unwrap();
-        assert_eq!(build, format!("0.1.0+{}", &installed.to.runtime_sha256[..8]));
+        assert_eq!(build, format!("1.1.0+{}", &installed.to.runtime_sha256[..8]));
         assert_eq!(installed.from.tensorfs_sha256, installed.to.tensorfs_sha256);
         let request = update_request(&updates, "again", &candidate);
         updates.request(request, |_| panic!("the running wheel restarted the service")).unwrap();
@@ -1832,14 +1895,14 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cm-unresolved-update-{}", uuid::Uuid::new_v4()));
         let paths = Paths::new(&root.join("engine"), &root);
         fs::create_dir_all(&paths.image_wheels).unwrap();
-        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
-        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        wheel(&paths.image_wheels, "cozy_runtime", "1.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "1.1.0", None);
         let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
-        let candidate = requiring(&root, "cozy_runtime", "0.2.0", None, "Requires-Dist: tensorfs>=0.2\n");
+        let candidate = requiring(&root, "cozy_runtime", "1.2.0", None, "Requires-Dist: tensorfs>=1.2\n");
         let mut request = update_request(&updates, "u1", &candidate);
-        let tensorfs = wheel(&root, "tensorfs", "0.1.0", None);
-        let (sha256, _) = updates.stage("tensorfs-0.1.0-py3-none-any.whl", &mut fs::File::open(tensorfs).unwrap()).unwrap();
-        request.tensorfs = Some(Choice { file: "tensorfs-0.1.0-py3-none-any.whl".into(), sha256, ..Default::default() });
+        let tensorfs = wheel(&root, "tensorfs", "1.1.0", None);
+        let (sha256, _) = updates.stage("tensorfs-1.1.0-py3-none-any.whl", &mut fs::File::open(tensorfs).unwrap()).unwrap();
+        request.tensorfs = Some(Choice { file: "tensorfs-1.1.0-py3-none-any.whl".into(), sha256, ..Default::default() });
         updates.request(request, |_| panic!("an unresolved pair activated")).unwrap();
         let failed = loop {
             match updates.update("u1").unwrap() {
@@ -1848,9 +1911,9 @@ mod tests {
             }
         };
         assert_eq!(failed.state, "failed");
-        assert!(failed.error.starts_with("cozy_runtime 0.2.0 and tensorfs 0.1.0 do not install together: "), "{}", failed.error);
-        assert!(failed.error.contains("tensorfs>=0.2"), "{}", failed.error);
-        assert!(failed.error.ends_with("; it keeps Runtime 0.1.0 and TensorFS 0.1.0"), "{}", failed.error);
+        assert!(failed.error.starts_with("cozy_runtime 1.2.0 and tensorfs 1.1.0 do not install together: "), "{}", failed.error);
+        assert!(failed.error.contains("tensorfs>=1.2"), "{}", failed.error);
+        assert!(failed.error.ends_with("; it keeps Runtime 1.1.0 and TensorFS 1.1.0"), "{}", failed.error);
         assert!(fs::symlink_metadata(paths.current_sdk_link()).is_err(), "an unresolved pair was selected");
         fs::remove_dir_all(root).unwrap();
     }
@@ -1862,10 +1925,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cm-unpaired-update-{}", uuid::Uuid::new_v4()));
         let paths = Paths::new(&root.join("engine"), &root);
         fs::create_dir_all(&paths.image_wheels).unwrap();
-        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
-        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        wheel(&paths.image_wheels, "cozy_runtime", "1.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "1.1.0", None);
         let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
-        let candidate = requiring(&root, "cozy_runtime", "0.2.0", None, "Requires-Dist: tensorfs>=999\n");
+        let candidate = requiring(&root, "cozy_runtime", "1.2.0", None, "Requires-Dist: tensorfs>=999\n");
         updates.request(update_request(&updates, "u1", &candidate), |_| panic!("an unpaired Runtime activated")).unwrap();
         let failed = loop {
             match updates.update("u1").unwrap() {
@@ -1875,7 +1938,7 @@ mod tests {
         };
         assert_eq!((failed.state.as_str(), failed.code.as_str()), ("failed", "tensorfs_unresolved"), "{}", failed.error);
         assert!(failed.error.contains("name one with --tensorfs-wheel"), "{}", failed.error);
-        assert!(failed.error.ends_with("; it keeps Runtime 0.1.0 and TensorFS 0.1.0"), "{}", failed.error);
+        assert!(failed.error.ends_with("; it keeps Runtime 1.1.0 and TensorFS 1.1.0"), "{}", failed.error);
         assert!(fs::symlink_metadata(paths.current_sdk_link()).is_err(), "an unpaired Runtime was selected");
         fs::remove_dir_all(root).unwrap();
     }

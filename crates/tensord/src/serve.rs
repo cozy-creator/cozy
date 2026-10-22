@@ -291,6 +291,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
     let paths = crate::machine::update::Paths::new(&engine, &layout.root);
+    crate::machine::update::check_startup_pair(&paths)?;
     let (_owned, store) = own(&engine, &layout.store, Some(&paths))?;
     // The machine's one downloader, held for its life: it reads the datacenter volume before the
     // Hub and fills it. A variable naming no mount point (the volume was not delivered) is none.
