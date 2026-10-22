@@ -3,11 +3,16 @@
 //! no host thread waits on a device event or on custody. Host pages fill synchronously, so the
 //! backend here is the host backend with stream events that complete only when the test says
 //! (as a card's do when their work finishes), and with the stream waits it was asked for.
+// Its sets load from TensorFS sources, which are Unix's so far (`tensorfs::io::source`).
+#![cfg(unix)]
 
 use std::collections::HashSet;
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::net::{SocketAddr, UnixListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -489,11 +494,13 @@ impl Drop for Scope {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// A custody whose answers wait for `gate`.
 fn gated_custody(gpu: &str, gate: Arc<Gate>) {
     serve_custody(gpu, gate, Arc::new(Log::default()));
 }
 
+#[cfg(target_os = "linux")]
 /// The calls a fake custody served, per connection, and its connections (to cut them).
 #[derive(Default)]
 struct Log {
@@ -504,12 +511,14 @@ struct Log {
     kept: Mutex<std::collections::HashMap<(String, u64), Owned>>,
 }
 
+#[cfg(target_os = "linux")]
 /// A call's (fingerprint key, page).
 fn kept_key(call: &serde_json::Value) -> Option<(String, u64)> {
     let body = call.as_object()?.values().next()?;
     Some((body.get("fp")?.as_str()?.to_string(), body.get("page")?.as_u64()?))
 }
 
+#[cfg(target_os = "linux")]
 impl Log {
     fn await_call(&self, f: impl Fn(&(usize, String)) -> bool) {
         let mut calls = self.calls.lock();
@@ -524,6 +533,7 @@ impl Log {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn serve_custody(gpu: &str, gate: Arc<Gate>, log: Arc<Log>) {
     let uid = unsafe { libc::geteuid() };
     let addr = SocketAddr::from_abstract_name(format!("cozy-varena-{uid}-test{}-custody-{gpu}", std::process::id())).unwrap();
@@ -570,6 +580,7 @@ fn serve_custody(gpu: &str, gate: Arc<Gate>, log: Arc<Log>) {
 /// filling page while exports queue, and an unload whose withdraw queues behind them, both
 /// return. Exports and withdraws go to one sender thread and no caller waits on them; no thread
 /// holds the state lock with another. (A load's import is a question it waits on custody for.)
+#[cfg(target_os = "linux")]
 #[test]
 fn no_call_waits_on_custody() {
     let dir = tempfile::tempdir().unwrap();
@@ -615,6 +626,7 @@ fn no_call_waits_on_custody() {
 
 /// Round 2, finding 12: when custody's holder changes (a TensorD restart), every kept page is
 /// exported again to the new one.
+#[cfg(target_os = "linux")]
 #[test]
 fn kept_pages_go_to_a_new_custody_holder() {
     let dir = tempfile::tempdir().unwrap();
@@ -744,6 +756,8 @@ fn a_create_short_of_memory_decides_again() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
 /// A card's view of memory: a page's bytes are in use while any handle to them lives, the
 /// process's own or custody's (custody runs in this process), and so are bytes allocated outside
 /// varena (torch's, or another process's). An allocation needs `slack` bytes free beyond its own
@@ -763,11 +777,13 @@ struct Card {
     unmap_waits: Gate,
 }
 
+#[cfg(target_os = "linux")]
 fn inode(h: &Owned) -> u64 {
     use std::os::unix::fs::MetadataExt;
     std::fs::File::from(h.try_clone().unwrap()).metadata().unwrap().ino()
 }
 
+#[cfg(target_os = "linux")]
 impl Card {
     fn new(limit: u64, slack: u64) -> Arc<Card> {
         Arc::new(Card { host: HostBackend::new(limit), limit, slack, pages: Mutex::default(), torch: AtomicU64::default(), foreign: AtomicU64::default(), hold_unmap: AtomicBool::default(), unmap_gate: Gate::default(), unmap_waits: Gate::default() })
@@ -801,8 +817,10 @@ impl Card {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct Driver(Arc<Card>);
 
+#[cfg(target_os = "linux")]
 impl Backend for Driver {
     fn capacity(&self) -> u64 {
         self.0.limit
@@ -921,6 +939,7 @@ fn stored(dir: &std::path::Path, uuid: &str, name: &str, regions: u64) -> SetSpe
 /// Review 3, N1: an evicted kept page's memory is custody's until its Withdraw is sent; the
 /// demand that evicted it waits for that before mapping into the bytes, so one eviction is
 /// enough and the bind succeeds.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_evicted_kept_page_is_free_once_withdrawn() {
     let dir = tempfile::tempdir().unwrap();
@@ -1278,7 +1297,9 @@ fn a_fill_is_issued_only_after_its_map() {
 
 /// ILLEGAL_ADDRESS audit, 3: no page is unmapped while the RAM tier's copy reads it. The copy
 /// is held mid-way while a bind needs the page's bytes: the bind waits for the copy, then
-/// evicts; the unmap comes after the copy.
+/// evicts; the unmap comes after the copy. Linux: the RAM tier's files are Linux's (elsewhere
+/// no save is made).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_page_being_saved_is_unmapped_only_after_its_copy() {
     let dir = tempfile::tempdir().unwrap();
@@ -1305,6 +1326,8 @@ fn a_page_being_saved_is_unmapped_only_after_its_copy() {
 
 /// An unknown copy completion deliberately retains owners until process exit. Run each
 /// case in its own process, so its quarantined tier reservation cannot affect other tests.
+/// Linux: the RAM tier's files are Linux's (elsewhere no save is made).
+#[cfg(target_os = "linux")]
 #[test]
 fn failed_saves_release_memory_only_after_the_save_stream_drains() {
     for drained in [true, false] {
@@ -1322,6 +1345,7 @@ fn failed_saves_release_memory_only_after_the_save_stream_drains() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "subprocess entry for failed_saves_release_memory_only_after_the_save_stream_drains"]
 fn failed_save_child() {
@@ -1386,6 +1410,7 @@ fn failed_save_child() {
 
 /// A previous unload can still be waiting for custody when an independent bind starts.
 /// Preparation waits outside the state lock; allocator recovery refuses without waiting.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
     let dir = tempfile::tempdir().unwrap();
@@ -1416,6 +1441,7 @@ fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
     binder.join().unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn failed_renewal_completion_keeps_the_old_mapping_alive() {
     for mode in ["finish", "unmap", "destroy"] {
@@ -1426,6 +1452,7 @@ fn failed_renewal_completion_keeps_the_old_mapping_alive() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "subprocess entry for failed_renewal_completion_keeps_the_old_mapping_alive"]
 fn failed_renewal_child() {
@@ -1576,6 +1603,7 @@ fn an_unmeasured_pass_takes_idle_kept_pages_before_it_runs() {
 /// pages (unpinned, no release pending), each contiguous run of a set in one call; a page in use
 /// stays due (Stats' keep_pending) and is kept at its first idle moment; a bind that meets a
 /// protect in flight gets its pin only after it.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     let dir = tempfile::tempdir().unwrap();
@@ -1666,6 +1694,7 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
 /// takes the idle pages before it runs, with custody's handles and its own unmaps gone, so its
 /// activation fits at once; the next run's measured pass makes its room before it runs too.
 /// Neither meets an OOM.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_pass_on_a_card_full_of_idle_kept_pages_has_its_room_before_it_runs() {
     let dir = tempfile::tempdir().unwrap();
@@ -1700,6 +1729,7 @@ fn a_pass_on_a_card_full_of_idle_kept_pages_has_its_room_before_it_runs() {
 /// pass runs (torch allocates outside the mechanism's order, and the allocator callback cannot
 /// wait). The idle kept pages an unmeasured pass takes are free once custody lets them go and
 /// their unmaps are done: both are held here, and the pass returns only after them.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_pass_returns_only_once_the_room_it_made_is_free() {
     let dir = tempfile::tempdir().unwrap();
@@ -1749,6 +1779,7 @@ fn a_pass_returns_only_once_the_room_it_made_is_free() {
 /// pass made only its measured room, the activation outgrew it, and each OOM answers Retry with
 /// the idle pages; a retry the driver still refuses (its slack, as e199's refused a claim of
 /// exactly 1 GiB with 1.19 MiB more reported free) evicts more, and fits.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
     let dir = tempfile::tempdir().unwrap();
