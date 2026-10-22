@@ -1161,7 +1161,7 @@ async fn untagged_immutable_commit_keeps_constraints_when_indexed_selection_is_u
     let mut repo=format::Repo::new("acme/model");
     repo.tags.push(format::Tag{name:"1.0".into(),commit:tagged.clone(),public:true,yanked:false});
     let path=origin.join(repo.key());fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,repo.to_json().unwrap()).unwrap();
-    let http=Http::new(origin);
+    let http=Http::new(origin.clone());
     let mut cfg=config(&scratch.0.join("client"),&http.url);cfg.token=None;
     let client=Client::new(cfg).unwrap();
     let reference=format!("acme/model@{}",untagged.id());
@@ -1173,6 +1173,17 @@ async fn untagged_immutable_commit_keeps_constraints_when_indexed_selection_is_u
     let cpu=client.open(&reference,&Open{gpus:Some(vec![]),bits:Some(16),..Default::default()}).await.unwrap();
     assert_eq!(cpu.tree(),Some(&untagged));assert_eq!(cpu.id(),&plain);
     assert_ne!(cpu.tree(),Some(&tagged),"a missing index entry never selects the tagged default");
+    // A run token may read a retained commit while the repo's tag document is invisible.
+    fs::remove_file(origin.join(repo.key())).unwrap();
+    let mut hidden_cfg=config(&scratch.0.join("hidden-client"),&http.url);hidden_cfg.token=None;
+    let hidden=Client::new(hidden_cfg).unwrap();
+    let selected=hidden.open(&reference,&options).await.unwrap();
+    assert_eq!(selected.tree(),Some(&untagged));assert_eq!(selected.id(),&encoded);
+    let before=http.requests.lock().unwrap().len();
+    let cached=hidden.open(&reference,&Open{gpus:Some(vec![]),bits:Some(16),local_files_only:true,..Default::default()}).await.unwrap();
+    assert_eq!(cached.id(),&plain);
+    assert_eq!(http.requests.lock().unwrap().len(),before,"a cached untagged commit and its headers open offline without network");
+
     // No tensor chunks exist, and selection issued no request for one.
     for (_,path,_) in http.requests.lock().unwrap().iter().filter(|(_,p,_)|p.starts_with("/blobs/")) {
         assert!([&plain,&encoded,&untagged,&tagged].iter().any(|object|path.ends_with(&object.sha256)),"payload requested: {path}");
