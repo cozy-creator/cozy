@@ -1,15 +1,13 @@
-//! The host asks for memory back (MEM/HOST-PRESSURE.md). One thread blocks in poll() with no
-//! timeout on what the kernel lets this process watch: a PSI trigger (`shared`: the system's
-//! `some` stall, anyone's; `dedicated`: this cgroup's `full`, else the system's) and inotify on
-//! `memory.events` of every limited cgroup v2 on its path, whose counters change as a limit is
-//! reached (containers deny PSI triggers, not inotify). Cgroup v1 has neither: system `some` wakes
-//! the watcher and only a rise of a limited cgroup's `memory.failcnt` counts. A wakeup only says
-//! "look": rungs go back while the live budget is below what must stay free (each live call's
-//! measured growth still to come, and [`Growth`]), so benign reclaim at a limit, which a pod
-//! counts 100k times, gives nothing back.
-use super::host_memory::HostMemory;
+//! The host asks for memory back (MEM/HOST-PRESSURE.md). A PSI trigger wakes one thread blocked
+//! in poll() with no timeout: in `shared` mode on the whole system's memory pressure (anyone
+//! stalled, the owner's apps included), in `dedicated` mode on this cgroup's (every task of it
+//! stalled). Cgroup v1 has no per-cgroup PSI: system `some` wakes the watcher, but only
+//! this cgroup's limit-hit counters may request reclaim, including limits on its parents.
+//! Each event gives one rung back while each rung lowers the pressure; one that did not
+//! stops it, since that stall is not ours to fix (page-cache refaults on a slow disk), until the
+//! stall rises above where it stopped (`Feedback`).
 use serde::Deserialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How the machine shares its host (`host.mode` in the GPU config): a guest on someone's
 /// computer (the default), or the whole of a rented pod (its image or grant says so).
@@ -26,61 +24,121 @@ pub enum HostMode {
 /// "something stalled on memory in the last window".
 pub const WINDOW: Duration = Duration::from_secs(2);
 
-/// The most non-reclaimable bytes, shared memory aside, grew between two consecutive looks: what
-/// can arrive before the watcher answers, so it stays free. Shared memory is the host tier itself
-/// (sealed layouts), whose fill is admitted, never answered. A high-water; a look against
-/// another bound (the tightest limit changed) starts over from it.
-#[derive(Debug, Default)]
-pub struct Growth {
-    last: Option<HostMemory>,
-    most: u64,
+/// Different kernel counters, never synthetic stall microseconds. V1's memory.failcnt
+/// counts charges that reached a limit and triggered reclaim, not just failed allocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sample {
+    StalledUs(u64),
+    LimitHits(u64),
 }
 
-impl Growth {
-    pub fn observe(&mut self, host: HostMemory) -> u64 {
-        if host.available < 0 || host.bound <= 0 {
-            return self.most;
+impl Sample {
+    pub fn total(self) -> u64 {
+        match self {
+            Self::StalledUs(total) | Self::LimitHits(total) => total,
         }
-        if let Some(last) = self.last.filter(|last| last.bound == host.bound) {
-            let grew = (last.available - host.available) - (host.shmem - last.shmem);
-            self.most = self.most.max(grew.max(0) as u64);
+    }
+    pub fn stalled_us(self) -> Option<u64> {
+        match self {
+            Self::StalledUs(total) => Some(total),
+            _ => None,
         }
-        self.last = Some(host);
-        self.most
     }
-
-    pub fn most(&self) -> u64 {
-        self.most
-    }
-}
-
-/// What shared mode leaves the host's other programs beyond their use now: the most they used
-/// recently. Raised to their use at every reading and every stall; each bring-back pass that
-/// found no stall since the previous one halves the excess, so a spike that caused no pressure
-/// (a compile, a browser burst) holds warming back for a few calls, not until a restart.
-/// Measured, never a constant. Dedicated mode leaves nothing.
-#[derive(Debug, Default)]
-pub struct Reserve {
-    peak: u64,
-}
-
-impl Reserve {
-    /// The other programs use `others` bytes now: the bytes discretionary holdings must leave.
-    pub fn observe(&mut self, others: u64) -> u64 {
-        self.peak = self.peak.max(others);
-        self.peak - others
-    }
-
-    /// A bring-back pass with no stall since the last one: the excess halves.
-    pub fn quiet(&mut self, others: u64) {
-        self.peak = others.max(self.peak - self.peak.saturating_sub(others) / 2);
+    pub fn limit_hits(self) -> Option<u64> {
+        match self {
+            Self::LimitHits(total) => Some(total),
+            _ => None,
+        }
     }
 }
 
-/// Bytes the host's other programs use: everything in use but what the machine holds.
-pub fn others(host: &HostMemory, total: u64, ours: u64) -> Option<u64> {
-    let available = u64::try_from(host.mem_available).ok()?;
-    Some(total.saturating_sub(available).saturating_sub(ours))
+/// Whether the next event gives a rung back. Each event brings the pressure counter's rate:
+/// stalled time for PSI, limit hits for v1. After a rung, a rate lower than before by more than the noise
+/// says the rung helped, and another may go; one that is not stops giving, and the noise is then
+/// measured: the largest change between consecutive shares while nothing is given. Giving
+/// resumes only once the share rises above where it stopped by more than that noise. So a stall
+/// giving back cannot touch (page-cache refaults on a slow disk) sheds a rung or two, however
+/// long it lasts, while a hog's stall falls rung by rung and a rising one is answered. Nothing
+/// here is a constant: the window is the trigger's, the noise is measured. An event more than
+/// two windows after the last means a whole window passed without a stall: a new episode, in
+/// which a stall no higher than where giving stopped still gives nothing (background refault
+/// bursts would otherwise shed a rung each).
+#[derive(Debug)]
+pub struct Feedback {
+    total: u64,
+    at: Instant,
+    last: Option<f64>,
+    rung: Option<f64>,
+    stopped: Option<f64>,
+    noise: Option<f64>,
+}
+
+impl Feedback {
+    pub fn new(total: u64, at: Instant) -> Self {
+        Self {
+            total,
+            at,
+            last: None,
+            rung: None,
+            stopped: None,
+            noise: None,
+        }
+    }
+
+    pub fn give(&mut self, total: u64, at: Instant) -> bool {
+        let elapsed = at.saturating_duration_since(self.at);
+        let share = total.saturating_sub(self.total) as f64 / elapsed.as_micros().max(1) as f64;
+        (self.total, self.at) = (total, at);
+        if elapsed > 2 * WINDOW {
+            // a new episode; where giving stopped, and the noise, still hold
+            (self.last, self.rung) = (None, None);
+        }
+        let previous = self.last.replace(share);
+        if let Some(level) = self.stopped {
+            if self.noise.is_some_and(|noise| share > level + noise) {
+                (self.stopped, self.rung) = (None, Some(share));
+                return true;
+            }
+            if let Some(previous) = previous {
+                let change = (share - previous).abs();
+                self.noise = Some(self.noise.map_or(change, |noise| noise.max(change)));
+            }
+            return false;
+        }
+        let noise = self.noise.unwrap_or(0.0);
+        if self.rung.is_some_and(|before| share >= before - noise) {
+            self.stopped = Some(share);
+            return false;
+        }
+        self.rung = Some(share);
+        true
+    }
+
+    /// None is an unrelated host wakeup (or a reset v1 counter), not local pressure.
+    pub fn observe(&mut self, sample: Sample, at: Instant) -> Option<bool> {
+        if let Sample::LimitHits(total) = sample {
+            // A host PSI wakeup without another local limit hit is not this pod's
+            // pressure. Administrators may reset failcnt: start a fresh baseline.
+            if total < self.total {
+                *self = Self::new(total, at);
+                return None;
+            }
+            if total == self.total {
+                return None;
+            }
+        }
+        Some(self.give(sample.total(), at))
+    }
+
+    /// Nothing was left to give: wait for more pressure than now.
+    pub fn exhausted(&mut self) {
+        self.stopped = self.rung.take();
+    }
+
+    /// The share giving stopped at, for the record; None while it gives.
+    pub fn stopped_at(&self) -> Option<f64> {
+        self.stopped
+    }
 }
 
 #[cfg_attr(target_os = "linux", path = "host_pressure_linux.rs")]

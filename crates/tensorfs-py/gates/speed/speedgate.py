@@ -28,7 +28,7 @@ import torch
 from fastsafetensors import SafeTensorsFileLoader
 from fastsafetensors.frameworks import get_framework_op
 from safetensors import safe_open
-from tensorfs import raw, varena
+from tensorfs import raw
 
 # fastsafetensors dlopens libcudart.so; Torch wheels carry the versioned filename.
 _cudart = sorted(glob.glob(str(Path(torch.__file__).parent / ".." / "nvidia" / "**" / "libcudart.so*"), recursive=True))
@@ -65,20 +65,11 @@ def safetensors_key(component, key, role):
     return f"{component}/{key}#{role}"
 
 
-def copy_rows():
-    """Drain existing shared-engine observations; this does not initiate a probe."""
-    names = ("kind", "gpu", "bytes", "ns", "ceiling", "link", "busy_ns", "pin_ns", "staged", "cached")
-    return [{name: getattr(row, name) for name in names} for row in varena.copies()]
-
-
-def transfer_metrics(rows):
-    h2d = [row for row in rows if row["kind"] == "h2d"]
-    measured = bool(h2d) and all(row["ceiling"] > 0 and row["ns"] > 0 and row["link"] for row in h2d)
-    nbytes, ns = sum(row["bytes"] for row in h2d), sum(row["ns"] for row in h2d)
-    # Byte/ns is decimal GB/s. Aggregate each batch's measured wire-time denominator.
-    wire_ns = sum(row["bytes"] / row["ceiling"] for row in h2d) if measured else None
-    return {"records": rows, "h2d_gbps": nbytes / ns if ns else None,
-            "pinned_ceiling_ratio": wire_ns / ns if measured else None, "measured": measured}
+def measure_ceiling(path):
+    """TensorFS's ceiling for `path`'s volume and GPU 0 (`tensorfs.ceiling`), measured or kept this boot. The public
+    reads are no varena request, so no Stats records them: their rate against this ceiling is the measure."""
+    c = tensorfs.ceiling(0, path=path)
+    return {"disk_gbps": c.disk_gbps, "disk_direct": c.disk_direct, "h2d_gbps": c.h2d_gbps, "streams": c.streams}
 
 
 class Model:
@@ -226,12 +217,10 @@ class Model:
         torch.cuda.synchronize()
         return sum(array.numel() for array in arrays), opened, (arrays, cleanup)
 
-    def once(self, layout, window, collect=True):
-        copy_rows()
+    def once(self, layout, window):
         started = time.perf_counter()
         moved, opened, keep = self.public(window) if layout == "T64+rust" else self.safetensors(layout, window)
         seconds = time.perf_counter() - started
-        rows = copy_rows()
         expected = self.window_bytes if window else self.bytes
         if moved != expected:
             raise ValueError(f"{self.name}/{layout}: moved {moved} bytes, expected {expected}")
@@ -246,8 +235,7 @@ class Model:
             for owner in cleanup:
                 owner.close()
         torch.cuda.empty_cache()
-        return {"seconds": seconds, "bytes": moved, "open_seconds": opened,
-                "engine": transfer_metrics(rows) if collect and layout == "T64+rust" else None}
+        return {"seconds": seconds, "bytes": moved, "open_seconds": opened}
 
     def provenance(self):
         return {"source": self.spec, "header": self.header, "geometry_sha256": self.geometry,
@@ -256,7 +244,7 @@ class Model:
                 "part_sha256": self.part_hashes, "legacy_manifest": LANES[self.name]["legacy_manifest"]}
 
 
-def summary(results):
+def summary(results, ceiling):
     gate = {}
     for cell in CELLS:
         own = results.get(f"T64+rust {cell}", [])
@@ -273,14 +261,17 @@ def summary(results):
                       "safetensors_ms": round(1000 * baseline, 3), "margin": baseline / seconds - 1,
                       "rust_open_ms": 1000 * statistics.median(row["open_seconds"] for row in own),
                       "rust_read_ms": 1000 * statistics.median(row["seconds"] - row["open_seconds"] for row in own)}
-    warm = results.get("T64+rust full warm", [])
-    link_measured = len(warm) == REPS and all(row["engine"]["measured"] for row in warm)
-    ratios = [row["engine"]["pinned_ceiling_ratio"] for row in warm if row["engine"]["measured"]]
-    return {"cells": gate, "link_measured": link_measured,
-            "full_warm_pinned_ceiling_ratio_median": statistics.median(ratios) if ratios else None,
+    ratios = {}
+    for cell, limit in (("full warm", ceiling.get("h2d_gbps")), ("full cold", ceiling.get("disk_gbps"))):
+        rows = results.get(f"T64+rust {cell}", [])
+        rates = [row["bytes"] / row["seconds"] / 1e9 for row in rows if row["seconds"] > 0]
+        ratios[cell] = statistics.median(rates) / limit if len(rates) == REPS and limit else None
+    return {"cells": gate, "ceiling": ceiling, "ceiling_measured": bool(ceiling.get("h2d_gbps")),
+            "full_warm_h2d_ceiling_ratio_median": ratios["full warm"],
+            "full_cold_disk_ceiling_ratio_median": ratios["full cold"],
             "link_threshold": None, "parity_pass": all(cell["pass"] for cell in gate.values()),
             "r4_link_review_required": True,
-            "note": "F1 parity only. Link ratios need parent review; no numeric threshold is invented."}
+            "note": "F1 parity only. Ceiling ratios need parent review; no numeric threshold is invented."}
 
 
 def environment(cache_dir, work):
@@ -317,7 +308,7 @@ def main(args):
     cache_dir, work = Path(plan["cache_dir"]).expanduser(), Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
     out = {"format": "tensorfs.speed-proof/2", "sources": plan, "models": {},
-           "parity_pass": False, "link_measurements_complete": False,
+           "parity_pass": False, "ceiling_measured": False,
            "r4_link_review_required": True, "r4_lifecycle_review_required": True}
     # A failed or partial rerun must never leave an earlier successful result at this path.
     with open(args.result, "xb") as result:
@@ -339,8 +330,9 @@ def main(args):
     for model in models:
         if env["mem_available"] <= 1.3 * model.bytes + (512 << 20):
             raise ValueError(f"{model.name}: insufficient page-cache headroom for required full-warm cell")
-    # Public reads initialize the existing shared engine/probe outside every timed cell.
-    out["initialization"] = {model.name: model.once("T64+rust", True)["engine"] for model in models}
+    # Public reads initialize the shared engine, and the ceiling is measured, outside every timed cell.
+    out["initialization"] = {model.name: model.once("T64+rust", True)["seconds"] for model in models}
+    ceiling = measure_ceiling(work)
     for model in models:
         results = {}
         for rep in range(REPS):
@@ -352,20 +344,20 @@ def main(args):
                         if cold:
                             model.drop(layout)
                         else:
-                            model.once(layout, window, collect=False)
+                            model.once(layout, window)
                         row = model.once(layout, window)
                         cell = f"{layout} {scope} {'cold' if cold else 'warm'}"
                         results.setdefault(cell, []).append(row)
                         print(f"{model.name} rep{rep + 1} {cell}: {1000 * row['seconds']:.3f}ms {row['bytes']}B", flush=True)
                 model.drop(layout)
-        out["models"][model.name] = {**model.provenance(), "results": results, "gate": summary(results)}
+        out["models"][model.name] = {**model.provenance(), "results": results, "gate": summary(results, ceiling)}
         Path(args.result).write_bytes(canonical(out))
     out["parity_pass"] = all(row["gate"]["parity_pass"] for row in out["models"].values())
-    out["link_measurements_complete"] = all(row["gate"]["link_measured"] for row in out["models"].values())
+    out["ceiling_measured"] = all(row["gate"]["ceiling_measured"] for row in out["models"].values())
     Path(args.result).write_bytes(canonical(out))
     print(json.dumps({name: row["gate"] for name, row in out["models"].items()}, indent=2), flush=True)
     # Success supplies F1 parity and complete observations, never an R4 complete verdict.
-    return 0 if out["parity_pass"] and out["link_measurements_complete"] else 1
+    return 0 if out["parity_pass"] and out["ceiling_measured"] else 1
 
 
 if __name__ == "__main__":

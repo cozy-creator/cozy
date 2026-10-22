@@ -1448,6 +1448,7 @@ print(json.dumps({"identity": generation.identity}))
                             destination: String::new(),
                             actor: String::new(),
                             operation: String::new(),
+                            family: String::new(),
                             max_output_bytes: crate::output_capacity::DEFAULT_BYTES,
                             request_id: id.clone(),
                             construction: "fixture".into(),

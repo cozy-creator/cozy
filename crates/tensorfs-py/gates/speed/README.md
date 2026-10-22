@@ -33,10 +33,11 @@ also requires ending it and verifying it gone.
   Every cell must beat or tie its fastest measured control, from first open through completed transfer.
 - Cold requests `POSIX_FADV_DONTNEED` on payload files, retaining metadata caches; warm follows an untimed
   read. Windows stay SDXL `unet/up_blocks.1.` and Qwen `transformer/transformer_blocks.30.`.
-- Shared-engine initialization is outside the clock. Actual `varena.copies()` records bank bytes, ns,
-  measured pinned-H2D ceiling, PCIe link, busy/pin time and staged/cached bytes. The full-warm rate/ceiling
-  ratio is reported, with no invented numeric threshold; absent measurements do not qualify the gate.
-  `parity_pass` and exit zero establish F1 parity plus complete observations only; output retains
+- Shared-engine initialization and `tensorfs.ceiling(0, path=WORK)` (the volume's sequential and pinned-H2D
+  GB/s) are outside the clock. A public read is no varena request, so no varena `Stats` records it: the
+  full-warm rate over the H2D ceiling and the full-cold rate over the disk ceiling are reported, with no
+  invented numeric threshold; an unmeasured H2D ceiling does not qualify the gate.
+  `parity_pass` and exit zero establish F1 parity plus a measured ceiling only; output retains
   `r4_link_review_required` and `r4_lifecycle_review_required` for parent link/teardown receipt review.
 - Results record source header/part/geometry hashes, extension/script hashes, package versions, GPU UUID,
   driver and volume. Bank the exact wheel/cohort and rental receipts beside them. Decoding, model
