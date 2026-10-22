@@ -52,8 +52,9 @@ struct RunArgs {
     /// Use at most N GPUs for the run and its calls.
     #[arg(long, value_name = "N", value_parser = gpu_count)]
     gpus: Option<u32>,
-    /// precision lane: 16, 8 or 4 bits. Absent, 8 is preferred, in the encoding the GPUs run best,
-    /// else whatever works.
+    /// precision lane: 16, 8 or 4 bits, of the function's main model; its LoRAs and other
+    /// models take the default. Absent, 8 is preferred, in the encoding the GPUs run best, else
+    /// whatever works.
     #[arg(long, value_parser = ["16", "8", "4"])]
     lane: Option<String>,
     /// Pin an attention kernel for this run: everywhere, or at one `[slot/]component`.

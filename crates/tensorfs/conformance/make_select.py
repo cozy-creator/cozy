@@ -146,6 +146,8 @@ case("a variant holding nvfp4 is 4-bit, however many int8 bytes it holds", h3, [
 case("the default lane takes int8 over a smaller nvfp4 variant", h3, ["12.0"], "model.int8.cozytensors")
 case("four bits take the nvfp4 variant", h3, ["12.0"], "model.nvfp4.cozytensors", bits=4)
 case("the nvfp4 variant serves 4 bits before Blackwell, weight-only", h3, ["8.9"], "model.nvfp4.cozytensors", bits=4)
+case("a run's lane is its main model's: H3's 16-bit-only LoRA is asked nothing", {"lora.cozytensors": "bf16"}, ["12.0"],
+     "lora.cozytensors", ["precision 8: acme/model@1 has no int8 or fp8 lane for sm120; served bf16"])
 # A slot: its lane first, never narrower than min_bits unasked, encoded weights only when it takes them.
 case("a slot refusing encoded weights refuses a sole 8-bit variant", {"m.cozytensors": "int8"}, ["8.9"], None, plain=True,
      refused=none(8, "sm89", "m.cozytensors (int8) holds encoded int8.rowwise"))

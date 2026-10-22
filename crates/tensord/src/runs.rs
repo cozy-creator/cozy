@@ -71,7 +71,7 @@ pub struct Spec {
     pub models: Vec<domain::ModelChoice>,
     pub attention_kernel: String,
     pub gpus: u32,
-    /// The run's weight precision (16, 8 or 4); 0 lets the lane rule choose each slot's.
+    /// The main model's weight precision (16, 8 or 4); 0, and every other slot, the lane rule.
     pub bits: u32,
     /// The Hub the run reads, under its owner's newest bearer there when its request carried one.
     pub hub: Option<hub::Source>,
@@ -1162,6 +1162,7 @@ impl Runs {
         })?;
         let installed = self.service.engine.installation(actor, &context.installation)?
             .ok_or_else(|| refused("child_call_refused", "the caller's installation is gone"))?;
+        let caller = installed.package.clone();
         let installed = self.callee_view(installed, application)?;
         let callee_interface: Value = serde_json::from_slice(&installed.interface)
             .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
@@ -1190,8 +1191,9 @@ impl Runs {
             attention_kernel: context.attention_kernel,
             // The caller's count caps a child's group; the child's own declaration picks within it.
             gpus: context.gpus,
-            // One request has one precision: its children inherit it.
-            bits: context.bits,
+            // The asked lane follows the main model into the package's own children (long_form's
+            // segments); another package's model (qwen-image-2 for references) takes its default.
+            bits: if installed.package == caller { context.bits } else { 0 },
             hub: context.hub,
             providers: context.providers,
             tensorfs: context.tensorfs,
@@ -1909,7 +1911,9 @@ mod tests {
             ..Default::default()
         });
         let child = runs.child_spec("alice","7","callee:app","render",json!({}),vec![],"child",&[]).unwrap();
-        assert_eq!((child.gpus, child.bits), (2, 4), "a child inherits its caller's GPU cap and bits");
+        assert_eq!((child.gpus, child.bits), (2, 0), "a child inherits its caller's GPU cap; another package's model its own lane");
+        let own = runs.child_spec("alice","7","caller:app","render",json!({}),vec![],"own",&[]).unwrap();
+        assert_eq!(own.bits, 4, "the asked lane follows the main model into the package's own children");
         let chosen: Vec<_> = child.models.iter().map(|c| (c.parameter.as_str(), c.repository.as_str())).collect();
         assert_eq!(chosen, [("render.models.network", "second/chosen")],
             "a choice addressed to the callee's package reaches its declared slot, by that slot's path");

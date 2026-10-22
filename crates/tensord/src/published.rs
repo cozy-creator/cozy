@@ -1226,6 +1226,7 @@ impl Publisher {
             ))?;
         let degree = crate::gpu_service::group_degree(&slots, request.gpus, gpu.width());
         let gpus = gpu.gpus(degree);
+        let main = main_model(&slots);
         // One slot's grant, its Hub checkpoint and its warnings.
         let pick = |slot: &Value| -> Result<(ModelGrant, Option<Named>, Vec<String>), Failure> {
             let path = slot.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -1263,9 +1264,11 @@ impl Publisher {
             }
             let named = choose(choice, &path)?;
             let tolerances = precision::Slot::of(slot);
-            let bits = tolerances.bits(request.bits);
+            // The asked lane is the main model's; every other slot takes the no-flag rule.
+            let asked = if Some(slot) == main { request.bits } else { 0 };
+            let bits = tolerances.bits(asked);
             let ruled = named.lane.is_empty() && named.tree.is_none();
-            let constraints = tolerances.constraints(&gpus, request.bits);
+            let constraints = tolerances.constraints(&gpus, asked);
             let named = self.resolve(service, request.hub(&format!("the model for {path}"))?, named, &constraints, &request.catalog_revision)?;
             let model = format!("{}@{}", named.repository, named.release);
             let warnings = if ruled {
@@ -1316,8 +1319,8 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                // An adapter is selected for the run's GPUs, its bits a preference: no slot governs it.
-                let constraints = precision::Constraints { gpus: gpus.capabilities.clone(), prefer: (request.bits != 0).then_some(request.bits), ..Default::default() };
+                // An adapter is selected for the run's GPUs by the no-flag rule: `--lane` is the main model's.
+                let constraints = precision::Constraints { gpus: gpus.capabilities.clone(), ..Default::default() };
                 let resolve = |source: &hub::Source, named| self.resolve(service, source, named, &constraints, &request.catalog_revision);
                 apply_adapters(self, request.source.as_ref(), &resolve, choice, grant, &request.providers, job)?;
             }
@@ -1352,6 +1355,13 @@ impl Publisher {
             .map_err(io_failure)?;
         Ok((plan, warnings))
     }
+}
+
+/// A function's main model, the one a run's `--lane` filters (owner, 10-22): its first slot
+/// constructed up front, neither raw weights nor on demand. Its LoRAs and auxiliary models take
+/// the no-flag rule.
+fn main_model(slots: &[Value]) -> Option<&Value> {
+    slots.iter().find(|slot| crate::gpu_service::constructed(slot) && slot["on_demand"] != true)
 }
 
 /// Each checkpoint once.
@@ -3143,7 +3153,7 @@ pub(crate) mod tests {
 
     /// A compute slot takes its row's 8-bit lane and a `min_bits=4` decode slot `nvfp4`, only
     /// those lanes' checkpoints read; a warm run asks the Hub nothing; `--lane 16` is another
-    /// resolution.
+    /// resolution of the main model only.
     #[test]
     fn each_slot_takes_its_rows_lane_and_a_warm_run_asks_the_hub_nothing() {
         let slots = json!([
@@ -3157,7 +3167,7 @@ pub(crate) mod tests {
         let (lanes, _, asked) = hopper.run(0);
         assert_eq!((lanes, asked), (vec!["int8".to_string(), "nvfp4".into()], vec![]), "a warm run asks the Hub nothing");
         let (lanes, warnings, _) = hopper.run(16);
-        assert_eq!((lanes, warnings), (vec!["bf16".to_string(), "bf16".into()], vec![]));
+        assert_eq!((lanes, warnings), (vec!["bf16".to_string(), "nvfp4".into()], vec![]), "the lane is the main model's alone");
         let blackwell_ultra = Machine::new("acme/pkg", &[("10.3", 288 * GIB)], slots, &["bf16", "fp8", "int8", "nvfp4"]);
         assert_eq!(blackwell_ultra.run(0).0, ["fp8", "nvfp4"]);
     }
@@ -3171,7 +3181,7 @@ pub(crate) mod tests {
             {"path": "render.models.other", "class": "O", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
         let short = Machine::new("acme/pkg", &[("8.9", 64)], slots, &["int8", "nvfp4", "bf16"]);
         assert_eq!(short.run(0).0, ["int8", "int8"]);
-        assert_eq!(short.run(4).0, ["nvfp4", "nvfp4"], "asked 4 bits");
+        assert_eq!(short.run(4).0, ["nvfp4", "int8"], "asked 4 bits, for the main model alone");
     }
 
     /// Unasked, a release without the preferred lane serves the next with one warning, again on a
@@ -3207,6 +3217,35 @@ pub(crate) mod tests {
         assert_eq!(blackwell.run(0).0, ["int8"]);
         assert_eq!(blackwell.run(8).0, ["int8"], "asked 8 bits, as a run's children inherit them");
         assert_eq!(blackwell.run(4).0, ["nvfp4-int8"]);
+    }
+
+    /// `--lane` is the main model's alone (owner, 10-22): H3 turbo's DiT takes the asked lane and
+    /// its 16-bit-only LoRA slot the no-flag rule (runs 13781–13783 refused it); only the main
+    /// model lacking the lane is refused.
+    #[test]
+    fn an_asked_lane_is_the_main_models_alone() {
+        let slots = json!([
+            {"path": "render.models.base_model", "class": "B", "default": "model@1.0.0", "encoded_leaves": "accept"},
+            {"path": "render.models.turbo_lora", "class": "L", "default": "lora@1.0.0", "encoded_leaves": "accept"}]);
+        let blackwell = Machine::new("acme/pkg", &[("12.0", 24 * GIB)], slots, &["int8", "nvfp4-int8"]);
+        for (bits, lane, precision) in [(8, "int8", "int8"), (4, "nvfp4-int8", "nvfp4")] {
+            let plan = blackwell.attempt(bits, vec![]).unwrap_or_else(|e| panic!("{bits}: {e:?}")).plan.unwrap();
+            let served: Vec<_> = plan.slots.iter().map(|slot| (slot.binding.model_parameter_name.as_str(),
+                blackwell.lanes.get(&slot.binding.snapshot).map(String::as_str), slot.precision.as_str())).collect();
+            assert_eq!(served, [("base_model", Some(lane), precision), ("turbo_lora", None, "f32")], "{bits}");
+        }
+        let (code, message) = blackwell.attempt(16, vec![]).err().unwrap();
+        assert!(code == "model_resolution_failed" && message.contains("acme/model@1.0.0 has no variant that works"), "{message}");
+    }
+
+    /// A function's main model is its first slot constructed up front: Klein's drafter is on
+    /// demand, so its `model` is the main one; raw weights are never it.
+    #[test]
+    fn the_main_model_is_the_first_constructed_up_front() {
+        let klein = [json!({"path": "g.models.drafter", "on_demand": true}), json!({"path": "g.models.model"}),
+            json!({"path": "g.models.upsampler", "on_demand": true, "min_bits": 4, "phase": "decode"})];
+        assert_eq!(main_model(&klein).map(|slot| &slot["path"]), Some(&json!("g.models.model")));
+        assert_eq!(main_model(&[json!({"path": "c.models.source", "weights": true})]), None);
     }
 
     /// A mixed local set runs what every GPU in it runs: an Ampere and an Ada card share no fp8.
