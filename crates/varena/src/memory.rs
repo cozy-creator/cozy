@@ -4019,11 +4019,6 @@ impl Request {
         }
     }
 
-    /// Reclaim for a native allocator callback, without the state lock: only pages the state
-    /// offered (idle N or S, complete, never kept) are claimed from the stock, each unmapped
-    /// and destroyed by this thread with no state lock held; the state reconciles them at its
-    /// next lock. No Python or torch, peer RPC, mechanism queue or wait on device work; broader
-    /// reclaim is preparation's (design §1). Returns the bytes given back.
     /// Bytes the request could have now beside every W and P without evicting either (free,
     /// S, N and D pages, caches, the allocator's slack), as the last publication measured them:
     /// read without the state lock, for a capture's room before it captures (S4).
@@ -4031,6 +4026,11 @@ impl Request {
         self.inner.spare.load(Ordering::Acquire)
     }
 
+    /// Reclaim for a native allocator callback, without the state lock: only pages the state
+    /// offered (idle N or S, complete, never kept) are claimed from the stock, each unmapped
+    /// and destroyed by this thread with no state lock held; the state reconciles them at its
+    /// next lock. No Python or torch, peer RPC, mechanism queue or wait on device work; broader
+    /// reclaim is preparation's (design §1). Returns the bytes given back.
     pub fn reclaim_allocation(&self, need: u64) -> Result<u64> {
         self.inner.check_ownership()?;
         self.inner.reclaim_stock(need)

@@ -1778,11 +1778,11 @@ fn a_pass_returns_only_once_the_room_it_made_is_free() {
 /// An OOM in a measured pass on a card full of idle kept pages (native an_oom_in_a_pass): the
 /// pass made only its measured room, the activation outgrew it, and the OOM answers Retry with
 /// the idle pages. The driver refuses that retry too (its slack, as e199's refused a claim of
-/// exactly 1 GiB with 1.19 MiB more reported free): the allocation got no further, so the
-/// second OOM escalates (lead's ruling, v6 13592) and never retries again: here a park.
+/// exactly 1 GiB with 1.19 MiB more reported free); the second OOM frees more than the free
+/// bytes (progress, lead's ruling), and its retry fits.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_a_refused_retry_escalates() {
+fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("oomkept-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 24 * REGION_ALIGN };
@@ -1804,15 +1804,19 @@ fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_a_refused_retry_escalates
     let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
     let pins: Vec<varena::Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
     let activation = 8 * REGION_ALIGN;
-    assert!(!card.take(activation), "the activation outgrew the measured room");
-    let first = r.oom(Some(m), Some(activation), None, Torch::default());
-    assert!(matches!(first, Next::Retry), "idle kept pages answer Retry: {first:?}");
-    assert!(!card.take(activation), "the driver refuses the exact claim (its slack)");
-    let second = r.oom(Some(m), Some(activation), None, Torch::default());
-    assert!(matches!(second, Next::Park(_)), "no progress past the failure: an escalation, never another Retry: {second:?}");
-    drop((pins, pass));
+    let mut answers = vec![];
+    while !card.take(activation) {
+        let next = r.oom(Some(m), Some(activation), None, Torch::default());
+        assert!(matches!(next, Next::Retry), "idle kept pages answer Retry: {answers:?} then {next:?} ({} free)", card.free());
+        answers.push(next);
+        assert!(answers.len() <= 3, "the OOM ladder ends: {answers:?}");
+    }
+    assert!(answers.len() >= 2, "the activation outgrew the measured room, and the driver refused the first retry: {answers:?}");
+    pass.end(Measured { allocated_peak: activation, slack: 0, sites: vec![] }, Torch { allocated: activation, reserved: activation });
+    drop(pins);
+    card.give(activation);
     let stats = r.end();
-    assert!(stats.retries == 1 && stats.leftover == 0, "{stats:?}");
+    assert!(stats.retries >= 2 && stats.leftover == 0, "{stats:?}");
 }
 
 /// The kept-page handoff (native kept_pages_survive_a_holder_that_served, graph-core 577): pages
