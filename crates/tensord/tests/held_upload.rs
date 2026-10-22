@@ -7,6 +7,7 @@ use axum::{
 };
 use serde_json::json;
 use std::{
+    collections::BTreeMap,
     io,
     sync::{
         Arc, Mutex,
@@ -17,7 +18,7 @@ use std::{
 };
 use tensord::{
     api::domain,
-    journal::{Execution, State},
+    journal::{Execution, InputFile, State},
     objects::Objects,
     published::Publisher,
     runs::{Runs, Source as RunSource, Spec},
@@ -25,7 +26,7 @@ use tensord::{
 };
 use tensorfs::{
     fetch::{Client, Endpoint, SourcePolicy},
-    format::{Dtype, ObjectRef, Repo, Tree},
+    format::{Dtype, Header, ObjectRef, Repo, Tree},
     store::Store,
     writer::{Data, Source},
 };
@@ -68,6 +69,7 @@ impl Fixture {
             "README.md".into(),
             store.put_bytes(b"retained repo file").unwrap(),
         );
+        tree.files.insert("LICENSE".into(), store.put_bytes(b"retained license").unwrap());
         let tree = store.put_tree(&tree).unwrap();
         let tree_digest = tensorfs::sha256::digest(&store.read(&tree).unwrap()).to_vec();
         // The newest local name is deliberately different from the exact retained output.
@@ -119,7 +121,16 @@ impl Fixture {
     }
 
     fn pinned(&self, id: &str, endpoint: &str, variant: &str, digest: Vec<u8>) -> String {
-        let spec = Spec {
+        let choice = domain::ModelChoice {
+            parameter: "model".into(), repository: "local/derived".into(),
+            manifest: Some(domain::Ref { digest, length: 0 }), lane: variant.into(),
+            ..Default::default()
+        };
+        self.runs.submit("owner", id, self.spec(id, endpoint, choice)).unwrap().id
+    }
+
+    fn spec(&self, id: &str, endpoint: &str, choice: domain::ModelChoice) -> Spec {
+        Spec {
             warm: true,
             remove: false,
             set: None,
@@ -128,13 +139,7 @@ impl Fixture {
             entrypoint: String::new(),
             input: json!({}),
             inputs: vec![],
-            models: vec![domain::ModelChoice {
-                parameter: "model".into(),
-                repository: "local/derived".into(),
-                manifest: Some(domain::Ref { digest, length: 0 }),
-                lane: variant.into(),
-                ..Default::default()
-            }],
+            models: vec![choice],
             attention_kernel: String::new(),
             gpus: 0,
             bits: 0,
@@ -151,8 +156,33 @@ impl Fixture {
             application: String::new(),
             digest: id.into(),
             journaled: vec![],
-        };
-        self.runs.submit("owner", id, spec).unwrap().id
+        }
+    }
+
+    fn folder_spec(&self, id: &str, endpoint: &str, files: &BTreeMap<String, Vec<u8>>) -> Spec {
+        let mut entries = BTreeMap::new();
+        for (name, bytes) in files {
+            entries.insert(name.clone(), self.write_input(bytes));
+        }
+        let document = tensord::trees::document(&entries);
+        let object = self.write_input(&document);
+        let mut spec = self.spec(id, endpoint, domain::ModelChoice {
+            parameter: "model".into(), source: "input://model".into(), ..Default::default()
+        });
+        spec.inputs.push(InputFile {
+            input_id: "model".into(), digest: object.id(), length: object.length,
+            media_type: "application/vnd.cozy.tree-manifest".into(), order: 0,
+        });
+        spec
+    }
+
+    fn write_input(&self, bytes: &[u8]) -> ObjectRef {
+        let object = ObjectRef::of(bytes);
+        if let Some(upload) = self.runs.objects.upload("owner", &object.id(), object.length).unwrap() {
+            upload.write_at(0, bytes).unwrap();
+            self.runs.objects.settle(&upload).unwrap();
+        }
+        object
     }
 
     fn settled(&self, id: &str) -> Execution {
@@ -182,6 +212,7 @@ struct HttpState {
     entered: mpsc::Sender<()>,
     released: tokio::sync::watch::Sender<bool>,
     puts: Mutex<Vec<String>>,
+    gets: Mutex<Vec<String>>,
 }
 
 async fn answer(
@@ -197,6 +228,15 @@ async fn answer(
     );
     let key = uri.path().trim_start_matches('/');
     let is_ref = key.starts_with("refs/");
+    if method == Method::GET {
+        state.gets.lock().unwrap().push(key.to_owned());
+    }
+    if method == Method::HEAD && !is_ref {
+        return match std::fs::metadata(state.store.root().join(key)) {
+            Ok(meta) => ([("content-length", meta.len().to_string())], "").into_response(),
+            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     if method == Method::PUT {
         let mode = state.mode.load(Ordering::Acquire);
         if (mode == 1 && !is_ref) || (mode == 2 && is_ref) {
@@ -269,6 +309,7 @@ impl Http {
             entered,
             released: tokio::sync::watch::channel(false).0,
             puts: Mutex::new(vec![]),
+            gets: Mutex::new(vec![]),
         });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -323,6 +364,149 @@ impl Drop for Http {
         let _ = self.shutdown.take().unwrap().send(());
         self.thread.take().unwrap().join().unwrap();
     }
+}
+
+/// A metadata edit whose tensor payloads are deliberately absent from the machine. The input
+/// tree contains both variant headers, both repo files and only the new plan asset.
+fn thin(fixture: &Fixture, http: &Http, keep_remote_payload: bool) -> (BTreeMap<String, Vec<u8>>, Tree, Vec<ObjectRef>) {
+    let original = fixture.store.tree(&fixture.tree).unwrap();
+    let plan = br#"{"steps":[1,2]}"#.to_vec();
+    let asset = ObjectRef::of(&plan);
+    let mut files = BTreeMap::from([(format!("chunks/{}", asset.sha256), plan)]);
+    let mut expected = original.clone();
+    let mut chunks = Vec::new();
+    for (name, object) in &original.files {
+        let bytes = fixture.store.read(object).unwrap();
+        http.state.store.put(&bytes[..], Some(object)).unwrap();
+        if tensorfs::format::variant_of(name).is_none() {
+            files.insert(name.clone(), bytes);
+            continue;
+        }
+        let header = Header::from_cbor(&bytes).unwrap();
+        let mut components = header.components().to_vec();
+        components[0].assets.insert("timestep-plan.json".into(), asset.clone());
+        let edited = Header::new(header.chunks.clone(), header.pipeline().cloned(), components, header.metadata.clone()).unwrap();
+        let bytes = edited.to_cbor().unwrap();
+        expected.files.insert(name.clone(), ObjectRef::of(&bytes));
+        files.insert(name.clone(), bytes);
+        for chunk in &header.chunks {
+            if !chunks.contains(chunk) {
+                if keep_remote_payload {
+                    http.state.store.put(fixture.store.file(chunk).unwrap(), Some(chunk)).unwrap();
+                }
+                std::fs::remove_file(fixture.store.path(chunk).unwrap()).unwrap();
+                chunks.push(chunk.clone());
+            }
+        }
+    }
+    http.state.store.put_tree(&original).unwrap();
+    (files, expected, chunks)
+}
+
+#[test]
+fn a_thin_folder_preserves_every_variant_repo_file_and_tensor_without_weight_transit() {
+    let fixture = Fixture::new();
+    let http = Http::new(0);
+    let (files, expected, chunks) = thin(&fixture, &http, true);
+    http.state.store.update_ref("owner/retry", |old| {
+        let mut repo = tensorfs::fetch::with_tag(old, "owner/retry", "1.0.0", &fixture.tree);
+        repo.tag_mut("1.0.0").unwrap().public = true;
+        Some(repo)
+    }).unwrap();
+    let run = fixture.runs.submit("owner", "thin", fixture.folder_spec("thin", &http.origin, &files)).unwrap().id;
+    let result = fixture.settled(&run);
+    assert_eq!(result.state, State::Completed, "{:?}", result.failure);
+    let repo = Repo::from_json(&std::fs::read(http.state.store.root().join("refs/owner/retry.json")).unwrap()).unwrap();
+    assert_eq!(repo.tag("1.0.0").unwrap().commit, fixture.tree, "the original release is unchanged");
+    let uploaded = http.state.store.tree(&repo.tag("main").unwrap().commit).unwrap();
+    assert_eq!(uploaded, expected, "both variants, README and LICENSE preserve exact object identities");
+    for (variant, object) in uploaded.variants() {
+        let new = Header::from_cbor(&http.state.store.read(object).unwrap()).unwrap();
+        let old_tree = fixture.store.tree(&fixture.tree).unwrap();
+        let old = Header::from_cbor(&fixture.store.read(old_tree.variant(Some(variant)).unwrap().1).unwrap()).unwrap();
+        assert_eq!(new.chunks, old.chunks);
+        assert_eq!(new.pipeline(), old.pipeline());
+        assert_eq!(new.metadata, old.metadata);
+        for (new, old) in new.components().iter().zip(old.components()) {
+            assert_eq!(new.tensors, old.tensors);
+            assert_eq!(new.config, old.config);
+            assert_eq!(new.class, old.class);
+        }
+    }
+    for chunk in chunks {
+        assert!(fixture.store.file(&chunk).is_err(), "a tensor payload landed on the machine");
+        assert!(fixture.runs.objects.path("owner", &chunk.id()).unwrap().is_none(), "a tensor was staged as input");
+        assert!(!http.state.gets.lock().unwrap().contains(&chunk.key()), "a tensor was downloaded");
+        assert!(!http.state.puts.lock().unwrap().contains(&chunk.id()), "a tensor was uploaded");
+    }
+}
+
+#[test]
+fn a_thin_folder_missing_remote_payload_fails_before_the_tag_moves() {
+    let fixture = Fixture::new();
+    let http = Http::new(0);
+    let (files, _, _) = thin(&fixture, &http, false);
+    let run = fixture.runs.submit("owner", "missing-payload", fixture.folder_spec("missing-payload", &http.origin, &files)).unwrap().id;
+    let result = fixture.settled(&run);
+    assert_eq!(result.state, State::Failed);
+    assert!(!http.published());
+}
+
+#[test]
+fn a_folder_cannot_upload_unstaged_tensor_bytes_from_another_actors_shared_cache() {
+    let fixture = Fixture::new();
+    let http = Http::new(0);
+    let original = fixture.store.tree(&fixture.tree).unwrap();
+    // The attacker knows every hash, but staged only headers and repo files. The shared
+    // machine Store holds all tensor payloads; none were written into this actor's input CAS.
+    let files = original.files.iter().map(|(name, object)| {
+        (name.clone(), fixture.store.read(object).unwrap())
+    }).collect();
+    let victim = fixture.store.checkpoint(&fixture.header).unwrap().header().chunks[0].clone();
+    assert!(fixture.store.file(&victim).is_ok());
+    assert!(fixture.runs.objects.path("owner", &victim.id()).unwrap().is_none());
+    let run = fixture.runs.submit("owner", "unstaged-cached-payload", fixture.folder_spec("unstaged-cached-payload", &http.origin, &files)).unwrap().id;
+    let result = fixture.settled(&run);
+    assert_eq!(result.state, State::Failed);
+    assert!(!http.published());
+    assert!(!http.state.puts.lock().unwrap().contains(&victim.id()));
+    assert!(http.state.store.file(&victim).is_err(), "another actor's cached bytes escaped");
+    assert!(fixture.store.file(&victim).is_ok(), "shared cached bytes were modified");
+}
+
+#[test]
+fn a_folder_source_must_name_its_owned_retained_tree_input() {
+    let fixture = Fixture::new();
+    let http = Http::new(0);
+    let (files, _, _) = thin(&fixture, &http, true);
+    let mut spec = fixture.folder_spec("wrong-input", &http.origin, &files);
+    spec.models[0].source = "input://other".into();
+    assert_eq!(fixture.runs.submit("owner", "wrong-input", spec).unwrap_err().code, "model_folder_invalid");
+    let mut spec = fixture.folder_spec("local-alias", &http.origin, &files);
+    spec.weights_destination = "model://local/alias".into();
+    assert_eq!(fixture.runs.submit("owner", "local-alias", spec).unwrap_err().code, "model_folder_invalid");
+    for (id, bits, gpus) in [("folder-bits", 8, 0), ("folder-gpus", 0, 1)] {
+        let mut spec = fixture.folder_spec(id, &http.origin, &files);
+        spec.bits = bits;
+        spec.gpus = gpus;
+        assert_eq!(fixture.runs.submit("owner", id, spec).unwrap_err().code, "model_folder_invalid");
+    }
+    let spec = fixture.folder_spec("wrong-owner", &http.origin, &files);
+    assert_eq!(fixture.runs.submit("another-owner", "wrong-owner", spec).unwrap_err().code, "input_unwritten");
+    assert!(!http.published());
+}
+
+#[test]
+fn a_thin_folder_upload_keeps_the_warm_run_cancellation_gate() {
+    let fixture = Fixture::new();
+    let http = Http::new(1);
+    let (files, _, _) = thin(&fixture, &http, true);
+    let run = fixture.runs.submit("owner", "cancel-folder", fixture.folder_spec("cancel-folder", &http.origin, &files)).unwrap().id;
+    http.wait();
+    fixture.runs.service.engine.cancel(&run, "owner").unwrap();
+    http.release();
+    assert_eq!(fixture.settled(&run).state, State::Canceled);
+    assert!(!http.published());
 }
 
 #[test]

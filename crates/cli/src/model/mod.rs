@@ -104,7 +104,8 @@ pub(crate) struct Download {
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Upload {
-    /// A provider source, local/<alias>, a Hub model or checkpoint, or ./file.safetensors.
+    /// A provider source, local/<alias>, a Hub model or checkpoint, ./file.safetensors, or a
+    /// CozyTensors folder (all variants and repo files; its chunks may already be at the Hub).
     source: String,
     /// Where it goes: org/name[@tag], the Hub repository and the private tag the upload moves (main).
     destination: String,

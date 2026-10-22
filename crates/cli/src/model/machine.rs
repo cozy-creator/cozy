@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use protocol::calcifer::{Kind as RunKind, Run, StagedInput, Status, SubmitRun};
 use protocol::error::{Error, Kind};
 use protocol::ids::Digest;
-use protocol::machine::{ModelChoice, RunKind as SpecKind, RunSpec};
+use protocol::machine::{InputFile, ModelChoice, RunKind as SpecKind, RunSpec};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -21,6 +21,41 @@ use crate::run::Placement;
 
 fn usage(code: &str, message: impl Into<String>) -> Error {
     Error::new(Kind::Usage, code, message)
+}
+
+struct ModelInput {
+    choice: ModelChoice,
+    staged: Vec<StagedInput>,
+    files: Vec<InputFile>,
+}
+
+impl From<(ModelChoice, Option<StagedInput>)> for ModelInput {
+    fn from((choice, staged): (ModelChoice, Option<StagedInput>)) -> Self {
+        Self { choice, staged: staged.into_iter().collect(), files: vec![] }
+    }
+}
+
+/// A plain CozyTensors folder travels as an ordinary retained input tree. The machine admits
+/// its headers without importing or fetching the tensor objects a thin folder omits.
+fn folder(path: &Path, profiles: &[String], manifests: &Path, memo: &Path) -> Result<ModelInput, Error> {
+    if !profiles.is_empty() {
+        return Err(usage("model_profile_unused", "a CozyTensors folder is already converted; omit --source-profile"));
+    }
+    let staged = crate::run::tree::stage(path, Some(memo), manifests)?;
+    let input = InputFile {
+        field: "model".into(),
+        digest: staged.manifest.digest.to_string(),
+        length: staged.manifest.length,
+        media_type: crate::run::tree::MEDIA.into(),
+        order: 0,
+    };
+    let mut files = staged.files;
+    files.push(staged.manifest);
+    Ok(ModelInput {
+        choice: ModelChoice { parameter: "model".into(), source: "input://model".into(), ..Default::default() },
+        staged: files,
+        files: vec![input],
+    })
 }
 
 /// The model a warm run makes present: a reference, or a local `.safetensors` file.
@@ -86,14 +121,15 @@ async fn warm(
     placement: &Placement,
     detach: bool,
     target: String,
-    (choice, staged): (ModelChoice, Option<StagedInput>),
+    input: ModelInput,
     destination: String,
     bits: u32,
 ) -> Result<ExitCode, Error> {
     let spec = RunSpec {
         kind: SpecKind::Warm,
         bits,
-        models: vec![choice],
+        models: vec![input.choice],
+        inputs: input.files,
         weights_destination: destination,
         ..Default::default()
     };
@@ -104,7 +140,7 @@ async fn warm(
         kind: RunKind::Warm,
         target,
         spec,
-        inputs: staged.into_iter().collect(),
+        inputs: input.staged,
         out: None,
         warnings: vec![],
     };
@@ -155,17 +191,22 @@ pub(crate) async fn download(ctx: &Context, args: Download) -> Result<ExitCode, 
     if made.1.is_some() && destination.is_empty() {
         return Err(usage("model_alias_missing", "a local file is kept under a name: add local/<name>"));
     }
-    warm(ctx, &args.placement, args.detach, args.model.clone(), made, destination, args.bits.as_deref().map_or(0, |b| b.parse().expect("clap checked bits"))).await
+    warm(ctx, &args.placement, args.detach, args.model.clone(), made.into(), destination, args.bits.as_deref().map_or(0, |b| b.parse().expect("clap checked bits"))).await
 }
 
 pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Error> {
     let destination = refs::destination(&args.destination)?;
-    let made = source(&args.source, &args.profiles)?;
     if !ctx.signed_in(&ctx.hub()?) {
         // The machine publishes under this computer's sign-in; refuse before anything is made.
         return Err(Error::new(Kind::Credential, "not_logged_in", "an upload publishes as your account: sign in first")
             .next(ctx.login(&ctx.hub()?)));
     }
+    let path = Path::new(&args.source);
+    let made = if (args.source.starts_with('.') || path.is_absolute()) && path.is_dir() {
+        folder(path, &args.profiles, &ctx.home.root().join("cache/trees"), &ctx.home.root().join("cache/digests"))?
+    } else {
+        source(&args.source, &args.profiles)?.into()
+    };
     let target = format!("{} → {destination}", args.source);
     warm(ctx, &args.placement, args.detach, target, made, destination, 0).await
 }
@@ -238,6 +279,30 @@ pub(crate) async fn list(ctx: &Context, args: List) -> Result<ExitCode, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_is_one_retained_tree_input_with_every_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("model");
+        std::fs::create_dir_all(root.join("chunks")).unwrap();
+        for (name, bytes) in [("README.md", b"readme".as_slice()), ("LICENSE", b"license"),
+            ("model.bf16.cozytensors", b"header1"), ("model.int8.cozytensors", b"header2"),
+            ("chunks/plan", b"plan")]
+        {
+            std::fs::write(root.join(name), bytes).unwrap();
+        }
+        let input = folder(&root, &[], &dir.path().join("manifests"), &dir.path().join("digests")).unwrap();
+        assert_eq!(input.choice.source, "input://model");
+        assert_eq!(input.files.len(), 1);
+        assert_eq!(input.files[0].media_type, crate::run::tree::MEDIA);
+        assert_eq!(input.staged.len(), 6, "all five files and their immutable manifest");
+        let manifest = input.staged.last().unwrap();
+        assert_eq!(input.files[0].digest, manifest.digest.to_string());
+        let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest.path).unwrap()).unwrap();
+        let names: Vec<_> = document["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
+        assert_eq!(names, ["LICENSE", "README.md", "chunks/plan", "model.bf16.cozytensors", "model.int8.cozytensors"]);
+        assert!(folder(&root, &["convert/1".into()], &dir.path().join("manifests"), &dir.path().join("digests")).is_err());
+    }
 
     #[test]
     fn a_local_file_is_named_by_its_content_and_an_escaped_name() {
