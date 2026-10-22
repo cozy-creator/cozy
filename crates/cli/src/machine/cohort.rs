@@ -50,7 +50,7 @@ pub(super) fn require_binary(
         Kind::Conflict,
         "memory_protocol_incompatible",
         format!("{name} runs cozy {version}; Runtime >=0.31 or TensorFS >=0.14 requires cozy >=0.12 and both SDKs in the same upgrade"),
-    ).next(format!("run `cozy update` on {name}'s host using cozy >=0.11.4, or stage --tensord with both SDK wheels in one `cozy machine update`")))
+    ).next(format!("run `cozy update` on {name}'s host using cozy >=0.11.5, or stage --tensord with both SDK wheels in one `cozy machine update`")))
 }
 
 /// Before replacing the CLI, a stopped machine with a selected old SDK must first run the
@@ -84,7 +84,7 @@ pub(super) fn stopped_selection(version: &str, root: &std::path::Path, stopped: 
     if pair().is_some_and(|(r, t)| compatible(&r, &t)) { return Ok(()); }
     Err(Error::new(Kind::Conflict, "memory_protocol_incompatible",
         format!("the stopped local machine has an old or unreadable SDK selection at {}; cozy {version} cannot activate its replacement while the machine is stopped", selected.display()))
-        .next("with cozy 0.11.4, run `cozy machine enable`, then retry `cozy update`; this refusal leaves the binary and stopped machine unchanged"))
+        .next("with cozy 0.11.5, run `cozy machine enable`, then retry `cozy update`; this refusal leaves the binary and stopped machine unchanged"))
 }
 
 #[cfg(test)]

@@ -63,7 +63,7 @@ impl Pair {
             && band(&self.tensorfs).is_some_and(|v| v >= (0, 14))
         { return Ok(()); }
         Err(io::Error::other(Coded { code: "memory_protocol_incompatible", message: format!(
-            "this TensorD requires Runtime >=0.31.0 and TensorFS >=0.14.0 together; selected Runtime {:?}, TensorFS {:?}. Upgrade through cozy 0.11.4 before cozy 0.12, or stage the binary and both SDK wheels in one machine update",
+            "this TensorD requires Runtime >=0.31.0 and TensorFS >=0.14.0 together; selected Runtime {:?}, TensorFS {:?}. Upgrade through cozy 0.11.5 before cozy 0.12, or stage the binary and both SDK wheels in one machine update",
             self.runtime, self.tensorfs,
         ) }))
     }
@@ -1079,15 +1079,16 @@ impl Updates {
         }
         let machine = self.machine.as_ref().ok_or_else(|| invalid("this machine fetches no published wheels"))?;
         let stop = self.stop.lock().unwrap().clone();
-        super::pypi::wheel(distribution, &choice.version, &self.paths.update("downloads"), machine, &stop)
+        super::pypi::wheel(distribution, &choice.version, &self.paths.uv, &self.paths.update("downloads"), machine, &stop)
     }
 }
 
 /// Resolve SDK requirements using the same uv path as an explicit machine update.
-fn compile_sdk(uv: &Path, input: &str, stop: &Stop, wheel_plan: bool) -> io::Result<Result<String, String>> {
+pub(super) fn compile_sdk(uv: &Path, input: &str, stop: &Stop, wheel_plan: bool) -> io::Result<Result<String, String>> {
     super::client::ensure_uv(uv)?;
     let mut command = std::process::Command::new(uv);
-    if wheel_plan { command.args(["pip", "compile", "--format", "pylock.toml", "--only-binary", ":all:"]); }
+    if wheel_plan { command.args(["pip", "compile", "--format", "pylock.toml", "--only-binary", ":all:", "--default-index", "https://pypi.org/simple"]); }
+
     else { command.args(["pip", "compile"]); }
     let mut child = platform::process::own_group(&mut command)
         .args(["--quiet", "--no-config", "--no-cache", "--no-header", "--no-annotate", "--python", "3.12", "-"])
@@ -1346,7 +1347,7 @@ mod tests {
         wheel(&paths.image_wheels, "cozy_runtime", "0.30.3", None);
         wheel(&paths.image_wheels, "tensorfs", "0.13.3", None);
         let error = check_startup_pair(&paths).unwrap_err();
-        assert!(error.to_string().contains("cozy 0.11.4"));
+        assert!(error.to_string().contains("cozy 0.11.5"));
         let next = root.path().join("next");
         fs::create_dir_all(&next).unwrap();
         wheel(&next, "cozy_runtime", "0.31.1", None);

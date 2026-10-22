@@ -204,17 +204,36 @@ impl Fetcher {
         want: &Want<'_>,
     ) -> Result<Pulled> {
         let repo = origin.repo_of(name).await?;
-        // Only a header digest reads trees to resolve; the chosen one is then local.
+        // A header digest may read trees to resolve. Keep the selected tree's first source:
+        // rereading it from the store must not relabel bytes just fetched from the origin.
         let quiet = Want { priority: want.priority, ..Want::default() };
+        let mut resolved_tree = None;
         let (tag, cited) = resolve(&repo, revision, async |commit: &ObjectRef| {
-            self.objects(origin, std::slice::from_ref(commit), &quiet).await?;
-            Tree::from_json(&self.read(commit).await?).map_err(|e| invalid(commit, e))
+            let landed = self.objects(origin, std::slice::from_ref(commit), &quiet).await?;
+            let parsed = Tree::from_json(&self.read(commit).await?).map_err(|e| invalid(commit, e))?;
+            resolved_tree = Some((parsed.clone(), landed));
+            Ok::<_, Refusal>(parsed)
         })
         .await?;
-        self.objects(origin, std::slice::from_ref(&tag.commit), &quiet).await?;
-        let tree = Tree::from_json(&self.read(&tag.commit).await?).map_err(|e| invalid(&tag.commit,e))?;
+        let (tree, landed) = match resolved_tree {
+            Some(found) => {
+                // Resolution stops at the matching tree. Its quiet read has not yet
+                // advanced the selected closure's progress.
+                if let Some(progress) = want.progress {
+                    progress.total.fetch_add(tag.commit.length, Ordering::Relaxed);
+                    progress.held.fetch_add(tag.commit.length, Ordering::Relaxed);
+                }
+                found
+            }
+            None => {
+                let landed = self.objects(origin, std::slice::from_ref(&tag.commit), want).await?;
+                let tree = Tree::from_json(&self.read(&tag.commit).await?)
+                    .map_err(|e| invalid(&tag.commit, e))?;
+                (tree, landed)
+            }
+        };
         let variant = pick_variant(&tree, revision, cited, variant)?;
-        self.pull_tree(origin, &tag.commit, variant.as_deref(), want).await
+        self.pull_parsed_tree(origin, &tag.commit, &tree, variant.as_deref(), want, landed).await
     }
 
     /// The tree `tree`: its repo files, and its `variant` (its only one when `None`) with the
@@ -226,9 +245,21 @@ impl Fetcher {
         variant: Option<&str>,
         want: &Want<'_>,
     ) -> Result<Pulled> {
-        let mut landed = self.objects(origin, std::slice::from_ref(tree), want).await?;
+        let landed = self.objects(origin, std::slice::from_ref(tree), want).await?;
         let parsed = Tree::from_json(&self.read(tree).await?).map_err(|e| invalid(tree, e))?;
-        let (variant, header) = variant_of_tree(&parsed, variant)?;
+        self.pull_parsed_tree(origin, tree, &parsed, variant, want, landed).await
+    }
+
+    async fn pull_parsed_tree(
+        &self,
+        origin: &Arc<dyn Origin>,
+        tree: &ObjectRef,
+        parsed: &Tree,
+        variant: Option<&str>,
+        want: &Want<'_>,
+        mut landed: Landed,
+    ) -> Result<Pulled> {
+        let (variant, header) = variant_of_tree(parsed, variant)?;
         let files: Vec<ObjectRef> = parsed.repo_files().map(|(_, r)| r.clone()).collect();
         landed.join(self.objects(origin, &files, want).await?);
         let mut pulled = self.pull_header(origin, &header, want).await?;

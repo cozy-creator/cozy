@@ -20,56 +20,57 @@ use crate::{
     stop::Stop,
 };
 
-const MAX_INDEX_BYTES: usize = 32 << 20;
 const MAX_REDIRECTS: usize = 8;
 
-pub fn wheel(distribution: &str, version: &str, dir: &Path, machine: &Machine, stop: &Stop) -> io::Result<PathBuf> {
+pub fn wheel(distribution: &str, version: &str, uv: &Path, dir: &Path, machine: &Machine, stop: &Stop) -> io::Result<PathBuf> {
     let project = distribution.replace('_', "-");
-    let index = format!("https://pypi.org/pypi/{project}/{version}/json");
-    let http = client(None)?;
-    let raw = machine
-        .block(stop, async move {
-            let answer = http.get(&index).send().await.map_err(weather)?;
-            if !answer.status().is_success() {
-                return refuse(Code::REF_NOT_FOUND, format!("HTTP {}", answer.status()));
-            }
-            let raw = answer.bytes().await.map_err(weather)?;
-            match raw.len() <= MAX_INDEX_BYTES {
-                true => Ok(raw.to_vec()),
-                false => refuse(Code::SIZE_CAP, "the index answer is too large"),
-            }
-        })
-        .map_err(|e| io::Error::other(format!("PyPI {project} {version}: {e}")))?;
-    #[derive(serde::Deserialize)]
-    struct File {
-        filename: String,
-        url: String,
-        size: u64,
-        digests: Digests,
+    if version.is_empty() || !version.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-+!".contains(&c)) {
+        return Err(io::Error::other("a published wheel requires a concrete version"));
     }
-    #[derive(serde::Deserialize)]
-    struct Digests {
-        sha256: String,
+    let input = format!("{project}=={version}\n");
+    let plan = super::update::compile_sdk(uv, &input, stop, true)?
+        .map_err(|why| io::Error::other(format!("PyPI {project} {version}: {why}")))?;
+    let wheel = selected(&plan, &project, version)?;
+    wheel_at(&wheel.url, &wheel.hashes.sha256, &wheel.filename()?, dir, machine, stop)
+}
+
+#[derive(serde::Deserialize)]
+struct Artifact {
+    url: String,
+    hashes: Hashes,
+}
+#[derive(serde::Deserialize)]
+struct Hashes { sha256: String }
+
+impl Artifact {
+    fn filename(&self) -> io::Result<String> {
+        let name = self.url.rsplit('/').next().unwrap_or_default();
+        if !self.url.starts_with("https://") || !name.ends_with(".whl")
+            || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-+".contains(&c))
+            || self.hashes.sha256.len() != 64 || !self.hashes.sha256.bytes().all(|c| c.is_ascii_hexdigit())
+        { return Err(io::Error::other("the resolver returned no verified wheel URL")); }
+        Ok(name.into())
     }
+}
+
+/// uv resolves for the executor's Python and this machine's platform, returning one wheel.
+/// Filename order and a matching architecture alone cannot establish Python ABI compatibility.
+fn selected(plan: &str, distribution: &str, version: &str) -> io::Result<Artifact> {
     #[derive(serde::Deserialize)]
-    struct Release {
-        urls: Vec<File>,
+    struct Package { name: String, version: String, #[serde(default)] wheels: Vec<Artifact> }
+    #[derive(serde::Deserialize)]
+    struct Plan { packages: Vec<Package> }
+    let parsed: Plan = toml::from_str(plan).map_err(io::Error::other)?;
+    let mut packages = parsed.packages.into_iter().filter(|p| p.name.replace('_', "-") == distribution);
+    let package = packages.next().ok_or_else(|| io::Error::other("the resolver omitted the requested wheel"))?;
+    if packages.next().is_some() || package.version != version || package.wheels.len() != 1 {
+        return Err(io::Error::other("the resolver returned ambiguous or different SDK wheels"));
     }
-    let release: Release = serde_json::from_slice(&raw).map_err(io::Error::other)?;
-    let arch = std::env::consts::ARCH;
-    let file = release
-        .urls
-        .into_iter()
-        .find(|f| {
-            f.filename.ends_with(".whl")
-                && f.filename.contains("manylinux")
-                && f.filename.contains(arch)
-                && !f.filename.contains('/')
-        })
-        .ok_or_else(|| io::Error::other(format!("PyPI has no linux {arch} wheel of {project} {version}")))?;
-    let object = ObjectRef { sha256: file.digests.sha256.to_lowercase(), length: file.size };
-    let blob = fetch(machine, &file.url, &object, None, stop).map_err(|e| io::Error::other(format!("{}: {e}", file.filename)))?;
-    land(&blob, dir, &file.filename)
+    let wheel = package.wheels.into_iter().next().ok_or_else(|| io::Error::other("no host wheel"))?;
+    if !wheel.filename()?.starts_with(&format!("{}-{version}-", distribution.replace('-', "_"))) {
+        return Err(io::Error::other("the selected filename differs from its package/version"));
+    }
+    Ok(wheel)
 }
 
 /// Wheel `file` at an https `url` on any host, redirects followed: its bytes are held to
@@ -162,4 +163,39 @@ fn land(blob: &Path, dir: &Path, file: &str) -> io::Result<PathBuf> {
     let _ = fs::remove_file(&path);
     fs::hard_link(blob, &path).or_else(|_| fs::copy(blob, &path).map(drop))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_plan_must_identify_one_exact_wheel() {
+        let plan = format!(r#"
+[[packages]]
+name = "tensorfs"
+version = "0.13.5"
+wheels = [{{url = "https://files.pythonhosted.org/tensorfs-0.13.5-cp311-abi3-manylinux_2_17_x86_64.whl", hashes = {{sha256 = "{}"}}}}]
+"#, "1".repeat(64));
+        assert!(selected(&plan, "tensorfs", "0.13.5").unwrap().filename().unwrap().contains("cp311-abi3"));
+        assert!(selected(&plan, "tensorfs", "0.13.4").is_err());
+        assert!(selected(&format!("{plan}\n{plan}"), "tensorfs", "0.13.5").is_err());
+        assert!(selected(&plan.replace("tensorfs-0.13.5", "tensorfs-0.13.4"), "tensorfs", "0.13.5").is_err());
+        assert!(selected(&plan.replace(&"1".repeat(64), "invalid"), "tensorfs", "0.13.5").is_err());
+    }
+
+    #[test]
+    #[ignore = "downloads a real published wheel and installs it for the executor's Python"]
+    fn published_tensorfs_wheel_installs_for_executor_python() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(tensorfs::store::Store::open(root.path().join("store")).unwrap());
+        let machine = Machine::new(store, None).unwrap();
+        let uv = root.path().join(if cfg!(windows) { "uv.exe" } else { "uv" });
+        let wheel = wheel("tensorfs", "0.13.5", &uv, &root.path().join("wheels"), &machine, &Stop::default()).unwrap();
+        let output = std::process::Command::new(&uv)
+            .args(["pip", "install", "--no-config", "--no-deps", "--python", "3.12", "--target"])
+            .arg(root.path().join("installed")).arg(&wheel).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(root.path().join("installed/tensorfs-0.13.5.dist-info/METADATA").is_file());
+    }
 }
