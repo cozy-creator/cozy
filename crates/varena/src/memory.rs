@@ -3006,10 +3006,12 @@ impl Inner {
         for home in st.homes.values() {
             if home.filling || home.transforming || home.keeping || !self.backend.query(home.ready)? { return Ok(false); }
         }
-        for set in st.sets.iter_mut().flatten() { set.closing = true; }
-        self.close_sets(&mut st);
+        // A clean executor exit keeps exported pages in custody for the next owner.
+        // Explicit unload withdraws them; final public retirement only drops local mappings.
+        let keys: Vec<Key> = st.homes.keys().copied().collect();
+        for key in keys { self.unmap(&mut st, key, Class::N, None, false)?; }
         self.publish(&st);
-        let empty = st.homes.is_empty() && st.sets.iter().all(Option::is_none);
+        let empty = st.homes.is_empty();
         drop(st);
         Ok(empty && self.mech.idle() && self.to_custody.idle() && self.to_tier.idle() && self.saves.idle())
     }
