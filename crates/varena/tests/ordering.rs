@@ -1742,7 +1742,8 @@ fn a_pass_returns_only_once_the_room_it_made_is_free() {
 
 /// An OOM in a measured pass on a card full of idle kept pages (native an_oom_in_a_pass): the
 /// pass made only its measured room, the activation outgrew it, and each OOM answers Retry with
-/// the idle pages; a retry the driver still refuses (its metadata) evicts more, and fits.
+/// the idle pages; a retry the driver still refuses (its slack, as e199's refused a claim of
+/// exactly 1 GiB with 1.19 MiB more reported free) evicts more, and fits.
 #[test]
 fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
     let dir = tempfile::tempdir().unwrap();
@@ -1750,7 +1751,7 @@ fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 24 * REGION_ALIGN };
     let _scope = Scope::new(&g.uuid);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let card = Card::new(g.memory, REGION_ALIGN / 2);
+    let card = Card::new(g.memory, 3 * REGION_ALIGN / 2);
     let mem = Memory::open(g.clone(), None, Box::new(Driver(card.clone()))).unwrap();
     let m = mem.load(stored(dir.path(), &uuid, "m", 2), Level::Ram).unwrap();
     let plan = Plan { steps: vec![Step { sets: vec!["m".into()], passes: 1 }] };
@@ -1773,7 +1774,7 @@ fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
         answers.push(next);
         assert!(answers.len() <= 3, "the OOM ladder ends: {answers:?}");
     }
-    assert!(!answers.is_empty(), "the activation outgrew the measured room");
+    assert!(answers.len() >= 2, "the activation outgrew the measured room, and the driver refused the first retry: {answers:?}");
     pass.end(Measured { allocated_peak: activation, slack: 0, sites: vec![] }, Torch { allocated: activation, reserved: activation });
     drop(pins);
     card.give(activation);
