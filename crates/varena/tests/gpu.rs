@@ -330,7 +330,9 @@ fn pages_fill_protect_unmap_and_survive_a_clean_owner_exit() {
 
 /// `stray`: one `st.global.u8` of 7 at its argument. `spin`: busy for `ns` nanoseconds of the
 /// GPU's clock (a forward). `copy`: `words` u64s from `src` to `dst`, one thread (a consumer that
-/// reads a page).
+/// reads a page). `sweep`: reads `words` u64s at `src` again and again for at least `ns`, one
+/// thread (a forward that reads a page throughout); `out` gets their XOR over all passes and the
+/// pass count.
 const KERNELS: &std::ffi::CStr = c"
 .version 7.0
 .target sm_70
@@ -373,20 +375,51 @@ LOOP:
 DONE:
     ret;
 }
+.visible .entry sweep(.param .u64 src, .param .u64 words, .param .u64 ns, .param .u64 out) {
+    .reg .b64 %s, %at, %n, %i, %v, %acc, %passes, %start, %now, %d, %lim, %o;
+    .reg .pred %p;
+    ld.param.u64 %s, [src];
+    ld.param.u64 %n, [words];
+    ld.param.u64 %lim, [ns];
+    ld.param.u64 %o, [out];
+    mov.u64 %acc, 0;
+    mov.u64 %passes, 0;
+    mov.u64 %start, %globaltimer;
+PASS:
+    mov.u64 %at, %s;
+    mov.u64 %i, %n;
+WORD:
+    setp.eq.u64 %p, %i, 0;
+    @%p bra PASSED;
+    ld.volatile.global.u64 %v, [%at];
+    xor.b64 %acc, %acc, %v;
+    add.u64 %at, %at, 8;
+    sub.u64 %i, %i, 1;
+    bra WORD;
+PASSED:
+    add.u64 %passes, %passes, 1;
+    mov.u64 %now, %globaltimer;
+    sub.u64 %d, %now, %start;
+    setp.lt.u64 %p, %d, %lim;
+    @%p bra PASS;
+    st.global.u64 [%o], %acc;
+    st.global.u64 [%o+8], %passes;
+    ret;
+}
 ";
 
 /// Prepare each diagnostic kernel before a deliberately blocked consumer stream exists.
 /// CUDA module/function loading can wait on that stream; doing it inside launch would make
 /// the fixture deadlock before it ever exercised Varena's consumer ordering.
-fn kernels() -> &'static [usize; 3] {
-    static FUNCTIONS: std::sync::OnceLock<[usize; 3]> = std::sync::OnceLock::new();
+fn kernels() -> &'static [usize; 4] {
+    static FUNCTIONS: std::sync::OnceLock<[usize; 4]> = std::sync::OnceLock::new();
     FUNCTIONS.get_or_init(|| {
         let d = cuda::driver().unwrap();
         let (_, ctx) = cuda::primary_context(0).unwrap();
         let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
         let mut module = std::ptr::null_mut();
         cuda::check("cuModuleLoadData", unsafe { (d.module_load_data)(&mut module, KERNELS.as_ptr().cast()) }).unwrap();
-        [c"stray", c"spin", c"copy"].map(|name| {
+        [c"stray", c"spin", c"copy", c"sweep"].map(|name| {
             let mut function = std::ptr::null_mut();
             cuda::check("cuModuleGetFunction", unsafe { (d.module_get_function)(&mut function, module, name.as_ptr()) }).unwrap();
             function as usize
@@ -396,7 +429,7 @@ fn kernels() -> &'static [usize; 3] {
 
 /// Launches a prepared diagnostic kernel on `stream` with u64 arguments.
 fn launch(name: &std::ffi::CStr, args: &[u64], stream: usize) -> cuda::CUresult {
-    let index = match name.to_bytes() { b"stray" => 0, b"spin" => 1, b"copy" => 2, _ => panic!("unknown diagnostic kernel") };
+    let index = match name.to_bytes() { b"stray" => 0, b"spin" => 1, b"copy" => 2, b"sweep" => 3, _ => panic!("unknown diagnostic kernel") };
     let kernel = kernels()[index] as cuda::CUfunction;
     let d = cuda::driver().unwrap();
     let (_, ctx) = cuda::primary_context(0).unwrap();
@@ -997,30 +1030,62 @@ fn maps_beside_a_fill_in_flight_are_timed_against_maps_on_an_idle_card() {
 
 // ---- the backend's calls, timed
 
-/// Each backend call's count, total and longest time, by name, and when the last one ended; and the
-/// stream whose next `record` fails (0: none), an injected completion-record failure.
 #[derive(Default)]
-struct Timings(
-    parking_lot::Mutex<std::collections::BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>>,
-    parking_lot::Mutex<std::collections::BTreeMap<&'static str, std::time::Instant>>,
-    std::sync::atomic::AtomicUsize,
-);
+struct Timings {
+    /// Each call's count, total and longest time, by name.
+    calls: parking_lot::Mutex<std::collections::BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>>,
+    /// When each call last ended.
+    last: parking_lot::Mutex<std::collections::BTreeMap<&'static str, std::time::Instant>>,
+    /// The stream whose next `record` fails (0: none): an injected completion-record failure.
+    fail_record: std::sync::atomic::AtomicUsize,
+    /// Each protect's start and end.
+    protects: parking_lot::Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
+    /// TensorFS copy runs taken from its log as pages are made (the log keeps only its latest): runs, bytes, ns,
+    /// GPU-busy ns.
+    fills: parking_lot::Mutex<[u64; 4]>,
+}
 
 impl Timings {
     const fn new() -> Timings {
-        Timings(parking_lot::const_mutex(std::collections::BTreeMap::new()), parking_lot::const_mutex(std::collections::BTreeMap::new()), std::sync::atomic::AtomicUsize::new(0))
+        Timings {
+            calls: parking_lot::const_mutex(std::collections::BTreeMap::new()),
+            last: parking_lot::const_mutex(std::collections::BTreeMap::new()),
+            fail_record: std::sync::atomic::AtomicUsize::new(0),
+            protects: parking_lot::const_mutex(Vec::new()),
+            fills: parking_lot::const_mutex([0; 4]),
+        }
+    }
+
+    /// TensorFS's copy runs since the last look, added to `fills`.
+    fn absorb(&self) {
+        let runs = io::metrics::take();
+        let mut f = self.fills.lock();
+        for c in runs {
+            *f = [f[0] + 1, f[1] + c.bytes, f[2] + c.ns, f[3] + c.busy_ns];
+        }
+    }
+
+    /// The copy runs so far, and a fresh start.
+    fn take_fills(&self) -> [u64; 4] {
+        self.absorb();
+        std::mem::take(&mut *self.fills.lock())
     }
 
     /// The next event recorded on `stream` fails, as a driver's record can.
     fn fail_record(&self, stream: usize) {
-        self.2.store(stream, std::sync::atomic::Ordering::Release);
+        self.fail_record.store(stream, std::sync::atomic::Ordering::Release);
     }
 
     fn add(&self, op: &'static str, took: std::time::Duration) {
-        let mut t = self.0.lock();
+        let mut t = self.calls.lock();
         let e = t.entry(op).or_default();
         *e = (e.0 + 1, e.1 + took, e.2.max(took));
-        self.1.lock().insert(op, std::time::Instant::now());
+        self.last.lock().insert(op, std::time::Instant::now());
+    }
+
+    /// Every call's time together.
+    fn total(&self) -> std::time::Duration {
+        self.calls.lock().values().map(|e| e.1).sum()
     }
 
     fn time<T>(&self, op: &'static str, f: impl FnOnce() -> T) -> T {
@@ -1033,26 +1098,26 @@ impl Timings {
     /// The report, and a fresh start.
     fn take(&self) -> String {
         let report = self.report();
-        self.0.lock().clear();
+        self.calls.lock().clear();
         report
     }
 
     fn count(&self, op: &str) -> u64 {
-        self.0.lock().get(op).map_or(0, |e| e.0)
+        self.calls.lock().get(op).map_or(0, |e| e.0)
     }
 
     fn last(&self, op: &str) -> Option<std::time::Instant> {
-        self.1.lock().get(op).copied()
+        self.last.lock().get(op).copied()
     }
 
     /// The wall time since the previous lap (None on the first).
     fn lap(&self) -> Option<std::time::Duration> {
-        self.1.lock().insert("lap", std::time::Instant::now()).map(|t| t.elapsed())
+        self.last.lock().insert("lap", std::time::Instant::now()).map(|t| t.elapsed())
     }
 
     /// `op n total max`, the costliest first.
     fn report(&self) -> String {
-        let mut rows: Vec<_> = self.0.lock().iter().map(|(op, (n, total, max))| (*op, *n, *total, *max)).collect();
+        let mut rows: Vec<_> = self.calls.lock().iter().map(|(op, (n, total, max))| (*op, *n, *total, *max)).collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.2));
         rows.iter().map(|(op, n, total, max)| format!("{op} {n}x {total:?} (max {max:?})")).collect::<Vec<_>>().join(", ")
     }
@@ -1106,6 +1171,7 @@ impl Backend for Timed {
     fn release(&self, va: Va) { self.1.time("release", || self.0.release(va)) }
     fn create(&self, len: u64) -> varena::Result<Physical> {
         let page = self.1.time("create", || self.0.create(len));
+        self.1.absorb();
         // Every 1,000 pages a process says where their time goes (stderr: the case log).
         let n = self.1.count("create");
         if n == 1 || n.is_multiple_of(1000) {
@@ -1122,7 +1188,12 @@ impl Backend for Timed {
     }
     fn destroy(&self, page: Physical) -> varena::Result<()> { self.1.time("destroy", || self.0.destroy(page)) }
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> varena::Result<()> { self.1.time("map", || self.0.map(va, offset, page, access)) }
-    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> { self.1.time("protect", || self.0.protect(va, offset, len, access)) }
+    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> {
+        let start = std::time::Instant::now();
+        let out = self.1.time("protect", || self.0.protect(va, offset, len, access));
+        self.1.protects.lock().push((start, std::time::Instant::now()));
+        out
+    }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> varena::Result<()> { self.1.time("unmap", || self.0.unmap(va, offset, len)) }
     fn export(&self, page: &Physical) -> varena::Result<platform::handles::Owned> { self.1.time("export", || self.0.export(page)) }
     fn import(&self, handle: platform::handles::Owned, len: u64) -> varena::Result<Physical> { self.1.time("import", || self.0.import(handle, len)) }
@@ -1130,7 +1201,7 @@ impl Backend for Timed {
     fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> varena::Result<()> { self.1.time("save", || self.0.save(va, offset, host, after)) }
     fn fence(&self) -> varena::Result<Event> { self.1.time("fence", || self.0.fence()) }
     fn record(&self, stream: usize) -> varena::Result<Event> {
-        if stream != 0 && self.1.2.compare_exchange(stream, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_ok() {
+        if stream != 0 && self.1.fail_record.compare_exchange(stream, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_ok() {
             return Err(Error::Device { op: "cuEventRecord", code: 999, name: "CUDA_ERROR_UNKNOWN (injected)".into() });
         }
         self.1.time("record", || self.0.record(stream))
@@ -1688,6 +1759,20 @@ fn a_save_runs_beside_a_demand_fill_on_the_other_copy_engine() {
     step!();
 }
 
+/// Where a load's `wall` went: its copy runs (`fills`: runs, bytes, ns, GPU-busy ns), their rate against the GPU's H2D
+/// ceiling, and the driver calls. The sets' sources are host memory, so no disk ceiling applies. Fills and driver
+/// calls run on different threads at once: the parts can overlap.
+fn split(wall: std::time::Duration, driver: std::time::Duration, [runs, bytes, ns, busy]: [u64; 4]) -> String {
+    let gbps = bytes as f64 / ns.max(1) as f64;
+    let ceiling = io::metrics::h2d(0).map_or(0.0, |(c, _)| c);
+    format!(
+        "SPLIT load {wall:?}: {runs} copy runs, {bytes} B in {:?} ({gbps:.2} GB/s, {:.1}% of the {ceiling:.2} GB/s H2D ceiling; GPU copying {:?}); driver calls {driver:?}",
+        std::time::Duration::from_nanos(ns),
+        100.0 * gbps / ceiling.max(f64::MIN_POSITIVE),
+        std::time::Duration::from_nanos(busy)
+    )
+}
+
 /// `bytes` in a device buffer of their own.
 fn device(bytes: &[u8]) -> io::DeviceBuffer {
     let buffer = io::DeviceBuffer::new(0, bytes.len()).unwrap();
@@ -1997,6 +2082,78 @@ fn a_failed_completion_record_quarantines_the_page_and_nothing_reuses_it() {
     assert_eq!((timings.count("unmap"), timings.count("destroy")), (unmaps, destroys), "a page whose completion is unknown was unmapped or freed");
     step!();
     println!("PASS a failed completion record quarantines the page and nothing reuses it ({refused:?}) {uuid}");
+    step!();
+}
+
+/// S3's ILLEGAL_ADDRESS (gpu12): a Keep (the protect of a filled page to read-only, on the mechanism thread) ran while
+/// the page's pin was handed out and its kernels read it. Here the baker marks its page filled while it still holds the
+/// pin and a kernel sweeps the page for ten times the first bind. No fault, the sweep reads the baked bytes throughout,
+/// and the page is protected only after the pin is dropped, which is after the sweep has ended.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_keep_protects_a_page_only_after_its_pin_and_the_kernels_reading_it_end() {
+    let (b, g, uuid) = card("keep");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let t = mem.load(set("t", 1, Fill::Declared("bake-1".into()), &g.uuid, |b| block(90, b)), Level::Ram).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["t"]])).unwrap();
+    step!();
+    let pass = r.pass(t, "main", "1", Torch::default()).unwrap();
+    step!();
+    let x = cuda::Stream::new(0).unwrap();
+    step!();
+    let (baked, out) = (device(&block(91, 0)), io::DeviceBuffer::new(0, 16).unwrap());
+    step!();
+    let first = std::time::Instant::now();
+    let pin = mem.bind(t, 0, x.raw()).unwrap();
+    let first = first.elapsed();
+    step!();
+    assert!(pin.fresh, "the caller bakes it");
+    step!();
+    assert_eq!(launch(c"copy", &[pin.ptr, baked.ptr(), REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    let long = first * 10;
+    step!();
+    assert_eq!(launch(c"sweep", &[pin.ptr, REGION_ALIGN / 8, long.as_nanos() as u64, out.ptr()], x.raw()), cuda::SUCCESS);
+    step!();
+    let protects = timings.protects.lock().len();
+    step!();
+    // The Keep is queued now, with the pin held and the sweep running.
+    pin.filled();
+    step!();
+    let swept = x.drain();
+    step!();
+    let unpinned = std::time::Instant::now();
+    drop(pin);
+    step!();
+    swept.unwrap();
+    step!();
+    let read = bytes(out.ptr(), 16, 0);
+    step!();
+    let (acc, passes) = (u64::from_ne_bytes(read[..8].try_into().unwrap()), u64::from_ne_bytes(read[8..].try_into().unwrap()));
+    step!();
+    let once = block(91, 0).chunks(8).fold(0u64, |a, w| a ^ u64::from_ne_bytes(w.try_into().unwrap()));
+    step!();
+    assert_eq!(acc, if passes % 2 == 1 { once } else { 0 }, "the sweep read other bytes than the bake's ({passes} passes)");
+    step!();
+    while timings.protects.lock().len() == protects {
+        // The Keep runs on the mechanism thread once the page is free of pins and consumers.
+        let _ = mem.torch_limit();
+    }
+    let (start, end) = timings.protects.lock()[protects];
+    step!();
+    assert!(start >= unpinned, "the page was protected {:?} while its pin was held", unpinned - start);
+    step!();
+    pass.end(Measured::default(), Torch::default());
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("KEEP protect {:?} after the unpin, for {:?}; the sweep {passes} passes over {long:?}", start - unpinned, end - start);
+    step!();
+    println!("PASS a keep protects a page only after its pin and the kernels reading it end {uuid}");
     step!();
 }
 
@@ -2362,6 +2519,7 @@ fn role_agent() {
     let mut pins: Vec<Pin> = vec![];
     let mut crowded: Vec<Pressure> = vec![];
     let mut timings: Option<Arc<Timings>> = None;
+    let mut loaded = std::time::Duration::ZERO;
     step!();
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
@@ -2385,7 +2543,12 @@ fn role_agent() {
                     other => Fill::Declared(other.into()),
                 };
                 let level = if *level == "gpu" { Level::Gpu } else { Level::Ram };
-                match m().load(set(name, blocks, fill, &uuid, |b| bytes_of(seed, b)), level) {
+                let spec = set(name, blocks, fill, &uuid, |b| bytes_of(seed, b));
+                timings.as_ref().unwrap().take_fills();
+                let started = std::time::Instant::now();
+                let out = m().load(spec, level);
+                loaded = started.elapsed();
+                match out {
                     Ok(id) => {
                         sets.insert(name.to_string(), id);
                         "ok".into()
@@ -2445,7 +2608,10 @@ fn role_agent() {
                 crowded.push(crowd());
                 "ok".into()
             }
-            ["timings"] => format!("ok backend {} | driver {}", timings.as_ref().unwrap().report(), CALLS.report()),
+            ["timings"] => {
+                let t = timings.as_ref().unwrap();
+                format!("ok {} | backend {} | driver {}", split(loaded, CALLS.total(), t.take_fills()), t.report(), CALLS.report())
+            }
             ["unpin"] => {
                 pins.clear();
                 "ok".into()
