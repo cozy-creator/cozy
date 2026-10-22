@@ -1295,6 +1295,9 @@ impl Inner {
         // An event per page, after every copy so far.
         let landed: Vec<Result<(Origin, Event)>> = copied.into_iter().map(|c| c.and_then(|origin| Ok((origin, self.backend.fence()?)))).collect();
         let (ns, bytes) = (start.elapsed().as_nanos() as u64, pages.iter().map(|(_, (.., span))| span).sum::<u64>().max(1));
+        // After a copy error the engine's copies may still run: a failed page is unmapped only
+        // once the copy stream is proven drained.
+        let drained = landed.iter().all(Result::is_ok) || self.backend.drain().is_ok();
         let mut sticky = false;
         let mut st = self.state.lock();
         for ((job, (.., span)), landed) in pages.iter().zip(landed) {
@@ -1339,12 +1342,15 @@ impl Inner {
                 Err(e) => {
                     tracing::warn!("varena: filling {:?} failed: {e}", job.key);
                     sticky |= e.is_sticky();
-                    if let Some(h) = st.homes.get_mut(&job.key) {
-                        h.filling = false;
-                    }
                     let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
-                    let _ = self.unmap(&mut st, job.key, Class::P, None, true);
-                    if !speculative {
+                    // Undrained, it stays filling (P) for good: never unmapped under a copy.
+                    if drained {
+                        if let Some(h) = st.homes.get_mut(&job.key) {
+                            h.filling = false;
+                        }
+                        let _ = self.unmap(&mut st, job.key, Class::P, None, true);
+                    }
+                    if !speculative || !drained {
                         st.failed.insert(job.key, e);
                     }
                 }
@@ -1416,13 +1422,17 @@ impl Inner {
 
     /// A fill thread's batch failed outside its copies (a panic): its pages go, their binders fail.
     fn fail(&self, jobs: &[Job], e: Error) {
+        // Its copies may have been issued: unmapped only once the copy stream is drained.
+        let drained = self.backend.drain().is_ok();
         let mut st = self.state.lock();
         for job in jobs {
             if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen) {
-                if let Some(h) = st.homes.get_mut(&job.key) {
-                    h.filling = false;
+                if drained {
+                    if let Some(h) = st.homes.get_mut(&job.key) {
+                        h.filling = false;
+                    }
+                    let _ = self.unmap(&mut st, job.key, Class::P, None, true);
                 }
-                let _ = self.unmap(&mut st, job.key, Class::P, None, true);
                 st.failed.insert(job.key, e.clone());
             }
         }
@@ -1969,7 +1979,11 @@ impl Inner {
         }
         let (mut hit, mut waited, mut speculative) = (true, false, false);
         loop {
-            if let Some(e) = st.failed.remove(&key) {
+            if let Some(e) = st.failed.get(&key).cloned() {
+                // A page whose failed copies could not be proven drained keeps failing.
+                if !st.homes.get(&key).is_some_and(|h| h.filling) {
+                    st.failed.remove(&key);
+                }
                 return Err(e);
             }
             let identity = st.mech(set)?.spec.fingerprint.key();

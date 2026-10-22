@@ -58,6 +58,27 @@ struct Events {
     /// Events varena gave up (retired), and a signal for each.
     retired: Mutex<HashSet<u64>>,
     retiring: Condvar,
+    /// Mapping calls by address, in order: map, target (a fill writes), save (a copy out read),
+    /// unmap.
+    calls: Mutex<Vec<(&'static str, u64)>>,
+    /// The next map, fill target or save waits until its gate opens (its `waits` opens then).
+    hold_map: AtomicBool,
+    map_gate: Gate,
+    map_waits: Gate,
+    hold_target: AtomicBool,
+    target_gate: Gate,
+    target_waits: Gate,
+    hold_save: AtomicBool,
+    save_gate: Gate,
+    save_waits: Gate,
+}
+
+/// Holds the call when `hold` is set: `waits` opens, then it passes `gate`.
+fn held(hold: &AtomicBool, waits: &Gate, gate: &Gate) {
+    if hold.swap(false, Ordering::SeqCst) {
+        waits.open();
+        gate.pass();
+    }
 }
 
 impl Events {
@@ -154,7 +175,10 @@ impl Backend for Stream {
         self.host.destroy(page)
     }
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()> {
-        self.host.map(va, offset, page, access)
+        held(&self.events.hold_map, &self.events.map_waits, &self.events.map_gate);
+        self.host.map(va, offset, page, access)?;
+        self.events.calls.lock().push(("map", va.base + offset));
+        Ok(())
     }
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()> {
         self.events.log("protect");
@@ -166,6 +190,7 @@ impl Backend for Stream {
             self.events.unmap_gate.pass();
         }
         self.events.unmaps.fetch_add(1, Ordering::Relaxed);
+        self.events.calls.lock().push(("unmap", va.base + offset));
         self.host.unmap(va, offset, len)
     }
     fn export(&self, page: &Physical) -> Result<Owned> {
@@ -176,10 +201,15 @@ impl Backend for Stream {
         self.host.import(handle, len)
     }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
+        self.events.calls.lock().push(("target", va.base + offset));
+        held(&self.events.hold_target, &self.events.target_waits, &self.events.target_gate);
         self.host.target(va, offset, len)
     }
     fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> {
-        self.host.save(va, offset, host, after)
+        held(&self.events.hold_save, &self.events.save_waits, &self.events.save_gate);
+        self.host.save(va, offset, host, after)?;
+        self.events.calls.lock().push(("save", va.base + offset));
+        Ok(())
     }
     fn fence(&self) -> Result<Event> {
         if self.events.hold_fence.swap(false, Ordering::SeqCst) {
@@ -1035,4 +1065,93 @@ fn a_drain_queries_each_stream_once() {
     (first + 8..=last).for_each(|e| events.complete(e));
     per_lock();
     assert_eq!(per_lock(), 0, "nothing pending");
+}
+
+/// ILLEGAL_ADDRESS audit, 1: no page is unmapped while a fill into it is in flight. A cold
+/// load's prefetch is held mid-fill (its copy not yet issued) while an OOM wants every byte:
+/// the in-flight page is P, so the OOM takes the rest, and the fill lands in mapped memory
+/// (an unmapped page is PROT_NONE here: a write would fault the test).
+#[test]
+fn a_page_in_flight_is_never_unmapped_for_an_oom() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("inflight-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 3 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    mem.load(stored(dir.path(), &uuid, "n", 1), Level::Gpu).unwrap();
+    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
+    mem.settle();
+    events.hold_target.store(true, Ordering::SeqCst);
+    let loading = {
+        let (mem, dir, uuid) = (mem.clone(), dir.path().to_path_buf(), uuid.clone());
+        std::thread::spawn(move || mem.load(stored(&dir, &uuid, "p", 1), Level::Gpu).unwrap())
+    };
+    events.target_waits.pass();
+    let filling = events.calls.lock().iter().rev().find(|(c, _)| *c == "target").map(|(_, at)| *at).unwrap();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+    let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
+    let next = r.oom(Some(a), Some(3 * REGION_ALIGN), None, Torch::default());
+    assert!(!events.calls.lock().iter().any(|(c, at)| *c == "unmap" && *at == filling), "the page in flight was unmapped ({next:?})");
+    events.target_gate.open();
+    let p = loading.join().unwrap();
+    drop(pass);
+    drop(r);
+    let pin = mem.bind(p, 0, 0).unwrap();
+    // SAFETY: a mapped page bound to this test; read only.
+    assert!(unsafe { std::slice::from_raw_parts(pin.ptr as *const u8, pin.len as usize) }.iter().all(|b| *b == 7));
+}
+
+/// ILLEGAL_ADDRESS audit, 2: a fill is issued only after its page is mapped (the mechanism's
+/// map, set-access included, has returned): with the map held, nothing writes its address.
+#[test]
+fn a_fill_is_issued_only_after_its_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("mapfirst-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    events.hold_map.store(true, Ordering::SeqCst);
+    let loading = {
+        let (mem, dir, uuid) = (mem.clone(), dir.path().to_path_buf(), uuid.clone());
+        std::thread::spawn(move || mem.load(stored(&dir, &uuid, "m", 3), Level::Gpu).unwrap())
+    };
+    events.map_waits.pass();
+    assert!(!events.calls.lock().iter().any(|(c, _)| *c == "target"), "a fill was issued while its map waits");
+    events.map_gate.open();
+    loading.join().unwrap();
+    let calls = events.calls.lock().clone();
+    for (i, (c, at)) in calls.iter().enumerate() {
+        if *c == "target" {
+            assert!(calls[..i].iter().any(|(m, a)| *m == "map" && a == at), "a fill of {at:#x} before its map: {calls:?}");
+        }
+    }
+}
+
+/// ILLEGAL_ADDRESS audit, 3: no page is unmapped while the RAM tier's copy reads it. The copy
+/// is held mid-way while a bind needs the page's bytes: the bind waits for the copy, then
+/// evicts; the unmap comes after the copy.
+#[test]
+fn a_page_being_saved_is_unmapped_only_after_its_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("saving-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    events.hold_save.store(true, Ordering::SeqCst);
+    mem.load(stored(dir.path(), &uuid, "s", 1), Level::Gpu).unwrap();
+    events.save_waits.pass();
+    let saved = events.calls.lock().iter().find(|(c, _)| *c == "map").map(|(_, at)| *at).unwrap();
+    let t = mem.load(stored(dir.path(), &uuid, "t", 1), Level::Ram).unwrap();
+    let binding = {
+        let mem = mem.clone();
+        std::thread::spawn(move || drop(mem.bind(t, 0, 0).unwrap()))
+    };
+    events.save_gate.open();
+    binding.join().unwrap();
+    let calls = events.calls.lock().clone();
+    let at = |what: &str| calls.iter().position(|(c, a)| *c == what && *a == saved);
+    assert!(at("save") < at("unmap") && at("save").is_some(), "unmapped under its copy: {calls:?}");
 }
