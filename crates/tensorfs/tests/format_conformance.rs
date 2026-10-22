@@ -360,11 +360,12 @@ fn revisions_resolve_to_commits() {
         .collect();
     for case in doc.defaults {
         let repo = Repo::from_json(&serde_json::to_vec(&case.repo).unwrap()).unwrap();
-        assert_eq!(newest(&repo.tags).map(|t| &t.name), case.default.as_ref(), "{}", case.why);
-        assert_eq!(repo.default_tag(), newest(&repo.tags));
-        // The string core over plain rows, filtered by the caller.
+        assert_eq!(repo.default_tag().map(|t| &t.name), case.default.as_ref(), "{}", case.why);
+        // The string core over plain rows, filtered by the caller; `main` is the fallback.
         let rows = repo.tags.iter().filter(|t| t.public && !t.yanked).map(|t| t.name.clone());
-        assert_eq!(newest_by(rows, |v| v.as_str()).as_ref(), case.default.as_ref(), "{}", case.why);
+        let main = repo.tag("main").filter(|t| !t.yanked).map(|t| t.name.clone());
+        assert_eq!(newest(&repo.tags).map(|t| t.name.clone()).or(main.clone()).as_ref(), case.default.as_ref(), "{}", case.why);
+        assert_eq!(newest_by(rows, |v| v.as_str()).or(main).as_ref(), case.default.as_ref(), "{}", case.why);
     }
     for case in doc.cases {
         let found = repo.resolve(case.revision.as_deref()).map(|r| r.find(|c| Ok::<_, ()>(trees[c].clone())).unwrap());

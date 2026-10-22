@@ -770,7 +770,7 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
     };
     let source = fixtures().join("comfy-nvfp4");
     tfs(&[
-        "convert",
+        "import",
         source.to_str().unwrap(),
         "--name",
         "local/comfy-nvfp4@1",
