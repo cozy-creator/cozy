@@ -963,4 +963,181 @@ mod reservation_tests {
             assert!(!admitted, "two pending fills spent the same six bytes of host surplus");
         });
     }
+
+    fn await_promised(tier: &Tier, bytes: u64) {
+        let (lock, changed) = &*tier.state;
+        let mut state = lock.lock();
+        while state.promised.values().sum::<u64>() != bytes {
+            assert!(!changed.wait_for(&mut state, std::time::Duration::from_secs(5)).timed_out(), "reservation was not released");
+        }
+    }
+
+    #[test]
+    fn closing_a_permit_returns_only_the_promise_not_resident_pages() {
+        isolated("closing_a_permit_returns_only_the_promise_not_resident_pages", || {
+            let available = Arc::new(AtomicU64::new(6));
+            let sample = available.clone();
+            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || sample.load(Acquire))).unwrap().unwrap();
+            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let permit = client.reserve(4).unwrap();
+            assert!(client.reserve(4).is_none());
+            available.store(2, Release); // The completed fill now occupies four physical bytes.
+            drop(permit);
+            await_promised(&tier, 0);
+            assert!(client.reserve(4).is_none(), "resident pages remain charged by live headroom");
+            available.store(6, Release); // Only actual reclaim restores them.
+            assert!(client.reserve(4).is_some());
+        });
+    }
+
+    #[test]
+    fn a_dead_client_returns_its_unspent_reservation() {
+        isolated("a_dead_client_returns_its_unspent_reservation", || {
+            use std::io::BufRead;
+            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(|| 6)).unwrap().unwrap();
+            let address = format!("cozy-varena-{}-tier-reservation-{}-tier", os::euid(), std::process::id());
+            let script = r#"import json,socket,struct,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+s.connect('\0'+sys.argv[1])
+b=json.dumps({'Room':{'bytes':4}}).encode()
+s.sendall(struct.pack('<I',len(b))+b'\0'+b)
+def read(n):
+    b=b''
+    while len(b)<n:
+        p=s.recv(n-len(b))
+        if not p: raise RuntimeError('tier closed')
+        b+=p
+    return b
+head=read(5)
+r=json.loads(read(struct.unpack('<I',head[:4])[0]))
+assert r['Room']['ok'],r
+print('reserved',flush=True)
+sys.stdin.read()
+"#;
+            struct Child(std::process::Child);
+            impl Drop for Child {
+                fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            }
+            let mut child = Child(std::process::Command::new("python3").args(["-c", script, &address])
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap());
+            let mut line = String::new();
+            std::io::BufReader::new(child.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "reserved");
+            assert!(!room(4).1);
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            await_promised(&tier, 0);
+            assert!(room(4).1, "a dead client cannot strand its admission");
+        });
+    }
+
+    #[test]
+    fn unmeasured_calls_and_pending_fills_keep_their_headroom() {
+        isolated("unmeasured_calls_and_pending_fills_keep_their_headroom", || {
+            let need = Arc::new(AtomicU64::new(3));
+            let read = need.clone();
+            let tier = Tier::bind_with(Arc::new(move || match read.load(Acquire) { u64::MAX => None, n => Some(n) }), Arc::new(|| 8)).unwrap().unwrap();
+            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            assert!(client.reserve(6).is_none());
+            let permit = client.reserve(5).unwrap();
+            assert!(client.reserve(1).is_none());
+            drop(permit);
+            await_promised(&tier, 0);
+            need.store(u64::MAX, Release);
+            assert!(client.reserve(1).is_none(), "an unmeasured call permits no speculative fill");
+        });
+    }
+
+    #[test]
+    fn a_drained_fill_failure_returns_only_its_unfinished_pages() {
+        isolated("a_drained_fill_failure_returns_only_its_unfinished_pages", || {
+            let page = platform_page();
+            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || 8 * page)).unwrap().unwrap();
+            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let held = client.open_layout("failed", vec![(0, page), (page, page)], "").unwrap();
+            let first = client.reserve(page).unwrap();
+            held.fill(&[0], |dsts| {
+                for (_, dst) in dsts {
+                    let tensorfs::io::Dst::Host { ptr, len } = dst else { unreachable!() };
+                    // SAFETY: the fill owns this mapped host destination exclusively.
+                    unsafe { std::ptr::write_bytes(*ptr, 7, *len) };
+                }
+                Ok(())
+            }).unwrap();
+            drop(first);
+            await_promised(&tier, 0);
+            let next = client.reserve(page).unwrap();
+            let result = held.fill(&[0, 1], |dsts| {
+                assert_eq!(dsts.len(), 1, "ready pages must not be overwritten");
+                for (_, dst) in dsts {
+                    let tensorfs::io::Dst::Host { ptr, len } = dst else { unreachable!() };
+                    // SAFETY: the fill owns this mapped host destination exclusively.
+                    unsafe { std::ptr::write_bytes(*ptr, 9, *len) };
+                }
+                Err(Error::Io("drained read failure".into()))
+            });
+            assert!(matches!(result, Err(Error::Io(_))));
+            drop(next);
+            await_promised(&tier, 0);
+            assert!(held.holds(0) && !held.holds(1));
+            assert!(os::allocated(&held.fd) <= held.data + page, "dirty unready pages were stranded");
+            // SAFETY: the first ready region remains mapped by Held.
+            assert_eq!(unsafe { *(held.ptr(0).unwrap().0 as *const u8) }, 7);
+        });
+    }
+
+    #[test]
+    fn an_undrained_fill_keeps_its_destination_mapping_and_region_lock() {
+        isolated("an_undrained_fill_keeps_its_destination_mapping_and_region_lock", || {
+            let page = platform_page();
+            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || 8 * page)).unwrap().unwrap();
+            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let held = client.open_layout("quarantined", vec![(0, page)], "").unwrap();
+            let inspection = os::reopen(&held.fd, true).unwrap();
+            let permit = client.reserve(page).unwrap();
+            let pointer = AtomicU64::new(0);
+            let result = held.fill(&[0], |dsts| {
+                let tensorfs::io::Dst::Host { ptr, .. } = dsts[0].1 else { unreachable!() };
+                pointer.store(ptr as u64, Release);
+                Err(Error::Ownership("copy completion unknown".into()))
+            });
+            assert!(matches!(result, Err(Error::Ownership(_))));
+            let data = held.data;
+            assert!(!held.holds(0));
+            drop(held);
+            assert!(os::held(&inspection, data, page).unwrap(), "quarantine lost the write lock");
+            let mut residency = [0u8; 1];
+            // SAFETY: mincore only queries the saved page-aligned mapping; it does not dereference it.
+            assert_eq!(unsafe { libc::mincore(pointer.load(Acquire) as *mut libc::c_void, page as usize, residency.as_mut_ptr()) }, 0,
+                "quarantine unmapped the asynchronous destination");
+            // The caller quarantines its host permit alongside the unresolved GPU source.
+            std::mem::forget(permit);
+        });
+    }
+
+    #[test]
+    fn local_fillers_use_distinct_lock_descriptions() {
+        isolated("local_fillers_use_distinct_lock_descriptions", || {
+            let page = platform_page();
+            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || 8 * page)).unwrap().unwrap();
+            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let held = Arc::new(client.open_layout("local-locks", vec![(0, page)], "").unwrap());
+            let (entered, ready) = std::sync::mpsc::channel();
+            let (release, done) = std::sync::mpsc::channel();
+            let first = held.clone();
+            let writer = std::thread::spawn(move || first.fill(&[0], |_| {
+                entered.send(()).unwrap();
+                done.recv().unwrap();
+                Ok(())
+            }));
+            ready.recv().unwrap();
+            assert!(os::held(&held.fd, held.data, page).unwrap(), "a shared OFD does not exclude local writers");
+            let second = held.clone();
+            let follower = std::thread::spawn(move || second.fill(&[0], |_| panic!("a ready region must not be filled twice")));
+            release.send(()).unwrap();
+            writer.join().unwrap().unwrap();
+            follower.join().unwrap().unwrap();
+        });
+    }
+
 }
