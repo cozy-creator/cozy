@@ -65,6 +65,7 @@ impl Drop for Preparing {
             st.pins.remove(id);
             st.sync(*key);
         }
+        self.inner.keeps(&mut st);
         self.inner.close_sets(&mut st);
         self.inner.publish(&mut st);
         self.inner.landed.notify_all();
@@ -343,6 +344,9 @@ pub struct Stats {
     pub tier: u64,
     /// Bytes the request still held when it ended (pins, rooms, caches): 0.
     pub leftover: u64,
+    /// Bytes due to be kept (read-only, exported to custody) and not kept yet: pages not idle
+    /// (unpinned, no release pending) since their fill. Each is kept at its first idle moment.
+    pub keep_pending: u64,
 }
 
 /// An op site that ran short, as `oom` names it.
@@ -505,8 +509,12 @@ struct Home {
     identity: String,
     /// Keep (read-only, exported) once `ready` completes: a write may still be running.
     keep_after: bool,
-    /// Its Keep (read-only, export) is with the mechanism thread.
+    /// Its Keep (read-only, export) is due: queued for its set, or waiting for the page to
+    /// be idle.
     keeping: bool,
+    /// Its Keep's protect and export run now. No work may touch a page while its access
+    /// changes (`cuMemSetAccess` under a reading kernel faults it): binds and saves wait.
+    protecting: bool,
 }
 
 impl Home {
@@ -528,8 +536,9 @@ enum Mech {
     Adopt { key: Key, gen: u64, va: Va, off: u64, phys: u64, len: u64, identity: String },
     /// Unmap a page (the driver lets its consumers finish) and destroy it.
     Unmap { va: Va, off: u64, span: u64, phys: Option<Physical>, ready: Event },
-    /// Make a filled page read-only and hand its export to custody.
-    Keep { key: Key, gen: u64, va: Va, off: u64, span: u64, phys: u64, len: u64 },
+    /// Make the set's due pages that are idle read-only (each contiguous run in one call) and
+    /// hand their exports to custody.
+    Keep { set: u32 },
     /// A read-only kept page whose fill identity changed: never protected again, it is
     /// unmapped (after its consumers) and a fresh page filled in its place.
     Renew { key: Key, gen: u64, va: Va, off: u64, span: u64, old: Option<Physical>, after: Vec<Event>, job: Job },
@@ -716,9 +725,25 @@ struct State {
     holder: u64,
     /// The tier connection this process's layouts were opened or handed over on.
     tier_holder: u64,
+    /// Pages whose Keep is due ([`Home::keeping`]), and sets with a Keep queued.
+    keep_due: BTreeSet<Key>,
+    keep_queued: BTreeSet<u32>,
 }
 
 impl State {
+    /// No work can touch the page: unpinned, no release event pending, not filling or being
+    /// transformed.
+    fn idle(&self, key: Key) -> bool {
+        self.table.page(key).is_some_and(|p| p.pins.is_empty() && p.releasing.is_empty())
+            && self.homes.get(&key).is_some_and(|h| !h.filling && !h.transforming)
+    }
+
+    /// Bytes due to be kept and not kept yet.
+    fn keep_pending(&self) -> u64 {
+        let protecting = self.homes.iter().filter(|(_, h)| h.protecting).map(|(k, _)| *k);
+        self.keep_due.iter().copied().chain(protecting).filter_map(|k| self.table.page(k)).map(|p| p.bytes).sum()
+    }
+
     fn promises(&mut self) {
         self.table.promised = self.budgets.values().map(|n| n.load(Ordering::Acquire)).sum();
     }
@@ -740,7 +765,11 @@ impl State {
 
     /// The table's page facts from the mechanism's.
     fn sync(&mut self, key: Key) {
-        let home = self.homes.get(&key).map(|h| (h.filled, h.filling, h.speculative, h.exported));
+        if !self.homes.get(&key).is_some_and(|h| h.keeping) {
+            self.keep_due.remove(&key);
+        }
+        // A protect in flight pins the page (P) like a fill.
+        let home = self.homes.get(&key).map(|h| (h.filled, h.filling || h.protecting, h.speculative, h.exported));
         let pins: Vec<u64> = self.pins.iter().filter(|(_, (k, ..))| *k == key).map(|(id, _)| *id).collect();
         if let Some(p) = self.table.page_mut(key) {
             p.mapped = home.is_some();
@@ -1333,6 +1362,7 @@ impl Inner {
 
     fn drain(&self, st: &mut State) {
         let wake = self.poll_releases(st, true);
+        self.keeps(st);
         if let Some(h) = self.custody.as_ref().map(|c| c.holder()).filter(|h| *h != st.holder) {
             // A new custody holder knows none of the kept pages: all go to it again.
             st.holder = h;
@@ -1577,7 +1607,7 @@ impl Inner {
             let gen = st.tick();
             // Pinned (filling) until the mechanism maps it.
             self.mech.post(Mech::Adopt { key, gen, va, off, phys: phys.id, len: phys.len, identity: identity.clone() }, 0);
-            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false });
+            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, protecting: false });
             st.sync(key);
             let s = st.fills(req, key, span, Origin::Kept);
             s.moved.kept.bytes += span;
@@ -1601,7 +1631,7 @@ impl Inner {
         let decided = st.table.free();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false });
+        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, protecting: false });
         st.sync(key);
         self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, speculative, decided }, 0);
         Ok(true)
@@ -1623,7 +1653,7 @@ impl Inner {
         // Kept, or with a Keep queued: never written again; a fresh page takes its place.
         let phys = if exported || h.keeping { h.phys.take() } else { None };
         let renew = phys.is_some();
-        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false };
+        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
         let job = Job { key, gen, req, span, after: vec![] };
@@ -1650,7 +1680,6 @@ impl Inner {
         if self.custody.is_none() {
             return;
         }
-        let Ok((va, off, span)) = st.place(key) else { return };
         let Ok(m) = st.mech(key.0) else { return };
         let fp = m.spec.fingerprint.clone();
         let Some(home) = st.homes.get_mut(&key) else { return };
@@ -1667,9 +1696,27 @@ impl Inner {
             st.events.entry(stream).or_default().push_back((ready, key));
             return;
         }
-        let Some(phys) = home.phys.as_ref().map(|p| (p.id, p.len)).filter(|_| !home.keeping) else { return };
+        if home.phys.is_none() || home.keeping {
+            return;
+        }
         home.keeping = true;
-        self.mech.post(Mech::Keep { key, gen: home.gen, va, off, span, phys: phys.0, len: phys.1 }, 0);
+        st.keep_due.insert(key);
+        self.keeps(st);
+    }
+
+    /// Queues a Keep for each set with a due page that is idle now. A page in use stays due:
+    /// the drain that finds it idle (its last release complete) queues it, so a page pinned
+    /// across a whole request is kept at its first idle moment.
+    fn keeps(&self, st: &mut State) {
+        if st.keep_due.is_empty() {
+            return;
+        }
+        let sets: BTreeSet<u32> = st.keep_due.iter().filter(|k| st.idle(**k)).map(|k| k.0).collect();
+        for set in sets {
+            if st.keep_queued.insert(set) {
+                self.mech.post(Mech::Keep { set }, 0);
+            }
+        }
     }
 
     /// A fill thread's batch: each page from the tier, else the store, in as few engine reads as
@@ -1934,6 +1981,12 @@ impl Inner {
         if self.check_ownership().is_err() { return; }
         let (pin, held, (va, off, span), ready) = {
             let mut st = self.lock();
+            // A copy out reads the page: never while its Keep's protect runs.
+            while st.homes.get(&s.key).is_some_and(|h| h.gen == s.gen && h.protecting) {
+                if self.wait(&mut st).is_err() {
+                    return;
+                }
+            }
             let home = st.homes.get(&s.key).filter(|h| h.gen == s.gen && h.filled && !h.filling && !h.transforming).map(|h| h.ready);
             // Only into the layout of the identity it was filled under.
             let held = st.mech(s.key.0).ok().filter(|m| m.tier == s.tier).and_then(|m| m.held.clone()).filter(|h| !h.holds(s.key.1));
@@ -2002,6 +2055,7 @@ impl Inner {
         st.pins.remove(&pin);
         st.saving = None;
         st.sync(s.key);
+        self.keeps(&mut st);
         // Its class while pinned may have been published meanwhile: no longer.
         self.publish(&mut st);
         if saved {
@@ -2486,6 +2540,12 @@ impl Inner {
                     waited = true;
                     self.wait(&mut st)?;
                 }
+                // Its Keep's protect runs now: no pin while its access changes; the Keep's end
+                // wakes the binder.
+                Some(h) if h.protecting => {
+                    waited = true;
+                    self.wait(&mut st)?;
+                }
                 Some(h) if h.filled || !(h.filling || h.transforming) => {
                     speculative |= h.speculative;
                     break;
@@ -2929,6 +2989,7 @@ impl Inner {
             st.shrinks.remove(id);
         });
         stats.leftover = leftover;
+        stats.keep_pending = st.keep_pending();
         st.last = Some(stats.clone());
         self.publish(&mut st);
         let uses: Vec<Call> = st.sets.iter().flatten().map(|m| Call::Use { digest: m.tier.clone(), distance: None }).collect();
@@ -3512,7 +3573,9 @@ impl Request {
 
     pub fn stats(&self) -> Stats {
         let st = self.inner.state.lock();
-        st.stats.get(&self.id).cloned().unwrap_or_default()
+        let mut stats = st.stats.get(&self.id).cloned().unwrap_or_default();
+        stats.keep_pending = st.keep_pending();
+        stats
     }
 
     /// Ends the request, returning its record.
@@ -3711,28 +3774,61 @@ impl Inner {
                 }
                 self.backend.retire(ready);
             }
-            Mech::Keep { key, gen, va, off, span, phys, len } => {
-                // A Keep for an earlier life of the page is dropped before it protects: that
-                // page was renewed (a Keep queued forces a renewal), never refilled in place.
-                if !self.state.lock().homes.get(&key).is_some_and(|h| h.gen == gen) {
-                    return;
-                }
-                let made = self.backend.protect(va, off, span, Access::Read).and_then(|_| self.backend.export(&Physical { id: phys, len }));
-                let mut st = self.state.lock();
-                let Some(home) = st.homes.get_mut(&key).filter(|h| h.gen == gen) else { return };
-                home.keeping = false;
-                match made {
-                    Ok(handle) => {
-                        home.exported = true;
-                        let fp = home.identity.clone();
-                        self.post(Call::Export { fp, page: key.1, len: span, handle });
-                        st.sync(key);
-                    }
-                    Err(e) => tracing::warn!("varena: keeping {key:?} failed: {e}"),
-                }
-            }
+            Mech::Keep { set } => self.keep_set(set),
             Mech::Release(va) => self.backend.release(va),
         }
+    }
+
+    /// The set's due pages that are idle now, made read-only (each contiguous run in one
+    /// protect) and exported. A page pinned, with a release pending, filling or transformed
+    /// stays due; one unmapped or renewed since is not kept. Binds and saves of a page wait
+    /// while its protect runs.
+    fn keep_set(self: &Arc<Self>, set: u32) {
+        let (va, pages) = {
+            let mut st = self.state.lock();
+            st.keep_queued.remove(&set);
+            let Ok(va) = st.mech(set).map(|m| m.va) else { return };
+            let due: Vec<Key> = st.keep_due.range((set, 0)..=(set, u32::MAX)).copied().collect();
+            let mut pages = vec![];
+            for key in due {
+                let (place, idle) = (st.place(key), st.idle(key));
+                let Some(home) = st.homes.get_mut(&key).filter(|h| h.keeping && !h.exported) else {
+                    st.keep_due.remove(&key);
+                    continue;
+                };
+                let (Ok((_, off, span)), Some(phys), true) = (place, home.phys.as_ref().map(|p| (p.id, p.len)), idle) else { continue };
+                home.protecting = true;
+                pages.push((key, home.gen, off, span, phys));
+            }
+            for (key, ..) in &pages {
+                st.keep_due.remove(key);
+                st.sync(*key);
+            }
+            (va, pages)
+        };
+        let mut made = Vec::with_capacity(pages.len());
+        // Each contiguous run (a page starting where the one before ends) in one protect.
+        for run in pages.chunk_by(|a, b| a.2 + a.3 == b.2) {
+            let (Some(first), Some(last)) = (run.first(), run.last()) else { continue };
+            let protected = self.backend.protect(va, first.2, last.2 + last.3 - first.2, Access::Read);
+            made.extend(run.iter().map(|(.., (id, len))| protected.clone().and_then(|()| self.backend.export(&Physical { id: *id, len: *len }))));
+        }
+        let mut st = self.state.lock();
+        for ((key, gen, _, span, _), made) in pages.iter().zip(made) {
+            let Some(home) = st.homes.get_mut(key).filter(|h| h.gen == *gen) else { continue };
+            (home.keeping, home.protecting) = (false, false);
+            match made {
+                Ok(handle) => {
+                    home.exported = true;
+                    let fp = home.identity.clone();
+                    self.post(Call::Export { fp, page: key.1, len: *span, handle });
+                }
+                Err(e) => tracing::warn!("varena: keeping {key:?} failed: {e}"),
+            }
+            st.sync(*key);
+        }
+        drop(st);
+        self.landed.notify_all();
     }
 
     /// Creates and maps a page for `key` and queues its fill; a create the device cannot
