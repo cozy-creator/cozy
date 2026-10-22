@@ -95,7 +95,7 @@ fn callback_does_not_wait_for_a_peer_heap_lock() {
     let callback = std::thread::spawn(move || {
         let until = std::time::Instant::now() + Duration::from_secs(1);
         let result = loop {
-            let result = active.reclaim_allocation(None, gpu().memory, Torch::default());
+            let result = active.reclaim_allocation(gpu().memory);
             if !matches!(result, Ok(0)) || std::time::Instant::now() >= until { break result; }
             std::thread::yield_now();
         };

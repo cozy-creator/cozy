@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use tensorfs::io::cuda;
-use varena::{Memory, Request, SetId, Torch, Workspace};
+use varena::{Memory, Request, Workspace};
 
 type Pool = (u64, u64);
 pub type Refusal = (i32, Pool, &'static str, u64, u64, u64);
@@ -25,7 +25,6 @@ pub type Refusal = (i32, Pool, &'static str, u64, u64, u64);
 struct Active {
     memory: Arc<Memory>,
     request: Arc<Request>,
-    set: Option<SetId>,
     outside: u64,
     device: i32,
     pool: Pool,
@@ -185,9 +184,9 @@ impl Drop for Inside {
     fn drop(&mut self) { INSIDE.with(|v| v.set(self.0)); }
 }
 
-pub fn enter(memory: Arc<Memory>, request: Arc<Request>, set: Option<SetId>, reserved: u64, device: i32, pool: Pool) {
+pub fn enter(memory: Arc<Memory>, request: Arc<Request>, reserved: u64, device: i32, pool: Pool) {
     let outside = reserved.saturating_sub(live(device));
-    ACTIVE.with(|a| a.borrow_mut().push(Active { memory, request, set, outside, device, pool }));
+    ACTIVE.with(|a| a.borrow_mut().push(Active { memory, request, outside, device, pool }));
 }
 pub fn exit() { ACTIVE.with(|a| a.borrow_mut().pop()); }
 pub fn workspace_enter(workspace: Arc<Workspace>) { WORKSPACES.with(|b| b.borrow_mut().push(workspace)); }
@@ -285,7 +284,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
                 refusal.0 = "no_progress";
                 if previous == Some(state) { break 0; }
                 previous = Some(state);
-                let reclaimed = a.request.reclaim_allocation(a.set, size as u64, Torch { allocated: held, reserved: held }).unwrap_or(0);
+                let reclaimed = a.request.reclaim_allocation(size as u64).unwrap_or(0);
                 refusal.0 = "no_reclaim";
                 if reclaimed == 0 { break 0; }
                 reclaimed_total += reclaimed;

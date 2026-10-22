@@ -472,8 +472,10 @@ impl PyMemory {
         done(py, &self.gpu.uuid, || self.memory().fill(SetId(set), fill))
     }
 
-    /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id.
-    fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>) -> PyResult<u32> {
+    /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id. A cache
+    /// serving set `set` (a component's graph pool, its decode cache) takes that set's class.
+    #[pyo3(signature = (owner, shrink, set = None))]
+    fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>, set: Option<u32>) -> PyResult<u32> {
         // Inside torch's allocator a shrink would free through it under its own lock: none runs there.
         let shrink = move |want: u64| {
             if crate::allocator::inside() {
@@ -482,7 +484,7 @@ impl PyMemory {
             }
             Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0)
         };
-        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, None, shrink))).map(|c| c.0)
+        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, set.map(SetId), shrink))).map(|c| c.0)
     }
 
     fn cached(&self, py: Python<'_>, cache: u32, nbytes: u64) -> PyResult<()> {
@@ -683,13 +685,12 @@ impl PyRequest {
         detached(py, &self.gpu, || Ok(r.cut(set.map(SetId), site, shape)))
     }
 
-    /// This thread's segments for torch's pool are `set`'s pass's (None: outside any pass) from
-    /// now on, torch's bytes now being `allocated` and `reserved`: a shortfall asks this request.
-    #[pyo3(signature = (memory, set, allocated, reserved, pool = (0, 0)))]
-    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, set: Option<u32>, allocated: u64, reserved: u64, pool: (u64, u64)) -> PyResult<()> {
+    /// This thread's segments for torch's pool `pool` are this request's from now on, torch's
+    /// reserved bytes now being `reserved`: a shortfall claims from the request's stock.
+    #[pyo3(signature = (memory, reserved, pool = (0, 0)))]
+    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, reserved: u64, pool: (u64, u64)) -> PyResult<()> {
         let r = self.get(py)?;
-        let _ = allocated;
-        crate::allocator::enter(memory.memory().clone(), r, set.map(SetId), reserved, memory.dl.1, pool);
+        crate::allocator::enter(memory.memory().clone(), r, reserved, memory.dl.1, pool);
         Ok(())
     }
 
