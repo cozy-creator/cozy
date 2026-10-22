@@ -307,6 +307,9 @@ pub struct Remote {
     pub running: bool,
     pub context: u64,
     pub torch: u64,
+    /// Actual unique device backing attributed to this row, including context/native bytes;
+    /// admission promises are excluded. Orphans remain on custody's separate counter.
+    pub physical: u64,
     /// Of `torch`, what its trim hook and caches give back when it is idle.
     pub caches: u64,
     pub classes: [u64; 7],
@@ -338,6 +341,15 @@ pub struct Table {
     /// Bytes on the device no row accounts for, measured, beyond what the card leaves outside
     /// the table's cap (`capacity`): `capacity - foreign` is min(cap, card - foreign bytes).
     pub foreign: u64,
+    /// Actual unique device backing for this row: context, committed native allocations and
+    /// resident VMM backing. No placeholders or future promises; retiring aliases count once.
+    pub physical: u64,
+    /// Unique actual VMM backing, including retired/quarantined backing until ownership ends.
+    pub vmm: u64,
+    /// Future VMM backing: exactly the mapped Home placeholders with no physical allocation.
+    pub mapping: u64,
+    /// Unique retiring subset of vmm; ownership-lost quarantines remain vmm but cannot return.
+    pub returning: u64,
     /// This process's driver context.
     pub context: u64,
     /// Kept pages no live process maps, on this device (custody's).
@@ -418,7 +430,9 @@ impl Table {
     pub fn classes(&self) -> [u64; 7] {
         let mut out = [0u64; 7];
         if let Some(p) = out.get_mut(Class::P.index()) {
-            *p = self.pending + self.inflight;
+            // Unmapped physical backing includes quarantines as well as live retirement.
+            // Mapped placeholders are counted by their page's P class below.
+            *p = self.vmm.saturating_sub(self.mapped().saturating_sub(self.mapping));
         }
         for (key, page) in self.pages() {
             if let Some(slot) = self.class(key).and_then(|c| out.get_mut(c.index())) {
@@ -445,18 +459,24 @@ impl Table {
     }
 
     pub fn held(&self) -> u64 {
-        self.context + self.torch() + self.mapped() + self.pending
+        self.context + self.torch() + self.vmm + self.mapping
     }
 
-    /// Bytes already retiring. Own unmaps are ordered before subsequent creates and counted
-    /// as free locally; custody's copy still holds pending bytes. Other rows remain charged
-    /// until their completion is published.
+    /// Unique backing already retiring. It remains charged until its owners finish; neither
+    /// overlapping mechanism/custody tickets nor ownership-lost quarantines add reclaim credit.
     pub fn returning(&self) -> u64 {
-        self.pending + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
+        self.returning.min(self.vmm) + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
     }
 
     fn others_held(&self) -> u64 {
         self.others.iter().map(Remote::held).sum()
+    }
+
+    /// Driver usage not owned by a row or custody, charged only past the card's room outside
+    /// this cap. Logical room/claims/workspace promises never alter physical attribution.
+    pub fn foreign_used(&self, card_capacity: u64, driver_used: u64) -> u64 {
+        let physical = self.others.iter().fold(self.physical.saturating_add(self.orphans), |held, row| held.saturating_add(row.physical));
+        driver_used.saturating_sub(physical).saturating_sub(card_capacity.saturating_sub(self.capacity))
     }
 
     /// F: what no row, orphan or foreign tenant holds.
@@ -473,7 +493,7 @@ impl Table {
 
     /// What torch's allocator may hold: capacity − context − mapped − other rows − foreign.
     pub fn torch_limit(&self) -> u64 {
-        self.capacity.saturating_sub(self.foreign + self.orphans + self.context + self.mapped() + self.pending + self.inflight + self.promised + self.others_held())
+        self.capacity.saturating_sub(self.foreign + self.orphans + self.context + self.vmm + self.mapping + self.promised + self.others_held())
     }
 
     /// The bytes of a step's pages.
