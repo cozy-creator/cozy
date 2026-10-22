@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Weak};
 
-use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use platform::contain::host_memory;
 use platform::handles::Owned;
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,6 @@ use sha2::{Digest, Sha256};
 use crate::custody;
 use crate::decide::{self, Admitted};
 use crate::os::{self, Listener, Map};
-use crate::memory::SitePeak;
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
@@ -366,8 +365,8 @@ fn openers(fd: &Owned) -> Vec<u32> {
 }
 
 impl Shared {
-    /// The table behind `fd` (a grant's), initialised if it is new. The first opener sets the
-    /// capacity; a later one can only lower it.
+    /// The table behind `fd` (a grant's), initialised at `capacity` (the card's) if it is new.
+    /// Only TensorD changes it after ([`Ledger::create`]): an opener's limit is its own row's.
     pub fn adopt(fd: Owned, gpu: &GpuId, capacity: u64) -> Result<Shared> {
         // The description handed over is this process's own (a granted executor of another uid
         // could not open the file again).
@@ -413,7 +412,6 @@ impl Shared {
                 fence(Release);
                 h.magic = MAGIC;
             }
-            h.capacity.fetch_min(capacity, AcqRel);
             Ok(map)
         })();
         os::unlock(&fd, 0, 8)?;
@@ -907,8 +905,8 @@ fn restart() {
     }
 }
 
-/// A request's compute room (beside its weights) at `compute/<package>|<shape>`: the latest
-/// run's replaces what was there, as a pass's room does (one large run never pins it).
+/// A request's compute bytes (beside its weights) at `compute/<package>|<shape>`: the latest
+/// run's replaces what was there (one large run never pins it).
 pub(crate) fn record_compute(shared: &Shared, key: &str, bytes: u64) -> Result<()> {
     shared.put(&format!("compute/{key}"), Some(&bytes.to_le_bytes()))
 }
@@ -928,12 +926,6 @@ pub(crate) fn record_set(shared: &Shared, name: &str, bytes: u64) -> Result<()> 
         let known = old.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes);
         Some(known.map_or(bytes, |k| k.max(bytes)).to_le_bytes().to_vec())
     })
-}
-
-/// A pass's room at `room/<key>`: the latest measurement replaces what was there (a room comes
-/// down when a pass measures less).
-pub(crate) fn record_room(shared: &Shared, key: &str, room: &Room) -> Result<()> {
-    shared.put(&format!("room/{key}"), Some(&os::encode(room)?))
 }
 
 /// Writes `key` only where the table has nothing newer (a restore: what this run measured
@@ -1086,19 +1078,6 @@ impl Row {
         Ok(freed)
     }
 
-    /// This row's wake endpoint, signalled while it waits for room.
-    pub fn endpoint(&self) -> Result<os::Endpoint> {
-        os::wake_bind(self.shared.ns, &row_wake(&self.shared.name, self.id()))?.ok_or_else(|| Error::Internal("a row's wake is taken".into()))
-    }
-
-    /// Registers one waiting thread before it reads the condition. Dropping its guard removes
-    /// only that waiter, including on errors or panic; another thread remains registered.
-    pub fn waiting(&self) -> Waiting<'_> {
-        self.rec(|r| { r.waiting.fetch_add(1, SeqCst); });
-        self.shared.event();
-        Waiting(self)
-    }
-
     /// Binds this row's ask socket: its owner's ask thread serves it.
     pub fn listen(&self) -> Result<Listener> {
         os::listen(self.shared.ns, &self.ask_name())?.ok_or_else(|| Error::Internal("a row's ask socket is taken".into()))
@@ -1147,53 +1126,6 @@ pub struct PhysicalChange {
 impl PhysicalChange {
     pub fn finish(self) {
         self.row.end_physical();
-    }
-}
-
-/// A row's registered wait; no lock is held while the caller checks or waits.
-pub(crate) struct Waiting<'a>(&'a Row);
-
-impl Drop for Waiting<'_> {
-    fn drop(&mut self) {
-        self.0.rec(|r| { r.waiting.fetch_sub(1, SeqCst); });
-        self.0.shared.event();
-    }
-}
-
-/// One process's row endpoint broadcasts an event to every local waiter. Only one thread
-/// drains the datagrams; an epoch lets all other threads recheck after the same change.
-pub(crate) struct RoomWake {
-    endpoint: os::Endpoint,
-    state: Mutex<(u64, bool)>,
-    changed: Condvar,
-}
-
-impl RoomWake {
-    pub fn new(endpoint: os::Endpoint) -> Self {
-        Self { endpoint, state: Mutex::new((0, false)), changed: Condvar::new() }
-    }
-
-    pub fn epoch(&self) -> u64 {
-        self.state.lock().0
-    }
-
-    pub fn wait(&self, epoch: u64) -> Result<()> {
-        let mut state = self.state.lock();
-        while state.0 == epoch {
-            if state.1 {
-                self.changed.wait(&mut state);
-            } else {
-                state.1 = true;
-                drop(state);
-                let result = os::wake_await(&self.endpoint);
-                state = self.state.lock();
-                state.0 = state.0.wrapping_add(1);
-                state.1 = false;
-                self.changed.notify_all();
-                result?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1332,18 +1264,20 @@ pub(crate) fn held(rows: &[RowView]) -> u64 {
 pub struct Grant {
     pub table: Owned,
     pub row: Owned,
+    /// A standalone opener's cap on its own row (never the table's: v8, a test's 1 GiB capped
+    /// every executor on the card).
+    pub limit: Option<u64>,
 }
 
 impl Grant {
-    /// `gpu`'s table by name, created when absent, for a standalone engine. `limit` lowers the
-    /// capacity (the first opener sets it, a later one can only lower it).
+    /// `gpu`'s table by name, created at the card's capacity when absent, for a standalone
+    /// engine; `limit` caps only this opener's row.
     pub fn open(gpu: &GpuId, limit: Option<u64>) -> Result<Grant> {
-        let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
         // Read-locked open while the grant lives.
         let table = open_named(&gpu.uuid)?;
-        drop(Shared::adopt(os::dup(&table)?, gpu, capacity)?);
+        drop(Shared::adopt(os::dup(&table)?, gpu, gpu.memory)?);
         let row = os::reopen(&table, true)?;
-        Ok(Grant { table, row })
+        Ok(Grant { table, row, limit })
     }
 }
 
@@ -1387,10 +1321,9 @@ pub struct Status {
 pub enum Peak {
     /// A request's largest working set at `<package>|<shape>`.
     Request { key: String, bytes: u64 },
-    /// A request's largest room beside its weights (its compute bytes) at `<package>|<shape>`.
+    /// A request's largest allocations beside its weights (its compute bytes) at
+    /// `<package>|<shape>`: what placement keeps free on GPU 0.
     Compute { key: String, bytes: u64 },
-    /// A pass's room at `<set>|<shape>|<cuts>`, every field as measured.
-    Pass { key: String, room: Room },
     /// A set's resident bytes (its layout's span), by set name.
     Set { key: String, bytes: u64 },
     /// A request's host high-water at `<package>|<shape>` (anonymous bytes; the RAM tier's and
@@ -1398,54 +1331,34 @@ pub enum Peak {
     Host { key: String, bytes: u64 },
 }
 
-/// A pass's measured room, as the ledger keeps it under `room/<set>|<shape>|<cuts>`. One unit
-/// everywhere: the absolute room is the start allocation plus [`Room::bytes`], with the start
-/// measured per (set, shape); a running pass uses its own start allocation instead.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Room {
-    /// What it was measured at: the package entry, the shape, the cut levels in effect.
-    pub entry: String,
-    pub shape: String,
-    pub cuts: std::collections::BTreeMap<String, u32>,
-    pub start: u64,
-    /// Allocated peak less what was allocated at the pass's start.
-    pub delta: u64,
-    pub slack: u64,
-    pub context: u64,
-    pub sites: Vec<SitePeak>,
-}
-
-impl Room {
-    /// Beyond the start allocation.
-    pub fn bytes(&self) -> u64 {
-        self.delta + self.slack + self.context
-    }
-
-    pub fn absolute(&self) -> u64 {
-        self.start + self.bytes()
-    }
-
-}
-
 /// TensorD's handle on one GPU's table.
 pub struct Ledger {
     shared: Arc<Shared>,
+    /// The card's bytes: the capacity again once this TensorD goes (its limit never outlives it).
+    card: u64,
     /// The GPU's wake endpoint, bound by name: every participant signals it.
     events: os::Endpoint,
     custody: custody::Client,
 }
 
+impl Drop for Ledger {
+    fn drop(&mut self) {
+        let _ = self.shared.set_capacity(self.card);
+    }
+}
+
 impl Ledger {
-    /// The GPU's table, named per GPU and user; capacity = min(card, limit), never raised by a
-    /// later opener. A restarted TensorD reopens the same table and drops every dispatch it
-    /// finds (TensorD is the only dispatcher: they are a dead one's). TensorD serves custody when
-    /// it holds the service lock (it does when it starts first).
+    /// The GPU's table, named per GPU and user; capacity = min(card, limit), whatever an earlier
+    /// opener chose, and the card's again when this ledger goes. A restarted TensorD reopens the
+    /// same table and drops every dispatch it finds (TensorD is the only dispatcher: they are a
+    /// dead one's). TensorD serves custody when it holds the service lock (it does when it
+    /// starts first).
     pub fn create(gpu: &GpuId, limit: Option<u64>) -> Result<Ledger> {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
         let table = open_named(&gpu.uuid)?;
         let shared = Arc::new(Shared::adopt(table, gpu, capacity)?);
-        // TensorD is the capacity's authority: min(card, limit) exactly, raised when a limit is
-        // lifted (standalone openers may only lower it).
+        // TensorD is the capacity's authority: min(card, limit) exactly (an opener's limit is
+        // its own row's).
         shared.set_capacity(capacity)?;
         let events = os::wake_bind(shared.ns, &gpu.uuid)?.ok_or_else(|| Error::Invalid(format!("another TensorD holds {}", gpu.uuid)))?;
         shared.reap(None)?;
@@ -1453,7 +1366,7 @@ impl Ledger {
             shared.put(&key, None)?;
         }
         let custody = custody::Client::open(&shared)?;
-        Ok(Ledger { shared, events, custody })
+        Ok(Ledger { shared, card: gpu.memory, events, custody })
     }
 
     /// The machine's sharing mode (shared until TensorD says dedicated).
@@ -1468,7 +1381,7 @@ impl Ledger {
         let table = self.shared.descriptor()?;
         // A transferred grant owns this generation even before the child creates its row.
         os::share(&table, OPEN, 8, true)?;
-        Ok(Grant { table, row: self.shared.descriptor()? })
+        Ok(Grant { table, row: self.shared.descriptor()?, limit: None })
     }
 
     /// After `waitpid`: `pid`'s row goes, and the pages it kept become orphans.
@@ -1534,8 +1447,9 @@ impl Ledger {
     /// The GPU of `group` (an index) that keeps each set of `package`'s request at `shape`
     /// ([`decide::place`]). A set's bytes are its layout's when the caller has it (`Some`),
     /// else as its load recorded them on any GPU of the group, else unknown. Each GPU's room is
-    /// its capacity less foreign bytes and every live row's unmovable bytes (context, torch,
-    /// W, P, and a yielded parent's W unless it waits for `family`); GPU 0's less the
+    /// its capacity less foreign bytes and every live row's unmovable bytes (context; torch, W
+    /// and P, at least its running requests' peaks; a yielded parent's W unless it waits for
+    /// `family`); GPU 0's less the
     /// package's measured compute room too (its room beside its weights, so where its sets
     /// lived when it was measured does not move them).
     pub fn place(group: &[&Ledger], package: &str, shape: &str, family: Option<&str>, sets: &[(&str, Option<u64>)]) -> Result<Vec<u32>> {
@@ -1543,7 +1457,8 @@ impl Ledger {
         let mut rooms = Vec::with_capacity(group.len());
         for (g, l) in group.iter().enumerate() {
             // A yielded parent's W comes back, except to its own family's child.
-            let unmovable = |f: &Facts| f.context + f.torch + [Class::W, Class::P].iter().filter_map(|c| f.classes.get(c.index())).sum::<u64>() + decide::yielded_beside(&f.yielded, family);
+            // A running request holds its recorded peak (its pages and allocations) at least.
+            let unmovable = |f: &Facts| f.context + (f.torch + [Class::W, Class::P].iter().filter_map(|c| f.classes.get(c.index())).sum::<u64>()).max(f.remaining) + decide::yielded_beside(&f.yielded, family);
             let held: u64 = l.shared.rows()?.iter().filter(|r| r.live).map(|r| unmovable(&r.facts)).sum();
             // GPU 0 keeps the package's compute room free: its measured room beside its
             // weights, wherever those lived when it was measured.
@@ -1600,11 +1515,6 @@ impl Ledger {
                 out.push(Peak::Request { key: key.trim_start_matches("peak/").to_string(), bytes });
             }
         }
-        for (key, v) in self.shared.facts("room/").unwrap_or_default() {
-            if let Ok(room) = serde_json::from_slice::<Room>(&v) {
-                out.push(Peak::Pass { key: key.trim_start_matches("room/").to_string(), room });
-            }
-        }
         for (key, v) in self.shared.facts("host/").unwrap_or_default() {
             if let Ok(bytes) = v.try_into().map(u64::from_le_bytes) {
                 out.push(Peak::Host { key: key.trim_start_matches("host/").to_string(), bytes });
@@ -1629,7 +1539,6 @@ impl Ledger {
         for p in peaks {
             match p {
                 Peak::Request { key, bytes } => restore_fact(&self.shared, &format!("peak/{key}"), bytes.to_le_bytes().to_vec())?,
-                Peak::Pass { key, room } => restore_fact(&self.shared, &format!("room/{key}"), os::encode(room)?)?,
                 Peak::Set { key, bytes } => record_set(&self.shared, key, *bytes)?,
                 Peak::Host { key, bytes } => record_host(&self.shared, key, *bytes)?,
                 Peak::Compute { key, bytes } => restore_fact(&self.shared, &format!("compute/{key}"), bytes.to_le_bytes().to_vec())?,
@@ -1796,28 +1705,6 @@ mod tests {
         assert!(shared.free(at, ready & !0xff | CLAIMING, false).unwrap());
         shared.leave().unwrap();
         assert!(!os::linked(&shared.fd).unwrap());
-    }
-
-    #[test]
-    fn one_event_releases_every_local_waiter() {
-        let gpu = GpuId { uuid: format!("unit-{}-waiters", std::process::id()), model: "host".into(), memory: 64 << 20 };
-        let shared = Arc::new(Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, gpu.memory).unwrap());
-        let row = shared.claim(std::process::id()).unwrap();
-        let wake = RoomWake::new(row.endpoint().unwrap());
-        let first = row.waiting();
-        let second = row.waiting();
-        drop(first);
-        assert_eq!(shared.waiting().unwrap(), vec![row.id()], "one departing waiter cannot clear another");
-        let epoch = wake.epoch();
-        shared.ring();
-        std::thread::scope(|scope| {
-            let a = scope.spawn(|| wake.wait(epoch).unwrap());
-            let b = scope.spawn(|| wake.wait(epoch).unwrap());
-            a.join().unwrap();
-            b.join().unwrap();
-        });
-        drop(second);
-        assert!(shared.waiting().unwrap().is_empty());
     }
 
     #[test]

@@ -1,8 +1,7 @@
-//! One process's facts: its sets and their pages, the plans of its requests, their cursors and
-//! the measured rooms; plus the other rows' published bytes. Classes are derived here, never
-//! stored: [`Table::class`] answers from the facts each time.
+//! One process's facts: its sets and their pages, the plans of its requests and their cursors;
+//! plus the other rows' published bytes. Classes are derived here, never stored.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -97,7 +96,8 @@ impl Fingerprint {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let digit = |n: u8| char::from(if n < 10 { b'0' + n } else { b'a' + n - 10 });
+    bytes.iter().flat_map(|b| [digit(b >> 4), digit(b & 0xf)]).collect()
 }
 
 /// A weight set: its layout (one page per region), where its bytes come from, and what they are.
@@ -188,26 +188,8 @@ pub struct Set {
     pub declared: bool,
 }
 
-/// A cut site's facts for the current pass's (set, shape).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CutSite {
-    pub name: String,
-    pub level: u32,
-    /// The finest level its op has: never cut beyond.
-    pub finest: u32,
-    /// Its measured peak at this level.
-    pub peak: u64,
-    /// A finer level did not lower the pass's allocated peak: not cut further at this shape.
-    pub stuck: bool,
-    /// A collective's site: its level changes only as the ranks agree at a pass start.
-    pub collective: bool,
-    /// The pass's measured room one level finer; `None`: unmeasured there.
-    pub finer: Option<u64>,
-    /// The pass's measured room one level coarser, and the room that level last failed at.
-    pub coarser: Option<(u64, Option<u64>)>,
-}
-
-/// Pages a streamed (lowered) step holds at once: one bound while the next lands.
+/// Blocks ahead of a pass's cursor its prefetch maps (free bytes only): one bound while the next
+/// lands.
 pub const SLOTS: u64 = 2;
 
 /// Where a request is in its plan.
@@ -220,14 +202,6 @@ pub struct Cursor {
     pub next: BTreeMap<u32, u32>,
 }
 
-/// The state of one out-of-memory episode (from a pass start to its end).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Episode {
-    /// Free bytes were claimed once (the cap was stale).
-    pub claimed_free: bool,
-    pub parked: bool,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Req {
     pub id: u64,
@@ -235,67 +209,16 @@ pub struct Req {
     /// (set indices, passes) per step; a set not loaded has no index and is not in the plan.
     pub steps: Vec<(Vec<u32>, u32)>,
     pub cursor: Cursor,
-    /// The current pass's room: measured or bounded (`measured`), else the unmeasured reserve.
-    pub room: u64,
-    pub measured: bool,
-    /// Bytes claimed by `oom` answers during the current pass.
-    pub claimed: u64,
-    pub starved: bool,
-    pub lowered: bool,
-    /// Pages fetched speculatively during the current pass.
-    pub speculated: BTreeSet<Key>,
-    /// The largest known pass room per step (None: unmeasured), for the remaining W.
-    pub rooms: Vec<Option<u64>>,
-    /// The cut sites of each set's current pass (a joint step runs several).
-    pub sites: BTreeMap<u32, Vec<CutSite>>,
-    /// Cut levels of op sites outside any pass (the package's own code) by (site, op shape):
-    /// the request's memo.
-    pub outside: BTreeMap<(String, String), u32>,
-    /// Waiting on a child call: the room it gave back, retaken when the wait ends. Meanwhile
-    /// its current step's pages are a later use (D) and it has no remaining W.
-    pub yielded: Option<u64>,
-    /// The family it waits for while yielded (`crate::ledger` publishes it; 0: none).
+    /// Its dispatch key's recorded peak (the most it held: pages and allocations): what TensorD
+    /// admits it against and what it asks peers for at its open and pass starts. `None`:
+    /// unmeasured (it asks for every idle byte).
+    pub peak: Option<u64>,
+    /// Waiting on a child call: its current step is a later use meanwhile, and its peak counts
+    /// for everyone's admission but its family's child (`crate::ledger` publishes it).
+    pub yielded: bool,
     pub family: u64,
-    pub episode: Episode,
-    /// Its room outside its passes (its setup, between passes).
-    pub aside: Aside,
-    /// The last OOM answered Retry, by site: a second one there with no progress past it
-    /// escalates (lead, v6 13592: the whole decode re-ran at one level three times). A pass's
-    /// end does not clear it: a failed try ends its passes too (S4's tiled decode).
-    pub retried: Option<Retried>,
-}
-
-/// A request's room outside its passes (its setup, between passes), as its dispatch key's
-/// records give it (review 6, C3).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Aside {
-    /// Measured: for its key, else the largest of its package's at any shape.
-    Measured(u64),
-    /// Its package was never measured: every idle byte is its (the idle-GPU rule, peers'
-    /// idle pages included).
-    Unmeasured,
-    /// No dispatch key (a standalone call): its own idle pages, lent.
-    #[default]
-    Unknown,
-}
-
-impl Aside {
-    pub fn bytes(self) -> Option<u64> {
-        match self {
-            Aside::Measured(b) => Some(b),
-            Aside::Unmeasured | Aside::Unknown => None,
-        }
-    }
-}
-
-/// Where an OOM answered Retry failed: its site, op shape, the site's level then, and how far
-/// the allocation had got (torch's allocated bytes plus the failing need).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Retried {
-    pub site: String,
-    pub shape: String,
-    pub level: u32,
-    pub at: u64,
+    /// Idle work (a graph capture off the request path): free bytes only, never evicting.
+    pub idle: bool,
 }
 
 impl Req {
@@ -307,12 +230,12 @@ impl Req {
     /// A yielded request uses nothing now: its current step is one step ahead.
     pub fn distance(&self, key: Key) -> Option<(u32, u32, u32)> {
         let d = self.plan_distance(key)?;
-        Some(if self.yielded.is_some() && d.0 == 0 { (1, d.1, d.2) } else { d })
+        Some(if self.yielded && d.0 == 0 { (1, d.1, d.2) } else { d })
     }
 
     /// The current step's sets are in use until the cursor leaves the step, however many
-    /// passes they run (a tiled decode runs one per tile; lead, 10-22): a block used this pass
-    /// is next used by the next pass. Declared passes only order the steps after it.
+    /// passes they run (a tiled decode runs one per tile): a block used this pass is next used
+    /// by the next pass. Declared passes only order the steps after it.
     fn plan_distance(&self, key: Key) -> Option<(u32, u32, u32)> {
         let (set, block) = key;
         let (sets, _) = self.step(self.cursor.step)?;
@@ -329,15 +252,9 @@ impl Req {
         (self.cursor.step + 1..self.steps.len() as u32).find(|i| self.step(*i).is_some_and(|(s, _)| s.contains(&set))).map(|i| i - self.cursor.step)
     }
 
-    /// How far a cache serving `set` is from its next use: the current step (its next pass) or
-    /// the first later step that runs the set; past every block of it, so it goes before the
-    /// set's pages at the same distance. `None`: the plan declares the set no more.
-    pub fn cache_distance(&self, set: u32) -> Option<(u32, u32, u32)> {
-        let (sets, _) = self.step(self.cursor.step)?;
-        if sets.contains(&set) {
-            return Some((0, 1, u32::MAX));
-        }
-        self.later(set).map(|i| (i, 0, u32::MAX))
+    /// Whether `set` is in its current step.
+    pub fn runs(&self, set: u32) -> bool {
+        self.step(self.cursor.step).is_some_and(|(s, _)| s.contains(&set))
     }
 }
 
@@ -346,18 +263,12 @@ impl Req {
 pub struct Cache {
     pub id: u32,
     pub owner: String,
-    /// The components (sets) it serves, if any: it takes the most protective class among
-    /// them (D while a plan still declares any, N otherwise) and goes before their pages.
-    pub sets: Vec<u32>,
     pub bytes: u64,
     pub last_use: u64,
     /// Holds out (a graph replay's preparation until its GPU completion) and the release
-    /// events still pending: held, it is P, and nothing asks it to shrink (review 6, C1).
+    /// events still pending: held, nothing shrinks it.
     pub holds: u32,
     pub releasing: Vec<u64>,
-    /// Bytes its shrink queued and has not given back yet (the domain lock was busy): coming,
-    /// as a peer's deferred shrink is (review 6, C2).
-    pub coming: u64,
     /// Its shrinks running, and the bytes it reported meanwhile: applied after them, so a
     /// shrink's return never overwrites a report made during it.
     pub shrinking: u32,
@@ -365,10 +276,8 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// Its caller's word on its bytes: any queued shrink's have arrived.
-    pub fn report(&mut self, bytes: u64) {
-        self.bytes = bytes;
-        self.coming = 0;
+    pub fn held(&self) -> bool {
+        self.holds > 0 || !self.releasing.is_empty()
     }
 }
 
@@ -377,18 +286,17 @@ impl Cache {
 pub struct Remote {
     /// Its row's offset and generation (a reused offset is another row).
     pub row: u64,
-    /// It has a request open: an ask reaches only its pages.
+    /// It has a request open.
     pub running: bool,
     pub context: u64,
     pub torch: u64,
-    /// Actual unique device backing attributed to this row, including context/native bytes;
-    /// admission promises are excluded. Orphans remain on custody's separate counter.
+    /// Actual unique device backing attributed to this row, including context/native bytes.
+    /// Orphans remain on custody's separate counter.
     pub physical: u64,
-    /// Of `torch`, what its trim hook and caches give back when it is idle.
+    /// Of `torch`, its caches' bytes when it is idle (display).
     pub caches: u64,
     pub classes: [u64; 7],
-    /// Bytes it is giving back: retiring pages (of P) and its caches' queued shrinks (of torch's);
-    /// still held, reachable once they land.
+    /// Bytes it is giving back: retiring pages (of P); still held, reachable once they land.
     pub returning: u64,
 }
 
@@ -397,15 +305,10 @@ impl Remote {
         self.context + self.torch + self.classes.iter().enumerate().filter(|(c, _)| *c != Class::O.index()).map(|(_, b)| b).sum::<u64>()
     }
 
-    /// What no ask can free: its context, torch's bytes beyond its idle caches, W and P.
-    pub fn unevictable(&self) -> u64 {
-        self.held().saturating_sub(self.evictable(Class::D) + self.returning.min(self.classes.get(Class::P.index()).copied().unwrap_or(0)))
-    }
-
-    /// What its ask thread can free under `ceiling`.
-    pub fn evictable(&self, ceiling: Class) -> u64 {
-        let pages: u64 = [Class::S, Class::N, Class::D].iter().filter(|c| **c <= ceiling).filter_map(|c| self.classes.get(c.index())).sum();
-        pages + if self.running { 0 } else { self.caches }
+    /// The pages its ask thread may give back: those no running step of its uses (S, N and D;
+    /// of D, it gives what only a request waiting on a child call uses).
+    pub fn idle(&self) -> u64 {
+        [Class::S, Class::N, Class::D].iter().filter_map(|c| self.classes.get(c.index())).sum()
     }
 }
 
@@ -413,11 +316,13 @@ impl Remote {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Table {
     pub capacity: u64,
+    /// This row's own cap (a standalone opener's limit); the table's capacity is TensorD's.
+    pub limit: Option<u64>,
     /// Bytes on the device no row accounts for, measured, beyond what the card leaves outside
     /// the table's cap (`capacity`): `capacity - foreign` is min(cap, card - foreign bytes).
     pub foreign: u64,
     /// Actual unique device backing for this row: context, committed native allocations and
-    /// resident VMM backing. No placeholders or future promises; retiring aliases count once.
+    /// resident VMM backing. No placeholders; retiring aliases count once.
     pub physical: u64,
     /// Unique actual VMM backing, including retired/quarantined backing until ownership ends.
     pub vmm: u64,
@@ -425,12 +330,14 @@ pub struct Table {
     pub mapping: u64,
     /// Unique retiring subset of vmm; ownership-lost quarantines remain vmm but cannot return.
     pub returning: u64,
-    /// This process's driver context.
+    /// This process's driver context (its device bytes beyond pages and the hook's segments).
     pub context: u64,
+    /// The allocator hook's segments (torch's bytes in varena's pool), exactly, and the room
+    /// held for its segments not allocated yet ([`crate::memory::Claim`]).
+    pub segments: u64,
+    pub claimed: u64,
     /// Kept pages no live process maps, on this device (custody's).
     pub orphans: u64,
-    /// Host bytes available now, for parking.
-    pub headroom: u64,
     /// Bytes of kept pages this process unmapped whose Withdraw custody has not had yet: its
     /// handle still holds them (pinned, P).
     pub pending: u64,
@@ -438,18 +345,10 @@ pub struct Table {
     /// device (P to others), already spent on the creates queued after them (not to itself).
     pub inflight: u64,
     /// Own pages pinned only by varena's own short work (a RAM-tier copy, a Keep's protect):
-    /// evictable again once it ends, so a demand waits for them before it degrades (review 4, N4).
+    /// evictable again once it ends.
     pub transient: u64,
-    /// The machine's largest measured outside room (any dispatch key): a GPU-level load leaves
-    /// it free even before a request opens.
-    pub aside: u64,
-    /// Torch's allocator, as last measured (pass start and end, every OOM).
-    pub allocated: u64,
-    pub reserved: u64,
-    /// Future native graph-pool allocations reserved before capture.
-    pub promised: u64,
-    /// Shared mode (a machine its owner also uses): speculation never grows this process's
-    /// footprint, so it takes only what it frees of its own.
+    /// Shared mode (a machine its owner also uses): prefetch never grows this process's
+    /// footprint.
     pub shared: bool,
     /// Indexed by set id; `None` once unloaded.
     pub sets: Vec<Option<Set>>,
@@ -475,7 +374,10 @@ impl Table {
         self.requests.iter_mut().find(|r| r.id == id)
     }
 
-    /// Every page, mapped or not.
+    pub fn cache_mut(&mut self, id: u32) -> Option<&mut Cache> {
+        self.caches.iter_mut().find(|c| c.id == id)
+    }
+
     pub fn pages(&self) -> impl Iterator<Item = (Key, &Page)> {
         self.sets.iter().enumerate().filter_map(|(s, set)| set.as_ref().map(|set| (s as u32, set))).flat_map(|(s, set)| set.pages.iter().enumerate().map(move |(b, p)| ((s, b as u32), p)))
     }
@@ -483,57 +385,6 @@ impl Table {
     /// The nearest next use over the open requests.
     pub fn distance(&self, key: Key) -> Option<(u32, u32, u32)> {
         self.requests.iter().filter_map(|r| r.distance(key)).min()
-    }
-
-    pub fn cache_mut(&mut self, id: u32) -> Option<&mut Cache> {
-        self.caches.iter_mut().find(|c| c.id == id)
-    }
-
-    /// A cache's nearest next use over the open requests and its sets.
-    pub fn cache_distance(&self, c: &Cache) -> Option<(u32, u32, u32)> {
-        self.requests.iter().flat_map(|r| c.sets.iter().filter_map(|s| r.cache_distance(*s))).min()
-    }
-
-    /// Bytes a GPU-level load leaves free: every open request's outside room and next measured
-    /// pass room, at least the machine's largest measured outside room; everything beside an
-    /// open request with either unmeasured.
-    pub fn held_back(&self) -> u64 {
-        let mut held = 0u64;
-        for r in &self.requests {
-            let next = r.rooms.get(r.cursor.step as usize).copied().flatten();
-            match (r.aside.bytes(), next) {
-                (Some(aside), Some(room)) => held = held.saturating_add(aside).saturating_add(room),
-                _ => return u64::MAX,
-            }
-        }
-        held.max(self.aside)
-    }
-
-    /// Bytes this process could have now beside every W and P, evicting neither: the free
-    /// bytes, its S, N and D pages, its caches and the allocator's slack.
-    pub fn spare(&self) -> u64 {
-        let c = self.classes();
-        let pages: u64 = [Class::S, Class::N, Class::D].iter().filter_map(|k| c.get(k.index())).sum();
-        self.free() + pages + self.caches.iter().map(|c| c.bytes).sum::<u64>() + self.slack()
-    }
-
-    /// A cache's class, exactly its sets' (review 6, C1): P while held or its release is
-    /// pending, W while a running step uses any of its sets, D while a plan still declares one,
-    /// N otherwise.
-    pub fn cache_class(&self, c: &Cache) -> Class {
-        if c.holds > 0 || !c.releasing.is_empty() {
-            return Class::P;
-        }
-        match self.cache_distance(c) {
-            Some((0, ..)) => Class::W,
-            Some(_) => Class::D,
-            None => Class::N,
-        }
-    }
-
-    /// The request whose current step uses `key` next, nearest first.
-    pub fn user(&self, key: Key) -> Option<&Req> {
-        self.requests.iter().filter(|r| r.distance(key).is_some_and(|d| d.0 == 0)).min_by_key(|r| r.distance(key))
     }
 
     /// The class of a mapped page; `None` when unmapped.
@@ -573,27 +424,13 @@ impl Table {
         self.pages().filter(|(_, p)| p.mapped).map(|(_, p)| p.bytes).sum()
     }
 
-    /// Torch's bytes as this row counts them: the open requests' rooms and claims, or what the
-    /// allocator holds when that is more.
-    pub fn torch(&self) -> u64 {
-        self.requests.iter().map(|r| r.room + r.claimed).sum::<u64>().max(self.reserved.saturating_add(self.promised))
-    }
-
-    /// The allocator's slack beyond what the rooms need: free once the trim hook runs (F).
-    pub fn slack(&self) -> u64 {
-        let rooms: u64 = self.requests.iter().map(|r| r.room + r.claimed).sum();
-        self.reserved.saturating_sub(rooms.max(self.allocated))
-    }
-
     pub fn held(&self) -> u64 {
-        self.context + self.torch() + self.vmm + self.mapping
+        self.context + self.segments + self.claimed + self.vmm + self.mapping
     }
 
-    /// Unique backing already retiring. It remains charged until its owners finish; neither
-    /// overlapping mechanism/custody tickets nor ownership-lost quarantines add reclaim credit.
+    /// Unique backing already retiring, own and others': still charged until its owners finish.
     pub fn returning(&self) -> u64 {
-        // A peer's: its retiring pages (P) and its caches' bytes coming (torch's).
-        self.returning.min(self.vmm) + self.transient + self.caches.iter().map(|c| c.coming).sum::<u64>() + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0) + r.torch)).sum::<u64>()
+        self.returning.min(self.vmm) + self.transient + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
     }
 
     fn others_held(&self) -> u64 {
@@ -601,7 +438,7 @@ impl Table {
     }
 
     /// Driver usage not owned by a row or custody, charged only past the card's room outside
-    /// this cap. Logical room/claims/workspace promises never alter physical attribution.
+    /// this cap.
     pub fn foreign_used(&self, card_capacity: u64, driver_used: u64) -> u64 {
         let physical = self.others.iter().fold(self.physical.saturating_add(self.orphans), |held, row| held.saturating_add(row.physical));
         self.foreign_from_known(card_capacity, driver_used, physical)
@@ -613,90 +450,33 @@ impl Table {
         driver_used.saturating_sub(known).saturating_sub(card_capacity.saturating_sub(self.capacity))
     }
 
-    /// F: what no row, orphan or foreign tenant holds.
+    /// The one budget: the ledger's capacity less foreign bytes, orphans and the other rows,
+    /// within this row's own cap.
+    pub fn budget(&self) -> u64 {
+        let room = self.capacity.saturating_sub(self.foreign + self.orphans + self.others_held());
+        self.limit.map_or(room, |l| room.min(l))
+    }
+
+    /// F: the budget less what this row holds.
     pub fn free(&self) -> u64 {
-        self.capacity.saturating_sub(self.foreign + self.orphans + self.held() + self.others_held())
+        self.budget().saturating_sub(self.held())
     }
 
-    /// The most this process could ever have beside torch's allocation: the capacity less
-    /// foreign bytes, its context, that allocation and what no ask can free from other rows.
-    pub fn reachable(&self) -> u64 {
-        self.torch_ceiling().saturating_sub(self.allocated)
-    }
-
-    /// The most torch's allocator could ever hold (its fraction cap beside a pool varena's own
-    /// allocator governs): the capacity less foreign bytes, the context and what no ask can free
-    /// from other rows. Its own pages and others' evictable bytes count: they can be made room.
-    pub fn torch_ceiling(&self) -> u64 {
-        let others: u64 = self.others.iter().map(Remote::unevictable).sum();
-        self.capacity.saturating_sub(self.foreign + self.context + others)
-    }
-
-    /// What torch's allocator may hold: capacity − context − mapped − other rows − foreign.
-    pub fn torch_limit(&self) -> u64 {
-        self.capacity.saturating_sub(self.foreign + self.orphans + self.context + self.vmm + self.mapping + self.promised + self.others_held())
-    }
-
-    /// The bytes of a step's pages.
-    fn step_pages(&self, sets: &[u32]) -> u64 {
-        sets.iter().filter_map(|s| self.sets.get(*s as usize)?.as_ref()).flat_map(|s| s.pages.iter()).map(|p| p.bytes).sum()
-    }
-
-    /// A step's pages as the request holds them: all, or, lowered, every one it holds mapped
-    /// plus the streaming slots (never more than all).
-    fn held_pages(&self, req: &Req, sets: &[u32]) -> u64 {
-        let all = self.step_pages(sets);
-        if !req.lowered {
-            return all;
-        }
-        let pages = || sets.iter().filter_map(|s| self.sets.get(*s as usize)?.as_ref()).flat_map(|s| s.pages.iter());
-        let largest = pages().map(|p| p.bytes).max().unwrap_or(0);
-        let mapped: u64 = pages().filter(|p| p.mapped).map(|p| p.bytes).sum();
-        all.min(mapped + largest * SLOTS)
-    }
-
-    /// The request's working set now: its current step's pages (as it holds them) plus its
-    /// room; all absolute bytes.
-    pub fn w(&self, req: &Req) -> u64 {
-        self.step_held(req) + req.room + req.claimed
-    }
-
-    /// The current step's pages as the request holds them.
-    pub fn step_held(&self, req: &Req) -> u64 {
-        req.step(req.cursor.step).map_or(0, |(sets, _)| self.held_pages(req, sets))
-    }
-
-    /// The largest W left in the request's plan (absolute: each step's pages plus its room as
-    /// started from its measured start allocation, the current step's at least its room now);
-    /// `None` while a remaining step is unmeasured. A yielded request has none.
+    /// The largest W left: the request's recorded peak; `None` unmeasured. A yielded request
+    /// has none (its family's child runs in its place).
     pub fn remaining(&self, req: &Req) -> Option<u64> {
-        if req.yielded.is_some() {
+        if req.yielded {
             return Some(0);
         }
-        let now = req.measured.then_some(req.room + req.claimed);
-        let steps = req.steps.iter().zip(&req.rooms).enumerate().skip(req.cursor.step as usize);
-        steps
-            .map(|(i, ((sets, _), room))| {
-                let room = if i == req.cursor.step as usize { (*room).max(now) } else { *room };
-                room.map(|room| self.held_pages(req, sets) + room)
-            })
-            .try_fold(0, |m, w| w.map(|w| m.max(w)))
-    }
-
-    /// A yielded request's remaining W as it will be when its wait ends (0 when not yielded):
-    /// admission counts it for everyone but its family's child.
-    pub fn yielded_w(&self, req: &Req) -> u64 {
-        let Some(room) = req.yielded else { return 0 };
-        let back = Req { room, yielded: None, ..req.clone() };
-        self.remaining(&back).unwrap_or_else(|| self.w(&back))
+        req.peak
     }
 
     /// Yielded W per family waited for, in a row's slots: the largest families apart, any more
     /// than the slots together under family 0 (counted for every child).
     pub fn yielded_by_family(&self) -> [(u64, u64); crate::decide::YIELDED] {
         let mut by: BTreeMap<u64, u64> = BTreeMap::new();
-        for r in self.requests.iter().filter(|r| r.yielded.is_some()) {
-            *by.entry(r.family).or_default() += self.yielded_w(r);
+        for r in self.requests.iter().filter(|r| r.yielded) {
+            *by.entry(r.family).or_default() += r.peak.unwrap_or_else(|| self.step_pages(r));
         }
         let mut families: Vec<(u64, u64)> = by.into_iter().collect();
         families.sort_by_key(|(f, w)| (std::cmp::Reverse(*w), *f));
@@ -715,9 +495,14 @@ impl Table {
         out
     }
 
+    /// The bytes of the request's current step's pages.
+    fn step_pages(&self, r: &Req) -> u64 {
+        r.steps.get(r.cursor.step as usize).map_or(0, |(sets, _)| sets.iter().filter_map(|s| self.sets.get(*s as usize)?.as_ref()).flat_map(|s| s.pages.iter()).map(|p| p.bytes).sum())
+    }
+
     /// Pinned bytes outside every open request's current step (counted apart by `fits`).
     pub fn outside(&self) -> u64 {
-        let current = |(set, _): Key| self.requests.iter().any(|r| r.step(r.cursor.step).is_some_and(|(s, _)| s.contains(&set)));
+        let current = |(set, _): Key| self.requests.iter().any(|r| r.runs(set));
         self.pages().filter(|(k, p)| p.mapped && p.pinned() && !current(*k)).map(|(_, p)| p.bytes).sum()
     }
 }

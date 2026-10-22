@@ -5,48 +5,23 @@ const M: u64 = 1 << 20;
 
 fn own() -> Table {
     Table {
-        capacity: 24 * M, physical: 8 * M, vmm: 4 * M, context: M, reserved: 3 * M,
+        capacity: 24 * M, physical: 8 * M, vmm: 4 * M, context: M, segments: 3 * M,
         sets: vec![Some(Set { name: "weights".into(), pages: vec![Page { bytes: 4 * M, mapped: true, ..Page::default() }], ..Set::default() })],
         requests: vec![Req { id: 1, ..Req::default() }], ..Table::default()
     }
 }
 
 #[test]
-fn own_and_peer_promises_cannot_reduce_physical_foreign_usage() {
+fn a_peers_published_bytes_cannot_reduce_physical_foreign_usage() {
     let mut t = own();
     t.others.push(Remote { row: 2, context: M, torch: 3 * M, physical: 4 * M, ..Remote::default() });
     t.orphans = M;
     t.foreign = t.foreign_used(24 * M, 16 * M);
     assert_eq!(t.foreign, 3 * M);
     let free = t.free();
-    t.promised = 2 * M;
-    assert_eq!(t.foreign_used(24 * M, 16 * M), 3 * M);
-    assert_eq!(t.free(), free - 2 * M);
-    t.promised = 0;
-    t.requests[0].claimed = 5 * M; // Two bytes beyond the three already physically reserved.
-    assert_eq!(t.foreign_used(24 * M, 16 * M), 3 * M);
-    assert_eq!(t.free(), free - 2 * M);
-    t.requests[0].claimed = 0;
     t.others[0].torch += 2 * M;
     assert_eq!(t.foreign_used(24 * M, 16 * M), 3 * M);
     assert_eq!(t.free(), free - 2 * M);
-}
-
-#[test]
-fn successful_credit_conversion_does_not_charge_the_same_bytes_twice() {
-    let mut t = own();
-    t.promised = 2 * M;
-    t.foreign = t.foreign_used(24 * M, 10 * M);
-    let admitted = t.free();
-    // Consuming the promise provisionally changes admission fields, not actual backing.
-    t.promised = 0;
-    t.reserved += 2 * M;
-    assert_eq!(t.foreign_used(24 * M, 10 * M), 2 * M);
-    assert_eq!(t.free(), admitted);
-    // Only the successful driver allocation adds physical bytes; actual driver used agrees.
-    t.physical += 2 * M;
-    assert_eq!(t.foreign_used(24 * M, 12 * M), 2 * M);
-    assert_eq!(t.free(), admitted);
 }
 
 #[test]
@@ -72,7 +47,7 @@ fn shared_retirement_and_custody_handover_count_unique_backing_once() {
     // to the caller's unique physical observation again.
     t.foreign = t.foreign_used(8 * M, 6 * M);
     assert_eq!(t.foreign, 2 * M);
-    assert_eq!(t.torch_limit(), 2 * M, "overlapping tickets cannot cause a false allocator refusal");
+    assert_eq!(t.free(), 2 * M, "overlapping tickets cannot cause a false allocator refusal");
     assert_eq!(t.classes()[Class::P.index()], 4 * M);
     t.inflight = 0;
     assert_eq!(t.foreign_used(8 * M, 6 * M), 2 * M);
@@ -105,7 +80,7 @@ fn quarantined_backing_stays_charged_but_is_not_available_returning_memory() {
     assert_eq!(t.held(), 4 * M);
     assert_eq!(t.classes()[Class::P.index()], 4 * M);
     assert_eq!(t.returning(), 0);
-    assert_eq!(t.torch_limit(), 4 * M);
+    assert_eq!(t.free(), 4 * M);
 }
 
 #[test]

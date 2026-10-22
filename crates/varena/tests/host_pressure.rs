@@ -19,7 +19,7 @@ use std::{
 };
 use tensorfs::{format::ObjectRef, io::{source::Source as FileSource, ItemSource, ObjectRange}};
 use varena::layout::{Item, Layout, Part, Region};
-use varena::{Fill, Fingerprint, GpuId, HostBackend, Ledger, Level, Measured, Memory, Plan, SetSpec, Step, Tier, Torch};
+use varena::{Fill, Fingerprint, GpuId, HostBackend, Ledger, Level, Memory, Plan, SetSpec, Step, Tier};
 
 const MIB: u64 = 1 << 20;
 /// The scope: what it holds is sized against this.
@@ -228,7 +228,7 @@ fn executor() {
             ["request", id, using @ ..] => {
                 let steps = using.iter().map(|s| Step { sets: vec![s.to_string()], passes: 1 }).collect();
                 let begun = memory.as_ref().unwrap().request(id, Plan { steps }).unwrap();
-                pass = using.first().map(|s| begun.pass(sets[*s], "fwd", "1x1", Torch::default()).unwrap());
+                pass = using.first().map(|s| begun.pass(sets[*s], "k").unwrap());
                 request = Some(begun);
                 "begun".to_string()
             }
@@ -238,7 +238,7 @@ fn executor() {
             }
             ["end"] => {
                 if let Some(pass) = pass.take() {
-                    pass.end(Measured::default(), Torch::default());
+                    pass.end(0);
                 }
                 format!("ended {}", request.take().unwrap().end().host.map_or("none".into(), |h| h.to_string()))
             }

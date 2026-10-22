@@ -23,7 +23,7 @@ use tensorfs::format::ObjectRef;
 use tensorfs::io::source::Source;
 use tensorfs::io::{Dst, ItemSource, ObjectRange};
 use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
-use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Next, Physical, Plan, Result, SetSpec, Step, Torch, Va};
+use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Physical, Plan, Result, SetSpec, Step, Va};
 
 #[derive(Default)]
 struct Events {
@@ -360,7 +360,7 @@ fn a_page_is_kept_only_after_its_transform_completes() {
     let mem = Memory::open(g.clone(), None, Box::new(backend)).unwrap();
     let id = mem.load(set(dir.path(), &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["lora".into()], passes: 1 }] }).unwrap();
-    let pass = r.pass(id, "fwd", "1x1", Torch::default()).unwrap();
+    let pass = r.pass(id, "k").unwrap();
     let pin = mem.bind(id, 0, 1).unwrap();
     assert!(pin.fresh, "a declared fill comes back fresh");
     pin.filled();
@@ -368,7 +368,7 @@ fn a_page_is_kept_only_after_its_transform_completes() {
     drop(pin);
     // Decisions run (the lock drains releases), the transform's event still pending.
     for _ in 0..3 {
-        mem.torch_limit();
+        mem.make_room(0).unwrap();
     }
     assert!(events.kept.lock().is_empty(), "kept while its transform ran: {:?}", events.kept.lock());
     // Another binder waits on the transform in-stream and gets the page, not fresh.
@@ -378,16 +378,17 @@ fn a_page_is_kept_only_after_its_transform_completes() {
     drop(again);
     let last = events.next.load(Ordering::Relaxed);
     events.complete(transform);
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     // Its consumers' releases are pending: no protect yet (a page in use is never protected).
     assert!(events.kept.lock().is_empty(), "protected while its consumers' streams ran: {:?}", events.kept.lock());
     (1..=last).for_each(|e| events.complete(e));
-    mem.torch_limit();
-    // The mechanism makes it read-only, then exports it.
+    mem.make_room(0).unwrap();
+    // While its request runs the page is the allocator hook's; once it ends the mechanism
+    // makes it read-only, then exports it.
+    pass.end(0);
+    drop(r);
     events.await_log(|log| log.len() >= 2);
     assert_eq!(*events.kept.lock(), vec!["protect", "export"], "read-only, then exported, once complete");
-    pass.end(Default::default(), Torch::default());
-    drop(r);
 }
 
 /// Review 1, finding 12: a page released with its transform undone goes, but only after the
@@ -403,17 +404,17 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     let mem = Memory::open(g.clone(), None, Box::new(backend)).unwrap();
     let id = mem.load(set(dir.path(), &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["lora".into()], passes: 1 }] }).unwrap();
-    let _pass = r.pass(id, "fwd", "1x1", Torch::default()).unwrap();
+    let _pass = r.pass(id, "k").unwrap();
     let pin = mem.bind(id, 0, 1).unwrap();
     assert!(pin.fresh);
     drop(pin);
     let release = events.next.load(Ordering::Relaxed);
     for _ in 0..3 {
-        mem.torch_limit();
+        mem.make_room(0).unwrap();
     }
     assert_eq!(events.unmaps.load(Ordering::Relaxed), 0, "unmapped while its consumer's stream ran");
     events.complete(release);
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     while events.unmaps.load(Ordering::Relaxed) == 0 {
         ledger.await_event().unwrap();
     }
@@ -437,7 +438,7 @@ fn a_binder_never_waits_on_a_release_event() {
     let mem = Arc::new(Memory::open(g.clone(), None, Box::new(backend)).unwrap());
     let id = mem.load(set(dir.path(), &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["lora".into()], passes: 1 }] }).unwrap();
-    let _pass = r.pass(id, "fwd", "1x1", Torch::default()).unwrap();
+    let _pass = r.pass(id, "k").unwrap();
     // Released fresh with its transform undone: its bytes are not the weights, and the stream
     // that read it has not finished.
     drop(mem.bind(id, 0, 1).unwrap());
@@ -607,7 +608,7 @@ fn no_call_waits_on_custody() {
     let a = mem.load(named("a"), Level::Ram).unwrap();
     let b = mem.load(named("b"), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["b".into(), "a".into()], passes: 1 }] }).unwrap();
-    let _pass = r.pass(b, "fwd", "1x1", Torch::default()).unwrap();
+    let _pass = r.pass(b, "k").unwrap();
     // Custody stops answering. A's page is filled and kept: its export holds the sender thread.
     custody.close();
     drop(mem.bind(a, 0, 0).unwrap());
@@ -746,15 +747,15 @@ fn a_create_short_of_memory_decides_again() {
     let pin = mem.bind(a, 0, 0).unwrap();
     let cold: u64 = ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum();
     assert_eq!(cold, 0, "the cold page went for it");
-    drop(pin);
-    // Everything else lands: nothing is left to give (the first page's consumer still reads
-    // it), and the bind says so, short by what the page lacks of the measured free half page
-    // (S2's v2-native: never "1 byte short" from a stale estimate).
+    // Everything else lands: nothing is left to give (the first page is still bound), and the
+    // bind says so, short by what the page lacks of the measured free half page (S2's
+    // v2-native: never "1 byte short" from a stale estimate).
     events.lands.store(4 * REGION_ALIGN, Ordering::SeqCst);
     match mem.bind(a, 1, 0) {
         Err(varena::Error::Exhausted(e)) => assert_eq!(e.need, REGION_ALIGN / 2, "{e:?}"),
         other => panic!("exhausted: {:?}", other.map(|p| p.ptr)),
     }
+    drop(pin);
 }
 
 #[cfg(target_os = "linux")]
@@ -975,7 +976,7 @@ fn an_unmeasurable_process_keeps_its_opened_context() {
     let events = Arc::new(Events::default());
     events.unmeasured.store(5 << 20, Ordering::SeqCst);
     let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events })).unwrap();
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     let pid = std::process::id();
     assert_eq!(ledger.status().rows.iter().find(|r| r.pid == pid && r.context > 0).map(|r| r.context), Some(5 << 20));
     drop(mem);
@@ -1009,7 +1010,7 @@ fn a_kept_page_is_never_overwritten_under_its_old_key() {
     // Kept once the bake completed and its consumer let go (a page in use is never protected).
     drop(pin);
     (1..=events.next.load(Ordering::Relaxed)).for_each(|e| events.complete(e));
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     log.await_call(|(_, c)| c.contains("Export") && c.contains(&old));
     // Another consumer reads it and lets go; custody stops answering; lora-b is loaded.
     drop(mem.bind(id, 0, 1).unwrap());
@@ -1045,10 +1046,12 @@ fn a_capped_table_keeps_its_cap_beside_other_occupants() {
     events.foreign.store(40 << 20, Ordering::SeqCst);
     let grant = varena::Grant::open(&g, Some(8 << 20)).unwrap();
     let mem = Memory::open(g.clone(), Some(grant), Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
-    assert_eq!(mem.torch_limit(), 8 << 20, "the whole cap: the card has 24 MB outside the others");
+    mem.make_room(0).unwrap();
+    assert_eq!(mem.free(), 8 << 20, "the whole cap: the card has 24 MB outside the others");
     // The others grow to leave the card less than the cap.
     events.foreign.store(60 << 20, Ordering::SeqCst);
-    assert_eq!(mem.torch_limit(), 4 << 20, "min(cap, card - others)");
+    mem.make_room(0).unwrap();
+    assert_eq!(mem.free(), 4 << 20, "min(cap, card - others)");
 }
 
 /// One Memory per device per process: a row is a process.
@@ -1109,7 +1112,7 @@ fn a_waiting_unmap_holds_no_lock() {
     };
     events.unmap_waits.pass();
     // The unmap waits; the state lock is free.
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     events.unmap_gate.open();
     binder.join().unwrap();
 }
@@ -1141,7 +1144,7 @@ fn a_page_with_a_keep_queued_is_renewed_after_its_consumers() {
     events.unmap_waits.pass();
     // P's fill completes: the next decision queues its Keep behind the held unmap.
     events.complete(filled);
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     let protects = || events.kept.lock().iter().filter(|c| **c == "protect").count();
     let before = protects();
     // A fill-identity switch (a LoRA change), then a bind: P is renewed, not refilled in place.
@@ -1167,11 +1170,10 @@ fn a_page_with_a_keep_queued_is_renewed_after_its_consumers() {
     pin.filled();
 }
 
-/// An OOM's Retry comes once its unmaps are done (the mechanism's, off the lock): the caller
-/// retries its allocation into bytes the device has freed. The mechanism never waits on the
-/// caller's pins.
+/// `make_room` returns once its unmaps are done (the mechanism's, off the lock): the hook maps
+/// into bytes the device has freed. The mechanism never waits on the caller's pins.
 #[test]
-fn an_oom_retries_once_its_unmaps_are_done() {
+fn make_room_returns_once_its_unmaps_are_done() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("oomunmap-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 2 * REGION_ALIGN };
@@ -1180,23 +1182,22 @@ fn an_oom_retries_once_its_unmaps_are_done() {
     let events = Arc::new(Events::default());
     let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
     mem.load(stored(dir.path(), &uuid, "n", 1), Level::Gpu).unwrap();
-    mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
+    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
     mem.settle();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+    // The pass start withdraws the kept idle page from custody: the hook's to take.
+    let _pass = r.pass(a, "k").unwrap();
     let before = events.unmaps.load(Ordering::SeqCst);
     events.hold_unmap.store(true, Ordering::SeqCst);
-    let oom = std::thread::spawn({
-        let events = events.clone();
-        move || {
-            let next = r.oom(None, Some(2 * REGION_ALIGN), None, Torch::default());
-            (matches!(next, varena::Next::Retry), events.unmaps.load(Ordering::SeqCst))
-        }
+    let made = std::thread::spawn({
+        let (events, mem) = (events.clone(), mem.clone());
+        move || (mem.make_room(2 * REGION_ALIGN).is_ok(), events.unmaps.load(Ordering::SeqCst))
     });
     events.unmap_waits.pass();
     events.unmap_gate.open();
-    let (retry, seen) = oom.join().unwrap();
-    assert!(retry);
-    assert!(seen > before, "the Retry came before the cold page's unmap was done");
+    let (made, seen) = made.join().unwrap();
+    assert!(made);
+    assert!(seen > before, "make_room returned before the cold page's unmap was done");
 }
 
 /// The lead's memory6 suspect: a drain queries only each stream's oldest pending event (one
@@ -1221,7 +1222,7 @@ fn a_drain_queries_each_stream_once() {
     let last = events.next.load(Ordering::SeqCst);
     let per_lock = || {
         let before = events.queries.load(Ordering::SeqCst);
-        mem.torch_limit();
+        mem.make_room(0).unwrap();
         events.queries.load(Ordering::SeqCst) - before
     };
     per_lock();
@@ -1257,8 +1258,8 @@ fn a_page_in_flight_is_never_unmapped_for_an_oom() {
     events.target_waits.pass();
     let filling = events.calls.lock().iter().rev().find(|(c, _)| *c == "target").map(|(_, at)| *at).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
-    let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
-    let next = r.oom(Some(a), Some(3 * REGION_ALIGN), None, Torch::default());
+    let pass = r.pass(a, "k").unwrap();
+    let next = mem.make_room(3 * REGION_ALIGN);
     assert!(!events.calls.lock().iter().any(|(c, at)| *c == "unmap" && *at == filling), "the page in flight was unmapped ({next:?})");
     events.target_gate.open();
     let p = loading.join().unwrap();
@@ -1409,8 +1410,8 @@ fn failed_save_child() {
     }
 }
 
-/// A previous unload can still be waiting for custody when an independent bind starts.
-/// Preparation waits outside the state lock; allocator recovery refuses without waiting.
+/// A previous unload can still be waiting for custody when an independent bind starts: its bytes
+/// stay charged, and the bind waits for custody outside the state lock.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
@@ -1429,15 +1430,13 @@ fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
     gate.close();
     mem.unload(a);
     log.await_call(|(_, call)| call.contains("Withdraw"));
-    assert_eq!(mem.torch_limit(), 0, "the queued custody handle still holds the page");
-    let request = mem.request("pending", Plan::default()).unwrap();
-    assert_eq!(request.reclaim_allocation(REGION_ALIGN).unwrap(), 0, "the allocator never waits for custody");
+    assert_eq!(mem.free(), 0, "the queued custody handle still holds the page");
     let binder = {
         let mem = mem.clone();
         std::thread::spawn(move || drop(mem.bind(b, 0, 0).unwrap()))
     };
     // Probe the state lock while preparation may be settling, then release the exact hold.
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     gate.open();
     binder.join().unwrap();
 }
@@ -1475,7 +1474,7 @@ fn failed_renewal_child() {
     // Kept once the bake completed and its consumer let go (a page in use is never protected).
     drop(pin);
     (1..=events.next.load(Ordering::Relaxed)).for_each(|e| events.complete(e));
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     log.await_call(|(_, c)| c.contains("Export") && c.contains(&old));
     // Another consumer reads it and lets go: its release is pending at the renewal.
     drop(mem.bind(id, 0, 1).unwrap());
@@ -1532,77 +1531,6 @@ fn undeclared(dir: &std::path::Path, uuid: &str, name: &str, regions: u64) -> Se
     spec
 }
 
-/// Lead's ruling 2 (S3 review / run 13090): the allocator callback never waits for the state
-/// lock, and a held lock never makes it refuse: its limit is the last publication's, and it
-/// reclaims idle pages offered to it beforehand.
-#[test]
-fn the_allocator_callback_works_while_the_state_is_locked() {
-    let dir = tempfile::tempdir().unwrap();
-    let uuid = format!("lockfree-{}", std::process::id());
-    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
-    let _scope = Scope::new(&g.uuid);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let events = Arc::new(Events::default());
-    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
-    mem.load(undeclared(dir.path(), &uuid, "idle", 2), Level::Gpu).unwrap();
-    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
-    mem.settle();
-    // Between passes (an unmeasured pass would take the idle pages itself, before it runs).
-    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
-    // Another thread holds the state lock (in a driver read under it).
-    events.hold_free.store(true, Ordering::SeqCst);
-    let holder = {
-        let mem = mem.clone();
-        std::thread::spawn(move || mem.torch_limit())
-    };
-    events.free_waits.pass();
-    let limit = mem.allocator_limit();
-    let reclaimed = r.reclaim_allocation(2 * REGION_ALIGN);
-    let after = mem.allocator_limit();
-    // The lock goes back before any assertion, so a failure never hangs the case.
-    events.free_gate.open();
-    holder.join().unwrap();
-    let (limit, reclaimed) = (limit.expect("a limit with the state locked"), reclaimed.unwrap());
-    assert_eq!(reclaimed, 2 * REGION_ALIGN, "the idle pages, reclaimed with the state locked");
-    assert_eq!(after, Some(limit + reclaimed), "the limit counts them at once");
-    drop(r);
-    let _ = a;
-    // Reconciled: the reclaimed pages are gone from the table, and bind again from the store.
-    let idle = mem.load(undeclared(dir.path(), &uuid, "idle", 2), Level::Ram).unwrap();
-    drop(mem.bind(idle, 0, 0).unwrap());
-}
-
-/// Lead's rulings (lazy room, the room outside passes; S3's run 13633): a request on a card
-/// full of an idle kept set lends those pages to the allocator callback when it opens (custody
-/// lets go; the pages stay mapped), so its allocations, outside a pass or in one, reclaim only
-/// what they need; the pages it leaves are kept again when it ends.
-#[test]
-fn a_request_lends_idle_kept_pages_to_the_callback_and_keeps_the_rest_after() {
-    let dir = tempfile::tempdir().unwrap();
-    let uuid = format!("unmeasured-{}", std::process::id());
-    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
-    let _scope = Scope::new(&g.uuid);
-    let ledger = varena::Ledger::create(&g, None).unwrap();
-    let events = Arc::new(Events::default());
-    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
-    mem.load(stored(dir.path(), &uuid, "kept", 3), Level::Gpu).unwrap();
-    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
-    mem.settle();
-    let exports = || events.kept.lock().iter().filter(|c| **c == "export").count();
-    let kept = exports();
-    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
-    // Its first allocation, before any pass: one page, from the lent ones.
-    assert_eq!(r.reclaim_allocation(REGION_ALIGN).unwrap(), REGION_ALIGN, "a lent page is the callback's");
-    // (A pass start publishes the table.)
-    let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
-    let n: u64 = ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum();
-    assert_eq!(n, 2 * REGION_ALIGN, "the pages not needed stay mapped");
-    pass.end(Measured::default(), Torch::default());
-    r.end();
-    mem.settle();
-    assert_eq!(exports(), kept + 2, "the two left are kept again once no request is open");
-}
-
 /// gpu12's ILLEGAL_ADDRESS: a Keep made a page read-only (`cuMemSetAccess`) while kernels of
 /// the block it had just been bound to read it, and the read faulted. A Keep protects only idle
 /// pages (unpinned, no release pending), each contiguous run of a set in one call; a page in use
@@ -1630,18 +1558,20 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     events.pending_fences.store(false, Ordering::SeqCst);
     let fills = events.next.load(Ordering::Relaxed);
     (1..=fills).for_each(|e| events.complete(e));
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     drop(pins);
     let last = events.next.load(Ordering::Relaxed);
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     assert_eq!(protects(), 0, "protected while in use");
     (fills + 1..=last).for_each(|e| events.complete(e));
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     events.await_log(|log| log.iter().filter(|c| **c == "export").count() == 3);
     assert_eq!(*events.protected.lock(), vec![3 * REGION_ALIGN], "one protect for the run");
 
     // A page bound while its fill's event is pending, held through the fill's completion and
-    // released with its release event pending: never protected while in use.
+    // released with its release event pending: never protected while in use, nor while its
+    // request runs (the allocator hook's to take meanwhile); kept at its first idle moment
+    // after.
     let r = mem.request("r", Plan::default()).unwrap();
     events.pending_fences.store(true, Ordering::SeqCst);
     let used = mem.load(stored(dir.path(), &uuid, "used", 1), Level::Ram).unwrap();
@@ -1649,19 +1579,19 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     events.pending_fences.store(false, Ordering::SeqCst);
     let fill = *events.fences.lock().last().unwrap();
     events.complete(fill);
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     assert_eq!(protects(), 1, "protected while pinned");
-    assert_eq!(r.stats().keep_pending, REGION_ALIGN, "due, waiting for the page to be idle");
     drop(pin);
     let release = events.next.load(Ordering::Relaxed);
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     assert_eq!(protects(), 1, "protected while its consumer's stream ran");
     events.complete(release);
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
+    assert_eq!(protects(), 1, "protected while its request runs");
+    drop(r);
     events.await_log(|log| log.iter().filter(|c| **c == "export").count() == 4);
     assert_eq!(protects(), 2);
     mem.settle();
-    assert_eq!(r.stats().keep_pending, 0, "kept at its first idle moment");
 
     // A bind that meets a protect in flight waits for it.
     let raced = mem.load(stored(dir.path(), &uuid, "raced", 1), Level::Ram).unwrap();
@@ -1670,7 +1600,7 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     events.pending_fences.store(false, Ordering::SeqCst);
     events.hold_protect.store(true, Ordering::SeqCst);
     (1..=events.next.load(Ordering::Relaxed)).for_each(|e| events.complete(e));
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     events.protect_waits.pass();
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
     let binder = {
@@ -1691,13 +1621,11 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     binder.join().unwrap();
     assert_eq!(events.bound_while_protecting.load(Ordering::SeqCst), 0, "a pin handed out while its page's protect ran");
     assert_eq!(exports(), 5);
-    drop(r);
 }
 
 /// Native an_oom_in_a_pass / a_measured_pass (graph-core runs 519 and e199) on a host card: the
-/// card crowded and the rest full of an idle kept set. Unmeasured, the request lends the idle
-/// pages to the allocator callback (lazy room), which reclaims what the activation needs; the
-/// next run's measured pass makes its room before it runs. Neither meets an OOM.
+/// card crowded and the rest full of an idle set; the hook's `make_room` takes what the
+/// activation needs, first run and second alike.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_pass_on_a_card_full_of_idle_kept_pages_has_its_room_before_it_runs() {
@@ -1717,75 +1645,24 @@ fn a_pass_on_a_card_full_of_idle_kept_pages_has_its_room_before_it_runs() {
         mem.settle();
         assert!(!card.fits(REGION_ALIGN), "{name}: the idle set fills the card: {} free", card.free());
         let r = mem.request(name, plan.clone()).unwrap();
-        let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
+        let pass = r.pass(m, "k").unwrap();
         let pins: Vec<varena::Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
-        // Torch's allocator: its callback reclaims from the stock when the card is short.
-        let took = card.take(activation) || (r.reclaim_allocation(activation).is_ok() && card.take(activation));
-        assert!(took, "{name} (measured: {measured}): the room is there before the pass runs: {} free", card.free());
-        pass.end(Measured { allocated_peak: activation, slack: 0, sites: vec![] }, Torch { allocated: activation, reserved: activation });
+        // Torch's allocator: its hook makes room when the card is short.
+        let took = card.take(activation) || (mem.make_room(activation).is_ok() && card.take(activation));
+        assert!(took, "{name} (measured: {measured}): the hook made the room: {} free", card.free());
+        pass.end(activation);
         drop(pins);
         card.give(activation);
-        let stats = r.end();
-        assert_eq!((stats.retries, stats.leftover), (0, 0), "{name}: {stats:?}");
+        assert_eq!(r.end().leftover, 0, "{name}");
     }
 }
 
-/// Lazy room: a page lent to the allocator callback is its to reclaim only once custody has
-/// let go of it (custody's handle holds the memory, so an unmap would free nothing). A request
-/// lends its idle kept pages when it opens and returns only after custody answers; a reclaim
-/// then frees real bytes.
+/// The hook on a card full of idle pages (native an_oom_in_a_pass): `make_room` takes them. The
+/// driver refuses the first map anyway (its slack, as e199's refused a claim of exactly 1 GiB
+/// with 1.19 MiB more reported free); the hook asks one page more, and its map fits.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_lent_page_is_the_callbacks_only_once_custody_let_go() {
-    let dir = tempfile::tempdir().unwrap();
-    let uuid = format!("roomfree-{}", std::process::id());
-    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 * REGION_ALIGN };
-    let _scope = Scope::new(&g.uuid);
-    let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
-    gate.open();
-    serve_custody(&uuid, gate.clone(), log.clone());
-    let card = Card::new(g.memory, 0);
-    let mem = Memory::open(g.clone(), None, Box::new(Driver(card.clone()))).unwrap();
-    let k = stored(dir.path(), &uuid, "k", 6);
-    let key = k.fingerprint.key();
-    mem.load(k, Level::Gpu).unwrap();
-    mem.settle();
-    assert_eq!(log.kept.lock().keys().filter(|(fp, _)| *fp == key).count(), 6, "the idle set is kept");
-    mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
-    // Custody answers nothing until the opener is seen waiting for it.
-    gate.close();
-    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
-    std::thread::scope(|t| {
-        let opening = t.spawn(|| {
-            // SAFETY: gettid has no preconditions.
-            tid_tx.send(unsafe { libc::gettid() }).unwrap();
-            mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap()
-        });
-        let tid = tid_rx.recv().unwrap();
-        log.await_call(|(_, call)| call.contains("Withdraw"));
-        let sleeping = || std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).is_ok_and(|s| s.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('S')));
-        while !opening.is_finished() && !sleeping() {
-            std::thread::yield_now();
-        }
-        let early = opening.is_finished();
-        gate.open();
-        let r = opening.join().unwrap();
-        assert!(!early, "the request opened before custody let go of the pages it lent");
-        let before = card.free();
-        let reclaimed = r.reclaim_allocation(2 * REGION_ALIGN).unwrap();
-        assert_eq!((reclaimed, card.free() - before), (2 * REGION_ALIGN, 2 * REGION_ALIGN), "a reclaim of lent pages frees real bytes");
-        drop(r);
-    });
-}
-
-/// An OOM in a measured pass on a card full of idle kept pages (native an_oom_in_a_pass): the
-/// pass made only its measured room, the activation outgrew it, and the OOM answers Retry with
-/// the idle pages. The driver refuses that retry too (its slack, as e199's refused a claim of
-/// exactly 1 GiB with 1.19 MiB more reported free); the second OOM frees more than the free
-/// bytes (progress, lead's ruling), and its retry fits.
-#[cfg(target_os = "linux")]
-#[test]
-fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
+fn the_hook_takes_idle_pages_and_asks_more_when_the_driver_refuses() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("oomkept-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 24 * REGION_ALIGN };
@@ -1797,29 +1674,29 @@ fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
     let plan = Plan { steps: vec![Step { sets: vec!["m".into()], passes: 1 }] };
     // The shape measured small on an empty card.
     let r = mem.request("small", plan.clone()).unwrap();
-    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
-    pass.end(Measured { allocated_peak: REGION_ALIGN, slack: 0, sites: vec![] }, Torch::default());
+    let pass = r.pass(m, "k").unwrap();
+    pass.end(REGION_ALIGN);
     drop(r);
     card.foreign.store(8 * REGION_ALIGN, Ordering::SeqCst);
     mem.load(stored(dir.path(), &uuid, "idle", 17), Level::Gpu).unwrap();
     mem.settle();
     let r = mem.request("big", plan).unwrap();
-    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
+    let pass = r.pass(m, "k").unwrap();
     let pins: Vec<varena::Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
     let activation = 8 * REGION_ALIGN;
-    let mut answers = vec![];
+    let mut asked = vec![];
     while !card.take(activation) {
-        let next = r.oom(Some(m), Some(activation), None, Torch::default());
-        assert!(matches!(next, Next::Retry), "idle kept pages answer Retry: {answers:?} then {next:?} ({} free)", card.free());
-        answers.push(next);
-        assert!(answers.len() <= 3, "the OOM ladder ends: {answers:?}");
+        let need = activation + asked.len() as u64 * REGION_ALIGN;
+        assert!(mem.make_room(need).is_ok(), "idle pages make the room: {asked:?} then {need} ({} free)", card.free());
+        asked.push(need);
+        assert!(asked.len() <= 3, "the hook's asks end: {asked:?}");
     }
-    assert!(answers.len() >= 2, "the activation outgrew the measured room, and the driver refused the first retry: {answers:?}");
-    pass.end(Measured { allocated_peak: activation, slack: 0, sites: vec![] }, Torch { allocated: activation, reserved: activation });
+    assert!(asked.len() >= 2, "the driver refused the first map: {asked:?}");
+    pass.end(activation);
     drop(pins);
     card.give(activation);
     let stats = r.end();
-    assert!(stats.retries >= 2 && stats.leftover == 0, "{stats:?}");
+    assert!(stats.make_room.len() >= 2 && stats.leftover == 0, "{stats:?}");
 }
 
 /// The kept-page handoff (native kept_pages_survive_a_holder_that_served, graph-core 577): pages
@@ -1843,10 +1720,10 @@ fn a_settle_makes_every_due_keep_before_it_returns() {
     events.pending_fences.store(false, Ordering::SeqCst);
     let fills = events.next.load(Ordering::SeqCst);
     (1..=fills).for_each(|e| events.complete(e));
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     drop(pins);
     let exports = || events.kept.lock().iter().filter(|c| **c == "export").count();
-    mem.torch_limit();
+    mem.make_room(0).unwrap();
     assert_eq!(exports(), 0, "kept while its consumers ran");
     let releases = fills + 1..=events.next.load(Ordering::SeqCst);
     let settling = {
@@ -1903,35 +1780,35 @@ fn a_range_prepared_after_an_identity_change_fills_its_page_again() {
 }
 
 
-/// S3 (varena-standalone's capping): torch's cap is taken when a pass returns, so the room it
-/// made is complete then: its unmaps done and the kept pages it lent or evicted let go by
-/// custody. Unmeasured (its kept pages lent) and lowered (streaming W pages) alike, torch_limit
-/// at the return is the settled one.
+/// S2 (64 evicting binds at 71 ms each on an L4): a bind's work is the pages it touches, never
+/// every resident page. Here its driver queries: binds evicting idle kept pages ask the same
+/// number of event queries beside 16 idle pages as beside 48 (each restock used to query every
+/// offer, and every page's set fingerprint was hashed again at each lock).
 #[cfg(target_os = "linux")]
 #[test]
-fn a_passs_room_is_settled_when_it_returns() {
-    let dir = tempfile::tempdir().unwrap();
-    let uuid = format!("settled-{}", std::process::id());
-    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
-    let _scope = Scope::new(&g.uuid);
-    let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
-    gate.open();
-    serve_custody(&uuid, gate, log.clone());
-    let mem = Memory::open(g.clone(), None, Box::new(Driver(Card::new(g.memory, 0)))).unwrap();
-    let k = stored(dir.path(), &uuid, "k", 1);
-    let key = k.fingerprint.key();
-    mem.load(k, Level::Gpu).unwrap();
-    log.await_call(|(_, call)| call.contains("Export") && call.contains(&key));
-    let a = mem.load(stored(dir.path(), &uuid, "a", 3), Level::Ram).unwrap();
-    for round in ["unmeasured", "lowered"] {
-        let r = mem.request(round, Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
-        let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
-        let at_return = mem.torch_limit();
+fn a_binds_work_does_not_grow_with_the_resident_pages() {
+    let queries = |idle: u64| {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = format!("bindcost{idle}-{}", std::process::id());
+        let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: idle * REGION_ALIGN };
+        let _scope = Scope::new(&g.uuid);
+        let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
+        gate.open();
+        serve_custody(&uuid, gate, log.clone());
+        let _ledger = varena::Ledger::create(&g, None).unwrap();
+        let events = Arc::new(Events::default());
+        let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
+        let a = mem.load(stored(dir.path(), &uuid, "a", 8), Level::Ram).unwrap();
+        mem.load(stored(dir.path(), &uuid, "idle", idle + 1), Level::Gpu).unwrap();
         mem.settle();
-        assert_eq!(at_return, mem.torch_limit(), "{round}: the limit at the pass's return is final");
-        (0..3).for_each(|b| drop(mem.bind(a, b, 0).unwrap()));
-        pass.end(Measured { allocated_peak: 2 * REGION_ALIGN, slack: 0, sites: vec![] }, Torch::default());
-        r.end();
-        mem.settle();
-    }
+        let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+        let pass = r.pass(a, "k").unwrap();
+        let before = events.queries.load(Ordering::SeqCst);
+        let pins: Vec<_> = (0..8).map(|b| mem.bind(a, b, 0).unwrap()).collect();
+        let asked = events.queries.load(Ordering::SeqCst) - before;
+        drop((pins, pass));
+        asked
+    };
+    let (few, many) = (queries(16), queries(48));
+    assert_eq!(few, many, "8 binds asked {few} event queries beside 16 idle pages, {many} beside 48");
 }
