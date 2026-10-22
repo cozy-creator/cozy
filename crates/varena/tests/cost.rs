@@ -13,7 +13,7 @@ use tensorfs::format::ObjectRef;
 use tensorfs::io::source::Source;
 use tensorfs::io::{ItemSource, ObjectRange};
 use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
-use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Plan, SetSpec, Step, Torch};
+use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Plan, SetSpec, Step};
 
 const CARRIED: u64 = 4096;
 
@@ -59,7 +59,7 @@ fn per_page_cost() {
     let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
     let id = mem.load(set(dir.path(), "evict", binds, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/evict".into()], passes: 1 }] }).unwrap();
-    let pass = r.pass(id, "fwd", "1x1", Torch::default()).unwrap();
+    let pass = r.pass(id, "k").unwrap();
     let start = Instant::now();
     for b in 0..binds as u32 {
         drop(mem.bind(id, b, 0).unwrap());

@@ -13,7 +13,7 @@ use tensorfs::format::ObjectRef;
 use tensorfs::io::source::Source;
 use tensorfs::io::{ItemSource, ObjectRange};
 use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
-use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Next, Pass, Physical, Pin, Plan, Request, SetId, SetSpec, Step, Torch, Va};
+use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Pass, Physical, Pin, Plan, Request, SetId, SetSpec, Step, Va};
 
 const MB: u64 = 1 << 20;
 
@@ -76,7 +76,7 @@ pub fn main() {
         ("a_joint_step_runs_a_pass_per_set", a_joint_step_runs_a_pass_per_set),
         ("a_child_runs_while_its_parent_yields", a_child_runs_while_its_parent_yields),
         ("a_reaper_with_a_stale_view_frees_nothing", a_reaper_with_a_stale_view_frees_nothing),
-        ("an_oom_counts_its_own_unmaps_after_an_ask", an_oom_counts_its_own_unmaps_after_an_ask),
+        ("a_request_asks_peers_at_its_open_and_the_hook_takes_its_own_idle_page_first", a_request_asks_peers_at_its_open_and_the_hook_takes_its_own_idle_page_first),
         ("a_standalone_process_wakes_tensord", a_standalone_process_wakes_tensord),
         ("a_yielded_parent_is_its_familys_alone_and_waits_for_its_room", a_yielded_parent_is_its_familys_alone_and_waits_for_its_room),
     ];
@@ -88,7 +88,7 @@ pub fn main() {
         ("the_tier_gives_back_in_order", the_tier_gives_back_in_order),
         ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
         ("a_layout_stays_locked_until_the_tier_takes_it_back", a_layout_stays_locked_until_the_tier_takes_it_back),
-        ("an_unmeasured_pass_asks_peers_only_on_an_oom", an_unmeasured_pass_asks_peers_only_on_an_oom),
+        ("an_unmeasured_request_asks_peers_for_pages_never_caches", an_unmeasured_request_asks_peers_for_pages_never_caches),
         ("a_refused_tier_copy_runs_after_a_measured_pass", a_refused_tier_copy_runs_after_a_measured_pass),
         ("a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends", a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends),
         ("a_joiners_limit_leaves_its_peers_room", a_joiners_limit_leaves_its_peers_room),
@@ -366,22 +366,22 @@ fn agent() {
             ["cache", owner, bytes] => {
                 let m = mem.as_ref().unwrap();
                 let s = shrunk.clone();
-                let c = m.cache(owner, &[], Box::new(move |want| {
+                let c = m.cache(owner, move |want| {
                     s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    varena::Shrunk { freed: want, coming: 0 }
-                }));
+                    want
+                });
                 m.cached(c, bytes.parse().unwrap());
                 "ok".into()
             }
             ["shrunk"] => format!("ok {}", shrunk.load(std::sync::atomic::Ordering::Relaxed)),
-            ["pass", req, set, shape] => match requests[*req].pass(sets[*set].0, "fwd", shape, Torch::default()) {
+            ["pass", req, set, shape] => match requests[*req].pass(sets[*set].0, shape) {
                 Ok(p) => {
                     passes.insert(req.to_string(), p);
                     "ok".into()
                 }
                 Err(e) => format!("err {}", e.code()),
             },
-            ["passas", req, set, shape, name] => match requests[*req].pass(sets[*set].0, "fwd", shape, Torch::default()) {
+            ["passas", req, set, shape, name] => match requests[*req].pass(sets[*set].0, shape) {
                 Ok(p) => {
                     passes.insert(name.to_string(), p);
                     "ok".into()
@@ -390,19 +390,19 @@ fn agent() {
             },
             ["endpassas", name, peak] => {
                 if let Some(p) = passes.remove(*name) {
-                    p.end(Measured { allocated_peak: peak.parse().unwrap(), ..Measured::default() }, Torch::default());
+                    p.end(peak.parse().unwrap());
                 }
                 "ok".into()
             }
             ["endpass", req] => {
                 if let Some(p) = passes.remove(*req) {
-                    p.end(Measured::default(), Torch::default());
+                    p.end(0);
                 }
                 "ok".into()
             }
             ["endpass", req, peak] => {
                 if let Some(p) = passes.remove(*req) {
-                    p.end(Measured { allocated_peak: peak.parse().unwrap(), ..Measured::default() }, Torch::default());
+                    p.end(peak.parse().unwrap());
                 }
                 "ok".into()
             }
@@ -432,11 +432,10 @@ fn agent() {
                 pins.clear();
                 "ok".into()
             }
-            ["oom", req, set, need] => match requests[*req].oom(Some(sets[*set].0), Some(need.parse().unwrap()), None, Torch::default()) {
-                Next::Retry => "retry".into(),
-                Next::Cut(l) => format!("cut {l}"),
-                Next::Park(b) => format!("park {b}"),
-                Next::Exhausted(e) => format!("exhausted {} {}", e.stats.request, e.need),
+            ["room", need] => match mem.as_ref().unwrap().make_room(need.parse().unwrap()) {
+                Ok(_) => "ok".into(),
+                Err(varena::Error::Exhausted(e)) => format!("exhausted {} {}", e.stats.request, e.need),
+                Err(e) => format!("err {}", e.code()),
             },
             ["yield", req, family] => {
                 yielded.insert(req.to_string(), requests[*req].yielding(family));
@@ -446,10 +445,6 @@ fn agent() {
                 Some(Err(e)) => format!("err {}", e.code()),
                 _ => "ok".into(),
             },
-            ["parked", req, bytes] => {
-                requests[*req].parked(bytes.parse().unwrap());
-                "ok".into()
-            }
             ["trace", req] => {
                 let s = requests[*req].stats();
                 let origins: Vec<String> = s.trace.iter().map(|r| format!("{:?}", r.origin)).collect();
@@ -460,7 +455,11 @@ fn agent() {
                 let s = requests.remove(*req).unwrap().end();
                 format!("ok leftover={} kept={} tier={} store={} evicted={:?} spec={}", s.leftover, s.moved.kept.bytes, s.moved.tier.bytes, s.moved.store.bytes, s.evicted, s.moved.speculative)
             }
-            ["limit"] => format!("ok {}", mem.as_ref().unwrap().torch_limit()),
+            ["limit"] => {
+                let m = mem.as_ref().unwrap();
+                m.make_room(0).unwrap();
+                format!("ok {}", m.free())
+            }
             ["settle"] => {
                 mem.as_ref().unwrap().settle();
                 "ok".into()
@@ -569,8 +568,8 @@ impl Drop for Agent {
     }
 }
 
-/// A holder with every page of its set mapped and nothing running answers an ask: the
-/// demander's pass and binds get its pages' room.
+/// A holder with every page of its set mapped and nothing running answers an ask: an
+/// unmeasured request opening beside it gets its idle pages' room.
 fn an_idle_holder_answers_an_ask(dir: &Path) {
     let g = gpu("ask", 8 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
@@ -589,7 +588,7 @@ fn an_idle_holder_answers_an_ask(dir: &Path) {
     b.ok("bind b 0");
     b.ok("bind b 1");
     assert_eq!(b.ok("exact b 1"), "true");
-    assert_eq!(held(&ledger, &a_pid), 4 * MB, "a gave back what b needed");
+    assert_eq!(held(&ledger, &a_pid), 0, "b's unmeasured request asked a for its idle pages");
     assert_eq!(held(&ledger, &b_pid), 4 * MB);
     b.ok("unpin");
     b.ok("end r");
@@ -641,7 +640,7 @@ fn a_killed_holder_leaves_orphans_a_successor_imports(dir: &Path) {
     c.exit();
 }
 
-/// A request that fails mid-way (an exhausted op) frees every pin, room and cache: leftover 0,
+/// A request that fails mid-way (an exhausted allocation) frees every pin and cache: leftover 0,
 /// and the same process serves the next request.
 fn a_failed_request_frees_everything(dir: &Path) {
     let g = gpu("fail", 8 * MB);
@@ -655,13 +654,8 @@ fn a_failed_request_frees_everything(dir: &Path) {
     a.ok("pass r1 f 1x1");
     a.ok("bind f 0");
     a.ok("bind f 1");
-    // The free bytes are claimed once (the cap was stale); with every page pinned nothing else
-    // frees: park (the host has headroom), and a park of nothing ends it. (The whole card: a
-    // need beyond it is Exhausted at once.)
-    assert_eq!(a.say("oom r1 f 8388608"), "retry");
-    assert!(a.say("oom r1 f 8388608").starts_with("park "));
-    a.ok("parked r1 0");
-    assert!(a.say("oom r1 f 8388608").starts_with("exhausted r1"));
+    // With every page pinned, the whole card is Exhausted at once.
+    assert!(a.say("room 8388608").starts_with("exhausted r1"));
     a.ok("cache r1 1048576");
     a.ok("unpin");
     assert!(a.ok("end r1").starts_with("leftover=0"));
@@ -808,8 +802,6 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
 /// Review 1, finding 2: an ask to a victim whose ask thread cannot run (stopped) waits on the
 /// victim itself: when it dies, the asker goes on, with no timer. Review 2, finding 3: TensorD
 /// sees it stalled only while an ask is pending to it, and the ask is in the asker's own row.
-/// Finding 11: while the ask is out, the asker claims what it asked and what it unmapped of its
-/// own for the same demand.
 fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     let g = gpu("stop", 10 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
@@ -819,10 +811,10 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     let mut a = Agent::granted(ledger.grant(std::process::id()).unwrap());
     a.ok(&format!("grant {} {}", g.uuid, g.memory));
     let mut b = Agent::granted(ledger.grant(std::process::id()).unwrap());
-    let b_pid = b.ok(&format!("grant {} {}", g.uuid, g.memory));
+    b.ok(&format!("grant {} {}", g.uuid, g.memory));
     b.ok(&format!("load vb {} stored ram", b_path.display()));
     b.ok(&format!("load vn {} stored gpu", write_set(dir, "vn", 1).display()));
-    // b opens first: its room outside passes, prepared at the open, asks nobody yet.
+    // b opens first: nobody holds anything to ask for yet.
     b.ok("request r vb");
     a.ok(&format!("load va {} stored gpu", a_path.display()));
     // Earlier events (rows claimed, pages mapped) are not the ask's.
@@ -842,8 +834,6 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
         ledger.await_event().unwrap();
     }
     assert_eq!(ledger.stalled(), vec![pid as u32], "asked and its ask thread stopped: measured, not counted");
-    let torch = ledger.status().rows.iter().find(|r| r.pid.to_string() == b_pid).map(|r| r.torch);
-    assert_eq!(torch, Some(2 * MB + 2 * MB), "b claims its own unmapped page and the asked bytes meanwhile");
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     assert_eq!(b.reply(), "ok", "the asker went on when the victim died");
@@ -1078,10 +1068,10 @@ fn a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends(dir: &Path) {
     y.exit();
 }
 
-/// Review 6, C3: an unmeasured pass makes its room up front from the free bytes and its own
-/// row's idle pages; it asks a peer holding idle pages nothing when it opens (measuring one
-/// model's new shape must not drop another's weights). An OOM's escalation asks it.
-fn an_unmeasured_pass_asks_peers_only_on_an_oom(dir: &Path) {
+/// Co-residency (lead, v7: block code runs once, with no OOM to escalate from): an unmeasured
+/// request asks its peers for every idle page at its open, pages only: an idle holder's graph
+/// caches survive. Its allocations then fit.
+fn an_unmeasured_request_asks_peers_for_pages_never_caches(dir: &Path) {
     let g = gpu("peers", 8 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     let (a_path, b_path) = (write_set(dir, "pa", 2), write_set(dir, "pb", 1));
@@ -1089,26 +1079,25 @@ fn an_unmeasured_pass_asks_peers_only_on_an_oom(dir: &Path) {
     let mut a = Agent::spawn();
     let a_pid = a.ok(&format!("open {} {}", g.uuid, g.memory));
     a.ok(&format!("load pa {} stored gpu", a_path.display()));
+    a.ok(&format!("cache graphs {MB}"));
     let mut b = Agent::spawn();
     b.ok(&format!("open {} {}", g.uuid, g.memory));
     b.ok(&format!("load pb {} stored gpu", b_path.display()));
     b.ok("request r pb");
+    assert_eq!(held(&ledger, &a_pid), 0, "the request asked a for its idle pages");
+    assert_eq!(a.ok("shrunk"), "0", "a's caches survive");
     b.ok("pass r pb 1x1");
-    assert_eq!(held(&ledger, &a_pid), 2 * REGION_ALIGN, "the pass opened without asking a");
-    // The card: a's two pages, b's one, one free. An op needs three.
-    b.send(&format!("oom r pb {}", 3 * REGION_ALIGN));
-    assert_eq!(b.reply(), "retry");
-    assert!(held(&ledger, &a_pid) < 2 * REGION_ALIGN, "the OOM's escalation asked a");
+    assert_eq!(b.say(&format!("room {}", 2 * REGION_ALIGN)), "ok", "its allocations fit");
     b.ok("end r");
     a.exit();
     b.exit();
 }
 
 /// A joint step ({a, b}): each set runs its own pass; interleaved binds land in their own
-/// passes, and each pass's peak is recorded under its own set.
+/// passes.
 fn a_joint_step_runs_a_pass_per_set(dir: &Path) {
     let g = gpu("joint", 32 * MB);
-    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
     let (ja, jb) = (write_set(dir, "ja", 2), write_set(dir, "jb", 2));
     let mut a = Agent::spawn();
     a.ok(&format!("open {} {}", g.uuid, g.memory));
@@ -1127,14 +1116,6 @@ fn a_joint_step_runs_a_pass_per_set(dir: &Path) {
     a.ok(&format!("endpassas jb {}", 5 * MB));
     a.ok("end r");
     a.exit();
-    let peaks = ledger.peaks();
-    let peak = |set: &str| {
-        peaks.iter().find_map(|p| match p {
-            varena::Peak::Pass { key, room } if key.starts_with(&format!("{set}|")) => Some(room.delta),
-            _ => None,
-        })
-    };
-    assert_eq!((peak("ja"), peak("jb")), (Some(3 * MB), Some(5 * MB)), "{peaks:?}");
 }
 
 /// Round 2, finding 15 (S5): a request waiting on a child call yields its room and its step's
@@ -1163,9 +1144,9 @@ fn a_child_runs_while_its_parent_yields(dir: &Path) {
     for block in 0..3 {
         assert_eq!(child.ok(&format!("exact yc {block}")), "true");
     }
-    // Its pages were a later use while it waited: it gave what its child asked for. (Not
+    // Its pages were a later use while it waited: its unmeasured child asked for them. (Not
     // yielded they are its working set, and its child would have streamed beside them.)
-    assert_eq!(held(&parent_pid), 2 * MB, "the yielded parent gave its child what it needed");
+    assert_eq!(held(&parent_pid), 0, "the yielded parent gave its child its working set");
     child.ok("unpin");
     child.ok("end c");
     child.exit();
@@ -1282,9 +1263,9 @@ fn a_reaper_with_a_stale_view_frees_nothing(_dir: &Path) {
     b.exit();
 }
 
-/// Round 2, finding 17 (review 1, finding 5, through Memory): an OOM whose own N unmap and
-/// another row's answer together cover the need retries with both counted, evicting no D page.
-fn an_oom_counts_its_own_unmaps_after_an_ask(dir: &Path) {
+/// Co-residency (owner, 10-22): an unmeasured request asks its peers for their idle pages when
+/// it opens; the hook's `make_room` then takes its own idle page before a declared one.
+fn a_request_asks_peers_at_its_open_and_the_hook_takes_its_own_idle_page_first(dir: &Path) {
     let g = gpu("ownask", 6 * REGION_ALIGN);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     let path = |n: &str, r| write_set(dir, n, r);
@@ -1297,14 +1278,14 @@ fn an_oom_counts_its_own_unmaps_after_an_ask(dir: &Path) {
     b.ok(&format!("load od {} stored gpu", path("od", 2).display()));
     b.ok(&format!("load ox {} stored gpu", path("ox", 1).display()));
     b.ok("request r ow;od");
+    let row = |pid: &str| ledger.status().rows.into_iter().find(|r| r.pid.to_string() == pid).unwrap();
+    assert_eq!(row(&a.child.id().to_string()).classes.iter().sum::<u64>(), 0, "a gave its idle page at b's open");
     b.ok("pass r ow 1x1");
     b.ok("bind ow 0");
     b.ok("bind ow 1");
-    // The card is full: b's own N page and a's N page together are the need.
-    assert_eq!(b.say(&format!("oom r ow {}", 2 * REGION_ALIGN)), "retry");
-    let row = |pid: &str| ledger.status().rows.into_iter().find(|r| r.pid.to_string() == pid).unwrap();
+    // The card: ow's two pages, od's two, ox's one, one free. The hook needs two.
+    assert_eq!(b.say(&format!("room {}", 2 * REGION_ALIGN)), "ok");
     assert_eq!(row(&b_pid).classes[varena::table::Class::D.index()], 2 * REGION_ALIGN, "no D page went");
-    assert_eq!(row(&a.child.id().to_string()).classes.iter().sum::<u64>(), 0, "a gave its page");
     b.ok("unpin");
     b.ok("end r");
     a.exit();
@@ -1402,9 +1383,9 @@ fn held_layouts_outlive_a_tier_restart(dir: &Path) {
     c.exit();
 }
 
-/// Review 4, NEW-3: a yielded parent is no stranger's: admission counts its remaining W for
-/// every request but its own family's child; and its wait's end waits for its room (the
-/// table's changes wake it), never Exhausted while the card can hold it.
+/// Review 4, NEW-3: a yielded parent is no stranger's: admission counts its W (its peak, else
+/// its step's pages) for every request but its own family's child; its wait ends at once, and
+/// it binds again once the child gave the card up.
 fn a_yielded_parent_is_its_familys_alone_and_waits_for_its_room(dir: &Path) {
     let g = gpu("family", 8 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
@@ -1431,15 +1412,11 @@ fn a_yielded_parent_is_its_familys_alone_and_waits_for_its_room(dir: &Path) {
         child.ok(&format!("bind fc {block}"));
     }
     assert_eq!(ledger.status().free, 0, "the card is the child's");
-    // The wait ends while the card is the child's: the parent waits for its room.
-    parent.send("unyield r");
-    while !ledger.status().rows.iter().any(|r| r.pid.to_string() == parent_pid && r.waiting) {
-        ledger.await_event().unwrap();
-    }
+    parent.ok("unyield r");
+    let _ = parent_pid;
     child.ok("unpin");
     child.ok("end c");
     child.exit();
-    assert_eq!(parent.reply(), "ok", "its room came back once the child gave the card up");
     for block in 0..2 {
         assert_eq!(parent.ok(&format!("exact fp {block}")), "true");
     }

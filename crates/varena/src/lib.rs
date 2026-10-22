@@ -23,8 +23,8 @@ pub mod tier;
 
 pub use backend::{Access, Backend, Event, HostBackend, Physical, Va};
 pub use cuda::CudaBackend;
-pub use ledger::{Grant, HostCall, Ledger, Peak, PhysicalChange, Room, RowStatus, Status};
-pub use memory::{CacheId, Decision, Fills, HoldId, Measured, Memory, Moved, Next, Origin, Pass, Pin, Ref, Request, Retained, SetId, Shrunk, Site, SitePeak, Stats, StepStats, Torch, Unregisters, Workspace, Yielded};
+pub use ledger::{Grant, HostCall, Ledger, Peak, PhysicalChange, RowStatus, Status};
+pub use memory::{CacheId, Claim, Fills, HoldId, MakeRoom, Memory, Moved, Origin, Pass, Pin, Ref, Request, Retained, SetId, Stats, StepStats, Unregisters, Yielded};
 pub use table::{Fill, Fingerprint, Level, PartId, Plan, SetSpec, Step};
 pub use tier::{Need, Tier};
 

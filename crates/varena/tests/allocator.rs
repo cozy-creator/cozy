@@ -10,7 +10,7 @@ use std::time::Duration;
 use tensorfs::format::ObjectRef;
 use tensorfs::io::{ItemSource, ObjectRange, source::Source};
 use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
-use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Plan, SetSpec, Torch};
+use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Plan, SetSpec};
 
 fn gpu() -> GpuId {
     GpuId { uuid: "callback-heap-lock".into(), model: "host".into(), memory: 64 << 20 }
@@ -64,7 +64,7 @@ impl Drop for Claims {
 }
 
 #[test]
-#[ignore = "subprocess role, invoked by callback_does_not_wait_for_a_peer_heap_lock"]
+#[ignore = "subprocess role, invoked by the_hooks_free_read_does_not_wait_for_a_peer_heap_lock"]
 fn callback_peer() {
     let role = std::env::var("VARENA_CALLBACK_ROLE").unwrap();
     assert!(varena::os::namespace(&std::env::var("VARENA_CALLBACK_NAMESPACE").unwrap()));
@@ -84,41 +84,34 @@ fn callback_peer() {
 }
 
 #[test]
-fn callback_does_not_wait_for_a_peer_heap_lock() {
+fn the_hooks_free_read_does_not_wait_for_a_peer_heap_lock() {
     let namespace = format!("allocator-test-{}-", std::process::id());
     assert!(varena::os::namespace(&namespace));
     let _claims = Claims;
-    let memory = Memory::open(gpu(), None, Box::new(HostBackend::new(gpu().memory))).unwrap();
+    let memory = Arc::new(Memory::open(gpu(), None, Box::new(HostBackend::new(gpu().memory))).unwrap());
     let dir = tempfile::tempdir().unwrap();
     let set = memory.load(cold_page(dir.path()), Level::Gpu).unwrap();
     let pin = memory.bind(set, 0, 0).unwrap();
     pin.filled();
     drop(pin);
-    let request = Arc::new(memory.request("callback", Plan::default()).unwrap());
-    memory.observe(Torch::default()).unwrap();
+    let request = memory.request("callback", Plan::default()).unwrap();
     let mut dead = peer("dead-row", &namespace);
     dead.0.kill().unwrap();
     assert!(!dead.0.wait().unwrap().success(), "leave an unreaped row by killing its owner");
     let mut locker = peer("heap-lock", &namespace);
     let (answer, received) = mpsc::channel();
-    let active = request.clone();
-    let callback = std::thread::spawn(move || {
-        let until = std::time::Instant::now() + Duration::from_secs(1);
-        let result = loop {
-            let result = active.reclaim_allocation(gpu().memory);
-            if !matches!(result, Ok(0)) || std::time::Instant::now() >= until { break result; }
-            std::thread::yield_now();
-        };
-        let _ = answer.send(result);
+    let hook = std::thread::spawn({
+        let memory = memory.clone();
+        move || {
+            let _ = answer.send(memory.free());
+        }
     });
-    // Hang protection only. The assertion is causal: callback returned BEFORE the controller
+    // Hang protection only. The assertion is causal: the read returned BEFORE the controller
     // releases C's real heap lock. On failure release first, then join; no child is stranded.
     let result = received.recv_timeout(Duration::from_secs(5));
     locker.0.stdin.as_mut().unwrap().write_all(b"release\n").unwrap();
     assert!(locker.0.wait().unwrap().success());
-    callback.join().unwrap();
-    assert!(result.is_ok(), "native callback waited for a peer heap lock");
-    assert!(result.unwrap().unwrap() >= REGION_ALIGN, "the callback actually reclaimed a completed local page while C still held the peer heap lock");
+    hook.join().unwrap();
+    assert!(result.is_ok(), "the hook's free read waited for a peer heap lock");
     drop(request);
-    drop(memory);
 }
