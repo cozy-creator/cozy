@@ -545,7 +545,7 @@ fn a_failed_ref_update_retries_the_exact_held_tree_without_uploading_admitted_bl
     );
     let row = &result.result.as_ref().unwrap().value["models"][0];
     assert_eq!(row["tree"], fixture.tree.id());
-    assert_eq!(row["lane"], "f32");
+    assert_eq!(row["lane"], "model.f32.cozytensors");
     assert_eq!(row["published"]["tree"], fixture.tree.id());
     assert_eq!(row["published"]["checkpoint"], fixture.header.id());
     assert_eq!(row["published"]["converged"], false);

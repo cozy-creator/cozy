@@ -103,7 +103,7 @@ def check(vectors, parse_header, plain):
             failures.append(f"selection: {case['why']}")
     for case in spec["lookups"]:
         asked = case["ask"]
-        candidates = [asked, asked + ".cozytensors", f"model.{asked}.cozytensors"]
+        candidates = [asked, asked + ".cozytensors", f"model.{asked}.cozytensors" if asked else "model.cozytensors"]
         got = next((p for p in candidates if p in case["paths"] and p.endswith(".cozytensors")), None)
         passed += got == case["variant"]
         if got != case["variant"]:
