@@ -3,7 +3,10 @@
 # dependencies = ["cozy-runtime>=0.27.4"]
 # ///
 """varena's native GPU suite on a rental: `cozy run native.py --on <rental> --gpus 1
---asset binary=<the gpu test binary> --asset suite=<suite.json>`.
+--asset binary=<bundle.tar of test binaries> --asset suite=<suite.json>`.
+
+The bundle (gpu/testbins.sh) holds varena's `gpu` (its cases, and the `role_monitor` role) and
+TensorFS's `tensorfs-io`; a case is named `<binary>/<test>`.
 
 `suite.json`: `{"label", "cases": [name, ...], "steps": {name: s}}`, `steps` being each case's
 longest step on an earlier run. Each case runs in a fresh process of the binary, one after another;
@@ -28,6 +31,7 @@ import os
 import re
 import signal
 import subprocess
+import tarfile
 import tempfile
 import time
 from typing import Annotated
@@ -94,12 +98,15 @@ class Monitor:
         self.proc.wait()
 
 
-def longest_step(text: str) -> float | None:
-    """Seconds of the case's longest step: the largest gap between consecutive STEP lines, at
-    least their 1 ms resolution."""
+def longest_step(text: str, took: float) -> float | None:
+    """Seconds of the case's longest step: the largest gap between consecutive STEP lines, or the
+    time outside them (start-up before the first, teardown after the last), at least their 1 ms
+    resolution."""
     ms = [int(m) for m in STEP.findall(text)]
-    gaps = [b - a for a, b in zip(ms, ms[1:])]
-    return max(max(gaps), 1) / 1000 if gaps else None
+    if not ms:
+        return None
+    gaps = [b - a for a, b in zip(ms, ms[1:])] + [took * 1000 - (ms[-1] - ms[0])]
+    return max(max(gaps), 1) / 1000
 
 
 def run_case(program: Path, case: str, log: Path, interval: float | None, monitor: Monitor, cancelled) -> tuple[int, str | None]:
@@ -117,7 +124,11 @@ def run_case(program: Path, case: str, log: Path, interval: float | None, monito
                     return proc.wait(), "cancelled"
                 if interval is None:
                     continue
-                now = (log.stat().st_size, group_io(proc.pid))
+                # Judged between its first step and its verdict: start-up and teardown are not steps.
+                text = log.read_text(errors="replace")
+                if not STEP.search(text) or "PASS " in text:
+                    continue
+                now = (len(text), group_io(proc.pid))
                 moved = monitor.worked() or now != last
                 quiet = 0 if moved else quiet + 1
                 if quiet == 2:
@@ -131,13 +142,19 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
     selection = json.loads(suite.read_bytes())
     label, cases = selection["label"], selection["cases"]
     steps = selection.get("steps", {})
-    if not cases or len(set(cases)) != len(cases):
-        raise ValueError("the suite names distinct cases")
+    if not cases or len(set(cases)) != len(cases) or not all("/" in c for c in cases):
+        raise ValueError("the suite names distinct cases, each <binary>/<test>")
     ctx.log(f"native suite {label}: {len(cases)} cases", level="warn")
     root = Path(tempfile.mkdtemp(prefix="varena-gpu-"))
+    bundle = root / "bundle.tar"
+    bundle.write_bytes(binary.read_bytes())
+    with tarfile.open(bundle) as tar:
+        for member in tar.getmembers():
+            if not member.isfile() or "/" in member.name or member.name.startswith("."):
+                raise ValueError(f"the bundle holds only plain binaries, not {member.name!r}")
+            (root / member.name).write_bytes(tar.extractfile(member).read())
+            (root / member.name).chmod(0o700)
     program = root / "gpu"
-    program.write_bytes(binary.read_bytes())
-    program.chmod(0o700)
     logs = root / "logs"
     logs.mkdir()
     monitor = Monitor(program, lambda m: ctx.log(m, level="warn"))
@@ -145,19 +162,21 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
     for case in cases:
         if ctx.cancelled:
             break
-        log = logs / f"{case}.log"
+        name, test = case.split("/", 1)
+        log = logs / f"{name}-{test}.log"
         interval = steps.get(case)
         if interval is None:
             unjudged.append(case)
         ctx.log(f"START {case}" + (" (unjudged: no earlier runtime)" if interval is None else f" (looks every {interval:.3f} s)"), level="warn")
         start = time.monotonic()
-        code, end = run_case(program, case, log, interval, monitor, lambda: ctx.cancelled)
+        code, end = run_case(root / name, test, log, interval, monitor, lambda: ctx.cancelled)
         took[case] = round(time.monotonic() - start, 3)
         text = log.read_text(errors="replace")
-        longest[case] = longest_step(text)
+        longest[case] = longest_step(text, took[case])
         summary = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", text)
         named = [m for line in text.splitlines() if "PASS " in line for m in UUID.findall(line)[-1:]]
-        ok = not end and not code and summary[-1:] == [("1", "0", "0")] and bool(named)
+        # Varena's cases name the GPU they ran on; other binaries' tests do not print one.
+        ok = not end and not code and summary[-1:] == [("1", "0", "0")] and (bool(named) or name != "gpu")
         (passed if ok else failed).append(case)
         if end:
             ended[case] = end
@@ -165,8 +184,15 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
         verdict = "PASS" if ok else (end or "FAIL").upper()
         ctx.log(f"{verdict} {case} in {took[case]} s, longest step {longest[case]} s", level="warn" if ok else "error")
         if not ok:
-            # The run log reaches the caller even when a cancelled run's outputs do not.
-            ctx.log(f"TAIL {case}:\n" + "\n".join(text.splitlines()[-40:]), level="error")
+            # The run log reaches the caller even when a cancelled run's outputs do not; it keeps a
+            # message's first 200 characters, so the tail goes line by line, the steps but the last
+            # left out.
+            lines = text.splitlines()
+            stepped = [l for l in lines if STEP.search(l)]
+            tail = [l for l in lines if not STEP.search(l)][-40:] + stepped[-1:]
+            for line in tail:
+                for at in range(0, max(len(line), 1), 180):
+                    ctx.log(f"TAIL {case[:40]}: {line[at:at + 180]}", level="error")
     monitor.close()
     result = {"label": label, "cases": cases, "passed": passed, "failed": failed, "ended": ended, "unjudged": unjudged,
               "seconds": took, "steps": {c: s for c, s in longest.items() if s}, "gpus": sorted(gpus),
