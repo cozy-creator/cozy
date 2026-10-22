@@ -691,6 +691,30 @@ impl Table {
         self.remaining(&back).unwrap_or_else(|| self.w(&back))
     }
 
+    /// Yielded W per family waited for, in a row's slots: the largest families apart, any more
+    /// than the slots together under family 0 (counted for every child).
+    pub fn yielded_by_family(&self) -> [(u64, u64); crate::decide::YIELDED] {
+        let mut by: BTreeMap<u64, u64> = BTreeMap::new();
+        for r in self.requests.iter().filter(|r| r.yielded.is_some()) {
+            *by.entry(r.family).or_default() += self.yielded_w(r);
+        }
+        let mut families: Vec<(u64, u64)> = by.into_iter().collect();
+        families.sort_by_key(|(f, w)| (std::cmp::Reverse(*w), *f));
+        let mut out = [(0, 0); crate::decide::YIELDED];
+        let fits = families.len() <= crate::decide::YIELDED;
+        for (i, (f, w)) in families.into_iter().enumerate() {
+            match out.get_mut(i) {
+                Some(slot) if fits || i + 1 < crate::decide::YIELDED => *slot = (f, w),
+                _ => {
+                    if let Some(last) = out.last_mut() {
+                        *last = (0, last.1 + w);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Pinned bytes outside every open request's current step (counted apart by `fits`).
     pub fn outside(&self) -> u64 {
         let current = |(set, _): Key| self.requests.iter().any(|r| r.step(r.cursor.step).is_some_and(|(s, _)| s.contains(&set)));

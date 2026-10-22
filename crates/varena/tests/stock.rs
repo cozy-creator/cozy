@@ -420,9 +420,10 @@ fn a_pin_dropped_before_the_binder_waits_wakes_it() {
 }
 
 /// Review 6, G1 (the reviewer's probe): a restock re-checks the live offers in place, so an
-/// allocator callback during the re-check finds the idle N page offered (it used to find the
-/// stock empty: the offers were taken out and sent back after). The callback runs inside the
-/// re-check here, standing in for the allocator on another thread.
+/// allocator callback during a restock finds the idle N page offered (it used to find the
+/// stock empty: the offers were taken out and sent back after). A live offer's re-check makes
+/// no driver call (G2), so the callback runs inside the restock's one call, a fresh offer's
+/// event query, standing in for the allocator on another thread.
 #[test]
 fn a_restock_never_leaves_the_callback_an_empty_stock() {
     assert!(varena::os::namespace(&format!("stock{}-", std::process::id())));
@@ -435,22 +436,32 @@ fn a_restock_never_leaves_the_callback_an_empty_stock() {
     let mem = Arc::new(Memory::open(g.clone(), None, Box::new(backend)).unwrap());
     let k = mem.load(spec(dir.path(), &uuid, "kset", Fill::Undeclared), Level::Ram).unwrap();
     mem.load(spec(dir.path(), &uuid, "other", Fill::Undeclared), Level::Ram).unwrap();
+    let third = mem.load(spec(dir.path(), &uuid, "third", Fill::Undeclared), Level::Ram).unwrap();
     // K used and let go: offered to the callback as N.
     use_once(&mem, k, "kset", "r0");
     let r1 = Arc::new(mem.request("r1", plan("other")).unwrap());
+    // The third set's page in use, then N once its request ends: a fresh offer then.
+    let r3 = mem.request("r3", plan("third")).unwrap();
+    let pass = r3.pass(third, "fwd", "1x1", Torch::default()).unwrap();
+    let pin = mem.bind(third, 0, 0).unwrap();
+    if pin.fresh {
+        pin.filled();
+    }
+    drop(pin);
+    pass.end(Measured::default(), Torch::default());
     let claimed = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
     *hook.lock() = Some(Box::new({
         let (r1, claimed) = (r1.clone(), claimed.clone());
-        move || claimed.store(r1.reclaim_allocation(REGION_ALIGN).unwrap_or(0), Ordering::SeqCst)
+        move || {
+            let _ = claimed.compare_exchange(u64::MAX, r1.reclaim_allocation(REGION_ALIGN).unwrap_or(0), Ordering::SeqCst, Ordering::SeqCst);
+        }
     }));
     armed.store(true, Ordering::SeqCst);
-    // A new plan restocks: the live offer of K is taken out and re-checked.
-    let r2 = mem.request("r2", plan("other")).unwrap();
+    // Its end restocks: K's live offer is re-checked, the third set's page offered fresh.
+    r3.end();
     armed.store(false, Ordering::SeqCst);
     let during = claimed.load(Ordering::SeqCst);
-    let after = r1.reclaim_allocation(REGION_ALIGN).unwrap_or(0);
-    println!("callback during the re-check claimed {during}; right after it {after}");
-    r2.end();
+    println!("callback during the restock claimed {during}");
     drop(r1);
     drop(mem);
     varena::os::remove_table(&uuid);

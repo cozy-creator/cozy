@@ -1236,10 +1236,11 @@ impl Memory {
     }
 
     /// Registers bytes the caller holds (torch tensors) that `shrink(want) -> freed` gives back.
-    /// A cache whose `owner` is a request id ends with that request. One serving components
-    /// (`sets`: a component's graph pool or decode cache, a pool shared by a serialized
-    /// domain's components) takes the most protective class among them and goes before their
-    /// pages; one serving none is N.
+    /// A cache whose `owner` is a request id ends with that request. A cache takes exactly the
+    /// class of the components it serves (`sets`), the most protective among them, and goes
+    /// before their pages: a component's graph pool or decode cache names the component, a
+    /// model's KV or derived cache its model's sets (W while the model runs, D while a plan
+    /// declares it, N once idle; review 6, C4); one serving none is N.
     pub fn cache(&self, owner: &str, sets: &[SetId], shrink: impl Fn(u64) -> Shrunk + Send + Sync + 'static) -> CacheId {
         let shrink: Shrink = Arc::new(shrink);
         self.inner
@@ -1541,10 +1542,11 @@ impl Inner {
         st.promises();
         self.physical(st);
         if settled > 0 {
-            // The reclaimed bytes move from the callback's count into the stored limit: the
-            // allocator's limit never drops between publications.
-            self.limit.store(st.table.torch_limit(), Ordering::Release);
+            // The reclaimed bytes move from the callback's count into the stored limit, the
+            // count first: a reader (the limit, then the count) may miss them for a moment, never
+            // count them twice (review 6, F5).
             self.unreconciled.fetch_sub(settled, Ordering::AcqRel);
+            self.limit.store(st.table.torch_limit(), Ordering::Release);
         }
     }
 
@@ -1932,7 +1934,7 @@ impl Inner {
             unmeasured: remaining.iter().filter(|r| r.is_none()).count() as u64,
             running: t.requests.len() as u64,
             outside: t.outside(),
-            yielded: yielded_by_family(t),
+            yielded: t.yielded_by_family(),
             host_peak: st.host.values().flatten().copied().max().unwrap_or(0),
             host_unmeasured: st.host.values().filter(|h| h.is_none()).count() as u64,
             // Retiring bytes, and the caches' shrinks queued or asked (torch's bytes coming).
@@ -1962,7 +1964,7 @@ impl Inner {
         let stocked: Vec<Key> = st.homes.iter().filter(|(_, h)| h.stock.is_some()).map(|(k, _)| *k).collect();
         for key in stocked {
             let gen = st.homes.get(&key).map(|h| h.gen);
-            if self.offerable(st, key).is_some_and(|o| Some(o.gen) == gen) {
+            if self.offerable(st, key, false).is_some_and(|o| Some(o.gen) == gen) {
                 continue;
             }
             if let Some(h) = st.homes.get_mut(&key) {
@@ -1976,7 +1978,7 @@ impl Inner {
         }
         let fresh: Vec<Key> = st.homes.iter().filter(|(_, h)| h.stock.is_none()).map(|(k, _)| *k).collect();
         for key in fresh {
-            let Some(offer) = self.offerable(st, key) else { continue };
+            let Some(offer) = self.offerable(st, key, true) else { continue };
             let claim = Arc::new(AtomicU8::new(STOCKED));
             if let Some(h) = st.homes.get_mut(&key) {
                 h.stock = Some(claim.clone());
@@ -1990,7 +1992,7 @@ impl Inner {
         if self.stock.len() > 2 * live.len() {
             st.round += 1;
             for (key, claim) in live {
-                if let Some(offer) = self.offerable(st, key) {
+                if let Some(offer) = self.offerable(st, key, false) {
                     let _ = self.stock_tx.send(Stocked { claim, round: st.round, ..offer });
                 }
             }
@@ -2004,13 +2006,15 @@ impl Inner {
     }
 
     /// Page `key` as the callback may reclaim it: mapped, filled and complete, unpinned, never
-    /// kept, and of no declared use (N or S). `None` otherwise.
-    fn offerable(&self, st: &State, key: Key) -> Option<Stocked> {
+    /// kept, and of no declared use (N or S). `None` otherwise. A live offer's ready event was
+    /// complete when it was made and no use since left it in the stock: not queried again
+    /// (review 6, G2).
+    fn offerable(&self, st: &State, key: Key, query: bool) -> Option<Stocked> {
         let idle = st.table.page(key).is_some_and(|p| p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.kept);
         let class = st.table.class(key);
         let (va, off, span) = st.place(key).ok()?;
         let h = st.homes.get(&key)?;
-        let complete = !h.filling && !h.transforming && !h.keeping && !h.keep_after && !h.exported && self.backend.query(h.ready).unwrap_or(false);
+        let complete = !h.filling && !h.transforming && !h.keeping && !h.keep_after && !h.exported && (!query || self.backend.query(h.ready).unwrap_or(false));
         let phys = h.phys.as_ref().map(|p| p.id).filter(|_| idle && complete && matches!(class, Some(Class::N | Class::S)))?;
         Some(Stocked { key, gen: h.gen, round: st.round, va, off, span, phys, claim: Arc::new(AtomicU8::new(TAKEN)) })
     }
@@ -3696,7 +3700,7 @@ impl Inner {
         let shrinks: Vec<(u32, u64, Shrink)> = holding.iter().filter_map(|id| st.shrinks.get(id).map(|s| (*id, u64::MAX, s.clone()))).collect();
         let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
         let mut stats = st.stats.remove(&req).unwrap_or_default();
-        st.host.remove(&req);
+        let unmeasured = st.host.remove(&req).is_some_and(|h| h.is_none()) && st.host.values().all(Option::is_some);
         // Its anonymous host peak (the process's since the first open request started).
         stats.host = st.window.as_mut().and_then(ledger::Window::look);
         if st.table.requests.is_empty() {
@@ -3725,6 +3729,11 @@ impl Inner {
         stats.keep_pending = st.keep_pending();
         st.last = Some(stats.clone());
         self.publish(&mut st);
+        // The last host-unmeasured call ended (published): a copy refused beside it probes for
+        // room again; a standalone call has no measured pass end to retry at (review 6).
+        if let Some(save) = unmeasured.then(|| st.deferred_saves.pop()).flatten() {
+            self.saves.post(save, 0);
+        }
         let uses: Vec<Call> = st.sets.iter().flatten().map(|m| Call::Use { digest: m.tier.clone(), distance: None }).collect();
         if self.tier.is_some() {
             uses.into_iter().for_each(|c| self.post(c));
@@ -3972,29 +3981,6 @@ impl Inner {
         drop(st);
         Ok(empty && self.mech.idle() && self.to_custody.idle() && self.to_tier.idle() && self.saves.idle())
     }
-}
-
-/// The table's yielded W per family it waits for, in the row's slots: the largest families
-/// apart, any more together under family 0 (counted for every child).
-fn yielded_by_family(t: &Table) -> [(u64, u64); crate::decide::YIELDED] {
-    let mut by: BTreeMap<u64, u64> = BTreeMap::new();
-    for r in t.requests.iter().filter(|r| r.yielded.is_some()) {
-        *by.entry(r.family).or_default() += t.yielded_w(r);
-    }
-    let mut families: Vec<(u64, u64)> = by.into_iter().collect();
-    families.sort_by_key(|(f, w)| (std::cmp::Reverse(*w), *f));
-    let mut out = [(0, 0); crate::decide::YIELDED];
-    for (i, (f, w)) in families.into_iter().enumerate() {
-        match out.get_mut(i) {
-            Some(slot) if i + 1 < crate::decide::YIELDED => *slot = (f, w),
-            _ => {
-                if let Some(last) = out.last_mut() {
-                    *last = (0, last.1 + w);
-                }
-            }
-        }
-    }
-    out
 }
 
 impl Inner {
