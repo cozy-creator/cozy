@@ -417,8 +417,8 @@ def cpu_by_thread(before: dict[int, tuple[str, float]], after: dict[int, tuple[s
 
 def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> weakref.ref[Memory]:
     """On host pages, a warm forward through the adapter costs at most 10% more CPU than the
-    plain model on the same pages (the same bytes, the same kernels: placement alone moves a
-    forward's CPU by more than the adapter costs, and by the runner). Its own table and model,
+    plain model: what a user pays. Beside it, the split: the plain model on the same pages (the
+    same bytes and kernels) is placement's part, the rest the adapter's. Its own table and model,
     every block a hit; the best of several tries each, interleaved, so the shared machine's load
     is not the measurement. On one torch thread: torch's idle workers spin while the main thread
     runs Python, so with N workers the adapter's own time counts up to N+1 times, and the ratio
@@ -465,11 +465,12 @@ def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> 
                 where[name][tid] = (thread, where[name].get(tid, (thread, 0.0))[1] + cpu - before.get(tid, (thread, 0.0))[1])
     del runs, paged, pins
     costs(mem, unet)
-    ratio = best["served"] / best["paged"]
+    ratio, adapter_part, placement = best["served"] / best["plain"], best["served"] / best["paged"], best["paged"] / best["plain"]
     torch.set_num_threads(threads_before)
     print("OVERHEAD best CPU ms: " + ", ".join(f"{name} {1e3 * t:.1f}" for name, t in best.items()) + "; all 11 runs' CPU ms by thread: "
           + "; ".join(f"{name} {cpu_by_thread({}, w)}" for name, w in where.items()), flush=True)
-    check(f"overhead: a warm forward through the adapter costs {100 * (ratio - 1):+.1f}% CPU over plain on its pages (at most +10%)", ratio <= 1.10 and origins == {"hit"}, (best, origins))
+    check(f"overhead: a warm forward through the adapter costs {100 * (ratio - 1):+.1f}% CPU over plain (at most +10%; "
+          f"adapter {100 * (adapter_part - 1):+.1f}%, placement {100 * (placement - 1):+.1f}%)", ratio <= 1.10 and origins == {"hit"}, (best, origins))
     return weakref.ref(mem)
 
 
