@@ -94,7 +94,7 @@ def main():
                 address = layer.weight.data_ptr()
             records.append((binding, graph, pool, static, output, address))
             torch.cuda.synchronize()
-            mem.native.load(placed.set, Level.Ram)  # release backing; graph+VA stay live
+            mem.native.load(placed.set, Level.RAM)  # release backing; graph+VA stay live
             print(f"CAPTURE {i + 1}/{DEPTH} ptr={address:#x} pool={pool.id}", flush=True)
 
     def run(label, value):
@@ -109,7 +109,7 @@ def main():
                     graph.replay()  # the exact instance captured before backing eviction
                     x = output.clone()
                 torch.cuda.synchronize()
-                mem.native.load(placed.set, Level.Ram)
+                mem.native.load(placed.set, Level.RAM)
             actual = x.cpu()
             moved = request.stats().moved
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
