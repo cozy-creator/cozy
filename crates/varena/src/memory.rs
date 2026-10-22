@@ -1151,7 +1151,7 @@ impl Memory {
             let holder = custody.as_ref().map_or(0, |c| c.holder());
             let tier_holder = tier.as_ref().map_or(0, |t| t.holder());
             let context = backend.process_used().unwrap_or_else(|_| backend.opened_context());
-            let table = Table { capacity: shared.capacity()?, context, ..Table::default() };
+            let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, ..Table::default() };
             let inner = Arc::new(Inner {
                 backend,
                 shared,

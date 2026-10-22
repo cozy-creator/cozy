@@ -414,6 +414,8 @@ impl Remote {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Table {
     pub capacity: u64,
+    /// This row's own cap (a standalone opener's limit); the table's capacity is TensorD's.
+    pub limit: Option<u64>,
     /// Bytes on the device no row accounts for, measured, beyond what the card leaves outside
     /// the table's cap (`capacity`): `capacity - foreign` is min(cap, card - foreign bytes).
     pub foreign: u64,
@@ -616,7 +618,12 @@ impl Table {
 
     /// F: what no row, orphan or foreign tenant holds.
     pub fn free(&self) -> u64 {
-        self.capacity.saturating_sub(self.foreign + self.orphans + self.held() + self.others_held())
+        self.capped(self.capacity.saturating_sub(self.foreign + self.orphans + self.held() + self.others_held()), self.held())
+    }
+
+    /// `room` within this row's own cap, `own` bytes held against it already.
+    fn capped(&self, room: u64, own: u64) -> u64 {
+        self.limit.map_or(room, |l| room.min(l.saturating_sub(own)))
     }
 
     /// The most this process could ever have beside torch's allocation: the capacity less
@@ -630,12 +637,13 @@ impl Table {
     /// from other rows. Its own pages and others' evictable bytes count: they can be made room.
     pub fn torch_ceiling(&self) -> u64 {
         let others: u64 = self.others.iter().map(Remote::unevictable).sum();
-        self.capacity.saturating_sub(self.foreign + self.context + others)
+        self.capped(self.capacity.saturating_sub(self.foreign + self.context + others), self.context)
     }
 
     /// What torch's allocator may hold: capacity − context − mapped − other rows − foreign.
     pub fn torch_limit(&self) -> u64 {
-        self.capacity.saturating_sub(self.foreign + self.orphans + self.context + self.vmm + self.mapping + self.promised + self.others_held())
+        let own = self.context + self.vmm + self.mapping + self.promised;
+        self.capped(self.capacity.saturating_sub(self.foreign + self.orphans + own + self.others_held()), own)
     }
 
     /// The bytes of a step's pages.

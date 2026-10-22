@@ -92,7 +92,7 @@ fn executor_stand_in() {
     // Granted by TensorD, or a standalone engine that opens the GPU's table by name.
     let grant = (opened == "granted").then(|| {
         let table = platform::handles::recv_fd(&control).unwrap();
-        Grant { table, row: platform::handles::recv_fd(&control).unwrap() }
+        Grant { table, row: platform::handles::recv_fd(&control).unwrap(), limit: None }
     });
     let memory = Memory::open(gpu.clone(), grant, Box::new(HostBackend::new(gpu.memory))).unwrap();
     let set = memory.load(spec(&gpu), if level == "gpu" { Level::Gpu } else { Level::Ram }).unwrap();
