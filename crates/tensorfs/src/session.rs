@@ -198,18 +198,18 @@ impl Client {
     /// One path for a plain folder, local identity, digest, or remote repository.
     /// Lazy opens return metadata only; eager opens await this checkpoint's bytes.
     pub async fn open(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint> {
+        let path = Path::new(name_or_path);
         let constraints = crate::precision::Constraints {
             bits: options.bits,
             gpus: match &options.gpus {
                 Some(gpus) => gpus.clone(),
-                None if options.variant.is_some() => vec![],
+                None if options.variant.is_some() || path.is_file() => vec![],
                 None => platform::gpu::probe(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref())
                     .map_err(|e| Failure { kind: Kind::Invalid, detail: format!("query GPUs: {e}") })?
                     .into_iter().map(|g| g.compute_capability.map(|(a,b)| format!("{a}.{b}")).unwrap_or_default()).collect(),
             },
         };
         constraints.select(name_or_path, &[])?; // Validate even an explicit variant's options.
-        let path = Path::new(name_or_path);
         let checkpoint = if path.exists() {
             let path = path
                 .canonicalize()

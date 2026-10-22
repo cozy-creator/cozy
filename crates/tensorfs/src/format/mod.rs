@@ -42,8 +42,8 @@ pub fn variant_of(path: &str) -> Option<&str> {
     name.ends_with(VARIANT_EXTENSION).then_some(path)
 }
 
-/// The path a writer gives variant `name`: itself, else with the extension added; `""` is
-/// [`HEADER_PATH`].
+/// A writer's full path, or a legacy bare name written as `model.<name>.cozytensors`;
+/// an extensionless nested path gets the extension. `""` is [`HEADER_PATH`].
 pub fn variant_path(name: &str) -> String {
     match name {
         "" => HEADER_PATH.into(),
