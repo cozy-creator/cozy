@@ -80,7 +80,10 @@ PUT  B/refs/<org>/<name>.json   If-Match: <etag> | If-None-Match: *
   the paths the client's delete patterns match, plus the uploaded files, added or replaced; a file the commit sets is
   never deleted. The tag then moves to it. Publishing creates or moves a public tag, or makes a private one public;
   yanking sets `yanked`. Each is one PUT of the edited document; on `412` an upload reads the tag's tree again and
-  re-applies its files. A model is deleted by a document with no tags. There is no DELETE.
+  re-applies its files. A document with no tags leaves the model untagged. There is no DELETE.
+- A commit a write untags stays the repo's: a server frees its objects only after the repo's owner deletes it (the
+  server's own operation, refused while a public tag names it), and then only those no other retained commit
+  reaches.
 - A server checks:
   - the body is a canonical `cozytensors.repo/1` document (cozytensors.md §9) whose `name` folds to the path;
   - every commit it cites has its closure present and readable by the writer, else `409 closure_incomplete` with up
