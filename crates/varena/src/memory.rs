@@ -520,6 +520,8 @@ type Trim = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 struct SetMech {
     spec: SetSpec,
+    /// Its fingerprint's key at its current fill (derived once: a hash).
+    key: String,
     va: Va,
     /// The RAM tier's name for its pages' bytes ([`tier_name`]) and its layout there.
     tier: String,
@@ -530,7 +532,7 @@ struct SetMech {
 }
 
 fn retained_identity(set: u32, m: &SetMech, blocks: &[u32]) -> String {
-    format!("{set}:{}:{}:{}:{blocks:?}", m.va.base, m.va.len, m.spec.fingerprint.key())
+    format!("{set}:{}:{}:{}:{blocks:?}", m.va.base, m.va.len, m.key)
 }
 
 /// The RAM tier's name for the bytes a set's pages hold: the store's (stored, or transformed
@@ -1782,7 +1784,7 @@ impl Inner {
         let stale: Vec<Key> = st
             .homes
             .iter()
-            .filter(|(k, h)| !h.filling && st.mech(k.0).is_ok_and(|m| m.spec.fingerprint.key() != h.identity))
+            .filter(|(k, h)| !h.filling && st.mech(k.0).is_ok_and(|m| m.key != h.identity))
             .filter(|(k, _)| st.table.page(**k).is_some_and(|p| p.pins.is_empty() && p.releasing.is_empty()))
             .map(|(k, _)| *k)
             .collect();
@@ -1798,6 +1800,7 @@ impl Inner {
             return Ok(());
         }
         m.spec.fingerprint.fill = fill;
+        m.key = m.spec.fingerprint.key();
         // The tier holds bytes by identity: another identity's layout is another layout.
         let tier = tier_name(&m.spec);
         let declared = m.spec.fingerprint.declared();
@@ -2011,11 +2014,16 @@ impl Inner {
     /// (review 6, G2).
     fn offerable(&self, st: &State, key: Key, query: bool) -> Option<Stocked> {
         let idle = st.table.page(key).is_some_and(|p| p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.kept);
-        let class = st.table.class(key);
+        if !idle || !matches!(st.table.class(key), Some(Class::N | Class::S)) {
+            return None;
+        }
+        let h = st.homes.get(&key).filter(|h| !h.filling && !h.transforming && !h.keeping && !h.keep_after && !h.exported)?;
+        // The driver is asked last, and only about a page that is otherwise an offer.
+        if query && !self.backend.query(h.ready).unwrap_or(false) {
+            return None;
+        }
         let (va, off, span) = st.place(key).ok()?;
-        let h = st.homes.get(&key)?;
-        let complete = !h.filling && !h.transforming && !h.keeping && !h.keep_after && !h.exported && (!query || self.backend.query(h.ready).unwrap_or(false));
-        let phys = h.phys.as_ref().map(|p| p.id).filter(|_| idle && complete && matches!(class, Some(Class::N | Class::S)))?;
+        let phys = h.phys.as_ref()?.id;
         Some(Stocked { key, gen: h.gen, round: st.round, va, off, span, phys, claim: Arc::new(AtomicU8::new(TAKEN)) })
     }
 
@@ -2144,7 +2152,7 @@ impl Inner {
             let w = keys
                 .into_iter()
                 .filter(|k| st.table.page(*k).is_some_and(|p| !p.mapped))
-                .filter_map(|k| st.mech(k.0).ok().filter(|m| m.spec.fingerprint.declared()).map(|m| (k, m.spec.fingerprint.key())))
+                .filter_map(|k| st.mech(k.0).ok().filter(|m| m.spec.fingerprint.declared()).map(|m| (k, m.key.clone())))
                 .collect();
             self.unlock(st);
             w
@@ -2154,7 +2162,7 @@ impl Inner {
             let start = Instant::now();
             let Some(handle) = c.import(&identity, key.1) else { continue };
             let mut st = self.lock();
-            let current = st.mech(key.0).ok().map(|m| m.spec.fingerprint.key());
+            let current = st.mech(key.0).ok().map(|m| m.key.clone());
             if st.homes.contains_key(&key) || current.as_ref() != Some(&identity) {
                 self.post(Call::Disown { fp: identity, page: key.1 });
                 self.unlock(st);
@@ -2194,7 +2202,7 @@ impl Inner {
         }
         let (va, off, span) = st.place(key)?;
         let gen = st.tick();
-        let identity = st.mech(key.0)?.spec.fingerprint.key();
+        let identity = st.mech(key.0)?.key.clone();
         let decided = st.table.free();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
@@ -2210,7 +2218,7 @@ impl Inner {
     /// owners' copy completion; resident replay never performs this preparation.
     fn refill_in_place(&self, st: &mut State, key: Key, req: Option<u64>) -> Result<()> {
         let (va, off, span) = st.place(key)?;
-        let identity = st.mech(key.0)?.spec.fingerprint.key();
+        let identity = st.mech(key.0)?.key.clone();
         let gen = st.tick();
         let after = st.table.page_mut(key).map(|p| std::mem::take(&mut p.releasing)).unwrap_or_default();
         // Its events are the refill's now (it waits on them, then retires them).
@@ -2537,7 +2545,7 @@ impl Inner {
     fn save_later(&self, st: &State, key: Key, req: Option<u64>) {
         let Ok(m) = st.mech(key.0) else { return };
         // Bytes of the set's current identity only: its layout is that identity's.
-        let current = |h: &&Home| h.identity == m.spec.fingerprint.key();
+        let current = |h: &&Home| h.identity == m.key;
         let Some(gen) = st.homes.get(&key).filter(current).map(|h| h.gen).filter(|_| m.held.as_ref().is_some_and(|h| !h.holds(key.1))) else { return };
         self.saves.post(Save { key, gen, tier: m.tier.clone(), req }, 0);
     }
@@ -2985,7 +2993,7 @@ impl Inner {
                     let pages = layout.regions.iter().map(|r| Page { bytes: r.span, ..Page::default() }).collect();
                     let set = Set { name: spec.name.clone(), pages, declared: spec.fingerprint.declared() };
                     let i = st.sets.len() as u32;
-                    st.sets.push(Some(SetMech { tier: tier_name(&spec), spec, va, held: None, closing: false, retained: 0 }));
+                    st.sets.push(Some(SetMech { tier: tier_name(&spec), key: spec.fingerprint.key(), spec, va, held: None, closing: false, retained: 0 }));
                     st.table.sets.push(Some(set));
                     (i, false)
                 }
@@ -3206,7 +3214,7 @@ impl Inner {
                 }
                 return Err(e);
             }
-            let identity = st.mech(set)?.spec.fingerprint.key();
+            let identity = st.mech(set)?.key.clone();
             let pinned = st.table.page(key).is_some_and(|p| p.pins.iter().any(|id| !claims.contains(id)));
             // Waiting on pins only this thread holds would wait on itself.
             let me = std::thread::current().id();

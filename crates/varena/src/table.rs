@@ -97,7 +97,8 @@ impl Fingerprint {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let digit = |n: u8| char::from(if n < 10 { b'0' + n } else { b'a' + n - 10 });
+    bytes.iter().flat_map(|b| [digit(b >> 4), digit(b & 0xf)]).collect()
 }
 
 /// A weight set: its layout (one page per region), where its bytes come from, and what they are.
