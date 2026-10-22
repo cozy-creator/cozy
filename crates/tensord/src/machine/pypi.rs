@@ -1,4 +1,4 @@
-//! A Runtime or TensorFS wheel the machine fetches itself: published on PyPI, checked against
+//! A Runtime or TensorFS wheel the machine fetches itself: published on uv's index, checked against
 //! the index's own SHA-256, or at any https URL, held to the digest its update names. It lands
 //! through the machine's store with the one downloader: `stop` ends it, and what landed stays
 //! for the next ask.
@@ -22,14 +22,14 @@ use crate::{
 
 const MAX_REDIRECTS: usize = 8;
 
-pub fn wheel(distribution: &str, version: &str, uv: &Path, dir: &Path, machine: &Machine, stop: &Stop) -> io::Result<PathBuf> {
+pub fn wheel(distribution: &str, version: &str, uv: &Path, python: &str, dir: &Path, machine: &Machine, stop: &Stop) -> io::Result<PathBuf> {
     let project = distribution.replace('_', "-");
     if version.is_empty() || !version.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-+!".contains(&c)) {
         return Err(io::Error::other("a published wheel requires a concrete version"));
     }
     let input = format!("{project}=={version}\n");
-    let plan = super::update::compile_sdk(uv, &input, stop, true)?
-        .map_err(|why| io::Error::other(format!("PyPI {project} {version}: {why}")))?;
+    let plan = super::update::compile_sdk(uv, python, &input, stop, true)?
+        .map_err(|why| io::Error::other(format!("{project} {version}: {why}")))?;
     let wheel = selected(&plan, &project, version)?;
     wheel_at(&wheel.url, &wheel.hashes.sha256, &wheel.filename()?, dir, machine, stop)
 }
@@ -184,18 +184,24 @@ wheels = [{{url = "https://files.pythonhosted.org/tensorfs-0.13.5-cp311-abi3-man
         assert!(selected(&plan.replace(&"1".repeat(64), "invalid"), "tensorfs", "0.13.5").is_err());
     }
 
+    /// PyPI lists TensorFS 0.13.5's cp310-only wheel first; an executor on 3.12 gets the abi3
+    /// one, which its environment imports. Real PyPI, uv and download.
     #[test]
-    #[ignore = "downloads a real published wheel and installs it for the executor's Python"]
     fn published_tensorfs_wheel_installs_for_executor_python() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(tensorfs::store::Store::open(root.path().join("store")).unwrap());
         let machine = Machine::new(store, None).unwrap();
         let uv = root.path().join(if cfg!(windows) { "uv.exe" } else { "uv" });
-        let wheel = wheel("tensorfs", "0.13.5", &uv, &root.path().join("wheels"), &machine, &Stop::default()).unwrap();
-        let output = std::process::Command::new(&uv)
-            .args(["pip", "install", "--no-config", "--no-deps", "--python", "3.12", "--target"])
-            .arg(root.path().join("installed")).arg(&wheel).output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert!(root.path().join("installed/tensorfs-0.13.5.dist-info/METADATA").is_file());
+        let wheel = wheel("tensorfs", "0.13.5", &uv, "3.12", &root.path().join("wheels"), &machine, &Stop::default()).unwrap();
+        assert!(wheel.to_string_lossy().contains("-cp311-abi3-"), "{wheel:?}");
+        let env = root.path().join("env");
+        let python = platform::paths::venv_python(&env);
+        for args in [vec!["venv", "--no-config", "--python", "3.12", env.to_str().unwrap()],
+            vec!["pip", "install", "--no-config", "--no-deps", "--python", python.to_str().unwrap(), wheel.to_str().unwrap()]] {
+            let output = std::process::Command::new(&uv).args(&args).output().unwrap();
+            assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        let imported = std::process::Command::new(&python).args(["-I", "-c", "import tensorfs"]).output().unwrap();
+        assert!(imported.status.success(), "{}", String::from_utf8_lossy(&imported.stderr));
     }
 }

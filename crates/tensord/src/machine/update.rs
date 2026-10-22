@@ -421,6 +421,8 @@ fn latest(paths: &Paths, pending: Status) -> io::Result<Status> {
 
 pub struct Updates {
     paths: Paths,
+    /// The Python executors run (`PackageSdk::python`): the SDK pair resolves for it.
+    python: String,
     status: Mutex<Option<Status>>,
     idle: Box<dyn Fn() -> bool + Send + Sync>,
     lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
@@ -435,6 +437,7 @@ pub struct Updates {
 impl Updates {
     pub fn open(
         paths: Paths,
+        python: String,
         idle: Box<dyn Fn() -> bool + Send + Sync>,
         lifecycle: Option<Arc<super::lifecycle::Lifecycle>>,
         machine: Option<Arc<Machine>>,
@@ -453,6 +456,7 @@ impl Updates {
         }
         Ok(Arc::new(Self {
             paths,
+            python,
             status: Mutex::new(status),
             idle,
             lifecycle,
@@ -1001,7 +1005,7 @@ impl Updates {
     fn compile(&self, wheels: &[PathBuf]) -> io::Result<Result<String, String>> {
         let input: String = wheels.iter().map(|p| p.display().to_string() + "\n").collect();
         let stop = self.stop.lock().unwrap().clone();
-        compile_sdk(&self.paths.uv, &input, &stop, false)
+        compile_sdk(&self.paths.uv, &self.python, &input, &stop, false)
     }
 
     /// A {file, sha256} fetched from its url or staged, or a published {version} fetched from
@@ -1033,18 +1037,18 @@ impl Updates {
         }
         let machine = self.machine.as_ref().ok_or_else(|| invalid("this machine fetches no published wheels"))?;
         let stop = self.stop.lock().unwrap().clone();
-        super::pypi::wheel(distribution, &choice.version, &self.paths.uv, &self.paths.update("downloads"), machine, &stop)
+        super::pypi::wheel(distribution, &choice.version, &self.paths.uv, &self.python, &self.paths.update("downloads"), machine, &stop)
     }
 }
 
-/// Resolve SDK requirements using the same uv path as an explicit machine update.
-pub(super) fn compile_sdk(uv: &Path, input: &str, stop: &Stop, wheel_plan: bool) -> io::Result<Result<String, String>> {
+/// Resolves SDK requirements for the executors' `python` over uv's configured index.
+pub(super) fn compile_sdk(uv: &Path, python: &str, input: &str, stop: &Stop, wheel_plan: bool) -> io::Result<Result<String, String>> {
     super::client::ensure_uv(uv)?;
     let mut command = std::process::Command::new(uv);
-    if wheel_plan { command.args(["pip", "compile", "--format", "pylock.toml", "--only-binary", ":all:", "--default-index", "https://pypi.org/simple"]); }
-    else { command.args(["pip", "compile"]); }
+    command.args(["pip", "compile"]);
+    if wheel_plan { command.args(["--format", "pylock.toml", "--only-binary", ":all:"]); }
     let mut child = platform::process::own_group(&mut command)
-        .args(["--quiet", "--no-config", "--no-cache", "--no-header", "--no-annotate", "--python", "3.12", "-"])
+        .args(["--quiet", "--no-config", "--no-cache", "--no-header", "--no-annotate", "--python", python, "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1423,7 +1427,7 @@ mod tests {
         let earlier = lifecycle.admit().unwrap();
         let drained = lifecycle.clone();
         let idle = Box::new(move || drained.admitted() == 0);
-        let updates = Updates::open(paths.clone(), idle, Some(lifecycle.clone()), None).unwrap();
+        let updates = Updates::open(paths.clone(), "3.12".into(), idle, Some(lifecycle.clone()), None).unwrap();
         let candidate = wheel(&root, "cozy_runtime", "0.2.0", None);
         let file = candidate.file_name().unwrap().to_str().unwrap().to_owned();
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(&candidate).unwrap()).unwrap();
@@ -1457,7 +1461,7 @@ mod tests {
         let lifecycle = super::super::lifecycle::Lifecycle::open(root.join("idle.json"), false, true, super::super::lifecycle::IDLE_GRACE_MS).unwrap();
         let earlier = lifecycle.admit().unwrap();
         let drained = lifecycle.clone();
-        let updates = Updates::open(paths.clone(), Box::new(move || drained.admitted() == 0), Some(lifecycle.clone()), None).unwrap();
+        let updates = Updates::open(paths.clone(), "3.12".into(), Box::new(move || drained.admitted() == 0), Some(lifecycle.clone()), None).unwrap();
         let candidate = wheel(&root, "cozy_runtime", "0.2.0", None);
         let request = update_request(&updates, "u1", &candidate);
         updates.request(request, |_| panic!("a canceled update activated")).unwrap();
@@ -1476,7 +1480,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
 
         let activating = Activation::prepare();
-        let updates = Updates::open(activating.paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(activating.paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         assert_eq!(updates.cancel("transaction").unwrap_err().kind(), io::ErrorKind::ResourceBusy);
         assert_eq!(updates.update("transaction").unwrap().state, "installing");
     }
@@ -1494,7 +1498,7 @@ mod tests {
         fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
         fs::write(&paths.config, "hub = \"local\"\n[machine]\nport = 9\n").unwrap();
         for (operation, limit) in [("cap", 8u64 << 30), ("lift", 0)] {
-            let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+            let updates = Updates::open(paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
             let request = Request {
                 operation: operation.into(), pin: None, runtime: None, tensorfs: None, cozy: None, binary: None,
                 gpu_memory_limit: Some(limit), toolchain: false,
@@ -1506,7 +1510,7 @@ mod tests {
             assert_eq!(config.machine.gpu_memory_limit, (limit > 0).then_some(limit), "{text}");
             assert_eq!((config.machine.port, config.hub.as_deref()), (Some(9), Some("local")));
             // The restarted machine proves ready and commits it.
-            Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap().commit().unwrap();
+            Updates::open(paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap().commit().unwrap();
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -1519,7 +1523,7 @@ mod tests {
         fs::create_dir_all(&paths.image_wheels).unwrap();
         wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
         wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
-        let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         let request = Request {
             operation: "same".into(), pin: None,
             runtime: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
@@ -1551,7 +1555,7 @@ mod tests {
         status.enter("preparing");
         fs::create_dir_all(paths.update("")).unwrap();
         write_json(&paths.update("status.json"), &status).unwrap();
-        let updates = Updates::open(paths, Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(paths, "3.12".into(), Box::new(|| true), None, None).unwrap();
         let stopped = updates.update("u1").unwrap();
         assert_eq!(stopped.state, "failed");
         assert!(stopped.error.starts_with("machine_restarted"));
@@ -1609,12 +1613,12 @@ mod tests {
             if changed_link {
                 relink(&transaction.paths.current_sdk_link(), Some(&transaction.new)).unwrap();
             }
-            let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+            let updates = Updates::open(transaction.paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
             assert!(updates.commit().is_err(), "unpublished state committed");
             assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Restored);
             transaction.links(&transaction.old);
             assert!(!transaction.paths.update("pending.json").exists());
-            let recovered = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+            let recovered = Updates::open(transaction.paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
             assert_eq!(recovered.update("transaction").unwrap().state, "rolled_back");
             assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Nothing);
         }
@@ -1628,7 +1632,7 @@ mod tests {
         assert_eq!(recover_activation(&transaction.paths).unwrap(), Recovered::Nothing);
         assert!(transaction.paths.update("pending.json").exists());
         transaction.links(&transaction.new);
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         // Keep the old pending bytes to simulate death after writing succeeded, before removal.
         let pending = fs::read(transaction.paths.update("pending.json")).unwrap();
         updates.commit().unwrap();
@@ -1700,7 +1704,7 @@ mod tests {
     fn committed_success_is_visible_even_when_pending_cleanup_fails() {
         let transaction = Activation::prepare();
         transaction.state("starting");
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         let mut succeeded = updates.update("transaction").unwrap();
         succeeded.enter("succeeded");
         // Fail the actual cleanup operation after the commit decision has already been read.
@@ -1728,7 +1732,7 @@ mod tests {
     fn failed_commit_is_observable_without_a_fabricated_terminal_outcome() {
         let transaction = Activation::prepare();
         transaction.state("starting");
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         let before = fs::read(transaction.paths.update("status.json")).unwrap();
         fs::remove_file(transaction.paths.update("status.json")).unwrap();
         fs::create_dir(transaction.paths.update("status.json")).unwrap();
@@ -1759,7 +1763,7 @@ mod tests {
     fn operation_ids_never_name_or_delete_software_directories() {
         let transaction = Activation::prepare();
         rollback_pending(&transaction.paths, "fixture").unwrap();
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         let original = fs::read_dir(&transaction.old).unwrap().count();
         for (id, version) in [(".", "0.3.0"), ("..", "0.3.1")] {
             let candidate = wheel(&transaction.root, "cozy_runtime", version, None);
@@ -1778,7 +1782,7 @@ mod tests {
     fn retrying_a_historical_operation_preserves_its_selected_generation() {
         let transaction = Activation::prepare();
         rollback_pending(&transaction.paths, "fixture").unwrap();
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         let candidate = wheel(&transaction.root, "cozy_runtime", "0.3.0", None);
         let request = update_request(&updates, "A", &candidate);
         updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
@@ -1808,7 +1812,7 @@ mod tests {
     fn a_named_wheel_is_compared_by_its_bytes_not_its_version() {
         let transaction = Activation::prepare();
         rollback_pending(&transaction.paths, "fixture").unwrap();
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         let rebuilt = transaction.root.join("rebuilt");
         fs::create_dir_all(&rebuilt).unwrap();
         let candidate = wheel(&rebuilt, "cozy_runtime", "0.1.0", Some(b"rebuilt"));
@@ -1840,7 +1844,7 @@ mod tests {
         fs::create_dir_all(&paths.image_wheels).unwrap();
         wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
         wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
-        let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         let candidate = requiring(&root, "cozy_runtime", "0.2.0", None, "Requires-Dist: tensorfs>=0.2\n");
         let mut request = update_request(&updates, "u1", &candidate);
         let tensorfs = wheel(&root, "tensorfs", "0.1.0", None);
@@ -1870,7 +1874,7 @@ mod tests {
         fs::create_dir_all(&paths.image_wheels).unwrap();
         wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
         wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
-        let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         let candidate = requiring(&root, "cozy_runtime", "0.2.0", None, "Requires-Dist: tensorfs>=999\n");
         updates.request(update_request(&updates, "u1", &candidate), |_| panic!("an unpaired Runtime activated")).unwrap();
         let failed = loop {
@@ -1889,7 +1893,7 @@ mod tests {
     #[test]
     fn a_failed_status_write_does_not_advance_the_in_memory_state() {
         let transaction = Activation::prepare();
-        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(transaction.paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         fs::remove_file(transaction.paths.update("status.json")).unwrap();
         fs::create_dir(transaction.paths.update("status.json")).unwrap();
         assert!(updates.set(|s| s.enter("starting")).is_err());

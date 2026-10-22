@@ -2479,7 +2479,7 @@ pub(crate) mod tests {
         tiny_wheel(&image, "tensorfs", "1.0", &[]);
         let named = tiny_wheel(&dev, "cozy-runtime", "2.1", &[]);
         let paths = Paths::new(&root.join("engine"), &root);
-        let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         let file = named.file_name().unwrap().to_string_lossy().to_string();
         let (digest, _) = updates.stage(&file, &mut File::open(&named).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256: digest.clone(), ..Default::default() });

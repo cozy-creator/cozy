@@ -304,12 +304,22 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     let (activating, executions) = (lifecycle.clone(), service.engine.clone());
     service.hold_while(move || activating.activating());
     lifecycle.on_activation(move || executions.notify_activity());
+    let mut sdk = crate::published::PackageSdk::selected(&paths.sdk(), &layout.root, crate::machine::client::uv(&layout.root));
+    // A local machine installs releases through its owner's uv cache, as its local packages do;
+    // a cache of its own from before is no longer read (environments keep their linked files).
+    if !rental {
+        sdk.owner_uv = crate::published::OwnerUv::of(protocol::config::environment());
+        if sdk.owner_uv.is_some() {
+            let _ = std::fs::remove_dir_all(engine.join("published/uv-cache"));
+        }
+    }
     let updates = {
         let (service, admitted) = (service.clone(), lifecycle.clone());
         // Only started runs drain: queued ones are journaled and run after the restart.
         let idle = move || service.settled().unwrap_or(false) && admitted.admitted() == 0;
         crate::machine::update::Updates::open(
             paths.clone(),
+            sdk.python.clone(),
             Box::new(idle),
             Some(lifecycle.clone()),
             Some(machine.clone()),
@@ -406,17 +416,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     identity.webrtc = crate::machine::player::listen(&layout.state, grant.webrtc_port, !rental)?;
     identity.player = grant.webrtc_reach.clone();
     // The client this binary embeds; the installer helper over it is made at the first install.
-    let uv = crate::machine::client::uv(&layout.root);
     let wheel = crate::machine::client::wheel(&engine)?;
-    let mut sdk = crate::published::PackageSdk::selected(&paths.sdk(), &layout.root, uv);
-    // A local machine installs releases through its owner's uv cache, as its local packages do;
-    // a cache of its own from before is no longer read (environments keep their linked files).
-    if !rental {
-        sdk.owner_uv = crate::published::OwnerUv::of(protocol::config::environment());
-        if sdk.owner_uv.is_some() {
-            let _ = std::fs::remove_dir_all(engine.join("published/uv-cache"));
-        }
-    }
     start_api(
         &engine,
         &generations,
