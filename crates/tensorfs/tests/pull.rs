@@ -95,6 +95,20 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
         "a warm pull asks for no object"
     );
 
+    let digest_root = temporary("python-header-digest");
+    let digest_fetcher = crate::fetcher(&open_store(&digest_root), None);
+    let digest_progress = Progress::default();
+    let revision = format!("sha256:{}", model.header.sha256);
+    let by_header = digest_fetcher
+        .pull(&origin, "acme/tiny", Some(&revision), None,
+              &Want { progress: Some(&digest_progress), ..Want::default() })
+        .await
+        .unwrap();
+    assert_eq!(by_header.landed.origin, model.bytes(), "resolution retains the tree's first source");
+    assert_eq!(by_header.landed.local, 0);
+    assert_eq!(digest_progress.total.load(std::sync::atomic::Ordering::Relaxed), model.bytes());
+    assert_eq!(digest_progress.held.load(std::sync::atomic::Ordering::Relaxed), model.bytes());
+
     let vae_root = temporary("python-vae");
     let vae_store = open_store(&vae_root);
     let vae = ["vae".to_string()];
@@ -360,6 +374,16 @@ async fn a_private_origin_writes_nothing_to_the_volume() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hung_volume_is_left_alone_until_it_answers() {
+    struct ReleaseFifo(std::path::PathBuf);
+    impl Drop for ReleaseFifo {
+        fn drop(&mut self) {
+            use std::os::unix::fs::OpenOptionsExt;
+            // An assertion failure must release the blocking reader before Tokio joins
+            // its blocking pool. O_RDWR is nonblocking even if the reader never started.
+            let _ = std::fs::OpenOptions::new().read(true).write(true)
+                .custom_flags(libc::O_NONBLOCK).open(&self.0);
+        }
+    }
     let origin_dir = temporary("hung-origin");
     let model = model(&origin_dir, "acme/hung", &[("unet", &[MIB, MIB])], 5);
     let server = Server::serve(&origin_dir, plain());
@@ -372,6 +396,7 @@ async fn a_hung_volume_is_left_alone_until_it_answers() {
         .status()
         .unwrap()
         .success());
+    let _release = ReleaseFifo(fifo.clone());
     let volume = VolumeOrigin::new(volume_dir.to_path_buf(), Duration::from_secs(60));
 
     let root = temporary("hung-store");
