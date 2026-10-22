@@ -1,11 +1,14 @@
-//! The CUDA driver API, dlopen'd on first use. The crate builds and its CPU paths run with no
-//! driver present; `libcuda.so.1` missing is a typed error, never a panic.
-//!
-//! One symbol table. Adding a symbol is one field plus one `load!` line.
+//! The CUDA VMM [`Backend`]: shareable physical pages (a POSIX fd, a WIN32 handle) mapped into
+//! reserved address space, filled pages remapped read-only, and fills through TensorFS's engine
+//! into `Dst::Device` ordered on varena's copy stream. Everything runs in the device's primary
+//! context, the one torch uses, so a page's pointer is valid there unchanged. Nothing is stored
+//! but the device's facts: a page's id is its `CUmemGenericAllocationHandle`, an event's its
+//! `CUevent`.
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::ffi::{c_char, c_int, c_void, CStr};
 
+<<<<<<<< HEAD:crates/tensorfs/src/io/cuda.rs
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error("CUDA unavailable: {0}")]
@@ -29,62 +32,49 @@ pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 /// `CUmemGenericAllocationHandle`: one physical VRAM allocation.
 pub type Handle = u64;
+========
+use parking_lot::Mutex;
+use platform::handles::Owned;
+use tensorfs::io::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUdevice, CUevent, CUstream, CtxGuard};
+use tensorfs::io::Dst;
 
-pub const SUCCESS: CUresult = 0;
-pub const ERROR_INVALID_VALUE: CUresult = 1;
-pub const ERROR_OUT_OF_MEMORY: CUresult = 2;
-pub const ERROR_HOST_MEMORY_ALREADY_REGISTERED: CUresult = 712;
-pub const ERROR_NOT_READY: CUresult = 600;
-pub const ERROR_NOT_SUPPORTED: CUresult = 801;
+use crate::backend::{Access, Backend, Event, Physical, Va};
+use crate::{Error, GpuId, Result};
+>>>>>>>> varena-one/integration:crates/varena/src/cuda.rs
 
-pub const STREAM_NON_BLOCKING: c_uint = 0x1;
-pub const EVENT_DEFAULT: c_uint = 0x0;
-pub const EVENT_DISABLE_TIMING: c_uint = 0x2;
-pub const MEMHOSTREGISTER_PORTABLE: c_uint = 0x1;
-/// The range is mapped read-only (a sealed layout); the device only reads it.
-pub const MEMHOSTREGISTER_READ_ONLY: c_uint = 0x8;
-pub const MEMHOSTALLOC_PORTABLE: c_uint = 0x1;
+#[cfg(unix)]
+const HANDLES: u32 = cuda::MEM_HANDLE_TYPE_POSIX_FD;
+#[cfg(unix)]
+const HANDLES_SUPPORTED: c_int = cuda::ATTR_POSIX_FD_SUPPORTED;
+#[cfg(windows)]
+const HANDLES: u32 = cuda::MEM_HANDLE_TYPE_WIN32;
+#[cfg(windows)]
+const HANDLES_SUPPORTED: c_int = cuda::ATTR_WIN32_HANDLE_SUPPORTED;
 
-pub const ATTR_VMM_SUPPORTED: c_int = 102;
-pub const ATTR_PCI_BUS_ID: c_int = 33;
-pub const ATTR_PCI_DEVICE_ID: c_int = 34;
-pub const ATTR_PCI_DOMAIN_ID: c_int = 50;
-pub const ATTR_POSIX_FD_SUPPORTED: c_int = 103;
-
-pub const MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
-pub const MEM_LOCATION_TYPE_DEVICE: u32 = 1;
-pub const MEM_HANDLE_TYPE_NONE: u32 = 0;
-pub const MEM_HANDLE_TYPE_POSIX_FD: u32 = 1;
-pub const MEM_ACCESS_PROT_READ: u32 = 1;
-pub const MEM_ACCESS_PROT_READWRITE: u32 = 3;
-pub const MEM_GRANULARITY_MINIMUM: u32 = 0;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
-pub struct MemLocation {
-    pub kind: u32,
-    pub id: c_int,
+/// One driver call; the caller has the context entered.
+macro_rules! call {
+    ($op:literal, $f:ident($($arg:expr),* $(,)?)) => {{
+        // Each driver call is a trace span of its name: a subscriber can time every one.
+        let _call = tracing::trace_span!($op).entered();
+        // SAFETY: the documented driver ABI, on live handles of this backend's context; every
+        // out-param points at a live local.
+        cuda::check($op, unsafe { (cuda::driver()?.$f)($($arg),*) })
+    }};
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
-pub struct AllocFlags {
-    pub compression_type: u8,
-    pub gpu_direct_rdma_capable: u8,
-    pub usage: u16,
-    pub reserved: [u8; 4],
+/// This process's reference on the device's primary context.
+struct Primary {
+    device: CUdevice,
+    ctx: usize,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct AllocationProp {
-    pub kind: u32,
-    pub requested_handle_types: u32,
-    pub location: MemLocation,
-    pub win32_handle_meta_data: *mut c_void,
-    pub alloc_flags: AllocFlags,
+impl Primary {
+    fn enter(&self) -> Result<CtxGuard> {
+        Ok(CtxGuard::enter(self.ctx as CUcontext)?)
+    }
 }
 
+<<<<<<<< HEAD:crates/tensorfs/src/io/cuda.rs
 impl AllocationProp {
     /// Pinned device memory on `device`; `handles`: another process may hold it by a POSIX fd.
     pub fn device(device: CUdevice, handles: u32) -> Self {
@@ -97,17 +87,28 @@ impl AllocationProp {
             },
             win32_handle_meta_data: std::ptr::null_mut(),
             alloc_flags: AllocFlags::default(),
+========
+impl Drop for Primary {
+    fn drop(&mut self) {
+        if let Ok(d) = cuda::driver() {
+            // SAFETY: releases the reference `open` retained.
+            unsafe { (d.primary_ctx_release)(self.device) };
+>>>>>>>> varena-one/integration:crates/varena/src/cuda.rs
         }
     }
 }
 
+/// `SECURITY_ATTRIBUTES` (minwinbase.h): with no descriptor, an exported page's NT handle gets
+/// the creator's default security; it crosses to a peer by `DuplicateHandle`, never by name.
+#[cfg(windows)]
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct AccessDesc {
-    pub location: MemLocation,
-    pub flags: u32,
+struct SecurityAttributes {
+    length: u32,
+    descriptor: *mut c_void,
+    inherit: i32,
 }
 
+<<<<<<<< HEAD:crates/tensorfs/src/io/cuda.rs
 type F<Args, R = CUresult> = unsafe extern "C" fn(Args) -> R;
 
 pub struct Driver {
@@ -301,68 +302,164 @@ impl Driver {
                 code: rc,
                 name: d.error_name(rc),
             });
-        }
-        Ok(d)
-    }
+========
+/// The stream pages are saved to the host on: the lowest priority, so a save never goes ahead of a
+/// fill. Synchronized and destroyed before the context is released.
+struct Saves {
+    raw: usize,
+    ctx: usize,
+}
 
-    pub fn error_name(&self, rc: CUresult) -> String {
-        let mut p: *const c_char = std::ptr::null();
-        // SAFETY: out-param; the driver returns a static string or fails.
-        if unsafe { (self.get_error_name)(rc, &mut p) } == SUCCESS && !p.is_null() {
-            // SAFETY: a NUL-terminated static string owned by the driver.
-            return unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+impl Drop for Saves {
+    fn drop(&mut self) {
+        if let (Ok(d), Ok(_ctx)) = (cuda::driver(), CtxGuard::enter(self.ctx as CUcontext)) {
+            // SAFETY: our stream, in its context; nothing is queued on it after this.
+            unsafe {
+                (d.stream_synchronize)(self.raw as CUstream);
+                (d.stream_destroy)(self.raw as CUstream);
+            }
+>>>>>>>> varena-one/integration:crates/varena/src/cuda.rs
         }
-        format!("CUresult {rc}")
     }
 }
 
-/// Map a driver result to the crate error.
-#[inline]
-pub fn check(op: &'static str, rc: CUresult) -> Result<()> {
-    if rc == SUCCESS {
-        Ok(())
-    } else {
-        Err(Error::Cuda {
-            op,
-            code: rc,
-            name: driver().map(|d| d.error_name(rc)).unwrap_or_default(),
+/// One CUDA device's VMM mechanism.
+pub struct CudaBackend {
+    /// Host registrations (`register_host`) by address. They go before the context does.
+    hosts: Mutex<HashMap<usize, cuda::HostPin>>,
+    ordinal: i32,
+    /// Varena's copy stream: fills are ordered on it. Dropped (synchronized) before the context.
+    stream: cuda::Stream,
+    saves: Saves,
+    primary: Primary,
+    prop: AllocationProp,
+    granularity: u64,
+    capacity: u64,
+    nvml: Option<platform::gpu::Device>,
+    /// The device's used bytes `open` measured across making the context.
+    context: u64,
+    /// The device page-locks host memory it may only read (attribute 113).
+    read_only_register: bool,
+    /// What `prop`'s WIN32 metadata points at, for as long as pages are created.
+    #[cfg(windows)]
+    _security: Box<SecurityAttributes>,
+}
+
+// SAFETY: driver handles are opaque and every use enters their context; `prop`'s only pointer is
+// the WIN32 metadata, owned by the backend and never written.
+unsafe impl Send for CudaBackend {}
+unsafe impl Sync for CudaBackend {}
+
+impl CudaBackend {
+    /// Device `ordinal` as CUDA enumerates it (after `CUDA_VISIBLE_DEVICES`), on its primary
+    /// context, retained while the backend lives.
+    pub fn open(ordinal: i32) -> Result<CudaBackend> {
+        let mut device: CUdevice = 0;
+        call!("cuDeviceGet", device_get(&mut device, ordinal))?;
+        for (attr, what) in [(cuda::ATTR_VMM_SUPPORTED, "virtual memory management"), (HANDLES_SUPPORTED, "shareable handles")] {
+            if cuda::attribute(device, attr)? == 0 {
+                return Err(Error::Invalid(format!("CUDA device {ordinal} has no {what}")));
+            }
+        }
+        let nvml = platform::gpu::Device::open(&cuda::uuid(device)?)
+            .inspect_err(|e| tracing::warn!(target: "varena", "NVML: {e}: no process bytes measured"))
+            .ok();
+        let before = used(nvml.as_ref());
+        let (_, ctx) = cuda::primary_context(ordinal)?;
+        let primary = Primary { device, ctx: ctx as usize };
+        let stream = cuda::Stream::new(ordinal)?;
+        // A context that existed before `open` (a framework made it) measures 0 here.
+        let context = used(nvml.as_ref()).zip(before).map_or(0, |(after, before)| after.saturating_sub(before));
+        let read_only_register = cuda::attribute(device, cuda::ATTR_READ_ONLY_HOST_REGISTER_SUPPORTED)? != 0;
+        #[allow(unused_mut)]
+        let mut prop = AllocationProp::device(device, HANDLES);
+        #[cfg(windows)]
+        let security = Box::new(SecurityAttributes { length: std::mem::size_of::<SecurityAttributes>() as u32, descriptor: std::ptr::null_mut(), inherit: 0 });
+        #[cfg(windows)]
+        {
+            prop.win32_handle_meta_data = (&*security as *const SecurityAttributes).cast_mut().cast();
+        }
+        let _ctx = primary.enter()?;
+        let mut granularity = 0usize;
+        call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut granularity, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
+        let (mut free, mut total) = (0usize, 0usize);
+        call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
+        let (mut least, mut greatest): (c_int, c_int) = (0, 0);
+        call!("cuCtxGetStreamPriorityRange", ctx_get_stream_priority_range(&mut least, &mut greatest))?;
+        let mut raw: CUstream = std::ptr::null_mut();
+        call!("cuStreamCreateWithPriority", stream_create_with_priority(&mut raw, cuda::STREAM_NON_BLOCKING, least))?;
+        let saves = Saves { raw: raw as usize, ctx: primary.ctx };
+        drop(_ctx);
+        Ok(CudaBackend {
+            hosts: Mutex::new(HashMap::new()),
+            ordinal,
+            stream,
+            saves,
+            primary,
+            prop,
+            granularity: granularity as u64,
+            capacity: total as u64,
+            nvml,
+            context,
+            read_only_register,
+            #[cfg(windows)]
+            _security: security,
         })
     }
-}
 
+<<<<<<<< HEAD:crates/tensorfs/src/io/cuda.rs
 /// Makes `ctx` current on this thread for the guard's life, then restores the caller's
 /// context. Caller threads belong to someone else (the executor's framework keeps its own
 /// current device), so TensorFS never leaves a different context bound behind it.
 pub struct CtxGuard {
     prev: Option<CUcontext>,
 }
+========
+>>>>>>>> varena-one/integration:crates/varena/src/cuda.rs
 
-impl CtxGuard {
-    // Driver handles are opaque: Rust never dereferences them.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn enter(ctx: CUcontext) -> Result<CtxGuard> {
-        let d = driver()?;
-        let mut prev: CUcontext = std::ptr::null_mut();
-        // SAFETY: out-param of the documented shape.
-        check("cuCtxGetCurrent", unsafe { (d.ctx_get_current)(&mut prev) })?;
-        if prev == ctx {
-            return Ok(CtxGuard { prev: None });
+    pub fn ordinal(&self) -> i32 {
+        self.ordinal
+    }
+
+    /// The copy stream (a `CUstream`).
+    pub fn stream(&self) -> usize {
+        self.stream.raw()
+    }
+
+    /// The device as the shared table names it.
+    pub fn gpu(&self) -> Result<GpuId> {
+        let mut name = [0 as c_char; 256];
+        call!("cuDeviceGetName", device_get_name(name.as_mut_ptr(), name.len() as c_int, self.primary.device))?;
+        // SAFETY: the driver wrote a NUL-terminated name into the buffer.
+        let model = unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned();
+        Ok(GpuId { uuid: cuda::uuid(self.primary.device)?, model, memory: self.capacity })
+    }
+
+    fn aligned(&self, what: &str, n: u64) -> Result<()> {
+        match n % self.granularity {
+            0 => Ok(()),
+            _ => Err(Error::Invalid(format!("{what} {n} is not a multiple of the {} byte granularity", self.granularity))),
         }
-        // SAFETY: `ctx` is a retained primary context.
-        check("cuCtxSetCurrent", unsafe { (d.ctx_set_current)(ctx) })?;
-        Ok(CtxGuard { prev: Some(prev) })
+    }
+
+    fn access(&self, ptr: u64, len: u64, access: Access) -> Result<()> {
+        let flags = match access {
+            Access::ReadWrite => cuda::MEM_ACCESS_PROT_READWRITE,
+            Access::Read => cuda::MEM_ACCESS_PROT_READ,
+        };
+        let desc = AccessDesc { location: self.prop.location, flags };
+        Ok(call!("cuMemSetAccess", mem_set_access(ptr, len as usize, &desc, 1))?)
+    }
+
+    /// `f` in the context; a failure of a call with no result to return is logged.
+    fn logged(&self, op: &str, f: impl FnOnce() -> Result<()>) {
+        if let Err(e) = self.primary.enter().and_then(|_ctx| f()) {
+            tracing::warn!(target: "varena", "{op}: {e}");
+        }
     }
 }
 
-impl Drop for CtxGuard {
-    fn drop(&mut self) {
-        if let (Some(prev), Ok(d)) = (self.prev, driver()) {
-            // SAFETY: restoring the handle the driver reported as current (possibly null).
-            unsafe { (d.ctx_set_current)(prev) };
-        }
-    }
-}
-
+<<<<<<<< HEAD:crates/tensorfs/src/io/cuda.rs
 /// A device's PRIMARY context: the one the CUDA runtime uses, so TensorFS's pointers, streams and
 /// events are valid in the executor's framework unchanged. Retained for the process's life.
 pub fn primary_context(ordinal: c_int) -> Result<(CUdevice, CUcontext)> {
@@ -376,18 +473,19 @@ pub fn primary_context(ordinal: c_int) -> Result<(CUdevice, CUcontext)> {
         (d.primary_ctx_retain)(&mut ctx, dev)
     })?;
     Ok((dev, ctx))
+========
+/// The device's used bytes as NVML reads them; `None` when NVML can't.
+fn used(nvml: Option<&platform::gpu::Device>) -> Option<u64> {
+    let reading = nvml?.read().ok()?;
+    Some(reading.total.saturating_sub(reading.free))
+>>>>>>>> varena-one/integration:crates/varena/src/cuda.rs
 }
 
-pub fn attribute(dev: CUdevice, attr: c_int) -> Result<i32> {
-    let d = driver()?;
-    let mut v: c_int = 0;
-    // SAFETY: out-param.
-    check("cuDeviceGetAttribute", unsafe {
-        (d.device_get_attribute)(&mut v, attr, dev)
-    })?;
-    Ok(v)
+fn raw(event: Event) -> CUevent {
+    event.0 as CUevent
 }
 
+<<<<<<<< HEAD:crates/tensorfs/src/io/cuda.rs
 pub fn uuid(dev: CUdevice) -> Result<String> {
     let d = driver()?;
     let mut u = [0u8; 16];
@@ -404,6 +502,268 @@ pub fn uuid(dev: CUdevice) -> Result<String> {
         &h[16..20],
         &h[20..32]
     ))
+========
+impl Backend for CudaBackend {
+    fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    fn free(&self) -> Result<u64> {
+        let _ctx = self.primary.enter()?;
+        let (mut free, mut total) = (0usize, 0usize);
+        call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
+        Ok(free as u64)
+    }
+
+    /// NVML's figure for this pid. Where the driver names no process of ours (WDDM has no
+    /// per-process numbers; a container whose pids are the host's) there is none: an error, and
+    /// the context stays as `open` measured it (`opened_context`).
+    fn process_used(&self) -> Result<u64> {
+        let nvml = self.nvml.as_ref().ok_or_else(|| Error::Io("NVML is unavailable: no process bytes".into()))?;
+        let reading = nvml.read()?;
+        reading.processes.as_ref().and_then(|p| p.get(&std::process::id()).copied()).ok_or_else(|| Error::Device {
+            op: "process_used",
+            code: -1,
+            name: "the driver names no process of ours (WDDM, or another pid namespace)".into(),
+        })
+    }
+
+    /// The device's used bytes `open` measured across making the context (0 when a framework
+    /// made it first): the context where the driver has no per-process numbers.
+    fn opened_context(&self) -> u64 {
+        self.context
+    }
+
+    fn granularity(&self) -> u64 {
+        self.granularity
+    }
+
+    fn reserve(&self, len: u64) -> Result<Va> {
+        let len = len.checked_next_multiple_of(self.granularity).ok_or_else(|| Error::Invalid(format!("reserve {len} overflows")))?;
+        let _ctx = self.primary.enter()?;
+        let mut base = 0u64;
+        call!("cuMemAddressReserve", mem_address_reserve(&mut base, len as usize, 0, 0, 0))?;
+        Ok(Va { base, len })
+    }
+
+    fn release(&self, va: Va) {
+        self.logged("cuMemAddressFree", || Ok(call!("cuMemAddressFree", mem_address_free(va.base, va.len as usize))?));
+    }
+
+    fn create(&self, len: u64) -> Result<Physical> {
+        self.aligned("a page of", len)?;
+        let _ctx = self.primary.enter()?;
+        let mut id = 0;
+        call!("cuMemCreate", mem_create(&mut id, len as usize, &self.prop, 0))?;
+        Ok(Physical { id, len })
+    }
+
+    fn destroy(&self, page: Physical) {
+        self.logged("cuMemRelease", || Ok(call!("cuMemRelease", mem_release(page.id))?));
+    }
+
+    fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()> {
+        self.aligned("offset", offset)?;
+        if offset.checked_add(page.len).is_none_or(|end| end > va.len) {
+            return Err(Error::Invalid(format!("{} bytes at {offset} outside a {} byte reservation", page.len, va.len)));
+        }
+        let ptr = va.base + offset;
+        let _ctx = self.primary.enter()?;
+        call!("cuMemMap", mem_map(ptr, page.len as usize, 0, page.id, 0))?;
+        self.access(ptr, page.len, access).inspect_err(|_| {
+            // SAFETY: the mapping just made, with nothing ordered on it yet.
+            unsafe { cuda::driver().map(|d| (d.mem_unmap)(ptr, page.len as usize)) }.ok();
+        })
+    }
+
+    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        self.access(va.base + offset, len, access)
+    }
+
+    fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        Ok(call!("cuMemUnmap", mem_unmap(va.base + offset, len as usize))?)
+    }
+
+    fn export(&self, page: &Physical) -> Result<Owned> {
+        let _ctx = self.primary.enter()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            let mut fd: c_int = -1;
+            call!("cuMemExportToShareableHandle", mem_export((&mut fd as *mut c_int).cast(), page.id, HANDLES, 0))?;
+            // SAFETY: the driver made this descriptor for us to own.
+            Ok(unsafe { Owned::from_raw_fd(fd) })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::FromRawHandle;
+            let mut handle: *mut c_void = std::ptr::null_mut();
+            call!("cuMemExportToShareableHandle", mem_export((&mut handle as *mut *mut c_void).cast(), page.id, HANDLES, 0))?;
+            // SAFETY: the driver made this NT handle for us to own.
+            Ok(unsafe { Owned::from_raw_handle(handle) })
+        }
+    }
+
+    fn import(&self, handle: Owned, len: u64) -> Result<Physical> {
+        self.aligned("a page of", len)?;
+        #[cfg(unix)]
+        let os: *mut c_void = {
+            use std::os::fd::AsRawFd;
+            handle.as_raw_fd() as usize as *mut c_void
+        };
+        #[cfg(windows)]
+        let os: *mut c_void = {
+            use std::os::windows::io::AsRawHandle;
+            handle.as_raw_handle()
+        };
+        let _ctx = self.primary.enter()?;
+        let mut id = 0;
+        call!("cuMemImportFromShareableHandle", mem_import(&mut id, os, HANDLES))?;
+        // The allocation holds its own reference now; our handle closes.
+        drop(handle);
+        Ok(Physical { id, len })
+    }
+
+    fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
+        Dst::Device { device: self.ordinal, ptr: va.base + offset, len: len as usize, stream: self.stream.raw() }
+    }
+
+    /// One driver copy on the save stream, after `after`, then a wait for that stream alone.
+    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> {
+        if offset.checked_add(host.len() as u64).is_none_or(|end| end > va.len) {
+            return Err(Error::Invalid(format!("{} bytes at {offset} outside a {} byte reservation", host.len(), va.len)));
+        }
+        let _ctx = self.primary.enter()?;
+        let stream = self.saves.raw as CUstream;
+        if after != Event::DONE {
+            call!("cuStreamWaitEvent", stream_wait_event(stream, raw(after), 0))?;
+        }
+        call!("cuMemcpyDtoHAsync", memcpy_dtoh_async(host.as_mut_ptr().cast(), va.base + offset, host.len(), stream))?;
+        Ok(call!("cuStreamSynchronize", stream_synchronize(stream))?)
+    }
+
+    fn fence(&self) -> Result<Event> {
+        self.record(self.stream.raw())
+    }
+
+    fn record(&self, stream: usize) -> Result<Event> {
+        let _ctx = self.primary.enter()?;
+        let mut event: CUevent = std::ptr::null_mut();
+        call!("cuEventCreate", event_create(&mut event, cuda::EVENT_DEFAULT))?;
+        if let Err(e) = call!("cuEventRecord", event_record(event, stream as CUstream)) {
+            // SAFETY: the event just made; nothing recorded it.
+            unsafe { cuda::driver().map(|d| (d.event_destroy)(event)) }.ok();
+            return Err(e.into());
+        }
+        Ok(Event(event as u64))
+    }
+
+    fn query(&self, event: Event) -> Result<bool> {
+        if event == Event::DONE {
+            return Ok(true);
+        }
+        let _ctx = self.primary.enter()?;
+        let _call = tracing::trace_span!("cuEventQuery").entered();
+        // SAFETY: a live event of this context.
+        match unsafe { (cuda::driver()?.event_query)(raw(event)) } {
+            cuda::SUCCESS => Ok(true),
+            cuda::ERROR_NOT_READY => Ok(false),
+            code => Err(cuda::check("cuEventQuery", code).err().map_or_else(|| Error::Internal("cuEventQuery".into()), Error::from)),
+        }
+    }
+
+    fn elapsed(&self, from: Event, to: Event) -> Result<Option<u64>> {
+        if from == Event::DONE || to == Event::DONE {
+            return Ok(Some(0));
+        }
+        if !(self.query(from)? && self.query(to)?) {
+            return Ok(None);
+        }
+        let _ctx = self.primary.enter()?;
+        let mut ms = 0f32;
+        call!("cuEventElapsedTime", event_elapsed_time(&mut ms, raw(from), raw(to)))?;
+        Ok(Some((f64::from(ms.max(0.0)) * 1e6) as u64))
+    }
+
+    fn wait(&self, event: Event, stream: usize) -> Result<()> {
+        if event == Event::DONE {
+            return Ok(());
+        }
+        let _ctx = self.primary.enter()?;
+        Ok(call!("cuStreamWaitEvent", stream_wait_event(stream as CUstream, raw(event), 0))?)
+    }
+
+    fn synchronize(&self, stream: usize) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        Ok(call!("cuStreamSynchronize", stream_synchronize(stream as CUstream))?)
+    }
+
+    fn finish(&self, event: Event) -> Result<()> {
+        if event == Event::DONE {
+            return Ok(());
+        }
+        let _ctx = self.primary.enter()?;
+        Ok(call!("cuEventSynchronize", event_synchronize(raw(event)))?)
+    }
+
+    fn retire(&self, event: Event) {
+        if event != Event::DONE {
+            // An event still pending is freed by the driver once it completes.
+            self.logged("cuEventDestroy", || Ok(call!("cuEventDestroy", event_destroy(raw(event)))?));
+        }
+    }
+
+    fn drain(&self) -> Result<()> {
+        self.stream.drain()?;
+        Ok(tensorfs::io::drain(self.ordinal)?)
+    }
+
+    /// Read-only where the device can (attribute 113), else read-write, which a read-only mapping
+    /// refuses: the caller then stages. A range already registered by another owner is refused,
+    /// never borrowed; one this backend holds stays as it is.
+    fn register_host(&self, ptr: u64, len: u64) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        let mut hosts = self.hosts.lock();
+        if hosts.contains_key(&(ptr as usize)) {
+            return Ok(());
+        }
+        // SAFETY: a lookup of the driver's registrations; no memory is touched.
+        if unsafe { cuda::registered(ptr as *const u8) }? {
+            return Err(Error::Invalid(format!("{ptr:#x} is registered by another owner")));
+        }
+        // SAFETY: the tier keeps the range mapped until `unregister_host`.
+        let pin = unsafe { cuda::pin_region(ptr as *mut u8, len as usize, self.read_only_register) }?;
+        hosts.insert(ptr as usize, pin);
+        Ok(())
+    }
+
+    /// A failed release keeps the registration, so its owner keeps the memory mapped and retries.
+    fn unregister_host(&self, ptr: u64) -> Result<()> {
+        let mut hosts = self.hosts.lock();
+        let pin = hosts.get_mut(&(ptr as usize)).ok_or_else(|| Error::Invalid(format!("{ptr:#x} is not registered")))?;
+        pin.release()?;
+        hosts.remove(&(ptr as usize));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hosted runners have no NVIDIA driver; run there with `--ignored`, never where a GPU is.
+    #[test]
+    #[ignore = "a machine without a CUDA driver only"]
+    fn no_driver_is_a_typed_error() {
+        match CudaBackend::open(0) {
+            Err(Error::Device { op: "load the driver", .. }) => {}
+            Err(e) => unreachable!("expected no driver, got {e}"),
+            Ok(_) => unreachable!("this machine has a CUDA driver"),
+        }
+    }
+>>>>>>>> varena-one/integration:crates/varena/src/cuda.rs
 }
 
 /// A caller-owned consumer stream for a DLPack handoff. The producer orders its work onto

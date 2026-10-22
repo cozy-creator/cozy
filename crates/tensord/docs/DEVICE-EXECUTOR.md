@@ -39,9 +39,9 @@ PYTHON -I -m cozy_runtime.internal.trampoline --expect-parent <pid> --oom-adj 10
 ## Weight loading
 
 TensorD's `Load` command asks Runtime to construct the model in this executor. TensorD supplies
-the selected stored metadata/assets and the weight sets' bytes (`read_grant`); Runtime parses
-and plans reads with its own TensorFS library, and varena in the executor decides every GPU byte
-it holds, making room in other executors through the GPU's ledger (design memory-varena).
+the selected stored metadata/assets; Runtime reads with its own TensorFS library, and varena in
+the executor decides every byte it holds (kept pages, the RAM tier, the store, in that order),
+making room in other executors through the GPU's ledger (design varena-slim).
 
 ## Wire
 
@@ -59,15 +59,13 @@ it holds, making room in other executors through the GPU's ledger (design memory
   whenever it holds a newer one. Load and Invoke name `actor`. A Runtime without the handler
   answers `reply: bearer`, which TensorD ignores.
 - `start` names `ledgers: N` and `memory_mode` (`shared` or `dedicated`); 2N fds follow the
-  frame, each GPU of `devices` in order its ledger memfd then its eventfd. Rank 0 claims its row
-  in the first and hands follower r its pair.
+  frame, each GPU of `devices` in order its grant (`varena::Grant`: its table, then its row's
+  lock description; the GPU's wake is by name). Rank 0 opens its memory with the first and
+  hands follower r the r-th.
 - While waiting for a reply, `event=progress` frames go to `Services::progress`. `event=request`
   frames (optionally with an `SCM_RIGHTS` fd) go to `Services::request`. The reply must name the
   command, otherwise it is an error. Unknown events and fields are ignored.
 - `Baseline` services answer every request `capability_unavailable`.
-- `read_grant {manifest, layout}`: the answer names its `descriptors` and the fds follow it: a
-  deposited sealed host layout (`held`), else none. They go to `Services::read_grant`. `deposit {manifest, layout}` carries one
-  memfd (`descriptor`): a sealed layout the executor filled.
 
 ## Capabilities
 

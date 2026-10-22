@@ -2873,12 +2873,12 @@ pub(crate) mod tests {
         fs::write(dir.join("generation.json"), json!({"identity": identity, "package": "acme/pkg", "version": "1.0.0",
             "application": "pkg:app", "python": python, "interface": interface}).to_string()).unwrap();
         let held = generations.resolve(&identity).unwrap();
-        let slot = |manifest: &ObjectRef, on_demand| PlanSlot { selected_encoded_bytes: 0, on_demand, lane: String::new(),
+        let slot = |manifest: &ObjectRef, on_demand| PlanSlot { selected_encoded_bytes: 0, on_demand, lane: String::new(), placeable: vec![],
             binding: crate::device_executor::Binding { snapshot: manifest.id(), components: vec!["model".into()], ..Default::default() } };
         let plan = Plan { id: "warm".into(), construction: "warm".into(), installation: "i".into(), generation: identity.clone(),
             entrypoint: "render".into(), slots: vec![slot(&manifest, false), slot(&later, true)], sources: vec![], degree: 1 };
         assert_eq!(plan.upfront(), [(manifest.id(), vec!["model".to_string()])]);
-        let config = serde_json::from_value(json!({"devices": "GPU-test-0", "authorized_device_limit_bytes": null, "prespawn": true})).unwrap();
+        let config = serde_json::from_value(json!({"devices": "GPU-test-0", "prespawn": true})).unwrap();
         let pool = Pool::new(&bench.root.join("gpu"), config, store.clone()).unwrap();
         let engine = crate::execution::Engine::open(&bench.root.join("execution")).unwrap();
         let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub), u64::MAX);
@@ -2953,11 +2953,13 @@ pub(crate) mod tests {
             let store = crate::storage::open(&root.join("store")).unwrap();
             let machine = crate::origin::Machine::new(store.clone(), None).unwrap();
             let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), machine).unwrap();
+            // Each test's GPUs are its own: their ledgers are named by UUID, machine-wide.
+            let tag = root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
             let inventory: Vec<Value> = gpus.iter().enumerate().map(|(at, (cc, memory))| json!({"device_index": at,
-                "device_name": "GPU", "device_uuid": format!("GPU-{at}"), "driver_version": "1", "memory_bytes": memory,
+                "device_name": "GPU", "device_uuid": format!("GPU-{at}-{tag}"), "driver_version": "1", "memory_bytes": memory,
                 "pci_bus_id": format!("{at}"), "compute_cap": cc})).collect();
             let devices: Vec<String> = (0..gpus.len()).map(|at| at.to_string()).collect();
-            let config = json!({"devices": devices.join(","), "inventory": inventory, "authorized_device_limit_bytes": null, "prespawn": false});
+            let config = json!({"devices": devices.join(","), "inventory": inventory, "prespawn": false});
             service.configure_pool(Pool::new(&root.join("gpu"), serde_json::from_value(config).unwrap(), store).unwrap()).unwrap();
             let identity = "cd".repeat(16);
             let dir = service.catalog.root().join(&identity);
