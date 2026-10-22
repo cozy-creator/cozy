@@ -1934,7 +1934,8 @@ impl Inner {
             yielded: yielded_by_family(t),
             host_peak: st.host.values().flatten().copied().max().unwrap_or(0),
             host_unmeasured: st.host.values().filter(|h| h.is_none()).count() as u64,
-            returning: t.returning,
+            // Retiring bytes, and the caches' shrinks queued or asked (torch's bytes coming).
+            returning: t.returning + t.caches.iter().map(|c| c.coming).sum::<u64>(),
         }
     }
 
@@ -2730,7 +2731,7 @@ impl Inner {
             self.publish(&mut st);
             drop(admission);
             self.unlock(st);
-            self.shrink(shrinks);
+            self.shrink(shrinks, false);
             if remote.is_empty() {
                 return Ok(actions);
             }
@@ -2915,13 +2916,17 @@ impl Inner {
     }
 
     /// Runs caches' shrink callbacks, the lock released (they are the caller's code).
-    fn shrink(&self, shrinks: Vec<(u32, u64, Shrink)>) {
+    /// Runs caches' shrinks, the lock released (the caller's code). `announced`: an answer to a
+    /// peer marked the bytes coming beforehand (review 6, C2); they now are what is still to
+    /// come.
+    fn shrink(&self, shrinks: Vec<(u32, u64, Shrink)>, announced: bool) {
         for (id, bytes, f) in shrinks {
             let shrunk = crate::caught(|| Ok(f(bytes))).unwrap_or_default();
             let mut st = self.state.lock();
             if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == id) {
                 c.bytes = c.bytes.saturating_sub(shrunk.freed + shrunk.coming);
-                c.coming += shrunk.coming;
+                let before = if announced { c.coming.saturating_sub(bytes) } else { c.coming };
+                c.coming = before + shrunk.coming;
             }
         }
     }
@@ -3697,7 +3702,7 @@ impl Inner {
             }
         }
         self.unlock(st);
-        self.shrink(shrinks);
+        self.shrink(shrinks, false);
         stats.tier = self.tier.as_ref().map_or(0, |t| t.resident());
         let mut st = self.lock();
         st.table.caches.retain(|c| !owned.contains(&c.id));
@@ -3760,7 +3765,14 @@ impl Inner {
                         self.unmap(&mut st, *page, *class, None, true)?;
                     }
                     Action::Trim(_) => wanted.trim = true,
-                    Action::Shrink { cache, bytes } => wanted.shrinks.push((*cache, *bytes)),
+                    // Its trim thread shrinks it after the reply; the bytes are coming meanwhile
+                    // (published), so the asker waits for them rather than escalating (C2).
+                    Action::Shrink { cache, bytes } => {
+                        if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == *cache) {
+                            c.coming += *bytes;
+                        }
+                        wanted.shrinks.push((*cache, *bytes));
+                    }
                     _ => {}
                 }
             }
@@ -3841,7 +3853,7 @@ impl Inner {
             let st = self.state.lock();
             wanted.shrinks.iter().filter_map(|(id, b)| st.shrinks.get(id).map(|s| (*id, *b, s.clone()))).collect()
         };
-        self.shrink(shrinks);
+        self.shrink(shrinks, true);
         let mut st = self.state.lock();
         self.publish(&mut st);
         drop(st);

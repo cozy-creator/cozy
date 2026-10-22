@@ -575,7 +575,8 @@ impl Table {
     /// Unique backing already retiring. It remains charged until its owners finish; neither
     /// overlapping mechanism/custody tickets nor ownership-lost quarantines add reclaim credit.
     pub fn returning(&self) -> u64 {
-        self.returning.min(self.vmm) + self.transient + self.caches.iter().map(|c| c.coming).sum::<u64>() + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
+        // A peer's: its retiring pages (P) and its caches' bytes coming (torch's).
+        self.returning.min(self.vmm) + self.transient + self.caches.iter().map(|c| c.coming).sum::<u64>() + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0) + r.torch)).sum::<u64>()
     }
 
     fn others_held(&self) -> u64 {

@@ -765,3 +765,22 @@ fn an_unmeasured_pass_never_sweeps_caches() {
     assert!(!short.iter().any(|a| matches!(a, Action::Shrink { .. })), "{short:?}");
 }
 
+/// Review 6, C2: a busy peer answers an ask with an older N cache's shrink (the reviewer's
+/// probe); it runs after the reply, so the peer publishes the bytes as coming (its returning),
+/// and the asker counts them: it waits for them rather than escalating.
+#[test]
+fn a_peers_cache_shrink_counts_as_coming_for_the_asker() {
+    let mut peer = table(8 * MB, vec![set("a", 1, MB), set("n", 1, MB)], vec![(vec![0], 1)]);
+    map(&mut peer, (0, 0));
+    map(&mut peer, (1, 0));
+    peer.page_mut((1, 0)).unwrap().last_use = 5;
+    peer.caches.push(Cache { id: 7, owner: "kv:r".into(), bytes: MB, last_use: 1, ..Default::default() });
+    (peer.allocated, peer.reserved) = (MB, MB);
+    let a = decide(&peer, &Trigger::Ask { ceiling: Class::N, bytes: MB });
+    assert_eq!(a, vec![Action::Shrink { cache: 7, bytes: MB }], "the older cache covers the ask");
+    // The asker sees the peer's bytes coming (published in its returning, of its torch's).
+    let mut asker = table(8 * MB, vec![set("x", 1, MB)], vec![(vec![0], 1)]);
+    asker.others.push(Remote { row: 2, running: true, torch: MB, returning: MB, ..Remote::default() });
+    assert_eq!(asker.returning(), MB);
+}
+
