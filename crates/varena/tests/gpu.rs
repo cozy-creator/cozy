@@ -2323,7 +2323,18 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
     // The idle set is no step of the plan: a step's pages are its working set, which the callback never takes.
     let r = mem.request("r", plan(&[&["w"]])).unwrap();
     step!();
-    let warm = loaded / pages;
+    // The longest single call the threads make, measured before them: thread A's first segment, cut and freed once.
+    let warm = {
+        let near = mem.allocator_limit().unwrap().saturating_sub(2 * REGION_ALIGN);
+        let (_, ctx) = cuda::primary_context(0).unwrap();
+        let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+        let d = cuda::driver().unwrap();
+        let t = std::time::Instant::now();
+        let mut ptr = 0;
+        assert_eq!(unsafe { (d.mem_alloc)(&mut ptr, near as usize) }, cuda::SUCCESS);
+        assert_eq!(unsafe { (d.mem_free)(ptr) }, cuda::SUCCESS);
+        t.elapsed().max(loaded / pages)
+    };
     step!();
     let (x, y, gated) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
     step!();
