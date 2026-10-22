@@ -34,7 +34,7 @@ enum Verb {
     Download(Download),
     /// Make a model on a machine and upload it as a private checkpoint.
     Upload(Upload),
-    /// Write a model's int8, fp8 or nvfp4 lane with the package that serves it.
+    /// Write a model's int8, fp8, nvfp4 or w4a8 lane with the package that serves it.
     Quantize(Quantize),
     /// Release a commit: a public tag named by a version, created, moved, or a private one made public.
     Publish(Publish),
@@ -124,7 +124,7 @@ pub(crate) struct Upload {
 }
 
 #[derive(clap::Args, Debug)]
-#[command(group(ArgGroup::new("lane").required(true).args(["int8", "fp8", "nvfp4"])))]
+#[command(group(ArgGroup::new("lane").required(true).args(["int8", "fp8", "nvfp4", "w4a8"])))]
 pub(crate) struct Quantize {
     /// org/name[@release] or org/name#sha256:….
     model: String,
@@ -139,6 +139,9 @@ pub(crate) struct Quantize {
     /// Write the nvfp4 lane (block-scaled FP4).
     #[arg(long)]
     nvfp4: bool,
+    /// Write the w4a8 lane (4-bit ConvRot codes on int8 tensor cores: Ampere, Ada, Hopper).
+    #[arg(long)]
+    w4a8: bool,
     /// The package (org/name[@release]) whose quantizer runs; default: the one the machine holds.
     #[arg(long)]
     package: Option<String>,

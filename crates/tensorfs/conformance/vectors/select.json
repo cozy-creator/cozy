@@ -44,7 +44,8 @@
     "int8.tensorwise",
     "mxfp4",
     "mxfp8",
-    "nvfp4"
+    "nvfp4",
+    "w4a8.convrot"
   ],
   "profiles": {
     "bf16": {
@@ -144,8 +145,8 @@
       ]
     },
     "mixed-unsupported": {
-      "family": "bf16",
-      "bits": 16,
+      "family": "",
+      "bits": 0,
       "bytes": 160,
       "kinds": [
         "BF16",
@@ -196,6 +197,26 @@
         "BF16",
         "int8.convrot",
         "nvfp4"
+      ]
+    },
+    "w4a8-int8": {
+      "family": "w4a8",
+      "bits": 4,
+      "bytes": 92,
+      "kinds": [
+        "BF16",
+        "int8.convrot",
+        "w4a8.convrot"
+      ]
+    },
+    "kitchen-int8": {
+      "family": "",
+      "bits": 0,
+      "bytes": 92,
+      "kinds": [
+        "BF16",
+        "comfy.asym_w4a8_int8",
+        "int8.convrot"
       ]
     },
     "scheme-awq.int4": {
@@ -549,6 +570,23 @@
       "kinds": [
         "nvfp4"
       ]
+    },
+    "scheme-w4a8.convrot": {
+      "family": "w4a8",
+      "bits": 4,
+      "bytes": 64,
+      "kinds": [
+        "w4a8.convrot"
+      ]
+    },
+    "gguf-bf16": {
+      "family": "",
+      "bits": 0,
+      "bytes": 192,
+      "kinds": [
+        "BF16",
+        "gguf.q4_0"
+      ]
     }
   },
   "cases": [
@@ -868,6 +906,36 @@
       "reasons": []
     },
     {
+      "why": "a tableless encoding beside bf16 has no lane",
+      "variants": {
+        "a.cozytensors": "gguf-bf16",
+        "b.cozytensors": "bf16"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ]
+      },
+      "variant": "b.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no int8 or fp8 lane for sm90; served bf16"
+      ]
+    },
+    {
+      "why": "a tableless encoding serves when no lane variant works",
+      "variants": {
+        "a.cozytensors": "gguf-bf16",
+        "b.cozytensors": "int8"
+      },
+      "constraints": {
+        "gpus": [
+          "7.5"
+        ]
+      },
+      "variant": "a.cozytensors",
+      "reasons": []
+    },
+    {
       "why": "Ada prefers int8 over fp8",
       "variants": {
         "weights/accurate.cozytensors": "bf16",
@@ -916,7 +984,9 @@
         "bits": 4
       },
       "variant": "q4.cozytensors",
-      "reasons": []
+      "reasons": [
+        "precision 4: acme/model@1 has no w4a8 lane for sm86; served nvfp4"
+      ]
     },
     {
       "why": "explicit sixteen",
@@ -1103,7 +1173,7 @@
       },
       "variant": null,
       "reasons": [],
-      "refused": "precision 16 on sm90: acme/model@1 has no variant that works; it publishes q.cozytensors (bf16) holds encoded future.scheme"
+      "refused": "precision 16 on sm90: acme/model@1 has no variant that works; it publishes q.cozytensors (BF16+future.scheme) is not 16-bit"
     },
     {
       "why": "an integer-dominant variant holding int8 is 8-bit",
@@ -1226,7 +1296,247 @@
         "bits": 4
       },
       "variant": "model.nvfp4.cozytensors",
+      "reasons": [
+        "precision 4: acme/model@1 has no w4a8 lane for sm89; served nvfp4"
+      ]
+    },
+    {
+      "why": "four bits take w4a8 on Ampere",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy",
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "8.6"
+        ],
+        "bits": 4
+      },
+      "variant": "model.w4a8.cozytensors",
       "reasons": []
+    },
+    {
+      "why": "four bits take w4a8 on Hopper",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy",
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ],
+        "bits": 4
+      },
+      "variant": "model.w4a8.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "four bits take nvfp4 on Blackwell",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy",
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "12.0"
+        ],
+        "bits": 4
+      },
+      "variant": "model.nvfp4.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "Blackwell without nvfp4 takes w4a8",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "bits": 4
+      },
+      "variant": "model.w4a8.cozytensors",
+      "reasons": [
+        "precision 4: acme/model@1 has no nvfp4 lane for sm100; served w4a8"
+      ]
+    },
+    {
+      "why": "the default lane takes int8 over a smaller w4a8 variant",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy",
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "8.6"
+        ]
+      },
+      "variant": "model.int8.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "kitchen's scheme beside int8 has no lane",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy",
+        "model.kitchen.cozytensors": "kitchen-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "8.6"
+        ]
+      },
+      "variant": "model.int8.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "kitchen's scheme is not the w4a8 lane",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy",
+        "model.kitchen.cozytensors": "kitchen-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "8.6"
+        ],
+        "bits": 4
+      },
+      "variant": "model.nvfp4.cozytensors",
+      "reasons": [
+        "precision 4: acme/model@1 has no w4a8 lane for sm86; served nvfp4"
+      ]
+    },
+    {
+      "why": "eight never takes a w4a8 variant",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy",
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ],
+        "bits": 8
+      },
+      "variant": "model.int8.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "a decode slot's own 4 bits take nvfp4 before w4a8",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy",
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "8.9"
+        ],
+        "prefer": 4,
+        "min_bits": 4
+      },
+      "variant": "model.nvfp4.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "a decode slot takes w4a8 without nvfp4",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "8.9"
+        ],
+        "prefer": 4,
+        "min_bits": 4
+      },
+      "variant": "model.w4a8.cozytensors",
+      "reasons": [
+        "precision 4: acme/model@1 has no nvfp4 lane for sm89; served w4a8"
+      ]
+    },
+    {
+      "why": "asked 4 bits on a decode slot take w4a8",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy",
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "8.9"
+        ],
+        "bits": 4,
+        "min_bits": 4
+      },
+      "variant": "model.w4a8.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "B300 has no int8, so no w4a8",
+      "variants": {
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "10.3"
+        ],
+        "bits": 4
+      },
+      "variant": null,
+      "reasons": [],
+      "refused": "precision 4 on sm103: acme/model@1 has no variant that works; it publishes model.w4a8.cozytensors (w4a8) needs sm80+ except sm103 for int8.convrot and sm80+ except sm103 for w4a8.convrot"
+    },
+    {
+      "why": "the CPU takes int8 over a smaller w4a8 variant unasked",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": []
+      },
+      "variant": "model.int8.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no bf16 or fp16 lane for no GPU; served int8"
+      ]
+    },
+    {
+      "why": "the CPU takes int8 over a smaller nvfp4 variant unasked",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy"
+      },
+      "constraints": {
+        "gpus": []
+      },
+      "variant": "model.int8.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no bf16 or fp16 lane for no GPU; served int8"
+      ]
+    },
+    {
+      "why": "a sole w4a8 variant serves the CPU",
+      "variants": {
+        "model.w4a8.cozytensors": "w4a8-int8"
+      },
+      "constraints": {
+        "gpus": [],
+        "bits": 4
+      },
+      "variant": "model.w4a8.cozytensors",
+      "reasons": [
+        "precision 4: acme/model@1 has no bf16 or fp16 lane for no GPU; served w4a8"
+      ]
     },
     {
       "why": "a run's lane is its main model's: H3's 16-bit-only LoRA is asked nothing",
@@ -1306,7 +1616,9 @@
         "min_bits": 8
       },
       "variant": "m.cozytensors",
-      "reasons": []
+      "reasons": [
+        "precision 4: acme/model@1 has no w4a8 lane for sm90; served nvfp4"
+      ]
     },
     {
       "why": "a decode slot prefers 4 bits",
@@ -2009,6 +2321,23 @@
       },
       "variant": "s.cozytensors",
       "reasons": []
+    },
+    {
+      "why": "scheme w4a8.convrot",
+      "variants": {
+        "s.cozytensors": "scheme-w4a8.convrot",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 4
+      },
+      "variant": "s.cozytensors",
+      "reasons": [
+        "precision 4: acme/model@1 has no nvfp4 lane for sm100; served w4a8"
+      ]
     }
   ],
   "lookups": [

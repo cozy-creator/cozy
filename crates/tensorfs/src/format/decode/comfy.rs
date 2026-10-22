@@ -1,6 +1,7 @@
 //! ComfyUI's ConvRot integer formats (spec §6): `int4.convrot` (comfy-kitchen's
 //! `TensorCoreConvRotW4A4Layout`), and kitchen's split-plane `AsymW4A8Int8Layout` at 4 bits
-//! (`comfy.asym_w4a8_int8`) and 6 bits (`comfy.w6a8_int8`). The codes are in the rotated basis;
+//! (`comfy.asym_w4a8_int8`, and `w4a8.convrot`, Cozy's profile of it) and 6 bits (`comfy.w6a8_int8`).
+//! The codes are in the rotated basis;
 //! each block of `rotation_size` columns is rotated back by `H_B`, as `int8.convrot` does.
 
 use super::affine::{Codes, Fill, Order, Packing};
@@ -31,6 +32,28 @@ pub static ASYM_W4A8_INT8: Scheme = Scheme {
         Part::req("scale", F32, |c| Grid::Row.shape(c)),
         Part::opt("codebook", F32, |_| Ok(Shape::Count(16))),
         Part::opt("correction", &["F32", "BF16", "F16"], |c| correction(c).shape(c)),
+    ],
+    decode: |c| grouped(c, 4),
+};
+
+/// `comfy.asym_w4a8_int8`'s parts and decode under Cozy's own name, at 16-input groups with E4M3
+/// group scales and no correction: the w4a8 lane's scheme (spec §6, §7).
+pub static W4A8_CONVROT: Scheme = Scheme {
+    name: "w4a8.convrot",
+    view: View::Matrix,
+    params: &[
+        Param {
+            key: "group_size",
+            allowed: Allowed::Check(|v| v.as_u64() == Some(16), "16"),
+        },
+        ROTATION,
+        ROTATION_SIZE,
+    ],
+    parts: &[
+        Part::req("weight", I8, |c| packed(c, 4, true)),
+        Part::req("group_scale", &["F8_E4M3"], |c| groups(c).shape(c)),
+        Part::req("scale", F32, |c| Grid::Row.shape(c)),
+        Part::opt("codebook", F32, |_| Ok(Shape::Count(16))),
     ],
     decode: |c| grouped(c, 4),
 };
@@ -80,7 +103,7 @@ pub static INT4_CONVROT: Scheme = Scheme {
 };
 
 pub(super) fn supports_sources(scheme: &Scheme) -> bool {
-    [&ASYM_W4A8_INT8, &W6A8_INT8, &INT4_CONVROT]
+    [&ASYM_W4A8_INT8, &W4A8_CONVROT, &W6A8_INT8, &INT4_CONVROT]
         .into_iter()
         .any(|s| std::ptr::eq(s, scheme))
 }
