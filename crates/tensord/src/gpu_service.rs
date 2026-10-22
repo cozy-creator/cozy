@@ -4279,8 +4279,8 @@ mod tests {
     /// An executor stand-in for the stall rule: granted the GPU's ledger over its control socket
     /// (stdin), it loads its set to the GPU and answers one line per command: `warm` (a request
     /// binding every block, ended: its pages stay idle on the GPU), `run <id> <shape>` (a request
-    /// and its pass, which makes the pass's measured room first) and `end <room>` (the pass
-    /// measured at `room`, the request ended).
+    /// and its pass, which asks its peers for every idle byte: no peak is recorded for it) and
+    /// `end <room>` (the pass ended at peak `room`, the request ended).
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "the stall-rule test runs it as an executor"]
@@ -4293,7 +4293,7 @@ mod tests {
         let gpu = varena::GpuId { uuid: uuid.into(), model: "host".into(), memory: bytes.parse().unwrap() };
         // SAFETY: the test installs its control socket at this process's stdin.
         let control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
-        let grant = varena::Grant { table: platform::handles::recv_fd(&control).unwrap(), row: platform::handles::recv_fd(&control).unwrap() };
+        let grant = varena::Grant { table: platform::handles::recv_fd(&control).unwrap(), row: platform::handles::recv_fd(&control).unwrap(), limit: None };
         let memory = varena::Memory::open(gpu.clone(), Some(grant), Box::new(varena::HostBackend::new(gpu.memory))).unwrap();
         let parts: usize = parts.parse().unwrap();
         let set = memory.load(stall_set(&gpu, name, parts), varena::Level::Gpu).unwrap();
@@ -4304,21 +4304,21 @@ mod tests {
             let reply = match line.split(' ').collect::<Vec<_>>()[..] {
                 ["warm"] => {
                     let warm = memory.request(&format!("warm-{}", uuid::Uuid::new_v4()), plan()).unwrap();
-                    let binding = warm.pass(set, "warm", "1", varena::Torch::default()).unwrap();
+                    let binding = warm.pass(set, "warm").unwrap();
                     drop((0..parts as u32).map(|block| memory.bind(set, block, 0).unwrap()).collect::<Vec<_>>());
-                    binding.end(varena::Measured::default(), varena::Torch::default());
+                    binding.end(0);
                     warm.end();
                     "warm".to_string()
                 }
                 ["run", id, shape] => {
                     let opened = memory.request(id, plan()).unwrap();
-                    pass = Some(opened.pass(set, "run", shape, varena::Torch::default()).unwrap());
+                    pass = Some(opened.pass(set, &format!("run|{shape}")).unwrap());
                     request = Some(opened);
                     "passing".to_string()
                 }
                 ["end", room] => {
                     let room: u64 = room.parse().unwrap();
-                    pass.take().unwrap().end(varena::Measured { allocated_peak: room, slack: room / 8, ..Default::default() }, varena::Torch::default());
+                    pass.take().unwrap().end(room);
                     request.take().unwrap().end();
                     "ended".to_string()
                 }
