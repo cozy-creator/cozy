@@ -415,12 +415,6 @@ impl Shared {
         Ok(slot.clone())
     }
 
-    /// A callback may inspect the fixed header through an existing map, never wait or remap.
-    pub(crate) fn try_capacity(&self) -> Option<u64> {
-        let map = self.map.try_read()?;
-        Some(header(&map).capacity.load(Acquire))
-    }
-
     /// TensorD's: the capacity is exactly this (a lifted limit raises it).
     fn set_capacity(&self, capacity: u64) -> Result<()> {
         let m = self.map()?;
