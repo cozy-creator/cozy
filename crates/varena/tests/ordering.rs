@@ -88,6 +88,14 @@ struct Events {
     save_waits: Gate,
     fail_save: AtomicBool,
     fail_save_drain: AtomicBool,
+    /// The next protect waits until its gate opens (its `waits` opens then); a protect is
+    /// running; binds (a binder's in-stream wait) made while one ran; each protect's bytes.
+    hold_protect: AtomicBool,
+    protect_gate: Gate,
+    protect_waits: Gate,
+    protecting: AtomicBool,
+    bound_while_protecting: AtomicU64,
+    protected: Mutex<Vec<u64>>,
 }
 
 /// Holds the call when `hold` is set: `waits` opens, then it passes `gate`.
@@ -207,7 +215,12 @@ impl Backend for Stream {
     }
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()> {
         self.events.log("protect");
-        self.host.protect(va, offset, len, access)
+        self.events.protected.lock().push(len);
+        self.events.protecting.store(true, Ordering::SeqCst);
+        held(&self.events.hold_protect, &self.events.protect_waits, &self.events.protect_gate);
+        let out = self.host.protect(va, offset, len, access);
+        self.events.protecting.store(false, Ordering::SeqCst);
+        out
     }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> {
         if self.events.fail_unmap.swap(false, Ordering::SeqCst) {
@@ -268,6 +281,10 @@ impl Backend for Stream {
         Ok(Some(0))
     }
     fn wait(&self, event: Event, stream: usize) -> Result<()> {
+        // A binder's stream (a fill's copy stream is 0): a pin handed out under a protect.
+        if stream != 0 && self.events.protecting.load(Ordering::SeqCst) {
+            self.events.bound_while_protecting.fetch_add(1, Ordering::SeqCst);
+        }
         if event != Event::DONE {
             self.events.waits.lock().push((event.0, stream));
         }
@@ -337,7 +354,7 @@ fn a_page_is_kept_only_after_its_transform_completes() {
     let dir = tempfile::tempdir().unwrap();
     let g = GpuId { uuid: format!("order-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
     let _scope = Scope::new(&g.uuid);
-    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
     let events = Arc::new(Events::default());
     let backend = Stream { host: HostBackend::new(g.memory), events: events.clone() };
     let mem = Memory::open(g.clone(), None, Box::new(backend)).unwrap();
@@ -359,12 +376,15 @@ fn a_page_is_kept_only_after_its_transform_completes() {
     assert!(!again.fresh);
     assert_eq!(again.ready, Event(transform), "the second binder orders after the transform");
     drop(again);
+    let last = events.next.load(Ordering::Relaxed);
     events.complete(transform);
     mem.torch_limit();
+    // Its consumers' releases are pending: no protect yet (a page in use is never protected).
+    assert!(events.kept.lock().is_empty(), "protected while its consumers' streams ran: {:?}", events.kept.lock());
+    (1..=last).for_each(|e| events.complete(e));
+    mem.torch_limit();
     // The mechanism makes it read-only, then exports it.
-    while events.kept.lock().len() < 2 {
-        ledger.await_event().unwrap();
-    }
+    events.await_log(|log| log.len() >= 2);
     assert_eq!(*events.kept.lock(), vec!["protect", "export"], "read-only, then exported, once complete");
     pass.end(Default::default(), Torch::default());
     drop(r);
@@ -940,11 +960,13 @@ fn a_kept_page_is_never_overwritten_under_its_old_key() {
     unsafe { std::ptr::write_bytes(pin.ptr as *mut u8, 0xab, pin.len as usize) };
     let len = pin.len as usize;
     pin.filled();
-    events.complete(events.next.load(Ordering::Relaxed));
+    // Kept once the bake completed and its consumer let go (a page in use is never protected).
+    drop(pin);
+    (1..=events.next.load(Ordering::Relaxed)).for_each(|e| events.complete(e));
     mem.torch_limit();
     log.await_call(|(_, c)| c.contains("Export") && c.contains(&old));
-    // Its consumer lets go; custody stops answering; lora-b is loaded.
-    drop(pin);
+    // Another consumer reads it and lets go; custody stops answering; lora-b is loaded.
+    drop(mem.bind(id, 0, 1).unwrap());
     gate.close();
     let mut b = spec;
     b.fingerprint.fill = Fill::Declared("lora-b".into());
@@ -1399,10 +1421,13 @@ fn failed_renewal_child() {
     let pin = mem.bind(id, 0, 1).unwrap();
     let ptr = pin.ptr;
     pin.filled();
-    events.complete(events.next.load(Ordering::Relaxed));
+    // Kept once the bake completed and its consumer let go (a page in use is never protected).
+    drop(pin);
+    (1..=events.next.load(Ordering::Relaxed)).for_each(|e| events.complete(e));
     mem.torch_limit();
     log.await_call(|(_, c)| c.contains("Export") && c.contains(&old));
-    drop(pin);
+    // Another consumer reads it and lets go: its release is pending at the renewal.
+    drop(mem.bind(id, 0, 1).unwrap());
     let pending = events.next.load(Ordering::Relaxed);
     spec.fingerprint.fill = Fill::Declared("lora-b".into());
     mem.load(spec, Level::Ram).unwrap();
@@ -1521,4 +1546,94 @@ fn an_unmeasured_pass_takes_idle_kept_pages_before_it_runs() {
     assert_eq!(n, 0, "the idle kept pages went before the unmeasured pass ran");
     assert!(mem.allocator_limit().unwrap() >= 2 * REGION_ALIGN, "its allocations have the room: {:?}", mem.allocator_limit());
     drop(pass);
+}
+
+/// gpu12's ILLEGAL_ADDRESS: a Keep made a page read-only (`cuMemSetAccess`) while kernels of
+/// the block it had just been bound to read it, and the read faulted. A Keep protects only idle
+/// pages (unpinned, no release pending), each contiguous run of a set in one call; a page in use
+/// stays due (Stats' keep_pending) and is kept at its first idle moment; a bind that meets a
+/// protect in flight gets its pin only after it.
+#[test]
+fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("keepidle-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    let protects = || events.kept.lock().iter().filter(|c| **c == "protect").count();
+    let exports = || events.kept.lock().iter().filter(|c| **c == "export").count();
+
+    // Three contiguous pages filled while pinned (their fills' events pending until the pins
+    // are taken), then released: due, but in use until their release events complete; then
+    // idle together, and kept in one protect.
+    let run = mem.load(stored(dir.path(), &uuid, "run", 3), Level::Ram).unwrap();
+    events.pending_fences.store(true, Ordering::SeqCst);
+    let pins: Vec<_> = (0..3).map(|b| mem.bind(run, b, 1).unwrap()).collect();
+    events.pending_fences.store(false, Ordering::SeqCst);
+    let fills = events.next.load(Ordering::Relaxed);
+    (1..=fills).for_each(|e| events.complete(e));
+    mem.torch_limit();
+    drop(pins);
+    let last = events.next.load(Ordering::Relaxed);
+    mem.torch_limit();
+    assert_eq!(protects(), 0, "protected while in use");
+    (fills + 1..=last).for_each(|e| events.complete(e));
+    mem.torch_limit();
+    events.await_log(|log| log.iter().filter(|c| **c == "export").count() == 3);
+    assert_eq!(*events.protected.lock(), vec![3 * REGION_ALIGN], "one protect for the run");
+
+    // A page bound while its fill's event is pending, held through the fill's completion and
+    // released with its release event pending: never protected while in use.
+    let r = mem.request("r", Plan::default()).unwrap();
+    events.pending_fences.store(true, Ordering::SeqCst);
+    let used = mem.load(stored(dir.path(), &uuid, "used", 1), Level::Ram).unwrap();
+    let pin = mem.bind(used, 0, 1).unwrap();
+    events.pending_fences.store(false, Ordering::SeqCst);
+    let fill = *events.fences.lock().last().unwrap();
+    events.complete(fill);
+    mem.torch_limit();
+    assert_eq!(protects(), 1, "protected while pinned");
+    assert_eq!(r.stats().keep_pending, REGION_ALIGN, "due, waiting for the page to be idle");
+    drop(pin);
+    let release = events.next.load(Ordering::Relaxed);
+    mem.torch_limit();
+    assert_eq!(protects(), 1, "protected while its consumer's stream ran");
+    events.complete(release);
+    mem.torch_limit();
+    events.await_log(|log| log.iter().filter(|c| **c == "export").count() == 4);
+    assert_eq!(protects(), 2);
+    mem.settle();
+    assert_eq!(r.stats().keep_pending, 0, "kept at its first idle moment");
+
+    // A bind that meets a protect in flight waits for it.
+    let raced = mem.load(stored(dir.path(), &uuid, "raced", 1), Level::Ram).unwrap();
+    events.pending_fences.store(true, Ordering::SeqCst);
+    drop(mem.bind(raced, 0, 1).unwrap());
+    events.pending_fences.store(false, Ordering::SeqCst);
+    events.hold_protect.store(true, Ordering::SeqCst);
+    (1..=events.next.load(Ordering::Relaxed)).for_each(|e| events.complete(e));
+    mem.torch_limit();
+    events.protect_waits.pass();
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let binder = {
+        let mem = mem.clone();
+        std::thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            tid_tx.send(unsafe { libc::gettid() }).unwrap();
+            drop(mem.bind(raced, 0, 7).unwrap());
+        })
+    };
+    let tid = tid_rx.recv().unwrap();
+    // The protect goes on once the binder returned (a pin under the protect) or sleeps on it.
+    let sleeping = || std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).is_ok_and(|s| s.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('S')));
+    while !binder.is_finished() && !sleeping() {
+        std::thread::yield_now();
+    }
+    events.protect_gate.open();
+    binder.join().unwrap();
+    assert_eq!(events.bound_while_protecting.load(Ordering::SeqCst), 0, "a pin handed out while its page's protect ran");
+    assert_eq!(exports(), 5);
+    drop(r);
 }
