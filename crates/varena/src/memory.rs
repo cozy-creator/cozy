@@ -365,6 +365,28 @@ pub struct Stats {
     pub keep_pending: u64,
     /// RAM-tier host ranges unlocked while it ran: each unlock stalls the device until idle.
     pub unregisters: Unregisters,
+    /// Every non-trivial decision made for it, in order: lowering, cuts, parks, exhaustion and
+    /// evictions of declared (D) or working (W) pages, each with what asked for it.
+    pub decisions: Vec<Decision>,
+}
+
+/// One decision a request's demand made (lead, v6: the Lower trigger, trace4's hang and the
+/// 4 MP sequence had to be rebuilt from totals).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Decision {
+    /// The request's plan step then.
+    pub step: u32,
+    /// What asked: a pass start, a bind, an OOM, a range's preparation, a workspace.
+    pub trigger: &'static str,
+    /// lower, cut, cut_outside, park, exhausted, evict_d or evict_w.
+    pub action: &'static str,
+    pub site: Option<String>,
+    /// The bytes asked for (exhausted: the bytes short).
+    pub need: u64,
+    /// The bytes this decision's round gave back (evictions: those of its class).
+    pub freed: u64,
+    /// A cut's level after it.
+    pub level: Option<u32>,
 }
 
 /// Host ranges unlocked for the RAM tier (`cuMemHostUnregister`, which synchronizes the device).
@@ -2555,9 +2577,17 @@ impl Inner {
             }
             let actions = decide(&st.table, &trigger);
             let (mut remote, mut shrinks, mut freed) = (vec![], vec![], 0);
+            let mut evicted = (0, 0);
             for a in &actions {
-                freed += self.apply(&mut st, a, req, &mut remote, &mut shrinks)?;
+                let bytes = self.apply(&mut st, a, req, &mut remote, &mut shrinks)?;
+                freed += bytes;
+                match a {
+                    Action::Unmap { class: Class::D, .. } => evicted.0 += bytes,
+                    Action::Unmap { class: Class::W, .. } => evicted.1 += bytes,
+                    _ => {}
+                }
             }
+            self.record(&mut st, req, &trigger, &actions, freed, evicted);
             let asked: u64 = remote.iter().map(|a| if let Action::Ask { bytes, .. } = a { *bytes } else { 0 }).sum();
             if remote.is_empty() {
                 st.claims.remove(&id);
@@ -2607,6 +2637,45 @@ impl Inner {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// The round's non-trivial decisions, into its request's record ([`Stats::decisions`]).
+    fn record(&self, st: &mut State, req: Option<u64>, trigger: &Trigger, actions: &[Action], freed: u64, (d, w): (u64, u64)) {
+        let Some(req) = req else { return };
+        let (kind, asked) = match trigger {
+            Trigger::Pass { room, unmeasured, .. } => ("pass", room.unwrap_or(*unmeasured)),
+            Trigger::Bind { page, .. } => ("bind", st.table.page(*page).map_or(0, |p| p.bytes)),
+            Trigger::Oom { need, .. } => ("oom", need.unwrap_or(0)),
+            Trigger::Prepare { pages, .. } => ("prepare", pages.iter().filter_map(|k| st.table.page(*k)).filter(|p| !p.mapped).map(|p| p.bytes).sum()),
+            Trigger::Workspace { bytes, .. } => ("workspace", *bytes),
+            Trigger::Speculate { .. } | Trigger::Ask { .. } | Trigger::Load { .. } => return,
+        };
+        let step = st.table.request(req).map_or(0, |r| r.cursor.step);
+        let level = |st: &State, site: &str, set: u32| st.active.get(&(req, set)).and_then(|a| st.cuts.get(&(set, a.shape.clone()))).and_then(|c| c.get(site).copied());
+        let mut out = vec![];
+        let decision = |action, site: Option<String>, need, freed, level| Decision { step, trigger: kind, action, site, need, freed, level };
+        for a in actions {
+            match a {
+                Action::Lower(_) => out.push(decision("lower", None, asked, freed, None)),
+                Action::Cut { set, site, .. } => out.push(decision("cut", Some(site.clone()), asked, freed, level(st, site, *set))),
+                Action::CutOutside { site, shape, .. } => {
+                    let level = st.table.request(req).and_then(|r| r.outside.get(&(site.clone(), shape.clone())).copied());
+                    out.push(decision("cut_outside", Some(site.clone()), asked, freed, level));
+                }
+                Action::Park(_) => out.push(decision("park", None, asked, freed, None)),
+                Action::Exhausted { need } => out.push(decision("exhausted", None, *need, freed, None)),
+                _ => {}
+            }
+        }
+        if d > 0 {
+            out.push(decision("evict_d", None, asked, d, None));
+        }
+        if w > 0 {
+            out.push(decision("evict_w", None, asked, w, None));
+        }
+        if let Some(s) = st.stats(Some(req)) {
+            s.decisions.extend(out);
         }
     }
 

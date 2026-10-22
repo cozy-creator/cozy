@@ -796,3 +796,23 @@ fn spare_bytes_count_idle_pages_never_the_current_steps() {
     pass.end(Measured::default(), Torch::default());
 }
 
+/// Lead's ruling (v6: the Lower trigger, trace4's hang and the 4 MP sequence had to be rebuilt
+/// from totals): a request's record keeps every non-trivial decision with what asked for it.
+#[test]
+fn a_requests_record_keeps_every_decision_with_its_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("decisions", 4 * MB);
+    let id = mem.load(set(dir.path(), "c", 2, &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("r", plan("c")).unwrap();
+    let pass = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
+    let pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
+    let site = Some(Site { name: "ffn", collective: false, finest: 4, shape: "1x8" });
+    assert!(matches!(r.oom(Some(id), Some(MB), site, Torch::default()), Next::Cut(1)));
+    assert!(matches!(r.oom(Some(id), Some(MB), site, Torch::default()), Next::Cut(2)));
+    let stats = r.stats();
+    let cuts: Vec<(&str, &str, Option<&str>, Option<u32>)> = stats.decisions.iter().map(|d| (d.trigger, d.action, d.site.as_deref(), d.level)).collect();
+    assert_eq!(cuts, vec![("oom", "cut", Some("ffn"), Some(1)), ("oom", "cut", Some("ffn"), Some(2))]);
+    assert!(stats.decisions.iter().all(|d| d.need == MB && d.step == 0));
+    drop((pins, pass));
+}
+
