@@ -84,7 +84,7 @@ fn bytes(ptr: u64, len: u64, stream: usize) -> Vec<u8> {
 fn unload(b: &CudaBackend, va: Va, offset: u64, page: Physical) {
     b.unmap(va, offset, page.len).unwrap();
     step!();
-    b.destroy(page);
+    b.destroy(page).unwrap();
     step!();
 }
 
@@ -171,7 +171,7 @@ fn free_is_the_drivers() {
     step!();
     let during = b.free().unwrap();
     step!();
-    b.destroy(page);
+    b.destroy(page).unwrap();
     step!();
     let after = b.free().unwrap();
     step!();
@@ -902,7 +902,7 @@ fn a_registered_host_range_fills_directly_every_time() {
     step!();
     b.unmap(va, 0, len).unwrap();
     step!();
-    b.destroy(page);
+    b.destroy(page).unwrap();
     step!();
     b.release(va);
     step!();
@@ -988,7 +988,7 @@ fn maps_beside_a_fill_in_flight_are_timed_against_maps_on_an_idle_card() {
     step!();
     b.unmap(va, 0, 2 * pages as u64 * gran).unwrap();
     step!();
-    made.into_iter().for_each(|p| b.destroy(p));
+    made.into_iter().for_each(|p| b.destroy(p).unwrap());
     b.release(va);
     step!();
     println!("PASS maps beside a fill: idle {}; beside a fill {} {uuid}", spread(&idle), spread(&busy));
@@ -1110,7 +1110,7 @@ impl Backend for Timed {
         }
         page
     }
-    fn destroy(&self, page: Physical) { self.1.time("destroy", || self.0.destroy(page)) }
+    fn destroy(&self, page: Physical) -> varena::Result<()> { self.1.time("destroy", || self.0.destroy(page)) }
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> varena::Result<()> { self.1.time("map", || self.0.map(va, offset, page, access)) }
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> { self.1.time("protect", || self.0.protect(va, offset, len, access)) }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> varena::Result<()> { self.1.time("unmap", || self.0.unmap(va, offset, len)) }
@@ -1661,11 +1661,11 @@ fn a_save_runs_beside_a_demand_fill_on_the_other_copy_engine() {
     step!();
     b.unmap(va, len, len).unwrap();
     step!();
-    b.destroy(fresh);
+    b.destroy(fresh).unwrap();
     step!();
     b.unmap(va, 0, len).unwrap();
     step!();
-    b.destroy(saved);
+    b.destroy(saved).unwrap();
     step!();
     b.release(va);
     step!();

@@ -67,7 +67,7 @@ pub trait Backend: Send + Sync {
     /// New physical memory that [`Backend::export`] can share. Fails when the device is full.
     fn create(&self, len: u64) -> Result<Physical>;
     /// Drops this process's reference; the memory is freed when no mapping or handle holds it.
-    fn destroy(&self, page: Physical);
+    fn destroy(&self, page: Physical) -> Result<()>;
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()>;
     /// Changes the access of a mapped range (filled pages become read-only).
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()>;
@@ -210,8 +210,9 @@ mod host {
             Ok(pages.insert(fd, len, len))
         }
 
-        fn destroy(&self, page: Physical) {
+        fn destroy(&self, page: Physical) -> Result<()> {
             self.pages.lock().live.remove(&page.id);
+            Ok(())
         }
 
         fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()> {
@@ -351,8 +352,9 @@ mod host {
         fn create(&self, _: u64) -> Result<Physical> {
             Err(later())
         }
-        fn destroy(&self, page: Physical) {
+        fn destroy(&self, page: Physical) -> Result<()> {
             self.pages.lock().live.remove(&page.id);
+            Ok(())
         }
         fn map(&self, _: Va, _: u64, _: &Physical, _: Access) -> Result<()> {
             Err(later())

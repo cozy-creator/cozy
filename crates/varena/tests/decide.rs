@@ -2,7 +2,7 @@
 //! the speculation invariant and termination. A small simulator applies the actions the way
 //! the applier does (maps fill at once; asks free what the other row offers).
 
-use varena::decide::{decide, fits, Action, Admitted, OomSite, Trigger, Tried};
+use varena::decide::{decide as decision, fits, Action, Admitted, OomSite, Trigger, Tried};
 use varena::table::{Class, Key, Page, Remote, Req, Set, Table};
 
 const MB: u64 = 1 << 20;
@@ -23,6 +23,19 @@ fn with_rooms(mut t: Table, rooms: &[u64]) -> Table {
     t.requests[0].rooms = rooms.iter().map(|r| Some(*r)).collect();
     t
 }
+
+/// This simulator's maps allocate immediately and its retiring fixture counters are disjoint.
+/// Production has explicit unique backing/placeholder facts supplied by the memory mechanism.
+fn observed(t: &Table) -> Table {
+    let mut view = t.clone();
+    view.vmm = view.mapped() + view.pending + view.inflight;
+    view.mapping = 0;
+    view.returning = view.pending + view.inflight;
+    view.physical = view.context + view.reserved + view.vmm;
+    view
+}
+
+fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> { decision(&observed(t), trigger) }
 
 #[derive(Default)]
 struct Run {
@@ -522,8 +535,8 @@ fn sets_place_largest_first_and_stay_on_gpu_0_when_they_fit() {
 fn already_returning_bytes_settle_before_any_degradation() {
     let t = Table { capacity: 10 * MB, pending: 8 * MB, reserved: 2 * MB, sets: vec![set("next", 1, 8 * MB)], ..Table::default() };
     let trigger = Trigger::Bind { page: (0, 0), req: None, tried: Tried::default() };
-    assert_eq!(t.free(), 0);
-    assert_eq!(t.classes()[Class::P.index()], 8 * MB, "custody bytes stay charged once");
+    assert_eq!(observed(&t).free(), 0);
+    assert_eq!(observed(&t).classes()[Class::P.index()], 8 * MB, "custody bytes stay charged once");
     assert_eq!(decide(&t, &trigger), vec![Action::Settle]);
     let settled = Table { pending: 0, ..t };
     assert_eq!(decide(&settled, &trigger), vec![Action::Map((0, 0))]);
@@ -538,7 +551,7 @@ fn remote_returning_bytes_are_reachable_but_not_free() {
     remote.classes[Class::P.index()] = 4 * MB;
     t.others = vec![remote];
     let trigger = Trigger::Oom { req: 1, set: None, need: Some(4 * MB), site: None, tried: Tried::default() };
-    assert_eq!(t.free(), 0);
+    assert_eq!(observed(&t).free(), 0);
     assert_eq!(t.others[0].held(), 4 * MB, "returning is a subset of P, never an extra charge");
     assert_eq!(t.reachable(), 4 * MB);
     assert_eq!(decide(&t, &trigger), vec![Action::Settle]);
@@ -568,10 +581,10 @@ fn partial_kept_recovery_settles_and_retries_before_cut_or_park() {
         let actions = decide(&t, &trigger(Tried::default()));
         assert_eq!(actions, vec![Action::Unmap { page: (1, 0), class: Class::N }, Action::Settle], "partial progress must complete before degradation");
         // Own mapping is gone, but custody still holds the same six bytes. It is not free yet.
-        let before = t.free();
+        let before = observed(&t).free();
         t.page_mut((1, 0)).unwrap().mapped = false;
         t.pending = 6 * MB;
-        assert_eq!(t.free(), before);
+        assert_eq!(observed(&t).free(), before);
         // The checked completion ends ownership; only these newly freed bytes count again.
         t.pending = 0;
         let actions = decide(&t, &trigger(Tried { freed: 6 * MB, ..Tried::default() }));

@@ -32,7 +32,7 @@ use crate::memory::SitePeak;
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledgr10");
+const MAGIC: u64 = u64::from_le_bytes(*b"vledgr11");
 /// The header's page: the heap starts after it, and grows from there.
 const HEADER: u64 = 4096;
 /// The heap's unit: rows take two, a fact as many as its bytes need.
@@ -50,8 +50,8 @@ const ROW: u64 = 1;
 const FACT: u64 = 2;
 
 /// The latch: context, torch, caches, classes (7), remaining, unmeasured, running, outside,
-/// yielded, family, host_peak, host_unmeasured, returning.
-const WORDS: usize = 19;
+/// yielded, family, host_peak, host_unmeasured, returning, physical.
+const WORDS: usize = 20;
 
 #[repr(C)]
 struct Header {
@@ -153,17 +153,20 @@ pub(crate) struct Facts {
     pub host_unmeasured: u64,
     /// Subset of P already retiring: charged until completion, then returned without an ask.
     pub returning: u64,
+    /// Actual unique resident bytes. Future admission promises are never physical usage;
+    /// orphans remain custody's separate charge, not duplicated in their keeper's facts.
+    pub physical: u64,
 }
 
 impl Facts {
     fn words(&self) -> [u64; WORDS] {
         let c = self.classes;
-        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family, self.host_peak, self.host_unmeasured, self.returning]
+        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family, self.host_peak, self.host_unmeasured, self.returning, self.physical]
     }
 
     fn of(w: [u64; WORDS]) -> Facts {
-        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning] = w;
-        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning }
+        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning, physical] = w;
+        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning, physical }
     }
 
     fn held(&self) -> u64 {
@@ -1069,6 +1072,7 @@ pub(crate) fn remotes(rows: &[RowView], own: u64) -> (Vec<Remote>, u64) {
             running: r.facts.running > 0 || !r.live,
             context: r.facts.context,
             torch: r.facts.torch,
+            physical: r.facts.physical,
             caches: r.facts.caches,
             classes: r.facts.classes,
             returning: if r.live { r.facts.returning.min(r.facts.classes.get(Class::P.index()).copied().unwrap_or(0)) } else { 0 },
@@ -1082,7 +1086,7 @@ fn asked_of(rows: &[RowView], id: u64) -> u64 {
     rows.iter().filter(|r| r.live && r.asking == id).map(|r| r.asked).sum()
 }
 
-/// Every row's held bytes, for foreign bytes.
+/// Every row's admission charge, for status/free. These include promises, not just physical bytes.
 pub(crate) fn held(rows: &[RowView]) -> u64 {
     rows.iter().map(|r| r.facts.held() + r.orphans).sum()
 }
@@ -1619,4 +1623,21 @@ mod tests {
             os::wake_await(&wake).unwrap();
         }
     }
+
+    #[test]
+    fn physical_facts_are_published_without_turning_promises_into_device_usage() {
+        let gpu = GpuId { uuid: format!("unit-{}-physical-facts", std::process::id()), model: "host".into(), memory: 64 << 20 };
+        let shared = Arc::new(Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, gpu.memory).unwrap());
+        let row = shared.claim(std::process::id()).unwrap();
+        let facts = Facts { context: 2, torch: 30, physical: 12, returning: 3, ..Facts::default() };
+        assert_eq!(Facts::of(facts.words()), facts);
+        row.publish(&facts);
+        let rows = shared.rows().unwrap();
+        let (peers, _) = remotes(&rows, u64::MAX);
+        let peer = peers.iter().find(|r| r.row == row.id()).unwrap();
+        assert_eq!(peer.physical, 12);
+        assert_eq!(peer.held(), 32, "admission includes the reserved envelope");
+        assert_eq!(held(&rows), 32, "status.free must continue counting promises");
+    }
+
 }

@@ -182,7 +182,7 @@ impl Backend for Stream {
         }
         self.host.create(len)
     }
-    fn destroy(&self, page: Physical) {
+    fn destroy(&self, page: Physical) -> Result<()> {
         self.host.destroy(page)
     }
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()> {
@@ -753,7 +753,7 @@ impl Backend for Driver {
         self.pages.lock().insert(page.id, (ino, len, false));
         Ok(page)
     }
-    fn destroy(&self, page: Physical) {
+    fn destroy(&self, page: Physical) -> Result<()> {
         if let Some(p) = self.pages.lock().get_mut(&page.id) {
             p.2 = true;
         }

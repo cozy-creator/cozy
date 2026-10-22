@@ -66,7 +66,7 @@ impl Drop for Preparing {
             st.sync(*key);
         }
         self.inner.close_sets(&mut st);
-        self.inner.publish(&st);
+        self.inner.publish(&mut st);
         self.inner.landed.notify_all();
     }
 }
@@ -104,7 +104,7 @@ impl Retained {
                     st.sync(key);
                     pins.push((id, key));
                 }
-                self.inner.publish(&st);
+                self.inner.publish(&mut st);
                 (Preparing { inner: self.inner.clone().into(), pins }, req)
             };
             let pages = self.blocks.iter().map(|b| (self.set, *b)).collect();
@@ -132,7 +132,7 @@ impl Drop for Retained {
             m.retained = m.retained.saturating_sub(1);
         }
         self.inner.close_sets(&mut st);
-        self.inner.publish(&st);
+        self.inner.publish(&mut st);
     }
 }
 
@@ -169,7 +169,7 @@ impl Workspace {
         self.remaining.store(left - bytes, Ordering::Release);
         st.promises();
         st.table.reserved = st.table.reserved.saturating_add(bytes);
-        self.inner.try_publish(&st);
+        self.inner.try_publish(&mut st);
         Some(AllocationCredit { inner: self.inner.clone().into(), id: self.id, bytes, epoch: st.measure_epoch, committed: false })
     }
 }
@@ -201,7 +201,7 @@ impl Drop for Workspace {
         let mut st = self.inner.lock();
         st.budgets.remove(&self.id);
         st.promises();
-        self.inner.publish(&st);
+        self.inner.publish(&mut st);
     }
 }
 
@@ -636,11 +636,21 @@ struct Wanted {
     closed: bool,
 }
 
+struct Retirement {
+    bytes: u64,
+    created: bool,
+    mechanism: Option<u64>,
+    custody: Option<u64>,
+    kept: bool,
+}
+
 #[derive(Default)]
 struct State {
     table: Table,
     budgets: HashMap<u64, Arc<AtomicU64>>,
     measure_epoch: u64,
+    ordinary_reserved: u64,
+    retired: HashMap<(Key, u64), Retirement>,
     sets: Vec<Option<SetMech>>,
     homes: HashMap<Key, Home>,
     /// Pin → (page, request).
@@ -949,8 +959,8 @@ impl Memory {
             std::thread::Builder::new().name("varena-trim".into()).spawn(move || trim_loop(&wanted, &weak)).map_err(|e| Error::io("spawn trim", e))?;
             let (weak, saves, burst) = (Arc::downgrade(&inner), inner.saves.clone(), inner.burst.clone());
             std::thread::Builder::new().name("varena-tier-copies".into()).spawn(move || save_loop(&saves, &burst, &weak)).map_err(|e| Error::io("spawn tier copies", e))?;
-            let st = inner.lock();
-            inner.publish(&st);
+            let mut st = inner.lock();
+            inner.publish(&mut st);
             inner.unlock(st);
             Ok(Memory { inner: inner.into() })
         })
@@ -1002,7 +1012,7 @@ impl Memory {
                 c.bytes = bytes;
                 c.last_use = now;
             }
-            self.inner.publish(&st);
+            self.inner.publish(&mut st);
             self.inner.unlock(st);
             Ok(())
         });
@@ -1013,7 +1023,7 @@ impl Memory {
             let mut st = self.inner.lock();
             st.table.caches.retain(|c| c.id != cache.0);
             st.shrinks.remove(&cache.0);
-            self.inner.publish(&st);
+            self.inner.publish(&mut st);
             self.inner.unlock(st);
             Ok(())
         });
@@ -1096,7 +1106,7 @@ impl Memory {
             let mut st = self.inner.lock();
             self.inner.measure(&mut st, torch);
             self.inner.refresh(&mut st)?;
-            self.inner.publish(&st);
+            self.inner.publish(&mut st);
             Ok(())
         })
     }
@@ -1151,7 +1161,7 @@ impl Memory {
         let remaining = Arc::new(AtomicU64::new(st.table.free()));
         st.budgets.insert(id, remaining.clone());
         st.promises();
-        self.inner.publish(&st);
+        self.inner.publish(&mut st);
         Ok(Workspace { inner: self.inner.clone().into(), id, remaining })
     }
 
@@ -1203,7 +1213,7 @@ impl Inner {
             r.speculated.clear();
         }
         st.claims.clear();
-        self.publish(&st);
+        self.publish(&mut st);
         self.unlock(st);
         self.landed.notify_all();
     }
@@ -1215,6 +1225,7 @@ impl Inner {
             if st.measure_epoch == epoch { st.table.reserved = st.table.reserved.saturating_sub(bytes); }
         }
         st.promises();
+        self.physical(st);
     }
 
     /// The state, with pin releases applied and completed events acted on.
@@ -1424,7 +1435,7 @@ impl Inner {
         st.table.capacity = self.shared.capacity()?;
         st.table.shared = self.shared.shared_mode()?;
         st.table.pending = self.to_custody.pending();
-        let others: u64 = st.table.others.iter().map(crate::table::Remote::held).sum();
+        self.physical(st);
         let card = self.backend.capacity();
         let used = card.saturating_sub(self.backend.free()?);
         // Unmaps in flight are this process's still (and already spent on the creates queued
@@ -1432,8 +1443,7 @@ impl Inner {
         st.table.inflight = self.mech.pending();
         // Foreign bytes take from the card, not from the table's cap: they count only beyond the
         // card's room outside the cap (capacity = min(cap, card - foreign)).
-        let foreign = used.saturating_sub(others + orphans + st.table.held() + st.table.inflight);
-        st.table.foreign = foreign.saturating_sub(card.saturating_sub(st.table.capacity));
+        st.table.foreign = st.table.foreign_used(card, used);
         self.shared.set_foreign(st.table.foreign)?;
         Ok(())
     }
@@ -1445,6 +1455,7 @@ impl Inner {
         // everyone but its family's child.
         let idle = t.requests.is_empty();
         Facts {
+            physical: t.physical,
             context: t.context,
             torch: t.torch() + st.claims.values().sum::<u64>(),
             caches: if idle { t.slack() + t.caches.iter().map(|c| c.bytes).sum::<u64>() } else { 0 },
@@ -1457,13 +1468,35 @@ impl Inner {
             family: t.requests.iter().find(|r| r.yielded.is_some()).map_or(0, |r| r.family),
             host_peak: st.host.values().flatten().copied().max().unwrap_or(0),
             host_unmeasured: st.host.values().filter(|h| h.is_none()).count() as u64,
-            returning: t.pending + t.inflight,
+            returning: t.returning,
         }
     }
 
-    fn publish(&self, st: &State) { self.row.publish(&Self::facts(st)); }
+    fn publish(&self, st: &mut State) {
+        self.physical(st);
+        self.row.publish(&Self::facts(st));
+    }
 
-    fn try_publish(&self, st: &State) { self.row.try_publish(&Self::facts(st)); }
+    fn try_publish(&self, st: &mut State) {
+        self.physical(st);
+        self.row.try_publish(&Self::facts(st));
+    }
+
+    /// Physical backing and promises have separate owners. A page retiring through both
+    /// VMM and custody is one allocation; it stays charged until both receipts complete.
+    fn physical(&self, st: &mut State) {
+        let quarantined = self.ownership_lost.load(Ordering::Acquire);
+        if !quarantined {
+            st.retired.retain(|_, r| r.kept || r.mechanism.is_some_and(|t| !self.mech.completed(t)) || r.custody.is_some_and(|t| !self.to_custody.completed(t)));
+        }
+        st.table.vmm = st.homes.values().filter_map(|h| h.phys.as_ref()).map(|p| p.len).sum::<u64>()
+            + st.retired.values().map(|r| r.bytes).sum::<u64>();
+        st.table.mapping = st.homes.iter().filter(|(_, h)| h.phys.is_none()).filter_map(|(k, _)| st.table.page(*k)).map(|p| p.bytes).sum();
+        st.table.returning = if quarantined { 0 } else { st.retired.values().filter(|r| !r.kept).map(|r| r.bytes).sum() };
+        let reserved = st.ordinary_reserved.saturating_add(self.native_resident.load(Ordering::Acquire));
+        st.table.reserved = st.table.reserved.max(reserved);
+        st.table.physical = st.table.context.saturating_add(reserved).saturating_add(st.table.vmm);
+    }
 
     // ---- the mechanism
 
@@ -1473,10 +1506,14 @@ impl Inner {
         let Some(home) = st.homes.remove(&key) else { return Ok(()) };
         let (va, off, span) = st.place(key)?;
         // Custody's handle holds the memory until the Withdraw is sent: held (P) meanwhile.
-        if home.exported && withdraw && self.withdraw(home.identity.clone(), key.1, span).is_some() {
-            st.table.pending += span;
+        let custody = if home.exported && withdraw { self.withdraw(home.identity.clone(), key.1, span) } else { None };
+        if custody.is_some() { st.table.pending += span; }
+        let physical = home.phys.as_ref().map(|p| p.len);
+        let ticket = self.mech.post(Mech::Unmap { va, off, span, phys: home.phys, ready: home.ready }, span);
+        if let Some(bytes) = physical {
+            st.retired.insert((key, home.gen), Retirement { bytes, created: home.origin != Origin::Kept, mechanism: Some(ticket), custody, kept: home.exported && !withdraw });
         }
-        st.last_unmap = Some(self.mech.post(Mech::Unmap { va, off, span, phys: home.phys, ready: home.ready }, span));
+        st.last_unmap = Some(ticket);
         st.table.inflight = self.mech.pending();
         st.sync(key);
         if let Some(s) = st.stats(req) {
@@ -1530,7 +1567,7 @@ impl Inner {
             s.moved.kept.bytes += span;
             s.moved.kept.ns += start.elapsed().as_nanos() as u64;
             adopted += span;
-            self.publish(&st);
+            self.publish(&mut st);
             self.unlock(st);
         }
         Ok(adopted)
@@ -1566,7 +1603,7 @@ impl Inner {
         // Its events are the refill's now (it waits on them, then retires them).
         st.events.values_mut().for_each(|q| q.retain(|(_, k)| *k != key));
         let Some(h) = st.homes.get_mut(&key) else { return Ok(()) };
-        let (old, exported, old_identity) = (std::mem::replace(&mut h.ready, Event::DONE), h.exported, h.identity.clone());
+        let (old, exported, old_identity, old_gen, created) = (std::mem::replace(&mut h.ready, Event::DONE), h.exported, h.identity.clone(), h.gen, h.origin != Origin::Kept);
         // Kept, or with a Keep queued: never written again; a fresh page takes its place.
         let phys = if exported || h.keeping { h.phys.take() } else { None };
         let renew = phys.is_some();
@@ -1578,11 +1615,11 @@ impl Inner {
             // Read-only and kept under its old identity (or about to be): never written or
             // protected again. Custody gives the old key up; a fresh page takes its place once
             // its consumers are done.
-            if exported && self.withdraw(old_identity, key.1, span).is_some() {
-                st.table.pending += span;
-            }
+            let custody = if exported { self.withdraw(old_identity, key.1, span) } else { None };
+            if custody.is_some() { st.table.pending += span; }
             self.backend.retire(old);
-            self.mech.post(Mech::Renew { key, gen, va, off, span, old: phys, after, job }, 0);
+            let ticket = self.mech.post(Mech::Renew { key, gen, va, off, span, old: phys, after, job }, 0);
+            st.retired.insert((key, old_gen), Retirement { bytes: span, created, mechanism: Some(ticket), custody, kept: false });
             return Ok(());
         }
         // Read-write and nobody else's: filled again in place, after its consumers in-stream.
@@ -1718,7 +1755,7 @@ impl Inner {
             }
         }
         if sticky { self.ownership_lost.store(true, Ordering::Release); }
-        self.publish(&st);
+        self.publish(&mut st);
         self.unlock(st);
         self.landed.notify_all();
         // A sticky error ends the process, and the GPU's kept pages go with it (a custody call:
@@ -1950,7 +1987,7 @@ impl Inner {
         st.saving = None;
         st.sync(s.key);
         // Its class while pinned may have been published meanwhile: no longer.
-        self.publish(&st);
+        self.publish(&mut st);
         if saved {
             let stats = match s.req.filter(|r| st.stats.contains_key(r)) {
                 Some(r) => st.stats.entry(r).or_default(),
@@ -1994,7 +2031,7 @@ impl Inner {
         let out = self.rounds(id, trigger, req);
         let mut st = self.lock();
         if st.claims.remove(&id).is_some() {
-            self.publish(&st);
+            self.publish(&mut st);
         }
         self.unlock(st);
         out
@@ -2044,7 +2081,7 @@ impl Inner {
                 self.unlock(st);
                 continue;
             }
-            self.publish(&st);
+            self.publish(&mut st);
             self.unlock(st);
             self.shrink(shrinks);
             if remote.is_empty() {
@@ -2207,7 +2244,7 @@ impl Inner {
         let freed = crate::caught(|| Ok(hook())).unwrap_or(0);
         let mut st = self.state.lock();
         st.table.reserved = st.table.reserved.saturating_sub(freed);
-        self.publish(&st);
+        self.publish(&mut st);
         freed
     }
 
@@ -2264,7 +2301,7 @@ impl Inner {
                     for key in keys {
                         self.unmap(&mut st, key, Class::N, None, true)?;
                     }
-                    self.publish(&st);
+                    self.publish(&mut st);
                     self.unlock(st);
                 }
                 self.load_ram(id)?
@@ -2384,7 +2421,7 @@ impl Inner {
         // A cold request's record carries the fills since the last one ended (its loads).
         let earlier = std::mem::take(&mut st.unclaimed);
         st.stats.insert(rid, Stats { request: id.to_string(), moved: earlier.moved, trace: earlier.trace, ..Stats::default() });
-        self.publish(&st);
+        self.publish(&mut st);
         self.unlock(st);
         Ok(rid)
     }
@@ -2484,7 +2521,7 @@ impl Inner {
                 s.stall_ns += start.elapsed().as_nanos() as u64;
             }
         }
-        self.publish(&st);
+        self.publish(&mut st);
         self.unlock(st);
         self.speculate(req);
         let pin = Pin { ptr: va.base + off, len: span, ready, fresh, inner: self.clone().into(), key, id, stream, transform, transformed: AtomicBool::new(false) };
@@ -2684,7 +2721,7 @@ impl Inner {
             s.peak = s.peak.max(w);
             s.room = s.room.max(room);
         }
-        self.publish(&st);
+        self.publish(&mut st);
         self.unlock(st);
         self.speculate(Some(req));
         Ok(id)
@@ -2707,9 +2744,12 @@ impl Inner {
         st.measure_epoch = st.measure_epoch.wrapping_add(1);
         st.table.allocated = torch.allocated;
         st.table.reserved = torch.reserved;
+        st.ordinary_reserved = torch.reserved.saturating_sub(self.native_resident.load(Ordering::Acquire));
+        self.physical(st);
         st.table.context = match self.backend.process_used() {
             Ok(used) => {
-                let created: u64 = st.homes.iter().filter(|(_, h)| h.origin != Origin::Kept).filter_map(|(k, _)| st.table.page(*k)).map(|p| p.bytes).sum();
+                let created: u64 = st.homes.values().filter(|h| h.origin != Origin::Kept).filter_map(|h| h.phys.as_ref()).map(|p| p.len).sum::<u64>()
+                    + st.retired.values().filter(|r| r.created).map(|r| r.bytes).sum::<u64>();
                 used.saturating_sub(torch.reserved + created)
             }
             // Not measurable here: the context as open measured it.
@@ -2763,7 +2803,7 @@ impl Inner {
             s.peak = s.peak.max(w);
             s.room = s.room.max(room);
         }
-        self.publish(&st);
+        self.publish(&mut st);
         self.unlock(st);
         Ok(())
     }
@@ -2814,7 +2854,7 @@ impl Inner {
             }
         };
         let unmapped = st.last_unmap;
-        self.publish(&st);
+        self.publish(&mut st);
         self.unlock(st);
         // Its unmaps are done before the caller retries the allocation. The mechanism never
         // waits on a pin: it unmaps only unpinned pages (a renewal waits on device events).
@@ -2871,7 +2911,7 @@ impl Inner {
         });
         stats.leftover = leftover;
         st.last = Some(stats.clone());
-        self.publish(&st);
+        self.publish(&mut st);
         let uses: Vec<Call> = st.sets.iter().flatten().map(|m| Call::Use { digest: m.tier.clone(), distance: None }).collect();
         if self.tier.is_some() {
             uses.into_iter().for_each(|c| self.post(c));
@@ -2919,7 +2959,7 @@ impl Inner {
             }
             wanted.settle = st.table.pending > 0;
             let unmapped = st.last_unmap.filter(|_| freed > 0);
-            self.publish(&st);
+            self.publish(&mut st);
             self.unlock(st);
             // Its own unmaps first (the mechanism's, up to its last): the asker then finds the
             // bytes free. Kept pages' bytes are marked pending (custody's handle holds them):
@@ -2971,7 +3011,7 @@ impl Inner {
         };
         self.shrink(shrinks);
         let st = self.state.lock();
-        self.publish(&st);
+        self.publish(&mut st);
         drop(st);
         self.shared.ring();
     }
@@ -3030,7 +3070,7 @@ impl Inner {
         // Explicit unload withdraws them; final public retirement only drops local mappings.
         let keys: Vec<Key> = st.homes.keys().copied().collect();
         for key in keys { self.unmap(&mut st, key, Class::N, None, false)?; }
-        self.publish(&st);
+        self.publish(&mut st);
         let empty = st.homes.is_empty();
         drop(st);
         Ok(empty && self.mech.idle() && self.to_custody.idle() && self.to_tier.idle() && self.saves.idle())
@@ -3054,12 +3094,12 @@ impl Drop for Inner {
             match op {
                 Mech::Unmap { va, off, span, phys, ready } => {
                     let _ = self.backend.unmap(va, off, span);
-                    phys.into_iter().for_each(|p| self.backend.destroy(p));
+                    phys.into_iter().for_each(|p| { let _ = self.backend.destroy(p); });
                     self.backend.retire(ready);
                 }
                 Mech::Renew { va, off, span, old, .. } => {
                     let _ = self.backend.unmap(va, off, span);
-                    old.into_iter().for_each(|p| self.backend.destroy(p));
+                    old.into_iter().for_each(|p| { let _ = self.backend.destroy(p); });
                 }
                 Mech::Release(va) => self.backend.release(va),
                 Mech::Map { .. } | Mech::Adopt { .. } | Mech::Keep { .. } => {}
@@ -3072,7 +3112,7 @@ impl Drop for Inner {
             if let Ok((va, off, span)) = st.place(key) {
                 let _ = self.backend.unmap(va, off, span);
             }
-            self.backend.destroy(phys);
+            let _ = self.backend.destroy(phys);
         }
         let sets: Vec<SetMech> = st.sets.drain(..).flatten().collect();
         drop(st);
@@ -3152,7 +3192,7 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
         // The ticket remains live until this worker releases its Memory owner below.
         queue.returned(ticket, bytes);
         st.table.inflight = queue.pending();
-        me.publish(&st);
+        me.publish(&mut st);
         me.unlock(st);
         me.landed.notify_all();
         // The row's facts changed (a page mapped, kept or gone).
@@ -3170,7 +3210,7 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
 fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Option<&tier::Client>, inner: &Weak<Inner>) {
     while let Some((ticket, bytes, call)) = outbox.next() {
         let holder = (custody.map(custody::Client::holder), tier.map(tier::Client::holder));
-        let _ = match call {
+        let result = match call {
             Call::Export { fp, page, len, handle } => custody.map(|c| c.export(&fp, page, len, handle)),
             Call::Withdraw { fp, page } => custody.map(|c| c.withdraw(&fp, page)),
             Call::Disown { fp, page } => custody.map(|c| c.disown(&fp, page)),
@@ -3184,6 +3224,14 @@ fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Opt
             }
             Call::Close { digest } => tier.map(|t| t.close(&digest)),
         };
+        if bytes > 0 && !matches!(result, Some(Ok(()))) {
+            if let Some(me) = inner.upgrade() {
+                let mut st = me.state.lock();
+                me.lost_backing(&mut st, bytes, true, "custody did not acknowledge withdrawal");
+            }
+            outbox.sent(ticket, 0); // processed, but its physical bytes remain charged
+            continue;
+        }
         outbox.sent(ticket, bytes);
         let moved = holder != (custody.map(custody::Client::holder), tier.map(tier::Client::holder));
         if moved || bytes > 0 {
@@ -3192,7 +3240,7 @@ fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Opt
                 // layout (the drain does it); withdrawn bytes are free for the next decision.
                 let mut st = me.lock();
                 st.table.pending = me.to_custody.pending();
-                me.publish(&st);
+                me.publish(&mut st);
                 me.unlock(st);
                 me.landed.notify_all();
                 me.shared.ring();
@@ -3233,7 +3281,7 @@ impl Request {
                 r.cursor = Default::default();
             }
             st.synthetic.remove(&self.id);
-            self.inner.publish(&st);
+            self.inner.publish(&mut st);
             self.inner.unlock(st);
             Ok(())
         });
@@ -3280,8 +3328,7 @@ impl Request {
         view.reserved = view.allocated;
         view.headroom = 0;
         // Returning bytes stay unavailable; this callback cannot wait for their arrival.
-        view.context = view.context.saturating_add(view.pending);
-        view.pending = 0;
+        view.returning = 0;
         for peer in &mut view.others { peer.returning = 0; }
         let keys: Vec<Key> = view.pages().map(|(k, _)| k).collect();
         for key in keys {
@@ -3305,10 +3352,19 @@ impl Request {
                     let (va, off, span) = st.place(page)?;
                     // The decision excludes pins, releases, fills and saves; query above proved
                     // the final producer complete. No synchronization or stream wait occurs.
-                    self.inner.backend.unmap(va, off, span)?;
+                    if let Err(error) = self.inner.backend.unmap(va, off, span) {
+                        return Err(self.inner.lost_backing(&mut st, span, true, error));
+                    }
                     if let Some(home) = st.homes.remove(&page) {
-                        if home.exported && self.inner.withdraw(home.identity, page.1, span).is_some() { st.table.pending += span; }
-                        if let Some(phys) = home.phys { self.inner.backend.destroy(phys); }
+                        let custody = if home.exported { self.inner.withdraw(home.identity, page.1, span) } else { None };
+                        if custody.is_some() { st.table.pending += span; }
+                        if let Some(phys) = home.phys {
+                            st.retired.insert((page, home.gen), Retirement { bytes: span, created: home.origin != Origin::Kept, mechanism: None, custody, kept: false });
+                            if let Err(error) = self.inner.backend.destroy(phys) {
+                                st.sync(page);
+                                return Err(self.inner.lost_backing(&mut st, span, true, error));
+                            }
+                        }
                         self.inner.backend.retire(home.ready);
                     }
                     st.sync(page);
@@ -3330,7 +3386,7 @@ impl Request {
                 _ => {} // No callback, cut, park, peer ask, or queue wait inside an allocator.
             }
         }
-        self.inner.try_publish(&st);
+        self.inner.try_publish(&mut st);
         // Kept handles withdraw asynchronously. Their bytes remain pending until the native
         // custody sender reports completion; the allocation may retry once, but never waits
         // for that sender or reacquires state after releasing it.
@@ -3404,7 +3460,7 @@ impl Request {
                 (r.room, r.claimed) = (0, 0);
                 r.family = ledger::family_id(family);
             }
-            self.inner.publish(&st);
+            self.inner.publish(&mut st);
             self.inner.unlock(st);
             self.inner.shared.ring();
             Ok(())
@@ -3458,7 +3514,7 @@ impl Pin {
                 let req = st.binding(self.key.0);
                 self.inner.save_later(&st, self.key, req);
             }
-            self.inner.publish(&st);
+            self.inner.publish(&mut st);
             self.inner.unlock(st);
             self.inner.landed.notify_all();
             Ok(())
@@ -3520,6 +3576,18 @@ impl Pass {
 }
 
 impl Inner {
+    fn lost_backing(self: &Arc<Self>, st: &mut State, bytes: u64, tracked: bool, why: impl std::fmt::Display) -> Error {
+        if !tracked {
+            let id = st.tick();
+            st.retired.insert(((u32::MAX, u32::MAX), id), Retirement { bytes, created: true, mechanism: None, custody: None, kept: true });
+        }
+        self.ownership_lost.store(true, Ordering::Release);
+        self.publish(st);
+        self.landed.notify_all();
+        std::mem::forget(self.clone());
+        Error::Ownership(format!("physical release could not be proved: {why}"))
+    }
+
     /// Runs one mechanism call (the state lock free), then applies its result under it.
     fn mechanism(self: &Arc<Self>, op: Mech) {
         if self.check_ownership().is_err() {
@@ -3542,7 +3610,11 @@ impl Inner {
                     return;
                 }
                 if let Some(old) = old {
-                    self.backend.destroy(old);
+                    if let Err(error) = self.backend.destroy(old) {
+                        let mut st = self.state.lock();
+                        self.lost_backing(&mut st, span, true, error);
+                        return;
+                    }
                 }
                 after.into_iter().for_each(|e| self.backend.retire(e));
                 self.place_page(key, gen, va, off, span, job, Some(u64::MAX));
@@ -3551,6 +3623,10 @@ impl Inner {
                 let mapped = self.backend.map(va, off, &Physical { id: phys, len }, Access::Read);
                 let mut st = self.state.lock();
                 let current = st.homes.get(&key).is_some_and(|h| h.gen == gen);
+                if let Err(error @ Error::Ownership(_)) = &mapped {
+                    self.lost_backing(&mut st, len, current, error);
+                    return;
+                }
                 match (mapped, current) {
                     (Ok(()), true) => {
                         if let Some(h) = st.homes.get_mut(&key) {
@@ -3564,10 +3640,18 @@ impl Inner {
                         st.sync(key);
                         drop(st);
                         if mapped.is_ok() {
-                            let _ = self.backend.unmap(va, off, len);
+                            if let Err(error) = self.backend.unmap(va, off, len) {
+                                let mut st = self.state.lock();
+                                self.lost_backing(&mut st, len, false, error);
+                                return;
+                            }
                         }
                         if let Some(Some(p)) = home.map(|h| h.phys) {
-                            self.backend.destroy(p);
+                            if let Err(error) = self.backend.destroy(p) {
+                                let mut st = self.state.lock();
+                                self.lost_backing(&mut st, len, false, error);
+                                return;
+                            }
                         }
                         self.post(Call::Disown { fp: identity, page: key.1 });
                     }
@@ -3584,7 +3668,11 @@ impl Inner {
                     return;
                 }
                 if let Some(p) = phys {
-                    self.backend.destroy(p);
+                    if let Err(error) = self.backend.destroy(p) {
+                        let mut st = self.state.lock();
+                        self.lost_backing(&mut st, span, true, error);
+                        return;
+                    }
                 }
                 self.backend.retire(ready);
             }
@@ -3616,21 +3704,34 @@ impl Inner {
     /// serve leaves the page unmapped, with the free bytes it was decided on (`decided`;
     /// `None`: a speculative page, which goes quietly).
     #[allow(clippy::too_many_arguments)]
-    fn place_page(&self, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: Option<u64>) {
+    fn place_page(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: Option<u64>) {
         let speculative = decided.is_none();
         let made = self.backend.create(span).and_then(|p| match self.backend.map(va, off, &p, Access::ReadWrite) {
             Ok(()) => Ok(p),
-            Err(e) => {
-                self.backend.destroy(p);
-                Err(e)
+            Err(error @ Error::Ownership(_)) => {
+                let mut st = self.state.lock();
+                Err(self.lost_backing(&mut st, p.len, false, error))
+            }
+            Err(error) => {
+                let bytes = p.len;
+                match self.backend.destroy(p) {
+                    Ok(()) => Err(error),
+                    Err(release) => {
+                        let mut st = self.state.lock();
+                        Err(self.lost_backing(&mut st, bytes, false, release))
+                    }
+                }
             }
         });
         let mut st = self.state.lock();
         if !st.homes.get(&key).is_some_and(|h| h.gen == gen) {
             drop(st);
             if let Ok(p) = made {
-                let _ = self.backend.unmap(va, off, span);
-                self.backend.destroy(p);
+                let released = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(p));
+                if let Err(error) = released {
+                    let mut st = self.state.lock();
+                    self.lost_backing(&mut st, span, false, error);
+                }
             }
             return;
         }
@@ -3672,7 +3773,7 @@ impl Inner {
             let mut st = self.lock();
             let set = st.current(req).map(|a| a.set);
             let back = st.table.request_mut(req).and_then(|r| r.yielded.take().map(|room| (room, r.measured)));
-            self.publish(&st);
+            self.publish(&mut st);
             self.unlock(st);
             back.zip(set)
         };
