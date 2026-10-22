@@ -39,8 +39,8 @@ use tensorfs::{
 };
 use crate::catalog::normalized;
 
-/// How each published environment gets its Runtime SDK. Empty `requirements` keeps the
-/// release's own locked SDK rows.
+/// The selected SDK wheel inputs, or a local first-install resolver. Without either, the
+/// package lock supplies its SDK (the standalone/development path).
 #[derive(Clone, Debug, Default)]
 pub struct PackageSdk {
     pub uv: PathBuf,
@@ -94,8 +94,8 @@ impl PackageSdk {
             .and_then(|default| default.resolved()).map_or(&self.requirements, |chosen| &chosen.requirements)
     }
 
-    /// Executors use the selected Runtime/TensorFS pair (an update's, else the image's), so they
-    /// speak this machine's protocol; without a complete pair, each release's locked SDK.
+    /// Freeze the selected Runtime/TensorFS pair (an update's, else the image's). Local startup
+    /// attaches lazy resolution separately, only when neither selection exists.
     pub fn selected(wheels: &Path, root: &Path, uv: PathBuf) -> Self {
         // An activation replaces sdk/current, not the immutable candidate directory. Freeze
         // that selection once: both cache identity and the installer's actual wheel inputs
@@ -971,7 +971,8 @@ impl Publisher {
             let pins = self.export_pins(&project, &lock_sdk, job.stop.as_ref())?;
             fs::write(dir.join("constraints.txt"), pins).map_err(io_failure)?;
         }
-        // The machine's own pair when it has one, whatever the lock's: its findings warn.
+        // The selected pair must satisfy the remaining closure; only explicit development
+        // overrides retain a warning for incompatible package bounds.
         let (sdk_choice, mut sdk_fallback) = (if own_sdk { "machine" } else { "locked" }, String::new());
         if own_sdk {
             next();

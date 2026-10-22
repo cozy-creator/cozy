@@ -224,7 +224,11 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
                 named = [f"--index={index}" for index in indexes]
                 install = ["uv", "pip", "install", "--python", str(interpreter), *found, *named, "--editable", str(project)]
                 offered = [str(wheel) for wheel in sdk] if machine else []
-                if not offered or subprocess.run([*install, *offered]).returncode != 0:
+                if not offered:
+                    subprocess.run(install, check=True)
+                elif subprocess.run([*install, *offered]).returncode != 0:
+                    if not runtime_build:
+                        raise PackageError("package_sdk_incompatible", "the package does not resolve with the selected Runtime/TensorFS pair")
                     subprocess.run(install, check=True)
             live_paths(environment)
 
@@ -323,7 +327,11 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
                 # Unlocked: resolved with the pair's wheels offered where its bounds admit them.
                 install = ["uv", "pip", "install", *COPY, "--python", str(interpreter), *([str(project)] if project else []),
                            *map(str, wheels)]
-                if not offered or subprocess.run([*install, *offered]).returncode != 0:
+                if not offered:
+                    subprocess.run(install, check=True)
+                elif subprocess.run([*install, *offered]).returncode != 0:
+                    if not runtime_build:
+                        raise PackageError("package_sdk_incompatible", "the package does not resolve with the selected Runtime/TensorFS pair")
                     subprocess.run(install, check=True)
 
         capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
