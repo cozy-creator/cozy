@@ -257,6 +257,19 @@ pub struct Req {
     /// The family it waits for while yielded (`crate::ledger` publishes it; 0: none).
     pub family: u64,
     pub episode: Episode,
+    /// The last OOM answered Retry, by site: a second one there with no progress past it
+    /// escalates (lead, v6 13592: the whole decode re-ran at one level three times).
+    pub retried: Option<Retried>,
+}
+
+/// Where an OOM answered Retry failed: its site, op shape, the site's level then, and how far
+/// the allocation had got (torch's allocated bytes plus the failing need).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Retried {
+    pub site: String,
+    pub shape: String,
+    pub level: u32,
+    pub at: u64,
 }
 
 impl Req {

@@ -3291,6 +3291,10 @@ impl Inner {
             return Ok(());
         };
         let Some(active) = st.active.remove(&key) else { return Ok(()) };
+        // The pass got through: a retry since went past where it failed.
+        if let Some(r) = st.table.request_mut(req) {
+            r.retried = None;
+        }
         let name = st.mech(active.set)?.spec.name.clone();
         let levels = st.levels(active.set, &active.shape);
         let key = room_key(&name, &active.shape, &levels);
@@ -3379,6 +3383,15 @@ impl Inner {
             _ => {
                 if let Some(s) = st.stats(Some(req)) {
                     s.retries += 1;
+                }
+                // Where it failed, so a second failure there with no progress escalates.
+                if let Some(r) = st.table.request_mut(req) {
+                    let level = site.map_or(0, |s| match set {
+                        Some(set) => r.sites.get(&set).and_then(|v| v.iter().find(|x| x.name == s.name)).map_or(0, |x| x.level),
+                        None => r.outside.get(&(s.name.to_string(), s.shape.to_string())).copied().unwrap_or(0),
+                    });
+                    let (name, shape) = site.map_or((String::new(), String::new()), |s| (s.name.to_string(), s.shape.to_string()));
+                    r.retried = Some(crate::table::Retried { site: name, shape, level, at: torch.allocated.saturating_add(need.unwrap_or(0)) });
                 }
                 Next::Retry
             }

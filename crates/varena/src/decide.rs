@@ -264,9 +264,27 @@ fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&O
         Some(_) => sites.iter().find(|x| x.name == s.name).map_or(0, |x| x.level),
         None => r.outside.get(&(s.name.clone(), s.shape.clone())).copied().unwrap_or(0),
     };
+    // A retry that failed again at the same site and level, its allocation no further than
+    // the last failure there, made no progress: it escalates (a cut, else a park or
+    // exhaustion), never another Retry. Nothing is claimed, evicted or lowered for it.
+    let at = t.allocated.saturating_add(need.unwrap_or(0));
+    let key = site.map_or((String::new(), String::new(), 0), |s| (s.name.clone(), s.shape.clone(), level(s)));
+    let again = r.retried.as_ref().is_some_and(|m| (&m.site, &m.shape, m.level) == (&key.0, &key.1, key.2) && at <= m.at);
     // A site at its finest level is not cut or proposed further: the next rung follows.
     let outside = site.filter(|s| set.is_none() && !s.collective && level(s) < s.finest);
     let site = set.zip(site).filter(|(_, s)| level(s) < s.finest);
+    if again {
+        let cuttable = site.filter(|(_, s)| !s.collective && !sites.iter().any(|x| x.name == s.name && x.stuck));
+        return match (cuttable, outside) {
+            (Some((set, s)), _) => vec![Action::Cut { req, set, site: s.name.clone(), failed_at: r.room + r.claimed + t.free() }],
+            (None, Some(s)) => vec![Action::CutOutside { req, site: s.name.clone(), shape: s.shape.clone() }],
+            (None, None) => {
+                let mut d = Demand::new(t, need.unwrap_or(1), Some(req), None, tried);
+                d.park_or_exhaust(r.episode.parked);
+                d.out
+            }
+        };
+    }
     // Unknown: any page's worth is progress.
     let mut d = Demand::new(t, need.unwrap_or(1), Some(req), None, tried);
     d.oom = true;

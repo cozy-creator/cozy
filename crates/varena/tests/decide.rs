@@ -3,7 +3,7 @@
 //! the applier does (maps fill at once; asks free what the other row offers).
 
 use varena::decide::{decide as decision, fits, Action, Admitted, OomSite, Trigger, Tried};
-use varena::table::{Cache, Class, Key, Page, Remote, Req, Set, Table};
+use varena::table::{Cache, Class, Key, Page, Remote, Req, Retried, Set, Table};
 
 const MB: u64 = 1 << 20;
 const GB: u64 = 1 << 30;
@@ -634,5 +634,38 @@ fn a_components_cache_goes_at_its_class_turn_before_its_pages() {
     (t.allocated, t.reserved) = (MB, MB);
     let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(3 * MB), unmeasured: 0, tried: Tried::default() });
     assert_eq!(&a[..3], &[Action::Unmap { page: (2, 0), class: Class::N }, Action::Shrink { cache: 7, bytes: MB }, Action::Unmap { page: (1, 0), class: Class::N }], "{a:?}");
+}
+
+/// Lead's ruling (S4's v6 13592: the tiled 4 MP decode's split re-ran at level 0 three times on
+/// evict-and-retry): a second OOM at the same site and level, its allocation no further than the
+/// first's, made no progress. It escalates (the outside cut, or the pass's site, finer), and
+/// nothing is claimed, evicted or lowered for it; progress past the failure retries as before;
+/// at the finest level it parks or ends exhausted.
+#[test]
+fn an_oom_again_at_a_site_without_progress_cuts_finer() {
+    let split = OomSite { name: "split:x".into(), collective: false, finest: 3, shape: "k".into() };
+    let mut t = table(8 * MB, vec![set("vae", 2, MB), set("other", 2, MB)], vec![(vec![0], 1)]);
+    for k in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+        map(&mut t, k);
+    }
+    t.allocated = MB;
+    let oom = |t: &Table, set: Option<u32>| decide(t, &Trigger::Oom { req: 1, set, need: Some(2 * MB), site: Some(split.clone()), tried: Tried::default() });
+    // The first OOM there: the free bytes (and N pages) answer, a Retry.
+    let first = oom(&t, None);
+    assert!(matches!(first.last(), Some(Action::Claim { .. })), "{first:?}");
+    // It failed again at level 0 with no more allocated: the outside cut goes finer, alone.
+    t.requests[0].retried = Some(Retried { site: "split:x".into(), shape: "k".into(), level: 0, at: 3 * MB });
+    assert_eq!(oom(&t, None), vec![Action::CutOutside { req: 1, site: "split:x".into(), shape: "k".into() }]);
+    // Inside the pass, its own site is cut.
+    t.requests[0].sites.insert(0, vec![varena::table::CutSite { name: "split:x".into(), finest: 3, ..Default::default() }]);
+    assert!(matches!(oom(&t, Some(0)).as_slice(), [Action::Cut { site, .. }] if site == "split:x"));
+    // Progress past where it failed: a retry again.
+    t.allocated = 2 * MB;
+    assert!(matches!(oom(&t, None).last(), Some(Action::Claim { .. })));
+    // At its finest level, no progress: no retry, no cut; exhausted with no host room to park in.
+    t.allocated = MB;
+    t.requests[0].outside.insert(("split:x".into(), "k".into()), 3);
+    t.requests[0].retried = Some(Retried { site: "split:x".into(), shape: "k".into(), level: 3, at: 3 * MB });
+    assert!(matches!(oom(&t, None).as_slice(), [Action::Exhausted { .. }]), "{:?}", oom(&t, None));
 }
 
