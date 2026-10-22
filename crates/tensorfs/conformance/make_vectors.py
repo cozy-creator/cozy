@@ -459,7 +459,9 @@ def resolution() -> dict:
         default("private tags are not candidates", [("1.0", public), ("2.0", {})], "1.0"),
         default("a public name that is not a version is never the default", [("1.0.0", public), ("1.0.0-audit.1", public)],
                 "1.0.0"),
-        default("no public, non-yanked tag: none", [("main", {}), ("1.0", yanked)]),
+        default("no public, non-yanked version: main", [("main", {}), ("1.0", yanked)], "main"),
+        default("a public version beats main", [("main", {}), ("1.0", public)], "1.0"),
+        default("a yanked main is no default", [("main", yanked), ("draft", {})]),
     ]
     return {"repo": doc, "trees": [json.loads(t) for t in trees], "cases": cases, "defaults": defaults}
 

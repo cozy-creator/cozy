@@ -15,7 +15,7 @@ tensors, bit for bit:
   when its `prepare()` changes; `bind` makes the module's tensors; `Exhausted` leaves the
   memory usable;
 - an idle (RAM-level) model's cold pages go before a warm one's; a request short of room waits
-  for another's bytes; `load` seals the host tier for deposit; the row carries the facts;
+  for another's bytes; an admitted `load` seals the host tier for deposit; the row carries the facts;
 - a granted host tier adopted before its module exists copies while the module is built, and
   the load binds to it; a module of other regions is a miss and seals anew.
 
@@ -155,7 +155,7 @@ def main() -> int:
     )
     mem = Memory.open(dev, LedgerGrant(0, table.fd, table.events_fd))
     net = meta(a.dim, a.blocks)
-    net._varena = Declared(WeightGrant(ck, "net", MANIFEST))
+    net._varena = Declared(WeightGrant(ck, "net", MANIFEST, seal=True))
     model = mem.load(net)
     sealed = mem.sealed()
     check("load seals the host tier for deposit", [m for m, _ in sealed] == [model], str(sealed))
@@ -329,7 +329,7 @@ def main() -> int:
 
     fill = Bias()
     net2 = meta(a.dim, a.blocks)
-    net2._varena = Declared(WeightGrant(ck, "net", "sha256:" + "1" * 64), fill=fill, bind=bind)
+    net2._varena = Declared(WeightGrant(ck, "net", "sha256:" + "1" * 64, seal=True), fill=fill, bind=bind)
     model2 = mem.load(net2)
     for _, fd in mem.sealed():
         os.close(fd)
@@ -377,7 +377,7 @@ def main() -> int:
     # a later step's resident pages are room for this step's binds, the furthest first
     torch.cuda.synchronize()
     net3 = meta(a.dim, a.blocks)
-    net3._varena = Declared(WeightGrant(ck, "net", "sha256:" + "2" * 64))
+    net3._varena = Declared(WeightGrant(ck, "net", "sha256:" + "2" * 64, seal=True))
     model3 = mem.load(net3)
     for m in (model, model2, model3):
         m.evict()
@@ -474,7 +474,7 @@ def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespa
     """A held deposit loads as a fresh one does, with no seal; the pages a gone process kept
     of it map as a cache hit; a fill model serves them only when they were filled under the
     identity its fill names, else refills."""
-    grant = WeightGrant(ck, "net", "sha256:" + "2" * 64, host_fd=held)
+    grant = WeightGrant(ck, "net", "sha256:" + "2" * 64, host_fd=held, seal=True)
     net = meta(a.dim, a.blocks)
     net._varena = Declared(grant)
     model = mem.load(net)

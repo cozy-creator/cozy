@@ -174,11 +174,11 @@ class Writer:
         elif self._resume is None:
             self.abandon()
 
-    def pipeline(self, cls, config: Mapping) -> None:
-        self._native.pipeline(cls, dict(config))
+    def pipeline(self, cls=None, config: Mapping | None = None) -> None:
+        self._native.pipeline(cls, dict(config) if config is not None else {})
 
-    def component(self, name: str, *, cls, config: Mapping, config_file=None) -> ComponentWriter:
-        return ComponentWriter(self._native.component(name, cls, dict(config), config_file))
+    def component(self, name: str, *, cls=None, config: Mapping | None = None, config_file=None) -> ComponentWriter:
+        return ComponentWriter(self._native.component(name, cls, dict(config) if config is not None else {}, config_file))
 
     def commit(self):
         if self._failed is not None:

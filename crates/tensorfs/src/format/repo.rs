@@ -347,9 +347,10 @@ impl Repo {
         self.tags.iter_mut().find(|t| t.name == name)
     }
 
-    /// The unversioned default: [`newest`] of the tags.
+    /// The unversioned default: [`newest`] of the tags, else `main` (HF's revision default)
+    /// unless yanked.
     pub fn default_tag(&self) -> Option<&Tag> {
-        newest(&self.tags)
+        newest(&self.tags).or_else(|| self.tag("main").filter(|t| !t.yanked))
     }
 
     /// Resolves `revision` once (§7): none is the default; `sha256:<hex>` a tag's commit, else a

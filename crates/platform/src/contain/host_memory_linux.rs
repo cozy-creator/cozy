@@ -34,12 +34,12 @@ pub(crate) fn number(path: &Path) -> Option<u64> {
     text.parse::<u64>().ok().filter(|&n| n > 0 && n < (1 << 60))
 }
 
-/// (`inactive_file`, `shmem`) from a cgroup's `memory.stat`: the page cache the kernel gives
-/// back before it OOM-kills (active file pages may not go in time); v1 states its subtree's
-/// under `total_`.
+/// (reclaimable, `shmem`) from a cgroup's `memory.stat`: the page cache the kernel gives back
+/// before it OOM-kills is its inactive file pages less those still dirty or under writeback (active
+/// ones may not go in time, dirty ones wait on the disk); v1 states its subtree's under `total_`.
 fn stat(cgroup: &Path) -> Option<(u64, u64)> {
     let text = fs::read_to_string(cgroup.join("memory.stat")).ok()?;
-    let row = |name: &str| -> u64 {
+    let row = |names: &[&str]| -> u64 {
         let find = |key: &str| {
             text.lines().find_map(|l| {
                 l.strip_prefix(key)
@@ -47,11 +47,10 @@ fn stat(cgroup: &Path) -> Option<(u64, u64)> {
                     .and_then(|v| v.trim().parse().ok())
             })
         };
-        find(&format!("total_{name}"))
-            .or_else(|| find(name))
-            .unwrap_or(0)
+        names.iter().find_map(|name| find(&format!("total_{name}")).or_else(|| find(name))).unwrap_or(0)
     };
-    Some((row("inactive_file"), row("shmem")))
+    let unwritten = row(&["file_dirty", "dirty"]) + row(&["file_writeback", "writeback"]);
+    Some((row(&["inactive_file"]).saturating_sub(unwritten), row(&["shmem"])))
 }
 
 /// This process's memory cgroup and every parent up to the controller root, innermost first,
@@ -115,6 +114,7 @@ pub(super) fn read() -> HostMemory {
         available: mem_available,
         shmem: meminfo("Shmem").max(0),
         mem_available,
+        bound: total(),
     };
     let Some((path, limits, usage)) = cgroups() else {
         return best;
@@ -137,10 +137,30 @@ pub(super) fn read() -> HostMemory {
                 available: room,
                 shmem: shmem as i64,
                 mem_available,
+                bound: bound as i64,
             };
         }
     }
     best
+}
+
+/// `/proc/<pid>/status`: `RssAnon` now and `VmHWM` as a conservative upper bound on its peak.
+/// Current file/shared RSS cannot be subtracted from a peak reached at a different time.
+pub(super) fn anon(pid: u32) -> io::Result<super::Anon> {
+    let text = fs::read_to_string(format!("/proc/{pid}/status"))?;
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(':')?.split_whitespace().next()?.parse::<u64>().ok())
+            .map(|kib| kib * 1024)
+            .ok_or_else(|| io::Error::other(format!("no {name} in /proc/{pid}/status")))
+    };
+    let (anon, peak) = (field("RssAnon")?, field("VmHWM")?);
+    Ok(super::Anon { now: anon, peak: peak.max(anon) })
+}
+
+/// `clear_refs` 5: the resident high-water becomes the process's use now.
+pub(super) fn reset_peak(pid: u32) -> io::Result<()> {
+    fs::write(format!("/proc/{pid}/clear_refs"), b"5")
 }
 
 pub(super) fn process(pid: u32) -> io::Result<ProcessMemory> {
