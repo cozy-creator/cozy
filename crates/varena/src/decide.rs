@@ -316,19 +316,25 @@ impl<'a> Demand<'a> {
         self.got >= self.need
     }
 
-    /// What is still missing, the withdrawn kept pages counted as coming.
+    /// Bytes on their way back: kept pages planned out now, and what the table counts as
+    /// coming (own withdraws and unmaps, a tier copy, other rows' answered or unloaded bytes).
+    fn coming(&self) -> u64 {
+        self.withdrawn + self.t.coming()
+    }
+
+    /// What is still missing, the coming bytes counted.
     fn short(&self) -> u64 {
-        self.need.saturating_sub(self.got + self.withdrawn)
+        self.need.saturating_sub(self.got + self.coming())
     }
 
-    /// Enough once the withdrawn kept pages are free.
+    /// Enough once the coming bytes are free.
     fn covered(&self) -> bool {
-        self.got + self.withdrawn >= self.need
+        self.got + self.coming() >= self.need
     }
 
-    /// Covered by kept pages planned out: settle, then decide again.
+    /// Covered by bytes on their way back: settle (wait for them), then decide again.
     fn settles(&mut self) -> bool {
-        if self.enough() || !self.covered() || self.withdrawn == 0 {
+        if self.enough() || !self.covered() || self.coming() == 0 {
             return false;
         }
         self.out.push(Action::Settle);

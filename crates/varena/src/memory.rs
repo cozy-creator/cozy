@@ -1107,6 +1107,7 @@ impl Inner {
             family: t.requests.iter().find(|r| r.yielded.is_some()).map_or(0, |r| r.family),
             host_peak: st.host.values().flatten().copied().max().unwrap_or(0),
             host_unmeasured: st.host.values().filter(|h| h.is_none()).count() as u64,
+            coming: t.pending + t.inflight,
         });
     }
 
@@ -1518,6 +1519,7 @@ impl Inner {
             let pin = st.tick();
             st.pins.insert(pin, (s.key, None, std::thread::current().id()));
             st.saving = Some(s.key);
+            st.table.saving = place.2;
             st.sync(s.key);
             self.unlock(st);
             (pin, held, place, ready)
@@ -1539,6 +1541,7 @@ impl Inner {
         let mut st = self.lock();
         st.pins.remove(&pin);
         st.saving = None;
+        st.table.saving = 0;
         st.sync(s.key);
         // Its class while pinned may have been published meanwhile: no longer.
         self.publish(&st);
@@ -1627,15 +1630,6 @@ impl Inner {
                     (*room, *unmeasured) = self.pass_room(&mut st, r, *set)?;
                 }
             }
-            // A tier copy in flight holds its page like a consumer: a decision short of bytes
-            // waits for it, then decides again.
-            if remote.is_empty() && st.saving.is_some() && matches!(actions.last(), Some(Action::Exhausted { .. } | Action::Park(_))) {
-                while st.saving.is_some() {
-                    self.wait(&mut st);
-                }
-                self.unlock(st);
-                continue;
-            }
             self.publish(&st);
             self.unlock(st);
             self.shrink(shrinks);
@@ -1667,7 +1661,7 @@ impl Inner {
                         tried.freed += self.row.ask(row, ceiling, bytes)?;
                     }
                     // Custody lets go of the kept pages unmapped: then they are free.
-                    Action::Settle => self.to_custody.settle(),
+                    Action::Settle => self.settle_coming(),
                     _ => {}
                 }
             }
@@ -2454,11 +2448,37 @@ impl Inner {
         stats
     }
 
+    /// Waits for the bytes on their way back: this process's withdraws sent, a running tier
+    /// copy over, and other rows' coming bytes (answered or unloaded) once one of them rings.
+    /// No timer: each wait ends on the event that frees them.
+    fn settle_coming(&self) {
+        self.to_custody.settle();
+        let mut st = self.lock();
+        while st.saving.is_some() {
+            self.wait(&mut st);
+        }
+        let others = st.table.others.iter().any(|r| r.coming > 0);
+        self.unlock(st);
+        if others {
+            self.row.set_waiting(true);
+            // Read after the mark: any ring from now on reaches this row.
+            let still = self.shared.rows().is_ok_and(|rows| ledger::remotes(&rows, self.row.at()).0.iter().any(|r| r.coming > 0));
+            if still {
+                let _ = os::wake_await(&self.room_wake);
+            }
+            self.row.set_waiting(false);
+        }
+    }
+
     /// The ask thread's answer, from pages only: it runs no caller code. An idle process's trim
     /// and cache shrinks go to its trim thread, after the answer.
     fn answer(&self, ceiling: Class, bytes: u64) -> u64 {
         let out = crate::caught(|| {
             let mut st = self.lock();
+            // A tier copy's page comes back with it: the answer counts it (review 4, N4).
+            while st.saving.is_some() {
+                self.wait(&mut st);
+            }
             let actions = decide(&st.table, &Trigger::Ask { ceiling, bytes });
             let mut freed = 0;
             let mut wanted = Wanted::default();

@@ -16,7 +16,7 @@
 //! take that lock for writing, so nobody is left holding a table nobody else can find.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Weak};
 
@@ -32,7 +32,7 @@ use crate::memory::SitePeak;
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledger9");
+const MAGIC: u64 = u64::from_le_bytes(*b"vledgr10");
 /// The header's page: the heap starts after it, and grows from there.
 const HEADER: u64 = 4096;
 /// The heap's unit: rows take two, a fact as many as its bytes need.
@@ -50,8 +50,8 @@ const ROW: u64 = 1;
 const FACT: u64 = 2;
 
 /// The latch: context, torch, caches, classes (7), remaining, unmeasured, running, outside,
-/// yielded, family, host_peak, host_unmeasured.
-const WORDS: usize = 18;
+/// yielded, family, host_peak, host_unmeasured, coming.
+const WORDS: usize = 19;
 
 #[repr(C)]
 struct Header {
@@ -151,17 +151,20 @@ pub(crate) struct Facts {
     /// measured: the RAM tier keeps their growth free, and fills nothing beside an unmeasured one.
     pub host_peak: u64,
     pub host_unmeasured: u64,
+    /// Its bytes on their way back (withdraws not yet sent, unmaps in flight): held still,
+    /// free soon, so others count them as reachable and wait for them before degrading.
+    pub coming: u64,
 }
 
 impl Facts {
     fn words(&self) -> [u64; WORDS] {
         let c = self.classes;
-        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family, self.host_peak, self.host_unmeasured]
+        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family, self.host_peak, self.host_unmeasured, self.coming]
     }
 
     fn of(w: [u64; WORDS]) -> Facts {
-        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured] = w;
-        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured }
+        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, coming] = w;
+        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, coming }
     }
 
     fn held(&self) -> u64 {
@@ -366,7 +369,8 @@ impl Shared {
 
     /// The rows waiting for room (their ids).
     fn waiting(&self) -> Result<Vec<u64>> {
-        self.records(|m, at, w| (kind(w) == ROW && row(m, at)?.waiting.load(Acquire) > 0).then(|| row_id(at, w)))
+        fence(SeqCst);
+        self.records(|m, at, w| (kind(w) == ROW && row(m, at)?.waiting.load(SeqCst) > 0).then(|| row_id(at, w)))
     }
 
     /// Every READY record, read again if the heap's shape moved meanwhile.
@@ -815,8 +819,13 @@ impl Row {
     }
 
     /// Marks this row waiting (every change of the table signals it) or not.
+    /// Counted: each of its threads waiting adds one. Sequentially consistent with `ring`'s
+    /// read, so a change after the mark always signals (review 5, R6).
     pub fn set_waiting(&self, waiting: bool) {
-        self.rec(|r| r.waiting.store(u64::from(waiting), Release));
+        self.rec(|r| match waiting {
+            true => r.waiting.fetch_add(1, SeqCst),
+            false => r.waiting.fetch_sub(1, SeqCst),
+        });
         self.shared.event();
     }
 
@@ -967,6 +976,7 @@ pub(crate) fn remotes(rows: &[RowView], own: u64) -> (Vec<Remote>, u64) {
             torch: r.facts.torch,
             caches: r.facts.caches,
             classes: r.facts.classes,
+            coming: r.facts.coming,
         })
         .collect();
     (others, orphans)
@@ -1021,6 +1031,8 @@ pub struct RowStatus {
     pub torch: u64,
     /// Bytes asked of it and not yet answered.
     pub asked: u64,
+    /// Its bytes on their way back (withdraws not yet sent, unmaps in flight).
+    pub coming: u64,
     /// Waiting for room: a request's wait on a child call ended and its room is not back yet.
     pub waiting: bool,
 }
@@ -1309,7 +1321,7 @@ impl Ledger {
             foreign,
             rows: rows
                 .iter()
-                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, torch: r.facts.torch, asked: asked_of(&rows, r.id()), waiting: r.waiting })
+                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, torch: r.facts.torch, asked: asked_of(&rows, r.id()), coming: r.facts.coming, waiting: r.waiting })
                 .collect(),
             dispatched: dispatched.into_iter().map(|(k, v)| (k.trim_start_matches("dispatch/").to_string(), String::from_utf8_lossy(&v).into_owned())).collect(),
         }

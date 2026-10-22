@@ -310,16 +310,19 @@ pub struct Remote {
     /// Of `torch`, what its trim hook and caches give back when it is idle.
     pub caches: u64,
     pub classes: [u64; 7],
+    /// Its bytes on their way back (withdraws not yet sent, unmaps in flight).
+    pub coming: u64,
 }
 
 impl Remote {
     pub fn held(&self) -> u64 {
-        self.context + self.torch + self.classes.iter().enumerate().filter(|(c, _)| *c != Class::O.index()).map(|(_, b)| b).sum::<u64>()
+        self.context + self.torch + self.coming + self.classes.iter().enumerate().filter(|(c, _)| *c != Class::O.index()).map(|(_, b)| b).sum::<u64>()
     }
 
-    /// What no ask can free: its context, torch's bytes beyond its idle caches, W and P.
+    /// What no ask can free and nothing returns: its context, torch's bytes beyond its idle
+    /// caches, W and P (its coming bytes return on their own).
     pub fn unevictable(&self) -> u64 {
-        self.held().saturating_sub(self.evictable(Class::D))
+        self.held().saturating_sub(self.evictable(Class::D) + self.coming)
     }
 
     /// What its ask thread can free under `ceiling`.
@@ -348,6 +351,8 @@ pub struct Table {
     /// Bytes of pages being unmapped by the mechanism thread: still this process's on the
     /// device (P to others), already spent on the creates queued after them (not to itself).
     pub inflight: u64,
+    /// The bytes of a page whose RAM-tier copy runs (pinned meanwhile, like a consumer).
+    pub saving: u64,
     /// Torch's allocator, as last measured (pass start and end, every OOM).
     pub allocated: u64,
     pub reserved: u64,
@@ -410,12 +415,9 @@ impl Table {
         Some(if distance.is_some() { Class::D } else { Class::N })
     }
 
-    /// This process's page bytes by class (withdrawn kept pages custody still holds are P).
+    /// This process's page bytes by class (its coming bytes apart: [`Table::own_coming`]).
     pub fn classes(&self) -> [u64; 7] {
         let mut out = [0u64; 7];
-        if let Some(p) = out.get_mut(Class::P.index()) {
-            *p = self.pending + self.inflight;
-        }
         for (key, page) in self.pages() {
             if let Some(slot) = self.class(key).and_then(|c| out.get_mut(c.index())) {
                 *slot += page.bytes;
@@ -442,6 +444,19 @@ impl Table {
 
     pub fn held(&self) -> u64 {
         self.context + self.torch() + self.mapped() + self.pending
+    }
+
+    /// This process's bytes on their way back to its own decisions: withdrawn kept pages custody
+    /// still holds, and a page whose RAM-tier copy runs (its unmaps in flight are already
+    /// spent on the creates queued after them).
+    pub fn own_coming(&self) -> u64 {
+        self.pending + self.saving
+    }
+
+    /// Bytes on their way back here and in other rows: a demand short by no more than these
+    /// waits for them (and decides again) before it cuts, lowers, parks or ends.
+    pub fn coming(&self) -> u64 {
+        self.own_coming() + self.others.iter().map(|r| r.coming).sum::<u64>()
     }
 
     fn others_held(&self) -> u64 {
