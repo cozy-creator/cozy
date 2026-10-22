@@ -39,6 +39,9 @@ use crate::table::{Class, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table
 use crate::tier;
 use crate::{Error, Exhausted, GpuId, Result};
 
+mod stream;
+use stream::{StreamIn, Streaming};
+
 /// A loaded set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SetId(pub u32);
@@ -519,6 +522,9 @@ enum Mech {
     /// A read-only kept page whose fill identity changed: never protected again, it is
     /// unmapped (after its consumers) and a fresh page filled in its place.
     Renew { key: Key, gen: u64, va: Va, off: u64, span: u64, old: Option<Physical>, after: Vec<Event>, job: Job },
+    /// A streamed set's slot moves from the block at `from` to `key`'s block, after the old block's consumers
+    /// (`after`); then `key`'s fill is queued.
+    Move { key: Key, gen: u64, va: Va, from: u64, off: u64, span: u64, phys: Physical, after: Vec<Event>, job: Job },
     /// A closed set's reservation, after its pages' unmaps.
     Release(Va),
 }
@@ -637,6 +643,8 @@ struct State {
     /// in the order recorded: one stream's events complete in order, so a drain queries only
     /// each stream's oldest.
     events: BTreeMap<usize, VecDeque<(Event, Key)>>,
+    /// Sets streaming their upper blocks through slots (step 2's watermark), by set.
+    streams: HashMap<u32, Streaming>,
     /// Ids and the logical clock.
     clock: u64,
     shrinks: HashMap<u32, Shrink>,
@@ -2212,9 +2220,22 @@ impl Inner {
             }
             let mut want = bytes - free;
             let (mut unmapped, mut withdrawn, mut events, mut shrinks) = (0, false, vec![], vec![]);
+            let mut streamed = HashSet::new();
             for v in decide::victims(&st.table, keep) {
                 if want == 0 {
                     break;
+                }
+                // Step 2: a running set's own pages are not evicted one by one; the set streams its upper blocks
+                // through slots instead, once per round, and its other pages stay.
+                if let Victim::Page { key, .. } = &v {
+                    if st.table.distance(*key).is_some_and(|d| d.0 == 0) {
+                        if streamed.insert(key.0) {
+                            let taken = self.stream(&mut st, key.0, want, req, hook)?;
+                            (unmapped, want) = (unmapped + taken.unmapped, want.saturating_sub(taken.unmapped + taken.pending));
+                            events.extend(taken.events);
+                        }
+                        continue;
+                    }
                 }
                 let kept = |key: Key| st.table.page(key).is_some_and(|p| p.kept);
                 match v {
@@ -2630,6 +2651,19 @@ impl Inner {
             // Waiting on pins only this thread holds would wait on itself.
             let me = std::thread::current().id();
             let mine = pinned && st.pins.iter().filter(|(id, (k, ..))| *k == key && !claims.contains(id)).all(|(_, (.., t))| *t == me);
+            // A streamed set's upper block takes a slot rather than a new page (step 2's watermark).
+            match self.stream_in(&mut st, key, req)? {
+                StreamIn::Moved => {
+                    hit = false;
+                    continue;
+                }
+                StreamIn::Wait => {
+                    (hit, waited) = (false, true);
+                    self.wait(&mut st)?;
+                    continue;
+                }
+                StreamIn::No => {}
+            }
             match st.homes.get(&key) {
                 // Its Keep's protect runs now: no pin (and no refill) while its access changes;
                 // the Keep's end wakes the binder.
@@ -2820,6 +2854,7 @@ impl Inner {
 
     fn end_request(&self, req: u64) -> Stats {
         let mut st = self.lock();
+        self.unstream(&mut st, req);
         let name = st.table.request(req).map(|r| r.name.clone()).unwrap_or_default();
         st.active.retain(|(r, _), _| *r != req);
         st.synthetic.remove(&req);
@@ -3129,6 +3164,10 @@ impl Drop for Inner {
                 Mech::Renew { va, off, span, old, .. } => {
                     let _ = self.backend.unmap(va, off, span);
                     old.into_iter().for_each(|p| { let _ = self.backend.destroy(p); });
+                }
+                Mech::Move { va, from, span, phys, .. } => {
+                    let _ = self.backend.unmap(va, from, span);
+                    let _ = self.backend.destroy(phys);
                 }
                 Mech::Release(va) => self.backend.release(va),
                 Mech::Map { .. } | Mech::Adopt { .. } | Mech::Keep { .. } => {}
@@ -3535,6 +3574,7 @@ impl Inner {
                 self.backend.retire(ready);
             }
             Mech::Keep { set } => self.keep_set(set),
+            Mech::Move { key, gen, va, from, off, span, phys, after, job } => self.move_slot(key, gen, va, from, off, span, phys, after, job),
             Mech::Release(va) => self.backend.release(va),
         }
     }
