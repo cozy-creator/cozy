@@ -461,6 +461,8 @@ class Memory:
         self.crossed = 0
         if pool and self.cuda:
             self._pools[threading.get_ident()] = self.new_pool()
+        if self.cuda:
+            _observe(device)
         if device.type != "cpu":
             owner = weakref.ref(self)
             def trim() -> int:
@@ -574,6 +576,11 @@ class Memory:
                 yield r
         except BaseException as failed:
             try:
+                self._fold()
+                refused = _refused_bytes()  # an allocation refused outside any pass
+                if r.alone:
+                    r.outside = max(r.outside, self.torch.now()[0] - r.base + refused if refused else 0)
+                    r.native.outside(r.outside)
                 r.ended = r.native.end()
             except BaseException as ending:
                 failed.add_note(f"ending request {id!r} also failed: {ending!r}")  # the request's own error stays the one raised
@@ -716,6 +723,7 @@ class Memory:
             local.depth -= 1
             raise Unbound("open the model pass and prepare graph dependencies before capture")
         p: _Pass | None = None
+        _refused_bytes()  # a refusal before this pass is not this pass's
         try:
             r = self._current()
             shape = "x".join(str(d) for t in tree_leaves((args, kwargs)) if isinstance(t, Tensor) for d in t.shape)
@@ -768,8 +776,13 @@ class Memory:
         self._fold()
         with self.measuring:
             self.passes.remove(p)
-        if sys.exc_info()[1] is not p.entered:
-            return  # torch runs this hook in its handler of the forward's raise: unended, it records nothing
+        # torch runs this hook in its handler of the forward's raise: a failed pass still ends
+        # with what it reached, the bytes torch's allocator refused included, so the next pass
+        # of its shape prepares for them.
+        failed = sys.exc_info()[1]
+        failed = None if failed is p.entered else failed
+        refused = _refused_bytes()
+        peak = max(p.peak, self.torch.now()[0] + refused) if failed is not None and refused else p.peak
         sites = [(name, *site) for name, site in p.sites.items()]
         # The pass's own slack: its reserved growth beyond its allocated growth (the cache that
         # earlier passes left is theirs, not this pass's room).
@@ -777,9 +790,14 @@ class Memory:
         churn = {k: now[k] - p.churned.get(k, 0) for k in now}
         for k, n in churn.items():
             p.request.churn[k] = p.request.churn.get(k, 0) + n
-        model.rooms[(p.entry, p.shape)] = (max(p.peak - p.start, 0), slack)
-        model.last = (f"{p.entry}|{p.shape}", p.peak, slack, churn)
-        p.native.end(p.peak, slack, sites, *self.torch.now())
+        model.rooms[(p.entry, p.shape)] = (max(peak - p.start, 0), slack)
+        model.last = (f"{p.entry}|{p.shape}", peak, slack, churn)
+        try:
+            p.native.end(peak, slack, sites, *self.torch.now())
+        except BaseException as ending:
+            if failed is None:
+                raise
+            failed.add_note(f"ending the failed pass of {model.name!r} also failed: {ending!r}")
 
     # -- blocks
 
@@ -1179,6 +1197,25 @@ def _hook(model: Model) -> None:
 
 
 _threads = threading.local()
+_observed: set[int] = set()
+
+
+def _observe(device: torch.device) -> None:
+    """torch's allocator tells the refusing thread the bytes each refused allocation asked for."""
+    if device.index not in _observed:
+        _observed.add(device.index)
+        with torch.cuda.device(device):
+            torch._C._cuda_attach_out_of_memory_observer(_refusal)
+
+
+def _refusal(device: int, nbytes: int, _limit: int, _free: int) -> None:
+    _threads.refused = int(nbytes)
+
+
+def _refused_bytes() -> int:
+    """The bytes torch's allocator last refused on this thread, taken (0: none since)."""
+    refused, _threads.refused = getattr(_threads, "refused", 0), 0
+    return refused
 
 
 def _owed() -> dict[object, int]:

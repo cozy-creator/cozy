@@ -291,6 +291,32 @@ def attempts(mem: Memory, ck: tensorfs.Checkpoint) -> None:
         check("attempts: a pass records the completed attempt's peak, not the failed one's", last is not None and retried <= last[1] < failed, last)
 
 
+def failures(mem: Memory, ck: tensorfs.Checkpoint) -> None:
+    """A pass that fails still ends with what it reached, the bytes torch's allocator refused
+    included: the next pass of its shape is measured, its room at least those bytes."""
+    unet, refused = loaded(ck, mem, release="failures"), 64 << 20
+
+    def short(*_: object) -> None:
+        adapter._refusal(0, refused, 0, 0)  # torch's allocator refused this thread
+        raise torch.OutOfMemoryError("standalone: refused")
+
+    hook = unet.conv_in.register_forward_pre_hook(short)
+    with mem.request("failed", plan=[unet]):
+        try:
+            forward(unet, mem.device, 0)
+        except torch.OutOfMemoryError:
+            pass
+    hook.remove()
+    room = mem.models[unet].rooms.get(("", "1x4x8x8x1x5x768"), (0, 0))[0]
+    check("failed: the failed pass's room holds the refused bytes", room >= refused, (room, refused))
+    measured: list[bool] = []
+    probe = unet.conv_in.register_forward_pre_hook(lambda *_: measured.append(mem._current().measured()))
+    with mem.request("after", plan=[unet]):
+        forward(unet, mem.device, 0)
+    probe.remove()
+    check("failed: the next pass of its shape is measured", measured == [True], measured)
+
+
 def gone(memory: weakref.ref[Memory], phase: str) -> None:
     """One Memory per device in a process: a phase's goes before the next opens (on a GPU they
     share the card's table, and each would count the other's pages as its own context)."""
@@ -390,22 +416,31 @@ def cpu_by_thread(before: dict[int, tuple[str, float]], after: dict[int, tuple[s
 
 
 def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> weakref.ref[Memory]:
-    """On host pages (the same bytes, the same kernels), a warm forward through the adapter costs
-    at most 10% more CPU than the plain model's. Its own table and model, every block a hit;
-    the best of several tries each, interleaved, so the shared machine's load is not the
-    measurement. On one torch thread: torch's idle workers spin while the main thread runs
-    Python, so with N workers the adapter's own time counts up to N+1 times, and the ratio would
-    follow the machine's core count, not the adapter."""
+    """On host pages, a warm forward through the adapter costs at most 10% more CPU than the
+    plain model on the same pages (the same bytes, the same kernels: placement alone moves a
+    forward's CPU by more than the adapter costs, and by the runner). Its own table and model,
+    every block a hit; the best of several tries each, interleaved, so the shared machine's load
+    is not the measurement. On one torch thread: torch's idle workers spin while the main thread
+    runs Python, so with N workers the adapter's own time counts up to N+1 times, and the ratio
+    would follow the machine's core count, not the adapter."""
     threads_before = torch.get_num_threads()
     torch.set_num_threads(1)
     mem = opened(f"{tag}-overhead", 1 << 31)
     unet = loaded(ck, mem)
     x, text = inputs(torch.device("cpu"), 0)
+    model = mem.models[unet]
+    regions = [b for b in (model.common, *model.blocks.values()) if b is not None]
+    pins = [mem.native.bind(model.id, b.region, 0) for b in regions]  # held: the pages stay put
+    with torch.device("meta"):
+        paged = UNet2DConditionModel(**CONFIG).eval()
+    paged.load_state_dict({k: v["value"] for b, pin in zip(regions, pins) for k, v in adapter._views(b, torch.from_dlpack(pin.window())).items()}, assign=True)
 
-    def plain_run() -> None:
-        with torch.no_grad():
-            for _ in range(3):
-                plain(x, 3, encoder_hidden_states=text)
+    def bare(m: UNet2DConditionModel) -> Callable[[], None]:
+        def run_() -> None:
+            with torch.no_grad():
+                for _ in range(3):
+                    m(x, 3, encoder_hidden_states=text)
+        return run_
 
     def served() -> None:
         with mem.request("overhead", plan=[unet] * 3) as r, torch.no_grad():
@@ -413,26 +448,28 @@ def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> 
                 unet(x, 3, encoder_hidden_states=text)
         origins.update(ref.origin for ref in r.stats().trace)
 
+    runs = {"plain": bare(plain), "paged": bare(paged), "served": served}
     origins: set[str] = set()
-    plain_run()
-    served()
+    for run_ in runs.values():
+        run_()
     origins.clear()
-    best = [float("inf"), float("inf")]
+    best = dict.fromkeys(runs, float("inf"))
     # All runs' CPU by thread (clock ticks: too coarse for one run).
-    where: list[dict[int, tuple[str, float]]] = [{}, {}]
+    where: dict[str, dict[int, tuple[str, float]]] = {name: {} for name in runs}
     for _ in range(11):
-        for i, run_ in enumerate((plain_run, served)):
+        for name, run_ in runs.items():
             before, began = threads(), time.process_time()
             run_()
-            best[i] = min(best[i], time.process_time() - began)
-            for tid, (name, cpu) in threads().items():
-                where[i][tid] = (name, where[i].get(tid, (name, 0.0))[1] + cpu - before.get(tid, (name, 0.0))[1])
+            best[name] = min(best[name], time.process_time() - began)
+            for tid, (thread, cpu) in threads().items():
+                where[name][tid] = (thread, where[name].get(tid, (thread, 0.0))[1] + cpu - before.get(tid, (thread, 0.0))[1])
+    del runs, paged, pins
     costs(mem, unet)
-    ratio = best[1] / best[0]
+    ratio = best["served"] / best["paged"]
     torch.set_num_threads(threads_before)
-    print(f"OVERHEAD best CPU ms: plain {1e3 * best[0]:.1f}, served {1e3 * best[1]:.1f}; all 11 runs' CPU ms by thread: "
-          f"plain {cpu_by_thread({}, where[0])}; served {cpu_by_thread({}, where[1])}", flush=True)
-    check(f"overhead: a warm forward through the adapter costs {100 * (ratio - 1):+.1f}% CPU over plain (at most +10%)", ratio <= 1.10 and origins == {"hit"}, (best, origins))
+    print("OVERHEAD best CPU ms: " + ", ".join(f"{name} {1e3 * t:.1f}" for name, t in best.items()) + "; all 11 runs' CPU ms by thread: "
+          + "; ".join(f"{name} {cpu_by_thread({}, w)}" for name, w in where.items()), flush=True)
+    check(f"overhead: a warm forward through the adapter costs {100 * (ratio - 1):+.1f}% CPU over plain on its pages (at most +10%)", ratio <= 1.10 and origins == {"hit"}, (best, origins))
     return weakref.ref(mem)
 
 
@@ -492,6 +529,7 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     check("identity: a pass under a new identity shed the hold of the old bake", shed == [True] and not mem.models[filled].holds, (shed, hold.blocks))
     concurrent(mem, ck)
     attempts(mem, ck)
+    failures(mem, ck)
     capping(mem, unet)
     if CUDA:
         costs(mem, unet)
@@ -548,10 +586,19 @@ def outside_alone(tag: str) -> weakref.ref[Memory]:
         with mem.request("first") as first:
             with mem.request("second") as second:
                 figures["peak"] += 9 << 20
+        try:
+            with mem.request("failing") as failing:
+                figures["now"] += 4 << 20
+                figures["peak"] += 5 << 20
+                adapter._refusal(0, 3 << 20, 0, 0)  # refused with 4 MiB held: it needed 7
+                raise RuntimeError("standalone: the request fails")
+        except RuntimeError:
+            pass
     finally:
         mem.torch.now, mem.torch.peaks, mem.torch.reset = real  # type: ignore[method-assign]
     check("outside: the one request open is measured", alone.outside_measured == 7 << 20, alone.outside_measured)
     check("outside: two open, neither is measured", (first.outside_measured, second.outside_measured) == (None, None), (first.outside_measured, second.outside_measured))
+    check("outside: a failed lone request reports what it held when refused plus the refused bytes", failing.outside_measured == 7 << 20, failing.outside_measured)
     return weakref.ref(mem)
 
 
