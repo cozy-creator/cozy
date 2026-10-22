@@ -172,6 +172,18 @@ impl Layout {
         HostLayout { digest: digest.to_string(), regions, users: self.users.values().map(|(d, _)| *d).collect(), used: self.used }
     }
 
+    /// A failed or dead filler may leave physical pages behind ready=0. Reclaim only
+    /// ranges no operation locks; active and quarantined transfers keep their OFD leases.
+    fn discard_unready(&self) -> u64 {
+        let before = os::allocated(&self.fd);
+        for r in 0..self.regions.len() {
+            if self.ready(r).is_some_and(|w| w.load(Acquire) != 1) {
+                self.release(r as u32);
+            }
+        }
+        before.saturating_sub(os::allocated(&self.fd))
+    }
+
     /// Gives back region `r` unless a copy took it meanwhile.
     fn release(&self, r: u32) -> u64 {
         let Some(&(off, span)) = self.regions.get(r as usize) else { return 0 };
@@ -280,6 +292,17 @@ type Shared = Arc<(Mutex<State>, Condvar)>;
 fn relieve(state: &Shared, trigger: HostTrigger) -> u64 {
     let (lock, cv) = &**state;
     let mut s = lock.lock();
+    let discarded: u64 = s.layouts.values().map(Layout::discard_unready).sum();
+    let trigger = match trigger {
+        HostTrigger::Pressure if discarded > 0 => {
+            s.releases += 1;
+            drop(s);
+            cv.notify_all();
+            return discarded;
+        }
+        HostTrigger::Room { bytes, headroom } => HostTrigger::Room { bytes, headroom: headroom.saturating_add(discarded) },
+        other => other,
+    };
     let facts: Vec<HostLayout> = s.layouts.iter().map(|(d, l)| l.facts(d)).collect();
     let actions = host_decide(&facts, trigger);
     if actions.is_empty() {
@@ -291,7 +314,10 @@ fn relieve(state: &Shared, trigger: HostTrigger) -> u64 {
                 os::signal(w);
             }
         }
-        return 0;
+        if discarded > 0 { s.releases += 1; }
+        drop(s);
+        cv.notify_all();
+        return discarded;
     }
     let mut chosen: BTreeMap<String, (Vec<u32>, bool)> = BTreeMap::new();
     for a in actions {
@@ -300,7 +326,7 @@ fn relieve(state: &Shared, trigger: HostTrigger) -> u64 {
             HostAction::Forget(digest) => chosen.entry(digest).or_default().1 = true,
         }
     }
-    let (mut gave, mut unasked) = (0, vec![]);
+    let (mut gave, mut unasked) = (discarded, vec![]);
     for (digest, (regions, forget)) in chosen {
         let Some(l) = s.layouts.get_mut(&digest) else { continue };
         let users: Vec<(u64, String)> = l.users.iter().map(|(c, (_, ask))| (*c, ask.clone())).collect();
@@ -581,6 +607,8 @@ fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget) {
     s.layouts.values_mut().for_each(|l| {
         l.users.remove(&conn);
     });
+    let discarded: u64 = s.layouts.values().map(Layout::discard_unready).sum();
+    if discarded > 0 { s.releases += 1; }
     drop(s);
     cv.notify_all();
 }
@@ -1224,6 +1252,69 @@ sys.stdin.read()
                     assert_eq!(unsafe { libc::mincore(original_mapping.cast(), (data + page) as usize, residency.as_mut_ptr()) }, 0);
                 }
             }
+        });
+    }
+
+
+    #[test]
+    fn a_dead_filler_returns_dirty_unready_pages() {
+        isolated("a_dead_filler_returns_dirty_unready_pages", || {
+            use std::io::BufRead;
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let page = platform_page();
+            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
+            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let held = client.open_layout("dead-fill", vec![(0, page)], "").unwrap();
+            let words = os::map_at(&held.fd, 0, held.data as usize, true).unwrap();
+            // SAFETY: the ready word is mapped and no writer has begun this fixture yet.
+            unsafe { (&*words.base.cast::<AtomicU32>()).store(0, Release) };
+            let address = format!("cozy-varena-{}-tier-reservation-{}-tier", os::euid(), std::process::id());
+            let script = r#"import ctypes,fcntl,json,mmap,os,socket,struct,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect('\0'+sys.argv[1])
+size=int(sys.argv[3]);data=int(sys.argv[2])
+b=json.dumps({'Room':{'bytes':size}}).encode();s.sendall(struct.pack('<I',len(b))+b'\0'+b)
+def read(n):
+    b=b''
+    while len(b)<n:
+        p=s.recv(n-len(b))
+        if not p:raise RuntimeError('tier closed')
+        b+=p
+    return b
+head=read(5);assert json.loads(read(struct.unpack('<I',head[:4])[0]))['Room']['ok']
+fd=os.open('/proc/self/fd/3',os.O_RDWR)
+class Lock(ctypes.Structure):
+    _fields_=[('kind',ctypes.c_short),('whence',ctypes.c_short),('start',ctypes.c_longlong),('length',ctypes.c_longlong),('pid',ctypes.c_int)]
+fcntl.fcntl(fd,fcntl.F_OFD_SETLKW,bytes(Lock(fcntl.F_WRLCK,os.SEEK_SET,data,size,0)))
+m=mmap.mmap(fd,size,offset=data);m[:]=b'\7'*size
+print('dirty',flush=True);sys.stdin.read()
+"#;
+            struct Child(std::process::Child);
+            impl Drop for Child {
+                fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            }
+            let fd = held.fd.as_raw_fd();
+            let mut command = std::process::Command::new("python3");
+            command.args(["-c", script, &address, &held.data.to_string(), &page.to_string()])
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+            // SAFETY: only async-signal-safe descriptor operations between fork and exec.
+            unsafe { command.pre_exec(move || {
+                if libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 { return Err(std::io::Error::last_os_error()); }
+                Ok(())
+            }); }
+            let mut child = Child(command.spawn().unwrap());
+            let mut line = String::new();
+            std::io::BufReader::new(child.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "dirty");
+            assert!(!held.holds(0));
+            assert!(os::allocated(&held.fd) >= held.data + page);
+            assert_eq!(held.region(0).unwrap().1, page);
+            // Cleanup must respect the live fill's write lease.
+            assert_eq!(tier.state.0.lock().layouts.get("dead-fill").unwrap().discard_unready(), 0);
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            await_promised(&tier, 0);
+            assert!(os::allocated(&held.fd) <= held.data, "a dead fill stranded dirty pages outside the pressure policy");
         });
     }
 
