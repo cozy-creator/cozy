@@ -1884,20 +1884,19 @@ fn a_cancelled_request_keeps_its_page_until_its_pending_output_copy_ends() {
     step!();
     let unmaps = timings.count("unmap");
     step!();
-    drop(pass);
-    step!();
-    drop(r);
-    step!();
-    drop(pin);
-    step!();
-    drop(range);
-    step!();
+    // The cancel, watched: if any of it waits on the host for the queued copy, the gate opens.
     let waited = std::thread::scope(|t| {
-        let (unloaded, waited) = watch(t, first, || mem.unload(s));
+        let (cancelled, waited) = watch(t, first, || {
+            drop(pass);
+            drop(r);
+            drop(pin);
+            drop(range);
+            mem.unload(s);
+        });
         if waited != Waited::Returned {
             gate.take();
         }
-        unloaded.join().unwrap();
+        cancelled.join().unwrap();
         waited
     });
     step!();
@@ -1908,7 +1907,7 @@ fn a_cancelled_request_keeps_its_page_until_its_pending_output_copy_ends() {
     step!();
     let drained = x.drain();
     step!();
-    assert!(!early, "the page was unmapped while its output copy was still queued (unload {waited:?})");
+    assert!(!early, "the page was unmapped while its output copy was still queued (the cancel {waited:?})");
     step!();
     drained.unwrap();
     step!();
@@ -1921,7 +1920,7 @@ fn a_cancelled_request_keeps_its_page_until_its_pending_output_copy_ends() {
     step!();
     assert!(unmapped >= opened, "unmapped {:?} before the copy could run", opened - unmapped);
     step!();
-    println!("CANCEL unload {waited:?}; the page unmapped {:?} after the gate opened", unmapped - opened);
+    println!("CANCEL the cancel {waited:?}; the page unmapped {:?} after the gate opened", unmapped - opened);
     step!();
     println!("PASS a cancelled request keeps its page until its pending output copy ends {uuid}");
     step!();
@@ -1972,7 +1971,14 @@ fn old_and_new_fill_identities_at_once_each_read_their_own_bytes() {
     step!();
     let unmaps = timings.count("unmap");
     step!();
-    mem.fill(t, Fill::Declared("v2".into()));
+    let changed = std::thread::scope(|s| {
+        let (changed, waited) = watch(s, first, || mem.fill(t, Fill::Declared("v2".into())));
+        if waited != Waited::Returned {
+            gate.take();
+        }
+        changed.join().unwrap();
+        waited
+    });
     step!();
     assert!(!old.valid(), "the v1 range is stale once the fill is v2");
     step!();
@@ -2013,7 +2019,7 @@ fn old_and_new_fill_identities_at_once_each_read_their_own_bytes() {
     step!();
     assert!(bytes(out2.ptr(), REGION_ALIGN, 0) == *block(72, 0), "the v2 consumer read other bytes than v2's");
     step!();
-    println!("IDENTITY v2's preparation {waited:?} while v1's consumer was queued; at v1's address: {}", pin2.ptr == address);
+    println!("IDENTITY the fill change {changed:?}, v2's preparation {waited:?} while v1's consumer was queued; at v1's address: {}", pin2.ptr == address);
     step!();
     drop(pin2);
     step!();
@@ -2049,7 +2055,9 @@ fn a_failed_completion_record_quarantines_the_page_and_nothing_reuses_it() {
     step!();
     let pass = r.pass(s, "main", "1", Torch::default()).unwrap();
     step!();
+    let first = std::time::Instant::now();
     let pin = mem.bind(s, 0, x.raw()).unwrap();
+    let first = first.elapsed();
     step!();
     let gate = Gate::hold(x.raw());
     step!();
@@ -2061,25 +2069,34 @@ fn a_failed_completion_record_quarantines_the_page_and_nothing_reuses_it() {
     step!();
     drop(pin);
     step!();
-    let refused = mem.bind(s, 0, 0).err();
+    let mut gate = Some(gate);
+    // The quarantine, watched: nothing after it may wait for the queued copy, but if it does the gate opens.
+    let (refused, waited) = std::thread::scope(|t| {
+        let (refused, waited) = watch(t, first, || {
+            let refused = mem.bind(s, 0, 0).err();
+            drop(pass);
+            drop(r);
+            mem.unload(s);
+            drop(mem);
+            refused
+        });
+        if waited != Waited::Returned {
+            gate.take();
+        }
+        (refused.join().unwrap(), waited)
+    });
     step!();
     assert!(matches!(refused, Some(Error::Ownership(_))), "a bind after an unproven release: {refused:?}");
     step!();
-    drop(pass);
-    step!();
-    drop(r);
-    step!();
-    mem.unload(s);
-    step!();
-    drop(mem);
-    step!();
-    drop(gate);
+    gate.take();
     step!();
     x.drain().unwrap();
     step!();
     assert!(bytes(out.ptr(), REGION_ALIGN, 0) == *block(80, 0), "the consumer read other bytes than the page's");
     step!();
     assert_eq!((timings.count("unmap"), timings.count("destroy")), (unmaps, destroys), "a page whose completion is unknown was unmapped or freed");
+    step!();
+    println!("RECORD after the failure, the bind, the request's end, the unload and Memory's drop: {waited:?}");
     step!();
     println!("PASS a failed completion record quarantines the page and nothing reuses it ({refused:?}) {uuid}");
     step!();
