@@ -718,15 +718,16 @@ have no encoded GPU formats. BF16 is preferred unless a known GPU is below compu
 
 A header's profile is `{family, bits, bytes, kinds}`. A tensor's kind is its encoding scheme or,
 for plain tensors, its dtype. Sum the lengths of all tensor locations (including encoded parts)
-by kind. `bytes` is their total, `kinds` their sorted unique names. The dominant kind has the most
-stored bytes, with lexical kind order breaking ties. Its family and bits are:
+by kind. `bytes` is their total, `kinds` their sorted unique names. Its lane kind is the kind of the
+table below with the fewest bits (an nvfp4 variant that keeps sensitive layers in int8 is 4 bits, however
+many bytes those hold); of equal bits, the most stored bytes, then lexical kind order. Its family and bits:
 
-| Dominant kind | family | bits |
+| Lane kind | family | bits |
 | --- | --- | --- |
 | BF16, F16, F32 | bf16, fp16, f32 respectively | 16 (the unquantized preference) |
 | int8.*, fp8.* | int8, fp8 | 8 |
 | nvfp4, mxfp4, int4.* | nvfp4, mxfp4, int4 | 4 |
-| any other | empty | 0 |
+| none of these | empty | 0 |
 
 Known plain dtypes are readable on any target. Encoded int8 requires capability >=8.0 except 10.3;
 fp8 requires >=8.9; nvfp4, mxfp4 and int4 require >=8.0 (weight-only below native FP4 capability 10.0).
@@ -745,8 +746,9 @@ The Hub indexes profiles and the repo's ordered tag document transactionally wit
 It stages rows, performs the object store's conditional PUT inside that transaction, records the
 returned ETag, then commits. A failed PUT rolls back. A read detects a newer repo-file ETag and repairs
 that repository's index, including a process loss after PUT but before COMMIT. Its indexed endpoint
-is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8`; the response has `release`,
-`commit`, `variant`, `header`, `profile` and `reasons`. No fitting variant is HTTP200 with null fields;
+is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8`; the response has `rule`,
+`release`, `commit`, `variant`, `header`, `profile` and `reasons`. A client takes only an answer of its
+own rule version (2), else reads the headers. No fitting variant is HTTP200 with null fields;
 invalid bits is HTTP400. Read permissions and explicit yanked-tag behavior match ordinary resolution.
 The current index covers commits named by repo tags. An untagged retained commit can be readable
 without a selection index entry; HTTP404 from this optional route does not establish that the

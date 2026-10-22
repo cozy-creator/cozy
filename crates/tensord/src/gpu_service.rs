@@ -889,14 +889,6 @@ impl Pool {
             .map(|d| self.inventory(&d.entry).map_or("", |g| g.compute_cap.as_str())).collect();
         crate::precision::Gpus::of(&ccs)
     }
-    /// The lane rule's budget on the first `degree` GPUs (design §2.1): the smallest one's memory
-    /// less a quarter of it for activations. None when the inventory names no memory.
-    pub fn budget(&self, degree: u32) -> Option<u64> {
-        let lane = &self.devices[..self.devices.len().min(degree as usize)];
-        let memory = lane.iter().map(|d| self.inventory(&d.entry).map(|g| g.memory_bytes)).min()??;
-        let memory = self.config.gpu_memory_limit.map_or(memory, |limit| memory.min(limit));
-        Some(memory - memory / 4)
-    }
     fn inventory(&self, entry: &str) -> Option<&crate::machine::receipt::Gpu> {
         self.config.inventory.iter().find(|g| g.device_index.to_string() == entry || g.device_uuid == entry)
     }

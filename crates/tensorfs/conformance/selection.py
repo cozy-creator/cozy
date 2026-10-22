@@ -24,8 +24,9 @@ def profile(header):
             else:
                 kind, size = tensor["dtype"], tensor["data"]["length"]
             held[kind] += size
-    dominant = min(held, key=lambda kind: (-held[kind], kind)) if held else ""
-    name, width = family(dominant)
+    lanes = [kind for kind in held if family(kind)[1]]
+    lane = min(lanes, key=lambda kind: (family(kind)[1], -held[kind], kind)) if lanes else ""
+    name, width = family(lane)
     return dict(family=name, bits=width, bytes=sum(held.values()), kinds=sorted(held))
 
 
