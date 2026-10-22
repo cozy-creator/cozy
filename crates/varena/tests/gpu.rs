@@ -2191,6 +2191,210 @@ fn measured_small(mem: &Memory, m: SetId) {
     step!();
 }
 
+/// The native allocator's protocol (tensorfs-py's allocator.rs) on raw driver calls, under `torch` (torch's allocator
+/// lock, holding the bytes its segments hold): a segment is admitted against Memory's allocator limit and cut with
+/// cuMemAlloc. Past the limit, or on a real OOM, the callback (`reclaim_allocation`) runs inside the lock, and the
+/// allocation retries while each try finds the state changed and the callback reclaimed something. None: refused.
+fn segment(mem: &Memory, r: &Request, set: SetId, torch: &parking_lot::Mutex<u64>, size: u64, callbacks: &Timings) -> Option<(u64, varena::memory::Resident)> {
+    let mut held = torch.lock();
+    let d = cuda::driver().unwrap();
+    let mut last = None;
+    loop {
+        let limit = mem.allocator_limit()?;
+        if *held + size <= limit {
+            let change = mem.physical_change();
+            let mut ptr = 0;
+            let rc = unsafe { (d.mem_alloc)(&mut ptr, size as usize) };
+            if rc == cuda::SUCCESS {
+                let resident = mem.resident(size);
+                change.finish();
+                *held += size;
+                return Some((ptr, resident));
+            }
+            assert_eq!(rc, cuda::ERROR_OUT_OF_MEMORY, "cuMemAlloc");
+            change.finish();
+        }
+        if last == Some((*held, limit)) {
+            return None;
+        }
+        last = Some((*held, limit));
+        let torch_now = Torch { allocated: *held, reserved: *held };
+        if callbacks.time("reclaim_allocation", || r.reclaim_allocation(Some(set), size, torch_now)).unwrap_or(0) == 0 {
+            return None;
+        }
+    }
+}
+
+/// Frees a segment as the native allocator's worker does: after its stream's work, outside the allocator lock, then
+/// gives its bytes back to the lock's count.
+fn unsegment(torch: &parking_lot::Mutex<u64>, (ptr, resident): (u64, varena::memory::Resident), size: u64) {
+    assert_eq!(unsafe { (cuda::driver().unwrap().mem_free)(ptr) }, cuda::SUCCESS, "cuMemFree");
+    drop(resident);
+    *torch.lock() -= size;
+}
+
+/// Review 6 F4: the allocator callback unmaps and releases idle pages (cuMemUnmap, cuMemRelease) inside torch's
+/// allocator lock. Two threads allocate as the native allocator does, under one lock, on a card capped at 1 GiB (a
+/// small card: a few segments reach its limit). A keeps its segments, so past the limit each of its allocations runs
+/// the callback. B allocates, writes and frees. Meanwhile an unrelated stream is gated and a kernel reads a pinned page.
+/// Pass conditions:
+/// - Neither thread waits on the gated stream: no deadlock.
+/// - Nothing faults, and the pinned page is never taken.
+/// - The bytes reconcile: the callbacks unmapped exactly the idle pages, and the driver got their bytes back.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated_device_work() {
+    let (b, g, uuid) = card("callback");
+    step!();
+    // 1 GiB: a card small enough that a few segments reach its allocator limit.
+    let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let pages = 64;
+    let idle = mem.load(bulk("idle", pages, &g.uuid), Level::Ram).unwrap();
+    step!();
+    let w = mem.load(set("w", 1, Fill::Stored, &g.uuid, |b| block(95, b)), Level::Ram).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["idle", "w"]])).unwrap();
+    step!();
+    // The idle set mapped and released: complete, never-kept pages the callback may take.
+    let mut warm = std::time::Duration::ZERO;
+    for p in 0..pages {
+        let t = std::time::Instant::now();
+        drop(mem.bind(idle, p, 0).unwrap());
+        warm = warm.max(t.elapsed());
+    }
+    step!();
+    let (x, y, gated) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
+    step!();
+    let pinned = mem.bind(w, 0, x.raw()).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, 16).unwrap();
+    step!();
+    let sweep = warm * pages * 10;
+    assert_eq!(launch(c"sweep", &[pinned.ptr, REGION_ALIGN / 8, sweep.as_nanos() as u64, out.ptr()], x.raw()), cuda::SUCCESS);
+    step!();
+    let _ = mem.torch_limit();
+    step!();
+    let (start_free, start_limit, unmaps) = (driver_free(), mem.allocator_limit().unwrap(), timings.count("unmap"));
+    step!();
+    let mut gate = Some(Gate::hold(gated.raw()));
+    step!();
+    let torch = parking_lot::Mutex::new(0u64);
+    let callbacks = Timings::default();
+    let (calls, longest, done) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(warm.as_nanos() as u64), std::sync::atomic::AtomicBool::new(false));
+    // Where each thread is: 0 between calls, 1 allocating (the allocator lock's path), 2 writing, 3 freeing.
+    let phase = [std::sync::atomic::AtomicU8::new(0), std::sync::atomic::AtomicU8::new(0)];
+    let at = |thread: usize, where_: u8| phase[thread].store(where_, std::sync::atomic::Ordering::Release);
+    let timed = |t: std::time::Instant| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        longest.fetch_max(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::AcqRel);
+    };
+    let (kept, churned, waited) = std::thread::scope(|s| {
+        let a = s.spawn(|| {
+            let (_, ctx) = cuda::primary_context(0).unwrap();
+            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+            let mut kept = vec![];
+            // One segment up to near the limit, then a page's worth at a time: each past it runs the callback.
+            let near = mem.allocator_limit().unwrap().saturating_sub(2 * REGION_ALIGN);
+            let t = std::time::Instant::now();
+            at(0, 1);
+            kept.extend(segment(&mem, &r, idle, &torch, near, &callbacks).map(|seg| (seg, near)));
+            at(0, 0);
+            timed(t);
+            loop {
+                let t = std::time::Instant::now();
+                at(0, 1);
+                let got = segment(&mem, &r, idle, &torch, REGION_ALIGN, &callbacks);
+                at(0, 0);
+                timed(t);
+                let Some(seg) = got else { break };
+                kept.push((seg, REGION_ALIGN));
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+            kept
+        });
+        let b = s.spawn(|| {
+            let (_, ctx) = cuda::primary_context(0).unwrap();
+            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+            let d = cuda::driver().unwrap();
+            let mut churned = (0u64, 0u64);
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                let t = std::time::Instant::now();
+                at(1, 1);
+                match segment(&mem, &r, idle, &torch, REGION_ALIGN, &callbacks) {
+                    Some(seg) => {
+                        at(1, 2);
+                        assert_eq!(unsafe { (d.memset_d8_async)(seg.0, 9, REGION_ALIGN as usize, y.raw() as cuda::CUstream) }, cuda::SUCCESS);
+                        y.drain().unwrap();
+                        at(1, 3);
+                        unsegment(&torch, seg, REGION_ALIGN);
+                        churned.0 += 1;
+                    }
+                    None => churned.1 += 1,
+                }
+                at(1, 0);
+                timed(t);
+            }
+            churned
+        });
+        // Looks every interval of the longest call so far: two with no call done mean a thread waits, and where each
+        // thread is says on what. Then the gate opens, so the case ends either way.
+        let (mut seen, mut quiet, mut waited) = (0, 0, None);
+        while !(a.is_finished() && b.is_finished()) {
+            std::thread::sleep(std::time::Duration::from_nanos(longest.load(std::sync::atomic::Ordering::Acquire)));
+            let now = calls.load(std::sync::atomic::Ordering::Acquire);
+            quiet = if now == seen { quiet + 1 } else { 0 };
+            seen = now;
+            if quiet == 2 && gate.is_some() {
+                waited = Some([0, 1].map(|t| phase[t].load(std::sync::atomic::Ordering::Acquire)));
+                gate.take();
+            }
+        }
+        (a.join().unwrap(), b.join().unwrap(), waited)
+    });
+    step!();
+    gate.take();
+    step!();
+    let (sx, sy, sg) = (x.drain(), y.drain(), gated.drain());
+    step!();
+    for (seg, size) in kept {
+        unsegment(&torch, seg, size);
+    }
+    step!();
+    let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
+    step!();
+    let (gained, raised) = (driver_free().saturating_sub(start_free), mem.allocator_limit().unwrap().saturating_sub(start_limit));
+    step!();
+    println!("CALLBACK {} callbacks ({}); B churned {} segments, refused {}; unmapped {unmapped} B; driver gained {gained} B, allocator limit raised {raised} B; waited on the gated stream (phases A, B: 1 allocating, 2 writing, 3 freeing): {waited:?}",
+        callbacks.count("reclaim_allocation"), callbacks.report(), churned.0, churned.1);
+    step!();
+    // A free (cuMemFree, outside the lock, as the allocator's worker does) may wait for the device; the allocator
+    // lock's path may not.
+    assert!(!waited.is_some_and(|p| p.contains(&1)), "an allocation waited for the gated stream, inside the allocator lock: {waited:?}");
+    step!();
+    sx.unwrap();
+    sy.unwrap();
+    sg.unwrap();
+    step!();
+    assert!(callbacks.count("reclaim_allocation") > 0 && unmapped > 0, "the callback reclaimed idle pages");
+    step!();
+    assert!(exact(&pinned, &block(95, 0), 0), "the pinned page was never taken");
+    step!();
+    // The idle pages are what the callbacks took, and the driver has their bytes back (to the page: the driver keeps
+    // its own small allocations).
+    assert!(unmapped <= u64::from(pages) * REGION_ALIGN);
+    step!();
+    assert!(gained.abs_diff(unmapped) <= REGION_ALIGN, "the driver gained {gained} B for {unmapped} B unmapped");
+    step!();
+    drop(pinned);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS the allocator callback reclaims inside its lock without waiting for unrelated device work {uuid}");
+    step!();
+}
+
 /// A pass of `m` (two pinned blocks), measured smaller than its one-gibibyte activation, which meets a real OOM:
 /// the card is crowded and the rest full of an idle set. Returns the OOM answers and the record.
 fn first_run(mem: &Memory, m: SetId, idle: u32) -> (Vec<String>, Stats) {
