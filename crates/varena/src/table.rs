@@ -257,8 +257,12 @@ pub struct Req {
     /// The family it waits for while yielded (`crate::ledger` publishes it; 0: none).
     pub family: u64,
     pub episode: Episode,
+    /// Its room outside its passes (its setup, between passes) as measured for its dispatch
+    /// key; `None`: unmeasured (every idle byte is its, as for an unmeasured pass).
+    pub aside: Option<u64>,
     /// The last OOM answered Retry, by site: a second one there with no progress past it
-    /// escalates (lead, v6 13592: the whole decode re-ran at one level three times).
+    /// escalates (lead, v6 13592: the whole decode re-ran at one level three times). A pass's
+    /// end does not clear it: a failed try ends its passes too (S4's tiled decode).
     pub retried: Option<Retried>,
 }
 
@@ -394,6 +398,9 @@ pub struct Table {
     /// Own pages pinned only by varena's own short work (a RAM-tier copy, a Keep's protect):
     /// evictable again once it ends, so a demand waits for them before it degrades (review 4, N4).
     pub transient: u64,
+    /// The machine's largest measured outside room (any dispatch key): a GPU-level load leaves
+    /// it free even before a request opens.
+    pub aside: u64,
     /// Torch's allocator, as last measured (pass start and end, every OOM).
     pub allocated: u64,
     pub reserved: u64,
@@ -439,6 +446,21 @@ impl Table {
     /// A cache's nearest next use over the open requests and its sets.
     pub fn cache_distance(&self, c: &Cache) -> Option<(u32, u32, u32)> {
         self.requests.iter().flat_map(|r| c.sets.iter().filter_map(|s| r.cache_distance(*s))).min()
+    }
+
+    /// Bytes a GPU-level load leaves free: every open request's outside room and next measured
+    /// pass room, at least the machine's largest measured outside room; everything beside an
+    /// open request with either unmeasured.
+    pub fn held_back(&self) -> u64 {
+        let mut held = 0u64;
+        for r in &self.requests {
+            let next = r.rooms.get(r.cursor.step as usize).copied().flatten();
+            match (r.aside, next) {
+                (Some(aside), Some(room)) => held = held.saturating_add(aside).saturating_add(room),
+                _ => return u64::MAX,
+            }
+        }
+        held.max(self.aside)
     }
 
     /// Bytes this process could have now beside every W and P, evicting neither: the free

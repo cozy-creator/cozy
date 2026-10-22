@@ -73,6 +73,8 @@ fn apply(t: &mut Table, actions: &[Action], run: &mut Run, tried: &mut Tried, cl
                     t.requests[0].speculated.insert(*k);
                 }
             }
+            // Custody lets go; the page stays mapped, the allocator callback's.
+            Action::Lend(k) => t.page_mut(*k).unwrap().kept = false,
             Action::Starve(_) => t.requests[0].starved = true,
             Action::Lower(_) => {
                 t.requests[0].lowered = true;
@@ -131,14 +133,14 @@ fn demand(t: &mut Table, mut trigger: Trigger, run: &mut Run, clock: &mut u64) -
     loop {
         let actions = decide(t, &trigger);
         let mut tried = match &trigger {
-            Trigger::Prepare { tried, .. } | Trigger::Workspace { tried, .. } | Trigger::Bind { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } => tried.clone(),
+            Trigger::Prepare { tried, .. } | Trigger::Workspace { tried, .. } | Trigger::Bind { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } | Trigger::Outside { tried, .. } => tried.clone(),
             Trigger::Ask { .. } | Trigger::Load { .. } => Tried::default(),
         };
         if !apply(t, &actions, run, &mut tried, clock) {
             return actions;
         }
         match &mut trigger {
-            Trigger::Prepare { tried: t, .. } | Trigger::Workspace { tried: t, .. } | Trigger::Bind { tried: t, .. } | Trigger::Pass { tried: t, .. } | Trigger::Oom { tried: t, .. } | Trigger::Speculate { tried: t, .. } => *t = tried,
+            Trigger::Prepare { tried: t, .. } | Trigger::Workspace { tried: t, .. } | Trigger::Bind { tried: t, .. } | Trigger::Pass { tried: t, .. } | Trigger::Oom { tried: t, .. } | Trigger::Speculate { tried: t, .. } | Trigger::Outside { tried: t, .. } => *t = tried,
             Trigger::Ask { .. } | Trigger::Load { .. } => return actions,
         }
     }
