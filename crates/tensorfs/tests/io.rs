@@ -611,7 +611,7 @@ fn landed_tells_each_host_copy_once() {
 
 /// `ReadOpts::landed` on a device: each copy (staged from host memory in several pieces, staged
 /// from a file, a direct zero fill, an empty one, a small one) is heard of exactly once, and when
-/// it is, its bytes on the device are already the source's (read back in the callback itself).
+/// it is, all its bytes on the device are already the source's (read back in the callback itself).
 #[test]
 #[ignore = "requires an allocated CUDA GPU; no mock driver"]
 fn landed_tells_each_device_copy_once_after_its_bytes_land() {
@@ -646,7 +646,7 @@ fn landed_tells_each_device_copy_once_after_its_bytes_land() {
             let d = io::cuda::driver().unwrap();
             io::cuda::check("cuMemcpyDtoH", unsafe { (d.memcpy_dtoh)(back.as_mut_ptr().cast(), ptr, len) }).unwrap();
         }
-        heard.lock().unwrap().push((copy, back == want[copy]));
+        heard.lock().unwrap().push((copy, back.iter().zip(&want[copy]).filter(|(a, b)| a == b).count()));
     }));
     let dst = |i: usize| Dst::Device { device: 0, ptr: places[i].0, len: places[i].1, stream: 0 };
     let copies = [
@@ -660,6 +660,7 @@ fn landed_tells_each_device_copy_once_after_its_bytes_land() {
     unsafe { io::read(&copies, &opts) }.unwrap();
     let mut heard = checks.lock().unwrap().clone();
     heard.sort();
-    assert_eq!(heard, (0..5).map(|copy| (copy, true)).collect::<Vec<_>>(), "each copy once, its bytes landed when told");
-    println!("PASS landed tells each device copy once, after its bytes land");
+    let lens: Vec<usize> = expected.iter().map(Vec::len).collect();
+    assert_eq!(heard, lens.iter().copied().enumerate().collect::<Vec<_>>(), "each copy once, all its bytes landed when told");
+    println!("PASS landed: {} copies, {} calls, each copy's bytes all on the device at its call ({lens:?})", copies.len(), heard.len());
 }
