@@ -313,7 +313,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         // compatible pair once, shared by the published and captured installer paths.
         if sdk.requirements.is_empty() && paths.unselected_sdk() {
             sdk.default_sdk = Some(crate::machine::update::DefaultSdk::new(
-                engine.join("sdk/default"), sdk.uv.clone(), machine.clone()));
+                engine.join("sdk/default"), sdk.uv.clone(), sdk.python.clone(), machine.clone()));
         }
         sdk.owner_uv = crate::published::OwnerUv::of(protocol::config::environment());
         if sdk.owner_uv.is_some() {

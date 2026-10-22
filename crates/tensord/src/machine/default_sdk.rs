@@ -8,6 +8,8 @@ use std::{fs, io, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock}};
 pub struct DefaultSdk {
     root: PathBuf,
     uv: PathBuf,
+    /// The executors' Python, whose wheels it resolves.
+    python: String,
     machine: Arc<Machine>,
     resolving: Mutex<()>,
     chosen: OnceLock<Resolved>,
@@ -25,8 +27,8 @@ impl std::fmt::Debug for DefaultSdk {
 }
 
 impl DefaultSdk {
-    pub fn new(root: PathBuf, uv: PathBuf, machine: Arc<Machine>) -> Arc<Self> {
-        Arc::new(Self { root, uv, machine, resolving: Mutex::new(()), chosen: OnceLock::new() })
+    pub fn new(root: PathBuf, uv: PathBuf, python: String, machine: Arc<Machine>) -> Arc<Self> {
+        Arc::new(Self { root, uv, python, machine, resolving: Mutex::new(()), chosen: OnceLock::new() })
     }
 
     pub fn resolved(&self) -> Option<&Resolved> { self.chosen.get() }
@@ -34,7 +36,7 @@ impl DefaultSdk {
     pub fn resolve(&self, stop: Option<&Stop>) -> io::Result<&Resolved> {
         let stop = stop.cloned().unwrap_or_default();
         self.resolve_with(|directory| {
-            let solution = compile_sdk(&self.uv, "cozy-runtime>=0.31.0\ntensorfs>=0.14.0\n", &stop, true)?
+            let solution = compile_sdk(&self.uv, &self.python, "cozy-runtime>=0.31.0\ntensorfs>=0.14.0\n", &stop, true)?
                 .map_err(|why| io::Error::other(Coded { code: "package_sdk_incompatible", message: why }))?;
             artifacts(&solution)?.into_iter().map(|wheel| {
                 // uv selected the host tags. The existing downloader checks its exact digest;
@@ -169,7 +171,7 @@ mod tests {
 
     fn resolver(root: &Path) -> Arc<DefaultSdk> {
         let store = crate::storage::open(&root.join("store")).unwrap();
-        DefaultSdk::new(root.join("sdk/default"), "uv".into(), Machine::new(store, None).unwrap())
+        DefaultSdk::new(root.join("sdk/default"), "uv".into(), "3.12".into(), Machine::new(store, None).unwrap())
     }
 
     #[test]

@@ -3527,7 +3527,6 @@ struct Callbacks<'a> {
 }
 impl Services for Callbacks<'_> {
     fn progress(&mut self, frame: &Frame) {
-        self.pool.host.nudge();
         crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
     }
     fn request(
@@ -4007,7 +4006,7 @@ mod tests {
         let (root, pool, _engine) = pool_of(2);
         let binding = Binding { model_binding_path: "e.models.m".into(), release: "p@1".into(), ..Default::default() };
         let mut group = plan("film", 2);
-        group.slots = vec![PlanSlot { binding, lane: String::new(), selected_encoded_bytes: 0, on_demand: false, placeable: vec!["te".into()] }];
+        group.slots = vec![PlanSlot { binding, lane: String::new(), precision: String::new(), selected_encoded_bytes: 0, on_demand: false, placeable: vec!["te".into()] }];
         let homes = pool.homes(&group, pool.lane(0, 2).unwrap(), None);
         assert_eq!(homes, BTreeMap::from([("e.models.m".to_string(), BTreeMap::from([("te".to_string(), 0)]))]));
         assert!(pool.homes(&group, pool.lane(0, 1).unwrap(), None).is_empty());
