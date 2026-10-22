@@ -56,6 +56,13 @@ def select(profiles, constraints, model, plain):
     order = (["nvfp4"] if width == 4 and mma else [])
     order += (["int8"] if width <= 8 and int8 else []) + (["fp8"] if width <= 8 and fp8 else [])
     order += ["bf16", "fp16", "f32"] if bf16 else ["fp16", "bf16", "f32"]
+    # The owner's rule (10-22): with no explicit lane a sole variant is used, a GPU-less host
+    # included; GPUs present that cannot run it are an error; a kind this reader cannot decode
+    # stays refused.
+    if constraints.get("bits") is None and len(profiles) == 1:
+        path, p = next(iter(profiles.items()))
+        known = all(kind in plain or kind in supported for kind in p["kinds"])
+        return (path if known and (not devices or all(runs(kind) for kind in p["kinds"])) else None), []
     ranked = []
     for path, p in profiles.items():
         group = "nvfp4" if p["family"] in ("mxfp4", "int4") else p["family"]
