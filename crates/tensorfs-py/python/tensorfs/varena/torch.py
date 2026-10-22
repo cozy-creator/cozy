@@ -36,6 +36,9 @@ from torch.utils._pytree import tree_leaves
 
 from . import Exhausted, Fill, GpuId, Grant, Level, Next, Pass, Pin, Stats, VarenaError, Window, Yielded
 from . import Memory as Native
+from .._ext.varena import allocated as _allocated
+from .._ext.varena import allocator_stats as _allocator_stats
+from .. import _ext
 from . import Request as NativeRequest
 from . import Set
 
@@ -200,6 +203,8 @@ class _Pass:
     #: the exception being handled where it opened: another at its close is a raise
     entered: BaseException | None = None
     token: object = None
+    #: SPIKE: the pool's context while the pass allocates from it
+    pooled: object = None
 
 
 class Model:
@@ -295,7 +300,7 @@ _pass: ContextVar[_Pass | None] = ContextVar("varena_pass", default=None)
 class Memory:
     """This process's memory on one device: its models, caches and requests."""
 
-    def __init__(self, native: Native, device: torch.device) -> None:
+    def __init__(self, native: Native, device: torch.device, pool: bool = False) -> None:
         self.native, self.device = native, device
         self.cuda = device.type == "cuda"
         self.models: dict[nn.Module, Model] = {}
@@ -310,9 +315,17 @@ class Memory:
         self.capped: int | None = None
         if device.type != "cpu":
             native.trim_with(self.torch.trim)
+        #: SPIKE (pending the owner): passes allocate from a pool whose segments come from this
+        #: library's allocator, which asks varena for room on a shortfall instead of raising
+        self.pool: torch.cuda.MemPool | None = None
+        #: the largest torch reserve a pass held outside the pool (other threads' allocations)
+        self.outside = 0
+        if pool and self.cuda:
+            allocator = torch.cuda.memory.CUDAPluggableAllocator(_ext.__file__, "varena_torch_alloc", "varena_torch_free")
+            self.pool = torch.cuda.MemPool(allocator._allocator)
 
     @classmethod
-    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None) -> Memory:
+    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = False) -> Memory:
         """A TensorD executor's memory (`grant`), or a standalone engine's: the device's table by
         name, its capacity lowered to `limit` (the first opener sets it, a later one can only
         lower it). On CUDA the backend opens first and measures this process's context, so open
@@ -333,7 +346,7 @@ class Memory:
                 else:
                     ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
                     native = Native.host(GpuId("host", device.type, ram), grant, limit)
-                memory = _memories[key] = cls(native, device)
+                memory = _memories[key] = cls(native, device, pool)
         return memory
 
     @property
@@ -445,7 +458,13 @@ class Memory:
     def _cap(self, room: int = 0, start: bool = False) -> None:
         """torch's allocator cap. At a pass's start, the larger of `torch_limit` and the pass's
         measured `room`; otherwise, or beside another running pass, it only rises: a pass that
-        got its room never has its allocator churn against a smaller cap."""
+        got its room never has its allocator churn against a smaller cap. With the pool, its
+        segments ask varena themselves: no cap."""
+        if self.pool is not None:
+            if self.capped is None:
+                self.capped = self.torch.total
+                self.torch.cap(self.capped)
+            return
         want = max(self.native.torch_limit(), room)
         if not start or self.passes:
             want = max(want, self.capped or 0)
@@ -488,6 +507,10 @@ class Memory:
             p = _Pass(r.native.pass_(model.id, entry, shape, allocated, reserved), r, model.id, entry, shape, allocated, self.torch.churn())
             growth, slack = model.rooms.get((entry, shape), (0, 0))
             self._cap(allocated + growth + slack if growth or slack else 0, start=True)
+            if self.pool is not None:  # the pass's new segments ask its request for room
+                r.native.allocating(self.native, model.id, allocated, reserved)
+                p.pooled = torch.cuda.use_mem_pool(self.pool, self.device)
+                p.pooled.__enter__()
             p.entered = sys.exc_info()[1]
             self._fold()  # the passes open already keep what ran before; this one starts here
             with self.measuring:
@@ -500,6 +523,9 @@ class Memory:
             with self.measuring:
                 if p in self.passes:
                     self.passes.remove(p)
+            if p is not None and p.pooled is not None:
+                p.pooled.__exit__(None, None, None)
+                _allocated()
             raise
 
     def _close(self, model: Model) -> None:
@@ -512,6 +538,10 @@ class Memory:
         _pass.reset(p.token)  # type: ignore[arg-type]
         if model.common is not None:
             self._exit(model.common)
+        if p.pooled is not None:
+            p.pooled.__exit__(None, None, None)
+            _allocated()
+            self.outside = max(self.outside, self.torch.now()[1] - _allocator_stats()[0])
         self._fold()
         with self.measuring:
             self.passes.remove(p)

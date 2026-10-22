@@ -22,6 +22,8 @@ mod verification;
 mod resident_decode;
 #[cfg(feature = "store")]
 mod varena;
+#[cfg(feature = "store")]
+mod allocator;
 
 use pyo3::prelude::*;
 
