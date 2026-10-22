@@ -93,7 +93,15 @@ fn apply(t: &mut Table, actions: &[Action], run: &mut Run, tried: &mut Tried, cl
                 remote = true;
             }
             // Custody lets go at once here.
-            Action::Settle => remote = true,
+            Action::Settle => {
+                t.pending = 0;
+                for r in &mut t.others {
+                    r.classes[Class::P.index()] = r.classes[Class::P.index()].saturating_sub(r.returning);
+                    r.returning = 0;
+                }
+                remote = true;
+            }
+            Action::Workspace { bytes, .. } => t.promised += bytes,
             Action::Reserve { req, room, measured } => {
                 let r = t.request_mut(*req).unwrap();
                 r.room = *room;
@@ -110,14 +118,14 @@ fn demand(t: &mut Table, mut trigger: Trigger, run: &mut Run, clock: &mut u64) -
     loop {
         let actions = decide(t, &trigger);
         let mut tried = match &trigger {
-            Trigger::Bind { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } => tried.clone(),
+            Trigger::Prepare { tried, .. } | Trigger::Workspace { tried, .. } | Trigger::Bind { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } => tried.clone(),
             Trigger::Ask { .. } | Trigger::Load { .. } => Tried::default(),
         };
         if !apply(t, &actions, run, &mut tried, clock) {
             return actions;
         }
         match &mut trigger {
-            Trigger::Bind { tried: t, .. } | Trigger::Pass { tried: t, .. } | Trigger::Oom { tried: t, .. } | Trigger::Speculate { tried: t, .. } => *t = tried,
+            Trigger::Prepare { tried: t, .. } | Trigger::Workspace { tried: t, .. } | Trigger::Bind { tried: t, .. } | Trigger::Pass { tried: t, .. } | Trigger::Oom { tried: t, .. } | Trigger::Speculate { tried: t, .. } => *t = tried,
             Trigger::Ask { .. } | Trigger::Load { .. } => return actions,
         }
     }
