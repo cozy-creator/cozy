@@ -3010,7 +3010,7 @@ impl Inner {
             wanted.shrinks.iter().filter_map(|(id, b)| st.shrinks.get(id).map(|s| (*id, *b, s.clone()))).collect()
         };
         self.shrink(shrinks);
-        let st = self.state.lock();
+        let mut st = self.state.lock();
         self.publish(&mut st);
         drop(st);
         self.shared.ring();
