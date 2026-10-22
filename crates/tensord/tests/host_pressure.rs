@@ -8,7 +8,7 @@
 use platform::contain::host_pressure::{HostMode, Pressure};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},

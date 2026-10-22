@@ -49,9 +49,16 @@ pub fn need(ledgers: &[&crate::Ledger]) -> Need {
     Arc::new(move || tables.iter().map(|t| ledger::host_need(t)).sum())
 }
 
-/// The live host budget: what this process can still allocate before its tightest limit.
-fn budget() -> u64 {
-    u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0)
+/// Discretionary headroom includes the shipped measured non-tier growth reserve. This is
+/// observed demand, not a fixed floor; shmem growth from the tier itself is excluded.
+fn measured_budget() -> Budget {
+    let growth = Mutex::new(platform::contain::host_pressure::Growth::default());
+    Arc::new(move || {
+        let mut growth = growth.lock();
+        let host = platform::contain::host_memory::read();
+        let reserved = growth.observe(host);
+        u64::try_from(host.available).unwrap_or(0).saturating_sub(reserved)
+    })
 }
 
 /// The tier's one admission: a fill of `bytes` goes only into measured surplus, the live budget
@@ -84,7 +91,7 @@ fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget, conn: u64) ->
 /// A pressure event only says "look": rungs go back while the budget is below what the running
 /// calls must keep free (all of it while one is unmeasured), so benign reclaim at a limit gives
 /// nothing back.
-fn answer(state: &Shared, need: &Need) {
+fn answer(state: &Shared, need: &Need, budget: &Budget) {
     while budget() < need().unwrap_or(u64::MAX) {
         if relieve(state, HostTrigger::Pressure) == 0 {
             return;
@@ -355,6 +362,7 @@ pub struct Tier {
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// The host-short event's waiting end.
     short: Owned,
+    budget: Budget,
     /// The accept loop: the name is free once it ends.
     accepting: Option<std::thread::JoinHandle<()>>,
 }
@@ -376,16 +384,16 @@ impl Drop for Tier {
 impl Tier {
     /// Binds the machine's tier name and serves it, admitting fills against `need`; `None` when
     /// another participant does.
-    pub fn serve(pressure: Pressure, need: Need) -> Result<Option<Tier>> {
+    pub fn serve(mut pressure: Pressure, need: Need) -> Result<Option<Tier>> {
         let Some(tier) = Tier::bind(need.clone())? else { return Ok(None) };
         if matches!(pressure, Pressure::Headroom) {
             return Ok(Some(tier));
         }
-        let (state, stop) = (tier.state.clone(), tier.stop.clone());
+        let (state, stop, budget) = (tier.state.clone(), tier.stop.clone(), tier.budget.clone());
         std::thread::Builder::new()
             .name("varena-pressure".into())
             .spawn(move || loop {
-                let woke = match &pressure {
+                let woke = match &mut pressure {
                     Pressure::Host(p) => p.wait().map_err(Error::from),
                     Pressure::Events(e) => os::await_event(e),
                     Pressure::Headroom => return,
@@ -393,14 +401,14 @@ impl Tier {
                 if woke.is_err() || stop.load(Acquire) {
                     return;
                 }
-                answer(&state, &need);
+                answer(&state, &need, &budget);
             })
             .map_err(|e| Error::io("spawn pressure", e))?;
         Ok(Some(tier))
     }
 
     fn bind(need: Need) -> Result<Option<Tier>> {
-        Self::bind_with(need, Arc::new(budget))
+        Self::bind_with(need, measured_budget())
     }
 
     fn bind_with(need: Need, budget: Budget) -> Result<Option<Tier>> {
@@ -409,7 +417,7 @@ impl Tier {
         let signal = os::dup(&short)?;
         let state = Arc::new((Mutex::new(State { short: Some(signal), ..State::default() }), Condvar::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (s, halt) = (state.clone(), stop.clone());
+        let (s, halt, available) = (state.clone(), stop.clone(), budget.clone());
         let accepting = std::thread::Builder::new()
             .name("varena-tier".into())
             .spawn(move || {
@@ -417,12 +425,12 @@ impl Tier {
                     if halt.load(Acquire) {
                         return;
                     }
-                    let (s, need, budget) = (s.clone(), need.clone(), budget.clone());
+                    let (s, need, budget) = (s.clone(), need.clone(), available.clone());
                     let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s, &need, &budget));
                 }
             })
             .map_err(|e| Error::io("spawn tier", e))?;
-        Ok(Some(Tier { state, stop, short, accepting: Some(accepting) }))
+        Ok(Some(Tier { state, stop, short, budget, accepting: Some(accepting) }))
     }
 
     /// The layouts holding any ready region (status).
@@ -891,9 +899,6 @@ impl Client {
             _ => None,
         }
     }
-
-    // Removed with the paired Memory caller change: a fill must hold reserve()'s permit.
-    pub fn room(&self, bytes: u64) -> bool { self.reserve(bytes).is_some() }
 
     /// Every layout's resident bytes in the tier, together (0 when it cannot be asked).
     pub fn resident(&self) -> u64 {
