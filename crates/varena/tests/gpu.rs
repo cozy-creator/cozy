@@ -1077,7 +1077,9 @@ fn time_calls() {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Layer;
         let only = tracing_subscriber::filter::Targets::new().with_target("varena::cuda", tracing::Level::TRACE);
-        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Calls.with_filter(only))).unwrap();
+        let errors = tracing_subscriber::filter::Targets::new().with_target("varena::memory", tracing::Level::DEBUG);
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Calls.with_filter(only))
+            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_filter(errors))).unwrap();
     });
 }
 
@@ -1209,6 +1211,7 @@ fn plan(steps: &[&[&str]]) -> Plan {
 }
 
 fn memory(b: CudaBackend, g: &GpuId) -> Memory {
+    time_calls();
     Memory::open(g.clone(), None, Box::new(b)).unwrap()
 }
 
@@ -2122,6 +2125,12 @@ fn role_agent() {
                 pins.clear();
                 "ok".into()
             }
+            ["settle"] => {
+                assert_eq!(synchronize(), cuda::SUCCESS);
+                m().torch_limit();
+                m().settle();
+                "ok".into()
+            }
             ["end", req] => {
                 passes.remove(*req);
                 let s = requests.remove(*req).unwrap().end();
@@ -2303,6 +2312,8 @@ fn kept_pages_survive_a_holder_that_served() {
     step!();
     a.ok("end r");
     step!();
+    a.ok("settle");
+    step!();
     a.child.kill().unwrap();
     step!();
     a.child.wait().unwrap();
@@ -2394,8 +2405,11 @@ fn the_tier_takes_back_a_pinned_layout() {
     step!();
     let signal = event.try_clone().unwrap();
     step!();
-    // No call runs beside the tier here: it keeps nothing free for one.
-    let tier = varena::Tier::serve(varena::Pressure::Events(event), Arc::new(|| Some(0))).unwrap().expect("no other participant serves this user's RAM tier");
+    let unmeasured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let demand = unmeasured.clone();
+    let tier = varena::Tier::serve(varena::Pressure::Events(event), Arc::new(move ||
+        if demand.load(std::sync::atomic::Ordering::Acquire) { None } else { Some(0) }
+    )).unwrap().expect("no other participant serves this user's RAM tier");
     step!();
     let digest = |n: &str| format!("{n}-2-{}", g.uuid);
     step!();
@@ -2414,14 +2428,19 @@ fn the_tier_takes_back_a_pinned_layout() {
     step!();
     assert!(resident(&digest("p1")) >= 2 * REGION_ALIGN && resident(&digest("p2")) >= 2 * REGION_ALIGN);
     step!();
+    // An unmeasured call needs the host headroom; the event asks the tier to reevaluate it.
+    unmeasured.store(true, std::sync::atomic::Ordering::Release);
     // SAFETY: an 8-byte write to our eventfd.
     unsafe { libc::write(signal.as_raw_fd(), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
     step!();
-    tier.await_releases(1);
+    let mut released = 0;
+    while resident(&digest("p1")) + resident(&digest("p2")) > 0 {
+        released = tier.await_releases(released + 1);
+    }
     step!();
-    assert!(resident(&digest("p1")) < REGION_ALIGN, "the pinned layout's regions returned: {}", resident(&digest("p1")));
+    assert_eq!(resident(&digest("p1")), 0, "the pinned layout's regions returned");
     step!();
-    assert!(resident(&digest("p2")) >= 2 * REGION_ALIGN, "the next one is untouched");
+    assert_eq!(resident(&digest("p2")), 0, "unmeasured demand releases the other cached layout too");
     step!();
     assert!(tier.acked() >= REGION_ALIGN, "y unregistered and unmapped the region it had read when asked: {}", tier.acked());
     step!();

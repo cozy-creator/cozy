@@ -22,6 +22,9 @@ pub struct Tried {
     pub cut: BTreeSet<String>,
     /// Bytes this demand's earlier rounds freed, own unmaps and remote answers alike.
     pub freed: u64,
+    /// A physical page allocation failed at this unchanged free-byte estimate. Retry only
+    /// after making additional room; the driver's OOM overrides the estimate.
+    pub failed_free: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +112,8 @@ pub fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> {
     crate::faults::hit(crate::faults::Point::Decide);
     match trigger {
         Trigger::Bind { page, req, tried } => {
-            let need = t.page(*page).map_or(0, |p| p.bytes);
+            let bytes = t.page(*page).map_or(0, |p| p.bytes);
+            let need = tried.failed_free.map_or(bytes, |free| bytes.max(free.saturating_add(1)));
             let mut d = Demand::new(t, need, *req, Some(*page), tried);
             if d.run(Rungs::Bind) == Some(Done::Enough) {
                 d.out.push(Action::Map(*page));

@@ -1938,13 +1938,12 @@ impl Inner {
             if matches!(trigger, Trigger::Oom { .. }) {
                 st.table.headroom = u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0);
             }
-            // A page whose create fell short, measured the same again: nothing more is known.
-            if let Trigger::Bind { page, .. } = &trigger {
-                if let Some((need, at)) = st.short.remove(page) {
-                    if at == st.table.free() {
-                        self.unlock(st);
-                        return Ok(vec![Action::Exhausted { need }]);
-                    }
+            // A real allocation failure can precede an unchanged free-byte report (driver
+            // metadata, granularity or delayed release). Try the ordinary eviction ladder
+            // for additional room instead of declaring exhaustion while idle pages remain.
+            if let Trigger::Bind { page, tried, .. } = &mut trigger {
+                if let Some((_, at)) = st.short.remove(page) {
+                    if at == st.table.free() { tried.failed_free = Some(at); }
                 }
             }
             let actions = decide(&st.table, &trigger);
@@ -3536,7 +3535,11 @@ impl Inner {
                     match e {
                         // The device had less than the table showed: the bind measures and
                         // decides again.
-                        Error::Device { code: crate::backend::OUT_OF_MEMORY, .. } => {
+                        error @ Error::Device { code: crate::backend::OUT_OF_MEMORY, .. } => {
+                            tracing::debug!(target: "varena::memory", ?key, ?error, span, decided,
+                                estimated_free = st.table.free(), mapped = st.table.mapped(),
+                                pending = st.table.pending, inflight = st.table.inflight,
+                                "physical allocation refused; another bind must make progress");
                             st.short.insert(key, (span, decided.unwrap_or(0)));
                         }
                         e => drop(st.failed.insert(key, e)),
