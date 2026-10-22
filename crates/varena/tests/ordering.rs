@@ -491,6 +491,7 @@ impl Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         varena::os::remove_table(&self.uuid);
+        varena::tier::remove_claims();
     }
 }
 

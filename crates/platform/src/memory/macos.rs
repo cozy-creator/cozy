@@ -388,15 +388,3 @@ pub fn stalled(pid: u32, _tid: u32) -> bool {
     let got = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
     got == size && matches!(info.pbi_status, libc::SSTOP | libc::SZOMB)
 }
-
-/// A process's high-water is measured on Linux only (`/proc`): here a call is unmeasured,
-/// and the RAM tier (Linux's) is absent anyway.
-pub fn high_water() -> Option<u64> {
-    None
-}
-
-pub fn reset_high_water() {}
-
-pub fn anon(_: u32) -> Option<u64> {
-    None
-}

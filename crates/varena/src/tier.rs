@@ -2,65 +2,135 @@
 //! read-only (and page-locked, region by region) by executors, held by whichever participant
 //! binds the machine's tier name (TensorD when present). An executor fills a region it misses
 //! through `io::read` under the region's write lock, and copies from a ready region under its
-//! read lock, so a region in flight is locked. Under pressure (an event, or a headroom check
-//! before a fill) [`host_decide`] picks what goes: orphaned layouts (least recently used), then
-//! layouts with no declared use, then the furthest declared; never a region in flight. Each
-//! executor mapping a chosen layout is asked first, through its row's ask thread, to unpin and
-//! unmap it, so the pages really return when the tier punches them out.
+//! read lock, so a region in flight is locked. Under pressure (the platform's host pressure
+//! watcher, the one TensorD arms, or a headroom check before a fill), while the live budget is
+//! below what the running calls must keep free ([`Keep`]), [`host_decide`] picks what goes:
+//! orphaned layouts (least recently used), then layouts with no declared use, then the furthest
+//! declared; never a region in flight. Each executor mapping a chosen layout is asked first,
+//! through its row's ask thread, to unpin and unmap it, so the pages really return when the tier
+//! punches them out.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Condvar, Mutex};
+use platform::contain::host_memory;
+use platform::contain::host_pressure::{Growth, HostMode, Nudge, Pressure};
 use platform::handles::Owned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::ledger;
+use crate::ledger::{self, HostCall};
 use crate::os::{self, Map, Stream};
 use crate::{Error, Result};
 
-/// Where pressure comes from.
-pub enum Pressure {
-    /// The host's PSI trigger and cgroup events.
-    Host(platform::contain::host_pressure::Pressure),
-    /// A descriptor that turns readable on pressure (an eventfd).
-    Events(Owned),
-    /// No event source: only the headroom check at every host decision.
-    Headroom,
-}
-
 const NAME: &str = "tier";
 
-/// What the host must keep free for the calls running on it: their measured host growth still
-/// to come (each one's recorded high-water less its process's anonymous bytes now). `None`: a
-/// running call is unmeasured, and the tier fills nothing beside it. TensorD sums its GPUs'
-/// ([`crate::Ledger::host_need`]); an executor serving the tier itself, its own GPU's.
-pub type Need = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+/// The processes running requests on the host, as the tier's need reads them; `None`: a GPU's
+/// table cannot be read (unmeasured). TensorD's are its GPUs' ([`need`]); an executor serving
+/// the tier itself, its own GPU's.
+pub type Need = Arc<dyn Fn() -> Option<Vec<HostCall>> + Send + Sync>;
 
-// The live OS source in production; deterministic headroom in isolated service tests.
-type Budget = Arc<dyn Fn() -> i128 + Send + Sync>;
+// The live OS budget in production; deterministic headroom in isolated service tests. `None`:
+// unreadable, no measure.
+type Budget = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
-/// TensorD's need source: what the requests running on its GPUs keep free, summed (`None`
-/// while any is unmeasured).
+/// TensorD's need source: the processes running requests on its GPUs.
 pub fn need(ledgers: &[&crate::Ledger]) -> Need {
     let tables: Vec<Arc<ledger::Shared>> = ledgers.iter().map(|l| l.table()).collect();
-    Arc::new(move || tables.iter().map(|t| ledger::host_need(t)).sum())
+    Arc::new(move || tables.iter().map(|t| ledger::host_calls(t)).collect::<Option<Vec<_>>>().map(|calls| calls.concat()))
 }
 
-/// The live budget. `Growth` now takes calls' anonymous growth (6442e872e): the tier's need
-/// takes it in the port that follows.
-fn measured_budget() -> Budget {
-    Arc::new(|| i128::from(platform::contain::host_memory::read().available))
+/// The tightest limit's live room: shmem (the tier's layouts) and clean page cache are in it.
+fn live_budget() -> Budget {
+    Arc::new(|| u64::try_from(host_memory::read().available).ok())
+}
+
+/// What the host keeps free for the calls running on it: each process's anonymous growth still
+/// to come (its requests' measured anonymous peak less its anonymous bytes now) and [`Growth`],
+/// the most a look saw them grow past what was measured to come (an unmeasured call's every
+/// byte). Mapped layouts and page cache are never need: the budget holds them, once.
+struct Keep {
+    calls: Need,
+    /// Growth, and each process's requests running at the last look: each that ended settles it.
+    growth: Mutex<(Growth, BTreeMap<u32, u64>)>,
+}
+
+impl Keep {
+    fn new(calls: Need) -> Keep {
+        Keep { calls, growth: Mutex::new((Growth::default(), BTreeMap::new())) }
+    }
+
+    /// A look: what must stay free, and whether every running call is measured.
+    fn look(&self) -> (u64, bool) {
+        let calls = (self.calls)();
+        let mut measured = calls.is_some();
+        // A process with rows on several GPUs is one call.
+        let mut by: BTreeMap<u32, HostCall> = BTreeMap::new();
+        for call in calls.unwrap_or_default() {
+            by.entry(call.pid)
+                .and_modify(|seen| {
+                    seen.peak = seen.peak.zip(call.peak).map(|(a, b)| a.max(b));
+                    seen.running += call.running;
+                })
+                .or_insert(call);
+        }
+        let (mut need, mut unforeseen) = (0u64, BTreeMap::new());
+        for call in by.values() {
+            measured &= call.peak.is_some();
+            let peak = call.peak.unwrap_or(0);
+            need = need.saturating_add(peak.saturating_sub(call.anon));
+            unforeseen.insert(call.pid.to_string(), call.anon.saturating_sub(peak));
+        }
+        let mut held = self.growth.lock();
+        let (growth, running) = &mut *held;
+        for (pid, was) in running.iter() {
+            for _ in by.get(pid).map_or(0, |call| call.running)..*was {
+                growth.settle();
+            }
+        }
+        *running = by.values().map(|call| (call.pid, call.running)).collect();
+        (need.saturating_add(growth.observe(unforeseen)), measured)
+    }
+}
+
+/// The claim key of layout `digest`.
+fn layout_key(digest: &str) -> u64 {
+    let hash = Sha256::digest(digest.as_bytes());
+    hash.first_chunk::<8>().map_or(0, |b| u64::from_le_bytes(*b))
+}
+
+/// What admitted fills have still to fill: each layout's claims together, never more than its
+/// bytes not yet resident, so executors filling one layout reserve it once.
+fn reserved(claims: &BTreeMap<u64, u64>, unfilled: &BTreeMap<u64, u64>) -> u64 {
+    claims.iter().map(|(layout, bytes)| unfilled.get(layout).map_or(*bytes, |u| (*bytes).min(*u))).sum()
+}
+
+/// Each layout's bytes not yet resident, by claim key.
+fn unfilled(state: &Shared) -> BTreeMap<u64, u64> {
+    let s = state.0.lock();
+    s.layouts.iter().map(|(digest, l)| {
+        let size = l.data + l.regions.iter().map(|(o, s)| o + s).max().unwrap_or(0);
+        (layout_key(digest), size.saturating_sub(os::allocated(&l.fd)))
+    }).collect()
+}
+
+/// Tests only: removes this namespace's claim file (a test's own, once its tiers are gone).
+pub fn remove_claims() {
+    os::unlink(CLAIMS);
 }
 
 // One named claim file for this tier's host-pressure domain, shared by every GPU and
-// surviving service replacements. Each live client owns a read lock on one bytes record;
-// the metadata lock serializes scan, budget check and new lock/record publication.
+// surviving service replacements. Each live client owns a read lock on one record (its bytes
+// and its layout's key); the metadata lock serializes scan, budget check and new lock/record
+// publication.
 const CLAIMS: &str = "tier-claims";
-const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"vhrsv001");
+const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"vhrsv002");
 const CLAIM_WORD: u64 = 8;
+/// A record: its bytes, then its layout's key. The first is the header (the magic word).
+const RECORD: u64 = 2 * CLAIM_WORD;
 
 struct Claims {
     fd: Owned,
@@ -79,6 +149,7 @@ impl Drop for ClaimLock<'_> {
 enum Admission {
     Granted(Owned),
     Short { bytes: u64, headroom: u64 },
+    /// A running call is unmeasured, or the budget unreadable: nothing to admit against.
     Unmeasured,
 }
 
@@ -96,15 +167,15 @@ impl Claims {
             let size = os::size(&claims.fd)?;
             if size == 0 { os::resize(&claims.fd, platform_page())?; }
             let size = os::size(&claims.fd)?;
-            if size < platform_page() || !size.is_multiple_of(CLAIM_WORD) {
+            if size < platform_page() || !size.is_multiple_of(RECORD) {
                 return Err(Error::Closed("invalid host-reservation claim table".into()));
             }
             let map = os::map(&claims.fd, size as usize, true)?;
             let magic = claim_word(&map, 0);
             if magic.load(Acquire) == 0 && size == platform_page() {
-                // Complete an interrupted first creation only when no client owns a row.
-                for offset in (CLAIM_WORD..size).step_by(CLAIM_WORD as usize) {
-                    if os::held(&claims.fd, offset, CLAIM_WORD)? {
+                // Complete an interrupted first creation only when no client owns a record.
+                for offset in (RECORD..size).step_by(RECORD as usize) {
+                    if os::held(&claims.fd, offset, RECORD)? {
                         return Err(Error::Closed("uninitialized host claim table has live owners".into()));
                     }
                 }
@@ -124,7 +195,7 @@ impl Claims {
 
     fn view(&self) -> Result<Map> {
         let size = os::size(&self.fd)?;
-        if size < platform_page() || !size.is_multiple_of(CLAIM_WORD) {
+        if size < platform_page() || !size.is_multiple_of(RECORD) {
             return Err(Error::Closed("invalid host-reservation claim table".into()));
         }
         let map = os::map(&self.fd, size as usize, true)?;
@@ -134,11 +205,13 @@ impl Claims {
         Ok(map)
     }
 
-    fn scan(&self, map: &Map) -> Result<(u64, Option<u64>)> {
-        let (mut live, mut vacant) = (0u64, None);
-        for offset in (CLAIM_WORD..map.len as u64).step_by(CLAIM_WORD as usize) {
-            if os::held(&self.fd, offset, CLAIM_WORD)? {
-                live = live.saturating_add(claim_word(map, offset).load(Acquire));
+    /// The live claims' bytes by layout key, and the first vacant record.
+    fn scan(&self, map: &Map) -> Result<(BTreeMap<u64, u64>, Option<u64>)> {
+        let (mut live, mut vacant) = (BTreeMap::<u64, u64>::new(), None);
+        for offset in (RECORD..map.len as u64).step_by(RECORD as usize) {
+            if os::held(&self.fd, offset, RECORD)? {
+                let bytes = live.entry(claim_word(map, offset + CLAIM_WORD).load(Acquire)).or_default();
+                *bytes = bytes.saturating_add(claim_word(map, offset).load(Acquire));
             } else if vacant.is_none() {
                 vacant = Some(offset);
             }
@@ -146,20 +219,25 @@ impl Claims {
         Ok((live, vacant))
     }
 
-    fn live_bytes(&self) -> Result<u64> {
+    /// What admitted fills have still to fill ([`reserved`]).
+    fn live_bytes(&self, unfilled: &BTreeMap<u64, u64>) -> Result<u64> {
         let _lock = self.lock()?;
-        self.scan(&self.view()?).map(|(live, _)| live)
+        self.scan(&self.view()?).map(|(live, _)| reserved(&live, unfilled))
     }
 
-    fn admit(&self, need: &Need, bytes: u64, budget: &Budget) -> Result<Admission> {
+    /// A claim of `bytes` into `layout`, beside what must stay free and what admitted fills
+    /// have still to fill (its layout's with it, once).
+    fn admit(&self, keep: &Keep, layout: u64, bytes: u64, budget: &Budget, unfilled: &BTreeMap<u64, u64>) -> Result<Admission> {
         let _lock = self.lock()?;
-        let Some(keep) = need() else { return Ok(Admission::Unmeasured) };
+        let (need, measured) = keep.look();
+        let Some(mut room) = budget().filter(|_| measured) else { return Ok(Admission::Unmeasured) };
         let mut map = self.view()?;
-        let (pending, vacant) = self.scan(&map)?;
-        let want = keep.saturating_add(pending).saturating_add(bytes);
-        let mut room = budget();
+        let (mut claims, vacant) = self.scan(&map)?;
+        let with = claims.entry(layout).or_default();
+        *with = with.saturating_add(bytes);
+        let want = need.saturating_add(reserved(&claims, unfilled));
         let mut metadata = if vacant.is_none() { platform_page() } else { 0 };
-        if room >= i128::from(want) + i128::from(metadata) {
+        if room >= want.saturating_add(metadata) {
             let offset = if let Some(offset) = vacant { offset } else {
                 let offset = map.len as u64;
                 let size = offset.checked_add(platform_page()).ok_or_else(|| Error::Internal("host claim table overflow".into()))?;
@@ -168,30 +246,32 @@ impl Claims {
                 // Fault the new metadata page before re-reading actual headroom.
                 claim_word(&map, offset).store(0, Release);
                 metadata = 0; // This page is now in the observed OS budget, not future bytes.
-                room = budget();
+                let Some(now) = budget() else { return Ok(Admission::Unmeasured) };
+                room = now;
                 offset
             };
-            if room >= i128::from(want) {
+            if room >= want {
                 // Read-only rights are enough for a lifetime lock. The client receives no
                 // write access to another client's claim, and no explicit stale-ID free exists.
                 let lease = os::reopen(&self.fd, false)?;
-                if !os::share(&lease, offset, CLAIM_WORD, false)? {
+                if !os::share(&lease, offset, RECORD, false)? {
                     return Err(Error::Internal("host claim lock refused".into()));
                 }
+                claim_word(&map, offset + CLAIM_WORD).store(layout, Release);
                 claim_word(&map, offset).store(bytes, Release);
                 return Ok(Admission::Granted(lease));
             }
         }
-        let deficit = u64::try_from((-room).max(0)).unwrap_or(u64::MAX);
-        Ok(Admission::Short { bytes: want.saturating_add(metadata).saturating_add(deficit), headroom: u64::try_from(room).unwrap_or(0) })
+        Ok(Admission::Short { bytes: want.saturating_add(metadata), headroom: room })
     }
 }
 
-/// Atomically admit a fill into measured surplus. The record lock already exists before
-/// its fd is sent; queued SCM_RIGHTS keeps it alive even if the service dies before receipt.
-fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget, claims: &Claims) -> Result<Option<Owned>> {
+/// Atomically admit a fill of `bytes` into layout `digest` into measured surplus. The record
+/// lock already exists before its fd is sent; queued SCM_RIGHTS keeps it alive even if the
+/// service dies before receipt.
+fn admit(state: &Shared, keep: &Keep, digest: &str, bytes: u64, budget: &Budget, claims: &Claims) -> Result<Option<Owned>> {
     for attempt in 0..2 {
-        match claims.admit(need, bytes, budget)? {
+        match claims.admit(keep, layout_key(digest), bytes, budget, &unfilled(state))? {
             Admission::Granted(fd) => return Ok(Some(fd)),
             Admission::Unmeasured => return Ok(None),
             Admission::Short { bytes, headroom } if attempt == 0 => { relieve(state, HostTrigger::Room { bytes, headroom }); }
@@ -201,11 +281,17 @@ fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget, claims: &Clai
     Ok(None)
 }
 
-/// A pressure event only says look. Preserve signed growth deficits and every still-live
-/// future claim, including those granted by an earlier service holder.
-fn answer(state: &Shared, need: &Need, budget: &Budget, claims: &Claims) {
-    while budget() < i128::from(need().unwrap_or(u64::MAX)).saturating_add(i128::from(claims.live_bytes().unwrap_or(u64::MAX))) {
-        if relieve(state, HostTrigger::Pressure) == 0 { return; }
+/// A pressure event only says look: rungs go back while the budget is below what must stay free
+/// and what admitted fills have still to fill (an earlier service holder's grants too). An
+/// unmeasured call's need is what it was seen to grow; an unreadable budget or claim file is no
+/// look.
+fn answer(state: &Shared, keep: &Keep, budget: &Budget, claims: &Claims) {
+    loop {
+        let need = keep.look().0;
+        let (Ok(pending), Some(room)) = (claims.live_bytes(&unfilled(state)), budget()) else { return };
+        if room >= need.saturating_add(pending) || relieve(state, HostTrigger::Pressure) == 0 {
+            return;
+        }
     }
 }
 
@@ -219,8 +305,8 @@ enum Call {
     /// This process's next use of the layout, in steps; `None`: no declared use.
     Use { digest: String, distance: Option<u32> },
     Close { digest: String },
-    /// Make `bytes` of host headroom before a fill, giving back in order.
-    Room { bytes: u64 },
+    /// Make `bytes` of host headroom before a fill into layout `digest`, giving back in order.
+    Room { digest: String, bytes: u64 },
     /// Every layout's resident bytes, together.
     Resident,
 }
@@ -390,13 +476,17 @@ struct State {
     conns: HashMap<u64, Stream>,
     /// What pressure is answered against, while a watcher runs.
     press: Option<Press>,
+    /// The watcher's looks begun and answered, and whether it still watches.
+    begun: u64,
+    looked: u64,
+    watching: bool,
 }
 
 /// A pressure answer's figures, kept so a release that completes later (its users answered)
 /// looks again: one event gives back for as long as the host stays short.
 #[derive(Clone)]
 struct Press {
-    need: Need,
+    keep: Arc<Keep>,
     budget: Budget,
     claims: Arc<Claims>,
 }
@@ -503,7 +593,7 @@ fn acked(state: &Shared, digest: &str, conn: u64, freed: u64) {
     cv.notify_all();
     // The release completed: if the host is still short, the next rung goes.
     if let Some(p) = press {
-        answer(state, &p.need, &p.budget, &p.claims);
+        answer(state, &p.keep, &p.budget, &p.claims);
     }
 }
 
@@ -515,6 +605,9 @@ pub struct Tier {
     short: Owned,
     budget: Budget,
     claims: Arc<Claims>,
+    keep: Arc<Keep>,
+    /// Wakes the watcher, while one runs.
+    nudge: OnceLock<Nudge>,
     /// The accept loop: the name is free once it ends.
     accepting: Option<std::thread::JoinHandle<()>>,
 }
@@ -524,6 +617,7 @@ impl Drop for Tier {
     /// closes its users' connections, as its process's end would.
     fn drop(&mut self) {
         self.stop.store(true, Release);
+        self.nudge();
         let _ = os::connect(os::euid(), NAME);
         if let Some(accepting) = self.accepting.take() {
             let _ = accepting.join();
@@ -534,37 +628,71 @@ impl Drop for Tier {
 }
 
 impl Tier {
-    /// Binds the machine's tier name and serves it, admitting fills against `need`; `None` when
-    /// another participant does.
-    pub fn serve(pressure: Pressure, need: Need) -> Result<Option<Tier>> {
-        let Some(tier) = Tier::bind(need.clone())? else { return Ok(None) };
-        tier.watch(pressure, need)?;
+    /// Binds the machine's tier name and serves it, admitting fills against `need` and, with
+    /// `pressure`, giving back when the host asks; `None` when another participant does.
+    pub fn serve(pressure: Option<Pressure>, need: Need) -> Result<Option<Tier>> {
+        let Some(tier) = Tier::bind(need)? else { return Ok(None) };
+        if let Some(pressure) = pressure {
+            tier.watch(pressure)?;
+        }
         Ok(Some(tier))
     }
 
-    fn watch(&self, mut pressure: Pressure, need: Need) -> Result<()> {
-        if matches!(pressure, Pressure::Headroom) { return Ok(()); }
-        let (state, stop, budget, claims) = (self.state.clone(), self.stop.clone(), self.budget.clone(), self.claims.clone());
-        state.0.lock().press = Some(Press { need: need.clone(), budget: budget.clone(), claims: claims.clone() });
+    /// The watcher: one thread blocked until the host asks or a nudge comes, then a look.
+    fn watch(&self, mut pressure: Pressure) -> Result<()> {
+        let (state, stop) = (self.state.clone(), self.stop.clone());
+        let (keep, budget, claims) = (self.keep.clone(), self.budget.clone(), self.claims.clone());
+        {
+            let mut s = state.0.lock();
+            s.press = Some(Press { keep: keep.clone(), budget: budget.clone(), claims: claims.clone() });
+            s.watching = true;
+        }
+        let _ = self.nudge.set(pressure.nudge());
+        let watching = state.clone();
         std::thread::Builder::new()
             .name("varena-pressure".into())
-            .spawn(move || loop {
-                let woke = match &mut pressure {
-                    Pressure::Host(p) => p.wait().map_err(Error::from),
-                    Pressure::Events(e) => os::await_event(e).map_err(Error::from),
-                    Pressure::Headroom => return,
-                };
-                if woke.is_err() || stop.load(Acquire) {
-                    return;
+            .spawn(move || {
+                while pressure.wait().is_ok() && !stop.load(Acquire) {
+                    let look = {
+                        let mut s = state.0.lock();
+                        s.begun += 1;
+                        s.begun
+                    };
+                    answer(&state, &keep, &budget, &claims);
+                    state.0.lock().looked = look;
+                    state.1.notify_all();
                 }
-                answer(&state, &need, &budget, &claims);
+                state.0.lock().watching = false;
+                state.1.notify_all();
             })
-            .map_err(|e| Error::io("spawn pressure", e))?;
+            .map_err(|e| {
+                watching.0.lock().watching = false;
+                Error::io("spawn pressure", e)
+            })?;
         Ok(())
     }
 
+    /// Something happened (a call began, an executor's frame came): the watcher looks.
+    pub fn nudge(&self) {
+        if let Some(nudge) = self.nudge.get() {
+            nudge.send();
+        }
+    }
+
+    /// Nudges the watcher and blocks until a look begun since has answered, what it asked back
+    /// settled too; at once when nothing watches.
+    pub fn look(&self) {
+        let (lock, cv) = &*self.state;
+        let mut s = lock.lock();
+        let after = s.begun;
+        self.nudge();
+        while s.watching && (s.looked <= after || s.layouts.values().any(|l| l.pending.is_some())) {
+            cv.wait(&mut s);
+        }
+    }
+
     fn bind(need: Need) -> Result<Option<Tier>> {
-        Self::bind_with(need, measured_budget())
+        Self::bind_with(need, live_budget())
     }
 
     fn bind_with(need: Need, budget: Budget) -> Result<Option<Tier>> {
@@ -572,10 +700,11 @@ impl Tier {
         drop(os::tier_file("varena-tier-probe")?);
         let Some(listener) = os::listen(os::euid(), NAME)? else { return Ok(None) };
         let claims = Arc::new(Claims::open()?);
+        let keep = Arc::new(Keep::new(need));
         let (short, signal) = os::event()?;
         let state = Arc::new((Mutex::new(State { short: Some(signal), ..State::default() }), Condvar::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (s, halt, available, held_claims) = (state.clone(), stop.clone(), budget.clone(), claims.clone());
+        let (s, halt, available, held_claims, kept) = (state.clone(), stop.clone(), budget.clone(), claims.clone(), keep.clone());
         let accepting = std::thread::Builder::new()
             .name("varena-tier".into())
             .spawn(move || {
@@ -583,12 +712,12 @@ impl Tier {
                     if halt.load(Acquire) {
                         return;
                     }
-                    let (s, need, budget, claims) = (s.clone(), need.clone(), available.clone(), held_claims.clone());
-                    let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s, &need, &budget, &claims));
+                    let (s, keep, budget, claims) = (s.clone(), kept.clone(), available.clone(), held_claims.clone());
+                    let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s, &keep, &budget, &claims));
                 }
             })
             .map_err(|e| Error::io("spawn tier", e))?;
-        Ok(Some(Tier { state, stop, short, budget, claims, accepting: Some(accepting) }))
+        Ok(Some(Tier { state, stop, short, budget, claims, keep, nudge: OnceLock::new(), accepting: Some(accepting) }))
     }
 
     /// The layouts holding any ready region (status).
@@ -657,7 +786,7 @@ impl Tier {
     }
 }
 
-fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget, claims: &Claims) {
+fn serve(stream: Stream, state: &Shared, keep: &Keep, budget: &Budget, claims: &Claims) {
     // Only this user's processes: an abstract name has no permissions of its own.
     if os::peer(&stream).is_err() {
         return;
@@ -717,10 +846,10 @@ fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget, claims: &
                 }
                 (Reply::Done, None)
             }
-            Call::Room { bytes } => {
+            Call::Room { digest, bytes } => {
                 drop(s);
                 // Never waits: what nobody maps goes now; what executors map is asked back.
-                let lease = admit(state, need, bytes, budget, claims).unwrap_or_else(|e| {
+                let lease = admit(state, keep, &digest, bytes, budget, claims).unwrap_or_else(|e| {
                     tracing::warn!("varena tier admission refused: {e}");
                     None
                 });
@@ -1118,11 +1247,11 @@ impl Client {
         self.call(&Call::Close { digest: digest.into() }).map(|_| ())
     }
 
-    /// Host headroom for `bytes`, the tier giving back in order; false when it cannot now. A
-    /// connection of its own: a fill never waits behind another call.
-    pub fn reserve(&self, bytes: u64) -> Option<Permit> {
+    /// Host headroom for `bytes` of layout `digest`, the tier giving back in order; false when
+    /// it cannot now. A connection of its own: a fill never waits behind another call.
+    pub fn reserve(&self, digest: &str, bytes: u64) -> Option<Permit> {
         let stream = os::connect(self.ns, NAME).ok()??;
-        match os::call::<_, Reply>(&stream, &Call::Room { bytes }, None) {
+        match os::call::<_, Reply>(&stream, &Call::Room { digest: digest.into(), bytes }, None) {
             Ok((Reply::Room { ok: true }, Some(claim))) => {
                 let (done, extra) = os::recv(&stream).ok()??;
                 if !matches!(os::decode::<Reply>(&done), Ok(Reply::Done)) || extra.is_some() { return None; }
@@ -1153,11 +1282,7 @@ fn connect(ns: u32, need: &Need) -> Result<(Stream, Option<Tier>)> {
         if ns != os::euid() {
             return Err(Error::Closed("the RAM tier (its TensorD serves none)".into()));
         }
-        let mode = platform::contain::host_pressure::HostMode::Shared;
-        service = match platform::contain::host_pressure::Pressure::arm(mode) {
-            Ok(p) => Tier::serve(Pressure::Host(p), need.clone())?,
-            Err(_) => Tier::serve(Pressure::Headroom, need.clone())?,
-        };
+        service = Tier::serve(Pressure::arm(HostMode::Shared).ok(), need.clone())?;
     }
 }
 
@@ -1173,6 +1298,12 @@ mod reservation_tests {
         const ROLE: &str = "VARENA_TIER_RESERVATION_TEST";
         if std::env::var(ROLE).as_deref() == Ok(name) {
             assert!(os::namespace(&format!("tier-reservation-{}-", std::process::id())));
+            // Its claim file goes with it, passed or failed.
+            struct Claimed;
+            impl Drop for Claimed {
+                fn drop(&mut self) { remove_claims(); }
+            }
+            let _claimed = Claimed;
             run();
             return;
         }
@@ -1182,9 +1313,19 @@ mod reservation_tests {
         assert!(status.success(), "isolated tier case {name}: {status}");
     }
 
+    /// No running call.
+    fn none() -> Need {
+        Arc::new(|| Some(vec![]))
+    }
+
+    /// One running call: `peak` measured (`None`: unmeasured), `anon` bytes now.
+    fn call(peak: Option<u64>, anon: u64) -> HostCall {
+        HostCall { pid: 1, peak, anon, running: 1 }
+    }
+
     fn room(bytes: u64) -> (Option<Permit>, bool) {
-        let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
-        let permit = client.reserve(bytes);
+        let client = Client::open(os::euid(), none()).unwrap();
+        let permit = client.reserve("fill", bytes);
         let admitted = permit.is_some();
         (permit, admitted)
     }
@@ -1192,7 +1333,7 @@ mod reservation_tests {
     #[test]
     fn concurrent_fills_cannot_spend_the_same_surplus() {
         isolated("concurrent_fills_cannot_spend_the_same_surplus", || {
-            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(|| 6)).unwrap().unwrap();
+            let _tier = Tier::bind_with(none(), Arc::new(|| Some(6))).unwrap().unwrap();
             let (_first, admitted) = room(4);
             assert!(admitted);
             // The first fill has been admitted but has not touched its pages yet. Another
@@ -1205,7 +1346,7 @@ mod reservation_tests {
     fn await_promised(tier: &Tier, bytes: u64) {
         let (lock, changed) = &*tier.state;
         let mut state = lock.lock();
-        while tier.claims.live_bytes().unwrap() != bytes {
+        while tier.claims.live_bytes(&BTreeMap::new()).unwrap() != bytes {
             assert!(!changed.wait_for(&mut state, std::time::Duration::from_secs(5)).timed_out(), "reservation was not released");
         }
     }
@@ -1215,16 +1356,16 @@ mod reservation_tests {
         isolated("closing_a_permit_returns_only_the_promise_not_resident_pages", || {
             let available = Arc::new(AtomicU64::new(6));
             let sample = available.clone();
-            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(sample.load(Acquire)))).unwrap().unwrap();
-            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
-            let permit = client.reserve(4).unwrap();
-            assert!(client.reserve(4).is_none());
+            let tier = Tier::bind_with(none(), Arc::new(move || Some(sample.load(Acquire)))).unwrap().unwrap();
+            let client = Client::open(os::euid(), none()).unwrap();
+            let permit = client.reserve("fill", 4).unwrap();
+            assert!(client.reserve("fill", 4).is_none());
             available.store(2, Release); // The completed fill now occupies four physical bytes.
             drop(permit);
             await_promised(&tier, 0);
-            assert!(client.reserve(4).is_none(), "resident pages remain charged by live headroom");
+            assert!(client.reserve("fill", 4).is_none(), "resident pages remain charged by live headroom");
             available.store(6, Release); // Only actual reclaim restores them.
-            assert!(client.reserve(4).is_some());
+            assert!(client.reserve("fill", 4).is_some());
         });
     }
 
@@ -1232,12 +1373,12 @@ mod reservation_tests {
     fn a_dead_client_returns_its_unspent_reservation() {
         isolated("a_dead_client_returns_its_unspent_reservation", || {
             use std::io::BufRead;
-            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(|| 6)).unwrap().unwrap();
+            let tier = Tier::bind_with(none(), Arc::new(|| Some(6))).unwrap().unwrap();
             let address = format!("cozy-varena-{}-tier-reservation-{}-tier", os::euid(), std::process::id());
             let script = r#"import array,json,socket,struct,sys
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
 s.connect('\0'+sys.argv[1])
-b=json.dumps({'Room':{'bytes':4}}).encode()
+b=json.dumps({'Room':{'digest':'fill','bytes':4}}).encode()
 s.sendall(struct.pack('<I',len(b))+b'\0'+b)
 def read(n):
     b=b''
@@ -1277,15 +1418,15 @@ sys.stdin.read()
         isolated("unmeasured_calls_and_pending_fills_keep_their_headroom", || {
             let need = Arc::new(AtomicU64::new(3));
             let read = need.clone();
-            let tier = Tier::bind_with(Arc::new(move || match read.load(Acquire) { u64::MAX => None, n => Some(n) }), Arc::new(|| 8)).unwrap().unwrap();
-            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
-            assert!(client.reserve(6).is_none());
-            let permit = client.reserve(5).unwrap();
-            assert!(client.reserve(1).is_none());
+            let tier = Tier::bind_with(Arc::new(move || Some(vec![call(match read.load(Acquire) { u64::MAX => None, n => Some(n) }, 0)])), Arc::new(|| Some(8))).unwrap().unwrap();
+            let client = Client::open(os::euid(), none()).unwrap();
+            assert!(client.reserve("fill", 6).is_none());
+            let permit = client.reserve("fill", 5).unwrap();
+            assert!(client.reserve("fill", 1).is_none());
             drop(permit);
             await_promised(&tier, 0);
             need.store(u64::MAX, Release);
-            assert!(client.reserve(1).is_none(), "an unmeasured call permits no speculative fill");
+            assert!(client.reserve("fill", 1).is_none(), "an unmeasured call permits no speculative fill");
         });
     }
 
@@ -1293,10 +1434,10 @@ sys.stdin.read()
     fn a_drained_fill_failure_returns_only_its_unfinished_pages() {
         isolated("a_drained_fill_failure_returns_only_its_unfinished_pages", || {
             let page = platform_page();
-            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
-            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let tier = Tier::bind_with(none(), Arc::new(move || Some(8 * page))).unwrap().unwrap();
+            let client = Client::open(os::euid(), none()).unwrap();
             let held = client.open_layout("failed", vec![(0, page), (page, page)], "").unwrap();
-            let first = client.reserve(page).unwrap();
+            let first = client.reserve("fill", page).unwrap();
             held.fill(&[0], |dsts| {
                 for (_, dst) in dsts {
                     let tensorfs::io::Dst::Host { ptr, len } = dst else { unreachable!() };
@@ -1307,7 +1448,7 @@ sys.stdin.read()
             }).unwrap();
             drop(first);
             await_promised(&tier, 0);
-            let next = client.reserve(page).unwrap();
+            let next = client.reserve("fill", page).unwrap();
             let result = held.fill(&[0, 1], |dsts| {
                 assert_eq!(dsts.len(), 1, "ready pages must not be overwritten");
                 for (_, dst) in dsts {
@@ -1331,11 +1472,11 @@ sys.stdin.read()
     fn an_undrained_fill_keeps_its_destination_mapping_and_region_lock() {
         isolated("an_undrained_fill_keeps_its_destination_mapping_and_region_lock", || {
             let page = platform_page();
-            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
-            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let _tier = Tier::bind_with(none(), Arc::new(move || Some(8 * page))).unwrap().unwrap();
+            let client = Client::open(os::euid(), none()).unwrap();
             let held = client.open_layout("quarantined", vec![(0, page)], "").unwrap();
             let inspection = os::reopen(&held.fd, true).unwrap();
-            let permit = client.reserve(page).unwrap();
+            let permit = client.reserve("fill", page).unwrap();
             let pointer = AtomicU64::new(0);
             let result = held.fill(&[0], |dsts| {
                 let tensorfs::io::Dst::Host { ptr, .. } = dsts[0].1 else { unreachable!() };
@@ -1360,8 +1501,8 @@ sys.stdin.read()
     fn local_fillers_use_distinct_lock_descriptions() {
         isolated("local_fillers_use_distinct_lock_descriptions", || {
             let page = platform_page();
-            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
-            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let _tier = Tier::bind_with(none(), Arc::new(move || Some(8 * page))).unwrap().unwrap();
+            let client = Client::open(os::euid(), none()).unwrap();
             let held = Arc::new(client.open_layout("local-locks", vec![(0, page)], "").unwrap());
             let (entered, ready) = std::sync::mpsc::channel();
             let (release, done) = std::sync::mpsc::channel();
@@ -1387,34 +1528,86 @@ sys.stdin.read()
     fn a_released_layout_refuses_a_fill() {
         isolated("a_released_layout_refuses_a_fill", || {
             let page = platform_page();
-            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
-            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let _tier = Tier::bind_with(none(), Arc::new(move || Some(8 * page))).unwrap().unwrap();
+            let client = Client::open(os::euid(), none()).unwrap();
             let held = client.open_layout("released", vec![(0, page)], "").unwrap();
             held.release(|_| Ok(()));
             assert!(matches!(held.fill(&[0], |_| panic!("a released layout was written")), Err(Error::Closed(_))));
         });
     }
 
+    /// A call grown past its measure needs nothing more to come, but what it was seen to grow
+    /// between two looks stays free: the tier yields to it.
     #[test]
-    fn observed_growth_deficit_reclaims_even_with_zero_call_need() {
-        isolated("observed_growth_deficit_reclaims_even_with_zero_call_need", || {
+    fn growth_past_a_measure_reclaims_with_no_need_left() {
+        isolated("growth_past_a_measure_reclaims_with_no_need_left", || {
             let page = platform_page();
-            let budget = Arc::new(AtomicU64::new(8 * page));
-            let available = budget.clone();
-            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(available.load(Acquire)) - 1)).unwrap().unwrap();
-            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
-            let held = client.open_layout("growth", vec![(0, page)], "").unwrap();
-            held.fill(&[0], |dsts| {
-                let tensorfs::io::Dst::Host { ptr, len } = dsts[0].1 else { unreachable!() };
-                // SAFETY: this fill exclusively owns its mapped destination.
-                unsafe { std::ptr::write_bytes(ptr, 1, len) };
-                Ok(())
-            }).unwrap();
+            let anon = Arc::new(AtomicU64::new(4 * page));
+            let now = anon.clone();
+            let need: Need = Arc::new(move || Some(vec![call(Some(4 * page), now.load(Acquire))]));
+            let tier = Tier::bind_with(need, Arc::new(move || Some(page))).unwrap().unwrap();
+            let client = Client::open(os::euid(), none()).unwrap();
+            drop(filled(&client, "growth", ""));
             client.close("growth").unwrap();
-            budget.store(0, Release); // Need0, but measured growth exceeds live headroom.
-            let need: Need = Arc::new(|| Some(0));
-            answer(&tier.state, &need, &tier.budget, &tier.claims);
-            assert!(tier.held().is_empty(), "saturating a growth deficit to0 suppressed pressure reclaim");
+            answer(&tier.state, &tier.keep, &tier.budget, &tier.claims);
+            assert_eq!(tier.held(), ["growth"], "at its measure, nothing to keep free");
+            anon.store(6 * page, Release);
+            answer(&tier.state, &tier.keep, &tier.budget, &tier.claims);
+            assert!(tier.held().is_empty(), "two pages grown past the measure, one page of room");
+        });
+    }
+
+    /// Lead ruling (review 5): an unmeasured call fills nothing and drains nothing; a measured
+    /// shortfall gives back in order, an orphan before a layout its user is asked for.
+    #[test]
+    fn an_unmeasured_need_drains_nothing_and_a_measured_shortfall_releases_in_order() {
+        isolated("an_unmeasured_need_drains_nothing_and_a_measured_shortfall_releases_in_order", || {
+            use std::os::fd::AsRawFd;
+            let peak = Arc::new(Mutex::new(None::<u64>));
+            let measured = peak.clone();
+            let need: Need = Arc::new(move || Some(vec![call(*measured.lock(), 0)]));
+            let tier = Tier::bind_with(need, Arc::new(|| Some(0))).unwrap().unwrap();
+            let client = Client::open(os::euid(), none()).unwrap();
+            let listener = os::listen(os::euid(), "asked-user").unwrap().unwrap();
+            drop(filled(&client, "orphan", ""));
+            client.close("orphan").unwrap();
+            let _used = filled(&client, "used", "asked-user");
+            answer(&tier.state, &tier.keep, &tier.budget, &tier.claims);
+            assert_eq!(tier.held(), ["orphan", "used"], "an unmeasured call drained the tier");
+            assert!(client.reserve("fill", 1).is_none(), "an unmeasured call permits no fill");
+            *peak.lock() = Some(u64::MAX / 2);
+            answer(&tier.state, &tier.keep, &tier.budget, &tier.claims);
+            let mut incoming = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: poll only inspects the live listener descriptor; timeout only fails hangs.
+            assert_eq!(unsafe { libc::poll(&mut incoming, 1, 5000) }, 1);
+            let (ask, _) = listener.accept().unwrap();
+            assert!(os::recv(&ask).unwrap().is_some());
+            assert_eq!(tier.held(), ["used"], "the orphan went first, the used one is asked");
+            os::send(&ask, &(os::encode(&serde_json::json!({"freed": 0})).unwrap(), None)).unwrap();
+            let (lock, changed) = &*tier.state;
+            let mut state = lock.lock();
+            while state.layouts.values().any(Layout::holds) {
+                assert!(!changed.wait_for(&mut state, std::time::Duration::from_secs(5)).timed_out(), "the asked layout never went back");
+            }
+        });
+    }
+
+    /// Executors filling one layout reserve its unfilled bytes once; another layout's fill
+    /// still sees them.
+    #[test]
+    fn fills_of_one_layout_reserve_it_once() {
+        isolated("fills_of_one_layout_reserve_it_once", || {
+            let page = platform_page();
+            let _tier = Tier::bind_with(none(), Arc::new(move || Some(3 * page))).unwrap().unwrap();
+            let (first, second) = (Client::open(os::euid(), none()).unwrap(), Client::open(os::euid(), none()).unwrap());
+            // Its file is a words page and two of data: never more than three pages to fill.
+            let _held = first.open_layout("shared", vec![(0, page), (page, page)], "").unwrap();
+            let a = first.reserve("shared", 2 * page).unwrap();
+            let b = second.reserve("shared", 2 * page);
+            assert!(b.is_some(), "two fills of one layout reserve it once");
+            assert!(second.reserve("other", 3 * page).is_none(), "another layout still sees the shared one's");
+            drop((a, b));
+            assert!(second.reserve("other", 3 * page).is_some());
         });
     }
 
@@ -1423,8 +1616,8 @@ sys.stdin.read()
         isolated("a_failed_read_drains_before_releasing_its_exact_source", || {
             for completes in [true, false] {
                 let page = platform_page();
-                let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
-                let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+                let _tier = Tier::bind_with(none(), Arc::new(move || Some(8 * page))).unwrap().unwrap();
+                let client = Client::open(os::euid(), none()).unwrap();
                 let held = Arc::new(client.open_layout("read-failure", vec![(0, page)], "").unwrap());
                 held.fill(&[0], |_| Ok(())).unwrap();
                 let observed = held.clone();
@@ -1467,8 +1660,8 @@ sys.stdin.read()
             use std::os::fd::AsRawFd;
             use std::os::unix::process::CommandExt;
             let page = platform_page();
-            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
-            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let tier = Tier::bind_with(none(), Arc::new(move || Some(8 * page))).unwrap().unwrap();
+            let client = Client::open(os::euid(), none()).unwrap();
             let held = client.open_layout("dead-fill", vec![(0, page)], "").unwrap();
             let words = os::map_at(&held.fd, 0, held.data as usize, true).unwrap();
             // SAFETY: the ready word is mapped and no writer has begun this fixture yet.
@@ -1477,7 +1670,7 @@ sys.stdin.read()
             let script = r#"import array,ctypes,fcntl,json,mmap,os,socket,struct,sys
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect('\0'+sys.argv[1])
 size=int(sys.argv[3]);data=int(sys.argv[2])
-b=json.dumps({'Room':{'bytes':size}}).encode();s.sendall(struct.pack('<I',len(b))+b'\0'+b)
+b=json.dumps({'Room':{'digest':'dead-fill','bytes':size}}).encode();s.sendall(struct.pack('<I',len(b))+b'\0'+b)
 def read(n):
     b=b''
     while len(b)<n:
@@ -1533,7 +1726,7 @@ print('dirty',flush=True);sys.stdin.read()
         use std::io::Read;
         let Ok(prefix) = std::env::var("VARENA_TIER_CLAIM_SERVER") else { return };
         assert!(os::namespace(&prefix));
-        let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(|| 6)).unwrap().unwrap();
+        let _tier = Tier::bind_with(none(), Arc::new(|| Some(6))).unwrap().unwrap();
         println!("claim-holder-ready");
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input).unwrap();
@@ -1562,20 +1755,20 @@ print('dirty',flush=True);sys.stdin.read()
                 child
             };
             let first = holder();
-            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
-            let permit = client.reserve(4).unwrap(); // No destination page has faulted yet.
-            assert_eq!(Claims::open().unwrap().live_bytes().unwrap(), 4);
+            let client = Client::open(os::euid(), none()).unwrap();
+            let permit = client.reserve("fill", 4).unwrap(); // No destination page has faulted yet.
+            assert_eq!(Claims::open().unwrap().live_bytes(&BTreeMap::new()).unwrap(), 4);
             drop(first); // Real SIGKILL of the service process, while the client survives.
             let _replacement = holder();
-            let next = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
-            assert!(next.reserve(4).is_none(), "replacement forgot a live future-byte promise");
+            let next = Client::open(os::euid(), none()).unwrap();
+            assert!(next.reserve("fill", 4).is_none(), "replacement forgot a live future-byte promise");
             drop(client);
-            assert!(next.reserve(4).is_none(), "a permit outlives its ordinary client connection");
+            assert!(next.reserve("fill", 4).is_none(), "a permit outlives its ordinary client connection");
             drop(permit);
-            let settled = next.reserve(6).unwrap();
-            assert_eq!(Claims::open().unwrap().live_bytes().unwrap(), 6);
+            let settled = next.reserve("fill", 6).unwrap();
+            assert_eq!(Claims::open().unwrap().live_bytes(&BTreeMap::new()).unwrap(), 6);
             drop(settled);
-            assert_eq!(Claims::open().unwrap().live_bytes().unwrap(), 0, "completion returns the durable claim immediately");
+            assert_eq!(Claims::open().unwrap().live_bytes(&BTreeMap::new()).unwrap(), 0, "completion returns the durable claim immediately");
         });
     }
 
@@ -1584,9 +1777,8 @@ print('dirty',flush=True);sys.stdin.read()
         isolated("unknown_claim_schema_never_resets_a_live_owner", || {
             use std::os::fd::AsRawFd;
             let claims = Claims::open().unwrap();
-            let need: Need = Arc::new(|| Some(0));
-            let budget: Budget = Arc::new(|| 6);
-            let Admission::Granted(lease) = claims.admit(&need, 4, &budget).unwrap() else { panic!("initial claim refused") };
+            let budget: Budget = Arc::new(|| Some(6));
+            let Admission::Granted(lease) = claims.admit(&Keep::new(none()), layout_key("fill"), 4, &budget, &BTreeMap::new()).unwrap() else { panic!("initial claim refused") };
             // SAFETY: querying the flags of this live owned descriptor.
             assert_eq!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE, libc::O_RDONLY);
             for invalid in [u64::from_le_bytes(*b"vhrsv999"), 0] {
@@ -1599,11 +1791,11 @@ print('dirty',flush=True);sys.stdin.read()
                 let _lock = claims.lock().unwrap();
                 let map = os::map(&claims.fd, platform_page() as usize, true).unwrap();
                 assert_eq!(claim_word(&map, 0).load(Acquire), invalid, "unknown bytes were rewritten");
-                assert!(os::held(&claims.fd, CLAIM_WORD, CLAIM_WORD).unwrap(), "the live claim was lost");
+                assert!(os::held(&claims.fd, RECORD, RECORD).unwrap(), "the live claim was lost");
                 claim_word(&map, 0).store(CLAIM_MAGIC, Release);
             }
             drop(lease);
-            assert_eq!(claims.live_bytes().unwrap(), 0);
+            assert_eq!(claims.live_bytes(&BTreeMap::new()).unwrap(), 0);
         });
     }
 
@@ -1624,10 +1816,10 @@ print('dirty',flush=True);sys.stdin.read()
             let page = platform_page();
             let files = Arc::new(Mutex::new(Vec::<(Owned, u64)>::new()));
             let observed = files.clone();
-            let need: Need = Arc::new(move || Some(2 * page));
+            let need: Need = Arc::new(move || Some(vec![call(Some(2 * page), 0)]));
             let budget: Budget = Arc::new(move || {
                 let resident: u64 = observed.lock().iter().map(|(fd, data)| os::allocated(fd).saturating_sub(*data)).sum();
-                i128::from(2 * page) - i128::from(resident)
+                Some((2 * page).saturating_sub(resident))
             });
             let tier = Tier::bind_with(need.clone(), budget).unwrap().unwrap();
             let client = Client::open(os::euid(), need.clone()).unwrap();
@@ -1636,9 +1828,8 @@ print('dirty',flush=True);sys.stdin.read()
             let first = filled(&client, "first", "departed-user");
             let second = filled(&client, "second", "departed-user");
             files.lock().extend([(os::reopen(&first.fd, true).unwrap(), first.data), (os::reopen(&second.fd, true).unwrap(), second.data)]);
-            let (event, signal) = os::event().unwrap();
-            tier.watch(Pressure::Events(event), need).unwrap();
-            os::signal(&signal); // Exactly one external pressure event.
+            tier.watch(Pressure::arm(HostMode::Shared).unwrap()).unwrap();
+            tier.nudge(); // One look.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let (lock, changed) = &*tier.state;
             let mut state = lock.lock();
@@ -1649,7 +1840,7 @@ print('dirty',flush=True);sys.stdin.read()
             }
             assert_eq!(state.releases, 2);
             drop(state);
-            assert_eq!(tier.budget.as_ref()(), i128::from(2 * page));
+            assert_eq!(tier.budget.as_ref()(), Some(2 * page));
         });
     }
 
@@ -1657,12 +1848,12 @@ print('dirty',flush=True);sys.stdin.read()
     fn pressure_pending_reclaim_does_not_raise_host_short() {
         isolated("pressure_pending_reclaim_does_not_raise_host_short", || {
             use std::os::fd::AsRawFd;
-            let need: Need = Arc::new(|| Some(1));
-            let tier = Tier::bind_with(need.clone(), Arc::new(|| 0)).unwrap().unwrap();
+            let need: Need = Arc::new(|| Some(vec![call(Some(1), 0)]));
+            let tier = Tier::bind_with(need.clone(), Arc::new(|| Some(0))).unwrap().unwrap();
             let client = Client::open(os::euid(), need.clone()).unwrap();
             let listener = os::listen(os::euid(), "stalled-user").unwrap().unwrap();
             let _held = filled(&client, "pending", "stalled-user");
-            answer(&tier.state, &need, &tier.budget, &tier.claims);
+            answer(&tier.state, &tier.keep, &tier.budget, &tier.claims);
             let mut incoming = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             // SAFETY: poll only inspects the live listener descriptor; timeout only fails hangs.
             assert_eq!(unsafe { libc::poll(&mut incoming, 1, 5000) }, 1);
@@ -1671,7 +1862,7 @@ print('dirty',flush=True);sys.stdin.read()
             assert!(os::recv(&ask).unwrap().is_some());
             // The first ask remains unanswered. A later event must return promptly without
             // escalating to executor termination while already-requested reclaim is pending.
-            answer(&tier.state, &need, &tier.budget, &tier.claims);
+            answer(&tier.state, &tier.keep, &tier.budget, &tier.claims);
             let mut short = libc::pollfd { fd: tier.short.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             // SAFETY: poll only inspects the live event descriptor and does not wait.
             let escalated = unsafe { libc::poll(&mut short, 1, 0) };

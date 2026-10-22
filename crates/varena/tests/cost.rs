@@ -69,4 +69,5 @@ fn per_page_cost() {
     drop(pass);
     drop((r, mem, ledger));
     varena::os::remove_table(&g.uuid);
+    varena::tier::remove_claims();
 }

@@ -44,6 +44,7 @@ impl Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         varena::os::remove_table(&self.uuid);
+        varena::tier::remove_claims();
     }
 }
 
@@ -605,18 +606,19 @@ fn an_impossible_need_is_exhausted_at_once() {
     pass.end(Measured::default(), Torch::default());
 }
 
-/// Host-OOM, the varena side: a request records its host high-water (Peak::Host, its
-/// anonymous bytes; the tier's and file mappings aside); while a request runs unmeasured the
-/// GPU's host need is unknown, and once measured it is that high-water less what the process
-/// holds now. Linux: the high-water is read from `/proc` (elsewhere a request is unmeasured).
+/// Host-OOM, the varena side: a request records its anonymous host peak (Peak::Host; the tier's
+/// and file mappings aside). While it runs unmeasured its process is an unmeasured call, and once
+/// measured the call carries that peak. Linux: the peak is read from `/proc` (elsewhere a request
+/// is unmeasured).
 #[cfg(target_os = "linux")]
 #[test]
-fn a_request_records_its_host_high_water() {
+fn a_request_records_its_anonymous_host_peak() {
     let (_scope, ledger, mem, _g) = open("host", 8 * MB);
     ledger.dispatch("first", "pkg", "1x1").unwrap();
     let r = mem.request("first", Plan { steps: vec![] }).unwrap();
-    assert_eq!(ledger.host_need(), None, "a running request with no host peak");
-    assert_eq!(varena::tier::need(&[&ledger])(), None, "TensorD's sum over its GPUs");
+    let unmeasured = |calls: Option<Vec<varena::HostCall>>| calls.is_some_and(|c| c.len() == 1 && c[0].pid == std::process::id() && c[0].peak.is_none());
+    assert!(unmeasured(ledger.host_calls()), "a running request with no host peak");
+    assert!(unmeasured(varena::tier::need(&[&ledger])()), "TensorD's over its GPUs");
     let held: Vec<u8> = vec![1; (64 * MB) as usize];
     let stats = r.end();
     assert!(stats.host.is_some_and(|h| h >= 64 * MB), "{:?}", stats.host);
@@ -627,7 +629,8 @@ fn a_request_records_its_host_high_water() {
     assert!(recorded.is_some_and(|b| b >= 64 * MB), "{recorded:?}");
     ledger.dispatch("second", "pkg", "1x1").unwrap();
     let r = mem.request("second", Plan { steps: vec![] }).unwrap();
-    assert!(ledger.host_need().is_some(), "measured now");
+    let calls = ledger.host_calls().unwrap();
+    assert!(calls.len() == 1 && calls[0].peak == recorded, "measured now: {calls:?}");
     drop(held);
     r.end();
 }
