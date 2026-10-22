@@ -1,7 +1,7 @@
-"""CPU proof of native.py, no GPU: real processes of a stub test binary (a shell script that
-speaks libtest's arguments and output) for a case that passes, one that fails, one that hangs
-(judged by its earlier steps, so killed as stalled), one that hangs unjudged until a cancel, and
-the GPU monitor. cozy_runtime's author API is stood in for by the few names native.py uses.
+"""CPU proof of native.py, no GPU: real processes of stub test binaries (shell scripts that speak
+libtest's arguments and output), bundled as the runner takes them: `gpu` with a case that passes,
+one that fails, one that hangs (judged by its earlier steps, so killed as stalled), one that
+hangs unjudged until a cancel, and the GPU monitor; `tensorfs-io` with a test that prints no GPU. cozy_runtime's author API is stood in for by the few names native.py uses.
 
     python3 -I crates/varena/gpu/test_native.py
 """
@@ -9,6 +9,7 @@ from pathlib import Path
 import importlib.util
 import json
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -20,6 +21,7 @@ case "$3" in
   passes) echo "test passes ... STEP 1 0"; echo "STEP 2 5"; echo "PASS it passes GPU-00000000-0000-0000-0000-000000000000"; echo "test result: ok. 1 passed; 0 failed; 0 ignored" ;;
   fails) echo "test fails ... STEP 1 0"; echo "thread 'fails' panicked: on purpose" >&2; echo "test result: FAILED. 0 passed; 1 failed; 0 ignored"; exit 101 ;;
   hangs|waits) echo "test $3 ... STEP 1 0"; exec sleep 100000 ;;
+  plain) echo "test plain ... ok"; echo "test result: ok. 1 passed; 0 failed; 0 ignored" ;;
 esac
 """
 
@@ -61,30 +63,35 @@ def main():
     native = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(native)
     with tempfile.TemporaryDirectory() as tmp:
-        stub = Path(tmp) / "stub"
-        stub.write_text(STUB)
-        stub.chmod(0o755)
+        bundle = Path(tmp) / "bundle.tar"
+        with tarfile.open(bundle, "w") as tar:
+            for name in ["gpu", "tensorfs-io"]:
+                stub = Path(tmp) / name
+                stub.write_text(STUB)
+                stub.chmod(0o755)
+                tar.add(stub, arcname=name)
         ctx = stand_in.ScriptContext()
         # "hangs" has an earlier longest step, so it is judged; "waits" has none: unjudged until the cancel.
-        suite = {"label": "cpu", "cases": ["passes", "fails", "hangs", "waits", "passes2"], "steps": {"hangs": 0.2}}
+        cases = ["gpu/passes", "tensorfs-io/plain", "gpu/fails", "gpu/hangs", "gpu/waits", "gpu/passes2"]
+        suite = {"label": "cpu", "cases": cases, "steps": {"gpu/hangs": 0.2}}
         threading.Timer(3.0, lambda: setattr(ctx, "cancelled", True)).start()
         start = time.monotonic()
-        tree = native.main(ctx, binary=stand_in.FileAsset(stub.read_bytes()),
+        tree = native.main(ctx, binary=stand_in.FileAsset(bundle.read_bytes()),
                            suite=stand_in.FileAsset(json.dumps(suite).encode()), out=stand_in.Outputs())
         took = time.monotonic() - start
     result = json.loads(tree["result.json"])
     for level, line in ctx.lines:
         print(f"{level}: {line.splitlines()[0]}")
-    assert result["passed"] == ["passes"], result
-    assert result["failed"] == ["fails", "hangs", "waits"], result
-    assert result["ended"] == {"hangs": "stalled", "waits": "cancelled"}, result
-    assert result["unjudged"] == ["passes", "fails", "waits"], result
+    assert result["passed"] == ["gpu/passes", "tensorfs-io/plain"], result
+    assert result["failed"] == ["gpu/fails", "gpu/hangs", "gpu/waits"], result
+    assert result["ended"] == {"gpu/hangs": "stalled", "gpu/waits": "cancelled"}, result
+    assert result["unjudged"] == ["gpu/passes", "tensorfs-io/plain", "gpu/fails", "gpu/waits"], result
     assert result["cancelled"] and not result["ok"], result
-    assert "passes2" not in result["passed"] + result["failed"], "a cancel stops the suite"
-    assert any("TAIL fails" in m and "panicked: on purpose" in m for _, m in ctx.lines), "a failure's tail reaches the run log"
-    assert any("TAIL waits" in m for _, m in ctx.lines), "a cancelled case's tail reaches the run log"
+    assert "gpu/passes2" not in result["passed"] + result["failed"], "a cancel stops the suite"
+    assert any(m.startswith("TAIL gpu/fails") and "panicked: on purpose" in m for _, m in ctx.lines), "a failure's tail reaches the run log"
+    assert any(m.startswith("TAIL gpu/waits") for _, m in ctx.lines), "a cancelled case's tail reaches the run log"
     assert took < 10, f"the hang and the cancel ended the suite in {took:.1f} s"
-    print(f"PASS native.py on CPU: pass, fail, stalled, cancelled, in {took:.1f} s")
+    print(f"PASS native.py on CPU: pass (two binaries), fail, stalled, cancelled, in {took:.1f} s")
 
 
 if __name__ == "__main__":
