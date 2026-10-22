@@ -156,6 +156,9 @@ fn a_dropped_custody_holder_leaves_no_zombie_row() {
     let held = |l: &varena::Ledger| l.status().rows.iter().map(|r| r.classes.iter().enumerate().filter(|(c, _)| *c != 1).map(|(_, b)| b).sum::<u64>()).sum::<u64>();
     assert_eq!(held(&ledger), 4 * MB);
     drop(mem);
+    // Final public drop transfers ownership to retirement; the row remains charged until
+    // completed device work and custody handoff are finished on that independent worker.
+    while held(&ledger) != 0 { ledger.await_event().unwrap(); }
     assert_eq!(held(&ledger), 0, "{:?}", ledger.status().rows);
 }
 
