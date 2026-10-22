@@ -1,6 +1,6 @@
 [package]
 name = "tensorfs-py"
-version = "0.13.7"
+version = "0.13.8"
 edition = "2021"
 publish.workspace = true
 
