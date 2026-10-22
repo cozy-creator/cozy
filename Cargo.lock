@@ -4719,11 +4719,19 @@ dependencies = [
 name = "varena"
 version = "0.13.2"
 dependencies = [
+ "crossbeam-channel",
  "libc",
+ "parking_lot",
  "platform",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tensorfs",
  "thiserror 2.0.21",
  "tracing",
+ "tracing-subscriber",
+ "varena",
 ]
 
 [[package]]

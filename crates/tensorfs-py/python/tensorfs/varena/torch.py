@@ -523,11 +523,12 @@ class Memory:
         return torch.cuda.MemPool(allocator._allocator)
 
     @contextmanager
-    def allocating(self, pool: torch.cuda.MemPool | None = None) -> Iterator[None]:
+    def allocating(self, pool: torch.cuda.MemPool | None = None, *, route: bool = True) -> Iterator[None]:
         """Use the request's allocator between passes too, or a graph's dedicated scratch pool.
 
-        Warm and capture must name the same graph pool. Capture cannot grow it; a capacity
-        shortfall aborts capture, without native pressure recovery or arbitrary package replay.
+        Warm and capture must name the same graph pool. Exit the warm routing context before
+        `torch.cuda.graph(pool=pool)`; use `route=False` to retain native accounting while the
+        graph owns routing. Capture cannot grow its pool or enter pressure recovery.
         """
         selected = self.pool if pool is None and self.pooling else pool
         r, p = _request.get(), _pass.get()
@@ -539,7 +540,7 @@ class Memory:
         r.native.allocating(self.native, p.set if p else None, *self.torch.now(), selected.id)
         token = _pool.set((self, selected))
         try:
-            with torch.cuda.use_mem_pool(selected, self.device):
+            with torch.cuda.use_mem_pool(selected, self.device) if route else nullcontext():
                 yield
         finally:
             _pool.reset(token)

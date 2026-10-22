@@ -20,7 +20,7 @@ import tempfile
 from pathlib import Path
 from typing import Annotated
 
-from cozy_runtime.author import AssetBound, FileAsset, Outputs, Tree
+from cozy_runtime.author import AssetBound, FileAsset, Outputs, ScriptContext, Tree
 
 #: pip accepts a wheel only under its own name.
 WHEEL = "tensorfs-0.13.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
@@ -36,7 +36,7 @@ def install(target: Path, *specs: str) -> str:
     return text
 
 
-def main(*, wheel: Annotated[FileAsset, AssetBound(max_bytes=1 << 27)],
+def main(ctx: ScriptContext, *, wheel: Annotated[FileAsset, AssetBound(max_bytes=1 << 27)],
          script: Annotated[FileAsset, AssetBound(max_bytes=1 << 20)], out: Outputs) -> Tree:
     root = Path(tempfile.mkdtemp(prefix="varena-standalone-"))
     logs, site = root / "out", root / "site"
@@ -53,7 +53,9 @@ def main(*, wheel: Annotated[FileAsset, AssetBound(max_bytes=1 << 27)],
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(site), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)}
     with (logs / "log.txt").open("w") as log:
         def say(line: str) -> None:  # streamed: the run's log shows where a stall sits
-            print(line, end="", flush=True)
+            for entry in line.splitlines():
+                for at in range(0, len(entry), 180):
+                    ctx.log(entry[at:at + 180], level="warn")
             log.write(line)
             log.flush()
 

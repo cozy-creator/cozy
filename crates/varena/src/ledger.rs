@@ -1348,15 +1348,9 @@ impl Ledger {
     }
 }
 
-impl Drop for Ledger {
-    /// A table with a live row of another process stays: a restarted TensorD reopens it.
-    fn drop(&mut self) {
-        let me = std::process::id();
-        if self.shared.rows().is_ok_and(|rows| rows.iter().all(|r| !r.live || r.pid == me)) {
-            os::unlink(&self.shared.name);
-        }
-    }
-}
+// Named-table retirement belongs to Shared::leave, under the OPEN lock. Dropping TensorD's
+// handle cannot unlink while same-process grants or a custody row still own this generation:
+// a delayed old row could otherwise unlink a replacement table with the same GPU name.
 
 #[cfg(test)]
 mod tests {

@@ -15,7 +15,6 @@ const MB: u64 = 1 << 20;
 
 fn open(case: &str, memory: u64) -> (Scope, varena::Ledger, Memory, GpuId) {
     let g = GpuId { uuid: format!("m{}-{case}", std::process::id()), model: "host".into(), memory };
-    let _scope = Scope::new(&g.uuid);
     let scope = Scope::new(&g.uuid);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(memory))).unwrap();
@@ -673,4 +672,16 @@ fn workspace_promises_convert_to_native_segments_and_release_unused_bytes() {
     assert_eq!(mem.allocator_limit().unwrap(), initial - 3 * MB);
     drop(reservation);
     assert_eq!(mem.allocator_limit().unwrap(), initial);
+}
+
+#[test]
+fn a_grant_keeps_its_table_generation_when_the_ledger_is_dropped() {
+    let g = GpuId { uuid: format!("m{}-grant-generation", std::process::id()), model: "host".into(), memory: 64 * MB };
+    let _scope = Scope::new(&g.uuid);
+    let ledger = varena::Ledger::create(&g, Some(12 * MB)).unwrap();
+    let grant = varena::Grant::open(&g, None).unwrap();
+    drop(ledger);
+    drop(varena::Grant::open(&g, Some(8 * MB)).unwrap());
+    let memory = Memory::open(g.clone(), Some(grant), Box::new(HostBackend::new(g.memory))).unwrap();
+    assert_eq!(memory.torch_limit(), 8 * MB, "the grant and the next opener share the same live generation");
 }

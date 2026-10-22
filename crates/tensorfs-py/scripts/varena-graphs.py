@@ -75,12 +75,13 @@ def main():
         for i, (layer, binding) in enumerate(zip(model.layers, bindings, strict=True)):
             pool = mem.new_pool()
             graph = torch.cuda.CUDAGraph()
-            with binding.prepare(stream, workspace=None), mem.allocating(pool):
-                static = source.to(mem.device)
-                # Prewarm exactly the pool passed to capture, never the default request pool.
-                warm = torch.nn.functional.linear(static, layer.weight)
-                torch.cuda.synchronize()
-                del warm
+            with binding.prepare(stream, workspace=None):
+                with mem.allocating(pool):
+                    static = source.to(mem.device)
+                    # Prewarm exactly the pool passed to capture, never the default request pool.
+                    warm = torch.nn.functional.linear(static, layer.weight)
+                    torch.cuda.synchronize()
+                    del warm
                 before = allocator_stats(0, pool.id)
                 start = time.perf_counter()
                 with torch.cuda.graph(graph, pool=pool, stream=stream):
@@ -139,7 +140,7 @@ def main():
     empty = mem.new_pool()
     before = allocator_stats(0, empty.id)
     failed = False
-    with mem.request("capture-growth-refused"), mem.allocating(empty):
+    with mem.request("capture-growth-refused"):
         try:
             bad = torch.cuda.CUDAGraph()
             with torch.cuda.graph(bad, pool=empty, stream=stream):
