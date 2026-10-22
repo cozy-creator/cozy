@@ -217,7 +217,7 @@ pub(crate) struct Shared {
     /// in that user's namespace.
     pub ns: u32,
     /// Signals the GPU's wake endpoint (TensorD's, by name).
-    wake: Owned,
+    wake: os::Notifier,
 }
 
 /// The heap lock, held.
@@ -812,9 +812,9 @@ impl Row {
 
     /// Serves this row's asks until `stop`: every asker (of this user only) at once, each
     /// answered with what `answer` freed. A silent or stopped asker holds up nobody's answer.
-    pub fn serve_asks(listener: os::Listener, stop: &AtomicBool, row: &Weak<Row>, mut answer: impl FnMut(Ask) -> u64) {
-        os::serve_all(listener, stop, |body| {
-            let freed = os::decode::<Ask>(body).map_or(0, &mut answer);
+    pub fn serve_asks(listener: os::Listener, stop: &AtomicBool, row: Weak<Row>, answer: impl Fn(Ask) -> u64 + Send + Sync + 'static) {
+        os::serve_all(listener, stop, move |body| {
+            let freed = os::decode::<Ask>(body).map_or(0, &answer);
             if let Some(r) = row.upgrade() {
                 r.shared.ring();
             }
@@ -1051,7 +1051,7 @@ impl Room {
 pub struct Ledger {
     shared: Arc<Shared>,
     /// The GPU's wake endpoint, bound by name: every participant signals it.
-    events: Owned,
+    events: os::Endpoint,
     custody: custody::Client,
 }
 
@@ -1259,7 +1259,7 @@ impl Ledger {
     /// Readable when room frees, a row dies, an ask goes out or a peak is recorded, in any
     /// process on the GPU; [`Ledger::clear_events`] clears it.
     pub fn events(&self) -> &Owned {
-        &self.events
+        self.events.handle()
     }
 
     /// Clears every event so far; true when one came from an accepted user (another user's
@@ -1352,6 +1352,7 @@ mod tests {
 
     /// Review 2, finding 14: a standalone engine's table is unlinked when its last row leaves
     /// (custody stops once nobody is connected and nothing is kept).
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_standalone_table_goes_with_its_last_row() {
         let gpu = GpuId { uuid: format!("unit-{}-unlink", std::process::id()), model: "host".into(), memory: 1 << 30 };

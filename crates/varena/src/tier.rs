@@ -322,7 +322,7 @@ impl Tier {
             .spawn(move || loop {
                 let woke = match &pressure {
                     Pressure::Host(p) => p.wait().map_err(Error::from),
-                    Pressure::Events(e) => os::await_event(e),
+                    Pressure::Events(e) => os::await_event(e).map_err(Error::from),
                     Pressure::Headroom => return,
                 };
                 if woke.is_err() || stop.load(Acquire) {
@@ -335,9 +335,10 @@ impl Tier {
     }
 
     fn bind() -> Result<Option<Tier>> {
+        // Its layouts are files punched region by region: where there are none, no tier.
+        drop(os::tier_file("varena-tier-probe")?);
         let Some(listener) = os::listen(os::euid(), NAME)? else { return Ok(None) };
-        let short = os::event()?;
-        let signal = os::dup(&short)?;
+        let (short, signal) = os::event()?;
         let state = Arc::new((Mutex::new(State { short: Some(signal), ..State::default() }), Condvar::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (s, halt) = (state.clone(), stop.clone());
@@ -375,7 +376,7 @@ impl Tier {
     /// then ends idle executors, least recently used first (the last host rung, a lifecycle
     /// action, so TensorD's).
     pub fn await_short(&self) -> Result<()> {
-        os::await_event(&self.short)
+        Ok(os::await_event(&self.short)?)
     }
 
     /// The host-short event, for a caller that waits on several (signalled; a wait clears it).
@@ -511,7 +512,7 @@ fn open(s: &mut State, digest: &str, regions: Vec<(u64, u64)>) -> Result<(u64, O
     }
     let data = words_bytes(&regions);
     let end = regions.iter().map(|(o, s)| o + s).max().unwrap_or(0);
-    let fd = os::memfd(&format!("varena-tier-{digest}"))?;
+    let fd = os::tier_file(&format!("varena-tier-{digest}"))?;
     os::resize(&fd, data + end)?;
     let words = os::map(&fd, data as usize, true)?;
     let handed = os::dup(&fd)?;
