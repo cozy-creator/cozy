@@ -42,6 +42,7 @@ struct Counters {
     refused: u64,
     ns: u64,
     frees: u64,
+    refusal: Option<(&'static str, u64, u64, u64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -125,6 +126,12 @@ pub fn stats(device: Option<i32>, pool: Option<Pool>) -> (u64, u64, u64, u64, u6
     (c.live, c.segments, c.resolved, c.resolved_bytes, c.refused, c.ns, c.frees)
 }
 
+/// Last refusal by device/pool. Collected outside the callback: no callback logging or Python.
+pub fn refusals(device: Option<i32>) -> Vec<(i32, Pool, &'static str, u64, u64, u64)> {
+    accounts().counts.iter().filter(|((d, _), _)| device.is_none_or(|want| *d == want))
+        .filter_map(|((d, p), c)| c.refusal.map(|(why, size, held, limit)| (*d, *p, why, size, held, limit))).collect()
+}
+
 fn capturing(stream: *mut c_void) -> bool {
     let Ok(d) = cuda::driver() else { return true };
     let mut status = 0;
@@ -149,21 +156,27 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     let pool = active.as_ref().map_or((0, 0), |a| a.pool);
     let key = (device, pool);
     if capturing(stream) {
-        accounts().counts.entry(key).or_default().refused += 1;
+        let held = live(device);
+        let mut all = accounts();
+        let c = all.counts.entry(key).or_default();
+        c.refused += 1;
+        c.refusal = Some(("capture_growth", size as u64, held, 0));
         return std::ptr::null_mut();
     }
     let mut previous = None;
     let mut reclaimed_total = 0;
+    let mut refusal = ("unknown", size as u64, 0, 0);
     let ptr = loop {
         let held = active.as_ref().map_or(live(device), |a| a.outside.saturating_add(live(device)));
         let limit = match active.as_ref() {
             None => u64::MAX,
-            Some(a) => match a.memory.allocator_limit() { Some(n) => n.saturating_add(budget.as_ref().map_or(0, |b| b.remaining())), None => break 0 },
+            Some(a) => match a.memory.allocator_limit() { Some(n) => n.saturating_add(budget.as_ref().map_or(0, |b| b.remaining())), None => { refusal = ("state_unavailable", size as u64, held, 0); break 0 } },
         };
+        refusal = ("workspace", size as u64, held, limit);
         if budget.as_ref().is_some_and(|b| b.remaining() < size as u64) { break 0; }
         let result = if held.saturating_add(size as u64) <= limit {
             let credit = match &budget {
-                Some(b) => match b.take(size as u64) { Some(c) => Some(c), None => break 0 },
+                Some(b) => match b.take(size as u64) { Some(c) => Some(c), None => { refusal = ("state_unavailable", size as u64, held, 0); break 0 } },
                 None => None,
             };
             let result = segment(size);
@@ -173,17 +186,21 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
         match result {
             Ok(ptr) => break ptr,
             Err(cuda::ERROR_OUT_OF_MEMORY) => {
+                refusal = ("driver_capacity", size as u64, held, limit);
                 let Some(a) = active.as_ref() else { break 0 };
                 // Neither a changed watermark nor a stale free count can spin forever. A new
                 // attempt requires actual reclaimed bytes or a strictly larger available cap.
                 let state = (held, limit);
+                refusal.0 = "no_progress";
                 if previous == Some(state) { break 0; }
                 previous = Some(state);
                 let reclaimed = a.request.reclaim_allocation(a.set, size as u64, Torch { allocated: held, reserved: held }).unwrap_or(0);
+                refusal.0 = "no_reclaim";
                 if reclaimed == 0 { break 0; }
                 reclaimed_total += reclaimed;
             }
             Err(code) => {
+                refusal = ("driver_error", size as u64, held, limit);
                 accounts().faults.entry(device).or_insert_with(|| format!("CUDA allocation failed with non-capacity error {code}"));
                 break 0;
             }
@@ -192,7 +209,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     let mut all = accounts();
     let c = all.counts.entry(key).or_default();
     c.ns += began.elapsed().as_nanos() as u64;
-    if ptr == 0 { c.refused += 1; }
+    if ptr == 0 { c.refused += 1; c.refusal = Some(refusal); }
     else {
         c.live += size as u64; c.segments += 1;
         if reclaimed_total != 0 { c.resolved += 1; c.resolved_bytes += reclaimed_total; }

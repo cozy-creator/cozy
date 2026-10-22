@@ -1001,6 +1001,13 @@ fn allocator_stats(device: Option<i32>, pool: Option<(u64, u64)>) -> (u64, u64, 
     crate::allocator::stats(device, pool)
 }
 
+/// Last native allocation refusal: device, pool, reason, size, held bytes, admitted limit.
+#[pyfunction]
+#[pyo3(signature = (device = None))]
+fn allocator_refusals(device: Option<i32>) -> Vec<(i32, (u64, u64), &'static str, u64, u64, u64)> {
+    crate::allocator::refusals(device)
+}
+
 /// A lost completion/release quarantines its segment and retires this executor at a safe
 /// Python boundary; it must not masquerade as a recoverable capacity failure.
 #[pyfunction]
@@ -1053,6 +1060,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStats>()?;
     m.add_function(wrap_pyfunction!(allocated, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_stats, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_refusals, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_pending, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_check, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_reentries, &m)?)?;
