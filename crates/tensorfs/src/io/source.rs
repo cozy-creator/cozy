@@ -188,6 +188,9 @@ impl Source {
         let mut copies = Vec::new();
         let mut inline = 0;
         for &Placement { items, origin, dst } in placements {
+            // Each placement's copies in destination order, gaps included, so contiguous runs
+            // merge (`coalesce`).
+            let mut ordered: Vec<(u64, Copy)> = Vec::with_capacity(items.len() + 1);
             let mut intervals = Vec::with_capacity(items.len());
             for item in items {
                 if let ItemSource::Object(range) = &item.source {
@@ -221,10 +224,10 @@ impl Source {
                         Src::Host(bytes.as_ptr())
                     }
                 };
-                copies.push(Copy {
+                ordered.push((start, Copy {
                     src,
                     dst: dst.slice(start as usize, item.len as usize),
-                });
+                }));
             }
             intervals.sort_unstable();
             let mut cursor = 0;
@@ -236,20 +239,23 @@ impl Source {
                     return Err(invalid("placement items overlap"));
                 }
                 if start > cursor {
-                    copies.push(Copy {
+                    ordered.push((cursor, Copy {
                         src: Src::Zero,
                         dst: dst.slice(cursor as usize, (start - cursor) as usize),
-                    });
+                    }));
                 }
                 cursor = end;
             }
             if cursor < dst.len() as u64 {
-                copies.push(Copy {
+                ordered.push((cursor, Copy {
                     src: Src::Zero,
                     dst: dst.slice(cursor as usize, dst.len() - cursor as usize),
-                });
+                }));
             }
+            ordered.sort_by_key(|(at, _)| *at);
+            copies.extend(ordered.into_iter().map(|(_, c)| c));
         }
+        let copies = super::coalesce(copies);
         let opts = ReadOpts {
             threads,
             direct: self.direct_io && mode == Mode::Cache,
