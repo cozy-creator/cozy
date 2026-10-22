@@ -1229,6 +1229,21 @@
       "reasons": []
     },
     {
+      "why": "a run's lane is its main model's: H3's 16-bit-only LoRA is asked nothing",
+      "variants": {
+        "lora.cozytensors": "bf16"
+      },
+      "constraints": {
+        "gpus": [
+          "12.0"
+        ]
+      },
+      "variant": "lora.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no int8 or fp8 lane for sm120; served bf16"
+      ]
+    },
+    {
       "why": "a slot refusing encoded weights refuses a sole 8-bit variant",
       "variants": {
         "m.cozytensors": "int8"

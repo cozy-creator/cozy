@@ -1873,7 +1873,7 @@
           "bits": {
             "type": "integer",
             "format": "int32",
-            "description": "The run's weight precision: 16, 8 or 4. 0: the machine's rules choose each slot's lane.\nChildren inherit it.",
+            "description": "The main model's weight precision: 16, 8 or 4. 0, and every other slot: the machine's rules\nchoose the lane. The package's own children inherit it; another package's take 0.",
             "default": 0,
             "minimum": 0
           },

@@ -303,8 +303,8 @@ pub struct RunSpec {
     /// 0: widest group every model slot supports on this machine. Positive: at most this many
     /// GPUs, for the run and its children.
     pub gpus: u32,
-    /// The run's weight precision: 16, 8 or 4. 0: the machine's rules choose each slot's lane.
-    /// Children inherit it.
+    /// The main model's weight precision: 16, 8 or 4. 0, and every other slot: the machine's rules
+    /// choose the lane. The package's own children inherit it; another package's take 0.
     pub bits: u32,
 }
 
