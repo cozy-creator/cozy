@@ -404,7 +404,9 @@ pub struct ModelChoice {
     pub adapters: Vec<Adapter>,
     /// A provider source (`hf://<org>/<repo>@<rev>[/member]`, `civitai://<version>[/file]`) the
     /// machine makes the slot's model from, under these reviewed `profiles` (none: the one its
-    /// headers select); never with repository or manifest.
+    /// headers select); never with repository or manifest. A model-only warm upload also accepts
+    /// `input://<field>` naming its retained tree input: a plain CozyTensors folder, without
+    /// selectors or conversion profiles. Missing folder payload must already be at the endpoint.
     pub source: String,
     pub profiles: Vec<String>,
 }

@@ -27,7 +27,7 @@ mod play;
 mod show;
 mod spec;
 mod target;
-mod tree;
+pub(crate) mod tree;
 mod upload;
 
 #[derive(clap::Args, Debug)]
