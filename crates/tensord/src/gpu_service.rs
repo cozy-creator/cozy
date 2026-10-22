@@ -637,8 +637,9 @@ pub struct Pool {
     engine: std::sync::OnceLock<Weak<Engine>>,
     /// Rows the ledgers named stalled at the last look: each is ended once.
     stalled: Mutex<std::collections::BTreeSet<u32>>,
-    /// The machine's RAM tier, served while the pool lives.
-    _tier: Option<Arc<varena::Tier>>,
+    /// The machine's RAM tier, served while the pool lives; nudged to look at the host when a
+    /// call begins, an executor's frame comes or a ledger signals.
+    tier: Option<Arc<varena::Tier>>,
     /// Held while the pool lives: the thread blocked on the ledgers' events ends with it.
     _events: Option<std::os::unix::net::UnixStream>,
     /// Memoized Model methods' results, shared by every run on this machine.
@@ -755,7 +756,7 @@ impl Pool {
                 peaks,
                 engine: Default::default(),
                 stalled: Mutex::default(),
-                _tier: tier,
+                tier,
                 _events: events,
                 incarnation,
                 config,
@@ -779,6 +780,7 @@ impl Pool {
     /// `fits` again, each row the ledger newly names stalled ends (once), and changed peaks are
     /// saved.
     fn memory_changed(&self) {
+        self.nudge_host();
         if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
             engine.notify_activity();
         }
@@ -1782,6 +1784,13 @@ impl Pool {
         }
     }
 
+    /// The RAM tier's watcher looks at the host now (a nudge; the host's own events wake it too).
+    fn nudge_host(&self) {
+        if let Some(tier) = &self.tier {
+            tier.nudge();
+        }
+    }
+
     /// The call's memory decisions (varena's record of its request, in order: lowering, cuts,
     /// parks, exhaustion, evictions of declared or working pages, each with its trigger, site,
     /// need, freed bytes and level), one memory-log line each: why a run lowered, cut or failed.
@@ -2538,6 +2547,8 @@ impl Pool {
         let (start, degree) = (session.start, plan.degree);
         let construction = plan.construction.clone();
         let gpus = self.lane(start, degree)?;
+        // A call begins: the host is looked at before it grows.
+        self.nudge_host();
         let retained = session.loaded;
         if retained {
             session.executor.begin_request();
@@ -2553,6 +2564,7 @@ impl Pool {
             generation: &held.record,
             spool: None,
             caller: None,
+            tier: self.tier.as_deref(),
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -3524,9 +3536,15 @@ struct Callbacks<'a> {
     spool: Option<PathBuf>,
     /// The invoking request as a caller: its child-call frames.
     caller: Option<&'a crate::calls::Caller>,
+    /// The machine's RAM tier: each frame nudges it to look at the host (the only wakeup where
+    /// the kernel gives none, cgroup v1 with PSI denied).
+    tier: Option<&'a varena::Tier>,
 }
 impl Services for Callbacks<'_> {
     fn progress(&mut self, frame: &Frame) {
+        if let Some(tier) = self.tier {
+            tier.nudge();
+        }
         crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
     }
     fn request(
@@ -4351,6 +4369,52 @@ mod tests {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    /// An executor's frame nudges the machine's RAM tier: its watcher looks at the host (it
+    /// reads what the running calls keep free), with no kernel event to wake it. In its own
+    /// process: one tier per namespace, and this binary's other pools serve theirs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_executors_frame_nudges_the_host_tier_to_look() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gpu_service::tests::frame_nudge_child", "--ignored", "--nocapture"])
+            .env("S5_NUDGE", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "an_executors_frame_nudges_the_host_tier_to_look runs it in its own process"]
+    fn frame_nudge_child() {
+        if std::env::var("S5_NUDGE").is_err() { return; }
+        assert!(varena::os::namespace(&format!("nudge{}-", std::process::id())));
+        let (looked, looks) = std::sync::mpsc::channel();
+        let (looked, armed) = (std::sync::Mutex::new(looked), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let watching = armed.clone();
+        let need: varena::Need = Arc::new(move || {
+            if watching.load(Ordering::SeqCst) {
+                let _ = looked.lock().unwrap().send(());
+            }
+            Some(vec![])
+        });
+        let pressure = platform::contain::host_pressure::Pressure::arm(platform::contain::host_pressure::HostMode::Shared).unwrap();
+        let tier = varena::Tier::serve(Some(pressure), need).unwrap().expect("this namespace's tier");
+        tier.look(); // Whatever woke it at its start has been answered.
+        armed.store(true, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("gpu-nudge-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root.join("execution")).unwrap();
+        let generation: crate::catalog::Generation = serde_json::from_value(json!({"identity": "g", "package": "p", "version": "1",
+            "application": "app", "python": "/usr/bin/python3", "interface": {}})).unwrap();
+        let mut callbacks = Callbacks { engine: &engine, id: "nudged", completed: 0, generation: &generation, spool: None, caller: None, tier: Some(&tier) };
+        let frame: Frame = serde_json::from_value(json!({"event": "progress", "stage": "denoise", "position": 1, "total": 8})).unwrap();
+        callbacks.progress(&frame);
+        // A failure backstop only: the look follows the frame's nudge.
+        looks.recv_timeout(std::time::Duration::from_secs(60)).expect("the frame's nudge made the tier look");
+        drop(tier);
+        crate::scratch::remove(&root);
     }
 
     /// A call's decisions reach the memory log in order, one line each with the run, process
