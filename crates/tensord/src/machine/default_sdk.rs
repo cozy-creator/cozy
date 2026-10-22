@@ -68,7 +68,7 @@ impl DefaultSdk {
                 digest.update(file_digest(wheel)?);
                 names.push(name.to_os_string());
             }
-            identified(pending.path())?.require_memory_protocol()?;
+            identified(pending.path())?.meets_default()?;
             let digest = super::hex(&digest.finalize());
             let immutable = self.root.join(&digest);
             if !immutable.exists() {
@@ -146,7 +146,7 @@ fn artifacts(solution: &str) -> io::Result<Vec<Artifact>> {
         if name == "cozy-runtime" { pair.runtime = package.version; } else { pair.tensorfs = package.version; }
         chosen.push(wheel);
     }
-    pair.require_memory_protocol()?;
+    pair.meets_default()?;
     Ok(chosen)
 }
 

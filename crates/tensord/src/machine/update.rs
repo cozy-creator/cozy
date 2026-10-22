@@ -52,20 +52,17 @@ pub struct Pair {
 }
 
 impl Pair {
-    /// Published software floors for memory protocol 1. Patch versions remain independent;
-    /// Runtime's dependency metadata and the executor Hello enforce the actual pair/ABI.
-    fn require_memory_protocol(&self) -> io::Result<()> {
+    /// The default SDK's requirement: a machine that resolves its own pair takes one of this
+    /// TensorD's memory protocol (an older pair still runs when selected: version skew degrades).
+    fn meets_default(&self) -> io::Result<()> {
         let band = |version: &str| -> Option<(u32, u32)> {
             let mut parts = version.split('.');
             Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
         };
-        if band(&self.runtime).is_some_and(|v| v >= (0, 31))
-            && band(&self.tensorfs).is_some_and(|v| v >= (0, 14))
-        { return Ok(()); }
-        Err(io::Error::other(Coded { code: "memory_protocol_incompatible", message: format!(
-            "this TensorD requires Runtime >=0.31.0 and TensorFS >=0.14.0 together; selected Runtime {:?}, TensorFS {:?}. Upgrade through cozy 0.11.5 before cozy 0.12, or stage the binary and both SDK wheels in one machine update",
-            self.runtime, self.tensorfs,
-        ) }))
+        if band(&self.runtime).is_some_and(|v| v >= (0, 31)) && band(&self.tensorfs).is_some_and(|v| v >= (0, 14)) {
+            return Ok(());
+        }
+        Err(io::Error::other(format!("the default SDK resolved Runtime {:?} and TensorFS {:?}, below cozy-runtime>=0.31 and tensorfs>=0.14", self.runtime, self.tensorfs)))
     }
 }
 
@@ -379,16 +376,21 @@ pub fn recover_activation(paths: &Paths) -> io::Result<Recovered> {
     }
 }
 
-/// Checked by the new service before it opens the store or reports readiness, including
-/// an activation requested by an older binary which did not know this memory contract.
-/// A fresh local machine may start idle; its first package install resolves the SDK pair.
-/// Executor memory capability remains checked before Start.
+/// Checked by the new service before it opens the store or reports readiness: a selected SDK
+/// names both wheels (a fresh local machine may start with none; its first package install
+/// resolves the pair). Any versions start: an executor before memory protocol 1 runs without
+/// this machine's ledger (version skew degrades).
 pub fn check_startup_pair(paths: &Paths) -> io::Result<()> {
-    let pair = pair_in(&paths.sdk());
     if paths.unselected_sdk() && read_pending(paths)?.is_none() {
         return Ok(());
     }
-    pair.require_memory_protocol()
+    let pair = pair_in(&paths.sdk());
+    if pair.runtime.is_empty() || pair.tensorfs.is_empty() {
+        return Err(io::Error::other(Coded { code: "sdk_selection_unreadable", message: format!(
+            "the selected SDK at {} names no Runtime and TensorFS wheel pair", paths.sdk().display(),
+        ) }));
+    }
+    Ok(())
 }
 
 fn read_pending(paths: &Paths) -> io::Result<Option<Pending>> {
@@ -831,9 +833,6 @@ impl Updates {
                 None => from.clone(),
             };
             to.cozy = binary.as_ref().map_or_else(|| from.cozy.clone(), |b| b.version.clone());
-            if binary.is_some() || !to.runtime.is_empty() || !to.tensorfs.is_empty() {
-                to.require_memory_protocol()?;
-            }
             self.set(|s| s.to = to.clone())?;
             let activation = self.drain()?;
             self.set(|s| s.enter("installing"))?;
@@ -1011,7 +1010,6 @@ impl Updates {
             }
         }
         let pair = identified(candidate)?;
-        pair.require_memory_protocol()?;
         platform::durable::sync_dir(candidate)?;
         Ok(pair)
     }
@@ -1328,34 +1326,6 @@ fn server(error: io::Error) -> (u16, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_memory_upgrade_requires_both_sdk_members_and_allows_patch_skew() {
-        for (runtime, tensorfs) in [("0.30.3", "0.13.3"), ("0.31.0", "0.13.3"), ("0.30.3", "0.14.0"), ("0.31.0", "")] {
-            let pair = Pair { runtime: runtime.into(), tensorfs: tensorfs.into(), ..Default::default() };
-            assert!(pair.require_memory_protocol().is_err(), "{pair:?}");
-        }
-        Pair { runtime: "0.31.7".into(), tensorfs: "0.14.2".into(), ..Default::default() }.require_memory_protocol().unwrap();
-    }
-
-    #[test]
-    fn a_new_service_refuses_the_old_selected_sdk_before_readiness() {
-        let root = tempfile::tempdir().unwrap();
-        let paths = Paths::new(&root.path().join("engine"), root.path());
-        check_startup_pair(&paths).unwrap(); // no selected pair: CPU baseline stays available
-        fs::create_dir_all(&paths.image_wheels).unwrap();
-        wheel(&paths.image_wheels, "cozy_runtime", "0.30.3", None);
-        wheel(&paths.image_wheels, "tensorfs", "0.13.3", None);
-        let error = check_startup_pair(&paths).unwrap_err();
-        assert!(error.to_string().contains("cozy 0.11.5"));
-        let next = root.path().join("next");
-        fs::create_dir_all(&next).unwrap();
-        wheel(&next, "cozy_runtime", "0.31.1", None);
-        wheel(&next, "tensorfs", "0.14.0", None);
-        fs::create_dir_all(paths.current_sdk_link().parent().unwrap()).unwrap();
-        relink(&paths.current_sdk_link(), Some(&next)).unwrap();
-        check_startup_pair(&paths).unwrap();
-    }
 
     /// A minimal wheel: METADATA, optionally a bundled script.
     fn wheel(dir: &Path, distribution: &str, version: &str, script: Option<&[u8]>) -> PathBuf {
@@ -1828,6 +1798,42 @@ mod tests {
             operation: id.into(), pin: None,
             runtime: Some(Choice { file, sha256, ..Default::default() }), tensorfs: None, cozy: None, binary: None, gpu_memory_limit: None, toolchain: false,
         }
+    }
+
+    /// A new service starts on the selected pair, whatever its versions (an older one runs its
+    /// executors without the ledger); only a selection naming no pair is refused.
+    #[test]
+    fn a_new_service_starts_on_an_older_selected_sdk() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(&root.path().join("engine"), root.path());
+        check_startup_pair(&paths).unwrap(); // no selected pair: CPU baseline stays available
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        assert!(check_startup_pair(&paths).is_err(), "a selection naming no pair");
+        wheel(&paths.image_wheels, "cozy_runtime", "0.30.3", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.13.3", None);
+        check_startup_pair(&paths).unwrap();
+    }
+
+    /// Version skew degrades (owner rule): a pair before memory protocol 1 (Runtime 0.30 with
+    /// TensorFS 0.13) stages and activates like any other, refused by nothing; its executors run
+    /// without this machine's ledger (`Pool::grants`).
+    #[test]
+    fn an_sdk_pair_before_the_memory_protocol_stages_and_activates() {
+        let transaction = Activation::prepare();
+        rollback_pending(&transaction.paths, "fixture").unwrap();
+        let updates = Updates::open(transaction.paths.clone(), Box::new(|| true), None, None).unwrap();
+        let older = transaction.root.join("older");
+        fs::create_dir_all(&older).unwrap();
+        let mut request = update_request(&updates, "older", &wheel(&older, "cozy_runtime", "0.30.3", None));
+        let tensorfs = wheel(&older, "tensorfs", "0.13.6", None);
+        let file = tensorfs.file_name().unwrap().to_str().unwrap().to_owned();
+        let (sha256, _) = updates.stage(&file, &mut fs::File::open(&tensorfs).unwrap()).unwrap();
+        request.tensorfs = Some(Choice { file, sha256, ..Default::default() });
+        updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
+        state(&updates, "older", "starting");
+        updates.commit().unwrap();
+        let installed = updates.update("older").unwrap();
+        assert_eq!((installed.to.runtime.as_str(), installed.to.tensorfs.as_str()), ("0.30.3", "0.13.6"));
     }
 
     #[test]
