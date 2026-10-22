@@ -1,753 +1,88 @@
-//! The decision procedure: [`decide`] maps a [`Table`] and a [`Trigger`] to [`Action`]s, pure
-//! (no device, clock, I/O or thread), in the design's §4 order. Own evictions are certain, so
-//! one call plans them through; a remote rung (the trim hook, orphans, asks) is uncertain, so
-//! a call ends there and the applier decides again once it is answered, with the rung marked
-//! [`Tried`] and what it freed counted. Every placement choice is made here: a pass's room and
-//! cuts, relaxing a cut, an OOM's answer, prefetch, a load's placement, an ask's answer, and
-//! admission ([`fits`]).
+//! The order `make_room` takes bytes in, pure (no device, clock, I/O or thread): pages of sets
+//! no open plan uses (least recently used first), then caches nobody holds (least recently
+//! used first), then the plans' own pages, furthest next use first (Belady). Never a pinned or
+//! filling page; a page whose release event is pending is taken once it completes. Also what an
+//! ask gives back, what prefetch maps, and admission ([`fits`]) and placement ([`place`]).
 
-use std::collections::BTreeSet;
+use crate::table::{Key, Table, SLOTS};
 
-use crate::table::{Aside, Class, CutSite, Key, Table};
-
-/// Remote rungs already tried in this demand, and what this demand's earlier rounds freed.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Tried {
-    /// The trim hook ran.
-    pub trimmed: bool,
-    pub orphans: bool,
-    /// (row, ceiling) asked.
-    pub asked: BTreeSet<(u64, Class)>,
-    /// Sites cut at this pass start (each at most once), or proposed at this OOM.
-    pub cut: BTreeSet<String>,
-    /// Bytes this demand's earlier rounds freed, own unmaps and remote answers alike.
-    pub freed: u64,
-    /// The driver refused the page's create with this many bytes free (its measure then): the
-    /// truth over the table's estimate. The free bytes counted never exceed it, and the page
-    /// needs more than it (the driver keeps some for itself).
-    pub driver_free: Option<u64>,
+/// What `make_room` may take, in its order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Victim {
+    /// An own page: its bytes, and whether a release event is still pending on it.
+    Page { key: Key, bytes: u64, releasing: bool },
+    /// An own cache: its bytes.
+    Cache { id: u32, bytes: u64 },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Trigger {
-    /// A bind of an unmapped page, for `req` when a request's pass binds it.
-    Bind { page: Key, req: Option<u64>, tried: Tried },
-    /// Admit every missing page of a retained range together, before any consumer launches.
-    Prepare { pages: Vec<Key>, req: Option<u64>, tried: Tried },
-    /// A pass of `req` over `set` starts needing `room` (measured at its cut levels), or,
-    /// unmeasured, the reserve `unmeasured` sets aside: the room and its step's unmapped pages
-    /// must fit.
-    Pass { req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried: Tried },
-    /// An op of `req`'s pass over `set` (`None`: outside any pass) ran short by `need` (at
-    /// least one page's worth when unknown) at `site`; a collective site recovers locally and
-    /// proposes its finer level for the next pass.
-    Oom { req: u64, set: Option<u32>, need: Option<u64>, site: Option<OomSite>, tried: Tried },
-    /// Reserve future native workspace bytes before executing/capturing a region.
-    Workspace { id: u64, bytes: u64, tried: Tried },
-    /// `req`'s room outside its passes (its setup, between passes), prepared at its open and
-    /// at each pass end, outside the allocator callback, as its [`crate::table::Aside`] says.
-    Outside { req: u64, tried: Tried },
-    /// Another row asks for `bytes` under `ceiling`.
-    Ask { ceiling: Class, bytes: u64 },
-    /// Fetch ahead for `req` into the surplus.
-    Speculate { req: u64, tried: Tried },
-    /// Place a loaded set's unmapped pages into free bytes, evicting nothing.
-    Load { set: u32 },
-}
-
-/// The op site an OOM happened at.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OomSite {
-    pub name: String,
-    pub collective: bool,
-    /// The finest level the op has: never proposed or cut beyond.
-    pub finest: u32,
-    /// The op's shape key: outside any pass the request's memo is per (site, shape).
-    pub shape: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action {
-    /// Run the trim hook: the allocator's slack (part of F) becomes free, before any eviction.
-    Trim(u64),
-    /// Kept pages were unmapped: their bytes are free once custody has let go of them (the
-    /// Withdraws are sent); decide again then.
-    Settle,
-    /// Unmap an own page, of this class now.
-    Unmap { page: Key, class: Class },
-    /// Lend an own idle kept page to the allocator callback for an unmeasured pass: custody
-    /// lets go of it and it stays mapped, so the callback reclaims it only if the pass's
-    /// allocations need it; kept again after.
-    Lend(Key),
-    /// Ask custody to drop this many orphan bytes, least recently used first.
-    ReleaseOrphans(u64),
-    Ask { row: u64, ceiling: Class, bytes: u64 },
-    /// Ask an own cache to give back bytes.
-    Shrink { cache: u32, bytes: u64 },
-    /// The request's step starves: no more speculation until the next step.
-    Starve(u64),
-    /// Map and fill a page for use now.
-    Map(Key),
-    /// Map and fill a page ahead of its use; fails soft.
-    Prefetch(Key),
-    /// Commit an admitted future-allocation reservation.
-    Workspace { id: u64, bytes: u64 },
-    /// The freed bytes become the request's room for its failing op.
-    Claim { req: u64, bytes: u64 },
-    /// The pass's room, set in the same apply as the evictions that made it.
-    Reserve { req: u64, room: u64, measured: bool },
-    /// Cut `site` of the pass over `set` one level finer; the cut level last had `failed_at`
-    /// bytes of room.
-    Cut { req: u64, set: u32, site: String, failed_at: u64 },
-    /// Cut op site `site` outside any pass one level finer at the op's `shape` (the request's
-    /// memo).
-    CutOutside { req: u64, site: String, shape: String },
-    /// Relax `site` one level: its measured room fits the surplus.
-    Relax { req: u64, set: u32, site: String },
-    /// A collective site's level proposed for the next agreement: finer after an OOM (whose
-    /// room was `failed_at`), or one coarser when its measured room fits the surplus.
-    Propose { req: u64, set: u32, site: String, level: u32, failed_at: Option<u64> },
-    /// Lower the request's watermark for the rest of it: its W becomes evictable.
-    Lower(u64),
-    Park(u64),
-    Exhausted { need: u64 },
-}
-
-/// The actions for `trigger`; the last one ends a demand (enough, a remote rung, a cut, a park
-/// or exhaustion).
-pub fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> {
+/// Everything `make_room` may take, in its order; `keep` (the pages being bound) never.
+pub fn victims(t: &Table, keep: &[Key]) -> Vec<Victim> {
     #[cfg(feature = "faults")]
     crate::faults::hit(crate::faults::Point::Decide);
-    match trigger {
-        Trigger::Bind { page, req, tried } => {
-            let bytes = t.page(*page).map_or(0, |p| p.bytes);
-            let need = tried.driver_free.map_or(bytes, |free| bytes.max(free.saturating_add(1)));
-            let mut d = Demand::new(t, need, *req, Some(*page), tried);
-            if let Some(free) = tried.driver_free {
-                d.got = d.got.min(free);
-            }
-            if d.run(Rungs::Bind) == Some(Done::Enough) {
-                d.out.push(Action::Map(*page));
-            }
-            d.out
-        }
-        Trigger::Prepare { pages, req, tried } => {
-            let missing: Vec<Key> = pages.iter().copied().filter(|k| t.page(*k).is_some_and(|p| !p.mapped)).collect();
-            let need = missing.iter().filter_map(|k| t.page(*k)).map(|p| p.bytes).sum();
-            let mut d = Demand::new(t, need, *req, None, tried);
-            if d.run(Rungs::Bind) == Some(Done::Enough) {
-                d.out.extend(missing.into_iter().map(Action::Map));
-            }
-            d.out
-        }
-        Trigger::Workspace { id, bytes, tried } => {
-            let mut d = Demand::new(t, *bytes, None, None, tried);
-            if d.run(Rungs::Bind) == Some(Done::Enough) {
-                d.out.push(Action::Workspace { id: *id, bytes: *bytes });
-            }
-            d.out
-        }
-        Trigger::Pass { req, set, room, unmeasured, tried } => pass(t, *req, *set, *room, *unmeasured, tried),
-        Trigger::Oom { req, set, need, site, tried } => oom(t, *req, *set, *need, site.as_ref(), tried),
-        Trigger::Ask { ceiling, bytes } => answer(t, *ceiling, *bytes),
-        Trigger::Speculate { req, tried } => speculate(t, *req, tried),
-        Trigger::Outside { req, tried } => outside(t, *req, tried),
-        Trigger::Load { set } => {
-            // A GPU-level load stops short of the prepared rooms: every open request's outside
-            // room and next measured pass, else the machine's largest measured outside room;
-            // beside an unmeasured one it takes nothing (the idle-GPU rule; lead, v6 13633).
-            let mut free = t.free().saturating_sub(t.held_back());
-            let mut out = vec![];
-            for (k, p) in t.pages().filter(|(k, p)| k.0 == *set && !p.mapped) {
-                if free < p.bytes {
-                    break;
-                }
-                free -= p.bytes;
-                out.push(Action::Prefetch(k));
-            }
-            out
-        }
-    }
+    let pages = || t.pages().filter(|(k, p)| p.mapped && !p.filling && p.pins.is_empty() && !keep.contains(k));
+    let page = |(key, p): (Key, &crate::table::Page)| Victim::Page { key, bytes: p.bytes, releasing: !p.releasing.is_empty() };
+    let mut idle: Vec<(Key, &crate::table::Page)> = pages().filter(|(k, _)| t.distance(*k).is_none()).collect();
+    idle.sort_by_key(|(k, p)| (p.last_use, *k));
+    let mut caches: Vec<&crate::table::Cache> = t.caches.iter().filter(|c| c.bytes > 0 && !c.held()).collect();
+    caches.sort_by_key(|c| (c.last_use, c.id));
+    let mut planned: Vec<((u32, u32, u32), Key, &crate::table::Page)> = pages().filter_map(|(k, p)| t.distance(k).map(|d| (d, k, p))).collect();
+    planned.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    idle.into_iter()
+        .map(page)
+        .chain(caches.into_iter().map(|c| Victim::Cache { id: c.id, bytes: c.bytes }))
+        .chain(planned.into_iter().map(|(_, k, p)| page((k, p))))
+        .collect()
 }
 
-/// A pass start: its room and its step's unmapped pages (one page, lowered) must fit. When
-/// eviction can't, the uncut site with the highest measured peak is cut (never a collective
-/// one, nor one whose flag is unknown: ranks change those together), the room becoming the
-/// measured room at the finer level or, unmeasured there, the reserve; then the request lowers.
-/// With room to spare, a cut relaxes one level when its measured room fits and beats the room it
-/// failed at; a collective one is proposed one level coarser for the ranks' agreement.
-fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried: &Tried) -> Vec<Action> {
-    let Some(r) = t.request(req) else { return vec![] };
-    let sites = r.sites.get(&set).map(Vec::as_slice).unwrap_or_default();
-    let held = r.room + r.claimed;
-    let unmapped = |lowered: bool| {
-        let step = r.steps.get(r.cursor.step as usize);
-        let sets = step.into_iter().flat_map(|(sets, _)| sets.iter()).filter_map(|s| t.sets.get(*s as usize)?.as_ref());
-        let sizes: Vec<u64> = sets.flat_map(|s| s.pages.iter()).filter(|p| !p.mapped).map(|p| p.bytes).collect();
-        if lowered { sizes.iter().copied().max().unwrap_or(0) } else { sizes.iter().sum() }
-    };
-    let (mut room, mut measured) = (room.unwrap_or(unmeasured), room.is_some());
-    let mut d = Demand::new(t, room.saturating_sub(held) + unmapped(r.lowered), Some(req), None, tried);
-    // Caches shrink only for a measured shortfall (review 6, C3).
-    d.caches = measured;
-    let mut lowered = r.lowered;
-    let mut cut: BTreeSet<&str> = tried.cut.iter().map(String::as_str).collect();
-    loop {
-        match d.run(Rungs::Pass) {
-            Some(Done::Enough) => break,
-            Some(Done::Remote) => return d.out,
-            _ => {}
-        }
-        let fresh = |s: &&CutSite| !s.stuck && !s.collective && s.peak > 0 && s.level < s.finest && !cut.contains(s.name.as_str());
-        if let Some(site) = sites.iter().filter(fresh).max_by_key(|s| (s.peak, std::cmp::Reverse(s.name.clone()))) {
-            cut.insert(&site.name);
-            d.out.push(Action::Cut { req, set, site: site.name.clone(), failed_at: d.got + held });
-            (room, measured) = match site.finer {
-                Some(finer) => (finer, true),
-                None => (unmeasured, false),
-            };
-            d.caches = measured;
-            d.need = room.saturating_sub(held) + unmapped(lowered);
-            continue;
-        }
-        if lowered {
-            d.lowered = true;
-            d.need = room.saturating_sub(held) + unmapped(true);
-            match d.run(Rungs::Lowered) {
-                Some(Done::Enough) => break,
-                Some(Done::Remote) => return d.out,
-                _ => {
-                    d.exhausted();
-                    return d.out;
-                }
-            }
-        }
-        d.out.push(Action::Lower(req));
-        lowered = true;
-        d.need = room.saturating_sub(held) + unmapped(true);
-    }
-    // Relaxing is speculation: only into what is left once this pass has its room.
-    let spare = d.got - d.need;
-    let coarser = sites.iter().filter(|s| s.level > 0).filter_map(|s| s.coarser.map(|c| (s, c)));
-    let fitting = |(_, (c, failed)): &(&CutSite, (u64, Option<u64>))| c.saturating_sub(room) <= spare && failed.is_none_or(|f| room + spare > f);
-    let relax = coarser.filter(fitting).min_by_key(|(s, (c, _))| (*c, s.name.clone()));
-    if let (true, Some((site, (coarse, _)))) = (measured, relax) {
-        d.out.push(match site.collective {
-            true => Action::Propose { req, set, site: site.name.clone(), level: site.level - 1, failed_at: None },
-            false => Action::Relax { req, set, site: site.name.clone() },
-        });
-        room = room.max(coarse);
-    }
-    // Unmeasured, its room is made up front from the free bytes and its own row's idle pages,
-    // lazily: they stay mapped for the callback to reclaim as the pass allocates, the kept ones
-    // lent to it (orphans go). Peers are asked only on an OOM's escalation, and caches never
-    // shrink for it (review 6, C3): a pass runs again, and measuring one model's new shape
-    // must not drop another's weights or graphs on a stacked pod. Never a declared use.
-    if !measured {
-        let mut idle = Demand::new(t, u64::MAX, Some(req), None, tried);
-        idle.gone.clone_from(&d.gone);
-        let remote = idle.idle(false);
-        d.out.append(&mut idle.out);
-        if remote {
-            return d.out;
-        }
-    }
-    d.out.push(Action::Reserve { req, room, measured });
-    d.out
-}
-
-/// An out-of-memory: free bytes count once per episode (the cap was stale); after that only
-/// what this demand freed. Then the demand order; at its end, a cut of the op's site (never a
-/// collective's mid-pass: its finer level is proposed for the next pass), lowering, parking,
-/// exhaustion. Each answer is progress, so a sequence ends.
-/// Outside any pass (no set) no pass's site is cut and no running W lowers: the demand order,
-/// then the request's own cut of an op site outside any pass (its memo), then a park, then
-/// exhaustion.
-fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&OomSite>, tried: &Tried) -> Vec<Action> {
-    let Some(r) = t.request(req) else { return vec![Action::Exhausted { need: need.unwrap_or(0) }] };
-    // A need beyond what the request could ever get: Exhausted at once, nothing lowered or
-    // evicted for it.
-    if let Some(n) = need.filter(|n| *n > t.reachable()) {
-        return vec![Action::Exhausted { need: n - t.reachable() }];
-    }
-    let sites = set.and_then(|s| r.sites.get(&s)).map(Vec::as_slice).unwrap_or_default();
-    let level = |s: &OomSite| match set {
-        Some(_) => sites.iter().find(|x| x.name == s.name).map_or(0, |x| x.level),
-        None => r.outside.get(&(s.name.clone(), s.shape.clone())).copied().unwrap_or(0),
-    };
-    // A retry that failed again at the same site and level, its allocation no further than
-    // the last failure there, retries only on progress: bytes freed beyond what is free now
-    // (the driver refused a claim at decided-free: one more page is progress). An answer that
-    // would free nothing more escalates (a cut, else a park or exhaustion), never another Retry
-    // (lead, v6 13592 and e199).
-    let at = t.allocated.saturating_add(need.unwrap_or(0));
-    let key = site.map_or((String::new(), String::new(), 0), |s| (s.name.clone(), s.shape.clone(), level(s)));
-    let again = r.retried.as_ref().is_some_and(|m| (&m.site, &m.shape, m.level) == (&key.0, &key.1, key.2) && at <= m.at);
-    // A site at its finest level is not cut or proposed further: the next rung follows.
-    let outside = site.filter(|s| set.is_none() && !s.collective && level(s) < s.finest);
-    let site = set.zip(site).filter(|(_, s)| level(s) < s.finest);
-    // Unknown: any page's worth is progress.
-    let n = need.unwrap_or(1);
-    let mut d = Demand::new(t, n, Some(req), None, tried);
-    d.oom = true;
-    if again {
-        // The op had its claim and the bytes free when this demand began (its own rounds'
-        // frees aside): it needs more than that, counted with the claim.
-        let before = t.free().saturating_sub(tried.freed);
-        d.need = n.max(r.claimed + before + 1);
-        d.got = t.free() + r.claimed;
-    } else if r.episode.claimed_free {
-        d.got = t.free().min(tried.freed);
-    }
-    let mut out = vec![];
-    if let Some((set, s)) = site.filter(|(_, s)| s.collective) {
-        if !tried.cut.contains(&s.name) {
-            out.push(Action::Propose { req, set, site: s.name.clone(), level: level(s) + 1, failed_at: Some(r.room + r.claimed + t.free()) });
-        }
-    }
-    match d.run(Rungs::Oom) {
-        Some(Done::Remote) => {
-            out.append(&mut d.out);
-            return out;
-        }
-        Some(Done::Enough) => {}
-        // The previous allocation claim is still available. Try newly freed bytes before
-        // cutting or lowering, even when this round alone freed less than the full need; a
-        // failure again there only when this round frees something.
-        Some(Done::Lowered) | None if d.got > 0 && (!again || d.out.iter().any(frees)) => {}
-        Some(Done::Lowered) | None if set.is_none() => match outside {
-            Some(s) => d.out.push(Action::CutOutside { req, site: s.name.clone(), shape: s.shape.clone() }),
-            None if d.got == 0 || again => d.park_or_exhaust(r.episode.parked),
-            None => {}
-        },
-        Some(Done::Lowered) | None => {
-            let cuttable = site.filter(|(_, s)| !s.collective && !sites.iter().any(|x| x.name == s.name && x.stuck));
-            if let Some((set, s)) = cuttable {
-                d.out.push(Action::Cut { req, set, site: s.name.clone(), failed_at: r.room + r.claimed + t.free() });
-            } else {
-                if !r.lowered {
-                    d.out.push(Action::Lower(req));
-                }
-                d.lowered = true;
-                match d.run(Rungs::Lowered) {
-                    Some(Done::Remote) => {
-                        out.append(&mut d.out);
-                        return out;
-                    }
-                    None if d.got == 0 || (again && !d.out.iter().any(frees)) => d.park_or_exhaust(r.episode.parked),
-                    _ => {}
-                }
-            }
-        }
-    }
-    let escalated = d.out.iter().any(|a| matches!(a, Action::Cut { .. } | Action::CutOutside { .. } | Action::Park(_) | Action::Exhausted { .. }));
-    if d.got > 0 && !(again && escalated) {
-        // A known need claims what it needs; an unknown one everything gathered (again: beyond
-        // its claim so far).
-        let bytes = if need.is_some() { d.got.min(d.need) } else { d.got };
-        let bytes = if again { bytes.saturating_sub(r.claimed) } else { bytes };
-        d.out.push(Action::Claim { req, bytes });
-    }
-    out.append(&mut d.out);
-    out
-}
-
-/// An action that gives bytes back (now, or once a remote rung answers).
-fn frees(a: &Action) -> bool {
-    matches!(a, Action::Unmap { .. } | Action::Shrink { .. } | Action::Trim(_) | Action::ReleaseOrphans(_) | Action::Ask { .. } | Action::Settle)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Done {
-    Enough,
-    /// Ended on a remote rung: decide again once answered.
-    Remote,
-    /// Nothing left but cutting or lowering.
-    Lowered,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rungs {
-    Bind,
-    Pass,
-    Oom,
-    /// Only the lowered request's W, after everything else.
-    Lowered,
-}
-
-struct Demand<'a> {
-    t: &'a Table,
-    need: u64,
-    /// Bytes available so far: F plus what the planned actions free.
-    got: u64,
-    /// Bytes of kept pages planned out: free once custody lets go (a Settle).
-    withdrawn: u64,
-    req: Option<u64>,
-    /// The page being bound: never a victim.
-    keep: Option<Key>,
-    tried: &'a Tried,
-    oom: bool,
-    lowered: bool,
-    gone: BTreeSet<Key>,
-    /// Caches this decision shrinks; none at all when `caches` is off (an unmeasured need).
-    shrunk: BTreeSet<u32>,
-    caches: bool,
-    out: Vec<Action>,
-}
-
-/// What a class's turn gives back: an own page, or an own cache (torch's bytes).
-enum Victim {
-    Page(Key, u64),
-    Cache(u32, u64),
-}
-
-impl<'a> Demand<'a> {
-    fn new(t: &'a Table, need: u64, req: Option<u64>, keep: Option<Key>, tried: &'a Tried) -> Demand<'a> {
-        Demand { t, need, got: t.free(), withdrawn: 0, req, keep, tried, oom: false, lowered: false, gone: BTreeSet::new(), shrunk: BTreeSet::new(), caches: true, out: vec![] }
-    }
-
-    fn enough(&self) -> bool {
-        self.got >= self.need
-    }
-
-    /// Bytes already retiring plus the kept pages this decision will withdraw.
-    fn returning(&self) -> u64 {
-        self.withdrawn + self.t.returning()
-    }
-
-    fn short(&self) -> u64 {
-        self.need.saturating_sub(self.got + self.returning())
-    }
-
-    /// Enough once the withdrawn kept pages are free.
-    fn covered(&self) -> bool {
-        self.got + self.returning() >= self.need
-    }
-
-    /// Covered by returning pages, or real partial OOM progress from our own withdrawals:
-    /// settle before degrading. The next round counts these own bytes through tried.freed.
-    fn settles(&mut self) -> bool {
-        if self.enough() || self.returning() == 0 || (!self.covered() && !(self.oom && self.withdrawn > 0)) {
-            return false;
-        }
-        self.out.push(Action::Settle);
-        true
-    }
-
-    /// Own pages of `class`, in eviction order.
-    fn own(&self, class: Class) -> Vec<(Key, u64)> {
-        let t = self.t;
-        type Candidate = (Key, u64, u64, Option<(u32, u32, u32)>);
-        let mut pages: Vec<Candidate> = t
-            .pages()
-            .filter(|(k, _)| Some(*k) != self.keep && !self.gone.contains(k) && t.class(*k) == Some(class))
-            .map(|(k, p)| (k, p.bytes, p.last_use, t.distance(k)))
-            .collect();
-        match class {
-            // Least recently used first.
-            Class::N => pages.sort_by_key(|(k, _, used, _)| (*used, *k)),
-            // Furthest next use first (Belady).
-            _ => pages.sort_by(|a, b| b.3.cmp(&a.3).then(a.0.cmp(&b.0))),
-        }
-        if class == Class::W {
-            // Only a lowered request's working set, after lowering.
-            let lowered = |k: Key| t.user(k).is_some_and(|r| r.lowered || (self.lowered && Some(r.id) == self.req));
-            pages.retain(|(k, ..)| lowered(*k));
-        }
-        pages.into_iter().map(|(k, b, ..)| (k, b)).collect()
-    }
-
-    /// Own pages and caches of `class` in its order: N least recently used first (a cache by
-    /// its set's oldest page, before them), D furthest next use first (a cache before its set's
-    /// pages); other classes have pages only.
-    fn victims(&self, class: Class) -> Vec<Victim> {
-        let t = self.t;
-        let pages = self.own(class);
-        if !matches!(class, Class::N | Class::D) {
-            return pages.into_iter().map(|(k, b)| Victim::Page(k, b)).collect();
-        }
-        let caches: Vec<&crate::table::Cache> = t.caches.iter().filter(|c| self.caches && c.bytes > 0 && !self.shrunk.contains(&c.id) && t.cache_class(c) == class).collect();
-        if caches.is_empty() {
-            return pages.into_iter().map(|(k, b)| Victim::Page(k, b)).collect();
-        }
-        type Ordered = ((u64, u32, u32, u32), u8, u64, Victim);
-        let mut all: Vec<Ordered> = Vec::with_capacity(pages.len() + caches.len());
-        for (k, b) in pages {
-            let order = match class {
-                Class::N => (t.page(k).map_or(0, |p| p.last_use), 0, 0, 0),
-                _ => t.distance(k).map_or((0, 0, 0, 0), |d| (0, u32::MAX - d.0, u32::MAX - d.1, u32::MAX - d.2)),
-            };
-            all.push((order, 1, u64::from(k.0) << 32 | u64::from(k.1), Victim::Page(k, b)));
-        }
-        for c in caches {
-            let order = match class {
-                Class::N => {
-                    // Its own sets' pages only (review 6, C5).
-                    let oldest = c.sets.iter().filter_map(|s| t.sets.get(*s as usize)?.as_ref()).flat_map(|s| s.pages.iter()).filter(|p| p.mapped).map(|p| p.last_use).min();
-                    (oldest.map_or(c.last_use, |o| o.min(c.last_use)), 0, 0, 0)
-                }
-                _ => t.cache_distance(c).map_or((0, 0, 0, 0), |d| (0, u32::MAX - d.0, u32::MAX - d.1, u32::MAX - d.2)),
-            };
-            all.push((order, 0, u64::from(c.id), Victim::Cache(c.id, c.bytes)));
-        }
-        all.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-        all.into_iter().map(|(.., v)| v).collect()
-    }
-
-    /// Gives back own pages and caches of `class` until enough (counting kept pages' bytes,
-    /// which come back once custody lets go). A cache shrinks at its class's turn on every
-    /// demand, never only on an OOM.
-    fn evict(&mut self, class: Class) {
-        for victim in self.victims(class) {
-            if self.covered() {
-                return;
-            }
-            let (page, bytes) = match victim {
-                Victim::Cache(cache, bytes) => {
-                    let bytes = bytes.min(self.short());
-                    self.out.push(Action::Shrink { cache, bytes });
-                    self.shrunk.insert(cache);
-                    self.got += bytes;
-                    continue;
-                }
-                Victim::Page(page, bytes) => (page, bytes),
-            };
-            if class == Class::S {
-                if let Some((r, _)) = self.t.page(page).and_then(|p| p.speculative) {
-                    if !self.out.contains(&Action::Starve(r)) {
-                        self.out.push(Action::Starve(r));
-                    }
-                }
-            }
-            self.out.push(Action::Unmap { page, class });
-            self.gone.insert(page);
-            match self.t.page(page).is_some_and(|p| p.kept) {
-                true => self.withdrawn += bytes,
-                false => self.got += bytes,
-            }
-        }
-    }
-
-    /// Every own cache not shrunk yet, least recently used first (an idle process's answer).
-    fn shrink(&mut self) {
-        let mut caches: Vec<_> = self.t.caches.iter().filter(|c| c.bytes > 0 && !self.shrunk.contains(&c.id) && self.t.cache_class(c) != Class::P).collect();
-        caches.sort_by_key(|c| (c.last_use, c.id));
-        for c in caches {
-            if self.covered() {
-                return;
-            }
-            let bytes = c.bytes.min(self.short());
-            self.out.push(Action::Shrink { cache: c.id, bytes });
-            self.got += bytes;
-        }
-    }
-
-    /// Asks every untried row with bytes under `ceiling`; true when it asked.
-    fn ask(&mut self, ceiling: Class) -> bool {
-        let mut rows: Vec<_> = self.t.others.iter().filter(|r| !self.tried.asked.contains(&(r.row, ceiling)) && r.evictable(ceiling) > 0).collect();
-        rows.sort_by_key(|r| (std::cmp::Reverse(r.evictable(ceiling)), r.row));
-        let mut asked = false;
-        let mut left = self.short();
-        for r in rows {
-            if left == 0 {
-                break;
-            }
-            let bytes = left.min(r.evictable(ceiling));
-            self.out.push(Action::Ask { row: r.row, ceiling, bytes });
-            left -= bytes;
-            asked = true;
-        }
-        asked
-    }
-
-    /// Runs the demand order to enough, a remote rung, or the end of eviction.
-    fn run(&mut self, rungs: Rungs) -> Option<Done> {
-        if self.enough() {
-            return Some(Done::Enough);
-        }
-        if self.settles() {
-            return Some(Done::Remote);
-        }
-        if rungs == Rungs::Lowered {
-            self.evict(Class::W);
-            if self.settles() {
-                return Some(Done::Remote);
-            }
-            return self.enough().then_some(Done::Enough);
-        }
-        if !self.tried.trimmed && self.t.slack() > 0 {
-            self.out.push(Action::Trim(self.short().min(self.t.slack())));
-            return Some(Done::Remote);
-        }
-        if !self.tried.orphans && self.t.orphans > 0 {
-            self.out.push(Action::ReleaseOrphans(self.short().min(self.t.orphans)));
-            return Some(Done::Remote);
-        }
-        self.evict(Class::S);
-        self.evict(Class::N);
-        if self.enough() {
-            return Some(Done::Enough);
-        }
-        if self.settles() || self.ask(Class::N) {
-            return Some(Done::Remote);
-        }
-        self.evict(Class::D);
-        if self.enough() {
-            return Some(Done::Enough);
-        }
-        if self.settles() || self.ask(Class::D) {
-            return Some(Done::Remote);
-        }
-        if rungs == Rungs::Bind {
-            // Mid-pass nothing is cut: the binding request lowers and streams its own W.
-            if let Some(r) = self.req.and_then(|id| self.t.request(id)).filter(|r| !r.lowered) {
-                self.out.push(Action::Lower(r.id));
-            }
-            self.lowered = true;
-            self.evict(Class::W);
-            if self.enough() {
-                return Some(Done::Enough);
-            }
-            if self.settles() {
-                return Some(Done::Remote);
-            }
-            self.exhausted();
-            return None;
-        }
-        Some(Done::Lowered)
-    }
-
-    /// Every idle byte, lazily: orphans, own S and N staying mapped (the kept ones lent, custody
-    /// settled after), and with `peers` others' S and N asked for. True when a remote rung is
-    /// out.
-    fn idle(&mut self, peers: bool) -> bool {
-        if !self.tried.orphans && self.t.orphans > 0 {
-            self.out.push(Action::ReleaseOrphans(self.t.orphans));
-            return true;
-        }
-        let mut lent = false;
-        for class in [Class::S, Class::N] {
-            let kept: Vec<Key> = self.own(class).into_iter().map(|(k, _)| k).filter(|k| self.t.page(*k).is_some_and(|p| p.kept)).collect();
-            lent |= !kept.is_empty();
-            self.out.extend(kept.into_iter().map(Action::Lend));
-        }
-        // A lent page is the callback's only once custody has let go of it: settled first.
-        if lent {
-            self.out.push(Action::Settle);
-            return true;
-        }
-        peers && self.ask(Class::N)
-    }
-
-    fn park_or_exhaust(&mut self, parked: bool) {
-        match (self.req, parked || self.t.headroom == 0) {
-            (Some(r), false) => self.out.push(Action::Park(r)),
-            _ => self.exhausted(),
-        }
-    }
-
-    fn exhausted(&mut self) {
-        let need = self.need.saturating_sub(self.got);
-        self.out.push(Action::Exhausted { need });
-    }
-}
-
-/// A request's room outside its passes. Measured: the free bytes and own idle pages the
-/// callback can reclaim (S and N, not kept) cover it, else kept S and N pages are lent, least
-/// recently used first, until they do. Its package never measured: every idle byte, lazily
-/// (orphans, others' S and N asked for, own kept S and N lent); it cannot run again, as a pass
-/// can. No dispatch key: its own idle pages, lent.
-fn outside(t: &Table, req: u64, tried: &Tried) -> Vec<Action> {
-    let Some(r) = t.request(req) else { return vec![] };
-    let mut d = Demand::new(t, r.aside.bytes().unwrap_or(u64::MAX), Some(req), None, tried);
-    let room = match r.aside {
-        Aside::Measured(room) => room,
-        Aside::Unmeasured => {
-            d.idle(true);
-            return d.out;
-        }
-        Aside::Unknown => {
-            d.idle(false);
-            return d.out;
-        }
-    };
-    let idle: Vec<(Key, u64)> = [Class::S, Class::N].into_iter().flat_map(|c| d.own(c)).collect();
-    let kept = |k: &Key| t.page(*k).is_some_and(|p| p.kept);
-    let mut got = t.free() + idle.iter().filter(|(k, _)| !kept(k)).map(|(_, b)| b).sum::<u64>();
-    for (k, b) in idle.into_iter().filter(|(k, _)| kept(k)) {
-        if got >= room {
-            break;
-        }
-        d.out.push(Action::Lend(k));
-        got += b;
-    }
-    if d.out.iter().any(|a| matches!(a, Action::Lend(_))) {
-        d.out.push(Action::Settle);
-    }
-    d.out
-}
-
-/// The own ask thread's answer, from pages only (the thread runs no caller code): S, then N
-/// (least recently used), then under a D ceiling the furthest D; never W or P. An idle process
-/// also wants its trim and caches run, which its trim thread does after the answer.
-fn answer(t: &Table, ceiling: Class, bytes: u64) -> Vec<Action> {
-    let tried = Tried::default();
-    let mut d = Demand { got: 0, ..Demand::new(t, bytes, None, None, &tried) };
-    d.evict(Class::S);
-    d.evict(Class::N);
-    if ceiling >= Class::D {
-        d.evict(Class::D);
-    }
-    // Idle: its trim and caches answer too.
-    if t.requests.is_empty() && !d.enough() {
-        if t.slack() > 0 {
-            d.out.push(Action::Trim(t.slack()));
-        }
-        d.shrink();
-    }
-    d.out
-}
-
-/// Prefetch for `req` into the surplus: F, then orphans, then own N, never anything with a
-/// declared use; in shared mode only own N (the footprint never grows). Needs a measured pass,
-/// a declared fill and no starvation; each page once per pass, nearest use first. A page for a
-/// later step leaves that step's extra room free, so a prefetch never makes a step's room come
-/// from D or W: demand evicts what it would without it.
-fn speculate(t: &Table, req: u64, tried: &Tried) -> Vec<Action> {
-    let Some(r) = t.request(req) else { return vec![] };
-    if !r.measured || r.starved || t.requests.iter().any(|o| !o.measured) {
-        return vec![];
-    }
-    let declared = |set: u32| t.sets.get(set as usize).and_then(|s| s.as_ref()).is_some_and(|s| s.declared);
-    let mut wanted: Vec<(Key, u64, (u32, u32, u32))> = t
+/// What an ask from another row takes, up to `bytes`: pages no plan of this row's uses (least
+/// recently used first), then pages only a request waiting on a child call uses (furthest next
+/// use first: a blocked parent's working set goes to its child). Never a cache, never a page in
+/// use or with a release pending (an answer never waits).
+pub fn answer(t: &Table, bytes: u64) -> Vec<Key> {
+    #[cfg(feature = "faults")]
+    crate::faults::hit(crate::faults::Point::Decide);
+    let waiting = |k: Key| t.requests.iter().all(|r| r.yielded || r.distance(k).is_none());
+    // (No use, else the furthest; then least recently used; page; bytes.)
+    type Ordered = (Option<std::cmp::Reverse<(u32, u32, u32)>>, u64, Key, u64);
+    let mut idle: Vec<Ordered> = t
         .pages()
-        .filter(|(k, p)| !p.mapped && declared(k.0) && !r.speculated.contains(k))
-        .filter_map(|(k, p)| r.distance(k).map(|d| (k, p.bytes, d)))
+        .filter(|(k, p)| p.mapped && !p.filling && p.pins.is_empty() && p.releasing.is_empty() && waiting(*k))
+        .map(|(k, p)| (t.requests.iter().filter_map(|r| r.distance(k)).min().map(std::cmp::Reverse), p.last_use, k, p.bytes))
         .collect();
-    wanted.sort_by_key(|(k, _, d)| (*d, *k));
-    // The extra room each step ahead needs beyond the current one; `None`: unmeasured.
-    let reserve = |ahead: u32| -> Option<u64> {
-        (1..=ahead).map(|i| r.rooms.get((r.cursor.step + i) as usize).copied().flatten().map(|room| room.saturating_sub(r.room))).try_fold(0, |m, x| x.map(|x| m.max(x)))
-    };
-    let mut d = Demand { got: if t.shared { 0 } else { t.free() }, ..Demand::new(t, 0, Some(req), None, tried) };
-    // Kept pages stay: freeing one waits on custody, and it is the cache.
-    let n: Vec<(Key, u64)> = d.own(Class::N).into_iter().filter(|(k, _)| !t.page(*k).is_some_and(|p| p.kept)).collect();
-    let mut n = n.into_iter();
-    for (page, bytes, distance) in wanted {
-        let Some(keep) = reserve(distance.0) else { return d.out };
-        while d.got < bytes + keep {
-            if !t.shared && !d.tried.orphans && t.orphans > 0 {
-                d.out.push(Action::ReleaseOrphans(bytes + keep - d.got));
-                return d.out;
-            }
-            let Some((victim, b)) = n.next() else { return d.out };
-            d.out.push(Action::Unmap { page: victim, class: Class::N });
-            d.got += b;
-        }
-        d.out.push(Action::Prefetch(page));
-        d.got -= bytes;
-    }
-    d.out
+    idle.sort();
+    let mut got = 0;
+    idle.into_iter()
+        .take_while(|(.., b)| {
+            let more = got < bytes;
+            got += b;
+            more
+        })
+        .map(|(_, _, k, _)| k)
+        .collect()
+}
+
+/// What prefetch maps for `req` into free bytes only: the next [`SLOTS`] unmapped blocks of its
+/// current step's sets past their cursors, nearest first, while they fit.
+pub fn prefetch(t: &Table, req: u64) -> Vec<Key> {
+    #[cfg(feature = "faults")]
+    crate::faults::hit(crate::faults::Point::Decide);
+    let Some(r) = t.request(req) else { return vec![] };
+    let mut ahead: Vec<((u32, u32, u32), Key, u64)> = t
+        .pages()
+        .filter(|(_, p)| !p.mapped)
+        .filter_map(|(k, p)| r.distance(k).filter(|d| d.0 == 0 && d.1 == 0 && u64::from(d.2) < SLOTS).map(|d| (d, k, p.bytes)))
+        .collect();
+    ahead.sort();
+    let mut free = t.free();
+    ahead
+        .into_iter()
+        .take_while(|(.., b)| {
+            let fits = *b <= free;
+            free = free.saturating_sub(*b);
+            fits
+        })
+        .map(|(_, k, _)| k)
+        .collect()
 }
 
 /// A row's facts as admission reads them.
@@ -774,9 +109,9 @@ pub fn yielded_beside(yielded: &[(u64, u64); YIELDED], family: Option<u64>) -> u
     yielded.iter().filter(|(f, _)| family != Some(*f) || *f == 0).map(|(_, w)| w).sum()
 }
 
-/// Whether a request whose W is `w` (`None`: unmeasured) fits beside `rows` and the dispatched
-/// requests not yet running: contexts + pins outside a running W + each running request's
-/// largest remaining W + this one's ≤ capacity less foreign bytes. An idle GPU always fits (a
+/// Whether a request whose W is `w` (its recorded peak; `None`: unmeasured) fits beside `rows`
+/// and the dispatched requests not yet running: contexts + pins outside a running W + each
+/// running request's peak + this one's ≤ capacity less foreign bytes. An idle GPU always fits (a
 /// request larger than the card streams); anything unmeasured fits only there. A request
 /// waiting on a child call counts too, except for its own family's child (`family`).
 pub fn fits(capacity: u64, foreign: u64, rows: &[Admitted], dispatched: &[Option<u64>], w: Option<u64>, family: Option<u64>) -> bool {

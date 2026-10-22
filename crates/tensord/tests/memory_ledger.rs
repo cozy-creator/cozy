@@ -21,7 +21,7 @@ use tensord::{
     memory::{self, Gpu, MemoryLog, Peaks},
 };
 use varena::{
-    layout::Layout, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, PartId, Peak, Plan, SetSpec, Step, Torch,
+    layout::Layout, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Memory, PartId, Peak, Plan, SetSpec, Step,
 };
 
 const MIB: u64 = 1 << 20;
@@ -112,10 +112,10 @@ fn executor_stand_in() {
             reply = match (command.as_str(), args.as_str()) {
                 ("load", _) => {
                     let request = memory.request(&format!("load-{}", std::process::id()), plan()).unwrap();
-                    let pass = request.pass(set, "load", "1", Torch::default()).unwrap();
+                    let pass = request.pass(set, "k").unwrap();
                     let pins: Vec<_> = (0..PARTS.len() as u32).map(|block| memory.bind(set, block, 0).unwrap()).collect();
                     drop(pins);
-                    pass.end(Measured::default(), Torch::default());
+                    pass.end(0);
                     let stats = request.end();
                     let origins: Vec<String> = stats.trace.iter().map(|bind| format!("{:?}", bind.origin)).collect();
                     format!("{} {} {}", origins.join(","), stats.moved.kept.bytes, stats.moved.store.bytes)
@@ -125,12 +125,12 @@ fn executor_stand_in() {
                     "open".into()
                 }
                 ("pass", shape) => {
-                    pass = Some(request.as_ref().unwrap().pass(set, "run", shape, Torch::default()).unwrap());
+                    pass = Some(request.as_ref().unwrap().pass(set, shape).unwrap());
                     "passing".into()
                 }
                 ("done", room) => {
                     let room: u64 = room.parse().unwrap();
-                    pass.take().unwrap().end(Measured { allocated_peak: room, slack: room / 8, ..Default::default() }, Torch::default());
+                    pass.take().unwrap().end(room);
                     "done".into()
                 }
                 ("yield", family) => {
@@ -235,7 +235,7 @@ impl Drop for StandIn {
 /// A peak record's key.
 fn key(peak: &Peak) -> &str {
     match peak {
-        Peak::Request { key, .. } | Peak::Compute { key, .. } | Peak::Host { key, .. } | Peak::Pass { key, .. } | Peak::Set { key, .. } => key,
+        Peak::Request { key, .. } | Peak::Compute { key, .. } | Peak::Host { key, .. } | Peak::Set { key, .. } => key,
     }
 }
 
@@ -314,7 +314,7 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
         peaks
     };
     let measured = sorted(gpu.ledger.peaks());
-    assert!(measured.iter().any(|peak| matches!(peak, Peak::Pass { room, .. } if room.slack > 0)), "{measured:?}");
+    assert!(measured.iter().any(|peak| matches!(peak, Peak::Compute { bytes, .. } if *bytes > 0)), "{measured:?}");
     for restart in ["b", "c"] {
         let other = gpu_id(restart);
         let restored = Gpu::create("0", &[inventory(&other)], None, HostMode::Dedicated, &Peaks::at(dir.path().join("peaks")), &log).unwrap();
