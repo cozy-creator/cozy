@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import weakref
+from collections.abc import Callable
 from pathlib import Path
 
 import tensorfs
@@ -298,27 +299,39 @@ def gone(memory: weakref.ref[Memory], phase: str) -> None:
 
 
 def capping(mem: Memory, unet: UNet2DConditionModel) -> None:
-    """torch's cap: at each pass's start at least `torch_limit` (and the pass's measured room);
-    within the pass, oom answers only ever raise it."""
+    """torch's cap: at each pass's start at least `torch_limit` as it stands then (and the pass's
+    measured room); within the pass, oom answers only ever raise it. `op` rows show the limit at
+    the pass's first op: what varena's thread changed after the start."""
     seen: list[tuple[str, int, int]] = []
+    capping_ = mem._cap
+
+    def cap(room: int = 0, start: bool = False) -> None:
+        limit = mem.native.torch_limit()
+        capping_(room, start)
+        if start:
+            seen.append(("start", mem.capped or 0, limit))
 
     def op(*_: object) -> None:
         r = mem._current()
-        seen.append(("start", mem.capped or 0, mem.native.torch_limit()))
+        seen.append(("op", mem.capped or 0, mem.native.torch_limit()))
         for _ in range(2):
             r.oom(None, None)
             seen.append(("oom", mem.capped or 0, mem.native.torch_limit()))
 
+    mem._cap = cap  # type: ignore[method-assign]
     hook = unet.conv_in.register_forward_pre_hook(op)
-    with mem.request("capping", plan=[unet, unet]):
-        forward(unet, mem.device, 0)
-        forward(unet, mem.device, 1)
-    hook.remove()
+    try:
+        with mem.request("capping", plan=[unet, unet]):
+            forward(unet, mem.device, 0)
+            forward(unet, mem.device, 1)
+    finally:
+        hook.remove()
+        mem._cap = capping_  # type: ignore[method-assign]
     starts = [cap >= limit for kind, cap, limit in seen if kind == "start"]
     caps = [cap for _, cap, _ in seen]
-    rising = all(a <= b for pass_ in (caps[:3], caps[3:]) for a, b in zip(pass_, pass_[1:]))
+    rising = all(a <= b for pass_ in (caps[:4], caps[4:]) for a, b in zip(pass_, pass_[1:]))
     check("cap: a pass starts at least at torch_limit", len(starts) == 2 and all(starts), seen)
-    check("cap: within a pass it never falls", len(caps) == 6 and rising, seen)
+    check("cap: within a pass it never falls", len(caps) == 8 and rising, seen)
 
 
 def costs(mem: Memory, unet: UNet2DConditionModel) -> None:
@@ -542,6 +555,34 @@ def outside_alone(tag: str) -> weakref.ref[Memory]:
     return weakref.ref(mem)
 
 
+def held_caches(tag: str) -> weakref.ref[Memory]:
+    """A request's end asks the caches it owns for everything, unless one is held (a graph pool
+    a replay still reads). A shrink answers `freed` or `(freed, coming)`."""
+    mem = opened(f"{tag}-held", 1 << 31)
+    asked: list[tuple[str, int]] = []
+    errors: list[object] = []
+    hook, sys.unraisablehook = sys.unraisablehook, errors.append
+
+    def answer(name: str, freed: int | tuple[int, int]) -> Callable[[int], int | tuple[int, int]]:
+        return lambda want: (asked.append((name, want)), freed)[1]
+
+    try:
+        held = mem.cache("held", answer("held", 1 << 20))
+        held.cached(4 << 20)
+        with held.holding():
+            with mem.request("held"):
+                pass
+        for name, freed in (("whole", 4 << 20), ("queued", (3 << 20, 1 << 20))):
+            mem.cache(name, answer(name, freed)).cached(4 << 20)
+            with mem.request(name):
+                pass
+    finally:
+        sys.unraisablehook = hook
+    check("held: a held cache is not shrunk at its request's end", "held" not in dict(asked), asked)
+    check("held: an unheld one is asked for everything, `freed` or `(freed, coming)`", asked == [("whole", (1 << 64) - 1), ("queued", (1 << 64) - 1)] and not errors, (asked, errors))
+    return weakref.ref(mem)
+
+
 def off_forward(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel) -> None:
     """A weight read outside any forward (a package's table, an overlay's factor) binds on read:
     it has its bytes, the tensor made of it holds the page's pin while it lives, the pin goes
@@ -620,6 +661,7 @@ def main() -> int:
     if not CUDA:
         gone(overhead(ck, plain, tag), "overhead")
     gone(outside_alone(tag), "outside")
+    gone(held_caches(tag), "held caches")
     ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
     blocks = sorted(spans[1:])
     # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.

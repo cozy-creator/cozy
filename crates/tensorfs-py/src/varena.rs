@@ -63,6 +63,21 @@ fn call<'py>(py: Python<'py>, f: &Py<PyAny>, args: impl pyo3::call::PyCallArgs<'
     })
 }
 
+/// A cache's `shrink(want)`: `freed`, or `(freed, coming)`.
+fn shrunk(py: Python<'_>, f: &Py<PyAny>, want: u64) -> varena::Shrunk {
+    let answer = f.call1(py, (want,)).and_then(|r| {
+        let r = r.into_bound(py);
+        match r.extract::<u64>() {
+            Ok(freed) => Ok(varena::Shrunk { freed, coming: 0 }),
+            Err(_) => r.extract::<(u64, u64)>().map(|(freed, coming)| varena::Shrunk { freed, coming }),
+        }
+    });
+    answer.unwrap_or_else(|e| {
+        e.write_unraisable(py, None);
+        varena::Shrunk::default()
+    })
+}
+
 /// `detached` for a call with nothing to return.
 fn done(py: Python<'_>, gpu: &str, f: impl Send + FnOnce()) -> PyResult<()> {
     detached(py, gpu, || {
@@ -472,9 +487,10 @@ impl PyMemory {
         done(py, &self.gpu.uuid, || self.memory().fill(SetId(set), fill))
     }
 
-    /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id. A cache
+    /// Bytes the caller holds that `shrink(want)` gives back (`freed`, or `(freed, coming)` when
+    /// a queued drop returns the rest later and `cached` reports it); returns its id. A cache
     /// serving sets `sets` (a component's graph pool, its decode cache, one pool a serialized
-    /// domain shares) takes their most protective class.
+    /// domain shares) takes their class.
     #[pyo3(signature = (owner, shrink, sets = Vec::new()))]
     fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>, sets: Vec<u32>) -> PyResult<u32> {
         // Inside torch's allocator a shrink would free through it under its own lock: none runs there.
@@ -483,7 +499,7 @@ impl PyMemory {
                 crate::allocator::shrink_inside();
                 return varena::Shrunk::default();
             }
-            varena::Shrunk { freed: Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0), coming: 0 }
+            Python::try_attach(|py| shrunk(py, &shrink, want)).unwrap_or_default()
         };
         let sets: Vec<SetId> = sets.into_iter().map(SetId).collect();
         detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, &sets, shrink))).map(|c| c.0)
@@ -491,6 +507,17 @@ impl PyMemory {
 
     fn cached(&self, py: Python<'_>, cache: u32, nbytes: u64) -> PyResult<()> {
         done(py, &self.gpu.uuid, || self.memory().cached(varena::CacheId(cache), nbytes))
+    }
+
+    /// Holds `cache` (P, never shrunk) until `release_cache`; holds nest.
+    fn hold_cache(&self, py: Python<'_>, cache: u32) -> PyResult<u64> {
+        detached(py, &self.gpu.uuid, || Ok(self.memory().hold_cache(varena::CacheId(cache)).0))
+    }
+
+    /// Ends `hold` once the work queued on `stream` (a `CUstream`, 0 the default) so far completes.
+    #[pyo3(signature = (cache, hold, stream = 0))]
+    fn release_cache(&self, py: Python<'_>, cache: u32, hold: u64, stream: usize) -> PyResult<()> {
+        done(py, &self.gpu.uuid, || self.memory().release_cache(varena::CacheId(cache), varena::HoldId(hold), stream))
     }
 
     fn uncache(&self, py: Python<'_>, cache: u32) -> PyResult<()> {
