@@ -291,6 +291,32 @@ def attempts(mem: Memory, ck: tensorfs.Checkpoint) -> None:
         check("attempts: a pass records the completed attempt's peak, not the failed one's", last is not None and retried <= last[1] < failed, last)
 
 
+def failures(mem: Memory, ck: tensorfs.Checkpoint) -> None:
+    """A pass that fails still ends with what it reached, the bytes torch's allocator refused
+    included: the next pass of its shape is measured, its room at least those bytes."""
+    unet, refused = loaded(ck, mem, release="failures"), 64 << 20
+
+    def short(*_: object) -> None:
+        adapter._refusal(0, refused, 0, 0)  # torch's allocator refused this thread
+        raise torch.OutOfMemoryError("standalone: refused")
+
+    hook = unet.conv_in.register_forward_pre_hook(short)
+    with mem.request("failed", plan=[unet]):
+        try:
+            forward(unet, mem.device, 0)
+        except torch.OutOfMemoryError:
+            pass
+    hook.remove()
+    room = mem.models[unet].rooms.get(("", "1x4x8x8x1x5x768"), (0, 0))[0]
+    check("failed: the failed pass's room holds the refused bytes", room >= refused, (room, refused))
+    measured: list[bool] = []
+    probe = unet.conv_in.register_forward_pre_hook(lambda *_: measured.append(mem._current().measured()))
+    with mem.request("after", plan=[unet]):
+        forward(unet, mem.device, 0)
+    probe.remove()
+    check("failed: the next pass of its shape is measured", measured == [True], measured)
+
+
 def gone(memory: weakref.ref[Memory], phase: str) -> None:
     """One Memory per device in a process: a phase's goes before the next opens (on a GPU they
     share the card's table, and each would count the other's pages as its own context)."""
@@ -503,6 +529,7 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     check("identity: a pass under a new identity shed the hold of the old bake", shed == [True] and not mem.models[filled].holds, (shed, hold.blocks))
     concurrent(mem, ck)
     attempts(mem, ck)
+    failures(mem, ck)
     capping(mem, unet)
     if CUDA:
         costs(mem, unet)
@@ -559,10 +586,19 @@ def outside_alone(tag: str) -> weakref.ref[Memory]:
         with mem.request("first") as first:
             with mem.request("second") as second:
                 figures["peak"] += 9 << 20
+        try:
+            with mem.request("failing") as failing:
+                figures["now"] += 4 << 20
+                figures["peak"] += 5 << 20
+                adapter._refusal(0, 3 << 20, 0, 0)  # refused with 4 MiB held: it needed 7
+                raise RuntimeError("standalone: the request fails")
+        except RuntimeError:
+            pass
     finally:
         mem.torch.now, mem.torch.peaks, mem.torch.reset = real  # type: ignore[method-assign]
     check("outside: the one request open is measured", alone.outside_measured == 7 << 20, alone.outside_measured)
     check("outside: two open, neither is measured", (first.outside_measured, second.outside_measured) == (None, None), (first.outside_measured, second.outside_measured))
+    check("outside: a failed lone request reports what it held when refused plus the refused bytes", failing.outside_measured == 7 << 20, failing.outside_measured)
     return weakref.ref(mem)
 
 
