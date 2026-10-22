@@ -713,9 +713,13 @@ impl Line {
 /// keep the token, every other field is scanned.
 fn command_bytes(command: &DeviceCommand, memo: bool) -> io::Result<Vec<u8>> {
     let mut value = serde_json::to_value(command)?;
-    // The executor's memoized stages go to the machine tier.
-    if matches!(command, DeviceCommand::Start { .. }) && memo {
-        value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
+    if matches!(command, DeviceCommand::Start { .. }) {
+        // The receiver checks this before reading any ledger descriptors. Older TensorD
+        // sends none, allowing a rebuilt Runtime to refuse its single-fd contract safely.
+        value["memory_protocol"] = 1.into();
+        if memo {
+            value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
+        }
     }
     let bytes = serde_json::to_vec(&value)?;
     if let (true, Some(options)) = (
@@ -2008,7 +2012,9 @@ mod codec_tests {
                 ledgers: 0,
                 memory_mode: mode,
             };
-            assert_eq!(serde_json::to_value(&start).unwrap()["memory_mode"], wire);
+            let frame: Value = serde_json::from_slice(&command_bytes(&start, false).unwrap()).unwrap();
+            assert_eq!(frame["memory_mode"], wire);
+            assert_eq!(frame["memory_protocol"], 1);
         }
     }
 
