@@ -711,8 +711,9 @@ impl Pool {
             entry: entry.clone(),
             memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, &peaks, &notes).map(Arc::new),
         }).collect();
-        let gpus = devices.iter().filter_map(|d| d.memory.clone()).collect();
-        let tier = memory::serve_tier(config.host.mode, memory::need(gpus), &notes);
+        // The RAM tier fills only beside what the calls running on these GPUs keep free.
+        let ledgers: Vec<&varena::Ledger> = devices.iter().filter_map(|d| d.memory.as_deref()).map(|gpu| &gpu.ledger).collect();
+        let tier = memory::serve_tier(config.host.mode, varena::tier::need(&ledgers), &notes);
         let launcher = crate::child_launcher::ChildLauncher::new()?;
         let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
         Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
