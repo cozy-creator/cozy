@@ -224,7 +224,7 @@ impl Remote {
         Ok(())
     }
 
-    pub async fn open(&self, mut reference: Ref, constraints: Option<&crate::precision::Constraints>) -> Result<Checkpoint> {
+    pub async fn open(&self, mut reference: Ref, constraints: &crate::precision::Constraints) -> Result<Checkpoint> {
         let Root { object: root, tag, variant } = self.root(&reference).await?;
         let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
@@ -232,34 +232,23 @@ impl Remote {
         let bytes = self.store.read(&root)?;
         let (tree, header, variant, mut extra) = match Tree::from_json(&bytes) {
             Ok(tree) => {
-                let wanted = fetch::pick_variant(&tree, reference.revision.as_deref(), variant, reference.variant.as_deref())?;
-                let mut held_profiles = true;
-                for (_, header) in tree.variants() { held_profiles &= self.store.reuse(header)?; }
-                let indexed = if let Some(constraints) = constraints.filter(|_| !held_profiles && !self.offline && wanted.is_none() && !reference.repo_id.starts_with("local/") && !reference.repo_id.starts_with("sha256:")) {
-                    self.endpoint.inner.select(&reference.repo_id, &root.id(), constraints).await.map_err(from_native)?
-                } else { None };
-                let selected;
-                let wanted = if let Some(answer) = &indexed {
-                    if answer.commit != root { return fail(Kind::Integrity, "selection names a different commit"); }
-                    let Some(name) = &answer.variant else { return fail(Kind::NotFound, "no variant fits the requested GPUs and bits"); };
-                    if tree.header(name) != answer.header.as_ref() { return fail(Kind::Integrity, "selection header does not belong to its variant"); }
-                    for reason in &answer.reasons { tracing::warn!("{reason}"); }
-                    Some(name.as_str())
-                } else if let Some(constraints) = constraints.filter(|_| wanted.is_none()) {
-                    let headers: Vec<_> = tree.variants().map(|(_,h)| h.clone()).collect();
-                    let _headers_hold = self.store.hold(&headers)?;
-                    self.fetch(&headers, &Download::default()).await?;
-                    let profiles: Vec<_> = tree.variants().map(|(n,h)| {
-                        Ok((n, crate::precision::Profile::of(&Header::from_cbor(&self.store.read(h)?)?)))
-                    }).collect::<Result<_>>()?;
-                    let candidates: Vec<_> = profiles.iter().map(|(n,p)| (*n,p)).collect();
-                    let Some((at,reasons)) = constraints.select(&reference.repo_id, &candidates)? else {
-                        return fail(Kind::NotFound, "no variant fits the requested GPUs and bits");
-                    };
-                    for reason in reasons { tracing::warn!("{reason}"); }
-                    selected = profiles[at].0.to_owned();
-                    Some(selected.as_str())
-                } else { wanted.as_deref() };
+                let named = fetch::pick_variant(&tree, reference.revision.as_deref(), variant, reference.variant.as_deref())?;
+                let selected = match named {
+                    Some(named) => named,
+                    None => {
+                        let repo = &reference.repo_id;
+                        let index = !self.offline && !repo.starts_with("local/") && !repo.starts_with("sha256:");
+                        let origin = index.then_some(&*self.endpoint.inner as &dyn Origin);
+                        let model = tag.as_ref().map_or_else(|| repo.clone(), |tag| format!("{repo}@{}", tag.name));
+                        let headers: Vec<_> = tree.variants().map(|(_, header)| header.clone()).collect();
+                        let _headers_hold = self.store.hold(&headers)?;
+                        let fetch = async |headers: &[ObjectRef]| self.fetch(headers, &Download::default()).await.map(drop);
+                        let selected = fetch::select(origin, &self.store, repo, &model, &root, &tree, constraints, fetch).await?;
+                        for reason in &selected.reasons { tracing::warn!("{reason}"); }
+                        selected.variant
+                    }
+                };
+                let wanted = Some(selected.as_str());
                 let (variant, header) = tree.variant(wanted).map_err(|e| absent(wanted.is_some(), e))?;
                 let extra = tree.repo_files().map(|(_, r)| r.clone()).collect();
                 (

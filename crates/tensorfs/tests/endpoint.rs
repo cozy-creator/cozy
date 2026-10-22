@@ -101,7 +101,7 @@ impl Drop for HttpServer {
 /// Pulls `name@1.0` variant `bf16` from `origin` into `store` and checks every tensor.
 async fn pull_and_check(origin: Arc<dyn Origin>, store: &Store, header: &ObjectRef, tensors: &BTreeMap<(String, String), Vec<u8>>) {
     let fetcher = Fetcher::new(Arc::new(store.clone()) as Arc<dyn ObjectStore>, client(), None, Config::default());
-    let pulled = fetcher.pull(&origin, "Acme/Tiny", Some("1.0"), Some("bf16"), &Want::default()).await.unwrap();
+    let pulled = fetcher.pull(&origin, "Acme/Tiny", Some("1.0"), Some("model.bf16.cozytensors"), &Want::default()).await.unwrap();
     fetcher.settled().await;
     assert_eq!(pulled.header, *header);
     let ck = store.checkpoint(header).unwrap();
@@ -247,7 +247,7 @@ fn a_streaming_writer_tees_to_the_store_before_publishing() {
         let origin: Arc<dyn Origin> = endpoint.clone();
         let pulled = fetcher.pull(&origin, "acme/streamed", Some(&header.id()), None, &Want::default()).await.unwrap();
         fetcher.settled().await;
-        assert_eq!((pulled.header, pulled.variant.as_str()), (header.clone(), "int8"));
+        assert_eq!((pulled.header, pulled.variant.as_str()), (header.clone(), "model.int8.cozytensors"));
     });
     assert!(into.checkpoint(&header).unwrap().read("unet", "big").unwrap() == big);
 }

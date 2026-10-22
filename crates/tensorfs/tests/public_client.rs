@@ -1161,12 +1161,12 @@ async fn an_exact_commit_keeps_constraints_online_and_offline_once_untagged() {
     let http=Http::new(origin.clone());
     let client=Client::new(config(&scratch.0.join("client"),&http.url)).unwrap();
     let reference=format!("acme/model@{}",exact.id());
-    let options=Open{gpus:Some(vec!["8.6".into()]),bits:Some(8),..Default::default()};
+    let options=Open{gpus:Some(vec!["8.6".into()]),lane:Some(8),..Default::default()};
     let selected=client.open(&reference,&options).await.unwrap();
     assert_eq!(selected.tree(),Some(&exact));assert_eq!(selected.id(),&encoded);
     assert_eq!(selected.variant(),Some("nested/odd.cozytensors"));
     assert!(http.requests.lock().unwrap().iter().any(|(_,path,_)|path.starts_with("/v1/models/acme/model/select?")),"the origin has no index, so the client used headers");
-    let cpu=Open{gpus:Some(vec![]),bits:Some(16),..Default::default()};
+    let cpu=Open{gpus:Some(vec![]),lane:Some(16),..Default::default()};
     assert_eq!(client.open(&reference,&cpu).await.unwrap().id(),&plain);
     // The tag moves on and this store learns it: the commit is untagged everywhere.
     publish(&tagged);
@@ -1221,7 +1221,7 @@ async fn offline_unversioned_opens_follow_the_newest_public_release_else_main() 
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, repo.to_json().unwrap()).unwrap();
     let http = Http::new(origin.clone());
-    let cpu = Open { gpus: Some(vec![]), bits: Some(16), ..Default::default() };
+    let cpu = Open { gpus: Some(vec![]), lane: Some(16), ..Default::default() };
     let offline = Open { local_files_only: true, ..cpu.clone() };
     let open = async |client: &Client, reference: &str, options: &Open| client.open(reference, options).await.map(|c| c.tree().cloned());
     // Each store opens its names online in this order: the private `dev` last.

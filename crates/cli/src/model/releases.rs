@@ -207,7 +207,7 @@ struct Deleted {
 /// Never prompts: `--yes` is the confirmation, and without it nothing is sent.
 pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Error> {
     let (repo, tag) = match ModelRef::parse(&args.model)? {
-        ModelRef::Hub { repo, release, lane: None } => (repo, release),
+        ModelRef::Hub { repo, release } => (repo, release),
         _ => return Err(usage("model_ref_invalid", format!("{:?}: delete takes org/name or org/name@tag", args.model))),
     };
     let hub = ctx.hub()?;

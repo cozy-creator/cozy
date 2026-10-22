@@ -242,20 +242,20 @@ impl PyClient {
         Ok(Self { client })
     }
 
-    #[pyo3(signature = (name_or_path, *, revision = None, variant = None, bits = None, gpus = None, local_files_only = false, lazy = true))]
+    #[pyo3(signature = (name_or_path, *, revision = None, variant = None, lane = None, gpus = None, local_files_only = false, lazy = true))]
     fn open(
         &self,
         py: Python<'_>,
         name_or_path: &str,
         revision: Option<String>,
         variant: Option<String>,
-        bits: Option<u32>,
+        lane: Option<u32>,
         gpus: Option<Vec<String>>,
         local_files_only: bool,
         lazy: bool,
     ) -> PyResult<PyCheckpoint> {
         let options = Open {
-            bits, gpus,
+            lane, gpus,
             revision,
             variant,
             local_files_only,

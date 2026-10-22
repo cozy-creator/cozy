@@ -2168,7 +2168,8 @@ components:
       type: object
       required: [lane, manifest_id, manifest_length, components, objects, bytes]
       properties:
-        lane: {type: string}
+        lane: {type: string, description: "The variant, by its path."}
+        precision: {type: string, description: "Its header's precision lane (int8, fp8, nvfp4, bf16, …)."}
         manifest_id: {type: string}
         manifest_length: {type: integer, format: int64}
         components: {type: array, nullable: true, items: {type: string}}

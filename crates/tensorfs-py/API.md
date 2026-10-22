@@ -25,7 +25,7 @@ uv pip install tensorfs
 ```python
 import tensorfs
 
-checkpoint = tensorfs.open("me/model", revision="1.0", bits=16)
+checkpoint = tensorfs.open("me/model", revision="1.0", lane=16)
 weight = checkpoint.components["unet"].tensors.read("conv_in.weight")
 ```
 
@@ -42,7 +42,7 @@ explicitly materialized folder; those are optional input forms.
 To download the complete checkpoint into the shared store before continuing:
 
 ```python
-checkpoint = tensorfs.open("me/model", bits=16, lazy=False)
+checkpoint = tensorfs.open("me/model", lane=16, lazy=False)
 ```
 
 This waits for all declared chunks and component assets. It does not create a folder,
@@ -54,11 +54,12 @@ For a private model, pass `token=...`. Other options are `endpoint`, `cache_dir`
 data is unavailable locally. A private CA is set once, with `tensorfs.configure(ca_der=...)`.
 
 Automatic selection derives precision and GPU requirements from each variant's header. Pass
-`bits=4`, `bits=8` or `bits=16` (Rust: `Open.bits`); omitted means an 8-bit preference with safe
-fallbacks. `gpus=["8.9"]` supplies compute capabilities; omitted detects visible GPUs, while `[]`
-selects for CPU. Explicit `variant="nested/weights.cozytensors"` fixes the path instead. Every
+`lane=16`, `lane=8` or `lane=4` (Rust: `Open.lane`), the precision lane in bits, to take only that lane: a release without it is
+refused. Omitted, the 8-bit lane is a preference, and a variant outside it serves when none in it works.
+`gpus=["8.9"]` supplies compute capabilities; omitted detects visible GPUs, while `[]` reads on the CPU,
+where no GPU requirement applies. A refusal names each variant and why it does not work. Explicit `variant="nested/weights.cozytensors"` fixes the path instead. Every
 `.cozytensors` file at every depth is a variant, and its name conveys no precision. Selection
-loads only headers; unsupported profiles are skipped. The Hub's indexed selection and local
+loads only headers. The Hub's indexed selection and local
 selection use the same [normative vectors](../tensorfs/conformance/vectors/select.json).
 
 ## Python: use the returned objects
@@ -297,7 +298,7 @@ the blocking call to a worker thread so the event loop remains responsive:
 import asyncio
 
 async def load_model():
-    return await asyncio.to_thread(tensorfs.open, "me/model", bits=16, lazy=False)
+    return await asyncio.to_thread(tensorfs.open, "me/model", lane=16, lazy=False)
 
 checkpoint = asyncio.run(load_model())
 ```
@@ -517,7 +518,7 @@ does not write a configuration file and does not change existing checkpoint hand
 You can instead pass settings directly to each operation:
 
 ```python
-checkpoint = tensorfs.open("me/model", bits=16, endpoint="https://tensorhub.com", token=my_token)
+checkpoint = tensorfs.open("me/model", lane=16, endpoint="https://tensorhub.com", token=my_token)
 ```
 
 The default endpoint is `https://tensorhub.com`; environment settings include

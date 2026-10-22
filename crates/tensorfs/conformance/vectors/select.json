@@ -1,5 +1,51 @@
 {
   "model": "acme/model@1",
+  "schemes": [
+    "awq.int4",
+    "bnb.fp4",
+    "bnb.int8",
+    "bnb.nf4",
+    "comfy.asym_w4a8_int8",
+    "comfy.w6a8_int8",
+    "ct.int1",
+    "ct.int2",
+    "ct.int3",
+    "ct.int4",
+    "ct.int5",
+    "ct.int6",
+    "ct.int7",
+    "ct.int8",
+    "fp8.blockwise",
+    "fp8.columnwise",
+    "fp8.rowwise",
+    "fp8.tensorwise",
+    "gguf.mxfp4",
+    "gguf.nvfp4",
+    "gguf.q1_0",
+    "gguf.q2_0",
+    "gguf.q2_k",
+    "gguf.q3_k",
+    "gguf.q4_0",
+    "gguf.q4_1",
+    "gguf.q4_k",
+    "gguf.q5_0",
+    "gguf.q5_1",
+    "gguf.q5_k",
+    "gguf.q6_k",
+    "gguf.q8_0",
+    "gptq.int2",
+    "gptq.int3",
+    "gptq.int4",
+    "gptq.int8",
+    "int4.convrot",
+    "int8.columnwise",
+    "int8.convrot",
+    "int8.rowwise",
+    "int8.tensorwise",
+    "mxfp4",
+    "mxfp8",
+    "nvfp4"
+  ],
   "profiles": {
     "bf16": {
       "family": "bf16",
@@ -151,6 +197,358 @@
         "int8.convrot",
         "nvfp4"
       ]
+    },
+    "scheme-awq.int4": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "awq.int4"
+      ]
+    },
+    "scheme-bnb.fp4": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "bnb.fp4"
+      ]
+    },
+    "scheme-bnb.int8": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "bnb.int8"
+      ]
+    },
+    "scheme-bnb.nf4": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "bnb.nf4"
+      ]
+    },
+    "scheme-comfy.asym_w4a8_int8": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "comfy.asym_w4a8_int8"
+      ]
+    },
+    "scheme-comfy.w6a8_int8": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "comfy.w6a8_int8"
+      ]
+    },
+    "scheme-ct.int1": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "ct.int1"
+      ]
+    },
+    "scheme-ct.int2": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "ct.int2"
+      ]
+    },
+    "scheme-ct.int3": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "ct.int3"
+      ]
+    },
+    "scheme-ct.int4": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "ct.int4"
+      ]
+    },
+    "scheme-ct.int5": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "ct.int5"
+      ]
+    },
+    "scheme-ct.int6": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "ct.int6"
+      ]
+    },
+    "scheme-ct.int7": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "ct.int7"
+      ]
+    },
+    "scheme-ct.int8": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "ct.int8"
+      ]
+    },
+    "scheme-fp8.blockwise": {
+      "family": "fp8",
+      "bits": 8,
+      "bytes": 64,
+      "kinds": [
+        "fp8.blockwise"
+      ]
+    },
+    "scheme-fp8.columnwise": {
+      "family": "fp8",
+      "bits": 8,
+      "bytes": 64,
+      "kinds": [
+        "fp8.columnwise"
+      ]
+    },
+    "scheme-fp8.rowwise": {
+      "family": "fp8",
+      "bits": 8,
+      "bytes": 64,
+      "kinds": [
+        "fp8.rowwise"
+      ]
+    },
+    "scheme-fp8.tensorwise": {
+      "family": "fp8",
+      "bits": 8,
+      "bytes": 64,
+      "kinds": [
+        "fp8.tensorwise"
+      ]
+    },
+    "scheme-gguf.mxfp4": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.mxfp4"
+      ]
+    },
+    "scheme-gguf.nvfp4": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.nvfp4"
+      ]
+    },
+    "scheme-gguf.q1_0": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q1_0"
+      ]
+    },
+    "scheme-gguf.q2_0": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q2_0"
+      ]
+    },
+    "scheme-gguf.q2_k": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q2_k"
+      ]
+    },
+    "scheme-gguf.q3_k": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q3_k"
+      ]
+    },
+    "scheme-gguf.q4_0": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q4_0"
+      ]
+    },
+    "scheme-gguf.q4_1": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q4_1"
+      ]
+    },
+    "scheme-gguf.q4_k": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q4_k"
+      ]
+    },
+    "scheme-gguf.q5_0": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q5_0"
+      ]
+    },
+    "scheme-gguf.q5_1": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q5_1"
+      ]
+    },
+    "scheme-gguf.q5_k": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q5_k"
+      ]
+    },
+    "scheme-gguf.q6_k": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q6_k"
+      ]
+    },
+    "scheme-gguf.q8_0": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gguf.q8_0"
+      ]
+    },
+    "scheme-gptq.int2": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gptq.int2"
+      ]
+    },
+    "scheme-gptq.int3": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gptq.int3"
+      ]
+    },
+    "scheme-gptq.int4": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gptq.int4"
+      ]
+    },
+    "scheme-gptq.int8": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "gptq.int8"
+      ]
+    },
+    "scheme-int4.convrot": {
+      "family": "int4",
+      "bits": 4,
+      "bytes": 64,
+      "kinds": [
+        "int4.convrot"
+      ]
+    },
+    "scheme-int8.columnwise": {
+      "family": "int8",
+      "bits": 8,
+      "bytes": 64,
+      "kinds": [
+        "int8.columnwise"
+      ]
+    },
+    "scheme-int8.convrot": {
+      "family": "int8",
+      "bits": 8,
+      "bytes": 64,
+      "kinds": [
+        "int8.convrot"
+      ]
+    },
+    "scheme-int8.rowwise": {
+      "family": "int8",
+      "bits": 8,
+      "bytes": 64,
+      "kinds": [
+        "int8.rowwise"
+      ]
+    },
+    "scheme-int8.tensorwise": {
+      "family": "int8",
+      "bits": 8,
+      "bytes": 64,
+      "kinds": [
+        "int8.tensorwise"
+      ]
+    },
+    "scheme-mxfp4": {
+      "family": "mxfp4",
+      "bits": 4,
+      "bytes": 64,
+      "kinds": [
+        "mxfp4"
+      ]
+    },
+    "scheme-mxfp8": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "mxfp8"
+      ]
+    },
+    "scheme-nvfp4": {
+      "family": "nvfp4",
+      "bits": 4,
+      "bytes": 64,
+      "kinds": [
+        "nvfp4"
+      ]
     }
   },
   "cases": [
@@ -182,6 +580,291 @@
         ]
       },
       "variant": "small.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "a mixed release on Ada takes int8",
+      "variants": {
+        "weights/accurate.cozytensors": "bf16",
+        "small.cozytensors": "int8",
+        "nested/fp.cozytensors": "fp8",
+        "q4.cozytensors": "nvfp4"
+      },
+      "constraints": {
+        "gpus": [
+          "8.9"
+        ]
+      },
+      "variant": "small.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "a mixed release on Turing takes bf16",
+      "variants": {
+        "weights/accurate.cozytensors": "bf16",
+        "small.cozytensors": "int8",
+        "nested/fp.cozytensors": "fp8",
+        "q4.cozytensors": "nvfp4"
+      },
+      "constraints": {
+        "gpus": [
+          "7.5"
+        ]
+      },
+      "variant": "weights/accurate.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no fp16 lane for sm75; served bf16"
+      ]
+    },
+    {
+      "why": "unknown capability is conservative",
+      "variants": {
+        "weights/accurate.cozytensors": "bf16",
+        "small.cozytensors": "int8",
+        "nested/fp.cozytensors": "fp8",
+        "q4.cozytensors": "nvfp4"
+      },
+      "constraints": {
+        "gpus": [
+          ""
+        ]
+      },
+      "variant": "weights/accurate.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "overflow capability is unknown",
+      "variants": {
+        "weights/accurate.cozytensors": "bf16",
+        "small.cozytensors": "int8",
+        "nested/fp.cozytensors": "fp8",
+        "q4.cozytensors": "nvfp4"
+      },
+      "constraints": {
+        "gpus": [
+          "4294967295.0"
+        ]
+      },
+      "variant": "weights/accurate.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "fallback emits a reason",
+      "variants": {
+        "plain.cozytensors": "bf16"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ]
+      },
+      "variant": "plain.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no int8 or fp8 lane for sm90; served bf16"
+      ]
+    },
+    {
+      "why": "Turing prefers fp16",
+      "variants": {
+        "a.cozytensors": "bf16",
+        "b.cozytensors": "fp16"
+      },
+      "constraints": {
+        "gpus": [
+          "7.5"
+        ]
+      },
+      "variant": "b.cozytensors",
+      "reasons": [
+        "precision 8: sm75 runs no bf16; served fp16"
+      ]
+    },
+    {
+      "why": "F32 last-resort precision family",
+      "variants": {
+        "a.cozytensors": "f32",
+        "z.cozytensors": "future"
+      },
+      "constraints": {
+        "gpus": []
+      },
+      "variant": "a.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "plain integer-only single variant",
+      "variants": {
+        "index.cozytensors": "integer"
+      },
+      "constraints": {
+        "gpus": []
+      },
+      "variant": "index.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "dominant-kind tie uses lexical kind",
+      "variants": {
+        "tie.cozytensors": "tie"
+      },
+      "constraints": {
+        "gpus": []
+      },
+      "variant": "tie.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "all kinds must run on a GPU",
+      "variants": {
+        "a.cozytensors": "mixed-unsupported",
+        "b.cozytensors": "bf16"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ]
+      },
+      "variant": "b.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no int8 or fp8 lane for sm90; served bf16"
+      ]
+    },
+    {
+      "why": "a minority fp8 leaf still needs fp8",
+      "variants": {
+        "a.cozytensors": "mixed-fp8",
+        "b.cozytensors": "bf16"
+      },
+      "constraints": {
+        "gpus": [
+          "8.6"
+        ]
+      },
+      "variant": "b.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no int8 lane for sm86; served bf16"
+      ]
+    },
+    {
+      "why": "a sole 8-bit variant serves the CPU",
+      "variants": {
+        "model.cozytensors": "int8"
+      },
+      "constraints": {
+        "gpus": []
+      },
+      "variant": "model.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no bf16 or fp16 lane for no GPU; served int8"
+      ]
+    },
+    {
+      "why": "a sole fp8 variant serves the CPU",
+      "variants": {
+        "model.cozytensors": "fp8"
+      },
+      "constraints": {
+        "gpus": []
+      },
+      "variant": "model.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no bf16 or fp16 lane for no GPU; served fp8"
+      ]
+    },
+    {
+      "why": "a sole 8-bit variant serves a GPU that runs it",
+      "variants": {
+        "model.cozytensors": "int8"
+      },
+      "constraints": {
+        "gpus": [
+          "8.9"
+        ]
+      },
+      "variant": "model.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "a sole 8-bit variant is refused on a GPU that runs none of it",
+      "variants": {
+        "model.cozytensors": "int8"
+      },
+      "constraints": {
+        "gpus": [
+          "7.5"
+        ]
+      },
+      "variant": null,
+      "reasons": [],
+      "refused": "precision 8 on sm75: acme/model@1 has no variant that works; it publishes model.cozytensors (int8) needs sm80+ except sm103 for int8.rowwise"
+    },
+    {
+      "why": "one GPU of a set running it is enough",
+      "variants": {
+        "model.cozytensors": "fp8"
+      },
+      "constraints": {
+        "gpus": [
+          "8.6",
+          "8.9"
+        ]
+      },
+      "variant": "model.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no int8, bf16 or fp16 lane for sm86+sm89; served fp8"
+      ]
+    },
+    {
+      "why": "an unknown encoding is refused on a GPU",
+      "variants": {
+        "future.cozytensors": "future"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ]
+      },
+      "variant": null,
+      "reasons": [],
+      "refused": "precision 8 on sm100: acme/model@1 has no variant that works; it publishes future.cozytensors (future.scheme) needs a GPU reader for future.scheme"
+    },
+    {
+      "why": "an unknown scheme inside a known family is refused on a GPU",
+      "variants": {
+        "q.cozytensors": "future-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ]
+      },
+      "variant": null,
+      "reasons": [],
+      "refused": "precision 8 on sm90: acme/model@1 has no variant that works; it publishes q.cozytensors (int8) needs a GPU reader for int8.future"
+    },
+    {
+      "why": "no variants",
+      "variants": {},
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ]
+      },
+      "variant": null,
+      "reasons": [],
+      "refused": "precision 8 on sm90: acme/model@1 has no variant that works; it publishes none"
+    },
+    {
+      "why": "a scheme outside the table decodes on any GPU",
+      "variants": {
+        "q.cozytensors": "scheme-gguf.q4_0"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ]
+      },
+      "variant": "q.cozytensors",
       "reasons": []
     },
     {
@@ -289,23 +972,6 @@
       "reasons": []
     },
     {
-      "why": "unknown capability is conservative",
-      "variants": {
-        "weights/accurate.cozytensors": "bf16",
-        "small.cozytensors": "int8",
-        "nested/fp.cozytensors": "fp8",
-        "q4.cozytensors": "nvfp4"
-      },
-      "constraints": {
-        "gpus": [
-          ""
-        ],
-        "bits": 8
-      },
-      "variant": "weights/accurate.cozytensors",
-      "reasons": []
-    },
-    {
       "why": "a misleading name carries no precision",
       "variants": {
         "int8.cozytensors": "bf16",
@@ -383,159 +1049,21 @@
       "reasons": []
     },
     {
-      "why": "fallback emits a reason",
+      "why": "a sole 8-bit variant serves the CPU at bits 8",
       "variants": {
-        "plain.cozytensors": "bf16"
+        "model.cozytensors": "int8"
       },
       "constraints": {
-        "gpus": [
-          "9.0"
-        ],
+        "gpus": [],
         "bits": 8
       },
-      "variant": "plain.cozytensors",
+      "variant": "model.cozytensors",
       "reasons": [
-        "precision 8: acme/model@1 has no int8 or fp8 lane for sm90; served bf16"
+        "precision 8: acme/model@1 has no bf16 or fp16 lane for no GPU; served int8"
       ]
     },
     {
-      "why": "Turing prefers fp16",
-      "variants": {
-        "a.cozytensors": "bf16",
-        "b.cozytensors": "fp16"
-      },
-      "constraints": {
-        "gpus": [
-          "7.5"
-        ],
-        "bits": 8
-      },
-      "variant": "b.cozytensors",
-      "reasons": [
-        "precision 8: sm75 runs no bf16; served fp16"
-      ]
-    },
-    {
-      "why": "F32 last-resort precision family",
-      "variants": {
-        "a.cozytensors": "f32",
-        "z.cozytensors": "future"
-      },
-      "constraints": {
-        "gpus": [],
-        "bits": 8
-      },
-      "variant": "a.cozytensors",
-      "reasons": []
-    },
-    {
-      "why": "plain integer-only single variant",
-      "variants": {
-        "index.cozytensors": "integer"
-      },
-      "constraints": {
-        "gpus": [],
-        "bits": 8
-      },
-      "variant": "index.cozytensors",
-      "reasons": []
-    },
-    {
-      "why": "unknown encoding is not rescued by sole variant",
-      "variants": {
-        "future.cozytensors": "future"
-      },
-      "constraints": {
-        "gpus": [
-          "10.0"
-        ],
-        "bits": 8
-      },
-      "variant": null,
-      "reasons": []
-    },
-    {
-      "why": "known GPU-incompatible sole variant is skipped",
-      "variants": {
-        "int8.cozytensors": "int8"
-      },
-      "constraints": {
-        "gpus": [],
-        "bits": 8
-      },
-      "variant": null,
-      "reasons": []
-    },
-    {
-      "why": "all kinds must run",
-      "variants": {
-        "a.cozytensors": "mixed-unsupported",
-        "b.cozytensors": "bf16"
-      },
-      "constraints": {
-        "gpus": [],
-        "bits": 8
-      },
-      "variant": "b.cozytensors",
-      "reasons": []
-    },
-    {
-      "why": "a minority fp8 leaf still needs fp8",
-      "variants": {
-        "a.cozytensors": "mixed-fp8",
-        "b.cozytensors": "bf16"
-      },
-      "constraints": {
-        "gpus": [
-          "8.6"
-        ],
-        "bits": 8
-      },
-      "variant": "b.cozytensors",
-      "reasons": [
-        "precision 8: acme/model@1 has no int8 lane for sm86; served bf16"
-      ]
-    },
-    {
-      "why": "dominant-kind tie uses lexical kind",
-      "variants": {
-        "tie.cozytensors": "tie"
-      },
-      "constraints": {
-        "gpus": [],
-        "bits": 8
-      },
-      "variant": "tie.cozytensors",
-      "reasons": []
-    },
-    {
-      "why": "integer-dominant sole variant still excludes encoded kinds at sixteen",
-      "variants": {
-        "index.cozytensors": "integer-mixed-int8"
-      },
-      "constraints": {
-        "gpus": [
-          "9.0"
-        ],
-        "bits": 16
-      },
-      "variant": null,
-      "reasons": []
-    },
-    {
-      "why": "no variants",
-      "variants": {},
-      "constraints": {
-        "gpus": [
-          "9.0"
-        ],
-        "bits": 8
-      },
-      "variant": null,
-      "reasons": []
-    },
-    {
-      "why": "sixteen never falls to a sole encoded profile",
+      "why": "sixteen refuses a sole 8-bit variant",
       "variants": {
         "q.cozytensors": "int8"
       },
@@ -546,12 +1074,26 @@
         "bits": 16
       },
       "variant": null,
-      "reasons": []
+      "reasons": [],
+      "refused": "precision 16 on sm90: acme/model@1 has no variant that works; it publishes q.cozytensors (int8) is not 16-bit"
+    },
+    {
+      "why": "sixteen refuses a sole 8-bit variant on the CPU",
+      "variants": {
+        "q.cozytensors": "int8"
+      },
+      "constraints": {
+        "gpus": [],
+        "bits": 16
+      },
+      "variant": null,
+      "reasons": [],
+      "refused": "precision 16 on no GPU: acme/model@1 has no variant that works; it publishes q.cozytensors (int8) is not 16-bit"
     },
     {
       "why": "sixteen excludes minority encoded leaves",
       "variants": {
-        "q.cozytensors": "mixed-fp8"
+        "q.cozytensors": "mixed-unsupported"
       },
       "constraints": {
         "gpus": [
@@ -560,29 +1102,28 @@
         "bits": 16
       },
       "variant": null,
-      "reasons": []
+      "reasons": [],
+      "refused": "precision 16 on sm90: acme/model@1 has no variant that works; it publishes q.cozytensors (bf16) holds encoded future.scheme"
     },
     {
-      "why": "overflow capability is unknown",
+      "why": "an integer-dominant variant holding int8 is 8-bit",
       "variants": {
-        "weights/accurate.cozytensors": "bf16",
-        "small.cozytensors": "int8",
-        "nested/fp.cozytensors": "fp8",
-        "q4.cozytensors": "nvfp4"
+        "index.cozytensors": "integer-mixed-int8"
       },
       "constraints": {
         "gpus": [
-          "4294967295.0"
+          "9.0"
         ],
-        "bits": 8
+        "bits": 16
       },
-      "variant": "weights/accurate.cozytensors",
-      "reasons": []
+      "variant": null,
+      "reasons": [],
+      "refused": "precision 16 on sm90: acme/model@1 has no variant that works; it publishes index.cozytensors (int8) is not 16-bit"
     },
     {
-      "why": "unknown scheme inside known family is skipped",
+      "why": "eight refuses a 16-bit release",
       "variants": {
-        "q.cozytensors": "future-int8"
+        "plain.cozytensors": "bf16"
       },
       "constraints": {
         "gpus": [
@@ -591,7 +1132,42 @@
         "bits": 8
       },
       "variant": null,
-      "reasons": []
+      "reasons": [],
+      "refused": "precision 8 on sm90: acme/model@1 has no variant that works; it publishes plain.cozytensors (bf16) is not 8-bit"
+    },
+    {
+      "why": "four refuses an 8-bit release and names each variant",
+      "variants": {
+        "a.cozytensors": "int8",
+        "b.cozytensors": "bf16"
+      },
+      "constraints": {
+        "gpus": [
+          "8.9"
+        ],
+        "bits": 4
+      },
+      "variant": null,
+      "reasons": [],
+      "refused": "precision 4 on sm89: acme/model@1 has no variant that works; it publishes a.cozytensors (int8) is not 4-bit; b.cozytensors (bf16) is not 4-bit"
+    },
+    {
+      "why": "invalid bits",
+      "variants": {
+        "weights/accurate.cozytensors": "bf16",
+        "small.cozytensors": "int8",
+        "nested/fp.cozytensors": "fp8",
+        "q4.cozytensors": "nvfp4"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ],
+        "bits": 3
+      },
+      "variant": null,
+      "reasons": [],
+      "error": "invalid"
     },
     {
       "why": "a variant holding nvfp4 is 4-bit, however many int8 bytes it holds",
@@ -638,7 +1214,37 @@
       "reasons": []
     },
     {
-      "why": "invalid bits",
+      "why": "the nvfp4 variant serves 4 bits before Blackwell, weight-only",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy"
+      },
+      "constraints": {
+        "gpus": [
+          "8.9"
+        ],
+        "bits": 4
+      },
+      "variant": "model.nvfp4.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "a slot refusing encoded weights refuses a sole 8-bit variant",
+      "variants": {
+        "m.cozytensors": "int8"
+      },
+      "constraints": {
+        "gpus": [
+          "8.9"
+        ],
+        "plain": true
+      },
+      "variant": null,
+      "reasons": [],
+      "refused": "precision 8 on sm89: acme/model@1 has no variant that works; it publishes m.cozytensors (int8) holds encoded int8.rowwise"
+    },
+    {
+      "why": "a slot refusing encoded weights takes bf16",
       "variants": {
         "weights/accurate.cozytensors": "bf16",
         "small.cozytensors": "int8",
@@ -649,11 +1255,745 @@
         "gpus": [
           "9.0"
         ],
-        "bits": 3
+        "plain": true
+      },
+      "variant": "weights/accurate.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 declines encoded leaves; served bf16"
+      ]
+    },
+    {
+      "why": "min_bits refuses a narrower variant unasked",
+      "variants": {
+        "m.cozytensors": "nvfp4"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ],
+        "prefer": 8,
+        "min_bits": 8
       },
       "variant": null,
       "reasons": [],
-      "error": "invalid"
+      "refused": "precision 8 on sm90: acme/model@1 has no variant that works; it publishes m.cozytensors (nvfp4) is 4-bit, under 8"
+    },
+    {
+      "why": "asked bits outrank min_bits",
+      "variants": {
+        "m.cozytensors": "nvfp4"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ],
+        "bits": 4,
+        "min_bits": 8
+      },
+      "variant": "m.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "a decode slot prefers 4 bits",
+      "variants": {
+        "weights/accurate.cozytensors": "bf16",
+        "small.cozytensors": "int8",
+        "nested/fp.cozytensors": "fp8",
+        "q4.cozytensors": "nvfp4"
+      },
+      "constraints": {
+        "gpus": [
+          "8.9"
+        ],
+        "prefer": 4,
+        "min_bits": 4
+      },
+      "variant": "q4.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "a 16-bit slot prefers bf16 and refuses 8-bit unasked",
+      "variants": {
+        "a.cozytensors": "int8",
+        "b.cozytensors": "bf16"
+      },
+      "constraints": {
+        "gpus": [
+          "8.9"
+        ],
+        "prefer": 16,
+        "min_bits": 16
+      },
+      "variant": "b.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme awq.int4",
+      "variants": {
+        "s.cozytensors": "scheme-awq.int4",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme bnb.fp4",
+      "variants": {
+        "s.cozytensors": "scheme-bnb.fp4",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme bnb.int8",
+      "variants": {
+        "s.cozytensors": "scheme-bnb.int8",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme bnb.nf4",
+      "variants": {
+        "s.cozytensors": "scheme-bnb.nf4",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme comfy.asym_w4a8_int8",
+      "variants": {
+        "s.cozytensors": "scheme-comfy.asym_w4a8_int8",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme comfy.w6a8_int8",
+      "variants": {
+        "s.cozytensors": "scheme-comfy.w6a8_int8",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme ct.int1",
+      "variants": {
+        "s.cozytensors": "scheme-ct.int1",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme ct.int2",
+      "variants": {
+        "s.cozytensors": "scheme-ct.int2",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme ct.int3",
+      "variants": {
+        "s.cozytensors": "scheme-ct.int3",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme ct.int4",
+      "variants": {
+        "s.cozytensors": "scheme-ct.int4",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme ct.int5",
+      "variants": {
+        "s.cozytensors": "scheme-ct.int5",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme ct.int6",
+      "variants": {
+        "s.cozytensors": "scheme-ct.int6",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme ct.int7",
+      "variants": {
+        "s.cozytensors": "scheme-ct.int7",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme ct.int8",
+      "variants": {
+        "s.cozytensors": "scheme-ct.int8",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme fp8.blockwise",
+      "variants": {
+        "s.cozytensors": "scheme-fp8.blockwise",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "s.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no int8 lane for sm100; served fp8"
+      ]
+    },
+    {
+      "why": "scheme fp8.columnwise",
+      "variants": {
+        "s.cozytensors": "scheme-fp8.columnwise",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "s.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no int8 lane for sm100; served fp8"
+      ]
+    },
+    {
+      "why": "scheme fp8.rowwise",
+      "variants": {
+        "s.cozytensors": "scheme-fp8.rowwise",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "s.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no int8 lane for sm100; served fp8"
+      ]
+    },
+    {
+      "why": "scheme fp8.tensorwise",
+      "variants": {
+        "s.cozytensors": "scheme-fp8.tensorwise",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "s.cozytensors",
+      "reasons": [
+        "precision 8: acme/model@1 has no int8 lane for sm100; served fp8"
+      ]
+    },
+    {
+      "why": "scheme gguf.mxfp4",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.mxfp4",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.nvfp4",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.nvfp4",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q1_0",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q1_0",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q2_0",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q2_0",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q2_k",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q2_k",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q3_k",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q3_k",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q4_0",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q4_0",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q4_1",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q4_1",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q4_k",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q4_k",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q5_0",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q5_0",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q5_1",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q5_1",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q5_k",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q5_k",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q6_k",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q6_k",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gguf.q8_0",
+      "variants": {
+        "s.cozytensors": "scheme-gguf.q8_0",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gptq.int2",
+      "variants": {
+        "s.cozytensors": "scheme-gptq.int2",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gptq.int3",
+      "variants": {
+        "s.cozytensors": "scheme-gptq.int3",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gptq.int4",
+      "variants": {
+        "s.cozytensors": "scheme-gptq.int4",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme gptq.int8",
+      "variants": {
+        "s.cozytensors": "scheme-gptq.int8",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme int4.convrot",
+      "variants": {
+        "s.cozytensors": "scheme-int4.convrot",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 4
+      },
+      "variant": "s.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme int8.columnwise",
+      "variants": {
+        "s.cozytensors": "scheme-int8.columnwise",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "s.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme int8.convrot",
+      "variants": {
+        "s.cozytensors": "scheme-int8.convrot",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "s.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme int8.rowwise",
+      "variants": {
+        "s.cozytensors": "scheme-int8.rowwise",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "s.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme int8.tensorwise",
+      "variants": {
+        "s.cozytensors": "scheme-int8.tensorwise",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "s.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme mxfp4",
+      "variants": {
+        "s.cozytensors": "scheme-mxfp4",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 4
+      },
+      "variant": "s.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme mxfp8",
+      "variants": {
+        "s.cozytensors": "scheme-mxfp8",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 8
+      },
+      "variant": "f32.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "scheme nvfp4",
+      "variants": {
+        "s.cozytensors": "scheme-nvfp4",
+        "f32.cozytensors": "f32"
+      },
+      "constraints": {
+        "gpus": [
+          "10.0"
+        ],
+        "prefer": 4
+      },
+      "variant": "s.cozytensors",
+      "reasons": []
     }
   ],
   "lookups": [
@@ -666,23 +2006,22 @@
     },
     {
       "paths": [
-        "bf16.cozytensors",
         "model.bf16.cozytensors"
       ],
-      "ask": "bf16",
-      "variant": "bf16.cozytensors"
-    },
-    {
-      "paths": [
-        "model.bf16.cozytensors"
-      ],
-      "ask": "bf16",
+      "ask": "model.bf16.cozytensors",
       "variant": "model.bf16.cozytensors"
     },
     {
       "paths": [
-        "nested/model.bf16.cozytensors",
-        "other/model.bf16.cozytensors"
+        "bf16.cozytensors",
+        "model.bf16.cozytensors"
+      ],
+      "ask": "bf16",
+      "variant": null
+    },
+    {
+      "paths": [
+        "model.bf16.cozytensors"
       ],
       "ask": "bf16",
       "variant": null
@@ -692,15 +2031,21 @@
         "nested/anything.cozytensors"
       ],
       "ask": "nested/anything",
-      "variant": "nested/anything.cozytensors"
+      "variant": null
     },
     {
       "paths": [
-        "weights.cozytensors",
-        "model.weights.cozytensors"
+        "model.cozytensors"
       ],
-      "ask": "model.weights.cozytensors",
-      "variant": "model.weights.cozytensors"
+      "ask": "",
+      "variant": null
+    },
+    {
+      "paths": [
+        "README.md"
+      ],
+      "ask": "README.md",
+      "variant": null
     }
   ]
 }

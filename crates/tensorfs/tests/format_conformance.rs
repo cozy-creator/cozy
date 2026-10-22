@@ -296,8 +296,8 @@ fn reader_decodes_every_case() {
         if family == "core" {
             assert_eq!(repo.default_tag().unwrap().name, "1", "release 2 is yanked");
             assert_eq!(
-                tree(Some("2")).header("all"),
-                tree(None).header("spans"),
+                tree(Some("2")).header("model.all.cozytensors"),
+                tree(None).header("model.spans.cozytensors"),
                 "an explicit version still resolves"
             );
             assert_eq!(tree(Some("main")).variants().count(), 1, "a private tag");
@@ -305,7 +305,7 @@ fn reader_decodes_every_case() {
         }
         for c in cases {
             let latest = tree(None);
-            let header = Header::from_cbor(&blob(&root, latest.variant(Some(&c.lane)).unwrap().1)).unwrap();
+            let header = Header::from_cbor(&blob(&root, latest.variant(Some(&tensorfs::format::variant_path(&c.lane))).unwrap().1)).unwrap();
             let got = header.read(&c.component, &c.key, |i| {
                 Ok::<_, Error>(blob(&root, &header.chunks[i]))
             });
@@ -613,6 +613,9 @@ fn chunk_rule() {
 fn shared_selection_vectors() {
     use tensorfs::precision::{Constraints, Profile};
     let spec: Json = serde_json::from_slice(&fs::read(vectors().join("select.json")).unwrap()).unwrap();
+    let mut schemes: Vec<&str> = tensorfs::format::SCHEMES.iter().map(|scheme| scheme.name).collect();
+    schemes.sort();
+    assert_eq!(spec["schemes"], serde_json::json!(schemes), "the vectors cover every scheme this reader implements");
     let mut profiles = BTreeMap::new();
     for (name, expected) in spec["profiles"].as_object().unwrap() {
         let header = Header::from_cbor(&fs::read(vectors().join("select").join(format!("{name}.cbor"))).unwrap()).unwrap();
@@ -624,11 +627,17 @@ fn shared_selection_vectors() {
         let constraints: Constraints = serde_json::from_value(case["constraints"].clone()).unwrap();
         let candidates: Vec<_> = case["variants"].as_object().unwrap().iter().map(|(path, name)| (path.as_str(), &profiles[name.as_str().unwrap()])).collect();
         let result = constraints.select(spec["model"].as_str().unwrap(), &candidates);
-        if case.get("error").is_some() { assert!(result.is_err(), "{}", case["why"]); continue; }
-        let selected = result.unwrap();
-        let name = selected.as_ref().map(|(at,_)| candidates[*at].0);
-        assert_eq!(name, case["variant"].as_str(), "{}", case["why"]);
-        let reasons = selected.map_or_else(Vec::new, |(_,reasons)| reasons);
+        if case.get("error").is_some() {
+            assert_eq!(result.map_err(|e| e.kind), Err(tensorfs::Kind::Invalid), "{}", case["why"]);
+            continue;
+        }
+        if let Some(refused) = case.get("refused") {
+            let failure = result.unwrap_err();
+            assert_eq!((failure.kind, failure.detail.as_str()), (tensorfs::Kind::NotFound, refused.as_str().unwrap()), "{}", case["why"]);
+            continue;
+        }
+        let (at, reasons) = result.unwrap_or_else(|e| panic!("{}: {e}", case["why"]));
+        assert_eq!(Some(candidates[at].0), case["variant"].as_str(), "{}", case["why"]);
         assert_eq!(serde_json::to_value(reasons).unwrap(), case["reasons"], "{}", case["why"]);
     }
     for case in spec["lookups"].as_array().unwrap() {

@@ -597,6 +597,8 @@ pub struct Checkpoint {
     #[serde(default)]
     pub release: String,
     pub lane: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub precision: String,
     pub manifest: String,
     #[serde(default)]
     pub yanked: bool,

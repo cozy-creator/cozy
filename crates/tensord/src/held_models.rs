@@ -140,9 +140,11 @@ fn list(store: &Store, seen: &Seen) -> std::io::Result<Listing> {
         if models.last().is_none_or(|m| m.repository != *repository) {
             models.push(v1::Model { repository: repository.clone(), ..Default::default() });
         }
+        let precision = store.checkpoint(header).map(|c| crate::precision::Profile::of(c.header()).family).unwrap_or_default();
         models.last_mut().expect("pushed").checkpoints.push(v1::Checkpoint {
             release: release.clone(),
             lane: lane.clone(),
+            precision,
             manifest: header.id(),
             yanked: false,
         });
@@ -211,7 +213,7 @@ mod tests {
         assert_eq!(rows, [("acme/base", 1000 + own[0], own[0]), ("local/mine", 1000 + own[1], own[1])]);
         assert_eq!(held.bytes, 1000 + own[0] + own[1], "the shared asset counts once");
         let release = &held.models[0].checkpoints[0];
-        assert_eq!((release.release.as_str(), release.lane.as_str()), ("1.0.0", "fp8"));
+        assert_eq!((release.release.as_str(), release.lane.as_str()), ("1.0.0", "model.fp8.cozytensors"));
         assert!(release.manifest.starts_with("sha256:") && !release.yanked);
         assert_eq!(held.models[1].checkpoints[0].release, "", "a local model has no release");
         // A use answers from the last read; a removed model is seen.
@@ -219,7 +221,7 @@ mod tests {
         drop(store.checkpoint(&acme).unwrap());
         assert_eq!(listing(&root), held);
         let pulled = Pulled::of(&store, &acme).unwrap().unwrap();
-        assert_eq!((pulled.repository.as_str(), pulled.release.as_str(), pulled.lane.as_str()), ("acme/base", "1.0.0", "fp8"));
+        assert_eq!((pulled.repository.as_str(), pulled.release.as_str(), pulled.lane.as_str()), ("acme/base", "1.0.0", "model.fp8.cozytensors"));
         store.update_ref("local/mine", |_| None).unwrap();
         assert_eq!(listing(&root).models.len(), 1);
         std::fs::remove_dir_all(&root).unwrap();
