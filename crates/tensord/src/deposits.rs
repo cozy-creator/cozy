@@ -248,8 +248,8 @@ mod tests {
     fn a_deposited_layout_keeps_its_admission_until_filled() {
         use tensorfs::io::{source::{IoTally, Source}, ItemSource, Span};
         let deposits = Deposits::default();
-        let spans = [Span { what: "weight".into(), len: 4096, source: ItemSource::Inline(vec![7; 4096].into()) }];
-        let layout = varena::layout::Layout::build(&spans, &[vec!["weight".into()]]).unwrap();
+        let spans = [Span { what: "model/weight#data".into(), len: 4096, source: ItemSource::Inline(vec![7; 4096].into()) }];
+        let layout = varena::layout::Layout::build(&spans, &[vec!["model/weight".into()]]).unwrap();
         assert_eq!(deposits.seal("m", "l", "run-a#0", || true), Ok(true));
         let (file, fill) = varena::host::open_sealed("admission", &layout, None, None).unwrap();
         deposits.deposit("m", "l", file.into(), &[]).unwrap();
