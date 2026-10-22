@@ -927,6 +927,11 @@ impl Timings {
         self.1.lock().get(op).copied()
     }
 
+    /// The wall time since the previous lap (None on the first).
+    fn lap(&self) -> Option<std::time::Duration> {
+        self.1.lock().insert("lap", std::time::Instant::now()).map(|t| t.elapsed())
+    }
+
     /// `op n total max`, the costliest first.
     fn report(&self) -> String {
         let mut rows: Vec<_> = self.0.lock().iter().map(|(op, (n, total, max))| (*op, *n, *total, *max)).collect();
@@ -946,7 +951,16 @@ impl Backend for Timed {
     fn granularity(&self) -> u64 { self.0.granularity() }
     fn reserve(&self, len: u64) -> varena::Result<Va> { self.1.time("reserve", || self.0.reserve(len)) }
     fn release(&self, va: Va) { self.1.time("release", || self.0.release(va)) }
-    fn create(&self, len: u64) -> varena::Result<Physical> { self.1.time("create", || self.0.create(len)) }
+    fn create(&self, len: u64) -> varena::Result<Physical> {
+        let page = self.1.time("create", || self.0.create(len));
+        // Every 1,000 pages a process says where their time goes (stderr: the case log).
+        let n = self.1.count("create");
+        if n == 1 || n.is_multiple_of(1000) {
+            let wall = self.1.lap();
+            eprintln!("TIMINGS pid {} after {n} pages ({wall:?} wall since page {}): {}", std::process::id(), n.saturating_sub(1000).max(1), self.1.report());
+        }
+        page
+    }
     fn destroy(&self, page: Physical) { self.1.time("destroy", || self.0.destroy(page)) }
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> varena::Result<()> { self.1.time("map", || self.0.map(va, offset, page, access)) }
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> { self.1.time("protect", || self.0.protect(va, offset, len, access)) }
@@ -1866,6 +1880,8 @@ fn role_agent() {
     let mut passes: HashMap<String, Pass> = HashMap::new();
     step!();
     let mut pins: Vec<Pin> = vec![];
+    let mut crowded: Vec<Pressure> = vec![];
+    let mut timings: Option<Arc<Timings>> = None;
     step!();
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
@@ -1877,7 +1893,9 @@ fn role_agent() {
                 let (b, real) = gpu();
                 uuid = id.to_string();
                 let g = GpuId { uuid: uuid.clone(), ..b.gpu().unwrap() };
-                mem = Some(memory(b, &g));
+                let (m, t) = timed_memory(b, &g);
+                mem = Some(m);
+                timings = Some(t);
                 format!("ok {} {real}", std::process::id())
             }
             ["load", name, blocks, seed, fill, level] => {
@@ -1942,6 +1960,12 @@ fn role_agent() {
                 let origins: Vec<String> = requests[*req].stats().trace.iter().map(|t| format!("{:?}", t.origin)).collect();
                 format!("ok {}", origins.join(","))
             }
+            // Takes the card down to ROOM free, as other allocations of this process would.
+            ["crowd"] => {
+                crowded.push(crowd());
+                "ok".into()
+            }
+            ["timings"] => format!("ok {}", timings.as_ref().unwrap().report()),
             ["unpin"] => {
                 pins.clear();
                 "ok".into()
@@ -2271,7 +2295,12 @@ fn two_processes_contend_and_an_idle_holder_gives_back_while_its_pins_stay() {
     step!();
     holder.ok("load h 1 11 stored ram");
     step!();
+    // The card down to ROOM first: the holder's idle set is then ROOM's pages, not the whole card's.
+    holder.ok("crowd");
+    step!();
     holder.ok("load idle more bulk stored gpu");
+    step!();
+    println!("TIMINGS holder load: {}", holder.ok("timings"));
     step!();
     holder.ok("request rh h");
     step!();

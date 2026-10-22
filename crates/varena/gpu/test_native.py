@@ -1,6 +1,6 @@
 """CPU proof of native.py, no GPU: real processes of stub test binaries (shell scripts that speak
-libtest's arguments and output), bundled as the runner takes them: `gpu` with a case that passes,
-one that fails, one that hangs (judged by its earlier steps, so killed as stalled), one that
+libtest's arguments and output), bundled as the runner takes them: `gpu` with a case that passes
+(printing a long TIMINGS line), one that fails, one that hangs (judged by its earlier steps, so killed as stalled), one that
 hangs unjudged until a cancel, and the GPU monitor; `tensorfs-io` with a test that prints no GPU. cozy_runtime's author API is stood in for by the few names native.py uses.
 
     python3 -I crates/varena/gpu/test_native.py
@@ -18,7 +18,7 @@ import types
 STUB = r"""#!/bin/sh
 case "$3" in
   role_monitor) echo "running 1 test"; echo "test role_monitor ... @ ready"; while read l; do echo "@ unknown no sample"; done ;;
-  passes) echo "test passes ... STEP 1 0"; echo "STEP 2 5"; echo "PASS it passes GPU-00000000-0000-0000-0000-000000000000"; echo "test result: ok. 1 passed; 0 failed; 0 ignored" ;;
+  passes) echo "test passes ... STEP 1 0"; echo "TIMINGS holder load: ok $(printf 'map 1x 1ms, %.0s' $(seq 30))" >&2; echo "STEP 2 5"; echo "PASS it passes GPU-00000000-0000-0000-0000-000000000000"; echo "test result: ok. 1 passed; 0 failed; 0 ignored" ;;
   fails) echo "test fails ... STEP 1 0"; echo "thread 'fails' panicked: on purpose" >&2; echo "test result: FAILED. 0 passed; 1 failed; 0 ignored"; exit 101 ;;
   hangs|waits) echo "test $3 ... STEP 1 0"; exec sleep 100000 ;;
   plain) echo "test plain ... ok"; echo "test result: ok. 1 passed; 0 failed; 0 ignored" ;;
@@ -90,8 +90,10 @@ def main():
     assert "gpu/passes2" not in result["passed"] + result["failed"], "a cancel stops the suite"
     assert any(m.startswith("TAIL gpu/fails") and "panicked: on purpose" in m for _, m in ctx.lines), "a failure's tail reaches the run log"
     assert any(m.startswith("TAIL gpu/waits") for _, m in ctx.lines), "a cancelled case's tail reaches the run log"
+    figures = [m for _, m in ctx.lines if m.startswith("gpu/passes: ")]
+    assert len(figures) == 3 and figures[0].startswith("gpu/passes: TIMINGS holder load: ok map") and all(len(m) <= 200 for m in figures), figures
     assert took < 10, f"the hang and the cancel ended the suite in {took:.1f} s"
-    print(f"PASS native.py on CPU: pass (two binaries), fail, stalled, cancelled, in {took:.1f} s")
+    print(f"PASS native.py on CPU: pass (two binaries, figures told), fail, stalled, cancelled, in {took:.1f} s")
 
 
 if __name__ == "__main__":
