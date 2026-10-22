@@ -116,7 +116,7 @@ def main():
             actual = x.cpu()
             moved = request.stats().moved
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
-        print(json.dumps({"run": label, "ms": (time.perf_counter() - start) * 1000, "store_bytes": moved.store.bytes, "tier_bytes": moved.tier.bytes}), flush=True)
+        print(json.dumps({"run": label, "ms": (time.perf_counter() - start) * 1000, "store_bytes": moved.store.bytes}), flush=True)
         return actual
 
     run("graph-refill-1", source, True)

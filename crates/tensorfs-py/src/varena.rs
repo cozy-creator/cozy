@@ -119,7 +119,6 @@ pub struct PyFills {
 #[derive(Clone)]
 pub struct PyMoved {
     kept: PyFills,
-    tier: PyFills,
     store: PyFills,
     speculative: u64,
 }
@@ -182,13 +181,12 @@ impl From<varena::Stats> for PyStats {
         let origin = |o: Origin| match o {
             Origin::Hit => "hit",
             Origin::Kept => "kept",
-            Origin::Tier => "tier",
             Origin::Store => "store",
         };
         PyStats {
             raw,
             request: s.request,
-            moved: PyMoved { kept: m.kept.into(), tier: m.tier.into(), store: m.store.into(), speculative: m.speculative },
+            moved: PyMoved { kept: m.kept.into(), store: m.store.into(), speculative: m.speculative },
             trace: s.trace.into_iter().map(|r| PyRef_ { step: r.step, set: r.set, block: r.block, bytes: r.bytes, origin: origin(r.origin), speculative: r.speculative }).collect(),
             steps: s.steps.into_iter().map(|t| PyStepStats { capacity: t.capacity, evicted: t.evicted.into() }).collect(),
             stall_ns: s.stall_ns,
