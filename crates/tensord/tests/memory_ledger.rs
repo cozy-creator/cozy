@@ -540,8 +540,9 @@ fn a_root_tensord_grants_executors_of_its_identity() {
 
 /// Hosting (S5 r3): TensorD names the GPU of a 2-GPU group that keeps a placeable set. Beside
 /// GPU 0's running request (its pass's room held, the package's measured working set) the set
-/// has no room there and is homed on GPU 1; the same placement with GPU 0 idle keeps it there.
-/// Its bytes are what its load recorded on the group (a loader on GPU 1).
+/// has no room there and is homed on GPU 1; with GPU 0 idle, before and after its request is
+/// measured, it stays there (place, measure, place again: one answer). Its bytes are what its
+/// load recorded on the group (a loader on GPU 1).
 #[test]
 fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
     let dir = tempfile::tempdir().unwrap();
@@ -561,7 +562,9 @@ fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
     let admit = |id: &str| memory::admit(&engine, &[&gpu0.ledger], id, PACKAGE, BIG, None).unwrap();
     let homes = || memory::homes(&[&gpu0.ledger, &gpu1.ledger], PACKAGE, "", None, &[set.as_str()], &log);
     let mut busy = StandIn::spawn(&gpu0, &id0, "gpu");
+    assert_eq!(homes(), [0], "nothing measured runs on GPU 0: it keeps it");
     measure(&mut busy, &request, &admit, &gpu0);
+    assert_eq!(homes(), [0], "measuring GPU 0's request changes nothing while it is idle");
     let call = request("busy");
     assert!(admit(&call));
     assert_eq!(busy.ask(&format!("run {call} {BIG}")), "passing");
@@ -569,4 +572,5 @@ fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
     assert_eq!(busy.ask(&format!("end {BIG_ROOM}")), "ended");
     gpu0.ledger.undispatch(&call);
     assert_eq!(homes(), [0], "with room on GPU 0 it stays there");
+    assert_eq!(homes(), [0], "and the same placement answers the same");
 }
