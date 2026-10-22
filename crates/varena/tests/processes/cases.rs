@@ -345,7 +345,7 @@ fn agent() {
                 let s = shrunk.clone();
                 let c = m.cache(owner, &[], Box::new(move |want| {
                     s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    want
+                    varena::Shrunk { freed: want, coming: 0 }
                 }));
                 m.cached(c, bytes.parse().unwrap());
                 "ok".into()

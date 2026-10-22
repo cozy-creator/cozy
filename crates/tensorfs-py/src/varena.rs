@@ -478,9 +478,9 @@ impl PyMemory {
         let shrink = move |want: u64| {
             if crate::allocator::inside() {
                 crate::allocator::shrink_inside();
-                return 0;
+                return varena::Shrunk::default();
             }
-            Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0)
+            varena::Shrunk { freed: Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0), coming: 0 }
         };
         detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, &[], shrink))).map(|c| c.0)
     }

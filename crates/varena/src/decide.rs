@@ -526,7 +526,7 @@ impl<'a> Demand<'a> {
 
     /// Every own cache not shrunk yet, least recently used first (an idle process's answer).
     fn shrink(&mut self) {
-        let mut caches: Vec<_> = self.t.caches.iter().filter(|c| c.bytes > 0 && !self.shrunk.contains(&c.id)).collect();
+        let mut caches: Vec<_> = self.t.caches.iter().filter(|c| c.bytes > 0 && !self.shrunk.contains(&c.id) && self.t.cache_class(c) != Class::P).collect();
         caches.sort_by_key(|c| (c.last_use, c.id));
         for c in caches {
             if self.covered() {
