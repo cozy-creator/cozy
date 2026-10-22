@@ -290,6 +290,18 @@ pub(crate) mod tests {
         assert_eq!(deposits.seal("m", "other", "run-d#1", 10, false, |_| true), Ok(true));
     }
 
+    /// A waiter whose loader ended (it died, or its call ended without a deposit) loads the
+    /// layout itself at its next ask, instead of waiting on nobody.
+    #[test]
+    fn a_waiter_whose_loader_ended_loads_the_layout_itself() {
+        let deposits = Deposits::default();
+        assert_eq!(deposits.seal("m", "l", "run-a#0", 4096, false, |_| true), Ok(true));
+        assert_eq!(deposits.seal("m", "l", "run-b#0", 4096, false, |_| true), Err("run-a#0".into()));
+        deposits.ended("run-a");
+        assert_eq!(deposits.seal("m", "l", "run-b#0", 4096, false, |_| true), Ok(true), "the waiter loads it");
+        assert_eq!(deposits.seal("m", "l", "run-c#0", 4096, false, |_| true), Err("run-b#0".into()));
+    }
+
     /// An older Runtime or TensorFS seals whatever the answer: it is the layout's one sealer even
     /// unadmitted, so a second asker waits for its copy instead of filling another.
     #[test]

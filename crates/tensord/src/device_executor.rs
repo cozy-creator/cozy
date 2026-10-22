@@ -737,6 +737,11 @@ pub trait Services {
         drop(plan);
         Ok((Answer::unavailable(frame.seq), Vec::new()))
     }
+    /// After a `read_grant` refused `layout_sealing`: the progress of the call loading that
+    /// layout, which the asker waits on.
+    fn sealer(&mut self) -> Option<crate::process::Lender> {
+        None
+    }
     /// `keep_pages`: its fds, one per page.
     fn keep_pages(&mut self, frame: &Frame, pages: Vec<File>) -> Answer {
         drop(pages);
@@ -1674,7 +1679,10 @@ impl DeviceExecutor {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::UnexpectedEof, "stock executor EOF before reply")
                 })?;
-            watch.frame();
+            // A re-ask while another call loads the layout is no progress of its own (below).
+            if frame.kind != Kind::ReadGrant {
+                watch.frame();
+            }
             match frame.event {
                 Some(Event::Request) if !frame.malformed.is_empty() => {
                     refuse_malformed(&mut self.writer.lock().unwrap(), &frame)?
@@ -1703,6 +1711,14 @@ impl DeviceExecutor {
                     let answered = services.read_grant(&frame, plan);
                     watch.serving(false);
                     let (mut answer, out) = answered?;
+                    // Waiting on the call that loads the layout, the asker moves as it moves.
+                    match answer.code.as_str() {
+                        "layout_sealing" => watch.waits_on(services.sealer()),
+                        _ => {
+                            watch.waits_on(None);
+                            watch.frame();
+                        }
+                    }
                     answer.event = "answer";
                     answer.seq = frame.seq;
                     answer.descriptor = false;
