@@ -280,7 +280,14 @@ impl Remote {
                 )
             }
             Err(_) => {
-                Header::from_cbor(&bytes)?;
+                let header = Header::from_cbor(&bytes)?;
+                // A header id is its own only variant, validated by the same rule.
+                if let Some(constraints) = constraints {
+                    let profile = crate::precision::Profile::of(&header);
+                    if constraints.select(&reference.repo_id, &[("", &profile)])?.is_none() {
+                        return fail(Kind::NotFound, "no variant fits the requested GPUs and bits");
+                    }
+                }
                 (None, root.clone(), reference.variant.clone(), Vec::new())
             }
         };
