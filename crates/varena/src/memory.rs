@@ -1278,14 +1278,16 @@ impl Memory {
         Ok(Workspace { inner: self.inner.clone().into(), id, remaining })
     }
 
-    /// Blocks until every mechanism call and every custody and tier call decided so far has
-    /// been made: then the kept pages are custody's (a planned handover), and a dropped Memory's
-    /// row is gone when the drop returns.
+    /// Blocks until every Keep due so far is made (waiting for its page's pending events), and
+    /// every mechanism call and every custody and tier call decided so far has been made: then
+    /// the kept pages are custody's (a planned handover), and a dropped Memory's row is gone when
+    /// the drop returns.
     pub fn settle(&self) {
+        self.inner.saves.settle();
+        self.inner.hand_over();
         self.inner.mech.settle();
         self.inner.to_custody.settle();
         self.inner.to_tier.settle();
-        self.inner.saves.settle();
     }
 
     /// The record of the request that ended last.
@@ -1416,27 +1418,85 @@ impl Inner {
                 if let Some(q) = st.events.get_mut(&stream) {
                     q.pop_front();
                 }
-                st.restock = true;
-                let ready = st.homes.get(&key).map(|h| h.ready);
-                if let Some(i) = st.table.page(key).and_then(|p| p.releasing.iter().position(|e| *e == event.0)) {
-                    if let Some(p) = st.table.page_mut(key) {
-                        p.releasing.swap_remove(i);
-                    }
-                    if Some(event) != ready {
-                        self.backend.retire(event);
-                    }
-                }
-                // A transform or fill whose event completed: now read-only and kept.
-                if keep && st.homes.get(&key).is_some_and(|h| h.keep_after && h.ready == event) {
-                    if let Some(h) = st.homes.get_mut(&key) {
-                        h.keep_after = false;
-                    }
-                    self.keep(st, key);
-                }
+                self.completed(st, event, key, keep);
             }
         }
         st.events.retain(|_, q| !q.is_empty());
         wake
+    }
+
+    /// `key`'s pending `event` completed: it leaves the page's releases (retired unless it is
+    /// the page's ready event), and a Keep waiting on it falls due.
+    fn completed(&self, st: &mut State, event: Event, key: Key, keep: bool) {
+        st.restock = true;
+        let ready = st.homes.get(&key).map(|h| h.ready);
+        if let Some(i) = st.table.page(key).and_then(|p| p.releasing.iter().position(|e| *e == event.0)) {
+            if let Some(p) = st.table.page_mut(key) {
+                p.releasing.swap_remove(i);
+            }
+            if Some(event) != ready {
+                self.backend.retire(event);
+            }
+        }
+        // A transform or fill whose event completed: now read-only and kept.
+        if keep && st.homes.get(&key).is_some_and(|h| h.keep_after && h.ready == event) {
+            if let Some(h) = st.homes.get_mut(&key) {
+                h.keep_after = false;
+            }
+            self.keep(st, key);
+        }
+    }
+
+    /// A planned handover ([`Memory::settle`]): every Keep due so far is queued. A due page
+    /// waits on its pending events (its consumers' releases, or its fill's): this call takes
+    /// them from the drain under a pin of its own, so nothing else retires or evicts them,
+    /// waits for them unlocked, and completes them as a drain would.
+    fn hand_over(&self) {
+        let (pins, taken) = {
+            let mut st = self.lock();
+            let due: BTreeSet<Key> = st.keep_due.iter().copied().chain(st.homes.iter().filter(|(_, h)| h.keep_after).map(|(k, _)| *k)).collect();
+            let mut taken = vec![];
+            for (stream, q) in &mut st.events {
+                q.retain(|&(event, key)| {
+                    let mine = due.contains(&key);
+                    if mine {
+                        taken.push((*stream, event, key));
+                    }
+                    !mine
+                });
+            }
+            let me = std::thread::current().id();
+            let keys: BTreeSet<Key> = taken.iter().map(|(.., k)| *k).collect();
+            let pins: Vec<u64> = keys
+                .into_iter()
+                .map(|key| {
+                    let pin = st.tick();
+                    st.pins.insert(pin, (key, None, me));
+                    st.sync(key);
+                    pin
+                })
+                .collect();
+            self.unlock(st);
+            (pins, taken)
+        };
+        let done: Vec<bool> = taken.iter().map(|(_, event, _)| self.backend.finish(*event).is_ok()).collect();
+        let mut st = self.lock();
+        for pin in pins {
+            if let Some((key, ..)) = st.pins.remove(&pin) {
+                st.sync(key);
+            }
+        }
+        for ((stream, event, key), done) in taken.into_iter().zip(done) {
+            match done {
+                true => self.completed(&mut st, event, key, true),
+                // Unproven: still pending, for the drain.
+                false => st.events.entry(stream).or_default().push_back((event, key)),
+            }
+        }
+        self.drain(&mut st);
+        self.publish(&mut st);
+        self.unlock(st);
+        self.landed.notify_all();
     }
 
     fn drain(&self, st: &mut State) {
@@ -2936,8 +2996,9 @@ impl Inner {
     }
 
     fn pass(&self, req: u64, set: u32, entry: &str, dims: &str, torch: Torch) -> Result<u64> {
-        let (id, room, unmeasured, step_pages, orphans) = {
+        let (id, room, unmeasured, step_pages, orphans, before) = {
             let mut st = self.lock();
+            let before = st.last_unmap;
             st.restock = true;
             st.mech(set)?;
             self.measure(&mut st, torch);
@@ -2960,7 +3021,7 @@ impl Inner {
             let step: Vec<Key> = st.table.request(req).and_then(|r| r.steps.get(r.cursor.step as usize)).map(|(sets, _)| st.table.pages().filter(|(k, p)| sets.contains(&k.0) && !p.mapped).map(|(k, _)| k).collect()).unwrap_or_default();
             let orphans = st.table.orphans > 0;
             self.unlock(st);
-            (id, room, unmeasured, step, orphans)
+            (id, room, unmeasured, step, orphans, before)
         };
         // Kept pages of this step are adopted before the demand could release them as orphans.
         if orphans {
@@ -2973,6 +3034,7 @@ impl Inner {
             self.unlock(st);
             return Err(Error::Exhausted(exhausted(*need, None, stats)));
         }
+        self.settle_unmaps(before);
         let mut st = self.lock();
         let (w, room) = st.table.request(req).map_or((0, 0), |r| (st.table.w(r), r.room + r.claimed));
         if let Some(s) = st.step_stats(req) {
@@ -3125,6 +3187,15 @@ impl Inner {
             self.mech.settle_to(t + 1);
         }
         Ok(next)
+    }
+
+    /// A pass's room is real before it runs: the unmaps decided since `before` are done (torch
+    /// allocates outside the mechanism's order, so a queued unmap's bytes are not its yet).
+    fn settle_unmaps(&self, before: Option<u64>) {
+        let last = self.state.lock().last_unmap;
+        if let Some(t) = last.filter(|t| Some(*t) != before) {
+            self.mech.settle_to(t + 1);
+        }
     }
 
     /// An OOM in a pass whose room was measured: the room it needed (`allocated`, its
@@ -4141,13 +4212,17 @@ impl Inner {
         // Its room back as a request first gets it: a decision, then waits on the table's
         // changes. Exhausted only if the card cannot hold it at all.
         let _waiting = self.row.waiting();
+        let before = self.state.lock().last_unmap;
         loop {
             let epoch = self.room_wake.epoch();
             let actions = match self.demand(Trigger::Pass { req, set, room: measured.then_some(room), unmeasured: room, tried: Tried::default() }, Some(req)) {
                 Ok(a) => a,
                 Err(e) => break Err(e),
             };
-            let Some(Action::Exhausted { need }) = actions.last() else { break Ok(()) };
+            let Some(Action::Exhausted { need }) = actions.last() else {
+                self.settle_unmaps(before);
+                break Ok(());
+            };
             let st = self.lock();
             let never = room > st.table.capacity;
             let stats = st.stats.get(&req).cloned().unwrap_or_default();

@@ -18,7 +18,7 @@ use tensorfs::format::ObjectRef;
 use tensorfs::io::source::Source;
 use tensorfs::io::{Dst, ItemSource, ObjectRange};
 use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
-use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Physical, Plan, Result, SetSpec, Step, Torch, Va};
+use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Next, Physical, Plan, Result, SetSpec, Step, Torch, Va};
 
 #[derive(Default)]
 struct Events {
@@ -740,12 +740,22 @@ fn a_create_short_of_memory_decides_again() {
 }
 
 /// A card's view of memory: a page's bytes are in use while any handle to them lives, the
-/// process's own or custody's (here the fake custody's, in this process).
-struct Driver {
+/// process's own or custody's (custody runs in this process), and so are bytes allocated outside
+/// varena (torch's, or another process's). An allocation needs `slack` bytes free beyond its own
+/// (the driver's metadata: a card refused 2 MiB with 3.3 MB free, and 1 GiB with 1.2 MiB over).
+struct Card {
     host: HostBackend,
     limit: u64,
+    slack: u64,
     /// id → (inode, bytes, destroyed by this process).
     pages: Mutex<std::collections::HashMap<u64, (u64, u64, bool)>>,
+    /// This process's allocations outside varena (torch's), and another process's bytes.
+    torch: AtomicU64,
+    foreign: AtomicU64,
+    /// The next unmap waits (as a card's does on queued work) until the gate opens.
+    hold_unmap: AtomicBool,
+    unmap_gate: Gate,
+    unmap_waits: Gate,
 }
 
 fn inode(h: &Owned) -> u64 {
@@ -753,106 +763,135 @@ fn inode(h: &Owned) -> u64 {
     std::fs::File::from(h.try_clone().unwrap()).metadata().unwrap().ino()
 }
 
-impl Driver {
+impl Card {
+    fn new(limit: u64, slack: u64) -> Arc<Card> {
+        Arc::new(Card { host: HostBackend::new(limit), limit, slack, pages: Mutex::default(), torch: AtomicU64::default(), foreign: AtomicU64::default(), hold_unmap: AtomicBool::default(), unmap_gate: Gate::default(), unmap_waits: Gate::default() })
+    }
+
     fn used(&self) -> u64 {
         let open: HashSet<u64> = std::fs::read_dir("/proc/self/fd").unwrap().flatten().filter_map(|e| std::fs::metadata(e.path()).ok()).map(|m| std::os::unix::fs::MetadataExt::ino(&m)).collect();
-        self.pages.lock().values().filter(|(ino, _, gone)| !gone || open.contains(ino)).map(|(_, len, _)| len).sum()
+        let pages: u64 = self.pages.lock().values().filter(|(ino, _, gone)| !gone || open.contains(ino)).map(|(_, len, _)| len).sum();
+        pages + self.torch.load(Ordering::SeqCst) + self.foreign.load(Ordering::SeqCst)
+    }
+
+    fn free(&self) -> u64 {
+        self.limit.saturating_sub(self.used())
+    }
+
+    fn fits(&self, len: u64) -> bool {
+        self.used() + len + self.slack <= self.limit
+    }
+
+    /// An allocation of torch's, as a card serves it: refused without room.
+    fn take(&self, len: u64) -> bool {
+        let fits = self.fits(len);
+        if fits {
+            self.torch.fetch_add(len, Ordering::SeqCst);
+        }
+        fits
+    }
+
+    fn give(&self, len: u64) {
+        self.torch.fetch_sub(len, Ordering::SeqCst);
     }
 }
 
+struct Driver(Arc<Card>);
+
 impl Backend for Driver {
     fn capacity(&self) -> u64 {
-        self.limit
+        self.0.limit
     }
     fn free(&self) -> Result<u64> {
-        Ok(self.limit.saturating_sub(self.used()))
+        Ok(self.0.free())
     }
     fn process_used(&self) -> Result<u64> {
-        self.host.process_used()
+        Ok(self.0.host.process_used()? + self.0.torch.load(Ordering::SeqCst))
     }
     fn opened_context(&self) -> u64 {
         0
     }
     fn granularity(&self) -> u64 {
-        self.host.granularity()
+        self.0.host.granularity()
     }
     fn reserve(&self, len: u64) -> Result<Va> {
-        self.host.reserve(len)
+        self.0.host.reserve(len)
     }
     fn release(&self, va: Va) {
-        self.host.release(va)
+        self.0.host.release(va)
     }
     fn create(&self, len: u64) -> Result<Physical> {
-        if self.used() + len > self.limit {
+        if !self.0.fits(len) {
             return Err(varena::Error::Device { op: "create", code: varena::backend::OUT_OF_MEMORY, name: "out of memory".into() });
         }
-        let page = self.host.create(len)?;
-        let ino = inode(&self.host.export(&page)?);
-        self.pages.lock().insert(page.id, (ino, len, false));
+        let page = self.0.host.create(len)?;
+        let ino = inode(&self.0.host.export(&page)?);
+        self.0.pages.lock().insert(page.id, (ino, len, false));
         Ok(page)
     }
     fn destroy(&self, page: Physical) -> Result<()> {
-        if let Some(p) = self.pages.lock().get_mut(&page.id) {
+        if let Some(p) = self.0.pages.lock().get_mut(&page.id) {
             p.2 = true;
         }
-        self.host.destroy(page)
+        self.0.host.destroy(page)
     }
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()> {
-        self.host.map(va, offset, page, access)
+        self.0.host.map(va, offset, page, access)
     }
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()> {
-        self.host.protect(va, offset, len, access)
+        self.0.host.protect(va, offset, len, access)
     }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> {
-        self.host.unmap(va, offset, len)
+        held(&self.0.hold_unmap, &self.0.unmap_waits, &self.0.unmap_gate);
+        self.0.host.unmap(va, offset, len)
     }
     fn export(&self, page: &Physical) -> Result<Owned> {
-        self.host.export(page)
+        self.0.host.export(page)
     }
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> {
-        self.host.import(handle, len)
+        self.0.host.import(handle, len)
     }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
-        self.host.target(va, offset, len)
+        self.0.host.target(va, offset, len)
     }
     fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> {
-        self.host.save(va, offset, host, after)
+        self.0.host.save(va, offset, host, after)
     }
     fn fence(&self) -> Result<Event> {
-        self.host.fence()
+        self.0.host.fence()
     }
     fn record(&self, stream: usize) -> Result<Event> {
-        self.host.record(stream)
+        self.0.host.record(stream)
     }
     fn query(&self, event: Event) -> Result<bool> {
-        self.host.query(event)
+        self.0.host.query(event)
     }
     fn elapsed(&self, from: Event, to: Event) -> Result<Option<u64>> {
-        self.host.elapsed(from, to)
+        self.0.host.elapsed(from, to)
     }
     fn wait(&self, event: Event, stream: usize) -> Result<()> {
-        self.host.wait(event, stream)
+        self.0.host.wait(event, stream)
     }
     fn synchronize(&self, stream: usize) -> Result<()> {
-        self.host.synchronize(stream)
+        self.0.host.synchronize(stream)
     }
     fn finish(&self, event: Event) -> Result<()> {
-        self.host.finish(event)
+        self.0.host.finish(event)
     }
     fn register_host(&self, ptr: u64, len: u64) -> Result<()> {
-        self.host.register_host(ptr, len)
+        self.0.host.register_host(ptr, len)
     }
     fn unregister_host(&self, ptr: u64) -> Result<()> {
-        self.host.unregister_host(ptr)
+        self.0.host.unregister_host(ptr)
     }
     fn retire(&self, event: Event) {
-        self.host.retire(event)
+        self.0.host.retire(event)
     }
     fn drain(&self) -> Result<()> {
-        self.host.drain()
+        self.0.host.drain()
     }
     fn drain_save(&self) -> Result<()> {
-        self.host.drain_save()
+        self.0.host.drain_save()
     }
 }
 
@@ -886,8 +925,7 @@ fn an_evicted_kept_page_is_free_once_withdrawn() {
     let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
     gate.open();
     serve_custody(&uuid, gate, log.clone());
-    let driver = Driver { host: HostBackend::new(g.memory), limit: g.memory, pages: Mutex::new(Default::default()) };
-    let mem = Memory::open(g.clone(), None, Box::new(driver)).unwrap();
+    let mem = Memory::open(g.clone(), None, Box::new(Driver(Card::new(g.memory, 0)))).unwrap();
     let k = stored(dir.path(), &uuid, "k", 2);
     let key = k.fingerprint.key();
     mem.load(k, Level::Gpu).unwrap();
@@ -1617,3 +1655,170 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     assert_eq!(exports(), 5);
     drop(r);
 }
+
+/// Native an_oom_in_a_pass / a_measured_pass (graph-core runs 519 and e199) on a host card, after
+/// the lead's ruling 1: the card crowded and the rest full of an idle kept set. An unmeasured pass
+/// takes the idle pages before it runs, with custody's handles and its own unmaps gone, so its
+/// activation fits at once; the next run's measured pass makes its room before it runs too.
+/// Neither meets an OOM.
+#[test]
+fn a_pass_on_a_card_full_of_idle_kept_pages_has_its_room_before_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("fullkept-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 24 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let card = Card::new(g.memory, 0);
+    let mem = Memory::open(g.clone(), None, Box::new(Driver(card.clone()))).unwrap();
+    let m = mem.load(stored(dir.path(), &uuid, "m", 2), Level::Ram).unwrap();
+    card.foreign.store(8 * REGION_ALIGN, Ordering::SeqCst);
+    let activation = 8 * REGION_ALIGN;
+    let plan = Plan { steps: vec![Step { sets: vec!["m".into()], passes: 1 }] };
+    for (name, measured) in [("first", false), ("second", true)] {
+        mem.load(stored(dir.path(), &uuid, "idle", 17), Level::Gpu).unwrap();
+        mem.settle();
+        assert!(!card.fits(REGION_ALIGN), "{name}: the idle set fills the card: {} free", card.free());
+        let r = mem.request(name, plan.clone()).unwrap();
+        let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
+        let pins: Vec<varena::Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
+        assert!(card.take(activation), "{name} (measured: {measured}): the pass made its room before it ran: {} free", card.free());
+        pass.end(Measured { allocated_peak: activation, slack: 0, sites: vec![] }, Torch { allocated: activation, reserved: activation });
+        drop(pins);
+        card.give(activation);
+        let stats = r.end();
+        assert_eq!((stats.retries, stats.leftover), (0, 0), "{name}: {stats:?}");
+        assert!(stats.evicted.iter().sum::<u64>() >= activation, "{name}: {stats:?}");
+    }
+}
+
+/// Lead's ruling 1, the pass side: the room a pass start makes is free on the device when the
+/// pass runs (torch allocates outside the mechanism's order, and the allocator callback cannot
+/// wait). The idle kept pages an unmeasured pass takes are free once custody lets them go and
+/// their unmaps are done: both are held here, and the pass returns only after them.
+#[test]
+fn a_pass_returns_only_once_the_room_it_made_is_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("roomfree-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
+    gate.open();
+    serve_custody(&uuid, gate.clone(), log.clone());
+    let card = Card::new(g.memory, 0);
+    let mem = Memory::open(g.clone(), None, Box::new(Driver(card.clone()))).unwrap();
+    let k = stored(dir.path(), &uuid, "k", 6);
+    let key = k.fingerprint.key();
+    mem.load(k, Level::Gpu).unwrap();
+    mem.settle();
+    assert_eq!(log.kept.lock().keys().filter(|(fp, _)| *fp == key).count(), 6, "the idle set is kept");
+    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+    // Custody answers nothing, and the next unmap waits.
+    gate.close();
+    card.hold_unmap.store(true, Ordering::SeqCst);
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|t| {
+        let passing = t.spawn(|| {
+            // SAFETY: gettid has no preconditions.
+            tid_tx.send(unsafe { libc::gettid() }).unwrap();
+            let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
+            (pass, card.free())
+        });
+        let tid = tid_rx.recv().unwrap();
+        // Its decision is out: an unmap is held and custody has a Withdraw.
+        card.unmap_waits.pass();
+        log.await_call(|(_, call)| call.contains("Withdraw"));
+        let sleeping = || std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).is_ok_and(|s| s.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('S')));
+        while !passing.is_finished() && !sleeping() {
+            std::thread::yield_now();
+        }
+        gate.open();
+        card.unmap_gate.open();
+        let (pass, free) = passing.join().unwrap();
+        assert_eq!(free, 8 * REGION_ALIGN, "the pass returned before the room it made was free");
+        drop(pass);
+    });
+}
+
+/// An OOM in a measured pass on a card full of idle kept pages (native an_oom_in_a_pass): the
+/// pass made only its measured room, the activation outgrew it, and each OOM answers Retry with
+/// the idle pages; a retry the driver still refuses (its metadata) evicts more, and fits.
+#[test]
+fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("oomkept-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 24 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let card = Card::new(g.memory, REGION_ALIGN / 2);
+    let mem = Memory::open(g.clone(), None, Box::new(Driver(card.clone()))).unwrap();
+    let m = mem.load(stored(dir.path(), &uuid, "m", 2), Level::Ram).unwrap();
+    let plan = Plan { steps: vec![Step { sets: vec!["m".into()], passes: 1 }] };
+    // The shape measured small on an empty card.
+    let r = mem.request("small", plan.clone()).unwrap();
+    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
+    pass.end(Measured { allocated_peak: REGION_ALIGN, slack: 0, sites: vec![] }, Torch::default());
+    drop(r);
+    card.foreign.store(8 * REGION_ALIGN, Ordering::SeqCst);
+    mem.load(stored(dir.path(), &uuid, "idle", 17), Level::Gpu).unwrap();
+    mem.settle();
+    let r = mem.request("big", plan).unwrap();
+    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
+    let pins: Vec<varena::Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
+    let activation = 8 * REGION_ALIGN;
+    let mut answers = vec![];
+    while !card.take(activation) {
+        let next = r.oom(Some(m), Some(activation), None, Torch::default());
+        assert!(matches!(next, Next::Retry), "idle kept pages answer Retry: {answers:?} then {next:?} ({} free)", card.free());
+        answers.push(next);
+        assert!(answers.len() <= 3, "the OOM ladder ends: {answers:?}");
+    }
+    assert!(!answers.is_empty(), "the activation outgrew the measured room");
+    pass.end(Measured { allocated_peak: activation, slack: 0, sites: vec![] }, Torch { allocated: activation, reserved: activation });
+    drop(pins);
+    card.give(activation);
+    let stats = r.end();
+    assert!(stats.retries >= 1 && stats.leftover == 0, "{stats:?}");
+}
+
+/// The kept-page handoff (native kept_pages_survive_a_holder_that_served, graph-core 577): pages
+/// bound and released with their release events still pending are due for their Keep; a settle
+/// (the planned handover before an exit) waits for those events and makes every Keep, so custody
+/// holds every page when it returns.
+#[test]
+fn a_settle_makes_every_due_keep_before_it_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("handover-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    let s = mem.load(stored(dir.path(), &uuid, "s", 3), Level::Ram).unwrap();
+    // Filled while pinned (their fills' events pending until the pins are out), then released
+    // with their release events pending.
+    events.pending_fences.store(true, Ordering::SeqCst);
+    let pins: Vec<_> = (0..3).map(|b| mem.bind(s, b, 1).unwrap()).collect();
+    events.pending_fences.store(false, Ordering::SeqCst);
+    let fills = events.next.load(Ordering::SeqCst);
+    (1..=fills).for_each(|e| events.complete(e));
+    mem.torch_limit();
+    drop(pins);
+    let exports = || events.kept.lock().iter().filter(|c| **c == "export").count();
+    mem.torch_limit();
+    assert_eq!(exports(), 0, "kept while its consumers ran");
+    let releases = fills + 1..=events.next.load(Ordering::SeqCst);
+    let settling = {
+        let (mem, events) = (mem.clone(), events.clone());
+        std::thread::spawn(move || {
+            mem.settle();
+            events.log("settled");
+        })
+    };
+    events.await_log(|log| log.contains(&"finish") || log.contains(&"settled"));
+    assert!(!events.kept.lock().contains(&"settled"), "the handover waits for the consumers");
+    releases.for_each(|e| events.complete(e));
+    settling.join().unwrap();
+    assert_eq!(exports(), 3, "every due page kept by the time settle returns");
+}
+

@@ -231,6 +231,11 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
         if remote {
             return d.out;
         }
+        // Kept pages it took are free once custody lets go: settled before it runs.
+        if idle.withdrawn > 0 {
+            d.out.push(Action::Settle);
+            return d.out;
+        }
     }
     d.out.push(Action::Reserve { req, room, measured });
     d.out
