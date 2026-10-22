@@ -787,6 +787,41 @@ async fn endpoint_commit_resolves_a_tag_a_header_and_an_untagged_commit() {
     }
 }
 
+/// A tag this client cannot read (a newer writer's, or malformed) is skipped with a warning: the
+/// rest of the document resolves, and an edit writes the odd tag back as it was.
+#[tokio::test(flavor = "current_thread")]
+async fn a_repo_with_a_tag_this_client_cannot_read_still_resolves_its_others() {
+    let scratch = Scratch::new();
+    let endpoint = scratch.0.join("endpoint");
+    let client = client(&scratch.0.join("cache"), &endpoint);
+    let options = WriterOptions { repo_id: Some("acme/odd"), revision: Some("1.0"), ..WriterOptions::default() };
+    let mut writer = client.writer(options).unwrap();
+    (writer.component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None).unwrap())
+        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
+        .unwrap();
+    let tree = writer.commit().await.unwrap().tree().unwrap().clone();
+    let path = endpoint.join(tensorfs::format::repo_key("acme/odd"));
+    let mut doc: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let odd = serde_json::json!({"name": "2.0", "lanes": {"bf16": "a future kind"}, "public": true});
+    doc["tags"].as_array_mut().unwrap().push(odd.clone());
+    fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+
+    let remote = tensorfs::Endpoint::new(endpoint.to_str().unwrap(), None).unwrap();
+    assert_eq!(remote.commit("acme/odd", "1.0").await.unwrap().0, tree);
+    assert_eq!(remote.commit("acme/odd", "2.0").await.unwrap_err().kind, Kind::NotFound);
+    let reader = self::client(&scratch.0.join("reader"), &endpoint);
+    let opened = reader.open("acme/odd@1.0", &Open { lazy: false, ..Open::default() }).await.unwrap();
+    assert_eq!(opened.component("model").unwrap().read_decoded("w").unwrap(), WEIGHT);
+    let edited = remote.update_repo("acme/odd", |repo| {
+        let mut repo = repo.unwrap();
+        repo.tag_mut("1.0").unwrap().yanked = true;
+        Ok(Some(repo))
+    }).await.unwrap();
+    assert_eq!(edited.unread, [odd.clone()]);
+    let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(written["tags"].as_array().unwrap().contains(&odd), "{written}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_failed_local_result()
 {

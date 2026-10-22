@@ -668,6 +668,8 @@ A repo is a set of **commits** and the **tags** that point at them, as in git:
 - `public` (boolean, default `false`): a public tag is a release, of any tag name (`1.0.0-audit.1`). A private
   tag is the owner's: a server serves it only to readers who may write the repo (distribution.md §4).
 - `yanked` (boolean, default `false`) withdraws a tag from unversioned lookups.
+- A client skips a tag entry it cannot read, with a warning, and resolves the rest; an edit writes that entry back
+  unchanged. A server refuses to store a document with an entry it cannot read.
 - Any change is a new document: a writer conditions it on the whole document it read (its ETag, distribution.md §4).
   Nothing in it counts edits.
 - **Resolution** of a `revision`, once, to a commit:

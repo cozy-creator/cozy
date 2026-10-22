@@ -183,6 +183,9 @@ pub fn repo_key(name: &str) -> String {
 pub struct Repo {
     pub name: String,
     pub tags: Vec<Tag>,
+    /// Tag entries this reader cannot read (a newer writer's, or malformed): skipped with a
+    /// warning so the rest resolves, and written back as they were.
+    pub unread: Vec<serde_json::Value>,
 }
 
 /// A movable name for a commit. A public tag is a release; a private one is the owner's. A yanked
@@ -205,14 +208,24 @@ fn is_false(b: &bool) -> bool {
 struct RepoWire {
     format: String,
     name: String,
-    tags: Vec<Tag>,
+    tags: Vec<serde_json::Value>,
 }
 
 impl TryFrom<RepoWire> for Repo {
     type Error = Error;
     fn try_from(w: RepoWire) -> Result<Self> {
         check_format(&w.format, REPO_FORMAT)?;
-        let repo = Repo { name: w.name, tags: w.tags };
+        let mut repo = Repo::new(&w.name);
+        for raw in w.tags {
+            match serde_json::from_value::<Tag>(raw.clone()) {
+                Ok(t) if tag_name(&t.name) && repo.tag(&t.name).is_none() => repo.tags.push(t),
+                read => {
+                    let why = read.map_or_else(|e| e.to_string(), |t| format!("tag {:?} is not a segment, starts with sha256: or repeats", t.name));
+                    tracing::warn!("{}: skipping a tag this client cannot read: {why}", repo.name);
+                    repo.unread.push(raw);
+                }
+            }
+        }
         repo.check()?;
         Ok(repo)
     }
@@ -220,7 +233,8 @@ impl TryFrom<RepoWire> for Repo {
 
 impl From<Repo> for RepoWire {
     fn from(r: Repo) -> Self {
-        RepoWire { format: REPO_FORMAT.into(), name: r.name, tags: r.tags }
+        let known = r.tags.iter().map(|t| serde_json::to_value(t).expect("a tag is JSON"));
+        RepoWire { format: REPO_FORMAT.into(), name: r.name, tags: known.chain(r.unread).collect() }
     }
 }
 
@@ -285,7 +299,7 @@ impl Tree {
 
 impl Repo {
     pub fn new(name: &str) -> Repo {
-        Repo { name: name.into(), tags: vec![] }
+        Repo { name: name.into(), ..Repo::default() }
     }
     pub fn from_json(bytes: &[u8]) -> Result<Repo> {
         json::read(bytes, REPO_FORMAT)

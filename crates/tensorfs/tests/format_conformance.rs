@@ -183,6 +183,7 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
         let repo = Repo {
             name: repo_name(family),
             tags: vec![release("1", tree(&mut put, &[("all", &variants["all"])]), false)],
+            ..Repo::default()
         };
         files.insert(repo.key(), repo.to_json().unwrap());
         return;
@@ -218,6 +219,7 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
     let repo = Repo {
         name: repo_name(family),
         tags: vec![release("1", first, false), release("2", swapped, true), main],
+        ..Repo::default()
     };
     files.insert(repo.key(), repo.to_json().unwrap());
 }
@@ -546,7 +548,11 @@ fn green_documents_read_and_red_documents_refuse() {
                 }
                 "header" => Header::from_cbor(&bytes).map(drop),
                 "tree" => Tree::from_json(&bytes).map(drop),
-                "repo" => Repo::from_json(&bytes).map(drop),
+                // A client reads around a tag it cannot read; the document is still not valid.
+                "repo" => Repo::from_json(&bytes).and_then(|r| match r.unread.is_empty() {
+                    true => Ok(()),
+                    false => Err(Error::Invalid(format!("unread tags {:?}", r.unread))),
+                }),
                 other => panic!("{name}: unknown kind {other}"),
             };
             assert_eq!(read.is_ok(), green, "{dir}/{name}: {read:?}");

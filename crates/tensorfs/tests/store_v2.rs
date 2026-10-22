@@ -98,6 +98,7 @@ fn repo(name: &str, tree: ObjectRef) -> Repo {
             public: true,
             yanked: false,
         }],
+        ..Repo::default()
     }
 }
 

@@ -131,6 +131,7 @@ fn fixture(scratch: &Scratch) -> Fixture {
                     public: true,
                     yanked: false,
                 }],
+                ..Repo::default()
             })
         })
         .unwrap();
@@ -667,6 +668,7 @@ fn writer_results_expire_but_local_replays_remain() {
                 public: false,
                 yanked: false,
             }],
+            ..Repo::default()
         })
     })
     .unwrap();
