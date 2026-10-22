@@ -715,7 +715,14 @@ fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget, claims: &
             Call::Resident => (Reply::Resident { bytes: s.layouts.values().map(|l| os::allocated(&l.fd)).sum() }, None),
         };
         drop(s);
+        let granted = matches!(reply, Reply::Room { ok: true });
         if os::encode(&reply).and_then(|b| os::send(&stream, &(b, out))).is_err() {
+            break;
+        }
+        // The temporary reply dropped our claim fd. A receiver may finish recvmsg before
+        // sendmsg returns here, so acknowledge that it is now the sole owner before letting
+        // reserve return. Permit drop then releases the promise without an IPC round trip.
+        if granted && os::encode(&Reply::Done).and_then(|b| os::send(&stream, &(b, None))).is_err() {
             break;
         }
     }
@@ -1059,7 +1066,11 @@ impl Client {
     pub fn reserve(&self, bytes: u64) -> Option<Permit> {
         let stream = os::connect(self.ns, NAME).ok()??;
         match os::call::<_, Reply>(&stream, &Call::Room { bytes }, None) {
-            Ok((Reply::Room { ok: true }, Some(claim))) => Some(Permit { _claim: claim, _stream: stream }),
+            Ok((Reply::Room { ok: true }, Some(claim))) => {
+                let (done, extra) = os::recv(&stream).ok()??;
+                if !matches!(os::decode::<Reply>(&done), Ok(Reply::Done)) || extra.is_some() { return None; }
+                Some(Permit { _claim: claim, _stream: stream })
+            }
             _ => None,
         }
     }
@@ -1115,12 +1126,10 @@ mod reservation_tests {
     }
 
     fn room(bytes: u64) -> (Option<Permit>, bool) {
-        let stream = os::connect(os::euid(), NAME).unwrap().unwrap();
-        let (reply, claim) = os::call::<_, Reply>(&stream, &Call::Room { bytes }, None).unwrap();
-        match (reply, claim) {
-            (Reply::Room { ok: true }, Some(claim)) => (Some(Permit { _claim: claim, _stream: stream }), true),
-            _ => (None, false),
-        }
+        let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+        let permit = client.reserve(bytes);
+        let admitted = permit.is_some();
+        (permit, admitted)
     }
 
     #[test]
@@ -1185,6 +1194,7 @@ r=json.loads(read(struct.unpack('<I',head[:4])[0]))
 assert r['Room']['ok'] and head[4]==1,r
 _,ancillary,_,_=s.recvmsg(1,socket.CMSG_SPACE(array.array('i').itemsize))
 claim=array.array('i');claim.frombytes(ancillary[0][2]);assert len(claim)==1
+head=read(5);assert json.loads(read(struct.unpack('<I',head[:4])[0]))=='Done' and head[4]==0
 print('reserved',flush=True)
 sys.stdin.read()
 "#;
@@ -1408,6 +1418,7 @@ def read(n):
 head=read(5);assert json.loads(read(struct.unpack('<I',head[:4])[0]))['Room']['ok'] and head[4]==1
 _,ancillary,_,_=s.recvmsg(1,socket.CMSG_SPACE(array.array('i').itemsize))
 claim=array.array('i');claim.frombytes(ancillary[0][2]);assert len(claim)==1
+head=read(5);assert json.loads(read(struct.unpack('<I',head[:4])[0]))=='Done' and head[4]==0
 fd=os.open('/proc/self/fd/3',os.O_RDWR)
 class Lock(ctypes.Structure):
     _fields_=[('kind',ctypes.c_short),('whence',ctypes.c_short),('start',ctypes.c_longlong),('length',ctypes.c_longlong),('pid',ctypes.c_int)]
