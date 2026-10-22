@@ -39,6 +39,8 @@ impl FromStr for Ref {
 // Client.open checks an existing folder/.cozytensors path before parsing a Ref.
 
 pub struct Open {
+    pub bits: Option<u32>,
+    pub gpus: Option<Vec<String>>,
     pub revision: Option<String>,
     pub variant: Option<String>,
     pub endpoint: Option<String>,

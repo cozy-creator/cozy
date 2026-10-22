@@ -140,17 +140,19 @@ pub async fn choose<E: From<Refusal>>(
     mut tree: impl AsyncFnMut(&ObjectRef) -> std::result::Result<Tree, E>,
 ) -> std::result::Result<Chosen, E> {
     let (tag, cited) = resolve(repo, revision, &mut tree).await?;
-    let variant = pick_variant(revision, cited, variant)?;
-    let (variant, header) = variant_of_tree(&tree(&tag.commit).await?, variant.as_deref())?;
+    let tree = tree(&tag.commit).await?;
+    let variant = pick_variant(&tree, revision, cited, variant)?;
+    let (variant, header) = variant_of_tree(&tree, variant.as_deref())?;
     Ok(Chosen { tag, variant, header })
 }
 
 /// The variant to open: the one a header digest named (an explicit one must agree), else `asked`.
-pub fn pick_variant(revision: Option<&str>, cited: Option<String>, asked: Option<&str>) -> Result<Option<String>> {
+pub fn pick_variant(tree: &Tree, revision: Option<&str>, cited: Option<String>, asked: Option<&str>) -> Result<Option<String>> {
+    let asked = asked.map(|name| variant_of_tree(tree, Some(name)).map(|(path,_)|path)).transpose()?;
     match (cited, asked) {
         (Some(cited), Some(asked)) if cited != asked => {
             refuse(Code::REF_NOT_FOUND, format!("{} is variant {cited:?}, not {asked:?}", revision.unwrap_or_default()))
         }
-        (cited, asked) => Ok(cited.or(asked.map(str::to_owned))),
+        (cited, asked) => Ok(cited.or(asked)),
     }
 }

@@ -50,8 +50,9 @@ impl Store {
     /// and those headers' objects this store holds.
     pub fn snapshot(&self, tree: &ObjectRef, dir: &Path, variants: Option<&[String]>) -> Result<()> {
         let tree = self.tree(tree)?;
+        let wanted = variants.map(|names| names.iter().map(|name| tree.variant(Some(name)).map(|(path,_)|path)).collect::<crate::format::Result<Vec<_>>>()).transpose()?;
         let chosen: Vec<(&str, &ObjectRef)> = (tree.variants())
-            .filter(|(v, _)| variants.is_none_or(|want| want.iter().any(|w| w == v)))
+            .filter(|(v, _)| wanted.as_ref().is_none_or(|want| want.contains(v)))
             .collect();
         let mut payload = Vec::new();
         for (_, header) in &chosen {
@@ -101,7 +102,7 @@ impl Store {
 }
 
 /// Every regular file under `dir`, as tree paths, but `chunks/` at the root.
-fn files(dir: &Path, prefix: &str) -> Result<Vec<String>> {
+pub(crate) fn files(dir: &Path, prefix: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(dir).map_err(fail("list", dir))? {
         let entry = entry.map_err(fail("list", dir))?;

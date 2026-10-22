@@ -28,25 +28,28 @@ pub use value::{Config, ConfigValue, Value};
 
 pub const HEADER_FORMAT: &str = "cozytensors/1";
 pub const REPO_FORMAT: &str = "cozytensors.repo/1";
-/// The tree path of an unnamed variant's header.
+/// The tree path a writer gives a variant it names nothing.
 pub const HEADER_PATH: &str = "model.cozytensors";
+/// A variant's extension: any repo file ending in it is one (spec §3).
+pub const VARIANT_EXTENSION: &str = ".cozytensors";
 /// A repo's file tree: `{format, files: {path: object}}`.
 pub const TREE_FORMAT: &str = "cozytensors.tree/1";
 
-/// The variant a repo file holds: `model.<variant>.cozytensors` → `<variant>`,
-/// `model.cozytensors` → `""`; `None` for any other path.
+/// The variant a repo file is (spec §3): any `.cozytensors` file, at any depth, named by its
+/// path; `None` for any other path.
 pub fn variant_of(path: &str) -> Option<&str> {
-    match path.strip_prefix("model")?.strip_suffix(".cozytensors")? {
-        "" => Some(""),
-        rest => rest.strip_prefix('.').filter(|v| !v.is_empty() && !v.contains('/')),
-    }
+    let name = path.rsplit('/').next()?;
+    name.ends_with(VARIANT_EXTENSION).then_some(path)
 }
 
-/// The repo path of a variant's cozytensors: the inverse of [`variant_of`].
-pub fn variant_path(variant: &str) -> String {
-    match variant {
+/// A writer's full path, or a legacy bare name written as `model.<name>.cozytensors`;
+/// an extensionless nested path gets the extension. `""` is [`HEADER_PATH`].
+pub fn variant_path(name: &str) -> String {
+    match name {
         "" => HEADER_PATH.into(),
-        v => format!("model.{v}.cozytensors"),
+        name if variant_of(name).is_some() => name.into(),
+        name if !name.contains('/') => format!("model.{name}{VARIANT_EXTENSION}"),
+        name => format!("{name}{VARIANT_EXTENSION}"),
     }
 }
 

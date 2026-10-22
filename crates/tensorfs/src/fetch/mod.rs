@@ -211,7 +211,9 @@ impl Fetcher {
             Tree::from_json(&self.read(commit).await?).map_err(|e| invalid(commit, e))
         })
         .await?;
-        let variant = pick_variant(revision, cited, variant)?;
+        self.objects(origin, std::slice::from_ref(&tag.commit), &quiet).await?;
+        let tree = Tree::from_json(&self.read(&tag.commit).await?).map_err(|e| invalid(&tag.commit,e))?;
+        let variant = pick_variant(&tree, revision, cited, variant)?;
         self.pull_tree(origin, &tag.commit, variant.as_deref(), want).await
     }
 

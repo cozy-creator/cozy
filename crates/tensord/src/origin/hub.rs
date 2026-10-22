@@ -65,3 +65,11 @@ fn loopback(key: &str) -> bool {
     let host = key.split_once("://").and_then(|(_, rest)| rest.rsplit_once(':')).map(|(host, _)| host);
     matches!(host, Some("localhost" | "127.0.0.1" | "[::1]"))
 }
+
+/// Header-derived selection from the Hub's indexed snapshot, if that origin supports it.
+pub fn select(machine: &Machine, source: &hub::Source, repository: &str, revision: &str,
+    constraints: &tensorfs::precision::Constraints) -> Result<Option<tensorfs::precision::Selection>> {
+    let (endpoint, _) = endpoint(machine, source)?;
+    let (repository, revision, constraints) = (repository.to_owned(), revision.to_owned(), constraints.clone());
+    machine.block(&Stop::default(), async move { endpoint.select(&repository, &revision, &constraints).await })
+}
