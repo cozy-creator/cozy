@@ -83,11 +83,9 @@ def conflicts(interpreter: Path, step: subprocess.CompletedProcess | None = None
     return {line for line in lines if line.startswith("The package") and not line.endswith("was built for a different platform")}
 
 
-def machine_sdk(interpreter: Path, sdk: list[Path]) -> str:
-    """This machine's own Runtime/TensorFS pair over the captured closure, always: version skew
-    is allowed. Every other selected version stays exact: the closure's versions constrain the
-    install, and one the pair's own requirements reject is kept while the pair goes in without
-    its dependencies, which is the warning returned ("" when there is none)."""
+def machine_sdk(interpreter: Path, sdk: list[Path], runtime_build: str = "") -> str:
+    """Install the selected pair with the captured dependency constraints. Only an explicit
+    development Runtime may retain the no-deps fallback and its reported warning."""
     pair = {canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk}
     kept = interpreter.parents[2] / "sdk-constraints.txt"
     kept.write_text("".join(f"{row.name}=={row.version}\n" for row in inventory(interpreter)
@@ -98,6 +96,8 @@ def machine_sdk(interpreter: Path, sdk: list[Path]) -> str:
     if step.returncode == 0:
         return ""
     reason = " | ".join([line.strip() for line in step.stderr.splitlines() if line.strip()][-12:])[:1000]
+    if not runtime_build:
+        raise PackageError("package_sdk_incompatible", f"the selected Runtime/TensorFS pair contradicts the package's locked requirements: {reason}")
     bare = subprocess.run([*install, "--no-deps"], stderr=subprocess.PIPE, text=True)
     sys.stderr.write(bare.stderr)
     if bare.returncode != 0:
@@ -105,15 +105,16 @@ def machine_sdk(interpreter: Path, sdk: list[Path]) -> str:
     return f"this machine's Runtime and TensorFS want versions the captured lock does not hold, which it keeps ({reason})"
 
 
-def checked(interpreter: Path, note: str, runtime_build: str = "") -> str:
-    """The run's warning: `note`, then every requirement an installed version misses (uv's check,
-    the package's bounds on the pair included), never a refusal; a development Runtime an update
-    named (`--runtime-wheel`) says it runs regardless. "" when there is nothing to say."""
+def checked(interpreter: Path, note: str, runtime_build: str = "", *, sdk: bool = False) -> str:
+    """A normal SDK must satisfy the package's bounds. Explicit development overrides retain
+    the reported warning; without a machine SDK the capture's existing checks are unchanged."""
     found = sorted(conflicts(interpreter))
     warnings = [*([note] if note else []), *(["uv pip check: " + "; ".join(found)] if found else [])]
     if warnings and runtime_build:
         warnings.append(f"this machine's development Runtime {runtime_build} (`--runtime-wheel`) runs it regardless")
     warning = "; ".join(warnings)[:4000]
+    if warning and sdk and not runtime_build:
+        raise PackageError("package_sdk_incompatible", warning)
     if warning:
         print(warning, file=sys.stderr)
     return warning
@@ -223,14 +224,18 @@ def install_editable(*, project: Path, environment: Path, wheels: list[Path], di
                 named = [f"--index={index}" for index in indexes]
                 install = ["uv", "pip", "install", "--python", str(interpreter), *found, *named, "--editable", str(project)]
                 offered = [str(wheel) for wheel in sdk] if machine else []
-                if not offered or subprocess.run([*install, *offered]).returncode != 0:
+                if not offered:
+                    subprocess.run(install, check=True)
+                elif subprocess.run([*install, *offered]).returncode != 0:
+                    if not runtime_build:
+                        raise PackageError("package_sdk_incompatible", "the package does not resolve with the selected Runtime/TensorFS pair")
                     subprocess.run(install, check=True)
             live_paths(environment)
 
         capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
-        note = machine_sdk(interpreter, sdk) if sdk else ""
+        note = machine_sdk(interpreter, sdk, runtime_build) if sdk else ""
         add_client(interpreter, environment.parent / (environment.name + ".constraints.txt"), client_wheel)
-        ready.write_text(checked(interpreter, note, runtime_build))
+        ready.write_text(checked(interpreter, note, runtime_build, sdk=bool(sdk)))
     generations.mkdir(parents=True, exist_ok=True)
     root = generations.resolve() / uuid.uuid4().hex
     root.mkdir(); (root / ".hold").touch()
@@ -322,13 +327,17 @@ def install_captured(*, project: Path | None, wheels: list[Path], requirements: 
                 # Unlocked: resolved with the pair's wheels offered where its bounds admit them.
                 install = ["uv", "pip", "install", *COPY, "--python", str(interpreter), *([str(project)] if project else []),
                            *map(str, wheels)]
-                if not offered or subprocess.run([*install, *offered]).returncode != 0:
+                if not offered:
+                    subprocess.run(install, check=True)
+                elif subprocess.run([*install, *offered]).returncode != 0:
+                    if not runtime_build:
+                        raise PackageError("package_sdk_incompatible", "the package does not resolve with the selected Runtime/TensorFS pair")
                     subprocess.run(install, check=True)
 
         capture({canonicalize_name(wheel.name.split("-")[0]) for wheel in sdk})
-        note = machine_sdk(interpreter, sdk) if sdk else ""
+        note = machine_sdk(interpreter, sdk, runtime_build) if sdk else ""
         add_client(interpreter, root / "captured-constraints.txt", client_wheel)
-        return publish_generation(root, metadata, None, callees, checked(interpreter, note, runtime_build))
+        return publish_generation(root, metadata, None, callees, checked(interpreter, note, runtime_build, sdk=bool(sdk)))
     except BaseException:
         shutil.rmtree(root)  # uniquely owned unpublished generation, never dispatched
         raise

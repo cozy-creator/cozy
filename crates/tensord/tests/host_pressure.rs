@@ -8,7 +8,7 @@
 use platform::contain::host_pressure::{HostMode, Pressure};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -17,7 +17,9 @@ use std::{
         Arc,
     },
 };
-use tensord::{host_tier::HostTier, memory::MemoryLog};
+use tensorfs::{format::ObjectRef, io::{source::Source as FileSource, ItemSource, ObjectRange}};
+use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Memory, SetSpec, Tier};
+use varena::layout::{Item, Layout, Part, Region};
 
 const MIB: u64 = 1 << 20;
 /// The scope: what it holds is sized against this.
@@ -61,24 +63,36 @@ fn event(cgroup: &Path, name: &str) -> u64 {
     text.lines().find_map(|l| l.strip_prefix(name)?.trim().parse().ok()).unwrap()
 }
 
-/// A sealed layout of `bytes`, filled here (charged to this scope), deposited by an executor
-/// that has ended.
-fn deposit(tier: &HostTier, n: usize, bytes: u64) {
-    let layout = File::from(platform::shm::memfd_named("layout").unwrap());
-    let chunk = vec![1u8; MIB as usize];
-    for _ in 0..bytes / MIB {
-        (&layout).write_all(&chunk).unwrap();
-    }
-    platform::shm::seal(std::os::fd::AsFd::as_fd(&layout)).unwrap();
-    tier.deposits.deposit("sha256:m", &format!("layout-{n}"), layout, &[]).unwrap();
+/// A real Varena RAM-tier layout filled through the normal Memory.load path. The source
+/// is a sparse zero file (reclaimable cache); the tier's shared pages are charged to this scope.
+fn deposit(memory: &Memory, dir: &Path, gpu: &str, n: usize, bytes: u64) {
+    let path = dir.join(format!("source-{n}"));
+    File::create(&path).unwrap().set_len(bytes).unwrap();
+    let object = ObjectRef { sha256: format!("{n:064x}"), length: bytes };
+    let source = FileSource::files(vec![(object.clone(), File::open(&path).unwrap())], false, 0);
+    let layout = Layout {
+        parts: vec![Part { what: format!("model/value{n}#data"), region: 0, offset: 0, nbytes: bytes }],
+        regions: vec![Region { offset: 0, nbytes: bytes, span: bytes, items: vec![Item {
+            offset: 0, len: bytes, source: ItemSource::Object(ObjectRange { obj: object, off: 0, len: bytes }), part_end: true,
+        }] }],
+        nbytes: bytes,
+        digest: format!("host-pressure-{n}"),
+        names: vec![vec![format!("value{n}")]],
+    };
+    let fingerprint = Fingerprint::new(&layout, &[], Fill::Stored, "host-pressure", "0/1", gpu);
+    memory.load(SetSpec { name: format!("layout-{n}"), layout: Arc::new(layout), source: Arc::new(source), fingerprint }, Level::Ram).unwrap();
+    memory.settle();
 }
 
 /// A clean page cache of `bytes`, as a downloaded checkpoint leaves: a file written, synced and
 /// read back. (Dirty pages are no room: the kernel cannot give them back in time.)
 fn cache(dir: &Path, bytes: u64) {
     let path = dir.join("cache");
-    let written = Command::new("dd").args(["if=/dev/zero", &format!("of={}", path.display()), "bs=1M", "conv=fsync"])
-        .arg(format!("count={}", bytes / MIB)).stderr(Stdio::null()).status().unwrap();
+    // Bound dirty pages while crossing the limit. A final-only fsync can leave more than
+    // the entire cgroup dirty and kill the watcher fixture before reclaimable cache exists.
+    assert_eq!(bytes % (16 * MIB), 0);
+    let written = Command::new("dd").args(["if=/dev/zero", &format!("of={}", path.display()), "bs=16M", "oflag=dsync"])
+        .arg(format!("count={}", bytes / (16 * MIB))).stderr(Stdio::null()).status().unwrap();
     assert!(written.success());
     assert!(Command::new("cat").arg(&path).stdout(Stdio::null()).status().unwrap().success());
 }
@@ -100,29 +114,33 @@ fn call(bytes: u64) -> std::process::ExitStatus {
 fn scenario(watch: bool) {
     let cgroup = deny_psi();
     let dir = tempfile::tempdir().unwrap();
-    let tier = Arc::new(HostTier::new(dir.path(), HostMode::Dedicated, MemoryLog::at(dir.path().into())));
-    let given = Arc::new(AtomicUsize::new(0));
-    if watch {
-        let (weak, count) = (Arc::downgrade(&tier), given.clone());
-        tier.watch(move || {
-            let gave = weak.upgrade()?.deposits.release_one();
-            count.fetch_add(gave as usize, Ordering::AcqRel);
-            Some(gave)
-        });
-    }
+    assert!(varena::os::namespace(&format!("host-pressure-{}-", std::process::id())));
+    // A previous measured peak is already consumed. Observed growth must still make the
+    // tier yield at a limit; saturating its deficit to zero would suppress this case.
+    let need: varena::Need = Arc::new(|| Some(0));
+    let pressure = if watch {
+        let pressure = Pressure::arm(HostMode::Dedicated).unwrap();
+        assert!(pressure.how().contains("no psi trigger") && pressure.how().contains("inotify"), "{}", pressure.how());
+        varena::Pressure::Host(pressure)
+    } else { varena::Pressure::Headroom };
+    let tier = Tier::serve(pressure, need).unwrap().unwrap();
+    let gpu = GpuId { uuid: format!("host-pressure-{}", std::process::id()), model: "host".into(), memory: 4 * LIMIT };
+    let memory = Memory::open(gpu.clone(), None, Box::new(HostBackend::new(gpu.memory))).unwrap();
     for n in 0..LAYOUTS {
-        deposit(&tier, n, LAYOUT);
+        deposit(&memory, dir.path(), &gpu.uuid, n, LAYOUT);
     }
+    let resident = || tier.resident().iter().map(|(_, bytes)| *bytes).sum::<u64>();
+    let before = resident();
+    assert!(before >= LAYOUT * LAYOUTS as u64, "the normal RAM-tier path actually filled the layouts: {before}");
     cache(dir.path(), CACHE);
     let killed = event(&cgroup, "oom_kill");
     let status = call(CALL);
-    let log = fs::read_to_string(dir.path().join("memory.log")).unwrap_or_default();
     let (oom_kill, max) = (event(&cgroup, "oom_kill"), event(&cgroup, "max"));
-    eprintln!("watch={watch}: call {status:?}, oom_kill {killed} -> {oom_kill}, max {max}, layouts given {}\n{log}", given.load(Ordering::Acquire));
+    let given = before.saturating_sub(resident());
+    eprintln!("watch={watch}: call {status:?}, oom_kill {killed} -> {oom_kill}, max {max}, tier bytes returned {given}");
     if watch {
-        assert!(log.contains("\"no psi trigger") && log.contains("inotify"), "{log}");
         assert!(status.success() && oom_kill == killed, "the call completes with no OOM kill");
-        assert!(given.load(Ordering::Acquire) >= 1 && given.load(Ordering::Acquire) <= LAYOUTS);
+        assert!(given >= LAYOUT, "the actual Varena tier returned no layout");
     } else {
         assert_eq!(status.signal(), Some(libc::SIGKILL), "nothing gives back: the kernel kills the call");
         assert_eq!(oom_kill, killed + 1);

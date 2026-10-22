@@ -39,13 +39,15 @@ use tensorfs::{
 };
 use crate::catalog::normalized;
 
-/// How each published environment gets its Runtime SDK. Empty `requirements` keeps the
-/// release's own locked SDK rows.
+/// The selected SDK wheel inputs, or a local first-install resolver. Without either, the
+/// package lock supplies its SDK (the standalone/development path).
 #[derive(Clone, Debug, Default)]
 pub struct PackageSdk {
     pub uv: PathBuf,
     pub python: String,
     pub requirements: Vec<String>,
+    /// Lazily resolved only for an unselected local machine; shared with local installs.
+    pub default_sdk: Option<Arc<crate::machine::update::DefaultSdk>>,
     pub find_links: Option<PathBuf>,
     /// The machine's description client (`tensord_client`), installed into each generation.
     pub client_wheel: Option<PathBuf>,
@@ -80,8 +82,20 @@ impl OwnerUv {
 }
 
 impl PackageSdk {
-    /// Executors use the selected Runtime/TensorFS pair (an update's, else the image's), so they
-    /// speak this machine's protocol; without a complete pair, each release's locked SDK.
+    pub fn resolve(&self, stop: Option<&Stop>) -> io::Result<()> {
+        if self.requirements.is_empty() {
+            if let Some(default) = &self.default_sdk { default.resolve(stop)?; }
+        }
+        Ok(())
+    }
+
+    pub fn requirements(&self) -> &[String] {
+        self.default_sdk.as_ref().filter(|_| self.requirements.is_empty())
+            .and_then(|default| default.resolved()).map_or(&self.requirements, |chosen| &chosen.requirements)
+    }
+
+    /// Freeze the selected Runtime/TensorFS pair (an update's, else the image's). Local startup
+    /// attaches lazy resolution separately, only when neither selection exists.
     pub fn selected(wheels: &Path, root: &Path, uv: PathBuf) -> Self {
         // An activation replaces sdk/current, not the immutable candidate directory. Freeze
         // that selection once: both cache identity and the installer's actual wheel inputs
@@ -110,6 +124,7 @@ impl PackageSdk {
             },
             find_links: complete.then_some(wheels),
             requirements: if complete { pair } else { vec![] },
+            default_sdk: None,
             client_wheel: None,
             seed_cache: seed.is_dir().then_some(seed),
             owner_uv: None,
@@ -343,6 +358,8 @@ impl Publisher {
         observe: Option<Observer>,
         stop: Option<&Stop>,
     ) -> Result<Prepared, Failure> {
+        // The exact real wheel paths must exist before any held alias or generation identity.
+        self.sdk.resolve(stop).map_err(|e| ("package_sdk_unavailable", e.to_string()))?;
         if let Ok(Some(prepared)) = self.held(service, actor, request) {
             return Ok(prepared);
         }
@@ -624,11 +641,11 @@ impl Publisher {
     /// The Runtime and TensorFS versions an environment built here holds: this machine's own
     /// pair's (by its wheels' names), else the lock's.
     fn planned_pair(&self, locked: &Locked) -> BTreeMap<String, String> {
-        let own = self.sdk.requirements.iter().filter_map(|wheel| {
+        let own = self.sdk.requirements().iter().filter_map(|wheel| {
             let mut parts = Path::new(wheel).file_name()?.to_str()?.split('-');
             Some((normalized(parts.next()?), parts.next()?.to_string()))
         });
-        let pair: BTreeMap<String, String> = match self.sdk.requirements.is_empty() {
+        let pair: BTreeMap<String, String> = match self.sdk.requirements().is_empty() {
             true => locked.packages.clone(),
             false => own.collect(),
         };
@@ -639,8 +656,8 @@ impl Publisher {
     fn release_alias(&self, request: &Request, release: &str) -> String {
         let origin = request.origin();
         let sdk = format!(
-            "{:?}{:?}{:?}",
-            self.sdk.requirements, self.sdk.find_links, self.sdk.client_wheel
+            "{:?}{:?}{:?}{:?}",
+            self.sdk.requirements(), self.sdk.find_links, self.sdk.client_wheel, self.sdk.runtime_build
         );
         let key = format!("{origin}\0{}\0{release}\0{sdk}", request.package);
         format!("hub-{}", &sha256::hex_digest(key.as_bytes())[..32])
@@ -825,7 +842,7 @@ impl Publisher {
             .map(|record| record.dependencies.into_iter().map(|d| (normalized(&d.name), d.version)).collect());
         let stage = install_stage(&request.package, &release, before.as_ref(), &self.planned_pair(&locked));
         let wheels: Vec<&str> = card.wheels.iter().map(|wheel| wheel.sha256.as_str()).collect();
-        let identity = sha256::hex_digest(json!({"package":request.package,"release":release,"pyproject":card.pyproject,"lock":card.lock,"wheels":wheels,"python":card.python,"hub":hub::origin_key(&source.origin),"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
+        let identity = sha256::hex_digest(json!({"package":request.package,"release":release,"pyproject":card.pyproject,"lock":card.lock,"wheels":wheels,"python":card.python,"hub":hub::origin_key(&source.origin),"sdk":self.sdk.requirements(),"runtime_build":self.sdk.runtime_build,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
         let wanted = Environment {
             card: &card,
             locked: &locked,
@@ -904,7 +921,7 @@ impl Publisher {
         fs::write(project.join("pyproject.toml"), &card.pyproject).map_err(io_failure)?;
         fs::write(project.join("uv.lock"), &card.lock).map_err(io_failure)?;
         let files: Vec<HubFile> = card.wheels.iter().chain(&locked.hub).cloned().collect();
-        let own_sdk = !self.sdk.requirements.is_empty();
+        let own_sdk = !self.sdk.requirements().is_empty();
         let client = self.sdk.client_wheel.is_some();
         // One stage to the person, its steps counted: the Hub's files, the Python, the locked
         // packages, this machine's Runtime pair, the description.
@@ -954,7 +971,8 @@ impl Publisher {
             let pins = self.export_pins(&project, &lock_sdk, job.stop.as_ref())?;
             fs::write(dir.join("constraints.txt"), pins).map_err(io_failure)?;
         }
-        // The machine's own pair when it has one, whatever the lock's: its findings warn.
+        // The selected pair must satisfy the remaining closure; only explicit development
+        // overrides retain a warning for incompatible package bounds.
         let (sdk_choice, mut sdk_fallback) = (if own_sdk { "machine" } else { "locked" }, String::new());
         if own_sdk {
             next();
@@ -1097,12 +1115,9 @@ impl Publisher {
         Ok(Some(lock))
     }
 
-    /// This machine's own Runtime and TensorFS over a release's locked requirements, always.
-    /// Every other locked version stays exact: the lock's pins constrain the install, and a pin
-    /// the pair's own requirements reject keeps the lock's version while the pair goes in
-    /// without its dependencies. What uv's check finds that the pair adds, the package's bounds
-    /// on the pair included, is the run's warning, never a refusal: a real import failure names
-    /// itself when it runs. Returns that warning; empty when there is none.
+    /// Install the selected pair while preserving other locked versions and package bounds.
+    /// Only an explicitly named development Runtime may override a dependency contradiction;
+    /// it retains the existing warning and no-deps fallback rather than disguising the skew.
     fn install_sdk(&self, py: &str, dir: &Path, compile: &str, stop: Option<&Stop>) -> Result<String, Failure> {
         let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
         let links = self.sdk.find_links.as_ref().map(|p| p.to_string_lossy().to_string());
@@ -1112,7 +1127,7 @@ impl Publisher {
             if let Some(links) = &links {
                 args.extend(["--find-links", links]);
             }
-            args.extend(self.sdk.requirements.iter().map(String::as_str));
+            args.extend(self.sdk.requirements().iter().map(String::as_str));
             self.uv(&args, stop)
         };
         // What the release's own closure reports already stands (NVIDIA's aarch64 cusparseLt
@@ -1123,6 +1138,9 @@ impl Publisher {
             if code == CANCELED {
                 return Err((code, detail));
             }
+            if self.sdk.runtime_build.is_empty() {
+                return Err(("package_sdk_incompatible", format!("the selected Runtime/TensorFS pair contradicts the package's locked requirements: {detail}")));
+            }
             install(&["--no-deps"])?;
             warnings.push(format!(
                 "this machine's Runtime and TensorFS want versions the release's lock does not hold, which it keeps ({})",
@@ -1131,7 +1149,9 @@ impl Publisher {
         }
         let added: Vec<String> = self.check(py, stop)?.difference(&before).cloned().collect();
         if !added.is_empty() {
-            warnings.push(format!("uv pip check: {}", added.join("; ")));
+            let detail = format!("uv pip check: {}", added.join("; "));
+            if self.sdk.runtime_build.is_empty() { return Err(("package_sdk_incompatible", detail)); }
+            warnings.push(detail);
         }
         let build = &self.sdk.runtime_build;
         if !warnings.is_empty() && !build.is_empty() {
@@ -2315,7 +2335,7 @@ pub(crate) mod tests {
     /// refusal. A locked pin the pair's own requirements reject is kept, and the pair goes in
     /// without its dependencies. Real uv, wheels and locks; no network.
     #[test]
-    fn an_old_pair_lock_runs_on_the_machines_pair_with_a_warning() {
+    fn incompatible_sdk_bounds_refuse_except_for_an_explicit_development_override() {
         let root = std::env::temp_dir().join(format!("cm-sdk-{}", uuid::Uuid::new_v4()));
         let (wheels, own) = (root.join("wheels"), root.join("own"));
         for dir in [&wheels, &own] {
@@ -2329,13 +2349,13 @@ pub(crate) mod tests {
         tiny_wheel(&wheels, "cz-pinned", "1.0", &[]);
         tiny_wheel(&wheels, "cz-pinned", "2.0", &[]);
         tiny_wheel(&wheels, "cz-holds-pinned", "1.0", &["cz-pinned==1.0"]);
-        let publisher = |requirements: Vec<String>| {
+        let publisher = |requirements: Vec<String>, runtime_build: &str| {
             let sdk = PackageSdk { uv: PathBuf::from("uv"), python: "3.12".into(), requirements,
-                find_links: Some(wheels.clone()), ..Default::default() };
+                runtime_build: runtime_build.into(), find_links: Some(wheels.clone()), ..Default::default() };
             let store = crate::storage::open(&root.join(format!("tensorfs-{}", uuid::Uuid::new_v4()))).unwrap();
             Publisher::new(&root.join("published"), sdk, crate::origin::Machine::new(store, None).unwrap()).unwrap()
         };
-        let machine = publisher(pair.iter().map(|w| w.to_string_lossy().into()).collect());
+        let machine = publisher(pair.iter().map(|w| w.to_string_lossy().into()).collect(), "");
         let generations = root.join("generations");
         let held = |record: &crate::catalog::Generation| -> Vec<(String, String)> {
             record.dependencies.iter().map(|d| (d.name.clone(), d.version.clone())).collect()
@@ -2368,14 +2388,18 @@ pub(crate) mod tests {
         // The old pair's lock: the machine's pair, its bounds a warning; it runs.
         let (pyproject, lock) = locked(&root.join("old-pair"), &["cz-h3-app"], &wheels, "");
         assert!(lock.contains("version = \"0.27.0\"") && lock.contains("version = \"0.10.0\""), "{lock}");
-        let record = generate(&machine, &generations, "old-pair", &card(pyproject, lock)).unwrap();
+        let old = card(pyproject, lock);
+        assert_eq!(generate(&machine, &generations, "old-pair-refused", &old).unwrap_err().0, "package_sdk_incompatible");
+        let development = publisher(pair.iter().map(|w| w.to_string_lossy().into()).collect(), "0.30.0+fixture");
+        let record = generate(&development, &generations, "old-pair", &old).unwrap();
         assert_eq!(held(&record), pair_held);
         let why = &record.sdk_fallback;
         assert!(why.starts_with("uv pip check: ") && why.contains("cz-h3-app"), "{why}");
         assert_eq!(runs("old-pair", &["cozy-runtime", "tensorfs", "cz-h3-app"]), "0.30.0 0.13.0 1.0");
 
         // A pair whose own requirement a locked pin rejects: the pin stays, the pair goes in.
-        let wants = publisher(vec![tiny_wheel(&own, "cozy-runtime", "0.31.0", &["cz-pinned>=2"]).to_string_lossy().into()]);
+        let wheel = tiny_wheel(&own, "cozy-runtime", "0.31.0", &["cz-pinned>=2"]);
+        let wants = publisher(vec![wheel.to_string_lossy().into()], "0.31.0+fixture");
         let (pyproject, lock) = locked(&root.join("cz-pinned"), &["cz-holds-pinned", "cz-takes-any"], &wheels, "");
         let record = generate(&wants, &generations, "cz-pinned", &card(pyproject, lock)).unwrap();
         assert!(record.sdk_fallback.contains("want versions the release's lock does not hold"), "{}", record.sdk_fallback);
@@ -2889,12 +2913,12 @@ pub(crate) mod tests {
         fs::write(dir.join("generation.json"), json!({"identity": identity, "package": "acme/pkg", "version": "1.0.0",
             "application": "pkg:app", "python": python, "interface": interface}).to_string()).unwrap();
         let held = generations.resolve(&identity).unwrap();
-        let slot = |manifest: &ObjectRef, on_demand| PlanSlot { selected_encoded_bytes: 0, on_demand, lane: String::new(),
+        let slot = |manifest: &ObjectRef, on_demand| PlanSlot { selected_encoded_bytes: 0, on_demand, lane: String::new(), placeable: vec![],
             binding: crate::device_executor::Binding { snapshot: manifest.id(), components: vec!["model".into()], ..Default::default() } };
         let plan = Plan { id: "warm".into(), construction: "warm".into(), installation: "i".into(), generation: identity.clone(),
             entrypoint: "render".into(), slots: vec![slot(&manifest, false), slot(&later, true)], sources: vec![], degree: 1 };
         assert_eq!(plan.upfront(), [(manifest.id(), vec!["model".to_string()])]);
-        let config = serde_json::from_value(json!({"devices": "GPU-test-0", "authorized_device_limit_bytes": null, "prespawn": true})).unwrap();
+        let config = serde_json::from_value(json!({"devices": "GPU-test-0", "prespawn": true})).unwrap();
         let pool = Pool::new(&bench.root.join("gpu"), config, store.clone()).unwrap();
         let engine = crate::execution::Engine::open(&bench.root.join("execution")).unwrap();
         let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub), u64::MAX);
@@ -2969,11 +2993,13 @@ pub(crate) mod tests {
             let store = crate::storage::open(&root.join("store")).unwrap();
             let machine = crate::origin::Machine::new(store.clone(), None).unwrap();
             let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), machine).unwrap();
+            // Each test's GPUs are its own: their ledgers are named by UUID, machine-wide.
+            let tag = root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
             let inventory: Vec<Value> = gpus.iter().enumerate().map(|(at, (cc, memory))| json!({"device_index": at,
-                "device_name": "GPU", "device_uuid": format!("GPU-{at}"), "driver_version": "1", "memory_bytes": memory,
+                "device_name": "GPU", "device_uuid": format!("GPU-{at}-{tag}"), "driver_version": "1", "memory_bytes": memory,
                 "pci_bus_id": format!("{at}"), "compute_cap": cc})).collect();
             let devices: Vec<String> = (0..gpus.len()).map(|at| at.to_string()).collect();
-            let config = json!({"devices": devices.join(","), "inventory": inventory, "authorized_device_limit_bytes": null, "prespawn": false});
+            let config = json!({"devices": devices.join(","), "inventory": inventory, "prespawn": false});
             service.configure_pool(Pool::new(&root.join("gpu"), serde_json::from_value(config).unwrap(), store).unwrap()).unwrap();
             let identity = "cd".repeat(16);
             let dir = service.catalog.root().join(&identity);

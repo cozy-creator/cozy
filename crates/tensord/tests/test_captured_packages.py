@@ -220,3 +220,42 @@ def test_a_captured_lock_takes_the_machines_pair_without_fetching_its_own(captur
     assert versions["cozy-runtime"] == pair[0].name.split("-")[1]
     assert versions["tensorfs"] == pair[1].name.split("-")[1]
     assert_installed(generation)
+
+
+def test_normal_sdk_contradictions_refuse_and_explicit_development_remains_visible(tmp_path):
+    """Real uv checks a package bound against the selected SDK; no inference substitute."""
+    from tensord_client.captured_packages import checked
+    subprocess.run(["uv", "venv", "--python", "3.12", str(tmp_path / "env")], check=True)
+    site, = layout.site_packages(tmp_path / "env")
+    for name, version, requires in [("cozy_runtime", "0.31.0", ""),
+                                    ("bounded_app", "1.0", "Requires-Dist: cozy-runtime<0.31\n")]:
+        info = site / f"{name}-{version}.dist-info"
+        info.mkdir()
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n{requires}")
+        (info / "WHEEL").write_text("Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+    interpreter = layout.interpreter(tmp_path / "env")
+    with pytest.raises(PackageError, match="bounded-app") as refused:
+        checked(interpreter, "", sdk=True)
+    assert refused.value.code == "package_sdk_incompatible"
+    warning = checked(interpreter, "", "0.31.0+explicit", sdk=True)
+    assert "bounded-app" in warning and "development Runtime 0.31.0+explicit" in warning
+
+
+def test_sdk_dependency_resolution_cannot_silently_fall_back_to_no_deps(tmp_path, monkeypatch):
+    from tensord_client.captured_packages import checked, inventory, machine_sdk
+    subprocess.run(["uv", "venv", "--python", "3.12", str(tmp_path / "env")], check=True)
+    site, = layout.site_packages(tmp_path / "env")
+    info = site / "synthetic_dep-1.0.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: synthetic-dep\nVersion: 1.0\n")
+    (info / "WHEEL").write_text("Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+    wheel = app_wheel(tmp_path, "cozy_runtime", "", "Requires-Dist: synthetic-dep>=2\n")
+    interpreter = layout.interpreter(tmp_path / "env")
+    monkeypatch.setenv("UV_NO_INDEX", "1")
+    with pytest.raises(PackageError) as refused:
+        machine_sdk(interpreter, [wheel])
+    assert refused.value.code == "package_sdk_incompatible"
+    assert all(row.name != "cozy-runtime" for row in inventory(interpreter))
+    note = machine_sdk(interpreter, [wheel], "0.1.0+explicit")
+    assert "captured lock" in note
+    assert "synthetic-dep" in checked(interpreter, note, "0.1.0+explicit", sdk=True)

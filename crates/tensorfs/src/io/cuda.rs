@@ -50,11 +50,14 @@ pub const ATTR_PCI_BUS_ID: c_int = 33;
 pub const ATTR_PCI_DEVICE_ID: c_int = 34;
 pub const ATTR_PCI_DOMAIN_ID: c_int = 50;
 pub const ATTR_POSIX_FD_SUPPORTED: c_int = 103;
+pub const ATTR_WIN32_HANDLE_SUPPORTED: c_int = 104;
+pub const ATTR_READ_ONLY_HOST_REGISTER_SUPPORTED: c_int = 113;
 
 pub const MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const MEM_LOCATION_TYPE_DEVICE: u32 = 1;
 pub const MEM_HANDLE_TYPE_NONE: u32 = 0;
 pub const MEM_HANDLE_TYPE_POSIX_FD: u32 = 1;
+pub const MEM_HANDLE_TYPE_WIN32: u32 = 2;
 pub const MEM_ACCESS_PROT_READ: u32 = 1;
 pub const MEM_ACCESS_PROT_READWRITE: u32 = 3;
 pub const MEM_GRANULARITY_MINIMUM: u32 = 0;
@@ -118,6 +121,7 @@ pub struct Driver {
     pub device_get_count: F<*mut c_int>,
     pub device_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, CUdevice) -> CUresult,
     pub device_get_uuid: unsafe extern "C" fn(*mut [u8; 16], CUdevice) -> CUresult,
+    pub device_get_name: unsafe extern "C" fn(*mut c_char, c_int, CUdevice) -> CUresult,
     pub primary_ctx_retain: unsafe extern "C" fn(*mut CUcontext, CUdevice) -> CUresult,
     pub ctx_get_current: F<*mut CUcontext>,
     pub ctx_set_current: F<CUcontext>,
@@ -125,8 +129,12 @@ pub struct Driver {
     pub primary_ctx_release: F<CUdevice>,
     pub mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult,
     pub stream_create: unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult,
+    pub stream_create_with_priority:
+        unsafe extern "C" fn(*mut CUstream, c_uint, c_int) -> CUresult,
+    pub ctx_get_stream_priority_range: unsafe extern "C" fn(*mut c_int, *mut c_int) -> CUresult,
     pub stream_destroy: F<CUstream>,
     pub stream_synchronize: F<CUstream>,
+    pub stream_is_capturing: unsafe extern "C" fn(CUstream, *mut c_int) -> CUresult,
     pub stream_wait_event: unsafe extern "C" fn(CUstream, CUevent, c_uint) -> CUresult,
     pub event_create: unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult,
     pub event_destroy: F<CUevent>,
@@ -246,6 +254,7 @@ impl Driver {
             device_get_count: load!(lib, b"cuDeviceGetCount"),
             device_get_attribute: load!(lib, b"cuDeviceGetAttribute"),
             device_get_uuid: load!(lib, b"cuDeviceGetUuid_v2"),
+            device_get_name: load!(lib, b"cuDeviceGetName"),
             primary_ctx_retain: load!(lib, b"cuDevicePrimaryCtxRetain"),
             ctx_get_current: load!(lib, b"cuCtxGetCurrent"),
             ctx_set_current: load!(lib, b"cuCtxSetCurrent"),
@@ -253,8 +262,11 @@ impl Driver {
             primary_ctx_release: load!(lib, b"cuDevicePrimaryCtxRelease_v2"),
             mem_get_info: load!(lib, b"cuMemGetInfo_v2"),
             stream_create: load!(lib, b"cuStreamCreate"),
+            stream_create_with_priority: load!(lib, b"cuStreamCreateWithPriority"),
+            ctx_get_stream_priority_range: load!(lib, b"cuCtxGetStreamPriorityRange"),
             stream_destroy: load!(lib, b"cuStreamDestroy_v2"),
             stream_synchronize: load!(lib, b"cuStreamSynchronize"),
+            stream_is_capturing: load!(lib, b"cuStreamIsCapturing"),
             stream_wait_event: load!(lib, b"cuStreamWaitEvent"),
             event_create: load!(lib, b"cuEventCreate"),
             event_destroy: load!(lib, b"cuEventDestroy_v2"),

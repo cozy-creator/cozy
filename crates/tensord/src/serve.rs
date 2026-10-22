@@ -291,6 +291,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
     let paths = crate::machine::update::Paths::new(&engine, &layout.root);
+    crate::machine::update::check_startup_pair(&paths)?;
     let (_owned, store) = own(&engine, &layout.store, Some(&paths))?;
     // The machine's one downloader, held for its life: it reads the datacenter volume before the
     // Hub and fills it. A variable naming no mount point (the volume was not delivered) is none.
@@ -412,6 +413,12 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     // A local machine installs releases through its owner's uv cache, as its local packages do;
     // a cache of its own from before is no longer read (environments keep their linked files).
     if !rental {
+        // An idle fresh machine downloads nothing. Its first package install resolves a
+        // compatible pair once, shared by the published and captured installer paths.
+        if sdk.requirements.is_empty() && paths.unselected_sdk() {
+            sdk.default_sdk = Some(crate::machine::update::DefaultSdk::new(
+                engine.join("sdk/default"), sdk.uv.clone(), machine.clone()));
+        }
         sdk.owner_uv = crate::published::OwnerUv::of(protocol::config::environment());
         if sdk.owner_uv.is_some() {
             let _ = std::fs::remove_dir_all(engine.join("published/uv-cache"));
@@ -485,6 +492,7 @@ fn start_api(
         sdk.seed_cache.clone(),
         sdk.runtime_build.clone(),
     );
+    let default_sdk = sdk.default_sdk.clone();
     let store = store.clone();
     let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store.clone());
     backend.logs = logs;
@@ -503,6 +511,7 @@ fn start_api(
             generations: generations.to_path_buf(),
             staging_root: root.join("package-staging"),
             sdk: pair,
+            default_sdk,
             runtime_build,
             uv: uv.clone(),
             seed_cache,

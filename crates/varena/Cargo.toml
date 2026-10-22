@@ -1,21 +1,35 @@
 [package]
 name = "varena"
-version = "0.13.5"
+version = "0.14.0"
 edition = "2021"
 publish.workspace = true
-description = "The memory of the process computing with model weights: GPU pages, slots and pins; the sealed host tier."
+description = "The memory of the processes computing with model weights: one GPU table, one decision procedure, kept pages and the RAM tier."
 
 [dependencies]
-platform.workspace = true
-tensorfs.workspace = true
+crossbeam-channel = "0.5.17"
 libc.workspace = true
+parking_lot = "0.12.5"
+platform.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tensorfs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [features]
-# Store-backed sources (checkpoints and fills from a TensorFS store). Without it: sealed host
-# layouts only.
+# Store-backed sources (checkpoints from a TensorFS store).
 default = ["store"]
 store = ["tensorfs/store"]
-# Test-only fault points on the host tier.
+# Panic points for the recovery tests (`faults`); the tests turn it on through the dev-dependency below.
 faults = []
+
+[dev-dependencies]
+varena = { path = ".", features = ["faults"] }
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+# Its own harness: the child processes are this binary (`processes child`), roles in argv.
+[[test]]
+name = "processes"
+harness = false

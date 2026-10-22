@@ -44,7 +44,6 @@ TENSOR_COUNT = 3858
 REPS = 5
 READERS = {"cpu": ("tensorfs", "safetensors-copy"),
            "cuda": ("tensorfs", "fastsafetensors", "safetensors-cuda", "safetensors-cpu-cuda")}
-COPY_FIELDS = ("kind", "gpu", "bytes", "ns", "ceiling", "link", "busy_ns", "pin_ns", "staged", "cached")
 GIB = 1 << 30
 INIT_OVERHEAD = 64 << 20
 STEADY_OVERHEAD = 2 << 20
@@ -161,20 +160,18 @@ def summarize(rows, payload):
     return {"cells": cells, "complete": len(rows) == expected and all(c["complete"] for c in cells.values()),
             "parity_pass": len(rows) == expected and all(c["parity_pass"] for c in cells.values()),
             "observations_complete": observations_complete, "link_threshold": None,
-            "cpu_engine_metrics": "raw CPU reads do not emit placement disk Copy records in current25",
             "r4_link_review_required": True, "r4_lifecycle_review_required": True}
 
 
-def copy_metrics(records, destination, payload):
+def rate_metrics(nbytes, seconds, destination, ceiling, payload):
+    """A TensorFS read's rate against TensorFS's measured ceiling (`tensorfs.ceiling`): GPU reads against pinned H2D,
+    host reads against the volume. A raw read is no varena request, so it has no Stats; the ceiling is the measure."""
     kind = "disk" if destination == "cpu" else "h2d"
-    selected = [r for r in records if r["kind"] == kind]
-    nbytes, ns = sum(r["bytes"] for r in selected), sum(r["ns"] for r in selected)
-    measured = nbytes >= payload and bool(selected) and all(
-        r["bytes"] > 0 and r["ns"] > 0 and r["ceiling"] > 0
-        and (kind == "disk" or r["link"]) for r in selected)
-    return {"kind": kind, "measured": measured, "bytes": nbytes,
-            "gbps": nbytes / ns if ns else None,
-            "ceiling_ratio": sum(r["bytes"] / r["ceiling"] for r in selected) / ns if measured else None}
+    limit = ceiling.get(f"{kind}_gbps") or 0
+    gbps = nbytes / seconds / 1e9 if seconds > 0 else None
+    measured = nbytes >= payload and gbps is not None and limit > 0
+    return {"kind": kind, "measured": measured, "bytes": nbytes, "gbps": gbps, "ceiling_gbps": limit or None,
+            "ceiling_ratio": gbps / limit if measured else None}
 
 
 def installed_provenance(wheel, expected, native_source):
@@ -218,7 +215,6 @@ def load_cohort(torch_version):
     torch = importlib.import_module("torch")
     tfs = importlib.import_module("tensorfs")
     importlib.import_module("tensorfs.raw")
-    importlib.import_module("tensorfs.varena")
     importlib.import_module("safetensors")
     importlib.import_module("fastsafetensors")
     require(isinstance(tfs._ext.__loader__, machinery.ExtensionFileLoader), "TensorFS is not a native extension")
@@ -260,7 +256,7 @@ def physical_files(checkpoint, cache_dir):
 
 class Fixture:
     def __init__(self, plan, work, tfs):
-        self.tfs, self.work = tfs, Path(work)
+        self.tfs, self.work, self.ceiling = tfs, Path(work), {}
         self.source = tfs.open(plan["header"], cache_dir=plan["cache_dir"], local_files_only=True)
         try:
             require(self.source.id == "sha256:" + plan["header_sha256"], "opened header identity mismatch")
@@ -392,8 +388,6 @@ class Fixture:
         return self.payload
 
     def once(self, destination, reader, torch, device, ordinal, recovery_floor):
-        varena = self.tfs.varena
-        varena.copies()
         before_free = torch.cuda.mem_get_info(ordinal)[0]
         require(before_free >= recovery_floor,
                 f"GPU memory below fixed recovery floor before read: {before_free} < {recovery_floor}")
@@ -407,7 +401,6 @@ class Fixture:
                         torch.cuda.synchronize(ordinal)
                     seconds = time.perf_counter() - started
                     after_read_free = torch.cuda.mem_get_info(ordinal)[0]
-                    copies = [{name: getattr(c, name) for name in COPY_FIELDS} for c in varena.copies()]
                     # Every part remains owned through completion and untimed validation.
                     moved = self.validate(arrays, destination, reader, torch, ordinal)
                 finally:
@@ -421,8 +414,9 @@ class Fixture:
         except ValueError as error:
             raise ValueError(f"{error}; before_free={before_free}; after_read_free={after_read_free}") from error
         recovery.update(before_free=before_free, after_read_free=after_read_free)
-        return {"seconds": seconds, "bytes": moved, "verified": True, "copies": copies,
-                "metrics": copy_metrics(copies, destination, self.payload) if reader == "tensorfs" else None,
+        return {"seconds": seconds, "bytes": moved, "verified": True,
+                "metrics": rate_metrics(moved, seconds, destination, self.ceiling, self.payload)
+                if reader == "tensorfs" else None,
                 "recovery": recovery}
 
 
@@ -475,6 +469,11 @@ def run(args, receipt):
     receipt["environment"]["cudart"] = {"path": runtime, "sha256": digest(runtime)}
     nogds.resolve_runtime_lib_name = lambda framework=None: runtime
     nogds.load_library_func(framework.get_framework_op("pytorch"))
+    # TensorFS's ceiling for this volume and GPU, measured (or kept this boot) outside every timed cell.
+    ceiling = tfs.ceiling(ordinal, path=fixture.work)
+    fixture.ceiling = {"disk_gbps": ceiling.disk_gbps, "disk_direct": ceiling.disk_direct,
+                       "h2d_gbps": ceiling.h2d_gbps, "streams": ceiling.streams}
+    receipt["ceiling"] = fixture.ceiling
     initial_free = torch.cuda.mem_get_info(ordinal)[0]
     initial_floor = initial_free - INIT_OVERHEAD
     receipt["initialization"] = []

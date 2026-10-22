@@ -259,7 +259,7 @@ impl LocalSources {
         let key = serde_json::json!({
             "lock": held("uv.lock"), "project": held("pyproject.toml"), "beside": beside, "wheels": carried,
             "indexes": manifest.indexes,
-            "sdk": self.installer.sdk, "client": self.installer.client_wheel,
+            "sdk": self.installer.sdk(), "runtime_build": self.installer.runtime_build, "client": self.installer.client_wheel,
             "python": self.installer.python, "python_version": manifest.python_version,
         });
         home.join(format!("env-{}", &sha256::hex_digest(key.to_string().as_bytes())[..16]))
@@ -442,11 +442,14 @@ impl LocalSources {
         run: &str,
         stage: &dyn Fn(&str),
     ) -> Result<Installation, Refused> {
+        // Establish custody before a first install can trigger SDK resolution/downloads.
+        let (manifest, object) = open_manifest(&self.objects, actor, digest)?;
+        self.installer.resolve_sdk(stop).map_err(installer_refusal)?;
         // Like published installations, local aliases include the selected SDK and
         // client. The source digest alone cannot identify the environment after an update.
         let key = serde_json::json!({
             "manifest": digest,
-            "sdk": self.installer.sdk,
+            "sdk": self.installer.sdk(), "runtime_build": self.installer.runtime_build,
             "client": self.installer.client_wheel,
             "python": self.installer.python,
         });
@@ -469,8 +472,7 @@ impl LocalSources {
                 installing
             }
         };
-        let package = open_manifest(&self.objects, actor, digest).map(|(m, _)| m.package).unwrap_or_default();
-        *self.holder.lock().unwrap() = Some((service.engine.caller_id(run), package));
+        *self.holder.lock().unwrap() = Some((service.engine.caller_id(run), manifest.package.clone()));
         let _held = Holder(&self.holder);
         if let Some(held) = service.engine.installation(actor, &alias)? {
             if service.catalog.resolve(&held.generation).is_ok() {
@@ -478,7 +480,6 @@ impl LocalSources {
             }
         }
         let member = |m: &Member| written_member(&self.objects, actor, m);
-        let (manifest, object) = open_manifest(&self.objects, actor, digest)?;
         if !manifest.files.is_empty() || !manifest.path.is_empty() {
             return self.install_live(service, actor, alias, manifest, &object.sha256, stop, stage);
         }
@@ -552,6 +553,8 @@ fn installer_refusal(error: protocol::error::Error) -> Refused {
     let code = match error.code.as_str() {
         crate::published::CANCELED => crate::published::CANCELED,
         "no_progress" => "no_progress",
+        "package_sdk_incompatible" => "package_sdk_incompatible",
+        "package_sdk_unavailable" => "package_sdk_unavailable",
         _ => "package_installation_failed",
     };
     refused(code, error.message)
@@ -625,6 +628,7 @@ mod tests {
             client_wheel: client,
             staging_root: root.join("staging"),
             sdk: vec![],
+            default_sdk: None,
             uv: "uv".into(),
             seed_cache: None,
             runtime_build: String::new(),
@@ -766,6 +770,70 @@ mod tests {
             .unwrap();
         assert_eq!(again.generation, installed.generation);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn foreign_source_cannot_trigger_a_default_sdk_download() {
+        let m = machine("cm-default-sdk-custody");
+        let store = crate::storage::open(&m.root.join("sdk-store")).unwrap();
+        let machine = crate::origin::Machine::new(store, None).unwrap();
+        let directory = m.root.join("default-sdk");
+        let default = crate::machine::update::DefaultSdk::new(directory.clone(), m.root.join("must-not-execute"), machine);
+        let sources = LocalSources::new(m.objects.clone(), InstallerConfig { default_sdk: Some(default.clone()), ..m.installer.clone() });
+        let manifest = write(&m.objects, "alice", br#"{"package":"local/example","release":"1"}"#);
+        assert_eq!(sources.install(&m.service, "bob", &manifest.digest, None, "", &|_| ()).err().unwrap().code, "local_source_incomplete");
+        assert!(default.resolved().is_none() && !directory.exists());
+        let _ = fs::remove_dir_all(&m.root);
+    }
+
+    /// Exact private/released native wheels, never relabeled. This proves the normal installer
+    /// consumes the lazy choice; PyPI discovery and GPU execution are separate boundaries.
+    #[test]
+    #[ignore = "requires genuine Runtime >=0.31 and TensorFS >=0.14 wheel artifacts"]
+    fn a_lazy_default_pair_installs_the_real_scalar_cohort_once() {
+        let m = machine("cm-default-sdk-cohort");
+        let wheels: Vec<PathBuf> = ["COZY_TEST_RUNTIME_WHEEL", "COZY_TEST_TENSORFS_WHEEL"].iter()
+            .map(|name| std::env::var_os(name).map(PathBuf::from).expect("exact native cohort artifact"))
+            .collect();
+        let store = crate::storage::open(&m.root.join("sdk-store")).unwrap();
+        let machine = crate::origin::Machine::new(store, None).unwrap();
+        let default = crate::machine::update::DefaultSdk::new(m.root.join("default-sdk"), "uv".into(), machine);
+        default.seed_verified(&wheels).unwrap(); // Uses production metadata/floor/content checks.
+        let config = InstallerConfig { default_sdk: Some(default.clone()), ..m.installer.clone() };
+        assert!(config.sdk.is_empty() && config.runtime_build.is_empty());
+        let published = crate::published::PackageSdk { default_sdk: Some(default.clone()), ..Default::default() };
+        assert_eq!(published.requirements(), config.sdk().iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>());
+        let sources = LocalSources::new(m.objects.clone(), config);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_lifecycle");
+        let tree = archive(&fixture, &["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"]);
+        let source = write(&m.objects, "alice", &tree);
+        let manifest = serde_json::json!({"package":"local/tensord-cpu-lifecycle", "release":"0.1.0", "python_version":"3.12",
+            "source":{"digest":source.digest,"length":source.length}});
+        let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
+        let first = sources.install(&m.service, "alice", &manifest.digest, None, "", &|_| ()).unwrap();
+        let held = m.service.catalog.resolve(&first.generation).unwrap();
+        assert_eq!(installed_sdk(&held.record.python), format!("{} {}", wheel_version(&wheels[0]), wheel_version(&wheels[1])));
+        assert!(held.record.sdk_fallback.is_empty() && held.record.runtime_build.is_empty());
+        named_runtime_loaded(&held.record.python);
+        run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_lifecycle; print(cpu_lifecycle.Done(3).steps)"]));
+        let second = sources.install(&m.service, "alice", &manifest.digest, None, "", &|_| ()).unwrap();
+        assert_eq!(first.generation, second.generation);
+        // An unlocked project cannot fall back to its old SDK after the offered pair fails.
+        let incompatible = m.root.join("incompatible-project");
+        fs::create_dir_all(incompatible.join("cpu_lifecycle")).unwrap();
+        for file in ["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"] {
+            let mut text = fs::read_to_string(fixture.join(file)).unwrap();
+            if file == "pyproject.toml" { text = text.replace("\"cozy-runtime\"", "\"cozy-runtime<0.31\""); }
+            fs::write(incompatible.join(file), text).unwrap();
+        }
+        let tree = archive(&incompatible, &["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"]);
+        let source = write(&m.objects, "alice", &tree);
+        let bad = serde_json::json!({"package":"local/tensord-cpu-lifecycle", "release":"0.1.0", "python_version":"3.12",
+            "source":{"digest":source.digest,"length":source.length}});
+        let bad = write(&m.objects, "alice", bad.to_string().as_bytes());
+        assert_eq!(sources.install(&m.service, "alice", &bad.digest, None, "", &|_| ()).err().unwrap().code, "package_sdk_incompatible");
+        assert!(!m.root.join("sdk/current").exists());
+        let _ = fs::remove_dir_all(&m.root);
     }
 
     /// Remote edits get independent editable trees/environments. Explicit direct paths keep
@@ -1201,19 +1269,17 @@ mod tests {
         let _ = fs::remove_dir_all(m.root);
     }
 
-    /// A package whose lock holds another Runtime than the machine's (here a vendored dev build,
-    /// pinned exactly) runs on the machine's own pair: version skew is allowed. uv's check of its
-    /// pin is the run's warning, never a refusal (card I: an old-pair lock refused, runs
-    /// 12795-12810). A dev Runtime is a machine's through `--runtime-wheel`. Every capture shape
-    /// the CLI sends.
+    /// Normal SDK contradictions refuse in every capture shape. Only an explicit development
+    /// override retains the existing warning, without being reused by a normal selection.
     #[test]
-    fn a_lock_of_another_runtime_runs_on_the_machines_pair_with_a_warning() {
+    fn local_sdk_bounds_refuse_except_for_an_explicit_development_override() {
         let m = machine("cm-vendored");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let pair = sdk_pair(&m.root);
+        let normal = LocalSources::new(m.objects.clone(), InstallerConfig { sdk: pair.clone(), ..m.installer.clone() });
         let sources = LocalSources::new(
             m.objects.clone(),
-            InstallerConfig { sdk: pair.clone(), ..m.installer.clone() },
+            InstallerConfig { sdk: pair.clone(), runtime_build: "explicit-fixture".into(), ..m.installer.clone() },
         );
         let project = m.root.join("project");
         let fixture = repo.join("tests/fixtures/cpu_input");
@@ -1265,6 +1331,9 @@ mod tests {
         // The live tree, file by file: the project as it is, its lock and vendor/ wheel.
         let live = manifest(serde_json::json!({"files": live_files(&m.objects, "alice", &project, &[&files[..], &[vendored.as_str()]].concat())}));
         for digest in [source, carried, live] {
+            let error = normal.install(&m.service, "alice", &digest, None, "", &|_| ()).err().unwrap();
+            assert_eq!(error.code, "package_sdk_incompatible");
+            assert!(error.message.contains("package_sdk_incompatible"), "{}", error.message);
             let installed = sources.install(&m.service, "alice", &digest, None, "", &|_| ()).unwrap();
             let held = m.service.catalog.resolve(&installed.generation).unwrap();
             assert_eq!(installed_sdk(&held.record.python), format!("{runtime} {}", wheel_version(&pair[1])));
