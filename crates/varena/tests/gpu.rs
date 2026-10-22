@@ -1228,6 +1228,7 @@ fn activation(r: &Request, set: SetId, p: &mut Pressure, len: u64, pages: u32) -
         assert_eq!(code, cuda::ERROR_OUT_OF_MEMORY);
         let next = r.oom(Some(set), Some(len), None, p.torch());
         answers.push(format!("{next:?}").split('(').next().unwrap_or_default().to_string());
+        eprintln!("OOM_DIAGNOSTIC need={len} driver_free={} allocated={} next={next:?} stats={:?}", driver_free(), p.bytes(), r.stats());
         assert!(matches!(next, Next::Retry), "idle pages answer Retry: {answers:?}");
         assert!(answers.len() <= pages as usize + 2, "the OOM ladder must end: {answers:?}");
     }
@@ -1371,7 +1372,7 @@ fn watch<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, budget: std::time:
         out
     });
     let task = format!("/proc/self/task/{}", tid.recv().unwrap());
-    let mut asleep: Option<std::time::Instant> = None;
+    let started = std::time::Instant::now();
     loop {
         if done.load(std::sync::atomic::Ordering::Acquire) {
             return (handle, Waited::Returned);
@@ -1382,15 +1383,10 @@ fn watch<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, budget: std::time:
         };
         let state = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned));
         let ran = sched.split_whitespace().next().unwrap().parse::<u128>().unwrap();
-        if matches!(state.as_deref(), Some("S" | "D")) {
-            if asleep.get_or_insert_with(std::time::Instant::now).elapsed() > budget {
-                return (handle, Waited::Asleep);
-            }
-        } else {
-            asleep = None;
-        }
-        if ran > budget.as_nanos() {
-            return (handle, Waited::Spun);
+        // Repeated condvar wakes must not reset this diagnostic's observation window.
+        // A waiting fill may be notified by unrelated completed work many times.
+        if started.elapsed() > budget {
+            return (handle, if matches!(state.as_deref(), Some("S" | "D")) || ran < budget.as_nanos() { Waited::Asleep } else { Waited::Spun });
         }
         std::thread::yield_now();
     }

@@ -2720,6 +2720,7 @@ impl Inner {
         let trigger = Trigger::Oom { req, set, need, site: site_of, tried: Tried::default() };
         let actions = self.demand(trigger, Some(req))?;
         let mut st = self.lock();
+        tracing::debug!(target: "varena::memory", need, free=st.table.free(), context=st.table.context, foreign=st.table.foreign, mapped=st.table.mapped(), pending=st.table.pending, inflight=st.table.inflight, torch=st.table.torch(), driver_free=?self.backend.free(), actions=?actions, "OOM_DIAGNOSTIC decision");
         let stats = |st: &State| st.stats.get(&req).cloned().unwrap_or_default();
         let next = match actions.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::CutOutside { .. } | Action::Park(_) | Action::Exhausted { .. })) {
             Some(Action::Cut { set, site, .. }) => {
