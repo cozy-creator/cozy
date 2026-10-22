@@ -153,6 +153,7 @@ class Memory:
     def request(self, id: str, plan: list[tuple[list[str], int]]) -> Request:
         """Opens request `id`; `plan` is its steps, each `(set names, passes)`."""
 
+    def retain(self, set: int, blocks: list[int]) -> Retained: ...
     def bind(self, set: int, block: int, stream: int = 0) -> Pin:
         """Block (region) `block` of `set`, mapped and filled; `stream` (a CUstream, 0 the default)
         waits on the fill, and tensors made from the pin are consumed on it only."""
@@ -387,3 +388,9 @@ class Stats:
     def leftover(self) -> int: ...
     def json(self) -> str:
         """The record as JSON, field for field (what a Runtime relays)."""
+
+class Retained:
+    """Stable virtual references. `prepare` leases their physical pages through stream completion."""
+    identity: str
+    def prepare(self, stream: int = 0) -> list[Pin]: ...
+    def close(self) -> None: ...

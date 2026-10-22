@@ -615,3 +615,46 @@ fn a_request_records_its_host_high_water() {
     drop(held);
     r.end();
 }
+
+#[test]
+fn retained_addresses_survive_unload_and_refill_without_pinning_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("retained-refill", 8 * MB);
+    let id = mem.load(set(dir.path(), "retained", 2, &g.uuid), Level::Ram).unwrap();
+    let binding = mem.retain(id, &[1, 0, 1]).unwrap();
+    let first = binding.prepare(0).unwrap();
+    let addresses: Vec<_> = first.iter().map(|p| p.ptr).collect();
+    assert_eq!(addresses.len(), 2, "ranges are deduplicated and ordered");
+    assert!(first.iter().all(|p| unsafe { *(p.ptr as *const u8) } == 3));
+    drop(first);
+    mem.unload(id);
+    mem.settle();
+    let second = binding.prepare(0).unwrap();
+    assert_eq!(second.iter().map(|p| p.ptr).collect::<Vec<_>>(), addresses);
+    assert!(second.iter().all(|p| unsafe { *(p.ptr as *const u8) } == 3));
+    drop(second);
+    drop(binding);
+    mem.settle();
+    assert!(mem.bind(id, 0, 0).is_err(), "final address owner retires the unloaded set");
+}
+
+#[test]
+fn retained_identity_change_refuses_preparation_before_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("retained-identity", 8 * MB);
+    let id = mem.load(set(dir.path(), "identity", 1, &g.uuid), Level::Ram).unwrap();
+    let binding = mem.retain(id, &[0]).unwrap();
+    mem.fill(id, Fill::Declared("changed-bake".into()));
+    assert!(matches!(binding.prepare(0), Err(varena::Error::Invalid(_))));
+}
+
+#[test]
+fn a_range_larger_than_capacity_unwinds_all_preparation_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("retained-exhausted", 2 * REGION_ALIGN);
+    let id = mem.load(set(dir.path(), "large-range", 3, &g.uuid), Level::Ram).unwrap();
+    let all = mem.retain(id, &[0, 1, 2]).unwrap();
+    assert!(matches!(all.prepare(0), Err(varena::Error::Exhausted(_))));
+    let one = mem.retain(id, &[0]).unwrap();
+    assert_eq!(one.prepare(0).unwrap().len(), 1, "failed preparation strands no physical claims");
+}

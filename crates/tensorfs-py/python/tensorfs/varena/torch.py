@@ -229,6 +229,19 @@ class Model:
         #: the fill identity its pages were last declared under
         self.identity: str | None = declared.fill.identity if declared.fill is not None else None
 
+    def retain(self, paths: Collection[str] = ("",)) -> Binding:
+        """Retain addresses for every weight/buffer in the declared module subtrees.
+
+        An empty path declares the whole model. Runtime declares indirect dependencies too;
+        observing the modules visited by one capture is not a complete declaration.
+        """
+        all_blocks = [b for b in (self.common, *self.blocks.values()) if b is not None]
+        blocks = [b for b in all_blocks if any(not p or b.path == p or b.path.startswith(p + ".") for p in paths)]
+        # Common weights can be read by any child block, so include them conservatively.
+        if self.common is not None and self.common not in blocks:
+            blocks.insert(0, self.common)
+        return Binding(self, sorted(blocks, key=lambda b: b.region))
+
     def hold(self, shed: Callable[[], None] | None = None) -> Hold:
         """Every block bound, pins and param views, until the hold's release (a CUDA graph's
         fixed addresses). Register the graph as a `mem.cache` whose shrink drops it and releases
@@ -258,6 +271,59 @@ class Model:
                 b.views = b.assign = b.window = b.track = None
         self.memory.models.pop(self.module, None)
         self.memory.native.unload(self.id)
+
+
+class Binding:
+    """A graph's virtual addresses, leased physically only around capture or replay."""
+
+    def __init__(self, model: Model, blocks: list[_Block]) -> None:
+        self.model, self.blocks = model, blocks
+        self.native = model.memory.native.retain(model.id, [b.region for b in blocks])
+        self.identity = self.native.identity
+        self.closed = False
+        # Covers input copies, launch, and output uses: each graph has one static buffer set.
+        self.lock = threading.RLock()
+
+    @contextmanager
+    def prepare(self, stream: torch.cuda.Stream | int | None = None) -> Iterator[Binding]:
+        with self.lock:
+            if self.closed:
+                raise Unbound("graph binding is closed")
+            memory = self.model.memory
+            if memory.cuda:
+                if torch.cuda.is_current_stream_capturing():
+                    raise Unbound("graph residency must be prepared before capture")
+                if stream is None:
+                    stream = torch.cuda.current_stream(memory.device)
+                elif isinstance(stream, int):
+                    stream = torch.cuda.ExternalStream(stream, device=memory.device)
+            pins = self.native.prepare(stream.cuda_stream if stream is not None else 0)
+            held: list[_Block] = []
+            try:
+                with self.model.lock:
+                    for block, pin in zip(self.blocks, pins, strict=True):
+                        if block.count == 0:
+                            memory._bind(block, stream, pin)
+                        elif stream is not None and block.stream != stream:
+                            stream.wait_stream(block.stream)
+                        block.count += 1
+                        held.append(block)
+                yield self
+            finally:
+                # `_exit` joins a caller's current consumer stream back to each bind stream.
+                # More streams must be joined by the caller before leaving this scope.
+                for block in reversed(held):
+                    memory._exit(block)
+                pins.clear()  # Native pin drops record completion after the queued uses.
+
+    def close(self) -> None:
+        with self.lock:
+            if not self.closed:
+                self.closed = True
+                self.native.close()
+
+    def __del__(self) -> None:
+        self.close()
 
 
 class Hold:
@@ -600,9 +666,10 @@ class Memory:
             warnings.warn(f"{model.name}: a weight tensor of block {block.path or 'common'!r} outlived its forward; its page stays bound while it lives", stacklevel=2)
         block.views = block.assign = block.window = block.track = block.at = None
 
-    def _bind(self, block: _Block, stream: torch.cuda.Stream | None) -> None:
+    def _bind(self, block: _Block, stream: torch.cuda.Stream | None, pin: Pin | None = None) -> None:
         model = block.model
-        pin = self.native.bind(model.id, block.region, stream.cuda_stream if stream is not None else 0)
+        if pin is None:
+            pin = self.native.bind(model.id, block.region, stream.cuda_stream if stream is not None else 0)
         if self.torch.kind in ("cpu", "cuda"):
             if block.views is None or block.at != pin.ptr:  # a new mapping: its views once
                 window = pin.window()

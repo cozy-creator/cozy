@@ -498,12 +498,10 @@ mod imp {
         names.iter().map(|n| field(n)).collect()
     }
 
-    /// This process's anonymous high-water: its resident peak less the file and shared pages it
-    /// maps now (shared: the RAM tier's layouts and host pages), at least its anonymous bytes.
+    /// Conservative process resident peak. Subtracting current file/shared RSS from a past
+    /// peak can undercount anonymous growth when those mappings grew after the peak.
     pub(crate) fn high_water() -> Option<u64> {
-        let v = status("self", &["VmHWM", "RssFile", "RssShmem", "RssAnon"])?;
-        let (peak, file, shmem, anon) = (*v.first()?, *v.get(1)?, *v.get(2)?, *v.get(3)?);
-        Some(peak.saturating_sub(file + shmem).max(anon))
+        status("self", &["VmHWM"])?.first().copied()
     }
 
     /// Starts this process's resident high-water over from its use now (`clear_refs` 5).

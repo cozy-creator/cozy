@@ -42,6 +42,90 @@ use crate::{Error, Exhausted, GpuId, Result};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SetId(pub u32);
 
+/// A graph's immutable address/layout/fill binding. Retention keeps the virtual reservation,
+/// never its physical pages. `prepare` leases the complete declared range before launch.
+pub struct Retained {
+    inner: Arc<Inner>,
+    set: u32,
+    blocks: Vec<u32>,
+    identity: String,
+}
+
+/// Preparation's claims prevent eviction of any dependency while all its pages are admitted.
+/// On failure they unwind without launching a consumer; completed fills may remain cached.
+struct Preparing {
+    inner: Arc<Inner>,
+    pins: Vec<(u64, Key)>,
+}
+
+impl Drop for Preparing {
+    fn drop(&mut self) {
+        let mut st = self.inner.lock();
+        for (id, key) in &self.pins {
+            st.pins.remove(id);
+            st.sync(*key);
+        }
+        self.inner.close_sets(&mut st);
+        self.inner.publish(&st);
+        self.inner.landed.notify_all();
+    }
+}
+
+impl Retained {
+    pub fn identity(&self) -> &str { &self.identity }
+
+    /// Acquires all physical dependencies atomically against eviction. The returned pins hold
+    /// them until completion on `stream`, including a cancelled caller's queued work. Callers
+    /// join every additional consumer stream back into `stream` before releasing these pins.
+    pub fn prepare(&self, stream: usize) -> Result<Vec<Pin>> {
+        self.inner.guard(|| {
+            let (preparing, req) = {
+                let mut st = self.inner.lock();
+                let m = st.mech(self.set)?;
+                if retained_identity(self.set, m) != self.identity {
+                    return Err(Error::Invalid("retained range identity changed; recapture required".into()));
+                }
+                let req = st.binding(self.set);
+                let mut pins = Vec::with_capacity(self.blocks.len());
+                for &block in &self.blocks {
+                    let key = (self.set, block);
+                    let id = st.tick();
+                    st.pins.insert(id, (key, req, std::thread::current().id()));
+                    st.sync(key);
+                    pins.push((id, key));
+                }
+                self.inner.publish(&st);
+                (Preparing { inner: self.inner.clone(), pins }, req)
+            };
+            let pages = self.blocks.iter().map(|b| (self.set, *b)).collect();
+            let actions = self.inner.demand(Trigger::Prepare { pages, req, tried: Tried::default() }, req)?;
+            if let Some(Action::Exhausted { need }) = actions.last() {
+                let mut st = self.inner.lock();
+                return Err(Error::Exhausted(exhausted(*need, None, st.stats(req).cloned().unwrap_or_default())));
+            }
+            let pins = self.blocks.iter().map(|b| self.inner.bind(self.set, *b, stream)).collect::<Result<Vec<_>>>()?;
+            let st = self.inner.lock();
+            if retained_identity(self.set, st.mech(self.set)?) != self.identity {
+                return Err(Error::Invalid("retained range identity changed during preparation".into()));
+            }
+            drop(st);
+            drop(preparing);
+            Ok(pins)
+        })
+    }
+}
+
+impl Drop for Retained {
+    fn drop(&mut self) {
+        let mut st = self.inner.lock();
+        if let Some(Some(m)) = st.sets.get_mut(self.set as usize) {
+            m.retained = m.retained.saturating_sub(1);
+        }
+        self.inner.close_sets(&mut st);
+        self.inner.publish(&st);
+    }
+}
+
 /// A registered cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CacheId(pub u32);
@@ -249,6 +333,12 @@ struct SetMech {
     tier: String,
     held: Option<Arc<tier::Held>>,
     closing: bool,
+    /// Graph/address references, independent of physical residency.
+    retained: u64,
+}
+
+fn retained_identity(set: u32, m: &SetMech) -> String {
+    format!("{set}:{}:{}:{}", m.va.base, m.va.len, m.spec.fingerprint.key())
 }
 
 /// The RAM tier's name for the bytes a set's pages hold: the store's (stored, or transformed
@@ -821,6 +911,22 @@ impl Memory {
         self.inner.guard(|| self.inner.bind(set.0, block, stream))
     }
 
+    /// Retains stable virtual addresses for exactly these blocks, without making them resident.
+    pub fn retain(&self, set: SetId, blocks: &[u32]) -> Result<Retained> {
+        self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            let blocks: Vec<u32> = blocks.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
+            let m = st.mech(set.0)?;
+            if m.closing {
+                return Err(Error::Closed(format!("set {}", set.0)));
+            }
+            for &b in &blocks { m.spec.layout.region(b)?; }
+            let identity = retained_identity(set.0, m);
+            if let Some(Some(m)) = st.sets.get_mut(set.0 as usize) { m.retained += 1; }
+            Ok(Retained { inner: self.inner.clone(), set: set.0, blocks, identity })
+        })
+    }
+
     /// Bytes torch's allocator may hold now: capacity − context − mapped − other rows − foreign
     /// bytes. The adapter applies it at every pass start and after every `oom` answer.
     pub fn torch_limit(&self) -> u64 {
@@ -1047,6 +1153,9 @@ impl Inner {
                 let _ = self.unmap(st, key, Class::N, None, true);
             }
             if st.table.pages().any(|(k, p)| k.0 == set && p.mapped) {
+                continue;
+            }
+            if st.mech(set).is_ok_and(|m| m.retained != 0) {
                 continue;
             }
             if let Some(m) = st.sets.get_mut(set as usize).and_then(Option::take) {
@@ -1643,7 +1752,7 @@ impl Inner {
                 return Ok(actions);
             }
             let tried = match &mut trigger {
-                Trigger::Bind { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } => tried,
+                Trigger::Bind { tried, .. } | Trigger::Prepare { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } => tried,
                 Trigger::Ask { .. } | Trigger::Load { .. } => return Ok(actions),
             };
             tried.freed += freed;
@@ -1826,7 +1935,7 @@ impl Inner {
                     let pages = layout.regions.iter().map(|r| Page { bytes: r.span, ..Page::default() }).collect();
                     let set = Set { name: spec.name.clone(), pages, declared: spec.fingerprint.declared() };
                     let i = st.sets.len() as u32;
-                    st.sets.push(Some(SetMech { tier: tier_name(&spec), spec, va, held: None, closing: false }));
+                    st.sets.push(Some(SetMech { tier: tier_name(&spec), spec, va, held: None, closing: false, retained: 0 }));
                     st.table.sets.push(Some(set));
                     (i, false)
                 }
@@ -2063,8 +2172,9 @@ impl Inner {
         self.publish(&st);
         self.unlock(st);
         self.speculate(req);
+        let pin = Pin { ptr: va.base + off, len: span, ready, fresh, inner: self.clone(), key, id, stream, transform, transformed: AtomicBool::new(false) };
         self.backend.wait(ready, stream)?;
-        Ok(Pin { ptr: va.base + off, len: span, ready, fresh, inner: self.clone(), key, id, stream, transform, transformed: AtomicBool::new(false) })
+        Ok(pin)
     }
 
     /// A configuration's measured room: exact, else bounded by the nearest larger measured

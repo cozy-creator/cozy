@@ -28,6 +28,8 @@ pub struct Tried {
 pub enum Trigger {
     /// A bind of an unmapped page, for `req` when a request's pass binds it.
     Bind { page: Key, req: Option<u64>, tried: Tried },
+    /// Admit every missing page of a retained range together, before any consumer launches.
+    Prepare { pages: Vec<Key>, req: Option<u64>, tried: Tried },
     /// A pass of `req` over `set` starts needing `room` (measured at its cut levels), or,
     /// unmeasured, the reserve `unmeasured` sets aside: the room and its step's unmapped pages
     /// must fit.
@@ -107,6 +109,15 @@ pub fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> {
             let mut d = Demand::new(t, need, *req, Some(*page), tried);
             if d.run(Rungs::Bind) == Some(Done::Enough) {
                 d.out.push(Action::Map(*page));
+            }
+            d.out
+        }
+        Trigger::Prepare { pages, req, tried } => {
+            let missing: Vec<Key> = pages.iter().copied().filter(|k| t.page(*k).is_some_and(|p| !p.mapped)).collect();
+            let need = missing.iter().filter_map(|k| t.page(*k)).map(|p| p.bytes).sum();
+            let mut d = Demand::new(t, need, *req, None, tried);
+            if d.run(Rungs::Bind) == Some(Done::Enough) {
+                d.out.extend(missing.into_iter().map(Action::Map));
             }
             d.out
         }

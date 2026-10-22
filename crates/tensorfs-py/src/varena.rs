@@ -14,7 +14,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use tensorfs::format::Body;
 use varena::layout::Layout;
-use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, Next, Origin, Pass, Pin, Plan, Request, SetId, SetSpec, Site, SitePeak, Step, Torch, Yielded};
+use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, Next, Origin, Pass, Pin, Plan, Request, Retained, SetId, SetSpec, Site, SitePeak, Step, Torch, Yielded};
 
 use crate::store::PyCheckpoint;
 
@@ -505,6 +505,13 @@ impl PyMemory {
         Ok(PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.uuid.clone(), pin: Arc::new(Held(Some(pin))) })
     }
 
+    /// Graph address retention: no physical pin until `prepare`.
+    fn retain(&self, py: Python<'_>, set: u32, blocks: Vec<u32>) -> PyResult<PyRetained> {
+        let retained = detached(py, &self.gpu.uuid, || self.memory().retain(SetId(set), &blocks))?;
+        let identity = retained.identity().to_string();
+        Ok(PyRetained { retained: Mutex::new(Some(Arc::new(retained))), identity, gpu: self.gpu.uuid.clone(), dl: self.dl })
+    }
+
     /// Bytes torch's allocator may hold now.
     fn torch_limit(&self, py: Python<'_>) -> PyResult<u64> {
         detached(py, &self.gpu.uuid, || Ok(self.memory().torch_limit()))
@@ -514,6 +521,35 @@ impl PyMemory {
     fn stats(&self, py: Python<'_>) -> PyResult<Option<PyStats>> {
         detached(py, &self.gpu.uuid, || Ok(self.memory().stats())).map(|s| s.map(Into::into))
     }
+}
+
+/// A graph's address references; physical leases are acquired separately for each use.
+#[pyclass(name = "Retained", module = "tensorfs.varena", frozen)]
+pub struct PyRetained {
+    retained: Mutex<Option<Arc<Retained>>>,
+    #[pyo3(get)]
+    identity: String,
+    gpu: String,
+    dl: (i32, i32),
+}
+
+#[pymethods]
+impl PyRetained {
+    #[pyo3(signature = (stream = 0))]
+    fn prepare(&self, py: Python<'_>, stream: usize) -> PyResult<Vec<PyPin>> {
+        let r = lock(&self.retained).clone().ok_or_else(|| error(py, &self.gpu, Error::Closed("retained range".into())))?;
+        let pins = detached(py, &self.gpu, || r.prepare(stream))?;
+        Ok(pins.into_iter().map(|pin| PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.clone(), pin: Arc::new(Held(Some(pin))) }).collect())
+    }
+
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let r = lock(&self.retained).take();
+        done(py, &self.gpu, || drop(r))
+    }
+}
+
+impl Drop for PyRetained {
+    fn drop(&mut self) { release(lock(&self.retained).take()); }
 }
 
 // ---------------------------------------------------------------- requests and passes
@@ -936,6 +972,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPass>()?;
     m.add_class::<PyYielded>()?;
     m.add_class::<PyPin>()?;
+    m.add_class::<PyRetained>()?;
     m.add_class::<PyWindow>()?;
     m.add_class::<PyNext>()?;
     m.add_class::<PyFills>()?;
