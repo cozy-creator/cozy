@@ -49,7 +49,7 @@ fn main() {
     }
     let filter: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
     type Case = (&'static str, fn(&Path));
-    let cases: [Case; 23] = [
+    let cases: [Case; 24] = [
         ("an_idle_holder_answers_an_ask", an_idle_holder_answers_an_ask),
         ("a_killed_holder_leaves_orphans_a_successor_imports", a_killed_holder_leaves_orphans_a_successor_imports),
         ("a_failed_request_frees_everything", a_failed_request_frees_everything),
@@ -60,6 +60,7 @@ fn main() {
         ("an_ask_to_a_stopped_victim_ends_when_it_dies", an_ask_to_a_stopped_victim_ends_when_it_dies),
         ("binds_outlive_the_custody_holder", binds_outlive_the_custody_holder),
         ("a_table_with_live_rows_outlives_tensord", a_table_with_live_rows_outlives_tensord),
+        ("a_transferred_grant_keeps_its_cap_after_ledger_drop", a_transferred_grant_keeps_its_cap_after_ledger_drop),
         ("a_stale_reader_never_frees_a_newer_row", a_stale_reader_never_frees_a_newer_row),
         ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
         ("a_joint_step_runs_a_pass_per_set", a_joint_step_runs_a_pass_per_set),
@@ -822,6 +823,24 @@ fn binds_outlive_the_custody_holder(dir: &Path) {
 }
 
 /// Review 1, finding 10: TensorD's exit keeps a table an executor still uses, and a restarted
+/// The grant survives in a real child before its Memory is opened. Dropping the parent's
+/// ledger and lowering the named cap must update that very same generation.
+fn a_transferred_grant_keeps_its_cap_after_ledger_drop(_dir: &Path) {
+    let g = gpu("transferred-cap", 64 * MB);
+    let ledger = varena::Ledger::create(&g, Some(12 * MB)).unwrap();
+    let mut child = Agent::granted(ledger.grant(std::process::id()).unwrap());
+    drop(ledger);
+    drop(varena::Grant::open(&g, Some(8 * MB)).unwrap());
+    child.ok(&format!("grant {} {}", g.uuid, g.memory));
+    assert_eq!(child.ok("limit"), (8 * MB).to_string());
+    let mut observer = Agent::spawn();
+    observer.ok(&format!("open {} {}", g.uuid, g.memory));
+    assert_eq!(observer.ok("limit"), (8 * MB).to_string());
+    child.exit();
+    assert_eq!(observer.ok("limit"), (8 * MB).to_string(), "the surviving opener retains the cap");
+    observer.exit();
+}
+
 /// TensorD reopens it.
 fn a_table_with_live_rows_outlives_tensord(dir: &Path) {
     let g = gpu("restart", 8 * MB);
