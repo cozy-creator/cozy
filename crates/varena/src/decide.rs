@@ -44,6 +44,11 @@ pub enum Trigger {
     Oom { req: u64, set: Option<u32>, need: Option<u64>, site: Option<OomSite>, tried: Tried },
     /// Reserve future native workspace bytes before executing/capturing a region.
     Workspace { id: u64, bytes: u64, tried: Tried },
+    /// `req`'s room outside its passes (its setup, between passes), prepared at its open and
+    /// at each pass end, outside the allocator callback: measured (`room`), the free bytes and
+    /// own idle pages the callback can reclaim must cover it, kept ones lent to it as needed;
+    /// unmeasured, every idle byte is the request's, lazily (as for an unmeasured pass).
+    Outside { req: u64, room: Option<u64>, tried: Tried },
     /// Another row asks for `bytes` under `ceiling`.
     Ask { ceiling: Class, bytes: u64 },
     /// Fetch ahead for `req` into the surplus.
@@ -72,6 +77,10 @@ pub enum Action {
     Settle,
     /// Unmap an own page, of this class now.
     Unmap { page: Key, class: Class },
+    /// Lend an own idle kept page to the allocator callback for an unmeasured pass: custody
+    /// lets go of it and it stays mapped, so the callback reclaims it only if the pass's
+    /// allocations need it; kept again after.
+    Lend(Key),
     /// Ask custody to drop this many orphan bytes, least recently used first.
     ReleaseOrphans(u64),
     Ask { row: u64, ceiling: Class, bytes: u64 },
@@ -144,8 +153,12 @@ pub fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> {
         Trigger::Oom { req, set, need, site, tried } => oom(t, *req, *set, *need, site.as_ref(), tried),
         Trigger::Ask { ceiling, bytes } => answer(t, *ceiling, *bytes),
         Trigger::Speculate { req, tried } => speculate(t, *req, tried),
+        Trigger::Outside { req, room, tried } => outside(t, *req, *room, tried),
         Trigger::Load { set } => {
-            let mut free = t.free();
+            // A GPU-level load stops short of the prepared rooms: every open request's outside
+            // room and next measured pass, else the machine's largest measured outside room;
+            // beside an unmeasured one it takes nothing (the idle-GPU rule; lead, v6 13633).
+            let mut free = t.free().saturating_sub(t.held_back());
             let mut out = vec![];
             for (k, p) in t.pages().filter(|(k, p)| k.0 == *set && !p.mapped) {
                 if free < p.bytes {
@@ -224,20 +237,16 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
         });
         room = room.max(coarse);
     }
-    // Unmeasured, it fits only on an idle GPU: it takes every idle byte before it runs (so its
-    // allocations never need the allocator callback to evict): orphans, own S and N, others'
-    // S and N. Never a declared use, never a cut.
+    // Unmeasured, it fits only on an idle GPU: every idle byte is its before it runs, lazily
+    // (lead, 10-22): orphans go and others' S and N are asked for (the allocator callback
+    // cannot reach them); own idle pages stay mapped for the callback to reclaim as the pass
+    // allocates, the kept ones lent to it. Never a declared use, never a cut.
     if !measured {
         let mut idle = Demand::new(t, u64::MAX, Some(req), None, tried);
         idle.gone.clone_from(&d.gone);
         let remote = idle.idle();
         d.out.append(&mut idle.out);
         if remote {
-            return d.out;
-        }
-        // Kept pages it took are free once custody lets go: settled before it runs.
-        if idle.withdrawn > 0 {
-            d.out.push(Action::Settle);
             return d.out;
         }
     }
@@ -265,30 +274,27 @@ fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&O
         None => r.outside.get(&(s.name.clone(), s.shape.clone())).copied().unwrap_or(0),
     };
     // A retry that failed again at the same site and level, its allocation no further than
-    // the last failure there, made no progress: it escalates (a cut, else a park or
-    // exhaustion), never another Retry. Nothing is claimed, evicted or lowered for it.
+    // the last failure there, retries only on progress: bytes freed beyond what is free now
+    // (the driver refused a claim at decided-free: one more page is progress). An answer that
+    // would free nothing more escalates (a cut, else a park or exhaustion), never another Retry
+    // (lead, v6 13592 and e199).
     let at = t.allocated.saturating_add(need.unwrap_or(0));
     let key = site.map_or((String::new(), String::new(), 0), |s| (s.name.clone(), s.shape.clone(), level(s)));
     let again = r.retried.as_ref().is_some_and(|m| (&m.site, &m.shape, m.level) == (&key.0, &key.1, key.2) && at <= m.at);
     // A site at its finest level is not cut or proposed further: the next rung follows.
     let outside = site.filter(|s| set.is_none() && !s.collective && level(s) < s.finest);
     let site = set.zip(site).filter(|(_, s)| level(s) < s.finest);
-    if again {
-        let cuttable = site.filter(|(_, s)| !s.collective && !sites.iter().any(|x| x.name == s.name && x.stuck));
-        return match (cuttable, outside) {
-            (Some((set, s)), _) => vec![Action::Cut { req, set, site: s.name.clone(), failed_at: r.room + r.claimed + t.free() }],
-            (None, Some(s)) => vec![Action::CutOutside { req, site: s.name.clone(), shape: s.shape.clone() }],
-            (None, None) => {
-                let mut d = Demand::new(t, need.unwrap_or(1), Some(req), None, tried);
-                d.park_or_exhaust(r.episode.parked);
-                d.out
-            }
-        };
-    }
     // Unknown: any page's worth is progress.
-    let mut d = Demand::new(t, need.unwrap_or(1), Some(req), None, tried);
+    let n = need.unwrap_or(1);
+    let mut d = Demand::new(t, n, Some(req), None, tried);
     d.oom = true;
-    if r.episode.claimed_free {
+    if again {
+        // The op had its claim and the bytes free when this demand began (its own rounds'
+        // frees aside): it needs more than that, counted with the claim.
+        let before = t.free().saturating_sub(tried.freed);
+        d.need = n.max(r.claimed + before + 1);
+        d.got = t.free() + r.claimed;
+    } else if r.episode.claimed_free {
         d.got = t.free().min(tried.freed);
     }
     let mut out = vec![];
@@ -304,11 +310,12 @@ fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&O
         }
         Some(Done::Enough) => {}
         // The previous allocation claim is still available. Try newly freed bytes before
-        // cutting or lowering, even when this round alone freed less than the full need.
-        Some(Done::Lowered) | None if d.got > 0 => {}
+        // cutting or lowering, even when this round alone freed less than the full need; a
+        // failure again there only when this round frees something.
+        Some(Done::Lowered) | None if d.got > 0 && (!again || d.out.iter().any(frees)) => {}
         Some(Done::Lowered) | None if set.is_none() => match outside {
             Some(s) => d.out.push(Action::CutOutside { req, site: s.name.clone(), shape: s.shape.clone() }),
-            None if d.got == 0 => d.park_or_exhaust(r.episode.parked),
+            None if d.got == 0 || again => d.park_or_exhaust(r.episode.parked),
             None => {}
         },
         Some(Done::Lowered) | None => {
@@ -325,19 +332,27 @@ fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&O
                         out.append(&mut d.out);
                         return out;
                     }
-                    None if d.got == 0 => d.park_or_exhaust(r.episode.parked),
+                    None if d.got == 0 || (again && !d.out.iter().any(frees)) => d.park_or_exhaust(r.episode.parked),
                     _ => {}
                 }
             }
         }
     }
-    if d.got > 0 {
-        // A known need claims what it needs; an unknown one everything gathered.
+    let escalated = d.out.iter().any(|a| matches!(a, Action::Cut { .. } | Action::CutOutside { .. } | Action::Park(_) | Action::Exhausted { .. }));
+    if d.got > 0 && !(again && escalated) {
+        // A known need claims what it needs; an unknown one everything gathered (again: beyond
+        // its claim so far).
         let bytes = if need.is_some() { d.got.min(d.need) } else { d.got };
+        let bytes = if again { bytes.saturating_sub(r.claimed) } else { bytes };
         d.out.push(Action::Claim { req, bytes });
     }
     out.append(&mut d.out);
     out
+}
+
+/// An action that gives bytes back (now, or once a remote rung answers).
+fn frees(a: &Action) -> bool {
+    matches!(a, Action::Unmap { .. } | Action::Shrink { .. } | Action::Trim(_) | Action::ReleaseOrphans(_) | Action::Ask { .. } | Action::Settle)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -598,15 +613,25 @@ impl<'a> Demand<'a> {
         Some(Done::Lowered)
     }
 
-    /// Every idle byte (an unmeasured pass): orphans, own S and N, then asks for others' S and
-    /// N. True when a remote rung is out.
+    /// Every idle byte (an unmeasured pass), lazily: orphans, then asks for others' S and N;
+    /// own S and N stay, the kept ones lent (custody settled after). True when a remote rung is
+    /// out.
     fn idle(&mut self) -> bool {
         if !self.tried.orphans && self.t.orphans > 0 {
             self.out.push(Action::ReleaseOrphans(self.t.orphans));
             return true;
         }
-        self.evict(Class::S);
-        self.evict(Class::N);
+        let mut lent = false;
+        for class in [Class::S, Class::N] {
+            let kept: Vec<Key> = self.own(class).into_iter().map(|(k, _)| k).filter(|k| self.t.page(*k).is_some_and(|p| p.kept)).collect();
+            lent |= !kept.is_empty();
+            self.out.extend(kept.into_iter().map(Action::Lend));
+        }
+        // A lent page is the callback's only once custody has let go of it: settled first.
+        if lent {
+            self.out.push(Action::Settle);
+            return true;
+        }
         self.ask(Class::N)
     }
 
@@ -621,6 +646,32 @@ impl<'a> Demand<'a> {
         let need = self.need.saturating_sub(self.got);
         self.out.push(Action::Exhausted { need });
     }
+}
+
+/// A request's room outside its passes. Unmeasured: every idle byte, lazily (orphans, others'
+/// S and N asked for, own kept S and N lent). Measured: the free bytes and own idle pages the
+/// callback can reclaim (S and N, not kept) cover it, else kept S and N pages are lent, least
+/// recently used first, until they do.
+fn outside(t: &Table, req: u64, room: Option<u64>, tried: &Tried) -> Vec<Action> {
+    let mut d = Demand::new(t, room.unwrap_or(u64::MAX), Some(req), None, tried);
+    let Some(room) = room else {
+        d.idle();
+        return d.out;
+    };
+    let idle: Vec<(Key, u64)> = [Class::S, Class::N].into_iter().flat_map(|c| d.own(c)).collect();
+    let kept = |k: &Key| t.page(*k).is_some_and(|p| p.kept);
+    let mut got = t.free() + idle.iter().filter(|(k, _)| !kept(k)).map(|(_, b)| b).sum::<u64>();
+    for (k, b) in idle.into_iter().filter(|(k, _)| kept(k)) {
+        if got >= room {
+            break;
+        }
+        d.out.push(Action::Lend(k));
+        got += b;
+    }
+    if d.out.iter().any(|a| matches!(a, Action::Lend(_))) {
+        d.out.push(Action::Settle);
+    }
+    d.out
 }
 
 /// The own ask thread's answer, from pages only (the thread runs no caller code): S, then N

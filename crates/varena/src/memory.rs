@@ -365,6 +365,28 @@ pub struct Stats {
     pub keep_pending: u64,
     /// RAM-tier host ranges unlocked while it ran: each unlock stalls the device until idle.
     pub unregisters: Unregisters,
+    /// Every non-trivial decision made for it, in order: lowering, cuts, parks, exhaustion and
+    /// evictions of declared (D) or working (W) pages, each with what asked for it.
+    pub decisions: Vec<Decision>,
+}
+
+/// One decision a request's demand made (lead, v6: the Lower trigger, trace4's hang and the
+/// 4 MP sequence had to be rebuilt from totals).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Decision {
+    /// The request's plan step then.
+    pub step: u32,
+    /// What asked: a pass start, a bind, an OOM, a range's preparation, a workspace.
+    pub trigger: &'static str,
+    /// lower, cut, cut_outside, park, exhausted, evict_d or evict_w.
+    pub action: &'static str,
+    pub site: Option<String>,
+    /// The bytes asked for (exhausted: the bytes short).
+    pub need: u64,
+    /// The bytes this decision's round gave back (evictions: those of its class).
+    pub freed: u64,
+    /// A cut's level after it.
+    pub level: Option<u32>,
 }
 
 /// Host ranges unlocked for the RAM tier (`cuMemHostUnregister`, which synchronizes the device).
@@ -539,6 +561,9 @@ struct Home {
     /// Its Keep's protect and export run now. No work may touch a page while its access
     /// changes (`cuMemSetAccess` under a reading kernel faults it): binds and saves wait.
     protecting: bool,
+    /// Lent to the allocator callback for a request's room (custody let go of it): kept again
+    /// once no request is open, unless the callback reclaimed it.
+    lent: bool,
 }
 
 impl Home {
@@ -809,6 +834,9 @@ struct State {
     /// Tier copies the host had no room for: one is posted again when a measured pass ends,
     /// and the rest once it finds room (first runs and standalone calls reach the tier so).
     deferred_saves: Vec<Save>,
+    /// Each request's allocated peak outside its passes, as it reported it: its dispatch key's
+    /// outside room from its end.
+    aside: HashMap<u64, u64>,
 }
 
 impl State {
@@ -1714,6 +1742,34 @@ impl Inner {
         Ok(())
     }
 
+    /// An idle kept page, lent to the allocator callback for a request's room (an unmeasured
+    /// pass's, or its room outside its passes): custody lets go of its handle (the memory stays
+    /// this process's mapping, so no bytes come back), and the callback may reclaim it.
+    fn lend(&self, st: &mut State, key: Key) {
+        let Some(h) = st.homes.get_mut(&key).filter(|h| h.exported) else { return };
+        h.exported = false;
+        h.lent = true;
+        let fp = h.identity.clone();
+        self.withdraw(fp, key.1, 0);
+        st.restock = true;
+        st.sync(key);
+    }
+
+    /// Once no request is open, the pages lent to the allocator callback that it left are
+    /// kept again: their weights survive whenever they fit.
+    fn rekeep(&self, st: &mut State) {
+        if !st.table.requests.is_empty() {
+            return;
+        }
+        let lent: Vec<Key> = st.homes.iter().filter(|(_, h)| h.lent).map(|(k, _)| *k).collect();
+        for key in lent {
+            if let Some(h) = st.homes.get_mut(&key) {
+                h.lent = false;
+            }
+            self.keep(st, key);
+        }
+    }
+
     /// A layout this process stops using: still held (and page-locked) with no declared use,
     /// for the tier to take back when it needs the room; one never mapped is closed.
     fn park(&self, st: &mut State, digest: String, held: Option<Arc<tier::Held>>) {
@@ -2019,7 +2075,7 @@ impl Inner {
             let gen = st.tick();
             // Pinned (filling) until the mechanism maps it.
             self.mech.post(Mech::Adopt { key, gen, va, off, phys: phys.id, len: phys.len, identity: identity.clone() }, 0);
-            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, stock: None, protecting: false });
+            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, stock: None, protecting: false, lent: false });
             st.sync(key);
             let s = st.fills(req, key, span, Origin::Kept);
             s.moved.kept.bytes += span;
@@ -2044,7 +2100,7 @@ impl Inner {
         let decided = st.table.free();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, stock: None, protecting: false });
+        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, stock: None, protecting: false, lent: false });
         st.sync(key);
         self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, speculative, decided }, 0);
         Ok(true)
@@ -2066,7 +2122,7 @@ impl Inner {
         // Kept, or with a Keep queued: never written again; a fresh page takes its place.
         let phys = if exported || h.keeping { h.phys.take() } else { None };
         let renew = phys.is_some();
-        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, stock: None, protecting: false };
+        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, stock: None, protecting: false, lent: false };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
         let job = Job { key, gen, req, span, after: vec![] };
@@ -2555,9 +2611,17 @@ impl Inner {
             }
             let actions = decide(&st.table, &trigger);
             let (mut remote, mut shrinks, mut freed) = (vec![], vec![], 0);
+            let mut evicted = (0, 0);
             for a in &actions {
-                freed += self.apply(&mut st, a, req, &mut remote, &mut shrinks)?;
+                let bytes = self.apply(&mut st, a, req, &mut remote, &mut shrinks)?;
+                freed += bytes;
+                match a {
+                    Action::Unmap { class: Class::D, .. } => evicted.0 += bytes,
+                    Action::Unmap { class: Class::W, .. } => evicted.1 += bytes,
+                    _ => {}
+                }
             }
+            self.record(&mut st, req, &trigger, &actions, freed, evicted);
             let asked: u64 = remote.iter().map(|a| if let Action::Ask { bytes, .. } = a { *bytes } else { 0 }).sum();
             if remote.is_empty() {
                 st.claims.remove(&id);
@@ -2579,7 +2643,7 @@ impl Inner {
                 return Ok(actions);
             }
             let tried = match &mut trigger {
-                Trigger::Bind { tried, .. } | Trigger::Prepare { tried, .. } | Trigger::Workspace { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } => tried,
+                Trigger::Bind { tried, .. } | Trigger::Prepare { tried, .. } | Trigger::Workspace { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } | Trigger::Outside { tried, .. } => tried,
                 Trigger::Ask { .. } | Trigger::Load { .. } => return Ok(actions),
             };
             tried.freed += freed;
@@ -2607,6 +2671,46 @@ impl Inner {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// The round's non-trivial decisions, into its request's record ([`Stats::decisions`]).
+    fn record(&self, st: &mut State, req: Option<u64>, trigger: &Trigger, actions: &[Action], freed: u64, (d, w): (u64, u64)) {
+        let Some(req) = req else { return };
+        let (kind, asked) = match trigger {
+            Trigger::Pass { room, unmeasured, .. } => ("pass", room.unwrap_or(*unmeasured)),
+            Trigger::Bind { page, .. } => ("bind", st.table.page(*page).map_or(0, |p| p.bytes)),
+            Trigger::Oom { need, .. } => ("oom", need.unwrap_or(0)),
+            Trigger::Prepare { pages, .. } => ("prepare", pages.iter().filter_map(|k| st.table.page(*k)).filter(|p| !p.mapped).map(|p| p.bytes).sum()),
+            Trigger::Workspace { bytes, .. } => ("workspace", *bytes),
+            Trigger::Outside { room, .. } => ("outside", room.unwrap_or(0)),
+            Trigger::Speculate { .. } | Trigger::Ask { .. } | Trigger::Load { .. } => return,
+        };
+        let step = st.table.request(req).map_or(0, |r| r.cursor.step);
+        let level = |st: &State, site: &str, set: u32| st.active.get(&(req, set)).and_then(|a| st.cuts.get(&(set, a.shape.clone()))).and_then(|c| c.get(site).copied());
+        let mut out = vec![];
+        let decision = |action, site: Option<String>, need, freed, level| Decision { step, trigger: kind, action, site, need, freed, level };
+        for a in actions {
+            match a {
+                Action::Lower(_) => out.push(decision("lower", None, asked, freed, None)),
+                Action::Cut { set, site, .. } => out.push(decision("cut", Some(site.clone()), asked, freed, level(st, site, *set))),
+                Action::CutOutside { site, shape, .. } => {
+                    let level = st.table.request(req).and_then(|r| r.outside.get(&(site.clone(), shape.clone())).copied());
+                    out.push(decision("cut_outside", Some(site.clone()), asked, freed, level));
+                }
+                Action::Park(_) => out.push(decision("park", None, asked, freed, None)),
+                Action::Exhausted { need } => out.push(decision("exhausted", None, *need, freed, None)),
+                _ => {}
+            }
+        }
+        if d > 0 {
+            out.push(decision("evict_d", None, asked, d, None));
+        }
+        if w > 0 {
+            out.push(decision("evict_w", None, asked, w, None));
+        }
+        if let Some(s) = st.stats(Some(req)) {
+            s.decisions.extend(out);
         }
     }
 
@@ -2712,6 +2816,7 @@ impl Inner {
                     s.lowered = true;
                 }
             }
+            Action::Lend(page) => self.lend(st, *page),
             Action::Park(_) | Action::Exhausted { .. } => {}
         }
         Ok(0)
@@ -2798,6 +2903,13 @@ impl Inner {
                 self.load_ram(id)?
             }
             Level::Gpu => {
+                // The machine's largest measured outside room stays free.
+                let aside = self.shared.facts("aside/")?.iter().filter_map(|(_, v)| v.as_slice().try_into().ok().map(u64::from_le_bytes)).max().unwrap_or(0);
+                {
+                    let mut st = self.lock();
+                    st.table.aside = aside;
+                    self.unlock(st);
+                }
                 self.demand(Trigger::Load { set: id }, None)?;
                 let mut st = self.lock();
                 while st.table.pages().any(|(k, p)| k.0 == id && p.filling) {
@@ -2919,7 +3031,12 @@ impl Inner {
             None => None,
         };
         st.host.insert(rid, host);
-        st.table.requests.push(Req { id: rid, name: id.to_string(), steps, rooms, ..Req::default() });
+        // Its room outside its passes, as measured for its dispatch key.
+        let aside = match st.peaks.get(&rid) {
+            Some(key) => self.shared.fact(&format!("aside/{key}"))?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes),
+            None => None,
+        };
+        st.table.requests.push(Req { id: rid, name: id.to_string(), steps, rooms, aside, ..Req::default() });
         // Its plan reclassifies pages (N to D): the stock is offered again.
         st.restock = true;
         // A cold request's record carries the fills since the last one ended (its loads).
@@ -2927,7 +3044,20 @@ impl Inner {
         st.stats.insert(rid, Stats { request: id.to_string(), moved: earlier.moved, trace: earlier.trace, ..Stats::default() });
         self.publish(&mut st);
         self.unlock(st);
+        self.prepare_outside(rid)?;
         Ok(rid)
+    }
+
+    /// The request's room outside its passes, made before it allocates there (at its open and
+    /// at each pass end), outside the allocator callback: its kept idle pages lent to the
+    /// callback as the room needs (all of them while it is unmeasured), never evicted for it.
+    fn prepare_outside(&self, req: u64) -> Result<()> {
+        let room = {
+            let st = self.lock();
+            let Some(r) = st.table.request(req) else { return Ok(()) };
+            r.aside
+        };
+        self.demand(Trigger::Outside { req, room, tried: Tried::default() }, Some(req)).map(|_| ())
     }
 
     fn bind(self: &Arc<Self>, set: u32, block: u32, stream: usize) -> Result<Pin> {
@@ -3296,10 +3426,6 @@ impl Inner {
             return Ok(());
         };
         let Some(active) = st.active.remove(&key) else { return Ok(()) };
-        // The pass got through: a retry since went past where it failed.
-        if let Some(r) = st.table.request_mut(req) {
-            r.retried = None;
-        }
         let name = st.mech(active.set)?.spec.name.clone();
         let levels = st.levels(active.set, &active.shape);
         let key = room_key(&name, &active.shape, &levels);
@@ -3344,7 +3470,8 @@ impl Inner {
         }
         self.publish(&mut st);
         self.unlock(st);
-        Ok(())
+        // Between passes the request allocates outside them: its room is made again.
+        self.prepare_outside(req)
     }
 
     fn oom(&self, req: u64, set: Option<u32>, need: Option<u64>, site: Option<Site<'_>>, torch: Torch) -> Result<Next> {
@@ -3444,6 +3571,7 @@ impl Inner {
         st.active.retain(|(r, _), _| *r != req);
         st.synthetic.remove(&req);
         st.table.requests.retain(|r| r.id != req);
+        self.rekeep(&mut st);
         let owned: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name).map(|c| c.id).collect();
         let holding: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name && c.bytes > 0).map(|c| c.id).collect();
         let shrinks: Vec<(u32, u64, Shrink)> = holding.iter().filter_map(|id| st.shrinks.get(id).map(|s| (*id, u64::MAX, s.clone()))).collect();
@@ -3452,7 +3580,11 @@ impl Inner {
         st.host.remove(&req);
         // Its host high-water (the process's since the first open request started).
         stats.host = os::high_water();
+        let aside = st.aside.remove(&req);
         if let Some(key) = st.peaks.remove(&req) {
+            if let Some(bytes) = aside {
+                let _ = self.shared.put(&format!("aside/{key}"), Some(&bytes.to_le_bytes()));
+            }
             let _ = ledger::record_peak(&self.shared, &format!("peak/{key}"), stats.peak);
             let _ = ledger::record_compute(&self.shared, &key, stats.room);
             if let Some(h) = stats.host {
@@ -3483,9 +3615,9 @@ impl Inner {
     /// Preparation only: wait for already-retiring bytes, never for a peer to run package
     /// code or finish a RAM-tier copy. The allocator callback does not execute this action.
     fn settle_returning(&self) -> Result<()> {
-        if self.to_custody.pending() > 0 {
-            self.to_custody.settle();
-        }
+        // Withdraws: of evicted kept pages (their bytes), and of lent ones (their pages the
+        // allocator callback's only once custody let go).
+        self.to_custody.settle();
         // A running tier copy's or protect's page: evictable once it ends.
         let mut st = self.lock();
         while st.table.transient > 0 {
@@ -4019,11 +4151,6 @@ impl Request {
         }
     }
 
-    /// Reclaim for a native allocator callback, without the state lock: only pages the state
-    /// offered (idle N or S, complete, never kept) are claimed from the stock, each unmapped
-    /// and destroyed by this thread with no state lock held; the state reconciles them at its
-    /// next lock. No Python or torch, peer RPC, mechanism queue or wait on device work; broader
-    /// reclaim is preparation's (design §1). Returns the bytes given back.
     /// Bytes the request could have now beside every W and P without evicting either (free,
     /// S, N and D pages, caches, the allocator's slack), as the last publication measured them:
     /// read without the state lock, for a capture's room before it captures (S4).
@@ -4031,6 +4158,11 @@ impl Request {
         self.inner.spare.load(Ordering::Acquire)
     }
 
+    /// Reclaim for a native allocator callback, without the state lock: only pages the state
+    /// offered (idle N or S, complete, never kept) are claimed from the stock, each unmapped
+    /// and destroyed by this thread with no state lock held; the state reconciles them at its
+    /// next lock. No Python or torch, peer RPC, mechanism queue or wait on device work; broader
+    /// reclaim is preparation's (design §1). Returns the bytes given back.
     pub fn reclaim_allocation(&self, need: u64) -> Result<u64> {
         self.inner.check_ownership()?;
         self.inner.reclaim_stock(need)
@@ -4119,6 +4251,18 @@ impl Request {
     }
 
     /// Ends the request, returning its record.
+    /// Torch's allocated peak outside the request's passes (its setup, between passes), less
+    /// what was allocated at its start: recorded at its end as its dispatch key's outside room,
+    /// made before the next such request allocates there.
+    pub fn outside(&self, peak: u64) {
+        let _ = self.inner.guard(|| {
+            let mut st = self.inner.state.lock();
+            let e = st.aside.entry(self.id).or_default();
+            *e = (*e).max(peak);
+            Ok(())
+        });
+    }
+
     pub fn end(mut self) -> Stats {
         self.ended = true;
         let id = self.id;

@@ -1571,12 +1571,12 @@ fn the_allocator_callback_works_while_the_state_is_locked() {
     drop(mem.bind(idle, 0, 0).unwrap());
 }
 
-/// Lead's ruling 1 (S3 review / run 13090, host version): an unmeasured pass on a card full
-/// of an idle kept set takes the idle pages before it runs (preparation, outside the
-/// allocator), so its allocations find the room; in the callback a kept page is never
-/// reclaimable (custody holds its memory).
+/// Lead's rulings (lazy room, the room outside passes; S3's run 13633): a request on a card
+/// full of an idle kept set lends those pages to the allocator callback when it opens (custody
+/// lets go; the pages stay mapped), so its allocations, outside a pass or in one, reclaim only
+/// what they need; the pages it leaves are kept again when it ends.
 #[test]
-fn an_unmeasured_pass_takes_idle_kept_pages_before_it_runs() {
+fn a_request_lends_idle_kept_pages_to_the_callback_and_keeps_the_rest_after() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("unmeasured-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
@@ -1587,15 +1587,19 @@ fn an_unmeasured_pass_takes_idle_kept_pages_before_it_runs() {
     mem.load(stored(dir.path(), &uuid, "kept", 3), Level::Gpu).unwrap();
     let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
     mem.settle();
+    let exports = || events.kept.lock().iter().filter(|c| **c == "export").count();
+    let kept = exports();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
-    // In the callback, kept pages are custody's: nothing to reclaim.
-    assert_eq!(r.reclaim_allocation(REGION_ALIGN).unwrap(), 0, "kept pages are not the callback's");
+    // Its first allocation, before any pass: one page, from the lent ones.
+    assert_eq!(r.reclaim_allocation(REGION_ALIGN).unwrap(), REGION_ALIGN, "a lent page is the callback's");
+    // (A pass start publishes the table.)
     let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
-    mem.settle();
     let n: u64 = ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum();
-    assert_eq!(n, 0, "the idle kept pages went before the unmeasured pass ran");
-    assert!(mem.allocator_limit().unwrap() >= 2 * REGION_ALIGN, "its allocations have the room: {:?}", mem.allocator_limit());
-    drop(pass);
+    assert_eq!(n, 2 * REGION_ALIGN, "the pages not needed stay mapped");
+    pass.end(Measured::default(), Torch::default());
+    r.end();
+    mem.settle();
+    assert_eq!(exports(), kept + 2, "the two left are kept again once no request is open");
 }
 
 /// gpu12's ILLEGAL_ADDRESS: a Keep made a page read-only (`cuMemSetAccess`) while kernels of
@@ -1689,11 +1693,10 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     drop(r);
 }
 
-/// Native an_oom_in_a_pass / a_measured_pass (graph-core runs 519 and e199) on a host card, after
-/// the lead's ruling 1: the card crowded and the rest full of an idle kept set. An unmeasured pass
-/// takes the idle pages before it runs, with custody's handles and its own unmaps gone, so its
-/// activation fits at once; the next run's measured pass makes its room before it runs too.
-/// Neither meets an OOM.
+/// Native an_oom_in_a_pass / a_measured_pass (graph-core runs 519 and e199) on a host card: the
+/// card crowded and the rest full of an idle kept set. Unmeasured, the request lends the idle
+/// pages to the allocator callback (lazy room), which reclaims what the activation needs; the
+/// next run's measured pass makes its room before it runs. Neither meets an OOM.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_pass_on_a_card_full_of_idle_kept_pages_has_its_room_before_it_runs() {
@@ -1715,23 +1718,24 @@ fn a_pass_on_a_card_full_of_idle_kept_pages_has_its_room_before_it_runs() {
         let r = mem.request(name, plan.clone()).unwrap();
         let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
         let pins: Vec<varena::Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
-        assert!(card.take(activation), "{name} (measured: {measured}): the pass made its room before it ran: {} free", card.free());
+        // Torch's allocator: its callback reclaims from the stock when the card is short.
+        let took = card.take(activation) || (r.reclaim_allocation(activation).is_ok() && card.take(activation));
+        assert!(took, "{name} (measured: {measured}): the room is there before the pass runs: {} free", card.free());
         pass.end(Measured { allocated_peak: activation, slack: 0, sites: vec![] }, Torch { allocated: activation, reserved: activation });
         drop(pins);
         card.give(activation);
         let stats = r.end();
         assert_eq!((stats.retries, stats.leftover), (0, 0), "{name}: {stats:?}");
-        assert!(stats.evicted.iter().sum::<u64>() >= activation, "{name}: {stats:?}");
     }
 }
 
-/// Lead's ruling 1, the pass side: the room a pass start makes is free on the device when the
-/// pass runs (torch allocates outside the mechanism's order, and the allocator callback cannot
-/// wait). The idle kept pages an unmeasured pass takes are free once custody lets them go and
-/// their unmaps are done: both are held here, and the pass returns only after them.
+/// Lazy room: a page lent to the allocator callback is its to reclaim only once custody has
+/// let go of it (custody's handle holds the memory, so an unmap would free nothing). A request
+/// lends its idle kept pages when it opens and returns only after custody answers; a reclaim
+/// then frees real bytes.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_pass_returns_only_once_the_room_it_made_is_free() {
+fn a_lent_page_is_the_callbacks_only_once_custody_let_go() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("roomfree-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 * REGION_ALIGN };
@@ -1746,43 +1750,41 @@ fn a_pass_returns_only_once_the_room_it_made_is_free() {
     mem.load(k, Level::Gpu).unwrap();
     mem.settle();
     assert_eq!(log.kept.lock().keys().filter(|(fp, _)| *fp == key).count(), 6, "the idle set is kept");
-    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
-    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
-    // Custody answers nothing, and the next unmap waits.
+    mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
+    // Custody answers nothing until the opener is seen waiting for it.
     gate.close();
-    card.hold_unmap.store(true, Ordering::SeqCst);
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
     std::thread::scope(|t| {
-        let passing = t.spawn(|| {
+        let opening = t.spawn(|| {
             // SAFETY: gettid has no preconditions.
             tid_tx.send(unsafe { libc::gettid() }).unwrap();
-            let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
-            (pass, card.free())
+            mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap()
         });
         let tid = tid_rx.recv().unwrap();
-        // Its decision is out: an unmap is held and custody has a Withdraw.
-        card.unmap_waits.pass();
         log.await_call(|(_, call)| call.contains("Withdraw"));
         let sleeping = || std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).is_ok_and(|s| s.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('S')));
-        while !passing.is_finished() && !sleeping() {
+        while !opening.is_finished() && !sleeping() {
             std::thread::yield_now();
         }
+        let early = opening.is_finished();
         gate.open();
-        card.unmap_gate.open();
-        let (pass, free) = passing.join().unwrap();
-        assert_eq!(free, 8 * REGION_ALIGN, "the pass returned before the room it made was free");
-        drop(pass);
+        let r = opening.join().unwrap();
+        assert!(!early, "the request opened before custody let go of the pages it lent");
+        let before = card.free();
+        let reclaimed = r.reclaim_allocation(2 * REGION_ALIGN).unwrap();
+        assert_eq!((reclaimed, card.free() - before), (2 * REGION_ALIGN, 2 * REGION_ALIGN), "a reclaim of lent pages frees real bytes");
+        drop(r);
     });
 }
 
 /// An OOM in a measured pass on a card full of idle kept pages (native an_oom_in_a_pass): the
 /// pass made only its measured room, the activation outgrew it, and the OOM answers Retry with
 /// the idle pages. The driver refuses that retry too (its slack, as e199's refused a claim of
-/// exactly 1 GiB with 1.19 MiB more reported free): the allocation got no further, so the
-/// second OOM escalates (lead's ruling, v6 13592) and never retries again: here a park.
+/// exactly 1 GiB with 1.19 MiB more reported free); the second OOM frees more than the free
+/// bytes (progress, lead's ruling), and its retry fits.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_a_refused_retry_escalates() {
+fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("oomkept-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 24 * REGION_ALIGN };
@@ -1804,15 +1806,19 @@ fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_a_refused_retry_escalates
     let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
     let pins: Vec<varena::Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
     let activation = 8 * REGION_ALIGN;
-    assert!(!card.take(activation), "the activation outgrew the measured room");
-    let first = r.oom(Some(m), Some(activation), None, Torch::default());
-    assert!(matches!(first, Next::Retry), "idle kept pages answer Retry: {first:?}");
-    assert!(!card.take(activation), "the driver refuses the exact claim (its slack)");
-    let second = r.oom(Some(m), Some(activation), None, Torch::default());
-    assert!(matches!(second, Next::Park(_)), "no progress past the failure: an escalation, never another Retry: {second:?}");
-    drop((pins, pass));
+    let mut answers = vec![];
+    while !card.take(activation) {
+        let next = r.oom(Some(m), Some(activation), None, Torch::default());
+        assert!(matches!(next, Next::Retry), "idle kept pages answer Retry: {answers:?} then {next:?} ({} free)", card.free());
+        answers.push(next);
+        assert!(answers.len() <= 3, "the OOM ladder ends: {answers:?}");
+    }
+    assert!(answers.len() >= 2, "the activation outgrew the measured room, and the driver refused the first retry: {answers:?}");
+    pass.end(Measured { allocated_peak: activation, slack: 0, sites: vec![] }, Torch { allocated: activation, reserved: activation });
+    drop(pins);
+    card.give(activation);
     let stats = r.end();
-    assert!(stats.retries == 1 && stats.leftover == 0, "{stats:?}");
+    assert!(stats.retries >= 2 && stats.leftover == 0, "{stats:?}");
 }
 
 /// The kept-page handoff (native kept_pages_survive_a_holder_that_served, graph-core 577): pages
