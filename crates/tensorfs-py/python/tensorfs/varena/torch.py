@@ -315,6 +315,12 @@ class Binding:
             self.model.memory.native.fill(self.model.id, _fill(self.model.fill))
             return self.native.valid()
 
+    def resident(self) -> bool:
+        """Every block mapped and filled now (an idle capture runs only into what is resident):
+        a read, no pin, no fill."""
+        with self.lock:
+            return not self.closed and self.native.resident()
+
     @contextmanager
     def prepare(self, stream: torch.cuda.Stream | int | None = None) -> Iterator[Binding]:
         with self.lock:
