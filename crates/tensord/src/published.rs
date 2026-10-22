@@ -83,7 +83,9 @@ impl OwnerUv {
 
 impl PackageSdk {
     pub fn resolve(&self, stop: Option<&Stop>) -> io::Result<()> {
-        if self.requirements.is_empty() && let Some(default) = &self.default_sdk { default.resolve(stop)?; }
+        if self.requirements.is_empty() {
+            if let Some(default) = &self.default_sdk { default.resolve(stop)?; }
+        }
         Ok(())
     }
 
