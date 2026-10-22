@@ -48,6 +48,7 @@ struct Counters {
 
 struct Allocation {
     device: i32,
+    context: usize,
     pool: Pool,
     bytes: u64,
     pending: bool,
@@ -93,14 +94,14 @@ pub fn pending(device: i32) -> u64 {
     accounts().counts.iter().filter(|((d, _), _)| *d == device).map(|(_, c)| c.pending).sum()
 }
 
-fn retiring(ptr: usize) -> bool {
+fn retiring(ptr: usize) -> Option<(i32, usize)> {
     let mut all = accounts();
-    let Some(a) = all.pointers.get_mut(&ptr) else { return false };
-    if a.pending { return false; }
+    let a = all.pointers.get_mut(&ptr)?;
+    if a.pending { return None; }
     a.pending = true;
-    let (device, pool, bytes) = (a.device, a.pool, a.bytes);
+    let (device, pool, bytes, context) = (a.device, a.pool, a.bytes, a.context);
     all.counts.entry((device, pool)).or_default().pending += bytes;
-    true
+    Some((device, context))
 }
 
 pub fn fault_message(device: i32) -> Option<String> { accounts().faults.get(&device).cloned() }
@@ -168,6 +169,13 @@ fn segment(size: usize) -> Result<cuda::CUdeviceptr, cuda::CUresult> {
 fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     let _inside = Inside::enter();
     if fault_message(device).is_some() { return std::ptr::null_mut(); }
+    let Ok(driver) = cuda::driver() else { return std::ptr::null_mut() };
+    let mut context = std::ptr::null_mut();
+    // Torch's allocation context belongs to the pointer, not to its eventual freeing thread.
+    if unsafe { (driver.ctx_get_current)(&mut context) } != cuda::SUCCESS || context.is_null() {
+        accounts().faults.entry(device).or_insert_with(|| "allocation has no current CUDA context".into());
+        return std::ptr::null_mut();
+    }
     let began = Instant::now();
     let active = ACTIVE.with(|a| a.borrow().iter().rev().find(|p| p.device == device).cloned());
     let budget = active.as_ref().and_then(|a| WORKSPACES.with(|b| b.borrow().iter().rev().find(|b| b.belongs_to(&a.memory)).cloned()));
@@ -232,7 +240,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     else {
         c.live += size as u64; c.segments += 1;
         if reclaimed_total != 0 { c.resolved += 1; c.resolved_bytes += reclaimed_total; }
-        all.pointers.insert(ptr as usize, Allocation { device, pool, bytes: size as u64, pending: false, _resident: resident });
+        all.pointers.insert(ptr as usize, Allocation { device, context: context as usize, pool, bytes: size as u64, pending: false, _resident: resident });
     }
     ptr as *mut c_void
 }
@@ -278,18 +286,21 @@ fn freer() -> &'static mpsc::Sender<Pending> {
 }
 
 #[no_mangle]
-pub extern "C" fn varena_torch_free(ptr: *mut c_void, _size: usize, _device: c_int, stream: *mut c_void) {
+pub extern "C" fn varena_torch_free(ptr: *mut c_void, _size: usize, device: c_int, stream: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let _inside = Inside::enter();
         // Graph-owned pools must only be freed after graph disposal; never synchronize or
         // record a real completion event into an in-progress capture.
-        if ptr.is_null() || !retiring(ptr as usize) { return; }
+        if ptr.is_null() { return; }
+        let Some((owner_device, context)) = retiring(ptr as usize) else { return };
+        if device != owner_device { quarantine(ptr as usize, "free device differs from allocation owner".into()); return; }
+        let Ok(_ctx) = cuda::CtxGuard::enter(context as cuda::CUcontext) else { quarantine(ptr as usize, "allocation context unavailable during free".into()); return };
         if capturing(stream) { quarantine(ptr as usize, "segment freed during capture or capture state unknown".into()); return; }
         let Ok(d) = cuda::driver() else { quarantine(ptr as usize, "CUDA driver unavailable during free".into()); return };
-        let (mut context, mut event) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let mut event = std::ptr::null_mut();
         // SAFETY: context/stream belong to torch; the newly-created event is ours.
         unsafe {
-            if (d.ctx_get_current)(&mut context) != cuda::SUCCESS || (d.event_create)(&mut event, cuda::EVENT_DEFAULT) != cuda::SUCCESS {
+            if (d.event_create)(&mut event, cuda::EVENT_DEFAULT) != cuda::SUCCESS {
                 quarantine(ptr as usize, "unable to create a retirement event".into()); return;
             }
             if (d.event_record)(event, stream as cuda::CUstream) != cuda::SUCCESS {
@@ -297,7 +308,7 @@ pub extern "C" fn varena_torch_free(ptr: *mut c_void, _size: usize, _device: c_i
                 quarantine(ptr as usize, "unable to record segment completion".into()); return;
             }
         }
-        if freer().send(Pending { ptr: ptr as usize, event: event as usize, context: context as usize }).is_err() {
+        if freer().send(Pending { ptr: ptr as usize, event: event as usize, context }).is_err() {
             quarantine(ptr as usize, "native retirement worker stopped".into());
         }
     }));
@@ -308,7 +319,7 @@ mod tests {
     use super::*;
 
     fn allocation(pool: Pool, bytes: u64, pending: bool) -> Allocation {
-        Allocation { device: 0, pool, bytes, pending, _resident: None }
+        Allocation { device: 0, context: 1, pool, bytes, pending, _resident: None }
     }
 
     #[test]
