@@ -600,6 +600,7 @@ fn a_request_records_its_host_high_water() {
     ledger.dispatch("first", "pkg", "1x1").unwrap();
     let r = mem.request("first", Plan { steps: vec![] }).unwrap();
     assert_eq!(ledger.host_need(), None, "a running request with no host peak");
+    assert_eq!(varena::tier::need(&[&ledger])(), None, "TensorD's sum over its GPUs");
     let held: Vec<u8> = vec![1; (64 * MB) as usize];
     let stats = r.end();
     assert!(stats.host.is_some_and(|h| h >= 64 * MB), "{:?}", stats.host);

@@ -1224,6 +1224,11 @@ impl Ledger {
         Ok(decide::place(&rooms, &bytes))
     }
 
+    /// Its table, for a need source that outlives the borrow ([`crate::tier::need`]).
+    pub(crate) fn table(&self) -> Arc<Shared> {
+        self.shared.clone()
+    }
+
     /// What the host must keep free for the requests running on this GPU (`None`: one is
     /// unmeasured): TensorD's RAM tier sums its GPUs' ([`crate::Tier::serve`]).
     pub fn host_need(&self) -> Option<u64> {
