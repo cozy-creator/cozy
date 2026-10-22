@@ -406,6 +406,13 @@ async fn idle(ctx: &Context, calcifer: &Client) -> Result<(), Error> {
     }
 }
 
+/// Refuses a binary replacement that would strand a stopped machine's selected SDK. This
+/// checks local files and the actual root lock without starting Calcifer or the machine.
+pub(crate) fn preflight_update(ctx: &Context, version: &str) -> Result<(), Error> {
+    let root = machine_root(ctx)?;
+    super::cohort::stopped_selection(version, &root, free(&root))
+}
+
 /// What this computer's machine did with the binary `cozy update` installed (design §5).
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
