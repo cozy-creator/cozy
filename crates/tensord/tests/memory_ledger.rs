@@ -582,9 +582,9 @@ fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
     assert_eq!(homes(), [0], "and the same placement answers the same");
 }
 
-/// The RAM tier's need (varena's, over TensorD's GPUs): a call running unmeasured on the host
-/// makes it None (the tier fills nothing beside it); once its package and shape were measured,
-/// the same call's need is known.
+/// The RAM tier's need is varena's over TensorD's GPUs: a call running unmeasured is an
+/// unmeasured call (the tier fills nothing beside it); once its package and shape were measured,
+/// the same call carries its anonymous peak.
 #[test]
 fn an_unmeasured_running_call_lets_the_tier_fill_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -594,15 +594,16 @@ fn an_unmeasured_running_call_lets_the_tier_fill_nothing() {
     let need = varena::tier::need(&[&gpu.ledger]);
     let engine = Engine::open(&dir.path().join("engine")).unwrap();
     let mut a = StandIn::spawn(&gpu, &id, "gpu");
-    assert_eq!(need(), Some(0), "nothing runs");
+    assert_eq!(need(), Some(vec![]), "nothing runs");
     for (key, measured) in [("first", false), ("again", true)] {
         let call = engine.submit(key, Invocation::default()).unwrap().id;
         assert!(memory::admit(&engine, &[&gpu.ledger], &call, PACKAGE, BIG, None).unwrap());
         assert_eq!(a.ask(&format!("run {call} {BIG}")), "passing");
-        assert_eq!(need().is_some(), measured, "{key}: {:?}", need());
+        let calls = need().unwrap();
+        assert!(calls.len() == 1 && calls[0].peak.is_some() == measured, "{key}: {calls:?}");
         assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
         gpu.ledger.undispatch(&call);
-        assert_eq!(need(), Some(0), "{key} ended");
+        assert_eq!(need(), Some(vec![]), "{key} ended");
         assert!(gpu.ledger.peaks().iter().any(|peak| matches!(peak, Peak::Host { key, .. } if *key == format!("{PACKAGE}|{BIG}"))));
     }
 }

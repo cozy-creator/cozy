@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use varena::{ledger::Mode, GpuId, Ledger, Need, Peak, Pressure, Tier};
+use varena::{ledger::Mode, GpuId, Ledger, Need, Peak, Tier};
 
 /// Past this the memory log rotates to `memory.log.1`, so it holds at most twice this.
 const ROTATE_BYTES: u64 = 4 << 20;
@@ -228,10 +228,9 @@ pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::
 /// source at all, only at its headroom check at every host decision (a memory-log note says
 /// so). None when another participant serves it.
 pub fn serve_tier(mode: HostMode, need: Need, log: &MemoryLog) -> Option<Arc<Tier>> {
-    let pressure = host_pressure::Pressure::arm(mode).map(Pressure::Host).unwrap_or_else(|error| {
-        log.note(serde_json::json!({"event": "tier_headroom_only", "mode": format!("{mode:?}"), "why": error.to_string()}));
-        Pressure::Headroom
-    });
+    let pressure = host_pressure::Pressure::arm(mode)
+        .inspect_err(|error| log.note(serde_json::json!({"event": "tier_headroom_only", "mode": format!("{mode:?}"), "why": error.to_string()})))
+        .ok();
     match Tier::serve(pressure, need) {
         Ok(tier) => tier.map(Arc::new),
         Err(error) => {

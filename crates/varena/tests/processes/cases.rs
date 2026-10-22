@@ -18,17 +18,28 @@ use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Leve
 const MB: u64 = 1 << 20;
 
 /// A tier's need source with no call to keep growth free for.
+#[cfg(target_os = "linux")]
 fn nothing() -> varena::Need {
-    Arc::new(|| Some(0))
+    Arc::new(|| Some(vec![]))
 }
 
-/// A tier's need source the case sets: what running calls keep free (`SHORT`: more than the
-/// host has, so a pressure event gives back).
+/// A tier's need source the case sets: one measured call keeping `keep` free (`SHORT`: more than
+/// the host has, so a pressure event gives back).
+#[cfg(target_os = "linux")]
 fn need(keep: &Arc<std::sync::atomic::AtomicU64>) -> varena::Need {
     let keep = keep.clone();
-    Arc::new(move || Some(keep.load(std::sync::atomic::Ordering::SeqCst)))
+    Arc::new(move || Some(vec![varena::HostCall { pid: 0, peak: Some(keep.load(std::sync::atomic::Ordering::SeqCst)), anon: 0, running: 1 }]))
 }
 
+/// This case's tier on the host's pressure watcher (the one TensorD arms): a nudge is a pressure
+/// event.
+#[cfg(target_os = "linux")]
+fn watched(need: varena::Need) -> varena::Tier {
+    let pressure = platform::contain::host_pressure::Pressure::arm(platform::contain::host_pressure::HostMode::Shared).unwrap();
+    varena::Tier::serve(Some(pressure), need).unwrap().expect("this namespace's tier")
+}
+
+#[cfg(target_os = "linux")]
 const SHORT: u64 = u64::MAX / 2;
 
 /// The tables the running case made: removed when it ends, passed or failed.
@@ -96,6 +107,7 @@ pub fn main() {
         std::io::stdout().flush().unwrap();
         let outcome = std::panic::catch_unwind(|| case(&path));
         TABLES.lock().drain(..).for_each(|t| varena::os::remove_table(&t));
+        varena::tier::remove_claims();
         match outcome {
             Ok(()) => println!("ok"),
             Err(_) => {
@@ -709,14 +721,10 @@ fn exhausted_carries_stats(dir: &Path) {
 /// On injected pressure the tier gives back orphaned layouts first, then unused, then the
 /// furthest declared.
 fn the_tier_gives_back_in_order(dir: &Path) {
-    use std::os::fd::FromRawFd;
     let g = gpu("tier", 64 * MB);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
-    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
-    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
-    let signal = event.try_clone().unwrap();
     let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tier = varena::Tier::serve(varena::Pressure::Events(event), need(&keep)).unwrap().expect("another process serves this user's RAM tier");
+    let tier = watched(need(&keep));
     let paths: Vec<PathBuf> = ["l1", "l2", "l3", "l4"].iter().map(|n| write_set(dir, n, 1)).collect();
     let digest = |n: &str| format!("layout-{n}-{}", g.uuid);
     // l1: loaded by a process that ended (orphaned).
@@ -740,8 +748,7 @@ fn the_tier_gives_back_in_order(dir: &Path) {
     // a rung its users must answer ending its turn.
     keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
     for n in 1..=4 {
-        // SAFETY: an 8-byte write to our eventfd.
-        unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
+        tier.nudge();
         tier.await_releases(n);
         let held: Vec<String> = tier.held().into_iter().filter(|d| d.ends_with(&g.uuid)).collect();
         assert!(order.ends_with(&held) && held.len() as u64 <= 4 - n, "in order after {n} rungs: {held:?}");
@@ -797,7 +804,7 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     let g = gpu("stop", 10 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     // TensorD serves the tier too: a stopped executor must not be the one serving it.
-    let _tier = varena::Tier::serve(varena::Pressure::Headroom, nothing()).unwrap();
+    let _tier = varena::Tier::serve(None, nothing()).unwrap();
     let (a_path, b_path) = (write_set(dir, "va", 4), write_set(dir, "vb", 2));
     let mut a = Agent::granted(ledger.grant(std::process::id()).unwrap());
     a.ok(&format!("grant {} {}", g.uuid, g.memory));
@@ -921,14 +928,10 @@ fn a_stale_reader_never_frees_a_newer_row(dir: &Path) {
 /// back from it first (it unpins and unmaps it), then punched out: its bytes really return
 /// before the next layout is touched. The executor goes on from the store.
 fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
-    use std::os::fd::FromRawFd;
     let g = gpu("pinned", 64 * MB);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
-    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
-    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
-    let signal = event.try_clone().unwrap();
     let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tier = varena::Tier::serve(varena::Pressure::Events(event), need(&keep)).unwrap().expect("this namespace's tier");
+    let tier = watched(need(&keep));
     let (p1, p2) = (write_set(dir, "p1", 2), write_set(dir, "p2", 2));
     let digest = |n: &str| format!("layout-{n}-{}", g.uuid);
     let mut y = Agent::spawn();
@@ -943,8 +946,7 @@ fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
     // Each layout's file: its ready words' page and its two regions.
     assert!(resident(&digest("p1")) >= 4 * MB && resident(&digest("p2")) >= 4 * MB);
     keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
-    // SAFETY: an 8-byte write to our eventfd.
-    unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
+    tier.nudge();
     tier.await_releases(1);
     // Its regions return; its ready words' page stays with the layout's file (S2's native loop
     // waited for 0 bytes, which never come: it hung after the release, not in it).
@@ -965,14 +967,10 @@ fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
 /// ends). Unloading a set and changing its fill identity park its layout locked; loading it
 /// again reuses it, locked; the tier's ask unlocks it, one call per run.
 fn a_layout_stays_locked_until_the_tier_takes_it_back(dir: &Path) {
-    use std::os::fd::FromRawFd;
     let g = gpu("parked", 64 * MB);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
-    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
-    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
-    let signal = event.try_clone().unwrap();
     let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tier = varena::Tier::serve(varena::Pressure::Events(event), need(&keep)).unwrap().expect("this namespace's tier");
+    let tier = watched(need(&keep));
     let (q1, q2) = (write_set(dir, "q1", 2), write_set(dir, "q2", 2));
     let mut y = Agent::spawn();
     y.ok(&format!("openrec {} {}", g.uuid, g.memory));
@@ -988,8 +986,7 @@ fn a_layout_stays_locked_until_the_tier_takes_it_back(dir: &Path) {
     assert_eq!(y.ok("exact q1 1"), "true");
     assert_eq!((y.ok("unregisters").as_str(), y.ok("registered").as_str()), ("0", "2"), "loaded again, its parked layout serves, still locked");
     keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
-    // SAFETY: an 8-byte write to our eventfd.
-    unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
+    tier.nudge();
     tier.await_releases(1);
     assert_eq!(y.ok("unregisters"), "1", "the tier's ask unlocks one layout's run in one call");
     y.exit();
@@ -1000,13 +997,10 @@ fn a_layout_stays_locked_until_the_tier_takes_it_back(dir: &Path) {
 /// measured pass ends with the host's room back, it runs, so a first run's (or a standalone
 /// call's) weights reach the tier.
 fn a_refused_tier_copy_runs_after_a_measured_pass(dir: &Path) {
-    use std::os::fd::FromRawFd;
     let g = gpu("deferred", 64 * MB);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
-    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
-    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
     let keep = Arc::new(std::sync::atomic::AtomicU64::new(SHORT));
-    let tier = varena::Tier::serve(varena::Pressure::Events(event), need(&keep)).unwrap().expect("this namespace's tier");
+    let tier = watched(need(&keep));
     let path = write_set(dir, "d1", 2);
     let digest = format!("layout-d1-{}", g.uuid);
     let resident = || tier.resident().into_iter().find(|(k, _)| *k == digest).map_or(0, |(_, b)| b);
@@ -1107,18 +1101,11 @@ fn a_child_runs_while_its_parent_yields(dir: &Path) {
 /// marked in the asked row, so TensorD sees the stopped user stalled, and under pressure with
 /// nothing else to give the tier says the host is short meanwhile.
 fn the_tier_waits_on_no_executor_and_a_pending_release_settles_first(dir: &Path) {
-    use std::os::fd::FromRawFd;
     let g = gpu("short", 64 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
-    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
-    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
-    let signal = event.try_clone().unwrap();
-    let pressure = || {
-        // SAFETY: an 8-byte write to our eventfd.
-        unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
-    };
     let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tier = varena::Tier::serve(varena::Pressure::Events(event), need(&keep)).unwrap().expect("this namespace's tier");
+    let tier = watched(need(&keep));
+    let pressure = || tier.nudge();
     let (s1, s2) = (write_set(dir, "s1", 2), write_set(dir, "s2", 2));
     let digest = |n: &str| format!("layout-{n}-{}", g.uuid);
     let mut y = Agent::spawn();
@@ -1256,14 +1243,10 @@ fn a_standalone_process_wakes_tensord(_dir: &Path) {
 /// Round 2, finding 8: after the tier took a layout back, the set opens it again at its next
 /// pass start, and its filled pages go to it again.
 fn the_tier_comes_back_after_a_release(dir: &Path) {
-    use std::os::fd::FromRawFd;
     let g = gpu("back", 64 * MB);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
-    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
-    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
-    let signal = event.try_clone().unwrap();
     let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tier = varena::Tier::serve(varena::Pressure::Events(event), need(&keep)).unwrap().expect("this namespace's tier");
+    let tier = watched(need(&keep));
     let path = write_set(dir, "tb", 2);
     let digest = format!("layout-tb-{}", g.uuid);
     let mut y = Agent::spawn();
@@ -1271,8 +1254,7 @@ fn the_tier_comes_back_after_a_release(dir: &Path) {
     y.ok(&format!("load tb {} stored ram", path.display()));
     assert_eq!(y.ok("exact tb 0"), "true");
     keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
-    // SAFETY: an 8-byte write to our eventfd.
-    unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
+    tier.nudge();
     tier.await_releases(1);
     assert!(!tier.held().contains(&digest));
     keep.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -1293,7 +1275,7 @@ fn the_tier_comes_back_after_a_release(dir: &Path) {
 fn a_reload_fills_from_the_tier(dir: &Path) {
     let g = gpu("reload", 64 * MB);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let tier = varena::Tier::serve(varena::Pressure::Headroom, nothing()).unwrap().expect("this namespace's tier");
+    let tier = varena::Tier::serve(None, nothing()).unwrap().expect("this namespace's tier");
     let path = write_set(dir, "rl", 2);
     let mut a = Agent::spawn();
     a.ok(&format!("open {} {}", g.uuid, g.memory));
@@ -1315,7 +1297,7 @@ fn a_reload_fills_from_the_tier(dir: &Path) {
 fn held_layouts_outlive_a_tier_restart(dir: &Path) {
     let g = gpu("tierback", 64 * MB);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let first = varena::Tier::serve(varena::Pressure::Headroom, nothing()).unwrap().expect("this namespace's tier");
+    let first = varena::Tier::serve(None, nothing()).unwrap().expect("this namespace's tier");
     let (p, q) = (write_set(dir, "hp", 2), write_set(dir, "hq", 1));
     let digest = format!("layout-hp-{}", g.uuid);
     let mut c = Agent::spawn();
@@ -1323,7 +1305,7 @@ fn held_layouts_outlive_a_tier_restart(dir: &Path) {
     c.ok(&format!("load hp {} undeclared ram", p.display()));
     // The tier's server restarts.
     drop(first);
-    let second = varena::Tier::serve(varena::Pressure::Headroom, nothing()).unwrap().expect("the tier again");
+    let second = varena::Tier::serve(None, nothing()).unwrap().expect("the tier again");
     // c's next tier call finds the new tier, and hands it what it holds.
     c.ok(&format!("load hq {} undeclared ram", q.display()));
     second.await_uses(|u| u.iter().any(|(d, _)| *d == digest));

@@ -215,21 +215,6 @@ pub(crate) fn call<T: serde::Serialize, R: serde::de::DeserializeOwned>(stream: 
     Ok((decode(&bytes)?, handle))
 }
 
-/// This process's resident high-water (`None`: unmeasured here).
-pub(crate) fn high_water() -> Option<u64> {
-    platform::memory::high_water()
-}
-
-/// Starts this process's high-water over from its use now.
-pub(crate) fn reset_high_water() {
-    platform::memory::reset_high_water()
-}
-
-/// `pid`'s anonymous bytes now.
-pub(crate) fn anon(pid: u32) -> Option<u64> {
-    platform::memory::anon(pid)
-}
-
 /// `f` is closing: the locks it holds go with it (on macOS, lock files held for it).
 pub(crate) fn closing(f: &Owned) {
     platform::memory::closing(f)

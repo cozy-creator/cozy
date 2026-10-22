@@ -37,11 +37,12 @@ fn a_tier_copy_goes_only_into_measured_surplus() {
     assert!(varena::os::namespace(&format!("host{}-", std::process::id())));
     let dir = tempfile::tempdir().unwrap();
     let keep = Arc::new(Mutex::new(None::<u64>));
+    // One running call, measured to keep `keep` free (`None`: unmeasured).
     let need: varena::Need = Arc::new({
         let keep = keep.clone();
-        move || *keep.lock()
+        move || Some(vec![varena::HostCall { pid: 0, peak: *keep.lock(), anon: 0, running: 1 }])
     });
-    let _tier = varena::Tier::serve(varena::Pressure::Headroom, need).unwrap().expect("this binary's tier");
+    let _tier = varena::Tier::serve(None, need).unwrap().expect("this binary's tier");
     let g = GpuId { uuid: format!("h{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
     let ledger = varena::Ledger::create(&g, None).unwrap();
     let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
@@ -58,4 +59,5 @@ fn a_tier_copy_goes_only_into_measured_surplus() {
     assert_eq!(saved("room"), 3 * REGION_ALIGN, "measured surplus: its page and the deferred two");
     drop((mem, ledger));
     varena::os::remove_table(&g.uuid);
+    varena::tier::remove_claims();
 }
