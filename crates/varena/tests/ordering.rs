@@ -42,6 +42,7 @@ struct Events {
     /// The next event record fails (a driver error), and the streams synchronized instead.
     fail_record: AtomicBool,
     fail_finish: AtomicBool,
+    fail_unmap: AtomicBool,
     syncs: Mutex<Vec<usize>>,
     /// Another process's bytes on the device, and bytes that land there at the next create
     /// (between a decision and its page).
@@ -195,6 +196,9 @@ impl Backend for Stream {
         self.host.protect(va, offset, len, access)
     }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> {
+        if self.events.fail_unmap.swap(false, Ordering::SeqCst) {
+            return Err(varena::Error::Device { op: "unmap", code: 999, name: "mapping release unknown".into() });
+        }
         if self.events.hold_unmap.swap(false, Ordering::SeqCst) {
             self.events.unmap_waits.open();
             self.events.unmap_gate.pass();
@@ -1331,10 +1335,12 @@ fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
 
 #[test]
 fn failed_renewal_completion_keeps_the_old_mapping_alive() {
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--ignored", "--exact", "failed_renewal_child", "--nocapture"])
-        .output().unwrap();
-    assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    for mode in ["finish", "unmap"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "failed_renewal_child", "--nocapture"])
+            .env("VARENA_TEST_RENEWAL_FAILURE", mode).output().unwrap();
+        assert!(output.status.success(), "{mode}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
 }
 
 #[test]
@@ -1362,11 +1368,16 @@ fn failed_renewal_child() {
     let pending = events.next.load(Ordering::Relaxed);
     spec.fingerprint.fill = Fill::Declared("lora-b".into());
     mem.load(spec, Level::Ram).unwrap();
-    events.fail_finish.store(true, Ordering::SeqCst);
-    assert!(matches!(mem.bind(id, 0, 2), Err(varena::Error::Ownership(_))), "failed completion must poison preparation");
+    let finish = std::env::var("VARENA_TEST_RENEWAL_FAILURE").unwrap() == "finish";
+    if finish { events.fail_finish.store(true, Ordering::SeqCst); }
+    else {
+        events.fail_unmap.store(true, Ordering::SeqCst);
+        events.complete(pending);
+    }
+    assert!(matches!(mem.bind(id, 0, 2), Err(varena::Error::Ownership(_))), "failed release must poison preparation");
     drop(mem);
     assert_eq!(events.unmaps.load(Ordering::SeqCst), 0, "an uncertain consumer's mapping survives all public owners");
-    assert!(!events.retired.lock().contains(&pending), "uncertain event stays owned");
+    if finish { assert!(!events.retired.lock().contains(&pending), "uncertain event stays owned"); }
     // SAFETY: the fault path must retain the original mapping through executor exit.
     assert_eq!(unsafe { *(ptr as *const u8) }, 7);
 }
