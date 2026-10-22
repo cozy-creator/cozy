@@ -129,6 +129,9 @@ pub struct Driver {
     pub primary_ctx_release: F<CUdevice>,
     pub mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult,
     pub stream_create: unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult,
+    pub stream_create_with_priority:
+        unsafe extern "C" fn(*mut CUstream, c_uint, c_int) -> CUresult,
+    pub ctx_get_stream_priority_range: unsafe extern "C" fn(*mut c_int, *mut c_int) -> CUresult,
     pub stream_destroy: F<CUstream>,
     pub stream_synchronize: F<CUstream>,
     pub stream_wait_event: unsafe extern "C" fn(CUstream, CUevent, c_uint) -> CUresult,
@@ -258,6 +261,8 @@ impl Driver {
             primary_ctx_release: load!(lib, b"cuDevicePrimaryCtxRelease_v2"),
             mem_get_info: load!(lib, b"cuMemGetInfo_v2"),
             stream_create: load!(lib, b"cuStreamCreate"),
+            stream_create_with_priority: load!(lib, b"cuStreamCreateWithPriority"),
+            ctx_get_stream_priority_range: load!(lib, b"cuCtxGetStreamPriorityRange"),
             stream_destroy: load!(lib, b"cuStreamDestroy_v2"),
             stream_synchronize: load!(lib, b"cuStreamSynchronize"),
             stream_wait_event: load!(lib, b"cuStreamWaitEvent"),
