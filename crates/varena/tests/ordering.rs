@@ -46,6 +46,9 @@ struct Events {
     /// (between a decision and its page).
     foreign: AtomicU64,
     lands: AtomicU64,
+    /// Driver allocation can fail despite its reported free bytes (for example metadata room).
+    hidden_ooms: AtomicU64,
+    creates: AtomicU64,
     /// The process's own bytes cannot be measured (WDDM); open measured this context.
     unmeasured: AtomicU64,
     /// The next unmap waits (as a card's does on queued work) until the gate opens.
@@ -166,6 +169,10 @@ impl Backend for Stream {
         self.host.release(va)
     }
     fn create(&self, len: u64) -> Result<Physical> {
+        self.events.creates.fetch_add(1, Ordering::SeqCst);
+        if self.events.hidden_ooms.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+            return Err(varena::Error::Device { op: "create", code: varena::backend::OUT_OF_MEMORY, name: "allocation needs room beyond reported free bytes".into() });
+        }
         let landed = self.events.lands.swap(0, Ordering::SeqCst);
         let foreign = self.events.foreign.fetch_add(landed, Ordering::SeqCst) + landed;
         if self.host.free()? < len + foreign {
@@ -615,6 +622,33 @@ fn a_release_without_an_event_synchronizes_its_stream() {
     events.fail_record.store(true, Ordering::SeqCst);
     drop(pin);
     assert_eq!(*events.syncs.lock(), vec![7]);
+}
+
+/// A driver-reported OOM is stronger evidence than an unchanged free-byte estimate. There
+/// may still be completed idle pages to reclaim; exhausting without trying them strands room.
+#[test]
+fn an_allocation_shortfall_reclaims_even_when_reported_free_bytes_are_unchanged() {
+    for failures in [1, 64] {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = format!("hidden-oom-{failures}-{}", std::process::id());
+        let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
+        let _scope = Scope::new(&uuid);
+        let events = Arc::new(Events::default());
+        let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
+        mem.load(stored(dir.path(), &uuid, "idle", 1), Level::Gpu).unwrap();
+        mem.settle();
+        let target = mem.load(set(dir.path(), &uuid), Level::Ram).unwrap();
+        events.hidden_ooms.store(failures, Ordering::SeqCst);
+        let creates = events.creates.load(Ordering::SeqCst);
+        let result = mem.bind(target, 0, 0);
+        if failures == 1 {
+            assert!(result.is_ok(), "a completed idle page should rescue this allocation");
+        } else {
+            assert!(matches!(result, Err(varena::Error::Exhausted(_))), "no-progress retries must end");
+        }
+        assert!(events.unmaps.load(Ordering::SeqCst) > 0, "the idle page was actually reclaimed");
+        assert!(events.creates.load(Ordering::SeqCst) - creates <= 2, "one failed attempt and one retry after real reclaim");
+    }
 }
 
 /// Python review 1, item 2: a page's create that finds the device fuller than the table (a
