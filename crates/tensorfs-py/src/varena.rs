@@ -655,7 +655,7 @@ impl PyRequest {
     fn oom(&self, py: Python<'_>, set: Option<u32>, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool, finest: u32, shape: &str) -> PyResult<PyNext> {
         let r = self.get(py)?;
         let site = site.map(|name| Site { name, collective, finest, shape });
-        Ok(match detached(py, &self.gpu, || Ok(r.oom(set.map(SetId), need, site, Torch { allocated, reserved })))? {
+        Ok(match detached(py, &self.gpu, || { let next = r.oom(set.map(SetId), need, site, Torch { allocated, reserved }); r.check()?; Ok(next) })? {
             Next::Retry => PyNext::Retry(),
             Next::Cut(level) => PyNext::Cut { level },
             Next::Park(budget) => PyNext::Park { budget },

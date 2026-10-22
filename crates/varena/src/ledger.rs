@@ -320,6 +320,12 @@ impl Shared {
         Ok(slot.clone())
     }
 
+    /// A callback may inspect the fixed header through an existing map, never wait or remap.
+    pub(crate) fn try_capacity(&self) -> Option<u64> {
+        let map = self.map.try_read()?;
+        Some(header(&map).capacity.load(Acquire))
+    }
+
     /// TensorD's: the capacity is exactly this (a lifted limit raises it).
     fn set_capacity(&self, capacity: u64) -> Result<()> {
         let m = self.map()?;
@@ -816,6 +822,16 @@ impl Row {
         if r.word.load(Acquire) == self.word {
             latch_write(&r.seq, &r.latch, &facts.words());
         }
+    }
+
+    /// Native allocator publication: no remap, heap lock or latch wait.
+    pub(crate) fn try_publish(&self, facts: &Facts) -> bool {
+        let Some(map) = self.shared.map.try_read() else { return false };
+        let Some(r) = row(&map, self.at) else { return false };
+        let Some(_one) = self.latch.try_lock() else { return false };
+        if r.word.load(Acquire) != self.word { return false; }
+        latch_write(&r.seq, &r.latch, &facts.words());
+        true
     }
 
     /// The custody service's orphans; a change is a ledger event.

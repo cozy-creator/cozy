@@ -148,25 +148,47 @@ impl Workspace {
     pub fn remaining(&self) -> u64 { self.remaining.load(Ordering::Acquire) }
     pub fn belongs_to(&self, memory: &Memory) -> bool { Arc::ptr_eq(&self.inner, &memory.inner) }
 
-    /// Nonblocking conversion while inside torch's allocator lock.
-    pub fn take(&self, bytes: u64) -> bool {
-        let Some(mut st) = self.inner.state.try_lock() else { return false };
+    /// A provisional segment credit. Dropping it after a failed allocation restores both
+    /// promise and accounting at one state boundary; successful allocation commits it.
+    pub fn take(&self, bytes: u64) -> Option<AllocationCredit> {
+        self.inner.check_ownership().ok()?;
+        let mut st = self.inner.state.try_lock()?;
+        self.inner.local_accounting(&mut st);
         let left = self.remaining();
-        if bytes > left { return false; }
+        if bytes > left { return None; }
         self.remaining.store(left - bytes, Ordering::Release);
         st.promises();
         st.table.reserved = st.table.reserved.saturating_add(bytes);
-        self.inner.publish(&st);
-        true
+        self.inner.try_publish(&st);
+        Some(AllocationCredit { inner: self.inner.clone(), id: self.id, bytes, epoch: st.measure_epoch, committed: false })
     }
+}
 
-    /// Failed driver allocation: restore the promise atomically, without taking a lock.
-    pub fn refund(&self, bytes: u64) { self.remaining.fetch_add(bytes, Ordering::AcqRel); }
+pub struct AllocationCredit {
+    inner: Arc<Inner>,
+    id: u64,
+    bytes: u64,
+    epoch: u64,
+    committed: bool,
+}
+
+impl AllocationCredit {
+    pub fn commit(mut self) { self.committed = true; }
+}
+
+impl Drop for AllocationCredit {
+    fn drop(&mut self) {
+        if !self.committed {
+            // No state-lock wait, and no two-atomic partial refund. A concurrent observer sees
+            // the original credit until the next state boundary applies this transaction.
+            let _ = self.inner.refund_tx.send((self.id, self.bytes, self.epoch));
+        }
+    }
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        let mut st = self.inner.state.lock();
+        let mut st = self.inner.lock();
         st.budgets.remove(&self.id);
         st.promises();
         self.inner.publish(&st);
@@ -559,6 +581,7 @@ struct Wanted {
 struct State {
     table: Table,
     budgets: HashMap<u64, Arc<AtomicU64>>,
+    measure_epoch: u64,
     sets: Vec<Option<SetMech>>,
     homes: HashMap<Key, Home>,
     /// Pin → (page, request).
@@ -764,6 +787,8 @@ struct Inner {
     mech: Arc<Outbox<Mech>>,
     release_tx: Sender<Release>,
     releases: Receiver<Release>,
+    refund_tx: Sender<(u64, u64, u64)>,
+    refunds: Receiver<(u64, u64, u64)>,
     /// Fill jobs; the fill threads hold the receiving ends and a weak reference to the rest,
     /// so dropping the Memory ends them. The trim thread's work likewise.
     jobs: Jobs,
@@ -772,6 +797,7 @@ struct Inner {
     saves: Arc<Outbox<Save>>,
     wanted: Arc<(Mutex<Wanted>, Condvar)>,
     stop: Arc<AtomicBool>,
+    ownership_lost: AtomicBool,
     #[cfg(unix)]
     tally: tensorfs::io::source::IoTally,
 }
@@ -809,6 +835,7 @@ impl Memory {
             let tier = tier::Client::open(shared.ns, need).map_err(|e| tracing::warn!("varena: no RAM tier: {e}")).ok().map(Arc::new);
             let (to_custody, to_tier, mech) = (Arc::new(Outbox::default()), Arc::new(Outbox::default()), Arc::new(Outbox::default()));
             let (release_tx, releases) = unbounded();
+            let (refund_tx, refunds) = unbounded();
             let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
             let holder = custody.as_ref().map_or(0, |c| c.holder());
             let tier_holder = tier.as_ref().map_or(0, |t| t.holder());
@@ -829,11 +856,14 @@ impl Memory {
                 mech,
                 release_tx,
                 releases,
+                refund_tx,
+                refunds,
                 jobs: Jobs { demand, ahead },
                 burst: Arc::new((Mutex::new(Burst::default()), Condvar::new())),
                 saves: Arc::new(Outbox::default()),
                 wanted: Arc::new((Mutex::new(Wanted::default()), Condvar::new())),
                 stop: Arc::new(AtomicBool::new(false)),
+                ownership_lost: AtomicBool::new(false),
                 #[cfg(unix)]
                 tally: Default::default(),
             });
@@ -1010,10 +1040,13 @@ impl Memory {
 
     /// The native allocator's limit without waiting for state or running maintenance.
     pub fn allocator_limit(&self) -> Option<u64> {
+        self.inner.check_ownership().ok()?;
         let mut st = self.inner.state.try_lock()?;
-        st.promises();
-        // Completed custody withdrawals become spendable; no wait on their sender.
-        st.table.pending = self.inner.to_custody.pending();
+        self.inner.local_accounting(&mut st);
+        st.table.capacity = self.inner.shared.try_capacity()?;
+        // These leaf queues are sampled without waiting either.
+        st.table.pending = self.inner.to_custody.try_pending()?;
+        st.table.inflight = self.inner.mech.try_pending()?;
         Some(st.table.torch_limit())
     }
 
@@ -1071,11 +1104,19 @@ impl Memory {
 impl Inner {
     /// `f`, a panic in it caught: the call fails `Internal` and the table is derived again.
     fn guard<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.check_ownership()?;
         let out = crate::caught(f);
+        if out.as_ref().err().is_some_and(Error::is_sticky) { self.ownership_lost.store(true, Ordering::Release); }
         if matches!(&out, Err(Error::Internal(m)) if m.starts_with("panic")) {
             self.recover();
         }
         out
+    }
+
+    fn check_ownership(&self) -> Result<()> {
+        if self.ownership_lost.load(Ordering::Acquire) {
+            Err(Error::Ownership("consumer completion failed; retire this executor".into()))
+        } else { Ok(()) }
     }
 
     /// After a panic: the table's pages derived again from the homes (each recorded in the same
@@ -1096,10 +1137,19 @@ impl Inner {
         self.landed.notify_all();
     }
 
+    fn local_accounting(&self, st: &mut State) {
+        for (id, bytes, epoch) in self.refunds.try_iter() {
+            if let Some(remaining) = st.budgets.get(&id) { remaining.fetch_add(bytes, Ordering::Release); }
+            // A newer real Torch observation already removed the failed provisional credit.
+            if st.measure_epoch == epoch { st.table.reserved = st.table.reserved.saturating_sub(bytes); }
+        }
+        st.promises();
+    }
+
     /// The state, with pin releases applied and completed events acted on.
     fn lock(&self) -> MutexGuard<'_, State> {
         let mut st = self.state.lock();
-        st.promises();
+        self.local_accounting(&mut st);
         self.drain(&mut st);
         st
     }
@@ -1314,13 +1364,13 @@ impl Inner {
         Ok(())
     }
 
-    fn publish(&self, st: &State) {
+    fn facts(st: &State) -> Facts {
         let t = &st.table;
         let remaining: Vec<Option<u64>> = t.requests.iter().map(|r| t.remaining(r)).collect();
         // A request waiting on a child call is no stranger's: it runs, and its W counts for
         // everyone but its family's child.
         let idle = t.requests.is_empty();
-        self.row.publish(&Facts {
+        Facts {
             context: t.context,
             torch: t.torch() + st.claims.values().sum::<u64>(),
             caches: if idle { t.slack() + t.caches.iter().map(|c| c.bytes).sum::<u64>() } else { 0 },
@@ -1334,8 +1384,12 @@ impl Inner {
             host_peak: st.host.values().flatten().copied().max().unwrap_or(0),
             host_unmeasured: st.host.values().filter(|h| h.is_none()).count() as u64,
             returning: t.pending + t.inflight,
-        });
+        }
     }
+
+    fn publish(&self, st: &State) { self.row.publish(&Self::facts(st)); }
+
+    fn try_publish(&self, st: &State) { self.row.try_publish(&Self::facts(st)); }
 
     // ---- the mechanism
 
@@ -2515,6 +2569,7 @@ impl Inner {
     /// less torch's reserved and the pages it created (an imported page is not charged to the
     /// importer's process).
     fn measure(&self, st: &mut State, torch: Torch) {
+        st.measure_epoch = st.measure_epoch.wrapping_add(1);
         st.table.allocated = torch.allocated;
         st.table.reserved = torch.reserved;
         st.table.context = match self.backend.process_used() {
@@ -3000,6 +3055,8 @@ fn trim_loop(wanted: &(Mutex<Wanted>, Condvar), inner: &Weak<Inner>) {
 }
 
 impl Request {
+    pub fn check(&self) -> Result<()> { self.inner.check_ownership() }
+
     /// Replaces the plan (packages declare it after the request opened); the cursor starts over.
     pub fn plan(&self, plan: Plan) {
         let _ = self.inner.guard(|| {
@@ -3044,15 +3101,23 @@ impl Request {
     /// decision procedure chooses victims; work requiring those waits is prepared before entry.
     /// Returns bytes of actual reclaim (or newly available capacity), so retries make progress.
     pub fn reclaim_allocation(&self, set: Option<SetId>, need: u64, torch: Torch) -> Result<u64> {
+        self.inner.check_ownership()?;
         let Some(mut st) = self.inner.state.try_lock() else { return Ok(0) };
+        self.inner.local_accounting(&mut st);
         self.inner.poll_releases(&mut st, false);
-        self.inner.refresh(&mut st)?;
-        self.inner.measure(&mut st, torch);
+        // Use the prepared cross-process/driver snapshot. Reaping, remapping and peer heap
+        // locks belong outside the Torch allocator lock, even if a peer is stopped.
+        st.table.allocated = torch.allocated;
+        st.table.reserved = torch.reserved;
         let before = st.table.torch_limit();
         let mut view = st.table.clone();
         view.caches.clear(); // They remain counted in torch; callbacks cannot reclaim them here.
         view.reserved = view.allocated;
         view.headroom = 0;
+        // Returning bytes stay unavailable; this callback cannot wait for their arrival.
+        view.context = view.context.saturating_add(view.pending);
+        view.pending = 0;
+        for peer in &mut view.others { peer.returning = 0; }
         let keys: Vec<Key> = view.pages().map(|(k, _)| k).collect();
         for key in keys {
             let completed = st.homes.get(&key).is_some_and(|h| !h.filling && !h.transforming && !h.keeping && self.inner.backend.query(h.ready).unwrap_or(false));
@@ -3100,7 +3165,7 @@ impl Request {
                 _ => {} // No callback, cut, park, peer ask, or queue wait inside an allocator.
             }
         }
-        self.inner.publish(&st);
+        self.inner.try_publish(&st);
         // Kept handles withdraw asynchronously. Their bytes remain pending until the native
         // custody sender reports completion; the allocation may retry once, but never waits
         // for that sender or reacquires state after releasing it.
@@ -3246,6 +3311,7 @@ impl Drop for Pin {
                 tracing::warn!("varena: recording a release failed ({e}); synchronizing its stream");
                 if let Err(e) = self.inner.backend.synchronize(self.stream) {
                     tracing::error!("varena: cannot prove consumer completion; quarantining pin {}: {e}", self.id);
+                    self.inner.ownership_lost.store(true, Ordering::Release);
                     // Keep the backend and reservation too, even if this was their last owner.
                     std::mem::forget(self.inner.clone());
                     return;

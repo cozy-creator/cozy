@@ -162,9 +162,12 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
         };
         if budget.as_ref().is_some_and(|b| b.remaining() < size as u64) { break 0; }
         let result = if held.saturating_add(size as u64) <= limit {
-            if budget.as_ref().is_some_and(|b| !b.take(size as u64)) { break 0; }
+            let credit = match &budget {
+                Some(b) => match b.take(size as u64) { Some(c) => Some(c), None => break 0 },
+                None => None,
+            };
             let result = segment(size);
-            if result.is_err() { if let Some(b) = &budget { b.refund(size as u64); } }
+            if result.is_ok() { if let Some(credit) = credit { credit.commit(); } }
             result
         } else { Err(cuda::ERROR_OUT_OF_MEMORY) };
         match result {
@@ -180,7 +183,10 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
                 if reclaimed == 0 { break 0; }
                 reclaimed_total += reclaimed;
             }
-            Err(_) => break 0,
+            Err(code) => {
+                accounts().faults.entry(device).or_insert_with(|| format!("CUDA allocation failed with non-capacity error {code}"));
+                break 0;
+            }
         }
     };
     let mut all = accounts();

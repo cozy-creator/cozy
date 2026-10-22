@@ -671,11 +671,11 @@ fn workspace_promises_convert_to_native_segments_and_release_unused_bytes() {
     let initial = mem.allocator_limit().unwrap();
     let reservation = mem.workspace(3 * MB, Torch::default()).unwrap();
     assert_eq!(mem.allocator_limit().unwrap(), initial - 3 * MB);
-    assert!(reservation.take(MB));
+    let credit = reservation.take(MB).unwrap();
     assert_eq!(reservation.remaining(), 2 * MB);
     assert_eq!(mem.allocator_limit().unwrap(), initial - 2 * MB);
-    assert!(!reservation.take(3 * MB), "a pool cannot exceed its prepared budget");
-    reservation.refund(MB);
+    assert!(reservation.take(3 * MB).is_none(), "a pool cannot exceed its prepared budget");
+    drop(credit);
     assert_eq!(mem.allocator_limit().unwrap(), initial - 3 * MB);
     drop(reservation);
     assert_eq!(mem.allocator_limit().unwrap(), initial);
@@ -691,4 +691,18 @@ fn a_grant_keeps_its_table_generation_when_the_ledger_is_dropped() {
     drop(varena::Grant::open(&g, Some(8 * MB)).unwrap());
     let memory = Memory::open(g.clone(), Some(grant), Box::new(HostBackend::new(g.memory))).unwrap();
     assert_eq!(memory.torch_limit(), 8 * MB, "the grant and the next opener share the same live generation");
+}
+
+#[test]
+fn a_failed_segment_credit_does_not_steal_room_from_the_next_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("workspace-refund-room", 4 * REGION_ALIGN);
+    let reservation = mem.workspace(REGION_ALIGN, Torch::default()).unwrap();
+    let failed = reservation.take(REGION_ALIGN).unwrap();
+    drop(failed); // Driver rejected this segment: no physical allocation occurred.
+    // No new Torch observation between failure and this real placement. The unused promise
+    // counts once, leaving exactly three regions; the old refund counted it twice and failed.
+    let id = mem.load(set(dir.path(), "refund-range", 3, &g.uuid), Level::Ram).unwrap();
+    let binding = mem.retain(id, &[0, 1, 2]).unwrap();
+    assert_eq!(binding.prepare(0).unwrap().len(), 3);
 }

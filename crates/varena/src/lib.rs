@@ -53,6 +53,8 @@ pub struct Exhausted {
 pub enum Error {
     #[error("exhausted: {} bytes short{}", .0.need, .0.site.as_deref().map(|s| format!(" at {s}")).unwrap_or_default())]
     Exhausted(Box<Exhausted>),
+    #[error("device ownership is unproven: {0}")]
+    Ownership(String),
     #[error("stale graph binding: {0}")]
     StaleBinding(String),
     #[error("invalid: {0}")]
@@ -83,6 +85,7 @@ impl Error {
             Error::Exhausted(_) => "EXHAUSTED",
             Error::Invalid(_) => "INVALID",
             Error::StaleBinding(_) => "STALE_BINDING",
+            Error::Ownership(_) => "OWNERSHIP",
             Error::Device { .. } => "DEVICE",
             Error::Io(_) => "IO",
             Error::Closed(_) => "CLOSED",
@@ -94,7 +97,7 @@ impl Error {
     /// CUDA documents these as destroying the context: the process must end, and the GPU's kept
     /// pages go (cuda 13.0 driver API, CUresult).
     pub fn is_sticky(&self) -> bool {
-        matches!(self, Error::Device { code: 700 | 702 | 709 | 710 | 714..=719 | 721 | 911, .. })
+        matches!(self, Error::Ownership(_) | Error::Device { code: 700 | 702 | 709 | 710 | 714..=719 | 721 | 911, .. })
     }
 
     pub(crate) fn io(what: &str, e: impl std::fmt::Display) -> Error {

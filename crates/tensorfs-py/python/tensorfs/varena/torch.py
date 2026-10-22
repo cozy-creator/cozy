@@ -439,7 +439,11 @@ class Memory:
         if pool and self.cuda:
             self._pools[threading.get_ident()] = self.new_pool()
         if device.type != "cpu":
-            native.trim_with(self._trim)
+            owner = weakref.ref(self)
+            def trim() -> int:
+                memory = owner()
+                return memory._trim() if memory is not None else 0
+            native.trim_with(trim)
 
     @property
     def pool(self) -> torch.cuda.MemPool | None:
