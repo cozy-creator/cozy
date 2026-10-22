@@ -17,9 +17,10 @@ pub(super) struct Folder {
 pub(super) fn input<'a>(spec: &'a Spec, choice: &domain::ModelChoice) -> Result<Option<&'a InputFile>, Refused> {
     let Some(field) = choice.source.strip_prefix("input://") else { return Ok(None) };
     let invalid = || refused("model_folder_invalid", "a folder upload names one retained tree input, without model selectors or conversion profiles");
+    let destination = spec.weights_destination.trim_start_matches("model://");
     if field.is_empty() || !spec.warm || !matches!(&spec.source, Source::Models)
-        || spec.models.len() != 1 || spec.weights_destination.is_empty()
-        || spec.weights_destination.starts_with("local/")
+        || spec.remove || spec.set.is_some() || spec.models.len() != 1
+        || destination.is_empty() || destination.starts_with("local/")
         || !choice.repository.is_empty() || !choice.release.is_empty() || !choice.lane.is_empty()
         || choice.manifest.is_some() || !choice.profiles.is_empty() || !choice.adapters.is_empty()
     {

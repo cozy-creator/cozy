@@ -454,6 +454,9 @@ fn a_folder_source_must_name_its_owned_retained_tree_input() {
     let mut spec = fixture.folder_spec("wrong-input", &http.origin, &files);
     spec.models[0].source = "input://other".into();
     assert_eq!(fixture.runs.submit("owner", "wrong-input", spec).unwrap_err().code, "model_folder_invalid");
+    let mut spec = fixture.folder_spec("local-alias", &http.origin, &files);
+    spec.weights_destination = "model://local/alias".into();
+    assert_eq!(fixture.runs.submit("owner", "local-alias", spec).unwrap_err().code, "model_folder_invalid");
     let spec = fixture.folder_spec("wrong-owner", &http.origin, &files);
     assert_eq!(fixture.runs.submit("another-owner", "wrong-owner", spec).unwrap_err().code, "input_unwritten");
     assert!(!http.published());
