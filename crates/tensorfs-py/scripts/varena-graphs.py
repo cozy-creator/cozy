@@ -67,7 +67,9 @@ def main():
     assert len({b.identity for b in bindings}) == DEPTH, "range identities include their dependency subsets"
     weight_bytes = WIDTH * WIDTH * 4 * DEPTH
     assert weight_bytes > CAP
-    print(json.dumps({"context_measurable": mem.native.context_measurable()}), flush=True)
+    measurable = mem.native.context_measurable()
+    print(json.dumps({"context_measurable": measurable}), flush=True)
+    assert measurable, "a capped graph proof requires measured per-process driver/context bytes"
     stream = torch.cuda.Stream()
     records = []
     capture_ms = 0.0
