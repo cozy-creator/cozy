@@ -55,6 +55,15 @@ impl Backend for Gated {
     fn drain_save(&self) -> varena::Result<()> { self.host.drain_save() }
 }
 
+/// Its claim file goes when the test does, passed or failed.
+struct Claims;
+
+impl Drop for Claims {
+    fn drop(&mut self) {
+        varena::tier::remove_claims();
+    }
+}
+
 #[test]
 #[ignore = "child role for concurrent_workspace_admissions_share_one_cap"]
 fn admission_child() {
@@ -113,6 +122,7 @@ impl Peer {
 fn concurrent_workspace_admissions_share_one_cap() {
     let namespace = format!("admission-test-{}-", std::process::id());
     assert!(varena::os::namespace(&namespace));
+    let _claims = Claims;
     let ledger = Ledger::create(&gpu(), Some(8 * M)).unwrap();
     let mut first = Peer::spawn(&namespace);
     let mut second = Peer::spawn(&namespace);

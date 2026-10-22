@@ -499,17 +499,5 @@ pub fn stalled(pid: u32, tid: u32) -> bool {
     }
 }
 
-/// A process's high-water is measured on Linux only (`/proc`): here a call is unmeasured,
-/// and the RAM tier (Linux's) is absent anyway.
-pub fn high_water() -> Option<u64> {
-    None
-}
-
-pub fn reset_high_water() {}
-
-pub fn anon(_: u32) -> Option<u64> {
-    None
-}
-
 /// `f` is closing: its locks go with its handle, so nothing is released here.
 pub fn closing(_: &Owned) {}

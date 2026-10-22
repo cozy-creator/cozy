@@ -2395,19 +2395,15 @@ fn binds_outlive_the_custody_holder() {
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn the_tier_takes_back_a_pinned_layout() {
-    use std::os::fd::FromRawFd;
     let (ledger, g, uuid) = tensord("pinned");
     step!();
-    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
-    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
-    step!();
-    let signal = event.try_clone().unwrap();
-    step!();
-    let unmeasured = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let demand = unmeasured.clone();
-    let tier = varena::Tier::serve(varena::Pressure::Events(event), Arc::new(move ||
-        if demand.load(std::sync::atomic::Ordering::Acquire) { None } else { Some(0) }
-    )).unwrap().expect("no other participant serves this user's RAM tier");
+    let short = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let demand = short.clone();
+    let pressure = platform::contain::host_pressure::Pressure::arm(platform::contain::host_pressure::HostMode::Shared).unwrap();
+    let tier = varena::Tier::serve(Some(pressure), Arc::new(move || {
+        let peak = if demand.load(std::sync::atomic::Ordering::Acquire) { u64::MAX / 2 } else { 0 };
+        Some(vec![varena::HostCall { pid: std::process::id(), peak: Some(peak), anon: 0, running: 1 }])
+    })).unwrap().expect("no other participant serves this user's RAM tier");
     step!();
     let digest = |n: &str| format!("{n}-2-{}", g.uuid);
     step!();
@@ -2426,10 +2422,9 @@ fn the_tier_takes_back_a_pinned_layout() {
     step!();
     assert!(resident(&digest("p1")) >= 2 * REGION_ALIGN && resident(&digest("p2")) >= 2 * REGION_ALIGN);
     step!();
-    // An unmeasured call needs the host headroom; the event asks the tier to reevaluate it.
-    unmeasured.store(true, std::sync::atomic::Ordering::Release);
-    // SAFETY: an 8-byte write to our eventfd.
-    unsafe { libc::write(signal.as_raw_fd(), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
+    // A measured call needs more than the host has; a nudge asks the tier to look.
+    short.store(true, std::sync::atomic::Ordering::Release);
+    tier.nudge();
     step!();
     let mut released = 0;
     while resident(&digest("p1")) + resident(&digest("p2")) > 0 {
@@ -2438,7 +2433,7 @@ fn the_tier_takes_back_a_pinned_layout() {
     step!();
     assert_eq!(resident(&digest("p1")), 0, "the pinned layout's regions returned");
     step!();
-    assert_eq!(resident(&digest("p2")), 0, "unmeasured demand releases the other cached layout too");
+    assert_eq!(resident(&digest("p2")), 0, "a measured shortfall releases the other cached layout too");
     step!();
     assert!(tier.acked() >= REGION_ALIGN, "y unregistered and unmapped the region it had read when asked: {}", tier.acked());
     step!();

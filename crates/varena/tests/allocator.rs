@@ -54,6 +54,15 @@ fn peer(role: &str, namespace: &str) -> Peer {
     child
 }
 
+/// Its claim file goes when the test does, passed or failed.
+struct Claims;
+
+impl Drop for Claims {
+    fn drop(&mut self) {
+        varena::tier::remove_claims();
+    }
+}
+
 #[test]
 #[ignore = "subprocess role, invoked by callback_does_not_wait_for_a_peer_heap_lock"]
 fn callback_peer() {
@@ -78,6 +87,7 @@ fn callback_peer() {
 fn callback_does_not_wait_for_a_peer_heap_lock() {
     let namespace = format!("allocator-test-{}-", std::process::id());
     assert!(varena::os::namespace(&namespace));
+    let _claims = Claims;
     let memory = Memory::open(gpu(), None, Box::new(HostBackend::new(gpu().memory))).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let set = memory.load(cold_page(dir.path()), Level::Gpu).unwrap();

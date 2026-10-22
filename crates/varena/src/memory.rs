@@ -34,7 +34,6 @@ use crate::custody;
 use crate::decide::{decide, Action, Trigger, Tried};
 use crate::ledger::{self, Facts, Grant, PhysicalChange, Room, Row, Shared};
 use crate::table::{Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
-use crate::os;
 use crate::tier;
 use crate::{Error, Exhausted, GpuId, Result};
 
@@ -828,8 +827,10 @@ struct State {
     failed: HashMap<Key, Error>,
     /// The latest unmap's mechanism ticket: whoever counts on its bytes settles up to it.
     last_unmap: Option<u64>,
-    /// Request → its recorded host high-water (`None`: unmeasured).
+    /// Request → its recorded anonymous host peak (`None`: unmeasured).
     host: HashMap<u64, Option<u64>>,
+    /// This process's anonymous peak while requests run.
+    window: Option<ledger::Window>,
     /// Request → the `<package>|<shape>` its peak is recorded under.
     peaks: HashMap<u64, String>,
     /// Requests whose last step is one their plan did not declare.
@@ -1137,7 +1138,7 @@ impl Memory {
             // Serving the tier here, it keeps this GPU's running requests' host growth free.
             let need: tier::Need = Arc::new({
                 let shared = shared.clone();
-                move || ledger::host_need(&shared)
+                move || ledger::host_calls(&shared)
             });
             let tier = tier::Client::open(shared.ns, need).map_err(|e| tracing::warn!("varena: no RAM tier: {e}")).ok().map(Arc::new);
             let (to_custody, to_tier, mech) = (Arc::new(Outbox::default()), Arc::new(Outbox::default()), Arc::new(Outbox::default()));
@@ -2544,7 +2545,7 @@ impl Inner {
         // (or never) stalls only this speculative copy, never a demand's settle or an ask's
         // answer (review 5, F7). No room now: it waits for a measured pass to end.
         let Ok((.., span)) = self.state.lock().place(s.key) else { return };
-        let Some(permit) = self.tier.as_ref().and_then(|t| t.reserve(span)) else {
+        let Some(permit) = self.tier.as_ref().and_then(|t| t.reserve(&s.tier, span)) else {
             let mut st = self.state.lock();
             if !st.deferred_saves.iter().any(|d| d.key == s.key && d.gen == s.gen) {
                 st.deferred_saves.push(s.clone());
@@ -3049,10 +3050,10 @@ impl Inner {
     /// not fit. A declared set's tier holds its transformed bytes: only its filled pages go
     /// there.
     fn load_ram(self: &Arc<Self>, set: u32) -> Result<()> {
-        let (spec, held) = {
+        let (spec, held, name) = {
             let st = self.lock();
             let m = st.mech(set)?;
-            let out = (m.spec.clone(), m.held.clone());
+            let out = (m.spec.clone(), m.held.clone(), m.tier.clone());
             self.unlock(st);
             out
         };
@@ -3062,7 +3063,7 @@ impl Inner {
         while want > 0 {
             let batch: Vec<u32> = (at..at + want).map(|r| r as u32).collect();
             let bytes = regions.iter().skip(at).take(want).map(|r| r.span).sum();
-            let Some(permit) = tier.reserve(bytes) else {
+            let Some(permit) = tier.reserve(&name, bytes) else {
                 want /= 2;
                 continue;
             };
@@ -3114,9 +3115,12 @@ impl Inner {
             st.peaks.insert(rid, String::from_utf8_lossy(&peak).into_owned());
             self.shared.put(&key, None)?;
         }
-        // Its host high-water is measured from its start (the process's, when it runs alone).
-        if st.table.requests.is_empty() {
-            os::reset_high_water();
+        // Its anonymous host peak is measured from its start (the process's, when it runs alone).
+        match st.window.as_mut() {
+            Some(window) => {
+                window.look();
+            }
+            None => st.window = ledger::Window::start(),
         }
         let host = match st.peaks.get(&rid) {
             Some(key) => self.shared.fact(&format!("host/{key}"))?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes),
@@ -3670,8 +3674,11 @@ impl Inner {
         let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
         let mut stats = st.stats.remove(&req).unwrap_or_default();
         st.host.remove(&req);
-        // Its host high-water (the process's since the first open request started).
-        stats.host = os::high_water();
+        // Its anonymous host peak (the process's since the first open request started).
+        stats.host = st.window.as_mut().and_then(ledger::Window::look);
+        if st.table.requests.is_empty() {
+            st.window = None;
+        }
         let aside = st.aside.remove(&req);
         if let Some(key) = st.peaks.remove(&req) {
             if let Some(bytes) = aside {
