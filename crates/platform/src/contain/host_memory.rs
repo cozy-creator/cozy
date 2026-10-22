@@ -23,6 +23,8 @@ pub struct HostMemory {
     pub shmem: i64,
     /// The host's available memory (`MemAvailable` on Linux), for the record; -1 when unreadable.
     pub mem_available: i64,
+    /// The limit `available` is measured against: the tightest cgroup's, else physical memory.
+    pub bound: i64,
 }
 
 /// Physical memory; -1 when unreadable.
@@ -48,6 +50,24 @@ pub struct ProcessMemory {
 
 pub fn process(pid: u32) -> io::Result<ProcessMemory> {
     sys::process(pid)
+}
+
+/// One process's anonymous bytes now, and their high-water since it started or since
+/// [`reset_peak`]: its resident peak less the file and shared pages it maps now. Linux only (the
+/// host tier's OS); elsewhere `Unsupported`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Anon {
+    pub now: u64,
+    pub peak: u64,
+}
+
+pub fn anon(pid: u32) -> io::Result<Anon> {
+    sys::anon(pid)
+}
+
+/// Starts `pid`'s high-water over from its use now.
+pub fn reset_peak(pid: u32) -> io::Result<()> {
+    sys::reset_peak(pid)
 }
 
 /// Private bytes (PSS less shared pages) of `pid` and every process descended from it: what a
@@ -90,6 +110,27 @@ mod tests {
             tree > own.pss.saturating_sub(own.pss_shmem),
             "a child counts too: {tree}"
         );
+    }
+
+    /// A process's anonymous high-water holds what it touched and freed, until it starts over.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_anonymous_high_water_holds_a_freed_peak_until_reset() {
+        let script = "b = bytearray(64 << 20); b[::4096] = b'\\1' * len(b[::4096]); del b\nprint('freed', flush=True)\nimport time; time.sleep(60)";
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", script])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+        let held = super::anon(child.id()).unwrap();
+        assert!(held.peak >= 64 << 20 && held.now < 64 << 20, "{held:?}");
+        super::reset_peak(child.id()).unwrap();
+        let reset = super::anon(child.id()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(reset.peak < 64 << 20 && reset.peak >= reset.now, "{reset:?}");
     }
 
     #[cfg(target_os = "linux")]
