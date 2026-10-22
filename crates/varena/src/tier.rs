@@ -985,6 +985,10 @@ impl Held {
     /// exclude one another too. Ordinary Err means the caller proved its I/O drained;
     /// Ownership means completion is unknown and destination mappings/locks are quarantined.
     pub fn fill(&self, regions: &[u32], fill: impl FnOnce(&[(u32, tensorfs::io::Dst)]) -> Result<()>) -> Result<()> {
+        // The tier took the layout back: it is going, never written again (review 5, N6).
+        if self.pins.lock().released {
+            return Err(Error::Closed("the RAM tier took this layout back".into()));
+        }
         let locks = self.lock_regions(regions.iter().copied(), true)?;
         let todo: Vec<u32> = regions.iter().copied().collect::<std::collections::BTreeSet<_>>().into_iter()
             .filter(|r| self.ready(*r).is_none_or(|w| w.load(Acquire) != 1)).collect();
@@ -1383,6 +1387,19 @@ sys.stdin.read()
         });
     }
 
+
+    /// Review 5, N6: a layout the tier took back is never written again.
+    #[test]
+    fn a_released_layout_refuses_a_fill() {
+        isolated("a_released_layout_refuses_a_fill", || {
+            let page = platform_page();
+            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
+            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let held = client.open_layout("released", vec![(0, page)], "").unwrap();
+            held.release(|_| Ok(()));
+            assert!(matches!(held.fill(&[0], |_| panic!("a released layout was written")), Err(Error::Closed(_))));
+        });
+    }
 
     #[test]
     fn observed_growth_deficit_reclaims_even_with_zero_call_need() {
