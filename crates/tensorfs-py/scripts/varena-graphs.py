@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import gc
+import hashlib
 import json
 import tempfile
 import time
@@ -43,7 +44,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     mem = Memory.open(0, limit=CAP)
-    print(json.dumps({"torch": torch.__version__, "tensorfs": tensorfs.__version__, "gpu": torch.cuda.get_device_name(), "cap": CAP}), flush=True)
+    print(json.dumps({"torch": torch.__version__, "tensorfs": tensorfs.__version__, "gpu": torch.cuda.get_device_name(), "cap": CAP, "native_sha256": hashlib.sha256(Path(tensorfs._ext.__file__).read_bytes()).hexdigest()}), flush=True)
     torch.manual_seed(19)
     plain = Network().eval()
     source = torch.randn(2, WIDTH)

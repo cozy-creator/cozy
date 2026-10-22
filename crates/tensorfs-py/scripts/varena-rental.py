@@ -11,6 +11,7 @@ own TensorFS. Its output streams to the run's log as it comes, and the output ho
 """
 import os
 import io
+import hashlib
 import zipfile
 import shutil
 import subprocess
@@ -56,6 +57,7 @@ def main(*, wheel: Annotated[FileAsset, AssetBound(max_bytes=1 << 27)],
             log.write(line)
             log.flush()
 
+        say(f"wheel {wheel_path.name} sha256={hashlib.sha256(data).hexdigest()}\n")
         say(install(site, "--no-deps", str(wheel_path)))
         command = [sys.executable, "-u", str(test)]
         with subprocess.Popen(command, env=env, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:

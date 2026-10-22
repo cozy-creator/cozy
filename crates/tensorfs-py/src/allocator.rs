@@ -125,6 +125,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
         return std::ptr::null_mut();
     }
     let mut previous = None;
+    let mut reclaimed_total = 0;
     let ptr = loop {
         let held = active.as_ref().map_or(live(device), |a| a.outside.saturating_add(live(device)));
         let limit = match active.as_ref() {
@@ -149,9 +150,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
                 previous = Some(state);
                 let reclaimed = a.request.reclaim_allocation(a.set, size as u64, Torch { allocated: held, reserved: held }).unwrap_or(0);
                 if reclaimed == 0 { break 0; }
-                let mut all = accounts();
-                let c = all.counts.entry(key).or_default();
-                c.resolved += 1; c.resolved_bytes += reclaimed;
+                reclaimed_total += reclaimed;
             }
             Err(_) => break 0,
         }
@@ -162,6 +161,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     if ptr == 0 { c.refused += 1; }
     else {
         c.live += size as u64; c.segments += 1;
+        if reclaimed_total != 0 { c.resolved += 1; c.resolved_bytes += reclaimed_total; }
         all.pointers.insert(ptr as usize, Allocation { device, pool, bytes: size as u64 });
     }
     ptr as *mut c_void
