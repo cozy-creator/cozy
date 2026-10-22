@@ -119,7 +119,9 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   stalled (once), and saves changed peaks (varena's records, whole) to
   `<pool>/peaks/<GPU model>.json`, restored when a ledger is created.
   A device fault (an unsettled call) drops the GPU's kept pages (`Ledger::fault`). The machine's
-  RAM tier is served from TensorD on the host's pressure trigger (`varena::Tier`): TensorD
+  RAM tier is served from TensorD on the host's pressure events (`varena::Tier`; the platform's
+  PSI trigger, else the cgroup's memory events; with neither, its headroom checks alone, noted
+  as `tier_headroom_only` in the memory log): TensorD
   computes no host room; it ends idle processes only on the tier's host-short event.
 - An executor's failed terminal (its own refusal before entry, or a failed invoke) first keeps a
   triage bundle (`triage.rs`: terminal, traceback, executor pid and stderr tail; canonical JSON
