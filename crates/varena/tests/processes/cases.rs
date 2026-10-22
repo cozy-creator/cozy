@@ -566,7 +566,8 @@ fn an_idle_holder_answers_an_ask(dir: &Path) {
     b.ok("bind b 0");
     b.ok("bind b 1");
     assert_eq!(b.ok("exact b 1"), "true");
-    assert_eq!(held(&ledger, &a_pid), 4 * MB, "a gave back what b needed");
+    // b is unmeasured: every idle byte is its (the idle-GPU rule), a's idle pages included.
+    assert_eq!(held(&ledger, &a_pid), 0, "a gave back its idle pages when b asked");
     assert_eq!(held(&ledger, &b_pid), 4 * MB);
     b.ok("unpin");
     b.ok("end r");
@@ -800,14 +801,15 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     let (a_path, b_path) = (write_set(dir, "va", 4), write_set(dir, "vb", 2));
     let mut a = Agent::granted(ledger.grant(std::process::id()).unwrap());
     a.ok(&format!("grant {} {}", g.uuid, g.memory));
-    a.ok(&format!("load va {} stored gpu", a_path.display()));
     let mut b = Agent::granted(ledger.grant(std::process::id()).unwrap());
     let b_pid = b.ok(&format!("grant {} {}", g.uuid, g.memory));
     b.ok(&format!("load vb {} stored ram", b_path.display()));
     b.ok(&format!("load vn {} stored gpu", write_set(dir, "vn", 1).display()));
+    // b opens first: its room outside passes, prepared at the open, asks nobody yet.
+    b.ok("request r vb");
+    a.ok(&format!("load va {} stored gpu", a_path.display()));
     // Earlier events (rows claimed, pages mapped) are not the ask's.
     ledger.clear_events();
-    b.ok("request r vb");
     let pid = a.child.id() as i32;
     assert!(ledger.stalled().is_empty(), "a running or sleeping ask thread is never stalled");
     let mut status = 0;

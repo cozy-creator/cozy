@@ -816,3 +816,52 @@ fn a_requests_record_keeps_every_decision_with_its_trigger() {
     drop((pins, pass));
 }
 
+/// Lead's rulings (S3's 13633, S4's 13640: loads at GPU filled the card to the brim, and torch's
+/// first allocation before a pass found no room). Cold, a request opening on a card a load
+/// filled lends its idle kept pages to the allocator callback, and its 2 MiB allocation before
+/// its first pass succeeds; it reports its outside peak, and a later GPU-level load leaves that
+/// room free.
+#[test]
+fn a_gpu_load_leaves_the_outside_room_and_a_request_allocates_before_its_first_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("aside", 16 * MB);
+    let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
+    let big = mem.load(set(dir.path(), "big", 10, &g.uuid), Level::Gpu).unwrap();
+    mem.settle();
+    // Cold: the load took every free byte.
+    assert!(varena::Ledger::admit(&[&ledger], "first", "pkg", "1x8", None).unwrap());
+    let r = mem.request("first", plan("a")).unwrap();
+    assert_eq!(r.reclaim_allocation(REGION_ALIGN).unwrap(), REGION_ALIGN, "its first allocation, before any pass, from a lent page");
+    r.outside(2 * REGION_ALIGN);
+    let pass = r.pass(a, "fwd", "1x8", Torch::default()).unwrap();
+    pass.end(Measured::default(), Torch::default());
+    r.end();
+    mem.unload(big);
+    mem.settle();
+    // Measured: a load at GPU leaves the outside room free.
+    mem.load(set(dir.path(), "again", 10, &g.uuid), Level::Gpu).unwrap();
+    mem.settle();
+    let mapped = ledger.status().rows.iter().map(|r| r.classes.iter().sum::<u64>()).sum::<u64>();
+    assert!(16 * MB - mapped >= 2 * REGION_ALIGN, "the load left the measured outside room: {} free", 16 * MB - mapped);
+}
+
+/// S4 (a tiled decode on host pages refused 11 times at level 0): a failed try ends its passes
+/// before the enclosing split's OOM is asked, so a pass's end must not clear where the retry
+/// failed. The same OOM asked again at the outside cut, with no progress, cuts it finer.
+#[test]
+fn a_retry_mark_survives_the_failed_tries_pass_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("retry-mark", 8 * MB);
+    let id = mem.load(set(dir.path(), "vae", 1, &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("r", plan("vae")).unwrap();
+    let split = Some(Site { name: "split:x", collective: false, finest: 3, shape: "k" });
+    let pass = r.pass(id, "decode", "1x8", Torch::default()).unwrap();
+    let pin = mem.bind(id, 0, 0).unwrap();
+    assert!(matches!(r.oom(Some(id), Some(2 * MB), split, Torch::default()), Next::Retry));
+    drop(pin);
+    // The try fails: its pass ends as the exception unwinds.
+    pass.end(Measured::default(), Torch::default());
+    let next = r.oom(None, Some(2 * MB), split, Torch::default());
+    assert!(matches!(next, Next::Cut(1)), "the outside cut goes finer, no second Retry: {next:?}");
+}
+
