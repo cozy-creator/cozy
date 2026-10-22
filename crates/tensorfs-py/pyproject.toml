@@ -6,7 +6,7 @@ backend-path = ["backend"]
 
 [project]
 name = "tensorfs"
-version = "0.13.4"
+version = "0.14.0"
 description = "Load, store and share model weights: a self-describing tensor format, a deduplicating local store and the tfs CLI"
 readme = "README.md"
 license = "MIT"
