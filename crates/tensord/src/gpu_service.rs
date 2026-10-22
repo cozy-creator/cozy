@@ -3420,7 +3420,8 @@ fn refused(error: &io::Error) -> Option<&Refused> {
 
 /// What the call's executor measured, kept as the run's (`run show`): its stage and step
 /// tracks, its ranks' execution records, its kernel observations (the attention and GEMM
-/// kernels that served, Sol's dense and sparse calls) and the models it ran, as resolved.
+/// kernels that served, Sol's dense and sparse calls), its residency (graph counters) and the
+/// models it ran, as resolved.
 pub(crate) fn record_measurements(engine: &Engine, id: &str, plan: &Plan, reply: &Frame) {
     let software = engine.get(id).ok().and_then(|run| run.executor.map(|executor| executor.software(run.attempt)));
     let measurements = measured(plan, reply, software, call_memory(reply));
@@ -3452,7 +3453,7 @@ fn measured<S: Serialize, M: Serialize>(plan: &Plan, reply: &Frame, software: S,
         .filter(|row| row["name"].as_str().is_some_and(|name| name.starts_with("attention.") || name.starts_with("gemm.")))
         .collect();
     serde_json::json!({"attribution": reply.attribution, "software": software, "execution": reply.execution,
-        "observations": kernels, "memory": memory, "models": plan.models()})
+        "observations": kernels, "memory": memory, "residency": reply.residency, "models": plan.models()})
 }
 
 pub(crate) fn command_ok(frame: Frame) -> io::Result<Frame> {
@@ -3590,6 +3591,27 @@ mod tests {
             {"slot": "lora", "repository": "paul/wushu", "release": "1.0.0", "lane": "bf16", "manifest": "sha256:bb"}]));
         let kept: Vec<&str> = measured["observations"].as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap()).collect();
         assert_eq!(kept, ["attention.selected", "gemm.selected"]);
+    }
+
+    /// An invoke reply's residency (the Runtime's graph counters per model, fields this TensorD
+    /// does not know included) reaches the run's measurements whole.
+    #[test]
+    fn an_invoke_replys_residency_reaches_the_runs_measurements() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("engine")).unwrap();
+        let id = engine.submit("graphs", crate::journal::Invocation::default()).unwrap().id;
+        let plan = Plan { id: "p".into(), construction: "c".into(), installation: "i".into(), generation: "g".into(),
+            entrypoint: "generate".into(), slots: vec![], sources: vec![], degree: 1 };
+        let residency = json!({"notes": {"weights": "resident"}, "graphs": {"transformer": {
+            "declared_regions": 40, "active_graphs": 40, "replays": 120, "captures": 40, "graph_pool_bytes": 1 << 30,
+            "captured_regions": ["blocks.0"], "eager_gaps": {"router": "dynamic routing"}, "later_counter": 7}},
+            "later_section": {"kept": true}});
+        let reply: Frame = serde_json::from_value(json!({"reply": "invoke", "ok": true, "residency": residency})).unwrap();
+        record_measurements(&engine, &id, &plan, &reply);
+        let kept = engine.with_journal(|journal| journal.measurements(&id)).unwrap().expect("measurements kept");
+        let kept: serde_json::Value = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(kept["residency"], residency);
+        assert_eq!(kept["residency"]["graphs"]["transformer"]["replays"], 120);
     }
 
     #[cfg(unix)]
