@@ -88,6 +88,7 @@ pub fn main() {
         ("the_tier_gives_back_in_order", the_tier_gives_back_in_order),
         ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
         ("a_layout_stays_locked_until_the_tier_takes_it_back", a_layout_stays_locked_until_the_tier_takes_it_back),
+        ("an_unmeasured_pass_asks_peers_only_on_an_oom", an_unmeasured_pass_asks_peers_only_on_an_oom),
         ("a_refused_tier_copy_runs_after_a_measured_pass", a_refused_tier_copy_runs_after_a_measured_pass),
         ("the_tier_waits_on_no_executor_and_a_pending_release_settles_first", the_tier_waits_on_no_executor_and_a_pending_release_settles_first),
         ("a_silent_asker_holds_up_no_answer", a_silent_asker_holds_up_no_answer),
@@ -578,8 +579,7 @@ fn an_idle_holder_answers_an_ask(dir: &Path) {
     b.ok("bind b 0");
     b.ok("bind b 1");
     assert_eq!(b.ok("exact b 1"), "true");
-    // b is unmeasured: every idle byte is its (the idle-GPU rule), a's idle pages included.
-    assert_eq!(held(&ledger, &a_pid), 0, "a gave back its idle pages when b asked");
+    assert_eq!(held(&ledger, &a_pid), 4 * MB, "a gave back what b needed");
     assert_eq!(held(&ledger, &b_pid), 4 * MB);
     b.ok("unpin");
     b.ok("end r");
@@ -1018,6 +1018,32 @@ fn a_refused_tier_copy_runs_after_a_measured_pass(dir: &Path) {
     assert!(resident() >= 2 * REGION_ALIGN, "the deferred copies ran: {}", resident());
     y.ok("end r");
     y.exit();
+}
+
+/// Review 6, C3: an unmeasured pass makes its room up front from the free bytes and its own
+/// row's idle pages; it asks a peer holding idle pages nothing when it opens (measuring one
+/// model's new shape must not drop another's weights). An OOM's escalation asks it.
+fn an_unmeasured_pass_asks_peers_only_on_an_oom(dir: &Path) {
+    let g = gpu("peers", 8 * MB);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let (a_path, b_path) = (write_set(dir, "pa", 2), write_set(dir, "pb", 1));
+    let held = |l: &varena::Ledger, pid: &str| l.status().rows.iter().find(|r| r.pid.to_string() == pid).map(|r| r.classes.iter().sum::<u64>()).unwrap();
+    let mut a = Agent::spawn();
+    let a_pid = a.ok(&format!("open {} {}", g.uuid, g.memory));
+    a.ok(&format!("load pa {} stored gpu", a_path.display()));
+    let mut b = Agent::spawn();
+    b.ok(&format!("open {} {}", g.uuid, g.memory));
+    b.ok(&format!("load pb {} stored gpu", b_path.display()));
+    b.ok("request r pb");
+    b.ok("pass r pb 1x1");
+    assert_eq!(held(&ledger, &a_pid), 2 * REGION_ALIGN, "the pass opened without asking a");
+    // The card: a's two pages, b's one, one free. An op needs three.
+    b.send(&format!("oom r pb {}", 3 * REGION_ALIGN));
+    assert_eq!(b.reply(), "retry");
+    assert!(held(&ledger, &a_pid) < 2 * REGION_ALIGN, "the OOM's escalation asked a");
+    b.ok("end r");
+    a.exit();
+    b.exit();
 }
 
 /// A joint step ({a, b}): each set runs its own pass; interleaved binds land in their own

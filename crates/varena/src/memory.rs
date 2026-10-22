@@ -33,7 +33,7 @@ use crate::backend::{Access, Backend, Event, Physical, Va};
 use crate::custody;
 use crate::decide::{decide, Action, Trigger, Tried};
 use crate::ledger::{self, Facts, Grant, PhysicalChange, Room, Row, Shared};
-use crate::table::{Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
+use crate::table::{Aside, Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
 use crate::tier;
 use crate::{Error, Exhausted, GpuId, Result};
 
@@ -2775,7 +2775,7 @@ impl Inner {
             Trigger::Oom { need, .. } => ("oom", need.unwrap_or(0)),
             Trigger::Prepare { pages, .. } => ("prepare", pages.iter().filter_map(|k| st.table.page(*k)).filter(|p| !p.mapped).map(|p| p.bytes).sum()),
             Trigger::Workspace { bytes, .. } => ("workspace", *bytes),
-            Trigger::Outside { room, .. } => ("outside", room.unwrap_or(0)),
+            Trigger::Outside { req, .. } => ("outside", st.table.request(*req).and_then(|r| r.aside.bytes()).unwrap_or(0)),
             Trigger::Speculate { .. } | Trigger::Ask { .. } | Trigger::Load { .. } => return,
         };
         let step = st.table.request(req).map_or(0, |r| r.cursor.step);
@@ -3128,9 +3128,20 @@ impl Inner {
         };
         st.host.insert(rid, host);
         // Its room outside its passes, as measured for its dispatch key.
+        // As measured for its key, else the largest of its package's at any shape (review 6, C3).
+        let bytes = |v: Vec<u8>| v.try_into().ok().map(u64::from_le_bytes);
         let aside = match st.peaks.get(&rid) {
-            Some(key) => self.shared.fact(&format!("aside/{key}"))?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes),
-            None => None,
+            None => Aside::Unknown,
+            Some(key) => match self.shared.fact(&format!("aside/{key}"))?.and_then(bytes) {
+                Some(b) => Aside::Measured(b),
+                None => {
+                    let package = key.split('|').next().unwrap_or_default();
+                    match self.shared.facts(&format!("aside/{package}|"))?.into_iter().filter_map(|(_, v)| bytes(v)).max() {
+                        Some(b) => Aside::Measured(b),
+                        None => Aside::Unmeasured,
+                    }
+                }
+            },
         };
         st.table.requests.push(Req { id: rid, name: id.to_string(), steps, rooms, aside, ..Req::default() });
         // Its plan reclassifies pages (N to D): the stock is offered again.
@@ -3148,12 +3159,7 @@ impl Inner {
     /// at each pass end), outside the allocator callback: its kept idle pages lent to the
     /// callback as the room needs (all of them while it is unmeasured), never evicted for it.
     fn prepare_outside(&self, req: u64) -> Result<()> {
-        let room = {
-            let st = self.lock();
-            let Some(r) = st.table.request(req) else { return Ok(()) };
-            r.aside
-        };
-        self.demand(Trigger::Outside { req, room, tried: Tried::default() }, Some(req)).map(|_| ())
+        self.demand(Trigger::Outside { req, tried: Tried::default() }, Some(req)).map(|_| ())
     }
 
     fn bind(self: &Arc<Self>, set: u32, block: u32, stream: usize) -> Result<Pin> {

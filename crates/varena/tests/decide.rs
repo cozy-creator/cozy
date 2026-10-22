@@ -746,3 +746,22 @@ fn a_held_cache_is_never_asked_to_shrink() {
     assert_eq!(t.cache_class(&t.caches[0]), Class::N);
 }
 
+/// Review 6, C3 (the reviewer's probe): an unmeasured pass with room to spare never shrinks
+/// another component's graph pool; caches shrink only for a measured shortfall or an OOM.
+#[test]
+fn an_unmeasured_pass_never_sweeps_caches() {
+    let mut t = table(64 * MB, vec![set("a", 1, MB), set("b", 1, MB)], vec![(vec![0], 1)]);
+    map(&mut t, (1, 0));
+    t.caches.push(Cache { id: 9, owner: "graphs:b".into(), sets: vec![1], bytes: 4 * MB, last_use: 6, ..Default::default() });
+    (t.allocated, t.reserved) = (4 * MB, 4 * MB);
+    let roomy = decide(&t, &Trigger::Pass { req: 1, set: 0, room: None, unmeasured: MB, tried: Tried::default() });
+    assert!(!roomy.iter().any(|a| matches!(a, Action::Shrink { .. })), "{roomy:?}");
+    // Short of room, unmeasured: still no cache shrinks (pages only).
+    let mut t = table(6 * MB, vec![set("a", 1, MB), set("b", 1, MB)], vec![(vec![0], 1)]);
+    map(&mut t, (1, 0));
+    t.caches.push(Cache { id: 9, owner: "graphs:b".into(), sets: vec![1], bytes: 4 * MB, last_use: 6, ..Default::default() });
+    (t.allocated, t.reserved) = (4 * MB, 4 * MB);
+    let short = decide(&t, &Trigger::Pass { req: 1, set: 0, room: None, unmeasured: 2 * MB, tried: Tried::default() });
+    assert!(!short.iter().any(|a| matches!(a, Action::Shrink { .. })), "{short:?}");
+}
+
