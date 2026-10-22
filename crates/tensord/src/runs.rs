@@ -425,6 +425,7 @@ impl Runs {
         let mut models = vec![];
         for choice in &spec.models {
             let folder = model_folder::prepare(self, actor, spec, choice, stoppable)?;
+            let upload_store = folder.as_ref().map_or(publisher.store().as_ref(), |folder| &folder.store);
             // Each model's header, and the tree that names it when one does.
             let (header, tree, mut row) = if let Some(folder) = &folder {
                 let row = json!({"parameter": choice.parameter, "source": choice.source,
@@ -510,7 +511,7 @@ impl Runs {
                     endpoint = endpoint.anonymous();
                 }
                 let runtime = tensorfs::fetch::runtime().map_err(|error| refused("upload_failed", error.to_string()))?;
-                let uploaded = runtime.block_on(upload_tree_with(&endpoint, repository, &tree, publisher.store(), tag, &[], &UploadControl {
+                let uploaded = runtime.block_on(upload_tree_with(&endpoint, repository, &tree, upload_store, tag, &[], &UploadControl {
                     cancelled: &|| stoppable.stop.is_cancelled(),
                     progress: &|done, total| observe(&stage, done, total),
                     commit: &|| stoppable.commit(),

@@ -447,6 +447,28 @@ fn a_thin_folder_missing_remote_payload_fails_before_the_tag_moves() {
 }
 
 #[test]
+fn a_folder_cannot_upload_unstaged_tensor_bytes_from_another_actors_shared_cache() {
+    let fixture = Fixture::new();
+    let http = Http::new(0);
+    let original = fixture.store.tree(&fixture.tree).unwrap();
+    // The attacker knows every hash, but staged only headers and repo files. The shared
+    // machine Store holds all tensor payloads; none were written into this actor's input CAS.
+    let files = original.files.iter().map(|(name, object)| {
+        (name.clone(), fixture.store.read(object).unwrap())
+    }).collect();
+    let victim = fixture.store.checkpoint(&fixture.header).unwrap().header().chunks[0].clone();
+    assert!(fixture.store.file(&victim).is_ok());
+    assert!(fixture.runs.objects.path("owner", &victim.id()).unwrap().is_none());
+    let run = fixture.runs.submit("owner", "unstaged-cached-payload", fixture.folder_spec("unstaged-cached-payload", &http.origin, &files)).unwrap().id;
+    let result = fixture.settled(&run);
+    assert_eq!(result.state, State::Failed);
+    assert!(!http.published());
+    assert!(!http.state.puts.lock().unwrap().contains(&victim.id()));
+    assert!(http.state.store.file(&victim).is_err(), "another actor's cached bytes escaped");
+    assert!(fixture.store.file(&victim).is_ok(), "shared cached bytes were modified");
+}
+
+#[test]
 fn a_folder_source_must_name_its_owned_retained_tree_input() {
     let fixture = Fixture::new();
     let http = Http::new(0);

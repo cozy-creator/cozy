@@ -2,16 +2,18 @@
 //! staged are admitted; missing tensor objects stay missing until the upload's endpoint check.
 use std::fs;
 
-use tensorfs::{format::ObjectRef, store::Checkpoint};
+use tensorfs::{format::ObjectRef, store::{Checkpoint, Store}};
 
 use super::{domain, refused, InputFile, Refused, Runs, Source, Spec, Stoppable};
 
 pub(super) struct Folder {
+    pub store: Store,
     pub tree: ObjectRef,
     pub header: ObjectRef,
     pub variants: Vec<String>,
     // Opening every variant retains the complete tree and its present closure during upload.
     _checkpoints: Vec<Checkpoint>,
+    _staging: tempfile::TempDir,
 }
 
 pub(super) fn input<'a>(spec: &'a Spec, choice: &domain::ModelChoice) -> Result<Option<&'a InputFile>, Refused> {
@@ -44,10 +46,11 @@ pub(super) fn prepare(
         return Err(missing());
     }
     let files = crate::trees::parse(&fs::read(manifest)?)?;
-    let store = runs.publisher.store();
-    let scratch = store.root().join("tmp");
+    let scratch = runs.objects.cas().root().join("tmp");
     fs::create_dir_all(&scratch)?;
-    let folder = tempfile::Builder::new().prefix("model-folder-").tempdir_in(scratch)?;
+    let staging = tempfile::Builder::new().prefix("model-folder-").tempdir_in(scratch)?;
+    let folder = staging.path().join("folder");
+    fs::create_dir(&folder)?;
     for (name, object) in files {
         if stoppable.stop.is_cancelled() {
             return Err(refused(crate::published::CANCELED, "the folder upload was canceled before admission"));
@@ -56,7 +59,7 @@ pub(super) fn prepare(
         if length != object.length {
             return Err(missing());
         }
-        let path = folder.path().join(name);
+        let path = folder.join(name);
         fs::create_dir_all(path.parent().expect("a tree member has a parent"))?;
         // The input CAS is immutable. TensorFS reads these links and verifies admission; it
         // never rewrites the folder. Copy only if the two stores occupy different volumes.
@@ -65,7 +68,11 @@ pub(super) fn prepare(
         }
     }
     let invalid = |error| refused("model_folder_invalid", format!("{error}"));
-    let (tree, _) = store.admit_folder(folder.path()).map_err(invalid)?;
+    // This payload view contains ONLY this caller's staged files. The shared model cache may
+    // hold another actor's tensor bytes: citing their hash in a fabricated header grants no
+    // right to upload them. An unstaged object can only be reused by the endpoint's own HEAD.
+    let store = Store::open(staging.path().join("store")).map_err(invalid)?;
+    let (tree, _) = store.admit_folder(&folder).map_err(invalid)?;
     let parsed = store.tree(&tree).map_err(invalid)?;
     let variants: Vec<String> = parsed.variants().map(|(name, _)| name.to_owned()).collect();
     if variants.is_empty() {
@@ -75,6 +82,7 @@ pub(super) fn prepare(
         .map(|variant| store.variant(&tree, Some(variant)).map_err(invalid))
         .collect::<Result<_, _>>()?;
     Ok(Some(Folder {
-        header: checkpoints[0].id().clone(), tree, variants, _checkpoints: checkpoints,
+        header: checkpoints[0].id().clone(), tree, variants, store, _checkpoints: checkpoints,
+        _staging: staging,
     }))
 }
