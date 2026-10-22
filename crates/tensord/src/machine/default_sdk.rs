@@ -139,9 +139,11 @@ fn artifacts(solution: &str) -> io::Result<Vec<Artifact>> {
         if package.wheels.len() != 1 || plan.packages.iter().any(|p| p.name.replace('_', "-") == name) {
             return Err(io::Error::other(format!("SDK resolution returned ambiguous host wheels for {name}")));
         }
-        if name == "cozy-runtime" { pair.runtime = package.version; } else { pair.tensorfs = package.version; }
         let wheel = package.wheels.into_iter().next().ok_or_else(|| io::Error::other("SDK wheel absent"))?;
-        wheel.filename()?;
+        if !wheel.filename()?.starts_with(&format!("{}-{}-", name.replace('-', "_"), package.version)) {
+            return Err(io::Error::other(format!("SDK wheel does not name the resolved {name} version")));
+        }
+        if name == "cozy-runtime" { pair.runtime = package.version; } else { pair.tensorfs = package.version; }
         chosen.push(wheel);
     }
     pair.require_memory_protocol()?;
@@ -266,6 +268,7 @@ wheels = [{{url="https://example.test/tensorfs-0.14.0-cp312-abi3-{platform}.whl"
             assert!(wheels[1].filename().unwrap().ends_with(&format!("{platform}.whl")));
         }
         for bad in [plan("win_amd64").replace("0.14.0", "0.13.4"),
+            plan("win_amd64").replace("version = \"0.31.0\"", "version = \"0.31.1\""),
             plan("win_amd64").replace("https://example.test/", "file:///"),
             plan("win_amd64").replace(&"a".repeat(64), "missing")]
         { assert!(artifacts(&bad).is_err()); }
