@@ -28,7 +28,7 @@ def header(name, entries):
     (HEADERS / f"{name}.cbor").write_bytes(cbor2.dumps(raw, canonical=True))
     dominant = sorted(held, key=lambda k: (-held[k], k))[0]
     family, bits = {"BF16": ("bf16",16), "F16": ("fp16",16), "F32": ("f32",16),
-                    "int8.rowwise": ("int8",8), "fp8.rowwise": ("fp8",8),
+                    "int8.rowwise": ("int8",8), "int8.future": ("int8",8), "fp8.rowwise": ("fp8",8),
                     "nvfp4": ("nvfp4",4), "mxfp4": ("mxfp4",4), "int4.convrot": ("int4",4)}.get(dominant,("",0))
     profiles[name] = dict(family=family,bits=bits,bytes=sum(held.values()),kinds=sorted(held))
 for name,kind,n in [("bf16","BF16",128),("fp16","F16",128),("f32","F32",256),("int8","int8.rowwise",64),

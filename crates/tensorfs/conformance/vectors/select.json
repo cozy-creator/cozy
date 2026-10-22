@@ -90,8 +90,8 @@
       ]
     },
     "future-int8": {
-      "family": "",
-      "bits": 0,
+      "family": "int8",
+      "bits": 8,
       "bytes": 64,
       "kinds": [
         "int8.future"
