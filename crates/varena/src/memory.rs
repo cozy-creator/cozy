@@ -465,6 +465,9 @@ struct Home {
     /// Its Keep's protect and export run now. No work may touch a page while its access
     /// changes (`cuMemSetAccess` under a reading kernel faults it): binds and saves wait.
     protecting: bool,
+    /// The allocator hook unmaps it in place now, on its own thread (never queued behind the
+    /// mechanism's other work): nobody else touches it meanwhile.
+    reclaiming: bool,
 }
 
 impl Home {
@@ -715,7 +718,7 @@ impl State {
         let home = self.homes.get(&key).map(|h| (h.filled, h.filling, h.speculative, h.exported));
         let mut pins: Vec<u64> = self.pins.iter().filter(|(_, (k, ..))| *k == key).map(|(id, _)| *id).collect();
         // A protect in flight pins the page (P): nothing evicts or unmaps it meanwhile.
-        if self.homes.get(&key).is_some_and(|h| h.protecting) {
+        if self.homes.get(&key).is_some_and(|h| h.protecting || h.reclaiming) {
             pins.push(PROTECTING);
         }
         if let Some(p) = self.table.page_mut(key) {
@@ -1658,7 +1661,7 @@ impl Inner {
             let gen = st.tick();
             // Pinned (filling) until the mechanism maps it.
             self.mech.post(Mech::Adopt { key, gen, va, off, phys: phys.id, len: phys.len, identity: identity.clone() }, 0);
-            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, protecting: false });
+            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false });
             st.sync(key);
             let s = st.fills(req, key, span, Origin::Kept);
             s.moved.kept.bytes += span;
@@ -1683,7 +1686,7 @@ impl Inner {
         let decided = st.table.free();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, protecting: false });
+        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false });
         st.sync(key);
         self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, speculative, decided }, 0);
         Ok(true)
@@ -1705,7 +1708,7 @@ impl Inner {
         // Kept, or with a Keep queued: never written again; a fresh page takes its place.
         let phys = if exported || h.keeping { h.phys.take() } else { None };
         let renew = phys.is_some();
-        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false };
+        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
         let job = Job { key, gen, req, span, after: vec![] };
@@ -2240,6 +2243,10 @@ impl Inner {
             }
             let mut want = bytes - free;
             let (mut unmapped, mut withdrawn, mut events, mut shrinks) = (0, false, vec![], vec![]);
+            // The hook's pages, taken in place below: (page, its generation, class, place,
+            // backing, ready event).
+            type Taking = (Key, u64, Class, (Va, u64, u64), Physical, Event);
+            let mut taking: Vec<Taking> = vec![];
             for v in decide::victims(&st.table, keep) {
                 if want == 0 {
                     break;
@@ -2248,6 +2255,15 @@ impl Inner {
                 match v {
                     Victim::Page { key, .. } if hook && kept(key) => {}
                     Victim::Cache { .. } if hook => {}
+                    Victim::Page { key, bytes: b, releasing: false } if hook => {
+                        let (place, class) = (st.place(key)?, st.table.class(key).unwrap_or(Class::N));
+                        let Some(h) = st.homes.get_mut(&key).filter(|h| !h.keeping && !h.keep_after && !h.protecting && !h.reclaiming && !h.exported) else { continue };
+                        let Some(phys) = h.phys.take() else { continue };
+                        h.reclaiming = true;
+                        taking.push((key, h.gen, class, place, phys, h.ready));
+                        st.sync(key);
+                        want = want.saturating_sub(b);
+                    }
                     Victim::Page { key, bytes: b, releasing: false } => {
                         let class = st.table.class(key).unwrap_or(Class::N);
                         withdrawn |= st.table.page(key).is_some_and(|p| p.kept);
@@ -2268,9 +2284,10 @@ impl Inner {
                 }
             }
             // Its own bytes on their way back (unmaps and withdrawals in flight), and pages about
-            // to be evictable again (varena's own short work, a fill).
+            // to be evictable again: varena's own short work, and (not for the hook, which never
+            // takes a page being filled) a fill.
             let returning = st.table.returning > 0 || (!hook && st.table.pending > 0);
-            let coming = st.table.transient > 0 || st.homes.iter().any(|(k, h)| (h.protecting || h.filling) && !keep.contains(k));
+            let coming = st.table.transient > 0 || st.homes.iter().any(|(k, h)| (h.protecting || (!hook && h.filling)) && !keep.contains(k));
             let last = st.last_unmap;
             self.publish(&mut st);
             drop(admission);
@@ -2282,6 +2299,37 @@ impl Inner {
             }
             if withdrawn {
                 self.to_custody.settle();
+            }
+            // The hook's pages: unmapped and destroyed here, on its own thread.
+            for (key, gen, class, (va, off, span), phys, ready) in taking {
+                let change = self.row.physical_change();
+                let given = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(phys));
+                let mut st = self.lock();
+                if st.homes.get(&key).is_some_and(|h| h.gen == gen) {
+                    st.homes.remove(&key);
+                    self.backend.retire(ready);
+                }
+                st.sync(key);
+                if let Some(e) = st.stats(req).and_then(|s| s.evicted.get_mut(class.index())) {
+                    *e += span;
+                }
+                if let Err(e) = given {
+                    // Its memory could not be proved given back: it stays charged, and this
+                    // executor retires (as lost backing does).
+                    let id = st.tick();
+                    st.retired.insert(((u32::MAX, u32::MAX), id), Retirement { bytes: span, created: true, mechanism: None, custody: None, kept: true });
+                    self.ownership_lost.store(true, Ordering::Release);
+                    self._device.retiring(true);
+                    self.publish(&mut st);
+                    self.unlock(st);
+                    self.landed.notify_all();
+                    return Err(Error::Ownership(format!("a page the hook took could not be proved given back: {e}")));
+                }
+                unmapped += span;
+                self.publish(&mut st);
+                self.unlock(st);
+                change.finish();
+                self.landed.notify_all();
             }
             let shrunk = self.shrink(shrinks);
             for e in &events {
@@ -2568,13 +2616,13 @@ impl Inner {
     /// as its recorded peak lacks beside the free bytes and what the hook could take already.
     /// They are kept again when no request is open.
     fn unkeep(&self, req: u64) {
-        let mut st = self.lock();
+        let st = self.lock();
         let Some(peak) = st.table.request(req).map(|r| r.peak) else { return self.unlock(st) };
         let victims = decide::victims(&st.table, &[]);
         let kept = |st: &State, key: Key| st.table.page(key).is_some_and(|p| p.kept);
         let takeable: u64 = victims.iter().filter_map(|v| if let Victim::Page { key, bytes, .. } = v { (!kept(&st, *key)).then_some(*bytes) } else { None }).sum();
         let mut need = peak.map_or(u64::MAX, |p| p.saturating_sub(st.table.free() + takeable));
-        let mut withdrew = false;
+        let mut withdrawn = vec![];
         for v in victims {
             let Victim::Page { key, bytes, .. } = v else { continue };
             if need == 0 {
@@ -2583,19 +2631,27 @@ impl Inner {
             if !kept(&st, key) {
                 continue;
             }
-            let Some(h) = st.homes.get_mut(&key).filter(|h| h.exported) else { continue };
-            h.exported = false;
-            let fp = h.identity.clone();
-            self.withdraw(fp, key.1, 0);
-            st.sync(key);
+            let Some(h) = st.homes.get(&key).filter(|h| h.exported) else { continue };
+            let (fp, gen) = (h.identity.clone(), h.gen);
+            if let Some(ticket) = self.withdraw(fp, key.1, 0) {
+                withdrawn.push((key, gen, ticket));
+            }
             need = need.saturating_sub(bytes);
-            withdrew = true;
+        }
+        self.unlock(st);
+        // Still kept (custody holds the memory, the hook never takes it) until custody let go.
+        if let Some(last) = withdrawn.iter().map(|(.., t)| *t).max() {
+            self.to_custody.settle_to(last + 1);
+        }
+        let mut st = self.lock();
+        for (key, gen, _) in withdrawn {
+            if let Some(h) = st.homes.get_mut(&key).filter(|h| h.gen == gen) {
+                h.exported = false;
+                st.sync(key);
+            }
         }
         self.publish(&mut st);
         self.unlock(st);
-        if withdrew {
-            self.to_custody.settle();
-        }
     }
 
     /// Co-residency, at a request's open and its pass starts (never in the hook): short of its
@@ -2661,7 +2717,7 @@ impl Inner {
             match st.homes.get(&key) {
                 // Its Keep's protect runs now: no pin (and no refill) while its access changes;
                 // the Keep's end wakes the binder.
-                Some(h) if h.protecting => {
+                Some(h) if h.protecting || h.reclaiming => {
                     waited = true;
                     self.wait(&mut st)?;
                 }
