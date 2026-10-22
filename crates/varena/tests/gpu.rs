@@ -2195,7 +2195,7 @@ fn measured_small(mem: &Memory, m: SetId) {
 /// lock, holding the bytes its segments hold): a segment is admitted against Memory's allocator limit and cut with
 /// cuMemAlloc. Past the limit, or on a real OOM, the callback (`reclaim_allocation`) runs inside the lock, and the
 /// allocation retries while each try finds the state changed and the callback reclaimed something. None: refused.
-fn segment(mem: &Memory, r: &Request, set: SetId, torch: &parking_lot::Mutex<u64>, size: u64, callbacks: &Timings) -> Option<(u64, varena::memory::Resident)> {
+fn segment(mem: &Memory, r: &Request, torch: &parking_lot::Mutex<u64>, size: u64, callbacks: &Timings) -> Option<(u64, varena::memory::Resident)> {
     let mut held = torch.lock();
     let d = cuda::driver().unwrap();
     let mut last = None;
@@ -2218,8 +2218,7 @@ fn segment(mem: &Memory, r: &Request, set: SetId, torch: &parking_lot::Mutex<u64
             return None;
         }
         last = Some((*held, limit));
-        let torch_now = Torch { allocated: *held, reserved: *held };
-        if callbacks.time("reclaim_allocation", || r.reclaim_allocation(Some(set), size, torch_now)).unwrap_or(0) == 0 {
+        if callbacks.time("reclaim_allocation", || r.reclaim_allocation(size)).unwrap_or(0) == 0 {
             return None;
         }
     }
@@ -2299,13 +2298,13 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
             let near = mem.allocator_limit().unwrap().saturating_sub(2 * REGION_ALIGN);
             let t = std::time::Instant::now();
             at(0, 1);
-            kept.extend(segment(&mem, &r, idle, &torch, near, &callbacks).map(|seg| (seg, near)));
+            kept.extend(segment(&mem, &r, &torch, near, &callbacks).map(|seg| (seg, near)));
             at(0, 0);
             timed(t);
             loop {
                 let t = std::time::Instant::now();
                 at(0, 1);
-                let got = segment(&mem, &r, idle, &torch, REGION_ALIGN, &callbacks);
+                let got = segment(&mem, &r, &torch, REGION_ALIGN, &callbacks);
                 at(0, 0);
                 timed(t);
                 let Some(seg) = got else { break };
@@ -2322,7 +2321,7 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
             while !done.load(std::sync::atomic::Ordering::Acquire) {
                 let t = std::time::Instant::now();
                 at(1, 1);
-                match segment(&mem, &r, idle, &torch, REGION_ALIGN, &callbacks) {
+                match segment(&mem, &r, &torch, REGION_ALIGN, &callbacks) {
                     Some(seg) => {
                         at(1, 2);
                         assert_eq!(unsafe { (d.memset_d8_async)(seg.0, 9, REGION_ALIGN as usize, y.raw() as cuda::CUstream) }, cuda::SUCCESS);
@@ -2392,6 +2391,70 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
     assert_eq!(r.end().leftover, 0);
     step!();
     println!("PASS the allocator callback reclaims inside its lock without waiting for unrelated device work {uuid}");
+    step!();
+}
+
+/// Lazy room (core 98e4e4a24) on a card full of an idle kept set:
+/// - A request opens and lends the kept pages to the allocator callback: custody lets go, and the pages stay mapped
+///   and stocked.
+/// - The callback claims one; it unmaps and destroys it, and the driver gets the page's bytes back. Custody has let
+///   go, so the bytes are real.
+/// - The rest stay mapped while the request runs, and are kept (exported) again once no request is open.
+///
+/// Host version: ordering::a_request_lends_idle_kept_pages_to_the_callback_and_keeps_the_rest_after.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_lent_kept_page_is_claimed_by_the_callback_and_the_rest_are_kept_again() {
+    let (b, g, uuid) = card("lend");
+    step!();
+    // 1 GiB: a card small enough for a kept set to fill.
+    let ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let a = mem.load(set("a", 1, Fill::Stored, &g.uuid, |b| block(96, b)), Level::Ram).unwrap();
+    step!();
+    let room = mem.torch_limit() / REGION_ALIGN;
+    step!();
+    mem.load(bulk("kept", room as u32, &g.uuid), Level::Gpu).unwrap();
+    step!();
+    mem.settle();
+    step!();
+    let kept = timings.count("export");
+    step!();
+    assert!(kept >= 2, "the card holds an idle kept set: {kept} pages kept of {room}");
+    step!();
+    let r = mem.request("r", plan(&[&["a"]])).unwrap();
+    step!();
+    let before = driver_free();
+    step!();
+    let (unmaps, destroys) = (timings.count("unmap"), timings.count("destroy"));
+    step!();
+    assert_eq!(r.reclaim_allocation(REGION_ALIGN).unwrap(), REGION_ALIGN, "a lent page is the callback's");
+    step!();
+    let gained = driver_free().saturating_sub(before);
+    step!();
+    assert_eq!((timings.count("unmap") - unmaps, timings.count("destroy") - destroys), (1, 1), "the callback unmapped and destroyed one page");
+    step!();
+    assert!(gained >= REGION_ALIGN, "custody let go before the callback claimed it: the driver gained {gained} B");
+    step!();
+    // A pass start publishes the table: the pages not claimed stay mapped, not kept (N).
+    let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
+    step!();
+    let n: u64 = ledger.status().rows.iter().map(|row| row.classes[varena::table::Class::N.index()]).sum();
+    step!();
+    assert_eq!(n, (kept - 1) * REGION_ALIGN, "the lent pages the callback left stay mapped");
+    step!();
+    pass.end(Measured::default(), Torch::default());
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    mem.settle();
+    step!();
+    assert_eq!(timings.count("export"), kept + (kept - 1), "the pages left are kept again once no request is open");
+    step!();
+    println!("LEND {kept} kept pages lent; the callback claimed one (the driver gained {gained} B); {} kept again {uuid}", kept - 1);
+    step!();
+    println!("PASS a lent kept page is claimed by the callback and the rest are kept again {uuid}");
     step!();
 }
 
