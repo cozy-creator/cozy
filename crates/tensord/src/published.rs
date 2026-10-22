@@ -2770,7 +2770,7 @@ pub(crate) mod tests {
         assert_eq!(count(&heard, "GET /o/"), 2, "the header and its tree: {heard:?}");
         assert_eq!(count(&heard, "GET /blobs/"), 2, "{heard:?}");
         assert!(!crate::access::whole(store, &manifest.id(), &[]));
-        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "bf16".into(), tree: named.tree.clone().unwrap() };
+        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "model.bf16.cozytensors".into(), tree: named.tree.clone().unwrap() };
         assert_eq!(Pulled::of(store, &manifest).unwrap(), Some(pulled));
         let asked = heard.lock().unwrap().len();
         bench.publisher.structure(&hub, &[named], &job).unwrap();
@@ -3278,8 +3278,8 @@ pub(crate) mod tests {
         let source = json!({"path": "render.models.source", "class": "M", "weights": true, "default": "model@1.0.0",
             "encoded_leaves": "accept", "min_bits": 4, "phase": "decode"});
         let blackwell = Machine::new("acme/pkg", &[("10.0", 180 * GIB)], json!([source]), &["nvfp4", "int8", "fp16"]);
-        assert_eq!(blackwell.run(4).0, ["fp16"]);
+        assert_eq!(blackwell.run(4).0, ["model.fp16.cozytensors"]);
         let (lanes, warnings, _) = Machine::new("acme/pkg", &[("10.0", 180 * GIB)], json!([source]), &["nvfp4"]).run(0);
-        assert_eq!((lanes, warnings), (vec!["nvfp4".to_string()], vec![]));
+        assert_eq!((lanes, warnings), (vec!["model.nvfp4.cozytensors".to_string()], vec![]));
     }
 }
