@@ -264,6 +264,9 @@ fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&O
             return out;
         }
         Some(Done::Enough) => {}
+        // The previous allocation claim is still available. Try newly freed bytes before
+        // cutting or lowering, even when this round alone freed less than the full need.
+        Some(Done::Lowered) | None if d.got > 0 => {}
         Some(Done::Lowered) | None if set.is_none() => match outside {
             Some(s) => d.out.push(Action::CutOutside { req, site: s.name.clone(), shape: s.shape.clone() }),
             None if d.got == 0 => d.park_or_exhaust(r.episode.parked),
@@ -356,9 +359,10 @@ impl<'a> Demand<'a> {
         self.got + self.returning() >= self.need
     }
 
-    /// Covered by kept pages planned out: settle, then decide again.
+    /// Covered by returning pages, or real partial OOM progress from our own withdrawals:
+    /// settle before degrading. The next round counts these own bytes through tried.freed.
     fn settles(&mut self) -> bool {
-        if self.enough() || !self.covered() || self.returning() == 0 {
+        if self.enough() || self.returning() == 0 || (!self.covered() && !(self.oom && self.withdrawn > 0)) {
             return false;
         }
         self.out.push(Action::Settle);
