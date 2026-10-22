@@ -537,6 +537,12 @@ impl PyMemory {
         detached(py, &self.gpu.uuid, || Ok(self.memory().torch_limit()))
     }
 
+    /// The most torch's allocator could ever hold here (allocated + reachable): the fraction cap
+    /// beside the native pool, whose segments varena's allocator governs inside it.
+    fn torch_ceiling(&self, py: Python<'_>) -> PyResult<u64> {
+        detached(py, &self.gpu.uuid, || Ok(self.memory().torch_ceiling()))
+    }
+
     /// The record of the request that ended last.
     fn stats(&self, py: Python<'_>) -> PyResult<Option<PyStats>> {
         detached(py, &self.gpu.uuid, || Ok(self.memory().stats())).map(|s| s.map(Into::into))

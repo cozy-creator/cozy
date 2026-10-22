@@ -639,13 +639,13 @@ class Memory:
         """torch's allocator cap. At a pass's start, the larger of `torch_limit` and the pass's
         measured `room`; otherwise, or beside another running pass, it only rises: a pass that
         got its room never has its allocator churn against a smaller cap. With the pool, its
-        segments ask varena themselves: no cap."""
+        segments ask varena themselves, so the cap is `torch_ceiling`, the most torch could ever
+        hold: torch checks it before the pool's allocator, and it bounds other threads' default
+        pool."""
         if self.pool is not None and self.pooling:
-            if self.capped != self.torch.total:
-                self.capped = self.torch.total
-                self.torch.cap(self.capped)
-            return
-        want = max(self.native.torch_limit(), room)
+            want = self.native.torch_ceiling()
+        else:
+            want = max(self.native.torch_limit(), room)
         if not start or self.passes:
             want = max(want, self.capped or 0)
         if want != self.capped:
