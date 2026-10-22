@@ -6,10 +6,30 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use varena::{GpuId, HostBackend, Memory, Plan, Torch};
+use tensorfs::format::ObjectRef;
+use tensorfs::io::{ItemSource, ObjectRange, source::Source};
+use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
+use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Plan, SetSpec, Torch};
 
 fn gpu() -> GpuId {
     GpuId { uuid: "callback-heap-lock".into(), model: "host".into(), memory: 64 << 20 }
+}
+
+fn cold_page(dir: &std::path::Path) -> SetSpec {
+    let path = dir.join("cold.bin");
+    std::fs::write(&path, vec![7u8; REGION_ALIGN as usize]).unwrap();
+    let object = ObjectRef { sha256: "callback-cold-page".into(), length: REGION_ALIGN };
+    let layout = Layout {
+        parts: vec![Part { what: "weight".into(), region: 0, offset: 0, nbytes: REGION_ALIGN }],
+        regions: vec![Region { offset: 0, nbytes: REGION_ALIGN, span: REGION_ALIGN, items: vec![Item {
+            offset: 0, len: REGION_ALIGN,
+            source: ItemSource::Object(ObjectRange { obj: object.clone(), off: 0, len: REGION_ALIGN }), part_end: true,
+        }] }], nbytes: REGION_ALIGN, digest: "callback-cold-layout".into(), names: vec![vec!["weight".into()]],
+    };
+    // Undeclared fills are never exported to custody: actual driver bytes are ours to free.
+    let fingerprint = Fingerprint::new(&layout, &[], Fill::Undeclared, "1", "0/1", &gpu().uuid);
+    let source = Source::files(vec![(object, std::fs::File::open(path).unwrap())], false, 0);
+    SetSpec { name: "cold".into(), layout: Arc::new(layout), source: Arc::new(source), fingerprint }
 }
 
 struct Peer(Child);
@@ -61,6 +81,11 @@ fn callback_does_not_wait_for_a_peer_heap_lock() {
     let namespace = format!("allocator-test-{}-", std::process::id());
     assert!(varena::os::namespace(&namespace));
     let memory = Memory::open(gpu(), None, Box::new(HostBackend::new(gpu().memory))).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let set = memory.load(cold_page(dir.path()), Level::Gpu).unwrap();
+    let pin = memory.bind(set, 0, 0).unwrap();
+    pin.filled();
+    drop(pin);
     let request = Arc::new(memory.request("callback", Plan::default()).unwrap());
     memory.observe(Torch::default()).unwrap();
     let mut dead = peer("dead-row", &namespace);
@@ -70,7 +95,12 @@ fn callback_does_not_wait_for_a_peer_heap_lock() {
     let (answer, received) = mpsc::channel();
     let active = request.clone();
     let callback = std::thread::spawn(move || {
-        let result = active.reclaim_allocation(None, 1, Torch::default());
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        let result = loop {
+            let result = active.reclaim_allocation(None, gpu().memory, Torch::default());
+            if !matches!(result, Ok(0)) || std::time::Instant::now() >= until { break result; }
+            std::thread::yield_now();
+        };
         let _ = answer.send(result);
     });
     // Hang protection only. The assertion is causal: callback returned BEFORE the controller
@@ -80,7 +110,7 @@ fn callback_does_not_wait_for_a_peer_heap_lock() {
     assert!(locker.0.wait().unwrap().success());
     callback.join().unwrap();
     assert!(result.is_ok(), "native callback waited for a peer heap lock");
-    assert!(result.unwrap().is_ok(), "local callback must succeed or cleanly find no room");
+    assert!(result.unwrap().unwrap() >= REGION_ALIGN, "the callback actually reclaimed a completed local page while C still held the peer heap lock");
     drop(request);
     drop(memory);
 }
