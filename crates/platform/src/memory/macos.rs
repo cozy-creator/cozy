@@ -36,8 +36,12 @@ fn dir() -> Result<PathBuf> {
 }
 
 fn open(path: &std::path::Path) -> Result<Owned> {
+    open_as(path, true)
+}
+
+fn open_as(path: &std::path::Path, write: bool) -> Result<Owned> {
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
+    options.read(true).write(write).create(write);
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     Ok(options.open(path).map_err(Error::io("open", path))?.into())
 }
@@ -65,9 +69,9 @@ fn path_of(f: &Owned) -> Result<PathBuf> {
     Ok(PathBuf::from(path.to_string_lossy().into_owned()))
 }
 
-/// A new description of the same file: its locks are its own.
-pub fn reopen(f: &Owned) -> Result<Owned> {
-    open(&path_of(f)?)
+/// A new description of the same file (read-only unless `write`): its locks are its own.
+pub fn reopen(f: &Owned, write: bool) -> Result<Owned> {
+    open_as(&path_of(f)?, write)
 }
 
 /// The lock files this process holds, by (description, range start). A lock goes when its

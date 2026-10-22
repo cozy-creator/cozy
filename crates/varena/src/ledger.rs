@@ -1130,8 +1130,6 @@ impl Drop for Row {
             let _ = self.shared.leave();
             self.shared.ring();
         }
-        // Released here, not only by the close: on macOS the lock is a file of its own.
-        let _ = os::unlock(&self._lock, self.at, ROW_CELLS * CELL);
     }
 }
 

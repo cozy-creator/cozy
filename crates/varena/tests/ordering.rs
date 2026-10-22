@@ -1363,6 +1363,7 @@ fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
     binder.join().unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn failed_renewal_completion_keeps_the_old_mapping_alive() {
     for mode in ["finish", "unmap", "destroy"] {
@@ -1373,6 +1374,7 @@ fn failed_renewal_completion_keeps_the_old_mapping_alive() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "subprocess entry for failed_renewal_completion_keeps_the_old_mapping_alive"]
 fn failed_renewal_child() {
