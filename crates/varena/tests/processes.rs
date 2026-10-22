@@ -187,6 +187,9 @@ impl Backend for Recording {
     fn target(&self, va: Va, offset: u64, len: u64) -> tensorfs::io::Dst {
         self.host.target(va, offset, len)
     }
+    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> varena::Result<()> {
+        self.host.save(va, offset, host, after)
+    }
     fn fence(&self) -> varena::Result<Event> {
         self.host.fence()
     }
@@ -204,6 +207,9 @@ impl Backend for Recording {
     }
     fn synchronize(&self, stream: usize) -> varena::Result<()> {
         self.host.synchronize(stream)
+    }
+    fn finish(&self, event: Event) -> varena::Result<()> {
+        self.host.finish(event)
     }
     fn register_host(&self, ptr: u64, _: u64) -> varena::Result<()> {
         self.registered.lock().insert(ptr);
@@ -272,6 +278,8 @@ fn agent() {
                 let m = mem.as_ref().unwrap();
                 match m.load(spec(name, Path::new(path), fill, &uuid), level) {
                     Ok(id) => {
+                        // The tier's copies of the filled pages too: the cases count classes.
+                        m.settle();
                         sets.insert(name.to_string(), (id, path.to_string()));
                         "ok".into()
                     }
@@ -806,7 +814,7 @@ fn a_table_with_live_rows_outlives_tensord(dir: &Path) {
     drop(first);
     let second = varena::Ledger::create(&g, None).unwrap();
     let row = second.status().rows.into_iter().find(|r| r.pid == pid);
-    assert!(row.is_some_and(|r| r.live && r.classes[3] == 2 * MB), "the executor's row is still there");
+    assert!(row.as_ref().is_some_and(|r| r.live && r.classes[3] == 2 * MB), "the executor's row is still there: {row:?}");
     a.exit();
     drop(second);
 }

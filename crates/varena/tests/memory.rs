@@ -354,7 +354,8 @@ fn an_oom_between_passes_evicts_cold_pages() {
     assert!(matches!(r.oom(None, Some(free + REGION_ALIGN), None, Torch::default()), Next::Retry));
     assert_eq!(ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum::<u64>(), 0, "n went");
     let pass = r.pass(a, "fwd", "1x8", Torch::default()).unwrap();
-    assert!(!mem.bind(a, 1, 0).unwrap().fresh);
+    drop(mem.bind(a, 1, 0).unwrap());
+    assert_eq!(r.stats().trace.last().map(|t| t.origin), Some(varena::Origin::Hit), "a's page stayed");
     assert_eq!(r.cut(Some(a), "ffn", "1x8"), 0, "nothing was cut");
     pass.end(Measured::default(), Torch::default());
     assert!(!r.stats().lowered, "nothing was lowered");
@@ -450,4 +451,85 @@ fn tensord_sets_the_capacity_a_standalone_opener_lowers_it() {
     assert_eq!(capacity(&ledger), 64 * MB, "the limit lifted: the card's");
     drop(varena::Grant::open(&g, Some(8 * MB)).unwrap());
     assert_eq!(capacity(&ledger), 8 * MB, "a standalone cap lowers it");
+}
+
+/// S5 r3: a load records its set's bytes (its layout's span) on its GPU's table, persisted as
+/// Peak::Set; placement homes a set that does not fit beside GPU 0's pinned pages on the GPU
+/// with room, and keeps it on GPU 0 once they let go.
+#[test]
+fn a_set_goes_where_it_fits_and_stays_on_gpu_0_when_it_can() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("place0", 8 * MB);
+    let other = GpuId { uuid: format!("m{}-place1", std::process::id()), model: "host".into(), memory: 8 * MB };
+    let _other_scope = Scope::new(&other.uuid);
+    let second = varena::Ledger::create(&other, None).unwrap();
+    let big = mem.load(set(dir.path(), "big", 3, &g.uuid), Level::Ram).unwrap();
+    mem.load(set(dir.path(), "te", 2, &g.uuid), Level::Ram).unwrap();
+    assert!(ledger.peaks().contains(&varena::Peak::Set { key: "pkg@1/te".into(), bytes: 2 * REGION_ALIGN }));
+    let r = mem.request("r", plan("big")).unwrap();
+    let pass = r.pass(big, "fwd", "1x8", Torch::default()).unwrap();
+    let pins: Vec<_> = (0..3).map(|b| mem.bind(big, b, 0).unwrap()).collect();
+    let te = [("pkg@1/te", None)];
+    assert_eq!(varena::Ledger::place(&[&ledger, &second], "pkg", "", None, &te).unwrap(), vec![1], "GPU 0 holds 2 MB beside the running pass");
+    drop(pins);
+    pass.end(Measured::default(), Torch::default());
+    r.end();
+    assert_eq!(varena::Ledger::place(&[&ledger, &second], "pkg", "", None, &te).unwrap(), vec![0], "idle, GPU 0 keeps it");
+    assert_eq!(varena::Ledger::place(&[&ledger, &second], "pkg", "", None, &[("pkg@1/te", Some(6 * MB))]).unwrap(), vec![0], "a layout's bytes, given");
+}
+
+/// A one-region set of `fill` (stored bytes 7).
+fn one(dir: &Path, uuid: &str, name: &str, fill: Fill) -> SetSpec {
+    let mut spec = set(dir, name, 1, uuid);
+    std::fs::write(dir.join(format!("{name}.bin")), vec![7u8; REGION_ALIGN as usize]).unwrap();
+    spec.fingerprint = Fingerprint::new(&spec.layout, &[], fill, "release-1", "0/1", uuid);
+    spec
+}
+
+/// One page of room: binds `set`'s block in its own request (after `other` took the page),
+/// bakes it to `bake` when it comes back fresh, and returns (fresh, its first byte).
+fn rebind(mem: &Memory, set: varena::SetId, other: varena::SetId, bake: u8) -> (bool, u8) {
+    let r = mem.request("other", Plan { steps: vec![Step { sets: vec!["pkg@1/other".into()], passes: 1 }] }).unwrap();
+    let pass = r.pass(other, "fwd", "1x1", Torch::default()).unwrap();
+    drop(mem.bind(other, 0, 0).unwrap());
+    pass.end(Measured::default(), Torch::default());
+    r.end();
+    let r = mem.request("lora", plan("lora")).unwrap();
+    let pass = r.pass(set, "fwd", "1x1", Torch::default()).unwrap();
+    let pin = mem.bind(set, 0, 0).unwrap();
+    // SAFETY: a mapped page bound to this test alone; read, and written only when fresh.
+    let byte = unsafe { *(pin.ptr as *const u8) };
+    let fresh = pin.fresh;
+    if fresh {
+        // SAFETY: as above.
+        unsafe { std::ptr::write_bytes(pin.ptr as *mut u8, bake, pin.len as usize) };
+        pin.filled();
+    }
+    drop(pin);
+    pass.end(Measured::default(), Torch::default());
+    // Its tier copy, and the eviction's withdraws and unmaps, are done.
+    mem.settle();
+    r.end();
+    (fresh, byte)
+}
+
+/// Review 4, N1 and N2 (the reviewer's probes, event-driven): a page whose bytes are the
+/// weights is never fresh, so a RAM-tier hit of a baked page is not baked again; and the tier
+/// holds bytes by identity: after LoRA a -> b, b's page comes from the store, fresh, and a's
+/// layout still gives a's baked bytes.
+#[test]
+fn the_tier_keeps_baked_pages_by_identity_and_never_hands_them_out_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("baked", REGION_ALIGN);
+    let lora = mem.load(one(dir.path(), &g.uuid, "lora", Fill::Declared("a".into())), Level::Ram).unwrap();
+    let other = mem.load(one(dir.path(), &g.uuid, "other", Fill::Stored), Level::Ram).unwrap();
+    assert_eq!(rebind(&mem, lora, other, 0x11), (true, 7), "first use: the store's bytes, baked to a");
+    assert!(mem.stats().unwrap().moved.saved.bytes > 0, "the baked page went to the tier");
+    assert_eq!(rebind(&mem, lora, other, 0x11), (false, 0x11), "a tier hit holds a's weights: not baked again");
+    mem.fill(lora, Fill::Declared("b".into()));
+    mem.settle();
+    assert_eq!(rebind(&mem, lora, other, 0x22), (true, 7), "b: the store's bytes, fresh, never a's");
+    mem.fill(lora, Fill::Declared("a".into()));
+    mem.settle();
+    assert_eq!(rebind(&mem, lora, other, 0x33), (false, 0x11), "a's layout is untouched");
 }

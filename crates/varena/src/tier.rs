@@ -645,6 +645,11 @@ impl Held {
         self.regions.get(r as usize).copied().ok_or_else(|| Error::Invalid(format!("region {r}")))
     }
 
+    /// Whether the tier holds region `r` (filled, and not taken back).
+    pub fn holds(&self, r: u32) -> bool {
+        self.ready(r).is_some_and(|w| w.load(Acquire) == 1)
+    }
+
     /// Copies each ready region into its destination, all in one engine read, under their
     /// read locks; whether each was copied. The caller settles each afterwards
     /// ([`Held::settle`]).

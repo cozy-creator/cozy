@@ -78,6 +78,10 @@ pub trait Backend: Send + Sync {
     /// Where `io::read` writes `len` mapped bytes at `va + offset`: device memory ordered on the
     /// backend's copy stream, or host memory.
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst;
+    /// Copies `host.len()` mapped bytes at `va + offset` into `host`, after `after`, on a
+    /// low-priority stream of its own (the other copy direction: never ahead of a fill), and
+    /// returns once they are there.
+    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()>;
     /// An event after everything the copy stream holds so far.
     fn fence(&self) -> Result<Event>;
     /// An event (with timing) after everything `stream` holds so far.
@@ -90,6 +94,9 @@ pub trait Backend: Send + Sync {
     fn wait(&self, event: Event, stream: usize) -> Result<()>;
     /// Blocks until `stream`'s work so far completes: only where recording an event failed.
     fn synchronize(&self, stream: usize) -> Result<()>;
+    /// Blocks until `event` completes: only the mechanism thread, before it unmaps a page whose
+    /// consumers may still read it.
+    fn finish(&self, event: Event) -> Result<()>;
     /// Page-locks `len` bytes of read-only host memory at `ptr` for the copy engine
     /// (`cuMemHostRegister`): a RAM-tier region, once, so every fill from it is a pinned copy.
     fn register_host(&self, ptr: u64, len: u64) -> Result<()>;
@@ -252,6 +259,13 @@ mod host {
             Dst::Host { ptr: (va.base + offset) as *mut u8, len: len as usize }
         }
 
+        fn save(&self, va: Va, offset: u64, host: &mut [u8], _: Event) -> Result<()> {
+            // SAFETY: a mapped page of at least `host.len()` bytes, filled (fills here are
+            // synchronous); another mapping than `host`.
+            host.copy_from_slice(unsafe { std::slice::from_raw_parts((va.base + offset) as *const u8, host.len()) });
+            Ok(())
+        }
+
         fn fence(&self) -> Result<Event> {
             Ok(Event::DONE)
         }
@@ -273,6 +287,11 @@ mod host {
         }
 
         fn synchronize(&self, _: usize) -> Result<()> {
+            Ok(())
+        }
+
+        /// Host events are complete when made.
+        fn finish(&self, _: Event) -> Result<()> {
             Ok(())
         }
 
@@ -348,6 +367,9 @@ mod host {
         fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
             Dst::Host { ptr: (va.base + offset) as *mut u8, len: len as usize }
         }
+        fn save(&self, _: Va, _: u64, _: &mut [u8], _: Event) -> Result<()> {
+            Err(later())
+        }
         fn fence(&self) -> Result<Event> {
             Ok(Event::DONE)
         }
@@ -365,6 +387,9 @@ mod host {
         }
 
         fn synchronize(&self, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn finish(&self, _: Event) -> Result<()> {
             Ok(())
         }
         fn register_host(&self, _: u64, _: u64) -> Result<()> {
