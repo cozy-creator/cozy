@@ -557,8 +557,20 @@ def off_forward(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionM
     del row
     gc.collect()
     check("off-forward: the pin goes when the tensor dies", native.pins_held() == held, (native.pins_held(), held))
+    # The runtime's gateway for a read no op sees (a launch by pointer): Placeholder._varena_read.
+    bound = weight._varena_read()
+    check("off-forward: _varena_read is the bound tensor, its bytes", torch.equal(bound.detach().cpu(), want), "differs")
+    check("off-forward: it holds its page's pin while it lives", native.pins_held() == held + 1 and bound.data_ptr() != 0, native.pins_held())
+    del bound
+    gc.collect()
+    check("off-forward: the pin goes when it dies", native.pins_held() == held, native.pins_held())
+    try:
+        adapter.Placeholder((2,), torch.float32, torch.device("cpu"))._varena_read()
+        check("off-forward: a placeholder of no loaded model refuses", False, "read")
+    except adapter.Unbound:
+        check("off-forward: a placeholder of no loaded model refuses", True)
     reads = {path: n for (_, path), n in mem.off_forward.items()}.get("down_blocks.1.resnets.0", (0, 0))
-    check("off-forward: the reads are counted with their bytes", reads[0] == 2 and reads[1] > 0, mem.off_forward)
+    check("off-forward: the reads are counted with their bytes", reads[0] == 3 and reads[1] > 0, mem.off_forward)
 
 
 def escapes(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel, reference: list[torch.Tensor], derived: bool) -> None:

@@ -116,6 +116,13 @@ class Placeholder(Tensor):
     def __repr__(self) -> str:  # type: ignore[override]
         return f"Placeholder({tuple(self.shape)}, {self.dtype}, {self.device})"
 
+    def _varena_read(self) -> Tensor:
+        """Its block bound now, for a read no op sees too (a compiled extension's or Triton's
+        launch reads it by pointer, which is 0 here): the bound tensor, which with its views
+        holds the pin until it dies. A loaded model's placeholder carries its own; this one
+        belongs to none."""
+        raise Unbound("a weight of no loaded model, with no pin bound")
+
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
         aten, kwargs = torch.ops.aten, kwargs or {}
@@ -125,18 +132,13 @@ class Placeholder(Tensor):
             held = args[0]
             dtype, device = kwargs.get("dtype") or held.dtype, kwargs.get("device") or held.device
             made = cls(held.shape, dtype, device)
-            read = getattr(held, "_varena_read", None)
-            if read is not None:
+            if "_varena_read" in vars(held):  # a loaded model's: the copy reads converted
+                read = held._varena_read
                 made._varena_read = lambda: read().to(device=device, dtype=dtype)
             return made
 
         def bound(a: object) -> object:
-            if not isinstance(a, Placeholder):
-                return a
-            read = getattr(a, "_varena_read", None)
-            if read is None:
-                raise Unbound(f"{func}: a weight of no loaded model, with no pin bound")
-            return read()
+            return a._varena_read() if isinstance(a, Placeholder) else a
 
         args, kwargs = tree_map(bound, (args, kwargs))
         return func(*args, **kwargs)
