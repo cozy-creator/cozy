@@ -52,8 +52,25 @@ pub struct Hello {
     pub pgid: u32,
     pub runtime_version: String,
     pub tensorfs_version: String,
+    /// Executor memory wire contract: 1 receives table + row-lock descriptors per GPU
+    /// and uses Varena custody/RAM services directly. Zero is the legacy single-fd contract.
+    pub memory_protocol: u32,
     pub sealed: BTreeMap<String, String>,
     pub torch_loaded: bool,
+}
+
+impl Hello {
+    fn accepts(&self, command: &DeviceCommand) -> io::Result<()> {
+        if matches!(command, DeviceCommand::Start { devices, ledgers, .. } if !devices.is_empty() || *ledgers != 0)
+            && self.memory_protocol != 1
+        {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
+                "GPU executor requires memory_protocol=1 (two ledger descriptors per GPU); Runtime {} advertises {}. Upgrade Runtime and TensorFS together",
+                self.runtime_version, self.memory_protocol,
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1550,6 +1567,9 @@ impl DeviceExecutor {
         fds: &[File],
         services: &mut impl Services,
     ) -> io::Result<Frame> {
+        // Refuse incompatible descriptor framing before writing the command or any handle.
+        // CPU/import-only baseline commands do not need the GPU memory capability.
+        self.hello.accepts(command)?;
         let meter = match (command, &self.activity) {
             (DeviceCommand::Invoke { .. }, Some(_)) => Meter::Work,
             (DeviceCommand::Invoke { .. }, None) => Meter::Frames,
@@ -2021,6 +2041,24 @@ mod codec_tests {
         assert_eq!(adjustments("run-2", &many).len(), MAX_ADJUSTMENTS);
         let none = Frame { adjustments: serde_json::json!({"steps": 30}), ..Default::default() };
         assert!(adjustments("run-3", &none).is_empty() && adjustments("run-4", &Frame::default()).is_empty());
+    }
+
+    #[test]
+    fn gpu_start_requires_the_memory_descriptor_contract_not_a_patch_version() {
+        let legacy: Hello = serde_json::from_value(serde_json::json!({"runtime_version": "0.30.3"})).unwrap();
+        let mut start = DeviceCommand::Start {
+            devices: String::new(), application: String::new(), package_interface: PathBuf::new(),
+            sequence_parallel_degree: 1, import_only: false, call_interfaces: vec![],
+            constructions: vec![], ledgers: 0, memory_mode: MemoryMode::Dedicated,
+        };
+        legacy.accepts(&DeviceCommand::Hello).unwrap();
+        legacy.accepts(&start).unwrap();
+        if let DeviceCommand::Start { devices, ledgers, .. } = &mut start { *devices = "0".into(); *ledgers = 1; }
+        assert_eq!(legacy.accepts(&start).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        let capable: Hello = serde_json::from_value(serde_json::json!({"runtime_version": "0.31.99", "memory_protocol": 1})).unwrap();
+        capable.accepts(&start).unwrap();
+        let incompatible: Hello = serde_json::from_value(serde_json::json!({"memory_protocol": 2})).unwrap();
+        assert!(incompatible.accepts(&start).is_err());
     }
 
     /// A null in any optional field reads as its absence: a string, a flattened hello field,
