@@ -1581,7 +1581,8 @@ impl Inner {
         let (ns, bytes) = (start.elapsed().as_nanos() as u64, pages.iter().map(|(_, (.., span))| span).sum::<u64>().max(1));
         // After a copy error the engine's copies may still run: a failed page is unmapped only
         // once the copy stream is proven drained.
-        let drained = landed.iter().all(Result::is_ok) || self.backend.drain().is_ok();
+        let ownership_lost = landed.iter().any(|out| matches!(out, Err(Error::Ownership(_))));
+        let drained = !ownership_lost && (landed.iter().all(Result::is_ok) || self.backend.drain().is_ok());
         let mut sticky = false;
         let mut st = self.state.lock();
         if !drained {
@@ -1645,6 +1646,7 @@ impl Inner {
                 }
             }
         }
+        if sticky { self.ownership_lost.store(true, Ordering::Release); }
         self.publish(&st);
         self.unlock(st);
         self.landed.notify_all();
@@ -1691,8 +1693,10 @@ impl Inner {
                         }
                     }
                     let mut from: Vec<&mut Copying> = copies.iter_mut().filter(|c| todo(c)).collect();
-                    let copied = held.read(&from.iter().map(|c| (c.key.1, c.dst)).collect::<Vec<_>>());
-                    from.iter().for_each(|c| held.settle(c.key.1, unregister));
+                    let copied = held.read(&from.iter().map(|c| (c.key.1, c.dst)).collect::<Vec<_>>(), || self.backend.drain());
+                    if !matches!(&copied, Err(Error::Ownership(_))) {
+                        from.iter().for_each(|c| held.settle(c.key.1, unregister));
+                    }
                     match copied {
                         Ok(copied) => from.iter_mut().zip(copied).filter(|(_, ok)| *ok).for_each(|(c, _)| c.out = Some(Ok(Origin::Tier))),
                         Err(e) => from.iter_mut().for_each(|c| c.out = Some(Err(e.clone()))),
@@ -1710,10 +1714,15 @@ impl Inner {
     }
 
     /// A fill thread's batch failed outside its copies (a panic): its pages go, their binders fail.
-    fn fail(&self, jobs: &[Job], e: Error) {
+    fn fail(self: &Arc<Self>, jobs: &[Job], e: Error) {
         // Its copies may have been issued: unmapped only once the copy stream is drained.
         let drained = self.backend.drain().is_ok();
         let mut st = self.state.lock();
+        let e = if drained { e } else {
+            self.ownership_lost.store(true, Ordering::Release);
+            std::mem::forget(self.clone());
+            Error::Ownership(format!("fill panicked ({e}); its copies did not drain"))
+        };
         for job in jobs {
             if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen) {
                 if drained {
