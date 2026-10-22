@@ -54,8 +54,17 @@ fn peer(role: &str, namespace: &str) -> Peer {
     child
 }
 
-/// Its claim file goes when the test does, passed or failed.
-struct Claims;
+/// Its claim file goes when the test does, passed or failed. The cases share one table, one
+/// namespace and its RAM-tier claims: they run one at a time (a process opens a device once).
+struct Claims(#[allow(dead_code)] parking_lot::MutexGuard<'static, ()>);
+
+static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+impl Claims {
+    fn new() -> Claims {
+        Claims(SERIAL.lock())
+    }
+}
 
 impl Drop for Claims {
     fn drop(&mut self) {
@@ -87,7 +96,7 @@ fn callback_peer() {
 fn the_hooks_free_read_does_not_wait_for_a_peer_heap_lock() {
     let namespace = format!("allocator-test-{}-", std::process::id());
     assert!(varena::os::namespace(&namespace));
-    let _claims = Claims;
+    let _claims = Claims::new();
     let memory = Arc::new(Memory::open(gpu(), None, Box::new(HostBackend::new(gpu().memory))).unwrap());
     let dir = tempfile::tempdir().unwrap();
     let set = memory.load(cold_page(dir.path()), Level::Gpu).unwrap();
@@ -125,7 +134,7 @@ fn the_hooks_free_read_does_not_wait_for_a_peer_heap_lock() {
 fn step1_the_hooks_make_room_waits_for_a_peer_heap_lock() {
     let namespace = format!("allocator-test-{}-", std::process::id());
     assert!(varena::os::namespace(&namespace));
-    let _claims = Claims;
+    let _claims = Claims::new();
     let memory = Arc::new(Memory::open(gpu(), None, Box::new(HostBackend::new(gpu().memory))).unwrap());
     let dir = tempfile::tempdir().unwrap();
     let set = memory.load(cold_page(dir.path()), Level::Gpu).unwrap();
