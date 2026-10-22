@@ -82,8 +82,8 @@ impl Deposits {
         Some((file, filling))
     }
 
-    /// Whether `who` (`call#rank`) seals `layout` of `bytes`: `admit` decides, beside the bytes
-    /// admitted fills have still to fill, under this one lock. One copy per layout: while
+    /// Whether `who` (`call#rank`) seals `layout` of `bytes` (its checkpoint's): `admit` decides,
+    /// beside the bytes admitted fills of other checkpoints have still to fill, under this lock. One copy per layout: while
     /// another seals it, that one is named and the asker waits for its deposit. False: not
     /// admitted, or a deposit landed since the caller looked (it should ask `grant` again).
     /// `regardless`: the asker seals whatever the answer (an older Runtime or TensorFS), so it is
@@ -98,20 +98,20 @@ impl Deposits {
         if held.contains_key(&key(manifest, layout)) {
             return Ok(false);
         }
-        let reserved = sealing.values().map(|p| p.bytes).sum::<u64>() + held.values().map(Held::unfilled).sum::<u64>();
+        let mut reserved = reserved(&sealing, &held);
+        reserved.remove(&key(manifest, layout).0);
         drop(held);
-        if !admit(reserved) && !regardless {
+        if !admit(reserved.values().sum()) && !regardless {
             return Ok(false);
         }
         sealing.insert(key(manifest, layout), Pending { who: who.into(), bytes });
         Ok(true)
     }
 
-    /// Bytes admitted fills have still to fill: layouts sealing and not yet deposited, and
-    /// deposited ones their fillers still fill.
+    /// Bytes admitted fills have still to fill (`reserved`).
     pub fn reserved(&self) -> u64 {
         let sealing = self.sealing.lock().unwrap();
-        sealing.values().map(|p| p.bytes).sum::<u64>() + self.held.lock().unwrap().values().map(Held::unfilled).sum::<u64>()
+        reserved(&sealing, &self.held.lock().unwrap()).values().sum()
     }
 
     /// Call `call` ended: a layout it was sealing and never deposited is nobody's to wait for.
@@ -136,6 +136,21 @@ impl Deposits {
         let oldest = idle.min_by_key(|(_, h)| h.used).map(|(key, _)| key.clone());
         oldest.and_then(|key| held.remove(&key)).is_some()
     }
+}
+
+/// What admitted fills have still to fill, by manifest: a layout sealing and not yet deposited
+/// reserves its checkpoint's selected bytes, which cover every layout of that checkpoint, else
+/// the deposited layouts' fillers what they have still to fill.
+fn reserved(sealing: &BTreeMap<(String, String), Pending>, held: &BTreeMap<(String, String), Held>) -> BTreeMap<String, u64> {
+    let mut by: BTreeMap<String, u64> = BTreeMap::new();
+    for ((manifest, _), layout) in held {
+        *by.entry(manifest.clone()).or_default() += layout.unfilled();
+    }
+    for ((manifest, _), pending) in sealing {
+        let bytes = by.entry(manifest.clone()).or_default();
+        *bytes = (*bytes).max(pending.bytes);
+    }
+    by
 }
 
 /// Whether `pid` maps `file` or holds it open (its /proc entries name the same inode). A process
@@ -262,14 +277,16 @@ pub(crate) mod tests {
         assert_eq!(deposits.seal("m", "l", "run-a#0", 4096, false, |_| panic!("a retry keeps its admission")), Ok(true));
         assert_eq!(deposits.seal("m", "l", "run-a#1", 4096, false, |_| true), Err("run-a#0".into()), "rank 1 waits for rank 0");
         assert_eq!(deposits.seal("m", "l", "run-b#0", 4096, false, |_| false), Err("run-a#0".into()), "another call waits too");
-        assert_eq!(deposits.seal("m", "other", "run-b#0", 10, false, |reserved| reserved == 4096), Ok(true));
+        assert_eq!(deposits.seal("m2", "other", "run-b#0", 10, false, |reserved| reserved == 4096), Ok(true));
         assert_eq!(deposits.reserved(), 4096 + 10);
+        // Another layout of the first checkpoint: its bytes already cover it.
+        assert_eq!(deposits.seal("m", "l2", "run-b#0", 4096, false, |reserved| reserved == 10), Ok(true));
+        assert_eq!(deposits.reserved(), 4096 + 10);
+        deposits.ended("run-b");
         deposits.deposit("m", "l", layout(4096), &[]).unwrap();
-        assert_eq!(deposits.reserved(), 10, "a filled deposit reserves nothing");
+        assert_eq!(deposits.reserved(), 0, "a filled deposit reserves nothing");
         assert_eq!(deposits.seal("m", "l", "run-c#0", 4096, false, |_| panic!("the deposit already landed")), Ok(false));
         assert!(deposits.grant("m", "l", &[]).is_some());
-        deposits.ended("run-b");
-        assert_eq!(deposits.reserved(), 0);
         assert_eq!(deposits.seal("m", "other", "run-d#1", 10, false, |_| true), Ok(true));
     }
 
