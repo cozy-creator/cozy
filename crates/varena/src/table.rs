@@ -362,6 +362,9 @@ pub struct Table {
     /// Bytes of pages being unmapped by the mechanism thread: still this process's on the
     /// device (P to others), already spent on the creates queued after them (not to itself).
     pub inflight: u64,
+    /// The bytes of a page whose RAM-tier copy runs: pinned meanwhile (a consumer), its own
+    /// again once the copy ends, so a demand waits for it before it degrades (review 4, N4).
+    pub saving: u64,
     /// Torch's allocator, as last measured (pass start and end, every OOM).
     pub allocated: u64,
     pub reserved: u64,
@@ -465,7 +468,7 @@ impl Table {
     /// Unique backing already retiring. It remains charged until its owners finish; neither
     /// overlapping mechanism/custody tickets nor ownership-lost quarantines add reclaim credit.
     pub fn returning(&self) -> u64 {
-        self.returning.min(self.vmm) + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
+        self.returning.min(self.vmm) + self.saving + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
     }
 
     fn others_held(&self) -> u64 {
