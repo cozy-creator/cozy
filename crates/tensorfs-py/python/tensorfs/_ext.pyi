@@ -4,7 +4,7 @@ from collections.abc import Callable, ItemsView, Iterator, KeysView, Mapping, Se
 from os import PathLike
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Protocol, TypeVar, overload
+from typing import Any, Literal, Protocol, TypeVar, overload
 from typing_extensions import Buffer
 
 from .api import CheckpointFile
@@ -294,9 +294,9 @@ class Writer:
                  base: Checkpoint | None = None, resume: str | None = None,
                  cache_dir: StrPath | None = None, repo_id: str | None = None, revision: str | None = None,
                  endpoint: str | None = None, token: _Token | None = None, ca_der: bytes | None = None) -> None: ...
-    def pipeline(self, cls: ClassRef | tuple[str, str, str], config: Mapping[str, Any]) -> None: ...
+    def pipeline(self, cls: ClassRef | tuple[str, str, str] | Literal[""] | None, config: Mapping[str, Any]) -> None: ...
     def component(
-        self, name: str, cls: ClassRef | tuple[str, str, str] | None = None, config: Mapping[str, Any] | None = None,
+        self, name: str, cls: ClassRef | tuple[str, str, str] | Literal[""] | None = None, config: Mapping[str, Any] | None = None,
         config_file: str | None = None,
     ) -> ComponentWriter:
         """Declares a component (again: class and config change, tensors stay)."""

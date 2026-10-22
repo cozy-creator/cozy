@@ -1,6 +1,6 @@
 [package]
 name = "varena"
-version = "0.13.2"
+version = "0.13.3"
 edition = "2021"
 publish.workspace = true
 description = "The memory of the processes computing with model weights: one GPU table, one decision procedure, kept pages and the RAM tier."

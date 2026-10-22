@@ -29,6 +29,7 @@ fn peer(role: &str, namespace: &str) -> Peer {
         assert!(output.read_line(&mut line).unwrap() != 0, "peer {role} exited before ready");
         if line.contains("CALLBACK_READY") { break; }
     }
+    child.0.stdout = Some(output.into_inner());
     child
 }
 

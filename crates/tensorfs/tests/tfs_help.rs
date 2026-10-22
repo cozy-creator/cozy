@@ -30,20 +30,21 @@ fn help_succeeds() {
         assert_eq!(code, Some(0), "{args:?}");
         assert!(
             out.starts_with("usage: tfs")
-                && out.contains("\n  convert ")
+                && out.contains("\n  import ")
                 && out.contains("\n  version"),
             "{args:?}: {out}"
         );
     }
     for args in [
-        &["convert", "--help"][..],
-        &["convert", "-h"],
-        &["help", "convert"],
+        &["import", "--help"][..],
+        &["import", "-h"],
+        &["help", "import"],
+        &["convert", "--help"],
     ] {
         let (code, out, _) = tfs(args);
         assert_eq!(code, Some(0), "{args:?}");
         assert!(
-            out.contains("\n  convert <source>") && !out.contains("\n  version"),
+            out.contains("\n  import <source>") && !out.contains("\n  version"),
             "{args:?}: {out}"
         );
     }
