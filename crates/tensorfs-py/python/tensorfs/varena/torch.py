@@ -298,6 +298,7 @@ class Binding:
                 elif isinstance(stream, int):
                     stream = torch.cuda.ExternalStream(stream, device=memory.device)
             with torch.cuda.stream(stream) if memory.cuda else nullcontext():
+                memory.native.fill(self.model.id, _fill(self.model.fill))
                 pins = self.native.prepare(stream.cuda_stream if stream is not None else 0)
                 held: list[_Block] = []
                 try:
@@ -363,6 +364,7 @@ _opening = threading.Lock()
 #: The request a forward runs in, and the pass a site op runs in.
 _request: ContextVar[Request | None] = ContextVar("varena_request", default=None)
 _pass: ContextVar[_Pass | None] = ContextVar("varena_pass", default=None)
+_pool: ContextVar[tuple[Memory, torch.cuda.MemPool] | None] = ContextVar("varena_pool", default=None)
 
 
 class Memory:
@@ -505,11 +507,15 @@ class Memory:
         if selected is None or r is None:
             yield
             return
+        if self.cuda and torch.cuda.is_current_stream_capturing():
+            raise Unbound("select and preseed the graph pool before capture")
         r.native.allocating(self.native, p.set if p else None, *self.torch.now(), selected.id)
+        token = _pool.set((self, selected))
         try:
             with torch.cuda.use_mem_pool(selected, self.device):
                 yield
         finally:
+            _pool.reset(token)
             _allocated()
 
     def cache(self, owner: str, shrink: Callable[[int], int]) -> Cache:
@@ -590,6 +596,9 @@ class Memory:
         local.depth = getattr(local, "depth", 0) + 1
         if local.depth > 1:
             return
+        if self.cuda and torch.cuda.is_current_stream_capturing():
+            local.depth -= 1
+            raise Unbound("open the model pass and prepare graph dependencies before capture")
         p: _Pass | None = None
         try:
             r = self._current()
@@ -605,8 +614,10 @@ class Memory:
             growth, slack = model.rooms.get((entry, shape), (0, 0))
             self._cap(allocated + growth + slack if growth or slack else 0, start=True)
             if self.pool is not None and self.pooling and not (self.cuda and torch.cuda.is_current_stream_capturing()):  # capture owns its exact pool
-                r.native.allocating(self.native, model.id, allocated, reserved, self.pool.id)
-                p.pooled = torch.cuda.use_mem_pool(self.pool, self.device)
+                selected = _pool.get()
+                pool = selected[1] if selected is not None and selected[0] is self else self.pool
+                r.native.allocating(self.native, model.id, allocated, reserved, pool.id)
+                p.pooled = torch.cuda.use_mem_pool(pool, self.device)
                 p.pooled.__enter__()
             p.entered = sys.exc_info()[1]
             self._fold()  # the passes open already keep what ran before; this one starts here
@@ -663,6 +674,8 @@ class Memory:
         stream = torch.cuda.current_stream(self.device) if self.cuda else None
         with block.model.lock:
             if block.count == 0:
+                if self.cuda and torch.cuda.is_current_stream_capturing():
+                    raise Unbound(f"block {block.path!r} was not prepared before capture")
                 self._bind(block, stream)
             elif stream is not None and stream != block.stream and not torch.cuda.is_current_stream_capturing():
                 self.crossed += 1  # SPIKE DIAG
