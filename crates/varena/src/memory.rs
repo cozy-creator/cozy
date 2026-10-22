@@ -126,7 +126,7 @@ impl Retained {
                 self.inner.make_room(missing, &keep, "prepare", req, false)?;
             }
             let claims: Vec<u64> = preparing.pins.iter().map(|(id, _)| *id).collect();
-            let pins = self.blocks.iter().map(|b| self.inner.bind_for(self.set, *b, stream, req, &claims)).collect::<Result<Vec<_>>>()?;
+            let pins = self.blocks.iter().map(|b| self.inner.bind_for(self.set, *b, stream, req, &claims, false)).collect::<Result<Vec<_>>>()?;
             let st = self.inner.lock();
             if retained_identity(self.set, st.mech(self.set)?, &self.blocks) != self.identity {
                 return Err(Error::StaleBinding("retained range identity changed during preparation".into()));
@@ -1050,14 +1050,29 @@ impl Memory {
 
     /// Opens a request with its plan; Belady runs over the open requests' plans.
     pub fn request(&self, id: &str, plan: Plan) -> Result<Request> {
-        let rid = self.inner.guard(|| self.inner.open_request(id, &plan))?;
+        let rid = self.inner.guard(|| self.inner.open_request(id, &plan, false))?;
+        Ok(Request { inner: self.inner.clone().into(), id: rid, ended: false })
+    }
+
+    /// Opens a request for idle work (a graph capture off the request path): its binds, its
+    /// ranges' preparation and its allocator hook's room take free bytes only, `Exhausted` at
+    /// once when they lack them; it asks no peer and withdraws no kept page, so it never holds
+    /// up another request.
+    pub fn request_idle(&self, id: &str, plan: Plan) -> Result<Request> {
+        let rid = self.inner.guard(|| self.inner.open_request(id, &plan, true))?;
         Ok(Request { inner: self.inner.clone().into(), id: rid, ended: false })
     }
 
     /// Maps and fills block `block` of `set`; `stream` (a `CUstream`, 0 the default) waits on
     /// the fill in-stream, and the release is ordered after its work.
     pub fn bind(&self, set: SetId, block: u32, stream: usize) -> Result<Pin> {
-        self.inner.guard(|| self.inner.bind(set.0, block, stream))
+        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, None, &[], false))
+    }
+
+    /// [`Memory::bind`] into free bytes only: `Exhausted` at once when they lack the block's,
+    /// nothing taken.
+    pub fn bind_free(&self, set: SetId, block: u32, stream: usize) -> Result<Pin> {
+        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, None, &[], true))
     }
 
     /// Retains stable virtual addresses for exactly these blocks, without making them resident.
@@ -1116,7 +1131,7 @@ impl Memory {
     /// and pass starts. `Exhausted` once a round takes nothing. Synchronous, from any thread,
     /// without the GIL.
     pub fn make_room(&self, bytes: u64) -> Result<Claim> {
-        self.inner.guard(|| self.inner.make_room(bytes, &[], "hook", None, true))?;
+        self.inner.guard(|| self.inner.make_room(bytes, &[], "hook", None, false))?;
         Ok(Claim { inner: self.inner.clone().into(), bytes })
     }
 
@@ -2141,7 +2156,8 @@ impl Inner {
     /// waited for). `why` and `req` name it in the request's record. For the allocator `hook`,
     /// local work only (no orphans, caches or kept pages: custody calls and Python), and the
     /// room it made is claimed for the hook's segment before the lock goes.
-    fn make_room(&self, bytes: u64, keep: &[Key], why: &'static str, req: Option<u64>, hook: bool) -> Result<u64> {
+    fn make_room(&self, bytes: u64, keep: &[Key], why: &'static str, req: Option<u64>, free_only: bool) -> Result<u64> {
+        let hook = why == "hook";
         let mut record = MakeRoom { step: 0, trigger: why, need: bytes, freed: 0, waited: 0 };
         let (mut orphans_released, mut settled) = (false, false);
         let out = loop {
@@ -2164,6 +2180,13 @@ impl Inner {
                 drop(admission);
                 self.unlock(st);
                 break Ok(free);
+            }
+            // Idle work (a request opened idle, a free-only bind) takes free bytes only.
+            if free_only || req.and_then(|r| st.table.request(r)).is_some_and(|r| r.idle) {
+                let stats = st.stats(req).cloned().unwrap_or_default();
+                drop(admission);
+                self.unlock(st);
+                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats)));
             }
             // Beyond what it could ever have (the budget with orphans released, less its context,
             // the hook's segments but its caches', its pinned pages): Exhausted at once.
@@ -2473,7 +2496,7 @@ impl Inner {
         plan.steps.iter().map(|s| (s.sets.iter().filter_map(index).collect(), s.passes.max(1))).collect()
     }
 
-    fn open_request(&self, id: &str, plan: &Plan) -> Result<u64> {
+    fn open_request(&self, id: &str, plan: &Plan, idle: bool) -> Result<u64> {
         let mut st = self.lock();
         let rid = st.tick();
         let steps = Self::resolve(&st, plan);
@@ -2499,13 +2522,15 @@ impl Inner {
             Some(key) => self.shared.fact(&format!("peak/{key}"))?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes),
             None => None,
         };
-        st.table.requests.push(Req { id: rid, name: id.to_string(), steps, peak, ..Req::default() });
+        st.table.requests.push(Req { id: rid, name: id.to_string(), steps, peak, idle, ..Req::default() });
         // A cold request's record carries the fills since the last one ended (its loads).
         let earlier = std::mem::take(&mut st.unclaimed);
         st.stats.insert(rid, Stats { request: id.to_string(), moved: earlier.moved, trace: earlier.trace, ..Stats::default() });
         self.publish(&mut st);
         self.unlock(st);
-        self.coreside(rid)?;
+        if !idle {
+            self.coreside(rid)?;
+        }
         Ok(rid)
     }
 
@@ -2580,13 +2605,10 @@ impl Inner {
         Ok(())
     }
 
-    fn bind(self: &Arc<Self>, set: u32, block: u32, stream: usize) -> Result<Pin> {
-        self.bind_for(set, block, stream, None, &[])
-    }
 
     /// Binds `block` of `set` for `stream`; `claims` are the caller's own preparation pins,
     /// which hold the page for this bind and never against it.
-    fn bind_for(self: &Arc<Self>, set: u32, block: u32, stream: usize, request: Option<u64>, claims: &[u64]) -> Result<Pin> {
+    fn bind_for(self: &Arc<Self>, set: u32, block: u32, stream: usize, request: Option<u64>, claims: &[u64], free_only: bool) -> Result<Pin> {
         let key = (set, block);
         let start = Instant::now();
         let mut st = self.lock();
@@ -2648,7 +2670,7 @@ impl Inner {
                         st = self.lock();
                         continue;
                     }
-                    self.make_room(bytes, &[key], "bind", req, false)?;
+                    self.make_room(bytes, &[key], if free_only { "bind_free" } else { "bind" }, req, free_only)?;
                     st = self.lock();
                     if !st.homes.contains_key(&key) {
                         self.map(&mut st, key, req, false)?;
@@ -2755,8 +2777,10 @@ impl Inner {
         if orphans {
             self.adopt(step_pages, Some(req))?;
         }
-        self.coreside(req)?;
-        self.unkeep(req);
+        if !self.state.lock().table.request(req).is_some_and(|r| r.idle) {
+            self.coreside(req)?;
+            self.unkeep(req);
+        }
         self.prefetch(req);
         Ok(id)
     }

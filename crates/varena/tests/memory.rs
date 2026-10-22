@@ -429,3 +429,29 @@ fn a_tiled_step_keeps_its_pages_w_through_every_tile() {
 }
 
 
+
+/// Idle work (S4's captures off the request path, S3's free-only hold) takes free bytes only: a
+/// free-only bind, and an idle request's binds and hook, are `Exhausted` at once when free
+/// bytes lack, taking nothing; an ordinary bind then takes the idle pages.
+#[test]
+fn idle_work_takes_free_bytes_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("idle-work", 8 * MB);
+    mem.load(set(dir.path(), "n", 3, &g.uuid), Level::Gpu).unwrap();
+    let a = mem.load(set(dir.path(), "a", 2, &g.uuid), Level::Ram).unwrap();
+    let idle_pages = || ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum::<u64>();
+    assert_eq!(idle_pages(), 3 * 2 * MB);
+    let first = mem.bind_free(a, 0, 0).unwrap();
+    assert!(matches!(mem.bind_free(a, 1, 0), Err(varena::Error::Exhausted(_))), "no free page left");
+    let r = mem.request_idle("capture", plan("a")).unwrap();
+    let pass = r.pass(a, "k").unwrap();
+    assert!(matches!(mem.make_room(2 * MB), Err(varena::Error::Exhausted(_))), "an idle request's hook takes nothing");
+    assert_eq!(idle_pages(), 3 * 2 * MB, "nothing was taken");
+    pass.end(0);
+    drop((r, first));
+    let r = mem.request("ordinary", plan("a")).unwrap();
+    let pass = r.pass(a, "k").unwrap();
+    drop(mem.bind(a, 1, 0).unwrap());
+    assert!(r.stats().evicted[varena::table::Class::N.index()] >= 2 * MB, "an ordinary bind takes an idle page: {:?}", r.stats());
+    pass.end(0);
+}

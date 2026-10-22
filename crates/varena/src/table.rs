@@ -217,6 +217,8 @@ pub struct Req {
     /// for everyone's admission but its family's child (`crate::ledger` publishes it).
     pub yielded: bool,
     pub family: u64,
+    /// Idle work (a graph capture off the request path): free bytes only, never evicting.
+    pub idle: bool,
 }
 
 impl Req {
