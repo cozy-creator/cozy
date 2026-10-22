@@ -496,6 +496,10 @@ pub struct Frame {
     /// of another shape (an older Hello's list) reads as absent.
     #[serde(deserialize_with = "lenient")]
     pub memory: Option<serde_json::Map<String, Value>>,
+    /// `invoke`: the Runtime's residency report, relayed into the run's measurements; one of
+    /// another shape reads as absent.
+    #[serde(deserialize_with = "lenient")]
+    pub residency: Option<Residency>,
     pub stage: String,
     pub position: Option<u64>,
     pub total: Option<u64>,
@@ -1852,6 +1856,18 @@ pub fn read_result(spool: &Path, reply: &Frame) -> io::Result<Value> {
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 /// A field of the shape this machine reads, else absent: never a reason to refuse the frame.
+/// The Runtime's residency report on an invoke reply: its notes and, per model, its graph
+/// regions' counters (captures, replays, pool bytes, eager gaps). Relayed whole: fields this
+/// TensorD does not know are kept.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Residency {
+    pub notes: serde_json::Map<String, Value>,
+    pub graphs: BTreeMap<String, serde_json::Map<String, Value>>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
+}
+
 fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
     Ok(serde_json::from_value(Value::deserialize(d)?).ok())
 }
