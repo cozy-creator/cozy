@@ -1782,6 +1782,20 @@ impl Pool {
         }
     }
 
+    /// The call's memory decisions (varena's record of its request, in order: lowering, cuts,
+    /// parks, exhaustion, evictions of declared or working pages, each with its trigger, site,
+    /// need, freed bytes and level), one memory-log line each: why a run lowered, cut or failed.
+    /// Each record is relayed whole; the run's measurements keep them with the rest of its stats.
+    fn note_decisions(&self, run: &str, pid: u32, gpus: &str, reply: &Frame) {
+        let decisions = reply.memory.as_ref().and_then(|stats| stats.get("decisions")).and_then(serde_json::Value::as_array);
+        for decision in decisions.into_iter().flatten() {
+            let mut line = serde_json::Map::from_iter([("event".to_string(), "decision".into()), ("run".to_string(), run.into()),
+                ("pid".to_string(), pid.into()), ("gpus".to_string(), gpus.into())]);
+            line.extend(decision.as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())));
+            self.notes.note(serde_json::Value::Object(line));
+        }
+    }
+
     /// A running parent's hint that it will call `plan` next (`model_prefetch`, H3 long-form's
     /// `prefetch(motion_segment)`): load it in the background where it fits beside the tenants
     /// already there (it never makes room), without waiting for the parent's own run to end.
@@ -2805,6 +2819,7 @@ impl Pool {
         let reply = reply?;
         session.level = Level::Gpu;
         self.record_invoke(&construction, &lane, first, invoked.elapsed(), &reply);
+        self.note_decisions(id, session.executor.birth.pid, &lane, &reply);
         record_measurements(engine, id, &plan, &reply);
         if reply.attention_applied {
             if let Err(error) = engine.apply_attention(id) {
@@ -3512,7 +3527,6 @@ struct Callbacks<'a> {
 }
 impl Services for Callbacks<'_> {
     fn progress(&mut self, frame: &Frame) {
-        self.pool.host.nudge();
         crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
     }
     fn request(
@@ -3992,7 +4006,7 @@ mod tests {
         let (root, pool, _engine) = pool_of(2);
         let binding = Binding { model_binding_path: "e.models.m".into(), release: "p@1".into(), ..Default::default() };
         let mut group = plan("film", 2);
-        group.slots = vec![PlanSlot { binding, lane: String::new(), selected_encoded_bytes: 0, on_demand: false, placeable: vec!["te".into()] }];
+        group.slots = vec![PlanSlot { binding, lane: String::new(), precision: String::new(), selected_encoded_bytes: 0, on_demand: false, placeable: vec!["te".into()] }];
         let homes = pool.homes(&group, pool.lane(0, 2).unwrap(), None);
         assert_eq!(homes, BTreeMap::from([("e.models.m".to_string(), BTreeMap::from([("te".to_string(), 0)]))]));
         assert!(pool.homes(&group, pool.lane(0, 1).unwrap(), None).is_empty());
@@ -4337,6 +4351,33 @@ mod tests {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    /// A call's decisions reach the memory log in order, one line each with the run, process
+    /// and GPUs, every field relayed; the run's measurements keep them in its stats.
+    #[test]
+    fn a_calls_memory_decisions_reach_the_memory_log_in_order() {
+        let (root, pool, _engine) = pool_of(1);
+        let decisions = json!([
+            {"step": 0, "trigger": "pass", "action": "cut", "site": "ffn", "need": 1 << 30, "freed": 0, "level": 2},
+            {"step": 1, "trigger": "oom", "action": "evict_d", "site": null, "need": 1 << 29, "freed": 1 << 28, "level": null},
+            {"step": 1, "trigger": "oom", "action": "exhausted", "site": "attention", "need": 1 << 20, "freed": 0, "level": null, "later": true}]);
+        let reply: Frame = serde_json::from_value(json!({"reply": "invoke", "ok": true, "memory": {"peak": 7, "decisions": decisions}})).unwrap();
+        pool.note_decisions("run-7", 4242, "0", &reply);
+        let log = std::fs::read_to_string(pool.store.root().join("logs/memory.log")).unwrap();
+        // Each line: its time, then the record.
+        let noted: Vec<serde_json::Value> = log.lines().filter_map(|l| l.split_once(' ')).map(|(_, l)| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|l| l["event"] == "decision").collect();
+        assert_eq!(noted.len(), 3, "{log}");
+        for (line, decision) in noted.iter().zip(decisions.as_array().unwrap()) {
+            assert_eq!((line["run"].as_str(), line["pid"].as_u64(), line["gpus"].as_str()), (Some("run-7"), Some(4242), Some("0")));
+            for (key, value) in decision.as_object().unwrap() {
+                assert_eq!(&line[key], value, "{key} relayed");
+            }
+        }
+        assert_eq!(call_memory(&reply).unwrap()["stats"]["decisions"], decisions, "the measurements keep them");
+        pool.stop().unwrap();
+        crate::scratch::remove(&root);
     }
 
     /// The stall rule, through the pool's own events thread (`memory_changed` → `end_stalled`)
