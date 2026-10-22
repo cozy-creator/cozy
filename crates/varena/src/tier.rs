@@ -61,42 +61,157 @@ fn measured_budget() -> Budget {
     })
 }
 
-/// The tier's one admission: a fill of `bytes` goes only into measured surplus, the live budget
-/// less what the running calls must keep free. Layouts nobody maps make room first, then those
-/// executors map (asked back), in [`host_decide`] order. Never beside an unmeasured call.
-fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget, conn: u64) -> bool {
-    for attempt in 0..2 {
-        let mut s = state.0.lock();
-        // Check and reserve in one critical section. In-flight fills may not have faulted
-        // their pages yet, so the live OS budget alone does not account for their promises.
-        if s.promised.contains_key(&conn) { return false; }
-        let Some(keep) = need() else { return false };
-        let pending = s.promised.values().copied().fold(0u64, u64::saturating_add);
-        let Some(want) = keep.checked_add(pending).and_then(|n| n.checked_add(bytes)) else { return false };
-        let room = budget();
-        if room >= i128::from(want) {
-            s.promised.insert(conn, bytes);
-            return true;
-        }
-        drop(s);
-        if attempt == 0 {
-            // No peer wait: immediately reclaimable layouts go now. Re-read actual headroom
-            // before admitting; do not add a release estimate to a newer OS measurement.
-            let deficit = u64::try_from((-room).max(0)).unwrap_or(u64::MAX);
-            relieve(state, HostTrigger::Room { bytes: want.saturating_add(deficit), headroom: u64::try_from(room).unwrap_or(0) });
-        }
-    }
-    false
+// One named claim file for this tier's host-pressure domain, shared by every GPU and
+// surviving service replacements. Each live client owns a read lock on one bytes record;
+// the metadata lock serializes scan, budget check and new lock/record publication.
+const CLAIMS: &str = "tier-claims";
+const CLAIM_MAGIC: u64 = u64::from_le_bytes(*b"vhrsv001");
+const CLAIM_WORD: u64 = 8;
+
+struct Claims {
+    fd: Owned,
+    local: Mutex<()>,
 }
 
-/// A pressure event only says "look": rungs go back while the budget is below what the running
-/// calls must keep free (all of it while one is unmeasured), so benign reclaim at a limit gives
-/// nothing back.
-fn answer(state: &Shared, need: &Need, budget: &Budget) {
-    while budget() < i128::from(need().unwrap_or(u64::MAX)) {
-        if relieve(state, HostTrigger::Pressure) == 0 {
-            return;
+struct ClaimLock<'a> {
+    claims: &'a Claims,
+    _local: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl Drop for ClaimLock<'_> {
+    fn drop(&mut self) { let _ = os::unlock(&self.claims.fd, 0, CLAIM_WORD); }
+}
+
+enum Admission {
+    Granted(Owned),
+    Short { bytes: u64, headroom: u64 },
+    Unmeasured,
+}
+
+fn claim_word(map: &Map, offset: u64) -> &AtomicU64 {
+    // SAFETY: callers walk aligned complete words inside this mapping under the metadata lock.
+    unsafe { &*(map.base.add(offset as usize).cast::<AtomicU64>()) }
+}
+
+impl Claims {
+    fn open() -> Result<Self> {
+        let claims = Self { fd: os::shared(CLAIMS, true)?, local: Mutex::new(()) };
+        os::own(&claims.fd)?;
+        {
+            let _lock = claims.lock()?;
+            let size = os::size(&claims.fd)?;
+            if size == 0 { os::resize(&claims.fd, platform_page())?; }
+            let size = os::size(&claims.fd)?;
+            if size < platform_page() || !size.is_multiple_of(CLAIM_WORD) {
+                return Err(Error::Closed("invalid host-reservation claim table".into()));
+            }
+            let map = os::map(&claims.fd, size as usize, true)?;
+            let magic = claim_word(&map, 0);
+            if magic.load(Acquire) == 0 && size == platform_page() {
+                // Complete an interrupted first creation only when no client owns a row.
+                for offset in (CLAIM_WORD..size).step_by(CLAIM_WORD as usize) {
+                    if os::held(&claims.fd, offset, CLAIM_WORD)? {
+                        return Err(Error::Closed("uninitialized host claim table has live owners".into()));
+                    }
+                }
+                magic.store(CLAIM_MAGIC, Release);
+            } else if magic.load(Acquire) != CLAIM_MAGIC {
+                return Err(Error::Closed("incompatible host-reservation claim table".into()));
+            }
         }
+        Ok(claims)
+    }
+
+    fn lock(&self) -> Result<ClaimLock<'_>> {
+        let local = self.local.lock();
+        os::lock(&self.fd, 0, CLAIM_WORD, true)?;
+        Ok(ClaimLock { claims: self, _local: local })
+    }
+
+    fn view(&self) -> Result<Map> {
+        let size = os::size(&self.fd)?;
+        if size < platform_page() || !size.is_multiple_of(CLAIM_WORD) {
+            return Err(Error::Closed("invalid host-reservation claim table".into()));
+        }
+        let map = os::map(&self.fd, size as usize, true)?;
+        if claim_word(&map, 0).load(Acquire) != CLAIM_MAGIC {
+            return Err(Error::Closed("incompatible host-reservation claim table".into()));
+        }
+        Ok(map)
+    }
+
+    fn scan(&self, map: &Map) -> Result<(u64, Option<u64>)> {
+        let (mut live, mut vacant) = (0u64, None);
+        for offset in (CLAIM_WORD..map.len as u64).step_by(CLAIM_WORD as usize) {
+            if os::held(&self.fd, offset, CLAIM_WORD)? {
+                live = live.saturating_add(claim_word(map, offset).load(Acquire));
+            } else if vacant.is_none() {
+                vacant = Some(offset);
+            }
+        }
+        Ok((live, vacant))
+    }
+
+    fn live_bytes(&self) -> Result<u64> {
+        let _lock = self.lock()?;
+        self.scan(&self.view()?).map(|(live, _)| live)
+    }
+
+    fn admit(&self, need: &Need, bytes: u64, budget: &Budget) -> Result<Admission> {
+        let _lock = self.lock()?;
+        let Some(keep) = need() else { return Ok(Admission::Unmeasured) };
+        let mut map = self.view()?;
+        let (pending, vacant) = self.scan(&map)?;
+        let want = keep.saturating_add(pending).saturating_add(bytes);
+        let mut room = budget();
+        let mut metadata = if vacant.is_none() { platform_page() } else { 0 };
+        if room >= i128::from(want) + i128::from(metadata) {
+            let offset = if let Some(offset) = vacant { offset } else {
+                let offset = map.len as u64;
+                let size = offset.checked_add(platform_page()).ok_or_else(|| Error::Internal("host claim table overflow".into()))?;
+                os::resize(&self.fd, size)?;
+                map = os::map(&self.fd, size as usize, true)?;
+                // Fault the new metadata page before re-reading actual headroom.
+                claim_word(&map, offset).store(0, Release);
+                metadata = 0; // This page is now in the observed OS budget, not future bytes.
+                room = budget();
+                offset
+            };
+            if room >= i128::from(want) {
+                // Read-only rights are enough for a lifetime lock. The client receives no
+                // write access to another client's claim, and no explicit stale-ID free exists.
+                let lease = os::reopen(&self.fd, false)?;
+                if !os::share(&lease, offset, CLAIM_WORD, false)? {
+                    return Err(Error::Internal("host claim lock refused".into()));
+                }
+                claim_word(&map, offset).store(bytes, Release);
+                return Ok(Admission::Granted(lease));
+            }
+        }
+        let deficit = u64::try_from((-room).max(0)).unwrap_or(u64::MAX);
+        Ok(Admission::Short { bytes: want.saturating_add(metadata).saturating_add(deficit), headroom: u64::try_from(room).unwrap_or(0) })
+    }
+}
+
+/// Atomically admit a fill into measured surplus. The record lock already exists before
+/// its fd is sent; queued SCM_RIGHTS keeps it alive even if the service dies before receipt.
+fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget, claims: &Claims) -> Result<Option<Owned>> {
+    for attempt in 0..2 {
+        match claims.admit(need, bytes, budget)? {
+            Admission::Granted(fd) => return Ok(Some(fd)),
+            Admission::Unmeasured => return Ok(None),
+            Admission::Short { bytes, headroom } if attempt == 0 => { relieve(state, HostTrigger::Room { bytes, headroom }); }
+            Admission::Short { .. } => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// A pressure event only says look. Preserve signed growth deficits and every still-live
+/// future claim, including those granted by an earlier service holder.
+fn answer(state: &Shared, need: &Need, budget: &Budget, claims: &Claims) {
+    while budget() < i128::from(need().unwrap_or(u64::MAX)).saturating_add(i128::from(claims.live_bytes().unwrap_or(u64::MAX))) {
+        if relieve(state, HostTrigger::Pressure) == 0 { return; }
     }
 }
 
@@ -279,8 +394,6 @@ struct State {
     short: Option<Owned>,
     /// Its users' open connections: a tier that stops serving closes them.
     conns: HashMap<u64, Stream>,
-    /// Admission promises, one dedicated connection per live fill. EOF releases its charge.
-    promised: HashMap<u64, u64>,
 }
 
 type Shared = Arc<(Mutex<State>, Condvar)>;
@@ -390,6 +503,7 @@ pub struct Tier {
     /// The host-short event's waiting end.
     short: Owned,
     budget: Budget,
+    claims: Arc<Claims>,
     /// The accept loop: the name is free once it ends.
     accepting: Option<std::thread::JoinHandle<()>>,
 }
@@ -416,7 +530,7 @@ impl Tier {
         if matches!(pressure, Pressure::Headroom) {
             return Ok(Some(tier));
         }
-        let (state, stop, budget) = (tier.state.clone(), tier.stop.clone(), tier.budget.clone());
+        let (state, stop, budget, claims) = (tier.state.clone(), tier.stop.clone(), tier.budget.clone(), tier.claims.clone());
         std::thread::Builder::new()
             .name("varena-pressure".into())
             .spawn(move || loop {
@@ -428,7 +542,7 @@ impl Tier {
                 if woke.is_err() || stop.load(Acquire) {
                     return;
                 }
-                answer(&state, &need, &budget);
+                answer(&state, &need, &budget, &claims);
             })
             .map_err(|e| Error::io("spawn pressure", e))?;
         Ok(Some(tier))
@@ -440,11 +554,12 @@ impl Tier {
 
     fn bind_with(need: Need, budget: Budget) -> Result<Option<Tier>> {
         let Some(listener) = os::listen(os::euid(), NAME)? else { return Ok(None) };
+        let claims = Arc::new(Claims::open()?);
         let short = os::event()?;
         let signal = os::dup(&short)?;
         let state = Arc::new((Mutex::new(State { short: Some(signal), ..State::default() }), Condvar::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (s, halt, available) = (state.clone(), stop.clone(), budget.clone());
+        let (s, halt, available, held_claims) = (state.clone(), stop.clone(), budget.clone(), claims.clone());
         let accepting = std::thread::Builder::new()
             .name("varena-tier".into())
             .spawn(move || {
@@ -452,12 +567,12 @@ impl Tier {
                     if halt.load(Acquire) {
                         return;
                     }
-                    let (s, need, budget) = (s.clone(), need.clone(), available.clone());
-                    let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s, &need, &budget));
+                    let (s, need, budget, claims) = (s.clone(), need.clone(), available.clone(), held_claims.clone());
+                    let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s, &need, &budget, &claims));
                 }
             })
             .map_err(|e| Error::io("spawn tier", e))?;
-        Ok(Some(Tier { state, stop, short, budget, accepting: Some(accepting) }))
+        Ok(Some(Tier { state, stop, short, budget, claims, accepting: Some(accepting) }))
     }
 
     /// The layouts holding any ready region (status).
@@ -526,7 +641,7 @@ impl Tier {
     }
 }
 
-fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget) {
+fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget, claims: &Claims) {
     // Only this user's processes: an abstract name has no permissions of its own.
     if os::peer(&stream).is_err() {
         return;
@@ -589,10 +704,13 @@ fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget) {
             Call::Room { bytes } => {
                 drop(s);
                 // Never waits: what nobody maps goes now; what executors map is asked back.
-                let ok = admit(state, need, bytes, budget, conn);
+                let lease = admit(state, need, bytes, budget, claims).unwrap_or_else(|e| {
+                    tracing::warn!("varena tier admission refused: {e}");
+                    None
+                });
                 cv.notify_all();
                 s = lock.lock();
-                (Reply::Room { ok }, None)
+                (Reply::Room { ok: lease.is_some() }, lease)
             }
             Call::Resident => (Reply::Resident { bytes: s.layouts.values().map(|l| os::allocated(&l.fd)).sum() }, None),
         };
@@ -603,7 +721,6 @@ fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget) {
     }
     let mut s = lock.lock();
     s.conns.remove(&conn);
-    s.promised.remove(&conn);
     s.layouts.values_mut().for_each(|l| {
         l.users.remove(&conn);
     });
@@ -855,9 +972,11 @@ impl Held {
 
 }
 
-/// A fill's host reservation. Closing its dedicated socket (including process death)
-/// releases the service charge. Quarantining an unfinished copy must retain this permit.
+/// A fill's host reservation, owned in the client. Its record's read-lock fd survives a
+/// service restart and closes on completion/client death. Never unlink the named claim file.
 pub(crate) struct Permit {
+    // Drop the kernel claim before closing the socket that wakes the current service.
+    _claim: Owned,
     _stream: Stream,
 }
 
@@ -940,7 +1059,7 @@ impl Client {
     pub fn reserve(&self, bytes: u64) -> Option<Permit> {
         let stream = os::connect(self.ns, NAME).ok()??;
         match os::call::<_, Reply>(&stream, &Call::Room { bytes }, None) {
-            Ok((Reply::Room { ok: true }, _)) => Some(Permit { _stream: stream }),
+            Ok((Reply::Room { ok: true }, Some(claim))) => Some(Permit { _claim: claim, _stream: stream }),
             _ => None,
         }
     }
@@ -995,10 +1114,13 @@ mod reservation_tests {
         assert!(status.success(), "isolated tier case {name}: {status}");
     }
 
-    fn room(bytes: u64) -> (Stream, bool) {
+    fn room(bytes: u64) -> (Option<Permit>, bool) {
         let stream = os::connect(os::euid(), NAME).unwrap().unwrap();
-        let (reply, _) = os::call::<_, Reply>(&stream, &Call::Room { bytes }, None).unwrap();
-        (stream, matches!(reply, Reply::Room { ok: true }))
+        let (reply, claim) = os::call::<_, Reply>(&stream, &Call::Room { bytes }, None).unwrap();
+        match (reply, claim) {
+            (Reply::Room { ok: true }, Some(claim)) => (Some(Permit { _claim: claim, _stream: stream }), true),
+            _ => (None, false),
+        }
     }
 
     #[test]
@@ -1017,7 +1139,7 @@ mod reservation_tests {
     fn await_promised(tier: &Tier, bytes: u64) {
         let (lock, changed) = &*tier.state;
         let mut state = lock.lock();
-        while state.promised.values().sum::<u64>() != bytes {
+        while tier.claims.live_bytes().unwrap() != bytes {
             assert!(!changed.wait_for(&mut state, std::time::Duration::from_secs(5)).timed_out(), "reservation was not released");
         }
     }
@@ -1046,7 +1168,7 @@ mod reservation_tests {
             use std::io::BufRead;
             let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(|| 6)).unwrap().unwrap();
             let address = format!("cozy-varena-{}-tier-reservation-{}-tier", os::euid(), std::process::id());
-            let script = r#"import json,socket,struct,sys
+            let script = r#"import array,json,socket,struct,sys
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
 s.connect('\0'+sys.argv[1])
 b=json.dumps({'Room':{'bytes':4}}).encode()
@@ -1060,7 +1182,9 @@ def read(n):
     return b
 head=read(5)
 r=json.loads(read(struct.unpack('<I',head[:4])[0]))
-assert r['Room']['ok'],r
+assert r['Room']['ok'] and head[4]==1,r
+_,ancillary,_,_=s.recvmsg(1,socket.CMSG_SPACE(array.array('i').itemsize))
+claim=array.array('i');claim.frombytes(ancillary[0][2]);assert len(claim)==1
 print('reserved',flush=True)
 sys.stdin.read()
 "#;
@@ -1209,7 +1333,7 @@ sys.stdin.read()
             client.close("growth").unwrap();
             budget.store(0, Release); // Need0, but measured growth exceeds live headroom.
             let need: Need = Arc::new(|| Some(0));
-            answer(&tier.state, &need, &tier.budget);
+            answer(&tier.state, &need, &tier.budget, &tier.claims);
             assert!(tier.held().is_empty(), "saturating a growth deficit to0 suppressed pressure reclaim");
         });
     }
@@ -1270,7 +1394,7 @@ sys.stdin.read()
             // SAFETY: the ready word is mapped and no writer has begun this fixture yet.
             unsafe { (&*words.base.cast::<AtomicU32>()).store(0, Release) };
             let address = format!("cozy-varena-{}-tier-reservation-{}-tier", os::euid(), std::process::id());
-            let script = r#"import ctypes,fcntl,json,mmap,os,socket,struct,sys
+            let script = r#"import array,ctypes,fcntl,json,mmap,os,socket,struct,sys
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect('\0'+sys.argv[1])
 size=int(sys.argv[3]);data=int(sys.argv[2])
 b=json.dumps({'Room':{'bytes':size}}).encode();s.sendall(struct.pack('<I',len(b))+b'\0'+b)
@@ -1281,7 +1405,9 @@ def read(n):
         if not p:raise RuntimeError('tier closed')
         b+=p
     return b
-head=read(5);assert json.loads(read(struct.unpack('<I',head[:4])[0]))['Room']['ok']
+head=read(5);assert json.loads(read(struct.unpack('<I',head[:4])[0]))['Room']['ok'] and head[4]==1
+_,ancillary,_,_=s.recvmsg(1,socket.CMSG_SPACE(array.array('i').itemsize))
+claim=array.array('i');claim.frombytes(ancillary[0][2]);assert len(claim)==1
 fd=os.open('/proc/self/fd/3',os.O_RDWR)
 class Lock(ctypes.Structure):
     _fields_=[('kind',ctypes.c_short),('whence',ctypes.c_short),('start',ctypes.c_longlong),('length',ctypes.c_longlong),('pid',ctypes.c_int)]
@@ -1314,7 +1440,89 @@ print('dirty',flush=True);sys.stdin.read()
             child.0.kill().unwrap();
             child.0.wait().unwrap();
             await_promised(&tier, 0);
+            relieve(&tier.state, HostTrigger::Pressure);
             assert!(os::allocated(&held.fd) <= held.data, "a dead fill stranded dirty pages outside the pressure policy");
+        });
+    }
+
+
+    #[test]
+    #[ignore = "subprocess service holder for the restart regression"]
+    fn claim_holder() {
+        use std::io::Read;
+        let Ok(prefix) = std::env::var("VARENA_TIER_CLAIM_SERVER") else { return };
+        assert!(os::namespace(&prefix));
+        let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(|| 6)).unwrap().unwrap();
+        println!("claim-holder-ready");
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).unwrap();
+    }
+
+    #[test]
+    fn holder_death_preserves_unfaulted_client_claims() {
+        isolated("holder_death_preserves_unfaulted_client_claims", || {
+            use std::io::BufRead;
+            struct Child(std::process::Child);
+            impl Drop for Child {
+                fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            }
+            let prefix = format!("tier-reservation-{}-", std::process::id());
+            let holder = || {
+                let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["tier::reservation_tests::claim_holder", "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+                    .env("VARENA_TIER_CLAIM_SERVER", &prefix)
+                    .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap());
+                let mut output = std::io::BufReader::new(child.0.stdout.take().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert!(output.read_line(&mut line).unwrap() > 0, "holder exited before serving");
+                    if line.contains("claim-holder-ready") { break; }
+                }
+                child
+            };
+            let first = holder();
+            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let permit = client.reserve(4).unwrap(); // No destination page has faulted yet.
+            assert_eq!(Claims::open().unwrap().live_bytes().unwrap(), 4);
+            drop(first); // Real SIGKILL of the service process, while the client survives.
+            let _replacement = holder();
+            let next = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            assert!(next.reserve(4).is_none(), "replacement forgot a live future-byte promise");
+            drop(client);
+            assert!(next.reserve(4).is_none(), "a permit outlives its ordinary client connection");
+            drop(permit);
+            let settled = next.reserve(6).unwrap();
+            assert_eq!(Claims::open().unwrap().live_bytes().unwrap(), 6);
+            drop(settled);
+            assert_eq!(Claims::open().unwrap().live_bytes().unwrap(), 0, "completion returns the durable claim immediately");
+        });
+    }
+
+    #[test]
+    fn unknown_claim_schema_never_resets_a_live_owner() {
+        isolated("unknown_claim_schema_never_resets_a_live_owner", || {
+            use std::os::fd::AsRawFd;
+            let claims = Claims::open().unwrap();
+            let need: Need = Arc::new(|| Some(0));
+            let budget: Budget = Arc::new(|| 6);
+            let Admission::Granted(lease) = claims.admit(&need, 4, &budget).unwrap() else { panic!("initial claim refused") };
+            // SAFETY: querying the flags of this live owned descriptor.
+            assert_eq!(unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE, libc::O_RDONLY);
+            for invalid in [u64::from_le_bytes(*b"vhrsv999"), 0] {
+                {
+                    let _lock = claims.lock().unwrap();
+                    let map = os::map(&claims.fd, platform_page() as usize, true).unwrap();
+                    claim_word(&map, 0).store(invalid, Release);
+                }
+                assert!(matches!(Claims::open(), Err(Error::Closed(_))));
+                let _lock = claims.lock().unwrap();
+                let map = os::map(&claims.fd, platform_page() as usize, true).unwrap();
+                assert_eq!(claim_word(&map, 0).load(Acquire), invalid, "unknown bytes were rewritten");
+                assert!(os::held(&claims.fd, CLAIM_WORD, CLAIM_WORD).unwrap(), "the live claim was lost");
+                claim_word(&map, 0).store(CLAIM_MAGIC, Release);
+            }
+            drop(lease);
+            assert_eq!(claims.live_bytes().unwrap(), 0);
         });
     }
 
