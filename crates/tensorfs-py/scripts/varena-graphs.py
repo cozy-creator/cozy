@@ -157,8 +157,8 @@ def main():
     try:
         binding.native.prepare(stream.cuda_stream)
         raise AssertionError("stale graph binding entered")
-    except VarenaError:
-        pass
+    except VarenaError as error:
+        assert error.code == "STALE_BINDING", f"stale identity raised the wrong refusal: {error}"
     for binding in bindings:
         binding.close()
     print(json.dumps({"PASS": True, "graphs": len(records), "capture_ms": capture_ms, "weights": weight_bytes, "cap": CAP, "allocator": allocator_stats(0)}), flush=True)

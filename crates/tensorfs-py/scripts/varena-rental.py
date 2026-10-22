@@ -49,7 +49,8 @@ def main(ctx: ScriptContext, *, wheel: Annotated[FileAsset, AssetBound(max_bytes
     wheel_path = root / f"{distribution}-{tag}.whl"
     wheel_path.write_bytes(data)
     test = root / "script.py"
-    test.write_bytes(script.read_bytes())
+    test_data = script.read_bytes()
+    test.write_bytes(test_data)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(site), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)}
     with (logs / "log.txt").open("w") as log:
         def say(line: str) -> None:  # streamed: the run's log shows where a stall sits
@@ -60,6 +61,7 @@ def main(ctx: ScriptContext, *, wheel: Annotated[FileAsset, AssetBound(max_bytes
             log.flush()
 
         say(f"wheel {wheel_path.name} sha256={hashlib.sha256(data).hexdigest()}\n")
+        say(f"fixture sha256={hashlib.sha256(test_data).hexdigest()}\n")
         say(install(site, "--no-deps", str(wheel_path)))
         command = [sys.executable, "-u", str(test)]
         with subprocess.Popen(command, env=env, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:
