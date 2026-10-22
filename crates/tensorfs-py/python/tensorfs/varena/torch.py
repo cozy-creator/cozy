@@ -229,6 +229,19 @@ class Model:
         #: the fill identity its pages were last declared under
         self.identity: str | None = declared.fill.identity if declared.fill is not None else None
 
+    @contextmanager
+    def passing(self, entry: str, args: tuple[object, ...], kwargs: dict[str, object]) -> Iterator[Model]:
+        """Prepare the native pass before a graph wrapper intercepts the module's hooks.
+
+        Original hooks executed during capture then only enter the already-prepared pass.
+        Nested segments share their root pass's shape, memory room and cut-level identity.
+        """
+        self.memory._open(self, entry, args, kwargs)
+        try:
+            yield self
+        finally:
+            self.memory._close(self)
+
     def retain(self, paths: Collection[str] = ("",)) -> Binding:
         """Retain addresses for every weight/buffer in the declared module subtrees.
 
@@ -392,6 +405,7 @@ _opening = threading.Lock()
 _request: ContextVar[Request | None] = ContextVar("varena_request", default=None)
 _pass: ContextVar[_Pass | None] = ContextVar("varena_pass", default=None)
 _pool: ContextVar[tuple[Memory, torch.cuda.MemPool] | None] = ContextVar("varena_pool", default=None)
+_routes: ContextVar[frozenset[tuple[int, int]]] = ContextVar("varena_routes", default=frozenset())
 
 
 class Memory:
@@ -414,16 +428,26 @@ class Memory:
             native.trim_with(self.torch.trim)
         #: Request allocations use the native callback, which reclaims completed local pages
         #: on shortfall without replaying package code.
-        self.pool: torch.cuda.MemPool | None = None
-        #: whether passes use it now (the spike's measurement alternates with torch's default)
+        self._pools = threading.local()
+        #: Native pooling is the default; diagnostics may compare an explicit eager baseline.
         self.pooling = pool
         #: the largest torch reserve a pass held outside the pool (other threads' allocations)
         self.outside = 0
         #: Cross-stream consumers joined back into the binding stream.
         self.crossed = 0
         if pool and self.cuda:
-            allocator = torch.cuda.memory.CUDAPluggableAllocator(_ext.__file__, "varena_torch_alloc", "varena_torch_free")
-            self.pool = torch.cuda.MemPool(allocator._allocator)
+            self._pools.pool = self.new_pool()
+
+    @property
+    def pool(self) -> torch.cuda.MemPool | None:
+        # Torch rejects routing the same MemPool from concurrent threads. Each request thread
+        # keeps its own reusable pool; the native cap/accounting still covers the entire device.
+        if not self.cuda or not self.pooling:
+            return None
+        pool = getattr(self._pools, "pool", None)
+        if pool is None:
+            pool = self._pools.pool = self.new_pool()
+        return pool
 
     @classmethod
     def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = True) -> Memory:
@@ -523,7 +547,7 @@ class Memory:
         return torch.cuda.MemPool(allocator._allocator)
 
     @contextmanager
-    def allocating(self, pool: torch.cuda.MemPool | None = None, *, route: bool = True) -> Iterator[None]:
+    def allocating(self, pool: torch.cuda.MemPool | None = None, *, route: bool = True, set_id: int | None = None) -> Iterator[None]:
         """Use the request's allocator between passes too, or a graph's dedicated scratch pool.
 
         Warm and capture must name the same graph pool. Exit the warm routing context before
@@ -537,12 +561,16 @@ class Memory:
             return
         if self.cuda and torch.cuda.is_current_stream_capturing():
             raise Unbound("select and preseed the graph pool before capture")
-        r.native.allocating(self.native, p.set if p else None, *self.torch.now(), selected.id)
+        r.native.allocating(self.native, set_id if set_id is not None else p.set if p else None, *self.torch.now(), selected.id)
         token = _pool.set((self, selected))
+        route = route and selected.id not in _routes.get()
+        routed = _routes.set(_routes.get() | {selected.id}) if route else None
         try:
             with torch.cuda.use_mem_pool(selected, self.device) if route else nullcontext():
                 yield
         finally:
+            if routed is not None:
+                _routes.reset(routed)
             _pool.reset(token)
             _allocated()
 
@@ -644,8 +672,7 @@ class Memory:
             if self.pool is not None and self.pooling and not (self.cuda and torch.cuda.is_current_stream_capturing()):  # capture owns its exact pool
                 selected = _pool.get()
                 pool = selected[1] if selected is not None and selected[0] is self else self.pool
-                r.native.allocating(self.native, model.id, allocated, reserved, pool.id)
-                p.pooled = torch.cuda.use_mem_pool(pool, self.device)
+                p.pooled = self.allocating(pool, set_id=model.id)
                 p.pooled.__enter__()
             p.entered = sys.exc_info()[1]
             self._fold()  # the passes open already keep what ran before; this one starts here
@@ -660,10 +687,7 @@ class Memory:
                 if p in self.passes:
                     self.passes.remove(p)
             if p is not None and p.pooled is not None:
-                try:
-                    p.pooled.__exit__(None, None, None)
-                finally:
-                    _allocated()
+                p.pooled.__exit__(None, None, None)
             raise
 
     def _close(self, model: Model) -> None:
@@ -674,14 +698,13 @@ class Memory:
             return
         local.passing = None
         _pass.reset(p.token)  # type: ignore[arg-type]
-        if model.common is not None:
-            self._exit(model.common)
-        if p.pooled is not None:
-            try:
+        try:
+            if model.common is not None:
+                self._exit(model.common)
+        finally:
+            if p.pooled is not None:
                 p.pooled.__exit__(None, None, None)
-            finally:
-                _allocated()
-            self.outside = max(self.outside, self.torch.now()[1] - _allocator_stats(self.device.index or 0)[0])
+                self.outside = max(self.outside, self.torch.now()[1] - _allocator_stats(self.device.index or 0)[0])
         self._fold()
         with self.measuring:
             self.passes.remove(p)
