@@ -241,14 +241,6 @@ pub fn serve_tier(mode: HostMode, need: Need, log: &MemoryLog) -> Option<Arc<Tie
     }
 }
 
-/// What the host keeps free for the calls running on `gpus`, which the RAM tier fills only
-/// beside: varena's host need of each GPU, all of them (`None`: a running call is unmeasured,
-/// and the tier fills nothing).
-// TODO(S1): replace the sum with varena's own over a group, so TensorD adds no bytes.
-pub fn need(gpus: Vec<Arc<Gpu>>) -> Need {
-    Arc::new(move || gpus.iter().try_fold(0u64, |sum, gpu| Some(sum.saturating_add(gpu.ledger.host_need()?))))
-}
-
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
 }
