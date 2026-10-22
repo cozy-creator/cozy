@@ -2988,11 +2988,29 @@ pub(crate) mod tests {
             let source = crate::storage::open(&root.join("source")).unwrap();
             let model = |repository: &str, lane: &str, header| names_hub::Model { repository: repository.into(),
                 release: "1.0.0".into(), lane: lane.into(), header };
+            // These policy fixtures carry actual dtypes and quantized encodings. Their names
+            // are labels for assertions, never the production selection input.
             let mut models: Vec<_> = lanes.iter().zip(30u8..).map(|(lane, tag)| {
-                model("acme/model", lane, tensors(&source, &format!("lane-{tag}"), "unet", &[("proj.weight", vec![4, 3], f32s(12, tag.into()))]))
+                use tensorfs::{format::{encode, Dtype, Encoding, PartBytes}, writer::{Data, PartData, Source}};
+                let mut writer = source.writer(None, None).unwrap();
+                let shape = [4, 32];
+                if matches!(*lane, "int8" | "fp8" | "nvfp4") {
+                    let encoding = Encoding { scheme: match *lane { "int8" => "int8.rowwise", "fp8" => "fp8.rowwise", _ => "nvfp4" }.into(),
+                        params: if *lane == "nvfp4" { serde_json::from_value(json!({"block_size":16,"global_scale":"multiply","nibble_order":"low_first","scale_layout":"row_major"})).unwrap() } else { Default::default() } };
+                    let values = f32s(128, tag.into());
+                    let arrays = BTreeMap::from([("values", PartBytes {dtype:&Dtype::F32,shape:&shape,bytes:&values})]);
+                    let encoded = encode::quantize(&encode::Input {dtype:&Dtype::BF16,shape:&shape,encoding:&encoding,arrays:&arrays}).unwrap();
+                    let mut readers: Vec<_> = encoded.iter().map(|part| std::io::Cursor::new(&part.bytes)).collect();
+                    let parts = encoded.iter().zip(&mut readers).map(|(part,reader)| PartData {role:part.role.clone(),dtype:part.dtype.clone(),shape:part.shape.clone(),data:Source::Read(reader)}).collect();
+                    writer.get("unet").put("proj.weight",&Dtype::BF16,&shape,Data::Encoded{encoding,parts}).unwrap();
+                } else {
+                    let (dtype,bytes) = if *lane == "bf16" { (Dtype::BF16,vec![0u8;256]) } else if *lane == "fp16" { (Dtype::F16,vec![0u8;256]) } else { (Dtype::F32,f32s(128,tag.into())) };
+                    writer.get("unet").put("proj.weight",&dtype,&shape,Data::Plain(Source::Read(&mut bytes.as_slice()))).unwrap();
+                }
+                model("acme/model", lane, writer.commit().unwrap())
             }).collect();
             let lanes = models.iter().map(|model| (model.header.id(), model.lane.clone())).collect();
-            let lora = [("proj.lora_A.weight", vec![2, 3], f32s(6, 0.25)), ("proj.lora_B.weight", vec![4, 2], f32s(8, 0.75))];
+            let lora = [("proj.lora_A.weight", vec![2, 32], f32s(64, 0.25)), ("proj.lora_B.weight", vec![4, 2], f32s(8, 0.75))];
             models.push(model("acme/lora", "bf16", tensors(&source, "lora", "adapter", &lora)));
             let (origin, heard) = names_hub::models(&source, models);
             let hub = hub::Source::new(&origin, None, None).unwrap();
@@ -3109,7 +3127,7 @@ pub(crate) mod tests {
             ..Default::default() }]);
         let a = machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
         assert_eq!(a.sources[0].manifest, first.id());
-        assert_eq!(a.sources[0].lane, "f32");
+        assert_eq!(a.sources[0].lane, "model.f32.cozytensors");
         for variant in ["absent", ""] {
             request.choices[0].lane = variant.into();
             assert_eq!(machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).err().unwrap().0,
@@ -3146,7 +3164,7 @@ pub(crate) mod tests {
         let hopper = Machine::new("acme/pkg", &[("9.0", 80 * GIB)], slots.clone(), &["bf16", "fp8", "int8", "nvfp4"]);
         let (lanes, warnings, asked) = hopper.run(0);
         assert_eq!((lanes, warnings), (vec!["int8".to_string(), "nvfp4".into()], vec![]));
-        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["int8", "nvfp4"]), "no lane past the first published one");
+        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["bf16", "fp8", "int8", "nvfp4"]), "a static origin supplies headers to the shared rule");
         let (lanes, _, asked) = hopper.run(0);
         assert_eq!((lanes, asked), (vec!["int8".to_string(), "nvfp4".into()], vec![]), "a warm run asks the Hub nothing");
         let (lanes, warnings, _) = hopper.run(16);
@@ -3179,7 +3197,7 @@ pub(crate) mod tests {
         let warned = ["precision 4: acme/model@1.0.0 has no nvfp4 lane for sm89; served int8".to_string()];
         let (lanes, warnings, asked) = ada.run(4);
         assert_eq!((lanes, warnings), (vec!["int8".to_string()], warned.to_vec()));
-        assert_eq!(ada.landed(&asked), std::collections::BTreeSet::from(["int8"]));
+        assert_eq!(ada.landed(&asked), std::collections::BTreeSet::from(["bf16", "int8"]));
         let (_, warnings, asked) = ada.run(4);
         assert_eq!((warnings, asked), (warned.to_vec(), vec![]), "a warm run warns again and asks nothing");
         let declines = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "refuse"}]);
@@ -3209,7 +3227,7 @@ pub(crate) mod tests {
         let lora = domain::ModelChoice { parameter: "model".into(), adapters: vec![adapter], ..Default::default() };
         let plan = hopper.prepare(0, vec![lora]).plan.unwrap();
         let asked = std::mem::take(&mut *hopper.heard.lock().unwrap());
-        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["int8"]));
+        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["bf16", "int8"]));
         assert!(asked.iter().any(|heard| heard == "GET /refs/acme/lora.json"), "{asked:?}");
         assert!(plan.slots[0].binding.model.starts_with("view-"), "{:?}", plan.slots[0].binding);
     }
