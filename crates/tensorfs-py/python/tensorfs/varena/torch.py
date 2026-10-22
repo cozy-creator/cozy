@@ -580,6 +580,8 @@ class Memory:
             raise
         else:
             self._fold()  # its last interval outside any pass
+            if r.alone:  # torch's peak was this request's alone: varena records its outside room
+                r.native.outside(r.outside)
             r.ended = r.native.end()
         finally:
             _request.reset(token)

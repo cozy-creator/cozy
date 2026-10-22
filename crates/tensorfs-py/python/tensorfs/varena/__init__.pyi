@@ -213,6 +213,9 @@ class Request:
         back its reserved room to that family alone; ended, it waits for its room back."""
 
     def stats(self) -> Stats: ...
+    def outside(self, peak: int) -> None:
+        """Torch's allocated peak outside its passes (its setup, between passes), less what was
+        allocated at its start: recorded at its end as its dispatch key's outside room."""
     def spare(self) -> int:
         """Bytes the request could have now beside every W and P page without evicting one, as
         the last publication measured them (no lock): a capture's room before it captures."""

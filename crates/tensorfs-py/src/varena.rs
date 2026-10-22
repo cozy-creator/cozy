@@ -708,6 +708,16 @@ impl PyRequest {
         detached(py, &self.gpu, || Ok(r.stats())).map(Into::into)
     }
 
+    /// Torch's allocated peak outside the request's passes (its setup, between passes), less what
+    /// was allocated at its start: recorded at its end as its dispatch key's outside room.
+    fn outside(&self, py: Python<'_>, peak: u64) -> PyResult<()> {
+        let r = self.get(py)?;
+        detached(py, &self.gpu, || {
+            r.outside(peak);
+            Ok(())
+        })
+    }
+
     /// Bytes the request could have now beside every W and P page without evicting one (the
     /// last publication's figure, read without the state lock): a capture's room before it
     /// captures.
