@@ -49,16 +49,10 @@ pub fn need(ledgers: &[&crate::Ledger]) -> Need {
     Arc::new(move || tables.iter().map(|t| ledger::host_need(t)).sum())
 }
 
-/// Discretionary headroom includes the shipped measured non-tier growth reserve. This is
-/// observed demand, not a fixed floor; shmem growth from the tier itself is excluded.
+/// The live budget. `Growth` now takes calls' anonymous growth (6442e872e): the tier's need
+/// takes it in the port that follows.
 fn measured_budget() -> Budget {
-    let growth = Mutex::new(platform::contain::host_pressure::Growth::default());
-    Arc::new(move || {
-        let mut growth = growth.lock();
-        let host = platform::contain::host_memory::read();
-        let reserved = growth.observe(host);
-        i128::from(host.available) - i128::from(reserved)
-    })
+    Arc::new(|| i128::from(platform::contain::host_memory::read().available))
 }
 
 // One named claim file for this tier's host-pressure domain, shared by every GPU and
