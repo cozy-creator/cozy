@@ -563,6 +563,7 @@ class Memory:
     def request(self, id: str, plan: Sequence[object] = ()) -> Iterator[Request]:
         """Request `id` and its plan: its steps in order, each a model (`Model`, module or set
         name) or a collection of models that run together. Leaving ends it."""
+        self._fold()  # its outside-pass peak starts here
         r = Request(self, self.native.request(id, self._plan(plan)))
         self.requests[r] = None
         token = _request.set(r)
@@ -576,6 +577,7 @@ class Memory:
                 failed.add_note(f"ending request {id!r} also failed: {ending!r}")  # the request's own error stays the one raised
             raise
         else:
+            self._fold()  # its last interval outside any pass
             r.ended = r.native.end()
         finally:
             _request.reset(token)
@@ -676,7 +678,8 @@ class Memory:
 
     def _fold(self, discard: _Pass | None = None) -> None:
         """The allocator's peaks since the last reset into every open pass and its open sites,
-        but `discard`'s (a failed attempt's); then the reset. The only place peaks reset."""
+        but `discard`'s (a failed attempt's); with no pass open, into every open request's
+        outside-pass peak. Then the reset. The only place peaks reset."""
         with self.measuring:
             peak, reserved = self.torch.peaks()
             for p in self.passes:
@@ -684,6 +687,9 @@ class Memory:
                     p.peak, p.reserved_peak = max(p.peak, peak), max(p.reserved_peak, reserved)
                     for entry in p.open:
                         entry[1] = max(entry[1], peak)  # type: ignore[call-overload]
+            if not self.passes:
+                for r in self.requests:
+                    r.outside = max(r.outside, peak - r.base)
             self.torch.reset()
 
     # -- passes
@@ -878,6 +884,10 @@ class Request:
     def __init__(self, memory: Memory, native: NativeRequest) -> None:
         self.memory, self.native = memory, native
         self.ended: Stats | None = None
+        #: torch's allocation at its start, and the most it held beyond that while no pass was
+        #: open (its inputs, the tensors between its models, its call setup)
+        self.base = memory.torch.now()[0]
+        self.outside = 0
         #: torch's allocator churn over its passes (retries, device allocs and frees, syncs)
         self.churn: dict[str, int] = {}
         #: (set, block) -> bytes kept bound in it for weight tensors that outlived their run
