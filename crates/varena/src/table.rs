@@ -317,6 +317,11 @@ impl Remote {
         self.context + self.torch + self.classes.iter().enumerate().filter(|(c, _)| *c != Class::O.index()).map(|(_, b)| b).sum::<u64>()
     }
 
+    /// What no ask can free: its context, torch's bytes beyond its idle caches, W and P.
+    pub fn unevictable(&self) -> u64 {
+        self.held().saturating_sub(self.evictable(Class::D))
+    }
+
     /// What its ask thread can free under `ceiling`.
     pub fn evictable(&self, ceiling: Class) -> u64 {
         let pages: u64 = [Class::S, Class::N, Class::D].iter().filter(|c| **c <= ceiling).filter_map(|c| self.classes.get(c.index())).sum();
@@ -446,6 +451,13 @@ impl Table {
     /// F: what no row, orphan or foreign tenant holds.
     pub fn free(&self) -> u64 {
         self.capacity.saturating_sub(self.foreign + self.orphans + self.held() + self.others_held())
+    }
+
+    /// The most this process could ever have beside torch's allocation: the capacity less
+    /// foreign bytes, its context, that allocation and what no ask can free from other rows.
+    pub fn reachable(&self) -> u64 {
+        let others: u64 = self.others.iter().map(Remote::unevictable).sum();
+        self.capacity.saturating_sub(self.foreign + self.context + self.allocated + others)
     }
 
     /// What torch's allocator may hold: capacity − context − mapped − other rows − foreign.

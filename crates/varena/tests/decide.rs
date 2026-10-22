@@ -366,7 +366,7 @@ fn any_oom_sequence_ends_within_pages_plus_cuts_plus_two() {
         answers += 1;
         assert!(answers <= pages + cut_levels + 2, "{answers} answers");
         let site = (cuts < cut_levels).then(|| OomSite { name: "ffn".into(), collective: false, finest: cut_levels, shape: "1x8".into() });
-        let a = demand(&mut t, Trigger::Oom { req: 1, set: Some(0), need: Some(64 * MB), site, tried: Tried::default() }, &mut run, &mut clock);
+        let a = demand(&mut t, Trigger::Oom { req: 1, set: Some(0), need: Some(pages as u64 * MB), site, tried: Tried::default() }, &mut run, &mut clock);
         match a.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::Park(_) | Action::Exhausted { .. })) {
             Some(Action::Cut { .. }) => cuts += 1,
             Some(Action::Exhausted { .. }) => break,

@@ -640,9 +640,16 @@ impl Shared {
     }
 }
 
-/// Merges a request's peak into `peak/<key>`: the larger stays, whoever writes last.
+/// A request's compute room (beside its weights) at `compute/<package>|<shape>`: the latest
+/// run's replaces what was there, as a pass's room does (one large run never pins it).
+pub(crate) fn record_compute(shared: &Shared, key: &str, bytes: u64) -> Result<()> {
+    shared.put(&format!("compute/{key}"), Some(&bytes.to_le_bytes()))
+}
+
+/// Merges a request's working set into `peak/<package>|<shape>`: the larger stays, whoever
+/// writes last.
 pub(crate) fn record_peak(shared: &Shared, key: &str, bytes: u64) -> Result<()> {
-    shared.merge(&format!("peak/{key}"), |old| {
+    shared.merge(key, |old| {
         let known = old.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes);
         Some(known.map_or(bytes, |k| k.max(bytes)).to_le_bytes().to_vec())
     })
@@ -1012,6 +1019,8 @@ pub struct Status {
 pub enum Peak {
     /// A request's largest working set at `<package>|<shape>`.
     Request { key: String, bytes: u64 },
+    /// A request's largest room beside its weights (its compute bytes) at `<package>|<shape>`.
+    Compute { key: String, bytes: u64 },
     /// A pass's room at `<set>|<shape>|<cuts>`, every field as measured.
     Pass { key: String, room: Room },
     /// A set's resident bytes (its layout's span), by set name.
@@ -1109,12 +1118,18 @@ impl Ledger {
     /// A request's measured peak at `<package>|<shape>`; an empty shape means the package's
     /// widest measured one.
     fn peak(&self, key: &str) -> Result<Option<u64>> {
+        self.figure("peak", key)
+    }
+
+    /// A request's recorded figure (`peak` or `compute`) at `<package>|<shape>`; an empty shape
+    /// means the package's widest measured one.
+    fn figure(&self, kind: &str, key: &str) -> Result<Option<u64>> {
         let bytes = |v: Vec<u8>| v.try_into().ok().map(u64::from_le_bytes);
         if key.ends_with('|') {
-            let all = self.shared.facts(&format!("peak/{key}"))?;
+            let all = self.shared.facts(&format!("{kind}/{key}"))?;
             return Ok(all.into_iter().filter_map(|(_, v)| bytes(v)).max());
         }
-        Ok(self.shared.fact(&format!("peak/{key}"))?.and_then(bytes))
+        Ok(self.shared.fact(&format!("{kind}/{key}"))?.and_then(bytes))
     }
 
     /// Whether a request of `package` at `shape` (empty: its widest measured shape) can start
@@ -1147,7 +1162,8 @@ impl Ledger {
     /// else as its load recorded them on any GPU of the group, else unknown. Each GPU's room is
     /// its capacity less foreign bytes and every live row's unmovable bytes (context, torch,
     /// W, P, and a yielded parent's W unless it waits for `family`); GPU 0's less the
-    /// package's measured working set too.
+    /// package's measured compute room too (its room beside its weights, so where its sets
+    /// lived when it was measured does not move them).
     pub fn place(group: &[&Ledger], package: &str, shape: &str, family: Option<&str>, sets: &[(&str, Option<u64>)]) -> Result<Vec<u32>> {
         let family = family.map(family_id);
         let mut rooms = Vec::with_capacity(group.len());
@@ -1155,8 +1171,10 @@ impl Ledger {
             // A yielded parent's W comes back, except to its own family's child.
             let unmovable = |f: &Facts| f.context + f.torch + [Class::W, Class::P].iter().filter_map(|c| f.classes.get(c.index())).sum::<u64>() + if family == Some(f.family) { 0 } else { f.yielded };
             let held: u64 = l.shared.rows()?.iter().filter(|r| r.live).map(|r| unmovable(&r.facts)).sum();
+            // GPU 0 keeps the package's compute room free: its measured room beside its
+            // weights, wherever those lived when it was measured.
             let working = match g {
-                0 => l.peak(&format!("{package}|{shape}"))?.unwrap_or(0),
+                0 => l.figure("compute", &format!("{package}|{shape}"))?.unwrap_or(0),
                 _ => 0,
             };
             rooms.push(l.shared.capacity()?.saturating_sub(l.shared.foreign()? + held + working));
@@ -1202,6 +1220,11 @@ impl Ledger {
                 out.push(Peak::Pass { key: key.trim_start_matches("room/").to_string(), room });
             }
         }
+        for (key, v) in self.shared.facts("compute/").unwrap_or_default() {
+            if let Ok(bytes) = v.try_into().map(u64::from_le_bytes) {
+                out.push(Peak::Compute { key: key.trim_start_matches("compute/").to_string(), bytes });
+            }
+        }
         for (key, v) in self.shared.facts("set/").unwrap_or_default() {
             if let Ok(bytes) = v.try_into().map(u64::from_le_bytes) {
                 out.push(Peak::Set { key: key.trim_start_matches("set/").to_string(), bytes });
@@ -1218,6 +1241,7 @@ impl Ledger {
                 Peak::Request { key, bytes } => restore_fact(&self.shared, &format!("peak/{key}"), bytes.to_le_bytes().to_vec())?,
                 Peak::Pass { key, room } => restore_fact(&self.shared, &format!("room/{key}"), os::encode(room)?)?,
                 Peak::Set { key, bytes } => record_set(&self.shared, key, *bytes)?,
+                Peak::Compute { key, bytes } => restore_fact(&self.shared, &format!("compute/{key}"), bytes.to_le_bytes().to_vec())?,
             }
         }
         Ok(())
@@ -1340,7 +1364,7 @@ mod tests {
         let writers: Vec<_> = (1..=8u64)
             .map(|i| {
                 let shared = shared.clone();
-                std::thread::spawn(move || (0..16).for_each(|_| record_peak(&shared, "pkg|1x1", i << 20).unwrap()))
+                std::thread::spawn(move || (0..16).for_each(|_| record_peak(&shared, "peak/pkg|1x1", i << 20).unwrap()))
             })
             .collect();
         writers.into_iter().for_each(|w| w.join().unwrap());

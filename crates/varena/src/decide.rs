@@ -207,6 +207,11 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
 /// exhaustion.
 fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&OomSite>, tried: &Tried) -> Vec<Action> {
     let Some(r) = t.request(req) else { return vec![Action::Exhausted { need: need.unwrap_or(0) }] };
+    // A need beyond what the request could ever get: Exhausted at once, nothing lowered or
+    // evicted for it.
+    if let Some(n) = need.filter(|n| *n > t.reachable()) {
+        return vec![Action::Exhausted { need: n - t.reachable() }];
+    }
     let sites = set.and_then(|s| r.sites.get(&s)).map(Vec::as_slice).unwrap_or_default();
     let level = |s: &OomSite| match set {
         Some(_) => sites.iter().find(|x| x.name == s.name).map_or(0, |x| x.level),
