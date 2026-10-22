@@ -751,7 +751,7 @@ struct Inner {
     row: Arc<Row>,
     _device: Device,
     /// Signalled by every change of the table while this process waits for room.
-    room_wake: Owned,
+    room_wake: ledger::RoomWake,
     custody: Option<Arc<custody::Client>>,
     tier: Option<Arc<tier::Client>>,
     state: Mutex<State>,
@@ -799,7 +799,7 @@ impl Memory {
             shared.reap(None)?;
             let row = Arc::new(shared.claim_with(std::process::id(), grant.row)?);
             let listener = row.listen()?;
-            let room_wake = row.endpoint()?;
+            let room_wake = ledger::RoomWake::new(row.endpoint()?);
             let custody = custody::Client::open(&shared).map_err(|e| tracing::warn!("varena: no custody: {e}")).ok().map(Arc::new);
             // Serving the tier here, it keeps this GPU's running requests' host growth free.
             let need: tier::Need = Arc::new({
@@ -1333,6 +1333,7 @@ impl Inner {
             family: t.requests.iter().find(|r| r.yielded.is_some()).map_or(0, |r| r.family),
             host_peak: st.host.values().flatten().copied().max().unwrap_or(0),
             host_unmeasured: st.host.values().filter(|h| h.is_none()).count() as u64,
+            returning: t.pending + t.inflight,
         });
     }
 
@@ -1893,7 +1894,7 @@ impl Inner {
                         tried.freed += self.row.ask(row, ceiling, bytes)?;
                     }
                     // Custody lets go of the kept pages unmapped: then they are free.
-                    Action::Settle => self.to_custody.settle(),
+                    Action::Settle => self.settle_returning()?,
                     _ => {}
                 }
             }
@@ -2689,6 +2690,21 @@ impl Inner {
         stats
     }
 
+    /// Preparation only: wait for already-retiring bytes, never for a peer to run package
+    /// code or finish a RAM-tier copy. The allocator callback does not execute this action.
+    fn settle_returning(&self) -> Result<()> {
+        self.to_custody.settle();
+        let _waiting = self.row.waiting();
+        let epoch = self.room_wake.epoch();
+        // Check after registering, so any subsequent completion signals this endpoint.
+        let rows = self.shared.rows()?;
+        let returning = ledger::remotes(&rows, self.row.at()).0.iter().any(|r| r.returning > 0);
+        if returning {
+            self.room_wake.wait(epoch)?;
+        }
+        Ok(())
+    }
+
     /// The ask thread's answer, from pages only: it runs no caller code. An idle process's trim
     /// and cache shrinks go to its trim thread, after the answer.
     fn answer(&self, ceiling: Class, bytes: u64) -> u64 {
@@ -3405,8 +3421,9 @@ impl Inner {
         let Some(((room, measured), set)) = back else { return Ok(()) };
         // Its room back as a request first gets it: a decision, then waits on the table's
         // changes. Exhausted only if the card cannot hold it at all.
-        self.row.set_waiting(true);
-        let out = loop {
+        let _waiting = self.row.waiting();
+        loop {
+            let epoch = self.room_wake.epoch();
             let actions = match self.demand(Trigger::Pass { req, set, room: measured.then_some(room), unmeasured: room, tried: Tried::default() }, Some(req)) {
                 Ok(a) => a,
                 Err(e) => break Err(e),
@@ -3419,12 +3436,10 @@ impl Inner {
             if never {
                 break Err(Error::Exhausted(exhausted(*need, None, stats)));
             }
-            if let Err(e) = crate::os::wake_await(&self.room_wake) {
+            if let Err(e) = self.room_wake.wait(epoch) {
                 break Err(e);
             }
-        };
-        self.row.set_waiting(false);
-        out
+        }
     }
 
     fn levels(&self, req: u64, pass: u64) -> Vec<(String, u32)> {

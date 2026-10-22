@@ -338,19 +338,23 @@ impl<'a> Demand<'a> {
         self.got >= self.need
     }
 
-    /// What is still missing, the withdrawn kept pages counted as coming.
+    /// Bytes already retiring plus the kept pages this decision will withdraw.
+    fn returning(&self) -> u64 {
+        self.withdrawn + self.t.returning()
+    }
+
     fn short(&self) -> u64 {
-        self.need.saturating_sub(self.got + self.withdrawn)
+        self.need.saturating_sub(self.got + self.returning())
     }
 
     /// Enough once the withdrawn kept pages are free.
     fn covered(&self) -> bool {
-        self.got + self.withdrawn >= self.need
+        self.got + self.returning() >= self.need
     }
 
     /// Covered by kept pages planned out: settle, then decide again.
     fn settles(&mut self) -> bool {
-        if self.enough() || !self.covered() || self.withdrawn == 0 {
+        if self.enough() || !self.covered() || self.returning() == 0 {
             return false;
         }
         self.out.push(Action::Settle);
@@ -439,6 +443,9 @@ impl<'a> Demand<'a> {
     fn run(&mut self, rungs: Rungs) -> Option<Done> {
         if self.enough() {
             return Some(Done::Enough);
+        }
+        if self.settles() {
+            return Some(Done::Remote);
         }
         if rungs == Rungs::Lowered {
             self.evict(Class::W);
