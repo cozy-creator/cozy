@@ -1308,7 +1308,7 @@ pub(crate) fn remotes(rows: &[RowView], own: u64) -> (Vec<Remote>, u64) {
             physical: r.facts.physical,
             caches: r.facts.caches,
             classes: r.facts.classes,
-            returning: if r.live { r.facts.returning.min(r.facts.classes.get(Class::P.index()).copied().unwrap_or(0)) } else { 0 },
+            returning: if r.live { r.facts.returning } else { 0 },
         })
         .collect();
     (others, orphans)
@@ -1363,6 +1363,8 @@ pub struct RowStatus {
     pub torch: u64,
     /// Bytes asked of it and not yet answered.
     pub asked: u64,
+    /// Bytes it is giving back: its retiring pages and its caches' queued shrinks.
+    pub returning: u64,
     /// Waiting for room: a request's wait on a child call ended and its room is not back yet.
     pub waiting: bool,
 }
@@ -1654,7 +1656,7 @@ impl Ledger {
             foreign,
             rows: rows
                 .iter()
-                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, torch: r.facts.torch, asked: asked_of(&rows, r.id()), waiting: r.waiting })
+                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, torch: r.facts.torch, asked: asked_of(&rows, r.id()), returning: r.facts.returning, waiting: r.waiting })
                 .collect(),
             dispatched: dispatched.into_iter().map(|(k, v)| (k.trim_start_matches("dispatch/").to_string(), String::from_utf8_lossy(&v).into_owned())).collect(),
         }

@@ -11,7 +11,7 @@ use tensorfs::format::ObjectRef;
 use tensorfs::io::source::Source;
 use tensorfs::io::{ItemSource, ObjectRange};
 use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
-use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Next, Plan, SetSpec, Site, Step, Torch};
+use varena::{CacheId, Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Next, Plan, SetSpec, Shrunk, Site, Step, Torch};
 
 const MB: u64 = 1 << 20;
 
@@ -894,3 +894,36 @@ fn an_outside_room_is_its_packages_largest_at_any_shape() {
     r.end();
 }
 
+
+/// S3's footgun: a shrink that reports its cache from inside (its queued work finished before
+/// it returned) has the report applied after the shrink's own figures, never overwritten by
+/// them: the bytes it said came are not left coming, and nothing waits for them.
+#[test]
+fn a_report_made_during_a_shrink_is_applied_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("report", 8 * MB);
+    let mem = Arc::new(mem);
+    let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
+    // The shrink's handle to its Memory and cache, dropped at the end (a cycle meanwhile).
+    type Me = parking_lot::Mutex<Option<(Arc<Memory>, CacheId)>>;
+    let me: Arc<Me> = Arc::default();
+    let inside = me.clone();
+    let cache = mem.cache("decode", &[], move |want| {
+        if let Some((mem, id)) = inside.lock().clone() {
+            mem.cached(id, 0);
+        }
+        Shrunk { freed: 0, coming: want.min(4 * MB) }
+    });
+    *me.lock() = Some((mem.clone(), cache));
+    mem.cached(cache, 4 * MB);
+    let r = mem.request("r", plan("a")).unwrap();
+    let torch = Torch { allocated: 0, reserved: 4 * MB };
+    let pass = r.pass(a, "fwd", "1x8", torch).unwrap();
+    let pin = mem.bind(a, 0, 0).unwrap();
+    let free = ledger.status().free;
+    assert!(matches!(r.oom(Some(a), Some(free + MB), None, torch), Next::Retry));
+    let returning: u64 = ledger.status().rows.iter().map(|r| r.returning).sum();
+    me.lock().take();
+    assert_eq!(returning, 0, "the report inside the shrink is its last word: nothing is still coming");
+    drop((pin, pass));
+}

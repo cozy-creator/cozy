@@ -358,6 +358,18 @@ pub struct Cache {
     /// Bytes its shrink queued and has not given back yet (the domain lock was busy): coming,
     /// as a peer's deferred shrink is (review 6, C2).
     pub coming: u64,
+    /// Its shrinks running, and the bytes it reported meanwhile: applied after them, so a
+    /// shrink's return never overwrites a report made during it.
+    pub shrinking: u32,
+    pub reported: Option<u64>,
+}
+
+impl Cache {
+    /// Its caller's word on its bytes: any queued shrink's have arrived.
+    pub fn report(&mut self, bytes: u64) {
+        self.bytes = bytes;
+        self.coming = 0;
+    }
 }
 
 /// Another process's row, as it published it.
@@ -375,7 +387,8 @@ pub struct Remote {
     /// Of `torch`, what its trim hook and caches give back when it is idle.
     pub caches: u64,
     pub classes: [u64; 7],
-    /// Subset of P already retiring; still held, but reachable after its completion.
+    /// Bytes it is giving back: retiring pages (of P) and its caches' queued shrinks (of torch's);
+    /// still held, reachable once they land.
     pub returning: u64,
 }
 
@@ -470,6 +483,10 @@ impl Table {
     /// The nearest next use over the open requests.
     pub fn distance(&self, key: Key) -> Option<(u32, u32, u32)> {
         self.requests.iter().filter_map(|r| r.distance(key)).min()
+    }
+
+    pub fn cache_mut(&mut self, id: u32) -> Option<&mut Cache> {
+        self.caches.iter_mut().find(|c| c.id == id)
     }
 
     /// A cache's nearest next use over the open requests and its sets.
