@@ -688,7 +688,23 @@ struct State {
     deferred_saves: Vec<Save>,
 }
 
+/// A page the allocator hook takes in place, unmapped and destroyed on its own thread: (page, its generation, class,
+/// place, backing, ready event).
+type Taking = (Key, u64, Class, (Va, u64, u64), Physical, Event);
+
 impl State {
+    /// Marks `key` the hook's to take in place (nobody else touches it meanwhile) and takes its backing out of its
+    /// home; `None` when it is not the hook's to take (kept, being kept, protected, already taken, or unbacked).
+    fn take_in_place(&mut self, key: Key) -> Result<Option<Taking>> {
+        let (place, class) = (self.place(key)?, self.table.class(key).unwrap_or(Class::N));
+        let Some(h) = self.homes.get_mut(&key).filter(|h| !h.keeping && !h.keep_after && !h.protecting && !h.reclaiming && !h.exported) else { return Ok(None) };
+        let Some(phys) = h.phys.take() else { return Ok(None) };
+        h.reclaiming = true;
+        let taking = (key, h.gen, class, place, phys, h.ready);
+        self.sync(key);
+        Ok(Some(taking))
+    }
+
     /// No work can touch the page: unpinned, no release event pending, not filling or being
     /// transformed.
     fn idle(&self, key: Key) -> bool {
@@ -2251,9 +2267,6 @@ impl Inner {
             }
             let mut want = bytes - free;
             let (mut unmapped, mut withdrawn, mut events, mut shrinks) = (0, false, vec![], vec![]);
-            // The hook's pages, taken in place below: (page, its generation, class, place,
-            // backing, ready event).
-            type Taking = (Key, u64, Class, (Va, u64, u64), Physical, Event);
             let mut taking: Vec<Taking> = vec![];
             let mut streamed = HashSet::new();
             for v in decide::victims(&st.table, keep) {
@@ -2266,7 +2279,10 @@ impl Inner {
                     if st.table.distance(*key).is_some_and(|d| d.0 == 0) {
                         if streamed.insert(key.0) {
                             let taken = self.stream(&mut st, key.0, want, req, hook)?;
-                            (unmapped, want) = (unmapped + taken.unmapped, want.saturating_sub(taken.unmapped + taken.pending));
+                            for k in taken.takes {
+                                taking.extend(st.take_in_place(k)?);
+                            }
+                            (unmapped, want) = (unmapped + taken.unmapped, want.saturating_sub(taken.unmapped + taken.taking + taken.pending));
                             events.extend(taken.events);
                         }
                         continue;
@@ -2277,12 +2293,8 @@ impl Inner {
                     Victim::Page { key, .. } if hook && kept(key) => {}
                     Victim::Cache { .. } if hook => {}
                     Victim::Page { key, bytes: b, releasing: false } if hook => {
-                        let (place, class) = (st.place(key)?, st.table.class(key).unwrap_or(Class::N));
-                        let Some(h) = st.homes.get_mut(&key).filter(|h| !h.keeping && !h.keep_after && !h.protecting && !h.reclaiming && !h.exported) else { continue };
-                        let Some(phys) = h.phys.take() else { continue };
-                        h.reclaiming = true;
-                        taking.push((key, h.gen, class, place, phys, h.ready));
-                        st.sync(key);
+                        let Some(t) = st.take_in_place(key)? else { continue };
+                        taking.push(t);
                         want = want.saturating_sub(b);
                     }
                     Victim::Page { key, bytes: b, releasing: false } => {
