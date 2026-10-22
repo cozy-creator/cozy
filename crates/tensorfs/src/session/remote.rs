@@ -234,7 +234,7 @@ impl Remote {
         Ok(())
     }
 
-    pub async fn open(&self, mut reference: Ref, constraints: &crate::precision::Constraints) -> Result<Checkpoint> {
+    pub async fn open(&self, mut reference: Ref, constraints: Option<&crate::precision::Constraints>) -> Result<Checkpoint> {
         let Root { object: root, tag, variant } = self.root(&reference).await?;
         let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
@@ -245,7 +245,7 @@ impl Remote {
                 let wanted = fetch::pick_variant(&tree, reference.revision.as_deref(), variant, reference.variant.as_deref())?;
                 let mut held_profiles = true;
                 for (_, header) in tree.variants() { held_profiles &= self.store.reuse(header)?; }
-                let indexed = if !held_profiles && !self.offline && wanted.is_none() && !reference.repo_id.starts_with("local/") && !reference.repo_id.starts_with("sha256:") {
+                let indexed = if let Some(constraints) = constraints.filter(|_| !held_profiles && !self.offline && wanted.is_none() && !reference.repo_id.starts_with("local/") && !reference.repo_id.starts_with("sha256:")) {
                     self.endpoint.inner.select(&reference.repo_id, &root.id(), constraints).await.map_err(from_native)?
                 } else { None };
                 let selected;
@@ -255,7 +255,7 @@ impl Remote {
                     if tree.header(name) != answer.header.as_ref() { return fail(Kind::Integrity, "selection header does not belong to its variant"); }
                     for reason in &answer.reasons { tracing::warn!("{reason}"); }
                     Some(name.as_str())
-                } else if wanted.is_none() {
+                } else if let Some(constraints) = constraints.filter(|_| wanted.is_none()) {
                     let headers: Vec<_> = tree.variants().map(|(_,h)| h.clone()).collect();
                     let _headers_hold = self.store.hold(&headers)?;
                     self.fetch(&headers, &Download::default()).await?;

@@ -210,11 +210,28 @@ impl Client {
             },
         };
         constraints.select(name_or_path, &[])?; // Validate even an explicit variant's options.
+        self.open_using(name_or_path, options, Some(&constraints)).await
+    }
+
+    /// Open the named or sole variant for inspection and data operations, without selecting
+    /// for this computer's execution capabilities. Multiple variants require an explicit name.
+    /// Execution constraints belong to `open`; they must never be silently ignored here.
+    pub async fn open_variant(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint> {
+        if options.bits.is_some() || options.gpus.is_some() {
+            return fail(Kind::Invalid, "use open to select by GPUs or bits; open_variant names stored data");
+        }
+        self.open_using(name_or_path, options, None).await
+    }
+
+    async fn open_using(
+        &self, name_or_path: &str, options: &Open, constraints: Option<&crate::precision::Constraints>,
+    ) -> Result<Checkpoint> {
+        let path = Path::new(name_or_path);
         let checkpoint = if path.exists() {
             let path = path
                 .canonicalize()
                 .map_err(|e| io_failure(path.display(), e))?;
-            let selected = if path.is_dir() && options.variant.is_none() {
+            let selected = if let Some(constraints) = constraints.filter(|_| path.is_dir() && options.variant.is_none()) {
                 let mut profiles = Vec::new();
                 for name in crate::store::folder_files(&path, "")? {
                     if crate::format::variant_of(&name).is_some() {
@@ -260,7 +277,7 @@ impl Client {
             }
             reference.endpoint = options.endpoint.clone();
             let source = self.source(&reference, options.local_files_only)?;
-            source.open(reference, &constraints).await?
+            source.open(reference, constraints).await?
         };
         if !options.lazy {
             checkpoint.download(&Download::default()).await?;
