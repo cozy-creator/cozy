@@ -885,14 +885,8 @@ async fn supplied_provider_error_and_local_unreleased_semantics_are_public() {
     .unwrap();
     let repo = local.repo("local/unreleased").await.unwrap().unwrap().0;
     assert!(repo.tags.len() == 1 && repo.tag("main").is_some_and(|t| t.commit == tree && !t.public), "a private main");
-    assert_eq!(
-        client
-            .open("local/unreleased", &Open::default())
-            .await
-            .unwrap_err()
-            .kind,
-        Kind::NotFound
-    );
+    let unversioned = client.open("local/unreleased", &Open { gpus: Some(vec![]), ..Open::default() }).await.unwrap();
+    assert_eq!(unversioned.tree(), Some(&tree), "no public release: the default is main");
     let checkpoint = client
         .open(
             &tree.id(),
@@ -1146,7 +1140,7 @@ fn python_takes_the_store_and_endpoint_by_the_native_rule() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn untagged_immutable_commit_keeps_constraints_when_indexed_selection_is_unavailable() {
+async fn an_exact_commit_keeps_constraints_and_reopens_from_the_cache_once_untagged() {
     let scratch=Scratch::new();
     let origin=scratch.0.join("origin");
     let vectors=Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/vectors/select");
@@ -1156,36 +1150,90 @@ async fn untagged_immutable_commit_keeps_constraints_when_indexed_selection_is_u
     };
     let plain=put(fs::read(vectors.join("bf16.cbor")).unwrap());
     let encoded=put(fs::read(vectors.join("int8.cbor")).unwrap());
-    let untagged=put(format::Tree {files:BTreeMap::from([("nested/odd.cozytensors".into(),encoded.clone()),("model.int8.cozytensors".into(),plain.clone())])}.to_json().unwrap());
+    let exact=put(format::Tree {files:BTreeMap::from([("nested/odd.cozytensors".into(),encoded.clone()),("model.int8.cozytensors".into(),plain.clone())])}.to_json().unwrap());
     let tagged=put(format::Tree {files:BTreeMap::from([("default.cozytensors".into(),plain.clone())])}.to_json().unwrap());
-    let mut repo=format::Repo::new("acme/model");
-    repo.tags.push(format::Tag{name:"1.0".into(),commit:tagged.clone(),public:true,yanked:false});
-    let path=origin.join(repo.key());fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,repo.to_json().unwrap()).unwrap();
+    let publish=|commit:&ObjectRef| {
+        let mut repo=format::Repo::new("acme/model");
+        repo.tags.push(format::Tag{name:"1.0".into(),commit:commit.clone(),public:true,yanked:false});
+        let path=origin.join(repo.key());fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,repo.to_json().unwrap()).unwrap();
+    };
+    publish(&exact);
     let http=Http::new(origin.clone());
-    let mut cfg=config(&scratch.0.join("client"),&http.url);cfg.token=None;
-    let client=Client::new(cfg).unwrap();
-    let reference=format!("acme/model@{}",untagged.id());
+    let client=Client::new(config(&scratch.0.join("client"),&http.url)).unwrap();
+    let reference=format!("acme/model@{}",exact.id());
     let options=Open{gpus:Some(vec!["8.6".into()]),bits:Some(8),..Default::default()};
     let selected=client.open(&reference,&options).await.unwrap();
-    assert_eq!(selected.tree(),Some(&untagged));assert_eq!(selected.id(),&encoded);
+    assert_eq!(selected.tree(),Some(&exact));assert_eq!(selected.id(),&encoded);
     assert_eq!(selected.variant(),Some("nested/odd.cozytensors"));
-    assert!(http.requests.lock().unwrap().iter().any(|(_,path,_)|path.starts_with("/v1/models/acme/model/select?")),"the endpoint could not index this hash, so the client used headers");
-    let cpu=client.open(&reference,&Open{gpus:Some(vec![]),bits:Some(16),..Default::default()}).await.unwrap();
-    assert_eq!(cpu.tree(),Some(&untagged));assert_eq!(cpu.id(),&plain);
-    assert_ne!(cpu.tree(),Some(&tagged),"a missing index entry never selects the tagged default");
-    // A run token may read a retained commit while the repo's tag document is invisible.
-    fs::remove_file(origin.join(repo.key())).unwrap();
-    let mut hidden_cfg=config(&scratch.0.join("hidden-client"),&http.url);hidden_cfg.token=None;
-    let hidden=Client::new(hidden_cfg).unwrap();
-    let selected=hidden.open(&reference,&options).await.unwrap();
-    assert_eq!(selected.tree(),Some(&untagged));assert_eq!(selected.id(),&encoded);
+    assert!(http.requests.lock().unwrap().iter().any(|(_,path,_)|path.starts_with("/v1/models/acme/model/select?")),"the origin has no index, so the client used headers");
+    let cpu=Open{gpus:Some(vec![]),bits:Some(16),..Default::default()};
+    assert_eq!(client.open(&reference,&cpu).await.unwrap().id(),&plain);
+    // The tag moves on and this store learns it: the commit is untagged everywhere.
+    publish(&tagged);
+    assert_eq!(client.open("acme/model@1.0",&cpu).await.unwrap().tree(),Some(&tagged));
+    // A store without it is never handed it by digest, nor the tagged default instead.
+    let fresh=Client::new(config(&scratch.0.join("fresh"),&http.url)).unwrap();
+    assert_eq!(fresh.open(&reference,&cpu).await.unwrap_err().kind,Kind::NotFound);
+    // The store that holds it reopens it offline, with no network.
     let before=http.requests.lock().unwrap().len();
-    let cached=hidden.open(&reference,&Open{gpus:Some(vec![]),bits:Some(16),local_files_only:true,..Default::default()}).await.unwrap();
-    assert_eq!(cached.id(),&plain);
+    let cached=client.open(&reference,&Open{local_files_only:true,..cpu}).await.unwrap();
+    assert_eq!((cached.tree(),cached.id()),(Some(&exact),&plain));
     assert_eq!(http.requests.lock().unwrap().len(),before,"a cached untagged commit and its headers open offline without network");
 
     // No tensor chunks exist, and selection issued no request for one.
     for (_,path,_) in http.requests.lock().unwrap().iter().filter(|(_,p,_)|p.starts_with("/blobs/")) {
-        assert!([&plain,&encoded,&untagged,&tagged].iter().any(|object|path.ends_with(&object.sha256)),"payload requested: {path}");
+        assert!([&plain,&encoded,&exact,&tagged].iter().any(|object|path.ends_with(&object.sha256)),"payload requested: {path}");
+    }
+}
+
+/// Offline, an unversioned open is the newest public release this store resolved before, else
+/// `main`: never a private tag, however recently opened. A tag opens as named.
+#[tokio::test(flavor = "current_thread")]
+async fn offline_unversioned_opens_follow_the_newest_public_release_else_main() {
+    let scratch = Scratch::new();
+    let origin = scratch.0.join("origin");
+    let put = |bytes: Vec<u8>| {
+        let object = ObjectRef::of(&bytes);
+        let path = origin.join(object.key());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+        object
+    };
+    let header = put(fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/vectors/select/bf16.cbor")).unwrap());
+    let commit = |name: &str| {
+        let readme = put(name.as_bytes().to_vec());
+        put(format::Tree { files: BTreeMap::from([("model.cozytensors".into(), header.clone()), ("README.md".into(), readme)]) }.to_json().unwrap())
+    };
+    let (old, new, main, dev) = (commit("1.0"), commit("2.0"), commit("main"), commit("dev"));
+    let mut repo = format::Repo::new("acme/model");
+    for (name, commit, public) in [("1.0", &old, true), ("2.0", &new, true), ("main", &main, false), ("dev", &dev, false)] {
+        repo.tags.push(format::Tag { name: name.into(), commit: commit.clone(), public, yanked: false });
+    }
+    let path = origin.join(repo.key());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, repo.to_json().unwrap()).unwrap();
+    let http = Http::new(origin.clone());
+    let cpu = Open { gpus: Some(vec![]), bits: Some(16), ..Default::default() };
+    let offline = Open { local_files_only: true, ..cpu.clone() };
+    let open = async |client: &Client, reference: &str, options: &Open| client.open(reference, options).await.map(|c| c.tree().cloned());
+    // Each store opens its names online in this order: the private `dev` last.
+    let stores: [(&str, &[&str], Option<&ObjectRef>); 3] = [
+        ("all", &["acme/model@1.0", "acme/model", "acme/model@main", "acme/model@dev"], Some(&new)),
+        ("unreleased", &["acme/model@main", "acme/model@dev"], Some(&main)),
+        ("private", &["acme/model@dev"], None),
+    ];
+    for (name, online, default) in stores {
+        let client = Client::new(config(&scratch.0.join(name), &http.url)).unwrap();
+        for reference in online {
+            open(&client, reference, &cpu).await.unwrap();
+        }
+        let before = http.requests.lock().unwrap().len();
+        let unversioned = open(&client, "acme/model", &offline).await;
+        match default {
+            Some(commit) => assert_eq!(unversioned.unwrap().as_ref(), Some(commit), "{name}"),
+            None => assert_eq!(unversioned.unwrap_err().kind, Kind::NotFound, "{name}"),
+        }
+        assert_eq!(open(&client, "acme/model@dev", &offline).await.unwrap().as_ref(), Some(&dev), "{name}");
+        assert_eq!(http.requests.lock().unwrap().len(), before, "{name}: offline opens use no network");
     }
 }

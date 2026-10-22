@@ -679,7 +679,8 @@ A repo is a set of **commits** and the **tags** that point at them, as in git:
     `rc`, `.dev`) only when no final version exists; of equal versions (`1.0`, `1.0.0`), the later-created tag; with
     none, the tag `main` unless it is yanked (Hugging Face's default revision);
   - `sha256:<hex>`: the tag commit with that digest; else a variant header with that digest, at the commit that cites
-    it (the default's if it does, else the last-created tag's whose commit does); else not found;
+    it (the default's if it does, else the last-created tag's whose commit does); else a commit with that digest the
+    reader already holds; else not found;
   - otherwise the tag of that name, yanked or not (a reader MAY warn); else not found.
 
   The variant is then looked up in that commit's tree. An explicit path or header digest fixes the
@@ -750,11 +751,9 @@ is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8`; the respo
 `release`, `commit`, `variant`, `header`, `profile` and `reasons`. A client takes only an answer of its
 own rule version (2), else reads the headers. No fitting variant is HTTP200 with null fields;
 invalid bits is HTTP400. Read permissions and explicit yanked-tag behavior match ordinary resolution.
-The current index covers commits named by repo tags. An untagged retained commit can be readable
-without a selection index entry; HTTP404 from this optional route does not establish that the
-commit is absent. A static origin or older Hub can also omit the route. Clients retain the exact
-immutable commit and the requested constraints and apply the same pure rule to its headers;
-they never substitute a tagged default. Explicit owner deletion and commit retention are unchanged.
+The current index covers commits named by repo tags; a static origin or older Hub can omit the
+route (HTTP404). Clients then apply the same pure rule to the exact commit's headers; they never
+substitute a tagged default. Explicit owner deletion and commit retention are unchanged.
 
 ## 8. Versioning
 

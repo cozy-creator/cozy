@@ -158,14 +158,7 @@ impl Remote {
         };
         let repo = match endpoint.inner.repo_attempt(&reference.repo_id).await {
             Ok(Some((repo, _))) => repo,
-            Ok(None) => {
-                // A scoped reader may read a retained hash even when no tag document is
-                // visible. The object endpoint still enforces that reader's authorization.
-                if let Some(root) = self.direct_commit(endpoint, revision).await? {
-                    return Ok(root);
-                }
-                return fail(Kind::NotFound, format!("no repo {}", reference.repo_id));
-            }
+            Ok(None) => return fail(Kind::NotFound, format!("no repo {}", reference.repo_id)),
             Err(error) => {
                 let transport = matches!(&error, fetch::GetError::Exchange(_));
                 let error = from_native(error.refusal());
@@ -179,23 +172,8 @@ impl Remote {
                 return Err(error);
             }
         };
-        match fetch::resolve(&repo, revision, async |commit: &ObjectRef| self.tree(commit).await).await {
-            Ok((tag, variant)) => Ok(Root { object: tag.commit.clone(), tag: Some(tag), variant }),
-            Err(error) if error.kind == Kind::NotFound && revision.is_some_and(|r| r.starts_with("sha256:")) => {
-                // Tags do not enumerate retained history. An explicit immutable commit can
-                // still be readable at this endpoint; never substitute the tagged default.
-                self.direct_commit(endpoint, revision).await?.ok_or(error)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// A readable immutable commit that no visible tag document lists.
-    async fn direct_commit(&self, endpoint: &Endpoint, revision: Option<&str>) -> Result<Option<Root>> {
-        let Some(digest) = revision.filter(|r| r.starts_with("sha256:")) else { return Ok(None) };
-        let Some(object) = endpoint.inner.object(digest).await.map_err(from_native)? else { return Ok(None) };
-        self.tree(&object).await?;
-        Ok(Some(Root { object, tag: None, variant: None }))
+        let (tag, variant) = fetch::resolve(&repo, revision, async |commit: &ObjectRef| self.tree(commit).await).await?;
+        Ok(Root { object: tag.commit.clone(), tag: Some(tag), variant })
     }
 
     /// A bare object by digest: from the store, the offline mirror, or the endpoint.
