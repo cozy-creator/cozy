@@ -147,7 +147,9 @@ def main() -> int:
     after = allocator_stats()
     stats = r.stats()
     resolved, nbytes = after[2] - before[2], after[3] - before[3]
+    made, spent = after[1] - before[1], after[5] - before[5]
     print(f"POOL beside the filler: ms/step {[round(t) for t in times]}; shortfalls resolved in the allocator {resolved} ({nbytes} B); "
+          f"{made} new segments at {spent / max(made, 1) / 1e3:.0f} us each; "
           f"evicted by class {stats.evicted}; varena retries {stats.retries} cuts {stats.cuts} parks {stats.parks}; segments per step {segments}", flush=True)
     check("1: beside the filler, the pool's passes complete with no OOM raised to Python", raised is None and len(times) == STEPS, raised)
     check("1: the filler made the room (evictions)", sum(stats.evicted) > 0, stats.evicted)
@@ -166,25 +168,6 @@ def main() -> int:
                 print(f"SEGMENTS per step {segments}; {spent / max(new, 1) / 1e3:.0f} us per new segment ({new} new)", flush=True)
     best = {pool: min(v) for pool, v in warm.items()}
     print(f"WARM best of 3: default {best[False]:.0f} ms, pool {best[True]:.0f} ms ({100 * (best[True] / best[False] - 1):+.1f}%)", flush=True)
-
-    # 4. a forced exhaustion.
-    refused = allocator_stats()[4]
-    caught: list[BaseException] = []
-
-    def huge(*_: object) -> None:
-        try:
-            torch.empty(2 * CAP, dtype=torch.uint8, device=mem.device)
-        except torch.OutOfMemoryError as e:
-            caught.append(e)
-
-    mem.pooling = True
-    hook = run.unet.conv_in.register_forward_pre_hook(huge)
-    with mem.request("exhaustion", plan=[run.unet]), torch.no_grad():
-        run.unet(run.x, 1, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
-    hook.remove()
-    check("4: a forced exhaustion is torch's OutOfMemoryError at its call site, varena having refused", len(caught) == 1 and allocator_stats()[4] > refused, (caught, allocator_stats()))
-    times, _, _, raised = run.steps("after exhaustion", True)
-    check("4: the next passes run", raised is None and len(times) == STEPS, raised)
 
     # 5. what torch holds outside the pool in a forward, by source.
     torch.cuda.memory._record_memory_history(max_entries=100000)
@@ -230,6 +213,31 @@ def main() -> int:
     check("6: no deadlock: the pool's passes complete beside a thread allocating as varena evicts", raised is None and len(times) == STEPS and count[0] > 0, (raised, count, errors))
     host_callback(mem, run)
     slack(mem, run)
+    # 4. a forced exhaustion.
+    refused = allocator_stats()[4]
+    caught: list[BaseException] = []
+
+    def huge(*_: object) -> None:
+        try:
+            torch.empty(2 * CAP, dtype=torch.uint8, device=mem.device)
+        except torch.OutOfMemoryError as e:
+            caught.append(e)
+
+    mem.pooling = True
+    hook = run.unet.conv_in.register_forward_pre_hook(huge)
+    after_hook: list[BaseException] = []
+    with mem.request("exhaustion", plan=[run.unet]), torch.no_grad():
+        try:
+            run.unet(run.x, 1, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
+        except (torch.OutOfMemoryError, VarenaError) as e:
+            after_hook.append(e)  # the pass's own later binds, after varena answered the impossible need
+    print(f"EXHAUSTION at the call site {caught[:1]}; the pass after it {after_hook[:1]}; refusals {allocator_stats()[4] - refused}", flush=True)
+    hook.remove()
+    check("4: a forced exhaustion is torch's OutOfMemoryError at its call site, varena having refused", len(caught) == 1 and allocator_stats()[4] > refused, (caught, allocator_stats()))
+    check("4: the pass that met it goes on", not after_hook, after_hook)
+    times, _, _, raised = run.steps("after exhaustion", True)
+    check("4: the next passes run", raised is None and len(times) == STEPS, raised)
+
     print(f"{sum(results)}/{len(results)} checks passed", flush=True)
     return 0 if all(results) else 1
 
