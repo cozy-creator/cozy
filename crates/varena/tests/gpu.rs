@@ -2375,7 +2375,8 @@ fn the_tier_takes_back_a_pinned_layout() {
     step!();
     let signal = event.try_clone().unwrap();
     step!();
-    let tier = varena::Tier::serve(varena::Pressure::Events(event)).unwrap().expect("no other participant serves this user's RAM tier");
+    // No call runs beside the tier here: it keeps nothing free for one.
+    let tier = varena::Tier::serve(varena::Pressure::Events(event), Arc::new(|| Some(0))).unwrap().expect("no other participant serves this user's RAM tier");
     step!();
     let digest = |n: &str| format!("{n}-2-{}", g.uuid);
     step!();
