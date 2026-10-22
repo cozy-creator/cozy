@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Weak, OnceLock};
 
 use crossbeam_channel::{select_biased, unbounded, Receiver, Sender};
 
@@ -45,7 +45,7 @@ pub struct SetId(pub u32);
 /// A graph's immutable address/layout/fill binding. Retention keeps the virtual reservation,
 /// never its physical pages. `prepare` leases the complete declared range before launch.
 pub struct Retained {
-    inner: Arc<Inner>,
+    inner: Owner,
     set: u32,
     blocks: Vec<u32>,
     identity: String,
@@ -54,7 +54,7 @@ pub struct Retained {
 /// Preparation's claims prevent eviction of any dependency while all its pages are admitted.
 /// On failure they unwind without launching a consumer; completed fills may remain cached.
 struct Preparing {
-    inner: Arc<Inner>,
+    inner: Owner,
     pins: Vec<(u64, Key)>,
 }
 
@@ -105,7 +105,7 @@ impl Retained {
                     pins.push((id, key));
                 }
                 self.inner.publish(&st);
-                (Preparing { inner: self.inner.clone(), pins }, req)
+                (Preparing { inner: self.inner.clone().into(), pins }, req)
             };
             let pages = self.blocks.iter().map(|b| (self.set, *b)).collect();
             let actions = self.inner.demand(Trigger::Prepare { pages, req, tried: Tried::default() }, req)?;
@@ -139,7 +139,7 @@ impl Drop for Retained {
 /// Admitted bytes not yet backed by a native pool segment. Segment allocation converts the
 /// promise into actual allocator bytes; dropping releases only the unused promise.
 pub struct Workspace {
-    inner: Arc<Inner>,
+    inner: Owner,
     id: u64,
     remaining: Arc<AtomicU64>,
 }
@@ -160,12 +160,12 @@ impl Workspace {
         st.promises();
         st.table.reserved = st.table.reserved.saturating_add(bytes);
         self.inner.try_publish(&st);
-        Some(AllocationCredit { inner: self.inner.clone(), id: self.id, bytes, epoch: st.measure_epoch, committed: false })
+        Some(AllocationCredit { inner: self.inner.clone().into(), id: self.id, bytes, epoch: st.measure_epoch, committed: false })
     }
 }
 
 pub struct AllocationCredit {
-    inner: Arc<Inner>,
+    inner: Owner,
     id: u64,
     bytes: u64,
     epoch: u64,
@@ -350,15 +350,64 @@ pub struct Site<'a> {
     pub shape: &'a str,
 }
 
+/// Public handles count explicitly; internal worker references are not public ownership.
+/// The final public handle transfers its actual Arc, never a racing temporary clone.
+struct Owner(Option<Arc<Inner>>);
+
+impl From<Arc<Inner>> for Owner {
+    fn from(inner: Arc<Inner>) -> Self {
+        inner.public_owners.fetch_add(1, Ordering::Relaxed);
+        Self(Some(inner))
+    }
+}
+impl std::ops::Deref for Owner {
+    type Target = Arc<Inner>;
+    fn deref(&self) -> &Self::Target { self.0.as_ref().expect("live public owner") }
+}
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let Some(inner) = self.0.take() else { return };
+        if inner.public_owners.fetch_sub(1, Ordering::AcqRel) != 1 { return; }
+        static RETIRER: OnceLock<std::sync::mpsc::Sender<Arc<Inner>>> = OnceLock::new();
+        let sender = RETIRER.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Arc<Inner>>();
+            let _ = std::thread::Builder::new().name("varena-retire".into()).spawn(move || {
+                let mut pending = Vec::new();
+                loop {
+                    let next = if pending.is_empty() { rx.recv().ok() }
+                        else { rx.recv_timeout(std::time::Duration::from_millis(1)).ok() };
+                    if let Some(inner) = next { pending.push(inner); }
+                    let mut waiting = Vec::new();
+                    for inner in pending.drain(..) {
+                        let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.retire_public()));
+                        match completed {
+                            Ok(Ok(true)) => drop(inner),
+                            Ok(Ok(false)) => waiting.push(inner),
+                            Ok(Err(_)) | Err(_) => {
+                                inner.ownership_lost.store(true, Ordering::Release);
+                                inner.landed.notify_all();
+                                std::mem::forget(inner);
+                            }
+                        }
+                    }
+                    pending = waiting;
+                }
+            });
+            tx
+        });
+        if let Err(failed) = sender.send(inner) { std::mem::forget(failed.0); }
+    }
+}
+
 /// One process's memory on one device.
 pub struct Memory {
-    inner: Arc<Inner>,
+    inner: Owner,
 }
 
 /// A request in flight; dropping it ends it: its room, its claims and its caches go, and the
 /// leftover is measured.
 pub struct Request {
-    inner: Arc<Inner>,
+    inner: Owner,
     id: u64,
     ended: bool,
 }
@@ -373,7 +422,7 @@ pub struct Pin {
     /// undeclared fill's store bytes); [`Pin::filled`] after it. Never for bytes that are the
     /// weights (stored, kept, or a transformed page from the RAM tier).
     pub fresh: bool,
-    inner: Arc<Inner>,
+    inner: Owner,
     key: Key,
     id: u64,
     stream: usize,
@@ -385,7 +434,7 @@ pub struct Pin {
 /// A pass of a set at a shape, its measured room made. Dropping it without [`Pass::end`]
 /// records nothing.
 pub struct Pass {
-    inner: Arc<Inner>,
+    inner: Owner,
     req: u64,
     set: u32,
     id: u64,
@@ -798,6 +847,7 @@ struct Inner {
     wanted: Arc<(Mutex<Wanted>, Condvar)>,
     stop: Arc<AtomicBool>,
     ownership_lost: AtomicBool,
+    public_owners: AtomicU64,
     #[cfg(unix)]
     tally: tensorfs::io::source::IoTally,
 }
@@ -864,6 +914,7 @@ impl Memory {
                 wanted: Arc::new((Mutex::new(Wanted::default()), Condvar::new())),
                 stop: Arc::new(AtomicBool::new(false)),
                 ownership_lost: AtomicBool::new(false),
+                public_owners: AtomicU64::new(0),
                 #[cfg(unix)]
                 tally: Default::default(),
             });
@@ -889,7 +940,7 @@ impl Memory {
             let st = inner.lock();
             inner.publish(&st);
             inner.unlock(st);
-            Ok(Memory { inner })
+            Ok(Memory { inner: inner.into() })
         })
     }
 
@@ -984,7 +1035,7 @@ impl Memory {
     /// Opens a request with its plan; Belady runs over the open requests' plans.
     pub fn request(&self, id: &str, plan: Plan) -> Result<Request> {
         let rid = self.inner.guard(|| self.inner.open_request(id, &plan))?;
-        Ok(Request { inner: self.inner.clone(), id: rid, ended: false })
+        Ok(Request { inner: self.inner.clone().into(), id: rid, ended: false })
     }
 
     /// Maps and fills block `block` of `set`; `stream` (a `CUstream`, 0 the default) waits on
@@ -1005,7 +1056,7 @@ impl Memory {
             for &b in &blocks { m.spec.layout.region(b)?; }
             let identity = retained_identity(set.0, m, &blocks);
             if let Some(Some(m)) = st.sets.get_mut(set.0 as usize) { m.retained += 1; }
-            Ok(Retained { inner: self.inner.clone(), set: set.0, blocks, identity })
+            Ok(Retained { inner: self.inner.clone().into(), set: set.0, blocks, identity })
         })
     }
 
@@ -1061,7 +1112,7 @@ impl Memory {
             st.budgets.insert(id, remaining.clone());
             id
         };
-        let workspace = Workspace { inner: self.inner.clone(), id, remaining };
+        let workspace = Workspace { inner: self.inner.clone().into(), id, remaining };
         let actions = self.inner.demand(Trigger::Workspace { id, bytes, tried: Tried::default() }, None)?;
         if let Some(Action::Exhausted { need }) = actions.last() {
             return Err(Error::Exhausted(exhausted(*need, None, Stats::default())));
@@ -1081,7 +1132,7 @@ impl Memory {
         st.budgets.insert(id, remaining.clone());
         st.promises();
         self.inner.publish(&st);
-        Ok(Workspace { inner: self.inner.clone(), id, remaining })
+        Ok(Workspace { inner: self.inner.clone().into(), id, remaining })
     }
 
     /// Blocks until every mechanism call and every custody and tier call decided so far has
@@ -2416,7 +2467,7 @@ impl Inner {
         self.publish(&st);
         self.unlock(st);
         self.speculate(req);
-        let pin = Pin { ptr: va.base + off, len: span, ready, fresh, inner: self.clone(), key, id, stream, transform, transformed: AtomicBool::new(false) };
+        let pin = Pin { ptr: va.base + off, len: span, ready, fresh, inner: self.clone().into(), key, id, stream, transform, transformed: AtomicBool::new(false) };
         self.backend.wait(ready, stream)?;
         Ok(pin)
     }
@@ -2928,8 +2979,8 @@ impl Drop for Device {
 }
 
 impl Drop for Memory {
-    /// The mechanism's calls finish first and no tier copy is left to run: the row and its
-    /// pages go when the drop returns.
+    /// Stop speculative saves. Final physical retirement is transferred by Owner, so a
+    /// Python/DLPack destructor never waits for a CUDA consumer or a host callback.
     fn drop(&mut self) {
         self.inner.saves.close();
         self.inner.saves.drain();
@@ -2938,8 +2989,29 @@ impl Drop for Memory {
         // Under the state lock: a tier copy waiting on the fills sees it closed or is woken.
         drop(self.inner.state.lock());
         self.inner.landed.notify_all();
-        self.inner.saves.settle();
-        self.inner.mech.settle();
+    }
+}
+
+impl Inner {
+    /// Only the last public owner is queued here. Internal references may still finish work;
+    /// their count is a quiescence check, never the ownership-transfer decision.
+    fn retire_public(self: &Arc<Self>) -> Result<bool> {
+        self.check_ownership()?;
+        if Arc::strong_count(self) != 1 { return Ok(false); }
+        let mut st = self.state.lock();
+        self.drain(&mut st);
+        for (event, _) in st.events.values().flatten() {
+            if !self.backend.query(*event)? { return Ok(false); }
+        }
+        for home in st.homes.values() {
+            if home.filling || home.transforming || home.keeping || !self.backend.query(home.ready)? { return Ok(false); }
+        }
+        for set in st.sets.iter_mut().flatten() { set.closing = true; }
+        self.close_sets(&mut st);
+        self.publish(&st);
+        let empty = st.homes.is_empty() && st.sets.iter().all(Option::is_none);
+        drop(st);
+        Ok(empty && self.mech.idle() && self.to_custody.idle() && self.to_tier.idle() && self.saves.idle())
     }
 }
 
@@ -3056,7 +3128,7 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
         let mut st = me.lock();
         // Publish only after refresh will also read the physically completed byte count.
         // The ticket remains live until this worker releases its Memory owner below.
-        queue.returned(bytes);
+        queue.returned(ticket, bytes);
         st.table.inflight = queue.pending();
         me.publish(&st);
         me.unlock(st);
@@ -3151,7 +3223,7 @@ impl Request {
     pub fn pass(&self, set: SetId, entry: &str, shape: &str, torch: Torch) -> Result<Pass> {
         self.inner.guard(|| self.inner.open_tier(set.0))?;
         let id = self.inner.guard(|| self.inner.pass(self.id, set.0, entry, shape, torch))?;
-        Ok(Pass { inner: self.inner.clone(), req: self.id, set: set.0, id })
+        Ok(Pass { inner: self.inner.clone().into(), req: self.id, set: set.0, id })
     }
 
     /// An op of the pass over `set` ran out of memory, needing `need` more bytes when the error
@@ -3315,7 +3387,7 @@ impl Request {
             self.inner.shared.ring();
             Ok(())
         });
-        Yielded { wait: Some((self.inner.clone(), self.id)) }
+        Yielded { wait: Some((self.inner.clone().into(), self.id)) }
     }
 
     pub fn stats(&self) -> Stats {
@@ -3645,7 +3717,7 @@ impl Inner {
 
 /// A request waiting on a child call ([`Request::yielding`]); dropped, the wait is over.
 pub struct Yielded {
-    wait: Option<(Arc<Inner>, u64)>,
+    wait: Option<(Owner, u64)>,
 }
 
 impl Yielded {

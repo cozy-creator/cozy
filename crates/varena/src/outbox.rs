@@ -5,12 +5,14 @@
 //! can settle on the calls posted so far. Its lock is a leaf.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Condvar, Mutex};
 
 pub(crate) struct Outbox<C> {
     queue: Mutex<Queue<C>>,
     moved: Condvar,
+    completed: AtomicU64,
 }
 
 struct Queue<C> {
@@ -26,7 +28,7 @@ struct Queue<C> {
 
 impl<C> Default for Outbox<C> {
     fn default() -> Self {
-        Outbox { queue: Mutex::new(Queue { calls: VecDeque::new(), next: 0, sending: None, pending: 0, closed: false }), moved: Condvar::new() }
+        Outbox { queue: Mutex::new(Queue { calls: VecDeque::new(), next: 0, sending: None, pending: 0, closed: false }), moved: Condvar::new(), completed: AtomicU64::new(0) }
     }
 }
 
@@ -72,8 +74,15 @@ impl<C> Outbox<C> {
 
     /// The operation physically returned its bytes, before publishing its completion. The
     /// sender still owns the ticket and calls `sent(ticket, 0)` after releasing its owner.
-    pub fn returned(&self, bytes: u64) {
+    pub fn returned(&self, ticket: u64, bytes: u64) {
         self.queue.lock().pending -= bytes;
+        self.completed.fetch_max(ticket + 1, Ordering::Release);
+    }
+
+    /// A processed ticket, read without the queue lock. The caller must separately retain
+    /// quarantined resources when processing failed to prove physical release.
+    pub fn completed(&self, ticket: u64) -> bool {
+        self.completed.load(Ordering::Acquire) > ticket
     }
 
     /// The sender sent `ticket` (or gave up on it): its bytes are free.
@@ -83,6 +92,7 @@ impl<C> Outbox<C> {
         if q.sending == Some(ticket) {
             q.sending = None;
         }
+        self.completed.fetch_max(ticket + 1, Ordering::Release);
         drop(q);
         self.moved.notify_all();
     }
@@ -99,6 +109,11 @@ impl<C> Outbox<C> {
         while q.sending.is_some_and(|t| t < until) || q.calls.front().is_some_and(|(t, ..)| *t < until) {
             self.moved.wait(&mut q);
         }
+    }
+
+    pub fn idle(&self) -> bool {
+        let q = self.queue.lock();
+        q.sending.is_none() && q.calls.is_empty()
     }
 
     /// Bytes waiting on calls not yet sent.

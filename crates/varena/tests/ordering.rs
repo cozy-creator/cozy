@@ -1381,3 +1381,29 @@ fn failed_renewal_child() {
     // SAFETY: the fault path must retain the original mapping through executor exit.
     assert_eq!(unsafe { *(ptr as *const u8) }, 7);
 }
+
+#[test]
+fn last_public_owner_retires_only_after_the_consumer_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("last-public-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 << 20 };
+    let _scope = Scope::new(&uuid);
+    let events = Arc::new(Events::default());
+    let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
+    let id = mem.load(stored(dir.path(), &uuid, "s", 1), Level::Ram).unwrap();
+    let pin = mem.bind(id, 0, 1).unwrap();
+    drop(mem);
+    let queries = events.queries.load(Ordering::SeqCst);
+    let (sent, dropped) = std::sync::mpsc::channel();
+    let dropping = std::thread::spawn(move || { drop(pin); sent.send(()).unwrap(); });
+    dropped.recv_timeout(std::time::Duration::from_secs(5)).expect("dropping a DLPack/public pin must not wait for its consumer");
+    dropping.join().unwrap();
+    let pending = events.next.load(Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while events.queries.load(Ordering::SeqCst) == queries && std::time::Instant::now() < deadline { std::thread::yield_now(); }
+    assert!(events.queries.load(Ordering::SeqCst) > queries, "retirement inspected the pending event");
+    assert_eq!(events.unmaps.load(Ordering::SeqCst), 0, "last public drop preserves the consumer's mapping");
+    events.complete(pending);
+    while events.unmaps.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline { std::thread::yield_now(); }
+    assert_eq!(events.unmaps.load(Ordering::SeqCst), 1, "retirement completes without another public API call");
+}
