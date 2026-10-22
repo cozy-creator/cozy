@@ -57,6 +57,11 @@ impl<C> Outbox<C> {
         true
     }
 
+    /// Calls posted and not yet taken by the sender.
+    pub fn waiting(&self) -> usize {
+        self.queue.lock().calls.len()
+    }
+
     /// The next call to send (the sender's), `None` once closed and empty.
     pub fn next(&self) -> Option<(u64, u64, C)> {
         let mut q = self.queue.lock();

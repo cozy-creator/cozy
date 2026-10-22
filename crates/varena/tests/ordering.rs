@@ -1812,3 +1812,118 @@ fn a_binds_work_does_not_grow_with_the_resident_pages() {
     let (few, many) = (queries(16), queries(48));
     assert_eq!(few, many, "8 binds asked {few} event queries beside 16 idle pages, {many} beside 48");
 }
+
+// Append to crates/varena/tests/ordering.rs (it uses that file's Scope, Gate, Log, serve_custody, Card, Driver, stored).
+
+/// Reviewer (step 1, ruling 3): the hook's make_room over kept pages (no request open, so they
+/// stay kept) makes no custody call: with custody silent it returns at once.
+#[cfg(target_os = "linux")]
+#[test]
+fn step1_the_hooks_make_room_makes_no_custody_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("st1custody-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
+    gate.open();
+    serve_custody(&uuid, gate.clone(), log.clone());
+    let card = Card::new(g.memory, 0);
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Driver(card.clone()))).unwrap());
+    mem.load(stored(dir.path(), &uuid, "k", 4), Level::Gpu).unwrap();
+    mem.settle();
+    let kept = log.kept.lock().len();
+    gate.close();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let hook = std::thread::spawn({
+        let mem = mem.clone();
+        move || tx.send(mem.make_room(2 * REGION_ALIGN).map(drop).map_err(|e| e.code())).unwrap()
+    });
+    let within = rx.recv_timeout(std::time::Duration::from_secs(3));
+    gate.open();
+    let after = if within.is_err() { rx.recv_timeout(std::time::Duration::from_secs(5)).ok() } else { None };
+    hook.join().unwrap();
+    println!("kept {kept}; the hook's make_room with custody silent: within 3 s {within:?}; after custody answered {after:?}");
+    assert!(within.is_ok(), "the hook's make_room waited on custody inside the allocation");
+}
+
+/// Reviewer (step 1): a pass start withdraws kept pages for the hook (unkeep), then settles
+/// custody. A hook on another thread (another request's allocation) meanwhile takes a withdrawn
+/// page whose handle custody still holds: its claim counts bytes the driver does not have.
+#[cfg(target_os = "linux")]
+#[test]
+fn step1_a_hook_beside_a_pass_start_claims_bytes_custody_still_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("st1unkeep-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 6 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
+    gate.open();
+    serve_custody(&uuid, gate.clone(), log.clone());
+    let card = Card::new(g.memory, 0);
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Driver(card.clone()))).unwrap());
+    let k = mem.load(stored(dir.path(), &uuid, "k", 4), Level::Gpu).unwrap();
+    mem.settle();
+    let kept = log.kept.lock().len();
+    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
+    let resident = |mem: &Memory| (0..4u32).filter(|b| mem.retain(k, &[*b]).is_ok_and(|r| r.resident())).count();
+    // Another request already open (its thread allocates later); then custody goes silent.
+    let r0 = mem.request("r0", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+    gate.close();
+    std::thread::scope(|t| {
+        let starting = t.spawn(|| {
+            let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+            let pass = r.pass(a, "fwd|1x1");
+            (r, pass.map(drop).map_err(|e| e.code()))
+        });
+        log.await_call(|(_, call)| call.contains("Withdraw"));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let free_before = card.free();
+        // r0's allocation: its hook.
+        let claim = mem.make_room(card.free() + 2 * REGION_ALIGN);
+        let freed = card.free() - free_before;
+        let served = claim.is_ok() && card.take(2 * REGION_ALIGN);
+        if served {
+            card.give(2 * REGION_ALIGN);
+        }
+        let claimed = claim.as_ref().map(|_| ()).map_err(|e| e.code());
+        drop(claim);
+        let left = resident(&mem);
+        gate.open();
+        let (r, pass) = starting.join().unwrap();
+        println!("kept {kept}; hook beside the pass start: claim {claimed:?}, driver freed {freed} B, its segment served: {served}; k's pages still resident {left}/4; pass {pass:?}");
+        drop(r);
+        assert!(claimed.is_err() || served, "the hook's claim counted bytes custody still held");
+        assert!(left == 4 || freed > 0, "the hook evicted pages whose bytes custody still held, and gained nothing");
+    });
+    drop(r0);
+}
+
+/// The D9 rule (lead, 10-22): pages are protected at fill and exported only at a request's end
+/// or when idle, never mid-request. Pages filled inside a request reach custody only once it
+/// ends.
+#[cfg(target_os = "linux")]
+#[test]
+fn step1_no_export_mid_request_and_every_page_at_its_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("st1export-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
+    gate.open();
+    serve_custody(&uuid, gate.clone(), log.clone());
+    let card = Card::new(g.memory, 0);
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Driver(card.clone()))).unwrap());
+    let a = mem.load(stored(dir.path(), &uuid, "a", 3), Level::Ram).unwrap();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+    let pass = r.pass(a, "fwd|1x1").unwrap();
+    (0..3).for_each(|b| drop(mem.bind(a, b, 0).unwrap()));
+    mem.settle();
+    let mid = log.calls.lock().iter().filter(|(_, c)| c.contains("Export")).count();
+    drop(pass);
+    drop(r);
+    mem.settle();
+    let after = log.calls.lock().iter().filter(|(_, c)| c.contains("Export")).count();
+    println!("exports mid-request {mid}; after its end {after}");
+    assert_eq!(mid, 0, "a page was exported mid-request");
+    assert_eq!(after, 3, "the request's pages were not all kept at its end");
+}

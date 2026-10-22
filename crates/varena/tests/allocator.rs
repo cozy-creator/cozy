@@ -115,3 +115,40 @@ fn the_hooks_free_read_does_not_wait_for_a_peer_heap_lock() {
     assert!(result.is_ok(), "the hook's free read waited for a peer heap lock");
     drop(request);
 }
+
+// Append to crates/varena/tests/allocator.rs (it uses that file's gpu, cold_page, peer and Claims).
+
+/// Reviewer (step 1): the hook's make_room, not only its free read, while a stopped peer holds
+/// the ledger's heap lock. make_room refreshes the rows under that lock: the allocation waits
+/// for the peer.
+#[test]
+fn step1_the_hooks_make_room_waits_for_a_peer_heap_lock() {
+    let namespace = format!("allocator-test-{}-", std::process::id());
+    assert!(varena::os::namespace(&namespace));
+    let _claims = Claims;
+    let memory = Arc::new(Memory::open(gpu(), None, Box::new(HostBackend::new(gpu().memory))).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let set = memory.load(cold_page(dir.path()), Level::Gpu).unwrap();
+    let pin = memory.bind(set, 0, 0).unwrap();
+    pin.filled();
+    drop(pin);
+    let request = memory.request("callback", Plan::default()).unwrap();
+    let mut locker = peer("heap-lock", &namespace);
+    let need = memory.free() + REGION_ALIGN;
+    let (answer, received) = mpsc::channel();
+    let hook = std::thread::spawn({
+        let memory = memory.clone();
+        move || {
+            let _ = answer.send(memory.make_room(need).map(drop).map_err(|e| e.code()));
+        }
+    });
+    let result = received.recv_timeout(Duration::from_secs(5));
+    locker.0.stdin.as_mut().unwrap().write_all(b"release
+").unwrap();
+    assert!(locker.0.wait().unwrap().success());
+    let after = if result.is_err() { received.recv_timeout(Duration::from_secs(5)).ok() } else { None };
+    hook.join().unwrap();
+    println!("make_room with a stopped peer holding the heap lock: within 5 s {result:?}; after the release {after:?}");
+    assert!(result.is_ok(), "the hook's make_room waited for a peer heap lock");
+    drop(request);
+}
