@@ -565,3 +565,23 @@ fn placement_is_stable_across_runs() {
     }
     assert_eq!(homes, vec![vec![0]; 3], "te stays on GPU 0, measured or not");
 }
+
+/// S3 gpu10: an OOM whose need exceeds what the request could ever get (the capacity less
+/// context, torch's allocation, foreign bytes and other rows' unevictable bytes) is Exhausted
+/// at once: nothing lowered, nothing evicted, and the pass's next bind still finds its page.
+#[test]
+fn an_impossible_need_is_exhausted_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("impossible", 8 * MB);
+    let id = mem.load(set(dir.path(), "i", 2, &g.uuid), Level::Gpu).unwrap();
+    let r = mem.request("r", plan("i")).unwrap();
+    let pass = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
+    drop(mem.bind(id, 0, 0).unwrap());
+    let next = r.oom(Some(id), Some(64 * MB), None, Torch { allocated: MB, reserved: MB });
+    assert!(matches!(next, Next::Exhausted(_)), "{next:?}");
+    let stats = r.stats();
+    assert!(!stats.lowered && stats.evicted.iter().all(|e| *e == 0), "{stats:?}");
+    drop(mem.bind(id, 1, 0).unwrap());
+    assert_eq!(r.stats().trace.last().map(|t| t.origin), Some(varena::Origin::Hit));
+    pass.end(Measured::default(), Torch::default());
+}
