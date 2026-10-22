@@ -520,6 +520,28 @@ def capped(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, cap
     return weakref.ref(mem)
 
 
+def outside_alone(tag: str) -> weakref.ref[Memory]:
+    """A request's outside-pass peak (its setup, the tensors between its models) is measured only
+    while it is the one request open: torch's peak is the device's and the process's, so with two
+    open neither is measured. Driven by a fake peak source: the rule is which request gets it."""
+    mem = opened(f"{tag}-outside", 1 << 31)
+    figures, real = {"now": 1 << 20, "peak": 1 << 20}, (mem.torch.now, mem.torch.peaks, mem.torch.reset)
+    mem.torch.now = lambda: (figures["now"], figures["now"])  # type: ignore[method-assign]
+    mem.torch.peaks = lambda: (figures["peak"], figures["peak"])  # type: ignore[method-assign]
+    mem.torch.reset = lambda: figures.update(peak=figures["now"])  # type: ignore[method-assign]
+    try:
+        with mem.request("alone") as alone:
+            figures["peak"] += 7 << 20
+        with mem.request("first") as first:
+            with mem.request("second") as second:
+                figures["peak"] += 9 << 20
+    finally:
+        mem.torch.now, mem.torch.peaks, mem.torch.reset = real  # type: ignore[method-assign]
+    check("outside: the one request open is measured", alone.outside_measured == 7 << 20, alone.outside_measured)
+    check("outside: two open, neither is measured", (first.outside_measured, second.outside_measured) == (None, None), (first.outside_measured, second.outside_measured))
+    return weakref.ref(mem)
+
+
 def off_forward(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel) -> None:
     """A weight read outside any forward (a package's table, an overlay's factor) binds on read:
     it has its bytes, the tensor made of it holds the page's pin while it lives, the pin goes
@@ -585,6 +607,7 @@ def main() -> int:
     gone(memory, "ample")
     if not CUDA:
         gone(overhead(ck, plain, tag), "overhead")
+    gone(outside_alone(tag), "outside")
     ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
     blocks = sorted(spans[1:])
     # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.

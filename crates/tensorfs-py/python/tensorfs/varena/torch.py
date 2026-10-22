@@ -678,8 +678,10 @@ class Memory:
 
     def _fold(self, discard: _Pass | None = None) -> None:
         """The allocator's peaks since the last reset into every open pass and its open sites,
-        but `discard`'s (a failed attempt's); with no pass open, into every open request's
-        outside-pass peak. Then the reset. The only place peaks reset."""
+        but `discard`'s (a failed attempt's); with no pass open, into the outside-pass peak of
+        the one request open. torch's peak is the device's and the process's, not a request's:
+        with several open, none of them is measured. Then the reset. The only place peaks
+        reset."""
         with self.measuring:
             peak, reserved = self.torch.peaks()
             for p in self.passes:
@@ -688,8 +690,12 @@ class Memory:
                     for entry in p.open:
                         entry[1] = max(entry[1], peak)  # type: ignore[call-overload]
             if not self.passes:
-                for r in self.requests:
+                if len(self.requests) == 1:
+                    r = next(iter(self.requests))
                     r.outside = max(r.outside, peak - r.base)
+                else:
+                    for r in self.requests:
+                        r.alone = False
             self.torch.reset()
 
     # -- passes
@@ -885,9 +891,11 @@ class Request:
         self.memory, self.native = memory, native
         self.ended: Stats | None = None
         #: torch's allocation at its start, and the most it held beyond that while no pass was
-        #: open (its inputs, the tensors between its models, its call setup)
+        #: open (its inputs, the tensors between its models, its call setup); measured only while
+        #: it was the one request open (`alone`)
         self.base = memory.torch.now()[0]
         self.outside = 0
+        self.alone = True
         #: torch's allocator churn over its passes (retries, device allocs and frees, syncs)
         self.churn: dict[str, int] = {}
         #: (set, block) -> bytes kept bound in it for weight tensors that outlived their run
@@ -973,6 +981,11 @@ class Request:
 
     def stats(self) -> Stats:
         return self.ended if self.ended is not None else self.native.stats()
+
+    @property
+    def outside_measured(self) -> int | None:
+        """Its outside-pass peak, or None when another request was open beside it."""
+        return self.outside if self.alone else None
 
     def spare(self) -> int:
         """Bytes this request could have now beside every working-set and pinned page without
