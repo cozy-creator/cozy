@@ -1584,7 +1584,7 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     let report: Vec<String> = times.iter().map(|(w, t)| format!("{w} {t:?}")).collect();
     step!();
     println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}), still running at the query: {running}: {}", report.join(", "));
-    println!("TIMINGS driver calls while the forward ran: {during}");
+    println!("TIMINGS driver calls while the forward ran: {during}; RAM-tier unlocks during the request: {:?}", r.stats().unregisters);
     println!("TIMINGS in all: {}", timings.report());
     step!();
     for (what, took) in &times {
@@ -2359,12 +2359,13 @@ fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_ro
     step!();
     mem.load(set("idle", 1, Fill::Stored, &g.uuid, |b| block(6, b)), Level::Gpu).unwrap();
     step!();
+    // Everything else on the card is an allocation varena cannot free; then the pass starts. An unmeasured pass takes
+    // every idle byte before it runs, so a fill after it would take the room the idle page gave.
+    let full = Pressure::fill(64 << 10);
+    step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
     let pass = r.pass(m, "k").unwrap();
-    step!();
-    // Everything else on the card is an allocation varena cannot free.
-    let full = Pressure::fill(64 << 10);
     step!();
     let first = mem.bind(m, 0, 0).expect("the idle page makes room");
     step!();
