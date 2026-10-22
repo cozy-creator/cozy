@@ -1,13 +1,14 @@
 //! The mechanism under [`crate::Memory`], in the shape of CUDA's VMM: reserve address space,
 //! create shareable physical pages, map them (read-only once filled), export and import them,
 //! fill them through TensorFS's `io::read` on a copy stream, and order consumers on events.
-//! [`HostBackend`] is the same mechanism over host pages (memfd): CPU and MPS executors and the
-//! CPU tests use it; [`crate::CudaBackend`] is CUDA's.
+//! [`HostBackend`] is the same mechanism over host pages (a memfd, an `shm_open` object, a
+//! pagefile section): CPU and MPS executors and the CPU tests use it; [`crate::CudaBackend`] is CUDA's.
 
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
 use platform::handles::Owned;
+use platform::memory;
 use tensorfs::io::Dst;
 
 use crate::{Error, Result};
@@ -108,8 +109,8 @@ pub trait Backend: Send + Sync {
     fn drain_save(&self) -> Result<()>;
 }
 
-/// Pages in host memory: a memfd each, mapped into a reserved range. Its export is a read-only
-/// description of the memfd, its capacity a given limit. Fills are synchronous, so its events
+/// Pages in host memory (a memfd, an `shm_open` object or a pagefile section each), mapped into
+/// a reserved range. Its export maps read-only, its capacity a given limit. Fills are synchronous, so its events
 /// are always complete.
 pub struct HostBackend {
     limit: u64,
@@ -141,276 +142,141 @@ impl HostBackend {
     }
 }
 
-#[cfg(unix)]
-mod host {
-    use std::os::fd::{AsFd, AsRawFd};
-
-    use super::*;
-
-    fn prot(access: Access) -> libc::c_int {
-        match access {
-            Access::ReadWrite => libc::PROT_READ | libc::PROT_WRITE,
-            Access::Read => libc::PROT_READ,
-        }
-    }
-
-    fn failed(op: &'static str) -> Error {
-        let e = std::io::Error::last_os_error();
-        Error::Device { op, code: e.raw_os_error().unwrap_or(-1), name: e.to_string() }
-    }
-
-    impl Backend for HostBackend {
-        fn capacity(&self) -> u64 {
-            self.limit
-        }
-
-        fn free(&self) -> Result<u64> {
-            Ok(self.limit.saturating_sub(self.pages.lock().created()))
-        }
-
-        /// The pages it created, as NVML charges a process: an imported page is its exporter's.
-        fn process_used(&self) -> Result<u64> {
-            Ok(self.pages.lock().created())
-        }
-
-        fn opened_context(&self) -> u64 {
-            0
-        }
-
-        fn granularity(&self) -> u64 {
-            platform::shm::page_size() as u64
-        }
-
-        fn reserve(&self, len: u64) -> Result<Va> {
-            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
-            // SAFETY: a new anonymous inaccessible mapping; nothing aliases it.
-            let base = unsafe { libc::mmap(std::ptr::null_mut(), len as usize, libc::PROT_NONE, flags, -1, 0) };
-            if base == libc::MAP_FAILED {
-                return Err(failed("reserve"));
-            }
-            Ok(Va { base: base as u64, len })
-        }
-
-        fn release(&self, va: Va) {
-            // SAFETY: a reservation this backend made.
-            unsafe { libc::munmap(va.base as *mut libc::c_void, va.len as usize) };
-        }
-
-        fn create(&self, len: u64) -> Result<Physical> {
-            let mut pages = self.pages.lock();
-            if pages.created().saturating_add(len) > self.limit {
-                // CUDA_ERROR_OUT_OF_MEMORY, as a card answers.
-                return Err(Error::Device { op: "create", code: 2, name: "out of memory".into() });
-            }
-            let fd = platform::shm::memfd_named("varena-page")?;
-            // SAFETY: sizing a memfd only we hold.
-            if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
-                return Err(failed("create"));
-            }
-            Ok(pages.insert(fd, len, len))
-        }
-
-        fn destroy(&self, page: Physical) -> Result<()> {
-            self.pages.lock().live.remove(&page.id);
-            Ok(())
-        }
-
-        fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()> {
-            let pages = self.pages.lock();
-            let (fd, ..) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
-            if offset.saturating_add(page.len) > va.len {
-                return Err(Error::Invalid("map outside the reservation".into()));
-            }
-            let at = (va.base + offset) as *mut libc::c_void;
-            let flags = libc::MAP_SHARED | libc::MAP_FIXED;
-            // SAFETY: a fixed shared mapping inside our own reservation.
-            if unsafe { libc::mmap(at, page.len as usize, prot(access), flags, fd.as_raw_fd(), 0) } == libc::MAP_FAILED {
-                return Err(failed("map"));
-            }
-            Ok(())
-        }
-
-        fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()> {
-            // SAFETY: a range of our own reservation.
-            if unsafe { libc::mprotect((va.base + offset) as *mut libc::c_void, len as usize, prot(access)) } != 0 {
-                return Err(failed("protect"));
-            }
-            Ok(())
-        }
-
-        fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> {
-            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED;
-            let at = (va.base + offset) as *mut libc::c_void;
-            // SAFETY: replaces a range of our own reservation with inaccessible memory.
-            if unsafe { libc::mmap(at, len as usize, libc::PROT_NONE, flags, -1, 0) } == libc::MAP_FAILED {
-                return Err(failed("unmap"));
-            }
-            Ok(())
-        }
-
-        fn export(&self, page: &Physical) -> Result<Owned> {
-            let pages = self.pages.lock();
-            let (fd, ..) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
-            Ok(platform::shm::reopen(fd.as_fd(), false)?)
-        }
-
-        fn import(&self, handle: Owned, len: u64) -> Result<Physical> {
-            Ok(self.pages.lock().insert(handle, 0, len))
-        }
-
-        fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
-            Dst::Host { ptr: (va.base + offset) as *mut u8, len: len as usize }
-        }
-
-        fn save(&self, va: Va, offset: u64, host: &mut [u8], _: Event) -> Result<()> {
-            // SAFETY: a mapped page of at least `host.len()` bytes, filled (fills here are
-            // synchronous); another mapping than `host`.
-            host.copy_from_slice(unsafe { std::slice::from_raw_parts((va.base + offset) as *const u8, host.len()) });
-            Ok(())
-        }
-
-        fn fence(&self) -> Result<Event> {
-            Ok(Event::DONE)
-        }
-
-        fn record(&self, _: usize) -> Result<Event> {
-            Ok(Event::DONE)
-        }
-
-        fn query(&self, _: Event) -> Result<bool> {
-            Ok(true)
-        }
-
-        fn elapsed(&self, _: Event, _: Event) -> Result<Option<u64>> {
-            Ok(Some(0))
-        }
-
-        fn wait(&self, _: Event, _: usize) -> Result<()> {
-            Ok(())
-        }
-
-        fn synchronize(&self, _: usize) -> Result<()> {
-            Ok(())
-        }
-
-        /// Host events are complete when made.
-        fn finish(&self, _: Event) -> Result<()> {
-            Ok(())
-        }
-
-        /// Host copies need no page lock.
-        fn register_host(&self, _: u64, _: u64) -> Result<()> {
-            Ok(())
-        }
-
-        fn unregister_host(&self, _: u64) -> Result<()> {
-            Ok(())
-        }
-
-        fn retire(&self, _: Event) {}
-
-        fn drain(&self) -> Result<()> {
-            Ok(())
-        }
-        fn drain_save(&self) -> Result<()> {
-            Ok(())
-        }
-    }
+fn page_err(e: platform::Error) -> Error {
+    let e = std::io::Error::from(e);
+    Error::Device { op: "host page", code: e.raw_os_error().unwrap_or(-1), name: e.to_string() }
 }
 
-/// Windows host pages (VirtualAlloc and section handles) come with the Windows seams.
-#[cfg(windows)]
-mod host {
-    use super::*;
-
-    fn later() -> Error {
-        Error::Invalid("host pages are not yet on windows".into())
+/// One implementation on every OS, over cozy-platform's host-page seams (memfd, `shm_open`, or
+/// pagefile sections in placeholders).
+impl Backend for HostBackend {
+    fn capacity(&self) -> u64 {
+        self.limit
     }
 
-    impl Backend for HostBackend {
-        fn capacity(&self) -> u64 {
-            self.limit
-        }
-        fn free(&self) -> Result<u64> {
-            Ok(self.limit.saturating_sub(self.pages.lock().created()))
-        }
-        fn process_used(&self) -> Result<u64> {
-            Ok(self.pages.lock().created())
-        }
-        /// VirtualAlloc's allocation granularity.
-        fn opened_context(&self) -> u64 {
-            0
-        }
+    fn free(&self) -> Result<u64> {
+        Ok(self.limit.saturating_sub(self.pages.lock().created()))
+    }
 
-        fn granularity(&self) -> u64 {
-            1 << 16
-        }
-        fn reserve(&self, _: u64) -> Result<Va> {
-            Err(later())
-        }
-        fn release(&self, _: Va) {}
-        fn create(&self, _: u64) -> Result<Physical> {
-            Err(later())
-        }
-        fn destroy(&self, page: Physical) -> Result<()> {
-            self.pages.lock().live.remove(&page.id);
-            Ok(())
-        }
-        fn map(&self, _: Va, _: u64, _: &Physical, _: Access) -> Result<()> {
-            Err(later())
-        }
-        fn protect(&self, _: Va, _: u64, _: u64, _: Access) -> Result<()> {
-            Err(later())
-        }
-        fn unmap(&self, _: Va, _: u64, _: u64) -> Result<()> {
-            Err(later())
-        }
-        fn export(&self, _: &Physical) -> Result<Owned> {
-            Err(later())
-        }
-        fn import(&self, handle: Owned, len: u64) -> Result<Physical> {
-            Ok(self.pages.lock().insert(handle, 0, len))
-        }
-        fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
-            Dst::Host { ptr: (va.base + offset) as *mut u8, len: len as usize }
-        }
-        fn save(&self, _: Va, _: u64, _: &mut [u8], _: Event) -> Result<()> {
-            Err(later())
-        }
-        fn fence(&self) -> Result<Event> {
-            Ok(Event::DONE)
-        }
-        fn record(&self, _: usize) -> Result<Event> {
-            Ok(Event::DONE)
-        }
-        fn query(&self, _: Event) -> Result<bool> {
-            Ok(true)
-        }
-        fn elapsed(&self, _: Event, _: Event) -> Result<Option<u64>> {
-            Ok(Some(0))
-        }
-        fn wait(&self, _: Event, _: usize) -> Result<()> {
-            Ok(())
-        }
+    /// The pages it created, as NVML charges a process: an imported page is its exporter's.
+    fn process_used(&self) -> Result<u64> {
+        Ok(self.pages.lock().created())
+    }
 
-        fn synchronize(&self, _: usize) -> Result<()> {
-            Ok(())
+    fn opened_context(&self) -> u64 {
+        0
+    }
+
+    fn granularity(&self) -> u64 {
+        memory::granularity()
+    }
+
+    fn reserve(&self, len: u64) -> Result<Va> {
+        Ok(Va { base: memory::reserve(len).map_err(page_err)?, len })
+    }
+
+    fn release(&self, va: Va) {
+        memory::release(va.base, va.len);
+    }
+
+    fn create(&self, len: u64) -> Result<Physical> {
+        let mut pages = self.pages.lock();
+        if pages.created().saturating_add(len) > self.limit {
+            // As a card answers.
+            return Err(Error::Device { op: "create", code: OUT_OF_MEMORY, name: "out of memory".into() });
         }
-        fn finish(&self, _: Event) -> Result<()> {
-            Ok(())
+        let page = memory::page(len).map_err(page_err)?;
+        Ok(pages.insert(page, len, len))
+    }
+
+    fn destroy(&self, page: Physical) -> Result<()> {
+        self.pages.lock().live.remove(&page.id);
+        Ok(())
+    }
+
+    fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()> {
+        let pages = self.pages.lock();
+        let (handle, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
+        if offset.saturating_add(page.len) > va.len {
+            return Err(Error::Invalid("map outside the reservation".into()));
         }
-        fn register_host(&self, _: u64, _: u64) -> Result<()> {
-            Ok(())
-        }
-        fn unregister_host(&self, _: u64) -> Result<()> {
-            Ok(())
-        }
-        fn retire(&self, _: Event) {}
-        fn drain(&self) -> Result<()> {
-            Ok(())
-        }
-        fn drain_save(&self) -> Result<()> {
-            Ok(())
-        }
+        memory::map_page(va.base + offset, handle, page.len, access == Access::ReadWrite).map_err(page_err)
+    }
+
+    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()> {
+        memory::protect(va.base + offset, len, access == Access::ReadWrite).map_err(page_err)
+    }
+
+    fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> {
+        memory::unmap_page(va.base + offset, len).map_err(page_err)
+    }
+
+    fn export(&self, page: &Physical) -> Result<Owned> {
+        let pages = self.pages.lock();
+        let (handle, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
+        memory::export(handle).map_err(page_err)
+    }
+
+    fn import(&self, handle: Owned, len: u64) -> Result<Physical> {
+        Ok(self.pages.lock().insert(handle, 0, len))
+    }
+
+    fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
+        Dst::Host { ptr: (va.base + offset) as *mut u8, len: len as usize }
+    }
+
+    fn save(&self, va: Va, offset: u64, host: &mut [u8], _: Event) -> Result<()> {
+        // SAFETY: a mapped page of at least `host.len()` bytes, filled (fills here are
+        // synchronous); another mapping than `host`.
+        host.copy_from_slice(unsafe { std::slice::from_raw_parts((va.base + offset) as *const u8, host.len()) });
+        Ok(())
+    }
+
+    fn fence(&self) -> Result<Event> {
+        Ok(Event::DONE)
+    }
+
+    fn record(&self, _: usize) -> Result<Event> {
+        Ok(Event::DONE)
+    }
+
+    fn query(&self, _: Event) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn elapsed(&self, _: Event, _: Event) -> Result<Option<u64>> {
+        Ok(Some(0))
+    }
+
+    fn wait(&self, _: Event, _: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn synchronize(&self, _: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Host events are complete when made.
+    fn finish(&self, _: Event) -> Result<()> {
+        Ok(())
+    }
+
+    /// Host copies need no page lock.
+    fn register_host(&self, _: u64, _: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn unregister_host(&self, _: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn retire(&self, _: Event) {}
+
+    fn drain(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn drain_save(&self) -> Result<()> {
+        Ok(())
     }
 }

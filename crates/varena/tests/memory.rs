@@ -1,5 +1,7 @@
 //! One process's Memory over host pages: rooms bounded by measured shapes, the cut memo, and
 //! the OOM answers for cut and collective sites.
+// Its sets load from TensorFS sources, which are Unix's so far (`tensorfs::io::source`).
+#![cfg(unix)]
 
 use std::fs::File;
 use std::path::Path;
@@ -530,6 +532,8 @@ fn rebind(ledger: &varena::Ledger, mem: &Memory, set: varena::SetId, other: vare
 /// weights is never fresh, so a RAM-tier hit of a baked page is not baked again; and the tier
 /// holds bytes by identity: after LoRA a -> b, b's page comes from the store, fresh, and a's
 /// layout still gives a's baked bytes.
+// The RAM tier's files (a memfd with punched holes) are Linux's so far.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_tier_keeps_baked_pages_by_identity_and_never_hands_them_out_fresh() {
     let dir = tempfile::tempdir().unwrap();

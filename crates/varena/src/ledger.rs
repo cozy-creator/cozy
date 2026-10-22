@@ -244,7 +244,7 @@ pub(crate) struct Shared {
     /// in that user's namespace.
     pub ns: u32,
     /// Signals the GPU's wake endpoint (TensorD's, by name).
-    wake: Owned,
+    wake: os::Notifier,
 }
 
 /// The heap lock, held.
@@ -315,6 +315,13 @@ fn open_named(name: &str) -> Result<Owned> {
         if os::linked(&table)? {
             return Ok(table);
         }
+    }
+}
+
+impl Drop for Shared {
+    /// Its open mark goes with it (on macOS a lock file of its own, not the description's).
+    fn drop(&mut self) {
+        let _ = os::unlock(&self.fd, OPEN, 8);
     }
 }
 
@@ -993,7 +1000,7 @@ impl Row {
     }
 
     /// This row's wake endpoint, signalled while it waits for room.
-    pub fn endpoint(&self) -> Result<Owned> {
+    pub fn endpoint(&self) -> Result<os::Endpoint> {
         os::wake_bind(self.shared.ns, &row_wake(&self.shared.name, self.id()))?.ok_or_else(|| Error::Internal("a row's wake is taken".into()))
     }
 
@@ -1028,9 +1035,9 @@ impl Row {
 
     /// Serves this row's asks until `stop`: every asker (of this user only) at once, each
     /// answered with what `answer` freed. A silent or stopped asker holds up nobody's answer.
-    pub fn serve_asks(listener: os::Listener, stop: &AtomicBool, row: &Weak<Row>, mut answer: impl FnMut(Ask) -> u64) {
-        os::serve_all(listener, stop, |body| {
-            let freed = os::decode::<Ask>(body).map_or(0, &mut answer);
+    pub fn serve_asks(listener: os::Listener, stop: &AtomicBool, row: Weak<Row>, answer: impl Fn(Ask) -> u64 + Send + Sync + 'static) {
+        os::serve_all(listener, stop, move |body| {
+            let freed = os::decode::<Ask>(body).map_or(0, &answer);
             if let Some(r) = row.upgrade() {
                 r.shared.ring();
             }
@@ -1069,13 +1076,13 @@ impl Drop for Waiting<'_> {
 /// One process's row endpoint broadcasts an event to every local waiter. Only one thread
 /// drains the datagrams; an epoch lets all other threads recheck after the same change.
 pub(crate) struct RoomWake {
-    endpoint: Owned,
+    endpoint: os::Endpoint,
     state: Mutex<(u64, bool)>,
     changed: Condvar,
 }
 
 impl RoomWake {
-    pub fn new(endpoint: Owned) -> Self {
+    pub fn new(endpoint: os::Endpoint) -> Self {
         Self { endpoint, state: Mutex::new((0, false)), changed: Condvar::new() }
     }
 
@@ -1111,6 +1118,8 @@ impl Drop for Row {
             let _ = self.shared.leave();
             self.shared.ring();
         }
+        // Released here, not only by the close: on macOS the lock is a file of its own.
+        let _ = os::unlock(&self._lock, self.at, ROW_CELLS * CELL);
     }
 }
 
@@ -1334,7 +1343,7 @@ impl Room {
 pub struct Ledger {
     shared: Arc<Shared>,
     /// The GPU's wake endpoint, bound by name: every participant signals it.
-    events: Owned,
+    events: os::Endpoint,
     custody: custody::Client,
 }
 
@@ -1577,7 +1586,7 @@ impl Ledger {
     /// Readable when room frees, a row dies, an ask goes out or a peak is recorded, in any
     /// process on the GPU; [`Ledger::clear_events`] clears it.
     pub fn events(&self) -> &Owned {
-        &self.events
+        self.events.handle()
     }
 
     /// Clears every event so far; true when one came from an accepted user (another user's
@@ -1747,6 +1756,7 @@ mod tests {
 
     /// Review 2, finding 14: a standalone engine's table is unlinked when its last row leaves
     /// (custody stops once nobody is connected and nothing is kept).
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_standalone_table_goes_with_its_last_row() {
         let gpu = GpuId { uuid: format!("unit-{}-unlink", std::process::id()), model: "host".into(), memory: 1 << 30 };
