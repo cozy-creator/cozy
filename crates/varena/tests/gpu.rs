@@ -901,6 +901,69 @@ fn a_registered_host_range_fills_directly_every_time() {
     step!();
 }
 
+// ---- the backend's calls, timed
+
+/// Each backend call's count, total and longest time, by name.
+#[derive(Default)]
+struct Timings(parking_lot::Mutex<std::collections::BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>>);
+
+impl Timings {
+    fn time<T>(&self, op: &'static str, f: impl FnOnce() -> T) -> T {
+        let start = std::time::Instant::now();
+        let out = f();
+        let took = start.elapsed();
+        let mut t = self.0.lock();
+        let e = t.entry(op).or_default();
+        *e = (e.0 + 1, e.1 + took, e.2.max(took));
+        out
+    }
+
+    /// `op n total max`, the costliest first.
+    fn report(&self) -> String {
+        let mut rows: Vec<_> = self.0.lock().iter().map(|(op, (n, total, max))| (*op, *n, *total, *max)).collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+        rows.iter().map(|(op, n, total, max)| format!("{op} {n}x {total:?} (max {max:?})")).collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// The CUDA backend with every call timed: where Memory's time on the device side goes.
+struct Timed(CudaBackend, Arc<Timings>);
+
+impl Backend for Timed {
+    fn capacity(&self) -> u64 { self.0.capacity() }
+    fn free(&self) -> varena::Result<u64> { self.1.time("free", || self.0.free()) }
+    fn process_used(&self) -> varena::Result<u64> { self.1.time("process_used", || self.0.process_used()) }
+    fn opened_context(&self) -> u64 { self.0.opened_context() }
+    fn granularity(&self) -> u64 { self.0.granularity() }
+    fn reserve(&self, len: u64) -> varena::Result<Va> { self.1.time("reserve", || self.0.reserve(len)) }
+    fn release(&self, va: Va) { self.1.time("release", || self.0.release(va)) }
+    fn create(&self, len: u64) -> varena::Result<Physical> { self.1.time("create", || self.0.create(len)) }
+    fn destroy(&self, page: Physical) { self.1.time("destroy", || self.0.destroy(page)) }
+    fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> varena::Result<()> { self.1.time("map", || self.0.map(va, offset, page, access)) }
+    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> { self.1.time("protect", || self.0.protect(va, offset, len, access)) }
+    fn unmap(&self, va: Va, offset: u64, len: u64) -> varena::Result<()> { self.1.time("unmap", || self.0.unmap(va, offset, len)) }
+    fn export(&self, page: &Physical) -> varena::Result<platform::handles::Owned> { self.1.time("export", || self.0.export(page)) }
+    fn import(&self, handle: platform::handles::Owned, len: u64) -> varena::Result<Physical> { self.1.time("import", || self.0.import(handle, len)) }
+    fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.0.target(va, offset, len) }
+    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> varena::Result<()> { self.1.time("save", || self.0.save(va, offset, host, after)) }
+    fn fence(&self) -> varena::Result<Event> { self.1.time("fence", || self.0.fence()) }
+    fn record(&self, stream: usize) -> varena::Result<Event> { self.1.time("record", || self.0.record(stream)) }
+    fn query(&self, event: Event) -> varena::Result<bool> { self.1.time("query", || self.0.query(event)) }
+    fn elapsed(&self, from: Event, to: Event) -> varena::Result<Option<u64>> { self.1.time("elapsed", || self.0.elapsed(from, to)) }
+    fn wait(&self, event: Event, stream: usize) -> varena::Result<()> { self.1.time("wait", || self.0.wait(event, stream)) }
+    fn synchronize(&self, stream: usize) -> varena::Result<()> { self.1.time("synchronize", || self.0.synchronize(stream)) }
+    fn register_host(&self, ptr: u64, len: u64) -> varena::Result<()> { self.1.time("register_host", || self.0.register_host(ptr, len)) }
+    fn unregister_host(&self, ptr: u64) -> varena::Result<()> { self.1.time("unregister_host", || self.0.unregister_host(ptr)) }
+    fn retire(&self, event: Event) { self.1.time("retire", || self.0.retire(event)) }
+    fn drain(&self) -> varena::Result<()> { self.1.time("drain", || self.0.drain()) }
+}
+
+/// Memory over the timed CUDA backend, and its timings.
+fn timed_memory(b: CudaBackend, g: &GpuId) -> (Memory, Arc<Timings>) {
+    let timings = Arc::new(Timings::default());
+    (Memory::open(g.clone(), None, Box::new(Timed(b, timings.clone()))).unwrap(), timings)
+}
+
 // ---- Memory over the CUDA backend
 
 /// The run's GPU under a name of this case's own, so its table, custody and kept pages are the
@@ -1165,7 +1228,7 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     let probe = CudaBackend::open(0).unwrap();
     step!();
     let _ledger = Ledger::create(&g, None).unwrap();
-    let mem = memory(b, &g);
+    let (mem, timings) = timed_memory(b, &g);
     step!();
     // 64 pages: 128 MiB of binds, each one evicting an idle page on the full card.
     let pages = 64;
@@ -1191,6 +1254,10 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     };
     step!();
     let idle = sequence(b1);
+    step!();
+    println!("TIMINGS of {pages} binds evicting on an idle card ({idle:?}): {}", timings.report());
+    step!();
+    println!("TIMINGS of {pages} binds on an idle card ({idle:?}): {}", timings.report());
     step!();
     let forward = idle * 10;
     step!();
@@ -1250,6 +1317,7 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     let report: Vec<String> = times.iter().map(|(w, t)| format!("{w} {t:?}")).collect();
     step!();
     println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}): {}", report.join(", "));
+    println!("TIMINGS in all: {}", timings.report());
     step!();
     for (what, took) in &times {
         assert!(*took < forward, "{what} took {took:?} under a {forward:?} forward: it waited for it");
