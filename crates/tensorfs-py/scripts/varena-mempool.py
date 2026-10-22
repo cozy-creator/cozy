@@ -388,7 +388,7 @@ def diag() -> int:
     # graph-core: stored pages are kept (custody), and the callback cannot reclaim a kept page,
     # so the stored variant measures its passes first (each pass then gets its room at its start);
     # the undeclared variant's pages are never kept, so its unmeasured passes recover in the callback.
-    for label, fillers, mode in (("stored-measured", 2, "measured"), ("undeclared", 2, "undeclared")):
+    for label, fillers, mode in (("stored-default", 1, "alternate"),):
         log = work / f"{label}.stderr.log"
         env = {**os.environ, "CUDA_LAUNCH_BLOCKING": "1", "RUST_LOG": "debug"}
         began = time.perf_counter()
@@ -428,6 +428,40 @@ def summarize(label: str, log: Path) -> None:
         history = [line[:400] for line in lines[:first + 1] if page in line]
         print(f"DIAG {label}: page {page}'s last 40 ops:", *history[-40:], sep="\n  ", flush=True)
     print(f"DIAG {label}: stderr's Python lines (the faulting call's traceback):", *python[-60:], sep="\n  ", flush=True)
+
+
+def alternate(ck: tensorfs.Checkpoint) -> int:
+    """gpu12's fault, torch's default allocator alone (no pool): stored pages (kept), the unet's
+    passes measured with the card to itself, then the filler loaded, and the two alternate, each
+    pass's room evicting the other's pages, so each bind refills a page and its Keep follows."""
+    torch.backends.cudnn.allow_tf32 = torch.backends.cuda.matmul.allow_tf32 = False
+    mem = Memory.open(0, limit=CAP, pool=False)
+    print(f"ALTERNATE torch {torch.__version__}; PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF')!r}", flush=True)
+    unet = loaded(mem, ck, "")
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn(1, 4, LATENT, LATENT, generator=g).to(mem.device, torch.bfloat16)
+    text = torch.randn(1, 77, 2048, generator=g).to(mem.device, torch.bfloat16)
+    cond = {"text_embeds": torch.randn(1, 1280, generator=g).to(mem.device, torch.bfloat16),
+            "time_ids": torch.tensor([[2048, 2048, 0, 0, 2048, 2048]], dtype=torch.bfloat16, device=mem.device)}
+    with mem.request("measure", plan=[unet]), torch.no_grad():
+        unet(x, 999, encoder_hidden_states=text, added_cond_kwargs=cond)
+    torch.cuda.synchronize()
+    filler = loaded(mem, ck, "filler")
+    print(f"MEASURED the unet alone; the filler loaded beside it", flush=True)
+    for n in range(12):
+        for name, model, sample in (("filler", filler, x[:, :, :64, :64]), ("unet", unet, x)):
+            began = time.perf_counter()
+            try:
+                with mem.request(f"{name} {n}", plan=[model]) as r, torch.no_grad():
+                    model(sample, 999 - n, encoder_hidden_states=text, added_cond_kwargs=cond)
+                torch.cuda.synchronize()
+            except BaseException as e:
+                print(f"ROUND {n} {name}: raised {type(e).__name__}: {str(e).splitlines()[0][:300]}", flush=True)
+                return 1
+            stats = r.ended
+            print(f"ROUND {n} {name}: {1e3 * (time.perf_counter() - began):.0f} ms; evicted {sum(stats.evicted) if stats else None}", flush=True)
+    print("ALTERNATE 24 passes, no fault", flush=True)
+    return 0
 
 
 def variant(fillers: int, mode: str, ck: tensorfs.Checkpoint) -> int:
@@ -517,7 +551,8 @@ if __name__ == "__main__":
         threading.Thread(target=watch, daemon=True).start()
     if mode == "variant":
         try:
-            result = variant(int(sys.argv[2]), sys.argv[3], tensorfs.open(sys.argv[4], cache_dir=sys.argv[5], local_files_only=True))
+            ck = tensorfs.open(sys.argv[4], cache_dir=sys.argv[5], local_files_only=True)
+            result = alternate(ck) if sys.argv[3] == "alternate" else variant(int(sys.argv[2]), sys.argv[3], ck)
         except BaseException:
             print("ALLOCATOR_REFUSALS", getattr(_ext.varena, "allocator_refusals", lambda *_: "unavailable")(0), flush=True)
             raise
