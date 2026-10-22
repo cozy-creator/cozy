@@ -301,6 +301,7 @@ impl Remote {
         self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let tree = self.store.tree(&root)?;
+        let wanted = wanted.as_deref().map(|name| tree.variant(Some(name)).map(|(path,_)|path.to_owned()).map_err(|e| absent(true,e))).transpose()?;
         let headers: Vec<_> = match wanted.as_deref() {
             Some(variant) => vec![tree.variant(Some(variant)).map_err(|e| absent(true, e))?.1.clone()],
             None => tree.variants().map(|(_, h)| h.clone()).collect(),

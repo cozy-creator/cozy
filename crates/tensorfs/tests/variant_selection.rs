@@ -33,10 +33,19 @@ async fn local_and_static_origin_select_nested_headers_without_tensor_payloads()
     }
     let root=store.put_tree(&tree).unwrap();
     let mut repo=tensorfs::format::Repo::new("acme/profile");
-    repo.tags.push(tensorfs::format::Tag{name:"1.0".into(),commit:root,public:true,yanked:false});
+    repo.tags.push(tensorfs::format::Tag{name:"1.0".into(),commit:root.clone(),public:true,yanked:false});
     let at=store.root().join(repo.key());fs::create_dir_all(at.parent().unwrap()).unwrap();fs::write(at,repo.to_json().unwrap()).unwrap();
     let selected=client.open("acme/profile",&gpu).await.unwrap();
     assert_eq!(selected.variant(),Some("nested/banana.cozytensors"));
+    let projected=scratch.path().join("projected");
+    let reference="acme/profile@1.0/int8".parse().unwrap();
+    let metadata=tensorfs::Download{selection:tensorfs::Selection::Components(vec![]),..Default::default()};
+    client.materialize(&reference,&metadata,Some(&projected),false).await.unwrap();
+    assert!(projected.join("model.int8.cozytensors").is_file());
+    assert!(!projected.join("nested/banana.cozytensors").exists());
+    let snapshot=scratch.path().join("snapshot");
+    store.snapshot(&root,&snapshot,Some(&["int8".into()])).unwrap();
+    assert!(snapshot.join("model.int8.cozytensors").is_file());
     let invalid=Open {bits:Some(7),..gpu};
     assert!(client.open("acme/profile",&invalid).await.is_err());
 }
