@@ -2722,6 +2722,150 @@ fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable()
     step!();
 }
 
+// ---- step 2: the watermark (audit §4): a running set too big for the card streams its upper blocks through slots
+
+/// A set of `blocks` pages, each its own bytes ([`block`] of `seed`): a streamed set's contents are checked per block.
+fn distinct(mem: &Memory, name: &str, blocks: u32, seed: u8, uuid: &str) -> SetId {
+    mem.load(set(name, blocks, Fill::Stored, uuid, |b| block(seed, b)), Level::Ram).unwrap()
+}
+
+/// A request's passes over every block of `s` in order, each block bound, checked and released; per pass, the
+/// creates, maps and unmaps it made.
+fn passes(mem: &Memory, timings: &Timings, s: SetId, blocks: u32, seed: u8, n: u32) -> Vec<(u64, u64, u64)> {
+    let r = mem.request("stream", plan(&[&["big"]])).unwrap();
+    step!();
+    let mut made = vec![];
+    for _ in 0..n {
+        let (c, m, u) = (timings.count("create"), timings.count("map"), timings.count("unmap"));
+        let pass = r.pass(s, "fwd", "1", Torch::default()).unwrap();
+        for b in 0..blocks {
+            let pin = mem.bind(s, b, 0).unwrap_or_else(|e| panic!("block {b} of a set bigger than the card: {e}"));
+            assert!(exact(&pin, &block(seed, b), 0), "block {b} streamed in with other bytes");
+        }
+        pass.end(Measured::default(), Torch::default());
+        made.push((timings.count("create") - c, timings.count("map") - m, timings.count("unmap") - u));
+        step!();
+    }
+    assert_eq!(r.end().leftover, 0);
+    made
+}
+
+/// A set larger than the card (a 512 MiB cap) streams. Two passes over its blocks in order:
+/// - every bind is served with the block's own bytes, and nothing raises an OOM;
+/// - in the second pass the upper blocks move through the slots, with no new page per block (slot moves, not
+///   creates), and the lower blocks stay resident.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_set_bigger_than_the_card_streams_through_the_slots() {
+    let (b, g, uuid) = card("stream");
+    step!();
+    // 512 MiB: a card a 400 MiB set does not fit beside the context.
+    let _ledger = Ledger::create(&g, Some(512 << 20)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let blocks = 200;
+    let s = distinct(&mem, "big", blocks, 98, &g.uuid);
+    step!();
+    let made = passes(&mem, &timings, s, blocks, 98, 2);
+    step!();
+    println!("STREAM {blocks} blocks over a 512 MiB card; per pass (creates, maps, unmaps): {made:?}");
+    step!();
+    let (creates, maps, _) = made[1];
+    assert!(maps > 0, "the second pass streamed nothing");
+    step!();
+    assert!(creates < maps, "the second pass made a new page per block ({creates} creates, {maps} maps): no slots");
+    step!();
+    println!("PASS a set bigger than the card streams through the slots {uuid}");
+    step!();
+}
+
+/// A graph captured against a streamed block's VA replays across the slot moves. The set is larger than the card.
+/// - First pass: one graph is captured per block (a copy of the block), while the block is bound.
+/// - Second pass: each block is bound again, through whichever slot backs it now, and its graph replays.
+/// - Every replay reads the block's own bytes.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_graph_replays_across_a_streamed_sets_slot_moves() {
+    let (b, g, uuid) = card("stream-graph");
+    step!();
+    let _ledger = Ledger::create(&g, Some(512 << 20)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let blocks = 200;
+    let s = distinct(&mem, "big", blocks, 99, &g.uuid);
+    step!();
+    let stream = cuda::Stream::new(0).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap();
+    step!();
+    let r = mem.request("graphs", plan(&[&["big"]])).unwrap();
+    step!();
+    let mut execs = vec![];
+    let pass = r.pass(s, "fwd", "1", Torch::default()).unwrap();
+    for b in 0..blocks {
+        let pin = mem.bind(s, b, stream.raw()).unwrap();
+        execs.push((pin.ptr, captured_copy(out.ptr(), pin.ptr, REGION_ALIGN / 8, stream.raw())));
+    }
+    pass.end(Measured::default(), Torch::default());
+    step!();
+    let unmaps = timings.count("unmap");
+    let pass = r.pass(s, "fwd", "1", Torch::default()).unwrap();
+    for b in 0..blocks {
+        let pin = mem.bind(s, b, stream.raw()).unwrap();
+        let (ptr, exec) = execs[b as usize];
+        assert_eq!(pin.ptr, ptr, "block {b} moved off its own VA");
+        assert_eq!(unsafe { (graphs().launch)(exec as *mut c_void, stream.raw() as cuda::CUstream) }, cuda::SUCCESS);
+        assert!(bytes(out.ptr(), REGION_ALIGN, stream.raw()) == *block(99, b), "block {b}'s graph read other bytes");
+    }
+    pass.end(Measured::default(), Torch::default());
+    step!();
+    let moved = timings.count("unmap") - unmaps;
+    step!();
+    assert!(moved > 0, "the second pass moved no slot");
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS a graph replays across a streamed set's slot moves ({moved} unmaps in the second pass) {uuid}");
+    step!();
+}
+
+/// The floor holds: activations take all but a few blocks' room (through the allocator hook), and a set bigger than
+/// what is left still streams through the slots, every block exact. Weights never cause an OOM.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn the_floor_holds_with_activations_taking_all_but_the_slots() {
+    let (b, g, uuid) = card("floor");
+    step!();
+    let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let blocks = 64;
+    let s = distinct(&mem, "big", blocks, 100, &g.uuid);
+    step!();
+    let r = mem.request("floor", plan(&[&["big"]])).unwrap();
+    step!();
+    // Activations: all but eight blocks' room, through the hook (make_room) as torch's allocator takes them.
+    let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
+    let activations = mem.allocator_limit().unwrap().saturating_sub(8 * REGION_ALIGN);
+    let held = segment(&mem, &r, &torch, activations, &callbacks).expect("the activations");
+    step!();
+    let pass = r.pass(s, "fwd", "1", Torch { allocated: activations, reserved: activations }).unwrap();
+    for b in 0..blocks {
+        let pin = mem.bind(s, b, 0).unwrap_or_else(|e| panic!("block {b} beside the activations: {e}"));
+        assert!(exact(&pin, &block(100, b), 0), "block {b} streamed in with other bytes");
+    }
+    pass.end(Measured::default(), Torch { allocated: activations, reserved: activations });
+    step!();
+    println!("FLOOR {activations} B of activations; {blocks} blocks streamed beside them; creates {}, maps {}, unmaps {}", timings.count("create"), timings.count("map"), timings.count("unmap"));
+    step!();
+    unsegment(&torch, held, activations);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS the floor holds with activations taking all but the slots {uuid}");
+    step!();
+}
+
 /// A pass of `m` (two pinned blocks), measured smaller than its one-gibibyte activation, which meets a real OOM:
 /// the card is crowded and the rest full of an idle set. Returns the OOM answers and the record.
 fn first_run(mem: &Memory, m: SetId, idle: u32) -> (Vec<String>, Stats) {
