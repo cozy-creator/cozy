@@ -150,6 +150,20 @@ pub fn pack(lens: impl IntoIterator<Item = usize>, align: usize) -> Option<(Vec<
     Some((offsets, end))
 }
 
+/// Called by [`read`] once for each copy that landed, with its index in `copies`, as soon as its
+/// bytes are complete at the destination: device bytes then serve any later stream operation.
+/// It runs on a TensorFS thread (a reader, or the reading one as the read ends), must not block
+/// or call into TensorFS, and copies land in no set order. A read that fails returns `Err`, and a
+/// copy it did not call back for did not land.
+#[derive(Clone)]
+pub struct Landed(pub std::sync::Arc<dyn Fn(usize) + Send + Sync>);
+
+impl std::fmt::Debug for Landed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Landed")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ReadOpts {
     /// Reads in flight at once.
@@ -160,6 +174,8 @@ pub struct ReadOpts {
     pub streams: usize,
     /// Read what the page cache lacks with O_DIRECT, where the filesystem allows.
     pub direct: bool,
+    /// Told of each copy as it lands, before the read returns; `None` costs nothing.
+    pub landed: Option<Landed>,
 }
 
 impl Default for ReadOpts {
@@ -169,6 +185,7 @@ impl Default for ReadOpts {
             request: 1 << 20,
             streams: 2,
             direct: true,
+            landed: None,
         }
     }
 }
@@ -187,6 +204,8 @@ pub struct ReadStats {
     pub pin_ns: u64,
     pub staged: u64,
     pub busy_ns: u64,
+    /// Staging readers a device read ended with (`device`: grown while that helped).
+    pub readers: u64,
 }
 
 impl ReadStats {
@@ -286,6 +305,9 @@ unsafe fn read_impl(
         })?;
         #[cfg(unix)]
         disk_run(&host_copies, &stats, host_start.elapsed().as_nanos() as u64);
+        if let Some(landed) = &opts.landed {
+            host.iter().for_each(|(copy, _)| (landed.0)(*copy));
+        }
         stats
     };
     let device = unsafe { device::fill(&devices, opts, staged_host) }?;
@@ -295,14 +317,15 @@ unsafe fn read_impl(
     stats.pin_ns += device.pin_ns;
     stats.staged += device.staged;
     stats.busy_ns += device.busy_ns;
+    stats.readers = device.readers;
     stats.bytes = copies.iter().map(|c| c.dst.len() as u64).sum();
     stats.ns = start.elapsed().as_nanos() as u64;
     Ok(stats)
 }
 
-/// Logs the file reads among `copies` as one disk run (`metrics`).
+/// Logs the file reads among `copies` as one disk run (`metrics`): their volume's ceiling.
 #[cfg(unix)]
-fn disk_run(copies: &[Copy], stats: &ReadStats, ns: u64) {
+fn disk_run(copies: &[Copy], stats: &ReadStats, ns: u64) -> f64 {
     let mut files: Vec<&File> = Vec::new();
     let mut bytes = 0;
     for c in copies {
@@ -313,7 +336,8 @@ fn disk_run(copies: &[Copy], stats: &ReadStats, ns: u64) {
             }
         }
     }
-    if bytes > 0 {
-        metrics::disk_run(&files, bytes, ns, stats.direct, stats.cached);
+    match bytes {
+        0 => 0.0,
+        _ => metrics::disk_run(&files, bytes, ns, stats.direct, stats.cached),
     }
 }

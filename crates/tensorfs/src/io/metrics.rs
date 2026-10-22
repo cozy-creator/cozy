@@ -1,7 +1,8 @@
 //! What TensorFS copies are measured against: a GPU's pinned host→device bandwidth (best of 1,
-//! 2 and 4 streams) and PCIe link, and a volume's O_DIRECT read (`probe`). Ceilings are kept per
-//! boot (`probe::keep`), the GPU's by UUID and driver. Reads never measure one (`io::ceiling`
-//! does); a run faster than its ceiling raises it. Every copy run lands in one log (`take`).
+//! 2 and 4 streams) and PCIe link, its readers' page cache → pinned copy (`device`), and a
+//! volume's O_DIRECT read (`probe`). Ceilings are kept per boot (`probe::keep`), a GPU's by UUID
+//! and driver. Reads never measure one (`io::ceiling` does); a run faster than a ceiling raises
+//! it. Every copy run lands in one log (`take`).
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -26,6 +27,9 @@ pub struct Copy {
     pub ns: u64,
     /// GB/s; 0 when unmeasured.
     pub ceiling: f64,
+    /// h2d: the stage that sets `ceiling`: `disk` (bytes read past the page cache), `copy` (page
+    /// cache → pinned staging) or `h2d`; "" when unmeasured.
+    pub bound: &'static str,
     /// The PCIe link as the run ended (`Gen4 x16 of Gen5 x16`), "" if unknown or a disk fill.
     pub link: String,
     /// h2d: GPU time in copies; the rest of `ns` the host left the stream idle.
@@ -36,6 +40,8 @@ pub struct Copy {
     pub staged: u64,
     /// disk: bytes the page cache held.
     pub cached: u64,
+    /// h2d: staging readers the run ended with.
+    pub readers: u64,
 }
 
 static LOG: Mutex<Vec<Copy>> = Mutex::new(Vec::new());
@@ -55,10 +61,11 @@ pub fn take() -> Vec<Copy> {
 
 /// A run of reads from `files`, logged against its volume's kept ceiling. Only a run the page
 /// cache had no part in measures the volume: one of a probe's size seeds the ceiling, any that
-/// beats it raises it. A run that read cached bytes is logged unmeasured (ceiling 0).
-pub(crate) fn disk_run(files: &[&File], bytes: u64, ns: u64, direct: u64, cached: u64) {
+/// beats it raises it. A run that read cached bytes is logged unmeasured (ceiling 0). Returns the
+/// volume's ceiling after the run (0 when unmeasured).
+pub(crate) fn disk_run(files: &[&File], bytes: u64, ns: u64, direct: u64, cached: u64) -> f64 {
     let Some(volume) = files.first().and_then(|f| f.metadata().ok()).map(|m| volume(m.dev())) else {
-        return;
+        return 0.0;
     };
     let rate = direct as f64 / ns.max(1) as f64;
     let kept = probe::disk_known(volume).map(|(gbps, _)| gbps);
@@ -72,20 +79,41 @@ pub(crate) fn disk_run(files: &[&File], bytes: u64, ns: u64, direct: u64, cached
         _ => 0.0,
     };
     record(Copy { kind: "disk", gpu: -1, bytes, ns, cached, ceiling, ..Default::default() });
+    kept.unwrap_or(0.0).max(if measures { rate } else { 0.0 })
 }
 
-/// A run of copies to GPU `c.gpu`, logged against its kept H2D ceiling (0 until `io::ceiling`
-/// measures it); a run faster than that ceiling raises it.
-pub(crate) fn h2d_run(mut c: Copy) {
-    let key = h2d_key(c.gpu);
-    if let Some(kept) = key.as_deref().and_then(probe::known) {
-        let rate = c.bytes as f64 / c.ns.max(1) as f64;
-        if rate > kept[0] {
-            probe::keep(key.as_deref().unwrap(), &[rate, kept.get(1).copied().unwrap_or(1.0)]);
-        }
-        c.ceiling = kept[0].max(rate);
+/// A run of copies to GPU `c.gpu`, held against its slowest stage: the volume for the `direct`
+/// bytes read past the page cache (`disk`, GB/s), page cache → pinned staging for the cached
+/// ones, and the link for all. The stages overlap, so the run can take no less than its slowest
+/// stage's share. A stage not yet measured leaves the run unmeasured (ceiling 0); a run faster
+/// than a stage's kept ceiling raises it.
+pub(crate) fn h2d_run(mut c: Copy, direct: u64, disk: f64) {
+    let ns = c.ns.max(1) as f64;
+    let mut stages = vec![("h2d", c.bytes, raised(gpu_key("h2d", c.gpu), c.bytes as f64 / ns))];
+    if c.cached > 0 {
+        stages.push(("copy", c.cached, raised(gpu_key("copy", c.gpu), c.cached as f64 / ns)));
+    }
+    if direct > 0 {
+        stages.push(("disk", direct, disk));
+    }
+    if stages.iter().all(|s| s.2 > 0.0) {
+        let (bound, bytes, gbps) = stages
+            .into_iter()
+            .max_by(|a, b| (a.1 as f64 / a.2).total_cmp(&(b.1 as f64 / b.2)))
+            .expect("the link stage");
+        c.ceiling = c.bytes as f64 * gbps / bytes as f64;
+        c.bound = bound;
     }
     record(c);
+}
+
+/// `key`'s kept GB/s, raised to `rate` when the run beat it; 0 when unmeasured.
+fn raised(key: Option<String>, rate: f64) -> f64 {
+    let Some(kept) = key.as_deref().and_then(probe::known) else { return 0.0 };
+    if rate > kept[0] {
+        probe::keep(key.as_deref().unwrap(), &[rate, kept.get(1).copied().unwrap_or(1.0)]);
+    }
+    kept[0].max(rate)
 }
 
 /// A `st_dev` as `durable::device` names its volume.
@@ -160,7 +188,7 @@ pub(crate) fn pci_address(device: i32) -> Option<String> {
 /// Pinned host→device GB/s on CUDA device `device`, and the streams that reached it: kept this
 /// boot, else measured on its primary context.
 pub fn h2d(device: i32) -> Option<(f64, u32)> {
-    let key = h2d_key(device)?;
+    let key = gpu_key("h2d", device)?;
     if let Some(&[gbps, streams]) = probe::known(&key).as_deref() {
         return Some((gbps, streams as u32));
     }
@@ -174,14 +202,37 @@ pub fn h2d(device: i32) -> Option<(f64, u32)> {
     Some((gbps, streams))
 }
 
-/// A GPU's ceiling key: its UUID and the driver.
-fn h2d_key(device: i32) -> Option<String> {
+/// Page cache → pinned staging GB/s for GPU `device`'s readers, and the readers that reached it:
+/// kept this boot, else measured (`device::copy_ceiling`).
+pub fn copy(device: i32) -> Option<(f64, u32)> {
+    let key = gpu_key("copy", device)?;
+    if let Some(&[gbps, readers]) = probe::known(&key).as_deref() {
+        return Some((gbps, readers as u32));
+    }
+    let (gbps, readers) = super::device::copy_ceiling(device)
+        .inspect_err(|e| tracing::warn!("tensorfs: no host copy ceiling: {e}"))
+        .ok()?;
+    probe::keep(&key, &[gbps, readers as f64]);
+    Some((gbps, readers))
+}
+
+/// GPU `device`'s kept H2D GB/s this boot, without measuring.
+pub(crate) fn h2d_kept(device: i32) -> Option<f64> {
+    probe::known(&gpu_key("h2d", device)?).map(|kept| kept[0])
+}
+
+/// A GPU's ceiling key for `kind`: its UUID and the driver.
+fn gpu_key(kind: &str, device: i32) -> Option<String> {
     let d = cuda::driver().ok()?;
     let mut dev = 0;
     // SAFETY: driver out-param; an invalid ordinal returns an error.
     cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut dev, device) }).ok()?;
     let driver = std::fs::read_to_string("/sys/module/nvidia/version").unwrap_or_default();
-    Some(format!("h2d {} {}", cuda::uuid(dev).ok()?, driver.trim()))
+    Some(format!(
+        "{kind} {} {}",
+        cuda::uuid(dev).ok()?,
+        driver.trim()
+    ))
 }
 
 struct PrimaryContext(i32);

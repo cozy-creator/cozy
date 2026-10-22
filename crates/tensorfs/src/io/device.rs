@@ -1,21 +1,24 @@
 //! B7's bounded pinned staging and reuse policy, independent of varena's placement types.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use super::cuda::{self, CUcontext, CUevent, CUstream, CtxGuard};
-use super::{host, Copy, Dst, Error, ReadOpts, ReadStats, Src};
+use super::{host, Copy, Dst, Error, Landed, ReadOpts, ReadStats, Src};
 
 const PIECE: usize = 2 << 20;
+/// Readers a run starts with until runs on the engine have learned better (`Grow`).
 const READERS: usize = 8;
 /// Slots each reader owns: one fills while the other's copy lands, and both stay in its caches.
 /// A shared pool (LIFO or FIFO) measured 8-20% slower warm H2D.
 const RING: usize = 2;
-const STAGING: usize = READERS * RING;
 const STREAMS: usize = 4;
+/// Bytes of a memfd's pages the host copy probe reads per reader count: past any CPU cache.
+#[cfg(target_os = "linux")]
+const COPY_PROBE: usize = 1 << 30;
 
 fn failed(copy: usize, error: cuda::Error) -> Error {
     let kind = match error {
@@ -87,6 +90,8 @@ struct Slot {
     done: Event,
     pending: bool,
     recorded: bool,
+    /// The run and run-local copy its pending piece belongs to, when that run is told of landings.
+    landing: Option<(u64, usize)>,
 }
 
 impl Slot {
@@ -101,6 +106,7 @@ impl Slot {
             done,
             pending: false,
             recorded: false,
+            landing: None,
         })
     }
 }
@@ -161,6 +167,15 @@ impl Near {
     fn of(_: i32) -> Near {
         Near()
     }
+    /// CPUs readers may run on.
+    fn cpus(&self) -> usize {
+        #[cfg(target_os = "linux")]
+        if let Some(set) = &self.0 {
+            // SAFETY: a valid mask.
+            return unsafe { libc::CPU_COUNT(set) } as usize;
+        }
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    }
     /// Moves this thread there (TensorFS's own threads only).
     fn enter(&self) {
         #[cfg(target_os = "linux")]
@@ -171,15 +186,47 @@ impl Near {
     }
 }
 
+/// A run's copies still in flight, for `ReadOpts::landed`: allocated once per run, none per piece.
+struct Landing<'a> {
+    run: u64,
+    /// Pieces not yet complete, per run-local copy.
+    left: Vec<AtomicUsize>,
+    /// Run-local copy -> its index in `read`'s copies.
+    index: Vec<usize>,
+    call: &'a Landed,
+}
+
+impl Landing<'_> {
+    /// A piece of run-local copy `local` is complete (its staging slot's event synced).
+    fn piece(&self, local: usize) {
+        if self.left.get(local).is_some_and(|n| n.fetch_sub(1, Relaxed) == 1) {
+            (self.call.0)(self.index[local]);
+        }
+    }
+
+    /// Every lane drained: every copy with pieces left has landed.
+    fn rest(&self) {
+        for (local, n) in self.left.iter().enumerate() {
+            if n.swap(0, Relaxed) > 0 {
+                (self.call.0)(self.index[local]);
+            }
+        }
+    }
+}
+
+/// Each run's token, so a slot carried over from an earlier run tells nobody.
+static RUNS: AtomicU64 = AtomicU64::new(0);
+
 struct Engine {
     device: i32,
     ctx: CUcontext,
     streams: Vec<cuda::Stream>,
     queues: Vec<Mutex<()>>,
     near: Near,
+    /// Staging slots between runs; readers allocate what they lack on the GPU's node.
     free: Mutex<Vec<Slot>>,
+    learned: Mutex<Learned>,
     serial: Mutex<()>,
-    seen: Mutex<VecDeque<(usize, usize)>>,
     held: Mutex<Vec<Retained>>,
     staged: Mutex<Vec<Slot>>,
 }
@@ -234,7 +281,6 @@ impl Drop for DeviceBuffer {
 #[derive(Default)]
 struct Retained {
     slots: Vec<Slot>,
-    pins: Vec<cuda::HostPin>,
     events: Vec<Event>,
     streams: Vec<cuda::Stream>,
     _buffers: Vec<DeviceBuffer>,
@@ -335,47 +381,20 @@ impl Engine {
             .map(|_| cuda::Stream::new(device))
             .collect::<cuda::Result<_>>()?;
         let ctx = streams[0].context();
-        let near = Near::of(device);
-        // Pinned pages land on the allocating thread's node.
-        let at = ctx as usize;
-        let free = std::thread::scope(|s| {
-            s.spawn(|| {
-                near.enter();
-                let ctx = at as CUcontext;
-                let _ctx = CtxGuard::enter(ctx)?;
-                (0..STAGING)
-                    .map(|_| Slot::new(ctx))
-                    .collect::<cuda::Result<Vec<_>>>()
-            })
-            .join()
-            .expect("staging allocation does not panic")
-        })?;
         let engine = Arc::new(Engine {
             device,
             ctx,
             streams,
             queues: (0..STREAMS).map(|_| Mutex::new(())).collect(),
-            near,
-            free: Mutex::new(free),
+            near: Near::of(device),
+            free: Mutex::new(Vec::new()),
+            learned: Mutex::new(Learned::default()),
             serial: Mutex::new(()),
-            seen: Mutex::new(VecDeque::new()),
             held: Mutex::new(Vec::new()),
             staged: Mutex::new(Vec::new()),
         });
         engines.insert(device, engine.clone());
         Ok(engine)
-    }
-
-    fn reused(&self, ptr: usize, len: usize) -> bool {
-        let mut seen = self.seen.lock().unwrap();
-        if seen.contains(&(ptr, len)) {
-            return true;
-        }
-        if seen.len() >= 256 {
-            seen.pop_front();
-        }
-        seen.push_back((ptr, len));
-        false
     }
 
     fn wait(&self, event: &Event, streams: usize) -> cuda::Result<()> {
@@ -403,16 +422,10 @@ impl Engine {
     }
 
     fn checked_release(&self, owners: &mut [Retained], complete: bool) -> cuda::Result<()> {
-        if !complete {
-            self.synchronize(owners)?;
+        match complete {
+            true => Ok(()),
+            false => self.synchronize(owners),
         }
-        let mut first = None;
-        for pin in owners.iter_mut().flat_map(|r| &mut r.pins) {
-            if let Err(error) = pin.release() {
-                first.get_or_insert(error);
-            }
-        }
-        first.map_or(Ok(()), Err)
     }
 
     fn released(&self, owners: Vec<Retained>) {
@@ -461,6 +474,23 @@ impl Engine {
         self.free.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A reader's slots: free ones, else new ones pinned on this thread's (the GPU's) node.
+    fn ring(&self) -> cuda::Result<Vec<Slot>> {
+        let mut ring = {
+            let mut free = self.free();
+            let at = free.len().saturating_sub(RING);
+            free.split_off(at)
+        };
+        while ring.len() < RING {
+            match Slot::new(self.ctx) {
+                Ok(slot) => ring.push(slot),
+                Err(e) if ring.is_empty() => return Err(e),
+                Err(_) => break,
+            }
+        }
+        Ok(ring)
+    }
+
     fn hold_slot(&self, slot: Slot) {
         self.staged
             .lock()
@@ -495,7 +525,7 @@ impl Engine {
             let owners = hold.owners.as_mut().expect("run owners live");
             let mut jobs = Vec::new();
             let tally = Tally::default();
-            for &(copy, c) in copies {
+            for (local, &(copy, c)) in copies.iter().enumerate() {
                 if let Src::Device { device, stream, .. } = c.src {
                     let source = Engine::get(device).map_err(|e| failed(copy, e))?;
                     owners
@@ -523,29 +553,18 @@ impl Engine {
                     (c.src, c.dst),
                     (Src::Device { .. } | Src::Zero, Dst::Device { .. })
                 );
-                if !staged_host {
-                    if let (Src::Host(ptr), Dst::Device { .. }) = (c.src, c.dst) {
-                        let reused = self.reused(ptr as usize, c.dst.len());
-                        if unsafe { cuda::registered(ptr) }.map_err(|e| failed(copy, e))? {
-                            direct = true;
-                        } else if reused {
-                            let start = Instant::now();
-                            let pin =
-                                unsafe { cuda::pin_region(ptr.cast_mut(), c.dst.len(), true) };
-                            tally
-                                .pin_ns
-                                .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
-                            if let Ok(pin) = pin {
-                                owners.pins.push(pin);
-                                direct = true;
-                            }
-                        }
-                    }
+                // A host range its owner keeps registered (`pins::PinnedRanges`) copies directly;
+                // any other is staged. Registering one for a single read cost more than it saved
+                // (cuMemHostRegister + unregister ~100 ms/GiB: 25% of the link against 70% staged).
+                if let (Src::Host(ptr), Dst::Device { len, .. }, false) = (c.src, c.dst, staged_host) {
+                    let registered = |p| unsafe { cuda::registered(p) }.map_err(|e| failed(copy, e));
+                    direct = len > 0 && registered(ptr)? && registered(ptr.wrapping_add(len - 1))?;
                 }
                 let step = if direct { c.dst.len() } else { PIECE };
                 for at in (0..c.dst.len()).step_by(step.max(1)) {
                     jobs.push(Job {
                         copy,
+                        local,
                         c,
                         at,
                         len: step.min(c.dst.len() - at),
@@ -553,6 +572,11 @@ impl Engine {
                     });
                 }
             }
+            let landing = opts.landed.as_ref().map(|call| {
+                let left: Vec<AtomicUsize> = (0..copies.len()).map(|_| AtomicUsize::new(0)).collect();
+                jobs.iter().for_each(|j| _ = left[j.local].fetch_add(1, Relaxed));
+                Landing { run: RUNS.fetch_add(1, Relaxed), left, index: copies.iter().map(|(copy, _)| *copy).collect(), call }
+            });
             let start = owners.events.len();
             for stream in &self.streams[..streams] {
                 owners
@@ -568,32 +592,61 @@ impl Engine {
             let next = AtomicUsize::new(0);
             let stopped = AtomicBool::new(false);
             let error = Mutex::new(None);
-            // A failed copy's slots stay retained until checked completion: read with the rest.
-            let readers = opts.threads.clamp(1, READERS).min(jobs.len()).min(self.free().len() / RING);
-            if readers == 0 && !jobs.is_empty() {
-                let lost = io::Error::other("all staging is still retained by failed copies");
-                return Err(Error {
-                    copy: first,
-                    source: lost,
-                });
-            }
-            let work = || {
+            let cap = opts
+                .threads
+                .clamp(1, self.near.cpus())
+                .min(jobs.len().max(1));
+            let learned = *self.learned.lock().unwrap_or_else(|e| e.into_inner());
+            let h2d = super::metrics::h2d_kept(self.device).unwrap_or(0.0);
+            let mut grow = Grow::new(learned, cap, h2d);
+            let (allowed, running) = (AtomicUsize::new(grow.readers), AtomicUsize::new(0));
+            // Leaves one reader when more run than `allowed`.
+            let surplus = || {
+                let mut n = running.load(Relaxed);
+                while n > allowed.load(Relaxed) {
+                    match running.compare_exchange(n, n - 1, Relaxed, Relaxed) {
+                        Ok(_) => return true,
+                        Err(now) => n = now,
+                    }
+                }
+                false
+            };
+            // A reader that could pin no slot leaves the jobs to the others, if any.
+            let starved = Mutex::new(None);
+            let work = |tx: &mpsc::Sender<Read>| {
                 self.near.enter();
-                let mut ring = {
-                    let mut free = self.free();
-                    let at = free.len() - RING;
-                    free.split_off(at)
+                let ring = CtxGuard::enter(self.ctx).and_then(|_ctx| self.ring());
+                let mut ring = match ring {
+                    Ok(ring) => ring,
+                    Err(e) => {
+                        running.fetch_sub(1, Relaxed);
+                        starved.lock().unwrap().get_or_insert(failed(first, e));
+                        return;
+                    }
                 };
                 let mut turn = 0;
-                while !stopped.load(Relaxed) {
+                loop {
+                    if surplus() {
+                        break;
+                    }
                     let at = next.fetch_add(1, Relaxed);
-                    let Some(job) = jobs.get(at) else { break };
+                    let job = jobs.get(at).filter(|_| !stopped.load(Relaxed));
+                    let Some(job) = job else {
+                        running.fetch_sub(1, Relaxed);
+                        break;
+                    };
                     turn += 1;
-                    if let Err(failure) =
-                        self.piece(job, at % streams, opts, &tally, &mut ring[turn % RING])
-                    {
-                        error.lock().unwrap().get_or_insert(failure);
-                        stopped.store(true, Relaxed);
+                    let n = ring.len();
+                    let slot = &mut ring[turn % n];
+                    match self.piece(job, at % streams, opts, &tally, slot, landing.as_ref()) {
+                        Ok(Some(cached)) => {
+                            let _ = tx.send(Read::Piece { bytes: job.len as u64, cached });
+                        }
+                        Ok(None) => {}
+                        Err(failure) => {
+                            error.lock().unwrap().get_or_insert(failure);
+                            stopped.store(true, Relaxed);
+                        }
                     }
                 }
                 // After any failure a slot may still be in flight: kept until checked completion.
@@ -604,12 +657,47 @@ impl Engine {
                     }
                 }
             };
-            // Every reader is TensorFS's own thread, so moving it to the GPU's CPUs moves no caller.
+            // Every reader is TensorFS's own thread, so moving it to the GPU's CPUs moves no
+            // caller. This thread grows them while that raises the staged rate.
+            let (tx, rx) = mpsc::channel();
+            let clock = Instant::now();
             std::thread::scope(|scope| {
-                for _ in 0..readers {
-                    scope.spawn(work);
+                let spawn = |count: usize| {
+                    for _ in 0..count {
+                        running.fetch_add(1, Relaxed);
+                        let leave = Leave(tx.clone());
+                        scope.spawn(move || work(&leave.0));
+                    }
+                };
+                let (mut target, mut alive) = (grow.readers, grow.readers);
+                spawn(target);
+                while alive > 0 {
+                    let change = match rx.recv() {
+                        Ok(Read::Done) => {
+                            alive -= 1;
+                            continue;
+                        }
+                        Ok(Read::Piece { bytes, cached }) => {
+                            grow.piece(bytes, cached, clock.elapsed().as_nanos() as u64)
+                        }
+                        Err(_) => break,
+                    };
+                    if let Some(readers) = change {
+                        allowed.store(readers, Relaxed);
+                        if readers > target {
+                            spawn(readers - target);
+                            alive += readers - target;
+                        }
+                        target = readers;
+                    }
                 }
             });
+            grow.learn(&mut self.learned.lock().unwrap_or_else(|e| e.into_inner()));
+            if next.load(Relaxed) < jobs.len() {
+                if let Some(starved) = starved.into_inner().unwrap() {
+                    error.lock().unwrap().get_or_insert(starved);
+                }
+            }
             let mut busy_ns = 0;
             let mut all_complete = true;
             for (lane, stream) in self.streams[..streams].iter().enumerate() {
@@ -632,13 +720,16 @@ impl Engine {
             if let Some(error) = error.into_inner().unwrap() {
                 return Err(error);
             }
+            if let Some(landing) = &landing {
+                landing.rest();
+            }
             Ok(ReadStats {
                 direct: tally.direct.load(Relaxed),
                 cached: tally.cached.load(Relaxed),
                 bounced: tally.bounced.load(Relaxed),
-                pin_ns: tally.pin_ns.load(Relaxed),
                 staged: tally.staged.load(Relaxed),
                 busy_ns,
+                readers: grow.readers as u64,
                 ..ReadStats::default()
             })
         })();
@@ -648,6 +739,8 @@ impl Engine {
         Ok(stats)
     }
 
+    /// One job; for a staged file piece, whether the page cache held all of it (growth reads only
+    /// those).
     fn piece(
         &self,
         job: &Job,
@@ -655,7 +748,8 @@ impl Engine {
         opts: &ReadOpts,
         tally: &Tally,
         slot: &mut Slot,
-    ) -> Result<(), Error> {
+        landing: Option<&Landing>,
+    ) -> Result<Option<bool>, Error> {
         let _ctx = CtxGuard::enter(self.ctx).map_err(|e| failed(job.copy, e))?;
         let d = cuda::driver().map_err(|e| failed(job.copy, e))?;
         let stream = self.streams[lane].raw() as CUstream;
@@ -680,12 +774,20 @@ impl Engine {
                 }
                 _ => unreachable!(),
             };
-            return cuda::check("cuMemcpyAsync", result).map_err(|e| failed(job.copy, e));
+            return cuda::check("cuMemcpyAsync", result)
+                .map(|()| None)
+                .map_err(|e| failed(job.copy, e));
         }
         if slot.pending {
             slot.done.sync().map_err(|e| failed(job.copy, e))?;
             slot.pending = false;
+            if let (Some(l), Some((run, local))) = (landing, slot.landing.take()) {
+                if run == l.run {
+                    l.piece(local);
+                }
+            }
         }
+        let mut cached = None;
         match job.c.src {
             Src::File(file, offset) => {
                 let copy = Copy {
@@ -706,6 +808,7 @@ impl Engine {
                 tally.direct.fetch_add(stats.direct, Relaxed);
                 tally.cached.fetch_add(stats.cached, Relaxed);
                 tally.bounced.fetch_add(stats.bounced, Relaxed);
+                cached = Some(stats.direct == 0);
             }
             Src::Host(ptr) => unsafe {
                 std::ptr::copy_nonoverlapping(ptr.add(job.at), slot.ptr, job.len)
@@ -725,21 +828,28 @@ impl Engine {
         };
         slot.pending = true;
         slot.recorded = false;
+        slot.landing = landing.map(|l| (l.run, job.local));
         cuda::check("cuMemcpyAsync", rc).map_err(|e| failed(job.copy, e))?;
         slot.done.record(stream).map_err(|e| failed(job.copy, e))?;
         slot.recorded = true;
         if let Dst::Host { ptr, .. } = job.c.dst {
             slot.done.sync().map_err(|e| failed(job.copy, e))?;
             slot.pending = false;
+            slot.landing = None;
             unsafe { std::ptr::copy_nonoverlapping(slot.ptr, ptr.add(job.at), job.len) };
+            if let Some(l) = landing {
+                l.piece(job.local);
+            }
         }
         tally.staged.fetch_add(job.len as u64, Relaxed);
-        Ok(())
+        Ok(cached)
     }
 }
 
 struct Job<'a> {
     copy: usize,
+    /// Its copy's place in the run.
+    local: usize,
     c: Copy<'a>,
     at: usize,
     len: usize,
@@ -751,8 +861,231 @@ struct Tally {
     direct: AtomicU64,
     cached: AtomicU64,
     bounced: AtomicU64,
-    pin_ns: AtomicU64,
     staged: AtomicU64,
+}
+
+/// What a reader tells the run: a staged piece queued to the GPU, or that it left.
+enum Read {
+    Piece { bytes: u64, cached: bool },
+    Done,
+}
+
+/// Tells the run its reader left, on unwind too.
+struct Leave(mpsc::Sender<Read>);
+
+impl Drop for Leave {
+    fn drop(&mut self) {
+        let _ = self.0.send(Read::Done);
+    }
+}
+
+/// Readers per source (0: the page cache, 1: the disk), learned by runs on one engine; a source
+/// is settled once growing its readers stopped helping.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Learned {
+    readers: [usize; 2],
+    settled: [bool; 2],
+    last: usize,
+}
+
+impl Default for Learned {
+    fn default() -> Learned {
+        Learned { readers: [READERS; 2], settled: [false; 2], last: 0 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    /// The window after a change, left to settle; the run's first also names its source.
+    Ramp,
+    /// Two windows at the kept readers: the base rate and its spread.
+    Base(Option<f64>),
+    /// `trial` readers started: the window to settle, then the one measured.
+    Ramped(usize),
+    Trial(usize),
+    Done,
+}
+
+/// Grows a run's readers while that raises its staged rate (bytes queued to the GPU per ns), in
+/// windows of two turns of every ring. A step of a quarter more readers is kept only when it beat
+/// the base rate by more than the base's own window-to-window spread, and growth stops at `cap`
+/// or the GPU's H2D ceiling. Pure, so the policy is tested without a GPU.
+#[derive(Debug)]
+struct Grow {
+    learned: Learned,
+    /// Readers proven (or learned) for this run, and those running now.
+    readers: usize,
+    target: usize,
+    cap: usize,
+    h2d: f64,
+    phase: Phase,
+    source: Option<usize>,
+    /// The window so far: bytes, cached bytes, and when it began (ns).
+    window: (u64, u64, u64),
+    base: f64,
+    spread: f64,
+}
+
+impl Grow {
+    fn new(learned: Learned, cap: usize, h2d: f64) -> Grow {
+        let readers = learned.readers[learned.last].clamp(1, cap);
+        let (phase, source, window, base, spread) = (Phase::Ramp, None, (0, 0, 0), 0.0, 0.0);
+        Grow { learned, readers, target: readers, cap, h2d, phase, source, window, base, spread }
+    }
+
+    /// A staged piece queued at `now` ns: the readers to run with, when they change.
+    fn piece(&mut self, bytes: u64, cached: bool, now: u64) -> Option<usize> {
+        if self.phase == Phase::Done {
+            return None;
+        }
+        let (total, held, since) = &mut self.window;
+        (*total, *held) = (*total + bytes, *held + if cached { bytes } else { 0 });
+        if *total < (2 * self.target * RING * PIECE) as u64 {
+            return None;
+        }
+        let rate = *total as f64 / now.saturating_sub(*since).max(1) as f64;
+        let source = usize::from(*held * 2 < *total);
+        self.window = (0, 0, now);
+        let next = match (self.phase, self.source) {
+            (Phase::Ramp, None) => {
+                self.source = Some(source);
+                let learned = self.learned.readers[source].clamp(1, self.cap);
+                match std::mem::replace(&mut self.readers, learned) == learned {
+                    true => self.settled(source),
+                    false => Phase::Ramp,
+                }
+            }
+            (Phase::Ramp, Some(source)) => self.settled(source),
+            (Phase::Base(None), _) => Phase::Base(Some(rate)),
+            (Phase::Base(Some(first)), _) => {
+                (self.base, self.spread) = (first.max(rate), (first - rate).abs());
+                self.step()
+            }
+            (Phase::Ramped(trial), _) => Phase::Trial(trial),
+            (Phase::Trial(trial), _) if rate > self.base + self.spread => {
+                (self.readers, self.base) = (trial, rate);
+                self.step()
+            }
+            (Phase::Trial(_) | Phase::Done, _) => Phase::Done,
+        };
+        self.phase = next;
+        let target = match next {
+            Phase::Ramped(trial) | Phase::Trial(trial) => trial,
+            _ => self.readers,
+        };
+        (std::mem::replace(&mut self.target, target) != target).then_some(target)
+    }
+
+    /// Growth goes on for a source not yet settled.
+    fn settled(&self, source: usize) -> Phase {
+        match self.learned.settled[source] {
+            true => Phase::Done,
+            false => Phase::Base(None),
+        }
+    }
+
+    /// The next trial, or done at the cap or the link's ceiling.
+    fn step(&self) -> Phase {
+        let trial = (self.readers + (self.readers / 4).max(1)).min(self.cap);
+        match trial == self.readers || (self.h2d > 0.0 && self.base >= self.h2d) {
+            true => Phase::Done,
+            false => Phase::Ramped(trial),
+        }
+    }
+
+    /// What the run proved, for the engine's next runs.
+    fn learn(&self, learned: &mut Learned) {
+        if let Some(source) = self.source {
+            learned.readers[source] = self.readers;
+            learned.settled[source] |= self.phase == Phase::Done;
+            learned.last = source;
+        }
+    }
+}
+
+/// Page cache → pinned staging GB/s on GPU `device`'s readers, and the readers that reached it:
+/// a memfd's pages read into each reader's ring as staging reads a cached file, the readers
+/// doubling while that helped, up to the CPUs they may use. Slots beyond what the best count
+/// (or a run's start) needs are freed again.
+#[cfg(target_os = "linux")]
+pub(super) fn copy_ceiling(device: i32) -> io::Result<(f64, u32)> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::FileExt;
+    let engine = Engine::get(device).map_err(io::Error::other)?;
+    let _serial = engine.serial.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: a fresh anonymous file, owned below. The syscall, not glibc's wrapper (2.27+): the
+    // `tfs` binary links against manylinux2014's glibc 2.17.
+    let fd = unsafe { libc::syscall(libc::SYS_memfd_create, c"tensorfs-copy-probe".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor was just created and nothing else owns it.
+    let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+    let block = vec![0x5a; PIECE];
+    for at in (0..COPY_PROBE).step_by(PIECE) {
+        file.write_all_at(&block, at as u64)?;
+    }
+    let (cpus, mut best, mut readers, mut n) = (engine.near.cpus(), 0.0, 0, 1);
+    let measured = loop {
+        match engine.copy_rate(&file, n) {
+            Ok(gbps) if gbps > best => (best, readers) = (gbps, n),
+            Ok(_) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+        match n == cpus {
+            true => break Ok(()),
+            false => n = (n * 2).min(cpus),
+        }
+    };
+    engine.free().truncate(RING * readers.max(READERS));
+    measured.map(|()| (best, readers as u32))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn copy_ceiling(_: i32) -> io::Result<(f64, u32)> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "no host copy probe on this platform"))
+}
+
+impl Engine {
+    /// GB/s `readers` reach reading all of `file` (cached) into their rings, timed from when every
+    /// reader holds its slots. Caller holds `serial`.
+    #[cfg(target_os = "linux")]
+    fn copy_rate(&self, file: &std::fs::File, readers: usize) -> io::Result<f64> {
+        let (next, ready) = (AtomicUsize::new(0), std::sync::Barrier::new(readers + 1));
+        let read = || -> io::Result<()> {
+            self.near.enter();
+            let ring = CtxGuard::enter(self.ctx).and_then(|_ctx| self.ring());
+            ready.wait();
+            let mut ring = ring.map_err(io::Error::other)?;
+            let result = (|| {
+                for turn in 0.. {
+                    let at = next.fetch_add(1, Relaxed);
+                    if at >= COPY_PROBE / PIECE {
+                        break;
+                    }
+                    let n = ring.len();
+                    let slot = &mut ring[turn % n];
+                    if std::mem::take(&mut slot.pending) {
+                        slot.done.sync().map_err(io::Error::other)?;
+                    }
+                    // SAFETY: the slot's PIECE bytes, with no copy in flight from them.
+                    let buf = unsafe { std::slice::from_raw_parts_mut(slot.ptr, PIECE) };
+                    host::read_exact_at(file, buf, (at * PIECE) as u64)?;
+                }
+                Ok(())
+            })();
+            self.free().extend(ring);
+            result
+        };
+        let start = std::thread::scope(|s| {
+            let readers: Vec<_> = (0..readers).map(|_| s.spawn(read)).collect();
+            ready.wait();
+            let start = Instant::now();
+            readers.into_iter().try_for_each(|r| r.join().expect("a probe reader does not panic"))?;
+            io::Result::Ok(start)
+        })?;
+        Ok(COPY_PROBE as f64 / start.elapsed().as_nanos().max(1) as f64)
+    }
 }
 
 /// Same bounded B7 staging, with checked completion and retained native resources on error.
@@ -762,8 +1095,10 @@ pub(super) unsafe fn fill(
     staged_host: bool,
 ) -> Result<ReadStats, Error> {
     let mut groups: BTreeMap<(i32, &str), Vec<(usize, Copy)>> = BTreeMap::new();
+    let mut empty = Vec::new();
     for &(index, copy) in copies {
         if copy.dst.is_empty() {
+            empty.push(index);
             continue;
         }
         let device = match (copy.src, copy.dst) {
@@ -795,7 +1130,7 @@ pub(super) unsafe fn fill(
         {
             let ns = start.elapsed().as_nanos() as u64;
             let plain: Vec<Copy> = copies.iter().map(|&(_, c)| c).collect();
-            super::disk_run(&plain, &stats, ns);
+            let disk = super::disk_run(&plain, &stats, ns);
             let run = super::metrics::Copy {
                 kind,
                 gpu: device,
@@ -804,13 +1139,14 @@ pub(super) unsafe fn fill(
                 link: super::metrics::device_link(device)
                     .map_or_else(String::new, |link| link.to_string()),
                 busy_ns: stats.busy_ns,
+                readers: stats.readers,
                 pin_ns: stats.pin_ns,
                 staged: stats.staged,
                 cached: stats.cached,
                 ..Default::default()
             };
             match kind {
-                "h2d" => super::metrics::h2d_run(run),
+                "h2d" => super::metrics::h2d_run(run, stats.direct, disk),
                 _ => super::metrics::record(run),
             }
         }
@@ -822,6 +1158,10 @@ pub(super) unsafe fn fill(
         total.pin_ns += stats.pin_ns;
         total.staged += stats.staged;
         total.busy_ns += stats.busy_ns;
+        total.readers = total.readers.max(stats.readers);
+    }
+    if let Some(landed) = &opts.landed {
+        empty.into_iter().for_each(|copy| (landed.0)(copy));
     }
     Ok(total)
 }
@@ -853,6 +1193,90 @@ mod tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(released);
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+
+    /// Feeds `grow` staged pieces at `gbps(readers)`: the reader counts it switches to.
+    fn drive(
+        grow: &mut Grow,
+        gbps: impl Fn(usize) -> f64,
+        pieces: usize,
+        cached: bool,
+    ) -> Vec<usize> {
+        let (mut now, mut readers, mut changes) = (0, grow.target, Vec::new());
+        for _ in 0..pieces {
+            now += (PIECE as f64 / gbps(readers)).ceil() as u64;
+            if let Some(n) = grow.piece(PIECE as u64, cached, now) {
+                (readers, changes) = (n, [changes, vec![n]].concat());
+            }
+        }
+        changes
+    }
+
+    #[test]
+    fn readers_grow_while_the_staged_rate_rises_and_the_last_step_is_retired() {
+        let mut grow = Grow::new(Learned::default(), 64, 0.0);
+        let changes = drive(&mut grow, |n| (2.0 * n as f64).min(26.0), 4000, true);
+        assert_eq!(changes, [10, 12, 15, 18, 15]);
+        let mut learned = Learned::default();
+        grow.learn(&mut learned);
+        assert_eq!(
+            learned,
+            Learned {
+                readers: [15, READERS],
+                settled: [true, false],
+                last: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_flat_rate_keeps_the_readers_and_settles_after_one_step() {
+        let mut grow = Grow::new(Learned::default(), 64, 0.0);
+        assert_eq!(drive(&mut grow, |_| 20.0, 4000, false), [10, READERS]);
+        let mut learned = Learned::default();
+        grow.learn(&mut learned);
+        assert_eq!(
+            learned,
+            Learned {
+                readers: [READERS; 2],
+                settled: [false, true],
+                last: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_settled_source_switches_once_and_the_link_ceiling_or_cap_stops_growth() {
+        let learned = Learned {
+            readers: [12, READERS],
+            settled: [true, false],
+            last: 1,
+        };
+        let mut grow = Grow::new(learned, 64, 0.0);
+        assert_eq!(drive(&mut grow, |n| 2.0 * n as f64, 4000, true), [12]);
+        assert_eq!(grow.phase, Phase::Done);
+        let mut grow = Grow::new(Learned::default(), 64, 16.0);
+        assert!(drive(&mut grow, |n| 2.0 * n as f64, 4000, true).is_empty());
+        let mut grow = Grow::new(Learned::default(), 9, 0.0);
+        assert_eq!(drive(&mut grow, |n| 2.0 * n as f64, 4000, true), [9]);
+        assert_eq!((grow.readers, grow.phase), (9, Phase::Done));
+    }
+
+    #[test]
+    fn a_step_within_the_base_windows_spread_is_not_kept() {
+        let mut grow = Grow::new(Learned::default(), 64, 0.0);
+        let mut window = 0;
+        let (mut now, mut readers, mut changes) = (0.0, grow.target, Vec::new());
+        for _ in 0..4000 {
+            // Base windows alternate 16 and 20 GB/s; one more reader adds 2.
+            window += 1;
+            let noise = if (window / 32) % 2 == 0 { 0.0 } else { 4.0 };
+            now += PIECE as f64 / (16.0 + noise + 2.0 * (readers - READERS) as f64 / 2.0);
+            if let Some(n) = grow.piece(PIECE as u64, true, now as u64) {
+                (readers, changes) = (n, [changes, vec![n]].concat());
+            }
+        }
+        assert_eq!(changes.last(), Some(&READERS));
     }
 
     #[test]
