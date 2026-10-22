@@ -80,6 +80,22 @@ pub fn admit(engine: &Engine, ledgers: &[&Ledger], id: &str, package: &str, shap
     }
 }
 
+/// The GPU of the group (an index into `ledgers`, GPU order) that keeps each set of `sets`, by
+/// `Ledger::place` for `package`'s request at `shape` in `family`. A set's bytes are what its
+/// load recorded on a GPU of the group (its layout's, exact; its region split is the model's,
+/// known only where it loads): a set never loaded goes where the most room is free. A ledger
+/// that cannot answer keeps every set on GPU 0, where it pages.
+pub fn homes(ledgers: &[&Ledger], package: &str, shape: &str, family: Option<&str>, sets: &[&str], log: &MemoryLog) -> Vec<u32> {
+    let unknown: Vec<(&str, Option<u64>)> = sets.iter().map(|set| (*set, None)).collect();
+    match Ledger::place(ledgers, package, shape, family, &unknown) {
+        Ok(homes) => homes,
+        Err(error) => {
+            log.note(serde_json::json!({"event": "homes_on_gpu_0", "package": package, "why": error.to_string()}));
+            vec![0; sets.len()]
+        }
+    }
+}
+
 /// Measured peaks, persisted per GPU model as `<dir>/<model>.json`: varena's records, kept and
 /// restored whole. A key names its package release (`<construction>|<shape>`, or a set's
 /// `<package>@<release>/<component>|…`), so one file holds every release's. Each GPU of the

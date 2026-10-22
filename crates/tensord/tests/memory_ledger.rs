@@ -235,7 +235,7 @@ impl Drop for StandIn {
 /// A peak record's key.
 fn key(peak: &Peak) -> &str {
     match peak {
-        Peak::Request { key, .. } | Peak::Pass { key, .. } => key,
+        Peak::Request { key, .. } | Peak::Pass { key, .. } | Peak::Set { key, .. } => key,
     }
 }
 
@@ -536,4 +536,37 @@ fn a_root_tensord_grants_executors_of_its_identity() {
     let mut second = StandIn::granted(&gpu, &id, "ram", Some(IDENTITY));
     assert_eq!(second.load(), ("Kept,Kept,Kept,Hit,Hit,Hit".into(), set_bytes, 0), "imported at load, not copied");
     assert_eq!(orphans(&gpu), 0);
+}
+
+/// Hosting (S5 r3): TensorD names the GPU of a 2-GPU group that keeps a placeable set. Beside
+/// GPU 0's running request (its pass's room held, the package's measured working set) the set
+/// has no room there and is homed on GPU 1; the same placement with GPU 0 idle keeps it there.
+/// Its bytes are what its load recorded on the group (a loader on GPU 1).
+#[test]
+fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
+    let (id0, id1) = (gpu_id("home-0"), gpu_id("home-1"));
+    let gpu0 = Gpu::create("0", &[inventory(&id0)], None, HostMode::Dedicated, &peaks, &log).unwrap();
+    let gpu1 = Gpu::create("0", &[inventory(&id1)], None, HostMode::Dedicated, &peaks, &log).unwrap();
+    let set = format!("{PACKAGE}/c");
+    let mut loader = StandIn::spawn(&gpu1, &id1, "ram");
+    loader.ask("load");
+    let pid = loader.kill();
+    gpu1.ledger.reap(pid);
+    assert!(gpu1.ledger.peaks().iter().any(|peak| matches!(peak, Peak::Set { key, .. } if *key == set)), "its load recorded its bytes");
+
+    let engine = Engine::open(&dir.path().join("engine")).unwrap();
+    let request = |key: &str| engine.submit(key, Invocation::default()).unwrap().id;
+    let admit = |id: &str| memory::admit(&engine, &[&gpu0.ledger], id, PACKAGE, BIG, None).unwrap();
+    let homes = || memory::homes(&[&gpu0.ledger, &gpu1.ledger], PACKAGE, "", None, &[set.as_str()], &log);
+    let mut busy = StandIn::spawn(&gpu0, &id0, "gpu");
+    measure(&mut busy, &request, &admit, &gpu0);
+    let call = request("busy");
+    assert!(admit(&call));
+    assert_eq!(busy.ask(&format!("run {call} {BIG}")), "passing");
+    assert_eq!(homes(), [1], "no room beside GPU 0's running request: GPU 1 keeps it");
+    assert_eq!(busy.ask(&format!("end {BIG_ROOM}")), "ended");
+    gpu0.ledger.undispatch(&call);
+    assert_eq!(homes(), [0], "with room on GPU 0 it stays there");
 }
