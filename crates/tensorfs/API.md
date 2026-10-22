@@ -115,7 +115,7 @@ For example, parse a repository reference and use the returned folder or tree:
 ```rust
 use tensorfs::{Format, Ref};
 
-let model: Ref = "me/model@1.0/bf16".parse()?;
+let model: Ref = "me/model@1.0/model.bf16.cozytensors".parse()?;
 let folder = client.materialize(&model, &Download::default(), None, false).await?;
 println!("downloaded to {}", folder.display());
 
