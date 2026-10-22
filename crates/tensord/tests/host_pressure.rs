@@ -112,9 +112,9 @@ fn scenario(watch: bool) {
     let cgroup = deny_psi();
     let dir = tempfile::tempdir().unwrap();
     assert!(varena::os::namespace(&format!("host-pressure-{}-", std::process::id())));
-    let unmeasured = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let call_state = unmeasured.clone();
-    let need: varena::Need = Arc::new(move || (!call_state.load(Ordering::Acquire)).then_some(0));
+    // A previous measured peak is already consumed. Observed growth must still make the
+    // tier yield at a limit; saturating its deficit to zero would suppress this case.
+    let need: varena::Need = Arc::new(|| Some(0));
     let pressure = if watch {
         let pressure = Pressure::arm(HostMode::Dedicated).unwrap();
         assert!(pressure.how().contains("no psi trigger") && pressure.how().contains("inotify"), "{}", pressure.how());
@@ -130,8 +130,6 @@ fn scenario(watch: bool) {
     let before = resident();
     assert!(before >= LAYOUT * LAYOUTS as u64, "the normal RAM-tier path actually filled the layouts: {before}");
     cache(dir.path(), CACHE);
-    // The growing caller has no measured bound: the same Need contract the ledger publishes.
-    unmeasured.store(true, Ordering::Release);
     let killed = event(&cgroup, "oom_kill");
     let status = call(CALL);
     let (oom_kill, max) = (event(&cgroup, "oom_kill"), event(&cgroup, "max"));
