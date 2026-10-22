@@ -1,6 +1,6 @@
 [package]
 name = "varena"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2021"
 publish.workspace = true
 description = "The memory of the process computing with model weights: GPU pages, slots and pins; the sealed host tier."

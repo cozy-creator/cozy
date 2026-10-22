@@ -411,6 +411,44 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
     assert_eq!(child.read_decoded("packed").unwrap_err().kind, Kind::UnknownScheme);
 }
 
+/// A lane made on a fresh machine (`cozy model quantize`, run 12924): the base opened lazily
+/// holds only its header, and the commit fetches what it carries over, on the grid and off it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_writer_on_a_lazy_base_fetches_what_it_carries_over() {
+    let scratch = Scratch::new();
+    let endpoint = scratch.0.join("endpoint");
+    let publisher = client(&scratch.0.join("cache"), &endpoint);
+    let big: Vec<u8> = (0..20u32 << 20).map(|i| (i % 251) as u8).collect();
+    let options = WriterOptions { repo_id: Some("acme/lazy"), ..WriterOptions::default() };
+    let mut writer = publisher.writer(options).unwrap();
+    {
+        let class = ClassRef::new("test", "1.0", "Encoder");
+        let mut encoder = writer.component("text_encoder", class, Default::default(), None).unwrap();
+        encoder.put("big", Dtype::U8, &[big.len() as u64], &mut std::io::Cursor::new(&big)).unwrap();
+        encoder.put("small", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT)).unwrap();
+        encoder.asset("tokenizer.json", ASSET).unwrap();
+    }
+    (writer.component("transformer", ClassRef::new("test", "1.0", "Model"), Default::default(), None).unwrap())
+        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(b"aaaa"))
+        .unwrap();
+    let published = writer.commit().await.unwrap();
+
+    let fresh = client(&scratch.0.join("fresh"), &endpoint);
+    let base = fresh.open(&format!("acme/lazy@{}", published.id().id()), &Open::default()).await.unwrap();
+    assert!(!base.missing(&Selection::All).unwrap().is_empty(), "the base is lazy");
+    let mut lane = fresh.writer(WriterOptions { base: Some(&base), ..WriterOptions::default() }).unwrap();
+    (lane.component_writer("transformer").unwrap())
+        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(b"qqqq"))
+        .unwrap();
+    let made = lane.commit().await.unwrap();
+    assert!(made.missing(&Selection::All).unwrap().is_empty());
+    let encoder = made.component("text_encoder").unwrap();
+    assert!(encoder.read_decoded("big").unwrap() == big);
+    assert_eq!(encoder.read_decoded("small").unwrap(), WEIGHT);
+    assert_eq!(encoder.asset("tokenizer.json").unwrap(), ASSET);
+    assert_eq!(made.component("transformer").unwrap().read_decoded("w").unwrap(), b"qqqq");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn read_into_decodes_an_encoded_tensor_only_when_asked() {
     let scratch = Scratch::new();

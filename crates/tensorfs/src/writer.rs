@@ -796,6 +796,26 @@ impl Writer {
         Ok(())
     }
 
+    /// The base objects `commit` carries over: the chunks of every base tensor not written
+    /// again, and the base's assets. A lazily opened base holds only what was read, so the
+    /// session fetches the absent ones before it commits.
+    pub fn carried(&self) -> Result<Vec<ObjectRef>> {
+        let Some(base) = &self.base else { return Ok(Vec::new()) };
+        let header = base.header();
+        let mut out = Vec::new();
+        for c in base.components() {
+            for t in &c.tensors {
+                if self.tensors.get(&(c.name.clone(), t.key.clone())).is_none() {
+                    for (_, at) in base.tensor(&c.name, &t.key)?.locations() {
+                        out.extend(header.spans(&at).iter().map(|s| header.chunks[s.chunk].clone()));
+                    }
+                }
+            }
+            out.extend(c.assets.values().cloned());
+        }
+        Ok(out)
+    }
+
     /// `from`'s tensor as an entry of this writer: a large part on the grid keeps its objects
     /// (copied here when absent), one laid off the grid is split onto it, a small one goes to
     /// the spool.

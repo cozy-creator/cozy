@@ -4154,7 +4154,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -4188,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-py"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4717,7 +4717,7 @@ dependencies = [
 
 [[package]]
 name = "varena"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "libc",
  "platform",

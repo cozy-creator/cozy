@@ -88,8 +88,11 @@ impl Tree {
             Some((Some(v), r)) => Ok((v, r)),
             _ => {
                 let has: Vec<&str> = self.variants().map(|(v, _)| v).collect();
-                let want = variant.map_or("its only variant".into(), |v| format!("variant {v:?}"));
-                invalid(format!("the tree has no {want} (has {has:?})"))
+                invalid(match variant {
+                    Some(v) => format!("the tree has no variant {v:?} (has {has:?})"),
+                    None if has.is_empty() => "the tree has no variant".into(),
+                    None => format!("the tree has several variants; name one of {has:?}"),
+                })
             }
         }
     }

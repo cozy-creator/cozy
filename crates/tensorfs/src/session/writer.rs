@@ -8,7 +8,7 @@ use crate::format::{ClassRef, Config, Dtype, Encoding, ObjectRef, Tree, Value};
 use crate::store::Store;
 use crate::writer::{self as native, Data, Source};
 
-use super::{Checkpoint, Client, Component, Endpoint, Ref, TokenProvider};
+use super::{Checkpoint, Client, Component, Download, Endpoint, Ref, TokenProvider};
 
 /// Input for an explicitly encoded tensor, exposed by the public raw namespace.
 pub struct PartData<'a> {
@@ -34,6 +34,7 @@ pub struct WriterOptions<'a> {
 #[derive(Clone)]
 struct Context {
     store: Store,
+    base: Option<Checkpoint>,
     dest: Option<PathBuf>,
     variant: String,
     repo_id: Option<String>,
@@ -151,6 +152,7 @@ impl Client {
             })),
             context: Context {
                 store,
+                base: options.base.cloned(),
                 dest,
                 variant,
                 repo_id: options.repo_id.map(str::to_owned),
@@ -321,6 +323,10 @@ impl Writer {
     /// Sealing/final publication is a transaction. Its owned worker keeps the result available
     /// through committed(), even if a caller drops the awaiting future before it settles.
     pub async fn commit(&mut self) -> Result<Checkpoint> {
+        if let Some(base) = self.context.base.clone() {
+            let carried = self.with(|raw| raw.carried().map_err(from_writer))?;
+            base.fetch_objects_exact(&carried, &Download::default()).await?;
+        }
         let raw = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(raw) = state.native.take() else {

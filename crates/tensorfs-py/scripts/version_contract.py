@@ -24,8 +24,8 @@ PACKAGE = "tensorfs"
 # (the limited API's buffer protocol starts at 3.11). The floor is real; there is no ceiling.
 PYTHON_SPEC = ">=3.10"
 WHEEL_ABIS = (["cp311", "abi3"], ["cp310", "cp310"])
-CURRENT_CARGO_VERSION = "0.13.0"
-CURRENT_PYTHON_VERSION = "0.13.0"
+CURRENT_CARGO_VERSION = "0.13.1"
+CURRENT_PYTHON_VERSION = "0.13.1"
 
 
 def _toml(path: pathlib.Path) -> dict[str, object]:
