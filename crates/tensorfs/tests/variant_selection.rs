@@ -23,6 +23,13 @@ async fn local_and_static_origin_select_nested_headers_without_tensor_payloads()
     let cpu = Open {gpus:Some(vec![]),bits:Some(16),..Default::default()};
     let selected = client.open(folder.to_str().unwrap(),&cpu).await.unwrap();
     assert_eq!(selected.variant(),Some("model.int8.cozytensors"));
+    let inspect = std::process::Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .env("CUDA_VISIBLE_DEVICES", "")
+        .args(["--json", "--store", scratch.path().join("cli-cache").to_str().unwrap(), "inspect", folder.to_str().unwrap()])
+        .output().unwrap();
+    assert!(inspect.status.success(), "{}", String::from_utf8_lossy(&inspect.stdout));
+    let inspected: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(inspected["variant"], "model.int8.cozytensors", "data commands retain the shared choice when it fits");
     let legacy = Open {variant:Some("int8".into()),..cpu.clone()};
     assert_eq!(client.open(folder.to_str().unwrap(),&legacy).await.unwrap().id(),selected.id());
     // A static repo has only the tree and headers. No chunks exist anywhere.
