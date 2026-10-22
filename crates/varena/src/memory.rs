@@ -1484,9 +1484,9 @@ impl Inner {
     }
 
     /// A stale page (another fill identity, or a transform released undone) nobody pins is
-    /// filled again in place: its mapping and memory stay, the copy waits in-stream on its
-    /// pending release events, and its binder waits in-stream on the fill. No host thread waits
-    /// on a device event.
+    /// filled again in place: its mapping stays and the copy waits in-stream on its pending
+    /// release events. Preparation may wait outside capture/replay for the source/staging
+    /// owners' copy completion; resident replay never performs this preparation.
     fn refill_in_place(&self, st: &mut State, key: Key, req: Option<u64>) -> Result<()> {
         let (va, off, span) = st.place(key)?;
         let identity = st.mech(key.0)?.spec.fingerprint.key();
@@ -3047,6 +3047,12 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
     while let Some((ticket, bytes, op)) = queue.next() {
         let Some(me) = inner.upgrade() else { return };
         me.mechanism(op);
+        if me.check_ownership().is_err() {
+            // The fault path retained the executor and uncertain resources. Tickets finish so
+            // callers can retire it, but physical bytes are never advertised as returned.
+            queue.sent(ticket, 0);
+            continue;
+        }
         let mut st = me.lock();
         // Publish only after refresh will also read the physically completed byte count.
         // The ticket remains live until this worker releases its Memory owner below.
@@ -3421,17 +3427,24 @@ impl Pass {
 
 impl Inner {
     /// Runs one mechanism call (the state lock free), then applies its result under it.
-    fn mechanism(&self, op: Mech) {
+    fn mechanism(self: &Arc<Self>, op: Mech) {
+        if self.check_ownership().is_err() {
+            std::mem::forget(op);
+            return;
+        }
         match op {
             Mech::Map { key, gen, va, off, span, job, speculative, decided } => self.place_page(key, gen, va, off, span, job, (!speculative).then_some(decided)),
             Mech::Renew { key, gen, va, off, span, old, after, job } => {
                 // Its consumers finish before the unmap: this thread waits for their events.
-                for e in &after {
-                    if let Err(e) = self.backend.finish(*e) {
-                        tracing::warn!("varena: waiting for a renewed page's consumers failed: {e}");
-                    }
+                let released = after.iter().try_for_each(|e| self.backend.finish(*e))
+                    .and_then(|()| self.backend.unmap(va, off, span));
+                if let Err(error) = released {
+                    tracing::warn!("varena: renewed page ownership could not be released: {error}");
+                    self.ownership_lost.store(true, Ordering::Release);
+                    self.landed.notify_all();
+                    std::mem::forget((self.clone(), old, after));
+                    return;
                 }
-                let _ = self.backend.unmap(va, off, span);
                 if let Some(old) = old {
                     self.backend.destroy(old);
                 }
@@ -3465,8 +3478,12 @@ impl Inner {
                 }
             }
             Mech::Unmap { va, off, span, phys, ready } => {
-                if let Err(e) = self.backend.unmap(va, off, span) {
-                    tracing::warn!("varena: unmapping failed: {e}");
+                if let Err(error) = self.backend.unmap(va, off, span) {
+                    tracing::warn!("varena: page ownership could not be released: {error}");
+                    self.ownership_lost.store(true, Ordering::Release);
+                    self.landed.notify_all();
+                    std::mem::forget((self.clone(), phys, ready));
+                    return;
                 }
                 if let Some(p) = phys {
                     self.backend.destroy(p);

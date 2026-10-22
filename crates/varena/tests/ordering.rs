@@ -1368,5 +1368,5 @@ fn failed_renewal_child() {
     assert_eq!(events.unmaps.load(Ordering::SeqCst), 0, "an uncertain consumer's mapping survives all public owners");
     assert!(!events.retired.lock().contains(&pending), "uncertain event stays owned");
     // SAFETY: the fault path must retain the original mapping through executor exit.
-    assert_eq!(unsafe { *(ptr as *const u8) }, 0x11);
+    assert_eq!(unsafe { *(ptr as *const u8) }, 7);
 }
