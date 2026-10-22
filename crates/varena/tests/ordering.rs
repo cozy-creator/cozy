@@ -1075,6 +1075,30 @@ fn a_waiting_unmap_holds_no_lock() {
     binder.join().unwrap();
 }
 
+/// A GPU load with no request open (warm-phase work) returns once its fill's event completed
+/// and its page is custody's: a crash right after it leaves the page kept.
+#[test]
+fn an_idle_gpu_load_returns_with_its_pages_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("idleload-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 64 << 20 };
+    let _scope = Scope::new(&g.uuid);
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    let exports = || events.kept.lock().iter().filter(|c| **c == "export").count();
+    events.pending_fences.store(true, Ordering::SeqCst);
+    let loader = {
+        let (mem, spec) = (mem.clone(), stored(dir.path(), &uuid, "p", 1));
+        std::thread::spawn(move || mem.load(spec, Level::Gpu).unwrap())
+    };
+    // The load waits on its fill's pending event.
+    events.await_log(|log| log.contains(&"finish"));
+    assert!(!loader.is_finished() && exports() == 0, "returned or kept before its copies landed");
+    events.fences.lock().iter().for_each(|e| events.complete(*e));
+    loader.join().unwrap();
+    assert_eq!(exports(), 1, "the load returns with its page custody's");
+}
+
 /// Review 5, R1 and R3 (the reviewer's probe, event-driven): a Keep queued behind slow
 /// mechanism work never protects the page a refill hands out. A page with a Keep queued is
 /// renewed (a fresh page, a new life) and the stale Keep is dropped; the renewal unmaps the old
@@ -1088,11 +1112,13 @@ fn a_page_with_a_keep_queued_is_renewed_after_its_consumers() {
     let events = Arc::new(Events::default());
     let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
     let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Gpu).unwrap();
-    mem.settle();
-    // P's fill lands as an event still pending, so its Keep waits for it.
+    // Loaded inside a request, P returns with its fill's event pending; the request's end
+    // queues its Keep, which waits for that event.
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
     events.pending_fences.store(true, Ordering::SeqCst);
     let p = mem.load(stored(dir.path(), &uuid, "p", 1), Level::Gpu).unwrap();
     let filled = *events.fences.lock().last().unwrap();
+    r.end();
     // A consumer binds P and lets go: its release event is pending.
     drop(mem.bind(p, 0, 1).unwrap());
     let release = events.next.load(Ordering::SeqCst);
