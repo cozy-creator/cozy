@@ -482,7 +482,7 @@ impl PyMemory {
             }
             Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0)
         };
-        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, None, shrink))).map(|c| c.0)
+        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, &[], shrink))).map(|c| c.0)
     }
 
     fn cached(&self, py: Python<'_>, cache: u32, nbytes: u64) -> PyResult<()> {

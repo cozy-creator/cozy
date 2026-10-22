@@ -619,7 +619,7 @@ fn a_components_cache_goes_at_its_class_turn_before_its_pages() {
     for k in [(0, 0), (1, 0), (1, 1), (2, 0)] {
         map(&mut t, k);
     }
-    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), set: Some(1), bytes: MB, last_use: 0 });
+    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), sets: vec![1], bytes: MB, last_use: 0 });
     (t.allocated, t.reserved) = (MB, MB);
     let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(2 * MB), unmeasured: 0, tried: Tried::default() });
     assert_eq!(a, vec![Action::Unmap { page: (2, 0), class: Class::N }, Action::Shrink { cache: 7, bytes: MB }, Action::Reserve { req: 1, room: 2 * MB, measured: true }]);
@@ -630,7 +630,7 @@ fn a_components_cache_goes_at_its_class_turn_before_its_pages() {
         map(&mut t, k);
         t.page_mut(k).unwrap().last_use = used;
     }
-    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), set: Some(1), bytes: MB, last_use: 8 });
+    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), sets: vec![1], bytes: MB, last_use: 8 });
     (t.allocated, t.reserved) = (MB, MB);
     let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(3 * MB), unmeasured: 0, tried: Tried::default() });
     assert_eq!(&a[..3], &[Action::Unmap { page: (2, 0), class: Class::N }, Action::Shrink { cache: 7, bytes: MB }, Action::Unmap { page: (1, 0), class: Class::N }], "{a:?}");
@@ -667,5 +667,20 @@ fn an_oom_again_at_a_site_without_progress_cuts_finer() {
     t.requests[0].outside.insert(("split:x".into(), "k".into()), 3);
     t.requests[0].retried = Some(Retried { site: "split:x".into(), shape: "k".into(), level: 3, at: 3 * MB });
     assert!(matches!(oom(&t, None).as_slice(), [Action::Exhausted { .. }]), "{:?}", oom(&t, None));
+}
+
+/// Lead's ruling: a pool shared by a serialized domain's components (the TE, the UNet and the
+/// VAE) takes the most protective class among them, at the nearest one's distance: D while any
+/// is declared, N once none is.
+#[test]
+fn a_cache_serving_several_components_takes_the_nearest_ones_class() {
+    let mut t = table(8 * MB, vec![set("te", 1, MB), set("unet", 1, MB), set("vae", 1, MB)], vec![(vec![0], 1), (vec![1], 1), (vec![2], 1)]);
+    let pool = Cache { id: 3, owner: "graphs:domain".into(), sets: vec![0, 1, 2], bytes: MB, last_use: 0 };
+    t.caches.push(pool.clone());
+    assert_eq!((t.cache_class(&pool), t.cache_distance(&pool)), (Class::D, Some((0, 1, u32::MAX))), "the TE's step runs now");
+    t.requests[0].cursor.step = 2;
+    assert_eq!((t.cache_class(&pool), t.cache_distance(&pool)), (Class::D, Some((0, 1, u32::MAX))), "the VAE's");
+    t.requests[0].cursor.step = 3;
+    assert_eq!(t.cache_class(&pool), Class::N, "no set of it declared any more");
 }
 

@@ -775,3 +775,24 @@ fn a_tiled_step_keeps_its_pages_w_through_every_tile() {
     drop(r);
 }
 
+/// S4's capture admission: a request's spare bytes are what it could have beside every W and P
+/// without evicting either, read without the state lock. Idle pages count; the current step's
+/// pages do not.
+#[test]
+fn spare_bytes_count_idle_pages_never_the_current_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("spare", 16 * MB);
+    mem.load(set(dir.path(), "n", 2, &g.uuid), Level::Gpu).unwrap();
+    let b = mem.load(set(dir.path(), "b", 2, &g.uuid), Level::Ram).unwrap();
+    mem.settle();
+    let r = mem.request("spare", plan("b")).unwrap();
+    let before = r.spare();
+    assert_eq!(before, 16 * MB, "an idle card: every byte, the idle set's included");
+    let pass = r.pass(b, "fwd", "1x8", Torch::default()).unwrap();
+    for block in 0..2 {
+        drop(mem.bind(b, block, 0).unwrap());
+    }
+    assert_eq!(before - r.spare(), 2 * REGION_ALIGN, "the current step's pages are W: not spare");
+    pass.end(Measured::default(), Torch::default());
+}
+

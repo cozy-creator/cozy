@@ -1045,6 +1045,8 @@ struct Inner {
     /// The allocator's limit as the last publication computed it, and the bytes the callback
     /// reclaimed from the stock since (not yet in a publication): read without the state lock.
     limit: AtomicU64,
+    /// [`Table::spare`] as the last publication computed it: read without the state lock.
+    spare: AtomicU64,
     unreconciled: AtomicU64,
     /// The callback's stock of reclaimable pages, and its reclaims (page, gen, bytes, whether
     /// the driver gave them back) for the state to reconcile.
@@ -1129,6 +1131,7 @@ impl Memory {
                 public_owners: AtomicU64::new(0),
                 native_resident: AtomicU64::new(0),
                 limit: AtomicU64::new(0),
+                spare: AtomicU64::new(0),
                 unreconciled: AtomicU64::new(0),
                 stock_tx,
                 stock,
@@ -1187,17 +1190,18 @@ impl Memory {
     }
 
     /// Registers bytes the caller holds (torch tensors) that `shrink(want) -> freed` gives back.
-    /// A cache whose `owner` is a request id ends with that request. One serving a component
-    /// (`set`: its graph pool, its decode cache) takes that set's class and goes before its
+    /// A cache whose `owner` is a request id ends with that request. One serving components
+    /// (`sets`: a component's graph pool or decode cache, a pool shared by a serialized
+    /// domain's components) takes the most protective class among them and goes before their
     /// pages; one serving none is N.
-    pub fn cache(&self, owner: &str, set: Option<SetId>, shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
+    pub fn cache(&self, owner: &str, sets: &[SetId], shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
         let shrink: Shrink = Arc::new(shrink);
         self.inner
             .guard(|| {
                 let mut st = self.inner.lock();
                 let id = st.tick() as u32;
                 let last_use = st.clock;
-                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), set: set.map(|s| s.0), bytes: 0, last_use });
+                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), sets: sets.iter().map(|s| s.0).collect(), bytes: 0, last_use });
                 st.shrinks.insert(id, shrink);
                 self.inner.unlock(st);
                 Ok(CacheId(id))
@@ -1821,6 +1825,7 @@ impl Inner {
     /// pages changed) the stock of pages it may reclaim.
     fn offer(&self, st: &mut State) {
         self.limit.store(st.table.torch_limit(), Ordering::Release);
+        self.spare.store(st.table.spare(), Ordering::Release);
         if !std::mem::take(&mut st.restock) {
             return;
         }
@@ -4019,6 +4024,13 @@ impl Request {
     /// and destroyed by this thread with no state lock held; the state reconciles them at its
     /// next lock. No Python or torch, peer RPC, mechanism queue or wait on device work; broader
     /// reclaim is preparation's (design §1). Returns the bytes given back.
+    /// Bytes the request could have now beside every W and P without evicting either (free,
+    /// S, N and D pages, caches, the allocator's slack), as the last publication measured them:
+    /// read without the state lock, for a capture's room before it captures (S4).
+    pub fn spare(&self) -> u64 {
+        self.inner.spare.load(Ordering::Acquire)
+    }
+
     pub fn reclaim_allocation(&self, need: u64) -> Result<u64> {
         self.inner.check_ownership()?;
         self.inner.reclaim_stock(need)

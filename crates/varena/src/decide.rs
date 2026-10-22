@@ -464,7 +464,7 @@ impl<'a> Demand<'a> {
         for c in caches {
             let order = match class {
                 Class::N => {
-                    let oldest = t.pages().filter(|(k, p)| Some(k.0) == c.set && p.mapped).map(|(_, p)| p.last_use).min();
+                    let oldest = t.pages().filter(|(k, p)| c.sets.contains(&k.0) && p.mapped).map(|(_, p)| p.last_use).min();
                     (oldest.map_or(c.last_use, |o| o.min(c.last_use)), 0, 0, 0)
                 }
                 _ => t.cache_distance(c).map_or((0, 0, 0, 0), |d| (0, u32::MAX - d.0, u32::MAX - d.1, u32::MAX - d.2)),
