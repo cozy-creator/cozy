@@ -283,6 +283,10 @@ class Binding:
         self.closed = False
         # Covers input copies, launch, and output uses: each graph has one static buffer set.
         self.lock = threading.RLock()
+        self.last: torch.cuda.Event | None = None
+        if model.memory.cuda:
+            self.last = torch.cuda.Event()
+            self.last.record(torch.cuda.current_stream(model.memory.device))
 
     @contextmanager
     def prepare(self, stream: torch.cuda.Stream | int | None = None) -> Iterator[Binding]:
@@ -298,6 +302,8 @@ class Binding:
                 elif isinstance(stream, int):
                     stream = torch.cuda.ExternalStream(stream, device=memory.device)
             with torch.cuda.stream(stream) if memory.cuda else nullcontext():
+                if self.last is not None:
+                    stream.wait_event(self.last)
                 memory.native.fill(self.model.id, _fill(self.model.fill))
                 pins = self.native.prepare(stream.cuda_stream if stream is not None else 0)
                 held: list[_Block] = []
@@ -312,6 +318,13 @@ class Binding:
                             held.append(block)
                     yield self
                 finally:
+                    if self.last is not None:
+                        try:
+                            self.last.record(stream)
+                        except BaseException:
+                            self.closed = True
+                            self.quarantined = pins
+                            raise
                     # `_exit` joins a caller's current consumer stream back to each bind stream.
                     # More streams must be joined by the caller before leaving this scope.
                     for block in reversed(held):
