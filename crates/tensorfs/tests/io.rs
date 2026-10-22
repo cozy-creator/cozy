@@ -587,3 +587,80 @@ fn host_read_speed() {
         assert!(b.bytes() == ck.read(c, k).unwrap(), "{c}/{k}");
     }
 }
+
+/// `ReadOpts::landed` hears of every host copy, the empty one too, once each.
+#[test]
+fn landed_tells_each_host_copy_once() {
+    let src = noise(3, 3 * MIB + 5);
+    let (mut a, mut b, mut empty) = (vec![0u8; MIB], vec![0u8; 2 * MIB + 5], [0u8; 0]);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let heard = seen.clone();
+    let landed = io::Landed(std::sync::Arc::new(move |copy| heard.lock().unwrap().push(copy)));
+    let opts = ReadOpts { landed: Some(landed), ..ReadOpts::default() };
+    let copies = [
+        Copy { src: Src::Host(src.as_ptr()), dst: Dst::host(&mut a) },
+        Copy { src: Src::Host(src[MIB..].as_ptr()), dst: Dst::host(&mut b) },
+        Copy { src: Src::Zero, dst: Dst::host(&mut empty) },
+    ];
+    unsafe { io::read(&copies, &opts) }.unwrap();
+    let mut heard = seen.lock().unwrap().clone();
+    heard.sort();
+    assert_eq!(heard, [0, 1, 2]);
+    assert!(a == src[..MIB] && b == src[MIB..]);
+}
+
+/// `ReadOpts::landed` on a device: each copy (staged from host memory in several pieces, staged
+/// from a file, a direct zero fill, an empty one, a small one) is heard of exactly once, and when
+/// it is, all its bytes on the device are already the source's (read back in the callback itself).
+#[test]
+#[ignore = "requires an allocated CUDA GPU; no mock driver"]
+fn landed_tells_each_device_copy_once_after_its_bytes_land() {
+    let scratch = Scratch::new("landed");
+    let host = noise(5, 5 * MIB + 3);
+    let filed = noise(6, 3 * MIB);
+    let path = scratch.0.join("filed");
+    fs::write(&path, &filed).unwrap();
+    let file = fs::File::open(&path).unwrap();
+    let small = noise(7, 100);
+    let expected: Vec<Vec<u8>> = vec![host.clone(), filed.clone(), vec![0; MIB], vec![], small.clone()];
+    let total: usize = expected.iter().map(|e| e.len().next_multiple_of(io::DEVICE_ALIGN)).sum();
+    let buffer = io::DeviceBuffer::new(0, total).unwrap();
+    let mut at = buffer.ptr();
+    let places: Vec<(u64, usize)> = expected
+        .iter()
+        .map(|e| {
+            let place = (at, e.len());
+            at += e.len().next_multiple_of(io::DEVICE_ALIGN) as u64;
+            place
+        })
+        .collect();
+    let ctx = buffer.context() as usize;
+    let checks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (heard, want, where_) = (checks.clone(), expected.clone(), places.clone());
+    // The callback reads its copy back from the device on its own: the bytes must be there.
+    let landed = io::Landed(std::sync::Arc::new(move |copy: usize| {
+        let (ptr, len) = where_[copy];
+        let mut back = vec![0u8; len];
+        if len > 0 {
+            let _ctx = io::cuda::CtxGuard::enter(ctx as io::cuda::CUcontext).unwrap();
+            let d = io::cuda::driver().unwrap();
+            io::cuda::check("cuMemcpyDtoH", unsafe { (d.memcpy_dtoh)(back.as_mut_ptr().cast(), ptr, len) }).unwrap();
+        }
+        heard.lock().unwrap().push((copy, back.iter().zip(&want[copy]).filter(|(a, b)| a == b).count()));
+    }));
+    let dst = |i: usize| Dst::Device { device: 0, ptr: places[i].0, len: places[i].1, stream: 0 };
+    let copies = [
+        Copy { src: Src::Host(host.as_ptr()), dst: dst(0) },
+        Copy { src: Src::File(&file, 0), dst: dst(1) },
+        Copy { src: Src::Zero, dst: dst(2) },
+        Copy { src: Src::Zero, dst: dst(3) },
+        Copy { src: Src::Host(small.as_ptr()), dst: dst(4) },
+    ];
+    let opts = ReadOpts { landed: Some(landed), ..ReadOpts::default() };
+    unsafe { io::read(&copies, &opts) }.unwrap();
+    let mut heard = checks.lock().unwrap().clone();
+    heard.sort();
+    let lens: Vec<usize> = expected.iter().map(Vec::len).collect();
+    assert_eq!(heard, lens.iter().copied().enumerate().collect::<Vec<_>>(), "each copy once, all its bytes landed when told");
+    println!("PASS landed: {} copies, {} calls, each copy's bytes all on the device at its call ({lens:?})", copies.len(), heard.len());
+}
