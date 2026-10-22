@@ -116,6 +116,13 @@ class Placeholder(Tensor):
     def __repr__(self) -> str:  # type: ignore[override]
         return f"Placeholder({tuple(self.shape)}, {self.dtype}, {self.device})"
 
+    def _varena_read(self) -> Tensor:
+        """Its block bound now, for a read no op sees too (a compiled extension's or Triton's
+        launch reads it by pointer, which is 0 here): the bound tensor, which with its views
+        holds the pin until it dies. A loaded model's placeholder carries its own; this one
+        belongs to none."""
+        raise Unbound("a weight of no loaded model, with no pin bound")
+
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
         aten, kwargs = torch.ops.aten, kwargs or {}
@@ -125,18 +132,13 @@ class Placeholder(Tensor):
             held = args[0]
             dtype, device = kwargs.get("dtype") or held.dtype, kwargs.get("device") or held.device
             made = cls(held.shape, dtype, device)
-            read = getattr(held, "_varena_read", None)
-            if read is not None:
+            if "_varena_read" in vars(held):  # a loaded model's: the copy reads converted
+                read = held._varena_read
                 made._varena_read = lambda: read().to(device=device, dtype=dtype)
             return made
 
         def bound(a: object) -> object:
-            if not isinstance(a, Placeholder):
-                return a
-            read = getattr(a, "_varena_read", None)
-            if read is None:
-                raise Unbound(f"{func}: a weight of no loaded model, with no pin bound")
-            return read()
+            return a._varena_read() if isinstance(a, Placeholder) else a
 
         args, kwargs = tree_map(bound, (args, kwargs))
         return func(*args, **kwargs)
@@ -563,6 +565,7 @@ class Memory:
     def request(self, id: str, plan: Sequence[object] = ()) -> Iterator[Request]:
         """Request `id` and its plan: its steps in order, each a model (`Model`, module or set
         name) or a collection of models that run together. Leaving ends it."""
+        self._fold()  # its outside-pass peak starts here
         r = Request(self, self.native.request(id, self._plan(plan)))
         self.requests[r] = None
         token = _request.set(r)
@@ -576,6 +579,7 @@ class Memory:
                 failed.add_note(f"ending request {id!r} also failed: {ending!r}")  # the request's own error stays the one raised
             raise
         else:
+            self._fold()  # its last interval outside any pass
             r.ended = r.native.end()
         finally:
             _request.reset(token)
@@ -676,7 +680,10 @@ class Memory:
 
     def _fold(self, discard: _Pass | None = None) -> None:
         """The allocator's peaks since the last reset into every open pass and its open sites,
-        but `discard`'s (a failed attempt's); then the reset. The only place peaks reset."""
+        but `discard`'s (a failed attempt's); with no pass open, into the outside-pass peak of
+        the one request open. torch's peak is the device's and the process's, not a request's:
+        with several open, none of them is measured. Then the reset. The only place peaks
+        reset."""
         with self.measuring:
             peak, reserved = self.torch.peaks()
             for p in self.passes:
@@ -684,6 +691,13 @@ class Memory:
                     p.peak, p.reserved_peak = max(p.peak, peak), max(p.reserved_peak, reserved)
                     for entry in p.open:
                         entry[1] = max(entry[1], peak)  # type: ignore[call-overload]
+            if not self.passes:
+                if len(self.requests) == 1:
+                    r = next(iter(self.requests))
+                    r.outside = max(r.outside, peak - r.base)
+                else:
+                    for r in self.requests:
+                        r.alone = False
             self.torch.reset()
 
     # -- passes
@@ -878,6 +892,12 @@ class Request:
     def __init__(self, memory: Memory, native: NativeRequest) -> None:
         self.memory, self.native = memory, native
         self.ended: Stats | None = None
+        #: torch's allocation at its start, and the most it held beyond that while no pass was
+        #: open (its inputs, the tensors between its models, its call setup); measured only while
+        #: it was the one request open (`alone`)
+        self.base = memory.torch.now()[0]
+        self.outside = 0
+        self.alone = True
         #: torch's allocator churn over its passes (retries, device allocs and frees, syncs)
         self.churn: dict[str, int] = {}
         #: (set, block) -> bytes kept bound in it for weight tensors that outlived their run
@@ -963,6 +983,11 @@ class Request:
 
     def stats(self) -> Stats:
         return self.ended if self.ended is not None else self.native.stats()
+
+    @property
+    def outside_measured(self) -> int | None:
+        """Its outside-pass peak, or None when another request was open beside it."""
+        return self.outside if self.alone else None
 
     def spare(self) -> int:
         """Bytes this request could have now beside every working-set and pinned page without
