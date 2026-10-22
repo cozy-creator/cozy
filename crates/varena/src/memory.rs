@@ -738,9 +738,8 @@ struct State {
     single: HashSet<(u32, String, String)>,
     /// The finest level each site's op has, as its OOMs and measured rooms said.
     finest: HashMap<(u32, String, String), u32>,
-    /// Pages whose create found less device memory than the table showed (a foreign
-    /// allocation landed meanwhile), with their bytes and the free bytes measured then: a bind
-    /// that measures the same again knows nothing more and ends exhausted.
+    /// Pages whose create the driver refused, with their bytes and the driver's free bytes
+    /// measured at the refusal.
     short: HashMap<Key, (u64, u64)>,
     stuck: BTreeSet<(u32, String, String)>,
     /// The room each cut configuration failed at.
@@ -2443,13 +2442,14 @@ impl Inner {
             if matches!(trigger, Trigger::Oom { .. }) {
                 st.table.headroom = u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0);
             }
-            // A real allocation failure can precede an unchanged free-byte report (driver
-            // metadata, granularity or delayed release). Try the ordinary eviction ladder
-            // for additional room instead of declaring exhaustion while idle pages remain.
+            // A refused create: the driver's free bytes then are the truth over the table's
+            // estimate (a release not yet landed, a foreign allocation, the driver's own
+            // metadata). The ladder evicts past them, or the bind ends exhausted by the bytes
+            // the driver lacked.
+            // It holds for the decision right after the refusal only: that decision's own
+            // evictions are counted, and a later refusal measures again.
             if let Trigger::Bind { page, tried, .. } = &mut trigger {
-                if let Some((_, at)) = st.short.remove(page) {
-                    if at == st.table.free() { tried.failed_free = Some(at); }
-                }
+                tried.driver_free = st.short.remove(page).map(|(_, free)| free);
             }
             let actions = decide(&st.table, &trigger);
             let (mut remote, mut shrinks, mut freed) = (vec![], vec![], 0);
@@ -4349,11 +4349,12 @@ impl Inner {
                         // The device had less than the table showed: the bind measures and
                         // decides again.
                         error @ Error::Device { code: crate::backend::OUT_OF_MEMORY, .. } => {
-                            tracing::debug!(target: "varena::memory", ?key, ?error, span, decided,
+                            let driver_free = self.backend.free().unwrap_or(0);
+                            tracing::debug!(target: "varena::memory", ?key, ?error, span, decided, driver_free,
                                 estimated_free = st.table.free(), mapped = st.table.mapped(),
                                 pending = st.table.pending, inflight = st.table.inflight,
-                                "physical allocation refused; another bind must make progress");
-                            st.short.insert(key, (span, decided.unwrap_or(0)));
+                                "physical allocation refused; the bind decides again on the driver's free bytes");
+                            st.short.insert(key, (span, driver_free));
                         }
                         e => drop(st.failed.insert(key, e)),
                     }

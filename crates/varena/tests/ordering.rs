@@ -734,9 +734,14 @@ fn a_create_short_of_memory_decides_again() {
     let cold: u64 = ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum();
     assert_eq!(cold, 0, "the cold page went for it");
     drop(pin);
-    // Everything else lands: nothing is left to give, and the bind says so.
+    // Everything else lands: nothing is left to give (the first page's consumer still reads
+    // it), and the bind says so, short by what the page lacks of the measured free half page
+    // (S2's v2-native: never "1 byte short" from a stale estimate).
     events.lands.store(4 * REGION_ALIGN, Ordering::SeqCst);
-    assert!(matches!(mem.bind(a, 1, 0), Err(varena::Error::Exhausted(_))));
+    match mem.bind(a, 1, 0) {
+        Err(varena::Error::Exhausted(e)) => assert_eq!(e.need, REGION_ALIGN / 2, "{e:?}"),
+        other => panic!("exhausted: {:?}", other.map(|p| p.ptr)),
+    }
 }
 
 /// A card's view of memory: a page's bytes are in use while any handle to them lives, the
