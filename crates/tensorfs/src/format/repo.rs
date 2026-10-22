@@ -9,14 +9,14 @@ use pep440_rs::Version;
 use serde::{Deserialize, Serialize};
 
 use super::doc::{is_digest, path, segment};
-use super::{check_format, invalid, json, variant_of, variant_path, Error, ObjectRef, Result};
+use super::{check_format, invalid, json, variant_of, variant_path, Error, ObjectRef, Result, VARIANT_EXTENSION};
 use super::{REPO_FORMAT, TREE_FORMAT};
 
 /// The folder that holds a plain folder's chunks and assets: no repo file lives under it.
 pub const CHUNKS_DIR: &str = "chunks";
 
-/// `cozytensors.tree/1`: a commit, a repo state as files, as on HF. Each `model.<variant>.cozytensors` is
-/// a variant's header; every other file (README, LICENSE, images) is a blob shared by them all.
+/// `cozytensors.tree/1`: a commit, a repo state as files, as on HF. Each `.cozytensors` file, at any
+/// path, is a variant's header; every other file (README, LICENSE, images) is a blob shared by them all.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(try_from = "TreeWire", into = "TreeWire")]
 pub struct Tree {
@@ -65,36 +65,43 @@ impl Tree {
         json::write(self)
     }
 
-    /// Each variant (`""` for `model.cozytensors`) and its header, by variant name.
+    /// Each variant and its header, by name (its path).
     pub fn variants(&self) -> impl Iterator<Item = (&str, &ObjectRef)> {
         (self.files.iter()).filter_map(|(p, r)| Some((variant_of(p)?, r)))
     }
 
-    /// The header of `variant`.
-    pub fn header(&self, variant: &str) -> Option<&ObjectRef> {
-        self.files.get(&variant_path(variant))
+    /// The variant `name` names (spec §3): the one at that path, else at it with the extension
+    /// added; (its path, its header).
+    fn named(&self, name: &str) -> Option<(&str, &ObjectRef)> {
+        let at = |path: &str| self.files.get_key_value(path).filter(|(p, _)| variant_of(p).is_some());
+        at(name).or_else(|| at(&format!("{name}{VARIANT_EXTENSION}"))).map(|(p, r)| (p.as_str(), r))
+    }
+
+    /// The header of variant `name`.
+    pub fn header(&self, name: &str) -> Option<&ObjectRef> {
+        self.named(name).map(|(_, r)| r)
     }
 
     /// `variant`, or with `None` the tree's only one: (its name, its header).
     pub fn variant(&self, variant: Option<&str>) -> Result<(&str, &ObjectRef)> {
         let found = match variant {
-            Some(v) => self.files.get_key_value(&variant_path(v)).map(|(p, r)| (variant_of(p), r)),
+            Some(v) => self.named(v),
             None => match self.variants().collect::<Vec<_>>()[..] {
-                [(v, r)] => Some((Some(v), r)),
+                [only] => Some(only),
                 _ => None,
             },
         };
-        match found {
-            Some((Some(v), r)) => Ok((v, r)),
-            _ => {
+        found.map_or_else(
+            || {
                 let has: Vec<&str> = self.variants().map(|(v, _)| v).collect();
                 invalid(match variant {
                     Some(v) => format!("the tree has no variant {v:?} (has {has:?})"),
                     None if has.is_empty() => "the tree has no variant".into(),
-                    None => format!("the tree has several variants; name one of {has:?}"),
+                    None => format!("the tree has several variants; select by GPUs and bits or name one of {has:?}"),
                 })
-            }
-        }
+            },
+            Ok,
+        )
     }
 
     /// The repo files: everything but the variants' headers.
