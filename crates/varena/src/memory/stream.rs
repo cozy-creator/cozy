@@ -29,6 +29,9 @@ pub(super) struct Streamed {
     pub(super) unmapped: u64,
     pub(super) pending: u64,
     pub(super) events: Vec<u64>,
+    /// For the hook: pages it takes in place on its own thread (never through the mechanism queue), and their bytes.
+    pub(super) takes: Vec<Key>,
+    pub(super) taking: u64,
 }
 
 /// What [`Inner::stream_in`] did for a bind.
@@ -60,8 +63,8 @@ impl State {
 
 impl Inner {
     /// `make_room`'s rung before the running set's own pages. It lowers `set`'s watermark until the upper pages free
-    /// `want` (unmapped now, or once their pending release events complete: `events`, waited on by the caller with
-    /// no lock held), or until the whole set streams. It keeps the [`SLOTS`] most recently used upper pages that are
+    /// `want` (unmapped now; for the hook, `takes` it unmaps in place on its own thread; or once their pending release
+    /// events complete: `events`, waited on by the caller with no lock held), or until the whole set streams. It keeps the [`SLOTS`] most recently used upper pages that are
     /// not custody's as slots, since a slot's memory is overwritten next. The hook (`hook`) never takes a kept page:
     /// it makes no custody call.
     pub(super) fn stream(&self, st: &mut State, set: u32, want: u64, req: Option<u64>, hook: bool) -> Result<Streamed> {
@@ -73,7 +76,7 @@ impl Inner {
             upper.sort_by_key(|k| Reverse(st.last_use(*k)));
             let slots: Vec<Key> = upper.iter().filter(|k| st.slot(**k, watermark)).take(SLOTS).copied().collect();
             for key in upper.into_iter().filter(|k| !slots.contains(k)) {
-                if taken.unmapped + taken.pending >= want {
+                if taken.unmapped + taken.taking + taken.pending >= want {
                     break;
                 }
                 let Some(page) = st.table.page(key) else { continue };
@@ -89,10 +92,15 @@ impl Inner {
                     taken.pending += span;
                     continue;
                 }
-                self.unmap(st, key, Class::W, req, !hook)?;
-                taken.unmapped += span;
+                if hook {
+                    taken.takes.push(key);
+                    taken.taking += span;
+                } else {
+                    self.unmap(st, key, Class::W, req, true)?;
+                    taken.unmapped += span;
+                }
             }
-            if taken.unmapped + taken.pending >= want || watermark == 0 {
+            if taken.unmapped + taken.taking + taken.pending >= want || watermark == 0 {
                 break;
             }
             watermark -= 1;
