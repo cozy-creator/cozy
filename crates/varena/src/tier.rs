@@ -39,6 +39,13 @@ const NAME: &str = "tier";
 /// ([`crate::Ledger::host_need`]); an executor serving the tier itself, its own GPU's.
 pub type Need = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
+/// TensorD's need source: what the requests running on its GPUs keep free, summed (`None`
+/// while any is unmeasured).
+pub fn need(ledgers: &[&crate::Ledger]) -> Need {
+    let tables: Vec<Arc<ledger::Shared>> = ledgers.iter().map(|l| l.table()).collect();
+    Arc::new(move || tables.iter().map(|t| ledger::host_need(t)).sum())
+}
+
 /// The live host budget: what this process can still allocate before its tightest limit.
 fn budget() -> u64 {
     u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0)
