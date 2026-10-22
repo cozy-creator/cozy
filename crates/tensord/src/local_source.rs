@@ -553,6 +553,8 @@ fn installer_refusal(error: protocol::error::Error) -> Refused {
     let code = match error.code.as_str() {
         crate::published::CANCELED => crate::published::CANCELED,
         "no_progress" => "no_progress",
+        "package_sdk_incompatible" => "package_sdk_incompatible",
+        "package_sdk_unavailable" => "package_sdk_unavailable",
         _ => "package_installation_failed",
     };
     refused(code, error.message)
@@ -816,6 +818,20 @@ mod tests {
         run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_lifecycle; print(cpu_lifecycle.Done(3).steps)"]));
         let second = sources.install(&m.service, "alice", &manifest.digest, None, "", &|_| ()).unwrap();
         assert_eq!(first.generation, second.generation);
+        // An unlocked project cannot fall back to its old SDK after the offered pair fails.
+        let incompatible = m.root.join("incompatible-project");
+        fs::create_dir_all(incompatible.join("cpu_lifecycle")).unwrap();
+        for file in ["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"] {
+            let mut text = fs::read_to_string(fixture.join(file)).unwrap();
+            if file == "pyproject.toml" { text = text.replace("\"cozy-runtime\"", "\"cozy-runtime<0.31\""); }
+            fs::write(incompatible.join(file), text).unwrap();
+        }
+        let tree = archive(&incompatible, &["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"]);
+        let source = write(&m.objects, "alice", &tree);
+        let bad = serde_json::json!({"package":"local/tensord-cpu-lifecycle", "release":"0.1.0", "python_version":"3.12",
+            "source":{"digest":source.digest,"length":source.length}});
+        let bad = write(&m.objects, "alice", bad.to_string().as_bytes());
+        assert_eq!(sources.install(&m.service, "alice", &bad.digest, None, "", &|_| ()).err().unwrap().code, "package_sdk_incompatible");
         assert!(!m.root.join("sdk/current").exists());
         let _ = fs::remove_dir_all(&m.root);
     }
@@ -1316,6 +1332,7 @@ mod tests {
         let live = manifest(serde_json::json!({"files": live_files(&m.objects, "alice", &project, &[&files[..], &[vendored.as_str()]].concat())}));
         for digest in [source, carried, live] {
             let error = normal.install(&m.service, "alice", &digest, None, "", &|_| ()).err().unwrap();
+            assert_eq!(error.code, "package_sdk_incompatible");
             assert!(error.message.contains("package_sdk_incompatible"), "{}", error.message);
             let installed = sources.install(&m.service, "alice", &digest, None, "", &|_| ()).unwrap();
             let held = m.service.catalog.resolve(&installed.generation).unwrap();

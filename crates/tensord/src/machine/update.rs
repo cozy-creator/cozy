@@ -381,8 +381,8 @@ pub fn recover_activation(paths: &Paths) -> io::Result<Recovered> {
 
 /// Checked by the new service before it opens the store or reports readiness, including
 /// an activation requested by an older binary which did not know this memory contract.
-/// A fresh local machine without a selected SDK may still serve CPU/package operations;
-/// each GPU executor must prove the memory capability before Start.
+/// A fresh local machine may start idle; its first package install resolves the SDK pair.
+/// Executor memory capability remains checked before Start.
 pub fn check_startup_pair(paths: &Paths) -> io::Result<()> {
     let pair = pair_in(&paths.sdk());
     if paths.unselected_sdk() && read_pending(paths)?.is_none() {

@@ -353,6 +353,7 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>, 
             None => format!("package_installation_failed: the trusted Python/uv installer stopped ({exited}):\n{tail}"),
         };
         return Err(match failure {
+            Some(f) if f.code == "package_sdk_incompatible" => Error::conflict("package_sdk_incompatible", message),
             Some(f) if f.code.ends_with("_unsupported") => Error::not_found("capability_unavailable", message),
             _ => Error::conflict("precondition_failed", message),
         });
