@@ -2624,6 +2624,7 @@ impl Pool {
             selections: plan.selections(),
             adopted: false,
             admits: session.executor.hello.admits(),
+            sealer: None,
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -3569,6 +3570,8 @@ struct Callbacks<'a> {
     adopted: bool,
     /// Its Runtime and TensorFS seal only where `read_grant` says `seal` (`Hello::admits`).
     admits: bool,
+    /// The last `layout_sealing` answer's loader: its progress is the asker's while it waits.
+    sealer: Option<crate::process::Lender>,
 }
 /// A call's end: a layout it was sealing and never deposited is nobody's to wait for.
 struct Sealing<'a>(&'a Deposits, &'a str);
@@ -3610,6 +3613,16 @@ impl Services for Callbacks<'_> {
                         (file, filling, seal, admission.map(|a| crate::host_tier::Admission { seal, why: why(&a), ..a }))
                     }
                     Err(sealer) => {
+                        // The asker waits on the loading call: it moves as that call moves, and
+                        // once that call ends the next ask loads the layout itself.
+                        let loader = self.engine.get(sealer.rsplit_once('#').map_or(&*sealer, |(call, _)| call)).ok();
+                        let birth = loader.as_ref().and_then(|record| record.process.clone());
+                        self.sealer = Some(Arc::new(move || birth.as_ref().and_then(crate::process::group_burn)));
+                        let rank = self.kept.get(frame.rank as usize).copied().flatten();
+                        self.pool.notes.note(serde_json::json!({"event": "layout_sealing", "manifest": frame.manifest,
+                            "layout": frame.layout, "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "call": self.id,
+                            "sealer": sealer, "sealer_state": loader.as_ref().map(|r| format!("{:?}", r.state)),
+                            "sealer_doing": loader.and_then(|r| r.progress)}));
                         let detail = format!("{sealer} is sealing {layout}; ask again once it deposits");
                         return Ok((Answer::refused(frame.seq, "layout_sealing", &detail), vec![]));
                     }
@@ -3633,6 +3646,9 @@ impl Services for Callbacks<'_> {
             "layout": frame.layout, "held": held, "filling": filling, "admission": admission, "pages": answer.pages.len(),
             "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "gpu": rank.map(|(_, _, gpu)| gpu)}));
         Ok((answer, fds))
+    }
+    fn sealer(&mut self) -> Option<crate::process::Lender> {
+        self.sealer.take()
     }
     /// GPU pages the executor kept: held past its end, for the next executor of the layout.
     fn keep_pages(&mut self, frame: &Frame, pages: Vec<File>) -> Answer {
