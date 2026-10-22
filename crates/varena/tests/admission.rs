@@ -33,7 +33,7 @@ impl Backend for Gated {
     fn reserve(&self, len: u64) -> varena::Result<Va> { self.host.reserve(len) }
     fn release(&self, va: Va) { self.host.release(va) }
     fn create(&self, len: u64) -> varena::Result<Physical> { self.host.create(len) }
-    fn destroy(&self, page: Physical) { self.host.destroy(page) }
+    fn destroy(&self, page: Physical) -> varena::Result<()> { self.host.destroy(page) }
     fn map(&self, va: Va, off: u64, page: &Physical, access: Access) -> varena::Result<()> { self.host.map(va, off, page, access) }
     fn protect(&self, va: Va, off: u64, len: u64, access: Access) -> varena::Result<()> { self.host.protect(va, off, len, access) }
     fn unmap(&self, va: Va, off: u64, len: u64) -> varena::Result<()> { self.host.unmap(va, off, len) }
