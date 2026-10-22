@@ -997,13 +997,23 @@ fn maps_beside_a_fill_in_flight_are_timed_against_maps_on_an_idle_card() {
 
 // ---- the backend's calls, timed
 
-/// Each backend call's count, total and longest time, by name, and when the last one ended.
+/// Each backend call's count, total and longest time, by name, and when the last one ended; and the
+/// stream whose next `record` fails (0: none), an injected completion-record failure.
 #[derive(Default)]
-struct Timings(parking_lot::Mutex<std::collections::BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>>, parking_lot::Mutex<std::collections::BTreeMap<&'static str, std::time::Instant>>);
+struct Timings(
+    parking_lot::Mutex<std::collections::BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>>,
+    parking_lot::Mutex<std::collections::BTreeMap<&'static str, std::time::Instant>>,
+    std::sync::atomic::AtomicUsize,
+);
 
 impl Timings {
     const fn new() -> Timings {
-        Timings(parking_lot::const_mutex(std::collections::BTreeMap::new()), parking_lot::const_mutex(std::collections::BTreeMap::new()))
+        Timings(parking_lot::const_mutex(std::collections::BTreeMap::new()), parking_lot::const_mutex(std::collections::BTreeMap::new()), std::sync::atomic::AtomicUsize::new(0))
+    }
+
+    /// The next event recorded on `stream` fails, as a driver's record can.
+    fn fail_record(&self, stream: usize) {
+        self.2.store(stream, std::sync::atomic::Ordering::Release);
     }
 
     fn add(&self, op: &'static str, took: std::time::Duration) {
@@ -1119,7 +1129,12 @@ impl Backend for Timed {
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.0.target(va, offset, len) }
     fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> varena::Result<()> { self.1.time("save", || self.0.save(va, offset, host, after)) }
     fn fence(&self) -> varena::Result<Event> { self.1.time("fence", || self.0.fence()) }
-    fn record(&self, stream: usize) -> varena::Result<Event> { self.1.time("record", || self.0.record(stream)) }
+    fn record(&self, stream: usize) -> varena::Result<Event> {
+        if stream != 0 && self.1.2.compare_exchange(stream, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_ok() {
+            return Err(Error::Device { op: "cuEventRecord", code: 999, name: "CUDA_ERROR_UNKNOWN (injected)".into() });
+        }
+        self.1.time("record", || self.0.record(stream))
+    }
     fn query(&self, event: Event) -> varena::Result<bool> { self.1.time("query", || self.0.query(event)) }
     fn elapsed(&self, from: Event, to: Event) -> varena::Result<Option<u64>> { self.1.time("elapsed", || self.0.elapsed(from, to)) }
     fn wait(&self, event: Event, stream: usize) -> varena::Result<()> { self.1.time("wait", || self.0.wait(event, stream)) }
@@ -1670,6 +1685,318 @@ fn a_save_runs_beside_a_demand_fill_on_the_other_copy_engine() {
     b.release(va);
     step!();
     println!("PASS a save runs beside a demand fill on the other copy engine {uuid}");
+    step!();
+}
+
+/// `bytes` in a device buffer of their own.
+fn device(bytes: &[u8]) -> io::DeviceBuffer {
+    let buffer = io::DeviceBuffer::new(0, bytes.len()).unwrap();
+    let copy = [Copy { src: Src::Host(bytes.as_ptr()), dst: Dst::Device { device: 0, ptr: buffer.ptr(), len: bytes.len(), stream: 0 } }];
+    unsafe { io::read(&copy, &ReadOpts::default()) }.unwrap();
+    buffer
+}
+
+/// Design §5 card check, a delayed transform on a non-current stream: a bake queued on stream X behind a gate, the
+/// page marked filled at once. A second caller prepares the same range on stream Y: preparation returns without a
+/// host wait, and the consumer it queues on Y reads the baked bytes once X runs, never the bytes before the bake.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_delayed_transform_on_another_stream_orders_the_next_consumer_in_stream() {
+    let (b, g, uuid) = card("delayed");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let mem = memory(b, &g);
+    step!();
+    let base = mem.load(set("base", 1, Fill::Declared("lora-1".into()), &g.uuid, |b| block(50, b)), Level::Ram).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["base"]])).unwrap();
+    step!();
+    let pass = r.pass(base, "main", "1", Torch::default()).unwrap();
+    step!();
+    let (x, y) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
+    step!();
+    let (baked, out) = (device(&block(51, 0)), io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap());
+    step!();
+    let range = mem.retain(base, &[0]).unwrap();
+    step!();
+    let first = std::time::Instant::now();
+    let pin = range.prepare_for(x.raw(), Some(&r)).unwrap().remove(0);
+    let first = first.elapsed();
+    step!();
+    assert!(pin.fresh, "the caller bakes it");
+    step!();
+    let mut gate = Some(Gate::hold(x.raw()));
+    step!();
+    assert_eq!(launch(c"copy", &[pin.ptr, baked.ptr(), REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    pin.filled();
+    step!();
+    drop(pin);
+    step!();
+    let (second, waited) = std::thread::scope(|t| {
+        let (prepared, waited) = watch(t, first, || range.prepare_for(y.raw(), Some(&r)));
+        if waited != Waited::Returned {
+            gate.take();
+        }
+        (prepared.join().unwrap().unwrap().remove(0), waited)
+    });
+    step!();
+    assert!(!second.fresh, "the second caller gets the bake, not a bake of its own");
+    step!();
+    assert_eq!(launch(c"copy", &[out.ptr(), second.ptr, REGION_ALIGN / 8], y.raw()), cuda::SUCCESS);
+    step!();
+    gate.take();
+    step!();
+    y.drain().unwrap();
+    step!();
+    assert!(bytes(out.ptr(), REGION_ALIGN, 0) == *block(51, 0), "the consumer on Y read the page before X's bake landed");
+    step!();
+    assert_eq!(waited, Waited::Returned, "preparing a range whose bake is queued on another stream waited on the host");
+    step!();
+    drop(second);
+    step!();
+    drop(range);
+    step!();
+    pass.end(Measured::default(), Torch::default());
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS a delayed transform on another stream orders the next consumer in-stream {uuid}");
+    step!();
+}
+
+/// Design §5 card check, cancel with a pending output copy: a prepared range's consumer copies the page out on stream
+/// X behind a gate; then the request is cancelled (dropped unended), the pin and the range dropped and the set
+/// unloaded, all while the copy is still queued. The page is unmapped only after the gate opens, and the copy reads
+/// the page's own bytes.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_cancelled_request_keeps_its_page_until_its_pending_output_copy_ends() {
+    let (b, g, uuid) = card("cancel");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let s = mem.load(set("w", 1, Fill::Stored, &g.uuid, |b| block(60, b)), Level::Ram).unwrap();
+    step!();
+    let x = cuda::Stream::new(0).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap();
+    step!();
+    let range = mem.retain(s, &[0]).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["w"]])).unwrap();
+    step!();
+    let pass = r.pass(s, "main", "1", Torch::default()).unwrap();
+    step!();
+    let first = std::time::Instant::now();
+    let pin = range.prepare_for(x.raw(), Some(&r)).unwrap().remove(0);
+    let first = first.elapsed();
+    step!();
+    let mut gate = Some(Gate::hold(x.raw()));
+    step!();
+    assert_eq!(launch(c"copy", &[out.ptr(), pin.ptr, REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    let unmaps = timings.count("unmap");
+    step!();
+    drop(pass);
+    step!();
+    drop(r);
+    step!();
+    drop(pin);
+    step!();
+    drop(range);
+    step!();
+    let waited = std::thread::scope(|t| {
+        let (unloaded, waited) = watch(t, first, || mem.unload(s));
+        if waited != Waited::Returned {
+            gate.take();
+        }
+        unloaded.join().unwrap();
+        waited
+    });
+    step!();
+    let early = timings.count("unmap") > unmaps;
+    step!();
+    let opened = std::time::Instant::now();
+    gate.take();
+    step!();
+    let drained = x.drain();
+    step!();
+    assert!(!early, "the page was unmapped while its output copy was still queued (unload {waited:?})");
+    step!();
+    drained.unwrap();
+    step!();
+    assert!(bytes(out.ptr(), REGION_ALIGN, 0) == *block(60, 0), "the output copy read other bytes than the page's");
+    step!();
+    while timings.count("unmap") == unmaps {
+        let _ = mem.torch_limit();
+    }
+    let unmapped = timings.last("unmap").unwrap();
+    step!();
+    assert!(unmapped >= opened, "unmapped {:?} before the copy could run", opened - unmapped);
+    step!();
+    println!("CANCEL unload {waited:?}; the page unmapped {:?} after the gate opened", unmapped - opened);
+    step!();
+    println!("PASS a cancelled request keeps its page until its pending output copy ends {uuid}");
+    step!();
+}
+
+/// Design §5 card check, old and new fill identity at once: a consumer of identity v1 queued on stream X behind a gate;
+/// the set's fill becomes v2. The v1 range is refused as stale, a v2 range is retained and prepared while the v1
+/// consumer is still queued. The v1 consumer reads v1's bytes, the v2 consumer v2's: neither sees the other's.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn old_and_new_fill_identities_at_once_each_read_their_own_bytes() {
+    let (b, g, uuid) = card("identity");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let t = mem.load(set("t", 1, Fill::Declared("v1".into()), &g.uuid, |b| block(70, b)), Level::Ram).unwrap();
+    step!();
+    let (x, y) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
+    step!();
+    let (v1, v2) = (device(&block(71, 0)), device(&block(72, 0)));
+    step!();
+    let (out1, out2) = (io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap(), io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap());
+    step!();
+    let r = mem.request("r", plan(&[&["t"]])).unwrap();
+    step!();
+    let pass = r.pass(t, "main", "1", Torch::default()).unwrap();
+    step!();
+    let old = mem.retain(t, &[0]).unwrap();
+    step!();
+    let first = std::time::Instant::now();
+    let pin = old.prepare_for(x.raw(), Some(&r)).unwrap().remove(0);
+    let first = first.elapsed();
+    step!();
+    assert!(pin.fresh, "v1 is baked by its caller");
+    step!();
+    assert_eq!(launch(c"copy", &[pin.ptr, v1.ptr(), REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    pin.filled();
+    step!();
+    // The bake done (the gate synchronizes X first), the v1 consumer is queued behind the gate.
+    let mut gate = Some(Gate::hold(x.raw()));
+    step!();
+    assert_eq!(launch(c"copy", &[out1.ptr(), pin.ptr, REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    let address = pin.ptr;
+    drop(pin);
+    step!();
+    let unmaps = timings.count("unmap");
+    step!();
+    mem.fill(t, Fill::Declared("v2".into()));
+    step!();
+    assert!(!old.valid(), "the v1 range is stale once the fill is v2");
+    step!();
+    assert!(matches!(old.prepare_for(y.raw(), Some(&r)), Err(Error::StaleBinding(_))), "a stale range is refused, never prepared");
+    step!();
+    let new = mem.retain(t, &[0]).unwrap();
+    step!();
+    assert_ne!(new.identity(), old.identity());
+    step!();
+    let (pin2, waited) = std::thread::scope(|s| {
+        let (prepared, waited) = watch(s, first, || new.prepare_for(y.raw(), Some(&r)));
+        if waited != Waited::Returned {
+            gate.take();
+        }
+        (prepared.join().unwrap().unwrap().remove(0), waited)
+    });
+    step!();
+    let early = gate.is_some() && timings.count("unmap") > unmaps;
+    step!();
+    assert!(pin2.fresh, "v2 is baked by its caller");
+    step!();
+    assert_eq!(launch(c"copy", &[pin2.ptr, v2.ptr(), REGION_ALIGN / 8], y.raw()), cuda::SUCCESS);
+    step!();
+    pin2.filled();
+    step!();
+    assert_eq!(launch(c"copy", &[out2.ptr(), pin2.ptr, REGION_ALIGN / 8], y.raw()), cuda::SUCCESS);
+    step!();
+    gate.take();
+    step!();
+    let (dx, dy) = (x.drain(), y.drain());
+    step!();
+    assert!(!early, "the v1 page was unmapped while its consumer was still queued");
+    step!();
+    dx.unwrap();
+    dy.unwrap();
+    step!();
+    assert!(bytes(out1.ptr(), REGION_ALIGN, 0) == *block(71, 0), "the v1 consumer read other bytes than v1's");
+    step!();
+    assert!(bytes(out2.ptr(), REGION_ALIGN, 0) == *block(72, 0), "the v2 consumer read other bytes than v2's");
+    step!();
+    println!("IDENTITY v2's preparation {waited:?} while v1's consumer was queued; at v1's address: {}", pin2.ptr == address);
+    step!();
+    drop(pin2);
+    step!();
+    drop((old, new));
+    step!();
+    pass.end(Measured::default(), Torch::default());
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS old and new fill identities at once each read their own bytes {uuid}");
+    step!();
+}
+
+/// Design §3 and §5 card check, a completion-record failure without reuse: a consumer copies a page out on stream X
+/// behind a gate, then the pin's release event cannot be recorded (an injected driver failure). Memory must assume
+/// the page may still be read: binds fail as ownership errors, and nothing — the unload, the request's end, Memory's
+/// drop — unmaps or frees it. The consumer reads the page's own bytes once the gate opens.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_failed_completion_record_quarantines_the_page_and_nothing_reuses_it() {
+    let (b, g, uuid) = card("record");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let s = mem.load(set("q", 1, Fill::Stored, &g.uuid, |b| block(80, b)), Level::Ram).unwrap();
+    step!();
+    let x = cuda::Stream::new(0).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["q"]])).unwrap();
+    step!();
+    let pass = r.pass(s, "main", "1", Torch::default()).unwrap();
+    step!();
+    let pin = mem.bind(s, 0, x.raw()).unwrap();
+    step!();
+    let gate = Gate::hold(x.raw());
+    step!();
+    assert_eq!(launch(c"copy", &[out.ptr(), pin.ptr, REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    let (unmaps, destroys) = (timings.count("unmap"), timings.count("destroy"));
+    step!();
+    timings.fail_record(x.raw());
+    step!();
+    drop(pin);
+    step!();
+    let refused = mem.bind(s, 0, 0).err();
+    step!();
+    assert!(matches!(refused, Some(Error::Ownership(_))), "a bind after an unproven release: {refused:?}");
+    step!();
+    drop(pass);
+    step!();
+    drop(r);
+    step!();
+    mem.unload(s);
+    step!();
+    drop(mem);
+    step!();
+    drop(gate);
+    step!();
+    x.drain().unwrap();
+    step!();
+    assert!(bytes(out.ptr(), REGION_ALIGN, 0) == *block(80, 0), "the consumer read other bytes than the page's");
+    step!();
+    assert_eq!((timings.count("unmap"), timings.count("destroy")), (unmaps, destroys), "a page whose completion is unknown was unmapped or freed");
+    step!();
+    println!("PASS a failed completion record quarantines the page and nothing reuses it ({refused:?}) {uuid}");
     step!();
 }
 
