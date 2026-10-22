@@ -2245,6 +2245,12 @@ fn measured_small(mem: &Memory, m: SetId) {
     step!();
 }
 
+/// The allocator hook's reclaim, step 1's `make_room(need)` (audit §4, owner 10-22): the bytes it freed. The one place
+/// the core's call is named.
+fn make_room(r: &Request, need: u64) -> u64 {
+    r.reclaim_allocation(need).unwrap_or(0)
+}
+
 /// The native allocator's protocol (tensorfs-py's allocator.rs) on raw driver calls, under `torch` (torch's allocator
 /// lock, holding the bytes its segments hold): a segment is admitted against Memory's allocator limit and cut with
 /// cuMemAlloc. Past the limit, or on a real OOM, the callback (`reclaim_allocation`) runs inside the lock, and the
@@ -2275,7 +2281,7 @@ fn segment(mem: &Memory, r: &Request, torch: &parking_lot::Mutex<u64>, size: u64
             return None;
         }
         last = Some((*held, limit));
-        if callbacks.time("reclaim_allocation", || r.reclaim_allocation(size)).unwrap_or(0) == 0 {
+        if callbacks.time("make_room", || make_room(r, size)) == 0 {
             return None;
         }
     }
@@ -2291,59 +2297,87 @@ fn unsegment(torch: &parking_lot::Mutex<u64>, (ptr, resident): (u64, varena::mem
     *torch.lock() -= size;
 }
 
-/// Review 6 F4: the allocator callback unmaps and releases idle pages (cuMemUnmap, cuMemRelease) inside torch's
-/// allocator lock. Two threads allocate as the native allocator does, under one lock, on a card capped at 1 GiB (a
-/// small card: a few segments reach its limit). A keeps its segments, so past the limit each of its allocations runs
-/// the callback. B allocates, writes and frees. Meanwhile an unrelated stream is gated and a kernel reads a pinned page.
-/// Pass conditions:
-/// - Neither thread waits on the gated stream: no deadlock.
-/// - Nothing faults, and the pinned page is never taken.
-/// - The bytes reconcile: the callbacks unmapped exactly the idle pages, and the driver got their bytes back.
+// ---- step 1: one make_room(need) loop, called by the allocator hook (audit §4, owner 10-22)
+
+/// A set of `pages` pages of [`bulk_block`], bound on `stream` and released: resident own weights with no pin left.
+fn resident(mem: &Memory, name: &str, pages: u32, uuid: &str, stream: usize) -> SetId {
+    let one = bulk_block();
+    let set = mem.load(set(name, pages, Fill::Stored, uuid, |_| one.clone()), Level::Ram).unwrap();
+    drop((0..pages).map(|p| mem.bind(set, p, stream).unwrap()).collect::<Vec<Pin>>());
+    set
+}
+
+/// The hook evicts the request's own pages under a 1 GiB cap, with review 6's F4 folded in. Two threads allocate
+/// under one lock (torch's), as the native allocator does.
+/// - Setup: the request's own pages are released behind a kernel still running on their stream. An unrelated stream
+///   is gated. A kernel sweeps a pinned page throughout.
+/// - Thread A needs half the own set beyond the budget, then keeps allocating until refused. Its first allocation must
+///   wait for the running kernel, the pages' own release, and only for that.
+/// - Thread B allocates, writes and frees through a free worker; cuMemFree waits on the device outside the lock.
+/// - Pass conditions:
+///   - No thread on the lock's path waits for the gate (no deadlock).
+///   - No page is unmapped before its consumer ended.
+///   - The pinned page is never taken and keeps its bytes. Nothing faults.
+///   - The driver gains exactly the evicted bytes.
 #[test]
 #[ignore = "native GPU: a rental only"]
-fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated_device_work() {
-    let (b, g, uuid) = card("callback");
+fn the_hook_waits_on_its_pages_release_events_never_on_unrelated_work() {
+    let (b, g, uuid) = card("hook");
     step!();
-    // 1 GiB: a card small enough that a few segments reach its allocator limit.
+    // 1 GiB: a card small enough that the threads need the request's own pages.
     let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
     let (mem, timings) = timed_memory(b, &g);
     step!();
     let pages = 64;
-    // Mapped at load and never kept (an undeclared fill is never custody's): complete pages with no declared use,
-    // which the request's stock offers the callback when it opens.
-    let loaded = std::time::Instant::now();
     let one = bulk_block();
-    mem.load(set("idle", pages, Fill::Undeclared, &g.uuid, |_| one.clone()), Level::Gpu).unwrap();
-    let loaded = loaded.elapsed();
+    let w = mem.load(set("w", pages, Fill::Stored, &g.uuid, |_| one.clone()), Level::Ram).unwrap();
     step!();
-    let w = mem.load(set("w", 1, Fill::Stored, &g.uuid, |b| block(95, b)), Level::Ram).unwrap();
+    let p = mem.load(set("p", 1, Fill::Stored, &g.uuid, |b| block(95, b)), Level::Ram).unwrap();
     step!();
-    mem.settle();
+    let r = mem.request("r", plan(&[&["w", "p"]])).unwrap();
     step!();
-    // The idle set is no step of the plan: a step's pages are its working set, which the callback never takes.
-    let r = mem.request("r", plan(&[&["w"]])).unwrap();
+    let (x, y, swept, gated) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
     step!();
-    let warm = loaded / pages;
+    let first = std::time::Instant::now();
+    let pins: Vec<Pin> = (0..pages).map(|b| mem.bind(w, b, x.raw()).unwrap()).collect();
+    let first = first.elapsed();
     step!();
-    let (x, y, gated) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
+    // The longest single call the threads make, measured before them: thread A's big allocation, cut and freed once.
+    let near = mem.allocator_limit().unwrap().saturating_sub(2 * REGION_ALIGN);
+    let warm = {
+        let (_, ctx) = cuda::primary_context(0).unwrap();
+        let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+        let d = cuda::driver().unwrap();
+        let t = std::time::Instant::now();
+        let mut ptr = 0;
+        assert_eq!(unsafe { (d.mem_alloc)(&mut ptr, near as usize) }, cuda::SUCCESS);
+        assert_eq!(unsafe { (d.mem_free)(ptr) }, cuda::SUCCESS);
+        t.elapsed().max(first)
+    };
     step!();
-    let pinned = mem.bind(w, 0, x.raw()).unwrap();
+    // The own pages' consumer: ten times their binds, on their stream; each pin's release event lands behind it.
+    let spin = first * 10;
+    let launched = std::time::Instant::now();
+    assert_eq!(launch(c"spin", &[spin.as_nanos() as u64], x.raw()), cuda::SUCCESS);
+    step!();
+    drop(pins);
+    step!();
+    let pinned = mem.bind(p, 0, swept.raw()).unwrap();
     step!();
     let out = io::DeviceBuffer::new(0, 16).unwrap();
     step!();
-    // Ten times the idle set's load: the sweep outlasts the allocations.
-    let sweep = loaded * 10;
-    assert_eq!(launch(c"sweep", &[pinned.ptr, REGION_ALIGN / 8, sweep.as_nanos() as u64, out.ptr()], x.raw()), cuda::SUCCESS);
+    assert_eq!(launch(c"sweep", &[pinned.ptr, REGION_ALIGN / 8, (spin * 2).as_nanos() as u64, out.ptr()], swept.raw()), cuda::SUCCESS);
     step!();
     let _ = mem.torch_limit();
     step!();
-    let (start_free, start_limit, unmaps) = (driver_free(), mem.allocator_limit().unwrap(), timings.count("unmap"));
+    let (start_free, unmaps) = (driver_free(), timings.count("unmap"));
     step!();
     let mut gate = Some(Gate::hold(gated.raw()));
     step!();
     let torch = parking_lot::Mutex::new(0u64);
     let callbacks = Timings::default();
-    let (calls, longest, done) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(warm.as_nanos() as u64), std::sync::atomic::AtomicBool::new(false));
+    // One call may wait for the own pages' release (the kernel), on top of its own time.
+    let (calls, longest, done) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new((spin + warm).as_nanos() as u64), std::sync::atomic::AtomicBool::new(false));
     // Where each thread is: 0 between calls, 1 allocating (the allocator lock's path), 2 writing and handing to the
     // free worker.
     let phase = [std::sync::atomic::AtomicU8::new(0), std::sync::atomic::AtomicU8::new(0)];
@@ -2355,7 +2389,7 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
     // The native allocator's free: an event on the segment's stream, handed to a worker that waits for it and frees
     // outside the lock (a cuMemFree may wait for the device).
     let (hand, frees) = mpsc::channel::<((u64, varena::memory::Resident), usize)>();
-    let (kept, churned, waited) = std::thread::scope(|s| {
+    let (kept, churned, waited, first_returned) = std::thread::scope(|s| {
         let worker = s.spawn(|| {
             let (_, ctx) = cuda::primary_context(0).unwrap();
             let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
@@ -2367,15 +2401,14 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
             }
         });
         let a = s.spawn(|| {
-            let (_, ctx) = cuda::primary_context(0).unwrap();
-            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
             let mut kept = vec![];
-            // One segment up to near the limit, then a page's worth at a time: each past it runs the callback.
-            let near = mem.allocator_limit().unwrap().saturating_sub(2 * REGION_ALIGN);
+            // Half the own set beyond the budget: make_room must take own pages, waiting for their release.
+            let need = near + u64::from(pages / 2) * REGION_ALIGN;
             let t = std::time::Instant::now();
             at(0, 1);
-            kept.extend(segment(&mem, &r, &torch, near, &callbacks).map(|seg| (seg, near)));
+            kept.extend(segment(&mem, &r, &torch, need, &callbacks).map(|seg| (seg, need)));
             at(0, 0);
+            let first_returned = std::time::Instant::now();
             timed(t);
             loop {
                 let t = std::time::Instant::now();
@@ -2387,7 +2420,7 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
                 kept.push((seg, REGION_ALIGN));
             }
             done.store(true, std::sync::atomic::Ordering::Release);
-            kept
+            (kept, first_returned)
         });
         let b = s.spawn(|| {
             let (_, ctx) = cuda::primary_context(0).unwrap();
@@ -2429,41 +2462,45 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
                 gate.take();
             }
         }
-        let out = (a.join().unwrap(), b.join().unwrap(), waited);
+        let ((kept, first_returned), churned) = (a.join().unwrap(), b.join().unwrap());
         // B's frees wait on the device in the worker, outside the lock: they finish once the gate opens.
         gate.take();
         worker.join().unwrap();
-        out
+        (kept, churned, waited, first_returned)
     });
     step!();
     gate.take();
     step!();
-    let (sx, sy, sg) = (x.drain(), y.drain(), gated.drain());
+    let (sx, sy, ss, sg) = (x.drain(), y.drain(), swept.drain(), gated.drain());
     step!();
+    let served = !kept.is_empty();
     for (seg, size) in kept {
         unsegment(&torch, seg, size);
     }
     step!();
     let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
     step!();
-    let (gained, raised) = (driver_free().saturating_sub(start_free), mem.allocator_limit().unwrap().saturating_sub(start_limit));
+    let gained = driver_free().saturating_sub(start_free);
     step!();
-    println!("CALLBACK {} callbacks ({}); B churned {} segments, refused {}; unmapped {unmapped} B; driver gained {gained} B, allocator limit raised {raised} B; waited on the gated stream (phases A, B: 1 allocating, 2 writing): {waited:?}",
-        callbacks.count("reclaim_allocation"), callbacks.report(), churned.0, churned.1);
+    println!(
+        "HOOK the first allocation returned {:?} after the kernel's launch (its {spin:?}); make_room {}; B churned {} segments, refused {}; unmapped {unmapped} B; driver gained {gained} B; waited on the gated stream (phases A, B: 1 allocating, 2 writing): {waited:?}",
+        first_returned - launched, callbacks.report(), churned.0, churned.1
+    );
     step!();
     assert!(waited.is_none(), "a thread waited for the gated stream (on the allocator lock's path at 1): {waited:?}");
     step!();
     sx.unwrap();
     sy.unwrap();
+    ss.unwrap();
     sg.unwrap();
     step!();
-    assert!(callbacks.count("reclaim_allocation") > 0 && unmapped > 0, "the callback reclaimed idle pages");
+    assert!(served, "make_room served A's allocation from the request's own pages");
+    step!();
+    assert!(timings.last("unmap").is_some_and(|t| t >= launched + spin), "a page was unmapped before its consumer ended");
     step!();
     assert!(exact(&pinned, &block(95, 0), 0), "the pinned page was never taken");
     step!();
-    // The idle pages are what the callbacks took, and the driver has their bytes back (to the page: the driver keeps
-    // its own small allocations).
-    assert!(unmapped <= u64::from(pages) * REGION_ALIGN);
+    assert!(unmapped >= u64::from(pages / 2) * REGION_ALIGN && unmapped <= u64::from(pages) * REGION_ALIGN, "own pages only: {unmapped} B");
     step!();
     assert!(gained.abs_diff(unmapped) <= REGION_ALIGN, "the driver gained {gained} B for {unmapped} B unmapped");
     step!();
@@ -2471,71 +2508,114 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
-    println!("PASS the allocator callback reclaims inside its lock without waiting for unrelated device work {uuid}");
+    println!("PASS the hook waits on its pages' release events, never on unrelated work {uuid}");
     step!();
 }
 
-/// Lazy room (core 98e4e4a24) on a card full of an idle kept set:
-/// - A request opens and lends the kept pages to the allocator callback: custody lets go, and the pages stay mapped
-///   and stocked.
-/// - The callback claims one; it unmaps and destroys it, and the driver gets the page's bytes back. Custody has let
-///   go, so the bytes are real.
-/// - The rest stay mapped while the request runs, and are kept (exported) again once no request is open.
-///
-/// Host version: ordering::a_request_lends_idle_kept_pages_to_the_callback_and_keeps_the_rest_after.
+/// An activation larger than the free memory is served from evictable weights under a 1 GiB cap, never refused. The
+/// card holds the request's own resident set and an idle set of another; the activation needs more than free memory
+/// plus the idle set.
+/// - make_room takes the other set's idle pages first.
+/// - Then it takes the request's own pages.
+/// - The driver gets exactly what was evicted back.
 #[test]
 #[ignore = "native GPU: a rental only"]
-fn a_lent_kept_page_is_claimed_by_the_callback_and_the_rest_are_kept_again() {
-    let (b, g, uuid) = card("lend");
+fn an_activation_larger_than_free_memory_is_served_from_evictable_weights() {
+    let (b, g, uuid) = card("serve");
     step!();
-    // 1 GiB: a card small enough for a kept set to fill.
-    let ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
+    let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
     let (mem, timings) = timed_memory(b, &g);
     step!();
-    let a = mem.load(set("a", 1, Fill::Stored, &g.uuid, |b| block(96, b)), Level::Ram).unwrap();
+    let pages = 64;
+    resident(&mem, "own", pages, &g.uuid, 0);
     step!();
-    let room = mem.torch_limit() / REGION_ALIGN;
+    resident(&mem, "other", pages, &g.uuid, 0);
     step!();
-    mem.load(bulk("kept", room as u32, &g.uuid), Level::Gpu).unwrap();
+    let r = mem.request("r", plan(&[&["own"]])).unwrap();
     step!();
-    mem.settle();
+    let (start_free, unmaps) = (driver_free(), timings.count("unmap"));
     step!();
-    let kept = timings.count("export");
+    // Free memory, the other set, and half of the request's own.
+    let need = mem.allocator_limit().unwrap() + u64::from(pages + pages / 2) * REGION_ALIGN;
+    let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
+    let got = segment(&mem, &r, &torch, need, &callbacks).expect("the activation was served from evictable weights");
     step!();
-    assert!(kept >= 2, "the card holds an idle kept set: {kept} pages kept of {room}");
+    let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
     step!();
-    let r = mem.request("r", plan(&[&["a"]])).unwrap();
+    // By class: the other set's idle pages (no declared use) before the request's own (declared use).
+    let evicted = r.stats().evicted;
     step!();
-    let before = driver_free();
+    println!("SERVE {need} B served; make_room {}; unmapped {unmapped} B; evicted by class {evicted:?}", callbacks.report());
     step!();
-    let (unmaps, destroys) = (timings.count("unmap"), timings.count("destroy"));
+    assert!(unmapped >= u64::from(pages + pages / 2) * REGION_ALIGN);
     step!();
-    assert_eq!(r.reclaim_allocation(REGION_ALIGN).unwrap(), REGION_ALIGN, "a lent page is the callback's");
+    unsegment(&torch, got, need);
     step!();
-    let gained = driver_free().saturating_sub(before);
+    let gained = driver_free().saturating_sub(start_free);
     step!();
-    assert_eq!((timings.count("unmap") - unmaps, timings.count("destroy") - destroys), (1, 1), "the callback unmapped and destroyed one page");
-    step!();
-    assert!(gained >= REGION_ALIGN, "custody let go before the callback claimed it: the driver gained {gained} B");
-    step!();
-    // A pass start publishes the table: the pages not claimed stay mapped, not kept (N).
-    let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
-    step!();
-    let n: u64 = ledger.status().rows.iter().map(|row| row.classes[varena::table::Class::N.index()]).sum();
-    step!();
-    assert_eq!(n, (kept - 1) * REGION_ALIGN, "the lent pages the callback left stay mapped");
-    step!();
-    pass.end(Measured::default(), Torch::default());
+    assert!(gained.abs_diff(unmapped) <= REGION_ALIGN, "the driver gained {gained} B for {unmapped} B unmapped");
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
-    mem.settle();
+    println!("PASS an activation larger than free memory is served from evictable weights {uuid}");
     step!();
-    assert_eq!(timings.count("export"), kept + (kept - 1), "the pages left are kept again once no request is open");
+}
+
+/// Under a 1 GiB cap, the hook never takes a pinned page, and fails only when nothing is evictable.
+/// - Of two sets, one is pinned throughout (its bytes checked) and one is idle.
+/// - An allocation needing more than the idle set can give takes all of the idle set, then fails.
+/// - Once one pinned page is released, the same need short by a page is served from it.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable() {
+    let (b, g, uuid) = card("pinned-hook");
     step!();
-    println!("LEND {kept} kept pages lent; the callback claimed one (the driver gained {gained} B); {} kept again {uuid}", kept - 1);
+    let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
     step!();
-    println!("PASS a lent kept page is claimed by the callback and the rest are kept again {uuid}");
+    let pages = 16;
+    let held = mem.load(set("held", pages, Fill::Stored, &g.uuid, |b| block(97, b)), Level::Ram).unwrap();
+    step!();
+    resident(&mem, "idle", pages, &g.uuid, 0);
+    step!();
+    let r = mem.request("r", plan(&[&["held"]])).unwrap();
+    step!();
+    let mut pins: Vec<Pin> = (0..pages).map(|p| mem.bind(held, p, 0).unwrap()).collect();
+    step!();
+    let unmaps = timings.count("unmap");
+    step!();
+    // More than free memory and the idle set together: only pinned pages are left to give, and none may go.
+    let need = mem.allocator_limit().unwrap() + u64::from(pages + 1) * REGION_ALIGN;
+    let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
+    let refused = segment(&mem, &r, &torch, need, &callbacks);
+    step!();
+    let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
+    step!();
+    assert!(refused.is_none(), "an allocation beyond every evictable byte was served");
+    step!();
+    assert_eq!(unmapped, u64::from(pages) * REGION_ALIGN, "the idle set went, every page of it, and nothing else");
+    step!();
+    for (p, pin) in pins.iter().enumerate() {
+        assert!(exact(pin, &block(97, p as u32), 0), "pinned page {p} kept its bytes");
+    }
+    step!();
+    // One pinned page released: now something is evictable, and a need of one page more than free is served.
+    drop(pins.pop());
+    step!();
+    let _ = mem.torch_limit();
+    step!();
+    let one_more = mem.allocator_limit().unwrap() + REGION_ALIGN;
+    let served = segment(&mem, &r, &torch, one_more, &callbacks).expect("the released page made the room");
+    step!();
+    println!("PINNED refused at {need} B after taking the idle set ({unmapped} B); then {one_more} B served; make_room {}", callbacks.report());
+    step!();
+    unsegment(&torch, served, one_more);
+    step!();
+    drop(pins);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS the hook never takes a pinned page and fails only when nothing is evictable {uuid}");
     step!();
 }
 
@@ -2587,54 +2667,6 @@ fn an_oom_in_a_pass_is_recovered_in_process() {
     assert_eq!(stats.leftover, 0);
     step!();
     println!("PASS an OOM in a pass is recovered in process (answers {answers:?}) {uuid}");
-    step!();
-}
-
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_measured_pass_gets_its_room_before_it_runs() {
-    let (b, g, uuid) = card("room");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let mem = memory(b, &g);
-    step!();
-    let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(3, b)), Level::Ram).unwrap();
-    step!();
-    measured_small(&mem, m);
-    let _crowd = crowd();
-    let idle = more_than_free();
-    step!();
-    mem.load(bulk("idle", idle, &g.uuid), Level::Gpu).unwrap();
-    step!();
-    let (answers, _) = first_run(&mem, m, idle);
-    step!();
-    assert!(!answers.is_empty(), "the first run met a real OOM");
-    step!();
-    // The idle set takes the card again; the second run's pass makes its measured room first.
-    mem.load(bulk("idle", idle, &g.uuid), Level::Gpu).unwrap();
-    step!();
-    assert!(driver_free() < ROOM / 2, "the card is full before the second pass: {} free", driver_free());
-    step!();
-    let r = mem.request("second", plan(&[&["m"]])).unwrap();
-    step!();
-    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
-    step!();
-    // Lazy room: the measured room is free bytes and pages lent to the allocator callback, so the activation is
-    // allocated as the native allocator does, reclaiming through the callback; never an OOM answer.
-    let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
-    let activation = segment(&mem, &r, &torch, ROOM / 2, &callbacks);
-    step!();
-    assert!(activation.is_some(), "the pass made its measured room before it ran (callbacks: {})", callbacks.report());
-    step!();
-    pass.end(Measured { allocated_peak: ROOM / 2, slack: 0, sites: vec![] }, Torch { allocated: ROOM / 2, reserved: ROOM / 2 });
-    step!();
-    activation.into_iter().for_each(|a| unsegment(&torch, a, ROOM / 2));
-    step!();
-    let stats = r.end();
-    step!();
-    assert_eq!(stats.retries, 0, "{stats:?}");
-    step!();
-    println!("PASS a measured pass gets its room before it runs {uuid}");
     step!();
 }
 
