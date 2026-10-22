@@ -1,5 +1,7 @@
 //! Host-OOM, the RAM tier's side: a tier fill (a filled page's copy) goes only into measured
 //! surplus. Its own binary: the namespace's tier is this test's alone.
+//! Linux: the RAM tier's files are Linux's (elsewhere it is absent).
+#![cfg(target_os = "linux")]
 
 use std::fs::File;
 use std::path::Path;

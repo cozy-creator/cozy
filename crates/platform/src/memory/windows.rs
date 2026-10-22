@@ -125,10 +125,11 @@ pub fn granularity() -> u64 {
     u64::from(info.dwAllocationGranularity)
 }
 
-/// A new handle to the same file: its locks are its own.
-pub fn reopen(f: &Owned) -> Result<Owned> {
+/// A new handle to the same file (read-only unless `write`): its locks are its own.
+pub fn reopen(f: &Owned, write: bool) -> Result<Owned> {
+    let access = if write { GENERIC_READ | GENERIC_WRITE } else { GENERIC_READ };
     // SAFETY: reopening a handle we hold.
-    let h = unsafe { ReOpenFile(raw(f), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0) };
+    let h = unsafe { ReOpenFile(raw(f), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0) };
     if h == INVALID_HANDLE_VALUE {
         return Err(last("reopen the table"));
     }

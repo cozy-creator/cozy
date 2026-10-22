@@ -1,7 +1,8 @@
 //! The callback may use local completed resources while a peer is stopped under the ledger
-//! heap lock. These are real processes/OFD locks, not simulated lock state.
+//! heap lock. These are real processes and the OS's real range locks, not simulated lock state.
+//! Unix: the set is loaded from TensorFS's sources.
+#![cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -65,11 +66,8 @@ fn callback_peer() {
     }
     assert_eq!(role, "heap-lock");
     let grant = varena::Grant::open(&gpu(), None).unwrap();
-    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-    lock.l_type = libc::F_WRLCK as i16;
-    lock.l_whence = libc::SEEK_SET as i16;
-    lock.l_start = 0; lock.l_len = 8;
-    assert_eq!(unsafe { libc::fcntl(grant.table.as_raw_fd(), libc::F_OFD_SETLKW, &lock) }, 0);
+    // The ledger's heap lock: the table's first 8 bytes, through the seam the ledger takes it by.
+    assert!(platform::memory::lock(&grant.table, 0, 8, true).unwrap());
     println!("CALLBACK_READY"); std::io::stdout().flush().unwrap();
     let mut release = String::new();
     std::io::stdin().read_line(&mut release).unwrap();

@@ -428,6 +428,11 @@ fn agent() {
                 "ok".into()
             }
             ["exit"] => {
+                // Its memory retires before the process ends (the row goes, TensorD wakes).
+                drop((std::mem::take(&mut yielded), std::mem::take(&mut pins), std::mem::take(&mut passes), std::mem::take(&mut requests)));
+                if let Some(m) = mem.take() {
+                    m.retire().unwrap();
+                }
                 writeln!(out, "ok").unwrap();
                 return;
             }

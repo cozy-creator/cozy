@@ -25,8 +25,8 @@ pub fn unlink(name: &str) {
 }
 
 /// A new description of the same file: its locks are its own.
-pub fn reopen(f: &Owned) -> Result<Owned> {
-    crate::shm::reopen(f.as_fd(), true)
+pub fn reopen(f: &Owned, write: bool) -> Result<Owned> {
+    crate::shm::reopen(f.as_fd(), write)
 }
 
 /// Takes (or, `wait`, waits for) a write lock on a byte range of this description.

@@ -76,9 +76,9 @@ pub(crate) fn map_at(f: &Owned, offset: u64, len: usize, write: bool) -> Result<
     Ok(platform::memory::map(f, offset, len, write)?)
 }
 
-/// A new description of the same file, read-write: its locks are its own.
-pub(crate) fn reopen(f: &Owned, _write: bool) -> Result<Owned> {
-    Ok(platform::memory::reopen(f)?)
+/// A new description of the same file (read-only unless `write`): its locks are its own.
+pub(crate) fn reopen(f: &Owned, write: bool) -> Result<Owned> {
+    Ok(platform::memory::reopen(f, write)?)
 }
 
 pub(crate) fn linked(f: &Owned) -> Result<bool> {

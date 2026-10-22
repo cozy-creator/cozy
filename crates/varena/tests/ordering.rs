@@ -1333,6 +1333,7 @@ fn failed_save_child() {
 
 /// A previous unload can still be waiting for custody when an independent bind starts.
 /// Preparation waits outside the state lock; allocator recovery refuses without waiting.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
     let dir = tempfile::tempdir().unwrap();
@@ -1363,6 +1364,7 @@ fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
     binder.join().unwrap();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn failed_renewal_completion_keeps_the_old_mapping_alive() {
     for mode in ["finish", "unmap", "destroy"] {
@@ -1373,6 +1375,7 @@ fn failed_renewal_completion_keeps_the_old_mapping_alive() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "subprocess entry for failed_renewal_completion_keeps_the_old_mapping_alive"]
 fn failed_renewal_child() {
