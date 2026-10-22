@@ -591,6 +591,10 @@ pub struct Answer {
     pub code: String,
     pub detail: String,
     pub held: bool,
+    /// `read_grant` with nothing held: the asker may seal the layout (it fits in measured host
+    /// surplus); else it reads the checkpoint.
+    #[serde(skip_serializing_if = "is_false")]
+    pub seal: bool,
     /// One fd follows the answer. Sent only when true: a `Tier` answer types it as the fd.
     #[serde(skip_serializing_if = "is_false")]
     pub descriptor: bool,
@@ -648,6 +652,7 @@ impl Answer {
             code: "capability_unavailable".into(),
             detail: "owner has not qualified this operation".into(),
             held: false,
+            seal: false,
             descriptor: false,
             sha256: String::new(),
             length: 0,

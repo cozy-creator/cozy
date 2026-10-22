@@ -30,7 +30,16 @@ pub(super) fn read() -> HostMemory {
         available,
         shmem: 0,
         mem_available: available,
+        bound: total(),
     }
+}
+
+pub(super) fn anon(_: u32) -> io::Result<super::Anon> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+pub(super) fn reset_peak(_: u32) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 pub(super) fn process(pid: u32) -> io::Result<ProcessMemory> {
