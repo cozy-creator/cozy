@@ -107,3 +107,11 @@ fn quarantined_backing_stays_charged_but_is_not_available_returning_memory() {
     assert_eq!(t.returning(), 0);
     assert_eq!(t.torch_limit(), 4 * M);
 }
+
+#[test]
+fn unstable_physical_counts_cannot_reduce_foreign_usage() {
+    let t = Table { capacity: 8 * M, physical: 4 * M, vmm: 4 * M, ..Table::default() };
+    assert_eq!(t.foreign_from_known(8 * M, 6 * M, 4 * M), 2 * M);
+    assert_eq!(t.foreign_from_known(8 * M, 6 * M, 0), 6 * M);
+    assert_eq!(t.held(), 4 * M, "invalid physical evidence does not release its admission charge");
+}
