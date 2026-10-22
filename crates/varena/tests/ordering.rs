@@ -39,7 +39,7 @@ struct Events {
     fences: Mutex<Vec<u64>>,
     hold_fence: AtomicBool,
     fence_gate: Gate,
-    /// The next event record fails (a driver error), and the streams synchronized instead.
+    /// The next event record fails (a driver error); a deleter must never synchronize.
     fail_record: AtomicBool,
     fail_finish: AtomicBool,
     fail_unmap: AtomicBool,
@@ -619,10 +619,16 @@ fn kept_pages_go_to_a_new_custody_holder() {
     log.await_call(|(conn, call)| *conn > 0 && call.contains("Export") && call.contains(&key));
 }
 
-/// S2 review, 6a: a release whose event cannot be recorded never reads as complete: that one
-/// pin's stream is synchronized.
 #[test]
-fn a_release_without_an_event_synchronizes_its_stream() {
+fn a_failed_release_record_never_synchronizes_a_deleter() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "failed_record_child", "--nocapture"]).output().unwrap();
+    assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+#[ignore = "subprocess entry for a_failed_release_record_never_synchronizes_a_deleter"]
+fn failed_record_child() {
     let dir = tempfile::tempdir().unwrap();
     let g = GpuId { uuid: format!("record-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
     let _scope = Scope::new(&g.uuid);
@@ -633,7 +639,10 @@ fn a_release_without_an_event_synchronizes_its_stream() {
     let pin = mem.bind(id, 0, 7).unwrap();
     events.fail_record.store(true, Ordering::SeqCst);
     drop(pin);
-    assert_eq!(*events.syncs.lock(), vec![7]);
+    assert!(events.syncs.lock().is_empty(), "a host callback may need the deleter's GIL or allocator lock");
+    assert!(matches!(mem.bind(id, 0, 0), Err(varena::Error::Ownership(_))));
+    drop(mem);
+    assert_eq!(events.unmaps.load(Ordering::SeqCst), 0, "unknown completion retains the physical mapping");
 }
 
 /// A driver-reported OOM is stronger evidence than an unchanged free-byte estimate. There

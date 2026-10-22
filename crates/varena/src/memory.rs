@@ -3524,23 +3524,15 @@ impl Pin {
 
 impl Drop for Pin {
     fn drop(&mut self) {
-        // A failed completion record may fall back to a stream sync. If neither proves
-        // completion, preserve the pin: releasing it would permit unmapping live GPU work.
+        // A DLPack deleter may hold the GIL or an allocator lock. A failed event record
+        // cannot be rescued by synchronizing here: a CUDA host callback may need that lock.
         let event = match self.inner.backend.record(self.stream) {
             Ok(event) => event,
-            Err(e) => {
-                tracing::warn!("varena: recording a release failed ({e}); synchronizing its stream");
-                if let Err(e) = self.inner.backend.synchronize(self.stream) {
-                    tracing::error!("varena: cannot prove consumer completion; quarantining pin {}: {e}", self.id);
-                    let st = self.inner.state.lock();
-                    self.inner.ownership_lost.store(true, Ordering::Release);
-                    drop(st);
-                    self.inner.landed.notify_all();
-                    // Keep the backend and reservation too, even if this was their last owner.
-                    std::mem::forget(self.inner.clone());
-                    return;
-                }
-                Event::DONE
+            Err(error) => {
+                tracing::error!("varena: release completion is unknown; quarantining pin {}: {error}", self.id);
+                let mut st = self.inner.state.lock();
+                self.inner.lost_backing(&mut st, 0, true, error);
+                return;
             }
         };
         let untransformed = self.transform && !self.transformed.load(Ordering::Acquire);
