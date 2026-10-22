@@ -16,11 +16,11 @@
 //! take that lock for writing, so nobody is left holding a table nobody else can find.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Weak};
 
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use platform::handles::Owned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,7 +32,7 @@ use crate::memory::SitePeak;
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledger9");
+const MAGIC: u64 = u64::from_le_bytes(*b"vledgr10");
 /// The header's page: the heap starts after it, and grows from there.
 const HEADER: u64 = 4096;
 /// The heap's unit: rows take two, a fact as many as its bytes need.
@@ -50,8 +50,8 @@ const ROW: u64 = 1;
 const FACT: u64 = 2;
 
 /// The latch: context, torch, caches, classes (7), remaining, unmeasured, running, outside,
-/// yielded, family, host_peak, host_unmeasured.
-const WORDS: usize = 18;
+/// yielded, family, host_peak, host_unmeasured, returning.
+const WORDS: usize = 19;
 
 #[repr(C)]
 struct Header {
@@ -151,17 +151,19 @@ pub(crate) struct Facts {
     /// measured: the RAM tier keeps their growth free, and fills nothing beside an unmeasured one.
     pub host_peak: u64,
     pub host_unmeasured: u64,
+    /// Subset of P already retiring: charged until completion, then returned without an ask.
+    pub returning: u64,
 }
 
 impl Facts {
     fn words(&self) -> [u64; WORDS] {
         let c = self.classes;
-        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family, self.host_peak, self.host_unmeasured]
+        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family, self.host_peak, self.host_unmeasured, self.returning]
     }
 
     fn of(w: [u64; WORDS]) -> Facts {
-        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured] = w;
-        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured }
+        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning] = w;
+        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning }
     }
 
     fn held(&self) -> u64 {
@@ -270,7 +272,10 @@ impl Shared {
             // SAFETY: the header page is mapped and aligned; its fields are atomics or written
             // once under the heap lock before `magic`.
             let h = unsafe { &mut *(map.base as *mut Header) };
-            if h.magic != MAGIC {
+            if h.magic != 0 && h.magic != MAGIC {
+                return Err(Error::Closed("incompatible live varena table; its owners must finish before reopening".into()));
+            }
+            if h.magic == 0 {
                 h.capacity.store(capacity, Relaxed);
                 h.end.store(HEADER, Relaxed);
                 fence(Release);
@@ -366,7 +371,8 @@ impl Shared {
 
     /// The rows waiting for room (their ids).
     fn waiting(&self) -> Result<Vec<u64>> {
-        self.records(|m, at, w| (kind(w) == ROW && row(m, at)?.waiting.load(Acquire) > 0).then(|| row_id(at, w)))
+        fence(SeqCst);
+        self.records(|m, at, w| (kind(w) == ROW && row(m, at)?.waiting.load(SeqCst) > 0).then(|| row_id(at, w)))
     }
 
     /// Every READY record, read again if the heap's shape moved meanwhile.
@@ -836,10 +842,12 @@ impl Row {
         os::wake_bind(self.shared.ns, &row_wake(&self.shared.name, self.id()))?.ok_or_else(|| Error::Internal("a row's wake is taken".into()))
     }
 
-    /// Marks this row waiting (every change of the table signals it) or not.
-    pub fn set_waiting(&self, waiting: bool) {
-        self.rec(|r| r.waiting.store(u64::from(waiting), Release));
+    /// Registers one waiting thread before it reads the condition. Dropping its guard removes
+    /// only that waiter, including on errors or panic; another thread remains registered.
+    pub fn waiting(&self) -> Waiting<'_> {
+        self.rec(|r| { r.waiting.fetch_add(1, SeqCst); });
         self.shared.event();
+        Waiting(self)
     }
 
     /// Binds this row's ask socket: its owner's ask thread serves it.
@@ -877,6 +885,53 @@ impl Row {
             framed.extend_from_slice(&reply);
             framed
         });
+    }
+}
+
+/// A row's registered wait; no lock is held while the caller checks or waits.
+pub(crate) struct Waiting<'a>(&'a Row);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.rec(|r| { r.waiting.fetch_sub(1, SeqCst); });
+        self.0.shared.event();
+    }
+}
+
+/// One process's row endpoint broadcasts an event to every local waiter. Only one thread
+/// drains the datagrams; an epoch lets all other threads recheck after the same change.
+pub(crate) struct RoomWake {
+    endpoint: Owned,
+    state: Mutex<(u64, bool)>,
+    changed: Condvar,
+}
+
+impl RoomWake {
+    pub fn new(endpoint: Owned) -> Self {
+        Self { endpoint, state: Mutex::new((0, false)), changed: Condvar::new() }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.state.lock().0
+    }
+
+    pub fn wait(&self, epoch: u64) -> Result<()> {
+        let mut state = self.state.lock();
+        while state.0 == epoch {
+            if state.1 {
+                self.changed.wait(&mut state);
+            } else {
+                state.1 = true;
+                drop(state);
+                let result = os::wake_await(&self.endpoint);
+                state = self.state.lock();
+                state.0 = state.0.wrapping_add(1);
+                state.1 = false;
+                self.changed.notify_all();
+                result?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -989,6 +1044,7 @@ pub(crate) fn remotes(rows: &[RowView], own: u64) -> (Vec<Remote>, u64) {
             torch: r.facts.torch,
             caches: r.facts.caches,
             classes: r.facts.classes,
+            returning: if r.live { r.facts.returning.min(r.facts.classes.get(Class::P.index()).copied().unwrap_or(0)) } else { 0 },
         })
         .collect();
     (others, orphans)
@@ -1432,6 +1488,43 @@ mod tests {
         assert!(shared.free(at, ready & !0xff | CLAIMING, false).unwrap());
         shared.leave().unwrap();
         assert!(!os::linked(&shared.fd).unwrap());
+    }
+
+    #[test]
+    fn one_event_releases_every_local_waiter() {
+        let gpu = GpuId { uuid: format!("unit-{}-waiters", std::process::id()), model: "host".into(), memory: 64 << 20 };
+        let shared = Arc::new(Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, gpu.memory).unwrap());
+        let row = shared.claim(std::process::id()).unwrap();
+        let wake = RoomWake::new(row.endpoint().unwrap());
+        let first = row.waiting();
+        let second = row.waiting();
+        drop(first);
+        assert_eq!(shared.waiting().unwrap(), vec![row.id()], "one departing waiter cannot clear another");
+        let epoch = wake.epoch();
+        shared.ring();
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| wake.wait(epoch).unwrap());
+            let b = scope.spawn(|| wake.wait(epoch).unwrap());
+            a.join().unwrap();
+            b.join().unwrap();
+        });
+        drop(second);
+        assert!(shared.waiting().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_incompatible_table_is_refused_without_resetting_live_rows() {
+        let gpu = GpuId { uuid: format!("unit-{}-version", std::process::id()), model: "host".into(), memory: 64 << 20 };
+        let shared = Arc::new(Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, 8 << 20).unwrap());
+        let live = shared.claim(std::process::id()).unwrap();
+        let m = shared.map().unwrap();
+        // SAFETY: no other thread opens or reads this test's private header while it is changed.
+        unsafe { (*(m.base as *mut Header)).magic = u64::from_le_bytes(*b"vledger9"); }
+        assert!(matches!(Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, gpu.memory), Err(Error::Closed(_))));
+        assert_eq!(shared.capacity().unwrap(), 8 << 20);
+        assert!(shared.names(live.id()).unwrap());
+        // SAFETY: as above; restore the fixture's header for normal cleanup.
+        unsafe { (*(m.base as *mut Header)).magic = MAGIC; }
     }
 
     /// A table's namespace is its owner's; a process's own uid is what `grant` reads for it.

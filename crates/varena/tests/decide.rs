@@ -507,3 +507,35 @@ fn sets_place_largest_first_and_stay_on_gpu_0_when_they_fit() {
     assert_eq!(place(&[2 * MB, 3 * MB], &[Some(4 * MB)]), vec![0], "nowhere holds it: GPU 0 pages it");
     assert_eq!(place(&[2 * MB, 9 * MB, 3 * MB], &[None, Some(4 * MB)]), vec![1, 1], "known first; the unknown where the most is left");
 }
+
+/// A withdrawal is not free yet, but it is not permanent pressure either. Settling must
+/// precede a zero-byte trim/orphan request or a cut, and cannot authorize mapping early.
+#[test]
+fn already_returning_bytes_settle_before_any_degradation() {
+    let t = Table { capacity: 10 * MB, pending: 8 * MB, reserved: 2 * MB, sets: vec![set("next", 1, 8 * MB)], ..Table::default() };
+    let trigger = Trigger::Bind { page: (0, 0), req: None, tried: Tried::default() };
+    assert_eq!(t.free(), 0);
+    assert_eq!(t.classes()[Class::P.index()], 8 * MB, "custody bytes stay charged once");
+    assert_eq!(decide(&t, &trigger), vec![Action::Settle]);
+    let settled = Table { pending: 0, ..t };
+    assert_eq!(decide(&settled, &trigger), vec![Action::Map((0, 0))]);
+}
+
+#[test]
+fn remote_returning_bytes_are_reachable_but_not_free() {
+    let mut t = table(8 * MB, vec![], vec![]);
+    t.allocated = 4 * MB;
+    t.reserved = 4 * MB;
+    let mut remote = Remote { row: 7, returning: 4 * MB, ..Remote::default() };
+    remote.classes[Class::P.index()] = 4 * MB;
+    t.others = vec![remote];
+    let trigger = Trigger::Oom { req: 1, set: None, need: Some(4 * MB), site: None, tried: Tried::default() };
+    assert_eq!(t.free(), 0);
+    assert_eq!(t.others[0].held(), 4 * MB, "returning is a subset of P, never an extra charge");
+    assert_eq!(t.reachable(), 4 * MB);
+    assert_eq!(decide(&t, &trigger), vec![Action::Settle]);
+    // A real consumer pin or RAM copy is not retiring just because it might finish later.
+    t.others[0].returning = 0;
+    assert_eq!(t.reachable(), 0);
+    assert_eq!(decide(&t, &trigger), vec![Action::Exhausted { need: 4 * MB }]);
+}

@@ -310,6 +310,8 @@ pub struct Remote {
     /// Of `torch`, what its trim hook and caches give back when it is idle.
     pub caches: u64,
     pub classes: [u64; 7],
+    /// Subset of P already retiring; still held, but reachable after its completion.
+    pub returning: u64,
 }
 
 impl Remote {
@@ -319,7 +321,7 @@ impl Remote {
 
     /// What no ask can free: its context, torch's bytes beyond its idle caches, W and P.
     pub fn unevictable(&self) -> u64 {
-        self.held().saturating_sub(self.evictable(Class::D))
+        self.held().saturating_sub(self.evictable(Class::D) + self.returning.min(self.classes.get(Class::P.index()).copied().unwrap_or(0)))
     }
 
     /// What its ask thread can free under `ceiling`.
@@ -444,6 +446,13 @@ impl Table {
 
     pub fn held(&self) -> u64 {
         self.context + self.torch() + self.mapped() + self.pending
+    }
+
+    /// Bytes already retiring. Own unmaps are ordered before subsequent creates and counted
+    /// as free locally; custody's copy still holds pending bytes. Other rows remain charged
+    /// until their completion is published.
+    pub fn returning(&self) -> u64 {
+        self.pending + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
     }
 
     fn others_held(&self) -> u64 {

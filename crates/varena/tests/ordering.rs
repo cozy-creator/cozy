@@ -1155,3 +1155,35 @@ fn a_page_being_saved_is_unmapped_only_after_its_copy() {
     let at = |what: &str| calls.iter().position(|(c, a)| *c == what && *a == saved);
     assert!(at("save") < at("unmap") && at("save").is_some(), "unmapped under its copy: {calls:?}");
 }
+
+/// A previous unload can still be waiting for custody when an independent bind starts.
+/// Preparation waits outside the state lock; allocator recovery refuses without waiting.
+#[test]
+fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("pendingwithdraw-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
+    gate.open();
+    serve_custody(&uuid, gate.clone(), log.clone());
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events })).unwrap());
+    let a = mem.load(stored(dir.path(), &uuid, "old", 1), Level::Gpu).unwrap();
+    let b = mem.load(stored(dir.path(), &uuid, "next", 1), Level::Ram).unwrap();
+    mem.settle();
+    gate.close();
+    mem.unload(a);
+    log.await_call(|(_, call)| call.contains("Withdraw"));
+    assert_eq!(mem.torch_limit(), 0, "the queued custody handle still holds the page");
+    let request = mem.request("pending", Plan::default()).unwrap();
+    assert_eq!(request.reclaim_allocation(None, REGION_ALIGN, Torch::default()).unwrap(), 0, "the allocator never waits for custody");
+    let binder = {
+        let mem = mem.clone();
+        std::thread::spawn(move || drop(mem.bind(b, 0, 0).unwrap()))
+    };
+    // Probe the state lock while preparation may be settling, then release the exact hold.
+    mem.torch_limit();
+    gate.open();
+    binder.join().unwrap();
+}
