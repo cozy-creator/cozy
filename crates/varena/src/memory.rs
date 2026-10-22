@@ -1178,9 +1178,12 @@ impl Inner {
     }
 
     /// Waits for a fill or release on the state lock's condvar.
-    fn wait(&self, st: &mut MutexGuard<'_, State>) {
+    fn wait(&self, st: &mut MutexGuard<'_, State>) -> Result<()> {
+        self.check_ownership()?;
         self.landed.wait(st);
+        self.check_ownership()?;
         self.drain(st);
+        Ok(())
     }
 
     fn poll_releases(&self, st: &mut State, keep: bool) -> bool {
@@ -1547,13 +1550,13 @@ impl Inner {
 
     /// A fill thread's batch: each page from the tier, else the store, in as few engine reads as
     /// its sets allow; then each page's ready event.
-    fn fill(&self, jobs: &[Job]) {
+    fn fill(self: &Arc<Self>, jobs: &[Job]) {
         self.fill_batch(jobs);
         // Their fills' events follow them in-stream (or were dropped): nobody needs them now.
         jobs.iter().flat_map(|j| &j.after).for_each(|e| self.backend.retire(*e));
     }
 
-    fn fill_batch(&self, jobs: &[Job]) {
+    fn fill_batch(self: &Arc<Self>, jobs: &[Job]) {
         // Under one lock: each live job's place, and its set's spec and tier layout.
         let (sets, pages) = {
             let st = self.state.lock();
@@ -1581,6 +1584,10 @@ impl Inner {
         let drained = landed.iter().all(Result::is_ok) || self.backend.drain().is_ok();
         let mut sticky = false;
         let mut st = self.state.lock();
+        if !drained {
+            self.ownership_lost.store(true, Ordering::Release);
+            std::mem::forget(self.clone());
+        }
         for ((job, (.., span)), landed) in pages.iter().zip(landed) {
             let span = *span;
             if st.homes.get(&job.key).is_none_or(|h| h.gen != job.gen) {
@@ -1632,7 +1639,8 @@ impl Inner {
                         let _ = self.unmap(&mut st, job.key, Class::P, None, true);
                     }
                     if !speculative || !drained {
-                        st.failed.insert(job.key, e);
+                        let error = if drained { e } else { Error::Ownership(format!("fill failed ({e}); its copies did not drain")) };
+                        st.failed.insert(job.key, error);
                     }
                 }
             }
@@ -1771,7 +1779,7 @@ impl Inner {
     fn after_fills(&self) -> bool {
         let mut st = self.lock();
         while !self.burst.0.lock().closed && st.homes.values().any(|h| h.filling) {
-            self.wait(&mut st);
+            if self.wait(&mut st).is_err() { return false; }
         }
         !self.burst.0.lock().closed
     }
@@ -1789,7 +1797,8 @@ impl Inner {
     /// Copies a filled page into the RAM tier when the host has the room: speculation, so it
     /// soft-fails. The page is pinned meanwhile (a consumer: never unmapped under the copy); one
     /// unmapped or changed since it was queued is not copied.
-    fn save(&self, s: &Save) {
+    fn save(self: &Arc<Self>, s: &Save) {
+        if self.check_ownership().is_err() { return; }
         let (pin, held, (va, off, span), ready) = {
             let mut st = self.lock();
             let home = st.homes.get(&s.key).filter(|h| h.gen == s.gen && h.filled && !h.filling && !h.transforming).map(|h| h.ready);
@@ -1804,18 +1813,57 @@ impl Inner {
             (pin, held, place, ready)
         };
         let start = Instant::now();
-        let saved = self.tier.as_ref().is_some_and(|t| t.room(span))
-            && held
+        let permit = self.tier.as_ref().and_then(|t| t.reserve(span));
+        let result = match permit.as_ref() {
+            None => Ok(false),
+            Some(_) => held
                 .fill(&[s.key.1], |regions| {
                     regions.iter().try_for_each(|(_, dst)| match dst {
-                        // SAFETY: the region is mapped writable for its `len` bytes and
-                        // write-locked by this process.
-                        Dst::Host { ptr, len } => self.backend.save(va, off, unsafe { std::slice::from_raw_parts_mut(*ptr, (*len).min(span as usize)) }, ready),
-                        Dst::Device { .. } => Err(Error::Internal("a tier region is host memory".into())),
+                        // SAFETY: the region is mapped writable and write-locked for this fill.
+                        Dst::Host { ptr, len } => {
+                            let out = self.backend.save(
+                                va,
+                                off,
+                                unsafe {
+                                    std::slice::from_raw_parts_mut(*ptr, (*len).min(span as usize))
+                                },
+                                ready,
+                            );
+                            if let Err(e) = &out {
+                                if let Err(drain) = self.backend.drain_save() {
+                                    return Err(Error::Ownership(format!(
+                                        "RAM save failed ({e}); its stream did not drain ({drain})"
+                                    )));
+                                }
+                            }
+                            out
+                        }
+                        Dst::Device { .. } => {
+                            Err(Error::Internal("a tier region is host memory".into()))
+                        }
                     })
                 })
-                .map_err(|e| tracing::warn!("varena: copying {:?} into the RAM tier failed: {e}", s.key))
-                .is_ok();
+                .map(|()| true),
+        };
+        if let Err(e) = &result {
+            tracing::warn!("varena: copying {:?} into the RAM tier failed: {e}", s.key);
+            if e.is_sticky() {
+                // Publish failure while holding the same lock as condvar waiters, so none
+                // misses the wake and waits forever on this deliberately preserved pin.
+                let st = self.state.lock();
+                self.ownership_lost.store(true, Ordering::Release);
+                drop(st);
+                self.landed.notify_all();
+            }
+            if matches!(e, Error::Ownership(_)) {
+                // Held.fill preserves its destination maps and locks. Preserve the source
+                // pin, reservation and host promise until this failed executor exits too.
+                std::mem::forget((permit, held, self.clone()));
+                return;
+            }
+        }
+        let saved = result.unwrap_or(false);
+        drop(permit);
         let ns = start.elapsed().as_nanos() as u64;
         let mut st = self.lock();
         st.pins.remove(&pin);
@@ -1912,7 +1960,7 @@ impl Inner {
             // waits for it, then decides again.
             if remote.is_empty() && st.saving.is_some() && matches!(actions.last(), Some(Action::Exhausted { .. } | Action::Park(_))) {
                 while st.saving.is_some() {
-                    self.wait(&mut st);
+                    self.wait(&mut st)?;
                 }
                 self.unlock(st);
                 continue;
@@ -2093,7 +2141,7 @@ impl Inner {
 
     // ---- the calls
 
-    fn load(&self, spec: SetSpec, level: Level) -> Result<SetId> {
+    fn load(self: &Arc<Self>, spec: SetSpec, level: Level) -> Result<SetId> {
         let (id, again) = {
             let mut st = self.lock();
             let existing = st.sets.iter().position(|m| m.as_ref().is_some_and(|m| m.spec.name == spec.name && !m.closing));
@@ -2146,7 +2194,7 @@ impl Inner {
                 self.demand(Trigger::Load { set: id }, None)?;
                 let mut st = self.lock();
                 while st.table.pages().any(|(k, p)| k.0 == id && p.filling) {
-                    self.wait(&mut st);
+                    self.wait(&mut st)?;
                 }
                 self.unlock(st);
             }
@@ -2182,7 +2230,7 @@ impl Inner {
     /// everything left in one read when it has the room, else half as much, until a region does
     /// not fit. A declared set's tier holds its transformed bytes: only its filled pages go
     /// there.
-    fn load_ram(&self, set: u32) -> Result<()> {
+    fn load_ram(self: &Arc<Self>, set: u32) -> Result<()> {
         let (spec, held) = {
             let st = self.lock();
             let m = st.mech(set)?;
@@ -2196,11 +2244,19 @@ impl Inner {
         while want > 0 {
             let batch: Vec<u32> = (at..at + want).map(|r| r as u32).collect();
             let bytes = regions.iter().skip(at).take(want).map(|r| r.span).sum();
-            if !tier.room(bytes) {
+            let Some(permit) = tier.reserve(bytes) else {
                 want /= 2;
                 continue;
+            };
+            let filled = held.fill(&batch, |hosts| self.store(&spec, hosts));
+            if matches!(&filled, Err(Error::Ownership(_))) {
+                let st = self.state.lock();
+                self.ownership_lost.store(true, Ordering::Release);
+                drop(st);
+                self.landed.notify_all();
+                std::mem::forget((permit, held.clone(), self.clone()));
             }
-            held.fill(&batch, |hosts| self.store(&spec, hosts))?;
+            filled?;
             at += want;
             want = regions.len() - at;
         }
@@ -2293,7 +2349,7 @@ impl Inner {
                 Some(h) if h.identity != identity => {
                     hit = false;
                     waited = true;
-                    self.wait(&mut st);
+                    self.wait(&mut st)?;
                 }
                 Some(h) if h.filled || !(h.filling || h.transforming) => {
                     speculative |= h.speculative;
@@ -2303,7 +2359,7 @@ impl Inner {
                     speculative |= h.speculative;
                     hit = false;
                     waited = true;
-                    self.wait(&mut st);
+                    self.wait(&mut st)?;
                 }
                 None => {
                     hit = false;
@@ -3311,7 +3367,10 @@ impl Drop for Pin {
                 tracing::warn!("varena: recording a release failed ({e}); synchronizing its stream");
                 if let Err(e) = self.inner.backend.synchronize(self.stream) {
                     tracing::error!("varena: cannot prove consumer completion; quarantining pin {}: {e}", self.id);
+                    let st = self.inner.state.lock();
                     self.inner.ownership_lost.store(true, Ordering::Release);
+                    drop(st);
+                    self.inner.landed.notify_all();
                     // Keep the backend and reservation too, even if this was their last owner.
                     std::mem::forget(self.inner.clone());
                     return;

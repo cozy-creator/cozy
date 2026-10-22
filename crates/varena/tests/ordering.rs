@@ -71,6 +71,8 @@ struct Events {
     hold_save: AtomicBool,
     save_gate: Gate,
     save_waits: Gate,
+    fail_save: AtomicBool,
+    fail_save_drain: AtomicBool,
 }
 
 /// Holds the call when `hold` is set: `waits` opens, then it passes `gate`.
@@ -209,6 +211,9 @@ impl Backend for Stream {
         held(&self.events.hold_save, &self.events.save_waits, &self.events.save_gate);
         self.host.save(va, offset, host, after)?;
         self.events.calls.lock().push(("save", va.base + offset));
+        if self.events.fail_save.swap(false, Ordering::SeqCst) {
+            return Err(varena::Error::Device { op: "save", code: 999, name: "copy completion unknown".into() });
+        }
         Ok(())
     }
     fn fence(&self) -> Result<Event> {
@@ -266,6 +271,13 @@ impl Backend for Stream {
         self.events.retiring.notify_all();
     }
     fn drain(&self) -> Result<()> {
+        Ok(())
+    }
+    fn drain_save(&self) -> Result<()> {
+        self.events.log("drain_save");
+        if self.events.fail_save_drain.load(Ordering::SeqCst) {
+            return Err(varena::Error::Device { op: "drain_save", code: 999, name: "stream completion unknown".into() });
+        }
         Ok(())
     }
 }
@@ -759,6 +771,9 @@ impl Backend for Driver {
     fn drain(&self) -> Result<()> {
         self.host.drain()
     }
+    fn drain_save(&self) -> Result<()> {
+        self.host.drain_save()
+    }
 }
 
 /// A stored set `name` of `regions` regions, its fills kept (a declared, stored identity).
@@ -1161,6 +1176,87 @@ fn a_page_being_saved_is_unmapped_only_after_its_copy() {
     let calls = events.calls.lock().clone();
     let at = |what: &str| calls.iter().position(|(c, a)| *c == what && *a == saved);
     assert!(at("save") < at("unmap") && at("save").is_some(), "unmapped under its copy: {calls:?}");
+}
+
+/// An unknown copy completion deliberately retains owners until process exit. Run each
+/// case in its own process, so its quarantined tier reservation cannot affect other tests.
+#[test]
+fn failed_saves_release_memory_only_after_the_save_stream_drains() {
+    for drained in [true, false] {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["failed_save_child", "--exact", "--ignored", "--nocapture"])
+            .env("VARENA_TEST_SAVE_DRAINED", if drained { "1" } else { "0" })
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "drained={drained}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+#[ignore = "subprocess entry for failed_saves_release_memory_only_after_the_save_stream_drains"]
+fn failed_save_child() {
+    let drained = std::env::var("VARENA_TEST_SAVE_DRAINED").unwrap() == "1";
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("failedsave-{}", std::process::id());
+    let g = GpuId {
+        uuid: uuid.clone(),
+        model: "host".into(),
+        memory: REGION_ALIGN,
+    };
+    let _scope = Scope::new(&uuid);
+    let events = Arc::new(Events::default());
+    let mem = Memory::open(
+        g.clone(),
+        None,
+        Box::new(Stream {
+            host: HostBackend::new(g.memory),
+            events: events.clone(),
+        }),
+    )
+    .unwrap();
+    events.hold_save.store(true, Ordering::SeqCst);
+    events.fail_save.store(true, Ordering::SeqCst);
+    events.fail_save_drain.store(!drained, Ordering::SeqCst);
+    let id = mem
+        .load(stored(dir.path(), &uuid, "s", 1), Level::Gpu)
+        .unwrap();
+    events.save_waits.pass();
+    let request = mem.request("save-error", Plan::default()).unwrap();
+    events.save_gate.open();
+    events.await_log(|calls| calls.contains(&"drain_save"));
+    if drained {
+        mem.settle();
+        request.check().unwrap();
+        mem.unload(id);
+        mem.settle();
+        assert_eq!(
+            events.unmaps.load(Ordering::SeqCst),
+            1,
+            "drained source can be unmapped"
+        );
+    } else {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while request.check().is_ok() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(matches!(request.check(), Err(varena::Error::Ownership(_))));
+        assert!(matches!(
+            mem.bind(id, 0, 0),
+            Err(varena::Error::Ownership(_))
+        ));
+        drop(request);
+        drop(mem);
+        assert_eq!(
+            events.unmaps.load(Ordering::SeqCst),
+            0,
+            "uncertain source survives the last public owner"
+        );
+    }
 }
 
 /// A previous unload can still be waiting for custody when an independent bind starts.
