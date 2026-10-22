@@ -207,8 +207,9 @@ pub struct Pin {
     pub ptr: u64,
     pub len: u64,
     pub ready: Event,
-    /// The bytes were just copied: a set with a declared fill runs its transform, then
-    /// [`Pin::filled`].
+    /// Run the transform now: the page's bytes are not the weights yet (a declared or
+    /// undeclared fill's store bytes); [`Pin::filled`] after it. Never for bytes that are the
+    /// weights (stored, kept, or a transformed page from the RAM tier).
     pub fresh: bool,
     inner: Arc<Inner>,
     key: Key,
@@ -258,9 +259,7 @@ struct Home {
     gen: u64,
     filled: bool,
     filling: bool,
-    /// Landed and not yet bound: the next binder gets `fresh`.
-    fresh: bool,
-    /// A binder holds it fresh and runs the set's transform.
+    /// A binder holds it fresh ([`Home::fresh`]) and runs the set's transform.
     transforming: bool,
     exported: bool,
     origin: Origin,
@@ -272,6 +271,13 @@ struct Home {
     keep_after: bool,
     /// Its Keep (read-only, export) is with the mechanism thread.
     keeping: bool,
+}
+
+impl Home {
+    /// Its bytes landed and are not the weights yet: its binder runs the transform.
+    fn fresh(&self) -> bool {
+        !self.filled && !self.filling && !self.transforming
+    }
 }
 
 /// A call to the device's virtual-memory mechanism (`cuMemCreate`, `cuMemMap`,
@@ -354,10 +360,12 @@ impl Burst {
     }
 }
 
-/// A filled page to copy into the RAM tier (`gen`: as it was filled) for request `req`.
+/// A filled page to copy into the RAM tier layout `tier` (`gen`: as it was filled) for request
+/// `req`.
 struct Save {
     key: Key,
     gen: u64,
+    tier: String,
     req: Option<u64>,
 }
 
@@ -769,7 +777,8 @@ impl Memory {
             let mut st = self.inner.lock();
             let r = self.inner.refill(&mut st, set.0, fill);
             self.inner.unlock(st);
-            r
+            r?;
+            self.inner.open_tier(set.0)
         });
     }
 
@@ -975,6 +984,15 @@ impl Inner {
             return Ok(());
         }
         m.spec.fingerprint.fill = fill;
+        // The tier holds bytes by identity: another identity's layout is another layout.
+        let tier = tier_name(&m.spec);
+        if tier != m.tier {
+            let (old, held) = (std::mem::replace(&mut m.tier, tier), m.held.take());
+            if let Some(held) = held {
+                self.post(Call::Unpin(held));
+            }
+            self.post(Call::Close { digest: old });
+        }
         let declared = m.spec.fingerprint.declared();
         if let Some(Some(s)) = st.table.sets.get_mut(set as usize) {
             s.declared = declared;
@@ -1114,7 +1132,7 @@ impl Inner {
             let gen = st.tick();
             // Pinned (filling) until the mechanism maps it.
             self.mech.post(Mech::Adopt { key, gen, va, off, phys: phys.id, len: phys.len, identity: identity.clone() }, 0);
-            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, gen, filled: false, filling: true, fresh: false, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false });
+            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false });
             st.sync(key);
             let s = st.fills(req, key, span, Origin::Kept);
             s.moved.kept.bytes += span;
@@ -1138,7 +1156,7 @@ impl Inner {
         let decided = st.table.free();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, gen, filled: false, filling: true, fresh: false, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false });
+        st.homes.insert(key, Home { phys: None, ready: Event::DONE, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false });
         st.sync(key);
         self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, speculative, decided }, 0);
         Ok(true)
@@ -1159,7 +1177,7 @@ impl Inner {
         // Kept, or with a Keep queued: never written again; a fresh page takes its place.
         let phys = if exported || h.keeping { h.phys.take() } else { None };
         let renew = phys.is_some();
-        *h = Home { phys: h.phys.take(), ready: Event::DONE, gen, filled: false, filling: true, fresh: false, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false };
+        *h = Home { phys: h.phys.take(), ready: Event::DONE, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
         let job = Job { key, gen, req, span, after: vec![] };
@@ -1261,7 +1279,6 @@ impl Inner {
                         h.ready = ready;
                         h.filling = false;
                         h.filled = filled;
-                        h.fresh = true;
                         h.origin = origin;
                     }
                     st.sync(job.key);
@@ -1432,9 +1449,11 @@ impl Inner {
     /// Queues a copy of a page just filled with its tier's bytes into the RAM tier, unless it
     /// has no tier layout or the tier holds it.
     fn save_later(&self, st: &State, key: Key, req: Option<u64>) {
-        let held = st.mech(key.0).ok().and_then(|m| m.held.as_ref());
-        let Some(gen) = st.homes.get(&key).map(|h| h.gen).filter(|_| held.is_some_and(|h| !h.holds(key.1))) else { return };
-        self.saves.post(Save { key, gen, req }, 0);
+        let Ok(m) = st.mech(key.0) else { return };
+        // Bytes of the set's current identity only: its layout is that identity's.
+        let current = |h: &&Home| h.identity == m.spec.fingerprint.key();
+        let Some(gen) = st.homes.get(&key).filter(current).map(|h| h.gen).filter(|_| m.held.as_ref().is_some_and(|h| !h.holds(key.1))) else { return };
+        self.saves.post(Save { key, gen, tier: m.tier.clone(), req }, 0);
     }
 
     /// Copies a filled page into the RAM tier when the host has the room: speculation, so it
@@ -1444,7 +1463,8 @@ impl Inner {
         let (pin, held, (va, off, span), ready) = {
             let mut st = self.lock();
             let home = st.homes.get(&s.key).filter(|h| h.gen == s.gen && h.filled && !h.filling && !h.transforming).map(|h| h.ready);
-            let held = st.mech(s.key.0).ok().and_then(|m| m.held.clone()).filter(|h| !h.holds(s.key.1));
+            // Only into the layout of the identity it was filled under.
+            let held = st.mech(s.key.0).ok().filter(|m| m.tier == s.tier).and_then(|m| m.held.clone()).filter(|h| !h.holds(s.key.1));
             let (Some(ready), Some(held), Ok(place)) = (home, held, st.place(s.key)) else { return };
             let pin = st.tick();
             st.pins.insert(pin, (s.key, None, std::thread::current().id()));
@@ -1956,8 +1976,8 @@ impl Inner {
         let id = st.tick();
         let now = st.clock;
         let Some(h) = st.homes.get_mut(&key) else { return Err(Error::Internal("a bound page lost its home".into())) };
-        let fresh = std::mem::take(&mut h.fresh);
-        let transform = fresh && !h.filled;
+        let fresh = h.fresh();
+        let transform = fresh;
         if transform {
             h.transforming = true;
         }
