@@ -462,6 +462,8 @@ impl Stream {
     pub fn drain(&self) -> Result<()> {
         let driver = driver()?;
         let _context = CtxGuard::enter(self.ctx)?;
+        // A host wait: a trace span, so a subscriber can time each.
+        let _wait = tracing::trace_span!("tensorfs cuStreamSynchronize").entered();
         check("cuStreamSynchronize", unsafe {
             (driver.stream_synchronize)(self.raw)
         })
@@ -475,6 +477,7 @@ impl Drop for Stream {
     fn drop(&mut self) {
         if let Ok(driver) = driver() {
             if let Ok(_ctx) = CtxGuard::enter(self.ctx) {
+                let _wait = tracing::trace_span!("tensorfs cuStreamSynchronize (drop)").entered();
                 unsafe {
                     (driver.stream_synchronize)(self.raw);
                     (driver.stream_destroy)(self.raw);
