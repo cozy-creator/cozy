@@ -104,6 +104,8 @@ pub trait Backend: Send + Sync {
     fn retire(&self, event: Event);
     /// After a device error: proves the copy stream's work complete or fails.
     fn drain(&self) -> Result<()>;
+    /// After a failed save: proves the independent device-to-host stream complete or fails.
+    fn drain_save(&self) -> Result<()>;
 }
 
 /// Pages in host memory: a memfd each, mapped into a reserved range. Its export is a read-only
@@ -309,6 +311,9 @@ mod host {
         fn drain(&self) -> Result<()> {
             Ok(())
         }
+        fn drain_save(&self) -> Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -400,6 +405,9 @@ mod host {
         }
         fn retire(&self, _: Event) {}
         fn drain(&self) -> Result<()> {
+            Ok(())
+        }
+        fn drain_save(&self) -> Result<()> {
             Ok(())
         }
     }

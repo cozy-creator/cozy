@@ -1112,6 +1112,7 @@ impl Backend for Timed {
     fn unregister_host(&self, ptr: u64) -> varena::Result<()> { self.1.time("unregister_host", || self.0.unregister_host(ptr)) }
     fn retire(&self, event: Event) { self.1.time("retire", || self.0.retire(event)) }
     fn drain(&self) -> varena::Result<()> { self.1.time("drain", || self.0.drain()) }
+    fn drain_save(&self) -> varena::Result<()> { self.1.time("drain_save", || self.0.drain_save()) }
 }
 
 /// Memory over the timed CUDA backend, and its timings.

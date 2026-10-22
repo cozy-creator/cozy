@@ -440,6 +440,11 @@ impl Backend for CudaBackend {
         Ok(tensorfs::io::drain(self.ordinal)?)
     }
 
+    fn drain_save(&self) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        Ok(call!("cuStreamSynchronize", stream_synchronize(self.saves.raw as CUstream))?)
+    }
+
     /// Read-only where the device can (attribute 113), else read-write, which a read-only mapping
     /// refuses: the caller then stages. A range already registered by another owner is refused,
     /// never borrowed; one this backend holds stays as it is.

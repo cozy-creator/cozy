@@ -240,6 +240,9 @@ impl Backend for Recording {
     fn drain(&self) -> varena::Result<()> {
         self.host.drain()
     }
+    fn drain_save(&self) -> varena::Result<()> {
+        self.host.drain_save()
+    }
 }
 
 /// Runs commands over one Memory until stdin ends. Every command answers one line.
