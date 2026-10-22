@@ -2876,11 +2876,13 @@ fn a_graph_replays_across_a_streamed_sets_slot_moves() {
     step!();
 }
 
-/// The floor holds: activations take all but a few blocks' room (through the allocator hook), and a set bigger than
-/// what is left still streams through the slots, every block exact. Weights never cause an OOM.
+/// The floor is the activations and one block, under a 1 GiB cap. Activations (through the allocator hook) take all
+/// but four blocks' room, and a set bigger than the rest streams. Then they grow by three blocks: the hook takes the
+/// set's slots in place, down to one, and a second pass streams through that last slot. Every block is exact, and
+/// weights never cause an OOM.
 #[test]
 #[ignore = "native GPU: a rental only"]
-fn the_floor_holds_with_activations_taking_all_but_the_slots() {
+fn the_floor_is_the_activations_and_one_block() {
     let (b, g, uuid) = card("floor");
     step!();
     let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
@@ -2891,25 +2893,31 @@ fn the_floor_holds_with_activations_taking_all_but_the_slots() {
     step!();
     let r = mem.request("floor", plan(&[&["big"]])).unwrap();
     step!();
-    // Activations: all but eight blocks' room, through the hook (make_room) as torch's allocator takes them.
     let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
-    let activations = mem.free().saturating_sub(8 * REGION_ALIGN);
-    let held = segment(&mem, &torch, activations, &callbacks).expect("the activations");
-    step!();
-    let pass = r.pass(s, "fwd|1").unwrap();
-    for b in 0..blocks {
-        let pin = mem.bind(s, b, 0).unwrap_or_else(|e| panic!("block {b} beside the activations: {e}"));
-        assert!(exact(&pin, &block(100, b), 0), "block {b} streamed in with other bytes");
+    let (mut held, mut passes) = (vec![], vec![]);
+    for (room, more) in [(4, mem.free().saturating_sub(4 * REGION_ALIGN)), (1, 3 * REGION_ALIGN)] {
+        let seg = segment(&mem, &torch, more, &callbacks).unwrap_or_else(|| panic!("activations leaving {room} blocks of room: refused"));
+        held.push((seg, more));
+        step!();
+        let (c, m) = (timings.count("create"), timings.count("map"));
+        let pass = r.pass(s, "fwd|1").unwrap();
+        for b in 0..blocks {
+            let pin = mem.bind(s, b, 0).unwrap_or_else(|e| panic!("block {b} beside activations leaving {room} blocks of room: {e}"));
+            assert!(exact(&pin, &block(100, b), 0), "block {b} streamed in with other bytes");
+        }
+        pass.end(0);
+        passes.push((room, timings.count("create") - c, timings.count("map") - m));
+        step!();
     }
-    pass.end(0);
+    println!("FLOOR {} B of activations; per pass (blocks of room, creates, maps): {passes:?}; make_room {}", *torch.lock(), callbacks.report());
     step!();
-    println!("FLOOR {activations} B of activations; {blocks} blocks streamed beside them; creates {}, maps {}, unmaps {}", timings.count("create"), timings.count("map"), timings.count("unmap"));
-    step!();
-    unsegment(&torch, held, activations);
+    for (seg, size) in held {
+        unsegment(&torch, seg, size);
+    }
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
-    println!("PASS the floor holds with activations taking all but the slots {uuid}");
+    println!("PASS the floor is the activations and one block {uuid}");
     step!();
 }
 
