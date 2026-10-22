@@ -50,7 +50,7 @@ spelling. A reader also accepts `<kind>/1.<minor>`, the minor one or more decima
 | Document | `format` kind | Encoding (§9) | Usual name |
 |---|---|---|---|
 | tree | `cozytensors.tree` | JSON object | an object, cited by a repo |
-| header | `cozytensors` | CBOR array | the tree file `model.<variant>.cozytensors` |
+| header | `cozytensors` | CBOR array | any tree file ending in `.cozytensors` |
 | repo | `cozytensors.repo` | JSON object | `refs/<org>/<name>.json` |
 
 The schemas describe structure; they do not replace the rules below for canonical encoding, duplicate keys,
@@ -74,10 +74,12 @@ or more segments joined by `/`.
 ```
 
 - Every key of `files` MUST be a path whose first segment is not `chunks` (a plain folder's chunk directory).
-- A **variant** is a root-level entry named `model.<variant>.cozytensors`, or `model.cozytensors` for the unnamed
-  variant `""`. `<variant>` is non-empty and the resulting filename MUST be a valid segment. A nested path such
-  as `examples/model.bf16.cozytensors` is an ordinary repo file, not a variant. The variant's object is its header
-  (§4), and its id.
+- A **variant** is any file ending in `.cozytensors`, at any depth. Its identity within the tree is
+  its full path; its object is the header. Filenames convey no precision, layout or GPU requirements.
+  An explicit choice resolves the exact path first, then the path with `.cozytensors` appended.
+  For older callers only, a root-level shorthand also resolves `model.<name>.cozytensors` when
+  neither prior path exists; it never searches nested folders. The empty legacy name names
+  `model.cozytensors`. Every successful lookup returns the canonical full path.
 - Every other file (README, LICENSE, images, code) is a **repo file**: an object shared by all variants and never
   cited by a header. A tree without variants holds no tensors.
 
@@ -680,9 +682,9 @@ A repo is a set of **commits** and the **tags** that point at them, as in git:
     it (the default's if it does, else the last-created tag's whose commit does); else not found;
   - otherwise the tag of that name, yanked or not (a reader MAY warn); else not found.
 
-  The variant is then looked up in that commit's tree. Without an explicit variant, exactly one variant is selected
-  automatically; zero gives no variant and more than one requires an explicit choice. The unnamed variant has no
-  implicit priority over other variants. A commit id and a header digest name immutable content; a tag moves,
+  The variant is then looked up in that commit's tree. An explicit path or header digest fixes the
+  variant. Otherwise the constraints rule below selects one from header-derived profiles. A commit
+  id and a header digest name immutable content; a tag moves,
   and a commit it leaves stays the repo's (below).
 - **Roots.** Every commit the repo has is a referenced root: its tags' commits, yanked or private included, and every
   commit a tag has named, until the repo's owner deletes it. A commit no tag names is never collected on its own.
@@ -705,6 +707,52 @@ Closure follows only these defined reference slots. Object contents and unknown 
 an object reference that merely appears inside metadata is not a dependency. Same-major extensions MUST put
 additional required dependencies in the existing chunk, asset or tree-file slots. They MUST NOT require an old
 reader, copier or collector to discover a new kind of reference edge.
+
+### Variant selection
+
+`conformance/vectors/select.json` and its `select/*.cbor` headers are the shared selection vectors.
+Rust and Hub readers MUST agree. Selection reads headers, never tensor payloads.
+Consumers pass `{gpus: ["major.minor", ...], bits?: 4|8|16}`; no GPUs means CPU, omitted bits means 8.
+A device set supports an encoding only when every device does. Unread capabilities conservatively
+have no encoded GPU formats. BF16 is preferred unless a known GPU is below compute capability 8.0.
+
+A header's profile is `{family, bits, bytes, kinds}`. A tensor's kind is its encoding scheme or,
+for plain tensors, its dtype. Sum the lengths of all tensor locations (including encoded parts)
+by kind. `bytes` is their total, `kinds` their sorted unique names. The dominant kind has the most
+stored bytes, with lexical kind order breaking ties. Its family and bits are:
+
+| Dominant kind | family | bits |
+| --- | --- | --- |
+| BF16, F16, F32 | bf16, fp16, f32 respectively | 16 (the unquantized preference) |
+| int8.*, fp8.* | int8, fp8 | 8 |
+| nvfp4, mxfp4, int4.* | nvfp4, mxfp4, int4 | 4 |
+| any other | empty | 0 |
+
+Known plain dtypes are readable on any target. Encoded int8 requires capability >=8.0 except 10.3;
+fp8 requires >=8.9; nvfp4, mxfp4 and int4 require >=8.0 (weight-only below native FP4 capability 10.0).
+Only schemes this reader implements are eligible, even when an unknown scheme has a known family prefix.
+Unknown encodings or dtypes remain readable as raw metadata but are skipped by automatic selection.
+Every kind must satisfy these requirements, even a small minority kind in the header.
+
+At 4 bits the family order is FP4, int8, fp8, BF16, FP16, F32; at 8 bits omit FP4; at 16 bits omit
+all encoded families. Remove GPU-incompatible encoded families; place FP16 before BF16 only for a
+known pre-8.0 GPU. FP4 includes nvfp4, mxfp4 and int4. Within a family prefer native over weight-only,
+then fewer stored bytes, then lexical full path. At 16 bits every kind must be a plain dtype. If none ranks, the sole variant with no precision
+family may serve only when all its kinds are runnable (for example, a plain integer-only header). Otherwise selection is null.
+Fallback reasons use precision families, never variant filenames; the vectors define their text.
+
+The Hub indexes profiles and the repo's ordered tag document transactionally with a repo write.
+It stages rows, performs the object store's conditional PUT inside that transaction, records the
+returned ETag, then commits. A failed PUT rolls back. A read detects a newer repo-file ETag and repairs
+that repository's index, including a process loss after PUT but before COMMIT. Its indexed endpoint
+is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8`; the response has `release`,
+`commit`, `variant`, `header`, `profile` and `reasons`. No fitting variant is HTTP200 with null fields;
+invalid bits is HTTP400. Read permissions and explicit yanked-tag behavior match ordinary resolution.
+The current index covers commits named by repo tags. An untagged retained commit can be readable
+without a selection index entry; HTTP404 from this optional route does not establish that the
+commit is absent. A static origin or older Hub can also omit the route. Clients retain the exact
+immutable commit and the requested constraints and apply the same pure rule to its headers;
+they never substitute a tagged default. Explicit owner deletion and commit retention are unchanged.
 
 ## 8. Versioning
 

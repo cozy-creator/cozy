@@ -98,8 +98,8 @@ pub fn local(store: &Store, repo: &str, revision: Option<&str>, variant: Option<
     let Some((tag, cited)) = found else {
         return Err(absent(format!("{repo} has no revision {}", revision.unwrap_or(MAIN))));
     };
-    let variant = pick_variant(revision, cited, variant).map_err(|e| absent(e.to_string()))?;
     let parsed = store.tree(&tag.commit).map_err(io_error)?;
+    let variant = pick_variant(&parsed, revision, cited, variant).map_err(|e| absent(e.to_string()))?;
     let (variant, header) = parsed.variant(variant.as_deref()).map_err(|e| absent(e.to_string()))?;
     Ok(Some(Local { release: tag.name.clone(), variant: variant.into(), header: header.clone(), tree: tag.commit.clone() }))
 }

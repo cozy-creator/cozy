@@ -48,7 +48,7 @@ def convert_to_cozytensors(source: str | Sequence[str], *, converter: str | None
 def download_file(repo_id: str, filename: str, *, revision: str | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None) -> str:
     ...
 
-def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | None=None, endpoint: str | None=None, local_files_only: bool=False, cache_dir: StrPath | None=None, token: Token | None=None, lazy: bool=True) -> Checkpoint:
+def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | None=None, bits: int | None=None, gpus: Sequence[str] | None=None, endpoint: str | None=None, local_files_only: bool=False, cache_dir: StrPath | None=None, token: Token | None=None, lazy: bool=True) -> Checkpoint:
     ...
 
 def materialize(source: str | Checkpoint, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, format: str='cozytensors', decode: bool=False) -> str:

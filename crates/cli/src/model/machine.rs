@@ -123,9 +123,11 @@ async fn warm(
     target: String,
     input: ModelInput,
     destination: String,
+    bits: u32,
 ) -> Result<ExitCode, Error> {
     let spec = RunSpec {
         kind: SpecKind::Warm,
+        bits,
         models: vec![input.choice],
         inputs: input.files,
         weights_destination: destination,
@@ -189,7 +191,7 @@ pub(crate) async fn download(ctx: &Context, args: Download) -> Result<ExitCode, 
     if made.1.is_some() && destination.is_empty() {
         return Err(usage("model_alias_missing", "a local file is kept under a name: add local/<name>"));
     }
-    warm(ctx, &args.placement, args.detach, args.model.clone(), made.into(), destination).await
+    warm(ctx, &args.placement, args.detach, args.model.clone(), made.into(), destination, args.bits.as_deref().map_or(0, |b| b.parse().expect("clap checked bits"))).await
 }
 
 pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Error> {
@@ -206,7 +208,7 @@ pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Erro
         source(&args.source, &args.profiles)?.into()
     };
     let target = format!("{} → {destination}", args.source);
-    warm(ctx, &args.placement, args.detach, target, made, destination).await
+    warm(ctx, &args.placement, args.detach, target, made, destination, 0).await
 }
 
 /// One checkpoint a machine holds, and its repository's bytes there.

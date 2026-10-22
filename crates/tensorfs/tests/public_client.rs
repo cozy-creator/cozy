@@ -1144,3 +1144,48 @@ fn python_takes_the_store_and_endpoint_by_the_native_rule() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn untagged_immutable_commit_keeps_constraints_when_indexed_selection_is_unavailable() {
+    let scratch=Scratch::new();
+    let origin=scratch.0.join("origin");
+    let vectors=Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/vectors/select");
+    let put=|bytes:Vec<u8>| {
+        let object=ObjectRef::of(&bytes);let path=origin.join(object.key());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,bytes).unwrap();object
+    };
+    let plain=put(fs::read(vectors.join("bf16.cbor")).unwrap());
+    let encoded=put(fs::read(vectors.join("int8.cbor")).unwrap());
+    let untagged=put(format::Tree {files:BTreeMap::from([("nested/odd.cozytensors".into(),encoded.clone()),("model.int8.cozytensors".into(),plain.clone())])}.to_json().unwrap());
+    let tagged=put(format::Tree {files:BTreeMap::from([("default.cozytensors".into(),plain.clone())])}.to_json().unwrap());
+    let mut repo=format::Repo::new("acme/model");
+    repo.tags.push(format::Tag{name:"1.0".into(),commit:tagged.clone(),public:true,yanked:false});
+    let path=origin.join(repo.key());fs::create_dir_all(path.parent().unwrap()).unwrap();fs::write(path,repo.to_json().unwrap()).unwrap();
+    let http=Http::new(origin.clone());
+    let mut cfg=config(&scratch.0.join("client"),&http.url);cfg.token=None;
+    let client=Client::new(cfg).unwrap();
+    let reference=format!("acme/model@{}",untagged.id());
+    let options=Open{gpus:Some(vec!["8.6".into()]),bits:Some(8),..Default::default()};
+    let selected=client.open(&reference,&options).await.unwrap();
+    assert_eq!(selected.tree(),Some(&untagged));assert_eq!(selected.id(),&encoded);
+    assert_eq!(selected.variant(),Some("nested/odd.cozytensors"));
+    assert!(http.requests.lock().unwrap().iter().any(|(_,path,_)|path.starts_with("/v1/models/acme/model/select?")),"the endpoint could not index this hash, so the client used headers");
+    let cpu=client.open(&reference,&Open{gpus:Some(vec![]),bits:Some(16),..Default::default()}).await.unwrap();
+    assert_eq!(cpu.tree(),Some(&untagged));assert_eq!(cpu.id(),&plain);
+    assert_ne!(cpu.tree(),Some(&tagged),"a missing index entry never selects the tagged default");
+    // A run token may read a retained commit while the repo's tag document is invisible.
+    fs::remove_file(origin.join(repo.key())).unwrap();
+    let mut hidden_cfg=config(&scratch.0.join("hidden-client"),&http.url);hidden_cfg.token=None;
+    let hidden=Client::new(hidden_cfg).unwrap();
+    let selected=hidden.open(&reference,&options).await.unwrap();
+    assert_eq!(selected.tree(),Some(&untagged));assert_eq!(selected.id(),&encoded);
+    let before=http.requests.lock().unwrap().len();
+    let cached=hidden.open(&reference,&Open{gpus:Some(vec![]),bits:Some(16),local_files_only:true,..Default::default()}).await.unwrap();
+    assert_eq!(cached.id(),&plain);
+    assert_eq!(http.requests.lock().unwrap().len(),before,"a cached untagged commit and its headers open offline without network");
+
+    // No tensor chunks exist, and selection issued no request for one.
+    for (_,path,_) in http.requests.lock().unwrap().iter().filter(|(_,p,_)|p.starts_with("/blobs/")) {
+        assert!([&plain,&encoded,&untagged,&tagged].iter().any(|object|path.ends_with(&object.sha256)),"payload requested: {path}");
+    }
+}
