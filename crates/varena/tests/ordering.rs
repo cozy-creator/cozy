@@ -41,6 +41,7 @@ struct Events {
     fence_gate: Gate,
     /// The next event record fails (a driver error), and the streams synchronized instead.
     fail_record: AtomicBool,
+    fail_finish: AtomicBool,
     syncs: Mutex<Vec<usize>>,
     /// Another process's bytes on the device, and bytes that land there at the next create
     /// (between a decision and its page).
@@ -261,6 +262,9 @@ impl Backend for Stream {
     /// Waits, as a card's host does, until the test completes the event.
     fn finish(&self, event: Event) -> Result<()> {
         self.events.log("finish");
+        if self.events.fail_finish.swap(false, Ordering::SeqCst) {
+            return Err(varena::Error::Device { op: "finish", code: 999, name: "consumer completion unknown".into() });
+        }
         let mut done = self.events.done.lock();
         while event != Event::DONE && !done.contains(&event.0) {
             self.events.completed.wait(&mut done);
@@ -1323,4 +1327,46 @@ fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
     mem.torch_limit();
     gate.open();
     binder.join().unwrap();
+}
+
+#[test]
+fn failed_renewal_completion_keeps_the_old_mapping_alive() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "failed_renewal_child", "--nocapture"])
+        .output().unwrap();
+    assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+#[ignore = "subprocess entry for failed_renewal_completion_keeps_the_old_mapping_alive"]
+fn failed_renewal_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("failedrenewal-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 << 20 };
+    let _scope = Scope::new(&uuid);
+    let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
+    gate.open();
+    serve_custody(&uuid, gate, log.clone());
+    let events = Arc::new(Events::default());
+    let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
+    let mut spec = set(dir.path(), &uuid);
+    let old = spec.fingerprint.key();
+    let id = mem.load(spec.clone(), Level::Ram).unwrap();
+    let pin = mem.bind(id, 0, 1).unwrap();
+    let ptr = pin.ptr;
+    pin.filled();
+    events.complete(events.next.load(Ordering::Relaxed));
+    mem.torch_limit();
+    log.await_call(|(_, c)| c.contains("Export") && c.contains(&old));
+    drop(pin);
+    let pending = events.next.load(Ordering::Relaxed);
+    spec.fingerprint.fill = Fill::Declared("lora-b".into());
+    mem.load(spec, Level::Ram).unwrap();
+    events.fail_finish.store(true, Ordering::SeqCst);
+    assert!(matches!(mem.bind(id, 0, 2), Err(varena::Error::Ownership(_))), "failed completion must poison preparation");
+    drop(mem);
+    assert_eq!(events.unmaps.load(Ordering::SeqCst), 0, "an uncertain consumer's mapping survives all public owners");
+    assert!(!events.retired.lock().contains(&pending), "uncertain event stays owned");
+    // SAFETY: the fault path must retain the original mapping through executor exit.
+    assert_eq!(unsafe { *(ptr as *const u8) }, 0x11);
 }
