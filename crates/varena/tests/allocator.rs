@@ -54,7 +54,7 @@ fn peer(role: &str, namespace: &str) -> Peer {
     child
 }
 
-/// Its claim file goes when the test does, passed or failed. The cases share one table, one
+/// Its table and claim file go when the test does, passed or failed. The cases share one table, one
 /// namespace and its RAM-tier claims: they run one at a time (a process opens a device once).
 struct Claims(#[allow(dead_code)] parking_lot::MutexGuard<'static, ()>);
 
@@ -68,6 +68,7 @@ impl Claims {
 
 impl Drop for Claims {
     fn drop(&mut self) {
+        varena::os::remove_table(&gpu().uuid);
         varena::tier::remove_claims();
     }
 }
