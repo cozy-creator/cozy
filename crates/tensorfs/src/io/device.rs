@@ -35,6 +35,7 @@ fn failed(copy: usize, error: cuda::Error) -> Error {
 struct Event {
     ctx: CUcontext,
     raw: CUevent,
+    timing: bool,
 }
 
 impl Event {
@@ -51,7 +52,7 @@ impl Event {
                 },
             )
         })?;
-        Ok(Event { ctx, raw })
+        Ok(Event { ctx, raw, timing })
     }
     fn record(&self, stream: CUstream) -> cuda::Result<()> {
         let _ctx = CtxGuard::enter(self.ctx)?;
@@ -182,7 +183,13 @@ struct Engine {
     seen: Mutex<VecDeque<(usize, usize)>>,
     held: Mutex<Vec<Retained>>,
     staged: Mutex<Vec<Slot>>,
+    /// Completed events of this context, reused: a run records a start and an end on every
+    /// stream, and a wait for each foreign stream.
+    events: Mutex<Vec<Event>>,
 }
+
+/// Completed events an engine keeps for reuse; more than this go.
+const EVENTS: usize = 64;
 
 /// An engine-owned CUDA allocation. DLPack holders share it; the last owner frees it in its
 /// primary context, independently of Python checkpoint and component handles.
@@ -361,6 +368,7 @@ impl Engine {
             seen: Mutex::new(VecDeque::new()),
             held: Mutex::new(Vec::new()),
             staged: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
         });
         engines.insert(device, engine.clone());
         Ok(engine)
@@ -422,6 +430,14 @@ impl Engine {
                 slot.recorded = false;
                 self.free().push(slot);
             }
+            // Checked complete: its events are free to record again.
+            let mut pool = self.events.lock().unwrap_or_else(|e| e.into_inner());
+            for event in owner.events.drain(..).filter(|e| e.ctx == self.ctx) {
+                if pool.len() < EVENTS {
+                    pool.push(event);
+                }
+            }
+            drop(pool);
             // The remaining event/stream/allocation owners drop only after checked completion.
             drop(owner);
         }
@@ -455,6 +471,15 @@ impl Engine {
         }
         self.released(released);
         Ok(())
+    }
+
+    /// An event of this context, `timing` or not: a completed one again, else a new one.
+    fn event(&self, timing: bool) -> cuda::Result<Event> {
+        let reused = {
+            let mut pool = self.events.lock().unwrap_or_else(|e| e.into_inner());
+            pool.iter().position(|e| e.timing == timing).map(|at| pool.swap_remove(at))
+        };
+        reused.map_or_else(|| Event::new(self.ctx, timing), Ok)
     }
 
     fn free(&self) -> std::sync::MutexGuard<'_, Vec<Slot>> {
@@ -511,7 +536,7 @@ impl Engine {
                     if stream != 0 {
                         owners
                             .events
-                            .push(Event::new(self.ctx, false).map_err(|e| failed(copy, e))?);
+                            .push(self.event(false).map_err(|e| failed(copy, e))?);
                         let event = owners.events.last().expect("destination event inserted");
                         event
                             .record(stream as CUstream)
@@ -557,7 +582,7 @@ impl Engine {
             for stream in &self.streams[..streams] {
                 owners
                     .events
-                    .push(Event::new(self.ctx, true).map_err(|e| failed(first, e))?);
+                    .push(self.event(true).map_err(|e| failed(first, e))?);
                 owners
                     .events
                     .last()
@@ -568,9 +593,19 @@ impl Engine {
             let next = AtomicUsize::new(0);
             let stopped = AtomicBool::new(false);
             let error = Mutex::new(None);
+            // Direct copies (device, zero or registered host sources) need no staging: this
+            // thread issues them, round-robin over the streams, before any reader starts.
+            let (direct, jobs): (Vec<Job>, Vec<Job>) = jobs.into_iter().partition(|job| job.direct);
+            for (at, job) in direct.iter().enumerate() {
+                if let Err(failure) = self.issue(job, lane(at, streams)) {
+                    error.lock().unwrap().get_or_insert(failure);
+                    stopped.store(true, Relaxed);
+                    break;
+                }
+            }
             // A failed copy's slots stay retained until checked completion: read with the rest.
-            let readers = opts.threads.clamp(1, READERS).min(jobs.len()).min(self.free().len() / RING);
-            if readers == 0 && !jobs.is_empty() {
+            let readers = readers(jobs.len(), opts, self.free().len());
+            if readers == 0 && !jobs.is_empty() && !stopped.load(Relaxed) {
                 let lost = io::Error::other("all staging is still retained by failed copies");
                 return Err(Error {
                     copy: first,
@@ -614,7 +649,7 @@ impl Engine {
             let mut all_complete = true;
             for (lane, stream) in self.streams[..streams].iter().enumerate() {
                 let drained = (|| {
-                    owners.events.push(Event::new(self.ctx, true)?);
+                    owners.events.push(self.event(true)?);
                     let end = owners.events.last().expect("end event inserted");
                     end.record(stream.raw() as CUstream)?;
                     end.sync()?;
@@ -648,6 +683,31 @@ impl Engine {
         Ok(stats)
     }
 
+    /// A direct copy, whole, on stream `lane`: a memset, a device copy, a peer copy or a copy
+    /// from registered host memory. Nothing is staged.
+    fn issue(&self, job: &Job, lane: usize) -> Result<(), Error> {
+        let _ctx = CtxGuard::enter(self.ctx).map_err(|e| failed(job.copy, e))?;
+        let d = cuda::driver().map_err(|e| failed(job.copy, e))?;
+        let stream = self.streams[lane].raw() as CUstream;
+        let _queue = self.queues[lane].lock().unwrap();
+        let Dst::Device { ptr: dst, .. } = job.c.dst else {
+            unreachable!("a direct copy has a device destination")
+        };
+        let result = match job.c.src {
+            Src::Zero => unsafe { (d.memset_d8_async)(dst, 0, job.len, stream) },
+            Src::Host(ptr) => unsafe { (d.memcpy_htod_async)(dst, ptr.cast(), job.len, stream) },
+            Src::Device { device, ptr, .. } if device == self.device => unsafe {
+                (d.memcpy_dtod_async)(dst, ptr, job.len, stream)
+            },
+            Src::Device { device, ptr, .. } => {
+                let source = Engine::get(device).map_err(|e| failed(job.copy, e))?;
+                unsafe { (d.memcpy_peer_async)(dst, self.ctx, ptr, source.ctx, job.len, stream) }
+            }
+            Src::File(..) => unreachable!("a file source is staged"),
+        };
+        cuda::check("cuMemcpyAsync", result).map_err(|e| failed(job.copy, e))
+    }
+
     fn piece(
         &self,
         job: &Job,
@@ -659,29 +719,6 @@ impl Engine {
         let _ctx = CtxGuard::enter(self.ctx).map_err(|e| failed(job.copy, e))?;
         let d = cuda::driver().map_err(|e| failed(job.copy, e))?;
         let stream = self.streams[lane].raw() as CUstream;
-        if job.direct {
-            let _queue = self.queues[lane].lock().unwrap();
-            let Dst::Device { ptr: dst, .. } = job.c.dst else {
-                unreachable!()
-            };
-            let result = match job.c.src {
-                Src::Zero => unsafe { (d.memset_d8_async)(dst, 0, job.len, stream) },
-                Src::Host(ptr) => unsafe {
-                    (d.memcpy_htod_async)(dst, ptr.cast(), job.len, stream)
-                },
-                Src::Device { device, ptr, .. } if device == self.device => unsafe {
-                    (d.memcpy_dtod_async)(dst, ptr, job.len, stream)
-                },
-                Src::Device { device, ptr, .. } => {
-                    let source = Engine::get(device).map_err(|e| failed(job.copy, e))?;
-                    unsafe {
-                        (d.memcpy_peer_async)(dst, self.ctx, ptr, source.ctx, job.len, stream)
-                    }
-                }
-                _ => unreachable!(),
-            };
-            return cuda::check("cuMemcpyAsync", result).map_err(|e| failed(job.copy, e));
-        }
         if slot.pending {
             slot.done.sync().map_err(|e| failed(job.copy, e))?;
             slot.pending = false;
@@ -736,6 +773,17 @@ impl Engine {
         tally.staged.fetch_add(job.len as u64, Relaxed);
         Ok(())
     }
+}
+
+/// The stream the `at`-th direct copy of a run goes on: round-robin over the run's `streams`.
+fn lane(at: usize, streams: usize) -> usize {
+    at % streams.max(1)
+}
+
+/// Reader threads a run starts for its `staged` pieces: none without any, else as many as its
+/// threads allow and the free staging rings hold.
+fn readers(staged: usize, opts: &ReadOpts, free_slots: usize) -> usize {
+    opts.threads.clamp(1, READERS).min(staged).min(free_slots / RING)
 }
 
 struct Job<'a> {
@@ -853,6 +901,20 @@ mod tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(released);
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+
+    /// A run's direct copies go round-robin over its streams from the calling thread; reader
+    /// threads start only for staged pieces, never for an all-direct run (v7: a tier fill's
+    /// 2 MiB pages each paid a run's thread spawns).
+    #[test]
+    fn an_all_direct_run_starts_no_reader_and_spreads_over_its_streams() {
+        let opts = ReadOpts::default();
+        assert_eq!(readers(0, &opts, STAGING), 0, "nothing staged: no reader");
+        assert_eq!(readers(3, &opts, STAGING), 3);
+        assert_eq!(readers(100, &opts, STAGING), opts.threads.clamp(1, READERS));
+        assert_eq!(readers(100, &opts, RING), 1, "no more readers than free rings");
+        assert_eq!((0..6).map(|at| lane(at, 2)).collect::<Vec<_>>(), [0, 1, 0, 1, 0, 1]);
+        assert_eq!(lane(5, 0), 0, "a run has at least one stream");
     }
 
     #[test]
