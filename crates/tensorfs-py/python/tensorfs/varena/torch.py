@@ -620,11 +620,12 @@ class Memory:
             _pool.reset(token)
             _allocated()
 
-    def cache(self, owner: str, shrink: Callable[[int], int], model: nn.Module | Model | Sequence[nn.Module | Model] = ()) -> Cache:
-        """Bytes the caller holds that `shrink(want) -> freed` gives back on varena's ask; a
-        cache owned by a request id ends with it. A cache serving loaded models (a model's graph
-        pool or decode cache, one pool a serialized domain shares) takes their most protective
-        class: D while a plan declares one, N otherwise, shrunk before their own pages."""
+    def cache(self, owner: str, shrink: Callable[[int], int | tuple[int, int]], model: nn.Module | Model | Sequence[nn.Module | Model] = ()) -> Cache:
+        """Bytes the caller holds that `shrink(want)` gives back on varena's ask: `freed`, or
+        `(freed, coming)` when a queued drop returns the rest later (`Cache.cached` reports it).
+        A cache owned by a request id ends with it. One serving loaded models (a model's graph
+        pool or decode cache, one pool a serialized domain shares) takes their class and is
+        shrunk before their own pages."""
         served = [model] if isinstance(model, (nn.Module, Model)) else list(model)
         return Cache(self, self.native.cache(owner, shrink, [(m if isinstance(m, Model) else self.models[m]).id for m in served]))
 
@@ -1005,6 +1006,19 @@ class Cache:
 
     def cached(self, nbytes: int) -> None:
         self.memory.native.cached(self.id, nbytes)
+
+    @contextmanager
+    def holding(self, stream: torch.cuda.Stream | None = None) -> Iterator[None]:
+        """Never shrunk inside the block (a graph replay and its lent outputs' readers); after
+        it, until the work queued on `stream` (the current stream by default) completes."""
+        memory = self.memory
+        if stream is None and memory.cuda:
+            stream = torch.cuda.current_stream(memory.device)
+        hold = memory.native.hold_cache(self.id)
+        try:
+            yield
+        finally:
+            memory.native.release_cache(self.id, hold, stream.cuda_stream if stream is not None else 0)
 
     def close(self) -> None:
         self.memory.native.uncache(self.id)

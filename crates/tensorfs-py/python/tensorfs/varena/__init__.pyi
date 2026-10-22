@@ -144,12 +144,18 @@ class Memory:
     def fill(self, set: int, fill: Fill) -> None:
         """`set`'s current fill (a no-op when unchanged): pages filled under another come back
         fresh."""
-    def cache(self, owner: str, shrink: Callable[[int], int], sets: Sequence[int] = ()) -> int:
-        """Bytes the caller holds that `shrink(want) -> freed` gives back (from varena's thread);
-        a cache owned by a request id ends with it. A cache serving `sets` takes their most
-        protective class (D while a plan declares one, N otherwise)."""
+    def cache(self, owner: str, shrink: Callable[[int], int | tuple[int, int]], sets: Sequence[int] = ()) -> int:
+        """Bytes the caller holds that `shrink(want)` gives back (from varena's thread): `freed`,
+        or `(freed, coming)` when a queued drop returns the rest later and `cached` reports it.
+        A cache owned by a request id ends with it; one serving `sets` takes their class."""
 
     def cached(self, cache: int, nbytes: int) -> None: ...
+    def hold_cache(self, cache: int) -> int:
+        """Holds `cache` (never shrunk) until `release_cache`; holds nest."""
+
+    def release_cache(self, cache: int, hold: int, stream: int = 0) -> None:
+        """Ends `hold` once the work queued on `stream` so far completes."""
+
     def uncache(self, cache: int) -> None: ...
     def request(self, id: str, plan: list[tuple[list[str], int]]) -> Request:
         """Opens request `id`; `plan` is its steps, each `(set names, passes)`."""
