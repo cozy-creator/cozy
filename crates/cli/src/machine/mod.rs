@@ -11,6 +11,7 @@ use protocol::{
 
 use crate::{Context, output};
 
+mod cohort;
 mod end;
 mod list;
 pub(crate) mod live;
