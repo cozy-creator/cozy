@@ -50,7 +50,7 @@ impl State {
     /// No pin, and nothing writes or protects it: a slot that may move.
     fn movable(&self, key: Key) -> bool {
         self.table.page(key).is_some_and(|p| p.pins.is_empty())
-            && self.homes.get(&key).is_some_and(|h| h.phys.is_some() && !h.filling && !h.transforming && !h.protecting)
+            && self.homes.get(&key).is_some_and(|h| h.phys.is_some() && !h.filling && !h.landing && !h.transforming && !h.protecting)
     }
 
     fn last_use(&self, key: Key) -> u64 {
@@ -78,7 +78,7 @@ impl Inner {
                 }
                 let Some(page) = st.table.page(key) else { continue };
                 // A page in use stays until its release; the hook leaves custody's pages alone.
-                let busy = !page.pins.is_empty() || st.homes.get(&key).is_some_and(|h| h.filling || h.transforming || h.protecting);
+                let busy = !page.pins.is_empty() || st.homes.get(&key).is_some_and(|h| h.filling || h.landing || h.transforming || h.protecting);
                 if busy || (hook && page.kept) {
                     continue;
                 }
@@ -133,7 +133,7 @@ impl Inner {
         let gen = st.tick();
         let identity = st.mech(key.0)?.key.clone();
         // Counted mapped, filling, now: the mechanism moves the slot (no new memory), then queues the fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false });
+        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false, landing: false });
         st.sync(key);
         self.mech.post(Mech::Move { key, gen, va, from: from_off, off, span, phys, after, job: Job { key, gen, req, span, after: vec![] } }, 0);
         Ok(StreamIn::Moved)

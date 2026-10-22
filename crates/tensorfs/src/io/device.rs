@@ -2,12 +2,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::{AcqRel, Relaxed}};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use super::cuda::{self, CUcontext, CUevent, CUstream, CtxGuard};
-use super::{host, Copy, Dst, Error, ReadOpts, ReadStats, Src};
+use super::{host, Copy, Dst, Error, Issued, ReadOpts, ReadStats, Src};
 
 const PIECE: usize = 2 << 20;
 const READERS: usize = 8;
@@ -498,6 +498,7 @@ impl Engine {
         copies: &[(usize, Copy)],
         opts: &ReadOpts,
         staged_host: bool,
+        issued: Option<Issued>,
     ) -> Result<ReadStats, Error> {
         let _serial = self.serial.lock().unwrap_or_else(|e| e.into_inner());
         let first = copies[0].0;
@@ -520,7 +521,7 @@ impl Engine {
             let owners = hold.owners.as_mut().expect("run owners live");
             let mut jobs = Vec::new();
             let tally = Tally::default();
-            for &(copy, c) in copies {
+            for (local, &(copy, c)) in copies.iter().enumerate() {
                 if let Src::Device { device, stream, .. } = c.src {
                     let source = Engine::get(device).map_err(|e| failed(copy, e))?;
                     owners
@@ -571,6 +572,7 @@ impl Engine {
                 for at in (0..c.dst.len()).step_by(step.max(1)) {
                     jobs.push(Job {
                         copy,
+                        local,
                         c,
                         at,
                         len: step.min(c.dst.len() - at),
@@ -593,6 +595,17 @@ impl Engine {
             let next = AtomicUsize::new(0);
             let stopped = AtomicBool::new(false);
             let error = Mutex::new(None);
+            // Each copy's jobs not yet issued: the one that issues its last tells `issued`.
+            let left: Vec<AtomicUsize> = (0..copies.len()).map(|_| AtomicUsize::new(0)).collect();
+            jobs.iter().for_each(|job| _ = left[job.local].fetch_add(1, Relaxed));
+            let raw: Vec<usize> = self.streams[..streams].iter().map(|s| s.raw()).collect();
+            let done = |job: &Job| {
+                if let Some(issued) = issued {
+                    if left[job.local].fetch_sub(1, AcqRel) == 1 {
+                        issued(job.copy, &raw);
+                    }
+                }
+            };
             // Direct copies (device, zero or registered host sources) need no staging: this
             // thread issues them, round-robin over the streams, before any reader starts.
             let (direct, jobs): (Vec<Job>, Vec<Job>) = jobs.into_iter().partition(|job| job.direct);
@@ -602,6 +615,7 @@ impl Engine {
                     stopped.store(true, Relaxed);
                     break;
                 }
+                done(job);
             }
             // A failed copy's slots stay retained until checked completion: read with the rest.
             let readers = readers(jobs.len(), opts, self.free().len());
@@ -624,11 +638,12 @@ impl Engine {
                     let at = next.fetch_add(1, Relaxed);
                     let Some(job) = jobs.get(at) else { break };
                     turn += 1;
-                    if let Err(failure) =
-                        self.piece(job, at % streams, opts, &tally, &mut ring[turn % RING])
-                    {
-                        error.lock().unwrap().get_or_insert(failure);
-                        stopped.store(true, Relaxed);
+                    match self.piece(job, at % streams, opts, &tally, &mut ring[turn % RING]) {
+                        Ok(()) => done(job),
+                        Err(failure) => {
+                            error.lock().unwrap().get_or_insert(failure);
+                            stopped.store(true, Relaxed);
+                        }
                     }
                 }
                 // After any failure a slot may still be in flight: kept until checked completion.
@@ -788,6 +803,8 @@ fn readers(staged: usize, opts: &ReadOpts, free_slots: usize) -> usize {
 
 struct Job<'a> {
     copy: usize,
+    /// Its copy's place in the run.
+    local: usize,
     c: Copy<'a>,
     at: usize,
     len: usize,
@@ -808,6 +825,7 @@ pub(super) unsafe fn fill(
     copies: &[(usize, Copy)],
     opts: &ReadOpts,
     staged_host: bool,
+    issued: Option<Issued>,
 ) -> Result<ReadStats, Error> {
     let mut groups: BTreeMap<(i32, &str), Vec<(usize, Copy)>> = BTreeMap::new();
     for &(index, copy) in copies {
@@ -835,10 +853,14 @@ pub(super) unsafe fn fill(
             .push((index, copy));
     }
     let mut total = ReadStats::default();
+    // Zeroes first: a placement's padding is done before its file bytes go out, so the last of
+    // those (`issued`) completes it.
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by_key(|((_, kind), _)| *kind != "zero");
     for ((device, kind), copies) in groups {
         let engine = Engine::get(device).map_err(|e| failed(copies[0].0, e))?;
         let start = Instant::now();
-        let stats = engine.run(&copies, opts, staged_host)?;
+        let stats = engine.run(&copies, opts, staged_host, issued)?;
         #[cfg(unix)]
         {
             let ns = start.elapsed().as_nanos() as u64;

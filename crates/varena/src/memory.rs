@@ -452,6 +452,9 @@ struct Home {
     gen: u64,
     filled: bool,
     filling: bool,
+    /// Read ready at issue (`issued`), its batch not ended yet: the fill thread still accounts
+    /// for it and its copies may still land.
+    landing: bool,
     /// A binder holds it fresh ([`Home::fresh`]) and runs the set's transform.
     transforming: bool,
     exported: bool,
@@ -562,6 +565,7 @@ const COPY: usize = usize::MAX;
 /// One page of a fill batch: where it goes, and how its copy ended.
 struct Copying {
     key: Key,
+    gen: u64,
     dst: Dst,
     out: Option<Result<Origin>>,
 }
@@ -1669,7 +1673,7 @@ impl Inner {
             let gen = st.tick();
             // Pinned (filling) until the mechanism maps it.
             self.mech.post(Mech::Adopt { key, gen, va, off, phys: phys.id, len: phys.len, identity: identity.clone() }, 0);
-            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false });
+            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false, landing: false });
             st.sync(key);
             let s = st.fills(req, key, span, Origin::Kept);
             s.moved.kept.bytes += span;
@@ -1694,7 +1698,7 @@ impl Inner {
         let decided = st.table.free();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false });
+        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false, landing: false });
         st.sync(key);
         self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, speculative, decided }, 0);
         Ok(true)
@@ -1716,7 +1720,7 @@ impl Inner {
         // Kept, or with a Keep queued: never written again; a fresh page takes its place.
         let phys = if exported || h.keeping { h.phys.take() } else { None };
         let renew = phys.is_some();
-        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false };
+        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false, landing: false };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
         let job = Job { key, gen, req, span, after: vec![] };
@@ -1834,6 +1838,19 @@ impl Inner {
                 }
                 continue;
             }
+            // Read ready at issue (`issued`): its own copies all went out, whatever the batch's end.
+            let early = st.homes.get_mut(&job.key).is_some_and(|h| std::mem::take(&mut h.landing));
+            let landed = match (early, landed) {
+                (true, Ok((_, ready))) => {
+                    self.backend.retire(ready);
+                    Ok((Origin::Store, None))
+                }
+                (true, Err(e)) => {
+                    sticky |= e.is_sticky();
+                    Ok((Origin::Store, None))
+                }
+                (false, landed) => landed.map(|(origin, ready)| (origin, Some(ready))),
+            };
             match landed {
                 Ok((origin, ready)) => {
                     // Stored bytes are the weights; a declared set's tier holds its transformed
@@ -1841,14 +1858,12 @@ impl Inner {
                     let fill = sets.get(&job.key.0).map(|(spec, _)| &spec.fingerprint.fill);
                     let filled = matches!(fill, Some(Fill::Stored)) || (origin == Origin::Tier && matches!(fill, Some(Fill::Declared(_))));
                     let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
-                    if let Some(h) = st.homes.get_mut(&job.key) {
-                        h.ready = ready;
-                        h.ready_on = COPY;
-                        h.filling = false;
-                        h.filled = filled;
-                        h.origin = origin;
+                    // A page read ready at issue is its binders' since: a transform may have
+                    // filled it already, so only its accounting is left.
+                    if let (Some(ready), Some(h)) = (ready, st.homes.get_mut(&job.key)) {
+                        (h.ready, h.ready_on, h.filling, h.filled, h.origin) = (ready, COPY, false, filled, origin);
+                        st.sync(job.key);
                     }
-                    st.sync(job.key);
                     let s = st.fills(job.req, job.key, span, origin);
                     let f = if origin == Origin::Tier { &mut s.moved.tier } else { &mut s.moved.store };
                     f.bytes += span;
@@ -1913,7 +1928,7 @@ impl Inner {
                     Dst::Host { .. } => 0,
                 };
                 let out = job.after.iter().try_for_each(|e| self.backend.wait(*e, stream)).err().map(Err);
-                Copying { key: job.key, dst, out }
+                Copying { key: job.key, gen: job.gen, dst, out }
             })
             .collect();
         let unregister = |p| self.backend.unregister_host(p);
@@ -1942,7 +1957,12 @@ impl Inner {
             }
             let direct: Vec<(u32, Dst)> = copies.iter().filter(|c| todo(c)).map(|c| (c.key.1, c.dst)).collect();
             if !direct.is_empty() {
-                let stored = self.store(spec, &direct).map(|()| Origin::Store);
+                let owners: Vec<(Key, u64, usize)> = copies.iter().filter(|c| todo(c)).map(|c| {
+                    (c.key, c.gen, match c.dst { Dst::Device { stream, .. } => stream, Dst::Host { .. } => 0 })
+                }).collect();
+                let filled = matches!(spec.fingerprint.fill, Fill::Stored);
+                let issued = |i: usize, streams: &[usize]| owners.get(i).into_iter().for_each(|o| self.issued(*o, streams, filled));
+                let stored = self.store(spec, &direct, Some(&issued)).map(|()| Origin::Store);
                 copies.iter_mut().filter(|c| todo(c)).for_each(|c| c.out = Some(stored.clone()));
             }
         }
@@ -1960,7 +1980,11 @@ impl Inner {
             Error::Ownership(format!("fill panicked ({e}); its copies did not drain"))
         };
         for job in jobs {
-            if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen) {
+            // A page read ready at issue had all its copies go out: its binders keep it.
+            if let Some(h) = st.homes.get_mut(&job.key).filter(|h| h.gen == job.gen) {
+                h.landing = false;
+            }
+            if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen && h.filling) {
                 if drained {
                     if let Some(h) = st.homes.get_mut(&job.key) {
                         h.filling = false;
@@ -2167,21 +2191,53 @@ impl Inner {
     }
 
     /// The set's regions from its store into their destinations, in one engine read, in
-    /// region order: neighbours in the file and the reservation read as one run.
+    /// region order: neighbours in the file and the reservation read as one run. `issued`
+    /// hears of each device region (its index in `regions`) once its copies are all issued.
     #[cfg(unix)]
-    fn store(&self, spec: &SetSpec, regions: &[(u32, Dst)]) -> Result<()> {
-        let mut regions = regions.to_vec();
-        regions.sort_unstable_by_key(|(r, _)| *r);
-        let placements = regions.iter().map(|(r, dst)| spec.layout.region(*r).map(|region| Placement { items: &region.items, origin: region.offset, dst: *dst })).collect::<Result<Vec<_>>>()?;
+    fn store(&self, spec: &SetSpec, regions: &[(u32, Dst)], issued: Option<tensorfs::io::Issued>) -> Result<()> {
+        let mut order: Vec<(usize, &(u32, Dst))> = regions.iter().enumerate().collect();
+        order.sort_unstable_by_key(|(_, (r, _))| *r);
+        let placements = order.iter().map(|(_, (r, dst))| spec.layout.region(*r).map(|region| Placement { items: &region.items, origin: region.offset, dst: *dst })).collect::<Result<Vec<_>>>()?;
         let threads = tensorfs::io::ReadOpts::default().threads;
+        let placed = |p: usize, streams: &[usize]| {
+            if let (Some(issued), Some((i, _))) = (issued, order.get(p)) {
+                issued(*i, streams);
+            }
+        };
         // SAFETY: each `dst` is a mapped page (or a locked tier region) only this fill writes.
-        unsafe { spec.source.read_placements(&placements, threads, tensorfs::io::source::Mode::Cache, &self.tally) }?;
+        unsafe { spec.source.read_placements(&placements, threads, tensorfs::io::source::Mode::Cache, &self.tally, issued.map(|_| &placed as tensorfs::io::Issued)) }?;
         Ok(())
     }
 
     #[cfg(windows)]
-    fn store(&self, spec: &SetSpec, _: &[(u32, Dst)]) -> Result<()> {
+    fn store(&self, spec: &SetSpec, _: &[(u32, Dst)], _: Option<tensorfs::io::Issued>) -> Result<()> {
         match *spec.source {}
+    }
+
+    /// A store fill's copies of page `key` are all issued: it reads ready now, its event after
+    /// them on the copy stream, so its binders wait in-stream instead of for the whole batch.
+    fn issued(&self, (key, gen, copy): (Key, u64, usize), streams: &[usize], filled: bool) {
+        let ready = streams.iter().try_for_each(|&s| {
+            let e = self.backend.record(s)?;
+            let waited = self.backend.wait(e, copy);
+            self.backend.retire(e);
+            waited
+        });
+        // A failed record leaves the page to the batch's end.
+        let Ok(ready) = ready.and_then(|()| self.backend.fence()) else { return };
+        let mut st = self.state.lock();
+        match st.homes.get_mut(&key) {
+            Some(h) if h.gen == gen && h.filling => {
+                (h.ready, h.ready_on, h.filling, h.landing, h.filled, h.origin) = (ready, COPY, false, true, filled, Origin::Store);
+            }
+            _ => {
+                self.unlock(st);
+                return self.backend.retire(ready);
+            }
+        }
+        st.sync(key);
+        self.unlock(st);
+        self.landed.notify_all();
     }
 
     // ---- demands
@@ -2278,7 +2334,8 @@ impl Inner {
                     Victim::Cache { .. } if hook => {}
                     Victim::Page { key, bytes: b, releasing: false } if hook => {
                         let (place, class) = (st.place(key)?, st.table.class(key).unwrap_or(Class::N));
-                        let Some(h) = st.homes.get_mut(&key).filter(|h| !h.keeping && !h.keep_after && !h.protecting && !h.reclaiming && !h.exported) else { continue };
+                        // Never a page whose copies may still be landing (read ready at issue).
+                        let Some(h) = st.homes.get_mut(&key).filter(|h| !h.keeping && !h.keep_after && !h.protecting && !h.reclaiming && !h.exported && !h.landing) else { continue };
                         let Some(phys) = h.phys.take() else { continue };
                         h.reclaiming = true;
                         taking.push((key, h.gen, class, place, phys, h.ready));
@@ -2308,7 +2365,7 @@ impl Inner {
             // to be evictable again: varena's own short work, and (not for the hook, which never
             // takes a page being filled) a fill.
             let returning = st.table.returning > 0 || (!hook && st.table.pending > 0);
-            let coming = st.table.transient > 0 || st.homes.iter().any(|(k, h)| (h.protecting || (!hook && h.filling)) && !keep.contains(k));
+            let coming = st.table.transient > 0 || st.homes.iter().any(|(k, h)| (h.protecting || (!hook && (h.filling || h.landing))) && !keep.contains(k));
             let last = st.last_unmap;
             self.publish(&mut st);
             drop(admission);
@@ -2507,7 +2564,8 @@ impl Inner {
                     self.unlock(st);
                 }
                 let mut st = self.lock();
-                while st.table.pages().any(|(k, p)| k.0 == id && p.filling) {
+                // Until its fills' batches end (landed, accounted for and kept), not only issued.
+                while st.table.pages().any(|(k, p)| k.0 == id && p.filling) || st.homes.iter().any(|(k, h)| k.0 == id && h.landing) {
                     self.wait(&mut st)?;
                 }
                 self.unlock(st);
@@ -2569,7 +2627,7 @@ impl Inner {
                 want /= 2;
                 continue;
             };
-            let filled = held.fill(&batch, |hosts| self.store(&spec, hosts));
+            let filled = held.fill(&batch, |hosts| self.store(&spec, hosts, None));
             if matches!(&filled, Err(Error::Ownership(_))) {
                 let st = self.state.lock();
                 self.ownership_lost.store(true, Ordering::Release);
@@ -3241,6 +3299,7 @@ impl Drop for Inner {
         for op in self.mech.drain() {
             match op {
                 Mech::Unmap { va, off, span, phys, ready } => {
+                    let _ = self.backend.finish(ready);
                     let _ = self.backend.unmap(va, off, span);
                     phys.into_iter().for_each(|p| { let _ = self.backend.destroy(p); });
                     self.backend.retire(ready);
@@ -3647,7 +3706,8 @@ impl Inner {
                 }
             }
             Mech::Unmap { va, off, span, phys, ready } => {
-                if let Err(error) = self.backend.unmap(va, off, span) {
+                // A page read ready at issue may still be landing: its copies end first.
+                if let Err(error) = self.backend.finish(ready).and_then(|()| self.backend.unmap(va, off, span)) {
                     tracing::warn!("varena: page ownership could not be released: {error}");
                     let st = self.state.lock();
                     self.ownership_lost.store(true, Ordering::Release);
