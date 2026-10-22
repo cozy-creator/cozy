@@ -22,6 +22,9 @@ from .._ext.varena import (
     VarenaError,
     Window,
     Yielded,
+    allocated,
+    allocator_reentries,
+    allocator_stats,
 )
 
 __all__ = [
@@ -45,4 +48,7 @@ __all__ = [
     "VarenaError",
     "Window",
     "Yielded",
+    "allocated",
+    "allocator_reentries",
+    "allocator_stats",
 ]

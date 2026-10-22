@@ -453,7 +453,14 @@ impl PyMemory {
     /// The allocator's trim (torch's `empty_cache`), returning the bytes it freed: a demand
     /// trims before it evicts anything.
     fn trim_with(&self, py: Python<'_>, trim: Py<PyAny>) -> PyResult<()> {
-        let trim = move || Python::try_attach(|py| call(py, &trim, ())).unwrap_or(0);
+        // Inside torch's allocator (a pool's segment) nothing calls back into torch.
+        let trim = move || {
+            if crate::allocator::inside() {
+                crate::allocator::trim_inside();
+                return 0;
+            }
+            Python::try_attach(|py| call(py, &trim, ())).unwrap_or(0)
+        };
         done(py, &self.gpu.uuid, || self.memory().trim_with(trim))
     }
 
@@ -465,7 +472,14 @@ impl PyMemory {
 
     /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id.
     fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>) -> PyResult<u32> {
-        let shrink = move |want: u64| Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0);
+        // Inside torch's allocator a shrink would free through it under its own lock: none runs there.
+        let shrink = move |want: u64| {
+            if crate::allocator::inside() {
+                crate::allocator::shrink_inside();
+                return 0;
+            }
+            Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0)
+        };
         detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, shrink))).map(|c| c.0)
     }
 
@@ -574,6 +588,16 @@ impl PyRequest {
     fn cut(&self, py: Python<'_>, set: Option<u32>, site: &str, shape: &str) -> PyResult<u32> {
         let r = self.get(py)?;
         detached(py, &self.gpu, || Ok(r.cut(set.map(SetId), site, shape)))
+    }
+
+    /// This thread's segments for torch's pool are `set`'s pass's (None: outside any pass) from
+    /// now on, torch's bytes now being `allocated` and `reserved`: a shortfall asks this request.
+    #[pyo3(signature = (memory, set, allocated, reserved))]
+    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, set: Option<u32>, allocated: u64, reserved: u64) -> PyResult<()> {
+        let r = self.get(py)?;
+        let _ = allocated;
+        crate::allocator::enter(memory.memory().clone(), r, set.map(SetId), reserved);
+        Ok(())
     }
 
     /// The request waits on a call of its `family` (a child): until the guard ends it gives back
@@ -876,6 +900,25 @@ impl PyWindow {
 }
 
 
+/// This thread's pass is over for torch's pool (`Request.allocating`).
+#[pyfunction]
+fn allocated() {
+    crate::allocator::exit();
+}
+
+/// The pool's segments: (live bytes, segments made, shortfalls varena resolved, their bytes,
+/// refusals, nanoseconds making segments, segments freed).
+#[pyfunction]
+fn allocator_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
+    crate::allocator::stats()
+}
+
+/// The trims and cache shrinks varena reached on a thread inside the allocator (answered 0).
+#[pyfunction]
+fn allocator_reentries() -> (u64, u64) {
+    crate::allocator::reentries()
+}
+
 // ---------------------------------------------------------------- the module
 
 /// `tensorfs._ext.varena`, importable as such (the package `tensorfs.varena` re-exports it).
@@ -900,6 +943,9 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRef_>()?;
     m.add_class::<PyStepStats>()?;
     m.add_class::<PyStats>()?;
+    m.add_function(wrap_pyfunction!(allocated, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_stats, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_reentries, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;
     parent.add_submodule(&m)?;

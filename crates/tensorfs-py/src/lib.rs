@@ -22,6 +22,8 @@ mod verification;
 mod resident_decode;
 #[cfg(feature = "store")]
 mod varena;
+#[cfg(feature = "store")]
+mod allocator;
 
 use pyo3::prelude::*;
 
@@ -35,8 +37,10 @@ fn python_distribution_version() -> String {
 
 #[pymodule]
 fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // The library's warnings reach the process's stderr.
-    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
+    // The library's warnings reach the process's stderr. SPIKE DIAG: RUST_LOG=debug adds the
+    // mechanism's own ops (target varena_diag).
+    let level = std::env::var("RUST_LOG").ok().and_then(|l| l.parse().ok()).unwrap_or(tracing::level_filters::LevelFilter::INFO);
+    let _ = tracing_subscriber::fmt().with_max_level(level).with_writer(std::io::stderr).try_init();
     errors::install(m)?;
     cleanup::install(m)?;
     ceiling::install(m)?;

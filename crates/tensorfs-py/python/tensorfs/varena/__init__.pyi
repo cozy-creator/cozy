@@ -195,6 +195,10 @@ class Request:
         """The cut level of `set`'s current pass for `site` (0: whole); with no set (outside any
         pass) the request's own memo of that site at the op's shape key `shape`."""
 
+    def allocating(self, memory: Memory, set: int | None, allocated: int, reserved: int) -> None:
+        """SPIKE: this thread's segments for torch's pool are `set`'s pass's (None: outside any
+        pass) from now on: a shortfall asks this request."""
+
     def yielding(self, family: str) -> Yielded:
         """The request waits on a call of its `family` (a child): until the guard ends it gives
         back its reserved room to that family alone; ended, it waits for its room back."""
@@ -202,6 +206,17 @@ class Request:
     def stats(self) -> Stats: ...
     def end(self) -> Stats:
         """Ends it: its pins, rooms and caches go."""
+
+def allocated() -> None:
+    """SPIKE: this thread's pass is over for torch's pool (`Request.allocating`)."""
+
+def allocator_stats() -> tuple[int, int, int, int, int, int, int]:
+    """SPIKE: the pool's segments: (live bytes, segments made, shortfalls varena resolved, their
+    bytes, refusals, nanoseconds making segments, segments freed)."""
+
+def allocator_reentries() -> tuple[int, int]:
+    """SPIKE: the trims and cache shrinks varena reached on a thread inside the allocator
+    (answered 0, never run)."""
 
 class Pass:
     def end(self, allocated_peak: int, slack: int, sites: list[tuple[str, int, bool, int]], allocated: int, reserved: int) -> None:
