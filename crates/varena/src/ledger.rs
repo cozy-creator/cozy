@@ -978,15 +978,6 @@ impl Row {
         }
     }
 
-    /// Native allocator publication: no remap, heap lock or latch wait.
-    pub(crate) fn try_publish(&self, facts: &Facts) -> bool {
-        let Some(r) = row(&self.map, self.at) else { return false };
-        let Some(_one) = self.latch.try_lock() else { return false };
-        if r.word.load(Acquire) != self.word { return false; }
-        latch_write(&r.seq, &r.latch, &facts.words());
-        true
-    }
-
     /// A stamp taken before collecting authoritative physical counts. Keep it alongside
     /// those counts through deferred publication; taking a new stamp afterward is unsafe.
     pub fn physical_epoch(&self) -> u64 {

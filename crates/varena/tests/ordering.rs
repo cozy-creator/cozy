@@ -1430,7 +1430,7 @@ fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
     log.await_call(|(_, call)| call.contains("Withdraw"));
     assert_eq!(mem.torch_limit(), 0, "the queued custody handle still holds the page");
     let request = mem.request("pending", Plan::default()).unwrap();
-    assert_eq!(request.reclaim_allocation(None, REGION_ALIGN, Torch::default()).unwrap(), 0, "the allocator never waits for custody");
+    assert_eq!(request.reclaim_allocation(REGION_ALIGN).unwrap(), 0, "the allocator never waits for custody");
     let binder = {
         let mem = mem.clone();
         std::thread::spawn(move || drop(mem.bind(b, 0, 0).unwrap()))
@@ -1556,7 +1556,7 @@ fn the_allocator_callback_works_while_the_state_is_locked() {
     };
     events.free_waits.pass();
     let limit = mem.allocator_limit();
-    let reclaimed = r.reclaim_allocation(None, 2 * REGION_ALIGN, Torch::default());
+    let reclaimed = r.reclaim_allocation(2 * REGION_ALIGN);
     let after = mem.allocator_limit();
     // The lock goes back before any assertion, so a failure never hangs the case.
     events.free_gate.open();
@@ -1589,7 +1589,7 @@ fn an_unmeasured_pass_takes_idle_kept_pages_before_it_runs() {
     mem.settle();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
     // In the callback, kept pages are custody's: nothing to reclaim.
-    assert_eq!(r.reclaim_allocation(Some(a), REGION_ALIGN, Torch::default()).unwrap(), 0, "kept pages are not the callback's");
+    assert_eq!(r.reclaim_allocation(REGION_ALIGN).unwrap(), 0, "kept pages are not the callback's");
     let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
     mem.settle();
     let n: u64 = ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum();
