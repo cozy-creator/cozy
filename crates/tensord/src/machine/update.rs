@@ -23,6 +23,10 @@ use crate::{origin::Machine, stop::Stop};
 /// which runs report: a named wheel file is not a published release.
 pub const RUNTIME_BUILD: &str = "runtime-build";
 
+#[path = "default_sdk.rs"]
+mod default_sdk;
+pub use default_sdk::DefaultSdk;
+
 /// The service's exit status asking its parent to start the service again on the selected pair.
 pub const REPLACE_EXIT: i32 = 75;
 /// This binary's release, which an update's `from` and `to` name as `cozy`.
@@ -251,10 +255,10 @@ impl Paths {
     pub fn new(engine: &Path, root: &Path) -> Self {
         // A development image may vendor this machine's own executor SDK beside the Go agent's.
         let own = root.join("opt/cozy/machine/wheels");
-        let image_wheels = if own.is_dir() {
-            own
-        } else {
+        let image_wheels = if matches!(fs::symlink_metadata(&own), Err(e) if e.kind() == io::ErrorKind::NotFound) {
             root.join("opt/cozy/wheels")
+        } else {
+            own // Broken/empty baked selections are still selections, never a fallback.
         };
         let home = std::env::home_dir().unwrap_or_else(|| root.into());
         Self {
@@ -270,6 +274,13 @@ impl Paths {
     fn current_sdk_link(&self) -> PathBuf {
         self.engine.join("sdk/current")
     }
+    /// Truly fresh only when neither an explicit selection nor baked wheel directory exists.
+    /// Broken symlinks, empty directories and unreadable metadata cannot prove absence.
+    pub fn unselected_sdk(&self) -> bool {
+        [self.current_sdk_link(), self.image_wheels.clone()].iter().all(|path|
+            matches!(fs::symlink_metadata(path), Err(e) if e.kind() == io::ErrorKind::NotFound))
+    }
+
     /// The executors' Runtime/TensorFS wheels: the last activated pair, else the image's.
     pub fn sdk(&self) -> PathBuf {
         let link = self.current_sdk_link();
@@ -374,7 +385,7 @@ pub fn recover_activation(paths: &Paths) -> io::Result<Recovered> {
 /// each GPU executor must prove the memory capability before Start.
 pub fn check_startup_pair(paths: &Paths) -> io::Result<()> {
     let pair = pair_in(&paths.sdk());
-    if pair.runtime.is_empty() && pair.tensorfs.is_empty() && read_pending(paths)?.is_none() {
+    if paths.unselected_sdk() && read_pending(paths)?.is_none() {
         return Ok(());
     }
     pair.require_memory_protocol()
@@ -1035,39 +1046,8 @@ impl Updates {
     /// environments would set aside for a release's locked Runtime.
     fn compile(&self, wheels: &[PathBuf]) -> io::Result<Result<String, String>> {
         let input: String = wheels.iter().map(|p| p.display().to_string() + "\n").collect();
-        super::client::ensure_uv(&self.paths.uv)?;
-        let mut command = std::process::Command::new(&self.paths.uv);
-        let mut child = platform::process::own_group(&mut command)
-            .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--no-annotate", "--python", "3.12", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        // uv's own exit says why, should it stop before reading the input.
-        let _ = child.stdin.take().expect("piped stdin").write_all(input.as_bytes());
-        let (stdout, stderr) = (child.stdout.take().expect("piped stdout"), child.stderr.take().expect("piped stderr"));
         let stop = self.stop.lock().unwrap().clone();
-        let (ended, out, reason) = std::thread::scope(|scope| {
-            let drain = |mut pipe: Box<dyn Read + Send>| {
-                scope.spawn(move || {
-                    let mut text = String::new();
-                    let _ = pipe.read_to_string(&mut text);
-                    text
-                })
-            };
-            let (out, reason) = (drain(Box::new(stdout)), drain(Box::new(stderr)));
-            let ended = crate::process::supervise(&mut child, Some(&stop), "uv", &|_| ());
-            (ended, out.join().unwrap_or_default(), reason.join().unwrap_or_default())
-        });
-        match ended? {
-            Supervised::Exited(status) if status.success() => Ok(Ok(out)),
-            Supervised::Canceled => Err(io::Error::new(io::ErrorKind::Interrupted, "the update was canceled")),
-            Supervised::Wedged(verdict) => Err(io::Error::other(format!("uv pip compile: {verdict}"))),
-            Supervised::Exited(_) => {
-                let reason: Vec<&str> = reason.split_whitespace().filter(|w| !matches!(*w, "×" | "╰─▶")).collect();
-                Ok(Err(reason.join(" ").trim_end_matches('.').to_owned()))
-            }
-        }
+        compile_sdk(&self.paths.uv, &input, &stop, false)
     }
 
     /// A {file, sha256} fetched from its url or staged, or a published {version} fetched from
@@ -1103,6 +1083,43 @@ impl Updates {
     }
 }
 
+/// Resolve SDK requirements using the same uv path as an explicit machine update.
+fn compile_sdk(uv: &Path, input: &str, stop: &Stop, wheel_plan: bool) -> io::Result<Result<String, String>> {
+    super::client::ensure_uv(uv)?;
+    let mut command = std::process::Command::new(uv);
+    if wheel_plan { command.args(["pip", "compile", "--format", "pylock.toml", "--only-binary", ":all:"]); }
+    else { command.args(["pip", "compile"]); }
+    let mut child = platform::process::own_group(&mut command)
+        .args(["--quiet", "--no-config", "--no-cache", "--no-header", "--no-annotate", "--python", "3.12", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // uv's own exit says why, should it stop before reading the input.
+    let _ = child.stdin.take().expect("piped stdin").write_all(input.as_bytes());
+    let (stdout, stderr) = (child.stdout.take().expect("piped stdout"), child.stderr.take().expect("piped stderr"));
+    let (ended, out, reason) = std::thread::scope(|scope| {
+        let drain = |mut pipe: Box<dyn Read + Send>| {
+            scope.spawn(move || {
+                let mut text = String::new();
+                let _ = pipe.read_to_string(&mut text);
+                text
+            })
+        };
+        let (out, reason) = (drain(Box::new(stdout)), drain(Box::new(stderr)));
+        let ended = crate::process::supervise(&mut child, Some(stop), "uv", &|_| ());
+        (ended, out.join().unwrap_or_default(), reason.join().unwrap_or_default())
+    });
+    match ended? {
+        Supervised::Exited(status) if status.success() => Ok(Ok(out)),
+        Supervised::Canceled => Err(io::Error::new(io::ErrorKind::Interrupted, "SDK resolution was canceled")),
+        Supervised::Wedged(verdict) => Err(io::Error::other(format!("uv pip compile: {verdict}"))),
+        Supervised::Exited(_) => {
+            let reason: Vec<&str> = reason.split_whitespace().filter(|w| !matches!(*w, "×" | "╰─▶")).collect();
+            Ok(Err(reason.join(" ").trim_end_matches('.').to_owned()))
+        }
+    }
+}
 /// Copies a verified `distribution` wheel into `candidate`, durably: where it is now. The copy is
 /// written and flushed through its own handle, since a wheel from the store is read-only (a copy
 /// keeps that) and Windows flushes only through a writable handle.

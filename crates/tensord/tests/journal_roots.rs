@@ -88,6 +88,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
             // A Runtime wheel not yet published, installed as this machine's own (a dev build),
             // the operator's choice as an update's `--runtime-wheel` is.
             sdk: named_runtime::pair().to_vec(),
+            default_sdk: None,
             runtime_build: named_runtime::named().map(|(version, _)| version.clone()).unwrap_or_default(),
             uv: "uv".into(),
             seed_cache: None,

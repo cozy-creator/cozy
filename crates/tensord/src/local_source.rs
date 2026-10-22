@@ -259,7 +259,7 @@ impl LocalSources {
         let key = serde_json::json!({
             "lock": held("uv.lock"), "project": held("pyproject.toml"), "beside": beside, "wheels": carried,
             "indexes": manifest.indexes,
-            "sdk": self.installer.sdk, "client": self.installer.client_wheel,
+            "sdk": self.installer.sdk(), "client": self.installer.client_wheel,
             "python": self.installer.python, "python_version": manifest.python_version,
         });
         home.join(format!("env-{}", &sha256::hex_digest(key.to_string().as_bytes())[..16]))
@@ -442,11 +442,12 @@ impl LocalSources {
         run: &str,
         stage: &dyn Fn(&str),
     ) -> Result<Installation, Refused> {
+        self.installer.resolve_sdk(stop).map_err(installer_refusal)?;
         // Like published installations, local aliases include the selected SDK and
         // client. The source digest alone cannot identify the environment after an update.
         let key = serde_json::json!({
             "manifest": digest,
-            "sdk": self.installer.sdk,
+            "sdk": self.installer.sdk(),
             "client": self.installer.client_wheel,
             "python": self.installer.python,
         });
@@ -625,6 +626,7 @@ mod tests {
             client_wheel: client,
             staging_root: root.join("staging"),
             sdk: vec![],
+            default_sdk: None,
             uv: "uv".into(),
             seed_cache: None,
             runtime_build: String::new(),
