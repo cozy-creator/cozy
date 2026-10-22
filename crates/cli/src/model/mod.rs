@@ -145,7 +145,7 @@ pub(crate) struct Quantize {
 pub(crate) struct Publish {
     /// org/name.
     model: String,
-    /// The release: a PEP 440 version.
+    /// The release: any tag name; only a PEP 440 version is a candidate for the unversioned default.
     #[arg(long)]
     release: String,
     /// The commit it names: a tag, or sha256:<hex> of a commit or a variant header; default: the

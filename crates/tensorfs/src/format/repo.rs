@@ -185,8 +185,8 @@ pub struct Repo {
     pub tags: Vec<Tag>,
 }
 
-/// A movable name for a commit. A public tag is a release named by a PEP 440 version; a private
-/// one is the owner's. A yanked tag is skipped by an unversioned lookup.
+/// A movable name for a commit. A public tag is a release; a private one is the owner's. A yanked
+/// tag, or a public name that is not a PEP 440 version, is never the unversioned default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tag {
     pub name: String,
@@ -308,9 +308,6 @@ impl Repo {
         for t in &self.tags {
             if !tag_name(&t.name) || !seen.insert(&t.name) {
                 return invalid(format!("tag {:?} is not a segment, starts with sha256: or repeats", t.name));
-            }
-            if t.public && Version::from_str(&t.name).is_err() {
-                return invalid(format!("public tag {:?} is not a PEP 440 version", t.name));
             }
         }
         Ok(())

@@ -5,7 +5,7 @@ For anyone implementing [cozytensors/1](../spec/cozytensors.md).
 | Path | What |
 |---|---|
 | `schema/header.cddl` | The header's CBOR structure (RFC 8610). |
-| `schema/{tree,repo}.schema.json` | JSON Schema (2020-12) of the tree and repo. Byte lengths, bounds, duplicate keys, integer-only numbers, unique tag names and PEP 440 public names are spec rules the schema cannot express. |
+| `schema/{tree,repo}.schema.json` | JSON Schema (2020-12) of the tree and repo. Byte lengths, bounds, duplicate keys, integer-only numbers, and unique tag names are spec rules the schema cannot express. |
 | `vectors/cases/<family>.json` | Decode cases of one scheme family (`core`: plain tensors, spans, an unknown scheme), in header order: a tensor's parts (base64 bits, in order) and its expected logical bytes, or the refusal code (`decode`, `unknown_scheme`). |
 | `vectors/store/` | A static origin holding those cases: one repo per family, `Conformance/<family>` at `refs/conformance/<family>.json`, public tag `1` a commit with variant `all` (every case, laid out by the chunk rule) and a LICENSE. `core` adds variant `spans` (a range across three chunks), a yanked public tag `2` whose commit swaps the variants, and a private tag `main`. |
 | `vectors/cores.json` | Cases of the decode building blocks (spec §6): affine and table over the producers' packings, and gguf-py's own q4_0/q8_0 block structs. |

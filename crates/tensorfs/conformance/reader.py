@@ -159,7 +159,6 @@ def parse_repo(data: bytes) -> dict:
         need(segment(tag) and not tag.startswith("sha256:") and tag not in seen, f"bad or repeated tag {tag!r}")
         seen.add(tag)
         public = field(t, "public", bool, optional=True)
-        need(not public or version(tag) is not None, f"public tag {tag!r} is not a PEP 440 version")
         tags.append({"name": tag, "commit": object_ref(field(t, "commit", dict)), "public": public,
                      "yanked": field(t, "yanked", bool, optional=True)})
     return {"name": name, "tags": tags}

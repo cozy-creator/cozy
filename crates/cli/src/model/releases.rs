@@ -2,7 +2,7 @@
 //! model's repo document at the Hub's distribution endpoint (TensorFS's `Endpoint::update_repo`):
 //! read it, change it, write it under `If-Match` on what was read. A lost race reads it again and
 //! re-applies the edit, at most [`ATTEMPTS`] times; an edit the newer document no longer allows is
-//! refused. A public tag is a release, named by a PEP 440 version.
+//! refused. A public tag is a release; a PEP 440 version is a candidate for the default.
 use std::process::ExitCode;
 
 use base64::Engine as _;
@@ -327,8 +327,11 @@ mod tests {
             let error = publish(&endpoint, release, commit).await.unwrap_err();
             assert_eq!(error.code, code, "{error:?}");
         }
-        let unversioned = publish(&endpoint, "nightly", Some("main")).await.unwrap_err();
-        assert!(unversioned.kind == Kind::Validation && unversioned.message.contains("PEP 440"), "{unversioned:?}");
+        // Any tag name is a release (`1.0.0-audit.1`): resolvable by name, never the default.
+        let (doc, _) = publish(&endpoint, "1.0.0-audit.1", Some("main")).await.unwrap();
+        assert_eq!(doc.tag("1.0.0-audit.1").map(|t| (t.commit.id(), t.public)), Some((base.id(), true)));
+        assert_eq!(doc.default_tag().map(|t| t.name.as_str()), Some("2.0.0"));
+        assert_eq!(endpoint.commit(MODEL, "1.0.0-audit.1").await.unwrap().0, base);
         let nothing = edit(&endpoint_at(&dir.path().join("empty")), release("1.0.0", "main")).await.unwrap_err();
         assert_eq!(nothing.code, "model_not_found", "{nothing:?}");
     }

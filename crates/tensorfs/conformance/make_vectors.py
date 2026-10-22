@@ -389,6 +389,7 @@ REPOS_GREEN = {
                                                          "1.0.dev3", "1.0.0", "01.2"))),
     "shared-commit": repo(tag("1.0", public=True), tag("main"), tag("1.0.1", public=True)),
     "explicit-false": repo(tag("1.0", T1, public=False, yanked=False)),
+    "public-any-name": repo(tag("1.0.0", public=True), tag("1.0.0-audit.1", public=True), tag("main", public=True)),
 }
 REPOS_RED = {
     "bad-name": {**REPO_BASIC, "name": "acme"},
@@ -401,8 +402,6 @@ REPOS_RED = {
     "dot-tag": repo(tag("..")),
     "slash-tag": repo(tag("runs/42")),
     "digest-tag": repo(tag("sha256:" + T1["sha256"])),
-    "public-not-version": repo(tag("main", public=True)),
-    "public-wildcard": repo(tag("1.0.*", public=True)),
     "no-commit": repo({"name": "main"}),
     "public-not-bool": repo(tag("1.0", public="true")),
     "yanked-not-bool": repo(tag("1.0", public=True, yanked=1)),
@@ -458,6 +457,8 @@ def resolution() -> dict:
                 "1.0+local.1"),
         default("an epoch outranks a larger release", [("2!0.1", public), ("10.0", public)], "2!0.1"),
         default("private tags are not candidates", [("1.0", public), ("2.0", {})], "1.0"),
+        default("a public name that is not a version is never the default", [("1.0.0", public), ("1.0.0-audit.1", public)],
+                "1.0.0"),
         default("no public, non-yanked tag: none", [("main", {}), ("1.0", yanked)]),
     ]
     return {"repo": doc, "trees": [json.loads(t) for t in trees], "cases": cases, "defaults": defaults}

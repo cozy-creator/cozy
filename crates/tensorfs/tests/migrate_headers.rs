@@ -439,10 +439,9 @@ fn checkpoints_differing_only_in_dropped_metadata_share_one_tree() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// A release named by no PEP 440 version cannot be a public tag: the one the owner ruled an
-/// audit artifact becomes private, any other refuses its repo.
+/// A release named by no PEP 440 version stays a public release under its own name.
 #[test]
-fn a_release_that_is_no_version_is_private_by_ruling_or_refused() {
+fn a_release_that_is_no_version_stays_public() {
     let dir = scratch("no-version");
     let manifest = put(&dir, &serde_json::to_vec(&json!({"format": "tensorfs.manifest/1", "files": lane_files(&dir, GPT2_FULL)})).unwrap());
     let doc = |name: &str| {
@@ -451,11 +450,8 @@ fn a_release_that_is_no_version_is_private_by_ruling_or_refused() {
     };
     let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let read = |o: &ObjectRef| Ok(std::fs::read(dir.join(o.key()))?);
-    let ruled = migrator.repo(&doc(d10::PRIVATE[0].0), &read).unwrap();
-    let tag = &ruled.repo.tags[0];
-    assert_eq!((tag.name.as_str(), tag.public, tag.yanked), (d10::PRIVATE[0].1, false, true));
-    assert_eq!(ruled.report["made_private"], json!([d10::PRIVATE[0].1]));
-    let refused = migrator.repo(&doc("acme/audit"), &read).err().unwrap();
-    assert!(refused.detail.contains("PEP 440"), "{}", refused.detail);
+    let migrated = migrator.repo(&doc("fidika/minimax-h3-turbo-lora"), &read).unwrap();
+    let tag = &migrated.repo.tags[0];
+    assert_eq!((tag.name.as_str(), tag.public, tag.yanked), ("1.0.0-audit.1", true, true));
     std::fs::remove_dir_all(dir).unwrap();
 }

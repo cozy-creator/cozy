@@ -197,22 +197,6 @@ fn peft(tensors: &mut [(String, Vec<Tensor>)]) -> BTreeMap<String, Vec<(String, 
     out
 }
 
-/// Releases that become private tags (a public tag is a PEP 440 version): model and version, by
-/// ruling (2026-10-20: audit, proof and recovery artifacts, production's and 8819's). Any other
-/// release not a version refuses its repo.
-pub const PRIVATE: &[(&str, &str)] = &[
-    ("fidika/minimax-h3-turbo-lora", "1.0.0-audit.1"),
-    ("paul/cache-persistence-proof", "0.0.1-cacheproof.20260924"),
-    ("paul/cozy-mixed-input-proof", "0.0.0-rental-audit.20260913"),
-    ("paul/creator-output-b93c35ccecf8c183", "0.0.0-recovery-source-config.20260906"),
-    ("paul/creator-output-b93c35ccecf8c183", "0.0.0-recovery-source.20260906"),
-    ("paul/d1-g5r32-sdxl", "0.0.1-d1"),
-    ("paul/d1-gate5-sdxl", "0.0.1-d1"),
-    ("paul/d1-gate5c-sdxl", "0.0.1-d1"),
-    ("paul/minimax-h3", "1.0.0-h3-audit.1"),
-    ("paul/minimax-h3-turbo-lora", "1.0.0-audit.1"),
-];
-
 /// A repo document before D10, whatever wrote it: 0.12's `releases` of lanes and `checkpoints`
 /// (U11), or `tags` (the Hub's view of a v1 model: a release's `lanes`, an unreleased
 /// checkpoint's v1 manifest as its `commit`; or a D10 document).
@@ -335,7 +319,7 @@ impl<'t> Migrator<'t> {
         let mut objects = Objects::new();
         let mut lanes: HashMap<ObjectRef, Lane> = HashMap::new();
         let put = |objects: &mut Objects, tree: &Tree| -> Result<ObjectRef> { Ok(add(objects, tree.to_json()?)) };
-        let (mut repo, mut released, mut unreleased, mut private) = (Repo::new(&name), Vec::new(), Vec::new(), Vec::new());
+        let (mut repo, mut released, mut unreleased) = (Repo::new(&name), Vec::new(), Vec::new());
         for t in tags {
             let what = t.name.clone().unwrap_or_default();
             let commit = match (&t.lanes, &t.commit) {
@@ -376,10 +360,6 @@ impl<'t> Migrator<'t> {
                 }
                 (None, None) => return fail(Kind::Invalid, format!("{name}: tag {what:?} names no lanes or commit")),
             };
-            let public = t.public && !PRIVATE.contains(&(name.as_str(), what.as_str()));
-            if public != t.public {
-                private.push(json!(what));
-            }
             let tag = match (t.name, &t.commit) {
                 (Some(n), _) if t.public => n,
                 (n, Some(c)) if unnamed.contains(&c.sha256) => {
@@ -399,13 +379,10 @@ impl<'t> Migrator<'t> {
             if repo.tag(&tag).is_some() {
                 return fail(Kind::Invalid, format!("{name}: two tags named {tag}"));
             }
-            repo.tags.push(Tag { name: tag, commit, public, yanked: t.yanked });
+            repo.tags.push(Tag { name: tag, commit, public: t.public, yanked: t.yanked });
         }
         repo.to_json().map_err(|e| invalid(format!("{name}: {e}")))?;
-        let mut report = json!({"model": name, "upstream": upstream.map(|u| u.from), "releases": released, "checkpoints": unreleased});
-        if !private.is_empty() {
-            report["made_private"] = json!(private);
-        }
+        let report = json!({"model": name, "upstream": upstream.map(|u| u.from), "releases": released, "checkpoints": unreleased});
         Ok(Migrated { repo, objects, report })
     }
 

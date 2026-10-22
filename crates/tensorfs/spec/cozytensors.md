@@ -665,13 +665,13 @@ A repo is a set of **commits** and the **tags** that point at them, as in git:
 - A **commit** is an immutable repo state: a tree (§3). Its id is the tree's object ref. Every upload makes one.
 - A **tag** is a movable name for a commit. `tags` lists them in creation order: moving a tag keeps its place, a new
   one is appended, a deleted one is removed. Names MUST be unique segments (§2) that do not start with `sha256:`.
-- `public` (boolean, default `false`): a public tag is a release, and its name MUST be a version (PEP 440). A private
+- `public` (boolean, default `false`): a public tag is a release, of any tag name (`1.0.0-audit.1`). A private
   tag is the owner's: a server serves it only to readers who may write the repo (distribution.md §4).
 - `yanked` (boolean, default `false`) withdraws a tag from unversioned lookups.
 - Any change is a new document: a writer conditions it on the whole document it read (its ETag, distribution.md §4).
   Nothing in it counts edits.
 - **Resolution** of a `revision`, once, to a commit:
-  - none: among public, non-yanked tags, the highest final version in PEP 440 order; a pre-release (`a`, `b`,
+  - none: among public, non-yanked tags named by a PEP 440 version, the highest final one; a pre-release (`a`, `b`,
     `rc`, `.dev`) only when no final version exists; of equal versions (`1.0`, `1.0.0`), the later-created tag;
   - `sha256:<hex>`: the tag commit with that digest; else a variant header with that digest, at the commit that cites
     it (the default's if it does, else the last-created tag's whose commit does); else not found;

@@ -78,8 +78,8 @@ fn release_verbs_edit_the_repo_document_as_its_owner() {
     assert_eq!(by_header["commit"].as_str(), Some(more.as_str()), "{by_header}");
     let unknown = refused(&home, &["model", "publish", &model, "--release", "2.0.0", "--commit", UNKNOWN]);
     assert_eq!(unknown["code"], "commit_not_found", "{unknown}");
-    let unversioned = refused(&home, &["model", "publish", &model, "--release", "nightly", "--commit", "main"]);
-    assert!(unversioned["message"].as_str().unwrap().contains("PEP 440"), "{unversioned}");
+    let named = publish("1.0.0-audit.1", "draft");
+    assert_eq!((named["commit"].as_str(), &named["public"]), (Some(base.as_str()), &Value::Bool(true)), "{named}");
 
     let yank = |extra: &[&str]| home.json(["--json", "model", "yank", &model, "--release", "1.0.0"].iter().chain(extra));
     let yanked = yank(&[]);
