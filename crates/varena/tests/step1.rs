@@ -159,6 +159,7 @@ fn open(tag: &str, pages: u64) -> (tempfile::TempDir, String, Arc<Card>, Arc<Mem
 fn close(uuid: &str, mem: Arc<Memory>) {
     drop(mem);
     varena::os::remove_table(uuid);
+    varena::tier::remove_claims();
 }
 
 /// The hook waits on a page's release event, the state unlocked meanwhile: another thread's

@@ -2858,8 +2858,23 @@ impl Inner {
                         st = self.lock();
                         continue;
                     }
-                    self.make_room(bytes, &[key], if free_only { "bind_free" } else { "bind" }, req, free_only)?;
+                    let refused = match self.make_room(bytes, &[key], if free_only { "bind_free" } else { "bind" }, req, free_only) {
+                        Err(e @ Error::Exhausted(_)) if !free_only => Some(e),
+                        made => made.map(|_| None)?,
+                    };
                     st = self.lock();
+                    if let Some(e) = refused {
+                        // A streamed set with only its slots left: one of them moves to the block (the floor: one block).
+                        match self.stream_in(&mut st, key, req)? {
+                            StreamIn::Moved => continue,
+                            StreamIn::Wait => {
+                                waited = true;
+                                self.wait(&mut st)?;
+                                continue;
+                            }
+                            StreamIn::No => return Err(e),
+                        }
+                    }
                     if !st.homes.contains_key(&key) {
                         self.map(&mut st, key, req, false)?;
                     }

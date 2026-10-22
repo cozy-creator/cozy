@@ -32,6 +32,7 @@ impl Gpu {
 impl Drop for Gpu {
     fn drop(&mut self) {
         varena::os::remove_table(&self.0.uuid);
+        varena::tier::remove_claims();
     }
 }
 

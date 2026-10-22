@@ -140,6 +140,7 @@ fn a_pin_dropped_before_the_binder_waits_wakes_it() {
     binder.join().unwrap();
     drop(mem);
     varena::os::remove_table(&uuid);
+    varena::tier::remove_claims();
     assert!(first.is_ok(), "the binder slept through the pin drop's wake ({second:?} after an unrelated one)");
 }
 
