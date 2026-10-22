@@ -88,32 +88,6 @@ fn unload(b: &CudaBackend, va: Va, offset: u64, page: Physical) {
     step!();
 }
 
-/// The native runner's GPU monitor: one line per look on stdin, answered `@ <kernels> <memory>`:
-/// whether kernels ran, and whether device memory moved, on the run's GPU since the last look
-/// (NVML's samples). It makes no CUDA context.
-#[test]
-#[ignore = "native GPU: the runner's GPU monitor"]
-fn role_monitor() {
-    if role().as_deref() != Some("monitor") {
-        return;
-    }
-    let mut device = 0;
-    cuda::check("cuDeviceGet", unsafe { (cuda::driver().unwrap().device_get)(&mut device, 0) }).unwrap();
-    let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
-    let mut seen = 0;
-    let _ = nvml.worked_since(&mut seen);
-    println!("@ ready");
-    std::io::stdout().flush().unwrap();
-    for _ in std::io::stdin().lock().lines() {
-        // NVML answers "not found" when it has taken no sample since the last look: no signal.
-        match nvml.worked_since(&mut seen) {
-            Ok((kernels, memory)) => println!("@ {kernels} {memory}"),
-            Err(e) => println!("@ unknown {e}"),
-        }
-        std::io::stdout().flush().unwrap();
-    }
-}
-
 /// This binary again, running `test` as `role`, with `stdin` (a socket to pass handles on).
 fn child(test: &str, role: &str, stdin: Stdio) -> Child {
     Command::new(std::env::current_exe().unwrap())
@@ -790,8 +764,11 @@ fn graphs() -> &'static Graphs {
     })
 }
 
-/// A graph of one `copy` from `src` to `dst` (`words` u64s), captured on `stream`, instantiated.
+/// A graph of one `copy` from `src` to `dst` (`words` u64s), captured on `stream`, instantiated. The graph calls take
+/// the current context: the primary one, entered here.
 fn captured_copy(dst: u64, src: u64, words: u64, stream: usize) -> usize {
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
     let g = graphs();
     // Relaxed: other threads may call the driver meanwhile.
     const RELAXED: std::ffi::c_int = 2;
@@ -802,6 +779,13 @@ fn captured_copy(dst: u64, src: u64, words: u64, stream: usize) -> usize {
     let mut exec = std::ptr::null_mut();
     assert_eq!(unsafe { (g.instantiate)(&mut exec, graph, 0) }, cuda::SUCCESS);
     exec as usize
+}
+
+/// Replays an instantiated graph on `stream`, in the primary context.
+fn replay(exec: usize, stream: usize) -> cuda::CUresult {
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    unsafe { (graphs().launch)(exec as *mut c_void, stream as cuda::CUstream) }
 }
 
 /// Step 2's mechanism on the driver: two physical slots stream four blocks, each slot remapped (cuMemUnmap, then
@@ -841,7 +825,7 @@ fn a_graph_captured_at_a_blocks_va_replays_across_slot_remaps() {
             b.map(va, i * gran, &slots[s], Access::ReadWrite).unwrap();
             // SAFETY: the slot is mapped at the block's VA and nothing else uses it until the replay.
             unsafe { io::read(&[Copy { src: Src::Host(data[i as usize].as_ptr()), dst: b.target(va, i * gran, gran) }], &ReadOpts::default()) }.unwrap();
-            assert_eq!(unsafe { (graphs().launch)(execs[i as usize] as *mut c_void, stream.raw() as cuda::CUstream) }, cuda::SUCCESS);
+            assert_eq!(replay(execs[i as usize], stream.raw()), cuda::SUCCESS);
             at[s] = Some((i, b.record(stream.raw()).unwrap()));
         }
         stream.drain().unwrap();
@@ -1504,7 +1488,7 @@ fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishe
     // The copy must read the original contents before the in-place refill lands: the refill's
     // copies wait for it in-stream. The rebind returns once they are issued (D), its page ready
     // in-stream, while the fill thread's read keeps its staging until they complete.
-    let _ = mem.free();
+    poke(&mem);
     let (again, waited) = std::thread::scope(|t| {
         let (rebind, waited) = watch(t, first, || mem.bind(s, 0, 0));
         drop(gate);
@@ -1757,6 +1741,8 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
 /// A kept page whose fill identity changed is renewed: a fresh page takes its place, and the old
 /// one is unmapped only once its consumers are done. A spin kernel holds it as its consumer; the
 /// unmap must come after the kernel's end (its launch plus its measured length on the GPU's clock).
+/// A page is kept with no request open (D9), and the renewal runs outside one too: a request's pass
+/// start withdraws the Keep, and a page not kept refills in place.
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
@@ -1783,15 +1769,15 @@ fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
     step!();
     drop(pin);
     step!();
-    assert_eq!(synchronize(), cuda::SUCCESS);
+    pass.end(0);
     step!();
-    // The bake's event done, the page is kept (exported read-only) at the next look.
-    let _ = mem.free();
-    while timings.count("export") == 0 {
-        drop(mem.bind(s, 0, 0).unwrap());
-        assert_eq!(synchronize(), cuda::SUCCESS);
-        let _ = mem.free();
-    }
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    // The request ended: the baked page is kept (exported read-only) once its bake's event is done.
+    mem.settle();
+    step!();
+    assert!(timings.count("export") > 0, "the baked page was kept once its request ended");
+    step!();
     let consumer = cuda::Stream::new(0).unwrap();
     step!();
     let held = mem.bind(s, 0, consumer.raw()).unwrap();
@@ -1813,25 +1799,22 @@ fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
     step!();
     assert!(renewed.fresh, "a new identity is baked again");
     step!();
-    consumer.drain().unwrap();
-    step!();
-    let ended = launched + spin;
-    step!();
-    while timings.count("unmap") == unmaps {
-        // The old page goes on the mechanism thread once its consumer is done.
-        let _ = mem.free();
-    }
-    let unmapped = timings.last("unmap").unwrap();
-    step!();
-    assert!(unmapped >= ended, "the old page was unmapped {:?} before its consumer's end", ended - unmapped);
-    step!();
     renewed.filled();
     step!();
     drop(renewed);
     step!();
-    pass.end(0);
+    consumer.drain().unwrap();
     step!();
-    assert_eq!(r.end().leftover, 0);
+    let ended = launched + spin;
+    step!();
+    // The old page goes on the mechanism thread once its consumer is done; settle waits for it.
+    mem.settle();
+    step!();
+    assert!(timings.count("unmap") > unmaps, "the old page was never unmapped");
+    step!();
+    let unmapped = timings.last("unmap").unwrap();
+    step!();
+    assert!(unmapped >= ended, "the old page was unmapped {:?} before its consumer's end", ended - unmapped);
     step!();
     println!("RENEW the old page unmapped {:?} after its {spin:?} consumer ended; {}", unmapped - ended, timings.report());
     step!();
@@ -2316,17 +2299,17 @@ fn a_keep_protects_a_page_only_after_its_pin_and_the_kernels_reading_it_end() {
     step!();
     assert_eq!(acc, if passes % 2 == 1 { once } else { 0 }, "the sweep read other bytes than the bake's ({passes} passes)");
     step!();
-    while timings.protects.lock().len() == protects {
-        // The Keep runs on the mechanism thread once the page is free of pins and consumers.
-        poke(&mem);
-    }
-    let (start, end) = timings.protects.lock()[protects];
-    step!();
-    assert!(start >= unpinned, "the page was protected {:?} while its pin was held", unpinned - start);
-    step!();
     pass.end(0);
     step!();
     assert_eq!(r.end().leftover, 0);
+    step!();
+    // A Keep runs with no request open (D9), on the mechanism thread once the page is free of pins and consumers;
+    // settle waits for it.
+    mem.settle();
+    step!();
+    let (start, end) = *timings.protects.lock().get(protects).expect("the page was kept once its request ended");
+    step!();
+    assert!(start >= unpinned, "the page was protected {:?} while its pin was held", unpinned - start);
     step!();
     println!("KEEP protect {:?} after the unpin, for {:?}; the sweep {passes} passes over {long:?}", start - unpinned, end - start);
     step!();
@@ -2861,7 +2844,7 @@ fn a_graph_replays_across_a_streamed_sets_slot_moves() {
         let pin = mem.bind(s, b, stream.raw()).unwrap();
         let (ptr, exec) = execs[b as usize];
         assert_eq!(pin.ptr, ptr, "block {b} moved off its own VA");
-        assert_eq!(unsafe { (graphs().launch)(exec as *mut c_void, stream.raw() as cuda::CUstream) }, cuda::SUCCESS);
+        assert_eq!(replay(exec, stream.raw()), cuda::SUCCESS);
         assert!(bytes(out.ptr(), REGION_ALIGN, stream.raw()) == *block(99, b), "block {b}'s graph read other bytes");
     }
     pass.end(0);
@@ -3430,6 +3413,9 @@ fn a_kept_set_is_imported_after_its_holders_kill_9_and_another_fill_refills() {
     step!();
     a.ok("load k 4 10 stored gpu");
     step!();
+    // A filled page goes to custody asynchronously; settle makes the kept pages custody's before the kill.
+    a.ok("settle");
+    step!();
     a.child.kill().unwrap();
     step!();
     assert_eq!(a.child.wait().unwrap().signal(), Some(libc::SIGKILL));
@@ -3438,8 +3424,7 @@ fn a_kept_set_is_imported_after_its_holders_kill_9_and_another_fill_refills() {
     step!();
     let orphans: u64 = ledger.status().rows.iter().map(|r| r.classes[1]).sum();
     step!();
-    // A filled page goes to custody asynchronously: those the holder had exported are orphans.
-    assert!(orphans > 0 && orphans <= 4 * REGION_ALIGN, "class O shows the orphans: {orphans}");
+    assert_eq!(orphans, 4 * REGION_ALIGN, "class O shows the four kept pages as orphans");
     let kept = (orphans / REGION_ALIGN) as usize;
     step!();
     let mut s = Agent::spawn();
