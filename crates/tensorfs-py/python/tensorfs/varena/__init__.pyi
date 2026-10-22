@@ -164,6 +164,9 @@ class Memory:
 
     def torch_limit(self) -> int:
         """Bytes torch's allocator may hold now."""
+    def torch_ceiling(self) -> int:
+        """The most torch's allocator could ever hold here (allocated + reachable): the fraction
+        cap beside the native pool, whose segments varena's allocator governs inside it."""
 
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
