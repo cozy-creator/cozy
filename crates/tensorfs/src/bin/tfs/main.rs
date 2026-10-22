@@ -29,12 +29,11 @@ const VERBS: &[&str] = &[
 ];
 
 fn known(verb: &str) -> bool {
-    verb == "convert" || VERBS.iter().any(|l| l.split(' ').next() == Some(verb))
+    VERBS.iter().any(|l| l.split(' ').next() == Some(verb))
 }
 
 /// The usage of `verb`, or of every verb when it names none.
 fn usage(verb: Option<&str>) -> String {
-    let verb = verb.map(|v| if v == "convert" { "import" } else { v });
     let verb = verb.filter(|v| known(v));
     let mut text = String::from("usage: tfs [--store <dir>] [--endpoint <url>] [--json] <verb>");
     for line in VERBS.iter().filter(|l| verb.is_none_or(|v| l.split(' ').next() == Some(v))) {
@@ -205,7 +204,7 @@ async fn run(args: &Args) -> Done {
     let client = Client::new(config)?;
     tensorfs::io::keep_ceilings_in(&root);
     match pos.as_slice() {
-        ["import" | "convert", sources @ ..] if !sources.is_empty() => {
+        ["import", sources @ ..] if !sources.is_empty() => {
             let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
             let quiet = args.on("json");
             let last = Mutex::new((String::new(), Instant::now()));

@@ -39,7 +39,6 @@ fn help_succeeds() {
         &["import", "--help"][..],
         &["import", "-h"],
         &["help", "import"],
-        &["convert", "--help"],
     ] {
         let (code, out, _) = tfs(args);
         assert_eq!(code, Some(0), "{args:?}");
@@ -52,10 +51,11 @@ fn help_succeeds() {
 
 #[test]
 fn misuse_fails_with_2() {
-    let cases: [(&[&str], &str); 5] = [
+    let cases: [(&[&str], &str); 6] = [
         (&["--bogus"], "tfs: unknown flag --bogus"),
         (&["-x"], "tfs: unknown flag -x"),
         (&["bogus"], "tfs: unknown verb \"bogus\""),
+        (&["convert", "model.safetensors"], "tfs: unknown verb \"convert\""),
         (&["inspect"], "tfs: inspect: wrong arguments"),
         (&[], "tfs: no verb"),
     ];
