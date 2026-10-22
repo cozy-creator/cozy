@@ -3723,8 +3723,9 @@ fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>,
     if let Some(row) = row.upgrade() {
         row.ask_thread();
     }
-    Row::serve_asks(listener, stop, row, |ask| {
-        let Some(me) = Work::of(inner) else { return 0 };
+    let inner = inner.clone();
+    Row::serve_asks(listener, stop, row.clone(), move |ask| {
+        let Some(me) = Work::of(&inner) else { return 0 };
         // Never dies: a failed or panicking answer frees nothing, and the next ask is served.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ask {
             ledger::Ask::Room { ceiling, bytes } => me.answer(if ceiling >= Class::D.index() { Class::D } else { Class::N }, bytes),
