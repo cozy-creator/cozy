@@ -80,6 +80,10 @@ struct Events {
     target_gate: Gate,
     target_waits: Gate,
     hold_save: AtomicBool,
+    /// The next driver free-bytes read waits (under the state lock, as refresh reads it).
+    hold_free: AtomicBool,
+    free_gate: Gate,
+    free_waits: Gate,
     save_gate: Gate,
     save_waits: Gate,
     fail_save: AtomicBool,
@@ -156,6 +160,7 @@ impl Backend for Stream {
         self.host.capacity()
     }
     fn free(&self) -> Result<u64> {
+        held(&self.events.hold_free, &self.events.free_waits, &self.events.free_gate);
         Ok(self.host.free()?.saturating_sub(self.events.foreign.load(Ordering::SeqCst)))
     }
     fn process_used(&self) -> Result<u64> {
@@ -1441,4 +1446,79 @@ fn last_public_owner_retires_only_after_the_consumer_completes() {
     events.complete(pending);
     while events.unmaps.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline { std::thread::yield_now(); }
     assert_eq!(events.unmaps.load(Ordering::SeqCst), 1, "retirement completes without another public API call");
+}
+
+/// A set of `regions` regions whose fill is undeclared: never kept, so its idle pages are the
+/// allocator callback's to reclaim.
+fn undeclared(dir: &std::path::Path, uuid: &str, name: &str, regions: u64) -> SetSpec {
+    let mut spec = stored(dir, uuid, name, regions);
+    spec.fingerprint = Fingerprint::new(&spec.layout, &[], Fill::Undeclared, "release-1", "0/1", uuid);
+    spec
+}
+
+/// Lead's ruling 2 (S3 review / run 13090): the allocator callback never waits for the state
+/// lock, and a held lock never makes it refuse: its limit is the last publication's, and it
+/// reclaims idle pages offered to it beforehand.
+#[test]
+fn the_allocator_callback_works_while_the_state_is_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("lockfree-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    mem.load(undeclared(dir.path(), &uuid, "idle", 2), Level::Gpu).unwrap();
+    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
+    mem.settle();
+    // Between passes (an unmeasured pass would take the idle pages itself, before it runs).
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+    // Another thread holds the state lock (in a driver read under it).
+    events.hold_free.store(true, Ordering::SeqCst);
+    let holder = {
+        let mem = mem.clone();
+        std::thread::spawn(move || mem.torch_limit())
+    };
+    events.free_waits.pass();
+    let limit = mem.allocator_limit();
+    let reclaimed = r.reclaim_allocation(None, 2 * REGION_ALIGN, Torch::default());
+    let after = mem.allocator_limit();
+    // The lock goes back before any assertion, so a failure never hangs the case.
+    events.free_gate.open();
+    holder.join().unwrap();
+    let (limit, reclaimed) = (limit.expect("a limit with the state locked"), reclaimed.unwrap());
+    assert_eq!(reclaimed, 2 * REGION_ALIGN, "the idle pages, reclaimed with the state locked");
+    assert_eq!(after, Some(limit + reclaimed), "the limit counts them at once");
+    drop(r);
+    let _ = a;
+    // Reconciled: the reclaimed pages are gone from the table, and bind again from the store.
+    let idle = mem.load(undeclared(dir.path(), &uuid, "idle", 2), Level::Ram).unwrap();
+    drop(mem.bind(idle, 0, 0).unwrap());
+}
+
+/// Lead's ruling 1 (S3 review / run 13090, host version): an unmeasured pass on a card full
+/// of an idle kept set takes the idle pages before it runs (preparation, outside the
+/// allocator), so its allocations find the room; in the callback a kept page is never
+/// reclaimable (custody holds its memory).
+#[test]
+fn an_unmeasured_pass_takes_idle_kept_pages_before_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("unmeasured-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    mem.load(stored(dir.path(), &uuid, "kept", 3), Level::Gpu).unwrap();
+    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
+    mem.settle();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+    // In the callback, kept pages are custody's: nothing to reclaim.
+    assert_eq!(r.reclaim_allocation(Some(a), REGION_ALIGN, Torch::default()).unwrap(), 0, "kept pages are not the callback's");
+    let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
+    mem.settle();
+    let n: u64 = ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum();
+    assert_eq!(n, 0, "the idle kept pages went before the unmeasured pass ran");
+    assert!(mem.allocator_limit().unwrap() >= 2 * REGION_ALIGN, "its allocations have the room: {:?}", mem.allocator_limit());
+    drop(pass);
 }

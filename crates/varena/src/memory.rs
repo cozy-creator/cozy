@@ -14,7 +14,7 @@
 //! mappings, and the process keeps serving.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Weak, OnceLock};
 
 use crossbeam_channel::{select_biased, unbounded, Receiver, Sender};
@@ -168,17 +168,17 @@ impl Workspace {
 
     /// A provisional segment credit. Dropping it after a failed allocation restores both
     /// promise and accounting at one state boundary; successful allocation commits it.
+    /// Never waits for the state: the promise shrinks atomically, and the allocator bytes it
+    /// becomes reach the table at its next boundary.
     pub fn take(&self, bytes: u64) -> Option<AllocationCredit> {
         self.inner.check_ownership().ok()?;
-        let mut st = self.inner.state.try_lock()?;
-        self.inner.local_accounting(&mut st);
-        let left = self.remaining();
-        if bytes > left { return None; }
-        self.remaining.store(left - bytes, Ordering::Release);
-        st.promises();
-        st.table.reserved = st.table.reserved.saturating_add(bytes);
-        self.inner.try_publish(&mut st);
-        Some(AllocationCredit { inner: self.inner.clone().into(), id: self.id, bytes, epoch: st.measure_epoch, committed: false })
+        // The promise shrinks first, then the limit grows: an observer between the two sees
+        // less room, never more.
+        self.remaining.try_update(Ordering::AcqRel, Ordering::Acquire, |left| left.checked_sub(bytes)).ok()?;
+        self.inner.limit.fetch_add(bytes, Ordering::AcqRel);
+        let epoch = self.inner.measured_epoch.load(Ordering::Acquire);
+        let _ = self.inner.credit_tx.send((bytes, epoch));
+        Some(AllocationCredit { inner: self.inner.clone().into(), id: self.id, bytes, epoch, committed: false, remaining: self.remaining.clone() })
     }
 }
 
@@ -188,6 +188,8 @@ pub struct AllocationCredit {
     bytes: u64,
     epoch: u64,
     committed: bool,
+    /// Its workspace's promise, given back at once if the segment failed.
+    remaining: Arc<AtomicU64>,
 }
 
 impl AllocationCredit {
@@ -197,8 +199,11 @@ impl AllocationCredit {
 impl Drop for AllocationCredit {
     fn drop(&mut self) {
         if !self.committed {
-            // No state-lock wait, and no two-atomic partial refund. A concurrent observer sees
-            // the original credit until the next state boundary applies this transaction.
+            // No state-lock wait. The limit shrinks first, then the promise comes back: an
+            // observer between the two sees less room, never more. Its provisional allocator
+            // bytes leave the table at the next state boundary.
+            self.inner.limit.fetch_sub(self.bytes, Ordering::AcqRel);
+            self.remaining.fetch_add(self.bytes, Ordering::AcqRel);
             let _ = self.inner.refund_tx.send((self.id, self.bytes, self.epoch));
         }
     }
@@ -515,6 +520,8 @@ struct Home {
     keep_after: bool,
     /// Its Keep (read-only, export) is with the mechanism thread.
     keeping: bool,
+    /// Offered to the allocator callback ([`Stocked`]): its claim decides who touches it next.
+    stock: Option<Arc<AtomicU8>>,
 }
 
 impl Home {
@@ -523,6 +530,25 @@ impl Home {
         !self.filled && !self.filling && !self.transforming
     }
 }
+
+/// A page the allocator callback may reclaim without the state lock: mapped, filled and
+/// complete, unpinned, never kept, and of no declared use (N or S). The state offers it at its
+/// publications; its claim decides who touches it next: the callback (to unmap it) or the
+/// state (to use or unmap it itself).
+struct Stocked {
+    key: Key,
+    gen: u64,
+    va: Va,
+    off: u64,
+    span: u64,
+    phys: u64,
+    claim: Arc<AtomicU8>,
+}
+
+/// A stocked page's claim.
+const STOCKED: u8 = 0;
+const RECLAIMED: u8 = 1;
+const TAKEN: u8 = 2;
 
 /// A call to the device's virtual-memory mechanism (`cuMemCreate`, `cuMemMap`,
 /// `cuMemSetAccess`, `cuMemUnmap`): each may wait on the host for queued device work, so none
@@ -664,6 +690,8 @@ struct State {
     table: Table,
     budgets: HashMap<u64, Arc<AtomicU64>>,
     measure_epoch: u64,
+    /// Idle pages may have changed since the last offer to the allocator callback.
+    restock: bool,
     ordinary_reserved: u64,
     physical_epoch: u64,
     retired: HashMap<(Key, u64), Retirement>,
@@ -727,6 +755,18 @@ struct State {
 }
 
 impl State {
+    /// The state takes page `key` back from the allocator callback's stock before it uses or
+    /// unmaps it; false when the callback has it (it is being unmapped: treat it as gone).
+    fn unstock(&mut self, key: Key) -> bool {
+        let Some(h) = self.homes.get_mut(&key) else { return true };
+        let Some(claim) = h.stock.take() else { return true };
+        if claim.compare_exchange(STOCKED, TAKEN, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return true;
+        }
+        h.stock = Some(claim);
+        false
+    }
+
     fn promises(&mut self) {
         self.table.promised = self.budgets.values().map(|n| n.load(Ordering::Acquire)).sum();
     }
@@ -884,6 +924,21 @@ struct Inner {
     ownership_lost: AtomicBool,
     public_owners: AtomicU64,
     native_resident: AtomicU64,
+    /// The allocator's limit as the last publication computed it, and the bytes the callback
+    /// reclaimed from the stock since (not yet in a publication): read without the state lock.
+    limit: AtomicU64,
+    unreconciled: AtomicU64,
+    /// The callback's stock of reclaimable pages, and its reclaims (page, gen, bytes, whether
+    /// the driver gave them back) for the state to reconcile.
+    stock_tx: Sender<Stocked>,
+    stock: Receiver<Stocked>,
+    reclaimed_tx: Sender<(Key, u64, u64, bool)>,
+    reclaimed: Receiver<(Key, u64, u64, bool)>,
+    /// Workspace credits taken in the callback (bytes, measurement epoch), applied at the next
+    /// state boundary; the epoch of the latest measurement, readable there.
+    credit_tx: Sender<(u64, u64)>,
+    credits: Receiver<(u64, u64)>,
+    measured_epoch: AtomicU64,
     #[cfg(unix)]
     tally: tensorfs::io::source::IoTally,
     _device: Device,
@@ -923,6 +978,7 @@ impl Memory {
             let (to_custody, to_tier, mech) = (Arc::new(Outbox::default()), Arc::new(Outbox::default()), Arc::new(Outbox::default()));
             let (release_tx, releases) = unbounded();
             let (refund_tx, refunds) = unbounded();
+            let ((stock_tx, stock), (reclaimed_tx, reclaimed), (credit_tx, credits)) = (unbounded(), unbounded(), unbounded());
             let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
             let holder = custody.as_ref().map_or(0, |c| c.holder());
             let tier_holder = tier.as_ref().map_or(0, |t| t.holder());
@@ -953,6 +1009,15 @@ impl Memory {
                 ownership_lost: AtomicBool::new(false),
                 public_owners: AtomicU64::new(0),
                 native_resident: AtomicU64::new(0),
+                limit: AtomicU64::new(0),
+                unreconciled: AtomicU64::new(0),
+                stock_tx,
+                stock,
+                reclaimed_tx,
+                reclaimed,
+                credit_tx,
+                credits,
+                measured_epoch: AtomicU64::new(0),
                 #[cfg(unix)]
                 tally: Default::default(),
             });
@@ -1145,15 +1210,11 @@ impl Memory {
     }
 
     /// The native allocator's limit without waiting for state or running maintenance.
+    /// Never waits for the state: the limit the last publication computed, plus what the
+    /// callback reclaimed from the stock since.
     pub fn allocator_limit(&self) -> Option<u64> {
         self.inner.check_ownership().ok()?;
-        let mut st = self.inner.state.try_lock()?;
-        self.inner.local_accounting(&mut st);
-        st.table.capacity = self.inner.shared.try_capacity()?;
-        // These leaf queues are sampled without waiting either.
-        st.table.pending = self.inner.to_custody.try_pending()?;
-        st.table.inflight = self.inner.mech.try_pending()?;
-        Some(st.table.torch_limit())
+        Some(self.inner.limit.load(Ordering::Acquire).saturating_add(self.inner.unreconciled.load(Ordering::Acquire)))
     }
 
     /// Atomically admit additional external workspace before execution/capture. Actual pool
@@ -1244,8 +1305,9 @@ impl Inner {
     }
 
     fn local_accounting(&self, st: &mut State) {
-        for (id, bytes, epoch) in self.refunds.try_iter() {
-            if let Some(remaining) = st.budgets.get(&id) { remaining.fetch_add(bytes, Ordering::Release); }
+        // Credits before their refunds: a refund undoes its credit's provisional bytes.
+        self.reconcile(st);
+        for (_, bytes, epoch) in self.refunds.try_iter() {
             // A newer real Torch observation already removed the failed provisional credit.
             if st.measure_epoch == epoch { st.table.reserved = st.table.reserved.saturating_sub(bytes); }
         }
@@ -1296,6 +1358,7 @@ impl Inner {
     fn poll_releases(&self, st: &mut State, keep: bool) -> bool {
         let released: Vec<Release> = self.releases.try_iter().collect();
         let mut wake = false;
+        st.restock |= !released.is_empty();
         for r in released {
             st.pins.remove(&r.pin);
             if r.event != Event::DONE {
@@ -1326,6 +1389,7 @@ impl Inner {
                 if let Some(q) = st.events.get_mut(&stream) {
                     q.pop_front();
                 }
+                st.restock = true;
                 let ready = st.homes.get(&key).map(|h| h.ready);
                 if let Some(i) = st.table.page(key).and_then(|p| p.releasing.iter().position(|e| *e == event.0)) {
                     if let Some(p) = st.table.page_mut(key) {
@@ -1513,12 +1577,91 @@ impl Inner {
 
     fn publish(&self, st: &mut State) {
         self.physical(st);
+        self.offer(st);
         self.row.publish(&Self::facts(st));
     }
 
     fn try_publish(&self, st: &mut State) {
         self.physical(st);
+        self.offer(st);
         self.row.try_publish(&Self::facts(st));
+    }
+
+    /// What the allocator callback reads without the state lock: the limit, and (when idle
+    /// pages changed) the stock of pages it may reclaim.
+    fn offer(&self, st: &mut State) {
+        self.limit.store(st.table.torch_limit(), Ordering::Release);
+        if !std::mem::take(&mut st.restock) {
+            return;
+        }
+        // Stale offers (taken or reclaimed) go; live ones stay.
+        let live: Vec<Stocked> = self.stock.try_iter().filter(|s| s.claim.load(Ordering::Acquire) == STOCKED).collect();
+        live.into_iter().for_each(|s| drop(self.stock_tx.send(s)));
+        let keys: Vec<Key> = st.homes.iter().filter(|(_, h)| h.stock.is_none()).map(|(k, _)| *k).collect();
+        for key in keys {
+            let idle = st.table.page(key).is_some_and(|p| p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.kept);
+            let class = st.table.class(key);
+            let Ok((va, off, span)) = st.place(key) else { continue };
+            let Some(h) = st.homes.get_mut(&key) else { continue };
+            let complete = !h.filling && !h.transforming && !h.keeping && !h.keep_after && !h.exported && self.backend.query(h.ready).unwrap_or(false);
+            let Some(phys) = h.phys.as_ref().map(|p| p.id).filter(|_| idle && complete && matches!(class, Some(Class::N | Class::S))) else { continue };
+            let claim = Arc::new(AtomicU8::new(STOCKED));
+            h.stock = Some(claim.clone());
+            let _ = self.stock_tx.send(Stocked { key, gen: h.gen, va, off, span, phys, claim });
+        }
+    }
+
+    /// The allocator callback's reclaim from the stock, without the state lock: each page it
+    /// claims is unmapped and destroyed now (it was idle, complete and never kept when offered);
+    /// the state reconciles it at its next boundary. Returns the bytes given back.
+    fn reclaim_stock(&self, need: u64) -> Result<u64> {
+        let mut freed = 0;
+        while freed < need {
+            let Ok(s) = self.stock.try_recv() else { break };
+            if s.claim.compare_exchange(STOCKED, RECLAIMED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                continue;
+            }
+            let change = self.row.physical_change();
+            let given = self.backend.unmap(s.va, s.off, s.span).and_then(|()| self.backend.destroy(Physical { id: s.phys, len: s.span }));
+            self.unreconciled.fetch_add(s.span, Ordering::AcqRel);
+            let _ = self.reclaimed_tx.send((s.key, s.gen, s.span, given.is_ok()));
+            self.landed.notify_all();
+            given?;
+            change.finish();
+            freed += s.span;
+        }
+        Ok(freed)
+    }
+
+    /// The callback's reclaims, into the state: each reclaimed page's home goes (its memory is
+    /// already back); a page the driver would not give back is lost backing.
+    fn reconcile(&self, st: &mut State) {
+        for (key, gen, span, ok) in self.reclaimed.try_iter() {
+            self.unreconciled.fetch_sub(span, Ordering::AcqRel);
+            if !st.homes.get(&key).is_some_and(|h| h.gen == gen) {
+                continue;
+            }
+            // Destroyed by the callback: its Physical is spent.
+            if let Some(home) = st.homes.remove(&key) {
+                self.backend.retire(home.ready);
+            }
+            st.sync(key);
+            st.restock = true;
+            if !ok {
+                // Its memory could not be proved given back: it stays charged, and this executor
+                // retires (as lost backing does).
+                let id = st.tick();
+                st.retired.insert(((u32::MAX, u32::MAX), id), Retirement { bytes: span, created: true, mechanism: None, custody: None, kept: true });
+                self.ownership_lost.store(true, Ordering::Release);
+                self._device.retiring(true);
+                self.landed.notify_all();
+            }
+        }
+        for (bytes, epoch) in self.credits.try_iter() {
+            if st.measure_epoch == epoch {
+                st.table.reserved = st.table.reserved.saturating_add(bytes);
+            }
+        }
     }
 
     /// Physical backing and promises have separate owners. A page retiring through both
@@ -1544,6 +1687,11 @@ impl Inner {
     /// Unmaps a page; `withdraw` drops its kept copy too (an eviction or unload; a process that
     /// ends leaves its kept pages as orphans).
     fn unmap(&self, st: &mut State, key: Key, class: Class, req: Option<u64>, withdraw: bool) -> Result<()> {
+        // The allocator callback is unmapping it already: its bytes come back that way.
+        if !st.unstock(key) {
+            return Ok(());
+        }
+        st.restock = true;
         let Some(home) = st.homes.remove(&key) else { return Ok(()) };
         let (va, off, span) = st.place(key)?;
         // Custody's handle holds the memory until the Withdraw is sent: held (P) meanwhile.
@@ -1610,7 +1758,7 @@ impl Inner {
             let gen = st.tick();
             // Pinned (filling) until the mechanism maps it.
             self.mech.post(Mech::Adopt { key, gen, va, off, phys: phys.id, len: phys.len, identity: identity.clone() }, 0);
-            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false });
+            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, stock: None });
             st.sync(key);
             let s = st.fills(req, key, span, Origin::Kept);
             s.moved.kept.bytes += span;
@@ -1635,7 +1783,7 @@ impl Inner {
         let decided = st.table.free();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false });
+        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, stock: None });
         st.sync(key);
         self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, speculative, decided }, 0);
         Ok(true)
@@ -1657,7 +1805,7 @@ impl Inner {
         // Kept, or with a Keep queued: never written again; a fresh page takes its place.
         let phys = if exported || h.keeping { h.phys.take() } else { None };
         let renew = phys.is_some();
-        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false };
+        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, stock: None };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
         let job = Job { key, gen, req, span, after: vec![] };
@@ -1681,7 +1829,7 @@ impl Inner {
     /// event completed: a write still running must not meet a read-only page, and another
     /// process must not import a half-made one.
     fn keep(&self, st: &mut State, key: Key) {
-        if self.custody.is_none() {
+        if self.custody.is_none() || !st.unstock(key) {
             return;
         }
         let Ok((va, off, span)) = st.place(key) else { return };
@@ -1762,6 +1910,7 @@ impl Inner {
                     // bytes.
                     let fill = sets.get(&job.key.0).map(|(spec, _)| &spec.fingerprint.fill);
                     let filled = matches!(fill, Some(Fill::Stored)) || (origin == Origin::Tier && matches!(fill, Some(Fill::Declared(_))));
+                    st.restock = true;
                     let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
                     if let Some(h) = st.homes.get_mut(&job.key) {
                         h.ready = ready;
@@ -1972,6 +2121,9 @@ impl Inner {
             // Only into the layout of the identity it was filled under.
             let held = st.mech(s.key.0).ok().filter(|m| m.tier == s.tier).and_then(|m| m.held.clone()).filter(|h| !h.holds(s.key.1));
             let (Some(ready), Some(held), Ok(place)) = (home, held, st.place(s.key)) else { return };
+            if !st.unstock(s.key) {
+                return;
+            }
             let pin = st.tick();
             st.pins.insert(pin, (s.key, None, std::thread::current().id()));
             st.saving = Some(s.key);
@@ -2505,6 +2657,14 @@ impl Inner {
             // Waiting on pins only this thread holds would wait on itself.
             let me = std::thread::current().id();
             let mine = pinned && st.pins.values().filter(|(k, ..)| *k == key).all(|(.., t)| *t == me);
+            // The allocator callback is unmapping it: once reconciled it is gone, and fills again.
+            if st.homes.contains_key(&key) && !st.unstock(key) {
+                hit = false;
+                waited = true;
+                self.wait(&mut st)?;
+                self.reconcile(&mut st);
+                continue;
+            }
             match st.homes.get(&key) {
                 // Not the set's weights now, and unpinned: filled again in place.
                 Some(h) if h.identity != identity && !h.filling && !pinned => {
@@ -2731,6 +2891,7 @@ impl Inner {
     fn pass(&self, req: u64, set: u32, entry: &str, dims: &str, torch: Torch) -> Result<u64> {
         let (id, room, unmeasured, step_pages, orphans) = {
             let mut st = self.lock();
+            st.restock = true;
             st.mech(set)?;
             self.measure(&mut st, torch);
             let _admission = self.refresh(&mut st)?;
@@ -2795,6 +2956,7 @@ impl Inner {
     /// importer's process).
     fn measure(&self, st: &mut State, torch: Torch) {
         st.measure_epoch = st.measure_epoch.wrapping_add(1);
+        self.measured_epoch.store(st.measure_epoch, Ordering::Release);
         st.table.allocated = torch.allocated;
         st.table.reserved = torch.reserved;
         st.ordinary_reserved = torch.reserved.saturating_sub(self.native_resident.load(Ordering::Acquire));
@@ -2812,6 +2974,7 @@ impl Inner {
 
     fn end_pass(&self, req: u64, pass: u64, measured: Measured, torch: Torch) -> Result<()> {
         let mut st = self.lock();
+        st.restock = true;
         self.measure(&mut st, torch);
         let Some(key) = st.active.iter().find(|((r, _), a)| *r == req && a.id == pass).map(|(k, _)| *k) else {
             self.unlock(st);
@@ -2935,6 +3098,7 @@ impl Inner {
 
     fn end_request(&self, req: u64) -> Stats {
         let mut st = self.lock();
+        st.restock = true;
         let name = st.table.request(req).map(|r| r.name.clone()).unwrap_or_default();
         st.active.retain(|(r, _), _| *r != req);
         st.synthetic.remove(&req);
@@ -3417,7 +3581,12 @@ impl Request {
     /// Returns bytes of actual reclaim (or newly available capacity), so retries make progress.
     pub fn reclaim_allocation(&self, set: Option<SetId>, need: u64, torch: Torch) -> Result<u64> {
         self.inner.check_ownership()?;
-        let Some(mut st) = self.inner.state.try_lock() else { return Ok(0) };
+        // The stock first: pages offered for this, claimed without the state lock.
+        let stocked = self.inner.reclaim_stock(need)?;
+        if stocked >= need {
+            return Ok(stocked);
+        }
+        let Some(mut st) = self.inner.state.try_lock() else { return Ok(stocked) };
         self.inner.local_accounting(&mut st);
         self.inner.poll_releases(&mut st, false);
         // Use the prepared cross-process/driver snapshot. Reaping, remapping and peer heap
@@ -3494,7 +3663,7 @@ impl Request {
         // Kept handles withdraw asynchronously. Their bytes remain pending until the native
         // custody sender reports completion; the allocation may retry once, but never waits
         // for that sender or reacquires state after releasing it.
-        Ok(freed.max(st.table.torch_limit().saturating_sub(before)))
+        Ok(stocked + freed.max(st.table.torch_limit().saturating_sub(before)))
     }
 
     /// What the caller parked after a `Park` answer; 0 makes the next `oom` answer Exhausted.
