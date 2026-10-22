@@ -525,12 +525,15 @@ impl Drop for Tier {
 impl Tier {
     /// Binds the machine's tier name and serves it, admitting fills against `need`; `None` when
     /// another participant does.
-    pub fn serve(mut pressure: Pressure, need: Need) -> Result<Option<Tier>> {
+    pub fn serve(pressure: Pressure, need: Need) -> Result<Option<Tier>> {
         let Some(tier) = Tier::bind(need.clone())? else { return Ok(None) };
-        if matches!(pressure, Pressure::Headroom) {
-            return Ok(Some(tier));
-        }
-        let (state, stop, budget, claims) = (tier.state.clone(), tier.stop.clone(), tier.budget.clone(), tier.claims.clone());
+        tier.watch(pressure, need)?;
+        Ok(Some(tier))
+    }
+
+    fn watch(&self, mut pressure: Pressure, need: Need) -> Result<()> {
+        if matches!(pressure, Pressure::Headroom) { return Ok(()); }
+        let (state, stop, budget, claims) = (self.state.clone(), self.stop.clone(), self.budget.clone(), self.claims.clone());
         std::thread::Builder::new()
             .name("varena-pressure".into())
             .spawn(move || loop {
@@ -545,7 +548,7 @@ impl Tier {
                 answer(&state, &need, &budget, &claims);
             })
             .map_err(|e| Error::io("spawn pressure", e))?;
-        Ok(Some(tier))
+        Ok(())
     }
 
     fn bind(need: Need) -> Result<Option<Tier>> {
@@ -1534,6 +1537,79 @@ print('dirty',flush=True);sys.stdin.read()
             }
             drop(lease);
             assert_eq!(claims.live_bytes().unwrap(), 0);
+        });
+    }
+
+    fn filled(client: &Client, name: &str, ask: &str) -> Held {
+        let held = client.open_layout(name, vec![(0, platform_page())], ask).unwrap();
+        held.fill(&[0], |dsts| {
+            let tensorfs::io::Dst::Host { ptr, len } = dsts[0].1 else { unreachable!() };
+            // SAFETY: this fill exclusively owns its mapped destination.
+            unsafe { std::ptr::write_bytes(ptr, 1, len) };
+            Ok(())
+        }).unwrap();
+        held
+    }
+
+    #[test]
+    fn pressure_one_event_continues_after_async_layout_releases() {
+        isolated("pressure_one_event_continues_after_async_layout_releases", || {
+            let page = platform_page();
+            let files = Arc::new(Mutex::new(Vec::<(Owned, u64)>::new()));
+            let observed = files.clone();
+            let need: Need = Arc::new(move || Some(2 * page));
+            let budget: Budget = Arc::new(move || {
+                let resident: u64 = observed.lock().iter().map(|(fd, data)| os::allocated(fd).saturating_sub(*data)).sum();
+                i128::from(2 * page) - i128::from(resident)
+            });
+            let tier = Tier::bind_with(need.clone(), budget).unwrap().unwrap();
+            let client = Client::open(os::euid(), need.clone()).unwrap();
+            // The absent endpoint models a departed user: completion is asynchronous on the
+            // production ask thread, and real memfd data must be punched before headroom rises.
+            let first = filled(&client, "first", "departed-user");
+            let second = filled(&client, "second", "departed-user");
+            files.lock().extend([(os::reopen(&first.fd, true).unwrap(), first.data), (os::reopen(&second.fd, true).unwrap(), second.data)]);
+            let event = os::event().unwrap();
+            tier.watch(Pressure::Events(os::dup(&event).unwrap()), need).unwrap();
+            os::signal(&event); // Exactly one external pressure event.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let (lock, changed) = &*tier.state;
+            let mut state = lock.lock();
+            while state.layouts.values().any(Layout::holds) {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!remaining.is_zero() && !changed.wait_for(&mut state, remaining).timed_out(),
+                    "one event left ready layouts after asynchronous completion: {:?}", state.layouts.iter().filter(|(_, l)| l.holds()).map(|(d, _)| d).collect::<Vec<_>>());
+            }
+            assert_eq!(state.releases, 2);
+            drop(state);
+            assert_eq!(tier.budget.as_ref()(), i128::from(2 * page));
+        });
+    }
+
+    #[test]
+    fn pressure_pending_reclaim_does_not_raise_host_short() {
+        isolated("pressure_pending_reclaim_does_not_raise_host_short", || {
+            use std::os::fd::AsRawFd;
+            let need: Need = Arc::new(|| Some(1));
+            let tier = Tier::bind_with(need.clone(), Arc::new(|| 0)).unwrap().unwrap();
+            let client = Client::open(os::euid(), need.clone()).unwrap();
+            let listener = os::listen(os::euid(), "stalled-user").unwrap().unwrap();
+            let _held = filled(&client, "pending", "stalled-user");
+            answer(&tier.state, &need, &tier.budget, &tier.claims);
+            let mut incoming = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: poll only inspects the live listener descriptor; timeout only fails hangs.
+            assert_eq!(unsafe { libc::poll(&mut incoming, 1, 5000) }, 1);
+            let (ask, _) = listener.accept().unwrap();
+            ask.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            assert!(os::recv(&ask).unwrap().is_some());
+            // The first ask remains unanswered. A later event must return promptly without
+            // escalating to executor termination while already-requested reclaim is pending.
+            answer(&tier.state, &need, &tier.budget, &tier.claims);
+            let mut short = libc::pollfd { fd: tier.short.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: poll only inspects the live event descriptor and does not wait.
+            let escalated = unsafe { libc::poll(&mut short, 1, 0) };
+            os::send(&ask, &os::encode(&serde_json::json!({"freed": 0})).unwrap(), None).unwrap();
+            assert_eq!(escalated, 0, "pending tier reclaim must settle before host-short escalation");
         });
     }
 
