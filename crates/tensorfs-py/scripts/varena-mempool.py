@@ -373,6 +373,8 @@ def diag() -> int:
     dest = work / "unet.cozytensors"
     build(work / "store", dest)
     out = Path("out")  # the rental script's output tree
+    out.mkdir(exist_ok=True)
+    failed = []
     for label, fillers in (("both-fillers", 2), ("one-filler", 1)):
         log = work / f"{label}.stderr.log"
         env = {**os.environ, "CUDA_LAUNCH_BLOCKING": "1", "RUST_LOG": "debug"}
@@ -382,12 +384,18 @@ def diag() -> int:
             for line in child.stdout or ():
                 print(f"[{label}] {line}", end="", flush=True)
         print(f"DIAG {label}: exit {child.returncode} after {time.perf_counter() - began:.0f} s", flush=True)
+        if child.returncode:
+            failed.append(label)
         summarize(label, log)
         with log.open("rb") as raw, gzip.open(out / f"{label}.stderr.log.gz", "wb") as packed:
             shutil.copyfileobj(raw, packed)
     done = subprocess.run([sys.executable, "-u", __file__, "free"], capture_output=True, text=True)
     print(done.stdout + done.stderr[-4000:], flush=True)
-    return 0
+    if done.returncode:
+        failed.append("free-ordering")
+    if failed:
+        print(f"FAIL diagnostic children: {failed}", flush=True)
+    return 1 if failed else 0
 
 
 def summarize(label: str, log: Path) -> None:
@@ -435,7 +443,7 @@ def variant(fillers: int, ck: tensorfs.Checkpoint) -> int:
                 return 1
     hook.remove()
     print(f"POOL use count outside a pass {mem.pool.use_count()}", flush=True)
-    return 0
+    return 0 if all(results) else 1
 
 
 def free() -> int:
