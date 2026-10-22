@@ -409,8 +409,24 @@ async fn idle(ctx: &Context, calcifer: &Client) -> Result<(), Error> {
 /// Refuses a binary replacement that would strand a stopped machine's selected SDK. This
 /// checks local files and the actual root lock without starting Calcifer or the machine.
 pub(crate) fn preflight_update(ctx: &Context, version: &str) -> Result<(), Error> {
-    let root = machine_root(ctx)?;
-    super::cohort::stopped_selection(version, &root, free(&root))
+    if !super::cohort::needs_pair(version, None) { return Ok(()); }
+    preflight_root(&machine_root(ctx)?, version)
+}
+
+fn preflight_root(root: &Path, version: &str) -> Result<(), Error> {
+    let refused = |e: io::Error| Error::new(Kind::Unavailable, "machine_state_unreadable", e.to_string());
+    // A shared probe on a read-only descriptor cannot erase a dead holder's record, create
+    // a lock file, or change the stopped machine. A serving machine holds this exclusively.
+    let stopped = match std::fs::File::open(root.join("var/lib/cozy/machine/agent.lock")) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+        Err(e) => return Err(refused(e)),
+        Ok(file) => match file.try_lock_shared() {
+            Ok(()) => true,
+            Err(std::fs::TryLockError::WouldBlock) => false,
+            Err(std::fs::TryLockError::Error(e)) => return Err(refused(e)),
+        },
+    };
+    super::cohort::stopped_selection(version, root, stopped)
 }
 
 /// What this computer's machine did with the binary `cozy update` installed (design §5).
@@ -608,4 +624,30 @@ fn write_private(path: &Path, text: &str) -> io::Result<()> {
     let dir = path.parent().expect("a keys file has a directory");
     platform::durable::private_dir(dir).map_err(io::Error::other)?;
     platform::durable::replace(path, text.as_bytes(), 0o600).map_err(io::Error::other)
+}
+
+
+#[cfg(test)]
+mod update_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn preflight_uses_the_kernel_lock_and_keeps_a_stopped_holders_record() {
+        let root = tempfile::tempdir().unwrap();
+        let sdk = root.path().join("var/lib/cozy/tensord/sdk/current");
+        std::fs::create_dir_all(&sdk).unwrap();
+        for wheel in ["cozy_runtime-0.30.3-py3-none-any.whl", "tensorfs-0.13.4-py3-none-any.whl"] {
+            std::fs::write(sdk.join(wheel), b"fixture").unwrap();
+        }
+        let machine = root.path().join("var/lib/cozy/machine");
+        std::fs::create_dir_all(&machine).unwrap();
+        let record = machine.join("agent.lock.holder");
+        std::fs::write(&record, b"preserved holder record").unwrap();
+        let holder = std::fs::File::create(machine.join("agent.lock")).unwrap();
+        holder.lock().unwrap();
+        preflight_root(root.path(), "0.12.0").unwrap();
+        drop(holder);
+        assert_eq!(preflight_root(root.path(), "0.12.0").unwrap_err().code, "memory_protocol_incompatible");
+        assert_eq!(std::fs::read(&record).unwrap(), b"preserved holder record");
+    }
 }
