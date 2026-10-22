@@ -14,15 +14,13 @@ h3 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(h3)
 
 
-def observations(destination):
-    return [{"kind": "disk" if destination == "cpu" else "h2d", "bytes": 100,
-             "ns": 20, "ceiling": 10, "link": "Gen4 x16" if destination == "cuda" else ""}]
+CEILING = {"disk_gbps": 5.0, "disk_direct": True, "h2d_gbps": 25.0, "streams": 2}
 
 
 def complete_rows():
     return [{"rep": rep, "destination": dst, "reader": reader, "cold": cold,
              "seconds": 1 if reader == "tensorfs" else 2, "verified": True, "bytes": 100,
-             "metrics": h3.copy_metrics(observations(dst), dst, 100) if reader == "tensorfs" else None}
+             "metrics": h3.rate_metrics(100, 1, dst, CEILING, 100) if reader == "tensorfs" else None}
             for rep, dst, reader, cold in h3.schedule()]
 
 
@@ -108,20 +106,23 @@ class Completeness(unittest.TestCase):
         self.assertTrue(summary["complete"])
         self.assertFalse(summary["parity_pass"])
 
-    def test_missing_engine_observations_do_not_qualify(self):
+    def test_an_unmeasured_ceiling_or_short_read_does_not_qualify(self):
         rows = complete_rows()
         first_gpu = next(r for r in rows if r["reader"] == "tensorfs" and r["destination"] == "cuda")
-        first_gpu["metrics"] = h3.copy_metrics([], "cuda", 100)
+        first_gpu["metrics"] = h3.rate_metrics(100, 1, "cuda", {**CEILING, "h2d_gbps": None}, 100)
         self.assertFalse(h3.summarize(rows, 100)["observations_complete"])
-        record = observations("cuda")[0]
-        for change in ({"ceiling": 0}, {"ns": 0}, {"link": ""}, {"bytes": 1}):
-            self.assertFalse(h3.copy_metrics([{**record, **change}], "cuda", 100)["measured"])
+        for nbytes, seconds in ((99, 1), (100, 0)):
+            self.assertFalse(h3.rate_metrics(nbytes, seconds, "cuda", CEILING, 100)["measured"])
 
-    def test_no_fake_disk_telemetry_required_for_raw_cpu_reads(self):
+    def test_rates_are_against_their_own_ceiling(self):
+        gpu, host = h3.rate_metrics(10**10, 1, "cuda", CEILING, 100), h3.rate_metrics(10**10, 4, "cpu", CEILING, 100)
+        self.assertEqual((gpu["kind"], gpu["gbps"], gpu["ceiling_ratio"]), ("h2d", 10.0, 0.4))
+        self.assertEqual((host["kind"], host["gbps"], host["ceiling_ratio"]), ("disk", 2.5, 0.5))
+        # Host reads need no H2D ceiling: the CPU rows qualify on the disk one alone.
         rows = complete_rows()
         for row in rows:
             if row["reader"] == "tensorfs" and row["destination"] == "cpu":
-                row["metrics"] = h3.copy_metrics([], "cpu", 100)
+                row["metrics"] = h3.rate_metrics(100, 1, "cpu", {**CEILING, "h2d_gbps": None}, 100)
         self.assertTrue(h3.summarize(rows, 100)["observations_complete"])
 
     def test_summary_rechecks_full_telemetry_coverage(self):
