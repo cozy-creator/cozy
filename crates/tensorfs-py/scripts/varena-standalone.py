@@ -349,6 +349,9 @@ def costs(mem: Memory, unet: UNet2DConditionModel) -> None:
         varena_pass, open_close = each(native_pass), each(adapter_pass)
     print(f"COST warm bind {native_bind:.0f} us varena, {adapter_bind:.0f} us through the adapter ({len(block.tensors)} tensors); "
           f"pass {varena_pass:.0f} us varena, {open_close:.0f} us through the adapter (its common's bind included)", flush=True)
+    # The adapter's own part of a warm bind (kept views attached, the escape check at exit) is
+    # tens of microseconds at most: views made per bind cost about 100 more here.
+    check(f"cost: a warm bind adds {adapter_bind - native_bind:.0f} us to varena's (at most 30)", adapter_bind - native_bind <= 30, (native_bind, adapter_bind))
 
 
 def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> weakref.ref[Memory]:
@@ -402,6 +405,7 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     with model.hold():
         weight = unet.down_blocks[0].attentions[0].proj_in.weight
         check("hold: every block stays bound", not isinstance(weight, Placeholder), type(weight))
+        del weight  # kept past the hold it would be an escaped weight (and reported as one)
         run(mem, unet, reference[:1], "held", SAME)
     check("hold: released, placeholders are back", isinstance(unet.down_blocks[0].attentions[0].proj_in.weight, Placeholder))
     keys: list[str] = []
@@ -468,14 +472,47 @@ def two(ck: tensorfs.Checkpoint, store: Path, table: str, capacity: int, referen
     return stats.steps[0].w, weakref.ref(mem)
 
 
-def capped(ck: tensorfs.Checkpoint, table: str, capacity: int, base: int, spans: list[int], reference: list[torch.Tensor], ceiling: tensorfs.Ceiling) -> weakref.ref[Memory]:
-    """Below its size it streams, its outputs the uncapped run's; its fills against the ceiling."""
+def capped(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, capacity: int, base: int, spans: list[int], reference: list[torch.Tensor], ceiling: tensorfs.Ceiling) -> weakref.ref[Memory]:
+    """Below its size it streams, its outputs the uncapped run's; its fills against the ceiling.
+    Then weights that escape their block's run while it streams."""
     mem = opened(table, capacity)
-    stats, _ = run(mem, loaded(ck, mem), reference, "short", SAME)
+    unet = loaded(ck, mem)
+    stats, _ = run(mem, unet, reference, "short", SAME)
     check(f"short: below its {sum(spans)} B it streams in {capacity - base} B", sum(stats.evicted) > 0, stats.evicted)
     fills(stats, ceiling)
     print(f"STATS_JSON {stats.json()}", flush=True)
+    for derived in (False, True):
+        escapes(mem, unet, plain, reference, derived)
     return weakref.ref(mem)
+
+
+def escapes(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel, reference: list[torch.Tensor], derived: bool) -> None:
+    """A module keeps a weight (or a view of one) past its forward and reads it in the next, while
+    the model streams: it reads the right bytes, because its page stays bound while the kept
+    tensor lives, and the escape is reported."""
+    what = "a view of a weight" if derived else "a weight"
+    block = unet.down_blocks[1].resnets[0]
+    want = plain.down_blocks[1].resnets[0].conv1.weight.detach()
+    want = want[0] if derived else want
+    kept: dict[str, torch.Tensor] = {}
+    read: list[bool] = []
+
+    def keep(module: torch.nn.Module, *_: object) -> None:
+        if "w" in kept:
+            read.append(torch.equal(kept["w"].cpu(), want))
+        weight = module.conv1.weight
+        kept["w"] = weight[0] if derived else weight
+
+    hook = block.register_forward_pre_hook(keep)
+    with mem.request(f"escape {what}", plan=[unet] * 2) as r:
+        for n in range(2):
+            got = forward(unet, mem.device, n)
+            check(f"escape ({what}): pass {n} equals its reference", torch.allclose(got, reference[n], atol=SAME), (got - reference[n]).abs().max())
+    hook.remove()
+    late = torch.equal(kept["w"].cpu(), want)  # after both passes streamed the rest of the model
+    check(f"escape ({what}): read in the next forward and after, it holds its bytes", read == [True] and late, (read, late))
+    check(f"escape ({what}): reported with its block's bytes", sum(r.escaped.values()) > 0, r.escaped)
+    del kept["w"]
 
 
 def baked(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, capacity: int) -> weakref.ref[Memory]:
@@ -504,7 +541,7 @@ def main() -> int:
     # One block below the working set varena measured: it must stream, with room to spare for
     # what streaming needs (the pass's room, common and its slots).
     capacity = base + w - max(blocks)
-    gone(capped(ck, f"{tag}-short", capacity, base, spans, reference, ceiling), "short")
+    gone(capped(ck, plain, f"{tag}-short", capacity, base, spans, reference, ceiling), "short")
     gone(baked(ck, plain, f"{tag}-fill", capacity), "fill")
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1

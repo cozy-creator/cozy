@@ -747,15 +747,21 @@ struct DLManagedTensor {
     deleter: Option<unsafe extern "C" fn(*mut DLManagedTensor)>,
 }
 
-/// What a consumer's tensor owns: its shape and stride cells, and the pin (none for a window's).
+/// A pin a window's tensors may come to hold (`Window.keep`).
+type Keeper = Arc<Mutex<Option<Arc<Held>>>>;
+
+/// What a consumer's tensor owns: its shape and stride cells, and its pin: a pin's own, or the
+/// one its window was handed (none until then).
 struct Tensor {
     dims: [i64; 2],
     _pin: Option<Arc<Held>>,
+    _kept: Option<Keeper>,
 }
 
-/// A uint8 DLPack capsule of `len` bytes at `ptr` on `dl`, owning `pin` while any tensor of it lives.
-fn capsule<'p>(py: Python<'p>, ptr: u64, len: u64, dl: (i32, i32), pin: Option<Arc<Held>>) -> PyResult<Bound<'p, PyAny>> {
-    let held = Box::into_raw(Box::new(Tensor { dims: [len as i64, 1], _pin: pin }));
+/// A uint8 DLPack capsule of `len` bytes at `ptr` on `dl`, owning `pin` (or what `kept` comes to
+/// hold) while any tensor of it lives.
+fn capsule<'p>(py: Python<'p>, ptr: u64, len: u64, dl: (i32, i32), pin: Option<Arc<Held>>, kept: Option<Keeper>) -> PyResult<Bound<'p, PyAny>> {
+    let held = Box::into_raw(Box::new(Tensor { dims: [len as i64, 1], _pin: pin, _kept: kept }));
     // SAFETY: `held` is live until the deleter runs.
     let dims = unsafe { (*held).dims.as_mut_ptr() };
     let (device, dtype) = (DLDevice { device_type: dl.0, device_id: dl.1 }, DLDataType { code: KDL_UINT, bits: 8, lanes: 1 });
@@ -816,7 +822,7 @@ impl PyPin {
         if !ordered {
             return Err(PyBufferError::new_err(format!("a pin is consumed on the stream it was bound on ({}), not {stream:?}", self.stream)));
         }
-        capsule(py, self.ptr, self.len, self.dl, Some(self.pin.clone()))
+        capsule(py, self.ptr, self.len, self.dl, Some(self.pin.clone()), None)
     }
 
     fn __dlpack_device__(&self) -> (i32, i32) {
@@ -827,11 +833,12 @@ impl PyPin {
     /// the block is bound (an adapter keeps them across binds of one mapping and installs them
     /// only under a pin).
     fn window(&self) -> PyWindow {
-        PyWindow { ptr: self.ptr, len: self.len, dl: self.dl }
+        PyWindow { ptr: self.ptr, len: self.len, dl: self.dl, kept: Arc::new(Mutex::new(None)) }
     }
 }
 
-/// A block's bytes without a pin (`Pin.window`): its tensors are valid only while it is bound.
+/// A block's bytes without a pin (`Pin.window`): its tensors are valid only while it is bound,
+/// unless `keep` hands them a pin.
 #[pyclass(name = "Window", module = "tensorfs.varena", frozen)]
 pub struct PyWindow {
     #[pyo3(get)]
@@ -839,6 +846,7 @@ pub struct PyWindow {
     #[pyo3(get)]
     len: u64,
     dl: (i32, i32),
+    kept: Keeper,
 }
 
 #[pymethods]
@@ -853,13 +861,20 @@ impl PyWindow {
         if dl_device.is_some_and(|d| d != self.dl) {
             return Err(PyBufferError::new_err(format!("a window lives on {:?}", self.dl)));
         }
-        capsule(py, self.ptr, self.len, self.dl, None)
+        capsule(py, self.ptr, self.len, self.dl, None, Some(self.kept.clone()))
     }
 
     fn __dlpack_device__(&self) -> (i32, i32) {
         self.dl
     }
+
+    /// Its tensors hold `pin` from now on: the page stays bound while any of them lives (an
+    /// escaped view's), released with the last.
+    fn keep(&self, pin: PyRef<'_, PyPin>) {
+        *lock(&self.kept) = Some(pin.pin.clone());
+    }
 }
+
 
 // ---------------------------------------------------------------- the module
 
