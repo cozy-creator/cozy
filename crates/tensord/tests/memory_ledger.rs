@@ -235,7 +235,7 @@ impl Drop for StandIn {
 /// A peak record's key.
 fn key(peak: &Peak) -> &str {
     match peak {
-        Peak::Request { key, .. } | Peak::Pass { key, .. } | Peak::Set { key, .. } => key,
+        Peak::Request { key, .. } | Peak::Compute { key, .. } | Peak::Pass { key, .. } | Peak::Set { key, .. } => key,
     }
 }
 
@@ -325,7 +325,7 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
 }
 
 /// Two requests at `BIG`: the first measures its pass's room, the second its working set (more
-/// than half the card).
+/// than half the card) and its compute room beside its weights (what placement keeps free).
 fn measure(a: &mut StandIn, request: &dyn Fn(&str) -> String, admit: &dyn Fn(&str) -> bool, gpu: &Gpu) {
     for key in ["measure-room", "measure-set"] {
         let id = request(key);
@@ -334,11 +334,18 @@ fn measure(a: &mut StandIn, request: &dyn Fn(&str) -> String, admit: &dyn Fn(&st
         assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
         gpu.ledger.undispatch(&id);
     }
-    let set = gpu.ledger.peaks().into_iter().find_map(|peak| match peak {
-        Peak::Request { key, bytes } if key == format!("{PACKAGE}|{BIG}") => Some(bytes),
-        _ => None,
-    });
-    assert!(set.is_some_and(|bytes| bytes > gpu.ledger.status().capacity / 2), "{set:?}");
+    let at = format!("{PACKAGE}|{BIG}");
+    let peaks = gpu.ledger.peaks();
+    let (mut set, mut compute) = (None, None);
+    for peak in &peaks {
+        match peak {
+            Peak::Request { key, bytes } if *key == at => set = Some(*bytes),
+            Peak::Compute { key, bytes } if *key == at => compute = Some(*bytes),
+            _ => {}
+        }
+    }
+    assert!(set.is_some_and(|bytes| bytes > gpu.ledger.status().capacity / 2), "{peaks:?}");
+    assert!(compute.is_some_and(|bytes| bytes > 0 && Some(bytes) < set), "{peaks:?}");
 }
 
 /// A request whose measured working set does not fit beside a running one waits for it to end,
