@@ -257,13 +257,35 @@ pub struct Req {
     /// The family it waits for while yielded (`crate::ledger` publishes it; 0: none).
     pub family: u64,
     pub episode: Episode,
-    /// Its room outside its passes (its setup, between passes) as measured for its dispatch
-    /// key; `None`: unmeasured (every idle byte is its, as for an unmeasured pass).
-    pub aside: Option<u64>,
+    /// Its room outside its passes (its setup, between passes).
+    pub aside: Aside,
     /// The last OOM answered Retry, by site: a second one there with no progress past it
     /// escalates (lead, v6 13592: the whole decode re-ran at one level three times). A pass's
     /// end does not clear it: a failed try ends its passes too (S4's tiled decode).
     pub retried: Option<Retried>,
+}
+
+/// A request's room outside its passes (its setup, between passes), as its dispatch key's
+/// records give it (review 6, C3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Aside {
+    /// Measured: for its key, else the largest of its package's at any shape.
+    Measured(u64),
+    /// Its package was never measured: every idle byte is its (the idle-GPU rule, peers'
+    /// idle pages included).
+    Unmeasured,
+    /// No dispatch key (a standalone call): its own idle pages, lent.
+    #[default]
+    Unknown,
+}
+
+impl Aside {
+    pub fn bytes(self) -> Option<u64> {
+        match self {
+            Aside::Measured(b) => Some(b),
+            Aside::Unmeasured | Aside::Unknown => None,
+        }
+    }
 }
 
 /// Where an OOM answered Retry failed: its site, op shape, the site's level then, and how far
@@ -336,6 +358,18 @@ pub struct Cache {
     /// Bytes its shrink queued and has not given back yet (the domain lock was busy): coming,
     /// as a peer's deferred shrink is (review 6, C2).
     pub coming: u64,
+    /// Its shrinks running, and the bytes it reported meanwhile: applied after them, so a
+    /// shrink's return never overwrites a report made during it.
+    pub shrinking: u32,
+    pub reported: Option<u64>,
+}
+
+impl Cache {
+    /// Its caller's word on its bytes: any queued shrink's have arrived.
+    pub fn report(&mut self, bytes: u64) {
+        self.bytes = bytes;
+        self.coming = 0;
+    }
 }
 
 /// Another process's row, as it published it.
@@ -353,7 +387,8 @@ pub struct Remote {
     /// Of `torch`, what its trim hook and caches give back when it is idle.
     pub caches: u64,
     pub classes: [u64; 7],
-    /// Subset of P already retiring; still held, but reachable after its completion.
+    /// Bytes it is giving back: retiring pages (of P) and its caches' queued shrinks (of torch's);
+    /// still held, reachable once they land.
     pub returning: u64,
 }
 
@@ -450,6 +485,10 @@ impl Table {
         self.requests.iter().filter_map(|r| r.distance(key)).min()
     }
 
+    pub fn cache_mut(&mut self, id: u32) -> Option<&mut Cache> {
+        self.caches.iter_mut().find(|c| c.id == id)
+    }
+
     /// A cache's nearest next use over the open requests and its sets.
     pub fn cache_distance(&self, c: &Cache) -> Option<(u32, u32, u32)> {
         self.requests.iter().flat_map(|r| c.sets.iter().filter_map(|s| r.cache_distance(*s))).min()
@@ -462,7 +501,7 @@ impl Table {
         let mut held = 0u64;
         for r in &self.requests {
             let next = r.rooms.get(r.cursor.step as usize).copied().flatten();
-            match (r.aside, next) {
+            match (r.aside.bytes(), next) {
                 (Some(aside), Some(room)) => held = held.saturating_add(aside).saturating_add(room),
                 _ => return u64::MAX,
             }
@@ -553,7 +592,8 @@ impl Table {
     /// Unique backing already retiring. It remains charged until its owners finish; neither
     /// overlapping mechanism/custody tickets nor ownership-lost quarantines add reclaim credit.
     pub fn returning(&self) -> u64 {
-        self.returning.min(self.vmm) + self.transient + self.caches.iter().map(|c| c.coming).sum::<u64>() + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
+        // A peer's: its retiring pages (P) and its caches' bytes coming (torch's).
+        self.returning.min(self.vmm) + self.transient + self.caches.iter().map(|c| c.coming).sum::<u64>() + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0) + r.torch)).sum::<u64>()
     }
 
     fn others_held(&self) -> u64 {
@@ -649,6 +689,30 @@ impl Table {
         let Some(room) = req.yielded else { return 0 };
         let back = Req { room, yielded: None, ..req.clone() };
         self.remaining(&back).unwrap_or_else(|| self.w(&back))
+    }
+
+    /// Yielded W per family waited for, in a row's slots: the largest families apart, any more
+    /// than the slots together under family 0 (counted for every child).
+    pub fn yielded_by_family(&self) -> [(u64, u64); crate::decide::YIELDED] {
+        let mut by: BTreeMap<u64, u64> = BTreeMap::new();
+        for r in self.requests.iter().filter(|r| r.yielded.is_some()) {
+            *by.entry(r.family).or_default() += self.yielded_w(r);
+        }
+        let mut families: Vec<(u64, u64)> = by.into_iter().collect();
+        families.sort_by_key(|(f, w)| (std::cmp::Reverse(*w), *f));
+        let mut out = [(0, 0); crate::decide::YIELDED];
+        let fits = families.len() <= crate::decide::YIELDED;
+        for (i, (f, w)) in families.into_iter().enumerate() {
+            match out.get_mut(i) {
+                Some(slot) if fits || i + 1 < crate::decide::YIELDED => *slot = (f, w),
+                _ => {
+                    if let Some(last) = out.last_mut() {
+                        *last = (0, last.1 + w);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Pinned bytes outside every open request's current step (counted apart by `fits`).

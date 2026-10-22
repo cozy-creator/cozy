@@ -33,8 +33,7 @@ use crate::backend::{Access, Backend, Event, Physical, Va};
 use crate::custody;
 use crate::decide::{decide, Action, Trigger, Tried};
 use crate::ledger::{self, Facts, Grant, PhysicalChange, Room, Row, Shared};
-use crate::table::{Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
-use crate::os;
+use crate::table::{Aside, Class, CutSite, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
 use crate::tier;
 use crate::{Error, Exhausted, GpuId, Result};
 
@@ -828,8 +827,10 @@ struct State {
     failed: HashMap<Key, Error>,
     /// The latest unmap's mechanism ticket: whoever counts on its bytes settles up to it.
     last_unmap: Option<u64>,
-    /// Request → its recorded host high-water (`None`: unmeasured).
+    /// Request → its recorded anonymous host peak (`None`: unmeasured).
     host: HashMap<u64, Option<u64>>,
+    /// This process's anonymous peak while requests run.
+    window: Option<ledger::Window>,
     /// Request → the `<package>|<shape>` its peak is recorded under.
     peaks: HashMap<u64, String>,
     /// Requests whose last step is one their plan did not declare.
@@ -1137,7 +1138,7 @@ impl Memory {
             // Serving the tier here, it keeps this GPU's running requests' host growth free.
             let need: tier::Need = Arc::new({
                 let shared = shared.clone();
-                move || ledger::host_need(&shared)
+                move || ledger::host_calls(&shared)
             });
             let tier = tier::Client::open(shared.ns, need).map_err(|e| tracing::warn!("varena: no RAM tier: {e}")).ok().map(Arc::new);
             let (to_custody, to_tier, mech) = (Arc::new(Outbox::default()), Arc::new(Outbox::default()), Arc::new(Outbox::default()));
@@ -1235,10 +1236,11 @@ impl Memory {
     }
 
     /// Registers bytes the caller holds (torch tensors) that `shrink(want) -> freed` gives back.
-    /// A cache whose `owner` is a request id ends with that request. One serving components
-    /// (`sets`: a component's graph pool or decode cache, a pool shared by a serialized
-    /// domain's components) takes the most protective class among them and goes before their
-    /// pages; one serving none is N.
+    /// A cache whose `owner` is a request id ends with that request. A cache takes exactly the
+    /// class of the components it serves (`sets`), the most protective among them, and goes
+    /// before their pages: a component's graph pool or decode cache names the component, a
+    /// model's KV or derived cache its model's sets (W while the model runs, D while a plan
+    /// declares it, N once idle; review 6, C4); one serving none is N.
     pub fn cache(&self, owner: &str, sets: &[SetId], shrink: impl Fn(u64) -> Shrunk + Send + Sync + 'static) -> CacheId {
         let shrink: Shrink = Arc::new(shrink);
         self.inner
@@ -1259,11 +1261,12 @@ impl Memory {
         let _ = self.inner.guard(|| {
             let mut st = self.inner.lock();
             let now = st.tick();
-            if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
-                c.bytes = bytes;
+            if let Some(c) = st.table.cache_mut(cache.0) {
                 c.last_use = now;
-                // A queued shrink's bytes arrived.
-                c.coming = 0;
+                match c.shrinking {
+                    0 => c.report(bytes),
+                    _ => c.reported = Some(bytes),
+                }
             }
             self.inner.publish(&mut st);
             self.inner.unlock(st);
@@ -1279,7 +1282,7 @@ impl Memory {
             .guard(|| {
                 let mut st = self.inner.lock();
                 let id = st.tick();
-                if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
+                if let Some(c) = st.table.cache_mut(cache.0) {
                     c.holds += 1;
                 }
                 self.inner.publish(&mut st);
@@ -1295,7 +1298,7 @@ impl Memory {
         let _ = self.inner.guard(|| {
             let event = self.inner.backend.record(stream)?;
             let mut st = self.inner.lock();
-            if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
+            if let Some(c) = st.table.cache_mut(cache.0) {
                 c.holds = c.holds.saturating_sub(1);
                 if event != Event::DONE {
                     c.releasing.push(event.0);
@@ -1539,10 +1542,11 @@ impl Inner {
         st.promises();
         self.physical(st);
         if settled > 0 {
-            // The reclaimed bytes move from the callback's count into the stored limit: the
-            // allocator's limit never drops between publications.
-            self.limit.store(st.table.torch_limit(), Ordering::Release);
+            // The reclaimed bytes move from the callback's count into the stored limit, the
+            // count first: a reader (the limit, then the count) may miss them for a moment, never
+            // count them twice (review 6, F5).
             self.unreconciled.fetch_sub(settled, Ordering::AcqRel);
+            self.limit.store(st.table.torch_limit(), Ordering::Release);
         }
     }
 
@@ -1930,10 +1934,11 @@ impl Inner {
             unmeasured: remaining.iter().filter(|r| r.is_none()).count() as u64,
             running: t.requests.len() as u64,
             outside: t.outside(),
-            yielded: yielded_by_family(t),
+            yielded: t.yielded_by_family(),
             host_peak: st.host.values().flatten().copied().max().unwrap_or(0),
             host_unmeasured: st.host.values().filter(|h| h.is_none()).count() as u64,
-            returning: t.returning,
+            // Retiring bytes, and the caches' shrinks queued or asked (torch's bytes coming).
+            returning: t.returning + t.caches.iter().map(|c| c.coming).sum::<u64>(),
         }
     }
 
@@ -1959,7 +1964,7 @@ impl Inner {
         let stocked: Vec<Key> = st.homes.iter().filter(|(_, h)| h.stock.is_some()).map(|(k, _)| *k).collect();
         for key in stocked {
             let gen = st.homes.get(&key).map(|h| h.gen);
-            if self.offerable(st, key).is_some_and(|o| Some(o.gen) == gen) {
+            if self.offerable(st, key, false).is_some_and(|o| Some(o.gen) == gen) {
                 continue;
             }
             if let Some(h) = st.homes.get_mut(&key) {
@@ -1973,7 +1978,7 @@ impl Inner {
         }
         let fresh: Vec<Key> = st.homes.iter().filter(|(_, h)| h.stock.is_none()).map(|(k, _)| *k).collect();
         for key in fresh {
-            let Some(offer) = self.offerable(st, key) else { continue };
+            let Some(offer) = self.offerable(st, key, true) else { continue };
             let claim = Arc::new(AtomicU8::new(STOCKED));
             if let Some(h) = st.homes.get_mut(&key) {
                 h.stock = Some(claim.clone());
@@ -1987,7 +1992,7 @@ impl Inner {
         if self.stock.len() > 2 * live.len() {
             st.round += 1;
             for (key, claim) in live {
-                if let Some(offer) = self.offerable(st, key) {
+                if let Some(offer) = self.offerable(st, key, false) {
                     let _ = self.stock_tx.send(Stocked { claim, round: st.round, ..offer });
                 }
             }
@@ -2001,13 +2006,15 @@ impl Inner {
     }
 
     /// Page `key` as the callback may reclaim it: mapped, filled and complete, unpinned, never
-    /// kept, and of no declared use (N or S). `None` otherwise.
-    fn offerable(&self, st: &State, key: Key) -> Option<Stocked> {
+    /// kept, and of no declared use (N or S). `None` otherwise. A live offer's ready event was
+    /// complete when it was made and no use since left it in the stock: not queried again
+    /// (review 6, G2).
+    fn offerable(&self, st: &State, key: Key, query: bool) -> Option<Stocked> {
         let idle = st.table.page(key).is_some_and(|p| p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.kept);
         let class = st.table.class(key);
         let (va, off, span) = st.place(key).ok()?;
         let h = st.homes.get(&key)?;
-        let complete = !h.filling && !h.transforming && !h.keeping && !h.keep_after && !h.exported && self.backend.query(h.ready).unwrap_or(false);
+        let complete = !h.filling && !h.transforming && !h.keeping && !h.keep_after && !h.exported && (!query || self.backend.query(h.ready).unwrap_or(false));
         let phys = h.phys.as_ref().map(|p| p.id).filter(|_| idle && complete && matches!(class, Some(Class::N | Class::S)))?;
         Some(Stocked { key, gen: h.gen, round: st.round, va, off, span, phys, claim: Arc::new(AtomicU8::new(TAKEN)) })
     }
@@ -2544,7 +2551,7 @@ impl Inner {
         // (or never) stalls only this speculative copy, never a demand's settle or an ask's
         // answer (review 5, F7). No room now: it waits for a measured pass to end.
         let Ok((.., span)) = self.state.lock().place(s.key) else { return };
-        let Some(permit) = self.tier.as_ref().and_then(|t| t.reserve(span)) else {
+        let Some(permit) = self.tier.as_ref().and_then(|t| t.reserve(&s.tier, span)) else {
             let mut st = self.state.lock();
             if !st.deferred_saves.iter().any(|d| d.key == s.key && d.gen == s.gen) {
                 st.deferred_saves.push(s.clone());
@@ -2729,7 +2736,7 @@ impl Inner {
             self.publish(&mut st);
             drop(admission);
             self.unlock(st);
-            self.shrink(shrinks);
+            self.shrink(shrinks, false);
             if remote.is_empty() {
                 return Ok(actions);
             }
@@ -2774,7 +2781,7 @@ impl Inner {
             Trigger::Oom { need, .. } => ("oom", need.unwrap_or(0)),
             Trigger::Prepare { pages, .. } => ("prepare", pages.iter().filter_map(|k| st.table.page(*k)).filter(|p| !p.mapped).map(|p| p.bytes).sum()),
             Trigger::Workspace { bytes, .. } => ("workspace", *bytes),
-            Trigger::Outside { room, .. } => ("outside", room.unwrap_or(0)),
+            Trigger::Outside { req, .. } => ("outside", st.table.request(*req).and_then(|r| r.aside.bytes()).unwrap_or(0)),
             Trigger::Speculate { .. } | Trigger::Ask { .. } | Trigger::Load { .. } => return,
         };
         let step = st.table.request(req).map_or(0, |r| r.cursor.step);
@@ -2914,14 +2921,29 @@ impl Inner {
     }
 
     /// Runs caches' shrink callbacks, the lock released (they are the caller's code).
-    fn shrink(&self, shrinks: Vec<(u32, u64, Shrink)>) {
+    /// Runs caches' shrinks, the lock released (the caller's code). `announced`: an answer to a
+    /// peer marked the bytes coming beforehand (review 6, C2); they now are what is still to
+    /// come.
+    fn shrink(&self, shrinks: Vec<(u32, u64, Shrink)>, announced: bool) {
         for (id, bytes, f) in shrinks {
+            if let Some(c) = self.state.lock().table.cache_mut(id) {
+                c.shrinking += 1;
+            }
             let shrunk = crate::caught(|| Ok(f(bytes))).unwrap_or_default();
             let mut st = self.state.lock();
-            if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == id) {
+            if let Some(c) = st.table.cache_mut(id) {
                 c.bytes = c.bytes.saturating_sub(shrunk.freed + shrunk.coming);
-                c.coming += shrunk.coming;
+                let before = if announced { c.coming.saturating_sub(bytes) } else { c.coming };
+                c.coming = before + shrunk.coming;
+                c.shrinking = c.shrinking.saturating_sub(1);
+                // What it reported during its shrinks is the latest word on its bytes.
+                if let Some(b) = c.reported.take_if(|_| c.shrinking == 0) {
+                    c.report(b);
+                }
             }
+            self.publish(&mut st);
+            drop(st);
+            self.landed.notify_all();
         }
     }
 
@@ -3049,10 +3071,10 @@ impl Inner {
     /// not fit. A declared set's tier holds its transformed bytes: only its filled pages go
     /// there.
     fn load_ram(self: &Arc<Self>, set: u32) -> Result<()> {
-        let (spec, held) = {
+        let (spec, held, name) = {
             let st = self.lock();
             let m = st.mech(set)?;
-            let out = (m.spec.clone(), m.held.clone());
+            let out = (m.spec.clone(), m.held.clone(), m.tier.clone());
             self.unlock(st);
             out
         };
@@ -3062,7 +3084,7 @@ impl Inner {
         while want > 0 {
             let batch: Vec<u32> = (at..at + want).map(|r| r as u32).collect();
             let bytes = regions.iter().skip(at).take(want).map(|r| r.span).sum();
-            let Some(permit) = tier.reserve(bytes) else {
+            let Some(permit) = tier.reserve(&name, bytes) else {
                 want /= 2;
                 continue;
             };
@@ -3114,9 +3136,12 @@ impl Inner {
             st.peaks.insert(rid, String::from_utf8_lossy(&peak).into_owned());
             self.shared.put(&key, None)?;
         }
-        // Its host high-water is measured from its start (the process's, when it runs alone).
-        if st.table.requests.is_empty() {
-            os::reset_high_water();
+        // Its anonymous host peak is measured from its start (the process's, when it runs alone).
+        match st.window.as_mut() {
+            Some(window) => {
+                window.look();
+            }
+            None => st.window = ledger::Window::start(),
         }
         let host = match st.peaks.get(&rid) {
             Some(key) => self.shared.fact(&format!("host/{key}"))?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes),
@@ -3124,9 +3149,20 @@ impl Inner {
         };
         st.host.insert(rid, host);
         // Its room outside its passes, as measured for its dispatch key.
+        // As measured for its key, else the largest of its package's at any shape (review 6, C3).
+        let bytes = |v: Vec<u8>| v.try_into().ok().map(u64::from_le_bytes);
         let aside = match st.peaks.get(&rid) {
-            Some(key) => self.shared.fact(&format!("aside/{key}"))?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes),
-            None => None,
+            None => Aside::Unknown,
+            Some(key) => match self.shared.fact(&format!("aside/{key}"))?.and_then(bytes) {
+                Some(b) => Aside::Measured(b),
+                None => {
+                    let package = key.split('|').next().unwrap_or_default();
+                    match self.shared.facts(&format!("aside/{package}|"))?.into_iter().filter_map(|(_, v)| bytes(v)).max() {
+                        Some(b) => Aside::Measured(b),
+                        None => Aside::Unmeasured,
+                    }
+                }
+            },
         };
         st.table.requests.push(Req { id: rid, name: id.to_string(), steps, rooms, aside, ..Req::default() });
         // Its plan reclassifies pages (N to D): the stock is offered again.
@@ -3144,12 +3180,7 @@ impl Inner {
     /// at each pass end), outside the allocator callback: its kept idle pages lent to the
     /// callback as the room needs (all of them while it is unmeasured), never evicted for it.
     fn prepare_outside(&self, req: u64) -> Result<()> {
-        let room = {
-            let st = self.lock();
-            let Some(r) = st.table.request(req) else { return Ok(()) };
-            r.aside
-        };
-        self.demand(Trigger::Outside { req, room, tried: Tried::default() }, Some(req)).map(|_| ())
+        self.demand(Trigger::Outside { req, tried: Tried::default() }, Some(req)).map(|_| ())
     }
 
     fn bind(self: &Arc<Self>, set: u32, block: u32, stream: usize) -> Result<Pin> {
@@ -3669,9 +3700,12 @@ impl Inner {
         let shrinks: Vec<(u32, u64, Shrink)> = holding.iter().filter_map(|id| st.shrinks.get(id).map(|s| (*id, u64::MAX, s.clone()))).collect();
         let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
         let mut stats = st.stats.remove(&req).unwrap_or_default();
-        st.host.remove(&req);
-        // Its host high-water (the process's since the first open request started).
-        stats.host = os::high_water();
+        let unmeasured = st.host.remove(&req).is_some_and(|h| h.is_none()) && st.host.values().all(Option::is_some);
+        // Its anonymous host peak (the process's since the first open request started).
+        stats.host = st.window.as_mut().and_then(ledger::Window::look);
+        if st.table.requests.is_empty() {
+            st.window = None;
+        }
         let aside = st.aside.remove(&req);
         if let Some(key) = st.peaks.remove(&req) {
             if let Some(bytes) = aside {
@@ -3684,7 +3718,7 @@ impl Inner {
             }
         }
         self.unlock(st);
-        self.shrink(shrinks);
+        self.shrink(shrinks, false);
         stats.tier = self.tier.as_ref().map_or(0, |t| t.resident());
         let mut st = self.lock();
         st.table.caches.retain(|c| !owned.contains(&c.id));
@@ -3695,6 +3729,11 @@ impl Inner {
         stats.keep_pending = st.keep_pending();
         st.last = Some(stats.clone());
         self.publish(&mut st);
+        // The last host-unmeasured call ended (published): a copy refused beside it probes for
+        // room again; a standalone call has no measured pass end to retry at (review 6).
+        if let Some(save) = unmeasured.then(|| st.deferred_saves.pop()).flatten() {
+            self.saves.post(save, 0);
+        }
         let uses: Vec<Call> = st.sets.iter().flatten().map(|m| Call::Use { digest: m.tier.clone(), distance: None }).collect();
         if self.tier.is_some() {
             uses.into_iter().for_each(|c| self.post(c));
@@ -3747,7 +3786,14 @@ impl Inner {
                         self.unmap(&mut st, *page, *class, None, true)?;
                     }
                     Action::Trim(_) => wanted.trim = true,
-                    Action::Shrink { cache, bytes } => wanted.shrinks.push((*cache, *bytes)),
+                    // Its trim thread shrinks it after the reply; the bytes are coming meanwhile
+                    // (published), so the asker waits for them rather than escalating (C2).
+                    Action::Shrink { cache, bytes } => {
+                        if let Some(c) = st.table.cache_mut(*cache) {
+                            c.coming += *bytes;
+                        }
+                        wanted.shrinks.push((*cache, *bytes));
+                    }
                     _ => {}
                 }
             }
@@ -3828,7 +3874,7 @@ impl Inner {
             let st = self.state.lock();
             wanted.shrinks.iter().filter_map(|(id, b)| st.shrinks.get(id).map(|s| (*id, *b, s.clone()))).collect()
         };
-        self.shrink(shrinks);
+        self.shrink(shrinks, true);
         let mut st = self.state.lock();
         self.publish(&mut st);
         drop(st);
@@ -3935,29 +3981,6 @@ impl Inner {
         drop(st);
         Ok(empty && self.mech.idle() && self.to_custody.idle() && self.to_tier.idle() && self.saves.idle())
     }
-}
-
-/// The table's yielded W per family it waits for, in the row's slots: the largest families
-/// apart, any more together under family 0 (counted for every child).
-fn yielded_by_family(t: &Table) -> [(u64, u64); crate::decide::YIELDED] {
-    let mut by: BTreeMap<u64, u64> = BTreeMap::new();
-    for r in t.requests.iter().filter(|r| r.yielded.is_some()) {
-        *by.entry(r.family).or_default() += t.yielded_w(r);
-    }
-    let mut families: Vec<(u64, u64)> = by.into_iter().collect();
-    families.sort_by_key(|(f, w)| (std::cmp::Reverse(*w), *f));
-    let mut out = [(0, 0); crate::decide::YIELDED];
-    for (i, (f, w)) in families.into_iter().enumerate() {
-        match out.get_mut(i) {
-            Some(slot) if i + 1 < crate::decide::YIELDED => *slot = (f, w),
-            _ => {
-                if let Some(last) = out.last_mut() {
-                    *last = (0, last.1 + w);
-                }
-            }
-        }
-    }
-    out
 }
 
 impl Inner {

@@ -52,18 +52,20 @@ pub fn process(pid: u32) -> io::Result<ProcessMemory> {
     sys::process(pid)
 }
 
-/// One process's anonymous bytes now, and a conservative upper bound on their high-water
-/// since it started or since [`reset_peak`]. Linux exposes a total resident peak, not a separate
-/// anonymous peak; current file/shared pages cannot be subtracted from that historical value.
-/// Linux only (the host tier's OS); elsewhere `Unsupported`.
+/// One process's resident bytes now, anonymous, file and shmem (a sealed layout it maps), and
+/// its resident high-water since it started or [`reset_peak`]. Linux keeps no anonymous
+/// high-water; the host tier bounds one from these. Linux only (the host tier's OS); elsewhere
+/// `Unsupported`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Anon {
-    pub now: u64,
+pub struct Resident {
+    pub anon: u64,
+    pub file: u64,
+    pub shmem: u64,
     pub peak: u64,
 }
 
-pub fn anon(pid: u32) -> io::Result<Anon> {
-    sys::anon(pid)
+pub fn resident(pid: u32) -> io::Result<Resident> {
+    sys::resident(pid)
 }
 
 /// Starts `pid`'s high-water over from its use now.
@@ -113,67 +115,39 @@ mod tests {
         );
     }
 
-    /// A process's anonymous high-water holds what it touched and freed, until it starts over.
+    /// The high-water holds a freed anonymous peak until it starts over; mapped file pages are
+    /// shared, never anonymous.
     #[cfg(target_os = "linux")]
     #[test]
-    fn an_anonymous_high_water_holds_a_freed_peak_until_reset() {
-        let script = "b = bytearray(64 << 20); b[::4096] = b'\\1' * len(b[::4096]); del b\nprint('freed', flush=True)\nimport time; time.sleep(60)";
-        let mut child = std::process::Command::new("python3")
-            .args(["-c", script])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
-        let held = super::anon(child.id()).unwrap();
-        assert!(held.peak >= 64 << 20 && held.now < 64 << 20, "{held:?}");
-        super::reset_peak(child.id()).unwrap();
-        let reset = super::anon(child.id()).unwrap();
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(reset.peak < 64 << 20 && reset.peak >= reset.now, "{reset:?}");
-    }
-
-    /// Later file residency must not erase an earlier anonymous peak. Both observations use
-    /// a real child process; its current RSS composition changes while its high-water remains.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn file_pages_do_not_subtract_from_an_earlier_anonymous_peak() {
+    fn a_high_water_holds_a_freed_peak_until_reset_and_mapped_pages_are_shared() {
         use std::io::{BufRead, Write};
         let script = r#"
 import mmap, sys, tempfile
-anonymous = bytearray(64 << 20)
-print('anonymous', flush=True)
-sys.stdin.readline()
-del anonymous
-file = tempfile.TemporaryFile()
-file.truncate(48 << 20)
+b = bytearray(64 << 20); b[::4096] = b'\1' * len(b[::4096]); del b
+file = tempfile.TemporaryFile(); file.truncate(48 << 20)
 mapped = mmap.mmap(file.fileno(), 0)
 for at in range(0, len(mapped), 4096):
     mapped[at] = 1
-print('file', flush=True)
+print('mapped', flush=True)
 sys.stdin.readline()
 "#;
         let mut child = std::process::Command::new("python3")
             .args(["-c", script])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .spawn().unwrap();
+            .spawn()
+            .unwrap();
         let mut input = child.stdin.take().unwrap();
-        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
-        output.read_line(&mut line).unwrap();
-        let anonymous = super::anon(child.id()).unwrap();
-        input.write_all(b"next\n").unwrap();
-        line.clear();
-        output.read_line(&mut line).unwrap();
-        let file_backed = super::anon(child.id()).unwrap();
-        let mapped = super::process(child.id()).unwrap();
-        drop(input);
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let held = super::resident(child.id()).unwrap();
+        super::reset_peak(child.id()).unwrap();
+        let reset = super::resident(child.id()).unwrap();
+        input.write_all(b"done\n").unwrap();
         assert!(child.wait().unwrap().success());
-        assert!(anonymous.now >= 64 << 20, "{anonymous:?}");
-        assert!(file_backed.now < 32 << 20 && mapped.rss > 48 << 20, "{file_backed:?}, {mapped:?}");
-        assert!(file_backed.peak >= anonymous.now, "later file residency must preserve the anonymous peak: {anonymous:?} -> {file_backed:?}");
+        assert!(held.anon < 32 << 20 && held.file >= 48 << 20, "{held:?}");
+        assert!(held.peak >= 64 << 20 && held.peak > held.anon + held.file + held.shmem, "the freed peak holds: {held:?}");
+        assert!(reset.peak < held.peak && reset.peak >= reset.anon + reset.file + reset.shmem, "{reset:?}");
     }
 
     #[cfg(target_os = "linux")]

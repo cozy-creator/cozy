@@ -491,6 +491,7 @@ impl Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         varena::os::remove_table(&self.uuid);
+        varena::tier::remove_claims();
     }
 }
 
@@ -1901,3 +1902,36 @@ fn a_range_prepared_after_an_identity_change_fills_its_page_again() {
     assert!(events.waits.lock().contains(&(consumer, 0)), "the refill waits in-stream for the old consumer");
 }
 
+
+/// S3 (varena-standalone's capping): torch's cap is taken when a pass returns, so the room it
+/// made is complete then: its unmaps done and the kept pages it lent or evicted let go by
+/// custody. Unmeasured (its kept pages lent) and lowered (streaming W pages) alike, torch_limit
+/// at the return is the settled one.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_passs_room_is_settled_when_it_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("settled-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
+    gate.open();
+    serve_custody(&uuid, gate, log.clone());
+    let mem = Memory::open(g.clone(), None, Box::new(Driver(Card::new(g.memory, 0)))).unwrap();
+    let k = stored(dir.path(), &uuid, "k", 1);
+    let key = k.fingerprint.key();
+    mem.load(k, Level::Gpu).unwrap();
+    log.await_call(|(_, call)| call.contains("Export") && call.contains(&key));
+    let a = mem.load(stored(dir.path(), &uuid, "a", 3), Level::Ram).unwrap();
+    for round in ["unmeasured", "lowered"] {
+        let r = mem.request(round, Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+        let pass = r.pass(a, "fwd", "1x1", Torch::default()).unwrap();
+        let at_return = mem.torch_limit();
+        mem.settle();
+        assert_eq!(at_return, mem.torch_limit(), "{round}: the limit at the pass's return is final");
+        (0..3).for_each(|b| drop(mem.bind(a, b, 0).unwrap()));
+        pass.end(Measured { allocated_peak: 2 * REGION_ALIGN, slack: 0, sites: vec![] }, Torch::default());
+        r.end();
+        mem.settle();
+    }
+}

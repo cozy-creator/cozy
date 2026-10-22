@@ -71,6 +71,7 @@ fn load(path: &Path, run: usize) -> f64 {
     let rate = (PAGES * PAGE) as f64 / start.elapsed().as_secs_f64() / 1e9;
     drop(mem);
     varena::os::remove_table(&g.uuid);
+    varena::tier::remove_claims();
     rate
 }
 

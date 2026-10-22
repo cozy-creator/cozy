@@ -426,6 +426,20 @@ fn a_rows_yielded_w_is_per_family() {
     assert!(fits(24 * GB, 0, &rows, &[], Some(9 * GB), None) && !fits(24 * GB, 0, &rows, &[], Some(9 * GB + 1), None), "a stranger's child: beside both");
 }
 
+/// Review 6, R4 nit: a row's slots hold as many families apart as there are slots; only more
+/// than that fold the smallest together under family 0.
+#[test]
+fn a_rows_yielded_slots_fold_only_past_their_count() {
+    let yielded = |id: u64, family: u64, gb: u64| Req { id, family, yielded: Some(gb * GB), ..Req::default() };
+    let mut t = Table { capacity: 64 * GB, requests: vec![yielded(1, 11, 8), yielded(2, 22, 6), yielded(3, 33, 4)], ..Table::default() };
+    let w = |t: &Table, id: u64| t.requests.iter().find(|r| r.id == id).map_or(0, |r| t.yielded_w(r));
+    let (a, b, c) = (w(&t, 1), w(&t, 2), w(&t, 3));
+    assert_eq!(t.yielded_by_family(), [(11, a), (22, b), (33, c)], "three families, three slots");
+    t.requests.push(yielded(4, 44, 2));
+    let d = w(&t, 4);
+    assert_eq!(t.yielded_by_family(), [(11, a), (22, b), (0, c + d)], "a fourth folds with the third");
+}
+
 // ---- regressions from review 1
 
 /// Review 1, finding 5 (the reviewer's probe): an OOM whose own N unmap and another row's
@@ -744,5 +758,43 @@ fn a_held_cache_is_never_asked_to_shrink() {
     assert_eq!(t.cache_class(&t.caches[0]), Class::P, "its release is pending on its stream");
     t.caches[0].releasing.clear();
     assert_eq!(t.cache_class(&t.caches[0]), Class::N);
+}
+
+/// Review 6, C3 (the reviewer's probe): an unmeasured pass with room to spare never shrinks
+/// another component's graph pool; caches shrink only for a measured shortfall or an OOM.
+#[test]
+fn an_unmeasured_pass_never_sweeps_caches() {
+    let mut t = table(64 * MB, vec![set("a", 1, MB), set("b", 1, MB)], vec![(vec![0], 1)]);
+    map(&mut t, (1, 0));
+    t.caches.push(Cache { id: 9, owner: "graphs:b".into(), sets: vec![1], bytes: 4 * MB, last_use: 6, ..Default::default() });
+    (t.allocated, t.reserved) = (4 * MB, 4 * MB);
+    let roomy = decide(&t, &Trigger::Pass { req: 1, set: 0, room: None, unmeasured: MB, tried: Tried::default() });
+    assert!(!roomy.iter().any(|a| matches!(a, Action::Shrink { .. })), "{roomy:?}");
+    // Short of room, unmeasured: still no cache shrinks (pages only).
+    let mut t = table(6 * MB, vec![set("a", 1, MB), set("b", 1, MB)], vec![(vec![0], 1)]);
+    map(&mut t, (1, 0));
+    t.caches.push(Cache { id: 9, owner: "graphs:b".into(), sets: vec![1], bytes: 4 * MB, last_use: 6, ..Default::default() });
+    (t.allocated, t.reserved) = (4 * MB, 4 * MB);
+    let short = decide(&t, &Trigger::Pass { req: 1, set: 0, room: None, unmeasured: 2 * MB, tried: Tried::default() });
+    assert!(!short.iter().any(|a| matches!(a, Action::Shrink { .. })), "{short:?}");
+}
+
+/// Review 6, C2: a busy peer answers an ask with an older N cache's shrink (the reviewer's
+/// probe); it runs after the reply, so the peer publishes the bytes as coming (its returning),
+/// and the asker counts them: it waits for them rather than escalating.
+#[test]
+fn a_peers_cache_shrink_counts_as_coming_for_the_asker() {
+    let mut peer = table(8 * MB, vec![set("a", 1, MB), set("n", 1, MB)], vec![(vec![0], 1)]);
+    map(&mut peer, (0, 0));
+    map(&mut peer, (1, 0));
+    peer.page_mut((1, 0)).unwrap().last_use = 5;
+    peer.caches.push(Cache { id: 7, owner: "kv:r".into(), bytes: MB, last_use: 1, ..Default::default() });
+    (peer.allocated, peer.reserved) = (MB, MB);
+    let a = decide(&peer, &Trigger::Ask { ceiling: Class::N, bytes: MB });
+    assert_eq!(a, vec![Action::Shrink { cache: 7, bytes: MB }], "the older cache covers the ask");
+    // The asker sees the peer's bytes coming (published in its returning, of its torch's).
+    let mut asker = table(8 * MB, vec![set("x", 1, MB)], vec![(vec![0], 1)]);
+    asker.others.push(Remote { row: 2, running: true, torch: MB, returning: MB, ..Remote::default() });
+    assert_eq!(asker.returning(), MB);
 }
 

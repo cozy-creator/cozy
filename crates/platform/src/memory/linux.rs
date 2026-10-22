@@ -246,29 +246,6 @@ pub fn uid_of(pid: u32) -> Result<u32> {
     uids.and_then(|u| u.split_whitespace().nth(1)).and_then(|u| u.parse().ok()).ok_or_else(|| Error::os("read a uid")(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("no uid for {pid}"))))
 }
 
-/// `/proc/<pid>/status` fields in bytes (`VmHWM`, `RssAnon`, …).
-fn status(pid: &str, names: &[&str]) -> Option<Vec<u64>> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(':')?.split_whitespace().next()?.parse::<u64>().ok()).map(|kib| kib * 1024);
-    names.iter().map(|n| field(n)).collect()
-}
-
-/// Conservative process resident peak. Subtracting current file/shared RSS from a past
-/// peak can undercount anonymous growth when those mappings grew after the peak.
-pub fn high_water() -> Option<u64> {
-    status("self", &["VmHWM"])?.first().copied()
-}
-
-/// Starts this process's resident high-water over from its use now (`clear_refs` 5).
-pub fn reset_high_water() {
-    let _ = std::fs::write("/proc/self/clear_refs", b"5");
-}
-
-/// `pid`'s anonymous bytes now.
-pub fn anon(pid: u32) -> Option<u64> {
-    status(&pid.to_string(), &["RssAnon"])?.first().copied()
-}
-
 /// The calling thread's id.
 pub fn thread_id() -> u32 {
     // SAFETY: gettid has no arguments and cannot fail.

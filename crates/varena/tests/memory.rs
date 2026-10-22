@@ -11,7 +11,7 @@ use tensorfs::format::ObjectRef;
 use tensorfs::io::source::Source;
 use tensorfs::io::{ItemSource, ObjectRange};
 use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
-use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Next, Plan, SetSpec, Site, Step, Torch};
+use varena::{CacheId, Fill, Fingerprint, GpuId, HostBackend, Level, Measured, Memory, Next, Plan, SetSpec, Shrunk, Site, Step, Torch};
 
 const MB: u64 = 1 << 20;
 
@@ -44,6 +44,7 @@ impl Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         varena::os::remove_table(&self.uuid);
+        varena::tier::remove_claims();
     }
 }
 
@@ -605,18 +606,19 @@ fn an_impossible_need_is_exhausted_at_once() {
     pass.end(Measured::default(), Torch::default());
 }
 
-/// Host-OOM, the varena side: a request records its host high-water (Peak::Host, its
-/// anonymous bytes; the tier's and file mappings aside); while a request runs unmeasured the
-/// GPU's host need is unknown, and once measured it is that high-water less what the process
-/// holds now. Linux: the high-water is read from `/proc` (elsewhere a request is unmeasured).
+/// Host-OOM, the varena side: a request records its anonymous host peak (Peak::Host; the tier's
+/// and file mappings aside). While it runs unmeasured its process is an unmeasured call, and once
+/// measured the call carries that peak. Linux: the peak is read from `/proc` (elsewhere a request
+/// is unmeasured).
 #[cfg(target_os = "linux")]
 #[test]
-fn a_request_records_its_host_high_water() {
+fn a_request_records_its_anonymous_host_peak() {
     let (_scope, ledger, mem, _g) = open("host", 8 * MB);
     ledger.dispatch("first", "pkg", "1x1").unwrap();
     let r = mem.request("first", Plan { steps: vec![] }).unwrap();
-    assert_eq!(ledger.host_need(), None, "a running request with no host peak");
-    assert_eq!(varena::tier::need(&[&ledger])(), None, "TensorD's sum over its GPUs");
+    let unmeasured = |calls: Option<Vec<varena::HostCall>>| calls.is_some_and(|c| c.len() == 1 && c[0].pid == std::process::id() && c[0].peak.is_none());
+    assert!(unmeasured(ledger.host_calls()), "a running request with no host peak");
+    assert!(unmeasured(varena::tier::need(&[&ledger])()), "TensorD's over its GPUs");
     let held: Vec<u8> = vec![1; (64 * MB) as usize];
     let stats = r.end();
     assert!(stats.host.is_some_and(|h| h >= 64 * MB), "{:?}", stats.host);
@@ -627,7 +629,8 @@ fn a_request_records_its_host_high_water() {
     assert!(recorded.is_some_and(|b| b >= 64 * MB), "{recorded:?}");
     ledger.dispatch("second", "pkg", "1x1").unwrap();
     let r = mem.request("second", Plan { steps: vec![] }).unwrap();
-    assert!(ledger.host_need().is_some(), "measured now");
+    let calls = ledger.host_calls().unwrap();
+    assert!(calls.len() == 1 && calls[0].peak == recorded, "measured now: {calls:?}");
     drop(held);
     r.end();
 }
@@ -865,3 +868,62 @@ fn a_retry_mark_survives_the_failed_tries_pass_end() {
     assert!(matches!(next, Next::Cut(1)), "the outside cut goes finer, no second Retry: {next:?}");
 }
 
+/// Review 6, C3: a request's room outside its passes is its package's largest measured one at
+/// any shape when its own shape has none, so it lends only what that room needs; the idle-GPU
+/// rule is for a package never measured.
+#[test]
+fn an_outside_room_is_its_packages_largest_at_any_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("aside-package", 16 * MB);
+    let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
+    mem.load(set(dir.path(), "big", 10, &g.uuid), Level::Gpu).unwrap();
+    mem.settle();
+    // Never measured: every idle page is lent, so a large first allocation finds them all.
+    assert!(varena::Ledger::admit(&[&ledger], "first", "pkg", "1x8", None).unwrap());
+    let r = mem.request("first", plan("a")).unwrap();
+    assert_eq!(r.reclaim_allocation(REGION_ALIGN).unwrap(), REGION_ALIGN);
+    r.outside(2 * REGION_ALIGN);
+    r.pass(a, "fwd", "1x8", Torch::default()).unwrap().end(Measured::default(), Torch::default());
+    r.end();
+    mem.settle();
+    // Another shape of the package: its room is the package's 2 pages, of which one is free (the
+    // page the first allocation took): one page is lent, and a callback finds no more.
+    assert!(varena::Ledger::admit(&[&ledger], "second", "pkg", "2x8", None).unwrap());
+    let r = mem.request("second", plan("a")).unwrap();
+    assert_eq!(r.reclaim_allocation(4 * REGION_ALIGN).unwrap(), REGION_ALIGN, "only what the measured room needs is lent");
+    r.end();
+}
+
+
+/// S3's footgun: a shrink that reports its cache from inside (its queued work finished before
+/// it returned) has the report applied after the shrink's own figures, never overwritten by
+/// them: the bytes it said came are not left coming, and nothing waits for them.
+#[test]
+fn a_report_made_during_a_shrink_is_applied_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("report", 8 * MB);
+    let mem = Arc::new(mem);
+    let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
+    // The shrink's handle to its Memory and cache, dropped at the end (a cycle meanwhile).
+    type Me = parking_lot::Mutex<Option<(Arc<Memory>, CacheId)>>;
+    let me: Arc<Me> = Arc::default();
+    let inside = me.clone();
+    let cache = mem.cache("decode", &[], move |want| {
+        if let Some((mem, id)) = inside.lock().clone() {
+            mem.cached(id, 0);
+        }
+        Shrunk { freed: 0, coming: want.min(4 * MB) }
+    });
+    *me.lock() = Some((mem.clone(), cache));
+    mem.cached(cache, 4 * MB);
+    let r = mem.request("r", plan("a")).unwrap();
+    let torch = Torch { allocated: 0, reserved: 4 * MB };
+    let pass = r.pass(a, "fwd", "1x8", torch).unwrap();
+    let pin = mem.bind(a, 0, 0).unwrap();
+    let free = ledger.status().free;
+    assert!(matches!(r.oom(Some(a), Some(free + MB), None, torch), Next::Retry));
+    let returning: u64 = ledger.status().rows.iter().map(|r| r.returning).sum();
+    me.lock().take();
+    assert_eq!(returning, 0, "the report inside the shrink is its last word: nothing is still coming");
+    drop((pin, pass));
+}

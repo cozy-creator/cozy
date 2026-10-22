@@ -23,6 +23,7 @@ use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Weak};
 
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
+use platform::contain::host_memory;
 use platform::handles::Owned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -161,7 +162,7 @@ pub(crate) struct Facts {
     /// hash, W): each family's child is admitted beside its own parents as if they were gone,
     /// never beside another family's (review 3, R4). Family 0: any, counted for every child.
     pub yielded: [(u64, u64); decide::YIELDED],
-    /// Its running requests' largest measured host high-water, and how many have none
+    /// Its running requests' largest measured anonymous host peak, and how many have none
     /// measured: the RAM tier keeps their growth free, and fills nothing beside an unmeasured one.
     pub host_peak: u64,
     pub host_unmeasured: u64,
@@ -841,24 +842,69 @@ impl Shared {
     }
 }
 
-/// A request's host high-water at `host/<package>|<shape>`: the larger stays.
+/// A request's anonymous host peak at `host/<package>|<shape>`: the larger stays.
 pub(crate) fn record_host(shared: &Shared, key: &str, bytes: u64) -> Result<()> {
     record_peak(shared, &format!("host/{key}"), bytes)
 }
 
-/// What the host must keep free for the requests running on this GPU: each live row's
-/// measured host high-water less its process's anonymous bytes now. `None`: a running request
-/// is unmeasured (the RAM tier fills nothing beside it).
-pub(crate) fn host_need(shared: &Shared) -> Option<u64> {
+/// A process running requests on a GPU, as the RAM tier's need reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostCall {
+    pub pid: u32,
+    /// The anonymous peak its running requests were measured to reach; `None`: one is unmeasured.
+    pub peak: Option<u64>,
+    /// Its anonymous bytes now.
+    pub anon: u64,
+    /// Its requests running now.
+    pub running: u64,
+}
+
+/// The processes running requests on this GPU; `None`: its table cannot be read.
+pub(crate) fn host_calls(shared: &Shared) -> Option<Vec<HostCall>> {
     let rows = shared.rows().ok()?;
-    let mut need = 0u64;
-    for r in rows.iter().filter(|r| r.live && r.facts.running > 0) {
-        if r.facts.host_unmeasured > 0 {
-            return None;
-        }
-        need = need.saturating_add(r.facts.host_peak.saturating_sub(os::anon(r.pid).unwrap_or(0)));
+    let calls = rows.iter().filter(|r| r.live && r.facts.running > 0).map(|r| HostCall {
+        pid: r.pid,
+        peak: (r.facts.host_unmeasured == 0).then_some(r.facts.host_peak),
+        anon: host_memory::resident(r.pid).map_or(0, |now| now.anon),
+        running: r.facts.running,
+    });
+    Some(calls.collect())
+}
+
+/// This process's anonymous peak while it runs requests. Linux keeps only a resident high-water
+/// (`VmHWM`), so each look bounds the anonymous peak since the last as that high-water less the
+/// smaller of its file bytes then and now and less its shmem bytes now (the RAM tier's layouts
+/// and host pages it maps: counted once, in the budget, never as need), then starts it over.
+pub(crate) struct Window {
+    peak: u64,
+    file: u64,
+}
+
+impl Window {
+    /// Measured from now; `None` where it cannot be read.
+    pub(crate) fn start() -> Option<Window> {
+        let now = host_memory::resident(std::process::id()).ok()?;
+        restart();
+        Some(Window { peak: now.anon, file: now.file })
     }
-    Some(need)
+
+    /// The anonymous peak so far; `None` where it cannot be read.
+    pub(crate) fn look(&mut self) -> Option<u64> {
+        let now = host_memory::resident(std::process::id()).ok()?;
+        let bound = now.peak.saturating_sub(self.file.min(now.file) + now.shmem);
+        self.peak = self.peak.max(bound).max(now.anon);
+        self.file = now.file;
+        restart();
+        Some(self.peak)
+    }
+}
+
+/// This process's resident high-water starts over (where it may not, the next look bounds from
+/// further back).
+fn restart() {
+    if let Err(e) = host_memory::reset_peak(std::process::id()) {
+        tracing::debug!("varena: host high-water not reset: {e}");
+    }
 }
 
 /// A request's compute room (beside its weights) at `compute/<package>|<shape>`: the latest
@@ -1262,7 +1308,7 @@ pub(crate) fn remotes(rows: &[RowView], own: u64) -> (Vec<Remote>, u64) {
             physical: r.facts.physical,
             caches: r.facts.caches,
             classes: r.facts.classes,
-            returning: if r.live { r.facts.returning.min(r.facts.classes.get(Class::P.index()).copied().unwrap_or(0)) } else { 0 },
+            returning: if r.live { r.facts.returning } else { 0 },
         })
         .collect();
     (others, orphans)
@@ -1317,6 +1363,8 @@ pub struct RowStatus {
     pub torch: u64,
     /// Bytes asked of it and not yet answered.
     pub asked: u64,
+    /// Bytes it is giving back: its retiring pages and its caches' queued shrinks.
+    pub returning: u64,
     /// Waiting for room: a request's wait on a child call ended and its room is not back yet.
     pub waiting: bool,
 }
@@ -1528,10 +1576,10 @@ impl Ledger {
         self.shared.clone()
     }
 
-    /// What the host must keep free for the requests running on this GPU (`None`: one is
-    /// unmeasured): TensorD's RAM tier sums its GPUs' ([`crate::Tier::serve`]).
-    pub fn host_need(&self) -> Option<u64> {
-        host_need(&self.shared)
+    /// The processes running requests on this GPU, as the RAM tier's need reads them
+    /// ([`crate::tier::need`]); `None`: its table cannot be read.
+    pub fn host_calls(&self) -> Option<Vec<HostCall>> {
+        host_calls(&self.shared)
     }
 
     /// Names the `<package>|<shape>` a request's peak is recorded under, before it runs. The
@@ -1608,7 +1656,7 @@ impl Ledger {
             foreign,
             rows: rows
                 .iter()
-                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, torch: r.facts.torch, asked: asked_of(&rows, r.id()), waiting: r.waiting })
+                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, torch: r.facts.torch, asked: asked_of(&rows, r.id()), returning: r.facts.returning, waiting: r.waiting })
                 .collect(),
             dispatched: dispatched.into_iter().map(|(k, v)| (k.trim_start_matches("dispatch/").to_string(), String::from_utf8_lossy(&v).into_owned())).collect(),
         }

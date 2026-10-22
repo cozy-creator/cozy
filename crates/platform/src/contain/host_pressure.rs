@@ -1,15 +1,14 @@
-//! The host asks for memory back (MEM/HOST-PRESSURE.md). One thread blocks in poll() with no
-//! timeout on what the kernel lets this process watch: a PSI trigger (`shared`: the system's
-//! `some` stall, anyone's; `dedicated`: this cgroup's `full`, else the system's) and inotify on
-//! `memory.events` of every limited cgroup v2 on its path, whose counters change as a limit is
-//! reached (containers deny PSI triggers, not inotify). Cgroup v1 has neither: system `some` wakes
-//! the watcher and only a rise of a limited cgroup's `memory.failcnt` counts. A wakeup only says
-//! "look": rungs go back while the live budget is below what must stay free (each live call's
-//! measured growth still to come, and [`Growth`]), so benign reclaim at a limit, which a pod
-//! counts 100k times, gives nothing back.
+//! The host asks for memory back (`tensord::host_tier`). One thread blocks in poll() with no
+//! timeout on whatever this process may watch: a PSI trigger (`shared`: the system's `some`
+//! stall, anyone's; `dedicated`: this cgroup's `full`, else the system's `some`), inotify on the
+//! `memory.events` of each limited cgroup v2 on its path that it can watch (containers deny PSI
+//! triggers, not inotify), and a [`Nudge`]: TensorD's own events (a call begins, an executor
+//! frame arrives), which are the only wakeups where the kernel allows none (cgroup v1 with PSI
+//! denied). A wakeup only says "look": rungs go back while the live budget is below what must
+//! stay free, so benign reclaim at a limit, which a pod counts 100k times, gives nothing back.
 use super::host_memory::HostMemory;
 use serde::Deserialize;
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 /// How the machine shares its host (`host.mode` in the GPU config): a guest on someone's
 /// computer (the default), or the whole of a rented pod (its image or grant says so).
@@ -26,27 +25,33 @@ pub enum HostMode {
 /// "something stalled on memory in the last window".
 pub const WINDOW: Duration = Duration::from_secs(2);
 
-/// The most non-reclaimable bytes, shared memory aside, grew between two consecutive looks: what
-/// can arrive before the watcher answers, so it stays free. Shared memory is the host tier itself
-/// (sealed layouts), whose fill is admitted, never answered. A high-water; a look against
-/// another bound (the tightest limit changed) starts over from it.
+/// The most the live calls grew their anonymous bytes beyond what was measured to come, between
+/// two looks: what can arrive before the next look answers, so it stays free. An unmeasured
+/// call's every byte is unforeseen, a measured one's only past its peak. Sealed layouts and page
+/// cache are no part of it (a layout's fill is admitted, never answered; clean cache is room).
+/// Each call that ends measured settles it: what was seen since the last one stays, the rest
+/// halves.
 #[derive(Debug, Default)]
 pub struct Growth {
-    last: Option<HostMemory>,
+    last: BTreeMap<String, u64>,
     most: u64,
+    seen: u64,
 }
 
 impl Growth {
-    pub fn observe(&mut self, host: HostMemory) -> u64 {
-        if host.available < 0 || host.bound <= 0 {
-            return self.most;
-        }
-        if let Some(last) = self.last.filter(|last| last.bound == host.bound) {
-            let grew = (last.available - host.available) - (host.shmem - last.shmem);
-            self.most = self.most.max(grew.max(0) as u64);
-        }
-        self.last = Some(host);
+    /// Each live call's unforeseen anonymous bytes now; a call first seen has grown nothing.
+    pub fn observe(&mut self, unforeseen: BTreeMap<String, u64>) -> u64 {
+        let grew = unforeseen.iter().filter_map(|(call, now)| Some(now.saturating_sub(*self.last.get(call)?))).sum();
+        self.seen = self.seen.max(grew);
+        self.most = self.most.max(grew);
+        self.last = unforeseen;
         self.most
+    }
+
+    /// A call ended measured.
+    pub fn settle(&mut self) {
+        self.most = self.seen + (self.most - self.seen) / 2;
+        self.seen = 0;
     }
 
     pub fn most(&self) -> u64 {
@@ -87,4 +92,4 @@ pub fn others(host: &HostMemory, total: u64, ours: u64) -> Option<u64> {
 #[cfg_attr(not(target_os = "linux"), path = "host_pressure_unsupported.rs")]
 mod trigger;
 
-pub use trigger::Pressure;
+pub use trigger::{Nudge, Pressure};

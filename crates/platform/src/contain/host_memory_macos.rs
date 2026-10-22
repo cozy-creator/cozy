@@ -29,7 +29,7 @@ pub(super) fn read() -> HostMemory {
     }
 }
 
-pub(super) fn anon(_: u32) -> io::Result<super::Anon> {
+pub(super) fn resident(_: u32) -> io::Result<super::Resident> {
     Err(io::ErrorKind::Unsupported.into())
 }
 

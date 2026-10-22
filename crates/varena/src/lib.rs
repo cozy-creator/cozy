@@ -23,10 +23,10 @@ pub mod tier;
 
 pub use backend::{Access, Backend, Event, HostBackend, Physical, Va};
 pub use cuda::CudaBackend;
-pub use ledger::{Grant, Ledger, Peak, PhysicalChange, Room, RowStatus, Status};
-pub use memory::{CacheId, Decision, HoldId, Shrunk, Fills, Measured, Memory, Moved, Next, Origin, Pass, Pin, Ref, Request, Retained, SetId, Site, SitePeak, Stats, StepStats, Torch, Unregisters, Workspace, Yielded};
+pub use ledger::{Grant, HostCall, Ledger, Peak, PhysicalChange, Room, RowStatus, Status};
+pub use memory::{CacheId, Decision, Fills, HoldId, Measured, Memory, Moved, Next, Origin, Pass, Pin, Ref, Request, Retained, SetId, Shrunk, Site, SitePeak, Stats, StepStats, Torch, Unregisters, Workspace, Yielded};
 pub use table::{Fill, Fingerprint, Level, PartId, Plan, SetSpec, Step};
-pub use tier::{Need, Pressure, Tier};
+pub use tier::{Need, Tier};
 
 use thiserror::Error;
 
