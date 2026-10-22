@@ -1603,6 +1603,7 @@ fn an_unmeasured_pass_takes_idle_kept_pages_before_it_runs() {
 /// pages (unpinned, no release pending), each contiguous run of a set in one call; a page in use
 /// stays due (Stats' keep_pending) and is kept at its first idle moment; a bind that meets a
 /// protect in flight gets its pin only after it.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     let dir = tempfile::tempdir().unwrap();

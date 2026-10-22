@@ -490,6 +490,7 @@ fn a_set_goes_where_it_fits_and_stays_on_gpu_0_when_it_can() {
 }
 
 /// A one-region set of `fill` (stored bytes 7).
+#[cfg(target_os = "linux")]
 fn one(dir: &Path, uuid: &str, name: &str, fill: Fill) -> SetSpec {
     let mut spec = set(dir, name, 1, uuid);
     std::fs::write(dir.join(format!("{name}.bin")), vec![7u8; REGION_ALIGN as usize]).unwrap();
@@ -500,6 +501,7 @@ fn one(dir: &Path, uuid: &str, name: &str, fill: Fill) -> SetSpec {
 /// One page of room: binds `set`'s block in its own request (after `other` took the page),
 /// bakes it to `bake` when it comes back fresh, and returns (fresh, its first byte). Its
 /// requests are measured calls (a host peak recorded), so the RAM tier takes their copies.
+#[cfg(target_os = "linux")]
 fn rebind(ledger: &varena::Ledger, mem: &Memory, set: varena::SetId, other: varena::SetId, bake: u8) -> (bool, u8) {
     ledger.restore(&[varena::Peak::Host { key: "pkg|1x1".into(), bytes: 0 }]).unwrap();
     ledger.dispatch("other", "pkg", "1x1").unwrap();

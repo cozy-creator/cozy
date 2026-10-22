@@ -1642,9 +1642,9 @@ print('dirty',flush=True);sys.stdin.read()
             let first = filled(&client, "first", "departed-user");
             let second = filled(&client, "second", "departed-user");
             files.lock().extend([(os::reopen(&first.fd, true).unwrap(), first.data), (os::reopen(&second.fd, true).unwrap(), second.data)]);
-            let event = os::event().unwrap();
-            tier.watch(Pressure::Events(os::dup(&event).unwrap()), need).unwrap();
-            os::signal(&event); // Exactly one external pressure event.
+            let (event, signal) = os::event().unwrap();
+            tier.watch(Pressure::Events(event), need).unwrap();
+            os::signal(&signal); // Exactly one external pressure event.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let (lock, changed) = &*tier.state;
             let mut state = lock.lock();
