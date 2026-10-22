@@ -314,7 +314,9 @@ jobs:
   # Every platform and the sdist, or nothing.
   publish:
     if: inputs.publish && !inputs.dev
-    needs: [gate, pull, store, import, e2e, wheel, install, sdist]
+    # Tests (pull, store, import, e2e) run beside a release but never gate it (owner, 10-21): it builds,
+    # installs, publishes, and a smoke follows.
+    needs: [gate, wheel, install, sdist]
     runs-on: ubuntu-24.04
     environment: pypi
     # Hang bound, not a work budget.
