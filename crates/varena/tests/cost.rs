@@ -1,6 +1,8 @@
 //! What varena itself costs per page, over host pages whose copies are small (each region
 //! carries 4 KiB from the store; the rest is zeroed): a cold load of many pages, and binds that
 //! each evict.
+//! Unix: the store is TensorFS's sources.
+#![cfg(unix)]
 
 use std::fs::File;
 use std::path::Path;
