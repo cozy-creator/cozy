@@ -22,6 +22,15 @@ pub(super) struct Streaming {
     pub(super) req: Option<u64>,
 }
 
+/// What [`Inner::stream`] took: pages unmapped now, and pages whose pending release events (`events`) the caller
+/// waits on before a later round takes them.
+#[derive(Default)]
+pub(super) struct Streamed {
+    pub(super) unmapped: u64,
+    pub(super) pending: u64,
+    pub(super) events: Vec<u64>,
+}
+
 /// What [`Inner::stream_in`] did for a bind.
 pub(super) enum StreamIn {
     /// A slot moves to the block: it has a page now, filling.
@@ -50,36 +59,46 @@ impl State {
 }
 
 impl Inner {
-    /// `make_room`'s rung before the running set's own pages. It lowers `set`'s watermark until unmapping the upper
-    /// pages frees `want`, or the whole set streams. It keeps the [`SLOTS`] most recently used of them as slots, and
-    /// unmaps custody's ones: a slot's memory is overwritten next. Returns the bytes freed.
-    pub(super) fn stream(&self, st: &mut State, set: u32, want: u64, req: Option<u64>) -> Result<u64> {
+    /// `make_room`'s rung before the running set's own pages. It lowers `set`'s watermark until the upper pages free
+    /// `want` (unmapped now, or once their pending release events complete: `events`, waited on by the caller with
+    /// no lock held), or until the whole set streams. It keeps the [`SLOTS`] most recently used upper pages that are
+    /// not custody's as slots, since a slot's memory is overwritten next. The hook (`hook`) never takes a kept page:
+    /// it makes no custody call.
+    pub(super) fn stream(&self, st: &mut State, set: u32, want: u64, req: Option<u64>, hook: bool) -> Result<Streamed> {
         let blocks = st.mech(set)?.spec.layout.regions.len() as u32;
         let mut watermark = st.streams.get(&set).map_or(blocks, |s| s.watermark);
-        let mut freed = 0;
+        let mut taken = Streamed::default();
         loop {
             let mut upper: Vec<Key> = st.homes.keys().filter(|k| k.0 == set && k.1 >= watermark).copied().collect();
             upper.sort_by_key(|k| Reverse(st.last_use(*k)));
             let slots: Vec<Key> = upper.iter().filter(|k| st.slot(**k, watermark)).take(SLOTS).copied().collect();
             for key in upper.into_iter().filter(|k| !slots.contains(k)) {
-                if freed >= want {
+                if taken.unmapped + taken.pending >= want {
                     break;
                 }
-                // A page in use stays until its release: the next round takes it.
-                if st.table.page(key).is_some_and(|p| !p.pins.is_empty()) || st.homes.get(&key).is_some_and(|h| h.filling || h.transforming || h.protecting) {
+                let Some(page) = st.table.page(key) else { continue };
+                // A page in use stays until its release; the hook leaves custody's pages alone.
+                let busy = !page.pins.is_empty() || st.homes.get(&key).is_some_and(|h| h.filling || h.transforming || h.protecting);
+                if busy || (hook && page.kept) {
                     continue;
                 }
-                let span = st.place(key)?.2;
-                self.unmap(st, key, Class::W, req, true)?;
-                freed += span;
+                let (releasing, span) = (page.releasing.clone(), page.bytes);
+                if !releasing.is_empty() {
+                    // Taken in a later round, once its consumers are done.
+                    taken.events.extend(releasing);
+                    taken.pending += span;
+                    continue;
+                }
+                self.unmap(st, key, Class::W, req, !hook)?;
+                taken.unmapped += span;
             }
-            if freed >= want || watermark == 0 {
+            if taken.unmapped + taken.pending >= want || watermark == 0 {
                 break;
             }
             watermark -= 1;
         }
         st.streams.insert(set, Streaming { watermark, req });
-        Ok(freed)
+        Ok(taken)
     }
 
     /// A streamed set's upper block with no page: the least recently used movable slot of its set moves to it, after

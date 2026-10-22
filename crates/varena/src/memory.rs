@@ -2220,9 +2220,22 @@ impl Inner {
             }
             let mut want = bytes - free;
             let (mut unmapped, mut withdrawn, mut events, mut shrinks) = (0, false, vec![], vec![]);
+            let mut streamed = HashSet::new();
             for v in decide::victims(&st.table, keep) {
                 if want == 0 {
                     break;
+                }
+                // Step 2: a running set's own pages are not evicted one by one; the set streams its upper blocks
+                // through slots instead, once per round, and its other pages stay.
+                if let Victim::Page { key, .. } = &v {
+                    if st.table.distance(*key).is_some_and(|d| d.0 == 0) {
+                        if streamed.insert(key.0) {
+                            let taken = self.stream(&mut st, key.0, want, req, hook)?;
+                            (unmapped, want) = (unmapped + taken.unmapped, want.saturating_sub(taken.unmapped + taken.pending));
+                            events.extend(taken.events);
+                        }
+                        continue;
+                    }
                 }
                 let kept = |key: Key| st.table.page(key).is_some_and(|p| p.kept);
                 match v {
