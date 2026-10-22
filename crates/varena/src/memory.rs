@@ -361,6 +361,25 @@ pub struct Stats {
     /// Bytes due to be kept (read-only, exported to custody) and not kept yet: pages not idle
     /// (unpinned, no release pending) since their fill. Each is kept at its first idle moment.
     pub keep_pending: u64,
+    /// RAM-tier host ranges unlocked while it ran: each unlock stalls the device until idle.
+    pub unregisters: Unregisters,
+}
+
+/// Host ranges unlocked for the RAM tier (`cuMemHostUnregister`, which synchronizes the device).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Unregisters {
+    pub calls: u32,
+    pub bytes: u64,
+    /// The longest one.
+    pub max_ns: u64,
+}
+
+impl Unregisters {
+    fn add(&mut self, other: &Unregisters) {
+        self.calls += other.calls;
+        self.bytes += other.bytes;
+        self.max_ns = self.max_ns.max(other.max_ns);
+    }
 }
 
 /// An op site that ran short, as `oom` names it.
@@ -662,8 +681,6 @@ enum Call {
     Use { digest: String, distance: Option<u32> },
     /// A layout this process holds, handed to a tier that may not know it (a restarted one).
     Readopt { digest: String, regions: Vec<(u64, u64)>, ask: String, file: Owned },
-    /// A closing set's tier regions are unlocked, off the state lock.
-    Unpin(Arc<tier::Held>),
     Close { digest: String },
 }
 
@@ -753,6 +770,10 @@ struct State {
     /// Pages whose Keep is due ([`Home::keeping`]), and sets with a Keep queued.
     keep_due: BTreeSet<Key>,
     keep_queued: BTreeSet<u32>,
+    /// Layouts of closed sets (or of a fill identity left behind), still held and page-locked
+    /// by digest: unlocking stalls the device, so it waits for the tier to take one back (or
+    /// the process to end), and a set opening it again reuses it.
+    parked: HashMap<String, Arc<tier::Held>>,
 }
 
 impl State {
@@ -1394,7 +1415,7 @@ impl Inner {
     fn post(&self, call: Call) {
         match call {
             Call::Export { .. } | Call::Withdraw { .. } | Call::Disown { .. } => self.to_custody.post(call, 0),
-            Call::Use { .. } | Call::Readopt { .. } | Call::Unpin(_) | Call::Close { .. } => self.to_tier.post(call, 0),
+            Call::Use { .. } | Call::Readopt { .. } | Call::Close { .. } => self.to_tier.post(call, 0),
         };
     }
 
@@ -1574,7 +1595,9 @@ impl Inner {
                 .sets
                 .iter()
                 .flatten()
-                .filter_map(|m| m.held.as_ref().and_then(|h| h.handover().ok()).map(|(file, regions)| Call::Readopt { digest: m.tier.clone(), regions, ask: ask.clone(), file }))
+                .filter_map(|m| m.held.as_ref().map(|h| (&m.tier, h)))
+                .chain(st.parked.iter())
+                .filter_map(|(digest, h)| h.handover().ok().map(|(file, regions)| Call::Readopt { digest: digest.clone(), regions, ask: ask.clone(), file }))
                 .collect();
             held.into_iter().for_each(|c| self.post(c));
         }
@@ -1609,20 +1632,29 @@ impl Inner {
         m.spec.fingerprint.fill = fill;
         // The tier holds bytes by identity: another identity's layout is another layout.
         let tier = tier_name(&m.spec);
+        let declared = m.spec.fingerprint.declared();
         if tier != m.tier {
             let (old, held) = (std::mem::replace(&mut m.tier, tier), m.held.take());
-            if let Some(held) = held {
-                self.post(Call::Unpin(held));
-            }
-            self.post(Call::Close { digest: old });
+            self.park(st, old, held);
         }
-        let declared = m.spec.fingerprint.declared();
         if let Some(Some(s)) = st.table.sets.get_mut(set as usize) {
             s.declared = declared;
         }
         self.drop_stale(st);
         self.publish(st);
         Ok(())
+    }
+
+    /// A layout this process stops using: still held (and page-locked) with no declared use,
+    /// for the tier to take back when it needs the room; one never mapped is closed.
+    fn park(&self, st: &mut State, digest: String, held: Option<Arc<tier::Held>>) {
+        match held {
+            Some(held) => {
+                self.post(Call::Use { digest: digest.clone(), distance: None });
+                st.parked.insert(digest, held);
+            }
+            None => self.post(Call::Close { digest }),
+        }
     }
 
     /// Unmaps the unpinned pages of closing sets; a set goes once it has none. Its slot stays
@@ -1642,10 +1674,7 @@ impl Inner {
             }
             if let Some(m) = st.sets.get_mut(set as usize).and_then(Option::take) {
                 self.mech.post(Mech::Release(m.va), 0);
-                if let Some(held) = m.held {
-                    self.post(Call::Unpin(held));
-                }
-                self.post(Call::Close { digest: m.tier.clone() });
+                self.park(st, m.tier, m.held);
             }
             if let Some(slot) = st.table.sets.get_mut(set as usize) {
                 *slot = None;
@@ -2690,8 +2719,15 @@ impl Inner {
             l
         };
         let Some((layout, name)) = layout else { return Ok(()) };
-        let regions: Vec<(u64, u64)> = layout.regions.iter().map(|r| (r.offset, r.span)).collect();
-        let held = tier.open_layout(&name, regions, &self.row.ask_name()).map_err(|e| tracing::warn!("varena: tier: {e}")).ok().map(Arc::new);
+        // A layout it parked is still its own, page-locked: no new mapping or lock.
+        let parked = self.state.lock().parked.remove(&name);
+        let held = match parked {
+            Some(held) => Some(held),
+            None => {
+                let regions: Vec<(u64, u64)> = layout.regions.iter().map(|r| (r.offset, r.span)).collect();
+                tier.open_layout(&name, regions, &self.row.ask_name()).map_err(|e| tracing::warn!("varena: tier: {e}")).ok().map(Arc::new)
+            }
+        };
         let mut st = self.lock();
         if let Some(Some(m)) = st.sets.get_mut(set as usize) {
             if m.held.is_none() {
@@ -3395,11 +3431,36 @@ impl Inner {
     /// The RAM tier wants layout `digest` back: its regions are unlocked (one being read when
     /// its copy ends) and its mapping goes with the last fill holding it. Rust only, at once.
     fn release_tier(&self, digest: &str) -> u64 {
-        let held: Vec<Arc<tier::Held>> = {
+        let (held, parked) = {
             let mut st = self.state.lock();
-            st.sets.iter_mut().flatten().filter(|m| m.tier == digest).filter_map(|m| m.held.take()).collect()
+            let held: Vec<Arc<tier::Held>> = st.sets.iter_mut().flatten().filter(|m| m.tier == digest).filter_map(|m| m.held.take()).collect();
+            (held, st.parked.remove(digest))
         };
-        held.iter().map(|h| h.release(|p| self.backend.unregister_host(p))).sum()
+        // Each unlock stalls the device until it is idle: counted, and timed, for the requests
+        // running meanwhile. No lock of the Memory's is held across it.
+        let mut stalls = Unregisters::default();
+        let mut unregister = |p| {
+            let start = Instant::now();
+            let out = self.backend.unregister_host(p);
+            stalls.calls += 1;
+            stalls.max_ns = stalls.max_ns.max(start.elapsed().as_nanos() as u64);
+            out
+        };
+        let bytes: u64 = held.iter().chain(&parked).map(|h| h.release(&mut unregister)).sum();
+        if parked.is_some() {
+            self.post(Call::Close { digest: digest.to_string() });
+        }
+        if stalls.calls > 0 {
+            stalls.bytes = bytes;
+            let mut st = self.state.lock();
+            let running: Vec<u64> = st.table.requests.iter().map(|r| r.id).collect();
+            for r in running {
+                if let Some(s) = st.stats(Some(r)) {
+                    s.unregisters.add(&stalls);
+                }
+            }
+        }
+        bytes
     }
 
     /// The trim thread's work: the trim hook and shrinks an ask wanted, then a ledger event.
@@ -3608,12 +3669,16 @@ impl Drop for Inner {
             let _ = self.backend.destroy(phys);
         }
         let sets: Vec<SetMech> = st.sets.drain(..).flatten().collect();
+        let parked: Vec<Arc<tier::Held>> = st.parked.drain().map(|(_, h)| h).collect();
         drop(st);
         for m in sets {
             self.backend.release(m.va);
             if let Some(held) = &m.held {
                 held.unpin(|p| self.backend.unregister_host(p));
             }
+        }
+        for held in parked {
+            held.unpin(|p| self.backend.unregister_host(p));
         }
     }
 }
@@ -3716,12 +3781,6 @@ fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Opt
             Call::Disown { fp, page } => custody.map(|c| c.disown(&fp, page)),
             Call::Use { digest, distance } => tier.map(|t| t.use_layout(&digest, distance)),
             Call::Readopt { digest, regions, ask, file } => tier.map(|t| t.adopt_layout(&digest, regions, &ask, file)),
-            Call::Unpin(held) => {
-                if let Some(me) = Work::of(inner) {
-                    held.unpin(|p| me.backend.unregister_host(p));
-                }
-                None
-            }
             Call::Close { digest } => tier.map(|t| t.close(&digest)),
         };
         if bytes > 0 && !matches!(result, Some(Ok(()))) {
