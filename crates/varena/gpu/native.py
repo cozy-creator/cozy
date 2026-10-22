@@ -44,6 +44,10 @@ STEP = re.compile(r"STEP \d+ (\d+)")
 CANCEL = 1.0
 # The run log keeps a message's first 200 characters: longer lines go in pieces of this size.
 PIECE = 180
+# The run log keeps 512 lines: each case's failure tail gets an equal share of them.
+LOG_LINES = 512
+# libtest's own lines in a failure's tail, which say nothing of the failure.
+HARNESS = re.compile(r"^(running \d+ tests?|failures:|test result: .*|note: run with .*|FAILED|    \w+|\s*)$")
 
 
 def group_io(group: int) -> int:
@@ -113,6 +117,15 @@ def longest_step(text: str, took: float) -> float | None:
 
 def pieces(line: str) -> list[str]:
     return [line[at:at + PIECE] for at in range(0, max(len(line), 1), PIECE)]
+
+
+def tail(text: str, lines: int) -> list[str]:
+    """A failure's last `lines` log pieces: the case's own lines but its steps, then its last step. A long line keeps
+    its first and last piece."""
+    own = [l for l in text.splitlines() if not STEP.search(l) and not HARNESS.match(l)]
+    last = [l for l in text.splitlines() if STEP.search(l)][-1:]
+    cut = [p for l in own for p in (pieces(l) if len(l) <= 2 * PIECE else [pieces(l)[0], "… " + pieces(l)[-1]])]
+    return cut[-max(lines - len(last), 0):] + last if lines > len(last) else last
 
 
 def run_case(program: Path, case: str, log: Path, interval: float | None, monitor: Monitor, cancelled, say) -> tuple[int, str | None]:
@@ -207,14 +220,10 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
         verdict = "PASS" if ok else (end or "FAIL").upper()
         ctx.log(f"{verdict} {case} in {took[case]} s, longest step {longest[case]} s", level="warn" if ok else "error")
         if not ok:
-            # The run log reaches the caller even when a cancelled run's outputs do not: the tail
-            # goes line by line, the steps but the last left out.
-            lines = text.splitlines()
-            stepped = [l for l in lines if STEP.search(l)]
-            tail = [l for l in lines if not STEP.search(l)][-40:] + stepped[-1:]
-            for line in tail:
-                for piece in pieces(line):
-                    ctx.log(f"TAIL {case[:40]}: {piece}", level="error")
+            # The run log reaches the caller even when a cancelled run's outputs do not; a case's start and verdict
+            # take two lines of its share.
+            for piece in tail(text, LOG_LINES // len(cases) - 2):
+                ctx.log(f"TAIL {case[:40]}: {piece}", level="error")
     monitor.close()
     result = {"label": label, "cases": cases, "passed": passed, "failed": failed, "ended": ended, "unjudged": unjudged,
               "seconds": took, "steps": {c: s for c, s in longest.items() if s}, "gpus": sorted(gpus),

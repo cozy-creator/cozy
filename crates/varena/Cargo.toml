@@ -27,6 +27,7 @@ faults = []
 [dev-dependencies]
 varena = { path = ".", features = ["faults"] }
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 # Its own harness: the child processes are this binary (`processes child`), roles in argv.
 [[test]]

@@ -27,11 +27,13 @@ const HANDLES_SUPPORTED: c_int = cuda::ATTR_WIN32_HANDLE_SUPPORTED;
 
 /// One driver call; the caller has the context entered.
 macro_rules! call {
-    ($op:literal, $f:ident($($arg:expr),* $(,)?)) => {
+    ($op:literal, $f:ident($($arg:expr),* $(,)?)) => {{
+        // Each driver call is a trace span of its name: a subscriber can time every one.
+        let _call = tracing::trace_span!($op).entered();
         // SAFETY: the documented driver ABI, on live handles of this backend's context; every
         // out-param points at a live local.
         cuda::check($op, unsafe { (cuda::driver()?.$f)($($arg),*) })
-    };
+    }};
 }
 
 /// This process's reference on the device's primary context.
@@ -383,6 +385,7 @@ impl Backend for CudaBackend {
             return Ok(true);
         }
         let _ctx = self.primary.enter()?;
+        let _call = tracing::trace_span!("cuEventQuery").entered();
         // SAFETY: a live event of this context.
         match unsafe { (cuda::driver()?.event_query)(raw(event)) } {
             cuda::SUCCESS => Ok(true),
