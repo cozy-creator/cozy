@@ -63,10 +63,13 @@ fn selected(plan: &str, distribution: &str, version: &str) -> io::Result<Artifac
     let parsed: Plan = toml::from_str(plan).map_err(io::Error::other)?;
     let mut packages = parsed.packages.into_iter().filter(|p| p.name.replace('_', "-") == distribution);
     let package = packages.next().ok_or_else(|| io::Error::other("the resolver omitted the requested wheel"))?;
-    if packages.next().is_some() || package.version != version || package.wheels.len() != 1 {
+    if packages.next().is_some() || package.version != version {
         return Err(io::Error::other("the resolver returned ambiguous or different SDK wheels"));
     }
-    let wheel = package.wheels.into_iter().next().ok_or_else(|| io::Error::other("no host wheel"))?;
+    // uv lists every wheel this Python and host install (a Runtime's built one and its pure
+    // one); a built wheel is the one uv itself installs over a pure one.
+    let wheel = package.wheels.into_iter().min_by_key(|w| w.url.ends_with("-none-any.whl"))
+        .ok_or_else(|| io::Error::other("no host wheel"))?;
     if !wheel.filename()?.starts_with(&format!("{}-{version}-", distribution.replace('-', "_"))) {
         return Err(io::Error::other("the selected filename differs from its package/version"));
     }
@@ -170,7 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selected_plan_must_identify_one_exact_wheel() {
+    fn selected_plan_must_identify_one_exact_wheel_built_before_pure() {
         let plan = format!(r#"
 [[packages]]
 name = "tensorfs"
@@ -182,6 +185,10 @@ wheels = [{{url = "https://files.pythonhosted.org/tensorfs-0.13.5-cp311-abi3-man
         assert!(selected(&format!("{plan}\n{plan}"), "tensorfs", "0.13.5").is_err());
         assert!(selected(&plan.replace("tensorfs-0.13.5", "tensorfs-0.13.4"), "tensorfs", "0.13.5").is_err());
         assert!(selected(&plan.replace(&"1".repeat(64), "invalid"), "tensorfs", "0.13.5").is_err());
+        let pure = format!(r#"{{url = "https://files.pythonhosted.org/tensorfs-0.13.5-py3-none-any.whl", hashes = {{sha256 = "{}"}}}}"#, "2".repeat(64));
+        for both in [plan.replace("wheels = [", &format!("wheels = [{pure}, ")), plan.replace("}}]", &format!("}}}}, {pure}]"))] {
+            assert!(selected(&both, "tensorfs", "0.13.5").unwrap().filename().unwrap().contains("cp311-abi3"), "{both}");
+        }
     }
 
     /// PyPI lists TensorFS 0.13.5's cp310-only wheel first; an executor on 3.12 gets the abi3

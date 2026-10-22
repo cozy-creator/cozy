@@ -1865,6 +1865,37 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A published pair named by version (the Hub's target, run 13435) is resolved by uv for the
+    /// executors' Python, fetched, checked together and selected: Runtime 0.30.6 lists a built
+    /// and a pure wheel, and the built one is staged. Real PyPI, uv and downloads.
+    #[test]
+    fn a_published_pair_by_version_is_fetched_and_selected() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::new(&root.path().join("engine"), root.path());
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        let store = Arc::new(tensorfs::store::Store::open(root.path().join("store")).unwrap());
+        let machine = crate::origin::Machine::new(store, None).unwrap();
+        let updates = Updates::open(paths.clone(), "3.12".into(), Box::new(|| true), None, Some(machine)).unwrap();
+        let published = |version: &str| Some(Choice { version: version.into(), ..Default::default() });
+        let request = Request { operation: "u1".into(), pin: None, runtime: published("0.30.6"), tensorfs: published("0.13.8"),
+            cozy: None, binary: None, gpu_memory_limit: None, toolchain: false };
+        updates.request(request, |_| {}).unwrap();
+        let status = loop {
+            match updates.update("u1").unwrap() {
+                status if status.terminal() || status.state == "starting" => break status,
+                _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        };
+        assert_eq!((status.state.as_str(), status.to.runtime.as_str(), status.to.tensorfs.as_str()), ("starting", "0.30.6", "0.13.8"), "{}", status.error);
+        let mut selected: Vec<String> = fs::read_dir(paths.current_sdk_link()).unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| n.ends_with(".whl")).collect();
+        selected.sort();
+        assert!(selected.len() == 2 && selected[0].starts_with("cozy_runtime-0.30.6-cp312-abi3-")
+            && selected[1].starts_with("tensorfs-0.13.8-"), "{selected:?}");
+    }
+
     /// A Runtime named alone whose TensorFS neither the machine's nor any over the index meets
     /// fails naming `--tensorfs-wheel`, and selects nothing.
     #[test]
