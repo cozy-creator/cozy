@@ -522,6 +522,12 @@ impl PyRetained {
         detached(py, &self.gpu, || Ok(r.is_some_and(|r| r.valid())))
     }
 
+    /// Every block mapped and filled now: a read (no pin, no fill, no room made).
+    fn resident(&self, py: Python<'_>) -> PyResult<bool> {
+        let r = lock(&self.retained).clone();
+        detached(py, &self.gpu, || Ok(r.is_some_and(|r| r.resident())))
+    }
+
     #[pyo3(signature = (stream = 0, request = None))]
     fn prepare(&self, py: Python<'_>, stream: usize, request: Option<PyRef<'_, PyRequest>>) -> PyResult<Vec<PyPin>> {
         let r = lock(&self.retained).clone().ok_or_else(|| error(py, &self.gpu, Error::Closed("retained range".into())))?;
