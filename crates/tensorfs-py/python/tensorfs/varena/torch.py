@@ -195,6 +195,8 @@ class _Pass:
     #: torch's allocated bytes, and its allocator's churn counters, at its start
     start: int = 0
     churned: dict[str, int] = field(default_factory=dict)
+    #: torch's reserved bytes at its start (its cache from earlier passes included)
+    reserved_start: int = 0
     peak: int = 0
     reserved_peak: int = 0
     #: each cut site's allocated peak, whether it is a collective's, and its finest level
@@ -685,7 +687,7 @@ class Memory:
                 model.identity = identity
             self.native.fill(model.id, _fill(model.fill))
             allocated, reserved = self.torch.now()
-            p = _Pass(r.native.pass_(model.id, entry, shape, allocated, reserved), r, model.id, entry, shape, allocated, self.torch.churn())
+            p = _Pass(r.native.pass_(model.id, entry, shape, allocated, reserved), r, model.id, entry, shape, allocated, self.torch.churn(), reserved)
             growth, slack = model.rooms.get((entry, shape), (0, 0))
             self._cap(allocated + growth + slack if growth or slack else 0, start=True)
             if self.pool is not None and self.pooling and not (self.cuda and torch.cuda.is_current_stream_capturing()):  # capture owns its exact pool
@@ -730,7 +732,9 @@ class Memory:
         if sys.exc_info()[1] is not p.entered:
             return  # torch runs this hook in its handler of the forward's raise: unended, it records nothing
         sites = [(name, *site) for name, site in p.sites.items()]
-        slack, now = max(p.reserved_peak - p.peak, 0), self.torch.churn()
+        # The pass's own slack: its reserved growth beyond its allocated growth (the cache that
+        # earlier passes left is theirs, not this pass's room).
+        slack, now = max((p.reserved_peak - p.reserved_start) - (p.peak - p.start), 0), self.torch.churn()
         churn = {k: now[k] - p.churned.get(k, 0) for k in now}
         for k, n in churn.items():
             p.request.churn[k] = p.request.churn.get(k, 0) + n
