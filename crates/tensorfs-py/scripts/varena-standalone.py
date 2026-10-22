@@ -380,7 +380,11 @@ def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> 
     """On host pages (the same bytes, the same kernels), a warm forward through the adapter costs
     at most 10% more CPU than the plain model's. Its own table and model, every block a hit;
     the best of several tries each, interleaved, so the shared machine's load is not the
-    measurement."""
+    measurement. On one torch thread: torch's idle workers spin while the main thread runs
+    Python, so with N workers the adapter's own time counts up to N+1 times, and the ratio would
+    follow the machine's core count, not the adapter."""
+    threads_before = torch.get_num_threads()
+    torch.set_num_threads(1)
     mem = opened(f"{tag}-overhead", 1 << 31)
     unet = loaded(ck, mem)
     x, text = inputs(torch.device("cpu"), 0)
@@ -412,6 +416,7 @@ def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> 
                 where[i][tid] = (name, where[i].get(tid, (name, 0.0))[1] + cpu - before.get(tid, (name, 0.0))[1])
     costs(mem, unet)
     ratio = best[1] / best[0]
+    torch.set_num_threads(threads_before)
     print(f"OVERHEAD best CPU ms: plain {1e3 * best[0]:.1f}, served {1e3 * best[1]:.1f}; all 11 runs' CPU ms by thread: "
           f"plain {cpu_by_thread({}, where[0])}; served {cpu_by_thread({}, where[1])}", flush=True)
     check(f"overhead: a warm forward through the adapter costs {100 * (ratio - 1):+.1f}% CPU over plain (at most +10%)", ratio <= 1.10 and origins == {"hit"}, (best, origins))
