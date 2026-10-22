@@ -747,7 +747,11 @@ that repository's index, including a process loss after PUT but before COMMIT. I
 is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8`; the response has `release`,
 `commit`, `variant`, `header`, `profile` and `reasons`. No fitting variant is HTTP200 with null fields;
 invalid bits is HTTP400. Read permissions and explicit yanked-tag behavior match ordinary resolution.
-A static origin or older Hub can omit this route; clients apply the same pure rule to its headers.
+The current index covers commits named by repo tags. An untagged retained commit can be readable
+without a selection index entry; HTTP404 from this optional route does not establish that the
+commit is absent. A static origin or older Hub can also omit the route. Clients retain the exact
+immutable commit and the requested constraints and apply the same pure rule to its headers;
+they never substitute a tagged default. Explicit owner deletion and commit retention are unchanged.
 
 ## 8. Versioning
 

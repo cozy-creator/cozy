@@ -161,8 +161,18 @@ impl Remote {
                 return Err(error);
             }
         };
-        let (tag, variant) = fetch::resolve(&repo, revision, async |commit: &ObjectRef| self.tree(commit).await).await?;
-        Ok(Root { object: tag.commit.clone(), tag: Some(tag), variant })
+        match fetch::resolve(&repo, revision, async |commit: &ObjectRef| self.tree(commit).await).await {
+            Ok((tag, variant)) => Ok(Root { object: tag.commit.clone(), tag: Some(tag), variant }),
+            Err(error) if error.kind == Kind::NotFound && revision.is_some_and(|r| r.starts_with("sha256:")) => {
+                // Tags do not enumerate retained history. An explicit immutable commit can
+                // still be readable at this endpoint; never substitute the tagged default.
+                let digest = revision.expect("digest revision");
+                let Some(object) = endpoint.inner.object(digest).await.map_err(from_native)? else { return Err(error) };
+                self.tree(&object).await?;
+                Ok(Root { object, tag: None, variant: None })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// A bare object by digest: from the store, the offline mirror, or the endpoint.
@@ -210,7 +220,9 @@ impl Remote {
         let bytes = self.store.read(&root)?;
         let (tree, header, variant, mut extra) = match Tree::from_json(&bytes) {
             Ok(tree) => {
-                let indexed = if !self.offline && wanted.is_none() && !reference.repo_id.starts_with("local/") && !reference.repo_id.starts_with("sha256:") {
+                let mut held_profiles = true;
+                for (_, header) in tree.variants() { held_profiles &= self.store.reuse(header)?; }
+                let indexed = if !held_profiles && !self.offline && wanted.is_none() && !reference.repo_id.starts_with("local/") && !reference.repo_id.starts_with("sha256:") {
                     self.endpoint.inner.select(&reference.repo_id, &root.id(), constraints).await.map_err(from_native)?
                 } else { None };
                 let selected;
