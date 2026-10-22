@@ -657,6 +657,7 @@ struct State {
     budgets: HashMap<u64, Arc<AtomicU64>>,
     measure_epoch: u64,
     ordinary_reserved: u64,
+    physical_epoch: u64,
     retired: HashMap<(Key, u64), Retirement>,
     sets: Vec<Option<SetMech>>,
     homes: HashMap<Key, Home>,
@@ -1095,7 +1096,7 @@ impl Memory {
         self.inner
             .guard(|| {
                 let mut st = self.inner.lock();
-                self.inner.refresh(&mut st)?;
+                let _admission = self.inner.refresh(&mut st)?;
                 let limit = st.table.torch_limit();
                 self.inner.unlock(st);
                 Ok(limit)
@@ -1112,7 +1113,7 @@ impl Memory {
         self.inner.guard(|| {
             let mut st = self.inner.lock();
             self.inner.measure(&mut st, torch);
-            self.inner.refresh(&mut st)?;
+            let _admission = self.inner.refresh(&mut st)?;
             self.inner.publish(&mut st);
             Ok(())
         })
@@ -1163,7 +1164,7 @@ impl Memory {
     pub fn workspace_available(&self, torch: Torch) -> Result<Workspace> {
         let mut st = self.inner.lock();
         self.inner.measure(&mut st, torch);
-        self.inner.refresh(&mut st)?;
+        let _admission = self.inner.refresh(&mut st)?;
         let id = st.tick();
         let remaining = Arc::new(AtomicU64::new(st.table.free()));
         st.budgets.insert(id, remaining.clone());
@@ -1430,12 +1431,19 @@ impl Inner {
     }
 
     /// The other rows, orphans, capacity, mode and foreign bytes, read now.
-    fn refresh(&self, st: &mut State) -> Result<()> {
+    fn refresh(&self, st: &mut State) -> Result<ledger::Admission<'_>> {
         st.promises();
-        let mut rows = self.shared.rows()?;
+        // Device queries are outside the shared metadata transaction. Revalidate their
+        // physical attribution against the authoritative rows after taking admission.
+        let sample = self.shared.physical_sample()?;
+        let card = self.backend.capacity();
+        let used = card.saturating_sub(self.backend.free()?);
+        let admission = self.shared.admission()?;
+        let mut rows = admission.rows()?;
         if rows.iter().any(|r| !r.live) && self.shared.reap(None)? {
-            rows = self.shared.rows()?;
+            rows = admission.rows()?;
         }
+        let known = sample.known(&rows);
         let (others, orphans) = ledger::remotes(&rows, self.row.at());
         st.table.others = others;
         st.table.orphans = orphans;
@@ -1443,16 +1451,14 @@ impl Inner {
         st.table.shared = self.shared.shared_mode()?;
         st.table.pending = self.to_custody.pending();
         self.physical(st);
-        let card = self.backend.capacity();
-        let used = card.saturating_sub(self.backend.free()?);
         // Unmaps in flight are this process's still (and already spent on the creates queued
         // after them).
         st.table.inflight = self.mech.pending();
         // Foreign bytes take from the card, not from the table's cap: they count only beyond the
         // card's room outside the cap (capacity = min(cap, card - foreign)).
-        st.table.foreign = st.table.foreign_used(card, used);
+        st.table.foreign = st.table.foreign_from_known(card, used, known);
         self.shared.set_foreign(st.table.foreign)?;
-        Ok(())
+        Ok(admission)
     }
 
     fn facts(st: &State) -> Facts {
@@ -1463,6 +1469,7 @@ impl Inner {
         let idle = t.requests.is_empty();
         Facts {
             physical: t.physical,
+            physical_epoch: st.physical_epoch,
             context: t.context,
             torch: t.torch() + st.claims.values().sum::<u64>(),
             caches: if idle { t.slack() + t.caches.iter().map(|c| c.bytes).sum::<u64>() } else { 0 },
@@ -1492,6 +1499,7 @@ impl Inner {
     /// Physical backing and promises have separate owners. A page retiring through both
     /// VMM and custody is one allocation; it stays charged until both receipts complete.
     fn physical(&self, st: &mut State) {
+        let epoch = self.row.physical_epoch(); // sampled BEFORE these physical counts
         let quarantined = self.ownership_lost.load(Ordering::Acquire);
         if !quarantined {
             st.retired.retain(|_, r| r.kept || r.mechanism.is_some_and(|t| !self.mech.completed(t)) || r.custody.is_some_and(|t| !self.to_custody.completed(t)));
@@ -1503,6 +1511,7 @@ impl Inner {
         let reserved = st.ordinary_reserved.saturating_add(self.native_resident.load(Ordering::Acquire));
         st.table.reserved = st.table.reserved.max(reserved);
         st.table.physical = st.table.context.saturating_add(reserved).saturating_add(st.table.vmm);
+        st.physical_epoch = epoch;
     }
 
     // ---- the mechanism
@@ -2049,7 +2058,7 @@ impl Inner {
         let mut own = 0;
         loop {
             let mut st = self.lock();
-            self.refresh(&mut st)?;
+            let admission = self.refresh(&mut st)?;
             if matches!(trigger, Trigger::Oom { .. }) {
                 st.table.headroom = u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0);
             }
@@ -2082,6 +2091,8 @@ impl Inner {
             // A tier copy in flight holds its page like a consumer: a decision short of bytes
             // waits for it, then decides again.
             if remote.is_empty() && st.saving.is_some() && matches!(actions.last(), Some(Action::Exhausted { .. } | Action::Park(_))) {
+                self.publish(&mut st);
+                drop(admission);
                 while st.saving.is_some() {
                     self.wait(&mut st)?;
                 }
@@ -2089,6 +2100,7 @@ impl Inner {
                 continue;
             }
             self.publish(&mut st);
+            drop(admission);
             self.unlock(st);
             self.shrink(shrinks);
             if remote.is_empty() {
@@ -2686,7 +2698,8 @@ impl Inner {
         let (id, room, unmeasured, step_pages, orphans) = {
             let mut st = self.lock();
             st.mech(set)?;
-            self.refresh(&mut st)?;
+            self.measure(&mut st, torch);
+            let _admission = self.refresh(&mut st)?;
             if Self::advance(&mut st, req, set)? {
                 let t = &st.table;
                 let capacity = t.capacity.saturating_sub(t.foreign + t.context + t.others.iter().map(crate::table::Remote::held).sum::<u64>());
@@ -2695,7 +2708,6 @@ impl Inner {
                 }
                 self.tier_uses(&mut st, req);
             }
-            self.measure(&mut st, torch);
             let (id, context) = (st.tick(), st.table.context);
             st.active.insert((req, set), Active { id, thread: std::thread::current().id(), set, entry: entry.to_string(), dims: dims.to_string(), shape: config(entry, dims), allocated: torch.allocated, room: torch.allocated, context, measured: false });
             if let Some(r) = st.table.request_mut(req) {

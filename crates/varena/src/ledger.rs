@@ -14,6 +14,8 @@
 //! maps the table afresh rather than through the shared handle). Every process with the table
 //! open holds a read lock on [`OPEN`]; the last row to leave unlinks the name only when it can
 //! take that lock for writing, so nobody is left holding a table nobody else can find.
+//! The admission gate orders metadata snapshots/commits across processes; its callers sample
+//! drivers before taking it and never keep it through driver work or peer/service waits.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
@@ -32,7 +34,7 @@ use crate::memory::SitePeak;
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledgr11");
+const MAGIC: u64 = u64::from_le_bytes(*b"vledgr12");
 /// The header's page: the heap starts after it, and grows from there.
 const HEADER: u64 = 4096;
 /// The heap's unit: rows take two, a fact as many as its bytes need.
@@ -42,6 +44,8 @@ const FACT_HEAD: u64 = 24;
 /// The header bytes every opener read-locks while it has the table open (the heap lock is the
 /// eight before them).
 const OPEN: u64 = 8;
+/// Serializes authoritative admission snapshots and their metadata commits.
+const ADMISSION: u64 = 16;
 
 const FREE: u64 = 0;
 const CLAIMING: u64 = 1;
@@ -50,8 +54,8 @@ const ROW: u64 = 1;
 const FACT: u64 = 2;
 
 /// The latch: context, torch, caches, classes (7), remaining, unmeasured, running, outside,
-/// yielded, family, host_peak, host_unmeasured, returning, physical.
-const WORDS: usize = 20;
+/// yielded, family, host_peak, host_unmeasured, returning, physical, physical_epoch.
+const WORDS: usize = 21;
 
 #[repr(C)]
 struct Header {
@@ -84,6 +88,15 @@ struct RowRec {
     host: AtomicU64,
     /// Its process waits for room elsewhere: every change of the table signals its endpoint.
     waiting: AtomicU64,
+    /// Full heap generation, including the bits not carried by the compact row id.
+    born: AtomicU64,
+    /// Changes before every physical operation, including operations whose net change is zero.
+    physical_epoch: AtomicU64,
+    /// Concurrent driver operations/publications still outstanding. A failed or abandoned
+    /// operation stays active: uncertain physical ownership is never subtraction evidence.
+    physical_active: AtomicU64,
+    /// The orphan count's publication tag (ordinary physical counts use the facts latch).
+    orphan_epoch: AtomicU64,
     seq: AtomicU64,
     latch: [[AtomicU64; WORDS]; 2],
 }
@@ -156,17 +169,20 @@ pub(crate) struct Facts {
     /// Actual unique resident bytes. Future admission promises are never physical usage;
     /// orphans remain custody's separate charge, not duplicated in their keeper's facts.
     pub physical: u64,
+    /// Epoch sampled BEFORE collecting `physical`; zero means unobserved. A publication
+    /// must retain the observation's tag rather than tagging old counts with the current epoch.
+    pub physical_epoch: u64,
 }
 
 impl Facts {
     fn words(&self) -> [u64; WORDS] {
         let c = self.classes;
-        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family, self.host_peak, self.host_unmeasured, self.returning, self.physical]
+        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family, self.host_peak, self.host_unmeasured, self.returning, self.physical, self.physical_epoch]
     }
 
     fn of(w: [u64; WORDS]) -> Facts {
-        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning, physical] = w;
-        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning, physical }
+        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning, physical, physical_epoch] = w;
+        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning, physical, physical_epoch }
     }
 
     fn held(&self) -> u64 {
@@ -190,6 +206,7 @@ pub(crate) struct RowView {
     /// Host layouts the tier is asking of it now.
     pub host: u64,
     pub waiting: bool,
+    physical: PhysicalStamp,
 }
 
 impl RowView {
@@ -221,6 +238,7 @@ pub(crate) struct Shared {
     /// The heap lock's half for this process's threads: an OFD lock is per description, so it
     /// excludes only other processes.
     heap: Mutex<()>,
+    admission: Mutex<()>,
     pub name: String,
     /// The table owner's uid: its services (custody, the tier, the wake, the asks) are named
     /// in that user's namespace.
@@ -238,6 +256,53 @@ struct Heap<'a> {
 impl Drop for Heap<'_> {
     fn drop(&mut self) {
         let _ = os::unlock(self.fd, 0, 8);
+    }
+}
+
+/// The shared admission gate. Its local half excludes threads sharing one file description;
+/// the OFD half excludes independently opened descriptions, including those in this process.
+pub(crate) struct Admission<'a> {
+    shared: &'a Shared,
+    _threads: MutexGuard<'a, ()>,
+}
+
+impl Admission<'_> {
+    pub fn rows(&self) -> Result<Vec<RowView>> {
+        self.shared.rows()
+    }
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        let _ = os::unlock(&self.shared.fd, ADMISSION, 8);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PhysicalStamp {
+    born: u64,
+    epoch: u64,
+    facts: u64,
+    orphans: u64,
+    clean: bool,
+}
+
+/// Physical attribution across a driver observation. Admission promises are read afresh
+/// under the gate; only physical subtraction is filtered by this earlier observation.
+pub(crate) struct PhysicalSample(HashMap<u64, PhysicalStamp>);
+
+impl PhysicalSample {
+    pub fn known(&self, rows: &[RowView]) -> u64 {
+        rows.iter().filter(|r| r.live).fold(0u64, |known, row| {
+            let Some(before) = self.0.get(&row.id()) else { return known };
+            let after = row.physical;
+            if !before.clean || !after.clean || before.born != after.born || before.epoch != after.epoch {
+                return known;
+            }
+            let physical = if before.facts == before.epoch && after.facts == after.epoch { row.facts.physical } else { 0 };
+            let orphans = if before.orphans == before.epoch && after.orphans == after.epoch { row.orphans } else { 0 };
+            known.saturating_add(physical).saturating_add(orphans)
+        })
     }
 }
 
@@ -289,7 +354,7 @@ impl Shared {
         })();
         os::unlock(&fd, 0, 8)?;
         let map = init?;
-        Ok(Shared { fd, map: RwLock::new(Arc::new(map)), heap: Mutex::new(()), name: gpu.uuid.clone(), ns, wake: os::wake_sender()? })
+        Ok(Shared { fd, map: RwLock::new(Arc::new(map)), heap: Mutex::new(()), admission: Mutex::new(()), name: gpu.uuid.clone(), ns, wake: os::wake_sender()? })
     }
 
     pub fn descriptor(&self) -> Result<Owned> {
@@ -300,6 +365,21 @@ impl Shared {
         let threads = self.heap.lock();
         os::lock(&self.fd, 0, 8, true)?;
         Ok(Heap { fd: &self.fd, _threads: threads })
+    }
+
+    /// A metadata-only transaction: resnapshot rows and publish admission before releasing.
+    /// Sample driver state BEFORE taking this guard. Never hold it across driver calls, IPC,
+    /// asks, or waits; native allocation callbacks may only consume already-owned quota.
+    pub fn admission(&self) -> Result<Admission<'_>> {
+        let threads = self.admission.lock();
+        os::lock(&self.fd, ADMISSION, 8, true)?;
+        Ok(Admission { shared: self, _threads: threads })
+    }
+
+    /// Physical identities immediately BEFORE a driver sample. Only unchanged, fully
+    /// published identities in the authoritative post-sample snapshot may be subtracted.
+    pub fn physical_sample(&self) -> Result<PhysicalSample> {
+        Ok(PhysicalSample(self.rows()?.into_iter().filter(|r| r.live).map(|r| (r.id(), r.physical)).collect()))
     }
 
     /// `m`, or under the heap lock a mapping of its own when `m` ends before `len`.
@@ -541,6 +621,10 @@ impl Shared {
             if let Some(r) = row(m, at) {
                 r.pid.store(pid, Relaxed);
                 r.tid.store(0, Relaxed);
+                r.born.store(header(m).shape.load(Relaxed).wrapping_add(1), Relaxed);
+                r.physical_epoch.store(1, Relaxed);
+                r.physical_active.store(0, Relaxed);
+                r.orphan_epoch.store(0, Relaxed);
                 [&r.asking, &r.asked, &r.orphans, &r.host, &r.waiting, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
                 r.latch.iter().flatten().for_each(|a| a.store(0, Relaxed));
             }
@@ -553,7 +637,7 @@ impl Shared {
         let m = self.map()?;
         let rec = row(&m, at).ok_or_else(|| Error::Internal("ledger row".into()))?;
         rec.word.store(ready, Release);
-        Ok(Row { shared: self.clone(), at, word: ready, _lock: lock, latch: Mutex::new(()), asking: Mutex::new(()) })
+        Ok(Row { shared: self.clone(), at, word: ready, map: m, _lock: lock, latch: Mutex::new(()), asking: Mutex::new(()) })
     }
 
     pub fn rows(&self) -> Result<Vec<RowView>> {
@@ -562,8 +646,18 @@ impl Shared {
                 return None;
             }
             let r = row(m, at)?;
+            // Epoch/active surround both publications. An operation starting or finishing
+            // during this read invalidates the snapshot; a fresh one can validate later.
+            let epoch = r.physical_epoch.load(SeqCst);
+            let active = r.physical_active.load(SeqCst);
             let facts = Facts::of(latch_read(&r.seq, &r.latch));
-            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), asking: r.asking.load(Acquire), asked: r.asked.load(Acquire), tid: r.tid.load(Acquire), host: r.host.load(Acquire), waiting: r.waiting.load(Acquire) > 0 })
+            let orphans = r.orphans.load(Acquire);
+            let orphan_epoch = r.orphan_epoch.load(Acquire);
+            let physical = PhysicalStamp {
+                born: r.born.load(Acquire), epoch, facts: facts.physical_epoch, orphans: orphan_epoch,
+                clean: active == 0 && r.physical_active.load(SeqCst) == 0 && r.physical_epoch.load(SeqCst) == epoch,
+            };
+            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans, physical, asking: r.asking.load(Acquire), asked: r.asked.load(Acquire), tid: r.tid.load(Acquire), host: r.host.load(Acquire), waiting: r.waiting.load(Acquire) > 0 })
         })?;
         views
             .into_iter()
@@ -796,6 +890,9 @@ pub(crate) struct Row {
     shared: Arc<Shared>,
     at: u64,
     word: u64,
+    /// This mapping covers the row for its entire lifetime, even if the heap grows. Native
+    /// callbacks touch these atomics without the map RwLock, remapping, or a latch wait.
+    map: Arc<Map>,
     _lock: Owned,
     /// One latch writer at a time.
     latch: Mutex<()>,
@@ -813,14 +910,11 @@ impl Row {
     }
 
     fn rec<T>(&self, f: impl FnOnce(&RowRec) -> T) -> Option<T> {
-        let m = self.shared.map().ok()?;
-        row(&m, self.at).filter(|r| r.word.load(Acquire) == self.word).map(f)
+        row(&self.map, self.at).filter(|r| r.word.load(Acquire) == self.word).map(f)
     }
 
     pub fn publish(&self, facts: &Facts) {
-        // Mapped first: the latch lock is a leaf.
-        let Ok(m) = self.shared.map() else { return };
-        let Some(r) = row(&m, self.at) else { return };
+        let Some(r) = row(&self.map, self.at) else { return };
         let _one = self.latch.lock();
         if r.word.load(Acquire) == self.word {
             latch_write(&r.seq, &r.latch, &facts.words());
@@ -829,19 +923,50 @@ impl Row {
 
     /// Native allocator publication: no remap, heap lock or latch wait.
     pub(crate) fn try_publish(&self, facts: &Facts) -> bool {
-        let Some(map) = self.shared.map.try_read() else { return false };
-        let Some(r) = row(&map, self.at) else { return false };
+        let Some(r) = row(&self.map, self.at) else { return false };
         let Some(_one) = self.latch.try_lock() else { return false };
         if r.word.load(Acquire) != self.word { return false; }
         latch_write(&r.seq, &r.latch, &facts.words());
         true
     }
 
-    /// The custody service's orphans; a change is a ledger event.
+    /// A stamp taken before collecting authoritative physical counts. Keep it alongside
+    /// those counts through deferred publication; taking a new stamp afterward is unsafe.
+    pub fn physical_epoch(&self) -> u64 {
+        self.rec(|r| r.physical_epoch.load(SeqCst)).unwrap_or(0)
+    }
+
+    /// Mark BEFORE touching physical ownership. This is only pinned-map atomic work and is
+    /// usable inside native allocation callbacks. Complete only after publishing the change.
+    pub fn physical_change(self: &Arc<Self>) -> PhysicalChange {
+        self.begin_physical();
+        PhysicalChange { row: self.clone() }
+    }
+
+    fn begin_physical(&self) {
+        self.rec(|r| {
+            r.physical_active.fetch_add(1, SeqCst);
+            r.physical_epoch.fetch_add(1, SeqCst);
+        });
+    }
+
+    fn end_physical(&self) {
+        self.rec(|r| { r.physical_active.fetch_sub(1, SeqCst); });
+    }
+
+    /// The custody service's orphans. The caller brackets earlier driver work with a
+    /// PhysicalChange and orders ownership transfers under admission; this setter itself
+    /// neither acquires that gate nor proves completion of the earlier work.
     pub fn set_orphans(&self, bytes: u64) {
-        if self.rec(|r| r.orphans.swap(bytes, AcqRel) != bytes).unwrap_or(false) {
-            self.shared.ring();
-        }
+        self.begin_physical();
+        let changed = self.rec(|r| {
+            let epoch = r.physical_epoch.load(SeqCst);
+            let changed = r.orphans.swap(bytes, AcqRel) != bytes;
+            r.orphan_epoch.store(epoch, Release);
+            changed
+        }).unwrap_or(false);
+        self.end_physical();
+        if changed { self.shared.ring(); }
     }
 
     /// Asks row `id` for `bytes` under `ceiling`: its ask thread answers from its pages at once.
@@ -915,6 +1040,19 @@ impl Row {
             framed.extend_from_slice(&reply);
             framed
         });
+    }
+}
+
+/// An outstanding physical operation. Drop deliberately does NOT clear the dirty marker:
+/// without a checked publication/completion, old physical counts cannot become evidence.
+#[must_use = "finish only after publishing authoritative physical ownership"]
+pub(crate) struct PhysicalChange {
+    row: Arc<Row>,
+}
+
+impl PhysicalChange {
+    pub fn finish(self) {
+        self.row.end_physical();
     }
 }
 
@@ -1638,6 +1776,134 @@ mod tests {
         assert_eq!(peer.physical, 12);
         assert_eq!(peer.held(), 32, "admission includes the reserved envelope");
         assert_eq!(held(&rows), 32, "status.free must continue counting promises");
+    }
+
+    fn physical_fixture(name: &str) -> (Arc<Shared>, Arc<Row>) {
+        let gpu = GpuId { uuid: format!("unit-{}-{name}", std::process::id()), model: "host".into(), memory: 64 << 20 };
+        let shared = Arc::new(Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, gpu.memory).unwrap());
+        let row = Arc::new(shared.claim(std::process::id()).unwrap());
+        (shared, row)
+    }
+
+    fn publish_physical(row: &Row, physical: u64, promised: u64) {
+        let physical_epoch = row.physical_epoch();
+        row.publish(&Facts { physical, physical_epoch, torch: promised, ..Facts::default() });
+    }
+
+    #[test]
+    fn admission_excludes_independent_descriptions_and_local_threads() {
+        let (shared, _row) = physical_fixture("admission-gate");
+        let other = shared.descriptor().unwrap();
+        let gate = shared.admission().unwrap();
+        assert!(shared.admission.try_lock().is_none(), "the OFD lock alone cannot exclude threads on one description");
+        assert!(!os::lock(&other, ADMISSION, 8, false).unwrap(), "independent descriptions contend on the kernel lock");
+        assert_eq!(gate.rows().unwrap().len(), 1);
+        drop(gate);
+        assert!(os::lock(&other, ADMISSION, 8, false).unwrap());
+        os::unlock(&other, ADMISSION, 8).unwrap();
+    }
+
+    #[test]
+    fn stable_physical_facts_allow_promises_to_change_without_inventing_device_usage() {
+        let (shared, row) = physical_fixture("stable-physical");
+        publish_physical(&row, 4, 4);
+        let before = shared.physical_sample().unwrap();
+        let gate = shared.admission().unwrap();
+        publish_physical(&row, 4, 12);
+        let rows = gate.rows().unwrap();
+        assert_eq!(before.known(&rows), 4);
+        assert_eq!(held(&rows), 12);
+    }
+
+    #[test]
+    fn a_free_before_counter_publication_cannot_hide_foreign_bytes() {
+        let (shared, row) = physical_fixture("free-observation");
+        publish_physical(&row, 8, 8);
+        let before = shared.physical_sample().unwrap();
+        let freeing = row.physical_change();
+        // The driver has returned eight bytes, but the row still conservatively charges them.
+        let rows = shared.rows().unwrap();
+        assert_eq!(before.known(&rows), 0);
+        assert_eq!(held(&rows), 8);
+        let during = shared.physical_sample().unwrap();
+        publish_physical(&row, 0, 8);
+        freeing.finish();
+        assert_eq!(during.known(&shared.rows().unwrap()), 0);
+        let after = shared.physical_sample().unwrap();
+        assert_eq!(after.known(&shared.rows().unwrap()), 0);
+    }
+
+    #[test]
+    fn deferred_callbacks_and_overlapping_changes_stay_dirty_until_tagged_publication() {
+        let (shared, row) = physical_fixture("deferred-physical");
+        publish_physical(&row, 4, 12);
+        let before = shared.physical_sample().unwrap();
+        let a = {
+            // Markers must work when native callbacks cannot acquire either ordinary lock.
+            let _map = shared.map.write();
+            let _latch = row.latch.lock();
+            row.physical_change()
+        };
+        let stale_epoch = row.physical_epoch();
+        let b = row.physical_change();
+        row.publish(&Facts { physical: 12, physical_epoch: stale_epoch, torch: 12, ..Facts::default() });
+        a.finish();
+        assert_eq!(before.known(&shared.rows().unwrap()), 0);
+        b.finish();
+        let stale = shared.physical_sample().unwrap();
+        assert_eq!(stale.known(&shared.rows().unwrap()), 0, "inactive is not proof that a stale publication is current");
+        publish_physical(&row, 12, 12);
+        let current = shared.physical_sample().unwrap();
+        assert_eq!(current.known(&shared.rows().unwrap()), 12);
+    }
+
+    #[test]
+    fn physical_aba_and_abandoned_operations_never_validate_an_old_sample() {
+        let (shared, row) = physical_fixture("physical-aba");
+        publish_physical(&row, 4, 4);
+        let before = shared.physical_sample().unwrap();
+        for physical in [8, 4] {
+            let change = row.physical_change();
+            publish_physical(&row, physical, 8);
+            change.finish();
+        }
+        assert_eq!(before.known(&shared.rows().unwrap()), 0, "equal counts do not make an overlapping driver sample consistent");
+        let current = shared.physical_sample().unwrap();
+        assert_eq!(current.known(&shared.rows().unwrap()), 4);
+        let uncertain = row.physical_change();
+        drop(uncertain);
+        publish_physical(&row, 4, 8);
+        let abandoned = shared.physical_sample().unwrap();
+        assert_eq!(abandoned.known(&shared.rows().unwrap()), 0, "dropping an uncompleted marker cannot clear uncertain ownership");
+        assert_eq!(held(&shared.rows().unwrap()), 8);
+    }
+
+    #[test]
+    fn reused_rows_and_custody_transfers_invalidate_prior_physical_identity() {
+        let (shared, row) = physical_fixture("physical-generation");
+        // Keep the table generation open while its source row is retired and reused.
+        let custody = Arc::new(shared.claim(std::process::id()).unwrap());
+        publish_physical(&row, 8, 8);
+        let before = shared.physical_sample().unwrap();
+        let old_at = row.at;
+        let source_change = row.physical_change();
+        let custody_change = custody.physical_change();
+        {
+            let _gate = shared.admission().unwrap();
+            custody.set_orphans(8); // Destination charge precedes source release.
+            publish_physical(&row, 0, 0);
+            source_change.finish();
+            custody_change.finish();
+        }
+        assert_eq!(before.known(&shared.rows().unwrap()), 0);
+        let transferred = shared.physical_sample().unwrap();
+        assert_eq!(transferred.known(&shared.rows().unwrap()), 8);
+        drop(row);
+        let replacement = shared.claim(std::process::id()).unwrap();
+        assert_eq!(replacement.at, old_at);
+        publish_physical(&replacement, 8, 8);
+        assert_eq!(before.known(&shared.rows().unwrap()), 0, "same offset and count are not the same owner");
+        assert_eq!(transferred.known(&shared.rows().unwrap()), 8, "only the unchanged custody owner remains attributable");
     }
 
 }

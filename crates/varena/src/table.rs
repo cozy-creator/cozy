@@ -476,7 +476,13 @@ impl Table {
     /// this cap. Logical room/claims/workspace promises never alter physical attribution.
     pub fn foreign_used(&self, card_capacity: u64, driver_used: u64) -> u64 {
         let physical = self.others.iter().fold(self.physical.saturating_add(self.orphans), |held, row| held.saturating_add(row.physical));
-        driver_used.saturating_sub(physical).saturating_sub(card_capacity.saturating_sub(self.capacity))
+        self.foreign_from_known(card_capacity, driver_used, physical)
+    }
+
+    /// Foreign attribution with only the physical bytes proved stable across this driver
+    /// sample. Dirty/unpublished backing remains an admission charge, never subtraction.
+    pub fn foreign_from_known(&self, card_capacity: u64, driver_used: u64, known: u64) -> u64 {
+        driver_used.saturating_sub(known).saturating_sub(card_capacity.saturating_sub(self.capacity))
     }
 
     /// F: what no row, orphan or foreign tenant holds.
