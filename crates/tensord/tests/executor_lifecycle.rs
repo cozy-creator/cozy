@@ -238,16 +238,16 @@ fn a_failure_quotes_only_its_own_requests_stderr() {
 
 #[test]
 #[ignore = "needs installed cpu_lifecycle generations"]
-fn slow_steady_work_is_never_killed_without_a_cancel() {
+fn slow_steady_work_is_never_killed() {
     let (generation, hold) = generations().remove(0);
     let (mut executor, root, _) = launch(&generation, &hold);
-    // Each step is longer than the noise floor (0.6 s here); no cancel, so nothing judges.
+    // Twice the noise floor (0.6 s here) in all, a step reported every 0.2 s: never still.
     let reply = invoke(
         &mut executor,
         &root,
         "slow",
         "steps",
-        json!({"steps": 2, "seconds": 1.0}),
+        json!({"steps": 6, "seconds": 0.2}),
     )
     .unwrap();
     assert_eq!(terminal(&reply), "succeeded", "{reply:?}");
