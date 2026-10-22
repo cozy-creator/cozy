@@ -106,6 +106,11 @@ pub struct Binding {
     pub package: String,
     pub model: String,
     pub adapters: Vec<Adapter>,
+    /// A group's placeable components and the GPU that keeps each, an index within the group
+    /// (0: GPU 0, the serial scope's; g: GPU g keeps it resident for the group), decided by
+    /// TensorD at Load (`memory::homes`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub homes: BTreeMap<String, u32>,
 }
 impl Default for Binding {
     fn default() -> Self {
@@ -131,6 +136,7 @@ impl Default for Binding {
             package: String::new(),
             model: String::new(),
             adapters: Vec::new(),
+            homes: BTreeMap::new(),
         }
     }
 }
@@ -160,8 +166,9 @@ pub enum DeviceCommand {
         /// Each constructed slot's checkpoint, so Runtime schedules fetches before it imports.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         constructions: Vec<Construction>,
-        /// One ledger memfd per GPU of `devices`, in order, follows the frame: rank 0 claims its
-        /// row in the first and hands follower r the r-th (design memory-varena §5.5).
+        /// One grant per GPU of `devices`, in order, follows the frame (two descriptors: its
+        /// table, then one for its row's lock; the GPU's wake is by name): rank 0 opens its
+        /// memory with the first and hands follower r the r-th (design varena-slim §3).
         #[serde(skip_serializing_if = "is_zero")]
         ledgers: u32,
         memory_mode: MemoryMode,
@@ -234,9 +241,14 @@ pub enum DeviceCommand {
         actor: String,
         #[serde(skip_serializing_if = "String::is_empty")]
         operation: String,
+        /// The family whose GPUs its calls share (`Execution::family`): while it waits on a
+        /// child call it yields under this name (varena `Request::yielding`), so the child is
+        /// admitted beside it.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        family: String,
     },
-    /// Warming: the loaded construction's models are loaded at `level` (`gpu` or `ram`, varena
-    /// filling them), nothing run.
+    /// Warming: the loaded construction's models are loaded at `level` (`gpu` or `ram`; varena
+    /// places them), nothing run.
     Map {
         construction: String,
         level: &'static str,
@@ -325,12 +337,6 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    /// One weight set's held bytes: the sealed host layout deposited for it, else nothing.
-    ReadGrant,
-    /// A sealed host layout the executor filled, for the next executor of its weights.
-    Deposit,
-    /// GPU pages of weight regions the executor kept, held past its end (`descriptors` follow).
-    KeepPages,
     Publish,
     /// A weights output's TensorFS reference, which Runtime committed or uploaded.
     CheckpointItem,
@@ -464,27 +470,15 @@ pub struct Frame {
     pub seq: u64,
     pub kind: Kind,
     pub descriptor: bool,
-    /// `keep_pages`: the fds that follow, one per page.
-    pub descriptors: u64,
     pub name: String,
-    /// `read_grant`/`deposit`: the sealed host layout's digest.
-    pub layout: String,
-    /// `keep_pages`: what its pages hold, checked by the executor that maps them.
-    pub fingerprint: String,
-    pub pages: Vec<Page>,
-    /// GPU rank within this executor group for weight page grants and deposits.
-    pub rank: u32,
-    pub manifest: String,
     pub sha256: String,
     pub length: u64,
     pub facts: Option<LoadFacts>,
-    /// `map`: whether every weight of the construction is on its GPU after it.
-    pub complete: Option<bool>,
     pub metrics: Option<Metrics>,
-    /// `invoke`: the request's memory per model per step (varena's `RequestStats`); another
-    /// frame's `memory` of another shape (an older Hello's list) reads as absent.
+    /// `invoke`: varena's record of the request (`Stats`), kept whole; another frame's `memory`
+    /// of another shape (an older Hello's list) reads as absent.
     #[serde(deserialize_with = "lenient")]
-    pub memory: Option<crate::memory::call::Stats>,
+    pub memory: Option<serde_json::Map<String, Value>>,
     pub stage: String,
     pub position: Option<u64>,
     pub total: Option<u64>,
@@ -567,14 +561,6 @@ impl Frame {
     }
 }
 
-/// One kept GPU page: a home region and the bytes its allocation spans.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct Page {
-    pub region: u32,
-    pub nbytes: u64,
-}
-
 /// One part of a composite product: a spool file and the media time it adds.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -590,19 +576,11 @@ pub struct Answer {
     pub ok: bool,
     pub code: String,
     pub detail: String,
-    pub held: bool,
-    /// `read_grant` with nothing held: the asker may seal the layout (it fits in measured host
-    /// surplus); else it reads the checkpoint.
-    #[serde(skip_serializing_if = "is_false")]
-    pub seal: bool,
-    /// One fd follows the answer. Sent only when true: a `Tier` answer types it as the fd.
+    /// One fd follows the answer. Sent only when true.
     #[serde(skip_serializing_if = "is_false")]
     pub descriptor: bool,
     pub sha256: String,
     pub length: u64,
-    /// `read_grant`: the fds that follow the answer.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub descriptors: u64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub digest: String,
     #[serde(skip_serializing_if = "is_zero")]
@@ -634,11 +612,6 @@ pub struct Answer {
     pub stored: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
-    /// A held `read_grant`: GPU pages kept for it, whose fds follow the layout's.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub fingerprint: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub pages: Vec<Page>,
 }
 fn is_zero_ms(value: &f64) -> bool {
     *value == 0.0
@@ -651,12 +624,9 @@ impl Answer {
             ok: false,
             code: "capability_unavailable".into(),
             detail: "owner has not qualified this operation".into(),
-            held: false,
-            seal: false,
             descriptor: false,
             sha256: String::new(),
             length: 0,
-            descriptors: 0,
             digest: String::new(),
             sequence: 0,
             state: String::new(),
@@ -670,8 +640,6 @@ impl Answer {
             disputed: false,
             stored: false,
             reason: String::new(),
-            fingerprint: String::new(),
-            pages: Vec::new(),
         }
     }
     pub fn ok(seq: u64) -> Self {
@@ -700,21 +668,6 @@ pub trait Services {
     ) -> io::Result<(Answer, Option<File>)> {
         drop(descriptor);
         Ok((Answer::unavailable(frame.seq), None))
-    }
-    /// `read_grant`: the plan's memfd, when one came with the request; the fds returned follow
-    /// the answer (`descriptors`).
-    fn read_grant(
-        &mut self,
-        frame: &Frame,
-        plan: Option<File>,
-    ) -> io::Result<(Answer, Vec<File>)> {
-        drop(plan);
-        Ok((Answer::unavailable(frame.seq), Vec::new()))
-    }
-    /// `keep_pages`: its fds, one per page.
-    fn keep_pages(&mut self, frame: &Frame, pages: Vec<File>) -> Answer {
-        drop(pages);
-        Answer::unavailable(frame.seq)
     }
 }
 
@@ -1667,34 +1620,6 @@ impl DeviceExecutor {
                     watch.serving(false);
                     write_frame(&mut self.writer.lock().unwrap(), &answer)?;
                 }
-                Some(Event::Request) if frame.kind == Kind::ReadGrant => {
-                    let plan = if frame.descriptor {
-                        Some(File::from(platform::handles::recv_fd(&self.stream)?))
-                    } else {
-                        None
-                    };
-                    watch.serving(true);
-                    let answered = services.read_grant(&frame, plan);
-                    watch.serving(false);
-                    let (mut answer, out) = answered?;
-                    answer.event = "answer";
-                    answer.seq = frame.seq;
-                    answer.descriptor = false;
-                    answer.descriptors = out.len() as u64;
-                    let mut writer = self.writer.lock().unwrap();
-                    write_frame(&mut writer, &answer)?;
-                    for file in &out {
-                        platform::handles::send_fd(&writer, file)?;
-                    }
-                }
-                Some(Event::Request) if frame.kind == Kind::KeepPages => {
-                    watch.serving(true);
-                    let pages = (0..frame.descriptors).map(|_| platform::handles::recv_fd(&self.stream).map(File::from));
-                    let pages = pages.collect::<Result<Vec<_>, _>>()?;
-                    let answer = services.keep_pages(&frame, pages);
-                    watch.serving(false);
-                    write_frame(&mut self.writer.lock().unwrap(), &answer)?;
-                }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.
                     watch.serving(true);
@@ -2105,8 +2030,8 @@ mod codec_tests {
         let hello: Frame = serde_json::from_value(serde_json::json!({"reply": "hello", "ok": true, "pid": 7,
             "memory": [1, 2]})).unwrap();
         assert!(hello.ok && hello.memory.is_none() && hello.hello.pid == 7);
-        let invoke: Frame = serde_json::from_value(serde_json::json!({"reply": "invoke", "memory": {"paged_in": 5}})).unwrap();
-        assert_eq!(invoke.memory.unwrap().paged_in, 5);
+        let invoke: Frame = serde_json::from_value(serde_json::json!({"reply": "invoke", "memory": {"moved": {"store": {"bytes": 5}}}})).unwrap();
+        assert_eq!(invoke.memory.unwrap()["moved"]["store"]["bytes"], 5);
     }
 
     #[test]
@@ -2153,7 +2078,7 @@ mod codec_tests {
     #[test]
     fn a_request_that_does_not_decode_is_refused_alone() {
         let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
-        let malformed = serde_json::json!({"event": "request", "kind": "read_grant", "seq": 9,
+        let malformed = serde_json::json!({"event": "request", "kind": "publish", "seq": 9,
             "length": -23068672, "descriptor": true});
         write_frame(&mut runtime, &malformed).unwrap();
         platform::handles::send_fd(&runtime, &File::open(std::env::current_exe().unwrap()).unwrap()).unwrap();
@@ -2167,12 +2092,12 @@ mod codec_tests {
         write_frame(&mut runtime, &progress).unwrap();
         let dropped = read_frame(&mut machine).unwrap().unwrap();
         assert!(dropped.event == Some(Event::Progress) && !dropped.malformed.is_empty());
-        let fine = serde_json::json!({"event": "request", "kind": "read_grant", "seq": 10,
+        let fine = serde_json::json!({"event": "request", "kind": "publish", "seq": 10,
             "length": 5});
         write_frame(&mut runtime, &fine).unwrap();
         let next = read_frame(&mut machine).unwrap().unwrap();
         assert!(next.malformed.is_empty());
-        assert_eq!((next.kind, next.seq, next.length), (Kind::ReadGrant, 10, 5));
+        assert_eq!((next.kind, next.seq, next.length), (Kind::Publish, 10, 5));
     }
 
     fn pid(codec: &Codec) -> Option<u32> {
