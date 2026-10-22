@@ -755,6 +755,113 @@ impl Drop for Gate {
     }
 }
 
+type BeginCapture = unsafe extern "C" fn(cuda::CUstream, std::ffi::c_int) -> cuda::CUresult;
+type EndCapture = unsafe extern "C" fn(cuda::CUstream, *mut *mut c_void) -> cuda::CUresult;
+type Instantiate = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u64) -> cuda::CUresult;
+type GraphLaunch = unsafe extern "C" fn(*mut c_void, cuda::CUstream) -> cuda::CUresult;
+
+/// The driver's graph calls, which TensorFS's table does not carry, loaded for the cases that capture.
+struct Graphs {
+    begin: BeginCapture,
+    end: EndCapture,
+    instantiate: Instantiate,
+    launch: GraphLaunch,
+}
+
+fn graphs() -> &'static Graphs {
+    static GRAPHS: std::sync::OnceLock<Graphs> = std::sync::OnceLock::new();
+    GRAPHS.get_or_init(|| {
+        // SAFETY: libcuda is loaded already (TensorFS's driver); each symbol has the documented signature.
+        unsafe {
+            let lib = libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW);
+            assert!(!lib.is_null(), "libcuda.so.1");
+            let sym = |name: &std::ffi::CStr| {
+                let f = libc::dlsym(lib, name.as_ptr());
+                assert!(!f.is_null(), "{name:?}");
+                f
+            };
+            Graphs {
+                begin: std::mem::transmute::<*mut c_void, BeginCapture>(sym(c"cuStreamBeginCapture_v2")),
+                end: std::mem::transmute::<*mut c_void, EndCapture>(sym(c"cuStreamEndCapture")),
+                instantiate: std::mem::transmute::<*mut c_void, Instantiate>(sym(c"cuGraphInstantiateWithFlags")),
+                launch: std::mem::transmute::<*mut c_void, GraphLaunch>(sym(c"cuGraphLaunch")),
+            }
+        }
+    })
+}
+
+/// A graph of one `copy` from `src` to `dst` (`words` u64s), captured on `stream`, instantiated.
+fn captured_copy(dst: u64, src: u64, words: u64, stream: usize) -> usize {
+    let g = graphs();
+    // Relaxed: other threads may call the driver meanwhile.
+    const RELAXED: std::ffi::c_int = 2;
+    assert_eq!(unsafe { (g.begin)(stream as cuda::CUstream, RELAXED) }, cuda::SUCCESS);
+    assert_eq!(launch(c"copy", &[dst, src, words], stream), cuda::SUCCESS);
+    let mut graph = std::ptr::null_mut();
+    assert_eq!(unsafe { (g.end)(stream as cuda::CUstream, &mut graph) }, cuda::SUCCESS);
+    let mut exec = std::ptr::null_mut();
+    assert_eq!(unsafe { (g.instantiate)(&mut exec, graph, 0) }, cuda::SUCCESS);
+    exec as usize
+}
+
+/// Step 2's mechanism on the driver: two physical slots stream four blocks, each slot remapped (cuMemUnmap, then
+/// cuMemMap) at the block's own VA in turn. One graph is captured per block against the block's VA, before any slot
+/// is mapped there. Over three rounds, every replay reads the block's own bytes through whichever slot backs it.
+/// The graphs stay valid across the remaps.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_graph_captured_at_a_blocks_va_replays_across_slot_remaps() {
+    let (b, uuid) = gpu();
+    step!();
+    let gran = b.granularity();
+    let blocks: u64 = 4;
+    let va = b.reserve(blocks * gran).unwrap();
+    step!();
+    let slots: Vec<Physical> = (0..2).map(|_| b.create(gran).unwrap()).collect();
+    step!();
+    let stream = cuda::Stream::new(0).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, (blocks * gran) as usize).unwrap();
+    step!();
+    let execs: Vec<usize> = (0..blocks).map(|i| captured_copy(out.ptr() + i * gran, va.base + i * gran, gran / 8, stream.raw())).collect();
+    step!();
+    let data: Vec<Vec<u8>> = (0..blocks).map(|i| pattern(gran, 60 + i as u8)).collect();
+    // Which block each slot backs, and the event after its last replay.
+    let mut at: Vec<Option<(u64, Event)>> = vec![None, None];
+    let mut remaps = 0;
+    for round in 0..3 {
+        for i in 0..blocks {
+            let s = (i % 2) as usize;
+            if let Some((old, done)) = at[s].take() {
+                // The slot's last replay finished before its VA goes.
+                b.finish(done).unwrap();
+                b.unmap(va, old * gran, gran).unwrap();
+                remaps += 1;
+            }
+            b.map(va, i * gran, &slots[s], Access::ReadWrite).unwrap();
+            // SAFETY: the slot is mapped at the block's VA and nothing else uses it until the replay.
+            unsafe { io::read(&[Copy { src: Src::Host(data[i as usize].as_ptr()), dst: b.target(va, i * gran, gran) }], &ReadOpts::default()) }.unwrap();
+            assert_eq!(unsafe { (graphs().launch)(execs[i as usize] as *mut c_void, stream.raw() as cuda::CUstream) }, cuda::SUCCESS);
+            at[s] = Some((i, b.record(stream.raw()).unwrap()));
+        }
+        stream.drain().unwrap();
+        for i in 0..blocks {
+            assert!(bytes(out.ptr() + i * gran, gran, 0) == data[i as usize], "round {round}: block {i}'s replay read other bytes");
+        }
+        step!();
+    }
+    for (old, done) in at.into_iter().flatten() {
+        b.finish(done).unwrap();
+        b.unmap(va, old * gran, gran).unwrap();
+    }
+    step!();
+    slots.into_iter().for_each(|p| b.destroy(p).unwrap());
+    b.release(va);
+    step!();
+    println!("PASS a graph captured at a block's VA replays across {remaps} slot remaps {uuid}");
+    step!();
+}
+
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn release_events_order_consumers_without_a_host_wait() {
