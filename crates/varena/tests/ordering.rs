@@ -1823,3 +1823,42 @@ fn a_settle_makes_every_due_keep_before_it_returns() {
     assert_eq!(exports(), 3, "every due page kept by the time settle returns");
 }
 
+/// S2's native old_and_new_fill_identities_at_once (v2-native, run 13376): the fill identity
+/// changes while the old range's consumer still runs, and a fresh range's preparation fills
+/// the page again in place, after that consumer in-stream (never on the host). Its own claims
+/// hold the page for it; they are not pins that keep the old bytes (they made it refuse Held).
+#[test]
+fn a_range_prepared_after_an_identity_change_fills_its_page_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("newidentity-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
+    let t = mem.load(undeclared(dir.path(), &uuid, "t", 1), Level::Ram).unwrap();
+    let old = mem.retain(t, &[0]).unwrap();
+    drop(old.prepare(1).unwrap());
+    let consumer = events.next.load(Ordering::SeqCst);
+    mem.fill(t, Fill::Declared("v2".into()));
+    assert!(!old.valid(), "the old range is stale");
+    let new = mem.retain(t, &[0]).unwrap();
+    let prepared = std::thread::scope(|s| {
+        let preparing = s.spawn(|| {
+            let out = new.prepare(2).map(|pins| pins.iter().all(|p| p.fresh));
+            events.log("prepared");
+            out
+        });
+        // Back, or waiting on the host for an event (the old consumer's): then it ends, so the
+        // case fails instead of hanging.
+        events.await_log(|log| log.contains(&"prepared") || log.contains(&"finish"));
+        let waited = !events.kept.lock().contains(&"prepared");
+        events.complete(consumer);
+        (preparing.join().unwrap(), waited)
+    });
+    let (fresh, waited) = prepared;
+    assert!(matches!(fresh, Ok(true)), "the v2 page is its caller's to bake: {fresh:?}");
+    assert!(!waited, "the preparation waited on the host for the old consumer");
+    assert!(events.waits.lock().contains(&(consumer, 0)), "the refill waits in-stream for the old consumer");
+}
+

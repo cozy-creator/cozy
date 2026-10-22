@@ -114,7 +114,8 @@ impl Retained {
                 let mut st = self.inner.lock();
                 return Err(Error::Exhausted(exhausted(*need, None, st.stats(req).cloned().unwrap_or_default())));
             }
-            let pins = self.blocks.iter().map(|b| self.inner.bind_for(self.set, *b, stream, req)).collect::<Result<Vec<_>>>()?;
+            let claims: Vec<u64> = preparing.pins.iter().map(|(id, _)| *id).collect();
+            let pins = self.blocks.iter().map(|b| self.inner.bind_for(self.set, *b, stream, req, &claims)).collect::<Result<Vec<_>>>()?;
             let st = self.inner.lock();
             if retained_identity(self.set, st.mech(self.set)?, &self.blocks) != self.identity {
                 return Err(Error::StaleBinding("retained range identity changed during preparation".into()));
@@ -2786,10 +2787,12 @@ impl Inner {
     }
 
     fn bind(self: &Arc<Self>, set: u32, block: u32, stream: usize) -> Result<Pin> {
-        self.bind_for(set, block, stream, None)
+        self.bind_for(set, block, stream, None, &[])
     }
 
-    fn bind_for(self: &Arc<Self>, set: u32, block: u32, stream: usize, request: Option<u64>) -> Result<Pin> {
+    /// Binds `block` of `set` for `stream`; `claims` are the caller's own preparation pins,
+    /// which hold the page for this bind and never against it.
+    fn bind_for(self: &Arc<Self>, set: u32, block: u32, stream: usize, request: Option<u64>, claims: &[u64]) -> Result<Pin> {
         let key = (set, block);
         let start = Instant::now();
         let mut st = self.lock();
@@ -2807,10 +2810,10 @@ impl Inner {
                 return Err(e);
             }
             let identity = st.mech(set)?.spec.fingerprint.key();
-            let pinned = st.table.page(key).is_some_and(|p| !p.pins.is_empty());
+            let pinned = st.table.page(key).is_some_and(|p| p.pins.iter().any(|id| !claims.contains(id)));
             // Waiting on pins only this thread holds would wait on itself.
             let me = std::thread::current().id();
-            let mine = pinned && st.pins.values().filter(|(k, ..)| *k == key).all(|(.., t)| *t == me);
+            let mine = pinned && st.pins.iter().filter(|(id, (k, ..))| *k == key && !claims.contains(id)).all(|(_, (.., t))| *t == me);
             // The allocator callback is unmapping it: once reconciled it is gone, and fills again.
             if st.homes.contains_key(&key) && !st.unstock(key) {
                 hit = false;

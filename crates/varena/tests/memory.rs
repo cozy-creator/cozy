@@ -730,4 +730,3 @@ fn a_rooms_slack_excludes_the_cache_it_started_with() {
     measure("1x4", 40 * MB);
     assert_eq!(room(&mem, id, "t", "1x4", pages, None), 7 * MB, "its own 3 MB and the 4 MB its allocations left reserved");
 }
-
