@@ -213,13 +213,13 @@ impl Remote {
 
     pub async fn open(&self, mut reference: Ref, constraints: &crate::precision::Constraints) -> Result<Checkpoint> {
         let Root { object: root, tag, variant } = self.root(&reference).await?;
-        let wanted = fetch::pick_variant(reference.revision.as_deref(), variant, reference.variant.as_deref())?;
         let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let bytes = self.store.read(&root)?;
         let (tree, header, variant, mut extra) = match Tree::from_json(&bytes) {
             Ok(tree) => {
+                let wanted = fetch::pick_variant(&tree, reference.revision.as_deref(), variant, reference.variant.as_deref())?;
                 let mut held_profiles = true;
                 for (_, header) in tree.variants() { held_profiles &= self.store.reuse(header)?; }
                 let indexed = if !held_profiles && !self.offline && wanted.is_none() && !reference.repo_id.starts_with("local/") && !reference.repo_id.starts_with("sha256:") {
@@ -296,12 +296,11 @@ impl Remote {
         local_dir: Option<&Path>,
     ) -> Result<PathBuf> {
         let Root { object: root, tag, variant } = self.root(reference).await?;
-        let wanted = fetch::pick_variant(reference.revision.as_deref(), variant, reference.variant.as_deref())?;
         let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let tree = self.store.tree(&root)?;
-        let wanted = wanted.as_deref().map(|name| tree.variant(Some(name)).map(|(path,_)|path.to_owned()).map_err(|e| absent(true,e))).transpose()?;
+        let wanted = fetch::pick_variant(&tree, reference.revision.as_deref(), variant, reference.variant.as_deref())?;
         let headers: Vec<_> = match wanted.as_deref() {
             Some(variant) => vec![tree.variant(Some(variant)).map_err(|e| absent(true, e))?.1.clone()],
             None => tree.variants().map(|(_, h)| h.clone()).collect(),

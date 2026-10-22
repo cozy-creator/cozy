@@ -49,3 +49,14 @@ async fn local_and_static_origin_select_nested_headers_without_tensor_payloads()
     let invalid=Open {bits:Some(7),..gpu};
     assert!(client.open("acme/profile",&invalid).await.is_err());
 }
+
+#[test]
+fn pinned_header_aliases_resolve_before_agreement_is_checked() {
+    use tensorfs::format::{Tree,ObjectRef};
+    let first=ObjectRef::of(b"first");let second=ObjectRef::of(b"second");
+    let mut tree=Tree::default();tree.files.insert("model.z.cozytensors".into(),first);
+    let cited=Some("model.z.cozytensors".into());
+    assert_eq!(tensorfs::fetch::pick_variant(&tree,None,cited.clone(),Some("z")).unwrap(),cited);
+    tree.files.insert("z.cozytensors".into(),second);
+    assert!(tensorfs::fetch::pick_variant(&tree,None,cited,Some("z")).is_err(),"an exact competing path must not be redirected to the legacy alias");
+}
