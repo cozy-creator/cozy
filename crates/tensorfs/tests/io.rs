@@ -15,6 +15,7 @@ use std::time::Instant;
 use tensorfs::format::ClassRef;
 use tensorfs::format::{Body, Component, Dtype, Encoding, Header, Location, ObjectRef, Part, Tensor, CHUNKS_DIR};
 use tensorfs::import::{Access, Request};
+use tensorfs::io::source::{self as placement, IoTally, Item, ItemSource, Mode, Placement};
 use tensorfs::io::{self, Copy, Dst, ReadOpts, ReadStats, Src, Target};
 use tensorfs::store::{Checkpoint, Store};
 use tensorfs::writer::{Data, PartData, Source, Writer};
@@ -184,6 +185,81 @@ fn registered_pages_copy_direct_one_read_per_eight_pages() {
     let (whole, paged) = (rate(one), rate(paged));
     println!("TIMINGS whole copy {whole:.2} GB/s; {} reads of {BATCH} pages {paged:.2} GB/s ({:.0}% of whole)", PAGES / BATCH, 100.0 * paged / whole);
     println!("PASS registered pages copy direct, {paged:.2} of {whole:.2} GB/s {uuid}");
+}
+
+/// A placement read tells its listener of each placement once all its copies are issued, before
+/// the read returns: a consumer stream that waits on events recorded then on the given streams
+/// and copies the placement out reads exactly its bytes (file bytes, then zeroed padding), while
+/// later placements are still being read.
+#[test]
+#[ignore = "requires an allocated CUDA GPU; no mock driver"]
+fn placements_read_ready_at_issue_for_a_consumer_stream() {
+    const PLACEMENT: usize = 8 * MIB;
+    const PAD: usize = 4096;
+    const N: usize = 32;
+    let dir = Scratch::new("issued");
+    let path = dir.0.join("object");
+    let body = noise(17, N * PLACEMENT);
+    fs::write(&path, &body).unwrap();
+    let obj = ObjectRef { sha256: "obj-issued".into(), length: body.len() as u64 };
+    let source = placement::Source::files(vec![(obj.clone(), fs::File::open(&path).unwrap())], true, 0);
+    let items: Vec<[Item; 1]> = (0..N)
+        .map(|p| {
+            let off = (p * PLACEMENT) as u64;
+            let len = (PLACEMENT - PAD) as u64;
+            [Item { offset: off, len, source: ItemSource::Object(io::ObjectRange { obj: obj.clone(), off, len }), part_end: true }]
+        })
+        .collect();
+    let (gpu, scratch) = (io::DeviceBuffer::new(0, N * PLACEMENT).unwrap(), io::DeviceBuffer::new(0, N * PLACEMENT).unwrap());
+    let uuid = io::cuda::uuid(0).unwrap();
+    let context = gpu.context() as usize;
+    let _context = io::cuda::CtxGuard::enter(gpu.context()).unwrap();
+    let d = io::cuda::driver().unwrap();
+    let (copy, consumer) = (io::cuda::Stream::new(0).unwrap(), io::cuda::Stream::new(0).unwrap());
+    // Stale bytes everywhere first: a consumer copy ahead of a fill would read them.
+    io::cuda::check("cuMemsetD8", unsafe { (d.memset_d8_async)(gpu.ptr(), 0xff, N * PLACEMENT, copy.raw() as _) }).unwrap();
+    io::cuda::check("cuMemsetD8", unsafe { (d.memset_d8_async)(scratch.ptr(), 0xee, N * PLACEMENT, consumer.raw() as _) }).unwrap();
+    copy.drain().unwrap();
+    consumer.drain().unwrap();
+    let placements: Vec<Placement> = (0..N)
+        .map(|p| Placement { items: &items[p], origin: (p * PLACEMENT) as u64, dst: Dst::Device { device: 0, ptr: gpu.ptr() + (p * PLACEMENT) as u64, len: PLACEMENT, stream: copy.raw() } })
+        .collect();
+    let heard = std::sync::Mutex::new(vec![(0u32, std::time::Duration::ZERO); N]);
+    let start = Instant::now();
+    let listener = |p: usize, streams: &[usize]| {
+        let _context = io::cuda::CtxGuard::enter(context as _).unwrap();
+        assert!(!streams.is_empty());
+        for &s in streams {
+            let mut event = std::ptr::null_mut();
+            io::cuda::check("cuEventCreate", unsafe { (d.event_create)(&mut event, 0) }).unwrap();
+            io::cuda::check("cuEventRecord", unsafe { (d.event_record)(event, s as _) }).unwrap();
+            io::cuda::check("cuStreamWaitEvent", unsafe { (d.stream_wait_event)(consumer.raw() as _, event, 0) }).unwrap();
+            unsafe { (d.event_destroy)(event) };
+        }
+        let at = (p * PLACEMENT) as u64;
+        io::cuda::check("cuMemcpyDtoDAsync", unsafe { (d.memcpy_dtod_async)(scratch.ptr() + at, gpu.ptr() + at, PLACEMENT, consumer.raw() as _) }).unwrap();
+        let mut heard = heard.lock().unwrap();
+        heard[p].0 += 1;
+        heard[p].1 = start.elapsed();
+    };
+    let tally = IoTally::default();
+    // SAFETY: each destination is its own part of `gpu`, ours for the call.
+    unsafe { source.read_placements(&placements, 16, Mode::Cache, &tally, Some(&listener)) }.unwrap();
+    let total = start.elapsed();
+    consumer.drain().unwrap();
+    let heard = heard.into_inner().unwrap();
+    assert!(heard.iter().all(|(n, _)| *n == 1), "each placement is heard once: {:?}", heard.iter().map(|(n, _)| n).collect::<Vec<_>>());
+    let first = heard.iter().map(|(_, t)| *t).min().unwrap();
+    assert!(first < total, "the first placement is heard before the read returns");
+    let mut bytes = vec![0; N * PLACEMENT];
+    unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: scratch.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) }], &ReadOpts::default()) }.unwrap();
+    for p in 0..N {
+        let (got, want) = (&bytes[p * PLACEMENT..(p + 1) * PLACEMENT], &body[p * PLACEMENT..(p + 1) * PLACEMENT - PAD]);
+        assert!(&got[..PLACEMENT - PAD] == want, "placement {p}: the consumer read before its bytes landed");
+        assert!(got[PLACEMENT - PAD..].iter().all(|b| *b == 0), "placement {p}: its padding was not zeroed first");
+    }
+    println!("TIMINGS first placement ready at {:.1} ms of a {:.1} ms read ({N} x {} MiB)", first.as_secs_f64() * 1e3, total.as_secs_f64() * 1e3, PLACEMENT / MIB);
+    println!("PASS placements read ready at issue for a consumer stream {uuid}");
 }
 
 /// A destination `skew` bytes past a page boundary (0: O_DIRECT lands in place).

@@ -5,6 +5,7 @@
 //! - the page cache with TensorFS's default O_DIRECT reads (`warm_default`);
 //! - disk by buffered reads (`cold`, no O_DIRECT);
 //! - disk with O_DIRECT (`cold_direct`).
+//!
 //! One copy per 32 MiB block, as a fill issues them, and every mode's bytes are read back.
 //! `REFILL_GIB` (default 4) GiB in 1 GiB files under `REFILL_DIR` (default the temp dir). The
 //! test uses only `io::read`, so the same file builds against the shipping TensorFS (0.13.6).
