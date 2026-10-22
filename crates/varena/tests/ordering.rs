@@ -411,18 +411,25 @@ fn a_binder_never_waits_on_a_release_event() {
 
 /// This binary's namespace for tables and service names (never a machine's), and the test's
 /// table removed when it ends.
-struct Scope(String);
+// Every test in this binary uses the same process-wide RAM-tier service and its headroom
+// source. Isolate fixtures from one another; concurrency inside a case remains unchanged.
+static TEST_SCOPE: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+struct Scope {
+    uuid: String,
+    _serial: parking_lot::ReentrantMutexGuard<'static, ()>,
+}
 
 impl Scope {
     fn new(uuid: &str) -> Scope {
+        let serial = TEST_SCOPE.lock();
         assert!(varena::os::namespace(&format!("test{}-", std::process::id())));
-        Scope(uuid.to_string())
+        Scope { uuid: uuid.to_string(), _serial: serial }
     }
 }
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        varena::os::remove_table(&self.0);
+        varena::os::remove_table(&self.uuid);
     }
 }
 
