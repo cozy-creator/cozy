@@ -2999,7 +2999,13 @@ pub(crate) mod tests {
                         params: if *lane == "nvfp4" { serde_json::from_value(json!({"block_size":16,"global_scale":"multiply","nibble_order":"low_first","scale_layout":"row_major"})).unwrap() } else { Default::default() } };
                     let values = f32s(128, tag.into());
                     let arrays = BTreeMap::from([("values", PartBytes {dtype:&Dtype::F32,shape:&shape,bytes:&values})]);
-                    let encoded = encode::quantize(&encode::Input {dtype:&Dtype::BF16,shape:&shape,encoding:&encoding,arrays:&arrays}).unwrap();
+                    let encoded = if *lane == "nvfp4" {
+                        encode::quantize(&encode::Input {dtype:&Dtype::BF16,shape:&shape,encoding:&encoding,arrays:&arrays}).unwrap()
+                    } else {
+                        // Unit codes times the per-row scale reproduce `tag` exactly.
+                        vec![encode::OwnedPart {role:"weight".into(),dtype:if *lane=="fp8" {Dtype::F8_E4M3} else {Dtype::I8},shape:shape.to_vec(),bytes:vec![if *lane=="fp8" {0x38} else {1};128]},
+                            encode::OwnedPart {role:"scale".into(),dtype:Dtype::F32,shape:vec![4],bytes:f32s(4,tag.into())}]
+                    };
                     let mut readers: Vec<_> = encoded.iter().map(|part| std::io::Cursor::new(&part.bytes)).collect();
                     let parts = encoded.iter().zip(&mut readers).map(|(part,reader)| PartData {role:part.role.clone(),dtype:part.dtype.clone(),shape:part.shape.clone(),data:Source::Read(reader)}).collect();
                     writer.get("unet").put("proj.weight",&Dtype::BF16,&shape,Data::Encoded{encoding,parts}).unwrap();
