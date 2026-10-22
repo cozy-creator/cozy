@@ -1935,3 +1935,36 @@ fn a_passs_room_is_settled_when_it_returns() {
         mem.settle();
     }
 }
+
+/// S2 (64 evicting binds at 71 ms each on an L4): a bind's work is the pages it touches, never
+/// every resident page. Here its driver queries: binds evicting idle kept pages ask the same
+/// number of event queries beside 16 idle pages as beside 48 (each restock used to query every
+/// offer, and every page's set fingerprint was hashed again at each lock).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_binds_work_does_not_grow_with_the_resident_pages() {
+    let queries = |idle: u64| {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = format!("bindcost{idle}-{}", std::process::id());
+        let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: idle * REGION_ALIGN };
+        let _scope = Scope::new(&g.uuid);
+        let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
+        gate.open();
+        serve_custody(&uuid, gate, log.clone());
+        let _ledger = varena::Ledger::create(&g, None).unwrap();
+        let events = Arc::new(Events::default());
+        let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
+        let a = mem.load(stored(dir.path(), &uuid, "a", 8), Level::Ram).unwrap();
+        mem.load(stored(dir.path(), &uuid, "idle", idle + 1), Level::Gpu).unwrap();
+        mem.settle();
+        let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+        let pass = r.pass(a, "main", "1", Torch::default()).unwrap();
+        let before = events.queries.load(Ordering::SeqCst);
+        let pins: Vec<_> = (0..8).map(|b| mem.bind(a, b, 0).unwrap()).collect();
+        let asked = events.queries.load(Ordering::SeqCst) - before;
+        drop((pins, pass));
+        asked
+    };
+    let (few, many) = (queries(16), queries(48));
+    assert_eq!(few, many, "8 binds asked {few} event queries beside 16 idle pages, {many} beside 48");
+}
