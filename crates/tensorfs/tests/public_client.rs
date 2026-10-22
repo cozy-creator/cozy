@@ -1140,7 +1140,7 @@ fn python_takes_the_store_and_endpoint_by_the_native_rule() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn an_exact_commit_keeps_constraints_and_reopens_from_the_cache_once_untagged() {
+async fn an_exact_commit_keeps_constraints_online_and_offline_once_untagged() {
     let scratch=Scratch::new();
     let origin=scratch.0.join("origin");
     let vectors=Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/vectors/select");
@@ -1171,9 +1171,17 @@ async fn an_exact_commit_keeps_constraints_and_reopens_from_the_cache_once_untag
     // The tag moves on and this store learns it: the commit is untagged everywhere.
     publish(&tagged);
     assert_eq!(client.open("acme/model@1.0",&cpu).await.unwrap().tree(),Some(&tagged));
-    // A store without it is never handed it by digest, nor the tagged default instead.
+    // A store without it reads it from the endpoint that serves it, never the tagged default;
+    // with the repo document gone too, through the same path. An absent digest is not found.
     let fresh=Client::new(config(&scratch.0.join("fresh"),&http.url)).unwrap();
-    assert_eq!(fresh.open(&reference,&cpu).await.unwrap_err().kind,Kind::NotFound);
+    assert_eq!(fresh.open(&reference,&cpu).await.unwrap().tree(),Some(&exact));
+    let refs=origin.join(format::Repo::new("acme/model").key());
+    fs::remove_file(&refs).unwrap();
+    let hidden=Client::new(config(&scratch.0.join("hidden"),&http.url)).unwrap();
+    assert_eq!(hidden.open(&reference,&options).await.unwrap().id(),&encoded);
+    let absent=ObjectRef::of(b"absent");
+    let absent_ref=format!("acme/model@{}",absent.id());
+    assert_eq!(hidden.open(&absent_ref,&cpu).await.unwrap_err().kind,Kind::NotFound);
     // The store that holds it reopens it offline, with no network.
     let before=http.requests.lock().unwrap().len();
     let cached=client.open(&reference,&Open{local_files_only:true,..cpu}).await.unwrap();
@@ -1182,7 +1190,7 @@ async fn an_exact_commit_keeps_constraints_and_reopens_from_the_cache_once_untag
 
     // No tensor chunks exist, and selection issued no request for one.
     for (_,path,_) in http.requests.lock().unwrap().iter().filter(|(_,p,_)|p.starts_with("/blobs/")) {
-        assert!([&plain,&encoded,&exact,&tagged].iter().any(|object|path.ends_with(&object.sha256)),"payload requested: {path}");
+        assert!([&plain,&encoded,&exact,&tagged,&absent].iter().any(|object|path.ends_with(&object.sha256)),"payload requested: {path}");
     }
 }
 

@@ -157,8 +157,7 @@ impl Remote {
             &self.endpoint
         };
         let repo = match endpoint.inner.repo_attempt(&reference.repo_id).await {
-            Ok(Some((repo, _))) => repo,
-            Ok(None) => return fail(Kind::NotFound, format!("no repo {}", reference.repo_id)),
+            Ok(repo) => repo,
             Err(error) => {
                 let transport = matches!(&error, fetch::GetError::Exchange(_));
                 let error = from_native(error.refusal());
@@ -172,8 +171,21 @@ impl Remote {
                 return Err(error);
             }
         };
-        let (tag, variant) = fetch::resolve(&repo, revision, async |commit: &ObjectRef| self.tree(commit).await).await?;
-        Ok(Root { object: tag.commit.clone(), tag: Some(tag), variant })
+        let resolved = match repo {
+            Some((repo, _)) => fetch::resolve(&repo, revision, async |commit: &ObjectRef| self.tree(commit).await).await,
+            None => fail(Kind::NotFound, format!("no repo {}", reference.repo_id)),
+        };
+        match (resolved, revision.filter(|r| r.starts_with("sha256:"))) {
+            (Ok((tag, variant)), _) => Ok(Root { object: tag.commit.clone(), tag: Some(tag), variant }),
+            // A retained commit no tag names, as the endpoint serves it to the readers it
+            // authorizes; never the tagged default instead.
+            (Err(error), Some(digest)) if error.kind == Kind::NotFound => {
+                let object = endpoint.inner.object(digest).await.map_err(from_native)?.ok_or(error)?;
+                self.tree(&object).await?;
+                Ok(Root { object, tag: None, variant: None })
+            }
+            (Err(error), _) => Err(error),
+        }
     }
 
     /// A bare object by digest: from the store, the offline mirror, or the endpoint.
