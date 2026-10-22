@@ -709,6 +709,9 @@ impl Gate {
         let (_, ctx) = cuda::primary_context(0).unwrap();
         let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
         let d = cuda::driver().unwrap();
+        // Finish lazy kernel preparation too; a zero-length copy touches no address.
+        cuda::check("warm diagnostic copy", launch(c"copy", &[0, 0, 0], stream)).unwrap();
+        cuda::check("warm diagnostic stream", unsafe { (d.stream_synchronize)(stream as cuda::CUstream) }).unwrap();
         cuda::check("cuLaunchHostFunc", unsafe { (d.launch_host_func)(stream as cuda::CUstream, held, raw.cast()) }).unwrap();
         inside.recv().unwrap();
         Gate(Some(release))
