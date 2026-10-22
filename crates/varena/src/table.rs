@@ -496,8 +496,15 @@ impl Table {
     /// The most this process could ever have beside torch's allocation: the capacity less
     /// foreign bytes, its context, that allocation and what no ask can free from other rows.
     pub fn reachable(&self) -> u64 {
+        self.torch_ceiling().saturating_sub(self.allocated)
+    }
+
+    /// The most torch's allocator could ever hold (its fraction cap beside a pool varena's own
+    /// allocator governs): the capacity less foreign bytes, the context and what no ask can free
+    /// from other rows. Its own pages and others' evictable bytes count: they can be made room.
+    pub fn torch_ceiling(&self) -> u64 {
         let others: u64 = self.others.iter().map(Remote::unevictable).sum();
-        self.capacity.saturating_sub(self.foreign + self.context + self.allocated + others)
+        self.capacity.saturating_sub(self.foreign + self.context + others)
     }
 
     /// What torch's allocator may hold: capacity − context − mapped − other rows − foreign.

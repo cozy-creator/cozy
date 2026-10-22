@@ -164,6 +164,9 @@ class Memory:
 
     def torch_limit(self) -> int:
         """Bytes torch's allocator may hold now."""
+    def torch_ceiling(self) -> int:
+        """The most torch's allocator could ever hold here (allocated + reachable): the fraction
+        cap beside the native pool, whose segments varena's allocator governs inside it."""
 
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
@@ -412,6 +415,9 @@ def allocator_check(device: int) -> None: ...
 
 def allocator_refusals(device: int | None = None) -> list[tuple[int, tuple[int, int], str, int, int, int]]:
     """Each device and pool's last refusal: (device, pool, reason, size, held bytes, limit)."""
+
+def pins_held() -> int:
+    """Pins the binding holds now: Python's pin objects and the tensors that keep one."""
 
 def allocator_quarantined(device: int | None = None) -> list[tuple[int, tuple[int, int], int, str]]:
     """Quarantined segments by device and pool: (device, pool, bytes, last reason). They stay

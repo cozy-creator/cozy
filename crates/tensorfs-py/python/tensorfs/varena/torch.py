@@ -32,7 +32,7 @@ from typing import Protocol, TypeAlias
 import tensorfs
 import torch
 from torch import Tensor, nn
-from torch.utils._pytree import tree_leaves
+from torch.utils._pytree import tree_leaves, tree_map
 
 from . import Exhausted, Fill, GpuId, Grant, Level, Next, Pass, Pin, Stats, VarenaError, Window, Yielded
 from . import Memory as Native
@@ -104,8 +104,10 @@ class Declared:
 
 
 class Placeholder(Tensor):
-    """A weight while no pin is bound to it: shape, dtype and device, no bytes. Only a dtype or
-    device change (another placeholder) and detach work on it."""
+    """A weight while no pin is bound to it: shape, dtype and device, no bytes. A dtype or
+    device change is another placeholder and detach is itself; any other op reads it outside its
+    block's forward, which binds the block on read (`_varena_read`): the op runs on the bound
+    tensor, which (with what it views) owns the pin until it dies."""
 
     @staticmethod
     def __new__(cls, shape, dtype, device):  # type: ignore[no-untyped-def]
@@ -121,8 +123,23 @@ class Placeholder(Tensor):
             return args[0]
         if func is aten._to_copy.default:
             held = args[0]
-            return cls(held.shape, kwargs.get("dtype") or held.dtype, kwargs.get("device") or held.device)
-        raise Unbound(f"{func}: a weight with no pin bound (used outside its block's forward)")
+            dtype, device = kwargs.get("dtype") or held.dtype, kwargs.get("device") or held.device
+            made = cls(held.shape, dtype, device)
+            read = getattr(held, "_varena_read", None)
+            if read is not None:
+                made._varena_read = lambda: read().to(device=device, dtype=dtype)
+            return made
+
+        def bound(a: object) -> object:
+            if not isinstance(a, Placeholder):
+                return a
+            read = getattr(a, "_varena_read", None)
+            if read is None:
+                raise Unbound(f"{func}: a weight of no loaded model, with no pin bound")
+            return read()
+
+        args, kwargs = tree_map(bound, (args, kwargs))
+        return func(*args, **kwargs)
 
 
 def blocks_of(module: nn.Module) -> list[str]:
@@ -426,6 +443,8 @@ class Memory:
         self.measuring = threading.Lock()
         #: (set, block) -> bytes kept bound for tensors that outlived their block's run
         self.escaped: dict[tuple[str, str], int] = {}
+        #: weights read outside their block's forward, bound on read: (reads, bytes) per block
+        self.off_forward: dict[tuple[str, str], tuple[int, int]] = {}
         #: the bytes torch's allocator is capped at now
         self.capped: int | None = None
         #: Request allocations use the native callback, which reclaims completed local pages
@@ -639,13 +658,13 @@ class Memory:
         """torch's allocator cap. At a pass's start, the larger of `torch_limit` and the pass's
         measured `room`; otherwise, or beside another running pass, it only rises: a pass that
         got its room never has its allocator churn against a smaller cap. With the pool, its
-        segments ask varena themselves: no cap."""
+        segments ask varena themselves, so the cap is `torch_ceiling`, the most torch could ever
+        hold: torch checks it before the pool's allocator, and it bounds other threads' default
+        pool."""
         if self.pool is not None and self.pooling:
-            if self.capped != self.torch.total:
-                self.capped = self.torch.total
-                self.torch.cap(self.capped)
-            return
-        want = max(self.native.torch_limit(), room)
+            want = self.native.torch_ceiling()
+        else:
+            want = max(self.native.torch_limit(), room)
         if not start or self.passes:
             want = max(want, self.capped or 0)
         if want != self.capped:
@@ -784,6 +803,37 @@ class Memory:
             warnings.warn(f"{model.name}: a weight tensor of block {block.path or 'common'!r} outlived its forward; its page stays bound while it lives", stacklevel=2)
         block.views = block.assign = block.window = block.track = block.at = None
 
+    def _read(self, block: _Block, site: _Site) -> Tensor:
+        """A weight read outside its block's forward (a package's table, an overlay's factor):
+        its block bound now, on the current stream; the tensor returned, and any view of it,
+        owns the pin, so the page stays bound while it lives (the escaped-view rule). Counted as
+        an off-forward read."""
+        model = block.model
+        stream = torch.cuda.current_stream(self.device) if self.cuda else None
+        pin = self.native.bind(model.id, block.region, stream.cuda_stream if stream is not None else 0)
+        if self.torch.kind in ("cpu", "cuda"):
+            window = pin.window()
+            window.keep(pin)
+            views = _views(block, torch.from_dlpack(window))
+            if pin.fresh and model.fill is not None:
+                model.fill(block.path, views)  # in place: the views alias the page
+                pin.filled()
+        else:  # MPS: the host bytes are baked, then copied in
+            base = torch.from_dlpack(pin)
+            if pin.fresh and model.fill is not None:
+                model.fill(block.path, _views(block, base))
+                pin.filled()
+            views = _views(block, base.to(self.device))
+        value = next((v for s, v in _assign(block, views)[0] if s.table is site.table and s.attr == site.attr), None)
+        if value is None:
+            raise Unbound(f"{model.name}: {site.attr} is not a tensor of block {block.path or 'common'!r}")
+        key = (model.name, block.path)
+        r = _request.get()
+        for counts in (self.off_forward, *((r.off_forward,) if r is not None else ())):
+            reads, nbytes = counts.get(key, (0, 0))
+            counts[key] = (reads + 1, nbytes + pin.len)
+        return value
+
     def _bind(self, block: _Block, stream: torch.cuda.Stream | None, pin: Pin | None = None) -> None:
         model = block.model
         if pin is None:
@@ -829,6 +879,8 @@ class Request:
         self.churn: dict[str, int] = {}
         #: (set, block) -> bytes kept bound in it for weight tensors that outlived their run
         self.escaped: dict[tuple[str, str], int] = {}
+        #: (set, block) -> (reads, bytes) of weights read outside their block's forward
+        self.off_forward: dict[tuple[str, str], tuple[int, int]] = {}
 
     def plan(self, steps: Sequence[object]) -> None:
         """Replaces the plan (as `Memory.request` takes it); its cursor starts over."""
@@ -1048,9 +1100,10 @@ def _sites(module: nn.Module) -> dict[str, list[_Site]]:
 
 
 def _placeholders(model: Model) -> None:
-    """Every meta tensor becomes a placeholder on the execution device."""
+    """Every meta tensor becomes a placeholder on the execution device, read on demand."""
     done: set[int] = set()
-    for group in model.sites.values():
+    paths = list(model.blocks)
+    for name, group in model.sites.items():
         meta = group[0].table[group[0].attr]
         if meta is None or id(meta) in done or meta.device.type != "meta":
             continue
@@ -1058,6 +1111,8 @@ def _placeholders(model: Model) -> None:
         held: Tensor = Placeholder(meta.shape, meta.dtype, model.memory.device)
         if group[0].parameter:
             held = nn.Parameter(held, requires_grad=False)
+        block = model.blocks.get(_block_of(name, paths)) or model.common
+        held._varena_read = lambda block=block, site=group[0]: model.memory._read(block, site)  # type: ignore[attr-defined]
         for site in group:
             site.table[site.attr] = held
 

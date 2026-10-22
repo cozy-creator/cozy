@@ -1262,6 +1262,21 @@ impl Memory {
             .unwrap_or(0)
     }
 
+    /// The most torch's allocator could ever hold here (`allocated + reachable`): the cap for
+    /// torch's own pools while varena's allocator governs its pool's segments inside it. The
+    /// adapter applies it at every pass start and after every `oom` answer.
+    pub fn torch_ceiling(&self) -> u64 {
+        self.inner
+            .guard(|| {
+                let mut st = self.inner.lock();
+                let _admission = self.inner.refresh(&mut st)?;
+                let ceiling = st.table.torch_ceiling();
+                self.inner.unlock(st);
+                Ok(ceiling)
+            })
+            .unwrap_or(0)
+    }
+
     /// Whether driver-owned context growth has a measurable per-process owner. A graph
     /// capacity proof must report this; the opening-context fallback alone cannot prove it.
     pub fn context_measurable(&self) -> bool { self.inner.backend.process_used().is_ok() }
