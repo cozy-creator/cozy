@@ -136,6 +136,16 @@ impl Drop for Retained {
     }
 }
 
+/// One committed external allocation. The allocator retains this token until checked
+/// physical release; quarantined allocations retain it until executor exit.
+pub struct Resident {
+    inner: Owner,
+    bytes: u64,
+}
+impl Drop for Resident {
+    fn drop(&mut self) { self.inner.native_resident.fetch_sub(self.bytes, Ordering::AcqRel); }
+}
+
 /// Admitted bytes not yet backed by a native pool segment. Segment allocation converts the
 /// promise into actual allocator bytes; dropping releases only the unused promise.
 pub struct Workspace {
@@ -848,6 +858,7 @@ struct Inner {
     stop: Arc<AtomicBool>,
     ownership_lost: AtomicBool,
     public_owners: AtomicU64,
+    native_resident: AtomicU64,
     #[cfg(unix)]
     tally: tensorfs::io::source::IoTally,
 }
@@ -915,6 +926,7 @@ impl Memory {
                 stop: Arc::new(AtomicBool::new(false)),
                 ownership_lost: AtomicBool::new(false),
                 public_owners: AtomicU64::new(0),
+                native_resident: AtomicU64::new(0),
                 #[cfg(unix)]
                 tally: Default::default(),
             });
@@ -1087,6 +1099,14 @@ impl Memory {
             self.inner.publish(&st);
             Ok(())
         })
+    }
+
+    /// Records a successful native segment allocation. Call only after the driver succeeds;
+    /// drop the returned token only after its physical free succeeds, outside allocator locks.
+    pub fn resident(&self, bytes: u64) -> Resident {
+        let inner: Owner = self.inner.clone().into();
+        inner.native_resident.fetch_add(bytes, Ordering::AcqRel);
+        Resident { inner, bytes }
     }
 
     /// The native allocator's limit without waiting for state or running maintenance.

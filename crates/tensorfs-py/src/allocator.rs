@@ -46,12 +46,12 @@ struct Counters {
     refusal: Option<(&'static str, u64, u64, u64)>,
 }
 
-#[derive(Clone, Copy)]
 struct Allocation {
     device: i32,
     pool: Pool,
     bytes: u64,
     pending: bool,
+    _resident: Option<varena::memory::Resident>,
 }
 
 #[derive(Default)]
@@ -59,9 +59,10 @@ struct Accounts {
     counts: BTreeMap<(i32, Pool), Counters>,
     pointers: BTreeMap<usize, Allocation>,
     faults: BTreeMap<i32, String>,
+    quarantined: Vec<Allocation>,
 }
 
-static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new() });
+static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new() });
 
 fn accounts() -> std::sync::MutexGuard<'static, Accounts> {
     ACCOUNTS.lock().unwrap_or_else(|p| p.into_inner())
@@ -81,8 +82,8 @@ fn retiring(ptr: usize) -> bool {
     let Some(a) = all.pointers.get_mut(&ptr) else { return false };
     if a.pending { return false; }
     a.pending = true;
-    let a = *a;
-    all.counts.entry((a.device, a.pool)).or_default().pending += a.bytes;
+    let (device, pool, bytes) = (a.device, a.pool, a.bytes);
+    all.counts.entry((device, pool)).or_default().pending += bytes;
     true
 }
 
@@ -90,8 +91,8 @@ pub fn fault_message(device: i32) -> Option<String> { accounts().faults.get(&dev
 
 fn quarantine(ptr: usize, reason: String) {
     let mut all = accounts();
-    if let Some(a) = all.pointers.get(&ptr).copied() {
-        all.faults.entry(a.device).or_insert(reason);
+    if let Some(device) = all.pointers.get(&ptr).map(|a| a.device) {
+        all.faults.entry(device).or_insert(reason);
     }
 }
 
@@ -207,6 +208,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
             }
         }
     };
+    let resident = (ptr != 0).then(|| active.as_ref().map(|a| a.memory.resident(size as u64))).flatten();
     let mut all = accounts();
     let c = all.counts.entry(key).or_default();
     c.ns += began.elapsed().as_nanos() as u64;
@@ -214,7 +216,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     else {
         c.live += size as u64; c.segments += 1;
         if reclaimed_total != 0 { c.resolved += 1; c.resolved_bytes += reclaimed_total; }
-        all.pointers.insert(ptr as usize, Allocation { device, pool, bytes: size as u64, pending: false });
+        all.pointers.insert(ptr as usize, Allocation { device, pool, bytes: size as u64, pending: false, _resident: resident });
     }
     ptr as *mut c_void
 }
@@ -240,17 +242,25 @@ fn freer() -> &'static mpsc::Sender<Pending> {
                 // SAFETY: this worker owns the event and the segment is no longer torch's.
                 let ready = unsafe { (d.event_synchronize)(p.event as cuda::CUevent) };
                 if ready != cuda::SUCCESS { quarantine(p.ptr, format!("consumer completion could not be proven (CUDA {ready})")); continue; }
+                // Detach this generation before the driver can reuse its address. A new
+                // allocation at the same pointer must never be removed by this old free.
+                let Some(a) = accounts().pointers.remove(&p.ptr) else { continue };
                 let rc = unsafe { (d.mem_free)(p.ptr as cuda::CUdeviceptr) };
                 unsafe { (d.event_destroy)(p.event as cuda::CUevent); }
                 if rc == cuda::SUCCESS {
-                    let mut all = accounts();
-                    if let Some(a) = all.pointers.remove(&p.ptr) {
+                    {
+                        let mut all = accounts();
                         let c = all.counts.entry((a.device, a.pool)).or_default();
                         c.live = c.live.saturating_sub(a.bytes);
                         if a.pending { c.pending = c.pending.saturating_sub(a.bytes); }
                         c.frees += 1;
                     }
-                } else { quarantine(p.ptr, format!("CUDA segment release failed ({rc})")); }
+                    drop(a); // physical token/public owner drops outside the accounts lock
+                } else {
+                    let mut all = accounts();
+                    all.faults.entry(a.device).or_insert_with(|| format!("CUDA segment release failed ({rc})"));
+                    all.quarantined.push(a);
+                }
             }
         });
         tx
