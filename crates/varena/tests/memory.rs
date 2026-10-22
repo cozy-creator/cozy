@@ -730,3 +730,19 @@ fn a_rooms_slack_excludes_the_cache_it_started_with() {
     measure("1x4", 40 * MB);
     assert_eq!(room(&mem, id, "t", "1x4", pages, None), 7 * MB, "its own 3 MB and the 4 MB its allocations left reserved");
 }
+
+/// The fraction cap beside the native pool (S3, design §1): torch's ceiling is what it could ever
+/// hold, its own pages included (they can be made room), so mapping them lowers torch_limit but
+/// not the ceiling; it is allocated + reachable.
+#[test]
+fn torch_ceiling_counts_own_pages_as_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("ceiling", 8 * MB);
+    let (ceiling, limit) = (mem.torch_ceiling(), mem.torch_limit());
+    assert_eq!(ceiling, limit, "nothing mapped: the ceiling is the limit");
+    mem.load(set(dir.path(), "c", 2, &g.uuid), Level::Gpu).unwrap();
+    assert_eq!(mem.torch_limit(), limit - 2 * REGION_ALIGN, "its pages take from the limit");
+    assert_eq!(mem.torch_ceiling(), ceiling, "not from the ceiling");
+    let status = ledger.status();
+    assert!(mem.torch_ceiling() <= status.capacity, "{} within {}", mem.torch_ceiling(), status.capacity);
+}
