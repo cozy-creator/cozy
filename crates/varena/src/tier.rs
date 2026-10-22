@@ -39,6 +39,9 @@ const NAME: &str = "tier";
 /// ([`crate::Ledger::host_need`]); an executor serving the tier itself, its own GPU's.
 pub type Need = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
+// The live OS source in production; deterministic headroom in isolated service tests.
+type Budget = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// TensorD's need source: what the requests running on its GPUs keep free, summed (`None`
 /// while any is unmeasured).
 pub fn need(ledgers: &[&crate::Ledger]) -> Need {
@@ -54,7 +57,7 @@ fn budget() -> u64 {
 /// The tier's one admission: a fill of `bytes` goes only into measured surplus, the live budget
 /// less what the running calls must keep free. Layouts nobody maps make room first, then those
 /// executors map (asked back), in [`host_decide`] order. Never beside an unmeasured call.
-fn admit(state: &Shared, need: &Need, bytes: u64) -> bool {
+fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget) -> bool {
     let Some(keep) = need() else { return false };
     let want = keep.saturating_add(bytes);
     let room = budget();
@@ -379,6 +382,10 @@ impl Tier {
     }
 
     fn bind(need: Need) -> Result<Option<Tier>> {
+        Self::bind_with(need, Arc::new(budget))
+    }
+
+    fn bind_with(need: Need, budget: Budget) -> Result<Option<Tier>> {
         let Some(listener) = os::listen(os::euid(), NAME)? else { return Ok(None) };
         let short = os::event()?;
         let signal = os::dup(&short)?;
@@ -392,8 +399,8 @@ impl Tier {
                     if halt.load(Acquire) {
                         return;
                     }
-                    let (s, need) = (s.clone(), need.clone());
-                    let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s, &need));
+                    let (s, need, budget) = (s.clone(), need.clone(), budget.clone());
+                    let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s, &need, &budget));
                 }
             })
             .map_err(|e| Error::io("spawn tier", e))?;
@@ -466,7 +473,7 @@ impl Tier {
     }
 }
 
-fn serve(stream: Stream, state: &Shared, need: &Need) {
+fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget) {
     // Only this user's processes: an abstract name has no permissions of its own.
     if os::peer(&stream).is_err() {
         return;
@@ -529,7 +536,7 @@ fn serve(stream: Stream, state: &Shared, need: &Need) {
             Call::Room { bytes } => {
                 drop(s);
                 // Never waits: what nobody maps goes now; what executors map is asked back.
-                let ok = admit(state, need, bytes);
+                let ok = admit(state, need, bytes, budget);
                 cv.notify_all();
                 s = lock.lock();
                 (Reply::Room { ok }, None)
@@ -868,5 +875,46 @@ fn connect(ns: u32, need: &Need) -> Result<(Stream, Option<Tier>)> {
             Ok(p) => Tier::serve(Pressure::Host(p), need.clone())?,
             Err(_) => Tier::serve(Pressure::Headroom, need.clone())?,
         };
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod reservation_tests {
+    #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+    use super::*;
+
+    // Each service case gets a subprocess and namespace; a lib-test thread never changes
+    // another test's process-wide namespace or connects to the user's actual tier.
+    fn isolated(name: &str, run: impl FnOnce()) {
+        const ROLE: &str = "VARENA_TIER_RESERVATION_TEST";
+        if std::env::var(ROLE).as_deref() == Ok(name) {
+            assert!(os::namespace(&format!("tier-reservation-{}-", std::process::id())));
+            run();
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&format!("tier::reservation_tests::{name}"), "--exact", "--nocapture", "--test-threads=1"])
+            .env(ROLE, name).status().unwrap();
+        assert!(status.success(), "isolated tier case {name}: {status}");
+    }
+
+    fn room(bytes: u64) -> (Stream, bool) {
+        let stream = os::connect(os::euid(), NAME).unwrap().unwrap();
+        let (reply, _) = os::call::<_, Reply>(&stream, &Call::Room { bytes }, None).unwrap();
+        (stream, matches!(reply, Reply::Room { ok: true }))
+    }
+
+    #[test]
+    fn concurrent_fills_cannot_spend_the_same_surplus() {
+        isolated("concurrent_fills_cannot_spend_the_same_surplus", || {
+            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(|| 6)).unwrap().unwrap();
+            let (_first, admitted) = room(4);
+            assert!(admitted);
+            // The first fill has been admitted but has not touched its pages yet. Another
+            // connection sees the same OS headroom, but four bytes are already promised.
+            let (_second, admitted) = room(4);
+            assert!(!admitted, "two pending fills spent the same six bytes of host surplus");
+        });
     }
 }
