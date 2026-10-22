@@ -435,7 +435,12 @@ fn many_destinations_at_once_from_a_writers_folder() {
     println!("disk probe: {gbps:.2} GB/s, direct {direct}");
     assert!(gbps > 0.0 && direct == direct_ok(&ck));
     assert!(io::ceiling(None, &scratch.0).unwrap().disk_gbps > 0.0);
-    assert_eq!(io::ceiling(Some(0), &scratch.0).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    // GPU 0's copy ceiling is measured where this machine has one, refused where it has none.
+    let gpus = platform::gpu::probe(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref()).unwrap_or_default();
+    match io::ceiling(Some(0), &scratch.0) {
+        Ok(ceiling) => assert!(!gpus.is_empty() && ceiling.h2d_gbps.is_some_and(|gbps| gbps > 0.0), "{ceiling:?}"),
+        Err(error) => assert!(gpus.is_empty() && error.kind() == std::io::ErrorKind::Unsupported, "{error}"),
+    }
 }
 
 /// What `Tensors.read` does with many tensors: every range in one allocation at its `pack`
