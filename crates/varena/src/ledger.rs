@@ -474,12 +474,34 @@ impl Shared {
     /// After a row left: with no row left and nobody else holding the table open, its name
     /// goes (a standalone engine's table, its last user gone).
     fn leave(&self) -> Result<()> {
-        if !self.rows()?.is_empty() || !os::lock(&self.fd, OPEN, 8, false)? {
+        // A Shared can have several rows and callers in this process. Its OPEN lock is one
+        // file description, so only the heap mutex excludes a concurrent local claim/leave.
+        let _heap = self.heap()?;
+        let m = self.map()?;
+        let end = header(&m).end.load(Acquire);
+        let mut at = HEADER;
+        while at < end {
+            let w = atomic(&m, at).ok_or_else(|| Error::Internal("ledger leave outside its map".into()))?.load(Acquire);
+            if cells(w) == 0 || at + cells(w) * CELL > end {
+                return Err(Error::Internal("ledger leave found a torn record".into()));
+            }
+            // A claim owns the generation before it publishes READY or takes its row lock.
+            if kind(w) == ROW && state(w) != FREE {
+                return Ok(());
+            }
+            at += cells(w) * CELL;
+        }
+        if !os::lock(&self.fd, OPEN, 8, false)? {
             return Ok(());
         }
-        os::unlink(&self.name);
+        // A delayed second leave on the old description must never unlink a replacement
+        // created under the same name after the first leave retired this generation.
+        let linked = os::linked(&self.fd);
+        if matches!(linked, Ok(true)) {
+            os::unlink(&self.name);
+        }
         os::share(&self.fd, OPEN, 8, false)?;
-        Ok(())
+        linked.map(|_| ())
     }
 
     // ---- rows
@@ -1381,6 +1403,35 @@ mod tests {
         assert_eq!(second.ask(row_id(at, stale), Class::N, 1).unwrap(), 0);
         drop(second);
         os::unlink(&gpu.uuid);
+    }
+
+    #[test]
+    fn a_delayed_leave_cannot_unlink_the_next_table_generation() {
+        let gpu = GpuId { uuid: format!("unit-{}-leave-generation", std::process::id()), model: "host".into(), memory: 64 << 20 };
+        let old = Arc::new(Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, 12 << 20).unwrap());
+        drop(old.claim(std::process::id()).unwrap());
+        assert!(!os::linked(&old.fd).unwrap());
+        let next = Arc::new(Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, 8 << 20).unwrap());
+        let row = next.claim(std::process::id()).unwrap();
+        old.leave().unwrap();
+        assert!(os::linked(&next.fd).unwrap(), "a delayed leave owns only its old generation");
+        let reopened = Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, gpu.memory).unwrap();
+        assert_eq!(reopened.capacity().unwrap(), 8 << 20, "the cap survives reopening by name");
+        drop(reopened);
+        drop(row);
+    }
+
+    #[test]
+    fn a_claiming_row_keeps_the_table_linked() {
+        let gpu = GpuId { uuid: format!("unit-{}-claim-generation", std::process::id()), model: "host".into(), memory: 64 << 20 };
+        let shared = Arc::new(Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, 8 << 20).unwrap());
+        // Stop precisely between heap allocation and publishing the new row READY.
+        let (at, ready) = shared.alloc(ROW_CELLS, ROW, |_, _| {}).unwrap();
+        shared.leave().unwrap();
+        assert!(os::linked(&shared.fd).unwrap(), "the unpublished claim already owns this generation");
+        assert!(shared.free(at, ready & !0xff | CLAIMING, false).unwrap());
+        shared.leave().unwrap();
+        assert!(!os::linked(&shared.fd).unwrap());
     }
 
     /// A table's namespace is its owner's; a process's own uid is what `grant` reads for it.
