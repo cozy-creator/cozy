@@ -338,6 +338,29 @@ impl Drop for Shared {
     }
 }
 
+/// The processes that have the file behind `fd` open, this one aside (Linux: their
+/// descriptors; elsewhere none are named).
+fn openers(fd: &Owned) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let Ok(path) = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())) else { return vec![] };
+        let me = std::process::id();
+        let Ok(procs) = std::fs::read_dir("/proc") else { return vec![] };
+        procs
+            .flatten()
+            .filter_map(|p| p.file_name().to_str().and_then(|n| n.parse::<u32>().ok()))
+            .filter(|pid| *pid != me)
+            .filter(|pid| std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok_and(|fds| fds.flatten().any(|f| std::fs::read_link(f.path()).is_ok_and(|l| l == path))))
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        vec![]
+    }
+}
+
 impl Shared {
     /// The table behind `fd` (a grant's), initialised if it is new. The first opener sets the
     /// capacity; a later one can only lower it.
@@ -356,13 +379,30 @@ impl Shared {
             if os::size(&fd)? < HEADER {
                 os::resize(&fd, HEADER)?;
             }
-            let map = os::map(&fd, os::size(&fd)? as usize, true)?;
+            let mut map = os::map(&fd, os::size(&fd)? as usize, true)?;
             // SAFETY: the header page is mapped and aligned; its fields are atomics or written
             // once under the heap lock before `magic`.
-            let h = unsafe { &mut *(map.base as *mut Header) };
-            if h.magic != 0 && h.magic != MAGIC {
-                return Err(Error::Closed("incompatible live varena table; its owners must finish before reopening".into()));
+            let magic = unsafe { (*(map.base as *const Header)).magic };
+            if magic != 0 && magic != MAGIC {
+                // Another build's table (S3's gpu12 and gpu14: a wheel's A/B on one pod). With
+                // its owners still open it waits for them; with none it is this build's now.
+                let format = String::from_utf8_lossy(&magic.to_le_bytes()).into_owned();
+                if os::held(&fd, OPEN, 8)? {
+                    return Err(Error::Closed(format!(
+                        "the varena table of {} is another build's (format {format}; this build's is {}), and its owners have it open (pids {:?}): it is reopened once they finish",
+                        gpu.uuid,
+                        String::from_utf8_lossy(&MAGIC.to_le_bytes()),
+                        openers(&fd)
+                    )));
+                }
+                tracing::warn!("varena: the table of {} was another build's (format {format}) with no owner open: reclaimed", gpu.uuid);
+                drop(map);
+                os::resize(&fd, 0)?;
+                os::resize(&fd, HEADER)?;
+                map = os::map(&fd, os::size(&fd)? as usize, true)?;
             }
+            // SAFETY: as above, the header page of the (possibly reclaimed) mapping.
+            let h = unsafe { &mut *(map.base as *mut Header) };
             if h.magic == 0 {
                 h.capacity.store(capacity, Relaxed);
                 h.end.store(HEADER, Relaxed);
@@ -1622,6 +1662,28 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
     use super::*;
+
+    /// S3's gpu12 and gpu14 (two wheels' A/B on one pod): another build's table names its format
+    /// and owners while one has it open, and is reclaimed once none does.
+    #[test]
+    fn another_builds_table_is_named_while_open_and_reclaimed_after() {
+        let gpu = GpuId { uuid: format!("unit-{}-format", std::process::id()), model: "host".into(), memory: 1 << 30 };
+        let old = os::shared(&gpu.uuid, true).unwrap();
+        os::resize(&old, HEADER).unwrap();
+        let map = os::map(&old, HEADER as usize, true).unwrap();
+        // SAFETY: the header page, mapped writable, this test's alone.
+        unsafe { (*(map.base as *mut Header)).magic = u64::from_le_bytes(*b"vledgr11") };
+        drop(map);
+        // An owner of the other build has it open.
+        os::share(&old, OPEN, 8, true).unwrap();
+        let refused = Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, gpu.memory).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(refused.contains("format vledgr11") && refused.contains("have it open"), "another build's open table: {refused}");
+        drop(old);
+        let shared = Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, gpu.memory).unwrap();
+        assert!(shared.rows().unwrap().is_empty(), "reclaimed: this build's, empty");
+        drop(shared);
+        os::remove_table(&gpu.uuid);
+    }
 
     /// Review 1, finding 1: a reaper or writer acting on a stale view frees nothing once the
     /// offset holds a newer record: the free compares the whole word, generation included.
