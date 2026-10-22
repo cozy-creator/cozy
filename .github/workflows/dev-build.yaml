@@ -64,6 +64,11 @@ jobs:
     runs-on: ${{ inputs.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 60
+    # Every step's script is bash, on Windows and macOS runners too (`runner`: windows-latest,
+    # macos-latest run the targeted test command; the builds are Linux's).
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
         with:
@@ -233,7 +238,7 @@ jobs:
           persist-credentials: false
           path: .tensorhub
       # The machine's executor containment needs a delegated cgroup subtree.
-      - if: inputs.test != ''
+      - if: inputs.test != '' && runner.os == 'Linux'
         env:
           TEST: ${{ inputs.test }}
         run: |
@@ -246,6 +251,12 @@ jobs:
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=UV_TORCH_BACKEND=cpu \
             --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
             bash -euo pipefail -c "$TEST"
+      # Elsewhere (Windows, macOS) the command runs as it is: no executor containment there.
+      - if: inputs.test != '' && runner.os != 'Linux'
+        env:
+          TEST: ${{ inputs.test }}
+          CARGO_TERM_COLOR: never
+        run: bash -euo pipefail -c "$TEST"
       # Targeted proof commands may produce portable test executables and their source/hash
       # receipts. Export those exact files so a later paid worker needs no compiler.
       - name: Retain targeted proof executables
