@@ -2127,6 +2127,7 @@ impl Inner {
             let pin = st.tick();
             st.pins.insert(pin, (s.key, None, std::thread::current().id()));
             st.saving = Some(s.key);
+            st.table.saving = place.2;
             st.sync(s.key);
             self.unlock(st);
             (pin, held, place, ready)
@@ -2187,6 +2188,7 @@ impl Inner {
         let mut st = self.lock();
         st.pins.remove(&pin);
         st.saving = None;
+        st.table.saving = 0;
         st.sync(s.key);
         // Its class while pinned may have been published meanwhile: no longer.
         self.publish(&mut st);
@@ -2273,17 +2275,6 @@ impl Inner {
                 if actions.iter().any(|a| matches!(a, Action::Cut { .. })) && !remote.is_empty() {
                     (*room, *unmeasured) = self.pass_room(&mut st, r, *set)?;
                 }
-            }
-            // A tier copy in flight holds its page like a consumer: a decision short of bytes
-            // waits for it, then decides again.
-            if remote.is_empty() && st.saving.is_some() && matches!(actions.last(), Some(Action::Exhausted { .. } | Action::Park(_))) {
-                self.publish(&mut st);
-                drop(admission);
-                while st.saving.is_some() {
-                    self.wait(&mut st)?;
-                }
-                self.unlock(st);
-                continue;
             }
             self.publish(&mut st);
             drop(admission);
@@ -3144,6 +3135,12 @@ impl Inner {
         if self.to_custody.pending() > 0 {
             self.to_custody.settle();
         }
+        // A running tier copy's page: evictable once the copy ends.
+        let mut st = self.lock();
+        while st.saving.is_some() {
+            self.wait(&mut st)?;
+        }
+        self.unlock(st);
         let _waiting = self.row.waiting();
         let epoch = self.room_wake.epoch();
         // Check after registering, so any subsequent completion signals this endpoint.
@@ -3160,6 +3157,10 @@ impl Inner {
     fn answer(&self, ceiling: Class, bytes: u64) -> u64 {
         let out = crate::caught(|| {
             let mut st = self.lock();
+            // A tier copy's page comes back with it: the answer counts it (review 4, N4).
+            while st.saving.is_some() {
+                self.wait(&mut st)?;
+            }
             let actions = decide(&st.table, &Trigger::Ask { ceiling, bytes });
             let mut freed = 0;
             let mut wanted = Wanted::default();
