@@ -214,6 +214,10 @@ def allocator_stats() -> tuple[int, int, int, int, int, int]:
     """SPIKE: the pool's segments: (live bytes, segments made, shortfalls varena resolved, their
     bytes, refusals, nanoseconds making segments)."""
 
+def allocator_reentries() -> tuple[int, int]:
+    """SPIKE: the trims and cache shrinks varena reached on a thread inside the allocator
+    (answered 0, never run)."""
+
 class Pass:
     def end(self, allocated_peak: int, slack: int, sites: list[tuple[str, int, bool, int]], allocated: int, reserved: int) -> None:
         """Records what the pass measured (torch's absolute allocated peak, the allocator's slack

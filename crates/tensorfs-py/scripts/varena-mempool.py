@@ -10,7 +10,11 @@ OutOfMemoryError. Measured against torch's default allocator under the same cap,
   3. the allocator's cost per new segment, and segments per warm forward;
   4. a forced exhaustion is torch's OutOfMemoryError at its call site, and the next pass runs;
   5. the bytes torch holds outside the pool in a forward, by source;
-  6. no deadlock while a second thread allocates on the device as varena evicts.
+  6. no deadlock while a second thread allocates on the device as varena evicts;
+  7. torch holding a large cached slack when varena is short: varena asks for no trim, the
+     allocator refuses, torch releases its own cache and asks again (no callback runs inside);
+  8. no deadlock when a stream host callback that takes the GIL is queued ahead of varena's
+     unmaps.
 
     python scripts/varena-mempool.py
 GPU 0 only.
@@ -18,6 +22,7 @@ GPU 0 only.
 
 from __future__ import annotations
 
+import ctypes
 import faulthandler
 import sys
 import tempfile
@@ -28,7 +33,7 @@ from pathlib import Path
 import tensorfs
 import torch
 from diffusers import UNet2DConditionModel
-from tensorfs.varena import VarenaError, allocator_stats
+from tensorfs.varena import VarenaError, allocator_reentries, allocator_stats
 from tensorfs.varena.torch import Declared, Memory, Weights
 
 CONFIG = dict(
@@ -223,8 +228,68 @@ def main() -> int:
     other.join()
     print(f"SECOND thread: {count[0]} allocations of 256 MiB; evicted by class {r.stats().evicted}", flush=True)
     check("6: no deadlock: the pool's passes complete beside a thread allocating as varena evicts", raised is None and len(times) == STEPS and count[0] > 0, (raised, count, errors))
+    host_callback(mem, run)
+    slack(mem, run)
     print(f"{sum(results)}/{len(results)} checks passed", flush=True)
     return 0 if all(results) else 1
+
+
+def slack(mem: Memory, run: Run) -> None:
+    """7: the filler gone and every block pinned (a hold), so varena has nothing more to free;
+    torch's pool caching a
+    large freed buffer: a bigger one fits only once torch lets its cache go. varena gets no slack
+    and asks for no trim, the allocator refuses once, torch empties its cache and asks again."""
+    mem.pooling = True
+    mem.models[run.filler].close()  # its pages go: varena has nothing left to free but by a cut
+    hold = mem.models[run.unet].hold()
+    seen: dict[str, object] = {}
+
+    def probe(*_: object) -> None:
+        free = mem.native.torch_limit() - (torch.cuda.memory_reserved(mem.device))
+        first, second = int(free * 0.6) // (2 << 20) * (2 << 20), int(free * 0.7) // (2 << 20) * (2 << 20)
+        before, reentries = allocator_stats(), allocator_reentries()
+        a = torch.empty(first, dtype=torch.uint8, device=mem.device)
+        del a  # cached in the pool: torch's slack
+        try:
+            b = torch.empty(second, dtype=torch.uint8, device=mem.device)
+            del b
+            seen["ok"] = True
+        except torch.OutOfMemoryError as e:
+            seen["ok"] = e
+        after = allocator_stats()
+        seen.update(refused=after[4] - before[4], segments=after[1] - before[1], reentries=(allocator_reentries()[0] - reentries[0], allocator_reentries()[1] - reentries[1]), sizes=(first, second))
+
+    hook = run.unet.conv_in.register_forward_pre_hook(probe)
+    with mem.request("slack", plan=[run.unet]), torch.no_grad():
+        run.unet(run.x, 3, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
+    hook.remove()
+    hold.release()
+    print(f"SLACK {seen}", flush=True)
+    check("7: torch's cached slack is used by torch: the allocator refused, torch released its cache and the buffer came", seen.get("ok") is True and seen.get("refused", 0) >= 1, seen)
+    check("7: varena asked for no trim and ran no shrink inside the allocator", seen.get("reentries") == (0, 0), seen)
+
+
+def host_callback(mem: Memory, run: Run) -> None:
+    """8: a host function that takes the GIL is queued on the stream the pass binds on, ahead of
+    the unmaps varena makes for a shortfall in the allocator; the pass completes and it ran."""
+    mem.pooling = True
+    run.fill()
+    driver = ctypes.CDLL("libcuda.so.1")
+    ran: list[float] = []
+    callback = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(lambda _: ran.append(time.perf_counter()))
+    resolved = allocator_stats()[2]
+
+    def queue(*_: object) -> None:
+        stream = torch.cuda.current_stream(mem.device).cuda_stream
+        rc = driver.cuLaunchHostFunc(ctypes.c_void_p(stream), callback, None)
+        ran.append(float(rc))
+
+    hook = run.unet.conv_in.register_forward_pre_hook(queue)
+    times, _, _, raised = run.steps("host callback", True)
+    hook.remove()
+    torch.cuda.synchronize()
+    print(f"HOST callback: launches and runs {ran[:8]}; shortfalls resolved {allocator_stats()[2] - resolved}", flush=True)
+    check("8: no deadlock with a GIL-taking host callback queued ahead of varena's unmaps", raised is None and len(times) == STEPS and len(ran) >= 2, (raised, ran))
 
 
 if __name__ == "__main__":

@@ -4,10 +4,11 @@
 //! Retry. Null goes back only when it does not: torch then raises its OutOfMemoryError at the
 //! call site, with no op ever replayed.
 //!
-//! It runs under torch's allocator lock, with the GIL held: nothing here calls into torch or
-//! Python. varena's callbacks into Python (torch's trim, caches' shrinks) answer 0 on a thread
-//! inside it ([`inside`]); on another thread they wait for the GIL, and nothing here waits for
-//! them (varena's answer never waits on an ask).
+//! It runs under torch's allocator lock (torch's Python bindings release the GIL before an op;
+//! a thread that still holds it lets it go around varena's oom, which may wait on device work
+//! whose host callbacks need it). Nothing here calls into torch or Python: varena's callbacks
+//! (torch's trim, caches' shrinks) answer 0 on a thread inside it ([`inside`]), and the figures
+//! varena gets carry no slack, so it asks for no trim.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_int, c_void};
@@ -25,7 +26,6 @@ struct Active {
     memory: Arc<Memory>,
     request: Arc<Request>,
     set: Option<SetId>,
-    allocated: u64,
     outside: u64,
 }
 
@@ -42,16 +42,36 @@ static RESOLVED: AtomicU64 = AtomicU64::new(0);
 static RESOLVED_BYTES: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 static NS: AtomicU64 = AtomicU64::new(0);
+/// varena's callbacks into torch or Python reached on a thread inside the allocator (answered 0,
+/// never called): trims, cache shrinks.
+static TRIMS_INSIDE: AtomicU64 = AtomicU64::new(0);
+static SHRINKS_INSIDE: AtomicU64 = AtomicU64::new(0);
 
 /// Whether this thread is inside the allocator: varena's Python callbacks answer 0 here.
 pub fn inside() -> bool {
     INSIDE.with(Cell::get)
 }
 
+/// A trim reached inside the allocator (it is answered 0); with slack 0 in the figures varena
+/// gets from here it emits none.
+pub fn trim_inside() {
+    TRIMS_INSIDE.fetch_add(1, Relaxed);
+}
+
+/// A cache's shrink reached inside the allocator: answered 0, nothing freed under torch's lock.
+pub fn shrink_inside() {
+    SHRINKS_INSIDE.fetch_add(1, Relaxed);
+}
+
+/// (trims, shrinks) reached inside the allocator.
+pub fn reentries() -> (u64, u64) {
+    (TRIMS_INSIDE.load(Relaxed), SHRINKS_INSIDE.load(Relaxed))
+}
+
 /// The thread allocates for `request`'s pass of `set` (None: outside any pass) from now on.
-pub fn enter(memory: Arc<Memory>, request: Arc<Request>, set: Option<SetId>, allocated: u64, reserved: u64) {
+pub fn enter(memory: Arc<Memory>, request: Arc<Request>, set: Option<SetId>, reserved: u64) {
     let outside = reserved.saturating_sub(LIVE.load(Relaxed));
-    ACTIVE.with(|a| a.borrow_mut().push(Active { memory, request, set, allocated, outside }));
+    ACTIVE.with(|a| a.borrow_mut().push(Active { memory, request, set, outside }));
 }
 
 pub fn exit() {
@@ -83,14 +103,32 @@ fn fits(size: u64) -> bool {
     })
 }
 
+/// `f` without the GIL when this thread holds it: varena's oom may wait on device work (an
+/// unmap's queued consumers), and a stream host callback in it may need the GIL.
+fn unlocked<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: the C API on this thread; the state saved is restored before returning.
+    if unsafe { pyo3::ffi::PyGILState_Check() } == 1 {
+        let state = unsafe { pyo3::ffi::PyEval_SaveThread() };
+        let out = f();
+        unsafe { pyo3::ffi::PyEval_RestoreThread(state) };
+        out
+    } else {
+        f()
+    }
+}
+
 /// varena's answer to a shortfall of `need` bytes, for the thread's active pass.
 fn ask(need: u64) -> Option<Next> {
-    ACTIVE.with(|a| {
+    unlocked(|| ACTIVE.with(|a| {
         let active = a.borrow();
         let p = active.last()?;
-        let torch = Torch { allocated: p.allocated, reserved: p.outside + LIVE.load(Relaxed) };
+        // Slack 0 (reserved == allocated): varena emits no trim, so torch's cache is never
+        // emptied under its own lock; with nothing more to free it refuses, and torch then
+        // releases its cached blocks itself and asks again.
+        let held = p.outside + LIVE.load(Relaxed);
+        let torch = Torch { allocated: held, reserved: held };
         Some(p.request.oom(p.set, Some(need), None, torch))
-    })
+    }))
 }
 
 fn alloc(size: usize) -> *mut c_void {

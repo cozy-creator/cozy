@@ -454,7 +454,13 @@ impl PyMemory {
     /// trims before it evicts anything.
     fn trim_with(&self, py: Python<'_>, trim: Py<PyAny>) -> PyResult<()> {
         // Inside torch's allocator (a pool's segment) nothing calls back into torch.
-        let trim = move || if crate::allocator::inside() { 0 } else { Python::try_attach(|py| call(py, &trim, ())).unwrap_or(0) };
+        let trim = move || {
+            if crate::allocator::inside() {
+                crate::allocator::trim_inside();
+                return 0;
+            }
+            Python::try_attach(|py| call(py, &trim, ())).unwrap_or(0)
+        };
         done(py, &self.gpu.uuid, || self.memory().trim_with(trim))
     }
 
@@ -466,7 +472,14 @@ impl PyMemory {
 
     /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id.
     fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>) -> PyResult<u32> {
-        let shrink = move |want: u64| if crate::allocator::inside() { 0 } else { Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0) };
+        // Inside torch's allocator a shrink would free through it under its own lock: none runs there.
+        let shrink = move |want: u64| {
+            if crate::allocator::inside() {
+                crate::allocator::shrink_inside();
+                return 0;
+            }
+            Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0)
+        };
         detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, shrink))).map(|c| c.0)
     }
 
@@ -582,7 +595,8 @@ impl PyRequest {
     #[pyo3(signature = (memory, set, allocated, reserved))]
     fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, set: Option<u32>, allocated: u64, reserved: u64) -> PyResult<()> {
         let r = self.get(py)?;
-        crate::allocator::enter(memory.memory().clone(), r, set.map(SetId), allocated, reserved);
+        let _ = allocated;
+        crate::allocator::enter(memory.memory().clone(), r, set.map(SetId), reserved);
         Ok(())
     }
 
@@ -899,6 +913,12 @@ fn allocator_stats() -> (u64, u64, u64, u64, u64, u64) {
     crate::allocator::stats()
 }
 
+/// The trims and cache shrinks varena reached on a thread inside the allocator (answered 0).
+#[pyfunction]
+fn allocator_reentries() -> (u64, u64) {
+    crate::allocator::reentries()
+}
+
 // ---------------------------------------------------------------- the module
 
 /// `tensorfs._ext.varena`, importable as such (the package `tensorfs.varena` re-exports it).
@@ -925,6 +945,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStats>()?;
     m.add_function(wrap_pyfunction!(allocated, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_stats, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_reentries, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;
     parent.add_submodule(&m)?;

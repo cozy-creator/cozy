@@ -23,6 +23,7 @@ from .._ext.varena import (
     Window,
     Yielded,
     allocated,
+    allocator_reentries,
     allocator_stats,
 )
 
@@ -48,5 +49,6 @@ __all__ = [
     "Window",
     "Yielded",
     "allocated",
+    "allocator_reentries",
     "allocator_stats",
 ]
