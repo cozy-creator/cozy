@@ -251,7 +251,10 @@ class Pin:
 
 class Window:
     """A block's bytes without a pin (`Pin.window`): its tensors are valid only while the block is
-    bound, and the pin that binds it orders their consumers."""
+    bound, unless `keep` hands them a pin; the pin that binds it orders their consumers."""
+
+    def keep(self, pin: Pin) -> None:
+        """Its tensors hold `pin` from now on: the page stays bound while any of them lives."""
 
     @property
     def ptr(self) -> int: ...

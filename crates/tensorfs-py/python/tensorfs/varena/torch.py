@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import warnings
 import weakref
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -33,7 +34,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves
 
-from . import Exhausted, Fill, GpuId, Grant, Level, Next, Pass, Pin, Stats, VarenaError, Yielded
+from . import Exhausted, Fill, GpuId, Grant, Level, Next, Pass, Pin, Stats, VarenaError, Window, Yielded
 from . import Memory as Native
 from . import Request as NativeRequest
 from . import Set
@@ -168,6 +169,10 @@ class _Block:
     at: int | None = None
     views: dict[str, dict[str, Tensor]] | None = None
     assign: list[tuple[_Site, Tensor]] | None = None
+    #: the window the kept views are of, and what holds them when nothing escaped: the tensors,
+    #: each one's reference count and their storage's use count
+    window: Window | None = None
+    track: tuple[list[Tensor], list[int], int] | None = None
 
 
 @dataclass(eq=False, slots=True)
@@ -245,7 +250,7 @@ class Model:
         self.handles.clear()
         for b in (self.common, *self.blocks.values()):
             if b is not None:
-                b.views = b.assign = None
+                b.views = b.assign = b.window = b.track = None
         self.memory.models.pop(self.module, None)
         self.memory.native.unload(self.id)
 
@@ -299,6 +304,8 @@ class Memory:
         #: every open pass on the device, of every thread: a reset folds into each first
         self.passes: list[_Pass] = []
         self.measuring = threading.Lock()
+        #: (set, block) -> bytes kept bound for tensors that outlived their block's run
+        self.escaped: dict[tuple[str, str], int] = {}
         #: the bytes torch's allocator is capped at now
         self.capped: int | None = None
         if device.type != "cpu":
@@ -537,14 +544,34 @@ class Memory:
                 block.stream.wait_stream(stream)  # type: ignore[union-attr]
             block.count -= 1
             if block.count == 0:
+                pin = block.pin
                 _unbind(block)
+                if block.track is not None and _escaped(block.track):
+                    self._escape(block, pin)
+
+    def _escape(self, block: _Block, pin: Pin | None) -> None:
+        """A tensor of the block's kept views outlived its run (a package kept a weight or a view
+        of one): its window's tensors take the pin, so that page stays bound while they live,
+        and the block's next bind makes views anew."""
+        model = block.model
+        if pin is not None and block.window is not None:
+            block.window.keep(pin)
+            key = (model.name, block.path)
+            self.escaped[key] = self.escaped.get(key, 0) + pin.len
+            r = _request.get() or (next(iter(self.requests)) if len(self.requests) == 1 else None)
+            if r is not None:
+                r.escaped[key] = r.escaped.get(key, 0) + pin.len
+            warnings.warn(f"{model.name}: a weight tensor of block {block.path or 'common'!r} outlived its forward; its page stays bound while it lives", stacklevel=2)
+        block.views = block.assign = block.window = block.track = block.at = None
 
     def _bind(self, block: _Block, stream: torch.cuda.Stream | None) -> None:
         model = block.model
         pin = self.native.bind(model.id, block.region, stream.cuda_stream if stream is not None else 0)
         if self.torch.kind in ("cpu", "cuda"):
             if block.views is None or block.at != pin.ptr:  # a new mapping: its views once
-                block.views, block.at, block.assign = _views(block, torch.from_dlpack(pin.window())), pin.ptr, None
+                window = pin.window()
+                block.views, block.at, block.assign, block.window = _views(block, torch.from_dlpack(window)), pin.ptr, None, window
+                block.track = _track(block.views)
             views = block.views
             if pin.fresh and model.fill is not None:
                 model.fill(block.path, views)  # in place: the views alias the page
@@ -561,7 +588,8 @@ class Memory:
             if assign is None:
                 assign, kept = _assign(block, views)
                 if kept and views is block.views:
-                    block.assign = assign
+                    block.assign, block.track = assign, None  # the old record would count itself
+                    block.track = _track(block.views, assign)
             for site, value in assign:
                 block.written.append((site, site.table[site.attr]))
                 site.table[site.attr] = value
@@ -578,6 +606,8 @@ class Request:
         self.ended: Stats | None = None
         #: torch's allocator churn over its passes (retries, device allocs and frees, syncs)
         self.churn: dict[str, int] = {}
+        #: (set, block) -> bytes kept bound in it for weight tensors that outlived their run
+        self.escaped: dict[tuple[str, str], int] = {}
 
     def plan(self, steps: Sequence[object]) -> None:
         """Replaces the plan (as `Memory.request` takes it); its cursor starts over."""
@@ -729,6 +759,27 @@ class _Allocator:
         elif self.kind == "mps":
             torch.mps.empty_cache()
         return max(before - self.now()[1], 0)
+
+
+def _track(views: Mapping[str, Mapping[str, Tensor]], assign: Sequence[tuple[_Site, Tensor]] = ()) -> tuple[list[Tensor], list[int], int]:
+    """The kept tensors with nothing but the adapter holding them: each one's reference count
+    and their storage's use count, which a kept weight or a view of one raises."""
+    tensors = [t for parts in views.values() for t in parts.values()] + [t for _, t in assign]
+    return tensors, _references(tensors), _uses(tensors[0]) if tensors else 0
+
+
+def _references(tensors: list[Tensor]) -> list[int]:
+    return [sys.getrefcount(t) for t in tensors]
+
+
+def _uses(t: Tensor) -> int:
+    return torch._C._storage_Use_Count(t.untyped_storage()._cdata)
+
+
+def _escaped(track: tuple[list[Tensor], list[int], int]) -> bool:
+    """Whether anything but the adapter holds a kept tensor or a view of one."""
+    tensors, references, uses = track
+    return bool(tensors) and (_references(tensors) != references or _uses(tensors[0]) != uses)
 
 
 def _views(block: _Block, base: Tensor) -> dict[str, dict[str, Tensor]]:
