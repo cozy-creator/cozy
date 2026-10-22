@@ -208,14 +208,21 @@ pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::
 }
 
 /// The machine's RAM tier, served from this process while it lives: on the host's pressure
-/// trigger, else (no trigger here) at its headroom check at every host decision. None when
-/// another participant serves it.
-pub fn serve_tier(mode: HostMode) -> Option<Arc<Tier>> {
+/// events (the platform's PSI trigger, else the cgroup's memory events), else, with no event
+/// source at all, only at its headroom check at every host decision (a memory-log note says
+/// so). None when another participant serves it.
+pub fn serve_tier(mode: HostMode, log: &MemoryLog) -> Option<Arc<Tier>> {
     let pressure = host_pressure::Pressure::arm(mode).map(Pressure::Host).unwrap_or_else(|error| {
-        tracing::warn!("memory: no host pressure trigger ({error}); the RAM tier gives way at its headroom checks");
+        log.note(serde_json::json!({"event": "tier_headroom_only", "mode": format!("{mode:?}"), "why": error.to_string()}));
         Pressure::Headroom
     });
-    Tier::serve(pressure).map_err(|error| tracing::warn!("memory: no RAM tier: {error}")).ok().flatten().map(Arc::new)
+    match Tier::serve(pressure) {
+        Ok(tier) => tier.map(Arc::new),
+        Err(error) => {
+            log.note(serde_json::json!({"event": "no_tier", "why": error.to_string()}));
+            None
+        }
+    }
 }
 
 fn now_ms() -> u128 {
