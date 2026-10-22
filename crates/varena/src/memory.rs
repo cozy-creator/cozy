@@ -82,7 +82,12 @@ impl Retained {
     /// Acquires all physical dependencies atomically against eviction. The returned pins hold
     /// them until completion on `stream`, including a cancelled caller's queued work. Callers
     /// join every additional consumer stream back into `stream` before releasing these pins.
-    pub fn prepare(&self, stream: usize) -> Result<Vec<Pin>> {
+    pub fn prepare(&self, stream: usize) -> Result<Vec<Pin>> { self.prepare_for(stream, None) }
+
+    pub fn prepare_for(&self, stream: usize, request: Option<&Request>) -> Result<Vec<Pin>> {
+        if request.is_some_and(|r| !Arc::ptr_eq(&self.inner, &r.inner)) {
+            return Err(Error::Invalid("range and request use different devices".into()));
+        }
         self.inner.guard(|| {
             let (preparing, req) = {
                 let mut st = self.inner.lock();
@@ -90,7 +95,7 @@ impl Retained {
                 if retained_identity(self.set, m, &self.blocks) != self.identity {
                     return Err(Error::StaleBinding("retained range identity changed; recapture required".into()));
                 }
-                let req = st.binding(self.set);
+                let req = request.map(|r| r.id).or_else(|| st.binding(self.set));
                 let mut pins = Vec::with_capacity(self.blocks.len());
                 for &block in &self.blocks {
                     let key = (self.set, block);
@@ -108,7 +113,7 @@ impl Retained {
                 let mut st = self.inner.lock();
                 return Err(Error::Exhausted(exhausted(*need, None, st.stats(req).cloned().unwrap_or_default())));
             }
-            let pins = self.blocks.iter().map(|b| self.inner.bind(self.set, *b, stream)).collect::<Result<Vec<_>>>()?;
+            let pins = self.blocks.iter().map(|b| self.inner.bind_for(self.set, *b, stream, req)).collect::<Result<Vec<_>>>()?;
             let st = self.inner.lock();
             if retained_identity(self.set, st.mech(self.set)?, &self.blocks) != self.identity {
                 return Err(Error::StaleBinding("retained range identity changed during preparation".into()));
@@ -446,6 +451,7 @@ enum Mech {
 
 struct Active {
     id: u64,
+    thread: std::thread::ThreadId,
     set: u32,
     /// The package entry the pass runs, and its shape (dimensions joined by `x`).
     entry: String,
@@ -676,7 +682,7 @@ impl State {
 
     /// The request whose current pass runs `set`.
     fn binding(&self, set: u32) -> Option<u64> {
-        self.active.keys().filter(|(_, s)| *s == set).map(|(r, _)| *r).max()
+        self.active.iter().filter(|((_, s), a)| *s == set && a.thread == std::thread::current().id()).map(|((r, _), _)| *r).max()
     }
 
     /// The request's most recently started pass (the one an op, a cut or an OOM is in).
@@ -986,6 +992,10 @@ impl Memory {
             })
             .unwrap_or(0)
     }
+
+    /// Whether driver-owned context growth has a measurable per-process owner. A graph
+    /// capacity proof must report this; the opening-context fallback alone cannot prove it.
+    pub fn context_measurable(&self) -> bool { self.inner.backend.process_used().is_ok() }
 
     /// Reconcile actual allocator and driver-owned context bytes outside capture/callbacks.
     pub fn observe(&self, torch: Torch) -> Result<()> {
@@ -2190,10 +2200,14 @@ impl Inner {
     }
 
     fn bind(self: &Arc<Self>, set: u32, block: u32, stream: usize) -> Result<Pin> {
+        self.bind_for(set, block, stream, None)
+    }
+
+    fn bind_for(self: &Arc<Self>, set: u32, block: u32, stream: usize, request: Option<u64>) -> Result<Pin> {
         let key = (set, block);
         let start = Instant::now();
         let mut st = self.lock();
-        let req = st.binding(set);
+        let req = request.or_else(|| st.binding(set));
         if st.table.page(key).is_none() {
             return Err(Error::Invalid(format!("no block {block} in set {set}")));
         }
@@ -2449,7 +2463,7 @@ impl Inner {
             }
             self.measure(&mut st, torch);
             let (id, context) = (st.tick(), st.table.context);
-            st.active.insert((req, set), Active { id, set, entry: entry.to_string(), dims: dims.to_string(), shape: config(entry, dims), allocated: torch.allocated, room: torch.allocated, context, measured: false });
+            st.active.insert((req, set), Active { id, thread: std::thread::current().id(), set, entry: entry.to_string(), dims: dims.to_string(), shape: config(entry, dims), allocated: torch.allocated, room: torch.allocated, context, measured: false });
             if let Some(r) = st.table.request_mut(req) {
                 r.episode = Default::default();
                 r.claimed = 0;

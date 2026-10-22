@@ -67,6 +67,7 @@ def main():
     assert len({b.identity for b in bindings}) == DEPTH, "range identities include their dependency subsets"
     weight_bytes = WIDTH * WIDTH * 4 * DEPTH
     assert weight_bytes > CAP
+    print(json.dumps({"context_measurable": mem.native.context_measurable()}), flush=True)
     stream = torch.cuda.Stream()
     records = []
     capture_ms = 0.0

@@ -514,6 +514,10 @@ impl PyMemory {
         Ok(PyRetained { retained: Mutex::new(Some(Arc::new(retained))), identity, gpu: self.gpu.uuid.clone(), dl: self.dl })
     }
 
+    fn context_measurable(&self, py: Python<'_>) -> PyResult<bool> {
+        detached(py, &self.gpu.uuid, || Ok(self.memory().context_measurable()))
+    }
+
     fn observe(&self, py: Python<'_>, allocated: u64, reserved: u64) -> PyResult<()> {
         detached(py, &self.gpu.uuid, || self.memory().observe(Torch { allocated, reserved }))
     }
@@ -581,10 +585,11 @@ impl PyRetained {
         detached(py, &self.gpu, || Ok(r.is_some_and(|r| r.valid())))
     }
 
-    #[pyo3(signature = (stream = 0))]
-    fn prepare(&self, py: Python<'_>, stream: usize) -> PyResult<Vec<PyPin>> {
+    #[pyo3(signature = (stream = 0, request = None))]
+    fn prepare(&self, py: Python<'_>, stream: usize, request: Option<PyRef<'_, PyRequest>>) -> PyResult<Vec<PyPin>> {
         let r = lock(&self.retained).clone().ok_or_else(|| error(py, &self.gpu, Error::Closed("retained range".into())))?;
-        let pins = detached(py, &self.gpu, || r.prepare(stream))?;
+        let request = request.map(|r| r.get(py)).transpose()?;
+        let pins = detached(py, &self.gpu, || r.prepare_for(stream, request.as_deref()))?;
         Ok(pins.into_iter().map(|pin| PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.clone(), pin: Arc::new(Held(Some(pin))) }).collect())
     }
 

@@ -236,7 +236,7 @@ class Model:
         observing the modules visited by one capture is not a complete declaration.
         """
         all_blocks = [b for b in (self.common, *self.blocks.values()) if b is not None]
-        blocks = [b for b in all_blocks if any(not p or b.path == p or b.path.startswith(p + ".") for p in paths)]
+        blocks = [b for b in all_blocks if any(not p or b.path == p or b.path.startswith(p + ".") or p.startswith(b.path + ".") for p in paths)]
         # Common weights can be read by any child block, so include them conservatively.
         if self.common is not None and self.common not in blocks:
             blocks.insert(0, self.common)
@@ -315,7 +315,8 @@ class Binding:
                 if self.last is not None:
                     stream.wait_event(self.last)
                 memory.native.fill(self.model.id, _fill(self.model.fill))
-                pins = self.native.prepare(stream.cuda_stream if stream is not None else 0)
+                request = _request.get()
+                pins = self.native.prepare(stream.cuda_stream if stream is not None else 0, request.native if request is not None else None)
                 if workspace is None:
                     scope.enter_context(memory.native.workspace_available(*memory.torch.now()))
                 held: list[_Block] = []
