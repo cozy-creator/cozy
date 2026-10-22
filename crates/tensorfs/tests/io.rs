@@ -141,6 +141,7 @@ fn cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes() {
     }
     assert!(!unsafe { io::cuda::registered(source) }.unwrap());
     println!("HostPin: owned explicit/implicit unregister, borrowed explicit/implicit preservation, engine preservation and context restoration passed");
+    println!("PASS staged and direct device copies keep exact bytes {}", io::cuda::uuid(0).unwrap());
 }
 
 /// varena's tier fill shape: registered host pages, one copy per 2 MiB page, eight pages per
