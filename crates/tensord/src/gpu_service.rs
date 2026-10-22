@@ -162,6 +162,10 @@ pub struct PlanSlot {
     /// fetched or warmed before then.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub on_demand: bool,
+    /// Components the model class declares placeable (`@placeable`): in a group, TensorD names
+    /// the GPU that keeps each at Load (`Binding::homes`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placeable: Vec<String>,
 }
 
 /// One `Weights[M]` argument: the checkpoint a call reads raw (never constructed), and the
@@ -707,7 +711,7 @@ impl Pool {
             entry: entry.clone(),
             memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, &peaks, &notes).map(Arc::new),
         }).collect();
-        let tier = memory::serve_tier(config.host.mode);
+        let tier = memory::serve_tier(config.host.mode, &notes);
         let launcher = crate::child_launcher::ChildLauncher::new()?;
         let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
         Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
@@ -1491,11 +1495,18 @@ impl Pool {
                 model: format!("{}@{}", grant.repository, grant.release),
                 ..Default::default()
             };
+            let placeable = model.get("placeable").and_then(serde_json::Value::as_array).into_iter().flatten()
+                .map(|c| c.as_str().map(str::to_owned).ok_or_else(|| invalid("declared placeable component is not a name")))
+                .collect::<io::Result<Vec<_>>>()?;
+            if placeable.iter().any(|c| !binding.components.contains(c)) {
+                return Err(invalid(&format!("a placeable component of {path} is not one it loads")));
+            }
             planned.push(PlanSlot {
                 binding,
                 lane: grant.lane.clone(),
                 selected_encoded_bytes,
                 on_demand: model.get("on_demand").and_then(serde_json::Value::as_bool) == Some(true),
+                placeable,
             });
         }
         let digest = |value: serde_json::Value| -> io::Result<String> {
@@ -2581,6 +2592,8 @@ impl Pool {
             }
             // The request's signer, whose bearer the Runtime keeps apart.
             let actor = engine.get(id).ok().and_then(|record| record.submission).map(|s| s.actor).unwrap_or_default();
+            // The call's family, whose yielded parent's room its placement may use (none warming).
+            let family = engine.get(id).ok().and_then(|record| record.family().map(str::to_owned));
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
                 None => DeviceCommand::Load {
@@ -2599,10 +2612,12 @@ impl Pool {
                 },
                 Some(first) => {
                     let store = self.store.root().to_string_lossy().into_owned();
+                    let homes = self.homes(&plan, gpus, family.as_deref());
                     let load = |slot: &PlanSlot| {
                         let mut binding = slot.binding.clone();
                         binding.package_interface = interface_path.to_string_lossy().into();
                         binding.store = store.clone();
+                        binding.homes = homes.get(&slot.binding.model_binding_path).cloned().unwrap_or_default();
                         ModelLoad { binding }
                     };
                     let first = load(first);
@@ -2840,6 +2855,29 @@ impl Pool {
             }
         }
         Ok(true)
+    }
+
+    /// For a group, each slot's placeable components and the GPU of the group that keeps each
+    /// (`memory::homes`), by slot path. A GPU with no ledger keeps nothing away from GPU 0.
+    fn homes(&self, plan: &Plan, gpus: &[Device], family: Option<&str>) -> BTreeMap<String, BTreeMap<String, u32>> {
+        let placeable: Vec<(&str, &str, String)> = plan.slots.iter()
+            .flat_map(|slot| slot.placeable.iter().map(move |c| (slot.binding.model_binding_path.as_str(), c.as_str(), format!("{}/{c}", slot.binding.release))))
+            .collect();
+        if gpus.len() < 2 || placeable.is_empty() {
+            return BTreeMap::new();
+        }
+        let ledgers: Option<Vec<&varena::Ledger>> = gpus.iter().map(|d| d.memory.as_ref().map(|m| &m.ledger)).collect();
+        let sets: Vec<&str> = placeable.iter().map(|(_, _, set)| set.as_str()).collect();
+        let gpu = match ledgers {
+            Some(ledgers) => memory::homes(&ledgers, &plan.construction, UNPREPARED, family, &sets, &self.notes),
+            None => vec![0; sets.len()],
+        };
+        let mut homes: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+        for ((path, component, _), gpu) in placeable.iter().zip(gpu) {
+            homes.entry((*path).into()).or_default().insert((*component).into(), gpu);
+        }
+        self.notes.note(serde_json::json!({"event": "homes", "plan": plan.construction, "homes": homes}));
+        homes
     }
 
     /// Followers whose process has ended, as people name their GPUs ("GPU 1's process 3224
@@ -3534,7 +3572,7 @@ mod tests {
             installation: "i".into(),
             generation: "g".into(),
             entrypoint: "remove_background".into(),
-            slots: vec![PlanSlot { binding, lane: "fp16".into(), selected_encoded_bytes: 0, on_demand: false }],
+            slots: vec![PlanSlot { binding, lane: "fp16".into(), selected_encoded_bytes: 0, on_demand: false, placeable: vec![] }],
             sources: vec![source],
             degree: 1,
         };
@@ -3897,6 +3935,21 @@ mod tests {
         assert_ne!(of(json!({"frames": 8, "height": 4})), of(json!({"assets": 8, "frames": 4})));
         assert_eq!(of(json!({"a,b": "x=y|z%"})), "a%2Cb=\"x%3Dy%7Cz%25\"");
         assert_eq!(of(json!({})), "-");
+    }
+
+    /// A group's Load names each placeable component's GPU; one GPU names none. Without a
+    /// ledger on its GPUs, nothing is kept away from GPU 0.
+    #[test]
+    fn a_groups_load_names_each_placeable_components_gpu() {
+        let (root, pool, _engine) = pool_of(2);
+        let binding = Binding { model_binding_path: "e.models.m".into(), release: "p@1".into(), ..Default::default() };
+        let mut group = plan("film", 2);
+        group.slots = vec![PlanSlot { binding, lane: String::new(), selected_encoded_bytes: 0, on_demand: false, placeable: vec!["te".into()] }];
+        let homes = pool.homes(&group, pool.lane(0, 2).unwrap(), None);
+        assert_eq!(homes, BTreeMap::from([("e.models.m".to_string(), BTreeMap::from([("te".to_string(), 0)]))]));
+        assert!(pool.homes(&group, pool.lane(0, 1).unwrap(), None).is_empty());
+        pool.stop().unwrap();
+        crate::scratch::remove(&root);
     }
 
     #[test]

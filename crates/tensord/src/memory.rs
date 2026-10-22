@@ -80,6 +80,22 @@ pub fn admit(engine: &Engine, ledgers: &[&Ledger], id: &str, package: &str, shap
     }
 }
 
+/// The GPU of the group (an index into `ledgers`, GPU order) that keeps each set of `sets`, by
+/// `Ledger::place` for `package`'s request at `shape` in `family`. A set's bytes are what its
+/// load recorded on a GPU of the group (its layout's, exact; its region split is the model's,
+/// known only where it loads): a set never loaded goes where the most room is free. A ledger
+/// that cannot answer keeps every set on GPU 0, where it pages.
+pub fn homes(ledgers: &[&Ledger], package: &str, shape: &str, family: Option<&str>, sets: &[&str], log: &MemoryLog) -> Vec<u32> {
+    let unknown: Vec<(&str, Option<u64>)> = sets.iter().map(|set| (*set, None)).collect();
+    match Ledger::place(ledgers, package, shape, family, &unknown) {
+        Ok(homes) => homes,
+        Err(error) => {
+            log.note(serde_json::json!({"event": "homes_on_gpu_0", "package": package, "why": error.to_string()}));
+            vec![0; sets.len()]
+        }
+    }
+}
+
 /// Measured peaks, persisted per GPU model as `<dir>/<model>.json`: varena's records, kept and
 /// restored whole. A key names its package release (`<construction>|<shape>`, or a set's
 /// `<package>@<release>/<component>|…`), so one file holds every release's. Each GPU of the
@@ -208,14 +224,21 @@ pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::
 }
 
 /// The machine's RAM tier, served from this process while it lives: on the host's pressure
-/// trigger, else (no trigger here) at its headroom check at every host decision. None when
-/// another participant serves it.
-pub fn serve_tier(mode: HostMode) -> Option<Arc<Tier>> {
+/// events (the platform's PSI trigger, else the cgroup's memory events), else, with no event
+/// source at all, only at its headroom check at every host decision (a memory-log note says
+/// so). None when another participant serves it.
+pub fn serve_tier(mode: HostMode, log: &MemoryLog) -> Option<Arc<Tier>> {
     let pressure = host_pressure::Pressure::arm(mode).map(Pressure::Host).unwrap_or_else(|error| {
-        tracing::warn!("memory: no host pressure trigger ({error}); the RAM tier gives way at its headroom checks");
+        log.note(serde_json::json!({"event": "tier_headroom_only", "mode": format!("{mode:?}"), "why": error.to_string()}));
         Pressure::Headroom
     });
-    Tier::serve(pressure).map_err(|error| tracing::warn!("memory: no RAM tier: {error}")).ok().flatten().map(Arc::new)
+    match Tier::serve(pressure) {
+        Ok(tier) => tier.map(Arc::new),
+        Err(error) => {
+            log.note(serde_json::json!({"event": "no_tier", "why": error.to_string()}));
+            None
+        }
+    }
 }
 
 fn now_ms() -> u128 {

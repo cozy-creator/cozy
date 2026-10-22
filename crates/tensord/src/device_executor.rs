@@ -106,6 +106,11 @@ pub struct Binding {
     pub package: String,
     pub model: String,
     pub adapters: Vec<Adapter>,
+    /// A group's placeable components and the GPU that keeps each, an index within the group
+    /// (0: GPU 0, the serial scope's; g: GPU g keeps it resident for the group), decided by
+    /// TensorD at Load (`memory::homes`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub homes: BTreeMap<String, u32>,
 }
 impl Default for Binding {
     fn default() -> Self {
@@ -131,6 +136,7 @@ impl Default for Binding {
             package: String::new(),
             model: String::new(),
             adapters: Vec::new(),
+            homes: BTreeMap::new(),
         }
     }
 }

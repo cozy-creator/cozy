@@ -110,6 +110,11 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   requests end, and a GPU nothing runs on always admits. A cancel ends the wait; the request
   never started. It is spawned by the pool's `ChildLauncher`, which journals the birth, then sent
   Start (with its ledgers), Load and Activate once. Each request sends PrepareRequest and Invoke.
+- Hosting: a group's Load names, on each model's binding, the GPU of the group that keeps each
+  placeable component (`homes`, from the interface's `placeable`): `memory::homes`, varena's
+  `Ledger::place` over the lane's ledgers (a set's bytes as its load recorded them; one never
+  loaded goes where the most room is free). GPU 0 keeps what it has room for; GPU g ≥ 1 keeps
+  the rest resident for the group (remote scopes run there).
 - Warming: a warm member's executor is loaded, then `Map{construction, level}` has it load its
   models at `gpu` or `ram` (varena's `load(level)`), for any degree.
 - Each GPU's ledger (`Ledger::create`, capacity min(card, `gpu_memory_limit`)) is granted to an
@@ -119,7 +124,9 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   stalled (once), and saves changed peaks (varena's records, whole) to
   `<pool>/peaks/<GPU model>.json`, restored when a ledger is created.
   A device fault (an unsettled call) drops the GPU's kept pages (`Ledger::fault`). The machine's
-  RAM tier is served from TensorD on the host's pressure trigger (`varena::Tier`): TensorD
+  RAM tier is served from TensorD on the host's pressure events (`varena::Tier`; the platform's
+  PSI trigger, else the cgroup's memory events; with neither, its headroom checks alone, noted
+  as `tier_headroom_only` in the memory log): TensorD
   computes no host room; it ends idle processes only on the tier's host-short event.
 - An executor's failed terminal (its own refusal before entry, or a failed invoke) first keeps a
   triage bundle (`triage.rs`: terminal, traceback, executor pid and stderr tail; canonical JSON
