@@ -65,7 +65,7 @@ fn main() {
         ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
         ("a_joint_step_runs_a_pass_per_set", a_joint_step_runs_a_pass_per_set),
         ("a_child_runs_while_its_parent_yields", a_child_runs_while_its_parent_yields),
-        ("the_tier_waits_on_no_executor_and_says_when_the_host_is_short", the_tier_waits_on_no_executor_and_says_when_the_host_is_short),
+        ("the_tier_waits_on_no_executor_and_a_pending_release_settles_first", the_tier_waits_on_no_executor_and_a_pending_release_settles_first),
         ("a_silent_asker_holds_up_no_answer", a_silent_asker_holds_up_no_answer),
         ("a_reaper_with_a_stale_view_frees_nothing", a_reaper_with_a_stale_view_frees_nothing),
         ("an_oom_counts_its_own_unmaps_after_an_ask", an_oom_counts_its_own_unmaps_after_an_ask),
@@ -1003,7 +1003,7 @@ fn a_child_runs_while_its_parent_yields(dir: &Path) {
 /// layout and goes on serving; the executor's death is its answer. Review 3, N2: the ask is
 /// marked in the asked row, so TensorD sees the stopped user stalled, and under pressure with
 /// nothing else to give the tier says the host is short meanwhile.
-fn the_tier_waits_on_no_executor_and_says_when_the_host_is_short(dir: &Path) {
+fn the_tier_waits_on_no_executor_and_a_pending_release_settles_first(dir: &Path) {
     use std::os::fd::FromRawFd;
     let g = gpu("short", 64 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
@@ -1035,10 +1035,9 @@ fn the_tier_waits_on_no_executor_and_says_when_the_host_is_short(dir: &Path) {
         ledger.await_event().unwrap();
     }
     assert!(tier.held().contains(&digest("s1")), "nothing punched before its user answered");
-    // Nothing else to give while s1 waits on its stalled user: the host is short.
-    pressure();
-    tier.await_short().unwrap();
-    // The tier serves another executor meanwhile (the host has room again for its fill).
+    // A release still pending settles first (no host-short meanwhile: tier::reservation_tests);
+    // a stalled user is TensorD's stall rule to end. The tier serves another executor
+    // meanwhile (the host has room again for its fill).
     keep.store(0, std::sync::atomic::Ordering::SeqCst);
     let mut z = Agent::spawn();
     z.ok(&format!("open {} {}", g.uuid, g.memory));

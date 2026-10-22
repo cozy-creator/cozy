@@ -394,6 +394,17 @@ struct State {
     short: Option<Owned>,
     /// Its users' open connections: a tier that stops serving closes them.
     conns: HashMap<u64, Stream>,
+    /// What pressure is answered against, while a watcher runs.
+    press: Option<Press>,
+}
+
+/// A pressure answer's figures, kept so a release that completes later (its users answered)
+/// looks again: one event gives back for as long as the host stays short.
+#[derive(Clone)]
+struct Press {
+    need: Need,
+    budget: Budget,
+    claims: Arc<Claims>,
 }
 
 type Shared = Arc<(Mutex<State>, Condvar)>;
@@ -419,10 +430,11 @@ fn relieve(state: &Shared, trigger: HostTrigger) -> u64 {
     let facts: Vec<HostLayout> = s.layouts.iter().map(|(d, l)| l.facts(d)).collect();
     let actions = host_decide(&facts, trigger);
     if actions.is_empty() {
-        // Under pressure with nothing left to give (a layout being asked back of a stalled user
-        // waits for TensorD to end it): the host is short past the tier. A staging Room is no
+        // Under pressure with nothing left to give and nothing asked back still pending: the
+        // host is short past the tier. A release still pending settles first (its completion
+        // looks again); a stalled user's is TensorD's stall rule to end. A staging Room is no
         // pressure.
-        if trigger == HostTrigger::Pressure {
+        if trigger == HostTrigger::Pressure && !s.layouts.values().any(|l| l.pending.is_some()) {
             if let Some(w) = &s.short {
                 os::signal(w);
             }
@@ -492,8 +504,13 @@ fn acked(state: &Shared, digest: &str, conn: u64, freed: u64) {
     if gave > 0 {
         s.releases += 1;
     }
+    let press = s.press.clone();
     drop(s);
     cv.notify_all();
+    // The release completed: if the host is still short, the next rung goes.
+    if let Some(p) = press {
+        answer(state, &p.need, &p.budget, &p.claims);
+    }
 }
 
 /// The machine's RAM-tier service, served from this process until dropped.
@@ -534,6 +551,7 @@ impl Tier {
     fn watch(&self, mut pressure: Pressure, need: Need) -> Result<()> {
         if matches!(pressure, Pressure::Headroom) { return Ok(()); }
         let (state, stop, budget, claims) = (self.state.clone(), self.stop.clone(), self.budget.clone(), self.claims.clone());
+        state.0.lock().press = Some(Press { need: need.clone(), budget: budget.clone(), claims: claims.clone() });
         std::thread::Builder::new()
             .name("varena-pressure".into())
             .spawn(move || loop {
@@ -1608,7 +1626,7 @@ print('dirty',flush=True);sys.stdin.read()
             let mut short = libc::pollfd { fd: tier.short.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             // SAFETY: poll only inspects the live event descriptor and does not wait.
             let escalated = unsafe { libc::poll(&mut short, 1, 0) };
-            os::send(&ask, &os::encode(&serde_json::json!({"freed": 0})).unwrap(), None).unwrap();
+            os::send(&ask, &(os::encode(&serde_json::json!({"freed": 0})).unwrap(), None)).unwrap();
             assert_eq!(escalated, 0, "pending tier reclaim must settle before host-short escalation");
         });
     }
