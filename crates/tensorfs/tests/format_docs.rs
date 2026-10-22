@@ -183,7 +183,8 @@ fn writer_is_deterministic_and_reader_round_trips() {
     assert_eq!(r.default_tag().map(|t| &t.commit), Some(&ObjectRef::of(&tb)));
     assert_eq!(r.roots().count(), 2);
     r.tags[1].public = true;
-    assert!(r.to_json().is_err(), "a public tag is a version");
+    assert!(r.to_json().is_ok(), "a public tag may have any tag name");
+    assert_eq!(r.default_tag().map(|t| t.name.as_str()), Some("1.0"), "only a version is the default");
 }
 
 /// Later versions append fields to the root and to records, and add dtypes and schemes: this
@@ -333,11 +334,14 @@ fn red_documents_are_refused() {
         assert!(Tree::from_json(doc.to_string().as_bytes()).is_err(), "{path:?}");
     }
     let tree = json!({"sha256": "0".repeat(64), "length": 0});
+    // A tag a client cannot read (here a repeat) is read around: kept as it was, written back.
     let repo = json!({"format": "cozytensors.repo/1", "name": "acme/tiny", "tags": [
         {"name": "1", "commit": tree}, {"name": "1", "commit": tree, "public": true}]});
-    assert!(Repo::from_json(repo.to_string().as_bytes()).is_err());
+    let read = Repo::from_json(repo.to_string().as_bytes()).unwrap();
+    assert_eq!((read.tags.len(), read.unread.len(), read.tags[0].public), (1, 1, false));
     let lanes = json!({"format": "cozytensors.repo/1", "name": "acme/tiny", "tags": [{"name": "1", "lanes": {}}]});
-    assert!(Repo::from_json(lanes.to_string().as_bytes()).is_err(), "a tag names a commit");
+    let read = Repo::from_json(lanes.to_string().as_bytes()).unwrap();
+    assert_eq!((read.tags.len(), read.unread.len()), (0, 1), "a tag names a commit: one with lanes is read around");
 }
 
 fn tweak(f: impl FnOnce(&mut Vec<Tensor>)) -> Vec<Tensor> {
