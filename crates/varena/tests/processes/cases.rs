@@ -76,6 +76,7 @@ pub fn main() {
         ("an_ask_to_a_stopped_victim_ends_when_it_dies", an_ask_to_a_stopped_victim_ends_when_it_dies as fn(&Path)),
         ("the_tier_gives_back_in_order", the_tier_gives_back_in_order),
         ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
+        ("a_layout_stays_locked_until_the_tier_takes_it_back", a_layout_stays_locked_until_the_tier_takes_it_back),
         ("the_tier_waits_on_no_executor_and_a_pending_release_settles_first", the_tier_waits_on_no_executor_and_a_pending_release_settles_first),
         ("a_silent_asker_holds_up_no_answer", a_silent_asker_holds_up_no_answer),
         ("the_tier_comes_back_after_a_release", the_tier_comes_back_after_a_release),
@@ -161,6 +162,8 @@ fn spec(name: &str, path: &Path, fill: Fill, uuid: &str) -> SetSpec {
 struct Recording {
     host: HostBackend,
     registered: Arc<parking_lot::Mutex<std::collections::HashSet<u64>>>,
+    /// Unlock calls: each stalls a card until idle.
+    unregisters: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Backend for Recording {
@@ -239,6 +242,7 @@ impl Backend for Recording {
     }
     fn unregister_host(&self, ptr: u64) -> varena::Result<()> {
         self.registered.lock().remove(&ptr);
+        self.unregisters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
     fn retire(&self, event: Event) {
@@ -262,6 +266,7 @@ fn agent() {
     let mut pins: Vec<Pin> = vec![];
     let mut yielded: HashMap<String, varena::Yielded> = HashMap::new();
     let registered = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+    let unregisters = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let shrunk = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut out = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
@@ -289,10 +294,23 @@ fn agent() {
                 uuid = id.to_string();
                 let memory: u64 = memory.parse().unwrap();
                 let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory };
-                mem = Some(Memory::open(g, None, Box::new(Recording { host: HostBackend::new(memory), registered: registered.clone() })).unwrap());
+                mem = Some(Memory::open(g, None, Box::new(Recording { host: HostBackend::new(memory), registered: registered.clone(), unregisters: unregisters.clone() })).unwrap());
                 format!("ok {}", std::process::id())
             }
             ["registered"] => format!("ok {}", registered.lock().len()),
+            ["unregisters"] => format!("ok {}", unregisters.load(std::sync::atomic::Ordering::SeqCst)),
+            ["unload", set] => {
+                let m = mem.as_ref().unwrap();
+                m.unload(sets[*set].0);
+                m.settle();
+                "ok".into()
+            }
+            ["refill", set, fill] => {
+                let m = mem.as_ref().unwrap();
+                m.fill(sets[*set].0, Fill::Declared(fill.to_string()));
+                m.settle();
+                "ok".into()
+            }
             ["load", name, path, fill, level] => {
                 let fill = match *fill {
                     "stored" => Fill::Stored,
@@ -926,11 +944,48 @@ fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
     tier.await_releases(1);
     assert!(resident(&digest("p1")) < REGION_ALIGN, "the pinned layout's regions returned: {}", resident(&digest("p1")));
     assert!(resident(&digest("p2")) >= 4 * MB, "the next one is untouched");
-    assert_eq!(tier.acked(), REGION_ALIGN, "y unpinned the one region it had page-locked, when asked");
+    assert_eq!(tier.acked(), 2 * REGION_ALIGN, "y unlocked the run it had page-locked (both ready regions), when asked");
+    assert_eq!(y.ok("unregisters"), "1", "one unlock for the run: each stalls the card");
     // Review 2, finding 13: y unlocked it before it answered, so before the tier punched it.
     assert_eq!(y.ok("registered"), "0", "unlocked before the punch");
     assert_eq!(y.ok("exact p1 1"), "true", "y goes on from the store");
     y.ok("unpin");
+    y.exit();
+}
+
+#[cfg(target_os = "linux")]
+/// Lead's ruling (S2's forward case: cuMemHostUnregister stalled every CUDA call in the process
+/// for 2.7 s): a host range is unlocked only when the tier takes its layout back (or the process
+/// ends). Unloading a set and changing its fill identity park its layout locked; loading it
+/// again reuses it, locked; the tier's ask unlocks it, one call per run.
+fn a_layout_stays_locked_until_the_tier_takes_it_back(dir: &Path) {
+    use std::os::fd::FromRawFd;
+    let g = gpu("parked", 64 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
+    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
+    let signal = event.try_clone().unwrap();
+    let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let tier = varena::Tier::serve(varena::Pressure::Events(event), need(&keep)).unwrap().expect("this namespace's tier");
+    let (q1, q2) = (write_set(dir, "q1", 2), write_set(dir, "q2", 2));
+    let mut y = Agent::spawn();
+    y.ok(&format!("openrec {} {}", g.uuid, g.memory));
+    y.ok(&format!("load q1 {} stored ram", q1.display()));
+    y.ok(&format!("load q2 {} stored ram", q2.display()));
+    assert_eq!(y.ok("exact q1 0"), "true");
+    assert_eq!(y.ok("exact q2 0"), "true");
+    assert_eq!(y.ok("registered"), "2", "each layout's ready run, page-locked once");
+    y.ok("unload q1");
+    y.ok("refill q2 v2");
+    assert_eq!((y.ok("unregisters").as_str(), y.ok("registered").as_str()), ("0", "2"), "an unload and an identity change keep their layouts locked");
+    y.ok(&format!("load q1 {} stored ram", q1.display()));
+    assert_eq!(y.ok("exact q1 1"), "true");
+    assert_eq!((y.ok("unregisters").as_str(), y.ok("registered").as_str()), ("0", "2"), "loaded again, its parked layout serves, still locked");
+    keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: an 8-byte write to our eventfd.
+    unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
+    tier.await_releases(1);
+    assert_eq!(y.ok("unregisters"), "1", "the tier's ask unlocks one layout's run in one call");
     y.exit();
 }
 

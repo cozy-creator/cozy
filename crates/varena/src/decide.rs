@@ -22,9 +22,10 @@ pub struct Tried {
     pub cut: BTreeSet<String>,
     /// Bytes this demand's earlier rounds freed, own unmaps and remote answers alike.
     pub freed: u64,
-    /// A physical page allocation failed at this unchanged free-byte estimate. Retry only
-    /// after making additional room; the driver's OOM overrides the estimate.
-    pub failed_free: Option<u64>,
+    /// The driver refused the page's create with this many bytes free (its measure then): the
+    /// truth over the table's estimate. The free bytes counted never exceed it, and the page
+    /// needs more than it (the driver keeps some for itself).
+    pub driver_free: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,8 +114,11 @@ pub fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> {
     match trigger {
         Trigger::Bind { page, req, tried } => {
             let bytes = t.page(*page).map_or(0, |p| p.bytes);
-            let need = tried.failed_free.map_or(bytes, |free| bytes.max(free.saturating_add(1)));
+            let need = tried.driver_free.map_or(bytes, |free| bytes.max(free.saturating_add(1)));
             let mut d = Demand::new(t, need, *req, Some(*page), tried);
+            if let Some(free) = tried.driver_free {
+                d.got = d.got.min(free);
+            }
             if d.run(Rungs::Bind) == Some(Done::Enough) {
                 d.out.push(Action::Map(*page));
             }
@@ -229,6 +233,11 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
         let remote = idle.idle();
         d.out.append(&mut idle.out);
         if remote {
+            return d.out;
+        }
+        // Kept pages it took are free once custody lets go: settled before it runs.
+        if idle.withdrawn > 0 {
+            d.out.push(Action::Settle);
             return d.out;
         }
     }

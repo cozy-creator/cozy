@@ -606,7 +606,8 @@ fn an_impossible_need_is_exhausted_at_once() {
 /// Host-OOM, the varena side: a request records its host high-water (Peak::Host, its
 /// anonymous bytes; the tier's and file mappings aside); while a request runs unmeasured the
 /// GPU's host need is unknown, and once measured it is that high-water less what the process
-/// holds now.
+/// holds now. Linux: the high-water is read from `/proc` (elsewhere a request is unmeasured).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_request_records_its_host_high_water() {
     let (_scope, ledger, mem, _g) = open("host", 8 * MB);
@@ -712,4 +713,25 @@ fn a_failed_segment_credit_does_not_steal_room_from_the_next_range() {
     let id = mem.load(set(dir.path(), "refund-range", 3, &g.uuid), Level::Ram).unwrap();
     let binding = mem.retain(id, &[0, 1, 2]).unwrap();
     assert_eq!(binding.prepare(0).unwrap().len(), 3);
+}
+
+/// v5 (runs 13369 and 13372): torch's cache carried from earlier passes is not a pass's slack.
+/// A pass that starts with 32 MB cached and reports its reserved peak less its allocated peak
+/// records only what its own allocations left reserved, so a text encoder's room never takes the
+/// UNet's cache.
+#[test]
+fn a_rooms_slack_excludes_the_cache_it_started_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("cache", 64 * MB);
+    let id = mem.load(set(dir.path(), "t", 1, &g.uuid), Level::Ram).unwrap();
+    let pages = REGION_ALIGN;
+    let measure = |shape: &str, reserved_peak: u64| {
+        let r = mem.request(&format!("cached-{shape}"), plan("t")).unwrap();
+        let pass = r.pass(id, "fwd", shape, Torch { allocated: MB, reserved: 33 * MB }).unwrap();
+        pass.end(Measured { allocated_peak: 4 * MB, slack: reserved_peak - 4 * MB, sites: vec![] }, Torch { allocated: MB, reserved: reserved_peak });
+    };
+    measure("1x8", 36 * MB);
+    assert_eq!(room(&mem, id, "t", "1x8", pages, None), 3 * MB, "its own 3 MB; the 32 MB cache was there before it");
+    measure("1x4", 40 * MB);
+    assert_eq!(room(&mem, id, "t", "1x4", pages, None), 7 * MB, "its own 3 MB and the 4 MB its allocations left reserved");
 }

@@ -803,18 +803,32 @@ pub(crate) struct Held {
     ro: Map,
     data: u64,
     regions: Vec<(u64, u64)>,
-    /// Regions page-locked for the copy engine (once each, while ready), regions a copy is
-    /// reading now, and whether the tier asked for the layout back.
+    /// Runs of regions page-locked for the copy engine (each run once, while ready), regions
+    /// a copy is reading now, and whether the tier asked for the layout back.
     pins: parking_lot::Mutex<Pins>,
 }
 
 #[derive(Default)]
 struct Pins {
-    registered: std::collections::HashSet<u32>,
+    /// Page-locked runs of contiguous ready regions, by first region: their end (exclusive).
+    /// Unlocking stalls the whole device (cuMemHostUnregister synchronizes it), so a run is
+    /// unlocked in one call, and only when the tier takes the layout back or the process ends.
+    registered: std::collections::BTreeMap<u32, u32>,
     reading: std::collections::HashSet<u32>,
     released: bool,
-    /// Regions still read when the layout was released: unlocked when their copy ends.
-    deferred: Vec<u32>,
+    /// Runs still read when the layout was released: unlocked when their last copy ends.
+    deferred: Vec<(u32, u32)>,
+}
+
+impl Pins {
+    /// The registered run holding region `r`.
+    fn run(&self, r: u32) -> Option<(u32, u32)> {
+        self.registered.range(..=r).next_back().map(|(s, e)| (*s, *e)).filter(|(_, e)| r < *e)
+    }
+
+    fn read(&self, (start, end): (u32, u32)) -> bool {
+        (start..end).any(|r| self.reading.contains(&r))
+    }
 }
 
 impl Held {
@@ -828,19 +842,31 @@ impl Held {
         Ok((self.ro.base as u64 + self.data + off, span))
     }
 
-    /// The tier wants the layout back: every region not being read is unlocked now, the rest
-    /// when their copy ends; the mapping goes with the last holder. Returns the bytes it had
+    /// Regions `start..end` as one host range (they are contiguous in the layout's file).
+    fn span(&self, start: u32, end: u32) -> Result<(u64, u64)> {
+        let (ptr, _) = self.ptr(start)?;
+        let (off, span) = self.region(end.saturating_sub(1))?;
+        Ok((ptr, self.ro.base as u64 + self.data + off + span - ptr))
+    }
+
+    /// Whether region `r + 1` starts where region `r` ends.
+    fn contiguous(&self, r: u32) -> bool {
+        matches!((self.region(r), self.region(r + 1)), (Ok((off, span)), Ok((next, _))) if off + span == next)
+    }
+
+    /// The tier wants the layout back: every run not being read is unlocked now, the rest when
+    /// their last copy ends; the mapping goes with the last holder. Returns the bytes it had
     /// page-locked.
     pub fn release(&self, mut unregister: impl FnMut(u64) -> Result<()>) -> u64 {
         let mut pins = self.pins.lock();
         pins.released = true;
-        let regions: Vec<u32> = pins.registered.drain().collect();
+        let runs: Vec<(u32, u32)> = std::mem::take(&mut pins.registered).into_iter().collect();
         let mut bytes = 0;
-        for r in regions {
-            let Ok((ptr, span)) = self.ptr(r) else { continue };
-            bytes += span;
-            if pins.reading.contains(&r) {
-                pins.deferred.push(r);
+        for run in runs {
+            let Ok((ptr, len)) = self.span(run.0, run.1) else { continue };
+            bytes += len;
+            if pins.read(run) {
+                pins.deferred.push(run);
             } else {
                 let _ = unregister(ptr);
             }
@@ -848,46 +874,57 @@ impl Held {
         bytes
     }
 
-    /// After a copy from region `r`: unlocks it if the layout was released meanwhile.
+    /// After a copy from region `r`: unlocks its run if the layout was released meanwhile and
+    /// nothing reads the run any more.
     pub fn settle(&self, r: u32, unregister: impl FnOnce(u64) -> Result<()>) {
         let mut pins = self.pins.lock();
         pins.reading.remove(&r);
-        if let Some(i) = pins.deferred.iter().position(|d| *d == r) {
-            pins.deferred.swap_remove(i);
-            if let Ok((ptr, _)) = self.ptr(r) {
-                let _ = unregister(ptr);
-            }
+        let Some(i) = pins.deferred.iter().position(|run| (run.0..run.1).contains(&r)) else { return };
+        let Some(run) = pins.deferred.get(i).copied().filter(|run| !pins.read(*run)) else { return };
+        pins.deferred.swap_remove(i);
+        if let Ok((ptr, _)) = self.span(run.0, run.1) {
+            let _ = unregister(ptr);
         }
     }
 
-    /// Page-locks region `r` once it is ready, so fills from it are pinned copies; a region
-    /// the tier gave back is unlocked first. A released layout is never locked again.
+    /// Page-locks the run of ready regions around region `r` in one call, so fills from it are
+    /// pinned copies. A region taken back without the tier asking (never in order) has its run
+    /// unlocked first: its pages are not the ones locked. A released layout is never locked
+    /// again.
     pub fn pin(&self, r: u32, register: impl FnOnce(u64, u64) -> Result<()>, unregister: impl FnOnce(u64) -> Result<()>) -> Result<()> {
-        let (ptr, span) = self.ptr(r)?;
-        let ready = self.ready(r).is_some_and(|w| w.load(Acquire) == 1);
+        let ready = |i: u32| self.ready(i).is_some_and(|w| w.load(Acquire) == 1);
         let mut pins = self.pins.lock();
         if pins.released {
             return Ok(());
         }
-        let registered = &mut pins.registered;
-        match (ready, registered.contains(&r)) {
-            (true, false) => {
-                register(ptr, span)?;
-                registered.insert(r);
+        match (ready(r), pins.run(r)) {
+            (true, None) => {
+                let free = |i: u32| ready(i) && pins.run(i).is_none();
+                let (mut start, mut end) = (r, r + 1);
+                while start > 0 && self.contiguous(start - 1) && free(start - 1) {
+                    start -= 1;
+                }
+                while self.contiguous(end - 1) && free(end) {
+                    end += 1;
+                }
+                let (ptr, len) = self.span(start, end)?;
+                register(ptr, len)?;
+                pins.registered.insert(start, end);
             }
-            (false, true) => {
-                unregister(ptr)?;
-                registered.remove(&r);
+            (false, Some((start, end))) => {
+                unregister(self.span(start, end)?.0)?;
+                pins.registered.remove(&start);
             }
             _ => {}
         }
         Ok(())
     }
 
-    /// Unlocks every region (the layout is closing).
+    /// Unlocks every run (the process is ending).
     pub fn unpin(&self, unregister: impl FnMut(u64) -> Result<()>) {
         self.release(unregister);
     }
+
     fn ready(&self, r: u32) -> Option<&AtomicU32> {
         let at = r as usize * 4;
         (at + 4 <= self.data as usize).then(|| {

@@ -96,7 +96,7 @@ pub trait Backend: Send + Sync {
     /// Blocks until `stream`'s work so far completes: only where recording an event failed.
     fn synchronize(&self, stream: usize) -> Result<()>;
     /// Blocks until `event` completes: only the mechanism thread, before it unmaps a page whose
-    /// consumers may still read it.
+    /// consumers may still read it, and a planned handover ([`crate::Memory::settle`]).
     fn finish(&self, event: Event) -> Result<()>;
     /// Page-locks `len` bytes of read-only host memory at `ptr` for the copy engine
     /// (`cuMemHostRegister`): a RAM-tier region, once, so every fill from it is a pinned copy.
