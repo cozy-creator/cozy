@@ -244,6 +244,13 @@ fn open_named(name: &str) -> Result<Owned> {
     }
 }
 
+impl Drop for Shared {
+    /// Its open mark goes with it (on macOS a lock file of its own, not the description's).
+    fn drop(&mut self) {
+        let _ = os::unlock(&self.fd, OPEN, 8);
+    }
+}
+
 impl Shared {
     /// The table behind `fd` (a grant's), initialised if it is new. The first opener sets the
     /// capacity; a later one can only lower it.
@@ -835,6 +842,8 @@ impl Drop for Row {
             let _ = self.shared.leave();
             self.shared.ring();
         }
+        // Released here, not only by the close: on macOS the lock is a file of its own.
+        let _ = os::unlock(&self._lock, self.at, ROW_CELLS * CELL);
     }
 }
 

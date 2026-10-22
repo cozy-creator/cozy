@@ -44,7 +44,6 @@ pub fn main() {
         ("a_panic_fails_the_request_not_the_process", a_panic_fails_the_request_not_the_process),
         ("exhausted_carries_stats", exhausted_carries_stats),
         ("kept_pages_survive_a_holder_that_served", kept_pages_survive_a_holder_that_served),
-        ("an_ask_to_a_stopped_victim_ends_when_it_dies", an_ask_to_a_stopped_victim_ends_when_it_dies),
         ("binds_outlive_the_custody_holder", binds_outlive_the_custody_holder),
         ("a_table_with_live_rows_outlives_tensord", a_table_with_live_rows_outlives_tensord),
         ("a_stale_reader_never_frees_a_newer_row", a_stale_reader_never_frees_a_newer_row),
@@ -55,10 +54,12 @@ pub fn main() {
         ("a_standalone_process_wakes_tensord", a_standalone_process_wakes_tensord),
         ("a_yielded_parent_is_its_familys_alone_and_waits_for_its_room", a_yielded_parent_is_its_familys_alone_and_waits_for_its_room),
     ];
-    // The RAM tier's files are Linux's, and so is the kernel's list of sockets.
+    // The RAM tier's files are Linux's (TensorD serves the tier beside a stopped victim), and so
+    // is the kernel's list of sockets.
     #[cfg(target_os = "linux")]
     cases.extend([
-        ("the_tier_gives_back_in_order", the_tier_gives_back_in_order as fn(&Path)),
+        ("an_ask_to_a_stopped_victim_ends_when_it_dies", an_ask_to_a_stopped_victim_ends_when_it_dies as fn(&Path)),
+        ("the_tier_gives_back_in_order", the_tier_gives_back_in_order),
         ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
         ("the_tier_waits_on_no_executor_and_says_when_the_host_is_short", the_tier_waits_on_no_executor_and_says_when_the_host_is_short),
         ("a_silent_asker_holds_up_no_answer", a_silent_asker_holds_up_no_answer),
@@ -738,6 +739,7 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
     b.exit();
 }
 
+#[cfg(target_os = "linux")]
 /// Review 1, finding 2: an ask to a victim whose ask thread cannot run (stopped) waits on the
 /// victim itself: when it dies, the asker goes on, with no timer. Review 2, finding 3: TensorD
 /// sees it stalled only while an ask is pending to it, and the ask is in the asker's own row.

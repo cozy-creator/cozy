@@ -101,6 +101,12 @@ fn flock(file: &Owned, kind: libc::c_int, wait: bool) -> Result<bool> {
 }
 
 fn take(f: &Owned, start: u64, kind: libc::c_int, wait: bool) -> Result<bool> {
+    // This description's own lock on the range is converted in place (shared to exclusive and
+    // back), as an OFD lock is; flock converts on the same open lock file.
+    let own = held_locks().lock().unwrap_or_else(|e| e.into_inner()).get(&(f.as_raw_fd(), start)).map(OwnedFd::try_clone).transpose()?;
+    if let Some(file) = own {
+        return flock(&file, kind, wait);
+    }
     let file = lock_file(f, start)?;
     if !flock(&file, kind, wait)? {
         return Ok(false);
