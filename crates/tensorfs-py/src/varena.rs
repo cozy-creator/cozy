@@ -277,11 +277,10 @@ impl PyGrant {
     /// Takes ownership of the table's and the row's descriptors (handles on Windows).
     #[new]
     fn new(table: i64, row: i64) -> Self {
-        PyGrant(Mutex::new(Some(Grant { table: owned(table), row: owned(row) })))
+        PyGrant(Mutex::new(Some(Grant { table: owned(table), row: owned(row), limit: None })))
     }
 
-    /// A standalone engine's grant: `gpu`'s table by name; `limit` lowers its capacity (the first
-    /// opener sets it, a later one can only lower it).
+    /// A standalone engine's grant: `gpu`'s table by name; `limit` caps only this opener's row.
     #[staticmethod]
     #[pyo3(signature = (gpu, limit = None))]
     fn open(py: Python<'_>, gpu: PyGpuId, limit: Option<u64>) -> PyResult<Self> {
@@ -439,7 +438,7 @@ impl PyMemory {
 #[pymethods]
 impl PyMemory {
     /// CUDA device `ordinal`'s table through TensorD's `grant`, or by name without one
-    /// (standalone, its capacity lowered to `limit`). Open it before torch initializes CUDA.
+    /// (standalone, its own row capped at `limit`). Open it before torch initializes CUDA.
     #[staticmethod]
     #[pyo3(signature = (ordinal, grant = None, limit = None))]
     fn cuda(py: Python<'_>, ordinal: i32, grant: Option<PyRef<'_, PyGrant>>, limit: Option<u64>) -> PyResult<Self> {

@@ -1,9 +1,10 @@
-//! The decision procedure over tables: real plans at real capacities, each demand rung, Belady,
-//! the speculation invariant and termination. A small simulator applies the actions the way
-//! the applier does (maps fill at once; asks free what the other row offers).
+//! `make_room`'s order over tables, pure: other sets' idle pages, caches nobody holds, then the
+//! plans' own pages furthest next use first; never a pinned page. A small simulator runs real
+//! plans through it at real capacities (each bind takes its page's room, each block its
+//! activations'), plus an ask's answer, prefetch, admission and placement.
 
-use varena::decide::{decide as decision, fits, Action, Admitted, OomSite, Trigger, Tried};
-use varena::table::{Cache, Class, Key, Page, Remote, Req, Retried, Set, Table};
+use varena::decide::{answer, fits, place, prefetch, victims, Admitted, Victim};
+use varena::table::{Cache, Key, Page, Req, Set, Table};
 
 const MB: u64 = 1 << 20;
 const GB: u64 = 1 << 30;
@@ -14,391 +15,164 @@ fn set(name: &str, pages: usize, bytes: u64) -> Option<Set> {
 
 /// A table with these sets and one request over `steps` (set indices, passes).
 fn table(capacity: u64, sets: Vec<Option<Set>>, steps: Vec<(Vec<u32>, u32)>) -> Table {
-    let req = Req { id: 1, name: "r".into(), rooms: steps.iter().map(|_| Some(0)).collect(), steps, measured: true, ..Req::default() };
+    let req = Req { id: 1, name: "r".into(), steps, ..Req::default() };
     Table { capacity, sets, requests: vec![req], ..Table::default() }
 }
 
-/// Each step's measured room, as the applier reads it from the ledger.
-fn with_rooms(mut t: Table, rooms: &[u64]) -> Table {
-    t.requests[0].rooms = rooms.iter().map(|r| Some(*r)).collect();
-    t
+/// What the mechanism derives from the pages: the backing mapped.
+fn backed(t: &mut Table) {
+    t.vmm = t.mapped();
 }
 
-/// This simulator's maps allocate immediately and its retiring fixture counters are disjoint.
-/// Production has explicit unique backing/placeholder facts supplied by the memory mechanism.
-fn observed(t: &Table) -> Table {
-    let mut view = t.clone();
-    view.vmm = view.mapped() + view.pending + view.inflight;
-    view.mapping = 0;
-    view.returning = view.pending + view.inflight;
-    view.physical = view.context + view.reserved + view.vmm;
-    view
+fn map(t: &mut Table, k: Key, clock: &mut u64) {
+    *clock += 1;
+    let p = t.page_mut(k).unwrap();
+    (p.mapped, p.filled, p.last_use) = (true, true, *clock);
+    backed(t);
 }
 
-fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> { decision(&observed(t), trigger) }
+fn pages(v: &[Victim]) -> Vec<Key> {
+    v.iter().filter_map(|v| if let Victim::Page { key, .. } = v { Some(*key) } else { None }).collect()
+}
 
-#[derive(Default)]
+/// Takes `bytes` as `make_room` does: victims in order until free covers them. Returns the
+/// pages taken; `None` when nothing is left to take.
+fn make_room(t: &mut Table, bytes: u64, keep: &[Key]) -> Option<Vec<Key>> {
+    let mut taken = vec![];
+    while t.free() < bytes {
+        let v = victims(t, keep);
+        let Some(Victim::Page { key, .. }) = v.first() else { return None };
+        let key = *key;
+        let p = t.page_mut(key).unwrap();
+        (p.mapped, p.filled) = (false, false);
+        backed(t);
+        taken.push(key);
+    }
+    Some(taken)
+}
+
+#[derive(Default, Debug)]
 struct Run {
-    evicted: Vec<(Key, Class)>,
-    exhausted: bool,
-    lowered: bool,
-    speculative: Vec<Key>,
+    /// Pages taken while they were in the running step (refilled later in the pass).
+    own: u64,
     maps: u64,
 }
 
-/// Applies own actions to the table; asks are answered by removing the other row's bytes.
-fn apply(t: &mut Table, actions: &[Action], run: &mut Run, tried: &mut Tried, clock: &mut u64) -> bool {
-    let mut remote = false;
-    for a in actions {
-        match a {
-            Action::Unmap { page, class } => {
-                run.evicted.push((*page, *class));
-                tried.freed += t.page(*page).unwrap().bytes;
-                let p = t.page_mut(*page).unwrap();
-                p.mapped = false;
-                p.filled = false;
-                p.speculative = None;
-            }
-            Action::Map(k) | Action::Prefetch(k) => {
-                *clock += 1;
-                let step = t.requests[0].distance(*k).map(|d| t.requests[0].cursor.step + d.0);
-                let p = t.page_mut(*k).unwrap();
-                p.mapped = true;
-                p.filled = true;
-                p.last_use = *clock;
-                run.maps += p.bytes;
-                if matches!(a, Action::Prefetch(_)) {
-                    p.speculative = step.map(|s| (1, s));
-                    run.speculative.push(*k);
-                    t.requests[0].speculated.insert(*k);
-                }
-            }
-            // Custody lets go; the page stays mapped, the allocator callback's.
-            Action::Lend(k) => t.page_mut(*k).unwrap().kept = false,
-            Action::Starve(_) => t.requests[0].starved = true,
-            Action::Lower(_) => {
-                t.requests[0].lowered = true;
-                run.lowered = true;
-            }
-            Action::Exhausted { .. } => run.exhausted = true,
-            Action::ReleaseOrphans(b) => {
-                tried.orphans = true;
-                t.orphans = t.orphans.saturating_sub(*b);
-                remote = true;
-            }
-            Action::Ask { row, ceiling, bytes } => {
-                tried.asked.insert((*row, *ceiling));
-                let r = t.others.iter_mut().find(|r| r.row == *row).unwrap();
-                let mut left = *bytes;
-                for c in [Class::S, Class::N, Class::D].into_iter().filter(|c| *c <= *ceiling) {
-                    let take = left.min(r.classes[c.index()]);
-                    r.classes[c.index()] -= take;
-                    left -= take;
-                    tried.freed += take;
-                }
-                remote = true;
-            }
-            Action::Claim { req, bytes } => {
-                let r = t.request_mut(*req).unwrap();
-                r.claimed += bytes;
-                r.episode.claimed_free = true;
-            }
-            Action::Trim(_) => {
-                tried.trimmed = true;
-                remote = true;
-            }
-            // Custody lets go at once here.
-            Action::Settle => {
-                t.pending = 0;
-                for r in &mut t.others {
-                    r.classes[Class::P.index()] = r.classes[Class::P.index()].saturating_sub(r.returning);
-                    r.returning = 0;
-                }
-                remote = true;
-            }
-            Action::Workspace { bytes, .. } => t.promised += bytes,
-            Action::Reserve { req, room, measured } => {
-                let r = t.request_mut(*req).unwrap();
-                r.room = *room;
-                r.measured = *measured;
-            }
-            Action::Shrink { .. } | Action::Cut { .. } | Action::CutOutside { .. } | Action::Relax { .. } | Action::Propose { .. } | Action::Park(_) => {}
-        }
-    }
-    remote
-}
-
-/// Decides and applies until the trigger ends (remote rungs decided again).
-fn demand(t: &mut Table, mut trigger: Trigger, run: &mut Run, clock: &mut u64) -> Vec<Action> {
-    loop {
-        let actions = decide(t, &trigger);
-        let mut tried = match &trigger {
-            Trigger::Prepare { tried, .. } | Trigger::Workspace { tried, .. } | Trigger::Bind { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } | Trigger::Outside { tried, .. } => tried.clone(),
-            Trigger::Ask { .. } | Trigger::Load { .. } => Tried::default(),
-        };
-        if !apply(t, &actions, run, &mut tried, clock) {
-            return actions;
-        }
-        match &mut trigger {
-            Trigger::Prepare { tried: t, .. } | Trigger::Workspace { tried: t, .. } | Trigger::Bind { tried: t, .. } | Trigger::Pass { tried: t, .. } | Trigger::Oom { tried: t, .. } | Trigger::Speculate { tried: t, .. } | Trigger::Outside { tried: t, .. } => *t = tried,
-            Trigger::Ask { .. } | Trigger::Load { .. } => return actions,
-        }
-    }
-}
-
-/// Runs a request's plan: per pass a pass trigger, then a bind (and, `speculate`, a prefetch
-/// decision) per block in order.
-fn play(t: &mut Table, rooms: &[u64], speculate: bool) -> Run {
-    let mut run = Run::default();
-    let mut clock = 0;
+/// Runs the plan: each pass binds its step's blocks in order, each block allocating `acts` as
+/// its activations while bound (the hook's segments), then frees them. The bound page is the
+/// one pin.
+fn play(t: &mut Table, acts: u64) -> Option<Run> {
+    let (mut run, mut clock) = (Run::default(), 0);
     let steps = t.requests[0].steps.clone();
     for (i, (sets, passes)) in steps.iter().enumerate() {
-        {
-            let r = &mut t.requests[0];
-            r.cursor = Default::default();
-            r.cursor.step = i as u32;
-            r.starved = false;
-        }
+        t.requests[0].cursor = varena::table::Cursor { step: i as u32, ..Default::default() };
         for _ in 0..*passes {
             for &s in sets {
-                let r = &mut t.requests[0];
-                *r.cursor.passes.entry(s).or_insert(0) += 1;
-                r.cursor.next.insert(s, 0);
-                r.speculated.clear();
-                let room = rooms[i];
-                let a = demand(t, Trigger::Pass { req: 1, set: s, room: Some(room), unmeasured: 0, tried: Tried::default() }, &mut run, &mut clock);
-                if matches!(a.last(), Some(Action::Exhausted { .. })) {
-                    return run;
-                }
-                let blocks = t.sets[s as usize].as_ref().unwrap().pages.len() as u32;
-                for b in 0..blocks {
-                    let key = (s, b);
-                    if !t.page(key).unwrap().mapped {
-                        let a = demand(t, Trigger::Bind { page: key, req: Some(1), tried: Tried::default() }, &mut run, &mut clock);
-                        if matches!(a.last(), Some(Action::Exhausted { .. })) {
-                            return run;
-                        }
+                let begun = t.requests[0].cursor.passes.get(&s).copied().unwrap_or(0);
+                t.requests[0].cursor.passes.insert(s, begun + 1);
+                t.requests[0].cursor.next.insert(s, 0);
+                let n = t.sets[s as usize].as_ref().unwrap().pages.len() as u32;
+                for b in 0..n {
+                    let k = (s, b);
+                    if !t.page(k).unwrap().mapped {
+                        let bytes = t.page(k).unwrap().bytes;
+                        let taken = make_room(t, bytes, &[k])?;
+                        run.own += taken.iter().filter(|k| sets.contains(&k.0)).count() as u64;
+                        map(t, k, &mut clock);
+                        run.maps += 1;
                     }
-                    clock += 1;
-                    let p = t.page_mut(key).unwrap();
-                    p.last_use = clock;
-                    p.speculative = None;
+                    t.page_mut(k).unwrap().pins = vec![1];
                     t.requests[0].cursor.next.insert(s, b + 1);
-                    if speculate {
-                        demand(t, Trigger::Speculate { req: 1, tried: Tried::default() }, &mut run, &mut clock);
-                    }
+                    let taken = make_room(t, acts, &[k])?;
+                    run.own += taken.iter().filter(|k| sets.contains(&k.0)).count() as u64;
+                    t.segments = acts;
+                    t.segments = 0;
+                    t.page_mut(k).unwrap().pins.clear();
                 }
             }
         }
     }
-    run
+    Some(run)
 }
 
 /// H3: [te, {avae, vae}, dit×8, avae, vae] (8-bit DiT in 40 blocks).
-fn h3(capacity: u64) -> (Table, Vec<u64>) {
+fn h3(capacity: u64) -> Table {
     let sets = vec![set("te", 24, 256 * MB), set("avae", 2, 256 * MB), set("vae", 2, 256 * MB), set("dit", 40, 352 * MB)];
-    let steps = vec![(vec![0], 1), (vec![1, 2], 1), (vec![3], 8), (vec![1], 1), (vec![2], 1)];
-    let rooms = vec![GB, GB, 3 * GB, 2 * GB, 4 * GB];
-    (with_rooms(table(capacity, sets, steps), &rooms), rooms)
+    table(capacity, sets, vec![(vec![0], 1), (vec![1, 2], 1), (vec![3], 8), (vec![1], 1), (vec![2], 1)])
 }
 
 /// SDXL: [te, unet×30, vae].
-fn sdxl(capacity: u64) -> (Table, Vec<u64>) {
+fn sdxl(capacity: u64) -> Table {
     let sets = vec![set("te", 8, 200 * MB), set("unet", 26, 100 * MB), set("vae", 2, 80 * MB)];
-    let steps = vec![(vec![0], 1), (vec![1], 30), (vec![2], 1)];
-    let rooms = vec![GB / 2, 2 * GB, 3 * GB];
-    (with_rooms(table(capacity, sets, steps), &rooms), rooms)
+    table(capacity, sets, vec![(vec![0], 1), (vec![1], 30), (vec![2], 1)])
 }
 
+/// The audit's bar: one loop serves every capacity; a model bigger than the card streams (its
+/// own blocks behind the cursor go), one that fits loads once and stays.
 #[test]
 fn h3_and_sdxl_complete_at_24_12_and_8_gib() {
     for capacity in [24 * GB, 12 * GB, 8 * GB] {
-        for (name, (mut t, rooms)) in [("h3", h3(capacity)), ("sdxl", sdxl(capacity))] {
-            let run = play(&mut t, &rooms, true);
-            assert!(!run.exhausted, "{name} at {} GiB exhausted", capacity / GB);
-            let w_or_p = run.evicted.iter().filter(|(_, c)| matches!(c, Class::W | Class::P)).count();
-            assert!(run.lowered || w_or_p == 0, "{name} at {} GiB evicted W without lowering", capacity / GB);
-            assert!(run.evicted.iter().all(|(_, c)| *c != Class::P), "{name}: a pinned page went");
+        let run = play(&mut sdxl(capacity), GB).unwrap_or_else(|| panic!("SDXL at {capacity}"));
+        assert_eq!((run.own, run.maps), (0, 36), "SDXL fits at {}: each page loads once", capacity / GB);
+        let run = play(&mut h3(capacity), 2 * GB).unwrap_or_else(|| panic!("H3 at {capacity}"));
+        let dit = 40 * 352 * MB;
+        if capacity > dit + 3 * GB {
+            assert_eq!(run.own, 0, "H3's DiT fits at {}", capacity / GB);
+        } else {
+            assert!(run.own > 0, "H3's DiT streams at {}", capacity / GB);
         }
     }
-    // Whole at 24 GiB: the DiT (14 GiB) stays resident across its 8 passes.
-    let (mut t, rooms) = h3(24 * GB);
-    let run = play(&mut t, &rooms, false);
-    assert!(!run.lowered);
-    let dit = 40 * 352 * MB;
-    assert!(run.maps < dit * 2, "the DiT was read {} times", run.maps / dit);
-    // At 8 GiB the DiT streams: lowered.
-    let (mut t, rooms) = h3(8 * GB);
-    assert!(play(&mut t, &rooms, false).lowered);
 }
 
-/// A table at capacity 10 pages with one request at step 1 of [a, b, a+c], one page of each
-/// class an own demand can take.
-fn ladder() -> Table {
-    let sets = vec![set("a", 4, MB), set("b", 2, MB), set("c", 2, MB), set("n", 2, MB)];
-    let mut t = table(10 * MB, sets, vec![(vec![0], 1), (vec![1], 1), (vec![0, 2], 1)]);
-    t.requests[0].cursor.step = 1;
-    t.requests[0].cursor.passes.insert(1, 1);
-    t
-}
-
-fn map(t: &mut Table, k: Key) {
-    let p = t.page_mut(k).unwrap();
-    p.mapped = true;
-    p.filled = true;
-}
-
+/// The order: pages of sets no plan uses, least recently used first; then caches nobody holds,
+/// least recently used first; then the plan's pages, furthest next use first. Never a pinned
+/// or filling page, nor one being bound; a page whose release is pending is marked.
 #[test]
-fn every_rung_of_the_demand_order() {
-    let bind = |t: &Table| decide(t, &Trigger::Bind { page: (1, 1), req: Some(1), tried: Tried::default() });
-    // F: enough free, map at once.
-    let t = ladder();
-    assert_eq!(bind(&t), vec![Action::Map((1, 1))]);
-
-    // Fill the card: W = b0, D = a0..a3 and c0, c1, N = n0, n1, S = c? (speculated for step 2).
-    let mut full = ladder();
-    for k in [(1, 0), (0, 0), (0, 1), (0, 2), (0, 3), (2, 0), (2, 1), (3, 0), (3, 1)] {
-        map(&mut full, k);
-    }
-    full.page_mut((2, 1)).unwrap().speculative = Some((1, 2));
-    full.capacity = 9 * MB;
-    assert_eq!(full.class((1, 0)), Some(Class::W));
-    assert_eq!(full.class((0, 0)), Some(Class::D));
-    assert_eq!(full.class((2, 1)), Some(Class::S));
-    assert_eq!(full.class((3, 0)), Some(Class::N));
-
-    // O: orphans go first.
-    let mut t = full.clone();
-    t.orphans = MB;
-    t.capacity += MB;
-    assert_eq!(bind(&t), vec![Action::ReleaseOrphans(MB)]);
-    // Own S: the step starves.
-    let a = bind(&full);
-    assert_eq!(a[..2], [Action::Starve(1), Action::Unmap { page: (2, 1), class: Class::S }]);
-    // Own N, least recently used first.
-    let mut t = full.clone();
-    t.page_mut((2, 1)).unwrap().speculative = None;
-    t.page_mut((3, 0)).unwrap().last_use = 5;
-    t.page_mut((3, 1)).unwrap().last_use = 2;
-    assert_eq!(bind(&t)[0], Action::Unmap { page: (3, 1), class: Class::N });
-    // Others' O/S/N: asked under N.
-    let mut t = full.clone();
-    for k in [(2, 1), (3, 0), (3, 1)] {
-        t.page_mut(k).unwrap().mapped = false;
-    }
-    t.capacity = 6 * MB + 2 * MB;
-    t.others = vec![Remote { row: 7, classes: [0, 0, 0, 2 * MB, 0, 0, 0], ..Remote::default() }];
-    assert_eq!(bind(&t), vec![Action::Ask { row: 7, ceiling: Class::N, bytes: MB }]);
-    // Own D, furthest first: a3 (next used at step 2, block 3) before c0.
-    let mut tried = Tried::default();
-    tried.asked.insert((7, Class::N));
-    let a = decide(&t, &Trigger::Bind { page: (1, 1), req: Some(1), tried: tried.clone() });
-    assert_eq!(a[0], Action::Unmap { page: (0, 3), class: Class::D });
-    // Others' D: asked under D once own D is gone.
-    let mut t2 = t.clone();
-    for k in [(0, 0), (0, 1), (0, 2), (0, 3), (2, 0)] {
-        t2.page_mut(k).unwrap().mapped = false;
-    }
-    t2.capacity = MB + MB;
-    t2.others = vec![Remote { row: 7, classes: [0, 0, 0, 0, 2 * MB, 0, 0], ..Remote::default() }];
-    assert_eq!(decide(&t2, &Trigger::Bind { page: (1, 1), req: Some(1), tried: Tried::default() }), vec![Action::Ask { row: 7, ceiling: Class::D, bytes: MB }]);
-    // Cut at a pass start: the site with the highest measured peak.
-    let mut t3 = t2.clone();
-    t3.others.clear();
-    t3.requests[0].sites.insert(
-        1,
-        vec![
-            varena::table::CutSite { name: "ffn".into(), peak: 3 * MB, finest: 4, ..Default::default() },
-            varena::table::CutSite { name: "attn".into(), peak: 2 * MB, finest: 4, ..Default::default() },
-        ],
-    );
-    let a = decide(&t3, &Trigger::Pass { req: 1, set: 1, room: Some(4 * MB), unmeasured: 0, tried: Tried::default() });
-    assert!(a.iter().any(|a| matches!(a, Action::Cut { site, .. } if site == "ffn")), "{a:?}");
-    // Lower: no cut left, the request lowers and streams its own W (but never the page bound).
-    let mut tried = Tried::default();
-    tried.cut.extend(["ffn".to_string(), "attn".to_string()]);
-    let a = decide(&t3, &Trigger::Pass { req: 1, set: 1, room: Some(MB), unmeasured: 0, tried });
-    assert!(a.contains(&Action::Lower(1)), "{a:?}");
-    // Park, then Exhausted, at an OOM with nothing left.
-    let mut t4 = t3.clone();
-    t4.page_mut((1, 0)).unwrap().pins = vec![1];
-    t4.requests[0].lowered = true;
-    t4.requests[0].episode.claimed_free = true;
-    t4.headroom = GB;
-    let oom = |t: &Table| decide(t, &Trigger::Oom { req: 1, set: Some(1), need: Some(MB), site: None, tried: Tried::default() });
-    assert_eq!(oom(&t4).last(), Some(&Action::Park(1)));
-    t4.requests[0].episode.parked = true;
-    assert!(matches!(oom(&t4).last(), Some(Action::Exhausted { .. })));
-}
-
-#[test]
-fn belady_evicts_the_furthest_use() {
-    // Plan [a, b, c, d]; at step 0, b/c/d are D at distances 1/2/3: d goes first, then c.
-    let sets = vec![set("a", 1, MB), set("b", 1, MB), set("c", 1, MB), set("d", 1, MB), set("x", 1, MB)];
-    let mut t = table(4 * MB, sets, vec![(vec![0], 1), (vec![1], 1), (vec![2], 1), (vec![3], 1), (vec![4], 1)]);
-    for k in [(1, 0), (2, 0), (3, 0), (4, 0)] {
-        map(&mut t, k);
-    }
-    let a = decide(&t, &Trigger::Bind { page: (0, 0), req: Some(1), tried: Tried::default() });
-    assert_eq!(a, vec![Action::Unmap { page: (4, 0), class: Class::D }, Action::Map((0, 0))]);
-    // Within a repeating step the block just used is the furthest (most recently used).
-    let mut t = table(3 * MB, vec![set("dit", 4, MB)], vec![(vec![0], 8)]);
-    t.requests[0].lowered = true;
-    t.requests[0].cursor.passes.insert(0, 1);
-    t.requests[0].cursor.next.insert(0, 3);
-    for k in [(0, 0), (0, 1), (0, 2)] {
-        map(&mut t, k);
-    }
-    let a = decide(&t, &Trigger::Bind { page: (0, 3), req: Some(1), tried: Tried::default() });
-    assert_eq!(a[0], Action::Unmap { page: (0, 2), class: Class::W });
-}
-
-#[test]
-fn speculation_changes_no_demand_eviction() {
-    for (name, capacity) in [("24", 24 * GB), ("12", 12 * GB), ("8", 8 * GB)] {
-        let (mut off, rooms) = h3(capacity);
-        let (mut on, _) = h3(capacity);
-        let plain = play(&mut off, &rooms, false);
-        let ahead = play(&mut on, &rooms, true);
-        let valuable = |r: &Run| r.evicted.iter().filter(|(_, c)| matches!(c, Class::D | Class::W | Class::P)).copied().collect::<Vec<_>>();
-        assert_eq!(valuable(&plain), valuable(&ahead), "h3 at {name} GiB");
-        assert!(!ahead.speculative.is_empty() || capacity == 8 * GB, "h3 at {name} GiB fetched nothing ahead");
-    }
-    // Speculation itself never evicts anything with a declared use.
-    let (mut t, rooms) = sdxl(12 * GB);
-    play(&mut t, &rooms, false);
-    let a = decide(&t, &Trigger::Speculate { req: 1, tried: Tried::default() });
-    assert!(a.iter().all(|a| !matches!(a, Action::Unmap { class: Class::D | Class::W | Class::P | Class::S, .. })), "{a:?}");
-}
-
-#[test]
-fn any_oom_sequence_ends_within_pages_plus_cuts_plus_two() {
-    let pages = 6u32;
-    let cut_levels = 3u32;
-    let mut t = table(pages as u64 * MB, vec![set("dit", pages as usize, MB)], vec![(vec![0], 1)]);
-    t.requests[0].cursor.passes.insert(0, 1);
-    for b in 0..pages {
-        map(&mut t, (0, b));
-    }
-    t.page_mut((0, 0)).unwrap().pins = vec![9];
-    let mut answers = 0;
-    let mut cuts = 0;
+fn victims_go_idle_pages_then_caches_then_the_plan_furthest_first() {
+    let mut t = table(64 * MB, vec![set("now", 2, MB), set("later", 2, MB), set("idle", 2, MB)], vec![(vec![0], 1), (vec![1], 1)]);
     let mut clock = 0;
-    let mut run = Run::default();
-    loop {
-        answers += 1;
-        assert!(answers <= pages + cut_levels + 2, "{answers} answers");
-        let site = (cuts < cut_levels).then(|| OomSite { name: "ffn".into(), collective: false, finest: cut_levels, shape: "1x8".into() });
-        let a = demand(&mut t, Trigger::Oom { req: 1, set: Some(0), need: Some(pages as u64 * MB), site, tried: Tried::default() }, &mut run, &mut clock);
-        match a.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::Park(_) | Action::Exhausted { .. })) {
-            Some(Action::Cut { .. }) => cuts += 1,
-            Some(Action::Exhausted { .. }) => break,
-            Some(_) => t.requests[0].episode.parked = true,
-            None => assert!(a.iter().any(|a| matches!(a, Action::Claim { .. })), "a retry without progress: {a:?}"),
-        }
+    for k in [(2, 1), (2, 0), (1, 0), (1, 1), (0, 0), (0, 1)] {
+        map(&mut t, k, &mut clock);
     }
-    assert_eq!(cuts, cut_levels);
-    assert!(run.evicted.iter().all(|(k, _)| *k != (0, 0)), "the pinned page went");
+    t.caches = vec![Cache { id: 7, bytes: MB, last_use: 9, ..Cache::default() }, Cache { id: 8, bytes: MB, last_use: 1, holds: 1, ..Cache::default() }];
+    t.requests[0].cursor.passes.insert(0, 1);
+    t.requests[0].cursor.next.insert(0, 1);
+    t.page_mut((0, 1)).unwrap().releasing = vec![3];
+    let v = victims(&t, &[(1, 1)]);
+    assert_eq!(pages(&v), vec![(2, 1), (2, 0), (1, 0), (0, 0), (0, 1)], "idle by age; then later's; then now's block behind the cursor before the one ahead");
+    assert_eq!(v.get(2), Some(&Victim::Cache { id: 7, bytes: MB }), "the unheld cache after the idle pages; the held one never");
+    assert!(v.contains(&Victim::Page { key: (0, 1), bytes: MB, releasing: true }), "a page whose release is pending is taken once it completes");
+    t.page_mut((0, 0)).unwrap().pins = vec![1];
+    t.page_mut((2, 1)).unwrap().filling = true;
+    assert!(!pages(&victims(&t, &[])).iter().any(|k| *k == (0, 0) || *k == (2, 1)), "pinned and filling pages never go");
+}
+
+/// An ask takes this row's idle pages only (no plan uses them), oldest first, up to the bytes
+/// asked; never a planned page, one with a release pending, or a cache.
+#[test]
+fn an_answer_gives_idle_pages_only() {
+    let mut t = table(64 * MB, vec![set("run", 1, MB), set("idle", 3, MB)], vec![(vec![0], 1)]);
+    let mut clock = 0;
+    for k in [(1, 2), (1, 0), (1, 1), (0, 0)] {
+        map(&mut t, k, &mut clock);
+    }
+    t.page_mut((1, 1)).unwrap().releasing = vec![1];
+    t.caches = vec![Cache { id: 1, bytes: 8 * MB, ..Cache::default() }];
+    assert_eq!(answer(&t, MB + 1), vec![(1, 2), (1, 0)]);
+    assert_eq!(answer(&t, 64 * MB), vec![(1, 2), (1, 0)], "nothing planned, pending or cached");
+}
+
+/// Prefetch maps the next blocks past the cursor into free bytes only: never more than fits.
+#[test]
+fn prefetch_maps_the_next_blocks_into_free_bytes_only() {
+    let mut t = table(3 * MB, vec![set("s", 4, MB)], vec![(vec![0], 1)]);
+    t.requests[0].cursor.passes.insert(0, 1);
+    t.requests[0].cursor.next.insert(0, 1);
+    assert_eq!(prefetch(&t, 1), vec![(0, 1), (0, 2)], "the next two blocks");
+    let mut clock = 0;
+    map(&mut t, (0, 0), &mut clock);
+    map(&mut t, (0, 3), &mut clock);
+    assert_eq!(prefetch(&t, 1), vec![(0, 1)], "one block of room left");
 }
 
 #[test]
@@ -408,107 +182,33 @@ fn admission_counts_each_byte_once() {
     assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(13 * GB + 1), None));
     assert!(!fits(24 * GB, 2 * GB, &[row(10 * GB, 1, 0)], &[], Some(12 * GB), None), "foreign bytes are taken off");
     assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[Some(4 * GB)], Some(12 * GB), None), "a dispatched request counts");
-    // Unmeasured: only on an idle GPU.
+    // Unmeasured: only on an idle GPU, which admits anything (a request larger than it streams).
     assert!(!fits(24 * GB, 0, &[row(GB, 1, 0)], &[], None, None));
     assert!(fits(24 * GB, 0, &[row(0, 0, 0)], &[], None, None));
+    assert!(fits(8 * GB, 0, &[row(0, 0, 0)], &[], Some(20 * GB), None));
     assert!(!fits(24 * GB, 0, &[row(GB, 1, 1)], &[], Some(GB), None));
 }
 
-/// Review 3, R4: a row with requests yielded to two families publishes each family's W apart.
-/// A's child is admitted beside A's parent as if it were gone, never beside B's; B's likewise.
+/// Review 3, R4: a row with requests yielded to two families publishes each family's peak
+/// apart. A's child is admitted beside A's parent as if it were gone, never beside B's.
 #[test]
 fn a_rows_yielded_w_is_per_family() {
     let (a, b) = (11, 22);
     let rows = [Admitted { context: GB, outside: 0, remaining: 0, running: 1, unmeasured: 0, yielded: [(a, 8 * GB), (b, 6 * GB), (0, 0)] }];
-    // 24 GB: the context's 1, the other family's parent, and the child.
     assert!(fits(24 * GB, 0, &rows, &[], Some(17 * GB), Some(a)) && !fits(24 * GB, 0, &rows, &[], Some(17 * GB + 1), Some(a)), "A's child: beside B's parent (6) only");
     assert!(fits(24 * GB, 0, &rows, &[], Some(15 * GB), Some(b)) && !fits(24 * GB, 0, &rows, &[], Some(15 * GB + 1), Some(b)), "B's child: beside A's parent (8) only");
     assert!(fits(24 * GB, 0, &rows, &[], Some(9 * GB), None) && !fits(24 * GB, 0, &rows, &[], Some(9 * GB + 1), None), "a stranger's child: beside both");
 }
 
-// ---- regressions from review 1
-
-/// Review 1, finding 5 (the reviewer's probe): an OOM whose own N unmap and another row's
-/// answer together cover the need re-decides with both counted, and evicts no D page.
+/// Review 6, R4 nit: a row's slots hold as many families apart as there are slots; only more
+/// than that fold the smallest together under family 0.
 #[test]
-fn an_oom_counts_its_own_unmaps_after_an_ask() {
-    let g = 1 << 30;
-    let page = || Page { bytes: g, mapped: true, filled: true, ..Page::default() };
-    let set = |name: &str, n: usize| Some(Set { name: name.into(), pages: (0..n).map(|_| page()).collect(), declared: true });
-    let mut req = Req { id: 1, name: "r".into(), steps: vec![(vec![0], 1), (vec![1], 1)], rooms: vec![Some(0), Some(0)], measured: true, ..Req::default() };
-    req.episode.claimed_free = true;
-    let mut t = Table { capacity: 6 * g, sets: vec![set("w", 2), set("d", 2), set("n", 1)], requests: vec![req], others: vec![Remote { row: 99, running: true, classes: [0, 0, 0, g, 0, 0, 0], ..Remote::default() }], ..Table::default() };
-    let (mut run, mut clock) = (Run::default(), 0);
-    let a = demand(&mut t, Trigger::Oom { req: 1, set: Some(0), need: Some(2 * g), site: None, tried: Tried::default() }, &mut run, &mut clock);
-    assert!(run.evicted.iter().all(|(_, c)| *c != Class::D), "evicted a D page: {:?}", run.evicted);
-    assert!(a.iter().any(|a| matches!(a, Action::Claim { bytes, .. } if *bytes == 2 * g)), "{a:?}");
-}
-
-/// Review 1, finding 6: an idle GPU admits anything (it streams), and a lowered request's
-/// remaining W counts its streaming slots, not all its pages.
-#[test]
-fn an_idle_gpu_admits_a_model_larger_than_the_card() {
-    let idle = Admitted { context: GB, ..Admitted::default() };
-    assert!(fits(8 * GB, 0, &[idle], &[], Some(20 * GB), None));
-    let (mut t, rooms) = h3(8 * GB);
-    play(&mut t, &rooms, false);
-    let r = &t.requests[0];
-    assert!(r.lowered);
-    let remaining = t.remaining(r).unwrap();
-    assert!(remaining < 8 * GB, "a streamed step's W is its room and slots: {remaining}");
-}
-
-fn cut_table(level: u32, coarser: Option<(u64, Option<u64>)>, collective: bool) -> Table {
-    let mut t = table(16 * MB, vec![set("dit", 4, MB)], vec![(vec![0], 1)]);
-    t.requests[0].cursor.passes.insert(0, 1);
-    t.requests[0].sites.insert(0, vec![varena::table::CutSite { name: "ffn".into(), level, finest: 4, peak: 4 * MB, collective, finer: Some(2 * MB), coarser, ..Default::default() }]);
-    t
-}
-
-/// Review 1, finding 7: a cut relaxes only into what is left once the pass has its room and
-/// its step's pages, and never back to a room it failed at.
-#[test]
-fn relaxing_takes_only_the_surplus_and_remembers_failures() {
-    let pass = |t: &Table, room: u64| decide(t, &Trigger::Pass { req: 1, set: 0, room: Some(room), unmeasured: 0, tried: Tried::default() });
-    // 16 MB: 4 MB of pages unmapped, a 4 MB room; coarser needs 6 MB: 8 MB spare, so it relaxes.
-    let t = cut_table(1, Some((6 * MB, None)), false);
-    assert!(pass(&t, 4 * MB).contains(&Action::Relax { req: 1, set: 0, site: "ffn".into() }));
-    // The same with the coarser room larger than the spare: it stays cut.
-    let t = cut_table(1, Some((13 * MB, None)), false);
-    assert!(!pass(&t, 4 * MB).iter().any(|a| matches!(a, Action::Relax { .. })));
-    // It failed at 12 MB of room before; 12 MB is all there is: it stays cut.
-    let t = cut_table(1, Some((6 * MB, Some(12 * MB))), false);
-    assert!(!pass(&t, 4 * MB).iter().any(|a| matches!(a, Action::Relax { .. })));
-    // Relaxing never evicts: with the pages taking the surplus it waits.
-    let mut t = cut_table(1, Some((6 * MB, None)), false);
-    t.capacity = 9 * MB;
-    assert!(!pass(&t, 4 * MB).iter().any(|a| matches!(a, Action::Relax { .. } | Action::Unmap { .. })));
-}
-
-/// Review 1, finding 4: a pass start never cuts a collective site on its own, and an OOM at one
-/// proposes its finer level for the next pass instead of cutting mid-pass.
-#[test]
-fn collective_sites_change_only_by_agreement() {
-    let mut t = cut_table(0, None, true);
-    t.capacity = 5 * MB;
-    let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(4 * MB), unmeasured: 0, tried: Tried::default() });
-    assert!(!a.iter().any(|a| matches!(a, Action::Cut { .. })), "{a:?}");
-    assert!(a.contains(&Action::Lower(1)));
-    let a = decide(&t, &Trigger::Oom { req: 1, set: Some(0), need: Some(MB), site: Some(OomSite { name: "ffn".into(), collective: true, finest: 4, shape: "1x8".into() }), tried: Tried::default() });
-    assert!(a.iter().any(|a| matches!(a, Action::Propose { req: 1, set: 0, site, level: 1, failed_at: Some(_) } if site == "ffn")), "{a:?}");
-    assert!(!a.iter().any(|a| matches!(a, Action::Cut { .. })), "{a:?}");
-}
-
-/// Review 1, finding 8: a pass's room is set by the same decision, in the same apply, as the
-/// evictions that made it.
-#[test]
-fn a_pass_reserves_its_room_with_its_evictions() {
-    let mut t = table(4 * MB, vec![set("a", 2, MB), set("n", 2, MB)], vec![(vec![0], 1)]);
-    map(&mut t, (1, 0));
-    map(&mut t, (1, 1));
-    let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(2 * MB), unmeasured: 0, tried: Tried::default() });
-    assert_eq!(a.last(), Some(&Action::Reserve { req: 1, room: 2 * MB, measured: true }));
-    assert_eq!(a.iter().filter(|a| matches!(a, Action::Unmap { class: Class::N, .. })).count(), 2, "{a:?}");
+fn a_rows_yielded_slots_fold_only_past_their_count() {
+    let yielded = |id: u64, family: u64, gb: u64| Req { id, family, yielded: true, peak: Some(gb * GB), ..Req::default() };
+    let mut t = Table { capacity: 64 * GB, requests: vec![yielded(1, 11, 8), yielded(2, 22, 6), yielded(3, 33, 4)], ..Table::default() };
+    assert_eq!(t.yielded_by_family(), [(11, 8 * GB), (22, 6 * GB), (33, 4 * GB)], "three families, three slots");
+    t.requests.push(yielded(4, 44, 2));
+    assert_eq!(t.yielded_by_family(), [(11, 8 * GB), (22, 6 * GB), (0, 6 * GB)], "a fourth folds with the third");
 }
 
 /// The tier's order, pure: orphaned layouts first (least recently used), then unused, then the
@@ -530,219 +230,13 @@ fn the_tier_never_releases_a_region_in_flight() {
     assert_eq!(order, vec!["orphan", "unused", "far", "near"]);
 }
 
-/// S5 r3: largest first; GPU 0 keeps what fits beside the working set, else the GPU with the
-/// most room that holds it, else GPU 0 (it pages there); an unknown set goes where the most
-/// room is left.
+/// S5 r3: largest first; GPU 0 keeps what fits, else the GPU with the most room that holds it,
+/// else GPU 0 (it pages there); an unknown set goes where the most room is left.
 #[test]
 fn sets_place_largest_first_and_stay_on_gpu_0_when_they_fit() {
-    use varena::decide::place;
     assert_eq!(place(&[10 * MB, 20 * MB], &[Some(4 * MB), Some(6 * MB)]), vec![0, 0], "both fit on GPU 0");
     assert_eq!(place(&[8 * MB, 20 * MB], &[Some(4 * MB), Some(6 * MB)]), vec![1, 0], "the larger first: GPU 0 keeps 6, the 4 moves");
     assert_eq!(place(&[2 * MB, 5 * MB, 7 * MB], &[Some(4 * MB)]), vec![2], "the most room that holds it");
     assert_eq!(place(&[2 * MB, 3 * MB], &[Some(4 * MB)]), vec![0], "nowhere holds it: GPU 0 pages it");
     assert_eq!(place(&[2 * MB, 9 * MB, 3 * MB], &[None, Some(4 * MB)]), vec![1, 1], "known first; the unknown where the most is left");
 }
-
-/// A withdrawal is not free yet, but it is not permanent pressure either. Settling must
-/// precede a zero-byte trim/orphan request or a cut, and cannot authorize mapping early.
-#[test]
-fn already_returning_bytes_settle_before_any_degradation() {
-    let t = Table { capacity: 10 * MB, pending: 8 * MB, reserved: 2 * MB, sets: vec![set("next", 1, 8 * MB)], ..Table::default() };
-    let trigger = Trigger::Bind { page: (0, 0), req: None, tried: Tried::default() };
-    assert_eq!(observed(&t).free(), 0);
-    assert_eq!(observed(&t).classes()[Class::P.index()], 8 * MB, "custody bytes stay charged once");
-    assert_eq!(decide(&t, &trigger), vec![Action::Settle]);
-    let settled = Table { pending: 0, ..t };
-    assert_eq!(decide(&settled, &trigger), vec![Action::Map((0, 0))]);
-}
-
-#[test]
-fn remote_returning_bytes_are_reachable_but_not_free() {
-    let mut t = table(8 * MB, vec![], vec![]);
-    t.allocated = 4 * MB;
-    t.reserved = 4 * MB;
-    let mut remote = Remote { row: 7, returning: 4 * MB, ..Remote::default() };
-    remote.classes[Class::P.index()] = 4 * MB;
-    t.others = vec![remote];
-    let trigger = Trigger::Oom { req: 1, set: None, need: Some(4 * MB), site: None, tried: Tried::default() };
-    assert_eq!(observed(&t).free(), 0);
-    assert_eq!(t.others[0].held(), 4 * MB, "returning is a subset of P, never an extra charge");
-    assert_eq!(t.reachable(), 4 * MB);
-    assert_eq!(decide(&t, &trigger), vec![Action::Settle]);
-    // A real consumer pin or RAM copy is not retiring just because it might finish later.
-    t.others[0].returning = 0;
-    assert_eq!(t.reachable(), 0);
-    assert_eq!(decide(&t, &trigger), vec![Action::Exhausted { need: 4 * MB }]);
-}
-
-/// A previous attempt already claimed free room. The remaining kept victims are smaller than
-/// the whole allocation: their completion must still permit one real retry before degradation.
-#[test]
-fn partial_kept_recovery_settles_and_retries_before_cut_or_park() {
-    for cut in [false, true] {
-        let mut t = table(20 * MB, vec![set("working", 1, 4 * MB), set("idle", 1, 6 * MB)], vec![(vec![0], 1)]);
-        t.headroom = 20 * MB;
-        t.page_mut((0, 0)).unwrap().mapped = true;
-        t.page_mut((0, 0)).unwrap().pins.push(1);
-        let idle = t.page_mut((1, 0)).unwrap();
-        idle.mapped = true;
-        idle.filled = true;
-        idle.kept = true;
-        t.requests[0].claimed = 8 * MB;
-        t.requests[0].episode.claimed_free = true;
-        let site = cut.then(|| OomSite { name: "ffn".into(), collective: false, finest: 1, shape: "1".into() });
-        let trigger = |tried| Trigger::Oom { req: 1, set: Some(0), need: Some(8 * MB), site: site.clone(), tried };
-        let actions = decide(&t, &trigger(Tried::default()));
-        assert_eq!(actions, vec![Action::Unmap { page: (1, 0), class: Class::N }, Action::Settle], "partial progress must complete before degradation");
-        // Own mapping is gone, but custody still holds the same six bytes. It is not free yet.
-        let before = observed(&t).free();
-        t.page_mut((1, 0)).unwrap().mapped = false;
-        t.pending = 6 * MB;
-        assert_eq!(observed(&t).free(), before);
-        // The checked completion ends ownership; only these newly freed bytes count again.
-        t.pending = 0;
-        let actions = decide(&t, &trigger(Tried { freed: 6 * MB, ..Tried::default() }));
-        assert_eq!(actions, vec![Action::Claim { req: 1, bytes: 6 * MB }], "try the real allocation before cutting or parking");
-        t.requests[0].claimed += 6 * MB;
-        let no_progress = decide(&t, &trigger(Tried::default()));
-        assert!(!no_progress.iter().any(|a| matches!(a, Action::Settle | Action::Claim { .. })), "completed bytes cannot be retried forever");
-        assert!(no_progress.iter().any(|a| if cut { matches!(a, Action::Cut { .. }) } else { matches!(a, Action::Park(_)) }));
-    }
-}
-
-/// Lead's ruling (S4, SDXL's graph pools and decode caches): a cache registered for a component
-/// takes its class, and shrinks at that class's turn on every demand. The UNet declared next, a
-/// pass start gives back the free-standing N page, then the UNet's pool (D, before the UNet's
-/// pages at the same distance), and no UNet page.
-#[test]
-fn a_components_cache_goes_at_its_class_turn_before_its_pages() {
-    let sets = vec![set("te", 1, MB), set("unet", 2, MB), set("n", 1, MB)];
-    let mut t = table(5 * MB, sets, vec![(vec![0], 1), (vec![1], 1)]);
-    for k in [(0, 0), (1, 0), (1, 1), (2, 0)] {
-        map(&mut t, k);
-    }
-    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), sets: vec![1], bytes: MB, last_use: 0, ..Default::default() });
-    (t.allocated, t.reserved) = (MB, MB);
-    let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(2 * MB), unmeasured: 0, tried: Tried::default() });
-    assert_eq!(a, vec![Action::Unmap { page: (2, 0), class: Class::N }, Action::Shrink { cache: 7, bytes: MB }, Action::Reserve { req: 1, room: 2 * MB, measured: true }]);
-    // Declared no more, the pool is N: least recently used across pages and caches, before its
-    // set's own pages.
-    let mut t = table(5 * MB, vec![set("te", 1, MB), set("unet", 2, MB), set("n", 1, MB)], vec![(vec![0], 1)]);
-    for (k, used) in [((0, 0), 9), ((1, 0), 3), ((1, 1), 4), ((2, 0), 2)] {
-        map(&mut t, k);
-        t.page_mut(k).unwrap().last_use = used;
-    }
-    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), sets: vec![1], bytes: MB, last_use: 8, ..Default::default() });
-    (t.allocated, t.reserved) = (MB, MB);
-    let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(3 * MB), unmeasured: 0, tried: Tried::default() });
-    assert_eq!(&a[..3], &[Action::Unmap { page: (2, 0), class: Class::N }, Action::Shrink { cache: 7, bytes: MB }, Action::Unmap { page: (1, 0), class: Class::N }], "{a:?}");
-}
-
-/// Lead's rulings (S4's v6 13592: the tiled 4 MP decode's split re-ran at level 0 three times on
-/// evict-and-retry; e199: the driver refused a claim at decided-free). A second OOM at the same
-/// site and level, its allocation no further, retries only on progress: bytes freed beyond
-/// what is free now. With nothing more to free it escalates (the outside cut, or the pass's
-/// site, finer; at the finest level a park or exhaustion), claiming nothing.
-#[test]
-fn an_oom_again_at_a_site_without_progress_cuts_finer() {
-    let split = OomSite { name: "split:x".into(), collective: false, finest: 3, shape: "k".into() };
-    // The VAE's pages are the current step's (W); 4 MB free; nothing else to give.
-    let mut t = table(8 * MB, vec![set("vae", 2, MB), set("other", 2, MB)], vec![(vec![0], 1)]);
-    for k in [(0, 0), (0, 1)] {
-        map(&mut t, k);
-    }
-    t.allocated = MB;
-    let oom = |t: &Table, set: Option<u32>| decide(t, &Trigger::Oom { req: 1, set, need: Some(2 * MB), site: Some(split.clone()), tried: Tried::default() });
-    let first = oom(&t, None);
-    assert!(matches!(first.last(), Some(Action::Claim { .. })), "the first OOM there retries on the free bytes: {first:?}");
-    // It failed again at level 0, no further: nothing more to free, so the outside cut goes
-    // finer, alone.
-    t.requests[0].retried = Some(Retried { site: "split:x".into(), shape: "k".into(), level: 0, at: 3 * MB });
-    assert_eq!(oom(&t, None), vec![Action::CutOutside { req: 1, site: "split:x".into(), shape: "k".into() }]);
-    // Inside the pass, its own site is cut.
-    t.requests[0].sites.insert(0, vec![varena::table::CutSite { name: "split:x".into(), finest: 3, ..Default::default() }]);
-    assert!(matches!(oom(&t, Some(0)).as_slice(), [Action::Cut { site, .. }] if site == "split:x"));
-    // Its allocation got past the failure: a retry again.
-    t.allocated = 2 * MB;
-    assert!(matches!(oom(&t, None).last(), Some(Action::Claim { .. })));
-    // At its finest level with nothing more to free: exhausted (no host room to park in).
-    t.allocated = MB;
-    t.requests[0].outside.insert(("split:x".into(), "k".into()), 3);
-    t.requests[0].retried = Some(Retried { site: "split:x".into(), shape: "k".into(), level: 3, at: 3 * MB });
-    assert!(matches!(oom(&t, None).as_slice(), [Action::Exhausted { .. }]), "{:?}", oom(&t, None));
-}
-
-/// e199's shape (lead's ruling): the driver refused a claim of exactly the need at decided-free.
-/// The OOM again there frees one more page beyond the free bytes, and the retry fits.
-#[test]
-fn a_claim_the_driver_refused_retries_with_one_more_page() {
-    let mut t = table(8 * MB, vec![set("m", 1, MB), set("idle", 4, MB)], vec![(vec![0], 1)]);
-    for k in [(0, 0), (1, 0), (1, 1), (1, 2), (1, 3)] {
-        map(&mut t, k);
-    }
-    // 3 MB free; the activation needs 3 MB, claimed once and refused by the driver.
-    t.requests[0].retried = Some(Retried { site: String::new(), shape: String::new(), level: 0, at: 3 * MB });
-    let a = decide(&t, &Trigger::Oom { req: 1, set: Some(0), need: Some(3 * MB), site: None, tried: Tried::default() });
-    let unmapped = a.iter().filter(|a| matches!(a, Action::Unmap { class: Class::N, .. })).count();
-    assert_eq!(unmapped, 1, "one more page than the free bytes: {a:?}");
-    assert!(matches!(a.last(), Some(Action::Claim { .. })), "{a:?}");
-}
-
-/// Lead's ruling: a pool shared by a serialized domain's components (the TE, the UNet and the
-/// VAE) takes the most protective class among them, at the nearest one's distance: W while one
-/// runs, D while any is declared, N once none is.
-#[test]
-fn a_cache_serving_several_components_takes_the_nearest_ones_class() {
-    let mut t = table(8 * MB, vec![set("te", 1, MB), set("unet", 1, MB), set("vae", 1, MB)], vec![(vec![0], 1), (vec![1], 1), (vec![2], 1)]);
-    let pool = Cache { id: 3, owner: "graphs:domain".into(), sets: vec![0, 1, 2], bytes: MB, last_use: 0, ..Default::default() };
-    t.caches.push(pool.clone());
-    assert_eq!((t.cache_class(&pool), t.cache_distance(&pool)), (Class::W, Some((0, 1, u32::MAX))), "the TE's step runs now (review 6, C1)");
-    t.requests[0].cursor.step = 1;
-    assert_eq!(t.cache_class(&pool), Class::W, "the UNet's");
-    t.requests[0].cursor.step = 2;
-    assert_eq!((t.cache_class(&pool), t.cache_distance(&pool)), (Class::W, Some((0, 1, u32::MAX))), "the VAE's");
-    t.requests[0].cursor.step = 3;
-    assert_eq!(t.cache_class(&pool), Class::N, "no set of it declared any more");
-}
-
-/// Review 6, C1 (the reviewer's probes): a cache takes exactly its sets' class, W included. Mid
-/// pass, a bind of the running component short of room never shrinks its own graph pool; nor
-/// does a replay's preparation shrink the pool of the graph it prepares.
-#[test]
-fn a_running_components_own_cache_is_never_shrunk_for_it() {
-    let full = || {
-        let mut t = table(3 * MB, vec![set("unet", 3, MB)], vec![(vec![0], 1)]);
-        for k in [(0, 0), (0, 1)] {
-            map(&mut t, k);
-        }
-        t.caches.push(Cache { id: 3, owner: "graphs:unet".into(), sets: vec![0], bytes: MB, last_use: 7, ..Default::default() });
-        (t.allocated, t.reserved) = (MB, MB);
-        t
-    };
-    let mut t = full();
-    t.requests[0].cursor.passes.insert(0, 1);
-    let bind = decide(&t, &Trigger::Bind { page: (0, 2), req: Some(1), tried: Tried::default() });
-    assert!(!bind.iter().any(|a| matches!(a, Action::Shrink { cache: 3, .. })), "{bind:?}");
-    let t = full();
-    let prepare = decide(&t, &Trigger::Prepare { pages: vec![(0, 0), (0, 1), (0, 2)], req: Some(1), tried: Tried::default() });
-    assert!(!prepare.iter().any(|a| matches!(a, Action::Shrink { cache: 3, .. })), "{prepare:?}");
-}
-
-/// Review 6, C1: a held cache (a replay prepared, its GPU work not complete) is P: no demand
-/// asks it to shrink, though its sets are no plan's any more.
-#[test]
-fn a_held_cache_is_never_asked_to_shrink() {
-    let mut t = table(2 * MB, vec![set("a", 1, MB), set("b", 1, MB)], vec![(vec![0], 1)]);
-    map(&mut t, (1, 0));
-    t.caches.push(Cache { id: 4, owner: "graphs:b".into(), sets: vec![1], bytes: MB, last_use: 1, holds: 1, ..Default::default() });
-    (t.allocated, t.reserved) = (MB, MB);
-    assert_eq!(t.cache_class(&t.caches[0]), Class::P);
-    let a = decide(&t, &Trigger::Bind { page: (0, 0), req: Some(1), tried: Tried::default() });
-    assert!(!a.iter().any(|a| matches!(a, Action::Shrink { cache: 4, .. })), "{a:?}");
-    t.caches[0].holds = 0;
-    t.caches[0].releasing = vec![9];
-    assert_eq!(t.cache_class(&t.caches[0]), Class::P, "its release is pending on its stream");
-    t.caches[0].releasing.clear();
-    assert_eq!(t.cache_class(&t.caches[0]), Class::N);
-}
-

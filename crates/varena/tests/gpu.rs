@@ -15,7 +15,7 @@ use std::sync::{mpsc, Arc};
 use tensorfs::io::source::Source;
 use tensorfs::io::{self, cuda, Copy, Dst, ItemSource, ReadOpts, Src};
 use varena::layout::{Item, Layout, Region, REGION_ALIGN};
-use varena::{Access, Backend, CudaBackend, Error, Event, Fill, Fingerprint, GpuId, Ledger, Level, Measured, Memory, Next, Pass, Physical, Pin, Plan, Request, SetId, SetSpec, Stats, Step, Torch, Va};
+use varena::{Access, Backend, CudaBackend, Error, Event, Fill, Fingerprint, GpuId, Ledger, Level, Memory, Pass, Physical, Pin, Plan, Request, SetId, SetSpec, Stats, Step, Va};
 
 /// The role a child run of this binary plays.
 const ROLE: &str = "VARENA_GPU_ROLE";
@@ -598,10 +598,6 @@ impl Pressure {
         self.taken.iter().map(|(_, n)| n).sum()
     }
 
-    /// Torch's figures, were these its allocations.
-    fn torch(&self) -> Torch {
-        Torch { allocated: self.bytes(), reserved: self.bytes() }
-    }
 }
 
 impl Drop for Pressure {
@@ -1306,18 +1302,18 @@ fn exact(pin: &Pin, want: &[u8], stream: usize) -> bool {
     bytes(pin.ptr, pin.len, stream) == want
 }
 
-/// An activation of `len` bytes taken as torch takes one: on each real OOM, `r.oom` answers. The
-/// design bounds the answers: pages + cut levels + 2. Returns them.
-fn activation(r: &Request, set: SetId, p: &mut Pressure, len: u64, pages: u32) -> Vec<String> {
+/// An activation of `len` bytes taken as torch's hook takes one: on each real OOM, `make_room`
+/// (asking one page more each time the driver refuses). Returns its answers.
+fn activation(mem: &Memory, r: &Request, p: &mut Pressure, len: u64, pages: u32) -> Vec<String> {
     let mut answers = vec![];
     step!();
     while let Err(code) = p.try_take(len) {
         assert_eq!(code, cuda::ERROR_OUT_OF_MEMORY);
-        let next = r.oom(Some(set), Some(len), None, p.torch());
+        let next = mem.make_room(len + answers.len() as u64 * REGION_ALIGN);
         answers.push(format!("{next:?}").split('(').next().unwrap_or_default().to_string());
         eprintln!("OOM_DIAGNOSTIC need={len} driver_free={} allocated={} next={next:?} stats={:?}", driver_free(), p.bytes(), r.stats());
-        assert!(matches!(next, Next::Retry), "idle pages answer Retry: {answers:?}");
-        assert!(answers.len() <= pages as usize + 2, "the OOM ladder must end: {answers:?}");
+        assert!(next.is_ok(), "idle pages make the room: {answers:?}");
+        assert!(answers.len() <= pages as usize + 2, "the hook's asks must end: {answers:?}");
     }
     answers
 }
@@ -1334,7 +1330,7 @@ fn concurrent_binds_of_one_block_fill_it_once() {
     step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
-    let pass = r.pass(s, "main", "1x1", Torch::default()).unwrap();
+    let pass = r.pass(s, "k").unwrap();
     step!();
     let streams = [cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap()];
     step!();
@@ -1357,7 +1353,7 @@ fn concurrent_binds_of_one_block_fill_it_once() {
     step!();
     drop(pins);
     step!();
-    pass.end(Measured::default(), Torch::default());
+    pass.end(0);
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
@@ -1378,7 +1374,7 @@ fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishe
     step!();
     let r = mem.request("r", plan(&[&["t"]])).unwrap();
     step!();
-    let pass = r.pass(s, "main", "1x1", Torch::default()).unwrap();
+    let pass = r.pass(s, "k").unwrap();
     step!();
     let consumer = cuda::Stream::new(0).unwrap();
     step!();
@@ -1402,7 +1398,7 @@ fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishe
     // Preparation may wait outside capture/replay: Source::read_placements retains its
     // borrowed staging/source owners until the copy has completed. It cannot return a
     // future-ready pin. Resident replay and allocator callbacks have separate no-wait tests.
-    let _ = mem.torch_limit();
+    let _ = mem.free();
     let (again, waited) = std::thread::scope(|t| {
         let (rebind, waited) = watch(t, first, || mem.bind(s, 0, 0));
         drop(gate);
@@ -1425,7 +1421,7 @@ fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishe
     step!();
     drop(again);
     step!();
-    pass.end(Measured::default(), Torch::default());
+    pass.end(0);
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
@@ -1508,7 +1504,7 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     step!();
     let r = mem.request("r", plan(&[&["a", "b1", "b2", "c"]])).unwrap();
     step!();
-    let mut passes: Vec<Pass> = [a, b1, b2].iter().map(|s| r.pass(*s, "main", "1", Torch::default()).unwrap()).collect();
+    let mut passes: Vec<Pass> = [a, b1, b2].iter().map(|s| r.pass(*s, "k").unwrap()).collect();
     step!();
     let sequence = |set: SetId| {
         let start = std::time::Instant::now();
@@ -1552,10 +1548,10 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
         sequence(b2);
     });
     step!();
-    time("pass start", &mut || passes.push(r.pass(c, "main", "1", Torch::default()).unwrap()));
+    time("pass start", &mut || passes.push(r.pass(c, "k").unwrap()));
     step!();
     time("torch_limit", &mut || {
-        mem.torch_limit();
+        mem.make_room(0).unwrap();
     });
     step!();
     time("unload", &mut || mem.unload(b1));
@@ -1617,7 +1613,7 @@ fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
     step!();
     let r = mem.request("r", plan(&[&["t"]])).unwrap();
     step!();
-    let pass = r.pass(s, "main", "1", Torch::default()).unwrap();
+    let pass = r.pass(s, "k").unwrap();
     step!();
     let first = std::time::Instant::now();
     step!();
@@ -1634,11 +1630,11 @@ fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
     assert_eq!(synchronize(), cuda::SUCCESS);
     step!();
     // The bake's event done, the page is kept (exported read-only) at the next look.
-    let _ = mem.torch_limit();
+    let _ = mem.free();
     while timings.count("export") == 0 {
         drop(mem.bind(s, 0, 0).unwrap());
         assert_eq!(synchronize(), cuda::SUCCESS);
-        let _ = mem.torch_limit();
+        let _ = mem.free();
     }
     let consumer = cuda::Stream::new(0).unwrap();
     step!();
@@ -1667,7 +1663,7 @@ fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
     step!();
     while timings.count("unmap") == unmaps {
         // The old page goes on the mechanism thread once its consumer is done.
-        let _ = mem.torch_limit();
+        let _ = mem.free();
     }
     let unmapped = timings.last("unmap").unwrap();
     step!();
@@ -1677,7 +1673,7 @@ fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
     step!();
     drop(renewed);
     step!();
-    pass.end(Measured::default(), Torch::default());
+    pass.end(0);
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
@@ -2404,18 +2400,18 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
 fn first_run(mem: &Memory, m: SetId, idle: u32) -> (Vec<String>, Stats) {
     let r = mem.request("first", plan(&[&["m"]])).unwrap();
     step!();
-    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
+    let pass = r.pass(m, "k").unwrap();
     step!();
     let pins: Vec<Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
     step!();
     let mut p = Pressure::none();
     step!();
-    let answers = activation(&r, m, &mut p, ROOM / 2, idle);
+    let answers = activation(mem, &r, &mut p, ROOM / 2, idle);
     step!();
     for (b, pin) in pins.iter().enumerate() {
         assert!(exact(pin, &block(3, b as u32), 0), "pins outlive the OOM");
     }
-    pass.end(Measured { allocated_peak: ROOM / 2, slack: 0, sites: vec![] }, p.torch());
+    pass.end(ROOM / 2);
     step!();
     drop((pins, p));
     step!();
@@ -2442,7 +2438,7 @@ fn an_oom_in_a_pass_is_recovered_in_process() {
     step!();
     assert!(!answers.is_empty(), "the full card refused the activation");
     step!();
-    assert!(stats.retries >= 1 && stats.evicted.iter().sum::<u64>() >= ROOM / 2, "{stats:?}");
+    assert!(!stats.make_room.is_empty() && stats.evicted.iter().sum::<u64>() >= ROOM / 2, "{stats:?}");
     step!();
     assert_eq!(stats.leftover, 0);
     step!();
@@ -2477,17 +2473,15 @@ fn a_measured_pass_gets_its_room_before_it_runs() {
     step!();
     let r = mem.request("second", plan(&[&["m"]])).unwrap();
     step!();
-    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
+    let pass = r.pass(m, "k").unwrap();
     step!();
     let mut p = Pressure::none();
     step!();
-    assert_eq!(p.try_take(ROOM / 2).map(|_| ()), Ok(()), "the pass made its measured room before it ran");
+    activation(&mem, &r, &mut p, ROOM / 2, idle);
     step!();
-    pass.end(Measured { allocated_peak: ROOM / 2, slack: 0, sites: vec![] }, p.torch());
+    pass.end(ROOM / 2);
     step!();
-    let stats = r.end();
-    step!();
-    assert_eq!(stats.retries, 0, "{stats:?}");
+    assert_eq!(r.end().leftover, 0);
     step!();
     println!("PASS a measured pass gets its room before it runs {uuid}");
     step!();
@@ -2520,7 +2514,7 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
     step!();
     let r = mem.request("r", plan(&[&["huge"]])).unwrap();
     step!();
-    let pass = r.pass(huge, "main", "1", Torch::default());
+    let pass = r.pass(huge, "k");
     step!();
     let e = match &pass {
         Err(e) => e.clone(),
@@ -2541,7 +2535,7 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
     step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
-    let pass = r.pass(m, "main", "1", Torch::default()).unwrap();
+    let pass = r.pass(m, "k").unwrap();
     step!();
     let pin = mem.bind(m, 0, 0).unwrap();
     step!();
@@ -2549,7 +2543,7 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
     step!();
     drop(pin);
     step!();
-    pass.end(Measured::default(), Torch::default());
+    pass.end(0);
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
@@ -2575,7 +2569,7 @@ fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_ro
     step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
-    let pass = r.pass(m, "main", "1", Torch::default()).unwrap();
+    let pass = r.pass(m, "k").unwrap();
     step!();
     let first = mem.bind(m, 0, 0).expect("the idle page makes room");
     step!();
@@ -2591,7 +2585,7 @@ fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_ro
     step!();
     drop((first, second));
     step!();
-    pass.end(Measured::default(), Torch::default());
+    pass.end(0);
     step!();
     let stats = r.end();
     step!();
@@ -2618,9 +2612,9 @@ fn repeated_passes_of_a_set_keep_its_declared_step() {
     let r = mem.request("r", plan(&[&["a"], &["vae", "audio"], &["dit", "lora"], &["audio"], &["vae"]])).unwrap();
     step!();
     let forward = |n: &str| {
-        let pass = r.pass(id(n), "main", "1", Torch::default()).unwrap();
+        let pass = r.pass(id(n), "k").unwrap();
         drop(mem.bind(id(n), 0, 0).unwrap());
-        pass.end(Measured::default(), Torch::default());
+        pass.end(0);
         r.stats().trace.last().map(|t| t.step).unwrap()
     };
     step!();
@@ -2661,7 +2655,7 @@ fn a_transform_binds_another_set_under_pressure_and_a_second_binder_waits_for_it
     step!();
     let r = mem.request("r", plan(&[&["base", "factors"]])).unwrap();
     step!();
-    let pass = r.pass(base, "main", "1", Torch::default()).unwrap();
+    let pass = r.pass(base, "k").unwrap();
     step!();
     let first = std::time::Instant::now();
     let pin = mem.bind(base, 0, stream.raw()).unwrap();
@@ -2688,7 +2682,7 @@ fn a_transform_binds_another_set_under_pressure_and_a_second_binder_waits_for_it
     step!();
     drop((pin, f, second));
     step!();
-    pass.end(Measured::default(), Torch::default());
+    pass.end(0);
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
@@ -2708,7 +2702,7 @@ fn a_ram_level_set_binds_from_the_tier() {
     step!();
     let r = mem.request("r", plan(&[&["t"]])).unwrap();
     step!();
-    let pass = r.pass(s, "main", "1", Torch::default()).unwrap();
+    let pass = r.pass(s, "k").unwrap();
     step!();
     let pins: Vec<Pin> = (0..4).map(|b| mem.bind(s, b, 0).unwrap()).collect();
     step!();
@@ -2717,7 +2711,7 @@ fn a_ram_level_set_binds_from_the_tier() {
     }
     drop(pins);
     step!();
-    pass.end(Measured::default(), Torch::default());
+    pass.end(0);
     step!();
     let stats = r.end();
     step!();
@@ -2807,7 +2801,7 @@ fn role_agent() {
                 requests.insert(id.to_string(), m().request(id, plan(&steps)).unwrap());
                 "ok".into()
             }
-            ["pass", req, set, shape] => match requests[*req].pass(sets[*set], "main", shape, Torch::default()) {
+            ["pass", req, set, shape] => match requests[*req].pass(sets[*set], shape) {
                 Ok(p) => {
                     passes.insert(req.to_string(), p);
                     "ok".into()
@@ -2816,7 +2810,7 @@ fn role_agent() {
             },
             ["endpass", req, peak] => {
                 if let Some(p) = passes.remove(*req) {
-                    p.end(Measured { allocated_peak: peak.parse().unwrap(), slack: 0, sites: vec![] }, Torch::default());
+                    p.end(peak.parse().unwrap());
                 }
                 "ok".into()
             }
@@ -2863,7 +2857,7 @@ fn role_agent() {
             }
             ["settle"] => {
                 assert_eq!(synchronize(), cuda::SUCCESS);
-                m().torch_limit();
+                m().free();
                 m().settle();
                 "ok".into()
             }

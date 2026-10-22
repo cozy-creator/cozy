@@ -141,6 +141,49 @@ fn cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes() {
     }
     assert!(!unsafe { io::cuda::registered(source) }.unwrap());
     println!("HostPin: owned explicit/implicit unregister, borrowed explicit/implicit preservation, engine preservation and context restoration passed");
+    println!("PASS staged and direct device copies keep exact bytes {}", io::cuda::uuid(0).unwrap());
+}
+
+/// varena's tier fill shape: registered host pages, one copy per 2 MiB page, eight pages per
+/// read (a fill batch's first 16 MiB). Every read is all direct (nothing staged, no reader
+/// thread); its rate is set against one copy of the whole range on the same card.
+#[test]
+#[ignore = "requires an allocated CUDA GPU; no mock driver"]
+fn registered_pages_copy_direct_one_read_per_eight_pages() {
+    const PAGE: usize = 2 * MIB;
+    const PAGES: usize = 256;
+    const BATCH: usize = 8;
+    let len = PAGE * PAGES;
+    let mut host = Buf::new(len, 0);
+    let expected = noise(91, len);
+    host.mem[host.at..host.at + len].copy_from_slice(&expected);
+    let gpu = io::DeviceBuffer::new(0, len).unwrap();
+    let uuid = io::cuda::uuid(0).unwrap();
+    let source = host.bytes().as_ptr();
+    let _context = io::cuda::CtxGuard::enter(gpu.context()).unwrap();
+    let pin = unsafe { io::cuda::pin_region(source.cast_mut(), len, true) }.unwrap();
+    let opts = ReadOpts::default();
+    let device = |at: usize, len: usize| Dst::Device { device: 0, ptr: gpu.ptr() + at as u64, len, stream: 0 };
+    let whole = Copy { src: Src::Host(source), dst: device(0, len) };
+    unsafe { io::read(&[whole], &opts) }.unwrap();
+    let start = Instant::now();
+    assert_eq!(unsafe { io::read(&[whole], &opts) }.unwrap().staged, 0);
+    let one = start.elapsed();
+    unsafe { io::read(&[Copy { src: Src::Zero, dst: device(0, len) }], &opts) }.unwrap();
+    // SAFETY: every page lies inside the registered `len` bytes at `source`.
+    let pages: Vec<Copy> = (0..PAGES).map(|p| Copy { src: Src::Host(unsafe { source.add(p * PAGE) }), dst: device(p * PAGE, PAGE) }).collect();
+    let start = Instant::now();
+    let staged: u64 = pages.chunks(BATCH).map(|batch| unsafe { io::read(batch, &opts) }.unwrap().staged).sum();
+    let paged = start.elapsed();
+    assert_eq!(staged, 0, "registered pages are never staged");
+    let mut bytes = vec![0; len];
+    unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: gpu.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) }], &opts) }.unwrap();
+    assert!(bytes == expected, "a page did not land");
+    drop(pin);
+    let rate = |t: std::time::Duration| len as f64 / t.as_secs_f64() / 1e9;
+    let (whole, paged) = (rate(one), rate(paged));
+    println!("TIMINGS whole copy {whole:.2} GB/s; {} reads of {BATCH} pages {paged:.2} GB/s ({:.0}% of whole)", PAGES / BATCH, 100.0 * paged / whole);
+    println!("PASS registered pages copy direct, {paged:.2} of {whole:.2} GB/s {uuid}");
 }
 
 /// A destination `skew` bytes past a page boundary (0: O_DIRECT lands in place).
