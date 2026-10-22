@@ -65,6 +65,25 @@ struct SecurityAttributes {
     inherit: i32,
 }
 
+/// The stream pages are saved to the host on: the lowest priority, so a save never goes ahead of a
+/// fill. Synchronized and destroyed before the context is released.
+struct Saves {
+    raw: usize,
+    ctx: usize,
+}
+
+impl Drop for Saves {
+    fn drop(&mut self) {
+        if let (Ok(d), Ok(_ctx)) = (cuda::driver(), CtxGuard::enter(self.ctx as CUcontext)) {
+            // SAFETY: our stream, in its context; nothing is queued on it after this.
+            unsafe {
+                (d.stream_synchronize)(self.raw as CUstream);
+                (d.stream_destroy)(self.raw as CUstream);
+            }
+        }
+    }
+}
+
 /// One CUDA device's VMM mechanism.
 pub struct CudaBackend {
     /// Host registrations (`register_host`) by address. They go before the context does.
@@ -72,6 +91,7 @@ pub struct CudaBackend {
     ordinal: i32,
     /// Varena's copy stream: fills are ordered on it. Dropped (synchronized) before the context.
     stream: cuda::Stream,
+    saves: Saves,
     primary: Primary,
     prop: AllocationProp,
     granularity: u64,
@@ -125,11 +145,17 @@ impl CudaBackend {
         call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut granularity, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
         let (mut free, mut total) = (0usize, 0usize);
         call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
+        let (mut least, mut greatest): (c_int, c_int) = (0, 0);
+        call!("cuCtxGetStreamPriorityRange", ctx_get_stream_priority_range(&mut least, &mut greatest))?;
+        let mut raw: CUstream = std::ptr::null_mut();
+        call!("cuStreamCreateWithPriority", stream_create_with_priority(&mut raw, cuda::STREAM_NON_BLOCKING, least))?;
+        let saves = Saves { raw: raw as usize, ctx: primary.ctx };
         drop(_ctx);
         Ok(CudaBackend {
             hosts: Mutex::new(HashMap::new()),
             ordinal,
             stream,
+            saves,
             primary,
             prop,
             granularity: granularity as u64,
@@ -322,6 +348,20 @@ impl Backend for CudaBackend {
         Dst::Device { device: self.ordinal, ptr: va.base + offset, len: len as usize, stream: self.stream.raw() }
     }
 
+    /// One driver copy on the save stream, after `after`, then a wait for that stream alone.
+    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> {
+        if offset.checked_add(host.len() as u64).is_none_or(|end| end > va.len) {
+            return Err(Error::Invalid(format!("{} bytes at {offset} outside a {} byte reservation", host.len(), va.len)));
+        }
+        let _ctx = self.primary.enter()?;
+        let stream = self.saves.raw as CUstream;
+        if after != Event::DONE {
+            call!("cuStreamWaitEvent", stream_wait_event(stream, raw(after), 0))?;
+        }
+        call!("cuMemcpyDtoHAsync", memcpy_dtoh_async(host.as_mut_ptr().cast(), va.base + offset, host.len(), stream))?;
+        Ok(call!("cuStreamSynchronize", stream_synchronize(stream))?)
+    }
+
     fn fence(&self) -> Result<Event> {
         self.record(self.stream.raw())
     }
@@ -375,6 +415,14 @@ impl Backend for CudaBackend {
     fn synchronize(&self, stream: usize) -> Result<()> {
         let _ctx = self.primary.enter()?;
         Ok(call!("cuStreamSynchronize", stream_synchronize(stream as CUstream))?)
+    }
+
+    fn finish(&self, event: Event) -> Result<()> {
+        if event == Event::DONE {
+            return Ok(());
+        }
+        let _ctx = self.primary.enter()?;
+        Ok(call!("cuEventSynchronize", event_synchronize(raw(event)))?)
     }
 
     fn retire(&self, event: Event) {
