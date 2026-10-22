@@ -58,13 +58,14 @@ impl DefaultSdk {
                 verify_wheel(wheel, distribution)?;
                 let name = wheel.file_name().ok_or_else(|| io::Error::other("SDK wheel has no name"))?;
                 digest.update(name.as_encoded_bytes());
-                digest.update(Sha256::digest(fs::read(wheel)?));
+                digest.update(file_digest(wheel)?);
                 names.push(name.to_os_string());
             }
             identified(pending.path())?.require_memory_protocol()?;
             let digest = super::hex(&digest.finalize());
             let immutable = self.root.join(&digest);
             if !immutable.exists() {
+                platform::durable::sync_dir(pending.path())?;
                 match fs::rename(pending.path(), &immutable) {
                     Ok(()) => platform::durable::sync_dir(&self.root)?,
                     Err(_) if immutable.is_dir() => {}, // Another resolver published these exact bytes.
@@ -76,7 +77,7 @@ impl DefaultSdk {
             let mut held = Sha256::new();
             for wheel in &wheels {
                 held.update(wheel.file_name().ok_or_else(|| io::Error::other("SDK wheel name missing"))?.as_encoded_bytes());
-                held.update(Sha256::digest(fs::read(wheel)?));
+                held.update(file_digest(wheel)?);
             }
             if super::hex(&held.finalize()) != digest {
                 return Err(io::Error::other("cached immutable SDK bytes changed"));
@@ -89,6 +90,12 @@ impl DefaultSdk {
     }
 }
 
+
+fn file_digest(path: &Path) -> io::Result<Vec<u8>> {
+    let mut digest = Sha256::new();
+    io::copy(&mut fs::File::open(path)?, &mut digest)?;
+    Ok(digest.finalize().to_vec())
+}
 
 #[derive(serde::Deserialize)]
 struct Artifact {
@@ -232,4 +239,29 @@ mod tests {
             assert!(super::super::check_startup_pair(&paths).is_err());
         }
     }
+
+    #[test]
+    fn a_host_plan_requires_both_verified_wheels_and_preserves_the_solvers_platform() {
+        let plan = |platform: &str| format!(r#"
+lock-version = "1.0"
+[[packages]]
+name = "cozy-runtime"
+version = "0.31.0"
+wheels = [{{url="https://example.test/cozy_runtime-0.31.0-py3-none-any.whl", hashes={{sha256="{hash}"}}}}]
+[[packages]]
+name = "tensorfs"
+version = "0.14.0"
+wheels = [{{url="https://example.test/tensorfs-0.14.0-cp312-abi3-{platform}.whl", hashes={{sha256="{hash}"}}}}]
+"#, hash="a".repeat(64));
+        for platform in ["manylinux_2_28_x86_64", "macosx_11_0_arm64", "win_amd64"] {
+            let wheels = artifacts(&plan(platform)).unwrap();
+            assert_eq!(wheels.len(), 2);
+            assert!(wheels[1].filename().unwrap().ends_with(&format!("{platform}.whl")));
+        }
+        for bad in [plan("win_amd64").replace("0.14.0", "0.13.4"),
+            plan("win_amd64").replace("https://example.test/", "file:///"),
+            plan("win_amd64").replace(&"a".repeat(64), "missing")]
+        { assert!(artifacts(&bad).is_err()); }
+    }
+
 }

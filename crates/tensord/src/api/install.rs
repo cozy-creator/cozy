@@ -38,8 +38,10 @@ pub struct InstallerConfig {
 }
 impl InstallerConfig {
     pub fn resolve_sdk(&self, stop: Option<&Stop>) -> Result<(), Error> {
-        if self.sdk.is_empty() && let Some(default) = &self.default_sdk {
-            default.resolve(stop).map_err(|e| Error::unavailable("package_sdk_unavailable", e.to_string()))?;
+        if self.sdk.is_empty() {
+            if let Some(default) = &self.default_sdk {
+                default.resolve(stop).map_err(|e| Error::unavailable("package_sdk_unavailable", e.to_string()))?;
+            }
         }
         Ok(())
     }
