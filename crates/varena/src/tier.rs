@@ -40,7 +40,7 @@ const NAME: &str = "tier";
 pub type Need = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
 // The live OS source in production; deterministic headroom in isolated service tests.
-type Budget = Arc<dyn Fn() -> u64 + Send + Sync>;
+type Budget = Arc<dyn Fn() -> i128 + Send + Sync>;
 
 /// TensorD's need source: what the requests running on its GPUs keep free, summed (`None`
 /// while any is unmeasured).
@@ -57,7 +57,7 @@ fn measured_budget() -> Budget {
         let mut growth = growth.lock();
         let host = platform::contain::host_memory::read();
         let reserved = growth.observe(host);
-        u64::try_from(host.available).unwrap_or(0).saturating_sub(reserved)
+        i128::from(host.available) - i128::from(reserved)
     })
 }
 
@@ -74,7 +74,7 @@ fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget, conn: u64) ->
         let pending = s.promised.values().copied().fold(0u64, u64::saturating_add);
         let Some(want) = keep.checked_add(pending).and_then(|n| n.checked_add(bytes)) else { return false };
         let room = budget();
-        if room >= want {
+        if room >= i128::from(want) {
             s.promised.insert(conn, bytes);
             return true;
         }
@@ -82,7 +82,8 @@ fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget, conn: u64) ->
         if attempt == 0 {
             // No peer wait: immediately reclaimable layouts go now. Re-read actual headroom
             // before admitting; do not add a release estimate to a newer OS measurement.
-            relieve(state, HostTrigger::Room { bytes: want, headroom: room });
+            let deficit = u64::try_from((-room).max(0)).unwrap_or(u64::MAX);
+            relieve(state, HostTrigger::Room { bytes: want.saturating_add(deficit), headroom: u64::try_from(room).unwrap_or(0) });
         }
     }
     false
@@ -92,7 +93,7 @@ fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget, conn: u64) ->
 /// calls must keep free (all of it while one is unmeasured), so benign reclaim at a limit gives
 /// nothing back.
 fn answer(state: &Shared, need: &Need, budget: &Budget) {
-    while budget() < need().unwrap_or(u64::MAX) {
+    while budget() < i128::from(need().unwrap_or(u64::MAX)) {
         if relieve(state, HostTrigger::Pressure) == 0 {
             return;
         }
@@ -733,20 +734,40 @@ impl Held {
     /// Copies each ready region into its destination, all in one engine read, under their
     /// read locks; whether each was copied. The caller settles each afterwards
     /// ([`Held::settle`]).
-    pub fn read(&self, regions: &[(u32, tensorfs::io::Dst)]) -> Result<Vec<bool>> {
+    pub fn read(self: &Arc<Self>, regions: &[(u32, tensorfs::io::Dst)], drain: impl FnOnce() -> Result<()>) -> Result<Vec<bool>> {
+        self.read_with(regions, |copies| {
+            // SAFETY: the operation's locks and exact source mapping outlive the copy and
+            // any required error drain; the caller owns every destination exclusively.
+            unsafe { tensorfs::io::read(copies, &tensorfs::io::ReadOpts::default()) }.map(|_| ()).map_err(Error::from)
+        }, drain)
+    }
+
+    fn read_with(self: &Arc<Self>, regions: &[(u32, tensorfs::io::Dst)],
+        copy: impl FnOnce(&[tensorfs::io::Copy]) -> Result<()>, drain: impl FnOnce() -> Result<()>) -> Result<Vec<bool>> {
         let spans = regions.iter().map(|(r, dst)| self.region(*r).and_then(|(off, span)| if dst.len() as u64 > span { Err(Error::Invalid("tier read past its region".into())) } else { Ok((off, span)) })).collect::<Result<Vec<_>>>()?;
+        let locks = self.lock_regions(regions.iter().map(|(r, _)| *r), false)?;
         self.pins.lock().reading.extend(regions.iter().map(|(r, _)| *r));
-        self.locked(regions.iter().map(|(r, _)| *r), false, || {
-            let ready: Vec<bool> = regions.iter().map(|(r, _)| self.ready(*r).is_some_and(|w| w.load(Acquire) == 1)).collect();
-            // SAFETY: each ready region is read-locked (nobody frees it), inside our mapping.
-            let src = |off: u64| tensorfs::io::Src::Host(unsafe { self.ro.base.add((self.data + off) as usize) });
-            let copies: Vec<_> = regions.iter().zip(&spans).zip(&ready).filter(|(_, ready)| **ready).map(|(((_, dst), (off, _)), _)| tensorfs::io::Copy { src: src(*off), dst: *dst }).collect();
-            if !copies.is_empty() {
-                // SAFETY: the caller owns each `dst` exclusively for this call.
-                unsafe { tensorfs::io::read(&copies, &tensorfs::io::ReadOpts::default()) }?;
+        let ready: Vec<bool> = regions.iter().map(|(r, _)| self.ready(*r).is_some_and(|w| w.load(Acquire) == 1)).collect();
+        // SAFETY: each ready region is read-locked and inside this exact retained mapping.
+        let src = |off: u64| tensorfs::io::Src::Host(unsafe { self.ro.base.add((self.data + off) as usize) });
+        let copies: Vec<_> = regions.iter().zip(&spans).zip(&ready).filter(|(_, ready)| **ready).map(|(((_, dst), (off, _)), _)| tensorfs::io::Copy { src: src(*off), dst: *dst }).collect();
+        if !copies.is_empty() {
+            let copied = crate::caught(|| copy(&copies));
+            if let Err(error) = copied {
+                if matches!(error, Error::Ownership(_)) {
+                    std::mem::forget((self.clone(), locks));
+                    return Err(error);
+                }
+                // A direct host source may still be borrowed after CUDA failure. Drain while
+                // BOTH its mapping and read lock are alive; an error is not completion.
+                if let Err(draining) = crate::caught(drain) {
+                    std::mem::forget((self.clone(), locks));
+                    return Err(Error::Ownership(format!("RAM-tier read completion is unknown after {error}; drain failed: {draining}")));
+                }
+                return Err(error);
             }
-            Ok(ready)
-        })
+        }
+        Ok(ready)
     }
 
     /// Fill owns distinct write-lock descriptions, so concurrent calls through one Held
@@ -803,10 +824,6 @@ impl Held {
         Ok(fd)
     }
 
-    fn locked<T>(&self, regions: impl Iterator<Item = u32>, write: bool, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _locks = self.lock_regions(regions, write)?;
-        f()
-    }
 
 }
 
@@ -982,7 +999,7 @@ mod reservation_tests {
         isolated("closing_a_permit_returns_only_the_promise_not_resident_pages", || {
             let available = Arc::new(AtomicU64::new(6));
             let sample = available.clone();
-            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || sample.load(Acquire))).unwrap().unwrap();
+            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(sample.load(Acquire)))).unwrap().unwrap();
             let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
             let permit = client.reserve(4).unwrap();
             assert!(client.reserve(4).is_none());
@@ -1057,7 +1074,7 @@ sys.stdin.read()
     fn a_drained_fill_failure_returns_only_its_unfinished_pages() {
         isolated("a_drained_fill_failure_returns_only_its_unfinished_pages", || {
             let page = platform_page();
-            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || 8 * page)).unwrap().unwrap();
+            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
             let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
             let held = client.open_layout("failed", vec![(0, page), (page, page)], "").unwrap();
             let first = client.reserve(page).unwrap();
@@ -1095,7 +1112,7 @@ sys.stdin.read()
     fn an_undrained_fill_keeps_its_destination_mapping_and_region_lock() {
         isolated("an_undrained_fill_keeps_its_destination_mapping_and_region_lock", || {
             let page = platform_page();
-            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || 8 * page)).unwrap().unwrap();
+            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
             let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
             let held = client.open_layout("quarantined", vec![(0, page)], "").unwrap();
             let inspection = os::reopen(&held.fd, true).unwrap();
@@ -1124,7 +1141,7 @@ sys.stdin.read()
     fn local_fillers_use_distinct_lock_descriptions() {
         isolated("local_fillers_use_distinct_lock_descriptions", || {
             let page = platform_page();
-            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || 8 * page)).unwrap().unwrap();
+            let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
             let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
             let held = Arc::new(client.open_layout("local-locks", vec![(0, page)], "").unwrap());
             let (entered, ready) = std::sync::mpsc::channel();
@@ -1142,6 +1159,71 @@ sys.stdin.read()
             release.send(()).unwrap();
             writer.join().unwrap().unwrap();
             follower.join().unwrap().unwrap();
+        });
+    }
+
+
+    #[test]
+    fn observed_growth_deficit_reclaims_even_with_zero_call_need() {
+        isolated("observed_growth_deficit_reclaims_even_with_zero_call_need", || {
+            let page = platform_page();
+            let budget = Arc::new(AtomicU64::new(8 * page));
+            let available = budget.clone();
+            let tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(available.load(Acquire)) - 1)).unwrap().unwrap();
+            let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+            let held = client.open_layout("growth", vec![(0, page)], "").unwrap();
+            held.fill(&[0], |dsts| {
+                let tensorfs::io::Dst::Host { ptr, len } = dsts[0].1 else { unreachable!() };
+                // SAFETY: this fill exclusively owns its mapped destination.
+                unsafe { std::ptr::write_bytes(ptr, 1, len) };
+                Ok(())
+            }).unwrap();
+            client.close("growth").unwrap();
+            budget.store(0, Release); // Need0, but measured growth exceeds live headroom.
+            let need: Need = Arc::new(|| Some(0));
+            answer(&tier.state, &need, &tier.budget);
+            assert!(tier.held().is_empty(), "saturating a growth deficit to0 suppressed pressure reclaim");
+        });
+    }
+
+    #[test]
+    fn a_failed_read_drains_before_releasing_its_exact_source() {
+        isolated("a_failed_read_drains_before_releasing_its_exact_source", || {
+            for completes in [true, false] {
+                let page = platform_page();
+                let _tier = Tier::bind_with(Arc::new(|| Some(0)), Arc::new(move || i128::from(8 * page))).unwrap().unwrap();
+                let client = Client::open(os::euid(), Arc::new(|| Some(0))).unwrap();
+                let held = Arc::new(client.open_layout("read-failure", vec![(0, page)], "").unwrap());
+                held.fill(&[0], |_| Ok(())).unwrap();
+                let observed = held.clone();
+                let inspection = os::reopen(&held.fd, true).unwrap();
+                let data = held.data;
+                let original_mapping = held.ro.base;
+                let pointer = AtomicU64::new(0);
+                let result = held.read_with(&[(0, tensorfs::io::Dst::Device { device: 0, ptr: 1, len: page as usize, stream: 0 })], |copies| {
+                    let tensorfs::io::Src::Host(ptr) = copies[0].src else { unreachable!() };
+                    pointer.store(ptr as u64, Release);
+                    Err(Error::Io("in-flight copy failed".into()))
+                }, || {
+                    assert!(os::held(&inspection, data, page).unwrap(), "read lock released before drain");
+                    assert_eq!(pointer.load(Acquire), original_mapping as u64 + data, "drain retained a different source VA");
+                    if completes { Ok(()) } else { Err(Error::Io("completion check failed".into())) }
+                });
+                if completes {
+                    assert!(matches!(result, Err(Error::Io(_))));
+                    assert!(!os::held(&inspection, data, page).unwrap());
+                    held.settle(0, |_| Ok(()));
+                } else {
+                    assert!(matches!(result, Err(Error::Ownership(_))));
+                    assert!(observed.pins.lock().reading.contains(&0));
+                    drop(observed);
+                    drop(held);
+                    assert!(os::held(&inspection, data, page).unwrap(), "quarantine released its read lock");
+                    let mut residency = [0u8; 2];
+                    // SAFETY: mincore queries, without dereferencing, this exact old mapping.
+                    assert_eq!(unsafe { libc::mincore(original_mapping.cast(), (data + page) as usize, residency.as_mut_ptr()) }, 0);
+                }
+            }
         });
     }
 
