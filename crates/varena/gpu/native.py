@@ -16,14 +16,16 @@ it passes when the harness reports 1 passed, 0 failed, 0 ignored and it printed 
 A case is judged only by its own progress: the lines it prints (`STEP <line> <ms>` after each
 statement), the bytes its processes read and write (/proc/<pid>/io), and whether the GPU ran
 kernels or moved memory (NVML, through the binary's `role_monitor`). It is looked at every
-interval of its own longest step on an earlier run. Two looks in a row with nothing moved make it
-stuck: a step's line can land just after one look, so only a second quiet look spans a whole
-quiet step. It is then killed and fails as stalled. A case with no earlier run is never killed:
-it runs unjudged. Each start,
-verdict and `TIMINGS` line (a case's per-call figures) goes to the run log as it happens; a cancel
-kills the running case and returns the logs so far. A case that fails also puts its log's tail in the run log, which reaches the caller
-even when a cancelled run's outputs do not. The outputs hold every case's log and result.json;
-the caller judges from it.
+interval of its own longest step on an earlier run; a case with no earlier run, from its first step
+on, every interval of its longest step so far in this run (the start-up before its first step, or
+the largest gap between steps). Two looks in a row with nothing moved make it stuck: a step's line
+can land just after one look, so only a second quiet look spans a whole quiet step. It is then
+killed and fails as stalled, its log ending with each of its threads' state (process, name,
+scheduler state, kernel wait channel, syscall). Each start, verdict and `TIMINGS` line (a case's
+per-call figures) goes to the run log as it happens; a cancel kills the running case, its threads'
+state logged too, and returns the logs so far. A case that fails also puts its log's tail in the
+run log, which reaches the caller even when a cancelled run's outputs do not. The outputs hold
+every case's log and result.json; the caller judges from it.
 """
 from pathlib import Path
 import json
@@ -50,13 +52,39 @@ LOG_LINES = 512
 HARNESS = re.compile(r"^(running \d+ tests?|failures:|test result: .*|note: run with .*|FAILED|    \w+|\s*)$")
 
 
-def group_io(group: int) -> int:
-    """Bytes the processes of process group `group` have read and written so far."""
-    total = 0
+def group(pgrp: int) -> list[Path]:
+    """The /proc entries of process group `pgrp`'s processes."""
+    found = []
     for proc in Path("/proc").glob("[0-9]*"):
         try:
-            if int((proc / "stat").read_text().rsplit(")", 1)[1].split()[2]) != group:
+            if int((proc / "stat").read_text().rsplit(")", 1)[1].split()[2]) == pgrp:
+                found.append(proc)
+        except (OSError, ValueError, IndexError):
+            continue
+    return found
+
+
+def threads(pgrp: int) -> list[str]:
+    """Each thread of process group `pgrp`: process, thread, name, scheduler state, kernel wait channel, syscall."""
+    lines = []
+    for proc in group(pgrp):
+        for task in sorted(proc.glob("task/[0-9]*"), key=lambda t: int(t.name)):
+            try:
+                stat = (task / "stat").read_text()
+                name, state = stat[stat.index("(") + 1:stat.rindex(")")], stat.rsplit(")", 1)[1].split()[0]
+                wchan = (task / "wchan").read_text().strip() or "-"
+                syscall = (task / "syscall").read_text().split()[0]
+            except (OSError, ValueError, IndexError):
                 continue
+            lines.append(f"THREAD {proc.name}/{task.name} {name} {state} wchan={wchan} syscall={syscall}")
+    return lines
+
+
+def group_io(pgrp: int) -> int:
+    """Bytes the processes of process group `pgrp` have read and written so far."""
+    total = 0
+    for proc in group(pgrp):
+        try:
             counters = dict(line.split(": ") for line in (proc / "io").read_text().splitlines())
             total += int(counters["rchar"]) + int(counters["wchar"])
         except (OSError, ValueError, IndexError, KeyError):
@@ -115,6 +143,13 @@ def longest_step(text: str, took: float) -> float | None:
     return max(max(gaps), 1) / 1000
 
 
+def own_interval(text: str, startup: float) -> float:
+    """A case with no earlier run: seconds of its longest step so far in this run, the start-up before its first step
+    or the largest gap between its steps."""
+    ms = [int(m) for m in STEP.findall(text)]
+    return max([startup] + [(b - a) / 1000 for a, b in zip(ms, ms[1:])])
+
+
 def pieces(line: str) -> list[str]:
     return [line[at:at + PIECE] for at in range(0, max(len(line), 1), PIECE)]
 
@@ -141,13 +176,20 @@ def run_case(program: Path, case: str, log: Path, interval: float | None, monito
                 say(piece)
         told = len(figures)
 
+    def end(proc, why: str) -> tuple[int, str]:
+        with log.open("a") as more:
+            more.write("\n".join([f"{why.upper()}: its threads"] + threads(proc.pid)) + "\n")
+        os.killpg(proc.pid, signal.SIGKILL)
+        return proc.wait(), why
+
     with log.open("w") as out:
+        started = time.time()
         proc = subprocess.Popen([str(program), "--ignored", "--exact", case, "--nocapture", "--test-threads=1"],
                                 stdout=out, stderr=subprocess.STDOUT, cwd=program.parent, start_new_session=True)
-        last, quiet, looked = None, 0, time.monotonic()
+        last, quiet, looked, every, startup = None, 0, time.monotonic(), interval, None
         while True:
             try:
-                code = proc.wait(timeout=min(CANCEL, interval or CANCEL))
+                code = proc.wait(timeout=min(CANCEL, every or CANCEL))
                 tell(log.read_text(errors="replace"))
                 return code, None
             except subprocess.TimeoutExpired:
@@ -155,20 +197,22 @@ def run_case(program: Path, case: str, log: Path, interval: float | None, monito
             text = log.read_text(errors="replace")
             tell(text)
             if cancelled():
-                os.killpg(proc.pid, signal.SIGKILL)
-                return proc.wait(), "cancelled"
-            if interval is None or time.monotonic() - looked < interval:
-                continue
-            looked = time.monotonic()
+                return end(proc, "cancelled")
             # Judged between its first step and its verdict: start-up and teardown are not steps.
             if not STEP.search(text) or "PASS " in text:
                 continue
+            if interval is None:
+                # The log's last write is when its first step was seen at the latest.
+                startup = startup if startup is not None else max(log.stat().st_mtime - started, 0.0)
+                every = own_interval(text, startup)
+            if time.monotonic() - looked < every:
+                continue
+            looked = time.monotonic()
             now = (len(text), group_io(proc.pid))
             moved = monitor.worked() or now != last
             quiet = 0 if moved else quiet + 1
             if quiet == 2:
-                os.killpg(proc.pid, signal.SIGKILL)
-                return proc.wait(), "stalled"
+                return end(proc, "stalled")
             last = now
 
 
@@ -193,7 +237,7 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
     logs = root / "logs"
     logs.mkdir()
     monitor = Monitor(program, lambda m: ctx.log(m, level="warn"))
-    passed, failed, ended, unjudged, gpus, took, longest = [], [], {}, [], set(), {}, {}
+    passed, failed, ended, own, gpus, took, longest = [], [], {}, [], set(), {}, {}
     for case in cases:
         if ctx.cancelled:
             break
@@ -201,8 +245,8 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
         log = logs / f"{name}-{test}.log"
         interval = steps.get(case)
         if interval is None:
-            unjudged.append(case)
-        ctx.log(f"START {case}" + (" (unjudged: no earlier runtime)" if interval is None else f" (looks every {interval:.3f} s)"), level="warn")
+            own.append(case)
+        ctx.log(f"START {case}" + (" (judged by its own steps: no earlier runtime)" if interval is None else f" (looks every {interval:.3f} s)"), level="warn")
         start = time.monotonic()
         code, end = run_case(root / name, test, log, interval, monitor, lambda: ctx.cancelled,
                              lambda m: ctx.log(f"{case[:40]}: {m}", level="warn"))
@@ -225,7 +269,7 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
             for piece in tail(text, LOG_LINES // len(cases) - 2):
                 ctx.log(f"TAIL {case[:40]}: {piece}", level="error")
     monitor.close()
-    result = {"label": label, "cases": cases, "passed": passed, "failed": failed, "ended": ended, "unjudged": unjudged,
+    result = {"label": label, "cases": cases, "passed": passed, "failed": failed, "ended": ended, "own_steps": own,
               "seconds": took, "steps": {c: s for c, s in longest.items() if s}, "gpus": sorted(gpus),
               "ok": not failed and len(passed) == len(cases) and len(gpus) == 1, "cancelled": ctx.cancelled,
               "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
