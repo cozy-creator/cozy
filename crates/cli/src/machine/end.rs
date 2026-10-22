@@ -274,6 +274,8 @@ pub async fn update(
         output::warn(&format!("{}'s warm models reload after it restarts", m.name));
     }
     if payload.is_empty() {
+        let target = hub_answer(ctx.hub_anonymous(&hub).get_software().await)?;
+        super::cohort::require_binary(&m.name, m.status.as_ref(), &target.runtime, &target.tensorfs, false)?;
         let Some(status) = &m.status else {
             return Err(Error::new(
                 Kind::Unavailable,
@@ -282,7 +284,6 @@ pub async fn update(
             )
             .next(format!("cozy machine show {}", m.name)));
         };
-        let target = hub_answer(ctx.hub_anonymous(&hub).get_software().await)?;
         // An unpinned target older than the machine's software is no reason to go back.
         if (status.runtime == target.runtime && status.tensorfs == target.tensorfs)
             || (!target.pinned && newer(&status.runtime, &target.runtime))
@@ -296,6 +297,9 @@ pub async fn update(
         payload.insert("runtime".into(), target.runtime.into());
         payload.insert("tensorfs".into(), target.tensorfs.into());
     }
+    let requested = |member| want.iter().find(|(field, _)| *field == member)
+        .and_then(|(_, value)| value.as_str()).unwrap_or("");
+    super::cohort::require_binary(&m.name, m.status.as_ref(), requested("runtime"), requested("tensorfs"), dev)?;
     let spec = v1::RunSpec {
         kind: v1::RunKind::Update,
         payload: Some(

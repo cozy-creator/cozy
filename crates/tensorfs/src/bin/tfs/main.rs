@@ -181,7 +181,14 @@ fn identity(ck: &Checkpoint) -> Map<String, Json> {
 
 async fn open(client: &Client, args: &Args, reference: &str) -> Result<Checkpoint> {
     let options = Open { variant: args.get("variant").map(str::to_owned), ..Open::default() };
-    client.open(reference, &options).await
+    match client.open(reference, &options).await {
+        // Keep the ordinary shared choice when one fits. A sole stored checkpoint remains
+        // inspectable/exportable even when this computer cannot execute its encodings.
+        Err(error) if error.kind == Kind::NotFound && error.detail == "no variant fits the requested GPUs and bits" => {
+            client.open_variant(reference, &options).await
+        }
+        answer => answer,
+    }
 }
 
 async fn run(args: &Args) -> Done {
