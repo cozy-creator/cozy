@@ -62,6 +62,22 @@ struct Accounts {
     quarantined: Vec<Allocation>,
 }
 
+impl Accounts {
+    fn detach(&mut self, ptr: usize) -> Option<Allocation> { self.pointers.remove(&ptr) }
+
+    fn released(&mut self, allocation: &Allocation) {
+        let c = self.counts.entry((allocation.device, allocation.pool)).or_default();
+        c.live = c.live.saturating_sub(allocation.bytes);
+        if allocation.pending { c.pending = c.pending.saturating_sub(allocation.bytes); }
+        c.frees += 1;
+    }
+
+    fn failed_release(&mut self, allocation: Allocation, reason: String) {
+        self.faults.entry(allocation.device).or_insert(reason);
+        self.quarantined.push(allocation);
+    }
+}
+
 static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new() });
 
 fn accounts() -> std::sync::MutexGuard<'static, Accounts> {
@@ -244,22 +260,16 @@ fn freer() -> &'static mpsc::Sender<Pending> {
                 if ready != cuda::SUCCESS { quarantine(p.ptr, format!("consumer completion could not be proven (CUDA {ready})")); continue; }
                 // Detach this generation before the driver can reuse its address. A new
                 // allocation at the same pointer must never be removed by this old free.
-                let Some(a) = accounts().pointers.remove(&p.ptr) else { continue };
+                let Some(a) = accounts().detach(p.ptr) else { continue };
                 let rc = unsafe { (d.mem_free)(p.ptr as cuda::CUdeviceptr) };
                 unsafe { (d.event_destroy)(p.event as cuda::CUevent); }
                 if rc == cuda::SUCCESS {
                     {
-                        let mut all = accounts();
-                        let c = all.counts.entry((a.device, a.pool)).or_default();
-                        c.live = c.live.saturating_sub(a.bytes);
-                        if a.pending { c.pending = c.pending.saturating_sub(a.bytes); }
-                        c.frees += 1;
+                        accounts().released(&a);
                     }
                     drop(a); // physical token/public owner drops outside the accounts lock
                 } else {
-                    let mut all = accounts();
-                    all.faults.entry(a.device).or_insert_with(|| format!("CUDA segment release failed ({rc})"));
-                    all.quarantined.push(a);
+                    accounts().failed_release(a, format!("CUDA segment release failed ({rc})"));
                 }
             }
         });
@@ -291,4 +301,41 @@ pub extern "C" fn varena_torch_free(ptr: *mut c_void, _size: usize, _device: c_i
             quarantine(ptr as usize, "native retirement worker stopped".into());
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allocation(pool: Pool, bytes: u64, pending: bool) -> Allocation {
+        Allocation { device: 0, pool, bytes, pending, _resident: None }
+    }
+
+    #[test]
+    fn an_old_free_cannot_remove_a_new_allocation_at_the_reused_address() {
+        let mut a = Accounts::default();
+        let ptr = 0x1000;
+        a.pointers.insert(ptr, allocation((1, 0), 16, true));
+        a.counts.insert((0, (1, 0)), Counters { live: 16, pending: 16, ..Counters::default() });
+        let old = a.detach(ptr).unwrap(); // immediately before cuMemFree
+        // The driver returns the same address before the old worker updates its counters.
+        a.pointers.insert(ptr, allocation((2, 0), 32, false));
+        a.counts.insert((0, (2, 0)), Counters { live: 32, ..Counters::default() });
+        a.released(&old);
+        assert_eq!(a.pointers[&ptr].pool, (2, 0));
+        assert_eq!((a.counts[&(0, (1, 0))].live, a.counts[&(0, (1, 0))].pending), (0, 0));
+        assert_eq!(a.counts[&(0, (2, 0))].live, 32);
+    }
+
+    #[test]
+    fn an_uncertain_free_keeps_its_detached_allocation_charged() {
+        let mut a = Accounts::default();
+        a.pointers.insert(0x1000, allocation((1, 0), 16, true));
+        a.counts.insert((0, (1, 0)), Counters { live: 16, pending: 16, ..Counters::default() });
+        let old = a.detach(0x1000).unwrap();
+        a.failed_release(old, "release unproved".into());
+        assert_eq!((a.counts[&(0, (1, 0))].live, a.counts[&(0, (1, 0))].pending), (16, 16));
+        assert_eq!(a.quarantined[0].bytes, 16);
+        assert!(a.faults.contains_key(&0));
+    }
 }
