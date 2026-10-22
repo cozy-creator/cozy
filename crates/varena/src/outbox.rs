@@ -103,6 +103,18 @@ impl<C> Outbox<C> {
         self.settle_to(until);
     }
 
+    /// Blocks until every call posted before it, and every call those posted meanwhile, has
+    /// been sent (or cancelled).
+    pub fn quiesce(&self) {
+        loop {
+            let until = self.queue.lock().next;
+            self.settle_to(until);
+            if self.queue.lock().next == until {
+                return;
+            }
+        }
+    }
+
     /// Blocks until every call with a ticket below `until` has been sent (or cancelled).
     pub fn settle_to(&self, until: u64) {
         let mut q = self.queue.lock();

@@ -31,7 +31,7 @@ fn set(dir: &Path, name: &str, uuid: &str) -> SetSpec {
 }
 
 /// Nothing fills beside an unmeasured call, nor past the live budget less what the running
-/// calls keep free; into measured surplus it does.
+/// calls keep free; into measured surplus it does, the copies refused before included.
 #[test]
 fn a_tier_copy_goes_only_into_measured_surplus() {
     assert!(varena::os::namespace(&format!("host{}-", std::process::id())));
@@ -54,7 +54,8 @@ fn a_tier_copy_goes_only_into_measured_surplus() {
     *keep.lock() = Some(u64::MAX / 2);
     assert_eq!(saved("short"), 0, "past the budget less what calls keep free");
     *keep.lock() = Some(0);
-    assert_eq!(saved("room"), REGION_ALIGN, "measured surplus");
+    // Its own copy finds room, and the two refused earlier follow it (review 5, item 3).
+    assert_eq!(saved("room"), 3 * REGION_ALIGN, "measured surplus: its page and the deferred two");
     drop((mem, ledger));
     varena::os::remove_table(&g.uuid);
 }
