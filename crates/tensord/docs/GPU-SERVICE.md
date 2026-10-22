@@ -110,6 +110,11 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   requests end, and a GPU nothing runs on always admits. A cancel ends the wait; the request
   never started. It is spawned by the pool's `ChildLauncher`, which journals the birth, then sent
   Start (with its ledgers), Load and Activate once. Each request sends PrepareRequest and Invoke.
+- Hosting: a group's Load names, on each model's binding, the GPU of the group that keeps each
+  placeable component (`homes`, from the interface's `placeable`): `memory::homes`, varena's
+  `Ledger::place` over the lane's ledgers (a set's bytes as its load recorded them; one never
+  loaded goes where the most room is free). GPU 0 keeps what it has room for; GPU g ≥ 1 keeps
+  the rest resident for the group (remote scopes run there).
 - Warming: a warm member's executor is loaded, then `Map{construction, level}` has it load its
   models at `gpu` or `ram` (varena's `load(level)`), for any degree.
 - Each GPU's ledger (`Ledger::create`, capacity min(card, `gpu_memory_limit`)) is granted to an
