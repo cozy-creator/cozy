@@ -285,7 +285,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
                 refusal.0 = "no_progress";
                 if previous == Some(state) { break 0; }
                 previous = Some(state);
-                let reclaimed = a.request.reclaim_allocation(a.set, size as u64, Torch { allocated: held, reserved: held }).unwrap_or(0);
+                let reclaimed = a.request.reclaim_allocation(size as u64).unwrap_or(0);
                 refusal.0 = "no_reclaim";
                 if reclaimed == 0 { break 0; }
                 reclaimed_total += reclaimed;

@@ -101,6 +101,8 @@ impl Retained {
                 for &block in &self.blocks {
                     let key = (self.set, block);
                     let id = st.tick();
+                    // Taken back from the callback's stock (one it claimed refills at the bind).
+                    st.unstock(key);
                     st.pins.insert(id, (key, req, std::thread::current().id()));
                     st.sync(key);
                     pins.push((id, key));
@@ -546,6 +548,33 @@ impl Home {
     }
 }
 
+/// Wakes for state waiters: an epoch under a leaf mutex. A producer bumps it after its change
+/// (with the state lock or without: the allocator callback, a pin's drop); a waiter sleeps only
+/// while the epoch is the one it read before its last check, so no wake is lost between them.
+#[derive(Default)]
+struct Wakes {
+    epoch: Mutex<u64>,
+    cv: Condvar,
+}
+
+impl Wakes {
+    fn notify_all(&self) {
+        *self.epoch.lock() += 1;
+        self.cv.notify_all();
+    }
+
+    fn seen(&self) -> u64 {
+        *self.epoch.lock()
+    }
+
+    fn wait_past(&self, seen: u64) {
+        let mut epoch = self.epoch.lock();
+        while *epoch == seen {
+            self.cv.wait(&mut epoch);
+        }
+    }
+}
+
 /// A page the allocator callback may reclaim without the state lock: mapped, filled and
 /// complete, unpinned, never kept, and of no declared use (N or S). The state offers it at its
 /// publications; its claim decides who touches it next: the callback (to unmap it) or the
@@ -705,6 +734,9 @@ struct Retirement {
 
 #[derive(Default)]
 struct State {
+    /// The wake epoch read when this lock was taken, before its drain: a wait sleeps only while
+    /// no change came after it.
+    seen: u64,
     table: Table,
     budgets: HashMap<u64, Arc<AtomicU64>>,
     measure_epoch: u64,
@@ -985,7 +1017,9 @@ struct Inner {
     custody: Option<Arc<custody::Client>>,
     tier: Option<Arc<tier::Client>>,
     state: Mutex<State>,
-    landed: Condvar,
+    /// Every change a state waiter may test, from any thread (the allocator callback and a pin's
+    /// drop hold no state lock): an epoch the waiter read before its last check.
+    landed: Wakes,
     /// Custody's calls and the tier's, each in the order they were made, for one sender thread
     /// per service.
     to_custody: Arc<Outbox<Call>>,
@@ -1077,7 +1111,7 @@ impl Memory {
                 custody,
                 tier,
                 state: Mutex::new(State { table, holder, tier_holder, ..State::default() }),
-                landed: Condvar::new(),
+                landed: Wakes::default(),
                 to_custody,
                 to_tier,
                 mech,
@@ -1410,18 +1444,25 @@ impl Inner {
 
     fn local_accounting(&self, st: &mut State) {
         // Credits before their refunds: a refund undoes its credit's provisional bytes.
-        self.reconcile(st);
+        let settled = self.reconcile(st);
         for (_, bytes, epoch) in self.refunds.try_iter() {
             // A newer real Torch observation already removed the failed provisional credit.
             if st.measure_epoch == epoch { st.table.reserved = st.table.reserved.saturating_sub(bytes); }
         }
         st.promises();
         self.physical(st);
+        if settled > 0 {
+            // The reclaimed bytes move from the callback's count into the stored limit: the
+            // allocator's limit never drops between publications.
+            self.limit.store(st.table.torch_limit(), Ordering::Release);
+            self.unreconciled.fetch_sub(settled, Ordering::AcqRel);
+        }
     }
 
     /// The state, with pin releases applied and completed events acted on.
     fn lock(&self) -> MutexGuard<'_, State> {
         let mut st = self.state.lock();
+        st.seen = self.landed.seen();
         self.local_accounting(&mut st);
         self.drain(&mut st);
         st
@@ -1450,11 +1491,15 @@ impl Inner {
         Some(self.to_custody.post(Call::Withdraw { fp, page }, bytes))
     }
 
-    /// Waits for a fill or release on the state lock's condvar.
+    /// Waits, the state unlocked, for a change after the caller's last check (a fill, a release,
+    /// a reclaim), then reconciles and drains.
     fn wait(&self, st: &mut MutexGuard<'_, State>) -> Result<()> {
         self.check_ownership()?;
-        self.landed.wait(st);
+        let seen = st.seen;
+        MutexGuard::unlocked(st, || self.landed.wait_past(seen));
+        st.seen = self.landed.seen();
         self.check_ownership()?;
+        self.local_accounting(st);
         self.drain(st);
         Ok(())
     }
@@ -1772,11 +1817,6 @@ impl Inner {
         self.row.publish(&Self::facts(st));
     }
 
-    fn try_publish(&self, st: &mut State) {
-        self.physical(st);
-        self.offer(st);
-        self.row.try_publish(&Self::facts(st));
-    }
 
     /// What the allocator callback reads without the state lock: the limit, and (when idle
     /// pages changed) the stock of pages it may reclaim.
@@ -1785,21 +1825,40 @@ impl Inner {
         if !std::mem::take(&mut st.restock) {
             return;
         }
-        // Stale offers (taken or reclaimed) go; live ones stay.
+        // Stale offers (taken or reclaimed) go. A live one whose page is no longer idle N or S
+        // (a plan made it W or D, a bind pinned it) is taken back before the callback can
+        // claim it; the rest stay.
         let live: Vec<Stocked> = self.stock.try_iter().filter(|s| s.claim.load(Ordering::Acquire) == STOCKED).collect();
-        live.into_iter().for_each(|s| drop(self.stock_tx.send(s)));
+        for s in live {
+            if self.offerable(st, s.key).is_some_and(|o| o.gen == s.gen) {
+                let _ = self.stock_tx.send(s);
+            } else if s.claim.compare_exchange(STOCKED, TAKEN, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                if let Some(h) = st.homes.get_mut(&s.key).filter(|h| h.stock.as_ref().is_some_and(|c| Arc::ptr_eq(c, &s.claim))) {
+                    h.stock = None;
+                }
+            }
+        }
         let keys: Vec<Key> = st.homes.iter().filter(|(_, h)| h.stock.is_none()).map(|(k, _)| *k).collect();
         for key in keys {
-            let idle = st.table.page(key).is_some_and(|p| p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.kept);
-            let class = st.table.class(key);
-            let Ok((va, off, span)) = st.place(key) else { continue };
-            let Some(h) = st.homes.get_mut(&key) else { continue };
-            let complete = !h.filling && !h.transforming && !h.keeping && !h.keep_after && !h.exported && self.backend.query(h.ready).unwrap_or(false);
-            let Some(phys) = h.phys.as_ref().map(|p| p.id).filter(|_| idle && complete && matches!(class, Some(Class::N | Class::S))) else { continue };
+            let Some(offer) = self.offerable(st, key) else { continue };
             let claim = Arc::new(AtomicU8::new(STOCKED));
-            h.stock = Some(claim.clone());
-            let _ = self.stock_tx.send(Stocked { key, gen: h.gen, va, off, span, phys, claim });
+            if let Some(h) = st.homes.get_mut(&key) {
+                h.stock = Some(claim.clone());
+            }
+            let _ = self.stock_tx.send(Stocked { claim, ..offer });
         }
+    }
+
+    /// Page `key` as the callback may reclaim it: mapped, filled and complete, unpinned, never
+    /// kept, and of no declared use (N or S). `None` otherwise.
+    fn offerable(&self, st: &State, key: Key) -> Option<Stocked> {
+        let idle = st.table.page(key).is_some_and(|p| p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.kept);
+        let class = st.table.class(key);
+        let (va, off, span) = st.place(key).ok()?;
+        let h = st.homes.get(&key)?;
+        let complete = !h.filling && !h.transforming && !h.keeping && !h.keep_after && !h.exported && self.backend.query(h.ready).unwrap_or(false);
+        let phys = h.phys.as_ref().map(|p| p.id).filter(|_| idle && complete && matches!(class, Some(Class::N | Class::S)))?;
+        Some(Stocked { key, gen: h.gen, va, off, span, phys, claim: Arc::new(AtomicU8::new(TAKEN)) })
     }
 
     /// The allocator callback's reclaim from the stock, without the state lock: each page it
@@ -1814,7 +1873,9 @@ impl Inner {
             }
             let change = self.row.physical_change();
             let given = self.backend.unmap(s.va, s.off, s.span).and_then(|()| self.backend.destroy(Physical { id: s.phys, len: s.span }));
-            self.unreconciled.fetch_add(s.span, Ordering::AcqRel);
+            if given.is_ok() {
+                self.unreconciled.fetch_add(s.span, Ordering::AcqRel);
+            }
             let _ = self.reclaimed_tx.send((s.key, s.gen, s.span, given.is_ok()));
             self.landed.notify_all();
             given?;
@@ -1825,10 +1886,14 @@ impl Inner {
     }
 
     /// The callback's reclaims, into the state: each reclaimed page's home goes (its memory is
-    /// already back); a page the driver would not give back is lost backing.
-    fn reconcile(&self, st: &mut State) {
+    /// already back); a page the driver would not give back is lost backing. Returns the bytes
+    /// given back, which the caller moves from the callback's count into the limit.
+    fn reconcile(&self, st: &mut State) -> u64 {
+        let mut settled = 0;
         for (key, gen, span, ok) in self.reclaimed.try_iter() {
-            self.unreconciled.fetch_sub(span, Ordering::AcqRel);
+            if ok {
+                settled += span;
+            }
             if !st.homes.get(&key).is_some_and(|h| h.gen == gen) {
                 continue;
             }
@@ -1853,6 +1918,7 @@ impl Inner {
                 st.table.reserved = st.table.reserved.saturating_add(bytes);
             }
         }
+        settled
     }
 
     /// Physical backing and promises have separate owners. A page retiring through both
@@ -2850,6 +2916,8 @@ impl Inner {
         };
         st.host.insert(rid, host);
         st.table.requests.push(Req { id: rid, name: id.to_string(), steps, rooms, ..Req::default() });
+        // Its plan reclassifies pages (N to D): the stock is offered again.
+        st.restock = true;
         // A cold request's record carries the fills since the last one ended (its loads).
         let earlier = std::mem::take(&mut st.unclaimed);
         st.stats.insert(rid, Stats { request: id.to_string(), moved: earlier.moved, trace: earlier.trace, ..Stats::default() });
@@ -2891,7 +2959,6 @@ impl Inner {
                 hit = false;
                 waited = true;
                 self.wait(&mut st)?;
-                self.reconcile(&mut st);
                 continue;
             }
             match st.homes.get(&key) {
@@ -3882,6 +3949,8 @@ impl Request {
                 r.cursor = Default::default();
             }
             st.synthetic.remove(&self.id);
+            // Its new plan reclassifies pages (D to N, N to D): the stock is offered again.
+            st.restock = true;
             self.inner.publish(&mut st);
             self.inner.unlock(st);
             Ok(())
@@ -3910,95 +3979,14 @@ impl Request {
         }
     }
 
-    /// Reclaim for a native allocator callback. Only already-completed local pages participate:
-    /// no Python/torch hooks, peer asks, fill/save waits, or mechanism-queue waits. The same
-    /// decision procedure chooses victims; work requiring those waits is prepared before entry.
-    /// Returns bytes of actual reclaim (or newly available capacity), so retries make progress.
-    pub fn reclaim_allocation(&self, set: Option<SetId>, need: u64, torch: Torch) -> Result<u64> {
+    /// Reclaim for a native allocator callback, without the state lock: only pages the state
+    /// offered (idle N or S, complete, never kept) are claimed from the stock, each unmapped
+    /// and destroyed by this thread with no state lock held; the state reconciles them at its
+    /// next lock. No Python or torch, peer RPC, mechanism queue or wait on device work; broader
+    /// reclaim is preparation's (design §1). Returns the bytes given back.
+    pub fn reclaim_allocation(&self, need: u64) -> Result<u64> {
         self.inner.check_ownership()?;
-        // The stock first: pages offered for this, claimed without the state lock.
-        let stocked = self.inner.reclaim_stock(need)?;
-        if stocked >= need {
-            return Ok(stocked);
-        }
-        let Some(mut st) = self.inner.state.try_lock() else { return Ok(stocked) };
-        self.inner.local_accounting(&mut st);
-        self.inner.poll_releases(&mut st, false);
-        // Use the prepared cross-process/driver snapshot. Reaping, remapping and peer heap
-        // locks belong outside the Torch allocator lock, even if a peer is stopped.
-        st.table.allocated = torch.allocated;
-        st.table.reserved = torch.reserved;
-        let before = st.table.torch_limit();
-        let mut view = st.table.clone();
-        view.caches.clear(); // They remain counted in torch; callbacks cannot reclaim them here.
-        view.reserved = view.allocated;
-        view.headroom = 0;
-        // Returning bytes stay unavailable; this callback cannot wait for their arrival.
-        view.returning = 0;
-        for peer in &mut view.others { peer.returning = 0; }
-        let keys: Vec<Key> = view.pages().map(|(k, _)| k).collect();
-        for key in keys {
-            let completed = st.homes.get(&key).is_some_and(|h| !h.filling && !h.transforming && !h.keeping && self.inner.backend.query(h.ready).unwrap_or(false));
-            if let Some(p) = view.page_mut(key) {
-                // A kept page's memory is custody's: unmapping it frees nothing here (its
-                // withdraw is preparation's, as coming bytes). In the callback it is pinned.
-                if !completed || p.kept { p.pins.push(u64::MAX); }
-            }
-        }
-        let mut tried = Tried { trimmed: true, orphans: true, ..Tried::default() };
-        for row in &view.others {
-            for class in [Class::N, Class::D] { tried.asked.insert((row.row, class)); }
-        }
-        let actions = decide(&view, &Trigger::Oom { req: self.id, set: set.map(|s| s.0), need: Some(need), site: None, tried });
-        // Its unmaps change physical ownership: unproven until published (an error keeps it so).
-        let change = self.inner.row.physical_change();
-        let mut freed = 0;
-        for action in actions {
-            match action {
-                Action::Unmap { page, class } => {
-                    let (va, off, span) = st.place(page)?;
-                    // The decision excludes pins, releases, fills and saves; query above proved
-                    // the final producer complete. No synchronization or stream wait occurs.
-                    if let Err(error) = self.inner.backend.unmap(va, off, span) {
-                        return Err(self.inner.lost_backing(&mut st, span, true, error));
-                    }
-                    if let Some(home) = st.homes.remove(&page) {
-                        let custody = if home.exported { self.inner.withdraw(home.identity, page.1, span) } else { None };
-                        if custody.is_some() { st.table.pending += span; }
-                        if let Some(phys) = home.phys {
-                            st.retired.insert((page, home.gen), Retirement { bytes: span, created: home.origin != Origin::Kept, mechanism: None, custody, kept: false });
-                            if let Err(error) = self.inner.backend.destroy(phys) {
-                                st.sync(page);
-                                return Err(self.inner.lost_backing(&mut st, span, true, error));
-                            }
-                        }
-                        self.inner.backend.retire(home.ready);
-                    }
-                    st.sync(page);
-                    if let Some(stats) = st.stats(Some(self.id)) {
-                        if let Some(n) = stats.evicted.get_mut(class.index()) { *n += span; }
-                        if class == Class::W { stats.evicted_lowered += span; }
-                    }
-                    if let Some(n) = st.step_stats(self.id).and_then(|s| s.evicted.get_mut(class.index())) { *n += span; }
-                    freed += span;
-                }
-                Action::Lower(r) => {
-                    if let Some(r) = st.table.request_mut(r) { r.lowered = true; }
-                    if let Some(stats) = st.stats(Some(self.id)) { stats.lowered = true; }
-                }
-                Action::Claim { req, bytes } => {
-                    if let Some(r) = st.table.request_mut(req) { r.claimed += bytes; r.episode.claimed_free = true; }
-                }
-                Action::Starve(r) => { if let Some(r) = st.table.request_mut(r) { r.starved = true; } }
-                _ => {} // No callback, cut, park, peer ask, or queue wait inside an allocator.
-            }
-        }
-        self.inner.try_publish(&mut st);
-        change.finish();
-        // Kept handles withdraw asynchronously. Their bytes remain pending until the native
-        // custody sender reports completion; the allocation may retry once, but never waits
-        // for that sender or reacquires state after releasing it.
-        Ok(stocked + freed.max(st.table.torch_limit().saturating_sub(before)))
+        self.inner.reclaim_stock(need)
     }
 
     /// What the caller parked after a `Park` answer; 0 makes the next `oom` answer Exhausted.
