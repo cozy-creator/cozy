@@ -139,6 +139,7 @@ def main() -> int:
     ck = build(Path(tempfile.mkdtemp(prefix="varena-mempool-")) / "store")
     mem = Memory.open(0, limit=CAP, pool=True)
     run = Run(mem, ck)
+    shortfalls(mem, run, ck)
 
     # 1. beside the filler, through the pool: shortfalls resolved in the allocator.
     run.fill()
@@ -240,6 +241,59 @@ def main() -> int:
 
     print(f"{sum(results)}/{len(results)} checks passed", flush=True)
     return 0 if all(results) else 1
+
+
+def shortfalls(mem: Memory, run: Run, ck: tensorfs.Checkpoint) -> None:
+    """0: the allocator's own path. Two fillers occupy the card; the model's first pass at a
+    shape no pass measured (so varena makes no room for its activations ahead) runs through the
+    pool; then, in a pass, a buffer bigger than torch's headroom: each shortfall is resolved in
+    the allocator by evictions, with no OOM raised to Python."""
+    mem.pooling = True
+    second = loaded(mem, ck, "filler2")
+    run.fill()
+    with mem.request("filler2", plan=[second]), torch.no_grad():
+        second(run.x[:, :, :64, :64], 999, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
+    before = allocator_stats()
+    x = run.x[:, :, :224, :224].contiguous()  # a shape no pass ran
+    raised = None
+    with mem.request("unmeasured", plan=[run.unet]) as r, torch.no_grad():
+        try:
+            run.unet(x, 999, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
+        except (torch.OutOfMemoryError, VarenaError) as e:
+            raised = e
+    after = allocator_stats()
+    made, spent = after[1] - before[1], after[5] - before[5]
+    print(f"UNMEASURED beside two fillers: shortfalls resolved in the allocator {after[2] - before[2]} ({after[3] - before[3]} B); "
+          f"evicted by class {r.stats().evicted}; {made} new segments at {spent / max(made, 1) / 1e3:.0f} us each", flush=True)
+    check("0: an unmeasured pass beside two fillers completes with no OOM raised to Python", raised is None, raised)
+
+    run.fill()
+    seen: dict[str, object] = {}
+
+    def big(*_: object) -> None:
+        r = mem._current()
+        headroom = mem.native.torch_limit() - torch.cuda.memory_reserved(mem.device)
+        size = (headroom + (1 << 30)) // (2 << 20) * (2 << 20)
+        evicted, stats0 = sum(r.stats().evicted), allocator_stats()
+        try:
+            buffer = torch.empty(size, dtype=torch.uint8, device=mem.device)
+            del buffer
+            seen["ok"] = True
+        except torch.OutOfMemoryError as e:
+            seen["ok"] = e
+        stats1 = allocator_stats()
+        seen.update(size=size, headroom=headroom, resolved=stats1[2] - stats0[2], evicted=sum(r.stats().evicted) - evicted,
+                    us=(stats1[5] - stats0[5]) / max(stats1[1] - stats0[1], 1) / 1e3)
+
+    hook = run.unet.conv_in.register_forward_pre_hook(big)
+    with mem.request("beyond headroom", plan=[run.unet]), torch.no_grad():
+        run.unet(run.x, 998, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
+    hook.remove()
+    print(f"BEYOND headroom: {seen}", flush=True)
+    check("0: a buffer past torch's headroom is resolved in the allocator, with no OOM raised to Python",
+          seen.get("ok") is True and isinstance(seen.get("resolved"), int) and seen["resolved"] > 0, seen)
+    check("0: the evictions made it room", isinstance(seen.get("evicted"), int) and seen["evicted"] >= (1 << 30), seen)
+    mem.models[second].close()
 
 
 def slack(mem: Memory, run: Run) -> None:
