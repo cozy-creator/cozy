@@ -409,3 +409,10 @@ class Workspace:
 def allocator_pending(device: int) -> int: ...
 
 def allocator_check(device: int) -> None: ...
+
+def allocator_refusals(device: int | None = None) -> list[tuple[int, tuple[int, int], str, int, int, int]]:
+    """Each device and pool's last refusal: (device, pool, reason, size, held bytes, limit)."""
+
+def allocator_quarantined(device: int | None = None) -> list[tuple[int, tuple[int, int], int, str]]:
+    """Quarantined segments by device and pool: (device, pool, bytes, last reason). They stay
+    charged and are never reused; the device goes on."""
