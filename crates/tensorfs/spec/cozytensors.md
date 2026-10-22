@@ -710,7 +710,7 @@ reader, copier or collector to discover a new kind of reference edge.
 ### Variant selection
 
 `conformance/vectors/select.json` and its `select/*.cbor` headers are the shared selection vectors.
-Rust, Python conformance and Hub readers MUST agree. Selection reads headers, never tensor payloads.
+Rust and Hub readers MUST agree. Selection reads headers, never tensor payloads.
 Consumers pass `{gpus: ["major.minor", ...], bits?: 4|8|16}`; no GPUs means CPU, omitted bits means 8.
 A device set supports an encoding only when every device does. Unread capabilities conservatively
 have no encoded GPU formats. BF16 is preferred unless a known GPU is below compute capability 8.0.
@@ -729,14 +729,15 @@ stored bytes, with lexical kind order breaking ties. Its family and bits are:
 
 Known plain dtypes are readable on any target. Encoded int8 requires capability >=8.0 except 10.3;
 fp8 requires >=8.9; nvfp4, mxfp4 and int4 require >=8.0 (weight-only below native FP4 capability 10.0).
+Only schemes this reader implements are eligible, even when an unknown scheme has a known family prefix.
 Unknown encodings or dtypes remain readable as raw metadata but are skipped by automatic selection.
 Every kind must satisfy these requirements, even a small minority kind in the header.
 
 At 4 bits the family order is FP4, int8, fp8, BF16, FP16, F32; at 8 bits omit FP4; at 16 bits omit
 all encoded families. Remove GPU-incompatible encoded families; place FP16 before BF16 only for a
 known pre-8.0 GPU. FP4 includes nvfp4, mxfp4 and int4. Within a family prefer native over weight-only,
-then fewer stored bytes, then lexical full path. If none ranks, the sole variant may serve only when
-all its kinds are runnable (for example, a plain integer-only header). Otherwise selection is null.
+then fewer stored bytes, then lexical full path. At 16 bits every kind must be a plain dtype. If none ranks, the sole variant with no precision
+family may serve only when all its kinds are runnable (for example, a plain integer-only header). Otherwise selection is null.
 Fallback reasons use precision families, never variant filenames; the vectors define their text.
 
 The Hub indexes profiles and the repo's ordered tag document transactionally with a repo write.

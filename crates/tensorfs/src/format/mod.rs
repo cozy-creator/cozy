@@ -39,7 +39,7 @@ pub const TREE_FORMAT: &str = "cozytensors.tree/1";
 /// path; `None` for any other path.
 pub fn variant_of(path: &str) -> Option<&str> {
     let name = path.rsplit('/').next()?;
-    (name.len() > VARIANT_EXTENSION.len() && name.ends_with(VARIANT_EXTENSION)).then_some(path)
+    name.ends_with(VARIANT_EXTENSION).then_some(path)
 }
 
 /// The path a writer gives variant `name`: itself, else with the extension added; `""` is
@@ -48,6 +48,7 @@ pub fn variant_path(name: &str) -> String {
     match name {
         "" => HEADER_PATH.into(),
         name if variant_of(name).is_some() => name.into(),
+        name if !name.contains('/') => format!("model.{name}{VARIANT_EXTENSION}"),
         name => format!("{name}{VARIANT_EXTENSION}"),
     }
 }

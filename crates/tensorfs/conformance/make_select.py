@@ -29,12 +29,13 @@ def header(name, entries):
     dominant = sorted(held, key=lambda k: (-held[k], k))[0]
     family, bits = {"BF16": ("bf16",16), "F16": ("fp16",16), "F32": ("f32",16),
                     "int8.rowwise": ("int8",8), "fp8.rowwise": ("fp8",8),
-                    "nvfp4": ("nvfp4",4), "mxfp4": ("mxfp4",4), "int4.gptq": ("int4",4)}.get(dominant,("",0))
+                    "nvfp4": ("nvfp4",4), "mxfp4": ("mxfp4",4), "int4.convrot": ("int4",4)}.get(dominant,("",0))
     profiles[name] = dict(family=family,bits=bits,bytes=sum(held.values()),kinds=sorted(held))
 for name,kind,n in [("bf16","BF16",128),("fp16","F16",128),("f32","F32",256),("int8","int8.rowwise",64),
                     ("fp8","fp8.rowwise",64),("fp8-small","fp8.rowwise",32),("nvfp4","nvfp4",32),
-                    ("mxfp4","mxfp4",32),("int4","int4.gptq",16),("integer","I64",128),("future","future.scheme",64)]:
+                    ("mxfp4","mxfp4",32),("int4","int4.convrot",16),("integer","I64",128),("future","future.scheme",64)]:
     header(name,[(kind,n)])
+header("future-int8",[("int8.future",64)])
 header("mixed-unsupported",[("BF16",128),("future.scheme",32)])
 header("mixed-fp8",[("int8.rowwise",128),("fp8.rowwise",32)])
 header("tie",[("F16",128),("BF16",128)])
@@ -68,8 +69,13 @@ case("all kinds must run",{"a.cozytensors":"mixed-unsupported","b.cozytensors":"
 case("a minority fp8 leaf still needs fp8",{"a.cozytensors":"mixed-fp8","b.cozytensors":"bf16"},["8.6"],8,"b.cozytensors",["precision 8: acme/model@1 has no int8 lane for sm86; served bf16"])
 case("dominant-kind tie uses lexical kind",{"tie.cozytensors":"tie"},[],8,"tie.cozytensors")
 case("no variants",{},["9.0"],8,None)
+case("sixteen never falls to a sole encoded profile",{"q.cozytensors":"int8"},["9.0"],16,None)
+case("sixteen excludes minority encoded leaves",{"q.cozytensors":"mixed-fp8"},["9.0"],16,None)
+case("overflow capability is unknown",paths,["4294967295.0"],8,"weights/accurate.cozytensors")
+case("unknown scheme inside known family is skipped",{"q.cozytensors":"future-int8"},["9.0"],8,None)
 case("invalid bits",paths,["9.0"],3,None,error="invalid")
 lookups=[
+ {"paths":["nested/.cozytensors"],"ask":"nested/.cozytensors","variant":"nested/.cozytensors"},
  {"paths":["bf16.cozytensors","model.bf16.cozytensors"],"ask":"bf16","variant":"bf16.cozytensors"},
  {"paths":["model.bf16.cozytensors"],"ask":"bf16","variant":"model.bf16.cozytensors"},
  {"paths":["nested/model.bf16.cozytensors","other/model.bf16.cozytensors"],"ask":"bf16","variant":None},

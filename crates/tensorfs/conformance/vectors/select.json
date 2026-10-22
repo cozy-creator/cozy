@@ -70,7 +70,7 @@
       "bits": 4,
       "bytes": 16,
       "kinds": [
-        "int4.gptq"
+        "int4.convrot"
       ]
     },
     "integer": {
@@ -87,6 +87,14 @@
       "bytes": 64,
       "kinds": [
         "future.scheme"
+      ]
+    },
+    "future-int8": {
+      "family": "",
+      "bits": 0,
+      "bytes": 64,
+      "kinds": [
+        "int8.future"
       ]
     },
     "mixed-unsupported": {
@@ -485,6 +493,65 @@
       "reasons": []
     },
     {
+      "why": "sixteen never falls to a sole encoded profile",
+      "variants": {
+        "q.cozytensors": "int8"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ],
+        "bits": 16
+      },
+      "variant": null,
+      "reasons": []
+    },
+    {
+      "why": "sixteen excludes minority encoded leaves",
+      "variants": {
+        "q.cozytensors": "mixed-fp8"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ],
+        "bits": 16
+      },
+      "variant": null,
+      "reasons": []
+    },
+    {
+      "why": "overflow capability is unknown",
+      "variants": {
+        "weights/accurate.cozytensors": "bf16",
+        "small.cozytensors": "int8",
+        "nested/fp.cozytensors": "fp8",
+        "q4.cozytensors": "nvfp4"
+      },
+      "constraints": {
+        "gpus": [
+          "4294967295.0"
+        ],
+        "bits": 8
+      },
+      "variant": "weights/accurate.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "unknown scheme inside known family is skipped",
+      "variants": {
+        "q.cozytensors": "future-int8"
+      },
+      "constraints": {
+        "gpus": [
+          "9.0"
+        ],
+        "bits": 8
+      },
+      "variant": null,
+      "reasons": []
+    },
+    {
       "why": "invalid bits",
       "variants": {
         "weights/accurate.cozytensors": "bf16",
@@ -504,6 +571,13 @@
     }
   ],
   "lookups": [
+    {
+      "paths": [
+        "nested/.cozytensors"
+      ],
+      "ask": "nested/.cozytensors",
+      "variant": "nested/.cozytensors"
+    },
     {
       "paths": [
         "bf16.cozytensors",

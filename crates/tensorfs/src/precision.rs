@@ -36,7 +36,10 @@ impl Default for Gpus {
 impl Gpus {
     /// From each GPU's compute capability (`"9.0"`); one below 8.0 or unread runs none.
     pub fn of(ccs: &[&str]) -> Self {
-        let number = |cc: &str| cc.split_once('.').and_then(|(major, minor)| Some(major.parse::<u32>().ok()? * 10 + minor.parse::<u32>().ok()?));
+        let number = |cc: &str| cc.split_once('.').and_then(|(major, minor)| {
+            if major.is_empty() || minor.is_empty() || major.len() > 4 || minor.len() > 4 || !major.bytes().chain(minor.bytes()).all(|c| c.is_ascii_digit()) { return None; }
+            Some(major.parse::<u32>().ok()? * 10 + minor.parse::<u32>().ok()?)
+        });
         let all = |runs: fn(u32) -> bool| !ccs.is_empty() && ccs.iter().all(|cc| runs(number(cc).unwrap_or(0)));
         let mut names: Vec<String> = ccs.iter().filter(|cc| !cc.is_empty()).map(|cc| format!("sm{}", cc.replace('.', ""))).collect();
         names.sort();
@@ -141,10 +144,10 @@ impl Slot {
             "int4" => false,
             _ => true,
         };
-        let ranked = variants.iter().enumerate().filter(|(_, (_, p))| p.kinds.iter().all(|kind| runs(kind, gpus)));
+        let ranked = variants.iter().enumerate().filter(|(_, (_, p))| p.kinds.iter().all(|kind| runs(kind, gpus) && ((bits != 16 && self.encoded) || !matches!(Dtype::parse(kind), Dtype::Other(_)))));
         let ranked = ranked.filter_map(|(at, (name, p))| Some(((place(p)?, !native(p), p.bytes, *name), at)));
         ranked.min().map(|(_, at)| at).or_else(|| {
-            (variants.len() == 1 && variants[0].1.kinds.iter().all(|kind| runs(kind, gpus) && (self.encoded || !matches!(Dtype::parse(kind), Dtype::Other(_))))).then_some(0)
+            (variants.len() == 1 && variants[0].1.family.is_empty() && variants[0].1.kinds.iter().all(|kind| runs(kind, gpus) && (self.encoded || !matches!(Dtype::parse(kind), Dtype::Other(_))))).then_some(0)
         })
     }
 }
@@ -198,6 +201,7 @@ fn family(kind: &str) -> (&'static str, u32) {
 /// Whether every GPU runs `kind`: a §5 dtype always; an encoding of the table where its family
 /// does; any other never.
 fn runs(kind: &str, gpus: &Gpus) -> bool {
+    if matches!(Dtype::parse(kind), Dtype::Other(_)) && !crate::format::SCHEMES.iter().any(|scheme| scheme.name == kind) { return false; }
     match family(kind).0 {
         "int8" => gpus.int8,
         "fp8" => gpus.fp8,

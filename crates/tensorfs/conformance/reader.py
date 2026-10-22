@@ -206,7 +206,7 @@ def resolve(repo: dict, revision: str | None, tree) -> tuple[dict, str | None] |
 
 def variant_of(p: str) -> str | None:
     name = p.rsplit("/", 1)[-1]
-    return p if name.endswith(".cozytensors") and len(name) > len(".cozytensors") else None
+    return p if name.endswith(".cozytensors") else None
 
 
 # ---------------------------------------------------------------- the CBOR header
