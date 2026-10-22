@@ -2693,7 +2693,9 @@ impl Inner {
     /// Preparation only: wait for already-retiring bytes, never for a peer to run package
     /// code or finish a RAM-tier copy. The allocator callback does not execute this action.
     fn settle_returning(&self) -> Result<()> {
-        self.to_custody.settle();
+        if self.to_custody.pending() > 0 {
+            self.to_custody.settle();
+        }
         let _waiting = self.row.waiting();
         let epoch = self.room_wake.epoch();
         // Check after registering, so any subsequent completion signals this endpoint.
@@ -2926,7 +2928,10 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
         let Some(me) = inner.upgrade() else { return };
         me.mechanism(op);
         let mut st = me.lock();
-        st.table.inflight = queue.pending().saturating_sub(bytes);
+        // Publish only after refresh will also read the physically completed byte count.
+        // The ticket remains live until this worker releases its Memory owner below.
+        queue.returned(bytes);
+        st.table.inflight = queue.pending();
         me.publish(&st);
         me.unlock(st);
         me.landed.notify_all();
@@ -2935,7 +2940,7 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
         // Done with the Memory before it reads as done: a settled Memory is this thread's no
         // more.
         drop(me);
-        queue.sent(ticket, bytes);
+        queue.sent(ticket, 0);
     }
 }
 

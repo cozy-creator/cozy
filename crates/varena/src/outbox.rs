@@ -70,6 +70,12 @@ impl<C> Outbox<C> {
         }
     }
 
+    /// The operation physically returned its bytes, before publishing its completion. The
+    /// sender still owns the ticket and calls `sent(ticket, 0)` after releasing its owner.
+    pub fn returned(&self, bytes: u64) {
+        self.queue.lock().pending -= bytes;
+    }
+
     /// The sender sent `ticket` (or gave up on it): its bytes are free.
     pub fn sent(&self, ticket: u64, bytes: u64) {
         let mut q = self.queue.lock();
