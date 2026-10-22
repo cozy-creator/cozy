@@ -2362,15 +2362,12 @@ impl Inner {
                     let filled = matches!(fill, Some(Fill::Stored)) || (origin == Origin::Tier && matches!(fill, Some(Fill::Declared(_))));
                     st.restock = true;
                     let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
-                    if let Some(h) = st.homes.get_mut(&job.key) {
-                        if let Some(ready) = ready {
-                            (h.ready, h.ready_on) = (ready, COPY);
-                        }
-                        h.filling = false;
-                        h.filled = filled;
-                        h.origin = origin;
+                    // A page read ready at issue is its binders' since: a transform may have
+                    // filled it already, so only its accounting is left.
+                    if let (Some(ready), Some(h)) = (ready, st.homes.get_mut(&job.key)) {
+                        (h.ready, h.ready_on, h.filling, h.filled, h.origin) = (ready, COPY, false, filled, origin);
+                        st.sync(job.key);
                     }
-                    st.sync(job.key);
                     let s = st.fills(job.req, job.key, span, origin);
                     let f = if origin == Origin::Tier { &mut s.moved.tier } else { &mut s.moved.store };
                     f.bytes += span;
@@ -2487,7 +2484,8 @@ impl Inner {
             Error::Ownership(format!("fill panicked ({e}); its copies did not drain"))
         };
         for job in jobs {
-            if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen) {
+            // A page read ready at issue had all its copies go out: its binders keep it.
+            if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen && h.filling) {
                 if drained {
                     if let Some(h) = st.homes.get_mut(&job.key) {
                         h.filling = false;
