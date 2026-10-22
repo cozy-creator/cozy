@@ -88,8 +88,11 @@ fn deposit(memory: &Memory, dir: &Path, gpu: &str, n: usize, bytes: u64) {
 /// read back. (Dirty pages are no room: the kernel cannot give them back in time.)
 fn cache(dir: &Path, bytes: u64) {
     let path = dir.join("cache");
-    let written = Command::new("dd").args(["if=/dev/zero", &format!("of={}", path.display()), "bs=1M", "conv=fsync"])
-        .arg(format!("count={}", bytes / MIB)).stderr(Stdio::null()).status().unwrap();
+    // Bound dirty pages while crossing the limit. A final-only fsync can leave more than
+    // the entire cgroup dirty and kill the watcher fixture before reclaimable cache exists.
+    assert_eq!(bytes % (16 * MIB), 0);
+    let written = Command::new("dd").args(["if=/dev/zero", &format!("of={}", path.display()), "bs=16M", "oflag=dsync"])
+        .arg(format!("count={}", bytes / (16 * MIB))).stderr(Stdio::null()).status().unwrap();
     assert!(written.success());
     assert!(Command::new("cat").arg(&path).stdout(Stdio::null()).status().unwrap().success());
 }
