@@ -27,6 +27,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+mod model_folder;
+
 pub enum Source {
     /// A published release by name (th-245); empty: the Hub's newest.
     Release { package: String, release: String },
@@ -276,6 +278,8 @@ impl Runs {
         }
         // A written file a warm run makes into a model (`object://sha256:<hex>/<file>`).
         for choice in &spec.models {
+            // A folder is bound to one retained input tree, never an arbitrary store path.
+            model_folder::input(&spec, choice)?;
             let Some(hex) = choice.source.strip_prefix("object://").and_then(|rest| rest.split('/').next()) else {
                 continue;
             };
@@ -387,6 +391,7 @@ impl Runs {
     /// repository at the run's TensorFS endpoint.
     fn warm_models(
         &self,
+        actor: &str,
         spec: &Spec,
         observe: &(dyn Fn(&str, u64, u64) + Sync),
         stoppable: &Stoppable,
@@ -419,8 +424,13 @@ impl Runs {
         };
         let mut models = vec![];
         for choice in &spec.models {
+            let folder = model_folder::prepare(self, actor, spec, choice, stoppable)?;
             // Each model's header, and the tree that names it when one does.
-            let (header, tree, mut row) = if !choice.source.is_empty() {
+            let (header, tree, mut row) = if let Some(folder) = &folder {
+                let row = json!({"parameter": choice.parameter, "source": choice.source,
+                    "tree": folder.tree.id(), "variants": folder.variants});
+                (folder.header.clone(), Some(folder.tree.clone()), row)
+            } else if !choice.source.is_empty() {
                 let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, stop, observe)?;
                 let row = json!({"parameter": choice.parameter, "source": choice.source,
                     "resolved": made.resolved, "profiles": made.profiles,
@@ -552,7 +562,7 @@ impl Runs {
             return self.warm_set(actor, id, &spec, items, &observe, stoppable);
         }
         if let Source::Models = spec.source {
-            let models = self.warm_models(&spec, &*observe, stoppable)?;
+            let models = self.warm_models(actor, &spec, &*observe, stoppable)?;
             return warm_result(json!({}), models);
         }
         // A warm run naming no entrypoint installs its code, then makes its choices present.
@@ -674,7 +684,7 @@ impl Runs {
         }
         if spec.warm {
             let models = match install_only {
-                true => self.warm_models(&spec, &*observe, stoppable)?,
+                true => self.warm_models(actor, &spec, &*observe, stoppable)?,
                 false => vec![],
             };
             // A function's warm run ends holding what its constructions read (`downloaded`).
