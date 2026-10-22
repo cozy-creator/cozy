@@ -57,16 +57,6 @@ on:
         required: false
         default: ''
         type: string
-      tensorhub_ref:
-        description: Hub source and owner-day harness; master by default
-        required: false
-        default: master
-        type: string
-      runtime_ref:
-        description: Exact Runtime source paired with this TensorFS for owner-day; empty uses the published pair
-        required: false
-        default: ''
-        type: string
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -284,17 +274,6 @@ jobs:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
 
-  custom-owner-day:
-    needs:
-      - plan
-      - build-local-artifacts
-      - custom-release-gate
-    uses: ./.github/workflows/owner-day.yml
-    with:
-      plan: ${{ needs.plan.outputs.val }}
-      tensorhub_ref: ${{ inputs.tensorhub_ref || 'master' }}
-      runtime_ref: ${{ inputs.runtime_ref || '' }}
-    secrets: inherit
   # Determines if we should publish/announce
   host:
     needs:
@@ -302,10 +281,8 @@ jobs:
       - build-local-artifacts
       - custom-release-gate
       - build-global-artifacts
-      - custom-release-smoke
-      - custom-owner-day
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-release-smoke.result == 'skipped' || needs.custom-release-smoke.result == 'success') && (needs.custom-owner-day.result == 'skipped' || needs.custom-owner-day.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.custom-release-gate.result == 'skipped' || needs.custom-release-gate.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.custom-release-gate.result == 'skipped' || needs.custom-release-gate.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-24.04"

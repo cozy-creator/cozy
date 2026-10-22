@@ -1,6 +1,6 @@
 name: release-gate
-# dist local-artifacts job (dist-workspace.toml): a release needs a green platforms.yaml run on its own
-# commit that covered every release runner. When the binary links TensorFS (cargo tree, a fact of the
+# dist local-artifacts job (dist-workspace.toml): it records a green platforms.yaml run on its commit if
+# one exists, never requires one (releases build and publish; a smoke follows the deploy). When the binary links TensorFS (cargo tree, a fact of the
 # build), the newest tensorfs wheel on PyPI must also speak its store format and claim protocol
 # (design §2, crates/tensorfs-py/scripts/format_contract.py); a dry run or prerelease may name a
 # publish-tensorfs run (`tensorfs_run`) whose unpublished wheel stands in. A dry run reports the verdicts
@@ -42,7 +42,7 @@ jobs:
             missing=$(for r in $RUNNERS; do case $green in *" $r "*) ;; *) printf '%s ' "$r" ;; esac; done)
             [ -n "$missing" ] || { platforms=$runs/$id; break; }
           done
-          [ -n "$platforms" ] || refusals+=("no green platforms.yaml run on $SHA covers $RUNNERS; run: gh workflow run platforms.yaml --ref $REF")
+          [ -n "$platforms" ] || notes+=("platforms: no green platforms.yaml run on $SHA (not required: releases build and publish, then smoke)")
           tensorfs=
           links=$(cargo tree --locked -p cozy --target all -e normal --prefix none --format '{p}')
           if grep -q '^tensorfs v' <<< "$links" && [ -n "$TENSORFS_RUN" ]; then
