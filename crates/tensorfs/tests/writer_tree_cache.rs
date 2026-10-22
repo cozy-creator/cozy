@@ -65,7 +65,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
         .expect("Writer returned no tree identity")
         .clone();
     let payload: Vec<_> = checkpoint.header().objects().cloned().collect();
-    assert_eq!(checkpoint.variant(), Some(""));
+    assert_eq!(checkpoint.variant(), Some("model.cozytensors"), "a variant is its path");
     assert_eq!(
         checkpoint.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
@@ -127,7 +127,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
         .unwrap();
     assert_eq!(reopened.id(), &header);
     assert_eq!(reopened.tree(), Some(&tree));
-    assert_eq!(reopened.variant(), Some(""));
+    assert_eq!(reopened.variant(), Some("model.cozytensors"));
     assert_eq!(
         reopened.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT

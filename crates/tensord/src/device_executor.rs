@@ -764,7 +764,8 @@ pub struct DeviceExecutor {
     /// Stillness while this answers true is not this executor's: it waits on runs watched
     /// by their own executors (a job's unfinished children).
     pub waits: Option<crate::process::Waits>,
-    /// Its GPUs' work: a GPU executor's invocations are judged while they run (`Meter::Work`).
+    /// Its GPUs' work, which judges its invocations beside its CPU, bytes and frames
+    /// (`Meter::Work`); None on a lane with no GPUs.
     pub activity: Option<crate::process::Activity>,
     root: PathBuf,
     socket: PathBuf,
@@ -781,7 +782,7 @@ pub struct DeviceExecutor {
 }
 
 /// Cooperative first: the executor stops at its next safe point. The running invocation's
-/// frame meter then decides whether it stopped moving and must be killed.
+/// pace then decides whether it stopped and must be killed.
 #[derive(Clone)]
 pub struct Cancellation {
     root: PathBuf,
@@ -1590,9 +1591,8 @@ impl DeviceExecutor {
         // Refuse incompatible descriptor framing before writing the command or any handle.
         // CPU/import-only baseline commands do not need the GPU memory capability.
         self.hello.accepts(command)?;
-        let meter = match (command, &self.activity) {
-            (DeviceCommand::Invoke { .. }, Some(_)) => Meter::Work,
-            (DeviceCommand::Invoke { .. }, None) => Meter::Frames,
+        let meter = match command {
+            DeviceCommand::Invoke { .. } => Meter::Work,
             _ => Meter::Burn,
         };
         let watching = Watching::start(
@@ -1612,7 +1612,7 @@ impl DeviceExecutor {
             memo.release(run);
         }
         let (killed, worst_gap) = watching.finish();
-        if meter != Meter::Burn {
+        if meter == Meter::Work {
             self.worst_gap = self.worst_gap.max(worst_gap);
         }
         match killed {

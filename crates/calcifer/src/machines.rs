@@ -1154,6 +1154,7 @@ fn status(frame: &v1::StatusFrame, hubs: &Hubs) -> MachineStatus {
                     .map(|c| wire::Checkpoint {
                         release: c.release.clone(),
                         lane: c.lane.clone(),
+                        precision: c.precision.clone(),
                         manifest: c.manifest.clone(),
                         yanked: c.yanked,
                     })

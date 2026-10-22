@@ -458,11 +458,7 @@ async fn adopting(ctx: &Context, version: &str) -> Result<Adopted, Error> {
         "" => ctx.hub()?,
         origin => ctx.config.resolve(origin)?,
     };
-    let target = if super::cohort::needs_pair(version, local.status.as_ref()) {
-        crate::context::hub_answer(ctx.hub_anonymous(&hub).get_software().await).ok()
-    } else { None };
-    let payload = super::cohort::adoption(version, local.status.as_ref(),
-        target.as_ref().map(|t| (t.runtime.as_str(), t.tensorfs.as_str())));
+    let payload = serde_json::json!({ "cozy": version });
     let submit = SubmitRun {
         agreed: None,
         on: On::Machine(local.name),

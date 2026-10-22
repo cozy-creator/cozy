@@ -69,7 +69,7 @@ async fn start(name: &str, cache: Option<&Path>) -> (Machine, Client, PathBuf) {
     (machine, client, root)
 }
 
-/// `cozy model download acme/model@1.0.0 bf16` on `client`: its model row.
+/// `cozy model download acme/model@1.0.0 --variant model.bf16.cozytensors` on `client`: its model row.
 async fn download(client: &Client, id: &str, hub: &str) -> serde_json::Value {
     let spec = v1::RunSpec {
         kind: v1::RunKind::Warm,
@@ -77,7 +77,7 @@ async fn download(client: &Client, id: &str, hub: &str) -> serde_json::Value {
             parameter: "model".into(),
             repository: "acme/model".into(),
             release: "1.0.0".into(),
-            lane: "bf16".into(),
+            lane: "model.bf16.cozytensors".into(),
             ..Default::default()
         }],
         hub: Some(v1::HubAccess { origin: hub.into(), ..Default::default() }),
@@ -146,4 +146,57 @@ async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
         let _ = std::fs::remove_dir_all(dir);
     }
     let _ = std::fs::remove_file(cache);
+}
+
+/// An int8 checkpoint: one int8.rowwise tensor (unit codes, scale 1).
+fn int8(store: &tensorfs::store::Store) -> tensorfs::format::ObjectRef {
+    use tensorfs::{format::{Dtype, Encoding}, writer::{Data, PartData, Source}};
+    let mut writer = store.writer(None, None).unwrap();
+    let (weight, scale) = (vec![1u8; 4 * 32], 1f32.to_le_bytes().repeat(4));
+    let (mut weight, mut scale) = (weight.as_slice(), scale.as_slice());
+    let parts = vec![
+        PartData { role: "weight".into(), dtype: Dtype::I8, shape: vec![4, 32], data: Source::Read(&mut weight) },
+        PartData { role: "scale".into(), dtype: Dtype::F32, shape: vec![4], data: Source::Read(&mut scale) },
+    ];
+    let encoding = Encoding { scheme: "int8.rowwise".into(), params: Default::default() };
+    writer.get("model").put("proj.weight", &Dtype::BF16, &[4, 32], Data::Encoded { encoding, parts }).unwrap();
+    writer.commit().unwrap()
+}
+
+/// `cozy model download acme/q8`, an int8-only release (spec §7), on a machine told no GPU (one
+/// whose NVML still shows a card runs int8 on it): it serves its only variant and names its
+/// precision lane; `--lane 16` refuses, naming what the release publishes. The CPU's reason
+/// beside it is the shared vectors' ("a sole 8-bit variant serves the CPU").
+#[tokio::test]
+async fn a_cpu_machine_downloads_an_int8_only_release() {
+    let source = std::env::temp_dir().join(format!("tensord-q8-source-{}", uuid::Uuid::new_v4()));
+    let store = tensorfs::store::Store::open(&source).unwrap();
+    let model = names_hub::Model { repository: "acme/q8".into(), release: "1.0.0".into(), lane: "int8".into(), header: int8(&store) };
+    let (hub, _) = names_hub::serve(&store, model, Vec::<names_hub::Package>::new());
+    let (machine, client, root) = start("q8", None).await;
+    let download = |id: &'static str, bits| {
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Warm,
+            bits,
+            models: vec![v1::ModelChoice { parameter: "model".into(), repository: "acme/q8".into(), ..Default::default() }],
+            hub: Some(v1::HubAccess { origin: hub.clone(), ..Default::default() }),
+            catalog_revision: "r1".into(),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        common::run(&client, id, spec)
+    };
+    let outcome = common::outcome(&download("q8-cpu", 0).await);
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    let result: serde_json::Value = serde_json::from_str(outcome.result.as_ref().unwrap().get()).unwrap();
+    let row = &result["models"][0];
+    assert_eq!((&row["lane"], &row["precision"]), (&"model.int8.cozytensors".into(), &"int8".into()), "{row}");
+    let refused = common::outcome(&download("q8-sixteen", 16).await);
+    assert_eq!(refused.status, "failed", "{refused:?}");
+    let reason = refused.reason.unwrap();
+    assert!(reason.message.starts_with("precision 16 on ") && reason.message.ends_with(
+        ": acme/q8@1.0.0 has no variant that works; it publishes model.int8.cozytensors (int8) is not 16-bit"), "{reason:?}");
+    drop(machine);
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(source);
 }

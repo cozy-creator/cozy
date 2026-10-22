@@ -434,7 +434,7 @@ fn native_owner_process() {
     let f: Fixture =
         serde_json::from_slice(&fs::read(scratch.join("fixture.json")).unwrap()).unwrap();
     let store = Store::open(scratch.join("store")).unwrap();
-    let ck = store.variant(&f.tree, Some("main")).unwrap();
+    let ck = store.variant(&f.tree, Some("model.main.cozytensors")).unwrap();
     assert_eq!(ck.id(), &f.header);
     match std::env::var("TENSORFS_RETENTION_MODE").unwrap().as_str() {
         "source" => {
@@ -444,7 +444,7 @@ fn native_owner_process() {
             })
             .unwrap();
             let open = tensorfs::Open {
-                variant: Some("main".into()),
+                variant: Some("model.main.cozytensors".into()),
                 local_files_only: true,
                 ..Default::default()
             };

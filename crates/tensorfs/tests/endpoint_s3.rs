@@ -85,7 +85,7 @@ async fn a_bucket_serves_the_protocol_under_sigv4() {
     let into = Store::open(scratch.join("into")).unwrap();
     let fetcher = Fetcher::new(Arc::new(into.clone()) as Arc<dyn ObjectStore>, client.clone(), None, Config::default());
     let origin: Arc<dyn Origin> = endpoint.clone();
-    let pulled = fetcher.pull(&origin, "acme/s3", Some("1.0"), Some("int8"), &Want::default()).await.unwrap();
+    let pulled = fetcher.pull(&origin, "acme/s3", Some("1.0"), Some("model.int8.cozytensors"), &Want::default()).await.unwrap();
     fetcher.settled().await;
     assert_eq!(pulled.header, header);
     assert!(into.checkpoint(&header).unwrap().read("unet", "w").unwrap() == big);

@@ -679,7 +679,8 @@ A repo is a set of **commits** and the **tags** that point at them, as in git:
     `rc`, `.dev`) only when no final version exists; of equal versions (`1.0`, `1.0.0`), the later-created tag; with
     none, the tag `main` unless it is yanked (Hugging Face's default revision);
   - `sha256:<hex>`: the tag commit with that digest; else a variant header with that digest, at the commit that cites
-    it (the default's if it does, else the last-created tag's whose commit does); else not found;
+    it (the default's if it does, else the last-created tag's whose commit does); else the retained commit with that
+    digest, when the reader holds it or the endpoint serves it to that reader; else not found;
   - otherwise the tag of that name, yanked or not (a reader MAY warn); else not found.
 
   The variant is then looked up in that commit's tree. An explicit path or header digest fixes the
@@ -712,47 +713,56 @@ reader, copier or collector to discover a new kind of reference edge.
 
 `conformance/vectors/select.json` and its `select/*.cbor` headers are the shared selection vectors.
 Rust and Hub readers MUST agree. Selection reads headers, never tensor payloads.
-Consumers pass `{gpus: ["major.minor", ...], bits?: 4|8|16}`; no GPUs means CPU, omitted bits means 8.
-A device set supports an encoding only when every device does. Unread capabilities conservatively
-have no encoded GPU formats. BF16 is preferred unless a known GPU is below compute capability 8.0.
+Consumers pass `{gpus: ["major.minor", ...], bits?, prefer?, min_bits?, plain?}` (widths 4, 8 or 16).
+No GPUs means the CPU. `bits` is asked: only that lane answers. Otherwise `prefer` (8 when omitted) is
+the lane ranked first. A slot adds `min_bits`, the narrowest it takes unasked, and `plain`, that it takes
+no encoded weights. The lane order reads what every device runs natively. Unread capabilities have no
+encoded GPU formats. BF16 is preferred unless a known GPU is below compute capability 8.0.
 
 A header's profile is `{family, bits, bytes, kinds}`. A tensor's kind is its encoding scheme or,
 for plain tensors, its dtype. Sum the lengths of all tensor locations (including encoded parts)
-by kind. `bytes` is their total, `kinds` their sorted unique names. The dominant kind has the most
-stored bytes, with lexical kind order breaking ties. Its family and bits are:
+by kind. `bytes` is their total, `kinds` their sorted unique names. Its lane kind is the kind of the
+table below with the fewest bits (an nvfp4 variant that keeps sensitive layers in int8 is 4 bits, however
+many bytes those hold); of equal bits, the most stored bytes, then lexical kind order. Its family and bits:
 
-| Dominant kind | family | bits |
+| Lane kind | family | bits |
 | --- | --- | --- |
 | BF16, F16, F32 | bf16, fp16, f32 respectively | 16 (the unquantized preference) |
 | int8.*, fp8.* | int8, fp8 | 8 |
 | nvfp4, mxfp4, int4.* | nvfp4, mxfp4, int4 | 4 |
-| any other | empty | 0 |
+| none of these | empty | 0 |
 
-Known plain dtypes are readable on any target. Encoded int8 requires capability >=8.0 except 10.3;
-fp8 requires >=8.9; nvfp4, mxfp4 and int4 require >=8.0 (weight-only below native FP4 capability 10.0).
-Only schemes this reader implements are eligible, even when an unknown scheme has a known family prefix.
-Unknown encodings or dtypes remain readable as raw metadata but are skipped by automatic selection.
-Every kind must satisfy these requirements, even a small minority kind in the header.
+Known plain dtypes run on any target. Encoded int8 requires capability >=8.0 except 10.3; fp8 requires
+>=8.9; nvfp4, mxfp4 and int4 require >=8.0 (weight-only below native FP4 capability 10.0). Another scheme
+this reader implements decodes on any GPU; an unknown one runs on none, even with a known family prefix.
+With no GPUs, no GPU requirement applies. A variant named by its path, or a header by its id, is the sole
+candidate: the rule validates it.
 
-At 4 bits the family order is FP4, int8, fp8, BF16, FP16, F32; at 8 bits omit FP4; at 16 bits omit
-all encoded families. Remove GPU-incompatible encoded families; place FP16 before BF16 only for a
-known pre-8.0 GPU. FP4 includes nvfp4, mxfp4 and int4. Within a family prefer native over weight-only,
-then fewer stored bytes, then lexical full path. At 16 bits every kind must be a plain dtype. If none ranks, the sole variant with no precision
-family may serve only when all its kinds are runnable (for example, a plain integer-only header). Otherwise selection is null.
-Fallback reasons use precision families, never variant filenames; the vectors define their text.
+A variant works unless: `bits` is asked and its bits differ, or are 16 and it holds an encoded kind; it
+holds an encoded kind under `plain`; unasked, its bits are nonzero and below `min_bits`; or GPUs are given
+and no one of them runs one of its encoded kinds (every kind counts, even a small minority).
+
+At 4 bits the lane order is FP4, int8, fp8, BF16, FP16, then F32; at 8 bits omit FP4; at 16 bits, or under
+`plain`, omit all encoded families. Remove families not every device runs natively; place FP16 before BF16
+only for a known pre-8.0 GPU. FP4 includes nvfp4, mxfp4 and int4. Of the variants that work, the first in
+that order wins, then native over weight-only, then fewer stored bytes, then lexical full path. A variant
+outside the order serves only when none in it works. When none works, selection is refused, naming each
+variant's path, family and why. Reasons and refusals use families, never filenames; the vectors define
+their text and cover every scheme this reader implements.
 
 The Hub indexes profiles and the repo's ordered tag document transactionally with a repo write.
 It stages rows, performs the object store's conditional PUT inside that transaction, records the
 returned ETag, then commits. A failed PUT rolls back. A read detects a newer repo-file ETag and repairs
 that repository's index, including a process loss after PUT but before COMMIT. Its indexed endpoint
-is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8`; the response has `release`,
-`commit`, `variant`, `header`, `profile` and `reasons`. No fitting variant is HTTP200 with null fields;
-invalid bits is HTTP400. Read permissions and explicit yanked-tag behavior match ordinary resolution.
-The current index covers commits named by repo tags. An untagged retained commit can be readable
-without a selection index entry; HTTP404 from this optional route does not establish that the
-commit is absent. A static origin or older Hub can also omit the route. Clients retain the exact
-immutable commit and the requested constraints and apply the same pure rule to its headers;
-they never substitute a tagged default. Explicit owner deletion and commit retention are unchanged.
+is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8` (and `prefer`, `min_bits`,
+`plain`); the response has `rule`, `release`, `commit`, `variant`, `header`, `profile` and `reasons`. A
+client takes only an answer of its own rule version (3), else reads the headers. A refused selection is
+HTTP200 with null fields and the refusal as its reason; the client applies the rule to the headers itself.
+Invalid bits is HTTP400; a model it has not indexed is HTTP404. Read permissions and explicit yanked-tag
+behavior match ordinary resolution. The current index covers commits named by repo tags; an untagged
+retained commit, a static origin or an older Hub answers HTTP404. Clients then apply the same pure rule to
+the exact commit's headers; they never substitute a tagged default. Explicit owner deletion and commit
+retention are unchanged.
 
 ## 8. Versioning
 

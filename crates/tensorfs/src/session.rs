@@ -118,8 +118,9 @@ impl FromStr for Ref {
 
 #[derive(Clone, Debug)]
 pub struct Open {
-    /// Requested precision, 4/8/16; none selects the default 8-bit preference.
-    pub bits: Option<u32>,
+    /// The precision lane asked, 16, 8 or 4 bits: only it answers (an engine reading only 16-bit
+    /// weights asks 16); none prefers 8 and takes whatever works.
+    pub lane: Option<u32>,
     /// Compute capabilities (e.g. "8.9"); none detects visible devices, empty selects CPU.
     pub gpus: Option<Vec<String>>,
     pub revision: Option<String>,
@@ -133,7 +134,7 @@ pub struct Open {
 impl Default for Open {
     fn default() -> Self {
         Self {
-            bits: None,
+            lane: None,
             gpus: None,
             revision: None,
             variant: None,
@@ -200,7 +201,7 @@ impl Client {
     pub async fn open(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint> {
         let path = Path::new(name_or_path);
         let constraints = crate::precision::Constraints {
-            bits: options.bits,
+            bits: options.lane,
             gpus: match &options.gpus {
                 Some(gpus) => gpus.clone(),
                 None if options.variant.is_some() || path.is_file() => vec![],
@@ -208,30 +209,14 @@ impl Client {
                     .map_err(|e| Failure { kind: Kind::Invalid, detail: format!("query GPUs: {e}") })?
                     .into_iter().map(|g| g.compute_capability.map(|(a,b)| format!("{a}.{b}")).unwrap_or_default()).collect(),
             },
+            ..Default::default()
         };
-        constraints.select(name_or_path, &[])?; // Validate even an explicit variant's options.
-        self.open_using(name_or_path, options, Some(&constraints)).await
-    }
-
-    /// Open the named or sole variant for inspection and data operations, without selecting
-    /// for this computer's execution capabilities. Multiple variants require an explicit name.
-    /// Execution constraints belong to `open`; they must never be silently ignored here.
-    pub async fn open_variant(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint> {
-        if options.bits.is_some() || options.gpus.is_some() {
-            return fail(Kind::Invalid, "use open to select by GPUs or bits; open_variant names stored data");
-        }
-        self.open_using(name_or_path, options, None).await
-    }
-
-    async fn open_using(
-        &self, name_or_path: &str, options: &Open, constraints: Option<&crate::precision::Constraints>,
-    ) -> Result<Checkpoint> {
-        let path = Path::new(name_or_path);
+        constraints.check()?; // Even an explicit variant's.
         let checkpoint = if path.exists() {
             let path = path
                 .canonicalize()
                 .map_err(|e| io_failure(path.display(), e))?;
-            let selected = if let Some(constraints) = constraints.filter(|_| path.is_dir() && options.variant.is_none()) {
+            let selected = if path.is_dir() && options.variant.is_none() {
                 let mut profiles = Vec::new();
                 for name in crate::store::folder_files(&path, "")? {
                     if crate::format::variant_of(&name).is_some() {
@@ -241,9 +226,7 @@ impl Client {
                     }
                 }
                 let candidates: Vec<_> = profiles.iter().map(|(n,p)| (n.as_str(),p)).collect();
-                let Some((at, reasons)) = constraints.select(name_or_path, &candidates)? else {
-                    return fail(Kind::NotFound, "no variant fits the requested GPUs and bits");
-                };
+                let (at, reasons) = constraints.select(name_or_path, &candidates)?;
                 for reason in reasons { tracing::warn!("{reason}"); }
                 Some(profiles[at].0.clone())
             } else { options.variant.clone() };
@@ -277,8 +260,12 @@ impl Client {
             }
             reference.endpoint = options.endpoint.clone();
             let source = self.source(&reference, options.local_files_only)?;
-            source.open(reference, constraints).await?
+            source.open(reference, &constraints).await?
         };
+        // Every open answers to the one rule: a variant named, or a header by its id, is its sole
+        // candidate (spec §7). A GPU-less read takes any; asked bits or GPUs it cannot use refuse.
+        let named = checkpoint.variant().unwrap_or(name_or_path).to_owned();
+        constraints.select(name_or_path, &[(&named, &crate::precision::Profile::of(checkpoint.header()))])?;
         if !options.lazy {
             checkpoint.download(&Download::default()).await?;
         }

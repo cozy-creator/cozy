@@ -392,6 +392,7 @@ impl Runs {
     fn warm_models(
         &self,
         actor: &str,
+        id: &str,
         spec: &Spec,
         observe: &(dyn Fn(&str, u64, u64) + Sync),
         stoppable: &Stoppable,
@@ -468,17 +469,31 @@ impl Runs {
                 let named = crate::published::choose(choice, &choice.parameter)
                     .map_err(|(code, message)| refused(code, message))?;
                 let gpus = self.service.gpu().map(|gpu| gpu.gpus(gpu.width() as u32)).unwrap_or_default();
-                let any = crate::precision::Slot { min_bits: 8, decode: false, encoded: true, raw: false };
-                let constraints = crate::precision::Constraints { gpus: gpus.capabilities.clone(), bits: Some(any.bits(spec.bits, false)) };
+                let constraints = crate::precision::Constraints { gpus: gpus.capabilities.clone(),
+                    bits: (spec.bits != 0).then_some(spec.bits), ..Default::default() };
+                let ruled = named.lane.is_empty() && named.tree.is_none();
                 let stage = format!("downloading {}", choice.repository);
-                let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, Some(&constraints), &spec.catalog_revision, stop, &|done, total| {
+                let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &constraints, &spec.catalog_revision, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let header = named.header().map_err(|(code, message)| refused(code, message))?.clone();
+                let read = publisher.store().read(&header).map_err(|e| e.to_string())
+                    .and_then(|bytes| tensorfs::format::Header::from_cbor(&bytes).map_err(|e| e.to_string()))
+                    .map_err(|e| refused("model_resolution_failed", e))?;
+                let profile = crate::precision::Profile::of(&read);
+                // The rule's reasons for what it took, as a run's (`cozy model download` on a CPU).
+                if ruled {
+                    let model = format!("{}@{}", named.repository, named.release);
+                    for warning in constraints.warnings(&model, &profile) {
+                        if let Err(error) = self.service.engine.append_warning(id, &warning) {
+                            tracing::warn!("run {id}: {warning} ({error})");
+                        }
+                    }
+                }
                 let tree = named.tree.as_ref().map(ObjectRef::id);
                 let row = json!({"parameter": choice.parameter, "repository": named.repository,
-                    "release": named.release, "lane": named.lane, "tree": tree, "checkpoint": header.id(),
-                    "bytes": {"hub": hub, "volume": volume}});
+                    "release": named.release, "lane": named.lane, "precision": profile.family, "tree": tree,
+                    "checkpoint": header.id(), "bytes": {"hub": hub, "volume": volume}});
                 (header, None, row)
             };
             if let Some(name) = destination.strip_prefix("local/") {
@@ -563,7 +578,7 @@ impl Runs {
             return self.warm_set(actor, id, &spec, items, &observe, stoppable);
         }
         if let Source::Models = spec.source {
-            let models = self.warm_models(actor, &spec, &*observe, stoppable)?;
+            let models = self.warm_models(actor, id, &spec, &*observe, stoppable)?;
             return warm_result(json!({}), models);
         }
         // A warm run naming no entrypoint installs its code, then makes its choices present.
@@ -685,7 +700,7 @@ impl Runs {
         }
         if spec.warm {
             let models = match install_only {
-                true => self.warm_models(actor, &spec, &*observe, stoppable)?,
+                true => self.warm_models(actor, id, &spec, &*observe, stoppable)?,
                 false => vec![],
             };
             // A function's warm run ends holding what its constructions read (`downloaded`).

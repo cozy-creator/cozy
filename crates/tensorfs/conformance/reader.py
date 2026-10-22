@@ -5,7 +5,7 @@ Scheme decoders are in schemes/, one module per family.
 
     python reader.py <vectors-dir>     run the conformance vectors (exit 1 on any failure)
 
-As a library: `Store(root).checkpoint("org/name", variant="x")` -> (tree, header),
+As a library: `Store(root).checkpoint("org/name", variant="model.x.cozytensors")` -> (tree, header),
 `read(store, header, component, key)` -> the tensor's logical bytes, `parse_header(bytes)` and
 `encode(projection)`: a header's diagnostic projection (the CBOR tree as JSON, byte strings as
 {"hex": ...}) to its canonical bytes.
@@ -431,11 +431,11 @@ class Store:
             raise invalid(f"object {sha} does not match its ref")
         return data
 
-    def checkpoint(self, name: str, revision: str | None = None, variant: str = ""):
+    def checkpoint(self, name: str, revision: str | None = None, variant: str = "model.cozytensors"):
         repo = parse_repo((self.root / repo_key(name)).read_bytes())
         commit, _ = resolve(repo, revision, lambda c: parse_tree(self.blob(c)))
         tree = parse_tree(self.blob(commit))
-        return tree, parse_header(self.blob(tree["files"][variant_path(variant)]))
+        return tree, parse_header(self.blob(tree["files"][variant]))
 
 
 def gather(store: Store, header: dict, loc: dict) -> bytes:
@@ -466,7 +466,7 @@ def check(vectors: Path) -> int:
         cases = load_cases(path)
         repo = f"Conformance/{family}"
         for lane in dict.fromkeys(ln for ln, _, _ in cases):
-            _, header = store.checkpoint(repo, variant=lane)
+            _, header = store.checkpoint(repo, variant=variant_path(lane))
             for comp, c in header["components"].items():
                 for key in c["tensors"]:
                     case = cases.get((lane, comp, key))
@@ -491,7 +491,7 @@ def check(vectors: Path) -> int:
             if not ok:
                 failures.append(f"{family}:{lane}: header order differs from {path.name}")
     # Core's release 2 is yanked and swaps its variants: only an explicit version reaches it.
-    _, yanked = store.checkpoint("Conformance/core", revision="2", variant="all")
+    _, yanked = store.checkpoint("Conformance/core", revision="2", variant="model.all.cozytensors")
     ok = list(yanked["components"]) == ["spans"]
     passed += ok
     if not ok:

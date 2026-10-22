@@ -144,9 +144,8 @@ pub(super) fn read() -> HostMemory {
     best
 }
 
-/// `/proc/<pid>/status`: `RssAnon` now and `VmHWM` as a conservative upper bound on its peak.
-/// Current file/shared RSS cannot be subtracted from a peak reached at a different time.
-pub(super) fn anon(pid: u32) -> io::Result<super::Anon> {
+/// `/proc/<pid>/status`: `RssAnon`, `RssFile`, `RssShmem` and `VmHWM`.
+pub(super) fn resident(pid: u32) -> io::Result<super::Resident> {
     let text = fs::read_to_string(format!("/proc/{pid}/status"))?;
     let field = |name: &str| {
         text.lines()
@@ -154,8 +153,8 @@ pub(super) fn anon(pid: u32) -> io::Result<super::Anon> {
             .map(|kib| kib * 1024)
             .ok_or_else(|| io::Error::other(format!("no {name} in /proc/{pid}/status")))
     };
-    let (anon, peak) = (field("RssAnon")?, field("VmHWM")?);
-    Ok(super::Anon { now: anon, peak: peak.max(anon) })
+    let (anon, file, shmem) = (field("RssAnon")?, field("RssFile")?, field("RssShmem")?);
+    Ok(super::Resident { anon, file, shmem, peak: field("VmHWM")?.max(anon + file + shmem) })
 }
 
 /// `clear_refs` 5: the resident high-water becomes the process's use now.

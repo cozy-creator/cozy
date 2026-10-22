@@ -100,7 +100,10 @@ pub(crate) async fn search(ctx: &Context, args: Search) -> Result<ExitCode, Erro
 
 #[derive(Serialize)]
 struct Lane {
+    /// The variant, by its path.
     lane: String,
+    /// Its header's precision lane (`int8`, `bf16`, …).
+    precision: Option<String>,
     bytes: i64,
     components: Vec<String>,
     component_bytes: BTreeMap<String, i64>,
@@ -127,7 +130,7 @@ struct Detail {
 
 pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
     let (repo, selected) = match ModelRef::parse(&args.model)? {
-        ModelRef::Hub { repo, release, lane: None } => (repo, release),
+        ModelRef::Hub { repo, release } => (repo, release),
         _ => {
             return Err(Error::new(Kind::Usage, "model_ref_invalid", format!("{:?}: info reads org/name[@release]", args.model)));
         }
@@ -148,6 +151,7 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
                 .iter()
                 .map(|l| Lane {
                     lane: l.lane.clone(),
+                    precision: l.precision.clone().filter(|p| !p.is_empty()),
                     bytes: l.bytes,
                     components: l.components.clone().unwrap_or_default(),
                     component_bytes: l.component_bytes.clone().into_iter().collect(),
@@ -177,9 +181,10 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
         let yanked = if release.yanked { ", yanked" } else { "" };
         let revision = release.revision.map(|r| format!("revision {r}")).unwrap_or_default();
         anstream::println!("\n{repo}@{} ({revision}{yanked})", release.release);
-        let mut table = Table::new(ctx, ["lane", "bytes", "commit"]);
+        let mut table = Table::new(ctx, ["lane", "precision", "bytes", "commit"]);
         for lane in &release.lanes {
-            table = table.row([lane.lane.clone(), output::bytes(lane.bytes as u64), lane.commit.clone()]);
+            let precision = lane.precision.clone().unwrap_or_else(|| "-".into());
+            table = table.row([lane.lane.clone(), precision, output::bytes(lane.bytes as u64), lane.commit.clone()]);
         }
         table.print();
     }

@@ -157,15 +157,7 @@ impl Remote {
             &self.endpoint
         };
         let repo = match endpoint.inner.repo_attempt(&reference.repo_id).await {
-            Ok(Some((repo, _))) => repo,
-            Ok(None) => {
-                // A scoped reader may read a retained hash even when no tag document is
-                // visible. The object endpoint still enforces that reader's authorization.
-                if let Some(root) = self.direct_commit(endpoint, revision).await? {
-                    return Ok(root);
-                }
-                return fail(Kind::NotFound, format!("no repo {}", reference.repo_id));
-            }
+            Ok(repo) => repo,
             Err(error) => {
                 let transport = matches!(&error, fetch::GetError::Exchange(_));
                 let error = from_native(error.refusal());
@@ -179,23 +171,21 @@ impl Remote {
                 return Err(error);
             }
         };
-        match fetch::resolve(&repo, revision, async |commit: &ObjectRef| self.tree(commit).await).await {
-            Ok((tag, variant)) => Ok(Root { object: tag.commit.clone(), tag: Some(tag), variant }),
-            Err(error) if error.kind == Kind::NotFound && revision.is_some_and(|r| r.starts_with("sha256:")) => {
-                // Tags do not enumerate retained history. An explicit immutable commit can
-                // still be readable at this endpoint; never substitute the tagged default.
-                self.direct_commit(endpoint, revision).await?.ok_or(error)
+        let resolved = match repo {
+            Some((repo, _)) => fetch::resolve(&repo, revision, async |commit: &ObjectRef| self.tree(commit).await).await,
+            None => fail(Kind::NotFound, format!("no repo {}", reference.repo_id)),
+        };
+        match (resolved, revision.filter(|r| r.starts_with("sha256:"))) {
+            (Ok((tag, variant)), _) => Ok(Root { object: tag.commit.clone(), tag: Some(tag), variant }),
+            // A retained commit no tag names, as the endpoint serves it to the readers it
+            // authorizes; never the tagged default instead.
+            (Err(error), Some(digest)) if error.kind == Kind::NotFound => {
+                let object = endpoint.inner.object(digest).await.map_err(from_native)?.ok_or(error)?;
+                self.tree(&object).await?;
+                Ok(Root { object, tag: None, variant: None })
             }
-            Err(error) => Err(error),
+            (Err(error), _) => Err(error),
         }
-    }
-
-    /// A readable immutable commit that no visible tag document lists.
-    async fn direct_commit(&self, endpoint: &Endpoint, revision: Option<&str>) -> Result<Option<Root>> {
-        let Some(digest) = revision.filter(|r| r.starts_with("sha256:")) else { return Ok(None) };
-        let Some(object) = endpoint.inner.object(digest).await.map_err(from_native)? else { return Ok(None) };
-        self.tree(&object).await?;
-        Ok(Some(Root { object, tag: None, variant: None }))
     }
 
     /// A bare object by digest: from the store, the offline mirror, or the endpoint.
@@ -234,7 +224,7 @@ impl Remote {
         Ok(())
     }
 
-    pub async fn open(&self, mut reference: Ref, constraints: Option<&crate::precision::Constraints>) -> Result<Checkpoint> {
+    pub async fn open(&self, mut reference: Ref, constraints: &crate::precision::Constraints) -> Result<Checkpoint> {
         let Root { object: root, tag, variant } = self.root(&reference).await?;
         let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
@@ -242,34 +232,23 @@ impl Remote {
         let bytes = self.store.read(&root)?;
         let (tree, header, variant, mut extra) = match Tree::from_json(&bytes) {
             Ok(tree) => {
-                let wanted = fetch::pick_variant(&tree, reference.revision.as_deref(), variant, reference.variant.as_deref())?;
-                let mut held_profiles = true;
-                for (_, header) in tree.variants() { held_profiles &= self.store.reuse(header)?; }
-                let indexed = if let Some(constraints) = constraints.filter(|_| !held_profiles && !self.offline && wanted.is_none() && !reference.repo_id.starts_with("local/") && !reference.repo_id.starts_with("sha256:")) {
-                    self.endpoint.inner.select(&reference.repo_id, &root.id(), constraints).await.map_err(from_native)?
-                } else { None };
-                let selected;
-                let wanted = if let Some(answer) = &indexed {
-                    if answer.commit != root { return fail(Kind::Integrity, "selection names a different commit"); }
-                    let Some(name) = &answer.variant else { return fail(Kind::NotFound, "no variant fits the requested GPUs and bits"); };
-                    if tree.header(name) != answer.header.as_ref() { return fail(Kind::Integrity, "selection header does not belong to its variant"); }
-                    for reason in &answer.reasons { tracing::warn!("{reason}"); }
-                    Some(name.as_str())
-                } else if let Some(constraints) = constraints.filter(|_| wanted.is_none()) {
-                    let headers: Vec<_> = tree.variants().map(|(_,h)| h.clone()).collect();
-                    let _headers_hold = self.store.hold(&headers)?;
-                    self.fetch(&headers, &Download::default()).await?;
-                    let profiles: Vec<_> = tree.variants().map(|(n,h)| {
-                        Ok((n, crate::precision::Profile::of(&Header::from_cbor(&self.store.read(h)?)?)))
-                    }).collect::<Result<_>>()?;
-                    let candidates: Vec<_> = profiles.iter().map(|(n,p)| (*n,p)).collect();
-                    let Some((at,reasons)) = constraints.select(&reference.repo_id, &candidates)? else {
-                        return fail(Kind::NotFound, "no variant fits the requested GPUs and bits");
-                    };
-                    for reason in reasons { tracing::warn!("{reason}"); }
-                    selected = profiles[at].0.to_owned();
-                    Some(selected.as_str())
-                } else { wanted.as_deref() };
+                let named = fetch::pick_variant(&tree, reference.revision.as_deref(), variant, reference.variant.as_deref())?;
+                let selected = match named {
+                    Some(named) => named,
+                    None => {
+                        let repo = &reference.repo_id;
+                        let index = !self.offline && !repo.starts_with("local/") && !repo.starts_with("sha256:");
+                        let origin = index.then_some(&*self.endpoint.inner as &dyn Origin);
+                        let model = tag.as_ref().map_or_else(|| repo.clone(), |tag| format!("{repo}@{}", tag.name));
+                        let headers: Vec<_> = tree.variants().map(|(_, header)| header.clone()).collect();
+                        let _headers_hold = self.store.hold(&headers)?;
+                        let fetch = async |headers: &[ObjectRef]| self.fetch(headers, &Download::default()).await.map(drop);
+                        let selected = fetch::select(origin, &self.store, repo, &model, &root, &tree, constraints, fetch).await?;
+                        for reason in &selected.reasons { tracing::warn!("{reason}"); }
+                        selected.variant
+                    }
+                };
+                let wanted = Some(selected.as_str());
                 let (variant, header) = tree.variant(wanted).map_err(|e| absent(wanted.is_some(), e))?;
                 let extra = tree.repo_files().map(|(_, r)| r.clone()).collect();
                 (
@@ -280,14 +259,7 @@ impl Remote {
                 )
             }
             Err(_) => {
-                let header = Header::from_cbor(&bytes)?;
-                // A header id is its own only variant, validated by the same rule.
-                if let Some(constraints) = constraints {
-                    let profile = crate::precision::Profile::of(&header);
-                    if constraints.select(&reference.repo_id, &[("", &profile)])?.is_none() {
-                        return fail(Kind::NotFound, "no variant fits the requested GPUs and bits");
-                    }
-                }
+                Header::from_cbor(&bytes)?;
                 (None, root.clone(), reference.variant.clone(), Vec::new())
             }
         };

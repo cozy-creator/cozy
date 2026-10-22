@@ -26,7 +26,7 @@ use std::time::Duration;
 pub use endpoint::{commit_onto, upload_tree, upload_tree_with, with_tag, Committed, Endpoint, Fresh, Payload, Stream, UploadControl, Uploaded, MAIN};
 pub use net::Client;
 pub(crate) use net::GetError;
-pub use origin::{choose, pick_variant, resolve, variant_of_tree, Chosen, Location, Origin};
+pub use origin::{choose, pick_variant, resolve, select, variant_of_tree, Chosen, Location, Origin, Selected};
 pub use policy::SourcePolicy;
 pub use token::{bearer, SigV4, TokenProvider};
 pub use volume::VolumeOrigin;
