@@ -966,3 +966,35 @@ fn a_page_with_a_keep_queued_is_renewed_after_its_consumers() {
     unsafe { std::ptr::write_bytes(pin.ptr as *mut u8, 0xcd, pin.len as usize) };
     pin.filled();
 }
+
+/// An OOM's Retry comes once its unmaps are done (the mechanism's, off the lock): the caller
+/// retries its allocation into bytes the device has freed. The mechanism never waits on the
+/// caller's pins.
+#[test]
+fn an_oom_retries_once_its_unmaps_are_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("oomunmap-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 2 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    mem.load(stored(dir.path(), &uuid, "n", 1), Level::Gpu).unwrap();
+    mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
+    mem.settle();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
+    let before = events.unmaps.load(Ordering::SeqCst);
+    events.hold_unmap.store(true, Ordering::SeqCst);
+    let oom = std::thread::spawn({
+        let events = events.clone();
+        move || {
+            let next = r.oom(None, Some(2 * REGION_ALIGN), None, Torch::default());
+            (matches!(next, varena::Next::Retry), events.unmaps.load(Ordering::SeqCst))
+        }
+    });
+    events.unmap_waits.pass();
+    events.unmap_gate.open();
+    let (retry, seen) = oom.join().unwrap();
+    assert!(retry);
+    assert!(seen > before, "the Retry came before the cold page's unmap was done");
+}

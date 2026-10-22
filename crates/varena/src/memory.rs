@@ -434,6 +434,8 @@ struct State {
     failed: HashMap<Key, Error>,
     /// The page a tier copy holds now (pinned, like a consumer).
     saving: Option<Key>,
+    /// The latest unmap's mechanism ticket: whoever counts on its bytes settles up to it.
+    last_unmap: Option<u64>,
     /// Request → the `<package>|<shape>` its peak is recorded under.
     peaks: HashMap<u64, String>,
     /// Requests whose last step is one their plan did not declare.
@@ -1064,7 +1066,7 @@ impl Inner {
         if home.exported && withdraw && self.withdraw(home.identity.clone(), key.1, span).is_some() {
             st.table.pending += span;
         }
-        self.mech.post(Mech::Unmap { va, off, span, phys: home.phys, ready: home.ready }, span);
+        st.last_unmap = Some(self.mech.post(Mech::Unmap { va, off, span, phys: home.phys, ready: home.ready }, span));
         st.table.inflight = self.mech.pending();
         st.sync(key);
         if let Some(s) = st.stats(req) {
@@ -2297,8 +2299,14 @@ impl Inner {
                 Next::Retry
             }
         };
+        let unmapped = st.last_unmap;
         self.publish(&st);
         self.unlock(st);
+        // Its unmaps are done before the caller retries the allocation. The mechanism never
+        // waits on a pin: it unmaps only unpinned pages (a renewal waits on device events).
+        if let Some(t) = unmapped {
+            self.mech.settle_to(t + 1);
+        }
         Ok(next)
     }
 
@@ -2371,12 +2379,16 @@ impl Inner {
                 }
             }
             wanted.settle = st.table.pending > 0;
+            let unmapped = st.last_unmap.filter(|_| freed > 0);
             self.publish(&st);
             self.unlock(st);
-            // Its own unmaps first (the mechanism's): the asker then finds the bytes free. Kept
-            // pages' bytes are marked pending (custody's handle holds them): the reply does not
-            // wait on custody; the trim thread settles it and publishes them free.
-            self.mech.settle();
+            // Its own unmaps first (the mechanism's, up to its last): the asker then finds the
+            // bytes free. Kept pages' bytes are marked pending (custody's handle holds them):
+            // the reply does not wait on custody; the trim thread settles it and publishes them
+            // free.
+            if let Some(t) = unmapped {
+                self.mech.settle_to(t + 1);
+            }
             if wanted.trim || wanted.settle || !wanted.shrinks.is_empty() {
                 let (lock, want) = &*self.wanted;
                 let mut w = lock.lock();
