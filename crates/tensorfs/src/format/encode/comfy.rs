@@ -18,6 +18,12 @@ pub const ASYM_W4A8_INT8: Encoder = Encoder {
     pack: None,
 };
 
+pub const W4A8_CONVROT: Encoder = Encoder {
+    scheme: "w4a8.convrot",
+    quantize: Some(|i| quantize_with(i, &Kitchen::default())),
+    pack: None,
+};
+
 pub const W6A8_INT8: Encoder = Encoder {
     scheme: "comfy.w6a8_int8",
     quantize: Some(|i| quantize_with(i, &Kitchen::default())),
@@ -33,6 +39,9 @@ pub const INT4_CONVROT: Encoder = Encoder {
 impl Encoding {
     pub fn comfy_asym_w4a8_int8(group_size: u64, rotation_size: u64) -> Encoding {
         encoding("comfy.asym_w4a8_int8", &grouped_params(group_size, rotation_size))
+    }
+    pub fn w4a8_convrot(rotation_size: u64) -> Encoding {
+        encoding("w4a8.convrot", &grouped_params(16, rotation_size))
     }
     pub fn comfy_w6a8_int8(group_size: u64, rotation_size: u64) -> Encoding {
         encoding("comfy.w6a8_int8", &grouped_params(group_size, rotation_size))
@@ -93,7 +102,7 @@ pub fn quantize_with(input: &Input, options: &Kitchen) -> Result<Vec<OwnedPart>>
     let fail = |d: String| Error::Encode(format!("{scheme}: {d}"));
     if !matches!(
         scheme,
-        "comfy.asym_w4a8_int8" | "comfy.w6a8_int8" | "int4.convrot"
+        "comfy.asym_w4a8_int8" | "w4a8.convrot" | "comfy.w6a8_int8" | "int4.convrot"
     ) {
         return Err(Error::UnknownScheme(scheme.into()));
     }
@@ -175,6 +184,9 @@ pub fn quantize_with(input: &Input, options: &Kitchen) -> Result<Vec<OwnedPart>>
             }
             if bits == 6 && !options.symmetric {
                 return Err(fail("W6A8 has no asymmetric correction option".into()));
+            }
+            if scheme == "w4a8.convrot" && (!options.symmetric || options.f32_scales) {
+                return Err(fail("its group scales are E4M3 with no correction".into()));
             }
             Some((g, bits))
         }

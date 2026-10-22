@@ -114,10 +114,10 @@ fn every_encoded_green_vector_prepares_a_kernel_without_host_fallback() {
     let digest = format!("{:x}", corpus.finalize());
     assert_eq!(
         digest,
-        "9f5807cafb15a9c4793c8139425e7e183b1fb6ee4668922598d130adcb70660f"
+        "bc1579bcfcc195ab5fc9d89fa14a9a5f5ae771373b86cff370bd1e6854ed6cad"
     );
-    assert_eq!(checked, 230);
-    assert_eq!(schemes.len(), 44);
+    assert_eq!(checked, 234);
+    assert_eq!(schemes.len(), 45);
     println!("kernel routing: {checked} full + {checked} odd-byte windows, {} schemes, 0 host fallbacks; corpus {digest}", schemes.len());
 }
 

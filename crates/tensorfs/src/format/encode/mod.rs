@@ -86,6 +86,7 @@ pub static ENCODERS: &[&Encoder] = &[
 
     // comfy.*
     &comfy::ASYM_W4A8_INT8,
+    &comfy::W4A8_CONVROT,
     &comfy::W6A8_INT8,
     &comfy::INT4_CONVROT,
 ];

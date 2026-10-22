@@ -643,6 +643,13 @@ The codebook is kitchen's 16 levels (a frozen Lloyd-Max table, or one fitted to 
 uniform. `correction` is kitchen's asymmetric grid's per-group offset in the rotated basis, which the rotation
 carries back with the block.
 
+### `w4a8.convrot`
+
+`comfy.asym_w4a8_int8` under Cozy's own name, at one profile: the w4a8 lane's scheme (§7). Its parts and decode are
+that scheme's, with `group_size` 16, `group_scale` `F8_E4M3` and no `correction`; the `codebook` stays optional.
+A reader that does not know the name refuses it on a GPU, so it never serves the file as another lane.
+- Params: `group_size: 16`; `rotation: "kron_regular_h4"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
+
 ### Plain tensors
 
 A plain tensor's bytes are its value; reading it is a copy, whatever its dtype.
@@ -723,16 +730,19 @@ A header's profile is `{family, bits, bytes, kinds}`. A tensor's kind is its enc
 for plain tensors, its dtype. Sum the lengths of all tensor locations (including encoded parts)
 by kind. `bytes` is their total, `kinds` their sorted unique names. Its lane kind is the kind of the
 table below with the fewest bits (an nvfp4 variant that keeps sensitive layers in int8 is 4 bits, however
-many bytes those hold); of equal bits, the most stored bytes, then lexical kind order. Its family and bits:
+many bytes those hold); of equal bits, the most stored bytes, then lexical kind order. A header holding an
+encoded kind the table does not name has no lane kind: its width is not the rule's to guess, so a newer
+family is never read as its narrower or plain extras. Its family and bits:
 
 | Lane kind | family | bits |
 | --- | --- | --- |
 | BF16, F16, F32 | bf16, fp16, f32 respectively | 16 (the unquantized preference) |
 | int8.*, fp8.* | int8, fp8 | 8 |
 | nvfp4, mxfp4, int4.* | nvfp4, mxfp4, int4 | 4 |
+| w4a8.convrot | w4a8 | 4 |
 | none of these | empty | 0 |
 
-Known plain dtypes run on any target. Encoded int8 requires capability >=8.0 except 10.3; fp8 requires
+Known plain dtypes run on any target. Encoded int8 and w4a8 require capability >=8.0 except 10.3; fp8 requires
 >=8.9; nvfp4, mxfp4 and int4 require >=8.0 (weight-only below native FP4 capability 10.0). Another scheme
 this reader implements decodes on any GPU; an unknown one runs on none, even with a known family prefix.
 With no GPUs, no GPU requirement applies. A variant named by its path, or a header by its id, is the sole
@@ -742,10 +752,12 @@ A variant works unless: `bits` is asked and its bits differ, or are 16 and it ho
 holds an encoded kind under `plain`; unasked, its bits are nonzero and below `min_bits`; or GPUs are given
 and no one of them runs one of its encoded kinds (every kind counts, even a small minority).
 
-At 4 bits the lane order is FP4, int8, fp8, BF16, FP16, then F32; at 8 bits omit FP4; at 16 bits, or under
+At 4 bits the lane order is FP4 then w4a8 where every device runs FP4 natively or 4 is preferred unasked
+(a decode slot's, whose kernel is weight-only), else w4a8 then FP4; then int8, fp8, BF16, FP16 and F32. At 8 bits omit FP4 and w4a8; at 16 bits, or under
 `plain`, omit all encoded families. Remove families not every device runs natively; place FP16 before BF16
 only for a known pre-8.0 GPU. FP4 includes nvfp4, mxfp4 and int4. Of the variants that work, the first in
-that order wins, then native over weight-only, then fewer stored bytes, then lexical full path. A variant
+that order wins, then none narrower than the width ranked first, then native over weight-only, then fewer stored
+bytes, then lexical full path. A variant
 outside the order serves only when none in it works. When none works, selection is refused, naming each
 variant's path, family and why. Reasons and refusals use families, never filenames; the vectors define
 their text and cover every scheme this reader implements.
@@ -754,9 +766,12 @@ The Hub indexes profiles and the repo's ordered tag document transactionally wit
 It stages rows, performs the object store's conditional PUT inside that transaction, records the
 returned ETag, then commits. A failed PUT rolls back. A read detects a newer repo-file ETag and repairs
 that repository's index, including a process loss after PUT but before COMMIT. Its indexed endpoint
-is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8` (and `prefer`, `min_bits`,
+is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8&rule=4` (and `prefer`, `min_bits`,
 `plain`); the response has `rule`, `release`, `commit`, `variant`, `header`, `profile` and `reasons`. A
-client takes only an answer of its own rule version (3), else reads the headers. A refused selection is
+client takes only an answer of its own rule version (4), else reads the headers. A reader that names no
+`rule` is of rule 3: the Hub answers it as rule 3, choosing by its own rule among the variants whose every
+kind such a reader implements (none holding `w4a8.convrot`), since that reader would take a scheme it
+does not know on a CPU and fail to decode it. A refused selection is
 HTTP200 with null fields and the refusal as its reason; the client applies the rule to the headers itself.
 Invalid bits is HTTP400; a model it has not indexed is HTTP404. Read permissions and explicit yanked-tag
 behavior match ordinary resolution. The current index covers commits named by repo tags; an untagged

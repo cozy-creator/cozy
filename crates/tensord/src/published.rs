@@ -1266,7 +1266,6 @@ impl Publisher {
             let tolerances = precision::Slot::of(slot);
             // The asked lane is the main model's; every other slot takes the no-flag rule.
             let asked = if Some(slot) == main { request.bits } else { 0 };
-            let bits = tolerances.bits(asked);
             let ruled = named.lane.is_empty() && named.tree.is_none();
             let constraints = tolerances.constraints(&gpus, asked);
             let named = self.resolve(service, request.hub(&format!("the model for {path}"))?, named, &constraints, &request.catalog_revision)?;
@@ -1275,7 +1274,8 @@ impl Publisher {
                 let remote = origin::remote(&self.machine, request.hub("selected header")?).map_err(|e| refused("model_resolution_failed",e))?;
                 self.machine.objects(&remote, std::slice::from_ref(named.header()?), priority::NOW, &Stop::default()).map_err(|e| refused("model_resolution_failed",e))?;
                 let header = tensorfs::format::Header::from_cbor(&self.store.read(named.header()?).map_err(|e| ("model_resolution_failed",e.to_string()))?).map_err(|e| ("model_resolution_failed",e.to_string()))?;
-                tolerances.warnings(bits, &gpus, &model, &precision::Profile::of(&header).family)
+                // Raw weights are data and ask no lane; else the rule's own reasons, as it selected.
+                if tolerances.raw { vec![] } else { constraints.warnings(&model, &precision::Profile::of(&header)) }
             } else { vec![] };
             let grant = ModelGrant {
                 package: installation.package.clone(),
