@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use parking_lot::Mutex;
 
 pub(crate) use platform::handles::Owned;
-pub(crate) use platform::memory::{allocated, await_event, euid, held, lock, own, punch, resize, share, size, stalled, unlock, Endpoint, Listener, Map, Notifier, Stream};
+pub(crate) use platform::memory::{euid, held, lock, own, resize, share, size, stalled, unlock, Endpoint, Listener, Map, Notifier, Stream};
 
 use crate::{Error, Result};
 
@@ -19,8 +19,8 @@ pub(crate) type Message = (Vec<u8>, Option<Owned>);
 
 static NAMESPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Tests only: a process-wide prefix for every table and service name (custody, the tier, the
-/// wake, the asks), so a test's never meet a machine's. Set once, before any open; false when
+/// Tests only: a process-wide prefix for every table and service name (custody, the wake, the
+/// asks), so a test's never meet a machine's. Set once, before any open; false when
 /// another prefix was set first.
 pub fn namespace(prefix: &str) -> bool {
     NAMESPACE.get_or_init(|| prefix.to_string()) == prefix
@@ -71,11 +71,6 @@ pub(crate) fn map(f: &Owned, len: usize, write: bool) -> Result<Map> {
     Ok(platform::memory::map(f, 0, len, write)?)
 }
 
-/// `len` bytes of `f` from `offset`, a multiple of the mapping granularity.
-pub(crate) fn map_at(f: &Owned, offset: u64, len: usize, write: bool) -> Result<Map> {
-    Ok(platform::memory::map(f, offset, len, write)?)
-}
-
 /// A new description of the same file (read-only unless `write`): its locks are its own.
 pub(crate) fn reopen(f: &Owned, write: bool) -> Result<Owned> {
     Ok(platform::memory::reopen(f, write)?)
@@ -83,20 +78,6 @@ pub(crate) fn reopen(f: &Owned, write: bool) -> Result<Owned> {
 
 pub(crate) fn linked(f: &Owned) -> Result<bool> {
     Ok(platform::memory::linked(f)?)
-}
-
-/// A local event: (the waiting end, the signalling end).
-pub(crate) fn event() -> Result<(Owned, Owned)> {
-    Ok(platform::memory::event()?)
-}
-
-pub(crate) fn signal(writer: &Owned) {
-    platform::memory::signal(writer);
-}
-
-/// A RAM-tier layout's file (Linux's; elsewhere the tier is absent).
-pub(crate) fn tier_file(name: &str) -> Result<Owned> {
-    Ok(platform::memory::tier_file(name)?)
 }
 
 /// Binds the GPU's wake in user `ns`'s namespace; `None` while another process holds it.
@@ -155,11 +136,6 @@ pub(crate) fn peer(stream: &Stream) -> Result<u32> {
         return Err(Error::Invalid(format!("a peer of uid {uid} is not accepted")));
     }
     Ok(pid)
-}
-
-/// Ends both directions of a stream (its peer reads its end).
-pub(crate) fn close(stream: &Stream) {
-    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 pub(crate) fn dup(h: &Owned) -> Result<Owned> {

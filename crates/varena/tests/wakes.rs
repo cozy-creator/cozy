@@ -58,7 +58,6 @@ impl Backend for Hooked {
     fn export(&self, page: &Physical) -> Result<Owned> { self.host.export(page) }
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> { self.host.import(handle, len) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.host.target(va, offset, len) }
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> { self.host.save(va, offset, host, after) }
     fn fence(&self) -> Result<Event> { self.host.fence() }
     fn record(&self, _: usize) -> Result<Event> {
         Ok(if self.pending.load(Ordering::SeqCst) { Event(1000 + self.next.fetch_add(1, Ordering::SeqCst)) } else { Event::DONE })
@@ -79,11 +78,8 @@ impl Backend for Hooked {
     fn wait(&self, _: Event, _: usize) -> Result<()> { Ok(()) }
     fn synchronize(&self, stream: usize) -> Result<()> { self.host.synchronize(stream) }
     fn finish(&self, _: Event) -> Result<()> { Ok(()) }
-    fn register_host(&self, ptr: u64, len: u64) -> Result<()> { self.host.register_host(ptr, len) }
-    fn unregister_host(&self, ptr: u64) -> Result<()> { self.host.unregister_host(ptr) }
     fn retire(&self, _: Event) {}
     fn drain(&self) -> Result<()> { self.host.drain() }
-    fn drain_save(&self) -> Result<()> { self.host.drain_save() }
 }
 
 
@@ -140,7 +136,6 @@ fn a_pin_dropped_before_the_binder_waits_wakes_it() {
     binder.join().unwrap();
     drop(mem);
     varena::os::remove_table(&uuid);
-    varena::tier::remove_claims();
     assert!(first.is_ok(), "the binder slept through the pin drop's wake ({second:?} after an unrelated one)");
 }
 

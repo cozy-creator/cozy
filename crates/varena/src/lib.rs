@@ -3,8 +3,8 @@
 //! [`table`] holds one process's facts and [`decide`] is the one pure decision procedure over
 //! them; [`Memory`] applies its actions in an executor over a [`Backend`] ([`CudaBackend`], or
 //! host pages). [`Ledger`] is the GPU's shared table, run by TensorD or opened by name by a
-//! standalone engine; [`custody`] keeps filled pages across a process's death; [`Tier`] is the
-//! machine's RAM tier. TensorFS's `io` moves every byte.
+//! standalone engine; [`custody`] keeps filled pages across a process's death. Host RAM is the OS
+//! page cache: TensorFS's `io` moves every byte, through its staging.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 pub mod backend;
@@ -19,14 +19,12 @@ pub mod memory;
 pub mod os;
 mod outbox;
 pub mod table;
-pub mod tier;
 
 pub use backend::{Access, Backend, Event, HostBackend, Physical, Va};
 pub use cuda::CudaBackend;
 pub use ledger::{Grant, HostCall, Ledger, Peak, PhysicalChange, RowStatus, Status};
-pub use memory::{CacheId, Claim, Fills, HoldId, MakeRoom, Memory, Moved, Origin, Pass, Pin, Ref, Request, Retained, SetId, Stats, StepStats, Unregisters, Yielded};
+pub use memory::{CacheId, Claim, Fills, HoldId, MakeRoom, Memory, Moved, Origin, Pass, Pin, Ref, Request, Retained, SetId, Stats, StepStats, Yielded};
 pub use table::{Fill, Fingerprint, Level, PartId, Plan, SetSpec, Step};
-pub use tier::{Need, Tier};
 
 use thiserror::Error;
 

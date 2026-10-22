@@ -109,23 +109,6 @@ fn flock(start: usize, len: usize, region: Region) -> libc::flock {
     }
 }
 
-/// Frees `[off, off+span)`'s pages; the file keeps its size.
-pub fn punch(fd: BorrowedFd<'_>, off: u64, span: u64) -> Result<()> {
-    // SAFETY: punching a hole in a memfd the caller holds.
-    let rc = unsafe {
-        libc::fallocate(
-            fd.as_raw_fd(),
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            off as libc::off_t,
-            span as libc::off_t,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
 /// A new open file description of the file behind `fd`: a dup would share `fd`'s, and with it
 /// its locks.
 pub fn reopen(fd: BorrowedFd<'_>, write: bool) -> Result<OwnedFd> {
