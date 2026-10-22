@@ -1205,6 +1205,55 @@ fn a_class_version_is_its_configs_else_the_models_else_the_references() {
     assert_eq!(other("", "X"), ClassRef::default(), "no library is the unknown class");
 }
 
+/// A construction config is a component's, never a repo file (tfs-132). A Diffusers modular
+/// pipeline (Anima) has no `model_index.json`: its `modular_model_index.json`, which stays a repo
+/// file, names the component folders, so its scheduler and tokenizer are config-only
+/// components. Without any index, a root config beside other components (SeedVR2's) is the root
+/// component's. No network.
+#[test]
+fn config_only_folders_and_a_root_config_are_components() {
+    let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+    let entry = |library: &str, class: &str, folder: &str| {
+        serde_json::json!([library, class, {"pretrained_model_name_or_path": "acme/anima", "subfolder": folder}])
+    };
+    let files = BTreeMap::from([
+        ("modular_model_index.json".to_owned(), json(serde_json::json!({
+            "_class_name": "AnimaModularPipeline", "_diffusers_version": "0.39.0",
+            "scheduler": entry("diffusers", "FlowMatchEulerDiscreteScheduler", "scheduler"),
+            "tokenizer": entry("transformers", "Qwen2Tokenizer", "tokenizer"),
+            "transformer": entry("diffusers", "CosmosTransformer3DModel", "transformer"),
+            "absent": entry("diffusers", "Unused", "absent")}))),
+        ("scheduler/scheduler_config.json".to_owned(), json(serde_json::json!({
+            "_class_name": "FlowMatchEulerDiscreteScheduler", "_diffusers_version": "0.39.0", "shift": 3.0}))),
+        ("tokenizer/tokenizer_config.json".to_owned(), json(serde_json::json!({"tokenizer_class": "Qwen2Tokenizer"}))),
+        ("tokenizer/tokenizer.json".to_owned(), b"{}".to_vec()),
+        ("transformer/config.json".to_owned(), json(serde_json::json!({"_class_name": "CosmosTransformer3DModel"}))),
+        ("README.md".to_owned(), b"# Anima\n".to_vec()),
+    ]);
+    let layout = import::layout(files, &["transformer".to_owned()], &Default::default()).unwrap();
+    assert!(layout.pipeline.is_none());
+    let names: Vec<&str> = layout.components.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["transformer", "scheduler", "tokenizer"], "an absent folder is no component");
+    let (scheduler, tokenizer) = (&layout.components[1], &layout.components[2]);
+    assert_eq!(scheduler.class, ClassRef::new("diffusers", "0.39.0", "FlowMatchEulerDiscreteScheduler"));
+    assert_eq!(scheduler.config_file.as_deref(), Some("scheduler_config.json"));
+    assert_eq!(scheduler.config["shift"], serde_json::json!(3.0));
+    assert_eq!(tokenizer.class, ClassRef::new("transformers", "", "Qwen2Tokenizer"));
+    assert_eq!(tokenizer.assets.keys().collect::<Vec<_>>(), ["tokenizer.json"]);
+    assert_eq!(layout.files.keys().collect::<Vec<_>>(), ["README.md", "modular_model_index.json"]);
+
+    let files = BTreeMap::from([
+        ("config.json".to_owned(), json(serde_json::json!({"architecture": "SeedVR2-7B"}))),
+        ("README.md".to_owned(), b"# SeedVR2\n".to_vec()),
+    ]);
+    let layout = import::layout(files, &["dit".to_owned(), "vae".to_owned()], &Default::default()).unwrap();
+    let names: Vec<&str> = layout.components.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["dit", "vae", "model"]);
+    assert_eq!(layout.components[2].config["architecture"], serde_json::json!("SeedVR2-7B"));
+    assert!(layout.components[2].class.is_unknown());
+    assert_eq!(layout.files.keys().collect::<Vec<_>>(), ["README.md"]);
+}
+
 /// network: Hugging Face (configs only, no weights). The same on the full-size repos.
 #[test]
 fn full_size_pipelines_take_model_index_classes() {

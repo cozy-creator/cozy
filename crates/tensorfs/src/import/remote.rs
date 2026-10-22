@@ -772,7 +772,7 @@ struct ModularSpec {
 }
 
 /// The component folders a Diffusers index names.
-fn index_folders(doc: &[u8]) -> Result<Vec<String>> {
+pub(crate) fn index_folders(doc: &[u8]) -> Result<Vec<String>> {
     let doc: BTreeMap<String, serde_json::Value> =
         serde_json::from_slice(doc).map_err(|e| Refusal {
             code: Code::MALFORMED_JSON,

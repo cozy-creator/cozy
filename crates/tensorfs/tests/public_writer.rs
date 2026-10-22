@@ -1088,6 +1088,82 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
     assert_eq!(child.asset("tokenizer.json").unwrap(), ASSET);
 }
 
+/// tfs-132: a Diffusers modular pipeline (Anima) converts with its config-only folders as
+/// components of the header, so every variant of the published release gives its scheduler's
+/// config to whoever builds the model's mapping; only the index and docs stay repo files.
+#[tokio::test(flavor = "current_thread")]
+async fn a_published_modular_pipeline_gives_every_variant_its_scheduler() {
+    let scratch = Scratch::new();
+    let source = scratch.0.join("anima");
+    let entry = |library: &str, class: &str, folder: &str| {
+        serde_json::json!([library, class, {"pretrained_model_name_or_path": "acme/anima", "subfolder": folder}])
+    };
+    let index = serde_json::json!({"_class_name": "AnimaModularPipeline", "_diffusers_version": "0.39.0",
+        "scheduler": entry("diffusers", "FlowMatchEulerDiscreteScheduler", "scheduler"),
+        "tokenizer": entry("transformers", "Qwen2Tokenizer", "tokenizer"),
+        "transformer": entry("diffusers", "TinyModel", "transformer")});
+    let scheduler = serde_json::json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "_diffusers_version": "0.39.0", "shift": 3.0});
+    for (path, bytes) in [
+        ("modular_model_index.json", serde_json::to_vec(&index).unwrap()),
+        ("scheduler/scheduler_config.json", serde_json::to_vec(&scheduler).unwrap()),
+        ("tokenizer/tokenizer_config.json", br#"{"tokenizer_class":"Qwen2Tokenizer"}"#.to_vec()),
+        ("tokenizer/tokenizer.json", ASSET.to_vec()),
+        ("transformer/config.json", br#"{"_class_name":"TinyModel"}"#.to_vec()),
+        ("transformer/diffusion_pytorch_model.safetensors", source_safetensors()),
+        ("README.md", README.to_vec()),
+    ] {
+        fs::create_dir_all(source.join(path).parent().unwrap()).unwrap();
+        fs::write(source.join(path), bytes).unwrap();
+    }
+    let endpoint = scratch.0.join("endpoint");
+    let publisher = client(&scratch.0.join("cache"), &endpoint);
+    let converted = publisher
+        .convert_to_cozytensors(&[source.to_str().unwrap().into()], &tensorfs::Convert::default())
+        .await
+        .unwrap();
+    let portable = scratch.0.join("portable");
+    converted.materialize(&portable, Format::Cozytensors, false).await.unwrap();
+    publisher.upload_folder(&"acme/anima@1".parse().unwrap(), &portable, &[], None).await.unwrap();
+    let remote = tensorfs::Endpoint::new(endpoint.to_str().unwrap(), None).unwrap();
+    remote
+        .update_repo("acme/anima", |old| {
+            let mut repo = old.unwrap();
+            repo.tag_mut("1").unwrap().public = true;
+            Ok(Some(repo))
+        })
+        .await
+        .unwrap();
+    // A second variant, written on the first as a quantizer writes its lane.
+    let released = Open { revision: Some("1".into()), ..Open::default() };
+    let base = publisher.open("acme/anima", &released).await.unwrap();
+    let options = WriterOptions { base: Some(&base), repo_id: Some("acme/anima"), revision: Some("1"),
+        variant: Some("lanes/q.cozytensors"), ..WriterOptions::default() };
+    let mut lane = publisher.writer(options).unwrap();
+    (lane.component_writer("transformer").unwrap())
+        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(b"qqqq"))
+        .unwrap();
+    lane.commit().await.unwrap();
+
+    let cache = scratch.0.join("consumer");
+    let consumer = client(&cache, &endpoint);
+    let mut variants = Vec::new();
+    for variant in [base.variant().unwrap().to_owned(), "lanes/q.cozytensors".to_owned()] {
+        let opened = consumer.open("acme/anima", &Open { variant: Some(variant.clone()), lazy: false, ..Open::default() }).await.unwrap();
+        let mapping: BTreeMap<&str, &tensorfs::format::Config> = (opened.components().iter())
+            .filter(|c| !c.config().is_empty())
+            .map(|c| (c.name(), c.config()))
+            .collect();
+        assert_eq!(mapping.keys().copied().collect::<Vec<_>>(), ["scheduler", "tokenizer", "transformer"], "{variant}");
+        assert_eq!(serde_json::Value::Object(mapping["scheduler"].clone()), scheduler, "{variant}");
+        assert_eq!(opened.component("tokenizer").unwrap().asset("tokenizer.json").unwrap(), ASSET);
+        let tree = tensorfs::format::Tree::from_json(&fs::read(cache.join(opened.tree().unwrap().key())).unwrap()).unwrap();
+        let files: Vec<&String> = tree.files.keys().filter(|p| !p.ends_with(".cozytensors")).collect();
+        assert_eq!(files, ["README.md", "modular_model_index.json"], "{variant}");
+        variants.push(opened.id().clone());
+    }
+    assert_ne!(variants[0], variants[1]);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn public_convert_result_callback_can_refuse_the_final_stage_and_returns_after_worker_drain()
 {

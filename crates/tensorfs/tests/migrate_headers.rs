@@ -455,3 +455,92 @@ fn a_release_that_is_no_version_stays_public() {
     assert_eq!((tag.name.as_str(), tag.public, tag.yanked), ("1.0.0-audit.1", true, true));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// tfs-132: a D10 tree whose repo files hold config-only components, as A11 left Anima's
+/// (`modular_model_index.json` was no index then) and SeedVR2's root config, is relaid: every
+/// variant's header takes them, with its own components, chunks and tensors as they were, and
+/// the tree keeps only its other repo files. The tag keeps its name and flags; again, nothing
+/// changes.
+#[test]
+fn a_tree_holding_config_only_components_as_repo_files_is_relaid() {
+    use tensorfs::format::{Body, ClassRef, Component, Dtype, Location, Tag, Tensor};
+    let dir = scratch("relayout");
+    let header = |weight: &[u8], names: &[&str]| {
+        let components = names.iter().map(|name| Component {
+            name: name.to_string(),
+            class: ClassRef::new("test", "1.0", "Tiny"),
+            config: if *name == "transformer" { serde_json::from_str(r#"{"width":4}"#).unwrap() } else { Config::new() },
+            tensors: vec![Tensor { key: "w".into(), dtype: Dtype::U8, shape: vec![4], body: Body::Data(Location { chunk: 0, offset: 0, length: 4 }) }],
+            ..Component::default()
+        });
+        Header::new(vec![ObjectRef::of(weight)], None, components.collect(), Default::default()).unwrap()
+    };
+    let json = |v: Json| serde_json::to_vec(&v).unwrap();
+    let anima = [
+        ("modular_model_index.json", json(json!({"_class_name": "AnimaModularPipeline",
+            "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler", {"subfolder": "scheduler"}],
+            "tokenizer": ["transformers", "Qwen2Tokenizer", {"subfolder": "tokenizer"}],
+            "transformer": ["diffusers", "Tiny", {"subfolder": "transformer"}]}))),
+        ("scheduler/scheduler_config.json", json(json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "_diffusers_version": "0.39.0", "shift": 3.0}))),
+        ("tokenizer/tokenizer_config.json", json(json!({"tokenizer_class": "Qwen2Tokenizer"}))),
+        ("tokenizer/tokenizer.json", b"{}".to_vec()),
+        ("README.md", b"# Anima\n".to_vec()),
+    ];
+    let seedvr2 = [("config.json", json(json!({"architecture": "SeedVR2-7B"}))), ("README.md", b"# SeedVR2\n".to_vec())];
+    // (model, its tensored components, its repo files, the components added, the repo files kept)
+    type Case<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, Vec<u8>)], &'a [&'a str], &'a [&'a str]);
+    let cases: [Case; 2] = [
+        ("acme/anima", &["transformer"], &anima, &["scheduler", "tokenizer"], &["README.md", "modular_model_index.json"]),
+        ("acme/seedvr2", &["dit", "vae"], &seedvr2, &["model"], &["README.md"]),
+    ];
+    for (name, tensored, files, added, kept) in cases {
+        let mut tree = Tree::default();
+        let olds: Vec<Header> = [b"aaaa", b"qqqq"].iter().map(|w| header(*w, tensored)).collect();
+        for (path, h) in ["model.bf16.cozytensors", "lanes/q.cozytensors"].iter().zip(&olds) {
+            tree.files.insert(path.to_string(), put(&dir, &h.to_cbor().unwrap()));
+        }
+        for (path, bytes) in files {
+            tree.files.insert(path.to_string(), put(&dir, bytes));
+        }
+        let commit = put(&dir, &tree.to_json().unwrap());
+        let mut repo = Repo::new(name);
+        repo.tags.push(Tag { name: "1.0.0".into(), commit: commit.clone(), public: true, yanked: true });
+        let mut migrator = Migrator::new(Access::from_env(), TABLE);
+        let read = |o: &ObjectRef| Ok(std::fs::read(dir.join(o.key()))?);
+        let migrated = migrator.repo(&repo.to_json().unwrap(), &read).unwrap();
+        let tag = &migrated.repo.tags[0];
+        assert_eq!((tag.name.as_str(), tag.public, tag.yanked), ("1.0.0", true, true), "{name}");
+        assert_ne!(tag.commit, commit, "{name}");
+        let object = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
+        let relaid = Tree::from_json(&object(&tag.commit)).unwrap();
+        let repo_files: Vec<&String> = relaid.files.keys().filter(|p| !p.ends_with(".cozytensors")).collect();
+        assert_eq!(repo_files, kept, "{name}");
+        for (path, old) in ["model.bf16.cozytensors", "lanes/q.cozytensors"].iter().zip(&olds) {
+            let new = Header::from_cbor(&object(relaid.header(path).unwrap())).unwrap();
+            assert_eq!(new.components()[..tensored.len()], *old.components(), "{name} {path}");
+            assert_eq!((&new.chunks, &new.metadata), (&old.chunks, &old.metadata), "{name} {path}");
+            let names: Vec<&str> = new.components()[tensored.len()..].iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, added, "{name} {path}");
+        }
+        if name == "acme/anima" {
+            let h = Header::from_cbor(&object(relaid.header("model.bf16.cozytensors").unwrap())).unwrap();
+            let scheduler = &h.components()[1];
+            assert_eq!((scheduler.config["shift"].clone(), scheduler.config_file.as_deref()), (json!(3.0), Some("scheduler_config.json")));
+            assert_eq!(scheduler.class, ClassRef::new("diffusers", "0.39.0", "FlowMatchEulerDiscreteScheduler"));
+            assert_eq!(h.components()[2].assets["tokenizer.json"], ObjectRef::of(b"{}"));
+        } else {
+            let h = Header::from_cbor(&object(relaid.header("lanes/q.cozytensors").unwrap())).unwrap();
+            assert_eq!(h.components()[2].config["architecture"], json!("SeedVR2-7B"));
+        }
+        assert!(migrated.report["relaid"][0]["moved"].is_object(), "{}", migrated.report);
+        // Again: the relaid tree is what layout makes, so nothing changes.
+        for (o, bytes) in &migrated.objects {
+            std::fs::create_dir_all(dir.join(o.key()).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(o.key()), bytes).unwrap();
+        }
+        let again = Migrator::new(Access::from_env(), TABLE).repo(&migrated.repo.to_json().unwrap(), &read).unwrap();
+        assert_eq!(again.repo.tags[0].commit, tag.commit, "{name}");
+        assert!(again.report.get("relaid").is_none(), "{name}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
