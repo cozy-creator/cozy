@@ -150,8 +150,8 @@ def own_interval(text: str, startup: float) -> float:
     return max([startup] + [(b - a) / 1000 for a, b in zip(ms, ms[1:])])
 
 
-def pieces(line: str) -> list[str]:
-    return [line[at:at + PIECE] for at in range(0, max(len(line), 1), PIECE)]
+def pieces(line: str, size: int = PIECE) -> list[str]:
+    return [line[at:at + size] for at in range(0, max(len(line), 1), size)]
 
 
 def tail(text: str, lines: int) -> list[str]:
@@ -172,7 +172,8 @@ def run_case(program: Path, case: str, log: Path, interval: float | None, monito
         nonlocal told
         figures = [l for l in text.splitlines() if "TIMINGS " in l]
         for line in figures[told:]:
-            for piece in pieces(line[line.index("TIMINGS "):]):
+            # Each piece and the case's name before it within the run log's 200 characters.
+            for piece in pieces(line[line.index("TIMINGS "):], PIECE - len(case[:40]) - 2):
                 say(piece)
         told = len(figures)
 

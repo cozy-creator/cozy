@@ -1479,6 +1479,56 @@ fn watch<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, budget: std::time:
     }
 }
 
+/// The cost of an evicting bind, alone, for an A/B of cores on one card. It uses the forward case's setup: a card
+/// crowded to ROOM and full of an idle kept set, and a request over four sets. Its three pass starts and its 64 binds
+/// (each needing an idle page's room) are timed apart, each window with its backend and driver calls and the request's
+/// evictions.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn evicting_binds_on_a_full_card_are_timed_apart_from_their_pass_starts() {
+    let (b, g, uuid) = card("evict");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    // 64 pages: 128 MiB of binds, as the forward case.
+    let pages = 64;
+    let a = mem.load(set("a", 4, Fill::Stored, &g.uuid, |b| block(20, b)), Level::Ram).unwrap();
+    step!();
+    let (b1, b2) = (mem.load(bulk("b1", pages, &g.uuid), Level::Ram).unwrap(), mem.load(bulk("b2", pages, &g.uuid), Level::Ram).unwrap());
+    step!();
+    mem.load(set("c", 1, Fill::Stored, &g.uuid, |b| block(21, b)), Level::Ram).unwrap();
+    step!();
+    let _crowd = crowd();
+    mem.load(bulk("idle", more_than_free(), &g.uuid), Level::Gpu).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["a", "b1", "b2", "c"]])).unwrap();
+    step!();
+    let (_, _) = (timings.take(), CALLS.take());
+    let t = std::time::Instant::now();
+    let passes: Vec<Pass> = [a, b1, b2].iter().map(|s| r.pass(*s, "main", "1", Torch::default()).unwrap()).collect();
+    let starts = t.elapsed();
+    step!();
+    let (start_backend, start_driver, start_evicted) = (timings.take(), CALLS.take(), r.stats().evicted);
+    step!();
+    let t = std::time::Instant::now();
+    let pins: Vec<Pin> = (0..pages).map(|b| mem.bind(b1, b, 0).unwrap()).collect();
+    drop(pins);
+    let binds = t.elapsed();
+    step!();
+    let (bind_backend, bind_driver, evicted) = (timings.take(), CALLS.take(), r.stats().evicted);
+    step!();
+    println!("TIMINGS AB pass starts {starts:?}, evicted by then {start_evicted:?} | backend {start_backend} | driver {start_driver}");
+    println!("TIMINGS AB {pages} binds {binds:?}, {:?} each, evicted by then {evicted:?} | backend {bind_backend} | driver {bind_driver}", binds / pages);
+    step!();
+    drop(passes);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS evicting binds timed apart from their pass starts ({:?} each) {uuid}", binds / pages);
+    step!();
+}
+
 /// While a forward runs on the card (a kernel on a stream that reads a set's pages), the bind and
 /// pass paths run on the host: binds that evict idle pages, releases, a pass start, the torch cap,
 /// an unload, and the backend's own calls (free, process bytes, events). None may wait for the
