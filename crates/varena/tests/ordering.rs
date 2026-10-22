@@ -1333,6 +1333,7 @@ fn failed_save_child() {
 
 /// A previous unload can still be waiting for custody when an independent bind starts.
 /// Preparation waits outside the state lock; allocator recovery refuses without waiting.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_earlier_withdrawal_stays_charged_until_custody_replies() {
     let dir = tempfile::tempdir().unwrap();
