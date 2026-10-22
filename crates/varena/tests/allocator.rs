@@ -54,12 +54,21 @@ fn peer(role: &str, namespace: &str) -> Peer {
     child
 }
 
-/// Its claim file goes when the test does, passed or failed.
-struct Claims;
+/// Its table goes when the test does, passed or failed. The cases share one table and one namespace:
+/// they run one at a time (a process opens a device once).
+struct Serial(#[allow(dead_code)] parking_lot::MutexGuard<'static, ()>);
 
-impl Drop for Claims {
+static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+impl Serial {
+    fn new() -> Serial {
+        Serial(SERIAL.lock())
+    }
+}
+
+impl Drop for Serial {
     fn drop(&mut self) {
-        varena::tier::remove_claims();
+        varena::os::remove_table(&gpu().uuid);
     }
 }
 
@@ -87,7 +96,7 @@ fn callback_peer() {
 fn the_hooks_free_read_does_not_wait_for_a_peer_heap_lock() {
     let namespace = format!("allocator-test-{}-", std::process::id());
     assert!(varena::os::namespace(&namespace));
-    let _claims = Claims;
+    let _serial = Serial::new();
     let memory = Arc::new(Memory::open(gpu(), None, Box::new(HostBackend::new(gpu().memory))).unwrap());
     let dir = tempfile::tempdir().unwrap();
     let set = memory.load(cold_page(dir.path()), Level::Gpu).unwrap();
@@ -116,8 +125,6 @@ fn the_hooks_free_read_does_not_wait_for_a_peer_heap_lock() {
     drop(request);
 }
 
-// Append to crates/varena/tests/allocator.rs (it uses that file's gpu, cold_page, peer and Claims).
-
 /// Reviewer (step 1): the hook's make_room, not only its free read, while a stopped peer holds
 /// the ledger's heap lock. make_room refreshes the rows under that lock: the allocation waits
 /// for the peer.
@@ -125,7 +132,7 @@ fn the_hooks_free_read_does_not_wait_for_a_peer_heap_lock() {
 fn step1_the_hooks_make_room_waits_for_a_peer_heap_lock() {
     let namespace = format!("allocator-test-{}-", std::process::id());
     assert!(varena::os::namespace(&namespace));
-    let _claims = Claims;
+    let _serial = Serial::new();
     let memory = Arc::new(Memory::open(gpu(), None, Box::new(HostBackend::new(gpu().memory))).unwrap());
     let dir = tempfile::tempdir().unwrap();
     let set = memory.load(cold_page(dir.path()), Level::Gpu).unwrap();

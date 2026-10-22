@@ -123,7 +123,6 @@ impl Backend for Driver {
     fn export(&self, page: &Physical) -> Result<Owned> { self.0.host.export(page) }
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> { self.0.host.import(handle, len) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.0.host.target(va, offset, len) }
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> { self.0.host.save(va, offset, host, after) }
     fn fence(&self) -> Result<Event> { self.0.host.fence() }
     fn record(&self, _: usize) -> Result<Event> {
         Ok(if self.0.pending.load(Ordering::SeqCst) { Event(self.0.next.fetch_add(1, Ordering::SeqCst)) } else { Event::DONE })
@@ -140,11 +139,8 @@ impl Backend for Driver {
         }
         Ok(())
     }
-    fn register_host(&self, ptr: u64, len: u64) -> Result<()> { self.0.host.register_host(ptr, len) }
-    fn unregister_host(&self, ptr: u64) -> Result<()> { self.0.host.unregister_host(ptr) }
     fn retire(&self, _: Event) {}
     fn drain(&self) -> Result<()> { Ok(()) }
-    fn drain_save(&self) -> Result<()> { Ok(()) }
 }
 
 fn open(tag: &str, pages: u64) -> (tempfile::TempDir, String, Arc<Card>, Arc<Memory>) {
