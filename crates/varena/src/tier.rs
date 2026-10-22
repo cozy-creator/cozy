@@ -33,6 +33,39 @@ pub enum Pressure {
 
 const NAME: &str = "tier";
 
+/// What the host must keep free for the calls running on it: their measured host growth still
+/// to come (each one's recorded high-water less its process's anonymous bytes now). `None`: a
+/// running call is unmeasured, and the tier fills nothing beside it. TensorD sums its GPUs'
+/// ([`crate::Ledger::host_need`]); an executor serving the tier itself, its own GPU's.
+pub type Need = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// The live host budget: what this process can still allocate before its tightest limit.
+fn budget() -> u64 {
+    u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0)
+}
+
+/// The tier's one admission: a fill of `bytes` goes only into measured surplus, the live budget
+/// less what the running calls must keep free. Layouts nobody maps make room first, then those
+/// executors map (asked back), in [`host_decide`] order. Never beside an unmeasured call.
+fn admit(state: &Shared, need: &Need, bytes: u64) -> bool {
+    let Some(keep) = need() else { return false };
+    let want = keep.saturating_add(bytes);
+    let room = budget();
+    let gave = if room >= want { 0 } else { relieve(state, HostTrigger::Room { bytes: want, headroom: room }) };
+    room + gave >= want
+}
+
+/// A pressure event only says "look": rungs go back while the budget is below what the running
+/// calls must keep free (all of it while one is unmeasured), so benign reclaim at a limit gives
+/// nothing back.
+fn answer(state: &Shared, need: &Need) {
+    while budget() < need().unwrap_or(u64::MAX) {
+        if relieve(state, HostTrigger::Pressure) == 0 {
+            return;
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 enum Call {
     /// Regions as (offset, span) in the layout; `ask` names the opener's ask socket.
@@ -45,6 +78,8 @@ enum Call {
     Close { digest: String },
     /// Make `bytes` of host headroom before a fill, giving back in order.
     Room { bytes: u64 },
+    /// Every layout's resident bytes, together.
+    Resident,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,6 +88,7 @@ enum Reply {
     /// The layout's data starts at this offset of the file handed with the reply.
     Opened { data: u64 },
     Room { ok: bool },
+    Resident { bytes: u64 },
 }
 
 struct Layout {
@@ -310,9 +346,10 @@ impl Drop for Tier {
 }
 
 impl Tier {
-    /// Binds the machine's tier name and serves it; `None` when another participant does.
-    pub fn serve(pressure: Pressure) -> Result<Option<Tier>> {
-        let Some(tier) = Tier::bind()? else { return Ok(None) };
+    /// Binds the machine's tier name and serves it, admitting fills against `need`; `None` when
+    /// another participant does.
+    pub fn serve(pressure: Pressure, need: Need) -> Result<Option<Tier>> {
+        let Some(tier) = Tier::bind(need.clone())? else { return Ok(None) };
         if matches!(pressure, Pressure::Headroom) {
             return Ok(Some(tier));
         }
@@ -328,13 +365,13 @@ impl Tier {
                 if woke.is_err() || stop.load(Acquire) {
                     return;
                 }
-                relieve(&state, HostTrigger::Pressure);
+                answer(&state, &need);
             })
             .map_err(|e| Error::io("spawn pressure", e))?;
         Ok(Some(tier))
     }
 
-    fn bind() -> Result<Option<Tier>> {
+    fn bind(need: Need) -> Result<Option<Tier>> {
         let Some(listener) = os::listen(os::euid(), NAME)? else { return Ok(None) };
         let short = os::event()?;
         let signal = os::dup(&short)?;
@@ -348,8 +385,8 @@ impl Tier {
                     if halt.load(Acquire) {
                         return;
                     }
-                    let s = s.clone();
-                    let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s));
+                    let (s, need) = (s.clone(), need.clone());
+                    let _ = std::thread::Builder::new().name("varena-tier-conn".into()).spawn(move || serve(stream, &s, &need));
                 }
             })
             .map_err(|e| Error::io("spawn tier", e))?;
@@ -422,7 +459,7 @@ impl Tier {
     }
 }
 
-fn serve(stream: Stream, state: &Shared) {
+fn serve(stream: Stream, state: &Shared, need: &Need) {
     // Only this user's processes: an abstract name has no permissions of its own.
     if os::peer(&stream).is_err() {
         return;
@@ -484,13 +521,13 @@ fn serve(stream: Stream, state: &Shared) {
             }
             Call::Room { bytes } => {
                 drop(s);
-                let headroom = u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0);
                 // Never waits: what nobody maps goes now; what executors map is asked back.
-                let gave = if headroom >= bytes { 0 } else { relieve(state, HostTrigger::Room { bytes, headroom }) };
+                let ok = admit(state, need, bytes);
                 cv.notify_all();
                 s = lock.lock();
-                (Reply::Room { ok: headroom + gave >= bytes }, None)
+                (Reply::Room { ok }, None)
             }
+            Call::Resident => (Reply::Resident { bytes: s.layouts.values().map(|l| os::allocated(&l.fd)).sum() }, None),
         };
         drop(s);
         if os::encode(&reply).and_then(|b| os::send(&stream, &(b, out))).is_err() {
@@ -727,15 +764,18 @@ pub(crate) struct Client {
     /// Connections made: a new one may be a new tier (its server restarted), which knows none
     /// of this user's layouts, so its user hands them over again.
     holder: AtomicU64,
+    /// What a tier served here admits fills against.
+    need: Need,
 }
 
 impl Client {
     /// Connects to the tier in user `ns`'s namespace (the table owner's), serving it from this
     /// process (with the host's pressure trigger when it arms) when nobody does and it is this
     /// user's; another user's tier is its TensorD's, never ours.
-    pub fn open(ns: u32) -> Result<Client> {
-        let (stream, service) = connect(ns)?;
-        Ok(Client { stream: Mutex::new(stream), ns, service: Mutex::new(service), holder: AtomicU64::new(1) })
+    /// Serving it here, the tier admits fills against `need`.
+    pub fn open(ns: u32, need: Need) -> Result<Client> {
+        let (stream, service) = connect(ns, &need)?;
+        Ok(Client { stream: Mutex::new(stream), ns, service: Mutex::new(service), holder: AtomicU64::new(1), need })
     }
 
     /// Which connection this is (it changes when the tier may have).
@@ -760,7 +800,7 @@ impl Client {
         if let Ok(reply) = os::call(&self.stream.lock(), call, handle) {
             return Ok(reply);
         }
-        let (stream, service) = connect(self.ns)?;
+        let (stream, service) = connect(self.ns, &self.need)?;
         if let Some(service) = service {
             *self.service.lock() = Some(service);
         }
@@ -794,11 +834,20 @@ impl Client {
         let Ok(Some(stream)) = os::connect(self.ns, NAME) else { return false };
         matches!(os::call::<_, Reply>(&stream, &Call::Room { bytes }, None), Ok((Reply::Room { ok: true }, _)))
     }
+
+    /// Every layout's resident bytes in the tier, together (0 when it cannot be asked).
+    pub fn resident(&self) -> u64 {
+        let Ok(Some(stream)) = os::connect(self.ns, NAME) else { return 0 };
+        match os::call::<_, Reply>(&stream, &Call::Resident, None) {
+            Ok((Reply::Resident { bytes }, _)) => bytes,
+            _ => 0,
+        }
+    }
 }
 
 /// Connects to the tier in user `ns`'s namespace, serving it from this process when nobody does
 /// and it is this user's (returned with the stream).
-fn connect(ns: u32) -> Result<(Stream, Option<Tier>)> {
+fn connect(ns: u32, need: &Need) -> Result<(Stream, Option<Tier>)> {
     let mut service = None;
     loop {
         if let Some(stream) = os::connect(ns, NAME)? {
@@ -809,8 +858,8 @@ fn connect(ns: u32) -> Result<(Stream, Option<Tier>)> {
         }
         let mode = platform::contain::host_pressure::HostMode::Shared;
         service = match platform::contain::host_pressure::Pressure::arm(mode) {
-            Ok(p) => Tier::serve(Pressure::Host(p))?,
-            Err(_) => Tier::serve(Pressure::Headroom)?,
+            Ok(p) => Tier::serve(Pressure::Host(p), need.clone())?,
+            Err(_) => Tier::serve(Pressure::Headroom, need.clone())?,
         };
     }
 }
