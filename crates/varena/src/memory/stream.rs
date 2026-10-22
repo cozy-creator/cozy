@@ -1,9 +1,11 @@
 //! Step 2's watermark (audit §4). Once `make_room` has to take the running set's own pages, that set streams its upper
 //! blocks (those at or above its watermark) through [`SLOTS`] physical pages. Each slot moves to its next block's own
-//! VA in turn, so a graph captured against a block's VA stays valid. Weights then never cause an OOM: the floor is the
-//! activations plus the slots. The watermark resets when its request ends.
+//! VA in turn, so a graph captured against a block's VA stays valid. Short of room for [`SLOTS`], a set streams through
+//! as many as fit, down to one: weights never cause an OOM, and the floor is the activations and one block. The
+//! watermark resets when its request ends.
 
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::MutexGuard;
@@ -34,6 +36,12 @@ pub(super) struct Streamed {
     pub(super) taking: u64,
 }
 
+impl Streamed {
+    fn covers(&self, want: u64) -> bool {
+        self.unmapped + self.taking + self.pending >= want
+    }
+}
+
 /// What [`Inner::stream_in`] did for a bind.
 pub(super) enum StreamIn {
     /// A slot moves to the block: it has a page now, filling.
@@ -59,59 +67,76 @@ impl State {
     fn last_use(&self, key: Key) -> u64 {
         self.table.page(key).map_or(0, |p| p.last_use)
     }
+
+    /// The set's pages at or above `watermark`, most recently used first.
+    fn upper(&self, set: u32, watermark: u32) -> Vec<Key> {
+        let mut upper: Vec<Key> = self.homes.keys().filter(|k| k.0 == set && k.1 >= watermark).copied().collect();
+        upper.sort_by_key(|k| Reverse(self.last_use(*k)));
+        upper
+    }
 }
 
 impl Inner {
     /// `make_room`'s rung before the running set's own pages. It lowers `set`'s watermark until the upper pages free
-    /// `want` (unmapped now; for the hook, `takes` it unmaps in place on its own thread; or once their pending release
-    /// events complete: `events`, waited on by the caller with no lock held), or until the whole set streams. It keeps the [`SLOTS`] most recently used upper pages that are
-    /// not custody's as slots, since a slot's memory is overwritten next. The hook (`hook`) never takes a kept page:
-    /// it makes no custody call.
+    /// `want`, or until the whole set streams. It keeps the [`SLOTS`] most recently used upper pages that are not
+    /// custody's as slots, since a slot's memory is overwritten next. With the whole set streaming and still short, the
+    /// slots go too, least recently used first, down to one: the floor. Each page is taken once ([`Inner::give`]).
     pub(super) fn stream(&self, st: &mut State, set: u32, want: u64, req: Option<u64>, hook: bool) -> Result<Streamed> {
         let blocks = st.mech(set)?.spec.layout.regions.len() as u32;
         let mut watermark = st.streams.get(&set).map_or(blocks, |s| s.watermark);
-        let mut taken = Streamed::default();
-        loop {
-            let mut upper: Vec<Key> = st.homes.keys().filter(|k| k.0 == set && k.1 >= watermark).copied().collect();
-            upper.sort_by_key(|k| Reverse(st.last_use(*k)));
+        let (mut taken, mut seen) = (Streamed::default(), HashSet::new());
+        let slots = loop {
+            let upper = st.upper(set, watermark);
             let slots: Vec<Key> = upper.iter().filter(|k| st.slot(**k, watermark)).take(SLOTS).copied().collect();
             for key in upper.into_iter().filter(|k| !slots.contains(k)) {
-                if taken.unmapped + taken.taking + taken.pending >= want {
+                if taken.covers(want) {
                     break;
                 }
-                let Some(page) = st.table.page(key) else { continue };
-                // A page in use stays until its release; the hook leaves custody's pages alone.
-                let busy = !page.pins.is_empty() || st.homes.get(&key).is_some_and(|h| h.filling || h.landing || h.transforming || h.protecting);
-                if busy || (hook && page.kept) {
-                    continue;
-                }
-                let (releasing, span) = (page.releasing.clone(), page.bytes);
-                if !releasing.is_empty() {
-                    // Taken in a later round, once its consumers are done.
-                    taken.events.extend(releasing);
-                    taken.pending += span;
-                    continue;
-                }
-                if hook {
-                    taken.takes.push(key);
-                    taken.taking += span;
-                } else {
-                    self.unmap(st, key, Class::W, req, true)?;
-                    taken.unmapped += span;
+                if seen.insert(key) {
+                    self.give(st, key, req, hook, &mut taken)?;
                 }
             }
-            if taken.unmapped + taken.taking + taken.pending >= want || watermark == 0 {
-                break;
+            if taken.covers(want) || watermark == 0 {
+                break slots;
             }
             watermark -= 1;
+        };
+        for key in slots.into_iter().skip(1).rev() {
+            if taken.covers(want) {
+                break;
+            }
+            self.give(st, key, req, hook, &mut taken)?;
         }
         st.streams.insert(set, Streaming { watermark, req });
         Ok(taken)
     }
 
+    /// `key` toward `taken`: unmapped now; for the hook, taken in place on its own thread (`takes`); or once its pending
+    /// release events complete (`events`, waited on by the caller with no lock held). A page in use stays until its
+    /// release; the hook leaves custody's pages alone (it makes no custody call).
+    fn give(&self, st: &mut State, key: Key, req: Option<u64>, hook: bool, taken: &mut Streamed) -> Result<()> {
+        let Some(page) = st.table.page(key) else { return Ok(()) };
+        let busy = !page.pins.is_empty() || st.homes.get(&key).is_some_and(|h| h.filling || h.landing || h.transforming || h.protecting);
+        if busy || (hook && page.kept) {
+            return Ok(());
+        }
+        let (releasing, span) = (page.releasing.clone(), page.bytes);
+        if !releasing.is_empty() {
+            taken.events.extend(releasing);
+            taken.pending += span;
+        } else if hook {
+            taken.takes.push(key);
+            taken.taking += span;
+        } else {
+            self.unmap(st, key, Class::W, req, true)?;
+            taken.unmapped += span;
+        }
+        Ok(())
+    }
+
     /// A streamed set's upper block with no page: the least recently used movable slot of its set moves to it, after
     /// the consumers of the block it backed. It falls back to the usual path while the set has fewer than [`SLOTS`]
-    /// slots, or when this thread itself pins every one of them (waiting would wait on itself).
+    /// slots and a new page fits, or when this thread itself pins every one of them (waiting would wait on itself).
     pub(super) fn stream_in(&self, st: &mut MutexGuard<'_, State>, key: Key, req: Option<u64>) -> Result<StreamIn> {
         let Some(watermark) = st.streams.get(&key.0).map(|s| s.watermark) else { return Ok(StreamIn::No) };
         if key.1 < watermark || st.homes.contains_key(&key) {
@@ -119,7 +144,10 @@ impl Inner {
         }
         let slots: Vec<Key> = st.homes.keys().filter(|k| k.0 == key.0 && st.slot(**k, watermark)).copied().collect();
         if slots.len() < SLOTS {
-            return Ok(StreamIn::No);
+            let free = st.table.free().min(self.backend.free().unwrap_or(u64::MAX));
+            if slots.is_empty() || st.table.page(key).is_some_and(|p| p.bytes <= free) {
+                return Ok(StreamIn::No);
+            }
         }
         let Some(from) = slots.iter().filter(|k| st.movable(**k)).min_by_key(|k| st.last_use(**k)).copied() else {
             let me = std::thread::current().id();
