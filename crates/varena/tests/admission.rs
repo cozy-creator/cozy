@@ -64,7 +64,7 @@ fn admission_child() {
     let mut control = unsafe { UnixStream::from_raw_fd(3) };
     control.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
     let armed = Arc::new(AtomicBool::new(false));
-    let memory = Memory::open(gpu(), Some(8 * M), Box::new(Gated {
+    let memory = Memory::open(gpu(), None, Box::new(Gated {
         host: HostBackend::new(gpu().memory), armed: armed.clone(), control: Mutex::new(control.try_clone().unwrap()),
     })).unwrap();
     control.write_all(b"R").unwrap();
