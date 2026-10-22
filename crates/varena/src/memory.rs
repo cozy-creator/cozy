@@ -378,6 +378,7 @@ impl Drop for Owner {
     fn drop(&mut self) {
         let Some(inner) = self.0.take() else { return };
         if inner.public_owners.fetch_sub(1, Ordering::AcqRel) != 1 { return; }
+        inner._device.retiring(inner.ownership_lost.load(Ordering::Acquire));
         static RETIRER: OnceLock<std::sync::mpsc::Sender<Arc<Inner>>> = OnceLock::new();
         let sender = RETIRER.get_or_init(|| {
             let (tx, rx) = std::sync::mpsc::channel::<Arc<Inner>>();
@@ -395,6 +396,7 @@ impl Drop for Owner {
                             Ok(Ok(false)) => waiting.push(inner),
                             Ok(Err(_)) | Err(_) => {
                                 inner.ownership_lost.store(true, Ordering::Release);
+                                inner._device.retiring(true);
                                 inner.landed.notify_all();
                                 std::mem::forget(inner);
                             }
@@ -405,7 +407,10 @@ impl Drop for Owner {
             });
             tx
         });
-        if let Err(failed) = sender.send(inner) { std::mem::forget(failed.0); }
+        if let Err(failed) = sender.send(inner) {
+            failed.0._device.retiring(true);
+            std::mem::forget(failed.0);
+        }
     }
 }
 
@@ -841,7 +846,6 @@ struct Inner {
     backend: Box<dyn Backend>,
     shared: Arc<Shared>,
     row: Arc<Row>,
-    _device: Device,
     /// Signalled by every change of the table while this process waits for room.
     room_wake: ledger::RoomWake,
     custody: Option<Arc<custody::Client>>,
@@ -871,6 +875,7 @@ struct Inner {
     native_resident: AtomicU64,
     #[cfg(unix)]
     tally: tensorfs::io::source::IoTally,
+    _device: Device,
 }
 
 fn exhausted(need: u64, site: Option<&str>, stats: Stats) -> Box<Exhausted> {
@@ -3018,23 +3023,46 @@ impl Inner {
 }
 
 /// This process's open devices: one Memory each.
-static OPEN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+#[derive(Clone, Copy)]
+enum DeviceState { Active, Retiring, Quarantined }
+static OPEN: Mutex<BTreeMap<String, DeviceState>> = Mutex::new(BTreeMap::new());
+static CLOSED: Condvar = Condvar::new();
 
-/// A device this process has open, given back when its Memory goes.
+/// A device this process has open, given back only after its prior owner has retired.
 struct Device(String);
 
 impl Device {
     fn open(uuid: &str) -> Result<Device> {
-        if !OPEN.lock().insert(uuid.to_string()) {
-            return Err(Error::Invalid(format!("{uuid} is already open in this process")));
+        let mut open = OPEN.lock();
+        loop {
+            match open.get(uuid) {
+                Some(DeviceState::Active) => return Err(Error::Invalid(format!("{uuid} is already open in this process"))),
+                Some(DeviceState::Quarantined) => return Err(Error::Ownership(format!("{uuid} has quarantined device ownership; retire this executor"))),
+                // Opening is preparation, outside Python/allocator locks. Existing public
+                // owners still refuse immediately; only their completed handoff is awaited.
+                Some(DeviceState::Retiring) => CLOSED.wait(&mut open),
+                None => break,
+            }
         }
+        open.insert(uuid.to_string(), DeviceState::Active);
         Ok(Device(uuid.to_string()))
+    }
+
+    fn retiring(&self, quarantined: bool) {
+        let mut open = OPEN.lock();
+        if let Some(state) = open.get_mut(&self.0) {
+            if quarantined { *state = DeviceState::Quarantined; }
+            else if !matches!(state, DeviceState::Quarantined) { *state = DeviceState::Retiring; }
+        }
+        drop(open);
+        CLOSED.notify_all();
     }
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
         OPEN.lock().remove(&self.0);
+        CLOSED.notify_all();
     }
 }
 
@@ -3574,6 +3602,7 @@ impl Inner {
             st.retired.insert(((u32::MAX, u32::MAX), id), Retirement { bytes, created: true, mechanism: None, custody: None, kept: true });
         }
         self.ownership_lost.store(true, Ordering::Release);
+        self._device.retiring(true);
         self.publish(st);
         self.landed.notify_all();
         std::mem::forget(self.clone());
