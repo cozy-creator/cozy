@@ -4293,7 +4293,7 @@ mod tests {
         let gpu = varena::GpuId { uuid: uuid.into(), model: "host".into(), memory: bytes.parse().unwrap() };
         // SAFETY: the test installs its control socket at this process's stdin.
         let control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
-        let grant = varena::Grant { table: platform::handles::recv_fd(&control).unwrap(), row: platform::handles::recv_fd(&control).unwrap() };
+        let grant = varena::Grant { table: platform::handles::recv_fd(&control).unwrap(), row: platform::handles::recv_fd(&control).unwrap(), limit: None };
         let memory = varena::Memory::open(gpu.clone(), Some(grant), Box::new(varena::HostBackend::new(gpu.memory))).unwrap();
         let parts: usize = parts.parse().unwrap();
         let set = memory.load(stall_set(&gpu, name, parts), varena::Level::Gpu).unwrap();
