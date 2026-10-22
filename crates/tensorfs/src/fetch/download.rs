@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify, Semaphore};
 
 use super::ask;
-use super::net::{same_origin, Client, GetError};
+use super::net::{same_origin, Answer, Client, GetError};
 use super::origin::{HttpLocation, Location, Origin};
 use super::token::TokenProvider;
 use super::volume::{blocking, VolumeOrigin, Wrote, STEP};
@@ -68,6 +68,8 @@ const VOLUME_READS: usize = 8;
 const WRITE_BACKS: usize = 2;
 /// Ticks per pace window, and the gain that earns a doubling.
 const PACE_TICKS: u32 = 8;
+/// Bytes of an error answer's body a refusal keeps.
+const SAID: usize = 512;
 const PACE_GAIN: f64 = 1.2;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -225,6 +227,24 @@ struct Measured {
     rates: VecDeque<f64>,
     /// The longest one volume step took.
     file_step: Duration,
+}
+
+/// The start of an error answer's body, its whitespace collapsed: what the origin said. Stops
+/// at `SAID` bytes, the body's end or the flight's drop.
+async fn said(answer: &mut Answer, flight: &Flight) -> String {
+    let mut body = Vec::new();
+    while body.len() < SAID {
+        let frame = tokio::select! {
+            frame = answer.frame() => frame,
+            () = flight.aborted() => break,
+        };
+        match frame {
+            Ok(Some(data)) => body.extend_from_slice(&data),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    body.truncate(SAID);
+    String::from_utf8_lossy(&body).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn push(samples: &mut VecDeque<f64>, value: f64) {
@@ -899,15 +919,18 @@ impl Shared {
         delivery: &mut Option<Delivery>,
     ) -> Attempt {
         let object = &task.object;
+        // Nothing left to ask (an answer whose last bytes came but whose end did not): a range
+        // past the end is refused (R2: 400 for `bytes=N-(N-1)`), so what is here is committed.
+        if sink.reached == object.length {
+            return Attempt::Done;
+        }
         let flying = self.fly(task, false, doublings);
         let flight = &flying.flight;
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         let mut headers = headers.to_vec();
-        if sink.reached > 0 {
-            headers.push((
-                "range".into(),
-                format!("bytes={}-{}", sink.reached, object.length - 1),
-            ));
+        let range = (sink.reached > 0).then(|| format!("bytes={}-{}", sink.reached, object.length - 1));
+        if let Some(range) = &range {
+            headers.push(("range".into(), range.clone()));
         }
         let answer = tokio::select! {
             answer = self.client.get_authorized(url, &headers, provider) => answer,
@@ -960,44 +983,22 @@ impl Shared {
                     });
                 }
             }
-            401 | 403 | 404 | 410 if delivered => {
-                *delivery = None;
-                return Attempt::Again {
-                    why: what(),
-                    wait: None,
-                    dropped: false,
+            status => {
+                // The answer's body says why (S3 and R2: `<Error><Code>…`), with the range asked.
+                let wait = answer.stated_wait();
+                let said = said(&mut answer, flight).await;
+                let why = format!("{}; range {}; said {said:?}", what(), range.as_deref().unwrap_or("none"));
+                return match status {
+                    401 | 403 | 404 | 410 if delivered => {
+                        *delivery = None;
+                        Attempt::Again { why, wait: None, dropped: false }
+                    }
+                    401 | 403 => Attempt::Refused(Refusal { code: Code::CREDENTIAL_REQUIRED, detail: why }),
+                    404 | 410 => Attempt::Fatal(Refusal { code: Code::REF_NOT_FOUND, detail: why }),
+                    416 => Attempt::Fatal(Refusal { code: Code::LENGTH_MISMATCH, detail: why }),
+                    status if ask::weather(status) => Attempt::Again { why, wait, dropped: false },
+                    _ => Attempt::Fatal(Refusal { code: Code::HUB_REFUSED, detail: why }),
                 };
-            }
-            401 | 403 => {
-                return Attempt::Refused(Refusal {
-                    code: Code::CREDENTIAL_REQUIRED,
-                    detail: what(),
-                })
-            }
-            404 | 410 => {
-                return Attempt::Fatal(Refusal {
-                    code: Code::REF_NOT_FOUND,
-                    detail: what(),
-                })
-            }
-            416 => {
-                return Attempt::Fatal(Refusal {
-                    code: Code::LENGTH_MISMATCH,
-                    detail: what(),
-                })
-            }
-            status if ask::weather(status) => {
-                return Attempt::Again {
-                    why: what(),
-                    wait: answer.stated_wait(),
-                    dropped: false,
-                }
-            }
-            _ => {
-                return Attempt::Fatal(Refusal {
-                    code: Code::HUB_REFUSED,
-                    detail: what(),
-                })
             }
         }
         loop {
