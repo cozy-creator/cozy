@@ -547,3 +547,38 @@ fn remote_returning_bytes_are_reachable_but_not_free() {
     assert_eq!(t.reachable(), 0);
     assert_eq!(decide(&t, &trigger), vec![Action::Exhausted { need: 4 * MB }]);
 }
+
+/// A previous attempt already claimed free room. The remaining kept victims are smaller than
+/// the whole allocation: their completion must still permit one real retry before degradation.
+#[test]
+fn partial_kept_recovery_settles_and_retries_before_cut_or_park() {
+    for cut in [false, true] {
+        let mut t = table(20 * MB, vec![set("working", 1, 4 * MB), set("idle", 1, 6 * MB)], vec![(vec![0], 1)]);
+        t.headroom = 20 * MB;
+        t.page_mut((0, 0)).unwrap().mapped = true;
+        t.page_mut((0, 0)).unwrap().pins.push(1);
+        let idle = t.page_mut((1, 0)).unwrap();
+        idle.mapped = true;
+        idle.filled = true;
+        idle.kept = true;
+        t.requests[0].claimed = 8 * MB;
+        t.requests[0].episode.claimed_free = true;
+        let site = cut.then(|| OomSite { name: "ffn".into(), collective: false, finest: 1, shape: "1".into() });
+        let trigger = |tried| Trigger::Oom { req: 1, set: Some(0), need: Some(8 * MB), site: site.clone(), tried };
+        let actions = decide(&t, &trigger(Tried::default()));
+        assert_eq!(actions, vec![Action::Unmap { page: (1, 0), class: Class::N }, Action::Settle], "partial progress must complete before degradation");
+        // Own mapping is gone, but custody still holds the same six bytes. It is not free yet.
+        let before = t.free();
+        t.page_mut((1, 0)).unwrap().mapped = false;
+        t.pending = 6 * MB;
+        assert_eq!(t.free(), before);
+        // The checked completion ends ownership; only these newly freed bytes count again.
+        t.pending = 0;
+        let actions = decide(&t, &trigger(Tried { freed: 6 * MB, ..Tried::default() }));
+        assert_eq!(actions, vec![Action::Claim { req: 1, bytes: 6 * MB }], "try the real allocation before cutting or parking");
+        t.requests[0].claimed += 6 * MB;
+        let no_progress = decide(&t, &trigger(Tried::default()));
+        assert!(!no_progress.iter().any(|a| matches!(a, Action::Settle | Action::Claim { .. })), "completed bytes cannot be retried forever");
+        assert!(no_progress.iter().any(|a| if cut { matches!(a, Action::Cut { .. }) } else { matches!(a, Action::Park(_)) }));
+    }
+}
