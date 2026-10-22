@@ -94,18 +94,28 @@ def build(store: Path, dest: Path | None = None) -> tensorfs.Checkpoint:
     return w.commit()
 
 
-def loaded(mem: Memory, ck: tensorfs.Checkpoint, release: str) -> UNet2DConditionModel:
+class Raw:
+    """An undeclared fill that changes nothing: its pages are never kept (exported to custody),
+    so a callback's unmap of a completed one gives its bytes back at once."""
+
+    identity = None
+
+    def __call__(self, block: str, parts: object) -> None:
+        pass
+
+
+def loaded(mem: Memory, ck: tensorfs.Checkpoint, release: str, fill: Raw | None = None) -> UNet2DConditionModel:
     with torch.device("meta"):
         unet = UNet2DConditionModel(**CONFIG).to(torch.bfloat16).eval()
-    vars(unet)["_varena"] = Declared(Weights(ck, "unet", release=release))
+    vars(unet)["_varena"] = Declared(Weights(ck, "unet", release=release), fill=fill)
     mem.load(unet, "gpu")
     return unet
 
 
 class Run:
-    def __init__(self, mem: Memory, ck: tensorfs.Checkpoint) -> None:
-        self.mem = mem
-        self.filler, self.unet = loaded(mem, ck, "filler"), loaded(mem, ck, "")
+    def __init__(self, mem: Memory, ck: tensorfs.Checkpoint, fill: Raw | None = None) -> None:
+        self.mem, self.raw = mem, fill
+        self.filler, self.unet = loaded(mem, ck, "filler", fill), loaded(mem, ck, "", fill)
         g = torch.Generator().manual_seed(1)
         self.x = torch.randn(1, 4, LATENT, LATENT, generator=g).to(mem.device, torch.bfloat16)
         self.text = torch.randn(1, 77, 2048, generator=g).to(mem.device, torch.bfloat16)
@@ -256,7 +266,7 @@ def shortfalls(mem: Memory, run: Run, ck: tensorfs.Checkpoint, fillers: int = 2)
     pool; then, in a pass, a buffer bigger than torch's headroom: each shortfall is resolved in
     the allocator by evictions, with no OOM raised to Python."""
     mem.pooling = True
-    second = loaded(mem, ck, "filler2") if fillers == 2 else None
+    second = loaded(mem, ck, "filler2", run.raw) if fillers == 2 else None
     run.fill()
     if second is not None:
         with mem.request("filler2", plan=[second]), torch.no_grad():
@@ -375,11 +385,14 @@ def diag() -> int:
     out = Path("out")  # the rental script's output tree
     out.mkdir(exist_ok=True)
     failed = []
-    for label, fillers in (("both-fillers", 2), ("one-filler", 1)):
+    # graph-core: stored pages are kept (custody), and the callback cannot reclaim a kept page,
+    # so the stored variant measures its passes first (each pass then gets its room at its start);
+    # the undeclared variant's pages are never kept, so its unmeasured passes recover in the callback.
+    for label, fillers, mode in (("stored-measured", 2, "measured"), ("undeclared", 2, "undeclared")):
         log = work / f"{label}.stderr.log"
         env = {**os.environ, "CUDA_LAUNCH_BLOCKING": "1", "RUST_LOG": "debug"}
         began = time.perf_counter()
-        with log.open("w") as err, subprocess.Popen([sys.executable, "-u", __file__, "variant", str(fillers), str(dest), str(work / "store")],
+        with log.open("w") as err, subprocess.Popen([sys.executable, "-u", __file__, "variant", str(fillers), mode, str(dest), str(work / "store")],
                                                     env=env, stdout=subprocess.PIPE, stderr=err, text=True) as child:
             for line in child.stdout or ():
                 print(f"[{label}] {line}", end="", flush=True)
@@ -417,16 +430,26 @@ def summarize(label: str, log: Path) -> None:
     print(f"DIAG {label}: stderr's Python lines (the faulting call's traceback):", *python[-60:], sep="\n  ", flush=True)
 
 
-def variant(fillers: int, ck: tensorfs.Checkpoint) -> int:
+def variant(fillers: int, mode: str, ck: tensorfs.Checkpoint) -> int:
     """gpu11's sequence: case 0 (with `fillers` fillers), case 1, then case 2's interleaved
-    default and pool runs, three iterations; the first error ends it."""
+    default and pool runs, three iterations; the first error ends it. `measured`: stored pages,
+    every pass measured first; `undeclared`: pages never kept, passes unmeasured."""
     torch.backends.cudnn.allow_tf32 = torch.backends.cuda.matmul.allow_tf32 = False
     mem = Memory.open(0, limit=CAP, pool=True)
     assert mem.pool is not None
-    print(f"POOL use count outside a pass {mem.pool.use_count()}; torch {torch.__version__}", flush=True)
-    run = Run(mem, ck)
+    print(f"POOL use count outside a pass {mem.pool.use_count()}; torch {torch.__version__}; "
+          f"PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF')!r}; mode {mode}", flush=True)
+    run = Run(mem, ck, Raw() if mode == "undeclared" else None)
     inside: list[int] = []
     hook = run.unet.conv_in.register_forward_pre_hook(lambda *_: inside.append(mem.pool.use_count()) if mem.pooling else None)  # type: ignore[union-attr]
+    if mode == "measured":
+        mem.pooling = True
+        run.fill()
+        for size in (224, LATENT):
+            x = run.x[:, :, :size, :size].contiguous()
+            with mem.request(f"measure {size}", plan=[run.unet]), torch.no_grad():
+                run.unet(x, 999, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
+        print(f"MEASURED filler at 64, unet at 224 and {LATENT}; allocator {allocator_stats()}", flush=True)
     shortfalls(mem, run, ck, fillers)
     run.fill()
     times, _, _, raised = run.steps("pool beside the filler", True)
@@ -440,6 +463,7 @@ def variant(fillers: int, ck: tensorfs.Checkpoint) -> int:
                   f"segments freed {allocator_stats()[6] - frees}; allocator {allocator_stats()}; cross-stream block runs {mem.crossed}; "
                   f"pool use counts in its passes {sorted(set(inside))}", flush=True)
             if raised is not None:
+                print(f"REFUSALS {_ext.varena.allocator_refusals(0)}", flush=True)
                 return 1
     hook.remove()
     print(f"POOL use count outside a pass {mem.pool.use_count()}", flush=True)
@@ -493,7 +517,7 @@ if __name__ == "__main__":
         threading.Thread(target=watch, daemon=True).start()
     if mode == "variant":
         try:
-            result = variant(int(sys.argv[2]), tensorfs.open(sys.argv[3], cache_dir=sys.argv[4], local_files_only=True))
+            result = variant(int(sys.argv[2]), sys.argv[3], tensorfs.open(sys.argv[4], cache_dir=sys.argv[5], local_files_only=True))
         except BaseException:
             print("ALLOCATOR_REFUSALS", getattr(_ext.varena, "allocator_refusals", lambda *_: "unavailable")(0), flush=True)
             raise
