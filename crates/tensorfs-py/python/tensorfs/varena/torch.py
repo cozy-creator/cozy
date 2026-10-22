@@ -614,13 +614,13 @@ class Memory:
             _pool.reset(token)
             _allocated()
 
-    def cache(self, owner: str, shrink: Callable[[int], int], model: nn.Module | Model | None = None) -> Cache:
+    def cache(self, owner: str, shrink: Callable[[int], int], model: nn.Module | Model | Sequence[nn.Module | Model] = ()) -> Cache:
         """Bytes the caller holds that `shrink(want) -> freed` gives back on varena's ask; a
-        cache owned by a request id ends with it. A cache serving a loaded `model` (its graph
-        pool, its decode cache) takes that model's class: D while a plan declares it, N
-        otherwise, shrunk before the model's own pages."""
-        served = model if isinstance(model, Model) or model is None else self.models[model]
-        return Cache(self, self.native.cache(owner, shrink, served.id if served is not None else None))
+        cache owned by a request id ends with it. A cache serving loaded models (a model's graph
+        pool or decode cache, one pool a serialized domain shares) takes their most protective
+        class: D while a plan declares one, N otherwise, shrunk before their own pages."""
+        served = [model] if isinstance(model, (nn.Module, Model)) else list(model)
+        return Cache(self, self.native.cache(owner, shrink, [(m if isinstance(m, Model) else self.models[m]).id for m in served]))
 
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
@@ -963,6 +963,11 @@ class Request:
 
     def stats(self) -> Stats:
         return self.ended if self.ended is not None else self.native.stats()
+
+    def spare(self) -> int:
+        """Bytes this request could have now beside every working-set and pinned page without
+        evicting one (lock-free, the last publication's): a capture's room before it captures."""
+        return self.native.spare()
 
 
 class Cache:

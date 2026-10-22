@@ -472,8 +472,11 @@ impl PyMemory {
         done(py, &self.gpu.uuid, || self.memory().fill(SetId(set), fill))
     }
 
-    /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id.
-    fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>) -> PyResult<u32> {
+    /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id. A cache
+    /// serving sets `sets` (a component's graph pool, its decode cache, one pool a serialized
+    /// domain shares) takes their most protective class.
+    #[pyo3(signature = (owner, shrink, sets = Vec::new()))]
+    fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>, sets: Vec<u32>) -> PyResult<u32> {
         // Inside torch's allocator a shrink would free through it under its own lock: none runs there.
         let shrink = move |want: u64| {
             if crate::allocator::inside() {
@@ -482,7 +485,8 @@ impl PyMemory {
             }
             Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0)
         };
-        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, &[], shrink))).map(|c| c.0)
+        let sets: Vec<SetId> = sets.into_iter().map(SetId).collect();
+        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, &sets, shrink))).map(|c| c.0)
     }
 
     fn cached(&self, py: Python<'_>, cache: u32, nbytes: u64) -> PyResult<()> {
@@ -504,7 +508,7 @@ impl PyMemory {
     #[pyo3(signature = (set, block, stream = 0))]
     fn bind(&self, py: Python<'_>, set: u32, block: u32, stream: usize) -> PyResult<PyPin> {
         let pin = detached(py, &self.gpu.uuid, || self.memory().bind(SetId(set), block, stream))?;
-        Ok(PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.uuid.clone(), pin: Arc::new(Held(Some(pin))) })
+        Ok(PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.uuid.clone(), pin: Arc::new(Held::new(pin)) })
     }
 
     /// Graph address retention: no physical pin until `prepare`.
@@ -535,6 +539,12 @@ impl PyMemory {
     /// Bytes torch's allocator may hold now.
     fn torch_limit(&self, py: Python<'_>) -> PyResult<u64> {
         detached(py, &self.gpu.uuid, || Ok(self.memory().torch_limit()))
+    }
+
+    /// The most torch's allocator could ever hold here (allocated + reachable): the fraction cap
+    /// beside the native pool, whose segments varena's allocator governs inside it.
+    fn torch_ceiling(&self, py: Python<'_>) -> PyResult<u64> {
+        detached(py, &self.gpu.uuid, || Ok(self.memory().torch_ceiling()))
     }
 
     /// The record of the request that ended last.
@@ -590,7 +600,7 @@ impl PyRetained {
         let r = lock(&self.retained).clone().ok_or_else(|| error(py, &self.gpu, Error::Closed("retained range".into())))?;
         let request = request.map(|r| r.get(py)).transpose()?;
         let pins = detached(py, &self.gpu, || r.prepare_for(stream, request.as_deref()))?;
-        Ok(pins.into_iter().map(|pin| PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.clone(), pin: Arc::new(Held(Some(pin))) }).collect())
+        Ok(pins.into_iter().map(|pin| PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.clone(), pin: Arc::new(Held::new(pin)) }).collect())
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -677,13 +687,12 @@ impl PyRequest {
         detached(py, &self.gpu, || Ok(r.cut(set.map(SetId), site, shape)))
     }
 
-    /// This thread's segments for torch's pool are `set`'s pass's (None: outside any pass) from
-    /// now on, torch's bytes now being `allocated` and `reserved`: a shortfall asks this request.
-    #[pyo3(signature = (memory, set, allocated, reserved, pool = (0, 0)))]
-    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, set: Option<u32>, allocated: u64, reserved: u64, pool: (u64, u64)) -> PyResult<()> {
+    /// This thread's segments for torch's pool `pool` are this request's from now on, torch's
+    /// reserved bytes now being `reserved`: a shortfall claims from the request's stock.
+    #[pyo3(signature = (memory, reserved, pool = (0, 0)))]
+    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, reserved: u64, pool: (u64, u64)) -> PyResult<()> {
         let r = self.get(py)?;
-        let _ = allocated;
-        crate::allocator::enter(memory.memory().clone(), r, set.map(SetId), reserved, memory.dl.1, pool);
+        crate::allocator::enter(memory.memory().clone(), r, reserved, memory.dl.1, pool);
         Ok(())
     }
 
@@ -697,6 +706,13 @@ impl PyRequest {
     fn stats(&self, py: Python<'_>) -> PyResult<PyStats> {
         let r = self.get(py)?;
         detached(py, &self.gpu, || Ok(r.stats())).map(Into::into)
+    }
+
+    /// Bytes the request could have now beside every W and P page without evicting one (the
+    /// last publication's figure, read without the state lock): a capture's room before it
+    /// captures.
+    fn spare(&self, py: Python<'_>) -> PyResult<u64> {
+        Ok(self.get(py)?.spare())
     }
 
     /// Ends the request: its pins, rooms and caches go. Refused while another call is in it.
@@ -788,12 +804,31 @@ impl PyYielded {
 /// The pin a `Pin` and every tensor made from it share; its drop releases it.
 struct Held(Option<Pin>);
 
+/// Pins the binding holds now: Python's pin objects and the tensors that keep one.
+static HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Held {
+    fn new(pin: Pin) -> Self {
+        HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(Some(pin))
+    }
+}
+
 impl Drop for Held {
     /// Also run by the DLPack deleter, maybe on a thread without the GIL: never unwinds.
     fn drop(&mut self) {
         let pin = self.0.take();
+        if pin.is_some() {
+            HELD.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = catch_unwind(AssertUnwindSafe(|| drop(pin)));
     }
+}
+
+/// Pins the binding holds now (Python's pin objects and the tensors that keep one).
+#[pyfunction]
+fn pins_held() -> u64 {
+    HELD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A bound block: `len` bytes at `ptr`, mapped and filled (a fresh one awaits its fill).
@@ -1008,6 +1043,14 @@ fn allocator_refusals(device: Option<i32>) -> Vec<crate::allocator::Refusal> {
     crate::allocator::refusals(device)
 }
 
+/// Quarantined native segments: device, pool, bytes and the last reason. They stay charged and
+/// are never reused; the device goes on.
+#[pyfunction]
+#[pyo3(signature = (device = None))]
+fn allocator_quarantined(device: Option<i32>) -> Vec<(i32, (u64, u64), u64, &'static str)> {
+    crate::allocator::quarantined(device)
+}
+
 /// A lost completion/release quarantines its segment and retires this executor at a safe
 /// Python boundary; it must not masquerade as a recoverable capacity failure.
 #[pyfunction]
@@ -1064,6 +1107,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(allocator_pending, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_check, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_reentries, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_quarantined, &m)?)?;
+    m.add_function(wrap_pyfunction!(pins_held, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;
     m.add("StaleBinding", py.get_type::<StaleBinding>())?;

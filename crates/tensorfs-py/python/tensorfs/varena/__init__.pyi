@@ -7,7 +7,7 @@ holds the block until the last one dies. Every call releases the GIL; a panic ra
 `VarenaError` with code `INTERNAL`.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Final, Literal
 
 from .._ext import Checkpoint
@@ -144,10 +144,10 @@ class Memory:
     def fill(self, set: int, fill: Fill) -> None:
         """`set`'s current fill (a no-op when unchanged): pages filled under another come back
         fresh."""
-    def cache(self, owner: str, shrink: Callable[[int], int], set: int | None = None) -> int:
+    def cache(self, owner: str, shrink: Callable[[int], int], sets: Sequence[int] = ()) -> int:
         """Bytes the caller holds that `shrink(want) -> freed` gives back (from varena's thread);
-        a cache owned by a request id ends with it. A cache serving set `set` takes its class: D
-        while a plan declares the set, N otherwise."""
+        a cache owned by a request id ends with it. A cache serving `sets` takes their most
+        protective class (D while a plan declares one, N otherwise)."""
 
     def cached(self, cache: int, nbytes: int) -> None: ...
     def uncache(self, cache: int) -> None: ...
@@ -213,6 +213,9 @@ class Request:
         back its reserved room to that family alone; ended, it waits for its room back."""
 
     def stats(self) -> Stats: ...
+    def spare(self) -> int:
+        """Bytes the request could have now beside every W and P page without evicting one, as
+        the last publication measured them (no lock): a capture's room before it captures."""
     def end(self) -> Stats:
         """Ends it: its pins, rooms and caches go."""
 
