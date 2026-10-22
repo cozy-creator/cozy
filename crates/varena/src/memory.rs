@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Weak, OnceLock};
+use std::sync::{Arc, Weak};
 
 use crossbeam_channel::{select_biased, unbounded, Receiver, Sender};
 
@@ -398,37 +398,21 @@ impl Drop for Owner {
         let inner = unsafe { std::mem::ManuallyDrop::take(&mut self.0) };
         if inner.public_owners.fetch_sub(1, Ordering::AcqRel) != 1 { return; }
         inner._device.retiring(inner.ownership_lost.load(Ordering::Acquire));
-        static RETIRER: OnceLock<std::sync::mpsc::Sender<Arc<Inner>>> = OnceLock::new();
-        let sender = RETIRER.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<Arc<Inner>>();
-            let _ = std::thread::Builder::new().name("varena-retire".into()).spawn(move || {
-                let mut pending = Vec::new();
-                loop {
-                    let next = if pending.is_empty() { rx.recv().ok() }
-                        else { rx.recv_timeout(std::time::Duration::from_millis(1)).ok() };
-                    if let Some(inner) = next { pending.push(inner); }
-                    let mut waiting = Vec::new();
-                    for inner in pending.drain(..) {
-                        let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.retire_public()));
-                        match completed {
-                            Ok(Ok(true)) => drop(inner),
-                            Ok(Ok(false)) => waiting.push(inner),
-                            Ok(Err(_)) | Err(_) => {
-                                inner.ownership_lost.store(true, Ordering::Release);
-                                inner._device.retiring(true);
-                                inner.landed.notify_all();
-                                std::mem::forget(inner);
-                            }
-                        }
-                    }
-                    pending = waiting;
-                }
-            });
-            tx
+        // Its retirement waits on the work it needs done, on a thread of its own: no caller
+        // (Python, a DLPack destructor, the allocator) waits for it.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Arc<Inner>>(1);
+        let spawned = std::thread::Builder::new().name("varena-retire".into()).spawn(move || {
+            if let Ok(inner) = rx.recv() {
+                inner.retire();
+            }
         });
-        if let Err(failed) = sender.send(inner) {
-            failed.0._device.retiring(true);
-            std::mem::forget(failed.0);
+        let unsent = match spawned {
+            Ok(_) => tx.send(inner).err().map(|e| e.0),
+            Err(_) => Some(inner),
+        };
+        if let Some(inner) = unsent {
+            inner._device.retiring(true);
+            std::mem::forget(inner);
         }
     }
 }
@@ -923,6 +907,44 @@ fn with(levels: &BTreeMap<String, u32>, site: &str, level: u32) -> BTreeMap<Stri
     l
 }
 
+/// Signalled each time a worker thread lets go of its reference to the Memory: a retirement
+/// waits on it for the last to go.
+#[derive(Default)]
+struct Quiet {
+    lock: Mutex<()>,
+    gone: Condvar,
+}
+
+/// A worker thread's reference to the Memory for one item; letting go of it wakes a retirement.
+struct Work {
+    inner: std::mem::ManuallyDrop<Arc<Inner>>,
+    quiet: Arc<Quiet>,
+}
+
+impl Work {
+    fn of(inner: &Weak<Inner>) -> Option<Work> {
+        let inner = inner.upgrade()?;
+        let quiet = inner.quiet.clone();
+        Some(Work { inner: std::mem::ManuallyDrop::new(inner), quiet })
+    }
+}
+
+impl std::ops::Deref for Work {
+    type Target = Arc<Inner>;
+    fn deref(&self) -> &Arc<Inner> {
+        &self.inner
+    }
+}
+
+impl Drop for Work {
+    fn drop(&mut self) {
+        // SAFETY: taken once, here; ManuallyDrop never drops it again.
+        drop(unsafe { std::mem::ManuallyDrop::take(&mut self.inner) });
+        let _quiet = self.quiet.lock.lock();
+        self.quiet.gone.notify_all();
+    }
+}
+
 struct Inner {
     backend: Box<dyn Backend>,
     shared: Arc<Shared>,
@@ -951,6 +973,7 @@ struct Inner {
     saves: Arc<Outbox<Save>>,
     wanted: Arc<(Mutex<Wanted>, Condvar)>,
     stop: Arc<AtomicBool>,
+    quiet: Arc<Quiet>,
     ownership_lost: AtomicBool,
     public_owners: AtomicU64,
     native_resident: AtomicU64,
@@ -1036,6 +1059,7 @@ impl Memory {
                 saves: Arc::new(Outbox::default()),
                 wanted: Arc::new((Mutex::new(Wanted::default()), Condvar::new())),
                 stop: Arc::new(AtomicBool::new(false)),
+                quiet: Arc::default(),
                 ownership_lost: AtomicBool::new(false),
                 public_owners: AtomicU64::new(0),
                 native_resident: AtomicU64::new(0),
@@ -1455,21 +1479,34 @@ impl Inner {
     /// them from the drain under a pin of its own, so nothing else retires or evicts them,
     /// waits for them unlocked, and completes them as a drain would.
     fn hand_over(&self) {
-        let (pins, taken) = {
+        if let Err(e) = self.finish_pending(true) {
+            tracing::warn!("varena: a handover's events are unproven: {e}");
+        }
+    }
+
+    /// Waits for pending events (host waits) and completes them as a drain would: the pages'
+    /// whose Keep is due (`due_only`), or every page's, ready events included (a retirement).
+    /// Their pages are pinned meanwhile, so nothing retires the events or evicts the pages.
+    fn finish_pending(&self, due_only: bool) -> Result<()> {
+        let (pins, taken, ready) = {
             let mut st = self.lock();
             let due: BTreeSet<Key> = st.keep_due.iter().copied().chain(st.homes.iter().filter(|(_, h)| h.keep_after).map(|(k, _)| *k)).collect();
             let mut taken = vec![];
             for (stream, q) in &mut st.events {
                 q.retain(|&(event, key)| {
-                    let mine = due.contains(&key);
+                    let mine = !due_only || due.contains(&key);
                     if mine {
                         taken.push((*stream, event, key));
                     }
                     !mine
                 });
             }
+            let ready: Vec<(Key, Event)> = match due_only {
+                true => vec![],
+                false => st.homes.iter().filter(|(_, h)| !self.backend.query(h.ready).unwrap_or(false)).map(|(k, h)| (*k, h.ready)).collect(),
+            };
             let me = std::thread::current().id();
-            let keys: BTreeSet<Key> = taken.iter().map(|(.., k)| *k).collect();
+            let keys: BTreeSet<Key> = taken.iter().map(|(.., k)| *k).chain(ready.iter().map(|(k, _)| *k)).collect();
             let pins: Vec<u64> = keys
                 .into_iter()
                 .map(|key| {
@@ -1480,8 +1517,10 @@ impl Inner {
                 })
                 .collect();
             self.unlock(st);
-            (pins, taken)
+            (pins, taken, ready)
         };
+        // A page's own ready event stays its home's: waited on, never retired here.
+        let ready: Result<()> = ready.iter().try_for_each(|(_, event)| self.backend.finish(*event));
         let done: Vec<bool> = taken.iter().map(|(_, event, _)| self.backend.finish(*event).is_ok()).collect();
         let mut st = self.lock();
         for pin in pins {
@@ -1489,6 +1528,7 @@ impl Inner {
                 st.sync(key);
             }
         }
+        let unproven = done.iter().filter(|d| !**d).count();
         for ((stream, event, key), done) in taken.into_iter().zip(done) {
             match done {
                 true => self.completed(&mut st, event, key, true),
@@ -1500,6 +1540,10 @@ impl Inner {
         self.publish(&mut st);
         self.unlock(st);
         self.landed.notify_all();
+        match unproven {
+            0 => ready,
+            n => Err(Error::Ownership(format!("{n} pending events could not be waited on"))),
+        }
     }
 
     fn drain(&self, st: &mut State) {
@@ -3473,6 +3517,50 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// The last public owner went: retires once nothing is left to finish. Each round waits on
+    /// the work it found unfinished, never on a clock; a failure quarantines it.
+    fn retire(self: Arc<Self>) {
+        loop {
+            let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.retire_public().and_then(|done| if done { Ok(true) } else { self.quiesce().map(|()| false) })));
+            match round {
+                Ok(Ok(true)) => return,
+                Ok(Ok(false)) => {}
+                Ok(Err(_)) | Err(_) => {
+                    self.ownership_lost.store(true, Ordering::Release);
+                    self._device.retiring(true);
+                    self.landed.notify_all();
+                    std::mem::forget(self);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Blocks until the work a retirement waits on is done: fills, every pending event and
+    /// ready event (a host wait, on the retirer's own thread), Keeps, queued calls and tier
+    /// copies, and every worker's reference.
+    fn quiesce(self: &Arc<Self>) -> Result<()> {
+        {
+            let mut st = self.lock();
+            while st.homes.values().any(|h| h.filling) {
+                self.wait(&mut st)?;
+            }
+            self.unlock(st);
+        }
+        self.finish_pending(false)?;
+        self.saves.settle();
+        self.mech.settle();
+        self.to_custody.settle();
+        self.to_tier.settle();
+        let mut alone = self.quiet.lock.lock();
+        while Arc::strong_count(self) > 1 {
+            self.quiet.gone.wait(&mut alone);
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -3529,7 +3617,7 @@ fn fill_loop(demand: &Receiver<Job>, ahead: &Receiver<Job>, inner: &Weak<Inner>)
             recv(ahead) -> j => j,
         };
         let Ok(job) = job else { return };
-        let Some(me) = inner.upgrade() else { return };
+        let Some(me) = Work::of(inner) else { return };
         let batch = me.batch(job, demand, ahead);
         // A panic outside the copies fails the batch's binders; the thread keeps serving.
         if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.fill(&batch))) {
@@ -3550,7 +3638,7 @@ fn save_loop(saves: &Outbox<Save>, burst: &(Mutex<Burst>, Condvar), inner: &Weak
         }
         let closed = b.closed;
         drop(b);
-        if let Some(me) = inner.upgrade().filter(|me| !closed && me.after_fills()) {
+        if let Some(me) = Work::of(inner).filter(|me| !closed && me.after_fills()) {
             me.save(&save);
         }
         saves.sent(ticket, bytes);
@@ -3562,7 +3650,7 @@ fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>,
         row.ask_thread();
     }
     Row::serve_asks(listener, stop, row, |ask| {
-        let Some(me) = inner.upgrade() else { return 0 };
+        let Some(me) = Work::of(inner) else { return 0 };
         // Never dies: a failed or panicking answer frees nothing, and the next ask is served.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ask {
             ledger::Ask::Room { ceiling, bytes } => me.answer(if ceiling >= Class::D.index() { Class::D } else { Class::N }, bytes),
@@ -3575,7 +3663,7 @@ fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>,
 /// The mechanism thread: the device's VMM calls, in the order decided, off the state lock.
 fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
     while let Some((ticket, bytes, op)) = queue.next() {
-        let Some(me) = inner.upgrade() else { return };
+        let Some(me) = Work::of(inner) else { return };
         // An op that creates or destroys physical memory: the row's counts are no foreign-byte
         // evidence until its outcome is published (an uncertain one never finishes).
         let change = matches!(op, Mech::Map { .. } | Mech::Unmap { .. } | Mech::Renew { .. }).then(|| me.row.physical_change());
@@ -3620,7 +3708,7 @@ fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Opt
             Call::Use { digest, distance } => tier.map(|t| t.use_layout(&digest, distance)),
             Call::Readopt { digest, regions, ask, file } => tier.map(|t| t.adopt_layout(&digest, regions, &ask, file)),
             Call::Unpin(held) => {
-                if let Some(me) = inner.upgrade() {
+                if let Some(me) = Work::of(inner) {
                     held.unpin(|p| me.backend.unregister_host(p));
                 }
                 None
@@ -3628,7 +3716,7 @@ fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Opt
             Call::Close { digest } => tier.map(|t| t.close(&digest)),
         };
         if bytes > 0 && !matches!(result, Some(Ok(()))) {
-            if let Some(me) = inner.upgrade() {
+            if let Some(me) = Work::of(inner) {
                 let mut st = me.state.lock();
                 me.lost_backing(&mut st, bytes, true, "custody did not acknowledge withdrawal");
             }
@@ -3638,7 +3726,7 @@ fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Opt
         outbox.sent(ticket, bytes);
         let moved = holder != (custody.map(custody::Client::holder), tier.map(tier::Client::holder));
         if moved || bytes > 0 {
-            if let Some(me) = inner.upgrade() {
+            if let Some(me) = Work::of(inner) {
                 // A new custody holder gets every kept page again, a new tier every held
                 // layout (the drain does it); withdrawn bytes are free for the next decision.
                 let mut st = me.lock();
@@ -3665,7 +3753,7 @@ fn trim_loop(wanted: &(Mutex<Wanted>, Condvar), inner: &Weak<Inner>) {
             }
             std::mem::take(&mut *w)
         };
-        let Some(me) = inner.upgrade() else { return };
+        let Some(me) = Work::of(inner) else { return };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.idle_trim(wanted)));
     }
 }
