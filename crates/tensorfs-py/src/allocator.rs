@@ -11,7 +11,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use tensorfs::io::cuda;
-use varena::{Memory, Request, SetId, Torch};
+use varena::{Memory, Request, SetId, Torch, Workspace};
 
 type Pool = (u64, u64);
 
@@ -27,6 +27,7 @@ struct Active {
 
 thread_local! {
     static ACTIVE: RefCell<Vec<Active>> = const { RefCell::new(Vec::new()) };
+    static WORKSPACES: RefCell<Vec<Arc<Workspace>>> = const { RefCell::new(Vec::new()) };
     static INSIDE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -83,6 +84,8 @@ pub fn enter(memory: Arc<Memory>, request: Arc<Request>, set: Option<SetId>, res
     ACTIVE.with(|a| a.borrow_mut().push(Active { memory, request, set, outside, device, pool }));
 }
 pub fn exit() { ACTIVE.with(|a| a.borrow_mut().pop()); }
+pub fn workspace_enter(workspace: Arc<Workspace>) { WORKSPACES.with(|b| b.borrow_mut().push(workspace)); }
+pub fn workspace_exit() { WORKSPACES.with(|b| b.borrow_mut().pop()); }
 
 pub fn stats(device: Option<i32>, pool: Option<Pool>) -> (u64, u64, u64, u64, u64, u64, u64) {
     let c = accounts().counts.iter().filter(|((d, p), _)| device.is_none_or(|want| *d == want) && pool.is_none_or(|want| *p == want)).fold(Counters::default(), |mut a, (_, c)| {
@@ -111,6 +114,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     let _inside = Inside::enter();
     let began = Instant::now();
     let active = ACTIVE.with(|a| a.borrow().iter().rev().find(|p| p.device == device).cloned());
+    let budget = active.as_ref().and_then(|a| WORKSPACES.with(|b| b.borrow().iter().rev().find(|b| b.belongs_to(&a.memory)).cloned()));
     let pool = active.as_ref().map_or((0, 0), |a| a.pool);
     let key = (device, pool);
     if capturing(stream) {
@@ -120,8 +124,17 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     let mut previous = None;
     let ptr = loop {
         let held = active.as_ref().map_or(live(device), |a| a.outside.saturating_add(live(device)));
-        let limit = active.as_ref().map_or(u64::MAX, |a| a.memory.torch_limit());
-        let result = if held.saturating_add(size as u64) <= limit { segment(size) } else { Err(cuda::ERROR_OUT_OF_MEMORY) };
+        let limit = match active.as_ref() {
+            None => u64::MAX,
+            Some(a) => match a.memory.allocator_limit() { Some(n) => n.saturating_add(budget.as_ref().map_or(0, |b| b.remaining())), None => break 0 },
+        };
+        if budget.as_ref().is_some_and(|b| b.remaining() < size as u64) { break 0; }
+        let result = if held.saturating_add(size as u64) <= limit {
+            if budget.as_ref().is_some_and(|b| !b.take(size as u64)) { break 0; }
+            let result = segment(size);
+            if result.is_err() { if let Some(b) = &budget { b.refund(size as u64); } }
+            result
+        } else { Err(cuda::ERROR_OUT_OF_MEMORY) };
         match result {
             Ok(ptr) => break ptr,
             Err(cuda::ERROR_OUT_OF_MEMORY) => {

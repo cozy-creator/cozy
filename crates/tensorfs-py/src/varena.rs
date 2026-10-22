@@ -14,16 +14,18 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use tensorfs::format::Body;
 use varena::layout::Layout;
-use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, Next, Origin, Pass, Pin, Plan, Request, Retained, SetId, SetSpec, Site, SitePeak, Step, Torch, Yielded};
+use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, Next, Origin, Pass, Pin, Plan, Request, Retained, SetId, SetSpec, Site, SitePeak, Step, Torch, Workspace, Yielded};
 
 use crate::store::PyCheckpoint;
 
 create_exception!(tensorfs.varena, VarenaError, PyException, "A varena error: `.code` names its class; `.cuda_code` is the driver's CUresult for a device error; `.sticky` means the device context is gone.");
+create_exception!(tensorfs.varena, StaleBinding, VarenaError, "The retained dependency identity changed; discard this graph before recapture.");
 create_exception!(tensorfs.varena, Exhausted, VarenaError, "The one memory error: `.gpu`, `.need`, `.site`, `.stats`.");
 
 fn error(py: Python<'_>, gpu: &str, e: Error) -> PyErr {
     let err = match &e {
         Error::Exhausted(_) => Exhausted::new_err(e.to_string()),
+        Error::StaleBinding(_) => StaleBinding::new_err(e.to_string()),
         _ => VarenaError::new_err(e.to_string()),
     };
     let v = err.value(py);
@@ -512,6 +514,15 @@ impl PyMemory {
         Ok(PyRetained { retained: Mutex::new(Some(Arc::new(retained))), identity, gpu: self.gpu.uuid.clone(), dl: self.dl })
     }
 
+    fn observe(&self, py: Python<'_>, allocated: u64, reserved: u64) -> PyResult<()> {
+        detached(py, &self.gpu.uuid, || self.memory().observe(Torch { allocated, reserved }))
+    }
+
+    fn workspace(&self, py: Python<'_>, bytes: u64, allocated: u64, reserved: u64) -> PyResult<PyWorkspace> {
+        let workspace = detached(py, &self.gpu.uuid, || self.memory().workspace(bytes, Torch { allocated, reserved }))?;
+        Ok(PyWorkspace { workspace: Mutex::new(Some(Arc::new(workspace))), gpu: self.gpu.uuid.clone() })
+    }
+
     /// Bytes torch's allocator may hold now.
     fn torch_limit(&self, py: Python<'_>) -> PyResult<u64> {
         detached(py, &self.gpu.uuid, || Ok(self.memory().torch_limit()))
@@ -521,6 +532,31 @@ impl PyMemory {
     fn stats(&self, py: Python<'_>) -> PyResult<Option<PyStats>> {
         detached(py, &self.gpu.uuid, || Ok(self.memory().stats())).map(|s| s.map(Into::into))
     }
+}
+
+/// Future graph scratch/static/output bytes, consumed by native allocations in this scope.
+#[pyclass(name = "Workspace", module = "tensorfs.varena", frozen)]
+pub struct PyWorkspace {
+    workspace: Mutex<Option<Arc<Workspace>>>,
+    gpu: String,
+}
+
+#[pymethods]
+impl PyWorkspace {
+    fn __enter__(&self, py: Python<'_>) -> PyResult<()> {
+        let workspace = lock(&self.workspace).clone().ok_or_else(|| error(py, &self.gpu, Error::Closed("workspace reservation".into())))?;
+        crate::allocator::workspace_enter(workspace);
+        Ok(())
+    }
+    fn __exit__(&self, py: Python<'_>, _ty: &Bound<'_, PyAny>, _value: &Bound<'_, PyAny>, _trace: &Bound<'_, PyAny>) -> PyResult<()> {
+        crate::allocator::workspace_exit();
+        let workspace = lock(&self.workspace).take();
+        done(py, &self.gpu, || drop(workspace))
+    }
+}
+
+impl Drop for PyWorkspace {
+    fn drop(&mut self) { release(lock(&self.workspace).take()); }
 }
 
 /// A graph's address references; physical leases are acquired separately for each use.
@@ -535,6 +571,11 @@ pub struct PyRetained {
 
 #[pymethods]
 impl PyRetained {
+    fn valid(&self, py: Python<'_>) -> PyResult<bool> {
+        let r = lock(&self.retained).clone();
+        detached(py, &self.gpu, || Ok(r.is_some_and(|r| r.valid())))
+    }
+
     #[pyo3(signature = (stream = 0))]
     fn prepare(&self, py: Python<'_>, stream: usize) -> PyResult<Vec<PyPin>> {
         let r = lock(&self.retained).clone().ok_or_else(|| error(py, &self.gpu, Error::Closed("retained range".into())))?;
@@ -974,6 +1015,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyYielded>()?;
     m.add_class::<PyPin>()?;
     m.add_class::<PyRetained>()?;
+    m.add_class::<PyWorkspace>()?;
     m.add_class::<PyWindow>()?;
     m.add_class::<PyNext>()?;
     m.add_class::<PyFills>()?;
@@ -986,6 +1028,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(allocator_reentries, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;
+    m.add("StaleBinding", py.get_type::<StaleBinding>())?;
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
 }

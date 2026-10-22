@@ -24,7 +24,7 @@ import threading
 import warnings
 import weakref
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Protocol, TypeAlias
@@ -288,8 +288,15 @@ class Binding:
             self.last = torch.cuda.Event()
             self.last.record(torch.cuda.current_stream(model.memory.device))
 
+    def valid(self) -> bool:
+        with self.lock:
+            if self.closed:
+                return False
+            self.model.memory.native.fill(self.model.id, _fill(self.model.fill))
+            return self.native.valid()
+
     @contextmanager
-    def prepare(self, stream: torch.cuda.Stream | int | None = None) -> Iterator[Binding]:
+    def prepare(self, stream: torch.cuda.Stream | int | None = None, *, workspace: int = 0) -> Iterator[Binding]:
         with self.lock:
             if self.closed:
                 raise Unbound("graph binding is closed")
@@ -301,7 +308,10 @@ class Binding:
                     stream = torch.cuda.current_stream(memory.device)
                 elif isinstance(stream, int):
                     stream = torch.cuda.ExternalStream(stream, device=memory.device)
-            with torch.cuda.stream(stream) if memory.cuda else nullcontext():
+            with ExitStack() as scope:
+                scope.enter_context(torch.cuda.stream(stream) if memory.cuda else nullcontext())
+                if workspace:
+                    scope.enter_context(memory.native.workspace(workspace, *memory.torch.now()))
                 if self.last is not None:
                     stream.wait_event(self.last)
                 memory.native.fill(self.model.id, _fill(self.model.fill))
@@ -330,6 +340,7 @@ class Binding:
                     for block in reversed(held):
                         memory._exit(block)
                     pins.clear()  # Native pin drops record completion after the queued uses.
+                    memory.native.observe(*memory.torch.now())
 
     def close(self) -> None:
         with self.lock:

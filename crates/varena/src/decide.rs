@@ -38,6 +38,8 @@ pub enum Trigger {
     /// least one page's worth when unknown) at `site`; a collective site recovers locally and
     /// proposes its finer level for the next pass.
     Oom { req: u64, set: Option<u32>, need: Option<u64>, site: Option<OomSite>, tried: Tried },
+    /// Reserve future native workspace bytes before executing/capturing a region.
+    Workspace { id: u64, bytes: u64, tried: Tried },
     /// Another row asks for `bytes` under `ceiling`.
     Ask { ceiling: Class, bytes: u64 },
     /// Fetch ahead for `req` into the surplus.
@@ -77,6 +79,8 @@ pub enum Action {
     Map(Key),
     /// Map and fill a page ahead of its use; fails soft.
     Prefetch(Key),
+    /// Commit an admitted future-allocation reservation.
+    Workspace { id: u64, bytes: u64 },
     /// The freed bytes become the request's room for its failing op.
     Claim { req: u64, bytes: u64 },
     /// The pass's room, set in the same apply as the evictions that made it.
@@ -118,6 +122,13 @@ pub fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> {
             let mut d = Demand::new(t, need, *req, None, tried);
             if d.run(Rungs::Bind) == Some(Done::Enough) {
                 d.out.extend(missing.into_iter().map(Action::Map));
+            }
+            d.out
+        }
+        Trigger::Workspace { id, bytes, tried } => {
+            let mut d = Demand::new(t, *bytes, None, None, tried);
+            if d.run(Rungs::Bind) == Some(Done::Enough) {
+                d.out.push(Action::Workspace { id: *id, bytes: *bytes });
             }
             d.out
         }

@@ -14,7 +14,7 @@
 //! mappings, and the process keeps serving.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use crossbeam_channel::{select_biased, unbounded, Receiver, Sender};
@@ -74,6 +74,11 @@ impl Drop for Preparing {
 impl Retained {
     pub fn identity(&self) -> &str { &self.identity }
 
+    pub fn valid(&self) -> bool {
+        let st = self.inner.state.lock();
+        st.mech(self.set).is_ok_and(|m| retained_identity(self.set, m, &self.blocks) == self.identity)
+    }
+
     /// Acquires all physical dependencies atomically against eviction. The returned pins hold
     /// them until completion on `stream`, including a cancelled caller's queued work. Callers
     /// join every additional consumer stream back into `stream` before releasing these pins.
@@ -83,7 +88,7 @@ impl Retained {
                 let mut st = self.inner.lock();
                 let m = st.mech(self.set)?;
                 if retained_identity(self.set, m, &self.blocks) != self.identity {
-                    return Err(Error::Invalid("retained range identity changed; recapture required".into()));
+                    return Err(Error::StaleBinding("retained range identity changed; recapture required".into()));
                 }
                 let req = st.binding(self.set);
                 let mut pins = Vec::with_capacity(self.blocks.len());
@@ -106,7 +111,7 @@ impl Retained {
             let pins = self.blocks.iter().map(|b| self.inner.bind(self.set, *b, stream)).collect::<Result<Vec<_>>>()?;
             let st = self.inner.lock();
             if retained_identity(self.set, st.mech(self.set)?, &self.blocks) != self.identity {
-                return Err(Error::Invalid("retained range identity changed during preparation".into()));
+                return Err(Error::StaleBinding("retained range identity changed during preparation".into()));
             }
             drop(st);
             drop(preparing);
@@ -122,6 +127,43 @@ impl Drop for Retained {
             m.retained = m.retained.saturating_sub(1);
         }
         self.inner.close_sets(&mut st);
+        self.inner.publish(&st);
+    }
+}
+
+/// Admitted bytes not yet backed by a native pool segment. Segment allocation converts the
+/// promise into actual allocator bytes; dropping releases only the unused promise.
+pub struct Workspace {
+    inner: Arc<Inner>,
+    id: u64,
+    remaining: Arc<AtomicU64>,
+}
+
+impl Workspace {
+    pub fn remaining(&self) -> u64 { self.remaining.load(Ordering::Acquire) }
+    pub fn belongs_to(&self, memory: &Memory) -> bool { Arc::ptr_eq(&self.inner, &memory.inner) }
+
+    /// Nonblocking conversion while inside torch's allocator lock.
+    pub fn take(&self, bytes: u64) -> bool {
+        let Some(mut st) = self.inner.state.try_lock() else { return false };
+        let left = self.remaining();
+        if bytes > left { return false; }
+        self.remaining.store(left - bytes, Ordering::Release);
+        st.promises();
+        st.table.reserved = st.table.reserved.saturating_add(bytes);
+        self.inner.publish(&st);
+        true
+    }
+
+    /// Failed driver allocation: restore the promise atomically, without taking a lock.
+    pub fn refund(&self, bytes: u64) { self.remaining.fetch_add(bytes, Ordering::AcqRel); }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let mut st = self.inner.state.lock();
+        st.budgets.remove(&self.id);
+        st.promises();
         self.inner.publish(&st);
     }
 }
@@ -510,6 +552,7 @@ struct Wanted {
 #[derive(Default)]
 struct State {
     table: Table,
+    budgets: HashMap<u64, Arc<AtomicU64>>,
     sets: Vec<Option<SetMech>>,
     homes: HashMap<Key, Home>,
     /// Pin → (page, request).
@@ -570,6 +613,9 @@ struct State {
 }
 
 impl State {
+    fn promises(&mut self) {
+        self.table.promised = self.budgets.values().map(|n| n.load(Ordering::Acquire)).sum();
+    }
     fn tick(&mut self) -> u64 {
         self.clock += 1;
         self.clock
@@ -941,6 +987,45 @@ impl Memory {
             .unwrap_or(0)
     }
 
+    /// Reconcile actual allocator and driver-owned context bytes outside capture/callbacks.
+    pub fn observe(&self, torch: Torch) -> Result<()> {
+        self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            self.inner.measure(&mut st, torch);
+            self.inner.refresh(&mut st)?;
+            self.inner.publish(&st);
+            Ok(())
+        })
+    }
+
+    /// The native allocator's limit without waiting for state or running maintenance.
+    pub fn allocator_limit(&self) -> Option<u64> {
+        let mut st = self.inner.state.try_lock()?;
+        st.promises();
+        // Completed custody withdrawals become spendable; no wait on their sender.
+        st.table.pending = self.inner.to_custody.pending();
+        Some(st.table.torch_limit())
+    }
+
+    /// Atomically admit additional external workspace before execution/capture. Actual pool
+    /// growth consumes the promise; existing static/pool bytes are measured exactly once.
+    pub fn workspace(&self, bytes: u64, torch: Torch) -> Result<Workspace> {
+        let remaining = Arc::new(AtomicU64::new(0));
+        let id = {
+            let mut st = self.inner.lock();
+            self.inner.measure(&mut st, torch);
+            let id = st.tick();
+            st.budgets.insert(id, remaining.clone());
+            id
+        };
+        let workspace = Workspace { inner: self.inner.clone(), id, remaining };
+        let actions = self.inner.demand(Trigger::Workspace { id, bytes, tried: Tried::default() }, None)?;
+        if let Some(Action::Exhausted { need }) = actions.last() {
+            return Err(Error::Exhausted(exhausted(*need, None, Stats::default())));
+        }
+        Ok(workspace)
+    }
+
     /// Blocks until every mechanism call and every custody and tier call decided so far has
     /// been made: then the kept pages are custody's (a planned handover), and a dropped Memory's
     /// row is gone when the drop returns.
@@ -989,6 +1074,7 @@ impl Inner {
     /// The state, with pin releases applied and completed events acted on.
     fn lock(&self) -> MutexGuard<'_, State> {
         let mut st = self.state.lock();
+        st.promises();
         self.drain(&mut st);
         st
     }
@@ -1178,6 +1264,7 @@ impl Inner {
 
     /// The other rows, orphans, capacity, mode and foreign bytes, read now.
     fn refresh(&self, st: &mut State) -> Result<()> {
+        st.promises();
         let mut rows = self.shared.rows()?;
         if rows.iter().any(|r| !r.live) && self.shared.reap(None)? {
             rows = self.shared.rows()?;
@@ -1757,7 +1844,7 @@ impl Inner {
                 return Ok(actions);
             }
             let tried = match &mut trigger {
-                Trigger::Bind { tried, .. } | Trigger::Prepare { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } => tried,
+                Trigger::Bind { tried, .. } | Trigger::Prepare { tried, .. } | Trigger::Workspace { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } => tried,
                 Trigger::Ask { .. } | Trigger::Load { .. } => return Ok(actions),
             };
             tried.freed += freed;
@@ -1791,6 +1878,10 @@ impl Inner {
     /// Applies one action; returns the bytes it unmapped.
     fn apply(&self, st: &mut State, a: &Action, req: Option<u64>, remote: &mut Vec<Action>, shrinks: &mut Vec<(u32, u64, Shrink)>) -> Result<u64> {
         match a {
+            Action::Workspace { id, bytes } => {
+                if let Some(remaining) = st.budgets.get(id) { remaining.store(*bytes, Ordering::Release); }
+                st.promises();
+            }
             Action::Unmap { page, class } => {
                 let bytes = st.table.page(*page).map_or(0, |p| p.bytes);
                 self.unmap(st, *page, *class, req, true)?;

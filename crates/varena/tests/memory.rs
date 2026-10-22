@@ -645,7 +645,7 @@ fn retained_identity_change_refuses_preparation_before_use() {
     let id = mem.load(set(dir.path(), "identity", 1, &g.uuid), Level::Ram).unwrap();
     let binding = mem.retain(id, &[0]).unwrap();
     mem.fill(id, Fill::Declared("changed-bake".into()));
-    assert!(matches!(binding.prepare(0), Err(varena::Error::Invalid(_))));
+    assert!(matches!(binding.prepare(0), Err(varena::Error::StaleBinding(_))));
 }
 
 #[test]
@@ -657,4 +657,20 @@ fn a_range_larger_than_capacity_unwinds_all_preparation_claims() {
     assert!(matches!(all.prepare(0), Err(varena::Error::Exhausted(_))));
     let one = mem.retain(id, &[0]).unwrap();
     assert_eq!(one.prepare(0).unwrap().len(), 1, "failed preparation strands no physical claims");
+}
+
+#[test]
+fn workspace_promises_convert_to_native_segments_and_release_unused_bytes() {
+    let (_scope, _l, mem, _g) = open("workspace-promises", 8 * MB);
+    let initial = mem.allocator_limit().unwrap();
+    let reservation = mem.workspace(3 * MB, Torch::default()).unwrap();
+    assert_eq!(mem.allocator_limit().unwrap(), initial - 3 * MB);
+    assert!(reservation.take(MB));
+    assert_eq!(reservation.remaining(), 2 * MB);
+    assert_eq!(mem.allocator_limit().unwrap(), initial - 2 * MB);
+    assert!(!reservation.take(3 * MB), "a pool cannot exceed its prepared budget");
+    reservation.refund(MB);
+    assert_eq!(mem.allocator_limit().unwrap(), initial - 3 * MB);
+    drop(reservation);
+    assert_eq!(mem.allocator_limit().unwrap(), initial);
 }

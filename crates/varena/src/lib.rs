@@ -24,7 +24,7 @@ pub mod tier;
 pub use backend::{Access, Backend, Event, HostBackend, Physical, Va};
 pub use cuda::CudaBackend;
 pub use ledger::{Grant, Ledger, Peak, Room, RowStatus, Status};
-pub use memory::{CacheId, Fills, Measured, Memory, Moved, Next, Origin, Pass, Pin, Ref, Request, Retained, SetId, Site, SitePeak, Stats, StepStats, Torch, Yielded};
+pub use memory::{CacheId, Fills, Measured, Memory, Moved, Next, Origin, Pass, Pin, Ref, Request, Retained, SetId, Site, SitePeak, Stats, StepStats, Torch, Workspace, Yielded};
 pub use table::{Fill, Fingerprint, Level, PartId, Plan, SetSpec, Step};
 pub use tier::{Need, Pressure, Tier};
 
@@ -53,6 +53,8 @@ pub struct Exhausted {
 pub enum Error {
     #[error("exhausted: {} bytes short{}", .0.need, .0.site.as_deref().map(|s| format!(" at {s}")).unwrap_or_default())]
     Exhausted(Box<Exhausted>),
+    #[error("stale graph binding: {0}")]
+    StaleBinding(String),
     #[error("invalid: {0}")]
     Invalid(String),
     /// A driver call failed; `code` is the driver's (CUresult), `name` its name.
@@ -80,6 +82,7 @@ impl Error {
         match self {
             Error::Exhausted(_) => "EXHAUSTED",
             Error::Invalid(_) => "INVALID",
+            Error::StaleBinding(_) => "STALE_BINDING",
             Error::Device { .. } => "DEVICE",
             Error::Io(_) => "IO",
             Error::Closed(_) => "CLOSED",

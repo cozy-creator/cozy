@@ -351,6 +351,8 @@ pub struct Table {
     /// Torch's allocator, as last measured (pass start and end, every OOM).
     pub allocated: u64,
     pub reserved: u64,
+    /// Future native graph-pool allocations reserved before capture.
+    pub promised: u64,
     /// Shared mode (a machine its owner also uses): speculation never grows this process's
     /// footprint, so it takes only what it frees of its own.
     pub shared: bool,
@@ -431,7 +433,7 @@ impl Table {
     /// Torch's bytes as this row counts them: the open requests' rooms and claims, or what the
     /// allocator holds when that is more.
     pub fn torch(&self) -> u64 {
-        self.requests.iter().map(|r| r.room + r.claimed).sum::<u64>().max(self.reserved)
+        self.requests.iter().map(|r| r.room + r.claimed).sum::<u64>().max(self.reserved.saturating_add(self.promised))
     }
 
     /// The allocator's slack beyond what the rooms need: free once the trim hook runs (F).
@@ -462,7 +464,7 @@ impl Table {
 
     /// What torch's allocator may hold: capacity − context − mapped − other rows − foreign.
     pub fn torch_limit(&self) -> u64 {
-        self.capacity.saturating_sub(self.foreign + self.orphans + self.context + self.mapped() + self.others_held())
+        self.capacity.saturating_sub(self.foreign + self.orphans + self.context + self.mapped() + self.pending + self.inflight + self.promised + self.others_held())
     }
 
     /// The bytes of a step's pages.
