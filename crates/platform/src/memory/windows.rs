@@ -165,27 +165,50 @@ fn lock_ex(f: &Owned, start: u64, len: u64, flags: u32) -> Result<bool> {
     }
 }
 
-/// Takes (or, `wait`, waits for) a write lock on a range, held by this handle.
-pub fn lock(f: &Owned, start: u64, len: u64, wait: bool) -> Result<bool> {
-    lock_ex(f, start, len, LOCKFILE_EXCLUSIVE_LOCK | if wait { 0 } else { LOCKFILE_FAIL_IMMEDIATELY })
+fn flags(exclusive: bool, wait: bool) -> u32 {
+    (if exclusive { LOCKFILE_EXCLUSIVE_LOCK } else { 0 }) | if wait { 0 } else { LOCKFILE_FAIL_IMMEDIATELY }
 }
 
-/// Takes (or waits for) a read lock: many readers, no writer.
+/// Releases this handle's lock on the range; false when it held none.
+fn unlock_range(f: &Owned, start: u64, len: u64) -> bool {
+    let mut o = at(start);
+    // SAFETY: as in `lock_ex`.
+    unsafe { UnlockFileEx(raw(f), 0, len as u32, (len >> 32) as u32, &mut o) != 0 }
+}
+
+/// Takes (or, `wait`, waits for) a write lock on a range, held by this handle. A Windows lock
+/// never converts and this handle's own lock refuses it, so, as with an OFD lock, its own lock
+/// converts: released and taken anew; a refused conversion keeps a read lock.
+pub fn lock(f: &Owned, start: u64, len: u64, wait: bool) -> Result<bool> {
+    if lock_ex(f, start, len, flags(true, false))? {
+        return Ok(true);
+    }
+    let own = unlock_range(f, start, len);
+    if lock_ex(f, start, len, flags(true, wait))? {
+        return Ok(true);
+    }
+    if own {
+        lock_ex(f, start, len, flags(false, true))?;
+    }
+    Ok(false)
+}
+
+/// Takes (or waits for) a read lock: many readers, no writer. This handle's own lock converts
+/// (a read lock beside its own write lock would be a second lock, not a conversion).
 pub fn share(f: &Owned, start: u64, len: u64, wait: bool) -> Result<bool> {
-    lock_ex(f, start, len, if wait { 0 } else { LOCKFILE_FAIL_IMMEDIATELY })
+    unlock_range(f, start, len);
+    lock_ex(f, start, len, flags(false, wait))
 }
 
 pub fn unlock(f: &Owned, start: u64, len: u64) -> Result<()> {
-    let mut o = at(start);
-    // SAFETY: as in `lock_ex`; a range this handle did not lock answers an error we ignore.
-    unsafe { UnlockFileEx(raw(f), 0, len as u32, (len >> 32) as u32, &mut o) };
+    unlock_range(f, start, len);
     Ok(())
 }
 
 /// Whether another handle holds a lock on the range: a lock this one can take is free.
 pub fn held(f: &Owned, start: u64, len: u64) -> Result<bool> {
-    if lock_ex(f, start, len, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)? {
-        unlock(f, start, len)?;
+    if lock_ex(f, start, len, flags(true, false))? {
+        unlock_range(f, start, len);
         return Ok(false);
     }
     Ok(true)

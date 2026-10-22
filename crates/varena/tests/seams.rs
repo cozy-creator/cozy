@@ -35,8 +35,8 @@ impl Drop for Gpu {
     }
 }
 
-/// A standalone engine: opens its memory on the GPU's table by name, says `open <pid>`, and
-/// holds it until its stdin ends.
+/// A standalone engine: opens its memory on the GPU's table by name, says `open <pid>`, holds it
+/// until its stdin ends, and retires it (its row goes, TensorD wakes) before it exits.
 #[test]
 #[ignore = "the seams tests run it as an engine"]
 fn seams_engine() {
@@ -48,7 +48,7 @@ fn seams_engine() {
     // Its own line: libtest has written `test seams_engine ... ` before the test runs.
     println!("\nopen {}", std::process::id());
     let _ = std::io::stdin().read_to_end(&mut vec![]);
-    drop(mem);
+    mem.retire().unwrap();
 }
 
 /// An engine started by this test, open on `gpu`'s table; its output read to the end.
