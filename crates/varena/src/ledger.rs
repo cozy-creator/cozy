@@ -34,7 +34,7 @@ use crate::memory::SitePeak;
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledgr12");
+const MAGIC: u64 = u64::from_le_bytes(*b"vledgr13");
 /// The header's page: the heap starts after it, and grows from there.
 const HEADER: u64 = 4096;
 /// The heap's unit: rows take two, a fact as many as its bytes need.
@@ -54,8 +54,9 @@ const ROW: u64 = 1;
 const FACT: u64 = 2;
 
 /// The latch: context, torch, caches, classes (7), remaining, unmeasured, running, outside,
-/// yielded, family, host_peak, host_unmeasured, returning, physical, physical_epoch.
-const WORDS: usize = 21;
+/// yielded (family, W) × YIELDED, host_peak, host_unmeasured, returning, physical,
+/// physical_epoch.
+const WORDS: usize = 19 + 2 * decide::YIELDED;
 
 #[repr(C)]
 struct Header {
@@ -156,10 +157,10 @@ pub(crate) struct Facts {
     pub unmeasured: u64,
     pub running: u64,
     pub outside: u64,
-    /// The remaining W of its requests waiting on child calls, and the family they wait for
-    /// (a hash; 0: none): only that family's child is admitted beside it as if it were gone.
-    pub yielded: u64,
-    pub family: u64,
+    /// The remaining W of its requests waiting on child calls, per family they wait for (a
+    /// hash, W): each family's child is admitted beside its own parents as if they were gone,
+    /// never beside another family's (review 3, R4). Family 0: any, counted for every child.
+    pub yielded: [(u64, u64); decide::YIELDED],
     /// Its running requests' largest measured host high-water, and how many have none
     /// measured: the RAM tier keeps their growth free, and fills nothing beside an unmeasured one.
     pub host_peak: u64,
@@ -177,12 +178,14 @@ pub(crate) struct Facts {
 impl Facts {
     fn words(&self) -> [u64; WORDS] {
         let c = self.classes;
-        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family, self.host_peak, self.host_unmeasured, self.returning, self.physical, self.physical_epoch]
+        let y = self.yielded;
+        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, y[0].0, y[0].1, y[1].0, y[1].1, y[2].0, y[2].1, self.host_peak, self.host_unmeasured, self.returning, self.physical, self.physical_epoch]
     }
 
     fn of(w: [u64; WORDS]) -> Facts {
-        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning, physical, physical_epoch] = w;
-        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family, host_peak, host_unmeasured, returning, physical, physical_epoch }
+        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, f0, y0, f1, y1, f2, y2, host_peak, host_unmeasured, returning, physical, physical_epoch] = w;
+        let yielded = [(f0, y0), (f1, y1), (f2, y2)];
+        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, host_peak, host_unmeasured, returning, physical, physical_epoch }
     }
 
     fn held(&self) -> u64 {
@@ -1441,7 +1444,7 @@ impl Ledger {
         let admitted = rows
             .iter()
             .filter(|r| r.live)
-            .map(|r| Admitted { context: r.facts.context, outside: r.facts.outside, remaining: r.facts.remaining, running: r.facts.running as u32, unmeasured: r.facts.unmeasured as u32, yielded: r.facts.yielded, family: r.facts.family })
+            .map(|r| Admitted { context: r.facts.context, outside: r.facts.outside, remaining: r.facts.remaining, running: r.facts.running as u32, unmeasured: r.facts.unmeasured as u32, yielded: r.facts.yielded })
             .collect();
         let dispatched = self.shared.facts("dispatch/")?.into_iter().map(|(_, key)| self.peak(&String::from_utf8_lossy(&key))).collect::<Result<_>>()?;
         Ok((self.shared.capacity()?, self.shared.foreign()?, admitted, dispatched))
@@ -1501,7 +1504,7 @@ impl Ledger {
         let mut rooms = Vec::with_capacity(group.len());
         for (g, l) in group.iter().enumerate() {
             // A yielded parent's W comes back, except to its own family's child.
-            let unmovable = |f: &Facts| f.context + f.torch + [Class::W, Class::P].iter().filter_map(|c| f.classes.get(c.index())).sum::<u64>() + if family == Some(f.family) { 0 } else { f.yielded };
+            let unmovable = |f: &Facts| f.context + f.torch + [Class::W, Class::P].iter().filter_map(|c| f.classes.get(c.index())).sum::<u64>() + decide::yielded_beside(&f.yielded, family);
             let held: u64 = l.shared.rows()?.iter().filter(|r| r.live).map(|r| unmovable(&r.facts)).sum();
             // GPU 0 keeps the package's compute room free: its measured room beside its
             // weights, wherever those lived when it was measured.

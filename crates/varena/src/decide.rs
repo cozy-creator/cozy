@@ -679,9 +679,17 @@ pub struct Admitted {
     pub running: u32,
     /// Running requests with an unmeasured step left.
     pub unmeasured: u32,
-    /// The remaining W of its requests waiting on child calls, and their family (0: none).
-    pub yielded: u64,
-    pub family: u64,
+    /// The remaining W of its requests waiting on child calls, per family they wait for
+    /// (family, W); family 0: any (beyond the slots), counted for every child.
+    pub yielded: [(u64, u64); YIELDED],
+}
+
+/// Families a row publishes yielded W for, each apart; more fold into one counted for all.
+pub const YIELDED: usize = 3;
+
+/// A row's yielded W as a child of `family` sees it: all but its own family's parents'.
+pub fn yielded_beside(yielded: &[(u64, u64); YIELDED], family: Option<u64>) -> u64 {
+    yielded.iter().filter(|(f, _)| family != Some(*f) || *f == 0).map(|(_, w)| w).sum()
 }
 
 /// Whether a request whose W is `w` (`None`: unmeasured) fits beside `rows` and the dispatched
@@ -696,7 +704,7 @@ pub fn fits(capacity: u64, foreign: u64, rows: &[Admitted], dispatched: &[Option
     if w.is_none() || rows.iter().any(|r| r.unmeasured > 0) || dispatched.iter().any(Option::is_none) {
         return false;
     }
-    let rows: u64 = rows.iter().map(|r| r.context + r.outside + r.remaining + if family == Some(r.family) { 0 } else { r.yielded }).sum();
+    let rows: u64 = rows.iter().map(|r| r.context + r.outside + r.remaining + yielded_beside(&r.yielded, family)).sum();
     let dispatched: u64 = dispatched.iter().flatten().sum();
     rows + dispatched + w.unwrap_or(0) <= capacity.saturating_sub(foreign)
 }

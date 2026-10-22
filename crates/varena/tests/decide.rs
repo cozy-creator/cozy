@@ -401,7 +401,7 @@ fn any_oom_sequence_ends_within_pages_plus_cuts_plus_two() {
 
 #[test]
 fn admission_counts_each_byte_once() {
-    let row = |remaining, running, unmeasured| Admitted { context: GB, outside: 0, remaining, running, unmeasured, yielded: 0, family: 0 };
+    let row = |remaining, running, unmeasured| Admitted { context: GB, outside: 0, remaining, running, unmeasured, yielded: [(0, 0); 3] };
     assert!(fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(12 * GB), None));
     assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(13 * GB + 1), None));
     assert!(!fits(24 * GB, 2 * GB, &[row(10 * GB, 1, 0)], &[], Some(12 * GB), None), "foreign bytes are taken off");
@@ -410,6 +410,18 @@ fn admission_counts_each_byte_once() {
     assert!(!fits(24 * GB, 0, &[row(GB, 1, 0)], &[], None, None));
     assert!(fits(24 * GB, 0, &[row(0, 0, 0)], &[], None, None));
     assert!(!fits(24 * GB, 0, &[row(GB, 1, 1)], &[], Some(GB), None));
+}
+
+/// Review 3, R4: a row with requests yielded to two families publishes each family's W apart.
+/// A's child is admitted beside A's parent as if it were gone, never beside B's; B's likewise.
+#[test]
+fn a_rows_yielded_w_is_per_family() {
+    let (a, b) = (11, 22);
+    let rows = [Admitted { context: GB, outside: 0, remaining: 0, running: 1, unmeasured: 0, yielded: [(a, 8 * GB), (b, 6 * GB), (0, 0)] }];
+    // 24 GB: the context's 1, the other family's parent, and the child.
+    assert!(fits(24 * GB, 0, &rows, &[], Some(17 * GB), Some(a)) && !fits(24 * GB, 0, &rows, &[], Some(17 * GB + 1), Some(a)), "A's child: beside B's parent (6) only");
+    assert!(fits(24 * GB, 0, &rows, &[], Some(15 * GB), Some(b)) && !fits(24 * GB, 0, &rows, &[], Some(15 * GB + 1), Some(b)), "B's child: beside A's parent (8) only");
+    assert!(fits(24 * GB, 0, &rows, &[], Some(9 * GB), None) && !fits(24 * GB, 0, &rows, &[], Some(9 * GB + 1), None), "a stranger's child: beside both");
 }
 
 // ---- regressions from review 1
