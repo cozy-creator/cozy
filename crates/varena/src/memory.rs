@@ -656,6 +656,7 @@ impl Burst {
 
 /// A filled page to copy into the RAM tier layout `tier` (`gen`: as it was filled) for request
 /// `req`.
+#[derive(Clone)]
 struct Save {
     key: Key,
     gen: u64,
@@ -773,6 +774,9 @@ struct State {
     /// by digest: unlocking stalls the device, so it waits for the tier to take one back (or
     /// the process to end), and a set opening it again reuses it.
     parked: HashMap<String, Arc<tier::Held>>,
+    /// Tier copies the host had no room for: one is posted again when a measured pass ends,
+    /// and the rest once it finds room (first runs and standalone calls reach the tier so).
+    deferred_saves: Vec<Save>,
 }
 
 impl State {
@@ -1337,7 +1341,7 @@ impl Memory {
     /// the kept pages are custody's (a planned handover), and a dropped Memory's row is gone when
     /// the drop returns.
     pub fn settle(&self) {
-        self.inner.saves.settle();
+        self.inner.saves.quiesce();
         self.inner.hand_over();
         self.inner.mech.settle();
         self.inner.to_custody.settle();
@@ -2302,6 +2306,21 @@ impl Inner {
     /// unmapped or changed since it was queued is not copied.
     fn save(self: &Arc<Self>, s: &Save) {
         if self.check_ownership().is_err() { return; }
+        // The host room first, nothing pinned or counted meanwhile: a tier that answers late
+        // (or never) stalls only this speculative copy, never a demand's settle or an ask's
+        // answer (review 5, F7). No room now: it waits for a measured pass to end.
+        let Ok((.., span)) = self.state.lock().place(s.key) else { return };
+        let Some(permit) = self.tier.as_ref().and_then(|t| t.reserve(span)) else {
+            let mut st = self.state.lock();
+            if !st.deferred_saves.iter().any(|d| d.key == s.key && d.gen == s.gen) {
+                st.deferred_saves.push(s.clone());
+            }
+            return;
+        };
+        // The host has room again: the copies deferred meanwhile go too.
+        for save in std::mem::take(&mut self.state.lock().deferred_saves) {
+            self.saves.post(save, 0);
+        }
         let (pin, held, (va, off, span), ready) = {
             let mut st = self.lock();
             // A copy out reads the page: never while its Keep's protect runs.
@@ -2325,10 +2344,7 @@ impl Inner {
             (pin, held, place, ready)
         };
         let start = Instant::now();
-        let permit = self.tier.as_ref().and_then(|t| t.reserve(span));
-        let result = match permit.as_ref() {
-            None => Ok(false),
-            Some(_) => held
+        let result = held
                 .fill(&[s.key.1], |regions| {
                     regions.iter().try_for_each(|(_, dst)| match dst {
                         // SAFETY: the region is mapped writable and write-locked for this fill.
@@ -2355,8 +2371,7 @@ impl Inner {
                         }
                     })
                 })
-                .map(|()| true),
-        };
+                .map(|()| true);
         if let Err(e) = &result {
             tracing::warn!("varena: copying {:?} into the RAM tier failed: {e}", s.key);
             if e.is_sticky() {
@@ -3179,6 +3194,11 @@ impl Inner {
         let mut st = self.lock();
         st.restock = true;
         self.measure(&mut st, torch);
+        // One deferred tier copy probes for room (one host ask); the rest follow it once
+        // there is.
+        if let Some(save) = st.deferred_saves.pop() {
+            self.saves.post(save, 0);
+        }
         let Some(key) = st.active.iter().find(|((r, _), a)| *r == req && a.id == pass).map(|(k, _)| *k) else {
             self.unlock(st);
             return Ok(());

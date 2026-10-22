@@ -49,7 +49,7 @@ fn main() {
     }
     let filter: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
     type Case = (&'static str, fn(&Path));
-    let cases: [Case; 25] = [
+    let cases: [Case; 26] = [
         ("an_idle_holder_answers_an_ask", an_idle_holder_answers_an_ask),
         ("a_killed_holder_leaves_orphans_a_successor_imports", a_killed_holder_leaves_orphans_a_successor_imports),
         ("a_failed_request_frees_everything", a_failed_request_frees_everything),
@@ -64,6 +64,7 @@ fn main() {
         ("a_stale_reader_never_frees_a_newer_row", a_stale_reader_never_frees_a_newer_row),
         ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
         ("a_layout_stays_locked_until_the_tier_takes_it_back", a_layout_stays_locked_until_the_tier_takes_it_back),
+        ("a_refused_tier_copy_runs_after_a_measured_pass", a_refused_tier_copy_runs_after_a_measured_pass),
         ("a_joint_step_runs_a_pass_per_set", a_joint_step_runs_a_pass_per_set),
         ("a_child_runs_while_its_parent_yields", a_child_runs_while_its_parent_yields),
         ("the_tier_waits_on_no_executor_and_a_pending_release_settles_first", the_tier_waits_on_no_executor_and_a_pending_release_settles_first),
@@ -975,6 +976,36 @@ fn a_layout_stays_locked_until_the_tier_takes_it_back(dir: &Path) {
     unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
     tier.await_releases(1);
     assert_eq!(y.ok("unregisters"), "1", "the tier's ask unlocks one layout's run in one call");
+    y.exit();
+}
+
+/// Review 5, item 3: a page's copy into the RAM tier the host had no room for is not lost; once a
+/// measured pass ends with the host's room back, it runs, so a first run's (or a standalone
+/// call's) weights reach the tier.
+fn a_refused_tier_copy_runs_after_a_measured_pass(dir: &Path) {
+    use std::os::fd::FromRawFd;
+    let g = gpu("deferred", 64 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
+    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
+    let keep = Arc::new(std::sync::atomic::AtomicU64::new(SHORT));
+    let tier = varena::Tier::serve(varena::Pressure::Events(event), need(&keep)).unwrap().expect("this namespace's tier");
+    let path = write_set(dir, "d1", 2);
+    let digest = format!("layout-d1-{}", g.uuid);
+    let resident = || tier.resident().into_iter().find(|(k, _)| *k == digest).map_or(0, |(_, b)| b);
+    let mut y = Agent::spawn();
+    y.ok(&format!("open {} {}", g.uuid, g.memory));
+    // Filled to the device while the host has no room: no tier copy.
+    y.ok(&format!("load d1 {} stored gpu", path.display()));
+    y.ok("settle");
+    assert!(resident() < REGION_ALIGN, "no room, no copy: {}", resident());
+    keep.store(0, std::sync::atomic::Ordering::SeqCst);
+    y.ok("request r d1");
+    y.ok("pass r d1 1x1");
+    y.ok(&format!("endpass r {MB}"));
+    y.ok("settle");
+    assert!(resident() >= 2 * REGION_ALIGN, "the deferred copies ran: {}", resident());
+    y.ok("end r");
     y.exit();
 }
 
