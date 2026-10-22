@@ -516,7 +516,27 @@ def capped(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, cap
     print(f"STATS_JSON {stats.json()}", flush=True)
     for derived in (False, True):
         escapes(mem, unet, plain, reference, derived)
+    off_forward(mem, unet, plain)
     return weakref.ref(mem)
+
+
+def off_forward(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel) -> None:
+    """A weight read outside any forward (a package's table, an overlay's factor) binds on read:
+    it has its bytes, the tensor made of it holds the page's pin while it lives, the pin goes
+    when it dies, and the read is counted."""
+    held = native.pins_held()
+    weight = unet.down_blocks[1].resnets[0].conv1.weight  # a placeholder: no forward runs
+    want = plain.down_blocks[1].resnets[0].conv1.weight.detach()
+    row = weight[0]
+    check("off-forward: a weight read outside any forward has its bytes", torch.equal(row.cpu(), want[0]), (row.cpu() - want[0]).abs().max())
+    check("off-forward: the tensor read holds its page's pin while it lives", native.pins_held() == held + 1, (native.pins_held(), held))
+    total = weight.float().sum()  # a converted placeholder reads too
+    check("off-forward: a converted read has its bytes", torch.allclose(total.cpu(), want.float().sum(), rtol=1e-5), (total, want.float().sum()))
+    del row
+    gc.collect()
+    check("off-forward: the pin goes when the tensor dies", native.pins_held() == held, (native.pins_held(), held))
+    reads = {path: n for (_, path), n in mem.off_forward.items()}.get("down_blocks.1.resnets.0", (0, 0))
+    check("off-forward: the reads are counted with their bytes", reads[0] == 2 and reads[1] > 0, mem.off_forward)
 
 
 def escapes(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel, reference: list[torch.Tensor], derived: bool) -> None:
