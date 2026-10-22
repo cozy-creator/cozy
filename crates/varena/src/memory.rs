@@ -1154,16 +1154,18 @@ impl Inner {
         st.releasing.remove(&key);
         let Some(h) = st.homes.get_mut(&key) else { return Ok(()) };
         let (old, exported, old_identity) = (std::mem::replace(&mut h.ready, Event::DONE), h.exported, h.identity.clone());
-        let phys = if exported { h.phys.take() } else { None };
-        let kept = phys.is_some();
+        // Kept, or with a Keep queued: never written again; a fresh page takes its place.
+        let phys = if exported || h.keeping { h.phys.take() } else { None };
+        let renew = phys.is_some();
         *h = Home { phys: h.phys.take(), ready: Event::DONE, gen, filled: false, filling: true, fresh: false, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
         let job = Job { key, gen, req, span, after: vec![] };
-        if kept {
-            // Read-only and kept under its old identity: never written or protected again. Custody
-            // gives the old key up; a fresh page takes its place once its consumers are done.
-            if self.withdraw(old_identity, key.1, span).is_some() {
+        if renew {
+            // Read-only and kept under its old identity (or about to be): never written or
+            // protected again. Custody gives the old key up; a fresh page takes its place once
+            // its consumers are done.
+            if exported && self.withdraw(old_identity, key.1, span).is_some() {
                 st.table.pending += span;
             }
             self.backend.retire(old);
@@ -2848,7 +2850,12 @@ impl Inner {
         match op {
             Mech::Map { key, gen, va, off, span, job, speculative, decided } => self.place_page(key, gen, va, off, span, job, (!speculative).then_some(decided)),
             Mech::Renew { key, gen, va, off, span, old, after, job } => {
-                // The driver lets its consumers finish before the unmap returns.
+                // Its consumers finish before the unmap: this thread waits for their events.
+                for e in &after {
+                    if let Err(e) = self.backend.finish(*e) {
+                        tracing::warn!("varena: waiting for a renewed page's consumers failed: {e}");
+                    }
+                }
                 let _ = self.backend.unmap(va, off, span);
                 if let Some(old) = old {
                     self.backend.destroy(old);
@@ -2892,6 +2899,11 @@ impl Inner {
                 self.backend.retire(ready);
             }
             Mech::Keep { key, gen, va, off, span, phys, len } => {
+                // A Keep for an earlier life of the page is dropped before it protects: that
+                // page was renewed (a Keep queued forces a renewal), never refilled in place.
+                if !self.state.lock().homes.get(&key).is_some_and(|h| h.gen == gen) {
+                    return;
+                }
                 let made = self.backend.protect(va, off, span, Access::Read).and_then(|_| self.backend.export(&Physical { id: phys, len }));
                 let mut st = self.state.lock();
                 let Some(home) = st.homes.get_mut(&key).filter(|h| h.gen == gen) else { return };

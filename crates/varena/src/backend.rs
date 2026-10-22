@@ -94,6 +94,9 @@ pub trait Backend: Send + Sync {
     fn wait(&self, event: Event, stream: usize) -> Result<()>;
     /// Blocks until `stream`'s work so far completes: only where recording an event failed.
     fn synchronize(&self, stream: usize) -> Result<()>;
+    /// Blocks until `event` completes: only the mechanism thread, before it unmaps a page whose
+    /// consumers may still read it.
+    fn finish(&self, event: Event) -> Result<()>;
     /// Page-locks `len` bytes of read-only host memory at `ptr` for the copy engine
     /// (`cuMemHostRegister`): a RAM-tier region, once, so every fill from it is a pinned copy.
     fn register_host(&self, ptr: u64, len: u64) -> Result<()>;
@@ -287,6 +290,11 @@ mod host {
             Ok(())
         }
 
+        /// Host events are complete when made.
+        fn finish(&self, _: Event) -> Result<()> {
+            Ok(())
+        }
+
         /// Host copies need no page lock.
         fn register_host(&self, _: u64, _: u64) -> Result<()> {
             Ok(())
@@ -379,6 +387,9 @@ mod host {
         }
 
         fn synchronize(&self, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn finish(&self, _: Event) -> Result<()> {
             Ok(())
         }
         fn register_host(&self, _: u64, _: u64) -> Result<()> {

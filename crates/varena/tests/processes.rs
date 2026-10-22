@@ -208,6 +208,9 @@ impl Backend for Recording {
     fn synchronize(&self, stream: usize) -> varena::Result<()> {
         self.host.synchronize(stream)
     }
+    fn finish(&self, event: Event) -> varena::Result<()> {
+        self.host.finish(event)
+    }
     fn register_host(&self, ptr: u64, _: u64) -> varena::Result<()> {
         self.registered.lock().insert(ptr);
         Ok(())

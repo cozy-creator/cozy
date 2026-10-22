@@ -24,8 +24,10 @@ use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Leve
 struct Events {
     next: AtomicU64,
     done: Mutex<HashSet<u64>>,
-    /// Calls that make a page read-only or hand it out.
+    /// Calls that make a page read-only or hand it out, and host waits on an event ("finish"),
+    /// each signalled.
     kept: Mutex<Vec<&'static str>>,
+    logged: Condvar,
     unmaps: AtomicU64,
     /// In-stream waits asked for, in order: (event, stream).
     waits: Mutex<Vec<(u64, usize)>>,
@@ -49,6 +51,40 @@ struct Events {
     unmap_gate: Gate,
     /// Opened when a held unmap is waiting.
     unmap_waits: Gate,
+    /// Signalled when the test completes an event.
+    completed: Condvar,
+    /// Events varena gave up (retired), and a signal for each.
+    retired: Mutex<HashSet<u64>>,
+    retiring: Condvar,
+}
+
+impl Events {
+    /// The work behind `event` finished, as a card's does.
+    fn complete(&self, event: u64) {
+        self.done.lock().insert(event);
+        self.completed.notify_all();
+    }
+
+    fn log(&self, call: &'static str) {
+        self.kept.lock().push(call);
+        self.logged.notify_all();
+    }
+
+    /// Blocks until the log of calls satisfies `until`.
+    fn await_log(&self, until: impl Fn(&[&'static str]) -> bool) {
+        let mut log = self.kept.lock();
+        while !until(&log) {
+            self.logged.wait(&mut log);
+        }
+    }
+
+    /// Blocks until varena retires `event`.
+    fn await_retired(&self, event: u64) {
+        let mut retired = self.retired.lock();
+        while !retired.contains(&event) {
+            self.retiring.wait(&mut retired);
+        }
+    }
 }
 
 /// Closed until opened.
@@ -119,7 +155,7 @@ impl Backend for Stream {
         self.host.map(va, offset, page, access)
     }
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()> {
-        self.events.kept.lock().push("protect");
+        self.events.log("protect");
         self.host.protect(va, offset, len, access)
     }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> {
@@ -131,7 +167,7 @@ impl Backend for Stream {
         self.host.unmap(va, offset, len)
     }
     fn export(&self, page: &Physical) -> Result<Owned> {
-        self.events.kept.lock().push("export");
+        self.events.log("export");
         self.host.export(page)
     }
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> {
@@ -177,13 +213,25 @@ impl Backend for Stream {
         self.events.syncs.lock().push(stream);
         Ok(())
     }
+    /// Waits, as a card's host does, until the test completes the event.
+    fn finish(&self, event: Event) -> Result<()> {
+        self.events.log("finish");
+        let mut done = self.events.done.lock();
+        while event != Event::DONE && !done.contains(&event.0) {
+            self.events.completed.wait(&mut done);
+        }
+        Ok(())
+    }
     fn register_host(&self, _: u64, _: u64) -> Result<()> {
         Ok(())
     }
     fn unregister_host(&self, _: u64) -> Result<()> {
         Ok(())
     }
-    fn retire(&self, _: Event) {}
+    fn retire(&self, event: Event) {
+        self.events.retired.lock().insert(event.0);
+        self.events.retiring.notify_all();
+    }
     fn drain(&self) -> Result<()> {
         Ok(())
     }
@@ -237,7 +285,7 @@ fn a_page_is_kept_only_after_its_transform_completes() {
     assert!(!again.fresh);
     assert_eq!(again.ready, Event(transform), "the second binder orders after the transform");
     drop(again);
-    events.done.lock().insert(transform);
+    events.complete(transform);
     mem.torch_limit();
     // The mechanism makes it read-only, then exports it.
     while events.kept.lock().len() < 2 {
@@ -270,7 +318,7 @@ fn a_page_unmaps_only_after_its_last_consumer() {
         mem.torch_limit();
     }
     assert_eq!(events.unmaps.load(Ordering::Relaxed), 0, "unmapped while its consumer's stream ran");
-    events.done.lock().insert(release);
+    events.complete(release);
     mem.torch_limit();
     while events.unmaps.load(Ordering::Relaxed) == 0 {
         ledger.await_event().unwrap();
@@ -306,7 +354,7 @@ fn a_binder_never_waits_on_a_release_event() {
         let (gate, events) = (gate.clone(), events.clone());
         std::thread::spawn(move || {
             gate.pass();
-            events.done.lock().insert(release);
+            events.complete(release);
         })
     };
     let binder = {
@@ -656,6 +704,9 @@ impl Backend for Driver {
     fn synchronize(&self, stream: usize) -> Result<()> {
         self.host.synchronize(stream)
     }
+    fn finish(&self, event: Event) -> Result<()> {
+        self.host.finish(event)
+    }
     fn register_host(&self, ptr: u64, len: u64) -> Result<()> {
         self.host.register_host(ptr, len)
     }
@@ -757,15 +808,17 @@ fn a_kept_page_is_never_overwritten_under_its_old_key() {
     unsafe { std::ptr::write_bytes(pin.ptr as *mut u8, 0xab, pin.len as usize) };
     let len = pin.len as usize;
     pin.filled();
-    events.done.lock().insert(events.next.load(Ordering::Relaxed));
+    events.complete(events.next.load(Ordering::Relaxed));
     mem.torch_limit();
     log.await_call(|(_, c)| c.contains("Export") && c.contains(&old));
-    // Its consumer's stream still reads it; custody stops answering; lora-b is loaded.
+    // Its consumer lets go; custody stops answering; lora-b is loaded.
     drop(pin);
     gate.close();
     let mut b = spec;
     b.fingerprint.fill = Fill::Declared("lora-b".into());
     mem.load(b, Level::Ram).unwrap();
+    // The renewal waits for the consumer's work to finish (review 5, R3).
+    events.complete(events.next.load(Ordering::Relaxed));
     let fresh = mem.bind(id, 0, 2).unwrap().fresh;
     assert!(fresh, "refilled for lora-b while custody answered nothing");
     // Custody still holds the old key (its Withdraw waits at the gate), over the old bytes.
@@ -859,4 +912,57 @@ fn a_waiting_unmap_holds_no_lock() {
     mem.torch_limit();
     events.unmap_gate.open();
     binder.join().unwrap();
+}
+
+/// Review 5, R1 and R3 (the reviewer's probe, event-driven): a Keep queued behind slow
+/// mechanism work never protects the page a refill hands out. A page with a Keep queued is
+/// renewed (a fresh page, a new life) and the stale Keep is dropped; the renewal unmaps the old
+/// page only once its consumers' events complete.
+#[test]
+fn a_page_with_a_keep_queued_is_renewed_after_its_consumers() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("stalekeep-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 64 << 20 };
+    let _scope = Scope::new(&g.uuid);
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Gpu).unwrap();
+    mem.settle();
+    // P's fill lands as an event still pending, so its Keep waits for it.
+    events.pending_fences.store(true, Ordering::SeqCst);
+    let p = mem.load(stored(dir.path(), &uuid, "p", 1), Level::Gpu).unwrap();
+    let filled = *events.fences.lock().last().unwrap();
+    // A consumer binds P and lets go: its release event is pending.
+    drop(mem.bind(p, 0, 1).unwrap());
+    let release = events.next.load(Ordering::SeqCst);
+    // The mechanism thread waits in an unmap, as a card's does behind queued work.
+    events.hold_unmap.store(true, Ordering::SeqCst);
+    mem.unload(a);
+    events.unmap_waits.pass();
+    // P's fill completes: the next decision queues its Keep behind the held unmap.
+    events.complete(filled);
+    mem.torch_limit();
+    let protects = || events.kept.lock().iter().filter(|c| **c == "protect").count();
+    let before = protects();
+    // A fill-identity switch (a LoRA change), then a bind: P is renewed, not refilled in place.
+    mem.fill(p, Fill::Declared("lora-b".into()));
+    let binder = {
+        let mem = mem.clone();
+        std::thread::spawn(move || mem.bind(p, 0, 2).unwrap())
+    };
+    // The bind decided the refill (it gave up P's old ready event) before the Keep runs.
+    events.await_retired(filled);
+    events.unmap_gate.open();
+    // The mechanism runs P's queued Keep, then the renewal, which waits for P's consumer.
+    events.await_log(|log| log.contains(&"finish") || log.iter().filter(|c| **c == "protect").count() > before);
+    assert_eq!(protects(), before, "the stale Keep protected nothing");
+    let unmaps = events.unmaps.load(Ordering::SeqCst);
+    events.complete(release);
+    let pin = binder.join().unwrap();
+    assert!(events.unmaps.load(Ordering::SeqCst) > unmaps, "the old page unmapped after its consumer");
+    assert!(pin.fresh);
+    // The caller bakes into its fresh page.
+    // SAFETY: a fresh host page bound to this test alone.
+    unsafe { std::ptr::write_bytes(pin.ptr as *mut u8, 0xcd, pin.len as usize) };
+    pin.filled();
 }
