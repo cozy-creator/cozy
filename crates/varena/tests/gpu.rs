@@ -2917,14 +2917,17 @@ fn binds_outlive_the_custody_holder() {
     step!();
 }
 
-/// Under a pressure event, a RAM-tier layout an executor maps and has page-locked with the card
-/// (`register_host`) is asked back first: the executor unregisters and unmaps it, then the tier
-/// punches it out, so its bytes really return. The executor goes on from the store.
+/// Under a pressure event with a measured shortfall, a RAM-tier layout an executor maps and has page-locked with the
+/// card (`register_host`), its device pin held throughout, is asked back first: the executor unlocks and unmaps it, then
+/// the tier punches its regions out, so their bytes really return; the other layout goes next. The executor goes on
+/// from the store. (Host version: processes::the_tier_takes_back_a_pinned_layout.)
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn the_tier_takes_back_a_pinned_layout() {
     let (ledger, g, uuid) = tensord("pinned");
     step!();
+    // What running calls keep free: nothing, until a measured shortfall (more than the host has) asks the tier to give
+    // back. An unmeasured need neither fills nor drains it.
     let short = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let demand = short.clone();
     let pressure = platform::contain::host_pressure::Pressure::arm(platform::contain::host_pressure::HostMode::Shared).unwrap();
@@ -2954,16 +2957,16 @@ fn the_tier_takes_back_a_pinned_layout() {
     short.store(true, std::sync::atomic::Ordering::Release);
     tier.nudge();
     step!();
-    let mut released = 0;
-    while resident(&digest("p1")) + resident(&digest("p2")) > 0 {
-        released = tier.await_releases(released + 1);
-    }
+    // Each layout's file keeps its ready words' page after a release: its regions are what return.
+    tier.await_releases(1);
     step!();
-    assert_eq!(resident(&digest("p1")), 0, "the pinned layout's regions returned");
+    assert!(resident(&digest("p1")) < REGION_ALIGN, "the pinned layout's regions returned first: {}", resident(&digest("p1")));
     step!();
-    assert_eq!(resident(&digest("p2")), 0, "a measured shortfall releases the other cached layout too");
+    assert_eq!(tier.acked(), 2 * REGION_ALIGN, "y unlocked the run it had page-locked (both ready regions) when asked");
     step!();
-    assert!(tier.acked() >= REGION_ALIGN, "y unregistered and unmapped the region it had read when asked: {}", tier.acked());
+    tier.await_releases(2);
+    step!();
+    assert!(resident(&digest("p2")) < REGION_ALIGN, "the shortfall takes the other cached layout next: {}", resident(&digest("p2")));
     step!();
     assert_eq!(y.ok("exact p1 1 17"), "true", "y goes on from the store");
     step!();
