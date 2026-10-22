@@ -417,6 +417,14 @@ impl Backend for CudaBackend {
         Ok(call!("cuStreamSynchronize", stream_synchronize(stream as CUstream))?)
     }
 
+    fn finish(&self, event: Event) -> Result<()> {
+        if event == Event::DONE {
+            return Ok(());
+        }
+        let _ctx = self.primary.enter()?;
+        Ok(call!("cuEventSynchronize", event_synchronize(raw(event)))?)
+    }
+
     fn retire(&self, event: Event) {
         if event != Event::DONE {
             // An event still pending is freed by the driver once it completes.
