@@ -3,7 +3,7 @@
 //! the applier does (maps fill at once; asks free what the other row offers).
 
 use varena::decide::{decide as decision, fits, Action, Admitted, OomSite, Trigger, Tried};
-use varena::table::{Cache, Class, Key, Page, Remote, Req, Set, Table};
+use varena::table::{Cache, Class, Key, Page, Remote, Req, Retried, Set, Table};
 
 const MB: u64 = 1 << 20;
 const GB: u64 = 1 << 30;
@@ -619,7 +619,7 @@ fn a_components_cache_goes_at_its_class_turn_before_its_pages() {
     for k in [(0, 0), (1, 0), (1, 1), (2, 0)] {
         map(&mut t, k);
     }
-    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), set: Some(1), bytes: MB, last_use: 0 });
+    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), sets: vec![1], bytes: MB, last_use: 0 });
     (t.allocated, t.reserved) = (MB, MB);
     let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(2 * MB), unmeasured: 0, tried: Tried::default() });
     assert_eq!(a, vec![Action::Unmap { page: (2, 0), class: Class::N }, Action::Shrink { cache: 7, bytes: MB }, Action::Reserve { req: 1, room: 2 * MB, measured: true }]);
@@ -630,9 +630,74 @@ fn a_components_cache_goes_at_its_class_turn_before_its_pages() {
         map(&mut t, k);
         t.page_mut(k).unwrap().last_use = used;
     }
-    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), set: Some(1), bytes: MB, last_use: 8 });
+    t.caches.push(Cache { id: 7, owner: "graphs:unet".into(), sets: vec![1], bytes: MB, last_use: 8 });
     (t.allocated, t.reserved) = (MB, MB);
     let a = decide(&t, &Trigger::Pass { req: 1, set: 0, room: Some(3 * MB), unmeasured: 0, tried: Tried::default() });
     assert_eq!(&a[..3], &[Action::Unmap { page: (2, 0), class: Class::N }, Action::Shrink { cache: 7, bytes: MB }, Action::Unmap { page: (1, 0), class: Class::N }], "{a:?}");
+}
+
+/// Lead's rulings (S4's v6 13592: the tiled 4 MP decode's split re-ran at level 0 three times on
+/// evict-and-retry; e199: the driver refused a claim at decided-free). A second OOM at the same
+/// site and level, its allocation no further, retries only on progress: bytes freed beyond
+/// what is free now. With nothing more to free it escalates (the outside cut, or the pass's
+/// site, finer; at the finest level a park or exhaustion), claiming nothing.
+#[test]
+fn an_oom_again_at_a_site_without_progress_cuts_finer() {
+    let split = OomSite { name: "split:x".into(), collective: false, finest: 3, shape: "k".into() };
+    // The VAE's pages are the current step's (W); 4 MB free; nothing else to give.
+    let mut t = table(8 * MB, vec![set("vae", 2, MB), set("other", 2, MB)], vec![(vec![0], 1)]);
+    for k in [(0, 0), (0, 1)] {
+        map(&mut t, k);
+    }
+    t.allocated = MB;
+    let oom = |t: &Table, set: Option<u32>| decide(t, &Trigger::Oom { req: 1, set, need: Some(2 * MB), site: Some(split.clone()), tried: Tried::default() });
+    let first = oom(&t, None);
+    assert!(matches!(first.last(), Some(Action::Claim { .. })), "the first OOM there retries on the free bytes: {first:?}");
+    // It failed again at level 0, no further: nothing more to free, so the outside cut goes
+    // finer, alone.
+    t.requests[0].retried = Some(Retried { site: "split:x".into(), shape: "k".into(), level: 0, at: 3 * MB });
+    assert_eq!(oom(&t, None), vec![Action::CutOutside { req: 1, site: "split:x".into(), shape: "k".into() }]);
+    // Inside the pass, its own site is cut.
+    t.requests[0].sites.insert(0, vec![varena::table::CutSite { name: "split:x".into(), finest: 3, ..Default::default() }]);
+    assert!(matches!(oom(&t, Some(0)).as_slice(), [Action::Cut { site, .. }] if site == "split:x"));
+    // Its allocation got past the failure: a retry again.
+    t.allocated = 2 * MB;
+    assert!(matches!(oom(&t, None).last(), Some(Action::Claim { .. })));
+    // At its finest level with nothing more to free: exhausted (no host room to park in).
+    t.allocated = MB;
+    t.requests[0].outside.insert(("split:x".into(), "k".into()), 3);
+    t.requests[0].retried = Some(Retried { site: "split:x".into(), shape: "k".into(), level: 3, at: 3 * MB });
+    assert!(matches!(oom(&t, None).as_slice(), [Action::Exhausted { .. }]), "{:?}", oom(&t, None));
+}
+
+/// e199's shape (lead's ruling): the driver refused a claim of exactly the need at decided-free.
+/// The OOM again there frees one more page beyond the free bytes, and the retry fits.
+#[test]
+fn a_claim_the_driver_refused_retries_with_one_more_page() {
+    let mut t = table(8 * MB, vec![set("m", 1, MB), set("idle", 4, MB)], vec![(vec![0], 1)]);
+    for k in [(0, 0), (1, 0), (1, 1), (1, 2), (1, 3)] {
+        map(&mut t, k);
+    }
+    // 3 MB free; the activation needs 3 MB, claimed once and refused by the driver.
+    t.requests[0].retried = Some(Retried { site: String::new(), shape: String::new(), level: 0, at: 3 * MB });
+    let a = decide(&t, &Trigger::Oom { req: 1, set: Some(0), need: Some(3 * MB), site: None, tried: Tried::default() });
+    let unmapped = a.iter().filter(|a| matches!(a, Action::Unmap { class: Class::N, .. })).count();
+    assert_eq!(unmapped, 1, "one more page than the free bytes: {a:?}");
+    assert!(matches!(a.last(), Some(Action::Claim { .. })), "{a:?}");
+}
+
+/// Lead's ruling: a pool shared by a serialized domain's components (the TE, the UNet and the
+/// VAE) takes the most protective class among them, at the nearest one's distance: D while any
+/// is declared, N once none is.
+#[test]
+fn a_cache_serving_several_components_takes_the_nearest_ones_class() {
+    let mut t = table(8 * MB, vec![set("te", 1, MB), set("unet", 1, MB), set("vae", 1, MB)], vec![(vec![0], 1), (vec![1], 1), (vec![2], 1)]);
+    let pool = Cache { id: 3, owner: "graphs:domain".into(), sets: vec![0, 1, 2], bytes: MB, last_use: 0 };
+    t.caches.push(pool.clone());
+    assert_eq!((t.cache_class(&pool), t.cache_distance(&pool)), (Class::D, Some((0, 1, u32::MAX))), "the TE's step runs now");
+    t.requests[0].cursor.step = 2;
+    assert_eq!((t.cache_class(&pool), t.cache_distance(&pool)), (Class::D, Some((0, 1, u32::MAX))), "the VAE's");
+    t.requests[0].cursor.step = 3;
+    assert_eq!(t.cache_class(&pool), Class::N, "no set of it declared any more");
 }
 

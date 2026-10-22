@@ -1776,9 +1776,10 @@ fn a_pass_returns_only_once_the_room_it_made_is_free() {
 }
 
 /// An OOM in a measured pass on a card full of idle kept pages (native an_oom_in_a_pass): the
-/// pass made only its measured room, the activation outgrew it, and each OOM answers Retry with
-/// the idle pages; a retry the driver still refuses (its slack, as e199's refused a claim of
-/// exactly 1 GiB with 1.19 MiB more reported free) evicts more, and fits.
+/// pass made only its measured room, the activation outgrew it, and the OOM answers Retry with
+/// the idle pages. The driver refuses that retry too (its slack, as e199's refused a claim of
+/// exactly 1 GiB with 1.19 MiB more reported free); the second OOM frees more than the free
+/// bytes (progress, lead's ruling), and its retry fits.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
@@ -1815,7 +1816,7 @@ fn an_oom_in_a_measured_pass_takes_idle_kept_pages_and_its_retry_fits() {
     drop(pins);
     card.give(activation);
     let stats = r.end();
-    assert!(stats.retries >= 1 && stats.leftover == 0, "{stats:?}");
+    assert!(stats.retries >= 2 && stats.leftover == 0, "{stats:?}");
 }
 
 /// The kept-page handoff (native kept_pages_survive_a_holder_that_served, graph-core 577): pages

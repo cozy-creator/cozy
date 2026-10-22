@@ -257,6 +257,19 @@ pub struct Req {
     /// The family it waits for while yielded (`crate::ledger` publishes it; 0: none).
     pub family: u64,
     pub episode: Episode,
+    /// The last OOM answered Retry, by site: a second one there with no progress past it
+    /// escalates (lead, v6 13592: the whole decode re-ran at one level three times).
+    pub retried: Option<Retried>,
+}
+
+/// Where an OOM answered Retry failed: its site, op shape, the site's level then, and how far
+/// the allocation had got (torch's allocated bytes plus the failing need).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Retried {
+    pub site: String,
+    pub shape: String,
+    pub level: u32,
+    pub at: u64,
 }
 
 impl Req {
@@ -307,9 +320,9 @@ impl Req {
 pub struct Cache {
     pub id: u32,
     pub owner: String,
-    /// The component (set) it serves, if any: it takes that set's class (D while a plan still
-    /// declares the set, N otherwise), and goes before the set's own pages.
-    pub set: Option<u32>,
+    /// The components (sets) it serves, if any: it takes the most protective class among
+    /// them (D while a plan still declares any, N otherwise) and goes before their pages.
+    pub sets: Vec<u32>,
     pub bytes: u64,
     pub last_use: u64,
 }
@@ -423,10 +436,17 @@ impl Table {
         self.requests.iter().filter_map(|r| r.distance(key)).min()
     }
 
-    /// A cache's nearest next use over the open requests.
+    /// A cache's nearest next use over the open requests and its sets.
     pub fn cache_distance(&self, c: &Cache) -> Option<(u32, u32, u32)> {
-        let set = c.set?;
-        self.requests.iter().filter_map(|r| r.cache_distance(set)).min()
+        self.requests.iter().flat_map(|r| c.sets.iter().filter_map(|s| r.cache_distance(*s))).min()
+    }
+
+    /// Bytes this process could have now beside every W and P, evicting neither: the free
+    /// bytes, its S, N and D pages, its caches and the allocator's slack.
+    pub fn spare(&self) -> u64 {
+        let c = self.classes();
+        let pages: u64 = [Class::S, Class::N, Class::D].iter().filter_map(|k| c.get(k.index())).sum();
+        self.free() + pages + self.caches.iter().map(|c| c.bytes).sum::<u64>() + self.slack()
     }
 
     /// A cache's class: D while a plan still declares its set, N otherwise.

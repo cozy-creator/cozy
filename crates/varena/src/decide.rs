@@ -264,13 +264,28 @@ fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&O
         Some(_) => sites.iter().find(|x| x.name == s.name).map_or(0, |x| x.level),
         None => r.outside.get(&(s.name.clone(), s.shape.clone())).copied().unwrap_or(0),
     };
+    // A retry that failed again at the same site and level, its allocation no further than
+    // the last failure there, retries only on progress: bytes freed beyond what is free now
+    // (the driver refused a claim at decided-free: one more page is progress). An answer that
+    // would free nothing more escalates (a cut, else a park or exhaustion), never another Retry
+    // (lead, v6 13592 and e199).
+    let at = t.allocated.saturating_add(need.unwrap_or(0));
+    let key = site.map_or((String::new(), String::new(), 0), |s| (s.name.clone(), s.shape.clone(), level(s)));
+    let again = r.retried.as_ref().is_some_and(|m| (&m.site, &m.shape, m.level) == (&key.0, &key.1, key.2) && at <= m.at);
     // A site at its finest level is not cut or proposed further: the next rung follows.
     let outside = site.filter(|s| set.is_none() && !s.collective && level(s) < s.finest);
     let site = set.zip(site).filter(|(_, s)| level(s) < s.finest);
     // Unknown: any page's worth is progress.
-    let mut d = Demand::new(t, need.unwrap_or(1), Some(req), None, tried);
+    let n = need.unwrap_or(1);
+    let mut d = Demand::new(t, n, Some(req), None, tried);
     d.oom = true;
-    if r.episode.claimed_free {
+    if again {
+        // The op had its claim and the bytes free when this demand began (its own rounds'
+        // frees aside): it needs more than that, counted with the claim.
+        let before = t.free().saturating_sub(tried.freed);
+        d.need = n.max(r.claimed + before + 1);
+        d.got = t.free() + r.claimed;
+    } else if r.episode.claimed_free {
         d.got = t.free().min(tried.freed);
     }
     let mut out = vec![];
@@ -286,11 +301,12 @@ fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&O
         }
         Some(Done::Enough) => {}
         // The previous allocation claim is still available. Try newly freed bytes before
-        // cutting or lowering, even when this round alone freed less than the full need.
-        Some(Done::Lowered) | None if d.got > 0 => {}
+        // cutting or lowering, even when this round alone freed less than the full need; a
+        // failure again there only when this round frees something.
+        Some(Done::Lowered) | None if d.got > 0 && (!again || d.out.iter().any(frees)) => {}
         Some(Done::Lowered) | None if set.is_none() => match outside {
             Some(s) => d.out.push(Action::CutOutside { req, site: s.name.clone(), shape: s.shape.clone() }),
-            None if d.got == 0 => d.park_or_exhaust(r.episode.parked),
+            None if d.got == 0 || again => d.park_or_exhaust(r.episode.parked),
             None => {}
         },
         Some(Done::Lowered) | None => {
@@ -307,19 +323,27 @@ fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&O
                         out.append(&mut d.out);
                         return out;
                     }
-                    None if d.got == 0 => d.park_or_exhaust(r.episode.parked),
+                    None if d.got == 0 || (again && !d.out.iter().any(frees)) => d.park_or_exhaust(r.episode.parked),
                     _ => {}
                 }
             }
         }
     }
-    if d.got > 0 {
-        // A known need claims what it needs; an unknown one everything gathered.
+    let escalated = d.out.iter().any(|a| matches!(a, Action::Cut { .. } | Action::CutOutside { .. } | Action::Park(_) | Action::Exhausted { .. }));
+    if d.got > 0 && !(again && escalated) {
+        // A known need claims what it needs; an unknown one everything gathered (again: beyond
+        // its claim so far).
         let bytes = if need.is_some() { d.got.min(d.need) } else { d.got };
+        let bytes = if again { bytes.saturating_sub(r.claimed) } else { bytes };
         d.out.push(Action::Claim { req, bytes });
     }
     out.append(&mut d.out);
     out
+}
+
+/// An action that gives bytes back (now, or once a remote rung answers).
+fn frees(a: &Action) -> bool {
+    matches!(a, Action::Unmap { .. } | Action::Shrink { .. } | Action::Trim(_) | Action::ReleaseOrphans(_) | Action::Ask { .. } | Action::Settle)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,7 +470,7 @@ impl<'a> Demand<'a> {
         for c in caches {
             let order = match class {
                 Class::N => {
-                    let oldest = t.pages().filter(|(k, p)| Some(k.0) == c.set && p.mapped).map(|(_, p)| p.last_use).min();
+                    let oldest = t.pages().filter(|(k, p)| c.sets.contains(&k.0) && p.mapped).map(|(_, p)| p.last_use).min();
                     (oldest.map_or(c.last_use, |o| o.min(c.last_use)), 0, 0, 0)
                 }
                 _ => t.cache_distance(c).map_or((0, 0, 0, 0), |d| (0, u32::MAX - d.0, u32::MAX - d.1, u32::MAX - d.2)),

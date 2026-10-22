@@ -365,6 +365,28 @@ pub struct Stats {
     pub keep_pending: u64,
     /// RAM-tier host ranges unlocked while it ran: each unlock stalls the device until idle.
     pub unregisters: Unregisters,
+    /// Every non-trivial decision made for it, in order: lowering, cuts, parks, exhaustion and
+    /// evictions of declared (D) or working (W) pages, each with what asked for it.
+    pub decisions: Vec<Decision>,
+}
+
+/// One decision a request's demand made (lead, v6: the Lower trigger, trace4's hang and the
+/// 4 MP sequence had to be rebuilt from totals).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Decision {
+    /// The request's plan step then.
+    pub step: u32,
+    /// What asked: a pass start, a bind, an OOM, a range's preparation, a workspace.
+    pub trigger: &'static str,
+    /// lower, cut, cut_outside, park, exhausted, evict_d or evict_w.
+    pub action: &'static str,
+    pub site: Option<String>,
+    /// The bytes asked for (exhausted: the bytes short).
+    pub need: u64,
+    /// The bytes this decision's round gave back (evictions: those of its class).
+    pub freed: u64,
+    /// A cut's level after it.
+    pub level: Option<u32>,
 }
 
 /// Host ranges unlocked for the RAM tier (`cuMemHostUnregister`, which synchronizes the device).
@@ -1045,6 +1067,8 @@ struct Inner {
     /// The allocator's limit as the last publication computed it, and the bytes the callback
     /// reclaimed from the stock since (not yet in a publication): read without the state lock.
     limit: AtomicU64,
+    /// [`Table::spare`] as the last publication computed it: read without the state lock.
+    spare: AtomicU64,
     unreconciled: AtomicU64,
     /// The callback's stock of reclaimable pages, and its reclaims (page, gen, bytes, whether
     /// the driver gave them back) for the state to reconcile.
@@ -1129,6 +1153,7 @@ impl Memory {
                 public_owners: AtomicU64::new(0),
                 native_resident: AtomicU64::new(0),
                 limit: AtomicU64::new(0),
+                spare: AtomicU64::new(0),
                 unreconciled: AtomicU64::new(0),
                 stock_tx,
                 stock,
@@ -1187,17 +1212,18 @@ impl Memory {
     }
 
     /// Registers bytes the caller holds (torch tensors) that `shrink(want) -> freed` gives back.
-    /// A cache whose `owner` is a request id ends with that request. One serving a component
-    /// (`set`: its graph pool, its decode cache) takes that set's class and goes before its
+    /// A cache whose `owner` is a request id ends with that request. One serving components
+    /// (`sets`: a component's graph pool or decode cache, a pool shared by a serialized
+    /// domain's components) takes the most protective class among them and goes before their
     /// pages; one serving none is N.
-    pub fn cache(&self, owner: &str, set: Option<SetId>, shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
+    pub fn cache(&self, owner: &str, sets: &[SetId], shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
         let shrink: Shrink = Arc::new(shrink);
         self.inner
             .guard(|| {
                 let mut st = self.inner.lock();
                 let id = st.tick() as u32;
                 let last_use = st.clock;
-                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), set: set.map(|s| s.0), bytes: 0, last_use });
+                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), sets: sets.iter().map(|s| s.0).collect(), bytes: 0, last_use });
                 st.shrinks.insert(id, shrink);
                 self.inner.unlock(st);
                 Ok(CacheId(id))
@@ -1821,6 +1847,7 @@ impl Inner {
     /// pages changed) the stock of pages it may reclaim.
     fn offer(&self, st: &mut State) {
         self.limit.store(st.table.torch_limit(), Ordering::Release);
+        self.spare.store(st.table.spare(), Ordering::Release);
         if !std::mem::take(&mut st.restock) {
             return;
         }
@@ -2550,9 +2577,17 @@ impl Inner {
             }
             let actions = decide(&st.table, &trigger);
             let (mut remote, mut shrinks, mut freed) = (vec![], vec![], 0);
+            let mut evicted = (0, 0);
             for a in &actions {
-                freed += self.apply(&mut st, a, req, &mut remote, &mut shrinks)?;
+                let bytes = self.apply(&mut st, a, req, &mut remote, &mut shrinks)?;
+                freed += bytes;
+                match a {
+                    Action::Unmap { class: Class::D, .. } => evicted.0 += bytes,
+                    Action::Unmap { class: Class::W, .. } => evicted.1 += bytes,
+                    _ => {}
+                }
             }
+            self.record(&mut st, req, &trigger, &actions, freed, evicted);
             let asked: u64 = remote.iter().map(|a| if let Action::Ask { bytes, .. } = a { *bytes } else { 0 }).sum();
             if remote.is_empty() {
                 st.claims.remove(&id);
@@ -2602,6 +2637,45 @@ impl Inner {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// The round's non-trivial decisions, into its request's record ([`Stats::decisions`]).
+    fn record(&self, st: &mut State, req: Option<u64>, trigger: &Trigger, actions: &[Action], freed: u64, (d, w): (u64, u64)) {
+        let Some(req) = req else { return };
+        let (kind, asked) = match trigger {
+            Trigger::Pass { room, unmeasured, .. } => ("pass", room.unwrap_or(*unmeasured)),
+            Trigger::Bind { page, .. } => ("bind", st.table.page(*page).map_or(0, |p| p.bytes)),
+            Trigger::Oom { need, .. } => ("oom", need.unwrap_or(0)),
+            Trigger::Prepare { pages, .. } => ("prepare", pages.iter().filter_map(|k| st.table.page(*k)).filter(|p| !p.mapped).map(|p| p.bytes).sum()),
+            Trigger::Workspace { bytes, .. } => ("workspace", *bytes),
+            Trigger::Speculate { .. } | Trigger::Ask { .. } | Trigger::Load { .. } => return,
+        };
+        let step = st.table.request(req).map_or(0, |r| r.cursor.step);
+        let level = |st: &State, site: &str, set: u32| st.active.get(&(req, set)).and_then(|a| st.cuts.get(&(set, a.shape.clone()))).and_then(|c| c.get(site).copied());
+        let mut out = vec![];
+        let decision = |action, site: Option<String>, need, freed, level| Decision { step, trigger: kind, action, site, need, freed, level };
+        for a in actions {
+            match a {
+                Action::Lower(_) => out.push(decision("lower", None, asked, freed, None)),
+                Action::Cut { set, site, .. } => out.push(decision("cut", Some(site.clone()), asked, freed, level(st, site, *set))),
+                Action::CutOutside { site, shape, .. } => {
+                    let level = st.table.request(req).and_then(|r| r.outside.get(&(site.clone(), shape.clone())).copied());
+                    out.push(decision("cut_outside", Some(site.clone()), asked, freed, level));
+                }
+                Action::Park(_) => out.push(decision("park", None, asked, freed, None)),
+                Action::Exhausted { need } => out.push(decision("exhausted", None, *need, freed, None)),
+                _ => {}
+            }
+        }
+        if d > 0 {
+            out.push(decision("evict_d", None, asked, d, None));
+        }
+        if w > 0 {
+            out.push(decision("evict_w", None, asked, w, None));
+        }
+        if let Some(s) = st.stats(Some(req)) {
+            s.decisions.extend(out);
         }
     }
 
@@ -3291,6 +3365,10 @@ impl Inner {
             return Ok(());
         };
         let Some(active) = st.active.remove(&key) else { return Ok(()) };
+        // The pass got through: a retry since went past where it failed.
+        if let Some(r) = st.table.request_mut(req) {
+            r.retried = None;
+        }
         let name = st.mech(active.set)?.spec.name.clone();
         let levels = st.levels(active.set, &active.shape);
         let key = room_key(&name, &active.shape, &levels);
@@ -3379,6 +3457,15 @@ impl Inner {
             _ => {
                 if let Some(s) = st.stats(Some(req)) {
                     s.retries += 1;
+                }
+                // Where it failed, so a second failure there with no progress escalates.
+                if let Some(r) = st.table.request_mut(req) {
+                    let level = site.map_or(0, |s| match set {
+                        Some(set) => r.sites.get(&set).and_then(|v| v.iter().find(|x| x.name == s.name)).map_or(0, |x| x.level),
+                        None => r.outside.get(&(s.name.to_string(), s.shape.to_string())).copied().unwrap_or(0),
+                    });
+                    let (name, shape) = site.map_or((String::new(), String::new()), |s| (s.name.to_string(), s.shape.to_string()));
+                    r.retried = Some(crate::table::Retried { site: name, shape, level, at: torch.allocated.saturating_add(need.unwrap_or(0)) });
                 }
                 Next::Retry
             }
@@ -3999,6 +4086,13 @@ impl Request {
             Err(Error::Exhausted(e)) => Next::Exhausted(e),
             Err(_) => Next::Exhausted(exhausted(need.unwrap_or(0), site.map(|s| s.name), self.stats())),
         }
+    }
+
+    /// Bytes the request could have now beside every W and P without evicting either (free,
+    /// S, N and D pages, caches, the allocator's slack), as the last publication measured them:
+    /// read without the state lock, for a capture's room before it captures (S4).
+    pub fn spare(&self) -> u64 {
+        self.inner.spare.load(Ordering::Acquire)
     }
 
     /// Reclaim for a native allocator callback, without the state lock: only pages the state

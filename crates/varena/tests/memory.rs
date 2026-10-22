@@ -775,3 +775,44 @@ fn a_tiled_step_keeps_its_pages_w_through_every_tile() {
     drop(r);
 }
 
+/// S4's capture admission: a request's spare bytes are what it could have beside every W and P
+/// without evicting either, read without the state lock. Idle pages count; the current step's
+/// pages do not.
+#[test]
+fn spare_bytes_count_idle_pages_never_the_current_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("spare", 16 * MB);
+    mem.load(set(dir.path(), "n", 2, &g.uuid), Level::Gpu).unwrap();
+    let b = mem.load(set(dir.path(), "b", 2, &g.uuid), Level::Ram).unwrap();
+    mem.settle();
+    let r = mem.request("spare", plan("b")).unwrap();
+    let before = r.spare();
+    assert_eq!(before, 16 * MB, "an idle card: every byte, the idle set's included");
+    let pass = r.pass(b, "fwd", "1x8", Torch::default()).unwrap();
+    for block in 0..2 {
+        drop(mem.bind(b, block, 0).unwrap());
+    }
+    assert_eq!(before - r.spare(), 2 * REGION_ALIGN, "the current step's pages are W: not spare");
+    pass.end(Measured::default(), Torch::default());
+}
+
+/// Lead's ruling (v6: the Lower trigger, trace4's hang and the 4 MP sequence had to be rebuilt
+/// from totals): a request's record keeps every non-trivial decision with what asked for it.
+#[test]
+fn a_requests_record_keeps_every_decision_with_its_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("decisions", 4 * MB);
+    let id = mem.load(set(dir.path(), "c", 2, &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("r", plan("c")).unwrap();
+    let pass = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
+    let pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
+    let site = Some(Site { name: "ffn", collective: false, finest: 4, shape: "1x8" });
+    assert!(matches!(r.oom(Some(id), Some(MB), site, Torch::default()), Next::Cut(1)));
+    assert!(matches!(r.oom(Some(id), Some(MB), site, Torch::default()), Next::Cut(2)));
+    let stats = r.stats();
+    let cuts: Vec<(&str, &str, Option<&str>, Option<u32>)> = stats.decisions.iter().map(|d| (d.trigger, d.action, d.site.as_deref(), d.level)).collect();
+    assert_eq!(cuts, vec![("oom", "cut", Some("ffn"), Some(1)), ("oom", "cut", Some("ffn"), Some(2))]);
+    assert!(stats.decisions.iter().all(|d| d.need == MB && d.step == 0));
+    drop((pins, pass));
+}
+
