@@ -109,12 +109,8 @@ impl Checkpoint {
             Some(v) => variant_path(v),
             None => {
                 let mut found = Vec::new();
-                for entry in fs::read_dir(dir).map_err(fail("list", dir))? {
-                    let name = entry.map_err(fail("list", dir))?.file_name();
-                    let name = name.to_string_lossy().into_owned();
-                    if variant_of(&name).is_some() {
-                        found.push(name);
-                    }
+                for name in super::folder_files(dir, "")? {
+                    if variant_of(&name).is_some() { found.push(name); }
                 }
                 match <[String; 1]>::try_from(found) {
                     Ok([one]) => one,

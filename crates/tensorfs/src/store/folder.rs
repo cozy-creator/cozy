@@ -101,7 +101,7 @@ impl Store {
 }
 
 /// Every regular file under `dir`, as tree paths, but `chunks/` at the root.
-fn files(dir: &Path, prefix: &str) -> Result<Vec<String>> {
+pub(crate) fn files(dir: &Path, prefix: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(dir).map_err(fail("list", dir))? {
         let entry = entry.map_err(fail("list", dir))?;

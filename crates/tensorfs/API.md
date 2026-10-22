@@ -23,7 +23,7 @@ use tensorfs::{Client, Config, Download, Open, Selection};
 let client = Client::new(Config::from_env())?;
 let checkpoint = client.open("me/model", &Open {
     revision: Some("1.0".into()),
-    variant: Some("bf16".into()),
+    bits: Some(16),
     ..Default::default()
 }).await?;
 
@@ -49,6 +49,14 @@ Only the placement `source` fetches on its own, on the process runtime.
 
 A borrowed component follows Rust's ordinary borrow rules. Clone the `Component` if it
 must outlive the parent checkpoint; owned child handles retain their source and data holds.
+
+Automatic selection derives precision and GPU requirements from each variant's header. Pass
+`bits=4`, `bits=8` or `bits=16` (Rust: `Open.bits`); omitted means an 8-bit preference with safe
+fallbacks. `gpus=["8.9"]` supplies compute capabilities; omitted detects visible GPUs, while `[]`
+selects for CPU. Explicit `variant="nested/weights.cozytensors"` fixes the path instead. Every
+`.cozytensors` file at every depth is a variant, and its name conveys no precision. Selection
+loads only headers; unsupported profiles are skipped. The Hub's indexed selection and local
+selection use the same [normative vectors](../tensorfs/conformance/vectors/select.json).
 
 ## Rust: write, convert and publish
 
@@ -79,7 +87,7 @@ low. Open checkpoints keep their bytes in the meantime. To copy a checkpoint to 
 write the portable form with `saved.materialize(dir, Format::Cozytensors, false)`.
 
 `dest` is the exact filename; TensorFS does not append a variant or create a directory.
-`dest` and `repo_id` exclude each other. `variant` names `model.<variant>.cozytensors` in a
+`dest` and `repo_id` exclude each other. `variant` names an arbitrary `.cozytensors` path in a
 `repo_id` upload and is `Invalid` without `repo_id`. With no destination, the writer keeps
 the checkpoint in the shared store as a cache entry.
 

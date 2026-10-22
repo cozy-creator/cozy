@@ -74,7 +74,11 @@ impl Tree {
     /// added; (its path, its header).
     fn named(&self, name: &str) -> Option<(&str, &ObjectRef)> {
         let at = |path: &str| self.files.get_key_value(path).filter(|(p, _)| variant_of(p).is_some());
-        at(name).or_else(|| at(&format!("{name}{VARIANT_EXTENSION}"))).map(|(p, r)| (p.as_str(), r))
+        at(name).or_else(|| at(&format!("{name}{VARIANT_EXTENSION}")))
+            .or_else(|| (!name.contains('/') && !name.ends_with(VARIANT_EXTENSION)).then(|| {
+                at(&if name.is_empty() { super::HEADER_PATH.into() } else { format!("model.{name}{VARIANT_EXTENSION}") })
+            }).flatten())
+            .map(|(p, r)| (p.as_str(), r))
     }
 
     /// The header of variant `name`.

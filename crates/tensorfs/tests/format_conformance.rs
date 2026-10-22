@@ -100,7 +100,7 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
             files: BTreeMap::from([("LICENSE".to_string(), put(LICENSE.to_vec()))]),
         };
         for (variant, header) in of {
-            t.set_variant(variant, (*header).clone());
+            t.set_variant(&format!("model.{variant}.cozytensors"), (*header).clone());
         }
         put(t.to_json().unwrap())
     };
@@ -606,4 +606,33 @@ fn chunk_rule() {
         "down_blocks.1.resnets.0"
     );
     assert_eq!(layout::block_of("conv_in.weight"), "");
+}
+
+#[test]
+fn shared_selection_vectors() {
+    use tensorfs::precision::{Constraints, Profile};
+    let spec: Json = serde_json::from_slice(&fs::read(vectors().join("select.json")).unwrap()).unwrap();
+    let mut profiles = BTreeMap::new();
+    for (name, expected) in spec["profiles"].as_object().unwrap() {
+        let header = Header::from_cbor(&fs::read(vectors().join("select").join(format!("{name}.cbor"))).unwrap()).unwrap();
+        let profile = Profile::of(&header);
+        assert_eq!(serde_json::to_value(&profile).unwrap(), *expected, "profile {name}");
+        profiles.insert(name.clone(), profile);
+    }
+    for case in spec["cases"].as_array().unwrap() {
+        let constraints: Constraints = serde_json::from_value(case["constraints"].clone()).unwrap();
+        let candidates: Vec<_> = case["variants"].as_object().unwrap().iter().map(|(path, name)| (path.as_str(), &profiles[name.as_str().unwrap()])).collect();
+        let result = constraints.select(spec["model"].as_str().unwrap(), &candidates);
+        if case.get("error").is_some() { assert!(result.is_err(), "{}", case["why"]); continue; }
+        let selected = result.unwrap();
+        let name = selected.as_ref().map(|(at,_)| candidates[*at].0);
+        assert_eq!(name, case["variant"].as_str(), "{}", case["why"]);
+        let reasons = selected.map_or_else(Vec::new, |(_,reasons)| reasons);
+        assert_eq!(serde_json::to_value(reasons).unwrap(), case["reasons"], "{}", case["why"]);
+    }
+    for case in spec["lookups"].as_array().unwrap() {
+        let tree = Tree { files: case["paths"].as_array().unwrap().iter().map(|p| (p.as_str().unwrap().to_string(), ObjectRef::of(b"header"))).collect() };
+        let selected = tree.variant(Some(case["ask"].as_str().unwrap())).ok().map(|(p,_)|p);
+        assert_eq!(selected, case["variant"].as_str(), "lookup {case}");
+    }
 }

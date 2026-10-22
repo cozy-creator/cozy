@@ -87,6 +87,9 @@ pub(crate) struct List {
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Download {
+    /// Precision preference (default: 8); selected from the header for the target machine's GPUs.
+    #[arg(long, value_parser = ["4", "8", "16"])]
+    bits: Option<String>,
     /// org/name[@release[/lane]], org/name#sha256:…, hf://…, civitai://… or https://….
     model: String,
     /// Keep it on the machine under this name.

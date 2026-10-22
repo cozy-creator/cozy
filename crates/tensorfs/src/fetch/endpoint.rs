@@ -290,6 +290,23 @@ impl Endpoint {
         }
     }
 
+    /// Optional indexed variant selection. Static origins and older Hubs fall back to the
+    /// same pure rule over their headers; their lack of this route is not a protocol failure.
+    pub async fn select(&self, name: &str, revision: &str, constraints: &crate::precision::Constraints) -> Result<Option<crate::precision::Selection>> {
+        check_repo_name(name)?;
+        constraints.select(name, &[]).map_err(|e| Refusal { code: Code::KEY_GRAMMAR, detail: e.to_string() })?;
+        let At::Http(base) = &self.at else { return Ok(None) };
+        let escaped = |value: &str| repo_url("", value).trim_start_matches('/').to_owned();
+        let mut url = format!("{}/select?revision={}&gpus={}", repo_url(base, &format!("v1/models/{name}")), escaped(revision), escaped(&constraints.gpus.join(",")));
+        if let Some(bits) = constraints.bits { url.push_str(&format!("&bits={bits}")); }
+        let reply = self.exchange(Ask { method: "GET", url: &url, headers: vec![], body: None, payload: None, auth: true }).await?;
+        match reply.status {
+            404 | 405 => Ok(None),
+            200 => serde_json::from_slice(&reply.body).map(Some).map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() }),
+            _ => Err(refusal(&reply, "GET")),
+        }
+    }
+
     /// An object named by digest, including its length, or `None` when absent or unreadable.
     pub async fn object(&self, sha256: &str) -> Result<Option<ObjectRef>> {
         let sha256 = sha256.strip_prefix("sha256:").unwrap_or(sha256);

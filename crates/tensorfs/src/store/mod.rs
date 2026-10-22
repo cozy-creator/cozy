@@ -19,6 +19,7 @@
 
 mod checkpoint;
 mod folder;
+pub(crate) use folder::files as folder_files;
 mod gc;
 mod records;
 pub(crate) mod retention;

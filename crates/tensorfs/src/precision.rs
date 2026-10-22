@@ -23,6 +23,7 @@ pub struct Gpus {
     pub fp8: bool,
     pub fp4: bool,
     pub name: String,
+    pub capabilities: Vec<String>,
 }
 
 /// No GPU: the CPU, which runs bf16 and no encoded format.
@@ -49,6 +50,7 @@ impl Gpus {
             fp8: all(|cc| cc >= 89),
             fp4: all(|cc| cc >= 100),
             name,
+            capabilities: ccs.iter().map(|cc| cc.to_string()).collect(),
         }
     }
 }
@@ -141,7 +143,9 @@ impl Slot {
         };
         let ranked = variants.iter().enumerate().filter(|(_, (_, p))| p.kinds.iter().all(|kind| runs(kind, gpus)));
         let ranked = ranked.filter_map(|(at, (name, p))| Some(((place(p)?, !native(p), p.bytes, *name), at)));
-        ranked.min().map(|(_, at)| at).or((variants.len() == 1).then_some(0))
+        ranked.min().map(|(_, at)| at).or_else(|| {
+            (variants.len() == 1 && variants[0].1.kinds.iter().all(|kind| runs(kind, gpus) && (self.encoded || !matches!(Dtype::parse(kind), Dtype::Other(_))))).then_some(0)
+        })
     }
 }
 
@@ -297,4 +301,16 @@ mod tests {
         assert_eq!(slot.warnings(8, &turing, "x@1", "bf16"), ["precision 8: x@1 has no fp16 lane for sm75; served bf16"]);
         assert_eq!(slot.warnings(16, &hopper, "sdxl@1", "fp16"), ["precision 16: sdxl@1 has no bf16 lane for sm90; served fp16"]);
     }
+}
+
+/// The Hub's indexed answer, with the same rule as local header selection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Selection {
+    pub release: String,
+    pub commit: crate::format::ObjectRef,
+    pub variant: Option<String>,
+    pub header: Option<crate::format::ObjectRef>,
+    pub profile: Option<Profile>,
+    #[serde(default)]
+    pub reasons: Vec<String>,
 }
