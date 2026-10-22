@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::{c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use tensorfs::io::cuda;
@@ -67,9 +68,11 @@ fn live(device: i32) -> u64 {
 
 pub fn inside() -> bool { INSIDE.with(Cell::get) }
 // Retained for diagnostics of attempts to enter Python hooks from a native callback.
-pub fn trim_inside() {}
-pub fn shrink_inside() {}
-pub fn reentries() -> (u64, u64) { (0, 0) }
+static TRIMS_INSIDE: AtomicU64 = AtomicU64::new(0);
+static SHRINKS_INSIDE: AtomicU64 = AtomicU64::new(0);
+pub fn trim_inside() { TRIMS_INSIDE.fetch_add(1, Relaxed); }
+pub fn shrink_inside() { SHRINKS_INSIDE.fetch_add(1, Relaxed); }
+pub fn reentries() -> (u64, u64) { (TRIMS_INSIDE.load(Relaxed), SHRINKS_INSIDE.load(Relaxed)) }
 
 struct Inside(bool);
 impl Inside {

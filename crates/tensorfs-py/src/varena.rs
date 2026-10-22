@@ -523,6 +523,11 @@ impl PyMemory {
         Ok(PyWorkspace { workspace: Mutex::new(Some(Arc::new(workspace))), gpu: self.gpu.uuid.clone() })
     }
 
+    fn workspace_available(&self, py: Python<'_>, allocated: u64, reserved: u64) -> PyResult<PyWorkspace> {
+        let workspace = detached(py, &self.gpu.uuid, || self.memory().workspace_available(Torch { allocated, reserved }))?;
+        Ok(PyWorkspace { workspace: Mutex::new(Some(Arc::new(workspace))), gpu: self.gpu.uuid.clone() })
+    }
+
     /// Bytes torch's allocator may hold now.
     fn torch_limit(&self, py: Python<'_>) -> PyResult<u64> {
         detached(py, &self.gpu.uuid, || Ok(self.memory().torch_limit()))

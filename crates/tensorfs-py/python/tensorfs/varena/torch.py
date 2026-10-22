@@ -203,7 +203,7 @@ class _Pass:
     #: the exception being handled where it opened: another at its close is a raise
     entered: BaseException | None = None
     token: object = None
-    #: SPIKE: the pool's context while the pass allocates from it
+    #: Selected allocator context while the pass executes.
     pooled: object = None
 
 
@@ -296,7 +296,7 @@ class Binding:
             return self.native.valid()
 
     @contextmanager
-    def prepare(self, stream: torch.cuda.Stream | int | None = None, *, workspace: int = 0) -> Iterator[Binding]:
+    def prepare(self, stream: torch.cuda.Stream | int | None = None, *, workspace: int | None = 0) -> Iterator[Binding]:
         with self.lock:
             if self.closed:
                 raise Unbound("graph binding is closed")
@@ -316,6 +316,8 @@ class Binding:
                     stream.wait_event(self.last)
                 memory.native.fill(self.model.id, _fill(self.model.fill))
                 pins = self.native.prepare(stream.cuda_stream if stream is not None else 0)
+                if workspace is None:
+                    scope.enter_context(memory.native.workspace_available(*memory.torch.now()))
                 held: list[_Block] = []
                 try:
                     with self.model.lock:
@@ -409,14 +411,14 @@ class Memory:
         self.capped: int | None = None
         if device.type != "cpu":
             native.trim_with(self.torch.trim)
-        #: SPIKE (pending the owner): passes allocate from a pool whose segments come from this
-        #: library's allocator, which asks varena for room on a shortfall instead of raising
+        #: Request allocations use the native callback, which reclaims completed local pages
+        #: on shortfall without replaying package code.
         self.pool: torch.cuda.MemPool | None = None
         #: whether passes use it now (the spike's measurement alternates with torch's default)
         self.pooling = pool
         #: the largest torch reserve a pass held outside the pool (other threads' allocations)
         self.outside = 0
-        #: SPIKE DIAG: block runs on a stream other than the one its pin was bound on
+        #: Cross-stream consumers joined back into the binding stream.
         self.crossed = 0
         if pool and self.cuda:
             allocator = torch.cuda.memory.CUDAPluggableAllocator(_ext.__file__, "varena_torch_alloc", "varena_torch_free")
@@ -526,7 +528,7 @@ class Memory:
         Warm and capture must name the same graph pool. Capture cannot grow it; a capacity
         shortfall aborts capture, without native pressure recovery or arbitrary package replay.
         """
-        selected = self.pool if pool is None else pool
+        selected = self.pool if pool is None and self.pooling else pool
         r, p = _request.get(), _pass.get()
         if selected is None or r is None:
             yield
@@ -702,7 +704,7 @@ class Memory:
                     raise Unbound(f"block {block.path!r} was not prepared before capture")
                 self._bind(block, stream)
             elif stream is not None and stream != block.stream and not torch.cuda.is_current_stream_capturing():
-                self.crossed += 1  # SPIKE DIAG
+                self.crossed += 1
                 stream.wait_stream(block.stream)  # type: ignore[arg-type]  # a capture binds under a hold
             block.count += 1
 
@@ -710,7 +712,7 @@ class Memory:
         stream = torch.cuda.current_stream(self.device) if self.cuda else None
         with block.model.lock:
             if stream is not None and block.stream not in (None, stream) and not torch.cuda.is_current_stream_capturing():
-                self.crossed += 1  # SPIKE DIAG
+                self.crossed += 1
                 block.stream.wait_stream(stream)  # type: ignore[union-attr]
             block.count -= 1
             if block.count == 0:

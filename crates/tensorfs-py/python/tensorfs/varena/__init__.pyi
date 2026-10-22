@@ -156,6 +156,7 @@ class Memory:
     def retain(self, set: int, blocks: list[int]) -> Retained: ...
     def workspace(self, bytes: int, allocated: int, reserved: int) -> Workspace: ...
     def observe(self, allocated: int, reserved: int) -> None: ...
+    def workspace_available(self, allocated: int, reserved: int) -> Workspace: ...
     def bind(self, set: int, block: int, stream: int = 0) -> Pin:
         """Block (region) `block` of `set`, mapped and filled; `stream` (a CUstream, 0 the default)
         waits on the fill, and tensors made from the pin are consumed on it only."""
@@ -198,7 +199,7 @@ class Request:
         """The cut level of `set`'s current pass for `site` (0: whole); with no set (outside any
         pass) the request's own memo of that site at the op's shape key `shape`."""
 
-    def allocating(self, memory: Memory, set: int | None, allocated: int, reserved: int) -> None:
+    def allocating(self, memory: Memory, set: int | None, allocated: int, reserved: int, pool: tuple[int, int] = (0, 0)) -> None:
         """SPIKE: this thread's segments for torch's pool are `set`'s pass's (None: outside any
         pass) from now on: a shortfall asks this request."""
 
@@ -213,7 +214,7 @@ class Request:
 def allocated() -> None:
     """SPIKE: this thread's pass is over for torch's pool (`Request.allocating`)."""
 
-def allocator_stats() -> tuple[int, int, int, int, int, int, int]:
+def allocator_stats(device: int | None = None, pool: tuple[int, int] | None = None) -> tuple[int, int, int, int, int, int, int]:
     """SPIKE: the pool's segments: (live bytes, segments made, shortfalls varena resolved, their
     bytes, refusals, nanoseconds making segments, segments freed)."""
 

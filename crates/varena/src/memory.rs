@@ -205,8 +205,8 @@ pub struct SitePeak {
 /// The answer to an out-of-memory at an op.
 #[derive(Clone, Debug)]
 pub enum Next {
-    /// Pages were unmapped (and claimed for this request) or the watermark lowered: run the op
-    /// again under the new [`Memory::torch_limit`].
+    /// Capacity was reclaimed. Retry only the failed allocation or a declared pure cut site;
+    /// never rerun arbitrary package code or a whole model block.
     Retry,
     /// Run the op one level finer: at this level.
     Cut(u32),
@@ -1024,6 +1024,21 @@ impl Memory {
             return Err(Error::Exhausted(exhausted(*need, None, Stats::default())));
         }
         Ok(workspace)
+    }
+
+    /// Exclusively claim the surplus after a pure region's weight ranges are prepared. This
+    /// is capacity discovery, not physical allocation or kernel tuning. Other allocations and
+    /// prefetch cannot spend the promise until it is consumed or released.
+    pub fn workspace_available(&self, torch: Torch) -> Result<Workspace> {
+        let mut st = self.inner.lock();
+        self.inner.measure(&mut st, torch);
+        self.inner.refresh(&mut st)?;
+        let id = st.tick();
+        let remaining = Arc::new(AtomicU64::new(st.table.free()));
+        st.budgets.insert(id, remaining.clone());
+        st.promises();
+        self.inner.publish(&st);
+        Ok(Workspace { inner: self.inner.clone(), id, remaining })
     }
 
     /// Blocks until every mechanism call and every custody and tier call decided so far has

@@ -73,7 +73,7 @@ def main():
         for i, (layer, binding) in enumerate(zip(model.layers, bindings, strict=True)):
             pool = mem.new_pool()
             graph = torch.cuda.CUDAGraph()
-            with binding.prepare(stream), mem.allocating(pool):
+            with binding.prepare(stream, workspace=None), mem.allocating(pool):
                 static = source.to(mem.device)
                 # Prewarm exactly the pool passed to capture, never the default request pool.
                 warm = torch.nn.functional.linear(static, layer.weight)
