@@ -555,6 +555,9 @@ struct Home {
     gen: u64,
     filled: bool,
     filling: bool,
+    /// Read ready at issue (`issued`), its batch not ended yet: the fill thread still accounts
+    /// for it and its copies may still land.
+    landing: bool,
     /// A binder holds it fresh ([`Home::fresh`]) and runs the set's transform.
     transforming: bool,
     exported: bool,
@@ -2179,7 +2182,7 @@ impl Inner {
             let gen = st.tick();
             // Pinned (filling) until the mechanism maps it.
             self.mech.post(Mech::Adopt { key, gen, va, off, phys: phys.id, len: phys.len, identity: identity.clone() }, 0);
-            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, stock: None, protecting: false, lent: false });
+            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, stock: None, protecting: false, lent: false, landing: false });
             st.sync(key);
             let s = st.fills(req, key, span, Origin::Kept);
             s.moved.kept.bytes += span;
@@ -2204,7 +2207,7 @@ impl Inner {
         let decided = st.table.free();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, stock: None, protecting: false, lent: false });
+        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, stock: None, protecting: false, lent: false, landing: false });
         st.sync(key);
         self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, speculative, decided }, 0);
         Ok(true)
@@ -2226,7 +2229,7 @@ impl Inner {
         // Kept, or with a Keep queued: never written again; a fresh page takes its place.
         let phys = if exported || h.keeping { h.phys.take() } else { None };
         let renew = phys.is_some();
-        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, stock: None, protecting: false, lent: false };
+        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, stock: None, protecting: false, lent: false, landing: false };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
         let job = Job { key, gen, req, span, after: vec![] };
@@ -2343,7 +2346,8 @@ impl Inner {
                 continue;
             }
             // Read ready at issue (`issued`): its own copies all went out, whatever the batch's end.
-            let landed = match (st.homes.get(&job.key).is_some_and(|h| !h.filling), landed) {
+            let early = st.homes.get_mut(&job.key).is_some_and(|h| std::mem::take(&mut h.landing));
+            let landed = match (early, landed) {
                 (true, Ok((_, ready))) => {
                     self.backend.retire(ready);
                     Ok((Origin::Store, None))
@@ -2485,6 +2489,9 @@ impl Inner {
         };
         for job in jobs {
             // A page read ready at issue had all its copies go out: its binders keep it.
+            if let Some(h) = st.homes.get_mut(&job.key).filter(|h| h.gen == job.gen) {
+                h.landing = false;
+            }
             if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen && h.filling) {
                 if drained {
                     if let Some(h) = st.homes.get_mut(&job.key) {
@@ -2732,7 +2739,7 @@ impl Inner {
         let mut st = self.state.lock();
         match st.homes.get_mut(&key) {
             Some(h) if h.gen == gen && h.filling => {
-                (h.ready, h.ready_on, h.filling, h.filled, h.origin) = (ready, COPY, false, filled, Origin::Store);
+                (h.ready, h.ready_on, h.filling, h.landing, h.filled, h.origin) = (ready, COPY, false, true, filled, Origin::Store);
             }
             _ => {
                 self.unlock(st);
@@ -3103,7 +3110,8 @@ impl Inner {
                 }
                 self.demand(Trigger::Load { set: id }, None)?;
                 let mut st = self.lock();
-                while st.table.pages().any(|(k, p)| k.0 == id && p.filling) {
+                // Until its fills' batches end (landed, accounted for and kept), not only issued.
+                while st.table.pages().any(|(k, p)| k.0 == id && p.filling) || st.homes.iter().any(|(k, h)| k.0 == id && h.landing) {
                     self.wait(&mut st)?;
                 }
                 self.unlock(st);
