@@ -362,21 +362,23 @@ pub struct Site<'a> {
 
 /// Public handles count explicitly; internal worker references are not public ownership.
 /// The final public handle transfers its actual Arc, never a racing temporary clone.
-struct Owner(Option<Arc<Inner>>);
+struct Owner(std::mem::ManuallyDrop<Arc<Inner>>);
 
 impl From<Arc<Inner>> for Owner {
     fn from(inner: Arc<Inner>) -> Self {
         inner.public_owners.fetch_add(1, Ordering::Relaxed);
-        Self(Some(inner))
+        Self(std::mem::ManuallyDrop::new(inner))
     }
 }
 impl std::ops::Deref for Owner {
     type Target = Arc<Inner>;
-    fn deref(&self) -> &Self::Target { self.0.as_ref().expect("live public owner") }
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 impl Drop for Owner {
     fn drop(&mut self) {
-        let Some(inner) = self.0.take() else { return };
+        // SAFETY: Owner always contains one initialized Arc; only this Drop moves it out,
+        // and ManuallyDrop prevents a second release after the transfer.
+        let inner = unsafe { std::mem::ManuallyDrop::take(&mut self.0) };
         if inner.public_owners.fetch_sub(1, Ordering::AcqRel) != 1 { return; }
         static RETIRER: OnceLock<std::sync::mpsc::Sender<Arc<Inner>>> = OnceLock::new();
         let sender = RETIRER.get_or_init(|| {
