@@ -2534,16 +2534,7 @@ impl Pool {
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
             let starting = Instant::now();
-            // Each GPU's grant (its table, and a description for its row's lock) follows the
-            // Start, in lane order: every rank claims its own row. Granted to the executor, whose
-            // exit reaps them.
-            let grants = match gpus.iter().all(|d| d.memory.is_some()) {
-                true => gpus.iter().filter_map(|d| d.memory.as_ref())
-                    .map(|m| m.ledger.grant(session.executor.birth.pid).map_err(io::Error::other))
-                    .collect::<io::Result<Vec<_>>>()?,
-                false => vec![],
-            };
-            let ledgers: Vec<File> = grants.into_iter().flat_map(|grant| [File::from(grant.table), File::from(grant.row)]).collect();
+            let ledgers = self.grants(gpus, &session.executor)?;
             // Rank 0 spawns and forms every follower inside this command; its watch meters
             // the whole group's work, so formation ends only on measured lack of progress.
             let started = command_ok(session.executor.command_with(
@@ -2857,6 +2848,28 @@ impl Pool {
             }
         }
         Ok(true)
+    }
+
+    /// Each GPU's grant for `executor`, in lane order (its table, and a description for its
+    /// row's lock), which follow its Start: every rank claims its own row, reaped at its exit.
+    /// An executor of another memory protocol (a Runtime before 0.31) gets none and runs its
+    /// memory alone, unshared with the others on these GPUs: version skew degrades, with a note.
+    fn grants(&self, gpus: &[Device], executor: &DeviceExecutor) -> io::Result<Vec<File>> {
+        if !gpus.iter().all(|d| d.memory.is_some()) {
+            return Ok(vec![]);
+        }
+        let hello = &executor.hello;
+        if !hello.takes_ledgers() {
+            tracing::warn!("executor {} (Runtime {}, TensorFS {}) speaks memory protocol {}, not {}: its GPU memory runs without this machine's ledger",
+                executor.birth.pid, hello.runtime_version, hello.tensorfs_version, hello.memory_protocol, device_executor::MEMORY_PROTOCOL);
+            self.notes.note(serde_json::json!({"event": "no_ledger", "pid": executor.birth.pid, "runtime": hello.runtime_version,
+                "tensorfs": hello.tensorfs_version, "memory_protocol": hello.memory_protocol}));
+            return Ok(vec![]);
+        }
+        let grants = gpus.iter().filter_map(|d| d.memory.as_ref())
+            .map(|m| m.ledger.grant(executor.birth.pid).map_err(io::Error::other))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(grants.into_iter().flat_map(|grant| [File::from(grant.table), File::from(grant.row)]).collect())
     }
 
     /// For a group, each slot's placeable components and the GPU of the group that keeps each
