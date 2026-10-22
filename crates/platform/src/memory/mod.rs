@@ -15,9 +15,6 @@
 //! | serving | one poll over all | one poll over all | a thread per connection |
 //! | host page | memfd | anonymous `shm_open` | pagefile section in a placeholder |
 //! | stall | `/proc` thread state | `proc_pidinfo` status | suspend count, exit code |
-//!
-//! The RAM tier's files (punched region by region) are Linux's; elsewhere they answer
-//! `Unsupported` and the tier is absent.
 
 /// A shared mapping; unmapped on drop.
 pub struct Map {

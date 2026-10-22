@@ -69,25 +69,19 @@ struct Events {
     /// Events varena gave up (retired), and a signal for each.
     retired: Mutex<HashSet<u64>>,
     retiring: Condvar,
-    /// Mapping calls by address, in order: map, target (a fill writes), save (a copy out read),
-    /// unmap.
+    /// Mapping calls by address, in order: map, target (a fill writes), unmap.
     calls: Mutex<Vec<(&'static str, u64)>>,
-    /// The next map, fill target or save waits until its gate opens (its `waits` opens then).
+    /// The next map or fill target waits until its gate opens (its `waits` opens then).
     hold_map: AtomicBool,
     map_gate: Gate,
     map_waits: Gate,
     hold_target: AtomicBool,
     target_gate: Gate,
     target_waits: Gate,
-    hold_save: AtomicBool,
     /// The next driver free-bytes read waits (under the state lock, as refresh reads it).
     hold_free: AtomicBool,
     free_gate: Gate,
     free_waits: Gate,
-    save_gate: Gate,
-    save_waits: Gate,
-    fail_save: AtomicBool,
-    fail_save_drain: AtomicBool,
     /// The next protect waits until its gate opens (its `waits` opens then); a protect is
     /// running; binds (a binder's in-stream wait) made while one ran; each protect's bytes.
     hold_protect: AtomicBool,
@@ -246,15 +240,6 @@ impl Backend for Stream {
         held(&self.events.hold_target, &self.events.target_waits, &self.events.target_gate);
         self.host.target(va, offset, len)
     }
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> {
-        held(&self.events.hold_save, &self.events.save_waits, &self.events.save_gate);
-        self.host.save(va, offset, host, after)?;
-        self.events.calls.lock().push(("save", va.base + offset));
-        if self.events.fail_save.swap(false, Ordering::SeqCst) {
-            return Err(varena::Error::Device { op: "save", code: 999, name: "copy completion unknown".into() });
-        }
-        Ok(())
-    }
     fn fence(&self) -> Result<Event> {
         if self.events.hold_fence.swap(false, Ordering::SeqCst) {
             self.events.fence_gate.pass();
@@ -306,24 +291,11 @@ impl Backend for Stream {
         }
         Ok(())
     }
-    fn register_host(&self, _: u64, _: u64) -> Result<()> {
-        Ok(())
-    }
-    fn unregister_host(&self, _: u64) -> Result<()> {
-        Ok(())
-    }
     fn retire(&self, event: Event) {
         self.events.retired.lock().insert(event.0);
         self.events.retiring.notify_all();
     }
     fn drain(&self) -> Result<()> {
-        Ok(())
-    }
-    fn drain_save(&self) -> Result<()> {
-        self.events.log("drain_save");
-        if self.events.fail_save_drain.load(Ordering::SeqCst) {
-            return Err(varena::Error::Device { op: "drain_save", code: 999, name: "stream completion unknown".into() });
-        }
         Ok(())
     }
 }
@@ -473,8 +445,7 @@ fn a_binder_never_waits_on_a_release_event() {
 
 /// This binary's namespace for tables and service names (never a machine's), and the test's
 /// table removed when it ends.
-// Every test in this binary uses the same process-wide RAM-tier service and its headroom
-// source. Isolate fixtures from one another; concurrency inside a case remains unchanged.
+// Fixtures are isolated from one another; concurrency inside a case remains unchanged.
 static TEST_SCOPE: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
 struct Scope {
     uuid: String,
@@ -492,7 +463,6 @@ impl Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         varena::os::remove_table(&self.uuid);
-        varena::tier::remove_claims();
     }
 }
 
@@ -879,9 +849,6 @@ impl Backend for Driver {
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
         self.0.host.target(va, offset, len)
     }
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> {
-        self.0.host.save(va, offset, host, after)
-    }
     fn fence(&self) -> Result<Event> {
         self.0.host.fence()
     }
@@ -903,20 +870,11 @@ impl Backend for Driver {
     fn finish(&self, event: Event) -> Result<()> {
         self.0.host.finish(event)
     }
-    fn register_host(&self, ptr: u64, len: u64) -> Result<()> {
-        self.0.host.register_host(ptr, len)
-    }
-    fn unregister_host(&self, ptr: u64) -> Result<()> {
-        self.0.host.unregister_host(ptr)
-    }
     fn retire(&self, event: Event) {
         self.0.host.retire(event)
     }
     fn drain(&self) -> Result<()> {
         self.0.host.drain()
-    }
-    fn drain_save(&self) -> Result<()> {
-        self.0.host.drain_save()
     }
 }
 
@@ -1294,119 +1252,6 @@ fn a_fill_is_issued_only_after_its_map() {
         if *c == "target" {
             assert!(calls[..i].iter().any(|(m, a)| *m == "map" && a == at), "a fill of {at:#x} before its map: {calls:?}");
         }
-    }
-}
-
-/// ILLEGAL_ADDRESS audit, 3: no page is unmapped while the RAM tier's copy reads it. The copy
-/// is held mid-way while a bind needs the page's bytes: the bind waits for the copy, then
-/// evicts; the unmap comes after the copy. Linux: the RAM tier's files are Linux's (elsewhere
-/// no save is made).
-#[cfg(target_os = "linux")]
-#[test]
-fn a_page_being_saved_is_unmapped_only_after_its_copy() {
-    let dir = tempfile::tempdir().unwrap();
-    let uuid = format!("saving-{}", std::process::id());
-    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: REGION_ALIGN };
-    let _scope = Scope::new(&g.uuid);
-    let events = Arc::new(Events::default());
-    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
-    events.hold_save.store(true, Ordering::SeqCst);
-    mem.load(stored(dir.path(), &uuid, "s", 1), Level::Gpu).unwrap();
-    events.save_waits.pass();
-    let saved = events.calls.lock().iter().find(|(c, _)| *c == "map").map(|(_, at)| *at).unwrap();
-    let t = mem.load(stored(dir.path(), &uuid, "t", 1), Level::Ram).unwrap();
-    let binding = {
-        let mem = mem.clone();
-        std::thread::spawn(move || drop(mem.bind(t, 0, 0).unwrap()))
-    };
-    events.save_gate.open();
-    binding.join().unwrap();
-    let calls = events.calls.lock().clone();
-    let at = |what: &str| calls.iter().position(|(c, a)| *c == what && *a == saved);
-    assert!(at("save") < at("unmap") && at("save").is_some(), "unmapped under its copy: {calls:?}");
-}
-
-/// An unknown copy completion deliberately retains owners until process exit. Run each
-/// case in its own process, so its quarantined tier reservation cannot affect other tests.
-/// Linux: the RAM tier's files are Linux's (elsewhere no save is made).
-#[cfg(target_os = "linux")]
-#[test]
-fn failed_saves_release_memory_only_after_the_save_stream_drains() {
-    for drained in [true, false] {
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["failed_save_child", "--exact", "--ignored", "--nocapture"])
-            .env("VARENA_TEST_SAVE_DRAINED", if drained { "1" } else { "0" })
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "drained={drained}: {}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-#[ignore = "subprocess entry for failed_saves_release_memory_only_after_the_save_stream_drains"]
-fn failed_save_child() {
-    let drained = std::env::var("VARENA_TEST_SAVE_DRAINED").unwrap() == "1";
-    let dir = tempfile::tempdir().unwrap();
-    let uuid = format!("failedsave-{}", std::process::id());
-    let g = GpuId {
-        uuid: uuid.clone(),
-        model: "host".into(),
-        memory: REGION_ALIGN,
-    };
-    let _scope = Scope::new(&uuid);
-    let events = Arc::new(Events::default());
-    let mem = Memory::open(
-        g.clone(),
-        None,
-        Box::new(Stream {
-            host: HostBackend::new(g.memory),
-            events: events.clone(),
-        }),
-    )
-    .unwrap();
-    events.hold_save.store(true, Ordering::SeqCst);
-    events.fail_save.store(true, Ordering::SeqCst);
-    events.fail_save_drain.store(!drained, Ordering::SeqCst);
-    let id = mem
-        .load(stored(dir.path(), &uuid, "s", 1), Level::Gpu)
-        .unwrap();
-    events.save_waits.pass();
-    let request = mem.request("save-error", Plan::default()).unwrap();
-    events.save_gate.open();
-    events.await_log(|calls| calls.contains(&"drain_save"));
-    if drained {
-        mem.settle();
-        request.check().unwrap();
-        mem.unload(id);
-        mem.settle();
-        assert_eq!(
-            events.unmaps.load(Ordering::SeqCst),
-            1,
-            "drained source can be unmapped"
-        );
-    } else {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while request.check().is_ok() && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(matches!(request.check(), Err(varena::Error::Ownership(_))));
-        assert!(matches!(
-            mem.bind(id, 0, 0),
-            Err(varena::Error::Ownership(_))
-        ));
-        drop(request);
-        drop(mem);
-        assert_eq!(
-            events.unmaps.load(Ordering::SeqCst),
-            0,
-            "uncertain source survives the last public owner"
-        );
     }
 }
 

@@ -59,7 +59,6 @@ struct Claims;
 
 impl Drop for Claims {
     fn drop(&mut self) {
-        varena::tier::remove_claims();
     }
 }
 

@@ -40,7 +40,6 @@ impl Backend for Counted {
     fn export(&self, page: &Physical) -> varena::Result<Owned> { self.0.export(page) }
     fn import(&self, handle: Owned, len: u64) -> varena::Result<Physical> { self.0.import(handle, len) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.0.target(va, offset, len) }
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> varena::Result<()> { self.0.save(va, offset, host, after) }
     fn fence(&self) -> varena::Result<Event> { self.0.fence() }
     fn record(&self, stream: usize) -> varena::Result<Event> { self.0.record(stream) }
     fn query(&self, event: Event) -> varena::Result<bool> { self.0.query(event) }
@@ -48,11 +47,8 @@ impl Backend for Counted {
     fn wait(&self, event: Event, stream: usize) -> varena::Result<()> { self.0.wait(event, stream) }
     fn synchronize(&self, stream: usize) -> varena::Result<()> { self.0.synchronize(stream) }
     fn finish(&self, event: Event) -> varena::Result<()> { self.0.finish(event) }
-    fn register_host(&self, ptr: u64, len: u64) -> varena::Result<()> { self.0.register_host(ptr, len) }
-    fn unregister_host(&self, ptr: u64) -> varena::Result<()> { self.0.unregister_host(ptr) }
     fn retire(&self, event: Event) { self.0.retire(event) }
     fn drain(&self) -> varena::Result<()> { self.0.drain() }
-    fn drain_save(&self) -> varena::Result<()> { self.0.drain_save() }
 }
 
 /// This binary's namespace for tables and service names (never a machine's), and the test's table removed when it ends.
@@ -68,7 +64,6 @@ impl Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         varena::os::remove_table(&self.0);
-        varena::tier::remove_claims();
     }
 }
 

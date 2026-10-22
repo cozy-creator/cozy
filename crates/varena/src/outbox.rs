@@ -1,4 +1,4 @@
-//! The calls a Memory makes to one service (custody, or the RAM tier), in the order it made
+//! The calls a Memory makes to one service (custody), in the order it made
 //! them, for that service's one sender thread: a stalled service delays only its own calls. A
 //! call not yet sent can be cancelled (an Export by its page's Withdraw: its handle goes with
 //! it, so the queue holds nothing beyond the pages it covers). Each call is a ticket; a waiter
@@ -106,18 +106,6 @@ impl<C> Outbox<C> {
     pub fn settle(&self) {
         let until = self.queue.lock().next;
         self.settle_to(until);
-    }
-
-    /// Blocks until every call posted before it, and every call those posted meanwhile, has
-    /// been sent (or cancelled).
-    pub fn quiesce(&self) {
-        loop {
-            let until = self.queue.lock().next;
-            self.settle_to(until);
-            if self.queue.lock().next == until {
-                return;
-            }
-        }
     }
 
     /// Blocks until every call with a ticket below `until` has been sent (or cancelled).

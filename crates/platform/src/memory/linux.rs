@@ -3,7 +3,7 @@ use super::clean;
 use super::unix::{Owned, Stream};
 use crate::shm::Region;
 use crate::{Error, Result};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 
@@ -46,43 +46,6 @@ pub fn unlock(f: &Owned, start: u64, len: u64) -> Result<()> {
 /// Whether another description holds a lock over the range.
 pub fn held(f: &Owned, start: u64, len: u64) -> Result<bool> {
     Ok(crate::shm::region_holder(f.as_fd(), start as usize, len as usize)?.is_some())
-}
-
-/// A local event: (the reader, the writer). Writes are signals; a read clears them.
-pub fn event() -> Result<(Owned, Owned)> {
-    // SAFETY: eventfd(2) with no shared state.
-    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if fd < 0 {
-        return Err(Error::os("eventfd")(std::io::Error::last_os_error()));
-    }
-    // SAFETY: a descriptor we just created.
-    let reader = unsafe { Owned::from_raw_fd(fd) };
-    let writer = reader.try_clone()?;
-    Ok((reader, writer))
-}
-
-pub fn signal(writer: &Owned) {
-    let one = 1u64.to_ne_bytes();
-    // SAFETY: an 8-byte write to an eventfd; a full counter is a signal already.
-    unsafe { libc::write(writer.as_raw_fd(), one.as_ptr().cast(), 8) };
-}
-
-/// Blocks until the event is signalled, then clears it.
-pub fn await_event(reader: &Owned) -> Result<()> {
-    let mut poll = libc::pollfd { fd: reader.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-    loop {
-        // SAFETY: one live descriptor.
-        if unsafe { libc::poll(&mut poll, 1, -1) } > 0 {
-            let mut buf = [0u8; 8];
-            // SAFETY: an 8-byte read into our buffer; EAGAIN when another reader took it.
-            unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
-            return Ok(());
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(Error::os("wait for a wake")(e));
-        }
-    }
 }
 
 /// The GPU's wake endpoint: an abstract datagram socket every participant signals by name.
@@ -221,22 +184,6 @@ pub fn page(len: u64) -> Result<Owned> {
 /// A read-only description of a page: what another process imports.
 pub fn export(page: &Owned) -> Result<Owned> {
     crate::shm::reopen(page.as_fd(), false)
-}
-
-/// A RAM-tier layout's file.
-pub fn tier_file(name: &str) -> Result<Owned> {
-    crate::shm::memfd_named(name)
-}
-
-/// Frees `[offset, offset+len)` of a tier file; it keeps its size.
-pub fn punch(f: &Owned, offset: u64, len: u64) -> Result<()> {
-    crate::shm::punch(f.as_fd(), offset, len)
-}
-
-/// The bytes a file really holds (its allocated blocks).
-pub fn allocated(f: &Owned) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    f.try_clone().ok().and_then(|f| std::fs::File::from(f).metadata().ok()).map_or(0, |m| m.blocks() * 512)
 }
 
 /// The effective uid of `pid`, from `/proc`.
