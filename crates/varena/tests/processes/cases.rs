@@ -90,6 +90,7 @@ pub fn main() {
         ("a_layout_stays_locked_until_the_tier_takes_it_back", a_layout_stays_locked_until_the_tier_takes_it_back),
         ("an_unmeasured_pass_asks_peers_only_on_an_oom", an_unmeasured_pass_asks_peers_only_on_an_oom),
         ("a_refused_tier_copy_runs_after_a_measured_pass", a_refused_tier_copy_runs_after_a_measured_pass),
+        ("a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends", a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends),
         ("the_tier_waits_on_no_executor_and_a_pending_release_settles_first", the_tier_waits_on_no_executor_and_a_pending_release_settles_first),
         ("a_silent_asker_holds_up_no_answer", a_silent_asker_holds_up_no_answer),
         ("the_tier_comes_back_after_a_release", the_tier_comes_back_after_a_release),
@@ -1017,6 +1018,35 @@ fn a_refused_tier_copy_runs_after_a_measured_pass(dir: &Path) {
     y.ok("settle");
     assert!(resident() >= 2 * REGION_ALIGN, "the deferred copies ran: {}", resident());
     y.ok("end r");
+    y.exit();
+}
+
+/// Review 6: a standalone call (no dispatch key: host-unmeasured, no measured pass end) has the
+/// copies refused beside it probe for room again when it ends, the last unmeasured call.
+fn a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends(dir: &Path) {
+    let g = gpu("standalone-save", 64 * MB);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let keep = Arc::new(std::sync::atomic::AtomicU64::new(SHORT));
+    let tier = watched(need(&keep));
+    let path = write_set(dir, "s1", 2);
+    let digest = format!("layout-s1-{}", g.uuid);
+    let resident = || tier.resident().into_iter().find(|(k, _)| *k == digest).map_or(0, |(_, b)| b);
+    let mut y = Agent::spawn();
+    y.ok(&format!("open {} {}", g.uuid, g.memory));
+    y.ok(&format!("load s1 {} stored gpu", path.display()));
+    y.ok("settle");
+    assert!(resident() < REGION_ALIGN, "no room, no copy: {}", resident());
+    // Its pass end retries, beside itself: refused again.
+    y.ok("request r s1");
+    y.ok("pass r s1 1x1");
+    y.ok(&format!("endpass r {MB}"));
+    y.ok("settle");
+    assert!(resident() < REGION_ALIGN, "no room beside the unmeasured call: {}", resident());
+    // The call's need goes as it ends.
+    keep.store(0, std::sync::atomic::Ordering::SeqCst);
+    y.ok("end r");
+    y.ok("settle");
+    assert!(resident() >= 2 * REGION_ALIGN, "the refused copies ran once it ended: {}", resident());
     y.exit();
 }
 
