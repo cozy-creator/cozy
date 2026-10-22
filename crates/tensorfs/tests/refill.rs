@@ -1,10 +1,12 @@
 //! Refill speeds for the audit's step 3 (host RAM = the OS page cache). The same bytes go onto
-//! the GPU from five sources:
+//! the GPU from five sources, and two more read into host memory:
 //! - pinned host memory (the RAM tier's path);
 //! - the page cache, by buffered reads through TensorFS's pinned staging (`warm`);
 //! - the page cache with TensorFS's default O_DIRECT reads (`warm_default`);
 //! - disk by buffered reads (`cold`, no O_DIRECT);
-//! - disk with O_DIRECT (`cold_direct`).
+//! - disk with O_DIRECT (`cold_direct`);
+//! - disk into host memory, buffered and O_DIRECT (`cold_host`, `cold_host_direct`).
+//!
 //! One copy per 32 MiB block, as a fill issues them, and every mode's bytes are read back.
 //! `REFILL_GIB` (default 4) GiB in 1 GiB files under `REFILL_DIR` (default the temp dir). The
 //! test uses only `io::read`, so the same file builds against the shipping TensorFS (0.13.6).
@@ -119,6 +121,22 @@ fn page_cache_refill_against_the_pinned_tier() {
     run("cold", &from_files, ReadOpts { direct: false, ..ReadOpts::default() });
     evict(&files);
     run("cold_direct", &from_files, ReadOpts::default());
+    // The same cold reads into host memory (a host page; a machine with no GPU).
+    let mut into = vec![0u8; total];
+    let base = into.as_mut_ptr();
+    for (mode, direct) in [("cold_host", false), ("cold_host_direct", true)] {
+        evict(&files);
+        // SAFETY: each block's destination lies inside `into`, ours for the read.
+        let copies: Vec<Copy> = blocks.iter().map(|&(f, o)| Copy { src: Src::File(&files[f], o as u64), dst: Dst::Host { ptr: unsafe { base.add(f * GIB + o) }, len: BLOCK } }).collect();
+        let start = Instant::now();
+        let stats: ReadStats = unsafe { io::read(&copies, &ReadOpts { direct, ..ReadOpts::default() }) }.unwrap();
+        let gbps = rate(start.elapsed());
+        for &(f, o) in [blocks[0], blocks[blocks.len() - 1]].iter() {
+            assert!(into[f * GIB + o..f * GIB + o + BLOCK] == noise(f as u64 + 1, GIB)[o..o + BLOCK], "{mode}: block {f}/{o} differs");
+        }
+        println!("STEP {} {}", line!(), started.elapsed().as_millis());
+        rows.push(format!("{mode} {gbps:.2} GB/s (direct {} cached {} MiB)", stats.direct / MIB as u64, stats.cached / MIB as u64));
+    }
     let fs_type = std::process::Command::new("stat").args(["-f", "-c", "%T"]).arg(&dir).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
     let ceiling = io::ceiling(Some(0), &dir).map(|c| format!("{c:?}")).unwrap_or_else(|e| format!("unmeasured: {e}"));
     println!("TIMINGS {gib} GiB in {} blocks of 32 MiB on {fs_type}: {}; ceiling {ceiling}", blocks.len(), rows.join("; "));

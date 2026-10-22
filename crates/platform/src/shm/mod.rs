@@ -1,8 +1,8 @@
 //! Sealed shared memory for weight layouts and the plane's host tier: a Linux memfd with file
 //! seals, handed between processes by descriptor and claimed region by region with
 //! open-file-description locks. macOS has neither memfd nor seals; the Apple tier (AP) designs its
-//! own, and until then every call answers `Unsupported` (a Mac's host tier is its page cache).
-//! Windows has only `frozen`: its host tier is off.
+//! own, and until then every call answers `Unsupported`.
+//! Windows has only `frozen`.
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
 #[cfg_attr(all(unix, not(target_os = "linux")), path = "unsupported.rs")]
 #[cfg_attr(windows, path = "windows.rs")]

@@ -34,10 +34,6 @@ pub fn written(_: BorrowedFd<'_>, _: usize, _: usize) -> Result<bool> {
     Err(Error::unsupported(Seam::SharedMemory))
 }
 
-pub fn punch(_: BorrowedFd<'_>, _: u64, _: u64) -> Result<()> {
-    Err(Error::unsupported(Seam::SharedMemory))
-}
-
 pub fn reopen(_: BorrowedFd<'_>, _: bool) -> Result<OwnedFd> {
     Err(Error::unsupported(Seam::SharedMemory))
 }

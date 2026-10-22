@@ -2,12 +2,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::{AcqRel, Relaxed}};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use super::cuda::{self, CUcontext, CUevent, CUstream, CtxGuard};
-use super::{host, Copy, Dst, Error, Landed, ReadOpts, ReadStats, Src};
+use super::{host, Copy, Dst, Error, Issued, ReadOpts, ReadStats, Src};
 
 const PIECE: usize = 2 << 20;
 const READERS: usize = 8;
@@ -62,8 +62,6 @@ impl Event {
     }
     fn sync(&self) -> cuda::Result<()> {
         let _ctx = CtxGuard::enter(self.ctx)?;
-        // A host wait: a trace span, so a subscriber can time each.
-        let _wait = tracing::trace_span!("tensorfs cuEventSynchronize").entered();
         cuda::check("cuEventSynchronize", unsafe {
             (cuda::driver()?.event_synchronize)(self.raw)
         })
@@ -90,8 +88,6 @@ struct Slot {
     done: Event,
     pending: bool,
     recorded: bool,
-    /// The run and run-local copy its pending piece belongs to, when that run is told of landings.
-    landing: Option<(u64, usize)>,
 }
 
 impl Slot {
@@ -106,7 +102,6 @@ impl Slot {
             done,
             pending: false,
             recorded: false,
-            landing: None,
         })
     }
 }
@@ -176,41 +171,6 @@ impl Near {
         }
     }
 }
-
-/// A run's copies still in flight, for `ReadOpts::landed`: allocated once per run, none per piece.
-struct Landing<'a> {
-    run: u64,
-    /// Pieces not yet complete, per run-local copy.
-    left: Vec<AtomicUsize>,
-    /// Run-local copy -> its index in `read`'s copies.
-    index: Vec<usize>,
-    call: &'a Landed,
-}
-
-impl Landing<'_> {
-    /// A piece of run-local copy `local` is complete (its staging slot's event synced).
-    fn piece(&self, local: usize) {
-        if self
-            .left
-            .get(local)
-            .is_some_and(|n| n.fetch_sub(1, Relaxed) == 1)
-        {
-            (self.call.0)(self.index[local]);
-        }
-    }
-
-    /// Every lane drained: every copy with pieces left has landed.
-    fn rest(&self) {
-        for (local, n) in self.left.iter().enumerate() {
-            if n.swap(0, Relaxed) > 0 {
-                (self.call.0)(self.index[local]);
-            }
-        }
-    }
-}
-
-/// Each run's token, so a slot carried over from an earlier run tells nobody.
-static RUNS: AtomicU64 = AtomicU64::new(0);
 
 struct Engine {
     device: i32,
@@ -538,6 +498,7 @@ impl Engine {
         copies: &[(usize, Copy)],
         opts: &ReadOpts,
         staged_host: bool,
+        issued: Option<Issued>,
     ) -> Result<ReadStats, Error> {
         let _serial = self.serial.lock().unwrap_or_else(|e| e.into_inner());
         let first = copies[0].0;
@@ -619,18 +580,6 @@ impl Engine {
                     });
                 }
             }
-            let landing = opts.landed.as_ref().map(|call| {
-                let left: Vec<AtomicUsize> =
-                    (0..copies.len()).map(|_| AtomicUsize::new(0)).collect();
-                jobs.iter()
-                    .for_each(|j| _ = left[j.local].fetch_add(1, Relaxed));
-                Landing {
-                    run: RUNS.fetch_add(1, Relaxed),
-                    left,
-                    index: copies.iter().map(|(copy, _)| *copy).collect(),
-                    call,
-                }
-            });
             let start = owners.events.len();
             for stream in &self.streams[..streams] {
                 owners
@@ -646,6 +595,17 @@ impl Engine {
             let next = AtomicUsize::new(0);
             let stopped = AtomicBool::new(false);
             let error = Mutex::new(None);
+            // Each copy's jobs not yet issued: the one that issues its last tells `issued`.
+            let left: Vec<AtomicUsize> = (0..copies.len()).map(|_| AtomicUsize::new(0)).collect();
+            jobs.iter().for_each(|job| _ = left[job.local].fetch_add(1, Relaxed));
+            let raw: Vec<usize> = self.streams[..streams].iter().map(|s| s.raw()).collect();
+            let done = |job: &Job| {
+                if let Some(issued) = issued {
+                    if left[job.local].fetch_sub(1, AcqRel) == 1 {
+                        issued(job.copy, &raw);
+                    }
+                }
+            };
             // Direct copies (device, zero or registered host sources) need no staging: this
             // thread issues them, round-robin over the streams, before any reader starts.
             let (direct, jobs): (Vec<Job>, Vec<Job>) = jobs.into_iter().partition(|job| job.direct);
@@ -655,6 +615,7 @@ impl Engine {
                     stopped.store(true, Relaxed);
                     break;
                 }
+                done(job);
             }
             // A failed copy's slots stay retained until checked completion: read with the rest.
             let readers = readers(jobs.len(), opts, self.free().len());
@@ -677,16 +638,12 @@ impl Engine {
                     let at = next.fetch_add(1, Relaxed);
                     let Some(job) = jobs.get(at) else { break };
                     turn += 1;
-                    if let Err(failure) = self.piece(
-                        job,
-                        at % streams,
-                        opts,
-                        &tally,
-                        &mut ring[turn % RING],
-                        landing.as_ref(),
-                    ) {
-                        error.lock().unwrap().get_or_insert(failure);
-                        stopped.store(true, Relaxed);
+                    match self.piece(job, at % streams, opts, &tally, &mut ring[turn % RING]) {
+                        Ok(()) => done(job),
+                        Err(failure) => {
+                            error.lock().unwrap().get_or_insert(failure);
+                            stopped.store(true, Relaxed);
+                        }
                     }
                 }
                 // After any failure a slot may still be in flight: kept until checked completion.
@@ -724,9 +681,6 @@ impl Engine {
             complete = all_complete;
             if let Some(error) = error.into_inner().unwrap() {
                 return Err(error);
-            }
-            if let Some(landing) = &landing {
-                landing.rest();
             }
             Ok(ReadStats {
                 direct: tally.direct.load(Relaxed),
@@ -776,7 +730,6 @@ impl Engine {
         opts: &ReadOpts,
         tally: &Tally,
         slot: &mut Slot,
-        landing: Option<&Landing>,
     ) -> Result<(), Error> {
         let _ctx = CtxGuard::enter(self.ctx).map_err(|e| failed(job.copy, e))?;
         let d = cuda::driver().map_err(|e| failed(job.copy, e))?;
@@ -784,11 +737,6 @@ impl Engine {
         if slot.pending {
             slot.done.sync().map_err(|e| failed(job.copy, e))?;
             slot.pending = false;
-            if let (Some(l), Some((run, local))) = (landing, slot.landing.take()) {
-                if run == l.run {
-                    l.piece(local);
-                }
-            }
         }
         match job.c.src {
             Src::File(file, offset) => {
@@ -829,18 +777,13 @@ impl Engine {
         };
         slot.pending = true;
         slot.recorded = false;
-        slot.landing = landing.map(|l| (l.run, job.local));
         cuda::check("cuMemcpyAsync", rc).map_err(|e| failed(job.copy, e))?;
         slot.done.record(stream).map_err(|e| failed(job.copy, e))?;
         slot.recorded = true;
         if let Dst::Host { ptr, .. } = job.c.dst {
             slot.done.sync().map_err(|e| failed(job.copy, e))?;
             slot.pending = false;
-            slot.landing = None;
             unsafe { std::ptr::copy_nonoverlapping(slot.ptr, ptr.add(job.at), job.len) };
-            if let Some(l) = landing {
-                l.piece(job.local);
-            }
         }
         tally.staged.fetch_add(job.len as u64, Relaxed);
         Ok(())
@@ -882,12 +825,11 @@ pub(super) unsafe fn fill(
     copies: &[(usize, Copy)],
     opts: &ReadOpts,
     staged_host: bool,
+    issued: Option<Issued>,
 ) -> Result<ReadStats, Error> {
     let mut groups: BTreeMap<(i32, &str), Vec<(usize, Copy)>> = BTreeMap::new();
-    let mut empty = Vec::new();
     for &(index, copy) in copies {
         if copy.dst.is_empty() {
-            empty.push(index);
             continue;
         }
         let device = match (copy.src, copy.dst) {
@@ -911,10 +853,14 @@ pub(super) unsafe fn fill(
             .push((index, copy));
     }
     let mut total = ReadStats::default();
+    // Zeroes first: a placement's padding is done before its file bytes go out, so the last of
+    // those (`issued`) completes it.
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by_key(|((_, kind), _)| *kind != "zero");
     for ((device, kind), copies) in groups {
         let engine = Engine::get(device).map_err(|e| failed(copies[0].0, e))?;
         let start = Instant::now();
-        let stats = engine.run(&copies, opts, staged_host)?;
+        let stats = engine.run(&copies, opts, staged_host, issued)?;
         #[cfg(unix)]
         {
             let ns = start.elapsed().as_nanos() as u64;
@@ -946,9 +892,6 @@ pub(super) unsafe fn fill(
         total.pin_ns += stats.pin_ns;
         total.staged += stats.staged;
         total.busy_ns += stats.busy_ns;
-    }
-    if let Some(landed) = &opts.landed {
-        empty.into_iter().for_each(|copy| (landed.0)(copy));
     }
     Ok(total)
 }

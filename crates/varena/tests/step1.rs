@@ -123,7 +123,6 @@ impl Backend for Driver {
     fn export(&self, page: &Physical) -> Result<Owned> { self.0.host.export(page) }
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> { self.0.host.import(handle, len) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.0.host.target(va, offset, len) }
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> { self.0.host.save(va, offset, host, after) }
     fn fence(&self) -> Result<Event> { self.0.host.fence() }
     fn record(&self, _: usize) -> Result<Event> {
         Ok(if self.0.pending.load(Ordering::SeqCst) { Event(self.0.next.fetch_add(1, Ordering::SeqCst)) } else { Event::DONE })
@@ -140,11 +139,8 @@ impl Backend for Driver {
         }
         Ok(())
     }
-    fn register_host(&self, ptr: u64, len: u64) -> Result<()> { self.0.host.register_host(ptr, len) }
-    fn unregister_host(&self, ptr: u64) -> Result<()> { self.0.host.unregister_host(ptr) }
     fn retire(&self, _: Event) {}
     fn drain(&self) -> Result<()> { Ok(()) }
-    fn drain_save(&self) -> Result<()> { Ok(()) }
 }
 
 fn open(tag: &str, pages: u64) -> (tempfile::TempDir, String, Arc<Card>, Arc<Memory>) {
@@ -396,6 +392,47 @@ fn the_hooks_unmap_waits_behind_an_unrelated_map() {
     println!("the hook's make_room with an unrelated Map stuck ahead: within 2 s {within:?}; after the map ran {after:?}");
     close(&uuid, mem);
     assert!(within.is_ok(), "the hook waited behind an unrelated mechanism map");
+}
+
+/// F1 on the watermark's path: the hook streams the running set's upper pages in place, on its own thread, so it never
+/// waits behind an unrelated mechanism map either. A request runs over a set that fills the card. Another thread's
+/// bind streams one of its pages out through the mechanism, then sticks in create. The hook's make_room is still
+/// served at once, from the set's next upper page.
+#[test]
+fn the_hooks_streaming_never_waits_behind_an_unrelated_map() {
+    let (dir, uuid, card, mem) = open("streammech", 6);
+    let x = mem.load(spec(dir.path(), &uuid, "x", 6), Level::Ram).unwrap();
+    let z = mem.load(spec(dir.path(), &uuid, "z", 1), Level::Ram).unwrap();
+    let r = mem.request("r", plan(&[&["x"]])).unwrap();
+    let pass = r.pass(x, "fwd|1").unwrap();
+    warm(&mem, x, 6);
+    *card.hold_create.lock() = true;
+    // Another thread binds z: its room comes from x streaming, then its Map is queued and stuck in create.
+    let binder = std::thread::spawn({
+        let mem = mem.clone();
+        move || drop(mem.bind(z, 0, 0).map(|p| {
+            if p.fresh {
+                p.filled();
+            }
+        }))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let hook = std::thread::spawn({
+        let mem = mem.clone();
+        move || tx.send(mem.make_room(P).map(drop).map_err(|e| e.code())).unwrap()
+    });
+    let within = rx.recv_timeout(Duration::from_secs(2));
+    *card.hold_create.lock() = false;
+    card.create_gate.notify_all();
+    let after = if within.is_err() { rx.recv_timeout(Duration::from_secs(5)).ok() } else { None };
+    hook.join().unwrap();
+    binder.join().unwrap();
+    println!("the hook's streaming make_room with an unrelated Map stuck ahead: within 2 s {within:?}; after the map ran {after:?}");
+    pass.end(0);
+    drop(r);
+    close(&uuid, mem);
+    assert!(matches!(within, Ok(Ok(()))), "the hook's streaming waited behind an unrelated mechanism map, or took nothing");
 }
 
 /// F3's rule: the hook never waits on, or takes, a page being filled. With nothing else to take

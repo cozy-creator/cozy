@@ -2,12 +2,11 @@
 //! one loop, `make_room`, takes bytes in [`crate::decide::victims`]' order for the allocator
 //! hook, a bind and a range's preparation. One `parking_lot` mutex guards the table and the
 //! mechanism's state; it is never held across a fill, a remote call, a wait on an event or a
-//! caller's callback: custody and tier calls made while it is held are posted, in order, to
-//! one sender thread.
+//! caller's callback: custody calls made while it is held are posted, in order, to one sender
+//! thread.
 //!
 //! Lock order: none. The state lock is only ever taken alone; every other lock (the release
-//! receiver, the fill queue, the trim wants, a custody or tier client's stream, a held layout's
-//! pins) is taken alone or inside the state lock and never takes another, and the state lock is
+//! receiver, the fill queue, the trim wants, the custody client's stream) is taken alone or inside the state lock and never takes another, and the state lock is
 //! never taken while one of them is held. A binder waits on the state lock's condvar only. Fills run
 //! on fill threads (demand misses before prefetches); pin releases arrive through a channel;
 //! asks are answered from pages by a thread of its own that runs no caller code; an idle
@@ -36,7 +35,6 @@ use crate::custody;
 use crate::decide::{self, Victim};
 use crate::ledger::{self, Facts, Grant, PhysicalChange, Row, Shared};
 use crate::table::{Class, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
-use crate::tier;
 use crate::{Error, Exhausted, GpuId, Result};
 
 mod stream;
@@ -211,7 +209,7 @@ pub enum Origin {
     Hit,
     /// A kept page imported by fingerprint: no copy.
     Kept,
-    Tier,
+    /// The store, through the page cache.
     Store,
 }
 
@@ -239,12 +237,9 @@ pub struct Fills {
 pub struct Moved {
     /// Kept pages imported by fingerprint (no copy; `ns` is the import).
     pub kept: Fills,
-    pub tier: Fills,
     pub store: Fills,
     /// Of the above, bytes filled speculatively.
     pub speculative: u64,
-    /// Filled pages copied into the RAM tier afterwards: speculation, off every bind's path.
-    pub saved: Fills,
 }
 
 /// One step of a request.
@@ -276,18 +271,14 @@ pub struct Stats {
     pub peak: u64,
     /// The most its passes allocated beside its weights, as they reported it: its compute bytes.
     pub compute: u64,
-    /// The process's anonymous host high-water over it (the RAM tier's and file mappings
-    /// aside); `None` where it cannot be read.
+    /// The process's anonymous host high-water over it (file mappings aside); `None` where it
+    /// cannot be read.
     pub host: Option<u64>,
-    /// The RAM tier's resident host bytes when it ended (all layouts, this user's tier).
-    pub tier: u64,
     /// Bytes the request still held when it ended (pins, caches): 0.
     pub leftover: u64,
     /// Bytes due to be kept (read-only, exported to custody) and not kept yet: pages not idle
     /// (unpinned, no release pending) since their fill. Each is kept at its first idle moment.
     pub keep_pending: u64,
-    /// RAM-tier host ranges unlocked while it ran: each unlock stalls the device until idle.
-    pub unregisters: Unregisters,
     /// Each `make_room` that had to take bytes for it, in order.
     pub make_room: Vec<MakeRoom>,
 }
@@ -305,23 +296,6 @@ pub struct MakeRoom {
     pub freed: u64,
     /// Release events it waited on before taking their pages.
     pub waited: u32,
-}
-
-/// Host ranges unlocked for the RAM tier (`cuMemHostUnregister`, which synchronizes the device).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
-pub struct Unregisters {
-    pub calls: u32,
-    pub bytes: u64,
-    /// The longest one.
-    pub max_ns: u64,
-}
-
-impl Unregisters {
-    fn add(&mut self, other: &Unregisters) {
-        self.calls += other.calls;
-        self.bytes += other.bytes;
-        self.max_ns = self.max_ns.max(other.max_ns);
-    }
 }
 
 /// Public handles count explicitly; internal worker references are not public ownership.
@@ -385,7 +359,7 @@ pub struct Pin {
     pub ready: Event,
     /// Run the transform now: the page's bytes are not the weights yet (a declared or
     /// undeclared fill's store bytes); [`Pin::filled`] after it. Never for bytes that are the
-    /// weights (stored, kept, or a transformed page from the RAM tier).
+    /// weights (stored, kept, or transformed).
     pub fresh: bool,
     inner: Owner,
     key: Key,
@@ -418,9 +392,6 @@ struct SetMech {
     /// Its fingerprint's key at its current fill (derived once: a hash).
     key: String,
     va: Va,
-    /// The RAM tier's name for its pages' bytes ([`tier_name`]) and its layout there.
-    tier: String,
-    held: Option<Arc<tier::Held>>,
     closing: bool,
     /// Graph/address references, independent of physical residency.
     retained: u64,
@@ -428,15 +399,6 @@ struct SetMech {
 
 fn retained_identity(set: u32, m: &SetMech, blocks: &[u32]) -> String {
     format!("{set}:{}:{}:{}:{blocks:?}", m.va.base, m.va.len, m.key)
-}
-
-/// The RAM tier's name for the bytes a set's pages hold: the store's (stored, or transformed
-/// after each fill), or a declared transform's under its identity.
-fn tier_name(spec: &SetSpec) -> String {
-    match &spec.fingerprint.fill {
-        Fill::Declared(id) => tensorfs::sha256::hex_digest(format!("{}\0declared\0{id}", spec.layout.digest).as_bytes()),
-        Fill::Stored | Fill::Undeclared => spec.layout.digest.clone(),
-    }
 }
 
 /// The table's pin for a page whose Keep's protect runs (no caller holds it).
@@ -452,6 +414,9 @@ struct Home {
     gen: u64,
     filled: bool,
     filling: bool,
+    /// Read ready at issue (`issued`), its batch not ended yet: the fill thread still accounts
+    /// for it and its copies may still land.
+    landing: bool,
     /// A binder holds it fresh ([`Home::fresh`]) and runs the set's transform.
     transforming: bool,
     exported: bool,
@@ -466,7 +431,7 @@ struct Home {
     /// be idle.
     keeping: bool,
     /// Its Keep's protect and export run now. No work may touch a page while its access
-    /// changes (`cuMemSetAccess` under a reading kernel faults it): binds and saves wait.
+    /// changes (`cuMemSetAccess` under a reading kernel faults it): binds wait.
     protecting: bool,
     /// The allocator hook unmaps it in place now, on its own thread (never queued behind the
     /// mechanism's other work): nobody else touches it meanwhile.
@@ -562,12 +527,13 @@ const COPY: usize = usize::MAX;
 /// One page of a fill batch: where it goes, and how its copy ended.
 struct Copying {
     key: Key,
+    gen: u64,
     dst: Dst,
     out: Option<Result<Origin>>,
 }
 
 /// The fill threads' work: jobs queued, batches running, the bytes filled since they were last
-/// all idle, and whether the Memory is gone. Its lock is a leaf; its condvar wakes the tier
+/// all idle, and whether the Memory is gone. Its lock is a leaf; its condvar wakes the
 /// copies when the fills are idle.
 #[derive(Default)]
 struct Burst {
@@ -583,16 +549,6 @@ impl Burst {
     }
 }
 
-/// A filled page to copy into the RAM tier layout `tier` (`gen`: as it was filled) for request
-/// `req`.
-#[derive(Clone)]
-struct Save {
-    key: Key,
-    gen: u64,
-    tier: String,
-    req: Option<u64>,
-}
-
 struct Release {
     key: Key,
     pin: u64,
@@ -603,15 +559,11 @@ struct Release {
     untransformed: bool,
 }
 
-/// A custody or tier call made under the lock, sent in order once it is released.
+/// A custody call made under the lock, sent in order once it is released.
 enum Call {
     Export { fp: String, page: u32, len: u64, handle: Owned },
     Withdraw { fp: String, page: u32 },
     Disown { fp: String, page: u32 },
-    Use { digest: String, distance: Option<u32> },
-    /// A layout this process holds, handed to a tier that may not know it (a restarted one).
-    Readopt { digest: String, regions: Vec<(u64, u64)>, ask: String, file: Owned },
-    Close { digest: String },
 }
 
 /// What the trim thread runs after an answer: custody settled for the kept pages it withdrew,
@@ -674,21 +626,29 @@ struct State {
     synthetic: HashSet<u64>,
     /// The custody connection the kept pages were exported over.
     holder: u64,
-    /// The tier connection this process's layouts were opened or handed over on.
-    tier_holder: u64,
     /// Pages whose Keep is due ([`Home::keeping`]), and sets with a Keep queued.
     keep_due: BTreeSet<Key>,
     keep_queued: BTreeSet<u32>,
-    /// Layouts of closed sets (or of a fill identity left behind), still held and page-locked
-    /// by digest: unlocking stalls the device, so it waits for the tier to take one back (or
-    /// the process to end), and a set opening it again reuses it.
-    parked: HashMap<String, Arc<tier::Held>>,
-    /// Tier copies the host had no room for: one is posted again when a measured pass ends,
-    /// and the rest once it finds room (first runs and standalone calls reach the tier so).
-    deferred_saves: Vec<Save>,
 }
 
+/// A page the allocator hook takes in place, unmapped and destroyed on its own thread: (page, its generation, class,
+/// place, backing, ready event).
+type Taking = (Key, u64, Class, (Va, u64, u64), Physical, Event);
+
 impl State {
+    /// Marks `key` the hook's to take in place (nobody else touches it meanwhile) and takes its backing out of its
+    /// home; `None` when it is not the hook's to take (kept, being kept, protected, already taken, or unbacked).
+    fn take_in_place(&mut self, key: Key) -> Result<Option<Taking>> {
+        let (place, class) = (self.place(key)?, self.table.class(key).unwrap_or(Class::N));
+        // Never a page whose copies may still be landing (read ready at issue).
+        let Some(h) = self.homes.get_mut(&key).filter(|h| !h.keeping && !h.keep_after && !h.protecting && !h.reclaiming && !h.exported && !h.landing) else { return Ok(None) };
+        let Some(phys) = h.phys.take() else { return Ok(None) };
+        h.reclaiming = true;
+        let taking = (key, h.gen, class, place, phys, h.ready);
+        self.sync(key);
+        Ok(Some(taking))
+    }
+
     /// No work can touch the page: unpinned, no release event pending, not filling or being
     /// transformed.
     fn idle(&self, key: Key) -> bool {
@@ -816,15 +776,12 @@ struct Inner {
     shared: Arc<Shared>,
     row: Arc<Row>,
     custody: Option<Arc<custody::Client>>,
-    tier: Option<Arc<tier::Client>>,
     state: Mutex<State>,
     /// Every change a state waiter may test, from any thread (the allocator callback and a pin's
     /// drop hold no state lock): an epoch the waiter read before its last check.
     landed: Wakes,
-    /// Custody's calls and the tier's, each in the order they were made, for one sender thread
-    /// per service.
+    /// Custody's calls, in the order they were made, for one sender thread.
     to_custody: Arc<Outbox<Call>>,
-    to_tier: Arc<Outbox<Call>>,
     /// The device's mechanism calls, for its one thread; their bytes are the unmaps in flight.
     mech: Arc<Outbox<Mech>>,
     release_tx: Sender<Release>,
@@ -836,8 +793,6 @@ struct Inner {
     /// ahead): it hands them over together once its queue is empty or they make a batch.
     grouped: Mutex<(Vec<Job>, Vec<Job>)>,
     burst: Arc<(Mutex<Burst>, Condvar)>,
-    /// Filled pages to copy into the RAM tier, for its one thread.
-    saves: Arc<Outbox<Save>>,
     wanted: Arc<(Mutex<Wanted>, Condvar)>,
     stop: Arc<AtomicBool>,
     quiet: Arc<Quiet>,
@@ -879,17 +834,10 @@ impl Memory {
             let row = Arc::new(shared.claim_with(std::process::id(), grant.row)?);
             let listener = row.listen()?;
             let custody = custody::Client::open(&shared).map_err(|e| tracing::warn!("varena: no custody: {e}")).ok().map(Arc::new);
-            // Serving the tier here, it keeps this GPU's running requests' host growth free.
-            let need: tier::Need = Arc::new({
-                let shared = shared.clone();
-                move || ledger::host_calls(&shared)
-            });
-            let tier = tier::Client::open(shared.ns, need).map_err(|e| tracing::warn!("varena: no RAM tier: {e}")).ok().map(Arc::new);
-            let (to_custody, to_tier, mech) = (Arc::new(Outbox::default()), Arc::new(Outbox::default()), Arc::new(Outbox::default()));
+            let (to_custody, mech) = (Arc::new(Outbox::default()), Arc::new(Outbox::default()));
             let (release_tx, releases) = unbounded();
             let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
             let holder = custody.as_ref().map_or(0, |c| c.holder());
-            let tier_holder = tier.as_ref().map_or(0, |t| t.holder());
             let context = backend.process_used().unwrap_or_else(|_| backend.opened_context());
             let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, ..Table::default() };
             let inner = Arc::new(Inner {
@@ -898,18 +846,15 @@ impl Memory {
                 row: row.clone(),
                 _device: device,
                 custody,
-                tier,
-                state: Mutex::new(State { table, holder, tier_holder, ..State::default() }),
+                state: Mutex::new(State { table, holder, ..State::default() }),
                 landed: Wakes::default(),
                 to_custody,
-                to_tier,
                 mech,
                 release_tx,
                 releases,
                 jobs: Jobs { demand, ahead },
                 grouped: Mutex::default(),
                 burst: Arc::new((Mutex::new(Burst::default()), Condvar::new())),
-                saves: Arc::new(Outbox::default()),
                 wanted: Arc::new((Mutex::new(Wanted::default()), Condvar::new())),
                 stop: Arc::new(AtomicBool::new(false)),
                 quiet: Arc::default(),
@@ -923,10 +868,8 @@ impl Memory {
             });
             let (weak, queue) = (Arc::downgrade(&inner), inner.mech.clone());
             std::thread::Builder::new().name("varena-mechanism".into()).spawn(move || mech_loop(&queue, &weak)).map_err(|e| Error::io("spawn mechanism", e))?;
-            for (name, outbox) in [("varena-custody-calls", inner.to_custody.clone()), ("varena-tier-calls", inner.to_tier.clone())] {
-                let (weak, c, t) = (Arc::downgrade(&inner), inner.custody.clone(), inner.tier.clone());
-                std::thread::Builder::new().name(name.into()).spawn(move || send_loop(&outbox, c.as_deref(), t.as_deref(), &weak)).map_err(|e| Error::io("spawn calls", e))?;
-            }
+            let (weak, outbox, c) = (Arc::downgrade(&inner), inner.to_custody.clone(), inner.custody.clone());
+            std::thread::Builder::new().name("varena-custody-calls".into()).spawn(move || send_loop(&outbox, c.as_deref(), &weak)).map_err(|e| Error::io("spawn calls", e))?;
             // One fill thread per copy stream TensorFS runs per device: a fill waits on its
             // streams, so this many keep them busy.
             for _ in 0..tensorfs::io::ReadOpts::default().streams.max(1) {
@@ -938,8 +881,6 @@ impl Memory {
             std::thread::Builder::new().name("varena-ask".into()).spawn(move || ask_loop(listener, &row, &weak, &stop)).map_err(|e| Error::io("spawn ask", e))?;
             let (weak, wanted) = (Arc::downgrade(&inner), inner.wanted.clone());
             std::thread::Builder::new().name("varena-trim".into()).spawn(move || trim_loop(&wanted, &weak)).map_err(|e| Error::io("spawn trim", e))?;
-            let (weak, saves, burst) = (Arc::downgrade(&inner), inner.saves.clone(), inner.burst.clone());
-            std::thread::Builder::new().name("varena-tier-copies".into()).spawn(move || save_loop(&saves, &burst, &weak)).map_err(|e| Error::io("spawn tier copies", e))?;
             let mut st = inner.lock();
             inner.publish(&mut st);
             inner.unlock(st);
@@ -949,7 +890,7 @@ impl Memory {
 
     /// Registers a set and brings it to `level`; a set loaded again is re-levelled in place. On
     /// every start, first or restart, its pages kept under its fingerprint are imported, and
-    /// the rest fill from the RAM tier, else the store.
+    /// the rest fill from the store, through the page cache.
     pub fn load(&self, set: SetSpec, level: Level) -> Result<SetId> {
         self.inner.guard(|| self.inner.load(set, level))
     }
@@ -1053,14 +994,13 @@ impl Memory {
 
     /// Sets the set's current fill identity (a no-op when unchanged). Pages filled under another
     /// one are unmapped (a pinned one when it is released), so each next bind fills again, from
-    /// kept pages of the new identity, the tier or the store, and comes back `fresh`.
+    /// kept pages of the new identity or the store, and comes back `fresh`.
     pub fn fill(&self, set: SetId, fill: Fill) {
         let _ = self.inner.guard(|| {
             let mut st = self.inner.lock();
             let r = self.inner.refill(&mut st, set.0, fill);
             self.inner.unlock(st);
-            r?;
-            self.inner.open_tier(set.0)
+            r
         });
     }
 
@@ -1152,15 +1092,13 @@ impl Memory {
     }
 
     /// Blocks until every Keep due so far is made (waiting for its page's pending events), and
-    /// every mechanism call and every custody and tier call decided so far has been made: then
-    /// the kept pages are custody's (a planned handover), and a dropped Memory's row is gone when
-    /// the drop returns.
+    /// every mechanism call and every custody call decided so far has been made: then the kept
+    /// pages are custody's (a planned handover), and a dropped Memory's row is gone when the drop
+    /// returns.
     pub fn settle(&self) {
-        self.inner.saves.quiesce();
         self.inner.hand_over();
         self.inner.mech.settle();
         self.inner.to_custody.settle();
-        self.inner.to_tier.settle();
     }
 
     /// The record of the request that ended last.
@@ -1214,12 +1152,9 @@ impl Inner {
         drop(st);
     }
 
-    /// A custody or tier call, sent after everything posted to its service before it.
+    /// A custody call, sent after everything posted before it.
     fn post(&self, call: Call) {
-        match call {
-            Call::Export { .. } | Call::Withdraw { .. } | Call::Disown { .. } => self.to_custody.post(call, 0),
-            Call::Use { .. } | Call::Readopt { .. } | Call::Close { .. } => self.to_tier.post(call, 0),
-        };
+        self.to_custody.post(call, 0);
     }
 
     /// Withdraws kept page `page` of `fp`: an Export not yet sent is cancelled (nothing was
@@ -1403,21 +1338,6 @@ impl Inner {
             }).collect();
             kept.into_iter().for_each(|k| self.keep(st, k));
         }
-        if let Some(h) = self.tier.as_ref().map(|t| t.holder()).filter(|h| *h != st.tier_holder) {
-            // A new tier (its server restarted) knows none of the layouts this process holds:
-            // they go to it with their files, ready regions and all.
-            st.tier_holder = h;
-            let ask = self.row.ask_name();
-            let held: Vec<Call> = st
-                .sets
-                .iter()
-                .flatten()
-                .filter_map(|m| m.held.as_ref().map(|h| (&m.tier, h)))
-                .chain(st.parked.iter())
-                .filter_map(|(digest, h)| h.handover().ok().map(|(file, regions)| Call::Readopt { digest: digest.clone(), regions, ask: ask.clone(), file }))
-                .collect();
-            held.into_iter().for_each(|c| self.post(c));
-        }
         self.drop_stale(st);
         self.close_sets(st);
         if wake {
@@ -1448,31 +1368,13 @@ impl Inner {
         }
         m.spec.fingerprint.fill = fill;
         m.key = m.spec.fingerprint.key();
-        // The tier holds bytes by identity: another identity's layout is another layout.
-        let tier = tier_name(&m.spec);
         let declared = m.spec.fingerprint.declared();
-        if tier != m.tier {
-            let (old, held) = (std::mem::replace(&mut m.tier, tier), m.held.take());
-            self.park(st, old, held);
-        }
         if let Some(Some(s)) = st.table.sets.get_mut(set as usize) {
             s.declared = declared;
         }
         self.drop_stale(st);
         self.publish(st);
         Ok(())
-    }
-
-    /// A layout this process stops using: still held (and page-locked) with no declared use,
-    /// for the tier to take back when it needs the room; one never mapped is closed.
-    fn park(&self, st: &mut State, digest: String, held: Option<Arc<tier::Held>>) {
-        match held {
-            Some(held) => {
-                self.post(Call::Use { digest: digest.clone(), distance: None });
-                st.parked.insert(digest, held);
-            }
-            None => self.post(Call::Close { digest }),
-        }
     }
 
     /// Unmaps the unpinned pages of closing sets; a set goes once it has none. Its slot stays
@@ -1492,7 +1394,6 @@ impl Inner {
             }
             if let Some(m) = st.sets.get_mut(set as usize).and_then(Option::take) {
                 self.mech.post(Mech::Release(m.va), 0);
-                self.park(st, m.tier, m.held);
             }
             if let Some(slot) = st.table.sets.get_mut(set as usize) {
                 *slot = None;
@@ -1669,7 +1570,7 @@ impl Inner {
             let gen = st.tick();
             // Pinned (filling) until the mechanism maps it.
             self.mech.post(Mech::Adopt { key, gen, va, off, phys: phys.id, len: phys.len, identity: identity.clone() }, 0);
-            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false });
+            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false, landing: false });
             st.sync(key);
             let s = st.fills(req, key, span, Origin::Kept);
             s.moved.kept.bytes += span;
@@ -1694,7 +1595,7 @@ impl Inner {
         let decided = st.table.free();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false });
+        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false, landing: false });
         st.sync(key);
         self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, speculative, decided }, 0);
         Ok(true)
@@ -1716,7 +1617,7 @@ impl Inner {
         // Kept, or with a Keep queued: never written again; a fresh page takes its place.
         let phys = if exported || h.keeping { h.phys.take() } else { None };
         let renew = phys.is_some();
-        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false };
+        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false, landing: false };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
         let job = Job { key, gen, req, span, after: vec![] };
@@ -1784,8 +1685,8 @@ impl Inner {
         }
     }
 
-    /// A fill thread's batch: each page from the tier, else the store, in as few engine reads as
-    /// its sets allow; then each page's ready event.
+    /// A fill thread's batch: each page from the store through the page cache, in as few engine
+    /// reads as its sets allow; then each page's ready event.
     fn fill(self: &Arc<Self>, jobs: &[Job]) {
         self.fill_batch(jobs);
         // Their fills' events follow them in-stream (or were dropped): nobody needs them now.
@@ -1793,15 +1694,15 @@ impl Inner {
     }
 
     fn fill_batch(self: &Arc<Self>, jobs: &[Job]) {
-        // Under one lock: each live job's place, and its set's spec and tier layout.
+        // Under one lock: each live job's place, and its set's spec.
         let (sets, pages) = {
             let st = self.state.lock();
-            let mut sets: BTreeMap<u32, (SetSpec, Option<Arc<tier::Held>>)> = BTreeMap::new();
+            let mut sets: BTreeMap<u32, SetSpec> = BTreeMap::new();
             let mut pages = vec![];
             for job in jobs {
                 let (Some(h), Ok(m), Ok(place)) = (st.homes.get(&job.key), st.mech(job.key.0), st.place(job.key)) else { continue };
                 if h.gen == job.gen {
-                    sets.entry(job.key.0).or_insert_with(|| (m.spec.clone(), m.held.clone()));
+                    sets.entry(job.key.0).or_insert_with(|| m.spec.clone());
                     pages.push((job, place));
                 }
             }
@@ -1834,23 +1735,32 @@ impl Inner {
                 }
                 continue;
             }
+            // Read ready at issue (`issued`): its own copies all went out, whatever the batch's end.
+            let early = st.homes.get_mut(&job.key).is_some_and(|h| std::mem::take(&mut h.landing));
+            let landed = match (early, landed) {
+                (true, Ok((_, ready))) => {
+                    self.backend.retire(ready);
+                    Ok((Origin::Store, None))
+                }
+                (true, Err(e)) => {
+                    sticky |= e.is_sticky();
+                    Ok((Origin::Store, None))
+                }
+                (false, landed) => landed.map(|(origin, ready)| (origin, Some(ready))),
+            };
             match landed {
                 Ok((origin, ready)) => {
-                    // Stored bytes are the weights; a declared set's tier holds its transformed
-                    // bytes.
-                    let fill = sets.get(&job.key.0).map(|(spec, _)| &spec.fingerprint.fill);
-                    let filled = matches!(fill, Some(Fill::Stored)) || (origin == Origin::Tier && matches!(fill, Some(Fill::Declared(_))));
+                    // Stored bytes are the weights; a declared set's are once transformed.
+                    let filled = sets.get(&job.key.0).is_some_and(|spec| matches!(spec.fingerprint.fill, Fill::Stored));
                     let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
-                    if let Some(h) = st.homes.get_mut(&job.key) {
-                        h.ready = ready;
-                        h.ready_on = COPY;
-                        h.filling = false;
-                        h.filled = filled;
-                        h.origin = origin;
+                    // A page read ready at issue is its binders' since: a transform may have
+                    // filled it already, so only its accounting is left.
+                    if let (Some(ready), Some(h)) = (ready, st.homes.get_mut(&job.key)) {
+                        (h.ready, h.ready_on, h.filling, h.filled, h.origin) = (ready, COPY, false, filled, origin);
+                        st.sync(job.key);
                     }
-                    st.sync(job.key);
                     let s = st.fills(job.req, job.key, span, origin);
-                    let f = if origin == Origin::Tier { &mut s.moved.tier } else { &mut s.moved.store };
+                    let f = &mut s.moved.store;
                     f.bytes += span;
                     // The batch's time, shared by its bytes.
                     f.ns += (u128::from(ns) * u128::from(span) / u128::from(bytes)) as u64;
@@ -1859,9 +1769,6 @@ impl Inner {
                     }
                     if filled {
                         self.keep(&mut st, job.key);
-                    }
-                    if filled && origin == Origin::Store {
-                        self.save_later(&st, job.key, job.req);
                     }
                 }
                 Err(e) => {
@@ -1895,11 +1802,9 @@ impl Inner {
         }
     }
 
-    /// The batch's copies: from the tier where ready, else straight from the store (the tier
-    /// gets its copy from the filled page afterwards); one engine read for each per set. Each
-    /// page's origin, or its error.
-    #[allow(clippy::type_complexity)]
-    fn copy(&self, sets: &BTreeMap<u32, (SetSpec, Option<Arc<tier::Held>>)>, pages: &[(&Job, (Va, u64, u64))]) -> Vec<Result<Origin>> {
+    /// The batch's copies from the store, through the page cache: one engine read per set.
+    /// Each page's origin, or its error.
+    fn copy(&self, sets: &BTreeMap<u32, SetSpec>, pages: &[(&Job, (Va, u64, u64))]) -> Vec<Result<Origin>> {
         #[cfg(feature = "faults")]
         crate::faults::hit(crate::faults::Point::Fill);
         let mut copies: Vec<Copying> = pages
@@ -1913,36 +1818,19 @@ impl Inner {
                     Dst::Host { .. } => 0,
                 };
                 let out = job.after.iter().try_for_each(|e| self.backend.wait(*e, stream)).err().map(Err);
-                Copying { key: job.key, dst, out }
+                Copying { key: job.key, gen: job.gen, dst, out }
             })
             .collect();
-        let unregister = |p| self.backend.unregister_host(p);
-        for (set, (spec, held)) in sets {
+        for (set, spec) in sets {
             let todo = |c: &Copying| c.key.0 == *set && c.out.is_none();
-            if let Some(held) = held {
-                // A copy from the tier, each region settled after (unlocked if the tier asked
-                // for it).
-                let read = |copies: &mut [Copying]| {
-                    for c in copies.iter_mut().filter(|c| todo(c)) {
-                        if let Err(e) = held.pin(c.key.1, |p, l| self.backend.register_host(p, l), unregister) {
-                            c.out = Some(Err(e));
-                        }
-                    }
-                    let mut from: Vec<&mut Copying> = copies.iter_mut().filter(|c| todo(c)).collect();
-                    let copied = held.read(&from.iter().map(|c| (c.key.1, c.dst)).collect::<Vec<_>>(), || self.backend.drain());
-                    if !matches!(&copied, Err(Error::Ownership(_))) {
-                        from.iter().for_each(|c| held.settle(c.key.1, unregister));
-                    }
-                    match copied {
-                        Ok(copied) => from.iter_mut().zip(copied).filter(|(_, ok)| *ok).for_each(|(c, _)| c.out = Some(Ok(Origin::Tier))),
-                        Err(e) => from.iter_mut().for_each(|c| c.out = Some(Err(e.clone()))),
-                    }
-                };
-                read(&mut copies);
-            }
             let direct: Vec<(u32, Dst)> = copies.iter().filter(|c| todo(c)).map(|c| (c.key.1, c.dst)).collect();
             if !direct.is_empty() {
-                let stored = self.store(spec, &direct).map(|()| Origin::Store);
+                let owners: Vec<(Key, u64, usize)> = copies.iter().filter(|c| todo(c)).map(|c| {
+                    (c.key, c.gen, match c.dst { Dst::Device { stream, .. } => stream, Dst::Host { .. } => 0 })
+                }).collect();
+                let filled = matches!(spec.fingerprint.fill, Fill::Stored);
+                let issued = |i: usize, streams: &[usize]| owners.get(i).into_iter().for_each(|o| self.issued(*o, streams, filled));
+                let stored = self.store(spec, &direct, Some(&issued)).map(|()| Origin::Store);
                 copies.iter_mut().filter(|c| todo(c)).for_each(|c| c.out = Some(stored.clone()));
             }
         }
@@ -1960,7 +1848,11 @@ impl Inner {
             Error::Ownership(format!("fill panicked ({e}); its copies did not drain"))
         };
         for job in jobs {
-            if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen) {
+            // A page read ready at issue had all its copies go out: its binders keep it.
+            if let Some(h) = st.homes.get_mut(&job.key).filter(|h| h.gen == job.gen) {
+                h.landing = false;
+            }
+            if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen && h.filling) {
                 if drained {
                     if let Some(h) = st.homes.get_mut(&job.key) {
                         h.filling = false;
@@ -2039,149 +1931,54 @@ impl Inner {
         }
     }
 
-    /// Waits until no page is decided to fill (one being mapped or queued counts); false once
-    /// the Memory is going.
-    fn after_fills(&self) -> bool {
-        let mut st = self.lock();
-        while !self.burst.0.lock().closed && st.homes.values().any(|h| h.filling) {
-            if self.wait(&mut st).is_err() { return false; }
-        }
-        !self.burst.0.lock().closed
-    }
-
-    /// Queues a copy of a page just filled with its tier's bytes into the RAM tier, unless it
-    /// has no tier layout or the tier holds it.
-    fn save_later(&self, st: &State, key: Key, req: Option<u64>) {
-        let Ok(m) = st.mech(key.0) else { return };
-        // Bytes of the set's current identity only: its layout is that identity's.
-        let current = |h: &&Home| h.identity == m.key;
-        let Some(gen) = st.homes.get(&key).filter(current).map(|h| h.gen).filter(|_| m.held.as_ref().is_some_and(|h| !h.holds(key.1))) else { return };
-        self.saves.post(Save { key, gen, tier: m.tier.clone(), req }, 0);
-    }
-
-    /// Copies a filled page into the RAM tier when the host has the room: speculation, so it
-    /// soft-fails. The page is pinned meanwhile (a consumer: never unmapped under the copy); one
-    /// unmapped or changed since it was queued is not copied.
-    fn save(self: &Arc<Self>, s: &Save) {
-        if self.check_ownership().is_err() { return; }
-        // The host room first, nothing pinned or counted meanwhile: a tier that answers late
-        // (or never) stalls only this speculative copy, never a demand's settle or an ask's
-        // answer (review 5, F7). No room now: it waits for a measured pass to end.
-        let Ok((.., span)) = self.state.lock().place(s.key) else { return };
-        let Some(permit) = self.tier.as_ref().and_then(|t| t.reserve(&s.tier, span)) else {
-            let mut st = self.state.lock();
-            if !st.deferred_saves.iter().any(|d| d.key == s.key && d.gen == s.gen) {
-                st.deferred_saves.push(s.clone());
-            }
-            return;
-        };
-        // The host has room again: the copies deferred meanwhile go too.
-        for save in std::mem::take(&mut self.state.lock().deferred_saves) {
-            self.saves.post(save, 0);
-        }
-        let (pin, held, (va, off, span), ready) = {
-            let mut st = self.lock();
-            // A copy out reads the page: never while its Keep's protect runs.
-            while st.homes.get(&s.key).is_some_and(|h| h.gen == s.gen && h.protecting) {
-                if self.wait(&mut st).is_err() {
-                    return;
-                }
-            }
-            let home = st.homes.get(&s.key).filter(|h| h.gen == s.gen && h.filled && !h.filling && !h.transforming).map(|h| h.ready);
-            // Only into the layout of the identity it was filled under.
-            let held = st.mech(s.key.0).ok().filter(|m| m.tier == s.tier).and_then(|m| m.held.clone()).filter(|h| !h.holds(s.key.1));
-            let (Some(ready), Some(held), Ok(place)) = (home, held, st.place(s.key)) else { return };
-            let pin = st.tick();
-            st.pins.insert(pin, (s.key, None, std::thread::current().id()));
-            st.table.transient += place.2;
-            st.sync(s.key);
-            self.unlock(st);
-            (pin, held, place, ready)
-        };
-        let start = Instant::now();
-        let result = held
-                .fill(&[s.key.1], |regions| {
-                    regions.iter().try_for_each(|(_, dst)| match dst {
-                        // SAFETY: the region is mapped writable and write-locked for this fill.
-                        Dst::Host { ptr, len } => {
-                            let out = self.backend.save(
-                                va,
-                                off,
-                                unsafe {
-                                    std::slice::from_raw_parts_mut(*ptr, (*len).min(span as usize))
-                                },
-                                ready,
-                            );
-                            if let Err(e) = &out {
-                                if let Err(drain) = self.backend.drain_save() {
-                                    return Err(Error::Ownership(format!(
-                                        "RAM save failed ({e}); its stream did not drain ({drain})"
-                                    )));
-                                }
-                            }
-                            out
-                        }
-                        Dst::Device { .. } => {
-                            Err(Error::Internal("a tier region is host memory".into()))
-                        }
-                    })
-                })
-                .map(|()| true);
-        if let Some(e) = result.as_ref().err().filter(|e| !matches!(e, Error::Closed(_))) {
-            tracing::warn!("varena: copying {:?} into the RAM tier failed: {e}", s.key);
-            if e.is_sticky() {
-                // Publish failure while holding the same lock as condvar waiters, so none
-                // misses the wake and waits forever on this deliberately preserved pin.
-                let st = self.state.lock();
-                self.ownership_lost.store(true, Ordering::Release);
-                drop(st);
-                self.landed.notify_all();
-            }
-            if matches!(e, Error::Ownership(_)) {
-                // Held.fill preserves its destination maps and locks. Preserve the source
-                // pin, reservation and host promise until this failed executor exits too.
-                std::mem::forget((permit, held, self.clone()));
-                return;
-            }
-        }
-        let saved = result.unwrap_or(false);
-        drop(permit);
-        let ns = start.elapsed().as_nanos() as u64;
-        let mut st = self.lock();
-        st.pins.remove(&pin);
-        st.table.transient = st.table.transient.saturating_sub(span);
-        st.sync(s.key);
-        self.keeps(&mut st);
-        // Its class while pinned may have been published meanwhile: no longer.
-        self.publish(&mut st);
-        if saved {
-            let stats = match s.req.filter(|r| st.stats.contains_key(r)) {
-                Some(r) => st.stats.entry(r).or_default(),
-                None => &mut st.unclaimed,
-            };
-            stats.moved.saved.bytes += span;
-            stats.moved.saved.ns += ns;
-        }
-        self.unlock(st);
-        self.landed.notify_all();
-    }
-
     /// The set's regions from its store into their destinations, in one engine read, in
-    /// region order: neighbours in the file and the reservation read as one run.
+    /// region order: neighbours in the file and the reservation read as one run. `issued`
+    /// hears of each device region (its index in `regions`) once its copies are all issued.
     #[cfg(unix)]
-    fn store(&self, spec: &SetSpec, regions: &[(u32, Dst)]) -> Result<()> {
-        let mut regions = regions.to_vec();
-        regions.sort_unstable_by_key(|(r, _)| *r);
-        let placements = regions.iter().map(|(r, dst)| spec.layout.region(*r).map(|region| Placement { items: &region.items, origin: region.offset, dst: *dst })).collect::<Result<Vec<_>>>()?;
+    fn store(&self, spec: &SetSpec, regions: &[(u32, Dst)], issued: Option<tensorfs::io::Issued>) -> Result<()> {
+        let mut order: Vec<(usize, &(u32, Dst))> = regions.iter().enumerate().collect();
+        order.sort_unstable_by_key(|(_, (r, _))| *r);
+        let placements = order.iter().map(|(_, (r, dst))| spec.layout.region(*r).map(|region| Placement { items: &region.items, origin: region.offset, dst: *dst })).collect::<Result<Vec<_>>>()?;
         let threads = tensorfs::io::ReadOpts::default().threads;
-        // SAFETY: each `dst` is a mapped page (or a locked tier region) only this fill writes.
-        unsafe { spec.source.read_placements(&placements, threads, tensorfs::io::source::Mode::Cache, &self.tally) }?;
+        let placed = |p: usize, streams: &[usize]| {
+            if let (Some(issued), Some((i, _))) = (issued, order.get(p)) {
+                issued(*i, streams);
+            }
+        };
+        // SAFETY: each `dst` is a mapped page only this fill writes.
+        unsafe { spec.source.read_placements(&placements, threads, tensorfs::io::source::Mode::Buffered, &self.tally, issued.map(|_| &placed as tensorfs::io::Issued)) }?;
         Ok(())
     }
 
     #[cfg(windows)]
-    fn store(&self, spec: &SetSpec, _: &[(u32, Dst)]) -> Result<()> {
+    fn store(&self, spec: &SetSpec, _: &[(u32, Dst)], _: Option<tensorfs::io::Issued>) -> Result<()> {
         match *spec.source {}
+    }
+
+    /// A store fill's copies of page `key` are all issued: it reads ready now, its event after
+    /// them on the copy stream, so its binders wait in-stream instead of for the whole batch.
+    fn issued(&self, (key, gen, copy): (Key, u64, usize), streams: &[usize], filled: bool) {
+        let ready = streams.iter().try_for_each(|&s| {
+            let e = self.backend.record(s)?;
+            let waited = self.backend.wait(e, copy);
+            self.backend.retire(e);
+            waited
+        });
+        // A failed record leaves the page to the batch's end.
+        let Ok(ready) = ready.and_then(|()| self.backend.fence()) else { return };
+        let mut st = self.state.lock();
+        match st.homes.get_mut(&key) {
+            Some(h) if h.gen == gen && h.filling => {
+                (h.ready, h.ready_on, h.filling, h.landing, h.filled, h.origin) = (ready, COPY, false, true, filled, Origin::Store);
+            }
+            _ => {
+                self.unlock(st);
+                return self.backend.retire(ready);
+            }
+        }
+        st.sync(key);
+        self.unlock(st);
+        self.landed.notify_all();
     }
 
     // ---- demands
@@ -2191,7 +1988,7 @@ impl Inner {
     /// the shortfall: idle pages unmapped (kept ones withdrawn, custody settled after), caches
     /// shrunk (outside the lock), pages whose last consumers still run taken once their release
     /// events complete (waited on here). It fails `Exhausted` only when a round takes nothing
-    /// and nothing of its own is about to come back (a fill, a tier copy, a Keep's protect:
+    /// and nothing of its own is about to come back (a fill or a Keep's protect:
     /// waited for). `why` and `req` name it in the request's record. For the allocator `hook`,
     /// local work only (no orphans, caches or kept pages: custody calls and Python), and the
     /// room it made is claimed for the hook's segment before the lock goes.
@@ -2229,7 +2026,7 @@ impl Inner {
             }
             // Beyond what it could ever have (the budget with orphans released, less its context,
             // the hook's segments but its caches', its pinned pages): Exhausted at once.
-            // (A page pinned by varena's own short work, a tier copy or a Keep's protect, comes back.)
+            // (A page pinned by varena's own short work, a Keep's protect, comes back.)
             let pinned: u64 = st.table.pages().filter(|(k, p)| p.mapped && (!p.pins.is_empty() || p.filling) && !keep.contains(k)).map(|(_, p)| p.bytes).sum();
             let caches: u64 = st.table.caches.iter().filter(|c| !c.held()).map(|c| c.bytes).sum();
             let fixed = st.table.context + st.table.segments.saturating_sub(caches) + pinned.saturating_sub(st.table.transient);
@@ -2251,9 +2048,6 @@ impl Inner {
             }
             let mut want = bytes - free;
             let (mut unmapped, mut withdrawn, mut events, mut shrinks) = (0, false, vec![], vec![]);
-            // The hook's pages, taken in place below: (page, its generation, class, place,
-            // backing, ready event).
-            type Taking = (Key, u64, Class, (Va, u64, u64), Physical, Event);
             let mut taking: Vec<Taking> = vec![];
             let mut streamed = HashSet::new();
             for v in decide::victims(&st.table, keep) {
@@ -2266,7 +2060,10 @@ impl Inner {
                     if st.table.distance(*key).is_some_and(|d| d.0 == 0) {
                         if streamed.insert(key.0) {
                             let taken = self.stream(&mut st, key.0, want, req, hook)?;
-                            (unmapped, want) = (unmapped + taken.unmapped, want.saturating_sub(taken.unmapped + taken.pending));
+                            for k in taken.takes {
+                                taking.extend(st.take_in_place(k)?);
+                            }
+                            (unmapped, want) = (unmapped + taken.unmapped, want.saturating_sub(taken.unmapped + taken.taking + taken.pending));
                             events.extend(taken.events);
                         }
                         continue;
@@ -2277,12 +2074,8 @@ impl Inner {
                     Victim::Page { key, .. } if hook && kept(key) => {}
                     Victim::Cache { .. } if hook => {}
                     Victim::Page { key, bytes: b, releasing: false } if hook => {
-                        let (place, class) = (st.place(key)?, st.table.class(key).unwrap_or(Class::N));
-                        let Some(h) = st.homes.get_mut(&key).filter(|h| !h.keeping && !h.keep_after && !h.protecting && !h.reclaiming && !h.exported) else { continue };
-                        let Some(phys) = h.phys.take() else { continue };
-                        h.reclaiming = true;
-                        taking.push((key, h.gen, class, place, phys, h.ready));
-                        st.sync(key);
+                        let Some(t) = st.take_in_place(key)? else { continue };
+                        taking.push(t);
                         want = want.saturating_sub(b);
                     }
                     Victim::Page { key, bytes: b, releasing: false } => {
@@ -2308,7 +2101,7 @@ impl Inner {
             // to be evictable again: varena's own short work, and (not for the hook, which never
             // takes a page being filled) a fill.
             let returning = st.table.returning > 0 || (!hook && st.table.pending > 0);
-            let coming = st.table.transient > 0 || st.homes.iter().any(|(k, h)| (h.protecting || (!hook && h.filling)) && !keep.contains(k));
+            let coming = st.table.transient > 0 || st.homes.iter().any(|(k, h)| (h.protecting || (!hook && (h.filling || h.landing))) && !keep.contains(k));
             let last = st.last_unmap;
             self.publish(&mut st);
             drop(admission);
@@ -2457,7 +2250,7 @@ impl Inner {
                     let pages = layout.regions.iter().map(|r| Page { bytes: r.span, ..Page::default() }).collect();
                     let set = Set { name: spec.name.clone(), pages, declared: spec.fingerprint.declared() };
                     let i = st.sets.len() as u32;
-                    st.sets.push(Some(SetMech { tier: tier_name(&spec), key: spec.fingerprint.key(), spec, va, held: None, closing: false, retained: 0 }));
+                    st.sets.push(Some(SetMech { key: spec.fingerprint.key(), spec, va, closing: false, retained: 0 }));
                     st.table.sets.push(Some(set));
                     (i, false)
                 }
@@ -2465,7 +2258,6 @@ impl Inner {
             self.unlock(st);
             out
         };
-        self.open_tier(id)?;
         // One load path: whatever custody keeps for this fingerprint comes first, at any level.
         let keys: Vec<Key> = {
             let st = self.lock();
@@ -2486,7 +2278,7 @@ impl Inner {
                     self.publish(&mut st);
                     self.unlock(st);
                 }
-                self.load_ram(id)?
+                self.readahead(id)?
             }
             Level::Gpu => {
                 // Into free bytes only, in block order: a GPU-level load evicts nothing.
@@ -2507,7 +2299,8 @@ impl Inner {
                     self.unlock(st);
                 }
                 let mut st = self.lock();
-                while st.table.pages().any(|(k, p)| k.0 == id && p.filling) {
+                // Until its fills' batches end (landed, accounted for and kept), not only issued.
+                while st.table.pages().any(|(k, p)| k.0 == id && p.filling) || st.homes.iter().any(|(k, h)| k.0 == id && h.landing) {
                     self.wait(&mut st)?;
                 }
                 self.unlock(st);
@@ -2516,76 +2309,23 @@ impl Inner {
         Ok(SetId(id))
     }
 
-    /// The set's layout in the RAM tier, opened unlocked (a call to the tier) unless it is
-    /// open: at its load, and again at a load or pass start after the tier took it back.
-    fn open_tier(&self, set: u32) -> Result<()> {
-        let Some(tier) = &self.tier else { return Ok(()) };
-        let layout = {
+    /// Brings the set's stored bytes into host RAM, the page cache, ahead of its fills.
+    #[cfg(unix)]
+    fn readahead(&self, set: u32) -> Result<()> {
+        let spec = {
             let st = self.lock();
-            let m = st.mech(set)?;
-            let l = (m.held.is_none()).then(|| (m.spec.layout.clone(), m.tier.clone()));
+            let spec = st.mech(set)?.spec.clone();
             self.unlock(st);
-            l
+            spec
         };
-        let Some((layout, name)) = layout else { return Ok(()) };
-        // A layout it parked is still its own, page-locked: no new mapping or lock.
-        let parked = self.state.lock().parked.remove(&name);
-        let held = match parked {
-            Some(held) => Some(held),
-            None => {
-                let regions: Vec<(u64, u64)> = layout.regions.iter().map(|r| (r.offset, r.span)).collect();
-                tier.open_layout(&name, regions, &self.row.ask_name()).map_err(|e| tracing::warn!("varena: tier: {e}")).ok().map(Arc::new)
-            }
-        };
-        let mut st = self.lock();
-        if let Some(Some(m)) = st.sets.get_mut(set as usize) {
-            if m.held.is_none() {
-                m.held = held;
-            }
-        }
-        self.unlock(st);
-        Ok(())
+        let items: Vec<tensorfs::io::source::Item> = spec.layout.regions.iter().flat_map(|r| r.items.iter().cloned()).collect();
+        Ok(spec.source.readahead(&items)?)
     }
 
-    /// Fills the set's layout in the RAM tier from the store as host headroom allows:
-    /// everything left in one read when it has the room, else half as much, until a region does
-    /// not fit. A declared set's tier holds its transformed bytes: only its filled pages go
-    /// there.
-    fn load_ram(self: &Arc<Self>, set: u32) -> Result<()> {
-        let (spec, held, name) = {
-            let st = self.lock();
-            let m = st.mech(set)?;
-            let out = (m.spec.clone(), m.held.clone(), m.tier.clone());
-            self.unlock(st);
-            out
-        };
-        let (Some(held), Some(tier), false) = (held, &self.tier, matches!(spec.fingerprint.fill, Fill::Declared(_))) else { return Ok(()) };
-        let regions = &spec.layout.regions;
-        let (mut at, mut want) = (0, regions.len());
-        while want > 0 {
-            let batch: Vec<u32> = (at..at + want).map(|r| r as u32).collect();
-            let bytes = regions.iter().skip(at).take(want).map(|r| r.span).sum();
-            let Some(permit) = tier.reserve(&name, bytes) else {
-                want /= 2;
-                continue;
-            };
-            let filled = held.fill(&batch, |hosts| self.store(&spec, hosts));
-            if matches!(&filled, Err(Error::Ownership(_))) {
-                let st = self.state.lock();
-                self.ownership_lost.store(true, Ordering::Release);
-                drop(st);
-                self.landed.notify_all();
-                std::mem::forget((permit, held.clone(), self.clone()));
-            }
-            match filled {
-                // The tier took the layout back meanwhile: the load is done with it.
-                Err(Error::Closed(_)) => return Ok(()),
-                other => other?,
-            }
-            at += want;
-            want = regions.len() - at;
-        }
-        Ok(())
+    #[cfg(windows)]
+    fn readahead(&self, set: u32) -> Result<()> {
+        let st = self.lock();
+        match *st.mech(set)?.spec.source {}
     }
 
     fn resolve(st: &State, plan: &Plan) -> Vec<(Vec<u32>, u32)> {
@@ -2788,8 +2528,23 @@ impl Inner {
                         st = self.lock();
                         continue;
                     }
-                    self.make_room(bytes, &[key], if free_only { "bind_free" } else { "bind" }, req, free_only)?;
+                    let refused = match self.make_room(bytes, &[key], if free_only { "bind_free" } else { "bind" }, req, free_only) {
+                        Err(e @ Error::Exhausted(_)) if !free_only => Some(e),
+                        made => made.map(|_| None)?,
+                    };
                     st = self.lock();
+                    if let Some(e) = refused {
+                        // A streamed set with only its slots left: one of them moves to the block (the floor: one block).
+                        match self.stream_in(&mut st, key, req)? {
+                            StreamIn::Moved => continue,
+                            StreamIn::Wait => {
+                                waited = true;
+                                self.wait(&mut st)?;
+                                continue;
+                            }
+                            StreamIn::No => return Err(e),
+                        }
+                    }
                     if !st.homes.contains_key(&key) {
                         self.map(&mut st, key, req, false)?;
                     }
@@ -2881,7 +2636,6 @@ impl Inner {
                 if let Some(s) = st.step_stats(req) {
                     s.capacity = budget;
                 }
-                self.tier_uses(&mut st, req);
             }
             let id = st.tick();
             st.active.insert((req, set), Active { id, thread: std::thread::current().id() });
@@ -2903,27 +2657,12 @@ impl Inner {
         Ok(id)
     }
 
-    /// Tells the tier each set's next use in this request, for its release order.
-    fn tier_uses(&self, st: &mut State, req: u64) {
-        if self.tier.is_none() {
-            return;
-        }
-        let Some(r) = st.table.request(req) else { return };
-        let uses: Vec<Call> = st.sets.iter().enumerate().filter_map(|(i, m)| m.as_ref().map(|m| Call::Use { digest: m.tier.clone(), distance: r.distance((i as u32, 0)).map(|d| d.0) })).collect();
-        uses.into_iter().for_each(|c| self.post(c));
-    }
-
     /// A pass ends: `peak` (what the execution layer saw it allocate at most) and what the row
-    /// holds now go into the request's record; one deferred tier copy probes for room.
+    /// holds now go into the request's record.
     fn end_pass(&self, req: u64, pass: u64, peak: u64) -> Result<()> {
         let mut st = self.lock();
         self.measure(&mut st);
         self.physical(&mut st);
-        // One deferred tier copy probes for room (one host ask); the rest follow it once
-        // there is.
-        if let Some(save) = st.deferred_saves.pop() {
-            self.saves.post(save, 0);
-        }
         st.active.retain(|(r, _), a| !(*r == req && a.id == pass));
         let compute = st.table.segments.max(peak);
         let held = st.table.vmm + st.table.mapping + compute;
@@ -2948,7 +2687,7 @@ impl Inner {
         let shrinks: Vec<(u32, u64, Shrink)> = holding.iter().filter_map(|id| st.shrinks.get(id).map(|s| (*id, u64::MAX, s.clone()))).collect();
         let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
         let mut stats = st.stats.remove(&req).unwrap_or_default();
-        let unmeasured = st.host.remove(&req).is_some_and(|h| h.is_none()) && st.host.values().all(Option::is_some);
+        st.host.remove(&req);
         // Its anonymous host peak (the process's since the first open request started).
         stats.host = st.window.as_mut().and_then(ledger::Window::look);
         if st.table.requests.is_empty() {
@@ -2963,7 +2702,6 @@ impl Inner {
         }
         self.unlock(st);
         self.shrink(shrinks);
-        stats.tier = self.tier.as_ref().map_or(0, |t| t.resident());
         let mut st = self.lock();
         // No request open: every page kept that can be (the hook's to take until now).
         if st.table.requests.is_empty() {
@@ -2978,28 +2716,19 @@ impl Inner {
         stats.keep_pending = st.keep_pending();
         st.last = Some(stats.clone());
         self.publish(&mut st);
-        // The last host-unmeasured call ended (published): a copy refused beside it probes for
-        // room again; a standalone call has no measured pass end to retry at (review 6).
-        if let Some(save) = unmeasured.then(|| st.deferred_saves.pop()).flatten() {
-            self.saves.post(save, 0);
-        }
-        let uses: Vec<Call> = st.sets.iter().flatten().map(|m| Call::Use { digest: m.tier.clone(), distance: None }).collect();
-        if self.tier.is_some() {
-            uses.into_iter().for_each(|c| self.post(c));
-        }
         self.unlock(st);
         self.shared.ring();
         stats
     }
 
     /// The ask thread's answer: idle pages no plan of this row's uses ([`decide::answer`]),
-    /// never a cache, never waiting on anything but its own tier copies and protects; it runs
+    /// never a cache, never waiting on anything but its own protects; it runs
     /// no caller code. Kept pages' bytes come back once custody lets go: the trim thread
     /// settles that after the reply and publishes them free.
     fn answer(&self, bytes: u64) -> u64 {
         let out = crate::caught(|| {
             let mut st = self.lock();
-            // A tier copy's or protect's page comes back with it: the answer counts it.
+            // A protect's page comes back with it: the answer counts it.
             while st.table.transient > 0 {
                 self.wait(&mut st)?;
             }
@@ -3028,41 +2757,6 @@ impl Inner {
             self.recover();
         }
         out.unwrap_or(0)
-    }
-
-    /// The RAM tier wants layout `digest` back: its regions are unlocked (one being read when
-    /// its copy ends) and its mapping goes with the last fill holding it. Rust only, at once.
-    fn release_tier(&self, digest: &str) -> u64 {
-        let (held, parked) = {
-            let mut st = self.state.lock();
-            let held: Vec<Arc<tier::Held>> = st.sets.iter_mut().flatten().filter(|m| m.tier == digest).filter_map(|m| m.held.take()).collect();
-            (held, st.parked.remove(digest))
-        };
-        // Each unlock stalls the device until it is idle: counted, and timed, for the requests
-        // running meanwhile. No lock of the Memory's is held across it.
-        let mut stalls = Unregisters::default();
-        let mut unregister = |p| {
-            let start = Instant::now();
-            let out = self.backend.unregister_host(p);
-            stalls.calls += 1;
-            stalls.max_ns = stalls.max_ns.max(start.elapsed().as_nanos() as u64);
-            out
-        };
-        let bytes: u64 = held.iter().chain(&parked).map(|h| h.release(&mut unregister)).sum();
-        if parked.is_some() {
-            self.post(Call::Close { digest: digest.to_string() });
-        }
-        if stalls.calls > 0 {
-            stalls.bytes = bytes;
-            let mut st = self.state.lock();
-            let running: Vec<u64> = st.table.requests.iter().map(|r| r.id).collect();
-            for r in running {
-                if let Some(s) = st.stats(Some(r)) {
-                    s.unregisters.add(&stalls);
-                }
-            }
-        }
-        bytes
     }
 
     /// The trim thread's work: the trim hook and shrinks an ask wanted, then a ledger event.
@@ -3143,15 +2837,11 @@ impl Memory {
 }
 
 impl Drop for Memory {
-    /// Stop speculative saves. Final physical retirement is transferred by Owner, so a
-    /// Python/DLPack destructor never waits for a CUDA consumer or a host callback.
+    /// Final physical retirement is transferred by Owner, so a Python/DLPack destructor never
+    /// waits for a CUDA consumer or a host callback.
     fn drop(&mut self) {
-        self.inner.saves.close();
-        self.inner.saves.drain();
         self.inner.burst.0.lock().closed = true;
         self.inner.burst.1.notify_all();
-        // Under the state lock: a tier copy waiting on the fills sees it closed or is woken.
-        drop(self.inner.state.lock());
         self.inner.landed.notify_all();
     }
 }
@@ -3177,7 +2867,7 @@ impl Inner {
         self.publish(&mut st);
         let empty = st.homes.is_empty();
         drop(st);
-        Ok(empty && self.mech.idle() && self.to_custody.idle() && self.to_tier.idle() && self.saves.idle())
+        Ok(empty && self.mech.idle() && self.to_custody.idle())
     }
 }
 
@@ -3202,8 +2892,8 @@ impl Inner {
     }
 
     /// Blocks until the work a retirement waits on is done: fills, every pending event and
-    /// ready event (a host wait, on the retirer's own thread), Keeps, queued calls and tier
-    /// copies, and every worker's reference.
+    /// ready event (a host wait, on the retirer's own thread), Keeps, queued calls, and every
+    /// worker's reference.
     fn quiesce(self: &Arc<Self>) -> Result<()> {
         {
             let mut st = self.lock();
@@ -3213,10 +2903,8 @@ impl Inner {
             self.unlock(st);
         }
         self.finish_pending(false)?;
-        self.saves.settle();
         self.mech.settle();
         self.to_custody.settle();
-        self.to_tier.settle();
         let mut alone = self.quiet.lock.lock();
         while Arc::strong_count(self) > 1 {
             self.quiet.gone.wait(&mut alone);
@@ -3229,11 +2917,9 @@ impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.to_custody.close();
-        self.to_tier.close();
         self.row.knock();
         self.wanted.0.lock().closed = true;
         self.wanted.1.notify_all();
-        self.saves.close();
         self.burst.0.lock().closed = true;
         self.burst.1.notify_all();
         // The mechanism's thread is gone with the Memory: what it was still to do happens here.
@@ -3241,6 +2927,7 @@ impl Drop for Inner {
         for op in self.mech.drain() {
             match op {
                 Mech::Unmap { va, off, span, phys, ready } => {
+                    let _ = self.backend.finish(ready);
                     let _ = self.backend.unmap(va, off, span);
                     phys.into_iter().for_each(|p| { let _ = self.backend.destroy(p); });
                     self.backend.retire(ready);
@@ -3267,16 +2954,9 @@ impl Drop for Inner {
             let _ = self.backend.destroy(phys);
         }
         let sets: Vec<SetMech> = st.sets.drain(..).flatten().collect();
-        let parked: Vec<Arc<tier::Held>> = st.parked.drain().map(|(_, h)| h).collect();
         drop(st);
         for m in sets {
             self.backend.release(m.va);
-            if let Some(held) = &m.held {
-                held.unpin(|p| self.backend.unregister_host(p));
-            }
-        }
-        for held in parked {
-            held.unpin(|p| self.backend.unregister_host(p));
         }
     }
 }
@@ -3300,23 +2980,6 @@ fn fill_loop(demand: &Receiver<Vec<Job>>, ahead: &Receiver<Vec<Job>>, inner: &We
     }
 }
 
-/// The RAM tier's copies of filled pages, one at a time and only while the fill threads are
-/// idle: never ahead of a fill, never on a bind's path.
-fn save_loop(saves: &Outbox<Save>, burst: &(Mutex<Burst>, Condvar), inner: &Weak<Inner>) {
-    while let Some((ticket, bytes, save)) = saves.next() {
-        let mut b = burst.0.lock();
-        while !b.closed && !b.idle() {
-            burst.1.wait(&mut b);
-        }
-        let closed = b.closed;
-        drop(b);
-        if let Some(me) = Work::of(inner).filter(|me| !closed && me.after_fills()) {
-            me.save(&save);
-        }
-        saves.sent(ticket, bytes);
-    }
-}
-
 fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>, stop: &AtomicBool) {
     if let Some(row) = row.upgrade() {
         row.ask_thread();
@@ -3327,7 +2990,6 @@ fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>,
         // Never dies: a failed or panicking answer frees nothing, and the next ask is served.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ask {
             ledger::Ask::Room { bytes, .. } => me.answer(bytes),
-            ledger::Ask::Host { digest } => me.release_tier(&digest),
         }))
         .unwrap_or(0)
     });
@@ -3376,19 +3038,16 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
     }
 }
 
-/// The sender thread: custody and tier calls, in the order they were posted, until the Memory
-/// goes. It holds no lock of the Memory's while it calls; a call that reached a new custody
-/// holder takes the state lock alone after, so every kept page is exported to it again.
-fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Option<&tier::Client>, inner: &Weak<Inner>) {
+/// The sender thread: custody calls, in the order they were posted, until the Memory goes. It
+/// holds no lock of the Memory's while it calls; a call that reached a new custody holder takes
+/// the state lock alone after, so every kept page is exported to it again.
+fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, inner: &Weak<Inner>) {
     while let Some((ticket, bytes, call)) = outbox.next() {
-        let holder = (custody.map(custody::Client::holder), tier.map(tier::Client::holder));
+        let holder = custody.map(custody::Client::holder);
         let result = match call {
             Call::Export { fp, page, len, handle } => custody.map(|c| c.export(&fp, page, len, handle)),
             Call::Withdraw { fp, page } => custody.map(|c| c.withdraw(&fp, page)),
             Call::Disown { fp, page } => custody.map(|c| c.disown(&fp, page)),
-            Call::Use { digest, distance } => tier.map(|t| t.use_layout(&digest, distance)),
-            Call::Readopt { digest, regions, ask, file } => tier.map(|t| t.adopt_layout(&digest, regions, &ask, file)),
-            Call::Close { digest } => tier.map(|t| t.close(&digest)),
         };
         if bytes > 0 && !matches!(result, Some(Ok(()))) {
             if let Some(me) = Work::of(inner) {
@@ -3399,11 +3058,11 @@ fn send_loop(outbox: &Outbox<Call>, custody: Option<&custody::Client>, tier: Opt
             continue;
         }
         outbox.sent(ticket, bytes);
-        let moved = holder != (custody.map(custody::Client::holder), tier.map(tier::Client::holder));
+        let moved = holder != custody.map(custody::Client::holder);
         if moved || bytes > 0 {
             if let Some(me) = Work::of(inner) {
-                // A new custody holder gets every kept page again, a new tier every held
-                // layout (the drain does it); withdrawn bytes are free for the next decision.
+                // A new custody holder gets every kept page again (the drain does it);
+                // withdrawn bytes are free for the next decision.
                 let mut st = me.lock();
                 st.table.pending = me.to_custody.pending();
                 me.publish(&mut st);
@@ -3457,7 +3116,6 @@ impl Request {
     /// blocks are prefetched into free bytes.
     pub fn pass(&self, set: SetId, key: &str) -> Result<Pass> {
         let _ = key;
-        self.inner.guard(|| self.inner.open_tier(set.0))?;
         let id = self.inner.guard(|| self.inner.pass(self.id, set.0))?;
         Ok(Pass { inner: self.inner.clone().into(), req: self.id, set: set.0, id })
     }
@@ -3524,10 +3182,6 @@ impl Pin {
             }
             st.sync(self.key);
             self.inner.keep(&mut st, self.key);
-            if matches!(st.mech(self.key.0).map(|m| &m.spec.fingerprint.fill), Ok(Fill::Declared(_))) {
-                let req = st.binding(self.key.0);
-                self.inner.save_later(&st, self.key, req);
-            }
             self.inner.publish(&mut st);
             self.inner.unlock(st);
             self.inner.landed.notify_all();
@@ -3647,7 +3301,8 @@ impl Inner {
                 }
             }
             Mech::Unmap { va, off, span, phys, ready } => {
-                if let Err(error) = self.backend.unmap(va, off, span) {
+                // A page read ready at issue may still be landing: its copies end first.
+                if let Err(error) = self.backend.finish(ready).and_then(|()| self.backend.unmap(va, off, span)) {
                     tracing::warn!("varena: page ownership could not be released: {error}");
                     let st = self.state.lock();
                     self.ownership_lost.store(true, Ordering::Release);

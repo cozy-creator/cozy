@@ -146,49 +146,6 @@ pub fn held(f: &Owned, start: u64, _len: u64) -> Result<bool> {
     Ok(!flock(&probe, libc::LOCK_EX, false)?)
 }
 
-/// A local event: (the reader, the writer) of a datagram socket pair.
-pub fn event() -> Result<(Owned, Owned)> {
-    let mut fds = [0; 2];
-    // SAFETY: a socket pair into our array.
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) } != 0 {
-        return Err(Error::os("socketpair")(std::io::Error::last_os_error()));
-    }
-    // SAFETY: two descriptors we just created.
-    let (reader, writer) = unsafe { (Owned::from_raw_fd(fds[0]), Owned::from_raw_fd(fds[1])) };
-    for fd in [&reader, &writer] {
-        // SAFETY: flags on descriptors we hold.
-        unsafe {
-            libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
-        }
-    }
-    Ok((reader, writer))
-}
-
-pub fn signal(writer: &Owned) {
-    let one = [1u8];
-    // SAFETY: a one-byte datagram; a full buffer is a signal already.
-    unsafe { libc::send(writer.as_raw_fd(), one.as_ptr().cast(), 1, libc::MSG_DONTWAIT) };
-}
-
-/// Blocks until the event is signalled, then clears it.
-pub fn await_event(reader: &Owned) -> Result<()> {
-    let mut poll = libc::pollfd { fd: reader.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-    loop {
-        // SAFETY: one live descriptor.
-        if unsafe { libc::poll(&mut poll, 1, -1) } > 0 {
-            let mut buf = [0u8; 64];
-            // SAFETY: datagram reads into our buffer until none is left.
-            while unsafe { libc::recv(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) } > 0 {}
-            return Ok(());
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(Error::os("wait for a wake")(e));
-        }
-    }
-}
-
 /// A service: its socket and the lock that makes it the service's.
 pub struct Listener {
     socket: UnixListener,
@@ -344,18 +301,6 @@ pub fn page(len: u64) -> Result<Owned> {
 /// the importer maps it read-only.
 pub fn export(page: &Owned) -> Result<Owned> {
     Ok(page.try_clone()?)
-}
-
-pub fn tier_file(_: &str) -> Result<Owned> {
-    Err(Error::unsupported(Seam::SharedMemory))
-}
-
-pub fn punch(_: &Owned, _: u64, _: u64) -> Result<()> {
-    Err(Error::unsupported(Seam::SharedMemory))
-}
-
-pub fn allocated(_: &Owned) -> u64 {
-    0
 }
 
 /// The uid of `pid` (its real uid, as the kernel reports it).

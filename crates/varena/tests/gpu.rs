@@ -330,9 +330,7 @@ fn pages_fill_protect_unmap_and_survive_a_clean_owner_exit() {
 
 /// `stray`: one `st.global.u8` of 7 at its argument. `spin`: busy for `ns` nanoseconds of the
 /// GPU's clock (a forward). `copy`: `words` u64s from `src` to `dst`, one thread (a consumer that
-/// reads a page). `sweep`: reads `words` u64s at `src` again and again for at least `ns`, one
-/// thread (a forward that reads a page throughout); `out` gets their XOR over all passes and the
-/// pass count.
+/// reads a page).
 const KERNELS: &std::ffi::CStr = c"
 .version 7.0
 .target sm_70
@@ -375,51 +373,20 @@ LOOP:
 DONE:
     ret;
 }
-.visible .entry sweep(.param .u64 src, .param .u64 words, .param .u64 ns, .param .u64 out) {
-    .reg .b64 %s, %at, %n, %i, %v, %acc, %passes, %start, %now, %d, %lim, %o;
-    .reg .pred %p;
-    ld.param.u64 %s, [src];
-    ld.param.u64 %n, [words];
-    ld.param.u64 %lim, [ns];
-    ld.param.u64 %o, [out];
-    mov.u64 %acc, 0;
-    mov.u64 %passes, 0;
-    mov.u64 %start, %globaltimer;
-PASS:
-    mov.u64 %at, %s;
-    mov.u64 %i, %n;
-WORD:
-    setp.eq.u64 %p, %i, 0;
-    @%p bra PASSED;
-    ld.volatile.global.u64 %v, [%at];
-    xor.b64 %acc, %acc, %v;
-    add.u64 %at, %at, 8;
-    sub.u64 %i, %i, 1;
-    bra WORD;
-PASSED:
-    add.u64 %passes, %passes, 1;
-    mov.u64 %now, %globaltimer;
-    sub.u64 %d, %now, %start;
-    setp.lt.u64 %p, %d, %lim;
-    @%p bra PASS;
-    st.global.u64 [%o], %acc;
-    st.global.u64 [%o+8], %passes;
-    ret;
-}
 ";
 
 /// Prepare each diagnostic kernel before a deliberately blocked consumer stream exists.
 /// CUDA module/function loading can wait on that stream; doing it inside launch would make
 /// the fixture deadlock before it ever exercised Varena's consumer ordering.
-fn kernels() -> &'static [usize; 4] {
-    static FUNCTIONS: std::sync::OnceLock<[usize; 4]> = std::sync::OnceLock::new();
+fn kernels() -> &'static [usize; 3] {
+    static FUNCTIONS: std::sync::OnceLock<[usize; 3]> = std::sync::OnceLock::new();
     FUNCTIONS.get_or_init(|| {
         let d = cuda::driver().unwrap();
         let (_, ctx) = cuda::primary_context(0).unwrap();
         let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
         let mut module = std::ptr::null_mut();
         cuda::check("cuModuleLoadData", unsafe { (d.module_load_data)(&mut module, KERNELS.as_ptr().cast()) }).unwrap();
-        [c"stray", c"spin", c"copy", c"sweep"].map(|name| {
+        [c"stray", c"spin", c"copy"].map(|name| {
             let mut function = std::ptr::null_mut();
             cuda::check("cuModuleGetFunction", unsafe { (d.module_get_function)(&mut function, module, name.as_ptr()) }).unwrap();
             function as usize
@@ -429,7 +396,7 @@ fn kernels() -> &'static [usize; 4] {
 
 /// Launches a prepared diagnostic kernel on `stream` with u64 arguments.
 fn launch(name: &std::ffi::CStr, args: &[u64], stream: usize) -> cuda::CUresult {
-    let index = match name.to_bytes() { b"stray" => 0, b"spin" => 1, b"copy" => 2, b"sweep" => 3, _ => panic!("unknown diagnostic kernel") };
+    let index = match name.to_bytes() { b"stray" => 0, b"spin" => 1, b"copy" => 2, _ => panic!("unknown diagnostic kernel") };
     let kernel = kernels()[index] as cuda::CUfunction;
     let d = cuda::driver().unwrap();
     let (_, ctx) = cuda::primary_context(0).unwrap();
@@ -876,75 +843,6 @@ fn fills_are_reported_against_the_measured_ceiling() {
     step!();
 }
 
-/// A RAM fill read again. Unregistered, TensorFS's engine stages a range's first read, then
-/// registers it for the length of each later read (cuMemHostRegister, then cuMemHostUnregister as
-/// the read ends): every reuse pays the registration. Registered once by its owner through
-/// `Backend::register_host` (as the executor does when it maps a RAM-tier layout), every read
-/// copies directly. Rates are reported as % of TensorFS's measured H2D ceiling.
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_registered_host_range_fills_directly_every_time() {
-    let (b, uuid) = gpu();
-    step!();
-    let (h2d, _) = io::metrics::h2d(0).unwrap();
-    step!();
-    let len = (1u64 << 30).next_multiple_of(b.granularity());
-    step!();
-    let data = pattern(len, 9);
-    step!();
-    let va = b.reserve(len).unwrap();
-    step!();
-    let page = b.create(len).unwrap();
-    step!();
-    b.map(va, 0, &page, Access::ReadWrite).unwrap();
-    step!();
-    let mut rows = vec![];
-    step!();
-    let mut read = |what: &str| -> (f64, u64, u64) {
-        io::metrics::take();
-        // SAFETY: the mapping is ours and writable; `data` outlives the read.
-        unsafe { io::read(&[Copy { src: Src::Host(data.as_ptr()), dst: b.target(va, 0, len) }], &ReadOpts::default()) }.unwrap();
-        let runs: Vec<_> = io::metrics::take().into_iter().filter(|c| c.kind == "h2d").collect();
-        let sum = |f: fn(&io::metrics::Copy) -> u64| runs.iter().map(f).sum::<u64>();
-        let gbps = sum(|c| c.bytes) as f64 / sum(|c| c.ns).max(1) as f64;
-        let (pin, staged) = (sum(|c| c.pin_ns), sum(|c| c.staged));
-        rows.push(format!("{what} {gbps:.2} GB/s = {:.0}% (pin {:.0} ms, staged {} MiB)", 100.0 * gbps / h2d, pin as f64 / 1e6, staged >> 20));
-        (gbps, pin, staged)
-    };
-    step!();
-    read("unregistered 1");
-    step!();
-    let (again, ..) = read("unregistered 2");
-    step!();
-    read("unregistered 3");
-    step!();
-    // `data` stays mapped until it is unregistered below.
-    b.register_host(data.as_ptr() as u64, len).unwrap();
-    step!();
-    let first = read("registered 1");
-    step!();
-    let second = read("registered 2");
-    step!();
-    b.unregister_host(data.as_ptr() as u64).unwrap();
-    step!();
-    assert_eq!(bytes(va.base, len, 0), data);
-    step!();
-    b.unmap(va, 0, len).unwrap();
-    step!();
-    b.destroy(page).unwrap();
-    step!();
-    b.release(va);
-    step!();
-    println!("REUSE of {h2d:.2} GB/s: {}", rows.join("; "));
-    step!();
-    for (gbps, pin, staged) in [first, second] {
-        assert_eq!((pin, staged), (0, 0), "a registered range copies directly, never staged or pinned per read");
-        assert!(gbps > again, "a registered read beats an unregistered reuse ({gbps:.2} vs {again:.2} GB/s)");
-    }
-    println!("PASS a registered host range fills directly every time (second {:.0}% vs first {:.0}%) {uuid}", 100.0 * second.0 / h2d, 100.0 * first.0 / h2d);
-    step!();
-}
-
 /// cuMemSetAccess is documented synchronous: does a map wait for a fill another thread has in flight? Fresh pages
 /// mapped with the card idle, then while another thread fills a device buffer from pageable host memory without a
 /// pause; each phase's maps split into cuMemMap and cuMemSetAccess (the backend's driver spans). Reported, not judged:
@@ -1026,62 +924,20 @@ fn maps_beside_a_fill_in_flight_are_timed_against_maps_on_an_idle_card() {
 
 // ---- the backend's calls, timed
 
+/// Each backend call's count, total and longest time, by name, and when the last one ended.
 #[derive(Default)]
-struct Timings {
-    /// Each call's count, total and longest time, by name.
-    calls: parking_lot::Mutex<std::collections::BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>>,
-    /// When each call last ended.
-    last: parking_lot::Mutex<std::collections::BTreeMap<&'static str, std::time::Instant>>,
-    /// The stream whose next `record` fails (0: none): an injected completion-record failure.
-    fail_record: std::sync::atomic::AtomicUsize,
-    /// Each protect's start and end.
-    protects: parking_lot::Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
-    /// TensorFS copy runs taken from its log as pages are made (the log keeps only its latest): runs, bytes, ns,
-    /// GPU-busy ns.
-    fills: parking_lot::Mutex<[u64; 4]>,
-}
+struct Timings(parking_lot::Mutex<std::collections::BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>>, parking_lot::Mutex<std::collections::BTreeMap<&'static str, std::time::Instant>>);
 
 impl Timings {
     const fn new() -> Timings {
-        Timings {
-            calls: parking_lot::const_mutex(std::collections::BTreeMap::new()),
-            last: parking_lot::const_mutex(std::collections::BTreeMap::new()),
-            fail_record: std::sync::atomic::AtomicUsize::new(0),
-            protects: parking_lot::const_mutex(Vec::new()),
-            fills: parking_lot::const_mutex([0; 4]),
-        }
-    }
-
-    /// TensorFS's copy runs since the last look, added to `fills`.
-    fn absorb(&self) {
-        let runs = io::metrics::take();
-        let mut f = self.fills.lock();
-        for c in runs {
-            *f = [f[0] + 1, f[1] + c.bytes, f[2] + c.ns, f[3] + c.busy_ns];
-        }
-    }
-
-    /// The copy runs so far, and a fresh start.
-    fn take_fills(&self) -> [u64; 4] {
-        self.absorb();
-        std::mem::take(&mut *self.fills.lock())
-    }
-
-    /// The next event recorded on `stream` fails, as a driver's record can.
-    fn fail_record(&self, stream: usize) {
-        self.fail_record.store(stream, std::sync::atomic::Ordering::Release);
+        Timings(parking_lot::const_mutex(std::collections::BTreeMap::new()), parking_lot::const_mutex(std::collections::BTreeMap::new()))
     }
 
     fn add(&self, op: &'static str, took: std::time::Duration) {
-        let mut t = self.calls.lock();
+        let mut t = self.0.lock();
         let e = t.entry(op).or_default();
         *e = (e.0 + 1, e.1 + took, e.2.max(took));
-        self.last.lock().insert(op, std::time::Instant::now());
-    }
-
-    /// Every call's time together.
-    fn total(&self) -> std::time::Duration {
-        self.calls.lock().values().map(|e| e.1).sum()
+        self.1.lock().insert(op, std::time::Instant::now());
     }
 
     fn time<T>(&self, op: &'static str, f: impl FnOnce() -> T) -> T {
@@ -1094,33 +950,32 @@ impl Timings {
     /// The report, and a fresh start.
     fn take(&self) -> String {
         let report = self.report();
-        self.calls.lock().clear();
+        self.0.lock().clear();
         report
     }
 
     fn count(&self, op: &str) -> u64 {
-        self.calls.lock().get(op).map_or(0, |e| e.0)
+        self.0.lock().get(op).map_or(0, |e| e.0)
     }
 
     fn last(&self, op: &str) -> Option<std::time::Instant> {
-        self.last.lock().get(op).copied()
+        self.1.lock().get(op).copied()
     }
 
     /// The wall time since the previous lap (None on the first).
     fn lap(&self) -> Option<std::time::Duration> {
-        self.last.lock().insert("lap", std::time::Instant::now()).map(|t| t.elapsed())
+        self.1.lock().insert("lap", std::time::Instant::now()).map(|t| t.elapsed())
     }
 
     /// `op n total max`, the costliest first.
     fn report(&self) -> String {
-        let mut rows: Vec<_> = self.calls.lock().iter().map(|(op, (n, total, max))| (*op, *n, *total, *max)).collect();
+        let mut rows: Vec<_> = self.0.lock().iter().map(|(op, (n, total, max))| (*op, *n, *total, *max)).collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.2));
         rows.iter().map(|(op, n, total, max)| format!("{op} {n}x {total:?} (max {max:?})")).collect::<Vec<_>>().join(", ")
     }
 }
 
-/// Every driver call of this process's CUDA backends and every host wait in TensorFS's engine (their trace spans), by
-/// name.
+/// Every driver call of this process's CUDA backends (their trace spans), by name.
 static CALLS: Timings = Timings::new();
 
 /// Times each of the backend's driver spans into [`CALLS`].
@@ -1148,7 +1003,7 @@ fn time_calls() {
     ONCE.call_once(|| {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Layer;
-        let only = tracing_subscriber::filter::Targets::new().with_target("varena::cuda", tracing::Level::TRACE).with_target("tensorfs::io", tracing::Level::TRACE);
+        let only = tracing_subscriber::filter::Targets::new().with_target("varena::cuda", tracing::Level::TRACE);
         let errors = tracing_subscriber::filter::Targets::new().with_target("varena::memory", tracing::Level::DEBUG);
         tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Calls.with_filter(only))
             .with(tracing_subscriber::fmt::layer().with_ansi(false).with_filter(errors))).unwrap();
@@ -1168,7 +1023,6 @@ impl Backend for Timed {
     fn release(&self, va: Va) { self.1.time("release", || self.0.release(va)) }
     fn create(&self, len: u64) -> varena::Result<Physical> {
         let page = self.1.time("create", || self.0.create(len));
-        self.1.absorb();
         // Every 1,000 pages a process says where their time goes (stderr: the case log).
         let n = self.1.count("create");
         if n == 1 || n.is_multiple_of(1000) {
@@ -1185,34 +1039,20 @@ impl Backend for Timed {
     }
     fn destroy(&self, page: Physical) -> varena::Result<()> { self.1.time("destroy", || self.0.destroy(page)) }
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> varena::Result<()> { self.1.time("map", || self.0.map(va, offset, page, access)) }
-    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> {
-        let start = std::time::Instant::now();
-        let out = self.1.time("protect", || self.0.protect(va, offset, len, access));
-        self.1.protects.lock().push((start, std::time::Instant::now()));
-        out
-    }
+    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> { self.1.time("protect", || self.0.protect(va, offset, len, access)) }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> varena::Result<()> { self.1.time("unmap", || self.0.unmap(va, offset, len)) }
     fn export(&self, page: &Physical) -> varena::Result<platform::handles::Owned> { self.1.time("export", || self.0.export(page)) }
     fn import(&self, handle: platform::handles::Owned, len: u64) -> varena::Result<Physical> { self.1.time("import", || self.0.import(handle, len)) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.0.target(va, offset, len) }
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> varena::Result<()> { self.1.time("save", || self.0.save(va, offset, host, after)) }
     fn fence(&self) -> varena::Result<Event> { self.1.time("fence", || self.0.fence()) }
-    fn record(&self, stream: usize) -> varena::Result<Event> {
-        if stream != 0 && self.1.fail_record.compare_exchange(stream, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_ok() {
-            return Err(Error::Device { op: "cuEventRecord", code: 999, name: "CUDA_ERROR_UNKNOWN (injected)".into() });
-        }
-        self.1.time("record", || self.0.record(stream))
-    }
+    fn record(&self, stream: usize) -> varena::Result<Event> { self.1.time("record", || self.0.record(stream)) }
     fn query(&self, event: Event) -> varena::Result<bool> { self.1.time("query", || self.0.query(event)) }
     fn elapsed(&self, from: Event, to: Event) -> varena::Result<Option<u64>> { self.1.time("elapsed", || self.0.elapsed(from, to)) }
     fn wait(&self, event: Event, stream: usize) -> varena::Result<()> { self.1.time("wait", || self.0.wait(event, stream)) }
     fn synchronize(&self, stream: usize) -> varena::Result<()> { self.1.time("synchronize", || self.0.synchronize(stream)) }
     fn finish(&self, event: Event) -> varena::Result<()> { self.1.time("finish", || self.0.finish(event)) }
-    fn register_host(&self, ptr: u64, len: u64) -> varena::Result<()> { self.1.time("register_host", || self.0.register_host(ptr, len)) }
-    fn unregister_host(&self, ptr: u64) -> varena::Result<()> { self.1.time("unregister_host", || self.0.unregister_host(ptr)) }
     fn retire(&self, event: Event) { self.1.time("retire", || self.0.retire(event)) }
     fn drain(&self) -> varena::Result<()> { self.1.time("drain", || self.0.drain()) }
-    fn drain_save(&self) -> varena::Result<()> { self.1.time("drain_save", || self.0.drain_save()) }
 }
 
 /// Memory over the timed CUDA backend, and its timings.
@@ -1349,7 +1189,7 @@ fn concurrent_binds_of_one_block_fill_it_once() {
     step!();
     let moved = r.stats().moved;
     step!();
-    assert_eq!(moved.store.bytes + moved.tier.bytes, REGION_ALIGN, "one fill for both binders");
+    assert_eq!(moved.store.bytes, REGION_ALIGN, "one fill for both binders");
     step!();
     drop(pins);
     step!();
@@ -1394,10 +1234,9 @@ fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishe
     step!();
     drop(pin);
     step!();
-    // The copy must read the original contents before the in-place refill starts.
-    // Preparation may wait outside capture/replay: Source::read_placements retains its
-    // borrowed staging/source owners until the copy has completed. It cannot return a
-    // future-ready pin. Resident replay and allocator callbacks have separate no-wait tests.
+    // The copy must read the original contents before the in-place refill lands: the refill's
+    // copies wait for it in-stream. The rebind returns once they are issued (D), its page ready
+    // in-stream, while the fill thread's read keeps its staging until they complete.
     let _ = mem.free();
     let (again, waited) = std::thread::scope(|t| {
         let (rebind, waited) = watch(t, first, || mem.bind(s, 0, 0));
@@ -1409,7 +1248,7 @@ fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishe
     step!();
     assert_eq!(bytes(dst, REGION_ALIGN, 0), *block(2, 0));
     step!();
-    assert_ne!(waited, Waited::Returned, "refill preparation released its borrowed copy owners before the gated consumer completed");
+    assert_eq!(waited, Waited::Returned, "the rebind waited on the host for the gated consumer: its page reads ready at issue ({waited:?})");
     step!();
     let again = again.unwrap();
     step!();
@@ -1531,8 +1370,6 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     step!();
     assert_eq!(launch(c"spin", &[forward.as_nanos() as u64], stream.raw()), cuda::SUCCESS);
     step!();
-    // The driver calls from here on are those made while the forward runs.
-    CALLS.take();
     drop(pins);
     step!();
     let mut times: Vec<(&str, std::time::Duration)> = vec![];
@@ -1564,16 +1401,12 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
         let _ = probe.process_used();
     });
     step!();
-    let mut event = Event::DONE;
-    time("record", &mut || event = probe.record(stream.raw()).unwrap());
-    step!();
-    time("query", &mut || running = !probe.query(event).unwrap());
-    step!();
-    time("wait", &mut || probe.wait(event, other.raw()).unwrap());
-    step!();
-    time("retire", &mut || probe.retire(event));
-    step!();
-    let during = CALLS.take();
+    time("record+query+wait", &mut || {
+        let e = probe.record(stream.raw()).unwrap();
+        running = !probe.query(e).unwrap();
+        probe.wait(e, other.raw()).unwrap();
+        probe.retire(e);
+    });
     step!();
     stream.drain().unwrap();
     step!();
@@ -1583,8 +1416,7 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     step!();
     let report: Vec<String> = times.iter().map(|(w, t)| format!("{w} {t:?}")).collect();
     step!();
-    println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}), still running at the query: {running}: {}", report.join(", "));
-    println!("TIMINGS driver calls while the forward ran: {during}; RAM-tier unlocks during the request: {:?}", r.stats().unregisters);
+    println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}), still running at the last call: {running}: {}", report.join(", "));
     println!("TIMINGS in all: {}", timings.report());
     step!();
     for (what, took) in &times {
@@ -1683,720 +1515,8 @@ fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
     step!();
 }
 
-/// The RAM tier saves a filled page to the host on its own low-priority stream, the other copy
-/// direction, while demand fills come in: both run at once. Each rate alone and together, against
-/// the H2D ceiling; together they must move more bytes per second than either alone.
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_save_runs_beside_a_demand_fill_on_the_other_copy_engine() {
-    let (b, uuid) = gpu();
-    step!();
-    let (h2d, _) = io::metrics::h2d(0).unwrap();
-    step!();
-    // A gibibyte each way, as the ceiling probe and the fills case measure.
-    let len = (1u64 << 30).next_multiple_of(b.granularity());
-    step!();
-    let data = pattern(len, 23);
-    step!();
-    let va = b.reserve(2 * len).unwrap();
-    step!();
-    let (saved, ready) = filled(&b, va, 0, len, Src::Host(data.as_ptr()));
-    step!();
-    let fresh = b.create(len).unwrap();
-    step!();
-    b.map(va, len, &fresh, Access::ReadWrite).unwrap();
-    step!();
-    let mut host = vec![0u8; len as usize];
-    step!();
-    let gbps = |bytes: u64, t: std::time::Duration| bytes as f64 / t.as_nanos().max(1) as f64;
-    step!();
-    let save = |host: &mut [u8]| {
-        let start = std::time::Instant::now();
-        b.save(va, 0, host, ready).unwrap();
-        start.elapsed()
-    };
-    step!();
-    let fill = || {
-        let start = std::time::Instant::now();
-        // SAFETY: the second page is ours and writable; `data` outlives the read.
-        unsafe { io::read(&[Copy { src: Src::Host(data.as_ptr()), dst: b.target(va, len, len) }], &ReadOpts::default()) }.unwrap();
-        start.elapsed()
-    };
-    step!();
-    let (save_alone, fill_alone) = (save(&mut host), fill());
-    step!();
-    assert!(host == data, "the save copied the page");
-    step!();
-    host.fill(0);
-    step!();
-    let start = std::time::Instant::now();
-    step!();
-    let (save_both, fill_both) = std::thread::scope(|t| {
-        let saving = t.spawn(|| save(&mut host));
-        let filling = fill();
-        (saving.join().unwrap(), filling)
-    });
-    step!();
-    let both = start.elapsed();
-    step!();
-    assert!(host == data);
-    step!();
-    let pct = |r: f64| 100.0 * r / h2d;
-    step!();
-    let (sa, fa, sb, fb, all) = (gbps(len, save_alone), gbps(len, fill_alone), gbps(len, save_both), gbps(len, fill_both), gbps(2 * len, both));
-    step!();
-    println!("SAVE alone {sa:.2} GB/s ({:.0}%), fill alone {fa:.2} ({:.0}%); together save {sb:.2} ({:.0}%), fill {fb:.2} ({:.0}%), {all:.2} GB/s in all ({:.0}% of {h2d:.2})", pct(sa), pct(fa), pct(sb), pct(fb), pct(all));
-    step!();
-    assert!(all > sa.max(fa), "the save and the fill did not overlap: {all:.2} GB/s together");
-    step!();
-    b.unmap(va, len, len).unwrap();
-    step!();
-    b.destroy(fresh).unwrap();
-    step!();
-    b.unmap(va, 0, len).unwrap();
-    step!();
-    b.destroy(saved).unwrap();
-    step!();
-    b.release(va);
-    step!();
-    println!("PASS a save runs beside a demand fill on the other copy engine {uuid}");
-    step!();
-}
-
-/// Where a load's `wall` went: its copy runs (`fills`: runs, bytes, ns, GPU-busy ns), their rate against the GPU's H2D
-/// ceiling, and the driver calls. The sets' sources are host memory, so no disk ceiling applies. Fills and driver
-/// calls run on different threads at once: the parts can overlap.
-fn split(wall: std::time::Duration, driver: std::time::Duration, [runs, bytes, ns, busy]: [u64; 4]) -> String {
-    let gbps = bytes as f64 / ns.max(1) as f64;
-    let ceiling = io::metrics::h2d(0).map_or(0.0, |(c, _)| c);
-    format!(
-        "SPLIT load {wall:?}: {runs} copy runs, {bytes} B in {:?} ({gbps:.2} GB/s, {:.1}% of the {ceiling:.2} GB/s H2D ceiling; GPU copying {:?}); driver calls {driver:?}",
-        std::time::Duration::from_nanos(ns),
-        100.0 * gbps / ceiling.max(f64::MIN_POSITIVE),
-        std::time::Duration::from_nanos(busy)
-    )
-}
-
-/// `bytes` in a device buffer of their own.
-fn device(bytes: &[u8]) -> io::DeviceBuffer {
-    let buffer = io::DeviceBuffer::new(0, bytes.len()).unwrap();
-    let copy = [Copy { src: Src::Host(bytes.as_ptr()), dst: Dst::Device { device: 0, ptr: buffer.ptr(), len: bytes.len(), stream: 0 } }];
-    unsafe { io::read(&copy, &ReadOpts::default()) }.unwrap();
-    buffer
-}
-
-/// Design §5 card check, a delayed transform on a non-current stream: a bake queued on stream X behind a gate, the
-/// page marked filled at once. A second caller prepares the same range on stream Y: preparation returns without a
-/// host wait, and the consumer it queues on Y reads the baked bytes once X runs, never the bytes before the bake.
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_delayed_transform_on_another_stream_orders_the_next_consumer_in_stream() {
-    let (b, g, uuid) = card("delayed");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let mem = memory(b, &g);
-    step!();
-    let base = mem.load(set("base", 1, Fill::Declared("lora-1".into()), &g.uuid, |b| block(50, b)), Level::Ram).unwrap();
-    step!();
-    let r = mem.request("r", plan(&[&["base"]])).unwrap();
-    step!();
-    let pass = r.pass(base, "main", "1", Torch::default()).unwrap();
-    step!();
-    let (x, y) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
-    step!();
-    let (baked, out) = (device(&block(51, 0)), io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap());
-    step!();
-    let range = mem.retain(base, &[0]).unwrap();
-    step!();
-    let first = std::time::Instant::now();
-    let pin = range.prepare_for(x.raw(), Some(&r)).unwrap().remove(0);
-    let first = first.elapsed();
-    step!();
-    assert!(pin.fresh, "the caller bakes it");
-    step!();
-    let mut gate = Some(Gate::hold(x.raw()));
-    step!();
-    assert_eq!(launch(c"copy", &[pin.ptr, baked.ptr(), REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
-    step!();
-    pin.filled();
-    step!();
-    drop(pin);
-    step!();
-    let (second, waited) = std::thread::scope(|t| {
-        let (prepared, waited) = watch(t, first, || range.prepare_for(y.raw(), Some(&r)));
-        if waited != Waited::Returned {
-            gate.take();
-        }
-        (prepared.join().unwrap().unwrap().remove(0), waited)
-    });
-    step!();
-    assert!(!second.fresh, "the second caller gets the bake, not a bake of its own");
-    step!();
-    assert_eq!(launch(c"copy", &[out.ptr(), second.ptr, REGION_ALIGN / 8], y.raw()), cuda::SUCCESS);
-    step!();
-    gate.take();
-    step!();
-    y.drain().unwrap();
-    step!();
-    assert!(bytes(out.ptr(), REGION_ALIGN, 0) == *block(51, 0), "the consumer on Y read the page before X's bake landed");
-    step!();
-    assert_eq!(waited, Waited::Returned, "preparing a range whose bake is queued on another stream waited on the host");
-    step!();
-    drop(second);
-    step!();
-    drop(range);
-    step!();
-    pass.end(Measured::default(), Torch::default());
-    step!();
-    assert_eq!(r.end().leftover, 0);
-    step!();
-    println!("PASS a delayed transform on another stream orders the next consumer in-stream {uuid}");
-    step!();
-}
-
-/// Design §5 card check, cancel with a pending output copy: a prepared range's consumer copies the page out on stream
-/// X behind a gate; then the request is cancelled (dropped unended), the pin and the range dropped and the set
-/// unloaded, all while the copy is still queued. The page is unmapped only after the gate opens, and the copy reads
-/// the page's own bytes.
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_cancelled_request_keeps_its_page_until_its_pending_output_copy_ends() {
-    let (b, g, uuid) = card("cancel");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let (mem, timings) = timed_memory(b, &g);
-    step!();
-    let s = mem.load(set("w", 1, Fill::Stored, &g.uuid, |b| block(60, b)), Level::Ram).unwrap();
-    step!();
-    let x = cuda::Stream::new(0).unwrap();
-    step!();
-    let out = io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap();
-    step!();
-    let range = mem.retain(s, &[0]).unwrap();
-    step!();
-    let r = mem.request("r", plan(&[&["w"]])).unwrap();
-    step!();
-    let pass = r.pass(s, "main", "1", Torch::default()).unwrap();
-    step!();
-    let first = std::time::Instant::now();
-    let pin = range.prepare_for(x.raw(), Some(&r)).unwrap().remove(0);
-    let first = first.elapsed();
-    step!();
-    let mut gate = Some(Gate::hold(x.raw()));
-    step!();
-    assert_eq!(launch(c"copy", &[out.ptr(), pin.ptr, REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
-    step!();
-    let unmaps = timings.count("unmap");
-    step!();
-    // The cancel, watched: if any of it waits on the host for the queued copy, the gate opens.
-    let waited = std::thread::scope(|t| {
-        let (cancelled, waited) = watch(t, first, || {
-            drop(pass);
-            drop(r);
-            drop(pin);
-            drop(range);
-            mem.unload(s);
-        });
-        if waited != Waited::Returned {
-            gate.take();
-        }
-        cancelled.join().unwrap();
-        waited
-    });
-    step!();
-    let early = timings.count("unmap") > unmaps;
-    step!();
-    let opened = std::time::Instant::now();
-    gate.take();
-    step!();
-    let drained = x.drain();
-    step!();
-    assert!(!early, "the page was unmapped while its output copy was still queued (the cancel {waited:?})");
-    step!();
-    drained.unwrap();
-    step!();
-    assert!(bytes(out.ptr(), REGION_ALIGN, 0) == *block(60, 0), "the output copy read other bytes than the page's");
-    step!();
-    while timings.count("unmap") == unmaps {
-        let _ = mem.torch_limit();
-    }
-    let unmapped = timings.last("unmap").unwrap();
-    step!();
-    assert!(unmapped >= opened, "unmapped {:?} before the copy could run", opened - unmapped);
-    step!();
-    println!("CANCEL the cancel {waited:?}; the page unmapped {:?} after the gate opened", unmapped - opened);
-    step!();
-    println!("PASS a cancelled request keeps its page until its pending output copy ends {uuid}");
-    step!();
-}
-
-/// Design §5 card check, old and new fill identity at once: a consumer of identity v1 queued on stream X behind a gate;
-/// the set's fill becomes v2. The v1 range is refused as stale, a v2 range is retained and prepared while the v1
-/// consumer is still queued. The v1 consumer reads v1's bytes, the v2 consumer v2's: neither sees the other's.
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn old_and_new_fill_identities_at_once_each_read_their_own_bytes() {
-    let (b, g, uuid) = card("identity");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let (mem, timings) = timed_memory(b, &g);
-    step!();
-    let t = mem.load(set("t", 1, Fill::Declared("v1".into()), &g.uuid, |b| block(70, b)), Level::Ram).unwrap();
-    step!();
-    let (x, y) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
-    step!();
-    let (v1, v2) = (device(&block(71, 0)), device(&block(72, 0)));
-    step!();
-    let (out1, out2) = (io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap(), io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap());
-    step!();
-    let r = mem.request("r", plan(&[&["t"]])).unwrap();
-    step!();
-    let pass = r.pass(t, "main", "1", Torch::default()).unwrap();
-    step!();
-    let old = mem.retain(t, &[0]).unwrap();
-    step!();
-    let first = std::time::Instant::now();
-    let pin = old.prepare_for(x.raw(), Some(&r)).unwrap().remove(0);
-    let first = first.elapsed();
-    step!();
-    assert!(pin.fresh, "v1 is baked by its caller");
-    step!();
-    assert_eq!(launch(c"copy", &[pin.ptr, v1.ptr(), REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
-    step!();
-    pin.filled();
-    step!();
-    // The bake done (the gate synchronizes X first), the v1 consumer is queued behind the gate.
-    let mut gate = Some(Gate::hold(x.raw()));
-    step!();
-    assert_eq!(launch(c"copy", &[out1.ptr(), pin.ptr, REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
-    step!();
-    let address = pin.ptr;
-    drop(pin);
-    step!();
-    let unmaps = timings.count("unmap");
-    step!();
-    let changed = std::thread::scope(|s| {
-        let (changed, waited) = watch(s, first, || mem.fill(t, Fill::Declared("v2".into())));
-        if waited != Waited::Returned {
-            gate.take();
-        }
-        changed.join().unwrap();
-        waited
-    });
-    step!();
-    assert!(!old.valid(), "the v1 range is stale once the fill is v2");
-    step!();
-    assert!(matches!(old.prepare_for(y.raw(), Some(&r)), Err(Error::StaleBinding(_))), "a stale range is refused, never prepared");
-    step!();
-    let new = mem.retain(t, &[0]).unwrap();
-    step!();
-    assert_ne!(new.identity(), old.identity());
-    step!();
-    let (pin2, waited) = std::thread::scope(|s| {
-        let (prepared, waited) = watch(s, first, || new.prepare_for(y.raw(), Some(&r)));
-        if waited != Waited::Returned {
-            gate.take();
-        }
-        (prepared.join().unwrap().unwrap().remove(0), waited)
-    });
-    step!();
-    let early = gate.is_some() && timings.count("unmap") > unmaps;
-    step!();
-    assert!(pin2.fresh, "v2 is baked by its caller");
-    step!();
-    assert_eq!(launch(c"copy", &[pin2.ptr, v2.ptr(), REGION_ALIGN / 8], y.raw()), cuda::SUCCESS);
-    step!();
-    pin2.filled();
-    step!();
-    assert_eq!(launch(c"copy", &[out2.ptr(), pin2.ptr, REGION_ALIGN / 8], y.raw()), cuda::SUCCESS);
-    step!();
-    gate.take();
-    step!();
-    let (dx, dy) = (x.drain(), y.drain());
-    step!();
-    assert!(!early, "the v1 page was unmapped while its consumer was still queued");
-    step!();
-    dx.unwrap();
-    dy.unwrap();
-    step!();
-    assert!(bytes(out1.ptr(), REGION_ALIGN, 0) == *block(71, 0), "the v1 consumer read other bytes than v1's");
-    step!();
-    assert!(bytes(out2.ptr(), REGION_ALIGN, 0) == *block(72, 0), "the v2 consumer read other bytes than v2's");
-    step!();
-    println!("IDENTITY the fill change {changed:?}, v2's preparation {waited:?} while v1's consumer was queued; at v1's address: {}", pin2.ptr == address);
-    step!();
-    drop(pin2);
-    step!();
-    drop((old, new));
-    step!();
-    pass.end(Measured::default(), Torch::default());
-    step!();
-    assert_eq!(r.end().leftover, 0);
-    step!();
-    println!("PASS old and new fill identities at once each read their own bytes {uuid}");
-    step!();
-}
-
-/// Design §3 and §5 card check, a completion-record failure without reuse: a consumer copies a page out on stream X
-/// behind a gate, then the pin's release event cannot be recorded (an injected driver failure). Memory must assume
-/// the page may still be read: binds fail as ownership errors, and nothing — the unload, the request's end, Memory's
-/// drop — unmaps or frees it. The consumer reads the page's own bytes once the gate opens.
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_failed_completion_record_quarantines_the_page_and_nothing_reuses_it() {
-    let (b, g, uuid) = card("record");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let (mem, timings) = timed_memory(b, &g);
-    step!();
-    let s = mem.load(set("q", 1, Fill::Stored, &g.uuid, |b| block(80, b)), Level::Ram).unwrap();
-    step!();
-    let x = cuda::Stream::new(0).unwrap();
-    step!();
-    let out = io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap();
-    step!();
-    let r = mem.request("r", plan(&[&["q"]])).unwrap();
-    step!();
-    let pass = r.pass(s, "main", "1", Torch::default()).unwrap();
-    step!();
-    let first = std::time::Instant::now();
-    let pin = mem.bind(s, 0, x.raw()).unwrap();
-    let first = first.elapsed();
-    step!();
-    let gate = Gate::hold(x.raw());
-    step!();
-    assert_eq!(launch(c"copy", &[out.ptr(), pin.ptr, REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
-    step!();
-    let (unmaps, destroys) = (timings.count("unmap"), timings.count("destroy"));
-    step!();
-    timings.fail_record(x.raw());
-    step!();
-    drop(pin);
-    step!();
-    let mut gate = Some(gate);
-    // The quarantine, watched: nothing after it may wait for the queued copy, but if it does the gate opens.
-    let (refused, waited) = std::thread::scope(|t| {
-        let (refused, waited) = watch(t, first, || {
-            let refused = mem.bind(s, 0, 0).err();
-            drop(pass);
-            drop(r);
-            mem.unload(s);
-            drop(mem);
-            refused
-        });
-        if waited != Waited::Returned {
-            gate.take();
-        }
-        (refused.join().unwrap(), waited)
-    });
-    step!();
-    assert!(matches!(refused, Some(Error::Ownership(_))), "a bind after an unproven release: {refused:?}");
-    step!();
-    gate.take();
-    step!();
-    x.drain().unwrap();
-    step!();
-    assert!(bytes(out.ptr(), REGION_ALIGN, 0) == *block(80, 0), "the consumer read other bytes than the page's");
-    step!();
-    assert_eq!((timings.count("unmap"), timings.count("destroy")), (unmaps, destroys), "a page whose completion is unknown was unmapped or freed");
-    step!();
-    println!("RECORD after the failure, the bind, the request's end, the unload and Memory's drop: {waited:?}");
-    step!();
-    println!("PASS a failed completion record quarantines the page and nothing reuses it ({refused:?}) {uuid}");
-    step!();
-}
-
-/// S3's ILLEGAL_ADDRESS (gpu12): a Keep (the protect of a filled page to read-only, on the mechanism thread) ran while
-/// the page's pin was handed out and its kernels read it. Here the baker marks its page filled while it still holds the
-/// pin and a kernel sweeps the page for ten times the first bind. No fault, the sweep reads the baked bytes throughout,
-/// and the page is protected only after the pin is dropped, which is after the sweep has ended.
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_keep_protects_a_page_only_after_its_pin_and_the_kernels_reading_it_end() {
-    let (b, g, uuid) = card("keep");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let (mem, timings) = timed_memory(b, &g);
-    step!();
-    let t = mem.load(set("t", 1, Fill::Declared("bake-1".into()), &g.uuid, |b| block(90, b)), Level::Ram).unwrap();
-    step!();
-    let r = mem.request("r", plan(&[&["t"]])).unwrap();
-    step!();
-    let pass = r.pass(t, "main", "1", Torch::default()).unwrap();
-    step!();
-    let x = cuda::Stream::new(0).unwrap();
-    step!();
-    let (baked, out) = (device(&block(91, 0)), io::DeviceBuffer::new(0, 16).unwrap());
-    step!();
-    let first = std::time::Instant::now();
-    let pin = mem.bind(t, 0, x.raw()).unwrap();
-    let first = first.elapsed();
-    step!();
-    assert!(pin.fresh, "the caller bakes it");
-    step!();
-    assert_eq!(launch(c"copy", &[pin.ptr, baked.ptr(), REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
-    step!();
-    let long = first * 10;
-    step!();
-    assert_eq!(launch(c"sweep", &[pin.ptr, REGION_ALIGN / 8, long.as_nanos() as u64, out.ptr()], x.raw()), cuda::SUCCESS);
-    step!();
-    let protects = timings.protects.lock().len();
-    step!();
-    // The Keep is queued now, with the pin held and the sweep running.
-    pin.filled();
-    step!();
-    let swept = x.drain();
-    step!();
-    let unpinned = std::time::Instant::now();
-    drop(pin);
-    step!();
-    swept.unwrap();
-    step!();
-    let read = bytes(out.ptr(), 16, 0);
-    step!();
-    let (acc, passes) = (u64::from_ne_bytes(read[..8].try_into().unwrap()), u64::from_ne_bytes(read[8..].try_into().unwrap()));
-    step!();
-    let once = block(91, 0).chunks(8).fold(0u64, |a, w| a ^ u64::from_ne_bytes(w.try_into().unwrap()));
-    step!();
-    assert_eq!(acc, if passes % 2 == 1 { once } else { 0 }, "the sweep read other bytes than the bake's ({passes} passes)");
-    step!();
-    while timings.protects.lock().len() == protects {
-        // The Keep runs on the mechanism thread once the page is free of pins and consumers.
-        let _ = mem.torch_limit();
-    }
-    let (start, end) = timings.protects.lock()[protects];
-    step!();
-    assert!(start >= unpinned, "the page was protected {:?} while its pin was held", unpinned - start);
-    step!();
-    pass.end(Measured::default(), Torch::default());
-    step!();
-    assert_eq!(r.end().leftover, 0);
-    step!();
-    println!("KEEP protect {:?} after the unpin, for {:?}; the sweep {passes} passes over {long:?}", start - unpinned, end - start);
-    step!();
-    println!("PASS a keep protects a page only after its pin and the kernels reading it end {uuid}");
-    step!();
-}
-
-/// A pass of `m` measured at one page (on the empty card), before its activation grew: an unmeasured pass would take
-/// every idle byte before it runs and never meet an OOM.
-fn measured_small(mem: &Memory, m: SetId) {
-    let r = mem.request("seed", plan(&[&["m"]])).unwrap();
-    step!();
-    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
-    step!();
-    pass.end(Measured { allocated_peak: REGION_ALIGN, slack: 0, sites: vec![] }, Torch::default());
-    step!();
-    assert_eq!(r.end().leftover, 0);
-    step!();
-}
-
-/// The native allocator's protocol (tensorfs-py's allocator.rs) on raw driver calls, under `torch` (torch's allocator
-/// lock, holding the bytes its segments hold): a segment is admitted against Memory's allocator limit and cut with
-/// cuMemAlloc. Past the limit, or on a real OOM, the callback (`reclaim_allocation`) runs inside the lock, and the
-/// allocation retries while each try finds the state changed and the callback reclaimed something. None: refused.
-fn segment(mem: &Memory, r: &Request, set: SetId, torch: &parking_lot::Mutex<u64>, size: u64, callbacks: &Timings) -> Option<(u64, varena::memory::Resident)> {
-    let mut held = torch.lock();
-    let d = cuda::driver().unwrap();
-    let mut last = None;
-    loop {
-        let limit = mem.allocator_limit()?;
-        if *held + size <= limit {
-            let change = mem.physical_change();
-            let mut ptr = 0;
-            let rc = unsafe { (d.mem_alloc)(&mut ptr, size as usize) };
-            if rc == cuda::SUCCESS {
-                let resident = mem.resident(size);
-                change.finish();
-                *held += size;
-                return Some((ptr, resident));
-            }
-            assert_eq!(rc, cuda::ERROR_OUT_OF_MEMORY, "cuMemAlloc");
-            change.finish();
-        }
-        if last == Some((*held, limit)) {
-            return None;
-        }
-        last = Some((*held, limit));
-        let torch_now = Torch { allocated: *held, reserved: *held };
-        if callbacks.time("reclaim_allocation", || r.reclaim_allocation(Some(set), size, torch_now)).unwrap_or(0) == 0 {
-            return None;
-        }
-    }
-}
-
-/// Frees a segment as the native allocator's worker does: after its stream's work, outside the allocator lock, then
-/// gives its bytes back to the lock's count.
-fn unsegment(torch: &parking_lot::Mutex<u64>, (ptr, resident): (u64, varena::memory::Resident), size: u64) {
-    assert_eq!(unsafe { (cuda::driver().unwrap().mem_free)(ptr) }, cuda::SUCCESS, "cuMemFree");
-    drop(resident);
-    *torch.lock() -= size;
-}
-
-/// Review 6 F4: the allocator callback unmaps and releases idle pages (cuMemUnmap, cuMemRelease) inside torch's
-/// allocator lock. Two threads allocate as the native allocator does, under one lock, on a card capped at 1 GiB (a
-/// small card: a few segments reach its limit). A keeps its segments, so past the limit each of its allocations runs
-/// the callback. B allocates, writes and frees. Meanwhile an unrelated stream is gated and a kernel reads a pinned page.
-/// Pass conditions:
-/// - Neither thread waits on the gated stream: no deadlock.
-/// - Nothing faults, and the pinned page is never taken.
-/// - The bytes reconcile: the callbacks unmapped exactly the idle pages, and the driver got their bytes back.
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated_device_work() {
-    let (b, g, uuid) = card("callback");
-    step!();
-    // 1 GiB: a card small enough that a few segments reach its allocator limit.
-    let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
-    let (mem, timings) = timed_memory(b, &g);
-    step!();
-    let pages = 64;
-    let idle = mem.load(bulk("idle", pages, &g.uuid), Level::Ram).unwrap();
-    step!();
-    let w = mem.load(set("w", 1, Fill::Stored, &g.uuid, |b| block(95, b)), Level::Ram).unwrap();
-    step!();
-    let r = mem.request("r", plan(&[&["idle", "w"]])).unwrap();
-    step!();
-    // The idle set mapped and released: complete, never-kept pages the callback may take.
-    let mut warm = std::time::Duration::ZERO;
-    for p in 0..pages {
-        let t = std::time::Instant::now();
-        drop(mem.bind(idle, p, 0).unwrap());
-        warm = warm.max(t.elapsed());
-    }
-    step!();
-    let (x, y, gated) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
-    step!();
-    let pinned = mem.bind(w, 0, x.raw()).unwrap();
-    step!();
-    let out = io::DeviceBuffer::new(0, 16).unwrap();
-    step!();
-    let sweep = warm * pages * 10;
-    assert_eq!(launch(c"sweep", &[pinned.ptr, REGION_ALIGN / 8, sweep.as_nanos() as u64, out.ptr()], x.raw()), cuda::SUCCESS);
-    step!();
-    let _ = mem.torch_limit();
-    step!();
-    let (start_free, start_limit, unmaps) = (driver_free(), mem.allocator_limit().unwrap(), timings.count("unmap"));
-    step!();
-    let mut gate = Some(Gate::hold(gated.raw()));
-    step!();
-    let torch = parking_lot::Mutex::new(0u64);
-    let callbacks = Timings::default();
-    let (calls, longest, done) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(warm.as_nanos() as u64), std::sync::atomic::AtomicBool::new(false));
-    // Where each thread is: 0 between calls, 1 allocating (the allocator lock's path), 2 writing, 3 freeing.
-    let phase = [std::sync::atomic::AtomicU8::new(0), std::sync::atomic::AtomicU8::new(0)];
-    let at = |thread: usize, where_: u8| phase[thread].store(where_, std::sync::atomic::Ordering::Release);
-    let timed = |t: std::time::Instant| {
-        calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        longest.fetch_max(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::AcqRel);
-    };
-    let (kept, churned, waited) = std::thread::scope(|s| {
-        let a = s.spawn(|| {
-            let (_, ctx) = cuda::primary_context(0).unwrap();
-            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
-            let mut kept = vec![];
-            // One segment up to near the limit, then a page's worth at a time: each past it runs the callback.
-            let near = mem.allocator_limit().unwrap().saturating_sub(2 * REGION_ALIGN);
-            let t = std::time::Instant::now();
-            at(0, 1);
-            kept.extend(segment(&mem, &r, idle, &torch, near, &callbacks).map(|seg| (seg, near)));
-            at(0, 0);
-            timed(t);
-            loop {
-                let t = std::time::Instant::now();
-                at(0, 1);
-                let got = segment(&mem, &r, idle, &torch, REGION_ALIGN, &callbacks);
-                at(0, 0);
-                timed(t);
-                let Some(seg) = got else { break };
-                kept.push((seg, REGION_ALIGN));
-            }
-            done.store(true, std::sync::atomic::Ordering::Release);
-            kept
-        });
-        let b = s.spawn(|| {
-            let (_, ctx) = cuda::primary_context(0).unwrap();
-            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
-            let d = cuda::driver().unwrap();
-            let mut churned = (0u64, 0u64);
-            while !done.load(std::sync::atomic::Ordering::Acquire) {
-                let t = std::time::Instant::now();
-                at(1, 1);
-                match segment(&mem, &r, idle, &torch, REGION_ALIGN, &callbacks) {
-                    Some(seg) => {
-                        at(1, 2);
-                        assert_eq!(unsafe { (d.memset_d8_async)(seg.0, 9, REGION_ALIGN as usize, y.raw() as cuda::CUstream) }, cuda::SUCCESS);
-                        y.drain().unwrap();
-                        at(1, 3);
-                        unsegment(&torch, seg, REGION_ALIGN);
-                        churned.0 += 1;
-                    }
-                    None => churned.1 += 1,
-                }
-                at(1, 0);
-                timed(t);
-            }
-            churned
-        });
-        // Looks every interval of the longest call so far: two with no call done mean a thread waits, and where each
-        // thread is says on what. Then the gate opens, so the case ends either way.
-        let (mut seen, mut quiet, mut waited) = (0, 0, None);
-        while !(a.is_finished() && b.is_finished()) {
-            std::thread::sleep(std::time::Duration::from_nanos(longest.load(std::sync::atomic::Ordering::Acquire)));
-            let now = calls.load(std::sync::atomic::Ordering::Acquire);
-            quiet = if now == seen { quiet + 1 } else { 0 };
-            seen = now;
-            if quiet == 2 && gate.is_some() {
-                waited = Some([0, 1].map(|t| phase[t].load(std::sync::atomic::Ordering::Acquire)));
-                gate.take();
-            }
-        }
-        (a.join().unwrap(), b.join().unwrap(), waited)
-    });
-    step!();
-    gate.take();
-    step!();
-    let (sx, sy, sg) = (x.drain(), y.drain(), gated.drain());
-    step!();
-    for (seg, size) in kept {
-        unsegment(&torch, seg, size);
-    }
-    step!();
-    let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
-    step!();
-    let (gained, raised) = (driver_free().saturating_sub(start_free), mem.allocator_limit().unwrap().saturating_sub(start_limit));
-    step!();
-    println!("CALLBACK {} callbacks ({}); B churned {} segments, refused {}; unmapped {unmapped} B; driver gained {gained} B, allocator limit raised {raised} B; waited on the gated stream (phases A, B: 1 allocating, 2 writing, 3 freeing): {waited:?}",
-        callbacks.count("reclaim_allocation"), callbacks.report(), churned.0, churned.1);
-    step!();
-    // A free (cuMemFree, outside the lock, as the allocator's worker does) may wait for the device; the allocator
-    // lock's path may not.
-    assert!(!waited.is_some_and(|p| p.contains(&1)), "an allocation waited for the gated stream, inside the allocator lock: {waited:?}");
-    step!();
-    sx.unwrap();
-    sy.unwrap();
-    sg.unwrap();
-    step!();
-    assert!(callbacks.count("reclaim_allocation") > 0 && unmapped > 0, "the callback reclaimed idle pages");
-    step!();
-    assert!(exact(&pinned, &block(95, 0), 0), "the pinned page was never taken");
-    step!();
-    // The idle pages are what the callbacks took, and the driver has their bytes back (to the page: the driver keeps
-    // its own small allocations).
-    assert!(unmapped <= u64::from(pages) * REGION_ALIGN);
-    step!();
-    assert!(gained.abs_diff(unmapped) <= REGION_ALIGN, "the driver gained {gained} B for {unmapped} B unmapped");
-    step!();
-    drop(pinned);
-    step!();
-    assert_eq!(r.end().leftover, 0);
-    step!();
-    println!("PASS the allocator callback reclaims inside its lock without waiting for unrelated device work {uuid}");
-    step!();
-}
-
-/// A pass of `m` (two pinned blocks), measured smaller than its one-gibibyte activation, which meets a real OOM:
-/// the card is crowded and the rest full of an idle set. Returns the OOM answers and the record.
+/// A pass of `m` (two pinned blocks) whose one-gibibyte activation meets a real OOM: the card is
+/// crowded and the rest full of an idle set. Returns the OOM answers and the record.
 fn first_run(mem: &Memory, m: SetId, idle: u32) -> (Vec<String>, Stats) {
     let r = mem.request("first", plan(&[&["m"]])).unwrap();
     step!();
@@ -2428,7 +1548,6 @@ fn an_oom_in_a_pass_is_recovered_in_process() {
     step!();
     let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(3, b)), Level::Ram).unwrap();
     step!();
-    measured_small(&mem, m);
     let _crowd = crowd();
     let idle = more_than_free();
     step!();
@@ -2456,7 +1575,6 @@ fn a_measured_pass_gets_its_room_before_it_runs() {
     step!();
     let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(3, b)), Level::Ram).unwrap();
     step!();
-    measured_small(&mem, m);
     let _crowd = crowd();
     let idle = more_than_free();
     step!();
@@ -2507,7 +1625,7 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
     step!();
     let source = Arc::new(Source::files(vec![], false, 0));
     step!();
-    // To the GPU: it maps only into free bytes, so the page is never filled (the RAM tier would be).
+    // To the GPU: it maps only into free bytes, so the page is never filled.
     let huge = mem.load(SetSpec { name: "huge".into(), layout: Arc::new(layout), source, fingerprint }, Level::Gpu).unwrap();
     step!();
     io::metrics::take();
@@ -2529,7 +1647,7 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
     step!();
     let stats = r.end();
     step!();
-    assert_eq!((stats.leftover, stats.moved.store.bytes + stats.moved.tier.bytes), (0, 0), "{stats:?}");
+    assert_eq!((stats.leftover, stats.moved.store.bytes), (0, 0), "{stats:?}");
     step!();
     let m = mem.load(set("m", 1, Fill::Stored, &g.uuid, |b| block(4, b)), Level::Ram).unwrap();
     step!();
@@ -2563,13 +1681,12 @@ fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_ro
     step!();
     mem.load(set("idle", 1, Fill::Stored, &g.uuid, |b| block(6, b)), Level::Gpu).unwrap();
     step!();
-    // Everything else on the card is an allocation varena cannot free; then the pass starts. An unmeasured pass takes
-    // every idle byte before it runs, so a fill after it would take the room the idle page gave.
-    let full = Pressure::fill(64 << 10);
-    step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
     let pass = r.pass(m, "k").unwrap();
+    step!();
+    // Everything else on the card is an allocation varena cannot free.
+    let full = Pressure::fill(64 << 10);
     step!();
     let first = mem.bind(m, 0, 0).expect("the idle page makes room");
     step!();
@@ -2690,43 +1807,6 @@ fn a_transform_binds_another_set_under_pressure_and_a_second_binder_waits_for_it
     step!();
 }
 
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_ram_level_set_binds_from_the_tier() {
-    let (b, g, uuid) = card("tier");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let mem = memory(b, &g);
-    step!();
-    let s = mem.load(set("t", 4, Fill::Stored, &g.uuid, |b| block(9, b)), Level::Ram).unwrap();
-    step!();
-    let r = mem.request("r", plan(&[&["t"]])).unwrap();
-    step!();
-    let pass = r.pass(s, "k").unwrap();
-    step!();
-    let pins: Vec<Pin> = (0..4).map(|b| mem.bind(s, b, 0).unwrap()).collect();
-    step!();
-    for (b, pin) in pins.iter().enumerate() {
-        assert!(exact(pin, &block(9, b as u32), 0));
-    }
-    drop(pins);
-    step!();
-    pass.end(0);
-    step!();
-    let stats = r.end();
-    step!();
-    let origins: Vec<String> = stats.trace.iter().map(|t| format!("{:?}", t.origin)).collect();
-    step!();
-    assert_eq!(stats.moved.tier.bytes, 4 * REGION_ALIGN, "{origins:?}");
-    step!();
-    let gbps = stats.moved.tier.bytes as f64 / stats.moved.tier.ns.max(1) as f64;
-    step!();
-    println!("FILLS tier {gbps:.2} GB/s ({origins:?})");
-    step!();
-    println!("PASS a RAM-level set binds from the tier {uuid}");
-    step!();
-}
-
 /// A request's trace as `trace` reports it (`Kept,Kept,Hit,...`): its load's fills, then its
 /// binds. How many of each origin.
 fn origins(trace: &str) -> std::collections::BTreeMap<&str, usize> {
@@ -2758,7 +1838,6 @@ fn role_agent() {
     let mut pins: Vec<Pin> = vec![];
     let mut crowded: Vec<Pressure> = vec![];
     let mut timings: Option<Arc<Timings>> = None;
-    let mut loaded = std::time::Duration::ZERO;
     step!();
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
@@ -2782,12 +1861,7 @@ fn role_agent() {
                     other => Fill::Declared(other.into()),
                 };
                 let level = if *level == "gpu" { Level::Gpu } else { Level::Ram };
-                let spec = set(name, blocks, fill, &uuid, |b| bytes_of(seed, b));
-                timings.as_ref().unwrap().take_fills();
-                let started = std::time::Instant::now();
-                let out = m().load(spec, level);
-                loaded = started.elapsed();
-                match out {
+                match m().load(set(name, blocks, fill, &uuid, |b| bytes_of(seed, b)), level) {
                     Ok(id) => {
                         sets.insert(name.to_string(), id);
                         "ok".into()
@@ -2847,10 +1921,7 @@ fn role_agent() {
                 crowded.push(crowd());
                 "ok".into()
             }
-            ["timings"] => {
-                let t = timings.as_ref().unwrap();
-                format!("ok {} | backend {} | driver {}", split(loaded, CALLS.total(), t.take_fills()), t.report(), CALLS.report())
-            }
+            ["timings"] => format!("ok backend {} | driver {}", timings.as_ref().unwrap().report(), CALLS.report()),
             ["unpin"] => {
                 pins.clear();
                 "ok".into()
@@ -2864,7 +1935,7 @@ fn role_agent() {
             ["end", req] => {
                 passes.remove(*req);
                 let s = requests.remove(*req).unwrap().end();
-                format!("ok leftover={} kept={} tier={} store={}", s.leftover, s.moved.kept.bytes, s.moved.tier.bytes, s.moved.store.bytes)
+                format!("ok leftover={} kept={} store={}", s.leftover, s.moved.kept.bytes, s.moved.store.bytes)
             }
             // A sticky error ends the process: no destructor runs against its context.
             ["exit"] => std::process::exit(0),
@@ -2975,10 +2046,11 @@ fn a_kept_set_is_imported_after_its_holders_kill_9_and_another_fill_refills() {
     let trace = s.ok("trace r");
     step!();
     let n = origins(&trace);
-    // The orphans' blocks bind as hits on the imported pages; the rest come from the tier the load filled.
+    // The orphans' blocks bind as hits on the imported pages; the rest fill from the store (the
+    // load read it into the page cache).
     let some = |k: usize| (k > 0).then_some(k);
     assert_eq!(
-        (n.get("Kept").copied(), n.get("Hit").copied(), n.get("Tier").copied()),
+        (n.get("Kept").copied(), n.get("Hit").copied(), n.get("Store").copied()),
         (Some(kept), Some(kept), some(4 - kept)),
         "every orphan imported at load, never copied: {trace}"
     );
@@ -3066,13 +2138,13 @@ fn kept_pages_survive_a_holder_that_served() {
     let trace = b.ok("trace r");
     step!();
     let n = origins(&trace);
-    assert_eq!((n.get("Kept").copied(), n.get("Hit").copied(), n.get("Store"), n.get("Tier")), (Some(3), Some(3), None, None), "every page kept, none copied: {trace}");
+    assert_eq!((n.get("Kept").copied(), n.get("Hit").copied(), n.get("Store")), (Some(3), Some(3), None), "every page kept, none copied: {trace}");
     step!();
     b.ok("unpin");
     step!();
     let end = b.ok("end r");
     step!();
-    assert!(end.contains("tier=0 store=0"), "{end}");
+    assert!(end.contains("store=0"), "{end}");
     step!();
     b.exit();
     println!("PASS kept pages survive a holder that served {uuid}");
@@ -3118,73 +2190,6 @@ fn binds_outlive_the_custody_holder() {
     drop(Ledger::create(&g, None).unwrap());
     step!();
     println!("PASS binds outlive the custody holder {uuid}");
-    step!();
-}
-
-/// Under a pressure event with a measured shortfall, a RAM-tier layout an executor maps and has page-locked with the
-/// card (`register_host`), its device pin held throughout, is asked back first: the executor unlocks and unmaps it, then
-/// the tier punches its regions out, so their bytes really return; the other layout goes next. The executor goes on
-/// from the store. (Host version: processes::the_tier_takes_back_a_pinned_layout.)
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn the_tier_takes_back_a_pinned_layout() {
-    use std::os::fd::FromRawFd;
-    let (ledger, g, uuid) = tensord("pinned");
-    step!();
-    // SAFETY: eventfd(2) with no shared state; the descriptor is ours.
-    let event = unsafe { platform::handles::Owned::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
-    step!();
-    let signal = event.try_clone().unwrap();
-    step!();
-    // What running calls keep free: nothing, until a measured shortfall (more than the host has) asks the tier to give
-    // back. An unmeasured need neither fills nor drains it.
-    let short = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let demand = short.clone();
-    let tier = varena::Tier::serve(varena::Pressure::Events(event), Arc::new(move ||
-        Some(if demand.load(std::sync::atomic::Ordering::Acquire) { u64::MAX / 2 } else { 0 })
-    )).unwrap().expect("no other participant serves this user's RAM tier");
-    step!();
-    let digest = |n: &str| format!("{n}-2-{}", g.uuid);
-    step!();
-    let resident = |d: &str| tier.resident().into_iter().find(|(k, _)| *k == d).map_or(0, |(_, b)| b);
-    step!();
-    let mut y = Agent::spawn();
-    step!();
-    y.ok(&format!("open {}", g.uuid));
-    step!();
-    y.ok("load p1 2 17 stored ram");
-    step!();
-    y.ok("load p2 2 18 stored ram");
-    step!();
-    // A device page filled from the tier: the region is mapped and page-locked in y.
-    assert_eq!(y.ok("exact p1 0 17"), "true");
-    step!();
-    assert!(resident(&digest("p1")) >= 2 * REGION_ALIGN && resident(&digest("p2")) >= 2 * REGION_ALIGN);
-    step!();
-    // A measured shortfall; the event asks the tier to give back until the host has room.
-    short.store(true, std::sync::atomic::Ordering::Release);
-    // SAFETY: an 8-byte write to our eventfd.
-    unsafe { libc::write(signal.as_raw_fd(), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
-    step!();
-    // Each layout's file keeps its ready words' page after a release: its regions are what return.
-    tier.await_releases(1);
-    step!();
-    assert!(resident(&digest("p1")) < REGION_ALIGN, "the pinned layout's regions returned first: {}", resident(&digest("p1")));
-    step!();
-    assert_eq!(tier.acked(), 2 * REGION_ALIGN, "y unlocked the run it had page-locked (both ready regions) when asked");
-    step!();
-    tier.await_releases(2);
-    step!();
-    assert!(resident(&digest("p2")) < REGION_ALIGN, "the shortfall takes the other cached layout next: {}", resident(&digest("p2")));
-    step!();
-    assert_eq!(y.ok("exact p1 1 17"), "true", "y goes on from the store");
-    step!();
-    y.ok("unpin");
-    step!();
-    y.exit();
-    drop(ledger);
-    step!();
-    println!("PASS the tier takes back a pinned layout ({} bytes acked) {uuid}", tier.acked());
     step!();
 }
 
@@ -3293,13 +2298,13 @@ fn a_stray_write_to_a_kept_page_ends_only_its_writer() {
     let trace = next.ok("trace r");
     step!();
     let n = origins(&trace);
-    assert_eq!((n.get("Kept").copied(), n.get("Hit").copied(), n.get("Store"), n.get("Tier")), (Some(2), Some(2), None, None), "both pages imported at load: {trace}");
+    assert_eq!((n.get("Kept").copied(), n.get("Hit").copied(), n.get("Store")), (Some(2), Some(2), None), "both pages imported at load: {trace}");
     step!();
     next.ok("unpin");
     step!();
     let end = next.ok("end r");
     step!();
-    assert!(end.contains("tier=0 store=0"), "the kept pages came back, none copied: {end}");
+    assert!(end.contains("store=0"), "the kept pages came back, none copied: {end}");
     step!();
     next.exit();
     println!("PASS a stray write to a kept page ends only its writer (fault {fault}; next process {trace}) {uuid}");

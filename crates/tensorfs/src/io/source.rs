@@ -3,11 +3,11 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::{AcqRel, Relaxed}};
 use std::sync::{Arc, Mutex};
 
 pub use super::{ItemSource, ObjectRange};
-use super::{Copy, Dst, ReadOpts, ReadStats, Src};
+use super::{Copy, Dst, Issued, ReadOpts, ReadStats, Src};
 use crate::failure::{Failure, Kind};
 use crate::format::ObjectRef;
 
@@ -128,6 +128,33 @@ impl Source {
         Ok(platform::durable::cached(&file, 0, obj.length).unwrap_or(false))
     }
 
+    /// Asks the kernel to read `items`' object bytes into the page cache ahead of their fills
+    /// (`POSIX_FADV_WILLNEED`, Linux; elsewhere nothing): host RAM is the page cache. Best effort.
+    pub fn readahead(&self, items: &[Item]) -> Result<()> {
+        #[cfg(feature = "store")]
+        {
+            let objects: std::collections::BTreeMap<_, _> = items.iter().filter_map(|i| match &i.source {
+                ItemSource::Object(range) => Some((range.obj.sha256.clone(), range.obj.clone())),
+                ItemSource::Inline(_) => None,
+            }).collect();
+            self.load(&objects.into_values().collect::<Vec<_>>())?;
+        }
+        for item in items {
+            if let ItemSource::Object(range) = &item.source {
+                let file = self.file(&range.obj)?;
+                #[cfg(target_os = "linux")]
+                // SAFETY: advice on a descriptor this source holds open.
+                unsafe {
+                    use std::os::fd::AsRawFd;
+                    libc::posix_fadvise(file.as_raw_fd(), range.off as libc::off_t, range.len as libc::off_t, libc::POSIX_FADV_WILLNEED);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = file;
+            }
+        }
+        Ok(())
+    }
+
     /// Transfer a placement range. Uncovered padding is zeroed through the same engine.
     ///
     /// # Safety
@@ -143,12 +170,14 @@ impl Source {
     ) -> Result<ReadStats> {
         // SAFETY: inherited from caller.
         unsafe {
-            self.read_placements(&[Placement { items, origin, dst }], threads, mode, tally)
+            self.read_placements(&[Placement { items, origin, dst }], threads, mode, tally, None)
         }
     }
 
     /// Transfer many placement ranges in one engine read, so it pipelines across all of them.
-    /// Uncovered padding is zeroed through the same engine.
+    /// Uncovered padding is zeroed through the same engine. `issued` hears of each device
+    /// placement (its index and the engine's streams) once all its copies are issued, before
+    /// the read returns.
     ///
     /// # Safety
     /// Each `dst` is exclusively writable for its length; its selected item ranges lie inside it.
@@ -160,6 +189,7 @@ impl Source {
         threads: usize,
         mode: Mode,
         tally: &IoTally,
+        issued: Option<Issued>,
     ) -> Result<ReadStats> {
         #[cfg(feature = "store")]
         {
@@ -186,8 +216,10 @@ impl Source {
             }
         }
         let mut copies = Vec::new();
+        // Each copy's placement.
+        let mut of = Vec::new();
         let mut inline = 0;
-        for &Placement { items, origin, dst } in placements {
+        for (p, &Placement { items, origin, dst }) in placements.iter().enumerate() {
             // Each placement's copies in destination order, gaps included, so contiguous runs
             // merge (`coalesce`).
             let mut ordered: Vec<(u64, Copy)> = Vec::with_capacity(items.len() + 1);
@@ -253,16 +285,34 @@ impl Source {
                 }));
             }
             ordered.sort_by_key(|(at, _)| *at);
+            of.resize(of.len() + ordered.len(), p);
             copies.extend(ordered.into_iter().map(|(_, c)| c));
         }
-        let copies = super::coalesce(copies);
+        let (copies, firsts) = super::coalesce(copies);
+        // Each run's placements, and the runs each placement waits for.
+        let runs: Vec<Vec<usize>> = (0..firsts.len())
+            .map(|r| {
+                let mut ps = of[firsts[r]..firsts.get(r + 1).copied().unwrap_or(of.len())].to_vec();
+                ps.dedup();
+                ps
+            })
+            .collect();
+        let left: Vec<AtomicUsize> = (0..placements.len()).map(|_| AtomicUsize::new(0)).collect();
+        runs.iter().flatten().for_each(|&p| _ = left[p].fetch_add(1, Relaxed));
+        let run_issued = |r: usize, streams: &[usize]| {
+            for &p in &runs[r] {
+                if left[p].fetch_sub(1, AcqRel) == 1 {
+                    issued.expect("only asked with a listener")(p, streams);
+                }
+            }
+        };
         let opts = ReadOpts {
             threads,
             direct: self.direct_io && mode == Mode::Cache,
             ..ReadOpts::default()
         };
         // SAFETY: item ranges and destination bounds checked above; caller supplies exclusivity.
-        let mut stats = unsafe { super::read_staged(&copies, &opts) }?;
+        let mut stats = unsafe { super::read_staged(&copies, &opts, issued.map(|_| &run_issued as Issued)) }?;
         stats.bytes = placements
             .iter()
             .flat_map(|p| p.items)

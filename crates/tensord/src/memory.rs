@@ -2,23 +2,25 @@
 //! has a [`Ledger`] (capacity min(card, `gpu_memory_limit`)): an executor is granted it at spawn,
 //! its row is reaped once its exit is proven, and admission is [`admit`] (`Ledger::admit`: a
 //! group on all of its GPUs or none, waiting while refused). TensorD holds no byte count and
-//! decides no eviction: kept-page custody runs inside the ledger and the RAM tier ([`Tier`]) in
-//! this process. One thread blocks on every ledger's events and the tier's host-short event.
+//! decides no eviction: kept-page custody runs inside the ledger. Host RAM is the OS page cache;
+//! [`Host`] watches what the running calls must keep free of it. One thread blocks on every
+//! ledger's events and the host's short event.
 use crate::{execution::Engine, machine::receipt};
-use platform::contain::host_pressure::{self, HostMode};
+use platform::contain::host_memory;
+use platform::contain::host_pressure::{self, Growth, HostMode, Nudge};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::{AsRawFd, RawFd},
         unix::net::UnixStream,
     },
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use varena::{ledger::Mode, GpuId, Ledger, Need, Peak, Tier};
+use varena::{ledger::Mode, GpuId, HostCall, Ledger, Peak};
 
 /// Past this the memory log rotates to `memory.log.1`, so it holds at most twice this.
 const ROTATE_BYTES: u64 = 4 << 20;
@@ -154,21 +156,21 @@ impl Peaks {
 pub enum Woke {
     /// A ledger: room freed, a row died, a peak was recorded.
     Ledger,
-    /// The RAM tier gave back all it may and the host is still short.
+    /// The host is short of what its running calls must keep free ([`Host`]).
     HostShort,
 }
 
-/// A source the events thread waits on: a ledger's events, or the RAM tier's host-short event.
+/// A source the events thread waits on: a ledger's events, or the host's short event.
 pub enum Source {
     Ledger(Arc<Gpu>),
-    Tier(Arc<Tier>),
+    Host(Arc<Host>),
 }
 
 impl Source {
-    fn fd(&self) -> &OwnedFd {
+    fn fd(&self) -> RawFd {
         match self {
-            Source::Ledger(gpu) => gpu.ledger.events(),
-            Source::Tier(tier) => tier.short(),
+            Source::Ledger(gpu) => gpu.ledger.events().as_raw_fd(),
+            Source::Host(host) => host.short.as_raw_fd(),
         }
     }
 
@@ -179,8 +181,8 @@ impl Source {
                 gpu.ledger.clear_events();
                 Woke::Ledger
             }
-            Source::Tier(tier) => {
-                let _ = tier.await_short();
+            Source::Host(host) => {
+                host.short();
                 Woke::HostShort
             }
         }
@@ -192,7 +194,7 @@ impl Source {
 pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::Result<UnixStream> {
     let (held, end) = UnixStream::pair()?;
     std::thread::Builder::new().name("memory-events".into()).spawn(move || {
-        let watched = std::iter::once(end.as_raw_fd()).chain(sources.iter().map(|source| source.fd().as_raw_fd()));
+        let watched = std::iter::once(end.as_raw_fd()).chain(sources.iter().map(Source::fd));
         let mut fds: Vec<libc::pollfd> = watched.map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
         loop {
             // SAFETY: poll on descriptors this thread owns; no timeout.
@@ -223,20 +225,124 @@ pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::
     Ok(held)
 }
 
-/// The machine's RAM tier, served from this process while it lives: on the host's pressure
-/// events (the platform's PSI trigger, else the cgroup's memory events), else, with no event
-/// source at all, only at its headroom check at every host decision (a memory-log note says
-/// so). None when another participant serves it.
-pub fn serve_tier(mode: HostMode, need: Need, log: &MemoryLog) -> Option<Arc<Tier>> {
-    let pressure = host_pressure::Pressure::arm(mode)
-        .inspect_err(|error| log.note(serde_json::json!({"event": "tier_headroom_only", "mode": format!("{mode:?}"), "why": error.to_string()})))
-        .ok();
-    match Tier::serve(pressure, need) {
-        Ok(tier) => tier.map(Arc::new),
-        Err(error) => {
-            log.note(serde_json::json!({"event": "no_tier", "why": error.to_string()}));
-            None
+/// The host rule (#1851) on the platform's watcher: each pressure event, or a nudge (TensorD's
+/// own events, where the kernel gives none), is a look. What the calls running on these GPUs
+/// must keep free, each process's measured anonymous peak less its anonymous bytes now plus
+/// the growth seen past it ([`Growth`]), against the live budget, page cache counted as room.
+/// Short, the events thread hears it ([`Woke::HostShort`]): the pool ends one idle process, and
+/// the next event looks again. No timer.
+pub struct Host {
+    short: UnixStream,
+    nudge: Nudge,
+    /// Looks begun and made so far, and a signal for each made.
+    looks: Arc<(Mutex<(u64, u64)>, std::sync::Condvar)>,
+}
+
+impl Host {
+    /// Watches while the process lives; None (a memory-log note says why) where the platform
+    /// gives no pressure events.
+    pub fn watch(mode: HostMode, gpus: Vec<Arc<Gpu>>, log: &MemoryLog) -> Option<Arc<Host>> {
+        let armed = host_pressure::Pressure::arm(mode).and_then(|pressure| {
+            let (short, signal) = UnixStream::pair()?;
+            short.set_nonblocking(true)?;
+            Ok((pressure, (short, signal)))
+        });
+        let (mut pressure, (short, mut signal)) = armed
+            .inspect_err(|error| log.note(serde_json::json!({"event": "host_unwatched", "mode": format!("{mode:?}"), "why": error.to_string()})))
+            .ok()?;
+        let (nudge, looks) = (pressure.nudge(), Arc::new((Mutex::new((0, 0)), std::sync::Condvar::new())));
+        let looked = looks.clone();
+        let watching = std::thread::Builder::new().name("host-pressure".into()).spawn(move || {
+            let mut keep = Keep::default();
+            while pressure.wait().is_ok() {
+                looked.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+                let need = keep.look(gpus.iter().map(|gpu| gpu.ledger.host_calls()).collect::<Option<Vec<_>>>().map(|calls| calls.concat()));
+                let budget = u64::try_from(host_memory::read().available).unwrap_or(u64::MAX);
+                if budget < need && signal.write_all(&[1]).is_err() {
+                    return;
+                }
+                looked.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+                looked.1.notify_all();
+            }
+        });
+        if let Err(error) = watching {
+            log.note(serde_json::json!({"event": "host_unwatched", "why": error.to_string()}));
+            return None;
         }
+        Some(Arc::new(Host { short, nudge, looks }))
+    }
+
+    /// Something happened (a call began, an executor's frame came): the watcher looks.
+    pub fn nudge(&self) {
+        self.nudge.send();
+    }
+
+    /// Nudges the watcher and blocks until a look begun since has been made.
+    pub fn look(&self) {
+        let begun = self.looks.0.lock().unwrap_or_else(|e| e.into_inner()).0;
+        self.nudge();
+        self.await_look(begun);
+    }
+
+    /// Looks made so far.
+    pub fn looks(&self) -> u64 {
+        self.looks.0.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+
+    /// Blocks until more than `made` looks have been made.
+    pub fn await_look(&self, made: u64) {
+        let (count, signal) = &*self.looks;
+        let mut looks = count.lock().unwrap_or_else(|e| e.into_inner());
+        while looks.1 <= made {
+            looks = signal.wait(looks).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Whether a look found the host short since this was last asked (the events thread asks).
+    pub fn short(&self) -> bool {
+        let mut buf = [0; 64];
+        (&self.short).read(&mut buf).is_ok_and(|n| n > 0)
+    }
+}
+
+/// What the host keeps free for the calls running on it: each process's anonymous growth still
+/// to come (its requests' measured anonymous peak less its anonymous bytes now) and [`Growth`],
+/// the most a look saw them grow past what was measured to come (an unmeasured call's every
+/// byte). Page cache is never need: the budget holds it.
+#[derive(Default)]
+struct Keep {
+    growth: Growth,
+    /// Each process's requests running at the last look: each that ended settles the growth.
+    running: BTreeMap<u32, u64>,
+}
+
+impl Keep {
+    /// A look at the processes running requests (`None`: a GPU's table cannot be read): what
+    /// must stay free.
+    fn look(&mut self, calls: Option<Vec<HostCall>>) -> u64 {
+        // A process with rows on several GPUs is one call.
+        let mut by: BTreeMap<u32, HostCall> = BTreeMap::new();
+        for call in calls.unwrap_or_default() {
+            by.entry(call.pid)
+                .and_modify(|seen| {
+                    seen.peak = seen.peak.zip(call.peak).map(|(a, b)| a.max(b));
+                    seen.running += call.running;
+                })
+                .or_insert(call);
+        }
+        let (mut need, mut unforeseen) = (0u64, BTreeMap::new());
+        for call in by.values() {
+            let peak = call.peak.unwrap_or(0);
+            need = need.saturating_add(peak.saturating_sub(call.anon));
+            unforeseen.insert(call.pid.to_string(), call.anon.saturating_sub(peak));
+        }
+        for (pid, was) in &self.running {
+            for _ in by.get(pid).map_or(0, |call| call.running)..*was {
+                self.growth.settle();
+            }
+        }
+        self.running = by.values().map(|call| (call.pid, call.running)).collect();
+        need.saturating_add(self.growth.observe(unforeseen))
     }
 }
 

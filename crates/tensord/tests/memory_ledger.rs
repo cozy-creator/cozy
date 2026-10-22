@@ -582,16 +582,16 @@ fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
     assert_eq!(homes(), [0], "and the same placement answers the same");
 }
 
-/// The RAM tier's need is varena's over TensorD's GPUs: a call running unmeasured is an
-/// unmeasured call (the tier fills nothing beside it); once its package and shape were measured,
-/// the same call carries its anonymous peak.
+/// The host rule reads the calls running on TensorD's GPUs: a call running unmeasured is an
+/// unmeasured call (its every byte is growth to keep free); once its package and shape were
+/// measured, the same call carries its anonymous peak.
 #[test]
-fn an_unmeasured_running_call_lets_the_tier_fill_nothing() {
+fn an_unmeasured_running_call_carries_no_host_peak() {
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("need");
     let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap());
-    let need = varena::tier::need(&[&gpu.ledger]);
+    let need = || gpu.ledger.host_calls();
     let engine = Engine::open(&dir.path().join("engine")).unwrap();
     let mut a = StandIn::spawn(&gpu, &id, "gpu");
     assert_eq!(need(), Some(vec![]), "nothing runs");
