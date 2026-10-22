@@ -640,8 +640,14 @@ impl Shared {
     }
 }
 
-/// Merges a request's figure into `key` (`peak/<package>|<shape>`, its working set, or
-/// `compute/…`, its room beside its weights): the larger stays, whoever writes last.
+/// A request's compute room (beside its weights) at `compute/<package>|<shape>`: the latest
+/// run's replaces what was there, as a pass's room does (one large run never pins it).
+pub(crate) fn record_compute(shared: &Shared, key: &str, bytes: u64) -> Result<()> {
+    shared.put(&format!("compute/{key}"), Some(&bytes.to_le_bytes()))
+}
+
+/// Merges a request's working set into `peak/<package>|<shape>`: the larger stays, whoever
+/// writes last.
 pub(crate) fn record_peak(shared: &Shared, key: &str, bytes: u64) -> Result<()> {
     shared.merge(key, |old| {
         let known = old.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes);

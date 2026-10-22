@@ -24,6 +24,8 @@ use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Leve
 struct Events {
     next: AtomicU64,
     done: Mutex<HashSet<u64>>,
+    /// Event queries made.
+    queries: AtomicU64,
     /// Calls that make a page read-only or hand it out, and host waits on an event ("finish"),
     /// each signalled.
     kept: Mutex<Vec<&'static str>>,
@@ -198,6 +200,7 @@ impl Backend for Stream {
         Ok(Event(self.events.next.fetch_add(1, Ordering::Relaxed) + 1))
     }
     fn query(&self, event: Event) -> Result<bool> {
+        self.events.queries.fetch_add(1, Ordering::SeqCst);
         Ok(event == Event::DONE || self.events.done.lock().contains(&event.0))
     }
     fn elapsed(&self, _: Event, _: Event) -> Result<Option<u64>> {
@@ -997,4 +1000,39 @@ fn an_oom_retries_once_its_unmaps_are_done() {
     let (retry, seen) = oom.join().unwrap();
     assert!(retry);
     assert!(seen > before, "the Retry came before the cold page's unmap was done");
+}
+
+/// The lead's memory6 suspect: a drain queries only each stream's oldest pending event (one
+/// stream's events complete in order), so a lock costs a query per stream, not one per page
+/// with a release pending.
+#[test]
+fn a_drain_queries_each_stream_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("drain-{}", std::process::id());
+    let pages = 64;
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: pages * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
+    let events = Arc::new(Events::default());
+    let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
+    let id = mem.load(stored(dir.path(), &uuid, "s", pages), Level::Gpu).unwrap();
+    mem.settle();
+    // Every page bound and let go on one of two streams: 64 release events pending.
+    let first = events.next.load(Ordering::SeqCst) + 1;
+    for b in 0..pages as u32 {
+        drop(mem.bind(id, b, 1 + b as usize % 2).unwrap());
+    }
+    let last = events.next.load(Ordering::SeqCst);
+    let per_lock = || {
+        let before = events.queries.load(Ordering::SeqCst);
+        mem.torch_limit();
+        events.queries.load(Ordering::SeqCst) - before
+    };
+    per_lock();
+    assert!(per_lock() <= 2, "a query per stream, not per pending event");
+    // They complete in order: each lock pops what completed and stops at the next.
+    (first..first + 8).for_each(|e| events.complete(e));
+    assert!(per_lock() <= 2 + 8);
+    (first + 8..=last).for_each(|e| events.complete(e));
+    per_lock();
+    assert_eq!(per_lock(), 0, "nothing pending");
 }

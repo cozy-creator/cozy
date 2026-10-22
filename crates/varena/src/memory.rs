@@ -13,7 +13,7 @@
 //! call and on every thread: the call fails `Internal`, the table is derived again from the
 //! mappings, and the process keeps serving.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -258,6 +258,8 @@ struct Home {
     /// `None` while the mechanism thread creates and maps it.
     phys: Option<Physical>,
     ready: Event,
+    /// The stream `ready` is on ([`COPY`] for a fill's).
+    ready_on: usize,
     /// Tells a fill whether its page is still the one it was queued for.
     gen: u64,
     filled: bool,
@@ -339,6 +341,10 @@ struct Jobs {
     ahead: Sender<Job>,
 }
 
+/// The backend's copy stream, where fills' ready events are ([`Backend::fence`]); no caller's
+/// stream is this.
+const COPY: usize = usize::MAX;
+
 /// One page of a fill batch: where it goes, and how its copy ended.
 struct Copying {
     key: Key,
@@ -376,6 +382,8 @@ struct Release {
     key: Key,
     pin: u64,
     event: Event,
+    /// The stream it was recorded on.
+    stream: usize,
     /// Released fresh without its transform: its bytes are not the weights.
     untransformed: bool,
 }
@@ -411,7 +419,10 @@ struct State {
     /// Pin → (page, request).
     /// Pin → (page, request, the thread that holds it).
     pins: HashMap<u64, (Key, Option<u64>, std::thread::ThreadId)>,
-    releasing: BTreeSet<Key>,
+    /// Each stream's pending events (a page's release, or the ready event a Keep waits for),
+    /// in the order recorded: one stream's events complete in order, so a drain queries only
+    /// each stream's oldest.
+    events: BTreeMap<usize, VecDeque<(Event, Key)>>,
     /// Ids and the logical clock.
     clock: u64,
     shrinks: HashMap<u32, Shrink>,
@@ -901,7 +912,7 @@ impl Inner {
                 if let Some(p) = st.table.page_mut(r.key) {
                     p.releasing.push(r.event.0);
                 }
-                st.releasing.insert(r.key);
+                st.events.entry(r.stream).or_default().push_back((r.event, r.key));
             }
             if r.untransformed {
                 // Its bytes are not the weights: it goes once unpinned and its release event
@@ -914,28 +925,36 @@ impl Inner {
             }
             st.sync(r.key);
         }
-        let pending: Vec<Key> = st.releasing.iter().copied().collect();
-        for key in pending {
-            let ready = st.homes.get(&key).map(|h| h.ready.0);
-            let Some(p) = st.table.page_mut(key) else { continue };
-            let events = std::mem::take(&mut p.releasing);
-            let (left, done): (Vec<u64>, Vec<u64>) = events.into_iter().partition(|e| !self.backend.query(Event(*e)).unwrap_or(true));
-            done.into_iter().filter(|e| Some(*e) != ready).for_each(|e| self.backend.retire(Event(e)));
-            let empty = left.is_empty();
-            if let Some(p) = st.table.page_mut(key) {
-                p.releasing = left;
-            }
-            if empty {
-                st.releasing.remove(&key);
-            }
-            // A transform or fill whose event completed: now read-only and kept.
-            if st.homes.get(&key).is_some_and(|h| h.keep_after && self.backend.query(h.ready).unwrap_or(false)) {
-                if let Some(h) = st.homes.get_mut(&key) {
-                    h.keep_after = false;
+        // Completed events, oldest first on each stream: the first not yet complete ends that
+        // stream's turn, so a drain costs a query per stream, not per pending event.
+        let streams: Vec<usize> = st.events.keys().copied().collect();
+        for stream in streams {
+            while let Some((event, key)) = st.events.get(&stream).and_then(|q| q.front()).copied() {
+                if !self.backend.query(event).unwrap_or(true) {
+                    break;
                 }
-                self.keep(st, key);
+                if let Some(q) = st.events.get_mut(&stream) {
+                    q.pop_front();
+                }
+                let ready = st.homes.get(&key).map(|h| h.ready);
+                if let Some(i) = st.table.page(key).and_then(|p| p.releasing.iter().position(|e| *e == event.0)) {
+                    if let Some(p) = st.table.page_mut(key) {
+                        p.releasing.swap_remove(i);
+                    }
+                    if Some(event) != ready {
+                        self.backend.retire(event);
+                    }
+                }
+                // A transform or fill whose event completed: now read-only and kept.
+                if st.homes.get(&key).is_some_and(|h| h.keep_after && h.ready == event) {
+                    if let Some(h) = st.homes.get_mut(&key) {
+                        h.keep_after = false;
+                    }
+                    self.keep(st, key);
+                }
             }
         }
+        st.events.retain(|_, q| !q.is_empty());
         if let Some(h) = self.custody.as_ref().map(|c| c.holder()).filter(|h| *h != st.holder) {
             // A new custody holder knows none of the kept pages: all go to it again.
             st.holder = h;
@@ -1135,7 +1154,7 @@ impl Inner {
             let gen = st.tick();
             // Pinned (filling) until the mechanism maps it.
             self.mech.post(Mech::Adopt { key, gen, va, off, phys: phys.id, len: phys.len, identity: identity.clone() }, 0);
-            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false });
+            st.homes.insert(key, Home { phys: Some(phys), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false, keeping: false });
             st.sync(key);
             let s = st.fills(req, key, span, Origin::Kept);
             s.moved.kept.bytes += span;
@@ -1159,7 +1178,7 @@ impl Inner {
         let decided = st.table.free();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false });
+        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false, keeping: false });
         st.sync(key);
         self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, speculative, decided }, 0);
         Ok(true)
@@ -1174,13 +1193,14 @@ impl Inner {
         let identity = st.mech(key.0)?.spec.fingerprint.key();
         let gen = st.tick();
         let after = st.table.page_mut(key).map(|p| std::mem::take(&mut p.releasing)).unwrap_or_default();
-        st.releasing.remove(&key);
+        // Its events are the refill's now (it waits on them, then retires them).
+        st.events.values_mut().for_each(|q| q.retain(|(_, k)| *k != key));
         let Some(h) = st.homes.get_mut(&key) else { return Ok(()) };
         let (old, exported, old_identity) = (std::mem::replace(&mut h.ready, Event::DONE), h.exported, h.identity.clone());
         // Kept, or with a Keep queued: never written again; a fresh page takes its place.
         let phys = if exported || h.keeping { h.phys.take() } else { None };
         let renew = phys.is_some();
-        *h = Home { phys: h.phys.take(), ready: Event::DONE, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false };
+        *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
         let job = Job { key, gen, req, span, after: vec![] };
@@ -1215,13 +1235,13 @@ impl Inner {
             return;
         }
         if !self.backend.query(home.ready).unwrap_or(false) {
-            // Pinned (P) until the event completes; the next drain keeps it.
+            // Pinned (P) until the event completes; the drain that sees it complete keeps it.
             home.keep_after = true;
-            let ready = home.ready.0;
+            let (ready, stream) = (home.ready, home.ready_on);
             if let Some(p) = st.table.page_mut(key) {
-                p.releasing.push(ready);
+                p.releasing.push(ready.0);
             }
-            st.releasing.insert(key);
+            st.events.entry(stream).or_default().push_back((ready, key));
             return;
         }
         let Some(phys) = home.phys.as_ref().map(|p| (p.id, p.len)).filter(|_| !home.keeping) else { return };
@@ -1280,6 +1300,7 @@ impl Inner {
                     let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
                     if let Some(h) = st.homes.get_mut(&job.key) {
                         h.ready = ready;
+                        h.ready_on = COPY;
                         h.filling = false;
                         h.filled = filled;
                         h.origin = origin;
@@ -2367,7 +2388,7 @@ impl Inner {
         let mut stats = st.stats.remove(&req).unwrap_or_default();
         if let Some(key) = st.peaks.remove(&req) {
             let _ = ledger::record_peak(&self.shared, &format!("peak/{key}"), stats.peak);
-            let _ = ledger::record_peak(&self.shared, &format!("compute/{key}"), stats.room);
+            let _ = ledger::record_compute(&self.shared, &key, stats.room);
         }
         self.unlock(st);
         self.shrink(shrinks);
@@ -2825,6 +2846,7 @@ impl Pin {
             let mut st = self.inner.lock();
             if let Some(h) = st.homes.get_mut(&self.key) {
                 let old = std::mem::replace(&mut h.ready, event);
+                h.ready_on = self.stream;
                 h.filled = true;
                 h.transforming = false;
                 if old != event {
@@ -2856,7 +2878,7 @@ impl Drop for Pin {
             Event::DONE
         });
         let untransformed = self.transform && !self.transformed.load(Ordering::Acquire);
-        let _ = self.inner.release_tx.send(Release { key: self.key, pin: self.id, event, untransformed });
+        let _ = self.inner.release_tx.send(Release { key: self.key, pin: self.id, event, stream: self.stream, untransformed });
         self.inner.landed.notify_all();
     }
 }
