@@ -2309,21 +2309,21 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
     let (mem, timings) = timed_memory(b, &g);
     step!();
     let pages = 64;
-    let idle = mem.load(bulk("idle", pages, &g.uuid), Level::Ram).unwrap();
+    // Mapped at load and never kept (an undeclared fill is never custody's): complete pages with no declared use,
+    // which the request's stock offers the callback when it opens.
+    let loaded = std::time::Instant::now();
+    let one = bulk_block();
+    mem.load(set("idle", pages, Fill::Undeclared, &g.uuid, |_| one.clone()), Level::Gpu).unwrap();
+    let loaded = loaded.elapsed();
     step!();
     let w = mem.load(set("w", 1, Fill::Stored, &g.uuid, |b| block(95, b)), Level::Ram).unwrap();
     step!();
-    // The idle set is no step of the plan: its pages have no declared use (N), which the callback may take; a
-    // step's pages are its working set, which it never takes.
+    mem.settle();
+    step!();
+    // The idle set is no step of the plan: a step's pages are its working set, which the callback never takes.
     let r = mem.request("r", plan(&[&["w"]])).unwrap();
     step!();
-    // The idle set mapped and released: complete, never-kept pages the callback may take.
-    let mut warm = std::time::Duration::ZERO;
-    for p in 0..pages {
-        let t = std::time::Instant::now();
-        drop(mem.bind(idle, p, 0).unwrap());
-        warm = warm.max(t.elapsed());
-    }
+    let warm = loaded / pages;
     step!();
     let (x, y, gated) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
     step!();
@@ -2331,7 +2331,8 @@ fn the_allocator_callback_reclaims_inside_its_lock_without_waiting_for_unrelated
     step!();
     let out = io::DeviceBuffer::new(0, 16).unwrap();
     step!();
-    let sweep = warm * pages * 10;
+    // Ten times the idle set's load: the sweep outlasts the allocations.
+    let sweep = loaded * 10;
     assert_eq!(launch(c"sweep", &[pinned.ptr, REGION_ALIGN / 8, sweep.as_nanos() as u64, out.ptr()], x.raw()), cuda::SUCCESS);
     step!();
     let _ = mem.torch_limit();
