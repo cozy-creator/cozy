@@ -206,6 +206,16 @@ def main() -> int:
         "the block is a placeholder again after the op",
         isinstance(net.blocks[3].lin.weight, Placeholder),
     )
+    held = net.blocks[3].lin.weight._varena_read()  # a kernel launched by pointer (cr-208)
+    check(
+        "a read no op sees binds its block: bytes behind the pointer",
+        held.data_ptr() != 0 and torch.equal(held, tensors["blocks.3.lin.weight"].to(dev)),
+    )
+    check(
+        "the block is a placeholder again after the read, the read's tensor its pin",
+        isinstance(net.blocks[3].lin.weight, Placeholder),
+    )
+    del held
     with torch.no_grad():  # its norm's bytes sit in common: a small tensor shares a pack
         alone = net.blocks[3](x)
     check(
