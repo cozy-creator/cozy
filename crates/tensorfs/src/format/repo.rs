@@ -9,7 +9,7 @@ use pep440_rs::Version;
 use serde::{Deserialize, Serialize};
 
 use super::doc::{is_digest, path, segment};
-use super::{check_format, invalid, json, variant_of, variant_path, Error, ObjectRef, Result, VARIANT_EXTENSION};
+use super::{check_format, invalid, json, variant_of, variant_path, Error, ObjectRef, Result};
 use super::{REPO_FORMAT, TREE_FORMAT};
 
 /// The folder that holds a plain folder's chunks and assets: no repo file lives under it.
@@ -70,18 +70,13 @@ impl Tree {
         (self.files.iter()).filter_map(|(p, r)| Some((variant_of(p)?, r)))
     }
 
-    /// The variant `name` names (spec §3): the one at that path, else at it with the extension
-    /// added; (its path, its header).
-    fn named(&self, name: &str) -> Option<(&str, &ObjectRef)> {
-        let at = |path: &str| self.files.get_key_value(path).filter(|(p, _)| variant_of(p).is_some());
-        at(name).or_else(|| at(&format!("{name}{VARIANT_EXTENSION}")))
-            .or_else(|| (!name.contains('/') && !name.ends_with(VARIANT_EXTENSION)).then(|| {
-                at(&if name.is_empty() { super::HEADER_PATH.into() } else { format!("model.{name}{VARIANT_EXTENSION}") })
-            }).flatten())
-            .map(|(p, r)| (p.as_str(), r))
+    /// The variant at `path` (spec §3: a variant is its path, never a name matched to one):
+    /// (its path, its header).
+    fn named(&self, path: &str) -> Option<(&str, &ObjectRef)> {
+        self.files.get_key_value(path).filter(|(p, _)| variant_of(p).is_some()).map(|(p, r)| (p.as_str(), r))
     }
 
-    /// The header of variant `name`.
+    /// The header of the variant at `path`.
     pub fn header(&self, name: &str) -> Option<&ObjectRef> {
         self.named(name).map(|(_, r)| r)
     }

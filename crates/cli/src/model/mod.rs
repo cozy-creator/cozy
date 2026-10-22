@@ -87,10 +87,14 @@ pub(crate) struct List {
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Download {
-    /// Precision preference (default: 8); selected from the header for the target machine's GPUs.
-    #[arg(long, value_parser = ["4", "8", "16"])]
-    bits: Option<String>,
-    /// org/name[@release[/lane]], org/name#sha256:…, hf://…, civitai://… or https://….
+    /// precision lane: 16, 8 or 4 bits. Absent, 8 is preferred, in the encoding the machine's GPUs
+    /// run best, else whatever works.
+    #[arg(long, value_parser = ["16", "8", "4"], conflicts_with = "variant")]
+    lane: Option<String>,
+    /// This variant exactly, by its path in the release (`cozy model info` lists them).
+    #[arg(long, value_name = "PATH")]
+    variant: Option<String>,
+    /// org/name[@release], org/name#sha256:…, hf://…, civitai://… or https://….
     model: String,
     /// Keep it on the machine under this name.
     #[arg(value_name = "local/ALIAS")]
@@ -122,7 +126,7 @@ pub(crate) struct Upload {
 #[derive(clap::Args, Debug)]
 #[command(group(ArgGroup::new("lane").required(true).args(["int8", "fp8", "nvfp4"])))]
 pub(crate) struct Quantize {
-    /// org/name[@release[/lane]] or org/name#sha256:….
+    /// org/name[@release] or org/name#sha256:….
     model: String,
     /// Where it goes: org/name[@tag], the tag whose tree takes the variant (main); default: the model's own.
     destination: Option<String>,

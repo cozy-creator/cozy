@@ -279,7 +279,7 @@ async fn verification_all_checks_only_the_selected_checkpoint_not_its_repository
         .open(
             &tree.id(),
             &Open {
-                variant: Some(String::new()),
+                variant: Some("model.cozytensors".into()),
                 ..Open::default()
             },
         )

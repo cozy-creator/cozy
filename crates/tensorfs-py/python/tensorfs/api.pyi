@@ -16,7 +16,7 @@ class DLPack(Protocol):
 def configure(*, endpoint: str | None = None, cache_dir: StrPath | None = None, token: Token | None = None,
               ca_der: bytes | None = None) -> None: ...
 def open(name_or_path: StrPath, *, revision: str | None = None, variant: str | None = None,
-         bits: int | None = None, gpus: Sequence[str] | None = None,
+         lane: int | None = None, gpus: Sequence[str] | None = None,
          endpoint: str | None = None, local_files_only: bool = False, cache_dir: StrPath | None = None,
          token: Token | None = None, lazy: bool = True) -> Checkpoint: ...
 def materialize(source: str | Checkpoint, *, local_dir: StrPath | None = None,

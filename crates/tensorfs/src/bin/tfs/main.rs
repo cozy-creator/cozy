@@ -178,16 +178,11 @@ fn identity(ck: &Checkpoint) -> Map<String, Json> {
     doc.as_object().expect("an object").clone()
 }
 
+/// A data verb's checkpoint: the variant named, else the one a CPU read takes (spec §7: no GPU
+/// requirement applies to reading on the CPU).
 async fn open(client: &Client, args: &Args, reference: &str) -> Result<Checkpoint> {
-    let options = Open { variant: args.get("variant").map(str::to_owned), ..Open::default() };
-    match client.open(reference, &options).await {
-        // Keep the ordinary shared choice when one fits. A sole stored checkpoint remains
-        // inspectable/exportable even when this computer cannot execute its encodings.
-        Err(error) if error.kind == Kind::NotFound && error.detail == "no variant fits the requested GPUs and bits" => {
-            client.open_variant(reference, &options).await
-        }
-        answer => answer,
-    }
+    let options = Open { variant: args.get("variant").map(str::to_owned), gpus: Some(vec![]), ..Open::default() };
+    client.open(reference, &options).await
 }
 
 async fn run(args: &Args) -> Done {

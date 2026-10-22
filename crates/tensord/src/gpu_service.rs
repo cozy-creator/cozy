@@ -161,6 +161,9 @@ pub struct PlanSlot {
     /// The Hub lane its checkpoint was resolved in (`run show`); empty for one held here.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lane: String,
+    /// Its header's precision lane (`int8`, `bf16`, …; `run show` beside its path).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub precision: String,
     /// Native selected encoded source bytes; not a GPU-fit or full-memory charge.
     pub selected_encoded_bytes: u64,
     /// Built and fetched when the function first uses it (`on_demand`): nothing of it is
@@ -182,6 +185,8 @@ pub struct PlanSource {
     pub release: String,
     #[serde(default)]
     pub lane: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub precision: String,
 }
 
 /// A prepared call: its construction (the package's generation, App, entrypoint, constructed
@@ -247,14 +252,18 @@ impl Plan {
     }
     /// Each model it runs as the machine resolved it, constructed or raw (`run show`).
     pub fn models(&self) -> Vec<serde_json::Value> {
-        let row = |slot: &str, model: (&str, &str), lane: &str, manifest: &str| {
-            serde_json::json!({"slot": slot, "repository": model.0, "release": model.1, "lane": lane, "manifest": manifest})
+        let row = |slot: &str, model: (&str, &str), lane: (&str, &str), manifest: &str| {
+            let mut row = serde_json::json!({"slot": slot, "repository": model.0, "release": model.1, "lane": lane.0, "manifest": manifest});
+            if !lane.1.is_empty() {
+                row["precision"] = lane.1.into();
+            }
+            row
         };
         let constructed = self.slots.iter().map(|s| {
             let model = s.binding.model.rsplit_once('@').unwrap_or_default();
-            row(&s.binding.model_parameter_name, model, &s.lane, &s.binding.snapshot)
+            row(&s.binding.model_parameter_name, model, (&s.lane, &s.precision), &s.binding.snapshot)
         });
-        let raw = self.sources.iter().map(|s| row(&s.parameter, (&s.repository, &s.release), &s.lane, &s.manifest));
+        let raw = self.sources.iter().map(|s| row(&s.parameter, (&s.repository, &s.release), (&s.lane, &s.precision), &s.manifest));
         constructed.chain(raw).collect()
     }
     /// What a call reads before its function runs: every slot's components but an on-demand
@@ -262,6 +271,12 @@ impl Plan {
     pub fn upfront(&self) -> Vec<(String, Vec<String>)> {
         merged(self.slots.iter().filter(|slot| !slot.on_demand)).into_iter().map(|s| (s.manifest, s.components)).collect()
     }
+}
+
+/// The precision lane the header of checkpoint `manifest` holds (`int8`, `bf16`, …); empty when
+/// it holds none of the table's or is not here.
+fn precision(store: &Store, manifest: &str) -> String {
+    crate::storage::checkpoint(store, manifest).map(|c| crate::precision::Profile::of(c.header()).family).unwrap_or_default()
 }
 
 /// `components` of the checkpoint `manifest`: their encoded bytes, and its header's length.
@@ -1435,6 +1450,7 @@ impl Pool {
                     repository: grant.repository.clone(),
                     release: grant.release.clone(),
                     lane: grant.lane.clone(),
+                    precision: precision(&self.store, &grant.manifest),
                 });
                 continue;
             }
@@ -1510,6 +1526,7 @@ impl Pool {
             planned.push(PlanSlot {
                 binding,
                 lane: grant.lane.clone(),
+                precision: precision(&self.store, &grant.manifest),
                 selected_encoded_bytes,
                 on_demand: model.get("on_demand").and_then(serde_json::Value::as_bool) == Some(true),
             });
@@ -3738,7 +3755,8 @@ mod tests {
             length: 9,
             repository: "paul/wushu".into(),
             release: "1.0.0".into(),
-            lane: "bf16".into(),
+            lane: "model.bf16.cozytensors".into(),
+            precision: "bf16".into(),
         };
         let plan = Plan {
             id: "p".into(),
@@ -3746,7 +3764,7 @@ mod tests {
             installation: "i".into(),
             generation: "g".into(),
             entrypoint: "remove_background".into(),
-            slots: vec![PlanSlot { binding, lane: "fp16".into(), selected_encoded_bytes: 0, on_demand: false }],
+            slots: vec![PlanSlot { binding, lane: "model.fp16.cozytensors".into(), precision: "fp16".into(), selected_encoded_bytes: 0, on_demand: false }],
             sources: vec![source],
             degree: 1,
         };
@@ -3759,8 +3777,8 @@ mod tests {
         .unwrap();
         let measured = measured(&plan, &reply, None::<()>, ());
         assert_eq!(measured["models"], json!([
-            {"slot": "model", "repository": "paul/birefnet", "release": "0.1.0", "lane": "fp16", "manifest": "sha256:aa"},
-            {"slot": "lora", "repository": "paul/wushu", "release": "1.0.0", "lane": "bf16", "manifest": "sha256:bb"}]));
+            {"slot": "model", "repository": "paul/birefnet", "release": "0.1.0", "lane": "model.fp16.cozytensors", "precision": "fp16", "manifest": "sha256:aa"},
+            {"slot": "lora", "repository": "paul/wushu", "release": "1.0.0", "lane": "model.bf16.cozytensors", "precision": "bf16", "manifest": "sha256:bb"}]));
         let kept: Vec<&str> = measured["observations"].as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap()).collect();
         assert_eq!(kept, ["attention.selected", "gemm.selected"]);
     }

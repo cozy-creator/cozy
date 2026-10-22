@@ -67,7 +67,7 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
         ..Want::default()
     };
     let pulled = fetcher
-        .pull(&origin, "acme/tiny", Some("1.0"), Some("int8"), &want)
+        .pull(&origin, "acme/tiny", Some("1.0"), Some("model.int8.cozytensors"), &want)
         .await
         .unwrap();
     assert_eq!((pulled.tree.as_ref(), &pulled.header), (Some(&model.tree), &model.header));
@@ -117,7 +117,7 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
             &origin,
             "acme/tiny",
             None,
-            Some("int8"),
+            Some("model.int8.cozytensors"),
             &Want {
                 components: Some(&vae),
                 ..Want::default()
@@ -142,12 +142,12 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
     );
 
     let refused = fetcher
-        .pull(&origin, "acme/tiny", Some("9.9"), Some("int8"), &all())
+        .pull(&origin, "acme/tiny", Some("9.9"), Some("model.int8.cozytensors"), &all())
         .await
         .unwrap_err();
     assert_eq!(refused.code, Code::REVISION_ABSENT, "{refused}");
     let refused = fetcher
-        .pull(&origin, "acme/absent", None, Some("int8"), &all())
+        .pull(&origin, "acme/absent", None, Some("model.int8.cozytensors"), &all())
         .await
         .unwrap_err();
     assert_eq!(refused.code, Code::REF_NOT_FOUND, "{refused}");
@@ -184,7 +184,7 @@ async fn a_corrupted_object_is_refused_and_refetched() {
     let fetcher = fetcher(&store, None);
     let origin = http(&server.base);
     let refused = fetcher
-        .pull(&origin, "acme/corrupt", None, Some("int8"), &all())
+        .pull(&origin, "acme/corrupt", None, Some("model.int8.cozytensors"), &all())
         .await
         .unwrap_err();
     assert_eq!(refused.code, Code::OBJECT_ID_MISMATCH, "{refused}");
@@ -228,7 +228,7 @@ async fn the_volume_is_written_back_and_serves_the_next_machine() {
     );
     let a = fetcher(&open_store(&a_root), Some(volume.clone()));
     let pulled = a
-        .pull(&origin, "acme/shared", None, Some("int8"), &all())
+        .pull(&origin, "acme/shared", None, Some("model.int8.cozytensors"), &all())
         .await
         .unwrap();
     assert_eq!(pulled.landed.origin, model.bytes());
@@ -243,7 +243,7 @@ async fn the_volume_is_written_back_and_serves_the_next_machine() {
     let asked = server.blob_asks().len();
     let b = fetcher(&open_store(&b_root), Some(volume.clone()));
     let pulled = b
-        .pull(&origin, "acme/shared", None, Some("int8"), &all())
+        .pull(&origin, "acme/shared", None, Some("model.int8.cozytensors"), &all())
         .await
         .unwrap();
     assert_eq!(
@@ -265,7 +265,7 @@ async fn the_volume_is_written_back_and_serves_the_next_machine() {
     std::fs::write(&path, &bytes).unwrap();
     let c = fetcher(&open_store(&c_root), Some(volume.clone()));
     let pulled = c
-        .pull(&origin, "acme/shared", None, Some("int8"), &all())
+        .pull(&origin, "acme/shared", None, Some("model.int8.cozytensors"), &all())
         .await
         .unwrap();
     assert_eq!(
@@ -303,7 +303,7 @@ async fn https_trusts_a_private_ca_only_when_named() {
     );
     let origin: Arc<dyn Origin> = Arc::new(Endpoint::new(&trusting, &server.base, None).unwrap().anonymous());
     let pulled = fetcher
-        .pull(&origin, "acme/tls", None, Some("int8"), &all())
+        .pull(&origin, "acme/tls", None, Some("model.int8.cozytensors"), &all())
         .await
         .unwrap();
     assert_eq!(pulled.landed.origin, model.bytes());
@@ -312,7 +312,7 @@ async fn https_trusts_a_private_ca_only_when_named() {
     let webpki = tensorfs::fetch::Client::new(policy);
     let untrusting: Arc<dyn Origin> = Arc::new(Endpoint::new(&webpki, &server.base, None).unwrap().anonymous());
     let refused = fetcher
-        .pull(&untrusting, "acme/tls", None, Some("int8"), &all())
+        .pull(&untrusting, "acme/tls", None, Some("model.int8.cozytensors"), &all())
         .await
         .unwrap_err();
     assert_eq!(refused.code, Code::TLS_UNTRUSTED, "{refused}");
@@ -350,7 +350,7 @@ async fn a_private_origin_writes_nothing_to_the_volume() {
         )),
     );
     let pulled = fetcher
-        .pull(&origin, "acme/private", None, Some("int8"), &all())
+        .pull(&origin, "acme/private", None, Some("model.int8.cozytensors"), &all())
         .await
         .unwrap();
     assert_eq!(pulled.landed.origin, model.bytes());
@@ -362,7 +362,7 @@ async fn a_private_origin_writes_nothing_to_the_volume() {
 
     let anonymous = http(&server.base);
     let refused = fetcher
-        .pull(&anonymous, "acme/private", None, Some("int8"), &all())
+        .pull(&anonymous, "acme/private", None, Some("model.int8.cozytensors"), &all())
         .await
         .unwrap_err();
     assert_eq!(refused.code, Code::CREDENTIAL_REQUIRED, "{refused}");
@@ -402,7 +402,7 @@ async fn a_hung_volume_is_left_alone_until_it_answers() {
     let root = temporary("hung-store");
     let fetcher = fetcher(&open_store(&root), Some(volume.clone()));
     let pulled = fetcher
-        .pull(&origin, "acme/hung", None, Some("int8"), &all())
+        .pull(&origin, "acme/hung", None, Some("model.int8.cozytensors"), &all())
         .await
         .unwrap();
     assert_eq!(
@@ -435,7 +435,7 @@ async fn a_hung_volume_is_left_alone_until_it_answers() {
             config(),
         );
         from_volume = next
-            .pull(&origin, "acme/hung", None, Some("int8"), &all())
+            .pull(&origin, "acme/hung", None, Some("model.int8.cozytensors"), &all())
             .await
             .unwrap()
             .landed
@@ -554,7 +554,7 @@ async fn a_pull_where_nothing_lands_ends_and_quotes_the_last_answer() {
             &http(&server.base),
             "acme/never",
             None,
-            Some("int8"),
+            Some("model.int8.cozytensors"),
             &all(),
         )
         .await

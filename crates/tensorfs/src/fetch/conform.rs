@@ -216,14 +216,14 @@ async fn read_side(
     let into = Store::open(scratch.join("pulled")).map_err(crate::store::Error::refusal)?;
     let fetcher = Fetcher::new(Arc::new(into.clone()) as Arc<dyn ObjectStore>, client.clone(), None, Config::default());
     let origin: Arc<dyn Origin> = endpoint.clone();
-    let pulled = fetcher.pull(&origin, FIXTURE, Some("1"), Some("int8"), &Want::default()).await;
+    let pulled = fetcher.pull(&origin, FIXTURE, Some("1"), Some("model.int8.cozytensors"), &Want::default()).await;
     fetcher.settled().await;
     let outcome = pulled.map(|p| p.objects).map_err(|e| e.to_string()).and_then(|n| expect(n >= 4, || format!("{n} objects")));
     cases.record("blobs: GET returns each object, verified", true, Some(outcome));
 
     let header = Tree::from_json(&store.read(tree).map_err(crate::store::Error::refusal)?)
         .map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?
-        .header("int8")
+        .header("model.int8.cozytensors")
         .cloned()
         .expect("the fixture's variant");
     let head = endpoint.raw("HEAD", &header.key(), vec![], None).await?;

@@ -221,6 +221,8 @@ struct Model {
     repository: String,
     release: String,
     lane: String,
+    /// The header's precision lane (`int8`, …), shown beside the variant's path.
+    precision: String,
     manifest: String,
 }
 
@@ -468,7 +470,7 @@ fn stage_rows(measured: &Measured) -> Vec<Vec<String>> {
 }
 
 /// Each model slot's checkpoint: its repository and release, or its hash when it was passed
-/// by value, and the lane it was resolved in.
+/// by value, and the variant it was resolved in with its header's precision lane.
 fn model_rows(measured: &Measured) -> Vec<Vec<String>> {
     let measured = &measured.m;
     let row = |m: &Model| {
@@ -476,7 +478,11 @@ fn model_rows(measured: &Measured) -> Vec<Vec<String>> {
             true => m.manifest.chars().take(19).collect(),
             false => format!("{}@{}", m.repository, m.release),
         };
-        vec![m.slot.clone(), model, or_dash(&m.lane)]
+        let lane = match m.precision.is_empty() {
+            true => or_dash(&m.lane),
+            false => format!("{} ({})", or_dash(&m.lane), m.precision),
+        };
+        vec![m.slot.clone(), model, lane]
     };
     measured.models.iter().map(row).collect()
 }

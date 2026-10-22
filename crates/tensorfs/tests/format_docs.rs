@@ -161,8 +161,9 @@ fn writer_is_deterministic_and_reader_round_trips() {
     assert!(tb.ends_with(br#"}},"format":"cozytensors.tree/1"}"#));
     let back = Tree::from_json(&tb).unwrap();
     assert_eq!(back, t);
-    assert_eq!(back.variant(Some("bf16")).unwrap(), ("bf16", &ObjectRef::of(&bytes)));
-    assert_eq!(back.header(""), Some(&ObjectRef::of(&wb)));
+    assert_eq!(back.variant(Some("model.bf16.cozytensors")).unwrap(), ("model.bf16.cozytensors", &ObjectRef::of(&bytes)));
+    assert_eq!(back.header("model.cozytensors"), Some(&ObjectRef::of(&wb)));
+    assert!(back.variant(Some("bf16")).is_err(), "a lane word names no variant");
     assert!(back.variant(None).is_err(), "two variants: name one");
     let files: Vec<&str> = back.repo_files().map(|(p, _)| p).collect();
     assert_eq!(files, ["README.md"]);
@@ -473,11 +474,15 @@ fn config_floats_take_their_shortest_exact_form() {
 
 #[test]
 fn variants_name_their_files() {
-    for (path, variant) in [("model.cozytensors", Some("")), ("model.fp8.cozytensors", Some("fp8"))] {
-        assert_eq!(variant_of(path), variant);
-        assert_eq!(variant_path(variant.unwrap()), path);
+    // A variant is its path: every `.cozytensors` file, at any depth.
+    for path in ["model.cozytensors", "model.fp8.cozytensors", "a/model.cozytensors", "nested/x.cozytensors"] {
+        assert_eq!(variant_of(path), Some(path));
     }
-    for path in ["model..cozytensors", "models.cozytensors", "a/model.cozytensors", "model.a/b.cozytensors", "README.md"] {
+    // A writer's bare name is written as `model.<name>.cozytensors`; a path stays itself.
+    for (name, path) in [("", "model.cozytensors"), ("fp8", "model.fp8.cozytensors"), ("a/b.cozytensors", "a/b.cozytensors")] {
+        assert_eq!(variant_path(name), path);
+    }
+    for path in ["models.cozytensor", "README.md", "a/b"] {
         assert_eq!(variant_of(path), None, "{path}");
     }
 }
