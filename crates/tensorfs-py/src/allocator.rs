@@ -15,6 +15,7 @@ use tensorfs::io::cuda;
 use varena::{Memory, Request, SetId, Torch, Workspace};
 
 type Pool = (u64, u64);
+pub type Refusal = (i32, Pool, &'static str, u64, u64, u64);
 
 #[derive(Clone)]
 struct Active {
@@ -127,7 +128,7 @@ pub fn stats(device: Option<i32>, pool: Option<Pool>) -> (u64, u64, u64, u64, u6
 }
 
 /// Last refusal by device/pool. Collected outside the callback: no callback logging or Python.
-pub fn refusals(device: Option<i32>) -> Vec<(i32, Pool, &'static str, u64, u64, u64)> {
+pub fn refusals(device: Option<i32>) -> Vec<Refusal> {
     accounts().counts.iter().filter(|((d, _), _)| device.is_none_or(|want| *d == want))
         .filter_map(|((d, p), c)| c.refusal.map(|(why, size, held, limit)| (*d, *p, why, size, held, limit))).collect()
 }
@@ -165,7 +166,7 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     }
     let mut previous = None;
     let mut reclaimed_total = 0;
-    let mut refusal = ("unknown", size as u64, 0, 0);
+    let mut refusal;
     let ptr = loop {
         let held = active.as_ref().map_or(live(device), |a| a.outside.saturating_add(live(device)));
         let limit = match active.as_ref() {

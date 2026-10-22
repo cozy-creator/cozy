@@ -1004,7 +1004,7 @@ fn allocator_stats(device: Option<i32>, pool: Option<(u64, u64)>) -> (u64, u64, 
 /// Last native allocation refusal: device, pool, reason, size, held bytes, admitted limit.
 #[pyfunction]
 #[pyo3(signature = (device = None))]
-fn allocator_refusals(device: Option<i32>) -> Vec<(i32, (u64, u64), &'static str, u64, u64, u64)> {
+fn allocator_refusals(device: Option<i32>) -> Vec<crate::allocator::Refusal> {
     crate::allocator::refusals(device)
 }
 
