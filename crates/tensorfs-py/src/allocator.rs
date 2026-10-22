@@ -103,11 +103,18 @@ fn fits(size: u64) -> bool {
     })
 }
 
+extern "C" {
+    /// CPython's own (stable since 3.4, outside the limited API the abi3 headers give): whether
+    /// this thread holds the GIL, read without taking it.
+    fn PyGILState_Check() -> c_int;
+}
+
 /// `f` without the GIL when this thread holds it: varena's oom may wait on device work (an
-/// unmap's queued consumers), and a stream host callback in it may need the GIL.
+/// unmap's queued consumers), and a stream host callback in it may need the GIL. It never takes
+/// the GIL: another thread may hold it while it waits for torch's allocator lock.
 fn unlocked<T>(f: impl FnOnce() -> T) -> T {
     // SAFETY: the C API on this thread; the state saved is restored before returning.
-    if unsafe { pyo3::ffi::PyGILState_Check() } == 1 {
+    if unsafe { PyGILState_Check() } == 1 {
         let state = unsafe { pyo3::ffi::PyEval_SaveThread() };
         let out = f();
         unsafe { pyo3::ffi::PyEval_RestoreThread(state) };
