@@ -44,6 +44,13 @@ impl DefaultSdk {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_verified(&self, wheels: &[PathBuf]) -> io::Result<()> {
+        self.resolve_with(|directory| wheels.iter().zip(["cozy_runtime", "tensorfs"])
+            .map(|(wheel, distribution)| super::stage(directory, wheel, distribution)).collect())?;
+        Ok(())
+    }
+
     fn resolve_with(&self, resolve: impl FnOnce(&Path) -> io::Result<Vec<PathBuf>>) -> io::Result<&Resolved> {
         if let Some(chosen) = self.chosen.get() { return Ok(chosen); }
         let _one = self.resolving.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -442,6 +442,8 @@ impl LocalSources {
         run: &str,
         stage: &dyn Fn(&str),
     ) -> Result<Installation, Refused> {
+        // Establish custody before a first install can trigger SDK resolution/downloads.
+        let (manifest, object) = open_manifest(&self.objects, actor, digest)?;
         self.installer.resolve_sdk(stop).map_err(installer_refusal)?;
         // Like published installations, local aliases include the selected SDK and
         // client. The source digest alone cannot identify the environment after an update.
@@ -470,8 +472,7 @@ impl LocalSources {
                 installing
             }
         };
-        let package = open_manifest(&self.objects, actor, digest).map(|(m, _)| m.package).unwrap_or_default();
-        *self.holder.lock().unwrap() = Some((service.engine.caller_id(run), package));
+        *self.holder.lock().unwrap() = Some((service.engine.caller_id(run), manifest.package.clone()));
         let _held = Holder(&self.holder);
         if let Some(held) = service.engine.installation(actor, &alias)? {
             if service.catalog.resolve(&held.generation).is_ok() {
@@ -479,7 +480,6 @@ impl LocalSources {
             }
         }
         let member = |m: &Member| written_member(&self.objects, actor, m);
-        let (manifest, object) = open_manifest(&self.objects, actor, digest)?;
         if !manifest.files.is_empty() || !manifest.path.is_empty() {
             return self.install_live(service, actor, alias, manifest, &object.sha256, stop, stage);
         }
@@ -768,6 +768,56 @@ mod tests {
             .unwrap();
         assert_eq!(again.generation, installed.generation);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn foreign_source_cannot_trigger_a_default_sdk_download() {
+        let m = machine("cm-default-sdk-custody");
+        let store = crate::storage::open(&m.root.join("sdk-store")).unwrap();
+        let machine = crate::origin::Machine::new(store, None).unwrap();
+        let directory = m.root.join("default-sdk");
+        let default = crate::machine::update::DefaultSdk::new(directory.clone(), m.root.join("must-not-execute"), machine);
+        let sources = LocalSources::new(m.objects.clone(), InstallerConfig { default_sdk: Some(default.clone()), ..m.installer.clone() });
+        let manifest = write(&m.objects, "alice", br#"{"package":"local/example","release":"1"}"#);
+        assert_eq!(sources.install(&m.service, "bob", &manifest.digest, None, "", &|_| ()).err().unwrap().code, "local_source_incomplete");
+        assert!(default.resolved().is_none() && !directory.exists());
+        let _ = fs::remove_dir_all(&m.root);
+    }
+
+    /// Exact private/released native wheels, never relabeled. This proves the normal installer
+    /// consumes the lazy choice; PyPI discovery and GPU execution are separate boundaries.
+    #[test]
+    #[ignore = "requires genuine Runtime >=0.31 and TensorFS >=0.14 wheel artifacts"]
+    fn a_lazy_default_pair_installs_the_real_scalar_cohort_once() {
+        let m = machine("cm-default-sdk-cohort");
+        let wheels: Vec<PathBuf> = ["COZY_TEST_RUNTIME_WHEEL", "COZY_TEST_TENSORFS_WHEEL"].iter()
+            .map(|name| std::env::var_os(name).map(PathBuf::from).expect("exact native cohort artifact"))
+            .collect();
+        let store = crate::storage::open(&m.root.join("sdk-store")).unwrap();
+        let machine = crate::origin::Machine::new(store, None).unwrap();
+        let default = crate::machine::update::DefaultSdk::new(m.root.join("default-sdk"), "uv".into(), machine);
+        default.seed_verified(&wheels).unwrap(); // Uses production metadata/floor/content checks.
+        let config = InstallerConfig { default_sdk: Some(default.clone()), ..m.installer.clone() };
+        assert!(config.sdk.is_empty() && config.runtime_build.is_empty());
+        let published = crate::published::PackageSdk { default_sdk: Some(default.clone()), ..Default::default() };
+        assert_eq!(published.requirements(), config.sdk().iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>());
+        let sources = LocalSources::new(m.objects.clone(), config);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_lifecycle");
+        let tree = archive(&fixture, &["pyproject.toml", "package.toml", "cpu_lifecycle/__init__.py"]);
+        let source = write(&m.objects, "alice", &tree);
+        let manifest = serde_json::json!({"package":"local/tensord-cpu-lifecycle", "release":"0.1.0", "python_version":"3.12",
+            "source":{"digest":source.digest,"length":source.length}});
+        let manifest = write(&m.objects, "alice", manifest.to_string().as_bytes());
+        let first = sources.install(&m.service, "alice", &manifest.digest, None, "", &|_| ()).unwrap();
+        let held = m.service.catalog.resolve(&first.generation).unwrap();
+        assert_eq!(installed_sdk(&held.record.python), format!("{} {}", wheel_version(&wheels[0]), wheel_version(&wheels[1])));
+        assert!(held.record.sdk_fallback.is_empty() && held.record.runtime_build.is_empty());
+        named_runtime_loaded(&held.record.python);
+        run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_lifecycle; print(cpu_lifecycle.Done(3).steps)"]));
+        let second = sources.install(&m.service, "alice", &manifest.digest, None, "", &|_| ()).unwrap();
+        assert_eq!(first.generation, second.generation);
+        assert!(!m.root.join("sdk/current").exists());
+        let _ = fs::remove_dir_all(&m.root);
     }
 
     /// Remote edits get independent editable trees/environments. Explicit direct paths keep
