@@ -1501,10 +1501,9 @@ fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishe
     step!();
     drop(pin);
     step!();
-    // The copy must read the original contents before the in-place refill starts.
-    // Preparation may wait outside capture/replay: Source::read_placements retains its
-    // borrowed staging/source owners until the copy has completed. It cannot return a
-    // future-ready pin. Resident replay and allocator callbacks have separate no-wait tests.
+    // The copy must read the original contents before the in-place refill lands: the refill's
+    // copies wait for it in-stream. The rebind returns once they are issued (D), its page ready
+    // in-stream, while the fill thread's read keeps its staging until they complete.
     let _ = mem.free();
     let (again, waited) = std::thread::scope(|t| {
         let (rebind, waited) = watch(t, first, || mem.bind(s, 0, 0));
@@ -1516,7 +1515,7 @@ fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishe
     step!();
     assert_eq!(bytes(dst, REGION_ALIGN, 0), *block(2, 0));
     step!();
-    assert_ne!(waited, Waited::Returned, "refill preparation released its borrowed copy owners before the gated consumer completed");
+    assert_eq!(waited, Waited::Returned, "the rebind waited on the host for the gated consumer: its page reads ready at issue ({waited:?})");
     step!();
     let again = again.unwrap();
     step!();

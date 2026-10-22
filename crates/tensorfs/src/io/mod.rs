@@ -149,12 +149,17 @@ impl Dst {
     }
 }
 
+/// Told once all of a copy's device work is issued: its index and the engine streams it went on.
+/// Its bytes land in order there, so an event the caller records on each completes after them.
+pub type Issued<'a> = &'a (dyn Fn(usize, &[usize]) + Sync);
+
 /// `copies` in order, each one whose source and destination both continue the previous copy's
 /// merged into it: a fill reads one run per contiguous range, not one copy per tensor (v7's
-/// cold SDXL: thousands of small staged copies per fill).
-pub(crate) fn coalesce(copies: Vec<Copy<'_>>) -> Vec<Copy<'_>> {
+/// cold SDXL: thousands of small staged copies per fill). With each run, its first copy's index.
+pub(crate) fn coalesce(copies: Vec<Copy<'_>>) -> (Vec<Copy<'_>>, Vec<usize>) {
     let mut out: Vec<Copy> = Vec::with_capacity(copies.len());
-    for c in copies {
+    let mut firsts = Vec::with_capacity(copies.len());
+    for (i, c) in copies.into_iter().enumerate() {
         if let Some(last) = out.last_mut() {
             let n = last.dst.len();
             let follows = match (last.src, c.src) {
@@ -172,8 +177,9 @@ pub(crate) fn coalesce(copies: Vec<Copy<'_>>) -> Vec<Copy<'_>> {
             }
         }
         out.push(c);
+        firsts.push(i);
     }
-    out
+    (out, firsts)
 }
 
 /// Device regions' alignment in [`pack`]: DLPack's data alignment and `cuMemAlloc`'s, enough
@@ -194,20 +200,6 @@ pub fn pack(lens: impl IntoIterator<Item = usize>, align: usize) -> Option<(Vec<
     Some((offsets, end))
 }
 
-/// Called by [`read`] once for each copy that landed, with its index in `copies`, as soon as its
-/// bytes are complete at the destination: device bytes then serve any later stream operation.
-/// It runs on a TensorFS thread (a reader, or the reading one as the read ends), must not block
-/// or call into TensorFS, and copies land in no set order. A read that fails returns `Err`, and a
-/// copy it did not call back for did not land.
-#[derive(Clone)]
-pub struct Landed(pub std::sync::Arc<dyn Fn(usize) + Send + Sync>);
-
-impl std::fmt::Debug for Landed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Landed")
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct ReadOpts {
     /// Reads in flight at once.
@@ -218,8 +210,6 @@ pub struct ReadOpts {
     pub streams: usize,
     /// Read what the page cache lacks with O_DIRECT, where the filesystem allows.
     pub direct: bool,
-    /// Told of each copy as it lands, before the read returns; `None` costs nothing.
-    pub landed: Option<Landed>,
 }
 
 impl Default for ReadOpts {
@@ -229,7 +219,6 @@ impl Default for ReadOpts {
             request: 1 << 20,
             streams: 2,
             direct: true,
-            landed: None,
         }
     }
 }
@@ -291,21 +280,23 @@ pub fn drain(device: i32) -> cuda::Result<()> {
 /// An error or best-effort destructor is not a proof that borrowed memory is reusable.
 /// Host destinations use joined CPU copies from owned staging, never asynchronous GPU writes.
 pub unsafe fn read(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats, Error> {
-    unsafe { read_impl(copies, opts, false) }
+    unsafe { read_impl(copies, opts, false, None) }
 }
 
 /// Temporary host sources are copied only into the same bounded engine-owned B7 slots.
 /// GPU work never borrows those host source addresses beyond this call, including on error.
 /// Device destination ownership still follows `read`'s checked error-completion contract.
+/// `issued` hears of each device copy as its work is all issued (host destinations: never).
 #[cfg(any(feature = "store", unix))]
-pub(crate) unsafe fn read_staged(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats, Error> {
-    unsafe { read_impl(copies, opts, true) }
+pub(crate) unsafe fn read_staged(copies: &[Copy], opts: &ReadOpts, issued: Option<Issued>) -> Result<ReadStats, Error> {
+    unsafe { read_impl(copies, opts, true, issued) }
 }
 
 unsafe fn read_impl(
     copies: &[Copy],
     opts: &ReadOpts,
     staged_host: bool,
+    issued: Option<Issued>,
 ) -> Result<ReadStats, Error> {
     let start = Instant::now();
     for (copy, c) in copies.iter().enumerate() {
@@ -347,12 +338,9 @@ unsafe fn read_impl(
         })?;
         #[cfg(unix)]
         disk_run(&host_copies, &stats, host_start.elapsed().as_nanos() as u64);
-        if let Some(landed) = &opts.landed {
-            host.iter().for_each(|(copy, _)| (landed.0)(*copy));
-        }
         stats
     };
-    let device = unsafe { device::fill(&devices, opts, staged_host) }?;
+    let device = unsafe { device::fill(&devices, opts, staged_host, issued) }?;
     stats.direct += device.direct;
     stats.cached += device.cached;
     stats.bounced += device.bounced;
@@ -402,12 +390,14 @@ mod tests {
             Copy { src: Src::File(&b, 148), dst: device(5000, 10) },
             Copy { src: Src::File(&b, 158), dst: Dst::Device { device: 0, ptr: 5010, len: 10, stream: 8 } },
         ];
-        let runs: Vec<(usize, usize)> = coalesce(copies).iter().map(|c| (match c.dst { Dst::Device { ptr, .. } => ptr as usize, Dst::Host { .. } => 0 }, c.dst.len())).collect();
+        let (merged, firsts) = coalesce(copies);
+        assert_eq!(firsts, [0, 2, 4, 5, 6, 7]);
+        let runs: Vec<(usize, usize)> = merged.iter().map(|c| (match c.dst { Dst::Device { ptr, .. } => ptr as usize, Dst::Host { .. } => 0 }, c.dst.len())).collect();
         assert_eq!(runs, [(4096, 128), (4224, 96), (4320, 10), (4330, 10), (5000, 10), (5010, 10)]);
-        let mut host = vec![0u8; 64];
+        let mut host = [0u8; 64];
         let (left, right) = host.split_at_mut(16);
         let bytes = [1u8; 64];
-        let merged = coalesce(vec![
+        let (merged, _) = coalesce(vec![
             Copy { src: Src::Host(bytes.as_ptr()), dst: Dst::host(left) },
             Copy { src: Src::Host(bytes[16..].as_ptr()), dst: Dst::host(right) },
         ]);

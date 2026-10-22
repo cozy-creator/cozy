@@ -439,14 +439,15 @@ fn idle_work_takes_free_bytes_only() {
     let (_scope, ledger, mem, g) = open("idle-work", 8 * MB);
     mem.load(set(dir.path(), "n", 3, &g.uuid), Level::Gpu).unwrap();
     let a = mem.load(set(dir.path(), "a", 2, &g.uuid), Level::Ram).unwrap();
-    let idle_pages = || ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum::<u64>();
-    assert_eq!(idle_pages(), 3 * 2 * MB);
+    // Mapped pages, whatever their class (a Keep's protect pins one a moment).
+    let mapped = || ledger.status().rows.iter().map(|r| r.classes.iter().skip(varena::table::Class::S.index()).sum::<u64>()).sum::<u64>();
     let first = mem.bind_free(a, 0, 0).unwrap();
+    assert_eq!(mapped(), 4 * 2 * MB);
     assert!(matches!(mem.bind_free(a, 1, 0), Err(varena::Error::Exhausted(_))), "no free page left");
     let r = mem.request_idle("capture", plan("a")).unwrap();
     let pass = r.pass(a, "k").unwrap();
     assert!(matches!(mem.make_room(2 * MB), Err(varena::Error::Exhausted(_))), "an idle request's hook takes nothing");
-    assert_eq!(idle_pages(), 3 * 2 * MB, "nothing was taken");
+    assert_eq!(mapped(), 4 * 2 * MB, "nothing was taken");
     pass.end(0);
     drop((r, first));
     let r = mem.request("ordinary", plan("a")).unwrap();
