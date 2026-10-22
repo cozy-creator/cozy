@@ -275,6 +275,15 @@ class Placeholder(Tensor):
     def __repr__(self) -> str:  # type: ignore[override]
         return f"Placeholder({tuple(self.shape)}, {self.dtype}, {self.device})"
 
+    def _varena_read(self) -> Tensor:
+        """Its block bound for a read no op sees (a compiled extension or Triton launch reads it
+        by pointer, which is 0 here): the bound tensor, which with what views it holds the pin
+        until it dies, so past that launch."""
+        if self.block is None:
+            raise Unbound("a placeholder of no registered block")
+        with self.block.model.memory._reading([self.block]):
+            return _real(self)
+
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
         aten, kwargs = torch.ops.aten, kwargs or {}
