@@ -477,6 +477,15 @@ impl Shared {
         Ok(true)
     }
 
+    /// Retire the row lock before its heap record becomes reusable, under the same heap
+    /// lock as allocation. The Row value may live until its destructor finishes afterward.
+    fn release_row(&self, row: &Row) -> Result<bool> {
+        let m = self.map()?;
+        let _heap = self.heap()?;
+        os::unlock(&row._lock, row.at, ROW_CELLS * CELL)?;
+        self.free_locked(m, row.at, row.word, false)
+    }
+
     /// After a row left: with no row left and nobody else holding the table open, its name
     /// goes (a standalone engine's table, its last user gone).
     fn leave(&self) -> Result<()> {
@@ -939,7 +948,7 @@ impl Drop for Row {
     fn drop(&mut self) {
         self.publish(&Facts::default());
         self.set_orphans(0);
-        if self.shared.free(self.at, self.word, false).unwrap_or(false) {
+        if self.shared.release_row(self).unwrap_or(false) {
             let _ = self.shared.leave();
             self.shared.ring();
         }
@@ -1199,7 +1208,10 @@ impl Ledger {
     /// process's services accept (a granted set, never any peer).
     pub fn grant(&self, pid: u32) -> Result<Grant> {
         os::accept_uid(os::uid_of(pid)?);
-        Ok(Grant { table: self.shared.descriptor()?, row: self.shared.descriptor()? })
+        let table = self.shared.descriptor()?;
+        // A transferred grant owns this generation even before the child creates its row.
+        os::share(&table, OPEN, 8, true)?;
+        Ok(Grant { table, row: self.shared.descriptor()? })
     }
 
     /// After `waitpid`: `pid`'s row goes, and the pages it kept become orphans.
@@ -1459,6 +1471,21 @@ mod tests {
         assert_eq!(second.ask(row_id(at, stale), Class::N, 1).unwrap(), 0);
         drop(second);
         os::unlink(&gpu.uuid);
+    }
+
+    #[test]
+    fn a_retired_row_releases_its_lock_before_the_offset_is_reused() {
+        let gpu = GpuId { uuid: format!("unit-{}-row-release", std::process::id()), model: "host".into(), memory: 64 << 20 };
+        let shared = Arc::new(Shared::adopt(open_named(&gpu.uuid).unwrap(), &gpu, gpu.memory).unwrap());
+        let old = shared.claim(std::process::id()).unwrap();
+        assert!(shared.release_row(&old).unwrap());
+        // Keep the old Row and its descriptor alive, as while its destructor is still doing
+        // table cleanup. The new row must already be able to lock this exact offset.
+        let next = shared.claim(std::process::id()).unwrap();
+        assert_eq!(next.at, old.at);
+        assert_ne!(next.word, old.word);
+        drop(old);
+        assert!(shared.names(next.id()).unwrap());
     }
 
     #[test]
