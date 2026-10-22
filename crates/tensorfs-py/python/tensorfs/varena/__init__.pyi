@@ -7,7 +7,7 @@ holds the block until the last one dies. Every call releases the GIL; a panic ra
 `VarenaError` with code `INTERNAL`.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Final, Literal
 
 from .._ext import Checkpoint
@@ -137,17 +137,13 @@ class Memory:
         """Registers `set` and brings it to `level`; its id."""
 
     def unload(self, set: int) -> None: ...
-    def trim_with(self, trim: Callable[[], int]) -> None:
-        """The allocator's trim (torch's `empty_cache`), returning the bytes it freed (called from
-        varena's thread): a demand trims before it evicts anything."""
-
     def fill(self, set: int, fill: Fill) -> None:
         """`set`'s current fill (a no-op when unchanged): pages filled under another come back
         fresh."""
-    def cache(self, owner: str, shrink: Callable[[int], int | tuple[int, int]], sets: Sequence[int] = ()) -> int:
-        """Bytes the caller holds that `shrink(want)` gives back (from varena's thread): `freed`,
-        or `(freed, coming)` when a queued drop returns the rest later and `cached` reports it.
-        A cache owned by a request id ends with it; one serving `sets` takes their class."""
+    def cache(self, owner: str, shrink: Callable[[int], int]) -> int:
+        """Bytes the caller holds that `shrink(want) -> freed` gives back (from varena's thread,
+        never inside torch's allocator), after idle pages, least recently used first. A cache
+        owned by a request id ends with it."""
 
     def cached(self, cache: int, nbytes: int) -> None: ...
     def hold_cache(self, cache: int) -> int:
@@ -157,111 +153,52 @@ class Memory:
         """Ends `hold` once the work queued on `stream` so far completes."""
 
     def uncache(self, cache: int) -> None: ...
-    def request(self, id: str, plan: list[tuple[list[str], int]]) -> Request:
-        """Opens request `id`; `plan` is its steps, each `(set names, passes)`."""
+    def request(self, id: str, plan: list[tuple[list[str], int]], idle: bool = False) -> Request:
+        """Opens request `id`; `plan` is its steps, each `(set names, passes)`. An `idle` one (a
+        capture or warm-up beside others' work) takes free bytes only: it evicts nothing."""
 
     def retain(self, set: int, blocks: list[int]) -> Retained: ...
-    def workspace(self, bytes: int, allocated: int, reserved: int) -> Workspace: ...
-    def observe(self, allocated: int, reserved: int) -> None: ...
     def context_measurable(self) -> bool: ...
-    def workspace_available(self, allocated: int, reserved: int) -> Workspace: ...
-    def bind(self, set: int, block: int, stream: int = 0) -> Pin:
+    def bind(self, set: int, block: int, stream: int = 0, evict: bool = True) -> Pin:
         """Block (region) `block` of `set`, mapped and filled; `stream` (a CUstream, 0 the default)
-        waits on the fill, and tensors made from the pin are consumed on it only."""
+        waits on the fill, and tensors made from the pin are consumed on it only. With `evict`
+        false it maps into free bytes only, `Exhausted` at once when they are short."""
 
-    def torch_limit(self) -> int:
-        """Bytes torch's allocator may hold now."""
-    def torch_ceiling(self) -> int:
-        """The most torch's allocator could ever hold here (allocated + reachable): the fraction
-        cap beside the native pool, whose segments varena's allocator governs inside it."""
+    def free(self) -> int:
+        """The row's free bytes now: its budget less its context, pages, mappings and segments."""
 
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
 
 class Request:
-    def pass_(self, set: int, entry: str, shape: str, allocated: int, reserved: int) -> Pass:
-        """A pass of `set` entered at `entry` (the module's path in the model, "" the root) at
-        `shape` (its tensors' dims joined by `x`), with torch's bytes now; returns once its
-        measured room is free. Rooms match on (set, entry) and interpolate over shapes."""
+    def pass_(self, set: int, key: str) -> Pass:
+        """A pass of `set` keyed `key` (`entry|dims`): the plan's cursor moves to it."""
 
     def plan(self, plan: list[tuple[list[str], int]]) -> None:
         """Replaces the plan; its cursor starts over."""
 
-    def oom(
-        self,
-        set: int | None,
-        allocated: int,
-        reserved: int,
-        need: int | None = None,
-        site: str | None = None,
-        collective: bool = False,
-        finest: int = 0,
-        shape: str = "",
-    ) -> Next:
-        """An op of `set`'s pass (None: outside any pass) ran out of memory (`need` more bytes
-        when known) at cut site `site` (None: it cannot be cut) whose op has shape key `shape`,
-        cut no finer than `finest`, with torch's bytes now; a `collective` site's finer level
-        waits for the next pass's agreement."""
-
-    def parked(self, nbytes: int) -> None:
-        """The bytes a `Park` answer moved to the host (0: none, and the next `oom` is Exhausted)."""
-
-    def cut(self, set: int | None, site: str, shape: str = "") -> int:
-        """The cut level of `set`'s current pass for `site` (0: whole); with no set (outside any
-        pass) the request's own memo of that site at the op's shape key `shape`."""
-
-    def allocating(self, memory: Memory, reserved: int, pool: tuple[int, int] = (0, 0)) -> None:
-        """This thread's segments for torch's pool `pool` are this request's from now on, with
-        torch's `reserved` bytes now: a shortfall claims from the request's stock."""
-
-    def yielding(self, family: str) -> Yielded:
-        """The request waits on a call of its `family` (a child): until the guard ends it gives
-        back its reserved room to that family alone; ended, it waits for its room back."""
+    def allocating(self, memory: Memory, pool: tuple[int, int] = (0, 0)) -> None:
+        """This thread's segments for torch's pool `pool` are this request's from now on: a
+        shortfall makes room in `memory`."""
 
     def stats(self) -> Stats: ...
-    def outside(self, peak: int) -> None:
-        """Torch's allocated peak outside its passes (its setup, between passes), less what was
-        allocated at its start: recorded at its end as its dispatch key's outside room."""
-    def spare(self) -> int:
-        """Bytes the request could have now beside every W and P page without evicting one, as
-        the last publication measured them (no lock): a capture's room before it captures."""
     def end(self) -> Stats:
-        """Ends it: its pins, rooms and caches go."""
+        """Ends it: its pins and caches go."""
 
 def allocated() -> None:
     """SPIKE: this thread's pass is over for torch's pool (`Request.allocating`)."""
 
 def allocator_stats(device: int | None = None, pool: tuple[int, int] | None = None) -> tuple[int, int, int, int, int, int, int]:
-    """SPIKE: the pool's segments: (live bytes, segments made, shortfalls varena resolved, their
-    bytes, refusals, nanoseconds making segments, segments freed)."""
+    """The pool's segments: (live bytes, segments made, make_room calls, NULLs for torch's
+    release, refusals, nanoseconds making segments, segments freed)."""
 
-def allocator_reentries() -> tuple[int, int]:
-    """SPIKE: the trims and cache shrinks varena reached on a thread inside the allocator
-    (answered 0, never run)."""
+def allocator_retire(device: int, pool: tuple[int, int]) -> None:
+    """Torch dropped `pool` (a request's end): its segments come back as torch releases them,
+    and an allocation short of room first lets torch's retry release them."""
 
 class Pass:
-    def end(self, allocated_peak: int, slack: int, sites: list[tuple[str, int, bool, int]], allocated: int, reserved: int) -> None:
-        """Records what the pass measured (torch's absolute allocated peak, the allocator's slack
-        at it, each cut site's `(name, peak, collective, finest)`) and torch's bytes now;
-        dropping it unended records nothing."""
-
-    def measured(self) -> bool:
-        """Whether its room is the one measured for its set, shape and cut levels."""
-
-    def levels(self) -> list[tuple[str, int]]:
-        """Its collective sites' proposed `(site, level)`, for the ranks to agree before any
-        exchange."""
-
-    def agree(self, levels: list[tuple[str, int]]) -> None:
-        """The levels the ranks agreed (the maximum of their proposals): in effect for it."""
-
-class Yielded:
-    """A request waiting on a child call (`Request.yielding`): `end`, or leaving its `with`, ends
-    the wait."""
-
-    def end(self) -> None: ...
-    def __enter__(self) -> Yielded: ...
-    def __exit__(self, *exc: object) -> None: ...
+    def end(self, peak: int) -> None:
+        """Records torch's allocated peak over the pass (absolute)."""
 
 class Pin:
     @property
@@ -306,33 +243,6 @@ class Window:
     ) -> object: ...
     def __dlpack_device__(self) -> tuple[int, int]: ...
 
-class Next:
-    """`Request.oom`'s answer."""
-
-    class Retry(Next):
-        def __init__(self) -> None: ...
-
-    class Cut(Next):
-        """Run the op one level finer: at `level`."""
-
-        def __init__(self, level: int) -> None: ...
-        @property
-        def level(self) -> int: ...
-
-    class Park(Next):
-        """Move idle activations, up to `budget` bytes, to the host; report them with `parked`."""
-
-        def __init__(self, budget: int) -> None: ...
-        @property
-        def budget(self) -> int: ...
-
-    class Exhausted(Next):
-        """`error` is the `Exhausted` to raise."""
-
-        def __init__(self, error: object) -> None: ...
-        @property
-        def error(self) -> Exhausted: ...
-
 class Fills:
     @property
     def bytes(self) -> int: ...
@@ -369,12 +279,10 @@ class StepStats:
     @property
     def capacity(self) -> int: ...
     @property
-    def w(self) -> int: ...
-    @property
     def evicted(self) -> list[int]: ...
 
 class Stats:
-    """One request's record; `evicted` is by class (F, O, S, N, D, W, P)."""
+    """One request's record; `evicted` is what make_room took, by class (F, O, S, N, D, W, P)."""
 
     @property
     def request(self) -> str: ...
@@ -389,23 +297,15 @@ class Stats:
     @property
     def evicted(self) -> list[int]: ...
     @property
-    def evicted_lowered(self) -> int: ...
-    @property
-    def speculative_evicted_d(self) -> int: ...
-    @property
-    def retries(self) -> int: ...
-    @property
-    def cuts(self) -> int: ...
-    @property
-    def parks(self) -> int: ...
-    @property
-    def parked(self) -> int: ...
-    @property
-    def lowered(self) -> bool: ...
-    @property
     def peak(self) -> int: ...
     @property
+    def compute(self) -> int: ...
+    @property
     def leftover(self) -> int: ...
+    @property
+    def make_room(self) -> list[tuple[int, str, int, int, int]]:
+        """Each make_room that took bytes: (step, trigger, need, freed, release events waited on)."""
+
     def json(self) -> str:
         """The record as JSON, field for field (what a Runtime relays)."""
 
@@ -418,16 +318,12 @@ class Retained:
 
 class StaleBinding(VarenaError): ...
 
-class Workspace:
-    def __enter__(self) -> None: ...
-    def __exit__(self, ty: object, value: object, trace: object) -> None: ...
-
 def allocator_pending(device: int) -> int: ...
 
 def allocator_check(device: int) -> None: ...
 
-def allocator_refusals(device: int | None = None) -> list[tuple[int, tuple[int, int], str, int, int, int]]:
-    """Each device and pool's last refusal: (device, pool, reason, size, held bytes, limit)."""
+def allocator_refusals(device: int | None = None) -> list[tuple[int, tuple[int, int], str, int, int]]:
+    """Each device and pool's last refusal: (device, pool, reason, size, the row's free bytes)."""
 
 def pins_held() -> int:
     """Pins the binding holds now: Python's pin objects and the tensors that keep one."""

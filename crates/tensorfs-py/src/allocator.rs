@@ -1,39 +1,43 @@
-//! Torch pool segments, with recovery inside the failed allocation. All accounting is scoped
-//! by CUDA device and pool. Callbacks never enter Python, manipulate the GIL, or wait for CUDA
-//! events. Reclaim only touches completed Varena pages; other reclaim is done before execution.
-//! A capture can consume prewarmed pool segments, but cannot grow the pool or enter recovery.
+//! Torch pool segments, made room for inside the allocation. All accounting is scoped by CUDA
+//! device and pool. Callbacks never enter Python or manipulate the GIL. A segment the row's free
+//! bytes cover is mapped; otherwise torch's unused segments go first (a NULL lets torch's retry
+//! release a dropped pool's), then varena's `make_room` evicts pages and maps. A capture can
+//! consume prewarmed pool segments, but cannot grow the pool or make room.
 //! Driver calls run in relaxed capture mode, as torch's own capture-time cudaMalloc does: they
 //! never invalidate another thread's capture. A segment whose release cannot be ordered (freed
 //! during capture, or its completion unrecordable) is quarantined: it stays charged and is never
 //! reused. Only a sticky CUDA error or unprovable ownership faults the device.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Instant;
 
 use tensorfs::io::cuda;
-use varena::{Memory, Request, Workspace};
+use varena::{Memory, Request};
 
 type Pool = (u64, u64);
-pub type Refusal = (i32, Pool, &'static str, u64, u64, u64);
+pub type Refusal = (i32, Pool, &'static str, u64, u64);
 
 #[derive(Clone)]
 struct Active {
     memory: Arc<Memory>,
-    request: Arc<Request>,
-    outside: u64,
+    _request: Arc<Request>,
     device: i32,
     pool: Pool,
+    /// Its one NULL for torch's retry to release dropped pools' segments has been spent.
+    released: Arc<AtomicBool>,
 }
 
 thread_local! {
     static ACTIVE: RefCell<Vec<Active>> = const { RefCell::new(Vec::new()) };
-    static WORKSPACES: RefCell<Vec<Arc<Workspace>>> = const { RefCell::new(Vec::new()) };
     static INSIDE: Cell<bool> = const { Cell::new(false) };
+    /// The size this thread's last allocation returned NULL for, to let torch release segments:
+    /// torch's retry of it (the same size, next on this thread) makes room.
+    static RELEASING: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// CU_STREAM_CAPTURE_MODE_RELAXED.
@@ -75,13 +79,15 @@ struct Counters {
     live: u64,
     pending: u64,
     segments: u64,
-    resolved: u64,
-    resolved_bytes: u64,
     refused: u64,
     ns: u64,
     frees: u64,
+    /// make_room calls, and NULLs returned for torch to release dropped pools' segments first
+    rooms: u64,
+    released: u64,
     quarantined: u64,
-    refusal: Option<(&'static str, u64, u64, u64)>,
+    /// why, size, this row's free bytes then
+    refusal: Option<(&'static str, u64, u64)>,
     quarantine: Option<&'static str>,
 }
 
@@ -100,6 +106,8 @@ struct Accounts {
     pointers: BTreeMap<usize, Allocation>,
     faults: BTreeMap<i32, String>,
     quarantined: Vec<Allocation>,
+    /// Pools torch dropped (`retire`): their segments come back through torch's release.
+    retired: BTreeSet<(i32, Pool)>,
 }
 
 impl Accounts {
@@ -110,6 +118,14 @@ impl Accounts {
         c.live = c.live.saturating_sub(allocation.bytes);
         if allocation.pending { c.pending = c.pending.saturating_sub(allocation.bytes); }
         c.frees += 1;
+        if c.live == 0 {
+            self.retired.remove(&(allocation.device, allocation.pool));
+        }
+    }
+
+    /// Bytes in dropped pools' segments: torch's retry releases those it holds unused.
+    fn retired_live(&self, device: i32) -> u64 {
+        self.retired.iter().filter(|(d, _)| *d == device).filter_map(|k| self.counts.get(k)).map(|c| c.live - c.pending.min(c.live)).sum()
     }
 
     fn failed_release(&mut self, allocation: Allocation, reason: String) {
@@ -118,14 +134,10 @@ impl Accounts {
     }
 }
 
-static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new() });
+static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new(), retired: BTreeSet::new() });
 
 fn accounts() -> std::sync::MutexGuard<'static, Accounts> {
     ACCOUNTS.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-fn live(device: i32) -> u64 {
-    accounts().counts.iter().filter(|((d, _), _)| *d == device).map(|(_, c)| c.live).sum()
 }
 
 /// Segments torch has logically freed but whose GPU retirement has not completed.
@@ -168,13 +180,8 @@ pub fn quarantined(device: Option<i32>) -> Vec<(i32, Pool, u64, &'static str)> {
         .filter_map(|((d, p), c)| c.quarantine.map(|why| (*d, *p, c.quarantined, why))).collect()
 }
 
+/// This thread is inside torch's allocator (its lock held): no Python runs here.
 pub fn inside() -> bool { INSIDE.with(Cell::get) }
-// Retained for diagnostics of attempts to enter Python hooks from a native callback.
-static TRIMS_INSIDE: AtomicU64 = AtomicU64::new(0);
-static SHRINKS_INSIDE: AtomicU64 = AtomicU64::new(0);
-pub fn trim_inside() { TRIMS_INSIDE.fetch_add(1, Relaxed); }
-pub fn shrink_inside() { SHRINKS_INSIDE.fetch_add(1, Relaxed); }
-pub fn reentries() -> (u64, u64) { (TRIMS_INSIDE.load(Relaxed), SHRINKS_INSIDE.load(Relaxed)) }
 
 struct Inside(bool);
 impl Inside {
@@ -184,26 +191,34 @@ impl Drop for Inside {
     fn drop(&mut self) { INSIDE.with(|v| v.set(self.0)); }
 }
 
-pub fn enter(memory: Arc<Memory>, request: Arc<Request>, reserved: u64, device: i32, pool: Pool) {
-    let outside = reserved.saturating_sub(live(device));
-    ACTIVE.with(|a| a.borrow_mut().push(Active { memory, request, outside, device, pool }));
+pub fn enter(memory: Arc<Memory>, request: Arc<Request>, device: i32, pool: Pool) {
+    ACTIVE.with(|a| a.borrow_mut().push(Active { memory, _request: request, device, pool, released: Arc::default() }));
 }
 pub fn exit() { ACTIVE.with(|a| a.borrow_mut().pop()); }
-pub fn workspace_enter(workspace: Arc<Workspace>) { WORKSPACES.with(|b| b.borrow_mut().push(workspace)); }
-pub fn workspace_exit() { WORKSPACES.with(|b| b.borrow_mut().pop()); }
 
+/// Torch dropped `pool` on `device` (a request's end): its segments come back as torch releases
+/// them, and until then an allocation that needs room lets torch's retry release them first.
+pub fn retire(device: i32, pool: Pool) {
+    let mut all = accounts();
+    if all.counts.get(&(device, pool)).is_some_and(|c| c.live > 0) {
+        all.retired.insert((device, pool));
+    }
+}
+
+/// (live bytes, segments made, make_room calls, NULLs for torch's release, refusals,
+/// nanoseconds making segments, segments freed).
 pub fn stats(device: Option<i32>, pool: Option<Pool>) -> (u64, u64, u64, u64, u64, u64, u64) {
     let c = accounts().counts.iter().filter(|((d, p), _)| device.is_none_or(|want| *d == want) && pool.is_none_or(|want| *p == want)).fold(Counters::default(), |mut a, (_, c)| {
-        a.live += c.live; a.segments += c.segments; a.resolved += c.resolved;
-        a.resolved_bytes += c.resolved_bytes; a.refused += c.refused; a.ns += c.ns; a.frees += c.frees; a
+        a.live += c.live; a.segments += c.segments; a.rooms += c.rooms;
+        a.released += c.released; a.refused += c.refused; a.ns += c.ns; a.frees += c.frees; a
     });
-    (c.live, c.segments, c.resolved, c.resolved_bytes, c.refused, c.ns, c.frees)
+    (c.live, c.segments, c.rooms, c.released, c.refused, c.ns, c.frees)
 }
 
 /// Last refusal by device/pool. Collected outside the callback: no callback logging or Python.
 pub fn refusals(device: Option<i32>) -> Vec<Refusal> {
     accounts().counts.iter().filter(|((d, _), _)| device.is_none_or(|want| *d == want))
-        .filter_map(|((d, p), c)| c.refusal.map(|(why, size, held, limit)| (*d, *p, why, size, held, limit))).collect()
+        .filter_map(|((d, p), c)| c.refusal.map(|(why, size, free)| (*d, *p, why, size, free))).collect()
 }
 
 fn capturing(stream: *mut c_void) -> bool {
@@ -224,14 +239,22 @@ fn segment(size: usize) -> Result<cuda::CUdeviceptr, cuda::CUresult> {
 
 fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     let _inside = Inside::enter();
-    if fault_message(device).is_some() {
-        let held = live(device);
+    // Torch's retry of this thread's last NULL (the same size): make room now.
+    let retry = RELEASING.with(Cell::take) == Some(size);
+    let active = ACTIVE.with(|a| a.borrow().iter().rev().find(|p| p.device == device).cloned());
+    let key = (device, active.as_ref().map_or((0, 0), |a| a.pool));
+    let bytes = size as u64;
+    let free = || active.as_ref().map_or(u64::MAX, |a| a.memory.free());
+    let refuse = |why: &'static str| {
+        let free = free();
         let mut all = accounts();
-        let pool = ACTIVE.with(|a| a.borrow().iter().rev().find(|p| p.device == device).map_or((0, 0), |a| a.pool));
-        let c = all.counts.entry((device, pool)).or_default();
+        let c = all.counts.entry(key).or_default();
         c.refused += 1;
-        c.refusal = Some(("ownership_fault", size as u64, held, 0));
-        return std::ptr::null_mut();
+        c.refusal = Some((why, bytes, free));
+        std::ptr::null_mut()
+    };
+    if fault_message(device).is_some() {
+        return refuse("ownership_fault");
     }
     let Ok(driver) = cuda::driver() else { return std::ptr::null_mut() };
     let mut context = std::ptr::null_mut();
@@ -240,78 +263,56 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
         accounts().faults.entry(device).or_insert_with(|| "allocation has no current CUDA context".into());
         return std::ptr::null_mut();
     }
-    let began = Instant::now();
-    let active = ACTIVE.with(|a| a.borrow().iter().rev().find(|p| p.device == device).cloned());
-    let budget = active.as_ref().and_then(|a| WORKSPACES.with(|b| b.borrow().iter().rev().find(|b| b.belongs_to(&a.memory)).cloned()));
-    let pool = active.as_ref().map_or((0, 0), |a| a.pool);
-    let key = (device, pool);
     if capturing(stream) {
-        let held = live(device);
-        let mut all = accounts();
-        let c = all.counts.entry(key).or_default();
-        c.refused += 1;
-        c.refusal = Some(("capture_growth", size as u64, held, 0));
-        return std::ptr::null_mut();
+        return refuse("capture_growth");
     }
-    let mut previous = None;
-    let mut reclaimed_total = 0;
-    let mut refusal;
+    let began = Instant::now();
+    // The room asked of make_room: the segment, and a page more each time the driver refuses
+    // what the row's figure says is free (bytes no row accounts for, or its fragments).
+    let mut need = bytes;
+    let mut claim = None;
     let ptr = loop {
-        let held = active.as_ref().map_or(live(device), |a| a.outside.saturating_add(live(device)));
-        let limit = match active.as_ref() {
-            None => u64::MAX,
-            Some(a) => match a.memory.allocator_limit() { Some(n) => n.saturating_add(budget.as_ref().map_or(0, |b| b.remaining())), None => { refusal = ("state_unavailable", size as u64, held, 0); break 0 } },
-        };
-        refusal = ("workspace", size as u64, held, limit);
-        if budget.as_ref().is_some_and(|b| b.remaining() < size as u64) { break 0; }
-        let result = if held.saturating_add(size as u64) <= limit {
-            let credit = match &budget {
-                Some(b) => match b.take(size as u64) { Some(c) => Some(c), None => { refusal = ("state_unavailable", size as u64, held, 0); break 0 } },
-                None => None,
-            };
-            let result = segment(size);
-            if result.is_ok() { if let Some(credit) = credit { credit.commit(); } }
-            result
-        } else { Err(cuda::ERROR_OUT_OF_MEMORY) };
-        match result {
-            Ok(ptr) => break ptr,
-            Err(cuda::ERROR_OUT_OF_MEMORY) => {
-                refusal = ("driver_capacity", size as u64, held, limit);
-                let Some(a) = active.as_ref() else { break 0 };
-                // Neither a changed watermark nor a stale free count can spin forever. A new
-                // attempt requires actual reclaimed bytes or a strictly larger available cap.
-                let state = (held, limit);
-                refusal.0 = "no_progress";
-                if previous == Some(state) { break 0; }
-                previous = Some(state);
-                let reclaimed = a.request.reclaim_allocation(size as u64).unwrap_or(0);
-                refusal.0 = "no_reclaim";
-                if reclaimed == 0 { break 0; }
-                reclaimed_total += reclaimed;
-            }
-            Err(code) if capture_error(code) => {
-                refusal = ("capture", size as u64, held, limit);
-                break 0;
-            }
-            Err(code) => {
-                refusal = ("driver_error", size as u64, held, limit);
-                if sticky(code) {
-                    accounts().faults.entry(device).or_insert_with(|| format!("CUDA allocation failed with sticky error {code}"));
+        if claim.is_some() || free() >= need {
+            match segment(size) {
+                Ok(ptr) => break ptr,
+                Err(cuda::ERROR_OUT_OF_MEMORY) if active.is_none() => return refuse("driver_capacity"),
+                Err(cuda::ERROR_OUT_OF_MEMORY) => {
+                    drop(claim.take());
+                    need += varena::layout::REGION_ALIGN;
                 }
-                break 0;
+                Err(code) if capture_error(code) => return refuse("capture"),
+                Err(code) => {
+                    if sticky(code) {
+                        accounts().faults.entry(device).or_insert_with(|| format!("CUDA allocation failed with sticky error {code}"));
+                    }
+                    return refuse("driver_error");
+                }
             }
         }
+        let Some(a) = active.as_ref() else { return refuse("driver_capacity") };
+        // Torch's unused segments first: a dropped pool's come back through torch's retry, once
+        // per routing (it syncs the pool's events), and only while one holds segments.
+        if !retry && !a.released.load(Relaxed) && accounts().retired_live(device) > 0 {
+            a.released.store(true, Relaxed);
+            RELEASING.with(|r| r.set(Some(size)));
+            accounts().counts.entry(key).or_default().released += 1;
+            return std::ptr::null_mut();
+        }
+        accounts().counts.entry(key).or_default().rooms += 1;
+        match a.memory.make_room(need) {
+            Ok(room) => claim = Some(room),
+            Err(_) => return refuse("exhausted"),
+        }
     };
-    let resident = (ptr != 0).then(|| active.as_ref().map(|a| a.memory.resident(size as u64))).flatten();
+    // The segment counts from now on; the claim (room held for it, perhaps pages more) goes after.
+    let resident = active.as_ref().map(|a| a.memory.resident(bytes));
+    drop(claim);
     let mut all = accounts();
     let c = all.counts.entry(key).or_default();
     c.ns += began.elapsed().as_nanos() as u64;
-    if ptr == 0 { c.refused += 1; c.refusal = Some(refusal); }
-    else {
-        c.live += size as u64; c.segments += 1;
-        if reclaimed_total != 0 { c.resolved += 1; c.resolved_bytes += reclaimed_total; }
-        all.pointers.insert(ptr as usize, Allocation { device, context: context as usize, pool, bytes: size as u64, pending: false, _resident: resident });
-    }
+    c.live += bytes;
+    c.segments += 1;
+    all.pointers.insert(ptr as usize, Allocation { device, context: context as usize, pool: key.1, bytes, pending: false, _resident: resident });
     ptr as *mut c_void
 }
 

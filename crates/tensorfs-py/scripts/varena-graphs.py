@@ -77,7 +77,7 @@ def main():
         for i, (layer, binding) in enumerate(zip(model.layers, bindings, strict=True)):
             pool = mem.new_pool()
             graph = torch.cuda.CUDAGraph()
-            with binding.prepare(stream, workspace=None):
+            with binding.prepare(stream):
                 with mem.allocating(pool):
                     static = source.to(mem.device)
                     # Prewarm exactly the pool passed to capture, never the default request pool.
@@ -102,7 +102,7 @@ def main():
     def run(label, value, force_evict):
         moved = None
         start = time.perf_counter()
-        with torch.inference_mode(), mem.request(label, plan=[model]) as request, placed.passing("", (value,), {}):
+        with torch.inference_mode(), mem.request(label, plan=[model]) as request, placed.passing():
             x = value.to(mem.device)
             for i, (binding, graph, pool, static, output, address) in enumerate(records):
                 with binding.prepare(stream):
