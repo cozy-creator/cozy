@@ -1,5 +1,5 @@
-//! The real Memory, ledger, custody and RAM tier over host pages, across real processes. The
-//! parent plays TensorD (the ledger, custody, the tier); each child is this binary as an agent
+//! The real Memory, ledger and custody over host pages, across real processes. The parent
+//! plays TensorD (the ledger, custody); each child is this binary as an agent
 //! that runs one command per stdin line over its own `Memory` and answers on stdout.
 
 use std::collections::HashMap;
@@ -13,34 +13,10 @@ use tensorfs::format::ObjectRef;
 use tensorfs::io::source::Source;
 use tensorfs::io::{ItemSource, ObjectRange};
 use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
-use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Pass, Physical, Pin, Plan, Request, SetId, SetSpec, Step, Va};
+use varena::{Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Pass, Pin, Plan, Request, SetId, SetSpec, Step};
 
 const MB: u64 = 1 << 20;
 
-/// A tier's need source with no call to keep growth free for.
-#[cfg(target_os = "linux")]
-fn nothing() -> varena::Need {
-    Arc::new(|| Some(vec![]))
-}
-
-/// A tier's need source the case sets: one measured call keeping `keep` free (`SHORT`: more than
-/// the host has, so a pressure event gives back).
-#[cfg(target_os = "linux")]
-fn need(keep: &Arc<std::sync::atomic::AtomicU64>) -> varena::Need {
-    let keep = keep.clone();
-    Arc::new(move || Some(vec![varena::HostCall { pid: 0, peak: Some(keep.load(std::sync::atomic::Ordering::SeqCst)), anon: 0, running: 1 }]))
-}
-
-/// This case's tier on the host's pressure watcher (the one TensorD arms): a nudge is a pressure
-/// event.
-#[cfg(target_os = "linux")]
-fn watched(need: varena::Need) -> varena::Tier {
-    let pressure = platform::contain::host_pressure::Pressure::arm(platform::contain::host_pressure::HostMode::Shared).unwrap();
-    varena::Tier::serve(Some(pressure), need).unwrap().expect("this namespace's tier")
-}
-
-#[cfg(target_os = "linux")]
-const SHORT: u64 = u64::MAX / 2;
 
 /// The tables the running case made: removed when it ends, passed or failed.
 static TABLES: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
@@ -80,23 +56,13 @@ pub fn main() {
         ("a_standalone_process_wakes_tensord", a_standalone_process_wakes_tensord),
         ("a_yielded_parent_is_its_familys_alone_and_waits_for_its_room", a_yielded_parent_is_its_familys_alone_and_waits_for_its_room),
     ];
-    // The RAM tier's files are Linux's (TensorD serves the tier beside a stopped victim), and so
-    // is the kernel's list of sockets.
+    // The kernel's list of sockets and stopped threads are Linux's.
     #[cfg(target_os = "linux")]
     cases.extend([
         ("an_ask_to_a_stopped_victim_ends_when_it_dies", an_ask_to_a_stopped_victim_ends_when_it_dies as fn(&Path)),
-        ("the_tier_gives_back_in_order", the_tier_gives_back_in_order),
-        ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
-        ("a_layout_stays_locked_until_the_tier_takes_it_back", a_layout_stays_locked_until_the_tier_takes_it_back),
         ("an_unmeasured_request_asks_peers_for_pages_never_caches", an_unmeasured_request_asks_peers_for_pages_never_caches),
-        ("a_refused_tier_copy_runs_after_a_measured_pass", a_refused_tier_copy_runs_after_a_measured_pass),
-        ("a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends", a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends),
         ("a_joiners_limit_leaves_its_peers_room", a_joiners_limit_leaves_its_peers_room),
-        ("the_tier_waits_on_no_executor_and_a_pending_release_settles_first", the_tier_waits_on_no_executor_and_a_pending_release_settles_first),
         ("a_silent_asker_holds_up_no_answer", a_silent_asker_holds_up_no_answer),
-        ("the_tier_comes_back_after_a_release", the_tier_comes_back_after_a_release),
-        ("a_reload_fills_from_the_tier", a_reload_fills_from_the_tier),
-        ("held_layouts_outlive_a_tier_restart", held_layouts_outlive_a_tier_restart),
     ]);
     let dir = tempfile::tempdir().unwrap();
     let mut failed = vec![];
@@ -110,7 +76,6 @@ pub fn main() {
         std::io::stdout().flush().unwrap();
         let outcome = std::panic::catch_unwind(|| case(&path));
         TABLES.lock().drain(..).for_each(|t| varena::os::remove_table(&t));
-        varena::tier::remove_claims();
         match outcome {
             Ok(()) => println!("ok"),
             Err(_) => {
@@ -174,104 +139,6 @@ fn spec(name: &str, path: &Path, fill: Fill, uuid: &str) -> SetSpec {
 
 // ---- the child
 
-/// The host backend, recording which host ranges are page-locked for the copy engine now.
-struct Recording {
-    host: HostBackend,
-    registered: Arc<parking_lot::Mutex<std::collections::HashSet<u64>>>,
-    /// Unlock calls: each stalls a card until idle.
-    unregisters: Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl Backend for Recording {
-    fn capacity(&self) -> u64 {
-        self.host.capacity()
-    }
-    fn free(&self) -> varena::Result<u64> {
-        self.host.free()
-    }
-    fn process_used(&self) -> varena::Result<u64> {
-        self.host.process_used()
-    }
-    fn opened_context(&self) -> u64 {
-        self.host.opened_context()
-    }
-    fn granularity(&self) -> u64 {
-        self.host.granularity()
-    }
-    fn reserve(&self, len: u64) -> varena::Result<Va> {
-        self.host.reserve(len)
-    }
-    fn release(&self, va: Va) {
-        self.host.release(va)
-    }
-    fn create(&self, len: u64) -> varena::Result<Physical> {
-        self.host.create(len)
-    }
-    fn destroy(&self, page: Physical) -> varena::Result<()> {
-        self.host.destroy(page)
-    }
-    fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> varena::Result<()> {
-        self.host.map(va, offset, page, access)
-    }
-    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> {
-        self.host.protect(va, offset, len, access)
-    }
-    fn unmap(&self, va: Va, offset: u64, len: u64) -> varena::Result<()> {
-        self.host.unmap(va, offset, len)
-    }
-    fn export(&self, page: &Physical) -> varena::Result<platform::handles::Owned> {
-        self.host.export(page)
-    }
-    fn import(&self, handle: platform::handles::Owned, len: u64) -> varena::Result<Physical> {
-        self.host.import(handle, len)
-    }
-    fn target(&self, va: Va, offset: u64, len: u64) -> tensorfs::io::Dst {
-        self.host.target(va, offset, len)
-    }
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> varena::Result<()> {
-        self.host.save(va, offset, host, after)
-    }
-    fn fence(&self) -> varena::Result<Event> {
-        self.host.fence()
-    }
-    fn record(&self, stream: usize) -> varena::Result<Event> {
-        self.host.record(stream)
-    }
-    fn query(&self, event: Event) -> varena::Result<bool> {
-        self.host.query(event)
-    }
-    fn elapsed(&self, from: Event, to: Event) -> varena::Result<Option<u64>> {
-        self.host.elapsed(from, to)
-    }
-    fn wait(&self, event: Event, stream: usize) -> varena::Result<()> {
-        self.host.wait(event, stream)
-    }
-    fn synchronize(&self, stream: usize) -> varena::Result<()> {
-        self.host.synchronize(stream)
-    }
-    fn finish(&self, event: Event) -> varena::Result<()> {
-        self.host.finish(event)
-    }
-    fn register_host(&self, ptr: u64, _: u64) -> varena::Result<()> {
-        self.registered.lock().insert(ptr);
-        Ok(())
-    }
-    fn unregister_host(&self, ptr: u64) -> varena::Result<()> {
-        self.registered.lock().remove(&ptr);
-        self.unregisters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-    fn retire(&self, event: Event) {
-        self.host.retire(event)
-    }
-    fn drain(&self) -> varena::Result<()> {
-        self.host.drain()
-    }
-    fn drain_save(&self) -> varena::Result<()> {
-        self.host.drain_save()
-    }
-}
-
 /// Runs commands over one Memory until stdin ends. Every command answers one line.
 fn agent() {
     let mut mem: Option<Memory> = None;
@@ -281,8 +148,6 @@ fn agent() {
     let mut passes: HashMap<String, Pass> = HashMap::new();
     let mut pins: Vec<Pin> = vec![];
     let mut yielded: HashMap<String, varena::Yielded> = HashMap::new();
-    let registered = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
-    let unregisters = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let shrunk = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut out = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
@@ -314,15 +179,6 @@ fn agent() {
                 mem = Some(Memory::open(g, Some(grant), Box::new(HostBackend::new(memory))).unwrap());
                 format!("ok {}", std::process::id())
             }
-            ["openrec", id, memory] => {
-                uuid = id.to_string();
-                let memory: u64 = memory.parse().unwrap();
-                let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory };
-                mem = Some(Memory::open(g, None, Box::new(Recording { host: HostBackend::new(memory), registered: registered.clone(), unregisters: unregisters.clone() })).unwrap());
-                format!("ok {}", std::process::id())
-            }
-            ["registered"] => format!("ok {}", registered.lock().len()),
-            ["unregisters"] => format!("ok {}", unregisters.load(std::sync::atomic::Ordering::SeqCst)),
             ["unload", set] => {
                 let m = mem.as_ref().unwrap();
                 m.unload(sets[*set].0);
@@ -345,7 +201,6 @@ fn agent() {
                 let m = mem.as_ref().unwrap();
                 match m.load(spec(name, Path::new(path), fill, &uuid), level) {
                     Ok(id) => {
-                        // The tier's copies of the filled pages too: the cases count classes.
                         m.settle();
                         sets.insert(name.to_string(), (id, path.to_string()));
                         "ok".into()
@@ -453,7 +308,7 @@ fn agent() {
             ["end", req] => {
                 passes.remove(*req);
                 let s = requests.remove(*req).unwrap().end();
-                format!("ok leftover={} kept={} tier={} store={} evicted={:?} spec={}", s.leftover, s.moved.kept.bytes, s.moved.tier.bytes, s.moved.store.bytes, s.evicted, s.moved.speculative)
+                format!("ok leftover={} kept={} store={} evicted={:?} spec={}", s.leftover, s.moved.kept.bytes, s.moved.store.bytes, s.evicted, s.moved.speculative)
             }
             ["limit"] => {
                 let m = mem.as_ref().unwrap();
@@ -623,9 +478,9 @@ fn a_killed_holder_leaves_orphans_a_successor_imports(dir: &Path) {
     assert_eq!(b.ok("trace r"), "Kept,Kept,Kept,Kept,Hit,Hit,Hit,Hit", "imported at load (its fills in the record), not copied");
     b.ok("unpin");
     let end = b.ok("end r");
-    assert!(end.contains("tier=0 store=0"), "{end}");
+    assert!(end.contains("store=0"), "{end}");
     b.exit();
-    // A fingerprint mismatch (another fill identity) refills from the store or tier.
+    // A fingerprint mismatch (another fill identity) refills from the store.
     let mut c = Agent::spawn();
     c.ok(&format!("open {} {}", g.uuid, g.memory));
     c.ok(&format!("load k {} lora-x ram", path.display()));
@@ -721,46 +576,6 @@ fn exhausted_carries_stats(dir: &Path) {
     a.exit();
 }
 
-#[cfg(target_os = "linux")]
-/// On injected pressure the tier gives back orphaned layouts first, then unused, then the
-/// furthest declared.
-fn the_tier_gives_back_in_order(dir: &Path) {
-    let g = gpu("tier", 64 * MB);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tier = watched(need(&keep));
-    let paths: Vec<PathBuf> = ["l1", "l2", "l3", "l4"].iter().map(|n| write_set(dir, n, 1)).collect();
-    let digest = |n: &str| format!("layout-{n}-{}", g.uuid);
-    // l1: loaded by a process that ended (orphaned).
-    let mut x = Agent::spawn();
-    x.ok(&format!("open {} {}", g.uuid, g.memory));
-    x.ok(&format!("load l1 {} stored ram", paths[0].display()));
-    x.exit();
-    // l2 unused, l3 declared three steps ahead, l4 in use now.
-    let mut y = Agent::spawn();
-    y.ok(&format!("open {} {}", g.uuid, g.memory));
-    for (n, p) in ["l2", "l3", "l4"].iter().zip(&paths[1..]) {
-        y.ok(&format!("load {n} {} stored ram", p.display()));
-    }
-    y.ok("request r l4;l4;l4;l3");
-    y.ok("pass r l4 1x1");
-    // The executor tells the tier its next uses on its own thread.
-    tier.await_uses(|u| u.contains(&(digest("l4"), Some(0))) && u.contains(&(digest("l3"), Some(3))));
-    let order = vec![digest("l1"), digest("l2"), digest("l3"), digest("l4")];
-    assert_eq!(tier.held().into_iter().filter(|d| order.contains(d)).collect::<Vec<_>>(), order);
-    // The running calls need more than the host has: each event gives back while that lasts,
-    // a rung its users must answer ending its turn.
-    keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
-    for n in 1..=4 {
-        tier.nudge();
-        tier.await_releases(n);
-        let held: Vec<String> = tier.held().into_iter().filter(|d| d.ends_with(&g.uuid)).collect();
-        assert!(order.ends_with(&held) && held.len() as u64 <= 4 - n, "in order after {n} rungs: {held:?}");
-    }
-    y.ok("end r");
-    y.exit();
-}
-
 /// S5's finding: a holder that served a request (its pass measured, so a successor's pass
 /// needs room) and was then killed still leaves its kept pages to its successor: they are
 /// adopted before any demand could release them as orphans.
@@ -794,7 +609,7 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
     assert_eq!(b.ok("trace r"), "Kept,Kept,Kept,Hit,Hit,Hit", "every page kept, none copied");
     b.ok("unpin");
     let end = b.ok("end r");
-    assert!(end.contains("tier=0 store=0"), "{end}");
+    assert!(end.contains("store=0"), "{end}");
     b.exit();
 }
 
@@ -805,8 +620,6 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
 fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     let g = gpu("stop", 10 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
-    // TensorD serves the tier too: a stopped executor must not be the one serving it.
-    let _tier = varena::Tier::serve(None, nothing()).unwrap();
     let (a_path, b_path) = (write_set(dir, "va", 4), write_set(dir, "vb", 2));
     let mut a = Agent::granted(ledger.grant(std::process::id()).unwrap());
     a.ok(&format!("grant {} {}", g.uuid, g.memory));
@@ -925,103 +738,6 @@ fn a_stale_reader_never_frees_a_newer_row(dir: &Path) {
     b.exit();
 }
 
-#[cfg(target_os = "linux")]
-/// Under an injected pressure event, a layout an executor maps and has page-locked is asked
-/// back from it first (it unpins and unmaps it), then punched out: its bytes really return
-/// before the next layout is touched. The executor goes on from the store.
-fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
-    let g = gpu("pinned", 64 * MB);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tier = watched(need(&keep));
-    let (p1, p2) = (write_set(dir, "p1", 2), write_set(dir, "p2", 2));
-    let digest = |n: &str| format!("layout-{n}-{}", g.uuid);
-    let mut y = Agent::spawn();
-    y.ok(&format!("openrec {} {}", g.uuid, g.memory));
-    y.ok(&format!("load p1 {} stored ram", p1.display()));
-    y.ok(&format!("load p2 {} stored ram", p2.display()));
-    // A device page filled from the tier, its pin held throughout (S2's native case): the
-    // layout's ready run is mapped and page-locked in y.
-    y.ok("bind p1 0");
-    assert_eq!(y.ok("registered"), "1", "the run a fill read is page-locked");
-    let resident = |d: &str| tier.resident().into_iter().find(|(k, _)| k == d).map_or(0, |(_, b)| b);
-    // Each layout's file: its ready words' page and its two regions.
-    assert!(resident(&digest("p1")) >= 4 * MB && resident(&digest("p2")) >= 4 * MB);
-    keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
-    tier.nudge();
-    tier.await_releases(1);
-    // Its regions return; its ready words' page stays with the layout's file (S2's native loop
-    // waited for 0 bytes, which never come: it hung after the release, not in it).
-    assert!(resident(&digest("p1")) < REGION_ALIGN, "the pinned layout's regions returned: {}", resident(&digest("p1")));
-    assert!(resident(&digest("p2")) >= 4 * MB, "the next one is untouched");
-    assert_eq!(tier.acked(), 2 * REGION_ALIGN, "y unlocked the run it had page-locked (both ready regions), when asked");
-    assert_eq!(y.ok("unregisters"), "1", "one unlock for the run: each stalls the card");
-    // Review 2, finding 13: y unlocked it before it answered, so before the tier punched it.
-    assert_eq!(y.ok("registered"), "0", "unlocked before the punch");
-    assert_eq!(y.ok("exact p1 1"), "true", "y goes on from the store");
-    y.ok("unpin");
-    y.exit();
-}
-
-#[cfg(target_os = "linux")]
-/// Lead's ruling (S2's forward case: cuMemHostUnregister stalled every CUDA call in the process
-/// for 2.7 s): a host range is unlocked only when the tier takes its layout back (or the process
-/// ends). Unloading a set and changing its fill identity park its layout locked; loading it
-/// again reuses it, locked; the tier's ask unlocks it, one call per run.
-fn a_layout_stays_locked_until_the_tier_takes_it_back(dir: &Path) {
-    let g = gpu("parked", 64 * MB);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tier = watched(need(&keep));
-    let (q1, q2) = (write_set(dir, "q1", 2), write_set(dir, "q2", 2));
-    let mut y = Agent::spawn();
-    y.ok(&format!("openrec {} {}", g.uuid, g.memory));
-    y.ok(&format!("load q1 {} stored ram", q1.display()));
-    y.ok(&format!("load q2 {} stored ram", q2.display()));
-    assert_eq!(y.ok("exact q1 0"), "true");
-    assert_eq!(y.ok("exact q2 0"), "true");
-    assert_eq!(y.ok("registered"), "2", "each layout's ready run, page-locked once");
-    y.ok("unload q1");
-    y.ok("refill q2 v2");
-    assert_eq!((y.ok("unregisters").as_str(), y.ok("registered").as_str()), ("0", "2"), "an unload and an identity change keep their layouts locked");
-    y.ok(&format!("load q1 {} stored ram", q1.display()));
-    assert_eq!(y.ok("exact q1 1"), "true");
-    assert_eq!((y.ok("unregisters").as_str(), y.ok("registered").as_str()), ("0", "2"), "loaded again, its parked layout serves, still locked");
-    keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
-    tier.nudge();
-    tier.await_releases(1);
-    assert_eq!(y.ok("unregisters"), "1", "the tier's ask unlocks one layout's run in one call");
-    y.exit();
-}
-
-#[cfg(target_os = "linux")]
-/// Review 5, item 3: a page's copy into the RAM tier the host had no room for is not lost; once a
-/// measured pass ends with the host's room back, it runs, so a first run's (or a standalone
-/// call's) weights reach the tier.
-fn a_refused_tier_copy_runs_after_a_measured_pass(dir: &Path) {
-    let g = gpu("deferred", 64 * MB);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let keep = Arc::new(std::sync::atomic::AtomicU64::new(SHORT));
-    let tier = watched(need(&keep));
-    let path = write_set(dir, "d1", 2);
-    let digest = format!("layout-d1-{}", g.uuid);
-    let resident = || tier.resident().into_iter().find(|(k, _)| *k == digest).map_or(0, |(_, b)| b);
-    let mut y = Agent::spawn();
-    y.ok(&format!("open {} {}", g.uuid, g.memory));
-    // Filled to the device while the host has no room: no tier copy.
-    y.ok(&format!("load d1 {} stored gpu", path.display()));
-    y.ok("settle");
-    assert!(resident() < REGION_ALIGN, "no room, no copy: {}", resident());
-    keep.store(0, std::sync::atomic::Ordering::SeqCst);
-    y.ok("request r d1");
-    y.ok("pass r d1 1x1");
-    y.ok(&format!("endpass r {MB}"));
-    y.ok("settle");
-    assert!(resident() >= 2 * REGION_ALIGN, "the deferred copies ran: {}", resident());
-    y.ok("end r");
-    y.exit();
-}
-
 /// v8: a live joiner opening with a small limit caps its own row; its peer's room and the
 /// table's capacity stay the card's.
 fn a_joiners_limit_leaves_its_peers_room(dir: &Path) {
@@ -1037,35 +753,6 @@ fn a_joiners_limit_leaves_its_peers_room(dir: &Path) {
     assert_eq!(ledger.status().capacity, 64 * MB, "and the table's capacity");
     joiner.exit();
     peer.exit();
-}
-
-/// Review 6: a standalone call (no dispatch key: host-unmeasured, no measured pass end) has the
-/// copies refused beside it probe for room again when it ends, the last unmeasured call.
-fn a_refused_tier_copy_runs_when_the_last_unmeasured_call_ends(dir: &Path) {
-    let g = gpu("standalone-save", 64 * MB);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let keep = Arc::new(std::sync::atomic::AtomicU64::new(SHORT));
-    let tier = watched(need(&keep));
-    let path = write_set(dir, "s1", 2);
-    let digest = format!("layout-s1-{}", g.uuid);
-    let resident = || tier.resident().into_iter().find(|(k, _)| *k == digest).map_or(0, |(_, b)| b);
-    let mut y = Agent::spawn();
-    y.ok(&format!("open {} {}", g.uuid, g.memory));
-    y.ok(&format!("load s1 {} stored gpu", path.display()));
-    y.ok("settle");
-    assert!(resident() < REGION_ALIGN, "no room, no copy: {}", resident());
-    // Its pass end retries, beside itself: refused again.
-    y.ok("request r s1");
-    y.ok("pass r s1 1x1");
-    y.ok(&format!("endpass r {MB}"));
-    y.ok("settle");
-    assert!(resident() < REGION_ALIGN, "no room beside the unmeasured call: {}", resident());
-    // The call's need goes as it ends.
-    keep.store(0, std::sync::atomic::Ordering::SeqCst);
-    y.ok("end r");
-    y.ok("settle");
-    assert!(resident() >= 2 * REGION_ALIGN, "the refused copies ran once it ended: {}", resident());
-    y.exit();
 }
 
 /// Co-residency (lead, v7: block code runs once, with no OOM to escalate from): an unmeasured
@@ -1161,55 +848,6 @@ fn a_child_runs_while_its_parent_yields(dir: &Path) {
 }
 
 #[cfg(target_os = "linux")]
-/// Round 2, finding 2: the tier never waits on an executor. It asks a stopped executor for its
-/// layout and goes on serving; the executor's death is its answer. Review 3, N2: the ask is
-/// marked in the asked row, so TensorD sees the stopped user stalled, and under pressure with
-/// nothing else to give the tier says the host is short meanwhile.
-fn the_tier_waits_on_no_executor_and_a_pending_release_settles_first(dir: &Path) {
-    let g = gpu("short", 64 * MB);
-    let ledger = varena::Ledger::create(&g, None).unwrap();
-    let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tier = watched(need(&keep));
-    let pressure = || tier.nudge();
-    let (s1, s2) = (write_set(dir, "s1", 2), write_set(dir, "s2", 2));
-    let digest = |n: &str| format!("layout-{n}-{}", g.uuid);
-    let mut y = Agent::spawn();
-    y.ok(&format!("open {} {}", g.uuid, g.memory));
-    y.ok(&format!("load s1 {} stored ram", s1.display()));
-    assert_eq!(y.ok("exact s1 0"), "true");
-    let pid = y.child.id() as i32;
-    let mut status = 0;
-    // SAFETY: a signal to our own child, then waiting until it has stopped.
-    unsafe {
-        libc::kill(pid, libc::SIGSTOP);
-        libc::waitpid(pid, &mut status, libc::WUNTRACED);
-    }
-    keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
-    pressure();
-    while ledger.stalled() != vec![pid as u32] {
-        ledger.await_event().unwrap();
-    }
-    assert!(tier.held().contains(&digest("s1")), "nothing punched before its user answered");
-    // A release still pending settles first (no host-short meanwhile: tier::reservation_tests);
-    // a stalled user is TensorD's stall rule to end. The tier serves another executor
-    // meanwhile (the host has room again for its fill).
-    keep.store(0, std::sync::atomic::Ordering::SeqCst);
-    let mut z = Agent::spawn();
-    z.ok(&format!("open {} {}", g.uuid, g.memory));
-    z.ok(&format!("load s2 {} stored ram", s2.display()));
-    keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
-    // TensorD ends the stalled user: its death is its answer.
-    y.child.kill().unwrap();
-    y.child.wait().unwrap();
-    tier.await_releases(1);
-    assert!(!tier.held().contains(&digest("s1")), "released once its user died");
-    pressure();
-    tier.await_releases(2);
-    assert!(tier.held().iter().all(|d| !d.ends_with(&g.uuid)), "{:?}", tier.held());
-    z.exit();
-}
-
-#[cfg(target_os = "linux")]
 /// Round 2, finding 9: a row's ask thread serves every asker at once: one connected and
 /// silent (mid-message) holds up nobody else's answer.
 fn a_silent_asker_holds_up_no_answer(dir: &Path) {
@@ -1302,85 +940,6 @@ fn a_standalone_process_wakes_tensord(_dir: &Path) {
     a.exit();
     ledger.await_event().unwrap();
     assert!(ledger.status().rows.iter().all(|r| r.pid.to_string() != pid));
-}
-
-#[cfg(target_os = "linux")]
-/// Round 2, finding 8: after the tier took a layout back, the set opens it again at its next
-/// pass start, and its filled pages go to it again.
-fn the_tier_comes_back_after_a_release(dir: &Path) {
-    let g = gpu("back", 64 * MB);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let keep = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tier = watched(need(&keep));
-    let path = write_set(dir, "tb", 2);
-    let digest = format!("layout-tb-{}", g.uuid);
-    let mut y = Agent::spawn();
-    y.ok(&format!("open {} {}", g.uuid, g.memory));
-    y.ok(&format!("load tb {} stored ram", path.display()));
-    assert_eq!(y.ok("exact tb 0"), "true");
-    keep.store(SHORT, std::sync::atomic::Ordering::SeqCst);
-    tier.nudge();
-    tier.await_releases(1);
-    assert!(!tier.held().contains(&digest));
-    keep.store(0, std::sync::atomic::Ordering::SeqCst);
-    y.ok("unpin");
-    y.ok("request r tb");
-    y.ok("pass r tb 1x1");
-    assert_eq!(y.ok("exact tb 1"), "true");
-    y.ok("settle");
-    assert!(tier.held().contains(&digest), "the filled page went to the tier again");
-    y.ok("unpin");
-    y.ok("end r");
-    y.exit();
-}
-
-#[cfg(target_os = "linux")]
-/// The vertical slice's reload: an executor that ended (its kept pages gone with custody, here
-/// none kept for it) leaves its layout in the tier; the next one's load fills from there.
-fn a_reload_fills_from_the_tier(dir: &Path) {
-    let g = gpu("reload", 64 * MB);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let tier = varena::Tier::serve(None, nothing()).unwrap().expect("this namespace's tier");
-    let path = write_set(dir, "rl", 2);
-    let mut a = Agent::spawn();
-    a.ok(&format!("open {} {}", g.uuid, g.memory));
-    a.ok(&format!("load rl {} undeclared ram", path.display()));
-    a.exit();
-    let mut b = Agent::spawn();
-    b.ok(&format!("open {} {}", g.uuid, g.memory));
-    b.ok(&format!("load rl {} undeclared gpu", path.display()));
-    b.ok("request r rl");
-    assert_eq!(b.ok("trace r"), "Tier,Tier", "the load filled from the tier, not the store");
-    b.exit();
-    drop(tier);
-}
-
-#[cfg(target_os = "linux")]
-/// The vertical slice's TensorD restart: the tier's server goes and comes back; the executors
-/// that hold its layouts hand them (their files, ready regions and all) to the new one, so the
-/// next load still fills from the tier.
-fn held_layouts_outlive_a_tier_restart(dir: &Path) {
-    let g = gpu("tierback", 64 * MB);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let first = varena::Tier::serve(None, nothing()).unwrap().expect("this namespace's tier");
-    let (p, q) = (write_set(dir, "hp", 2), write_set(dir, "hq", 1));
-    let digest = format!("layout-hp-{}", g.uuid);
-    let mut c = Agent::spawn();
-    c.ok(&format!("open {} {}", g.uuid, g.memory));
-    c.ok(&format!("load hp {} undeclared ram", p.display()));
-    // The tier's server restarts.
-    drop(first);
-    let second = varena::Tier::serve(None, nothing()).unwrap().expect("the tier again");
-    // c's next tier call finds the new tier, and hands it what it holds.
-    c.ok(&format!("load hq {} undeclared ram", q.display()));
-    second.await_uses(|u| u.iter().any(|(d, _)| *d == digest));
-    let mut d = Agent::spawn();
-    d.ok(&format!("open {} {}", g.uuid, g.memory));
-    d.ok(&format!("load hp {} undeclared gpu", p.display()));
-    d.ok("request r hp");
-    assert_eq!(d.ok("trace r"), "Tier,Tier", "filled from the layout c handed over");
-    d.exit();
-    c.exit();
 }
 
 /// Review 4, NEW-3: a yielded parent is no stranger's: admission counts its W (its peak, else

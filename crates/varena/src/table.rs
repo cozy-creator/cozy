@@ -14,7 +14,8 @@ pub enum Source {}
 
 use crate::layout::Layout;
 
-/// How far [`crate::Memory::load`] brings a set: into the machine's RAM tier, or onto the GPU.
+/// How far [`crate::Memory::load`] brings a set: into host RAM (the page cache, read ahead), or
+/// onto the GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
     Ram,
@@ -344,7 +345,7 @@ pub struct Table {
     /// Bytes of pages being unmapped by the mechanism thread: still this process's on the
     /// device (P to others), already spent on the creates queued after them (not to itself).
     pub inflight: u64,
-    /// Own pages pinned only by varena's own short work (a RAM-tier copy, a Keep's protect):
+    /// Own pages pinned only by varena's own short work (a Keep's protect):
     /// evictable again once it ends.
     pub transient: u64,
     /// Shared mode (a machine its owner also uses): prefetch never grows this process's

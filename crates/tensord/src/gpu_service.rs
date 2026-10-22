@@ -339,7 +339,7 @@ pub enum Level {
     Downloaded,
     /// A process with its imports done: no device, no VRAM.
     Imported,
-    /// An executor with the model constructed, its weights in the host tier.
+    /// An executor with the model constructed, its weights in host RAM (the page cache).
     Host,
     /// Its weights on the GPU.
     Gpu,
@@ -426,7 +426,7 @@ struct Session {
     executor: DeviceExecutor,
     /// When it last came back idle: idle executors end least recently used first.
     used: Instant,
-    /// This executor in the host tier and the layouts it may adopt.
+    /// This executor in host RAM and the layouts it may adopt.
     launch: Launch,
     /// It has served a call: its next one is not its first.
     invoked: bool,
@@ -622,8 +622,8 @@ pub struct Pool {
     engine: std::sync::OnceLock<Weak<Engine>>,
     /// Rows the ledgers named stalled at the last look: each is ended once.
     stalled: Mutex<std::collections::BTreeSet<u32>>,
-    /// The machine's RAM tier, served while the pool lives.
-    _tier: Option<Arc<varena::Tier>>,
+    /// The host rule's watcher, while the pool lives.
+    _host: Option<Arc<memory::Host>>,
     /// Held while the pool lives: the thread blocked on the ledgers' events ends with it.
     _events: Option<std::os::unix::net::UnixStream>,
     /// Memoized Model methods' results, shared by every run on this machine.
@@ -712,12 +712,12 @@ impl Pool {
             memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, &peaks, &notes).map(Arc::new),
         }).collect();
         let gpus = devices.iter().filter_map(|d| d.memory.clone()).collect();
-        let tier = memory::serve_tier(config.host.mode, memory::need(gpus), &notes);
+        let host = memory::Host::watch(config.host.mode, gpus, &notes);
         let launcher = crate::child_launcher::ChildLauncher::new()?;
         let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
         Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
             let ledgers = devices.iter().filter_map(|d| d.memory.clone()).map(memory::Source::Ledger);
-            let sources: Vec<memory::Source> = ledgers.chain(tier.clone().map(memory::Source::Tier)).collect();
+            let sources: Vec<memory::Source> = ledgers.chain(host.clone().map(memory::Source::Host)).collect();
             let pool = pool.clone();
             let woke = move |woke| match (pool.upgrade(), woke) {
                 (Some(pool), memory::Woke::Ledger) => pool.memory_changed(),
@@ -739,7 +739,7 @@ impl Pool {
                 peaks,
                 engine: Default::default(),
                 stalled: Mutex::default(),
-                _tier: tier,
+                _host: host,
                 _events: events,
                 incarnation,
                 config,
@@ -783,7 +783,7 @@ impl Pool {
             self.peaks.save(model, gpus.iter().filter(|(_, gpu)| gpu.model == model).map(|(_, gpu)| &gpu.ledger));
         }
     }
-    /// The RAM tier gave back all it may and the host is still short: one idle process ends,
+    /// The host is short of what its running calls must keep free: one idle process ends,
     /// least recently used first: a deviceless executor, else an import-only parent with no live
     /// child, else an executor on a GPU no call holds (outside every warm set first).
     fn host_short(&self) {
@@ -1712,7 +1712,7 @@ impl Pool {
             result
         })
     }
-    /// One line per Load in `loads.jsonl`: the executor's load facts, the host tier's, and
+    /// One line per Load in `loads.jsonl`: the executor's load facts, and
     /// the machine's and executor's RSS/PSS.
     fn record_load(
         &self,

@@ -159,7 +159,7 @@ fn own_cgroup() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Growth, Reserve};
+    use super::super::Growth;
     use super::*;
     use std::collections::BTreeMap;
 
@@ -179,20 +179,6 @@ mod tests {
         assert_eq!(growth.most(), (1 << 30) + (5 << 30) / 2);
         growth.settle();
         assert_eq!(growth.most(), (7 << 30) / 4);
-    }
-
-    #[test]
-    fn the_reserve_keeps_a_recent_peak_and_forgets_it_on_quiet_passes() {
-        let mut reserve = Reserve::default();
-        assert_eq!(reserve.observe(4 << 30), 0);
-        // A 6 GiB burst came and went: 6 GiB stays theirs for now.
-        assert_eq!(reserve.observe(10 << 30), 0);
-        assert_eq!(reserve.observe(4 << 30), 6 << 30);
-        reserve.quiet(4 << 30);
-        assert_eq!(reserve.observe(4 << 30), 3 << 30);
-        reserve.quiet(4 << 30);
-        reserve.quiet(4 << 30);
-        assert_eq!(reserve.observe(4 << 30), (3 << 30) / 4);
     }
 
     /// Whatever the kernel allows, the watcher arms and a nudge wakes it.
