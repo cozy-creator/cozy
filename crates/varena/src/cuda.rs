@@ -278,8 +278,9 @@ impl Backend for CudaBackend {
         Ok(Physical { id, len })
     }
 
-    fn destroy(&self, page: Physical) {
-        self.logged("cuMemRelease", || Ok(call!("cuMemRelease", mem_release(page.id))?));
+    fn destroy(&self, page: Physical) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        Ok(call!("cuMemRelease", mem_release(page.id))?)
     }
 
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()> {
@@ -290,10 +291,13 @@ impl Backend for CudaBackend {
         let ptr = va.base + offset;
         let _ctx = self.primary.enter()?;
         call!("cuMemMap", mem_map(ptr, page.len as usize, 0, page.id, 0))?;
-        self.access(ptr, page.len, access).inspect_err(|_| {
-            // SAFETY: the mapping just made, with nothing ordered on it yet.
-            unsafe { cuda::driver().map(|d| (d.mem_unmap)(ptr, page.len as usize)) }.ok();
-        })
+        if let Err(error) = self.access(ptr, page.len, access) {
+            if let Err(release) = call!("cuMemUnmap", mem_unmap(ptr, page.len as usize)) {
+                return Err(Error::Ownership(format!("mapping access failed ({error}); rollback failed ({release})")));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()> {

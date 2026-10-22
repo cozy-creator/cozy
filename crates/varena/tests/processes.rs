@@ -181,7 +181,7 @@ impl Backend for Recording {
     fn create(&self, len: u64) -> varena::Result<Physical> {
         self.host.create(len)
     }
-    fn destroy(&self, page: Physical) {
+    fn destroy(&self, page: Physical) -> varena::Result<()> {
         self.host.destroy(page)
     }
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> varena::Result<()> {

@@ -492,5 +492,10 @@ if __name__ == "__main__":
     if mode in ("main", "variant"):
         threading.Thread(target=watch, daemon=True).start()
     if mode == "variant":
-        sys.exit(variant(int(sys.argv[2]), tensorfs.open(sys.argv[3], cache_dir=sys.argv[4], local_files_only=True)))
+        try:
+            result = variant(int(sys.argv[2]), tensorfs.open(sys.argv[3], cache_dir=sys.argv[4], local_files_only=True))
+        except BaseException:
+            print("ALLOCATOR_REFUSALS", getattr(_ext.varena, "allocator_refusals", lambda *_: "unavailable")(0), flush=True)
+            raise
+        sys.exit(result)
     sys.exit({"diag": diag, "free": free, "main": main}[mode]())
