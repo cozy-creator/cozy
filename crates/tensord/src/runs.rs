@@ -1659,6 +1659,7 @@ mod tests {
                 client_wheel: client,
                 staging_root: root.join("staging"),
                 sdk,
+                default_sdk: None,
                 uv: "uv".into(),
                 seed_cache: None,
                 runtime_build,
