@@ -1279,7 +1279,7 @@ fn concurrent_binds_of_one_block_fill_it_once() {
 
 #[test]
 #[ignore = "native GPU: a rental only"]
-fn a_rebind_waits_in_stream_while_the_last_consumer_runs() {
+fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishes() {
     let (b, g, uuid) = card("release");
     step!();
     let _ledger = Ledger::create(&g, None).unwrap();
@@ -1310,8 +1310,10 @@ fn a_rebind_waits_in_stream_while_the_last_consumer_runs() {
     step!();
     drop(pin);
     step!();
-    // Memory takes the release now; its event waits behind the gate and the copy. The rebind
-    // refills the page in place after it: in-stream, never waiting for it on the host.
+    // The copy must read the original contents before the in-place refill starts.
+    // Preparation may wait outside capture/replay: Source::read_placements retains its
+    // borrowed staging/source owners until the copy has completed. It cannot return a
+    // future-ready pin. Resident replay and allocator callbacks have separate no-wait tests.
     let _ = mem.torch_limit();
     let (again, waited) = std::thread::scope(|t| {
         let (rebind, waited) = watch(t, first, || mem.bind(s, 0, 0));
@@ -1323,7 +1325,7 @@ fn a_rebind_waits_in_stream_while_the_last_consumer_runs() {
     step!();
     assert_eq!(bytes(dst, REGION_ALIGN, 0), *block(2, 0));
     step!();
-    assert_eq!(waited, Waited::Returned, "the rebind waited on the host while the last consumer ran (longer than a whole first bind took)");
+    assert_ne!(waited, Waited::Returned, "refill preparation released its borrowed copy owners before the gated consumer completed");
     step!();
     let again = again.unwrap();
     step!();
@@ -1339,7 +1341,7 @@ fn a_rebind_waits_in_stream_while_the_last_consumer_runs() {
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
-    println!("PASS a rebind waits in-stream while the last consumer runs {uuid}");
+    println!("PASS an untransformed refill waits during preparation and preserves the old consumer bytes {uuid}");
     step!();
 }
 
