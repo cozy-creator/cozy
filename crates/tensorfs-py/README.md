@@ -412,6 +412,7 @@ Encoded tensors retain their parts unless `dequantize=` requests ordinary values
 
 ```python
 from array import array
+from pathlib import Path
 import tensorfs
 
 with tensorfs.Writer("./model.cozytensors") as writer:
@@ -422,7 +423,9 @@ checkpoint = writer.commit()
 tensorfs.materialize(checkpoint, local_dir="./portable", format="cozytensors")
 
 tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path="./portable")
-tensorfs.upload_folder(repo_id="acme/example", folder_path="./portable", endpoint="file:///srv/origin")
+tensorfs.upload_folder(
+    repo_id="acme/example", folder_path="./portable", endpoint=Path("./origin").resolve().as_uri(),
+)
 ```
 
 A normal save writes one .cozytensors header file, with its tensors and supporting-file bytes retained in
