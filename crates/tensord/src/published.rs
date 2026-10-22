@@ -1243,8 +1243,8 @@ impl Publisher {
             ))?;
         let degree = crate::gpu_service::group_degree(&slots, request.gpus, gpu.width());
         let gpus = gpu.gpus(degree);
-        // One slot's grant, its Hub checkpoint and its warnings, `short` of memory or not.
-        let pick = |slot: &Value, short: bool| -> Result<(ModelGrant, Option<Named>, Vec<String>), Failure> {
+        // One slot's grant, its Hub checkpoint and its warnings.
+        let pick = |slot: &Value| -> Result<(ModelGrant, Option<Named>, Vec<String>), Failure> {
             let path = slot.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
             let parameter = path.rsplit('.').next().unwrap_or_default().to_string();
             job.stage(format!("choosing the model for {path}"));
@@ -1280,7 +1280,7 @@ impl Publisher {
             }
             let named = choose(choice, &path)?;
             let tolerances = precision::Slot::of(slot);
-            let bits = tolerances.bits(request.bits, short);
+            let bits = tolerances.bits(request.bits);
             let ruled = named.lane.is_empty() && named.tree.is_none();
             let constraints = precision::Constraints { gpus: gpus.capabilities.clone(), bits: Some(if tolerances.encoded { bits } else { 16 }) };
             let named = self.resolve(service, request.hub(&format!("the model for {path}"))?, named, Some(&constraints), &request.catalog_revision)?;
@@ -1311,25 +1311,8 @@ impl Publisher {
                 false => self.structure(request.hub("a Hub model")?, &named, job),
             }
         };
-        let mut picked: Vec<_> = slots.iter().map(|slot| pick(slot, false)).collect::<Result<_, _>>()?;
+        let picked: Vec<_> = slots.iter().map(pick).collect::<Result<_, _>>()?;
         land(&picked)?;
-        // Memory short (design §2.2): a `min_bits=4` compute slot takes 4 bits when the weights it
-        // constructs exceed the budget (the GPU less a quarter for activations).
-        let shrinks = |slot: &Value| {
-            let tolerances = precision::Slot::of(slot);
-            request.bits == 0 && tolerances.min_bits == 4 && !tolerances.decode && !tolerances.raw
-        };
-        if slots.iter().any(&shrinks) {
-            let constructed = slots.iter().zip(&picked).filter(|(slot, _)| crate::gpu_service::constructed(slot));
-            let checkpoints = distinct(constructed.filter_map(|(_, (_, named, _))| named.as_ref()));
-            let bytes: u64 = checkpoints.iter().map(|named| self.bytes(named)).sum();
-            if gpu.budget(degree).is_some_and(|budget| bytes > budget) {
-                for (slot, chosen) in slots.iter().zip(&mut picked).filter(|(slot, _)| shrinks(slot)) {
-                    *chosen = pick(slot, true)?;
-                }
-                land(&picked)?;
-            }
-        }
         let (mut grants, mut warnings) = (vec![], vec![]);
         for (grant, _, said) in picked {
             grants.push(grant);
@@ -1385,13 +1368,6 @@ impl Publisher {
         Ok((plan, warnings))
     }
 
-    /// A landed checkpoint's bytes: its header and every chunk and asset it names.
-    fn bytes(&self, named: &Named) -> u64 {
-        let Ok(header) = named.header() else {
-            return 0;
-        };
-        self.store.closure(header).map_or(header.length, |objects| objects.iter().map(|o| o.length).sum())
-    }
 }
 
 /// Each checkpoint once.
@@ -2722,7 +2698,7 @@ pub(crate) mod tests {
             };
             let tree = names_hub::trees(&self.source, std::slice::from_ref(&model)).remove(0);
             let (origin, heard) = names_hub::paced(&self.source, model, None, Duration::from_millis(pace));
-            let named = Named { repository: repository.into(), release: "1.0.0".into(), lane: "bf16".into(),
+            let named = Named { repository: repository.into(), release: "1.0.0".into(), lane: "model.bf16.cozytensors".into(),
                 tree: Some(tree), header: Some(header.clone()) };
             (hub::Source::new(&origin, None, None).unwrap(), named, heard)
         }
@@ -2746,7 +2722,7 @@ pub(crate) mod tests {
         assert_eq!(count(&heard, "GET /o/"), 2, "the header and its tree: {heard:?}");
         assert_eq!(count(&heard, "GET /blobs/"), 2, "{heard:?}");
         assert!(!crate::access::whole(store, &manifest.id(), &[]));
-        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "bf16".into(), tree: named.tree.clone().unwrap() };
+        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "model.bf16.cozytensors".into(), tree: named.tree.clone().unwrap() };
         assert_eq!(Pulled::of(store, &manifest).unwrap(), Some(pulled));
         let asked = heard.lock().unwrap().len();
         bench.publisher.structure(&hub, &[named], &job).unwrap();
@@ -2994,7 +2970,25 @@ pub(crate) mod tests {
                 use tensorfs::{format::{encode, Dtype, Encoding, PartBytes}, writer::{Data, PartData, Source}};
                 let mut writer = source.writer(None, None).unwrap();
                 let shape = [4, 32];
-                if matches!(*lane, "int8" | "fp8" | "nvfp4") {
+                if *lane == "nvfp4-int8" {
+                    // H3's layout: its nvfp4 variant keeps a sensitive layer int8, which holds
+                    // most of its bytes; smaller than the int8 variant all the same.
+                    let shape = [4, 16];
+                    let int8 = Encoding { scheme: "int8.rowwise".into(), params: Default::default() };
+                    let parts = [encode::OwnedPart {role:"weight".into(),dtype:Dtype::I8,shape:shape.to_vec(),bytes:vec![1;64]},
+                        encode::OwnedPart {role:"scale".into(),dtype:Dtype::F32,shape:vec![4],bytes:f32s(4,tag.into())}];
+                    let mut readers: Vec<_> = parts.iter().map(|part| std::io::Cursor::new(&part.bytes)).collect();
+                    let parts = parts.iter().zip(&mut readers).map(|(part,reader)| PartData {role:part.role.clone(),dtype:part.dtype.clone(),shape:part.shape.clone(),data:Source::Read(reader)}).collect();
+                    writer.get("unet").put("proj.weight",&Dtype::BF16,&shape,Data::Encoded{encoding:int8,parts}).unwrap();
+                    let fp4 = Encoding { scheme: "nvfp4".into(),
+                        params: serde_json::from_value(json!({"block_size":16,"global_scale":"multiply","nibble_order":"low_first","scale_layout":"row_major"})).unwrap() };
+                    let values = f32s(64, tag.into());
+                    let arrays = BTreeMap::from([("values", PartBytes {dtype:&Dtype::F32,shape:&shape,bytes:&values})]);
+                    let encoded = encode::quantize(&encode::Input {dtype:&Dtype::BF16,shape:&shape,encoding:&fp4,arrays:&arrays}).unwrap();
+                    let mut readers: Vec<_> = encoded.iter().map(|part| std::io::Cursor::new(&part.bytes)).collect();
+                    let parts = encoded.iter().zip(&mut readers).map(|(part,reader)| PartData {role:part.role.clone(),dtype:part.dtype.clone(),shape:part.shape.clone(),data:Source::Read(reader)}).collect();
+                    writer.get("unet").put("out.weight",&Dtype::BF16,&shape,Data::Encoded{encoding:fp4,parts}).unwrap();
+                } else if matches!(*lane, "int8" | "fp8" | "nvfp4") {
                     let encoding = Encoding { scheme: match *lane { "int8" => "int8.rowwise", "fp8" => "fp8.rowwise", _ => "nvfp4" }.into(),
                         params: if *lane == "nvfp4" { serde_json::from_value(json!({"block_size":16,"global_scale":"multiply","nibble_order":"low_first","scale_layout":"row_major"})).unwrap() } else { Default::default() } };
                     let values = f32s(128, tag.into());
@@ -3179,19 +3173,16 @@ pub(crate) mod tests {
         assert_eq!(blackwell_ultra.run(0).0, ["fp8", "nvfp4"]);
     }
 
-    /// Only a `min_bits=4` compute slot drops to 4 bits, and only when the function's 8-bit
-    /// weights exceed the GPU's memory less its activations (a quarter before any measured).
+    /// Memory never lowers a lane: a `min_bits=4` compute slot on a GPU its 8-bit weights
+    /// overflow still takes 8 bits; paging fits them (owner, 2026-10-22). 4 bits are asked.
     #[test]
-    fn a_memory_short_function_drops_to_4_bits_only_where_min_bits_allows() {
+    fn memory_never_drops_a_slot_to_4_bits() {
         let slots = json!([
             {"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept", "min_bits": 4},
             {"path": "render.models.other", "class": "O", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
-        let lanes = ["int8", "nvfp4", "bf16"];
-        let short = Machine::new("acme/pkg", &[("8.9", 64)], slots.clone(), &lanes);
-        assert_eq!(short.run(0).0, ["nvfp4", "int8"]);
-        assert_eq!(short.run(8).0, ["int8", "int8"], "the request's bits win");
-        let ample = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], slots, &lanes);
-        assert_eq!(ample.run(0).0, ["int8", "int8"]);
+        let short = Machine::new("acme/pkg", &[("8.9", 64)], slots, &["int8", "nvfp4", "bf16"]);
+        assert_eq!(short.run(0).0, ["int8", "int8"]);
+        assert_eq!(short.run(4).0, ["nvfp4", "nvfp4"], "asked 4 bits");
     }
 
     /// A release without the wanted lane serves the next with one warning per step; a slot
@@ -3210,6 +3201,18 @@ pub(crate) mod tests {
         let ada = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], declines, &["int8", "bf16"]);
         let (lanes, warnings, _) = ada.run(0);
         assert_eq!((lanes, warnings), (vec!["bf16".to_string()], vec!["precision 8: acme/model@1.0.0 declines encoded leaves; served bf16".to_string()]));
+    }
+
+    /// H3's nvfp4 variant keeps a sensitive layer int8, which holds most of its bytes and makes it
+    /// smaller than the int8 variant: it is the 4-bit lane all the same. The 8-bit default takes
+    /// the int8 variant (runs 13145 and 13148 bound its nvfp4 leaves into a slot built for int8:
+    /// `KeyError: 'scale'`); 4 bits take it.
+    #[test]
+    fn a_variant_holding_nvfp4_is_the_4_bit_lane_however_many_int8_bytes() {
+        let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
+        let blackwell = Machine::new("acme/pkg", &[("12.0", 24 * GIB)], slots, &["int8", "nvfp4-int8"]);
+        assert_eq!(blackwell.run(0).0, ["int8"]);
+        assert_eq!(blackwell.run(4).0, ["nvfp4-int8"]);
     }
 
     /// A mixed local set runs what every GPU in it runs: an Ampere and an Ada card share no fp8.
@@ -3252,8 +3255,8 @@ pub(crate) mod tests {
         let source = json!({"path": "render.models.source", "class": "M", "weights": true, "default": "model@1.0.0",
             "encoded_leaves": "accept", "min_bits": 4, "phase": "decode"});
         let blackwell = Machine::new("acme/pkg", &[("10.0", 180 * GIB)], json!([source]), &["nvfp4", "int8", "fp16"]);
-        assert_eq!(blackwell.run(4).0, ["fp16"]);
+        assert_eq!(blackwell.run(4).0, ["model.fp16.cozytensors"]);
         let (lanes, warnings, _) = Machine::new("acme/pkg", &[("10.0", 180 * GIB)], json!([source]), &["nvfp4"]).run(0);
-        assert_eq!((lanes, warnings), (vec!["nvfp4".to_string()], vec![]));
+        assert_eq!((lanes, warnings), (vec!["model.nvfp4.cozytensors".to_string()], vec![]));
     }
 }

@@ -302,7 +302,10 @@ impl Endpoint {
         let reply = self.exchange(Ask { method: "GET", url: &url, headers: vec![], body: None, payload: None, auth: true }).await?;
         match reply.status {
             404 | 405 => Ok(None),
-            200 => serde_json::from_slice(&reply.body).map(Some).map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() }),
+            // Another rule's answer (an older Hub's) is no answer: the headers decide.
+            200 => serde_json::from_slice::<crate::precision::Selection>(&reply.body)
+                .map(|answer| (answer.rule == crate::precision::RULE).then_some(answer))
+                .map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() }),
             _ => Err(refusal(&reply, "GET")),
         }
     }

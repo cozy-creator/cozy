@@ -125,12 +125,31 @@
       ]
     },
     "integer-mixed-int8": {
-      "family": "",
-      "bits": 0,
+      "family": "int8",
+      "bits": 8,
       "bytes": 160,
       "kinds": [
         "I64",
         "int8.rowwise"
+      ]
+    },
+    "int8-convrot": {
+      "family": "int8",
+      "bits": 8,
+      "bytes": 176,
+      "kinds": [
+        "BF16",
+        "int8.convrot"
+      ]
+    },
+    "nvfp4-int8-heavy": {
+      "family": "nvfp4",
+      "bits": 4,
+      "bytes": 144,
+      "kinds": [
+        "BF16",
+        "int8.convrot",
+        "nvfp4"
       ]
     }
   },
@@ -572,6 +591,50 @@
         "bits": 8
       },
       "variant": null,
+      "reasons": []
+    },
+    {
+      "why": "a variant holding nvfp4 is 4-bit, however many int8 bytes it holds",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy"
+      },
+      "constraints": {
+        "gpus": [
+          "12.0"
+        ],
+        "bits": 8
+      },
+      "variant": "model.int8.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "the default lane takes int8 over a smaller nvfp4 variant",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy"
+      },
+      "constraints": {
+        "gpus": [
+          "12.0"
+        ]
+      },
+      "variant": "model.int8.cozytensors",
+      "reasons": []
+    },
+    {
+      "why": "four bits take the nvfp4 variant",
+      "variants": {
+        "model.int8.cozytensors": "int8-convrot",
+        "model.nvfp4.cozytensors": "nvfp4-int8-heavy"
+      },
+      "constraints": {
+        "gpus": [
+          "12.0"
+        ],
+        "bits": 4
+      },
+      "variant": "model.nvfp4.cozytensors",
       "reasons": []
     },
     {

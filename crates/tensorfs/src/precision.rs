@@ -80,13 +80,13 @@ impl Slot {
     }
 
     /// Its bits (§2.2): the request's; else 16 at `min_bits=16`; else 4 at `min_bits=4` for a
-    /// decode slot or a function whose 8-bit weights exceed the budget (`short`); else 8.
-    pub fn bits(&self, asked: u32, short: bool) -> u32 {
+    /// decode slot; else 8. Memory never lowers them: paging fits weights (owner, 2026-10-22).
+    pub fn bits(&self, asked: u32) -> u32 {
         match asked {
             _ if self.raw => 16,
             4 | 8 | 16 => asked,
             _ if self.min_bits == 16 => 16,
-            _ if self.min_bits == 4 && (self.decode || short) => 4,
+            _ if self.min_bits == 4 && self.decode => 4,
             _ => 8,
         }
     }
@@ -153,8 +153,8 @@ impl Slot {
 }
 
 /// A variant as the rule reads it, from its header alone (spec §7): every kind it holds (an
-/// encoded tensor's scheme, a plain one's dtype), its stored bytes, and the family and width of
-/// the kind holding most of them (`""`, 0 outside the table).
+/// encoded tensor's scheme, a plain one's dtype), its stored bytes, and its lane: the family and
+/// width of the narrowest kind of the table it holds (`""`, 0 when it holds none).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     pub bits: u32,
@@ -173,12 +173,12 @@ impl Profile {
             };
             *held.entry(kind).or_default() += tensor.locations().iter().map(|(_, at)| at.length).sum::<u64>();
         }
-        // The most bytes; of equal ones, the first name.
-        let dominant = held.iter().fold(None, |most: Option<(&String, u64)>, (kind, &n)| match most {
-            Some((_, m)) if m >= n => most,
-            _ => Some((kind, n)),
-        });
-        let (family, bits) = dominant.map_or(("", 0), |(kind, _)| family(kind));
+        // Its lane is the narrowest of the table's widths it holds: an nvfp4 variant that keeps
+        // its sensitive layers int8 is 4 bits, however many bytes those layers hold. Of that
+        // width, the kind with the most bytes; of equal ones, the first name.
+        let lane = held.iter().filter(|(kind, _)| family(kind).1 > 0)
+            .min_by_key(|(kind, n)| (family(kind).1, std::cmp::Reverse(**n), kind.as_str()));
+        let (family, bits) = lane.map_or(("", 0), |(kind, _)| family(kind));
         Self { bits, family: family.into(), bytes: held.values().sum(), kinds: held.into_keys().collect() }
     }
 }
@@ -228,7 +228,7 @@ impl Constraints {
             return crate::failure::fail(crate::Kind::Invalid, format!("bits {} is not 4, 8 or 16", self.bits.unwrap_or_default()));
         }
         let ccs: Vec<&str> = self.gpus.iter().map(String::as_str).collect();
-        let (gpus, bits) = (Gpus::of(&ccs), Slot::ANY.bits(self.bits.unwrap_or(0), false));
+        let (gpus, bits) = (Gpus::of(&ccs), Slot::ANY.bits(self.bits.unwrap_or(0)));
         Ok(Slot::ANY.select(bits, &gpus, variants).map(|at| (at, Slot::ANY.warnings(bits, &gpus, model, &variants[at].1.family))))
     }
 }
@@ -244,7 +244,7 @@ mod tests {
     fn one_lane_per_row() {
         let compute = Slot::of(&json!({"encoded_leaves": "accept"}));
         let decode = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 4, "phase": "decode"}));
-        let first = |slot: &Slot, asked, cc: &[&str]| slot.lanes(slot.bits(asked, false), &Gpus::of(cc))[0];
+        let first = |slot: &Slot, asked, cc: &[&str]| slot.lanes(slot.bits(asked), &Gpus::of(cc))[0];
         for (cc, eight) in [("8.0", "int8"), ("8.6", "int8"), ("8.9", "int8"), ("9.0", "int8"), ("10.0", "int8"),
             ("10.3", "fp8"), ("12.0", "int8"), ("12.1", "int8"), ("11.0", "int8")] {
             assert_eq!(first(&compute, 0, &[cc]), eight, "{cc}");
@@ -263,9 +263,11 @@ mod tests {
         assert_eq!(compute.lanes(4, &Gpus::of(&["12.0"])), ["nvfp4", "int8", "fp8", "bf16", "fp16"]);
         assert_eq!(compute.lanes(4, &Gpus::of(&["12.1"])), ["nvfp4", "int8", "fp8", "bf16", "fp16"], "GB10 proved fp8");
         let exact = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 16}));
-        assert_eq!((exact.bits(0, true), exact.bits(8, false)), (16, 8), "the request's bits win");
+        assert_eq!((exact.bits(0), exact.bits(8)), (16, 8), "the request's bits win");
+        let compute4 = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 4}));
+        assert_eq!(compute4.bits(0), 8, "only a decode slot prefers 4 bits; memory never lowers them");
         let raw = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 4, "phase": "decode", "weights": true}));
-        assert_eq!((raw.bits(4, true), raw.lanes(raw.bits(8, false), &Gpus::of(&["10.0"]))), (16, vec!["bf16", "fp16"]), "raw weights are data");
+        assert_eq!((raw.bits(4), raw.lanes(raw.bits(8), &Gpus::of(&["10.0"]))), (16, vec!["bf16", "fp16"]), "raw weights are data");
         assert!(raw.warnings(16, &Gpus::of(&["9.0"]), "x@1", "fp16").is_empty());
     }
 
@@ -307,9 +309,15 @@ mod tests {
     }
 }
 
+/// This rule's version. An index answer of another (a Hub whose profiles an older rule derived)
+/// is not taken: the headers are read instead.
+pub const RULE: u32 = 2;
+
 /// The Hub's indexed answer, with the same rule as local header selection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Selection {
+    #[serde(default)]
+    pub rule: u32,
     pub release: String,
     pub commit: crate::format::ObjectRef,
     pub variant: Option<String>,

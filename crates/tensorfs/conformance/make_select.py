@@ -26,10 +26,12 @@ def header(name, entries):
     raw = ["cozytensors/1", [[hashlib.sha256(name.encode()).digest(), offset]], encodings, [],
            [["model", ["", "", ""], {}, tensors, {}]], {}]
     (HEADERS / f"{name}.cbor").write_bytes(cbor2.dumps(raw, canonical=True))
-    dominant = sorted(held, key=lambda k: (-held[k], k))[0]
-    family, bits = {"BF16": ("bf16",16), "F16": ("fp16",16), "F32": ("f32",16),
-                    "int8.rowwise": ("int8",8), "int8.future": ("int8",8), "fp8.rowwise": ("fp8",8),
-                    "nvfp4": ("nvfp4",4), "mxfp4": ("mxfp4",4), "int4.convrot": ("int4",4)}.get(dominant,("",0))
+    table = {"BF16": ("bf16",16), "F16": ("fp16",16), "F32": ("f32",16), "int8.convrot": ("int8",8),
+             "int8.rowwise": ("int8",8), "int8.future": ("int8",8), "fp8.rowwise": ("fp8",8),
+             "nvfp4": ("nvfp4",4), "mxfp4": ("mxfp4",4), "int4.convrot": ("int4",4)}
+    lanes = [k for k in held if k in table]
+    lane = min(lanes, key=lambda k: (table[k][1], -held[k], k)) if lanes else None
+    family, bits = table.get(lane, ("", 0))
     profiles[name] = dict(family=family,bits=bits,bytes=sum(held.values()),kinds=sorted(held))
 for name,kind,n in [("bf16","BF16",128),("fp16","F16",128),("f32","F32",256),("int8","int8.rowwise",64),
                     ("fp8","fp8.rowwise",64),("fp8-small","fp8.rowwise",32),("nvfp4","nvfp4",32),
@@ -40,6 +42,9 @@ header("mixed-unsupported",[("BF16",128),("future.scheme",32)])
 header("mixed-fp8",[("int8.rowwise",128),("fp8.rowwise",32)])
 header("tie",[("F16",128),("BF16",128)])
 header("integer-mixed-int8",[("I64",128),("int8.rowwise",32)])
+# H3's layout: its nvfp4 variant keeps sensitive layers in int8, which hold most of its bytes.
+header("int8-convrot",[("int8.convrot",160),("BF16",16)])
+header("nvfp4-int8-heavy",[("int8.convrot",96),("nvfp4",32),("BF16",16)])
 paths={"weights/accurate.cozytensors":"bf16","small.cozytensors":"int8","nested/fp.cozytensors":"fp8","q4.cozytensors":"nvfp4"}
 cases=[]
 def case(why, variants, gpus, bits, chosen, reasons=(), **extra):
@@ -75,6 +80,10 @@ case("sixteen never falls to a sole encoded profile",{"q.cozytensors":"int8"},["
 case("sixteen excludes minority encoded leaves",{"q.cozytensors":"mixed-fp8"},["9.0"],16,None)
 case("overflow capability is unknown",paths,["4294967295.0"],8,"weights/accurate.cozytensors")
 case("unknown scheme inside known family is skipped",{"q.cozytensors":"future-int8"},["9.0"],8,None)
+h3={"model.int8.cozytensors":"int8-convrot","model.nvfp4.cozytensors":"nvfp4-int8-heavy"}
+case("a variant holding nvfp4 is 4-bit, however many int8 bytes it holds",h3,["12.0"],8,"model.int8.cozytensors")
+case("the default lane takes int8 over a smaller nvfp4 variant",h3,["12.0"],None,"model.int8.cozytensors")
+case("four bits take the nvfp4 variant",h3,["12.0"],4,"model.nvfp4.cozytensors")
 case("invalid bits",paths,["9.0"],3,None,error="invalid")
 lookups=[
  {"paths":["nested/.cozytensors"],"ask":"nested/.cozytensors","variant":"nested/.cozytensors"},
