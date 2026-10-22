@@ -4224,4 +4224,180 @@ mod tests {
         pool.stop().unwrap();
         crate::scratch::remove(&root);
     }
+
+    const MIB: u64 = 1 << 20;
+
+    /// `parts` one-MiB regions named `name` on `gpu`, filled inline: a set a stand-in holds.
+    #[cfg(target_os = "linux")]
+    fn stall_set(gpu: &varena::GpuId, name: &str, parts: usize) -> varena::SetSpec {
+        use varena::layout::Layout;
+        let names: Vec<String> = (0..parts).map(|i| format!("{name}/w{i}")).collect();
+        let spans: Vec<tensorfs::io::Span> = names.iter().enumerate().map(|(i, tensor)| tensorfs::io::Span {
+            what: format!("{tensor}#data"),
+            len: MIB,
+            source: tensorfs::io::ItemSource::Inline(Arc::from(vec![i as u8 + 1; MIB as usize])),
+        }).collect();
+        let regions: Vec<Vec<String>> = names.iter().map(|n| vec![n.clone()]).collect();
+        let layout = Layout::build(&spans, &regions).unwrap();
+        let ids: Vec<varena::PartId> = names.iter().map(|n| varena::PartId { name: format!("{n}#data"), encoding: "raw".into(), dtype: "u8".into() }).collect();
+        let fingerprint = varena::Fingerprint::new(&layout, &ids, varena::Fill::Stored, "stall/pkg@1", "0/1", &gpu.uuid);
+        varena::SetSpec { name: name.into(), layout: Arc::new(layout), source: Arc::new(tensorfs::io::source::Source::files(vec![], false, 0)), fingerprint }
+    }
+
+    /// An executor stand-in for the stall rule: granted the GPU's ledger over its control socket
+    /// (stdin), it loads its set to the GPU and answers one line per command: `warm` (a request
+    /// binding every block, ended: its pages stay idle on the GPU), `run <id> <shape>` (a request
+    /// and its pass, which makes the pass's measured room first) and `end <room>` (the pass
+    /// measured at `room`, the request ended).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "the stall-rule test runs it as an executor"]
+    fn stall_stand_in() {
+        use std::io::{BufRead, Write};
+        use std::os::fd::FromRawFd;
+        let Ok(spec) = std::env::var("S5_STALL") else { return };
+        let [prefix, uuid, bytes, name, parts] = spec.split('|').collect::<Vec<_>>()[..] else { panic!("{spec}") };
+        assert!(varena::os::namespace(prefix));
+        let gpu = varena::GpuId { uuid: uuid.into(), model: "host".into(), memory: bytes.parse().unwrap() };
+        // SAFETY: the test installs its control socket at this process's stdin.
+        let control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
+        let grant = varena::Grant { table: platform::handles::recv_fd(&control).unwrap(), row: platform::handles::recv_fd(&control).unwrap() };
+        let memory = varena::Memory::open(gpu.clone(), Some(grant), Box::new(varena::HostBackend::new(gpu.memory))).unwrap();
+        let parts: usize = parts.parse().unwrap();
+        let set = memory.load(stall_set(&gpu, name, parts), varena::Level::Gpu).unwrap();
+        let plan = || varena::Plan { steps: vec![varena::Step { sets: vec![name.to_string()], passes: 2 }] };
+        let (mut out, lines) = (control.try_clone().unwrap(), std::io::BufReader::new(control).lines());
+        let (mut request, mut pass) = (None, None);
+        for line in lines.map_while(Result::ok) {
+            let reply = match line.split(' ').collect::<Vec<_>>()[..] {
+                ["warm"] => {
+                    let warm = memory.request(&format!("warm-{}", uuid::Uuid::new_v4()), plan()).unwrap();
+                    let binding = warm.pass(set, "warm", "1", varena::Torch::default()).unwrap();
+                    drop((0..parts as u32).map(|block| memory.bind(set, block, 0).unwrap()).collect::<Vec<_>>());
+                    binding.end(varena::Measured::default(), varena::Torch::default());
+                    warm.end();
+                    "warm".to_string()
+                }
+                ["run", id, shape] => {
+                    let opened = memory.request(id, plan()).unwrap();
+                    pass = Some(opened.pass(set, "run", shape, varena::Torch::default()).unwrap());
+                    request = Some(opened);
+                    "passing".to_string()
+                }
+                ["end", room] => {
+                    let room: u64 = room.parse().unwrap();
+                    pass.take().unwrap().end(varena::Measured { allocated_peak: room, slack: room / 8, ..Default::default() }, varena::Torch::default());
+                    request.take().unwrap().end();
+                    "ended".to_string()
+                }
+                _ => panic!("unknown command {line}"),
+            };
+            writeln!(out, "{reply}").unwrap();
+        }
+    }
+
+    /// A stall-rule stand-in, its control socket and replies.
+    #[cfg(target_os = "linux")]
+    struct StallStandIn {
+        child: std::process::Child,
+        control: std::os::unix::net::UnixStream,
+        replies: std::io::BufReader<std::os::unix::net::UnixStream>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl StallStandIn {
+        fn spawn(prefix: &str, gpu: &memory::Gpu, uuid: &str, name: &str, parts: usize) -> StallStandIn {
+            let (control, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gpu_service::tests::stall_stand_in", "--ignored", "--nocapture"])
+                .env("S5_STALL", format!("{prefix}|{uuid}|{}|{name}|{parts}", 64 * MIB))
+                .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let grant = gpu.ledger.grant(child.id()).unwrap();
+            platform::handles::send_fd(&control, &grant.table).unwrap();
+            platform::handles::send_fd(&control, &grant.row).unwrap();
+            let replies = std::io::BufReader::new(control.try_clone().unwrap());
+            StallStandIn { child, control, replies }
+        }
+
+        fn ask(&mut self, command: &str) -> String {
+            use std::io::{BufRead, Write};
+            writeln!(self.control, "{command}").unwrap();
+            let mut reply = String::new();
+            self.replies.read_line(&mut reply).unwrap();
+            reply.trim().to_string()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for StallStandIn {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The stall rule, through the pool's own events thread (`memory_changed` → `end_stalled`)
+    /// over a host GPU's real ledger, with real processes: a row asked for room whose ask thread
+    /// still runs answers and is never ended, however its asker waits; once that row is stopped
+    /// (SIGSTOP: state T) with an ask out to it, the ledger names it stalled and the pool ends
+    /// it, so the asker's pass gets its room.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_row_asked_for_room_is_ended_and_an_answering_one_never() {
+        let prefix = format!("gpusvc{}-", std::process::id());
+        assert!(varena::os::namespace(&prefix), "the test binary's namespace");
+        let root = std::env::temp_dir().join(format!("gpu-stall-{}", uuid::Uuid::new_v4()));
+        let uuid = format!("GPU-stall-{}", uuid::Uuid::new_v4());
+        let config: GpuConfig = serde_json::from_value(json!({"devices": "0", "prespawn": false,
+            "inventory": [{"device_index": 0, "device_name": "host", "device_uuid": uuid, "driver_version": "", "memory_bytes": 64 * MIB, "pci_bus_id": ""}]})).unwrap();
+        let store = crate::storage::open(&root.join("store")).unwrap();
+        let pool = Pool::new(&root.join("gpu"), config, store.clone()).unwrap();
+        let gpu = pool.devices[0].memory.clone().expect("the host GPU's ledger");
+        const ROOM: u64 = 40 * MIB;
+        let mut asker = StallStandIn::spawn(&prefix, &gpu, &uuid, "asker", 2);
+        assert_eq!(asker.ask("warm"), "warm");
+        // Its pass at `big` measures its room while the card is free.
+        assert_eq!(asker.ask("run measure big"), "passing");
+        assert_eq!(asker.ask(&format!("end {ROOM}")), "ended");
+        let mut holder = StallStandIn::spawn(&prefix, &gpu, &uuid, "holder", 24);
+        assert_eq!(holder.ask("warm"), "warm");
+        let birth = Birth::of(holder.child.id()).unwrap();
+        pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: "holder".into(), start: 0, exact: Exact::open(&birth).unwrap().unwrap() });
+        let ended = || std::fs::read_to_string(store.root().join("logs/memory.log")).unwrap_or_default()
+            .lines().any(|line| line.contains("\"end_stalled\"") && line.contains(&format!("\"pid\":{}", birth.pid)));
+        // Answering: the asker's pass needs the holder's idle pages, asks, and gets them.
+        assert_eq!(asker.ask("run answered big"), "passing");
+        assert_eq!(asker.ask(&format!("end {ROOM}")), "ended");
+        assert!(holder.child.try_wait().unwrap().is_none() && !ended(), "an answering row is never ended");
+        assert_eq!(holder.ask("warm"), "warm");
+        // Stopped with an ask out to it: the pool ends it, and the pass gets its room.
+        let mut stopped = 0;
+        // SAFETY: a signal to this test's own child, then waiting until it has stopped.
+        unsafe {
+            assert_eq!(libc::kill(birth.pid as i32, libc::SIGSTOP), 0);
+            libc::waitpid(birth.pid as i32, &mut stopped, libc::WUNTRACED);
+        }
+        let (passed, passing) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let asker = &mut asker;
+            scope.spawn(move || passed.send(asker.ask("run stalled big")).unwrap());
+            // A failure backstop only: the pass returns once the pool has ended the holder.
+            let reply = passing.recv_timeout(std::time::Duration::from_secs(60));
+            if reply.is_err() {
+                // SAFETY: our own child; the asker's pass then goes on.
+                unsafe { libc::kill(birth.pid as i32, libc::SIGKILL) };
+            }
+            assert_eq!(reply.as_deref(), Ok("passing"), "the stopped holder's end freed its pages");
+        });
+        let status = holder.child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "ended by the pool: {status:?}");
+        assert!(ended(), "the memory log says the pool ended it");
+        assert_eq!(asker.ask(&format!("end {ROOM}")), "ended");
+        drop((asker, holder));
+        pool.stop().unwrap();
+        crate::scratch::remove(&root);
+    }
 }
