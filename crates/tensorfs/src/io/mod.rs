@@ -105,6 +105,23 @@ impl Dst {
         self.len() == 0
     }
 
+    /// It and `next` as one destination, when `next` starts where it ends (same device and
+    /// stream for device memory).
+    fn joined(self, next: Dst) -> Option<Dst> {
+        match (self, next) {
+            (Dst::Host { ptr, len }, Dst::Host { ptr: at, len: more }) if ptr.wrapping_add(len) == at => {
+                Some(Dst::Host { ptr, len: len + more })
+            }
+            (
+                Dst::Device { device, ptr, len, stream },
+                Dst::Device { device: d, ptr: at, len: more, stream: s },
+            ) if d == device && s == stream && ptr.checked_add(len as u64) == Some(at) => {
+                Some(Dst::Device { device, ptr, len: len + more, stream })
+            }
+            _ => None,
+        }
+    }
+
     /// `len` bytes of it from `at`.
     pub(crate) fn slice(self, at: usize, len: usize) -> Dst {
         assert!(
@@ -130,6 +147,33 @@ impl Dst {
             },
         }
     }
+}
+
+/// `copies` in order, each one whose source and destination both continue the previous copy's
+/// merged into it: a fill reads one run per contiguous range, not one copy per tensor (v7's
+/// cold SDXL: thousands of small staged copies per fill).
+pub(crate) fn coalesce(copies: Vec<Copy<'_>>) -> Vec<Copy<'_>> {
+    let mut out: Vec<Copy> = Vec::with_capacity(copies.len());
+    for c in copies {
+        if let Some(last) = out.last_mut() {
+            let n = last.dst.len();
+            let follows = match (last.src, c.src) {
+                (Src::Zero, Src::Zero) => true,
+                (Src::File(a, at), Src::File(b, from)) => std::ptr::eq(a, b) && at.checked_add(n as u64) == Some(from),
+                (Src::Host(a), Src::Host(b)) => a.wrapping_add(n) == b,
+                (Src::Device { device, ptr, stream }, Src::Device { device: d, ptr: from, stream: s }) => {
+                    device == d && stream == s && ptr.checked_add(n as u64) == Some(from)
+                }
+                _ => false,
+            };
+            if let (true, Some(dst)) = (follows, last.dst.joined(c.dst)) {
+                last.dst = dst;
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Device regions' alignment in [`pack`]: DLPack's data alignment and `cuMemAlloc`'s, enough
@@ -315,5 +359,38 @@ fn disk_run(copies: &[Copy], stats: &ReadStats, ns: u64) {
     }
     if bytes > 0 {
         metrics::disk_run(&files, bytes, ns, stats.direct, stats.cached);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Copies whose sources and destinations both continue the previous one's become one run;
+    /// a jump in either, another file or another kind of source starts the next run.
+    #[test]
+    fn contiguous_copies_coalesce_into_runs() {
+        let (a, b) = (File::open(std::env::current_exe().unwrap()).unwrap(), File::open(std::env::current_exe().unwrap()).unwrap());
+        let device = |ptr: u64, len: usize| Dst::Device { device: 0, ptr, len, stream: 7 };
+        let copies = vec![
+            Copy { src: Src::File(&a, 0), dst: device(4096, 100) },
+            Copy { src: Src::File(&a, 100), dst: device(4196, 28) },
+            Copy { src: Src::Zero, dst: device(4224, 32) },
+            Copy { src: Src::Zero, dst: device(4256, 64) },
+            Copy { src: Src::File(&a, 128), dst: device(4320, 10) },
+            Copy { src: Src::File(&b, 138), dst: device(4330, 10) },
+            Copy { src: Src::File(&b, 148), dst: device(5000, 10) },
+            Copy { src: Src::File(&b, 158), dst: Dst::Device { device: 0, ptr: 5010, len: 10, stream: 8 } },
+        ];
+        let runs: Vec<(usize, usize)> = coalesce(copies).iter().map(|c| (match c.dst { Dst::Device { ptr, .. } => ptr as usize, Dst::Host { .. } => 0 }, c.dst.len())).collect();
+        assert_eq!(runs, [(4096, 128), (4224, 96), (4320, 10), (4330, 10), (5000, 10), (5010, 10)]);
+        let mut host = vec![0u8; 64];
+        let (left, right) = host.split_at_mut(16);
+        let bytes = [1u8; 64];
+        let merged = coalesce(vec![
+            Copy { src: Src::Host(bytes.as_ptr()), dst: Dst::host(left) },
+            Copy { src: Src::Host(bytes[16..].as_ptr()), dst: Dst::host(right) },
+        ]);
+        assert_eq!((merged.len(), merged[0].dst.len()), (1, 64));
     }
 }
