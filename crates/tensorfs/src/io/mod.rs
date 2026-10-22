@@ -150,6 +150,20 @@ pub fn pack(lens: impl IntoIterator<Item = usize>, align: usize) -> Option<(Vec<
     Some((offsets, end))
 }
 
+/// Called by [`read`] once for each copy that landed, with its index in `copies`, as soon as its
+/// bytes are complete at the destination: device bytes then serve any later stream operation.
+/// It runs on a TensorFS thread (a reader, or the reading one as the read ends), must not block
+/// or call into TensorFS, and copies land in no set order. A read that fails returns `Err`, and a
+/// copy it did not call back for did not land.
+#[derive(Clone)]
+pub struct Landed(pub std::sync::Arc<dyn Fn(usize) + Send + Sync>);
+
+impl std::fmt::Debug for Landed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Landed")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ReadOpts {
     /// Reads in flight at once.
@@ -160,6 +174,8 @@ pub struct ReadOpts {
     pub streams: usize,
     /// Read what the page cache lacks with O_DIRECT, where the filesystem allows.
     pub direct: bool,
+    /// Told of each copy as it lands, before the read returns; `None` costs nothing.
+    pub landed: Option<Landed>,
 }
 
 impl Default for ReadOpts {
@@ -169,6 +185,7 @@ impl Default for ReadOpts {
             request: 1 << 20,
             streams: 2,
             direct: true,
+            landed: None,
         }
     }
 }
@@ -286,6 +303,9 @@ unsafe fn read_impl(
         })?;
         #[cfg(unix)]
         disk_run(&host_copies, &stats, host_start.elapsed().as_nanos() as u64);
+        if let Some(landed) = &opts.landed {
+            host.iter().for_each(|(copy, _)| (landed.0)(*copy));
+        }
         stats
     };
     let device = unsafe { device::fill(&devices, opts, staged_host) }?;
