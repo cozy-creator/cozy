@@ -57,12 +57,28 @@ fn budget() -> u64 {
 /// The tier's one admission: a fill of `bytes` goes only into measured surplus, the live budget
 /// less what the running calls must keep free. Layouts nobody maps make room first, then those
 /// executors map (asked back), in [`host_decide`] order. Never beside an unmeasured call.
-fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget) -> bool {
-    let Some(keep) = need() else { return false };
-    let want = keep.saturating_add(bytes);
-    let room = budget();
-    let gave = if room >= want { 0 } else { relieve(state, HostTrigger::Room { bytes: want, headroom: room }) };
-    room + gave >= want
+fn admit(state: &Shared, need: &Need, bytes: u64, budget: &Budget, conn: u64) -> bool {
+    for attempt in 0..2 {
+        let mut s = state.0.lock();
+        // Check and reserve in one critical section. In-flight fills may not have faulted
+        // their pages yet, so the live OS budget alone does not account for their promises.
+        if s.promised.contains_key(&conn) { return false; }
+        let Some(keep) = need() else { return false };
+        let pending = s.promised.values().copied().fold(0u64, u64::saturating_add);
+        let Some(want) = keep.checked_add(pending).and_then(|n| n.checked_add(bytes)) else { return false };
+        let room = budget();
+        if room >= want {
+            s.promised.insert(conn, bytes);
+            return true;
+        }
+        drop(s);
+        if attempt == 0 {
+            // No peer wait: immediately reclaimable layouts go now. Re-read actual headroom
+            // before admitting; do not add a release estimate to a newer OS measurement.
+            relieve(state, HostTrigger::Room { bytes: want, headroom: room });
+        }
+    }
+    false
 }
 
 /// A pressure event only says "look": rungs go back while the budget is below what the running
@@ -243,6 +259,8 @@ struct State {
     short: Option<Owned>,
     /// Its users' open connections: a tier that stops serving closes them.
     conns: HashMap<u64, Stream>,
+    /// Admission promises, one dedicated connection per live fill. EOF releases its charge.
+    promised: HashMap<u64, u64>,
 }
 
 type Shared = Arc<(Mutex<State>, Condvar)>;
@@ -536,7 +554,7 @@ fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget) {
             Call::Room { bytes } => {
                 drop(s);
                 // Never waits: what nobody maps goes now; what executors map is asked back.
-                let ok = admit(state, need, bytes, budget);
+                let ok = admit(state, need, bytes, budget, conn);
                 cv.notify_all();
                 s = lock.lock();
                 (Reply::Room { ok }, None)
@@ -550,9 +568,12 @@ fn serve(stream: Stream, state: &Shared, need: &Need, budget: &Budget) {
     }
     let mut s = lock.lock();
     s.conns.remove(&conn);
+    s.promised.remove(&conn);
     s.layouts.values_mut().for_each(|l| {
         l.users.remove(&conn);
     });
+    drop(s);
+    cv.notify_all();
 }
 
 /// The layout's file and data offset, made when absent.
@@ -720,52 +741,71 @@ impl Held {
         })
     }
 
-    /// Fills the regions not ready, all at once through `fill` (given each one's host bytes),
-    /// under their write locks; then they are ready.
+    /// Fill owns distinct write-lock descriptions, so concurrent calls through one Held
+    /// exclude one another too. Ordinary Err means the caller proved its I/O drained;
+    /// Ownership means completion is unknown and destination mappings/locks are quarantined.
     pub fn fill(&self, regions: &[u32], fill: impl FnOnce(&[(u32, tensorfs::io::Dst)]) -> Result<()>) -> Result<()> {
-        self.locked(regions.iter().copied(), true, || {
-            let todo: Vec<u32> = regions.iter().copied().filter(|r| self.ready(*r).is_none_or(|w| w.load(Acquire) != 1)).collect();
-            if todo.is_empty() {
-                return Ok(());
+        let locks = self.lock_regions(regions.iter().copied(), true)?;
+        let todo: Vec<u32> = regions.iter().copied().collect::<std::collections::BTreeSet<_>>().into_iter()
+            .filter(|r| self.ready(*r).is_none_or(|w| w.load(Acquire) != 1)).collect();
+        if todo.is_empty() { return Ok(()); }
+        let words = os::map_at(&locks, 0, self.data as usize, true)?;
+        let maps = todo.iter().map(|r| self.region(*r).and_then(|(off, span)| os::map_at(&locks, self.data + off, span as usize, true))).collect::<Result<Vec<_>>>()?;
+        let dsts: Vec<_> = todo.iter().zip(&maps).map(|(r, m)| (*r, tensorfs::io::Dst::Host { ptr: m.base, len: m.len })).collect();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fill(&dsts)))
+            .unwrap_or_else(|_| Err(Error::Ownership("RAM-tier fill panicked before proving completion".into())));
+        if let Err(error) = outcome {
+            if matches!(error, Error::Ownership(_)) {
+                std::mem::forget((maps, words, locks));
+                return Err(error);
             }
-            let maps = todo.iter().map(|r| self.region(*r).and_then(|(off, span)| os::map_at(&self.fd, self.data + off, span as usize, true))).collect::<Result<Vec<_>>>()?;
-            let dsts: Vec<_> = todo.iter().zip(&maps).map(|(r, m)| (*r, tensorfs::io::Dst::Host { ptr: m.base, len: m.len })).collect();
-            fill(&dsts)?;
-            drop(maps);
-            // The words page is the service's to write; the region locks order these stores.
-            let words = os::map_at(&self.fd, 0, self.data as usize, true)?;
+            // A drained failure must not strand dirty pages behind ready=0, where the
+            // pressure policy cannot see them. No ready region is punched by this cleanup.
             for r in todo {
-                // SAFETY: inside the words page, aligned to 4.
-                let word = unsafe { &*(words.base.add(r as usize * 4) as *const AtomicU32) };
-                word.store(1, Release);
+                let (off, span) = self.region(r)?;
+                if let Err(e) = os::punch(&locks, self.data + off, span) {
+                    std::mem::forget((maps, words, locks));
+                    return Err(Error::Ownership(format!("RAM-tier failed-fill cleanup could not return its pages: {e}")));
+                }
             }
-            Ok(())
-        })
+            return Err(error);
+        }
+        for r in todo {
+            // SAFETY: inside the words page, aligned to 4, with this region write-locked.
+            let word = unsafe { &*(words.base.add(r as usize * 4) as *const AtomicU32) };
+            word.store(1, Release);
+        }
+        Ok(())
     }
 
-    /// Runs `f` with the regions locked (write, or read), each unlocked after. They are taken
-    /// in ascending order, as every holder takes them, so no two holders wait on each other.
-    fn locked<T>(&self, regions: impl Iterator<Item = u32>, write: bool, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    /// A separate OFD description per operation: locks on Held's shared description would
+    /// not exclude two local threads, and could not outlive Held after quarantining a fill.
+    fn lock_regions(&self, regions: impl Iterator<Item = u32>, write: bool) -> Result<Owned> {
         let mut order: Vec<u32> = regions.collect();
         order.sort_unstable();
         order.dedup();
-        let mut held = vec![];
-        let out = (|| {
-            for r in &order {
-                let (off, span) = self.region(*r)?;
-                match write {
-                    true => os::lock(&self.fd, self.data + off, span, true)?,
-                    false => os::share(&self.fd, self.data + off, span, true)?,
-                };
-                held.push((off, span));
-            }
-            f()
-        })();
-        for (off, span) in held {
-            os::unlock(&self.fd, self.data + off, span)?;
+        let fd = os::reopen(&self.fd, true)?;
+        for r in order {
+            let (off, span) = self.region(r)?;
+            match write {
+                true => os::lock(&fd, self.data + off, span, true)?,
+                false => os::share(&fd, self.data + off, span, true)?,
+            };
         }
-        out
+        Ok(fd)
     }
+
+    fn locked<T>(&self, regions: impl Iterator<Item = u32>, write: bool, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _locks = self.lock_regions(regions, write)?;
+        f()
+    }
+
+}
+
+/// A fill's host reservation. Closing its dedicated socket (including process death)
+/// releases the service charge. Quarantining an unfinished copy must retain this permit.
+pub(crate) struct Permit {
+    _stream: Stream,
 }
 
 /// An executor's connection to the machine's tier.
@@ -844,10 +884,16 @@ impl Client {
 
     /// Host headroom for `bytes`, the tier giving back in order; false when it cannot now. A
     /// connection of its own: a fill never waits behind another call.
-    pub fn room(&self, bytes: u64) -> bool {
-        let Ok(Some(stream)) = os::connect(self.ns, NAME) else { return false };
-        matches!(os::call::<_, Reply>(&stream, &Call::Room { bytes }, None), Ok((Reply::Room { ok: true }, _)))
+    pub fn reserve(&self, bytes: u64) -> Option<Permit> {
+        let stream = os::connect(self.ns, NAME).ok()??;
+        match os::call::<_, Reply>(&stream, &Call::Room { bytes }, None) {
+            Ok((Reply::Room { ok: true }, _)) => Some(Permit { _stream: stream }),
+            _ => None,
+        }
     }
+
+    // Removed with the paired Memory caller change: a fill must hold reserve()'s permit.
+    pub fn room(&self, bytes: u64) -> bool { self.reserve(bytes).is_some() }
 
     /// Every layout's resident bytes in the tier, together (0 when it cannot be asked).
     pub fn resident(&self) -> u64 {
