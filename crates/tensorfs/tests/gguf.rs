@@ -318,7 +318,7 @@ fn tfs_imports_and_exports_a_gguf() {
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    tfs(&["convert", source.to_str().unwrap(), "--name", "local/llama@1"]);
+    tfs(&["import", source.to_str().unwrap(), "--name", "local/llama@1"]);
     let out = scratch.0.join("out");
     tfs(&["export", "local/llama@1", out.to_str().unwrap(), "--gguf"]);
     assert_eq!(

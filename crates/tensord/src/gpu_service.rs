@@ -13,6 +13,7 @@ use crate::{
     execution::Engine,
     gpu_allocation::Claims,
     deposits::Deposits,
+    host_tier::HostTier,
     journal::{
         AssetBinding, Execution, Failure, Outcome, Preparation, State,
     },
@@ -625,13 +626,9 @@ pub struct Pool {
     levels: Mutex<BTreeMap<String, (App, Level, Birth)>>,
     /// Each envelope GPU and its ledger, in envelope order.
     devices: Vec<Device>,
-    /// Host layouts executors deposited, granted to the next executor of the same weights.
-    deposits: Arc<Deposits>,
-    /// Shared mode's room for the host's other programs, and the stalls the watcher saw: the
-    /// count at the last bring-back pass says whether one came since (`host_pressure`).
-    reserve: Mutex<platform::contain::host_pressure::Reserve>,
-    stalls: std::sync::atomic::AtomicU64,
-    stalls_seen: std::sync::atomic::AtomicU64,
+    /// Host layouts executors deposited, granted to the next executor of the same weights, and
+    /// the host room they may take (`host_tier`).
+    host: Arc<HostTier>,
     /// Memoized Model methods' results, shared by every run on this machine.
     memo: Arc<crate::memo::Memo>,
     // Drop session/resource custody before ending the actual spawning thread.
@@ -729,6 +726,7 @@ impl Pool {
                 });
             devices.push(Device { entry: entry.clone(), memory });
         }
+        let host = Arc::new(HostTier::new(root, config.host.mode, notes.clone()));
         let pool = Arc::new(Self {
             launcher: crate::child_launcher::ChildLauncher::new()?,
             root: root.to_path_buf(),
@@ -749,10 +747,7 @@ impl Pool {
             members: Mutex::new(BTreeMap::new()),
             keeping: Mutex::new(()),
             levels: Mutex::new(BTreeMap::new()),
-            deposits: Arc::default(),
-            reserve: Mutex::default(),
-            stalls: Default::default(),
-            stalls_seen: Default::default(),
+            host,
             memo: Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?),
         });
         for device in &pool.devices {
@@ -760,89 +755,16 @@ impl Pool {
             let end = move |pid| if let Some(pool) = weak.upgrade() { pool.end_stalled(pid) };
             device.memory.iter().for_each(|ledger| ledger.on_stalled(Box::new(end.clone())));
         }
-        pool.watch_host();
+        let weak = Arc::downgrade(&pool);
+        pool.host.watch(move || weak.upgrade().map(|pool| pool.give_back_one()));
         Ok(pool)
     }
-    /// The host-pressure watcher (`host_pressure`): one thread blocked in poll() until the
-    /// kernel reports a stall, then a rung given back when the feedback rule says so.
-    fn watch_host(self: &Arc<Self>) {
-        let mode = self.config.host.mode;
-        let pressure = match platform::contain::host_pressure::Pressure::arm(mode) {
-            Ok(pressure) => pressure,
-            Err(error) => {
-                tracing::warn!("host pressure: no PSI trigger ({error}); memory goes back only as calls plan");
-                return;
-            }
-        };
-        let pool = Arc::downgrade(self);
-        let started = std::thread::Builder::new()
-            .name("host-pressure".into())
-            .spawn(move || {
-                let mut feedback = platform::contain::host_pressure::Feedback::new(
-                    pressure.sample().map(|sample| sample.total()).unwrap_or(0),
-                    std::time::Instant::now(),
-                );
-                while pressure.wait().is_ok() {
-                    let Some(pool) = pool.upgrade() else { break };
-                    let Ok(sample) = pressure.sample() else { break };
-                    let Some(give) = feedback.observe(sample, std::time::Instant::now()) else { continue };
-                    pool.stalls.fetch_add(1, Ordering::AcqRel);
-                    pool.host_room_now();
-                    let gave = give && pool.give_back_one();
-                    if give && !gave {
-                        feedback.exhausted();
-                    }
-                    pool.notes.note(serde_json::json!({"event": "host_pressure",
-                        "mode": format!("{mode:?}"), "stalled_us": sample.stalled_us(),
-                        "limit_hits": sample.limit_hits(), "gave": gave,
-                        "stopped_at": feedback.stopped_at()}));
-                }
-            });
-        if let Err(error) = started {
-            tracing::warn!("host pressure: {error}");
-        }
-    }
-    /// Host bytes discretionary holdings may take now (a warm member, an import ahead): what
-    /// the host has before its tightest limit, less, in shared mode, what its other programs
-    /// used recently beyond their use now (`host_pressure::Reserve`). None: unreadable.
-    fn host_room_now(&self) -> Option<u64> {
-        let host = platform::contain::host_memory::read();
-        let available = u64::try_from(host.available).ok()?;
-        if self.config.host.mode == platform::contain::host_pressure::HostMode::Dedicated {
-            return Some(available);
-        }
-        let ours = platform::contain::host_memory::tree_private(std::process::id());
-        let total = u64::try_from(platform::contain::host_memory::total()).ok()?;
-        let others = platform::contain::host_pressure::others(&host, total, ours)?;
-        Some(available.saturating_sub(self.reserve.lock().unwrap().observe(others)))
-    }
-    /// A bring-back pass: with no stall since the last one, the reserve forgets half.
-    fn quiet_pass(&self) {
-        let stalls = self.stalls.load(Ordering::Acquire);
-        if self.stalls_seen.swap(stalls, Ordering::AcqRel) != stalls {
-            return;
-        }
-        let host = platform::contain::host_memory::read();
-        let ours = platform::contain::host_memory::tree_private(std::process::id());
-        let others = u64::try_from(platform::contain::host_memory::total())
-            .ok()
-            .and_then(|total| platform::contain::host_pressure::others(&host, total, ours));
-        if let Some(others) = others {
-            self.reserve.lock().unwrap().quiet(others);
-        }
-    }
-    /// Host RAM for a fill of `need` bytes (a layout an executor seals): rungs go back while the
-    /// host's room is short of it, with or without a PSI trigger, so the kernel never has to
-    /// kill an executor for it (no host-RAM floor: what does not fit pages to disk).
-    pub fn host_room_for(&self, need: u64) {
-        while self.host_room_now().is_some_and(|room| room < need) && self.give_back_one() {}
-    }
-    /// One rung back to the host, in the agreed order: sealed layouts no tenant holds, an
+    /// One rung back to the host, in the agreed order: sealed layouts no live executor maps, an
     /// import-only parent with no live child, an idle deviceless executor, then an idle
     /// executor (outside every warm set first) on a GPU no call holds. Whether anything went
     /// back.
     pub fn give_back_one(&self) -> bool {
-        self.deposits.release_one()
+        self.host.deposits.release_one()
             || self.end_idle_parent(false) > 0
             || self.end_idle_deviceless(|_| true)
             || self.end_lru_idle("", false, 0..0)
@@ -1108,7 +1030,7 @@ impl Pool {
     /// from another member or a running call, and keeps the reason when it stops short.
     pub fn keep(self: &Arc<Self>, engine: &Arc<Engine>, actor: &str) {
         let _pass = self.keeping.lock().unwrap();
-        self.quiet_pass();
+        self.host.quiet();
         for member in self.warm_set(actor) {
             // From `downloaded` up, what its constructions read comes behind every call's.
             if let (Some(plan), Some(fetch), true) = (&member.plan, &member.fetch, member.level >= Level::Downloaded) {
@@ -2219,7 +2141,7 @@ impl Pool {
     fn parent_fits(&self, _held: &HeldGeneration) -> bool {
         let parents: Vec<Arc<Zygote>> = self.zygotes.lock().unwrap().values().cloned().collect();
         let need = parents.iter().map(|parent| parent.private_bytes()).max().filter(|b| *b > 0);
-        self.host_room_now().is_none_or(|room| room >= need.unwrap_or(UNMEASURED_PARENT))
+        self.host.room().is_none_or(|room| room >= need.unwrap_or(UNMEASURED_PARENT))
     }
 
     /// Drop a dead parent, if it is still the generation's: the next launch starts another.
@@ -2674,12 +2596,14 @@ impl Pool {
         // process (the Runtime refuses a group without constructed models).
         let ranks = if plan.slots.is_empty() { 1 } else { degree.max(1) };
         let lane = self.lane_devices(start, degree)?;
-        let _sealing = Sealing(&self.deposits, id);
+        let _sealing = Sealing(&self.host.deposits, id);
+        let live = self.host.begin(id, &construction, group(session).iter().map(|b| b.pid).collect());
         let mut callbacks = Callbacks {
             engine,
             id,
             completed: 0,
-            deposits: &self.deposits,
+            deposits: &self.host.deposits,
+            holders: group(session),
             generation: &held.record,
             pool: self,
             spool: None,
@@ -2753,6 +2677,8 @@ impl Pool {
                 let pid = if rank == 0 { Some(session.executor.birth.pid) } else { session.followers.get(rank - 1).map(|f| f.birth().pid) };
                 d.memory.as_ref().zip(pid).map(|(memory, pid)| (memory, pid, d.entry.as_str()))
             }).collect();
+            callbacks.holders = group(session);
+            live.pids(callbacks.holders.iter().map(|b| b.pid).collect());
             // The request's signer, whose bearer the Runtime keeps apart.
             let actor = engine.get(id).ok().and_then(|record| record.submission).map(|s| s.actor).unwrap_or_default();
             let load = match plan.slots.first() {
@@ -2890,6 +2816,7 @@ impl Pool {
         let prepared = command_ok(prepared)?;
         // Its measured peak is recorded under its shape: room for it, and the key named to varena.
         let shape = shape(&prepared.features);
+        live.shape(&shape);
         self.make_room(&construction, start, degree, Some(&shape), false, false)?;
         let _dispatched = Dispatched::new(gpus, id, &format!("{construction}|{shape}"));
         let spool = if let Some(identity) = self.config.identity {
@@ -2951,6 +2878,7 @@ impl Pool {
         );
         session.executor.waits = None;
         let reply = reply?;
+        live.measured();
         self.record_invoke(&construction, &lane, first, invoked.elapsed(), &reply);
         record_measurements(engine, id, &plan, &reply);
         if reply.attention_applied {
@@ -3119,6 +3047,11 @@ fn await_executor_exit(engine: &Arc<Engine>, births: &[Birth]) {
 
 fn owns_birth(leader: &Birth, followers: &[platform::process::Exact], candidate: &Birth) -> bool {
     leader == candidate || followers.iter().any(|f| f.birth() == candidate)
+}
+
+/// A session's executor processes: its leader and each follower.
+fn group(session: &Session) -> Vec<Birth> {
+    std::iter::once(session.executor.birth.clone()).chain(session.followers.iter().map(|f| f.birth().clone())).collect()
 }
 
 fn executor_births(leader: &Birth, followers: &[platform::process::Exact]) -> Vec<Birth> {
@@ -3608,6 +3541,8 @@ struct Callbacks<'a> {
     id: &'a str,
     completed: u64,
     deposits: &'a Deposits,
+    /// The executor processes a layout granted or deposited here is mapped by.
+    holders: Vec<Birth>,
     /// The environment the executor runs: its App's declarations name the products it publishes.
     generation: &'a crate::catalog::Generation,
     pool: &'a Pool,
@@ -3633,30 +3568,39 @@ impl Services for Callbacks<'_> {
     /// A weight set's held bytes: the sealed host layout an executor deposited for its manifest
     /// and layout (whole, or still filling: a region its filler leaves unfilled reads the
     /// checkpoint), else nothing, and the Runtime reads the checkpoint through TensorFS (TensorD
-    /// never fills). The first asker of a layout seals it, host RAM for its selected bytes made
-    /// first; another asker meanwhile is told to ask again once that deposit lands.
+    /// never fills). Without one, the asker seals it only when admitted (`seal`): a layout is
+    /// speculation, so it takes only measured surplus (`HostTier::admit`). Another asker
+    /// meanwhile is told to ask again once that deposit lands.
     fn read_grant(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
         drop(plan);
         let (manifest, layout) = (&frame.manifest, &frame.layout);
-        let (file, filling) = match self.deposits.grant(manifest, layout) {
-            Some((file, filling)) => (Some(file), filling),
-            None if layout.is_empty() => (None, false),
-            None => match self.deposits.seal(manifest, layout, &format!("{}#{}", self.id, frame.rank)) {
-                Ok(()) => (None, false),
-                Err(sealer) => {
-                    let detail = format!("{sealer} is sealing {layout}; ask again once it deposits");
-                    return Ok((Answer::refused(frame.seq, "layout_sealing", &detail), vec![]));
+        let (file, filling, seal, admission) = match self.deposits.grant(manifest, layout, &self.holders) {
+            Some((file, filling)) => (Some(file), filling, false, None),
+            None if layout.is_empty() => (None, false, false, None),
+            None => {
+                let id = |m: &str| m.trim_start_matches("sha256:").to_string();
+                let selected = self.selections.iter().find(|s| id(&s.manifest) == id(manifest));
+                let bytes = selected.and_then(|s| selected_bytes(&self.pool.store, &s.manifest, &s.components).ok());
+                let mut admission = None;
+                match self.deposits.seal(manifest, layout, &format!("{}#{}", self.id, frame.rank), || {
+                    admission = bytes.map(|(bytes, _)| self.pool.host.admit(bytes));
+                    admission.as_ref().is_some_and(|a| a.seal)
+                }) {
+                    Ok(seal) => {
+                        // A concurrent deposit may have landed after the first grant lookup.
+                        let granted = (!seal).then(|| self.deposits.grant(manifest, layout, &self.holders)).flatten();
+                        let (file, filling) = granted.map_or((None, false), |(file, filling)| (Some(file), filling));
+                        (file, filling, seal, admission.map(|a| crate::host_tier::Admission { seal, ..a }))
+                    }
+                    Err(sealer) => {
+                        let detail = format!("{sealer} is sealing {layout}; ask again once it deposits");
+                        return Ok((Answer::refused(frame.seq, "layout_sealing", &detail), vec![]));
+                    }
                 }
-            },
-        };
-        if file.is_none() {
-            let id = |m: &str| m.trim_start_matches("sha256:").to_string();
-            let selected = self.selections.iter().find(|s| id(&s.manifest) == id(manifest));
-            if let Some((need, _)) = selected.and_then(|s| selected_bytes(&self.pool.store, &s.manifest, &s.components).ok()) {
-                self.pool.host_room_for(need);
             }
-        }
+        };
         let (mut answer, mut fds) = granted(frame.seq, file);
+        answer.seal = seal;
         let held = answer.held;
         // GPU pages a gone executor kept of this layout follow its host layout.
         let rank = self.kept.get(frame.rank as usize).copied().flatten();
@@ -3669,7 +3613,7 @@ impl Services for Callbacks<'_> {
             (answer.fingerprint, answer.descriptors) = (fingerprint, fds.len() as u64);
         }
         self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
-            "layout": frame.layout, "held": held, "filling": filling, "pages": answer.pages.len(),
+            "layout": frame.layout, "held": held, "filling": filling, "admission": admission, "pages": answer.pages.len(),
             "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "gpu": rank.map(|(_, _, gpu)| gpu)}));
         Ok((answer, fds))
     }
@@ -3678,6 +3622,11 @@ impl Services for Callbacks<'_> {
         let Some((ledger, pid, gpu)) = self.kept.get(frame.rank as usize).copied().flatten().filter(|_| pages.len() == frame.pages.len()) else {
             return Answer::refused(frame.seq, "keep_pages_refused", "kept pages name one existing GPU rank, one fd per page");
         };
+        // Kept pages go only to an asker granted the layout's host layout: with none held they
+        // could never be adopted, and holding them pins the GPU memory their executor gives back.
+        if !self.deposits.holds(&frame.layout) {
+            return Answer::refused(frame.seq, "keep_pages_refused", "no host layout is held for it");
+        }
         let bytes: u64 = frame.pages.iter().map(|p| p.nbytes).sum();
         ledger.keep(&frame.layout, &frame.fingerprint, pid, frame.pages.iter().copied().zip(pages).collect());
         self.pool.notes.note(serde_json::json!({"event": "keep_pages", "layout": frame.layout, "pages": frame.pages.len(), "bytes": bytes,
@@ -3695,7 +3644,7 @@ impl Services for Callbacks<'_> {
         if frame.kind == Kind::Deposit {
             // A layout varena sealed in the executor, kept for the next executor of its weights.
             let layout = descriptor.ok_or_else(|| io::Error::other("a deposit omitted its layout"))?;
-            let kept = self.deposits.deposit(&frame.manifest, &frame.layout, layout);
+            let kept = self.deposits.deposit(&frame.manifest, &frame.layout, layout, &self.holders);
             self.pool.notes.note(serde_json::json!({"event": "deposit", "manifest": frame.manifest,
                 "layout": frame.layout, "kept": kept.as_ref().map_or_else(ToString::to_string, |()| "yes".into())}));
             return Ok(match kept {

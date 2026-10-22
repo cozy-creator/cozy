@@ -73,7 +73,9 @@ class Level(Enum):
 class WeightGrant:
     """TensorD's grant for one component: its checkpoint, the binding's manifest, the sealed host
     layout, and the stored tensors the module builds.
-    With a held layout, GPU pages a gone executor kept of it, `(region, fd)`, and what they hold."""
+    With a held layout, GPU pages a gone executor kept of it, `(region, fd)`, and what they hold.
+    Without one, `seal`: TensorD admits a host layout of it into measured surplus; else the load
+    reads the checkpoint."""
 
     ck: tensorfs.Checkpoint
     component: str
@@ -82,6 +84,7 @@ class WeightGrant:
     keys: Collection[str] | None = None
     pages: Sequence[tuple[int, int]] = ()
     fingerprint: str = ""
+    seal: bool = False
 
     @property
     def key(self) -> str:
@@ -595,8 +598,8 @@ class Memory:
         component: str | None = None,
     ) -> Model:
         """Load `module`, built on meta, at `level` from `module._varena`; standalone, from a
-        store's checkpoint `ck` (`component`: its only one by default). Under TensorD the first
-        load seals its host tier unless one was granted (`sealed()`). At GPU level it is warm and
+        store's checkpoint `ck` (`component`: its only one by default). Under TensorD a load seals
+        its host tier only where TensorD admits it (`WeightGrant.seal`, `sealed()`). At GPU level it is warm and
         fills free room now; at RAM level its resident pages are idle."""
         level = Level(level)
         declared = _declared(module)
@@ -666,7 +669,8 @@ class Memory:
             raise Unbound(f"{type(module).__name__}: no weights attached (`Declared.weights`)")
         paths, regions = blocks_of(module), regions_of(module)
         # One load, fresh or after a restart: the held host layout TensorD granted, else one sealed
-        # now; then the pages a gone executor kept of it, a cache hit (a fill's are never kept)
+        # now where TensorD admits it; then the pages a gone executor kept of it, a cache hit (a
+        # fill's are never kept)
         host_fd = grant.host_fd
         ws, sealed = None, None
         if host_fd is not None:
@@ -676,7 +680,7 @@ class Memory:
                 ws, host_fd = None, None
         if ws is None:
             name = self._name(grant.key)
-            if host_fd is None and self.cuda and self.granted:
+            if host_fd is None and self.cuda and self.granted and grant.seal:
                 host_fd = sealed = seal(grant.ck, regions, name)
             ws = self.core.register(name, grant.ck, regions, host_fd)
         if declared.fill is None:
