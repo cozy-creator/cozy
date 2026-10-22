@@ -354,12 +354,20 @@ struct Demand<'a> {
     oom: bool,
     lowered: bool,
     gone: BTreeSet<Key>,
+    /// Caches this decision shrinks.
+    shrunk: BTreeSet<u32>,
     out: Vec<Action>,
+}
+
+/// What a class's turn gives back: an own page, or an own cache (torch's bytes).
+enum Victim {
+    Page(Key, u64),
+    Cache(u32, u64),
 }
 
 impl<'a> Demand<'a> {
     fn new(t: &'a Table, need: u64, req: Option<u64>, keep: Option<Key>, tried: &'a Tried) -> Demand<'a> {
-        Demand { t, need, got: t.free(), withdrawn: 0, req, keep, tried, oom: false, lowered: false, gone: BTreeSet::new(), out: vec![] }
+        Demand { t, need, got: t.free(), withdrawn: 0, req, keep, tried, oom: false, lowered: false, gone: BTreeSet::new(), shrunk: BTreeSet::new(), out: vec![] }
     }
 
     fn enough(&self) -> bool {
@@ -413,13 +421,60 @@ impl<'a> Demand<'a> {
         pages.into_iter().map(|(k, b, ..)| (k, b)).collect()
     }
 
-    /// Unmaps own pages of `class` until enough (counting kept pages' bytes, which come back
-    /// once custody lets go).
+    /// Own pages and caches of `class` in its order: N least recently used first (a cache by
+    /// its set's oldest page, before them), D furthest next use first (a cache before its set's
+    /// pages); other classes have pages only.
+    fn victims(&self, class: Class) -> Vec<Victim> {
+        let t = self.t;
+        let pages = self.own(class);
+        if !matches!(class, Class::N | Class::D) {
+            return pages.into_iter().map(|(k, b)| Victim::Page(k, b)).collect();
+        }
+        let caches: Vec<&crate::table::Cache> = t.caches.iter().filter(|c| c.bytes > 0 && !self.shrunk.contains(&c.id) && t.cache_class(c) == class).collect();
+        if caches.is_empty() {
+            return pages.into_iter().map(|(k, b)| Victim::Page(k, b)).collect();
+        }
+        type Ordered = ((u64, u32, u32, u32), u8, u64, Victim);
+        let mut all: Vec<Ordered> = Vec::with_capacity(pages.len() + caches.len());
+        for (k, b) in pages {
+            let order = match class {
+                Class::N => (t.page(k).map_or(0, |p| p.last_use), 0, 0, 0),
+                _ => t.distance(k).map_or((0, 0, 0, 0), |d| (0, u32::MAX - d.0, u32::MAX - d.1, u32::MAX - d.2)),
+            };
+            all.push((order, 1, u64::from(k.0) << 32 | u64::from(k.1), Victim::Page(k, b)));
+        }
+        for c in caches {
+            let order = match class {
+                Class::N => {
+                    let oldest = t.pages().filter(|(k, p)| Some(k.0) == c.set && p.mapped).map(|(_, p)| p.last_use).min();
+                    (oldest.map_or(c.last_use, |o| o.min(c.last_use)), 0, 0, 0)
+                }
+                _ => t.cache_distance(c).map_or((0, 0, 0, 0), |d| (0, u32::MAX - d.0, u32::MAX - d.1, u32::MAX - d.2)),
+            };
+            all.push((order, 0, u64::from(c.id), Victim::Cache(c.id, c.bytes)));
+        }
+        all.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        all.into_iter().map(|(.., v)| v).collect()
+    }
+
+    /// Gives back own pages and caches of `class` until enough (counting kept pages' bytes,
+    /// which come back once custody lets go). A cache shrinks at its class's turn on every
+    /// demand, never only on an OOM.
     fn evict(&mut self, class: Class) {
-        for (page, bytes) in self.own(class) {
+        for victim in self.victims(class) {
             if self.covered() {
                 return;
             }
+            let (page, bytes) = match victim {
+                Victim::Cache(cache, bytes) => {
+                    let bytes = bytes.min(self.short());
+                    self.out.push(Action::Shrink { cache, bytes });
+                    self.shrunk.insert(cache);
+                    self.got += bytes;
+                    continue;
+                }
+                Victim::Page(page, bytes) => (page, bytes),
+            };
             if class == Class::S {
                 if let Some((r, _)) = self.t.page(page).and_then(|p| p.speculative) {
                     if !self.out.contains(&Action::Starve(r)) {
@@ -436,9 +491,9 @@ impl<'a> Demand<'a> {
         }
     }
 
-    /// Own caches, least recently used first (an OOM: their bytes are torch's).
+    /// Every own cache not shrunk yet, least recently used first (an idle process's answer).
     fn shrink(&mut self) {
-        let mut caches: Vec<_> = self.t.caches.iter().filter(|c| c.bytes > 0).collect();
+        let mut caches: Vec<_> = self.t.caches.iter().filter(|c| c.bytes > 0 && !self.shrunk.contains(&c.id)).collect();
         caches.sort_by_key(|c| (c.last_use, c.id));
         for c in caches {
             if self.covered() {
@@ -493,9 +548,6 @@ impl<'a> Demand<'a> {
         }
         self.evict(Class::S);
         self.evict(Class::N);
-        if self.oom {
-            self.shrink();
-        }
         if self.enough() {
             return Some(Done::Enough);
         }
@@ -627,9 +679,17 @@ pub struct Admitted {
     pub running: u32,
     /// Running requests with an unmeasured step left.
     pub unmeasured: u32,
-    /// The remaining W of its requests waiting on child calls, and their family (0: none).
-    pub yielded: u64,
-    pub family: u64,
+    /// The remaining W of its requests waiting on child calls, per family they wait for
+    /// (family, W); family 0: any (beyond the slots), counted for every child.
+    pub yielded: [(u64, u64); YIELDED],
+}
+
+/// Families a row publishes yielded W for, each apart; more fold into one counted for all.
+pub const YIELDED: usize = 3;
+
+/// A row's yielded W as a child of `family` sees it: all but its own family's parents'.
+pub fn yielded_beside(yielded: &[(u64, u64); YIELDED], family: Option<u64>) -> u64 {
+    yielded.iter().filter(|(f, _)| family != Some(*f) || *f == 0).map(|(_, w)| w).sum()
 }
 
 /// Whether a request whose W is `w` (`None`: unmeasured) fits beside `rows` and the dispatched
@@ -644,7 +704,7 @@ pub fn fits(capacity: u64, foreign: u64, rows: &[Admitted], dispatched: &[Option
     if w.is_none() || rows.iter().any(|r| r.unmeasured > 0) || dispatched.iter().any(Option::is_none) {
         return false;
     }
-    let rows: u64 = rows.iter().map(|r| r.context + r.outside + r.remaining + if family == Some(r.family) { 0 } else { r.yielded }).sum();
+    let rows: u64 = rows.iter().map(|r| r.context + r.outside + r.remaining + yielded_beside(&r.yielded, family)).sum();
     let dispatched: u64 = dispatched.iter().flatten().sum();
     rows + dispatched + w.unwrap_or(0) <= capacity.saturating_sub(foreign)
 }

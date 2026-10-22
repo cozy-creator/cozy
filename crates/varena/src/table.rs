@@ -271,21 +271,34 @@ impl Req {
         Some(if self.yielded.is_some() && d.0 == 0 { (1, d.1, d.2) } else { d })
     }
 
+    /// The current step's sets are in use until the cursor leaves the step, however many
+    /// passes they run (a tiled decode runs one per tile; lead, 10-22): a block used this pass
+    /// is next used by the next pass. Declared passes only order the steps after it.
     fn plan_distance(&self, key: Key) -> Option<(u32, u32, u32)> {
         let (set, block) = key;
-        let (sets, passes) = self.step(self.cursor.step)?;
+        let (sets, _) = self.step(self.cursor.step)?;
         if sets.contains(&set) {
             let begun = self.cursor.passes.get(&set).copied().unwrap_or(0);
             let next = self.cursor.next.get(&set).copied().unwrap_or(0);
-            if begun == 0 || block >= next {
-                return Some((0, 0, block.saturating_sub(next)));
-            }
-            if begun < *passes {
-                return Some((0, 1, block));
-            }
+            return Some(if begun == 0 || block >= next { (0, 0, block.saturating_sub(next)) } else { (0, 1, block) });
         }
-        let later = (self.cursor.step + 1..self.steps.len() as u32).find(|i| self.step(*i).is_some_and(|(s, _)| s.contains(&set)));
-        later.map(|i| (i - self.cursor.step, 0, block))
+        self.later(set).map(|i| (i, 0, block))
+    }
+
+    /// Steps until the first later step that runs `set`.
+    fn later(&self, set: u32) -> Option<u32> {
+        (self.cursor.step + 1..self.steps.len() as u32).find(|i| self.step(*i).is_some_and(|(s, _)| s.contains(&set))).map(|i| i - self.cursor.step)
+    }
+
+    /// How far a cache serving `set` is from its next use: the current step (its next pass) or
+    /// the first later step that runs the set; past every block of it, so it goes before the
+    /// set's pages at the same distance. `None`: the plan declares the set no more.
+    pub fn cache_distance(&self, set: u32) -> Option<(u32, u32, u32)> {
+        let (sets, _) = self.step(self.cursor.step)?;
+        if sets.contains(&set) {
+            return Some((0, 1, u32::MAX));
+        }
+        self.later(set).map(|i| (i, 0, u32::MAX))
     }
 }
 
@@ -294,6 +307,9 @@ impl Req {
 pub struct Cache {
     pub id: u32,
     pub owner: String,
+    /// The component (set) it serves, if any: it takes that set's class (D while a plan still
+    /// declares the set, N otherwise), and goes before the set's own pages.
+    pub set: Option<u32>,
     pub bytes: u64,
     pub last_use: u64,
 }
@@ -405,6 +421,17 @@ impl Table {
     /// The nearest next use over the open requests.
     pub fn distance(&self, key: Key) -> Option<(u32, u32, u32)> {
         self.requests.iter().filter_map(|r| r.distance(key)).min()
+    }
+
+    /// A cache's nearest next use over the open requests.
+    pub fn cache_distance(&self, c: &Cache) -> Option<(u32, u32, u32)> {
+        let set = c.set?;
+        self.requests.iter().filter_map(|r| r.cache_distance(set)).min()
+    }
+
+    /// A cache's class: D while a plan still declares its set, N otherwise.
+    pub fn cache_class(&self, c: &Cache) -> Class {
+        if self.cache_distance(c).is_some() { Class::D } else { Class::N }
     }
 
     /// The request whose current step uses `key` next, nearest first.

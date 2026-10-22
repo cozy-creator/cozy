@@ -1153,15 +1153,17 @@ impl Memory {
     }
 
     /// Registers bytes the caller holds (torch tensors) that `shrink(want) -> freed` gives back.
-    /// A cache whose `owner` is a request id ends with that request.
-    pub fn cache(&self, owner: &str, shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
+    /// A cache whose `owner` is a request id ends with that request. One serving a component
+    /// (`set`: its graph pool, its decode cache) takes that set's class and goes before its
+    /// pages; one serving none is N.
+    pub fn cache(&self, owner: &str, set: Option<SetId>, shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
         let shrink: Shrink = Arc::new(shrink);
         self.inner
             .guard(|| {
                 let mut st = self.inner.lock();
                 let id = st.tick() as u32;
                 let last_use = st.clock;
-                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), bytes: 0, last_use });
+                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), set: set.map(|s| s.0), bytes: 0, last_use });
                 st.shrinks.insert(id, shrink);
                 self.inner.unlock(st);
                 Ok(CacheId(id))
@@ -1756,8 +1758,7 @@ impl Inner {
             unmeasured: remaining.iter().filter(|r| r.is_none()).count() as u64,
             running: t.requests.len() as u64,
             outside: t.outside(),
-            yielded: t.requests.iter().map(|r| t.yielded_w(r)).sum(),
-            family: t.requests.iter().find(|r| r.yielded.is_some()).map_or(0, |r| r.family),
+            yielded: yielded_by_family(t),
             host_peak: st.host.values().flatten().copied().max().unwrap_or(0),
             host_unmeasured: st.host.values().filter(|h| h.is_none()).count() as u64,
             returning: t.returning,
@@ -3624,6 +3625,29 @@ impl Inner {
         drop(st);
         Ok(empty && self.mech.idle() && self.to_custody.idle() && self.to_tier.idle() && self.saves.idle())
     }
+}
+
+/// The table's yielded W per family it waits for, in the row's slots: the largest families
+/// apart, any more together under family 0 (counted for every child).
+fn yielded_by_family(t: &Table) -> [(u64, u64); crate::decide::YIELDED] {
+    let mut by: BTreeMap<u64, u64> = BTreeMap::new();
+    for r in t.requests.iter().filter(|r| r.yielded.is_some()) {
+        *by.entry(r.family).or_default() += t.yielded_w(r);
+    }
+    let mut families: Vec<(u64, u64)> = by.into_iter().collect();
+    families.sort_by_key(|(f, w)| (std::cmp::Reverse(*w), *f));
+    let mut out = [(0, 0); crate::decide::YIELDED];
+    for (i, (f, w)) in families.into_iter().enumerate() {
+        match out.get_mut(i) {
+            Some(slot) if i + 1 < crate::decide::YIELDED => *slot = (f, w),
+            _ => {
+                if let Some(last) = out.last_mut() {
+                    *last = (0, last.1 + w);
+                }
+            }
+        }
+    }
+    out
 }
 
 impl Inner {

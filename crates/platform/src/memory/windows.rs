@@ -510,3 +510,6 @@ pub fn reset_high_water() {}
 pub fn anon(_: u32) -> Option<u64> {
     None
 }
+
+/// `f` is closing: its locks go with its handle, so nothing is released here.
+pub fn closing(_: &Owned) {}

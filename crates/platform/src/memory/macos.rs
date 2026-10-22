@@ -134,6 +134,12 @@ pub fn unlock(f: &Owned, start: u64, _len: u64) -> Result<()> {
     Ok(())
 }
 
+/// `f` is closing: its lock files go with it (a description's locks die with it elsewhere; here
+/// each lock is a file this process holds for the descriptor, whose number is reused).
+pub fn closing(f: &Owned) {
+    held_locks().lock().unwrap_or_else(|e| e.into_inner()).retain(|(fd, _), _| *fd != f.as_raw_fd());
+}
+
 /// Whether another description holds a lock on the range: a lock this one can take is free.
 pub fn held(f: &Owned, start: u64, _len: u64) -> Result<bool> {
     let probe = lock_file(f, start)?;

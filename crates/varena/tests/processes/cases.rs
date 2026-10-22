@@ -343,7 +343,7 @@ fn agent() {
             ["cache", owner, bytes] => {
                 let m = mem.as_ref().unwrap();
                 let s = shrunk.clone();
-                let c = m.cache(owner, Box::new(move |want| {
+                let c = m.cache(owner, None, Box::new(move |want| {
                     s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     want
                 }));
@@ -933,9 +933,10 @@ fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
     y.ok(&format!("openrec {} {}", g.uuid, g.memory));
     y.ok(&format!("load p1 {} stored ram", p1.display()));
     y.ok(&format!("load p2 {} stored ram", p2.display()));
-    // A device page filled from the tier: the region is mapped and page-locked in y.
-    assert_eq!(y.ok("exact p1 0"), "true");
-    assert_eq!(y.ok("registered"), "1", "the region a fill read is page-locked");
+    // A device page filled from the tier, its pin held throughout (S2's native case): the
+    // layout's ready run is mapped and page-locked in y.
+    y.ok("bind p1 0");
+    assert_eq!(y.ok("registered"), "1", "the run a fill read is page-locked");
     let resident = |d: &str| tier.resident().into_iter().find(|(k, _)| k == d).map_or(0, |(_, b)| b);
     // Each layout's file: its ready words' page and its two regions.
     assert!(resident(&digest("p1")) >= 4 * MB && resident(&digest("p2")) >= 4 * MB);
@@ -943,6 +944,8 @@ fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
     // SAFETY: an 8-byte write to our eventfd.
     unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&signal), 1u64.to_ne_bytes().as_ptr().cast(), 8) };
     tier.await_releases(1);
+    // Its regions return; its ready words' page stays with the layout's file (S2's native loop
+    // waited for 0 bytes, which never come: it hung after the release, not in it).
     assert!(resident(&digest("p1")) < REGION_ALIGN, "the pinned layout's regions returned: {}", resident(&digest("p1")));
     assert!(resident(&digest("p2")) >= 4 * MB, "the next one is untouched");
     assert_eq!(tier.acked(), 2 * REGION_ALIGN, "y unlocked the run it had page-locked (both ready regions), when asked");

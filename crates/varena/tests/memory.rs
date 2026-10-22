@@ -753,3 +753,25 @@ fn torch_ceiling_counts_own_pages_as_room() {
     let status = ledger.status();
     assert!(mem.torch_ceiling() <= status.capacity, "{} within {}", mem.torch_ceiling(), status.capacity);
 }
+
+/// Lead's ruling (S4, SDXL's tiled VAE decode, one pass per tile): a set in the current step is
+/// W until the plan's cursor leaves the step, however many passes it runs; its later tiles find
+/// its pages in use, never N.
+#[test]
+fn a_tiled_step_keeps_its_pages_w_through_every_tile() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("tiles", 16 * MB);
+    let id = mem.load(set(dir.path(), "vae", 2, &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("tiles", plan("vae")).unwrap();
+    let class = |c: varena::table::Class| -> u64 { ledger.status().rows.iter().map(|r| r.classes[c.index()]).sum() };
+    for tile in 0..3 {
+        let pass = r.pass(id, "decode", "1x8", Torch::default()).unwrap();
+        for b in 0..2 {
+            drop(mem.bind(id, b, 0).unwrap());
+        }
+        pass.end(Measured::default(), Torch::default());
+        assert_eq!((class(varena::table::Class::W), class(varena::table::Class::N)), (2 * REGION_ALIGN, 0), "tile {tile} of a step declared once");
+    }
+    drop(r);
+}
+

@@ -229,3 +229,8 @@ pub(crate) fn reset_high_water() {
 pub(crate) fn anon(pid: u32) -> Option<u64> {
     platform::memory::anon(pid)
 }
+
+/// `f` is closing: the locks it holds go with it (on macOS, lock files held for it).
+pub(crate) fn closing(f: &Owned) {
+    platform::memory::closing(f)
+}

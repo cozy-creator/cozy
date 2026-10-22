@@ -284,3 +284,7 @@ pub fn stalled(pid: u32, tid: u32) -> bool {
     let thread = state(format!("/proc/{pid}/task/{tid}/stat"));
     process.as_deref() == Some("Z") || thread.as_deref() == Some("T")
 }
+
+/// `f` is closing: its OFD locks go with its description's last descriptor, a duplicate's
+/// included, so nothing is released here.
+pub fn closing(_: &Owned) {}
