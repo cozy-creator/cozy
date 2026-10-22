@@ -375,23 +375,34 @@ DONE:
 }
 ";
 
-/// Launches kernel `name` of [`KERNELS`] on `stream` with `args` (u64s).
+/// Prepare each diagnostic kernel before a deliberately blocked consumer stream exists.
+/// CUDA module/function loading can wait on that stream; doing it inside launch would make
+/// the fixture deadlock before it ever exercised Varena's consumer ordering.
+fn kernels() -> &'static [usize; 3] {
+    static FUNCTIONS: std::sync::OnceLock<[usize; 3]> = std::sync::OnceLock::new();
+    FUNCTIONS.get_or_init(|| {
+        let d = cuda::driver().unwrap();
+        let (_, ctx) = cuda::primary_context(0).unwrap();
+        let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+        let mut module = std::ptr::null_mut();
+        cuda::check("cuModuleLoadData", unsafe { (d.module_load_data)(&mut module, KERNELS.as_ptr().cast()) }).unwrap();
+        [c"stray", c"spin", c"copy"].map(|name| {
+            let mut function = std::ptr::null_mut();
+            cuda::check("cuModuleGetFunction", unsafe { (d.module_get_function)(&mut function, module, name.as_ptr()) }).unwrap();
+            function as usize
+        })
+    })
+}
+
+/// Launches a prepared diagnostic kernel on `stream` with u64 arguments.
 fn launch(name: &std::ffi::CStr, args: &[u64], stream: usize) -> cuda::CUresult {
+    let index = match name.to_bytes() { b"stray" => 0, b"spin" => 1, b"copy" => 2, _ => panic!("unknown diagnostic kernel") };
+    let kernel = kernels()[index] as cuda::CUfunction;
     let d = cuda::driver().unwrap();
-    step!();
     let (_, ctx) = cuda::primary_context(0).unwrap();
-    step!();
     let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
-    let (mut module, mut kernel) = (std::ptr::null_mut(), std::ptr::null_mut());
-    step!();
-    cuda::check("cuModuleLoadData", unsafe { (d.module_load_data)(&mut module, KERNELS.as_ptr().cast()) }).unwrap();
-    step!();
-    cuda::check("cuModuleGetFunction", unsafe { (d.module_get_function)(&mut kernel, module, name.as_ptr()) }).unwrap();
-    step!();
     let mut values = args.to_vec();
-    step!();
     let mut params: Vec<*mut c_void> = values.iter_mut().map(|v| (v as *mut u64).cast()).collect();
-    step!();
     unsafe { (d.launch_kernel)(kernel, 1, 1, 1, 1, 1, 1, 0, stream as cuda::CUstream, params.as_mut_ptr(), std::ptr::null_mut()) }
 }
 
@@ -685,6 +696,7 @@ struct Gate(Option<mpsc::Sender<()>>);
 
 impl Gate {
     fn hold(stream: usize) -> Gate {
+        kernels();
         unsafe extern "C" fn held(raw: *mut c_void) {
             // SAFETY: the box `hold` leaked, given to us once.
             let (entered, release) = *unsafe { Box::from_raw(raw.cast::<(mpsc::Sender<()>, mpsc::Receiver<()>)>()) };
@@ -1224,7 +1236,7 @@ fn concurrent_binds_of_one_block_fill_it_once() {
     let _ledger = Ledger::create(&g, None).unwrap();
     let mem = memory(b, &g);
     step!();
-    let s = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(1, b)), Level::Ram).unwrap();
+    let s = mem.load(set("m", 1, Fill::Stored, &g.uuid, |b| block(1, b)), Level::Ram).unwrap();
     step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
@@ -1232,8 +1244,11 @@ fn concurrent_binds_of_one_block_fill_it_once() {
     step!();
     let streams = [cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap()];
     step!();
+    let retained = mem.retain(s, &[0]).unwrap();
     let pins: Vec<Pin> = std::thread::scope(|t| {
-        let binds: Vec<_> = streams.iter().map(|st| t.spawn(|| mem.bind(s, 0, st.raw()).unwrap())).collect();
+        // Worker threads name their request explicitly; a different thread's active pass
+        // is never guessed from process-global state.
+        let binds: Vec<_> = streams.iter().map(|st| t.spawn(|| retained.prepare_for(st.raw(), Some(&r)).unwrap().remove(0))).collect();
         binds.into_iter().map(|h| h.join().unwrap()).collect()
     });
     step!();
