@@ -591,6 +591,9 @@ struct Active {
     /// kept per (set, this).
     shape: String,
     allocated: u64,
+    /// Torch's cached free bytes at its start (reserved less allocated): earlier passes', not
+    /// its slack.
+    cached: u64,
     /// Its own room (its start's allocation included), measured or the unmeasured reserve.
     room: u64,
     /// The context at the pass's start: its growth is the pass's.
@@ -2878,7 +2881,9 @@ impl Inner {
         if let Some((_, room)) = larger {
             return Ok(Some(room));
         }
-        Ok(smaller.map(|(_, ratio, room)| Room { start: (room.start as f64 * ratio) as u64, delta: (room.bytes() as f64 * ratio) as u64, slack: 0, context: 0, ..room }))
+        // Its allocations scale with the shape; the allocator's slack and the context growth
+        // are not the shape's.
+        Ok(smaller.map(|(_, ratio, room)| Room { start: (room.start as f64 * ratio) as u64, delta: (room.delta as f64 * ratio) as u64, ..room }))
     }
 
     /// The pass's room at its cut levels (`None`: unmeasured) and the unmeasured reserve (the
@@ -3012,7 +3017,7 @@ impl Inner {
                 self.tier_uses(&mut st, req);
             }
             let (id, context) = (st.tick(), st.table.context);
-            st.active.insert((req, set), Active { id, thread: std::thread::current().id(), set, entry: entry.to_string(), dims: dims.to_string(), shape: config(entry, dims), allocated: torch.allocated, room: torch.allocated, context, measured: false });
+            st.active.insert((req, set), Active { id, thread: std::thread::current().id(), set, entry: entry.to_string(), dims: dims.to_string(), shape: config(entry, dims), allocated: torch.allocated, cached: torch.reserved.saturating_sub(torch.allocated), room: torch.allocated, context, measured: false });
             if let Some(r) = st.table.request_mut(req) {
                 r.episode = Default::default();
                 r.claimed = 0;
@@ -3094,7 +3099,11 @@ impl Inner {
         let levels = st.levels(active.set, &active.shape);
         let key = room_key(&name, &active.shape, &levels);
         let growth = st.table.context.saturating_sub(active.context);
-        let room = Room { entry: active.entry.clone(), shape: active.dims.clone(), cuts: cuts(&levels), start: active.allocated, delta: measured.allocated_peak.saturating_sub(active.allocated), slack: measured.slack, context: growth, sites: measured.sites.clone() };
+        // Its slack is what its own allocations left reserved beyond them: the cache it started
+        // with is earlier passes' (and trimmable), never this room's (v5: a text encoder's room
+        // took 4.6 GB of the UNet's cache).
+        let slack = measured.slack.saturating_sub(active.cached);
+        let room = Room { entry: active.entry.clone(), shape: active.dims.clone(), cuts: cuts(&levels), start: active.allocated, delta: measured.allocated_peak.saturating_sub(active.allocated), slack, context: growth, sites: measured.sites.clone() };
         // A site whose finer level did not lower the allocated peak is not cut further here.
         for (site, level) in levels.iter().filter(|(_, l)| **l > 0) {
             if self.memo(&mut st, &room_key(&name, &active.shape, &with(&levels, site, level - 1)))?.is_some_and(|c| room.delta >= c.delta) {
