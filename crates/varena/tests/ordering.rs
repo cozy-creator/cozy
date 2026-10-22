@@ -178,7 +178,7 @@ impl Backend for Stream {
     }
     fn create(&self, len: u64) -> Result<Physical> {
         self.events.creates.fetch_add(1, Ordering::SeqCst);
-        if self.events.hidden_ooms.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+        if self.events.hidden_ooms.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
             return Err(varena::Error::Device { op: "create", code: varena::backend::OUT_OF_MEMORY, name: "allocation needs room beyond reported free bytes".into() });
         }
         let landed = self.events.lands.swap(0, Ordering::SeqCst);

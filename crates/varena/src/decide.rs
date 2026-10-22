@@ -220,6 +220,18 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
         });
         room = room.max(coarse);
     }
+    // Unmeasured, it fits only on an idle GPU: it takes every idle byte before it runs (so its
+    // allocations never need the allocator callback to evict): orphans, own S and N, others'
+    // S and N. Never a declared use, never a cut.
+    if !measured {
+        let mut idle = Demand::new(t, u64::MAX, Some(req), None, tried);
+        idle.gone.clone_from(&d.gone);
+        let remote = idle.idle();
+        d.out.append(&mut idle.out);
+        if remote {
+            return d.out;
+        }
+    }
     d.out.push(Action::Reserve { req, room, measured });
     d.out
 }
@@ -505,6 +517,18 @@ impl<'a> Demand<'a> {
             return None;
         }
         Some(Done::Lowered)
+    }
+
+    /// Every idle byte (an unmeasured pass): orphans, own S and N, then asks for others' S and
+    /// N. True when a remote rung is out.
+    fn idle(&mut self) -> bool {
+        if !self.tried.orphans && self.t.orphans > 0 {
+            self.out.push(Action::ReleaseOrphans(self.t.orphans));
+            return true;
+        }
+        self.evict(Class::S);
+        self.evict(Class::N);
+        self.ask(Class::N)
     }
 
     fn park_or_exhaust(&mut self, parked: bool) {
