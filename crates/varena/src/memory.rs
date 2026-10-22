@@ -25,6 +25,7 @@ use std::time::Instant;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use platform::handles::Owned;
 
+#[cfg(unix)]
 use tensorfs::io::source::Placement;
 use tensorfs::io::Dst;
 
