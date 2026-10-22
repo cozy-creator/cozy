@@ -805,7 +805,7 @@ impl Row {
 
     fn rec<T>(&self, f: impl FnOnce(&RowRec) -> T) -> Option<T> {
         let m = self.shared.map().ok()?;
-        row(&m, self.at).map(f)
+        row(&m, self.at).filter(|r| r.word.load(Acquire) == self.word).map(f)
     }
 
     pub fn publish(&self, facts: &Facts) {
@@ -813,7 +813,9 @@ impl Row {
         let Ok(m) = self.shared.map() else { return };
         let Some(r) = row(&m, self.at) else { return };
         let _one = self.latch.lock();
-        latch_write(&r.seq, &r.latch, &facts.words());
+        if r.word.load(Acquire) == self.word {
+            latch_write(&r.seq, &r.latch, &facts.words());
+        }
     }
 
     /// The custody service's orphans; a change is a ledger event.
@@ -1484,8 +1486,10 @@ mod tests {
         let next = shared.claim(std::process::id()).unwrap();
         assert_eq!(next.at, old.at);
         assert_ne!(next.word, old.word);
+        next.publish(&Facts { torch: 123, ..Facts::default() });
         drop(old);
         assert!(shared.names(next.id()).unwrap());
+        assert_eq!(shared.rows().unwrap().iter().find(|r| r.id() == next.id()).unwrap().facts.torch, 123, "a stale row cannot publish over its successor");
     }
 
     #[test]
