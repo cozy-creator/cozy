@@ -3440,7 +3440,9 @@ impl Inner {
                     .and_then(|()| self.backend.unmap(va, off, span));
                 if let Err(error) = released {
                     tracing::warn!("varena: renewed page ownership could not be released: {error}");
+                    let st = self.state.lock();
                     self.ownership_lost.store(true, Ordering::Release);
+                    drop(st);
                     self.landed.notify_all();
                     std::mem::forget((self.clone(), old, after));
                     return;
@@ -3480,7 +3482,9 @@ impl Inner {
             Mech::Unmap { va, off, span, phys, ready } => {
                 if let Err(error) = self.backend.unmap(va, off, span) {
                     tracing::warn!("varena: page ownership could not be released: {error}");
+                    let st = self.state.lock();
                     self.ownership_lost.store(true, Ordering::Release);
+                    drop(st);
                     self.landed.notify_all();
                     std::mem::forget((self.clone(), phys, ready));
                     return;
