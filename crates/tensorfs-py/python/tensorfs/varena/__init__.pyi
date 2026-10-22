@@ -210,9 +210,9 @@ class Request:
 def allocated() -> None:
     """SPIKE: this thread's pass is over for torch's pool (`Request.allocating`)."""
 
-def allocator_stats() -> tuple[int, int, int, int, int]:
-    """SPIKE: the pool's segments: (live bytes, segments made, shortfalls varena resolved,
-    refusals, nanoseconds making segments)."""
+def allocator_stats() -> tuple[int, int, int, int, int, int]:
+    """SPIKE: the pool's segments: (live bytes, segments made, shortfalls varena resolved, their
+    bytes, refusals, nanoseconds making segments)."""
 
 class Pass:
     def end(self, allocated_peak: int, slack: int, sites: list[tuple[str, int, bool, int]], allocated: int, reserved: int) -> None:

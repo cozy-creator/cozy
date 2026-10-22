@@ -318,6 +318,8 @@ class Memory:
         #: SPIKE (pending the owner): passes allocate from a pool whose segments come from this
         #: library's allocator, which asks varena for room on a shortfall instead of raising
         self.pool: torch.cuda.MemPool | None = None
+        #: whether passes use it now (the spike's measurement alternates with torch's default)
+        self.pooling = pool
         #: the largest torch reserve a pass held outside the pool (other threads' allocations)
         self.outside = 0
         if pool and self.cuda:
@@ -460,8 +462,8 @@ class Memory:
         measured `room`; otherwise, or beside another running pass, it only rises: a pass that
         got its room never has its allocator churn against a smaller cap. With the pool, its
         segments ask varena themselves: no cap."""
-        if self.pool is not None:
-            if self.capped is None:
+        if self.pool is not None and self.pooling:
+            if self.capped != self.torch.total:
                 self.capped = self.torch.total
                 self.torch.cap(self.capped)
             return
@@ -507,7 +509,7 @@ class Memory:
             p = _Pass(r.native.pass_(model.id, entry, shape, allocated, reserved), r, model.id, entry, shape, allocated, self.torch.churn())
             growth, slack = model.rooms.get((entry, shape), (0, 0))
             self._cap(allocated + growth + slack if growth or slack else 0, start=True)
-            if self.pool is not None:  # the pass's new segments ask its request for room
+            if self.pool is not None and self.pooling:  # the pass's new segments ask its request for room
                 r.native.allocating(self.native, model.id, allocated, reserved)
                 p.pooled = torch.cuda.use_mem_pool(self.pool, self.device)
                 p.pooled.__enter__()

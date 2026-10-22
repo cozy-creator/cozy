@@ -34,11 +34,12 @@ thread_local! {
     static INSIDE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Bytes of the pool's live segments, segments made, shortfalls varena resolved, allocations
-/// refused, and nanoseconds spent making segments.
+/// Bytes of the pool's live segments, segments made, shortfalls varena resolved (and their
+/// bytes), allocations refused, and nanoseconds spent making segments.
 static LIVE: AtomicU64 = AtomicU64::new(0);
 static SEGMENTS: AtomicU64 = AtomicU64::new(0);
 static RESOLVED: AtomicU64 = AtomicU64::new(0);
+static RESOLVED_BYTES: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 static NS: AtomicU64 = AtomicU64::new(0);
 
@@ -57,9 +58,9 @@ pub fn exit() {
     ACTIVE.with(|a| a.borrow_mut().pop());
 }
 
-/// (live bytes, segments, shortfalls resolved, refusals, ns making segments).
-pub fn stats() -> (u64, u64, u64, u64, u64) {
-    (LIVE.load(Relaxed), SEGMENTS.load(Relaxed), RESOLVED.load(Relaxed), REFUSED.load(Relaxed), NS.load(Relaxed))
+/// (live bytes, segments, shortfalls resolved, their bytes, refusals, ns making segments).
+pub fn stats() -> (u64, u64, u64, u64, u64, u64) {
+    (LIVE.load(Relaxed), SEGMENTS.load(Relaxed), RESOLVED.load(Relaxed), RESOLVED_BYTES.load(Relaxed), REFUSED.load(Relaxed), NS.load(Relaxed))
 }
 
 fn segment(size: usize) -> Result<cuda::CUdeviceptr, cuda::CUresult> {
@@ -103,6 +104,7 @@ fn alloc(size: usize) -> *mut c_void {
             Ok(ptr) => break ptr as *mut c_void,
             Err(cuda::ERROR_OUT_OF_MEMORY) if matches!(ask(size as u64), Some(Next::Retry)) => {
                 RESOLVED.fetch_add(1, Relaxed);
+                RESOLVED_BYTES.fetch_add(size as u64, Relaxed);
             }
             Err(_) => {
                 REFUSED.fetch_add(1, Relaxed);
