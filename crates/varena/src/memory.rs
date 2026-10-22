@@ -170,6 +170,8 @@ pub struct Stats {
     pub lowered: bool,
     /// The largest working set a step had: weights plus its passes' rooms.
     pub peak: u64,
+    /// The largest room a step had beside its weights (its compute bytes).
+    pub room: u64,
     /// Bytes the request still held when it ended (pins, rooms, caches): 0.
     pub leftover: u64,
 }
@@ -2190,12 +2192,13 @@ impl Inner {
             return Err(Error::Exhausted(exhausted(*need, None, stats)));
         }
         let mut st = self.lock();
-        let w = st.table.request(req).map_or(0, |r| st.table.w(r));
+        let (w, room) = st.table.request(req).map_or((0, 0), |r| (st.table.w(r), r.room + r.claimed));
         if let Some(s) = st.step_stats(req) {
             s.w = s.w.max(w);
         }
         if let Some(s) = st.stats(Some(req)) {
             s.peak = s.peak.max(w);
+            s.room = s.room.max(room);
         }
         self.publish(&st);
         self.unlock(st);
@@ -2264,12 +2267,16 @@ impl Inner {
                 *known = Some(known.unwrap_or(0).max(joint));
             }
         }
-        let w = st.table.request(req).map_or(0, |r| st.table.step_held(r) + joint.max(r.room + r.claimed));
+        let (w, room) = st.table.request(req).map_or((0, 0), |r| {
+            let room = joint.max(r.room + r.claimed);
+            (st.table.step_held(r) + room, room)
+        });
         if let Some(s) = st.step_stats(req) {
             s.w = s.w.max(w);
         }
         if let Some(s) = st.stats(Some(req)) {
             s.peak = s.peak.max(w);
+            s.room = s.room.max(room);
         }
         self.publish(&st);
         self.unlock(st);
@@ -2359,7 +2366,8 @@ impl Inner {
         let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
         let mut stats = st.stats.remove(&req).unwrap_or_default();
         if let Some(key) = st.peaks.remove(&req) {
-            let _ = ledger::record_peak(&self.shared, &key, stats.peak);
+            let _ = ledger::record_peak(&self.shared, &format!("peak/{key}"), stats.peak);
+            let _ = ledger::record_peak(&self.shared, &format!("compute/{key}"), stats.room);
         }
         self.unlock(st);
         self.shrink(shrinks);

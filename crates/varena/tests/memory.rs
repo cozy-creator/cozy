@@ -533,3 +533,35 @@ fn the_tier_keeps_baked_pages_by_identity_and_never_hands_them_out_fresh() {
     mem.settle();
     assert_eq!(rebind(&mem, lora, other, 0x33), (false, 0x11), "a's layout is untouched");
 }
+
+/// Review 4, L1: placement keeps only the package's compute room free on GPU 0, so measuring a
+/// run never moves a set the next run: place, run, place again, three times over.
+#[test]
+fn placement_is_stable_across_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, ledger, mem, g) = open("stable0", 16 * MB);
+    let other = GpuId { uuid: format!("m{}-stable1", std::process::id()), model: "host".into(), memory: 16 * MB };
+    let _other_scope = Scope::new(&other.uuid);
+    let second = varena::Ledger::create(&other, None).unwrap();
+    let unet = mem.load(set(dir.path(), "unet", 2, &g.uuid), Level::Ram).unwrap();
+    let te = mem.load(set(dir.path(), "te", 3, &g.uuid), Level::Ram).unwrap();
+    let mut homes = vec![];
+    for run in 0..3 {
+        let home = varena::Ledger::place(&[&ledger, &second], "pkg", "1x8", None, &[("pkg@1/te", None)]).unwrap();
+        homes.push(home.clone());
+        // The run: te's pages on GPU 0 only when placed there; a 4 MB room beside them.
+        let id = format!("run{run}");
+        ledger.dispatch(&id, "pkg", "1x8").unwrap();
+        let local = home == vec![0];
+        let sets: Vec<String> = ["unet", "te"].iter().take(if local { 2 } else { 1 }).map(|s| format!("pkg@1/{s}")).collect();
+        let r = mem.request(&id, Plan { steps: vec![Step { sets, passes: 1 }] }).unwrap();
+        for (set, blocks) in [(unet, 2), (te, 3)].into_iter().take(if local { 2 } else { 1 }) {
+            let pass = r.pass(set, "fwd", "1x8", Torch::default()).unwrap();
+            let pins: Vec<_> = (0..blocks).map(|b| mem.bind(set, b, 0).unwrap()).collect();
+            drop(pins);
+            pass.end(Measured { allocated_peak: 4 * MB, ..Measured::default() }, Torch::default());
+        }
+        r.end();
+    }
+    assert_eq!(homes, vec![vec![0]; 3], "te stays on GPU 0, measured or not");
+}
