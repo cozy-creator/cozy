@@ -10,6 +10,8 @@ diffusers), with the given TensorFS wheel installed into a directory ahead of th
 own TensorFS. Its output streams to the run's log as it comes, and the output holds it too.
 """
 import os
+import io
+import zipfile
 import shutil
 import subprocess
 import sys
@@ -27,7 +29,10 @@ def install(target: Path, *specs: str) -> str:
     uv = shutil.which("uv")
     command = [uv, "pip", "install", "--python", sys.executable] if uv else [sys.executable, "-m", "pip", "install"]
     done = subprocess.run([*command, "--target", str(target), *specs], capture_output=True, text=True)
-    return f"$ {' '.join(command)} --target {target} {' '.join(specs)}: exit {done.returncode}\n{done.stdout}{done.stderr}"
+    text = f"$ {' '.join(command)} --target {target} {' '.join(specs)}: exit {done.returncode}\n{done.stdout}{done.stderr}"
+    if done.returncode:
+        raise RuntimeError(text)
+    return text
 
 
 def main(*, wheel: Annotated[FileAsset, AssetBound(max_bytes=1 << 27)],
@@ -35,7 +40,13 @@ def main(*, wheel: Annotated[FileAsset, AssetBound(max_bytes=1 << 27)],
     root = Path(tempfile.mkdtemp(prefix="varena-standalone-"))
     logs, site = root / "out", root / "site"
     logs.mkdir()
-    (root / WHEEL).write_bytes(wheel.read_bytes())
+    data = wheel.read_bytes()
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        metadata = next(n for n in archive.namelist() if n.endswith(".dist-info/WHEEL"))
+        distribution = metadata.split(".dist-info/", 1)[0]
+        tag = next(line[5:] for line in archive.read(metadata).decode().splitlines() if line.startswith("Tag: "))
+    wheel_path = root / f"{distribution}-{tag}.whl"
+    wheel_path.write_bytes(data)
     test = root / "script.py"
     test.write_bytes(script.read_bytes())
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(site), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)}
@@ -45,10 +56,13 @@ def main(*, wheel: Annotated[FileAsset, AssetBound(max_bytes=1 << 27)],
             log.write(line)
             log.flush()
 
-        say(install(site, "--no-deps", str(root / WHEEL)))
+        say(install(site, "--no-deps", str(wheel_path)))
         command = [sys.executable, "-u", str(test)]
         with subprocess.Popen(command, env=env, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:
             for line in child.stdout or ():
                 say(line)
         say(f"$ {' '.join(command)}: exit {child.returncode}\n")
-    return out.save_tree(logs)
+    result = out.save_tree(logs)
+    if child.returncode:
+        raise RuntimeError(f"Varena child failed with exit {child.returncode}; see streamed log")
+    return result

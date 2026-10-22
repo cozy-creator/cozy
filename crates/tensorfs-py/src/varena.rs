@@ -628,11 +628,11 @@ impl PyRequest {
 
     /// This thread's segments for torch's pool are `set`'s pass's (None: outside any pass) from
     /// now on, torch's bytes now being `allocated` and `reserved`: a shortfall asks this request.
-    #[pyo3(signature = (memory, set, allocated, reserved))]
-    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, set: Option<u32>, allocated: u64, reserved: u64) -> PyResult<()> {
+    #[pyo3(signature = (memory, set, allocated, reserved, pool = (0, 0)))]
+    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, set: Option<u32>, allocated: u64, reserved: u64, pool: (u64, u64)) -> PyResult<()> {
         let r = self.get(py)?;
         let _ = allocated;
-        crate::allocator::enter(memory.memory().clone(), r, set.map(SetId), reserved);
+        crate::allocator::enter(memory.memory().clone(), r, set.map(SetId), reserved, memory.dl.1, pool);
         Ok(())
     }
 
@@ -945,8 +945,9 @@ fn allocated() {
 /// The pool's segments: (live bytes, segments made, shortfalls varena resolved, their bytes,
 /// refusals, nanoseconds making segments, segments freed).
 #[pyfunction]
-fn allocator_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
-    crate::allocator::stats()
+#[pyo3(signature = (device = None, pool = None))]
+fn allocator_stats(device: Option<i32>, pool: Option<(u64, u64)>) -> (u64, u64, u64, u64, u64, u64, u64) {
+    crate::allocator::stats(device, pool)
 }
 
 /// The trims and cache shrinks varena reached on a thread inside the allocator (answered 0).

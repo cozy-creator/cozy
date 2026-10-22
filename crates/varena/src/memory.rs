@@ -82,7 +82,7 @@ impl Retained {
             let (preparing, req) = {
                 let mut st = self.inner.lock();
                 let m = st.mech(self.set)?;
-                if retained_identity(self.set, m) != self.identity {
+                if retained_identity(self.set, m, &self.blocks) != self.identity {
                     return Err(Error::Invalid("retained range identity changed; recapture required".into()));
                 }
                 let req = st.binding(self.set);
@@ -105,7 +105,7 @@ impl Retained {
             }
             let pins = self.blocks.iter().map(|b| self.inner.bind(self.set, *b, stream)).collect::<Result<Vec<_>>>()?;
             let st = self.inner.lock();
-            if retained_identity(self.set, st.mech(self.set)?) != self.identity {
+            if retained_identity(self.set, st.mech(self.set)?, &self.blocks) != self.identity {
                 return Err(Error::Invalid("retained range identity changed during preparation".into()));
             }
             drop(st);
@@ -337,8 +337,8 @@ struct SetMech {
     retained: u64,
 }
 
-fn retained_identity(set: u32, m: &SetMech) -> String {
-    format!("{set}:{}:{}:{}", m.va.base, m.va.len, m.spec.fingerprint.key())
+fn retained_identity(set: u32, m: &SetMech, blocks: &[u32]) -> String {
+    format!("{set}:{}:{}:{}:{blocks:?}", m.va.base, m.va.len, m.spec.fingerprint.key())
 }
 
 /// The RAM tier's name for the bytes a set's pages hold: the store's (stored, or transformed
@@ -921,7 +921,7 @@ impl Memory {
                 return Err(Error::Closed(format!("set {}", set.0)));
             }
             for &b in &blocks { m.spec.layout.region(b)?; }
-            let identity = retained_identity(set.0, m);
+            let identity = retained_identity(set.0, m, &blocks);
             if let Some(Some(m)) = st.sets.get_mut(set.0 as usize) { m.retained += 1; }
             Ok(Retained { inner: self.inner.clone(), set: set.0, blocks, identity })
         })
@@ -1022,7 +1022,7 @@ impl Inner {
         self.drain(st);
     }
 
-    fn drain(&self, st: &mut State) {
+    fn poll_releases(&self, st: &mut State, keep: bool) -> bool {
         let released: Vec<Release> = self.releases.try_iter().collect();
         let mut wake = false;
         for r in released {
@@ -1049,7 +1049,7 @@ impl Inner {
         let streams: Vec<usize> = st.events.keys().copied().collect();
         for stream in streams {
             while let Some((event, key)) = st.events.get(&stream).and_then(|q| q.front()).copied() {
-                if !self.backend.query(event).unwrap_or(true) {
+                if !self.backend.query(event).unwrap_or(false) {
                     break;
                 }
                 if let Some(q) = st.events.get_mut(&stream) {
@@ -1065,7 +1065,7 @@ impl Inner {
                     }
                 }
                 // A transform or fill whose event completed: now read-only and kept.
-                if st.homes.get(&key).is_some_and(|h| h.keep_after && h.ready == event) {
+                if keep && st.homes.get(&key).is_some_and(|h| h.keep_after && h.ready == event) {
                     if let Some(h) = st.homes.get_mut(&key) {
                         h.keep_after = false;
                     }
@@ -1074,6 +1074,11 @@ impl Inner {
             }
         }
         st.events.retain(|_, q| !q.is_empty());
+        wake
+    }
+
+    fn drain(&self, st: &mut State) {
+        let wake = self.poll_releases(st, true);
         if let Some(h) = self.custody.as_ref().map(|c| c.holder()).filter(|h| *h != st.holder) {
             // A new custody holder knows none of the kept pages: all go to it again.
             st.holder = h;
@@ -2893,6 +2898,74 @@ impl Request {
         }
     }
 
+    /// Reclaim for a native allocator callback. Only already-completed local pages participate:
+    /// no Python/torch hooks, peer asks, fill/save waits, or mechanism-queue waits. The same
+    /// decision procedure chooses victims; work requiring those waits is prepared before entry.
+    /// Returns bytes of actual reclaim (or newly available capacity), so retries make progress.
+    pub fn reclaim_allocation(&self, set: Option<SetId>, need: u64, torch: Torch) -> Result<u64> {
+        let Some(mut st) = self.inner.state.try_lock() else { return Ok(0) };
+        self.inner.poll_releases(&mut st, false);
+        self.inner.refresh(&mut st)?;
+        self.inner.measure(&mut st, torch);
+        let before = st.table.torch_limit();
+        let mut view = st.table.clone();
+        view.caches.clear(); // They remain counted in torch; callbacks cannot reclaim them here.
+        view.reserved = view.allocated;
+        view.headroom = 0;
+        let keys: Vec<Key> = view.pages().map(|(k, _)| k).collect();
+        for key in keys {
+            let completed = st.homes.get(&key).is_some_and(|h| !h.filling && !h.transforming && !h.keeping && self.inner.backend.query(h.ready).unwrap_or(false));
+            if let Some(p) = view.page_mut(key) {
+                if !completed { p.pins.push(u64::MAX); }
+                // The custody's native sender is independent of Python and device streams;
+                // completed pages can withdraw their retained handle after the unmap.
+                p.kept = false;
+            }
+        }
+        let mut tried = Tried { trimmed: true, orphans: true, ..Tried::default() };
+        for row in &view.others {
+            for class in [Class::N, Class::D] { tried.asked.insert((row.row, class)); }
+        }
+        let actions = decide(&view, &Trigger::Oom { req: self.id, set: set.map(|s| s.0), need: Some(need), site: None, tried });
+        let mut freed = 0;
+        for action in actions {
+            match action {
+                Action::Unmap { page, class } => {
+                    let (va, off, span) = st.place(page)?;
+                    // The decision excludes pins, releases, fills and saves; query above proved
+                    // the final producer complete. No synchronization or stream wait occurs.
+                    self.inner.backend.unmap(va, off, span)?;
+                    if let Some(home) = st.homes.remove(&page) {
+                        if home.exported && self.inner.withdraw(home.identity, page.1, span).is_some() { st.table.pending += span; }
+                        if let Some(phys) = home.phys { self.inner.backend.destroy(phys); }
+                        self.inner.backend.retire(home.ready);
+                    }
+                    st.sync(page);
+                    if let Some(stats) = st.stats(Some(self.id)) {
+                        if let Some(n) = stats.evicted.get_mut(class.index()) { *n += span; }
+                        if class == Class::W { stats.evicted_lowered += span; }
+                    }
+                    if let Some(n) = st.step_stats(self.id).and_then(|s| s.evicted.get_mut(class.index())) { *n += span; }
+                    freed += span;
+                }
+                Action::Lower(r) => {
+                    if let Some(r) = st.table.request_mut(r) { r.lowered = true; }
+                    if let Some(stats) = st.stats(Some(self.id)) { stats.lowered = true; }
+                }
+                Action::Claim { req, bytes } => {
+                    if let Some(r) = st.table.request_mut(req) { r.claimed += bytes; r.episode.claimed_free = true; }
+                }
+                Action::Starve(r) => { if let Some(r) = st.table.request_mut(r) { r.starved = true; } }
+                _ => {} // No callback, cut, park, peer ask, or queue wait inside an allocator.
+            }
+        }
+        self.inner.publish(&st);
+        // Kept handles withdraw asynchronously. Their bytes remain pending until the native
+        // custody sender reports completion; the allocation may retry once, but never waits
+        // for that sender or reacquires state after releasing it.
+        Ok(freed.max(st.table.torch_limit().saturating_sub(before)))
+    }
+
     /// What the caller parked after a `Park` answer; 0 makes the next `oom` answer Exhausted.
     pub fn parked(&self, bytes: u64) {
         let _ = self.inner.guard(|| {
@@ -3024,14 +3097,21 @@ impl Pin {
 
 impl Drop for Pin {
     fn drop(&mut self) {
-        // Without an event the release waits on the host for this one pin's stream (rare).
-        let event = self.inner.backend.record(self.stream).unwrap_or_else(|e| {
-            tracing::warn!("varena: recording a release failed ({e}); synchronizing its stream");
-            if let Err(e) = self.inner.backend.synchronize(self.stream) {
-                tracing::warn!("varena: synchronizing a released pin's stream failed: {e}");
+        // A failed completion record may fall back to a stream sync. If neither proves
+        // completion, preserve the pin: releasing it would permit unmapping live GPU work.
+        let event = match self.inner.backend.record(self.stream) {
+            Ok(event) => event,
+            Err(e) => {
+                tracing::warn!("varena: recording a release failed ({e}); synchronizing its stream");
+                if let Err(e) = self.inner.backend.synchronize(self.stream) {
+                    tracing::error!("varena: cannot prove consumer completion; quarantining pin {}: {e}", self.id);
+                    // Keep the backend and reservation too, even if this was their last owner.
+                    std::mem::forget(self.inner.clone());
+                    return;
+                }
+                Event::DONE
             }
-            Event::DONE
-        });
+        };
         let untransformed = self.transform && !self.transformed.load(Ordering::Acquire);
         let _ = self.inner.release_tx.send(Release { key: self.key, pin: self.id, event, stream: self.stream, untransformed });
         self.inner.landed.notify_all();

@@ -24,7 +24,7 @@ import threading
 import warnings
 import weakref
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Protocol, TypeAlias
@@ -297,24 +297,25 @@ class Binding:
                     stream = torch.cuda.current_stream(memory.device)
                 elif isinstance(stream, int):
                     stream = torch.cuda.ExternalStream(stream, device=memory.device)
-            pins = self.native.prepare(stream.cuda_stream if stream is not None else 0)
-            held: list[_Block] = []
-            try:
-                with self.model.lock:
-                    for block, pin in zip(self.blocks, pins, strict=True):
-                        if block.count == 0:
-                            memory._bind(block, stream, pin)
-                        elif stream is not None and block.stream != stream:
-                            stream.wait_stream(block.stream)
-                        block.count += 1
-                        held.append(block)
-                yield self
-            finally:
-                # `_exit` joins a caller's current consumer stream back to each bind stream.
-                # More streams must be joined by the caller before leaving this scope.
-                for block in reversed(held):
-                    memory._exit(block)
-                pins.clear()  # Native pin drops record completion after the queued uses.
+            with torch.cuda.stream(stream) if memory.cuda else nullcontext():
+                pins = self.native.prepare(stream.cuda_stream if stream is not None else 0)
+                held: list[_Block] = []
+                try:
+                    with self.model.lock:
+                        for block, pin in zip(self.blocks, pins, strict=True):
+                            if block.count == 0:
+                                memory._bind(block, stream, pin)
+                            elif stream is not None and block.stream != stream:
+                                stream.wait_stream(block.stream)
+                            block.count += 1
+                            held.append(block)
+                    yield self
+                finally:
+                    # `_exit` joins a caller's current consumer stream back to each bind stream.
+                    # More streams must be joined by the caller before leaving this scope.
+                    for block in reversed(held):
+                        memory._exit(block)
+                    pins.clear()  # Native pin drops record completion after the queued uses.
 
     def close(self) -> None:
         with self.lock:
@@ -323,7 +324,8 @@ class Binding:
                 self.native.close()
 
     def __del__(self) -> None:
-        self.close()
+        if hasattr(self, "lock"):
+            self.close()
 
 
 class Hold:
@@ -366,7 +368,7 @@ _pass: ContextVar[_Pass | None] = ContextVar("varena_pass", default=None)
 class Memory:
     """This process's memory on one device: its models, caches and requests."""
 
-    def __init__(self, native: Native, device: torch.device, pool: bool = False) -> None:
+    def __init__(self, native: Native, device: torch.device, pool: bool = True) -> None:
         self.native, self.device = native, device
         self.cuda = device.type == "cuda"
         self.models: dict[nn.Module, Model] = {}
@@ -395,7 +397,7 @@ class Memory:
             self.pool = torch.cuda.MemPool(allocator._allocator)
 
     @classmethod
-    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = False) -> Memory:
+    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = True) -> Memory:
         """A TensorD executor's memory (`grant`), or a standalone engine's: the device's table by
         name, its capacity lowered to `limit` (the first opener sets it, a later one can only
         lower it). On CUDA the backend opens first and measures this process's context, so open
@@ -472,7 +474,8 @@ class Memory:
         self.requests[r] = None
         token = _request.set(r)
         try:
-            yield r
+            with self.allocating():
+                yield r
         except BaseException as failed:
             try:
                 r.ended = r.native.end()
@@ -484,6 +487,30 @@ class Memory:
         finally:
             _request.reset(token)
             self.requests.pop(r, None)
+
+    def new_pool(self) -> torch.cuda.MemPool:
+        """An independently owned graph scratch pool using the native allocation path."""
+        allocator = torch.cuda.memory.CUDAPluggableAllocator(_ext.__file__, "varena_torch_alloc", "varena_torch_free")
+        return torch.cuda.MemPool(allocator._allocator)
+
+    @contextmanager
+    def allocating(self, pool: torch.cuda.MemPool | None = None) -> Iterator[None]:
+        """Use the request's allocator between passes too, or a graph's dedicated scratch pool.
+
+        Warm and capture must name the same graph pool. Capture cannot grow it; a capacity
+        shortfall aborts capture, without native pressure recovery or arbitrary package replay.
+        """
+        selected = self.pool if pool is None else pool
+        r, p = _request.get(), _pass.get()
+        if selected is None or r is None:
+            yield
+            return
+        r.native.allocating(self.native, p.set if p else None, *self.torch.now(), selected.id)
+        try:
+            with torch.cuda.use_mem_pool(selected, self.device):
+                yield
+        finally:
+            _allocated()
 
     def cache(self, owner: str, shrink: Callable[[int], int]) -> Cache:
         """Bytes the caller holds that `shrink(want) -> freed` gives back on varena's ask; a
@@ -577,8 +604,8 @@ class Memory:
             p = _Pass(r.native.pass_(model.id, entry, shape, allocated, reserved), r, model.id, entry, shape, allocated, self.torch.churn())
             growth, slack = model.rooms.get((entry, shape), (0, 0))
             self._cap(allocated + growth + slack if growth or slack else 0, start=True)
-            if self.pool is not None and self.pooling:  # the pass's new segments ask its request for room
-                r.native.allocating(self.native, model.id, allocated, reserved)
+            if self.pool is not None and self.pooling and not (self.cuda and torch.cuda.is_current_stream_capturing()):  # capture owns its exact pool
+                r.native.allocating(self.native, model.id, allocated, reserved, self.pool.id)
                 p.pooled = torch.cuda.use_mem_pool(self.pool, self.device)
                 p.pooled.__enter__()
             p.entered = sys.exc_info()[1]
@@ -594,8 +621,10 @@ class Memory:
                 if p in self.passes:
                     self.passes.remove(p)
             if p is not None and p.pooled is not None:
-                p.pooled.__exit__(None, None, None)
-                _allocated()
+                try:
+                    p.pooled.__exit__(None, None, None)
+                finally:
+                    _allocated()
             raise
 
     def _close(self, model: Model) -> None:
@@ -609,9 +638,11 @@ class Memory:
         if model.common is not None:
             self._exit(model.common)
         if p.pooled is not None:
-            p.pooled.__exit__(None, None, None)
-            _allocated()
-            self.outside = max(self.outside, self.torch.now()[1] - _allocator_stats()[0])
+            try:
+                p.pooled.__exit__(None, None, None)
+            finally:
+                _allocated()
+            self.outside = max(self.outside, self.torch.now()[1] - _allocator_stats(self.device.index or 0)[0])
         self._fold()
         with self.measuring:
             self.passes.remove(p)
