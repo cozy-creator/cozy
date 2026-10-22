@@ -1,5 +1,7 @@
 //! One process's Memory over host pages: rooms bounded by measured shapes, the cut memo, and
 //! the OOM answers for cut and collective sites.
+// Its sets load from TensorFS sources, which are Unix's so far (`tensorfs::io::source`).
+#![cfg(unix)]
 
 use std::fs::File;
 use std::path::Path;

@@ -3,6 +3,8 @@
 //! no host thread waits on a device event or on custody. Host pages fill synchronously, so the
 //! backend here is the host backend with stream events that complete only when the test says
 //! (as a card's do when their work finishes), and with the stream waits it was asked for.
+// Its sets load from TensorFS sources, which are Unix's so far (`tensorfs::io::source`).
+#![cfg(unix)]
 
 use std::collections::HashSet;
 use std::fs::File;
