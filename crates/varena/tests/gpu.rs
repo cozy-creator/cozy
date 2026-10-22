@@ -901,6 +901,85 @@ fn a_registered_host_range_fills_directly_every_time() {
     step!();
 }
 
+/// cuMemSetAccess is documented synchronous: does a map wait for a fill another thread has in flight? Fresh pages
+/// mapped with the card idle, then while another thread fills a device buffer from pageable host memory without a
+/// pause; each phase's maps split into cuMemMap and cuMemSetAccess (the backend's driver spans). Reported, not judged:
+/// the figures say whether varena's mechanism must keep its maps apart from fills.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn maps_beside_a_fill_in_flight_are_timed_against_maps_on_an_idle_card() {
+    time_calls();
+    let (b, uuid) = gpu();
+    step!();
+    let gran = b.granularity();
+    // A 1 GiB set's pages per phase: hundreds of maps, enough to see each phase's spread.
+    let pages = ((1u64 << 30) / gran) as usize;
+    let va = b.reserve(2 * pages as u64 * gran).unwrap();
+    step!();
+    let made: Vec<Physical> = (0..2 * pages).map(|_| b.create(gran).unwrap()).collect();
+    step!();
+    let filling = std::sync::atomic::AtomicBool::new(false);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    // Each map's milliseconds, of those that began and ended in the phase's state.
+    let maps = |half: usize, busy: bool| -> Vec<f64> {
+        let mut ms = vec![];
+        for (i, page) in made.iter().enumerate().skip(half * pages).take(pages) {
+            let before = filling.load(std::sync::atomic::Ordering::Acquire);
+            let t = std::time::Instant::now();
+            b.map(va, i as u64 * gran, page, Access::ReadWrite).unwrap();
+            let took = t.elapsed().as_secs_f64() * 1e3;
+            if before == busy && filling.load(std::sync::atomic::Ordering::Acquire) == busy {
+                ms.push(took);
+            }
+        }
+        ms.sort_by(f64::total_cmp);
+        ms
+    };
+    let spread = |ms: &[f64]| format!("{} maps, median {:.3} ms, max {:.3} ms", ms.len(), ms.get(ms.len() / 2).copied().unwrap_or(0.0), ms.last().copied().unwrap_or(0.0));
+    CALLS.take();
+    let idle = maps(0, false);
+    step!();
+    let idle_calls = CALLS.take();
+    println!("TIMINGS idle card: {} | driver {idle_calls}", spread(&idle));
+    step!();
+    let host = vec![7u8; 1 << 30];
+    let buffer = io::DeviceBuffer::new(0, host.len()).unwrap();
+    step!();
+    let (reads, busy, busy_calls, fill_s) = std::thread::scope(|s| {
+        let filler = s.spawn(|| {
+            let copy = [Copy { src: Src::Host(host.as_ptr()), dst: Dst::Device { device: 0, ptr: buffer.ptr(), len: host.len(), stream: 0 } }];
+            let t = std::time::Instant::now();
+            let mut reads = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                filling.store(true, std::sync::atomic::Ordering::Release);
+                unsafe { io::read(&copy, &ReadOpts::default()) }.unwrap();
+                reads += 1;
+            }
+            filling.store(false, std::sync::atomic::Ordering::Release);
+            (reads, t.elapsed().as_secs_f64())
+        });
+        while !filling.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let busy = maps(1, true);
+        let calls = CALLS.take();
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let (reads, took) = filler.join().unwrap();
+        (reads, busy, calls, took)
+    });
+    step!();
+    let gbps = reads as f64 * host.len() as f64 / fill_s / 1e9;
+    println!("TIMINGS beside a fill ({reads} reads of 1 GiB at {gbps:.1} GB/s): {} | driver {busy_calls}", spread(&busy));
+    step!();
+    b.unmap(va, 0, 2 * pages as u64 * gran).unwrap();
+    step!();
+    made.into_iter().for_each(|p| b.destroy(p));
+    b.release(va);
+    step!();
+    println!("PASS maps beside a fill: idle {}; beside a fill {} {uuid}", spread(&idle), spread(&busy));
+    step!();
+}
+
 // ---- the backend's calls, timed
 
 /// Each backend call's count, total and longest time, by name, and when the last one ended.
@@ -908,15 +987,29 @@ fn a_registered_host_range_fills_directly_every_time() {
 struct Timings(parking_lot::Mutex<std::collections::BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>>, parking_lot::Mutex<std::collections::BTreeMap<&'static str, std::time::Instant>>);
 
 impl Timings {
-    fn time<T>(&self, op: &'static str, f: impl FnOnce() -> T) -> T {
-        let start = std::time::Instant::now();
-        let out = f();
-        let took = start.elapsed();
+    const fn new() -> Timings {
+        Timings(parking_lot::const_mutex(std::collections::BTreeMap::new()), parking_lot::const_mutex(std::collections::BTreeMap::new()))
+    }
+
+    fn add(&self, op: &'static str, took: std::time::Duration) {
         let mut t = self.0.lock();
         let e = t.entry(op).or_default();
         *e = (e.0 + 1, e.1 + took, e.2.max(took));
         self.1.lock().insert(op, std::time::Instant::now());
+    }
+
+    fn time<T>(&self, op: &'static str, f: impl FnOnce() -> T) -> T {
+        let start = std::time::Instant::now();
+        let out = f();
+        self.add(op, start.elapsed());
         out
+    }
+
+    /// The report, and a fresh start.
+    fn take(&self) -> String {
+        let report = self.report();
+        self.0.lock().clear();
+        report
     }
 
     fn count(&self, op: &str) -> u64 {
@@ -940,6 +1033,39 @@ impl Timings {
     }
 }
 
+/// Every driver call of this process's CUDA backends (their trace spans), by name.
+static CALLS: Timings = Timings::new();
+
+/// Times each of the backend's driver spans into [`CALLS`].
+struct Calls;
+
+impl<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> tracing_subscriber::Layer<S> for Calls {
+    fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().replace(std::time::Instant::now());
+        }
+    }
+
+    fn on_exit(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            if let Some(start) = span.extensions_mut().remove::<std::time::Instant>() {
+                CALLS.add(span.metadata().name(), start.elapsed());
+            }
+        }
+    }
+}
+
+/// From now on this process times every driver call into [`CALLS`].
+fn time_calls() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+        let only = tracing_subscriber::filter::Targets::new().with_target("varena::cuda", tracing::Level::TRACE);
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Calls.with_filter(only))).unwrap();
+    });
+}
+
 /// The CUDA backend with every call timed: where Memory's time on the device side goes.
 struct Timed(CudaBackend, Arc<Timings>);
 
@@ -957,7 +1083,13 @@ impl Backend for Timed {
         let n = self.1.count("create");
         if n == 1 || n.is_multiple_of(1000) {
             let wall = self.1.lap();
-            eprintln!("TIMINGS pid {} after {n} pages ({wall:?} wall since page {}): {}", std::process::id(), n.saturating_sub(1000).max(1), self.1.report());
+            eprintln!(
+                "TIMINGS pid {} after {n} pages ({wall:?} wall since page {}): backend {} | driver {}",
+                std::process::id(),
+                n.saturating_sub(1000).max(1),
+                self.1.report(),
+                CALLS.report()
+            );
         }
         page
     }
@@ -984,6 +1116,7 @@ impl Backend for Timed {
 
 /// Memory over the timed CUDA backend, and its timings.
 fn timed_memory(b: CudaBackend, g: &GpuId) -> (Memory, Arc<Timings>) {
+    time_calls();
     let timings = Arc::new(Timings::default());
     (Memory::open(g.clone(), None, Box::new(Timed(b, timings.clone()))).unwrap(), timings)
 }
@@ -1965,7 +2098,7 @@ fn role_agent() {
                 crowded.push(crowd());
                 "ok".into()
             }
-            ["timings"] => format!("ok {}", timings.as_ref().unwrap().report()),
+            ["timings"] => format!("ok backend {} | driver {}", timings.as_ref().unwrap().report(), CALLS.report()),
             ["unpin"] => {
                 pins.clear();
                 "ok".into()
@@ -2084,7 +2217,13 @@ fn a_kept_set_is_imported_after_its_holders_kill_9_and_another_fill_refills() {
     let trace = s.ok("trace r");
     step!();
     let n = origins(&trace);
-    assert_eq!((n.get("Kept").copied(), n.get("Hit").copied()), (Some(kept), Some(4)), "every orphan imported at load, never copied: {trace}");
+    // The orphans' blocks bind as hits on the imported pages; the rest come from the tier the load filled.
+    let some = |k: usize| (k > 0).then_some(k);
+    assert_eq!(
+        (n.get("Kept").copied(), n.get("Hit").copied(), n.get("Tier").copied()),
+        (Some(kept), Some(kept), some(4 - kept)),
+        "every orphan imported at load, never copied: {trace}"
+    );
     step!();
     s.ok("unpin");
     step!();
@@ -2236,7 +2375,8 @@ fn the_tier_takes_back_a_pinned_layout() {
     step!();
     let signal = event.try_clone().unwrap();
     step!();
-    let tier = varena::Tier::serve(varena::Pressure::Events(event)).unwrap().expect("no other participant serves this user's RAM tier");
+    // No call runs beside the tier here: it keeps nothing free for one.
+    let tier = varena::Tier::serve(varena::Pressure::Events(event), Arc::new(|| Some(0))).unwrap().expect("no other participant serves this user's RAM tier");
     step!();
     let digest = |n: &str| format!("{n}-2-{}", g.uuid);
     step!();
