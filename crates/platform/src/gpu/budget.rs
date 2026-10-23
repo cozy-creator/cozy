@@ -208,11 +208,12 @@ impl Budget {
         Ok((info.budget, info.usage))
     }
 
-    /// Blocks until the budget or usage changed (true) or [`Budget::close`] was called (false).
+    /// Blocks until the budget or usage changed (true) or [`Budget::close`] was called (false);
+    /// once closed, always false (the lowest signalled index wins, so `closed` comes first).
     pub fn wait(&self) -> bool {
-        let handles = [self.changed.as_raw_handle() as HANDLE, self.closed.as_raw_handle() as HANDLE];
+        let handles = [self.closed.as_raw_handle() as HANDLE, self.changed.as_raw_handle() as HANDLE];
         // SAFETY: live events this value holds.
-        unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) == WAIT_OBJECT_0 }
+        unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) == WAIT_OBJECT_0 + 1 }
     }
 
     pub fn close(&self) {
