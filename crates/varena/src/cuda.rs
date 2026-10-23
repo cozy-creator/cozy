@@ -6,6 +6,7 @@
 //! `CUevent`.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
+use std::sync::Arc;
 
 use platform::handles::Owned;
 use tensorfs::io::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUdevice, CUevent, CUstream, CtxGuard};
@@ -543,10 +544,10 @@ pub struct CudaChunks {
     _security: Security,
     granularity: u64,
     capacity: u64,
-    nvml: Option<platform::gpu::Device>,
-    context: Lazy<Primary>,
+    nvml: Option<Arc<platform::gpu::Device>>,
+    context: Lazy<Minimal>,
     /// Live chunks, and the hold that keeps the context while there are any.
-    chunks: parking_lot::Mutex<(u64, Option<User<Primary>>)>,
+    chunks: parking_lot::Mutex<(u64, Option<User<Minimal>>)>,
 }
 
 // SAFETY: as `CudaBackend`'s: `prop`'s only pointer is the WIN32 metadata, owned and never written.
@@ -556,14 +557,22 @@ unsafe impl Sync for CudaChunks {}
 
 /// The device's primary context with its stack, printf FIFO and malloc heap at 0 (P1: 188 MiB
 /// becomes 102): the least a context costs, for export and release.
-fn minimal(ordinal: i32) -> Result<Primary> {
+struct Minimal {
+    primary: Primary,
+    /// This process's NVML bytes across opening it (0 where NVML has no per-process figure).
+    bytes: u64,
+}
+
+fn minimal(ordinal: i32, nvml: Option<&platform::gpu::Device>) -> Result<Minimal> {
+    let before = process_used(nvml).ok();
     let (device, ctx) = cuda::primary_context(ordinal)?;
     let primary = Primary { device, ctx: ctx as usize };
     let _ctx = primary.enter()?;
     for limit in [cuda::LIMIT_STACK_SIZE, cuda::LIMIT_PRINTF_FIFO_SIZE, cuda::LIMIT_MALLOC_HEAP_SIZE] {
         call!("cuCtxSetLimit", ctx_set_limit(limit, 0))?;
     }
-    Ok(primary)
+    let bytes = process_used(nvml).ok().zip(before).map_or(0, |(after, before)| after.saturating_sub(before));
+    Ok(Minimal { primary, bytes })
 }
 
 impl CudaBackend {
@@ -571,15 +580,17 @@ impl CudaBackend {
     pub fn chunks(ordinal: i32) -> Result<CudaChunks> {
         let device = device(ordinal)?;
         let (prop, security) = pages(device);
-        let context = Lazy::new(move || minimal(ordinal));
+        let nvml = nvml(device).map(Arc::new);
+        let measure = nvml.clone();
+        let context = Lazy::new(move || minimal(ordinal, measure.as_deref()));
         let (mut granularity, mut free, mut total) = (0usize, 0usize, 0usize);
         {
             let open = context.enter()?;
-            let _ctx = open.enter()?;
+            let _ctx = open.primary.enter()?;
             call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut granularity, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
             call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
         }
-        Ok(CudaChunks { ordinal, prop, _security: security, granularity: granularity as u64, capacity: total as u64, nvml: nvml(device), context, chunks: Default::default() })
+        Ok(CudaChunks { ordinal, prop, _security: security, granularity: granularity as u64, capacity: total as u64, nvml, context, chunks: Default::default() })
     }
 }
 
@@ -587,7 +598,7 @@ impl CudaChunks {
     /// `f` in the minimal context, opened for it if it is not open.
     fn inside<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
         let open = self.context.enter()?;
-        let _ctx = open.enter()?;
+        let _ctx = open.primary.enter()?;
         f()
     }
 }
@@ -612,12 +623,12 @@ impl Backend for CudaChunks {
     }
 
     fn process_used(&self) -> Result<u64> {
-        process_used(self.nvml.as_ref())
+        process_used(self.nvml.as_deref())
     }
 
-    /// None between calls.
+    /// The minimal context's bytes while it is open, else 0.
     fn opened_context(&self) -> u64 {
-        0
+        self.context.peek().map_or(0, |m| m.bytes)
     }
 
     fn granularity(&self) -> u64 {
@@ -638,16 +649,16 @@ impl Backend for CudaChunks {
         Ok(Physical { id, len })
     }
 
-    /// The last chunk's release closes the context after it.
+    /// The last chunk's release closes the context after it; a failed release leaves the chunk counted.
     fn destroy(&self, page: Physical) -> Result<()> {
-        let released = self.inside(|| Ok(call!("cuMemRelease", mem_release(page.id))?));
+        self.inside(|| Ok(call!("cuMemRelease", mem_release(page.id))?))?;
         let last = {
             let mut chunks = self.chunks.lock();
             chunks.0 = chunks.0.saturating_sub(1);
             if chunks.0 == 0 { chunks.1.take() } else { None }
         };
         drop(last);
-        released
+        Ok(())
     }
 
     fn export(&self, page: &Physical) -> Result<Owned> {
