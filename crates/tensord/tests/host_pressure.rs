@@ -14,8 +14,9 @@ use std::{
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::Arc,
 };
-use tensord::memory::{Gpu, Host, MemoryLog};
-use varena::{GpuId, HostBackend, Ledger, Memory, Plan};
+use tensord::memory::{Call, Gpu, Host, Leases, MemoryLog, Peaks, Peers, Running, Tenants};
+use varena::lease::Peak;
+use varena::{GpuId, HostBackend};
 
 const MIB: u64 = 1 << 20;
 /// The scope: what it holds is sized against this.
@@ -112,13 +113,12 @@ impl Drop for Agent {
     }
 }
 
-/// A child: `hold <bytes>` touches that much anonymous memory and keeps it (an idle executor);
-/// `open <namespace> <gpu>` opens a varena Memory on the test's table, `request` begins a call
-/// with no recorded peak, `grow <bytes>` grows it.
+/// A child: `hold <bytes>` touches that much anonymous memory and keeps it (an idle executor, or
+/// a call growing).
 #[test]
 #[ignore = "a child process, spawned by the scenarios"]
 fn child() {
-    let (mut memory, mut request, mut held) = (None, None, Vec::<Vec<u8>>::new());
+    let mut held = Vec::<Vec<u8>>::new();
     for line in std::io::stdin().lines() {
         let line = line.unwrap();
         let words: Vec<&str> = line.split_whitespace().collect();
@@ -127,46 +127,48 @@ fn child() {
                 held.push(vec![1u8; bytes.parse().unwrap()]);
                 "held".to_string()
             }
-            ["open", namespace, uuid] => {
-                assert!(varena::os::namespace(namespace));
-                let gpu = GpuId { uuid: uuid.to_string(), model: "host".into(), memory: 4 * LIMIT };
-                memory = Some(Memory::open(gpu.clone(), None, Box::new(HostBackend::new(gpu.memory))).unwrap());
-                "open".to_string()
-            }
-            ["request"] => {
-                request = Some(memory.as_ref().unwrap().request("run", Plan { steps: vec![] }).unwrap());
-                "begun".to_string()
-            }
-            ["end"] => {
-                request.take().unwrap().end();
-                "ended".to_string()
-            }
             other => panic!("no command {other:?}"),
         };
         println!("child> {answer}");
     }
 }
 
+/// The test's GPU: a manager over host pages, its executors this test's children.
+fn gpu(namespace: &str, tenants: &Tenants) -> (Arc<Gpu>, GpuId) {
+    assert!(varena::os::namespace(namespace));
+    let id = GpuId { uuid: format!("host-pressure-{}", std::process::id()), model: "host".into(), memory: 4 * LIMIT };
+    let inventory: tensord::machine::receipt::Gpu = serde_json::from_value(serde_json::json!({"device_index": 0, "device_name": id.model,
+        "device_uuid": id.uuid, "driver_version": "", "memory_bytes": id.memory, "pci_bus_id": ""})).unwrap();
+    let peers = Arc::new(Peers::new(tenants.clone(), vec![platform::memory::euid()], MemoryLog::default()));
+    let card = id.memory;
+    let leases = Leases { peers, open: Some(Box::new(move || Ok(Arc::new(HostBackend::new(card)) as Arc<dyn varena::Backend>))), tenants: tenants.clone() };
+    let peaks = Peaks::at(std::env::temp_dir().join(format!("host-pressure-peaks-{}", std::process::id())));
+    let gpu = Gpu::create("0", &[inventory], None, HostMode::Dedicated, leases, &peaks, &MemoryLog::default()).expect("a manager");
+    (Arc::new(gpu), id)
+}
+
+/// `call` runs request `run` of `pkg|s` on the GPU, as TensorD records an admitted call.
+fn running(call: &Agent, running: &Running) {
+    running.lock().unwrap().insert("run".into(), Call { pid: call.child.id(), package: "pkg".into(), shape: "s".into() });
+}
+
 /// An unmeasured call grows past what is left beside an idle neighbour.
 fn scenario(watch: bool) {
     let cgroup = deny_psi();
-    let namespace = format!("host-pressure-{}-", std::process::id());
-    assert!(varena::os::namespace(&namespace));
-    let id = GpuId { uuid: format!("host-pressure-{}", std::process::id()), model: "host".into(), memory: 4 * LIMIT };
-    let gpu = Arc::new(Gpu::ledgered(Ledger::create(&id, None).unwrap(), "host"));
+    let (namespace, tenants, calls) = (format!("host-pressure-{}-", std::process::id()), Tenants::default(), Running::default());
+    let (gpu, _) = gpu(&namespace, &tenants);
     let dir = tempfile::tempdir().unwrap();
     let host = watch.then(|| {
         let how = Pressure::arm(HostMode::Dedicated).unwrap().how().to_string();
         assert!(how.contains("no psi trigger") && how.contains("inotify"), "{how}");
-        Host::watch(HostMode::Dedicated, vec![gpu.clone()], &MemoryLog::default()).expect("watched")
+        Host::watch(HostMode::Dedicated, vec![gpu.clone()], calls.clone(), &MemoryLog::default()).expect("watched")
     });
     let mut neighbour = Agent::spawn("child");
     assert_eq!(neighbour.ask(&format!("hold {NEIGHBOUR}")).as_deref(), Some("held"));
     cache(dir.path(), CACHE);
     let killed = event(&cgroup, "oom_kill");
     let mut call = Agent::spawn("child");
-    assert_eq!(call.ask(&format!("open {namespace} {}", id.uuid)).as_deref(), Some("open"));
-    assert_eq!(call.ask("request").as_deref(), Some("begun"));
+    running(&call, &calls);
     // The pool's part: on a short look, its one idle process ends.
     let mut ended = false;
     let mut look = |neighbour: &mut Agent| {
@@ -195,7 +197,6 @@ fn scenario(watch: bool) {
     if watch {
         assert!(grew && oom_kill == killed, "the call completes with no OOM kill");
         assert!(ended, "the host read short and the idle neighbour ended");
-        assert_eq!(call.ask("end").as_deref(), Some("ended"));
     } else {
         // Nothing ends the neighbour: the kernel OOM-kills (the larger then, or both).
         let neighbour_killed = neighbour.child.try_wait().unwrap().and_then(|s| s.signal()) == Some(libc::SIGKILL);
@@ -203,7 +204,6 @@ fn scenario(watch: bool) {
         assert!(oom_kill > killed && (neighbour_killed || call_killed), "OOM kills: call {call_killed}, neighbour {neighbour_killed}");
     }
     drop((call, neighbour, gpu));
-    varena::os::remove_table(&id.uuid);
 }
 
 /// A call measured to outgrow the host alone (its recorded peak is twice the limit), beside small
@@ -212,21 +212,17 @@ fn scenario(watch: bool) {
 /// meets its own limit.
 fn futile() {
     let cgroup = deny_psi();
-    let namespace = format!("host-pressure-{}-", std::process::id());
-    assert!(varena::os::namespace(&namespace));
-    let id = GpuId { uuid: format!("host-pressure-{}", std::process::id()), model: "host".into(), memory: 4 * LIMIT };
-    let gpu = Arc::new(Gpu::ledgered(Ledger::create(&id, None).unwrap(), "host"));
-    let host = Host::watch(HostMode::Dedicated, vec![gpu.clone()], &MemoryLog::default()).expect("watched");
-    gpu.ledger().restore(&[varena::Peak::Host { key: "pkg|s".into(), bytes: 2 * LIMIT }]).unwrap();
-    gpu.ledger().dispatch("run", "pkg", "s").unwrap();
+    let (namespace, tenants, calls) = (format!("host-pressure-{}-", std::process::id()), Tenants::default(), Running::default());
+    let (gpu, _) = gpu(&namespace, &tenants);
+    let host = Host::watch(HostMode::Dedicated, vec![gpu.clone()], calls.clone(), &MemoryLog::default()).expect("watched");
+    gpu.manager.restore(&[Peak::Host { key: "pkg|s".into(), bytes: 2 * LIMIT }]).unwrap();
     let mut neighbours: Vec<Agent> = (0..3).map(|_| Agent::spawn("child")).collect();
     for n in &mut neighbours {
         assert_eq!(n.ask(&format!("hold {MIB}")).as_deref(), Some("held"));
     }
     let killed = event(&cgroup, "oom_kill");
     let mut call = Agent::spawn("child");
-    assert_eq!(call.ask(&format!("open {namespace} {}", id.uuid)).as_deref(), Some("open"));
-    assert_eq!(call.ask("request").as_deref(), Some("begun"));
+    running(&call, &calls);
     let mut ended = 0;
     let mut grew = true;
     // Steps larger than a neighbour gives back: an end cannot raise the budget past the growth.
@@ -249,7 +245,6 @@ fn futile() {
     assert!(!grew && oom_kill > killed, "the call met its own limit");
     assert!(ended <= 1 && alive == neighbours.len() - ended, "ends stop once they cannot help: {ended} ended, {alive} alive");
     drop((call, neighbours, gpu));
-    varena::os::remove_table(&id.uuid);
 }
 
 /// Needs a user systemd session (a hosted runner has none): run with `--ignored` where one is.

@@ -195,6 +195,12 @@ impl Device {
         })
     }
 
+    /// Its free bytes now (an integrated GPU's: the host's available memory), read alone.
+    pub fn free(&self) -> Result<u64> {
+        let device = self.nvml.device_by_index(self.index).map_err(failed("open device"))?;
+        memory(device.memory_info()).map(|(_, free)| free)
+    }
+
     /// Whether kernels ran, and whether device memory moved (kernels' traffic, copies, peer
     /// writes), in NVML's samples after `seen` (its timestamp, µs), which it advances.
     pub fn worked_since(&self, seen: &mut u64) -> Result<(bool, bool)> {

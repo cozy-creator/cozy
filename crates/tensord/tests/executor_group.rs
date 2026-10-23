@@ -87,7 +87,6 @@ fn start(
         import_only: false,
         call_interfaces: vec![],
         constructions: Vec::new(),
-        ledgers: 0,
         leases: None,
         memory_mode: tensord::device_executor::MemoryMode::Shared,
     }
@@ -243,7 +242,6 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
                 import_only: true,
                 call_interfaces: vec![],
                 constructions: Vec::new(),
-                ledgers: 0,
                 leases: None,
                 memory_mode: tensord::device_executor::MemoryMode::Shared,
             },
@@ -301,7 +299,6 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
                 import_only: false,
                 call_interfaces: vec![],
                 constructions: Vec::new(),
-                ledgers: 0,
                 leases: None,
                 memory_mode: tensord::device_executor::MemoryMode::Shared,
             },

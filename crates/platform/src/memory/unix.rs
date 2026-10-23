@@ -218,15 +218,21 @@ impl Signal {
     }
 }
 
-/// Blocks until one of `items` is readable, or hung up or failed (then it stays ready: the
-/// caller drops it); the lowest such index. No timeout.
-pub fn wait_any(items: &[Waitable<'_>]) -> Result<usize> {
+/// Blocks until any of `items` is readable, hung up or failed, then answers every one that is, in
+/// order, so none starves behind a lower one. No timeout.
+pub fn wait_any(items: &[Waitable<'_>]) -> Result<Vec<super::Ready>> {
     let mut fds: Vec<libc::pollfd> = items.iter().map(|fd| libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
     loop {
         // SAFETY: descriptors the caller borrows for the call; no timeout.
         if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } >= 0 {
-            if let Some(i) = fds.iter().position(|fd| fd.revents != 0) {
-                return Ok(i);
+            let ready: Vec<super::Ready> = fds
+                .iter()
+                .enumerate()
+                .filter(|(_, fd)| fd.revents != 0)
+                .map(|(index, fd)| super::Ready { index, broken: fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 })
+                .collect();
+            if !ready.is_empty() {
+                return Ok(ready);
             }
             continue;
         }
@@ -234,5 +240,24 @@ pub fn wait_any(items: &[Waitable<'_>]) -> Result<usize> {
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(Error::os("wait")(error));
         }
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::{wait_any, Signal};
+    use crate::memory::Ready;
+
+    #[test]
+    fn every_ready_item_is_answered_and_a_hung_up_one_is_broken() {
+        let (a, b, idle) = (Signal::new().unwrap(), Signal::new().unwrap(), Signal::new().unwrap());
+        b.set();
+        a.set();
+        let (hung, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(peer);
+        let ready = wait_any(&[idle.waitable(), a.waitable(), b.waitable(), std::os::fd::AsFd::as_fd(&hung)]).unwrap();
+        let ready_at = |index, broken| Ready { index, broken };
+        assert_eq!(ready, vec![ready_at(1, false), ready_at(2, false), ready_at(3, true)]);
+        assert!(a.clear() && b.clear() && !idle.clear());
     }
 }

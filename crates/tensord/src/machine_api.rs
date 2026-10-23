@@ -694,8 +694,8 @@ impl MachineBackend for NativeBackend {
         }
         Ok(levels)
     }
-    fn leases(&self) -> BTreeMap<String, v1::GpuLeases> {
-        self.service.gpu().map(|gpu| gpu.leases()).unwrap_or_default()
+    fn memory(&self) -> BTreeMap<String, v1::GpuMemory> {
+        self.service.gpu().map(|gpu| gpu.memory()).unwrap_or_default()
     }
     fn warm_set(&self, actor: VerifiedActor) -> Result<Vec<v1::WarmItem>, Error> {
         let actor = actor_id(actor);
@@ -1403,7 +1403,6 @@ print(json.dumps({"identity": generation.identity}))
                             import_only: false,
                             call_interfaces: vec![],
                             constructions: Vec::new(),
-                            ledgers: 0,
                             leases: None,
                             memory_mode: crate::device_executor::MemoryMode::Shared,
                         },
