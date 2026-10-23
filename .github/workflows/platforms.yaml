@@ -31,7 +31,8 @@ on:
 permissions:
   contents: read
 
-# A PR's newer push replaces its running check; every other run stands alone.
+# A PR's newer push replaces its running check; every other run stands alone (release-gate.yml
+# needs a full run on the commit it releases).
 concurrency:
   group: platforms-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
@@ -48,7 +49,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.os || '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "macos-15-intel", "windows-2025", "windows-11-arm"]') }}
+        # A PR: one runner per OS (macOS runners are few); master and dispatches: every release runner.
+        os: ${{ fromJSON(inputs.os || (github.event_name == 'pull_request' && '["ubuntu-24.04", "macos-15", "windows-2025"]') || '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "macos-15-intel", "windows-2025", "windows-11-arm"]') }}
     defaults:
       run:
         shell: bash
