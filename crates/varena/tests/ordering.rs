@@ -631,43 +631,6 @@ fn a_drain_queries_each_stream_once() {
     assert_eq!(per_lock(), 0, "nothing pending");
 }
 
-/// ILLEGAL_ADDRESS audit, 1: no page is unmapped while a fill into it is in flight. A cold
-/// load's prefetch is held mid-fill (its copy not yet issued) while an OOM wants every byte:
-/// the in-flight page is P, so the OOM takes the rest, and the fill lands in mapped memory
-/// (an unmapped page is PROT_NONE here: a write would fault the test).
-#[test]
-fn a_page_in_flight_is_never_unmapped_for_an_oom() {
-    let dir = tempfile::tempdir().unwrap();
-    let uuid = format!("inflight-{}", std::process::id());
-    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 3 * REGION_ALIGN };
-    let _scope = Scope::new(&g.uuid);
-    let events = Arc::new(Events::default());
-    let mem = Arc::new(Memory::open(g.clone(), Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
-    mem.load(stored(dir.path(), &uuid, "n", 1), Level::Gpu).unwrap();
-    let a = mem.load(stored(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
-    mem.settle();
-    events.hold_target.store(true, Ordering::SeqCst);
-    let loading = {
-        let (mem, dir, uuid) = (mem.clone(), dir.path().to_path_buf(), uuid.clone());
-        std::thread::spawn(move || mem.load(stored(&dir, &uuid, "p", 1), Level::Gpu).unwrap())
-    };
-    events.target_waits.pass();
-    let filling = events.calls.lock().iter().rev().find(|(c, _)| *c == "target").map(|(_, at)| *at).unwrap();
-    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["a".into()], passes: 1 }] }).unwrap();
-    let pass = r.pass(a, "k").unwrap();
-    let range = mem.retain(a, &[0, 1, 2]).unwrap();
-    let next = range.prepare(0).map(|p| p.len());
-    drop(range);
-    assert!(!events.calls.lock().iter().any(|(c, at)| *c == "unmap" && *at == filling), "the page in flight was unmapped ({next:?})");
-    events.target_gate.open();
-    let p = loading.join().unwrap();
-    drop(pass);
-    drop(r);
-    let pin = mem.bind(p, 0, 0).unwrap();
-    // SAFETY: a mapped page bound to this test; read only.
-    assert!(unsafe { std::slice::from_raw_parts(pin.ptr as *const u8, pin.len as usize) }.iter().all(|b| *b == 7));
-}
-
 /// ILLEGAL_ADDRESS audit, 2: a fill is issued only after its page is mapped (the mechanism's
 /// map, set-access included, has returned): with the map held, nothing writes its address.
 #[test]

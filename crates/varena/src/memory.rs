@@ -1662,10 +1662,17 @@ impl Inner {
         let mut record = MakeRoom { step: 0, trigger: why, need: bytes, freed: 0, waited: 0 };
         let out = loop {
             let mut st = self.lock();
-            // A refused create says the device had less than the figures: the round takes the
-            // page's bytes itself.
+            // A refused create, or a manager's refusal, says there is less than the figures: the
+            // round takes the page's bytes itself. Leased, a page is asked of the manager first
+            // (its reclaim makes room across processes, this one's idle pages too). Standalone, a
+            // miss bounds the budget by the driver's free bytes (another tenant's churn); a pass
+            // never reads them.
             let refused = keep.iter().any(|k| st.short.remove(k).is_some());
-            let free = if refused { 0 } else { self.free(&st) };
+            let free = match (refused, self.leasing()) {
+                (true, _) => 0,
+                (false, true) => u64::MAX,
+                (false, false) => self.free(&st).min(self.backend.free().unwrap_or(u64::MAX)),
+            };
             let req = req.or_else(|| st.active.iter().find(|(_, a)| a.thread == std::thread::current().id()).map(|((r, _), _)| *r));
             let short = |st: &State| -> Result<u64> { Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, req.and_then(|r| st.stats.get(&r)).cloned().unwrap_or_default()))) };
             if free >= bytes {
@@ -1838,16 +1845,19 @@ impl Inner {
                 self.readahead(id)?
             }
             Level::Gpu => {
-                // Into spare bytes only, in block order: a GPU-level load evicts nothing.
+                // In block order, evicting nothing of its own: standalone into spare bytes;
+                // leased, every page is asked of the manager (retained ones come back with no
+                // copy), and one it refuses stays unmapped quietly.
                 {
                     let mut st = self.lock();
-                    let mut free = self.spare(&st);
+                    let leased = self.leasing();
+                    let mut free = if leased { u64::MAX } else { self.spare(&st) };
                     let keys: Vec<(Key, u64)> = st.table.pages().filter(|(k, p)| k.0 == id && !p.mapped).map(|(k, p)| (k, p.bytes)).collect();
                     for (key, bytes) in keys {
                         if bytes > free {
                             break;
                         }
-                        self.map(&mut st, key, None, false)?;
+                        self.map(&mut st, key, None, leased)?;
                         free -= bytes;
                     }
                     self.unlock(st);
@@ -2634,6 +2644,9 @@ impl Inner {
                 st.sync(key);
                 if !speculative {
                     match e {
+                        // The manager could make no room: the bind takes this process's own
+                        // pages (a running set streams) and asks again.
+                        Error::Exhausted(_) => drop(st.short.insert(key, 0)),
                         // The device had less than the figures showed: the bind decides again,
                         // taking the page's bytes itself.
                         error @ Error::Device { code: crate::backend::OUT_OF_MEMORY, .. } => {
