@@ -392,11 +392,11 @@ fn books(processes: &BTreeMap<u32, u64>, held: &varena::lease::Holdings, was: Op
     was
 }
 
-/// GPU `uuid`'s chunks, opened in TensorD's own context at its manager's first ask and released
-/// when the manager holds no chunk and serves no executor (a context costs VRAM, and keeps a
-/// laptop's GPU awake). None (a memory-log note says why) where its compute mode admits one
-/// process at a time, whose context TensorD's would lock out, or CUDA cannot share its pages.
-/// Only NVML and CUDA's driver are read here: no context is made.
+/// GPU `uuid`'s chunks, opened at its manager's first ask: created, exported and released with no
+/// CUDA context (a context costs VRAM, and keeps a laptop's GPU awake). None (a memory-log note
+/// says why) where its compute mode admits one process at a time, whose context TensorD's would
+/// lock out, or CUDA cannot share its pages. Only NVML and CUDA's driver are read here: no context
+/// is made.
 pub fn chunks(uuid: &str, log: &MemoryLog) -> Option<Opener> {
     let off = |why: String| log.note(serde_json::json!({"event": "leases_off", "gpu": uuid, "why": why}));
     match platform::gpu::Device::open(uuid).and_then(|device| device.exclusive()) {
@@ -408,7 +408,7 @@ pub fn chunks(uuid: &str, log: &MemoryLog) -> Option<Opener> {
         Err(error) => tracing::warn!("memory: GPU {uuid}'s compute mode is unread ({error}): CUDA decides"),
     }
     let ordinal = shareable(uuid).inspect_err(|why| off(why.clone())).ok()?;
-    Some(Box::new(move || CudaBackend::open(ordinal).map(|backend| Arc::new(backend) as Arc<dyn Backend>)))
+    Some(Box::new(move || CudaBackend::chunks(ordinal).map(|backend| Arc::new(backend) as Arc<dyn Backend>)))
 }
 
 /// The CUDA ordinal of GPU `uuid` in this process (neither NVML's index nor an executor's,
