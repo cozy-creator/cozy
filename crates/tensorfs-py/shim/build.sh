@@ -10,6 +10,6 @@ venv=$(mktemp -d)
 /opt/python/cp312-cp312/bin/python -m venv "$venv"
 "$venv/bin/pip" install -q --index-url https://download.pytorch.org/whl/cpu "torch==$torch"
 read -r site abi minor < <("$venv/bin/python" -c 'import os, torch; print(os.path.dirname(torch.__file__), int(torch._C._GLIBCXX_USE_CXX11_ABI), ".".join(torch.__version__.split(".")[:2]))')
-g++ -O2 -std=c++17 -shared -fPIC -D_GLIBCXX_USE_CXX11_ABI="$abi" -I"$site/include" shim/varena_torch.cpp \
+g++ -O2 -std=c++20 -shared -fPIC -D_GLIBCXX_USE_CXX11_ABI="$abi" -I"$site/include" shim/varena_torch.cpp \
     -L"$site/lib" -lc10 -Wl,--no-undefined -Wl,-rpath,'$ORIGIN/../torch/lib' -o python/tensorfs/_varena_torch.so
 printf '{"torch": "%s", "cxx11_abi": %s}\n' "$minor" "$abi" > python/tensorfs/_varena_torch.json
