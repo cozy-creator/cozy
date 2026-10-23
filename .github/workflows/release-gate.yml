@@ -42,6 +42,10 @@ on:
         description: "Start the baseline of a SKU that has none"
         type: boolean
         default: false
+      stress:
+        description: "Run the memory stress suite (release-gate/cells/stress.sh) whatever the selection says"
+        type: boolean
+        default: false
       publish:
         description: "Publish a PASS as the SKU's new baseline"
         type: boolean
@@ -61,6 +65,7 @@ on:
       skus: { type: string, default: '' }
       only: { type: string, default: '' }
       establish: { type: boolean, default: false }
+      stress: { type: boolean, default: false }
       publish: { type: boolean, default: true }
       nonce: { type: string, default: '' }
 run-name: release-gate ${{ inputs.cozy }} ${{ inputs.runtime_wheel }} ${{ inputs.tensorfs_wheel }} ${{ inputs.packages_ref }} ${{ inputs.nonce }}
@@ -74,6 +79,7 @@ jobs:
     outputs:
       skus: ${{ steps.select.outputs.skus }}
       only: ${{ steps.select.outputs.only }}
+      stress: ${{ steps.select.outputs.stress }}
     env:
       CHANGED: ${{ inputs.changed || (inputs.plan && format('cozy-creator {0}', github.sha)) || '' }}
     steps:
@@ -94,6 +100,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SKUS: ${{ inputs.skus }}
           ONLY: ${{ inputs.only }}
+          STRESS: ${{ inputs.stress }}
         run: |
           # ci/affected prints suites and pkg:<name> tokens (tracker design ci-v2, build contract). No answer: everything.
           words=gpu
@@ -118,6 +125,13 @@ jobs:
             only=$(printf '%s\n' $words | sed -n 's/^pkg://p' | paste -sd, -)
           fi
           echo "skus=$(printf '%s' "$skus" | jq -Rc 'split(",") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+          # stress: release-gate/cells/stress.sh on one consumer pod, and the product image cells on a real 8 GB card.
+          case " $(echo $words) " in *" stress "*) STRESS=true ;; esac
+          if [ "$STRESS" = true ]; then
+            eval "$(grep '^STRESS_' creator/release-gate/cells/stress.sh)"
+            skus=$(printf '%s\n' ${skus//,/ } "$STRESS_SKU" "$STRESS_REAL_SKU" | awk 'NF && !seen[$0]++' | paste -sd, -)
+          fi
+          echo "stress=${STRESS/false/}" >> "$GITHUB_OUTPUT"
           echo "only=$only" >> "$GITHUB_OUTPUT"
           echo "skus: ${skus:-none}; cells: ${only:-all}"
 
@@ -220,6 +234,7 @@ jobs:
         env:
           ARGS: ${{ steps.candidate.outputs.args }}
           ONLY: ${{ needs.select.outputs.only }}
+          STRESS: ${{ needs.select.outputs.stress }}
           ESTABLISH: ${{ inputs.establish }}
           PACKAGES: ${{ inputs.packages_ref != '' && 'packages' || '' }}
         run: |
@@ -227,6 +242,13 @@ jobs:
           [ -z "$ONLY" ] || args+=(--only "$ONLY")
           [ -z "$PACKAGES" ] || args+=(--packages "$PACKAGES")
           [ "$ESTABLISH" != true ] || args+=(--establish)
+          if [ -n "$STRESS" ]; then
+            eval "$(grep '^STRESS_' creator/release-gate/cells/stress.sh)"
+            case "${{ matrix.sku }}" in
+              "$STRESS_SKU") args+=(--cells "$PWD/creator/release-gate/cells/stress.sh") ;;
+              "$STRESS_REAL_SKU") args+=(--only "$STRESS_REAL_CELLS" --disk "$STRESS_REAL_DISK") ;;
+            esac
+          fi
           creator/release-gate/gate.sh "${{ matrix.sku }}" --out "$OUT" "${args[@]}"
       # gate.sh ends its rental in a trap; a cancelled job can skip it, so end it here too and say so.
       - if: always()

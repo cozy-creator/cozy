@@ -71,6 +71,7 @@ cell() {
   local name=$1 target=$2 p; shift 2
   p=${target%/*}; p=${p##*/}
   [ -z "$ONLY" ] || [[ $ONLY == *",$name,"* || $ONLY == *",$p,"* ]] || return 0
+  for p in "$@"; do [[ $p != prompt=* ]] || printf '%s\t%s\n' "$name" "${p#prompt=}" >> prompts.tsv; done  # quality.py
   "$CLI" run "$target" --on "$M" --json "$@" >"$name.ndjson" 2>"$name.err"
   local n; n=$(grep -o '"number":[0-9]*' "$name.ndjson" | head -1 | cut -d: -f2)
   [ -n "$n" ] && timeout 120 "$CLI" run show "$n" --json >"$name.json" 2>/dev/null
@@ -113,6 +114,7 @@ cell birefnet "$(pkg birefnet remove_background)" --asset image="$K"
 cell describer "$(pkg character-describer describe_character)" --asset image="$K"
 # More cells (`--cells FILE`): `name<TAB>target<TAB>args`, args expanded here ($SCENE, $CHAR, $R, $K, $M, $CLI ...).
 for f in "${EXTRA[@]}"; do
+  [[ $f == *.sh ]] && continue
   while IFS=$'\t' read -r name target args; do
     [ -n "$name" ] && [ "${name:0:1}" != "#" ] && eval "cell \"\$name\" \"\$target\" $args"
   done < "$f"
@@ -120,8 +122,11 @@ done
 # Second executor process: a GPU memory limit write restarts the machine, so every executor is new.
 [ -z "$ONLY" ] || [[ $ONLY == *",sdxl-p2,"* || $ONLY == *",sdxl,"* ]] && { "$CLI" machine update "$M" --gpu-memory-limit off -y >restart.log 2>&1; log "restarted $M: $(grep -E '^status' restart.log)"; }
 cell sdxl-p2 "$(pkg sdxl generate)" prompt="$OBJECT on a wooden table, product photo" seed:=$((R + 7))
+# A --cells FILE ending in .sh is sourced last, for cells that change the machine between them (cells/stress.sh).
+for f in "${EXTRA[@]}"; do [[ $f != *.sh ]] || . "$f"; done
 end_it
-uv run -q --no-project --with pillow --with numpy python -I "$HERE/analyze.py" "$OUT" "$SKU" "$B/gate-$SKU.json" | tee verdict.txt
+uv run -q --no-project --with pillow --with numpy --with torch --with transformers --index https://download.pytorch.org/whl/cpu \
+  --index-strategy unsafe-best-match python -I "$HERE/analyze.py" "$OUT" "$SKU" "$B/gate-$SKU.json" | tee verdict.txt
 [ "${PIPESTATUS[0]}" = 0 ] || exit 1
 # A PASS hands the next gate new references of the same shape: this Klein image and 3 s of this H3 video.
 if [ -z "$ONLY" ] && [ -n "$K" ] && [ -n "$CLIP" ]; then

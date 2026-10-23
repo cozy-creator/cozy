@@ -11,7 +11,9 @@ from PIL import Image
 out, sku, BASE = sys.argv[1].rstrip('/'), sys.argv[2], sys.argv[3]
 accept = '--accept' in sys.argv
 HERE = os.path.dirname(os.path.abspath(__file__))
-CHECKS = []
+sys.path.insert(0, HERE)
+import quality, stress  # noqa: E402
+CHECKS = [stress.check, quality.check]
 # Allowed rise over the worst known-good number, unless the good numbers' own spread is wider.
 SLACK = {'execution_ms': 0.25, 'step1_ms': 0.5, 'steady_ms': 0.10, 'peak_vram_mb': 0.10}
 # A step may cost at most 2x its reference plus 5 s: step 1 against step 2 (known-good fresh H3 executors 0.9-1.8x; the
