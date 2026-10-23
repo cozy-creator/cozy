@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use protocol::names::shown;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use protocol::{
     calcifer::{
@@ -444,8 +445,8 @@ impl View {
 
     fn line(&self, text: &str) {
         match &self.bar {
-            Some(bar) => bar.println(text),
-            None => anstream::eprintln!("{text}"),
+            Some(bar) => bar.println(shown(text)),
+            None => anstream::eprintln!("{}", shown(text)),
         }
     }
 
@@ -543,11 +544,11 @@ impl View {
         match &self.bar {
             Some(bar) => {
                 bar.set_length(0);
-                bar.set_message(text.to_owned());
+                bar.set_message(shown(text));
             }
             None if self.shown.0 != text => {
                 self.shown = (text.to_owned(), -1);
-                anstream::eprintln!("  {text}");
+                anstream::eprintln!("  {}", shown(text));
             }
             None => {}
         }
@@ -582,7 +583,7 @@ impl View {
         }
         match &self.bar {
             Some(bar) => {
-                bar.set_message(text);
+                bar.set_message(shown(&text));
                 if let Some(fraction) = fraction {
                     bar.set_length(1000);
                     bar.set_position((fraction.clamp(0.0, 1.0) * 1000.0) as u64);
@@ -592,7 +593,7 @@ impl View {
                 let tenth = fraction.map_or(-1, |f| (f * 10.0) as i64);
                 if self.shown.0 != progress.stage || tenth > self.shown.1 {
                     self.shown = (progress.stage.clone(), tenth);
-                    anstream::eprintln!("  {text}");
+                    anstream::eprintln!("  {}", shown(&text));
                 }
             }
         }

@@ -155,7 +155,7 @@ fn terms_bind_strictly_and_unknown_fields_only_warn() {
 fn the_grammar_refuses_what_it_cannot_run() {
     let Some(home) = Home::new() else { return };
     for (args, code, exit) in [
-        (&["run", "sdxl", "--json"][..], "target_malformed", 2),
+        (&["run", "fidika//generate", "--json"][..], "target_malformed", 2),
         (
             &["run", "fidika/sdxl/2.10.0/generate", "--json"],
             "target_malformed",

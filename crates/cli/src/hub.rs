@@ -217,6 +217,11 @@ fn remove(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
 }
 
 fn hubs_table(doc: &mut DocumentMut) -> &mut Table {
+    // `hubs = { … }`, an inline table, is the same Hubs: keep them (it was dropped on an add).
+    if let Some(inline) = doc.get_mut("hubs").and_then(Item::as_inline_table_mut) {
+        let table = std::mem::take(inline).into_table();
+        doc["hubs"] = Item::Table(table);
+    }
     if !doc.get("hubs").is_some_and(Item::is_table) {
         doc["hubs"] = Item::Table(Table::new());
     }

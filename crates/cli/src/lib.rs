@@ -50,7 +50,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run a function: `org/pkg/fn`, `./dir[/fn]` or `./script.py`.
+    /// Run a function: `pkg/fn` (first-party), `org/pkg/fn`, `./dir[/fn]` or `./script.py`.
     Run(run::Args),
     /// Local, rented and added machines.
     Machine(machine::Args),

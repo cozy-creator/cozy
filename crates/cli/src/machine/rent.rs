@@ -132,7 +132,7 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     output::next(
         ctx,
         &[
-            &format!("cozy run <org/package/function> --on {}", machine.name),
+            &format!("cozy run <[org/]package/function> --on {}", machine.name),
             &format!("cozy machine end {}", machine.name),
         ],
     );

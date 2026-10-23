@@ -214,7 +214,7 @@ async fn add(
     output::next(
         ctx,
         &[
-            &format!("cozy run <org/package/function> --on {}", added.name),
+            &format!("cozy run <[org/]package/function> --on {}", added.name),
             &format!("cozy machine show {}", added.name),
         ],
     );
