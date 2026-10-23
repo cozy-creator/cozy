@@ -720,7 +720,7 @@ impl Torch {
                 sh.alloc_in(&sh.arena(Owner::Pool(p)), size, stream, true)
             }
             None => {
-                sh.begun();
+                sh.begun(stream);
                 sh.alloc_in(&sh.routed(), size, stream, sh.capturing())
             }
         }
@@ -728,7 +728,7 @@ impl Torch {
 
     /// Never fails and never waits on the device; a pointer no arena holds is logged.
     pub fn free(&self, ptr: u64, bytes: u64, stream: usize) {
-        self.sh.begun();
+        self.sh.begun(stream);
         let Some(a) = self.sh.owner_of(ptr) else {
             tracing::error!("varena: torch freed {ptr:#x} ({bytes} bytes, stream {stream:#x}), which no arena holds");
             return;
@@ -752,10 +752,10 @@ impl Torch {
     }
 
     /// torch's begin-allocate-to-pool hook, on the capturing thread before its capture starts on
-    /// `stream` (the thread's current stream): one more use of `pool`, and this thread is served
-    /// from mapped free bytes until its end. Every epoch pending is recorded now, while nothing
-    /// captures yet.
-    pub fn pool_begin(&self, pool: PoolId, stream: usize) {
+    /// `stream` (the thread's current stream, when the caller knows it): one more use of `pool`,
+    /// and this thread is served from mapped free bytes until its end. Every epoch pending is
+    /// recorded now, while nothing captures yet.
+    pub fn pool_begin(&self, pool: PoolId, stream: Option<usize>) {
         let sh = &self.sh;
         let me = std::thread::current().id();
         let clocks: Vec<Arc<Clock>> = sh.clocks.read().values().cloned().collect();
@@ -764,7 +764,7 @@ impl Torch {
             let mut caps = sh.capturers.lock();
             // A capture this thread left open died (torch never ended it): this one replaces it.
             caps.retain(|c| !(c.thread == me && c.pool == pool));
-            caps.push(Capture { thread: me, pool, streams: vec![stream], seen: false });
+            caps.push(Capture { thread: me, pool, streams: stream.into_iter().collect(), seen: false });
             sh.captures.store(caps.len() as u32, SeqCst);
             drop(caps);
             clocks.iter().for_each(|c| sh.record(c));
@@ -986,22 +986,28 @@ impl Shared {
         }
     }
 
-    /// This thread's first allocator call since its capture's begin: the capture began (seen), or
-    /// its begin threw, and it is ended. No lock held across the driver call.
-    fn begun(&self) {
+    /// This thread's allocator call on `on` while its capture is unseen. With the capture's stream
+    /// known: capturing, it began (seen); not, its begin threw, and it is ended. With none known:
+    /// `on` capturing names it. No lock held across the driver calls.
+    fn begun(&self, on: usize) {
         if self.captures.load(SeqCst) == 0 {
             return;
         }
         let me = std::thread::current().id();
-        let unseen: Vec<(PoolId, usize)> = self.capturers.lock().iter().filter(|c| c.thread == me && !c.seen).filter_map(|c| c.streams.first().map(|s| (c.pool, *s))).collect();
-        for (pool, stream) in unseen {
-            match self.backend.capturing(stream) {
-                Ok(true) => self.capturers.lock().iter_mut().filter(|c| c.thread == me && c.pool == pool).for_each(|c| c.seen = true),
-                Ok(false) => {
+        let unseen: Vec<(PoolId, Option<usize>)> = self.capturers.lock().iter().filter(|c| c.thread == me && !c.seen).map(|c| (c.pool, c.streams.first().copied())).collect();
+        let mine = |c: &Capture, pool: PoolId| c.thread == me && c.pool == pool;
+        for (pool, known) in unseen {
+            match (known, self.backend.capturing(known.unwrap_or(on))) {
+                (Some(_), Ok(true)) => self.capturers.lock().iter_mut().filter(|c| mine(c, pool)).for_each(|c| c.seen = true),
+                (None, Ok(true)) => self.capturers.lock().iter_mut().filter(|c| mine(c, pool)).for_each(|c| {
+                    c.seen = true;
+                    c.streams.push(on);
+                }),
+                (Some(stream), Ok(false)) => {
                     tracing::warn!("varena: pool {pool:?}'s capture never began on stream {stream:#x}: ended");
-                    self.end_capture(|c| c.thread == me && c.pool == pool && !c.seen, |_| false);
+                    self.end_capture(|c| mine(c, pool) && !c.seen, |_| false);
                 }
-                Err(_) => {}
+                _ => {}
             }
         }
     }
