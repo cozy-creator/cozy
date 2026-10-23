@@ -120,6 +120,18 @@ impl Events {
         }
     }
 
+    /// Whether the log of calls satisfies `until` within `limit` (hang protection only).
+    fn log_within(&self, limit: std::time::Duration, until: impl Fn(&[&'static str]) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        let mut log = self.kept.lock();
+        while !until(&log) {
+            if self.logged.wait_until(&mut log, deadline).timed_out() {
+                return until(&log);
+            }
+        }
+        true
+    }
+
     /// Blocks until varena retires `event`.
     fn await_retired(&self, event: u64) {
         let mut retired = self.retired.lock();
@@ -1097,6 +1109,31 @@ fn an_idle_gpu_load_returns_with_its_pages_kept() {
     events.fences.lock().iter().for_each(|e| events.complete(*e));
     loader.join().unwrap();
     assert_eq!(exports(), 1, "the load returns with its page custody's");
+}
+
+/// A page whose copy is still landing when the last request ends is kept once the copy lands,
+/// with no further call: the trim thread finishes the Keep, so an idle process killed later
+/// leaves it to custody.
+#[test]
+fn a_keep_pending_at_the_last_requests_end_is_made_with_no_further_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("trimkeep-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 64 << 20 };
+    let _scope = Scope::new(&g.uuid);
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    let exports = || events.kept.lock().iter().filter(|c| **c == "export").count();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["p".into()], passes: 1 }] }).unwrap();
+    events.pending_fences.store(true, Ordering::SeqCst);
+    mem.load(stored(dir.path(), &uuid, "p", 1), Level::Gpu).unwrap();
+    r.end();
+    // Its Keep waits on the landing copy (the trim thread's host wait); nothing is kept yet.
+    assert!(events.log_within(std::time::Duration::from_secs(10), |log| log.contains(&"finish")), "nothing waits on the pending copy");
+    assert_eq!(exports(), 0, "kept before its copy landed");
+    events.fences.lock().iter().for_each(|e| events.complete(*e));
+    let kept = events.log_within(std::time::Duration::from_secs(10), |log| log.contains(&"export"));
+    drop(mem);
+    assert!(kept, "the page was not kept with no further call");
 }
 
 /// Review 5, R1 and R3 (the reviewer's probe, event-driven): a Keep queued behind slow
