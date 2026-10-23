@@ -14,7 +14,9 @@ First, the compiled `tensorfs._ext.varena` matches its stub name for name.
 
     python scripts/varena-standalone.py
 Runs on the CPU over host pages (each run names its own tables), or on GPU 0 when one is visible:
-its capacity is lowered by the standalone limit, and the uncapped GPU run is the reference.
+its capacity is lowered by the standalone limit, and the uncapped GPU run is the reference. A
+CUDA Memory is torch's allocator for its process's life, so on a GPU each phase runs in a
+process of its own.
 """
 
 from __future__ import annotations
@@ -291,8 +293,8 @@ def child(store: str, table: str, capacity: int, reference: str) -> int:
 
 def gone(memory: weakref.ref[Memory], phase: str) -> None:
     """One Memory per device in a process: a phase's goes before the next opens. A CUDA
-    device's is torch's allocator and lives as long as the process: no request's arena is
-    left open."""
+    device's is torch's allocator and lives as long as its process (one per phase): no
+    request's arena is left open."""
     gc.collect()
     if CUDA:
         torch._C._cuda_clearCublasWorkspaces()
@@ -641,32 +643,68 @@ def baked(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, capa
     return weakref.ref(mem)
 
 
+PHASES = ("ample", "overhead", "held caches", "two processes", "short", "fill")
+
+
+def phase(name: str, state: dict[str, object], plain: UNet2DConditionModel, ck: tensorfs.Checkpoint) -> weakref.ref[Memory]:
+    """One phase, from what the phases before it measured (`state`), adding its own."""
+    store, tag = Path(state["store"]), state["tag"]
+    if name == "ample":
+        state["reference"], state["spans"], state["room"], state["base"], memory = ample(ck, plain, tag)
+        return memory
+    if name == "overhead":
+        return overhead(ck, plain, tag)
+    if name == "held caches":
+        return held_caches(tag)
+    spans, base, reference = state["spans"], state["base"], state["reference"]
+    if name == "two processes":
+        # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.
+        capacity = base * (2 if CUDA else 1) + sum(spans) * 3 // 2 + state["room"]
+        state["w"], memory = two(ck, store, f"{tag}-two", capacity, reference)
+        return memory
+    # One block below the working set varena measured: it must stream, with room to spare for
+    # what streaming needs (the pass's room, common and its slots).
+    capacity = base + state["w"] - max(sorted(spans[1:]))
+    if name == "short":
+        ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
+        return capped(ck, plain, f"{tag}-short", capacity, base, spans, reference, ceiling)
+    return baked(ck, plain, f"{tag}-fill", capacity)
+
+
+def phase_process(name: str, saved: str) -> int:
+    """A phase in a process of its own (CUDA): its state in and out through `saved`."""
+    state = torch.load(saved, weights_only=False)
+    plain, ck = build(Path(state["store"]))
+    gone(phase(name, state, plain, ck), name)
+    torch.save(state, saved)
+    print(f"{sum(results)}/{len(results)} checks passed ({name})", flush=True)
+    return 0 if all(results) else 1
+
+
 def main() -> int:
     stub_matches()
     shim()
     store = Path(tempfile.mkdtemp(prefix="varena-standalone-")) / "store"
-    plain, ck = build(store)
-    tag = f"varena-standalone-{os.getpid()}"
-    reference, spans, room, base, memory = ample(ck, plain, tag)
-    gone(memory, "ample")
-    if not CUDA:
-        gone(overhead(ck, plain, tag), "overhead")
-    gone(held_caches(tag), "held caches")
-    ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
-    blocks = sorted(spans[1:])
-    # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.
-    capacity = base * (2 if CUDA else 1) + sum(spans) * 3 // 2 + room
-    w, memory = two(ck, store, f"{tag}-two", capacity, reference)
-    gone(memory, "two processes")
-    # One block below the working set varena measured: it must stream, with room to spare for
-    # what streaming needs (the pass's room, common and its slots).
-    capacity = base + w - max(blocks)
-    gone(capped(ck, plain, f"{tag}-short", capacity, base, spans, reference, ceiling), "short")
-    gone(baked(ck, plain, f"{tag}-fill", capacity), "fill")
+    state: dict[str, object] = {"store": str(store), "tag": f"varena-standalone-{os.getpid()}"}
+    phases = [p for p in PHASES if not (CUDA and p == "overhead")]
+    if CUDA:
+        saved = store.parent / "state.pt"
+        torch.save(state, saved)
+        for name in phases:
+            done = subprocess.run([sys.executable, __file__, "phase", name, str(saved)])
+            check(f"{name}: its process passes", done.returncode == 0, done.returncode)
+            if done.returncode != 0:
+                break
+    else:
+        plain, ck = build(store)
+        for name in phases:
+            gone(phase(name, state, plain, ck), name)
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
 
 
 if __name__ == "__main__":
     threading.Thread(target=watch, daemon=True).start()
-    sys.exit(child(*sys.argv[2:4], int(sys.argv[4]), sys.argv[5]) if sys.argv[1:2] == ["child"] else main())
+    if sys.argv[1:2] == ["child"]:
+        sys.exit(child(*sys.argv[2:4], int(sys.argv[4]), sys.argv[5]))
+    sys.exit(phase_process(*sys.argv[2:4]) if sys.argv[1:2] == ["phase"] else main())
