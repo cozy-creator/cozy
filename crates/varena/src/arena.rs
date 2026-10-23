@@ -331,7 +331,7 @@ impl State {
         }
         let Some(span) = self.spans.get_mut(&b.span) else { return Freed::Unknown };
         span.live = span.live.saturating_sub(1);
-        let (stream, tier, whole) = (span.stream(), span.tier, span.live == 0);
+        let (stream, tier, whole, evicted) = (span.stream(), span.tier, span.live == 0, span.chunks.is_empty());
         let (mut base, mut len) = (at, b.len);
         if let Some(next) = self.blocks.get(&(at + b.len)).copied().filter(|n| n.free && n.span == b.span) {
             self.free.remove(&(stream, tier, next.len, at + b.len));
@@ -347,7 +347,10 @@ impl State {
             }
         }
         self.blocks.insert(base, Block { len, span: b.span, free: true });
-        self.free.insert((stream, tier, len, base));
+        // An evicted span's runs stay out of the free list until it is resident again.
+        if !evicted {
+            self.free.insert((stream, tier, len, base));
+        }
         if whole { Freed::Whole(b.span) } else { Freed::Kept }
     }
 
@@ -398,7 +401,7 @@ impl State {
             }
             return Some((self.unfit(at), size));
         }
-        if was_full {
+        if was_full && !self.blocks.get(&at).and_then(|b| self.spans.get(&b.span)).is_some_and(|s| s.chunks.is_empty()) {
             self.open.entry(key).or_default().push(at);
         }
         Some((Freed::Kept, size))

@@ -100,7 +100,10 @@ impl Torch {
                 let mut st = a.st.lock();
                 let Some(span) = st.spans.get_mut(&base) else { continue };
                 let chunks = std::mem::take(&mut span.chunks);
-                st.mapped = st.mapped.saturating_sub(len);
+                if !chunks.is_empty() {
+                    st.mapped = st.mapped.saturating_sub(len);
+                    st.hide(base);
+                }
                 chunks
             };
             if chunks.is_empty() {
@@ -152,6 +155,7 @@ impl Torch {
                 };
                 span.chunks = chunks;
                 st.mapped += len;
+                st.show(base);
                 sh.mapped.fetch_add(len, AcqRel);
             }
             if let Some(f) = swap.as_mut() {
@@ -180,6 +184,40 @@ impl Torch {
         let mut st = a.st.lock();
         let gone: Vec<u64> = st.spans.iter().filter(|(_, s)| s.chunks.is_empty() && s.live == 0).map(|(b, _)| *b).collect();
         gone.into_iter().for_each(|b| self.sh.unreserve(&mut st, b));
+    }
+}
+
+impl State {
+    /// An evicted span's free runs and open slot pages leave the free lists: nothing is carved there
+    /// (its frees keep them out: [`State::unfit`], [`State::unslot`]).
+    fn hide(&mut self, base: u64) {
+        let Some((stream, tier, end)) = self.spans.get(&base).map(|s| (s.stream(), s.tier, base + s.len)) else { return };
+        let runs: Vec<(u64, u64)> = self.blocks.range(base..end).filter(|(_, b)| b.free && b.span == base).map(|(at, b)| (*at, b.len)).collect();
+        runs.into_iter().for_each(|(at, len)| {
+            self.free.remove(&(stream, tier, len, at));
+        });
+        let pages: Vec<(u64, (usize, usize))> = self.pages.range(base..end).map(|(at, p)| (*at, (p.stream, p.class))).collect();
+        for (at, key) in pages {
+            if let Some(v) = self.open.get_mut(&key) {
+                v.retain(|p| *p != at);
+            }
+        }
+    }
+
+    /// A span resident again: its free runs and slot pages with a free slot are carved from again.
+    fn show(&mut self, base: u64) {
+        let Some((stream, tier, end)) = self.spans.get(&base).map(|s| (s.stream(), s.tier, base + s.len)) else { return };
+        let runs: Vec<(u64, u64)> = self.blocks.range(base..end).filter(|(_, b)| b.free && b.span == base).map(|(at, b)| (*at, b.len)).collect();
+        runs.into_iter().for_each(|(at, len)| {
+            self.free.insert((stream, tier, len, at));
+        });
+        let pages: Vec<(u64, (usize, usize))> = self.pages.range(base..end).filter(|(_, p)| p.free != 0).map(|(at, p)| (*at, (p.stream, p.class))).collect();
+        for (at, key) in pages {
+            let v = self.open.entry(key).or_default();
+            if !v.contains(&at) {
+                v.push(at);
+            }
+        }
     }
 }
 

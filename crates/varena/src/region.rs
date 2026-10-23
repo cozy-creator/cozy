@@ -616,7 +616,8 @@ impl Memory {
             .lock()
             .iter()
             .filter_map(|(id, l)| match l {
-                Live::Cache(w) => w.upgrade().filter(|s| s.memory.same(self) && s.res.lock().pins > 0).map(|_| *id),
+                // Locked (a pin making it resident, a reclaim): not cold either way.
+                Live::Cache(w) => w.upgrade().filter(|s| s.memory.same(self) && s.res.try_lock().is_none_or(|r| r.pins > 0)).map(|_| *id),
                 Live::Graph(_) => None,
             })
             .collect();
