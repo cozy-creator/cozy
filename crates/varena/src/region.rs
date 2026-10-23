@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -54,7 +53,7 @@ pub struct Record {
     pub slots: Vec<u32>,
     /// Its measured production (or capture) time.
     pub cost_ns: u64,
-    /// Its last unpin, in ns since the process's first region.
+    /// Its last use, CLOCK_MONOTONIC ns (machine-wide).
     pub last_use: u64,
     /// Its advice: the plan step of its next use.
     pub next_use: Option<u32>,
@@ -98,9 +97,16 @@ impl Live {
 /// Every live region of the process: the manager's Reclaim finds its victim here.
 static LIVE: Mutex<BTreeMap<u64, Live>> = Mutex::new(BTreeMap::new());
 
+/// The machine-wide clock the manager ranks regions by (CLOCK_MONOTONIC ns); elsewhere, this
+/// process's own.
 fn now_ns() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    #[cfg(unix)]
+    return crate::memory::monotonic_ns();
+    #[cfg(not(unix))]
+    {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
 }
 
 /// A reclaim deferred by a pin runs here at the last unpin: never on the unpinning thread, which

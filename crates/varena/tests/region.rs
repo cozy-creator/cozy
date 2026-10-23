@@ -52,6 +52,7 @@ struct Shared(Arc<Dev>);
 
 impl Backend for Shared {
     fn capacity(&self) -> u64 { self.0.host.capacity() }
+    fn headroom(&self) -> u64 { self.0.host.headroom() }
     fn free(&self) -> varena::Result<u64> { self.0.host.free() }
     fn process_used(&self) -> varena::Result<u64> { self.0.host.process_used() }
     fn opened_context(&self) -> u64 { 0 }

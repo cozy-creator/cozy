@@ -4227,7 +4227,7 @@ impl Drop for Pass {
 
 /// CLOCK_MONOTONIC in nanoseconds: one clock for every process on the machine.
 #[cfg(unix)]
-fn monotonic_ns() -> u64 {
+pub(crate) fn monotonic_ns() -> u64 {
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: a valid clock id and a writable timespec.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
