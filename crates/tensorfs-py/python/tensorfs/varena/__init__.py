@@ -25,6 +25,7 @@ from .._ext.varena import (
     StepStats,
     VarenaError,
     Window,
+    Yielded,
     pins_held,
 )
 
@@ -52,5 +53,6 @@ __all__ = [
     "StepStats",
     "VarenaError",
     "Window",
+    "Yielded",
     "pins_held",
 ]

@@ -882,6 +882,16 @@ class Request:
         """Replaces the plan (as `Memory.request` takes it); its cursor starts over."""
         self.native.plan(self.memory._plan(steps))
 
+    @contextmanager
+    def yielding(self) -> Iterator[None]:
+        """Around a wait on a child call (a call this request made and awaits): its step's pages
+        are a later use, taken before the child's own."""
+        yielded = self.native.yielding()
+        try:
+            yield
+        finally:
+            yielded.end()
+
     def reset_peak(self) -> int:
         """Its torch arena's high-water since the last call or the pass's start, restarting
         here: a section's peak (a split's window). The pass's own peak still covers it."""

@@ -588,6 +588,14 @@ impl PyRequest {
         done(py, &self.gpu, || r.plan(steps(plan)))
     }
 
+    /// The request waits on a child call until the guard ends: its step's pages are a later use,
+    /// taken before the child's own.
+    fn yielding(&self, py: Python<'_>) -> PyResult<PyYielded> {
+        let r = self.get(py)?;
+        let y = detached(py, &self.gpu, || Ok(r.yielding()))?;
+        Ok(PyYielded { yielded: Mutex::new(Some(y)), gpu: self.gpu.clone() })
+    }
+
     /// Its torch arena's high-water since the last call or pass start, which restarts here (a
     /// section of a pass, such as a split's window); the pass's own peak still covers it.
     fn reset_peak(&self, py: Python<'_>) -> PyResult<u64> {
@@ -619,6 +627,21 @@ impl PyRequest {
                 Err(error(py, &self.gpu, Error::Invalid("a call is still running in the request".into())))
             }
         }
+    }
+}
+
+/// A request waiting on a child call (`Request.yielding`); `end` ends the wait.
+#[pyclass(name = "Yielded", module = "tensorfs.varena", frozen)]
+pub struct PyYielded {
+    yielded: Mutex<Option<varena::Yielded>>,
+    gpu: String,
+}
+
+#[pymethods]
+impl PyYielded {
+    fn end(&self, py: Python<'_>) -> PyResult<()> {
+        let Some(y) = lock(&self.yielded).take() else { return Ok(()) };
+        detached(py, &self.gpu, || y.end())
     }
 }
 
@@ -1046,6 +1069,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRequest>()?;
     m.add_class::<PyAllocating>()?;
     m.add_class::<PyRegion>()?;
+    m.add_class::<PyYielded>()?;
     m.add_class::<PyRegionPin>()?;
     m.add_class::<PyGraphRegion>()?;
     m.add_class::<PyPass>()?;
