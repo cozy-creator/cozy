@@ -2096,7 +2096,7 @@
           },
           "dev": {
             "type": "boolean",
-            "description": "Its binary arrived by a dev update (`cozy machine update --tensord`), not a release.",
+            "description": "Its binary arrived by a dev update (`cozy machine update --tensord <path>`), not a release.",
             "default": false
           },
           "disk": {

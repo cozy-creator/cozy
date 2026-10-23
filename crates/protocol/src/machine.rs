@@ -673,7 +673,7 @@ pub struct StatusFrame {
     pub version: String,
     /// The commit its `cozy` binary was built from.
     pub commit: String,
-    /// Its binary arrived by a dev update (`cozy machine update --tensord`), not a release.
+    /// Its binary arrived by a dev update (`cozy machine update --tensord <path>`), not a release.
     pub dev: bool,
     pub capabilities: Vec<String>,
     /// The sealed readiness envelope (base64); empty until sealed.

@@ -2,7 +2,7 @@ name: dev-build
 # Builds release artifacts for any ref, off the dev box:
 #   gh workflow run dev-build.yaml -R cozy-creator/cozy-creator -f ref=<sha> -f build=cozy,tensord,tensorfs
 # Artifacts: tensord-<sha> (the runner arch's manylinux tensord that Runtime's wheel bundles),
-# cozy-<sha> (the runner arch's dev `cozy`, <version>+dev.g<sha8>, which `cozy machine update --tensord`
+# cozy-<sha> (the runner arch's dev `cozy`, <version>+dev.g<sha8>, which `cozy machine update --tensord <path>`
 # runs on any machine: `ghbuild.sh cozy <ref> cozy`, `-r ubuntu-24.04-arm` for arm64) and
 # tensorfs-wheel-<sha> (the manylinux x86_64 wheel). The cozy binary's release archives are dist's
 # (release.yml).
@@ -77,7 +77,7 @@ jobs:
           path: dist/tensord/tensord-linux-*
           if-no-files-found: error
           retention-days: 7
-      # The dev `cozy` a machine runs (`cozy machine update --tensord`): dist's manylinux_2_28 build, so
+      # The dev `cozy` a machine runs (`cozy machine update --tensord <path>`): dist's manylinux_2_28 build, so
       # it runs on every pod, stamped <version>+dev.g<sha8> with its commit.
       - name: Build the dev cozy
         if: contains(inputs.build, 'cozy')

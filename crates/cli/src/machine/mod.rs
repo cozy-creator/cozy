@@ -65,23 +65,25 @@ enum Verb {
     },
     /// Reset a rental's 15-minute idle clock once.
     Keepalive { name: String },
-    /// Update a machine to its Hub's target software, or to named wheels, as a run.
+    /// Update a machine's Runtime, TensorFS and TensorD in one run and one restart: to the Hub's
+    /// target, or to the versions or local builds named.
     Update {
         name: String,
-        /// Install this cozy-runtime wheel instead of the Hub's target: a local file, or
-        /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself. Alone, the machine
-        /// keeps its tensorfs when the wheel accepts it, else installs PyPI's newest that it does.
-        #[arg(long, value_name = "FILE|URL")]
-        runtime_wheel: Option<std::path::PathBuf>,
-        /// Install this tensorfs wheel instead of the Hub's target: a local file, or
-        /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself.
-        #[arg(long, value_name = "FILE|URL")]
-        tensorfs_wheel: Option<std::path::PathBuf>,
-        /// Run this dev `cozy` binary as the machine (dev-build `build=cozy`): a local file, or
-        /// https://…#sha256=<hex>. The machine checks it runs there before its accepted runs drain;
-        /// on `local` it becomes this computer's cozy, which `cozy update` returns to a release.
-        #[arg(long, value_name = "FILE|URL")]
-        tensord: Option<std::path::PathBuf>,
+        /// The Runtime: a release (`0.30.16`) the machine fetches from PyPI, or a local wheel or
+        /// project to build, sent from here (dev). Alone, the machine keeps its TensorFS when the
+        /// Runtime accepts it, else installs PyPI's newest that it does.
+        #[arg(long, value_name = "VERSION|PATH")]
+        runtime: Option<String>,
+        /// TensorFS: a release (`0.13.13`) the machine fetches from PyPI, or a local wheel or
+        /// project to build, sent from here (dev).
+        #[arg(long, value_name = "VERSION|PATH")]
+        tensorfs: Option<String>,
+        /// TensorD, the machine's `cozy` binary: a release (`0.11.14`) the machine fetches from
+        /// its GitHub release, or a local binary or cozy-creator checkout to build, sent from
+        /// here (dev). On `local` a dev build becomes this computer's cozy, which `cozy update`
+        /// returns to a release.
+        #[arg(long, value_name = "VERSION|PATH")]
+        tensord: Option<String>,
         /// Use at most this much of each GPU's memory (`8GiB`), as a smaller card would; `off`
         /// lifts it. The machine keeps it in its config, across updates and restarts.
         #[arg(long, value_name = "SIZE|off", value_parser = gpu_memory_limit)]
@@ -134,11 +136,11 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         } => add(ctx, name, address, fingerprint).await,
         Verb::Update {
             name,
-            runtime_wheel,
-            tensorfs_wheel,
+            runtime,
+            tensorfs,
             tensord,
             gpu_memory_limit,
-        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel, tensord, gpu_memory_limit).await,
+        } => end::update(ctx, &name, runtime, tensorfs, tensord, gpu_memory_limit).await,
         Verb::Toolchain {
             verb: ToolchainVerb::Install { on },
         } => end::toolchain(ctx, &on).await,

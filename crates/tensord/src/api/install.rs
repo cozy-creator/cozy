@@ -26,7 +26,7 @@ pub struct InstallerConfig {
     pub staging_root: PathBuf,
     /// The machine's own Runtime/TensorFS wheels: a local package runs this pair too.
     pub sdk: Vec<PathBuf>,
-    /// The development Runtime an update named (`--runtime-wheel`, `PackageSdk::runtime_build`):
+    /// The development Runtime an update named (`--runtime <path>`, `PackageSdk::runtime_build`):
     /// it runs a local package whatever the package's own bounds on the pair, as a release.
     pub runtime_build: String,
     /// The machine's uv (`machine::client::uv`): the helper runs it, whatever PATH the machine had.

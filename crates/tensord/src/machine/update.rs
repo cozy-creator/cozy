@@ -105,6 +105,8 @@ impl Status {
     }
 }
 
+/// What an update installs of one component: a release `version` the machine fetches (PyPI's
+/// wheel; for `cozy`, its GitHub release), or a dev build the caller staged (`file`, `sha256`).
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Choice {
     #[serde(default)]
@@ -113,40 +115,6 @@ pub struct Choice {
     pub sha256: String,
     #[serde(default)]
     pub version: String,
-    /// Where the machine fetches `file` itself, held to `sha256`.
-    #[serde(default)]
-    pub url: String,
-}
-
-impl Choice {
-    /// `distribution`'s wheel at an https `url`, held to `sha256`: the machine fetches it.
-    pub fn fetched(distribution: &str, url: &str, sha256: &str) -> Result<Choice, String> {
-        let path = url.strip_prefix("https://").map(|rest| rest.split(['?', '#']).next().unwrap_or_default());
-        let file = path.and_then(|p| p.split_once('/')).and_then(|(_, p)| p.rsplit('/').next()).unwrap_or_default();
-        if path.is_none() {
-            return Err(format!("{url} is not an https URL"));
-        }
-        if wheel_name(file).is_none_or(|(d, _)| d != distribution) {
-            return Err(format!("{url} names no {distribution} wheel ({distribution}-<version>-….whl)"));
-        }
-        let sha256 = sha256.to_ascii_lowercase();
-        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!("{file}'s sha256 is 64 hex digits, not {sha256:?}"));
-        }
-        Ok(Choice { file: file.into(), sha256, url: url.into(), ..Default::default() })
-    }
-
-    /// A `cozy` binary at an https `url`, held to `sha256`: the machine fetches it.
-    pub fn binary_at(url: &str, sha256: &str) -> Result<Choice, String> {
-        let sha256 = sha256.to_ascii_lowercase();
-        if !url.starts_with("https://") {
-            return Err(format!("{url} is not an https URL"));
-        }
-        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!("the binary's sha256 is 64 hex digits, not {sha256:?}"));
-        }
-        Ok(Choice { file: BINARY.into(), sha256, url: url.into(), ..Default::default() })
-    }
 }
 
 /// An update failure with its own reason code.
@@ -177,7 +145,8 @@ pub struct Request {
     /// the drain and read at the restart the update ends with.
     #[serde(default)]
     pub gpu_memory_limit: Option<u64>,
-    /// A dev `cozy` binary to run (`cozy machine update --tensord`), staged or fetched like a wheel.
+    /// The `cozy` binary to run (`cozy machine update --tensord`): a release it fetches, or a
+    /// staged dev build, like a wheel.
     #[serde(default)]
     pub binary: Option<Choice>,
     /// Install the build toolchain (`super::toolchain`) instead of a software pair.
@@ -203,7 +172,10 @@ struct Pending {
 struct Binary {
     launch: PathBuf,
     version: String,
-    dev: Option<PathBuf>,
+    /// The binary to put at the launch path; None when `cozy update` already renamed it there.
+    staged: Option<PathBuf>,
+    /// A dev build the caller staged, not a release.
+    dev: bool,
 }
 
 /// In the engine directory while a committed dev binary runs.
@@ -807,8 +779,8 @@ impl Updates {
             let _ = fs::remove_dir_all(candidate);
         }
         let (to, _activation) = prepared?;
-        let dev = binary.as_ref().and_then(|b| b.dev.as_ref());
-        if let (Some(b), Some(_)) = (&binary, dev) {
+        let staged = binary.as_ref().and_then(|b| b.staged.as_ref());
+        if let (Some(b), Some(_)) = (&binary, staged) {
             // Kept before the record names it: a rollback renames `.cozy-previous` back.
             super::binary::keep(&b.launch, !self.dev())?;
         }
@@ -816,11 +788,11 @@ impl Updates {
             status: self.status.lock().unwrap().clone().unwrap_or_default(),
             sdk_before: previous_link(&self.paths.current_sdk_link())?,
             binary: binary.as_ref().map(|b| b.launch.clone()),
-            dev: dev.is_some(),
+            dev: binary.as_ref().is_some_and(|b| b.dev),
         };
         let publication = (|| {
             write_json(&self.paths.update("pending.json"), &pending)?;
-            if let Some(staged) = dev {
+            if let Some(staged) = staged {
                 super::binary::swap(staged)?;
             }
             if let Some(candidate) = &candidate {
@@ -859,7 +831,7 @@ impl Updates {
     fn binary(&self, request: &Request) -> io::Result<Option<Binary>> {
         let coded = |code, message| io::Error::other(Coded { code, message });
         if let Some(choice) = &request.binary {
-            return self.dev_binary(request, choice).map(Some);
+            return self.staged_binary(request, choice).map(Some);
         }
         let Some(launch) = super::binary::launch().filter(|l| l.swapped()) else {
             return match &request.cozy {
@@ -881,12 +853,13 @@ impl Updates {
                 format!("{} is missing: nothing to roll back to", previous.display()),
             ));
         }
-        Ok(Some(Binary { launch: launch.path.clone(), version, dev: None }))
+        Ok(Some(Binary { launch: launch.path.clone(), version, staged: None, dev: false }))
     }
 
-    /// A dev binary: fetched or staged and digest-checked, then refused before anything drains
-    /// unless this machine runs it (`super::binary::check`) and it is the release `cozy` names.
-    fn dev_binary(&self, request: &Request, choice: &Choice) -> io::Result<Binary> {
+    /// A release the machine fetches, or a dev binary the caller staged, digest-checked; then
+    /// refused before anything drains unless this machine runs it (`super::binary::check`) and it
+    /// is the release named.
+    fn staged_binary(&self, request: &Request, choice: &Choice) -> io::Result<Binary> {
         let coded = |code, message| io::Error::other(Coded { code, message });
         let launch = super::binary::launch()
             .ok_or_else(|| coded("binary_unsupported", "this machine was not started from a cozy binary".into()))?;
@@ -901,10 +874,11 @@ impl Updates {
         #[cfg(unix)]
         fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
         let version = super::binary::check(&staged).map_err(|why| coded("binary_incompatible", why))?;
-        if let Some(named) = request.cozy.as_ref().filter(|named| **named != version) {
+        let named = request.cozy.as_ref().or((!choice.version.is_empty()).then_some(&choice.version));
+        if let Some(named) = named.filter(|named| **named != version) {
             return Err(coded("binary_mismatch", format!("the binary is cozy {version}, not {named}")));
         }
-        Ok(Binary { launch: launch.path.clone(), version, dev: Some(staged) })
+        Ok(Binary { launch: launch.path.clone(), version, staged: Some(staged), dev: choice.version.is_empty() })
     }
 
     /// Whether this machine runs a dev binary: one a committed dev update activated.
@@ -976,7 +950,7 @@ impl Updates {
 
     /// A Runtime named alone keeps the machine's TensorFS when the two resolve together, else takes
     /// the TensorFS uv resolves for the Runtime over the index, fetched from PyPI held to its digest.
-    /// One that resolves none names `--tensorfs-wheel`.
+    /// One that resolves none names `--tensorfs`.
     fn pair(&self, candidate: &Path, runtime: &Path) -> io::Result<()> {
         if let Ok(current) = existing_wheel(&self.paths.sdk(), "tensorfs") {
             if self.compile(&[runtime.to_owned(), current.clone()])?.is_ok() {
@@ -987,7 +961,7 @@ impl Updates {
         let unresolved = |why: String| {
             io::Error::other(Coded {
                 code: "tensorfs_unresolved",
-                message: format!("{name} resolves no TensorFS over the index ({why}); name one with --tensorfs-wheel"),
+                message: format!("{name} resolves no TensorFS over the index ({why}); name one with --tensorfs <version>"),
             })
         };
         let resolved = self.compile(&[runtime.to_owned()])?.map_err(unresolved)?;
@@ -1008,15 +982,9 @@ impl Updates {
         compile_sdk(&self.paths.uv, &self.python, &input, &stop, false)
     }
 
-    /// A {file, sha256} fetched from its url or staged, or a published {version} fetched from
-    /// PyPI, each with its digest checked.
+    /// A staged {file, sha256}, or a release {version} the machine fetches: a wheel from PyPI,
+    /// `cozy` from its GitHub release, each held to the digest its source publishes.
     fn resolve(&self, distribution: &str, choice: &Choice) -> io::Result<PathBuf> {
-        if !choice.url.is_empty() {
-            let machine = self.machine.as_ref().ok_or_else(|| invalid("this machine fetches no wheels"))?;
-            let stop = self.stop.lock().unwrap().clone();
-            let dir = self.paths.update("downloads");
-            return super::pypi::wheel_at(&choice.url, &choice.sha256, &choice.file, &dir, machine, &stop);
-        }
         if !choice.file.is_empty() {
             let path = self
                 .paths
@@ -1035,9 +1003,13 @@ impl Updates {
         if choice.version.is_empty() {
             return Err(invalid("a pair member names a staged file or a version"));
         }
-        let machine = self.machine.as_ref().ok_or_else(|| invalid("this machine fetches no published wheels"))?;
+        let machine = self.machine.as_ref().ok_or_else(|| invalid("this machine fetches no releases"))?;
         let stop = self.stop.lock().unwrap().clone();
-        super::pypi::wheel(distribution, &choice.version, &self.paths.uv, &self.python, &self.paths.update("downloads"), machine, &stop)
+        let downloads = self.paths.update("downloads");
+        match distribution {
+            "cozy" => super::release::cozy(&choice.version, &downloads, machine, &stop),
+            _ => super::pypi::wheel(distribution, &choice.version, &self.paths.uv, &self.python, &downloads, machine, &stop),
+        }
     }
 }
 

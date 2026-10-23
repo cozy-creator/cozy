@@ -52,9 +52,12 @@ enum Command {
         #[arg(long)]
         detach: bool,
     },
-    /// Move a machine's packages to their Hub's newest release: the named ones, else every one.
+    /// Move a machine's packages to a release, their Hub's newest unless named: the named ones,
+    /// else every one. A directory or script installs live, as `install` does.
     Update {
-        /// [org/]name; none updates every published package on the machine.
+        /// [org/]name[@release], a directory such as `.` or `./project`, or a PEP 723 `script.py`;
+        /// none moves every published package on the machine to its newest release.
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::local))]
         packages: Vec<String>,
         #[command(flatten)]
         placement: Placement,
@@ -115,7 +118,13 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Command::Update {
             packages,
             placement,
-        } => machine::update(ctx, &names(&packages)?, placement.on()).await,
+        } => {
+            let paths: Vec<PathBuf> = packages.iter().filter_map(|p| directory(p)).collect();
+            let named = (packages.iter().filter(|p| directory(p).is_none()))
+                .map(|text| PackageRef::parse(text).map(|r| (r.package(), r.release)))
+                .collect::<Result<Vec<_>, _>>()?;
+            machine::update(ctx, &named, &paths, placement.on()).await
+        }
         Command::Remove {
             packages,
             placement,
@@ -194,7 +203,7 @@ fn directory(text: &str) -> Option<PathBuf> {
     explicit.then(|| PathBuf::from(text))
 }
 
-/// Names for update and remove: `[org/]name` (or `local/name`), with no release.
+/// Names to remove: `[org/]name` (or `local/name`), with no release.
 fn names(texts: &[String]) -> Result<Vec<String>, Error> {
     texts
         .iter()
