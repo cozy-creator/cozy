@@ -48,9 +48,10 @@ fn capture_error(code: cuda::CUresult) -> bool {
     (900..=908).contains(&code)
 }
 
-/// The context is gone (varena's classification of sticky CUDA errors).
+/// The context is gone (varena's classification of sticky CUDA errors; 999 is CUDA's "unknown
+/// error", cr-215's).
 fn sticky(code: cuda::CUresult) -> bool {
-    matches!(code, 700 | 702 | 709 | 710 | 714..=719 | 721 | 911)
+    matches!(code, 700 | 702 | 709 | 710 | 714..=719 | 721 | 911 | 999)
 }
 
 /// This thread in relaxed capture mode until dropped (its previous mode then comes back).
