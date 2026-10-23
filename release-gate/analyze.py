@@ -71,7 +71,9 @@ for name, target, number in cells:
     p = os.path.join(out, name + '.json')
     rec = json.load(open(p)) if os.path.exists(p) else None
     if rec is None or rec.get('status') != 'completed':
-        fails.append(f'{name}: run {number} {rec and rec.get("status")} {(rec or {}).get("reason")}')
+        why = (rec or {}).get('reason')
+        why = f"{why.get('code')}: {why.get('message')}" if isinstance(why, dict) else why
+        fails.append(f'{name}: run {number} {rec and rec.get("status")} {why}')
         continue
     recs[name] = rec
     obs = observations(rec)
