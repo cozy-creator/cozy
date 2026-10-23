@@ -52,6 +52,7 @@ struct Shared(Arc<Dev>);
 
 impl Backend for Shared {
     fn capacity(&self) -> u64 { self.0.host.capacity() }
+    fn headroom(&self) -> u64 { self.0.host.headroom() }
     fn free(&self) -> varena::Result<u64> { self.0.host.free() }
     fn process_used(&self) -> varena::Result<u64> { self.0.host.process_used() }
     fn opened_context(&self) -> u64 { 0 }
@@ -106,8 +107,6 @@ fn open() -> (Memory, Arc<Dev>, String) {
     let uuid = format!("region{}-{}", std::process::id(), OPENS.fetch_add(1, SeqCst));
     let g = varena::GpuId { uuid: uuid.clone(), model: "host".into(), memory: card };
     assert!(varena::os::namespace(&format!("test{}-", std::process::id())));
-    let ledger = varena::Ledger::create(&g, None).unwrap();
-    std::mem::forget(ledger);
     let dev = Arc::new(Dev {
         host: HostBackend::new(card),
         instant: AtomicBool::new(true),
@@ -118,7 +117,7 @@ fn open() -> (Memory, Arc<Dev>, String) {
         finished: Mutex::new(Vec::new()),
         waiting: Mutex::new(None),
     });
-    let mem = Memory::open(g, None, Box::new(Shared(dev.clone()))).unwrap();
+    let mem = Memory::open(g, Box::new(Shared(dev.clone()))).unwrap();
     mem.serve_standalone_torch().unwrap();
     (mem, dev, uuid)
 }

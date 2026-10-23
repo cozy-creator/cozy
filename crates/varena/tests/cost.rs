@@ -43,20 +43,18 @@ fn per_page_cost() {
     let dir = tempfile::tempdir().unwrap();
     let pages = 1000;
     let g = GpuId { uuid: format!("c{}-load", std::process::id()), model: "host".into(), memory: pages * REGION_ALIGN };
-    let ledger = varena::Ledger::create(&g, None).unwrap();
-    let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
+    let mem = Memory::open(g.clone(), Box::new(HostBackend::new(g.memory))).unwrap();
     let spec = set(dir.path(), "load", pages, &g.uuid);
     let start = Instant::now();
     mem.load(spec, Level::Gpu).unwrap();
     let load = start.elapsed();
     println!("load: {pages} pages in {load:?}: {:.0} us/page", load.as_secs_f64() * 1e6 / pages as f64);
-    drop((mem, ledger));
+    drop(mem);
     varena::os::remove_table(&g.uuid);
 
     let binds = 64;
     let g = GpuId { uuid: format!("c{}-evict", std::process::id()), model: "host".into(), memory: 4 * REGION_ALIGN };
-    let ledger = varena::Ledger::create(&g, None).unwrap();
-    let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
+    let mem = Memory::open(g.clone(), Box::new(HostBackend::new(g.memory))).unwrap();
     let id = mem.load(set(dir.path(), "evict", binds, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/evict".into()], passes: 1 }] }).unwrap();
     let pass = r.pass(id, "k").unwrap();
@@ -67,6 +65,6 @@ fn per_page_cost() {
     let evicting = start.elapsed();
     println!("evicting binds: {binds} in {evicting:?}: {:.0} us/bind", evicting.as_secs_f64() * 1e6 / binds as f64);
     drop(pass);
-    drop((r, mem, ledger));
+    drop((r, mem));
     varena::os::remove_table(&g.uuid);
 }

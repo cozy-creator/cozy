@@ -1,5 +1,5 @@
-//! One process's facts: its sets and their pages, the plans of its requests and their cursors;
-//! plus the other rows' published bytes. Classes are derived here, never stored.
+//! One process's facts: its sets and their pages, the plans of its requests and their cursors.
+//! Classes are derived here, never stored.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -169,8 +169,6 @@ pub struct Page {
     pub releasing: Vec<u64>,
     /// (request, step) it was mapped for speculatively.
     pub speculative: Option<(u64, u32)>,
-    /// Kept (exported to custody): unmapping it frees its bytes only once custody lets go.
-    pub kept: bool,
     /// A logical clock, not time.
     pub last_use: u64,
 }
@@ -216,14 +214,8 @@ pub struct Req {
     /// (set indices, passes) per step; a set not loaded has no index and is not in the plan.
     pub steps: Vec<(Vec<u32>, u32)>,
     pub cursor: Cursor,
-    /// Its dispatch key's recorded peak (the most it held: pages and allocations): what TensorD
-    /// admits it against and what it asks peers for at its open and pass starts. `None`:
-    /// unmeasured (it asks for every idle byte).
-    pub peak: Option<u64>,
-    /// Waiting on a child call: its current step is a later use meanwhile, and its peak counts
-    /// for everyone's admission but its family's child (`crate::ledger` publishes it).
+    /// Waiting on a child call: its current step is a later use meanwhile.
     pub yielded: bool,
-    pub family: u64,
     /// Idle work (a graph capture off the request path): free bytes only, never evicting.
     pub idle: bool,
 }
@@ -265,31 +257,6 @@ impl Req {
     }
 }
 
-/// A cache the caller holds: its bytes are torch's, given back through its shrink callback.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Cache {
-    pub id: u32,
-    pub owner: String,
-    /// The components (sets) it serves: its next use is theirs (none: no declared use).
-    pub sets: Vec<u32>,
-    pub bytes: u64,
-    pub last_use: u64,
-    /// Holds out (a graph replay's preparation until its GPU completion) and the release
-    /// events still pending: held, nothing shrinks it.
-    pub holds: u32,
-    pub releasing: Vec<u64>,
-    /// Its shrinks running, and the bytes it reported meanwhile: applied after them, so a
-    /// shrink's return never overwrites a report made during it.
-    pub shrinking: u32,
-    pub reported: Option<u64>,
-}
-
-impl Cache {
-    pub fn held(&self) -> bool {
-        self.holds > 0 || !self.releasing.is_empty()
-    }
-}
-
 /// Another process's row, as it published it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Remote {
@@ -321,56 +288,15 @@ impl Remote {
     }
 }
 
-/// One process's facts on one device, plus what the others published.
+/// One process's facts on one device.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Table {
-    pub capacity: u64,
-    /// The driver's headroom (the backend's): never filled, in any mode (cr-215).
-    pub driver: u64,
-    /// This row's own cap (a standalone opener's limit); the table's capacity is TensorD's.
-    pub limit: Option<u64>,
-    /// Bytes on the device no row accounts for, measured, beyond what the card leaves outside
-    /// the table's cap (`capacity`): `capacity - foreign` is min(cap, card - foreign bytes).
-    pub foreign: u64,
-    /// Actual unique device backing for this row: context, committed native allocations and
-    /// resident VMM backing. No placeholders; retiring aliases count once.
-    pub physical: u64,
-    /// Unique actual VMM backing, including retired/quarantined backing until ownership ends.
-    pub vmm: u64,
-    /// Future VMM backing: exactly the mapped Home placeholders with no physical allocation.
-    pub mapping: u64,
-    /// Unique retiring subset of vmm; ownership-lost quarantines remain vmm but cannot return.
-    pub returning: u64,
-    /// This process's driver context (its device bytes beyond pages and the hook's segments).
-    pub context: u64,
-    /// The allocator hook's segments (torch's bytes in varena's pool), exactly, and the room
-    /// held for its segments not allocated yet ([`crate::memory::Claim`]).
-    pub segments: u64,
-    pub claimed: u64,
-    /// Kept pages no live process maps, on this device (custody's).
-    pub orphans: u64,
-    /// Bytes of kept pages this process unmapped whose Withdraw custody has not had yet: its
-    /// handle still holds them (pinned, P).
-    pub pending: u64,
-    /// Bytes of pages being unmapped by the mechanism thread: still this process's on the
-    /// device (P to others), already spent on the creates queued after them (not to itself).
-    pub inflight: u64,
-    /// Own pages pinned only by varena's own short work (a Keep's protect):
-    /// evictable again once it ends.
-    pub transient: u64,
-    /// Shared mode (a machine its owner also uses): prefetch never grows this process's
-    /// footprint.
-    pub shared: bool,
-    /// TensorD samples foreign bytes (`foreign` is its reading): in shared mode the budget then
-    /// leaves H to the display and other programs.
-    pub sampled: bool,
-    /// The card's bytes (H's basis).
-    pub card: u64,
+    /// The standalone budget: the device's free bytes at open less its reserve (unused while
+    /// leased).
+    pub limit: u64,
     /// Indexed by set id; `None` once unloaded.
     pub sets: Vec<Option<Set>>,
     pub requests: Vec<Req>,
-    pub caches: Vec<Cache>,
-    pub others: Vec<Remote>,
 }
 
 impl Table {
@@ -388,10 +314,6 @@ impl Table {
 
     pub fn request_mut(&mut self, id: u64) -> Option<&mut Req> {
         self.requests.iter_mut().find(|r| r.id == id)
-    }
-
-    pub fn cache_mut(&mut self, id: u32) -> Option<&mut Cache> {
-        self.caches.iter_mut().find(|c| c.id == id)
     }
 
     pub fn pages(&self) -> impl Iterator<Item = (Key, &Page)> {
@@ -420,112 +342,7 @@ impl Table {
         Some(if distance.is_some() { Class::D } else { Class::N })
     }
 
-    /// This process's page bytes by class (withdrawn kept pages custody still holds are P).
-    pub fn classes(&self) -> [u64; 7] {
-        let mut out = [0u64; 7];
-        if let Some(p) = out.get_mut(Class::P.index()) {
-            // Unmapped physical backing includes quarantines as well as live retirement.
-            // Mapped placeholders are counted by their page's P class below.
-            *p = self.vmm.saturating_sub(self.mapped().saturating_sub(self.mapping));
-        }
-        for (key, page) in self.pages() {
-            if let Some(slot) = self.class(key).and_then(|c| out.get_mut(c.index())) {
-                *slot += page.bytes;
-            }
-        }
-        out
-    }
-
     pub fn mapped(&self) -> u64 {
         self.pages().filter(|(_, p)| p.mapped).map(|(_, p)| p.bytes).sum()
-    }
-
-    pub fn held(&self) -> u64 {
-        self.context + self.segments + self.claimed + self.vmm + self.mapping
-    }
-
-    /// Unique backing already retiring, own and others': still charged until its owners finish.
-    pub fn returning(&self) -> u64 {
-        self.returning.min(self.vmm) + self.transient + self.others.iter().map(|r| r.returning.min(r.classes.get(Class::P.index()).copied().unwrap_or(0))).sum::<u64>()
-    }
-
-    fn others_held(&self) -> u64 {
-        self.others.iter().map(Remote::held).sum()
-    }
-
-    /// Driver usage not owned by a row or custody, charged only past the card's room outside
-    /// this cap.
-    pub fn foreign_used(&self, card_capacity: u64, driver_used: u64) -> u64 {
-        let physical = self.others.iter().fold(self.physical.saturating_add(self.orphans), |held, row| held.saturating_add(row.physical));
-        self.foreign_from_known(card_capacity, driver_used, physical)
-    }
-
-    /// Foreign attribution with only the physical bytes proved stable across this driver
-    /// sample. Dirty/unpublished backing remains an admission charge, never subtraction.
-    pub fn foreign_from_known(&self, card_capacity: u64, driver_used: u64, known: u64) -> u64 {
-        driver_used.saturating_sub(known).saturating_sub(card_capacity.saturating_sub(self.capacity))
-    }
-
-    /// The one budget: the ledger's capacity less foreign bytes, orphans and the other rows,
-    /// within this row's own cap.
-    pub fn budget(&self) -> u64 {
-        let room = self.capacity.saturating_sub(self.foreign + self.orphans + self.others_held() + self.headroom());
-        self.limit.map_or(room, |l| room.min(l))
-    }
-
-    /// Bytes never filled: the driver's headroom always, and H in shared mode while TensorD
-    /// samples foreign bytes (its rule asks below it).
-    pub fn headroom(&self) -> u64 {
-        let yielding = if self.shared && self.sampled { headroom(self.card) } else { 0 };
-        self.driver.max(yielding)
-    }
-
-    /// F: the budget less what this row holds.
-    pub fn free(&self) -> u64 {
-        self.budget().saturating_sub(self.held())
-    }
-
-    /// The largest W left: the request's recorded peak; `None` unmeasured. A yielded request
-    /// has none (its family's child runs in its place).
-    pub fn remaining(&self, req: &Req) -> Option<u64> {
-        if req.yielded {
-            return Some(0);
-        }
-        req.peak
-    }
-
-    /// Yielded W per family waited for, in a row's slots: the largest families apart, any more
-    /// than the slots together under family 0 (counted for every child).
-    pub fn yielded_by_family(&self) -> [(u64, u64); crate::decide::YIELDED] {
-        let mut by: BTreeMap<u64, u64> = BTreeMap::new();
-        for r in self.requests.iter().filter(|r| r.yielded) {
-            *by.entry(r.family).or_default() += r.peak.unwrap_or_else(|| self.step_pages(r));
-        }
-        let mut families: Vec<(u64, u64)> = by.into_iter().collect();
-        families.sort_by_key(|(f, w)| (std::cmp::Reverse(*w), *f));
-        let mut out = [(0, 0); crate::decide::YIELDED];
-        let fits = families.len() <= crate::decide::YIELDED;
-        for (i, (f, w)) in families.into_iter().enumerate() {
-            match out.get_mut(i) {
-                Some(slot) if fits || i + 1 < crate::decide::YIELDED => *slot = (f, w),
-                _ => {
-                    if let Some(last) = out.last_mut() {
-                        *last = (0, last.1 + w);
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// The bytes of the request's current step's pages.
-    fn step_pages(&self, r: &Req) -> u64 {
-        r.steps.get(r.cursor.step as usize).map_or(0, |(sets, _)| sets.iter().filter_map(|s| self.sets.get(*s as usize)?.as_ref()).flat_map(|s| s.pages.iter()).map(|p| p.bytes).sum())
-    }
-
-    /// Pinned bytes outside every open request's current step (counted apart by `fits`).
-    pub fn outside(&self) -> u64 {
-        let current = |(set, _): Key| self.requests.iter().any(|r| r.runs(set));
-        self.pages().filter(|(k, p)| p.mapped && p.pinned() && !current(*k)).map(|(_, p)| p.bytes).sum()
     }
 }

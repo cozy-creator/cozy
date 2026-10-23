@@ -61,17 +61,17 @@ impl Memory {
         let agent = self.inner.lease.get().cloned().ok_or_else(|| Error::Invalid("this Memory holds no lease".into()))?;
         let mech = self.inner.mech.clone();
         let wake = Box::new(move || {
-            mech.post(super::Mech::Revoke, 0);
+            mech.post(super::Mech::Revoke);
         });
         self.serve_torch(Arc::new(Leased { agent, backend: self.inner.backend.clone(), held: Mutex::new(HashMap::new()), wake }))
     }
 
     /// Standalone, chosen explicitly when no compatible manager serves this GPU: the device's
-    /// own pages, bounded by its free bytes now less 2H (H = max(512 MiB, card/16), vram-yield).
+    /// own pages, bounded by its free bytes now less its reserve (rev 6: 512 MiB a GPU, none on
+    /// host pages).
     pub fn serve_standalone_torch(&self) -> Result<Arc<Torch>> {
         let backend = self.inner.backend.clone();
-        let headroom = (512 << 20u64).max(backend.capacity() / 16);
-        let limit = backend.free()?.saturating_sub(2 * headroom);
+        let limit = backend.free()?.saturating_sub(backend.headroom());
         self.serve_torch(Arc::new(Direct::new(backend, limit)))
     }
 

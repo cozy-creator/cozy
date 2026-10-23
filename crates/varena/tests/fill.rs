@@ -62,8 +62,7 @@ fn set(path: &Path, run: usize, uuid: &str) -> SetSpec {
 /// filled.
 fn load(path: &Path, run: usize) -> f64 {
     let g = GpuId { uuid: format!("f{}-{run}", std::process::id()), model: "host".into(), memory: 2 * PAGES * PAGE };
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
+    let mem = Memory::open(g.clone(), Box::new(HostBackend::new(g.memory))).unwrap();
     let spec = set(path, run, &g.uuid);
     uncached(path);
     let start = Instant::now();
