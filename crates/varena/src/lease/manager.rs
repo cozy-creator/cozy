@@ -1245,3 +1245,32 @@ fn look_loop(manager: &Weak<Manager>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    const M: u64 = 1 << 20;
+
+    /// The room is the driver's reading less what was created since, plus what was destroyed
+    /// since, within the card: (read free, created then, destroyed then, created now, destroyed
+    /// now, live, card, reserve, free, room).
+    #[test]
+    fn free_is_the_reading_less_created_and_plus_destroyed_since() {
+        type Row = (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
+        let rows: &[Row] = &[
+            (100, 0, 0, 0, 0, 0, 1024, 0, 100, 100),
+            (100, 0, 0, 30, 0, 30, 1024, 0, 70, 70),
+            (100, 0, 0, 30, 10, 20, 1024, 0, 80, 80),
+            (100, 20, 5, 50, 5, 45, 1024, 16, 70, 54),
+            (100, 0, 0, 0, 0, 0, 64, 16, 80, 64), // within the card (limit) plus the reserve
+            (10, 0, 0, 30, 0, 30, 1024, 16, 0, 0),
+        ];
+        for &(read, c0, d0, c1, d1, live, card, reserve, want, room_) in rows {
+            let b = Books { sample: Some(Sample { free: read * M, created: c0 * M, destroyed: d0 * M }), created_total: c1 * M, destroyed_total: d1 * M, created: live * M, card: card * M, reserve: reserve * M, ..Books::default() };
+            assert_eq!((free(&b), room(&b)), (Some(want * M), room_ * M), "{:?}", (read, c0, d0, c1, d1, live, card, reserve));
+        }
+        assert_eq!(free(&Books::default()), None, "unread: nothing grows");
+    }
+}
