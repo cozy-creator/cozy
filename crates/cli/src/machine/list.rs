@@ -9,9 +9,6 @@ use protocol::{
 use super::{Notices, clock, machine, now_ms, usd};
 use crate::{Context, output, run, tui};
 
-/// A Hub failure code: the provider stopped the pod. The Hub keeps the rental and never replaces it.
-const PROVIDER_STOPPED: &str = "readiness.provider_stopped";
-
 const IDLE_RULE: &str = "Rentals end themselves after 15 minutes idle (no queued or running work).";
 
 pub(crate) const HEADERS: [&str; 12] = [
@@ -73,7 +70,7 @@ pub async fn list(ctx: &Context, once: bool) -> Result<ExitCode, Error> {
         table = table.row(row);
     }
     table.print();
-    for note in live().filter_map(provider_stopped) {
+    for note in live().filter_map(offline) {
         println!("{note}");
     }
     for m in live() {
@@ -194,7 +191,7 @@ pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
             m.name
         ));
     }
-    if let Some(reason) = &m.reason {
+    if let Some(reason) = m.reason.as_ref().filter(|_| m.state != MachineState::Offline) {
         record = record.field("reason", reason);
     }
     if m.state != MachineState::Ended {
@@ -225,7 +222,7 @@ pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
         }
         None => {}
     }
-    if let Some(note) = provider_stopped(m) {
+    if let Some(note) = offline(m) {
         record = record.note(note);
     }
     record
@@ -370,7 +367,7 @@ fn kind(m: &Machine) -> &'static str {
 
 pub fn state_cell(m: &Machine) -> String {
     let mut cell = match m.state {
-        _ if provider_stopped(m).is_some() => "stopped by provider".to_string(),
+        MachineState::Offline => format!("offline: {}", m.reason.as_deref().unwrap_or("its Hub says so")),
         MachineState::Booting => match &m.boot {
             Some(boot) => format!("booting · {boot}"),
             None => "booting".into(),
@@ -388,9 +385,9 @@ pub fn state_cell(m: &Machine) -> String {
     if m.unverified {
         cell += " (unverified)";
     }
-    match m.unreachable.as_deref() {
-        Some(_) if m.state == MachineState::Ready && unreachable_since(m).is_none() => {
-            cell += " (unreachable)"
+    match m.unreachable_since_ms {
+        Some(at) if m.state == MachineState::Ready && unreachable_since(m).is_none() => {
+            cell += &format!(" (unreachable for {})", clock(now_ms() - at))
         }
         _ => {}
     }
@@ -490,15 +487,14 @@ fn unreachable_since(m: &Machine) -> Option<i64> {
     (m.state == MachineState::Ready).then_some(since)
 }
 
-fn provider_stopped(m: &Machine) -> Option<String> {
-    let r = m.rental.as_ref()?;
-    (r.failure.as_deref() == Some(PROVIDER_STOPPED)).then(|| {
-        format!(
-            "{} was stopped by its provider. The Hub keeps it but never replaces it: it returns if the \
-             provider resumes it, and ends after 15 minutes idle. To keep working: `cozy machine rent {}`.",
-            m.name, r.sku
-        )
-    })
+/// What an offline machine's owner can do: it is kept, never replaced, and refuses runs meanwhile.
+fn offline(m: &Machine) -> Option<String> {
+    let r = m.rental.as_ref().filter(|_| m.state == MachineState::Offline)?;
+    Some(format!(
+        "{} is offline and refuses runs: it returns if its provider resumes it, and ends after 15 \
+         minutes idle. To keep working: `cozy machine rent {}`, or `cozy run … --on new`.",
+        m.name, r.sku
+    ))
 }
 
 fn hub_label(ctx: &Context, origin: &str) -> String {

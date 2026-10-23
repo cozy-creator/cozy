@@ -151,7 +151,8 @@ impl Machines {
                 .flatten()
                 .cloned()
                 .collect();
-            for name in holders {
+            // An offline machine is not dialed; it gets the next one once it is back.
+            for name in holders.into_iter().filter(|name| self.offline(name).is_none()) {
                 match self.linked(&name) {
                     Ok((_, link)) => {
                         if let Err(error) = link.bearer(options).await {

@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 use protocol::{
-    calcifer::{Machine, NewMachine},
+    calcifer::{Machine, NewMachine, clock},
     error::{Error, Kind},
     ids::Digest,
 };
@@ -224,16 +224,6 @@ async fn add(
 /// Money as people read it: `$3.19`.
 fn usd(micros: i64) -> String {
     format!("${:.2}", micros as f64 / 1e6)
-}
-
-/// A duration as a clock reads: `41s`, `14m`, `1h12m`.
-fn clock(ms: i64) -> String {
-    let s = (ms / 1000).max(0);
-    match s {
-        0..60 => format!("{s}s"),
-        60..3600 => format!("{}m", s / 60),
-        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
-    }
 }
 
 fn now_ms() -> i64 {
