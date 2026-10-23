@@ -1062,8 +1062,9 @@ impl Memory {
     /// Leases this GPU's weight pages from the manager serving it (TensorD's, in the table
     /// owner's namespace), right after open, before any load: from then on its pages are the
     /// manager's chunks, retained by it across this process's exit (no Keep), and asked back by
-    /// it. `Some((Incompatible | Absent, why))`: it runs standalone. Any other refusal is an error
-    /// (TensorD parks a peer it has not registered yet, so the dial itself waits).
+    /// it. A refusal comes back typed, `Some((code, why))`: Incompatible or Absent runs standalone;
+    /// the caller fails on any other (TensorD parks a peer it has not registered yet, so the dial
+    /// itself waits).
     #[cfg(unix)]
     pub fn lease(&self) -> Result<Option<(crate::lease::Refusal, String)>> {
         let uuid = self.inner._device.0.clone();
@@ -1098,8 +1099,7 @@ impl Memory {
                 self.serve_leased_torch()?;
                 Ok(None)
             }
-            crate::lease::Attach::Refused { code: code @ (crate::lease::Refusal::Incompatible | crate::lease::Refusal::Absent), why } => Ok(Some((code, why))),
-            crate::lease::Attach::Refused { code, why } => Err(Error::Closed(format!("the lease manager refused this process ({code:?}): {why}"))),
+            crate::lease::Attach::Refused { code, why } => Ok(Some((code, why))),
         }
     }
 
