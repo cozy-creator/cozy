@@ -35,6 +35,8 @@ pub struct TorchStats {
     pub allocated: u64,
     pub mapped: u64,
     pub peak: u64,
+    /// The allocator's own overhead: mapped less live torch bytes.
+    pub fragmentation: u64,
     /// Request id → (allocated, peak).
     pub requests: Vec<(String, u64, u64)>,
     /// Pool → (mapped, allocated): torch's `MemPool.snapshot()` raises under a pluggable allocator.
@@ -141,7 +143,7 @@ impl Memory {
     pub fn torch_stats(&self) -> TorchStats {
         let Some(t) = self.inner.torch.get() else { return TorchStats::default() };
         let s = t.stats();
-        let mut out = TorchStats { allocated: s.allocated, mapped: s.mapped, peak: s.peak, ..TorchStats::default() };
+        let mut out = TorchStats { allocated: s.allocated, mapped: s.mapped, peak: s.peak, fragmentation: s.fragmentation, ..TorchStats::default() };
         for (owner, a) in s.arenas {
             match owner {
                 Owner::Request(id) => out.requests.push((id.to_string(), a.allocated, a.peak)),
