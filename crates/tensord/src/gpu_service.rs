@@ -2606,7 +2606,9 @@ impl Pool {
                 && gpus.iter().any(|d| d.memory.as_ref().is_some_and(|m| m.manager().is_some())))
                 .then(platform::memory::euid);
             // Rank 0 spawns and forms every follower inside this command; its watch meters
-            // the whole group's work, so formation ends only on measured lack of progress.
+            // the whole group's work, so formation ends only on measured lack of progress. A
+            // follower that dials its lease listener meanwhile waits for its registration.
+            let forming = self.tenants.forming(&session.executor.birth);
             let started = command_ok(session.executor.command_with(
                 &DeviceCommand::Start {
                     devices: lane.clone(),
@@ -2636,6 +2638,7 @@ impl Pool {
                 }));
             }
             session.followers = callbacks.formation.as_ref().map_or(Ok(vec![]), |formation| formation.register(&started.follower_pids))?;
+            drop(forming);
             if session.followers.len() + 1 != ranks as usize {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
@@ -3581,11 +3584,11 @@ impl Formation {
             .filter_map(|pid| members.iter().find(|m| m.pid == *pid))
             .filter_map(|birth| Exact::open(birth).ok().flatten())
             .collect();
-        let mut tenants = self.tenants.lock().unwrap();
-        for follower in &followers {
+        let tenant = |follower: &Exact| -> io::Result<(u32, Tenant)> {
             let tenant = Tenant { plan: self.plan.clone(), generation: self.generation.clone(), start: self.start, exact: follower.try_clone()? };
-            tenants.insert(follower.birth().pid, tenant);
-        }
+            Ok((follower.birth().pid, tenant))
+        };
+        self.tenants.register(followers.iter().map(tenant).collect::<io::Result<Vec<_>>>()?);
         Ok(followers)
     }
 }
