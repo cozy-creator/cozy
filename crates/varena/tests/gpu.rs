@@ -3223,9 +3223,7 @@ fn a_kept_set_is_imported_after_its_holders_kill_9_and_another_fill_refills() {
     step!();
     a.ok("load k 4 10 stored gpu");
     step!();
-    // A filled page goes to custody asynchronously; settle makes the kept pages custody's before the kill.
-    a.ok("settle");
-    step!();
+    // A GPU load with no request open returns with its pages custody's: all four are orphans after the kill.
     a.child.kill().unwrap();
     step!();
     assert_eq!(a.child.wait().unwrap().signal(), Some(libc::SIGKILL));
