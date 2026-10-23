@@ -2552,6 +2552,13 @@ impl Pool {
             generation: &held.record,
             spool: None,
             caller: None,
+            formation: Some(Formation {
+                tenants: self.tenants.clone(),
+                leader: session.executor.birth.clone(),
+                plan: construction.clone(),
+                generation: plan.generation.clone(),
+                start,
+            }),
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -2605,19 +2612,7 @@ impl Pool {
                     ),
                 }));
             }
-            // Only processes in rank 0's own group are taken as its followers: each is its own
-            // GPU's tenant, named in that GPU's ledger by its own pid.
-            let members = platform::process::group_members(&session.executor.birth);
-            session.followers = started
-                .follower_pids
-                .iter()
-                .filter_map(|pid| members.iter().find(|m| m.pid == *pid))
-                .filter_map(|birth| Exact::open(birth).ok().flatten())
-                .collect();
-            for follower in &session.followers {
-                let tenant = Tenant { plan: construction.clone(), generation: plan.generation.clone(), start, exact: follower.try_clone()? };
-                self.tenants.lock().unwrap().insert(follower.birth().pid, tenant);
-            }
+            session.followers = callbacks.formation.as_ref().map_or(Ok(vec![]), |formation| formation.register(&started.follower_pids))?;
             if session.followers.len() + 1 != ranks as usize {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
@@ -3508,6 +3503,35 @@ fn constructions(plan: &Plan) -> Vec<Construction> {
     plan.slots.iter().map(slot).collect()
 }
 
+/// A group's formation: rank 0 reports each follower it spawned (a progress frame's
+/// `follower_pids`, before the follower opens memory, then Start's reply), and each becomes its
+/// GPU's tenant at once, so its lease peer is known when it dials.
+struct Formation {
+    tenants: memory::Tenants,
+    leader: Birth,
+    plan: String,
+    generation: String,
+    start: usize,
+}
+
+impl Formation {
+    /// The reported followers in rank 0's own process group, each registered as its tenant.
+    fn register(&self, pids: &[u32]) -> io::Result<Vec<Exact>> {
+        let members = platform::process::group_members(&self.leader);
+        let followers: Vec<Exact> = pids
+            .iter()
+            .filter_map(|pid| members.iter().find(|m| m.pid == *pid))
+            .filter_map(|birth| Exact::open(birth).ok().flatten())
+            .collect();
+        let mut tenants = self.tenants.lock().unwrap();
+        for follower in &followers {
+            let tenant = Tenant { plan: self.plan.clone(), generation: self.generation.clone(), start: self.start, exact: follower.try_clone()? };
+            tenants.insert(follower.birth().pid, tenant);
+        }
+        Ok(followers)
+    }
+}
+
 struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
@@ -3518,9 +3542,16 @@ struct Callbacks<'a> {
     spool: Option<PathBuf>,
     /// The invoking request as a caller: its child-call frames.
     caller: Option<&'a crate::calls::Caller>,
+    /// Its executor's group, forming at Start.
+    formation: Option<Formation>,
 }
 impl Services for Callbacks<'_> {
     fn progress(&mut self, frame: &Frame) {
+        if let (Some(formation), false) = (&self.formation, frame.follower_pids.is_empty()) {
+            if let Err(error) = formation.register(&frame.follower_pids) {
+                tracing::warn!("run {}: followers {:?} unregistered: {error}", self.id, frame.follower_pids);
+            }
+        }
         crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
     }
     fn request(
