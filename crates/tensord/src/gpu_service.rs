@@ -165,8 +165,8 @@ pub struct PlanSlot {
     pub precision: String,
     /// Native selected encoded source bytes; not a GPU-fit or full-memory charge.
     pub selected_encoded_bytes: u64,
-    /// Built and fetched when the function first uses it (`on_demand`): nothing of it is
-    /// fetched or warmed before then.
+    /// Built when the function first uses it (`on_demand`); its bytes are fetched right behind
+    /// the up-front set's (`Plan::on_demand`), so that build reads them from the store.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub on_demand: bool,
 }
@@ -266,9 +266,13 @@ impl Plan {
         constructed.chain(raw).collect()
     }
     /// What a call reads before its function runs: every slot's components but an on-demand
-    /// one's, which Runtime fetches when a stage first uses it.
+    /// one's.
     pub fn upfront(&self) -> Vec<(String, Vec<String>)> {
         merged(self.slots.iter().filter(|slot| !slot.on_demand)).into_iter().map(|s| (s.manifest, s.components)).collect()
+    }
+    /// What it reads only once a stage first uses an on-demand slot: fetched behind `upfront`.
+    pub fn on_demand(&self) -> Vec<(String, Vec<String>)> {
+        merged(self.slots.iter().filter(|slot| slot.on_demand)).into_iter().map(|s| (s.manifest, s.components)).collect()
     }
 }
 

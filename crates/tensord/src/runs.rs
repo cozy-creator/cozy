@@ -653,7 +653,7 @@ impl Runs {
             ahead = plan.as_ref().map(|plan| {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
                 let fetch = crate::access::Fetch::new(self.publisher.machine().clone(), hub.clone(), order);
-                match fetch.ahead(&plan.upfront()) {
+                match fetch.ahead(&plan.upfront(), &plan.on_demand()) {
                     Ok(()) => crate::access::meter(self.service.engine.clone(), id.to_string(), &fetch),
                     Err(error) => tracing::warn!("run {id}: its weights' early fetch: {error}"),
                 }
@@ -704,12 +704,13 @@ impl Runs {
                 true => self.warm_models(actor, id, &spec, &*observe, stoppable)?,
                 false => vec![],
             };
-            // A function's warm run ends holding what its constructions read (`downloaded`).
+            // A function's warm run ends holding what its constructions read (`downloaded`), its
+            // on-demand models' too.
             let mut moved = (0, 0);
             if let Some(plan) = &plan {
                 let fetch = crate::access::Fetch::new(self.publisher.machine().clone(), hub.clone(), u64::MAX);
                 let report = |done, total| observe("downloading its weights", done, total);
-                moved = fetch.download(&plan.upfront(), &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
+                moved = fetch.download(&[plan.upfront(), plan.on_demand()].concat(), &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
                     true => refused(crate::published::CANCELED, "the run was canceled while it downloaded"),
                     false => {
                         let text = e.to_string();
