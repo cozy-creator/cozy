@@ -205,7 +205,7 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         .collect();
     assert_eq!(models, [("acme/base", 1000 + own[0], own[0]), ("local/mine", 1000 + own[1], own[1])]);
     assert_eq!(first.models_bytes, 1000 + own[0] + own[1]);
-    assert_eq!(first.models[0].checkpoints[0].lane, "fp8");
+    assert_eq!(first.models[0].checkpoints[0].lane, "model.fp8.cozytensors");
     // Its player endpoint is the provider's mapping of the granted port.
     let webrtc = first.webrtc.clone().expect("a rental with a WebRTC port plays");
     assert_eq!(webrtc.addresses, ["203.0.113.7:30001"]);

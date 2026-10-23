@@ -245,6 +245,7 @@ impl PyClient {
     }
 
     #[pyo3(signature = (name_or_path, *, revision = None, variant = None, lane = None, gpus = None, local_files_only = false, lazy = true))]
+    #[allow(clippy::too_many_arguments)]
     fn open(
         &self,
         py: Python<'_>,

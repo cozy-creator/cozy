@@ -268,7 +268,7 @@ fn run_list_on_one_machine() {
     assert!(!on_live.contains(&elsewhere), "{all:?}");
     assert_eq!(numbers(&["--on", "live"]), on_live);
     let newest = numbers(&["--on", "live", "--state", "canceled", "--limit", "1"]);
-    assert_eq!(newest, [second.clone()]);
+    assert_eq!(newest, std::slice::from_ref(&second));
     assert!(numbers(&["--on", "local"]).is_empty());
     let unknown = home.cozy(["run", "list", "--on", "nowhere"]);
     assert!(
