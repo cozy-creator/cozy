@@ -391,7 +391,7 @@ impl Leases {
         let socket = dir.join("lease.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let open: varena::lease::Opener = Box::new(move || Ok(Arc::new(HostBackend::new(capacity)) as Arc<dyn varena::Backend>));
-        let manager = varena::lease::Manager::create(&gpu, None, varena::ledger::Mode::Dedicated, open, listener, Arc::new(Ours)).unwrap();
+        let manager = varena::lease::Manager::create(&gpu, None, varena::lease::Mode::Dedicated, Some(open), listener, Arc::new(Ours)).unwrap();
         Leases { gpu, socket, manager }
     }
 
@@ -441,11 +441,11 @@ fn weights_by_lease_return_on_kill_and_are_adopted(dir: &Path) {
     b.ok("end r");
     let a_pid = a.child.id();
     let h = leases.until(&|h| h.executors.len() == 2 && h.executors.iter().any(|e| e.pid == a_pid && e.landed == 8 * MB));
-    assert_eq!((h.leased, h.created), (12 * MB, 12 * MB), "{h:?}");
+    assert_eq!((h.allocated, h.created), (12 * MB, 12 * MB), "{h:?}");
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     let h = leases.until(&|h| h.executors.len() == 1);
-    assert_eq!((h.retained, h.leased, h.created), (8 * MB, 4 * MB, 12 * MB), "a's landed weights retained: {h:?}");
+    assert_eq!((h.page_cache, h.allocated, h.created), (8 * MB, 4 * MB, 12 * MB), "a's landed weights retained: {h:?}");
     let mut c = leases.agent("k", &k);
     for block in 0..4 {
         assert_eq!(c.ok(&format!("exact k {block}")), "true", "c's adopted block {block} bit-exact");
@@ -455,7 +455,7 @@ fn weights_by_lease_return_on_kill_and_are_adopted(dir: &Path) {
     let end = c.ok("end r");
     assert!(end.contains("store=0"), "{end}");
     let h = leases.until(&|h| h.executors.len() == 2);
-    assert_eq!((h.retained, h.leased, h.created), (0, 12 * MB, 12 * MB), "adopted with no new chunk: {h:?}");
+    assert_eq!((h.page_cache, h.allocated, h.created), (0, 12 * MB, 12 * MB), "adopted with no new chunk: {h:?}");
     b.exit();
     c.exit();
 }

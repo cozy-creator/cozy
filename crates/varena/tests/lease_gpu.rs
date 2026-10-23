@@ -23,7 +23,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 use varena::backend::{Access, Backend, Va};
 use varena::lease::{Agent, Attach, Hosting, Identity, Lease, Manager, Record, Region};
-use varena::ledger::Mode;
+use varena::lease::Mode;
 use varena::{CudaBackend, GpuId};
 
 const MIB: u64 = 1 << 20;
@@ -222,7 +222,7 @@ fn host(name: String, any: bool) -> Host {
     let children = Arc::new(Children { pids: Mutex::default(), any, grants: Mutex::default() });
     let lent = backend.clone();
     let open = Box::new(move || Ok(lent.clone() as Arc<dyn Backend>));
-    let manager = Manager::create(&gpu, None, Mode::Shared, open, listener, children.clone()).unwrap();
+    let manager = Manager::create(&gpu, None, Mode::Shared, Some(open), listener, children.clone()).unwrap();
     varena::os::remove_table(&gpu.uuid);
     Host { manager, backend, name, children, uuid: card.uuid }
 }
@@ -295,15 +295,15 @@ fn chunks_cross_and_adopt() {
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     let h = until(&host, |h| h.executors.is_empty());
-    assert_eq!((h.retained, h.created), (total, total), "every landed chunk retained");
+    assert_eq!((h.page_cache, h.created), (total, total), "every landed chunk retained");
     let mut b = Spawned::start(&host);
     for (size, region) in [(2 * MIB, 100), (32 * MIB, 200)] {
         for n in 0..16 {
             assert_eq!(b.call(&format!("take {size} {}", region + n)), "ok 1 adopted verified");
         }
     }
-    let h = until(&host, |h| h.leased == total);
-    assert_eq!((h.retained, h.created), (0, total), "adopted with no new chunk");
+    let h = until(&host, |h| h.allocated == total);
+    assert_eq!((h.page_cache, h.created), (0, total), "adopted with no new chunk");
     assert_eq!(b.call("give"), "ok");
     until(&host, |h| h.created == 0);
     say(&format!("FACT manager free with {} MiB held {} MiB; all given back {} MiB", total / MIB, free_held / MIB, host.backend.free().unwrap() / MIB));
