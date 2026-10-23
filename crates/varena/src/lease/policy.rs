@@ -13,7 +13,11 @@
 //!    then other executors', the largest holder first;
 //! 6. the watermark: each running set's next [`SLOTS`] blocks, the asker's first.
 //!
-//! A chunk pinned by anything but a graph is never picked.
+//! A chunk pinned by anything but a graph is never picked. Graphs sharing a chunk (a process's
+//! capture pool) free it only together, so they go as one unit.
+//!
+//! Hints are agent-written, so the order is fair only among cooperating executors: an agent that
+//! marks every chunk running keeps its bytes longest. Pins and H hold regardless.
 //!
 //! Driver headroom H (cr-215) is never leased, in either mode: no grant, float, prefetch, refill
 //! or adoption leaves the device under H, and free under H asks back. VRAM yield (shared mode):
@@ -318,9 +322,16 @@ enum Scope {
     All,
 }
 
+/// A region's order: used, restore ns per MiB freed, last use, executor, region.
+type Rank = (bool, u128, u64, u64, u32);
+
+/// A water-fill queue: bytes left, its order, executor, chunks.
+type Queue = (u64, Reverse<usize>, usize, std::vec::IntoIter<usize>);
+
 enum Unit {
     Cache(usize, usize),
-    Graph(usize, usize),
+    /// One graph, or every graph holding a shared chunk.
+    Graphs(usize, Vec<usize>),
 }
 
 /// One decision's picks so far; chunks, graphs and caches by (executor, index).
@@ -408,9 +419,11 @@ impl<'a> Run<'a> {
         }
     }
 
-    fn graph_credit(&self, e: usize, g: usize) -> u64 {
-        let alone = |c: usize| self.needs(e, c).is_some_and(|n| n.iter().all(|&x| x == g));
-        self.graph_chunks(e, g).iter().filter(|&&c| self.credited(e, c) && self.open(e, c) && alone(c)).map(|&c| self.bytes(e, c)).sum()
+    /// What dropping `graphs` frees outright: credited chunks only they hold.
+    fn graphs_credit(&self, e: usize, graphs: &[usize]) -> u64 {
+        let held = |c: usize| self.needs(e, c).is_some_and(|n| !n.is_empty() && n.iter().all(|g| graphs.contains(g)));
+        let chunks: BTreeSet<usize> = graphs.iter().flat_map(|&g| self.graph_chunks(e, g).iter().copied()).collect();
+        chunks.into_iter().filter(|&c| self.credited(e, c) && self.open(e, c) && held(c)).map(|c| self.bytes(e, c)).sum()
     }
 
     /// A cache's chunks and bytes, when all of it can go now.
@@ -433,7 +446,7 @@ impl<'a> Run<'a> {
     /// per byte freed (unmeasured last).
     fn best_region(&self, scope: Scope) -> Option<Unit> {
         let per_byte = |ns: u64, bytes: u64| u128::from(ns) * (1 << 20) / u128::from(bytes.max(1));
-        let mut best: Option<((bool, u128, u64, u64, u32), Unit)> = None;
+        let mut best: Option<(Rank, Unit)> = None;
         let mut offer = |key, unit| {
             if best.as_ref().is_none_or(|(b, _)| key < *b) {
                 best = Some((key, unit));
@@ -446,17 +459,20 @@ impl<'a> Run<'a> {
                 let cost = self.spill(cache, bytes).unwrap_or(if cache.produce_ns > 0 { cache.produce_ns } else { u64::MAX });
                 offer((used, if used { per_byte(cost, bytes) } else { 0 }, cache.last_use, x.id, cache.id), Unit::Cache(e, k));
             }
-            for (g, graph) in x.graphs.iter().enumerate() {
-                let used = graph.next_use.is_some();
-                if graph.dropping || self.dropped.contains(&(e, g)) || (scope == Scope::Idle && used) {
+            let live = |g: usize| x.graphs.get(g).is_some_and(|graph| !graph.dropping) && !self.dropped.contains(&(e, g));
+            let mut units: BTreeSet<Vec<usize>> = (0..x.graphs.len()).filter(|&g| live(g)).map(|g| vec![g]).collect();
+            units.extend((0..x.chunks.len()).filter(|&c| self.credited(e, c) && self.open(e, c)).filter_map(|c| self.needs(e, c)).filter(|n| n.len() > 1));
+            for unit in units {
+                let graphs: Vec<&Graph> = unit.iter().filter_map(|&g| x.graphs.get(g)).collect();
+                let used = graphs.iter().any(|g| g.next_use.is_some());
+                let credit = self.graphs_credit(e, &unit);
+                if credit == 0 || (scope == Scope::Idle && used) {
                     continue;
                 }
-                let credit = self.graph_credit(e, g);
-                if credit == 0 {
-                    continue;
-                }
-                let cost = if graph.capture_ns > 0 { graph.capture_ns } else { u64::MAX };
-                offer((used, if used { per_byte(cost, credit) } else { 0 }, graph.last_use, x.id, graph.id), Unit::Graph(e, g));
+                let cost = graphs.iter().map(|g| if g.capture_ns > 0 { g.capture_ns } else { u64::MAX }).fold(0, u64::saturating_add);
+                let last = graphs.iter().map(|g| g.last_use).max().unwrap_or(0);
+                let id = graphs.first().map_or(0, |g| g.id);
+                offer((used, if used { per_byte(cost, credit) } else { 0 }, last, x.id, id), Unit::Graphs(e, unit));
             }
         }
         best.map(|(_, unit)| unit)
@@ -515,7 +531,7 @@ impl<'a> Run<'a> {
     /// Takes from `queues` (executor, chunks in order) the largest remaining first, until
     /// `target`.
     fn water(&mut self, queues: Vec<(usize, Vec<usize>)>, stage: Stage, target: u64) {
-        let mut queues: Vec<(u64, Reverse<usize>, usize, std::vec::IntoIter<usize>)> =
+        let mut queues: Vec<Queue> =
             queues.into_iter().enumerate().map(|(i, (e, q))| (q.iter().map(|&c| self.bytes(e, c)).sum(), Reverse(i), e, q.into_iter())).collect();
         while self.got < target {
             let Some((left, _, e, q)) = queues.iter_mut().filter(|q| q.0 > 0).max_by_key(|q| (q.0, q.1)) else { return };
@@ -546,22 +562,15 @@ impl<'a> Run<'a> {
     /// short of it.
     fn cover(&mut self, need: u64, asker: Option<usize>, scope: Scope) -> bool {
         let target = self.got.saturating_add(need);
-        let stages: [(Stage, fn(usize, Option<usize>, &Hint) -> Option<u64>); 3] = [
-            (Stage::Float, |e, asker, h| match h {
-                Hint::Float { since } if Some(e) != asker => Some(*since),
+        for stage in [Stage::Float, Stage::Free, Stage::Idle] {
+            // Each stage's chunks and their order: since, since, last use.
+            let key = |e: usize, h: &Hint| match (stage, *h) {
+                (Stage::Float, Hint::Float { since }) if Some(e) != asker => Some(since),
+                (Stage::Free, Hint::Free { since }) => Some(since),
+                (Stage::Idle, Hint::Idle { last_use }) => Some(last_use),
                 _ => None,
-            }),
-            (Stage::Free, |_, _, h| match h {
-                Hint::Free { since } => Some(*since),
-                _ => None,
-            }),
-            (Stage::Idle, |_, _, h| match h {
-                Hint::Idle { last_use } => Some(*last_use),
-                _ => None,
-            }),
-        ];
-        for (stage, key) in stages {
-            for (e, c) in self.listed(|e, h| key(e, asker, h)) {
+            };
+            for (e, c) in self.listed(key) {
                 if self.got >= target {
                     return true;
                 }
@@ -584,7 +593,7 @@ impl<'a> Run<'a> {
         while self.got < target {
             match self.best_region(scope) {
                 Some(Unit::Cache(e, k)) => self.give_cache(e, k),
-                Some(Unit::Graph(e, g)) => self.drop_graph(e, g),
+                Some(Unit::Graphs(e, graphs)) => graphs.into_iter().for_each(|g| self.drop_graph(e, g)),
                 None => break,
             }
         }
@@ -862,6 +871,20 @@ mod tests {
         let d = decide(&s, &[demand(2, 11)]);
         assert_eq!(show(&d), ["S1:3", "1:3", "D1:2", "1:2", "G1:5", "1:4", "S1:1", "1:1", "1:6"]);
         assert_eq!(d.answers, vec![Answer::Wait { on: vec![1] }]);
+    }
+
+    /// Graphs 1 (100 µs to capture) and 2 (1 s) share pool chunk 1: neither frees it alone, so
+    /// cache 3 (10 ms/MiB) goes before the pair (1.0001 s/MiB), and the pair before running 3.
+    #[test]
+    fn graphs_sharing_a_pool_go_together() {
+        let mut a = ex(1, vec![pinned(2, c(1, 1, Hint::Free { since: 0 })), c(2, 1, Hint::Cache { region: 3 }), next(3, 1)]);
+        a.caches = vec![cache(3, Some(1), 0, 10_000_000)];
+        a.graphs = vec![graph(1, &[1], Some(1), 0, 100_000), graph(2, &[1], Some(1), 0, 1_000_000_000)];
+        let rows: &[(u64, &[&str])] = &[(1, &["D1:3", "1:2"]), (2, &["D1:3", "1:2", "G1:1", "G1:2", "1:1"]), (3, &["D1:3", "1:2", "G1:1", "G1:2", "1:1", "1:3"])];
+        for &(need, picks) in rows {
+            let d = decide(&snap(0, 0, vec![], vec![a.clone(), ex(2, vec![])]), &[demand(2, need)]);
+            assert_eq!(show(&d), picks, "need {need} MiB");
+        }
     }
 
     #[test]
