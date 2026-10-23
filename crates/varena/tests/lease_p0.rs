@@ -26,7 +26,7 @@ mod cases {
     use serde_json::Value;
     use tensorfs::io::Dst;
     use varena::backend::{Access, Backend, Va};
-    use varena::lease::table::Table;
+    use varena::lease::table::{self, Table};
     use varena::lease::wire::{End, ToAgent, ToManager};
     use varena::lease::{Agent, Attach, Hosting, Identity, Lease, Manager, Record, Region, PROTOCOL};
     use varena::ledger::Mode;
@@ -259,27 +259,28 @@ mod cases {
         let (mut a, mut b) = (agent(&mut t, "d"), agent(&mut t, "d"));
         let table = nvml_used(&[t.p.pid(), a.pid(), b.pid()]) / 2;
         assert!(table > 0, "the fake NVML sees no table");
-        assert_eq!(a.call(&take(96, 1)), "ok 3 fresh verified");
+        assert_eq!(a.call(&take(64, 1)), "ok 1 fresh verified");
         assert_eq!(a.call(&format!("{} unlanded", take(32, 8))), "ok 1 fresh verified");
+        assert_eq!(a.call(&take(32, 9)), "ok 1 fresh verified");
         t.until(|h| n(h, "leased") == 128 * MIB);
         check_books(&mut t, &[&a, &b], table, "after grants");
         b.send(&take(160, 2));
         a.wait_rang();
         assert_eq!(a.call("revokes"), "released 1");
-        assert_eq!(b.answer(), "ok 5 fresh verified");
-        t.until(|h| n(h, "leased") == 256 * MIB);
+        assert_eq!(b.answer(), "ok 1 fresh verified");
+        t.until(|h| n(h, "leased") == 224 * MIB);
         check_books(&mut t, &[&a, &b], table, "after a revoke");
         a.kill();
         let h = t.until(|h| executors(h) == 1);
-        assert_eq!((n(&h, "retained"), n(&h, "created")), (64 * MIB, 224 * MIB), "landed chunks retained, the unlanded destroyed: {h}");
+        assert_eq!((n(&h, "retained"), n(&h, "created")), (32 * MIB, 192 * MIB), "landed chunks retained, the unlanded destroyed: {h}");
         check_books(&mut t, &[&b], table, "after an exit");
         b.kill();
-        t.until(|h| executors(h) == 0 && n(h, "retained") == 224 * MIB);
+        t.until(|h| executors(h) == 0 && n(h, "retained") == 192 * MIB);
         check_books(&mut t, &[], table, "with only retained chunks");
         let mut c = agent(&mut t, "d");
-        assert_eq!(c.call(&take(160, 2)), "ok 5 adopted verified");
+        assert_eq!(c.call(&take(160, 2)), "ok 1 adopted verified");
         let h = t.until(|h| n(h, "leased") == 160 * MIB);
-        assert_eq!(n(&h, "created"), 224 * MIB, "adopted with no new chunk");
+        assert_eq!(n(&h, "created"), 192 * MIB, "adopted with no new chunk");
         check_books(&mut t, &[&c], table, "after an adoption");
     }
 
@@ -288,7 +289,7 @@ mod cases {
     fn room_from_dropped_retained_chunks_is_granted_at_once(dir: &Path) {
         let mut t = Tensord::start(dir, 64 * MIB);
         let mut a = agent(&mut t, "d");
-        assert_eq!(a.call(&take(64, 1)), "ok 2 fresh verified");
+        assert_eq!(a.call(&take(64, 1)), "ok 1 fresh verified");
         a.kill();
         t.until(|h| n(h, "retained") == 64 * MIB);
         let mut b = agent(&mut t, "d");
@@ -342,7 +343,7 @@ mod cases {
         for (slot, seq) in g.iter().filter(|(s, _)| asked.split_whitespace().any(|a| a == s.to_string())) {
             assert_eq!(r.call(&format!("release {slot} {seq}")), "ok");
         }
-        assert_eq!(b.answer(), "ok 2 fresh verified");
+        assert_eq!(b.answer(), "ok 1 fresh verified");
     }
 
     /// Acks go by grant sequence (L3): a stale ack moves nothing. A lying ack (released but
@@ -389,31 +390,28 @@ mod cases {
     fn retention_is_keyed_by_domain_and_region(dir: &Path) {
         let mut t = Tensord::start(dir, 256 * MIB);
         let mut a = agent(&mut t, "pub/a@1");
-        assert_eq!(a.call(&take(80, 7)), "ok 3 fresh verified");
+        assert_eq!(a.call(&take(80, 7)), "ok 1 fresh verified");
         a.kill();
         t.until(|h| executors(h) == 0 && n(h, "retained") == 80 * MIB);
         let mut b = agent(&mut t, "pub/b@1");
-        assert_eq!(b.call(&take(80, 7)), "ok 3 fresh verified", "adopted across trust domains");
+        assert_eq!(b.call(&take(80, 7)), "ok 1 fresh verified", "adopted across trust domains");
         let h = t.until(|h| n(h, "leased") == 80 * MIB);
         assert_eq!((n(&h, "retained"), n(&h, "created")), (80 * MIB, 160 * MIB));
         let mut c = agent(&mut t, "pub/a@1");
-        assert_eq!(c.call(&take(80, 7)), "ok 3 adopted verified");
+        assert_eq!(c.call(&take(80, 7)), "ok 1 adopted verified");
         t.until(|h| n(h, "retained") == 0 && n(h, "created") == 160 * MIB);
         let mut r = raw(&mut t, Some("pub/z@1"));
         assert!(r.call(&format!("hello {PROTOCOL}")).starts_with("welcome"));
         assert_eq!(r.call(&format!("ask 1 {} 9", 64 * MIB)), "sent");
-        let g = grants(&mut r, 2);
-        for (i, (slot, seq)) in g.iter().enumerate() {
-            assert_eq!(r.call(&format!("map {slot} 9 {i}")), "ok");
-            assert_eq!(r.call(&format!("ack {slot} {seq} mapped")), "ok");
-            assert_eq!(r.call(&format!("landed {slot}")), "ok");
-        }
-        assert_eq!(r.call(&format!("forge index {} 1", g[0].0)), "ok");
-        assert_eq!(r.call(&format!("forge index {} 0", g[1].0)), "ok");
+        let (slot, seq) = grants(&mut r, 1)[0];
+        assert_eq!(r.call(&format!("map {slot} 9 0")), "ok");
+        assert_eq!(r.call(&format!("ack {slot} {seq} mapped")), "ok");
+        assert_eq!(r.call(&format!("landed {slot}")), "ok");
+        assert_eq!(r.call(&format!("forge index {slot} 1")), "ok");
         r.kill();
         t.until(|h| n(h, "retained") == 64 * MIB);
         let mut d = agent(&mut t, "pub/z@1");
-        assert_eq!(d.call(&take(64, 9)), "ok 2 adopted verified");
+        assert_eq!(d.call(&take(64, 9)), "ok 1 adopted verified");
     }
 
     /// The manager speaks the current protocol and, from protocol 3, the previous one. Any other
@@ -469,7 +467,7 @@ mod cases {
     fn a_stall_is_judged_on_the_looks_cadence(dir: &Path) {
         let mut t = Tensord::start(dir, 128 * MIB);
         let (mut a, mut c) = (agent(&mut t, "d"), agent(&mut t, "d"));
-        assert_eq!(a.call(&take(96, 1)), "ok 3 fresh verified");
+        assert_eq!(a.call(&take(96, 1)), "ok 1 fresh verified");
         let mut b = agent(&mut t, "d");
         b.send(&take(64, 2));
         a.wait_rang();
@@ -485,7 +483,7 @@ mod cases {
         let waited: Vec<u64> = t.records().iter().filter(|r| r["event"] == "stalled" && r["pid"] == a.pid()).map(|r| n(r, "waited_ms")).collect();
         assert!(named - rang > LOOK && waited.iter().all(|w| *w >= LOOK.as_millis() as u64), "named {:?} after its ask, judged at {waited:?} ms", named - rang);
         assert_eq!(a.call("revokes"), "released 1");
-        assert_eq!(b.answer(), "ok 2 fresh verified");
+        assert_eq!(b.answer(), "ok 1 fresh verified");
         let start = Instant::now();
         while !t.stalled().is_empty() {
             assert!(start.elapsed() < BOUND, "a release clears the verdict");
@@ -498,7 +496,7 @@ mod cases {
     fn a_fence_whose_epoch_moves_is_never_a_stall(dir: &Path) {
         let mut t = Tensord::start(dir, 128 * MIB);
         let mut a = agent(&mut t, "d");
-        assert_eq!(a.call(&take(96, 1)), "ok 3 fresh verified");
+        assert_eq!(a.call(&take(96, 1)), "ok 1 fresh verified");
         let mut b = agent(&mut t, "d");
         b.send(&take(64, 2));
         a.wait_rang();
@@ -511,7 +509,7 @@ mod cases {
         }
         t.until_stalled(a.pid());
         assert_eq!(a.call("revokes"), "released 1");
-        assert_eq!(b.answer(), "ok 2 fresh verified");
+        assert_eq!(b.answer(), "ok 1 fresh verified");
     }
 
     /// An asked chunk under a pin (a running pass) is never a stall; once unpinned and still
@@ -519,7 +517,7 @@ mod cases {
     fn a_pinned_ask_is_never_a_stall(dir: &Path) {
         let mut t = Tensord::start(dir, 64 * MIB);
         let mut a = agent(&mut t, "d");
-        assert_eq!(a.call(&take(64, 1)), "ok 2 fresh verified");
+        assert_eq!(a.call(&take(64, 1)), "ok 1 fresh verified");
         assert_eq!(a.call("pin"), "ok");
         let mut b = agent(&mut t, "d");
         b.send(&take(32, 2));
@@ -563,18 +561,21 @@ mod cases {
         let welcome = r.call(&format!("hello {PROTOCOL}"));
         let epoch: u64 = welcome.split_whitespace().nth(1).unwrap().parse().unwrap();
         let table = nvml_used(&[t.p.pid(), r.pid()]);
-        assert_eq!(r.call(&format!("ask 1 {} 5", 64 * MIB)), "sent");
-        let g = grants(&mut r, 2);
-        for (i, (slot, seq)) in g.iter().enumerate() {
-            assert_eq!(r.call(&format!("map {slot} 5 {i}")), "ok");
+        let regions = [5, 6];
+        let mut g = vec![];
+        for region in regions {
+            assert_eq!(r.call(&format!("ask {region} {} {region}", 32 * MIB)), "sent");
+            let (slot, seq) = grants(&mut r, 1)[0];
+            assert_eq!(r.call(&format!("map {slot} {region} 0")), "ok");
             assert_eq!(r.call(&format!("ack {slot} {seq} mapped")), "ok");
             assert_eq!(r.call(&format!("landed {slot}")), "ok");
+            g.push((slot, seq));
         }
         t.until(|h| n(h, "leased") == 64 * MIB);
         t.p.kill();
         // The pages outlive their creator: the executor's imports hold them.
-        for (i, (slot, _)) in g.iter().enumerate() {
-            assert_eq!(r.call(&format!("read {slot} 5 {i}")), "verified");
+        for ((slot, _), region) in g.iter().zip(regions) {
+            assert_eq!(r.call(&format!("read {slot} {region} 0")), "verified");
         }
         let mut t = Tensord::start(dir, 128 * MIB);
         t.admit(r.pid(), "d");
@@ -589,7 +590,7 @@ mod cases {
         }
         // Books-only bytes count against the card: a new executor gets only the rest.
         let mut b = agent(&mut t, "d");
-        assert_eq!(b.call(&take(64, 6)), "ok 2 fresh verified");
+        assert_eq!(b.call(&take(64, 7)), "ok 1 fresh verified");
         check_books(&mut t, &[&r, &b], table, "after a restart");
         assert_eq!(r.call(&format!("release {} {}", g[0].0, g[0].1)), "ok");
         t.until(|h| n(h, "books_only") == 32 * MIB);
@@ -858,9 +859,8 @@ mod cases {
         grants: BTreeMap<u32, Grant>,
     }
 
-    /// table.rs's layout, mirrored for forging: a 64-byte line per slot after the header; a
-    /// word is state | pins << 4 | seq << 32.
-    const LINE: usize = 64;
+    /// table.rs's layout, mirrored for forging: slot `i` starts at `table::bytes(i)`, its word
+    /// state | pins << 4 | seq << 32.
     const HEADER_PID: usize = 16;
     const SLOT_INDEX: usize = 40;
 
@@ -1021,7 +1021,7 @@ mod cases {
                     _ => 0,
                 };
                 let word = state | pins.parse::<u64>().unwrap() << 4 | seq.parse::<u64>().unwrap() << 32;
-                s.at::<AtomicU64>(LINE * (1 + slot.parse::<usize>().unwrap())).store(word, SeqCst);
+                s.at::<AtomicU64>(table::bytes(slot.parse().unwrap())).store(word, SeqCst);
                 s.ring();
                 "ok".into()
             }
@@ -1030,7 +1030,7 @@ mod cases {
                 "ok".into()
             }
             ["forge", "index", slot, index] => {
-                s.at::<AtomicU32>(LINE * (1 + slot.parse::<usize>().unwrap()) + SLOT_INDEX).store(index.parse().unwrap(), SeqCst);
+                s.at::<AtomicU32>(table::bytes(slot.parse().unwrap()) + SLOT_INDEX).store(index.parse().unwrap(), SeqCst);
                 s.ring();
                 "ok".into()
             }
