@@ -271,7 +271,7 @@ class Core:
             e.code = "PANIC"
             raise e
 
-    def serve(self, row: object) -> None:
+    def serve(self, row: object, answer: object) -> None:
         pass
 
     def register(self, name: str, ck: object, regions: list[list[str]], host_fd: object) -> Set:
