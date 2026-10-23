@@ -910,17 +910,20 @@ impl Memory {
     }
 
     /// Registers bytes the caller holds (torch tensors) that `shrink(want) -> freed` gives back:
-    /// `make_room` takes caches nobody holds after other sets' idle pages, least recently used
-    /// first (never inside the allocator: its shrink frees through it). A cache whose `owner`
-    /// is a request id ends with that request.
-    pub fn cache(&self, owner: &str, shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
+    /// `make_room` takes a cache nobody holds after other sets' idle pages, ranked with the
+    /// current step's pages by next use, its components' (`sets`: a graph pool names its
+    /// component; none, no declared use), a page before it on a tie (never inside the
+    /// allocator: its shrink frees through it). A cache whose `owner` is a request id ends with
+    /// that request.
+    pub fn cache(&self, owner: &str, sets: &[SetId], shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
         let shrink: Shrink = Arc::new(shrink);
         self.inner
             .guard(|| {
                 let mut st = self.inner.lock();
                 let id = st.tick() as u32;
                 let last_use = st.clock;
-                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), last_use, ..Default::default() });
+                let sets = sets.iter().map(|s| s.0).collect();
+                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), sets, last_use, ..Default::default() });
                 st.shrinks.insert(id, shrink);
                 self.inner.unlock(st);
                 Ok(CacheId(id))
