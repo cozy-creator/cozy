@@ -257,37 +257,6 @@ impl Req {
     }
 }
 
-/// Another process's row, as it published it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Remote {
-    /// Its row's offset and generation (a reused offset is another row).
-    pub row: u64,
-    /// It has a request open.
-    pub running: bool,
-    pub context: u64,
-    pub torch: u64,
-    /// Actual unique device backing attributed to this row, including context/native bytes.
-    /// Orphans remain on custody's separate counter.
-    pub physical: u64,
-    /// Of `torch`, its caches' bytes when it is idle (display).
-    pub caches: u64,
-    pub classes: [u64; 7],
-    /// Bytes it is giving back: retiring pages (of P); still held, reachable once they land.
-    pub returning: u64,
-}
-
-impl Remote {
-    pub fn held(&self) -> u64 {
-        self.context + self.torch + self.classes.iter().enumerate().filter(|(c, _)| *c != Class::O.index()).map(|(_, b)| b).sum::<u64>()
-    }
-
-    /// The pages its ask thread may give back: those no running step of its uses (S, N and D;
-    /// of D, it gives what only a request waiting on a child call uses).
-    pub fn idle(&self) -> u64 {
-        [Class::S, Class::N, Class::D].iter().filter_map(|c| self.classes.get(c.index())).sum()
-    }
-}
-
 /// One process's facts on one device.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Table {
