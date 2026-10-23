@@ -429,6 +429,16 @@ impl Backend for CudaBackend {
         Ok(tensorfs::io::drain(self.ordinal)?)
     }
 
+    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8], after: Event) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        let stream = self.stream.raw() as CUstream;
+        if after != Event::DONE {
+            call!("cuStreamWaitEvent", stream_wait_event(stream, self.raw(after)?, 0))?;
+        }
+        call!("cuMemcpyDtoHAsync", memcpy_dtoh_async(dst.as_mut_ptr().cast(), va.base + offset, dst.len(), stream))?;
+        Ok(call!("cuStreamSynchronize", stream_synchronize(stream))?)
+    }
+
     fn capturing(&self, stream: usize) -> Result<bool> {
         let _ctx = self.primary.enter()?;
         let mut status: c_int = 0;

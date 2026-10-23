@@ -273,7 +273,7 @@ fn r2_a_free_during_a_capture_waits_for_its_end() {
     let pool = PoolId(1, 0);
     let (torch, gpu, (begun_tx, begun), (end_tx, end)) = (r.torch.clone(), r.gpu.clone(), mpsc::channel(), mpsc::channel::<()>());
     let capture = std::thread::spawn(move || {
-        torch.pool_begin(pool, C);
+        torch.pool_begin(pool, None);
         gpu.capture(C, true);
         begun_tx.send(()).unwrap();
         end.recv().unwrap();
@@ -307,7 +307,7 @@ fn r4_r5_a_pool_keeps_its_spans_until_released_and_fenced() {
     r.torch.pool_prepare(pool, 8 * MB).unwrap();
     let (torch, gpu) = (r.torch.clone(), r.gpu.clone());
     let blocks = returns("a capture", move || {
-        torch.pool_begin(pool, A);
+        torch.pool_begin(pool, None);
         gpu.capture(A, true);
         let mut got: Vec<u64> = (0..3).map(|_| torch.alloc(MB, A, Some(pool)).unwrap()).collect();
         let freed = got.pop().unwrap();
@@ -343,7 +343,7 @@ fn a_shared_pool_leaves_at_its_last_release() {
     let (torch, gpu) = (r.torch.clone(), r.gpu.clone());
     returns("two captures", move || {
         for _ in 0..2 {
-            torch.pool_begin(pool, A);
+            torch.pool_begin(pool, None);
             gpu.capture(A, true);
             let b = torch.alloc(MB, A, Some(pool)).unwrap();
             torch.free(b, MB, A);
@@ -375,7 +375,7 @@ fn r6_a_capturing_thread_never_reaches_the_source() {
     let (torch, gpu) = (r.torch.clone(), r.gpu.clone());
     returns("a capture", move || {
         let pool = PoolId(3, 3);
-        torch.pool_begin(pool, A);
+        torch.pool_begin(pool, None);
         gpu.capture(A, true);
         let refused = torch.alloc(100 * MB, A, Some(pool));
         assert!(matches!(refused, Err(varena::Error::Exhausted(_))), "{refused:?}");
@@ -468,7 +468,7 @@ fn a_capture_that_died_without_an_end_is_reaped() {
     let (p, keep) = (r.torch.alloc(4 * MB, B, None).unwrap(), r.torch.alloc(4 * MB, B, None).unwrap());
     let (torch, gpu) = (r.torch.clone(), r.gpu.clone());
     returns("a capture that dies", move || {
-        torch.pool_begin(pool, A);
+        torch.pool_begin(pool, None);
         gpu.capture(A, true);
         torch.alloc(MB, A, Some(pool)).unwrap();
         // The capture stops (its thread died mid-capture): no pool_end.
@@ -482,7 +482,7 @@ fn a_capture_that_died_without_an_end_is_reaped() {
     r.torch.free(keep, 4 * MB, B);
     let torch = r.torch.clone();
     returns("a capture that never allocated", move || {
-        torch.pool_begin(PoolId(5, 5), C);
+        torch.pool_begin(PoolId(5, 5), None);
         torch.pool_end(PoolId(5, 5));
         torch.pool_release(PoolId(5, 5));
         let x = torch.alloc(4 * MB, C, None).unwrap();
@@ -500,7 +500,7 @@ fn a_shortfall_beside_an_open_capture_completes() {
     r.torch.free(p, 30 * MB, A);
     let (torch, gpu, (open_tx, open), (end_tx, end)) = (r.torch.clone(), r.gpu.clone(), mpsc::channel(), mpsc::channel::<()>());
     let capture = std::thread::spawn(move || {
-        torch.pool_begin(PoolId(6, 6), B);
+        torch.pool_begin(PoolId(6, 6), None);
         gpu.capture(B, true);
         open_tx.send(()).unwrap();
         end.recv().unwrap();
@@ -522,15 +522,16 @@ fn a_shortfall_beside_an_open_capture_completes() {
 }
 
 /// A begin that threw (cudaStreamBeginCapture failed): its stream never captures. The poller
-/// leaves it (right after the hook, a capture about to start looks the same), but the thread's next
-/// allocator call ends it, and so does torch's reset from any thread.
+/// leaves it (right after the hook, a capture about to start looks the same). With its stream
+/// known, the thread's next allocator call ends it; with none known, torch's reset or the
+/// Runtime's capture_failed does, from any thread.
 #[test]
 fn a_begin_that_threw_is_ended() {
     let r = rig(512 * MB, true);
     let (p, keep) = (r.torch.alloc(4 * MB, B, None).unwrap(), r.torch.alloc(4 * MB, B, None).unwrap());
     let (torch, (began_tx, began), (next_tx, next)) = (r.torch.clone(), mpsc::channel(), mpsc::channel::<()>());
     let threw = std::thread::spawn(move || {
-        torch.pool_begin(PoolId(8, 8), A);
+        torch.pool_begin(PoolId(8, 8), Some(A));
         began_tx.send(()).unwrap();
         next.recv().unwrap();
         let x = torch.alloc(4096, C, None).unwrap();
@@ -545,7 +546,7 @@ fn a_begin_that_threw_is_ended() {
     threw.join().unwrap();
     until("the thread's next call ended it", || r.torch.stats().allocated == 4 * MB);
     let torch = r.torch.clone();
-    std::thread::spawn(move || torch.pool_begin(PoolId(9, 1), A)).join().unwrap();
+    std::thread::spawn(move || torch.pool_begin(PoolId(9, 1), None)).join().unwrap();
     r.torch.free(keep, 4 * MB, B);
     assert_eq!(r.torch.stats().allocated, 4 * MB, "a free during the dead capture applied");
     r.torch.pool_end(PoolId(9, 1));
