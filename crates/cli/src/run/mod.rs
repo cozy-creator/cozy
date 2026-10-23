@@ -1,6 +1,8 @@
 //! `cozy run`: run a function on a machine, and the verbs over runs.
 use std::{path::PathBuf, process::ExitCode};
 
+use clap::ValueHint;
+use clap_complete::ArgValueCompleter;
 use protocol::{
     calcifer::{On, Run, StagedInput, SubmitRun},
     config::Hub,
@@ -42,10 +44,10 @@ pub struct Args {
 #[derive(clap::Args, Debug)]
 struct RunArgs {
     /// `org/pkg[/fn][@release]`, `./dir[/fn]` or `./script.py`; without a function, its functions.
-    #[arg(required = true, value_name = "TARGET")]
+    #[arg(required = true, value_name = "TARGET", add = ArgValueCompleter::new(crate::completion::local))]
     target: Option<String>,
     /// `key=value`, `key:=json`, `model.<slot>=<ref>`, one positional value, input files.
-    #[arg(value_name = "INPUT")]
+    #[arg(value_name = "INPUT", value_hint = ValueHint::FilePath)]
     inputs: Vec<String>,
     #[command(flatten)]
     placement: Placement,
@@ -64,7 +66,7 @@ struct RunArgs {
     #[arg(long = "input", value_name = "FILE")]
     input_file: Option<PathBuf>,
     /// Attach a file: `field.path=FILE`, `label=FILE`, or `FILE` into the declared assets.
-    #[arg(long = "asset", value_name = "[NAME=]FILE")]
+    #[arg(long = "asset", value_name = "[NAME=]FILE", value_hint = ValueHint::FilePath)]
     assets: Vec<String>,
     /// A hint for one attached asset: `label-or-index=auto|low|medium|high`.
     #[arg(long = "asset-fidelity", value_name = "ASSET=FIDELITY", value_parser = fidelity)]
@@ -73,7 +75,7 @@ struct RunArgs {
     #[arg(long = "lora", value_name = "SLOT:COMPONENT=REF")]
     loras: Vec<String>,
     /// Where the outputs land (default ~/.cozy/outputs).
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
     out: Option<PathBuf>,
     /// Print the run's record at once instead of following it.
     #[arg(long)]

@@ -95,6 +95,9 @@ enum Step {
 }
 
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
+    if let Err(e) = crate::completion::install(&ctx.user_home) {
+        crate::output::warn(&format!("shell completion not installed: {e}"));
+    }
     let current = env!("CARGO_PKG_VERSION");
     let binary = installed()?;
     let wanted = args.version.as_deref().map(|v| v.trim_start_matches('v'));
