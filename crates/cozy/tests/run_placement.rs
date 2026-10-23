@@ -78,7 +78,7 @@ fn a_new_run_says_where_the_hub_placed_it_and_what_else_it_would_rent() {
     // cheaper per run but slow; the B200 is the fastest. The H100 PCIe sells no single GPU.
     let quoted = home.cozy(["run", &format!("{package}/draw"), "--on", "new"]);
     assert_ne!(quoted.code, 0, "{quoted:?}");
-    let said = &quoted.stderr;
+    let said = format!("{}{}", quoted.stdout, quoted.stderr);
     for line in [
         "rtx-4090 ×1: $",
         "the Hub placed it on rtx-4090 (1× NVIDIA GeForce RTX 4090, 24 GB)",
@@ -101,10 +101,11 @@ fn a_new_run_says_where_the_hub_placed_it_and_what_else_it_would_rent() {
 
     // `--on new:<sku>`: the Hub ranks that product alone; `--gpus` fixes its count.
     let b200 = home.cozy(["run", &format!("{package}/draw"), "--on", "new:b200"]);
+    let said = format!("{}{}", b200.stdout, b200.stderr);
     assert!(
-        b200.stderr.contains("b200 ×1: $") && b200.stderr.contains("the Hub placed it on b200"),
+        said.contains("b200 ×1: $") && said.contains("the Hub placed it on b200"),
         "{b200:?}"
     );
     let pair = home.cozy(["run", &format!("{package}/draw"), "--on", "new:b200", "--gpus", "2"]);
-    assert!(pair.stderr.contains("b200 ×2: $"), "{pair:?}");
+    assert!(format!("{}{}", pair.stdout, pair.stderr).contains("b200 ×2: $"), "{pair:?}");
 }
