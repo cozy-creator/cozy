@@ -385,7 +385,8 @@ impl Manager {
         std::thread::Builder::new()
             .name("lease-listener".into())
             .spawn(move || {
-                for stream in listener.incoming() {
+                loop {
+                    let stream = platform::memory::accept(&listener);
                     if serving.retired.load(Relaxed) {
                         break;
                     }
