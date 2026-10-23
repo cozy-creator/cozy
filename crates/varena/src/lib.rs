@@ -14,6 +14,8 @@ pub mod decide;
 #[cfg(feature = "faults")]
 pub mod faults;
 pub mod layout;
+#[cfg(unix)]
+pub mod lease;
 pub mod ledger;
 pub mod memory;
 pub mod os;
