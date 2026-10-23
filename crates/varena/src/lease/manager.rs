@@ -5,9 +5,9 @@
 //! exports. What to allocate, reclaim and refuse is [`policy::decide`]'s: the manager builds its
 //! snapshot from the page accounting and applies the answer.
 //!
-//! The room is the device's own figure (§12, 18:40Z): the driver's free bytes (cuMemGetInfo), read
-//! outside the lock before every decision, less what was created since that read, less the
-//! reserved pool. Every context, module, library buffer and foreign byte is simply used: the
+//! The room is the device's own figure (§12, 18:40Z): the driver's free bytes as its host reads
+//! them with no context of ours (NVML; Windows: the DXGI budget less its usage), read outside the
+//! lock before every decision, less what was created since that read, less the reserved pool. Every context, module, library buffer and foreign byte is simply used: the
 //! page accounting never rests on an agent's word.
 //!
 //! One manager per GPU, TensorD's, with the GPU's listener; TensorD reacts to [`Manager::events`].
@@ -32,7 +32,7 @@ use platform::process::Exact;
 
 use super::policy::{self, Advice, Answer, Pick};
 use super::table::{self, Content, Figures, State, Table};
-use super::wire::{End, Kind, Measured, Refusal, Region, ToAgent, ToManager};
+use super::wire::{End, Kind, Measured, Refusal, Region, RegionFacts, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
 use crate::decide;
 use crate::os::{self, Listener, Owned, Stream};
@@ -86,6 +86,13 @@ pub trait Hosting: Send + Sync {
 
     /// A record of what the manager did, after its books dropped.
     fn record(&self, _record: Record) {}
+
+    /// The device's free bytes now as the driver counts them, needing no CUDA context of
+    /// TensorD's (NVML's memory info; Windows: the DXGI budget less its usage). `None`: unread
+    /// here, and the manager falls back to its open backend's (cuMemGetInfo), if it has one.
+    fn free(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -206,6 +213,9 @@ struct Books {
     /// Every byte ever created and destroyed: what changed since a sample is these less its own.
     created_total: u64,
     destroyed_total: u64,
+    /// min(limit, card), and the reserved pool: the backend's once it opened.
+    card: u64,
+    reserve: u64,
     /// The driver's last reading; `None`: unread, and nothing grows.
     sample: Option<Sample>,
     /// Device bytes no process of ours holds, as TensorD last sampled them (shown only), and
@@ -249,6 +259,9 @@ struct Exec {
     reported: BTreeSet<u32>,
     /// The executors whose pins its waiting ask waits on.
     waits_on: BTreeSet<u64>,
+    /// Its regions and graphs, as its agent last reported them, and those asked back whole.
+    regions: BTreeMap<u64, RegionFacts>,
+    reclaiming: BTreeSet<u64>,
 }
 
 struct Leased {
@@ -324,14 +337,14 @@ fn cached(b: &Books, domain: &str, region: Option<Region>, sizes: &[u64]) -> Opt
 /// what was created since and plus what was destroyed since, within the card or limit; `None`
 /// while unread.
 fn free(b: &Books) -> Option<u64> {
-    let (sample, d) = (b.sample?, b.device.as_ref()?);
+    let sample = b.sample?;
     let driver = (sample.free + (b.destroyed_total - sample.destroyed)).saturating_sub(b.created_total - sample.created);
-    Some(driver.min(d.card.saturating_sub(b.created) + d.headroom))
+    Some(driver.min(b.card.saturating_sub(b.created) + b.reserve))
 }
 
 /// What may be created now: free less the reserved pool.
 fn room(b: &Books) -> u64 {
-    free(b).map_or(0, |f| f.saturating_sub(b.device.as_ref().map_or(0, |d| d.headroom)))
+    free(b).map_or(0, |f| f.saturating_sub(b.reserve))
 }
 
 /// A figure at `<kind>/<key>`; a key ending in `|` (no shape) means the widest measured.
@@ -359,7 +372,8 @@ impl Manager {
     /// reserved pool, within `limit` (a `--gpu-memory-limit`, else the card).
     pub fn create(gpu: &GpuId, limit: Option<u64>, mode: Mode, open: Option<Opener>, listener: Listener, hosting: Arc<dyn Hosting>) -> Result<Arc<Manager>> {
         let events = Signal::new().map_err(|e| Error::Io(e.to_string()))?;
-        let books = Mutex::new(Books { mode, ..Books::default() });
+        let card = limit.unwrap_or(gpu.memory).min(gpu.memory);
+        let books = Mutex::new(Books { mode, card, reserve: crate::backend::RESERVE, ..Books::default() });
         let manager = Arc::new(Manager { open, opening: Mutex::new(()), gpu_memory: gpu.memory, limit, hosting, retired: AtomicBool::new(false), books, looking: Condvar::new(), events, born: Instant::now() });
         let weak = Arc::downgrade(&manager);
         std::thread::Builder::new().name("lease-look".into()).spawn(move || look_loop(&weak)).map_err(|e| Error::io("spawn lease-look", e))?;
@@ -530,7 +544,7 @@ impl Manager {
             let mut b = self.books.lock();
             b.next += 1;
             let id = b.next;
-            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, seen: (0, 0), still: 0, stalled: false, reported: BTreeSet::new(), waits_on: BTreeSet::new() };
+            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, seen: (0, 0), still: 0, stalled: false, reported: BTreeSet::new(), waits_on: BTreeSet::new(), regions: BTreeMap::new(), reclaiming: BTreeSet::new() };
             b.executors.insert(id, exec);
             id
         };
@@ -542,8 +556,8 @@ impl Manager {
                     let out = match message {
                         ToManager::Ask { id: ask, bytes, kind, region } => self.ask(id, Waiting { id: ask, bytes, kind, region }),
                         ToManager::Answered => self.answered(id),
-                        // The policy builder's: Exec.regions, ranked in decide.
-                        ToManager::Region(_) | ToManager::RegionGone { .. } => Out::default(),
+                        ToManager::Region(facts) => self.region(id, facts.id, Some(facts)),
+                        ToManager::RegionGone { id: region } => self.region(id, region, None),
                         ToManager::Measured(m) => self.measured(id, m),
                         ToManager::Hello { .. } => Out::default(),
                     };
@@ -615,20 +629,23 @@ impl Manager {
         let backend = open()?;
         let card = self.limit.unwrap_or(self.gpu_memory).min(backend.capacity());
         let device = Arc::new(Device { card, granularity: backend.granularity().max(1), headroom: backend.headroom(), backend });
-        self.books.lock().device = Some(device.clone());
+        let mut b = self.books.lock();
+        (b.card, b.reserve) = (device.card, device.headroom);
+        b.device = Some(device.clone());
+        drop(b);
         Ok(device)
     }
 
     /// The driver's free bytes now, read outside the lock between the created counter (read
     /// before) and the destroyed one (read after): a chunk created during the read counts twice,
     /// one destroyed during it not at all until the next read, so neither over-grants. `None`
-    /// when there is no device yet or the read failed: then nothing grows.
+    /// when nothing could be read: then nothing grows.
     fn read(&self) -> Option<Sample> {
         let (device, created) = {
             let b = self.books.lock();
-            (b.device.clone()?, b.created_total)
+            (b.device.clone(), b.created_total)
         };
-        let free = device.backend.free().ok()?;
+        let free = self.hosting.free().or_else(|| device?.backend.free().ok())?;
         let destroyed = self.books.lock().destroyed_total;
         Some(Sample { free, created, destroyed })
     }
@@ -682,12 +699,40 @@ impl Manager {
         Out::default()
     }
 
+    /// A region's facts (`None`: gone). One reported with no chunks after its reclaim is no
+    /// longer being reclaimed.
+    fn region(&self, exec: u64, id: u64, facts: Option<RegionFacts>) -> Out {
+        let mut b = self.books.lock();
+        if let Some(e) = b.executors.get_mut(&exec) {
+            match facts {
+                Some(f) => {
+                    if f.slots.is_empty() {
+                        e.reclaiming.remove(&id);
+                    }
+                    e.regions.insert(id, f);
+                }
+                None => {
+                    e.regions.remove(&id);
+                    e.reclaiming.remove(&id);
+                }
+            }
+        }
+        self.settle(&mut b)
+    }
+
     // ---- Admission and placement (TensorD's): its own dispatches and the measured peaks.
 
     /// The device bytes requests can use: free and every chunk of ours (all of it reclaimable),
     /// less the reserved pool; 0 until the device was read (a request then waits).
     fn usable(b: &Books) -> u64 {
-        free(b).map_or(0, |f| (f + b.created).saturating_sub(b.device.as_ref().map_or(0, |d| d.headroom)))
+        free(b).map_or(0, |f| (f + b.created).saturating_sub(b.reserve))
+    }
+
+    /// A fresh reading for admission and placement, which run before anything is asked.
+    fn refresh(&self) {
+        if let Some(sample) = self.read() {
+            self.books.lock().sample = Some(sample);
+        }
     }
 
     /// The measured peaks of every dispatched request (`None`: unmeasured).
@@ -700,6 +745,7 @@ impl Manager {
     /// within the usable bytes; anything unmeasured only on an idle GPU. A request that does not
     /// fit queues before it starts, so two never wait on each other's protected steps.
     pub fn fits(&self, package: &str, shape: &str) -> bool {
+        self.refresh();
         let b = self.books.lock();
         decide::fits(Self::usable(&b), 0, &[], &Self::dispatched_peaks(&b), figure(&b, "peak", &format!("{package}|{shape}")), None)
     }
@@ -735,6 +781,7 @@ impl Manager {
         let key = format!("{package}|{shape}");
         let mut rooms = Vec::with_capacity(group.len());
         for (g, m) in group.iter().enumerate() {
+            m.refresh();
             let b = m.books.lock();
             let running: u64 = Self::dispatched_peaks(&b).into_iter().flatten().sum();
             let working = if g == 0 { figure(&b, "compute", &key).unwrap_or(0) } else { 0 };
@@ -912,7 +959,7 @@ impl Manager {
     /// The decision's snapshot: the page accounting, every waiting ask in each executor's
     /// order, and the page cache's keys by the index the decision names them.
     fn snapshot(&self, b: &Books, free: u64) -> (policy::Snapshot, Vec<policy::Ask>, Vec<Kept>) {
-        let (reserved, granularity) = b.device.as_ref().map_or((0, 1), |d| (d.headroom, d.granularity));
+        let (reserved, granularity) = (b.reserve, b.device.as_ref().map_or(1, |d| d.granularity));
         let cache: Vec<Kept> = b.order.iter().cloned().collect();
         let (mut asks, mut executors) = (vec![], vec![]);
         for (id, e) in &b.executors {
@@ -927,7 +974,17 @@ impl Manager {
                 Some(policy::Chunk { slot: *slot, seq: l.seq, bytes: l.phys.len, state: w.state, pins: w.pins, asked: e.asked.contains_key(slot), advice: Advice::decode(class, value) })
             };
             let waits_on = if e.waiting.is_empty() { vec![] } else { e.waits_on.iter().copied().collect() };
-            executors.push(policy::Executor { id: *id, chunks: e.leased.iter().filter_map(chunk).collect(), regions: vec![], graphs: vec![], waits_on });
+            let (mut regions, mut graphs) = (vec![], vec![]);
+            for (rid, f) in &e.regions {
+                let next_use = (f.next_use != u64::MAX).then_some(f.next_use);
+                match f.kind {
+                    crate::region::Reclaimable::Graph => graphs.push(policy::Graph { id: *rid, chunks: f.slots.clone(), last_use: f.last_use, next_use, capture_ns: f.cost_ns, dropping: e.reclaiming.contains(rid) }),
+                    // One being reclaimed already: its chunks are asked; it is no candidate.
+                    _ if e.reclaiming.contains(rid) => {}
+                    kind => regions.push(policy::Region { id: *rid, chunks: f.slots.clone(), swappable: kind == crate::region::Reclaimable::Swappable, last_use: f.last_use, next_use, produce_ns: f.cost_ns }),
+                }
+            }
+            executors.push(policy::Executor { id: *id, chunks: e.leased.iter().filter_map(chunk).collect(), regions, graphs, waits_on });
         }
         let page_cache = cache.iter().map(|k| b.retained.get(k).map_or(0, |v| v.values().map(|p| p.len).sum())).collect();
         let snapshot = policy::Snapshot { free, reserved, new_foreign: b.new_foreign, page_cache, executors, host: policy::Host::default() };
@@ -960,8 +1017,10 @@ impl Manager {
                         freed = true;
                     }
                 }
-                // Regions and graphs reach the manager with their frames (step 3).
-                Pick::Region { .. } | Pick::Graph { .. } => {}
+                // A region or graph whole: its agent swaps, discards or drops it (its chunks follow
+                // as reclaim requests).
+                Pick::Region { executor, region, swap } => self.reclaim_region(b, out, executor, region, swap),
+                Pick::Graph { executor, region } => self.reclaim_region(b, out, executor, region, false),
             }
         }
         for (id, slots) in asked {
@@ -1013,6 +1072,13 @@ impl Manager {
         freed
     }
 
+    fn reclaim_region(&self, b: &mut Books, out: &mut Out, exec: u64, region: u64, swap: bool) {
+        if let Some(e) = b.executors.get_mut(&exec) {
+            e.reclaiming.insert(region);
+            out.sends.push((e.end.clone(), ToAgent::Reclaim { region, swap }, None));
+        }
+    }
+
     /// PSI's spans: one opens when an ask starts waiting and closes when none does.
     fn waited(&self, b: &mut Books) {
         let now = self.now();
@@ -1031,7 +1097,7 @@ impl Manager {
 
     /// Every table's figures: free bytes, and the cold room reclaim could give that executor.
     fn publish(&self, b: &Books) {
-        let headroom = b.device.as_ref().map_or(0, |d| d.headroom);
+        let headroom = b.reserve;
         let (snapshot, _, _) = self.snapshot(b, free(b).unwrap_or(0));
         let free = room(b);
         for (id, e) in &b.executors {
