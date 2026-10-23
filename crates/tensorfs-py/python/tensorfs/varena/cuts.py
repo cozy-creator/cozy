@@ -253,10 +253,9 @@ def _note(name: str, size: int) -> None:
 # ------------------------------------------------------------------------ out of memory
 
 
-def short(exc: BaseException, first: bool = False) -> int | None:
-    """The bytes a device allocation failure asked for (0: not said); None for any other. A
-    `first` failure counts a cuBLAS or cuDNN status too (its own allocation may be behind it): it
-    runs once more with room made, and a second is the library's own."""
+def short(exc: BaseException) -> int | None:
+    """The bytes a device allocation failure asked for (0: not said); None for any other. Of a
+    cuBLAS or cuDNN status, only an `_ALLOC_FAILED` says so: another is told apart by `_room`."""
     if isinstance(exc, torch.OutOfMemoryError):
         found = _ALLOCATE.search(str(exc))
         return int(float(found[1]) * _UNITS[found[2]]) if found else 0
@@ -264,8 +263,52 @@ def short(exc: BaseException, first: bool = False) -> int | None:
     if isinstance(exc, torch.AcceleratorError):
         return 0 if getattr(exc, "error_code", None) == 2 or "out of memory" in text else None
     failed = any(mark in text for mark in _REFUSED)
-    failed |= first and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
     return 0 if isinstance(exc, RuntimeError) and failed else None
+
+
+def _refused(exc: BaseException) -> bool:
+    """A launch the driver refused with 999 (CUDA_ERROR_UNKNOWN): on a full card, a kernel whose
+    module could not load at its first launch (cr-215: cub's scan in masked_scatter)."""
+    return isinstance(exc, torch.AcceleratorError) and getattr(exc, "error_code", None) == 999
+
+
+def _disguised(exc: BaseException) -> bool:
+    text = str(exc)
+    library = isinstance(exc, RuntimeError) and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
+    return library or _refused(exc)
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _room(exc: BaseException, device: torch.device, first: BaseException | None = None) -> int | None:
+    """The bytes to make room for before running again; None: not a memory failure, raise it.
+    An allocation failure (out of memory, an `_ALLOC_FAILED` status) as its text says. Any other
+    cuBLAS or cuDNN status (a library's handle or workspace, run 3095) and a launch refused with
+    999 (a kernel's module, cr-215) are allocations under another name, or device faults: the
+    device synchronizes once to tell, on this failure path only. A sticky error means the context
+    is dead: the original raises at once with it chained, no room made, no replay. A clean device
+    makes it an allocation failure, once: again (`first`, the one already run again for), the
+    original raises."""
+    need = short(exc)
+    if need is not None or not _disguised(exc):
+        return need
+    if first is not None:
+        raise first
+    try:
+        _synchronize(device)
+    except Exception as sticky:
+        raise exc from sticky
+    return 0
+
+
+def _retried(exc: BaseException, op: str) -> None:
+    """The failure a retry answers, in the request's record before its frames go: every retry
+    names what it retried."""
+    text = next(iter(str(exc).strip().splitlines()), "")[:200]
+    _served.rungs.noted(0, f"retried {op}: {type(exc).__name__}: {text}", 0)
 
 
 def _clear(exc: BaseException) -> None:
@@ -294,6 +337,7 @@ def _settle(
     again: bool | None = None,
     before: Callable[[int], _T | None] | None = None,
     last: Callable[[], _T | None] | None = None,
+    first: BaseException | None = None,
 ) -> tuple[int, _T]:
     """`run(size)` until it fits, each try strictly smaller: room made (rungs 1-2), each `shrink`
     down to `finest`, the first and the finest size tried again with room made, `before` (an
@@ -323,9 +367,13 @@ def _settle(
                 need, again = asked.need, False
                 _clear(asked)
             except Exception as exc:
-                need = short(exc)
-                if need is None or _capturing() or scope and size <= finest and not again:
+                if _capturing():
                     raise
+                need = _room(exc, device, first)
+                if need is None or scope and size <= finest and not again:
+                    raise
+                first = first or (exc if _disguised(exc) else None)
+                _retried(exc, name)
                 _clear(exc)
                 if not rungs.free(device, need + SLACK) and again:
                     again = False  # the same size again, with no room made, fails the same way
@@ -455,16 +503,26 @@ def run(site: Site, forward: Callable[..., object], args: Args, kwargs: Kwargs) 
             try:
                 out = forward(*args, **kwargs)
             except Exception as exc:  # out of memory where no op shows it (a kernel's launch)
-                need, drawn = short(exc, True), {id(g) for g, _ in states}
+                drawn = {id(g) for g, _ in states}
                 changed = journal.wrote or set(journal.generators) - drawn
-                if need is None or _capturing() or changed or before != _attributes(site.block):
+                if _capturing() or changed or before != _attributes(site.block):
                     raise
+                need = _room(exc, site.device)
+                if need is None:
+                    raise
+                first = exc if _disguised(exc) else None
+                _retried(exc, f"block {site.key}")
                 _clear(exc)
                 memo.retries += 1
                 for generator, state in states:
                     generator.set_state(state)
                 _served.rungs.free(site.device, need + SLACK)
-                out = forward(*args, **kwargs)
+                try:
+                    out = forward(*args, **kwargs)
+                except Exception as again:
+                    if first is not None and _disguised(again):
+                        raise first
+                    raise
             finally:
                 layer.journals.remove(journal)
         # a step counter or a band means it must never run twice
@@ -486,9 +544,13 @@ def _bare(
             _local.layer = None if pop else layer
             return forward(*args, **kwargs)
     except Exception as exc:
-        need = short(exc, True)
-        if need is None or _capturing():
+        if _capturing():
             raise
+        need = _room(exc, site.device)
+        if need is None:
+            raise
+        first = exc if _disguised(exc) else None
+        _retried(exc, f"block {site.key}")
         _clear(exc)
     finally:
         _local.layer = layer
@@ -499,7 +561,12 @@ def _bare(
     _served.rungs.free(site.device, need + SLACK)
     with caught() as layer:
         banded = layer.banded
-        out = forward(*args, **kwargs)
+        try:
+            out = forward(*args, **kwargs)
+        except Exception as again:
+            if first is not None and _disguised(again):
+                raise first
+            raise
     if layer.banded != banded:
         _served.memo.blocks[site.key] = Facts(False, facts.generators)
     return out
@@ -654,9 +721,14 @@ class Layer(TorchDispatchMode):
         try:
             return func(*args, **kwargs)
         except Exception as exc:
-            need, device = short(exc, True), _device(args, kwargs)
-            if need is None or device is None or _capturing():
+            device = _device(args, kwargs)
+            if device is None or _capturing():
                 raise
+            need = _room(exc, device)
+            if need is None:
+                raise
+            first = exc if _disguised(exc) else None
+            _retried(exc, name)
             _clear(exc)
         memo.retries += 1
         rungs.free(device, need + SLACK)
@@ -672,14 +744,15 @@ class Layer(TorchDispatchMode):
                 try:
                     return again(0)
                 except Exception as exc:
-                    if short(exc, True) is None:
+                    if short(exc) is None:
                         raise
+                    _retried(exc, name)
                     _clear(exc)
             for generator, state in states:
                 generator.set_state(state)
             return _hosted(func, args, kwargs, device)
 
-        return _settle(again, 1, 1, int, device, name, again=False, before=cut, last=hosted)[1]
+        return _settle(again, 1, 1, int, device, name, again=False, before=cut, last=hosted, first=first)[1]
 
     def _banded(self, func: OpOverload, plan: _Plan, key: tuple[object, ...], size: int) -> object:
         """The op in bands of `size` rows (0: what the room holds, at most half) into its whole
