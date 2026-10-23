@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod manager;
+pub mod policy;
 pub mod table;
 pub mod wire;
 
