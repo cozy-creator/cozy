@@ -222,7 +222,7 @@ impl Drop for Tenant {
 fn tenant() {
     let fd: i32 = std::env::var("LEDGER_FD").unwrap().parse().unwrap();
     let events: i32 = std::env::var("EVENTS_FD").unwrap().parse().unwrap();
-    // SAFETY: the descriptors this process inherited, open for its whole life.
+    // Copies of the descriptors this process inherited.
     let (fd, events) = (platform::process::take_handed(fd).unwrap(), platform::process::take_handed(events).unwrap());
     let ledger = Ledger::adopt(fd.as_fd(), Some(events.as_fd())).unwrap();
     let ledger = Arc::new(ledger);
@@ -429,8 +429,8 @@ fn inner_an_idle_executor_that_answers_asks_and_frees_nothing_is_ended() {
     let seen = ended.clone();
     ledger.on_refusing(Box::new(move |pid| {
         seen.lock().unwrap().push(pid);
-        // SAFETY: a signal to a tenant this test started, alive until its Tenant drops.
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // A signal to a tenant this test started, alive until its Tenant drops.
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL);
         release(pid);
     }));
     let [memfd, _] = ledger.grant().unwrap();
