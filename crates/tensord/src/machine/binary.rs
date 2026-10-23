@@ -51,7 +51,7 @@ pub fn previous(launch: &Path) -> PathBuf {
     launch.with_file_name(".cozy-previous")
 }
 
-/// The release a dev binary (`cozy machine update --tensord`) first replaced, beside the launch path.
+/// The release a dev binary (`cozy machine update --tensord <path>`) first replaced, beside the launch path.
 pub fn release(launch: &Path) -> PathBuf {
     launch.with_file_name(".cozy-release")
 }

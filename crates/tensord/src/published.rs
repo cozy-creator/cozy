@@ -937,11 +937,24 @@ impl Publisher {
             let pins = self.export_pins(&project, &lock_sdk, job.stop.as_ref())?;
             fs::write(dir.join("constraints.txt"), pins).map_err(io_failure)?;
         }
-        // The machine's own pair when it has one, whatever the lock's: its findings warn.
+        // The machine's own pair when it has one, whatever the lock's: a floor the release puts on
+        // it that the pair misses refuses the run; other findings warn.
         let (sdk_choice, mut sdk_fallback) = (if own_sdk { "machine" } else { "locked" }, String::new());
         if own_sdk {
             next();
-            sdk_fallback = self.install_sdk(&py, &dir, compile(!client), job.stop.as_ref())?;
+            sdk_fallback = self.install_sdk(&py, &dir, compile(!client), job.stop.as_ref()).map_err(|(code, detail)| {
+                if code != "runtime_floor_unmet" {
+                    return (code, detail);
+                }
+                let (pair, lock) = (self.planned_pair(locked), &locked.packages);
+                let running = |name: &str| pair.get(name).map_or("none", String::as_str);
+                let wanted = |name: &str| lock.get(name).map_or("<version>", String::as_str);
+                (code, format!(
+                    "{package} {release} needs {detail}, but this machine runs Runtime {} and TensorFS {}: update it first \
+                     (cozy machine update <machine> --runtime {} --tensorfs {})",
+                    running("cozy-runtime"), running("tensorfs"), wanted("cozy-runtime"), wanted("tensorfs"),
+                ))
+            })?;
             if !sdk_fallback.is_empty() {
                 tracing::warn!("package {package} {release}: {sdk_fallback}");
                 job.stage(format!("warning: {sdk_fallback}"));
@@ -1080,12 +1093,13 @@ impl Publisher {
         Ok(Some(lock))
     }
 
-    /// This machine's own Runtime and TensorFS over a release's locked requirements, always.
-    /// Every other locked version stays exact: the lock's pins constrain the install, and a pin
-    /// the pair's own requirements reject keeps the lock's version while the pair goes in
-    /// without its dependencies. What uv's check finds that the pair adds, the package's bounds
-    /// on the pair included, is the run's warning, never a refusal: a real import failure names
-    /// itself when it runs. Returns that warning; empty when there is none.
+    /// This machine's own Runtime and TensorFS over a release's locked requirements. Every other
+    /// locked version stays exact: the lock's pins constrain the install, and a pin the pair's own
+    /// requirements reject keeps the lock's version while the pair goes in without its
+    /// dependencies. A bound the release puts on the pair that it misses (a floor: Fibo's
+    /// `cozy-runtime>=0.30.16` for #1700's BatchNorm fix) refuses, `runtime_floor_unmet`: never a
+    /// run on the wrong Runtime with a warning. What else uv's check finds that the pair adds is
+    /// the run's warning. Returns that warning; empty when there is none.
     fn install_sdk(&self, py: &str, dir: &Path, compile: &str, stop: Option<&Stop>) -> Result<String, Failure> {
         let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
         let links = self.sdk.find_links.as_ref().map(|p| p.to_string_lossy().to_string());
@@ -1113,12 +1127,19 @@ impl Publisher {
             ));
         }
         let added: Vec<String> = self.check(py, stop)?.difference(&before).cloned().collect();
+        let floors: Vec<&str> = (added.iter().map(String::as_str))
+            .filter(|line| SDK.iter().any(|name| line.contains(&format!("requires `{name}"))))
+            .filter_map(|line| line.split('`').nth(3))
+            .collect();
+        if !floors.is_empty() {
+            return Err(("runtime_floor_unmet", floors.join(" and ")));
+        }
         if !added.is_empty() {
             warnings.push(format!("uv pip check: {}", added.join("; ")));
         }
         let build = &self.sdk.runtime_build;
         if !warnings.is_empty() && !build.is_empty() {
-            warnings.push(format!("this machine's development Runtime {build} (`--runtime-wheel`) runs it regardless"));
+            warnings.push(format!("this machine's development Runtime {build} (`--runtime <path>`) runs it regardless"));
         }
         Ok(warnings.join("; "))
     }

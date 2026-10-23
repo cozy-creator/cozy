@@ -1,6 +1,10 @@
 //! `cozy package install|update|remove|list`: runs on a machine through Calcifer. The machine
 //! resolves releases from the Hub and owns its environments; the CLI reads nothing from the Hub.
-use std::{collections::BTreeMap, path::Path, process::ExitCode};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use protocol::{
     calcifer::{self, Environment, Machine, MachineState, On, Run, Status, SubmitRun},
@@ -451,10 +455,24 @@ struct Updated {
 
 /// Each published (package, Hub) the machine holds moves to that Hub's newest release, then its
 /// older releases leave. A newer one stays (a pre-release, or one the Hub yanked since).
-pub async fn update(ctx: &Context, names: &[String], on: On) -> Result<ExitCode, Error> {
+/// Moves packages on a machine: each directory or script installs live; each named package goes
+/// to the release named, else its Hub's newest, and its other releases there go. With nothing
+/// named, every published package moves to its newest.
+pub async fn update(ctx: &Context, named: &[(String, Option<String>)], paths: &[PathBuf], on: On) -> Result<ExitCode, Error> {
+    for path in paths {
+        let code = install_directory(ctx, path, on.clone(), false).await?;
+        if code != ExitCode::SUCCESS {
+            return Ok(code);
+        }
+    }
+    if !paths.is_empty() && named.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let names: Vec<String> = named.iter().map(|(name, _)| name.clone()).collect();
+    let wanted = |package: &str| named.iter().find(|(name, _)| name == package).and_then(|(_, r)| r.clone()).unwrap_or_default();
     let machine = machines(ctx, Some(&on)).await?.remove(0);
     let envs = environments(ctx, &machine)?;
-    held(names, &envs, &machine.name)?;
+    held(&names, &envs, &machine.name)?;
     let mut groups: BTreeMap<(&str, String), Vec<&Environment>> = BTreeMap::new();
     for env in envs
         .iter()
@@ -483,7 +501,8 @@ pub async fn update(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
             continue;
         }
         // A catalog revision no ask used before makes the machine read the Hub's newest again.
-        let warm = spec(v1::RunKind::Warm, release(package, ""), fresh());
+        let chosen = wanted(package);
+        let warm = spec(v1::RunKind::Warm, release(package, &chosen), fresh());
         let ran = settle(
             ctx,
             submit(
@@ -515,7 +534,8 @@ pub async fn update(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
             .iter()
             .filter(|env| {
                 let older = [env.release.as_str(), row.to.as_str()];
-                env.release != row.to && tensorfs::format::newest_by(older, |r| *r) == Some(row.to.as_str())
+                env.release != row.to
+                    && (!chosen.is_empty() || tensorfs::format::newest_by(older, |r| *r) == Some(row.to.as_str()))
             })
         {
             let source = Source::Installation(env.installation.clone());

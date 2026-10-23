@@ -1,7 +1,6 @@
-//! A Runtime or TensorFS wheel the machine fetches itself: published on uv's index, checked against
-//! the index's own SHA-256, or at any https URL, held to the digest its update names. It lands
-//! through the machine's store with the one downloader: `stop` ends it, and what landed stays
-//! for the next ask.
+//! A Runtime or TensorFS wheel the machine fetches itself: published on uv's index, held to the
+//! index's own SHA-256. It lands through the machine's store with the one downloader: `stop` ends
+//! it, and what landed stays for the next ask.
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -76,9 +75,9 @@ fn selected(plan: &str, distribution: &str, version: &str) -> io::Result<Artifac
     Ok(wheel)
 }
 
-/// Wheel `file` at an https `url` on any host, redirects followed: its bytes are held to
-/// `sha256`, so no host vouches for anything. Other bytes fail `wheel_digest_mismatch`.
-pub fn wheel_at(url: &str, sha256: &str, file: &str, dir: &Path, machine: &Machine, stop: &Stop) -> io::Result<PathBuf> {
+/// Wheel `file` at an https `url`, redirects followed: its bytes are held to `sha256`, so no host
+/// vouches for anything. Other bytes fail `wheel_digest_mismatch`.
+fn wheel_at(url: &str, sha256: &str, file: &str, dir: &Path, machine: &Machine, stop: &Stop) -> io::Result<PathBuf> {
     // A private server's root as uv trusts it: the bundle SSL_CERT_FILE names. Only this fetch
     // reads it; the Hub's clients trust their own CA alone.
     let bundle = protocol::config::environment().get("SSL_CERT_FILE").and_then(|path| fs::read(path).ok()).filter(|pem| !pem.is_empty());
