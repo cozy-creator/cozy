@@ -54,6 +54,7 @@ fs2 = "0.4"
 futures-util = { version = "0.3.34", default-features = false }
 getrandom = "0.3"
 hex = "0.4"
+hmac = "0.12"
 http = "1"
 http-body-util = "0.1.5"
 hyper = { version = "1.11", default-features = false }
