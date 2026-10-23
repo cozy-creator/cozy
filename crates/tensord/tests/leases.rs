@@ -78,7 +78,7 @@ fn lease_agent() {
                 let (mib, fingerprint) = args.split_once(' ').unwrap();
                 let agent = agent.as_ref().unwrap();
                 let region = Region { fingerprint: fingerprint.parse().unwrap(), region: 0 };
-                let leases = agent.take(mib.parse::<u64>().unwrap() * MIB, Some(region)).unwrap();
+                let leases = agent.take(mib.parse::<u64>().unwrap() * MIB, varena::lease::Kind::Weights, Some(region)).unwrap();
                 agent.mapped(&leases.iter().map(|lease| lease.ticket).collect::<Vec<_>>()).unwrap();
                 let adopted = leases.iter().filter(|lease| lease.adopted).count();
                 let reply = format!("{} {adopted}", leases.len());
