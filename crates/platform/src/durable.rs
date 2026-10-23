@@ -277,6 +277,7 @@ impl FileId {
             };
             // SAFETY: plain-old-data the call fills, on a handle this File owns.
             let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
             if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
                 return Err(io::Error::last_os_error().into());
             }
@@ -398,6 +399,7 @@ pub fn links(path: &Path) -> Result<u64> {
         let file = itself(path)?;
         // SAFETY: plain-old-data the call fills, on a handle this File owns.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
             return Err(io::Error::last_os_error().into());
         }
@@ -444,6 +446,7 @@ pub fn changed(path: &Path) -> Result<std::time::SystemTime> {
         // SAFETY: plain-old-data the call fills, of the size it is told, on a handle this File owns.
         let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<FILE_BASIC_INFO>() as u32;
+        // SAFETY: as above.
         if unsafe {
             GetFileInformationByHandleEx(file.as_raw_handle(), FileBasicInfo, (&mut info as *mut FILE_BASIC_INFO).cast(), size)
         } == 0

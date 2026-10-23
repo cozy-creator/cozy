@@ -83,8 +83,8 @@ pub(super) fn kill(_: &Handle, birth: &Birth) -> io::Result<()> {
         Err(error) if gone(&error) => return Ok(()),
         Err(error) => return Err(error),
     };
-    // SAFETY: plain syscall on scalars.
     unix::signaled(
+        // SAFETY: plain syscall on scalars.
         unsafe { libc::kill(birth.pid as libc::pid_t, libc::SIGKILL) },
         birth.pid,
     )?;
@@ -152,6 +152,7 @@ pub(super) fn boot_id() -> io::Result<String> {
 pub(super) fn peak_resident() -> io::Result<u64> {
     // SAFETY: plain-old-data the call fills.
     let mut usage: libc::rusage = unsafe { mem::zeroed() };
+    // SAFETY: a writable rusage.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
         return Err(io::Error::last_os_error());
     }
