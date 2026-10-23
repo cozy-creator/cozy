@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn a_recipe_is_found_by_its_name_and_the_destination_among_the_terms() {
         let klein = interface("flux-3-klein-0.5.0");
-        assert_eq!(names(Wanted::Recipe("drafter-head").recipes(&klein)), ["drafter_head"]);
+        assert_eq!(names(Wanted::Recipe("upsampler-int8").recipes(&klein)), ["upsampler_int8"]);
         assert!(Wanted::Recipe("generate").recipes(&klein).is_empty(), "a function is no recipe");
         let terms = |raw: &[&str]| super::terms(&raw.iter().map(|t| t.to_string()).collect::<Vec<_>>());
         let (destination, inputs) = terms(&["model.base=fidika/h3@1.0.0", "Paul/Tiny", "max_relative_frobenius=0.1"]).unwrap();
