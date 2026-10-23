@@ -1,8 +1,9 @@
 //! Following a run: live progress on stderr, each output named as it lands, and the run's record
 //! on stdout at the end; NDJSON of Calcifer's events with `--json`, its terminal event last. A
 //! followed run is over once it ended and each output's last revision landed here (checked
-//! against its digest) or failed; an output not saved fails the follow. Ctrl-C stops following
-//! and never cancels: the run is Calcifer's, and `cozy run watch` reattaches.
+//! against its digest) or failed; an output not saved fails the follow. Ctrl-C (Esc or q in
+//! `cozy run list`) stops following and never cancels: the run is Calcifer's, and `cozy run
+//! watch` reattaches.
 use std::{
     collections::{HashSet, VecDeque},
     fmt::Write as _,
@@ -80,7 +81,16 @@ pub(crate) async fn follow(ctx: &Context, run: Run, detach: bool) -> Result<Run,
         record(ctx, &run);
         return Ok(run);
     }
-    let (run, interrupted) = watch(ctx, run, ctx.json).await?;
+    follow_until(ctx, run, interrupt()).await
+}
+
+/// `cozy run watch` until `stop`, which never cancels the run: the live view, then the record.
+pub(crate) async fn follow_until(
+    ctx: &Context,
+    run: Run,
+    stop: impl Future<Output = ()>,
+) -> Result<Run, Error> {
+    let (run, interrupted) = watch(ctx, run, ctx.json, stop).await?;
     if !ctx.json {
         record(ctx, &run);
     }
@@ -88,6 +98,11 @@ pub(crate) async fn follow(ctx: &Context, run: Run, detach: bool) -> Result<Run,
         true => Ok(run),
         false => saved(run),
     }
+}
+
+/// Ctrl-C in a shell.
+async fn interrupt() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// An output still owed to this computer: its last revision neither landed nor failed. A
@@ -133,18 +148,22 @@ fn saved(run: Run) -> Result<Run, Error> {
 /// Follows a run another one waits on (local code's install): its progress on a terminal, no
 /// record and no events of its own.
 pub(super) async fn settle(ctx: &Context, run: Run) -> Result<Run, Error> {
-    Ok(watch(ctx, run, false).await?.0)
+    Ok(watch(ctx, run, false, interrupt()).await?.0)
 }
 
 /// Renders `run`'s events until it ended and its outputs landed or failed (NDJSON with `events`,
-/// its terminal event held back to come last, as the run then stands); Ctrl-C stops early and
+/// its terminal event held back to come last, as the run then stands); `stop` ends it early and
 /// says so.
-async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool), Error> {
+async fn watch(
+    ctx: &Context,
+    run: Run,
+    events_out: bool,
+    stop: impl Future<Output = ()>,
+) -> Result<(Run, bool), Error> {
     let calcifer = ctx.calcifer().await?;
     let mut events = calcifer.events_until_landed(run.id.as_str(), 0);
     let mut view = View::new(ctx, &run);
-    let interrupt = tokio::signal::ctrl_c();
-    tokio::pin!(interrupt);
+    let mut interrupt = std::pin::pin!(stop);
     let id = run.id.clone();
     let mut terminal = None;
     // The rental the run was placed on, followed until it is known whether its Hub placed it far

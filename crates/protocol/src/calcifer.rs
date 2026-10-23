@@ -396,6 +396,9 @@ pub struct RunList {
     /// How many more runs match beyond the limit.
     #[serde(default)]
     pub older: u64,
+    /// The machine `?machine=` named, by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 /// `GET /v1/runs/events`: every run's changes, each run whole as `GET /v1/runs/{id}` answers it. No

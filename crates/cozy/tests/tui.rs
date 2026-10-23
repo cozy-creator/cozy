@@ -129,9 +129,9 @@ fn runs_on(screen: &str) -> Option<u32> {
 }
 
 /// `cozy run list` and `cozy machine list` on a pseudo-terminal, as a person drives them: j/k move
-/// the selection, Enter opens the row's own live view (the run as `cozy run show` draws it, the
-/// machine as `cozy machine show` does), which is drawn again as Calcifer says it changed; Esc or q
-/// goes back to the list, and q there quits.
+/// the selection; Enter on a run is `cozy run watch` of it, live, and a run that ended stays on
+/// screen, its record and all; Enter on a machine opens its live `cozy machine show`. Esc or q goes
+/// back to the list, and q there quits. Leaving a run's watch never cancels the run.
 #[test]
 fn enter_opens_a_rows_live_view_and_esc_or_q_comes_back() {
     let Some(home) = Home::new() else { return };
@@ -157,21 +157,38 @@ fn enter_opens_a_rows_live_view_and_esc_or_q_comes_back() {
     });
     runs.key("j");
     runs.key("k");
+    let watching = format!("cozy run watch {first}  (Esc or q back)");
+    let opened = format!("run {first} · fidika/sdxl/generate");
+    let list = |s: &str| s.contains("TARGET") && !s.contains(&watching);
     runs.key("\r");
-    let opened = format!("run {first}");
-    runs.until("the run's live view", |s| {
-        s.contains(&opened) && s.contains("Esc or q back")
-    });
-    home.json(["run", "cancel", &first, "--json"]);
-    runs.until("its cancel, drawn live", |s| {
-        s.contains(&opened) && s.contains("canceled")
-    });
+    runs.until("the run's watch", |s| s.contains(&watching) && s.contains(&opened));
     runs.key("\x1b");
-    runs.until("the list again", |s| {
-        s.contains("TARGET") && !s.contains("Esc or q back")
+    runs.until("the list again", list);
+    let status = home.json(["run", "show", &first, "--json"])["status"].to_string();
+    assert!(!settled(&status), "leaving the watch left it running: {status}");
+
+    runs.key("\r");
+    runs.until("the run's watch again", |s| s.contains(&watching));
+    home.json(["run", "cancel", &first, "--json"]);
+    runs.until("its cancel and record, followed live", |s| {
+        s.contains(&watching) && s.contains("canceled") && s.contains("next:")
     });
     runs.key("q");
+    runs.until("the list again", list);
+    // A run that ended: the same screen `cozy run watch` leaves, under the way back.
+    runs.key("\r");
+    let ended = runs.until("the ended run's watch", |s| {
+        s.contains(&watching) && s.contains("next:")
+    });
+    runs.key("\x1b");
+    runs.until("the list again", list);
+    runs.key("q");
     assert!(runs.wait().success());
+    let mut watch = Pty::spawn(home.command().args(["run", "watch", &first]));
+    let alone = watch.until("cozy run watch", |s| s.contains("next:"));
+    watch.wait();
+    let trimmed = |screen: &str| screen.trim_end().replace(&format!("{watching}\n"), "");
+    assert_eq!(trimmed(&ended), trimmed(&alone));
 
     let mut machines = Pty::spawn(home.command().args(["machine", "list"]));
     machines.until("the machine list", |s| {
@@ -191,4 +208,56 @@ fn enter_opens_a_rows_live_view_and_esc_or_q_comes_back() {
     });
     machines.key("q");
     assert!(machines.wait().success());
+}
+
+/// `cozy run list --on <machine>`: only that machine's runs, live and as JSON, with the other
+/// filters; a machine that ended still lists them, and a machine never known is refused by name.
+#[test]
+fn run_list_on_one_machine() {
+    let Some(home) = Home::new() else { return };
+    let _hub = SilentHub::for_home(&home);
+    let _machine = tensord::added(&home, "live");
+    let _other = tensord::added(&home, "other");
+    let submit = |on: &str| {
+        let args = ["run", "fidika/sdxl/generate@2.10.0", "a cat", "--on", on];
+        let run = home.json(args.iter().chain(&["--detach", "--json"]));
+        run["number"].as_u64().unwrap().to_string()
+    };
+    let (first, elsewhere) = (submit("live"), submit("other"));
+    let row = |s: &str, n: &str| s.lines().any(|l| l.starts_with(&format!("{n} ")));
+
+    let mut runs = Pty::spawn(home.command().args(["run", "list", "--on", "live"]));
+    let shown = runs.until("live's run", |s| row(s, &first));
+    assert!(!row(&shown, &elsewhere), "{shown}");
+    let second = submit("live");
+    runs.until("its new run, drawn live", |s| row(s, &second) && !row(s, &elsewhere));
+    runs.key("q");
+    assert!(runs.wait().success());
+
+    for run in [&first, &second, &elsewhere] {
+        home.json(["run", "cancel", run, "--json"]);
+    }
+    let listed = |args: &[&str]| home.json(["run", "list", "--json"].iter().chain(args));
+    let numbers = |args: &[&str]| -> Vec<String> {
+        let runs = listed(args)["runs"].as_array().unwrap().clone();
+        runs.iter().map(|r| r["number"].to_string()).collect()
+    };
+    // Its own runs (its Runtime's update among them), as the whole list says where each ran.
+    let all = listed(&[])["runs"].as_array().unwrap().clone();
+    let on_live: Vec<String> = (all.iter().filter(|r| r["machine"] == "live"))
+        .map(|r| r["number"].to_string())
+        .collect();
+    assert!(on_live.contains(&first) && on_live.contains(&second), "{all:?}");
+    assert!(!on_live.contains(&elsewhere), "{all:?}");
+    assert_eq!(numbers(&["--on", "live"]), on_live);
+    let newest = numbers(&["--on", "live", "--state", "canceled", "--limit", "1"]);
+    assert_eq!(newest, [second.clone()]);
+    assert!(numbers(&["--on", "local"]).is_empty());
+    let unknown = home.cozy(["run", "list", "--on", "nowhere"]);
+    assert!(
+        unknown.code != 0 && unknown.stdout.contains(r#"no machine is named "nowhere""#),
+        "{unknown:?}"
+    );
+    home.json(["machine", "end", "live", "--json"]);
+    assert_eq!(numbers(&["--on", "live"]), on_live, "an ended machine's runs");
 }
