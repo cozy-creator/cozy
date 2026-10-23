@@ -41,6 +41,10 @@ from torch.utils.hooks import RemovableHandle
 from . import Copy as CopyRun
 from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, copies, cuts, seal
 
+#: Blocks entered (each forward of a bound block, and of a host device's block) or bound to a host
+#: device, process-wide: the work a call does in its models, which the Runtime tells the machine
+#: (cl-648).
+progress = 0
 #: Blocks copied ahead of the one entered, in the recorded order.
 _AHEAD = 2
 #: A streamed model's scratch slots, in its largest blocks (the core keeps 2-3).
@@ -713,6 +717,8 @@ class Memory:
             self.landing[model] = {r for r in range(len(ws.spans)) if ws.resident(r)}
         if model.host:
             _bind_host(model)
+            for b in model.blocks:
+                _count(b)
             return model
         model.ws.home(_home_regions(model))
         for b in model.blocks:
@@ -874,6 +880,7 @@ class Memory:
     ) -> None:
         """Bind the block (refcounted). Short of room while another request holds it, wait for
         bytes to free (`wait`: the caller holds no lock), else `Exhausted`."""
+        global progress
         model = block.model
         if model.host:
             raise Unbound(f"{model.name}: {block.path or 'common'} binds to nothing")
@@ -886,6 +893,7 @@ class Memory:
                     elif stream != block.stream and not torch.cuda.is_current_stream_capturing():
                         stream.wait_stream(block.stream)
                     block.count += 1
+                    progress += 1
                     if record and block.index >= 0:
                         self._passed(block, call)
                 break
@@ -1921,6 +1929,24 @@ def _hook(block: Block) -> None:
     module.forward = bound  # type: ignore[method-assign]
 
 
+def _count(block: Block) -> None:
+    """A host device's block (CPU, Apple), bound once at its load: each forward counts as work
+    (`progress`), as a bound block's does, and nothing else wraps it (cl-648)."""
+    module = block.module
+    assert module is not None
+    block.own_forward = "forward" in module.__dict__
+    block.forward = module.forward
+    forward = block.forward if block.own_forward else cuts.current(module)
+
+    def counted(*args: object, **kwargs: object) -> object:
+        global progress
+        progress += 1
+        return forward(*args, **kwargs)
+
+    counted._varena = True  # type: ignore[attr-defined]  # what a package's shape check allows
+    module.forward = counted  # type: ignore[method-assign]
+
+
 def _unhook(block: Block) -> None:
     if block.module is None or block.forward is None:
         return
@@ -1971,6 +1997,7 @@ def _bound(block: Block, region: int, pinned: object) -> tuple[Tensor, dict[str,
 @torch.inference_mode(False)
 def _bind_host(model: Model) -> None:
     """Every weight once: CPU params view the host pages; an Apple device's are copied in."""
+    global progress
     for block in (model.common, *model.blocks):
         views: dict[str, dict[str, Tensor]] = {}
         for region in block.regions:
@@ -1980,6 +2007,7 @@ def _bind_host(model: Model) -> None:
             views.update(parts)
         _write(block, views)
         block.written.clear()
+        progress += 1
 
 
 def _home_regions(model: Model) -> list[int]:

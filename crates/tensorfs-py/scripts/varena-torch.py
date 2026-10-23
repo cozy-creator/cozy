@@ -39,6 +39,7 @@ from torch import nn
 
 import tensorfs
 from tensorfs.varena import Ledger, cuts
+from tensorfs.varena import torch as varena_torch
 from tensorfs.varena.torch import (
     Declared,
     Exhausted,
@@ -170,12 +171,15 @@ def main() -> int:
         return mem.resident()[name]
 
     # cold, then warm: one request, two passes
+    worked = varena_torch.progress
     with torch.no_grad(), mem.request("cold-warm") as r:
         cold, warm = net(x), net(x)
         same = torch.equal(cold, want) and torch.equal(warm, want)
         del cold, warm  # what outlives a request is its leftover
     steps = r.stats.steps
     check("cold and warm passes equal the reference", same)
+    worked = varena_torch.progress - worked
+    check("each pass counts every block it enters as work", worked >= 2 * a.blocks, str(worked))
     check(
         "the model is home after its load and first pass",
         resident(model.name) >= model.nbytes,
