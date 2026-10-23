@@ -605,13 +605,20 @@ def off_forward(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionM
     del bound
     gc.collect()
     check("off-forward: the pin goes when it dies", native.pins_held() == held, native.pins_held())
+    with torch.inference_mode():  # Klein's VAE reads its batch norm's statistics this way (se-074)
+        view = weight.view(-1)
+        scaled = view.view(1, -1) * 2
+    check("off-forward: a view of a placeholder under inference_mode reads its bytes",
+          torch.equal(view.cpu(), want.reshape(-1)) and torch.equal(scaled.cpu(), want.reshape(1, -1) * 2), "differs")
+    del view, scaled
+    gc.collect()
     try:
         adapter.Placeholder((2,), torch.float32, torch.device("cpu"))._varena_read()
         check("off-forward: a placeholder of no loaded model refuses", False, "read")
     except adapter.Unbound:
         check("off-forward: a placeholder of no loaded model refuses", True)
     reads = {path: n for (_, path), n in mem.off_forward.items()}.get("down_blocks.1.resnets.0", (0, 0))
-    check("off-forward: the reads are counted with their bytes", reads[0] == 3 and reads[1] > 0, mem.off_forward)
+    check("off-forward: the reads are counted with their bytes", reads[0] == 4 and reads[1] > 0, mem.off_forward)
 
 
 def escapes(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel, reference: list[torch.Tensor], derived: bool) -> None:

@@ -765,6 +765,7 @@ class Memory:
             warnings.warn(f"{model.name}: a weight tensor of block {block.path or 'common'!r} outlived its forward; its page stays bound while it lives", stacklevel=2)
         block.views = block.assign = block.window = block.track = block.at = None
 
+    @torch.inference_mode(False)  # what it returns is ordinary: a caller's view aliases it (se-074)
     def _read(self, block: _Block, site: _Site) -> Tensor:
         """A weight read outside its block's forward (a package's table, an overlay's factor):
         its block bound now, on the current stream; the tensor returned, and any view of it,
@@ -795,6 +796,10 @@ class Memory:
             counts[key] = (reads + 1, nbytes + pin.len)
         return value
 
+    # Bound under a caller's inference_mode, the views (kept across binds) and the module tensors
+    # made of them would be inference tensors, and a view of a placeholder outside its forward
+    # could not alias one (se-074, Klein's VAE batch norm statistics): ordinary, zero-copy.
+    @torch.inference_mode(False)
     def _bind(self, block: _Block, stream: int | None, pin: Pin | None = None, evict: bool = True) -> None:
         model = block.model
         if pin is None:
