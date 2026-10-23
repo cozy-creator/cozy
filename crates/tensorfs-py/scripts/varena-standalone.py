@@ -20,6 +20,7 @@ its capacity is lowered by the standalone limit, and the uncapped GPU run is the
 from __future__ import annotations
 
 import ast
+import copy
 import faulthandler
 import gc
 import json
@@ -276,16 +277,18 @@ def gone(memory: weakref.ref[Memory], phase: str) -> None:
     check(f"{phase}: its memory is gone before the next phase opens one", memory() is None, gc.get_referrers(memory()) if memory() else "")
 
 
-def costs(mem: Memory, unet: UNet2DConditionModel) -> None:
+def costs(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel) -> None:
     """Microseconds per warm bind and per pass, varena's and the adapter's (a warm bind attaches
-    the views it kept; a pass is varena's pass_ and end, and the adapter's open and close)."""
+    the views it kept; a pass is varena's pass_ and end, and the adapter's open and close). The
+    adapter's own work in a forward (a bind per block and its pass) is held to the plain model's
+    forward on the same machine: a ratio, as host CPUs differ."""
     model, n = mem.models[unet], 200
     block = max(model.blocks.values(), key=lambda b: len(b.tensors))
     stream = torch.cuda.current_stream(mem.device).cuda_stream if CUDA else 0
     mem._enter(block)
     mem._exit(block)
 
-    def each(f: object) -> float:
+    def each(f: object, n: int = n) -> float:
         began = time.perf_counter_ns()
         for _ in range(n):
             f()  # type: ignore[operator]
@@ -302,11 +305,24 @@ def costs(mem: Memory, unet: UNet2DConditionModel) -> None:
             mem._close(model)
 
         varena_pass, open_close = each(native_pass), each(adapter_pass)
+    on = plain if mem.device.type == "cpu" else copy.deepcopy(plain).to(mem.device)
+    x, text = inputs(mem.device, 0)
+
+    def plain_forward() -> None:
+        with torch.no_grad():
+            on(x, 3, encoder_hidden_states=text)
+        if CUDA:
+            torch.cuda.synchronize(mem.device)
+
+    plain_forward()
+    forward = min(each(plain_forward, 1) for _ in range(10))  # the best of ten: the shared machine's load is not it
+    # Its own work a forward: the largest block's warm bind for every block, and its pass.
+    own = len(model.blocks) * (adapter_bind - native_bind) + (open_close - varena_pass)
     print(f"COST warm bind {native_bind:.0f} us varena, {adapter_bind:.0f} us through the adapter ({len(block.tensors)} tensors); "
-          f"pass {varena_pass:.0f} us varena, {open_close:.0f} us through the adapter (its common's bind included)", flush=True)
-    # The adapter's own part of a warm bind (kept views attached, the escape check at exit) is
-    # tens of microseconds at most: views made per bind cost about 100 more here.
-    check(f"cost: a warm bind adds {adapter_bind - native_bind:.0f} us to varena's (at most 30)", adapter_bind - native_bind <= 30, (native_bind, adapter_bind))
+          f"pass {varena_pass:.0f} us varena, {open_close:.0f} us through the adapter (its common's bind included); "
+          f"plain forward {forward:.0f} us", flush=True)
+    check(f"cost: the adapter's own work a forward ({len(model.blocks)} binds and its pass) is {own:.0f} us, "
+          f"{100 * own / forward:.1f}% of the plain model's forward (at most 10%)", own <= 0.10 * forward, (native_bind, adapter_bind, varena_pass, open_close, forward))
 
 
 def threads() -> dict[int, tuple[str, float]]:
@@ -380,7 +396,7 @@ def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> 
             for tid, (thread, cpu) in threads().items():
                 where[name][tid] = (thread, where[name].get(tid, (thread, 0.0))[1] + cpu - before.get(tid, (thread, 0.0))[1])
     del runs, paged, pins
-    costs(mem, unet)
+    costs(mem, unet, plain)
     ratio, adapter_part, placement = best["served"] / best["plain"], best["served"] / best["paged"], best["paged"] / best["plain"]
     torch.set_num_threads(threads_before)
     print("OVERHEAD best CPU ms: " + ", ".join(f"{name} {1e3 * t:.1f}" for name, t in best.items()) + "; all 11 runs' CPU ms by thread: "
@@ -447,7 +463,7 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     check("identity: a pass under a new identity shed the hold of the old bake", shed == [True] and not mem.models[filled].holds, (shed, hold.blocks))
     concurrent(mem, ck)
     if CUDA:
-        costs(mem, unet)
+        costs(mem, unet, plain)
     spans = model.set.spans
     return reference, spans, stats.compute, base, weakref.ref(mem)
 

@@ -28,6 +28,7 @@ from .._ext.varena import (
     allocator_check,
     allocator_quarantined,
     allocator_refusals,
+    allocator_capture,
     allocator_retire,
     pins_held,
 )
@@ -59,6 +60,7 @@ __all__ = [
     "allocator_check",
     "allocator_quarantined",
     "allocator_refusals",
+    "allocator_capture",
     "allocator_retire",
     "pins_held",
 ]
