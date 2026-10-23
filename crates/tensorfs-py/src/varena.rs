@@ -561,7 +561,7 @@ fn lease(memory: &Memory, ns: u32, uuid: &str) -> varena::Result<Option<(String,
     let Some(stream) = varena::lease::connect(ns, uuid)? else {
         return Ok(Some(("Absent".into(), format!("no lease manager serves GPU {uuid}"))));
     };
-    Ok(memory.lease(stream)?.map(|(code, why)| (format!("{code:?}"), why)))
+    Ok(memory.lease_over(stream)?.map(|(code, why)| (format!("{code:?}"), why)))
 }
 
 #[cfg(not(unix))]
