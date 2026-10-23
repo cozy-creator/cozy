@@ -84,10 +84,6 @@ pub trait Backend: Send + Sync {
     /// Where `io::read` writes `len` mapped bytes at `va + offset`: device memory ordered on the
     /// backend's copy stream, or host memory.
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst;
-    /// Copies mapped bytes at `va + offset` into `dst`, waiting for the copy: a region's swap.
-    fn copy_out(&self, _va: Va, _offset: u64, _dst: &mut [u8]) -> Result<()> {
-        Err(Error::Invalid("this backend cannot swap".into()))
-    }
     /// Copies `src` into mapped bytes at `va + offset`, waiting for the copy: a swapped region back in.
     fn copy_in(&self, _va: Va, _offset: u64, _src: &[u8]) -> Result<()> {
         Err(Error::Invalid("this backend cannot swap".into()))
@@ -264,13 +260,6 @@ impl Backend for HostBackend {
 
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
         Dst::Host { ptr: (va.base + offset) as *mut u8, len: len as usize }
-    }
-
-    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8]) -> Result<()> {
-        inside(va, offset, dst.len())?;
-        // SAFETY: a mapped range of the caller's reservation, checked to hold `dst.len()` bytes.
-        unsafe { std::ptr::copy_nonoverlapping((va.base + offset) as *const u8, dst.as_mut_ptr(), dst.len()) };
-        Ok(())
     }
 
     fn copy_in(&self, va: Va, offset: u64, src: &[u8]) -> Result<()> {

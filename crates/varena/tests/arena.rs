@@ -88,7 +88,7 @@ impl Backend for Gpu {
     fn export(&self, page: &Physical) -> varena::Result<Owned> { self.host.export(page) }
     fn import(&self, handle: Owned, len: u64) -> varena::Result<Physical> { self.host.import(handle, len) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.host.target(va, offset, len) }
-    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8]) -> varena::Result<()> { self.host.copy_out(va, offset, dst) }
+    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8], after: Event) -> varena::Result<()> { self.host.copy_out(va, offset, dst, after) }
     fn copy_in(&self, va: Va, offset: u64, src: &[u8]) -> varena::Result<()> { self.host.copy_in(va, offset, src) }
     fn fence(&self) -> varena::Result<Event> { Ok(Event::DONE) }
     fn record(&self, stream: usize) -> varena::Result<Event> {
@@ -768,7 +768,7 @@ fn an_eviction_waits_for_the_regions_stream_and_never_during_a_capture() {
     let route = r.torch.route(Owner::Region(14));
     let p = r.torch.alloc(3 * MB, A, None).unwrap();
     drop(route);
-    r.torch.pool_begin(PoolId(9, 9), C);
+    r.torch.pool_begin(PoolId(9, 9), Some(C));
     assert!(r.torch.evict(Owner::Region(14), false).unwrap().is_none(), "evicted while a capture is open");
     r.torch.pool_end(PoolId(9, 9));
     let (tx, rx) = mpsc::channel();
