@@ -1,5 +1,5 @@
 //! `make_room`'s order over tables, pure: other sets' idle pages, caches nobody holds, then the
-//! plans' own pages furthest next use first; never a pinned page. A small simulator runs real
+//! current step's own pages furthest next use first; never a pinned page. A small simulator runs real
 //! plans through it at real capacities (each bind takes its page's room, each block its
 //! activations'), plus an ask's answer, prefetch, admission and placement.
 
@@ -124,11 +124,12 @@ fn h3_and_sdxl_complete_at_24_12_and_8_gib() {
     }
 }
 
-/// The order: pages of sets no plan uses, least recently used first; then caches nobody holds,
-/// least recently used first; then the plan's pages, furthest next use first. Never a pinned
-/// or filling page, nor one being bound; a page whose release is pending is marked.
+/// The order: pages of sets no plan uses, least recently used first; then a later step's pages,
+/// furthest first; then caches nobody holds, least recently used first; then the current step's
+/// pages, furthest next use first. Never a pinned or filling page, nor one being bound; a page
+/// whose release is pending is marked.
 #[test]
-fn victims_go_idle_pages_then_caches_then_the_plan_furthest_first() {
+fn victims_go_other_sets_pages_then_caches_then_the_current_step_furthest_first() {
     let mut t = table(64 * MB, vec![set("now", 2, MB), set("later", 2, MB), set("idle", 2, MB)], vec![(vec![0], 1), (vec![1], 1)]);
     let mut clock = 0;
     for k in [(2, 1), (2, 0), (1, 0), (1, 1), (0, 0), (0, 1)] {
@@ -140,7 +141,7 @@ fn victims_go_idle_pages_then_caches_then_the_plan_furthest_first() {
     t.page_mut((0, 1)).unwrap().releasing = vec![3];
     let v = victims(&t, &[(1, 1)]);
     assert_eq!(pages(&v), vec![(2, 1), (2, 0), (1, 0), (0, 0), (0, 1)], "idle by age; then later's; then now's block behind the cursor before the one ahead");
-    assert_eq!(v.get(2), Some(&Victim::Cache { id: 7, bytes: MB }), "the unheld cache after the idle pages; the held one never");
+    assert_eq!(v.get(3), Some(&Victim::Cache { id: 7, bytes: MB }), "the unheld cache after the other sets' pages; the held one never");
     assert!(v.contains(&Victim::Page { key: (0, 1), bytes: MB, releasing: true }), "a page whose release is pending is taken once it completes");
     t.page_mut((0, 0)).unwrap().pins = vec![1];
     t.page_mut((2, 1)).unwrap().filling = true;

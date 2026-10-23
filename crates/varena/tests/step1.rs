@@ -231,8 +231,8 @@ fn make_room_never_takes_a_pinned_page_and_an_impossible_need_takes_nothing() {
     assert!(possible.is_ok() && a_intact, "the need the idle pages cover failed, or a pinned page was taken");
 }
 
-/// The order: another set's idle page (N, least recently used), then caches nobody holds, then
-/// the plan's pages furthest next use first: a later step's (D) before the current step's (W).
+/// The order: another set's idle page (N, least recently used), then a later step's (D), then
+/// caches nobody holds, then the current step's (W), furthest next use first.
 #[test]
 fn make_room_takes_idle_then_caches_then_furthest_declared() {
     let (dir, uuid, card, mem) = open("order", 5);
@@ -262,6 +262,39 @@ fn make_room_takes_idle_then_caches_then_furthest_declared() {
     drop(r);
     close(&uuid, mem);
     assert!(!after_first.0 && after_first.1 == 0 && after_first.2 && after_first.3, "the first page taken was not the idle N page");
+}
+
+/// The lead's ruling (S4's v14 graphs): a streaming set's room comes from another set's idle
+/// weight pages, though a later step uses them, before that set's graph cache. A page refills from
+/// the page cache; a graph recaptures far slower.
+#[test]
+fn a_streaming_sets_room_takes_another_sets_idle_pages_before_its_graph_cache() {
+    let (dir, uuid, card, mem) = open("graphorder", 5);
+    let dit = mem.load(spec(dir.path(), &uuid, "dit", 3), Level::Ram).unwrap();
+    let vae = mem.load(spec(dir.path(), &uuid, "vae", 2), Level::Ram).unwrap();
+    warm(&mem, vae, 2);
+    let shrunk = Arc::new(AtomicU64::new(0));
+    let cache = mem.cache("vae-graphs", {
+        let shrunk = shrunk.clone();
+        move |want| {
+            shrunk.fetch_add(want, Ordering::SeqCst);
+            want
+        }
+    });
+    // The VAE's captured graphs: one page of torch's segments, touched after its weights.
+    assert!(card.take(P));
+    let _segment = mem.resident(P);
+    mem.cached(cache, P);
+    let r = mem.request("r", plan(&[&["dit"], &["vae"]])).unwrap();
+    let pass = r.pass(dit, "k").unwrap();
+    let pins: Vec<varena::Pin> = (0..3).map(|b| mem.bind(dit, b, 0).unwrap()).collect();
+    let shrunk = shrunk.load(Ordering::SeqCst);
+    drop(pins);
+    pass.end(0);
+    r.end();
+    let vae_left = (0..2).filter(|b| resident(&mem, vae, *b)).count();
+    close(&uuid, mem);
+    assert_eq!((shrunk, vae_left), (0, 1), "(cache bytes shrunk, VAE pages left): one VAE page goes, the graphs stay");
 }
 
 /// The bytes make_room freed are nobody's: another thread's bind maps into them before the
