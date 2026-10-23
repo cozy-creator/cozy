@@ -2617,17 +2617,18 @@ impl Pool {
                 }));
             }
             session.followers = callbacks.formation.as_ref().map_or(Ok(vec![]), |formation| formation.register(&started.follower_pids))?;
-            // A standalone group's rank r runs its own pages on the lane's GPU r.
-            for (follower, gpu) in session.followers.iter().zip(gpus.iter().skip(1)).filter(|_| standalone) {
-                if let Some(gpu) = gpu.memory.as_ref() {
-                    gpu.fix(follower.birth().pid);
-                }
-            }
             if session.followers.len() + 1 != ranks as usize {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
                     detail: "a follower exited before its GPU ledger could be associated".into(),
                 }));
+            }
+            // A formed standalone group's rank r (reported rank 1 first) runs its own pages on
+            // the lane's GPU r.
+            for (pid, gpu) in started.follower_pids.iter().zip(gpus.iter().skip(1)).filter(|_| standalone) {
+                if let Some(gpu) = gpu.memory.as_ref() {
+                    gpu.fix(*pid);
+                }
             }
             // The request's signer, whose bearer the Runtime keeps apart.
             let actor = engine.get(id).ok().and_then(|record| record.submission).map(|s| s.actor).unwrap_or_default();

@@ -38,6 +38,7 @@ pub struct Gpu {
     pub model: String,
     uuid: String,
     fixed: Arc<Mutex<Fixed>>,
+    log: MemoryLog,
 }
 
 /// Standalone executors' fixed rows by pid (varena-leases R2-2), and whether their sampler runs.
@@ -93,7 +94,7 @@ impl Gpu {
                 Held::Ledger(ledger)
             }
         };
-        let gpu = Gpu { held, model: id.model.clone(), uuid: id.uuid.clone(), fixed: Arc::default() };
+        let gpu = Gpu { held, model: id.model.clone(), uuid: id.uuid.clone(), fixed: Arc::default(), log: log.clone() };
         peaks.restore(&id.model, gpu.ledger());
         let leased = gpu.manager().is_some();
         log.note(serde_json::json!({"event": "ledger", "gpu": entry, "card": id.memory, "capacity": gpu.ledger().status().capacity, "leases": leased}));
@@ -102,7 +103,7 @@ impl Gpu {
 
     /// A GPU on `ledger` alone.
     pub fn ledgered(ledger: Ledger, model: &str) -> Gpu {
-        Gpu { held: Held::Ledger(ledger), model: model.into(), uuid: String::new(), fixed: Arc::default() }
+        Gpu { held: Held::Ledger(ledger), model: model.into(), uuid: String::new(), fixed: Arc::default(), log: MemoryLog::default() }
     }
 
     /// Standalone executor `pid` on it: a fixed row, never asked and never foreign, holding its
@@ -116,8 +117,8 @@ impl Gpu {
         let mut fixed = self.fixed.lock().unwrap();
         fixed.rows.insert(pid, row);
         if !std::mem::replace(&mut fixed.sampling, true) {
-            let (uuid, rows) = (self.uuid.clone(), Arc::downgrade(&self.fixed));
-            let spawned = std::thread::Builder::new().name("fixed-rows".into()).spawn(move || sample_fixed(&uuid, rows));
+            let (uuid, rows, log) = (self.uuid.clone(), Arc::downgrade(&self.fixed), self.log.clone());
+            let spawned = std::thread::Builder::new().name("fixed-rows".into()).spawn(move || sample_fixed(&uuid, rows, &log));
             if let Err(error) = spawned {
                 fixed.sampling = false;
                 tracing::warn!("memory: fixed rows unsampled: {error}");
@@ -208,11 +209,21 @@ impl Hosting for Peers {
     }
 }
 
-/// Sets each fixed row's bytes from NVML's per-pid reading until none is left.
-fn sample_fixed(uuid: &str, fixed: std::sync::Weak<Mutex<Fixed>>) {
-    let device = platform::gpu::Device::open(uuid).inspect_err(|error| tracing::warn!("memory: fixed rows unmeasured: {error}")).ok();
+/// Sets each fixed row's bytes from NVML's per-pid reading until none is left. A reading that
+/// fails or names no pid leaves them as they were, with one memory-log line each time it starts.
+fn sample_fixed(uuid: &str, fixed: std::sync::Weak<Mutex<Fixed>>, log: &MemoryLog) {
+    let device = platform::gpu::Device::open(uuid).map_err(|error| error.to_string());
+    let mut stale = false;
     while let Some(fixed) = fixed.upgrade() {
-        let processes = device.as_ref().and_then(|device| device.read().ok()).and_then(|reading| reading.processes);
+        let reading = device.as_ref().map_err(Clone::clone).and_then(|device| device.read().map_err(|error| error.to_string()));
+        let processes = reading.and_then(|reading| reading.processes.ok_or_else(|| "NVML names no process of this machine".to_string()));
+        match (&processes, stale) {
+            (Err(why), false) => log.note(serde_json::json!({"event": "fixed_rows_stale", "gpu": uuid, "why": why})),
+            (Ok(_), true) => log.note(serde_json::json!({"event": "fixed_rows_measured", "gpu": uuid})),
+            _ => {}
+        }
+        stale = processes.is_err();
+        let processes = processes.ok();
         let mut held = fixed.lock().unwrap();
         if held.rows.is_empty() {
             held.sampling = false;
