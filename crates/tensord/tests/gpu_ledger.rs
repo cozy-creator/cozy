@@ -221,7 +221,8 @@ impl Drop for Tenant {
 }
 
 /// A tenant: claims a row in the ledger it inherited and serves the commands above; in `answer`
-/// mode a thread answers asks by evicting cold bytes, in `stall` mode nothing does.
+/// mode a thread answers asks by evicting cold bytes, in `refuse` mode it answers each and frees
+/// nothing (run 14820's Klein executor, cr-216), in `stall` mode nothing answers.
 #[test]
 #[ignore = "a tenant process the ledger tests start"]
 fn tenant() {
@@ -243,6 +244,13 @@ fn tenant() {
             row.publish(&f);
             charge(&f);
             row.ack(freed);
+        });
+    }
+    if std::env::var("TENANT_MODE").unwrap() == "refuse" {
+        let row = row.clone();
+        std::thread::spawn(move || loop {
+            row.wait_want();
+            row.ack(0);
         });
     }
     println!("tenant-ok");
@@ -402,6 +410,48 @@ fn inner_a_stalled_victim_is_ended() {
         asker.wait(&victim).unwrap();
     }
     assert_eq!(*ended.lock().unwrap(), [stalled.pid]);
+}
+
+/// An idle executor that answers every ask for the cold bytes it says it holds, and frees none,
+/// is ended at the next readings (only its exit gives them back), and its asker gets them; one
+/// running a request is left to finish it. Run 14820 failed `memory_exhausted` after asking the
+/// idle Klein executor 3,920 times for its 7.9 GB.
+#[test]
+fn an_idle_executor_that_answers_asks_and_frees_nothing_is_ended() {
+    under_fake_nvml("inner_an_idle_executor_that_answers_asks_and_frees_nothing_is_ended", 8 * GIB, false);
+}
+
+#[test]
+#[ignore = "run under the fake NVML by its outer test"]
+fn inner_an_idle_executor_that_answers_asks_and_frees_nothing_is_ended() {
+    let ledger = ledger(Liveness { sample: Duration::from_millis(50) });
+    let mut idle = Tenant::start(&ledger, &charges(), "refuse");
+    idle.call(&format!("publish {} {} {} 0", GIB / 2, 6 * GIB, 6 * GIB));
+    let mut running = Tenant::start(&ledger, &charges(), "refuse");
+    running.call(&format!("publish {} {} {} 0", GIB / 4, GIB, GIB));
+    running.call("running r1 -1");
+    let ended: Arc<Mutex<Vec<u32>>> = Arc::default();
+    let seen = ended.clone();
+    ledger.on_refusing(Box::new(move |pid| {
+        seen.lock().unwrap().push(pid);
+        // SAFETY: a signal to a tenant this test started, alive until its Tenant drops.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        release(pid);
+    }));
+    let [memfd, _] = ledger.grant().unwrap();
+    let asker = Ledger::adopt(std::os::fd::AsFd::as_fd(&memfd), None).unwrap();
+    let _call = ledger.active();
+    // Asked again as an op retries, until the refusing one is gone; a hang bound only.
+    for _ in 0..2000 {
+        if !ended.lock().unwrap().is_empty() {
+            break;
+        }
+        for victim in asker.ask(None, 7 * GIB).unwrap() {
+            asker.wait(&victim).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(*ended.lock().unwrap(), [idle.pid], "the idle one ends; the running one is left");
 }
 
 /// A group's ranks each hold a row in their own GPU's ledger (no rank cells): a follower that

@@ -49,6 +49,8 @@ struct Inner {
     refused: AtomicBool,
     log: MemoryLog,
     end: OnceLock<Ender>,
+    /// Ends an idle process that answers asks and frees nothing (its pid).
+    refuse: OnceLock<Ender>,
     freed: OnceLock<Freed>,
     looked: Mutex<Instant>,
     liveness: Liveness,
@@ -175,6 +177,7 @@ impl GpuLedger {
             refused: AtomicBool::new(false),
             log,
             end: OnceLock::new(),
+            refuse: OnceLock::new(),
             freed: OnceLock::new(),
             looked: Mutex::new(Instant::now()),
             liveness,
@@ -196,6 +199,12 @@ impl GpuLedger {
     /// What ends a stalled process; set once, after the pool exists.
     pub fn on_stalled(&self, end: Ender) {
         let _ = self.inner.end.set(end);
+    }
+
+    /// What ends an idle process that answers asks for bytes it says it holds and frees none;
+    /// set once, after the pool exists.
+    pub fn on_refusing(&self, end: Ender) {
+        let _ = self.inner.refuse.set(end);
     }
 
     /// What is told when bytes free here (the dispatch queue's wake); set once.
@@ -360,6 +369,7 @@ fn watch(device: Option<Device>, inner: &Inner, ticks: &(Mutex<Ticks>, Condvar),
             tracing::warn!("memory: GPU {} ledger: {error}", inner.entry);
         }
         inner.look();
+        inner.refusals();
         let mut state = lock.lock().unwrap();
         state.latest = reading;
         state.answered = asked;
@@ -467,6 +477,22 @@ impl Inner {
             self.log.note(serde_json::json!({"event": "returned", "gpu": self.entry, "pid": row.pid, "bytes": row.held()}));
         }
         Ok(())
+    }
+
+    /// At each reading: idle rows asked for bytes they say they hold, that answered since the last
+    /// reading and gave none, are ended. Their answer is the evidence; no window is waited out.
+    fn refusals(&self) {
+        match self.ledger.refusing() {
+            Ok(pids) => {
+                for pid in pids.into_iter().filter(|pid| *pid != std::process::id()) {
+                    self.log.note(serde_json::json!({"event": "refusing", "gpu": self.entry, "pid": pid}));
+                    if let Some(end) = self.refuse.get() {
+                        end(pid);
+                    }
+                }
+            }
+            Err(error) => tracing::warn!("memory: GPU {} refusals: {error}", self.entry),
+        }
     }
 
     /// Once a wedge floor: rows asked for bytes whose progress did not move since the last look

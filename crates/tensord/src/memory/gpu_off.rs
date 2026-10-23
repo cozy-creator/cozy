@@ -23,6 +23,9 @@ impl GpuLedger {
     pub fn on_freed(&self, _: Freed) {
         match *self {}
     }
+    pub fn on_refusing(&self, _: Ender) {
+        match *self {}
+    }
     pub fn grant(&self) -> io::Result<[File; 2]> {
         match *self {}
     }

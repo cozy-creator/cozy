@@ -772,6 +772,9 @@ impl Pool {
             let weak = Arc::downgrade(&pool);
             let end = move |pid| if let Some(pool) = weak.upgrade() { pool.end_stalled(pid) };
             device.memory.iter().for_each(|ledger| ledger.on_stalled(Box::new(end.clone())));
+            let weak = Arc::downgrade(&pool);
+            let refusing = move |pid| if let Some(pool) = weak.upgrade() { pool.end_refusing(pid) };
+            device.memory.iter().for_each(|ledger| ledger.on_refusing(Box::new(refusing.clone())));
         }
         let weak = Arc::downgrade(&pool);
         pool.host.watch(move || weak.upgrade().map(|pool| pool.give_back_one()));
@@ -859,22 +862,39 @@ impl Pool {
         let (plan, start, birth, killed) = tenant;
         self.notes.note(serde_json::json!({"event": "end_stalled", "pid": pid, "plan": plan,
             "killed": killed.as_ref().map_or_else(|e| e.to_string(), |_| "yes".into())}));
-        let key = session_key(&plan, start);
-        let idle = {
-            let mut sessions = self.sessions.lock().unwrap();
-            let owns = |s: &Session| owns_birth(&s.executor.birth, &s.followers, &birth);
-            match sessions.get(&key).is_some_and(owns) {
-                true => sessions.remove(&key),
-                false => None,
-            }
-        };
-        if let Some(session) = idle {
-            let (degree, executor) = (session.degree, session.executor);
-            if let Err(error) = executor.terminate() {
-                tracing::warn!("memory: ending stalled executor {key}: {error}");
-            }
-            self.ended(&plan, start, degree);
+        if let Some(session) = self.take_idle(&plan, start, &birth) {
+            self.end_idle(&plan, start, session);
         }
+    }
+    /// An idle executor the ledger names refusing (asked for bytes it says it holds, it gave
+    /// none, cr-216): it leaves the pool and ends, and its exit gives them back. Only process exit
+    /// frees all of a CUDA context's bytes. One running a call is left to finish it.
+    fn end_refusing(&self, pid: u32) {
+        let tenant = self.tenants.lock().unwrap().get(&pid).map(|t| (t.plan.clone(), t.start, t.exact.birth().clone()));
+        let Some((plan, start, birth)) = tenant else {
+            return tracing::warn!("memory: refusing pid {pid} is no executor of this machine");
+        };
+        if let Some(session) = self.take_idle(&plan, start, &birth) {
+            self.notes.note(serde_json::json!({"event": "end_refusing", "pid": pid, "plan": plan}));
+            self.end_idle(&plan, start, session);
+        }
+    }
+    /// The pool's idle session of `plan` at `start` whose executor is `birth`, taken out of it.
+    fn take_idle(&self, plan: &str, start: usize, birth: &Birth) -> Option<Session> {
+        let key = session_key(plan, start);
+        let mut sessions = self.sessions.lock().unwrap();
+        let owns = |s: &Session| owns_birth(&s.executor.birth, &s.followers, birth);
+        match sessions.get(&key).is_some_and(owns) {
+            true => sessions.remove(&key),
+            false => None,
+        }
+    }
+    fn end_idle(&self, plan: &str, start: usize, session: Session) {
+        let (degree, executor) = (session.degree, session.executor);
+        if let Err(error) = executor.terminate() {
+            tracing::warn!("memory: ending idle executor {}: {error}", session_key(plan, start));
+        }
+        self.ended(plan, start, degree);
     }
     pub fn memo(&self) -> &crate::memo::Memo {
         &self.memo
