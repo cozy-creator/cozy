@@ -48,7 +48,7 @@ wildcards = "deny"
 allow-wildcard-paths = true
 skip = [
     { crate = "base64@0.22.1", reason = "ours; reqwest is on 0.23" },
-    { crate = "cpufeatures@0.3.1", reason = "aws-sigv4's digest 0.11 stack" },
+    { crate = "cpufeatures@0.3.1", reason = "chacha20, through str0m's rand" },
     { crate = "darling@0.20.11", reason = "nvml-wrapper's derive" },
     { crate = "darling_core@0.20.11", reason = "nvml-wrapper's derive" },
     { crate = "darling_macro@0.20.11", reason = "nvml-wrapper's derive" },
