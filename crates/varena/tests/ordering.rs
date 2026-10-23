@@ -1475,6 +1475,8 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     mem.make_room(0).unwrap();
     events.await_log(|log| log.iter().filter(|c| **c == "export").count() == 3);
     assert_eq!(*events.protected.lock(), vec![3 * REGION_ALIGN], "one protect for the run");
+    // Kept (custody's) before the request opens.
+    mem.settle();
 
     // A page bound while its fill's event is pending, held through the fill's completion and
     // released with its release event pending: never protected while in use, nor while its
@@ -1497,9 +1499,10 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     mem.make_room(0).unwrap();
     assert_eq!(protects(), 1, "protected while its request runs");
     drop(r);
-    events.await_log(|log| log.iter().filter(|c| **c == "export").count() == 4);
-    assert_eq!(protects(), 2);
     mem.settle();
+    // The request's open withdrew the run (unmeasured: every kept page); its end keeps it again
+    // beside the used page.
+    assert_eq!((exports(), protects()), (7, 3), "(exports, protects) once the request ended");
 
     // A bind that meets a protect in flight waits for it.
     let raced = mem.load(stored(dir.path(), &uuid, "raced", 1), Level::Ram).unwrap();
@@ -1528,7 +1531,8 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     events.protect_gate.open();
     binder.join().unwrap();
     assert_eq!(events.bound_while_protecting.load(Ordering::SeqCst), 0, "a pin handed out while its page's protect ran");
-    assert_eq!(exports(), 5);
+    mem.settle();
+    assert_eq!(exports(), 8);
 }
 
 /// Native an_oom_in_a_pass / a_measured_pass (graph-core runs 519 and e199) on a host card: the
