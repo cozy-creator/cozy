@@ -1235,9 +1235,11 @@ class Memory:
         return limited(self.limit, total - free - torch.cuda.memory_reserved(self.gpu))
 
     def _cap(self) -> None:
-        """Torch's allocator held to what the limit leaves it, at block boundaries."""
+        """Torch's allocator held to what a `gpu_memory_limit` leaves it, at block boundaries.
+        Under the reserve alone it is not held: a cap set at one boundary refused room varena
+        gave back before the next (cr-215)."""
         room = self._room()
-        if room is not None:
+        if room is not None and self.row is not None and self.row[0].capacity < self.total:
             torch.cuda.set_per_process_memory_fraction(min(room / self.total, 1.0), self.gpu)
 
     def available(self, device: torch.device | None = None) -> int:
