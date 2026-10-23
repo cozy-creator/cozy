@@ -18,7 +18,7 @@ pub struct HostMemory {
     /// Bytes left before the tightest limit on this process's cgroup path, or the host's
     /// available memory when that is tighter. -1: unreadable (never 0).
     pub available: i64,
-    /// Shared memory (memfd/tmpfs) charged where that limit is: sealed and pinned weight tiers.
+    /// Shared memory (memfd/tmpfs) charged where that limit is: host pages and sealed layouts.
     /// 0 where weights are never held in shared memory (macOS, Windows).
     pub shmem: i64,
     /// The host's available memory (`MemAvailable` on Linux), for the record; -1 when unreadable.
@@ -54,7 +54,7 @@ pub fn process(pid: u32) -> io::Result<ProcessMemory> {
 
 /// One process's resident bytes now, anonymous, file and shmem (a sealed layout it maps), and
 /// its resident high-water since it started or [`reset_peak`]. Linux keeps no anonymous
-/// high-water; the host tier bounds one from these. Linux only (the host tier's OS); elsewhere
+/// high-water; varena's request window bounds one from these. Linux only; elsewhere
 /// `Unsupported`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Resident {
