@@ -1644,6 +1644,11 @@ impl Ledger {
         os::wake_await(&self.events)
     }
 
+    /// An event for TensorD (the lease manager's: a grant, a revoke answered, an exit).
+    pub fn ring(&self) {
+        self.shared.ring();
+    }
+
     /// A GPU fault or sticky error: the GPU's kept pages go.
     pub fn fault(&self) {
         let _ = self.custody.fault();
