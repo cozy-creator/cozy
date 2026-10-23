@@ -157,7 +157,7 @@ jobs:
       # No tracked file names a real home directory; tests use only the fake ones allowed here.
       - name: No local paths
         run: |
-          git grep -n -I -P '(/hom[e]/|/User[s]/|[A-Za-z]:[\\/]+User[s][\\/]+)(?!(me|a|a b)[\\/])' && exit 1
+          git grep -n -I -P '(/hom[e]/|/User[s]/|[A-Za-z]:[\\/]+User[s][\\/]+)(?!(me|a|a b|linuxbrew)[\\/])' && exit 1
           [ $? = 1 ]
       - uses: astral-sh/setup-uv@v7
       - name: Constructor orders
