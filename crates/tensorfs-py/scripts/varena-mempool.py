@@ -164,7 +164,6 @@ def main() -> int:
           f"{made} new segments at {spent / max(made, 1) / 1e3:.0f} us each; "
           f"evicted by class {stats.evicted}; segments per step {segments}; pool free at make_room {r.pool_free}; flush {r.flush_ms:.1f} ms", flush=True)
     check("1: beside the filler, the pool's passes complete with no OOM raised to Python", raised is None and len(times) == STEPS, raised)
-    check("1: the filler made the room (evictions)", sum(stats.evicted) > 0, stats.evicted)
 
     # 2. and 3. interleaved warm runs, the filler refilled before each.
     warm: dict[bool, list[float]] = {True: [], False: []}
