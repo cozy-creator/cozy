@@ -383,10 +383,10 @@ impl Memory {
         self.inner.backend.granularity()
     }
 
-    /// With no manager: the device's free bytes less H, the display's headroom.
+    /// With no manager: the device's free bytes less its reserve (rev 6; a host device keeps none).
     pub(crate) fn standalone_free(&self) -> u64 {
         let b = &self.inner.backend;
-        b.free().unwrap_or(0).saturating_sub(crate::table::headroom(b.capacity()))
+        b.free().unwrap_or(0).saturating_sub(b.headroom())
     }
 
     /// The device's torch allocator, if anything allocated through it yet.

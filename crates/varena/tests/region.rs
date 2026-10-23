@@ -276,7 +276,8 @@ fn a_graph_drop_racing_a_replay_finishes_its_event() {
 fn room_counts_an_unpinned_region_cold() {
     let (mem, _dev, uuid) = open();
     let empty = mem.room(None);
-    assert!(empty.free > 0 && empty.granularity > 0);
+    assert_eq!(empty.free, 4 << 30, "a host device's free bytes, no reserve");
+    assert!(empty.granularity > 0);
     assert_eq!((empty.cold, empty.warm, empty.floor), (0, 0, 0));
     let region = mem.region("cond", RegionKind::Conditioning, &[], true).unwrap();
     let p = {
