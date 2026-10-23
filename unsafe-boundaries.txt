@@ -19,6 +19,7 @@ crates/platform/src/process/macos.rs
 crates/platform/src/process/mod.rs
 crates/platform/src/process/unix.rs
 crates/platform/src/process/windows.rs
+crates/platform/src/service/launchd.rs
 crates/platform/src/service/windows.rs
 crates/platform/src/shm/linux.rs
 crates/platform/src/shm/mod.rs

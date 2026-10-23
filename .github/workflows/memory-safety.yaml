@@ -22,7 +22,8 @@ jobs:
       - name: Unsafe only in the listed boundary files
         run: |
           export LC_ALL=C
-          git grep -lE '^[^/]*\bunsafe ?(\{|fn |impl |extern |\()' -- '*.rs' | sort | diff -u <(grep -v '^#' unsafe-boundaries.txt | sort) -
+          git grep -nE '\bunsafe ?(\{|fn |impl |extern |\()' -- '*.rs' | grep -vE '^[^:]+:[0-9]+:\s*//' | cut -d: -f1 | sort -u \
+            | diff -u <(grep -v '^#' unsafe-boundaries.txt | sort) -
       - name: Every crate takes the workspace lints
         run: |
           for t in crates/*/Cargo.toml; do
