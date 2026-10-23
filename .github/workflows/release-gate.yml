@@ -158,6 +158,8 @@ jobs:
           ref: ${{ inputs.packages_ref }}
           path: packages
       - uses: astral-sh/setup-uv@v7
+      # ffmpeg and ffprobe for the H3 and SeedVR2 cells, from the tool cache (apt took 34 min).
+      - uses: AnimMouse/setup-ffmpeg@v1
       - if: ${{ inputs.plan != '' }}
         uses: actions/download-artifact@v8
         with:
@@ -170,7 +172,6 @@ jobs:
           RUNTIME_WHEEL: ${{ inputs.runtime_wheel }}
           TENSORFS_WHEEL: ${{ inputs.tensorfs_wheel }}
         run: |
-          command -v ffmpeg >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq ffmpeg; }
           bin=$HOME/.cozy/bin; mkdir -p "$bin"; echo "$bin" >> "$GITHUB_PATH"
           args=()
           if [ -n "$PLAN" ]; then
