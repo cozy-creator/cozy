@@ -5,8 +5,8 @@
 """varena's native GPU suite on a rental: `cozy run native.py --on <rental> --gpus 1
 --asset binary=<bundle.tar of test binaries> --asset suite=<suite.json>`.
 
-The bundle (gpu/testbins.sh) holds varena's `gpu` and TensorFS's `tensorfs-io`; a case is named
-`<binary>/<test>`.
+The bundle (gpu/testbins.sh) holds varena's `gpu` and TensorFS's `tensorfs-io` and
+`tensorfs-refill`; a case is named `<binary>/<test>`.
 
 `suite.json`: `{"label", "cases": [name, ...], "steps": {name: s}}`, `steps` being each case's
 longest step on an earlier run. Each case runs in a fresh process of the binary, one after another;
