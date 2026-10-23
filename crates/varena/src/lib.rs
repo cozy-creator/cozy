@@ -20,11 +20,11 @@ pub mod os;
 mod outbox;
 pub mod table;
 
-pub use backend::{Access, Backend, Event, HostBackend, Physical, Va};
+pub use backend::{Access, Backend, Budget, Event, HostBackend, Physical, Va};
 pub use cuda::CudaBackend;
 pub use ledger::{Grant, HostCall, Ledger, Peak, PhysicalChange, RowStatus, Status};
 pub use memory::{CacheId, Claim, Fills, HoldId, MakeRoom, Memory, Moved, Origin, Pass, Pin, Ref, Request, Retained, SetId, Stats, StepStats, Yielded};
-pub use table::{Fill, Fingerprint, Level, PartId, Plan, SetSpec, Step};
+pub use table::{headroom, Fill, Fingerprint, Level, PartId, Plan, SetSpec, Step};
 
 use thiserror::Error;
 
@@ -45,11 +45,14 @@ pub struct Exhausted {
     pub need: u64,
     pub site: Option<String>,
     pub stats: Stats,
+    /// What holds the device besides cozy, when known: the largest foreign process and its bytes
+    /// (Linux, TensorD's sample), or this process's budget and usage (Windows).
+    pub foreign: Option<String>,
 }
 
 #[derive(Debug, Clone, Error)]
 pub enum Error {
-    #[error("exhausted: {} bytes short{}", .0.need, .0.site.as_deref().map(|s| format!(" at {s}")).unwrap_or_default())]
+    #[error("exhausted: {} bytes short{}{}", .0.need, .0.site.as_deref().map(|s| format!(" at {s}")).unwrap_or_default(), .0.foreign.as_deref().map(|f| format!(" (GPU memory in use by {f})")).unwrap_or_default())]
     Exhausted(Box<Exhausted>),
     #[error("device ownership is unproven: {0}")]
     Ownership(String),

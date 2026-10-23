@@ -30,7 +30,7 @@ use platform::handles::Owned;
 use tensorfs::io::source::Placement;
 use tensorfs::io::Dst;
 
-use crate::backend::{Access, Backend, Event, Physical, Va};
+use crate::backend::{Access, Backend, Budget, Event, Physical, Va};
 use crate::custody;
 use crate::decide::{self, Victim};
 use crate::ledger::{self, Facts, Grant, PhysicalChange, Row, Shared};
@@ -614,6 +614,9 @@ struct State {
     events: BTreeMap<usize, VecDeque<(Event, Key)>>,
     /// Sets streaming their upper blocks through slots (step 2's watermark), by set.
     streams: HashMap<u32, Streaming>,
+    /// Pages' backing between homes: taken in place (the hook unmaps and destroys it) or a slot
+    /// moving (a Move): still this process's created bytes, never context.
+    transit: u64,
     /// Ids and the logical clock.
     clock: u64,
     shrinks: HashMap<u32, Shrink>,
@@ -657,6 +660,7 @@ impl State {
         let Some(h) = self.homes.get_mut(&key).filter(|h| !h.keeping && !h.keep_after && !h.protecting && !h.reclaiming && !h.exported && !h.landing) else { return Ok(None) };
         let Some(phys) = h.phys.take() else { return Ok(None) };
         h.reclaiming = true;
+        self.transit += phys.len;
         let taking = (key, h.gen, class, place, phys, h.ready);
         self.sync(key);
         Ok(Some(taking))
@@ -810,6 +814,8 @@ struct Inner {
     stop: Arc<AtomicBool>,
     quiet: Arc<Quiet>,
     ownership_lost: AtomicBool,
+    /// This process's device budget (Windows): its changes give pages back; growth stays under it.
+    budget: Option<Arc<dyn Budget>>,
     public_owners: AtomicU64,
     /// The allocator hook's segments ([`Memory::resident`]), counted exactly, and the room its
     /// claims hold for segments not allocated yet.
@@ -823,8 +829,8 @@ struct Inner {
     _device: Device,
 }
 
-fn exhausted(need: u64, site: Option<&str>, stats: Stats) -> Box<Exhausted> {
-    Box::new(Exhausted { need, site: site.map(str::to_string), stats })
+fn exhausted(need: u64, site: Option<&str>, stats: Stats, foreign: Option<String>) -> Box<Exhausted> {
+    Box::new(Exhausted { need, site: site.map(str::to_string), stats, foreign })
 }
 
 impl Memory {
@@ -852,7 +858,8 @@ impl Memory {
             let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
             let holder = custody.as_ref().map_or(0, |c| c.holder());
             let context = backend.process_used().unwrap_or_else(|_| backend.opened_context());
-            let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, ..Table::default() };
+            let budget = backend.budget();
+            let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, card: backend.capacity(), ..Table::default() };
             let inner = Arc::new(Inner {
                 backend,
                 shared,
@@ -872,6 +879,7 @@ impl Memory {
                 stop: Arc::new(AtomicBool::new(false)),
                 quiet: Arc::default(),
                 ownership_lost: AtomicBool::new(false),
+                budget,
                 public_owners: AtomicU64::new(0),
                 native_resident: AtomicU64::new(0),
                 claimed: AtomicU64::new(0),
@@ -894,6 +902,10 @@ impl Memory {
             std::thread::Builder::new().name("varena-ask".into()).spawn(move || ask_loop(listener, &row, &weak, &stop)).map_err(|e| Error::io("spawn ask", e))?;
             let (weak, wanted) = (Arc::downgrade(&inner), inner.wanted.clone());
             std::thread::Builder::new().name("varena-trim".into()).spawn(move || trim_loop(&wanted, &weak)).map_err(|e| Error::io("spawn trim", e))?;
+            if let Some(budget) = inner.budget.clone() {
+                let weak = Arc::downgrade(&inner);
+                std::thread::Builder::new().name("varena-budget".into()).spawn(move || budget_loop(&*budget, &weak)).map_err(|e| Error::io("spawn budget", e))?;
+            }
             let mut st = inner.lock();
             inner.publish(&mut st);
             inner.unlock(st);
@@ -1435,11 +1447,24 @@ impl Inner {
         }
     }
 
+    /// What holds the device besides cozy, for a refusal: this process's budget and usage
+    /// (Windows), else the largest foreign process TensorD saw.
+    fn foreign(&self) -> Option<String> {
+        if let Some((budget, usage)) = self.budget.as_ref().and_then(|b| b.read().ok()) {
+            return Some(format!("other programs: this process's budget is {} MiB, its usage {} MiB", budget >> 20, usage >> 20));
+        }
+        self.shared.foreign_holder().ok().flatten().map(|(name, bytes)| format!("{name} ({} MiB)", bytes >> 20))
+    }
+
     /// The device's figures (this process's context, the driver's free bytes) sampled, and the
     /// rows read: only where they change a decision (a refusal, a peer ask, a request's open),
     /// never per pass.
     fn refresh(&self, st: &mut State) -> Result<ledger::Admission<'_>> {
         self.measure(st);
+        // TensorD samples foreign bytes while it has the table: the rows' read takes them.
+        if self.shared.sampled()? {
+            return self.rows(st);
+        }
         // Device queries are outside the shared metadata transaction. Revalidate their
         // physical attribution against the authoritative rows after taking admission.
         let sample = self.shared.physical_sample()?;
@@ -1479,6 +1504,10 @@ impl Inner {
         st.table.orphans = orphans;
         st.table.capacity = self.shared.capacity()?;
         st.table.shared = self.shared.shared_mode()?;
+        st.table.sampled = self.shared.sampled()?;
+        if st.table.sampled {
+            st.table.foreign = self.shared.foreign()?;
+        }
         st.table.pending = self.to_custody.pending();
         self.physical(st);
         // Unmaps in flight are this process's still (and already spent on the creates queued
@@ -1542,7 +1571,8 @@ impl Inner {
         st.table.context = match self.backend.process_used() {
             Ok(used) => {
                 let created: u64 = st.homes.values().filter(|h| h.origin != Origin::Kept).filter_map(|h| h.phys.as_ref()).map(|p| p.len).sum::<u64>()
-                    + st.retired.values().filter(|r| r.created).map(|r| r.bytes).sum::<u64>();
+                    + st.retired.values().filter(|r| r.created).map(|r| r.bytes).sum::<u64>()
+                    + st.transit;
                 used.saturating_sub(self.native_resident.load(Ordering::Acquire) + created)
             }
             // Not measurable here: the context as open measured it.
@@ -2081,7 +2111,7 @@ impl Inner {
                 let stats = st.stats(req).cloned().unwrap_or_default();
                 drop(admission);
                 self.unlock(st);
-                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats)));
+                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats, self.foreign())));
             }
             // Beyond what it could ever have (the budget with orphans released, less its context,
             // the hook's segments but its caches', its pinned pages): Exhausted at once.
@@ -2093,7 +2123,7 @@ impl Inner {
                 let stats = st.stats(req).cloned().unwrap_or_default();
                 drop(admission);
                 self.unlock(st);
-                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats)));
+                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats, self.foreign())));
             }
             record.step = req.and_then(|r| st.table.request(r)).map_or(0, |r| r.cursor.step);
             // Kept pages no live process maps go first: nobody's.
@@ -2176,8 +2206,10 @@ impl Inner {
             // The hook's pages: unmapped and destroyed here, on its own thread.
             for (key, gen, class, (va, off, span), phys, ready) in taking {
                 let change = self.row.physical_change();
+                let len = phys.len;
                 let given = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(phys));
                 let mut st = self.lock();
+                st.transit = st.transit.saturating_sub(len);
                 if st.homes.get(&key).is_some_and(|h| h.gen == gen) {
                     st.homes.remove(&key);
                     self.backend.retire(ready);
@@ -2233,7 +2265,7 @@ impl Inner {
                 let free = st.table.free();
                 let stats = st.stats(req).cloned().unwrap_or_default();
                 self.unlock(st);
-                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats)));
+                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats, self.foreign())));
             }
         };
         if record.freed > 0 || record.waited > 0 {
@@ -2269,6 +2301,56 @@ impl Inner {
             self.landed.notify_all();
         }
         total
+    }
+
+    /// Recovery, at a pass boundary only (a shrink is at once): a streaming set takes back the
+    /// blocks at its watermark, one by one, then refills its slots, into free bytes beyond 2H of
+    /// the device (shared: H more than the table leaves, which charges H; Windows: under budget −
+    /// 2H), mapped and filled on the copy stream, never evicting. The H..2H band is the
+    /// hysteresis: no timer.
+    fn regrow(&self, req: u64, set: u32) {
+        let mut st = self.lock();
+        let (Some(watermark), Ok(blocks)) = (st.streams.get(&set).map(|s| s.watermark), st.mech(set).map(|m| m.spec.layout.regions.len() as u32)) else {
+            return self.unlock(st);
+        };
+        let h = crate::table::headroom(self.backend.capacity());
+        let mut room = match self.budget.as_ref().and_then(|b| b.read().ok()) {
+            Some((budget, usage)) => budget.saturating_sub(2 * h + usage).min(st.table.free()),
+            None if st.table.shared => st.table.free().saturating_sub(h),
+            None => st.table.free(),
+        };
+        let mut w = watermark;
+        while let Some(bytes) = (w < blocks).then(|| st.table.page((set, w)).map(|p| p.bytes)).flatten().filter(|b| *b <= room) {
+            // A slot already there is resident now at no cost; a block with no page is mapped.
+            if !st.homes.contains_key(&(set, w)) {
+                if !self.map(&mut st, (set, w), Some(req), true).unwrap_or(false) {
+                    break;
+                }
+                room -= bytes;
+            }
+            w += 1;
+        }
+        if w >= blocks {
+            st.streams.remove(&set);
+        } else if let Some(s) = st.streams.get_mut(&set) {
+            s.watermark = w;
+        }
+        // Its slots, refilled here only (a bind mid-pass moves one, never makes one): the next
+        // upper blocks with no page.
+        let mut next = w;
+        for _ in st.slots(set, w)..stream::SLOTS {
+            while next < blocks && st.homes.contains_key(&(set, next)) {
+                next += 1;
+            }
+            let Some(bytes) = (next < blocks).then(|| st.table.page((set, next)).map(|p| p.bytes)).flatten().filter(|b| *b <= room) else { break };
+            if !self.map(&mut st, (set, next), Some(req), true).unwrap_or(false) {
+                break;
+            }
+            room -= bytes;
+            next += 1;
+        }
+        self.publish(&mut st);
+        self.unlock(st);
     }
 
     /// Maps the next blocks of `req`'s current step into free bytes only (never in shared mode,
@@ -2445,7 +2527,13 @@ impl Inner {
     /// as its recorded peak lacks beside the free bytes and what the hook could take already.
     /// They are kept again when no request is open.
     fn unkeep(&self, req: u64) {
-        let st = self.lock();
+        let mut st = self.lock();
+        // A Keep already protecting when the request opened ends kept: withdrawn below.
+        while st.homes.values().any(|h| h.protecting) {
+            if self.wait(&mut st).is_err() {
+                return self.unlock(st);
+            }
+        }
         if !st.homes.values().any(|h| h.exported) {
             return self.unlock(st);
         }
@@ -2500,6 +2588,8 @@ impl Inner {
                 admission = self.refresh(&mut st)?;
             }
             let asks = Self::asks(&st, req);
+            // The row shows what this sample measured (its context), not the last pass's figure.
+            self.publish(&mut st);
             drop(admission);
             self.unlock(st);
             asks
@@ -2739,6 +2829,7 @@ impl Inner {
             self.coreside(req, false)?;
             self.unkeep(req);
         }
+        self.regrow(req, set);
         self.prefetch(req);
         Ok(id)
     }
@@ -2806,11 +2897,13 @@ impl Inner {
         stats
     }
 
-    /// The ask thread's answer: idle pages no plan of this row's uses ([`decide::answer`]),
-    /// never a cache, never waiting on anything but its own protects; it runs
-    /// no caller code. Kept pages' bytes come back once custody lets go: the trim thread
-    /// settles that after the reply and publishes them free.
-    fn answer(&self, bytes: u64) -> u64 {
+    /// The ask thread's answer, up to `bytes` under `ceiling`: idle pages no plan of this row's
+    /// uses ([`decide::answer`]); D: later steps' pages too, furthest first; W (foreign pressure):
+    /// then the running sets stream, their watermarks lowered. Never a cache, never a pinned page,
+    /// never waiting on anything but its own protects; it runs no caller code, and it never ends
+    /// a request. Kept pages' bytes come back once custody lets go: the trim thread settles that
+    /// after the reply and publishes them free.
+    fn answer(&self, ceiling: Class, bytes: u64) -> u64 {
         let out = crate::caught(|| {
             let mut st = self.lock();
             // A protect's page comes back with it: the answer counts it.
@@ -2821,6 +2914,31 @@ impl Inner {
             for key in decide::answer(&st.table, bytes) {
                 freed += st.table.page(key).map_or(0, |p| p.bytes);
                 self.unmap(&mut st, key, Class::N, None, true)?;
+            }
+            if ceiling >= Class::D && freed < bytes {
+                let later: Vec<(Key, u64)> = decide::victims(&st.table, &[])
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Victim::Page { key, bytes, releasing: false } if st.table.distance(key).is_some_and(|d| d.0 > 0) => Some((key, bytes)),
+                        _ => None,
+                    })
+                    .collect();
+                for (key, b) in later {
+                    if freed >= bytes {
+                        break;
+                    }
+                    self.unmap(&mut st, key, Class::D, None, true)?;
+                    freed += b;
+                }
+            }
+            if ceiling >= Class::W && freed < bytes {
+                let running: Vec<(u32, u64)> = st.table.requests.iter().flat_map(|r| r.steps.get(r.cursor.step as usize).map(|(sets, _)| sets.iter().map(|s| (*s, r.id)).collect::<Vec<_>>()).unwrap_or_default()).collect();
+                for (set, req) in running {
+                    if freed >= bytes {
+                        break;
+                    }
+                    freed += self.stream(&mut st, set, bytes - freed, Some(req), false)?.unmapped;
+                }
             }
             let settle = st.table.pending > 0;
             let unmapped = st.last_unmap.filter(|_| freed > 0);
@@ -3013,6 +3131,9 @@ impl Drop for Inner {
         self.to_custody.close();
         self.row.knock();
         self.wanted.0.lock().closed = true;
+        if let Some(budget) = &self.budget {
+            budget.close();
+        }
         self.wanted.1.notify_all();
         self.burst.0.lock().closed = true;
         self.burst.1.notify_all();
@@ -3052,6 +3173,8 @@ impl Drop for Inner {
         for m in sets {
             self.backend.release(m.va);
         }
+        // Its retired events that completed go with it (one still pending, with the backend).
+        self.backend.sweep();
     }
 }
 
@@ -3074,6 +3197,19 @@ fn fill_loop(demand: &Receiver<Vec<Job>>, ahead: &Receiver<Vec<Job>>, inner: &We
     }
 }
 
+/// The budget's thread (Windows): each change over budget − H gives back what brings usage to
+/// budget − 2H, off any allocation.
+fn budget_loop(budget: &dyn Budget, inner: &Weak<Inner>) {
+    while budget.wait() {
+        let Some(me) = Work::of(inner) else { return };
+        let Ok((room, usage)) = budget.read() else { continue };
+        let h = crate::table::headroom(me.backend.capacity());
+        if usage > room.saturating_sub(h) {
+            me.answer(Class::W, usage - room.saturating_sub(2 * h));
+        }
+    }
+}
+
 fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>, stop: &AtomicBool) {
     if let Some(row) = row.upgrade() {
         row.ask_thread();
@@ -3083,7 +3219,7 @@ fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>,
         let Some(me) = Work::of(&inner) else { return 0 };
         // Never dies: a failed or panicking answer frees nothing, and the next ask is served.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ask {
-            ledger::Ask::Room { bytes, .. } => me.answer(bytes),
+            ledger::Ask::Room { ceiling, bytes } => me.answer(Class::ALL.get(ceiling).copied().unwrap_or(Class::N), bytes),
         }))
         .unwrap_or(0)
     });
@@ -3435,6 +3571,18 @@ impl Inner {
             st.keep_queued.remove(&set);
             let Ok(va) = st.mech(set).map(|m| m.va) else { return };
             let due: Vec<Key> = st.keep_due.range((set, 0)..=(set, u32::MAX)).copied().collect();
+            // A request opened since this Keep was queued: the pages stay the hook's, and its
+            // end keeps them.
+            if !st.table.requests.is_empty() {
+                for key in due {
+                    st.keep_due.remove(&key);
+                    if let Some(h) = st.homes.get_mut(&key) {
+                        h.keeping = false;
+                    }
+                    st.sync(key);
+                }
+                return;
+            }
             let mut pages = vec![];
             for key in due {
                 let (place, idle) = (st.place(key), st.idle(key));
