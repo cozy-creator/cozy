@@ -140,7 +140,7 @@ enum Verb {
     Show {
         /// The run's number or id.
         run: String,
-        /// One snapshot even on a terminal, instead of the live view of a run not yet settled.
+        /// One snapshot even on a terminal, instead of following a run not yet settled as `watch` does.
         #[arg(long)]
         once: bool,
     },

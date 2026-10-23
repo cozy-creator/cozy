@@ -22,7 +22,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 /// at an older version is from before cozy 0.9.4, which this cozy does not read. Two lines of
 /// development each called their addition 6 (`runs.agreed`, `outputs.checkpoint`), so a store at
 /// 5, 6 or 7 gains whichever of the two it lacks.
-const VERSION: i64 = 7;
+pub const VERSION: i64 = 7;
 const SCHEMA: &str = "
     CREATE TABLE machines (
         name TEXT PRIMARY KEY,

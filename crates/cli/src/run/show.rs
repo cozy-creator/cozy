@@ -12,7 +12,7 @@ use protocol::{
 use serde::Deserialize;
 
 use super::follow;
-use crate::{Context, output, tui};
+use crate::{Context, output};
 
 /// What an executor measured (`Outcome.measurements`, `Call.measurements`), read tolerantly: a
 /// newer machine's fields are ignored and absent ones are empty.
@@ -231,10 +231,9 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
     let run: Run = calcifer
         .get_query(&format!("/v1/runs/{id}"), &[("detail", "full")])
         .await?;
+    // A run not yet settled is followed on a terminal, as `cozy run watch` follows it.
     if !once && !ctx.json && ctx.term.stdout && !follow::settled(&run) {
-        let view = super::live::Live::open(ctx, run.id.as_str()).await?;
-        tui::show(ctx, tui::Screen::Run(Box::new(view))).await?;
-        return Ok(ExitCode::SUCCESS);
+        return Ok(follow::exit_code(&follow::follow(ctx, run, false).await?));
     }
     if ctx.json {
         output::json(&run);
