@@ -3546,9 +3546,12 @@ pub(crate) fn record_measurements(engine: &Engine, id: &str, plan: &Plan, reply:
 }
 
 
+/// The run's measurements: the kernels it served (`attention.`, `gemm.`, `kernel.`) and the work
+/// that blocked its request path (`request_path.`), which a release gate reads.
 fn measured<S: Serialize, M: Serialize>(plan: &Plan, reply: &Frame, software: S, memory: M) -> serde_json::Value {
+    let kept = |name: &str| ["attention.", "gemm.", "kernel.", "request_path."].iter().any(|prefix| name.starts_with(prefix));
     let kernels: Vec<&serde_json::Value> = (reply.observations.as_array().into_iter().flatten())
-        .filter(|row| row["name"].as_str().is_some_and(|name| name.starts_with("attention.") || name.starts_with("gemm.")))
+        .filter(|row| row["name"].as_str().is_some_and(kept))
         .collect();
     serde_json::json!({"attribution": reply.attribution, "software": software, "execution": reply.execution,
         "observations": kernels, "memory": memory, "residency": reply.residency, "models": plan.models()})
@@ -3825,6 +3828,8 @@ mod tests {
                 "fields": {"component": "base_model/ref2va_dit", "dense_reference": "kitchen-int8", "pin": "", "sites": 52}},
             {"kind": "confession", "name": "gemm.selected", "value": "cutlass-sm80-int8",
                 "fields": {"component": "base_model/ref2va_dit", "format": "int8", "sites": 416}},
+            {"kind": "confession", "name": "request_path.blocking", "value": "kernel build wait", "fields": {"ms": 812.0}},
+            {"kind": "confession", "name": "kernel.ready", "value": "sol-attn", "fields": {"where": "boundary"}},
             {"kind": "confession", "name": "weights.mode", "value": "resident", "fields": {"stage": "denoise"}}]}))
         .unwrap();
         let measured = measured(&plan, &reply, None::<()>, ());
@@ -3832,7 +3837,7 @@ mod tests {
             {"slot": "model", "repository": "paul/birefnet", "release": "0.1.0", "lane": "model.fp16.cozytensors", "precision": "fp16", "manifest": "sha256:aa"},
             {"slot": "lora", "repository": "paul/wushu", "release": "1.0.0", "lane": "model.bf16.cozytensors", "precision": "bf16", "manifest": "sha256:bb"}]));
         let kept: Vec<&str> = measured["observations"].as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap()).collect();
-        assert_eq!(kept, ["attention.selected", "gemm.selected"]);
+        assert_eq!(kept, ["attention.selected", "gemm.selected", "request_path.blocking", "kernel.ready"]);
     }
 
     /// An invoke reply's residency (the Runtime's graph counters per model, fields this TensorD
