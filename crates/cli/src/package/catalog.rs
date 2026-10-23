@@ -41,7 +41,7 @@ pub async fn search(ctx: &Context, query: &str, limit: u32) -> Result<ExitCode, 
         .packages
         .into_iter()
         .map(|p| Found {
-            package: format!("{}/{}", p.org, p.name),
+            package: protocol::names::shown(&format!("{}/{}", p.org, p.name)),
             latest_release: p.latest_release,
             created_at: stamp(&p.created_at),
         })

@@ -489,6 +489,15 @@ pub(super) async fn index_url(
     ))
 }
 
+/// Whose name a publication takes: the signed-in account's, or with `root` the root namespace's
+/// (first-party; the Hub admits only its admins there).
+pub(super) async fn publisher(client: &hub_client::Client, root: bool) -> Result<String, Error> {
+    match root {
+        true => Ok(protocol::names::ROOT.to_owned()),
+        false => account(client).await,
+    }
+}
+
 pub(super) async fn account(client: &hub_client::Client) -> Result<String, Error> {
     Ok(client
         .get_current_account()
@@ -505,7 +514,7 @@ struct Locked {
     changed: bool,
 }
 
-pub async fn lock(ctx: &Context, upgrade: &[String]) -> Result<ExitCode, Error> {
+pub async fn lock(ctx: &Context, upgrade: &[String], root: bool) -> Result<ExitCode, Error> {
     let project = Project::here()?;
     let stage = Stage::new(&project, project.tools(ctx).await?)?;
     let account_index = match project.account_index {
@@ -513,7 +522,7 @@ pub async fn lock(ctx: &Context, upgrade: &[String]) -> Result<ExitCode, Error> 
         true => {
             let hub = ctx.hub()?;
             let client = ctx.hub_signed_in(&hub)?;
-            let account = account(&client).await?;
+            let account = publisher(&client, root).await?;
             let url = index_url(&client, &hub, &account).await?;
             stage.bind(&url)?;
             Some(url)
@@ -603,11 +612,11 @@ impl File {
     }
 }
 
-pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
+pub async fn publish(ctx: &Context, root: bool) -> Result<ExitCode, Error> {
     let project = Project::here()?;
     let hub = ctx.hub()?;
     let client = ctx.hub_signed_in(&hub)?;
-    let account = account(&client).await?;
+    let account = publisher(&client, root).await?;
     let mut result = Published {
         package: format!("{account}/{}", project.name),
         release: project.version.clone(),
@@ -705,7 +714,7 @@ pub async fn publish(ctx: &Context) -> Result<ExitCode, Error> {
         "build_failed",
     )?;
     let git_wheels = carried::git_wheels(ctx, &stage, &python.request)?;
-    let interface = describe(&stage, &python, after.get("cozy-runtime"), &account)?;
+    let interface = describe(&stage, &python, after.get("cozy-runtime"))?;
     let interface_path = stage.root.join("package-interface.json");
     fs::write(&interface_path, &interface).map_err(|e| refuse("stage_unavailable", e))?;
 
@@ -814,14 +823,10 @@ fn unmet(error: Error, pins: &BTreeMap<String, String>, account: &str, hub: &Hub
     }
 }
 
-/// The interface Runtime's static describer reads from the staged source, with the publishing
-/// account written into org-relative model defaults; refused when installs could not read it.
-fn describe(
-    stage: &Stage,
-    python: &Python,
-    runtime: Option<&String>,
-    account: &str,
-) -> Result<Vec<u8>, Error> {
+/// The interface Runtime's static describer reads from the staged source, each model default with
+/// no org written as the root's (`sdxl@1.0.0` is `_/sdxl@1.0.0`, xs-071); refused when installs
+/// could not read it.
+fn describe(stage: &Stage, python: &Python, runtime: Option<&String>) -> Result<Vec<u8>, Error> {
     let from = match runtime {
         Some(version) => format!("cozy-runtime=={version}"),
         None => "cozy-runtime".into(),
@@ -859,7 +864,7 @@ fn describe(
                 .split_once('@')
                 .is_some_and(|(model, _)| !model.contains('/'))
             {
-                let named = format!("{account}/{default}");
+                let named = format!("{}/{default}", protocol::names::ROOT);
                 slot["default"] = named.into();
                 qualified = true;
             }
@@ -1027,7 +1032,7 @@ pub async fn yank(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
         return Err(Error::new(
             Kind::Usage,
             "yank_release_required",
-            "name the release to yank: org/name@release",
+            "name the release to yank: [org/]name@release",
         ));
     };
     let hub = ctx.hub()?;

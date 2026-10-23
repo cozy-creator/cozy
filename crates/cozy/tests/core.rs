@@ -22,6 +22,16 @@ fn current(hubs: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Hubs written as an inline table (`hubs = { local = … }`) are all kept when another is added.
+#[test]
+fn adding_a_hub_keeps_inline_hubs() {
+    let Some(home) = Home::new() else { return };
+    home.write_config("hubs = { local = \"http://127.0.0.1:1\" }\n");
+    home.json(["hub", "add", "other", "http://127.0.0.1:2", "--json"]);
+    let names: Vec<Value> = hubs(&home, &[]).iter().map(|h| h["name"].clone()).collect();
+    assert!(names.contains(&"local".into()) && names.contains(&"other".into()), "{names:?}");
+}
+
 /// Hub names work like kubectl contexts: one identity in any case, URLs in one spelling, the
 /// current one kept in config.toml, and `--tensorhub` picks one for a single command.
 #[test]

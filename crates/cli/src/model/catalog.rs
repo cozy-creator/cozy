@@ -35,7 +35,7 @@ fn available(release: &ModelCatalogRelease) -> bool {
 fn found(card: &ModelCard) -> Found {
     let release = tensorfs::format::newest_by(card.releases.iter().filter(|r| available(r)), |r| r.release.as_str());
     Found {
-        model: format!("{}/{}", card.model.org, card.model.name),
+        model: protocol::names::shown(&format!("{}/{}", card.model.org, card.model.name)),
         family: card.model.family.clone().filter(|f| !f.is_empty()),
         release: release.map(|r| r.release.clone()),
         lanes: release
@@ -49,7 +49,8 @@ fn found(card: &ModelCard) -> Found {
 pub(crate) async fn search(ctx: &Context, args: Search) -> Result<ExitCode, Error> {
     let client = ctx.hub_anonymous(&ctx.hub()?);
     let exact = match (&args.family, args.query.as_slice()) {
-        (None, [one]) => Repo::parse(one).ok(),
+        // A single word is search text (a root name among its matches, first); org/name is one model.
+        (None, [one]) if one.contains('/') => Repo::parse(one).ok(),
         _ => None,
     };
     let (cards, total) = match exact {
@@ -180,7 +181,7 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
     for release in &view.releases {
         let yanked = if release.yanked { ", yanked" } else { "" };
         let revision = release.revision.map(|r| format!("revision {r}")).unwrap_or_default();
-        anstream::println!("\n{repo}@{} ({revision}{yanked})", release.release);
+        anstream::println!("\n{}@{} ({revision}{yanked})", protocol::names::shown(&repo.to_string()), release.release);
         let mut table = Table::new(ctx, ["lane", "precision", "bytes", "commit"]);
         for lane in &release.lanes {
             let precision = lane.precision.clone().unwrap_or_else(|| "-".into());

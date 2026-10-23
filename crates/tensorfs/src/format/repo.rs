@@ -260,6 +260,10 @@ pub fn newest<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Option<&'a Tag> {
     newest_by(tags.into_iter().filter(|t| t.public && !t.yanked), |t| t.name.as_str())
 }
 
+/// The root namespace's org (Tensorhub's first-party models): a name with no org, `sdxl`, is
+/// `_/sdxl` in a reference, a repo key and a URL.
+pub const ROOT_ORG: &str = "_";
+
 /// A repository name: `<org>/<name>`, two segments.
 pub(crate) fn repo_name(name: &str) -> bool {
     name.split_once('/').is_some_and(|(org, name)| segment(org) && segment(name))
