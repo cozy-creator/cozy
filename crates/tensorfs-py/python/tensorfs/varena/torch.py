@@ -35,6 +35,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 from . import Exhausted, Fill, GpuId, Grant, Level, Pass, Pin, Stats, VarenaError, Window
 from . import Memory as Native
 from .._ext.varena import allocated as _allocated
+from .._ext.varena import allocator_capture as _allocator_capture
 from .._ext.varena import allocator_check as _allocator_check
 from .._ext.varena import allocator_retire as _allocator_retire
 from .._ext.varena import allocator_stats as _allocator_stats
@@ -561,6 +562,19 @@ class Memory:
         _allocator_retire(self.device.index or 0, pool.id)
         del pool
         r.flush_ms = (time.perf_counter() - began) * 1e3
+
+    @contextmanager
+    def capturing(self) -> Iterator[None]:
+        """A CUDA graph capture is open on this device (on any thread): wrap `capture_begin` ...
+        `capture_end`. Meanwhile torch skips its release-and-retry after a refused allocation,
+        so varena's allocator makes room at once rather than first letting torch release a
+        dropped pool's segments."""
+        device = self.device.index or 0
+        _allocator_capture(device, True)
+        try:
+            yield
+        finally:
+            _allocator_capture(device, False)
 
     def new_pool(self) -> torch.cuda.MemPool:
         """A torch pool whose segments varena's allocator makes (a request's, or a graph's)."""

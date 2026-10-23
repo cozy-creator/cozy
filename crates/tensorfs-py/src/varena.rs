@@ -900,6 +900,12 @@ fn allocator_check(py: Python<'_>, device: i32) -> PyResult<()> {
     Ok(())
 }
 
+/// A CUDA graph capture opens (`open`) or closes on `device` (`Memory.capturing`).
+#[pyfunction]
+fn allocator_capture(device: i32, open: bool) {
+    crate::allocator::capture(device, open);
+}
+
 /// Torch dropped `pool` on `device` (a request's end): its segments come back as torch releases
 /// them, and an allocation short of room first lets torch's retry release them.
 #[pyfunction]
@@ -940,6 +946,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(allocator_pending, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_check, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_retire, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_capture, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_quarantined, &m)?)?;
     m.add_function(wrap_pyfunction!(pins_held, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;

@@ -194,6 +194,9 @@ def allocator_stats(device: int | None = None, pool: tuple[int, int] | None = No
     """The pool's segments: (live bytes, segments made, make_room calls, NULLs for torch's
     release, refusals, nanoseconds making segments, segments freed)."""
 
+def allocator_capture(device: int, open: bool) -> None:
+    """A CUDA graph capture opens (`open`) or closes on `device` (`Memory.capturing`)."""
+
 def allocator_retire(device: int, pool: tuple[int, int]) -> None:
     """Torch dropped `pool` (a request's end): its segments come back as torch releases them,
     and an allocation short of room first lets torch's retry release them."""

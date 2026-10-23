@@ -108,6 +108,8 @@ struct Accounts {
     quarantined: Vec<Allocation>,
     /// Pools torch dropped (`retire`): their segments come back through torch's release.
     retired: BTreeSet<(i32, Pool)>,
+    /// CUDA graph captures open per device (`capture`): torch skips its release and retry then.
+    captures: BTreeMap<i32, u32>,
 }
 
 impl Accounts {
@@ -134,7 +136,7 @@ impl Accounts {
     }
 }
 
-static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new(), retired: BTreeSet::new() });
+static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new(), retired: BTreeSet::new(), captures: BTreeMap::new() });
 
 fn accounts() -> std::sync::MutexGuard<'static, Accounts> {
     ACCOUNTS.lock().unwrap_or_else(|p| p.into_inner())
@@ -203,6 +205,15 @@ pub fn retire(device: i32, pool: Pool) {
     if all.counts.get(&(device, pool)).is_some_and(|c| c.live > 0) {
         all.retired.insert((device, pool));
     }
+}
+
+/// A CUDA graph capture opens (`open`) or closes on `device`, on any thread. While one is open
+/// torch skips its release-and-retry after a refused allocation (v14 card probe), so the hook
+/// makes room at once instead of first letting torch release dropped pools' segments.
+pub fn capture(device: i32, open: bool) {
+    let mut all = accounts();
+    let n = all.captures.entry(device).or_default();
+    *n = if open { *n + 1 } else { n.saturating_sub(1) };
 }
 
 /// (live bytes, segments made, make_room calls, NULLs for torch's release, refusals,
@@ -291,8 +302,10 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
         }
         let Some(a) = active.as_ref() else { return refuse("driver_capacity") };
         // Torch's unused segments first: a dropped pool's come back through torch's retry, once
-        // per routing (it syncs the pool's events), and only while one holds segments.
-        if !retry && !a.released.load(Relaxed) && accounts().retired_live(device) > 0 {
+        // per routing (it syncs the pool's events), only while one holds segments and no capture
+        // is open on the device (torch then skips the retry: the NULL would be an OOM).
+        let releasable = |all: &Accounts| all.retired_live(device) > 0 && all.captures.get(&device).is_none_or(|n| *n == 0);
+        if !retry && !a.released.load(Relaxed) && releasable(&accounts()) {
             a.released.store(true, Relaxed);
             RELEASING.with(|r| r.set(Some(size)));
             accounts().counts.entry(key).or_default().released += 1;
