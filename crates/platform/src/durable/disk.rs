@@ -16,6 +16,7 @@
 //!   bytes are flushed before their name is published, as before.
 //! - **Persistent** — everything else (ext4, xfs, btrfs, zfs, ...), a `statfs` that fails,
 //!   and every non-Linux platform. The safe side: it survives a crash of this machine.
+#![allow(unsafe_code)]
 use std::{fs::File, path::Path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -1,5 +1,6 @@
 //! Each GPU's memory class from the CUDA driver's device attributes (`libcuda.so.1`,
 //! `nvcuda.dll`, opened at run time). A computer with no CUDA driver answers nothing.
+#![allow(unsafe_code)]
 use super::{Gpu, MemoryClass};
 use crate::{Error, Result};
 use libloading::Library;

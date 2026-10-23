@@ -1,6 +1,7 @@
 //! Windows: a change notification on the directory for names, sizes and last writes. NTFS reports
 //! a write through a handle held open only when its cache flushes: at once after a sync or a
 //! close (measured, microseconds), not within 10 s otherwise.
+#![allow(unsafe_code)]
 use crate::{Error, Result};
 use std::{io, os::windows::ffi::OsStrExt, path::Path, time::Duration};
 use windows_sys::Win32::{

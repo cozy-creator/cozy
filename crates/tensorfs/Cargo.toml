@@ -68,3 +68,6 @@ required-features = ["faults"]
 [dev-dependencies]
 libc.workspace = true
 rcgen.workspace = true
+
+[lints]
+workspace = true

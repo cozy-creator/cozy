@@ -1,4 +1,5 @@
 //! The wire types every cozy process shares.
+#![forbid(unsafe_code)]
 
 pub mod calcifer;
 pub mod capability;

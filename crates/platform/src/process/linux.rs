@@ -1,4 +1,5 @@
 //! Linux: births from `/proc`, exact handles by pidfd (TensorD `process.rs`).
+#![allow(unsafe_code)]
 use super::{Birth, State, unix};
 use std::{
     fs, io,

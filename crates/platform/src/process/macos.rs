@@ -1,4 +1,5 @@
 //! macOS: births from `proc_pidinfo`, exact handles as a kqueue watching the process's exit.
+#![allow(unsafe_code)]
 use super::{Birth, State, unix};
 use std::{
     io, mem,

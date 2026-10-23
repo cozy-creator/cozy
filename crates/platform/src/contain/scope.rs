@@ -2,6 +2,7 @@
 //! below the machine's where the host delegates one, else a process-tree token. Either
 //! reaches descendants that call `setsid` or double-fork. Lifecycle containment, not a
 //! sandbox: same-UID code can move out of a delegated cgroup or scrub its token.
+#![allow(unsafe_code)]
 use super::TOKEN_ENV;
 use crate::process::{Birth, Exact, State, gone};
 use std::{

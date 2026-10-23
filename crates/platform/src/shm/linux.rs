@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use super::{FULL_SEALS, Region};
 use crate::Result;
 use std::{

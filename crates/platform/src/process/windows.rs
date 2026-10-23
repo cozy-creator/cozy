@@ -1,5 +1,6 @@
 //! Windows: births from creation times, exact handles as process HANDLEs (an open handle keeps the
 //! PID from being reused), trees as Job Objects.
+#![allow(unsafe_code)]
 use super::{Birth, State};
 use std::{
     ffi::OsString,

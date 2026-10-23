@@ -1,5 +1,6 @@
 //! The Linux trigger: PSI on the system or this cgroup, inotify on each limited cgroup v2's
 //! `memory.events`, and an eventfd TensorD's own events write.
+#![allow(unsafe_code)]
 use super::{HostMode, WINDOW};
 use std::{
     ffi::CString,

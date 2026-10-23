@@ -1,6 +1,7 @@
 //! macOS: kqueue vnode events on the directory (an entry added, removed or renamed) and on each
 //! regular file in it (written, extended, deleted or renamed). A directory event rescans it, so
 //! a file rotated in is watched from then on.
+#![allow(unsafe_code)]
 use crate::{Error, Result};
 use std::{
     collections::HashMap,

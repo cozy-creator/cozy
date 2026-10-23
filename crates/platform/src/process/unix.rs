@@ -1,4 +1,5 @@
 //! What Linux and macOS share: process groups, sessions, signals and readiness.
+#![allow(unsafe_code)]
 use std::{
     ffi::OsString,
     fs::File,

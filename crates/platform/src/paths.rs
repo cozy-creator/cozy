@@ -1,5 +1,6 @@
 //! Where things live (design §7). Locations only: the caller's config resolves the user's home
 //! and hands it in, and nothing here reads the environment.
+#![allow(unsafe_code)]
 use crate::{Result, durable};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]

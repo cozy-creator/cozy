@@ -1,6 +1,8 @@
 // The machine API's error envelope is TensorD's error type; refusals are cold paths, so its size
 // costs nothing worth boxing it for.
 #![allow(clippy::result_large_err)]
+// xs-067 removes TensorD's unsafe; until then its blocks are not all documented.
+#![allow(clippy::undocumented_unsafe_blocks)]
 pub mod access;
 pub mod adapter;
 mod archive;

@@ -1,4 +1,5 @@
 //! The `cozy` command line. One module per verb group; each owns its clap arguments and handler.
+#![forbid(unsafe_code)]
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};

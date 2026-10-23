@@ -3,6 +3,7 @@
 //! flush each OS has: `fsync`, `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows. Windows has
 //! no POSIX owner or mode: a store there keeps the profile's ACL, so modes and owners are accepted
 //! and left to the filesystem's defaults, and a directory needs no sync (NTFS journals its entries).
+#![allow(unsafe_code)]
 use crate::{Error, Result};
 use std::{
     fs::{self, File, Metadata, OpenOptions},

@@ -1,0 +1,56 @@
+name: memory-safety
+# Every PR and master push (xs-067): no unsafe outside unsafe-boundaries.txt, no crate outside deny.toml's
+# allow-list or with an advisory, the crates' unsafe lints, and Miri over the pure-Rust unsafe it can run.
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: memory-safety-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  boundaries:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Unsafe only in the listed boundary files
+        run: |
+          git grep -lE '^[^/]*\bunsafe ?(\{|fn |impl |extern |\()' -- '*.rs' | sort | diff -u <(grep -v '^#' unsafe-boundaries.txt) -
+      - name: Every crate takes the workspace lints
+        run: |
+          for t in crates/*/Cargo.toml; do
+            sed -n '/^\[lints\]/,/^\[/p' "$t" | grep -qx 'workspace = true' || { echo "$t: no [lints] workspace = true"; exit 1; }
+          done
+
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  lints:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      # The unsafe lints are errors (Cargo.toml, crate roots); other lints are not judged here.
+      - run: cargo clippy --workspace --all-targets --locked
+
+  miri:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install nightly --profile minimal --component miri --allow-downgrade
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly miri test -p tensorfs --no-default-features --test miri

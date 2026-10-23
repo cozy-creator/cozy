@@ -1,4 +1,5 @@
 //! The `cozy` binary dispatches to its roles: CLI verbs, `calcifer` and `machine serve`.
+#![forbid(unsafe_code)]
 fn main() -> std::process::ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let words: Vec<&std::ffi::OsString> = args.iter().filter(|arg| *arg != "--json").collect();

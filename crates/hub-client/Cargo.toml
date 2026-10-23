@@ -36,3 +36,6 @@ syn.workspace = true
 [dev-dependencies]
 hub-client = { path = ".", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
