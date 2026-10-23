@@ -13,24 +13,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// `cozy machine serve` (and the `tensord` binary's run modes).
+/// `cozy machine serve` (and the `tensord` binary's run modes): this computer's machine, which
+/// Calcifer starts when something uses it, or with `--rental` a provider's pod.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::Args)]
-#[group(multiple = false)]
 pub struct Flags {
     /// A provider's pod: Hub lease, readiness receipt, idle release.
     #[arg(long)]
     pub rental: bool,
-    /// This computer's machine, run as a user service.
-    #[arg(long)]
-    pub persistent: bool,
 }
 
 impl Flags {
-    pub fn lifetime(&self) -> Option<Lifetime> {
-        match (self.rental, self.persistent) {
-            (true, _) => Some(Lifetime::Rental),
-            (_, true) => Some(Lifetime::Persistent),
-            _ => None,
+    pub fn lifetime(&self) -> Lifetime {
+        match self.rental {
+            true => Lifetime::Rental,
+            false => Lifetime::Local,
         }
     }
 }

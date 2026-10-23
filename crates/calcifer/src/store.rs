@@ -1508,7 +1508,7 @@ fn machine_state(state: MachineState) -> &'static str {
         MachineState::Booting => "booting",
         // Ending is the API's word for a machine whose end its Hub has not affirmed; nothing
         // records a state it does not know.
-        MachineState::Ready | MachineState::Ending | MachineState::Unknown => "ready",
+        MachineState::Ready | MachineState::Ending | MachineState::Stopped | MachineState::Unknown => "ready",
         MachineState::Ended => "ended",
     }
 }

@@ -381,6 +381,7 @@ pub fn state_cell(m: &Machine) -> String {
         },
         MachineState::Ending => "ending".into(),
         MachineState::Ended => "ended".into(),
+        MachineState::Stopped => "stopped · starts when used".into(),
         MachineState::Unknown => "unknown".into(),
     };
     if m.unverified {

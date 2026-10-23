@@ -1,5 +1,6 @@
-//! The machine role: `cozy machine serve --rental|--persistent` on a pod or this computer, and
-//! the `tensord` binary's modes, which TensorD's and Calcifer's tests run.
+//! The machine role: `cozy machine serve` on this computer (Calcifer starts it when something
+//! uses it), `--rental` on a pod; and the `tensord` binary's modes, which TensorD's and
+//! Calcifer's tests run.
 use crate::{
     config::{self, Flags},
     machine::grant::Lifetime,
@@ -8,12 +9,11 @@ use std::{io, path::PathBuf, process::ExitCode, sync::Arc};
 use fs2::FileExt;
 use crate::{origin::Machine, storage::Store};
 
-/// `cozy machine serve --rental|--persistent`, from the arguments after `machine`: this
-/// computer's or a pod's machine, until it stops.
+/// `cozy machine serve [--rental]`, from the arguments after `machine`: this computer's or a
+/// pod's machine, until it stops.
 pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
     #[derive(clap::Parser)]
     #[command(name = "cozy machine serve", about = "Run this computer's machine (TensorD)")]
-    #[command(group(clap::ArgGroup::new("lifetime").args(["rental", "persistent"]).required(true)))]
     struct Serve {
         #[command(flatten)]
         flags: Flags,
@@ -22,7 +22,7 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
         service_ready: Option<u64>,
     }
     let serve = <Serve as clap::Parser>::parse_from(args);
-    machine(serve.flags.lifetime().expect("clap requires one"), serve.service_ready)
+    machine(serve.flags.lifetime(), serve.service_ready)
 }
 
 /// The machine: its stable parent, then the service it starts (`service_ready`: this is that
@@ -301,9 +301,10 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     let (working, ended_ms) = service.engine.jobs(0)?;
     lifecycle.observe(crate::machine::lifecycle::Jobs { working, ended_ms }, lifecycle.epoch());
     // An update's activation holds queued runs; one that ends without its restart lets them start.
+    // An admission or a follower letting go may start the idle clock.
     let (activating, executions) = (lifecycle.clone(), service.engine.clone());
     service.hold_while(move || activating.activating());
-    lifecycle.on_activation(move || executions.notify_activity());
+    lifecycle.on_change(move || executions.notify_activity());
     let mut sdk = crate::published::PackageSdk::selected(&paths.sdk(), &layout.root, crate::machine::client::uv(&layout.root));
     // A local machine installs releases through its owner's uv cache, as its local packages do;
     // a cache of its own from before is no longer read (environments keep their linked files).
@@ -378,6 +379,24 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
             config,
             store,
         )?)?;
+    }
+    if !rental {
+        let (lifecycle, engine, home) = (lifecycle.clone(), service.engine.clone(), grant.home.clone());
+        let (released, stopped) = (service.clone(), service.clone());
+        std::thread::Builder::new().name("local-lifecycle".into()).spawn(move || {
+            crate::machine::lifecycle::exit_when_idle(
+                lifecycle,
+                engine,
+                move || released.release_idle(),
+                move || stopped.stop(),
+                // Kept up for its authorized controllers, unless `cozy update` replaced its binary:
+                // it exits idle and Calcifer starts the new one.
+                move || {
+                    let swapped = crate::machine::binary::launch().is_some_and(|launch| launch.swapped());
+                    crate::machine::grant::authorized(&home) && !swapped
+                },
+            )
+        })?;
     }
     if let Some(hub) = grant.hub.clone().filter(|_| rental) {
         identity.hubs = vec![(hub.origin.clone(), hub.worker_id.clone())];

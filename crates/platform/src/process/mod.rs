@@ -276,6 +276,31 @@ pub fn end_tree(tree: &[Exact]) -> Result<()> {
     Ok(())
 }
 
+/// Ends the process that holds the lock at `lock` (the birth it published) and everything it
+/// started, then waits until the kernel frees the lock. On Windows its stable parent too, which
+/// would start a killed service again. A free lock is nothing to end.
+pub fn end_holder(lock: &Path) -> Result<()> {
+    use crate::lock::{Kind, LockFile};
+    let lock = LockFile::new(lock);
+    if !lock.path().exists() || lock.try_lock(Kind::Exclusive)?.is_some() {
+        return Ok(());
+    }
+    let holder = lock.holder()?.and_then(|record| serde_json::from_slice::<Birth>(&record).ok());
+    let birth = holder.ok_or_else(|| Error::Io {
+        op: "read the holder of",
+        path: lock.path().into(),
+        source: io::Error::other("it names no process"),
+    })?;
+    // A parent is born before its child; an older PID's reuse is not.
+    #[cfg(windows)]
+    let birth = (parent_of(birth.pid).ok())
+        .and_then(|pid| Birth::of(pid).ok())
+        .filter(|parent| parent.start_ticks <= birth.start_ticks)
+        .unwrap_or(birth);
+    end_tree(&tree(birth.pid))?;
+    lock.lock(Kind::Exclusive).map(drop)
+}
+
 /// Every process in `leader`'s process group born with or after it: a leader's followers. A
 /// group number is not reused while a member lives. Empty on Windows, whose trees are Job Objects.
 pub fn group_members(leader: &Birth) -> Vec<Birth> {

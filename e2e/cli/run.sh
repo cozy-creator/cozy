@@ -11,7 +11,7 @@ step install; install_cozy
 user_services
 step up; cozy --json up
 step status; cozy --json status | tee "$OUT/status.json"
-step "the local machine"; cozy --json machine enable; machine_ready
+step "the local machine"; machine_ready
 step candidates; candidates
 
 step "BiRefNet on the CPU"
@@ -25,8 +25,7 @@ if [ "$first" != none ]; then
 fi
 
 step "a second executor"
-cozy --json machine disable || check "cozy machine disable failed"
-cozy --json machine enable || check "cozy machine enable failed"
+machine_stop || check "the local machine did not stop"
 machine_ready
 dog=$(picture dog2.jpg)
 if cell second "$(birefnet)" --asset "image=$dog"; then white_background "$(output second webp)" "$dog" || check "second: not a background removal"; fi

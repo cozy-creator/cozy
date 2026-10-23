@@ -16,23 +16,19 @@ use crate::{
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// The machine to check; without it, this computer's machine when it is one.
+    /// The machine to check; without it, this computer's machine, which starts for it.
     #[arg(long)]
     on: Option<String>,
 }
 
 /// `cozy doctor`: this computer's tools (found, or what each one's absence costs and what installs
-/// it), then a machine as its Status reports it: `--on`'s, else this computer's when enabled.
+/// it), then a machine as its Status reports it: `--on`'s, else this computer's.
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     let tools = crate::tools::rows(ctx, Side::Computer);
-    let named = args.on.is_some();
     let on = args.on.unwrap_or_else(|| "local".into());
-    let machine: Option<Machine> = match ctx.calcifer().await?.get(&route(&on)?).await {
-        Err(e) if e.kind == Kind::NotFound && !named => None,
-        answer => Some(answer?),
-    };
+    let m: Machine = ctx.calcifer().await?.get(&route(&on)?).await?;
     if ctx.json {
-        output::json(&serde_json::json!({ "tools": tools, "machine": machine }));
+        output::json(&serde_json::json!({ "tools": tools, "machine": m }));
         return Ok(ExitCode::SUCCESS);
     }
     let mut table = output::Table::new(ctx, ["THIS COMPUTER", "STATE", "PATH OR INSTALL"]);
@@ -40,11 +36,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         table = table.row(crate::tools::cells(row));
     }
     table.print();
-    let Some(m) = machine else {
-        output::say(ctx, "this computer is not a machine");
-        output::next(ctx, &["cozy machine enable", "cozy doctor --on <machine>"]);
-        return Ok(ExitCode::SUCCESS);
-    };
     let Some(status) = &m.status else {
         let why = m
             .unreachable

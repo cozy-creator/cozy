@@ -88,9 +88,9 @@ pub struct MachineConfig {
     /// The TensorFS store it fills; absent: a pod's `var/lib/tensorfs` under its root, this
     /// computer's shared TensorFS cache (`TENSORFS_HOME`, else `~/.cache/tensorfs`).
     pub store: Option<PathBuf>,
-    /// How long a rental stays with no job before it releases itself; absent: 15 minutes
-    /// (shorter only in tests).
-    pub rental_idle_seconds: Option<u32>,
+    /// Tests only: a shorter idle window than the fixed 15 minutes after which a rental releases
+    /// itself and this computer's machine exits (its executors at a third of it).
+    pub idle_seconds: Option<u32>,
     /// The image layout's root: `/` on a pod, `~/.cozy/machine` on this computer.
     pub root: Option<PathBuf>,
     /// The datacenter cache volume's mount.

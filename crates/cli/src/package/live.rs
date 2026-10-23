@@ -44,7 +44,8 @@ impl Packages {
     pub(crate) fn rows(&self, ctx: &Context) -> Vec<Vec<String>> {
         let shown = |m: &&Machine| match &self.on {
             Some(name) => m.name.eq_ignore_ascii_case(name) || m.alias.as_deref() == Some(name),
-            None => m.state == MachineState::Ready,
+            // A stopped `local` shows what it held when it last ran.
+            None => matches!(m.state, MachineState::Ready | MachineState::Stopped),
         };
         let machines = self.machines.list().machines.iter().filter(shown);
         // `open` checked `--tensorhub`, the one way reading the rows fails.

@@ -174,9 +174,6 @@ impl From<crate::Error> for Refusal {
                 format!("idempotency key {key:?} already names another run"),
             )
             .remedy("submit a different run under a new key"),
-            crate::Error::Store(StoreError::UnknownMachine(name)) if name == "local" => {
-                local_disabled()
-            }
             crate::Error::Store(StoreError::UnknownMachine(name)) => Error::new(
                 Kind::NotFound,
                 "machine_not_found",
@@ -190,26 +187,6 @@ impl From<crate::Error> for Refusal {
             }
             crate::Error::Refused(e) => e,
         })
-    }
-}
-
-/// A run for this computer while it is not a machine: enable it, or rent one. A Mac has no
-/// supported GPU, so renting comes first there.
-fn local_disabled() -> Error {
-    let error = Error::new(
-        Kind::NotFound,
-        "machine_not_found",
-        "this computer's machine is not enabled",
-    );
-    match cfg!(target_os = "macos") {
-        true => error
-            .remedy("this Mac has no supported GPU: rent one, or `cozy machine enable` for CPU functions")
-            .next("cozy run … --on new")
-            .next("cozy machine enable"),
-        false => error
-            .remedy("`cozy machine enable` makes this computer a machine; without a supported GPU, rent one")
-            .next("cozy machine enable")
-            .next("cozy run … --on new"),
     }
 }
 

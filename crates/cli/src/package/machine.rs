@@ -178,7 +178,7 @@ async fn machines(ctx: &Context, on: Option<&On>) -> Result<Vec<Machine>, Error>
         let all = calcifer.machines().await?.machines;
         return Ok(all
             .into_iter()
-            .filter(|m| m.state == MachineState::Ready)
+            .filter(|m| matches!(m.state, MachineState::Ready | MachineState::Stopped))
             .collect());
     };
     let mut machine: Machine = calcifer

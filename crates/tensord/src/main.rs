@@ -4,7 +4,6 @@ use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 use tensord::{
     config::Flags,
-    machine::grant::Lifetime,
     serve::{self, Dev},
 };
 
@@ -22,7 +21,7 @@ struct Tensord {
 
 #[derive(Subcommand)]
 enum Mode {
-    /// The machine (the default; a rental unless --persistent).
+    /// The machine (the default): this computer's, or with --rental a pod's.
     Run(Flags),
     /// What this binary is, as JSON.
     Version {
@@ -35,10 +34,9 @@ enum Mode {
 
 fn main() -> ExitCode {
     let tensord = Tensord::parse();
-    let lifetime = |flags: Flags| flags.lifetime().unwrap_or(Lifetime::Rental);
     let done = match tensord.mode {
-        None => return serve::machine(lifetime(tensord.flags), tensord.service_ready),
-        Some(Mode::Run(flags)) => return serve::machine(lifetime(flags), tensord.service_ready),
+        None => return serve::machine(tensord.flags.lifetime(), tensord.service_ready),
+        Some(Mode::Run(flags)) => return serve::machine(flags.lifetime(), tensord.service_ready),
         Some(Mode::Version { .. }) => serve::version(),
         Some(Mode::Serve(dev)) => serve::dev(*dev),
     };

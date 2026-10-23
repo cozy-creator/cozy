@@ -22,8 +22,8 @@ pub enum Reach {
 /// The listener on every interface: its capability is bound to the viewer's DTLS certificate,
 /// while the control API stays where the grant puts it. A rental listens on its granted port;
 /// this computer's machine keeps the port it first took, so a play link survives restarts.
-pub fn listen(state: &Path, granted: Option<u16>, persistent: bool) -> io::Result<Option<TcpListener>> {
-    if granted.is_none() && !persistent {
+pub fn listen(state: &Path, granted: Option<u16>, local: bool) -> io::Result<Option<TcpListener>> {
+    if granted.is_none() && !local {
         return Ok(None);
     }
     super::net::kept_listener(&state.join("webrtc-port"), Ipv4Addr::UNSPECIFIED.into(), granted).map(Some)

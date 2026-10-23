@@ -1,4 +1,5 @@
-//! Machines: this computer's (`local`), rentals, and other computers' added by address.
+//! Machines: this computer's (`local`, which starts when used), rentals, and other computers'
+//! added by address.
 //!
 //! Each machine with an endpoint has one `Status` stream. Its phase, idle deadline, GPUs and
 //! live runs are held here and answer `GET /v1/machines`; nothing is polled. A machine that
@@ -72,6 +73,8 @@ pub struct Machines {
     pub(crate) placing: Notify,
     /// The machines sent this computer's bearer at each Hub, which get each one minted after.
     pub(crate) bearers: Mutex<HashMap<config::Origin, HashSet<String>>>,
+    /// This computer's machine, started when something uses it.
+    local: crate::local::Local,
     tasks: Mutex<JoinSet<()>>,
 }
 
@@ -84,13 +87,21 @@ pub(crate) struct Seen {
     since: Option<i64>,
     /// A booting rental's phase, as its Hub says it.
     pub(crate) boot: Option<String>,
+    /// `local` is not running: it starts when something uses it.
+    stopped: bool,
 }
 
 impl Machines {
     /// Watches every machine Calcifer holds, follows booting rentals, asks again what it asked
     /// a Hub and was not answered, and places unplaced runs. The config names the Hubs listed
-    /// (a rental's own Hub is always read) and the model-source tokens runs carry.
-    pub fn start(calcifer: Arc<Calcifer>, home: Home, config: &config::Config) -> Arc<Self> {
+    /// (a rental's own Hub is always read), this computer's machine root and the model-source
+    /// tokens runs carry.
+    pub fn start(
+        calcifer: Arc<Calcifer>,
+        home: Home,
+        user_home: &Path,
+        config: &config::Config,
+    ) -> Arc<Self> {
         let token = |secret: &Option<config::Secret>| {
             secret
                 .as_ref()
@@ -101,6 +112,7 @@ impl Machines {
             huggingface: token(&config.huggingface_token),
             civitai: token(&config.civitai_token),
         };
+        let local = crate::local::Local::new(&home, user_home, config);
         let me = Arc::new(Self {
             hubs: Hubs::new(&home, config.hubs()),
             providers: (providers != v1::ProviderAccess::default()).then_some(providers),
@@ -111,13 +123,16 @@ impl Machines {
             renting: Mutex::default(),
             placing: Notify::new(),
             bearers: Mutex::default(),
+            local,
             tasks: Mutex::default(),
             calcifer,
         });
         me.calcifer.serve_with(&me);
         match me.store().machines() {
             Ok(rows) => {
-                for row in rows.iter().filter(|r| r.state != MachineState::Ended) {
+                // `local` is followed once recorded, while its TensorD runs.
+                let others = rows.iter().filter(|r| r.kind != MachineKind::Local);
+                for row in others.filter(|r| r.state != MachineState::Ended) {
                     match row.endpoint {
                         Some(_) => me.watch(row),
                         None if row.kind == MachineKind::Rental => me.follow_boot(row.clone()),
@@ -129,6 +144,7 @@ impl Machines {
         }
         me.prune_kept();
         me.resume_asks();
+        me.spawn(me.clone().local_tasks());
         me.spawn(me.clone().place_runs());
         let lister = me.clone();
         me.spawn(async move { lister.list_hubs().await });
@@ -163,6 +179,7 @@ impl Machines {
         if refresh {
             self.list_hubs().await;
         }
+        self.local_row()?;
         let rows = self.store().machines().map_err(internal)?;
         let mut machines = Vec::new();
         for row in rows.iter().filter(|r| r.state != MachineState::Ended) {
@@ -178,9 +195,10 @@ impl Machines {
         })
     }
 
-    /// One machine by its name, former name or rental id, with its Status read now.
+    /// One machine by its name, former name or rental id, with its Status read now: `local`
+    /// starts for it.
     pub async fn show(self: &Arc<Self>, text: &str) -> Result<Machine, Error> {
-        let Some(row) = self.store().find_machine(text).map_err(internal)? else {
+        let Some(row) = self.up(text).await? else {
             return self.hubs.other(text).ok_or_else(|| not_found(text));
         };
         if row.state != MachineState::Ended
@@ -280,44 +298,155 @@ impl Machines {
         self.picture(&row)
     }
 
-    /// Records this computer's machine, which signs with this controller's owner key.
-    pub fn put_local(self: &Arc<Self>, endpoint: Endpoint) -> Result<Machine, Error> {
+    /// Records this computer's machine where its TensorD serves (none before its first start),
+    /// signed with this controller's owner key (minted as it first starts), and follows it while
+    /// it serves.
+    fn put_local(self: &Arc<Self>, endpoint: Option<Endpoint>, serving: bool) -> Result<(), Error> {
         let row = MachineRow {
             name: "local".into(),
             kind: MachineKind::Local,
             hub: String::new(),
             rental_id: None,
-            endpoint: Some(endpoint),
-            key: self.owner_key()?,
+            endpoint,
+            key: self.home.owner_key(),
             state: MachineState::Ready,
             served: true,
             reason: None,
         };
+        lock(&self.seen).entry(row.name.clone()).or_default().stopped = !serving;
         self.calcifer.put_machine(&row).map_err(internal)?;
-        self.watch(&row);
-        self.picture(&row)
+        if serving {
+            self.watch(&row);
+        }
+        Ok(())
+    }
+
+    /// `local` always exists: recorded as Calcifer starts (after its first answer, which writes
+    /// nothing before it), or as something names it first.
+    fn local_row(self: &Arc<Self>) -> Result<MachineRow, Error> {
+        if let Some(row) = self.store().machine("local").map_err(internal)? {
+            return Ok(row);
+        }
+        self.record_local()?;
+        self.row("local")
+    }
+
+    /// Records `local` where its TensorD serves when one runs, else where it last served.
+    fn record_local(self: &Arc<Self>) -> Result<(), Error> {
+        let kept = self.store().machine("local").map_err(internal)?.and_then(|row| row.endpoint);
+        let serving = self.local.running().then(|| self.local.endpoint().ok()).flatten();
+        self.put_local(serving.clone().or(kept), serving.is_some())
+    }
+
+    /// With Calcifer: `local` starts at once when another computer's controller is authorized to
+    /// use it (Calcifer starts at login), and an earlier `cozy machine enable` service is removed
+    /// once nothing of Calcifer's runs on `local`.
+    async fn local_tasks(self: Arc<Self>) {
+        // Off the runtime's workers: a write may wait out a commit stuck on a busy disk.
+        let me = self.clone();
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || me.record_local()).await {
+            warn!("recording this computer's machine: {}", e.message);
+        }
+        if self.local.authorized()
+            && let Err(e) = self.local_up().await
+        {
+            warn!("starting this computer's machine for its authorized controllers: {}", e.message);
+        }
+        let mut events = self.calcifer.subscribe();
+        loop {
+            let load = self.store().machine_load().map_err(internal);
+            if load.is_ok_and(|load| load.get("local").is_none_or(|(r, q)| r + q == 0)) {
+                break;
+            }
+            if let Err(RecvError::Closed) = events.recv().await {
+                return;
+            }
+        }
+        let local = self.clone();
+        match tokio::task::spawn_blocking(move || local.local.retire_service()).await {
+            Ok(Ok(true)) => {
+                tracing::info!("removed the cozy-machine service: this computer's machine starts when used");
+                self.local_exited().await;
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => warn!("removing the cozy-machine service: {}", e.message),
+            Err(e) => warn!("removing the cozy-machine service: {e}"),
+        }
+    }
+
+    /// Brings `local` up: starts its TensorD when none runs, records where it serves and
+    /// follows it. Callers share one start.
+    pub(crate) async fn local_up(self: &Arc<Self>) -> Result<(), Error> {
+        let stopped = || lock(&self.seen).get("local").is_some_and(|seen| seen.stopped);
+        if !stopped() && self.local.running() {
+            return Ok(());
+        }
+        let _start = self.local.starting.lock().await;
+        if !stopped() && self.local.running() {
+            return Ok(());
+        }
+        // TensorD admits this controller's key from the home as it starts.
+        self.owner_key()?;
+        let endpoint = match self.local.serving().await {
+            Some(endpoint) => endpoint,
+            None => self.local.start().await?,
+        };
+        self.put_local(Some(endpoint), true)
+    }
+
+    /// The machine `text` names, with `local` brought up first.
+    async fn up(self: &Arc<Self>, text: &str) -> Result<Option<MachineRow>, Error> {
+        if text == "local" {
+            self.local_row()?;
+            self.local_up().await?;
+        }
+        self.store().find_machine(text).map_err(internal)
+    }
+
+    /// `local`'s TensorD exited (after its idle time, or ended): it is no longer followed, and
+    /// the next use starts it.
+    fn local_stopped(&self) {
+        if let Some((_, task)) = lock(&self.watching).remove("local") {
+            task.abort();
+        }
+        {
+            let mut seen = lock(&self.seen);
+            let seen = seen.entry("local".into()).or_default();
+            (seen.stopped, seen.unreachable, seen.since) = (true, None, None);
+        }
+        self.calcifer.touch("local");
+        self.calcifer.machine_changed();
+    }
+
+    /// `local`'s TensorD exited: while another computer's controller is authorized to use it, it
+    /// starts again at once (after `cozy update`, on the new binary).
+    async fn local_exited(self: &Arc<Self>) {
+        self.local_stopped();
+        if self.local.authorized()
+            && let Err(e) = self.local_up().await
+        {
+            warn!("starting this computer's machine again for its authorized controllers: {}", e.message);
+        }
     }
 
     /// Ends a rental at its Hub (`ending` until the Hub affirms it), or removes an added machine
-    /// from this controller. `local` is disabled, never ended. While outputs of its runs have not
-    /// landed it is refused `outputs_exporting`; `force` ends it anyway and names them given up.
+    /// from this controller. `local` is never ended. While outputs of its runs have not landed
+    /// it is refused `outputs_exporting`; `force` ends it anyway and names them given up.
     pub async fn end(self: &Arc<Self>, text: &str, force: bool) -> Result<Ended, Error> {
-        let Some(row) = self.store().find_machine(text).map_err(internal)? else {
-            return self.end_other(text).await;
+        let row = self.store().find_machine(text).map_err(internal)?;
+        let Some(row) = row.filter(|_| text != "local") else {
+            return match text {
+                "local" => Err(local_refusal()),
+                _ => self.end_other(text).await,
+            };
         };
+        if row.kind == MachineKind::Local {
+            return Err(local_refusal());
+        }
         if row.state == MachineState::Ended {
             return Ok(Ended {
                 machine: self.picture(&row)?,
                 changed: false,
-                abandoned: vec![],
-            });
-        }
-        // `cozy machine disable`: its runs here end, its files stay, and enable records it again.
-        if row.kind == MachineKind::Local {
-            self.ended(&row.name, "disabled on this computer");
-            return Ok(Ended {
-                machine: self.picture(&self.row(&row.name)?)?,
-                changed: true,
                 abandoned: vec![],
             });
         }
@@ -445,6 +574,9 @@ impl Machines {
         }
         let mut held = vec![];
         if let Some(seen) = lock(&self.seen).get(&row.name) {
+            if seen.stopped {
+                machine.state = MachineState::Stopped;
+            }
             machine.status = seen.frame.as_ref().map(|frame| status(frame, &self.hubs));
             held = seen.frame.as_ref().map(|f| f.runs.clone()).unwrap_or_default();
             machine.unreachable.clone_from(&seen.unreachable);
@@ -526,12 +658,16 @@ impl Machines {
             let offline = self.offline(&name).is_some();
             if !offline {
                 let reason = match self.status_frames(&name, &mut pause).await {
+                    Ok(()) if kind == MachineKind::Local => return self.local_exited().await,
                     Ok(()) => {
                         self.ended(&name, "it released itself after its idle time");
                         return;
                     }
                     Err(reason) => reason,
                 };
+                if kind == MachineKind::Local && !self.local.running() {
+                    return self.local_exited().await;
+                }
                 self.unreachable(&name, reason);
                 if pause.is_zero() {
                     hub_pause = Duration::ZERO;
@@ -586,6 +722,7 @@ impl Machines {
             if frame.phase == "ready" && seen.frame.as_ref().is_none_or(|f| f.phase != "ready") {
                 self.placing.notify_one();
             }
+            seen.stopped &= frame.phase == "releasing";
             seen.frame = Some(frame);
             seen.since = None;
             seen.unreachable.take().is_some()
@@ -640,17 +777,17 @@ impl Machines {
     /// of it coming. A rental on its way takes it. A machine whose Status stream is live is asked
     /// nothing, nor is its Hub; a Hub is asked only of a rental that did not answer.
     async fn reach(self: &Arc<Self>, text: &str) -> Result<(), Error> {
+        // This computer's machine starts for the run.
+        if text == "local" {
+            return self.local_row().map(drop);
+        }
         let Some(row) = self.store().find_machine(text).map_err(internal)? else {
             return Ok(());
         };
         let name = row.name.clone();
         if row.state == MachineState::Ended {
             let reason = row.reason.as_deref().unwrap_or("no reason was given");
-            let error = ended_refusal(&name, reason);
-            return Err(match row.kind {
-                MachineKind::Local => Error { next: vec!["cozy machine enable".into()], ..error },
-                _ => error,
-            });
+            return Err(ended_refusal(&name, reason));
         }
         if row.endpoint.is_none() {
             return Ok(());
@@ -982,7 +1119,7 @@ pub(crate) async fn show(
 /// One of Calcifer's machines with the Status frame it answered now, recorded as its latest:
 /// one that cannot answer is `machine_unavailable`, never its last picture.
 async fn fresh(machines: &Arc<Machines>, text: &str) -> Result<Machine, Error> {
-    let row = machines.store().find_machine(text).map_err(internal)?;
+    let row = machines.up(text).await?;
     let row = row.ok_or_else(|| not_found(text))?;
     let unavailable = |why: String| {
         let message = format!("{} cannot answer now: {why}", row.name);
@@ -1104,11 +1241,6 @@ pub(crate) async fn create(
         } => {
             let added = api.machines.add(&name, &address, &fingerprint).await;
             Ok(Json(added.map_err(Refusal)?).into_response())
-        }
-        NewMachine::Local { root } => {
-            let ready = root.join("var/lib/cozy/tensord/api-ready.json");
-            let local = api.machines.put_local(endpoint_of(&ready).map_err(Refusal)?);
-            Ok(Json(local.map_err(Refusal)?).into_response())
         }
     }
 }
@@ -1487,6 +1619,15 @@ fn offline_refusal(name: &str, reason: &str) -> Error {
     Error::new(Kind::Unavailable, "machine_offline", format!("{name} is offline: {reason}"))
         .remedy("it returns if its provider resumes it; `--on new` rents a machine, or name another")
         .next(format!("cozy machine show {name}"))
+}
+
+/// `local` is never ended.
+fn local_refusal() -> Error {
+    Error::new(
+        Kind::Validation,
+        "machine_local",
+        "`local` is this computer's machine: it starts when used and stops after 15 minutes idle",
+    )
 }
 
 pub(crate) fn not_found(text: &str) -> Error {

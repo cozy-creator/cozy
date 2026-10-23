@@ -1,9 +1,9 @@
 //! A user service per OS, started at login and on demand: a systemd `--user` unit, a launchd
-//! LaunchAgent, or the HKCU `Run` key (no admin; Calcifer is also started by any CLI call and
-//! TensorD's stable parent supervises it, so Windows needs no restart policy). Whether a service
-//! is alive is its own lock's answer, never the manager's. A service calls `announce` when it
-//! starts, so `stop` finds it however it was started.
-use crate::{Result, paths::Home};
+//! LaunchAgent, or the HKCU `Run` key (no admin; Calcifer is also started by any CLI call, so
+//! Windows needs no restart policy). Whether a service is alive is its own lock's answer, never
+//! the manager's. A service calls `announce` when it starts, so `stop` finds it however it was
+//! started. A program a service starts on demand (`detach`) outlives that service.
+use crate::{Result, paths::Home, process::Detached};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -91,15 +91,22 @@ impl Services {
         sys::stop(&self.dir, name)
     }
 
-    /// Stops it and removes its definition.
-    pub fn uninstall(&self, name: &str) -> Result<()> {
+    /// Stops it and removes its definition: true when there was one.
+    pub fn uninstall(&self, name: &str) -> Result<bool> {
         sys::stop(&self.dir, name)?;
         sys::uninstall(&self.dir, name)
     }
 
-    /// Whether the service failed to start: its manager gave up on it or restarted it.
-    pub fn failed(&self, name: &str) -> bool {
-        sys::failed(name)
+    /// Starts `spec`'s program now, detached from the caller and from the service the caller runs
+    /// as: stopping or restarting that service never ends it. Under systemd it gets a scope of
+    /// its own, out of the caller's unit; elsewhere a session (Unix) or console and job (Windows)
+    /// of its own is enough.
+    pub fn detach(&self, spec: &ServiceSpec) -> Result<Detached> {
+        let log = spec.log.as_deref();
+        match sys::scope(spec).filter(|_| self.available()) {
+            Some((program, args)) => crate::process::detach(&program, &args, log),
+            None => crate::process::detach(&spec.program, &spec.args, log),
+        }
     }
 }
 

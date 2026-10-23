@@ -26,14 +26,6 @@ use crate::{
 /// waits first for its runs' outputs to land here, unless `force`. Both waits follow Calcifer's
 /// streams: its runs' changes, then the machine's.
 pub async fn end(ctx: &Context, name: &str, force: bool) -> Result<ExitCode, Error> {
-    if name == "local" {
-        return Err(Error::new(
-            Kind::Validation,
-            "machine_local",
-            "`local` is this computer's machine; `end` ends rentals and removes added machines",
-        )
-        .next("cozy machine disable"));
-    }
     let calcifer = ctx.calcifer().await?;
     let path = route(name)?;
     let asked = match force {

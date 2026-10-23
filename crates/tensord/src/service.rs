@@ -346,6 +346,12 @@ impl Service {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Preparing(self.clone())
     }
+    /// This computer's machine idle a while: every idle executor ends, and what it held goes back.
+    pub fn release_idle(&self) {
+        if let Some(pool) = self.pool() {
+            pool.release_idle();
+        }
+    }
     pub fn stop(&self) -> io::Result<bool> {
         let mut stopped = self.stopped.lock().unwrap();
         if !self.idle()? {

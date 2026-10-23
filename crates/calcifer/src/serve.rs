@@ -140,7 +140,7 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     let mut token = [0; 32];
     getrandom::fill(&mut token).expect("the OS provides randomness");
     let token = hex::encode(token);
-    let machines = Machines::start(calcifer.clone(), home.clone(), &loaded.config);
+    let machines = Machines::start(calcifer.clone(), home.clone(), &loaded.user_home, &loaded.config);
     steps.done("machines");
     let api = Api::new(calcifer.clone(), machines.clone(), address.port(), &token);
     let app = api::router(api.clone()).into_make_service_with_connect_info::<SocketAddr>();

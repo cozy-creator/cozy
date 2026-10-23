@@ -1,23 +1,30 @@
-//! A rental's lifecycle: it releases itself after 15 minutes with no job queued for it or
-//! running on it, used or not (owner ruling 2026-10-10); every run asked of it is a job (a
-//! call, a job, a warm-up, an upload); an explicit keepalive restarts that clock once. The clock is durable state, never a sample held in memory: the journal's last
-//! job end and the ledger's idle start (this rental's first boot, or a keepalive), so restarts
-//! and updates neither shorten nor lose it. Also the Hub lease of authorized keys.
+//! The machine's idle clock. A rental releases itself after 15 minutes with no job queued for it
+//! or running on it, used or not (owner ruling 2026-10-10); every run asked of it is a job (a
+//! call, a job, a warm-up, an upload); an explicit keepalive restarts that clock once. The clock
+//! is durable state, never a sample held in memory: the journal's last job end and the ledger's
+//! idle start (this rental's first boot, or a keepalive), so restarts and updates neither shorten
+//! nor lose it. This computer's machine counts the same clock from its start: after 5 minutes its
+//! executors exit and give back every byte they held, after 15 it exits itself (Calcifer starts
+//! it again when something uses it), unless another computer's controller is authorized to use
+//! it. A client following a run or a log, or reading an output, holds either clock. Also the Hub
+//! lease of authorized keys.
 use super::hub::{Hub, Refusal};
 use crate::api::auth::Keys;
 use std::{
     io,
     path::PathBuf,
     sync::{
-        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use protocol::error::Error;
 
-/// A rental's idle window, `RentalIdleTimeoutSeconds` in the CLI.
+/// The idle window, `RentalIdleTimeoutSeconds` in the CLI.
 pub const IDLE_GRACE_MS: i64 = 900_000;
+/// This computer's machine's executors exit after this part of its idle window (5 minutes).
+const EXECUTORS_PART: i64 = 3;
 
 /// The journal's jobs: one queued or running, and when the last one stopped.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -51,14 +58,28 @@ pub struct Lifecycle {
     state: Mutex<State>,
     admissions: AtomicUsize,
     epoch: AtomicU64,
+    /// Clients following a run's events or a log now.
+    following: AtomicUsize,
+    /// This computer's machine stays up: another computer's controller is authorized to use it.
+    kept: AtomicBool,
     /// When an output read last moved bytes (unix ms).
     transferred: AtomicI64,
-    /// Called when an activation starts or ends without its restart: the runs it holds change.
-    activation_changed: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Called when an activation starts or ends without its restart (the runs it holds change),
+    /// and when an admission or a follower lets go: the idle clock may start.
+    changed: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// Holds the release while a call that may queue a job is in flight.
 pub struct Admission(Arc<Lifecycle>);
+
+/// Holds the release while a client follows a run's events or a log.
+pub struct Follow(Arc<Lifecycle>);
+impl Drop for Follow {
+    fn drop(&mut self) {
+        self.0.following.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed();
+    }
+}
 
 /// Closes admission while an update waits for admitted work to drain and replaces the
 /// service. Dropping it (a failed activation) reopens admission.
@@ -66,12 +87,13 @@ pub struct Activation(Arc<Lifecycle>);
 impl Drop for Activation {
     fn drop(&mut self) {
         self.0.state.lock().unwrap().activating = false;
-        self.0.activation_changed();
+        self.0.changed();
     }
 }
 impl Drop for Admission {
     fn drop(&mut self) {
         self.0.admissions.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed();
     }
 }
 
@@ -83,8 +105,11 @@ pub fn now_ms() -> i64 {
 }
 
 impl Lifecycle {
-    /// `fresh` starts this root's first idle clock; a restart keeps the persisted ledger.
+    /// `fresh` starts this root's first idle clock; a rental's restart keeps the persisted
+    /// ledger. Each start of this computer's machine is a use: its clock starts again, and an
+    /// exit it took is over.
     pub fn open(path: PathBuf, rental: bool, fresh: bool, grace: i64) -> io::Result<Arc<Self>> {
+        let fresh = fresh || !rental;
         let mut ledger: Ledger = match std::fs::read(&path) {
             Ok(raw) if !fresh => serde_json::from_slice(&raw)
                 .map_err(|e| io::Error::other(format!("the idle ledger is unreadable: {e}")))?,
@@ -102,8 +127,10 @@ impl Lifecycle {
             state: Mutex::new(State { ledger, jobs: Jobs::default(), sampled: 0, activating: false }),
             admissions: AtomicUsize::new(0),
             epoch: AtomicU64::new(0),
+            following: AtomicUsize::new(0),
+            kept: AtomicBool::new(false),
             transferred: AtomicI64::new(0),
-            activation_changed: Default::default(),
+            changed: Default::default(),
         });
         lifecycle.save(&lifecycle.state.lock().unwrap().ledger)?;
         Ok(lifecycle)
@@ -130,14 +157,35 @@ impl Lifecycle {
         state.ledger.released || (!state.jobs.working && now >= self.idle_end(state))
     }
 
-    /// The deadline a caller is told: none (0) while a job is queued or running, or while an
-    /// admission may have queued one since the journal was last read.
+    /// A job is queued or running, a call that may queue one is in flight (on this computer, a
+    /// follower too: a rental bills, so only jobs hold it), or a call was admitted since the
+    /// journal was last read.
+    fn working(&self, state: &State) -> bool {
+        state.jobs.working
+            || self.admitted() > 0
+            || (!self.rental && self.following.load(Ordering::Acquire) > 0)
+            || state.sampled != self.epoch()
+    }
+
+    /// The deadline a caller is told: none (0) while working.
     fn deadline(&self, state: &State) -> i64 {
-        let working = state.jobs.working || self.admitted() > 0 || state.sampled != self.epoch();
-        match working && !state.ledger.released {
+        match self.working(state) && !state.ledger.released {
             true => 0,
             false => self.idle_end(state),
         }
+    }
+
+    /// When the idle clock started, as last read: none while working, activating or released.
+    fn idle_since(&self) -> Option<i64> {
+        let state = self.state.lock().unwrap();
+        let idle = !self.working(&state) && !state.activating && !state.ledger.released;
+        idle.then(|| self.idle_end(&state) - self.grace)
+    }
+
+    /// A client follows a run's events or a log: the machine is in use until it lets go.
+    pub fn follow(self: &Arc<Self>) -> Follow {
+        self.following.fetch_add(1, Ordering::AcqRel);
+        Follow(self.clone())
     }
 
     pub fn admit(self: &Arc<Self>) -> Result<Admission, Error> {
@@ -148,10 +196,11 @@ impl Lifecycle {
                 "the machine is activating an update; submit again once it is back",
             ));
         }
-        if self.rental && self.due(&state, now_ms()) {
+        // This computer's machine past its deadline but not yet exiting takes the call.
+        if state.ledger.released || (self.rental && self.due(&state, now_ms())) {
             return Err(Error::unavailable(
                 "machine_released",
-                "this rental released itself after 15 minutes idle",
+                "this machine released itself after 15 minutes idle",
             ));
         }
         self.admissions.fetch_add(1, Ordering::AcqRel);
@@ -171,7 +220,7 @@ impl Lifecycle {
         }
         state.activating = true;
         drop(state);
-        self.activation_changed();
+        self.changed();
         Ok(Activation(self.clone()))
     }
 
@@ -179,11 +228,11 @@ impl Lifecycle {
     pub fn activating(&self) -> bool {
         self.state.lock().unwrap().activating
     }
-    pub fn on_activation(&self, changed: impl Fn() + Send + Sync + 'static) {
-        let _ = self.activation_changed.set(Box::new(changed));
+    pub fn on_change(&self, changed: impl Fn() + Send + Sync + 'static) {
+        let _ = self.changed.set(Box::new(changed));
     }
-    fn activation_changed(&self) {
-        if let Some(changed) = self.activation_changed.get() {
+    fn changed(&self) {
+        if let Some(changed) = self.changed.get() {
             changed();
         }
     }
@@ -232,12 +281,12 @@ impl Lifecycle {
         self.admissions.load(Ordering::Acquire)
     }
 
-    /// When this rental releases itself if no job comes first. 0: no deadline, because a job
-    /// is queued or running, or because this machine never releases itself.
+    /// When this machine releases itself or exits if no job comes first. 0: no deadline,
+    /// because it is working, or because another computer's controller keeps it up.
     pub fn deadline_ms(&self) -> i64 {
-        match self.rental {
-            true => self.deadline(&self.state.lock().unwrap()),
-            false => 0,
+        match self.kept.load(Ordering::Acquire) {
+            true => 0,
+            false => self.deadline(&self.state.lock().unwrap()),
         }
     }
 
@@ -245,20 +294,19 @@ impl Lifecycle {
         self.state.lock().unwrap().ledger.released
     }
 
-    /// Takes the release once the idle clock ran out on a current reading. Irreversible.
+    /// Work came between this computer's machine's claim and its stop: it serves on.
+    fn reopen(&self) {
+        self.state.lock().unwrap().ledger.released = false;
+    }
+
+    /// Takes the release once the idle clock ran out on a current reading. Irreversible but for
+    /// `reopen`.
     fn claim(&self) -> io::Result<bool> {
         let mut state = self.state.lock().unwrap();
-        if !self.rental {
-            return Ok(false);
-        }
         if state.ledger.released {
             return Ok(true);
         }
-        if state.activating
-            || self.admissions.load(Ordering::Acquire) > 0
-            || state.sampled != self.epoch()
-            || !self.due(&state, now_ms())
-        {
+        if state.activating || self.working(&state) || !self.due(&state, now_ms()) {
             return Ok(false);
         }
         let mut ledger = state.ledger.clone();
@@ -344,6 +392,57 @@ pub async fn release_when_idle(
             }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// This computer's machine through its idle clock: after a third of the window with no work its
+/// executors exit (`release`), after the whole window the machine stops (`stop`, false when work
+/// came meanwhile) and this process exits. While `kept` (another computer's controller is
+/// authorized to use it) only the executors go. It sleeps until activity or the next deadline.
+pub fn exit_when_idle(
+    lifecycle: Arc<Lifecycle>,
+    engine: Arc<crate::execution::Engine>,
+    release: impl Fn(),
+    stop: impl Fn() -> io::Result<bool>,
+    kept: impl Fn() -> bool,
+) {
+    let mut released = None;
+    loop {
+        let (seen, epoch) = (engine.activity_epoch(), lifecycle.epoch());
+        match engine.jobs(lifecycle.ended_ms()) {
+            Ok((working, ended_ms)) => lifecycle.observe(Jobs { working, ended_ms }, epoch),
+            Err(error) => tracing::warn!("cannot read this machine's jobs: {error}"),
+        }
+        let Some(since) = lifecycle.idle_since() else {
+            engine.wait_activity(seen, None);
+            continue;
+        };
+        let (now, grace) = (now_ms(), lifecycle.grace);
+        if now >= since + grace / EXECUTORS_PART && released != Some(since) {
+            tracing::info!("idle {} s: its executors end and give back what they hold", (now - since) / 1000);
+            release();
+            released = Some(since);
+        }
+        let held = kept();
+        lifecycle.kept.store(held, Ordering::Release);
+        if now >= since + grace && !held {
+            match lifecycle.claim().and_then(|claimed| Ok(claimed && stop()?)) {
+                Ok(true) => {
+                    tracing::info!("idle {} s: this machine exits until it is used", (now - since) / 1000);
+                    std::process::exit(0);
+                }
+                Ok(false) => lifecycle.reopen(),
+                Err(error) => tracing::warn!("this machine's idle exit: {error}"),
+            }
+        }
+        // Kept up past its window, it reads its authorization again a window later.
+        let next = match released == Some(since) {
+            false => since + grace / EXECUTORS_PART,
+            true if now < since + grace => since + grace,
+            true => now + grace,
+        };
+        let wait = (next - now).max(1000);
+        engine.wait_activity(seen, Some(Duration::from_millis(wait as u64)));
     }
 }
 
