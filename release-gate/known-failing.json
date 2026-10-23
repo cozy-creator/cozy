@@ -1,7 +1,7 @@
 [
  {"cell": "h3 with a 3 s video reference", "issue": "cr-215", "sku": "l4", "what": "15 s ref2va_turbo, image + 3 s 1344x768 video reference: CUDA unknown error at condition (varena eviction without a stream fence); not run until fixed (lead 10-23)"},
- {"cell": "s8-klein, s6-klein, s3-klein (Klein under 8, 6 and 3 GiB caps)", "issue": "stress 10-23", "sku": "rtx-5090", "what": "runs 15168, 15236, 15239: CUDA out of memory in the weight bind (encoding/formats.py to_blocked, from varena _bind), raised past the memory manager as accepted_envelope_breach; uncapped Klein completes. Not run until fixed"},
- {"cell": "s8-h3 at 15 s (the cell runs 5 s)", "issue": "stress 10-23", "sku": "rtx-5090", "what": "run 15176: ref2va_turbo 15 s 768p under an 8 GiB cap, step 1 407 s and step 2 still running at 25 min (uncapped: 346 s for the whole run); canceled"},
- {"cell": "klein", "issue": "stress 10-23", "sku": "rtx-3070", "what": "run 15143 on a real 8 GB card: the same weight-bind out of memory as Klein under a cap. Not run until fixed"},
- {"cell": "qwen", "issue": "stress 10-23", "sku": "rtx-3070", "what": "run 15150 on a real 8 GB card: memory_exhausted, the Qwen-Image 2.1 VAE's repeat_interleave needs 4.8 GB more and cannot be cut. Not run until fixed"}
+ {"cell": "s8-klein, s6-klein, s3-klein (Klein under 8, 6 and 3 GiB caps)", "issue": "cr-220", "sku": "rtx-5090", "what": "runs 15168, 15236, 15239: CUDA out of memory in the weight bind (encoding/formats.py to_blocked, from varena _bind), raised past the memory manager as accepted_envelope_breach; uncapped Klein completes. Not run until fixed"},
+ {"cell": "s8-h3 at 15 s (the cell runs 5 s)", "issue": "cr-222", "sku": "rtx-5090", "what": "run 15176: ref2va_turbo 15 s 768p under an 8 GiB cap, step 1 407 s and step 2 still running at 25 min (uncapped: 346 s for the whole run); canceled"},
+ {"cell": "klein", "issue": "cr-220", "sku": "rtx-3070", "what": "run 15143 on a real 8 GB card: the same weight-bind out of memory as Klein under a cap. Not run until fixed"},
+ {"cell": "qwen", "issue": "cr-221", "sku": "rtx-3070", "what": "run 15150 on a real 8 GB card: memory_exhausted, the Qwen-Image 2.1 VAE's repeat_interleave needs 4.8 GB more and cannot be cut. Not run until fixed"}
 ]
