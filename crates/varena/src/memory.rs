@@ -289,6 +289,7 @@ pub struct Stats {
     pub keep_pending: u64,
     /// Each `make_room` that had to take bytes for it, in order.
     pub make_room: Vec<MakeRoom>,
+    pub outlived: Vec<crate::arena::Outlived>, // its torch blocks live at its end (the audit)
 }
 
 /// One `make_room` that had to take bytes: what asked, how many bytes, what it took.
@@ -851,6 +852,7 @@ struct Inner {
     room: AtomicU64,
     #[cfg(unix)]
     tally: tensorfs::io::source::IoTally,
+    torch: std::sync::OnceLock<Arc<crate::arena::Torch>>,
     _device: Device,
 }
 
@@ -919,6 +921,7 @@ impl Memory {
                 room: AtomicU64::new(0),
                 #[cfg(unix)]
                 tally: Default::default(),
+                torch: Default::default(),
             });
             let (weak, queue) = (Arc::downgrade(&inner), inner.mech.clone());
             std::thread::Builder::new().name("varena-mechanism".into()).spawn(move || mech_loop(&queue, &weak)).map_err(|e| Error::io("spawn mechanism", e))?;
@@ -2940,6 +2943,7 @@ impl Inner {
     }
 
     fn end_request(&self, req: u64) -> Stats {
+        let outlived = self.torch.get().map(|t| t.end(crate::arena::Owner::Request(req)).outlived).unwrap_or_default();
         let mut st = self.lock();
         self.unstream(&mut st, req);
         let name = st.table.request(req).map(|r| r.name.clone()).unwrap_or_default();
@@ -2950,7 +2954,7 @@ impl Inner {
         let holding: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name && c.bytes > 0 && c.holds == 0 && c.releasing.is_empty()).map(|c| c.id).collect();
         let shrinks: Vec<(u32, u64, Shrink)> = holding.iter().filter_map(|id| st.shrinks.get(id).map(|s| (*id, u64::MAX, s.clone()))).collect();
         let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
-        let mut stats = st.stats.remove(&req).unwrap_or_default();
+        let mut stats = Stats { outlived, ..st.stats.remove(&req).unwrap_or_default() };
         st.host.remove(&req);
         // Its anonymous host peak (the process's since the first open request started).
         stats.host = st.window.as_mut().and_then(ledger::Window::look);

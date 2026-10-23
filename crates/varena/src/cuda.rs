@@ -414,6 +414,18 @@ impl Backend for CudaBackend {
         self.stream.drain()?;
         Ok(tensorfs::io::drain(self.ordinal)?)
     }
+
+    fn relax(&self) {
+        // CU_STREAM_CAPTURE_MODE_RELAXED.
+        let mut mode: c_int = 2;
+        let rc = cuda::driver().map(|d| {
+            // SAFETY: an out-param on the stack; the call needs no context.
+            unsafe { (d.thread_exchange_stream_capture_mode)(&mut mode) }
+        });
+        if !matches!(rc, Ok(cuda::SUCCESS)) {
+            tracing::warn!("varena: this thread stays in its capture mode: cuThreadExchangeStreamCaptureMode failed");
+        }
+    }
 }
 
 #[cfg(test)]

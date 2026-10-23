@@ -111,6 +111,9 @@ pub trait Backend: Send + Sync {
     }
     /// After a device error: proves the copy stream's work complete or fails.
     fn drain(&self) -> Result<()>;
+    /// This thread's driver calls never invalidate another thread's stream capture (relaxed
+    /// capture mode): varena's own threads, which run beside captures.
+    fn relax(&self) {}
 }
 
 /// Pages in host memory (a memfd, an `shm_open` object or a pagefile section each), mapped into
