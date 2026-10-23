@@ -267,7 +267,7 @@ impl Binder<'_> {
             .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"));
         let loaded: Value = match serde_json::from_str(&text) {
             Ok(value) if !yaml => value,
-            _ => yaml(&text).map_err(|e| {
+            _ => from_yaml(&text).map_err(|e| {
                 invalid("input_invalid", format!("--input {}: {e}", path.display()))
             })?,
         };
@@ -1839,7 +1839,7 @@ fn invalid(code: &str, message: impl Into<String>) -> Error {
 
 /// One YAML document (1.2 core schema, aliases resolved) as JSON; a mapping's keys are its
 /// scalar keys' text.
-fn yaml(text: &str) -> Result<Value, String> {
+fn from_yaml(text: &str) -> Result<Value, String> {
     use saphyr::{LoadableYamlNode, Scalar, Yaml};
     fn json(node: &Yaml) -> Result<Value, String> {
         Ok(match node {

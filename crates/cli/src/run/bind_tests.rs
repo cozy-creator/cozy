@@ -826,14 +826,14 @@ fn a_refusal_names_each_problem_at_its_path_and_the_release_it_checked() {
 #[test]
 fn a_yaml_input_reads_as_the_json_it_spells() {
     let text = "base: &b {steps: 8, guidance: 3.5, seed: 0x10}\nagain: *b\nrun:\n  prompt: 'yes'\n  negative: null\n  turbo: true\n  sizes: [512, -1]\n";
-    let value = super::yaml(text).unwrap();
+    let value = super::from_yaml(text).unwrap();
     assert_eq!(value["base"], serde_json::json!({"steps": 8, "guidance": 3.5, "seed": 16}));
     assert_eq!(value["again"], value["base"]);
     assert_eq!(value["run"]["prompt"], "yes");
     assert_eq!(value["run"]["negative"], serde_json::Value::Null);
     assert_eq!(value["run"]["turbo"], true);
     assert_eq!(value["run"]["sizes"], serde_json::json!([512, -1]));
-    assert_eq!(super::yaml("1: one\ntrue: two\n").unwrap(), serde_json::json!({"1": "one", "true": "two"}));
-    assert!(super::yaml("a: 1\n---\nb: 2\n").is_err());
-    assert!(super::yaml("a: [1\n").is_err());
+    assert_eq!(super::from_yaml("1: one\ntrue: two\n").unwrap(), serde_json::json!({"1": "one", "true": "two"}));
+    assert!(super::from_yaml("a: 1\n---\nb: 2\n").is_err());
+    assert!(super::from_yaml("a: [1\n").is_err());
 }
