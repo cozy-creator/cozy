@@ -276,7 +276,7 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _room(exc: BaseException, device: torch.device, first: BaseException | None = None) -> int | None:
+def _room(exc: BaseException, device: torch.device, op: str, first: BaseException | None = None) -> int | None:
     """The bytes to make room for before running again; None: not a memory failure, raise it.
     An allocation failure (out of memory, an `_ALLOC_FAILED` status) as its text says. Any other
     cuBLAS or cuDNN status is a library's allocation under another name (its handle or workspace,
@@ -292,15 +292,46 @@ def _room(exc: BaseException, device: torch.device, first: BaseException | None 
     try:
         _synchronize(device)
     except Exception as sticky:
+        _faulted(sticky, op, "under a library status")
         raise exc from sticky
     return 0
+
+
+def _said(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: " + next(iter(str(exc).strip().splitlines()), "")[:200]
 
 
 def _retried(exc: BaseException, op: str) -> None:
     """The failure a retry answers, in the request's record before its frames go: every retry
     names what it retried."""
-    text = next(iter(str(exc).strip().splitlines()), "")[:200]
-    _served.rungs.noted(0, f"retried {op}: {type(exc).__name__}: {text}", 0)
+    _served.rungs.noted(0, f"retried {op}: {_said(exc)}", 0)
+
+
+def _faulted(exc: BaseException, op: str, step: str) -> None:
+    _served.rungs.noted(0, f"retry of {op} faulted {step}: {_said(exc)}", 0)
+
+
+def _fenced(make: Callable[[torch.device, int], bool], device: torch.device, nbytes: int, op: str) -> bool:
+    """Room made for a retry with the device synchronized on each side, on this failure path
+    only, so a fault is placed (cr-215): before room (earlier async work), after room (the
+    eviction's own), or, both clean, in the replay (it read what the eviction took)."""
+    _fence(device, op, "before room")
+    made = make(device, nbytes)
+    _fence(device, op, "after room")
+    return made
+
+
+def _fence(device: torch.device, op: str, step: str) -> None:
+    try:
+        _synchronize(device)
+    except Exception as exc:
+        _faulted(exc, op, step)
+        raise
+
+
+def _replayed(exc: BaseException, op: str) -> None:
+    if short(exc) is None and not _library(exc):
+        _faulted(exc, op, "in the replay")
 
 
 def _clear(exc: BaseException) -> None:
@@ -330,11 +361,13 @@ def _settle(
     before: Callable[[int], _T | None] | None = None,
     last: Callable[[], _T | None] | None = None,
     first: BaseException | None = None,
+    replay: bool = False,
 ) -> tuple[int, _T]:
     """`run(size)` until it fits, each try strictly smaller: room made (rungs 1-2), each `shrink`
     down to `finest`, the first and the finest size tried again with room made, `before` (an
     op's cut) once, then rung 4 while it makes the room, then `last` (rung 5), else
-    `exhausted`. With `key` it is a call that cuts itself:
+    `exhausted`. `replay`: its first run is one, room made for it. With `key` it is a call that
+    cuts itself:
     up front at the memo's size, finer when an op inside asks (`Finer`), past `finest` its
     failure its caller's, and the size that fit remembered."""
     memo, rungs, total = _served.memo, _served.rungs, size
@@ -361,13 +394,16 @@ def _settle(
             except Exception as exc:
                 if _capturing():
                     raise
-                need = _room(exc, device, first)
+                need = _room(exc, device, name, first)
+                if need is None and replay:
+                    _replayed(exc, name)
                 if need is None or scope and size <= finest and not again:
                     raise
                 first = first or (exc if _library(exc) else None)
                 _retried(exc, name)
                 _clear(exc)
-                if not rungs.free(device, need + SLACK) and again:
+                replay = True
+                if not _fenced(rungs.free, device, need + SLACK, name) and again:
                     again = False  # the same size again, with no room made, fails the same way
                     if scope and size <= finest:
                         raise
@@ -379,7 +415,7 @@ def _settle(
                 again = scope is None and size <= finest
             elif before is not None and (out := before(need)) is not None:
                 break
-            elif not rungs.lower(device, need + SLACK):
+            elif not _fenced(rungs.lower, device, need + SLACK, name):
                 if last is not None and (out := last()) is not None:
                     break
                 raise rungs.exhausted(device, need, name)
@@ -499,21 +535,23 @@ def run(site: Site, forward: Callable[..., object], args: Args, kwargs: Kwargs) 
                 changed = journal.wrote or set(journal.generators) - drawn
                 if _capturing() or changed or before != _attributes(site.block):
                     raise
-                need = _room(exc, site.device)
+                op = f"block {site.key}"
+                need = _room(exc, site.device, op)
                 if need is None:
                     raise
                 first = exc if _library(exc) else None
-                _retried(exc, f"block {site.key}")
+                _retried(exc, op)
                 _clear(exc)
                 memo.retries += 1
                 for generator, state in states:
                     generator.set_state(state)
-                _served.rungs.free(site.device, need + SLACK)
+                _fenced(_served.rungs.free, site.device, need + SLACK, op)
                 try:
                     out = forward(*args, **kwargs)
                 except Exception as again:
                     if first is not None and _library(again):
                         raise first
+                    _replayed(again, op)
                     raise
             finally:
                 layer.journals.remove(journal)
@@ -529,7 +567,7 @@ def _bare(
     site: Site, facts: Facts, forward: Callable[..., object], args: Args, kwargs: Kwargs
 ) -> object:
     states, put = [(g, g.get_state()) for g in facts.generators], _kept(site.root, site.state)
-    layer = _local.layer
+    layer, op = _local.layer, f"block {site.key}"
     pop = layer is not None and _get_current_dispatch_mode() is layer  # else it runs under it
     try:
         with _pop_mode_temporarily() if pop else nullcontext():
@@ -538,11 +576,11 @@ def _bare(
     except Exception as exc:
         if _capturing():
             raise
-        need = _room(exc, site.device)
+        need = _room(exc, site.device, op)
         if need is None:
             raise
         first = exc if _library(exc) else None
-        _retried(exc, f"block {site.key}")
+        _retried(exc, op)
         _clear(exc)
     finally:
         _local.layer = layer
@@ -550,7 +588,7 @@ def _bare(
     for generator, state in states:
         generator.set_state(state)
     put()
-    _served.rungs.free(site.device, need + SLACK)
+    _fenced(_served.rungs.free, site.device, need + SLACK, op)
     with caught() as layer:
         banded = layer.banded
         try:
@@ -558,6 +596,7 @@ def _bare(
         except Exception as again:
             if first is not None and _library(again):
                 raise first
+            _replayed(again, op)
             raise
     if layer.banded != banded:
         _served.memo.blocks[site.key] = Facts(False, facts.generators)
@@ -716,14 +755,14 @@ class Layer(TorchDispatchMode):
             device = _device(args, kwargs)
             if device is None or _capturing():
                 raise
-            need = _room(exc, device)
+            need = _room(exc, device, name)
             if need is None:
                 raise
             first = exc if _library(exc) else None
             _retried(exc, name)
             _clear(exc)
         memo.retries += 1
-        rungs.free(device, need + SLACK)
+        _fenced(rungs.free, device, need + SLACK, name)
 
         def cut(need: int) -> object:  # before rung 4: the cut around it finer, else its bands
             if (scope := next((s for s in reversed(_local.scopes) if s.finer), None)) is not None:
@@ -744,7 +783,7 @@ class Layer(TorchDispatchMode):
                 generator.set_state(state)
             return _hosted(func, args, kwargs, device)
 
-        return _settle(again, 1, 1, int, device, name, again=False, before=cut, last=hosted, first=first)[1]
+        return _settle(again, 1, 1, int, device, name, again=False, before=cut, last=hosted, first=first, replay=True)[1]
 
     def _banded(self, func: OpOverload, plan: _Plan, key: tuple[object, ...], size: int) -> object:
         """The op in bands of `size` rows (0: what the room holds, at most half) into its whole

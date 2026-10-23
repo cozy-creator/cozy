@@ -720,8 +720,13 @@ def launches() -> None:
         check("another launch error is its own", "illegal" in str(exc) and memo.retries == 1, exc)
 
 
+def error(text: str) -> RuntimeError:
+    """A device failure as torch raises it: out of memory typed, any other a RuntimeError."""
+    return torch.OutOfMemoryError(text) if "out of memory" in text else RuntimeError(text)
+
+
 class Fault(TorchDispatchMode):
-    """A device whose next matmuls fail, one per text: a library's status as torch raises it."""
+    """A device whose next matmuls fail, one per text, as torch raises each."""
 
     def __init__(self, *texts: str) -> None:
         super().__init__()
@@ -729,7 +734,7 @@ class Fault(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
         if func.overloadpacket.__name__ == "mm" and self.texts:
-            raise RuntimeError(self.texts.pop(0))
+            raise error(self.texts.pop(0))
         return func(*args, **(kwargs or {}))
 
 
@@ -790,8 +795,82 @@ def device_faults() -> None:
     )
 
 
+class Syncs:
+    """The device's syncs; the `at`th (from 1) raises: a fault surfacing there."""
+
+    def __init__(self, at: int = 0) -> None:
+        self.at, self.calls = at, 0
+
+    def __call__(self, device: torch.device) -> None:
+        self.calls += 1
+        if self.calls == self.at:
+            raise RuntimeError("CUDA error: unknown error")
+
+
+def fault_steps() -> None:
+    """cr-215's diagnostic: a retry's room is made between two device syncs on the failure path
+    only, so its note places a fault before room (earlier async work), after room (the
+    eviction's own) or in the replay (it read what the eviction took). At each retry site: an
+    op, a block's first run, a bare block."""
+    a, b, x = torch.randn(8, 8), torch.randn(8, 8), torch.ones(4)
+    oom, dead = "CUDA out of memory. Tried to allocate 2.00 MiB.", "CUDA error: unknown error"
+    pending: list[str] = []
+
+    def launches(y: torch.Tensor) -> torch.Tensor:  # a kernel launch failing where no op shows it
+        if pending:
+            raise error(pending.pop(0))
+        return y * 2
+
+    def op(*texts: str) -> object:
+        with Fault(*texts), cuts.caught():
+            return torch.mm(a, b)
+
+    def block(*texts: str) -> object:
+        pending[:] = texts
+        return cuts.run(site("launches"), launches, (x,), {})
+
+    synchronize = cuts._synchronize
+    for what, run in (("aten.mm.default", op), ("block ('launches', 0)", block), ("bare block", block)):
+        cases = ((1, (oom,), "before room", 0), (2, (oom,), "after room", 1), (0, (oom, dead), "in the replay", 1), (0, (oom,), None, 1))
+        for at, texts, step, made in cases:
+            memo, _, room = fresh(1 << 60, frees=1 << 20)
+            if what == "bare block":
+                memo.blocks[("launches", 0)] = cuts.Facts(True, ())
+            cuts._synchronize = syncs = Syncs(at)
+            raised: BaseException | None = None
+            try:
+                run(*texts)
+            except RuntimeError as exc:
+                raised = exc
+            finally:
+                cuts._synchronize = synchronize
+            faulted = [why for _, why in room.notes if "faulted" in why]
+            name = what if what != "bare block" else "block ('launches', 0)"
+            if step is None:
+                check(
+                    f"{what}: a clean retry syncs twice and notes no fault",
+                    raised is None and syncs.calls == 2 and not faulted and room.made == 1,
+                    (raised, syncs.calls, faulted, room.made),
+                )
+                continue
+            check(
+                f"{what}: a fault {step} raises, noted so",
+                raised is not None and dead in str(raised) and room.made == made
+                and faulted == [f"retry of {name} faulted {step}: RuntimeError: {dead}"],
+                (raised, room.made, room.notes),
+            )
+    memo, _, room = fresh(1 << 60)
+    cuts._synchronize = syncs = Syncs()
+    try:
+        op()
+        block()
+    finally:
+        cuts._synchronize = synchronize
+    check("no failure, no sync", syncs.calls == 0, syncs.calls)
+
+
 def main() -> int:
-    for test in (ffn_cut, relax, plans, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, launches, lattice, device_faults):
+    for test in (ffn_cut, relax, plans, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, launches, lattice, device_faults, fault_steps):
         test()
     print(f"{sum(results)}/{len(results)} passed", flush=True)
     return 0 if all(results) else 1
