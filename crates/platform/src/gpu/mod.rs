@@ -177,7 +177,12 @@ impl Device {
         let device = self.nvml.device_by_index(self.index).map_err(failed("open device"))?;
         let from = *seen;
         let mut busy = |sampling| -> Result<bool> {
-            let samples = device.samples(sampling, from).map_err(failed("utilization samples"))?;
+            // No sample newer than `from` is no work seen: NVML answers NotFound while the GPU is
+            // idle, which is a reading, not an unreadable GPU: a call stuck there was never judged.
+            let samples = match device.samples(sampling, from) {
+                Err(NvmlError::NotFound) => return Ok(false),
+                samples => samples.map_err(failed("utilization samples"))?,
+            };
             Ok(samples.iter().fold(false, |busy, sample| {
                 *seen = (*seen).max(sample.timestamp);
                 busy || match sample.value {

@@ -2573,6 +2573,7 @@ impl Pool {
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
         executor.activity = gpu_work(self.lane(start, plan.degree)?);
+        executor.place = gpu_place(self.lane(start, plan.degree)?, executor.birth.pid);
         executor.keep_memo(self.memo.clone());
         if plan.degree > 0 {
             let exact = Exact::open(&executor.birth)?.ok_or_else(|| io::Error::other("executor exited before its start"))?;
@@ -3190,10 +3191,25 @@ fn unsettled(reply: &Frame, lost: &str) -> Refused {
     Refused { code, detail }
 }
 
+/// What executor `pid` waits on across `gpus`' ledgers, for a wedge's verdict; None without one.
+fn gpu_place(gpus: &[Device], pid: u32) -> Option<crate::process::Place> {
+    let places: Vec<_> = gpus.iter().filter_map(|gpu| gpu.memory.as_ref().map(|ledger| ledger.place(pid))).collect();
+    (!places.is_empty()).then(|| -> crate::process::Place {
+        Arc::new(move || places.iter().map(|place| place()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("; "))
+    })
+}
+
 /// What `gpus` did since the last reading; None without GPUs or while NVML cannot tell.
 fn gpu_work(gpus: &[Device]) -> Option<crate::process::Activity> {
+    if gpus.is_empty() {
+        return None;
+    }
+    // GPUs NVML cannot open (an Apple GPU) read as unread, which judges nothing, never as idle:
+    // their work would otherwise count for nothing, now that a call's CPU does not count.
     let opened = gpus.iter().map(|gpu| platform::gpu::Device::open(&gpu.entry).ok());
-    let devices: Vec<_> = opened.collect::<Option<_>>().filter(|devices: &Vec<_>| !devices.is_empty())?;
+    let Some(devices) = opened.collect::<Option<Vec<_>>>() else {
+        return Some(Arc::new(|| None));
+    };
     let seen = Mutex::new(vec![0; devices.len()]);
     Some(Arc::new(move || {
         let (mut kernels, mut memory) = (false, false);

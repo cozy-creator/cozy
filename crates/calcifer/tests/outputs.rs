@@ -1033,3 +1033,27 @@ async fn every_output_ends_landed_kept_or_lost_and_a_checkpoint_waits_on_nothing
     assert!(error.contains("the machine refused it"), "{big:?}");
     served.down().await;
 }
+
+/// Each stage a run enters is kept with it once, as it enters it: a run whose machine is lost
+/// still says where it got to and when (run 14868 sat at "encoding prompt" when gallahan went).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runs_stages_are_kept_as_it_enters_them() {
+    let home = tempfile::tempdir().unwrap();
+    let machine = installing_machine();
+    with_machine(home.path(), &machine);
+    let served = Served::start(home.path()).await;
+    let gate = machine.root.path().join("gate");
+    std::fs::write(&gate, b"").unwrap();
+    let id = served.submit(&package_run(home.path(), &gate, 1 << 10)).await.id;
+    let all = served.events(&id).await.until(|_| false).await;
+    let stages: Vec<&str> = (all.iter())
+        .filter_map(|event| match event {
+            Event::Log { level, text, .. } if level == "stage" => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let revisions: Vec<&str> = stages.iter().copied().filter(|s| s.starts_with("revision")).collect();
+    assert_eq!(revisions, ["revision 1", "revision 2", "revision 3"], "{stages:?}");
+    assert!(stages.windows(2).all(|w| w[0] != w[1]), "each stage once as it is entered: {stages:?}");
+    served.down().await;
+}

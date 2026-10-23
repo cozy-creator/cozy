@@ -8,7 +8,7 @@ from typing import Annotated
 
 import msgspec
 
-from cozy_runtime.author import App, AssetBound, Context, FileAsset, Outputs, Tree
+from cozy_runtime.author import App, AssetBound, Context, FileAsset, Outputs, Telemetry, Tree
 
 app = App()
 
@@ -34,9 +34,10 @@ def film(segments: int) -> bytes:
     return b"".join(f"segment {i}\n".encode() for i in range(1, segments + 1))
 
 
-async def make(ctx: Context, payload: Ask, out: Outputs) -> Made:
+async def make(ctx: Context, payload: Ask, out: Outputs, tel: Telemetry) -> Made:
     frames = []
     for revision in range(1, payload.revisions + 1):
+        tel.progress(0.0, stage=f"revision {revision}")
         frames.append(out.save_bytes(f"frame {revision}\n".encode(), media_type="video/mp4"))
         out.publish("frames", frames[-1], label=f"Frame {revision}")
         video = out.save_bytes(film(revision), media_type="video/mp4")

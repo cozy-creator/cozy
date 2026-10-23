@@ -83,6 +83,15 @@ int nvmlDeviceGetMemoryInfo_v2(void *d, memory_v2 *m) {
     m->free = m->total > used ? m->total - used : 0;
     return 0;
 }
+typedef struct { unsigned long long ts; unsigned long long value; } sample;
+/* NVML's answer for no sample newer than `last` is NOT_FOUND (6); FAKE_NVML_BUSY: one busy sample. */
+int nvmlDeviceGetSamples(void *d, int type, unsigned long long last, int *kind, unsigned *count, sample *out) {
+    if (!getenv("FAKE_NVML_BUSY")) return 6;
+    *kind = 1;
+    if (out && *count) { out[0].ts = last + 1; out[0].value = 50; }
+    *count = 1;
+    return 0;
+}
 int nvmlDeviceGetComputeRunningProcesses_v3(void *d, unsigned *count, process *infos) {
     unsigned long long used;
     unsigned n;
@@ -499,6 +508,26 @@ fn inner_ending_a_refuser_leaves_the_ledger_answering_readings() {
         let _ = done.send(());
     });
     answered.recv_timeout(Duration::from_secs(30)).expect("a reading after the end is answered");
+}
+
+/// An idle GPU's utilization reads idle: NVML answers NotFound when no sample is newer than the
+/// last one seen, which is no work, not an unreadable GPU (an invocation stuck on an idle GPU
+/// was excused as unread and never judged). A busy one reads busy.
+#[test]
+fn an_idle_gpus_utilization_reads_idle_and_a_busy_ones_busy() {
+    under_fake_nvml("inner_an_idle_gpus_utilization_reads_idle", 8 * GIB, false);
+}
+
+#[test]
+#[ignore = "run under the fake NVML by its outer test"]
+fn inner_an_idle_gpus_utilization_reads_idle() {
+    let gpu = platform::gpu::Device::open("0").unwrap();
+    let mut seen = 0;
+    assert_eq!(gpu.worked_since(&mut seen).unwrap(), (false, false), "idle");
+    // SAFETY: this child process is single-threaded here, and nothing else reads the environment.
+    unsafe { std::env::set_var("FAKE_NVML_BUSY", "1") };
+    assert_eq!(gpu.worked_since(&mut seen).unwrap(), (true, true), "busy");
+    assert_eq!(seen, 1, "the sample's time is the next reading's start");
 }
 
 /// A group's ranks each hold a row in their own GPU's ledger (no rank cells): a follower that

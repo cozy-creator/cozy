@@ -127,6 +127,7 @@ impl Machines {
             }
             Err(e) => warn!("reading the machines: {e}"),
         }
+        me.prune_kept();
         me.resume_asks();
         me.spawn(me.clone().place_runs());
         let lister = me.clone();
@@ -355,10 +356,19 @@ impl Machines {
     }
 
     /// The newest `lines` whole lines (0: all) of a log the machine keeps.
+    /// A machine that cannot answer (ended, lost, unreachable) answers the copy Calcifer kept.
     pub async fn logs(&self, text: &str, log: MachineLog, lines: u64) -> Result<Vec<u8>, Error> {
-        let (row, link) = self.linked(text)?;
-        let read = link.read_log(log_name(log), lines).await;
-        read.map_err(|e| log_refusal(&row.name, log, e))
+        let read = match self.linked(text) {
+            Ok((row, link)) => link.read_log(log_name(log), lines).await.map_err(|e| log_refusal(&row.name, log, e)),
+            Err(error) => Err(error),
+        };
+        match read {
+            Err(error) if matches!(error.code.as_str(), "machine_ended" | "machine_unreachable") => {
+                let row = self.store().find_machine(text).map_err(internal)?;
+                row.and_then(|row| self.kept_log(&row.name, log, lines)).ok_or(error)
+            }
+            read => read,
+        }
     }
 
     /// As `logs`, or the lines after `after` (a batch's place), then each batch as the machine
@@ -370,7 +380,11 @@ impl Machines {
         lines: u64,
         after: Option<&str>,
     ) -> Result<crate::link::Live<v1::LogLines>, Error> {
-        let (row, link) = self.linked(text)?;
+        let (row, link) = self.linked(text).map_err(|error| match self.store().find_machine(text) {
+            Ok(Some(row)) if self.kept_log(&row.name, log, 1).is_some() => error
+                .remedy("without --follow, it prints the copy of the log Calcifer kept"),
+            _ => error,
+        })?;
         let lines = link.follow_log(log_name(log), lines, after).await;
         lines.map_err(|e| log_refusal(&row.name, log, e))
     }
@@ -474,7 +488,10 @@ impl Machines {
             task.abort();
         }
         if let Some(endpoint) = endpoint {
-            let task = self.spawn(self.clone().follow_status(row.name.clone(), row.kind));
+            let (status, logs) = (self.clone().follow_status(row.name.clone(), row.kind), self.clone().keep_logs(row.name.clone(), row.kind));
+            let task = self.spawn(async move {
+                tokio::join!(status, logs);
+            });
             watching.insert(row.name.clone(), (endpoint, task));
         }
     }
@@ -1406,7 +1423,7 @@ pub(crate) fn signer(path: &Path) -> Result<SigningKey, Error> {
         })
 }
 
-fn log_name(log: MachineLog) -> &'static str {
+pub(crate) fn log_name(log: MachineLog) -> &'static str {
     match log {
         MachineLog::Tensord => "tensord",
         MachineLog::Tensorfs => "tensorfs-transport",
