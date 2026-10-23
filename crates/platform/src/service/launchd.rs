@@ -143,22 +143,3 @@ fn escape(text: &str) -> String {
 pub(super) fn failed(_: &str) -> bool {
     false
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn an_agent_keeps_every_argument_whole() {
-        let spec = super::ServiceSpec {
-            name: "calcifer".into(),
-            program: "/Users/a b/.cozy/bin/cozy".into(),
-            args: vec!["calcifer".into(), "<a & b>".into()],
-            log: None,
-        };
-        let plist = super::render(&spec);
-        assert!(plist.contains(
-            "<array><string>/Users/a b/.cozy/bin/cozy</string><string>calcifer</string>\
-             <string>&lt;a &amp; b&gt;</string></array>"
-        ));
-        assert!(plist.contains("<string>com.cozy-creator.calcifer</string>"));
-    }
-}

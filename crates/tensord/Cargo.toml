@@ -53,11 +53,6 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
-[dev-dependencies]
-png = "0.17"
-tower.workspace = true
-x509-parser = "0.18"
-
 [build-dependencies]
 zip.workspace = true
 sha2.workspace = true

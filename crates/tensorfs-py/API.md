@@ -60,7 +60,7 @@ refused. Omitted, the 8-bit lane is a preference, and a variant outside it serve
 where no GPU requirement applies. A refusal names each variant and why it does not work. Explicit `variant="nested/weights.cozytensors"` fixes the path instead. Every
 `.cozytensors` file at every depth is a variant, and its name conveys no precision. Selection
 loads only headers. The Hub's indexed selection and local
-selection use the same [normative vectors](../tensorfs/conformance/vectors/select.json).
+selection agree.
 
 ## Python: use the returned objects
 

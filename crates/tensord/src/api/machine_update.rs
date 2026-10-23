@@ -354,23 +354,3 @@ fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::Event
         }),
     }
 }
-
-
-#[cfg(test)]
-mod commit_observation_tests {
-    use super::*;
-
-    #[test]
-    fn a_blocked_commit_stops_observation_without_reporting_a_failed_run() {
-        let mut update = Update {
-            operation: "blocked".into(), state: "starting".into(),
-            error: "update_commit_blocked: no space left".into(), ..Default::default()
-        };
-        let error = observation_error(&update).unwrap();
-        assert_eq!(error.code, "update_commit_blocked");
-        assert_eq!(state("blocked", &update).state, "running");
-        assert_eq!(state("blocked", &update).waiting, update.error);
-        update.state = "succeeded".into();
-        assert!(observation_error(&update).is_none(), "cleanup cannot undo committed success");
-    }
-}

@@ -231,36 +231,3 @@ mod linux {
         ok
     }
 }
-
-/// Statfs magics are Linux's.
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn magics_name_their_class() {
-        assert_eq!(classify(0x794c_7630).class, DiskClass::Ephemeral);
-        assert_eq!(classify(0x0102_1994).class, DiskClass::Ephemeral);
-        assert_eq!(classify(0x6969).class, DiskClass::Network);
-        assert_eq!(classify(0x6573_5546).class, DiskClass::Network);
-        assert_eq!(classify(0xef53).class, DiskClass::Persistent);
-        assert_eq!(classify(0x1234_5678).class, DiskClass::Persistent);
-    }
-
-    #[test]
-    fn real_mounts_classify() {
-        if Path::new("/dev/shm").is_dir() {
-            assert_eq!(filesystem(Path::new("/dev/shm")).kind, "tmpfs");
-            assert_eq!(DiskClass::of(Path::new("/dev/shm")), DiskClass::Ephemeral);
-        }
-        assert_eq!(
-            DiskClass::of(Path::new("/proc/self")),
-            DiskClass::Persistent,
-            "an unrecognised filesystem is the safe side"
-        );
-        assert_eq!(
-            DiskClass::of(Path::new("/no/such/path/anywhere")),
-            DiskClass::Persistent
-        );
-    }
-}

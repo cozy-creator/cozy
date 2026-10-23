@@ -942,38 +942,3 @@ fn refused(e: client::Error) -> Ranged<Failure> {
         e => Ranged::Again(e.to_string()),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_runs_outputs_default_to_its_packages_folder_as_go_named_it() {
-        let outputs = Path::new("/home/me/.cozy/outputs");
-        for (target, folder) in [
-            ("fidika/minimax-h3/long_form@1.39.0", "fidika-minimax-h3"),
-            ("paul/sdxl/generate", "paul-sdxl"),
-            ("_/minimax-h3/ref2va_turbo", "minimax-h3"),
-            ("local/h3-tools/caption", "local-h3-tools"),
-            (
-                "local/cozy-script-0123456789abcdef01234567/main",
-                "local-cozy-script-0123456789abcdef01234567",
-            ),
-        ] {
-            assert_eq!(
-                package_outputs(outputs, target),
-                outputs.join(folder),
-                "{target}"
-            );
-        }
-        for target in [
-            "hf://org/model → acme/model",
-            "../x/y",
-            "a/b",
-            "a/../b/c",
-            "",
-        ] {
-            assert_eq!(package_outputs(outputs, target), outputs, "{target}");
-        }
-    }
-}

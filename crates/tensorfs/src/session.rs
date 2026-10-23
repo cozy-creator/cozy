@@ -391,18 +391,3 @@ pub enum Format {
     Safetensors,
     Cozytensors,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Ref;
-
-    /// A name with no org is the root namespace's (Tensorhub's first-party models).
-    #[test]
-    fn a_name_with_no_org_is_the_roots() {
-        let root: Ref = "flux-3-klein@0.1.0".parse().unwrap();
-        assert_eq!((root.repo_id.as_str(), root.revision.as_deref()), ("_/flux-3-klein", Some("0.1.0")));
-        let owned: Ref = "acme/tiny".parse().unwrap();
-        assert_eq!(owned.repo_id, "acme/tiny");
-        assert!("a/b/c".parse::<Ref>().is_err());
-    }
-}

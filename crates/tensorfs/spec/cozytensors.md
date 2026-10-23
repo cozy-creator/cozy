@@ -739,7 +739,6 @@ reader, copier or collector to discover a new kind of reference edge.
 
 ### Variant selection
 
-`conformance/vectors/select.json` and its `select/*.cbor` headers are the shared selection vectors.
 Rust and Hub readers MUST agree. Selection reads headers, never tensor payloads.
 Consumers pass `{gpus: ["major.minor", ...], bits?, prefer?, min_bits?, plain?}` (widths 4, 8 or 16).
 No GPUs means the CPU. `bits` is asked: only that lane answers. Otherwise `prefer` (8 when omitted) is

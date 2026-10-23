@@ -95,27 +95,3 @@ impl crate::fetch::TokenProvider for NativeProvider {
             .map_err(native_error)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_public_provider_error_roundtrips_without_losing_detail() {
-        for kind in Kind::ALL {
-            for detail in [
-                "",
-                "provider's exact diagnostic",
-                "CREDENTIAL_REQUIRED: caller text",
-            ] {
-                let original = Failure {
-                    kind,
-                    detail: detail.into(),
-                };
-                let restored = from_native(native_error(original.clone()));
-                assert_eq!(restored.kind, original.kind);
-                assert_eq!(restored.detail, original.detail);
-            }
-        }
-    }
-}

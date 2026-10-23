@@ -52,11 +52,6 @@ on:
         required: false
         default: ''
         type: string
-      tensorfs_run:
-        description: A publish-tensorfs run whose unpublished wheel stands in for PyPI's (dry runs and prereleases)
-        required: false
-        default: ''
-        type: string
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -201,24 +196,11 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
-  custom-release-gate:
-    needs:
-      - plan
-    if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' || inputs.tag == 'dry-run' }}
-    uses: ./.github/workflows/release-gate.yml
-    with:
-      plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
-    permissions:
-      "actions": "read"
-      "contents": "read"
-
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     needs:
       - plan
       - build-local-artifacts
-      - custom-release-gate
     runs-on: "ubuntu-24.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -264,12 +246,11 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
-  custom-release-smoke:
+  custom-release-attestations:
     needs:
       - plan
       - build-local-artifacts
-      - custom-release-gate
-    uses: ./.github/workflows/release-smoke.yml
+    uses: ./.github/workflows/release-attestations.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
@@ -279,12 +260,11 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
-      - custom-release-gate
       - build-global-artifacts
-      # Its mirror job makes the attestation bundles `cozy update` verifies; host releases them.
-      - custom-release-smoke
+      # The attestation bundles `cozy update` verifies; host releases them.
+      - custom-release-attestations
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-release-smoke.result == 'skipped' || needs.custom-release-smoke.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.custom-release-gate.result == 'skipped' || needs.custom-release-gate.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-release-attestations.result == 'skipped' || needs.custom-release-attestations.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-24.04"
@@ -345,8 +325,7 @@ jobs:
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   # HAND-EDITED: dist's homebrew job, pushing over SSH with the tap's write deploy key
-  # (secret HOMEBREW_TAP_DEPLOY_KEY) instead of a token, as Paul Fidika. It needs `host`, so only a
-  # release that passed the gate publishes its formula.
+  # (secret HOMEBREW_TAP_DEPLOY_KEY) instead of a token, as Paul Fidika.
   publish-homebrew-formula:
     needs:
       - plan

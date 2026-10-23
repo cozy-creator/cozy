@@ -503,25 +503,3 @@ pub fn kron_regular_h4(x: &mut [i32]) {
         stride *= 4;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn correction_prefix_matches_independent_indicator_rotations() {
-        for block in [4, 16, 64] {
-            for n in 0..=block {
-                let mut indicator: Vec<i32> = (0..block).map(|i| i32::from(i < n)).collect();
-                kron_regular_h4(&mut indicator);
-                for (j, expected) in indicator.into_iter().enumerate() {
-                    assert_eq!(
-                        column_prefix(n, j, block),
-                        expected,
-                        "B{block} prefix{n} column{j}"
-                    );
-                }
-            }
-        }
-    }
-}

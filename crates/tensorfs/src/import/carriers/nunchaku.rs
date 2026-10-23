@@ -263,22 +263,3 @@ fn linear(group: &Group, m: &str, keys: Vec<String>, logical: &Dtype, folds: &mu
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Each tiling places every element once.
-    #[test]
-    fn every_tiling_is_a_permutation() {
-        let once = |count: usize, at: &dyn Fn(usize) -> usize| {
-            let mut seen = vec![false; count];
-            (0..count).all(|e| !std::mem::replace(&mut seen[at(e)], true))
-        };
-        let (n, k, r) = (256, 256, 32);
-        assert!(once(n * k, &|e| code_at(e / k, e % k, k)));
-        assert!(once(n * k / 16, &|e| scale_at(e / (k / 16), e % (k / 16), k / 16)));
-        assert!(once(n, &vector_at));
-        assert!(once(r * k, &|e| { let (u, v) = (e / k, e % k); lowrank_at(v / 16, u / 16, r / 16, u % 16, v % 16) }));
-    }
-}

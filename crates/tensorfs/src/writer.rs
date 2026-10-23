@@ -43,7 +43,7 @@ use crate::format::{
 use crate::import;
 use crate::store::retention::{self, Hold};
 use crate::sha256::{hex, Sha256};
-use crate::store::{fail, fault, is_name, sync_dir, Admission, Checkpoint, Error, Result, Store};
+use crate::store::{fail, is_name, sync_dir, Admission, Checkpoint, Error, Result, Store};
 
 const SPOOL: &str = "spool";
 const JOURNAL: &str = "journal";
@@ -748,7 +748,6 @@ impl Writer {
                 Err(e) => break Err(e),
             }
             left -= n;
-            fault::point("writer.grid");
         };
         self.buffer = buffer;
         laid.map(|()| objects)
@@ -977,7 +976,6 @@ impl Writer {
             .map_err(fail("write", path))?;
         self.pending.clear();
         self.unflushed = 0;
-        fault::point("writer.journaled");
         Ok(())
     }
 

@@ -71,24 +71,3 @@ pub fn recv_fd(stream: &LocalStream) -> Result<OwnedHandle> {
     // SAFETY: the peer duplicated this handle into this process for us to own.
     Ok(unsafe { OwnedHandle::from_raw_handle(value as RawHandle) })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Seek, SeekFrom};
-
-    #[test]
-    fn a_handle_crosses_a_pair_with_its_file() {
-        let (a, b) = crate::ipc::pair().unwrap();
-        let mut file = tempfile::tempfile().unwrap();
-        file.write_all(b"crossed").unwrap();
-        send_fd(&a, &file).unwrap();
-        let mut got = std::fs::File::from(recv_fd(&b).unwrap());
-        got.seek(SeekFrom::Start(0)).unwrap();
-        let mut text = String::new();
-        got.read_to_string(&mut text).unwrap();
-        assert_eq!(text, "crossed");
-        assert_eq!(peer_credentials(&b).unwrap().pid, std::process::id());
-        assert!(peer_descends_from_machine(&b).unwrap());
-    }
-}

@@ -11,7 +11,6 @@
 #![deny(unsafe_code)]
 
 pub use tensorfs::io::{cuda, metrics as ceiling};
-pub mod faults;
 #[allow(unsafe_code)]
 pub mod host;
 pub mod io;

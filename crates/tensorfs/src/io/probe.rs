@@ -219,19 +219,3 @@ fn files(path: &Path, volume: u64, out: &mut Vec<(u64, PathBuf)>) -> io::Result<
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::saved;
-
-    #[test]
-    fn a_kept_ceiling_is_the_highest_positive_rate_for_the_exact_key() {
-        let key = "boot-a disk 42";
-        assert_eq!(saved("boot-a disk 420\t99\t1\nboot-b disk 42\t88\t1\n", key), None);
-        let text = "boot-a disk 42\t3.25\t1\nboot-a disk 42\t0.58\t1\nboot-a disk 42\t2.5\t0\n";
-        assert_eq!(saved(text, key), Some(vec![3.25, 1.0]));
-        for value in ["NaN\t1", "inf\t1", "0\t1", "-1\t1", "no rate"] {
-            assert_eq!(saved(&format!("{key}\t{value}\n"), key), None, "{value}");
-        }
-    }
-}

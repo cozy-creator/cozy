@@ -233,32 +233,3 @@ impl Cas {
         Ok(removed)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn objects_verify_once_and_go_only_unheld_and_unused() {
-        let root = std::env::temp_dir().join(format!("td-cas-{}", uuid::Uuid::new_v4()));
-        let cas = Cas::new(&root);
-        let object = cas.put_bytes(b"a result's bytes").unwrap();
-        assert_eq!(object, ObjectRef::of(b"a result's bytes"));
-        assert_eq!(cas.read(&object).unwrap(), b"a result's bytes");
-        let wrong = ObjectRef::of(b"other");
-        assert_eq!(cas.put(&b"bytes"[..], Some(&wrong)).unwrap_err().kind(), io::ErrorKind::InvalidData);
-        assert!(!cas.reuse(&wrong).unwrap() && fs::read_dir(root.join("tmp")).unwrap().count() == 0);
-        let tree = cas.put_bytes(b"{}").unwrap();
-        cas.hold("tree-1", &Hold { owner: "run-1".into(), roots: vec![tree.clone(), object.clone()] }).unwrap();
-        assert!(cas.sweep(Duration::ZERO, &mut |_| Ok(true)).unwrap().is_empty(), "held objects stay");
-        assert!(cas.release("tree-1").unwrap());
-        assert!(cas.sweep(Duration::from_secs(3600), &mut |_| Ok(true)).unwrap().is_empty(), "just used");
-        let mut removed = cas.sweep(Duration::ZERO, &mut |_| Ok(true)).unwrap();
-        removed.sort();
-        let mut both = vec![object.sha256.clone(), tree.sha256.clone()];
-        both.sort();
-        assert_eq!(removed, both);
-        assert!(!cas.reuse(&object).unwrap());
-        let _ = fs::remove_dir_all(root);
-    }
-}

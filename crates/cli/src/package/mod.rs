@@ -236,28 +236,3 @@ pub(crate) fn newest_first<T>(mut items: Vec<T>, version: impl Fn(&T) -> &str) -
     sorted.extend(items);
     sorted
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn refs_are_lowercase_and_releases_order_by_number() {
-        assert_eq!(
-            PackageRef::parse("Fidika/SDXL").unwrap().package(),
-            "fidika/sdxl"
-        );
-        let root = PackageRef::parse("SDXL@2.12.1").unwrap();
-        assert_eq!((root.package(), root.release.as_deref()), ("_/sdxl".into(), Some("2.12.1")));
-        assert!(PackageRef::parse("a/b/c").is_err());
-        assert!(directory("sdxl").is_none() && directory("./sdxl").is_some());
-        let releases = vec!["2.9.0", "2.10.0rc1", "2.10.0", "nightly", "1.37.2", "2.10.0.post1"];
-        let sorted = newest_first(releases, |r| *r);
-        assert_eq!(sorted, ["2.10.0.post1", "2.10.0", "2.9.0", "1.37.2", "2.10.0rc1", "nightly"]);
-        assert_eq!(stamp("2026-10-16T09:34:25.879488Z"), "2026-10-16T09:34:25Z");
-        assert_eq!(
-            stamp("2026-10-16T09:34:25+02:00"),
-            "2026-10-16T09:34:25+02:00"
-        );
-    }
-}

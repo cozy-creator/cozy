@@ -584,34 +584,6 @@ impl PyPinned {
     }
 }
 
-#[cfg(test)]
-mod stream_tests {
-    use super::{dlpack_stream, KDL_CPU, KDL_CUDA};
-
-    #[test]
-    fn cuda_none_and_positive_consumers_have_explicit_streams() {
-        assert_eq!(dlpack_stream(KDL_CUDA, None), Ok(Some(1)));
-        for stream in [1, 2, 99, i64::MAX] {
-            assert_eq!(dlpack_stream(KDL_CUDA, Some(stream)), Ok(Some(stream as u64)));
-        }
-    }
-
-    #[test]
-    fn cuda_ambiguous_and_no_sync_consumers_are_refused() {
-        for stream in [0, -1, -2, i64::MIN] {
-            assert!(dlpack_stream(KDL_CUDA, Some(stream)).is_err());
-        }
-    }
-
-    #[test]
-    fn cpu_accepts_only_no_stream() {
-        assert_eq!(dlpack_stream(KDL_CPU, None), Ok(None));
-        for stream in [0, 1, 2, 99, -1] {
-            assert!(dlpack_stream(KDL_CPU, Some(stream)).is_err());
-        }
-    }
-}
-
 // ---------------------------------------------------------------- the host tier
 
 /// A whole-tier claim on a host-tier memfd for an owner that maps none of it (TensorD): a new

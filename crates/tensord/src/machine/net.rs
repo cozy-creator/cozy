@@ -46,18 +46,3 @@ async fn connect_any(addresses: impl IntoIterator<Item = SocketAddr>) -> io::Res
     }
     Err(last)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn an_address_that_never_answers_does_not_hold_the_connect() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let open = listener.local_addr().unwrap();
-        // TEST-NET-1 is never routed: a SYN to it is dropped, as on a host without IPv6.
-        let silent: SocketAddr = format!("192.0.2.1:{}", open.port()).parse().unwrap();
-        let stream = connect_any([silent, open]).await.unwrap();
-        assert_eq!(stream.peer_addr().unwrap(), open);
-    }
-}

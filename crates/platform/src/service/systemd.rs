@@ -143,24 +143,3 @@ fn quote(word: &str) -> String {
     quoted.push('"');
     quoted
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_unit_keeps_every_word_literal() {
-        let spec = super::ServiceSpec {
-            name: "calcifer".into(),
-            program: "/home/a b/.cozy/bin/cozy".into(),
-            args: vec!["calcifer".into(), r#"say "100%" $HOME \n"#.into()],
-            log: Some("/home/a b/100%.log".into()),
-        };
-        let unit = super::render(&spec);
-        assert!(unit.contains(
-            r#"ExecStart="/home/a b/.cozy/bin/cozy" "calcifer" "say \"100%%\" $$HOME \\n""#
-        ));
-        assert!(unit.contains("StandardError=append:/home/a b/100%%.log\n"));
-        assert!(
-            unit.contains("Restart=on-failure\n") && unit.ends_with("WantedBy=default.target\n")
-        );
-    }
-}

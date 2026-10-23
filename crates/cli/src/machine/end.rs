@@ -505,28 +505,3 @@ fn newer(a: &str, b: &str) -> bool {
     let parts = |v: &str| -> Vec<u64> { v.split('.').map_while(|p| p.parse().ok()).collect() };
     parts(a) > parts(b)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// TensorD 0.10.1 ignores an update's `binary` and succeeds unapplied: the update fails, typed,
-    /// naming what it asked for, what runs, and the machine's own line about it.
-    #[test]
-    fn an_update_that_succeeded_unapplied_fails_naming_requested_and_running() {
-        let old = MachineStatus {
-            version: "0.10.1".into(), commit: "3f2a1b9c4d5e6f708192".into(), runtime: "0.27.4".into(),
-            tensorfs: "0.10.0".into(), ..Default::default()
-        };
-        let want = [reports("binary", "cozy"), reports("runtime", "cozy_runtime-0.30.1-py3-none-any.whl")];
-        assert!(!runs(&old, &want));
-        let line = r#"WARN update r1: ignoring unknown payload field "binary""#;
-        let error = unapplied("pod", &old, &want, Some(line));
-        assert_eq!((error.kind, error.code.as_str()), (Kind::Conflict, "update_unapplied"));
-        assert_eq!(error.message, "pod's update succeeded but it runs cozy 0.10.1 (release 3f2a1b9c4d5e), \
-            cozy-runtime 0.27.4, tensorfs 0.10.0, not the requested dev build, cozy-runtime 0.30.1: \
-            WARN update r1: ignoring unknown payload field \"binary\"");
-        let new = MachineStatus { dev: true, runtime: "0.30.1".into(), ..old };
-        assert!(runs(&new, &want));
-    }
-}

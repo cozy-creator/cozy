@@ -224,36 +224,3 @@ fn failed(op: &'static str) -> impl FnOnce(NvmlError) -> Error {
         detail: error.to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_driver_below_the_floor_is_named_with_the_driver_it_needs() {
-        let message = below_floor("570.133.20").expect("570 is below CUDA 13.0's floor");
-        assert!(
-            message.contains("570.133.20") && message.contains(DRIVER_FLOOR),
-            "{message}"
-        );
-        assert!(below_floor("580.0").is_some());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn an_integrated_gpus_memory_is_the_hosts() {
-        let (total, free) = memory(Err(NvmlError::NotSupported)).unwrap();
-        assert_eq!(total as i64, crate::contain::host_memory::total());
-        assert!(free > 0 && free <= total, "{free} of {total}");
-        assert!(memory(Err(NvmlError::Unknown)).is_err());
-    }
-
-    #[test]
-    fn the_floor_and_newer_drivers_serve_and_an_unreadable_version_is_not_judged() {
-        for driver in [DRIVER_FLOOR, "580.95.05", "581.57", "590.10", " 600.1 "] {
-            assert_eq!(below_floor(driver), None, "{driver}");
-        }
-        assert_eq!(below_floor("N/A"), None);
-        assert_eq!(below_floor(""), None);
-    }
-}

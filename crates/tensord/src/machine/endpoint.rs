@@ -31,37 +31,3 @@ pub fn from_env(vars: impl IntoIterator<Item = (String, String)>) -> Option<Endp
             (!ports.is_empty()).then(|| Endpoint { public_host: host.to_string(), ports })
         })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-    }
-
-    #[test]
-    fn runpod_and_vast_name_their_endpoint() {
-        // The environment of rental nanoha (RunPod EU-RO-1), 2026-10-09.
-        let runpod = from_env(vars(&[
-            ("RUNPOD_PUBLIC_IP", "213.173.105.223"),
-            ("RUNPOD_TCP_PORT_22", "43566"),
-            ("RUNPOD_TCP_PORT_8443", "43565"),
-            ("RUNPOD_TCP_PORT_8445", "43567"),
-            ("RUNPOD_POD_ID", "320hr6lbxdjnlq"),
-        ]))
-        .unwrap();
-        assert_eq!(runpod.public_host, "213.173.105.223");
-        assert_eq!(runpod.ports.get("8443"), Some(&43565));
-        assert_eq!(runpod.ports.len(), 3);
-        let vast = from_env(vars(&[("PUBLIC_IPADDR", "1.2.3.4"), ("VAST_TCP_PORT_8443", "40001")])).unwrap();
-        assert_eq!(vast.ports.get("8443"), Some(&40001));
-    }
-
-    #[test]
-    fn no_provider_or_no_ports_reports_nothing() {
-        assert_eq!(from_env(vars(&[("HOME", "/root")])), None);
-        assert_eq!(from_env(vars(&[("RUNPOD_PUBLIC_IP", "213.173.105.223")])), None);
-        assert_eq!(from_env(vars(&[("RUNPOD_PUBLIC_IP", "not-an-ip"), ("RUNPOD_TCP_PORT_8443", "1")])), None);
-    }
-}

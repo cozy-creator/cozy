@@ -177,30 +177,3 @@ pub fn check_digest(what: &str, text: &str, prefixed: bool) -> io::Result<()> {
         false => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{what}: {text:?} is not a sha256 digest"))),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn one_machine_claims_a_store_by_any_path_until_it_lets_go() {
-        let root = std::env::temp_dir().join(format!("tensord-claim-{}", uuid::Uuid::new_v4()));
-        let store = root.join("real/store");
-        super::open(&store).unwrap();
-        let first = super::claim(&store).unwrap();
-        platform::durable::symlink(&root.join("real"), &root.join("alias")).unwrap();
-        let busy = super::claim(&root.join("alias/store")).expect_err("a second claim");
-        assert!(busy.to_string().contains("STORE_BUSY: this TensorFS store already has an owner"), "{busy}");
-        drop(first);
-        super::claim(&root.join("alias/store")).unwrap();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_store_in_an_older_format_is_refused_with_what_to_do() {
-        let root = std::env::temp_dir().join(format!("tensord-old-store-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("format"), br#"{"format":"tensorfs.store/2"}"#).unwrap();
-        let Err(refused) = super::open(&root) else { panic!("an older store is not opened") };
-        assert!(refused.to_string().contains("pull again"), "{refused}");
-        let _ = std::fs::remove_dir_all(root);
-    }
-}

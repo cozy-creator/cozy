@@ -346,7 +346,7 @@ make the selected-block reads 211 MB and 227 MB respectively.
 These receipts predate the 0.13 API. They are separate runs and reader revisions: the full-load run predates the final CBOR header
 and lazy window registration; the block run includes them. They measure serialized-byte loading,
 excluding dequantization, model construction and inference. Hardware and cache conditions affect
-results. [Measurements and provenance](gates/speed/measurements.json) include the earlier failed
+results. [Measurements and provenance](https://github.com/cozy-creator/cozy-creator/blob/373dfa4af5b4bd56070515d767a4ddb9c958304c/crates/tensorfs-py/gates/speed/measurements.json) include the earlier failed
 window cell; [the recorded harness](https://github.com/cozy-creator/cozy-creator/blob/0a6e71ee2c919db3e6e9b5844c8234ca9749cedb/crates/tensorfs/gates/speed/speedgate.py)
 defines the workloads. Download projections are separate from these measured timings.
 
@@ -461,6 +461,4 @@ requires that scheme's implementation.
 
 The [cozytensors specification](../tensorfs/spec/cozytensors.md) is the format contract. The header is deterministic CBOR;
 trees and repository documents are canonical JSON. Construction order contributes to identity. The
-[conformance corpus](../tensorfs/conformance/) checks independent readers, and the [source fixtures](../tensorfs/vectors/) retain source
-provenance without model payloads. The [standalone end-to-end check](scripts/e2e.sh) converts a tiny public model,
-exports it for Diffusers, compares its render and downloads the same bytes through an ordinary endpoint.
+[source fixtures](../tensorfs/vectors/) retain source provenance without model payloads.
