@@ -1390,9 +1390,10 @@ fn lease_chunks_cost_across_two_processes() {
 }
 
 /// TensorD's own context (design §2a): a fresh process with no context. In order: NVML's bytes for it after cuInit;
-/// whether cuMemCreate works with no current context; the bytes the primary context adds; the stack, printf and
-/// malloc-heap limits set to 0 (the driver's answers, and the bytes after); then the context destroyed (the last
-/// release) while a page lives, and whether that page maps and keeps its bytes in a new context.
+/// whether cuMemCreate works with no current context, and a second page's export and release with none (P1 rerun);
+/// the bytes the primary context adds; the stack, printf and malloc-heap limits set to 0 (the driver's answers, and
+/// the bytes after); then the context destroyed (the last release) while a page lives, and whether that page maps and
+/// keeps its bytes in a new context.
 #[test]
 #[ignore = "native GPU: a role of a_managers_context_costs_and_pages_outlive_it"]
 fn role_context() {
@@ -1412,6 +1413,18 @@ fn role_context() {
     let mut handle = 0;
     let no_context = unsafe { (d.mem_create)(&mut handle, len as usize, &prop, 0) };
     report.push(format!("cuMemCreate with no current context: {no_context}; then {} B", used()));
+    // The rest of a manager's chunk life with no context current (P1 rerun): export, then release.
+    let mut other = 0;
+    // SAFETY: the documented driver ABI; `other` and `fd` are live locals.
+    let made = unsafe { (d.mem_create)(&mut other, len as usize, &prop, 0) };
+    let mut fd: std::ffi::c_int = -1;
+    let exported = if made == cuda::SUCCESS { unsafe { (d.mem_export)((&mut fd as *mut std::ffi::c_int).cast(), other, cuda::MEM_HANDLE_TYPE_POSIX_FD, 0) } } else { made };
+    if fd >= 0 {
+        // SAFETY: the descriptor the export just made, closed once.
+        unsafe { libc::close(fd) };
+    }
+    let released = if made == cuda::SUCCESS { unsafe { (d.mem_release)(other) } } else { made };
+    report.push(format!("with no current context: cuMemExportToShareableHandle {exported}, cuMemRelease {released}; then {} B", used()));
     let mut ctx = std::ptr::null_mut();
     cuda::check("cuDevicePrimaryCtxRetain", unsafe { (d.primary_ctx_retain)(&mut ctx, device) }).unwrap();
     cuda::check("cuCtxSetCurrent", unsafe { (d.ctx_set_current)(ctx) }).unwrap();
