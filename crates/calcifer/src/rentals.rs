@@ -595,14 +595,11 @@ impl Machines {
             _ => format!("the fastest of {}: none is fast enough", placement.machines.len()),
         };
         let why = format!(
-            "the Hub placed it on {} ({}× {}, {} GB): ${:.2}/h, about ${:.2} expected, {rule} for \
-             {} GB of {}-bit weights",
+            "the Hub placed it on {} ({}× {}, {} GB): {rule} for {} GB of {}-bit weights",
             top.name,
             top.accelerator_count,
             top.accelerator_model,
             top.vram_gb,
-            (top.price_usd_micros_per_hour + top.storage_usd_micros_per_hour) as f64 / 1e6,
-            top.expected_price.total_usd_micros as f64 / 1e6,
             placement.weight_bytes / 1_000_000_000,
             placement.bits,
         );
@@ -1002,7 +999,7 @@ fn alternatives(machines: &[types::RentalPlacementMachine]) -> Vec<Alternative> 
     let Some((top, rest)) = machines.split_first() else {
         return vec![];
     };
-    let (Some(speed), Some(cost)) = (top.speed, top.run_cost) else {
+    let (Some(speed), Some(_)) = (top.speed, top.run_cost) else {
         return vec![];
     };
     let by = |key: fn(&types::RentalPlacementMachine) -> f64| {
@@ -1030,9 +1027,7 @@ fn alternatives(machines: &[types::RentalPlacementMachine]) -> Vec<Alternative> 
                 gpus: u32::try_from(m.accelerator_count).unwrap_or(1),
                 label: label.into(),
                 time: m.speed.filter(|s| *s > 0.0).map_or(0.0, |s| speed / s),
-                run_cost: m.run_cost.map_or(0.0, |c| c / cost),
-                usd_micros_per_hour: m.price_usd_micros_per_hour + m.storage_usd_micros_per_hour,
-                expected_total_usd_micros: m.expected_price.total_usd_micros,
+                usd_micros_per_hour: m.price_usd_micros_per_hour,
             }
         })
         .collect()
@@ -1203,13 +1198,9 @@ fn boot_phase(rental: &types::Rental) -> Option<String> {
     (!words.is_empty()).then(|| words.join(": "))
 }
 
-/// What the rental costs an hour, the machine and its disk: until a machine is bought the Hub's
-/// `hourly_rate` is the machine's alone.
+/// What we charge for the rental an hour, its GPUs; disk and traffic are never the user's.
 fn hourly(rental: &types::Rental) -> i64 {
-    match rental.compute_usd_micros_per_hour {
-        Some(compute) => compute + rental.storage_usd_micros_per_hour.unwrap_or_default(),
-        None => rental.hourly_rate_usd_micros,
-    }
+    rental.compute_usd_micros_per_hour.unwrap_or(rental.hourly_rate_usd_micros)
 }
 
 fn view(rental: &types::Rental, sku: Option<String>) -> Rental {
