@@ -422,21 +422,19 @@ _pass: ContextVar[_Pass | None] = ContextVar("varena_pass", default=None)
 _routes: ContextVar[frozenset[tuple[int, int]]] = ContextVar("varena_routes", default=frozenset())
 
 
-def _lease(native: Native, ns: int, redial: Callable[[], bool] | None) -> str | None:
+def _lease(native: Native, ns: int) -> str | None:
     """The GPU's weight pages leased from the manager TensorD serves in namespace `ns`
-    (varena-leases §11), or why not. A follower can dial before rank 0's progress registers it:
-    `NotRegistered` calls `redial`, which waits on the start's progress and says whether to dial
-    again; with none, or False, it raises `NotRegistered`: never a fallback. Only no compatible
-    manager runs standalone, warned."""
-    while (refused := native.lease(ns)) is not None:
-        code, why = refused
-        if code == "NotRegistered" and redial is not None and redial():
-            continue
-        if code in ("Incompatible", "Absent"):
-            warnings.warn(f"varena: GPU {native.gpu.uuid} runs standalone, with no lease from TensorD: {why}", stacklevel=3)
-            return why
-        raise (NotRegistered if code == "NotRegistered" else VarenaError)(f"varena: TensorD refused GPU {native.gpu.uuid}'s lease ({code}): {why}")
-    return None
+    (varena-leases §11), or why not. TensorD holds a follower's dial until it registers it, so
+    `NotRegistered` is a failure, never a fallback. Only no compatible manager runs standalone,
+    warned."""
+    refused = native.lease(ns)
+    if refused is None:
+        return None
+    code, why = refused
+    if code in ("Incompatible", "Absent"):
+        warnings.warn(f"varena: GPU {native.gpu.uuid} runs standalone, with no lease from TensorD: {why}", stacklevel=3)
+        return why
+    raise (NotRegistered if code == "NotRegistered" else VarenaError)(f"varena: TensorD refused GPU {native.gpu.uuid}'s lease ({code}): {why}")
 
 
 class Memory:
@@ -475,7 +473,7 @@ class Memory:
             return pool
 
     @classmethod
-    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = True, leases: int | None = None, redial: Callable[[], bool] | None = None) -> Memory:
+    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = True, leases: int | None = None) -> Memory:
         """A TensorD executor's memory (`grant`), or a standalone engine's: the device's table by
         name, its capacity lowered to `limit` (the first opener sets it, a later one can only
         lower it). On CUDA the backend opens first and measures this process's context, so open
@@ -500,7 +498,7 @@ class Memory:
                     native = Native.host(GpuId("host", device.type, ram), grant, limit)
                 memory = cls(native, device, pool)
                 if device.type == "cuda" and leases is not None:
-                    memory.standalone = _lease(native, leases, redial)
+                    memory.standalone = _lease(native, leases)
                 _memories[key] = memory
         return memory
 
