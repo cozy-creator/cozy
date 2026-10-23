@@ -283,7 +283,8 @@ fn parked(tenants: &Tenants, count: usize) {
 
 /// A follower that dials before its rank 0 reports it waits, parked, and is admitted the moment
 /// it is registered; one its group's Start ends without is refused with a typed reason. Nothing
-/// redials and nothing times out: the Start's state decides.
+/// redials and nothing times out: the Start's state decides. No more wait than the Start expects
+/// followers, and a process that left rank 0's group (its own, as `setsid` makes) never waits.
 #[test]
 fn a_follower_dialing_before_it_is_reported_waits_and_is_admitted() {
     let dir = tempfile::tempdir().unwrap();
@@ -302,7 +303,7 @@ fn a_follower_dialing_before_it_is_reported_waits_and_is_admitted() {
     let birth = Birth::of(leader.id()).unwrap();
     let tenant = |exact: Exact| Tenant { plan: "plan-g".into(), generation: "gen-g".into(), start: 0, exact };
     tenants.register([(leader.id(), tenant(Exact::open(&birth).unwrap().unwrap()))]);
-    let forming = tenants.forming(&birth);
+    let forming = tenants.forming(&birth, 1);
 
     let mut early = StandIn::grouped(&id.uuid, Some(leader.id()));
     early.send("attach");
@@ -314,10 +315,15 @@ fn a_follower_dialing_before_it_is_reported_waits_and_is_admitted() {
     let mut late = StandIn::grouped(&id.uuid, Some(leader.id()));
     late.send("attach");
     parked(&tenants, 1);
+    let mut extra = StandIn::grouped(&id.uuid, Some(leader.id()));
+    assert_eq!(extra.ask("attach"), "NotRegistered", "the Start expects one follower: one waits");
+    let mut left = StandIn::grouped(&id.uuid, Some(0));
+    assert_eq!(left.ask("attach"), "NotRegistered", "a process in a group of its own never waits");
+    assert_eq!(tenants.parked(), 1);
     drop(forming);
     assert_eq!(late.reply("attach"), "NotRegistered", "the Start ended without it");
     parked(&tenants, 0);
-    drop((early, late));
+    drop((early, late, extra, left));
     // SAFETY: a signal to the process group this test made (rank 0, its sleep, the stand-ins).
     assert_eq!(unsafe { libc::kill(-(leader.id() as i32), libc::SIGKILL) }, 0);
     leader.wait().unwrap();

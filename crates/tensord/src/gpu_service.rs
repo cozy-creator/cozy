@@ -2608,7 +2608,7 @@ impl Pool {
             // Rank 0 spawns and forms every follower inside this command; its watch meters
             // the whole group's work, so formation ends only on measured lack of progress. A
             // follower that dials its lease listener meanwhile waits for its registration.
-            let forming = self.tenants.forming(&session.executor.birth);
+            let forming = self.tenants.forming(&session.executor.birth, ranks.saturating_sub(1) as usize);
             let started = command_ok(session.executor.command_with(
                 &DeviceCommand::Start {
                     devices: lane.clone(),

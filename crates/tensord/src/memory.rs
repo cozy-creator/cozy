@@ -185,12 +185,18 @@ pub struct Registry {
     changed: std::sync::Condvar,
 }
 
-/// What the registry holds: its tenants (the map it derefs to), the leaders whose groups form now,
-/// and how many peers wait on them.
+/// What the registry holds: its tenants (the map it derefs to), and the leaders whose groups form
+/// now.
 #[derive(Default)]
 pub struct Book {
     tenants: BTreeMap<u32, Tenant>,
-    forming: BTreeMap<u32, Birth>,
+    forming: BTreeMap<u32, Group>,
+}
+
+/// A forming group: its rank 0, the followers its Start expects, and its peers waiting now.
+struct Group {
+    leader: Birth,
+    followers: usize,
     parked: usize,
 }
 
@@ -212,23 +218,28 @@ impl Registry {
         self.book.lock()
     }
 
+    fn book(&self) -> std::sync::MutexGuard<'_, Book> {
+        self.book.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Registers `tenants`; a peer waiting for one is admitted.
     pub fn register(&self, tenants: impl IntoIterator<Item = (u32, Tenant)>) {
-        self.book.lock().unwrap().tenants.extend(tenants);
+        self.book().tenants.extend(tenants);
         self.changed.notify_all();
     }
 
-    /// `leader`'s Start forms its group until the returned guard drops: a member of its process
-    /// group that dials meanwhile waits to be registered, and is refused if the Start ends
-    /// without registering it.
-    pub fn forming(self: &Arc<Self>, leader: &Birth) -> Forming {
-        self.book.lock().unwrap().forming.insert(leader.pid, leader.clone());
+    /// `leader`'s Start forms its group of `followers` (ranks - 1) until the returned guard drops:
+    /// up to that many members of its process group that dial meanwhile wait to be registered
+    /// (more are refused, so a package's children cannot hold threads by dialing), and are refused
+    /// if the Start ends without registering them.
+    pub fn forming(self: &Arc<Self>, leader: &Birth, followers: usize) -> Forming {
+        self.book().forming.insert(leader.pid, Group { leader: leader.clone(), followers, parked: 0 });
         Forming { registry: self.clone(), leader: leader.pid }
     }
 
     /// Peers waiting for their registration now.
     pub fn parked(&self) -> usize {
-        self.book.lock().unwrap().parked
+        self.book().forming.values().map(|group| group.parked).sum()
     }
 }
 
@@ -240,7 +251,7 @@ pub struct Forming {
 
 impl Drop for Forming {
     fn drop(&mut self) {
-        self.registry.book.lock().unwrap_or_else(|e| e.into_inner()).forming.remove(&self.leader);
+        self.registry.book().forming.remove(&self.leader);
         self.registry.changed.notify_all();
     }
 }
@@ -269,20 +280,28 @@ impl Hosting for Peers {
         if !self.uids.contains(&peer.uid) {
             return None;
         }
-        let forming: Vec<Birth> = self.tenants.lock().unwrap().forming.values().cloned().collect();
+        let forming: Vec<Birth> = self.tenants.book().forming.values().map(|group| group.leader.clone()).collect();
         let leader = forming.iter().find(|leader| platform::process::group_members(leader).iter().any(|m| m.pid == peer.pid)).map(|leader| leader.pid);
-        let mut book = self.tenants.lock().unwrap();
-        loop {
+        let mut book = self.tenants.book();
+        let mut waited = false;
+        let identity = loop {
             if let Some(tenant) = book.tenants.get(&peer.pid).filter(|tenant| !tenant.exact.ended()) {
-                return Some(Identity { executor: format!("{}#{}", tenant.plan, tenant.start), domain: format!("{}/{}", tenant.generation, peer.uid) });
+                break Some(Identity { executor: format!("{}#{}", tenant.plan, tenant.start), domain: format!("{}/{}", tenant.generation, peer.uid) });
             }
-            if !leader.is_some_and(|leader| book.forming.contains_key(&leader)) {
-                return None;
+            let Some(group) = leader.and_then(|leader| book.forming.get_mut(&leader)) else { break None };
+            if !waited {
+                if group.parked >= group.followers {
+                    break None;
+                }
+                group.parked += 1;
+                waited = true;
             }
-            book.parked += 1;
-            book = self.tenants.changed.wait(book).unwrap();
-            book.parked -= 1;
+            book = self.tenants.changed.wait(book).unwrap_or_else(|e| e.into_inner());
+        };
+        if let Some(group) = leader.filter(|_| waited).and_then(|leader| book.forming.get_mut(&leader)) {
+            group.parked -= 1;
         }
+        identity
     }
 
     fn record(&self, record: Record) {
