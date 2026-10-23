@@ -77,6 +77,9 @@ pub struct CudaBackend {
     nvml: Option<platform::gpu::Device>,
     /// The device's used bytes `open` measured across making the context.
     context: u64,
+    /// Events retired while still pending: destroyed once complete, never before (cuEventDestroy
+    /// of a pending event can block until it completes, behind any other stream's work).
+    retired: parking_lot::Mutex<Vec<Event>>,
     /// What `prop`'s WIN32 metadata points at, for as long as pages are created.
     #[cfg(windows)]
     _security: Box<SecurityAttributes>,
@@ -130,6 +133,7 @@ impl CudaBackend {
             capacity: total as u64,
             nvml,
             context,
+            retired: parking_lot::Mutex::new(Vec::new()),
             #[cfg(windows)]
             _security: security,
         })
@@ -383,11 +387,20 @@ impl Backend for CudaBackend {
         Ok(call!("cuEventSynchronize", event_synchronize(raw(event)))?)
     }
 
+    /// Never blocks: an event is destroyed once complete, here or at a later retire.
     fn retire(&self, event: Event) {
-        if event != Event::DONE {
-            // An event still pending is freed by the driver once it completes.
-            self.logged("cuEventDestroy", || Ok(call!("cuEventDestroy", event_destroy(raw(event)))?));
+        if event == Event::DONE {
+            return;
         }
+        let mut retired = self.retired.lock();
+        retired.push(event);
+        retired.retain(|e| match self.query(*e) {
+            Ok(false) => true,
+            Ok(true) | Err(_) => {
+                self.logged("cuEventDestroy", || Ok(call!("cuEventDestroy", event_destroy(raw(*e)))?));
+                false
+            }
+        });
     }
 
     fn drain(&self) -> Result<()> {
