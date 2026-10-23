@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[cfg(unix)]
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use crossbeam_channel::{select_biased, unbounded, Receiver, Sender};
@@ -350,15 +350,18 @@ impl Drop for Owner {
 /// One process's memory on one device. A clone is another public handle on it.
 pub struct Memory {
     inner: Owner,
+    /// Memory handles (clones): the last one's drop closes it.
+    handles: Arc<AtomicUsize>,
 }
 
 impl Clone for Memory {
     fn clone(&self) -> Memory {
-        Memory { inner: Arc::clone(&*self.inner).into() }
+        self.handles.fetch_add(1, Ordering::AcqRel);
+        Memory { inner: Arc::clone(&*self.inner).into(), handles: self.handles.clone() }
     }
 }
 
-/// region.rs's hooks: events on the device's streams, and its granularity.
+/// region.rs's hooks: the device's events, its free bytes, the manager's figures, and the plan.
 impl Memory {
     pub(crate) fn record_event(&self, stream: usize) -> Result<Event> {
         self.inner.backend.record(stream)
@@ -372,8 +375,60 @@ impl Memory {
         self.inner.backend.retire(event)
     }
 
+    pub(crate) fn synchronize(&self, stream: usize) -> Result<()> {
+        self.inner.backend.synchronize(stream)
+    }
+
     pub(crate) fn granularity(&self) -> u64 {
         self.inner.backend.granularity()
+    }
+
+    /// With no manager: the device's free bytes less H, the display's headroom.
+    pub(crate) fn standalone_free(&self) -> u64 {
+        let b = &self.inner.backend;
+        b.free().unwrap_or(0).saturating_sub(crate::table::headroom(b.capacity()))
+    }
+
+    /// The device's torch allocator, if anything allocated through it yet.
+    pub(crate) fn torch_if(&self) -> Option<Arc<crate::arena::Torch>> {
+        self.inner.torch.get().cloned()
+    }
+
+    /// The same device memory: two handles of one open.
+    pub(crate) fn same(&self, other: &Memory) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The manager's figures for this executor, while its pages are leased.
+    pub(crate) fn figures(&self) -> Option<crate::lease::Figures> {
+        #[cfg(unix)]
+        return self.inner.lease.get().map(|a| a.table().figures());
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Plan step `step`'s sets (each open request's current step when `None`): this process's
+    /// mapped bytes in them, its idle mapped bytes outside them, and their largest block.
+    pub(crate) fn step_bytes(&self, step: Option<u32>) -> (u64, u64, u64) {
+        let st = self.inner.state.lock();
+        let sets: BTreeSet<u32> = st.table.requests.iter().filter_map(|r| r.steps.get(step.unwrap_or(r.cursor.step) as usize)).flat_map(|(s, _)| s.iter().copied()).collect();
+        let (mut warm, mut cold, mut largest) = (0, 0, 0);
+        for ((set, _), p) in st.table.pages() {
+            if sets.contains(&set) {
+                largest = largest.max(p.bytes);
+                warm += if p.mapped { p.bytes } else { 0 };
+            } else if p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.filling {
+                cold += p.bytes;
+            }
+        }
+        (warm, cold, largest)
+    }
+
+    /// Every block of `set`.
+    pub(crate) fn blocks(&self, set: SetId) -> Result<Vec<u32>> {
+        let st = self.inner.state.lock();
+        let n = st.table.sets.get(set.0 as usize).and_then(|s| s.as_ref()).map(|s| s.pages.len()).ok_or_else(|| Error::Closed(format!("set {}", set.0)))?;
+        Ok((0..n as u32).collect())
     }
 }
 
@@ -970,7 +1025,7 @@ impl Memory {
             let mut st = inner.lock();
             inner.publish(&mut st);
             inner.unlock(st);
-            Ok(Memory { inner: inner.into() })
+            Ok(Memory { inner: inner.into(), handles: Arc::new(AtomicUsize::new(1)) })
         })
     }
 
@@ -3169,6 +3224,9 @@ impl Drop for Memory {
     /// Final physical retirement is transferred by Owner, so a Python/DLPack destructor never
     /// waits for a CUDA consumer or a host callback.
     fn drop(&mut self) {
+        if self.handles.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
         self.inner.burst.0.lock().closed = true;
         self.inner.burst.1.notify_all();
         self.inner.landed.notify_all();

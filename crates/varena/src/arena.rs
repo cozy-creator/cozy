@@ -36,6 +36,9 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use crate::backend::{Access, Backend, Event, Physical, Va, OUT_OF_MEMORY};
 use crate::{Error, Exhausted, Result};
 
+mod regions;
+pub use regions::Evicted;
+
 /// A span's length, and every chunk's, is a multiple of this.
 pub const UNIT: u64 = 2 << 20;
 /// The largest chunk (the manager's lease size).
@@ -1336,6 +1339,9 @@ impl Shared {
     /// leaves for the idle list, stamped with its stream's epoch (R1), or is held while a capture
     /// is open.
     fn whole(&self, a: &Arc<Arena>, st: &mut State, base: u64) {
+        if st.spans.get(&base).is_some_and(|s| s.chunks.is_empty()) {
+            return self.evicted_whole(a, st, base);
+        }
         if a.pool() {
             if a.released.load(Acquire) && a.fenced.load(Acquire) {
                 self.to_idle(st, base, None);
