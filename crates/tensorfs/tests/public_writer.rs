@@ -817,7 +817,7 @@ async fn a_repo_with_a_tag_this_client_cannot_read_still_resolves_its_others() {
         repo.tag_mut("1.0").unwrap().yanked = true;
         Ok(Some(repo))
     }).await.unwrap();
-    assert_eq!(edited.unread, [odd.clone()]);
+    assert_eq!(edited.unread, std::slice::from_ref(&odd));
     let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert!(written["tags"].as_array().unwrap().contains(&odd), "{written}");
 }
