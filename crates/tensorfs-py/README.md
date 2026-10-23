@@ -170,7 +170,7 @@ runtime has a matching compute kernel:
 ```python
 import tensorfs
 
-checkpoint = tensorfs.open("owner/model", variant="int8")
+checkpoint = tensorfs.open("owner/model", variant="model.int8.cozytensors")
 tensors = checkpoint.components["unet"].tensors
 stored = tensors.read("proj.weight", device="cuda:0", decode=False)
 print(stored.scheme, stored.params)

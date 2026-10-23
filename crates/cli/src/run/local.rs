@@ -59,8 +59,9 @@ pub(super) async fn run(
         None => install(ctx, &hub.origin, on.clone(), &local).await?,
     };
     let script = path.extension().is_some_and(|e| e == "py");
-    let public = installed.interface.public();
-    let function = match (function, public.as_slice()) {
+    // A script's one callable runs bare, a recipe too: local code is its author's to run.
+    let callables: Vec<&str> = (installed.interface.callables.iter()).filter(|c| !c.internal).map(|c| c.name.as_str()).collect();
+    let function = match (function, callables.as_slice()) {
         (Some(function), _) => function,
         (None, [only]) if script => (*only).to_owned(),
         (None, _) => {
@@ -259,7 +260,7 @@ mod tests {
             ),
             (Some("local-0123"), Some("local"))
         );
-        assert_eq!(installed.interface.public(), ["generate", "fp8", "int8"]);
+        assert_eq!(installed.interface.public(), ["generate"]);
     }
 
     #[test]

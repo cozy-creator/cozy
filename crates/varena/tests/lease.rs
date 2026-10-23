@@ -17,7 +17,7 @@ mod cases {
     use tensorfs::io::Dst;
     use varena::backend::{Access, Backend, Va};
     use varena::lease::wire::{End, ToAgent};
-    use varena::lease::{Agent, Attach, Holdings, Hosting, Identity, Lease, Manager, Refusal, Region};
+    use varena::lease::{Agent, Attach, Holdings, Hosting, Identity, Kind, Lease, Manager, Refusal, Region};
     use varena::ledger::Mode;
     use varena::{GpuId, HostBackend};
 
@@ -38,11 +38,16 @@ mod cases {
         children: Arc<Children>,
     }
 
-    fn host(_dir: &Path, case: &str, capacity: u64) -> Host {
+    fn host(dir: &Path, case: &str, capacity: u64) -> Host {
+        host_with(dir, case, capacity, 0)
+    }
+
+    /// A host whose device keeps `headroom` free, as a card's driver does.
+    fn host_with(_dir: &Path, case: &str, capacity: u64, headroom: u64) -> Host {
         let gpu = GpuId { uuid: format!("lease{}-{case}", std::process::id()), model: "host".into(), memory: capacity };
         let listener = varena::lease::listen(&gpu).unwrap().unwrap();
         let children = Arc::new(Children(Mutex::new(vec![])));
-        let open = Box::new(move || Ok(Arc::new(HostBackend::new(capacity)) as Arc<dyn Backend>));
+        let open = Box::new(move || Ok(Arc::new(HostBackend::with_headroom(capacity, headroom)) as Arc<dyn Backend>));
         let manager = Manager::create(&gpu, Some(capacity), Mode::Dedicated, open, listener, children.clone()).unwrap();
         varena::os::remove_table(&gpu.uuid);
         Host { manager, uuid: gpu.uuid, children }
@@ -128,6 +133,29 @@ mod cases {
         assert_eq!(a.call(&format!("take {} {}", 400 * MIB, region(1))), "ok 1 fresh verified");
         let h = until(&host, |h| h.leased == 400 * MIB);
         assert_eq!(h.created_chunks, 1, "{h:?}");
+        // Undeclared (no region, never retainable): one chunk all the same.
+        let mut b = Agentd::start(&host);
+        assert_eq!(b.call(&format!("take {} none 0", 100 * MIB)), "ok 1 fresh verified");
+        let h = until(&host, |h| h.leased == 500 * MIB);
+        assert_eq!(h.created_chunks, 2, "{h:?}");
+    }
+
+    /// The driver's headroom is never leased, in any mode (cr-215): no sequence of grants leaves
+    /// less than H free, revokes make room inside capacity − H, and an ask only H could serve is
+    /// refused.
+    fn the_driver_headroom_is_never_leased(dir: &Path) {
+        let host = host_with(dir, "headroom", 128 * MIB, 32 * MIB);
+        let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
+        assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 1 fresh verified");
+        assert_eq!(host.manager.holdings().capacity, 96 * MIB);
+        b.send(&format!("take {} {}", 64 * MIB, region(2)));
+        a.wait_rang();
+        assert_eq!(a.call("revokes"), "released 1");
+        assert_eq!(b.answer(), "ok 1 fresh verified");
+        let h = until(&host, |h| h.leased == 64 * MIB);
+        assert!(h.created <= 96 * MIB, "{h:?}");
+        assert!(a.call(&format!("take {} {}", 100 * MIB, region(3))).starts_with("refused"), "only H could serve it");
+        assert!(host.manager.holdings().created <= 96 * MIB);
     }
 
     /// A running pass pins its chunks and asks for more: when only its own pins could give the
@@ -273,6 +301,7 @@ mod cases {
         let cases: Vec<Case> = vec![
             ("grant_maps_and_writes", grant_maps_and_writes),
             ("a_weights_page_is_one_chunk_however_big", a_weights_page_is_one_chunk_however_big),
+            ("the_driver_headroom_is_never_leased", the_driver_headroom_is_never_leased),
             ("an_unpinned_lease_is_revoked_for_another", an_unpinned_lease_is_revoked_for_another),
             ("a_revoke_waits_for_the_pin", a_revoke_waits_for_the_pin),
             ("an_ask_waits_for_anothers_pins", an_ask_waits_for_anothers_pins),
@@ -349,10 +378,12 @@ mod cases {
                 }
                 ["take", bytes, fingerprint, region, rest @ ..] => {
                     let unlanded = rest == ["unlanded"];
+                    // An undeclared page: no region, never retained, still one chunk.
+                    let undeclared = *fingerprint == "none";
                     let a = agent.as_ref().unwrap();
                     let region: u32 = region.parse().unwrap();
-                    let wanted = Region { fingerprint: fingerprint.parse().unwrap(), region };
-                    match a.take(bytes.parse().unwrap(), Some(wanted)) {
+                    let wanted = (!undeclared).then(|| Region { fingerprint: fingerprint.parse().unwrap(), region });
+                    match a.take(bytes.parse().unwrap(), Kind::Weights, wanted) {
                         Ok(leases) => {
                             let adopted = leases.iter().all(|l| l.adopted);
                             let n = leases.len();

@@ -1,5 +1,5 @@
-"""int4.convrot, comfy.asym_w4a8_int8 and comfy.w6a8_int8 (spec §6): ConvRot-basis integer codes, rotated back per
-block of rotation_size columns."""
+"""int4.convrot, comfy.asym_w4a8_int8 (and w4a8.convrot, Cozy's profile of it) and comfy.w6a8_int8 (spec §6):
+ConvRot-basis integer codes, rotated back per block of rotation_size columns."""
 
 import numpy as np
 
@@ -98,6 +98,12 @@ SCHEMES = (
             Part("codebook", ("F32",), lambda c: ("count", 16), required=False),
             Part("correction", ("F32", "BF16", "F16"),
                  lambda c: grid.shape(groups("transposed")(c), c), required=False)),
+           grouped(4)),
+    Scheme("w4a8.convrot", {"group_size": lambda g: g == 16, "rotation": ROTATION, "rotation_size": ROTATION_SIZE},
+           (Part("weight", ("I8",), packed(4)),
+            Part("group_scale", ("F8_E4M3",), lambda c: grid.shape(groups("row_major")(c), c)),
+            Part("scale", ("F32",), row),
+            Part("codebook", ("F32",), lambda c: ("count", 16), required=False)),
            grouped(4)),
     Scheme("comfy.w6a8_int8", {"group_size": W6_GROUP, "rotation": ROTATION, "rotation_size": ROTATION_SIZE},
            (Part("weight", ("I8",), packed(6)),

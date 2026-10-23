@@ -10,7 +10,7 @@ pub mod wire;
 pub use agent::{Agent, Attach, Done, Lease, Ticket};
 pub use manager::{chunks, ExecutorHolding, Holdings, Hosting, Identity, Manager, Opener, Record, CHUNK, PROTOCOL};
 pub use table::{Content, Figures, State, Table, Word};
-pub use wire::{Refusal, Region};
+pub use wire::{Kind, Refusal, Region};
 
 use crate::os::{self, Listener, Stream};
 use crate::{GpuId, Result};

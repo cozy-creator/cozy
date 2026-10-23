@@ -23,7 +23,7 @@ pub mod order;
 pub mod remote;
 pub mod source;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -188,6 +188,8 @@ pub struct Layout {
 
 /// What `model_index.json` holds: the pipeline.
 pub const PIPELINE_FILE: &str = "model_index.json";
+/// A Diffusers modular pipeline's index: a repo file whose entries name component folders.
+pub const MODULAR_INDEX: &str = "modular_model_index.json";
 /// The component of a model without a pipeline, whose folder is the root.
 pub const ROOT_COMPONENT: &str = "model";
 /// A folder's config file: the first of these it holds.
@@ -460,8 +462,11 @@ fn documents(
 ///   Each entry `name: [library, Class]` is a component in folder `name`, tensors or not
 ///   (schedulers, tokenizers, processors), of that library and class as written; a component
 ///   it names no class for has the unknown class.
-/// - Without one, a component named [`ROOT_COMPONENT`] owns the root (a Transformers folder),
-///   and a component's class is its config's ([`config_class`]).
+/// - Without one, a Diffusers modular pipeline's [`MODULAR_INDEX`] (a repo file) names its
+///   component folders the same way, tensors or not.
+/// - Without either, a component named [`ROOT_COMPONENT`] owns the root (a Transformers folder,
+///   or a root config beside other components: the model's own config).
+/// - Without a pipeline, a component's class is its config's ([`config_class`]).
 /// - A pair's library is its package for a dotted module path, and `diffusers` for a Diffusers
 ///   pipeline module (`stable_diffusion`) ([`class_of`]). A class's version is its own config's
 ///   for its library (`_diffusers_version`, `transformers_version`), else one another config of
@@ -495,12 +500,18 @@ pub fn layout(
             _ => None,
         })
         .collect();
+    let modular = match (&pipeline, files.get(MODULAR_INDEX)) {
+        (None, Some(bytes)) => remote::index_folders(bytes)?,
+        _ => Vec::new(),
+    };
     let mut names = tensored.to_vec();
-    names.extend(listed.keys().filter(|n| !tensored.contains(n)).cloned());
+    let rest: BTreeSet<&String> = listed.keys().chain(&modular).filter(|n| !tensored.contains(n)).collect();
+    names.extend(rest.into_iter().cloned());
+    let root_config = !files.contains_key(MODULAR_INDEX) && CONFIGS.iter().any(|c| files.contains_key(*c));
     let root = pipeline.is_none()
-        && (names.is_empty() || names.iter().any(|n| n == ROOT_COMPONENT))
+        && (names.is_empty() || names.iter().any(|n| n == ROOT_COMPONENT) || root_config)
         && !files.keys().any(|p| p.starts_with("model/"));
-    if root && names.is_empty() {
+    if root && !names.iter().any(|n| n == ROOT_COMPONENT) {
         names.push(ROOT_COMPONENT.into());
     }
     let mut components = Vec::new();

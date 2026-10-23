@@ -270,10 +270,15 @@ def gone(memory: weakref.ref[Memory], phase: str) -> None:
     (empty_cache) and retired first."""
     gc.collect()
     if CUDA:
+        # cuBLAS keeps a workspace per handle and stream until cleared, made where its first
+        # matmul ran: in a request's pool, whose segment it keeps (and the memory with it).
+        torch._C._cuda_clearCublasWorkspaces()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         while native.allocator_pending(0):
             time.sleep(1e-3)
+        live = native.allocator_stats(0)[0]
+        check(f"{phase}: its pools' segments all came back", live == 0, (live, native.allocator_stats(0)))
     check(f"{phase}: its memory is gone before the next phase opens one", memory() is None, gc.get_referrers(memory()) if memory() else "")
 
 
@@ -497,8 +502,14 @@ def capped(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, cap
     binding = mem.models[unet].retain()
     check("short: retained, a model bigger than its room is not all resident", not binding.resident(), "resident")
     binding.close()
-    refused = mem.models[unet].hold(free_only=True)
-    check("short: free only, a model bigger than its room is not held, and nothing stays bound", refused is None and native.pins_held() == pins and isinstance(unet.conv_in.weight, Placeholder), (refused, pins, native.pins_held()))
+    # Free only, all or none: held exactly when its weights alone fit its room (its working set
+    # did not: on a GPU the room covers the weights and not the activations beside them).
+    fits = sum(spans) <= capacity - base
+    held = mem.models[unet].hold(free_only=True)
+    if held is not None:
+        held.release()
+    check(f"short: free only, held exactly when its weights fit its room ({sum(spans)} of {capacity - base} B), nothing left bound",
+          (held is not None) == fits and native.pins_held() == pins and isinstance(unet.conv_in.weight, Placeholder), (held, fits, pins, native.pins_held()))
     fills(stats, ceiling)
     print(f"STATS_JSON {stats.json()}", flush=True)
     for derived in (False, True):
@@ -600,13 +611,20 @@ def off_forward(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionM
     del bound
     gc.collect()
     check("off-forward: the pin goes when it dies", native.pins_held() == held, native.pins_held())
+    with torch.inference_mode():  # Klein's VAE reads its batch norm's statistics this way (se-074)
+        view = weight.view(-1)
+        scaled = view.view(1, -1) * 2
+    check("off-forward: a view of a placeholder under inference_mode reads its bytes",
+          torch.equal(view.cpu(), want.reshape(-1)) and torch.equal(scaled.cpu(), want.reshape(1, -1) * 2), "differs")
+    del view, scaled
+    gc.collect()
     try:
         adapter.Placeholder((2,), torch.float32, torch.device("cpu"))._varena_read()
         check("off-forward: a placeholder of no loaded model refuses", False, "read")
     except adapter.Unbound:
         check("off-forward: a placeholder of no loaded model refuses", True)
     reads = {path: n for (_, path), n in mem.off_forward.items()}.get("down_blocks.1.resnets.0", (0, 0))
-    check("off-forward: the reads are counted with their bytes", reads[0] == 3 and reads[1] > 0, mem.off_forward)
+    check("off-forward: the reads are counted with their bytes", reads[0] == 4 and reads[1] > 0, mem.off_forward)
 
 
 def escapes(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel, reference: list[torch.Tensor], derived: bool) -> None:

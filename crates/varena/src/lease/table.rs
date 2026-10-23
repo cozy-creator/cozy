@@ -80,6 +80,10 @@ struct Header {
     revocable: AtomicU64,
     headroom: AtomicU64,
     foreign: AtomicU64,
+    /// 1 while GPU work the agent's holder recorded is not complete: busy, never stalled (a
+    /// kernel longer than the looks is no stall; a stream that never completes is a GPU hang,
+    /// the Runtime's health path).
+    busy: AtomicU64,
 }
 
 /// The manager's figures in a table's header.
@@ -222,6 +226,14 @@ impl Table {
 
     pub fn progressed(&self) {
         self.header().progress.fetch_add(1, Release);
+    }
+
+    pub fn busy(&self) -> bool {
+        self.header().busy.load(Acquire) == 1
+    }
+
+    pub fn set_busy(&self, busy: bool) {
+        self.header().busy.store(u64::from(busy), Release);
     }
 
     fn ack(&self) {
