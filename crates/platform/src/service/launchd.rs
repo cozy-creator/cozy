@@ -1,5 +1,6 @@
 //! A launchd LaunchAgent in the user's GUI domain. `KeepAlive{SuccessfulExit=false}` restarts it
 //! only after a failure, so a stop is a `bootout` (a signalled exit counts as a failure).
+#![allow(unsafe_code)]
 use super::{ServiceSpec, run};
 use crate::{Error, Result, durable, paths::Home};
 use std::{

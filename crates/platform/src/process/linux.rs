@@ -1,4 +1,5 @@
 //! Linux: births from `/proc`, exact handles by pidfd (TensorD `process.rs`).
+#![allow(unsafe_code)]
 use super::{Birth, State, unix};
 use std::{
     fs, io,
@@ -68,8 +69,8 @@ pub(super) fn kill(handle: &Handle, birth: &Birth) -> io::Result<()> {
     // A group's number is not reused while a member lives, so a group this birth leads is its own.
     let leads_group = stat(birth.pid)
         .is_ok_and(|stat| stat.start_ticks == birth.start_ticks && stat.pgrp as u32 == birth.pid);
-    // SAFETY: a live pidfd, a signal number and no siginfo.
     unix::signaled(
+        // SAFETY: a live pidfd, a signal number and no siginfo.
         unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,

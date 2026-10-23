@@ -16,6 +16,7 @@
 //!   bytes are flushed before their name is published, as before.
 //! - **Persistent** — everything else (ext4, xfs, btrfs, zfs, ...), a `statfs` that fails,
 //!   and every non-Linux platform. The safe side: it survives a crash of this machine.
+#![allow(unsafe_code)]
 use std::{fs::File, path::Path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,6 +59,7 @@ pub fn filesystem(path: &Path) -> Filesystem {
             // SAFETY: plain-old-data the call fills, and a NUL-terminated path.
             let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
             #[allow(clippy::unnecessary_cast)] // f_type's width differs by target
+            // SAFETY: as above.
             (unsafe { libc::statfs(c.as_ptr(), &mut stat) } == 0).then_some(stat.f_type as u64)
         });
     match magic {
@@ -193,6 +195,7 @@ mod linux {
         // SAFETY: out-param of the right type on our own descriptor.
         let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
         #[allow(clippy::unnecessary_cast)] // f_type is not an i64 on every target
+        // SAFETY: as above.
         let magic =
             unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) == 0 }.then_some(fs.f_type as i64);
         magic == Some(OVERLAYFS_SUPER_MAGIC)
@@ -223,6 +226,7 @@ mod linux {
         // SAFETY: the vector holds one byte per page of the mapping.
         let ok = unsafe { libc::mincore(p, n, pages.as_mut_ptr()) } == 0
             && pages.iter().all(|b| b & 1 == 1);
+        // SAFETY: unmaps the mapping made above, which nothing else references.
         unsafe { libc::munmap(p, n) };
         ok
     }

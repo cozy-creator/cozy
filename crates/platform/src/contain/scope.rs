@@ -2,6 +2,7 @@
 //! below the machine's where the host delegates one, else a process-tree token. Either
 //! reaches descendants that call `setsid` or double-fork. Lifecycle containment, not a
 //! sandbox: same-UID code can move out of a delegated cgroup or scrub its token.
+#![allow(unsafe_code)]
 use super::TOKEN_ENV;
 use crate::process::{Birth, Exact, State, gone};
 use std::{
@@ -61,6 +62,7 @@ fn writable_unified() -> bool {
         return false;
     }
     let path = std::ffi::CString::new(ROOT).unwrap();
+    // SAFETY: statvfs is plain old data; all-zero is a valid value.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: valid path and writable statvfs.
     unsafe { libc::statvfs(path.as_ptr(), &mut stat) == 0 && stat.f_flag & libc::ST_RDONLY == 0 }

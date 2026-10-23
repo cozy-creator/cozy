@@ -20,3 +20,6 @@ default = ["store"]
 store = ["tensorfs/store"]
 # Test-only fault points on the host tier.
 faults = []
+
+[lints]
+workspace = true

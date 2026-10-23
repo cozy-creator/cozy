@@ -8,14 +8,19 @@
 //! The host tier is Linux-only and answers [`Error::Unsupported`] elsewhere. On Windows the
 //! crate is empty until its tier exists (xs-043 unit WM).
 #![cfg(unix)]
+#![deny(unsafe_code)]
 
 pub use tensorfs::io::{cuda, metrics as ceiling};
 pub mod faults;
+#[allow(unsafe_code)]
 pub mod host;
 pub mod io;
 pub mod layout;
+#[allow(unsafe_code)]
 pub mod ledger;
+#[allow(unsafe_code)]
 pub mod memory;
+#[allow(unsafe_code)]
 pub mod window;
 
 pub use memory::{Gpu, GpuStats, Host, HostPinned, HostSet, Pinned, WeightSet};

@@ -394,7 +394,7 @@ impl HostMem {
         if unsafe { libc::ftruncate(fd.as_raw_fd(), map_len as libc::off_t) } != 0 {
             return Err(os("ftruncate window"));
         }
-        let h = Self::map(fd, data, map_len, n, false, Some(Window { slots, slot_span }))?;
+        let mut h = Self::map(fd, data, map_len, n, false, Some(Window { slots, slot_span }))?;
         // SAFETY: every write lies inside the state page of our writable mapping.
         unsafe {
             let page = h.ptr.add(data);
@@ -437,6 +437,7 @@ impl HostMem {
             || count != n as u64
             || slots == 0
             || slot_span < largest
+            || slot_span % PART_ALIGN != 0
             || slots.checked_mul(slot_span as usize) != Some(data)
             || data.checked_add(meta_len_window(n, slots)) != Some(size)
         {
@@ -624,7 +625,7 @@ impl HostMem {
         // Huge pages cut registration and TLB cost where shmem THP is enabled; advisory.
         shm::advise_huge(ptr as *mut u8, data);
         let share = reopen_as(fd.as_raw_fd(), !sealed)?;
-        let h = HostMem {
+        let mut h = HostMem {
             fd,
             share,
             ptr: ptr as *mut u8,
@@ -638,7 +639,6 @@ impl HostMem {
             readers: Mutex::new(HashMap::new()),
         };
         if fresh {
-            let head = h.head();
             // SAFETY: the extents and the trailer lie inside the state page of our mapping.
             unsafe {
                 let page = h.ptr.add(data);
@@ -652,6 +652,7 @@ impl HostMem {
                 std::ptr::copy_nonoverlapping(names.as_ptr(), at.add(8), names.len());
                 (page.add(map_len - data - 8) as *mut u64).write_unaligned((data as u64).to_le());
             }
+            let head = h.head();
             head.1.copy_from_slice(layout.digest.as_bytes());
             head.0[1] = regions as u64;
             head.0[0] = MAGIC;
@@ -673,8 +674,7 @@ impl HostMem {
         Ok(h)
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn head(&self) -> (&mut [u64; 2], &mut [u8]) {
+    fn head(&mut self) -> (&mut [u64; 2], &mut [u8]) {
         // SAFETY: the state page lies inside our mapping, 8-byte aligned (page aligned).
         unsafe {
             let base = self.ptr.add(self.data);

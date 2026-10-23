@@ -3,6 +3,7 @@
 //! flush each OS has: `fsync`, `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows. Windows has
 //! no POSIX owner or mode: a store there keeps the profile's ACL, so modes and owners are accepted
 //! and left to the filesystem's defaults, and a directory needs no sync (NTFS journals its entries).
+#![allow(unsafe_code)]
 use crate::{Error, Result};
 use std::{
     fs::{self, File, Metadata, OpenOptions},
@@ -326,6 +327,7 @@ pub fn device(path: &Path) -> Result<u64> {
         // glibc's wrapper is newer than the manylinux floor the binary links against.
         let mut stat: libc::statx = unsafe { std::mem::zeroed() };
         let flags = libc::AT_STATX_DONT_SYNC;
+        // SAFETY: as above.
         if unsafe {
             libc::syscall(
                 libc::SYS_statx,
@@ -610,6 +612,7 @@ pub fn space(path: &Path) -> Result<Space> {
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: plain-old-data the call fills, and a NUL-terminated path.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
         if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
             return Err(io::Error::last_os_error().into());
         }

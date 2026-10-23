@@ -1,5 +1,6 @@
 //! Windows: a handle crosses by being duplicated into the peer's process; the stream carries a
 //! zero marker byte and its value there.
+#![allow(unsafe_code)]
 use super::Peer;
 use crate::{Error, Result, ipc::LocalStream};
 use std::{

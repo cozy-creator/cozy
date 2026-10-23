@@ -6,6 +6,7 @@
 //! The test needs a descriptor on the file, and closing any descriptor on an inode drops every
 //! POSIX lock this process holds on it (SQLite's own included), so the probe descriptor for an
 //! inode, once opened, is never closed. Windows' locks name no holder.
+#![allow(unsafe_code)]
 use crate::{Error, Result, durable};
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
@@ -233,6 +234,7 @@ mod sys {
             lock.l_whence = libc::SEEK_SET as _;
             lock.l_start = start as _;
             lock.l_len = len as _;
+            // SAFETY: a lock query on a descriptor we hold, into a writable flock.
             if unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_GETLK, &mut lock) } != 0 {
                 return Err(io::Error::last_os_error().into());
             }

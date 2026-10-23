@@ -7,6 +7,7 @@
 //! its acceptance. From then on, the task follows the run from the durable cursor to its outcome.
 //! A Calcifer that stops leaves accepted work running; the next one resumes each run from the
 //! cursor.
+#![forbid(unsafe_code)]
 mod access;
 pub mod api;
 mod lanes;

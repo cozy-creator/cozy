@@ -1,5 +1,6 @@
 //! Processes named by their birth, never by a bare PID, and process trees ended whole.
 //! Nothing here kills because time passed: callers decide from what they measured.
+#![allow(unsafe_code)]
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{

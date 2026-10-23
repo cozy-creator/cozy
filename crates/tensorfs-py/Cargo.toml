@@ -27,3 +27,6 @@ tracing-subscriber.workspace = true
 default = ["store"]
 store = ["tensorfs/store", "varena/store"]
 extension-module = ["pyo3/extension-module"]
+
+[lints]
+workspace = true

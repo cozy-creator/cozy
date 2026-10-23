@@ -1,4 +1,5 @@
 //! Unix: Unix sockets.
+#![allow(unsafe_code)]
 use crate::{Error, Result, process::Exact};
 use std::{
     io,
