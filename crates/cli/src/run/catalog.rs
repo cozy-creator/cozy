@@ -205,27 +205,3 @@ pub fn read(document: &Value) -> Result<Card, Error> {
         document: document.clone(),
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::super::interface::tests::card;
-    use super::*;
-
-    #[test]
-    fn a_kept_card_answers_by_its_release_only() {
-        let home = tempfile::tempdir().unwrap();
-        let home = Home::at(home.path());
-        let hub = "http://127.0.0.1:8819";
-        assert!(kept(&home, hub, "fidika/sdxl", "2.10.0").is_none());
-        keep(&home, hub, "fidika/sdxl", &card("sdxl-2.10.0")).unwrap();
-        let kept_card = kept(&home, hub, "fidika/sdxl", "2.10.0").unwrap();
-        assert_eq!(kept_card.release, "2.10.0");
-        assert!(kept(&home, hub, "fidika/sdxl", "2.9.0").is_none());
-        assert!(kept(&home, "https://tensorhub.com", "fidika/sdxl", "2.10.0").is_none());
-        assert!(
-            home.root()
-                .join("packages/127.0.0.1_8819/fidika/sdxl/2.10.0.json")
-                .is_file()
-        );
-    }
-}

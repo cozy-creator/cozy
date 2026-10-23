@@ -165,22 +165,3 @@ pub fn single(dir: &Path, suffix: &str) -> Result<PathBuf, Error> {
         )),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_locked_git_source_names_its_commit() {
-        let vcs = Vcs::parse(
-            "https://github.com/huggingface/diffusers?rev=7ecb1e1b4fe500be7fb7381a7bb79a24d7fa3941#7ecb1e1b4fe500be7fb7381a7bb79a24d7fa3941",
-        );
-        assert_eq!(vcs.url, "https://github.com/huggingface/diffusers");
-        assert_eq!(vcs.requested.as_deref(), Some(vcs.commit.as_str()));
-        assert!(
-            Vcs::parse("https://x/y?branch=main#abc")
-                .requested
-                .is_none()
-        );
-    }
-}

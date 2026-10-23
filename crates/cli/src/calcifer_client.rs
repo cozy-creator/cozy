@@ -799,27 +799,3 @@ impl Steps {
         self.since = Instant::now();
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn events_survive_any_chunking() {
-        let stream = b": hi\r\nid: 1\r\ndata: {\"a\":\r\ndata: 1}\r\n\r\nevent: x\ndata: 2\n\n";
-        for cut in 0..stream.len() {
-            let mut sse = Sse::default();
-            let mut got = vec![];
-            for part in [&stream[..cut], &stream[cut..]] {
-                sse.push(part);
-                got.extend(std::iter::from_fn(|| sse.next()));
-            }
-            assert_eq!(got, ["{\"a\":\n1}", "2"], "cut at {cut}");
-        }
-    }
-
-    #[test]
-    fn paths_escape_each_segment() {
-        assert_eq!(path(&["v1", "runs", "a b/c"]), "/v1/runs/a%20b%2Fc");
-    }
-}

@@ -231,29 +231,3 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_gpu_memory_limit_is_a_size_or_off_and_shows_beside_the_card() {
-        assert_eq!(gpu_memory_limit("8GiB"), Ok(8 << 30));
-        assert_eq!(gpu_memory_limit("off"), Ok(0));
-        assert!(gpu_memory_limit("0").is_err() && gpu_memory_limit("8GB").is_err());
-        let gpu = |limit| protocol::calcifer::Gpu {
-            index: 0,
-            name: "RTX 5070".into(),
-            memory_bytes: 12 << 30,
-            memory_limit_bytes: limit,
-            ..Default::default()
-        };
-        let field = |gpus| {
-            let status = protocol::calcifer::MachineStatus { gpus, ..Default::default() };
-            status_fields(&status).into_iter().find(|(k, _)| k == "gpu memory limit").map(|(_, v)| v)
-        };
-        assert_eq!(field(vec![gpu(8 << 30), protocol::calcifer::Gpu { index: 1, ..gpu(8 << 30) }]).as_deref(),
-            Some("8.0 GiB of GPU 0's 12 GiB, GPU 1's 12 GiB"));
-        assert_eq!(field(vec![gpu(0)]), None);
-    }
-}

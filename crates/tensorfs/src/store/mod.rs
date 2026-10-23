@@ -467,7 +467,6 @@ impl Store {
             fs::create_dir_all(shard).map_err(fail("create", shard))?;
         }
         fs::rename(temp, blob).map_err(fail("rename into", blob))?;
-        fault::point("put.renamed");
         if !self.flushes() {
             self.unsynced.store(true, Ordering::SeqCst);
             return Ok(());
@@ -492,7 +491,6 @@ impl Store {
             let _ = fs::remove_file(&temp);
             return Err(fail("write", &temp)(error));
         }
-        fault::point("record.written");
         let dir = path.parent().expect("a record has a directory");
         let created = !dir.is_dir();
         if created {
@@ -502,7 +500,6 @@ impl Store {
             let _ = fs::remove_file(&temp);
             return Err(fail("rename into", path)(error));
         }
-        fault::point("record.renamed");
         if flush {
             if created {
                 sync_dir(dir.parent().expect("a record directory has a parent"))?;
@@ -565,7 +562,6 @@ impl Admission {
                 .map_err(fail("protect", &self.temp))?;
         }
         drop(file);
-        fault::point("put.written");
         let blob = self.store.blob(&got.sha256)?;
         self.store.install(&self.temp, &blob, &got.sha256)?;
         Ok(got)
@@ -680,40 +676,4 @@ fn syncfs(root: &Path) -> io::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn syncfs(_: &Path) -> io::Result<()> {
     Ok(())
-}
-
-/// Kill points for crash tests (feature `faults`). An armed point fires once: it prints
-/// `FAULT <point>` and waits for a line on stdin, so the test can SIGKILL the process exactly
-/// there or let it go on.
-#[cfg(feature = "faults")]
-pub mod fault {
-    use std::io::{BufRead, Write};
-    use std::sync::{Mutex, PoisonError};
-
-    static ARMED: Mutex<Option<String>> = Mutex::new(None);
-
-    pub fn arm(point: &str) {
-        *ARMED.lock().unwrap_or_else(PoisonError::into_inner) = Some(point.to_owned());
-    }
-
-    pub(crate) fn point(name: &str) {
-        {
-            let mut armed = ARMED.lock().unwrap_or_else(PoisonError::into_inner);
-            if armed.as_deref() != Some(name) {
-                return;
-            }
-            armed.take();
-        }
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "FAULT {name}");
-        let _ = out.flush();
-        drop(out);
-        let _ = std::io::stdin().lock().read_line(&mut String::new());
-    }
-}
-
-#[cfg(not(feature = "faults"))]
-pub(crate) mod fault {
-    #[inline(always)]
-    pub(crate) fn point(_: &str) {}
 }

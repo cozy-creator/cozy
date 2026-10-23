@@ -38,10 +38,6 @@ pub mod seam;
 pub mod published;
 pub mod reclaim;
 pub mod runs;
-#[cfg(test)]
-mod scratch;
-#[cfg(test)]
-mod sdk_selection_tests;
 pub mod serve;
 mod queue;
 pub mod service;

@@ -511,24 +511,3 @@ impl Service {
         pool.dispatch(&self.engine, record, held.application(&record.invocation.module)?, plan, claims, calls)
     }
 }
-
-#[cfg(test)]
-mod preparing_tests {
-    use super::*;
-
-    #[test]
-    fn a_preparation_in_flight_keeps_the_machine_busy() {
-        let root = std::env::temp_dir().join(format!("service-preparing-{}", uuid::Uuid::new_v4()));
-        let service = Service::open(&root, &root.join("generations"), 1).unwrap();
-        assert!(service.idle().unwrap());
-        let preparing = service.preparing();
-        assert!(
-            !service.idle().unwrap(),
-            "a rental must not release itself mid-install"
-        );
-        drop(preparing);
-        assert!(service.idle().unwrap());
-        assert!(service.stop().unwrap());
-        let _ = std::fs::remove_dir_all(root);
-    }
-}

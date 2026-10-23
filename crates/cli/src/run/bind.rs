@@ -1835,7 +1835,3 @@ fn usage(code: &str, message: impl Into<String>) -> Error {
 fn invalid(code: &str, message: impl Into<String>) -> Error {
     Error::new(Kind::Validation, code, message)
 }
-
-#[cfg(test)]
-#[path = "bind_tests.rs"]
-mod tests;

@@ -759,7 +759,6 @@ impl HostMem {
         self.registrations.register(off, len).map_err(Into::into)
     }
     pub fn pin_region(&self, region: u32, off: u64, len: u64) -> bool {
-        if crate::faults::hit("pin").is_err() { return false; }
         self.registrations.pin_region(region, off, len)
     }
     pub fn unpin_region(&self, region: u32, off: u64) -> Result<()> {

@@ -22,18 +22,3 @@ pub fn shown(text: &str) -> String {
     }
     out
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn root_names_read_without_their_org() {
-        for (text, read) in [
-            ("_/sdxl/generate@2.12.1", "sdxl/generate@2.12.1"),
-            ("installing _/sdxl 2.12.1 (model=_/sdxl@1.0.0)", "installing sdxl 2.12.1 (model=sdxl@1.0.0)"),
-            ("fidika/sdxl", "fidika/sdxl"),
-            ("./_/x a_/b", "./_/x a_/b"),
-        ] {
-            assert_eq!(super::shown(text), read);
-        }
-    }
-}

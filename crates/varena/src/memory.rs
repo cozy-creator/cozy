@@ -23,9 +23,6 @@ use crate::layout::{align_up, Layout, PART_ALIGN, REGION_ALIGN};
 use tensorfs::io::{self as byte_io, Copy, Dst, ReadOpts, Src};
 use crate::{lock, Error, Result};
 
-#[cfg(test)]
-mod tests;
-
 /// Scratch slots kept while a region streams; more exist only while every one is pinned.
 const SLOTS: usize = 3;
 /// Idle chunks kept after an eviction for the next map; the rest go back to the driver.
@@ -258,7 +255,6 @@ impl Fill {
     fn landed(&self) -> Result<bool> {
         match &*lock(&self.state) {
             Some(Filled::Ready(ready)) => {
-                crate::faults::hit("fill-query")?;
                 ready.done()
             }
             Some(Filled::Failed(_)) => Ok(true),
@@ -832,7 +828,6 @@ impl Inner {
     fn drain_copy(&self) -> Result<()> {
         self.check()?;
         let _c = CtxGuard::enter(self.ctx)?;
-        crate::faults::hit("copy-drain")?;
         call!("cuStreamSynchronize", stream_synchronize(self.copy))
     }
 
@@ -849,8 +844,8 @@ impl Inner {
     fn run(self: &Arc<Self>, job: &Job, _run: &mut Run) -> Result<(EvRef, EvRef)> {
         let s = self.copy;
         for w in &job.waits {
-            if let Err(e) = crate::faults::hit("release-wait").and_then(|_| wait_in(s, w)) {
-                let completed = crate::faults::hit("release-wait-sync").and_then(|_| job.waits.iter().try_for_each(|ev| ev.sync()));
+            if let Err(e) = wait_in(s, w) {
+                let completed = job.waits.iter().try_for_each(|ev| ev.sync());
                 return Err(self.failed_dependencies(e, &job.waits, completed));
             }
         }
@@ -873,7 +868,6 @@ impl Inner {
             }
             _ => {}
         }
-        crate::faults::hit("fill-record")?;
         Ok((start, self.events.record(s, true)?))
     }
 
@@ -1151,7 +1145,7 @@ impl Drop for Inner {
             self.retain_resources();
             return;
         }
-        let Ok(d) = crate::faults::hit("inner-drop-driver").and_then(|_| cuda::driver().map_err(Error::from)) else { self.retain_resources(); return };
+        let Ok(d) = cuda::driver().map_err(Error::from) else { self.retain_resources(); return };
         let Ok(_c) = CtxGuard::enter(self.ctx) else { self.retain_resources(); return };
         // SAFETY: our live stream in its current context. Drop cannot use the fallible macro.
         if self.check().is_err() || cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(self.copy) }).is_err() {
@@ -1460,7 +1454,7 @@ impl WeightSet {
     }
 
     fn unregister_host(&self) -> bool {
-        let released = crate::faults::hit("set-unregister").and_then(|_| self.weights.host.as_ref().map_or(Ok(()), HostMem::unpin_all));
+        let released = self.weights.host.as_ref().map_or(Ok(()), HostMem::unpin_all);
         match released {
             Ok(()) => true,
             Err(e) => { self.gpu.inner.poison(e); false }
@@ -1474,7 +1468,7 @@ impl Drop for WeightSet {
         if g.check().is_err() {
             return;
         }
-        let _c = match crate::faults::hit("set-drop-context").and_then(|_| CtxGuard::enter(g.ctx).map_err(Error::from)) {
+        let _c = match CtxGuard::enter(g.ctx).map_err(Error::from) {
             Ok(c) => c,
             Err(e) => { g.poison(e); return; }
         };
@@ -1626,11 +1620,9 @@ impl Drop for Pinned {
             return;
         }
         self.finish_streams(|stream| {
-            let _c = crate::faults::hit("pin-release-context").and_then(|_| CtxGuard::enter(g.ctx).map_err(Error::from))?;
-            crate::faults::hit("pin-release")?;
+            let _c = CtxGuard::enter(g.ctx).map_err(Error::from)?;
             g.events.record(stream as CUstream, false)
         }, |stream| {
-            crate::faults::hit("pin-release-drain")?;
             let _c = CtxGuard::enter(g.ctx)?;
             call!("cuStreamSynchronize", stream_synchronize(stream as CUstream))
         });

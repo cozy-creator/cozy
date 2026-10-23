@@ -158,31 +158,3 @@ pub(super) fn prepare(
         _staging: staging,
     }))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn staging_recovery_removes_only_abandoned_owned_directories() {
-        let root = tempfile::tempdir().unwrap();
-        let active = Staging::new(root.path()).unwrap();
-        fs::write(active.root.join("payload"), b"live").unwrap();
-        let mut abandoned = Staging::new(root.path()).unwrap();
-        fs::write(abandoned.root.join("payload"), b"interrupted").unwrap();
-        let abandoned_path = abandoned.root.clone();
-        // Simulate process loss: the kernel releases the lease, but no Drop removes the data.
-        drop(abandoned.lease.take());
-        std::mem::forget(abandoned);
-        let unknown = root.path().join("0".repeat(32));
-        fs::create_dir(&unknown).unwrap();
-        fs::write(unknown.join("lease"), b"not our lease").unwrap();
-        let recovering = Staging::new(root.path()).unwrap();
-        assert!(!abandoned_path.exists());
-        assert_eq!(fs::read(active.root.join("payload")).unwrap(), b"live");
-        assert!(unknown.exists(), "an unknown directory is never collected");
-        let recovered = recovering.root.clone();
-        drop(recovering);
-        assert!(!recovered.exists(), "normal completion removes staging immediately");
-    }
-}

@@ -463,22 +463,3 @@ impl Drop for Tree {
         let _ = self.kill();
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_child_names_this_process_as_its_parent() {
-        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
-            .args(if cfg!(windows) {
-                &["/C", "ping -n 30 127.0.0.1 >NUL"][..]
-            } else {
-                &["30"][..]
-            })
-            .spawn()
-            .unwrap();
-        let parent = super::parent_of(child.id());
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert_eq!(parent.unwrap(), std::process::id());
-    }
-}

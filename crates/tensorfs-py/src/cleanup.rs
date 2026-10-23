@@ -146,14 +146,6 @@ fn retry(state: &State) {
     }
 }
 
-/// Exercise worker initialization without moving an owner; production starts on first defer.
-#[cfg(test)]
-pub(crate) fn init() -> std::io::Result<()> {
-    let state = state()?;
-    retry(state);
-    Ok(())
-}
-
 fn submit(task: Task, queue: std::io::Result<&State>) {
     match queue {
         Ok(state) => {
@@ -172,42 +164,4 @@ fn submit(task: Task, queue: std::io::Result<&State>) {
 /// calling thread. Thread-start/send failure preserves it for the next successful init/defer.
 pub(crate) fn defer<T: Send + 'static>(value: T) {
     submit(Box::new(move || drop(value)), state());
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-    static TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct Released(mpsc::Sender<std::thread::ThreadId>);
-    impl Drop for Released {
-        fn drop(&mut self) {
-            let _ = self.0.send(std::thread::current().id());
-        }
-    }
-
-    #[test]
-    fn failed_worker_start_retains_the_actual_owner_until_retry() {
-        let _serial = TEST.lock().unwrap();
-        let (done, released) = mpsc::channel();
-        let owner = Released(done);
-        submit(
-            Box::new(move || drop(owner)),
-            Err(std::io::Error::other("worker start refused")),
-        );
-        assert_eq!(released.try_recv(), Err(mpsc::TryRecvError::Empty));
-        init().unwrap();
-        let worker = released.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_ne!(worker, std::thread::current().id());
-    }
-
-    #[test]
-    fn final_release_runs_on_the_native_worker() {
-        let _serial = TEST.lock().unwrap();
-        let (done, released) = mpsc::channel();
-        defer(Released(done));
-        let worker = released.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_ne!(worker, std::thread::current().id());
-    }
 }

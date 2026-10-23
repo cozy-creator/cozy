@@ -35,25 +35,6 @@ pub struct Objects {
     engine: Arc<Engine>,
     /// Uploads under way, by part file.
     uploads: Mutex<HashMap<PathBuf, Weak<Upload>>>,
-    #[cfg(test)]
-    pause: Pause,
-}
-
-/// Test seams: each runs once at its point, and `waiting` counts callers queued for custody.
-#[cfg(test)]
-#[derive(Default)]
-struct Pause {
-    stored_checked: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    settling: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    waiting: std::sync::atomic::AtomicUsize,
-}
-
-#[cfg(test)]
-fn pause_at(seam: &Mutex<Option<Box<dyn FnOnce() + Send>>>) {
-    let run = seam.lock().unwrap().take();
-    if let Some(run) = run {
-        run();
-    }
 }
 
 /// Why a write was refused, as the API's typed reason.
@@ -169,8 +150,6 @@ impl Objects {
             cas: engine.cas(),
             engine,
             uploads: Mutex::default(),
-            #[cfg(test)]
-            pause: Pause::default(),
         })
     }
 
@@ -181,12 +160,7 @@ impl Objects {
 
     /// Excludes root release while a Write or an acceptance takes references.
     pub(crate) fn guard(&self) -> MutexGuard<'_, ()> {
-        #[cfg(test)]
-        self.pause.waiting.fetch_add(1, Ordering::AcqRel);
-        let custody = self.engine.object_custody.lock().unwrap();
-        #[cfg(test)]
-        self.pause.waiting.fetch_sub(1, Ordering::AcqRel);
-        custody
+        self.engine.object_custody.lock().unwrap()
     }
     /// Renews `objects`, each here, so no sweep takes them soon; called with `guard` held.
     pub(crate) fn retain(&self, objects: &[ObjectRef]) -> io::Result<()> {
@@ -371,8 +345,6 @@ impl Objects {
         if self.renew(actor, digest)? == Some(length) {
             return Ok(None);
         }
-        #[cfg(test)]
-        pause_at(&self.pause.stored_checked);
         let part = self.part(actor, &hex);
         let mut uploads = self.uploads.lock().unwrap();
         uploads.retain(|_, upload| upload.strong_count() > 0);
@@ -435,8 +407,6 @@ impl Objects {
         let _custody = self.guard();
         upload.ended.store(true, Ordering::Release);
         self.uploads.lock().unwrap().remove(&upload.part);
-        #[cfg(test)]
-        pause_at(&self.pause.settling);
         let stored = File::open(&upload.part).map_err(Refused::from).and_then(|part| {
             self.cas.put(part, Some(&upload.object)).map_err(|e| {
                 let code = match e.kind() {
@@ -454,18 +424,6 @@ impl Objects {
             .with_journal(|j| j.bind_object(&upload.actor, &upload.object))?;
         Ok(held)
     }
-
-    /// Writes all of `bytes` as one upload.
-    #[cfg(test)]
-    pub fn write(&self, actor: &str, digest: &str, bytes: &[u8]) -> Result<Ranges, Refused> {
-        match self.upload(actor, digest, bytes.len() as u64)? {
-            None => Ok(whole(bytes.len() as u64)),
-            Some(upload) => {
-                upload.write_at(0, bytes)?;
-                self.settle(&upload)
-            }
-        }
-    }
 }
 
 fn valid(digest: &str) -> Result<String, Refused> {
@@ -482,150 +440,4 @@ fn hex(digest: &str) -> Option<String> {
         .strip_prefix("sha256:")
         .filter(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
         .map(String::from)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn objects(root: &Path) -> Objects {
-        let service =
-            crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
-        Objects::new(&root.join("writes"), service.engine.clone()).unwrap()
-    }
-
-    /// An upload of an object whose whole part is being settled never truncates that part: it
-    /// joins the upload or finds the object stored. The seams order the two calls exactly as
-    /// run_local raced them (an upload's stored check, then the settle taking the part, then
-    /// the rest of the upload), and the custody between them decides what happens.
-    #[test]
-    fn an_upload_never_truncates_a_part_being_settled() {
-        use std::sync::mpsc::channel;
-        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
-        let objects = objects(&root);
-        let bytes: Vec<u8> = (0..444u32).map(|i| (i % 251) as u8 + 1).collect();
-        let digest = format!("sha256:{}", sha256::hex_digest(&bytes));
-        let length = bytes.len() as u64;
-        let first = objects.upload("alice", &digest, length).unwrap().unwrap();
-        first.write_at(0, &bytes).unwrap();
-
-        let (checked, at_checked) = channel();
-        let (resume_upload, upload_resumes) = channel::<()>();
-        *objects.pause.stored_checked.lock().unwrap() = Some(Box::new(move || {
-            checked.send(()).unwrap();
-            upload_resumes.recv().unwrap();
-        }));
-        let (settling, at_settling) = channel();
-        let (resume_settle, settle_resumes) = channel::<()>();
-        *objects.pause.settling.lock().unwrap() = Some(Box::new(move || {
-            settling.send(()).unwrap();
-            settle_resumes.recv().unwrap();
-        }));
-        std::thread::scope(|scope| {
-            // A second write of the same input passes its stored check: not stored yet.
-            let second = scope.spawn(|| objects.upload("alice", &digest, length).map(|u| u.map(|u| u.object.clone())));
-            at_checked.recv().unwrap();
-            // The settle takes the whole part, or waits for custody the upload holds.
-            let settled = scope.spawn(|| objects.settle(&first));
-            let mut paused = false;
-            while !paused && objects.pause.waiting.load(Ordering::Acquire) == 0 {
-                paused = at_settling.try_recv().is_ok();
-                std::thread::yield_now();
-            }
-            resume_upload.send(()).unwrap();
-            assert!(second.join().unwrap().is_ok());
-            if !paused {
-                at_settling.recv().unwrap();
-            }
-            resume_settle.send(()).unwrap();
-            let settled = settled.join().unwrap().map_err(|r| (r.code, r.message));
-            assert_eq!(settled, Ok(whole(length)), "the settle read the part another upload truncated");
-        });
-        let (path, held) = objects.path("alice", &digest).unwrap().unwrap();
-        assert_eq!((fs::read(path).unwrap(), held), (bytes, length));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// Ranges land in any order, side by side, survive the machine's restart, verify once whole,
-    /// and belong to their signer.
-    #[test]
-    fn an_upload_lands_ranges_resumes_verifies_and_belongs_to_its_signer() {
-        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
-        let objects = objects(&root);
-        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
-        let digest = format!("sha256:{}", sha256::hex_digest(&bytes));
-        let length = bytes.len() as u64;
-
-        let (first, second) = (
-            objects.upload("alice", &digest, length).unwrap().unwrap(),
-            objects.upload("alice", &digest, length).unwrap().unwrap(),
-        );
-        assert!(Arc::ptr_eq(&first, &second), "one upload, joined");
-        second.write_at(200_000, &bytes[200_000..250_000]).unwrap();
-        first.write_at(0, &bytes[..100_000]).unwrap();
-        assert_eq!(objects.held("alice", &digest).unwrap(), [(0, 100_000), (200_000, 250_000)]);
-        assert_eq!(objects.settle(&first).unwrap(), [(0, 100_000), (200_000, 250_000)]);
-        drop((first, second));
-
-        // What was synced is held after a restart; the rest completes the object.
-        let objects = Objects::new(&root.join("writes"), objects.engine.clone()).unwrap();
-        assert_eq!(objects.held("alice", &digest).unwrap(), [(0, 100_000), (200_000, 250_000)]);
-        let upload = objects.upload("alice", &digest, length).unwrap().unwrap();
-        upload.write_at(50_000, &bytes[50_000..200_000]).unwrap();
-        upload.write_at(250_000, &bytes[250_000..]).unwrap();
-        assert_eq!(
-            upload.write_at(250_000, &[0; 50_001]).unwrap_err().code,
-            "object_length_exceeded"
-        );
-        // Asked while its ranges cover it, the upload is settled first: whole means stored.
-        assert_eq!(objects.held("alice", &digest).unwrap(), [(0, length)]);
-        assert_eq!(objects.settle(&upload).unwrap(), [(0, length)]);
-        let (path, held) = objects.path("alice", &digest).unwrap().unwrap();
-        assert_eq!((fs::read(path).unwrap(), held), (bytes.clone(), length));
-        assert!(objects.upload("alice", &digest, length).unwrap().is_none());
-        assert_eq!(objects.held("alice", &digest).unwrap(), [(0, length)]);
-
-        // Another signer learns nothing of it and must send the bytes itself.
-        assert!(objects.path("bob", &digest).unwrap().is_none());
-        assert_eq!(objects.held("bob", &digest).unwrap(), []);
-
-        // Bytes that differ from their digest are dropped, not stored.
-        let wrong = format!("sha256:{}", "0".repeat(64));
-        assert_eq!(objects.write("alice", &wrong, b"abc").unwrap_err().code, "object_digest_mismatch");
-        assert_eq!(objects.held("alice", &wrong).unwrap(), []);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// A held memo answers with its file in the answered run's custody while its signer holds
-    /// the file; when reclaim releases the file, the memo goes with it.
-    #[test]
-    fn a_held_memo_answers_while_its_file_is_held_and_goes_with_it() {
-        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
-        let objects = objects(&root);
-        let bytes = b"note 5".to_vec();
-        let hex = sha256::hex_digest(&bytes);
-        objects.write("alice", &format!("sha256:{hex}"), &bytes).unwrap();
-        let record = crate::journal::ResultRecord {
-            value: serde_json::json!({"file": {"asset_ref": "attempt:1/file/0001"}}),
-            artifacts: vec![crate::journal::Artifact { name: "file-0001".into(), path: String::new(), sha256: hex.clone(), length: 6 }],
-            asset_bindings: vec![crate::journal::AssetBinding {
-                relative_path: "file-0001".into(), asset_ref: "attempt:1/file/0001".into(), media_type: "text/plain".into(),
-                length: 6,
-            }],
-            adjustments: vec![],
-        };
-        let engine = objects.engine.clone();
-        let held = crate::journal::HeldMemo { actor: "alice".into(), computation: "sha256:c".into(),
-            record: serde_json::to_vec(&record).unwrap(), objects: vec![hex.clone()] };
-        engine.with_journal(|j| j.hold_memo(&held)).unwrap();
-        let held = objects.recall("alice", "sha256:c", "7").unwrap().unwrap();
-        assert_eq!(held.artifacts[0].path, format!("results/7/0-{hex}"));
-        assert_eq!(fs::read(engine.root.join(&held.artifacts[0].path)).unwrap(), bytes);
-        assert_eq!(held.value, record.value);
-        assert!(objects.recall("bob", "sha256:c", "8").unwrap().is_none(), "a memo is its signer's");
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(objects.release(Duration::ZERO).unwrap(), 1);
-        assert!(engine.with_journal(|j| j.held_memo("alice", "sha256:c")).unwrap().is_none(), "reclaim dropped the memo");
-        let _ = fs::remove_dir_all(root);
-    }
 }

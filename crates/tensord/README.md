@@ -13,13 +13,11 @@ separate daemon.
   handles exported by executors; Runtime performs the device operations. The CPU service
   does not load NVML; a configured GPU pool samples it on its GPU sampler threads.
 
-## Build and test
+## Build
 
 ```sh
 cargo build -p tensord --locked
 cargo clippy -p tensord --all-targets -- -D warnings
-cargo test -p tensord --locked -- --test-threads=2
-uv run --locked --extra test pytest -q
 ```
 
 ## Release

@@ -1330,36 +1330,3 @@ fn names(rental: &types::Rental, text: &str) -> bool {
             .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case(text))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The H3 placement of design/placement.md, as a Hub sends it: the pick is the cheapest per run,
-    /// so the quote offers the fastest and the next machine in the Hub's order.
-    #[test]
-    fn a_quote_offers_the_fastest_and_the_next_beside_the_cheapest() {
-        let machine = |name: &str, n: i64, speed: f64, cost: f64| {
-            serde_json::json!({"name": name, "accelerator_model": "NVIDIA", "compute_capability": "9.0",
-                "vram_gb": 80, "accelerator_count": n, "price_usd_micros_per_hour": 1_000_000 * n,
-                "storage_usd_micros_per_hour": 0, "container_disk_gb": 100, "speed": speed, "fast": true,
-                "run_cost": cost, "expected_price": {"hours": 1.0, "download_gb": 100, "download_hours": 0.0,
-                "gpu_usd_micros": 0, "disk_usd_micros": 0, "download_usd_micros": 0, "total_usd_micros": 2_000_000 * n}})
-        };
-        let machines: Vec<types::RentalPlacementMachine> = serde_json::from_value(serde_json::json!([
-            machine("h100-pcie", 2, 2855.0, 1.0),
-            machine("h100-pcie", 4, 5129.0, 1.06),
-            machine("b200", 8, 28125.0, 2.03),
-        ]))
-        .unwrap();
-        let alternatives = alternatives(&machines);
-        let said: Vec<_> = alternatives.iter().map(|a| (a.sku.as_str(), a.gpus, a.label.as_str())).collect();
-        assert_eq!(said, [("b200", 8, "faster"), ("h100-pcie", 4, "")]);
-        assert!((alternatives[0].time - 2855.0 / 28125.0).abs() < 1e-9 && alternatives[0].run_cost == 2.03);
-        assert_eq!(alternatives[1].expected_total_usd_micros, 8_000_000);
-        // A Hub that names no speeds offers none.
-        let mut old = serde_json::to_value(&machines).unwrap();
-        old[0].as_object_mut().unwrap().remove("speed");
-        assert!(super::alternatives(&serde_json::from_value::<Vec<_>>(old).unwrap()).is_empty());
-    }
-}

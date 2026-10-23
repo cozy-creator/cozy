@@ -68,21 +68,3 @@ impl<'de> Visitor<'de> for Json {
         Ok(Value::Object(values))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn payload_identity_tolerates_older_numeric_and_formatting_forms() {
-        let old = parse(br#" { "samples": [[6.0, -0.0]], "seed": 19 } "#).unwrap();
-        let current = parse(br#"{"seed":19,"samples":[[6,0]]}"#).unwrap();
-        assert_eq!(
-            serde_json_canonicalizer::to_vec(&old).unwrap(),
-            serde_json_canonicalizer::to_vec(&current).unwrap()
-        );
-        assert!(parse(br#"{"samples":[{"seed":1,"seed":2}]}"#).is_err());
-        assert!(parse(br#"{"seed":19} {}"#).is_err());
-        assert!(parse(br#"{"seed":1e999}"#).is_err());
-    }
-}

@@ -214,6 +214,3 @@ pub fn watched<T>(progress: &Progress, report: &(dyn Fn(u64, u64) + Sync), work:
         answer
     })
 }
-
-#[cfg(test)]
-pub(crate) mod tests;

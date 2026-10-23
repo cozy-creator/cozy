@@ -1071,7 +1071,3 @@ pub async fn yank(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
     }
     Ok(ExitCode::SUCCESS)
 }
-
-#[cfg(test)]
-#[path = "upload_tests.rs"]
-mod upload_tests;

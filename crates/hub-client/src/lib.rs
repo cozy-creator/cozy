@@ -6,8 +6,6 @@
 mod auth;
 mod device;
 mod raw;
-#[cfg(feature = "testing")]
-pub mod testing;
 
 #[allow(clippy::all, unused_imports)]
 mod generated {

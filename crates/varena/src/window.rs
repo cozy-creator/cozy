@@ -102,7 +102,6 @@ impl OpenWindow {
         if let Some(s) = held.iter().position(Option::is_none) {
             return Some(s);
         }
-        crate::faults::stall("window-victim"); // tests: claims arrive after the loop's snapshot
         let region = |s: usize| held[s].unwrap();
         let mut order: Vec<usize> = (0..held.len()).filter(|&s| !want.contains(&region(s))).collect();
         if urgent {

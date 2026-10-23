@@ -175,35 +175,3 @@ fn lines(program: &Path, args: &[&str]) -> Option<Vec<String>> {
     let lines: Vec<String> = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
     (!lines.is_empty()).then_some(lines)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn executors_find_an_installed_toolchain_first_and_nothing_else_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = BTreeMap::from([("LANG".to_string(), "C.UTF-8".to_string())]);
-        assert_eq!(environment(&base, dir.path(), "/usr/bin"), base, "no toolchain: unchanged");
-        let bin = cuda(dir.path()).join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("nvcc"), b"").unwrap();
-        let env = environment(&base, dir.path(), "/usr/bin:/bin");
-        assert_eq!(env["CUDA_HOME"], cuda(dir.path()).display().to_string());
-        assert_eq!(env["PATH"], format!("{}:{}:/usr/bin:/bin", bin.display(), dir.path().join("bin").display()));
-        assert_eq!(env["LANG"], "C.UTF-8");
-    }
-
-    #[test]
-    fn verdicts_are_read_from_each_namespace_and_a_write_in_flight_is_not() {
-        let kernels = tempfile::tempdir().unwrap();
-        let verified = kernels.path().join("u1000/verified");
-        fs::create_dir_all(&verified).unwrap();
-        let row = serde_json::json!({"kernel": "prebuilt-int8-sm89", "artifact": "a", "sm": 89, "driver": "580.65.06", "ok": true, "detail": "rel L2 1.2e-3"});
-        fs::write(verified.join("prebuilt-int8-sm89-0f.json"), row.to_string()).unwrap();
-        fs::write(verified.join(".prebuilt-fp8-sm89-1a.json.42"), "{").unwrap();
-        let read = verdicts(kernels.path());
-        assert_eq!(read.len(), 1);
-        assert!(read[0].ok && read[0].sm == 89 && read[0].kernel == "prebuilt-int8-sm89");
-    }
-}

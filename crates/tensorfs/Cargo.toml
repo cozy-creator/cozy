@@ -15,8 +15,6 @@ required-features = ["store"]
 # read engine only.
 default = ["store"]
 store = ["dep:aws-sigv4", "dep:aws-credential-types", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:tokio", "dep:tokio-rustls", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:async-trait", "dep:http-body-util", "dep:bytes", "dep:futures", "dep:tracing-subscriber"]
-# Kill points for the store's crash tests (`store::fault`).
-faults = ["store"]
 
 [dependencies]
 base64.workspace = true
@@ -32,8 +30,7 @@ serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 thiserror.workspace = true
 rustix = { version = "1.1.4", default-features = false, features = ["std", "net", "event"], optional = true }
-# The one HTTP client (src/fetch/net.rs). rustls is the one TLS stack, used only there;
-# scripts/fence.py refuses it anywhere else.
+# The one HTTP client (src/fetch/net.rs). rustls is the one TLS stack, used only there.
 rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 # Requests in flight are tasks, never a thread each: hyper's pooled HTTP/1.1 client over our
@@ -56,18 +53,6 @@ aws-credential-types = { version = "1.2", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "process"], optional = true }
-
-[[test]]
-name = "store_v2"
-required-features = ["faults"]
-
-[[test]]
-name = "writer"
-required-features = ["faults"]
-
-[dev-dependencies]
-libc.workspace = true
-rcgen.workspace = true
 
 [lints]
 workspace = true

@@ -2,7 +2,7 @@
 //! `ggml-quants.c` at llama.cpp ff5a233, MIT, © the ggml authors), bit-exact with ggml built for
 //! x86-64 without fused multiply-adds: the same f32 operations in the same order, ggml's own
 //! f16 conversions, and C's float-to-int casts as x86-64 performs them. Proven against the C on
-//! some 3.5 M blocks per type; `conformance/mine/gguf.py` mines the vectors that pin it.
+//! some 3.5 M blocks per type.
 
 use super::{Encoder, Input, OwnedPart};
 use crate::format::decode::gguf::{blocks_shape, Type, K};

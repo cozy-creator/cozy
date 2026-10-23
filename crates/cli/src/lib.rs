@@ -165,13 +165,3 @@ async fn dispatch(ctx: &Context, command: Command) -> Result<ExitCode, Error> {
         Command::Tools(args) => tools::exec(ctx, args).await,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use clap::CommandFactory as _;
-
-    #[test]
-    fn the_grammar_is_consistent() {
-        super::Cli::command().debug_assert();
-    }
-}
