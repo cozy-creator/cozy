@@ -275,8 +275,9 @@ fn tensord_leases_to_its_tenants_and_keeps_landed_weights_within_their_package()
     let books = manager.holdings();
     assert_eq!((books.executors.len(), books.executors[0].pid, books.executors[0].bytes), (1, first.pid(), 8 * MIB), "{books:?}");
     assert_eq!(first.ask("land"), "landed");
-    let grants = events(dir.path(), "allocate");
-    assert!(grants.iter().any(|grant| grant["pid"] == first.pid() && grant["bytes"] == 8 * MIB), "{grants:?}");
+    // The manager logs an allocation once its grant is sent.
+    let allocated = |grant: &serde_json::Value| grant["pid"] == first.pid() && grant["bytes"] == 8 * MIB;
+    eventually("its allocation is logged", || events(dir.path(), "allocate").iter().any(allocated));
 
     let pid = first.pid();
     first.kill();
@@ -296,7 +297,7 @@ fn tensord_leases_to_its_tenants_and_keeps_landed_weights_within_their_package()
     let mut next = StandIn::tenant(&id.uuid, &tenants, "plan-a", "gen-a");
     assert_eq!(next.ask("attach"), "attached");
     assert_eq!(next.ask("take 8 7"), "1 1", "the next executor of its package adopts it, no copy");
-    assert!(!events(dir.path(), "cached").is_empty());
+    eventually("its adoption is logged", || !events(dir.path(), "cached").is_empty());
     let books = manager.holdings();
     assert_eq!((books.page_cache, books.executors.len()), (0, 2), "{books:?}");
     drop((stranger, other, next));
