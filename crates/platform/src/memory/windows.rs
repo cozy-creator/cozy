@@ -559,7 +559,9 @@ impl Signal {
     }
 }
 
-/// Blocks until one of `items` is signalled; the lowest such index. No timeout.
+/// Blocks until any of `items` is signalled, then answers every one that is: the lowest, then each
+/// later one signalled now (a zero wait, which consumes an auto-reset signal: act on every answer).
+/// No timeout.
 pub fn wait_any(items: &[Waitable<'_>]) -> Result<Vec<super::Ready>> {
     let handles: Vec<HANDLE> = items.iter().map(|h| h.as_raw_handle() as HANDLE).collect();
     // SAFETY: live handles the caller borrows for the call, and their count.
