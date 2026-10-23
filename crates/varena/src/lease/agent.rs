@@ -15,7 +15,7 @@ use parking_lot::{Condvar, Mutex};
 use platform::process::Birth;
 
 use super::table::{State, Table};
-use super::wire::{End, Refusal, Region, ToAgent, ToManager};
+use super::wire::{End, Facts, Kind, Measured, Refusal, Region, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
 use crate::os::{self, Stream};
 use crate::{Error, Exhausted, Result};
@@ -69,17 +69,24 @@ pub struct Agent {
     pending: Mutex<Pending>,
     /// Mapped grants this process holds.
     held: Mutex<BTreeSet<Ticket>>,
+    /// The holder's wake for asks back (the doorbell's, and a grant asked back before its map).
+    revoked: Box<dyn Fn() + Send + Sync>,
 }
 
 impl Agent {
     /// Attaches to the manager serving `stream`; `revoked` runs on the reader thread at every
     /// Revoke doorbell (the holder wakes its mechanism thread, never works there). A refusal
     /// comes back typed: the caller redials or runs that GPU standalone, never fails for it.
-    pub fn attach(stream: Stream, backend: Arc<dyn Backend>, revoked: impl Fn() + Send + 'static) -> Result<Attach> {
+    pub fn attach(stream: Stream, backend: Arc<dyn Backend>, revoked: impl Fn() + Send + Sync + 'static) -> Result<Attach> {
         let end = Arc::new(End::new(stream));
         let me = Birth::own().map_err(|e| Error::Io(e.to_string()))?;
-        end.send(&ToManager::Hello { protocol: super::manager::PROTOCOL, birth: me.start_ticks }, None)?;
-        let table = match end.recv::<ToAgent>()? {
+        // A refusal can land before the Hello does: whatever the send says, read the answer.
+        let hello = end.send(&ToManager::Hello { protocol: super::manager::PROTOCOL, birth: me.start_ticks }, None);
+        let answer = match end.recv::<ToAgent>() {
+            Ok(answer) => answer,
+            Err(error) => return Err(hello.err().unwrap_or(error)),
+        };
+        let table = match answer {
             Some((ToAgent::Welcome { .. }, Some(file))) => {
                 let len = os::size(&file)? as usize;
                 Arc::new(Table::open(os::map(&file, len, true)?)?)
@@ -87,12 +94,12 @@ impl Agent {
             Some((ToAgent::Refuse { code, why, .. }, _)) => return Ok(Attach::Refused { code, why }),
             _ => return Err(Error::Closed("the lease manager answered Hello with no table".into())),
         };
-        let agent = Arc::new(Agent { end, table, backend, pending: Mutex::new(Pending::default()), held: Mutex::new(BTreeSet::new()) });
+        let agent = Arc::new(Agent { end, table, backend, pending: Mutex::new(Pending::default()), held: Mutex::new(BTreeSet::new()), revoked: Box::new(revoked) });
         let reader = agent.clone();
         std::thread::Builder::new()
             .name("lease-agent".into())
             .spawn(move || {
-                if let Err(error) = reader.read(&revoked) {
+                if let Err(error) = reader.read() {
                     tracing::warn!("lease: the manager's connection failed: {error}");
                 }
                 // Every ask still out fails: the manager is gone.
@@ -110,7 +117,7 @@ impl Agent {
         Ok(Attach::Leased(agent))
     }
 
-    fn read(&self, revoked: &dyn Fn()) -> Result<()> {
+    fn read(&self) -> Result<()> {
         while let Some((message, handle)) = self.end.recv::<ToAgent>()? {
             match message {
                 ToAgent::Grant { id, slot, seq, bytes, adopted, last } => self.granted(id, Ticket { slot, seq }, bytes, adopted, last, handle)?,
@@ -124,7 +131,7 @@ impl Agent {
                         }));
                     }
                 }
-                ToAgent::Revoke => revoked(),
+                ToAgent::Revoke => (self.revoked)(),
                 ToAgent::Welcome { .. } => {}
             }
         }
@@ -192,7 +199,7 @@ impl Agent {
     /// Asks for `bytes` of weights for `region`; `done` runs on the reader thread with the
     /// imported leases (the holder maps each and answers it) or the refusal (Exhausted), once
     /// the manager answers: after room is made, which may take other processes' revokes.
-    pub fn ask(&self, bytes: u64, region: Option<Region>, done: Done) -> Result<()> {
+    pub fn ask(&self, bytes: u64, kind: Kind, region: Option<Region>, done: Done) -> Result<()> {
         let id = {
             let mut p = self.pending.lock();
             if p.closed {
@@ -205,15 +212,16 @@ impl Agent {
             p.asks.insert(id, Asking { bytes, got: vec![], done });
             id
         };
-        self.end.send(&ToManager::Ask { id, bytes, region }, None)
+        self.end.send(&ToManager::Ask { id, bytes, kind, region }, None)
     }
 
     /// [`Agent::ask`], waiting for the answer here: never on a thread that answers revokes.
-    pub fn take(&self, bytes: u64, region: Option<Region>) -> Result<Vec<Lease>> {
+    pub fn take(&self, bytes: u64, kind: Kind, region: Option<Region>) -> Result<Vec<Lease>> {
         let answer = Arc::new((Mutex::new(None), Condvar::new()));
         let set = answer.clone();
         self.ask(
             bytes,
+            kind,
             region,
             Box::new(move |r| {
                 *set.0.lock() = Some(r);
@@ -235,7 +243,12 @@ impl Agent {
             self.table.answer(t.slot, t.seq, true)?;
             self.held.lock().insert(*t);
         }
-        self.end.send(&ToManager::Answered, None)
+        self.end.send(&ToManager::Answered, None)?;
+        // Asked back while in flight (L3: the revoke follows the map): the holder hears it now.
+        if tickets.iter().any(|t| self.asked(*t)) {
+            (self.revoked)();
+        }
+        Ok(())
     }
 
     /// The holder could not map it: its import goes, and the manager reclaims the chunk.
@@ -262,6 +275,11 @@ impl Agent {
     pub fn unland(&self, ticket: Ticket) -> Result<()> {
         self.table.set_landed_to(ticket.slot, false)?;
         self.end.send(&ToManager::Answered, None)
+    }
+
+    /// GPU work its holder recorded is (not) yet complete: a busy agent is never stalled.
+    pub fn busy(&self, busy: bool) {
+        self.table.set_busy(busy);
     }
 
     pub fn pin(&self, ticket: Ticket) -> Result<bool> {
@@ -333,6 +351,16 @@ impl Agent {
 
     pub fn table(&self) -> &Table {
         &self.table
+    }
+
+    /// Its admission facts changed.
+    pub fn report(&self, facts: Facts) -> Result<()> {
+        self.end.send(&ToManager::Facts(facts), None)
+    }
+
+    /// A request's peaks at its end, or a set's bytes at its load.
+    pub fn measured(&self, m: Measured) -> Result<()> {
+        self.end.send(&ToManager::Measured(m), None)
     }
 }
 

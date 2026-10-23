@@ -4,13 +4,14 @@
 
 pub mod agent;
 pub mod manager;
+pub mod policy;
 pub mod table;
 pub mod wire;
 
 pub use agent::{Agent, Attach, Done, Lease, Ticket};
-pub use manager::{chunks, ExecutorHolding, Holdings, Hosting, Identity, Manager, Opener, Record, CHUNK, PROTOCOL};
+pub use manager::{chunks, family_id, reserved_pool, ExecutorHolding, Holdings, HostCall, Hosting, Identity, Manager, Mode, Opener, Peak, Pressure, Record, CHUNK, PROTOCOL};
 pub use table::{Content, Figures, State, Table, Word};
-pub use wire::{Refusal, Region};
+pub use wire::{Facts, Kind, Measured, Refusal, Region};
 
 use crate::os::{self, Listener, Stream};
 use crate::{GpuId, Result};

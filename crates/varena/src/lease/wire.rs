@@ -26,6 +26,17 @@ pub enum Refusal {
     NothingRevocable,
     /// The manager failed serving the ask (its backend would not open, a chunk would not export).
     Failed,
+    /// Nobody serves this GPU's leases (no listener): never sent, an agent's own finding.
+    Absent,
+}
+
+/// What an ask is for: a weights page is one chunk sized to it (§3, never split, retainable or
+/// not); torch and cache bytes split at the largest chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Kind {
+    Weights,
+    Torch,
+    Cache,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,9 +45,44 @@ pub enum ToManager {
     /// birth. A re-attach after a manager restart sends its table's fd back with it.
     Hello { protocol: u32, birth: u64 },
     /// `bytes` of weights, for `region` when given (a retained region answers with no copy).
-    Ask { id: u64, bytes: u64, region: Option<Region> },
+    Ask { id: u64, bytes: u64, kind: Kind, region: Option<Region> },
     /// Doorbell: slots moved to Mapped, Refused or Released.
     Answered,
+    /// Its admission facts, whenever they change.
+    Facts(Facts),
+    /// What it measured: a request's peaks at its end, a set's bytes at its load.
+    Measured(Measured),
+}
+
+/// An agent's admission facts, as admission and the capacity read them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Facts {
+    /// Its context and modules, measured at open; torch's bytes outside its leases.
+    pub context: u64,
+    pub torch: u64,
+    /// Running requests, and how many have no measured working set.
+    pub running: u32,
+    pub unmeasured: u32,
+    /// Each running request's largest remaining working set, summed.
+    pub remaining: u64,
+    /// Pinned bytes outside any running working set.
+    pub outside: u64,
+    /// The remaining working set of its requests waiting on child calls, per family they wait
+    /// for ([`super::manager::family_id`], bytes); family 0: any.
+    pub yielded: [(u64, u64); crate::decide::YIELDED],
+    /// Its running requests' largest measured anonymous host peak, and how many have none.
+    pub host_peak: u64,
+    pub host_unmeasured: u32,
+}
+
+/// What an agent measured.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Measured {
+    /// A request's peaks at its end (keyed by its dispatch): its working set, its bytes beside its
+    /// weights, its anonymous host high-water.
+    Request { request: String, working: u64, compute: u64, host: u64 },
+    /// A set's resident bytes, at its load.
+    Set { name: String, bytes: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
