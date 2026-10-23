@@ -65,13 +65,32 @@ pub struct SubmitRun {
     pub agreed: Option<Agreed>,
 }
 
-/// `POST /v1/run-quotes`: what a `new` run would rent, and its price.
+/// `POST /v1/run-quotes`: what a `new` run would rent, and its price; when the Hub placed it, why,
+/// and two other machines it would rent instead.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunQuote {
     pub sku: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpus: Option<u32>,
     pub quote: Quote,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<Alternative>,
+}
+
+/// Another machine a run could rent, against the pick: its time and cost per run as multiples of
+/// the pick's, its price an hour and its expected total. `label` says which way it trades.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Alternative {
+    pub sku: String,
+    pub gpus: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    pub time: f64,
+    pub run_cost: f64,
+    pub usd_micros_per_hour: i64,
+    pub expected_total_usd_micros: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

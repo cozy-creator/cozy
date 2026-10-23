@@ -38,7 +38,7 @@ pub(crate) async fn submit(
     let calcifer = ctx.calcifer().await?;
     if matches!(run.on, On::New(_)) && run.agreed.is_none() {
         let quoted: RunQuote = calcifer.post("/v1/run-quotes", &run, None).await?;
-        let said = crate::machine::price(&quoted.sku, quoted.gpus.unwrap_or(1), &quoted.quote);
+        let said = crate::machine::placed(&quoted);
         if !crate::machine::agree(ctx, &said)? {
             return Err(Error::new(Kind::Usage, "quote_declined", "nothing was rented and the run was not sent"));
         }
