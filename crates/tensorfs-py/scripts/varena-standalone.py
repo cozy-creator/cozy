@@ -502,8 +502,14 @@ def capped(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, cap
     binding = mem.models[unet].retain()
     check("short: retained, a model bigger than its room is not all resident", not binding.resident(), "resident")
     binding.close()
-    refused = mem.models[unet].hold(free_only=True)
-    check("short: free only, a model bigger than its room is not held, and nothing stays bound", refused is None and native.pins_held() == pins and isinstance(unet.conv_in.weight, Placeholder), (refused, pins, native.pins_held()))
+    # Free only, all or none: held exactly when its weights alone fit its room (its working set
+    # did not: on a GPU the room covers the weights and not the activations beside them).
+    fits = sum(spans) <= capacity - base
+    held = mem.models[unet].hold(free_only=True)
+    if held is not None:
+        held.release()
+    check(f"short: free only, held exactly when its weights fit its room ({sum(spans)} of {capacity - base} B), nothing left bound",
+          (held is not None) == fits and native.pins_held() == pins and isinstance(unet.conv_in.weight, Placeholder), (held, fits, pins, native.pins_held()))
     fills(stats, ceiling)
     print(f"STATS_JSON {stats.json()}", flush=True)
     for derived in (False, True):
