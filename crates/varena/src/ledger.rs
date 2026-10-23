@@ -1323,6 +1323,9 @@ pub struct Ledger {
     /// The GPU's wake endpoint, bound by name: every participant signals it.
     events: os::Endpoint,
     custody: custody::Client,
+    /// Rows that answered a foreign reading's ask with nothing, by ceiling, and their classes
+    /// then: not asked again until those change (at the floor every reading would ask them).
+    quiet: Mutex<HashMap<(u64, usize), [u64; 7]>>,
 }
 
 impl Drop for Ledger {
@@ -1351,7 +1354,7 @@ impl Ledger {
             shared.put(&key, None)?;
         }
         let custody = custody::Client::open(&shared)?;
-        Ok(Ledger { shared, card: gpu.memory, events, custody })
+        Ok(Ledger { shared, card: gpu.memory, events, custody, quiet: Mutex::default() })
     }
 
     /// The machine's sharing mode (shared until TensorD says dedicated).
@@ -1366,34 +1369,60 @@ impl Ledger {
         self.shared.put(FOREIGN_HOLDER, value.as_deref())
     }
 
-    /// TensorD's sample of the device bytes no row accounts for, once per new reading. Short
-    /// (the rows hold more than capacity − `foreign`), it wants the deficit and H more, from
-    /// orphans, then idle rows' pages (ceiling N), then running rows (ceiling W: they stream),
-    /// until met. `fresh` (a new foreign process crossed its threshold) also asks every idle row
-    /// for all its idle pages. What it freed; a run is never ended for it.
+    /// TensorD's sample of the device bytes no row accounts for, once per new reading. Shared
+    /// mode charges H: short of H free (the rows hold more than capacity − H − `foreign`), it wants
+    /// the deficit and H more (2H − free), from orphans, then idle rows' pages (ceiling N), then
+    /// running rows (ceiling W: they stream), until met. `fresh` (a new foreign process crossed
+    /// its threshold) releases every orphan and asks every live row for its idle pages (N: never
+    /// a running set). What it freed; a run is never ended for it.
     pub fn set_foreign(&self, foreign: u64, fresh: bool) -> Result<u64> {
         self.shared.set_foreign(foreign)?;
         self.shared.set_sampled(true)?;
         let rows = self.shared.rows()?;
-        let deficit = held(&rows).saturating_sub(self.shared.capacity()?.saturating_sub(foreign));
-        let want = if deficit > 0 { deficit + crate::table::headroom(self.card) } else { 0 };
-        let mut freed = if want > 0 { self.custody.release(want) } else { 0 };
-        let (running, idle): (Vec<&RowView>, Vec<&RowView>) = rows.iter().filter(|r| r.live).partition(|r| r.facts.running > 0);
-        for r in idle {
-            if fresh || freed < want {
-                let ask = if fresh { u64::MAX } else { want - freed };
-                freed += ask_row(&self.shared, r.id(), Class::N, ask)?;
+        let h = if self.shared.shared_mode()? { crate::table::headroom(self.card) } else { 0 };
+        let deficit = held(&rows).saturating_sub(self.shared.capacity()?.saturating_sub(foreign + h));
+        let want = if deficit > 0 { deficit + h } else { 0 };
+        let mut freed = match (fresh, want) {
+            (true, _) => self.custody.release(u64::MAX),
+            (false, 0) => 0,
+            (false, want) => self.custody.release(want),
+        };
+        let live: Vec<&RowView> = rows.iter().filter(|r| r.live).collect();
+        if fresh {
+            for r in &live {
+                freed += self.ask(r, Class::N, u64::MAX)?;
             }
         }
-        for r in running {
+        for (r, ceiling) in live.iter().filter(|r| r.facts.running == 0).map(|r| (r, Class::N)).chain(live.iter().filter(|r| r.facts.running > 0).map(|r| (r, Class::W))) {
             if freed >= want {
                 break;
             }
-            freed += ask_row(&self.shared, r.id(), Class::W, want - freed)?;
+            freed += self.ask(r, ceiling, want - freed)?;
         }
         if freed > 0 {
             self.shared.ring();
         }
+        Ok(freed)
+    }
+
+    /// TensorD stopped sampling (nothing held on the device): executors measure foreign bytes
+    /// themselves again.
+    pub fn stop_sampling(&self) -> Result<()> {
+        self.shared.set_sampled(false)
+    }
+
+    /// Row `r`'s answer to an ask, unless it answered the same ceiling with nothing and its
+    /// classes have not changed since.
+    fn ask(&self, r: &RowView, ceiling: Class, bytes: u64) -> Result<u64> {
+        let key = (r.id(), ceiling.index());
+        if self.quiet.lock().get(&key) == Some(&r.facts.classes) {
+            return Ok(0);
+        }
+        let freed = ask_row(&self.shared, r.id(), ceiling, bytes)?;
+        match freed {
+            0 => self.quiet.lock().insert(key, r.facts.classes),
+            _ => self.quiet.lock().remove(&key),
+        };
         Ok(freed)
     }
 

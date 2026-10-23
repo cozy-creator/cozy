@@ -859,7 +859,7 @@ impl Memory {
             let holder = custody.as_ref().map_or(0, |c| c.holder());
             let context = backend.process_used().unwrap_or_else(|_| backend.opened_context());
             let budget = backend.budget();
-            let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, ..Table::default() };
+            let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, card: backend.capacity(), ..Table::default() };
             let inner = Arc::new(Inner {
                 backend,
                 shared,
@@ -1504,7 +1504,8 @@ impl Inner {
         st.table.orphans = orphans;
         st.table.capacity = self.shared.capacity()?;
         st.table.shared = self.shared.shared_mode()?;
-        if self.shared.sampled()? {
+        st.table.sampled = self.shared.sampled()?;
+        if st.table.sampled {
             st.table.foreign = self.shared.foreign()?;
         }
         st.table.pending = self.to_custody.pending();
@@ -2302,12 +2303,11 @@ impl Inner {
         total
     }
 
-    /// Maps the next blocks of `req`'s current step into free bytes only (never in shared mode,
-    /// where the footprint never grows).
     /// Recovery, at a pass boundary only (a shrink is at once): a streaming set takes back the
-    /// blocks at its watermark, one by one, into free bytes beyond 2H of the device (shared: H
-    /// more than the table leaves; Windows: under budget − 2H), mapped and filled on the copy
-    /// stream, never evicting. The H..2H band is the hysteresis: no timer.
+    /// blocks at its watermark, one by one, then refills its slots, into free bytes beyond 2H of
+    /// the device (shared: H more than the table leaves, which charges H; Windows: under budget −
+    /// 2H), mapped and filled on the copy stream, never evicting. The H..2H band is the
+    /// hysteresis: no timer.
     fn regrow(&self, req: u64, set: u32) {
         let mut st = self.lock();
         let (Some(watermark), Ok(blocks)) = (st.streams.get(&set).map(|s| s.watermark), st.mech(set).map(|m| m.spec.layout.regions.len() as u32)) else {
@@ -2335,10 +2335,26 @@ impl Inner {
         } else if let Some(s) = st.streams.get_mut(&set) {
             s.watermark = w;
         }
+        // Its slots, refilled here only (a bind mid-pass moves one, never makes one): the next
+        // upper blocks with no page.
+        let mut next = w;
+        for _ in st.slots(set, w)..stream::SLOTS {
+            while next < blocks && st.homes.contains_key(&(set, next)) {
+                next += 1;
+            }
+            let Some(bytes) = (next < blocks).then(|| st.table.page((set, next)).map(|p| p.bytes)).flatten().filter(|b| *b <= room) else { break };
+            if !self.map(&mut st, (set, next), Some(req), true).unwrap_or(false) {
+                break;
+            }
+            room -= bytes;
+            next += 1;
+        }
         self.publish(&mut st);
         self.unlock(st);
     }
 
+    /// Maps the next blocks of `req`'s current step into free bytes only (never in shared mode,
+    /// where the footprint never grows).
     fn prefetch(&self, req: u64) {
         let mut st = self.lock();
         if !st.table.shared {
