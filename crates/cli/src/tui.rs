@@ -28,7 +28,6 @@ use crate::{Context, machine, output, package, run};
 /// One live view.
 pub(crate) enum Screen {
     Runs(run::live::Runs),
-    Run(Box<run::live::Live>),
     Machines(machine::live::Machines),
     Machine(Box<machine::live::Shown>),
     Packages(package::live::Packages),
@@ -39,7 +38,6 @@ impl Screen {
     async fn changed(&mut self, ctx: &Context) -> Result<(), Error> {
         match self {
             Screen::Runs(view) => view.changed(ctx).await,
-            Screen::Run(view) => view.changed().await,
             Screen::Machines(view) => view.changed(ctx).await,
             Screen::Machine(view) => view.changed().await,
             Screen::Packages(view) => view.changed(ctx).await,
@@ -78,7 +76,6 @@ impl Screen {
                 view.rows(ctx),
                 selected,
             ),
-            Screen::Run(view) => detail(frame, &view.title(), view.lines(ctx)),
             Screen::Machine(view) => detail(frame, &view.title(), view.lines(ctx)),
         }
     }
@@ -88,7 +85,7 @@ impl Screen {
             Screen::Runs(view) => view.rows().len(),
             Screen::Machines(view) => view.rows(ctx).len(),
             Screen::Packages(view) => view.rows(ctx).len(),
-            Screen::Run(_) | Screen::Machine(_) => 0,
+            Screen::Machine(_) => 0,
         }
     }
 }
@@ -270,7 +267,7 @@ fn table(
     frame.render_stateful_widget(table, frame.area(), selected);
 }
 
-/// One run's or machine's record as its `show` prints it, drawn again as it changes.
+/// A machine's record as `cozy machine show` prints it, drawn again as it changes.
 fn detail(frame: &mut Frame, title: &str, lines: Vec<String>) {
     let block = Block::new().title(format!("{title}  (Esc or q back)"));
     let lines: Vec<Line> = lines.into_iter().map(Line::from).collect();

@@ -131,7 +131,8 @@ fn runs_on(screen: &str) -> Option<u32> {
 /// `cozy run list` and `cozy machine list` on a pseudo-terminal, as a person drives them: j/k move
 /// the selection; Enter on a run is `cozy run watch` of it, live, and a run that ended stays on
 /// screen, its record and all; Enter on a machine opens its live `cozy machine show`. Esc or q goes
-/// back to the list, and q there quits. Leaving a run's watch never cancels the run.
+/// back to the list, and q there quits. `cozy run show` of a running run follows it the same way.
+/// Leaving a run's watch never cancels the run.
 #[test]
 fn enter_opens_a_rows_live_view_and_esc_or_q_comes_back() {
     let Some(home) = Home::new() else { return };
@@ -164,6 +165,13 @@ fn enter_opens_a_rows_live_view_and_esc_or_q_comes_back() {
     runs.until("the run's watch", |s| s.contains(&watching) && s.contains(&opened));
     runs.key("\x1b");
     runs.until("the list again", list);
+    // `cozy run show` of a run still going follows it the same way; Ctrl-C detaches.
+    let mut show = Pty::spawn(home.command().args(["run", "show", &first]));
+    show.until("run show, following", |s| s.contains(&opened));
+    show.key("\x03");
+    let detached = format!("detached: run {first} keeps running");
+    show.until("its detach", |s| s.contains(&detached));
+    show.wait();
     let status = home.json(["run", "show", &first, "--json"])["status"].to_string();
     assert!(!settled(&status), "leaving the watch left it running: {status}");
 
