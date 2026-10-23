@@ -469,10 +469,13 @@ class Cache:
         self.memory, self.owner, self.shrink = memory, owner, shrink
         self.nbytes, self.last_use = 0, memory.clock
         self.holding: dict[Model, int] = {}
+        #: it gave nothing on an ask (its owner was busy): left out of what the row offers until
+        #: its owner serves again
+        self.refused = False
 
     def serving(self) -> AbstractContextManager[None]:
         """The owner's own loop, outside any request: its ops are caught like a request's."""
-        self.last_use = self.memory.clock
+        self.last_use, self.refused = self.memory.clock, False
         return cuts.caught()
 
     def hold(self, model: Model) -> Hold:
@@ -575,7 +578,7 @@ class Memory:
                 uuid = str(torch.cuda.get_device_properties(self.gpu).uuid)
                 table = Ledger.create(uuid, min(self.total, limit or self.total))
             self.row = (table, table.claim())
-            self.core.serve(self.row[1])  # other processes' asks, answered in Rust
+            self.core.serve(self.row[1], self._answer)  # other processes' asks
             self.limit = table.capacity if table.capacity < self.total else None
 
     @classmethod
@@ -1355,23 +1358,21 @@ class Memory:
             self.row[0].freed()
 
     def _publish(self) -> None:
-        """This row's facts (§5.6), as forwards start and land and at request ends. An ask the
-        Rust thread answers from weight pages also gets torch's slack and the caches here."""
+        """This row's facts (§5.6), as forwards start and land and at request ends. They offer
+        only what an ask's answer frees then (`_answer`, `Gpu.serve`): weight pages and idle
+        chunks, and with no request running the caches that did not refuse. Torch's other bytes
+        count as in use: a request's end empties its cache, so what stays is no ask's to free.
+        An offer no answer meets makes askers plan on room that never comes (tfs-133: an idle
+        describer's LM cache and slack, asked 171 times for 0 B, cut H3's steps finer)."""
         if self.row is None:
             return
         self._cap()
-        row, gpu = self.row[1], self.gpu
-        if row.want() > 0:
-            freed = self._idle() + sum(
-                self._shrink(c, c.nbytes) for c in list(self.caches) if c.nbytes
-            )
-            if freed:
-                self._freed()
-        resident = {s.name: int(s.resident) for s in self.core.stats().sets}  # type: ignore[union-attr]
+        row, gpu, stats = self.row[1], self.gpu, self.core.stats()  # type: ignore[union-attr]
+        resident = {s.name: int(s.resident) for s in stats.sets}
         models = list(self.models.values())
         bytes_of = lambda ms: sum(resident.get(m.name, 0) for m in ms)  # noqa: E731
         cold = [m for m in models if not m.flight and not m.held]
-        reserved, allocated = torch.cuda.memory_reserved(gpu), torch.cuda.memory_allocated(gpu)
+        reserved, idle = torch.cuda.memory_reserved(gpu), not self.active
         row.publish(
             context=self.context,
             resident=bytes_of(models),
@@ -1379,13 +1380,36 @@ class Memory:
             kept=bytes_of(m for m in cold if m.level is Level.GPU),
             pinned=bytes_of(m for m in models if m.flight or m.held),
             torch_reserved=reserved,
-            torch_allocated=allocated,
-            cache=sum(c.nbytes for c in list(self.caches)),
-            idle=reserved - allocated,
+            torch_allocated=reserved,
+            cache=sum(c.nbytes for c in list(self.caches) if not c.refused) if idle else 0,
+            idle=int(stats.idle),
             active_peak=torch.cuda.max_memory_allocated(gpu) if self.active else 0,
             last_use=self.last_use,
             waiting=self.waiting,
         )
+
+    def _answer(self, want: int) -> int:
+        """An ask while no request runs here (`Gpu.serve`): torch's slack, then the caches, least
+        recently used first, which only this process can let go; weight pages follow in Rust.
+        What it gives is what went back to the driver. Under the lock a request start takes, so
+        none starts while a cache sheds. A cache that gives nothing is left out of the offer
+        until its owner serves again."""
+        with self.lock:
+            before = torch.cuda.memory_reserved(self.gpu)
+            freed = 0
+            if not self.active:
+                shed = sorted((c for c in self.caches if c.nbytes), key=lambda c: c.last_use)
+                for cache in [None, *shed]:
+                    if cache is not None:
+                        cache.refused = self._shrink(cache, want - freed) == 0
+                    torch.cuda.empty_cache()
+                    freed = before - torch.cuda.memory_reserved(self.gpu)
+                    if freed >= want:
+                        break
+            self._publish()
+        if freed:
+            self._freed()
+        return max(freed, 0)
 
     def _running(self) -> None:
         """This row's running requests and what each may still need beyond what this process
@@ -1495,6 +1519,7 @@ class Memory:
                 self.plans[id].started = True
                 self._advance()
         self._running()
+        self._publish()  # a running request's offer: weight pages alone
         stack: list[Request] = self.local.__dict__.setdefault("requests", [])
         stack.append(request)
         try:

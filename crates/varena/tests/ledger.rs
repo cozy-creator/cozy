@@ -759,3 +759,30 @@ fn an_answer_sheds_what_it_gave_from_the_row() {
     assert_eq!((f.resident, f.cold, f.kept, f.idle), (2 * GIB, 0, 0, 0));
     assert_eq!(f.context, GIB);
 }
+
+/// A row with a running request is busy: its asks get what Rust frees alone (tfs-133).
+#[test]
+fn a_row_is_busy_while_it_has_running_requests() {
+    let (ledger, _fd) = Ledger::create("GPU-busy", 24 * GIB).unwrap();
+    let row = ledger.claim(std::process::id()).unwrap();
+    assert!(!row.busy());
+    row.running(&[("call".into(), -1)]).unwrap();
+    assert!(row.busy());
+    row.running(&[]).unwrap();
+    assert!(!row.busy());
+}
+
+/// What a row offers is what an ask can get: caches offered are reclaimable, torch bytes
+/// published as allocated are not, whatever torch reserved beyond them (tfs-133).
+#[test]
+fn a_row_offers_its_caches_and_never_bytes_it_counts_in_use() {
+    let (ledger, _fd) = Ledger::create("GPU-offer", 24 * GIB).unwrap();
+    let row = ledger.claim(std::process::id()).unwrap();
+    let mut facts = Facts { context: GIB, torch_reserved: 6 * GIB, torch_allocated: 6 * GIB, cache: 2 * GIB, last_use: 1, ..Facts::default() };
+    row.publish(&facts);
+    let offered = |ledger: &Ledger| ledger.snapshot().unwrap().into_iter().find(|r| r.slot == row.id()).unwrap().reclaimable();
+    assert_eq!(offered(&ledger), 2 * GIB);
+    facts.cache = 0;
+    row.publish(&facts);
+    assert_eq!(offered(&ledger), 0, "a busy row offers no torch bytes");
+}

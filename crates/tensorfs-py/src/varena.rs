@@ -208,13 +208,25 @@ impl PyGpu {
         detached(py, || self.0.give(nbytes))
     }
 
-    /// Answers other processes' asks of `row` from now on with `give`, on a Rust thread.
-    fn serve(&self, py: Python<'_>, row: PyRef<'_, PyRow>) -> PyResult<()> {
+    /// Answers other processes' asks of `row` from now on, on a Rust thread. With no request
+    /// running there, `spare(want)` first frees what only that process holds (torch's slack, its
+    /// caches); then `give` frees weight pages. A busy process answers from weight pages alone,
+    /// never waiting on its interpreter.
+    fn serve(&self, py: Python<'_>, row: PyRef<'_, PyRow>, spare: Py<PyAny>) -> PyResult<()> {
         let (gpu, facts) = (self.0.clone(), row.0.clone());
-        let answer = move |want| {
-            let freed = gpu.give(want).map_or(0, |gave| gave.iter().map(|g| g.1).sum());
-            facts.shed(freed);
-            freed
+        let answer = move |want: u64| {
+            let spared = match facts.busy() {
+                true => 0,
+                false => Python::attach(|py| {
+                    spare.bind(py).call1((want,)).and_then(|n| n.extract::<u64>()).unwrap_or_else(|e| {
+                        e.print(py);
+                        0
+                    })
+                }),
+            };
+            let pages = if spared < want { gpu.give(want - spared).map_or(0, |gave| gave.iter().map(|g| g.1).sum()) } else { 0 };
+            facts.shed(pages);
+            spared + pages
         };
         row.0.serve(answer).map(drop).or_raise(py)
     }

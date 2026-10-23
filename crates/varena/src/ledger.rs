@@ -443,6 +443,12 @@ impl Row {
         self.publish(&f);
     }
 
+    /// Whether its process has a running request (`running`): its asks then get weight pages
+    /// alone, never what only that process's own thread can free.
+    pub fn busy(&self) -> bool {
+        lock(&self.words)[FACTS] > 0
+    }
+
     /// Its running requests and the most each still needs beyond what it holds (-1: unmeasured).
     pub fn running(&self, requests: &[(String, i64)]) -> Result<()> {
         if requests.len() > RUNNING {
