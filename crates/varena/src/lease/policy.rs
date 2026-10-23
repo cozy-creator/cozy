@@ -923,6 +923,9 @@ mod tests {
             assert_eq!(stages.last().copied(), last, "free {free} MiB");
             assert!(!stages.contains(&Stage::Step), "free {free} MiB: memory.low covered it");
         }
+        // Between min and low with too few cold pages: background reclaim stays cold.
+        let s = snap(1000, 512, vec![], vec![ex(1, vec![q(1, Advice::Idle { last_use: 1 }), q(5, Advice::Later { at: 9 }), q(7, Advice::Step { at: 2 })])]);
+        assert_eq!(show(&decide(&s, &[])), ["1:1"], "background reclaim took a protected page");
         // Demand allocates down to min; speculation only down to high.
         let spec = |mib| Ask { speculative: true, ..demand(1, mib) };
         let s = snap(2048, 512, vec![], vec![ex(1, vec![])]);
@@ -1036,6 +1039,16 @@ mod tests {
         let d = decide(&s, &[demand(2, 11)]);
         assert_eq!(show(&d), ["S1:3", "1:3", "D1:2", "1:2", "G1:5", "1:4", "S1:1", "1:1", "1:6"]);
         assert_eq!(d.answers, vec![Answer::Wait { on: vec![1] }]);
+    }
+
+    /// A region goes whole or not at all: one of its chunks pinned keeps every other one of its
+    /// chunks too, whatever their advice.
+    #[test]
+    fn a_regions_chunks_go_only_with_it() {
+        let mut a = ex(1, vec![pinned(1, c(1, 1, Advice::Unset)), c(2, 1, Advice::Unset), c(3, 1, Advice::Idle { last_use: 1 })]);
+        a.regions = vec![region(4, &[1, 2, 3], None, 0, 1_000_000)];
+        let d = decide(&quiet(snap(0, 0, vec![], vec![a, ex(2, vec![])])), &[demand(2, 1)]);
+        assert_eq!((d.answers, d.picks), (vec![Answer::Refuse { room: 0 }], vec![]));
     }
 
     /// Graphs 1 (100 µs to capture) and 2 (1 s) share pool chunk 1: neither frees it alone, so

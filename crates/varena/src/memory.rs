@@ -1112,7 +1112,12 @@ impl Memory {
     /// the rest fill from the store, through the page cache. A GPU load with no request open
     /// returns with its pages custody's ([`Memory::settle`]).
     pub fn load(&self, set: SetSpec, level: Level) -> Result<SetId> {
-        self.inner.guard(|| self.inner.load(set, level))
+        let (name, bytes) = (set.name.clone(), set.layout.nbytes);
+        let id = self.inner.guard(|| self.inner.load(set, level))?;
+        if level == Level::Gpu {
+            self.inner.measured(crate::lease::Measured::Set { name, bytes });
+        }
+        Ok(id)
     }
 
     /// Unmaps the set's pages (each as its pin releases) and forgets it.
@@ -3615,7 +3620,9 @@ impl Request {
     pub fn end(mut self) -> Stats {
         self.ended = true;
         let id = self.id;
-        self.inner.guard(|| Ok(self.inner.end_request(id))).unwrap_or_default()
+        let stats = self.inner.guard(|| Ok(self.inner.end_request(id))).unwrap_or_default();
+        self.inner.measured(crate::lease::Measured::Request { request: stats.request.clone(), working: stats.peak, compute: stats.compute, host: stats.host.unwrap_or(0) });
+        stats
     }
 }
 
@@ -3988,6 +3995,17 @@ impl Inner {
                 }
                 drop(st);
                 self.landed.notify_all();
+            }
+        }
+    }
+
+    /// A figure for the lease manager's admission and placement (a request's peaks at its end,
+    /// a set's bytes at its load); nothing when not leased.
+    fn measured(&self, _m: crate::lease::Measured) {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            if let Err(error) = agent.measured(_m) {
+                tracing::debug!("varena: a measured figure for the lease manager: {error}");
             }
         }
     }
