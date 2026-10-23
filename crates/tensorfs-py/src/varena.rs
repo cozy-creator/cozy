@@ -429,9 +429,10 @@ impl PyMemory {
         done(py, &self.gpu.uuid, || self.memory().fill(SetId(set), fill))
     }
 
-    /// Bytes the caller holds that `shrink(want) -> freed` gives back (after idle pages, least
-    /// recently used first); returns its id.
-    fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>) -> PyResult<u32> {
+    /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id. Its next
+    /// use is its components' (`sets`, a graph pool's component; none: no declared use).
+    #[pyo3(signature = (owner, shrink, sets = Vec::new()))]
+    fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>, sets: Vec<u32>) -> PyResult<u32> {
         // Inside torch's allocator a shrink would free through it under its own lock: none runs there.
         let shrink = move |want: u64| {
             if crate::allocator::inside() {
@@ -439,7 +440,8 @@ impl PyMemory {
             }
             Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0)
         };
-        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, shrink))).map(|c| c.0)
+        let sets: Vec<SetId> = sets.into_iter().map(SetId).collect();
+        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, &sets, shrink))).map(|c| c.0)
     }
 
     fn cached(&self, py: Python<'_>, cache: u32, nbytes: u64) -> PyResult<()> {
