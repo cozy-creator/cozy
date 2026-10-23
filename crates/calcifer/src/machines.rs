@@ -670,7 +670,7 @@ impl Machines {
             .unwrap_or_default();
         let mut message = self.unanswered(&name, &error);
         if let Some(Word::Up) = word {
-            message += "; its Hub says its provider reports it running";
+            message += "; its Hub says its provider has not stopped it";
         }
         Err(Error::new(Kind::Unavailable, "machine_unreachable", message)
             .remedy("`--on new` rents a machine, or name another")

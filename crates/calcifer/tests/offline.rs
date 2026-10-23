@@ -242,7 +242,7 @@ async fn a_machine_that_answers_nothing_with_no_known_cause_is_refused_saying_si
         assert_eq!(error.code, "machine_unreachable", "{error:?}");
         assert!(error.message.starts_with(&format!("{name} is unreachable (for ")), "{error:?}");
         assert_eq!(
-            error.message.ends_with("; its Hub says its provider reports it running"),
+            error.message.ends_with("; its Hub says its provider has not stopped it"),
             hub_word,
             "{error:?}"
         );

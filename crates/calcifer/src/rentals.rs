@@ -1040,7 +1040,7 @@ pub(crate) enum Word {
     Offline(String),
     /// It serves at a new address, now recorded and followed.
     Moved,
-    /// Its Hub says its provider reports it running.
+    /// Its Hub says its provider has not stopped it.
     Up,
     /// Its Hub says it is on its way, with no address yet.
     Booting,
