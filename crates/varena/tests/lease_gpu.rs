@@ -130,7 +130,7 @@ impl Executor {
     /// `bytes` of `region`: imported, mapped at a VA of this process, written (fresh) or read
     /// back (adopted), acked landed. "ok <chunks> fresh|adopted verified|corrupt".
     fn take(&mut self, bytes: u64, region: u32, land: bool) -> String {
-        let leases = match self.agent.take(bytes, Some(Region { fingerprint: 0xfeed, region })) {
+        let leases = match self.agent.take(bytes, varena::lease::Kind::Weights, Some(Region { fingerprint: 0xfeed, region })) {
             Ok(leases) => leases,
             Err(e) => return format!("refused {e}"),
         };

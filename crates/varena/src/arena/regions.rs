@@ -13,7 +13,7 @@ use platform::handles::Owned;
 use platform::memory;
 
 use super::{Arena, Chunk, Kind, Owner, PoolId, Shared, State, Torch};
-use crate::backend::Va;
+use crate::backend::{Event, Va};
 use crate::{Error, Result};
 
 /// A swapped region's bytes: a RAM file (a memfd, a pagefile section) mapped here.
@@ -94,7 +94,8 @@ impl Torch {
         let mut out = Evicted::default();
         for (base, len) in spans {
             if let Some(f) = file.as_mut() {
-                sh.backend.copy_out(Va { base, len }, 0, f.at(out.bytes, len)?)?;
+                // The region's streams passed their epochs: nothing to order the copy after.
+                sh.backend.copy_out(Va { base, len }, 0, f.at(out.bytes, len)?, Event::DONE)?;
             }
             let chunks = {
                 let mut st = a.st.lock();

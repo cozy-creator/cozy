@@ -377,13 +377,6 @@ impl Backend for CudaBackend {
         Dst::Device { device: self.ordinal, ptr: va.base + offset, len: len as usize, stream: self.stream.raw() }
     }
 
-    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8]) -> Result<()> {
-        crate::backend::inside(va, offset, dst.len())?;
-        let _ctx = self.primary.enter()?;
-        call!("cuMemcpyDtoHAsync", memcpy_dtoh_async(dst.as_mut_ptr().cast(), va.base + offset, dst.len(), self.stream.raw() as CUstream))?;
-        Ok(self.stream.drain()?)
-    }
-
     fn copy_in(&self, va: Va, offset: u64, src: &[u8]) -> Result<()> {
         crate::backend::inside(va, offset, src.len())?;
         let _ctx = self.primary.enter()?;
@@ -472,6 +465,16 @@ impl Backend for CudaBackend {
     fn drain(&self) -> Result<()> {
         self.stream.drain()?;
         Ok(tensorfs::io::drain(self.ordinal)?)
+    }
+
+    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8], after: Event) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        let stream = self.stream.raw() as CUstream;
+        if after != Event::DONE {
+            call!("cuStreamWaitEvent", stream_wait_event(stream, self.raw(after)?, 0))?;
+        }
+        call!("cuMemcpyDtoHAsync", memcpy_dtoh_async(dst.as_mut_ptr().cast(), va.base + offset, dst.len(), stream))?;
+        Ok(call!("cuStreamSynchronize", stream_synchronize(stream))?)
     }
 
     fn capturing(&self, stream: usize) -> Result<bool> {

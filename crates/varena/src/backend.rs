@@ -51,6 +51,11 @@ pub const OUT_OF_MEMORY: i32 = 2;
 pub trait Backend: Send + Sync {
     /// The device's total bytes (the card, or a host device's limit).
     fn capacity(&self) -> u64;
+    /// Bytes the driver needs free at all times (its lazy kernel loads, cr-215): never leased,
+    /// never filled, in any mode.
+    fn headroom(&self) -> u64 {
+        crate::table::headroom(self.capacity())
+    }
     /// Free bytes as the driver measures them now. Only foreign bytes derive from it (the
     /// device's used bytes less every row's); placement never sizes from it.
     fn free(&self) -> Result<u64>;
@@ -84,10 +89,6 @@ pub trait Backend: Send + Sync {
     /// Where `io::read` writes `len` mapped bytes at `va + offset`: device memory ordered on the
     /// backend's copy stream, or host memory.
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst;
-    /// Copies mapped bytes at `va + offset` into `dst`, waiting for the copy: a region's swap.
-    fn copy_out(&self, _va: Va, _offset: u64, _dst: &mut [u8]) -> Result<()> {
-        Err(Error::Invalid("this backend cannot swap".into()))
-    }
     /// Copies `src` into mapped bytes at `va + offset`, waiting for the copy: a swapped region back in.
     fn copy_in(&self, _va: Va, _offset: u64, _src: &[u8]) -> Result<()> {
         Err(Error::Invalid("this backend cannot swap".into()))
@@ -126,6 +127,11 @@ pub trait Backend: Send + Sync {
     fn capturing(&self, _stream: usize) -> Result<bool> {
         Ok(false)
     }
+    /// Copies `dst.len()` mapped bytes at `va + offset` to host memory once `after` completed;
+    /// returns once they landed. A writer's thread only (it waits on the device).
+    fn copy_out(&self, _va: Va, _offset: u64, _dst: &mut [u8], _after: Event) -> Result<()> {
+        Err(Error::Invalid("this backend copies nothing out".into()))
+    }
 }
 
 /// Pages in host memory (a memfd, an `shm_open` object or a pagefile section each), mapped into
@@ -133,6 +139,7 @@ pub trait Backend: Send + Sync {
 /// are always complete.
 pub struct HostBackend {
     limit: u64,
+    headroom: u64,
     pages: Mutex<Pages>,
 }
 
@@ -156,8 +163,14 @@ impl Pages {
 }
 
 impl HostBackend {
+    /// Host pages load no kernels: no headroom.
     pub fn new(limit: u64) -> HostBackend {
-        HostBackend { limit, pages: Mutex::new(Pages::default()) }
+        HostBackend::with_headroom(limit, 0)
+    }
+
+    /// A host device that keeps `headroom` free, as a card's driver does.
+    pub fn with_headroom(limit: u64, headroom: u64) -> HostBackend {
+        HostBackend { limit, headroom, pages: Mutex::new(Pages::default()) }
     }
 }
 
@@ -247,6 +260,10 @@ impl Backend for HostBackend {
         memory::export(handle).map_err(page_err)
     }
 
+    fn headroom(&self) -> u64 {
+        self.headroom
+    }
+
     fn lend(&self, page: &Physical) -> Result<Owned> {
         let pages = self.pages.lock();
         let (handle, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
@@ -259,13 +276,6 @@ impl Backend for HostBackend {
 
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
         Dst::Host { ptr: (va.base + offset) as *mut u8, len: len as usize }
-    }
-
-    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8]) -> Result<()> {
-        inside(va, offset, dst.len())?;
-        // SAFETY: a mapped range of the caller's reservation, checked to hold `dst.len()` bytes.
-        unsafe { std::ptr::copy_nonoverlapping((va.base + offset) as *const u8, dst.as_mut_ptr(), dst.len()) };
-        Ok(())
     }
 
     fn copy_in(&self, va: Va, offset: u64, src: &[u8]) -> Result<()> {
@@ -307,6 +317,15 @@ impl Backend for HostBackend {
     fn retire(&self, _: Event) {}
 
     fn drain(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8], _: Event) -> Result<()> {
+        if offset.saturating_add(dst.len() as u64) > va.len {
+            return Err(Error::Invalid("a copy outside the reservation".into()));
+        }
+        // SAFETY: the range is mapped (the caller pins it) and host events are complete when made.
+        unsafe { std::ptr::copy_nonoverlapping((va.base + offset) as *const u8, dst.as_mut_ptr(), dst.len()) };
         Ok(())
     }
 }

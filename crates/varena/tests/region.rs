@@ -66,7 +66,7 @@ impl Backend for Shared {
     fn export(&self, page: &Physical) -> varena::Result<Owned> { self.0.host.export(page) }
     fn import(&self, handle: Owned, len: u64) -> varena::Result<Physical> { self.0.host.import(handle, len) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.0.host.target(va, offset, len) }
-    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8]) -> varena::Result<()> { self.0.host.copy_out(va, offset, dst) }
+    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8], after: Event) -> varena::Result<()> { self.0.host.copy_out(va, offset, dst, after) }
     fn copy_in(&self, va: Va, offset: u64, src: &[u8]) -> varena::Result<()> { self.0.host.copy_in(va, offset, src) }
     fn fence(&self) -> varena::Result<Event> { Ok(Event::DONE) }
     fn record(&self, stream: usize) -> varena::Result<Event> {
