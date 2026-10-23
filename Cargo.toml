@@ -75,13 +75,13 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 reqwest = { version = "0.13", default-features = false, features = ["form", "http2", "json", "query", "rustls", "stream"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+saphyr = { version = "0.2.2", default-features = false }
 self-replace = "1.5"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
 serde_json_canonicalizer = "0.3"
-serde_yaml = "0.9"
 sha2 = "0.10"
 sigstore-verify = { version = "0.15", default-features = false, features = ["aws-lc-rs"] }
 supports-hyperlinks = "3.2.0"
