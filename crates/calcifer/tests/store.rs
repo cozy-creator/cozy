@@ -3,7 +3,7 @@ mod common;
 
 use std::{path::Path, sync::Arc};
 
-use calcifer::store::{Acceptance, Batch, NewRun, RunFilter, State, Store, StoreError};
+use calcifer::store::{Acceptance, Batch, NewRun, RunFilter, State, Store, StoreError, VERSION};
 use protocol::{
     calcifer::{Call, Event, ItemStatus, Kind, Status, Warning},
     config::Origin,
@@ -544,7 +544,7 @@ fn version_five_migrates_without_rewriting_run_or_media_history() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        6
+        VERSION
     );
 }
 
