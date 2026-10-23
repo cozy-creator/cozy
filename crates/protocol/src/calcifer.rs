@@ -146,6 +146,9 @@ pub struct Run {
     pub created_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_at_ms: Option<i64>,
+    /// When its machine began executing it; its time counts from here, never its queue's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_at_ms: Option<i64>,
     /// Live: why a queued run waits, from Calcifer's memory.

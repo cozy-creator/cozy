@@ -78,6 +78,7 @@ pub(super) fn state(id: &str, state: &domain::MachineExecutionState) -> v1::RunS
         sequence: state.sequence,
         attempt: state.attempt_ordinal as u32,
         waiting: String::new(),
+        started_at_ms: state.started_at_ms,
     }
 }
 
@@ -341,16 +342,18 @@ impl Log {
         let body: Value =
             serde_json::from_slice(&event.body_canonical_bytes).unwrap_or(Value::Null);
         let kind = match event.kind.as_str() {
-            "state" | "running" => v1::Event::State(v1::RunState {
-                state: body["state"]
-                    .as_str()
-                    .unwrap_or("running")
-                    .replace("starting", "queued"),
-                sequence: event.sequence,
-                attempt: event.attempt_ordinal as u32,
-                waiting: body["waiting_reason"].as_str().unwrap_or_default().into(),
-                ..Default::default()
-            }),
+            "state" | "running" => {
+                let state = body["state"].as_str().unwrap_or("running").replace("starting", "queued");
+                v1::Event::State(v1::RunState {
+                    // Running from this event: its time counts from here.
+                    started_at_ms: if state == "running" { event.at_ms } else { 0 },
+                    state,
+                    sequence: event.sequence,
+                    attempt: event.attempt_ordinal as u32,
+                    waiting: body["waiting_reason"].as_str().unwrap_or_default().into(),
+                    ..Default::default()
+                })
+            }
             "progress" => {
                 let payload = &body["payload"];
                 v1::Event::Progress(v1::Progress {

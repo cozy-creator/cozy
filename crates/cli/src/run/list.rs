@@ -143,11 +143,11 @@ pub(crate) fn row(run: &Run) -> Vec<String> {
         (Status::InProgress, None) => run.machine_state.clone().unwrap_or_default(),
         _ => String::new(),
     };
-    let time = match (run.execution_ms, run.accepted_at_ms) {
-        (Some(ms), _) => seconds(ms),
-        (None, Some(at)) if run.status == Status::InProgress => {
-            seconds(now_ms().saturating_sub(at.max(0) as u64))
-        }
+    // Its own time, never its queue's: since it began executing, then its execution's total.
+    let time = match (run.status, run.execution_ms, run.started_at_ms) {
+        (Status::InProgress, _, Some(at)) => seconds(now_ms().saturating_sub(at.max(0) as u64)),
+        (Status::InProgress | Status::Queued, ..) => "—".into(),
+        (_, Some(ms), _) => seconds(ms),
         _ => "—".into(),
     };
     let reason = match run.status {
