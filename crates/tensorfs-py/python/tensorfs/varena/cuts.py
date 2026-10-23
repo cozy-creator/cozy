@@ -421,6 +421,8 @@ def _settle(
                 raise rungs.exhausted(device, need, name)
             else:
                 before = None
+        if replay:  # the replay returned: its kernels' own fault surfaces here, placed
+            _fence(device, name, "in the replay")
     finally:
         if scope is not None:
             _local.scopes.pop()
@@ -553,6 +555,7 @@ def run(site: Site, forward: Callable[..., object], args: Args, kwargs: Kwargs) 
                         raise first
                     _replayed(again, op)
                     raise
+                _fence(site.device, op, "in the replay")
             finally:
                 layer.journals.remove(journal)
         # a step counter or a band means it must never run twice
@@ -598,6 +601,7 @@ def _bare(
                 raise first
             _replayed(again, op)
             raise
+        _fence(site.device, op, "in the replay")
     if layer.banded != banded:
         _served.memo.blocks[site.key] = Facts(False, facts.generators)
     return out

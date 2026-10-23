@@ -809,9 +809,9 @@ class Syncs:
 
 def fault_steps() -> None:
     """cr-215's diagnostic: a retry's room is made between two device syncs on the failure path
-    only, so its note places a fault before room (earlier async work), after room (the
-    eviction's own) or in the replay (it read what the eviction took). At each retry site: an
-    op, a block's first run, a bare block."""
+    only, and a replay that returns is synced once more, so its note places a fault before room
+    (earlier async work), after room (the eviction's own) or in the replay (it read what the
+    eviction took). At each retry site: an op, a block's first run, a bare block."""
     a, b, x = torch.randn(8, 8), torch.randn(8, 8), torch.ones(4)
     oom, dead = "CUDA out of memory. Tried to allocate 2.00 MiB.", "CUDA error: unknown error"
     pending: list[str] = []
@@ -831,7 +831,13 @@ def fault_steps() -> None:
 
     synchronize = cuts._synchronize
     for what, run in (("aten.mm.default", op), ("block ('launches', 0)", block), ("bare block", block)):
-        cases = ((1, (oom,), "before room", 0), (2, (oom,), "after room", 1), (0, (oom, dead), "in the replay", 1), (0, (oom,), None, 1))
+        cases = (
+            (1, (oom,), "before room", 0),
+            (2, (oom,), "after room", 1),
+            (0, (oom, dead), "in the replay", 1),
+            (3, (oom,), "in the replay", 1),  # the replay returned; its kernels fault at the sync after
+            (0, (oom,), None, 1),
+        )
         for at, texts, step, made in cases:
             memo, _, room = fresh(1 << 60, frees=1 << 20)
             if what == "bare block":
@@ -848,13 +854,13 @@ def fault_steps() -> None:
             name = what if what != "bare block" else "block ('launches', 0)"
             if step is None:
                 check(
-                    f"{what}: a clean retry syncs twice and notes no fault",
-                    raised is None and syncs.calls == 2 and not faulted and room.made == 1,
+                    f"{what}: a clean retry syncs three times and notes no fault",
+                    raised is None and syncs.calls == 3 and not faulted and room.made == 1,
                     (raised, syncs.calls, faulted, room.made),
                 )
                 continue
             check(
-                f"{what}: a fault {step} raises, noted so",
+                f"{what}: a fault {step} (sync {at or 'none'}) raises, noted so",
                 raised is not None and dead in str(raised) and room.made == made
                 and faulted == [f"retry of {name} faulted {step}: RuntimeError: {dead}"],
                 (raised, room.made, room.notes),
