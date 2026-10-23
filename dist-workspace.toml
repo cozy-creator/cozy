@@ -5,7 +5,8 @@ members = ["cargo:."]
 cargo-dist-version = "0.33.0"
 # release.yml is dist's output plus hand edits, each marked HAND-EDITED there: the `must_contain` and
 # `tensorfs_run` dispatch inputs and the plan job's first step, which refuses a release missing any
-# must_contain commit, and the global job's step running scripts/patch-installers.sh.
+# must_contain commit, the global job's step running scripts/patch-installers.sh, and the homebrew job's
+# checkout with the tap's deploy key (secret HOMEBREW_TAP_DEPLOY_KEY) in place of dist's token.
 # After `dist generate` (or a dist upgrade), put them back.
 allow-dirty = ["ci"]
 ci = "github"
@@ -28,8 +29,8 @@ source-tarball = false
 pr-run-mode = "skip"
 github-attestations = true
 tap = "cozy-creator/homebrew-tap"
-# Homebrew's formula is built with every release and pushed nowhere until the owner opens the tap.
-publish-jobs = []
+# A published release pushes its Formula/cozy.rb to the tap.
+publish-jobs = ["homebrew"]
 # A release needs a green platforms.yaml run on its commit, and its own artifacts must pass the smoke and
 # the owner-day suite (owner-day.yml, the product tests on the release's linux x86_64 binary).
 # Both gate `host` by their result (a failed plan-job would skip the builds, which `host` accepts).

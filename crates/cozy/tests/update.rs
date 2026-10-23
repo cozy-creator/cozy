@@ -102,6 +102,33 @@ fn an_archive_without_its_own_attestation_is_refused() {
     assert_eq!(refusal["code"], "unattested", "{refusal}");
 }
 
+/// Homebrew's cozy (its keg in `<prefix>/Cellar`, linked from `<prefix>/bin`) is Homebrew's to
+/// update: `cozy update` names `brew upgrade cozy` and touches nothing.
+#[cfg(unix)]
+#[test]
+fn homebrew_s_cozy_is_left_to_brew_upgrade() {
+    let Some(home) = Home::new() else { return };
+    let keg = home.path().join("homebrew/Cellar/cozy").join(VERSION).join("bin/cozy");
+    let link = home.path().join("homebrew/bin/cozy");
+    for dir in [keg.parent().unwrap(), link.parent().unwrap()] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::rename(home.installed(), &keg).unwrap();
+    std::os::unix::fs::symlink(&keg, &link).unwrap();
+    home.use_binary(&link);
+    let before = fs::read_dir(keg.parent().unwrap()).unwrap().count();
+
+    let out = home.cozy(["--json", "update"]);
+    assert_eq!(out.code, 1, "{out:?}");
+    let refusal = out.refusal();
+    assert_eq!(refusal["code"], "homebrew_managed", "{refusal}");
+    assert_eq!(refusal["next"], serde_json::json!(["brew upgrade cozy"]), "{refusal}");
+    assert!(refusal["message"].as_str().unwrap().contains("homebrew/bin/cozy"), "{refusal}");
+    let out = home.cozy(["update"]);
+    assert!(out.stdout.contains("next: brew upgrade cozy"), "{out:?}");
+    assert_eq!(fs::read_dir(keg.parent().unwrap()).unwrap().count(), before);
+}
+
 /// After `cozy update`, a new bash completes a path wherever cozy takes one, as bash completes
 /// any path: `~` and relative, after `name=`, a directory with `/` and no space, `--out` only
 /// directories. Values still come from the grammar.
