@@ -1198,6 +1198,9 @@ fn role_importer() {
             break;
         }
         let fd = platform::handles::recv_fd(&control).unwrap();
+        // This process's open descriptors: the driver's own fd use for an imported chunk (design §10, M6).
+        let fds = || std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
+        let fds_held = fds();
         let before = (mode == "charge").then(charged);
         let t = std::time::Instant::now();
         let page = b.import(fd, len).unwrap();
@@ -1208,13 +1211,17 @@ fn role_importer() {
             b.destroy(page).unwrap();
         } else if mode == "charge" {
             // NVML's per-process bytes (executor, manager) around each step of a lease's life here.
-            let imported = charged();
+            let (imported, fds_imported) = (charged(), fds());
             b.map(va, 0, &page, Access::ReadWrite).unwrap();
-            let mapped = charged();
+            let (mapped, fds_mapped) = (charged(), fds());
             b.unmap(va, 0, len).unwrap();
             let unmapped = charged();
             b.destroy(page).unwrap();
-            println!("CHARGE before {before:?} imported {imported:?} mapped {mapped:?} unmapped {unmapped:?} released {:?}", charged());
+            println!(
+                "CHARGE before {before:?} imported {imported:?} mapped {mapped:?} unmapped {unmapped:?} released {:?}; open fds with the received one {fds_held}, imported {fds_imported}, mapped {fds_mapped}, released {}",
+                charged(),
+                fds()
+            );
         } else {
             let t = std::time::Instant::now();
             b.map(va, 0, &page, Access::ReadWrite).unwrap();
@@ -1379,6 +1386,158 @@ fn lease_chunks_cost_across_two_processes() {
     println!("TIMINGS NVML's per-process bytes (executor, manager) for one imported {CHUNK} B chunk: {charge} (the importer ended {exit})");
     step!();
     println!("PASS lease chunks measured across two processes {uuid}");
+    step!();
+}
+
+/// TensorD's own context (design §2a): a fresh process with no context. In order: NVML's bytes for it after cuInit;
+/// whether cuMemCreate works with no current context; the bytes the primary context adds; the stack, printf and
+/// malloc-heap limits set to 0 (the driver's answers, and the bytes after); then the context destroyed (the last
+/// release) while a page lives, and whether that page maps and keeps its bytes in a new context.
+#[test]
+#[ignore = "native GPU: a role of a_managers_context_costs_and_pages_outlive_it"]
+fn role_context() {
+    if role().as_deref() != Some("context") {
+        return;
+    }
+    type SetLimit = unsafe extern "C" fn(std::ffi::c_int, usize) -> cuda::CUresult;
+    let d = cuda::driver().unwrap();
+    let mut device = 0;
+    cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut device, 0) }).unwrap();
+    let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
+    let pid = std::process::id();
+    let used = || nvml.read().unwrap().processes.unwrap_or_default().get(&pid).copied().unwrap_or(0);
+    let mut report = vec![format!("after cuInit {} B", used())];
+    let prop = cuda::AllocationProp::device(device, cuda::MEM_HANDLE_TYPE_POSIX_FD);
+    let len = REGION_ALIGN;
+    let mut handle = 0;
+    let no_context = unsafe { (d.mem_create)(&mut handle, len as usize, &prop, 0) };
+    report.push(format!("cuMemCreate with no current context: {no_context}; then {} B", used()));
+    let mut ctx = std::ptr::null_mut();
+    cuda::check("cuDevicePrimaryCtxRetain", unsafe { (d.primary_ctx_retain)(&mut ctx, device) }).unwrap();
+    cuda::check("cuCtxSetCurrent", unsafe { (d.ctx_set_current)(ctx) }).unwrap();
+    report.push(format!("with the primary context {} B", used()));
+    // SAFETY: libcuda is loaded (TensorFS's driver); cuCtxSetLimit has this documented signature.
+    let set_limit = unsafe {
+        let f = libc::dlsym(libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW), c"cuCtxSetLimit".as_ptr());
+        assert!(!f.is_null(), "cuCtxSetLimit");
+        std::mem::transmute::<*mut c_void, SetLimit>(f)
+    };
+    // CU_LIMIT_STACK_SIZE, CU_LIMIT_PRINTF_FIFO_SIZE, CU_LIMIT_MALLOC_HEAP_SIZE.
+    let limits: Vec<String> = [(0, "stack"), (1, "printf"), (2, "malloc heap")].iter().map(|(limit, name)| format!("{name} {}", unsafe { set_limit(*limit, 0) })).collect();
+    report.push(format!("limits to 0: {}; then {} B", limits.join(", "), used()));
+    if no_context != cuda::SUCCESS {
+        cuda::check("cuMemCreate", unsafe { (d.mem_create)(&mut handle, len as usize, &prop, 0) }).unwrap();
+    }
+    cuda::check("cuCtxSetCurrent", unsafe { (d.ctx_set_current)(std::ptr::null_mut()) }).unwrap();
+    let released = unsafe { (d.primary_ctx_release)(device) };
+    report.push(format!("the last release {released}; then {} B with a page alive", used()));
+    // A new context: does the page map and hold bytes?
+    let b = CudaBackend::open(0).unwrap();
+    let page = Physical { id: handle, len };
+    let va = b.reserve(len).unwrap();
+    let survived = b.map(va, 0, &page, Access::ReadWrite).map(|()| {
+        let data = pattern(len, 9);
+        // SAFETY: the page is mapped read-write at va; data outlives the read.
+        unsafe { io::read(&[Copy { src: Src::Host(data.as_ptr()), dst: b.target(va, 0, len) }], &ReadOpts::default()) }.unwrap();
+        let exact = bytes(va.base, len, 0) == data;
+        b.unmap(va, 0, len).unwrap();
+        exact
+    });
+    report.push(format!("in a new context the page maps and holds its bytes: {survived:?}"));
+    b.destroy(page).unwrap();
+    b.release(va);
+    println!("CONTEXT {}", report.join("; "));
+}
+
+/// TensorD's context (design §2a, P1): its VRAM at idle with the limits at their minimum, whether cuMemCreate needs a
+/// current context, and whether VMM pages outlive the context, all measured in a fresh process (role_context). It
+/// prints the answers; a measurement.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_managers_context_costs_and_pages_outlive_it() {
+    let (_, uuid) = gpu();
+    step!();
+    let mut other = child("role_context", "context", Stdio::null());
+    let mut out = String::new();
+    other.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    let exit = other.wait().unwrap();
+    step!();
+    let answers = out.lines().find_map(|l| l.split_once("CONTEXT ").map(|(_, r)| r.to_owned())).unwrap_or_else(|| "no answer".into());
+    println!("TIMINGS a manager's context: {answers} (its process ended {exit})");
+    step!();
+    println!("PASS a manager's context measured {uuid}");
+    step!();
+}
+
+/// The lender of a_kill_9_of_the_manager_leaves_an_executors_kernel_correct: it makes and exports one chunk, sends it,
+/// and holds it until killed.
+#[test]
+#[ignore = "native GPU: a role of a_kill_9_of_the_manager_leaves_an_executors_kernel_correct"]
+fn role_lender() {
+    if role().as_deref() != Some("lender") {
+        return;
+    }
+    let (b, _) = gpu();
+    let page = b.create(CHUNK).unwrap();
+    let mut control = parent();
+    send(&mut control, &b.export(&page).unwrap(), CHUNK);
+    println!("LENDER ready");
+    std::io::stdout().flush().unwrap();
+    // Held until killed.
+    control.read_exact(&mut [0]).unwrap();
+    unreachable!("the lender is killed, never let go");
+}
+
+/// P1 (S5): kill -9 the manager while an executor runs kernels on a chunk it leased. This process imports the
+/// lender's chunk, fills it, and launches a sweep that reads it for ten times its import and map; the lender is
+/// killed -9 while the sweep runs. The sweep's result must be the chunk's, and the chunk still unmaps and releases.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_kill_9_of_the_manager_leaves_an_executors_kernel_correct() {
+    let (b, uuid) = gpu();
+    step!();
+    let (mut control, theirs) = UnixStream::pair().unwrap();
+    let mut lender = child("role_lender", "lender", Stdio::from(OwnedFd::from(theirs)));
+    let (fd, len) = receive(&mut control);
+    step!();
+    let t = std::time::Instant::now();
+    let page = b.import(fd, len).unwrap();
+    let va = b.reserve(len).unwrap();
+    b.map(va, 0, &page, Access::ReadWrite).unwrap();
+    let setup = t.elapsed();
+    step!();
+    let data = pattern(len, 13);
+    // SAFETY: the page is mapped read-write at va; data outlives the read.
+    unsafe { io::read(&[Copy { src: Src::Host(data.as_ptr()), dst: b.target(va, 0, len) }], &ReadOpts::default()) }.unwrap();
+    step!();
+    let (stream, out) = (cuda::Stream::new(0).unwrap(), io::DeviceBuffer::new(0, 16).unwrap());
+    // Ten times the import and map: the kill, a signal, lands well inside it.
+    let long = setup * 10;
+    let launched = std::time::Instant::now();
+    assert_eq!(launch(c"sweep", &[va.base, len / 8, long.as_nanos() as u64, out.ptr()], stream.raw()), cuda::SUCCESS);
+    lender.kill().unwrap();
+    let killed = launched.elapsed();
+    assert_eq!(lender.wait().unwrap().signal(), Some(libc::SIGKILL));
+    step!();
+    let swept = stream.drain();
+    step!();
+    let read = bytes(out.ptr(), 16, 0);
+    let (acc, passes) = (u64::from_ne_bytes(read[..8].try_into().unwrap()), u64::from_ne_bytes(read[8..].try_into().unwrap()));
+    let once = data.chunks(8).fold(0u64, |a, w| a ^ u64::from_ne_bytes(w.try_into().unwrap()));
+    step!();
+    let unmapped = b.unmap(va, 0, len);
+    let released = b.destroy(page);
+    b.release(va);
+    step!();
+    println!("TIMINGS kill -9 of the manager {killed:?} into a {long:?} sweep: the sweep {swept:?}, {passes} passes; unmap {unmapped:?}, release {released:?}");
+    step!();
+    swept.unwrap();
+    assert!(killed < long, "the kill landed after the sweep ({killed:?} of {long:?})");
+    assert_eq!(acc, if passes % 2 == 1 { once } else { 0 }, "the sweep read other bytes than the chunk's ({passes} passes)");
+    unmapped.unwrap();
+    released.unwrap();
+    step!();
+    println!("PASS a kill -9 of the manager leaves an executor's kernel correct {uuid}");
     step!();
 }
 
