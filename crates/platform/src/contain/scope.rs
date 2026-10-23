@@ -62,6 +62,7 @@ fn writable_unified() -> bool {
         return false;
     }
     let path = std::ffi::CString::new(ROOT).unwrap();
+    // SAFETY: statvfs is plain old data; all-zero is a valid value.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: valid path and writable statvfs.
     unsafe { libc::statvfs(path.as_ptr(), &mut stat) == 0 && stat.f_flag & libc::ST_RDONLY == 0 }

@@ -234,6 +234,7 @@ mod sys {
             lock.l_whence = libc::SEEK_SET as _;
             lock.l_start = start as _;
             lock.l_len = len as _;
+            // SAFETY: a lock query on a descriptor we hold, into a writable flock.
             if unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_GETLK, &mut lock) } != 0 {
                 return Err(io::Error::last_os_error().into());
             }

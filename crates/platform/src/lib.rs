@@ -5,7 +5,7 @@
 //! caller's `?` work across the boundary, an `io::Error` keeping its errno both ways.
 //!
 //! The workspace's FFI lives here: only the files listed in `unsafe-boundaries.txt` allow `unsafe`.
-#![deny(unsafe_code)]
+#![deny(unsafe_code, clippy::undocumented_unsafe_blocks)]
 use std::{fmt, io, path::PathBuf};
 
 pub mod contain;

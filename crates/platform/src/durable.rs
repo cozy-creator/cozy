@@ -327,6 +327,7 @@ pub fn device(path: &Path) -> Result<u64> {
         // glibc's wrapper is newer than the manylinux floor the binary links against.
         let mut stat: libc::statx = unsafe { std::mem::zeroed() };
         let flags = libc::AT_STATX_DONT_SYNC;
+        // SAFETY: as above.
         if unsafe {
             libc::syscall(
                 libc::SYS_statx,
@@ -611,6 +612,7 @@ pub fn space(path: &Path) -> Result<Space> {
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: plain-old-data the call fills, and a NUL-terminated path.
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
         if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
             return Err(io::Error::last_os_error().into());
         }

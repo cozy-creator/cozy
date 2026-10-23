@@ -26,6 +26,7 @@ pub fn peer_credentials(stream: &UnixStream) -> Result<Peer> {
 /// The peer as the kernel names it, whoever it runs as.
 #[cfg(target_os = "linux")]
 pub fn peer(stream: &UnixStream) -> io::Result<Peer> {
+    // SAFETY: ucred is plain old data; all-zero is a valid value.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: correctly sized writable credential structure and size pointer.
@@ -188,6 +189,7 @@ fn send_rights(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
     let flags = libc::MSG_NOSIGNAL;
     #[cfg(target_os = "macos")]
     let flags = 0;
+    // SAFETY: a live socket and a message whose buffers outlive the call.
     let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &message, flags) };
     if sent < 0 {
         return Err(io::Error::last_os_error());
@@ -222,6 +224,7 @@ pub fn recv_fd(stream: &UnixStream) -> Result<OwnedFd> {
     let flags = libc::MSG_CMSG_CLOEXEC;
     #[cfg(target_os = "macos")]
     let flags = 0;
+    // SAFETY: correctly sized aligned control/data buffers and a live socket.
     let count = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, flags) };
     if count < 0 {
         return Err(io::Error::last_os_error().into());
@@ -354,6 +357,7 @@ mod tests {
             .filter(|fd| {
                 // SAFETY: plain-old-data the call fills; a closed number fails harmlessly.
                 let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: as above.
                 let open = unsafe { libc::fstat(*fd, &mut stat) } == 0;
                 open && (stat.st_dev as u64, stat.st_ino as u64) == (own.dev(), own.ino())
             })
