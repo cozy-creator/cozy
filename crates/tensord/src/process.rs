@@ -124,9 +124,11 @@ impl Pace {
 pub enum Meter {
     /// CPU plus bytes moved by the process (Runtime `ExecutorChild.watched`).
     Burn,
-    /// An invocation's work, judged while it runs, on every executor and every lane: frames,
-    /// bytes moved, GPU memory traffic, or CPU other than a wait on a stuck GPU. Its call tree
-    /// is its own (`Waits`: a child call is watched by its own executor).
+    /// An invocation's work, judged while it runs, on every executor and every lane: progress it
+    /// reports (a step or stage advanced, an output, weights kept, a child call started; never a
+    /// repeated frame, telemetry or a log line), bytes moved, GPU memory traffic, or CPU other
+    /// than a wait on a stuck GPU. Its call tree is its own (`Waits`: a child call is watched by
+    /// its own executor).
     Work,
 }
 
@@ -163,6 +165,9 @@ struct WatchState {
     /// The work this subject waits on (another call loading a layout it needs), whose progress
     /// is its own while it waits: its re-asks are not.
     lender: Option<Lender>,
+    /// The last stage the subject reported (`progress`), where a wedge's verdict says it stopped.
+    at: String,
+    place: Option<Place>,
     canceled_at: Option<Instant>,
     killed: Option<String>,
     worst_gap: Duration,
@@ -174,6 +179,10 @@ pub type Waits = Arc<dyn Fn() -> bool + Send + Sync>;
 /// The progress meter of work a subject waits on (CPU plus bytes of the call loading a layout
 /// it asked for); None once that work is gone, which lends nothing more.
 pub type Lender = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// What the subject waits on now (GPU memory asked of other processes), for a wedge's verdict;
+/// empty when it names nothing.
+pub type Place = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// One exchange's progress observer, shared with whoever may cancel it. It kills the exact
 /// process (and its group) only on a measured wedge; the kill closes the channel, so the
@@ -238,10 +247,16 @@ impl Watch {
                 let still = now - since;
                 if still > pace.patience(floor) {
                     let measures = match self.meter {
-                        Meter::Work => " (frames, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)",
+                        Meter::Work => " (steps and stages advanced, outputs, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)",
                         Meter::Burn => "",
                     };
-                    let verdict = format!("wedged during {what}: {}{measures}", pace.verdict(still, floor));
+                    let at = match state.at.as_str() {
+                        "" => String::new(),
+                        stage => format!(" at {stage:?}"),
+                    };
+                    let place = state.place.as_ref().map(|place| place()).filter(|place| !place.is_empty());
+                    let place = place.map(|place| format!("; it waits on {place}")).unwrap_or_default();
+                    let verdict = format!("wedged during {what}{at}: {}{measures}{place}", pace.verdict(still, floor));
                     match exact.kill() {
                         Ok(()) => state.killed = Some(verdict),
                         Err(error) => tracing::warn!("{verdict}; kill failed: {error}"),
@@ -252,6 +267,18 @@ impl Watch {
             state = self.changed.wait_timeout(state, liveness.sample).unwrap().0;
         }
     }
+    /// The stage the subject reported last.
+    pub fn at(&self, stage: &str) {
+        let mut state = self.state.lock().unwrap();
+        if state.at != stage {
+            state.at = stage.to_string();
+        }
+    }
+    /// What it waits on, read when a wedge is judged.
+    pub fn place(&self, place: Option<Place>) {
+        self.state.lock().unwrap().place = place;
+    }
+    /// The subject made real progress (`device_executor::advances`).
     pub fn frame(&self) {
         self.state.lock().unwrap().frames += 1;
     }
@@ -575,26 +602,27 @@ mod tests {
 
     /// A call is judged while it runs on its work, with GPUs or without: one blocked with idle
     /// GPUs, or spinning while its GPU holds a kernel that moves no memory (a collective whose
-    /// peer is gone), is killed; one that computes on any number of threads, moves bytes, or
-    /// whose GPUs move memory or cannot be read is not.
+    /// peer is gone), is killed; one that reports advancing steps, computes on any number of
+    /// threads, moves bytes, or whose GPUs move memory or cannot be read is not.
     #[cfg(unix)]
     #[test]
     fn a_call_blocked_or_waiting_on_a_stuck_gpu_is_killed_and_working_ones_are_not() {
         let gpus = |reading: Option<Gpus>| -> Option<Activity> { Some(Arc::new(move || reading)) };
         let spin = "while :; do :; done";
         let cases = [
-            ("blocked", "sleep 600", gpus(Some(Gpus::Idle)), true),
-            ("waits on a stuck GPU", spin, gpus(Some(Gpus::Stuck)), true),
-            ("computes on one thread", spin, gpus(Some(Gpus::Idle)), false),
+            ("blocked", "sleep 600", gpus(Some(Gpus::Idle)), false, true),
+            ("waits on a stuck GPU", spin, gpus(Some(Gpus::Stuck)), false, true),
+            ("reports advancing steps", "sleep 600", gpus(Some(Gpus::Idle)), true, false),
+            ("computes on one thread", spin, gpus(Some(Gpus::Idle)), false, false),
             // However little CPU a loaded machine gives them.
-            ("computes on two threads", "while :; do :; done & while :; do :; done", gpus(Some(Gpus::Idle)), false),
-            ("moves bytes while its GPU is stuck", "while :; do echo work; done > /dev/null", gpus(Some(Gpus::Stuck)), false),
-            ("its GPU moves memory", "sleep 600", gpus(Some(Gpus::Moved)), false),
-            ("its GPU is unread", "sleep 600", gpus(None), false),
+            ("computes on two threads", "while :; do :; done & while :; do :; done", gpus(Some(Gpus::Idle)), false, false),
+            ("moves bytes while its GPU is stuck", "while :; do echo work; done > /dev/null", gpus(Some(Gpus::Stuck)), false, false),
+            ("its GPU moves memory", "sleep 600", gpus(Some(Gpus::Moved)), false, false),
+            ("its GPU is unread", "sleep 600", gpus(None), false, false),
             // A call with no GPUs (a script, a job root) is judged the same way (run 13543).
-            ("blocked with no GPUs", "sleep 600", None, true),
-            ("prints with no GPUs", "while :; do echo line; sleep 0.002; done > /dev/null", None, false),
-            ("computes with no GPUs", spin, None, false),
+            ("blocked with no GPUs", "sleep 600", None, false, true),
+            ("prints with no GPUs", "while :; do echo line; sleep 0.002; done > /dev/null", None, false, false),
+            ("computes with no GPUs", spin, None, false, false),
         ];
         // A shell can fork a CPU spinner. Always end its group, including on an assertion
         // failure: Child::kill only ends the shell and leaves that spinner running.
@@ -610,25 +638,54 @@ mod tests {
                 }
             }
         }
-        for (case, script, activity, killed) in cases {
+        for (case, script, activity, steps, killed) in cases {
             let child = Command::new("/bin/sh").args(["-c", script]).process_group(0).stdin(Stdio::null()).spawn().unwrap();
             let birth = Birth::of(child.id()).unwrap();
             let group = ChildGroup { child, exact: Exact::open(&birth).unwrap().unwrap() };
             let liveness = Liveness { sample: Duration::from_millis(20) };
             let watching = Watching::start(group.exact.try_clone().unwrap(), Meter::Work, liveness, Duration::ZERO, None, activity, "invoke").unwrap();
-            // Long past the floor (0.12 s): only measured stillness ends it.
-            std::thread::sleep(liveness.floor() * 25);
+            // Long past the floor (0.12 s): only measured stillness ends it. A call reporting
+            // steps advances one every few samples.
+            let (watch, until) = (watching.watch(), std::time::Instant::now() + liveness.floor() * 25);
+            while std::time::Instant::now() < until {
+                if steps {
+                    watch.frame();
+                }
+                std::thread::sleep(liveness.sample * 2);
+            }
             assert_eq!(birth.ended().unwrap(), killed, "{case}");
             let verdict = watching.finish().0;
             assert_eq!(verdict.is_some(), killed, "{case}: {verdict:?}");
             if killed {
                 let verdict = verdict.unwrap();
                 assert!(verdict.contains("wedged during invoke: no measurable progress"), "{case}");
-                assert!(verdict.contains("(frames, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)"), "{verdict}");
+                assert!(verdict.contains("(steps and stages advanced, outputs, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)"), "{verdict}");
             }
             drop(group);
             assert!(group_members(&birth).iter().all(|member| member.ended().unwrap()), "{case}: the test left a process running");
         }
+    }
+
+    /// A wedged call's verdict says where it stopped (the last stage it reported) and what it
+    /// waits on (run 14868 sat 13 min at "encoding prompt" with nothing to say why).
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_calls_verdict_names_its_stage_and_what_it_waits_on() {
+        let mut child = Command::new("/bin/sh").args(["-c", "sleep 600"]).process_group(0).stdin(Stdio::null()).spawn().unwrap();
+        let birth = Birth::of(child.id()).unwrap();
+        let liveness = Liveness { sample: Duration::from_millis(20) };
+        let idle: Activity = Arc::new(|| Some(Gpus::Idle));
+        let exact = Exact::open(&birth).unwrap().unwrap();
+        let watching = Watching::start(exact, Meter::Work, liveness, Duration::ZERO, None, Some(idle), "invoke").unwrap();
+        let asked = "bytes on GPU 0 asked of pid 7 (asked 2.00 GiB; gave 0.00 GiB in 3 answers)";
+        watching.watch().at("encoding prompt");
+        watching.watch().place(Some(Arc::new(move || asked.to_string())));
+        std::thread::sleep(liveness.floor() * 25);
+        let verdict = watching.finish().0.expect("a blocked call on an idle GPU is killed");
+        assert!(verdict.starts_with("wedged during invoke at \"encoding prompt\": no measurable progress"), "{verdict}");
+        assert!(verdict.ends_with(&format!("; it waits on {asked}")), "{verdict}");
+        assert!(birth.ended().unwrap());
+        let _ = child.wait();
     }
 
     /// A call waiting on another call that loads a layout it needs moves as that loader moves:

@@ -306,9 +306,16 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
         // A settled run's stream replays its log and closes.
         let mut events = calcifer.events(run.id.as_str(), 0);
         let mut lines = Vec::new();
+        // Each stage the run entered, at its time since the run was accepted: what a run whose
+        // machine was lost has to say about where it got to.
+        let start = run.accepted_at_ms.unwrap_or(run.created_at_ms);
         while let Some(event) = events.next().await {
-            if let Event::Log { level, text, .. } = event? {
-                lines.push(format!("  {level}: {text}"));
+            match event? {
+                Event::Log { level, text, at_ms, .. } if level == "stage" => {
+                    lines.push(format!("  stage: {text} (at {})", duration((at_ms - start).max(0) as f64)));
+                }
+                Event::Log { level, text, .. } => lines.push(format!("  {level}: {text}")),
+                _ => {}
             }
         }
         if !lines.is_empty() {

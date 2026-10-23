@@ -808,6 +808,9 @@ pub struct DeviceExecutor {
     /// Its GPUs' work, which judges its invocations beside its CPU, bytes and frames
     /// (`Meter::Work`); None on a lane with no GPUs.
     pub activity: Option<crate::process::Activity>,
+    /// What its invocations wait on (GPU memory asked of other processes), which a wedge's
+    /// verdict names; None on a lane with no GPUs.
+    pub place: Option<crate::process::Place>,
     root: PathBuf,
     socket: PathBuf,
     _generation_hold: Option<Arc<File>>,
@@ -1533,6 +1536,7 @@ impl DeviceExecutor {
             liveness: Liveness::default(),
             waits: None,
             activity: None,
+            place: None,
             root: config.root,
             socket: config.socket,
             _generation_hold: config.generation_hold,
@@ -1642,6 +1646,7 @@ impl DeviceExecutor {
             self.activity.clone(),
             command.name(),
         )?;
+        watching.watch().place(self.place.clone());
         *self.watched.lock().unwrap() = Some(watching.watch());
         let result = self.exchange(command, fds, services, &watching.watch());
         *self.watched.lock().unwrap() = None;
@@ -1674,13 +1679,13 @@ impl DeviceExecutor {
                 platform::handles::send_fd(&writer, fd)?;
             }
         }
+        let mut last = Advance::default();
         loop {
             let frame = read_frame(&mut self.stream)?
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::UnexpectedEof, "stock executor EOF before reply")
                 })?;
-            // A re-ask while another call loads the layout is no progress of its own (below).
-            if frame.kind != Kind::ReadGrant {
+            if advances(&frame, &mut last) {
                 watch.frame();
             }
             match frame.event {
@@ -1688,7 +1693,12 @@ impl DeviceExecutor {
                     refuse_malformed(&mut self.writer.lock().unwrap(), &frame)?
                 }
                 Some(Event::Progress) if !frame.malformed.is_empty() => (),
-                Some(Event::Progress) => services.progress(&frame),
+                Some(Event::Progress) => {
+                    if !frame.stage.is_empty() {
+                        watch.at(&frame.stage);
+                    }
+                    services.progress(&frame)
+                }
                 Some(Event::Request)
                     if matches!(frame.kind, Kind::StageMemoLookup | Kind::StageMemoStore) =>
                 {
@@ -1909,6 +1919,35 @@ impl Drop for DeviceExecutor {
         if let Err(error) = self.parts().end() {
             tracing::warn!("executor teardown: {error}");
         }
+    }
+}
+
+/// The last progress a call reported: its stage, its fractions (as bits), position, completed
+/// units and relayed call.
+type Advance = (String, Option<u64>, Option<u64>, Option<u64>, u64, Option<String>);
+
+/// Whether `frame` is real progress of its call: a progress frame that moved its stage, position
+/// or completed units (`last` is the one before; a repeat, telemetry or a log line is not), or
+/// a request that makes something toward its output: a product or checkpoint published, weights
+/// kept, a child call started. A re-ask for a layout, a memo lookup, a poll is not.
+fn advances(frame: &Frame, last: &mut Advance) -> bool {
+    match frame.kind {
+        Kind::Progress if matches!(frame.event, Some(Event::Progress)) && !frame.stage.is_empty() => {
+            let fraction = |f: Option<f64>| f.map(f64::to_bits);
+            let now = (
+                frame.stage.clone(),
+                fraction(frame.stage_fraction),
+                fraction(frame.overall_fraction),
+                frame.position,
+                frame.advance,
+                frame.call_request.clone(),
+            );
+            let moved = *last != now;
+            *last = now;
+            moved
+        }
+        Kind::Publish | Kind::CheckpointItem | Kind::Deposit | Kind::KeepPages | Kind::ChildCall => true,
+        _ => false,
     }
 }
 
@@ -2210,6 +2249,34 @@ mod codec_tests {
         runtime.write_all(&(seam::MAX_FRAME as u32 + 1).to_be_bytes()).unwrap();
         let refused = read_frame(&mut machine).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{refused}");
+    }
+
+    /// Only real progress advances a call's watch: a progress frame that moves its stage, position
+    /// or completed units, or a request making output; a repeat, a stageless telemetry frame, a
+    /// log line, a layout re-ask or a poll does not (S8 v15's hung suite read as 79 advances).
+    #[test]
+    fn only_real_progress_advances_a_call() {
+        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
+        let step = |stage: &str, position: u64| serde_json::json!({"event": "progress", "kind": "progress",
+            "stage": stage, "position": position, "total": 8, "advance": position});
+        let frames = [
+            (step("encoding prompt", 0), true),
+            (step("encoding prompt", 0), false),
+            (step("denoise", 1), true),
+            (serde_json::json!({"event": "progress", "kind": "log", "name": "still here", "value": "info"}), false),
+            (serde_json::json!({"event": "progress", "kind": "progress", "stage": ""}), false),
+            (serde_json::json!({"event": "request", "kind": "child_poll", "seq": 3}), false),
+            (serde_json::json!({"event": "request", "kind": "read_grant", "seq": 4}), false),
+            (step("denoise", 1), false),
+            (serde_json::json!({"event": "request", "kind": "publish", "seq": 5, "output": "image"}), true),
+            (step("denoise", 2), true),
+        ];
+        let mut last = Advance::default();
+        for (sent, advanced) in frames {
+            write_frame(&mut runtime, &sent).unwrap();
+            let frame = read_frame(&mut machine).unwrap().unwrap();
+            assert_eq!(advances(&frame, &mut last), advanced, "{sent}");
+        }
     }
 
     /// A request whose fields do not decode (a negative byte count, run 10078) is refused alone

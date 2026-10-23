@@ -642,3 +642,40 @@ async fn a_signed_out_local_run_reaches_its_machine_with_no_owner() {
     machines.close();
     calcifer.close();
 }
+
+/// A machine's logs are kept by Calcifer as it writes them: once it has ended (a rental released,
+/// a pod lost mid-run), `cozy machine logs` still reads them (se-076: gallahan's memory log went
+/// with the pod).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_machines_logs_outlive_it() {
+    let home = tempfile::tempdir().unwrap();
+    admit(home.path());
+    let mut machine = Tensord::start();
+    let calcifer = calcifer(home.path());
+    let machines = machines(&calcifer, home.path());
+    let fingerprint = Digest::from_bytes(machine.endpoint.pin);
+    machines
+        .add("box", &machine.endpoint.address, &fingerprint)
+        .await
+        .unwrap();
+    // The machine writes its memory log as it runs.
+    let logs = machine.root.path().join("state/tensorfs/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let line = "1792726795 refusing pid 4920 (asked 7.39 GiB; gave 0.00 GiB in 3920 answers)\n";
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(logs.join("memory.log")).unwrap();
+    std::io::Write::write_all(&mut file, line.as_bytes()).unwrap();
+    let kept = Home::at(home.path()).calcifer().join("machine-logs/box/memory.log");
+    eventually("the line kept", async || {
+        std::fs::read_to_string(&kept).ok().filter(|text| text.contains("refusing pid 4920"))
+    })
+    .await;
+
+    // The pod is gone, and with it the machine's own files.
+    machine.stop();
+    std::fs::remove_dir_all(&logs).unwrap();
+    machines.end("box", true).await.unwrap();
+    let read = machines.logs("box", MachineLog::Memory, 0).await.unwrap();
+    assert!(String::from_utf8_lossy(&read).ends_with(line), "{}", String::from_utf8_lossy(&read));
+    machines.close();
+    calcifer.close();
+}

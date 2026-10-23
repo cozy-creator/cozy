@@ -210,6 +210,26 @@ impl GpuLedger {
         let _ = self.inner.end.set(Arc::new(end));
     }
 
+    /// What `pid` waits on here, read when a wedge of its call is judged: its requests waiting
+    /// for room, and the rows asked for bytes now, each with what it was asked and gave.
+    pub fn place(&self, pid: u32) -> crate::process::Place {
+        let inner = self.inner.clone();
+        Arc::new(move || {
+            let Ok(rows) = inner.ledger.snapshot() else { return String::new() };
+            let gib = |n: u64| format!("{:.2} GiB", n as f64 / (1u64 << 30) as f64);
+            let waits = rows.iter().any(|r| r.pid == pid && r.facts.waiting > 0);
+            let asked: Vec<String> = (rows.iter())
+                .filter(|r| r.pid != pid && r.want > 0)
+                .map(|r| format!("pid {} (asked {}; gave {} in {} answers)", r.pid, gib(r.want), gib(r.acked), r.progress))
+                .collect();
+            match (waits, asked.is_empty()) {
+                (false, true) => String::new(),
+                (true, true) => format!("free bytes on GPU {}", inner.entry),
+                (_, false) => format!("bytes on GPU {} asked of {}", inner.entry, asked.join(", ")),
+            }
+        })
+    }
+
     /// What ends an idle process that answers asks for bytes it says it holds and frees none;
     /// set once, after the pool exists.
     pub fn on_refusing(&self, end: Ender) {

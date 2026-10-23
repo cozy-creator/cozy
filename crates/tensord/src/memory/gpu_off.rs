@@ -22,6 +22,9 @@ impl GpuLedger {
     pub fn on_refusing(&self, _: Ender) {
         match *self {}
     }
+    pub fn place(&self, _: u32) -> crate::process::Place {
+        match *self {}
+    }
     pub fn grant(&self) -> io::Result<[File; 2]> {
         match *self {}
     }

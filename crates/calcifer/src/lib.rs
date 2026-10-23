@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 mod access;
 pub mod api;
+mod kept;
 mod lanes;
 pub mod link;
 pub mod machines;
@@ -486,9 +487,16 @@ impl Calcifer {
         }
     }
 
-    fn progress(&self, id: &RunId, progress: Progress) {
-        lock(&self.live).entry(id.clone()).or_default().progress = Some(progress.clone());
+    /// Records the run's progress; whether it entered a stage it was not in.
+    fn progress(&self, id: &RunId, progress: Progress) -> bool {
+        let entered = {
+            let mut live = lock(&self.live);
+            let live = live.entry(id.clone()).or_default();
+            let was = live.progress.replace(progress.clone()).map(|p| p.stage);
+            !progress.stage.is_empty() && was.as_deref() != Some(progress.stage.as_str())
+        };
         let _ = self.events.send((id.clone(), Event::Progress { progress }));
+        entered
     }
 
     fn wake(&self, id: &RunId) {
@@ -831,7 +839,10 @@ impl Calcifer {
                 }
                 Frame::Gpu(_) => self.not_waiting(id),
                 Frame::Progress(p) => {
-                    self.progress(
+                    // Each stage it enters is kept with the run, so a run whose machine is lost
+                    // still says where it got to and when (run 14868, `encoding prompt`).
+                    let stage = p.stage.clone();
+                    let entered = self.progress(
                         id,
                         Progress {
                             stage: p.stage,
@@ -844,6 +855,9 @@ impl Calcifer {
                             step_avg_ms: p.step_avg_ms,
                         },
                     );
+                    if entered {
+                        batch.logs.push((frame.at_ms, "stage".into(), stage));
+                    }
                     continue;
                 }
                 Frame::State(state) => {

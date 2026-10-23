@@ -2573,6 +2573,7 @@ impl Pool {
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
         executor.activity = gpu_work(self.lane(start, plan.degree)?);
+        executor.place = gpu_place(self.lane(start, plan.degree)?, executor.birth.pid);
         executor.keep_memo(self.memo.clone());
         if plan.degree > 0 {
             let exact = Exact::open(&executor.birth)?.ok_or_else(|| io::Error::other("executor exited before its start"))?;
@@ -3188,6 +3189,14 @@ fn unsettled(reply: &Frame, lost: &str) -> Refused {
         poisoned => format!("{message}; the executor did not settle quiescent (poisoned: {poisoned})"),
     };
     Refused { code, detail }
+}
+
+/// What executor `pid` waits on across `gpus`' ledgers, for a wedge's verdict; None without one.
+fn gpu_place(gpus: &[Device], pid: u32) -> Option<crate::process::Place> {
+    let places: Vec<_> = gpus.iter().filter_map(|gpu| gpu.memory.as_ref().map(|ledger| ledger.place(pid))).collect();
+    (!places.is_empty()).then(|| -> crate::process::Place {
+        Arc::new(move || places.iter().map(|place| place()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("; "))
+    })
 }
 
 /// What `gpus` did since the last reading; None without GPUs or while NVML cannot tell.

@@ -521,7 +521,8 @@ impl View {
                     self.line(&format!("  {}  {}", item_name(item), checkpoint(reference)));
                 }
             }
-            Event::Log { level, text, .. } if !matches!(level.as_str(), "info" | "debug") => {
+            // A stage the run entered shows in its progress line as it goes.
+            Event::Log { level, text, .. } if !matches!(level.as_str(), "info" | "debug" | "stage") => {
                 self.line(&format!("  {level}: {text}"));
             }
             Event::Call { call, .. } => {
