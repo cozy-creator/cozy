@@ -53,6 +53,8 @@ pub struct Endpoint {
     client: Client,
     token: Option<Arc<dyn TokenProvider>>,
     patience: Patience,
+    /// Bytes of file bodies sent, ever: an upload's progress while its objects are on their way.
+    sent: Arc<AtomicU64>,
 }
 
 enum At {
@@ -138,7 +140,7 @@ impl Endpoint {
             At::Http(_) => token.or_else(|| default_for(&url)),
             At::Dir(..) => None,
         };
-        Ok(Endpoint { url, at, client: client.clone(), token, patience: Patience::default() })
+        Ok(Endpoint { url, at, client: client.clone(), token, patience: Patience::default(), sent: Arc::default() })
     }
 
     pub fn url(&self) -> &str {
@@ -477,7 +479,7 @@ impl Endpoint {
                     Payload::Bytes(bytes) => Body::Bytes(bytes),
                     Payload::File(file) => {
                         let length = file.metadata().map_err(|e| crate::err::classify_io(ask.url, e))?.len();
-                        Body::File { file, length, sent: Arc::clone(&moved) }
+                        Body::File { file, length, sent: [Arc::clone(&moved), Arc::clone(&self.sent)] }
                     }
                 }),
                 None => None,
@@ -680,7 +682,13 @@ pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef,
     let total = leaves.iter().chain(&headers)
         .try_fold(0u64, |sum, object| sum.checked_add(object.length))
         .ok_or_else(|| Refusal { code: Code::ARITH_OVERFLOW, detail: "upload closure byte count overflows".into() })?;
-    let mut verified = 0;
+    // Done: the objects it holds or that landed, and the bytes on their way meanwhile, so a slow
+    // upload is never silent between objects.
+    let (mut verified, mut landed, before) = (0, 0, endpoint.sent.load(Ordering::Relaxed));
+    let moving = |verified: u64, landed: u64| {
+        let sending = endpoint.sent.load(Ordering::Relaxed).saturating_sub(before).saturating_sub(landed);
+        (control.progress)(verified.saturating_add(sending).min(total), total);
+    };
     (control.progress)(0, total);
     for stage in [leaves, headers] {
         let mut sending = futures::stream::iter(stage)
@@ -696,15 +704,18 @@ pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef,
             }
             let done = tokio::select! {
                 done = sending.next() => done,
-                () = tokio::time::sleep(ask::TICK) => continue,
+                () = tokio::time::sleep(ask::TICK) => {
+                    moving(verified, landed);
+                    continue;
+                }
             };
             let Some(done) = done else { break };
             let (pushed, length) = done?;
             if pushed {
-                (sent, bytes) = (sent + 1, bytes + length);
+                (sent, bytes, landed) = (sent + 1, bytes + length, landed + length);
             }
             verified += length;
-            (control.progress)(verified, total);
+            moving(verified, landed);
         }
     }
     if (control.cancelled)() || !(control.commit)() {

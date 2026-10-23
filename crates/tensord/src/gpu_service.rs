@@ -2619,7 +2619,7 @@ impl Pool {
         let mut callbacks = Callbacks {
             engine,
             id,
-            completed: 0,
+            seen: Default::default(),
             deposits: &self.host.deposits,
             holders: group(session),
             generation: &held.record,
@@ -3560,7 +3560,7 @@ fn granted(seq: u64, layout: Option<File>) -> (Answer, Vec<File>) {
 struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
-    completed: u64,
+    seen: crate::calls::Seen,
     deposits: &'a Deposits,
     /// The executor processes a layout granted or deposited here is mapped by.
     holders: Vec<Birth>,
@@ -3677,7 +3677,7 @@ impl Services for Callbacks<'_> {
     }
     fn progress(&mut self, frame: &Frame) {
         self.pool.host.nudge();
-        crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
+        crate::calls::observe(self.engine, self.id, &mut self.seen, frame, self.caller);
     }
     fn request(
         &mut self,

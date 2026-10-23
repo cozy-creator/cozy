@@ -35,7 +35,7 @@ fn a_relayed_child_stage_carries_its_download_bytes() {
         calls: Mutex::new(CallTable { by_index: [(0, call)].into(), ..Default::default() }),
     });
     let caller = Caller { calls: broker.clone(), parent };
-    let mut completed = 0;
+    let mut seen = Seen::default();
     let mut relay = |stage: &str, call: Option<&str>| -> Value {
         let mut event = json!({"event": "progress", "request_id": job, "kind": "progress", "stage": stage,
             "advance": 0, "step_ms": 0.0, "call_attempt": 1});
@@ -45,7 +45,7 @@ fn a_relayed_child_stage_carries_its_download_bytes() {
         let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
         runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
         runtime.write_all(&body).unwrap();
-        observe(engine, &job, &mut completed, &device_executor::read_frame(&mut machine).unwrap().unwrap(), Some(&caller));
+        observe(engine, &job, &mut seen, &device_executor::read_frame(&mut machine).unwrap().unwrap(), Some(&caller));
         serde_json::from_str(&engine.get(&job).unwrap().progress.unwrap()).unwrap()
     };
     let own = |detail: Value| engine.observe_progress(&child, 0, detail.to_string()).unwrap();
@@ -53,6 +53,8 @@ fn a_relayed_child_stage_carries_its_download_bytes() {
     own(json!({"stage": "downloading acme/model@1.0.0 bf16", "bytes_done": 5u64 << 30, "bytes_total": 20u64 << 30}));
     let seen = relay("Reference / downloading acme/model@1.0.0 bf16", Some("job/0"));
     assert_eq!((&seen["bytes_done"], &seen["bytes_total"]), (&json!(5u64 << 30), &json!(20u64 << 30)));
+    own(json!({"stage": "denoise", "position": 3, "total": 8, "step_ms": 64_000.0, "step_avg_ms": 65_000.0}));
+    assert_eq!(relay("Reference / denoise", Some("job/0"))["step_avg_ms"], json!(65_000.0), "the call's steady step time");
     // An older Runtime names no child: the stage alone.
     let seen = relay("Reference / downloading acme/model@1.0.0 bf16", None);
     assert!(seen.get("bytes_done").is_none(), "{seen}");
@@ -62,6 +64,35 @@ fn a_relayed_child_stage_carries_its_download_bytes() {
     assert!(seen.get("bytes_total").is_none(), "{seen}");
     drop(caller);
     drop(broker);
+    drop(service);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A stage's steady step time is the mean of its steps after the first, which carries the
+/// stage's setup (run 14615's first step took 580 s and its others 65 s; watch said 551 s/step).
+/// A caller relaying its call's stage shows that call's.
+#[test]
+fn a_stage_says_its_steady_step_time_without_its_first_step() {
+    let root = std::env::temp_dir().join(format!("cm-steps-{}", uuid::Uuid::new_v4()));
+    let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
+    let engine = &service.engine;
+    let job = engine.accept_run("alice", "job", "job", Invocation::default()).unwrap().0.id;
+    let mut seen = Seen::default();
+    let mut step = |stage: &str, position: u64, ms: f64| -> Value {
+        let event = json!({"event": "progress", "request_id": job, "kind": "progress", "stage": stage,
+            "advance": position, "position": position, "total": 8, "step_ms": ms, "call_request": null});
+        let body = serde_json::to_vec(&event).unwrap();
+        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
+        runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+        runtime.write_all(&body).unwrap();
+        observe(engine, &job, &mut seen, &device_executor::read_frame(&mut machine).unwrap().unwrap(), None);
+        serde_json::from_str(&engine.get(&job).unwrap().progress.unwrap()).unwrap()
+    };
+    assert!(step("denoise", 1, 580_000.0).get("step_avg_ms").is_none(), "a first step alone is no pace");
+    assert_eq!(step("denoise", 2, 66_000.0)["step_avg_ms"], json!(66_000.0));
+    let shown = step("denoise", 3, 64_000.0);
+    assert_eq!((&shown["step_avg_ms"], &shown["step_ms"]), (&json!(65_000.0), &json!(64_000.0)));
+    assert!(step("decode", 1, 900.0).get("step_avg_ms").is_none(), "a new stage starts again");
     drop(service);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -87,7 +118,7 @@ fn package_log_lines_reach_the_root_log_and_stop_at_its_bound() {
         let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
         runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
         runtime.write_all(&body).unwrap();
-        observe(engine, seam, &mut 0, &device_executor::read_frame(&mut machine).unwrap().unwrap(), None);
+        observe(engine, seam, &mut Seen::default(), &device_executor::read_frame(&mut machine).unwrap().unwrap(), None);
     };
     let lines = || -> Vec<Value> {
         engine.logs(&job).unwrap().iter().map(|l| serde_json::from_slice(&l.product).unwrap()).collect()
@@ -105,7 +136,7 @@ fn package_log_lines_reach_the_root_log_and_stop_at_its_bound() {
     let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
     runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
     runtime.write_all(&body).unwrap();
-    observe(engine, own, &mut 0, &device_executor::read_frame(&mut machine).unwrap().unwrap(), None);
+    observe(engine, own, &mut Seen::default(), &device_executor::read_frame(&mut machine).unwrap().unwrap(), None);
     assert_eq!(lines(), vec![
         json!({"level": "info", "text": "description text used index=0 name=Andrea text=\"A woman with long dark hair\""}),
         json!({"level": "warning", "text": "caption_images: caption slow seconds=3.5"}),

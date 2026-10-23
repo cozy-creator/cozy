@@ -848,13 +848,18 @@ impl MachineBackend for NativeBackend {
             // A run preparing inside itself (`runs`) shows its stage and bytes as progress.
             let preparing = record.state == State::Queued
                 && record.waiting_reason.as_deref() == Some(crate::journal::PREPARING);
-            // What a queued run waits for (another run's install, its place in the queue) is its state.
+            // What a queued run waits for (another run's install, its place in the queue) is its state,
+            // until its weights arrive meanwhile: then their bytes are its progress, the client
+            // saying both.
             let waiting = record.waiting.clone().filter(|_| record.state == State::Queued);
-            if let Some(progress) = record.progress.as_ref().filter(|_| (running || preparing) && waiting.is_none()) {
-                let payload = serde_json::from_str::<Value>(progress)
+            let payload = record.progress.as_ref().map(|progress| {
+                serde_json::from_str::<Value>(progress)
                     .ok()
                     .filter(Value::is_object)
-                    .unwrap_or_else(|| json!({"stage":progress,"step_ms":0.0}));
+                    .unwrap_or_else(|| json!({"stage":progress,"step_ms":0.0}))
+            });
+            let arriving = payload.as_ref().is_some_and(|p| p["bytes_done"].as_u64() < p["bytes_total"].as_u64());
+            if let Some(payload) = payload.filter(|_| (running || preparing) && waiting.is_none() || arriving) {
                 events.push(event(
                     record.revision,
                     "progress",

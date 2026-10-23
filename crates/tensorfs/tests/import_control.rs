@@ -22,6 +22,8 @@ const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DATA: &[u8] = b"0123456789abcdef";
 const CONFIG: &[u8] = br#"{"_class_name":"Fixture","gain":3}"#;
 const ASSET: &[u8] = br#"{"vocab":["one","two"]}"#;
+/// A trickled member's pace: one byte per wait.
+const TRICKLE: Duration = Duration::from_millis(25);
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -56,14 +58,15 @@ fn safetensors() -> Vec<u8> {
 }
 
 /// What the first ask of a path meets: the listing's or the member's body held after its
-/// prefix until released; or, of the member, a 429 with `Retry-After: 1` or its body cut after
-/// the prefix.
+/// prefix until released; or, of the member, a 429 with `Retry-After: 1`, its body cut after
+/// the prefix, or its body trickled a byte at a time.
 #[derive(Clone, Copy, PartialEq)]
 enum Stall {
     Listing,
     Member,
     Busy,
     Cut,
+    Trickle,
 }
 #[derive(Clone)]
 struct Seen {
@@ -134,6 +137,16 @@ impl Origin {
                 Some(_) => path.ends_with("/model.safetensors"),
                 None => false,
             };
+            if stalls && stall == Some(Stall::Trickle) {
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-length:{}\r\nconnection:close\r\n\r\n", body.len());
+                for byte in body.iter() {
+                    thread::sleep(TRICKLE);
+                    if stream.write_all(&[*byte]).and_then(|()| stream.flush()).is_err() {
+                        return;
+                    }
+                }
+                return;
+            }
             if stalls && !fired.swap(true, Ordering::AcqRel) {
                 if stall == Some(Stall::Busy) {
                     let busy = b"HTTP/1.1 429 Busy\r\nretry-after: 1\r\ncontent-length:0\r\nconnection:close\r\n\r\n";
@@ -471,6 +484,37 @@ fn weather_and_cut_bodies_are_asked_again_from_the_byte_reached() {
             _ => assert_eq!(asks[1].range.as_deref(), Some("bytes=16-"), "not resumed from the byte reached"),
         }
     }
+}
+
+/// A member landing slowly is told byte by byte as it lands, not only once it is whole: a
+/// watcher of the import sees it move for as long as bytes do (runs 14517 and 14555 were
+/// killed inside one silent shard). Its digest is taken as it lands and still holds it to the
+/// provider's.
+#[test]
+fn a_trickled_member_is_told_as_its_bytes_land() {
+    let scratch = Scratch::new();
+    let origin = Origin::new(Some(Stall::Trickle));
+    let store = Store::open(scratch.0.join("store")).unwrap();
+    let told = Mutex::new(Vec::new());
+    let progress = |stage: &str, done, total| {
+        if stage == "downloading" {
+            told.lock().unwrap().push((done, total));
+        }
+    };
+    let (sources, tmp, access) = (vec!["hf://proof/model".to_owned()], store.root().join("tmp"), access(&origin, None, None, None));
+    let mut writer = store.writer(None, None).unwrap();
+    let request = Request { sources: &sources, converter: None, source_variant: None, access: &access, tmp: &tmp, progress: &progress, stop: None };
+    import::convert(&request, &mut writer).unwrap();
+    assert_bytes(&store, writer.committed().unwrap(), writer.repo_files());
+    let told = told.into_inner().unwrap();
+    let total = told[0].1;
+    let mut counts: Vec<u64> = told.iter().map(|(done, _)| *done).collect();
+    assert!(counts.windows(2).all(|w| w[0] <= w[1]), "counts went back: {counts:?}");
+    assert!(told.iter().all(|(done, all)| *all == total && *done <= total), "{told:?}");
+    counts.dedup();
+    // Told only between members, four members show at most five counts.
+    let members = 4;
+    assert!(counts.len() > members + 3, "a trickled member was silent while it landed: {counts:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -300,8 +300,8 @@ impl<'a> Scope<'a> {
     pub(super) fn list(&self, spec: &Spec) -> Result<Listing> {
         list_in(spec, self)
     }
-    pub(super) fn land(&self, member: &Member, dest: &Path) -> Result<PathBuf> {
-        land_in(member, dest, self)
+    pub(super) fn land(&self, member: &Member, dest: &Path, landed: &mut (dyn FnMut(u64) + Send)) -> Result<PathBuf> {
+        land_in(member, dest, self, landed)
     }
     pub(super) fn read_small(&self, member: &Member) -> Result<Vec<u8>> {
         read_small_in(member, self)
@@ -882,10 +882,13 @@ pub fn select(
 /// Lands `m` at `dest`: resumes a partial file, then checks length and sha256 when the
 /// provider states them. A local member is read where it is.
 pub fn land(m: &Member, dest: &Path, access: &Access) -> Result<PathBuf> {
-    land_in(m, dest, &Scope::new(access, None))
+    land_in(m, dest, &Scope::new(access, None), &mut |_| {})
 }
 
-fn land_in(m: &Member, dest: &Path, access: &Scope<'_>) -> Result<PathBuf> {
+/// `m` landed at `dest`, telling `landed` how many of its bytes are here and verified as they
+/// are: a kept prefix as it is read again for the digest, then each frame as it arrives. The
+/// digest is taken as the bytes land, so nothing is read twice.
+fn land_in(m: &Member, dest: &Path, access: &Scope<'_>, landed: &mut (dyn FnMut(u64) + Send)) -> Result<PathBuf> {
     access.check()?;
     let (url, provider) = match &m.at {
         At::Local(path) => return Ok(path.clone()),
@@ -896,12 +899,12 @@ fn land_in(m: &Member, dest: &Path, access: &Scope<'_>) -> Result<PathBuf> {
         std::fs::create_dir_all(parent).map_err(io)?;
     }
     let have = std::fs::metadata(dest).map(|md| md.len()).unwrap_or(0);
-    if m.length != Some(have) || m.sha256.is_none() {
-        let from = if m.length.is_some_and(|l| have < l) {
-            have
-        } else {
-            0
-        };
+    // A whole file the provider states a digest for is only verified; a shorter one resumes.
+    let whole = m.length == Some(have) && m.sha256.is_some();
+    let from = if whole || m.length.is_some_and(|l| have < l) { have } else { 0 };
+    let verify = m.sha256.is_some();
+    let mut hash = prefix(dest, from, verify, access, landed)?;
+    if !whole {
         let mut out: File = OpenOptions::new().create(true).append(true).open(dest).map_err(io)?;
         out.set_len(from).map_err(io)?;
         let (range, mut end) = ((from > 0).then_some((from, None)), from);
@@ -909,9 +912,12 @@ fn land_in(m: &Member, dest: &Path, access: &Scope<'_>) -> Result<PathBuf> {
             if at != end {
                 // The origin started the body over.
                 out.set_len(at).map_err(io)?;
+                hash = prefix(dest, at, verify, access, landed)?;
             }
             out.write_all(frame).map_err(io)?;
+            hash.update(frame);
             end = at + frame.len() as u64;
+            landed(end);
             Ok(())
         })?;
         out.sync_all().map_err(io)?;
@@ -928,7 +934,7 @@ fn land_in(m: &Member, dest: &Path, access: &Scope<'_>) -> Result<PathBuf> {
         );
     }
     if let Some(want) = &m.sha256 {
-        let got = super::source::file_sha256(dest)?;
+        let got = crate::sha256::hex(&hash.finish());
         if &got != want {
             std::fs::remove_file(dest).map_err(io)?;
             return refuse(
@@ -938,6 +944,31 @@ fn land_in(m: &Member, dest: &Path, access: &Scope<'_>) -> Result<PathBuf> {
         }
     }
     Ok(dest.to_path_buf())
+}
+
+/// The digest of the first `upto` bytes of `path` (none read unless `verify`), each MiB told to
+/// `landed` as it is read.
+fn prefix(path: &Path, upto: u64, verify: bool, access: &Scope<'_>, landed: &mut (dyn FnMut(u64) + Send)) -> Result<crate::sha256::Sha256> {
+    use std::io::Read;
+    let mut hash = crate::sha256::Sha256::new();
+    if upto == 0 || !verify {
+        landed(upto);
+        return Ok(hash);
+    }
+    let io = |e| crate::err::classify_io(format!("read {}", path.display()), e);
+    let mut file = File::open(path).map_err(io)?.take(upto);
+    let (mut buffer, mut read) = (vec![0u8; 1 << 20], 0);
+    loop {
+        access.check()?;
+        match file.read(&mut buffer).map_err(io)? {
+            0 => return Ok(hash),
+            n => {
+                hash.update(&buffer[..n]);
+                read += n as u64;
+                landed(read);
+            }
+        }
+    }
 }
 
 /// Bytes `from..to` of a remote member.

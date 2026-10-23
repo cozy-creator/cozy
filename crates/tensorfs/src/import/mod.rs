@@ -299,11 +299,19 @@ fn land(
     let total = members.iter().filter_map(|m| m.length).sum();
     let mut done = 0;
     let mut out = Vec::new();
+    // Bytes are told as they land, at most once a tick: a large member is never silent.
+    let mut told = std::time::Instant::now();
     for m in members {
         access.check()?;
         progress("downloading", done, total);
         access.check()?;
-        out.push((m.path.clone(), access.land(m, &area.join(&m.path))?));
+        let mut landed = |bytes| {
+            if told.elapsed() >= crate::fetch::ask::TICK {
+                told = std::time::Instant::now();
+                progress("downloading", done + bytes, total);
+            }
+        };
+        out.push((m.path.clone(), access.land(m, &area.join(&m.path), &mut landed)?));
         done += m.length.unwrap_or(0);
     }
     progress("downloading", done, total);

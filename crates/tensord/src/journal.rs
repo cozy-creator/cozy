@@ -375,7 +375,32 @@ pub struct ProgressSnapshot {
     pub detail: String,
     /// What the run waits for, while it waits (`Execution::waiting`).
     pub waiting: Option<String>,
+    /// The weights it waits on while they arrive, shown in `detail` over its own detail, kept here.
+    pub weights: Option<(Weights, String)>,
     pub revision: u64,
+}
+
+/// Weights a run waits on while they arrive (`access::meter`): their repositories, and the
+/// bytes here of their total.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Weights {
+    pub models: String,
+    pub done: u64,
+    pub total: u64,
+}
+
+impl Weights {
+    /// The progress detail they show over the run's own `detail`: its enclosing scope (what the
+    /// stage is part of) and the download, never a step its weights have not reached.
+    pub fn over(&self, detail: &str) -> String {
+        let own: Value = serde_json::from_str(detail).unwrap_or(Value::Null);
+        let label = format!("downloading {} weights", self.models);
+        let stage = match own["stage"].as_str().and_then(|stage| stage.rsplit_once(" / ")) {
+            Some((scope, _)) => format!("{scope} · {label}"),
+            None => label,
+        };
+        serde_json::json!({"stage": stage, "bytes_done": self.done, "bytes_total": self.total, "step_ms": 0.0}).to_string()
+    }
 }
 
 impl ProgressSnapshot {

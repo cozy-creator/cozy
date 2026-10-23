@@ -109,13 +109,14 @@ impl Answer {
     }
 }
 
-/// A request body: bytes, or the first `length` bytes of a file, counted into `sent` as they go.
+/// A request body: bytes, or the first `length` bytes of a file, counted into each of `sent`
+/// as they go (the exchange's stall rule, the endpoint's bytes sent).
 pub(crate) enum Body {
     Bytes(Bytes),
     File {
         file: std::fs::File,
         length: u64,
-        sent: Arc<AtomicU64>,
+        sent: [Arc<AtomicU64>; 2],
     },
 }
 
@@ -126,7 +127,7 @@ impl Body {
             Body::File { file, length, sent } => (tokio::fs::File::from_std(file), length, sent),
         };
         let frames = futures::stream::unfold((file, length), move |(mut file, left)| {
-            let sent = Arc::clone(&sent);
+            let sent = sent.clone();
             async move {
                 if left == 0 {
                     return None;
@@ -136,7 +137,7 @@ impl Body {
                     Ok(0) => (Err(std::io::ErrorKind::UnexpectedEof.into()), 0),
                     Ok(n) => {
                         buf.truncate(n);
-                        sent.fetch_add(n as u64, Ordering::Relaxed);
+                        sent.iter().for_each(|sent| _ = sent.fetch_add(n as u64, Ordering::Relaxed));
                         (Ok(Frame::data(Bytes::from(buf))), left - n as u64)
                     }
                     Err(error) => (Err(error), 0),

@@ -240,6 +240,9 @@ pub struct Progress {
     pub bytes_total: u64,
     #[serde(default)]
     pub step_ms: f64,
+    /// The stage's steady step time: the mean of its steps after the first; 0 before one.
+    #[serde(default)]
+    pub step_avg_ms: f64,
 }
 
 /// One event of a run's stream.
