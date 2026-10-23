@@ -3210,6 +3210,84 @@ fn origins(trace: &str) -> std::collections::BTreeMap<&str, usize> {
     n
 }
 
+// ---- VRAM yield (design/vram-yield.md §4): a stand-in game
+
+/// The stand-in game of the VRAM-yield proof: a CUDA process with no varena, so the ledger counts its bytes as foreign
+/// and NVML lists it as a compute process. One command per stdin line; each reply is a line `@ <reply>` on stdout, and
+/// every allocation is logged as `STANDIN alloc <n> ok|fail <ms since start>`.
+/// - `fill <percent>`: allocates 1 GiB blocks until it holds that share of the card (the game that takes memory).
+/// - `budget <percent>`: reads cuMemGetInfo's free bytes once, then allocates that share of them (the game that
+///   sizes itself from its budget at launch).
+/// - `sample`: NVML's bytes per compute process, `<ms> <pid>:<bytes> …`, and the device's free bytes.
+/// - `release`: frees every block. `exit`: ends.
+#[test]
+#[ignore = "native GPU: the VRAM-yield stand-in game"]
+fn role_standin() {
+    if role().as_deref() != Some("standin") {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    let d = cuda::driver().unwrap();
+    let mut device = 0;
+    cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut device, 0) }).unwrap();
+    let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
+    // A game's allocations: a gibibyte each, as the design's stand-in.
+    const BLOCK: usize = 1 << 30;
+    let mut blocks: Vec<u64> = vec![];
+    let ms = || start.elapsed().as_millis();
+    let allocate = |target: u64, blocks: &mut Vec<u64>| -> u32 {
+        let mut failed = 0;
+        while (blocks.len() as u64 + 1) * BLOCK as u64 <= target {
+            let mut ptr = 0;
+            let rc = unsafe { (d.mem_alloc)(&mut ptr, BLOCK) };
+            println!("STANDIN alloc {} {} {}", blocks.len(), if rc == cuda::SUCCESS { "ok" } else { "fail" }, ms());
+            if rc != cuda::SUCCESS {
+                failed += 1;
+                break;
+            }
+            blocks.push(ptr);
+        }
+        failed
+    };
+    println!("@ ready");
+    std::io::stdout().flush().unwrap();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.unwrap();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let (mut free, mut total) = (0usize, 0usize);
+        cuda::check("cuMemGetInfo", unsafe { (d.mem_get_info)(&mut free, &mut total) }).unwrap();
+        let reply = match words.as_slice() {
+            ["fill", percent] => {
+                let target = total as u64 * percent.parse::<u64>().unwrap() / 100;
+                let failed = allocate(target, &mut blocks);
+                format!("held {} failed {failed}", blocks.len() as u64 * BLOCK as u64)
+            }
+            ["budget", percent] => {
+                let target = free as u64 * percent.parse::<u64>().unwrap() / 100;
+                let failed = allocate(target, &mut blocks);
+                format!("free at launch {free}; held {} failed {failed}", blocks.len() as u64 * BLOCK as u64)
+            }
+            ["sample"] => {
+                let reading = nvml.read().unwrap();
+                let per: Vec<String> = reading.processes.unwrap_or_default().iter().map(|(pid, bytes)| format!("{pid}:{bytes}")).collect();
+                format!("{} free {} {}", ms(), reading.free, per.join(" "))
+            }
+            ["release"] => {
+                let t = std::time::Instant::now();
+                let bytes = blocks.len() as u64 * BLOCK as u64;
+                blocks.drain(..).for_each(|ptr| cuda::check("cuMemFree", unsafe { (d.mem_free)(ptr) }).unwrap());
+                format!("released {bytes} in {:?}", t.elapsed())
+            }
+            ["exit"] => break,
+            other => format!("unknown command {other:?}"),
+        };
+        println!("@ {reply}");
+        std::io::stdout().flush().unwrap();
+    }
+}
+
 // ---- several processes
 
 /// A child's Memory over the CUDA backend, one command per stdin line; each reply is a line
