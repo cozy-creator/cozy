@@ -2477,11 +2477,12 @@ fn an_activation_larger_than_free_memory_is_served_from_evictable_weights() {
     step!();
 }
 
-/// Under a 1 GiB cap, the hook never takes a pinned page, and fails only when nothing is evictable.
+/// Under a 1 GiB cap, the hook never takes a pinned page, and fails only when the need exceeds every evictable byte.
 /// - Of two sets, one is pinned throughout (its bytes checked) and one is idle.
-/// - An allocation needing more than the idle set can give takes all of the idle set, then fails.
-/// - Once two pinned pages are released, a need of one page more than free is served: the floor keeps one as the
-///   running set's slot.
+/// - Half a page more than free memory and the idle set together is refused at once, with nothing evicted.
+/// - Half a page less is served from the idle set, every page of it, and no pinned page.
+/// - Once two pinned pages are released, half a page more than free is served: the floor keeps one as the running
+///   set's slot, and the other goes.
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable() {
@@ -2504,14 +2505,19 @@ fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable()
     step!();
     let unmaps = timings.count("unmap");
     step!();
-    // More than free memory and the idle set together: only pinned pages are left to give, and none may go.
-    let need = mem.free() + u64::from(pages + 1) * REGION_ALIGN;
     let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
-    let refused = segment(&mem, &torch, need, &callbacks);
-    step!();
-    let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
+    // Pinned pages never count: beyond free memory and the idle set, the allocation is refused before any eviction.
+    let beyond = mem.free() + u64::from(pages) * REGION_ALIGN + REGION_ALIGN / 2;
+    let refused = segment(&mem, &torch, beyond, &callbacks);
     step!();
     assert!(refused.is_none(), "an allocation beyond every evictable byte was served");
+    step!();
+    assert_eq!(timings.count("unmap"), unmaps, "a refused allocation evicted weights");
+    step!();
+    let within = mem.free() + u64::from(pages) * REGION_ALIGN - REGION_ALIGN / 2;
+    let served = segment(&mem, &torch, within, &callbacks).expect("the idle set made the room");
+    step!();
+    let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
     step!();
     assert_eq!(unmapped, u64::from(pages) * REGION_ALIGN, "the idle set went, every page of it, and nothing else");
     step!();
@@ -2519,19 +2525,20 @@ fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable()
         assert!(exact(pin, &block(97, p as u32), 0), "pinned page {p} kept its bytes");
     }
     step!();
-    // Two pinned pages released: the floor keeps one as the running set's slot (its other pages are pinned), and a
-    // need of one page more than free is served from the other.
+    // Two pinned pages released: the floor keeps one as the running set's slot (its other pages are pinned), and half
+    // a page more than free is served from the other.
     drop(pins.pop());
     drop(pins.pop());
     step!();
     poke(&mem);
     step!();
-    let one_more = mem.free() + REGION_ALIGN;
-    let served = segment(&mem, &torch, one_more, &callbacks).expect("the released page made the room");
+    let half = mem.free() + REGION_ALIGN / 2;
+    let more = segment(&mem, &torch, half, &callbacks).expect("a released page made the room");
     step!();
-    println!("PINNED refused at {need} B after taking the idle set ({unmapped} B); then {one_more} B served; make_room {}", callbacks.report());
+    println!("PINNED {beyond} B refused with nothing evicted; {within} B served from the idle set ({unmapped} B); then {half} B served; make_room {}", callbacks.report());
     step!();
-    unsegment(&torch, served, one_more);
+    unsegment(&torch, more, half);
+    unsegment(&torch, served, within);
     step!();
     drop(pins);
     step!();
