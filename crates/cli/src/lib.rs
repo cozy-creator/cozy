@@ -2,7 +2,7 @@
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{ArgValueCompleter, CompleteEnv};
+use clap_complete::ArgValueCompleter;
 use protocol::{
     config::{self, Flags},
     error::{Error, Kind},
@@ -91,9 +91,7 @@ enum Command {
 /// Parses the command line, loads the config once, runs the verb and renders its refusal. Exit
 /// codes: 0 success, 1 a refusal or a run that did not succeed, 2 a usage error.
 pub fn main() -> ExitCode {
-    CompleteEnv::with_factory(Cli::command)
-        .var(completion::VAR)
-        .complete();
+    completion::answer(Cli::command);
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => return usage(error),

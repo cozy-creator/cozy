@@ -48,9 +48,10 @@ fn capture_error(code: cuda::CUresult) -> bool {
     (900..=908).contains(&code)
 }
 
-/// The context is gone (varena's classification of sticky CUDA errors).
+/// The context is gone (varena's classification of sticky CUDA errors; 999 is CUDA's "unknown
+/// error", cr-215's).
 fn sticky(code: cuda::CUresult) -> bool {
-    matches!(code, 700 | 702 | 709 | 710 | 714..=719 | 721 | 911)
+    matches!(code, 700 | 702 | 709 | 710 | 714..=719 | 721 | 911 | 999)
 }
 
 /// This thread in relaxed capture mode until dropped (its previous mode then comes back).
@@ -110,6 +111,10 @@ struct Accounts {
     retired: BTreeSet<(i32, Pool)>,
     /// CUDA graph captures open per device (`capture`): torch skips its release and retry then.
     captures: BTreeMap<i32, u32>,
+    /// Per device, dropped pools' live bytes after torch's last release: what it could not
+    /// release (a cuBLAS workspace a request's first matmul made in its pool lives on). A NULL
+    /// is worth torch's release (a sync of its events) only once more is retired than that.
+    floor: BTreeMap<i32, u64>,
 }
 
 impl Accounts {
@@ -130,13 +135,22 @@ impl Accounts {
         self.retired.iter().filter(|(d, _)| *d == device).filter_map(|k| self.counts.get(k)).map(|c| c.live - c.pending.min(c.live)).sum()
     }
 
+    /// Whether a NULL would let torch release something: more retired than its last release
+    /// left, and no capture open (torch then skips the release, so the NULL would be an OOM).
+    fn releasable(&mut self, device: i32) -> bool {
+        let live = self.retired_live(device);
+        let floor = self.floor.entry(device).or_default();
+        *floor = (*floor).min(live);
+        live > *floor && self.captures.get(&device).is_none_or(|n| *n == 0)
+    }
+
     fn failed_release(&mut self, allocation: Allocation, reason: String) {
         self.faults.entry(allocation.device).or_insert(reason);
         self.quarantined.push(allocation);
     }
 }
 
-static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new(), retired: BTreeSet::new(), captures: BTreeMap::new() });
+static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new(), retired: BTreeSet::new(), captures: BTreeMap::new(), floor: BTreeMap::new() });
 
 fn accounts() -> std::sync::MutexGuard<'static, Accounts> {
     ACCOUNTS.lock().unwrap_or_else(|p| p.into_inner())
@@ -250,8 +264,14 @@ fn segment(size: usize) -> Result<cuda::CUdeviceptr, cuda::CUresult> {
 
 fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     let _inside = Inside::enter();
-    // Torch's retry of this thread's last NULL (the same size): make room now.
+    // Torch's retry of this thread's last NULL (the same size): make room now. What its release
+    // left in dropped pools is the floor a NULL must beat from now on.
     let retry = RELEASING.with(Cell::take) == Some(size);
+    if retry {
+        let mut all = accounts();
+        let left = all.retired_live(device);
+        all.floor.insert(device, left);
+    }
     let active = ACTIVE.with(|a| a.borrow().iter().rev().find(|p| p.device == device).cloned());
     let key = (device, active.as_ref().map_or((0, 0), |a| a.pool));
     let bytes = size as u64;
@@ -274,22 +294,25 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
         accounts().faults.entry(device).or_insert_with(|| "allocation has no current CUDA context".into());
         return std::ptr::null_mut();
     }
-    if capturing(stream) {
-        return refuse("capture_growth");
-    }
+    let capture = capturing(stream);
     let began = Instant::now();
     // The room asked of make_room: the segment, and a page more each time the driver refuses
     // what the row's figure says is free (bytes no row accounts for, or its fragments).
     let mut need = bytes;
     let mut claim = None;
+    let mut refused = false;
     let ptr = loop {
-        if claim.is_some() || free() >= need {
-            match segment(size) {
+        let covered = !refused && (claim.is_some() || free() >= need);
+        // Torch's unused segments first: a dropped pool's come back through torch's retry, once
+        // per routing (it syncs the pool's events), only while it could release something.
+        let release = || !retry && active.as_ref().is_some_and(|a| !a.released.load(Relaxed)) && accounts().releasable(device);
+        match step(capture, covered, active.is_some(), release) {
+            Step::Map => match segment(size) {
                 Ok(ptr) => break ptr,
-                Err(cuda::ERROR_OUT_OF_MEMORY) if active.is_none() => return refuse("driver_capacity"),
                 Err(cuda::ERROR_OUT_OF_MEMORY) => {
                     drop(claim.take());
                     need += varena::layout::REGION_ALIGN;
+                    refused = true;
                 }
                 Err(code) if capture_error(code) => return refuse("capture"),
                 Err(code) => {
@@ -298,23 +321,31 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
                     }
                     return refuse("driver_error");
                 }
+            },
+            Step::Release => {
+                if let Some(a) = active.as_ref() {
+                    a.released.store(true, Relaxed);
+                }
+                RELEASING.with(|r| r.set(Some(size)));
+                accounts().counts.entry(key).or_default().released += 1;
+                return std::ptr::null_mut();
             }
-        }
-        let Some(a) = active.as_ref() else { return refuse("driver_capacity") };
-        // Torch's unused segments first: a dropped pool's come back through torch's retry, once
-        // per routing (it syncs the pool's events), only while one holds segments and no capture
-        // is open on the device (torch then skips the retry: the NULL would be an OOM).
-        let releasable = |all: &Accounts| all.retired_live(device) > 0 && all.captures.get(&device).is_none_or(|n| *n == 0);
-        if !retry && !a.released.load(Relaxed) && releasable(&accounts()) {
-            a.released.store(true, Relaxed);
-            RELEASING.with(|r| r.set(Some(size)));
-            accounts().counts.entry(key).or_default().released += 1;
-            return std::ptr::null_mut();
-        }
-        accounts().counts.entry(key).or_default().rooms += 1;
-        match a.memory.make_room(need) {
-            Ok(room) => claim = Some(room),
-            Err(_) => return refuse("exhausted"),
+            Step::MakeRoom => {
+                let Some(a) = active.as_ref() else { return refuse("driver_capacity") };
+                accounts().counts.entry(key).or_default().rooms += 1;
+                // Its unmaps and event waits run in relaxed capture mode, as the segment's
+                // allocation does: under another thread's global-mode capture they would be
+                // prohibited calls.
+                let _relaxed = RelaxedCapture::enter();
+                match a.memory.make_room(need) {
+                    Ok(room) => {
+                        claim = Some(room);
+                        refused = false;
+                    }
+                    Err(_) => return refuse("exhausted"),
+                }
+            }
+            Step::Refuse(why) => return refuse(why),
         }
     };
     // The segment counts from now on: its claim's bytes when it asked for exactly them; else
@@ -334,6 +365,35 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     c.segments += 1;
     all.pointers.insert(ptr as usize, Allocation { device, context: context as usize, pool: key.1, bytes, pending: false, _resident: resident });
     ptr as *mut c_void
+}
+
+/// The hook's next move for a segment.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Map,
+    /// NULL once, for torch's retry to release dropped pools' segments first.
+    Release,
+    MakeRoom,
+    Refuse(&'static str),
+}
+
+/// The hook's next move: a capturing thread's allocation is refused at once, whatever else
+/// holds (a capture consumes what was prewarmed; it never grows its pool, waits on an event or
+/// makes room: the capture fails cleanly and is retried off-path); else a segment the row's free
+/// bytes cover is mapped; outside a request it is refused; else torch releases first while that
+/// could pay (`release`, asked only then), and varena makes room.
+fn step(capturing: bool, covered: bool, active: bool, release: impl FnOnce() -> bool) -> Step {
+    if capturing {
+        Step::Refuse("capture_growth")
+    } else if covered {
+        Step::Map
+    } else if !active {
+        Step::Refuse("driver_capacity")
+    } else if release() {
+        Step::Release
+    } else {
+        Step::MakeRoom
+    }
 }
 
 #[no_mangle]
@@ -439,6 +499,35 @@ mod tests {
         assert_eq!(a.pointers[&ptr].pool, (2, 0));
         assert_eq!((a.counts[&(0, (1, 0))].live, a.counts[&(0, (1, 0))].pending), (0, 0));
         assert_eq!(a.counts[&(0, (2, 0))].live, 32);
+    }
+
+    #[test]
+    fn a_capturing_threads_allocation_is_refused_before_any_room_or_release() {
+        for (covered, active) in [(false, true), (true, true), (false, false)] {
+            let step = step(true, covered, active, || panic!("a capturing thread never asks for a release"));
+            assert_eq!(step, Step::Refuse("capture_growth"));
+        }
+    }
+
+    #[test]
+    fn a_shortfall_releases_first_while_that_pays_then_makes_room() {
+        assert_eq!(step(false, true, true, || true), Step::Map);
+        assert_eq!(step(false, false, false, || true), Step::Refuse("driver_capacity"));
+        assert_eq!(step(false, false, true, || true), Step::Release);
+        assert_eq!(step(false, false, true, || false), Step::MakeRoom);
+    }
+
+    #[test]
+    fn no_release_while_a_capture_is_open_or_nothing_more_is_retired() {
+        let mut a = Accounts::default();
+        a.retired.insert((0, (1, 0)));
+        a.counts.insert((0, (1, 0)), Counters { live: 16, ..Counters::default() });
+        a.captures.insert(0, 1);
+        assert!(!a.releasable(0), "torch skips its release while a capture is open");
+        a.captures.insert(0, 0);
+        assert!(a.releasable(0));
+        a.floor.insert(0, 16);
+        assert!(!a.releasable(0), "what torch's last release left is no reason to NULL again");
     }
 
     #[test]

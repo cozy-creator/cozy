@@ -119,9 +119,9 @@ def e2e(work: pathlib.Path) -> pathlib.Path:
     assert remote.commit("me/model", "1.0") == (tree, "1.0"), "publication keeps the immutable commit"
 
     fresh = work / "fresh"
-    opened = {v: tensorfs.open("me/model", revision="1.0", variant=v, endpoint=url, cache_dir=fresh) for v in written}
+    opened = {v: tensorfs.open("me/model", revision="1.0", variant=f"model.{v}.cozytensors", endpoint=url, cache_dir=fresh) for v in written}
     repo = tensorfs.materialize("me/model", revision="1.0", local_dir=work / "repo", endpoint=url, cache_dir=fresh)
-    reopened = {v: tensorfs.open(repo, variant=v, cache_dir=work / "from-folder") for v in written}
+    reopened = {v: tensorfs.open(repo, variant=f"model.{v}.cozytensors", cache_dir=work / "from-folder") for v in written}
     for variant, saved in written.items():
         for checkpoint in (opened[variant], reopened[variant]):
             assert checkpoint.id == saved.id, (variant, checkpoint.id, saved.id)

@@ -160,6 +160,9 @@ struct WatchState {
     done: bool,
     serving: bool,
     frames: u64,
+    /// The work this subject waits on (another call loading a layout it needs), whose progress
+    /// is its own while it waits: its re-asks are not.
+    lender: Option<Lender>,
     canceled_at: Option<Instant>,
     killed: Option<String>,
     worst_gap: Duration,
@@ -167,6 +170,10 @@ struct WatchState {
 
 /// Whether the subject is waiting on work watched elsewhere (a job's unfinished child runs).
 pub type Waits = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The progress meter of work a subject waits on (CPU plus bytes of the call loading a layout
+/// it asked for); None once that work is gone, which lends nothing more.
+pub type Lender = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
 /// One exchange's progress observer, shared with whoever may cancel it. It kills the exact
 /// process (and its group) only on a measured wedge; the kill closes the channel, so the
@@ -189,6 +196,8 @@ impl Watch {
         // A GPU call's samples with memory traffic, its CPU other than stuck-GPU waits, and its
         // last CPU reading.
         let (mut moves, mut ran, mut last_cpu) = (0, 0, None);
+        // What the work it waits on did so far, kept once that work is gone.
+        let mut lent = 0;
         let mut state = self.state.lock().unwrap();
         while !state.done {
             let now = Instant::now();
@@ -208,14 +217,15 @@ impl Watch {
                 state = self.changed.wait_timeout(state, liveness.sample).unwrap().0;
                 continue;
             }
+            lent = state.lender.as_ref().and_then(|lender| lender()).unwrap_or(lent);
             let reading = match self.meter {
-                Meter::Burn => group_burn(exact.birth()),
+                Meter::Burn => group_burn(exact.birth()).map(|burn| burn + lent),
                 Meter::Work => self.activity.as_ref().map_or(Some(Gpus::Idle), |gpus| gpus()).map(|gpus| {
                     let (cpu, moved) = group_meter(exact.birth()).unwrap_or_default();
                     let since = cpu.saturating_sub(last_cpu.replace(cpu).unwrap_or(cpu));
                     ran += if gpus == Gpus::Stuck { 0 } else { since };
                     moves += u64::from(gpus == Gpus::Moved);
-                    state.frames + moved + moves + ran
+                    state.frames + moved + moves + ran + lent
                 }),
             };
             pace.observe(reading, now);
@@ -244,6 +254,10 @@ impl Watch {
     }
     pub fn frame(&self) {
         self.state.lock().unwrap().frames += 1;
+    }
+    /// The subject waits on `lender`'s work (None: it no longer waits).
+    pub fn waits_on(&self, lender: Option<Lender>) {
+        self.state.lock().unwrap().lender = lender;
     }
     /// Time the machine spends answering this process is not the process's stillness.
     pub fn serving(&self, serving: bool) {
@@ -607,6 +621,48 @@ mod tests {
             }
             drop(group);
             assert!(group_members(&birth).iter().all(|member| member.ended().unwrap()), "{case}: the test left a process running");
+        }
+    }
+
+    /// A call waiting on another call that loads a layout it needs moves as that loader moves:
+    /// behind a loader that computes it is never killed; behind one that shows no progress, or
+    /// that has ended, it is (run 13618 waited 20 min, its re-asks counted as frames).
+    #[cfg(unix)]
+    #[test]
+    fn a_waiter_moves_as_its_loader_moves_and_is_killed_behind_a_still_or_gone_one() {
+        for (case, loader_script, end_loader, killed) in [
+            ("computing loader", "while :; do :; done", false, false),
+            ("still loader", "sleep 600", false, true),
+            ("gone loader", "sleep 600", true, true),
+        ] {
+            let spawn = |script: &str| Command::new("/bin/sh").args(["-c", script]).process_group(0).stdin(Stdio::null()).spawn().unwrap();
+            let (mut waiter, mut loader) = (spawn("sleep 600"), spawn(loader_script));
+            let (waiting, loading) = (Birth::of(waiter.id()).unwrap(), Birth::of(loader.id()).unwrap());
+            let lend = loading.clone();
+            let lender: Lender = Arc::new(move || group_burn(&lend));
+            let liveness = Liveness { sample: Duration::from_millis(20) };
+            let exact = Exact::open(&waiting).unwrap().unwrap();
+            let watching = Watching::start(exact, Meter::Work, liveness, Duration::ZERO, None, None, "invoke").unwrap();
+            watching.watch().waits_on(Some(lender));
+            if end_loader {
+                Exact::open(&loading).unwrap().unwrap().kill().unwrap();
+                loader.wait().unwrap();
+            }
+            std::thread::sleep(liveness.floor() * 25);
+            assert_eq!(waiting.ended().unwrap(), killed, "{case}");
+            let verdict = watching.finish().0;
+            assert_eq!(verdict.is_some(), killed, "{case}: {verdict:?}");
+            for exact in [Exact::open(&waiting), Exact::open(&loading)].into_iter().flatten().flatten() {
+                let _ = exact.kill();
+            }
+            let _ = waiter.wait();
+            let _ = loader.wait();
+            for member in group_members(&loading).into_iter().chain(group_members(&waiting)) {
+                if let Ok(Some(exact)) = Exact::open(&member) {
+                    let _ = exact.kill();
+                    let _ = exact.wait();
+                }
+            }
         }
     }
 

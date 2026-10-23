@@ -45,7 +45,7 @@ from . import Set
 
 __all__ = [
     "Bind", "Cache", "Declared", "Exhausted", "Filling", "GpuId", "Grant", "Hold", "Level", "Memory", "Model",
-    "Placeholder", "Request", "Stats", "Unbound", "VarenaError", "Weights", "blocks_of",
+    "NotRegistered", "Placeholder", "Request", "Stats", "Unbound", "VarenaError", "Weights", "blocks_of",
 ]
 
 #: TensorFS dtype names; an `F4` part is u8 pairs.
@@ -62,6 +62,10 @@ DTYPES: dict[str, torch.dtype] = {
 
 class Unbound(Exception):
     """An op on a weight no pin is bound to, or a forward outside a request."""
+
+
+class NotRegistered(VarenaError):
+    """TensorD's manager refused this GPU's lease: this process is no executor it registered."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +188,8 @@ class _Block:
     region: int
     tensors: dict[str, dict[str, _At]] = field(default_factory=dict)
     count: int = 0
-    stream: torch.cuda.Stream | None = None
+    #: the raw CUstream it was bound on (None off CUDA)
+    stream: int | None = None
     pin: Pin | None = None
     written: list[tuple[_Site, Tensor | None]] = field(default_factory=list)
     #: its mapping's address, the part views of it and the module tensors made of them: kept
@@ -313,7 +318,7 @@ class Binding:
         with self.lock:
             if self.closed:
                 return False
-            self.model.memory.native.fill(self.model.id, _fill(self.model.fill))
+            self.model.memory._declare(self.model)
             return self.native.valid()
 
     def resident(self) -> bool:
@@ -339,17 +344,18 @@ class Binding:
                 scope.enter_context(torch.cuda.stream(stream) if memory.cuda else nullcontext())
                 if self.last is not None:
                     stream.wait_event(self.last)
-                memory.native.fill(self.model.id, _fill(self.model.fill))
+                memory._declare(self.model)
                 request = _request.get()
                 pins = self.native.prepare(stream.cuda_stream if stream is not None else 0, request.native if request is not None else None)
                 held: list[_Block] = []
                 try:
                     with self.model.lock:
                         for block, pin in zip(self.blocks, pins, strict=True):
+                            raw = stream.cuda_stream if stream is not None else None
                             if block.count == 0:
-                                memory._bind(block, stream, pin)
-                            elif stream is not None and block.stream != stream:
-                                stream.wait_stream(block.stream)
+                                memory._bind(block, raw, pin)
+                            elif raw is not None and block.stream != raw:
+                                memory._join(raw, block.stream)  # type: ignore[arg-type]
                             block.count += 1
                             held.append(block)
                     yield self
@@ -416,12 +422,29 @@ _pass: ContextVar[_Pass | None] = ContextVar("varena_pass", default=None)
 _routes: ContextVar[frozenset[tuple[int, int]]] = ContextVar("varena_routes", default=frozenset())
 
 
+def _lease(native: Native, ns: int) -> str | None:
+    """The GPU's weight pages leased from the manager TensorD serves in namespace `ns`
+    (varena-leases §11), or why not. TensorD holds a follower's dial until it registers it, so
+    `NotRegistered` is a failure, never a fallback. Only no compatible manager runs standalone,
+    warned."""
+    refused = native.lease(ns)
+    if refused is None:
+        return None
+    code, why = refused
+    if code in ("Incompatible", "Absent"):
+        warnings.warn(f"varena: GPU {native.gpu.uuid} runs standalone, with no lease from TensorD: {why}", stacklevel=3)
+        return why
+    raise (NotRegistered if code == "NotRegistered" else VarenaError)(f"varena: TensorD refused GPU {native.gpu.uuid}'s lease ({code}): {why}")
+
+
 class Memory:
     """This process's memory on one device: its models, caches and requests."""
 
     def __init__(self, native: Native, device: torch.device, pool: bool = True) -> None:
         self.native, self.device = native, device
         self.cuda = device.type == "cuda"
+        #: why this GPU runs standalone though TensorD asked it to lease (`Memory.open(leases=)`)
+        self.standalone: str | None = None
         self.models: dict[nn.Module, Model] = {}
         self.requests: dict[Request, None] = {}
         #: (set, block) -> bytes kept bound for tensors that outlived their block's run
@@ -434,9 +457,6 @@ class Memory:
         self._pool_guard = threading.RLock()
         #: Native pooling is the default; diagnostics may compare an explicit eager baseline.
         self.pooling = pool
-        #: open passes on the device: torch's peak resets when the first opens
-        self.passing = 0
-        self._peaks = threading.Lock()
         #: Cross-stream consumers joined back into the binding stream.
         self.crossed = 0
 
@@ -453,13 +473,15 @@ class Memory:
             return pool
 
     @classmethod
-    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = True) -> Memory:
+    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = True, leases: int | None = None) -> Memory:
         """A TensorD executor's memory (`grant`), or a standalone engine's: the device's table by
         name, its capacity lowered to `limit` (the first opener sets it, a later one can only
         lower it). On CUDA the backend opens first and measures this process's context, so open
-        it before torch initializes CUDA, or torch's context counts as foreign bytes. CPU and MPS
-        use host pages on the machine's table `host` (its RAM); a `GpuId` names a host table.
-        A process has one Memory per device: while it lives, opening the device again returns it."""
+        it before torch initializes CUDA, or torch's context counts as foreign bytes. With
+        `leases` (TensorD's namespace, from its Start) its weight pages are leased from TensorD's
+        manager (`_lease`). CPU and MPS use host pages on the machine's table `host` (its RAM); a
+        `GpuId` names a host table. A process has one Memory per device: while it lives, opening
+        the device again returns it."""
         device = torch.device("cpu") if isinstance(gpu, GpuId) else torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
         if device.type == "cuda":
             device = torch.device("cuda", device.index or 0)
@@ -474,7 +496,10 @@ class Memory:
                 else:
                     ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
                     native = Native.host(GpuId("host", device.type, ram), grant, limit)
-                memory = _memories[key] = cls(native, device, pool)
+                memory = cls(native, device, pool)
+                if device.type == "cuda" and leases is not None:
+                    memory.standalone = _lease(native, leases)
+                _memories[key] = memory
         return memory
 
     @property
@@ -639,6 +664,16 @@ class Memory:
                 return model.name
         return str(step)
 
+    def _declare(self, model: Model) -> None:
+        """The model's fill, declared to varena when its identity changed (a LoRA set swapped):
+        holds of the old bake go first, as their pins would keep its pages."""
+        identity = model.fill.identity if model.fill is not None else None
+        if identity != model.identity:
+            for hold in list(model.holds):
+                hold.shed()
+            model.identity = identity
+            self.native.fill(model.id, _fill(model.fill))
+
     def _rooms(self, r: Request) -> int:
         """The make_room calls segments of the request's pool have made so far."""
         return _allocator_stats(self.device.index or 0, r.pool.id)[2] if r.pool is not None else 0
@@ -667,23 +702,15 @@ class Memory:
             r = self._current()
             if self.cuda:
                 _allocator_check(self.device.index or 0)
-            identity = model.fill.identity if model.fill is not None else None
-            if identity != model.identity:
-                for hold in list(model.holds):  # pins of the old bake would keep its pages
-                    hold.shed()
-                model.identity = identity
-            self.native.fill(model.id, _fill(model.fill))
+            self._declare(model)
             k = key()
             p = _Pass(r.native.pass_(model.id, k), r, k, self._rooms(r))
-            if r.pool is not None and not (self.cuda and torch.cuda.is_current_stream_capturing()):  # capture owns its exact pool
+            # Off the request's thread its allocations go to the request's pool for the pass.
+            if r.pool is not None and r.pool.id not in _routes.get():
                 p.pooled = self.allocating(r.pool)
                 p.pooled.__enter__()
             if model.common is not None:
                 self._enter(model.common)
-            with self._peaks:
-                if self.passing == 0 and self.cuda:
-                    torch.cuda.reset_peak_memory_stats(self.device)
-                self.passing += 1
             local.passing, p.token = p, _pass.set(p)
         except BaseException:
             local.depth -= 1
@@ -692,8 +719,8 @@ class Memory:
             raise
 
     def _close(self, model: Model) -> None:
-        """A pass ends with torch's allocated peak (the device's since the first open pass
-        opened: beside another pass, at most this one's), failed or not."""
+        """A pass ends, failed or not. On CUDA varena reads what it held from the pool's segments;
+        MPS has none, so its allocated bytes then stand in for its peak."""
         local = model.local
         local.depth -= 1
         p = getattr(local, "passing", None)
@@ -707,9 +734,7 @@ class Memory:
         finally:
             if p.pooled is not None:
                 p.pooled.__exit__(None, None, None)
-            with self._peaks:
-                self.passing -= 1
-            peak = torch.cuda.max_memory_allocated(self.device) if self.cuda else torch.mps.current_allocated_memory() if self.device.type == "mps" else 0
+            peak = torch.mps.current_allocated_memory() if self.device.type == "mps" else 0
             pool = p.request.pool
             if pool is not None and self._rooms(p.request) > p.rooms:  # it made room: what torch kept free in its pool
                 free = [b["size"] for seg in pool.snapshot(include_traces=False) for b in seg["blocks"] if b["state"] == "inactive"]
@@ -719,24 +744,31 @@ class Memory:
 
     # -- blocks
 
+    def _stream(self) -> int | None:
+        """The current raw CUstream (None off CUDA): an int, not a Stream object, per block."""
+        return torch._C._cuda_getCurrentRawStream(self.device.index or 0) if self.cuda else None
+
+    def _join(self, waiter: int, waited: int) -> None:
+        """`waiter` waits for the work queued on `waited` so far (two raw CUstreams)."""
+        self.crossed += 1
+        torch.cuda.ExternalStream(waiter, device=self.device).wait_stream(torch.cuda.ExternalStream(waited, device=self.device))
+
     def _enter(self, block: _Block, evict: bool = True) -> None:
-        stream = torch.cuda.current_stream(self.device) if self.cuda else None
+        stream = self._stream()
         with block.model.lock:
             if block.count == 0:
                 if self.cuda and torch.cuda.is_current_stream_capturing():
                     raise Unbound(f"block {block.path!r} was not prepared before capture")
                 self._bind(block, stream, evict=evict)
             elif stream is not None and stream != block.stream and not torch.cuda.is_current_stream_capturing():
-                self.crossed += 1
-                stream.wait_stream(block.stream)  # type: ignore[arg-type]  # a capture binds under a hold
+                self._join(stream, block.stream)  # type: ignore[arg-type]  # a capture binds under a hold
             block.count += 1
 
     def _exit(self, block: _Block) -> None:
-        stream = torch.cuda.current_stream(self.device) if self.cuda else None
+        stream = self._stream()
         with block.model.lock:
             if stream is not None and block.stream not in (None, stream) and not torch.cuda.is_current_stream_capturing():
-                self.crossed += 1
-                block.stream.wait_stream(stream)  # type: ignore[union-attr]
+                self._join(block.stream, stream)  # type: ignore[arg-type]
             block.count -= 1
             if block.count == 0:
                 pin = block.pin
@@ -759,14 +791,14 @@ class Memory:
             warnings.warn(f"{model.name}: a weight tensor of block {block.path or 'common'!r} outlived its forward; its page stays bound while it lives", stacklevel=2)
         block.views = block.assign = block.window = block.track = block.at = None
 
+    @torch.inference_mode(False)  # what it returns is ordinary: a caller's view aliases it (se-074)
     def _read(self, block: _Block, site: _Site) -> Tensor:
         """A weight read outside its block's forward (a package's table, an overlay's factor):
         its block bound now, on the current stream; the tensor returned, and any view of it,
         owns the pin, so the page stays bound while it lives (the escaped-view rule). Counted as
         an off-forward read."""
         model = block.model
-        stream = torch.cuda.current_stream(self.device) if self.cuda else None
-        pin = self.native.bind(model.id, block.region, stream.cuda_stream if stream is not None else 0)
+        pin = self.native.bind(model.id, block.region, self._stream() or 0)
         if self.device.type in ("cpu", "cuda"):
             window = pin.window()
             window.keep(pin)
@@ -790,10 +822,14 @@ class Memory:
             counts[key] = (reads + 1, nbytes + pin.len)
         return value
 
-    def _bind(self, block: _Block, stream: torch.cuda.Stream | None, pin: Pin | None = None, evict: bool = True) -> None:
+    # Bound under a caller's inference_mode, the views (kept across binds) and the module tensors
+    # made of them would be inference tensors, and a view of a placeholder outside its forward
+    # could not alias one (se-074, Klein's VAE batch norm statistics): ordinary, zero-copy.
+    @torch.inference_mode(False)
+    def _bind(self, block: _Block, stream: int | None, pin: Pin | None = None, evict: bool = True) -> None:
         model = block.model
         if pin is None:
-            pin = self.native.bind(model.id, block.region, stream.cuda_stream if stream is not None else 0, evict)
+            pin = self.native.bind(model.id, block.region, stream or 0, evict)
         if self.device.type in ("cpu", "cuda"):
             if block.views is None or block.at != pin.ptr:  # a new mapping: its views once
                 window = pin.window()

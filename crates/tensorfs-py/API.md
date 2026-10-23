@@ -181,7 +181,7 @@ The returned arrays and their framework consumers retain the storage they need.
 ### Keep quantized weights encoded
 
 ```python
-quantized = tensorfs.open("me/model", revision="1.0", variant="int8").components["unet"]
+quantized = tensorfs.open("me/model", revision="1.0", variant="model.int8.cozytensors").components["unet"]
 value = quantized.tensors.read("time_embedding.linear_1.weight")  # decode=False is the default
 print(value.scheme, value.params)
 print(value.parts.keys())
