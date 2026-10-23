@@ -1,11 +1,11 @@
 //! TensorD hosts varena's lease manager (design varena-leases): each envelope GPU the inventory
-//! names has one, which creates the GPU's chunks and leases them to its executors, and owns the
-//! GPU's [`Ledger`] (capacity min(card, `gpu_memory_limit`)) until the ledger folds into it. An
-//! executor is granted its row at spawn, its row is reaped once its exit is proven, and admission
-//! is [`admit`] (`Ledger::admit`: a group on all of its GPUs or none, waiting while refused).
-//! A GPU TensorD cannot create chunks on keeps the ledger alone. Host RAM is the OS page cache;
-//! [`Host`] watches what the running calls must keep free of it. One thread blocks on every
-//! GPU's events and the host's short event.
+//! names has one, which creates the GPU's chunks and leases them to its executors, admits and
+//! places their requests, and keeps their measured peaks (capacity min(card, `gpu_memory_limit`)).
+//! Admission is [`admit`] (`Manager::admit`: a group on all of its GPUs or none, waiting while
+//! refused). A GPU whose chunks TensorD cannot create has a chunk-less manager: its executors run
+//! standalone, admitted and counted all the same. Host RAM is the OS page cache; [`Host`] watches
+//! what the running calls must keep free of it. One thread blocks on every GPU's events and the
+//! host's short event; each GPU's [`Watch`] reads NVML while cozy holds bytes there.
 use crate::{execution::Engine, machine::receipt};
 use platform::contain::host_memory;
 use platform::contain::host_pressure::{self, Growth, HostMode, Nudge};
@@ -22,138 +22,166 @@ use platform::{
     handles::Peer,
     process::{Birth, Exact},
 };
-use varena::lease::{manager::{Opener, Record}, Hosting, Identity, Manager};
-use varena::{
-    ledger::{FixedRow, Mode},
-    Backend, CudaBackend, GpuId, HostCall, Ledger, Peak,
+use varena::lease::{
+    manager::{Opener, Record},
+    HostCall, Hosting, Identity, Manager, Mode, Peak,
 };
+use varena::{Backend, CudaBackend, GpuId};
 
 /// Past this the memory log rotates to `memory.log.1`, so it holds at most twice this.
 const ROTATE_BYTES: u64 = 4 << 20;
 
-/// One envelope GPU: its lease manager, or its ledger alone; and the GPU model its peaks are
-/// kept under.
+/// One envelope GPU: its lease manager (chunk-less where TensorD cannot create its chunks), the
+/// GPU model its peaks are kept under, and the watch that reads its foreign and standalone bytes.
 pub struct Gpu {
-    held: Held,
+    pub manager: Arc<Manager>,
     pub model: String,
-    uuid: String,
-    fixed: Arc<Mutex<Fixed>>,
-    log: MemoryLog,
+    watch: Arc<Watch>,
 }
 
-/// Standalone executors' fixed rows by pid (varena-leases R2-2), and whether their sampler runs.
-#[derive(Default)]
-struct Fixed {
-    rows: BTreeMap<u32, FixedRow>,
-    sampling: bool,
-}
-
-/// How often a fixed row's bytes are read again while one lives.
-const FIXED_SAMPLE: std::time::Duration = std::time::Duration::from_millis(500);
-
-enum Held {
-    Leases(Arc<Manager>),
-    Ledger(Ledger),
-}
-
-/// What hosting a GPU's leases takes: who the peers on its listener are, and its chunks.
+/// What hosting a GPU's leases takes: who the peers on its listener are, its chunks (none where
+/// TensorD cannot create them: its executors run standalone), and which processes are cozy's.
 pub struct Leases {
     pub hosting: Arc<dyn Hosting>,
-    pub open: Opener,
+    pub open: Option<Opener>,
+    pub tenants: Tenants,
 }
 
 impl Gpu {
-    /// `entry`'s memory, sized by the inventory's memory (an integrated GPU's is the host's) and
+    /// `entry`'s manager, sized by the inventory's memory (an integrated GPU's is the host's) and
     /// never above `limit`, in the machine's sharing `mode`, with the peaks this machine measured
-    /// on its model: a lease manager serving `leases`, else (none given, or its listener or
-    /// manager cannot be made: a memory-log note says why) the ledger alone. None when the
-    /// inventory does not name it or its table cannot be made.
-    pub fn create(entry: &str, inventory: &[receipt::Gpu], limit: Option<u64>, mode: HostMode, leases: Option<Leases>, peaks: &Peaks, log: &MemoryLog) -> Option<Gpu> {
+    /// on its model. None (a memory-log note says why) when the inventory does not name it, or
+    /// its listener or manager cannot be made.
+    pub fn create(entry: &str, inventory: &[receipt::Gpu], limit: Option<u64>, mode: HostMode, leases: Leases, peaks: &Peaks, log: &MemoryLog) -> Option<Gpu> {
         let row = row(entry, inventory)?;
         let id = GpuId { uuid: row.device_uuid.clone(), model: row.device_name.clone(), memory: row.memory_bytes };
         let mode = match mode {
             HostMode::Shared => Mode::Shared,
             HostMode::Dedicated => Mode::Dedicated,
         };
-        let held = match leases.map(|leases| manage(&id, limit, mode, leases)) {
-            Some(Ok(manager)) => Held::Leases(manager),
-            refused => {
-                if let Some(Err(why)) = refused {
-                    log.note(serde_json::json!({"event": "leases_off", "gpu": entry, "why": why}));
-                }
-                let ledger = match Ledger::create(&id, limit) {
-                    Ok(ledger) => ledger,
-                    Err(error) => {
-                        tracing::warn!("memory: GPU {entry} has no ledger: {error}");
-                        return None;
-                    }
-                };
-                if let Err(error) = ledger.set_mode(mode) {
-                    tracing::warn!("memory: GPU {entry} stays shared: {error}");
-                }
-                Held::Ledger(ledger)
+        let chunks = leases.open.is_some();
+        let manager = varena::lease::listen(&id)
+            .map_err(|error| format!("its listener: {error}"))
+            .and_then(|listener| listener.ok_or_else(|| "another process serves its leases".to_string()))
+            .and_then(|listener| Manager::create(&id, limit, mode, leases.open, listener, leases.hosting).map_err(|error| error.to_string()));
+        let manager = match manager {
+            Ok(manager) => manager,
+            Err(why) => {
+                log.note(serde_json::json!({"event": "no_manager", "gpu": entry, "why": why}));
+                return None;
             }
         };
-        let gpu = Gpu { held, model: id.model.clone(), uuid: id.uuid.clone(), fixed: Arc::default(), log: log.clone() };
-        peaks.restore(&id.model, gpu.ledger());
-        let leased = gpu.manager().is_some();
-        log.note(serde_json::json!({"event": "ledger", "gpu": entry, "card": id.memory, "capacity": gpu.ledger().status().capacity, "leases": leased}));
-        Some(gpu)
+        peaks.restore(&id.model, &manager);
+        log.note(serde_json::json!({"event": "manager", "gpu": entry, "card": id.memory, "chunks": chunks}));
+        let watch = Watch::start(&id.uuid, manager.clone(), leases.tenants, log);
+        Some(Gpu { manager, model: id.model, watch })
     }
 
-    /// A GPU on `ledger` alone.
-    pub fn ledgered(ledger: Ledger, model: &str) -> Gpu {
-        Gpu { held: Held::Ledger(ledger), model: model.into(), uuid: String::new(), fixed: Arc::default(), log: MemoryLog::default() }
-    }
-
-    /// Standalone executor `pid` on it: a fixed row, never asked and never foreign, holding its
-    /// bytes as NVML charges its pid, read every half second while any fixed row lives (where
-    /// NVML names no pid of ours, a container's, they stay unmeasured).
+    /// Standalone executor `pid` on it: fixed bytes, never asked and never foreign, as NVML
+    /// charges its pid on each reading (where NVML names no pid of ours, a container's, they stay
+    /// unmeasured).
     pub fn fix(&self, pid: u32) {
-        let row = match self.ledger().fixed(pid) {
-            Ok(row) => row,
-            Err(error) => return tracing::warn!("memory: standalone executor {pid} has no fixed row: {error}"),
-        };
-        let mut fixed = self.fixed.lock().unwrap();
-        fixed.rows.insert(pid, row);
-        if !std::mem::replace(&mut fixed.sampling, true) {
-            let (uuid, rows, log) = (self.uuid.clone(), Arc::downgrade(&self.fixed), self.log.clone());
-            let spawned = std::thread::Builder::new().name("fixed-rows".into()).spawn(move || sample_fixed(&uuid, rows, &log));
-            if let Err(error) = spawned {
-                fixed.sampling = false;
-                tracing::warn!("memory: fixed rows unsampled: {error}");
-            }
-        }
+        self.watch.change(|watched| drop(watched.fixed.insert(pid)));
     }
 
-    /// After `waitpid`: `pid`'s rows go.
+    /// After `waitpid`: `pid`'s fixed bytes and dispatches go.
     pub fn reap(&self, pid: u32) {
-        self.fixed.lock().unwrap().rows.remove(&pid);
-        self.ledger().reap(pid);
+        self.watch.change(|watched| drop(watched.fixed.remove(&pid)));
+        self.manager.reap(pid);
     }
 
-    /// The GPU's admission and placement facts (the manager's ledger, until step 4).
-    pub fn ledger(&self) -> &Ledger {
-        match &self.held {
-            Held::Leases(manager) => manager.ledger(),
-            Held::Ledger(ledger) => ledger,
-        }
-    }
-
-    /// Its lease manager, where TensorD creates its chunks.
-    pub fn manager(&self) -> Option<&Arc<Manager>> {
-        match &self.held {
-            Held::Leases(manager) => Some(manager),
-            Held::Ledger(_) => None,
-        }
-    }
-
-    /// Executors to end: the ledger's stalled rows, and those answering no revoke.
+    /// Executors to end: those answering no revoke.
     pub fn stalled(&self) -> Vec<u32> {
-        match &self.held {
-            Held::Leases(manager) => manager.stalled(),
-            Held::Ledger(ledger) => ledger.stalled(),
+        self.manager.stalled()
+    }
+
+    /// The manager's books changed: the watch looks whether to read again.
+    pub fn changed(&self) {
+        self.watch.change(|_| {});
+    }
+}
+
+/// How often the watch reads NVML while cozy holds bytes on the GPU (design vram-yield).
+const SAMPLE: std::time::Duration = std::time::Duration::from_millis(500);
+/// A foreign process that appears and crosses this is new: idle pages make room for it.
+const NEW_FOREIGN: u64 = 256 << 20;
+
+/// One GPU's watch: NVML read every half second while cozy holds bytes there (chunks, executors,
+/// standalone pids), else parked until the books change. Each reading sets every standalone pid's
+/// fixed bytes and hands the manager the bytes no cozy process holds (`set_foreign`, once per
+/// reading); a foreign pid absent when sampling began that crosses 256 MiB marks its reading new.
+/// Where NVML names no pid of ours (a container's), foreign is 0: a pod is cozy's alone.
+struct Watch {
+    watched: Mutex<Watched>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Watched {
+    fixed: std::collections::BTreeSet<u32>,
+    epoch: u64,
+}
+
+impl Watch {
+    fn start(uuid: &str, manager: Arc<Manager>, tenants: Tenants, log: &MemoryLog) -> Arc<Watch> {
+        let watch = Arc::new(Watch { watched: Mutex::default(), changed: std::sync::Condvar::new() });
+        let (uuid, watching, log) = (uuid.to_string(), Arc::downgrade(&watch), log.clone());
+        let spawned = std::thread::Builder::new().name("gpu-watch".into()).spawn(move || watching_gpu(&uuid, &manager, &tenants, watching, &log));
+        if let Err(error) = spawned {
+            log.note(serde_json::json!({"event": "gpu_unwatched", "why": error.to_string()}));
         }
+        watch
+    }
+
+    fn change(&self, f: impl FnOnce(&mut Watched)) {
+        let mut watched = self.watched.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut watched);
+        watched.epoch += 1;
+        self.changed.notify_all();
+    }
+}
+
+fn watching_gpu(uuid: &str, manager: &Manager, tenants: &Tenants, watch: std::sync::Weak<Watch>, log: &MemoryLog) {
+    let device = platform::gpu::Device::open(uuid).map_err(|error| error.to_string());
+    let (mut known, mut stale) = (None::<std::collections::BTreeSet<u32>>, false);
+    while let Some(watch) = watch.upgrade() {
+        let fixed = {
+            let mut watched = watch.watched.lock().unwrap_or_else(|e| e.into_inner());
+            let held = manager.holdings();
+            let active = held.created > 0 || !held.executors.is_empty() || !watched.fixed.is_empty();
+            if !active {
+                known = None;
+                let epoch = watched.epoch;
+                while watched.epoch == epoch {
+                    watched = watch.changed.wait(watched).unwrap_or_else(|e| e.into_inner());
+                }
+                continue;
+            }
+            watched.fixed.clone()
+        };
+        drop(watch);
+        let reading = device.as_ref().map_err(Clone::clone).and_then(|device| device.read().map_err(|error| error.to_string()));
+        let processes = reading.and_then(|reading| reading.processes.ok_or_else(|| "NVML names no process of this machine".to_string()));
+        match (&processes, stale) {
+            (Err(why), false) => log.note(serde_json::json!({"event": "gpu_unmeasured", "gpu": uuid, "why": why})),
+            (Ok(_), true) => log.note(serde_json::json!({"event": "gpu_measured", "gpu": uuid})),
+            _ => {}
+        }
+        stale = processes.is_err();
+        let (foreign, new_pid) = match &processes {
+            Ok(processes) => {
+                fixed.iter().for_each(|pid| manager.fixed(*pid, processes.get(pid).copied().unwrap_or(0)));
+                let ours: std::collections::BTreeSet<u32> = tenants.book().keys().copied().chain([std::process::id()]).collect();
+                let others: BTreeMap<u32, u64> = processes.iter().filter(|(pid, _)| !ours.contains(pid)).map(|(pid, bytes)| (*pid, *bytes)).collect();
+                let seen = known.get_or_insert_with(|| others.keys().copied().collect());
+                let new = others.iter().filter(|(pid, bytes)| !seen.contains(pid) && **bytes >= NEW_FOREIGN).map(|(pid, _)| *pid).collect::<Vec<_>>();
+                seen.extend(&new);
+                (others.values().sum(), !new.is_empty())
+            }
+            Err(_) => (0, false),
+        };
+        manager.set_foreign(foreign, new_pid);
+        std::thread::sleep(SAMPLE);
     }
 }
 
@@ -309,43 +337,6 @@ impl Hosting for Peers {
     }
 }
 
-/// Sets each fixed row's bytes from NVML's per-pid reading until none is left. A reading that
-/// fails or names no pid leaves them as they were, with one memory-log line each time it starts.
-fn sample_fixed(uuid: &str, fixed: std::sync::Weak<Mutex<Fixed>>, log: &MemoryLog) {
-    let device = platform::gpu::Device::open(uuid).map_err(|error| error.to_string());
-    let mut stale = false;
-    while let Some(fixed) = fixed.upgrade() {
-        let reading = device.as_ref().map_err(Clone::clone).and_then(|device| device.read().map_err(|error| error.to_string()));
-        let processes = reading.and_then(|reading| reading.processes.ok_or_else(|| "NVML names no process of this machine".to_string()));
-        match (&processes, stale) {
-            (Err(why), false) => log.note(serde_json::json!({"event": "fixed_rows_stale", "gpu": uuid, "why": why})),
-            (Ok(_), true) => log.note(serde_json::json!({"event": "fixed_rows_measured", "gpu": uuid})),
-            _ => {}
-        }
-        stale = processes.is_err();
-        let processes = processes.ok();
-        let mut held = fixed.lock().unwrap();
-        if held.rows.is_empty() {
-            held.sampling = false;
-            return;
-        }
-        for (pid, row) in processes.iter().flat_map(|processes| held.rows.iter().map(move |(pid, row)| (processes.get(pid), row))) {
-            row.set(pid.copied().unwrap_or(0));
-        }
-        drop(held);
-        drop(fixed);
-        std::thread::sleep(FIXED_SAMPLE);
-    }
-}
-
-/// `id`'s manager on its listener (`lease::listen`: named by its UUID in this user's namespace).
-fn manage(id: &GpuId, limit: Option<u64>, mode: Mode, leases: Leases) -> Result<Arc<Manager>, String> {
-    let listener = varena::lease::listen(id)
-        .map_err(|error| format!("its listener: {error}"))?
-        .ok_or_else(|| "another process serves its leases".to_string())?;
-    Manager::create(id, limit, mode, leases.open, listener, leases.hosting).map_err(|error| error.to_string())
-}
-
 /// GPU `uuid`'s chunks, opened in TensorD's own context at its manager's first ask and released
 /// when the manager holds no chunk and serves no executor (a context costs VRAM, and keeps a
 /// laptop's GPU awake). None (a memory-log note says why) where its compute mode admits one
@@ -392,16 +383,16 @@ fn shareable(uuid: &str) -> Result<i32, String> {
     Ok(ordinal)
 }
 
-/// Admits request `id` of `family` at `<package>|<shape>` on every one of `ledgers` or none
-/// (`Ledger::admit`, which names the key its peak is recorded under; a yielded request of the
+/// Admits request `id` of `family` at `<package>|<shape>` on every one of `managers` or none
+/// (`Manager::admit`, which names the key its peak is recorded under; a yielded request of the
 /// same family, waiting on this one, is left out). Refused, it waits for the engine's activity,
-/// which every ledger event and every cancel bumps, and asks again: running requests end, and a
-/// GPU nothing runs on always admits. False: it was canceled meanwhile. A ledger that cannot
+/// which every manager event and every cancel bumps, and asks again: running requests end, and a
+/// GPU nothing runs on always admits. False: it was canceled meanwhile. A manager that cannot
 /// answer lets it run unrecorded.
-pub fn admit(engine: &Engine, ledgers: &[&Ledger], id: &str, package: &str, shape: &str, family: Option<&str>) -> io::Result<bool> {
+pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, shape: &str, family: Option<&str>) -> io::Result<bool> {
     loop {
         let seen = engine.activity_epoch();
-        match Ledger::admit(ledgers, id, package, shape, family) {
+        match Manager::admit(managers, id, package, shape, family) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(error) => {
@@ -416,14 +407,13 @@ pub fn admit(engine: &Engine, ledgers: &[&Ledger], id: &str, package: &str, shap
     }
 }
 
-/// The GPU of the group (an index into `ledgers`, GPU order) that keeps each set of `sets`, by
-/// `Ledger::place` for `package`'s request at `shape` in `family`. A set's bytes are what its
-/// load recorded on a GPU of the group (its layout's, exact; its region split is the model's,
-/// known only where it loads): a set never loaded goes where the most room is free. A ledger
-/// that cannot answer keeps every set on GPU 0, where it pages.
-pub fn homes(ledgers: &[&Ledger], package: &str, shape: &str, family: Option<&str>, sets: &[&str], log: &MemoryLog) -> Vec<u32> {
+/// The GPU of the group (an index into `managers`, GPU order) that keeps each set of `sets`, by
+/// `Manager::place` for `package`'s request at `shape` in `family`. A set's bytes are what its
+/// load recorded on a GPU of the group: a set never loaded goes where the most room is free. A
+/// manager that cannot answer keeps every set on GPU 0, where it pages.
+pub fn homes(managers: &[&Manager], package: &str, shape: &str, family: Option<&str>, sets: &[&str], log: &MemoryLog) -> Vec<u32> {
     let unknown: Vec<(&str, Option<u64>)> = sets.iter().map(|set| (*set, None)).collect();
-    match Ledger::place(ledgers, package, shape, family, &unknown) {
+    match Manager::place(managers, package, shape, family, &unknown) {
         Ok(homes) => homes,
         Err(error) => {
             log.note(serde_json::json!({"event": "homes_on_gpu_0", "package": package, "why": error.to_string()}));
@@ -435,7 +425,7 @@ pub fn homes(ledgers: &[&Ledger], package: &str, shape: &str, family: Option<&st
 /// Measured peaks, persisted per GPU model as `<dir>/<model>.json`: varena's records, kept and
 /// restored whole. A key names its package release (`<construction>|<shape>`, or a set's
 /// `<package>@<release>/<component>|…`), so one file holds every release's. Each GPU of the
-/// model contributes its records; a key two of them measured is merged by the ledger's restore.
+/// model contributes its records; a key two of them measured is merged by the manager's restore.
 pub struct Peaks {
     dir: PathBuf,
     saved: Mutex<BTreeMap<String, Vec<Peak>>>,
@@ -451,23 +441,23 @@ impl Peaks {
         self.dir.join(format!("{name}.json"))
     }
 
-    fn restore(&self, model: &str, ledger: &Ledger) {
+    fn restore(&self, model: &str, manager: &Manager) {
         let mut saved = self.saved.lock().unwrap();
         let held = saved.entry(model.into()).or_insert_with(|| {
             let read = fs::read(self.path(model)).ok().and_then(|bytes| serde_json::from_slice::<Vec<Peak>>(&bytes).ok());
             read.unwrap_or_default()
         });
-        if let Err(error) = ledger.restore(held) {
+        if let Err(error) = manager.restore(held) {
             tracing::warn!("memory: {model}'s peaks not restored: {error}");
         }
     }
 
-    /// Saves what `ledgers` (every GPU of `model`, each holding what was restored into it) now
+    /// Saves what `managers` (every GPU of `model`, each holding what was restored into it) now
     /// hold, when it changed.
-    pub fn save<'a>(&self, model: &str, ledgers: impl Iterator<Item = &'a Ledger>) {
+    pub fn save<'a>(&self, model: &str, managers: impl Iterator<Item = &'a Manager>) {
         let mut saved = self.saved.lock().unwrap();
         let mut held: Vec<Peak> = vec![];
-        for peak in ledgers.flat_map(Ledger::peaks) {
+        for peak in managers.flat_map(Manager::peaks) {
             if !held.contains(&peak) {
                 held.push(peak);
             }
@@ -488,22 +478,22 @@ impl Peaks {
 /// What woke the events thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Woke {
-    /// A ledger: room freed, a row died, a peak was recorded.
-    Ledger,
+    /// A GPU's manager: room freed, an executor exited, a peak was recorded.
+    Gpu,
     /// The host is short of what its running calls must keep free ([`Host`]).
     HostShort,
 }
 
-/// A source the events thread waits on: a ledger's events, or the host's short event.
+/// A source the events thread waits on: a GPU manager's events, or the host's short event.
 pub enum Source {
-    Ledger(Arc<Gpu>),
+    Gpu(Arc<Gpu>),
     Host(Arc<Host>),
 }
 
 impl Source {
     fn waitable(&self) -> Waitable<'_> {
         match self {
-            Source::Ledger(gpu) => waitable(gpu.ledger().events()),
+            Source::Gpu(gpu) => waitable(gpu.manager.events()),
             Source::Host(host) => host.short.waitable(),
         }
     }
@@ -511,9 +501,9 @@ impl Source {
     /// Clears what it signalled (a ready event: no wait).
     fn clear(&self) -> Woke {
         match self {
-            Source::Ledger(gpu) => {
-                gpu.ledger().clear_events();
-                Woke::Ledger
+            Source::Gpu(gpu) => {
+                gpu.manager.clear_events();
+                Woke::Gpu
             }
             Source::Host(host) => {
                 host.short();
@@ -603,7 +593,7 @@ impl Host {
             let mut signalled: Option<u64> = None;
             while pressure.wait().is_ok() {
                 looked.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
-                let need = keep.look(gpus.iter().map(|gpu| gpu.ledger().host_calls()).collect::<Option<Vec<_>>>().map(|calls| calls.concat()));
+                let need = keep.look(gpus.iter().map(|gpu| gpu.manager.host_calls()).collect::<Option<Vec<_>>>().map(|calls| calls.concat()));
                 let budget = u64::try_from(host_memory::read().available).unwrap_or(u64::MAX);
                 if budget >= need {
                     signalled = None;

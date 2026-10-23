@@ -721,9 +721,10 @@ impl Pool {
         let tenants = memory::Tenants::default();
         let uids = [Some(platform::memory::euid()), config.identity.map(|identity| identity.uid)];
         let peers: Arc<dyn varena::lease::Hosting> = Arc::new(memory::Peers::new(tenants.clone(), uids.into_iter().flatten().collect(), notes.clone()));
-        let leases = |entry: &str| {
-            let uuid = memory::row(entry, &config.inventory)?.device_uuid.as_str();
-            memory::chunks(uuid, &notes).map(|open| memory::Leases { hosting: peers.clone(), open })
+        let leases = |entry: &str| memory::Leases {
+            hosting: peers.clone(),
+            open: memory::row(entry, &config.inventory).and_then(|row| memory::chunks(&row.device_uuid, &notes)),
+            tenants: tenants.clone(),
         };
         let devices: Vec<Device> = envelope.iter().map(|entry| Device {
             entry: entry.clone(),
@@ -734,11 +735,11 @@ impl Pool {
         let launcher = crate::child_launcher::ChildLauncher::new()?;
         let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
         Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
-            let ledgers = devices.iter().filter_map(|d| d.memory.clone()).map(memory::Source::Ledger);
-            let sources: Vec<memory::Source> = ledgers.chain(host.clone().map(memory::Source::Host)).collect();
+            let gpus = devices.iter().filter_map(|d| d.memory.clone()).map(memory::Source::Gpu);
+            let sources: Vec<memory::Source> = gpus.chain(host.clone().map(memory::Source::Host)).collect();
             let pool = pool.clone();
             let woke = move |woke| match (pool.upgrade(), woke) {
-                (Some(pool), memory::Woke::Ledger) => pool.memory_changed(),
+                (Some(pool), memory::Woke::Gpu) => pool.memory_changed(),
                 (Some(pool), memory::Woke::HostShort) => pool.host_short(),
                 (None, _) => {}
             };
@@ -777,10 +778,10 @@ impl Pool {
             }
         }))
     }
-    /// Each GPU's lease books by UUID, where TensorD creates its chunks.
+    /// Each GPU's lease books by UUID.
     pub fn leases(&self) -> BTreeMap<String, protocol::machine::GpuLeases> {
         let books = |device: &Device| {
-            let held = device.memory.as_ref()?.manager()?.holdings();
+            let held = device.memory.as_ref()?.manager.holdings();
             let uuid = memory::row(&device.entry, &self.config.inventory)?.device_uuid.clone();
             let executors = held.executors.into_iter().map(|e| protocol::machine::LeaseHolder { pid: e.pid, executor: e.executor, chunks: e.chunks as u64, bytes: e.bytes }).collect();
             Some((uuid, protocol::machine::GpuLeases {
@@ -797,7 +798,7 @@ impl Pool {
         };
         self.devices.iter().filter_map(books).collect()
     }
-    /// A ledger signalled (room freed, a row died, a peak was recorded): the dispatch queue asks
+    /// A manager signalled (room freed, an executor exited, a peak was recorded): the dispatch queue asks
     /// `fits` again, each row the ledger newly names stalled ends (once), and changed peaks are
     /// saved.
     fn memory_changed(&self) {
@@ -806,6 +807,7 @@ impl Pool {
             engine.notify_activity();
         }
         let gpus: Vec<(&str, &memory::Gpu)> = self.devices.iter().filter_map(|d| Some((d.entry.as_str(), d.memory.as_deref()?))).collect();
+        gpus.iter().for_each(|(_, gpu)| gpu.changed());
         let stalled: Vec<(&str, u32)> = gpus.iter().flat_map(|(entry, gpu)| gpu.stalled().into_iter().map(move |pid| (*entry, pid))).collect();
         let fresh: Vec<(&str, u32)> = {
             let mut seen = self.stalled.lock().unwrap();
@@ -819,7 +821,7 @@ impl Pool {
         }
         let models: std::collections::BTreeSet<&str> = gpus.iter().map(|(_, gpu)| gpu.model.as_str()).collect();
         for model in models {
-            self.peaks.save(model, gpus.iter().filter(|(_, gpu)| gpu.model == model).map(|(_, gpu)| gpu.ledger()));
+            self.peaks.save(model, gpus.iter().filter(|(_, gpu)| gpu.model == model).map(|(_, gpu)| &*gpu.manager));
         }
     }
     /// The host is short of what its running calls must keep free: one idle process ends,
@@ -1639,7 +1641,7 @@ impl Pool {
     /// before its shape is known (`fits`). A GPU without a ledger has nothing to refuse it with.
     fn fits(&self, plan: &str, start: usize, degree: u32, family: Option<&str>) -> bool {
         let lane = self.lane(start, degree).unwrap_or_default();
-        lane.iter().filter_map(|d| d.memory.as_ref()).all(|m| m.ledger().fits(plan, UNPREPARED, family))
+        lane.iter().filter_map(|d| d.memory.as_ref()).all(|m| m.manager.fits(plan, UNPREPARED, family))
     }
     /// Where `plan` runs now, with its lane's call slots: inside its root's `lane` when it has
     /// one, else (a standalone call, or warming with no root) on GPUs no root holds or older
@@ -2208,7 +2210,6 @@ impl Pool {
                     package_interface: interface,
                     sequence_parallel_degree: 1,
                     import_only: true,
-                    ledgers: 0,
                     leases: None,
                     memory_mode: self.config.host.mode.into(),
                 },
@@ -2598,18 +2599,17 @@ impl Pool {
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
             let starting = Instant::now();
-            // An executor speaking leases also dials each GPU's manager.
-            let contract = session.executor.hello.contract();
-            let standalone = contract == device_executor::Contract::Standalone;
-            let ledgers = self.grants(gpus, &session.executor)?;
-            let leases = (contract == device_executor::Contract::Leases
-                && gpus.iter().any(|d| d.memory.as_ref().is_some_and(|m| m.manager().is_some())))
-                .then(platform::memory::euid);
+            // An executor speaking leases dials each GPU's manager; any other runs standalone.
+            let standalone = session.executor.hello.contract() == device_executor::Contract::Standalone;
+            if standalone {
+                self.standalone(gpus, &session.executor);
+            }
+            let leases = (!standalone && gpus.iter().any(|d| d.memory.is_some())).then(platform::memory::euid);
             // Rank 0 spawns and forms every follower inside this command; its watch meters
             // the whole group's work, so formation ends only on measured lack of progress. A
             // follower that dials its lease listener meanwhile waits for its registration.
             let forming = self.tenants.forming(&session.executor.birth, ranks.saturating_sub(1) as usize);
-            let started = command_ok(session.executor.command_with(
+            let started = command_ok(session.executor.command(
                 &DeviceCommand::Start {
                     devices: lane.clone(),
                     application: held.record.application.clone(),
@@ -2618,11 +2618,9 @@ impl Pool {
                     import_only: false,
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions: constructions(&plan),
-                    ledgers: (ledgers.len() / 2) as u32,
                     leases,
                     memory_mode: self.config.host.mode.into(),
                 },
-                &ledgers,
                 &mut callbacks,
             )?)?;
             session.launch.start_ms = starting.elapsed().as_secs_f64() * 1e3;
@@ -2795,8 +2793,8 @@ impl Pool {
         // none, waiting while it does not fit. In its family, a yielded parent's working set is
         // left out: the parent waits on it.
         let shape = shape(&prepared.features);
-        let ledgers: Vec<&varena::Ledger> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| m.ledger()).collect();
-        let admitted = memory::admit(engine, &ledgers, id, &construction, &shape, record.family());
+        let managers: Vec<&varena::lease::Manager> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &*m.manager).collect();
+        let admitted = memory::admit(engine, &managers, id, &construction, &shape, record.family());
         let _dispatched = Dispatched { gpus, id: id.into() };
         if !admitted? {
             // Canceled while it waited for room: it never started.
@@ -2876,7 +2874,7 @@ impl Pool {
         let lost = self.lost_followers(start, degree, &session.followers);
         if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
             // It may have faulted on its GPUs: their kept pages go.
-            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.ledger().fault());
+            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.fault());
             // The author's failure keeps its traceback and origin in triage; the executor's
             // end would record only "executor_ended".
             if let Some(outcome) = reply.outcome.as_ref().filter(|o| !o.traceback.is_empty()) {
@@ -2920,30 +2918,17 @@ impl Pool {
         Ok(true)
     }
 
-    /// Each GPU's grant for `executor`, in lane order (its table, and a description for its
-    /// row's lock), which follow its Start: every rank claims its own row, reaped at its exit.
-    /// An executor of neither memory protocol (a Runtime before 0.31) gets none and runs its
-    /// memory alone, unshared with the others on these GPUs, its bytes a fixed row on its first
-    /// GPU: version skew degrades, with a note.
-    fn grants(&self, gpus: &[Device], executor: &DeviceExecutor) -> io::Result<Vec<File>> {
-        if !gpus.iter().all(|d| d.memory.is_some()) {
-            return Ok(vec![]);
-        }
+    /// An executor of another memory protocol runs its memory alone, unshared with the others on
+    /// these GPUs, its bytes a fixed charge on its first GPU: version skew degrades, with a note.
+    fn standalone(&self, gpus: &[Device], executor: &DeviceExecutor) {
         let hello = &executor.hello;
-        if hello.contract() == device_executor::Contract::Standalone {
-            tracing::warn!("executor {} (Runtime {}, TensorFS {}) speaks memory protocol {}, neither 1 nor 2: its GPU memory runs without this machine's ledger",
-                executor.birth.pid, hello.runtime_version, hello.tensorfs_version, hello.memory_protocol);
-            self.notes.note(serde_json::json!({"event": "no_ledger", "pid": executor.birth.pid, "runtime": hello.runtime_version,
-                "tensorfs": hello.tensorfs_version, "memory_protocol": hello.memory_protocol}));
-            if let Some(gpu) = gpus.first().and_then(|d| d.memory.as_ref()) {
-                gpu.fix(executor.birth.pid);
-            }
-            return Ok(vec![]);
+        tracing::warn!("executor {} (Runtime {}, TensorFS {}) speaks memory protocol {}, not leases: its GPU memory runs on its own",
+            executor.birth.pid, hello.runtime_version, hello.tensorfs_version, hello.memory_protocol);
+        self.notes.note(serde_json::json!({"event": "standalone", "pid": executor.birth.pid, "runtime": hello.runtime_version,
+            "tensorfs": hello.tensorfs_version, "memory_protocol": hello.memory_protocol}));
+        if let Some(gpu) = gpus.first().and_then(|d| d.memory.as_ref()) {
+            gpu.fix(executor.birth.pid);
         }
-        let grants = gpus.iter().filter_map(|d| d.memory.as_ref())
-            .map(|m| m.ledger().grant(executor.birth.pid).map_err(io::Error::other))
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok(grants.into_iter().flat_map(|grant| [File::from(grant.table), File::from(grant.row)]).collect())
     }
 
     /// For a group, each slot's placeable components and the GPU of the group that keeps each
@@ -2955,10 +2940,10 @@ impl Pool {
         if gpus.len() < 2 || placeable.is_empty() {
             return BTreeMap::new();
         }
-        let ledgers: Option<Vec<&varena::Ledger>> = gpus.iter().map(|d| d.memory.as_ref().map(|m| m.ledger())).collect();
+        let managers: Option<Vec<&varena::lease::Manager>> = gpus.iter().map(|d| d.memory.as_ref().map(|m| &*m.manager)).collect();
         let sets: Vec<&str> = placeable.iter().map(|(_, _, set)| set.as_str()).collect();
-        let gpu = match ledgers {
-            Some(ledgers) => memory::homes(&ledgers, &plan.construction, UNPREPARED, family, &sets, &self.notes),
+        let gpu = match managers {
+            Some(managers) => memory::homes(&managers, &plan.construction, UNPREPARED, family, &sets, &self.notes),
             None => vec![0; sets.len()],
         };
         let mut homes: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
@@ -3115,7 +3100,7 @@ struct Dispatched<'a> {
 }
 impl Drop for Dispatched<'_> {
     fn drop(&mut self) {
-        self.gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.ledger().undispatch(&self.id));
+        self.gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.undispatch(&self.id));
     }
 }
 

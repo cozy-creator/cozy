@@ -1403,7 +1403,6 @@ print(json.dumps({"identity": generation.identity}))
                             import_only: false,
                             call_interfaces: vec![],
                             constructions: Vec::new(),
-                            ledgers: 0,
                             leases: None,
                             memory_mode: crate::device_executor::MemoryMode::Shared,
                         },
