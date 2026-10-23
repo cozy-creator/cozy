@@ -1242,6 +1242,23 @@ pub(crate) fn held(rows: &[RowView]) -> u64 {
 
 // ---- TensorD's side
 
+/// A process TensorD started whose memory protocol has no row of its own (a standalone
+/// executor, varena-leases R2-2): its measured bytes, held as context in a row TensorD holds by
+/// its pid. Context is no class an ask reaches, so it is never asked; its physical bytes are
+/// known, so no executor reads them as foreign. Dropped (at its reap), the row goes.
+pub struct FixedRow(Arc<Row>);
+
+impl FixedRow {
+    /// Its device bytes now.
+    pub fn set(&self, bytes: u64) {
+        let change = self.0.physical_change();
+        let physical_epoch = self.0.physical_epoch();
+        self.0.publish(&Facts { context: bytes, physical: bytes, physical_epoch, ..Facts::default() });
+        change.finish();
+        self.0.shared.ring();
+    }
+}
+
 /// What TensorD hands an executor for its [`crate::Memory`]: two descriptions of the table,
 /// one for the table and one for the executor's row lock (an executor of another uid cannot
 /// open the file itself). Fields are public so a spawner can pass them across exec.
@@ -1434,6 +1451,11 @@ impl Ledger {
         // A transferred grant owns this generation even before the child creates its row.
         os::share(&table, OPEN, 8, true)?;
         Ok(Grant { table, row: self.shared.descriptor()?, limit: None })
+    }
+
+    /// A [`FixedRow`] for `pid`, held by this process.
+    pub fn fixed(&self, pid: u32) -> Result<FixedRow> {
+        Ok(FixedRow(Arc::new(self.shared.claim(pid)?)))
     }
 
     /// After `waitpid`: `pid`'s row goes, and the pages it kept become orphans.

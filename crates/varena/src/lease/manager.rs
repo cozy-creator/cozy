@@ -16,17 +16,17 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use platform::handles::Peer;
 use platform::process::{Birth, Exact};
 
-use super::table::{self, Content, State, Table};
-use super::wire::{End, Region, ToAgent, ToManager};
+use super::table::{self, Content, Figures, State, Table};
+use super::wire::{End, Refusal, Region, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
-use crate::ledger::{Ledger, Mode};
+use crate::ledger::{FixedRow, Ledger, Mode};
 use crate::os::{self, Listener, Owned, Stream};
 use crate::{Error, GpuId, Result};
 
@@ -34,6 +34,11 @@ use crate::{Error, GpuId, Result};
 pub const CHUNK: u64 = 32 << 20;
 /// The lease protocol an agent speaks in its Hello (1 is the ledger's).
 pub const PROTOCOL: u32 = 2;
+/// The stall look's cadence (TensorD's sampler's): a period, never a verdict.
+const LOOK: Duration = Duration::from_millis(500);
+/// Looks in a row with neither a release nor any of its GPU work completing, while an unpinned
+/// ask of it waits, before an executor is stalled.
+const LOOKS: u32 = 3;
 
 /// Who a connecting peer is, as its host knows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,10 +55,13 @@ pub struct Identity {
 pub enum Record {
     Grant { pid: u32, ask: u64, chunks: usize, bytes: u64, adopted: bool, create_us: u64, export_us: u64, total_us: u64 },
     Adopt { pid: u32, region: Region, chunks: usize, bytes: u64 },
-    Refuse { pid: u32, ask: u64, why: String },
+    Refuse { pid: u32, ask: u64, code: Refusal, why: String },
     Revoke { pid: u32, slots: Vec<u32> },
     Answered { pid: u32, released: usize, us: u64 },
     Reclaim { pid: u32, destroyed_bytes: u64, retained_bytes: u64, us: u64 },
+    /// Judged stalled: `looks` looks with no release and no GPU progress, its oldest unpinned
+    /// ask `waited_ms` old.
+    Stalled { pid: u32, looks: u32, waited_ms: u64 },
 }
 
 /// What TensorD answers for the manager.
@@ -72,6 +80,8 @@ pub struct ExecutorHolding {
     pub executor: String,
     pub chunks: usize,
     pub bytes: u64,
+    /// Of `bytes`, what its fills acked landed: what its exit would retain.
+    pub landed: u64,
 }
 
 /// What a manager holds, for its host's status and the tests: free = capacity − created.
@@ -88,18 +98,44 @@ pub struct Holdings {
     pub executors: Vec<ExecutorHolding>,
 }
 
-pub struct Manager {
+/// Opens the GPU's backend (TensorD's CUDA context), at the first ask.
+pub type Opener = Box<dyn Fn() -> Result<Arc<dyn Backend>> + Send + Sync>;
+
+/// The backend while chunks or executors need it, with what it measured at open.
+struct Device {
     backend: Arc<dyn Backend>,
     capacity: u64,
     granularity: u64,
+    headroom: u64,
+    context: u64,
+}
+
+/// A table's slots: one per smallest chunk the card could hold.
+const SLOT_UNIT: u64 = 2 << 20;
+
+pub struct Manager {
+    open: Opener,
+    /// One open at a time (never under `books`).
+    opening: Mutex<()>,
+    gpu_memory: u64,
+    limit: Option<u64>,
+    mode: Mode,
     ledger: Ledger,
+    /// Its own bytes on the ledger: retained chunks no executor maps and its context, so no
+    /// executor counts them foreign.
+    row: FixedRow,
     hosting: Arc<dyn Hosting>,
     retired: AtomicBool,
     books: Mutex<Books>,
+    /// Wakes the stall look when asks go out.
+    looking: Condvar,
 }
 
 #[derive(Default)]
 struct Books {
+    /// Opened at the first ask, dropped once no chunk and no executor is left (§2a: TensorD's
+    /// context keeps a laptop's GPU awake and costs VRAM).
+    device: Option<Arc<Device>>,
     created: u64,
     created_chunks: usize,
     seq: u32,
@@ -122,12 +158,18 @@ struct Exec {
     free: BTreeSet<u32>,
     leased: BTreeMap<u32, Leased>,
     waiting: VecDeque<Waiting>,
-    /// Slots asked back and not yet released.
-    asked: BTreeSet<u32>,
-    /// Releases the manager reclaimed itself: the progress a stall is judged by.
+    /// Slots asked back and not yet released, and when each was asked.
+    asked: BTreeMap<u32, Instant>,
+    /// Releases the manager reclaimed itself, and with the agent's GPU progress, what a stall
+    /// is judged by.
     progress: u64,
-    /// `progress` at the last stall look while unpinned asks were out.
-    looked: Option<u64>,
+    /// The stall look's: (releases, GPU progress) at the last look that saw either move, and
+    /// looks since.
+    seen: (u64, u64),
+    still: u32,
+    stalled: bool,
+    /// The executors whose pins its waiting ask waits on.
+    waits_on: BTreeSet<u64>,
 }
 
 struct Leased {
@@ -145,17 +187,19 @@ struct Waiting {
     region: Option<Region>,
 }
 
-/// What to send and record once `books` dropped.
+/// What to send and record once `books` dropped, and a backend nothing needs any more.
 #[derive(Default)]
 struct Out {
     sends: Vec<(Arc<End>, ToAgent, Option<Owned>)>,
     records: Vec<Record>,
+    idle: Option<Arc<Device>>,
 }
 
 impl Out {
     fn append(&mut self, mut other: Out) {
         self.sends.append(&mut other.sends);
         self.records.append(&mut other.records);
+        self.idle = self.idle.take().or(other.idle);
     }
 }
 
@@ -170,6 +214,18 @@ pub fn chunks(bytes: u64, granularity: u64) -> Vec<u64> {
         left -= take;
     }
     out
+}
+
+/// An ask's chunks: a weights region is one chunk sized to its page (§3, never split); torch
+/// and cache bytes split at [`CHUNK`].
+fn sizes(ask: &Waiting, granularity: u64) -> Vec<u64> {
+    match ask.region {
+        Some(_) => {
+            let unit = granularity.max(1);
+            vec![ask.bytes.div_ceil(unit) * unit]
+        }
+        None => chunks(ask.bytes, granularity),
+    }
 }
 
 enum Room {
@@ -188,16 +244,16 @@ fn micros(since: Instant) -> u64 {
 
 impl Manager {
     /// The GPU's manager: its ledger made, `listener` served on the manager's own thread until
-    /// [`Manager::retire`]. It creates at most `limit` (a `--gpu-memory-limit`, else the card),
-    /// less its own context and, in shared mode, the headroom H.
-    pub fn create(gpu: &GpuId, limit: Option<u64>, mode: Mode, backend: Arc<dyn Backend>, listener: Listener, hosting: Arc<dyn Hosting>) -> Result<Arc<Manager>> {
+    /// [`Manager::retire`]. Its backend opens at the first ask (`open`); it then creates at most
+    /// `limit` (a `--gpu-memory-limit`, else the card), less its own context and, in shared
+    /// mode, the headroom H.
+    pub fn create(gpu: &GpuId, limit: Option<u64>, mode: Mode, open: Opener, listener: Listener, hosting: Arc<dyn Hosting>) -> Result<Arc<Manager>> {
         let ledger = Ledger::create(gpu, limit)?;
         ledger.set_mode(mode)?;
-        let card = limit.unwrap_or(gpu.memory).min(backend.capacity());
-        let headroom = if mode == Mode::Shared { crate::table::headroom(gpu.memory) } else { 0 };
-        let capacity = card.saturating_sub(headroom).saturating_sub(backend.opened_context());
-        let granularity = backend.granularity();
-        let manager = Arc::new(Manager { backend, capacity, granularity, ledger, hosting, retired: AtomicBool::new(false), books: Mutex::new(Books::default()) });
+        let row = ledger.fixed(std::process::id())?;
+        let manager = Arc::new(Manager { open, opening: Mutex::new(()), gpu_memory: gpu.memory, limit, mode, ledger, row, hosting, retired: AtomicBool::new(false), books: Mutex::new(Books::default()), looking: Condvar::new() });
+        let weak = Arc::downgrade(&manager);
+        std::thread::Builder::new().name("lease-look".into()).spawn(move || look_loop(&weak)).map_err(|e| Error::io("spawn lease-look", e))?;
         let serving = manager.clone();
         std::thread::Builder::new()
             .name("lease-listener".into())
@@ -230,25 +286,37 @@ impl Manager {
         self.ledger.clear_events()
     }
 
-    /// The ledger's stalled rows, and executors with unpinned chunks asked back that released
-    /// nothing since the last look (progress the manager observed itself, never a clock).
+    /// The ledger's stalled rows, and executors the stall look judged stalled: an unpinned
+    /// chunk asked back, and neither a release nor any GPU progress of it across [`LOOKS`]
+    /// looks. A getter: any caller, any rate.
     pub fn stalled(&self) -> Vec<u32> {
         let mut pids = self.ledger.stalled();
-        let mut b = self.books.lock();
-        for e in b.executors.values_mut() {
-            let unpinned = e.asked.iter().any(|s| e.table.word(*s).is_some_and(|w| w.state == State::Mapped && w.pins == 0));
-            if !unpinned {
-                e.looked = None;
-                continue;
-            }
-            if e.looked == Some(e.progress) {
-                pids.push(e.pid);
-            }
-            e.looked = Some(e.progress);
-        }
+        pids.extend(self.books.lock().executors.values().filter(|e| e.stalled).map(|e| e.pid));
         pids.sort_unstable();
         pids.dedup();
         pids
+    }
+
+    /// One stall look (every [`LOOK`] while asks are out): whether any ask is out, and the
+    /// executors newly judged stalled.
+    fn look(&self) -> (bool, Vec<Record>) {
+        let mut b = self.books.lock();
+        let (mut out, mut records) = (false, vec![]);
+        for e in b.executors.values_mut() {
+            out |= !e.asked.is_empty();
+            let now = (e.progress, e.table.progress());
+            let oldest = e.asked.iter().filter(|(s, _)| e.table.word(**s).is_some_and(|w| w.state == State::Mapped && w.pins == 0)).map(|(_, at)| *at).min();
+            let Some(oldest) = oldest.filter(|_| now == e.seen) else {
+                (e.seen, e.still, e.stalled) = (now, 0, false);
+                continue;
+            };
+            e.still += 1;
+            if e.still >= LOOKS && !e.stalled {
+                e.stalled = true;
+                records.push(Record::Stalled { pid: e.pid, looks: e.still, waited_ms: u64::try_from(oldest.elapsed().as_millis()).unwrap_or(u64::MAX) });
+            }
+        }
+        (out, records)
     }
 
     pub fn holdings(&self) -> Holdings {
@@ -256,10 +324,16 @@ impl Manager {
         let executors: Vec<ExecutorHolding> = b
             .executors
             .values()
-            .map(|e| ExecutorHolding { pid: e.pid, executor: e.identity.executor.clone(), chunks: e.leased.len(), bytes: e.leased.values().map(|l| l.phys.len).sum() })
+            .map(|e| ExecutorHolding {
+                pid: e.pid,
+                executor: e.identity.executor.clone(),
+                chunks: e.leased.len(),
+                bytes: e.leased.values().map(|l| l.phys.len).sum(),
+                landed: e.leased.values().filter(|l| l.landed && l.region.is_some()).map(|l| l.phys.len).sum(),
+            })
             .collect();
         Holdings {
-            capacity: self.capacity,
+            capacity: b.device.as_ref().map_or(0, |d| d.capacity),
             created: b.created,
             created_chunks: b.created_chunks,
             leased: executors.iter().map(|e| e.bytes).sum(),
@@ -297,7 +371,7 @@ impl Manager {
         let peer = platform::handles::peer(&stream).map_err(|e| Error::io("lease peer", e))?;
         let end = Arc::new(End::new(stream));
         let Some(identity) = self.hosting.identify(&peer) else {
-            return end.send(&ToAgent::Refuse { id: 0, why: "not an executor of this machine".into() }, None);
+            return end.send(&ToAgent::Refuse { id: 0, code: Refusal::NotRegistered, why: format!("pid {} is no executor of this machine", peer.pid) }, None);
         };
         let Some((ToManager::Hello { protocol, birth }, again)) = end.recv::<ToManager>()? else {
             return Err(Error::Invalid("a lease connection opened without Hello".into()));
@@ -305,24 +379,24 @@ impl Manager {
         if protocol != PROTOCOL || again.is_some() {
             // A re-attach after a manager restart comes after slice 1: that agent runs standalone.
             let why = if again.is_some() { "re-attach is not served yet".into() } else { format!("lease protocol {protocol}; this manager speaks {PROTOCOL}") };
-            return end.send(&ToAgent::Refuse { id: 0, why }, None);
+            return end.send(&ToAgent::Refuse { id: 0, code: Refusal::Incompatible, why }, None);
         }
         let found = Birth::of(peer.pid).map_err(|e| Error::Io(e.to_string()))?;
         if found.start_ticks != birth {
             return Err(Error::Invalid(format!("lease Hello for birth {birth} from pid {} (birth {})", peer.pid, found.start_ticks)));
         }
         let process = Exact::open(&found).map_err(|e| Error::Io(e.to_string()))?.ok_or_else(|| Error::Closed(format!("process {}", peer.pid)))?;
-        let slots = u32::try_from(self.capacity / self.granularity.max(1)).unwrap_or(u32::MAX).max(1);
+        let slots = u32::try_from(self.limit.unwrap_or(self.gpu_memory) / SLOT_UNIT).unwrap_or(u32::MAX).max(1);
         // Sealed against resizing before the agent sees it: its ftruncate could SIGBUS us.
         let file = platform::memory::page(table::bytes(slots) as u64).map_err(|e| Error::Io(e.to_string()))?;
         platform::shm::seal_with(file.as_fd(), platform::shm::RESIZE_SEALS).map_err(|e| Error::Io(e.to_string()))?;
-        let table = Arc::new(Table::create(os::map(&file, table::bytes(slots), true)?, slots, peer.pid, birth, [0, 0])?);
+        let table = Arc::new(Table::create(os::map(&file, table::bytes(slots), true)?, slots, peer.pid, birth)?);
         let epoch = table.attach();
         let id = {
             let mut b = self.books.lock();
             b.next += 1;
             let id = b.next;
-            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeSet::new(), progress: 0, looked: None };
+            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, seen: (0, 0), still: 0, stalled: false, waits_on: BTreeSet::new() };
             b.executors.insert(id, exec);
             id
         };
@@ -362,10 +436,44 @@ impl Manager {
         for record in out.records {
             self.hosting.record(record);
         }
+        drop(out.idle);
         self.ledger.ring();
     }
 
+    /// The backend, opened now if it is not (outside `books`); the open's failure refuses.
+    fn device(&self) -> Result<Arc<Device>> {
+        if let Some(d) = self.books.lock().device.clone() {
+            return Ok(d);
+        }
+        let _one = self.opening.lock();
+        if let Some(d) = self.books.lock().device.clone() {
+            return Ok(d);
+        }
+        let backend = (self.open)()?;
+        let card = self.limit.unwrap_or(self.gpu_memory).min(backend.capacity());
+        let headroom = if self.mode == Mode::Shared { crate::table::headroom(self.gpu_memory) } else { 0 };
+        let context = backend.opened_context();
+        let capacity = card.saturating_sub(headroom).saturating_sub(context);
+        let device = Arc::new(Device { capacity, granularity: backend.granularity().max(1), headroom, context, backend });
+        self.books.lock().device = Some(device.clone());
+        Ok(device)
+    }
+
+    /// The backend goes once nothing needs it; its drop (a context's destroy) runs unlocked.
+    fn idle(b: &mut Books) -> Option<Arc<Device>> {
+        (b.created == 0 && b.executors.is_empty()).then(|| b.device.take()).flatten()
+    }
+
     fn ask(&self, exec: u64, ask: Waiting) -> Out {
+        if let Err(error) = self.device() {
+            let b = self.books.lock();
+            let mut out = Out::default();
+            if let Some(e) = b.executors.get(&exec) {
+                out.sends.push((e.end.clone(), ToAgent::Refuse { id: ask.id, code: Refusal::Failed, why: error.to_string() }, None));
+                out.records.push(Record::Refuse { pid: e.pid, ask: ask.id, code: Refusal::Failed, why: error.to_string() });
+            }
+            return out;
+        }
         let mut b = self.books.lock();
         if let Some(e) = b.executors.get_mut(&exec) {
             e.waiting.push_back(ask);
@@ -384,7 +492,7 @@ impl Manager {
             let mut done = vec![];
             for (slot, l) in e.leased.iter_mut() {
                 match e.table.word(*slot).map(|w| (w.state, w.seq)) {
-                    Some((State::Mapped, seq)) if seq == l.seq && e.table.landed(*slot) => l.landed = true,
+                    Some((State::Mapped, seq)) if seq == l.seq => l.landed = e.table.landed(*slot),
                     Some((State::Released | State::Refused, seq)) if seq == l.seq => done.push(*slot),
                     _ => {}
                 }
@@ -408,6 +516,7 @@ impl Manager {
             *us = micros(start);
         }
         out.append(self.settle(&mut b));
+        out.idle = Self::idle(&mut b);
         out
     }
 
@@ -418,9 +527,11 @@ impl Manager {
         let mut b = self.books.lock();
         let Some(e) = b.executors.remove(&exec) else { return Out::default() };
         let (mut gone, mut retained) = (vec![], 0);
-        for l in e.leased.into_values() {
+        for (slot, l) in e.leased {
+            // Both say landed: the manager's record of this grant's ack, and the table now (an
+            // unland whose doorbell was still queued wins).
             match l.region {
-                Some(region) if l.landed => {
+                Some(region) if l.landed && e.table.landed(slot) && e.table.word(slot).is_some_and(|w| w.seq == l.seq) => {
                     retained += l.phys.len;
                     let key = (e.identity.domain.clone(), region);
                     let kept = b.retained.entry(key.clone()).or_default();
@@ -439,13 +550,15 @@ impl Manager {
         }
         let mut out = self.settle(&mut b);
         out.records.insert(0, Record::Reclaim { pid: e.pid, destroyed_bytes: destroyed, retained_bytes: retained, us: micros(start) });
+        out.idle = Self::idle(&mut b);
         out
     }
 
     fn destroy(&self, b: &mut Books, phys: Physical) {
         b.created = b.created.saturating_sub(phys.len);
         b.created_chunks = b.created_chunks.saturating_sub(1);
-        if let Err(error) = self.backend.destroy(phys) {
+        let Some(d) = &b.device else { return };
+        if let Err(error) = d.backend.destroy(phys) {
             tracing::warn!("lease: destroying a chunk: {error}");
         }
     }
@@ -459,41 +572,72 @@ impl Manager {
 
     /// Answers waiting asks in order while room allows; for the first that does not fit, makes
     /// room and waits for it, or refuses it when none can come.
+    /// Each executor's asks in order (one waiting holds up only its own later asks): first
+    /// every ask that fits now, then room made for each executor's first that does not, which
+    /// then waits for it or is refused when none can come.
     fn settle(&self, b: &mut Books) -> Out {
         let mut out = Out::default();
-        while let Some((exec, ask)) = b.executors.iter_mut().find_map(|(id, e)| e.waiting.pop_front().map(|w| (*id, w))) {
-            let pid = b.executors.get(&exec).map_or(0, |e| e.pid);
-            let refuse = |b: &Books, out: &mut Out, why: String| {
-                if let Some(e) = b.executors.get(&exec) {
-                    out.sends.push((e.end.clone(), ToAgent::Refuse { id: ask.id, why: why.clone() }, None));
-                }
-                out.records.push(Record::Refuse { pid, ask: ask.id, why });
-            };
-            match self.answer(b, exec, &ask) {
-                Ok(Some(granted)) => out.append(granted),
-                Ok(None) => {
-                    let short = (b.created + chunks(ask.bytes, self.granularity).iter().sum::<u64>()).saturating_sub(self.capacity);
-                    match self.make_room(b, exec, short, &mut out) {
-                        Room::Coming | Room::Pinned => {
-                            if let Some(e) = b.executors.get_mut(&exec) {
-                                e.waiting.push_front(ask);
-                            }
-                            break;
+        let ids: Vec<u64> = b.executors.keys().copied().collect();
+        for exec in ids.iter().copied() {
+            while let Some(ask) = b.executors.get_mut(&exec).and_then(|e| e.waiting.pop_front()) {
+                match self.answer(b, exec, &ask) {
+                    Ok(Some(granted)) => {
+                        out.append(granted);
+                        if let Some(e) = b.executors.get_mut(&exec) {
+                            e.waits_on.clear();
                         }
-                        Room::Refused => refuse(b, &mut out, format!("nothing revocable for {} bytes", ask.bytes)),
                     }
+                    Ok(None) => {
+                        if let Some(e) = b.executors.get_mut(&exec) {
+                            e.waiting.push_front(ask);
+                        }
+                        break;
+                    }
+                    Err(error) => refuse(b, &mut out, exec, ask.id, Refusal::Failed, error.to_string()),
                 }
-                Err(error) => refuse(b, &mut out, error.to_string()),
             }
         }
+        for exec in ids {
+            let Some(ask) = b.executors.get_mut(&exec).and_then(|e| e.waiting.pop_front()) else { continue };
+            let (capacity, granularity) = b.device.as_ref().map_or((0, 1), |d| (d.capacity, d.granularity));
+            let short = (b.created + sizes(&ask, granularity).iter().sum::<u64>()).saturating_sub(capacity);
+            match self.make_room(b, exec, short, &mut out) {
+                Room::Coming | Room::Pinned => {
+                    if let Some(e) = b.executors.get_mut(&exec) {
+                        e.waiting.push_front(ask);
+                    }
+                    self.looking.notify_all();
+                }
+                Room::Refused => refuse(b, &mut out, exec, ask.id, Refusal::NothingRevocable, format!("nothing revocable for {} bytes", ask.bytes)),
+            }
+        }
+        self.publish(b);
         out
+    }
+
+    /// Every table's figures, and the manager's own row, as the books stand now.
+    fn publish(&self, b: &Books) {
+        let retained: u64 = b.retained.values().flat_map(|v| v.values()).map(|p| p.len).sum();
+        let (free, headroom, context) = b.device.as_ref().map_or((0, 0, 0), |d| (d.capacity.saturating_sub(b.created), d.headroom, d.context));
+        let unpinned: BTreeMap<u64, u64> = b
+            .executors
+            .iter()
+            .map(|(id, e)| (*id, e.leased.iter().filter(|(s, l)| e.table.word(**s).is_some_and(|w| w.state == State::Mapped && w.pins == 0 && w.seq == l.seq)).map(|(_, l)| l.phys.len).sum()))
+            .collect();
+        let total: u64 = unpinned.values().sum();
+        for (id, e) in &b.executors {
+            let revocable = retained + total - unpinned.get(id).copied().unwrap_or(0);
+            e.table.set_figures(Figures { free, revocable, headroom, foreign: 0 });
+        }
+        self.row.set(retained + context);
     }
 
     /// The grants for `ask` when it fits now; `None` when room must be made first. A failure
     /// partway rolls the whole ask back: no slot stays granted, no chunk leaks.
     fn answer(&self, b: &mut Books, exec: u64, ask: &Waiting) -> Result<Option<Out>> {
         let start = Instant::now();
-        let sizes = chunks(ask.bytes, self.granularity);
+        let Some(dev) = b.device.clone() else { return Err(Error::Closed("the GPU's backend".into())) };
+        let sizes = sizes(ask, dev.granularity);
         let Some(pid) = b.executors.get(&exec).map(|e| e.pid) else { return Err(Error::Closed("the executor".into())) };
         let domain = b.executors.get(&exec).map(|e| e.identity.domain.clone()).unwrap_or_default();
         // Adopted only whole: every chunk, by index, the size this ask cuts.
@@ -503,15 +647,15 @@ impl Manager {
             b.order.retain(|k| k != key);
             b.retained.remove(key).unwrap_or_default().into_values().collect()
         } else {
-            if b.created + sizes.iter().sum::<u64>() > self.capacity {
+            if b.created + sizes.iter().sum::<u64>() > dev.capacity {
                 return Ok(None);
             }
             let mut made = vec![];
             for &len in &sizes {
-                match self.backend.create(len) {
+                match dev.backend.create(len) {
                     Ok(p) => made.push(p),
                     Err(error) => {
-                        made.into_iter().for_each(|p| drop(self.backend.destroy(p)));
+                        made.into_iter().for_each(|p| drop(dev.backend.destroy(p)));
                         return Err(error);
                     }
                 }
@@ -546,7 +690,7 @@ impl Manager {
                 continue;
             };
             let content = ask.region.map(|r| Content { fingerprint: r.fingerprint, region: r.region, index: index as u32 });
-            let exported = e.table.grant(slot, seq, p.len, content, adopt.is_some()).and_then(|ok| if ok { self.backend.export(&p).map(Some) } else { Ok(None) });
+            let exported = e.table.grant(slot, seq, p.len, content, adopt.is_some()).and_then(|ok| if ok { dev.backend.lend(&p).map(Some) } else { Ok(None) });
             match exported {
                 Ok(Some(handle)) => {
                     out.sends.push((e.end.clone(), ToAgent::Grant { id: ask.id, slot, seq, bytes: p.len, adopted: adopt.is_some(), last: index + 1 == n }, Some(handle)));
@@ -610,25 +754,25 @@ impl Manager {
         if room >= short {
             return Room::Coming;
         }
-        for e in b.executors.values() {
-            for s in &e.asked {
-                if e.table.word(*s).is_some_and(|w| (w.state == State::Mapped && w.pins == 0) || w.state == State::Revoking) {
-                    room += e.table.bytes_of(*s);
-                }
-            }
-        }
-        let (mut unpinned, mut pinned) = (vec![], vec![]);
+        // An executor waiting (transitively) on the asker's pins is never waited on: a cycle.
+        let cyclic = waiting_on(b, asker);
+        let (mut later, mut unpinned, mut pinned) = (0, vec![], vec![]);
         for (id, e) in &b.executors {
             for (slot, l) in &e.leased {
                 let Some(w) = e.table.word(*slot) else { continue };
-                if w.state != State::Mapped || w.seq != l.seq || e.asked.contains(slot) {
+                if w.seq != l.seq {
                     continue;
                 }
-                if w.pins == 0 {
-                    let (class, next) = e.table.class(*slot);
-                    unpinned.push((class, std::cmp::Reverse(next), *id, *slot, l.seq));
-                } else if *id != asker {
-                    pinned.push((*id, *slot, l.seq));
+                let free_of_cycle = *id != asker && !cyclic.contains(id);
+                match (w.state, w.pins, e.asked.contains_key(slot)) {
+                    (State::Revoking, ..) | (State::Mapped, 0, true) => room += w_bytes(e, *slot),
+                    (State::Mapped, _, true) if free_of_cycle => later += w_bytes(e, *slot),
+                    (State::Mapped, 0, false) => {
+                        let (class, next) = e.table.class(*slot);
+                        unpinned.push((class, std::cmp::Reverse(next), *id, *slot, l.seq));
+                    }
+                    (State::Mapped, _, false) if free_of_cycle => pinned.push((*id, *slot, l.seq)),
+                    _ => {}
                 }
             }
         }
@@ -639,7 +783,7 @@ impl Manager {
             if e.table.request(slot, seq).is_err() {
                 return 0;
             }
-            e.asked.insert(slot);
+            e.asked.insert(slot, Instant::now());
             asked.entry(id).or_default().push(slot);
             e.table.bytes_of(slot)
         };
@@ -652,13 +796,28 @@ impl Manager {
         let verdict = if room >= short {
             Room::Coming
         } else {
+            let mut on = BTreeSet::new();
             for (id, slot, seq) in pinned {
-                if room >= short {
+                if room + later >= short {
                     break;
                 }
-                room += ask_back(b, id, slot, seq);
+                later += ask_back(b, id, slot, seq);
+                on.insert(id);
             }
-            if room >= short { Room::Pinned } else { Room::Refused }
+            if room + later >= short {
+                // Whose pins it waits on: every executor holding an asked, still-pinned chunk.
+                for (id, e) in &b.executors {
+                    if *id != asker && e.asked.keys().any(|s| e.table.word(*s).is_some_and(|w| w.state == State::Mapped && w.pins > 0)) {
+                        on.insert(*id);
+                    }
+                }
+                if let Some(e) = b.executors.get_mut(&asker) {
+                    e.waits_on = on;
+                }
+                Room::Pinned
+            } else {
+                Room::Refused
+            }
         };
         for (id, slots) in asked {
             if let Some(e) = b.executors.get(&id) {
@@ -667,5 +826,47 @@ impl Manager {
             }
         }
         verdict
+    }
+}
+
+fn w_bytes(e: &Exec, slot: u32) -> u64 {
+    e.table.bytes_of(slot)
+}
+
+/// Every executor whose waiting ask waits, directly or through others, on `of`'s pins.
+fn waiting_on(b: &Books, of: u64) -> BTreeSet<u64> {
+    let mut found = BTreeSet::new();
+    let mut frontier = vec![of];
+    while let Some(x) = frontier.pop() {
+        for (id, e) in &b.executors {
+            if !e.waiting.is_empty() && e.waits_on.contains(&x) && found.insert(*id) {
+                frontier.push(*id);
+            }
+        }
+    }
+    found
+}
+
+fn refuse(b: &mut Books, out: &mut Out, exec: u64, ask: u64, code: Refusal, why: String) {
+    let Some(e) = b.executors.get_mut(&exec) else { return };
+    e.waits_on.clear();
+    out.sends.push((e.end.clone(), ToAgent::Refuse { id: ask, code, why: why.clone() }, None));
+    out.records.push(Record::Refuse { pid: e.pid, ask, code, why });
+}
+
+/// The stall look: every [`LOOK`] while asks are out, else asleep until one goes out.
+fn look_loop(manager: &Weak<Manager>) {
+    loop {
+        let Some(m) = manager.upgrade() else { return };
+        let (out, records) = m.look();
+        for record in records {
+            m.hosting.record(record);
+        }
+        let mut b = m.books.lock();
+        if out {
+            m.looking.wait_for(&mut b, LOOK);
+        } else {
+            m.looking.wait_for(&mut b, LOOK * 20);
+        }
     }
 }

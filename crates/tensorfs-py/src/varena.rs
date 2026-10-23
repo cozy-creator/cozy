@@ -420,6 +420,14 @@ impl PyMemory {
         detached(py, &self.gpu.uuid, || self.memory().pool_prepare(varena::PoolId(pool.0, pool.1), expected))
     }
 
+    /// Leases this GPU's weight pages from the manager TensorD serves in namespace `ns` (its
+    /// uid), right after open: None when leased, else (code, why). `NotRegistered`: TensorD has
+    /// not registered this executor yet; `Incompatible`: its manager speaks another protocol;
+    /// `Absent`: no manager serves this GPU.
+    fn lease(&self, py: Python<'_>, ns: u32) -> PyResult<Option<(String, String)>> {
+        detached(py, &self.gpu.uuid, || lease(self.memory(), ns, &self.gpu.uuid))
+    }
+
     /// Host pages of `gpu.memory` bytes (CPU, MPS), on the table `gpu.uuid` names.
     #[staticmethod]
     #[pyo3(signature = (gpu, grant = None, limit = None))]
@@ -562,6 +570,19 @@ impl Drop for PyRetained {
 }
 
 // ---------------------------------------------------------------- requests and passes
+
+#[cfg(unix)]
+fn lease(memory: &Memory, ns: u32, uuid: &str) -> varena::Result<Option<(String, String)>> {
+    let Some(stream) = varena::lease::connect(ns, uuid)? else {
+        return Ok(Some(("Absent".into(), format!("no lease manager serves GPU {uuid}"))));
+    };
+    Ok(memory.lease_over(stream)?.map(|(code, why)| (format!("{code:?}"), why)))
+}
+
+#[cfg(not(unix))]
+fn lease(_: &Memory, _: u32, _: &str) -> varena::Result<Option<(String, String)>> {
+    Ok(Some(("Absent".into(), "leases serve Linux GPUs (slice 1)".into())))
+}
 
 fn steps(plan: Vec<(Vec<String>, u32)>) -> Plan {
     Plan { steps: plan.into_iter().map(|(sets, passes)| Step { sets, passes }).collect() }

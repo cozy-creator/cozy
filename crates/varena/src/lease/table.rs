@@ -1,5 +1,5 @@
 //! The lease table (varena-leases §11): one per executor and GPU, in shared memory the manager
-//! creates and both map. A header line, then one line per chunk. A slot's `word` (state, pins,
+//! creates and both map. A two-line header, then one line per chunk. A slot's `word` (state, pins,
 //! grant seq) changes only by CAS: the manager moves Free→Granted and Released/Refused→Free, the
 //! agent everything between. The manager's `ask` is advisory; the agent's CAS decides a revoke.
 //! The table is untrusted input to the manager: atomics only, every index bounds-checked, no lock
@@ -58,7 +58,7 @@ impl Word {
     }
 }
 
-#[repr(C, align(64))]
+#[repr(C, align(128))]
 struct Header {
     magic: AtomicU64,
     version: AtomicU32,
@@ -68,9 +68,27 @@ struct Header {
     birth: AtomicU64,
     /// The manager bumps it at every attach: an agent re-attaches when it moves.
     epoch: AtomicU64,
-    /// Grants and revokes the agent answered: the progress a stall is judged by.
+    /// Grants and revokes the agent answered.
     acked: AtomicU64,
-    gpu: [AtomicU64; 2],
+    /// GPU work of this process seen complete (its streams' events): a fence its revoke waits
+    /// on moving counts as progress.
+    progress: AtomicU64,
+    /// The manager's figures, rewritten at every grant and release (`room` reads them, no IPC):
+    /// bytes it could create now, other executors' unpinned and retained bytes it could revoke,
+    /// the headroom it keeps, and foreign bytes as last sampled.
+    free: AtomicU64,
+    revocable: AtomicU64,
+    headroom: AtomicU64,
+    foreign: AtomicU64,
+}
+
+/// The manager's figures in a table's header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Figures {
+    pub free: u64,
+    pub revocable: u64,
+    pub headroom: u64,
+    pub foreign: u64,
 }
 
 /// What a chunk holds: a region of a set's layout (`fingerprint` its digest's first 8 bytes).
@@ -96,11 +114,12 @@ struct Slot {
     class: AtomicU32,
 }
 
-const _: () = assert!(std::mem::size_of::<Header>() == LINE && std::mem::size_of::<Slot>() == LINE);
+const HEAD: usize = 2 * LINE;
+const _: () = assert!(std::mem::size_of::<Header>() == HEAD && std::mem::size_of::<Slot>() == LINE);
 
 /// The bytes a table of `slots` chunks takes.
 pub fn bytes(slots: u32) -> usize {
-    LINE * (1 + slots as usize)
+    HEAD + LINE * slots as usize
 }
 
 /// A mapped table. Every field is an atomic in the shared mapping.
@@ -111,7 +130,7 @@ pub struct Table {
 
 impl Table {
     /// The manager's: a new table over `map` (zeroed, `bytes(slots)` long).
-    pub fn create(map: Map, slots: u32, pid: u32, birth: u64, gpu: [u64; 2]) -> Result<Table> {
+    pub fn create(map: Map, slots: u32, pid: u32, birth: u64) -> Result<Table> {
         if map.len < bytes(slots) {
             return Err(Error::Invalid(format!("a lease table of {slots} slots needs {} bytes", bytes(slots))));
         }
@@ -121,15 +140,13 @@ impl Table {
         h.slots.store(slots, Relaxed);
         h.pid.store(pid, Relaxed);
         h.birth.store(birth, Relaxed);
-        h.gpu[0].store(gpu[0], Relaxed);
-        h.gpu[1].store(gpu[1], Relaxed);
         h.magic.store(MAGIC, Release);
         Ok(table)
     }
 
     /// Either side's: an existing table (the agent at spawn, a restarted manager by name).
     pub fn open(map: Map) -> Result<Table> {
-        if map.len < LINE {
+        if map.len < HEAD {
             return Err(Error::Invalid("a lease table shorter than its header".into()));
         }
         // SAFETY: the mapping is at least one line, page-aligned, and the header is atomics only.
@@ -155,7 +172,7 @@ impl Table {
 
     fn slot(&self, i: u32) -> Option<&Slot> {
         // SAFETY: i < slots, and the mapping holds every slot line, all atomics.
-        (i < self.slots).then(|| unsafe { &*(self.map.base.add(LINE * (1 + i as usize)) as *const Slot) })
+        (i < self.slots).then(|| unsafe { &*(self.map.base.add(HEAD + LINE * i as usize) as *const Slot) })
     }
 
     fn slot_or(&self, i: u32) -> Result<&Slot> {
@@ -184,6 +201,27 @@ impl Table {
 
     pub fn acked(&self) -> u64 {
         self.header().acked.load(Acquire)
+    }
+
+    pub fn figures(&self) -> Figures {
+        let h = self.header();
+        Figures { free: h.free.load(Acquire), revocable: h.revocable.load(Acquire), headroom: h.headroom.load(Acquire), foreign: h.foreign.load(Acquire) }
+    }
+
+    pub fn set_figures(&self, f: Figures) {
+        let h = self.header();
+        h.free.store(f.free, Release);
+        h.revocable.store(f.revocable, Release);
+        h.headroom.store(f.headroom, Release);
+        h.foreign.store(f.foreign, Release);
+    }
+
+    pub fn progress(&self) -> u64 {
+        self.header().progress.load(Acquire)
+    }
+
+    pub fn progressed(&self) {
+        self.header().progress.fetch_add(1, Release);
     }
 
     fn ack(&self) {
@@ -317,7 +355,11 @@ impl Table {
     }
 
     pub fn set_landed(&self, i: u32) -> Result<()> {
-        self.slot_or(i)?.landed.store(1, Release);
+        self.set_landed_to(i, true)
+    }
+
+    pub fn set_landed_to(&self, i: u32, landed: bool) -> Result<()> {
+        self.slot_or(i)?.landed.store(u32::from(landed), Release);
         Ok(())
     }
 

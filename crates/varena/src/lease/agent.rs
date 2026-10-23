@@ -15,7 +15,7 @@ use parking_lot::{Condvar, Mutex};
 use platform::process::Birth;
 
 use super::table::{State, Table};
-use super::wire::{End, Region, ToAgent, ToManager};
+use super::wire::{End, Refusal, Region, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
 use crate::os::{self, Stream};
 use crate::{Error, Exhausted, Result};
@@ -55,6 +55,13 @@ struct Pending {
     closed: bool,
 }
 
+/// What an attach came to.
+pub enum Attach {
+    Leased(Arc<Agent>),
+    /// `NotRegistered`: redial once registered; `Incompatible`: run that GPU standalone.
+    Refused { code: Refusal, why: String },
+}
+
 pub struct Agent {
     end: Arc<End>,
     table: Arc<Table>,
@@ -66,10 +73,9 @@ pub struct Agent {
 
 impl Agent {
     /// Attaches to the manager serving `stream`; `revoked` runs on the reader thread at every
-    /// Revoke doorbell (the holder wakes its mechanism thread, never works there). Refused (a
-    /// protocol this manager does not speak, not one of its executors), it is `Error::Closed`:
-    /// the caller runs that GPU standalone, never fails for it.
-    pub fn attach(stream: Stream, backend: Arc<dyn Backend>, revoked: impl Fn() + Send + 'static) -> Result<Arc<Agent>> {
+    /// Revoke doorbell (the holder wakes its mechanism thread, never works there). A refusal
+    /// comes back typed: the caller redials or runs that GPU standalone, never fails for it.
+    pub fn attach(stream: Stream, backend: Arc<dyn Backend>, revoked: impl Fn() + Send + 'static) -> Result<Attach> {
         let end = Arc::new(End::new(stream));
         let me = Birth::own().map_err(|e| Error::Io(e.to_string()))?;
         end.send(&ToManager::Hello { protocol: super::manager::PROTOCOL, birth: me.start_ticks }, None)?;
@@ -78,7 +84,7 @@ impl Agent {
                 let len = os::size(&file)? as usize;
                 Arc::new(Table::open(os::map(&file, len, true)?)?)
             }
-            Some((ToAgent::Refuse { why, .. }, _)) => return Err(Error::Closed(format!("the lease manager: {why}"))),
+            Some((ToAgent::Refuse { code, why, .. }, _)) => return Ok(Attach::Refused { code, why }),
             _ => return Err(Error::Closed("the lease manager answered Hello with no table".into())),
         };
         let agent = Arc::new(Agent { end, table, backend, pending: Mutex::new(Pending::default()), held: Mutex::new(BTreeSet::new()) });
@@ -101,18 +107,21 @@ impl Agent {
                 }
             })
             .map_err(|e| Error::io("spawn lease-agent", e))?;
-        Ok(agent)
+        Ok(Attach::Leased(agent))
     }
 
     fn read(&self, revoked: &dyn Fn()) -> Result<()> {
         while let Some((message, handle)) = self.end.recv::<ToAgent>()? {
             match message {
                 ToAgent::Grant { id, slot, seq, bytes, adopted, last } => self.granted(id, Ticket { slot, seq }, bytes, adopted, last, handle)?,
-                ToAgent::Refuse { id, why } => {
+                ToAgent::Refuse { id, code, why } => {
                     let asking = self.pending.lock().asks.remove(&id);
                     if let Some(a) = asking {
                         self.give_back(a.got);
-                        (a.done)(Err(exhausted(a.bytes, &why)));
+                        (a.done)(Err(match code {
+                            Refusal::NothingRevocable => exhausted(a.bytes, &why),
+                            _ => Error::Closed(format!("the lease manager: {why}")),
+                        }));
                     }
                 }
                 ToAgent::Revoke => revoked(),
@@ -243,6 +252,18 @@ impl Agent {
         self.end.send(&ToManager::Answered, None)
     }
 
+    /// GPU work of this process completed (an event its holder waits on): a revoke behind a
+    /// long kernel is progressing, never stalled.
+    pub fn progressed(&self) {
+        self.table.progressed();
+    }
+
+    /// Its bytes are no longer its region's weights (a streamed slot moved): never retained.
+    pub fn unland(&self, ticket: Ticket) -> Result<()> {
+        self.table.set_landed_to(ticket.slot, false)?;
+        self.end.send(&ToManager::Answered, None)
+    }
+
     pub fn pin(&self, ticket: Ticket) -> Result<bool> {
         self.table.pin(ticket.slot)
     }
@@ -265,10 +286,37 @@ impl Agent {
         self.held.lock().iter().copied().filter(|t| self.asked(*t)).collect()
     }
 
-    /// Commits a give-back (asked or not): false while pinned. The holder then unmaps and calls
-    /// [`Agent::release`].
+    /// Commits a give-back (asked or not) when the holder decides it, before its fence: false
+    /// while pinned. The holder then waits for the fence, unmaps and calls [`Agent::release`].
     pub fn commit(&self, ticket: Ticket) -> Result<bool> {
         self.table.commit(ticket.slot, ticket.seq)
+    }
+
+    /// The holder decided to give it back (before its fence): its pins in the table go and the
+    /// return is committed, so the manager sees it progressing. A grant not yet mapped is left.
+    pub fn decide(&self, ticket: Ticket) -> Result<()> {
+        while let Some(w) = self.table.word(ticket.slot).filter(|w| w.seq == ticket.seq && w.state == State::Mapped) {
+            if w.pins == 0 {
+                self.table.commit(ticket.slot, ticket.seq)?;
+                break;
+            }
+            self.table.unpin(ticket.slot)?;
+        }
+        Ok(())
+    }
+
+    /// The holder is done with it (unmapped, or never mapped): back to the manager, whatever
+    /// its state.
+    pub fn give(&self, ticket: Ticket, phys: Physical) -> Result<()> {
+        match self.table.word(ticket.slot).filter(|w| w.seq == ticket.seq).map(|w| w.state) {
+            Some(State::Granted) => self.refused(ticket, phys),
+            Some(State::Mapped) => {
+                self.decide(ticket)?;
+                self.release(ticket, phys)
+            }
+            Some(State::Revoking) => self.release(ticket, phys),
+            _ => self.backend.destroy(phys),
+        }
     }
 
     /// The committed lease is unmapped: its import goes, and the manager frees the chunk.

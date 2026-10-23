@@ -179,6 +179,11 @@ class Memory:
     def prepare_pool(self, pool: tuple[int, int], expected: int) -> None:
         """Maps `expected` bytes into torch pool `pool` before a capture into it begins."""
 
+    def lease(self, ns: int) -> tuple[str, str] | None:
+        """Leases this GPU's weight pages from the manager TensorD serves in namespace `ns` (its
+        uid), right after open: None when leased, else (code, why): `NotRegistered`,
+        `Incompatible` or `Absent`."""
+
 class Request:
     def pass_(self, set: int, key: str) -> Pass:
         """A pass of `set` keyed `key` (`entry|dims`): the plan's cursor moves to it."""
