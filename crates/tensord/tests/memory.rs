@@ -183,10 +183,10 @@ impl Drop for StandIn {
 /// A GPU hosted as TensorD hosts it: its manager over host pages (none: chunk-less), its peers
 /// `tenants`.
 fn hosted(id: &GpuId, tenants: &Tenants, chunks: bool, dir: &std::path::Path, log: &MemoryLog) -> Arc<Gpu> {
-    let hosting: Arc<dyn Hosting> = Arc::new(Peers::new(tenants.clone(), vec![euid()], log.clone()));
+    let peers = Arc::new(Peers::new(tenants.clone(), vec![euid()], log.clone()));
     let card = id.memory;
     let open: Option<varena::lease::Opener> = chunks.then(|| Box::new(move || Ok(Arc::new(HostBackend::new(card)) as Arc<dyn varena::Backend>)) as varena::lease::Opener);
-    let leases = Leases { hosting, open, tenants: tenants.clone() };
+    let leases = Leases { peers, open, tenants: tenants.clone() };
     Arc::new(Gpu::create("0", &[inventory(id)], None, HostMode::Dedicated, leases, &Peaks::at(dir.join("peaks")), log).unwrap())
 }
 
@@ -250,14 +250,14 @@ fn tensord_leases_to_its_tenants_and_keeps_landed_weights_within_their_package()
     let dir = tempfile::tempdir().unwrap();
     let (id, log) = (gpu_id(), MemoryLog::at(dir.path().to_path_buf()));
     let tenants = Tenants::default();
-    let hosting: Arc<dyn Hosting> = Arc::new(Peers::new(tenants.clone(), vec![euid()], log.clone()));
+    let peers = Arc::new(Peers::new(tenants.clone(), vec![euid()], log.clone()));
     let (card, opened) = (id.memory, Arc::new(AtomicUsize::new(0)));
     let opens = opened.clone();
     let open = move || {
         opens.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(HostBackend::new(card)) as Arc<dyn varena::Backend>)
     };
-    let leases = Leases { hosting, open: Some(Box::new(open)), tenants: tenants.clone() };
+    let leases = Leases { peers, open: Some(Box::new(open)), tenants: tenants.clone() };
     let peaks = Peaks::at(dir.path().join("peaks"));
     let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, leases, &peaks, &log).unwrap());
     let manager = gpu.manager.clone();

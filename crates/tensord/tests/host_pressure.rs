@@ -139,9 +139,9 @@ fn gpu(namespace: &str, tenants: &Tenants) -> (Arc<Gpu>, GpuId) {
     let id = GpuId { uuid: format!("host-pressure-{}", std::process::id()), model: "host".into(), memory: 4 * LIMIT };
     let inventory: tensord::machine::receipt::Gpu = serde_json::from_value(serde_json::json!({"device_index": 0, "device_name": id.model,
         "device_uuid": id.uuid, "driver_version": "", "memory_bytes": id.memory, "pci_bus_id": ""})).unwrap();
-    let hosting = Arc::new(Peers::new(tenants.clone(), vec![platform::memory::euid()], MemoryLog::default()));
+    let peers = Arc::new(Peers::new(tenants.clone(), vec![platform::memory::euid()], MemoryLog::default()));
     let card = id.memory;
-    let leases = Leases { hosting, open: Some(Box::new(move || Ok(Arc::new(HostBackend::new(card)) as Arc<dyn varena::Backend>))), tenants: tenants.clone() };
+    let leases = Leases { peers, open: Some(Box::new(move || Ok(Arc::new(HostBackend::new(card)) as Arc<dyn varena::Backend>))), tenants: tenants.clone() };
     let peaks = Peaks::at(std::env::temp_dir().join(format!("host-pressure-peaks-{}", std::process::id())));
     let gpu = Gpu::create("0", &[inventory], None, HostMode::Dedicated, leases, &peaks, &MemoryLog::default()).expect("a manager");
     (Arc::new(gpu), id)

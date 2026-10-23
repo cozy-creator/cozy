@@ -727,9 +727,9 @@ impl Pool {
         let peaks = memory::Peaks::at(root.join("peaks"));
         let tenants = memory::Tenants::default();
         let uids = [Some(platform::memory::euid()), config.identity.map(|identity| identity.uid)];
-        let peers: Arc<dyn varena::lease::Hosting> = Arc::new(memory::Peers::new(tenants.clone(), uids.into_iter().flatten().collect(), notes.clone()));
+        let peers = Arc::new(memory::Peers::new(tenants.clone(), uids.into_iter().flatten().collect(), notes.clone()));
         let leases = |entry: &str| memory::Leases {
-            hosting: peers.clone(),
+            peers: peers.clone(),
             open: memory::row(entry, &config.inventory).and_then(|row| chunks(&row.device_uuid, &notes)),
             tenants: tenants.clone(),
         };
@@ -4340,8 +4340,8 @@ mod tests {
         let inventory: crate::machine::receipt::Gpu = serde_json::from_value(json!({"device_index": 0, "device_name": "host", "device_uuid": uuid,
             "driver_version": "", "memory_bytes": 1u64 << 30, "pci_bus_id": ""})).unwrap();
         let tenants = memory::Tenants::default();
-        let hosting = Arc::new(memory::Peers::new(tenants.clone(), vec![], memory::MemoryLog::default()));
-        let leases = memory::Leases { hosting, open: None, tenants };
+        let peers = Arc::new(memory::Peers::new(tenants.clone(), vec![], memory::MemoryLog::default()));
+        let leases = memory::Leases { peers, open: None, tenants };
         let peaks = memory::Peaks::at(std::env::temp_dir().join(format!("gpu-nudge-peaks-{}", uuid::Uuid::new_v4())));
         let gpu = Arc::new(memory::Gpu::create("0", &[inventory], None, platform::contain::host_pressure::HostMode::Shared, leases, &peaks, &memory::MemoryLog::default()).unwrap());
         let host = memory::Host::watch(platform::contain::host_pressure::HostMode::Shared, vec![gpu], memory::Running::default(), &memory::MemoryLog::default()).expect("watched");
