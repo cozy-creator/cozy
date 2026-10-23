@@ -24,14 +24,18 @@ pub(crate) struct Runs {
 }
 
 impl Runs {
-    /// Subscribes, then lists: a run that changes in between is in the stream.
+    /// Subscribes, then lists: a run that changes in between is in the stream. Changes match
+    /// `--on` by the machine's name, which an alias or rental id resolved to.
     pub(crate) async fn open(ctx: &Context, query: list::Query, limit: u64) -> Result<Self, Error> {
         let watch = ctx.calcifer().await?.watch("/v1/runs/events").await?;
-        let runs = list::runs(ctx, &query).await?.runs;
+        let list = list::runs(ctx, &query).await?;
         Ok(Self {
-            query,
+            query: list::Query {
+                machine: list.machine.or(query.machine),
+                ..query
+            },
             limit,
-            runs,
+            runs: list.runs,
             watch,
         })
     }

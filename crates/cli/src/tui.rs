@@ -1,12 +1,16 @@
 //! Live full-screen views over Calcifer's event streams. A view is drawn again when its data
 //! changes or a key is pressed, never on a timer: ↑/↓ or k/j select, Enter opens the selected
-//! row's own view (a run's as `cozy run show` draws it, a machine's as `cozy machine show` does),
-//! Esc or q goes back to the list as it was left, and q there quits. The terminal is restored on
-//! every way out: q, Ctrl-C, a signal, an error, and (ratatui's hook) a panic.
+//! row's own view (a run as `cozy run watch` follows it, a machine as `cozy machine show` draws
+//! it), Esc or q goes back to the list as it was left, and q there quits. The terminal is restored
+//! on every way out: q, Ctrl-C, a signal, an error, and (ratatui's hook) a panic.
 use std::io;
 
 use protocol::error::{Error, Kind};
-use crossterm::event::{Event as Input, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::{
+    cursor::{MoveTo, Show},
+    event::{Event as Input, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{Clear, ClearType},
+};
 use futures_util::{Stream, StreamExt as _};
 use ratatui::{
     Frame, Terminal,
@@ -16,8 +20,10 @@ use ratatui::{
     text::Line,
     widgets::{Block, Paragraph, Row, Table, TableState},
 };
+#[cfg(unix)]
+use rustix::termios::{OptionalActions, OutputModes, tcgetattr, tcsetattr};
 
-use crate::{Context, machine, package, run};
+use crate::{Context, machine, output, package, run};
 
 /// One live view.
 pub(crate) enum Screen {
@@ -43,12 +49,6 @@ impl Screen {
     /// The view opened by Enter on row `selected`, if its rows open one.
     async fn open(&self, ctx: &Context, selected: usize) -> Result<Option<Screen>, Error> {
         match self {
-            Screen::Runs(view) => match view.id(selected) {
-                Some(id) => Ok(Some(Screen::Run(Box::new(
-                    run::live::Live::open(ctx, &id).await?,
-                )))),
-                None => Ok(None),
-            },
             Screen::Machines(view) => match view.id(selected) {
                 Some(id) => Ok(Some(Screen::Machine(Box::new(
                     machine::live::Shown::open(ctx, &id).await?,
@@ -110,11 +110,12 @@ pub(crate) async fn live<B: Backend>(
 ) -> Result<(), Error> {
     let mut stack = vec![(first, TableState::default().with_selected(Some(0)))];
     let mut signals = Signals::new()?;
+    let drew = |e: B::Error| drawing(io::Error::other(e.to_string()));
     loop {
         let (screen, selected) = stack.last_mut().expect("a view");
         terminal
             .draw(|frame| screen.draw(ctx, frame, selected))
-            .map_err(|e| drawing(io::Error::other(e.to_string())))?;
+            .map_err(drew)?;
         let rows = screen.len(ctx);
         let next = tokio::select! {
             changed = screen.changed(ctx) => Next::Changed(changed),
@@ -146,6 +147,17 @@ pub(crate) async fn live<B: Backend>(
             KeyCode::Down | KeyCode::Char('j') if rows > 0 => {
                 selected.select(Some((at + 1).min(rows - 1)))
             }
+            KeyCode::Enter if let Screen::Runs(view) = &*screen => {
+                if let Some(id) = view.id(at) {
+                    if watch(ctx, &id, &mut keys, &mut signals).await? {
+                        return Ok(());
+                    }
+                    // Drawn whole again: a resize forgets the screen without asking the
+                    // terminal where its cursor is, as `clear` would.
+                    let area = terminal.size().map_err(drew)?;
+                    terminal.resize(area.into()).map_err(drew)?;
+                }
+            }
             KeyCode::Enter => {
                 if let Some(opened) = screen.open(ctx, at).await? {
                     stack.push((opened, TableState::default()));
@@ -161,6 +173,72 @@ enum Next {
     Changed(Result<(), Error>),
     Input(Option<io::Result<Input>>),
     Quit,
+}
+
+/// Enter on a run: `cozy run watch` itself, on the terminal the list lends it, until Esc or q goes
+/// back; true when Ctrl-C quit. Leaving stops watching, never the run; a run that ended stays on
+/// screen, its record and all, until then.
+async fn watch(
+    ctx: &Context,
+    id: &str,
+    keys: &mut (impl Stream<Item = io::Result<Input>> + Unpin),
+    signals: &mut Signals,
+) -> Result<bool, Error> {
+    lines(true).map_err(drawing)?;
+    crossterm::execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show).map_err(drawing)?;
+    let mut left = None;
+    let watched = async {
+        let run = ctx.calcifer().await?.run(id).await?;
+        output::say(ctx, &format!("cozy run watch {}  (Esc or q back)", run.number));
+        let stop = async { left = Some(leave(&mut *keys, &mut *signals).await) };
+        run::follow_until(ctx, run, stop).await
+    };
+    if let Err(error) = watched.await {
+        output::refusal(ctx, &error);
+    }
+    let quit = match left {
+        Some(quit) => quit,
+        None => leave(keys, signals).await,
+    };
+    lines(false).map_err(drawing)?;
+    Ok(quit)
+}
+
+/// The next key that leaves a run's watch: Esc or q goes back; Ctrl-C or a signal quits (true).
+async fn leave(
+    keys: &mut (impl Stream<Item = io::Result<Input>> + Unpin),
+    signals: &mut Signals,
+) -> bool {
+    loop {
+        let key = tokio::select! {
+            input = keys.next() => match input {
+                Some(Ok(Input::Key(key))) if key.kind == KeyEventKind::Press => key,
+                Some(Ok(_)) => continue,
+                None | Some(Err(_)) => return true,
+            },
+            () = signals.next() => return true,
+        };
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Esc | KeyCode::Char('q') => return false,
+            _ => {}
+        }
+    }
+}
+
+/// Raw mode keeps keys coming; on Unix it also stops a newline returning the carriage, which the
+/// lines `cozy run watch` writes need (`on`) and ratatui's frames do not.
+#[cfg(unix)]
+fn lines(on: bool) -> io::Result<()> {
+    let mut mode = tcgetattr(io::stdout())?;
+    mode.output_modes.set(OutputModes::OPOST, on);
+    Ok(tcsetattr(io::stdout(), OptionalActions::Now, &mode)?)
+}
+
+/// Windows' raw mode leaves output as it was.
+#[cfg(not(unix))]
+fn lines(_on: bool) -> io::Result<()> {
+    Ok(())
 }
 
 /// Rows under `headers`, the selected one highlighted.
