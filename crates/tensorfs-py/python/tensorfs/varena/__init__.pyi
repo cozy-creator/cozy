@@ -162,9 +162,9 @@ class Memory:
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
 
-    def torch_stats(self) -> tuple[int, int, int, list[tuple[str, int, int]], list[tuple[tuple[int, int], int, int]]]:
-        """varena's figures for torch's blocks: (allocated, mapped, peak, per open request (id,
-        allocated, peak), per pool (pool, mapped, allocated))."""
+    def torch_stats(self) -> tuple[int, int, int, int, list[tuple[str, int, int]], list[tuple[tuple[int, int], int, int]]]:
+        """varena's figures for torch's blocks: (allocated, mapped, peak, fragmentation (mapped
+        less live), per open request (id, allocated, peak), per pool (pool, mapped, allocated))."""
 
     def serve_torch(self, leased: bool) -> None:
         """Serves torch's allocations here, before any: from the leased chunks (`leased`), else

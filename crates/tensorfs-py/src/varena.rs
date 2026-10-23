@@ -372,8 +372,8 @@ impl PyMemory {
         Ok(memory)
     }
 
-    /// varena's torch figures here: (allocated, mapped, peak, per open request (id, allocated,
-    /// peak), per pool (pool, mapped, allocated)). torch's own memory statistics don't see a
+    /// varena's torch figures here: (allocated, mapped, peak, fragmentation (mapped less live),
+    /// per open request (id, allocated, peak), per pool (pool, mapped, allocated)). torch's own memory statistics don't see a
     /// pluggable allocator.
     fn torch_stats(&self, py: Python<'_>) -> PyResult<TorchFigures> {
         detached(py, &self.gpu.uuid, || Ok(torch_stats(self.memory())))
@@ -1074,11 +1074,11 @@ impl PyWindow {
 /// A torch block still live at its arena's end: (ptr, bytes, stream).
 type Outlived = (u64, u64, usize);
 
-type TorchFigures = (u64, u64, u64, Vec<(String, u64, u64)>, Vec<((u64, u64), u64, u64)>);
+type TorchFigures = (u64, u64, u64, u64, Vec<(String, u64, u64)>, Vec<((u64, u64), u64, u64)>);
 
 fn torch_stats(memory: &Memory) -> TorchFigures {
     let s = memory.torch_stats();
-    (s.allocated, s.mapped, s.peak, s.requests, s.pools.into_iter().map(|(p, m, a)| ((p.0, p.1), m, a)).collect())
+    (s.allocated, s.mapped, s.peak, s.fragmentation, s.requests, s.pools.into_iter().map(|(p, m, a)| ((p.0, p.1), m, a)).collect())
 }
 
 // ---------------------------------------------------------------- the module
