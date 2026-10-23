@@ -120,6 +120,18 @@ impl Events {
         }
     }
 
+    /// Whether the log of calls satisfies `until` within `limit` (hang protection only).
+    fn log_within(&self, limit: std::time::Duration, until: impl Fn(&[&'static str]) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        let mut log = self.kept.lock();
+        while !until(&log) {
+            if self.logged.wait_until(&mut log, deadline).timed_out() {
+                return until(&log);
+            }
+        }
+        true
+    }
+
     /// Blocks until varena retires `event`.
     fn await_retired(&self, event: u64) {
         let mut retired = self.retired.lock();
@@ -1099,6 +1111,31 @@ fn an_idle_gpu_load_returns_with_its_pages_kept() {
     assert_eq!(exports(), 1, "the load returns with its page custody's");
 }
 
+/// A page whose copy is still landing when the last request ends is kept once the copy lands,
+/// with no further call: the trim thread finishes the Keep, so an idle process killed later
+/// leaves it to custody.
+#[test]
+fn a_keep_pending_at_the_last_requests_end_is_made_with_no_further_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let uuid = format!("trimkeep-{}", std::process::id());
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 64 << 20 };
+    let _scope = Scope::new(&g.uuid);
+    let events = Arc::new(Events::default());
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap());
+    let exports = || events.kept.lock().iter().filter(|c| **c == "export").count();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["p".into()], passes: 1 }] }).unwrap();
+    events.pending_fences.store(true, Ordering::SeqCst);
+    mem.load(stored(dir.path(), &uuid, "p", 1), Level::Gpu).unwrap();
+    r.end();
+    // Its Keep waits on the landing copy (the trim thread's host wait); nothing is kept yet.
+    assert!(events.log_within(std::time::Duration::from_secs(10), |log| log.contains(&"finish")), "nothing waits on the pending copy");
+    assert_eq!(exports(), 0, "kept before its copy landed");
+    events.fences.lock().iter().for_each(|e| events.complete(*e));
+    let kept = events.log_within(std::time::Duration::from_secs(10), |log| log.contains(&"export"));
+    drop(mem);
+    assert!(kept, "the page was not kept with no further call");
+}
+
 /// Review 5, R1 and R3 (the reviewer's probe, event-driven): a Keep queued behind slow
 /// mechanism work never protects the page a refill hands out. A page with a Keep queued is
 /// renewed (a fresh page, a new life) and the stale Keep is dropped; the renewal unmaps the old
@@ -1438,6 +1475,8 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     mem.make_room(0).unwrap();
     events.await_log(|log| log.iter().filter(|c| **c == "export").count() == 3);
     assert_eq!(*events.protected.lock(), vec![3 * REGION_ALIGN], "one protect for the run");
+    // Kept (custody's) before the request opens.
+    mem.settle();
 
     // A page bound while its fill's event is pending, held through the fill's completion and
     // released with its release event pending: never protected while in use, nor while its
@@ -1460,9 +1499,10 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     mem.make_room(0).unwrap();
     assert_eq!(protects(), 1, "protected while its request runs");
     drop(r);
-    events.await_log(|log| log.iter().filter(|c| **c == "export").count() == 4);
-    assert_eq!(protects(), 2);
     mem.settle();
+    // The request's open withdrew the run (unmeasured: every kept page); its end keeps it again
+    // beside the used page.
+    assert_eq!((exports(), protects()), (7, 3), "(exports, protects) once the request ended");
 
     // A bind that meets a protect in flight waits for it.
     let raced = mem.load(stored(dir.path(), &uuid, "raced", 1), Level::Ram).unwrap();
@@ -1491,7 +1531,8 @@ fn a_keep_protects_only_idle_pages_and_a_bind_waits_for_its_protect() {
     events.protect_gate.open();
     binder.join().unwrap();
     assert_eq!(events.bound_while_protecting.load(Ordering::SeqCst), 0, "a pin handed out while its page's protect ran");
-    assert_eq!(exports(), 5);
+    mem.settle();
+    assert_eq!(exports(), 8);
 }
 
 /// Native an_oom_in_a_pass / a_measured_pass (graph-core runs 519 and e199) on a host card: the

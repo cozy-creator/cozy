@@ -3,8 +3,8 @@
 `gpu_service.rs` (`GpuPool`) coordinates published, cached GPU callables through retained
 Runtime executors. TensorD supplies model data and grants each executor its GPUs' varena ledgers
 (`memory.rs`, design varena-slim). Varena in each executor decides that executor's bytes and
-makes room through the ledger's asks; kept-page custody runs in the ledger and the RAM tier in
-TensorD. TensorD places and admits calls (`fits`), reaps exited executors' rows, and ends the
+makes room through the ledger's asks; kept-page custody runs in the ledger, and the host watcher
+in TensorD. TensorD places and admits calls (`fits`), reaps exited executors' rows, and ends the
 ones the ledger names stalled. It holds no byte count and decides no eviction.
 Acceptance, journal, progress and output custody stay in `Engine`; scheduling stays in `service.rs`.
 
@@ -80,8 +80,8 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 - Admission names the call's family (`Execution::family`), which Invoke also carries: while a
   parent waits on a child call it yields under its family (varena `Request::yielding`), so its
   working set is left out for its family's child and counts for every stranger.
-- The RAM tier's host-short event (it gave back all it may, the host is still short) ends one
-  idle process, least recently used first: a deviceless executor, else an import-only parent
+- The host watcher's short event (what the running calls must keep free exceeds MemAvailable)
+  ends one idle process, least recently used first: a deviceless executor, else an import-only parent
   with no live child, else an idle GPU executor (outside every warm set first) whose lane's call
   slots are free.
 - Startup: every journaled birth still alive from a previous machine run (GPU births including
@@ -123,11 +123,12 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   engine's dispatch ask `fits` again (`notify_activity`), ends each row the ledger newly names
   stalled (once), and saves changed peaks (varena's records, whole) to
   `<pool>/peaks/<GPU model>.json`, restored when a ledger is created.
-  A device fault (an unsettled call) drops the GPU's kept pages (`Ledger::fault`). The machine's
-  RAM tier is served from TensorD on the host's pressure events (`varena::Tier`; the platform's
-  PSI trigger, else the cgroup's memory events; with neither, its headroom checks alone, noted
-  as `tier_headroom_only` in the memory log): TensorD
-  computes no host room; it ends idle processes only on the tier's host-short event.
+  A device fault (an unsettled call) drops the GPU's kept pages (`Ledger::fault`). Host RAM is
+  the OS page cache. TensorD's host watcher (`memory::Host`, on the platform's PSI trigger,
+  else the cgroup's memory events, and TensorD's own nudges; with neither, `host_unwatched` in
+  the memory log) compares what the running calls must keep free with MemAvailable; when the
+  host is short it ends one idle process, and another only once the last end raised
+  MemAvailable.
 - An executor's failed terminal (its own refusal before entry, or a failed invoke) first keeps a
   triage bundle (`triage.rs`: terminal, traceback, executor pid and stderr tail; canonical JSON
   under `execution/triage/`, fsynced) and binds it in the journal; the outcome body names it as

@@ -1,4 +1,4 @@
-//! Windows: only frozen bytes. The host tier that shares sealed memory is off here.
+//! Windows: only frozen bytes; sealed shared memory is off here.
 use crate::{Error, Result};
 use std::{
     fs::{self, File, OpenOptions},

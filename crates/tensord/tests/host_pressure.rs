@@ -206,13 +206,65 @@ fn scenario(watch: bool) {
     varena::os::remove_table(&id.uuid);
 }
 
+/// A call measured to outgrow the host alone (its recorded peak is twice the limit), beside small
+/// idle neighbours: ending them cannot help. Every look is short; the first ends one, the next
+/// find the budget no higher than when that end was signalled, so none more ends, and the call
+/// meets its own limit.
+fn futile() {
+    let cgroup = deny_psi();
+    let namespace = format!("host-pressure-{}-", std::process::id());
+    assert!(varena::os::namespace(&namespace));
+    let id = GpuId { uuid: format!("host-pressure-{}", std::process::id()), model: "host".into(), memory: 4 * LIMIT };
+    let gpu = Arc::new(Gpu { ledger: Ledger::create(&id, None).unwrap(), model: "host".into() });
+    let host = Host::watch(HostMode::Dedicated, vec![gpu.clone()], &MemoryLog::default()).expect("watched");
+    gpu.ledger.restore(&[varena::Peak::Host { key: "pkg|s".into(), bytes: 2 * LIMIT }]).unwrap();
+    gpu.ledger.dispatch("run", "pkg", "s").unwrap();
+    let mut neighbours: Vec<Agent> = (0..3).map(|_| Agent::spawn("child")).collect();
+    for n in &mut neighbours {
+        assert_eq!(n.ask(&format!("hold {MIB}")).as_deref(), Some("held"));
+    }
+    let killed = event(&cgroup, "oom_kill");
+    let mut call = Agent::spawn("child");
+    assert_eq!(call.ask(&format!("open {namespace} {}", id.uuid)).as_deref(), Some("open"));
+    assert_eq!(call.ask("request").as_deref(), Some("begun"));
+    let mut ended = 0;
+    let mut grew = true;
+    // Steps larger than a neighbour gives back: an end cannot raise the budget past the growth.
+    for _ in 0..(2 * LIMIT / STEP) {
+        host.look();
+        if host.short() && ended < neighbours.len() {
+            let n = &mut neighbours[ended];
+            let _ = n.child.kill();
+            let _ = n.child.wait();
+            ended += 1;
+        }
+        if call.ask(&format!("grow {STEP}")).is_none() {
+            grew = false;
+            break;
+        }
+    }
+    let alive = neighbours.iter_mut().skip(ended).filter_map(|n| n.child.try_wait().unwrap().is_none().then_some(())).count();
+    let oom_kill = event(&cgroup, "oom_kill");
+    eprintln!("futile: call grew {grew}, neighbours ended {ended}, alive {alive}, oom_kill {killed} -> {oom_kill}");
+    assert!(!grew && oom_kill > killed, "the call met its own limit");
+    assert!(ended <= 1 && alive == neighbours.len() - ended, "ends stop once they cannot help: {ended} ended, {alive} alive");
+    drop((call, neighbours, gpu));
+    varena::os::remove_table(&id.uuid);
+}
+
 /// Needs a user systemd session (a hosted runner has none): run with `--ignored` where one is.
 #[test]
 #[ignore = "needs a user systemd session for its memory-limited scopes"]
 fn an_unmeasured_calls_growth_ends_an_idle_neighbour_with_no_oom_kill() {
-    for name in ["inside_with_nothing_watching", "inside_with_the_watcher"] {
+    for name in ["inside_with_nothing_watching", "inside_with_the_watcher", "inside_where_ending_cannot_help"] {
         assert!(scope(name).success(), "{name}");
     }
+}
+
+#[test]
+#[ignore = "run inside a memory-limited scope by the test above"]
+fn inside_where_ending_cannot_help() {
+    futile();
 }
 
 #[test]

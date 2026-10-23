@@ -566,11 +566,24 @@ enum Call {
     Disown { fp: String, page: u32 },
 }
 
-/// What the trim thread runs after an answer: custody settled for the kept pages it withdrew,
-/// then the bytes published free.
+/// Which pending events [`Inner::finish_pending`] waits for.
+#[derive(Clone, Copy)]
+enum Pending {
+    /// Every page's, ready events included (a retirement).
+    All,
+    /// The pages' whose Keep is due ([`Memory::settle`]).
+    Due,
+    /// The ready events of copies a Keep waits for (the trim thread's).
+    Landing,
+}
+
+/// What the trim thread runs: after an answer, custody settled for the kept pages it withdrew,
+/// then the bytes published free; a Keep waiting on a copy still landing (no request open),
+/// made once it lands with no call to drive it.
 #[derive(Default)]
 struct Wanted {
     settle: bool,
+    keep: bool,
     closed: bool,
 }
 
@@ -1256,31 +1269,35 @@ impl Inner {
     /// them from the drain under a pin of its own, so nothing else retires or evicts them,
     /// waits for them unlocked, and completes them as a drain would.
     fn hand_over(&self) {
-        if let Err(e) = self.finish_pending(true) {
+        if let Err(e) = self.finish_pending(Pending::Due) {
             tracing::warn!("varena: a handover's events are unproven: {e}");
         }
     }
 
-    /// Waits for pending events (host waits) and completes them as a drain would: the pages'
-    /// whose Keep is due (`due_only`), or every page's, ready events included (a retirement).
-    /// Their pages are pinned meanwhile, so nothing retires the events or evicts the pages.
-    fn finish_pending(&self, due_only: bool) -> Result<()> {
+    /// Waits for pending events (host waits) and completes them as a drain would: those `which`
+    /// names. Their pages are pinned meanwhile, so nothing retires the events or evicts the pages.
+    fn finish_pending(&self, which: Pending) -> Result<()> {
         let (pins, taken, ready) = {
             let mut st = self.lock();
             let due: BTreeSet<Key> = st.keep_due.iter().copied().chain(st.homes.iter().filter(|(_, h)| h.keep_after).map(|(k, _)| *k)).collect();
+            let landing: Vec<(Key, Event)> = st.homes.iter().filter(|(_, h)| h.keep_after).map(|(k, h)| (*k, h.ready)).collect();
             let mut taken = vec![];
             for (stream, q) in &mut st.events {
                 q.retain(|&(event, key)| {
-                    let mine = !due_only || due.contains(&key);
+                    let mine = match which {
+                        Pending::All => true,
+                        Pending::Due => due.contains(&key),
+                        Pending::Landing => landing.contains(&(key, event)),
+                    };
                     if mine {
                         taken.push((*stream, event, key));
                     }
                     !mine
                 });
             }
-            let ready: Vec<(Key, Event)> = match due_only {
-                true => vec![],
-                false => st.homes.iter().filter(|(_, h)| !self.backend.query(h.ready).unwrap_or(false)).map(|(k, h)| (*k, h.ready)).collect(),
+            let ready: Vec<(Key, Event)> = match which {
+                Pending::All => st.homes.iter().filter(|(_, h)| !self.backend.query(h.ready).unwrap_or(false)).map(|(k, h)| (*k, h.ready)).collect(),
+                Pending::Due | Pending::Landing => vec![],
             };
             let me = std::thread::current().id();
             let keys: BTreeSet<Key> = taken.iter().map(|(.., k)| *k).chain(ready.iter().map(|(k, _)| *k)).collect();
@@ -1315,8 +1332,16 @@ impl Inner {
         }
         self.drain(&mut st);
         self.publish(&mut st);
-        self.unlock(st);
         self.landed.notify_all();
+        // Due copies another waiter took (the trim thread): their Keeps are queued once it
+        // completes them.
+        let queued = |st: &State, key: Key, ready: Event| st.events.values().any(|q| q.contains(&(ready, key)));
+        while matches!(which, Pending::Due) && st.homes.iter().any(|(k, h)| h.keep_after && !queued(&st, *k, h.ready)) {
+            if self.wait(&mut st).is_err() {
+                break;
+            }
+        }
+        self.unlock(st);
         match unproven {
             0 => ready,
             n => Err(Error::Ownership(format!("{n} pending events could not be waited on"))),
@@ -1669,6 +1694,7 @@ impl Inner {
                 p.releasing.push(ready.0);
             }
             st.events.entry(stream).or_default().push_back((ready, key));
+            self.want_keep();
             return;
         }
         if home.phys.is_none() || home.keeping {
@@ -1692,6 +1718,13 @@ impl Inner {
                 self.mech.post(Mech::Keep { set }, 0);
             }
         }
+    }
+
+    /// The trim thread finishes the Keeps waiting on events ([`Wanted`]).
+    fn want_keep(&self) {
+        let (lock, want) = &*self.wanted;
+        lock.lock().keep = true;
+        want.notify_one();
     }
 
     /// A fill thread's batch: each page from the store through the page cache, in as few engine
@@ -2383,11 +2416,13 @@ impl Inner {
         self.unlock(st);
         if !idle {
             self.coreside(rid)?;
+            self.unkeep(rid);
         }
         Ok(rid)
     }
 
-    /// At a pass start (never in the allocator hook, which makes no custody call): kept pages
+    /// At a request's open and its pass starts (never in the allocator hook, which makes no
+    /// custody call): kept pages
     /// the hook may need are withdrawn from custody and stay mapped, so its local work can take
     /// them, in [`decide::victims`]' order: all of them for an unmeasured request, else as many
     /// as its recorded peak lacks beside the free bytes and what the hook could take already.
@@ -2410,14 +2445,13 @@ impl Inner {
             }
             let Some(h) = st.homes.get(&key).filter(|h| h.exported) else { continue };
             let (fp, gen) = (h.identity.clone(), h.gen);
-            if let Some(ticket) = self.withdraw(fp, key.1, 0) {
-                withdrawn.push((key, gen, ticket));
-            }
+            // None: its Export was still queued and is cancelled; custody never had it.
+            withdrawn.push((key, gen, self.withdraw(fp, key.1, 0)));
             need = need.saturating_sub(bytes);
         }
         self.unlock(st);
         // Still kept (custody holds the memory, the hook never takes it) until custody let go.
-        if let Some(last) = withdrawn.iter().map(|(.., t)| *t).max() {
+        if let Some(last) = withdrawn.iter().filter_map(|(.., t)| *t).max() {
             self.to_custody.settle_to(last + 1);
         }
         let mut st = self.lock();
@@ -2775,8 +2809,16 @@ impl Inner {
         out.unwrap_or(0)
     }
 
-    /// The trim thread's work: the trim hook and shrinks an ask wanted, then a ledger event.
+    /// The trim thread's work: the Keeps waiting on events, custody settled after an answer,
+    /// then a ledger event.
     fn idle_trim(&self, wanted: Wanted) {
+        if wanted.keep {
+            // Only copies still landing: a consumer's release is never waited on under a pin
+            // (a renewing bind would wait for its forward).
+            if let Err(e) = self.finish_pending(Pending::Landing) {
+                tracing::warn!("varena: a landing copy's event is unproven: {e}");
+            }
+        }
         if wanted.settle {
             self.to_custody.settle();
             let mut st = self.state.lock();
@@ -2918,7 +2960,7 @@ impl Inner {
             }
             self.unlock(st);
         }
-        self.finish_pending(false)?;
+        self.finish_pending(Pending::All)?;
         self.mech.settle();
         self.to_custody.settle();
         let mut alone = self.quiet.lock.lock();
@@ -3095,7 +3137,7 @@ fn trim_loop(wanted: &(Mutex<Wanted>, Condvar), inner: &Weak<Inner>) {
         let wanted = {
             let (lock, want) = wanted;
             let mut w = lock.lock();
-            while !w.settle {
+            while !w.settle && !w.keep {
                 if w.closed {
                     return;
                 }

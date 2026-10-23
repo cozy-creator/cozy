@@ -16,6 +16,11 @@ use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Leve
 const P: u64 = REGION_ALIGN;
 
 fn spec(dir: &std::path::Path, uuid: &str, name: &str, pages: u64) -> SetSpec {
+    spec_filled(dir, uuid, name, pages, Fill::Undeclared)
+}
+
+/// A set whose pages may be kept (`Fill::Stored`) or never (`Fill::Undeclared`).
+fn spec_filled(dir: &std::path::Path, uuid: &str, name: &str, pages: u64, fill: Fill) -> SetSpec {
     let path = dir.join(format!("{name}.bin"));
     std::fs::write(&path, vec![7u8; (pages * P) as usize]).unwrap();
     let obj = ObjectRef { sha256: format!("obj-{name}"), length: pages * P };
@@ -30,7 +35,7 @@ fn spec(dir: &std::path::Path, uuid: &str, name: &str, pages: u64) -> SetSpec {
         names: (0..pages).map(|i| vec![format!("t{i}")]).collect(),
     };
     let source = Source::files(vec![(obj, File::open(&path).unwrap())], false, 0);
-    let fingerprint = Fingerprint::new(&layout, &[], Fill::Undeclared, "release-1", "0/1", uuid);
+    let fingerprint = Fingerprint::new(&layout, &[], fill, "release-1", "0/1", uuid);
     SetSpec { name: name.into(), layout: Arc::new(layout), source: Arc::new(source), fingerprint }
 }
 
@@ -70,12 +75,14 @@ struct Card {
     landed: Condvar,
     /// Creates wait while held (a mechanism map behind device work).
     hold_create: Mutex<bool>,
+    /// Pages exported (kept).
+    exports: AtomicU64,
     create_gate: Condvar,
 }
 
 impl Card {
     fn new(limit: u64) -> Arc<Card> {
-        Arc::new(Card { host: HostBackend::new(limit), limit, used: AtomicU64::new(0), pending: AtomicBool::new(false), next: AtomicU64::new(1000), done: Mutex::default(), landed: Condvar::new(), hold_create: Mutex::new(false), create_gate: Condvar::new() })
+        Arc::new(Card { host: HostBackend::new(limit), limit, used: AtomicU64::new(0), pending: AtomicBool::new(false), next: AtomicU64::new(1000), done: Mutex::default(), landed: Condvar::new(), hold_create: Mutex::new(false), create_gate: Condvar::new(), exports: AtomicU64::new(0) })
     }
     fn free(&self) -> u64 {
         self.limit.saturating_sub(self.used.load(Ordering::SeqCst))
@@ -120,7 +127,10 @@ impl Backend for Driver {
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()> { self.0.host.map(va, offset, page, access) }
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()> { self.0.host.protect(va, offset, len, access) }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> { self.0.host.unmap(va, offset, len) }
-    fn export(&self, page: &Physical) -> Result<Owned> { self.0.host.export(page) }
+    fn export(&self, page: &Physical) -> Result<Owned> {
+        self.0.exports.fetch_add(1, Ordering::SeqCst);
+        self.0.host.export(page)
+    }
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> { self.0.host.import(handle, len) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.0.host.target(va, offset, len) }
     fn fence(&self) -> Result<Event> { self.0.host.fence() }
@@ -331,6 +341,65 @@ fn a_streaming_sets_room_takes_its_run_pages_before_its_own_graph() {
     let first = resident(&mem, dit, 0);
     close(&uuid, mem);
     assert_eq!((last, shrunk, first), (Ok(()), 0, false), "(block 3 bound, graph bytes shrunk, block 0 resident)");
+}
+
+/// Native a_bind_on_a_full_card_takes_idle_pages (S5's step-3 check on 581769ea8): an idle set
+/// loaded with no request open is custody's at once; a card then full of it and of foreign
+/// bytes still gives a bind its room, the kept page withdrawn and taken; then exhausted; then
+/// served once room returns.
+#[test]
+fn a_bind_on_a_full_card_withdraws_and_takes_a_kept_idle_page() {
+    assert!(varena::os::namespace(&format!("st1{}-", std::process::id())));
+    let uuid = format!("st1keptfull-{}", std::process::id());
+    let card = Card::new(4 * P);
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * P };
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let mem = Arc::new(Memory::open(g, None, Box::new(Driver(card.clone()))).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem.load(spec_filled(dir.path(), &uuid, "m", 2, Fill::Stored), Level::Ram).unwrap();
+    mem.load(spec_filled(dir.path(), &uuid, "idle", 1, Fill::Stored), Level::Gpu).unwrap();
+    assert_eq!(card.exports.load(Ordering::SeqCst), 1, "the idle load is kept at once");
+    let r = mem.request("r", plan(&[&["m"]])).unwrap();
+    let pass = r.pass(m, "k").unwrap();
+    // Everything else on the card is foreign.
+    let foreign = card.free();
+    assert!(card.take(foreign));
+    let first = mem.bind(m, 0, 0).map_err(|e| e.to_string());
+    let second = mem.bind(m, 1, 0).map(drop).map_err(|e| e.code());
+    card.used.fetch_sub(foreign, Ordering::SeqCst);
+    let third = mem.bind(m, 1, 0).map(drop).map_err(|e| e.code());
+    let first = first.map(drop);
+    pass.end(0);
+    let stats = r.end();
+    close(&uuid, mem);
+    assert!(first.is_ok(), "the kept idle page makes room: {first:?}");
+    assert_eq!((second, third), (Err("EXHAUSTED"), Ok(())), "then nothing is left; then room came back");
+    assert!(stats.evicted.iter().sum::<u64>() >= P, "{stats:?}");
+}
+
+/// The lead's ruling (S2's round 3: an activation larger than free memory, the hook never
+/// takes a pinned page): an idle model's pages are custody's (kept at load), and the hook never
+/// withdraws one. A request's open withdraws them, as a pass start does, so the hook inside the
+/// request, before any pass, takes them.
+#[test]
+fn a_requests_open_withdraws_kept_idle_pages_for_the_hook() {
+    assert!(varena::os::namespace(&format!("st1{}-", std::process::id())));
+    let uuid = format!("st1openkept-{}", std::process::id());
+    let card = Card::new(4 * P);
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * P };
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let mem = Arc::new(Memory::open(g, None, Box::new(Driver(card.clone()))).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    mem.load(spec_filled(dir.path(), &uuid, "idle", 4, Fill::Stored), Level::Gpu).unwrap();
+    let kept = card.exports.load(Ordering::SeqCst);
+    let outside = mem.make_room(P).map(drop).map_err(|e| e.code());
+    let r = mem.request("r", plan(&[&["m"]])).unwrap();
+    let inside = mem.make_room(P).map(|c| c.resident());
+    let took = inside.is_ok() && card.take(P);
+    drop(inside);
+    r.end();
+    close(&uuid, mem);
+    assert_eq!((kept, outside, took), (4, Err("EXHAUSTED"), true), "(pages kept at load, the hook with no request open, the hook inside the request took a page)");
 }
 
 /// The bytes make_room freed are nobody's: another thread's bind maps into them before the

@@ -1,5 +1,5 @@
-//! One byte layout per weight set, identical in every tier: host memfd offsets, device VA
-//! offsets and offsets inside a streamed copy are the same numbers. Regions start on the VMM granularity so
+//! One byte layout per weight set: host page offsets, device VA offsets and offsets inside a
+//! streamed copy are the same numbers. Regions start on the VMM granularity so
 //! each maps independently; parts start on a 4 KiB boundary so O_DIRECT lands in place and a
 //! region moves in one copy.
 
@@ -59,9 +59,9 @@ pub struct Layout {
     /// Total span (a multiple of `REGION_ALIGN`).
     pub nbytes: u64,
     /// Identity of the layout: two layouts with the same digest place the same bytes at the
-    /// same offsets. Guards adoption of a host memfd written by another process.
+    /// same offsets. Guards adoption of pages another process filled (kept pages, by fingerprint).
     pub digest: String,
-    /// The `regions` it was built from; a sealed host layout carries them (`host::sealed_regions`).
+    /// The `regions` it was built from: each region's tensor names.
     pub names: Vec<Vec<String>>,
 }
 
