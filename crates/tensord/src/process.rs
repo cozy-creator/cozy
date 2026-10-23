@@ -811,13 +811,16 @@ mod tests {
     #[test]
     fn a_supervised_group_is_told_the_bytes_its_children_read() {
         // The leader reads nothing itself; its children read 1 MB each fifth of a second, 20 times.
-        let script = "for i in $(seq 20); do head -c 1000000 /dev/zero; sleep 0.2; done | cat > /dev/null";
+        // dd moves them with read(2) and write(2): a newer coreutils `cat` or `head` splices a
+        // pipe, which /proc/<pid>/io never counts (the CI runners' did).
+        let script = "for i in $(seq 20); do dd if=/dev/zero bs=100000 count=10 status=none; sleep 0.2; done \
+            | dd of=/dev/null bs=65536 status=none";
         let mut child = Command::new("/bin/sh").args(["-c", script]).process_group(0).spawn().unwrap();
         let told = std::sync::Mutex::new(vec![]);
         let ended = supervise(&mut child, None, "a reader", &|bytes| told.lock().unwrap().push(bytes)).unwrap();
         assert!(matches!(ended, Supervised::Exited(status) if status.success()), "{ended:?}");
         let told = told.into_inner().unwrap();
-        // Each sample more than the last, all of it read by children (`cat` counts its pipe too).
+        // Each sample more than the last, all of it read by children (the reader counts its pipe too).
         assert!(told.len() >= 3 && told.windows(2).all(|w| w[0] < w[1]), "not told as they moved: {told:?}");
         assert!(told[told.len() - 1] >= 20_000_000, "{told:?}");
     }
