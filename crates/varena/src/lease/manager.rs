@@ -23,10 +23,10 @@ use parking_lot::{Condvar, Mutex};
 use platform::handles::Peer;
 use platform::process::{Birth, Exact};
 
-use super::table::{self, Content, State, Table};
+use super::table::{self, Content, Figures, State, Table};
 use super::wire::{End, Refusal, Region, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
-use crate::ledger::{Ledger, Mode};
+use crate::ledger::{FixedRow, Ledger, Mode};
 use crate::os::{self, Listener, Owned, Stream};
 use crate::{Error, GpuId, Result};
 
@@ -106,6 +106,8 @@ struct Device {
     backend: Arc<dyn Backend>,
     capacity: u64,
     granularity: u64,
+    headroom: u64,
+    context: u64,
 }
 
 /// A table's slots: one per smallest chunk the card could hold.
@@ -119,6 +121,9 @@ pub struct Manager {
     limit: Option<u64>,
     mode: Mode,
     ledger: Ledger,
+    /// Its own bytes on the ledger: retained chunks no executor maps and its context, so no
+    /// executor counts them foreign.
+    row: FixedRow,
     hosting: Arc<dyn Hosting>,
     retired: AtomicBool,
     books: Mutex<Books>,
@@ -211,6 +216,18 @@ pub fn chunks(bytes: u64, granularity: u64) -> Vec<u64> {
     out
 }
 
+/// An ask's chunks: a weights region is one chunk sized to its page (§3, never split); torch
+/// and cache bytes split at [`CHUNK`].
+fn sizes(ask: &Waiting, granularity: u64) -> Vec<u64> {
+    match ask.region {
+        Some(_) => {
+            let unit = granularity.max(1);
+            vec![ask.bytes.div_ceil(unit) * unit]
+        }
+        None => chunks(ask.bytes, granularity),
+    }
+}
+
 enum Room {
     /// Enough is free or coming: retained bytes dropped, or revokes of chunks still unpinned or
     /// already being revoked.
@@ -233,7 +250,8 @@ impl Manager {
     pub fn create(gpu: &GpuId, limit: Option<u64>, mode: Mode, open: Opener, listener: Listener, hosting: Arc<dyn Hosting>) -> Result<Arc<Manager>> {
         let ledger = Ledger::create(gpu, limit)?;
         ledger.set_mode(mode)?;
-        let manager = Arc::new(Manager { open, opening: Mutex::new(()), gpu_memory: gpu.memory, limit, mode, ledger, hosting, retired: AtomicBool::new(false), books: Mutex::new(Books::default()), looking: Condvar::new() });
+        let row = ledger.fixed(std::process::id())?;
+        let manager = Arc::new(Manager { open, opening: Mutex::new(()), gpu_memory: gpu.memory, limit, mode, ledger, row, hosting, retired: AtomicBool::new(false), books: Mutex::new(Books::default()), looking: Condvar::new() });
         let weak = Arc::downgrade(&manager);
         std::thread::Builder::new().name("lease-look".into()).spawn(move || look_loop(&weak)).map_err(|e| Error::io("spawn lease-look", e))?;
         let serving = manager.clone();
@@ -434,8 +452,9 @@ impl Manager {
         let backend = (self.open)()?;
         let card = self.limit.unwrap_or(self.gpu_memory).min(backend.capacity());
         let headroom = if self.mode == Mode::Shared { crate::table::headroom(self.gpu_memory) } else { 0 };
-        let capacity = card.saturating_sub(headroom).saturating_sub(backend.opened_context());
-        let device = Arc::new(Device { capacity, granularity: backend.granularity().max(1), backend });
+        let context = backend.opened_context();
+        let capacity = card.saturating_sub(headroom).saturating_sub(context);
+        let device = Arc::new(Device { capacity, granularity: backend.granularity().max(1), headroom, context, backend });
         self.books.lock().device = Some(device.clone());
         Ok(device)
     }
@@ -508,9 +527,11 @@ impl Manager {
         let mut b = self.books.lock();
         let Some(e) = b.executors.remove(&exec) else { return Out::default() };
         let (mut gone, mut retained) = (vec![], 0);
-        for l in e.leased.into_values() {
+        for (slot, l) in e.leased {
+            // Both say landed: the manager's record of this grant's ack, and the table now (an
+            // unland whose doorbell was still queued wins).
             match l.region {
-                Some(region) if l.landed => {
+                Some(region) if l.landed && e.table.landed(slot) && e.table.word(slot).is_some_and(|w| w.seq == l.seq) => {
                     retained += l.phys.len;
                     let key = (e.identity.domain.clone(), region);
                     let kept = b.retained.entry(key.clone()).or_default();
@@ -579,7 +600,7 @@ impl Manager {
         for exec in ids {
             let Some(ask) = b.executors.get_mut(&exec).and_then(|e| e.waiting.pop_front()) else { continue };
             let (capacity, granularity) = b.device.as_ref().map_or((0, 1), |d| (d.capacity, d.granularity));
-            let short = (b.created + chunks(ask.bytes, granularity).iter().sum::<u64>()).saturating_sub(capacity);
+            let short = (b.created + sizes(&ask, granularity).iter().sum::<u64>()).saturating_sub(capacity);
             match self.make_room(b, exec, short, &mut out) {
                 Room::Coming | Room::Pinned => {
                     if let Some(e) = b.executors.get_mut(&exec) {
@@ -590,7 +611,25 @@ impl Manager {
                 Room::Refused => refuse(b, &mut out, exec, ask.id, Refusal::NothingRevocable, format!("nothing revocable for {} bytes", ask.bytes)),
             }
         }
+        self.publish(b);
         out
+    }
+
+    /// Every table's figures, and the manager's own row, as the books stand now.
+    fn publish(&self, b: &Books) {
+        let retained: u64 = b.retained.values().flat_map(|v| v.values()).map(|p| p.len).sum();
+        let (free, headroom, context) = b.device.as_ref().map_or((0, 0, 0), |d| (d.capacity.saturating_sub(b.created), d.headroom, d.context));
+        let unpinned: BTreeMap<u64, u64> = b
+            .executors
+            .iter()
+            .map(|(id, e)| (*id, e.leased.iter().filter(|(s, l)| e.table.word(**s).is_some_and(|w| w.state == State::Mapped && w.pins == 0 && w.seq == l.seq)).map(|(_, l)| l.phys.len).sum()))
+            .collect();
+        let total: u64 = unpinned.values().sum();
+        for (id, e) in &b.executors {
+            let revocable = retained + total - unpinned.get(id).copied().unwrap_or(0);
+            e.table.set_figures(Figures { free, revocable, headroom, foreign: 0 });
+        }
+        self.row.set(retained + context);
     }
 
     /// The grants for `ask` when it fits now; `None` when room must be made first. A failure
@@ -598,7 +637,7 @@ impl Manager {
     fn answer(&self, b: &mut Books, exec: u64, ask: &Waiting) -> Result<Option<Out>> {
         let start = Instant::now();
         let Some(dev) = b.device.clone() else { return Err(Error::Closed("the GPU's backend".into())) };
-        let sizes = chunks(ask.bytes, dev.granularity);
+        let sizes = sizes(ask, dev.granularity);
         let Some(pid) = b.executors.get(&exec).map(|e| e.pid) else { return Err(Error::Closed("the executor".into())) };
         let domain = b.executors.get(&exec).map(|e| e.identity.domain.clone()).unwrap_or_default();
         // Adopted only whole: every chunk, by index, the size this ask cuts.

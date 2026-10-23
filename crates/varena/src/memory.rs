@@ -804,9 +804,10 @@ struct Inner {
     /// The lease agent once attached (varena-leases): this GPU's pages are the manager's chunks.
     #[cfg(unix)]
     lease: std::sync::OnceLock<Arc<crate::lease::Agent>>,
-    /// Leased pages by physical id: their grant and their key.
+    /// Leased pages by physical id: their grant, their key, and whether their bytes are still
+    /// the region they were granted for (a moved slot's never are again).
     #[cfg(unix)]
-    leased: Mutex<HashMap<u64, (crate::lease::Ticket, Key)>>,
+    leased: Mutex<HashMap<u64, (crate::lease::Ticket, Key, bool)>>,
     /// Asked back while in use: pinned in the table until idle, then given.
     #[cfg(unix)]
     declined: Mutex<HashSet<crate::lease::Ticket>>,
@@ -945,12 +946,27 @@ impl Memory {
         })
     }
 
-    /// Leases this GPU's weight pages from TensorD's manager over `stream` (varena-leases), right
-    /// after open, before any load: from then on its pages are the manager's chunks, retained by
-    /// it across this process's exit (no Keep), and asked back by it. Refused, it stays
-    /// standalone: `Some((code, why))`.
+    /// Leases this GPU's weight pages from the manager serving it (TensorD's, in the table
+    /// owner's namespace), right after open, before any load: from then on its pages are the
+    /// manager's chunks, retained by it across this process's exit (no Keep), and asked back by
+    /// it. Refused, or nobody serving, it stays standalone: `Some((code, why))`.
     #[cfg(unix)]
-    pub fn lease(&self, stream: crate::os::Stream) -> Result<Option<(crate::lease::Refusal, String)>> {
+    pub fn lease(&self) -> Result<Option<(crate::lease::Refusal, String)>> {
+        let uuid = self.inner._device.0.clone();
+        match crate::lease::connect(self.inner.shared.ns, &uuid)? {
+            Some(stream) => self.lease_over(stream),
+            None => Ok(Some((crate::lease::Refusal::Incompatible, format!("no lease manager serves GPU {uuid}")))),
+        }
+    }
+
+    /// Whether its pages are leased ([`Memory::lease`]).
+    pub fn leased(&self) -> bool {
+        self.inner.leasing()
+    }
+
+    /// [`Memory::lease`] over a stream its host connected.
+    #[cfg(unix)]
+    pub fn lease_over(&self, stream: crate::os::Stream) -> Result<Option<(crate::lease::Refusal, String)>> {
         let mech = self.inner.mech.clone();
         let revoked = move || {
             mech.post(Mech::Revoke, 0);
@@ -1756,8 +1772,10 @@ impl Inner {
         st.events.values_mut().for_each(|q| q.retain(|(_, k)| *k != key));
         let Some(h) = st.homes.get_mut(&key) else { return Ok(()) };
         let (old, exported, old_identity, old_gen, created) = (std::mem::replace(&mut h.ready, Event::DONE), h.exported, h.identity.clone(), h.gen, h.origin != Origin::Kept);
-        // Kept, or with a Keep queued: never written again; a fresh page takes its place.
-        let phys = if exported || h.keeping { h.phys.take() } else { None };
+        // Kept, or with a Keep queued: never written again; a fresh page takes its place. Leased:
+        // a grant's identity never changes, so new content takes a new grant.
+        let leased = self.leased_page_of(h.phys.as_ref());
+        let phys = if exported || h.keeping || leased { h.phys.take() } else { None };
         let renew = phys.is_some();
         *h = Home { phys: h.phys.take(), ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false, landing: false };
         st.sync(key);
@@ -3720,7 +3738,7 @@ impl Inner {
                 region,
                 Box::new(move |got| {
                     if let Some(inner) = me.upgrade() {
-                        inner.leased_page(key, gen, va, off, span, job, decided, got, start);
+                        inner.leased_page(key, gen, va, off, span, job, decided, got, start, region.is_some());
                     }
                 }),
             );
@@ -3837,7 +3855,7 @@ impl Inner {
     fn give_page(&self, p: Physical) -> Result<()> {
         #[cfg(unix)]
         if let Some(agent) = self.lease.get() {
-            if let Some((ticket, _)) = self.leased.lock().remove(&p.id) {
+            if let Some((ticket, ..)) = self.leased.lock().remove(&p.id) {
                 self.declined.lock().remove(&ticket);
                 return agent.give(ticket, p);
             }
@@ -3850,7 +3868,7 @@ impl Inner {
     fn commit_page(&self, _p: &Physical) {
         #[cfg(unix)]
         if let Some(agent) = self.lease.get() {
-            if let Some((ticket, _)) = self.leased.lock().get(&_p.id).copied() {
+            if let Some((ticket, ..)) = self.leased.lock().get(&_p.id).copied() {
                 self.declined.lock().remove(&ticket);
                 if let Err(error) = agent.decide(ticket) {
                     tracing::warn!("varena: committing a lease's return: {error}");
@@ -3860,18 +3878,27 @@ impl Inner {
     }
 
     /// A leased page's bytes become `key`'s block (a streamed slot moving): no longer the
-    /// weights of the region it was asked for, it is never retained.
+    /// weights of the region it was granted for, it is never retained again (a grant's identity
+    /// never changes).
     fn moved_page(&self, _p: &Physical, _key: Key) {
         #[cfg(unix)]
         if let Some(agent) = self.lease.get() {
             let mut leased = self.leased.lock();
-            if let Some((ticket, at)) = leased.get_mut(&_p.id) {
-                *at = _key;
+            if let Some((ticket, at, retainable)) = leased.get_mut(&_p.id) {
+                (*at, *retainable) = (_key, false);
                 if let Err(error) = agent.unland(*ticket) {
                     tracing::warn!("varena: a moved slot's lease: {error}");
                 }
             }
         }
+    }
+
+    /// Whether `p` is a leased page.
+    fn leased_page_of(&self, _p: Option<&Physical>) -> bool {
+        #[cfg(unix)]
+        return _p.is_some_and(|p| self.leased.lock().contains_key(&p.id));
+        #[cfg(not(unix))]
+        false
     }
 
     /// What a leased page holds, for the manager's retention: a declared set's fill identity and
@@ -3889,15 +3916,16 @@ impl Inner {
     /// or the refusal.
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
-    fn leased_page(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: Option<u64>, got: Result<Vec<crate::lease::Lease>>, start: Instant) {
+    fn leased_page(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: Option<u64>, got: Result<Vec<crate::lease::Lease>>, start: Instant, region: bool) {
         let Some(agent) = self.lease.get().cloned() else { return };
+        let retainable = region;
         let made = got.and_then(|leases| {
             let mut leases = leases.into_iter();
             let (Some(lease), None) = (leases.next(), leases.next()) else {
                 return Err(Error::Invalid(format!("a page of {span} bytes leased as other than one chunk")));
             };
             let crate::lease::Lease { ticket, phys, adopted } = lease;
-            self.leased.lock().insert(phys.id, (ticket, key));
+            self.leased.lock().insert(phys.id, (ticket, key, retainable));
             let p = self.map_rw(va, off, phys)?;
             agent.mapped(&[ticket])?;
             Ok((p, adopted, Some(start.elapsed().as_nanos() as u64)))
@@ -3916,7 +3944,7 @@ impl Inner {
         if asked.is_empty() {
             return;
         }
-        let keys: Vec<(crate::lease::Ticket, Key)> = self.leased.lock().values().filter(|(t, _)| asked.contains(t)).copied().collect();
+        let keys: Vec<(crate::lease::Ticket, Key)> = self.leased.lock().values().filter(|(t, ..)| asked.contains(t)).map(|(t, k, _)| (*t, *k)).collect();
         let mut st = self.lock();
         for (ticket, key) in keys {
             let quiet = st.idle(key) && st.homes.get(&key).is_some_and(|h| !h.reclaiming && !h.landing && !h.protecting && h.phys.is_some());
@@ -3944,7 +3972,7 @@ impl Inner {
         let leased = self.leased.lock();
         to_land.retain(|key| {
             let Some(h) = st.homes.get(key).filter(|h| h.filled) else { return false };
-            let Some(ticket) = h.phys.as_ref().and_then(|p| leased.get(&p.id)).map(|(t, _)| *t) else { return false };
+            let Some(ticket) = h.phys.as_ref().and_then(|p| leased.get(&p.id)).filter(|(.., retainable)| *retainable).map(|(t, ..)| *t) else { return false };
             if !self.backend.query(h.ready).unwrap_or(false) {
                 return true;
             }
@@ -3963,7 +3991,7 @@ impl Inner {
         let idle: Vec<crate::lease::Ticket> = {
             let leased = self.leased.lock();
             let mut declined = self.declined.lock();
-            let idle: Vec<_> = declined.iter().copied().filter(|t| leased.values().find(|(x, _)| x == t).is_none_or(|(_, k)| st.idle(*k))).collect();
+            let idle: Vec<_> = declined.iter().copied().filter(|t| leased.values().find(|(x, ..)| x == t).is_none_or(|(_, k, _)| st.idle(*k))).collect();
             idle.iter().for_each(|t| {
                 declined.remove(t);
             });
