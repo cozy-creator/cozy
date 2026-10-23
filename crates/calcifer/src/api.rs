@@ -405,6 +405,7 @@ struct Listing {
     status: Option<Status>,
     /// A prefix of the runs' target (`org/pkg`).
     package: Option<String>,
+    /// A machine's name, former name or rental id, as a run's `--on` names it.
     machine: Option<String>,
     before: Option<u64>,
     limit: Option<u64>,
@@ -416,10 +417,20 @@ async fn list(
     query: Result<Query<Listing>, QueryRejection>,
 ) -> Result<Json<RunList>, Refusal> {
     let Query(listing) = query?;
-    let (rows, older) = api.calcifer.store().runs(&RunFilter {
+    let store = api.calcifer.store();
+    let machine = match listing.machine {
+        Some(text) => Some(match store.find_machine(&text)? {
+            Some(row) => row.name,
+            // Its runs are listed while it is off.
+            None if text == "local" => text,
+            None => return Err(Refusal(machines::not_found(&text))),
+        }),
+        None => None,
+    };
+    let (rows, older) = store.runs(&RunFilter {
         status: listing.status,
         target: listing.package,
-        machine: listing.machine,
+        machine: machine.clone(),
         before: listing.before,
         limit: listing.limit.unwrap_or(50).clamp(1, 1000),
     })?;
@@ -427,7 +438,11 @@ async fn list(
         .iter()
         .map(|row| api.calcifer.record(row))
         .collect::<Result<_, _>>()?;
-    Ok(Json(RunList { runs, older }))
+    Ok(Json(RunList {
+        runs,
+        older,
+        machine,
+    }))
 }
 
 #[derive(Deserialize)]

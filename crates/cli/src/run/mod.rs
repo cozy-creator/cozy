@@ -126,6 +126,9 @@ enum Verb {
         /// Only this package's runs.
         #[arg(long)]
         package: Option<String>,
+        /// Only the runs on this machine: its name or alias, or `local`.
+        #[arg(long = "on", value_name = "MACHINE")]
+        on: Option<String>,
         /// At most N runs (default 50; 0 shows all).
         #[arg(long, value_name = "N")]
         limit: Option<u64>,
@@ -181,12 +184,14 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Some(Verb::List {
             state,
             package,
+            on,
             limit,
             once,
         }) => {
             let query = list::Query {
                 status: state,
                 package,
+                machine: on,
                 before: None,
                 limit,
             };

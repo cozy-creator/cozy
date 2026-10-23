@@ -27,6 +27,8 @@ pub struct Query {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
@@ -66,18 +68,18 @@ pub(crate) async fn runs(ctx: &Context, query: &Query) -> Result<RunList, Error>
     let mut out = RunList {
         runs: vec![],
         older: 0,
+        machine: None,
     };
     let mut page = Query {
-        status: query.status.clone(),
-        package: query.package.clone(),
-        before: query.before,
         limit: Some(query.limit.unwrap_or(500).min(500)),
+        ..query.clone()
     };
     loop {
         let list = calcifer.runs(&page).await?;
         let last = list.runs.last().map(|r| r.number);
         let more = list.older > 0;
         out.older = list.older;
+        out.machine = list.machine;
         out.runs.extend(
             list.runs
                 .into_iter()
@@ -93,7 +95,7 @@ pub(crate) async fn runs(ctx: &Context, query: &Query) -> Result<RunList, Error>
     }
 }
 
-/// Whether `run` is one `query` lists: its state, package and (with `--tensorhub`) Hub.
+/// Whether `run` is one `query` lists: its state, package, machine and (with `--tensorhub`) Hub.
 pub(crate) fn matches(ctx: &Context, query: &Query, run: &Run) -> Result<bool, Error> {
     let status = serde_json::to_value(run.status).ok();
     let state = query
@@ -104,8 +106,12 @@ pub(crate) fn matches(ctx: &Context, query: &Query, run: &Run) -> Result<bool, E
         .package
         .as_ref()
         .is_none_or(|p| run.target.starts_with(p.as_str()));
+    let machine = query
+        .machine
+        .as_ref()
+        .is_none_or(|m| run.machine.as_ref() == Some(m));
     let hub = ctx.narrowed()?.is_none_or(|h| h.origin == run.hub);
-    Ok(state && package && hub)
+    Ok(state && package && machine && hub)
 }
 
 /// `text` cut to one cell's width.

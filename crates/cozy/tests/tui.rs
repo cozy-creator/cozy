@@ -209,3 +209,49 @@ fn enter_opens_a_rows_live_view_and_esc_or_q_comes_back() {
     machines.key("q");
     assert!(machines.wait().success());
 }
+
+/// `cozy run list --on <machine>`: only that machine's runs, live and as JSON, with the other
+/// filters; a machine that ended still lists them, and a machine never known is refused by name.
+#[test]
+fn run_list_on_one_machine() {
+    let Some(home) = Home::new() else { return };
+    let _hub = SilentHub::for_home(&home);
+    let _machine = tensord::added(&home, "live");
+    let _other = tensord::added(&home, "other");
+    let submit = |on: &str| {
+        let args = ["run", "fidika/sdxl/generate@2.10.0", "a cat", "--on", on];
+        let run = home.json(args.iter().chain(&["--detach", "--json"]));
+        run["number"].as_u64().unwrap().to_string()
+    };
+    let (first, elsewhere) = (submit("live"), submit("other"));
+    let row = |s: &str, n: &str| s.lines().any(|l| l.starts_with(&format!("{n} ")));
+
+    let mut runs = Pty::spawn(home.command().args(["run", "list", "--on", "live"]));
+    let shown = runs.until("live's run", |s| row(s, &first));
+    assert!(!row(&shown, &elsewhere), "{shown}");
+    let second = submit("live");
+    runs.until("its new run, drawn live", |s| row(s, &second) && !row(s, &elsewhere));
+    runs.key("q");
+    assert!(runs.wait().success());
+
+    for run in [&first, &second, &elsewhere] {
+        home.json(["run", "cancel", run, "--json"]);
+    }
+    let numbers = |args: &[&str]| -> Vec<String> {
+        let listed = home.json(["run", "list", "--json"].iter().chain(args));
+        let runs = listed["runs"].as_array().unwrap().iter();
+        runs.map(|r| r["number"].to_string()).collect()
+    };
+    let on_live = vec![second.clone(), first.clone()];
+    assert_eq!(numbers(&["--on", "live"]), on_live);
+    let newest = numbers(&["--on", "live", "--state", "canceled", "--limit", "1"]);
+    assert_eq!(newest, [second.clone()]);
+    assert!(numbers(&["--on", "local"]).is_empty());
+    let unknown = home.cozy(["run", "list", "--on", "nowhere"]);
+    assert!(
+        unknown.code != 0 && unknown.stdout.contains(r#"no machine is named "nowhere""#),
+        "{unknown:?}"
+    );
+    home.json(["machine", "end", "live", "--json"]);
+    assert_eq!(numbers(&["--on", "live"]), on_live, "an ended machine's runs");
+}
