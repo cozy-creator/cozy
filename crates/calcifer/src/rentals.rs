@@ -14,7 +14,7 @@ use platform::paths::Home;
 use protocol::{
     calcifer::{
         Agreed, Ended, HubListing, HubProblem, Machine, MachineKind, MachineState, On, Quote,
-        Reason, Rental, Rented, RunQuote, SubmitRun, Warning,
+        Alternative, Reason, Rental, Rented, RunQuote, SubmitRun, Warning,
     },
     config,
     error::{Error, Kind},
@@ -450,8 +450,9 @@ impl Machines {
     }
 
     /// Rents a machine for an unplaced run (`--on new[:<sku>]`) under a key the run names, so a
-    /// Calcifer that stops mid-ask asks again for the same rental. Without a product, the Hub
-    /// places the run: the cheapest expected rental that holds it, named on the run.
+    /// Calcifer that stops mid-ask asks again for the same rental. Unless the run names both the
+    /// product and its GPUs, the Hub places it (on the named product): the cheapest per run of the
+    /// machines fast enough, named on the run.
     pub(crate) fn rent_for(self: &Arc<Self>, run: &RunRow, sku: Option<&str>, gpus: u32) {
         if !lock(&self.renting).insert(run.id.clone()) {
             return;
@@ -464,8 +465,8 @@ impl Machines {
                     return Ok(ask);
                 }
                 let (sku, gpus) = match sku {
-                    Some(sku) => (sku, (gpus > 0).then_some(gpus)),
-                    None => me.placed(&run).await?,
+                    Some(sku) if gpus > 0 => (sku, Some(gpus)),
+                    sku => me.placed(&run, sku.as_deref()).await?,
                 };
                 let hub = run.hub.as_deref().unwrap_or_default();
                 let shape = Shape {
@@ -508,21 +509,42 @@ impl Machines {
         });
     }
 
-    /// Asks the run's Hub where to run it: the product to rent and its GPU count. The answer is
-    /// kept on the run as a warning naming the product, its price and why.
-    async fn placed(&self, run: &RunRow) -> Result<(String, Option<u32>), Error> {
+    /// Asks the run's Hub where to run it, on `sku` when the run names one: the product to rent and
+    /// its GPU count. The answer is kept on the run as a warning naming the product, its price and why.
+    async fn placed(&self, run: &RunRow, sku: Option<&str>) -> Result<(String, Option<u32>), Error> {
         let hub = run.hub.as_deref().unwrap_or_default();
-        let (sku, gpus, message) = self.placement(hub, &run.spec).await?;
-        let warning = Warning {
-            code: "placement".into(),
-            message,
-        };
-        self.calcifer.warn(&run.id, &warning).map_err(internal)?;
-        Ok((sku, gpus))
+        let placed = self.place(hub, &run.spec, sku).await?;
+        if !placed.why.is_empty() {
+            let warning = Warning {
+                code: "placement".into(),
+                message: placed.why,
+            };
+            self.calcifer.warn(&run.id, &warning).map_err(internal)?;
+        }
+        Ok((placed.sku, placed.gpus))
     }
 
-    /// What `hub` places a run of `spec` on: the product, its GPU count, and why, in words.
-    async fn placement(&self, hub: &str, spec: &v1::RunSpec) -> Result<(String, Option<u32>, String), Error> {
+    /// Where `hub` places a run of `spec`, on `sku` when the run names one. A named product the Hub
+    /// cannot place on (local code, weights it does not hold) is rented as named, at one GPU.
+    async fn place(&self, hub: &str, spec: &v1::RunSpec, sku: Option<&str>) -> Result<Placed, Error> {
+        match (self.placement(hub, spec, sku).await, sku) {
+            (Ok(placed), _) => Ok(placed),
+            (Err(e), Some(sku)) => Ok(Placed {
+                sku: sku.into(),
+                gpus: None,
+                why: match e.code.as_str() {
+                    "placement_needs_release" => String::new(),
+                    _ => format!("{sku} as asked, though {}", e.message),
+                },
+                alternatives: vec![],
+            }),
+            (Err(e), None) => Err(e),
+        }
+    }
+
+    /// What `hub` places a run of `spec` on: the pick, why in words, and the alternatives a quote
+    /// shows (the cheapest per run and the fastest, else the next machines in the Hub's order).
+    async fn placement(&self, hub: &str, spec: &v1::RunSpec, sku: Option<&str>) -> Result<Placed, Error> {
         let Some(v1::Source::Release(release)) = &spec.source else {
             return Err(Error::new(
                 Kind::Usage,
@@ -540,6 +562,7 @@ impl Machines {
                 .transpose()
                 .map_err(|e| Error::new(Kind::Validation, "bits_invalid", e.to_string()))?,
             gpus: std::num::NonZeroU64::new(spec.gpus.into()),
+            sku: sku.map(str::to_owned),
         };
         let client = self.hubs.client(hub)?;
         let placement = match client.place_rental(&request).await {
@@ -565,20 +588,30 @@ impl Machines {
                 ),
             ));
         };
-        let message = format!(
-            "the Hub placed it on {} ({}× {}, {} GB): ${:.2}/h, about ${:.2} expected, the \
-             cheapest of {} products holding {} GB of {}-bit weights",
+        let fast = placement.machines.iter().filter(|m| m.fast == Some(true)).count();
+        let rule = match (top.fast, top.speed) {
+            (_, None) => format!("the cheapest of {} products", placement.machines.len()),
+            (Some(true), _) => format!("the cheapest per run of {fast} machines fast enough"),
+            _ => format!("the fastest of {}: none is fast enough", placement.machines.len()),
+        };
+        let why = format!(
+            "the Hub placed it on {} ({}× {}, {} GB): ${:.2}/h, about ${:.2} expected, {rule} for \
+             {} GB of {}-bit weights",
             top.name,
             top.accelerator_count,
             top.accelerator_model,
             top.vram_gb,
             (top.price_usd_micros_per_hour + top.storage_usd_micros_per_hour) as f64 / 1e6,
             top.expected_price.total_usd_micros as f64 / 1e6,
-            placement.machines.len(),
             placement.weight_bytes / 1_000_000_000,
             placement.bits,
         );
-        Ok((top.name.clone(), u32::try_from(top.accelerator_count).ok(), message))
+        Ok(Placed {
+            sku: top.name.clone(),
+            gpus: u32::try_from(top.accelerator_count).ok(),
+            why,
+            alternatives: alternatives(&placement.machines),
+        })
     }
 
     /// What a `new` run would rent and its price, as `rent_for` would ask it: nothing is rented.
@@ -587,15 +620,19 @@ impl Machines {
             return Err(Error::new(Kind::Usage, "quote_needs_new", "only a run with `--on new` rents"));
         };
         let gpus = (submit.spec.gpus > 0).then_some(submit.spec.gpus);
-        let (sku, gpus) = match sku {
-            Some(sku) => (sku.clone(), gpus),
-            None => {
-                let (sku, gpus, _) = self.placement(&submit.hub, &submit.spec).await?;
-                (sku, gpus)
-            }
+        let placed = match (sku, gpus) {
+            (Some(sku), Some(_)) => Placed { sku: sku.clone(), gpus, why: String::new(), alternatives: vec![] },
+            (sku, _) => self.place(&submit.hub, &submit.spec, sku.as_deref()).await?,
         };
-        let quote = self.quote(&submit.hub, &sku, Shape { gpus, ..Shape::default() }).await?;
-        Ok(RunQuote { sku, gpus, quote })
+        let gpus = placed.gpus.or(gpus);
+        let quote = self.quote(&submit.hub, &placed.sku, Shape { gpus, ..Shape::default() }).await?;
+        Ok(RunQuote {
+            sku: placed.sku,
+            gpus,
+            quote,
+            why: Some(placed.why).filter(|w| !w.is_empty()),
+            alternatives: placed.alternatives,
+        })
     }
 
     /// Asks again what a Calcifer that stopped had asked a Hub and not heard back. A run asked
@@ -951,6 +988,56 @@ impl Hubs {
     }
 }
 
+/// Where a Hub places a run: the product, its GPU count, why in words, and other machines.
+struct Placed {
+    sku: String,
+    gpus: Option<u32>,
+    why: String,
+    alternatives: Vec<Alternative>,
+}
+
+/// Two machines beside the pick, against it: the cheapest per run and the fastest, each when it
+/// is not the pick, filled from the Hub's order. None from a Hub that names no speeds.
+fn alternatives(machines: &[types::RentalPlacementMachine]) -> Vec<Alternative> {
+    let Some((top, rest)) = machines.split_first() else {
+        return vec![];
+    };
+    let (Some(speed), Some(cost)) = (top.speed, top.run_cost) else {
+        return vec![];
+    };
+    let by = |key: fn(&types::RentalPlacementMachine) -> f64| {
+        rest.iter().enumerate().min_by(|a, b| key(a.1).total_cmp(&key(b.1))).map(|(i, _)| i)
+    };
+    let cheapest = by(|m| m.run_cost.unwrap_or(f64::MAX)).filter(|&i| rest[i].run_cost < top.run_cost);
+    let fastest = by(|m| -m.speed.unwrap_or(0.0)).filter(|&i| rest[i].speed > top.speed);
+    let mut picked: Vec<(usize, &str)> = vec![];
+    for (i, label) in [(cheapest, "cheaper per run"), (fastest, "faster")] {
+        if let Some(i) = i.filter(|i| !picked.iter().any(|(p, _)| p == i)) {
+            picked.push((i, label));
+        }
+    }
+    for i in 0..rest.len() {
+        if picked.len() < 2 && !picked.iter().any(|(p, _)| *p == i) {
+            picked.push((i, ""));
+        }
+    }
+    picked
+        .into_iter()
+        .map(|(i, label)| {
+            let m = &rest[i];
+            Alternative {
+                sku: m.name.clone(),
+                gpus: u32::try_from(m.accelerator_count).unwrap_or(1),
+                label: label.into(),
+                time: m.speed.filter(|s| *s > 0.0).map_or(0.0, |s| speed / s),
+                run_cost: m.run_cost.map_or(0.0, |c| c / cost),
+                usd_micros_per_hour: m.price_usd_micros_per_hour + m.storage_usd_micros_per_hour,
+                expected_total_usd_micros: m.expected_price.total_usd_micros,
+            }
+        })
+        .collect()
+}
+
 /// A rent ask as recorded: the exact request the Hub gets, and the quote it is held to.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RentBody {
@@ -1242,4 +1329,37 @@ fn names(rental: &types::Rental, text: &str) -> bool {
             .machine_name
             .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The H3 placement of design/placement.md, as a Hub sends it: the pick is the cheapest per run,
+    /// so the quote offers the fastest and the next machine in the Hub's order.
+    #[test]
+    fn a_quote_offers_the_fastest_and_the_next_beside_the_cheapest() {
+        let machine = |name: &str, n: i64, speed: f64, cost: f64| {
+            serde_json::json!({"name": name, "accelerator_model": "NVIDIA", "compute_capability": "9.0",
+                "vram_gb": 80, "accelerator_count": n, "price_usd_micros_per_hour": 1_000_000 * n,
+                "storage_usd_micros_per_hour": 0, "container_disk_gb": 100, "speed": speed, "fast": true,
+                "run_cost": cost, "expected_price": {"hours": 1.0, "download_gb": 100, "download_hours": 0.0,
+                "gpu_usd_micros": 0, "disk_usd_micros": 0, "download_usd_micros": 0, "total_usd_micros": 2_000_000 * n}})
+        };
+        let machines: Vec<types::RentalPlacementMachine> = serde_json::from_value(serde_json::json!([
+            machine("h100-pcie", 2, 2855.0, 1.0),
+            machine("h100-pcie", 4, 5129.0, 1.06),
+            machine("b200", 8, 28125.0, 2.03),
+        ]))
+        .unwrap();
+        let alternatives = alternatives(&machines);
+        let said: Vec<_> = alternatives.iter().map(|a| (a.sku.as_str(), a.gpus, a.label.as_str())).collect();
+        assert_eq!(said, [("b200", 8, "faster"), ("h100-pcie", 4, "")]);
+        assert!((alternatives[0].time - 2855.0 / 28125.0).abs() < 1e-9 && alternatives[0].run_cost == 2.03);
+        assert_eq!(alternatives[1].expected_total_usd_micros, 8_000_000);
+        // A Hub that names no speeds offers none.
+        let mut old = serde_json::to_value(&machines).unwrap();
+        old[0].as_object_mut().unwrap().remove("speed");
+        assert!(super::alternatives(&serde_json::from_value::<Vec<_>>(old).unwrap()).is_empty());
+    }
 }

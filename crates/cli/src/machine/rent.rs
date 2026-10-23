@@ -6,7 +6,7 @@ use std::{
 };
 
 use protocol::{
-    calcifer::{Machine, MachineState, NewMachine, Quote, Rented},
+    calcifer::{Machine, MachineState, NewMachine, Quote, Rented, RunQuote},
     config::Hub,
     error::{Error, Kind},
 };
@@ -180,6 +180,34 @@ pub(crate) fn price(sku: &str, gpus: u32, q: &Quote) -> String {
         q.expected_hours,
         q.expected_download_gb
     )
+}
+
+/// A run's quote as `price` says it, then why the Hub placed it there and the machines it would
+/// rent instead, each against the pick: its time and cost per run, its price an hour, its total.
+pub(crate) fn placed(q: &RunQuote) -> String {
+    let mut said = price(&q.sku, q.gpus.unwrap_or(1), &q.quote);
+    if let Some(why) = &q.why {
+        said += &format!("\n  {why}");
+    }
+    for a in &q.alternatives {
+        let label = match a.label.is_empty() {
+            true => String::new(),
+            false => format!(" ({})", a.label),
+        };
+        said += &format!(
+            "\n  or {} ×{}{label}: {:.2}× the time, {:.2}× the cost per run, {}/h, expected {}",
+            a.sku,
+            a.gpus,
+            a.time,
+            a.run_cost,
+            usd(a.usd_micros_per_hour),
+            usd(a.expected_total_usd_micros)
+        );
+    }
+    if !q.alternatives.is_empty() {
+        said += "\n  rent another with --on new:<sku> [--gpus N]";
+    }
+    said
 }
 
 /// The renter's yes to the quote `said`: `--yes`, else a person's on a terminal (a no is `false`).
