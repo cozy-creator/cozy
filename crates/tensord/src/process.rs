@@ -824,20 +824,22 @@ mod tests {
             let made = uv(&["venv".as_ref(), "-q".as_ref(), "--python".as_ref(), "python3".as_ref(), venv.as_os_str()]).status();
             assert!(made.expect("uv runs").success());
             let python = venv.join("bin/python");
-            let wheels = ["numpy==2.3.4", "pillow==12.0.0", "pandas==2.3.3"].map(std::ffi::OsStr::new);
-            let mut install = uv(&[&["pip".as_ref(), "install".as_ref(), "-q".as_ref(), "--python".as_ref(), python.as_os_str()][..], &wheels[..]].concat());
+            // A package's usual set: CPU torch, numpy, pandas and pillow (about 1 GB unpacked; on a
+            // runner's network the cold install takes seconds, so it is sampled as it lands).
+            let wheels = ["torch==2.9.0", "numpy==2.3.4", "pillow==12.0.0", "pandas==2.3.3"].map(std::ffi::OsStr::new);
+            let pip = ["pip", "install", "-q", "--torch-backend", "cpu", "--python"].map(std::ffi::OsStr::new);
+            let mut install = uv(&[&pip[..], &[python.as_os_str()], &wheels[..]].concat());
             let mut child = install.process_group(0).spawn().unwrap();
             let (stop, told) = (crate::stop::Stop::default(), std::sync::Mutex::new(vec![]));
             let ended = supervise(&mut child, Some(&stop), "uv", &|bytes| told.lock().unwrap().push(bytes)).unwrap();
             assert!(matches!(ended, Supervised::Exited(status) if status.success()), "cold {cold}: {ended:?}");
-            let imported = Command::new(&python).args(["-c", "import numpy, PIL, pandas"]).status().unwrap();
+            let imported = Command::new(&python).args(["-c", "import torch, numpy, PIL, pandas"]).status().unwrap();
             assert!(imported.success(), "cold {cold}: not installed");
             let told = told.into_inner().unwrap();
             assert!(told.windows(2).all(|w| w[0] <= w[1]), "cold {cold}: {told:?}");
             if cold {
-                // numpy, pandas and pillow unpack to about 150 MB, written as they land; read
-                // bytes would have told about 1 MB.
-                assert!(told.last().is_some_and(|bytes| *bytes >= 10 << 20), "{told:?}");
+                // Written as they land; the bytes it read would have told about 1 MB.
+                assert!(told.len() >= 2 && told[told.len() - 1] > told[0] && told[told.len() - 1] >= 50 << 20, "{told:?}");
                 assert!(stop.progress() > 0, "its progress never advanced: {told:?}");
             }
         }
