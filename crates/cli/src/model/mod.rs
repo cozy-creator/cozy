@@ -34,7 +34,7 @@ enum Verb {
     Download(Download),
     /// Make a model on a machine and upload it as a private checkpoint.
     Upload(Upload),
-    /// Write a model's int8, fp8, nvfp4 or w4a8 lane, or run any recipe, with the package that serves it.
+    /// Write a model's int8, fp8, nvfp4 or w4a8 lane, or any lane, by the recipe a named package declares.
     Quantize(Quantize),
     /// Release a commit: a public tag named by a version, created, moved, or a private one made public.
     Publish(Publish),
@@ -130,9 +130,9 @@ pub(crate) struct Quantize {
     /// org/name[@release] or org/name#sha256:….
     model: String,
     /// Where it goes: org/name[@tag], the tag whose tree takes the variant (main); default: the
-    /// model's own. Then the recipe's other inputs: `model.<slot>=<ref>`, `<field>=<value>`.
-    #[arg(value_name = "DESTINATION | INPUT=VALUE")]
-    terms: Vec<String>,
+    /// model's own.
+    #[arg(value_name = "DESTINATION")]
+    destination: Option<String>,
     /// Write the int8 lane (int8-convrot).
     #[arg(long)]
     int8: bool,
@@ -145,10 +145,11 @@ pub(crate) struct Quantize {
     /// Write the w4a8 lane (4-bit ConvRot codes on int8 tensor cores: Ampere, Ada, Hopper).
     #[arg(long)]
     w4a8: bool,
-    /// Run the package's recipe of this name: a preparation step (`drafter_head`) or any lane's.
+    /// Run the package's recipe of this name: any lane's (`drafter_head` writes a drafter).
     #[arg(long, value_name = "NAME")]
     recipe: Option<String>,
-    /// The package (org/name[@release]) whose recipe runs; default: the one the machine holds.
+    /// The package (org/name[@release]) whose recipe writes the lane. Required: packages that
+    /// serve the same model can each declare one.
     #[arg(long)]
     package: Option<String>,
     #[command(flatten)]

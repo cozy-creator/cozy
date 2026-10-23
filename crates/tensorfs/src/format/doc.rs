@@ -74,10 +74,48 @@ pub struct Header {
     pub chunks: Vec<ObjectRef>,
     pipeline: Option<Pipeline>,
     components: Vec<Component>,
-    /// Loading metadata: `source`, `filled`, per-file safetensors `__metadata__`.
+    /// Loading metadata: `source`, `filled`, per-file safetensors `__metadata__`, `provenance`.
     pub metadata: Metadata,
     /// Component name → (its index, tensor key → tensor index).
     index: HashMap<String, (usize, HashMap<String, usize>)>,
+    /// `metadata.provenance`, read once.
+    provenance: Option<Provenance>,
+}
+
+/// The recipe that wrote a lane (`metadata.provenance`, spec §4): its package and release, its
+/// name and fingerprint, the source header it read and its plan. No reader needs it to load the
+/// lane, and a writer never carries it over from a base.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Provenance {
+    pub package: String,
+    pub release: String,
+    pub recipe: String,
+    pub fingerprint: String,
+    pub source: String,
+    pub plan: Value,
+}
+
+impl Provenance {
+    pub const KEY: &'static str = "provenance";
+
+    /// The record in `metadata`; none when it is absent or not this shape.
+    fn of(metadata: &Metadata) -> Option<Provenance> {
+        let Some(Value::Map(fields)) = metadata.get(Self::KEY) else {
+            return None;
+        };
+        let text = |name: &str| match fields.get(name) {
+            Some(Value::Str(text)) => Some(text.clone()),
+            _ => None,
+        };
+        Some(Provenance {
+            package: text("package")?,
+            release: text("release")?,
+            recipe: text("recipe")?,
+            fingerprint: text("fingerprint")?,
+            source: text("source")?,
+            plan: fields.get("plan").filter(|plan| matches!(plan, Value::Map(_)))?.clone(),
+        })
+    }
 }
 
 impl PartialEq for Header {
@@ -255,6 +293,7 @@ impl Header {
             chunks,
             pipeline,
             components: Vec::new(),
+            provenance: Provenance::of(&metadata),
             metadata,
             index: HashMap::new(),
         };
@@ -340,6 +379,11 @@ impl Header {
     /// The header's deterministic bytes.
     pub fn to_cbor(&self) -> Result<Vec<u8>> {
         cbor::write(self)
+    }
+
+    /// The recipe that wrote this lane, when one did.
+    pub fn provenance(&self) -> Option<&Provenance> {
+        self.provenance.as_ref()
     }
 
     /// What `model_index.json` held; `None` for a checkpoint of one model.

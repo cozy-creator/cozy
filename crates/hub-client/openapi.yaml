@@ -2180,6 +2180,18 @@ components:
         assessment: {$ref: '#/components/schemas/CheckpointAssessment'}
         objects: {type: integer, format: int64}
         bytes: {type: integer, format: int64}
+        provenance: {$ref: '#/components/schemas/ModelLaneProvenance'}
+    ModelLaneProvenance:
+      type: object
+      description: "The recipe that wrote the lane: its header's `metadata.provenance`."
+      required: [package, release, recipe, fingerprint, source, plan]
+      properties:
+        package: {type: string}
+        release: {type: string}
+        recipe: {type: string}
+        fingerprint: {type: string, description: "The digest of the recipe's canonical plan; of a code hook, its identity with the release."}
+        source: {type: string, description: "The header digest of the checkpoint it was written from."}
+        plan: {type: object, additionalProperties: true, description: "The recipe's canonical plan."}
     ModelLaneRetarget:
       type: object
       required: [checkpoint_id]

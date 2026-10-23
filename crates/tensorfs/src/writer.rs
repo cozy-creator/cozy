@@ -583,6 +583,8 @@ impl Writer {
             .map(|c| c.expect("every chunk is laid"))
             .collect();
         let mut metadata = (self.base.as_ref()).map_or_else(Metadata::new, |b| b.header().metadata.clone());
+        // What wrote the base did not write this one.
+        metadata.remove(crate::format::Provenance::KEY);
         metadata.extend(self.metadata.clone());
         let pipeline = self.pipeline.clone().or_else(|| self.base.as_ref()?.pipeline().cloned());
         let header = Header::new(chunks, pipeline, components, metadata)?;

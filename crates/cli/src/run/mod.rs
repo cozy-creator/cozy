@@ -24,7 +24,7 @@ mod follow;
 pub(crate) mod interface;
 pub(crate) mod list;
 pub(crate) mod live;
-pub(crate) mod local;
+mod local;
 mod play;
 mod show;
 mod spec;
@@ -252,8 +252,8 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         return Ok(ExitCode::SUCCESS);
     };
     let asked = callable(&package, &resolved.card.interface, &function)?;
-    if asked.is_conversion() {
-        return Err(recipe(&package, asked));
+    if resolved.card.interface.runs_recipes(asked) {
+        return Err(recipes(&package, &resolved.card.interface));
     }
     if args.describe {
         let card = &resolved.card;
@@ -573,15 +573,16 @@ fn callable<'a>(
     }
 }
 
-/// A recipe is not a function: `cozy model quantize` runs it, by its lane or by name.
-fn recipe(package: &str, recipe: &Callable) -> Error {
-    let how = match recipe.weights_outputs.as_slice() {
-        [one] if ["int8", "fp8", "nvfp4"].contains(&one.output_id.as_str()) => format!("--{}", one.output_id),
-        _ => format!("--recipe {}", recipe.name),
-    };
-    let source = &recipe.models[0].param;
-    Error::new(Kind::Usage, "callable_recipe", format!("{package}/{} is a recipe, not a function", recipe.name))
-        .next(format!("cozy model quantize <{source}> [<org/model>] {how} --package {package}"))
+/// A package's recipes are data, not functions: `cozy model quantize` runs them.
+fn recipes(package: &str, interface: &Interface) -> Error {
+    let flags: Vec<String> = (interface.recipes.iter().map(|r| r.flag()))
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let mut error = Error::new(Kind::Usage, "callable_recipe", format!("{package}/{} runs its recipes", interface::RECIPES))
+        .remedy(format!("its recipes: {}", flags.join(", ")));
+    for flag in flags.iter().take(2) {
+        error = error.next(format!("cozy model quantize <model> {flag} --package {package}"));
+    }
+    error
 }
 
 /// Refuses inputs given to a package instead of one of its functions, naming the command that

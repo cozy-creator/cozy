@@ -11,6 +11,44 @@ pub struct Interface {
     pub callables: Vec<Callable>,
     /// Callables this build cannot read, and why.
     pub unavailable: Vec<(String, String)>,
+    /// The package's declared quantize recipes, which its `quantize` runs.
+    pub recipes: Vec<Recipe>,
+}
+
+/// The entrypoint a package with recipes runs them through (`cozy model quantize`).
+pub const RECIPES: &str = "quantize";
+
+/// One declared recipe: the lane it writes and the model it reads.
+#[derive(Debug, Deserialize)]
+pub struct Recipe {
+    pub name: String,
+    pub lane: String,
+    pub model: RecipeModel,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecipeModel {
+    pub class: String,
+    #[serde(default, deserialize_with = "or_default")]
+    pub component_use: BTreeMap<String, Vec<String>>,
+}
+
+/// The lanes `cozy model quantize` names by a flag of their own (`--int8`).
+pub const LANE_FLAGS: [&str; 4] = ["int8", "fp8", "nvfp4", "w4a8"];
+
+impl Recipe {
+    /// The `cozy model quantize` flag that runs it: its lane's, else its name.
+    pub fn flag(&self) -> String {
+        match LANE_FLAGS.contains(&self.lane.as_str()) {
+            true => format!("--{}", self.lane),
+            false => format!("--recipe {}", self.name),
+        }
+    }
+
+    /// Whether a checkpoint holding `components` holds every component its model reads.
+    pub fn reads(&self, components: &[String]) -> bool {
+        self.model.component_use.values().flatten().all(|need| components.contains(need))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,9 +91,6 @@ pub struct Slot {
     /// `decode` for an LM token loop; absent is compute.
     #[serde(default, deserialize_with = "or_default")]
     pub phase: Option<String>,
-    /// The checkpoint components each of its stages reads: what a checkpoint must carry for it.
-    #[serde(default, deserialize_with = "or_default")]
-    pub component_use: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,19 +235,28 @@ impl Interface {
                 Err(why) => out.unavailable.push((name, why)),
             }
         }
+        // A recipe this build cannot read is left out; `cozy model quantize` names those it can.
+        out.recipes = (document["recipes"].as_array().into_iter().flatten())
+            .filter_map(|raw| Recipe::deserialize(raw).ok())
+            .collect();
         Ok(out)
     }
 
     /// The package's functions, GPU before CPU, each group sorted: never an internal callable or
-    /// a recipe (a conversion, which only `cozy model quantize` runs).
+    /// the recipes' `quantize`, which `cozy model quantize` runs.
     pub fn public(&self) -> Vec<&str> {
-        let mut public: Vec<&Callable> = self.callables.iter().filter(|c| !c.internal && !c.is_conversion()).collect();
+        let mut public: Vec<&Callable> = self.callables.iter().filter(|c| !c.internal && !self.runs_recipes(c)).collect();
         public.sort_unstable_by_key(|c| (c.accelerator == Some(false), c.name.as_str()));
         public.into_iter().map(|c| c.name.as_str()).collect()
     }
 }
 
 impl Interface {
+    /// Whether `callable` is the `quantize` that runs this package's recipes.
+    pub fn runs_recipes(&self, callable: &Callable) -> bool {
+        callable.name == RECIPES && !self.recipes.is_empty()
+    }
+
     /// Whether `callable` runs on a GPU: its own body, or the package's internal GPU functions a
     /// CPU function that loads no model orchestrates (H3's ref2va and long_form). Tensorhub's
     /// placement (`runplacement`) reads a function the same way.
@@ -248,8 +292,7 @@ impl Callable {
         Ok(self)
     }
 
-    /// A conversion (a recipe) reads `<input-model> [<org/model>]`: it has model slots and writes
-    /// weights. It is never a function: `cozy model quantize` runs it.
+    /// A conversion reads `<input-model> [<org/model>]`: it has model slots and writes weights.
     pub fn is_conversion(&self) -> bool {
         !self.models.is_empty() && !self.weights_outputs.is_empty()
     }
@@ -414,7 +457,7 @@ pub(crate) mod tests {
     #[test]
     fn sdxl_reads_its_types_wires_defaults_and_slots() {
         let sdxl = interface("sdxl-2.10.0");
-        assert_eq!(sdxl.public(), ["generate"], "recipes are not functions");
+        assert_eq!(sdxl.public(), ["generate", "fp8", "int8"], "a conversion is a function");
         let generate = sdxl
             .callables
             .iter()
@@ -444,12 +487,23 @@ pub(crate) mod tests {
         assert_eq!(int8.result.input.as_deref(), Some("model"));
     }
 
+    /// A package's recipes are data: the `quantize` that runs them is no function of it.
     #[test]
     fn recipes_are_not_functions() {
-        let klein = interface("flux-3-klein-0.5.0");
-        assert_eq!(klein.public(), ["edit", "edit_base", "generate", "generate_base"]);
-        let recipes = klein.callables.iter().filter(|c| c.is_conversion()).count();
-        assert_eq!(recipes, 4, "int8, nvfp4 and the upsampler's are recipes");
+        let sdxl = interface("sdxl-2.10.0");
+        let mut quantize = (sdxl.callables.iter()).find(|c| c.name == "int8").unwrap().models[0].path.clone();
+        quantize = quantize.replace("int8.", "quantize.");
+        let read = |recipes: serde_json::Value| Interface::parse(&serde_json::json!({
+            "format": "cozy.package.interface/1", "application": "k:app", "recipes": recipes,
+            "entrypoints": [{"name": "quantize", "accelerator": false, "request": {"fields": []},
+                "models": [{"path": quantize, "class": "Model", "weights": true}],
+                "weights_outputs": [{"output_id": "int8", "max_bytes": 1}]}]})).unwrap();
+        let declared = read(serde_json::json!([{"name": "int8", "lane": "int8", "module": "k", "export": "INT8",
+            "model": {"class": "Klein", "component_use": {}}, "plan": {"kind": "quantization"}}]));
+        assert!(declared.public().is_empty() && declared.runs_recipes(&declared.callables[0]));
+        assert_eq!(declared.recipes[0].flag(), "--int8");
+        let none = read(serde_json::json!([]));
+        assert_eq!(none.public(), ["quantize"], "without recipes, a function of that name is the package's own");
     }
 
     #[test]

@@ -241,7 +241,7 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let found = json(&home, &["--json", "model", "search", "--family", "cycle-test"]);
     assert_eq!(found["models"][0]["model"], model.as_str(), "{found}");
 
-    // The package's quantizer runs on the machine and uploads the fp8 lane to the model.
+    // The package's declared recipe runs on the machine and uploads the fp8 lane to the model.
     publish_quantizer(&home);
     let package = format!("{account}/tiny-quantizer");
     // The release's only lane: the import's unnamed variant.
@@ -251,11 +251,11 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let written = run["output"].as_array().into_iter().flatten().find(|item| item["name"] == "fp8");
     let fp8 = written.and_then(|item| item["checkpoint"]["revision"].as_str()).unwrap_or_else(|| panic!("no tree in {run}")).to_owned();
 
-    // A recipe is no function: the package lists none, and `cozy run` names quantize instead.
+    // A recipe is data: the package lists no function, and `cozy run` of its `quantize` names quantize.
     let listed = json(&home, &["--json", "run", &package]);
     assert_eq!(listed["functions"], serde_json::json!([]), "{listed}");
-    let refused = cozy(&home, None, &["--json", "run", &format!("{package}/fp8"), &pinned, "--on", "m1"]);
-    assert_eq!((refused.code, refused.refusal()["code"].as_str()), (1, Some("callable_recipe")), "{refused:?}");
+    let refused = cozy(&home, None, &["--json", "run", &format!("{package}/quantize"), &pinned, "--on", "m1"]);
+    assert_eq!((refused.code, refused.refusal()["code"].as_str()), (2, Some("callable_recipe")), "{refused:?}");
 
     // A person runs the recipe by name and sees the checkpoint the machine wrote and how to publish it.
     let human = cozy(&home, None, &["model", "quantize", &pinned, "--recipe", "fp8", "--package", &package, "--on", "m1"]);
@@ -264,13 +264,26 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let next = format!("cozy model publish {model} --release 1.0.0 --commit {fp8}");
     assert!(human.stdout.contains(&next), "{human:?}");
 
-    // The machine holds the package now: quantize finds its quantizer there, and none for int8.
-    let none = cozy(&home, None, &["--json", "model", "quantize", &pinned, "--int8", "--on", "m1"]);
+    // The package is always named; one without a recipe for the lane says what it declares.
+    let unnamed = cozy(&home, None, &["--json", "model", "quantize", &pinned, "--fp8", "--on", "m1"]);
+    assert_eq!((unnamed.code, unnamed.refusal()["code"].as_str()), (2, Some("model_quantize_package")), "{unnamed:?}");
+    assert!(unnamed.refusal()["remedy"].as_str().is_some_and(|r| r.contains("--package org/name")), "{unnamed:?}");
+    let none = cozy(&home, None, &["--json", "model", "quantize", &pinned, "--int8", "--package", &package, "--on", "m1"]);
     assert_eq!((none.code, none.refusal()["code"].as_str()), (1, Some("model_quantizer_not_found")), "{none:?}");
+    assert!(none.refusal()["remedy"].as_str().is_some_and(|r| r.contains("--fp8 (Model: any checkpoint)")), "{none:?}");
 
-    // The release moves to the commit that adds the fp8 variant.
+    // The release moves to the commit that adds the fp8 variant; its header names the recipe.
     let moved = json(&home, &["--json", "model", "publish", &model, "--release", "1.0.0", "--commit", &fp8]);
     assert_eq!(moved["commit"].as_str(), Some(fp8.as_str()), "{moved}");
+    let info = json(&home, &["--json", "model", "info", &pinned]);
+    let lanes = info["releases"][0]["lanes"].as_array().unwrap();
+    let made = lanes.iter().find_map(|lane| lane["provenance"].as_object()).unwrap_or_else(|| panic!("no provenance in {info}"));
+    assert_eq!((made["package"].as_str(), made["release"].as_str(), made["recipe"].as_str()), (Some(package.as_str()), Some("0.1.0"), Some("fp8")), "{info}");
+    assert_eq!(made["source"].as_str(), Some(header.as_str()), "the lane names the header it was made from: {info}");
+    assert_eq!(made["plan"]["encoding"], "fp8.rowwise", "{info}");
+    assert!(made["fingerprint"].as_str().is_some_and(|f| f.starts_with("sha256:")), "{info}");
+    let shown = cozy(&home, None, &["model", "info", &pinned]);
+    assert!(shown.stdout.contains(&format!("{package}@0.1.0 fp8")), "{shown:?}");
 
     let yanked = json(&home, &["--json", "model", "yank", &model, "--release", "1.0.0"]);
     assert_eq!(yanked["yanked"], true, "{yanked}");
