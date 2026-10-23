@@ -3,14 +3,19 @@
 //! lock, clock or driver call. The manager applies it; a reclaim request is cooperative (each
 //! agent's CAS decides).
 //!
-//! Watermarks (§12, Linux's min/low/high): min is the reserved pool H, never allocated (cr-215);
-//! low = min + card/64; high = min + card/32. A demand allocation may take free down to min, a
-//! speculative one only down to high. Free under low starts background reclaim of cold pages up
-//! to high; free under min (foreign growth) reclaims everything unprotected up to high. A new
-//! foreign process takes every cold page.
+//! Free is the device's own figure (the driver's free bytes, less what was created since it was
+//! read): every context, module, library buffer and foreign byte is simply used, so the page
+//! accounting never rests on an agent's word.
+//!
+//! Watermarks (§12, Linux's min/low/high; no card fractions): min is the reserved pool H (a
+//! fixed 512 MiB per GPU, the driver's: never allocated, cr-215); low = min + H, high = min + 2H,
+//! so 1 GiB and 1.5 GiB on every GPU (a host test device with no reserve has none).
+//! A demand allocation may take free down to min, a speculative one only down to high. Free under
+//! low starts background reclaim of cold pages up to high; free under min (foreign growth)
+//! reclaims everything unprotected up to high. A new foreign process takes every cold page.
 //!
 //! Reclaim takes, machine-wide, each stage only while the cheaper ones fall short:
-//! 1. per-process free lists (never the asker's own);
+//! 1. per-process free lists (never the asker's own; all of them while another process waits);
 //! 2. wholly free arena chunks, then the GPU page cache, oldest first;
 //! 3. idle sets' pages, least recently used first;
 //! 4. regions: idle ones least recently used first, then by restore cost per byte freed; a graph
@@ -22,9 +27,12 @@
 //! 5. later steps' pages (memory.low), furthest advised use first (plan-Belady): the asker's
 //!    own, then other executors', the largest holder first;
 //! 6. the current step's pages (memory.min): only the asker's own, never for anyone else;
-//!    furthest first, its next [`SLOTS`] blocks last.
+//!    furthest first, its next [`SLOTS`] blocks last;
+//! 7. other executors' pinned, unprotected pages: asked now, they come when their holder's step
+//!    ends and unpins them, so the ask waits; unless the holder itself waits on the asker (a wait
+//!    cycle), when the later ask is refused instead. The asker's own pins are its floor.
 //!
-//! A chunk pinned by anything but a graph is never taken. Advice is agent-written, so the order
+//! Advice is agent-written, so the order
 //! is fair only among cooperating executors: an agent that advises every chunk as its current
 //! step keeps its bytes longest. Pins and the reserved pool hold regardless.
 
@@ -39,20 +47,13 @@ pub const SLOTS: usize = 2;
 /// One GPU's page accounting at a decision.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
-    /// min(card, limit) less TensorD's own context.
-    pub card: u64,
-    /// The reserved pool H = max(512 MiB, card/16): the driver's, never allocated; the min
-    /// watermark.
+    /// The device's free bytes: the driver's last reading less what was created since, within
+    /// a `--gpu-memory-limit`.
+    pub free: u64,
+    /// The reserved pool H: the driver's, never allocated; the min watermark.
     pub reserved: u64,
-    /// Every executor's measured fixed overhead (context, modules, graph exec): outside the
-    /// page accounting.
-    pub fixed: u64,
-    /// Other processes' bytes at the last sample (NVML used − created − fixed).
-    pub foreign: u64,
     /// This reading only: a foreign process absent when sampling began crossed 256 MiB.
     pub new_foreign: bool,
-    /// Every chunk the manager created: allocated, free lists and the page cache.
-    pub created: u64,
     /// The GPU page cache's entries' bytes, oldest first.
     pub page_cache: Vec<u64>,
     pub executors: Vec<Executor>,
@@ -96,7 +97,7 @@ pub struct Chunk {
 /// A chunk's advice (madvise; WDDM residency priority), as its agent publishes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Advice {
-    /// None yet: protected as the current step's.
+    /// None (MADV_NORMAL): reclaimed with later steps, nearest last.
     Unset,
     /// On its process's free list: allocated, unassigned.
     FreeList { since: u64 },
@@ -187,11 +188,12 @@ pub enum Stage {
     Region,
     Later,
     Step,
+    Pinned,
 }
 
 /// The GPU's (min, low, high) watermarks.
 pub fn watermarks(s: &Snapshot) -> (u64, u64, u64) {
-    (s.reserved, s.reserved + s.card / 64, s.reserved + s.card / 32)
+    (s.reserved, 2 * s.reserved, 3 * s.reserved)
 }
 
 /// Every pick for `asks`, plus background and foreign reclaim.
@@ -202,7 +204,7 @@ pub fn decide(s: &Snapshot, asks: &[Ask]) -> Decision {
     let (min, low, high) = watermarks(s);
     let (min, low, high) = (i128::from(min), i128::from(low), i128::from(high));
     let new = |a: &Ask| i128::from(if a.cached.is_some() { 0 } else { a.bytes });
-    let free = i128::from(s.card) - i128::from(s.fixed) - i128::from(s.foreign) - i128::from(s.created);
+    let free = i128::from(s.free);
     if s.new_foreign {
         run.cover(u64::MAX, None, Scope::Cold);
     }
@@ -241,11 +243,12 @@ pub fn decide(s: &Snapshot, asks: &[Ask]) -> Decision {
         let bytes = new(a);
         let from = run.picks.len();
         let asker = s.executors.iter().position(|e| e.id == a.executor);
-        let covered = if bytes > projected { run.cover_all(clamp(bytes - projected), asker, clamp(i128::from(later))) } else { Ok(()) };
+        run.cyclic = cyclic;
+        let covered = run.cover_all(bytes - projected, asker, later);
         let answer = match covered {
             Ok(()) => {
                 on.extend(run.picks.iter().skip(from).filter_map(|p| match p {
-                    Pick::Graph { executor, .. } if *executor != a.executor => Some(*executor),
+                    Pick::Graph { executor, .. } | Pick::Chunk { executor, stage: Stage::Pinned, .. } if *executor != a.executor => Some(*executor),
                     _ => None,
                 }));
                 let on: Vec<u64> = on.into_iter().collect();
@@ -385,11 +388,13 @@ struct Run<'a> {
     host: u64,
     got: u64,
     picks: Vec<Pick>,
+    /// Executors waiting, directly or not, on the current asker: their pins are never waited on.
+    cyclic: BTreeSet<u64>,
 }
 
 impl<'a> Run<'a> {
     fn new(s: &'a Snapshot, f: &'a Facts) -> Run<'a> {
-        Run { s, f, taken: BTreeSet::new(), dropped: BTreeSet::new(), given: BTreeSet::new(), gone: BTreeSet::new(), host: s.host.available, got: 0, picks: vec![] }
+        Run { s, f, taken: BTreeSet::new(), dropped: BTreeSet::new(), given: BTreeSet::new(), gone: BTreeSet::new(), host: s.host.available, got: 0, picks: vec![], cyclic: BTreeSet::new() }
     }
 
     fn ex(&self, e: usize) -> Option<&'a Executor> {
@@ -543,9 +548,9 @@ impl<'a> Run<'a> {
         out.into_iter().map(|(_, at)| at).collect()
     }
 
-    /// An executor's later steps' chunks (memory.low), and its current step's (memory.min,
-    /// unadvised and orphaned region chunks too); each furthest first, unpinned before a graph's,
-    /// the current step's next [`SLOTS`] unpinned uses last.
+    /// An executor's later steps' chunks (memory.low; unadvised and orphaned region chunks too,
+    /// nearest), and its current step's (memory.min); each furthest first, unpinned before a
+    /// graph's, the current step's next [`SLOTS`] unpinned uses last.
     fn running(&self, e: usize) -> (Vec<usize>, Vec<usize>) {
         let Some(x) = self.ex(e) else { return (vec![], vec![]) };
         let (mut later, mut step) = (vec![], vec![]);
@@ -553,8 +558,8 @@ impl<'a> Run<'a> {
             let (list, at) = match ch.advice {
                 Advice::Later { at } => (&mut later, at),
                 Advice::Step { at } => (&mut step, at),
-                Advice::Unset => (&mut step, 0),
-                Advice::Region { id } if !x.regions.iter().any(|r| r.id == id) => (&mut step, 0),
+                Advice::Unset => (&mut later, 0),
+                Advice::Region { id } if !x.regions.iter().any(|r| r.id == id) => (&mut later, 0),
                 _ => continue,
             };
             if let Some(n) = self.needs(e, c).filter(|_| self.open(e, c)) {
@@ -566,6 +571,18 @@ impl<'a> Run<'a> {
         let near: BTreeSet<u64> = step.iter().filter(|i| !i.0).map(|i| i.1 .0).collect::<BTreeSet<_>>().into_iter().take(SLOTS).collect();
         let (slots, far): (Vec<_>, Vec<_>) = step.into_iter().partition(|i| !i.0 && near.contains(&i.1 .0));
         (later.into_iter().map(|i| i.3).collect(), far.into_iter().chain(slots).map(|i| i.3).collect())
+    }
+
+    /// Per-process free lists are never kept while another process waits (§12): every other
+    /// executor's goes whole.
+    fn drain_free_lists(&mut self, asker: Option<usize>) {
+        for (e, x) in self.s.executors.iter().enumerate().filter(|(e, _)| Some(*e) != asker) {
+            for (c, ch) in x.chunks.iter().enumerate() {
+                if matches!(ch.advice, Advice::FreeList { .. }) && self.free_now(e, c) {
+                    self.take(e, c, Stage::FreeList);
+                }
+            }
+        }
     }
 
     /// Takes from `queues` (executor, chunks in order) the largest remaining first, until
@@ -587,11 +604,15 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// [`Run::cover`] over every stage, all or nothing (`later` bytes, coming once acked, may
-    /// make up the rest): what it could get when short.
-    fn cover_all(&mut self, need: u64, asker: Option<usize>, later: u64) -> Result<(), u64> {
+    /// A waiting ask's picks, all or nothing: every other executor's free list, then
+    /// [`Run::cover`] over every stage for what is still short of `need` (`later` bytes, coming
+    /// once acked, may make up the rest). What it could get when short.
+    fn cover_all(&mut self, need: i128, asker: Option<usize>, later: u64) -> Result<(), u64> {
         let mut trial = self.clone();
-        if trial.cover(need, asker, Scope::All) || trial.got - self.got + later >= need {
+        trial.drain_free_lists(asker);
+        let got = |t: &Run| i128::from(t.got - self.got);
+        let rest = need - got(&trial);
+        if rest <= 0 || trial.cover(clamp(rest), asker, Scope::All) || got(&trial) + i128::from(later) >= need {
             *self = trial;
             Ok(())
         } else {
@@ -646,8 +667,24 @@ impl<'a> Run<'a> {
             self.water(vec![(*e, own_later.clone())], Stage::Later, target);
         }
         self.water(later, Stage::Later, target);
-        if let Some((e, (_, own_step))) = own.filter(|_| scope == Scope::All) {
-            self.water(vec![(e, own_step)], Stage::Step, target);
+        let Some((asker, (_, own_step))) = own.filter(|_| scope == Scope::All) else { return self.got >= target };
+        self.water(vec![(asker, own_step)], Stage::Step, target);
+        // Others' pinned, unprotected chunks: asked now, given at their unpin.
+        for (e, x) in self.s.executors.iter().enumerate() {
+            if e == asker || self.cyclic.contains(&x.id) {
+                continue;
+            }
+            for (c, ch) in x.chunks.iter().enumerate() {
+                if self.got >= target {
+                    return true;
+                }
+                let protected = matches!(ch.advice, Advice::Step { .. });
+                if ch.pins > 0 && !protected && self.open(e, c) && self.needs(e, c).is_none() {
+                    self.taken.insert((e, c));
+                    self.got += ch.bytes;
+                    self.picks.push(Pick::Chunk { executor: x.id, slot: ch.slot, seq: ch.seq, bytes: ch.bytes, stage: Stage::Pinned });
+                }
+            }
         }
         self.got >= target
     }
@@ -726,23 +763,18 @@ mod tests {
         Graph { id, chunks: chunks.to_vec(), last_use, next_use, capture_ns, dropping: false }
     }
 
-    /// A card with `free` MiB uncreated and a reserved pool of `reserved` MiB. Its card is the
-    /// created bytes plus `free`: so small that low and high sit under one chunk above min.
-    fn snap(free: i64, reserved: u64, page_cache: Vec<u64>, executors: Vec<Executor>) -> Snapshot {
-        let created = executors.iter().flat_map(|e| &e.chunks).map(|c| c.bytes).sum::<u64>() + page_cache.iter().map(|r| r * M).sum::<u64>();
-        let card = (created as i64 + free * M as i64) as u64;
-        Snapshot { card, reserved: reserved * M, created, page_cache: page_cache.into_iter().map(|r| r * M).collect(), executors, ..Snapshot::default() }
+    /// A device with `free` MiB free and a reserved pool of `reserved` MiB.
+    fn snap(free: u64, reserved: u64, page_cache: Vec<u64>, executors: Vec<Executor>) -> Snapshot {
+        Snapshot { free: free * M, reserved: reserved * M, page_cache: page_cache.into_iter().map(|r| r * M).collect(), executors, ..Snapshot::default() }
     }
 
     fn demand(executor: u64, mib: u64) -> Ask {
         Ask { executor, bytes: mib * M, speculative: false, cached: None }
     }
 
-    /// `s` on a 64 GiB card with free exactly at low: no background reclaim.
+    /// `s` with free exactly at low: no background reclaim.
     fn quiet(mut s: Snapshot) -> Snapshot {
-        s.card = 64 << 30;
-        let (_, low, _) = watermarks(&s);
-        s.fixed = s.card - s.created - low;
+        s.free = watermarks(&s).1;
         s
     }
 
@@ -814,40 +846,59 @@ mod tests {
         let (min, low, _) = watermarks(&s);
         assert_eq!(d.answers, vec![Answer::Refuse { room: low - min + 18 * M }]);
         assert!(d.picks.is_empty(), "a refused ask reclaims nothing");
-        // Under low, background reclaim takes cold pages first, the asker's free list too.
-        assert_eq!(show(&decide(&ladder(), &[])), ["1:1"]);
+        // Under min with no ask: cold pages first, every free list too, up to high (3 MiB).
+        let mut s = ladder();
+        s.reserved = M;
+        assert_eq!(show(&decide(&s, &[])), ["1:1", "2:1", "3:1"]);
     }
 
     #[test]
     fn free_room_allocates_with_no_reclaim() {
+        // 512 MiB free, no reserve: allocated with no reclaim.
         let mut s = ladder();
-        s.card += 4 * M;
-        let d = decide(&s, &[demand(1, 3), demand(2, 1), demand(1, 2)]);
+        s.free = 512 * M;
+        let d = decide(&s, &[demand(1, 300), demand(2, 212), demand(1, 2)]);
         assert_eq!(d.answers, vec![Answer::Allocate, Answer::Allocate, Answer::Wait { on: vec![] }]);
         assert_eq!(show(&d), ["2:1", "3:1"]);
-        let d = decide(&s, &[demand(1, 9), demand(1, 1)]);
+        let d = decide(&s, &[demand(1, 600), demand(1, 1)]);
         assert_eq!(d.answers[1], Answer::Behind);
     }
 
-    /// Watermarks on a 64 MiB card with min = 4 MiB: low = 5, high = 6. (free MiB, MiB already
-    /// coming back, MiB picked, the last stage reached).
+    /// While another process waits, no process keeps its free list (§12), even past the need;
+    /// the waiter's own stays.
+    #[test]
+    fn free_lists_go_while_another_process_waits() {
+        let free = |slot, since| c(slot, 1, Advice::FreeList { since });
+        let s = quiet(snap(0, 0, vec![], vec![ex(1, vec![free(1, 1)]), ex(2, vec![free(1, 1), free(2, 2), free(3, 3)]), ex(3, vec![idle(1, 1)])]));
+        let d = decide(&s, &[past(&s, 1, 1)]);
+        assert_eq!(show(&d), ["2:1", "2:2", "2:3"]);
+        // Nobody waits: free lists stay; nor for a refused ask.
+        let mut room = s.clone();
+        room.free = M;
+        assert!(decide(&room, &[demand(1, 1)]).picks.is_empty());
+        assert!(decide(&s, &[past(&s, 1, 100)]).picks.is_empty());
+    }
+
+    /// Watermarks with min = 512 MiB: low = 1 GiB, high = 1.5 GiB; chunks of 256 MiB, four idle,
+    /// two of later steps, two of the current step. (free MiB, chunks already coming back, MiB
+    /// picked, the last stage reached).
     #[test]
     fn watermarks_reclaim_cold_pages_in_the_background_and_the_unprotected_below_min() {
-        let rows: &[(i64, u64, u64, Option<Stage>)] = &[
-            (8, 0, 0, None),
-            (6, 0, 0, None),
-            (5, 0, 0, None),                // at low: nothing
-            (4, 0, 2, Some(Stage::Idle)),   // under low: cold only, up to high
-            (4, 1, 1, Some(Stage::Idle)),   // what is coming counts
-            (3, 0, 3, Some(Stage::Later)),  // under min: idle (2 MiB), then memory.low
-            (-2, 0, 4, Some(Stage::Later)), // under min with too little: all but the current step
+        let rows: &[(u64, u32, u64, Option<Stage>)] = &[
+            (2048, 0, 0, None),
+            (1024, 0, 0, None),                 // at low: nothing
+            (1000, 0, 768, Some(Stage::Idle)),  // under low: cold pages, up to high
+            (1000, 2, 256, Some(Stage::Idle)),  // what is coming counts
+            (1000, 3, 0, None),
+            (400, 0, 1280, Some(Stage::Later)), // under min: cold, then memory.low
+            (0, 0, 1536, Some(Stage::Later)),   // never a current step
         ];
+        let q = |slot, advice| c(slot, 256, advice);
         for &(free, coming, picked, last) in rows {
-            let mut chunks = vec![idle(1, 1), idle(2, 2), later(3, 9), later(4, 8), step(5, 2), step(6, 1)];
-            chunks.extend((0..coming as u32).map(|i| asked(later(100 + i, 1))));
-            let mut s = snap(0, 4, vec![], vec![ex(1, chunks)]);
-            s.card = 64 * M;
-            s.fixed = (i128::from(s.card) - i128::from(s.created) - i128::from(free) * i128::from(M)) as u64;
+            let mut chunks: Vec<Chunk> = (1..=4).map(|i| q(i, Advice::Idle { last_use: u64::from(i) })).collect();
+            chunks.extend([q(5, Advice::Later { at: 9 }), q(6, Advice::Later { at: 8 }), q(7, Advice::Step { at: 2 }), q(8, Advice::Step { at: 1 })]);
+            chunks.extend((0..coming).map(|i| asked(q(100 + i, Advice::Later { at: 1 }))));
+            let s = snap(free, 512, vec![], vec![ex(1, chunks)]);
             let d = decide(&s, &[]);
             assert_eq!(bytes(&d), picked * M, "free {free} MiB, {coming} MiB coming");
             let stages: Vec<Stage> = d.picks.iter().filter_map(|p| if let Pick::Chunk { stage, .. } = p { Some(*stage) } else { None }).collect();
@@ -856,21 +907,18 @@ mod tests {
         }
         // Demand allocates down to min; speculation only down to high.
         let spec = |mib| Ask { speculative: true, ..demand(1, mib) };
-        let mut s = snap(0, 4, vec![], vec![ex(1, vec![])]);
-        s.card = 64 * M;
-        s.fixed = s.card - 10 * M;
-        assert_eq!(decide(&s, &[demand(1, 6)]).answers, vec![Answer::Allocate]);
-        assert_eq!(decide(&s, &[demand(1, 7)]).answers, vec![Answer::Refuse { room: 6 * M }]);
-        assert_eq!(decide(&s, &[spec(4)]).answers, vec![Answer::Allocate]);
-        let d = decide(&s, &[spec(5)]);
-        assert_eq!((d.answers, d.picks), (vec![Answer::Refuse { room: 4 * M }], vec![]));
-        assert_eq!(decide(&s, &[demand(1, 5), spec(1)]).answers[1], Answer::Refuse { room: 0 });
+        let s = snap(2048, 512, vec![], vec![ex(1, vec![])]);
+        assert_eq!(decide(&s, &[demand(1, 1536)]).answers, vec![Answer::Allocate]);
+        assert_eq!(decide(&s, &[demand(1, 1537)]).answers, vec![Answer::Refuse { room: 1536 * M }]);
+        assert_eq!(decide(&s, &[spec(512)]).answers, vec![Answer::Allocate]);
+        let d = decide(&s, &[spec(513)]);
+        assert_eq!((d.answers, d.picks), (vec![Answer::Refuse { room: 512 * M }], vec![]));
+        assert_eq!(decide(&s, &[demand(1, 1100), spec(1)]).answers[1], Answer::Refuse { room: 0 });
     }
 
     #[test]
     fn a_new_foreign_process_takes_every_cold_page_and_nothing_protected() {
-        let mut s = ladder();
-        s.card += 100 * M;
+        let mut s = quiet(ladder());
         s.new_foreign = true;
         let d = decide(&s, &[]);
         assert_eq!(show(&d), ["1:1", "2:1", "3:1", "P0", "3:3", "3:2", "G3:8", "3:6", "3:7", "D3:7", "3:4", "3:5"]);
@@ -912,7 +960,7 @@ mod tests {
             assert!(d.picks.iter().all(|p| matches!(p, Pick::Chunk { executor: 1 | 4, .. })), "need {need} MiB: {:?}", show(&d));
         }
         let d = decide(&co_resident(), &[demand(1, 12)]);
-        assert_eq!((show(&d), d.answers), (vec!["4:2".to_string()], vec![Answer::Refuse { room: 11 * M }]));
+        assert_eq!((d.answers, d.picks), (vec![Answer::Refuse { room: 11 * M }], vec![]));
     }
 
     #[test]
@@ -996,6 +1044,20 @@ mod tests {
         // Only the asker's own bound chunk: refused, nothing taken.
         let d = decide(&snap(0, 0, vec![], vec![ex(1, vec![pinned(1, step(1, 1))])]), &[demand(1, 1)]);
         assert_eq!((d.answers, d.picks), (vec![Answer::Refuse { room: 0 }], vec![]));
+        // Another's pinned chunk: asked now, the ask waits for its holder's unpin; never its
+        // current step (memory.min).
+        let held = |waits_on: Vec<u64>, advice| {
+            let mut b = ex(2, vec![pinned(1, c(1, 1, advice))]);
+            b.waits_on = waits_on;
+            snap(0, 0, vec![], vec![ex(1, vec![]), b])
+        };
+        let d = decide(&held(vec![], Advice::Later { at: 1 }), &[demand(1, 1)]);
+        assert_eq!((show(&d), d.answers), (vec!["2:1".to_string()], vec![Answer::Wait { on: vec![2] }]));
+        assert!(matches!(d.picks[0], Pick::Chunk { stage: Stage::Pinned, .. }));
+        assert_eq!(decide(&held(vec![], Advice::Step { at: 1 }), &[demand(1, 1)]).answers, vec![Answer::Refuse { room: 0 }]);
+        // Its holder waits on the asker: a cycle, and the later ask is refused.
+        let d = decide(&held(vec![1], Advice::Later { at: 1 }), &[demand(1, 1)]);
+        assert_eq!((d.answers, d.picks), (vec![Answer::Refuse { room: 0 }], vec![]));
         // Another's chunk asked while unpinned and pinned since: it comes at its unpin.
         let s = |waits_on: Vec<u64>| {
             let mut b = ex(2, vec![asked(pinned(1, later(1, 1)))]);
@@ -1017,9 +1079,10 @@ mod tests {
         assert_eq!(decide(&s, &[demand(1, 4)]).answers, vec![Answer::Refuse { room: 2 * M }]);
     }
 
-    /// Deterministic random page accounting: no ask takes a pinned chunk, the asker's own free
-    /// list or another's current step; stages run in order; a protected class loses nothing
-    /// while cheaper ones are left; and no pick but the last was needed.
+    /// Deterministic random page accounting: a pinned chunk only in the last stage (another's,
+    /// waited on), never the asker's own free list or another's current step; stages run in
+    /// order; a protected class loses nothing while cheaper ones are left; and no pick but the
+    /// last was needed.
     #[test]
     fn no_protected_pick_while_cold_pages_cover() {
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -1058,15 +1121,15 @@ mod tests {
             for p in &d.picks {
                 let Pick::Chunk { executor, slot, stage, .. } = p else { continue };
                 let ch = chunk(*executor, *slot);
-                assert_eq!(ch.pins, 0, "case {case}: a pinned chunk");
+                assert_eq!(ch.pins > 0, *stage == Stage::Pinned, "case {case}: a pinned chunk outside the last stage");
                 assert!(!(*executor == 1 && matches!(ch.advice, Advice::FreeList { .. })), "case {case}: the asker's own free list");
-                assert!(*executor == 1 || !matches!(ch.advice, Advice::Step { .. } | Advice::Unset), "case {case}: another's current step");
+                assert!(*executor == 1 || !matches!(ch.advice, Advice::Step { .. }), "case {case}: another's current step");
                 stages.push((*stage, ch.bytes));
             }
             assert!(stages.windows(2).all(|w| w[0].0 <= w[1].0), "case {case}: stages out of order {stages:?}");
             let short = need * M;
             let picked: BTreeSet<String> = show(&d).into_iter().collect();
-            for protected in [Stage::Later, Stage::Step] {
+            for protected in [Stage::Later, Stage::Step, Stage::Pinned] {
                 if !stages.iter().any(|s| s.0 == protected) {
                     continue;
                 }
@@ -1077,15 +1140,19 @@ mod tests {
                         let cheap = match ch.advice {
                             Advice::Free { .. } | Advice::Idle { .. } => true,
                             Advice::FreeList { .. } => e.id != 1,
-                            Advice::Later { .. } => protected == Stage::Step,
+                            Advice::Later { .. } | Advice::Unset => protected >= Stage::Step,
+                            Advice::Step { .. } => protected == Stage::Pinned && e.id == 1,
                             _ => false,
                         };
                         assert!(!cheap || picked.contains(&format!("{}:{}", e.id, ch.slot)), "case {case}: {}:{} left for a {protected:?} pick", e.id, ch.slot);
                     }
                 }
             }
-            if let (Answer::Wait { .. }, Some(last)) = (&d.answers[0], stages.last()) {
-                assert!(bytes(&d) - last.1 < short, "case {case}: picked past the need");
+            // Free lists go whole while another waits; every other pick but the last was needed.
+            let drained: u64 = stages.iter().filter(|s| s.0 == Stage::FreeList).map(|s| s.1).sum();
+            let rest: Vec<u64> = stages.iter().filter(|s| s.0 != Stage::FreeList).map(|s| s.1).collect();
+            if let (Answer::Wait { .. }, Some(last)) = (&d.answers[0], rest.last()) {
+                assert!(rest.iter().sum::<u64>() - last < short.saturating_sub(drained), "case {case}: picked past the need");
             }
         }
     }
@@ -1105,7 +1172,8 @@ mod tests {
     #[test]
     fn pressure_is_the_share_of_the_window_with_an_ask_waiting() {
         let s = 1_000_000_000u64;
-        let rows: &[(&[(u64, u64)], Option<u64>, u64, u64, f32)] = &[
+        type Row<'a> = (&'a [(u64, u64)], Option<u64>, u64, u64, f32);
+        let rows: &[Row] = &[
             (&[], None, 100 * s, 10 * s, 0.0),
             (&[(91 * s, 96 * s)], None, 100 * s, 10 * s, 0.5),
             (&[(85 * s, 95 * s)], None, 100 * s, 10 * s, 0.5), // only the part inside the window
@@ -1133,20 +1201,28 @@ mod tests {
     }
 
     /// A manager applying each decision at once (every reclaim request released, every
-    /// allocation mapped): device free = card − fixed − foreign − created.
+    /// allocation mapped) on a 4 GiB device: its free = card − fixed − foreign − created, as the
+    /// driver reads it.
     struct Sim {
         s: Snapshot,
+        card: u64,
+        fixed: u64,
+        foreign: u64,
+        created: u64,
         clock: u64,
     }
 
+    /// The sim's unit: 64 MiB.
+    const U: u64 = 64 * M;
+
     impl Sim {
         fn new() -> Sim {
-            let s = Snapshot { card: 64 * M, reserved: 4 * M, executors: (1..=3).map(|id| ex(id, vec![])).collect(), ..Snapshot::default() };
-            Sim { s, clock: 0 }
+            let s = Snapshot { reserved: 8 * U, executors: (1..=3).map(|id| ex(id, vec![])).collect(), ..Snapshot::default() };
+            Sim { s, card: 64 * U, fixed: 0, foreign: 0, created: 0, clock: 0 }
         }
 
         fn free(&self) -> i128 {
-            i128::from(self.s.card) - i128::from(self.s.fixed) - i128::from(self.s.foreign) - i128::from(self.s.created)
+            i128::from(self.card) - i128::from(self.fixed) - i128::from(self.foreign) - i128::from(self.created)
         }
 
         fn chunks(&mut self, id: u64) -> &mut Vec<Chunk> {
@@ -1156,16 +1232,17 @@ mod tests {
         /// Serves `asks` until none waits; every decision that allocates leaves min free.
         fn serve(&mut self, mut asks: Vec<Ask>, trace: &str) {
             for _ in 0..8 {
+                self.s.free = u64::try_from(self.free()).unwrap_or(0);
                 let d = decide(&self.s, &asks);
                 for p in &d.picks {
                     match *p {
                         Pick::Chunk { executor, slot, bytes, .. } => {
                             self.chunks(executor).retain(|c| c.slot != slot);
-                            self.s.created -= bytes;
+                            self.created -= bytes;
                         }
                         Pick::PageCache { index, bytes } => {
                             self.s.page_cache[index] = 0;
-                            self.s.created -= bytes;
+                            self.created -= bytes;
                         }
                         _ => {}
                     }
@@ -1181,7 +1258,7 @@ mod tests {
                             let bytes = match a.cached {
                                 Some(i) => std::mem::take(&mut self.s.page_cache[i]),
                                 None => {
-                                    self.s.created += a.bytes;
+                                    self.created += a.bytes;
                                     a.bytes
                                 }
                             };
@@ -1206,8 +1283,8 @@ mod tests {
             for (i, ev) in events.iter().enumerate() {
                 let trace = format!("event {i} {ev:?}");
                 match *ev {
-                    Ev::Demand(e, mib) => self.serve(vec![demand(e, mib)], &trace),
-                    Ev::Spec(e, mib) => self.serve(vec![Ask { speculative: true, ..demand(e, mib) }], &trace),
+                    Ev::Demand(e, u) => self.serve(vec![Ask { bytes: u * U, ..demand(e, 0) }], &trace),
+                    Ev::Spec(e, u) => self.serve(vec![Ask { bytes: u * U, speculative: true, ..demand(e, 0) }], &trace),
                     Ev::Cached(e) => {
                         if let Some(i) = self.s.page_cache.iter().position(|&b| b > 0) {
                             self.serve(vec![Ask { cached: Some(i), ..demand(e, 0) }], &trace);
@@ -1223,8 +1300,8 @@ mod tests {
                         let gone: u64 = std::mem::take(self.chunks(e)).iter().map(|c| c.bytes).sum();
                         self.s.page_cache.push(gone);
                     }
-                    Ev::Foreign(mib) => self.s.foreign = mib * M,
-                    Ev::Fixed(mib) => self.s.fixed = mib * M,
+                    Ev::Foreign(u) => self.foreign = u * U,
+                    Ev::Fixed(u) => self.fixed = u * U,
                 }
                 self.serve(vec![], &trace);
                 // Whatever moved, while reclaimable bytes remain the device is back to min.
@@ -1235,7 +1312,7 @@ mod tests {
     }
 
     /// The reserved pool (cr-215): no sequence of asks, exits, page-cache hits, foreign or
-    /// context growth allocates into min. Card 64 MiB, min 4 MiB.
+    /// context growth allocates into min. Device 4 GiB, min 512 MiB; events in 64 MiB units.
     #[test]
     fn no_decision_sequence_allocates_into_the_reserved_pool() {
         use Ev::*;

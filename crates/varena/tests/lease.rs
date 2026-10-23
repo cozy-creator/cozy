@@ -16,9 +16,8 @@ mod cases {
     use platform::handles::Peer;
     use tensorfs::io::Dst;
     use varena::backend::{Access, Backend, Va};
-    use varena::lease::wire::{End, ToAgent};
-    use varena::lease::{Agent, Attach, Holdings, Hosting, Identity, Kind, Lease, Manager, Refusal, Region};
-    use varena::ledger::Mode;
+    use varena::lease::wire::{End, ToAgent, ToManager};
+    use varena::lease::{Agent, Attach, Holdings, Hosting, Identity, Kind, Lease, Manager, Mode, Refusal, Region};
     use varena::{GpuId, HostBackend};
 
     const MIB: u64 = 1 << 20;
@@ -36,6 +35,8 @@ mod cases {
         manager: Arc<Manager>,
         uuid: String,
         children: Arc<Children>,
+        /// The device: a test allocates on it as a process outside the books would.
+        backend: Arc<HostBackend>,
     }
 
     fn host(dir: &Path, case: &str, capacity: u64) -> Host {
@@ -47,10 +48,12 @@ mod cases {
         let gpu = GpuId { uuid: format!("lease{}-{case}", std::process::id()), model: "host".into(), memory: capacity };
         let listener = varena::lease::listen(&gpu).unwrap().unwrap();
         let children = Arc::new(Children(Mutex::new(vec![])));
-        let open = Box::new(move || Ok(Arc::new(HostBackend::with_headroom(capacity, headroom)) as Arc<dyn Backend>));
-        let manager = Manager::create(&gpu, Some(capacity), Mode::Dedicated, open, listener, children.clone()).unwrap();
+        let backend = Arc::new(HostBackend::with_headroom(capacity, headroom));
+        let device = backend.clone();
+        let open = Box::new(move || Ok(device.clone() as Arc<dyn Backend>));
+        let manager = Manager::create(&gpu, Some(capacity), Mode::Dedicated, Some(open), listener, children.clone()).unwrap();
         varena::os::remove_table(&gpu.uuid);
-        Host { manager, uuid: gpu.uuid, children }
+        Host { manager, uuid: gpu.uuid, children, backend }
     }
 
     /// The GPU's listener, as an agent dials it.
@@ -122,8 +125,8 @@ mod cases {
         let host = host(dir, "grant", 256 * MIB);
         let mut a = Agentd::start(&host);
         assert_eq!(a.call(&format!("take {} {}", 80 * MIB, region(1))), "ok 1 fresh verified");
-        let h = until(&host, |h| h.leased == 80 * MIB);
-        assert_eq!((h.created, h.retained, h.executors.len()), (80 * MIB, 0, 1));
+        let h = until(&host, |h| h.allocated == 80 * MIB);
+        assert_eq!((h.created, h.page_cache, h.executors.len()), (80 * MIB, 0, 1));
     }
 
     /// A weights region leases as one chunk sized to its page, however big (§3): never split.
@@ -131,12 +134,12 @@ mod cases {
         let host = host(dir, "big", 512 * MIB);
         let mut a = Agentd::start(&host);
         assert_eq!(a.call(&format!("take {} {}", 400 * MIB, region(1))), "ok 1 fresh verified");
-        let h = until(&host, |h| h.leased == 400 * MIB);
+        let h = until(&host, |h| h.allocated == 400 * MIB);
         assert_eq!(h.created_chunks, 1, "{h:?}");
         // Undeclared (no region, never retainable): one chunk all the same.
         let mut b = Agentd::start(&host);
         assert_eq!(b.call(&format!("take {} none 0", 100 * MIB)), "ok 1 fresh verified");
-        let h = until(&host, |h| h.leased == 500 * MIB);
+        let h = until(&host, |h| h.allocated == 500 * MIB);
         assert_eq!(h.created_chunks, 2, "{h:?}");
     }
 
@@ -152,7 +155,7 @@ mod cases {
         a.wait_rang();
         assert_eq!(a.call("revokes"), "released 1");
         assert_eq!(b.answer(), "ok 1 fresh verified");
-        let h = until(&host, |h| h.leased == 64 * MIB);
+        let h = until(&host, |h| h.allocated == 64 * MIB);
         assert!(h.created <= 96 * MIB, "{h:?}");
         assert!(a.call(&format!("take {} {}", 100 * MIB, region(3))).starts_with("refused"), "only H could serve it");
         assert!(host.manager.holdings().created <= 96 * MIB);
@@ -166,7 +169,7 @@ mod cases {
         assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 1 fresh verified");
         assert_eq!(a.call("pin"), "ok");
         assert!(a.call(&format!("take {} {}", 32 * MIB, region(2))).starts_with("refused"));
-        assert_eq!(host.manager.holdings().leased, 64 * MIB);
+        assert_eq!(host.manager.holdings().allocated, 64 * MIB);
     }
 
     fn an_unpinned_lease_is_revoked_for_another(dir: &Path) {
@@ -178,7 +181,7 @@ mod cases {
         // 32 MiB were free: A's one chunk is asked back.
         assert_eq!(a.call("revokes"), "released 1");
         assert_eq!(b.answer(), "ok 1 fresh verified");
-        until(&host, |h| h.leased == 64 * MIB && h.created == 64 * MIB);
+        until(&host, |h| h.allocated == 64 * MIB && h.created == 64 * MIB);
     }
 
     fn a_revoke_waits_for_the_pin(dir: &Path) {
@@ -190,7 +193,7 @@ mod cases {
         // Pinned after the ask went out: the agent's CAS refuses the revoke, the asker waits.
         assert_eq!(a.call("pin"), "ok");
         assert_eq!(a.call("revokes"), "released 0");
-        assert_eq!(host.manager.holdings().leased, 96 * MIB);
+        assert_eq!(host.manager.holdings().allocated, 96 * MIB);
         assert_eq!(a.call("unpin"), "ok");
         assert_eq!(a.call("revokes"), "released 1");
         assert_eq!(b.answer(), "ok 1 fresh verified");
@@ -226,6 +229,24 @@ mod cases {
         assert_eq!(b.call("unpin"), "ok");
         assert_eq!(b.call("revokes"), "released 1");
         assert_eq!(a.answer(), "ok 1 fresh verified");
+    }
+
+    /// The room is the driver's own free figure (§12, 18:40Z), never an agent's word: bytes a
+    /// process outside the books takes shrink the next allocation's room by exactly that much,
+    /// and come back when it lets them go.
+    fn bytes_outside_the_books_shrink_the_room(dir: &Path) {
+        let host = host_with(dir, "outside", 256 * MIB, 32 * MIB);
+        let mut a = Agentd::start(&host);
+        assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 1 fresh verified");
+        assert_eq!(host.manager.holdings().free, 160 * MIB, "256 − 64 − H");
+        let outside = host.backend.create(100 * MIB).unwrap();
+        host.manager.set_foreign(100 * MIB, false);
+        assert_eq!(host.manager.holdings().free, 60 * MIB, "the next allocation's room shrank by the outside bytes");
+        assert_eq!(a.call(&format!("take {} {}", 60 * MIB, region(2))), "ok 1 fresh verified");
+        assert_eq!(host.manager.holdings().free, 0);
+        host.backend.destroy(outside).unwrap();
+        host.manager.set_foreign(0, false);
+        assert_eq!(host.manager.holdings().free, 100 * MIB);
     }
 
     /// Stall verdicts come only from the look's cadence and measured progress: back-to-back
@@ -269,11 +290,11 @@ mod cases {
         a.kill();
         // Its landed region is retained; the region whose fill never landed is destroyed.
         let h = until(&host, |h| h.executors.is_empty());
-        assert_eq!((h.leased, h.retained, h.created), (0, 80 * MIB, 80 * MIB));
+        assert_eq!((h.allocated, h.page_cache, h.created), (0, 80 * MIB, 80 * MIB));
         let mut c = Agentd::start(&host);
         assert_eq!(c.call(&format!("take {} {}", 80 * MIB, region(7))), "ok 1 adopted verified");
-        let h = until(&host, |h| h.leased == 80 * MIB);
-        assert_eq!((h.retained, h.created), (0, 80 * MIB), "adopted with no new chunk");
+        let h = until(&host, |h| h.allocated == 80 * MIB);
+        assert_eq!((h.page_cache, h.created), (0, 80 * MIB), "adopted with no new chunk");
     }
 
     /// A process the host never registered dials the GPU's listener: refused before it is
@@ -281,6 +302,8 @@ mod cases {
     fn a_stranger_is_refused(dir: &Path) {
         let host = host(dir, "stranger", 64 * MIB);
         let stranger = End::new(dial(&host.uuid));
+        // Every answer, a refusal too, answers a Hello.
+        stranger.send(&ToManager::Hello { protocol: varena::lease::PROTOCOL, birth: 0 }, None).unwrap();
         match stranger.recv::<ToAgent>().unwrap() {
             Some((ToAgent::Refuse { code: Refusal::NotRegistered, .. }, None)) => {}
             other => panic!("a stranger was answered {:?}", other.map(|(m, h)| (m, h.is_some()))),
@@ -306,6 +329,7 @@ mod cases {
             ("a_revoke_waits_for_the_pin", a_revoke_waits_for_the_pin),
             ("an_ask_waits_for_anothers_pins", an_ask_waits_for_anothers_pins),
             ("a_wait_cycle_is_refused", a_wait_cycle_is_refused),
+            ("bytes_outside_the_books_shrink_the_room", bytes_outside_the_books_shrink_the_room),
             ("stalls_are_judged_on_the_looks_cadence", stalls_are_judged_on_the_looks_cadence),
             ("an_ask_against_its_own_pins_is_refused", an_ask_against_its_own_pins_is_refused),
             ("a_killed_agents_leases_return_and_landed_weights_are_adopted", a_killed_agents_leases_return_and_landed_weights_are_adopted),

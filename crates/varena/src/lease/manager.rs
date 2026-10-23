@@ -5,10 +5,14 @@
 //! exports. What to allocate, reclaim and refuse is [`policy::decide`]'s: the manager builds its
 //! snapshot from the page accounting and applies the answer.
 //!
+//! The room is the device's own figure (§12, 18:40Z): the driver's free bytes (cuMemGetInfo), read
+//! outside the lock before every decision, less what was created since that read, less the
+//! reserved pool. Every context, module, library buffer and foreign byte is simply used: the
+//! page accounting never rests on an agent's word.
+//!
 //! One manager per GPU, TensorD's, with the GPU's listener; TensorD reacts to [`Manager::events`].
-//! It also holds what admission and placement read (its agents' facts, standalone executors'
-//! fixed bytes, foreign bytes, the measured peaks, the dispatches) and the allocation-wait spans
-//! PSI reads.
+//! It also holds what admission and placement read (TensorD's dispatches and the measured peaks)
+//! and the allocation-wait spans PSI reads.
 //!
 //! The table is untrusted input: identity, pid, a chunk's index and whether it landed are the
 //! manager's own records (peer credentials, grant time, fill-ack time), never read back at exit.
@@ -22,17 +26,15 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
-use platform::contain::host_memory;
 use platform::handles::Peer;
 use platform::memory::{Signal, Waitable};
 use platform::process::Exact;
-use sha2::{Digest, Sha256};
 
 use super::policy::{self, Advice, Answer, Pick};
 use super::table::{self, Content, Figures, State, Table};
-use super::wire::{End, Facts, Kind, Measured, Refusal, Region, ToAgent, ToManager};
+use super::wire::{End, Kind, Measured, Refusal, Region, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
-use crate::decide::{self, Admitted};
+use crate::decide;
 use crate::os::{self, Listener, Owned, Stream};
 use crate::{Error, GpuId, Result};
 
@@ -145,27 +147,12 @@ pub enum Peak {
     Host { key: String, bytes: u64 },
 }
 
-/// A process running requests on a GPU, as TensorD's host rule reads it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostCall {
-    pub pid: u32,
-    /// The anonymous peak its running requests were measured to reach; `None`: one is unmeasured.
-    pub peak: Option<u64>,
-    /// Its anonymous bytes now.
-    pub anon: u64,
-    /// Its requests running now.
-    pub running: u64,
-}
-
-/// The reserved pool H for a card: never allocated (cr-215).
-pub fn reserved_pool(card: u64) -> u64 {
-    (512 << 20).max(card / 16)
-}
-
-/// A family's id as agents publish it in [`Facts::yielded`] (never 0).
-pub fn family_id(family: &str) -> u64 {
-    let h = Sha256::digest(family.as_bytes());
-    u64::from_le_bytes(std::array::from_fn(|i| h.get(i).copied().unwrap_or(0))).max(1)
+/// The driver's free bytes, and the bytes created and destroyed before that read.
+#[derive(Clone, Copy, Debug)]
+struct Sample {
+    free: u64,
+    created: u64,
+    destroyed: u64,
 }
 
 /// Opens the GPU's backend (TensorD's CUDA context), at the first ask.
@@ -179,8 +166,6 @@ struct Device {
     granularity: u64,
     /// The reserved pool H, never allocated in any mode (cr-215).
     headroom: u64,
-    /// This process's context.
-    context: u64,
 }
 
 /// A table's slots: one per smallest chunk the card could hold.
@@ -218,13 +203,16 @@ struct Books {
     /// index, oldest first in `order`.
     retained: BTreeMap<Kept, BTreeMap<u32, Physical>>,
     order: VecDeque<Kept>,
-    /// Device bytes no process of ours holds, as TensorD last sampled them, and whether that
-    /// reading saw a new foreign process (consumed by the next decision).
+    /// Every byte ever created and destroyed: what changed since a sample is these less its own.
+    created_total: u64,
+    destroyed_total: u64,
+    /// The driver's last reading; `None`: unread, and nothing grows.
+    sample: Option<Sample>,
+    /// Device bytes no process of ours holds, as TensorD last sampled them (shown only), and
+    /// whether that reading saw a new foreign process (consumed by the next decision).
     foreign: u64,
     new_foreign: bool,
     mode: Mode,
-    /// Standalone executors' fixed bytes by pid, as TensorD measures them.
-    fixed: BTreeMap<u32, u64>,
     /// Measured figures by `<kind>/<key>`: peak, compute and host by `<package>|<shape>`, set by
     /// name.
     figures: BTreeMap<String, u64>,
@@ -261,8 +249,6 @@ struct Exec {
     reported: BTreeSet<u32>,
     /// The executors whose pins its waiting ask waits on.
     waits_on: BTreeSet<u64>,
-    /// Its agent's admission facts, as last reported.
-    facts: Facts,
 }
 
 struct Leased {
@@ -334,9 +320,18 @@ fn cached(b: &Books, domain: &str, region: Option<Region>, sizes: &[u64]) -> Opt
     whole.then_some(key)
 }
 
-/// Every byte outside the page accounting: agents' contexts and torch's own, standalone pids'.
-fn fixed(b: &Books) -> u64 {
-    b.executors.values().map(|e| e.facts.context + e.facts.torch).sum::<u64>() + b.fixed.values().sum::<u64>()
+/// The device's free bytes as the books stand (the policy's `free`): the driver's last reading less
+/// what was created since and plus what was destroyed since, within the card or limit; `None`
+/// while unread.
+fn free(b: &Books) -> Option<u64> {
+    let (sample, d) = (b.sample?, b.device.as_ref()?);
+    let driver = (sample.free + (b.destroyed_total - sample.destroyed)).saturating_sub(b.created_total - sample.created);
+    Some(driver.min(d.card.saturating_sub(b.created) + d.headroom))
+}
+
+/// What may be created now: free less the reserved pool.
+fn room(b: &Books) -> u64 {
+    free(b).map_or(0, |f| f.saturating_sub(b.device.as_ref().map_or(0, |d| d.headroom)))
 }
 
 /// A figure at `<kind>/<key>`; a key ending in `|` (no shape) means the widest measured.
@@ -360,9 +355,8 @@ fn micros(since: Instant) -> u64 {
 impl Manager {
     /// The GPU's manager, `listener` served on the manager's own thread until
     /// [`Manager::retire`]. Its backend opens at the first ask (`open`; `None`: no VMM for us,
-    /// every agent runs standalone); it then creates at most [`Manager::capacity`]'s bytes:
-    /// `limit` (a `--gpu-memory-limit`, else the card) less the reserved pool in every mode, its
-    /// context, every other fixed byte and foreign bytes.
+    /// every agent runs standalone); it then creates only into the driver's free bytes less the
+    /// reserved pool, within `limit` (a `--gpu-memory-limit`, else the card).
     pub fn create(gpu: &GpuId, limit: Option<u64>, mode: Mode, open: Option<Opener>, listener: Listener, hosting: Arc<dyn Hosting>) -> Result<Arc<Manager>> {
         let events = Signal::new().map_err(|e| Error::Io(e.to_string()))?;
         let books = Mutex::new(Books { mode, ..Books::default() });
@@ -453,10 +447,10 @@ impl Manager {
             .collect();
         let (now, spans) = (self.now(), b.waits.iter().copied().collect::<Vec<_>>());
         let pressure = Pressure { some_10s: policy::pressure(&spans, b.waiting, now, 10_000_000_000), some_60s: policy::pressure(&spans, b.waiting, now, 60_000_000_000) };
-        let capacity = self.capacity(&b);
+        let free = room(&b);
         Holdings {
-            capacity,
-            free: capacity.saturating_sub(b.created),
+            capacity: b.created + free,
+            free,
             foreign: b.foreign,
             created: b.created,
             created_chunks: b.created_chunks,
@@ -536,7 +530,7 @@ impl Manager {
             let mut b = self.books.lock();
             b.next += 1;
             let id = b.next;
-            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, seen: (0, 0), still: 0, stalled: false, reported: BTreeSet::new(), waits_on: BTreeSet::new(), facts: Facts::default() };
+            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, seen: (0, 0), still: 0, stalled: false, reported: BTreeSet::new(), waits_on: BTreeSet::new() };
             b.executors.insert(id, exec);
             id
         };
@@ -548,7 +542,6 @@ impl Manager {
                     let out = match message {
                         ToManager::Ask { id: ask, bytes, kind, region } => self.ask(id, Waiting { id: ask, bytes, kind, region }),
                         ToManager::Answered => self.answered(id),
-                        ToManager::Facts(facts) => self.facts(id, facts),
                         ToManager::Measured(m) => self.measured(id, m),
                         ToManager::Hello { .. } => Out::default(),
                     };
@@ -619,41 +612,39 @@ impl Manager {
         }
         let backend = open()?;
         let card = self.limit.unwrap_or(self.gpu_memory).min(backend.capacity());
-        let device = Arc::new(Device { card, granularity: backend.granularity().max(1), headroom: backend.headroom(), context: backend.opened_context(), backend });
+        let device = Arc::new(Device { card, granularity: backend.granularity().max(1), headroom: backend.headroom(), backend });
         self.books.lock().device = Some(device.clone());
         Ok(device)
     }
 
-    /// What the manager may create in all: the card (or limit) less the reserved pool H in every
-    /// mode (cr-215), its own context, every other fixed byte and foreign bytes.
-    fn capacity(&self, b: &Books) -> u64 {
-        let Some(d) = &b.device else { return 0 };
-        d.card.saturating_sub(d.headroom + d.context + fixed(b) + b.foreign)
+    /// The driver's free bytes now, read outside the lock between the created counter (read
+    /// before) and the destroyed one (read after): a chunk created during the read counts twice,
+    /// one destroyed during it not at all until the next read, so neither over-grants. `None`
+    /// when there is no device yet or the read failed: then nothing grows.
+    fn read(&self) -> Option<Sample> {
+        let (device, created) = {
+            let b = self.books.lock();
+            (b.device.clone()?, b.created_total)
+        };
+        let free = device.backend.free().ok()?;
+        let destroyed = self.books.lock().destroyed_total;
+        Some(Sample { free, created, destroyed })
     }
 
-    /// TensorD's reading of device bytes no process of ours holds (NVML, or the card less its
-    /// budget on Windows), and whether a new foreign process just crossed its threshold. Every
-    /// reading is also the background-reclaim tick: free under low reclaims cold pages up to
-    /// high (§12), and a new foreign process takes every cold page.
+    /// TensorD's reading of device bytes no process of ours holds (shown only: the driver's free
+    /// bytes already count them), and whether a new foreign process just crossed its threshold.
+    /// Every reading is also the background-reclaim tick: free under low reclaims cold pages up
+    /// to high (§12), a new foreign process takes every cold page.
     pub fn set_foreign(&self, bytes: u64, new_pid: bool) {
-        self.with(|b| {
+        let sample = self.read();
+        let out = {
+            let mut b = self.books.lock();
+            b.sample = sample;
             b.foreign = bytes;
             b.new_foreign = new_pid;
-        });
-    }
-
-    /// A standalone executor's fixed bytes (no lease table: never asked), on each reading.
-    pub fn fixed(&self, pid: u32, bytes: u64) {
-        self.with(|b| {
-            b.fixed.insert(pid, bytes);
-        });
-    }
-
-    /// After `waitpid`: a standalone executor's fixed bytes go.
-    pub fn reap(&self, pid: u32) {
-        self.with(|b| {
-            b.fixed.remove(&pid);
-        });
+            self.settle(&mut b)
+        };
+        self.emit(out);
     }
 
     /// A GPU fault or sticky error: the page cache goes.
@@ -670,27 +661,8 @@ impl Manager {
         self.emit(out);
     }
 
-    /// Changes the books, then settles and reacts.
-    fn with(&self, change: impl FnOnce(&mut Books)) {
-        let out = {
-            let mut b = self.books.lock();
-            change(&mut b);
-            self.settle(&mut b)
-        };
-        self.emit(out);
-    }
-
-    /// An agent's admission facts: its fixed bytes move the capacity.
-    fn facts(&self, exec: u64, facts: Facts) -> Out {
-        let mut b = self.books.lock();
-        if let Some(e) = b.executors.get_mut(&exec) {
-            e.facts = facts;
-        }
-        self.settle(&mut b)
-    }
-
-    /// What an agent measured: a request's peaks under its dispatch's key (the larger stays; the
-    /// compute bytes are the newest), a set's bytes (the larger).
+    /// What an agent measured: a request's peaks under TensorD's dispatch key (the larger stays;
+    /// the compute bytes are the newest), a set's bytes (the larger).
     fn measured(&self, exec: u64, m: Measured) -> Out {
         let mut b = self.books.lock();
         if !b.executors.contains_key(&exec) {
@@ -708,41 +680,32 @@ impl Manager {
         Out::default()
     }
 
-    // ---- Admission and placement (TensorD's): from the agents' facts, standalone pids' fixed
-    // bytes, foreign bytes and the measured peaks.
+    // ---- Admission and placement (TensorD's): its own dispatches and the measured peaks.
 
-    /// The bytes admission counts in: min(limit, card) less H and TensorD's context (before the
-    /// backend opens: the card less its H).
-    fn admittable(&self, b: &Books) -> u64 {
-        match &b.device {
-            Some(d) => d.card.saturating_sub(d.headroom + d.context),
-            None => {
-                let card = self.limit.unwrap_or(self.gpu_memory).min(self.gpu_memory);
-                card.saturating_sub(reserved_pool(card))
-            }
-        }
+    /// The device bytes requests can use: free and every chunk of ours (all of it reclaimable),
+    /// less the reserved pool; 0 until the device was read (a request then waits).
+    fn usable(b: &Books) -> u64 {
+        free(b).map_or(0, |f| (f + b.created).saturating_sub(b.device.as_ref().map_or(0, |d| d.headroom)))
     }
 
-    fn rows(b: &Books) -> Vec<Admitted> {
-        let agents = b.executors.values().map(|e| {
-            let f = &e.facts;
-            Admitted { context: f.context, outside: f.outside, remaining: f.remaining, running: f.running, unmeasured: f.unmeasured, yielded: f.yielded }
-        });
-        agents.chain(b.fixed.values().map(|&context| Admitted { context, ..Admitted::default() })).collect()
+    /// The measured peaks of every dispatched request (`None`: unmeasured).
+    fn dispatched_peaks(b: &Books) -> Vec<Option<u64>> {
+        b.dispatched.values().map(|key| figure(b, "peak", key)).collect()
     }
 
     /// Whether a request of `package` at `shape` (empty: its widest measured shape) can start now
-    /// beside everything running and dispatched ([`decide::fits`]).
-    pub fn fits(&self, package: &str, shape: &str, family: Option<&str>) -> bool {
+    /// beside every request dispatched here ([`decide::fits`]): their measured peaks and its own
+    /// within the usable bytes; anything unmeasured only on an idle GPU. A request that does not
+    /// fit queues before it starts, so two never wait on each other's protected steps.
+    pub fn fits(&self, package: &str, shape: &str) -> bool {
         let b = self.books.lock();
-        let dispatched: Vec<Option<u64>> = b.dispatched.values().map(|key| figure(&b, "peak", key)).collect();
-        decide::fits(self.admittable(&b), b.foreign, &Self::rows(&b), &dispatched, figure(&b, "peak", &format!("{package}|{shape}")), family.map(family_id))
+        decide::fits(Self::usable(&b), 0, &[], &Self::dispatched_peaks(&b), figure(&b, "peak", &format!("{package}|{shape}")), None)
     }
 
     /// A multi-GPU group: dispatches `request` on every GPU of `group` if it fits on all, else
     /// on none.
-    pub fn admit(group: &[&Manager], request: &str, package: &str, shape: &str, family: Option<&str>) -> Result<bool> {
-        if !group.iter().all(|m| m.fits(package, shape, family)) {
+    pub fn admit(group: &[&Manager], request: &str, package: &str, shape: &str) -> Result<bool> {
+        if !group.iter().all(|m| m.fits(package, shape)) {
             return Ok(false);
         }
         for m in group {
@@ -763,29 +726,25 @@ impl Manager {
 
     /// The GPU of `group` (an index) that keeps each set of `package`'s request at `shape`
     /// ([`decide::place`]). A set's bytes are its layout's when the caller has them, else as a
-    /// load measured them on any GPU of the group. Each GPU's room is what admission counts in,
-    /// less foreign bytes and every executor's unmovable bytes (fixed; torch and its running
-    /// sets, at least its running requests' peaks; a yielded parent's working set unless it waits
-    /// for `family`); GPU 0's less the package's measured compute bytes too.
-    pub fn place(group: &[&Manager], package: &str, shape: &str, family: Option<&str>, sets: &[(&str, Option<u64>)]) -> Result<Vec<u32>> {
-        let (family, key) = (family.map(family_id), format!("{package}|{shape}"));
+    /// load measured them on any GPU of the group. Each GPU's room is its usable bytes less its
+    /// dispatched requests' measured peaks; GPU 0's less the package's measured compute bytes
+    /// too.
+    pub fn place(group: &[&Manager], package: &str, shape: &str, sets: &[(&str, Option<u64>)]) -> Result<Vec<u32>> {
+        let key = format!("{package}|{shape}");
         let mut rooms = Vec::with_capacity(group.len());
         for (g, m) in group.iter().enumerate() {
             let b = m.books.lock();
-            let running = |e: &Exec| -> u64 {
-                let held = |(slot, l): (&u32, &Leased)| {
-                    let (class, value) = e.table.class(*slot);
-                    let pinned = e.table.word(*slot).is_some_and(|w| w.pins > 0);
-                    (pinned || !matches!(Advice::decode(class, value), Advice::FreeList { .. } | Advice::Free { .. } | Advice::Idle { .. })).then_some(l.phys.len)
-                };
-                e.leased.iter().filter_map(held).sum()
-            };
-            let unmovable: u64 = b.executors.values().map(|e| e.facts.context + (e.facts.torch + running(e)).max(e.facts.remaining) + decide::yielded_beside(&e.facts.yielded, family)).sum();
+            let running: u64 = Self::dispatched_peaks(&b).into_iter().flatten().sum();
             let working = if g == 0 { figure(&b, "compute", &key).unwrap_or(0) } else { 0 };
-            rooms.push(m.admittable(&b).saturating_sub(b.foreign + unmovable + b.fixed.values().sum::<u64>() + working));
+            rooms.push(Self::usable(&b).saturating_sub(running + working));
         }
         let bytes: Vec<Option<u64>> = sets.iter().map(|(name, known)| known.or_else(|| group.iter().filter_map(|m| figure(&m.books.lock(), "set", name)).max())).collect();
         Ok(decide::place(&rooms, &bytes))
+    }
+
+    /// A request's measured anonymous host peak at `<package>|<shape>`: TensorD's host rule.
+    pub fn host_peak(&self, package: &str, shape: &str) -> Option<u64> {
+        figure(&self.books.lock(), "host", &format!("{package}|{shape}"))
     }
 
     /// The measured peaks, to persist per GPU model.
@@ -820,18 +779,6 @@ impl Manager {
         Ok(())
     }
 
-    /// The processes running requests on this GPU, as TensorD's host rule reads them.
-    pub fn host_calls(&self) -> Option<Vec<HostCall>> {
-        let b = self.books.lock();
-        let calls = b.executors.values().filter(|e| e.facts.running > 0).map(|e| HostCall {
-            pid: e.pid,
-            peak: (e.facts.host_unmeasured == 0).then_some(e.facts.host_peak),
-            anon: host_memory::resident(e.pid).map_or(0, |now| now.anon),
-            running: u64::from(e.facts.running),
-        });
-        Some(calls.collect())
-    }
-
     /// The backend goes once nothing needs it; its drop (a context's destroy) runs unlocked.
     fn idle(b: &mut Books) -> Option<Arc<Device>> {
         (b.created == 0 && b.executors.is_empty()).then(|| b.device.take()).flatten()
@@ -847,7 +794,9 @@ impl Manager {
             }
             return out;
         }
+        let sample = self.read();
         let mut b = self.books.lock();
+        b.sample = sample;
         if let Some(e) = b.executors.get_mut(&exec) {
             e.waiting.push_back(ask);
         }
@@ -858,7 +807,9 @@ impl Manager {
     /// reclaimed, their chunks destroyed; then the waiting asks (their victims picked again).
     fn answered(&self, exec: u64) -> Out {
         let start = Instant::now();
+        let sample = self.read();
         let mut b = self.books.lock();
+        b.sample = sample;
         let mut gone = vec![];
         let mut out = Out::default();
         if let Some(e) = b.executors.get_mut(&exec) {
@@ -897,7 +848,9 @@ impl Manager {
     /// its domain, the rest destroyed.
     fn exited(&self, exec: u64) -> Out {
         let start = Instant::now();
+        let sample = self.read();
         let mut b = self.books.lock();
+        b.sample = sample;
         let Some(e) = b.executors.remove(&exec) else { return Out::default() };
         let (mut gone, mut retained) = (vec![], 0);
         for (slot, l) in e.leased {
@@ -929,6 +882,7 @@ impl Manager {
 
     fn destroy(&self, b: &mut Books, phys: Physical) {
         b.created = b.created.saturating_sub(phys.len);
+        b.destroyed_total += phys.len;
         b.created_chunks = b.created_chunks.saturating_sub(1);
         let Some(d) = &b.device else { return };
         if let Err(error) = d.backend.destroy(phys) {
@@ -955,8 +909,8 @@ impl Manager {
 
     /// The decision's snapshot: the page accounting, every waiting ask in each executor's
     /// order, and the page cache's keys by the index the decision names them.
-    fn snapshot(&self, b: &Books) -> (policy::Snapshot, Vec<policy::Ask>, Vec<Kept>) {
-        let (card, reserved, granularity) = b.device.as_ref().map_or((0, 0, 1), |d| (d.card.saturating_sub(d.context), d.headroom, d.granularity));
+    fn snapshot(&self, b: &Books, free: u64) -> (policy::Snapshot, Vec<policy::Ask>, Vec<Kept>) {
+        let (reserved, granularity) = b.device.as_ref().map_or((0, 1), |d| (d.headroom, d.granularity));
         let cache: Vec<Kept> = b.order.iter().cloned().collect();
         let (mut asks, mut executors) = (vec![], vec![]);
         for (id, e) in &b.executors {
@@ -974,7 +928,7 @@ impl Manager {
             executors.push(policy::Executor { id: *id, chunks: e.leased.iter().filter_map(chunk).collect(), regions: vec![], graphs: vec![], waits_on });
         }
         let page_cache = cache.iter().map(|k| b.retained.get(k).map_or(0, |v| v.values().map(|p| p.len).sum())).collect();
-        let snapshot = policy::Snapshot { card, reserved, fixed: fixed(b), foreign: b.foreign, new_foreign: b.new_foreign, created: b.created, page_cache, executors, host: policy::Host::default() };
+        let snapshot = policy::Snapshot { free, reserved, new_foreign: b.new_foreign, page_cache, executors, host: policy::Host::default() };
         (snapshot, asks, cache)
     }
 
@@ -982,7 +936,10 @@ impl Manager {
     /// left waiting or refused. True when dropped entries freed room at once: another round
     /// allocates it.
     fn settle_once(&self, b: &mut Books, out: &mut Out) -> bool {
-        let (snapshot, asks, cache) = self.snapshot(b);
+        // Unread (no device yet, or the driver's read failed): nothing grows or is reclaimed; the
+        // asks wait for the next read.
+        let Some(free) = free(b) else { return false };
+        let (snapshot, asks, cache) = self.snapshot(b, free);
         b.new_foreign = false;
         let decision = policy::decide(&snapshot, &asks);
         let (mut freed, mut asked) = (false, BTreeMap::<u64, Vec<u32>>::new());
@@ -1072,9 +1029,9 @@ impl Manager {
 
     /// Every table's figures: free bytes, and the cold room reclaim could give that executor.
     fn publish(&self, b: &Books) {
-        let free = self.capacity(b).saturating_sub(b.created);
         let headroom = b.device.as_ref().map_or(0, |d| d.headroom);
-        let (snapshot, _, _) = self.snapshot(b);
+        let (snapshot, _, _) = self.snapshot(b, free(b).unwrap_or(0));
+        let free = room(b);
         for (id, e) in &b.executors {
             e.table.set_figures(Figures { free, revocable: policy::cold(&snapshot, *id), headroom, foreign: b.foreign });
         }
@@ -1093,7 +1050,7 @@ impl Manager {
             b.order.retain(|k| k != key);
             b.retained.remove(key).unwrap_or_default().into_values().collect()
         } else {
-            if b.created + sizes.iter().sum::<u64>() > self.capacity(b) {
+            if sizes.iter().sum::<u64>() > room(b) {
                 return Ok(None);
             }
             let mut made = vec![];
@@ -1107,6 +1064,7 @@ impl Manager {
                 }
             }
             b.created += sizes.iter().sum::<u64>();
+            b.created_total += sizes.iter().sum::<u64>();
             b.created_chunks += sizes.len();
             made
         };

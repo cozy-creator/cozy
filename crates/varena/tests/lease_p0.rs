@@ -28,8 +28,7 @@ mod cases {
     use varena::backend::{Access, Backend, Va};
     use varena::lease::table::{self, Table};
     use varena::lease::wire::{End, ToAgent, ToManager};
-    use varena::lease::{Agent, Attach, Hosting, Identity, Kind, Lease, Manager, Record, Region, PROTOCOL};
-    use varena::ledger::Mode;
+    use varena::lease::{Agent, Attach, Hosting, Identity, Kind, Lease, Manager, Mode, Peak, Record, Region, PROTOCOL};
     use varena::{GpuId, HostBackend};
 
     const MIB: u64 = 1 << 20;
@@ -262,24 +261,24 @@ mod cases {
         assert_eq!(a.call(&take(64, 1)), "ok 1 fresh verified");
         assert_eq!(a.call(&format!("{} unlanded", take(32, 8))), "ok 1 fresh verified");
         assert_eq!(a.call(&take(32, 9)), "ok 1 fresh verified");
-        t.until(|h| n(h, "leased") == 128 * MIB);
+        t.until(|h| n(h, "allocated") == 128 * MIB);
         check_books(&mut t, &[&a, &b], table, "after grants");
         b.send(&take(160, 2));
         a.wait_rang();
         assert_eq!(a.call("revokes"), "released 1");
         assert_eq!(b.answer(), "ok 1 fresh verified");
-        t.until(|h| n(h, "leased") == 224 * MIB);
+        t.until(|h| n(h, "allocated") == 224 * MIB);
         check_books(&mut t, &[&a, &b], table, "after a revoke");
         a.kill();
         let h = t.until(|h| executors(h) == 1);
-        assert_eq!((n(&h, "retained"), n(&h, "created")), (32 * MIB, 192 * MIB), "landed chunks retained, the unlanded destroyed: {h}");
+        assert_eq!((n(&h, "page_cache"), n(&h, "created")), (32 * MIB, 192 * MIB), "landed chunks retained, the unlanded destroyed: {h}");
         check_books(&mut t, &[&b], table, "after an exit");
         b.kill();
-        t.until(|h| executors(h) == 0 && n(h, "retained") == 192 * MIB);
+        t.until(|h| executors(h) == 0 && n(h, "page_cache") == 192 * MIB);
         check_books(&mut t, &[], table, "with only retained chunks");
         let mut c = agent(&mut t, "d");
         assert_eq!(c.call(&take(160, 2)), "ok 1 adopted verified");
-        let h = t.until(|h| n(h, "leased") == 160 * MIB);
+        let h = t.until(|h| n(h, "allocated") == 160 * MIB);
         assert_eq!(n(&h, "created"), 192 * MIB, "adopted with no new chunk");
         check_books(&mut t, &[&c], table, "after an adoption");
     }
@@ -291,7 +290,7 @@ mod cases {
         let mut a = agent(&mut t, "d");
         assert_eq!(a.call(&take(64, 1)), "ok 1 fresh verified");
         a.kill();
-        t.until(|h| n(h, "retained") == 64 * MIB);
+        t.until(|h| n(h, "page_cache") == 64 * MIB);
         let mut b = agent(&mut t, "d");
         assert_eq!(b.call(&take(32, 2)), "ok 1 fresh verified");
     }
@@ -369,11 +368,11 @@ mod cases {
         assert_eq!(r.call(&format!("ask 3 {}", 32 * MIB)), "sent");
         let (third, _) = grants(&mut r, 1)[0];
         let h = t.holdings();
-        assert_eq!((n(&h, "leased"), third != slot), (64 * MIB, true), "a stale release reclaimed a live grant: {h}");
+        assert_eq!((n(&h, "allocated"), third != slot), (64 * MIB, true), "a stale release reclaimed a live grant: {h}");
         assert_eq!(r.call(&format!("forge word {slot} mapped 0 {seq}")), "ok");
         // The lie: released by the table, still mapped by the executor.
         assert_eq!(r.call(&format!("release {slot} {seq} keep")), "ok");
-        t.until(|h| n(h, "leased") == 32 * MIB);
+        t.until(|h| n(h, "allocated") == 32 * MIB);
         let (used, books, overhead) = books(&mut t, &[&r], table);
         assert_eq!(used - books - overhead, 32 * MIB, "NVML shows the lie as the bytes kept");
         assert_eq!(r.call(&format!("read {slot} 4 0")), "verified", "the liar's page is its own still");
@@ -392,14 +391,14 @@ mod cases {
         let mut a = agent(&mut t, "pub/a@1");
         assert_eq!(a.call(&take(80, 7)), "ok 1 fresh verified");
         a.kill();
-        t.until(|h| executors(h) == 0 && n(h, "retained") == 80 * MIB);
+        t.until(|h| executors(h) == 0 && n(h, "page_cache") == 80 * MIB);
         let mut b = agent(&mut t, "pub/b@1");
         assert_eq!(b.call(&take(80, 7)), "ok 1 fresh verified", "adopted across trust domains");
-        let h = t.until(|h| n(h, "leased") == 80 * MIB);
-        assert_eq!((n(&h, "retained"), n(&h, "created")), (80 * MIB, 160 * MIB));
+        let h = t.until(|h| n(h, "allocated") == 80 * MIB);
+        assert_eq!((n(&h, "page_cache"), n(&h, "created")), (80 * MIB, 160 * MIB));
         let mut c = agent(&mut t, "pub/a@1");
         assert_eq!(c.call(&take(80, 7)), "ok 1 adopted verified");
-        t.until(|h| n(h, "retained") == 0 && n(h, "created") == 160 * MIB);
+        t.until(|h| n(h, "page_cache") == 0 && n(h, "created") == 160 * MIB);
         let mut r = raw(&mut t, Some("pub/z@1"));
         assert!(r.call(&format!("hello {PROTOCOL}")).starts_with("welcome"));
         assert_eq!(r.call(&format!("ask 1 {} 9", 64 * MIB)), "sent");
@@ -409,7 +408,7 @@ mod cases {
         assert_eq!(r.call(&format!("landed {slot}")), "ok");
         assert_eq!(r.call(&format!("forge index {slot} 1")), "ok");
         r.kill();
-        t.until(|h| n(h, "retained") == 64 * MIB);
+        t.until(|h| n(h, "page_cache") == 64 * MIB);
         let mut d = agent(&mut t, "pub/z@1");
         assert_eq!(d.call(&take(64, 9)), "ok 1 adopted verified");
     }
@@ -457,7 +456,7 @@ mod cases {
         assert_eq!(r.call(&format!("truncate {slot}")), "refused");
         assert_eq!(r.call(&format!("seals {slot}")).parse::<i32>().unwrap() & resize, resize);
         r.kill();
-        t.until(|h| n(h, "retained") == 32 * MIB);
+        t.until(|h| n(h, "page_cache") == 32 * MIB);
         let mut c = agent(&mut t, "d");
         assert_eq!(c.call(&take(32, 11)), "ok 1 adopted verified");
     }
@@ -533,6 +532,28 @@ mod cases {
         assert_eq!(b.answer(), "ok 1 fresh verified");
     }
 
+    /// Two co-resident requests each short only of the other's protected current step would
+    /// both be refused and neither progress (§12 memory.min). Admission prevents it from
+    /// TensorD's own dispatches and measured peaks: a request whose peak does not fit beside a
+    /// running one's stays queued (not refused) until that one ends, and then runs, reclaiming the
+    /// idle set left behind.
+    fn admission_queues_a_step_that_would_not_fit_beside_a_running_one(dir: &Path) {
+        let mut t = Tensord::start(dir, 64 * MIB);
+        assert_eq!(t.p.call(&format!("restore sdxl|1024 {}", 40 * MIB)), "ok");
+        assert_eq!(t.p.call(&format!("restore klein|1024 {}", 40 * MIB)), "ok");
+        let (mut a, mut b) = (agent(&mut t, "d"), agent(&mut t, "d"));
+        assert_eq!(t.p.call("fits klein 1024"), "true", "an idle GPU admits anything");
+        assert_eq!(t.p.call("dispatch r1 sdxl 1024"), "ok");
+        assert_eq!(a.call(&take(40, 1)), "ok 1 fresh verified");
+        assert_eq!(t.p.call("fits klein 1024"), "false", "a 40 MiB peak admitted beside a running 40 MiB one on 64 MiB");
+        assert_eq!(t.p.call("undispatch r1"), "ok");
+        assert_eq!(t.p.call("fits klein 1024"), "true", "still queued once the running request ended");
+        b.send(&take(40, 2));
+        a.wait_rang();
+        assert_eq!(a.call("revokes"), "released 1");
+        assert_eq!(b.answer(), "ok 1 fresh verified");
+    }
+
     /// A stall names the peer's own pid (its credentials), never the pid its table claims.
     fn a_stall_names_the_peer_not_its_table(dir: &Path) {
         let mut t = Tensord::start(dir, 64 * MIB);
@@ -571,7 +592,7 @@ mod cases {
             assert_eq!(r.call(&format!("landed {slot}")), "ok");
             g.push((slot, seq));
         }
-        t.until(|h| n(h, "leased") == 64 * MIB);
+        t.until(|h| n(h, "allocated") == 64 * MIB);
         t.p.kill();
         // The pages outlive their creator: the executor's imports hold them.
         for ((slot, _), region) in g.iter().zip(regions) {
@@ -597,7 +618,7 @@ mod cases {
         check_books(&mut t, &[&r, &b], table, "after a books-only release");
         r.kill();
         let h = t.until(|h| executors(h) == 1);
-        assert_eq!((n(&h, "books_only"), n(&h, "retained")), (0, 0), "a books-only chunk is never retained: {h}");
+        assert_eq!((n(&h, "books_only"), n(&h, "page_cache")), (0, 0), "a books-only chunk is never retained: {h}");
     }
 
     type Case = (&'static str, fn(&Path));
@@ -614,6 +635,7 @@ mod cases {
         ("a_stall_is_judged_on_the_looks_cadence", a_stall_is_judged_on_the_looks_cadence),
         ("a_fence_whose_epoch_moves_is_never_a_stall", a_fence_whose_epoch_moves_is_never_a_stall),
         ("a_pinned_ask_is_never_a_stall", a_pinned_ask_is_never_a_stall),
+        ("admission_queues_a_step_that_would_not_fit_beside_a_running_one", admission_queues_a_step_that_would_not_fit_beside_a_running_one),
         ("a_stall_names_the_peer_not_its_table", a_stall_names_the_peer_not_its_table),
         ("a_tensord_restart_rebuilds_the_books_from_the_agents", a_tensord_restart_rebuilds_the_books_from_the_agents),
     ];
@@ -704,7 +726,7 @@ mod cases {
         // The card is twice the manager's limit (a --gpu-memory-limit): a books error shows in
         // NVML, not as the device's own out-of-memory.
         let open = Box::new(move || Ok(Arc::new(HostBackend::new(capacity * 2)) as Arc<dyn Backend>));
-        let manager = Manager::create(&gpu, Some(capacity), Mode::Dedicated, open, listener, admitted.clone()).unwrap();
+        let manager = Manager::create(&gpu, Some(capacity), Mode::Dedicated, Some(open), listener, admitted.clone()).unwrap();
         varena::os::remove_table(&gpu.uuid);
         serve(Some("ready"), |words| match words {
             ["admit", pid, domain] => {
@@ -712,6 +734,19 @@ mod cases {
                 "ok".into()
             }
             ["holdings"] => serde_json::to_string(&manager.holdings()).unwrap(),
+            ["fits", package, shape] => manager.fits(package, shape).to_string(),
+            ["dispatch", request, package, shape] => {
+                manager.dispatch(request, package, shape).unwrap();
+                "ok".into()
+            }
+            ["undispatch", request] => {
+                manager.undispatch(request);
+                "ok".into()
+            }
+            ["restore", key, bytes] => {
+                manager.restore(&[Peak::Request { key: key.to_string(), bytes: bytes.parse().unwrap() }]).unwrap();
+                "ok".into()
+            }
             ["stalled"] => serde_json::to_string(&manager.stalled()).unwrap(),
             ["records"] => serde_json::to_string(&*admitted.records.lock()).unwrap(),
             _ => format!("unknown {words:?}"),
