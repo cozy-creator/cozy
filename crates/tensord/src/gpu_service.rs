@@ -897,7 +897,7 @@ impl Pool {
         if let Err(error) = session.executor.shutdown() {
             tracing::warn!("ending idle deviceless executor of {plan}: {error}");
         }
-        self.ended(&plan, start, 0);
+        self.ended(&plan, start);
         true
     }
     /// End idle executor `key` and observe its exit: what it held goes back. Whether it was idle.
@@ -910,7 +910,7 @@ impl Pool {
         if let Err(error) = session.executor.shutdown() {
             tracing::warn!("memory: ending idle executor {key}: {error}");
         }
-        self.ended(&plan, start, degree);
+        self.ended(&plan, start);
         true
     }
     /// A process the ledger names stalled (asked for bytes, its progress still): it ends now.
@@ -932,11 +932,11 @@ impl Pool {
             }
         };
         if let Some(session) = idle {
-            let (degree, executor) = (session.degree, session.executor);
+            let executor = session.executor;
             if let Err(error) = executor.terminate() {
                 tracing::warn!("memory: ending stalled executor {key}: {error}");
             }
-            self.ended(&plan, start, degree);
+            self.ended(&plan, start);
         }
     }
     pub fn memo(&self) -> &crate::memo::Memo {
@@ -998,16 +998,16 @@ impl Pool {
     }
     /// `plan`'s executor on the lane from `start` is gone, its processes with it: once their
     /// exits are proven, each GPU of the lane reaps their rows.
-    fn ended(&self, plan: &str, start: usize, degree: u32) {
+    fn ended(&self, plan: &str, start: usize) {
         let mut births: Vec<Birth> = self.leaders.lock().unwrap().values()
             .filter(|(_, p, s)| p.as_str() == plan && *s == start).map(|(birth, _, _)| birth.clone()).collect();
         births.extend(self.tenants.lock().unwrap().values()
             .filter(|t| t.plan == plan && t.start == start).map(|t| t.exact.birth().clone()));
-        self.retire(plan, start, degree, &births);
+        self.retire(plan, start, &births);
     }
     /// Retire only proven exited incarnations. Another same-plan/lane session may already
     /// be running or cached; neither its row nor its most recent measured level is ours.
-    fn retire(&self, plan: &str, start: usize, degree: u32, births: &[Birth]) {
+    fn retire(&self, plan: &str, start: usize, births: &[Birth]) {
         let gone: std::collections::HashSet<&Birth> = births.iter()
             .filter(|birth| birth.ended().unwrap_or(false)).collect();
         if gone.is_empty() {
@@ -1229,9 +1229,9 @@ impl Pool {
             }
             drop(idle);
             let births = executor_births(&session.executor.birth, &session.followers);
-            let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+            let (plan, start) = (session.plan.clone(), session.start);
             session.executor.shutdown()?;
-            self.retire_returned(&plan, start, degree, &births);
+            self.retire_returned(&plan, start, &births);
             return Ok(Disposition::ProvenEnded(births));
         }
         let mut session = session;
@@ -1239,21 +1239,21 @@ impl Pool {
             let mut sessions = self.sessions.lock().unwrap();
             if self.stopped.load(Ordering::Acquire) {
                 drop(sessions);
-                let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+                let (plan, start) = (session.plan.clone(), session.start);
                 let births = executor_births(&session.executor.birth, &session.followers);
                 session.executor.shutdown()?;
-                self.retire_returned(&plan, start, degree, &births);
+                self.retire_returned(&plan, start, &births);
                 return Ok(Disposition::ProvenEnded(births));
             }
             if let Some(replaced) = sessions.remove(&key) {
                 drop(sessions);
                 let births = executor_births(&replaced.executor.birth, &replaced.followers);
-                let (plan, start, degree) = (replaced.plan.clone(), replaced.start, replaced.degree);
+                let (plan, start) = (replaced.plan.clone(), replaced.start);
                 if let Err(error) = replaced.executor.shutdown() {
                     tracing::warn!("ending replaced executor {key}: {error}");
                 }
                 await_executor_exit(engine, &births);
-                self.retire_returned(&plan, start, degree, &births);
+                self.retire_returned(&plan, start, &births);
                 continue;
             }
             session.used = Instant::now();
@@ -1265,19 +1265,19 @@ impl Pool {
             return Ok(Disposition::Cached);
         }
     }
-    fn retire_returned(&self, plan: &str, start: usize, degree: u32, births: &[Birth]) {
-        self.retire(plan, start, degree, births);
+    fn retire_returned(&self, plan: &str, start: usize, births: &[Birth]) {
+        self.retire(plan, start, births);
     }
 
     /// Complete the old call's bookkeeping before publishing, using its explicit return fact.
     /// In particular a Cached executor may already be running for another family member.
     fn finish_returned(
-        &self, engine: &Arc<Engine>, id: &str, plan: &str, start: usize, degree: u32,
+        &self, engine: &Arc<Engine>, id: &str, plan: &str, start: usize,
         disposition: &Disposition,
     ) -> io::Result<()> {
         match disposition {
             Disposition::Cached => (),
-            Disposition::ProvenEnded(births) => self.retire_returned(plan, start, degree, births),
+            Disposition::ProvenEnded(births) => self.retire_returned(plan, start, births),
             Disposition::Unknown(owned) => {
                 // Registration may have failed before persisting these owned processes.
                 // A second journal error cannot authorize releasing their live lane.
@@ -1292,7 +1292,7 @@ impl Pool {
                     }
                 }
                 await_executor_exit(engine, &births);
-                self.retire_returned(plan, start, degree, &births);
+                self.retire_returned(plan, start, &births);
                 record?;
             }
         }
@@ -1356,15 +1356,12 @@ impl Pool {
         };
         for session in gone {
             let births = executor_births(&session.executor.birth, &session.followers);
-            self.retire_returned(&session.plan, session.start, session.degree, &births);
+            self.retire_returned(&session.plan, session.start, &births);
         }
         let gone: Vec<_> = self.tenants.lock().unwrap().values().filter(|t| t.exact.ended())
             .map(|t| (t.plan.clone(), t.start, t.exact.birth().clone())).collect();
         for (plan, start, birth) in gone {
-            // A vanished uncached group may have occupied any later GPU; sampling does not
-            // release a row until its exact owner and driver charge have both gone.
-            let width = self.devices.len().saturating_sub(start) as u32;
-            self.retire_returned(&plan, start, width, &[birth]);
+            self.retire_returned(&plan, start, &[birth]);
         }
     }
     /// A call's degree as its declaration and this machine set it: 0 for `accelerator=False`
@@ -1939,18 +1936,18 @@ impl Pool {
             Err(error) => {
                 let births = born.into_inner().unwrap();
                 await_executor_exit(engine, &births);
-                self.retire_returned(&plan.construction, start, plan.degree, &births);
+                self.retire_returned(&plan.construction, start, &births);
                 return Err(error);
             }
         };
-        let (key, degree) = (plan.construction.clone(), plan.degree);
+        let key = plan.construction.clone();
         let result = self.call(engine, "", held, plan, &mut session, true, None, fetch);
         match result {
             Ok(_) => {
                 let births = executor_births(&session.executor.birth, &session.followers);
                 if let Err(error) = self.keep_idle(engine, session) {
                     await_executor_exit(engine, &births);
-                    self.retire_returned(&key, start, degree, &births);
+                    self.retire_returned(&key, start, &births);
                     return Err(error);
                 }
                 Ok("loaded")
@@ -1959,7 +1956,7 @@ impl Pool {
                 let births = executor_births(&session.executor.birth, &session.followers);
                 let error = ended_with(engine, "", error, session.executor);
                 await_executor_exit(engine, &births);
-                self.retire_returned(&key, start, degree, &births);
+                self.retire_returned(&key, start, &births);
                 Err(error)
             }
         }
@@ -1973,9 +1970,9 @@ impl Pool {
         };
         let deviceless = std::mem::take(&mut *self.deviceless.lock().unwrap());
         for session in sessions.into_values().chain(deviceless) {
-            let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+            let (plan, start) = (session.plan.clone(), session.start);
             session.executor.shutdown()?;
-            self.ended(&plan, start, degree);
+            self.ended(&plan, start);
         }
         for zygote in std::mem::take(&mut *self.zygotes.lock().unwrap()).into_values() {
             if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
@@ -2328,10 +2325,10 @@ impl Pool {
         start: usize,
         calls: Option<&Arc<crate::calls::Calls>>,
     ) -> io::Result<()> {
-        let (key, degree) = (plan.construction.clone(), plan.degree);
+        let key = plan.construction.clone();
         let mut disposition = Disposition::default();
         let result = self.run_on(engine, id, held, plan, start, calls, &mut disposition);
-        self.finish_returned(engine, id, &key, start, degree, &disposition)?;
+        self.finish_returned(engine, id, &key, start, &disposition)?;
         result
     }
 
@@ -2452,7 +2449,7 @@ impl Pool {
         }
         tracing::warn!("execution {id}: {error}; starting it on a fresh executor");
         if let Disposition::Unknown(births) = disposition {
-            self.retire_returned(&fresh.construction, start, fresh.degree, births);
+            self.retire_returned(&fresh.construction, start, births);
         }
         if !engine.redeliver(id)? {
             return Ok(()); // canceled meanwhile
@@ -3875,7 +3872,7 @@ mod tests {
             assert!(engine.get(&id)?.pending_completion.is_none());
             ready.send(()).unwrap();
             proceed.recv().unwrap();
-            serving.finish_returned(&engine, &id, "replica", 0, 1,
+            serving.finish_returned(&engine, &id, "replica", 0,
                 &Disposition::Unknown(vec![owned.clone()]))?;
             let preserved = owned.ended()? && !survivor.ended()?
                 && serving.tenants.lock().unwrap().get(&survivor.pid).is_some_and(|t| t.exact.birth() == &survivor)
@@ -3887,15 +3884,15 @@ mod tests {
         registered.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
         // No cache entry: the sibling already took it. Live and PID-reused identities cannot retire it.
         assert!(pool.sessions.lock().unwrap().is_empty());
-        pool.retire_returned(&model.construction, 0, 1, std::slice::from_ref(&live.birth));
+        pool.retire_returned(&model.construction, 0, std::slice::from_ref(&live.birth));
         let mut stale = live.birth.clone();
         stale.start_ticks = stale.start_ticks.wrapping_add(1);
         assert!(!owns_birth(&live.birth, &[], &stale), "a reused PID is not this owner");
-        pool.retire_returned(&model.construction, 0, 1, &[stale]);
+        pool.retire_returned(&model.construction, 0, &[stale]);
         assert_eq!(pool.tenants.lock().unwrap().len(), 2);
         drop(old.child.stdin.take());
         assert!(old.child.wait().unwrap().success());
-        pool.retire_returned(&model.construction, 0, 1, std::slice::from_ref(&old.birth));
+        pool.retire_returned(&model.construction, 0, std::slice::from_ref(&old.birth));
         assert!(!pool.tenants.lock().unwrap().contains_key(&old.birth.pid));
         assert!(pool.tenants.lock().unwrap().get(&live.birth.pid).is_some_and(|t| t.exact.birth() == &live.birth));
         assert_eq!(pool.hosting(&model.construction), [0]);
@@ -3905,7 +3902,7 @@ mod tests {
         assert!(finished.recv_timeout(std::time::Duration::from_secs(30)).unwrap());
         assert_eq!(pool.level(&model.construction), Some(Level::Gpu));
         drop((first, second, old, live));
-        pool.ended(&model.construction, 0, 1);
+        pool.ended(&model.construction, 0);
         assert!(pool.hosting(&model.construction).is_empty());
         pool.stop().unwrap();
         drop((pool, engine));
@@ -3931,7 +3928,7 @@ mod tests {
         let expected = engine.get(&id).unwrap_err();
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
-        let error = pool.finish_returned(&engine, &id, "unreadable", 0, 1,
+        let error = pool.finish_returned(&engine, &id, "unreadable", 0,
             &Disposition::Unknown(vec![birth.clone()])).unwrap_err();
         assert_eq!(error.to_string(), expected.to_string());
         assert!(!pool.tenants.lock().unwrap().contains_key(&birth.pid));
@@ -3984,7 +3981,7 @@ mod tests {
                     })
                 };
                 engine.defer_completion(&id, outcome, vec![owned_birth.clone()])?;
-                let result = serving.finish_returned(&engine, &id, &model.construction, 0, 1, &Disposition::Cached);
+                let result = serving.finish_returned(&engine, &id, &model.construction, 0, &Disposition::Cached);
                 let preserved = result.is_err() == reject_finish
                     && !owned_birth.ended()?
                     && serving.leaders.lock().unwrap().get(&owned_birth.pid).is_some_and(|(birth, _, _)| birth == &owned_birth)
@@ -4006,7 +4003,7 @@ mod tests {
             let proof = finished.recv_timeout(std::time::Duration::from_secs(30));
             drop(child.stdin.take());
             child.wait().unwrap();
-            pool.retire_returned("handoff", 0, 1, &[birth]);
+            pool.retire_returned("handoff", 0, &[birth]);
             assert!(proof.unwrap(), "the old call retired a borrowed live executor");
         }
         pool.stop().unwrap();
@@ -4086,9 +4083,9 @@ mod tests {
         let binding = Binding { model_binding_path: "e.models.m".into(), release: "p@1".into(), ..Default::default() };
         let mut group = plan("film", 2);
         group.slots = vec![PlanSlot { binding, lane: String::new(), precision: String::new(), selected_encoded_bytes: 0, on_demand: false, placeable: vec!["te".into()] }];
-        let homes = pool.homes(&group, pool.lane(0, 2).unwrap(), None);
+        let homes = pool.homes(&group, pool.lane(0, 2).unwrap());
         assert_eq!(homes, BTreeMap::from([("e.models.m".to_string(), BTreeMap::from([("te".to_string(), 0)]))]));
-        assert!(pool.homes(&group, pool.lane(0, 1).unwrap(), None).is_empty());
+        assert!(pool.homes(&group, pool.lane(0, 1).unwrap()).is_empty());
         pool.stop().unwrap();
         crate::scratch::remove(&root);
     }
@@ -4397,8 +4394,8 @@ mod tests {
 
     /// An executor stand-in for the stall rule: it dials the GPU's manager (its control socket at
     /// stdin) and answers one line per command: `take <MiB>` (weights chunks, imported, mapped and
-    /// landed, then idle) and `answering` (from now on every reclaim request is answered: the
-    /// asked chunks are unmapped and released).
+    /// landed, then idle), `keep <MiB>` (the same, pinned: never reclaimed) and `answering` (from
+    /// now on every reclaim request is answered: the asked chunks are unmapped and released).
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "the stall-rule test runs it as an executor"]
@@ -4439,11 +4436,14 @@ mod tests {
         let (mut out, lines) = (control.try_clone().unwrap(), std::io::BufReader::new(control).lines());
         for line in lines.map_while(Result::ok) {
             let reply = match line.split(' ').collect::<Vec<_>>()[..] {
-                ["take", mib] => {
+                [verb @ ("take" | "keep"), mib] => {
                     let leases = attached.take(mib.parse::<u64>().unwrap() * MIB, Kind::Weights, None).unwrap();
                     let tickets: Vec<_> = leases.iter().map(|lease| lease.ticket).collect();
                     attached.mapped(&tickets).unwrap();
                     tickets.iter().for_each(|ticket| attached.landed(*ticket).unwrap());
+                    if verb == "keep" {
+                        tickets.iter().for_each(|ticket| assert!(attached.pin(*ticket).unwrap()));
+                    }
                     held.lock().unwrap().extend(leases);
                     format!("took {} MiB", leases_bytes(&held.lock().unwrap()) / MIB)
                 }
@@ -4517,11 +4517,11 @@ mod tests {
         assert!(varena::os::namespace(&prefix), "the test binary's namespace");
         let root = std::env::temp_dir().join(format!("gpu-stall-{}", uuid::Uuid::new_v4()));
         let uuid = format!("GPU-stall-{}", uuid::Uuid::new_v4());
-        // 1 GiB: the reserved pool's 512 MiB leave 512 MiB to allocate.
+        // Host pages keep no reserved pool: 512 MiB to allocate.
         let config: GpuConfig = serde_json::from_value(json!({"devices": "0", "prespawn": false,
             "inventory": [{"device_index": 0, "device_name": "host", "device_uuid": uuid, "driver_version": "", "memory_bytes": 1u64 << 30, "pci_bus_id": ""}]})).unwrap();
         let store = crate::storage::open(&root.join("store")).unwrap();
-        let host = |_: &str, _: &MemoryLog| Some(Box::new(|| Ok(Arc::new(varena::HostBackend::new(1 << 30)) as Arc<dyn varena::Backend>)) as varena::lease::Opener);
+        let host = |_: &str, _: &MemoryLog| Some(Box::new(|| Ok(Arc::new(varena::HostBackend::new(512 * MIB)) as Arc<dyn varena::Backend>)) as varena::lease::Opener);
         let pool = Pool::with_chunks(&root.join("gpu"), config, store.clone(), host).unwrap();
         let mut holder = StallStandIn::spawn(&prefix, &pool, &uuid);
         assert_eq!(holder.ask("take 320"), "took 320 MiB");
@@ -4530,7 +4530,7 @@ mod tests {
             .lines().any(|line| line.contains("\"end_stalled\"") && line.contains(&format!("\"pid\":{pid}")));
         // Answering: the asker's allocation needs the holder's idle chunks, asks, and gets them.
         assert_eq!(holder.ask("answering"), "answering");
-        assert_eq!(asker.ask("take 256"), "took 256 MiB");
+        assert_eq!(asker.ask("keep 256"), "took 256 MiB");
         assert!(holder.child.try_wait().unwrap().is_none() && !ended(holder.child.id()), "an answering executor is never ended");
         assert_eq!(holder.ask("take 192"), "took 192 MiB", "its chunk went back; it takes again");
         // Stopped with a reclaim request out to it: the pool ends it, and the allocation is made.
@@ -4544,7 +4544,7 @@ mod tests {
         let (took, taking) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             let asker = &mut asker;
-            scope.spawn(move || took.send(asker.ask("take 192")).unwrap());
+            scope.spawn(move || took.send(asker.ask("keep 192")).unwrap());
             // A failure backstop only: the allocation is made once the pool has ended the holder.
             let reply = taking.recv_timeout(std::time::Duration::from_secs(60));
             if reply.is_err() {

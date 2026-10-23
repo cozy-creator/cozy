@@ -221,7 +221,7 @@ fn futile() {
         assert_eq!(n.ask(&format!("hold {MIB}")).as_deref(), Some("held"));
     }
     let killed = event(&cgroup, "oom_kill");
-    let call = Agent::spawn("child");
+    let mut call = Agent::spawn("child");
     running(&call, &calls);
     let mut ended = 0;
     let mut grew = true;

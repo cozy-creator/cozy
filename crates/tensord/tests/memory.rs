@@ -459,9 +459,9 @@ fn the_events_thread_wakes_on_a_managers_event_and_ends_with_its_pool() {
     assert!(wakes.recv().is_err(), "the thread ended with its pool");
 }
 
-/// TensorD names the GPU of a 2-GPU group that keeps a placeable set: beside GPU 0's executor's
-/// chunks the set has no room there and goes to GPU 1; with GPU 0 free it stays on GPU 0. Its
-/// bytes are what a load measured on the group.
+/// TensorD names the GPU of a 2-GPU group that keeps a placeable set: beside a request running on
+/// GPU 0 (its measured peak) the set has no room there and goes to GPU 1; once that request ends
+/// it stays on GPU 0. Its bytes are what a load measured on the group.
 #[test]
 fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
     let dir = tempfile::tempdir().unwrap();
@@ -471,14 +471,21 @@ fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
     let set = "s5/package@1/unet";
     gpu1.manager.restore(&[Peak::Set { key: set.into(), bytes: 3 * GIB }]).unwrap();
     let homes = || memory::homes(&[&*gpu0.manager, &*gpu1.manager], PACKAGE, BIG, &[set], &log);
+    // An executor on each GPU: its first allocation opens the GPU's chunks and their reading.
+    let executors: Vec<StandIn> = [&id0, &id1].iter().map(|id| {
+        let mut executor = StandIn::tenant(&id.uuid, &tenants, "plan-a", "gen-a");
+        assert_eq!(executor.ask("attach"), "attached");
+        assert_eq!(executor.ask("take 2 9"), "1 0");
+        executor
+    }).collect();
+    eventually("both GPUs read their free bytes", || [&gpu0, &gpu1].iter().all(|gpu| gpu.manager.holdings().free > 0));
     assert_eq!(homes(), vec![0], "GPU 0 has room");
-    let mut a = StandIn::tenant(&id0.uuid, &tenants, "plan-a", "gen-a");
-    assert_eq!(a.ask("attach"), "attached");
-    assert_eq!(a.ask(&format!("take {} 7", 6 * 1024)), "1 0");
-    assert_eq!(homes(), vec![1], "beside its chunks it has none");
-    a.kill();
-    eventually("its chunks go with it", || gpu0.manager.holdings().created == 0);
+    gpu0.manager.restore(&[Peak::Request { key: "s5/other@1|8".into(), bytes: 6 * GIB }]).unwrap();
+    gpu0.manager.dispatch("running", "s5/other@1", "8").unwrap();
+    assert_eq!(homes(), vec![1], "beside the running request it has none");
+    gpu0.manager.undispatch("running");
     assert_eq!(homes(), vec![0], "its room is back");
+    drop(executors);
 }
 
 /// A GPU TensorD cannot create chunks on has a chunk-less manager: its executors are refused as
