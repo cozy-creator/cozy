@@ -66,6 +66,18 @@ pub enum ToManager {
     Answered,
     Region(RegionFacts),
     RegionGone { id: u64 },
+    /// What it measured: a request's peaks at its end, a set's bytes at its load.
+    Measured(Measured),
+}
+
+/// What an agent measured.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Measured {
+    /// A request's peaks at its end (keyed by its dispatch): its working set, its bytes beside its
+    /// weights, its anonymous host high-water.
+    Request { request: String, working: u64, compute: u64, host: u64 },
+    /// A set's resident bytes, at its load.
+    Set { name: String, bytes: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
