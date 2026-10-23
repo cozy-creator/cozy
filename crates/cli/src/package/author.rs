@@ -823,9 +823,10 @@ fn unmet(error: Error, pins: &BTreeMap<String, String>, account: &str, hub: &Hub
     }
 }
 
-/// The interface Runtime's static describer reads from the staged source, each model default with
-/// no org written as the root's (`sdxl@1.0.0` is `_/sdxl@1.0.0`, xs-071); refused when installs
-/// could not read it.
+/// The interface Runtime's static describer reads from the staged source, as it reads it; refused
+/// when installs could not read it. A model default with no org stays as written: it names a
+/// first-party model (a machine reads `sdxl@1.0.0` as `_/sdxl@1.0.0`), and the Runtime's interface
+/// parser refuses an org of `_`.
 fn describe(stage: &Stage, python: &Python, runtime: Option<&String>) -> Result<Vec<u8>, Error> {
     let from = match runtime {
         Some(version) => format!("cozy-runtime=={version}"),
@@ -847,29 +848,7 @@ fn describe(stage: &Stage, python: &Python, runtime: Option<&String>) -> Result<
             .arg("describe"),
         "describe_failed",
     )?;
-    let mut interface: Value =
-        serde_json::from_str(&said).map_err(|e| refuse("describe_failed", e))?;
-    let mut qualified = false;
-    // `get_mut`, not indexing: indexing a missing key would write a null into the document.
-    let callables = interface
-        .get_mut("entrypoints")
-        .and_then(Value::as_array_mut);
-    for callable in callables.into_iter().flatten() {
-        let slots = callable.get_mut("models").and_then(Value::as_array_mut);
-        for slot in slots.into_iter().flatten() {
-            let Some(default) = slot.get("default").and_then(Value::as_str) else {
-                continue;
-            };
-            if default
-                .split_once('@')
-                .is_some_and(|(model, _)| !model.contains('/'))
-            {
-                let named = format!("{}/{default}", protocol::names::ROOT);
-                slot["default"] = named.into();
-                qualified = true;
-            }
-        }
-    }
+    let interface: Value = serde_json::from_str(&said).map_err(|e| refuse("describe_failed", e))?;
     let readable = crate::run::interface::Interface::parse(&interface).map_err(|why| {
         refuse(
             "package_interface_invalid",
@@ -882,10 +861,7 @@ fn describe(stage: &Stage, python: &Python, runtime: Option<&String>) -> Result<
             format!("installs could not call {callable}: {why}"),
         ));
     }
-    Ok(match qualified {
-        true => serde_json::to_vec(&interface).map_err(|e| refuse("describe_failed", e))?,
-        false => said.trim_end().as_bytes().to_vec(),
-    })
+    Ok(said.trim_end().as_bytes().to_vec())
 }
 
 /// Sends each file the Hub does not hold to its grant, once per digest, sixteen at once; the bytes
