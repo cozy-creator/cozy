@@ -260,9 +260,6 @@ impl Req {
 /// One process's facts on one device.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Table {
-    /// The standalone budget: the device's free bytes at open less its reserve (unused while
-    /// leased).
-    pub limit: u64,
     /// Indexed by set id; `None` once unloaded.
     pub sets: Vec<Option<Set>>,
     pub requests: Vec<Req>,

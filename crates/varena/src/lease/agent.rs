@@ -14,6 +14,7 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::{Condvar, Mutex};
 use platform::process::Birth;
 
+use super::policy::Advice;
 use super::table::{State, Table};
 use super::wire::{End, Kind, Measured, Refusal, Region, RegionFacts, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
@@ -296,8 +297,8 @@ impl Agent {
         self.table.unpin(ticket.slot)
     }
 
-    pub fn hint(&self, ticket: Ticket, class: u32, next_use: u64) -> Result<()> {
-        self.table.hint(ticket.slot, class, next_use)
+    pub fn advise(&self, ticket: Ticket, advice: Advice) -> Result<()> {
+        self.table.advise(ticket.slot, advice)
     }
 
     /// Whether the manager asked for this lease back.

@@ -30,7 +30,7 @@ use platform::contain::host_memory;
 use tensorfs::io::source::Placement;
 use tensorfs::io::Dst;
 
-use crate::backend::{Access, Backend, Event, Physical, Va};
+use crate::backend::{Access, Allowance, Backend, Event, Physical, Va};
 use crate::decide::{self, Victim};
 use crate::table::{Class, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
 use crate::{Error, Exhausted, GpuId, Result};
@@ -779,6 +779,9 @@ impl Drop for Work {
 
 struct Inner {
     backend: Arc<dyn Backend>,
+    /// Standalone, every page's and torch chunk's: the device's free bytes at open less its
+    /// reserve.
+    allowance: Arc<Allowance>,
     /// The lease agent once attached (varena-leases): this GPU's pages are the manager's chunks.
     #[cfg(unix)]
     lease: std::sync::OnceLock<Arc<crate::lease::Agent>>,
@@ -887,9 +890,9 @@ impl Memory {
             let device = Device::open(&gpu.uuid)?;
             let (release_tx, releases) = unbounded();
             let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
-            let limit = backend.free()?.saturating_sub(backend.headroom());
-            let table = Table { limit, ..Table::default() };
+            let allowance = Arc::new(Allowance::of(&*backend)?);
             let inner = Arc::new(Inner {
+                allowance,
                 backend: Arc::from(backend),
                 #[cfg(unix)]
                 lease: std::sync::OnceLock::new(),
@@ -900,7 +903,7 @@ impl Memory {
                 #[cfg(unix)]
                 to_land: Mutex::default(),
                 _device: device,
-                state: Mutex::new(State { table, ..State::default() }),
+                state: Mutex::default(),
                 landed: Wakes::default(),
                 mech: Arc::new(Mechs::new()),
                 release_tx,
@@ -1673,16 +1676,16 @@ impl Inner {
     // ---- demands
 
     /// Free bytes for a page now, from varena's own figures (never the device's: a pass reads
-    /// none). Leased: what the manager can allocate and reclaim from others. Standalone: the
-    /// budget less its pages and torch's (a refused create says the device has less).
-    fn free(&self, st: &State) -> u64 {
+    /// none). Leased: what the manager can allocate and reclaim from others. Standalone: what
+    /// the budget its pages and torch's share has left (a refused create says the device has
+    /// less).
+    fn free(&self, _st: &State) -> u64 {
         #[cfg(unix)]
         if let Some(agent) = self.lease.get() {
             let f = agent.table().figures();
             return f.free.saturating_add(f.revocable);
         }
-        let torch = self.torch.get().map_or(0, |t| t.mapped());
-        st.table.limit.saturating_sub(st.table.mapped() + torch)
+        self.allowance.left()
     }
 
     /// Free bytes speculative work (prefetch, a streamed set's regrowth) may take: never another
@@ -2633,7 +2636,7 @@ impl Inner {
             }
             return;
         }
-        let made = self.backend.create(span).and_then(|p| self.map_rw(va, off, p));
+        let made = self.allowance.create(&*self.backend, span).and_then(|p| self.map_rw(va, off, p));
         self.placed(key, gen, va, off, span, job, decided, made.map(|p| (p, false, None)));
     }
 
@@ -2746,7 +2749,7 @@ impl Inner {
                 return agent.give(ticket, p);
             }
         }
-        self.backend.destroy(p)
+        self.allowance.destroy(&*self.backend, p)
     }
 
     /// The decision to give a leased page back, before its fence: the manager sees it
@@ -2849,21 +2852,22 @@ impl Inner {
         self.unlock(st);
     }
 
-    /// What each leased page is to its plan, for the manager's victim order (the policy's
-    /// advice codes): the current step's (6, memory.min, its distance: the nearest are its
-    /// streaming slots), a later step's (4, its distance), or idle (3, its last bind on the
-    /// machine-wide clock). Atomics only, under the state lock.
+    /// What each leased page is to its plan, for the manager's victim order: the current
+    /// step's (memory.min, its distance: the nearest are its streaming slots), a later step's
+    /// (its distance), or idle (its last bind on the machine-wide clock). Atomics only, under
+    /// the state lock.
     #[cfg(unix)]
     fn advise(&self, st: &State, agent: &crate::lease::Agent) {
+        use crate::lease::Advice;
         for (ticket, key, _) in self.leased.lock().values() {
             let at = st.table.distance(*key).map(|(step, pass, block)| u64::from(step) << 40 | u64::from(pass) << 20 | u64::from(block));
-            let (code, value) = match (st.table.class(*key), at) {
-                (Some(Class::P), _) => (6, 0),
-                (Some(Class::W), at) => (6, at.unwrap_or(0)),
-                (_, Some(at)) => (4, at),
-                _ => (3, st.used_ns.get(key).copied().unwrap_or(0)),
+            let advice = match (st.table.class(*key), at) {
+                (Some(Class::P), _) => Advice::Step { at: 0 },
+                (Some(Class::W), at) => Advice::Step { at: at.unwrap_or(0) },
+                (_, Some(at)) => Advice::Later { at },
+                _ => Advice::Idle { last_use: st.used_ns.get(key).copied().unwrap_or(0) },
             };
-            let _ = agent.hint(*ticket, code, value);
+            let _ = agent.advise(*ticket, advice);
         }
     }
 

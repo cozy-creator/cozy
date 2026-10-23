@@ -8,6 +8,7 @@
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
+use super::policy::Advice;
 use crate::os::Map;
 use crate::{Error, Result};
 
@@ -375,14 +376,16 @@ impl Table {
         Ok(())
     }
 
-    pub fn hint(&self, i: u32, class: u32, next_use: u64) -> Result<()> {
+    /// The agent publishes a chunk's advice; the manager reads it back with [`Table::advice`].
+    pub fn advise(&self, i: u32, advice: Advice) -> Result<()> {
+        let (class, value) = advice.encode();
         let s = self.slot_or(i)?;
         s.class.store(class, Relaxed);
-        s.next_use.store(next_use, Relaxed);
+        s.next_use.store(value, Relaxed);
         Ok(())
     }
 
-    pub fn class(&self, i: u32) -> (u32, u64) {
-        self.slot(i).map_or((0, 0), |s| (s.class.load(Relaxed), s.next_use.load(Relaxed)))
+    pub fn advice(&self, i: u32) -> Advice {
+        self.slot(i).map_or(Advice::Unset, |s| Advice::decode(s.class.load(Relaxed), s.next_use.load(Relaxed)))
     }
 }

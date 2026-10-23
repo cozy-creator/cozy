@@ -30,7 +30,7 @@ use platform::handles::Peer;
 use platform::memory::{Signal, Waitable};
 use platform::process::Exact;
 
-use super::policy::{self, Advice, Answer, Pick};
+use super::policy::{self, Answer, Pick};
 use super::table::{self, Content, Figures, State, Table};
 use super::wire::{End, Kind, Measured, Refusal, Region, RegionFacts, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
@@ -976,8 +976,7 @@ impl Manager {
             }
             let chunk = |(slot, l): (&u32, &Leased)| {
                 let w = e.table.word(*slot).filter(|w| w.seq == l.seq)?;
-                let (class, value) = e.table.class(*slot);
-                Some(policy::Chunk { slot: *slot, seq: l.seq, bytes: l.phys.len, state: w.state, pins: w.pins, asked: e.asked.contains_key(slot), advice: Advice::decode(class, value) })
+                Some(policy::Chunk { slot: *slot, seq: l.seq, bytes: l.phys.len, state: w.state, pins: w.pins, asked: e.asked.contains_key(slot), advice: e.table.advice(*slot) })
             };
             let waits_on = if e.waiting.is_empty() { vec![] } else { e.waits_on.iter().copied().collect() };
             let (mut regions, mut graphs) = (vec![], vec![]);

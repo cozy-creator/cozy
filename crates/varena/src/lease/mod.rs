@@ -10,6 +10,7 @@ pub mod table;
 pub mod wire;
 
 pub use agent::{Agent, Attach, Done, Lease, Ticket};
+pub use policy::Advice;
 pub use manager::{chunks, ExecutorHolding, Holdings, Hosting, Identity, Manager, Mode, Opener, Peak, Pressure, Record, CHUNK, PROTOCOL};
 pub use table::{Content, Figures, State, Table, Word};
 pub use wire::{Kind, Measured, Refusal, Region};

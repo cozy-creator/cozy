@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex, RwLock};
 
-use crate::backend::{Access, Backend, Event, Physical, Va, OUT_OF_MEMORY};
+use crate::backend::{Access, Allowance, Backend, Event, Physical, Va, OUT_OF_MEMORY};
 use crate::{Error, Exhausted, Result};
 
 #[allow(unsafe_code)]
@@ -1679,50 +1679,31 @@ fn poll(weak: &Weak<Shared>) {
     }
 }
 
-/// A standalone budget: it creates its own pages, up to `limit` bytes. With no manager, Exhausted
-/// is the device's own out-of-memory, or the limit.
+/// Torch's chunks standalone: created within the Memory's [`Allowance`], which its weight pages
+/// share. With no manager, Exhausted is the device's own out-of-memory, or the allowance.
 pub struct Direct {
     backend: Arc<dyn Backend>,
-    limit: u64,
-    held: Mutex<(u64, HashMap<u64, Physical>)>,
+    allowance: Arc<Allowance>,
+    held: Mutex<HashMap<u64, Physical>>,
 }
 
 impl Direct {
-    pub fn new(backend: Arc<dyn Backend>, limit: u64) -> Direct {
-        Direct { backend, limit, held: Mutex::new((0, HashMap::new())) }
+    pub fn new(backend: Arc<dyn Backend>, allowance: Arc<Allowance>) -> Direct {
+        Direct { backend, allowance, held: Mutex::new(HashMap::new()) }
     }
 
     fn one(&self, va: Va, off: u64, len: u64) -> Result<Chunk> {
-        {
-            let mut held = self.held.lock();
-            if held.0 + len > self.limit {
-                return Err(exhausted(len, &format!("the standalone budget of {} bytes is spent", self.limit)));
-            }
-            held.0 += len;
-        }
-        let made = self.backend.create(len).map_err(|e| match e {
+        let p = self.allowance.create(&*self.backend, len).map_err(|e| match e {
             Error::Device { code: OUT_OF_MEMORY, .. } => exhausted(len, "the device is out of memory"),
             e => e,
-        });
-        let page = made.and_then(|p| match self.backend.map(va, off, &p, Access::ReadWrite) {
-            Ok(()) => Ok(p),
-            Err(e) => {
-                let _ = self.backend.destroy(p);
-                Err(e)
-            }
-        });
-        let mut held = self.held.lock();
-        match page {
-            Ok(p) => {
-                let id = p.id;
-                held.1.insert(id, p);
-                Ok(Chunk { id, len })
-            }
-            Err(e) => {
-                held.0 -= len;
-                Err(e)
-            }
+        })?;
+        if let Err(e) = self.backend.map(va, off, &p, Access::ReadWrite) {
+            let _ = self.allowance.destroy(&*self.backend, p);
+            return Err(e);
         }
+        let id = p.id;
+        self.held.lock().insert(id, p);
+        Ok(Chunk { id, len })
     }
 }
 
@@ -1747,13 +1728,9 @@ impl Source for Direct {
                 stuck.push((at, c));
                 continue;
             }
-            let page = {
-                let mut held = self.held.lock();
-                held.0 = held.0.saturating_sub(c.len);
-                held.1.remove(&c.id)
-            };
+            let page = self.held.lock().remove(&c.id);
             if let Some(p) = page {
-                let _ = self.backend.destroy(p);
+                let _ = self.allowance.destroy(&*self.backend, p);
             }
         }
         stuck

@@ -17,17 +17,11 @@ use crate::arena::{Direct, Owner, Route, Source, Torch};
 use crate::{
     arena::{Chunk, Kind},
     backend::{Access, Backend, Physical, Va},
-    lease::{Agent, Ticket},
+    lease::{Advice, Agent, Ticket},
 };
 use crate::{Error, Result};
 
 pub use crate::arena::{Ended, PoolId};
-
-/// The table's hint classes for a torch chunk: the manager asks idle ones back first.
-#[cfg(unix)]
-const IDLE: u32 = 0;
-#[cfg(unix)]
-const IN_USE: u32 = 1;
 
 /// torch's figures, varena's now: process-wide, per open request and per pool.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -69,12 +63,9 @@ impl Memory {
     }
 
     /// Standalone, chosen explicitly when no compatible manager serves this GPU: the device's
-    /// own pages, bounded by its free bytes now less its reserve (rev 6: 512 MiB a GPU, none on
-    /// host pages).
+    /// own pages, within the allowance its weight pages share (rev 6).
     pub fn serve_standalone_torch(&self) -> Result<Arc<Torch>> {
-        let backend = self.inner.backend.clone();
-        let limit = backend.free()?.saturating_sub(backend.headroom());
-        self.serve_torch(Arc::new(Direct::new(backend, limit)))
+        self.serve_torch(Arc::new(Direct::new(self.inner.backend.clone(), self.inner.allowance.clone())))
     }
 
     /// The device's torch allocator: refused until one is served.
@@ -328,7 +319,9 @@ impl Source for Leased {
             } else if !idle && !h.pinned {
                 h.pinned = self.agent.pin(h.ticket).unwrap_or(false);
             }
-            let _ = self.agent.hint(h.ticket, if idle { IDLE } else { IN_USE }, 0);
+            // Whole free: revocable at once, ahead of any executor's idle weights.
+            let advice = if idle { Advice::Free { since: super::monotonic_ns() } } else { Advice::Unset };
+            let _ = self.agent.advise(h.ticket, advice);
         }
     }
 

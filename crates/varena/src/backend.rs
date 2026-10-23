@@ -5,6 +5,7 @@
 //! pagefile section): CPU and MPS executors and the CPU tests use it; [`crate::CudaBackend`] is CUDA's.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering::AcqRel, Ordering::Acquire};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -12,7 +13,7 @@ use platform::handles::Owned;
 use platform::memory;
 use tensorfs::io::Dst;
 
-use crate::{Error, Result};
+use crate::{Error, Exhausted, Result};
 
 /// Reserved address space: `len` bytes from `base`, nothing mapped until [`Backend::map`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +50,49 @@ pub const RESERVE: u64 = 512 << 20;
 /// The code [`Backend::create`] fails with when the device has no memory for the page
 /// (`CUDA_ERROR_OUT_OF_MEMORY`; the host backend answers the same at its limit).
 pub const OUT_OF_MEMORY: i32 = 2;
+
+/// A standalone Memory's one allowance: the device's free bytes at open less its reserve. Weight
+/// pages and torch's chunks are both created through it, so together they never reach into the
+/// reserve.
+#[derive(Debug)]
+pub struct Allowance {
+    limit: u64,
+    used: AtomicU64,
+}
+
+impl Allowance {
+    pub fn of(backend: &dyn Backend) -> Result<Allowance> {
+        Ok(Allowance::new(backend.free()?.saturating_sub(backend.headroom())))
+    }
+
+    pub fn new(limit: u64) -> Allowance {
+        Allowance { limit, used: AtomicU64::new(0) }
+    }
+
+    /// Bytes not yet charged.
+    pub fn left(&self) -> u64 {
+        self.limit.saturating_sub(self.used.load(Acquire))
+    }
+
+    /// A page charged before it is made: `Exhausted` when it would cross the limit.
+    pub fn create(&self, backend: &dyn Backend, len: u64) -> Result<Physical> {
+        if self.used.try_update(AcqRel, Acquire, |u| u.checked_add(len).filter(|&n| n <= self.limit)).is_err() {
+            let site = format!("the standalone budget of {} bytes is spent", self.limit);
+            return Err(Error::Exhausted(Box::new(Exhausted { need: len, site: Some(site), stats: crate::Stats::default(), foreign: None })));
+        }
+        backend.create(len).inspect_err(|_| self.refund(len))
+    }
+
+    /// A page made by [`Allowance::create`] destroyed, its bytes refunded.
+    pub fn destroy(&self, backend: &dyn Backend, page: Physical) -> Result<()> {
+        self.refund(page.len);
+        backend.destroy(page)
+    }
+
+    fn refund(&self, len: u64) {
+        self.used.update(AcqRel, Acquire, |u| u.saturating_sub(len));
+    }
+}
 
 /// One device's mechanism. Every call is short: no call waits on another process or a fill.
 pub trait Backend: Send + Sync {
