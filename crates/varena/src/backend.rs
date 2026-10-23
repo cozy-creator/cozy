@@ -76,6 +76,10 @@ pub trait Backend: Send + Sync {
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()>;
     /// A handle another process can import (a POSIX fd, a WIN32 handle).
     fn export(&self, page: &Physical) -> Result<Owned>;
+    /// A handle another process maps read-write: a lease (a host page's export is read-only).
+    fn lend(&self, page: &Physical) -> Result<Owned> {
+        self.export(page)
+    }
     fn import(&self, handle: Owned, len: u64) -> Result<Physical>;
     /// Where `io::read` writes `len` mapped bytes at `va + offset`: device memory ordered on the
     /// backend's copy stream, or host memory.
@@ -215,6 +219,12 @@ impl Backend for HostBackend {
         let pages = self.pages.lock();
         let (handle, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
         memory::export(handle).map_err(page_err)
+    }
+
+    fn lend(&self, page: &Physical) -> Result<Owned> {
+        let pages = self.pages.lock();
+        let (handle, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
+        handle.try_clone().map_err(|e| Error::io("lend a host page", e))
     }
 
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> {

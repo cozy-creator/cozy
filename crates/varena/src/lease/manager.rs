@@ -546,7 +546,7 @@ impl Manager {
                 continue;
             };
             let content = ask.region.map(|r| Content { fingerprint: r.fingerprint, region: r.region, index: index as u32 });
-            let exported = e.table.grant(slot, seq, p.len, content, adopt.is_some()).and_then(|ok| if ok { self.backend.export(&p).map(Some) } else { Ok(None) });
+            let exported = e.table.grant(slot, seq, p.len, content, adopt.is_some()).and_then(|ok| if ok { self.backend.lend(&p).map(Some) } else { Ok(None) });
             match exported {
                 Ok(Some(handle)) => {
                     out.sends.push((e.end.clone(), ToAgent::Grant { id: ask.id, slot, seq, bytes: p.len, adopted: adopt.is_some(), last: index + 1 == n }, Some(handle)));
