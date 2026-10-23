@@ -1,0 +1,45 @@
+name: build
+# The PR check (tracker/design/ci-v2.md §1): the workspace compiles and is clippy-clean. Required on master, so it
+# always reports: a docs-only PR passes without building. Master pushes keep the cache warm for PRs.
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # Hang bound, not a work budget.
+    timeout-minutes: 60
+    steps:
+      - id: scope
+        name: Docs-only changes skip the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          files=$([ -z "$PR" ] || gh pr diff "$PR" -R "$GITHUB_REPOSITORY" --name-only) || files=
+          if [ -n "$files" ] && ! grep -qvE '\.(md|txt|png|jpe?g|svg)$|^docs/|(^|/)LICENSE$' <<< "$files"; then
+            echo "docs only"; echo run=false >> "$GITHUB_OUTPUT"
+          else
+            echo run=true >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.scope.outputs.run == 'true'
+        uses: actions/checkout@v5
+      - if: steps.scope.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - if: steps.scope.outputs.run == 'true'
+        run: cargo check --workspace --all-targets --locked
+      - if: steps.scope.outputs.run == 'true'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
