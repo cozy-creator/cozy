@@ -1740,7 +1740,7 @@ mod v1_api {
                     parameter: "model".into(),
                     repository: name.into(),
                     release: "1.0.0".into(),
-                    lane: "bf16".into(),
+                    lane: "model.bf16.cozytensors".into(),
                     ..Default::default()
                 }],
                 hub: Some(v1::HubAccess { origin: origins[at].clone(), ..Default::default() }),
