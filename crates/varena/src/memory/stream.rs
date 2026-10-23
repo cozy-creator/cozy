@@ -54,6 +54,10 @@ pub(super) enum StreamIn {
 
 impl State {
     /// A page that is the set's slot now: mapped at an upper block, never custody's (its memory is overwritten next).
+    pub(super) fn slots(&self, set: u32, watermark: u32) -> usize {
+        self.homes.keys().filter(|k| k.0 == set && self.slot(**k, watermark)).count()
+    }
+
     fn slot(&self, key: Key, watermark: u32) -> bool {
         key.1 >= watermark && self.homes.get(&key).is_some_and(|h| !h.exported && !h.keeping)
     }
@@ -143,11 +147,10 @@ impl Inner {
             return Ok(StreamIn::No);
         }
         let slots: Vec<Key> = st.homes.keys().filter(|k| k.0 == key.0 && st.slot(**k, watermark)).copied().collect();
-        if slots.len() < SLOTS {
-            let free = st.table.free().min(self.backend.free().unwrap_or(u64::MAX));
-            if slots.is_empty() || st.table.page(key).is_some_and(|p| p.bytes <= free) {
-                return Ok(StreamIn::No);
-            }
+        // Mid-pass a slot moves, never a new one made (`regrow` refills them at a boundary);
+        // the first is made the usual way.
+        if slots.is_empty() {
+            return Ok(StreamIn::No);
         }
         let Some(from) = slots.iter().filter(|k| st.movable(**k)).min_by_key(|k| st.last_use(**k)).copied() else {
             let me = std::thread::current().id();

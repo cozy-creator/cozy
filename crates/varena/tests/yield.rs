@@ -68,13 +68,14 @@ fn row(ledger: &Ledger) -> (u64, u64) {
     })
 }
 
-/// The foreign bytes that leave the rows `short` bytes short of capacity.
-fn short_by(ledger: &Ledger, short: u64) -> u64 {
-    ledger.status().capacity - row(ledger).0 + short
+/// TensorD's reading of a device with `free` bytes free: the bytes no row accounts for, as NVML
+/// shows them (card − rows' held − free).
+fn reading(ledger: &Ledger, free: u64) -> u64 {
+    CARD - row(ledger).0 - free
 }
 
-/// A reading that leaves an idle row 1 MiB short asks it for that and H: its idle pages all go.
-/// No deficit, no ask: the same pages, read again with room, stay.
+/// A reading with 2H free asks nothing; one with less than H free asks for 2H − free, which takes
+/// every idle page.
 #[test]
 fn a_foreign_reading_takes_the_deficit_and_h_from_idle_pages() {
     let (_scope, g) = Scope::new("deficit");
@@ -83,10 +84,11 @@ fn a_foreign_reading_takes_the_deficit_and_h_from_idle_pages() {
     let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(CARD))).unwrap();
     mem.load(set(dir.path(), "idle", 4, &g.uuid), Level::Gpu).unwrap();
     assert_eq!(row(&ledger).1, 4 * P, "the idle set is resident");
-    assert_eq!(ledger.set_foreign(short_by(&ledger, 0), false).unwrap(), 0, "no deficit: nothing asked");
+    let h = varena::headroom(CARD);
+    assert_eq!(ledger.set_foreign(reading(&ledger, 2 * h), false).unwrap(), 0, "2H free: nothing asked");
     assert_eq!(row(&ledger).1, 4 * P);
-    let freed = ledger.set_foreign(short_by(&ledger, 1 << 20), false).unwrap();
-    assert_eq!((freed, row(&ledger).1), (4 * P, 0), "(freed, pages left): the deficit and H take every idle page");
+    let freed = ledger.set_foreign(reading(&ledger, h / 2), false).unwrap();
+    assert_eq!((freed, row(&ledger).1), (4 * P, 0), "(freed, pages left): H/2 free asks 3H/2, every idle page");
     drop(mem);
 }
 
@@ -99,7 +101,8 @@ fn a_new_foreign_process_takes_idle_pages_only() {
     let ledger = Ledger::create(&g, None).unwrap();
     let idle = Memory::open(g.clone(), None, Box::new(HostBackend::new(CARD))).unwrap();
     idle.load(set(dir.path(), "idle", 3, &g.uuid), Level::Gpu).unwrap();
-    let freed = ledger.set_foreign(short_by(&ledger, 0), true).unwrap();
+    let room = 2 * varena::headroom(CARD);
+    let freed = ledger.set_foreign(reading(&ledger, room), true).unwrap();
     assert_eq!((freed, row(&ledger).1), (3 * P, 0), "(freed, pages left) for a new foreign process");
     // A running row: its working set stays (the rule takes idle pages only).
     let s = idle.load(set(dir.path(), "run", 3, &g.uuid), Level::Ram).unwrap();
@@ -108,7 +111,7 @@ fn a_new_foreign_process_takes_idle_pages_only() {
     let pins: Vec<_> = (0..3).map(|b| idle.bind(s, b, 0).unwrap()).collect();
     drop(pins);
     let before = row(&ledger).1;
-    assert_eq!(ledger.set_foreign(short_by(&ledger, 0), true).unwrap(), 0, "a running row's working set was asked for a new process");
+    assert_eq!(ledger.set_foreign(reading(&ledger, room), true).unwrap(), 0, "a running row's working set was asked for a new process");
     assert_eq!(row(&ledger).1, before);
     pass.end(0);
     drop(r);
@@ -130,8 +133,8 @@ fn foreign_pressure_streams_the_running_set_and_never_ends_it() {
         drop(mem.bind(s, b, 0).unwrap());
     }
     assert_eq!(row(&ledger).1, blocks * P);
-    // Short by 4 blocks less H: the asks take what streaming gives, down to the slots.
-    let freed = std::thread::scope(|t| t.spawn(|| ledger.set_foreign(short_by(&ledger, 4 * P), false).unwrap()).join().unwrap());
+    // H/2 free: the asks take what streaming gives, down to the slots.
+    let freed = std::thread::scope(|t| t.spawn(|| ledger.set_foreign(reading(&ledger, varena::headroom(CARD) / 2), false).unwrap()).join().unwrap());
     let left = row(&ledger).1;
     assert!(freed > 0 && left < blocks * P, "the running set gave nothing: freed {freed}, left {left}");
     for b in 0..blocks as u32 {
@@ -159,9 +162,8 @@ fn a_refusal_at_the_floor_names_the_foreign_process() {
     drop(r);
 }
 
-/// Growth only at a pass boundary and only beyond 2H of the device: a streamed set with less than
-/// H to spare above what the table leaves does not grow; with three blocks beyond, it takes back
-/// three, and binds them as hits.
+/// Growth only at a pass boundary and only beyond 2H free on the device: a streamed set inside the
+/// H..2H band does not grow; with three blocks beyond 2H, the boundary takes back three.
 #[test]
 fn growth_waits_for_a_pass_boundary_and_2h_free() {
     let (_scope, g) = Scope::new("grow");
@@ -180,22 +182,103 @@ fn growth_waits_for_a_pass_boundary_and_2h_free() {
     };
     sweep(&r);
     let h = varena::headroom(CARD);
-    // A foreign process takes all but the set's room: it streams.
-    ledger.set_foreign(short_by(&ledger, 6 * P), false).unwrap();
+    // A foreign process leaves H/2: it streams.
+    ledger.set_foreign(reading(&ledger, h / 2), false).unwrap();
     let streamed = row(&ledger).1;
     assert!(streamed < blocks * P, "it did not stream");
-    // Room comes back, but less than H beyond what the table leaves: no growth at the boundary.
-    let at = |spare: u64| ledger.status().capacity - row(&ledger).0 - spare;
-    ledger.set_foreign(at(h - P), false).unwrap();
+    // Room comes back, but the device stays inside the H..2H band: no growth at the boundary.
+    ledger.set_foreign(reading(&ledger, 2 * h - P), false).unwrap();
     let pass = r.pass(s, "k").unwrap();
     assert_eq!(row(&ledger).1, streamed, "it grew inside the H..2H band");
     pass.end(0);
-    // H and three blocks beyond: the next boundary takes back three.
-    ledger.set_foreign(at(h + 3 * P), false).unwrap();
+    // Three blocks beyond 2H: the next boundary takes back three.
+    ledger.set_foreign(reading(&ledger, 2 * h + 3 * P), false).unwrap();
     let pass = r.pass(s, "k").unwrap();
     assert_eq!(row(&ledger).1, streamed + 3 * P, "the boundary took back three blocks");
     pass.end(0);
     drop(r);
+}
+
+/// Y0 (the reviewer's probe): a real reading, the device left with H/2 free, yields: shared mode
+/// charges H, so the rule fires on NVML's figure, not a made-up one.
+#[test]
+fn a_reading_with_less_than_h_free_yields() {
+    let (_scope, g) = Scope::new("y0");
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::create(&g, None).unwrap();
+    let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(CARD))).unwrap();
+    mem.load(set(dir.path(), "idle", 4, &g.uuid), Level::Gpu).unwrap();
+    let freed = ledger.set_foreign(reading(&ledger, varena::headroom(CARD) / 2), false).unwrap();
+    assert!(freed > 0, "device free H/2 < H, and nothing was asked");
+    drop(mem);
+}
+
+/// Y1 (the reviewer's probe): a W ask mid-pass streams the running set down to its floor; the
+/// same pass then binds every block again without growing back (slots refill at a boundary).
+#[test]
+fn no_growth_inside_the_pass_after_a_shrink() {
+    let (_scope, g) = Scope::new("y1");
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::create(&g, None).unwrap();
+    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(HostBackend::new(CARD))).unwrap());
+    let blocks = 8;
+    let s = mem.load(set(dir.path(), "run", blocks, &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("r", plan("run")).unwrap();
+    let pass = r.pass(s, "k").unwrap();
+    for b in 0..blocks as u32 {
+        drop(mem.bind(s, b, 0).unwrap());
+    }
+    std::thread::scope(|t| t.spawn(|| ledger.set_foreign(reading(&ledger, varena::headroom(CARD) / 2), false).unwrap()).join().unwrap());
+    let after = row(&ledger).1;
+    let mut most = after;
+    for b in 0..blocks as u32 {
+        drop(mem.bind(s, b, 0).unwrap());
+        most = most.max(row(&ledger).1);
+    }
+    pass.end(0);
+    drop(r);
+    assert_eq!(most, after, "the streamed set grew inside the pass");
+}
+
+/// Y3 (the reviewer's probe): a new foreign process takes a running row's idle pages (a set its
+/// plan does not use), never its running set.
+#[test]
+fn a_new_process_takes_a_running_rows_idle_pages() {
+    let (_scope, g) = Scope::new("y3");
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::create(&g, None).unwrap();
+    let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(CARD))).unwrap();
+    mem.load(set(dir.path(), "other", 3, &g.uuid), Level::Gpu).unwrap();
+    let s = mem.load(set(dir.path(), "run", 2, &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("r", plan("run")).unwrap();
+    let pass = r.pass(s, "k").unwrap();
+    drop((mem.bind(s, 0, 0).unwrap(), mem.bind(s, 1, 0).unwrap()));
+    let freed = ledger.set_foreign(reading(&ledger, 2 * varena::headroom(CARD)), true).unwrap();
+    pass.end(0);
+    drop(r);
+    assert_eq!(freed, 3 * P, "a running row's idle pages stayed for a new foreign process");
+}
+
+/// A row that answered nothing is not asked again until its classes change: at the floor, each
+/// reading would ask it for nothing.
+#[test]
+fn a_row_that_gave_nothing_is_not_asked_again_until_it_changes() {
+    let (_scope, g) = Scope::new("quiet");
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::create(&g, None).unwrap();
+    let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(CARD))).unwrap();
+    let s = mem.load(set(dir.path(), "run", 2, &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("r", plan("run")).unwrap();
+    let pass = r.pass(s, "k").unwrap();
+    let pins = (mem.bind(s, 0, 0).unwrap(), mem.bind(s, 1, 0).unwrap());
+    // Everything pinned: the first reading's asks get nothing, the second makes none.
+    let short = || ledger.set_foreign(reading(&ledger, 0), false).unwrap();
+    assert_eq!((short(), short()), (0, 0));
+    let asked = ledger.status().rows.iter().map(|r| r.asked).sum::<u64>();
+    drop(pins);
+    pass.end(0);
+    drop(r);
+    assert_eq!(asked, 0);
 }
 
 /// A fake per-process budget (Windows' DXCore): `set` changes it and wakes the waiter; each

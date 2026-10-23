@@ -359,6 +359,11 @@ pub struct Table {
     /// Shared mode (a machine its owner also uses): prefetch never grows this process's
     /// footprint.
     pub shared: bool,
+    /// TensorD samples foreign bytes (`foreign` is its reading): in shared mode the budget then
+    /// leaves H to the display and other programs.
+    pub sampled: bool,
+    /// The card's bytes (H's basis).
+    pub card: u64,
     /// Indexed by set id; `None` once unloaded.
     pub sets: Vec<Option<Set>>,
     pub requests: Vec<Req>,
@@ -462,8 +467,13 @@ impl Table {
     /// The one budget: the ledger's capacity less foreign bytes, orphans and the other rows,
     /// within this row's own cap.
     pub fn budget(&self) -> u64 {
-        let room = self.capacity.saturating_sub(self.foreign + self.orphans + self.others_held());
+        let room = self.capacity.saturating_sub(self.foreign + self.orphans + self.others_held() + self.headroom());
         self.limit.map_or(room, |l| room.min(l))
+    }
+
+    /// H, charged in shared mode while TensorD samples foreign bytes (its rule asks below it).
+    pub fn headroom(&self) -> u64 {
+        if self.shared && self.sampled { headroom(self.card) } else { 0 }
     }
 
     /// F: the budget less what this row holds.
