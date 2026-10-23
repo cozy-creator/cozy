@@ -2396,6 +2396,8 @@ fn the_hook_waits_on_its_pages_release_events_never_on_unrelated_work() {
         "HOOK the first allocation returned {:?} after the kernel's launch (its {spin:?}); make_room {}; B churned {} segments, refused {}; unmapped {unmapped} B; driver gained {gained} B; waited on the gated stream (phases A, B: 1 allocating, 2 writing): {waited:?}",
         first_returned - launched, callbacks.report(), churned.0, churned.1
     );
+    // Which backend call a slow make_room spent its time in.
+    println!("TIMINGS hook backend calls: {}", timings.report());
     step!();
     assert!(waited.is_none(), "a thread waited for the gated stream (on the allocator lock's path at 1): {waited:?}");
     step!();
@@ -2437,11 +2439,15 @@ fn an_activation_larger_than_free_memory_is_served_from_evictable_weights() {
     let (mem, timings) = timed_memory(b, &g);
     step!();
     let pages = 64;
-    resident(&mem, "own", pages, &g.uuid, 0);
+    let own = resident(&mem, "own", pages, &g.uuid, 0);
     step!();
     resident(&mem, "other", pages, &g.uuid, 0);
     step!();
     let r = mem.request("r", plan(&[&["own"]])).unwrap();
+    step!();
+    // Both sets are kept (bound with no request open). The activation comes inside a pass: its start withdraws the
+    // kept pages the hook may take, which makes no custody call itself.
+    let pass = r.pass(own, "fwd|1").unwrap();
     step!();
     let (start_free, unmaps) = (driver_free(), timings.count("unmap"));
     step!();
@@ -2465,6 +2471,8 @@ fn an_activation_larger_than_free_memory_is_served_from_evictable_weights() {
     step!();
     assert!(gained.abs_diff(unmapped) <= REGION_ALIGN, "the driver gained {gained} B for {unmapped} B unmapped");
     step!();
+    pass.end(0);
+    step!();
     assert_eq!(r.end().leftover, 0);
     step!();
     println!("PASS an activation larger than free memory is served from evictable weights {uuid}");
@@ -2474,7 +2482,8 @@ fn an_activation_larger_than_free_memory_is_served_from_evictable_weights() {
 /// Under a 1 GiB cap, the hook never takes a pinned page, and fails only when nothing is evictable.
 /// - Of two sets, one is pinned throughout (its bytes checked) and one is idle.
 /// - An allocation needing more than the idle set can give takes all of the idle set, then fails.
-/// - Once one pinned page is released, the same need short by a page is served from it.
+/// - Once two pinned pages are released, a need of one page more than free is served: the floor keeps one as the
+///   running set's slot.
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable() {
@@ -2489,6 +2498,9 @@ fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable()
     resident(&mem, "idle", pages, &g.uuid, 0);
     step!();
     let r = mem.request("r", plan(&[&["held"]])).unwrap();
+    step!();
+    // The idle set is kept (bound with no request open): the pass start withdraws it for the hook.
+    let pass = r.pass(held, "fwd|1").unwrap();
     step!();
     let mut pins: Vec<Pin> = (0..pages).map(|p| mem.bind(held, p, 0).unwrap()).collect();
     step!();
@@ -2509,7 +2521,9 @@ fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable()
         assert!(exact(pin, &block(97, p as u32), 0), "pinned page {p} kept its bytes");
     }
     step!();
-    // One pinned page released: now something is evictable, and a need of one page more than free is served.
+    // Two pinned pages released: the floor keeps one as the running set's slot (its other pages are pinned), and a
+    // need of one page more than free is served from the other.
+    drop(pins.pop());
     drop(pins.pop());
     step!();
     poke(&mem);
@@ -2522,6 +2536,8 @@ fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable()
     unsegment(&torch, served, one_more);
     step!();
     drop(pins);
+    step!();
+    pass.end(0);
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
@@ -2870,7 +2886,7 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
 fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_room_returns() {
     let (b, g, uuid) = card("full");
     step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
+    let ledger = Ledger::create(&g, None).unwrap();
     let mem = memory(b, &g);
     step!();
     let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(5, b)), Level::Ram).unwrap();
@@ -2885,7 +2901,10 @@ fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_ro
     step!();
     let pass = r.pass(m, "k").unwrap();
     step!();
-    let first = mem.bind(m, 0, 0).expect("the idle page makes room");
+    // S1's probe: the row's figures just before the bind that must take the idle page.
+    println!("PROBE free {} rows {:?}", mem.free(), ledger.status().rows.iter().map(|r| (r.pid, r.live, r.context, r.classes, r.torch, r.returning)).collect::<Vec<_>>());
+    step!();
+    let first = mem.bind(m, 0, 0).unwrap_or_else(|e| panic!("the idle page makes room: {e:?}"));
     step!();
     let e = mem.bind(m, 1, 0).err().expect("nothing is left to free");
     step!();
@@ -3471,11 +3490,9 @@ fn a_stray_write_to_a_kept_page_ends_only_its_writer() {
     step!();
     w.ok(&format!("open {}", g.uuid));
     step!();
+    // An idle GPU load returns with its pages kept (read-only, custody's). The bind runs outside a request: a pass
+    // start would withdraw the Keep.
     w.ok("load s 2 13 stored gpu");
-    step!();
-    w.ok("request r s");
-    step!();
-    w.ok("pass r s 1");
     step!();
     w.ok("bind s 0");
     step!();
