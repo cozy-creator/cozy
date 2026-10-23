@@ -105,6 +105,47 @@ fn logical_config_edits_preserve_imported_filename_for_explicit_export() {
     assert_eq!(checkpoint.component("tokenizer").unwrap().config_file, None);
 }
 
+/// A lane's provenance is read once into its typed record, a malformed one ignored rather than
+/// refused, and never carried over from a base: what wrote the base did not write what derives
+/// from it.
+#[test]
+fn provenance_is_typed_and_never_inherited() {
+    let scratch = Scratch::new("provenance");
+    let store = scratch.store("store");
+    let text = |s: &str| Value::Str(s.into());
+    let plan = Value::Map(BTreeMap::from([("kind".into(), text("quantization"))]));
+    let record = |recipe: Value| {
+        Value::Map(BTreeMap::from([
+            ("package".into(), text("acme/tiny")),
+            ("release".into(), text("0.1.0")),
+            ("recipe".into(), recipe),
+            ("fingerprint".into(), text("sha256:aa")),
+            ("source".into(), text("sha256:bb")),
+            ("plan".into(), plan.clone()),
+        ]))
+    };
+    let mut w = store.writer(None, None).unwrap();
+    plain(&mut w, "unet", "w", &noise(1, 64));
+    w.set_metadata("provenance", record(text("int8")));
+    w.set_metadata("source", text("hf://acme/tiny@main"));
+    let lane = store.checkpoint(&w.commit().unwrap()).unwrap();
+    let found = lane.header().provenance().unwrap();
+    assert_eq!((found.package.as_str(), found.recipe.as_str(), &found.plan), ("acme/tiny", "int8", &plan));
+
+    let mut w = store.writer(Some(&lane), None).unwrap();
+    plain(&mut w, "unet", "extra", &noise(2, 64));
+    let derived = store.checkpoint(&w.commit().unwrap()).unwrap();
+    assert!(derived.header().provenance().is_none());
+    assert!(!derived.header().metadata.contains_key("provenance"));
+    assert_eq!(derived.header().metadata.get("source"), Some(&text("hf://acme/tiny@main")));
+
+    let mut w = store.writer(None, None).unwrap();
+    plain(&mut w, "unet", "w", &noise(1, 64));
+    w.set_metadata("provenance", record(Value::Int(8)));
+    let odd = store.checkpoint(&w.commit().unwrap()).unwrap();
+    assert!(odd.header().provenance().is_none() && odd.read("unet", "w").is_ok());
+}
+
 fn blobs(store: &Store) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for top in fs::read_dir(store.root().join("blobs")).unwrap().flatten() {

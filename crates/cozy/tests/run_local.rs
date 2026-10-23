@@ -1532,3 +1532,75 @@ fn a_second_run_reuses_the_video_and_image_its_machine_holds() {
         .count();
     assert_eq!(remembered, 2);
 }
+
+/// A package's declared recipe, through the CLI to a local machine and no Hub: its `quantize`
+/// (the Runtime's) picks the recipe for the lane, writes the lane, and its header records the
+/// recipe that wrote it. A lane the package declares no recipe for refuses by name.
+#[test]
+fn a_declared_recipe_writes_its_lane_and_its_provenance() {
+    use tensorfs::{
+        format::{Body, Dtype, Value as Field},
+        store::Store,
+        writer::{Data, Source},
+    };
+    let Some(home) = Home::new() else { return };
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
+        return;
+    };
+    home.write_config("hub = \"offline\"\n[hubs]\noffline = \"http://127.0.0.1:1\"\n");
+    let store_path = home.path().join("local-tensorfs");
+    let seed = {
+        let store = Store::open(&store_path).unwrap();
+        let mut writer = store.writer(None, None).unwrap();
+        let bf16 = |n: usize| (0..n).flat_map(|i| (0x3c00u16 + (i % 97) as u16).to_le_bytes()).collect::<Vec<u8>>();
+        for (key, shape) in [("transformer.h.0.attn.c_attn.weight", [32, 96]), ("transformer.h.0.mlp.c_fc.weight", [32, 128])] {
+            let bytes = bf16(shape[0] * shape[1]);
+            let data = Data::Plain(Source::Read(&mut &bytes[..]));
+            writer.get("model").put(key, &Dtype::BF16, &shape.map(|d| d as u64), data).unwrap();
+        }
+        let bias = bf16(96);
+        writer.get("model").put("transformer.h.0.attn.c_attn.bias", &Dtype::BF16, &[96], Data::Plain(Source::Read(&mut &bias[..]))).unwrap();
+        let header = writer.commit().unwrap();
+        tensord::storage::set_local(&store, "seed", &header, &Default::default()).unwrap();
+        header
+    };
+    let _machine = common::tensord::added_with(&home, "m1", &[("COZY_TENSORFS_ROOT", store_path.to_str().unwrap())]);
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/model/tiny-quantizer"),
+        &work.join("tiny-quantizer"),
+    );
+    let quantize = |lane: &str| {
+        let lane = format!("lane={lane}");
+        cozy(&home, &work, &["--json", "run", "./tiny-quantizer/quantize", "local/seed", "local/quantized",
+            &lane, "package=acme/tiny-quantizer", "release=0.1.0", "--on", "m1"])
+    };
+    let run = completed(&quantize("fp8"));
+    let output = run["output"].as_array().unwrap().iter().find(|item| item["name"] == "fp8").unwrap_or_else(|| panic!("{run}"));
+    let reference = &output["checkpoint"];
+    assert_eq!(reference["repo_id"], "local/quantized", "{run}");
+    let store = Store::open(&store_path).unwrap();
+    let tree = tensord::storage::held(&store, reference["revision"].as_str().unwrap()).unwrap();
+    let variant = reference["variant"].as_str().unwrap();
+    let (_, header) = tensorfs::fetch::variant_of_tree(&store.tree(&tree).unwrap(), Some(variant)).unwrap();
+    let lane = store.checkpoint(&header).unwrap();
+    let made = lane.header().provenance().unwrap_or_else(|| panic!("no provenance: {:?}", lane.header().metadata));
+    assert_eq!(
+        (made.package.as_str(), made.release.as_str(), made.recipe.as_str(), made.source.as_str()),
+        ("acme/tiny-quantizer", "0.1.0", "fp8", seed.id().as_str())
+    );
+    assert!(made.fingerprint.starts_with("sha256:"), "{made:?}");
+    let Field::Map(plan) = &made.plan else { panic!("{made:?}") };
+    assert_eq!(plan.get("encoding"), Some(&Field::Str("fp8.rowwise".into())), "{made:?}");
+    for key in ["transformer.h.0.attn.c_attn.weight", "transformer.h.0.mlp.c_fc.weight"] {
+        let tensor = lane.header().tensor("model", key).unwrap();
+        assert!(matches!(&tensor.body, Body::Encoded { encoding, .. } if encoding.scheme == "fp8.rowwise"), "{key}");
+    }
+    assert!(matches!(lane.header().tensor("model", "transformer.h.0.attn.c_attn.bias").unwrap().body, Body::Data(_)));
+
+    let none = quantize("int8");
+    let ended = none.stdout.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).rfind(|e| e["type"] == "run.failed");
+    let reason = ended.as_ref().map(|e| &e["run"]["reason"]).unwrap_or_else(|| panic!("{none:?}"));
+    assert_eq!(reason["code"], "recipe_not_found", "{none:?}");
+    assert!(reason["message"].as_str().is_some_and(|m| m.contains("its lanes: fp8")), "{none:?}");
+}

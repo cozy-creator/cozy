@@ -327,7 +327,8 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
         };
         writer.get(component).copy_as(key, from, from_component, from_key).map_err(storage::io_error)?;
     }
-    for (key, value) in &base.header().metadata {
+    // A composition is not the lane its base's recipe wrote.
+    for (key, value) in (base.header().metadata.iter()).filter(|(key, _)| *key != tensorfs::format::Provenance::KEY) {
         writer.set_metadata(key, value.clone());
     }
     let header = writer.commit().map_err(storage::io_error)?;

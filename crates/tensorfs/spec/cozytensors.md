@@ -156,7 +156,10 @@ location  = [chunk_index, offset, length]
 - **Closure:** a header's closure is the header, its chunks and every component's assets.
 - **Metadata** is loading metadata: each source file's safetensors `__metadata__` (a LoRA's alpha and rank),
   `source` (the pinned upstream, `hf://<org>/<name>@<commit>`), and `filled` (`{from, files, note}`) when a migration
-  filled run data from upstream.
+  filled run data from upstream. A quantized lane carries `provenance` (`{package, release, recipe, fingerprint,
+  source, plan}`): the package release and recipe that wrote it, the recipe's fingerprint (the digest of its plan's
+  canonical form; of a code hook, its identity with that release), the source header's id and the plan. No reader
+  needs it to load a lane, a malformed one is ignored, and a writer never carries it over from a base.
 - **Construction order is data.** `components`, each component's `tensors` and each encoded tensor's parts are
   arrays in construction order: the order in which the model builds and fills them (its `state_dict()` order). The
   order is part of the header's bytes, so reordering changes its digest. A writer MUST take the order from its

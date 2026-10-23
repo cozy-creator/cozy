@@ -98,15 +98,16 @@ fn download_and_upload_refuse_before_any_run() {
 }
 
 #[test]
-fn quantize_names_one_checkpoint_and_one_quantizer_before_any_run() {
+fn quantize_names_one_checkpoint_and_one_package_before_any_run() {
     let Some(home) = Home::new() else { return };
-    // Grammar and sources, before any Hub read.
-    let cases: [(&[&str], &str); 5] = [
-        (&["model", "quantize", "fidika/sdxl@1.0.0"], ""),
-        (&["model", "quantize", "fidika/sdxl@1.0.0", "--int8", "--fp8"], ""),
-        (&["model", "quantize", "local/tiny", "--int8"], "model_quantize_source"),
-        (&["model", "quantize", "fidika/sdxl@1.0.0", "local/x", "--int8"], "model_local_destination"),
-        (&["model", "quantize", "fidika/sdxl@1.0.0/bf16", "--int8"], "model_variant_pin"),
+    // Grammar, the package and sources, before any Hub read.
+    let cases: [(&[&str], &str); 6] = [
+        (&["model", "quantize", "fidika/sdxl@1.0.0", "--package", "fidika/sdxl"], ""),
+        (&["model", "quantize", "fidika/sdxl@1.0.0", "--int8", "--fp8", "--package", "fidika/sdxl"], ""),
+        (&["model", "quantize", "fidika/sdxl@1.0.0", "--int8"], "model_quantize_package"),
+        (&["model", "quantize", "local/tiny", "--int8", "--package", "fidika/sdxl"], "model_quantize_source"),
+        (&["model", "quantize", "fidika/sdxl@1.0.0", "local/x", "--int8", "--package", "fidika/sdxl"], "model_local_destination"),
+        (&["model", "quantize", "fidika/sdxl@1.0.0/bf16", "--int8", "--package", "fidika/sdxl"], "model_variant_pin"),
     ];
     for (args, code) in cases {
         let out = home.cozy(["--json", "--tensorhub", "http://127.0.0.1:9"].iter().chain(args));
@@ -115,9 +116,9 @@ fn quantize_names_one_checkpoint_and_one_quantizer_before_any_run() {
             assert_eq!(out.refusal()["code"], code, "{args:?}: {out:?}");
         }
     }
-    // tensorhub.com, read only: the quantizer's slot selects the release's variant, and a machine
-    // to be found by `any` holds no packages to choose a quantizer from.
+    // The recipe is never guessed from what a machine holds: the package is named, or nothing runs.
     let any = home.cozy(["--json", "model", "quantize", "fidika/sdxl@1.0.0", "--int8", "--on", "any"]);
-    assert_eq!((any.code, any.refusal()["code"].as_str()), (2, Some("model_quantizer_unnamed")), "{any:?}");
+    assert_eq!((any.code, any.refusal()["code"].as_str()), (2, Some("model_quantize_package")), "{any:?}");
+    assert!(any.refusal()["remedy"].as_str().is_some_and(|r| r.contains("--package org/name")), "{any:?}");
     assert!(!home.root().join("calcifer").exists(), "a refusal started Calcifer");
 }

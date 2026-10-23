@@ -260,7 +260,7 @@ mod tests {
             ),
             (Some("local-0123"), Some("local"))
         );
-        assert_eq!(installed.interface.public(), ["generate"]);
+        assert_eq!(installed.interface.public(), ["generate", "fp8", "int8"]);
     }
 
     #[test]

@@ -6,18 +6,13 @@ use serde_json::Value;
 
 use super::interface::{Callable, Constraints, Field, Interface, Type, Wire};
 
-/// One concrete invocation: required terms bare, optional ones bracketed. A published recipe
-/// runs through `cozy model quantize`; local code's runs as its author's.
+/// One concrete invocation: required terms bare, optional ones bracketed. A conversion reads its
+/// input model and the repository it writes first.
 pub fn usage_line(target: &str, callable: &Callable) -> String {
     let mut line = format!("cozy run {target}");
     if callable.is_conversion() {
         let source = &callable.models[0].param;
-        line = match target.rsplit_once('/') {
-            Some((package, name)) if !package.starts_with("local/") => {
-                format!("cozy model quantize <{source}> [<org/model>] --recipe {name} --package {package}")
-            }
-            _ => format!("{line} <{source}> [<org/model>]"),
-        };
+        let _ = write!(line, " <{source}> [<org/model>]");
         for slot in &callable.models[1..] {
             let _ = write!(line, " model.{}=<ref>", slot.param);
         }
@@ -259,11 +254,7 @@ mod tests {
         );
         assert_eq!(
             usage_line("fidika/sdxl/int8", callable(&sdxl, "int8")),
-            "cozy model quantize <source> [<org/model>] --recipe int8 --package fidika/sdxl"
-        );
-        assert_eq!(
-            usage_line("local/sdxl/int8", callable(&sdxl, "int8")),
-            "cozy run local/sdxl/int8 <source> [<org/model>]"
+            "cozy run fidika/sdxl/int8 <source> [<org/model>]"
         );
         let h3 = interface("minimax-h3-1.37.2");
         let ref2va = usage_line("fidika/minimax-h3/ref2va", callable(&h3, "ref2va"));

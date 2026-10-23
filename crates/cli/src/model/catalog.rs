@@ -110,6 +110,8 @@ struct Lane {
     component_bytes: BTreeMap<String, i64>,
     /// The commit (tree) the lane names, as `org/name#sha256:…`.
     commit: String,
+    /// The recipe that wrote it, as its header records.
+    provenance: Option<hub_client::types::ModelLaneProvenance>,
 }
 
 #[derive(Serialize)]
@@ -157,6 +159,7 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
                     components: l.components.clone().unwrap_or_default(),
                     component_bytes: l.component_bytes.clone().into_iter().collect(),
                     commit: format!("{repo}#{}", l.manifest_id),
+                    provenance: l.provenance.clone(),
                 })
                 .collect(),
         })
@@ -182,10 +185,15 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
         let yanked = if release.yanked { ", yanked" } else { "" };
         let revision = release.revision.map(|r| format!("revision {r}")).unwrap_or_default();
         anstream::println!("\n{}@{} ({revision}{yanked})", protocol::names::shown(&repo.to_string()), release.release);
-        let mut table = Table::new(ctx, ["lane", "precision", "bytes", "commit"]);
+        let mut table = Table::new(ctx, ["lane", "precision", "bytes", "commit", "recipe"]);
         for lane in &release.lanes {
             let precision = lane.precision.clone().unwrap_or_else(|| "-".into());
-            table = table.row([lane.lane.clone(), precision, output::bytes(lane.bytes as u64), lane.commit.clone()]);
+            let recipe = lane.provenance.as_ref().map_or_else(|| "-".into(), |p| format!("{}@{} {}", protocol::names::shown(&p.package), p.release, p.recipe));
+            table = table.row([lane.lane.clone(), precision, output::bytes(lane.bytes as u64), lane.commit.clone(), recipe]);
+        }
+        // A recipe is its fingerprint: the digest of the plan the lane was written by.
+        for (lane, made) in release.lanes.iter().filter_map(|l| Some((l, l.provenance.as_ref()?))) {
+            table = table.note(format!("{}: recipe {}, from {}", lane.lane, made.fingerprint, made.source));
         }
         table.print();
     }
