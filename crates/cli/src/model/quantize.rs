@@ -1,6 +1,7 @@
-//! `cozy model quantize`: the serving package's quantizer, run as an ordinary conversion call
-//! (`cozy run <package>/<fn> <model> <org/name>`). The package owns the recipe; Runtime writes
-//! the lane through Runtime's TensorFS store and returns its checkpoint reference.
+//! `cozy model quantize`: the serving package's recipe (a conversion: never a function, so `cozy
+//! run` refuses it), run as a call with `<model> <org/name>`. A lane flag picks the recipe that
+//! writes that lane from this checkpoint; `--recipe` names one. The package owns the recipe;
+//! Runtime writes the lane through Runtime's TensorFS store and returns its checkpoint reference.
 use std::process::ExitCode;
 
 use hub_client::types::{ModelCard, ModelCatalogRelease};
@@ -87,9 +88,36 @@ async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef, lane: &str) -> R
     }
 }
 
-/// The one (package, release, function) that writes `lane` from this checkpoint: `--package`'s,
-/// else among the published packages the target machine holds.
-async fn quantizer(ctx: &Context, hub: &Hub, args: &Quantize, lane: &str, components: &[String]) -> Result<(String, String, String), Error> {
+/// What a quantize runs: the recipe writing a lane from this checkpoint, or one by name.
+enum Wanted<'a> {
+    Lane(&'a str, &'a [String]),
+    Recipe(&'a str),
+}
+
+impl Wanted<'_> {
+    fn recipes<'i>(&self, interface: &'i Interface) -> Vec<&'i Callable> {
+        let fold = |name: &str| name.replace('-', "_");
+        match self {
+            Wanted::Lane(lane, components) => quantizers(interface, lane, components),
+            Wanted::Recipe(name) => (interface.callables.iter())
+                .filter(|c| !c.internal && c.is_conversion() && fold(&c.name) == fold(name))
+                .collect(),
+        }
+    }
+}
+
+/// The recipe a quantize runs.
+struct Recipe {
+    package: String,
+    release: String,
+    name: String,
+    /// The weights outputs it writes.
+    outputs: Vec<String>,
+}
+
+/// The one recipe `wanted` names: `--package`'s, else among the published packages the target
+/// machine holds.
+async fn quantizer(ctx: &Context, hub: &Hub, args: &Quantize, wanted: &Wanted<'_>) -> Result<Recipe, Error> {
     let candidates: Vec<(String, Option<String>)> = match &args.package {
         Some(package) => {
             let (name, release) = package.split_once('@').map_or((package.as_str(), None), |(n, r)| (n, Some(r.to_owned())));
@@ -112,63 +140,106 @@ async fn quantizer(ctx: &Context, hub: &Hub, args: &Quantize, lane: &str, compon
                 .collect()
         }
     };
-    let mut found = vec![];
+    let mut found: Vec<Recipe> = vec![];
     for (package, release) in candidates {
         let card = crate::run::resolve(ctx, hub, &package, release.as_deref()).await?.card;
-        for callable in quantizers(&card.interface, lane, components) {
-            found.push((package.clone(), card.release.clone(), callable.name.clone()));
+        for callable in wanted.recipes(&card.interface) {
+            if !found.iter().any(|r| r.package == package && r.release == card.release && r.name == callable.name) {
+                let outputs = callable.weights_outputs.iter().map(|o| o.output_id.clone()).collect();
+                found.push(Recipe { package: package.clone(), release: card.release.clone(), name: callable.name.clone(), outputs });
+            }
         }
     }
-    found.dedup();
-    match found.len() {
-        1 => Ok(found.remove(0)),
-        0 => Err(Error::new(Kind::NotFound, "model_quantizer_not_found", format!("no package here quantizes this model ({}) to {lane}", components.join(", ")))
-            .remedy(format!("a package's quantizer is a function that takes the model and declares one weights output named {lane}; name its package with --package org/name"))),
-        _ => {
-            let named: Vec<_> = found.iter().map(|(p, r, f)| format!("{p}/{f}@{r}")).collect();
-            Err(Error::new(Kind::Usage, "model_quantizer_ambiguous", format!("{} all quantize it to {lane}", named.join(", ")))
+    match (found.len(), wanted) {
+        (1, _) => Ok(found.remove(0)),
+        (0, Wanted::Lane(lane, components)) => Err(Error::new(Kind::NotFound, "model_quantizer_not_found", format!("no package here quantizes this model ({}) to {lane}", components.join(", ")))
+            .remedy(format!("a package's quantizer is a recipe that takes the model and declares one weights output named {lane}; name its package with --package org/name"))),
+        (0, Wanted::Recipe(name)) => Err(Error::new(Kind::NotFound, "model_recipe_not_found", format!("no package here has the recipe {name}"))
+            .remedy("name its package with --package org/name")),
+        (_, wanted) => {
+            let named: Vec<_> = found.iter().map(|r| format!("{}/{}@{}", r.package, r.name, r.release)).collect();
+            let what = match wanted {
+                Wanted::Lane(lane, _) => format!("quantize it to {lane}"),
+                Wanted::Recipe(name) => format!("have the recipe {name}"),
+            };
+            Err(Error::new(Kind::Usage, "model_quantizer_ambiguous", format!("{} all {what}", named.join(", ")))
                 .remedy("choose one with --package org/name[@release]"))
         }
     }
 }
 
-pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, Error> {
-    let lane = match (args.int8, args.fp8, args.w4a8) {
-        (true, ..) => "int8",
-        (_, true, _) => "fp8",
-        (.., true) => "w4a8",
-        _ => "nvfp4",
+/// The destination among a quantize's terms (the one without `=`), and the recipe's other inputs.
+fn terms(terms: &[String]) -> Result<(Option<String>, Vec<String>), Error> {
+    let (bare, inputs): (Vec<&String>, Vec<&String>) = terms.iter().partition(|term| !term.contains('='));
+    let destination = match bare.as_slice() {
+        [] => None,
+        [one] => Some(refs::destination(one)?),
+        _ => return Err(Error::new(Kind::Usage, "model_quantize_terms", format!(
+            "one destination at most; got {}", bare.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")))
+            .remedy("name the recipe's other inputs as model.<slot>=<ref> or <field>=<value>")),
     };
+    Ok((destination, inputs.into_iter().cloned().collect()))
+}
+
+pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, Error> {
     let model = ModelRef::parse(&args.model)?;
-    let destination = args.destination.as_deref().map(refs::destination).transpose()?;
+    let (destination, inputs) = terms(&args.terms)?;
     let hub = ctx.hub()?;
-    let (source, components, repo) = checkpoint(ctx, &hub, &model, lane).await?;
+    let (source, repo, recipe) = match &args.recipe {
+        Some(name) => {
+            let recipe = quantizer(ctx, &hub, &args, &Wanted::Recipe(name)).await?;
+            // A recipe writing one 4-bit lane takes original weights only, as the lane flag does.
+            let lane = match recipe.outputs.as_slice() {
+                [one] => one.as_str(),
+                _ => "",
+            };
+            let (source, _, repo) = checkpoint(ctx, &hub, &model, lane).await?;
+            (source, repo, recipe)
+        }
+        None => {
+            let lane = match (args.int8, args.fp8, args.w4a8) {
+                (true, ..) => "int8",
+                (_, true, _) => "fp8",
+                (.., true) => "w4a8",
+                _ => "nvfp4",
+            };
+            let (source, components, repo) = checkpoint(ctx, &hub, &model, lane).await?;
+            let recipe = quantizer(ctx, &hub, &args, &Wanted::Lane(lane, &components)).await?;
+            (source, repo, recipe)
+        }
+    };
     // The variant goes onto the tag's tree (main unless named): publishing the tag releases all.
     let destination = destination.unwrap_or_else(|| format!("{repo}@main"));
-    let (package, release, function) = quantizer(ctx, &hub, &args, lane, &components).await?;
-    let inputs = vec![source.clone(), destination.clone()];
-    let run = crate::run::call(ctx, &package, Some(&release), &function, inputs, &args.placement, args.detach).await?;
+    let mut terms = vec![source.clone(), destination.clone()];
+    terms.extend(inputs);
+    let run = crate::run::call(ctx, &recipe.package, Some(&recipe.release), &recipe.name, terms, &args.placement, args.detach).await?;
     if !ctx.json && run.status == Status::Completed {
-        match written_checkpoint(&run, lane) {
-            Some(WrittenCheckpoint::Reference(reference)) => {
-                let (model, tree) = (&reference.repo_id, &reference.revision);
-                let mut record = Record::new().field("checkpoint", format!("{model}@{tree}"));
-                if !reference.variant.is_empty() {
-                    record = record.field("variant", &reference.variant);
+        let mut next = vec![];
+        for output in &recipe.outputs {
+            match written_checkpoint(&run, output) {
+                Some(WrittenCheckpoint::Reference(reference)) => {
+                    let (model, tree) = (&reference.repo_id, &reference.revision);
+                    let mut record = Record::new().field("checkpoint", format!("{model}@{tree}"));
+                    if !reference.variant.is_empty() {
+                        record = record.field("variant", &reference.variant);
+                    }
+                    record.print(ctx);
+                    // The release it was made from moves to the commit the machine wrote, which
+                    // holds its variant too: exactly that one, wherever its tag moves next.
+                    let into = destination.split_once('@').map_or(destination.as_str(), |(into, _)| into);
+                    let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
+                    let release = pinned.filter(|_| into == repo.to_string()).unwrap_or("<version>");
+                    next.push(format!("cozy model publish {model} --release {release} --commit {tree}"));
                 }
-                record.print(ctx);
-                // The release it was made from moves to the commit the machine wrote, which holds
-                // its variant too: exactly that one, wherever its tag moves next.
-                let into = destination.split_once('@').map_or(destination.as_str(), |(into, _)| into);
-                let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
-                let release = pinned.filter(|_| into == repo.to_string()).unwrap_or("<version>");
-                output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tree}")]);
+                Some(WrittenCheckpoint::Header(header)) => {
+                    Record::new().field("checkpoint header", header).print(ctx);
+                    break;
+                }
+                None => {}
             }
-            Some(WrittenCheckpoint::Header(header)) => {
-                Record::new().field("checkpoint header", header).print(ctx);
-            }
-            None => {}
         }
+        next.dedup();
+        output::next(ctx, &next.iter().map(String::as_str).collect::<Vec<_>>());
     }
     Ok(crate::run::exit_code(&run))
 }
@@ -195,6 +266,18 @@ mod tests {
 
     fn names(found: Vec<&Callable>) -> Vec<&str> {
         found.into_iter().map(|c| c.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_recipe_is_found_by_its_name_and_the_destination_among_the_terms() {
+        let klein = interface("flux-3-klein-0.5.0");
+        assert_eq!(names(Wanted::Recipe("drafter-head").recipes(&klein)), ["drafter_head"]);
+        assert!(Wanted::Recipe("generate").recipes(&klein).is_empty(), "a function is no recipe");
+        let terms = |raw: &[&str]| super::terms(&raw.iter().map(|t| t.to_string()).collect::<Vec<_>>());
+        let (destination, inputs) = terms(&["model.base=fidika/h3@1.0.0", "Paul/Tiny", "max_relative_frobenius=0.1"]).unwrap();
+        assert_eq!(destination.as_deref(), Some("paul/tiny@main"));
+        assert_eq!(inputs, ["model.base=fidika/h3@1.0.0", "max_relative_frobenius=0.1"]);
+        assert_eq!(terms(&["a/b", "c/d"]).unwrap_err().code, "model_quantize_terms");
     }
 
     #[test]

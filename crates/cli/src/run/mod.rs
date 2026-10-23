@@ -243,6 +243,10 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         functions(ctx, &package, &resolved);
         return Ok(ExitCode::SUCCESS);
     };
+    let asked = callable(&package, &resolved.card.interface, &function)?;
+    if asked.is_conversion() {
+        return Err(recipe(&package, asked));
+    }
     if args.describe {
         let card = &resolved.card;
         let callable = callable(&package, &card.interface, &function)?;
@@ -561,6 +565,17 @@ fn callable<'a>(
     }
 }
 
+/// A recipe is not a function: `cozy model quantize` runs it, by its lane or by name.
+fn recipe(package: &str, recipe: &Callable) -> Error {
+    let how = match recipe.weights_outputs.as_slice() {
+        [one] if ["int8", "fp8", "nvfp4"].contains(&one.output_id.as_str()) => format!("--{}", one.output_id),
+        _ => format!("--recipe {}", recipe.name),
+    };
+    let source = &recipe.models[0].param;
+    Error::new(Kind::Usage, "callable_recipe", format!("{package}/{} is a recipe, not a function", recipe.name))
+        .next(format!("cozy model quantize <{source}> [<org/model>] {how} --package {package}"))
+}
+
 /// Refuses inputs given to a package instead of one of its functions, naming the command that
 /// runs each of its first two functions with them.
 fn unnamed(
@@ -611,7 +626,8 @@ fn functions(ctx: &Context, package: &str, resolved: &Resolved) {
     functions_of(ctx, package, (&card.release, card.summary()), Some(&from), &card.interface);
 }
 
-/// A package's public functions, and where each runs.
+/// A package's functions, and where each runs. Its recipes are not functions: `cozy model
+/// quantize` runs them.
 fn functions_of(
     ctx: &Context,
     package: &str,
@@ -626,10 +642,9 @@ fn functions_of(
         Some(c) if c.accelerator == Some(false) => "CPU",
         _ => "GPU",
     };
-    let conversion = |name: &&str| callable(name).is_some_and(Callable::is_conversion);
     if ctx.json {
         let rows: Vec<_> = (public.iter())
-            .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name), "conversion": conversion(name)}))
+            .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name)}))
             .collect();
         output::json(&serde_json::json!({
             "package": package, "release": release, "release_from": from, "summary": summary,
@@ -637,18 +652,12 @@ fn functions_of(
         }));
         return;
     }
-    // Conversions write model lanes: model authors' work, named below the functions a run uses.
-    let (conversions, public): (Vec<&str>, Vec<&str>) = public.iter().copied().partition(conversion);
-    let public = match public.is_empty() {
-        true => conversions.clone(),
-        false => public,
-    };
     let mut table = output::Table::new(ctx, ["FUNCTION", "RUNS ON"]);
     for name in &public {
         table = table.row([*name, runs_on(name)]);
     }
-    if public != conversions && !conversions.is_empty() {
-        table = table.note(format!("for model authors: {} (conversions)", conversions.join(", ")));
+    if public.is_empty() {
+        table = table.note(format!("{package} has no functions: its recipes run through cozy model quantize"));
     }
     let from = from.map(|from| format!(" ({from})")).unwrap_or_default();
     let summary = match summary.is_empty() {
