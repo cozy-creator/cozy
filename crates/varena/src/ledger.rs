@@ -871,42 +871,6 @@ pub(crate) fn host_calls(shared: &Shared) -> Option<Vec<HostCall>> {
     Some(calls.collect())
 }
 
-/// This process's anonymous peak while it runs requests. Linux keeps only a resident high-water
-/// (`VmHWM`), so each look bounds the anonymous peak since the last as that high-water less the
-/// smaller of its file bytes then and now and less its shmem bytes now (the host pages it maps:
-/// counted once, in the budget, never as need), then starts it over.
-pub(crate) struct Window {
-    peak: u64,
-    file: u64,
-}
-
-impl Window {
-    /// Measured from now; `None` where it cannot be read.
-    pub(crate) fn start() -> Option<Window> {
-        let now = host_memory::resident(std::process::id()).ok()?;
-        restart();
-        Some(Window { peak: now.anon, file: now.file })
-    }
-
-    /// The anonymous peak so far; `None` where it cannot be read.
-    pub(crate) fn look(&mut self) -> Option<u64> {
-        let now = host_memory::resident(std::process::id()).ok()?;
-        let bound = now.peak.saturating_sub(self.file.min(now.file) + now.shmem);
-        self.peak = self.peak.max(bound).max(now.anon);
-        self.file = now.file;
-        restart();
-        Some(self.peak)
-    }
-}
-
-/// This process's resident high-water starts over (where it may not, the next look bounds from
-/// further back).
-fn restart() {
-    if let Err(e) = host_memory::reset_peak(std::process::id()) {
-        tracing::debug!("varena: host high-water not reset: {e}");
-    }
-}
-
 /// A request's compute bytes (beside its weights) at `compute/<package>|<shape>`: the latest
 /// run's replaces what was there (one large run never pins it).
 pub(crate) fn record_compute(shared: &Shared, key: &str, bytes: u64) -> Result<()> {
