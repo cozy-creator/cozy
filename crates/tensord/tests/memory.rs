@@ -1,7 +1,9 @@
-//! TensorD hosting varena's lease manager (design varena-leases), with real processes as
-//! executors: stand-ins (this binary's `lease_agent`, run as children) dial the GPU's listener and
-//! lease chunks of the host-page backend. TensorD leases to its tenants alone, keeps the books,
-//! logs every grant and exit, and retains landed weights only for the same trust domain.
+//! TensorD hosting varena's memory manager (design varena-leases), with real processes as
+//! executors: stand-ins (this binary's `lease_agent`, run as children) dial the GPU's listener,
+//! allocate chunks of the host-page backend and report their facts. TensorD allocates to its
+//! tenants alone, accounts every page, logs every allocation and exit, keeps landed weights in the
+//! GPU page cache for the same trust domain only, admits and places requests by measured peaks,
+//! and reads the host rule's calls from the agents' facts.
 #![cfg(unix)]
 use std::{
     io::{BufRead, BufReader, Write},
@@ -22,11 +24,13 @@ use platform::{
     process::{Birth, Exact},
 };
 use tensord::{
+    execution::Engine,
+    journal::Invocation,
     machine::receipt,
     memory::{self, Gpu, Leases, MemoryLog, Peaks, Peers, Tenant, Tenants},
 };
 use varena::{
-    lease::{agent::Attach, Agent, Hosting, Identity, Region},
+    lease::{Agent, Attach, Hosting, Identity, Measured, Peak, Region},
     GpuId, HostBackend,
 };
 
@@ -51,9 +55,10 @@ fn euid() -> u32 {
 }
 
 /// A lease agent stand-in: run by `StandIn::start` with its control socket at stdin. It answers
-/// one line per command: `attach` (`attached`, or its refusal's code),
-/// `take <MiB> <fingerprint>` (one region's chunks, imported and mapped: `<chunks> <adopted>`) and
-/// `land` (every taken chunk's fill landed: `landed`).
+/// one line per command: `attach` (`attached`, or its refusal's code), `take <MiB> <fingerprint>`
+/// (one region's chunks, imported and mapped: `<chunks> <adopted>`), `land` (every taken chunk's
+/// fill landed: `landed`) and `measured <request> <working> <compute> <host>` (a request's peaks
+/// at its end: `measured`).
 #[test]
 #[ignore = "the lease tests run it as an executor"]
 fn lease_agent() {
@@ -78,7 +83,7 @@ fn lease_agent() {
                 let (mib, fingerprint) = args.split_once(' ').unwrap();
                 let agent = agent.as_ref().unwrap();
                 let region = Region { fingerprint: fingerprint.parse().unwrap(), region: 0 };
-                let leases = agent.take(mib.parse::<u64>().unwrap() * MIB, Some(region)).unwrap();
+                let leases = agent.take(mib.parse::<u64>().unwrap() * MIB, varena::lease::Kind::Weights, Some(region)).unwrap();
                 agent.mapped(&leases.iter().map(|lease| lease.ticket).collect::<Vec<_>>()).unwrap();
                 let adopted = leases.iter().filter(|lease| lease.adopted).count();
                 let reply = format!("{} {adopted}", leases.len());
@@ -89,6 +94,12 @@ fn lease_agent() {
                 let agent = agent.as_ref().unwrap();
                 taken.iter().for_each(|lease| agent.landed(lease.ticket).unwrap());
                 "landed".into()
+            }
+            ("measured", args) => {
+                let [request, working, compute, host] = args.split(' ').collect::<Vec<_>>()[..] else { panic!("{args}") };
+                let (working, compute, host) = (working.parse().unwrap(), compute.parse().unwrap(), host.parse().unwrap());
+                agent.as_ref().unwrap().measured(Measured::Request { request: request.into(), working, compute, host }).unwrap();
+                "measured".into()
             }
             (other, _) => panic!("unknown command {other}"),
         };
@@ -169,6 +180,25 @@ impl Drop for StandIn {
     }
 }
 
+/// A GPU hosted as TensorD hosts it: its manager over host pages (none: chunk-less), its peers
+/// `tenants`.
+fn hosted(id: &GpuId, tenants: &Tenants, chunks: bool, dir: &std::path::Path, log: &MemoryLog) -> Arc<Gpu> {
+    let hosting: Arc<dyn Hosting> = Arc::new(Peers::new(tenants.clone(), vec![euid()], log.clone()));
+    let card = id.memory;
+    let open: Option<varena::lease::Opener> = chunks.then(|| Box::new(move || Ok(Arc::new(HostBackend::new(card)) as Arc<dyn varena::Backend>)) as varena::lease::Opener);
+    let leases = Leases { hosting, open, tenants: tenants.clone() };
+    Arc::new(Gpu::create("0", &[inventory(id)], None, HostMode::Dedicated, leases, &Peaks::at(dir.join("peaks")), log).unwrap())
+}
+
+/// Waits until `done` holds: the manager reads an agent's reports on its own thread.
+fn eventually(what: &str, done: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < BACKSTOP, "never: {what}");
+        std::thread::yield_now();
+    }
+}
+
 /// The memory log's events of `kind`.
 fn events(dir: &std::path::Path, kind: &str) -> Vec<serde_json::Value> {
     let log = std::fs::read_to_string(dir.join("memory.log")).unwrap_or_default();
@@ -227,12 +257,12 @@ fn tensord_leases_to_its_tenants_and_keeps_landed_weights_within_their_package()
         opens.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(HostBackend::new(card)) as Arc<dyn varena::Backend>)
     };
-    let leases = Leases { hosting, open: Box::new(open) };
+    let leases = Leases { hosting, open: Some(Box::new(open)), tenants: tenants.clone() };
     let peaks = Peaks::at(dir.path().join("peaks"));
-    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, Some(leases), &peaks, &log).unwrap());
-    let manager = gpu.manager().expect("TensorD manages the GPU's chunks").clone();
+    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, leases, &peaks, &log).unwrap());
+    let manager = gpu.manager.clone();
     let (woke, wakes) = mpsc::channel();
-    let _events = memory::react(vec![memory::Source::Ledger(gpu.clone())], move |what| { let _ = woke.send(what); }).unwrap();
+    let _events = memory::react(vec![memory::Source::Gpu(gpu.clone())], move |what| { let _ = woke.send(what); }).unwrap();
 
     let mut stranger = StandIn::start(&id.uuid);
     assert_eq!(stranger.ask("attach"), "NotRegistered", "a process TensorD did not start is refused");
@@ -245,20 +275,20 @@ fn tensord_leases_to_its_tenants_and_keeps_landed_weights_within_their_package()
     let books = manager.holdings();
     assert_eq!((books.executors.len(), books.executors[0].pid, books.executors[0].bytes), (1, first.pid(), 8 * MIB), "{books:?}");
     assert_eq!(first.ask("land"), "landed");
-    let grants = events(dir.path(), "grant");
+    let grants = events(dir.path(), "allocate");
     assert!(grants.iter().any(|grant| grant["pid"] == first.pid() && grant["bytes"] == 8 * MIB), "{grants:?}");
 
     let pid = first.pid();
     first.kill();
-    // The manager logs the reclaim, then rings.
+    // The manager logs the exit, then rings.
     let (started, reclaimed) = (Instant::now(), |reclaim: &serde_json::Value| reclaim["pid"] == pid);
-    while !events(dir.path(), "reclaim").iter().any(reclaimed) {
+    while !events(dir.path(), "exit").iter().any(reclaimed) {
         wakes.recv_timeout(BACKSTOP.saturating_sub(started.elapsed())).expect("the manager reclaims an exited executor's leases");
     }
     let books = manager.holdings();
-    assert_eq!((books.retained, books.leased, books.executors.len()), (8 * MIB, 0, 0), "its landed region is retained: {books:?}");
-    let reclaims = events(dir.path(), "reclaim");
-    assert!(reclaims.iter().any(|reclaim| reclaimed(reclaim) && reclaim["retained_bytes"] == 8 * MIB), "{reclaims:?}");
+    assert_eq!((books.page_cache, books.allocated, books.executors.len()), (8 * MIB, 0, 0), "its landed region is in the GPU page cache: {books:?}");
+    let reclaims = events(dir.path(), "exit");
+    assert!(reclaims.iter().any(|reclaim| reclaimed(reclaim) && reclaim["cached_bytes"] == 8 * MIB), "{reclaims:?}");
 
     let mut other = StandIn::tenant(&id.uuid, &tenants, "plan-b", "gen-b");
     assert_eq!(other.ask("attach"), "attached");
@@ -266,9 +296,9 @@ fn tensord_leases_to_its_tenants_and_keeps_landed_weights_within_their_package()
     let mut next = StandIn::tenant(&id.uuid, &tenants, "plan-a", "gen-a");
     assert_eq!(next.ask("attach"), "attached");
     assert_eq!(next.ask("take 8 7"), "1 1", "the next executor of its package adopts it, no copy");
-    assert!(!events(dir.path(), "adopt").is_empty());
+    assert!(!events(dir.path(), "cached").is_empty());
     let books = manager.holdings();
-    assert_eq!((books.retained, books.executors.len()), (0, 2), "{books:?}");
+    assert_eq!((books.page_cache, books.executors.len()), (0, 2), "{books:?}");
     drop((stranger, other, next));
 }
 
@@ -290,11 +320,7 @@ fn a_follower_dialing_before_it_is_reported_waits_and_is_admitted() {
     let dir = tempfile::tempdir().unwrap();
     let (id, log) = (gpu_id(), MemoryLog::at(dir.path().to_path_buf()));
     let tenants = Tenants::default();
-    let hosting: Arc<dyn Hosting> = Arc::new(Peers::new(tenants.clone(), vec![euid()], log.clone()));
-    let card = id.memory;
-    let leases = Leases { hosting, open: Box::new(move || Ok(Arc::new(HostBackend::new(card)) as Arc<dyn varena::Backend>)) };
-    let peaks = Peaks::at(dir.path().join("peaks"));
-    let _gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, Some(leases), &peaks, &log).unwrap();
+    let _gpu = hosted(&id, &tenants, true, dir.path(), &log);
     // Rank 0: its own process group's leader, a registered executor whose Start forms the group.
     let mut command = Command::new("sh");
     command.args(["-c", "sleep 1000; :"]);
@@ -327,4 +353,142 @@ fn a_follower_dialing_before_it_is_reported_waits_and_is_admitted() {
     // SAFETY: a signal to the process group this test made (rank 0, its sleep, the stand-ins).
     assert_eq!(unsafe { libc::kill(-(leader.id() as i32), libc::SIGKILL) }, 0);
     leader.wait().unwrap();
+}
+
+const GIB: u64 = 1 << 30;
+const PACKAGE: &str = "s5/package@1";
+const BIG: &str = "big";
+
+/// A request whose measured peak does not fit beside a dispatched one waits, woken by the
+/// manager's events, and is admitted once that one ends; a cancel ends a wait. The peak is what
+/// an agent measured under its dispatch's key.
+#[test]
+fn a_request_that_does_not_fit_waits_until_the_running_one_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let (id, log, tenants) = (gpu_id(), MemoryLog::at(dir.path().join("logs")), Tenants::default());
+    let gpu = hosted(&id, &tenants, true, dir.path(), &log);
+    let engine = Engine::open(&dir.path().join("engine")).unwrap();
+    let woken = engine.clone();
+    let _events = memory::react(vec![memory::Source::Gpu(gpu.clone())], move |_| woken.notify_activity()).unwrap();
+    let request = |key: &str| engine.submit(key, Invocation::default()).unwrap().id;
+    let admit = |id: &str| memory::admit(&engine, &[&*gpu.manager], id, PACKAGE, BIG).unwrap();
+    let mut a = StandIn::tenant(&id.uuid, &tenants, "plan-a", "gen-a");
+    assert_eq!(a.ask("attach"), "attached");
+
+    let first = request("first");
+    assert!(admit(&first), "unmeasured on an idle GPU, it runs");
+    assert_eq!(a.ask(&format!("measured {first} {} 0 0", 5 * GIB)), "measured");
+    eventually("its peak is recorded", || gpu.manager.peaks().iter().any(|p| matches!(p, Peak::Request { key, bytes } if *key == format!("{PACKAGE}|{BIG}") && *bytes == 5 * GIB)));
+    gpu.manager.undispatch(&first);
+
+    let second = request("second");
+    assert!(admit(&second), "alone, it fits");
+    assert!(!gpu.manager.fits(PACKAGE, BIG), "two do not fit");
+    let third = request("third");
+    std::thread::scope(|scope| {
+        let (done, admitted) = mpsc::channel();
+        let (third, admit) = (&third, &admit);
+        scope.spawn(move || done.send(admit(third)).unwrap());
+        engine.notify_activity(); // a wake that frees nothing
+        assert!(admitted.try_recv().is_err(), "it waits while the second runs");
+        gpu.manager.undispatch(&second);
+        engine.notify_activity();
+        assert!(admitted.recv_timeout(BACKSTOP).expect("the second's end wakes it"), "admitted once the second ended");
+    });
+    let fourth = request("fourth");
+    std::thread::scope(|scope| {
+        let (fourth, admit) = (&fourth, &admit);
+        let waiting = scope.spawn(move || admit(fourth));
+        engine.cancel(fourth, "test").unwrap();
+        assert!(!waiting.join().unwrap(), "a cancel ends the wait, not admitted");
+    });
+    assert!(!gpu.manager.holdings().dispatched.iter().any(|(request, _)| *request == fourth));
+}
+
+/// Measured peaks persist per GPU model: saved from one manager and restored, exactly, into the
+/// next of the model (a restarted TensorD, another GPU of the model).
+#[test]
+fn measured_peaks_are_restored_exactly_by_the_next_manager_of_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let (id, log, tenants) = (gpu_id(), MemoryLog::at(dir.path().join("logs")), Tenants::default());
+    let gpu = hosted(&id, &tenants, true, dir.path(), &log);
+    let peaks = Peaks::at(dir.path().join("peaks"));
+    let measured = [Peak::Request { key: format!("{PACKAGE}|8"), bytes: 3 * GIB }, Peak::Set { key: "s5/package@1/unet".into(), bytes: 2 * GIB }];
+    gpu.manager.restore(&measured).unwrap();
+    peaks.save(&gpu.model, std::iter::once(&*gpu.manager));
+    let sorted = |mut p: Vec<Peak>| { p.sort_by_key(|p| format!("{p:?}")); p };
+    drop(gpu);
+    let next = hosted(&GpuId { uuid: format!("{}-next", id.uuid), ..id.clone() }, &tenants, true, dir.path(), &log);
+    assert_eq!(sorted(next.manager.peaks()), sorted(measured.to_vec()));
+}
+
+/// The host rule reads TensorD's own record of the running calls beside each GPU's measured host
+/// peaks: an unmeasured call carries none, a measured one the largest any GPU measured.
+#[test]
+fn an_unmeasured_running_call_carries_no_host_peak() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, tenants, running) = (MemoryLog::at(dir.path().join("logs")), Tenants::default(), memory::Running::default());
+    let gpus = [hosted(&gpu_id(), &tenants, true, dir.path(), &log), hosted(&gpu_id(), &tenants, true, dir.path(), &log)];
+    let calls = || memory::host_calls(&running, &gpus);
+    assert!(calls().is_empty(), "nothing runs");
+    let call = memory::Call { pid: std::process::id(), package: PACKAGE.into(), shape: BIG.into() };
+    running.lock().unwrap().insert("r".into(), call);
+    assert_eq!(calls()[0].peak, None, "unmeasured");
+    gpus[1].manager.restore(&[Peak::Host { key: format!("{PACKAGE}|{BIG}"), bytes: GIB }]).unwrap();
+    assert_eq!((calls()[0].peak, calls()[0].pid), (Some(GIB), std::process::id()), "measured on GPU 1");
+    running.lock().unwrap().remove("r");
+    assert!(calls().is_empty(), "ended");
+}
+
+/// The events thread wakes on a manager's event and ends with its pool.
+#[test]
+fn the_events_thread_wakes_on_a_managers_event_and_ends_with_its_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let (id, log, tenants) = (gpu_id(), MemoryLog::at(dir.path().join("logs")), Tenants::default());
+    let gpu = hosted(&id, &tenants, true, dir.path(), &log);
+    let (woke, wakes) = mpsc::channel();
+    let events = memory::react(vec![memory::Source::Gpu(gpu.clone())], move |what| {
+        let _ = woke.send(what);
+    })
+    .unwrap();
+    while wakes.recv_timeout(std::time::Duration::ZERO).is_ok() {}
+    gpu.manager.fault(); // its page cache goes: the manager signals
+    assert_eq!(wakes.recv_timeout(BACKSTOP).unwrap(), memory::Woke::Gpu);
+    drop(events);
+    while wakes.recv_timeout(BACKSTOP).is_ok() {}
+    assert!(wakes.recv().is_err(), "the thread ended with its pool");
+}
+
+/// TensorD names the GPU of a 2-GPU group that keeps a placeable set: beside GPU 0's executor's
+/// chunks the set has no room there and goes to GPU 1; with GPU 0 free it stays on GPU 0. Its
+/// bytes are what a load measured on the group.
+#[test]
+fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, tenants) = (MemoryLog::at(dir.path().join("logs")), Tenants::default());
+    let (id0, id1) = (gpu_id(), gpu_id());
+    let (gpu0, gpu1) = (hosted(&id0, &tenants, true, dir.path(), &log), hosted(&id1, &tenants, true, dir.path(), &log));
+    let set = "s5/package@1/unet";
+    gpu1.manager.restore(&[Peak::Set { key: set.into(), bytes: 3 * GIB }]).unwrap();
+    let homes = || memory::homes(&[&*gpu0.manager, &*gpu1.manager], PACKAGE, BIG, &[set], &log);
+    assert_eq!(homes(), vec![0], "GPU 0 has room");
+    let mut a = StandIn::tenant(&id0.uuid, &tenants, "plan-a", "gen-a");
+    assert_eq!(a.ask("attach"), "attached");
+    assert_eq!(a.ask(&format!("take {} 7", 6 * 1024)), "1 0");
+    assert_eq!(homes(), vec![1], "beside its chunks it has none");
+    a.kill();
+    eventually("its chunks go with it", || gpu0.manager.holdings().created == 0);
+    assert_eq!(homes(), vec![0], "its room is back");
+}
+
+/// A GPU TensorD cannot create chunks on has a chunk-less manager: its executors are refused as
+/// incompatible (they run standalone), and its requests are admitted all the same.
+#[test]
+fn a_chunkless_manager_refuses_its_agents_incompatible_and_still_admits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (id, log, tenants) = (gpu_id(), MemoryLog::at(dir.path().join("logs")), Tenants::default());
+    let gpu = hosted(&id, &tenants, false, dir.path(), &log);
+    let mut a = StandIn::tenant(&id.uuid, &tenants, "plan-a", "gen-a");
+    assert_eq!(a.ask("attach"), "Incompatible");
+    assert!(varena::lease::Manager::admit(&[&*gpu.manager], "r", PACKAGE, BIG).unwrap());
 }

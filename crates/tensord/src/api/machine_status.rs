@@ -61,7 +61,7 @@ pub(super) fn watch<B: MachineBackend>(
 }
 
 /// Disk use moves all the time; it alone is news once it moved by a hundredth of the disk.
-/// Lease books move with every grant: never news alone.
+/// Page accounting moves with every allocation: never news alone.
 fn changed(last: &v1::StatusFrame, next: &v1::StatusFrame) -> bool {
     let moved = match (&last.disk, &next.disk) {
         (Some(a), Some(b)) => a.free_bytes.abs_diff(b.free_bytes) >= b.total_bytes / 100,
@@ -69,7 +69,7 @@ fn changed(last: &v1::StatusFrame, next: &v1::StatusFrame) -> bool {
     };
     let still = |frame: &v1::StatusFrame| v1::StatusFrame {
         disk: None,
-        gpus: frame.gpus.iter().map(|gpu| v1::Gpu { leases: None, ..gpu.clone() }).collect(),
+        gpus: frame.gpus.iter().map(|gpu| v1::Gpu { memory: None, ..gpu.clone() }).collect(),
         ..frame.clone()
     };
     moved || still(last) != still(next)
@@ -104,10 +104,10 @@ pub(super) async fn frame<B: MachineBackend>(
     actor: VerifiedActor,
 ) -> Result<v1::StatusFrame, Error> {
     let store = identity.store.clone();
-    let ((runs, environments), warm, models, mut leases) = blocking(backend, move |backend| {
+    let ((runs, environments), warm, models, mut memory) = blocking(backend, move |backend| {
         let models = store.as_deref().map(crate::held_models::listing);
         let held = held(backend, actor)?;
-        Ok((held, backend.warm_set(actor)?, models.unwrap_or_default(), backend.leases()))
+        Ok((held, backend.warm_set(actor)?, models.unwrap_or_default(), backend.memory()))
     })
     .await?;
     let software = identity
@@ -143,7 +143,7 @@ pub(super) async fn frame<B: MachineBackend>(
                 },
                 memory_class: g.memory_class.clone(),
                 memory_limit_bytes: identity.gpu_memory_limit.filter(|&l| l < g.memory_bytes).unwrap_or(0),
-                leases: leases.remove(&g.device_uuid),
+                memory: memory.remove(&g.device_uuid),
             })
             .collect(),
         hubs: identity

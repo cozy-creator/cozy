@@ -645,6 +645,8 @@ pub struct Pool {
     _events: Option<memory::Reacting>,
     /// Memoized Model methods' results, shared by every run on this machine.
     memo: Arc<crate::memo::Memo>,
+    /// The calls running on its GPUs, by request: the host rule reads them.
+    running: memory::Running,
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
@@ -702,6 +704,11 @@ fn gpu_request_queued(engine: &Engine, root: Option<u64>) -> bool {
 
 impl Pool {
     pub fn new(root: &Path, config: GpuConfig, store: Arc<Store>) -> io::Result<Arc<Self>> {
+        Self::with_chunks(root, config, store, memory::chunks)
+    }
+
+    /// The pool with each GPU's chunks opened by `chunks` (its UUID; None: chunk-less).
+    fn with_chunks(root: &Path, config: GpuConfig, store: Arc<Store>, chunks: impl Fn(&str, &MemoryLog) -> Option<varena::lease::Opener>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
         let notes = MemoryLog::at(store.root().join("logs"));
         if let Some(identity) = config.identity {
@@ -723,7 +730,7 @@ impl Pool {
         let peers: Arc<dyn varena::lease::Hosting> = Arc::new(memory::Peers::new(tenants.clone(), uids.into_iter().flatten().collect(), notes.clone()));
         let leases = |entry: &str| memory::Leases {
             hosting: peers.clone(),
-            open: memory::row(entry, &config.inventory).and_then(|row| memory::chunks(&row.device_uuid, &notes)),
+            open: memory::row(entry, &config.inventory).and_then(|row| chunks(&row.device_uuid, &notes)),
             tenants: tenants.clone(),
         };
         let devices: Vec<Device> = envelope.iter().map(|entry| Device {
@@ -731,7 +738,8 @@ impl Pool {
             memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, leases(entry), &peaks, &notes).map(Arc::new),
         }).collect();
         let gpus = devices.iter().filter_map(|d| d.memory.clone()).collect();
-        let host = memory::Host::watch(config.host.mode, gpus, &notes);
+        let running = memory::Running::default();
+        let host = memory::Host::watch(config.host.mode, gpus, running.clone(), &notes);
         let launcher = crate::child_launcher::ChildLauncher::new()?;
         let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
         Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
@@ -775,28 +783,32 @@ impl Pool {
                 keeping: Mutex::new(()),
                 levels: Mutex::new(BTreeMap::new()),
                 memo,
+                running,
             }
         }))
     }
-    /// Each GPU's lease books by UUID.
-    pub fn leases(&self) -> BTreeMap<String, protocol::machine::GpuLeases> {
-        let books = |device: &Device| {
+    /// Each GPU's page accounting by UUID.
+    pub fn memory(&self) -> BTreeMap<String, protocol::machine::GpuMemory> {
+        let accounting = |device: &Device| {
             let held = device.memory.as_ref()?.manager.holdings();
             let uuid = memory::row(&device.entry, &self.config.inventory)?.device_uuid.clone();
-            let executors = held.executors.into_iter().map(|e| protocol::machine::LeaseHolder { pid: e.pid, executor: e.executor, chunks: e.chunks as u64, bytes: e.bytes }).collect();
-            Some((uuid, protocol::machine::GpuLeases {
+            let processes = held.executors.into_iter().map(|e| protocol::machine::ProcessMemory { pid: e.pid, executor: e.executor, chunks: e.chunks as u64, bytes: e.bytes }).collect();
+            Some((uuid, protocol::machine::GpuMemory {
                 capacity_bytes: held.capacity,
+                free_bytes: held.free,
+                foreign_bytes: held.foreign,
                 created_bytes: held.created,
                 created_chunks: held.created_chunks as u64,
-                leased_bytes: held.leased,
-                retained_bytes: held.retained,
-                retained_chunks: held.retained_chunks as u64,
+                allocated_bytes: held.allocated,
+                page_cache_bytes: held.page_cache,
+                page_cache_chunks: held.page_cache_chunks as u64,
                 books_only_bytes: held.books_only,
-                free_bytes: held.capacity.saturating_sub(held.created),
-                executors,
+                pressure_some_10s: held.pressure.some_10s,
+                pressure_some_60s: held.pressure.some_60s,
+                processes,
             }))
         };
-        self.devices.iter().filter_map(books).collect()
+        self.devices.iter().filter_map(accounting).collect()
     }
     /// A manager signalled (room freed, an executor exited, a peak was recorded): the dispatch queue asks
     /// `fits` again, each row the ledger newly names stalled ends (once), and changed peaks are
@@ -1011,9 +1023,6 @@ impl Pool {
             !(p.as_str() == plan && *s == start && gone.contains(birth)));
         self.tenants.lock().unwrap().retain(|_, t|
             !(t.plan == plan && t.start == start && gone.contains(t.exact.birth())));
-        for gpu in self.lane(start, degree).unwrap_or_default().iter().filter_map(|d| d.memory.as_ref()) {
-            gone.iter().for_each(|birth| gpu.reap(birth.pid));
-        }
     }
     /// The engine's dispatch wakes whenever a ledger signals: a queued request asks `fits`
     /// again then, and never polls.
@@ -1637,11 +1646,11 @@ impl Pool {
         let leaders = self.leaders.lock().unwrap();
         leaders.values().filter(|(_, p, _)| p.as_str() == plan).map(|(_, _, start)| *start).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
     }
-    /// Whether a call of `plan` in `family` fits on every GPU of the lane from `start` now,
-    /// before its shape is known (`fits`). A GPU without a ledger has nothing to refuse it with.
-    fn fits(&self, plan: &str, start: usize, degree: u32, family: Option<&str>) -> bool {
+    /// Whether a call of `plan` fits on every GPU of the lane from `start` now, before its shape
+    /// is known (`fits`). A GPU without a manager has nothing to refuse it with.
+    fn fits(&self, plan: &str, start: usize, degree: u32) -> bool {
         let lane = self.lane(start, degree).unwrap_or_default();
-        lane.iter().filter_map(|d| d.memory.as_ref()).all(|m| m.manager.fits(plan, UNPREPARED, family))
+        lane.iter().filter_map(|d| d.memory.as_ref()).all(|m| m.manager.fits(plan, UNPREPARED))
     }
     /// Where `plan` runs now, with its lane's call slots: inside its root's `lane` when it has
     /// one, else (a standalone call, or warming with no root) on GPUs no root holds or older
@@ -1668,7 +1677,7 @@ impl Pool {
             .iter()
             .find_map(|start| take(*start, claims))
             .or_else(|| {
-                let fit = |start: &usize| !hosts.contains(start) && self.fits(&plan.construction, *start, plan.degree, family);
+                let fit = |start: &usize| !hosts.contains(start) && self.fits(&plan.construction, *start, plan.degree);
                 starts.clone().filter(fit).find_map(|start| take(start, claims))
             })
             .or_else(|| (hosts.is_empty() || lane.is_some()).then(|| starts.clone().find_map(|start| take(start, claims))).flatten());
@@ -1917,7 +1926,7 @@ impl Pool {
             return Ok("already loaded");
         }
         // A warm member or a prefetch starts only where it fits: it never takes a running call's room.
-        if !self.fits(&plan.construction, start, plan.degree, None) {
+        if !self.fits(&plan.construction, start, plan.degree) {
             return Ok("no GPU room beside the warm set and the running call");
         }
         let born = Mutex::new(vec![]);
@@ -2602,7 +2611,7 @@ impl Pool {
             // An executor speaking leases dials each GPU's manager; any other runs standalone.
             let standalone = session.executor.hello.contract() == device_executor::Contract::Standalone;
             if standalone {
-                self.standalone(gpus, &session.executor);
+                self.standalone(&session.executor);
             }
             let leases = (!standalone && gpus.iter().any(|d| d.memory.is_some())).then(platform::memory::euid);
             // Rank 0 spawns and forms every follower inside this command; its watch meters
@@ -2643,17 +2652,8 @@ impl Pool {
                     detail: "a follower exited before its GPU ledger could be associated".into(),
                 }));
             }
-            // A formed standalone group's rank r (reported rank 1 first) runs its own pages on
-            // the lane's GPU r.
-            for (pid, gpu) in started.follower_pids.iter().zip(gpus.iter().skip(1)).filter(|_| standalone) {
-                if let Some(gpu) = gpu.memory.as_ref() {
-                    gpu.fix(*pid);
-                }
-            }
             // The request's signer, whose bearer the Runtime keeps apart.
             let actor = engine.get(id).ok().and_then(|record| record.submission).map(|s| s.actor).unwrap_or_default();
-            // The call's family, whose yielded parent's room its placement may use (none warming).
-            let family = engine.get(id).ok().and_then(|record| record.family().map(str::to_owned));
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
                 None => DeviceCommand::Load {
@@ -2672,7 +2672,7 @@ impl Pool {
                 },
                 Some(first) => {
                     let store = self.store.root().to_string_lossy().into_owned();
-                    let homes = self.homes(&plan, gpus, family.as_deref());
+                    let homes = self.homes(&plan, gpus);
                     let load = |slot: &PlanSlot| {
                         let mut binding = slot.binding.clone();
                         binding.package_interface = interface_path.to_string_lossy().into();
@@ -2794,8 +2794,10 @@ impl Pool {
         // left out: the parent waits on it.
         let shape = shape(&prepared.features);
         let managers: Vec<&varena::lease::Manager> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &*m.manager).collect();
-        let admitted = memory::admit(engine, &managers, id, &construction, &shape, record.family());
-        let _dispatched = Dispatched { gpus, id: id.into() };
+        let admitted = memory::admit(engine, &managers, id, &construction, &shape);
+        let call = memory::Call { pid: session.executor.birth.pid, package: construction.clone(), shape: shape.clone() };
+        let _dispatched = Dispatched { gpus, id: id.into(), running: self.running.clone() };
+        self.running.lock().unwrap().insert(id.into(), call);
         if !admitted? {
             // Canceled while it waited for room: it never started.
             defer_completion(engine, id, &session.executor.birth, &session.followers, Outcome::Canceled)?;
@@ -2919,21 +2921,18 @@ impl Pool {
     }
 
     /// An executor of another memory protocol runs its memory alone, unshared with the others on
-    /// these GPUs, its bytes a fixed charge on its first GPU: version skew degrades, with a note.
-    fn standalone(&self, gpus: &[Device], executor: &DeviceExecutor) {
+    /// these GPUs (the driver's free bytes count it): version skew degrades, with a note.
+    fn standalone(&self, executor: &DeviceExecutor) {
         let hello = &executor.hello;
         tracing::warn!("executor {} (Runtime {}, TensorFS {}) speaks memory protocol {}, not leases: its GPU memory runs on its own",
             executor.birth.pid, hello.runtime_version, hello.tensorfs_version, hello.memory_protocol);
         self.notes.note(serde_json::json!({"event": "standalone", "pid": executor.birth.pid, "runtime": hello.runtime_version,
             "tensorfs": hello.tensorfs_version, "memory_protocol": hello.memory_protocol}));
-        if let Some(gpu) = gpus.first().and_then(|d| d.memory.as_ref()) {
-            gpu.fix(executor.birth.pid);
-        }
     }
 
     /// For a group, each slot's placeable components and the GPU of the group that keeps each
     /// (`memory::homes`), by slot path. A GPU with no ledger keeps nothing away from GPU 0.
-    fn homes(&self, plan: &Plan, gpus: &[Device], family: Option<&str>) -> BTreeMap<String, BTreeMap<String, u32>> {
+    fn homes(&self, plan: &Plan, gpus: &[Device]) -> BTreeMap<String, BTreeMap<String, u32>> {
         let placeable: Vec<(&str, &str, String)> = plan.slots.iter()
             .flat_map(|slot| slot.placeable.iter().map(move |c| (slot.binding.model_binding_path.as_str(), c.as_str(), format!("{}/{c}", slot.binding.release))))
             .collect();
@@ -2943,7 +2942,7 @@ impl Pool {
         let managers: Option<Vec<&varena::lease::Manager>> = gpus.iter().map(|d| d.memory.as_ref().map(|m| &*m.manager)).collect();
         let sets: Vec<&str> = placeable.iter().map(|(_, _, set)| set.as_str()).collect();
         let gpu = match managers {
-            Some(managers) => memory::homes(&managers, &plan.construction, UNPREPARED, family, &sets, &self.notes),
+            Some(managers) => memory::homes(&managers, &plan.construction, UNPREPARED, &sets, &self.notes),
             None => vec![0; sets.len()],
         };
         let mut homes: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
@@ -3094,12 +3093,15 @@ fn shape(features: &BTreeMap<String, serde_json::Value>) -> String {
 const UNPREPARED: &str = "";
 
 /// A request admitted on every GPU of its lane (`memory::admit`), undispatched when it ends.
+/// A request admitted on its lane's GPUs: running, as the host rule reads it, until it drops.
 struct Dispatched<'a> {
     gpus: &'a [Device],
     id: String,
+    running: memory::Running,
 }
 impl Drop for Dispatched<'_> {
     fn drop(&mut self) {
+        self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
         self.gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.undispatch(&self.id));
     }
 }
@@ -4318,118 +4320,6 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
-    /// `parts` one-MiB regions named `name` on `gpu`, filled inline: a set a stand-in holds.
-    #[cfg(target_os = "linux")]
-    fn stall_set(gpu: &varena::GpuId, name: &str, parts: usize) -> varena::SetSpec {
-        use varena::layout::Layout;
-        let names: Vec<String> = (0..parts).map(|i| format!("{name}/w{i}")).collect();
-        let spans: Vec<tensorfs::io::Span> = names.iter().enumerate().map(|(i, tensor)| tensorfs::io::Span {
-            what: format!("{tensor}#data"),
-            len: MIB,
-            source: tensorfs::io::ItemSource::Inline(Arc::from(vec![i as u8 + 1; MIB as usize])),
-        }).collect();
-        let regions: Vec<Vec<String>> = names.iter().map(|n| vec![n.clone()]).collect();
-        let layout = Layout::build(&spans, &regions).unwrap();
-        let ids: Vec<varena::PartId> = names.iter().map(|n| varena::PartId { name: format!("{n}#data"), encoding: "raw".into(), dtype: "u8".into() }).collect();
-        let fingerprint = varena::Fingerprint::new(&layout, &ids, varena::Fill::Stored, "stall/pkg@1", "0/1", &gpu.uuid);
-        varena::SetSpec { name: name.into(), layout: Arc::new(layout), source: Arc::new(tensorfs::io::source::Source::files(vec![], false, 0)), fingerprint }
-    }
-
-    /// An executor stand-in for the stall rule: granted the GPU's ledger over its control socket
-    /// (stdin), it loads its set to the GPU and answers one line per command: `warm` (a request
-    /// binding every block, ended: its pages stay idle on the GPU), `run <id> <shape>` (a request
-    /// and its pass, which asks its peers for every idle byte: no peak is recorded for it) and
-    /// `end <room>` (the pass ended at peak `room`, the request ended).
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "the stall-rule test runs it as an executor"]
-    fn stall_stand_in() {
-        use std::io::{BufRead, Write};
-        use std::os::fd::FromRawFd;
-        let Ok(spec) = std::env::var("S5_STALL") else { return };
-        let [prefix, uuid, bytes, name, parts] = spec.split('|').collect::<Vec<_>>()[..] else { panic!("{spec}") };
-        assert!(varena::os::namespace(prefix));
-        let gpu = varena::GpuId { uuid: uuid.into(), model: "host".into(), memory: bytes.parse().unwrap() };
-        // SAFETY: the test installs its control socket at this process's stdin.
-        let control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
-        let grant = varena::Grant { table: platform::handles::recv_fd(&control).unwrap(), row: platform::handles::recv_fd(&control).unwrap(), limit: None };
-        let memory = varena::Memory::open(gpu.clone(), Some(grant), Box::new(varena::HostBackend::new(gpu.memory))).unwrap();
-        let parts: usize = parts.parse().unwrap();
-        let set = memory.load(stall_set(&gpu, name, parts), varena::Level::Gpu).unwrap();
-        let plan = || varena::Plan { steps: vec![varena::Step { sets: vec![name.to_string()], passes: 2 }] };
-        let (mut out, lines) = (control.try_clone().unwrap(), std::io::BufReader::new(control).lines());
-        let (mut request, mut pass) = (None, None);
-        for line in lines.map_while(Result::ok) {
-            let reply = match line.split(' ').collect::<Vec<_>>()[..] {
-                ["warm"] => {
-                    let warm = memory.request(&format!("warm-{}", uuid::Uuid::new_v4()), plan()).unwrap();
-                    let binding = warm.pass(set, "warm").unwrap();
-                    drop((0..parts as u32).map(|block| memory.bind(set, block, 0).unwrap()).collect::<Vec<_>>());
-                    binding.end(0);
-                    warm.end();
-                    "warm".to_string()
-                }
-                ["run", id, shape] => {
-                    let opened = memory.request(id, plan()).unwrap();
-                    pass = Some(opened.pass(set, &format!("run|{shape}")).unwrap());
-                    request = Some(opened);
-                    "passing".to_string()
-                }
-                ["end", room] => {
-                    let room: u64 = room.parse().unwrap();
-                    pass.take().unwrap().end(room);
-                    request.take().unwrap().end();
-                    "ended".to_string()
-                }
-                _ => panic!("unknown command {line}"),
-            };
-            writeln!(out, "{reply}").unwrap();
-        }
-    }
-
-    /// A stall-rule stand-in, its control socket and replies.
-    #[cfg(target_os = "linux")]
-    struct StallStandIn {
-        child: std::process::Child,
-        control: std::os::unix::net::UnixStream,
-        replies: std::io::BufReader<std::os::unix::net::UnixStream>,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl StallStandIn {
-        fn spawn(prefix: &str, gpu: &memory::Gpu, uuid: &str, name: &str, parts: usize) -> StallStandIn {
-            let (control, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-            let child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "gpu_service::tests::stall_stand_in", "--ignored", "--nocapture"])
-                .env("S5_STALL", format!("{prefix}|{uuid}|{}|{name}|{parts}", 64 * MIB))
-                .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(theirs)))
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
-            let grant = gpu.ledger().grant(child.id()).unwrap();
-            platform::handles::send_fd(&control, &grant.table).unwrap();
-            platform::handles::send_fd(&control, &grant.row).unwrap();
-            let replies = std::io::BufReader::new(control.try_clone().unwrap());
-            StallStandIn { child, control, replies }
-        }
-
-        fn ask(&mut self, command: &str) -> String {
-            use std::io::{BufRead, Write};
-            writeln!(self.control, "{command}").unwrap();
-            let mut reply = String::new();
-            self.replies.read_line(&mut reply).unwrap();
-            reply.trim().to_string()
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for StallStandIn {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-
     /// An executor's frame nudges the host watcher: it looks at the host (what the running
     /// calls keep free), with no kernel event to wake it. In its own process: one namespace.
     #[cfg(target_os = "linux")]
@@ -4449,9 +4339,15 @@ mod tests {
     fn frame_nudge_child() {
         if std::env::var("S5_NUDGE").is_err() { return; }
         assert!(varena::os::namespace(&format!("nudge{}-", std::process::id())));
-        let id = varena::GpuId { uuid: format!("nudge-{}", std::process::id()), model: "host".into(), memory: 64 << 20 };
-        let gpu = Arc::new(memory::Gpu::ledgered(varena::Ledger::create(&id, None).unwrap(), "host"));
-        let host = memory::Host::watch(platform::contain::host_pressure::HostMode::Shared, vec![gpu], &memory::MemoryLog::default()).expect("watched");
+        let uuid = format!("nudge-{}", std::process::id());
+        let inventory: crate::machine::receipt::Gpu = serde_json::from_value(json!({"device_index": 0, "device_name": "host", "device_uuid": uuid,
+            "driver_version": "", "memory_bytes": 1u64 << 30, "pci_bus_id": ""})).unwrap();
+        let tenants = memory::Tenants::default();
+        let hosting = Arc::new(memory::Peers::new(tenants.clone(), vec![], memory::MemoryLog::default()));
+        let leases = memory::Leases { hosting, open: None, tenants };
+        let peaks = memory::Peaks::at(std::env::temp_dir().join(format!("gpu-nudge-peaks-{}", uuid::Uuid::new_v4())));
+        let gpu = Arc::new(memory::Gpu::create("0", &[inventory], None, platform::contain::host_pressure::HostMode::Shared, leases, &peaks, &memory::MemoryLog::default()).unwrap());
+        let host = memory::Host::watch(platform::contain::host_pressure::HostMode::Shared, vec![gpu], memory::Running::default(), &memory::MemoryLog::default()).expect("watched");
         host.look(); // Whatever woke it at its start has been answered.
         let made = host.looks();
         let root = std::env::temp_dir().join(format!("gpu-nudge-{}", uuid::Uuid::new_v4()));
@@ -4499,65 +4395,170 @@ mod tests {
         crate::scratch::remove(&root);
     }
 
-    /// The stall rule, through the pool's own events thread (`memory_changed` → `end_stalled`)
-    /// over a host GPU's real ledger, with real processes: a row asked for room whose ask thread
-    /// still runs answers and is never ended, however its asker waits; once that row is stopped
-    /// (SIGSTOP: state T) with an ask out to it, the ledger names it stalled and the pool ends
-    /// it, so the asker's pass gets its room.
+    /// An executor stand-in for the stall rule: it dials the GPU's manager (its control socket at
+    /// stdin) and answers one line per command: `take <MiB>` (weights chunks, imported, mapped and
+    /// landed, then idle) and `answering` (from now on every reclaim request is answered: the
+    /// asked chunks are unmapped and released).
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_stopped_row_asked_for_room_is_ended_and_an_answering_one_never() {
+    #[ignore = "the stall-rule test runs it as an executor"]
+    fn stall_stand_in() {
+        use std::io::{BufRead, Write};
+        use std::os::fd::FromRawFd;
+        use varena::lease::{Agent, Attach, Kind, Lease};
+        let Ok(spec) = std::env::var("S5_STALL") else { return };
+        let [prefix, uuid] = spec.split('|').collect::<Vec<_>>()[..] else { panic!("{spec}") };
+        assert!(varena::os::namespace(prefix));
+        // SAFETY: the test installs its control socket at this process's stdin.
+        let control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
+        let held: Arc<Mutex<Vec<Lease>>> = Arc::default();
+        let (answering, agent) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::OnceLock::<Arc<Agent>>::new()));
+        let (give, gives) = std::sync::mpsc::channel::<()>();
+        let stream = varena::lease::connect(platform::memory::euid(), uuid).unwrap().expect("TensorD serves the GPU");
+        let Attach::Leased(attached) = Agent::attach(stream, Arc::new(varena::HostBackend::new(1 << 30)), move || {
+            let _ = give.send(());
+        }).unwrap() else { panic!("refused") };
+        let _ = agent.set(attached.clone());
+        let (releasing, keeping, answers) = (attached.clone(), held.clone(), answering.clone());
+        std::thread::spawn(move || {
+            for () in gives {
+                if !answers.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let mut leases = keeping.lock().unwrap();
+                for ticket in releasing.asked_back() {
+                    if let Some(at) = leases.iter().position(|lease| lease.ticket == ticket) {
+                        let lease = leases.remove(at);
+                        if releasing.commit(ticket).unwrap() {
+                            releasing.release(ticket, lease.phys).unwrap();
+                        }
+                    }
+                }
+            }
+        });
+        let (mut out, lines) = (control.try_clone().unwrap(), std::io::BufReader::new(control).lines());
+        for line in lines.map_while(Result::ok) {
+            let reply = match line.split(' ').collect::<Vec<_>>()[..] {
+                ["take", mib] => {
+                    let leases = attached.take(mib.parse::<u64>().unwrap() * MIB, Kind::Weights, None).unwrap();
+                    let tickets: Vec<_> = leases.iter().map(|lease| lease.ticket).collect();
+                    attached.mapped(&tickets).unwrap();
+                    tickets.iter().for_each(|ticket| attached.landed(*ticket).unwrap());
+                    held.lock().unwrap().extend(leases);
+                    format!("took {} MiB", leases_bytes(&held.lock().unwrap()) / MIB)
+                }
+                ["answering"] => {
+                    answering.store(true, std::sync::atomic::Ordering::Relaxed);
+                    "answering".to_string()
+                }
+                _ => panic!("unknown command {line}"),
+            };
+            writeln!(out, "{reply}").unwrap();
+        }
+    }
+
+    /// The bytes `held` leases hold.
+    #[cfg(target_os = "linux")]
+    fn leases_bytes(held: &[varena::lease::Lease]) -> u64 {
+        held.iter().map(|lease| lease.phys.len).sum()
+    }
+
+    /// A stall-rule stand-in, its control socket and replies.
+    #[cfg(target_os = "linux")]
+    struct StallStandIn {
+        child: std::process::Child,
+        control: std::os::unix::net::UnixStream,
+        replies: std::io::BufReader<std::os::unix::net::UnixStream>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl StallStandIn {
+        /// A stand-in registered as `pool`'s tenant, attached to its GPU.
+        fn spawn(prefix: &str, pool: &Pool, uuid: &str) -> StallStandIn {
+            let (control, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gpu_service::tests::stall_stand_in", "--ignored", "--nocapture"])
+                .env("S5_STALL", format!("{prefix}|{uuid}"))
+                .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let exact = Exact::open(&Birth::of(child.id()).unwrap()).unwrap().unwrap();
+            pool.tenants.register([(child.id(), Tenant { plan: format!("stall-{}", child.id()), generation: "g".into(), start: 0, exact })]);
+            let replies = std::io::BufReader::new(control.try_clone().unwrap());
+            StallStandIn { child, control, replies }
+        }
+
+        fn ask(&mut self, command: &str) -> String {
+            use std::io::{BufRead, Write};
+            writeln!(self.control, "{command}").unwrap();
+            let mut reply = String::new();
+            self.replies.read_line(&mut reply).unwrap();
+            reply.trim().to_string()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for StallStandIn {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The stall rule, through the pool's own events thread (`memory_changed` → `end_stalled`)
+    /// over a host GPU's manager, with real processes: an executor asked to give chunks back that
+    /// answers is never ended; once it is stopped (SIGSTOP) with a reclaim request out to it, the
+    /// manager names it stalled and the pool ends it, so the asker's allocation is made.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_executor_asked_for_chunks_is_ended_and_an_answering_one_never() {
         let prefix = format!("gpusvc{}-", std::process::id());
         assert!(varena::os::namespace(&prefix), "the test binary's namespace");
         let root = std::env::temp_dir().join(format!("gpu-stall-{}", uuid::Uuid::new_v4()));
         let uuid = format!("GPU-stall-{}", uuid::Uuid::new_v4());
+        // 1 GiB: the reserved pool's 512 MiB leave 512 MiB to allocate.
         let config: GpuConfig = serde_json::from_value(json!({"devices": "0", "prespawn": false,
-            "inventory": [{"device_index": 0, "device_name": "host", "device_uuid": uuid, "driver_version": "", "memory_bytes": 64 * MIB, "pci_bus_id": ""}]})).unwrap();
+            "inventory": [{"device_index": 0, "device_name": "host", "device_uuid": uuid, "driver_version": "", "memory_bytes": 1u64 << 30, "pci_bus_id": ""}]})).unwrap();
         let store = crate::storage::open(&root.join("store")).unwrap();
-        let pool = Pool::new(&root.join("gpu"), config, store.clone()).unwrap();
-        let gpu = pool.devices[0].memory.clone().expect("the host GPU's ledger");
-        const ROOM: u64 = 40 * MIB;
-        let mut asker = StallStandIn::spawn(&prefix, &gpu, &uuid, "asker", 2);
-        assert_eq!(asker.ask("warm"), "warm");
-        // Its pass at `big` measures its room while the card is free.
-        assert_eq!(asker.ask("run measure big"), "passing");
-        assert_eq!(asker.ask(&format!("end {ROOM}")), "ended");
-        let mut holder = StallStandIn::spawn(&prefix, &gpu, &uuid, "holder", 24);
-        assert_eq!(holder.ask("warm"), "warm");
-        let birth = Birth::of(holder.child.id()).unwrap();
-        pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: "holder".into(), generation: String::new(), start: 0, exact: Exact::open(&birth).unwrap().unwrap() });
-        let ended = || std::fs::read_to_string(store.root().join("logs/memory.log")).unwrap_or_default()
-            .lines().any(|line| line.contains("\"end_stalled\"") && line.contains(&format!("\"pid\":{}", birth.pid)));
-        // Answering: the asker's pass needs the holder's idle pages, asks, and gets them.
-        assert_eq!(asker.ask("run answered big"), "passing");
-        assert_eq!(asker.ask(&format!("end {ROOM}")), "ended");
-        assert!(holder.child.try_wait().unwrap().is_none() && !ended(), "an answering row is never ended");
-        assert_eq!(holder.ask("warm"), "warm");
-        // Stopped with an ask out to it: the pool ends it, and the pass gets its room.
+        let host = |_: &str, _: &MemoryLog| Some(Box::new(|| Ok(Arc::new(varena::HostBackend::new(1 << 30)) as Arc<dyn varena::Backend>)) as varena::lease::Opener);
+        let pool = Pool::with_chunks(&root.join("gpu"), config, store.clone(), host).unwrap();
+        let mut holder = StallStandIn::spawn(&prefix, &pool, &uuid);
+        assert_eq!(holder.ask("take 320"), "took 320 MiB");
+        let mut asker = StallStandIn::spawn(&prefix, &pool, &uuid);
+        let ended = |pid: u32| std::fs::read_to_string(store.root().join("logs/memory.log")).unwrap_or_default()
+            .lines().any(|line| line.contains("\"end_stalled\"") && line.contains(&format!("\"pid\":{pid}")));
+        // Answering: the asker's allocation needs the holder's idle chunks, asks, and gets them.
+        assert_eq!(holder.ask("answering"), "answering");
+        assert_eq!(asker.ask("take 256"), "took 256 MiB");
+        assert!(holder.child.try_wait().unwrap().is_none() && !ended(holder.child.id()), "an answering executor is never ended");
+        assert_eq!(holder.ask("take 192"), "took 192 MiB", "its chunk went back; it takes again");
+        // Stopped with a reclaim request out to it: the pool ends it, and the allocation is made.
+        let pid = holder.child.id();
         let mut stopped = 0;
         // SAFETY: a signal to this test's own child, then waiting until it has stopped.
         unsafe {
-            assert_eq!(libc::kill(birth.pid as i32, libc::SIGSTOP), 0);
-            libc::waitpid(birth.pid as i32, &mut stopped, libc::WUNTRACED);
+            assert_eq!(libc::kill(pid as i32, libc::SIGSTOP), 0);
+            libc::waitpid(pid as i32, &mut stopped, libc::WUNTRACED);
         }
-        let (passed, passing) = std::sync::mpsc::channel();
+        let (took, taking) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             let asker = &mut asker;
-            scope.spawn(move || passed.send(asker.ask("run stalled big")).unwrap());
-            // A failure backstop only: the pass returns once the pool has ended the holder.
-            let reply = passing.recv_timeout(std::time::Duration::from_secs(60));
+            scope.spawn(move || took.send(asker.ask("take 192")).unwrap());
+            // A failure backstop only: the allocation is made once the pool has ended the holder.
+            let reply = taking.recv_timeout(std::time::Duration::from_secs(60));
             if reply.is_err() {
-                // SAFETY: our own child; the asker's pass then goes on.
-                unsafe { libc::kill(birth.pid as i32, libc::SIGKILL) };
+                // SAFETY: our own child; the asker's allocation then goes on.
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
             }
-            assert_eq!(reply.as_deref(), Ok("passing"), "the stopped holder's end freed its pages");
+            assert_eq!(reply.as_deref(), Ok("took 448 MiB"), "the stopped holder's end freed its chunks");
         });
         let status = holder.child.wait().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL), "ended by the pool: {status:?}");
-        assert!(ended(), "the memory log says the pool ended it");
-        assert_eq!(asker.ask(&format!("end {ROOM}")), "ended");
+        assert!(ended(pid), "the memory log says the pool ended it");
         drop((asker, holder));
         pool.stop().unwrap();
         crate::scratch::remove(&root);
     }
+
 }

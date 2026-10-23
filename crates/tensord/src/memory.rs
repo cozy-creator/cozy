@@ -24,7 +24,7 @@ use platform::{
 };
 use varena::lease::{
     manager::{Opener, Record},
-    HostCall, Hosting, Identity, Manager, Mode, Peak,
+    Hosting, Identity, Manager, Mode, Peak,
 };
 use varena::{Backend, CudaBackend, GpuId};
 
@@ -77,19 +77,6 @@ impl Gpu {
         Some(Gpu { manager, model: id.model, watch })
     }
 
-    /// Standalone executor `pid` on it: fixed bytes, never asked and never foreign, as NVML
-    /// charges its pid on each reading (where NVML names no pid of ours, a container's, they stay
-    /// unmeasured).
-    pub fn fix(&self, pid: u32) {
-        self.watch.change(|watched| drop(watched.fixed.insert(pid)));
-    }
-
-    /// After `waitpid`: `pid`'s fixed bytes and dispatches go.
-    pub fn reap(&self, pid: u32) {
-        self.watch.change(|watched| drop(watched.fixed.remove(&pid)));
-        self.manager.reap(pid);
-    }
-
     /// Executors to end: those answering no revoke.
     pub fn stalled(&self) -> Vec<u32> {
         self.manager.stalled()
@@ -97,7 +84,7 @@ impl Gpu {
 
     /// The manager's books changed: the watch looks whether to read again.
     pub fn changed(&self) {
-        self.watch.change(|_| {});
+        self.watch.change();
     }
 }
 
@@ -106,37 +93,30 @@ const SAMPLE: std::time::Duration = std::time::Duration::from_millis(500);
 /// A foreign process that appears and crosses this is new: idle pages make room for it.
 const NEW_FOREIGN: u64 = 256 << 20;
 
-/// One GPU's watch: NVML read every half second while cozy holds bytes there (chunks, executors,
-/// standalone pids), else parked until the books change. Each reading sets every standalone pid's
-/// fixed bytes and hands the manager the bytes no cozy process holds (`set_foreign`, once per
-/// reading); a foreign pid absent when sampling began that crosses 256 MiB marks its reading new.
-/// Where NVML names no pid of ours (a container's), foreign is 0: a pod is cozy's alone.
+/// One GPU's watch: every half second while cozy holds bytes there (chunks or executors), else
+/// parked until the books change, it hands the manager a reading (`set_foreign`, its tick: the
+/// manager re-reads the driver's free bytes and reclaims in the background below its low
+/// watermark). NVML's bytes no cozy process holds go with it for display; a foreign pid absent
+/// when sampling began that crosses 256 MiB marks its reading new. Where NVML names no pid of ours
+/// (a container's), foreign is 0: a pod is cozy's alone.
 struct Watch {
-    watched: Mutex<Watched>,
+    epoch: Mutex<u64>,
     changed: std::sync::Condvar,
-}
-
-#[derive(Default)]
-struct Watched {
-    fixed: std::collections::BTreeSet<u32>,
-    epoch: u64,
 }
 
 impl Watch {
     fn start(uuid: &str, manager: Arc<Manager>, tenants: Tenants, log: &MemoryLog) -> Arc<Watch> {
-        let watch = Arc::new(Watch { watched: Mutex::default(), changed: std::sync::Condvar::new() });
-        let (uuid, watching, log) = (uuid.to_string(), Arc::downgrade(&watch), log.clone());
-        let spawned = std::thread::Builder::new().name("gpu-watch".into()).spawn(move || watching_gpu(&uuid, &manager, &tenants, watching, &log));
+        let watch = Arc::new(Watch { epoch: Mutex::default(), changed: std::sync::Condvar::new() });
+        let (uuid, watching, notes) = (uuid.to_string(), Arc::downgrade(&watch), log.clone());
+        let spawned = std::thread::Builder::new().name("gpu-watch".into()).spawn(move || watching_gpu(&uuid, &manager, &tenants, watching, &notes));
         if let Err(error) = spawned {
             log.note(serde_json::json!({"event": "gpu_unwatched", "why": error.to_string()}));
         }
         watch
     }
 
-    fn change(&self, f: impl FnOnce(&mut Watched)) {
-        let mut watched = self.watched.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut watched);
-        watched.epoch += 1;
+    fn change(&self) {
+        *self.epoch.lock().unwrap_or_else(|e| e.into_inner()) += 1;
         self.changed.notify_all();
     }
 }
@@ -145,20 +125,18 @@ fn watching_gpu(uuid: &str, manager: &Manager, tenants: &Tenants, watch: std::sy
     let device = platform::gpu::Device::open(uuid).map_err(|error| error.to_string());
     let (mut known, mut stale) = (None::<std::collections::BTreeSet<u32>>, false);
     while let Some(watch) = watch.upgrade() {
-        let fixed = {
-            let mut watched = watch.watched.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut epoch = watch.epoch.lock().unwrap_or_else(|e| e.into_inner());
             let held = manager.holdings();
-            let active = held.created > 0 || !held.executors.is_empty() || !watched.fixed.is_empty();
-            if !active {
+            if held.created == 0 && held.executors.is_empty() {
                 known = None;
-                let epoch = watched.epoch;
-                while watched.epoch == epoch {
-                    watched = watch.changed.wait(watched).unwrap_or_else(|e| e.into_inner());
+                let seen = *epoch;
+                while *epoch == seen {
+                    epoch = watch.changed.wait(epoch).unwrap_or_else(|e| e.into_inner());
                 }
                 continue;
             }
-            watched.fixed.clone()
-        };
+        }
         drop(watch);
         let reading = device.as_ref().map_err(Clone::clone).and_then(|device| device.read().map_err(|error| error.to_string()));
         let processes = reading.and_then(|reading| reading.processes.ok_or_else(|| "NVML names no process of this machine".to_string()));
@@ -170,7 +148,6 @@ fn watching_gpu(uuid: &str, manager: &Manager, tenants: &Tenants, watch: std::sy
         stale = processes.is_err();
         let (foreign, new_pid) = match &processes {
             Ok(processes) => {
-                fixed.iter().for_each(|pid| manager.fixed(*pid, processes.get(pid).copied().unwrap_or(0)));
                 let ours: std::collections::BTreeSet<u32> = tenants.book().keys().copied().chain([std::process::id()]).collect();
                 let others: BTreeMap<u32, u64> = processes.iter().filter(|(pid, _)| !ours.contains(pid)).map(|(pid, bytes)| (*pid, *bytes)).collect();
                 let seen = known.get_or_insert_with(|| others.keys().copied().collect());
@@ -383,16 +360,15 @@ fn shareable(uuid: &str) -> Result<i32, String> {
     Ok(ordinal)
 }
 
-/// Admits request `id` of `family` at `<package>|<shape>` on every one of `managers` or none
-/// (`Manager::admit`, which names the key its peak is recorded under; a yielded request of the
-/// same family, waiting on this one, is left out). Refused, it waits for the engine's activity,
-/// which every manager event and every cancel bumps, and asks again: running requests end, and a
-/// GPU nothing runs on always admits. False: it was canceled meanwhile. A manager that cannot
-/// answer lets it run unrecorded.
-pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, shape: &str, family: Option<&str>) -> io::Result<bool> {
+/// Admits request `id` at `<package>|<shape>` on every one of `managers` or none
+/// (`Manager::admit`, which names the key its peak is recorded under). Refused, it waits for the
+/// engine's activity, which every manager event and every cancel bumps, and asks again: running
+/// requests end, and a GPU nothing runs on always admits. False: it was canceled meanwhile. A
+/// manager that cannot answer lets it run unrecorded.
+pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, shape: &str) -> io::Result<bool> {
     loop {
         let seen = engine.activity_epoch();
-        match Manager::admit(managers, id, package, shape, family) {
+        match Manager::admit(managers, id, package, shape) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(error) => {
@@ -408,12 +384,12 @@ pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, sh
 }
 
 /// The GPU of the group (an index into `managers`, GPU order) that keeps each set of `sets`, by
-/// `Manager::place` for `package`'s request at `shape` in `family`. A set's bytes are what its
-/// load recorded on a GPU of the group: a set never loaded goes where the most room is free. A
-/// manager that cannot answer keeps every set on GPU 0, where it pages.
-pub fn homes(managers: &[&Manager], package: &str, shape: &str, family: Option<&str>, sets: &[&str], log: &MemoryLog) -> Vec<u32> {
+/// `Manager::place` for `package`'s request at `shape`. A set's bytes are what its load recorded
+/// on a GPU of the group: a set never loaded goes where the most room is free. A manager that
+/// cannot answer keeps every set on GPU 0, where it pages.
+pub fn homes(managers: &[&Manager], package: &str, shape: &str, sets: &[&str], log: &MemoryLog) -> Vec<u32> {
     let unknown: Vec<(&str, Option<u64>)> = sets.iter().map(|set| (*set, None)).collect();
-    match Manager::place(managers, package, shape, family, &unknown) {
+    match Manager::place(managers, package, shape, &unknown) {
         Ok(homes) => homes,
         Err(error) => {
             log.note(serde_json::json!({"event": "homes_on_gpu_0", "package": package, "why": error.to_string()}));
@@ -475,6 +451,43 @@ impl Peaks {
     }
 }
 
+/// One call running on the machine's GPUs: its executor and its `<package>|<shape>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Call {
+    pub pid: u32,
+    pub package: String,
+    pub shape: String,
+}
+
+/// The calls running now, by request: TensorD's own record (admitted until they end), which the
+/// host rule reads beside each GPU's measured host peaks.
+pub type Running = Arc<Mutex<BTreeMap<String, Call>>>;
+
+/// A process running calls, as the host rule reads it: its calls' measured anonymous peak (none
+/// while one is unmeasured), its anonymous bytes now, and how many calls it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostCall {
+    pub pid: u32,
+    pub peak: Option<u64>,
+    pub anon: u64,
+    pub running: u64,
+}
+
+/// The running calls as the host rule reads them: each call's host peak is the largest any GPU
+/// measured for its `<package>|<shape>`.
+pub fn host_calls(running: &Running, gpus: &[Arc<Gpu>]) -> Vec<HostCall> {
+    let calls: Vec<Call> = running.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+    calls
+        .into_iter()
+        .map(|call| HostCall {
+            pid: call.pid,
+            peak: gpus.iter().filter_map(|gpu| gpu.manager.host_peak(&call.package, &call.shape)).max(),
+            anon: host_memory::resident(call.pid).map_or(0, |now| now.anon),
+            running: 1,
+        })
+        .collect()
+}
+
 /// What woke the events thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Woke {
@@ -493,7 +506,7 @@ pub enum Source {
 impl Source {
     fn waitable(&self) -> Waitable<'_> {
         match self {
-            Source::Gpu(gpu) => waitable(gpu.manager.events()),
+            Source::Gpu(gpu) => gpu.manager.events(),
             Source::Host(host) => host.short.waitable(),
         }
     }
@@ -511,14 +524,6 @@ impl Source {
             }
         }
     }
-}
-
-/// A GPU's events, as [`wait_any`] waits on them: an endpoint's descriptor or event handle.
-fn waitable(events: &platform::handles::Owned) -> Waitable<'_> {
-    #[cfg(unix)]
-    return std::os::fd::AsFd::as_fd(events);
-    #[cfg(windows)]
-    return std::os::windows::io::AsHandle::as_handle(events);
 }
 
 /// Blocks on every source until the returned guard drops; `wake` runs once per wake with what
@@ -580,7 +585,7 @@ pub struct Host {
 impl Host {
     /// Watches while the process lives; None (a memory-log note says why) where the platform
     /// gives no pressure events.
-    pub fn watch(mode: HostMode, gpus: Vec<Arc<Gpu>>, log: &MemoryLog) -> Option<Arc<Host>> {
+    pub fn watch(mode: HostMode, gpus: Vec<Arc<Gpu>>, running: Running, log: &MemoryLog) -> Option<Arc<Host>> {
         let armed = host_pressure::Pressure::arm(mode).and_then(|pressure| Ok((pressure, Arc::new(Signal::new()?))));
         let (mut pressure, short) = armed
             .inspect_err(|error| log.note(serde_json::json!({"event": "host_unwatched", "mode": format!("{mode:?}"), "why": error.to_string()})))
@@ -593,7 +598,7 @@ impl Host {
             let mut signalled: Option<u64> = None;
             while pressure.wait().is_ok() {
                 looked.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
-                let need = keep.look(gpus.iter().map(|gpu| gpu.manager.host_calls()).collect::<Option<Vec<_>>>().map(|calls| calls.concat()));
+                let need = keep.look(host_calls(&running, &gpus));
                 let budget = u64::try_from(host_memory::read().available).unwrap_or(u64::MAX);
                 if budget >= need {
                     signalled = None;
@@ -656,12 +661,11 @@ struct Keep {
 }
 
 impl Keep {
-    /// A look at the processes running requests (`None`: a GPU's table cannot be read): what
-    /// must stay free.
-    fn look(&mut self, calls: Option<Vec<HostCall>>) -> u64 {
-        // A process with rows on several GPUs is one call.
+    /// A look at the processes running calls: what must stay free.
+    fn look(&mut self, calls: Vec<HostCall>) -> u64 {
+        // A process running several calls is one entry.
         let mut by: BTreeMap<u32, HostCall> = BTreeMap::new();
-        for call in calls.unwrap_or_default() {
+        for call in calls {
             by.entry(call.pid)
                 .and_modify(|seen| {
                     seen.peak = seen.peak.zip(call.peak).map(|(a, b)| a.max(b));
