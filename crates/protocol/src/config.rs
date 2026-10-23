@@ -1,4 +1,4 @@
-//! `~/.cozy/config.toml`, loaded once per process through figment and shared by the CLI,
+//! `~/.cozy/config.toml`, loaded once per process and shared by the CLI,
 //! Calcifer and the machine (TensorD). Sources, each over the last: the file, the environment
 //! (credentials and locations only: two model-source tokens, where releases come from, and a
 //! pod's machine contract), the command line. The home is always `<user home>/.cozy`. A key this
@@ -12,10 +12,6 @@ use std::{
 };
 
 use platform::paths::Home;
-use figment::{
-    Figment,
-    providers::{Format, Serialized, Toml},
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use url::Url;
@@ -82,8 +78,10 @@ pub struct CalciferConfig {
 #[serde(default)]
 pub struct MachineConfig {
     /// The machine API's port. On this computer, absent or 0: a free port, kept across restarts.
+    #[serde(deserialize_with = "port")]
     pub port: Option<u16>,
     /// The WebRTC player's port, kept across restarts the same way.
+    #[serde(deserialize_with = "port")]
     pub webrtc_port: Option<u16>,
     /// The TensorFS store it fills; absent: a pod's `var/lib/tensorfs` under its root, this
     /// computer's shared TensorFS cache (`TENSORFS_HOME`, else `~/.cache/tensorfs`).
@@ -143,6 +141,23 @@ fn list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error>
         List::Spelled(text) => split(&text),
         List::Items(items) => items,
     })
+}
+
+/// A port as TOML writes it, or as the environment spells it.
+fn port<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u16>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Port {
+        Number(u16),
+        Spelled(String),
+    }
+    match Option::<Port>::deserialize(d)? {
+        None => Ok(None),
+        Some(Port::Number(n)) => Ok(Some(n)),
+        Some(Port::Spelled(text)) => {
+            text.trim().parse().map(Some).map_err(|_| serde::de::Error::custom(format!("{text:?} is not a port")))
+        }
+    }
 }
 
 fn size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
@@ -280,9 +295,8 @@ impl PartialEq<String> for Origin {
 }
 
 /// What the command line contributes to the load.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub struct Flags {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tensorhub: Option<String>,
 }
 
@@ -312,18 +326,31 @@ pub fn load_from(
 ) -> Result<Loaded, Error> {
     let home = Home::under(&user_home);
     let path = home.config();
-    let mut figment = Figment::new();
-    if path.exists() {
-        figment = figment.merge(Toml::file_exact(&path));
-    }
+    let file = path.display().to_string();
+    let mut table = match std::fs::read_to_string(&path) {
+        Ok(text) => parse_table(&text, &file)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(error) => return Err(invalid(&file, "", &error.to_string())),
+    };
     // As spelled: a value is a string until its setting's type reads it (`"0"` stays a device).
     for (var, key) in ENV {
         if let Some(value) = environment.get(var).filter(|v| !v.is_empty()) {
-            figment = figment.merge(Serialized::default(key, value));
+            let (tables, name) = key.rsplit_once('.').map_or((None, key), |(t, n)| (Some(t), n));
+            let mut at = &mut table;
+            for part in tables.into_iter().flat_map(|t| t.split('.')) {
+                let entry = at.entry(part).or_insert_with(|| toml::Table::new().into());
+                if !entry.is_table() {
+                    *entry = toml::Table::new().into();
+                }
+                at = entry.as_table_mut().expect("a table");
+            }
+            at.insert(name.into(), value.clone().into());
         }
     }
-    let figment = figment.merge(Serialized::defaults(flags));
-    let (mut config, warnings) = extract(figment, &path.display().to_string())?;
+    if let Some(hub) = flags.tensorhub {
+        table.insert("tensorhub".into(), hub.into());
+    }
+    let (mut config, warnings) = extract(table, &file)?;
     config.machine.authorized_keys = split(environment.get(AUTHORIZED_KEYS).map_or("", String::as_str));
     Ok(Loaded {
         config,
@@ -336,7 +363,7 @@ pub fn load_from(
 impl Config {
     /// A config file's text as the load would read it: how an edit proves it still loads.
     pub fn parse(text: &str, name: &str) -> Result<(Config, Vec<String>), Error> {
-        extract(Figment::from(Toml::string(text)), name)
+        extract(parse_table(text, name)?, name)
     }
 
     /// Every named Hub, `tensorhub` included, by name.
@@ -479,29 +506,25 @@ pub fn valid_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
 }
 
-fn extract(figment: Figment, file: &str) -> Result<(Config, Vec<String>), Error> {
-    let invalid = |e: figment::Error| {
-        let key = e.path.join(".");
-        let at = if key.is_empty() {
-            String::new()
-        } else {
-            format!(" `{key}`")
-        };
-        Error::new(
-            Kind::Usage,
-            "config_invalid",
-            format!("{file}{at}: {}", e.kind),
-        )
+fn invalid(file: &str, key: &str, detail: &str) -> Error {
+    let at = if key.is_empty() || key == "." { String::new() } else { format!(" `{key}`") };
+    Error::new(Kind::Usage, "config_invalid", format!("{file}{at}: {detail}"))
         .remedy(format!("correct or remove it in {file}"))
-    };
-    let mut config: Config = figment.extract_lossy().map_err(invalid)?;
+}
+
+fn parse_table(text: &str, file: &str) -> Result<toml::Table, Error> {
+    text.parse().map_err(|e: toml::de::Error| invalid(file, "", e.message()))
+}
+
+/// The table as a Config, naming each key this build does not read.
+fn extract(table: toml::Table, file: &str) -> Result<(Config, Vec<String>), Error> {
     let mut warnings = vec![];
-    let value: figment::value::Value = figment.extract().map_err(invalid)?;
-    let _: Result<Config, _> = serde_ignored::deserialize(&value, |path| {
-        warnings.push(format!(
-            "{file}: `{path}` is not a setting this cozy reads; ignored"
-        ))
-    });
+    let mut ignored = |path: serde_ignored::Path<'_>| {
+        warnings.push(format!("{file}: `{path}` is not a setting this cozy reads; ignored"))
+    };
+    let value = toml::Value::Table(table);
+    let mut config: Config = serde_path_to_error::deserialize(serde_ignored::Deserializer::new(value, &mut ignored))
+        .map_err(|e| invalid(file, &e.path().to_string(), &e.inner().to_string()))?;
     config.normalize(file, &mut warnings);
     Ok((config, warnings))
 }
