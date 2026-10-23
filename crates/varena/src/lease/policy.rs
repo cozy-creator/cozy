@@ -23,11 +23,12 @@
 //!    measured cost.
 //!
 //! Stages 1-4 are cold: background reclaim stops there. Then the protected classes (§12, cgroup
-//! memory.low / memory.min):
+//! memory.low / memory.min; against foreign pressure, memory.min is only the streaming floor):
 //! 5. later steps' pages (memory.low), furthest advised use first (plan-Belady): the asker's
 //!    own, then other executors', the largest holder first;
-//! 6. the current step's pages (memory.min): only the asker's own, never for anyone else;
-//!    furthest first, its next [`SLOTS`] blocks last;
+//! 6. the current step's pages (memory.min): only the asker's own, never another executor's;
+//!    furthest first, its next [`SLOTS`] blocks last. Foreign pressure (under min, no asker)
+//!    takes every running set's current step down to its floor: its pinned blocks and slots;
 //! 7. other executors' pinned, unprotected pages: asked now, they come when their holder's step
 //!    ends and unpins them, so the ask waits; unless the holder itself waits on the asker (a wait
 //!    cycle), when the later ask is refused instead. The asker's own pins are its floor.
@@ -109,14 +110,14 @@ pub enum Advice {
     Later { at: u64 },
     /// The current step uses it (memory.min): its next use, ordered within its executor only.
     Step { at: u64 },
-    /// A chunk of region `id`.
-    Region { id: u32 },
 }
 
 /// A long-lived intermediate (KV, latents, conditioning, a preempted job's state).
 #[derive(Clone, Debug)]
 pub struct Region {
-    pub id: u32,
+    pub id: u64,
+    /// The chunks it holds (its arena's): it goes whole, never one of them alone.
+    pub chunks: Vec<u32>,
     /// Swappable to RAM; otherwise discardable only.
     pub swappable: bool,
     pub last_use: u64,
@@ -129,7 +130,7 @@ pub struct Region {
 /// A captured graph: one pin on each chunk it reads or writes, its pool's included.
 #[derive(Clone, Debug)]
 pub struct Graph {
-    pub id: u32,
+    pub id: u64,
     pub chunks: Vec<u32>,
     pub last_use: u64,
     pub next_use: Option<u64>,
@@ -175,9 +176,9 @@ pub enum Pick {
     Chunk { executor: u64, slot: u32, seq: u32, bytes: u64, stage: Stage },
     PageCache { index: usize, bytes: u64 },
     /// A region given back whole, swapped or discarded; its chunks follow as [`Pick::Chunk`].
-    Region { executor: u64, region: u32, swap: bool },
+    Region { executor: u64, region: u64, swap: bool },
     /// A graph dropped; the chunks it alone held that nothing needs follow.
-    Graph { executor: u64, region: u32 },
+    Graph { executor: u64, region: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -324,23 +325,27 @@ fn waiting_on(waits: &BTreeMap<u64, Vec<u64>>, of: u64) -> BTreeSet<u64> {
     found
 }
 
-/// Indices derived once per decision, per executor: each chunk's pinning graphs, each graph's
-/// chunks, each region's chunks.
+/// Indices derived once per decision, per executor: each chunk's pinning graphs and whether a
+/// region holds it, each graph's chunks, each region's chunks.
 struct Facts {
     pinned_by: Vec<Vec<Vec<usize>>>,
+    owned: Vec<Vec<bool>>,
     graph_chunks: Vec<Vec<Vec<usize>>>,
     region_chunks: Vec<Vec<Vec<usize>>>,
 }
 
 impl Facts {
     fn of(s: &Snapshot) -> Facts {
-        let mut f = Facts { pinned_by: vec![], graph_chunks: vec![], region_chunks: vec![] };
+        let mut f = Facts { pinned_by: vec![], owned: vec![], graph_chunks: vec![], region_chunks: vec![] };
         for e in &s.executors {
             let slots: BTreeMap<u32, usize> = e.chunks.iter().enumerate().map(|(i, c)| (c.slot, i)).collect();
             let graphs: Vec<Vec<usize>> = e.graphs.iter().map(|g| g.chunks.iter().filter_map(|s| slots.get(s).copied()).collect()).collect();
             let pinned_by = (0..e.chunks.len()).map(|c| graphs.iter().enumerate().filter(|(_, cs)| cs.contains(&c)).map(|(g, _)| g).collect()).collect();
-            let regions = e.regions.iter().map(|r| e.chunks.iter().enumerate().filter(|(_, c)| c.advice == Advice::Region { id: r.id }).map(|(i, _)| i).collect()).collect();
+            let regions: Vec<Vec<usize>> = e.regions.iter().map(|r| r.chunks.iter().filter_map(|s| slots.get(s).copied()).collect()).collect();
+            let mut owned = vec![false; e.chunks.len()];
+            regions.iter().flatten().for_each(|&c| owned.get_mut(c).into_iter().for_each(|o| *o = true));
             f.pinned_by.push(pinned_by);
+            f.owned.push(owned);
             f.graph_chunks.push(graphs);
             f.region_chunks.push(regions);
         }
@@ -356,14 +361,18 @@ fn at<T>(v: &[Vec<T>], e: usize, i: usize) -> Option<&T> {
 enum Scope {
     /// Stages 1-3 and idle regions: background reclaim, a new foreign process.
     Cold,
-    /// Every stage but the current step's: reclaim with no asker (foreign growth under min).
+    /// Every stage, running sets down to their floors: reclaim with no asker (foreign growth
+    /// under min).
     Unprotected,
     /// Every stage, the asker's own current step last.
     All,
 }
 
 /// A region's order: used, restore ns per MiB freed, last use, executor, region.
-type Rank = (bool, u128, u64, u64, u32);
+type Rank = (bool, u128, u64, u64, u64);
+
+/// An executor's running chunks: later steps', its current step's above the floor, its slots.
+type Running = (Vec<usize>, Vec<usize>, Vec<usize>);
 
 /// A water-fill queue: bytes left, its order, executor, chunks.
 type Queue = (u64, Reverse<usize>, usize, std::vec::IntoIter<usize>);
@@ -427,6 +436,11 @@ impl<'a> Run<'a> {
 
     fn free_now(&self, e: usize, c: usize) -> bool {
         self.open(e, c) && self.needs(e, c).is_some_and(|n| n.is_empty())
+    }
+
+    /// A region's chunk: it goes with its region, never alone.
+    fn owned(&self, e: usize, c: usize) -> bool {
+        at(&self.f.owned, e, c).copied().unwrap_or(false)
     }
 
     fn take(&mut self, e: usize, c: usize, stage: Stage) {
@@ -539,7 +553,7 @@ impl<'a> Run<'a> {
         let mut out = vec![];
         for (e, x) in self.s.executors.iter().enumerate() {
             for (c, ch) in x.chunks.iter().enumerate() {
-                if let Some(k) = key(e, &ch.advice).filter(|_| self.free_now(e, c)) {
+                if let Some(k) = key(e, &ch.advice).filter(|_| self.free_now(e, c) && !self.owned(e, c)) {
                     out.push(((k, x.id, ch.slot), (e, c)));
                 }
             }
@@ -548,20 +562,21 @@ impl<'a> Run<'a> {
         out.into_iter().map(|(_, at)| at).collect()
     }
 
-    /// An executor's later steps' chunks (memory.low; unadvised and orphaned region chunks too,
-    /// nearest), and its current step's (memory.min); each furthest first, unpinned before a
-    /// graph's, the current step's next [`SLOTS`] unpinned uses last.
-    fn running(&self, e: usize) -> (Vec<usize>, Vec<usize>) {
-        let Some(x) = self.ex(e) else { return (vec![], vec![]) };
+    /// An executor's later steps' chunks (memory.low; unadvised chunks too, nearest), its current step's above the floor (memory.min), and its streaming slots (the
+    /// nearest [`SLOTS`] unpinned uses); each furthest first, unpinned before a graph's.
+    fn running(&self, e: usize) -> Running {
+        let Some(x) = self.ex(e) else { return (vec![], vec![], vec![]) };
         let (mut later, mut step) = (vec![], vec![]);
         for (c, ch) in x.chunks.iter().enumerate() {
             let (list, at) = match ch.advice {
                 Advice::Later { at } => (&mut later, at),
                 Advice::Step { at } => (&mut step, at),
                 Advice::Unset => (&mut later, 0),
-                Advice::Region { id } if !x.regions.iter().any(|r| r.id == id) => (&mut later, 0),
                 _ => continue,
             };
+            if self.owned(e, c) {
+                continue;
+            }
             if let Some(n) = self.needs(e, c).filter(|_| self.open(e, c)) {
                 list.push((!n.is_empty(), Reverse(at), ch.slot, c));
             }
@@ -570,7 +585,8 @@ impl<'a> Run<'a> {
         step.sort();
         let near: BTreeSet<u64> = step.iter().filter(|i| !i.0).map(|i| i.1 .0).collect::<BTreeSet<_>>().into_iter().take(SLOTS).collect();
         let (slots, far): (Vec<_>, Vec<_>) = step.into_iter().partition(|i| !i.0 && near.contains(&i.1 .0));
-        (later.into_iter().map(|i| i.3).collect(), far.into_iter().chain(slots).map(|i| i.3).collect())
+        let ids = |v: Vec<(bool, Reverse<u64>, u32, usize)>| v.into_iter().map(|i| i.3).collect();
+        (ids(later), ids(far), ids(slots))
     }
 
     /// Per-process free lists are never kept while another process waits (§12): every other
@@ -578,7 +594,7 @@ impl<'a> Run<'a> {
     fn drain_free_lists(&mut self, asker: Option<usize>) {
         for (e, x) in self.s.executors.iter().enumerate().filter(|(e, _)| Some(*e) != asker) {
             for (c, ch) in x.chunks.iter().enumerate() {
-                if matches!(ch.advice, Advice::FreeList { .. }) && self.free_now(e, c) {
+                if matches!(ch.advice, Advice::FreeList { .. }) && self.free_now(e, c) && !self.owned(e, c) {
                     self.take(e, c, Stage::FreeList);
                 }
             }
@@ -662,13 +678,17 @@ impl<'a> Run<'a> {
             return self.got >= target;
         }
         let own = asker.map(|e| (e, self.running(e)));
-        let later = (0..self.s.executors.len()).filter(|&e| Some(e) != asker).map(|e| (e, self.running(e).0)).collect();
-        if let Some((e, (own_later, _))) = &own {
+        let others: Vec<(usize, Running)> = (0..self.s.executors.len()).filter(|&e| Some(e) != asker).map(|e| (e, self.running(e))).collect();
+        if let Some((e, (own_later, _, _))) = &own {
             self.water(vec![(*e, own_later.clone())], Stage::Later, target);
         }
-        self.water(later, Stage::Later, target);
-        let Some((asker, (_, own_step))) = own.filter(|_| scope == Scope::All) else { return self.got >= target };
-        self.water(vec![(asker, own_step)], Stage::Step, target);
+        self.water(others.iter().map(|(e, r)| (*e, r.0.clone())).collect(), Stage::Later, target);
+        if scope == Scope::Unprotected {
+            self.water(others.into_iter().map(|(e, r)| (e, r.1)).collect(), Stage::Step, target);
+            return self.got >= target;
+        }
+        let Some((asker, (_, far, slots))) = own else { return self.got >= target };
+        self.water(vec![(asker, far.into_iter().chain(slots).collect())], Stage::Step, target);
         // Others' pinned, unprotected chunks: asked now, given at their unpin.
         for (e, x) in self.s.executors.iter().enumerate() {
             if e == asker || self.cyclic.contains(&x.id) {
@@ -678,7 +698,7 @@ impl<'a> Run<'a> {
                 if self.got >= target {
                     return true;
                 }
-                let protected = matches!(ch.advice, Advice::Step { .. });
+                let protected = matches!(ch.advice, Advice::Step { .. }) || self.owned(e, c);
                 if ch.pins > 0 && !protected && self.open(e, c) && self.needs(e, c).is_none() {
                     self.taken.insert((e, c));
                     self.got += ch.bytes;
@@ -699,7 +719,6 @@ impl Advice {
             Advice::Free { since } => (2, since),
             Advice::Idle { last_use } => (3, last_use),
             Advice::Later { at } => (4, at),
-            Advice::Region { id } => (5, u64::from(id)),
             Advice::Step { at } => (6, at),
         }
     }
@@ -711,7 +730,6 @@ impl Advice {
             2 => Advice::Free { since: value },
             3 => Advice::Idle { last_use: value },
             4 => Advice::Later { at: value },
-            5 => u32::try_from(value).map_or(Advice::Unset, |id| Advice::Region { id }),
             6 => Advice::Step { at: value },
             _ => Advice::Unset,
         }
@@ -755,11 +773,11 @@ mod tests {
         Executor { id, chunks, ..Executor::default() }
     }
 
-    fn region(id: u32, next_use: Option<u64>, last_use: u64, produce_ns: u64) -> Region {
-        Region { id, swappable: true, last_use, next_use, produce_ns }
+    fn region(id: u64, chunks: &[u32], next_use: Option<u64>, last_use: u64, produce_ns: u64) -> Region {
+        Region { id, chunks: chunks.to_vec(), swappable: true, last_use, next_use, produce_ns }
     }
 
-    fn graph(id: u32, chunks: &[u32], next_use: Option<u64>, last_use: u64, capture_ns: u64) -> Graph {
+    fn graph(id: u64, chunks: &[u32], next_use: Option<u64>, last_use: u64, capture_ns: u64) -> Graph {
         Graph { id, chunks: chunks.to_vec(), last_use, next_use, capture_ns, dropping: false }
     }
 
@@ -809,10 +827,10 @@ mod tests {
     /// Executor 1 asks while running; 2 runs beside it; 3 is idle with a region and a graph.
     fn ladder() -> Snapshot {
         let one = ex(1, vec![c(1, 1, Advice::FreeList { since: 1 }), pinned(1, step(10, 1)), step(11, 2), step(12, 3), step(13, 7), later(14, 9), later(15, 8)]);
-        let mut two = ex(2, vec![c(1, 1, Advice::FreeList { since: 5 }), pinned(1, step(20, 1)), step(21, 2), step(22, 3), later(23, 8), later(24, 6), c(25, 1, Advice::Region { id: 9 }), c(26, 1, Advice::Region { id: 9 })]);
-        two.regions = vec![region(9, Some(4), 1, 1_000_000)];
-        let mut three = ex(3, vec![c(1, 1, Advice::Free { since: 3 }), idle(2, 50), idle(3, 10), c(4, 1, Advice::Region { id: 7 }), c(5, 1, Advice::Region { id: 7 }), pinned(1, idle(6, 20)), pinned(1, c(7, 1, Advice::Free { since: 0 }))]);
-        three.regions = vec![region(7, None, 30, 1_000_000)];
+        let mut two = ex(2, vec![c(1, 1, Advice::FreeList { since: 5 }), pinned(1, step(20, 1)), step(21, 2), step(22, 3), later(23, 8), later(24, 6), c(25, 1, Advice::Unset), c(26, 1, Advice::Unset)]);
+        two.regions = vec![region(9, &[25, 26], Some(4), 1, 1_000_000)];
+        let mut three = ex(3, vec![c(1, 1, Advice::Free { since: 3 }), idle(2, 50), idle(3, 10), c(4, 1, Advice::Unset), c(5, 1, Advice::Unset), pinned(1, idle(6, 20)), pinned(1, c(7, 1, Advice::Free { since: 0 }))]);
+        three.regions = vec![region(7, &[4, 5], None, 30, 1_000_000)];
         three.graphs = vec![graph(8, &[6, 7], None, 15, 1_000_000)];
         snap(0, 0, vec![1], vec![one, two, three])
     }
@@ -903,7 +921,7 @@ mod tests {
             assert_eq!(bytes(&d), picked * M, "free {free} MiB, {coming} MiB coming");
             let stages: Vec<Stage> = d.picks.iter().filter_map(|p| if let Pick::Chunk { stage, .. } = p { Some(*stage) } else { None }).collect();
             assert_eq!(stages.last().copied(), last, "free {free} MiB");
-            assert!(!stages.contains(&Stage::Step), "free {free} MiB: no reclaim without an asker takes a current step");
+            assert!(!stages.contains(&Stage::Step), "free {free} MiB: memory.low covered it");
         }
         // Demand allocates down to min; speculation only down to high.
         let spec = |mib| Ask { speculative: true, ..demand(1, mib) };
@@ -926,6 +944,23 @@ mod tests {
         let d = decide(&s, &[Ask { cached: Some(0), ..demand(1, 1) }]);
         assert!(!show(&d).contains(&"P0".to_string()));
         assert_eq!(d.answers, vec![Answer::Allocate]);
+    }
+
+    /// Foreign pressure (under min, no ask) streams running sets down to their floors: their
+    /// current steps' pages go, furthest first, the largest holder first, never a pinned block
+    /// nor a streaming slot. Another executor's ask never takes them (memory.min).
+    #[test]
+    fn foreign_pressure_streams_running_sets_down_to_their_floors() {
+        let q = |slot, at| c(slot, 256, Advice::Step { at });
+        let a = ex(1, vec![pinned(1, q(1, 0)), q(2, 1), q(3, 2), q(4, 3), q(5, 4), q(6, 5)]);
+        let b = ex(2, vec![pinned(1, q(1, 0)), q(2, 1), q(3, 2), q(4, 3)]);
+        // min 512 MiB, high 1.5 GiB; free 0: 1.5 GiB wanted, 1 GiB above the floors.
+        let d = decide(&snap(0, 512, vec![], vec![a.clone(), b.clone()]), &[]);
+        assert_eq!(show(&d), ["1:6", "1:5", "1:4", "2:4"]);
+        assert!(d.picks.iter().all(|p| matches!(p, Pick::Chunk { stage: Stage::Step, .. })));
+        // Executor 2's ask, the same room short: executor 1's current step is never its room.
+        let d = decide(&quiet(snap(0, 0, vec![], vec![a, b])), &[demand(2, 256)]);
+        assert!(d.picks.iter().all(|p| matches!(p, Pick::Chunk { executor: 2, .. })), "{:?}", show(&d));
     }
 
     /// 1 asks, running; 2 and 3 run beside it; 4 is idle.
@@ -981,11 +1016,11 @@ mod tests {
     #[test]
     fn regions_go_by_rank_and_a_graph_as_a_unit() {
         let host = Host { available: 64 << 30, total: 64 << 30, d2h: 1 << 30, h2d: 1 << 30 };
-        let mut a = ex(1, vec![c(1, 2, Advice::Region { id: 1 }), c(2, 2, Advice::Region { id: 2 }), c(3, 4, Advice::Region { id: 3 }), pinned(2, c(4, 1, Advice::Free { since: 0 })), pinned(1, idle(5, 0)), pinned(1, later(6, 6))]);
+        let mut a = ex(1, vec![c(1, 2, Advice::Unset), c(2, 2, Advice::Unset), c(3, 4, Advice::Unset), pinned(2, c(4, 1, Advice::Free { since: 0 })), pinned(1, idle(5, 0)), pinned(1, later(6, 6))]);
         // Regions 1 and 2 used: 1 costs 4 ms to make (swap 3.9 ms), 2 costs 50 µs (discarded).
         // Region 3 has no advised use. Graphs 5 and 6 share the pool chunk 4; 5 holds later 6,
         // 6 holds idle 5.
-        a.regions = vec![region(1, Some(2), 1, 4_000_000), region(2, Some(2), 1, 50_000), region(3, None, 9, 0)];
+        a.regions = vec![region(1, &[1], Some(2), 1, 4_000_000), region(2, &[2], Some(2), 1, 50_000), region(3, &[3], None, 9, 0)];
         a.graphs = vec![graph(5, &[4, 6], Some(1), 2, 1_000_000), graph(6, &[4, 5], None, 3, 1_000_000)];
         let mut s = snap(0, 0, vec![], vec![a, ex(2, vec![])]);
         s.host = host;
@@ -1007,8 +1042,8 @@ mod tests {
     /// region 3 (10 ms/MiB) goes before the pair (1.0001 s/MiB), and the pair before later 3.
     #[test]
     fn graphs_sharing_a_pool_go_together() {
-        let mut a = ex(1, vec![pinned(2, c(1, 1, Advice::Free { since: 0 })), c(2, 1, Advice::Region { id: 3 }), later(3, 1)]);
-        a.regions = vec![region(3, Some(1), 0, 10_000_000)];
+        let mut a = ex(1, vec![pinned(2, c(1, 1, Advice::Free { since: 0 })), c(2, 1, Advice::Unset), later(3, 1)]);
+        a.regions = vec![region(3, &[2], Some(1), 0, 10_000_000)];
         a.graphs = vec![graph(1, &[1], Some(1), 0, 100_000), graph(2, &[1], Some(1), 0, 1_000_000_000)];
         let rows: &[(u64, &[&str])] = &[(1, &["D1:3", "1:2"]), (2, &["D1:3", "1:2", "G1:1", "G1:2", "1:1"]), (3, &["D1:3", "1:2", "G1:1", "G1:2", "1:1", "1:3"])];
         for &(need, picks) in rows {
@@ -1030,8 +1065,8 @@ mod tests {
             (true, 10_000_000, 0, 64 * gb, false),       // unmeasured copies
         ];
         for &(swappable, produce_ns, rate, available, swapped) in rows {
-            let mut a = ex(1, vec![c(1, 4, Advice::Region { id: 1 })]);
-            a.regions = vec![Region { swappable, ..region(1, Some(1), 0, produce_ns) }];
+            let mut a = ex(1, vec![c(1, 4, Advice::Unset)]);
+            a.regions = vec![Region { swappable, ..region(1, &[1], Some(1), 0, produce_ns) }];
             let mut s = snap(0, 0, vec![], vec![a, ex(2, vec![])]);
             s.host = Host { available, total: 64 * gb, d2h: rate, h2d: rate };
             let d = decide(&s, &[demand(2, 4)]);
@@ -1142,7 +1177,6 @@ mod tests {
                             Advice::FreeList { .. } => e.id != 1,
                             Advice::Later { .. } | Advice::Unset => protected >= Stage::Step,
                             Advice::Step { .. } => protected == Stage::Pinned && e.id == 1,
-                            _ => false,
                         };
                         assert!(!cheap || picked.contains(&format!("{}:{}", e.id, ch.slot)), "case {case}: {}:{} left for a {protected:?} pick", e.id, ch.slot);
                     }
@@ -1355,11 +1389,11 @@ mod tests {
 
     #[test]
     fn advice_round_trips_the_table_words() {
-        for a in [Advice::Unset, Advice::FreeList { since: 7 }, Advice::Free { since: 8 }, Advice::Idle { last_use: 9 }, Advice::Later { at: 10 }, Advice::Region { id: 11 }, Advice::Step { at: 12 }] {
+        for a in [Advice::Unset, Advice::FreeList { since: 7 }, Advice::Free { since: 8 }, Advice::Idle { last_use: 9 }, Advice::Later { at: 10 }, Advice::Step { at: 12 }] {
             let (class, value) = a.encode();
             assert_eq!(Advice::decode(class, value), a);
         }
-        assert_eq!(Advice::decode(5, u64::MAX), Advice::Unset);
+        assert_eq!(Advice::decode(5, 1), Advice::Unset);
         assert_eq!(Advice::decode(99, 1), Advice::Unset);
     }
 }

@@ -43,6 +43,9 @@ pub enum Access {
     Read,
 }
 
+/// The reserve every GPU keeps free beyond its driver's measured use (design rev 6).
+pub const RESERVE: u64 = 512 << 20;
+
 /// The code [`Backend::create`] fails with when the device has no memory for the page
 /// (`CUDA_ERROR_OUT_OF_MEMORY`; the host backend answers the same at its limit).
 pub const OUT_OF_MEMORY: i32 = 2;
@@ -51,10 +54,10 @@ pub const OUT_OF_MEMORY: i32 = 2;
 pub trait Backend: Send + Sync {
     /// The device's total bytes (the card, or a host device's limit).
     fn capacity(&self) -> u64;
-    /// Bytes the driver needs free at all times (its lazy kernel loads, cr-215): never leased,
-    /// never filled, in any mode.
+    /// Bytes kept free beyond the driver's own measured use (its lazy kernel loads, cr-215): a
+    /// fixed reserve per GPU, never leased, never filled, in any mode (design rev 6).
     fn headroom(&self) -> u64 {
-        crate::table::headroom(self.capacity())
+        RESERVE
     }
     /// Free bytes as the driver measures them now. Only foreign bytes derive from it (the
     /// device's used bytes less every row's); placement never sizes from it.
@@ -89,6 +92,10 @@ pub trait Backend: Send + Sync {
     /// Where `io::read` writes `len` mapped bytes at `va + offset`: device memory ordered on the
     /// backend's copy stream, or host memory.
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst;
+    /// Copies `src` into mapped bytes at `va + offset`, waiting for the copy: a swapped region back in.
+    fn copy_in(&self, _va: Va, _offset: u64, _src: &[u8]) -> Result<()> {
+        Err(Error::Invalid("this backend cannot swap".into()))
+    }
     /// An event after everything the copy stream holds so far.
     fn fence(&self) -> Result<Event>;
     /// An event (with timing) after everything `stream` holds so far.
@@ -116,6 +123,18 @@ pub trait Backend: Send + Sync {
     }
     /// After a device error: proves the copy stream's work complete or fails.
     fn drain(&self) -> Result<()>;
+    /// This thread's driver calls never invalidate another thread's stream capture (relaxed
+    /// capture mode): varena's own threads, which run beside captures.
+    fn relax(&self) {}
+    /// Whether `stream` is capturing a graph now (a capture invalidated but not ended still is).
+    fn capturing(&self, _stream: usize) -> Result<bool> {
+        Ok(false)
+    }
+    /// Copies `dst.len()` mapped bytes at `va + offset` to host memory once `after` completed;
+    /// returns once they landed. A writer's thread only (it waits on the device).
+    fn copy_out(&self, _va: Va, _offset: u64, _dst: &mut [u8], _after: Event) -> Result<()> {
+        Err(Error::Invalid("this backend copies nothing out".into()))
+    }
 }
 
 /// Pages in host memory (a memfd, an `shm_open` object or a pagefile section each), mapped into
@@ -155,6 +174,14 @@ impl HostBackend {
     /// A host device that keeps `headroom` free, as a card's driver does.
     pub fn with_headroom(limit: u64, headroom: u64) -> HostBackend {
         HostBackend { limit, headroom, pages: Mutex::new(Pages::default()) }
+    }
+}
+
+/// `len` bytes at `offset` lie inside `va`.
+pub(crate) fn inside(va: Va, offset: u64, len: usize) -> Result<()> {
+    match offset.checked_add(len as u64) {
+        Some(end) if end <= va.len => Ok(()),
+        _ => Err(Error::Invalid(format!("{len} bytes at offset {offset} outside a {}-byte range", va.len))),
     }
 }
 
@@ -254,6 +281,13 @@ impl Backend for HostBackend {
         Dst::Host { ptr: (va.base + offset) as *mut u8, len: len as usize }
     }
 
+    fn copy_in(&self, va: Va, offset: u64, src: &[u8]) -> Result<()> {
+        inside(va, offset, src.len())?;
+        // SAFETY: a mapped read-write range of the caller's reservation, checked to hold `src.len()` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), (va.base + offset) as *mut u8, src.len()) };
+        Ok(())
+    }
+
     fn fence(&self) -> Result<Event> {
         Ok(Event::DONE)
     }
@@ -286,6 +320,15 @@ impl Backend for HostBackend {
     fn retire(&self, _: Event) {}
 
     fn drain(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8], _: Event) -> Result<()> {
+        if offset.saturating_add(dst.len() as u64) > va.len {
+            return Err(Error::Invalid("a copy outside the reservation".into()));
+        }
+        // SAFETY: the range is mapped (the caller pins it) and host events are complete when made.
+        unsafe { std::ptr::copy_nonoverlapping((va.base + offset) as *const u8, dst.as_mut_ptr(), dst.len()) };
         Ok(())
     }
 }

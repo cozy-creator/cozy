@@ -950,6 +950,7 @@ mod cases {
                 }
                 Ok((ToAgent::Refuse { id, code, .. }, _)) => format!("refuse {id} {code:?}"),
                 Ok((ToAgent::Revoke, _)) => "revoke".into(),
+                Ok((ToAgent::Reclaim { region, swap }, _)) => format!("reclaim {region} {swap}"),
                 Err(RecvTimeoutError::Timeout) => "timeout".into(),
                 Err(RecvTimeoutError::Disconnected) => "closed".into(),
             }

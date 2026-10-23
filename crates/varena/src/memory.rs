@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[cfg(unix)]
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use crossbeam_channel::{select_biased, unbounded, Receiver, Sender};
@@ -289,6 +289,7 @@ pub struct Stats {
     pub keep_pending: u64,
     /// Each `make_room` that had to take bytes for it, in order.
     pub make_room: Vec<MakeRoom>,
+    pub outlived: Vec<crate::arena::Outlived>, // its torch blocks live at its end (the audit)
 }
 
 /// One `make_room` that had to take bytes: what asked, how many bytes, what it took.
@@ -346,9 +347,116 @@ impl Drop for Owner {
     }
 }
 
-/// One process's memory on one device.
+/// One process's memory on one device. A clone is another public handle on it.
 pub struct Memory {
     inner: Owner,
+    /// Memory handles (clones): the last one's drop closes it.
+    handles: Arc<AtomicUsize>,
+}
+
+impl Clone for Memory {
+    fn clone(&self) -> Memory {
+        self.handles.fetch_add(1, Ordering::AcqRel);
+        Memory { inner: Arc::clone(&*self.inner).into(), handles: self.handles.clone() }
+    }
+}
+
+/// region.rs's hooks: the device's events, its free bytes, the manager's figures, and the plan.
+impl Memory {
+    pub(crate) fn record_event(&self, stream: usize) -> Result<Event> {
+        self.inner.backend.record(stream)
+    }
+
+    pub(crate) fn finish_event(&self, event: Event) -> Result<()> {
+        self.inner.backend.finish(event)
+    }
+
+    pub(crate) fn retire_event(&self, event: Event) {
+        self.inner.backend.retire(event)
+    }
+
+    pub(crate) fn synchronize(&self, stream: usize) -> Result<()> {
+        self.inner.backend.synchronize(stream)
+    }
+
+    pub(crate) fn granularity(&self) -> u64 {
+        self.inner.backend.granularity()
+    }
+
+    /// With no manager: the device's free bytes less H, the display's headroom.
+    pub(crate) fn standalone_free(&self) -> u64 {
+        let b = &self.inner.backend;
+        b.free().unwrap_or(0).saturating_sub(crate::table::headroom(b.capacity()))
+    }
+
+    /// The device's torch allocator, if anything allocated through it yet.
+    pub(crate) fn torch_if(&self) -> Option<Arc<crate::arena::Torch>> {
+        self.inner.torch.get().cloned()
+    }
+
+    /// The same device memory: two handles of one open.
+    pub(crate) fn same(&self, other: &Memory) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The manager's figures for this executor, while its pages are leased.
+    pub(crate) fn figures(&self) -> Option<crate::lease::Figures> {
+        #[cfg(unix)]
+        return self.inner.lease.get().map(|a| a.table().figures());
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Plan step `step`'s sets (each open request's current step when `None`): this process's
+    /// mapped bytes in them, its idle mapped bytes outside them, and their largest block.
+    pub(crate) fn step_bytes(&self, step: Option<u32>) -> (u64, u64, u64) {
+        let st = self.inner.state.lock();
+        let sets: BTreeSet<u32> = st.table.requests.iter().filter_map(|r| r.steps.get(step.unwrap_or(r.cursor.step) as usize)).flat_map(|(s, _)| s.iter().copied()).collect();
+        let (mut warm, mut cold, mut largest) = (0, 0, 0);
+        for ((set, _), p) in st.table.pages() {
+            if sets.contains(&set) {
+                largest = largest.max(p.bytes);
+                warm += if p.mapped { p.bytes } else { 0 };
+            } else if p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.filling {
+                cold += p.bytes;
+            }
+        }
+        (warm, cold, largest)
+    }
+
+    /// A region's facts to the lease manager (`None`: it is gone), while leased.
+    pub(crate) fn region_facts(&self, id: u64, record: Option<&crate::region::Record>) {
+        #[cfg(unix)]
+        if let Some(agent) = self.inner.lease.get() {
+            let sent = match record {
+                Some(r) => agent.region(crate::lease::wire::RegionFacts { id, kind: r.kind, slots: r.slots.clone(), cost_ns: r.cost_ns, last_use: r.last_use, next_use: r.next_use.map_or(u64::MAX, u64::from) }),
+                None => agent.region_gone(id),
+            };
+            if let Err(e) = sent {
+                tracing::debug!("varena: region {id}'s facts did not reach the lease manager: {e}");
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (id, record);
+    }
+
+    /// The lease slots of `sets`' leased pages.
+    pub(crate) fn lease_slots(&self, sets: &[SetId]) -> Vec<u32> {
+        #[cfg(unix)]
+        return self.inner.leased.lock().values().filter(|(_, key, _)| sets.iter().any(|s| s.0 == key.0)).map(|(t, ..)| t.slot).collect();
+        #[cfg(not(unix))]
+        {
+            let _ = sets;
+            Vec::new()
+        }
+    }
+
+    /// Every block of `set`.
+    pub(crate) fn blocks(&self, set: SetId) -> Result<Vec<u32>> {
+        let st = self.inner.state.lock();
+        let n = st.table.sets.get(set.0 as usize).and_then(|s| s.as_ref()).map(|s| s.pages.len()).ok_or_else(|| Error::Closed(format!("set {}", set.0)))?;
+        Ok((0..n as u32).collect())
+    }
 }
 
 /// A request in flight; dropping it ends it: its pins and its caches go, and the leftover is
@@ -506,6 +614,9 @@ enum Mech {
     /// The lease manager asked pages back: the quiet ones go, the busy ones once idle.
     #[cfg(unix)]
     Revoke,
+    /// The lease manager reclaims a region whole (crate::region).
+    #[cfg(unix)]
+    Reclaim { region: u64, swap: bool },
 }
 
 struct Active {
@@ -611,6 +722,10 @@ struct State {
     /// The wake epoch read when this lock was taken, before its drain: a wait sleeps only while
     /// no change came after it.
     seen: u64,
+    /// Each page's last bind on the machine-wide clock (CLOCK_MONOTONIC ns): the manager
+    /// compares idle pages across processes by it.
+    #[cfg(unix)]
+    used_ns: HashMap<Key, u64>,
     table: Table,
     physical_epoch: u64,
     retired: HashMap<(Key, u64), Retirement>,
@@ -851,6 +966,7 @@ struct Inner {
     room: AtomicU64,
     #[cfg(unix)]
     tally: tensorfs::io::source::IoTally,
+    torch: std::sync::OnceLock<Arc<crate::arena::Torch>>,
     _device: Device,
 }
 
@@ -919,6 +1035,7 @@ impl Memory {
                 room: AtomicU64::new(0),
                 #[cfg(unix)]
                 tally: Default::default(),
+                torch: Default::default(),
             });
             let (weak, queue) = (Arc::downgrade(&inner), inner.mech.clone());
             std::thread::Builder::new().name("varena-mechanism".into()).spawn(move || mech_loop(&queue, &weak)).map_err(|e| Error::io("spawn mechanism", e))?;
@@ -942,15 +1059,16 @@ impl Memory {
             let mut st = inner.lock();
             inner.publish(&mut st);
             inner.unlock(st);
-            Ok(Memory { inner: inner.into() })
+            Ok(Memory { inner: inner.into(), handles: Arc::new(AtomicUsize::new(1)) })
         })
     }
 
     /// Leases this GPU's weight pages from the manager serving it (TensorD's, in the table
     /// owner's namespace), right after open, before any load: from then on its pages are the
     /// manager's chunks, retained by it across this process's exit (no Keep), and asked back by
-    /// it. `Some((Incompatible | Absent, why))`: it runs standalone. Any other refusal is an error
-    /// (TensorD parks a peer it has not registered yet, so the dial itself waits).
+    /// it. A refusal comes back typed, `Some((code, why))`: Incompatible or Absent runs standalone;
+    /// the caller fails on any other (TensorD parks a peer it has not registered yet, so the dial
+    /// itself waits).
     #[cfg(unix)]
     pub fn lease(&self) -> Result<Option<(crate::lease::Refusal, String)>> {
         let uuid = self.inner._device.0.clone();
@@ -974,13 +1092,18 @@ impl Memory {
         };
         match crate::lease::Agent::attach(stream, self.inner.backend.clone(), revoked)? {
             crate::lease::Attach::Leased(agent) => {
+                let mech = self.inner.mech.clone();
+                agent.on_reclaim(Box::new(move |region, swap| {
+                    mech.post(Mech::Reclaim { region, swap }, 0);
+                }))?;
                 if self.inner.lease.set(agent).is_err() {
                     return Err(Error::Invalid("this Memory is leased already".into()));
                 }
+                // torch's blocks come from leased chunks too: the agent is its only allocator.
+                self.serve_leased_torch()?;
                 Ok(None)
             }
-            crate::lease::Attach::Refused { code: code @ (crate::lease::Refusal::Incompatible | crate::lease::Refusal::Absent), why } => Ok(Some((code, why))),
-            crate::lease::Attach::Refused { code, why } => Err(Error::Closed(format!("the lease manager refused this process ({code:?}): {why}"))),
+            crate::lease::Attach::Refused { code, why } => Ok(Some((code, why))),
         }
     }
 
@@ -1442,6 +1565,7 @@ impl Inner {
             agent.busy(st.events.values().any(|q| !q.is_empty()));
             self.redecline(st);
             self.land(st, agent);
+            self.advise(st, agent);
         }
         // A held cache's release completes on its stream: it is its class again.
         for c in &mut st.table.caches {
@@ -1649,6 +1773,12 @@ impl Inner {
     /// created (an imported page is not charged to the importer's process); torch's own pool
     /// outside the hook counts here.
     fn measure(&self, st: &mut State) {
+        // Leased, NVML may charge the chunks to their creator: the context is the open's
+        // measured one, never NVML pid − created.
+        if self.leasing() {
+            st.table.context = self.backend.opened_context();
+            return;
+        }
         st.table.context = match self.backend.process_used() {
             Ok(used) => {
                 let created: u64 = st.homes.values().filter(|h| h.origin != Origin::Kept).filter_map(|h| h.phys.as_ref()).map(|p| p.len).sum::<u64>()
@@ -2833,6 +2963,8 @@ impl Inner {
         st.pins.insert(id, (key, req, std::thread::current().id()));
         if let Some(p) = st.table.page_mut(key) {
             p.last_use = now;
+            #[cfg(unix)]
+            st.used_ns.insert(key, monotonic_ns());
         }
         st.sync(key);
         if let Some(r) = req.and_then(|r| st.table.request_mut(r)) {
@@ -2944,6 +3076,7 @@ impl Inner {
     }
 
     fn end_request(&self, req: u64) -> Stats {
+        let outlived = self.torch.get().map(|t| t.end(crate::arena::Owner::Request(req)).outlived).unwrap_or_default();
         let mut st = self.lock();
         self.unstream(&mut st, req);
         let name = st.table.request(req).map(|r| r.name.clone()).unwrap_or_default();
@@ -2954,7 +3087,7 @@ impl Inner {
         let holding: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name && c.bytes > 0 && c.holds == 0 && c.releasing.is_empty()).map(|c| c.id).collect();
         let shrinks: Vec<(u32, u64, Shrink)> = holding.iter().filter_map(|id| st.shrinks.get(id).map(|s| (*id, u64::MAX, s.clone()))).collect();
         let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
-        let mut stats = st.stats.remove(&req).unwrap_or_default();
+        let mut stats = Stats { outlived, ..st.stats.remove(&req).unwrap_or_default() };
         st.host.remove(&req);
         // Its anonymous host peak (the process's since the first open request started).
         stats.host = st.window.as_mut().and_then(ledger::Window::look);
@@ -3144,6 +3277,9 @@ impl Drop for Memory {
     /// Final physical retirement is transferred by Owner, so a Python/DLPack destructor never
     /// waits for a CUDA consumer or a host callback.
     fn drop(&mut self) {
+        if self.handles.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
         self.inner.burst.0.lock().closed = true;
         self.inner.burst.1.notify_all();
         self.inner.landed.notify_all();
@@ -3250,7 +3386,7 @@ impl Drop for Inner {
                 Mech::Release(va) => self.backend.release(va),
                 Mech::Map { .. } | Mech::Adopt { .. } | Mech::Keep { .. } => {}
                 #[cfg(unix)]
-                Mech::Revoke => {}
+                Mech::Revoke | Mech::Reclaim { .. } => {}
             }
         }
         let mut st = self.state.lock();
@@ -3446,6 +3582,7 @@ impl Request {
     pub fn pass(&self, set: SetId, key: &str) -> Result<Pass> {
         let _ = key;
         let id = self.inner.guard(|| self.inner.pass(self.id, set.0))?;
+        self.inner.torch_pass(self.id);
         Ok(Pass { inner: self.inner.clone().into(), req: self.id, set: set.0, id })
     }
 
@@ -3546,6 +3683,8 @@ impl Pass {
     /// Ends the pass: `peak`, the most the execution layer saw it allocate, goes into the
     /// request's record (its dispatch key's peak at the request's end).
     pub fn end(self, peak: u64) {
+        // The pass's torch peak is varena's own when torch allocates from it.
+        let peak = peak.max(self.inner.torch_peak(self.req));
         let _ = self.inner.guard(|| self.inner.end_pass(self.req, self.id, peak));
     }
 }
@@ -3574,6 +3713,12 @@ impl Inner {
             Mech::Map { key, gen, va, off, span, job, speculative, decided } => self.place_page(key, gen, va, off, span, job, (!speculative).then_some(decided)),
             #[cfg(unix)]
             Mech::Revoke => self.revoke(),
+            #[cfg(unix)]
+            Mech::Reclaim { region, swap } => {
+                if let Err(e) = crate::region::reclaim(region, swap) {
+                    tracing::warn!("varena: reclaiming region {region}: {e}");
+                }
+            }
             Mech::Renew { key, gen, va, off, span, old, after, job } => {
                 // Its consumers finish before the unmap: this thread waits for their events.
                 let released = after.iter().try_for_each(|e| self.backend.finish(*e))
@@ -3949,6 +4094,9 @@ impl Inner {
         if asked.is_empty() {
             return;
         }
+        // torch's chunks the manager asked back, given by the arena when idle and quiet (no
+        // state lock held: R10).
+        self.revoke_torch(&asked);
         let keys: Vec<(crate::lease::Ticket, Key)> = self.leased.lock().values().filter(|(t, ..)| asked.contains(t)).map(|(t, k, _)| (*t, *k)).collect();
         let mut st = self.lock();
         for (ticket, key) in keys {
@@ -3964,6 +4112,24 @@ impl Inner {
         }
         self.publish(&mut st);
         self.unlock(st);
+    }
+
+    /// What each leased page is to its plan, for the manager's victim order (the policy's
+    /// advice codes): the current step's (6, memory.min, its distance: the nearest are its
+    /// streaming slots), a later step's (4, its distance), or idle (3, its last bind on the
+    /// machine-wide clock). Atomics only, under the state lock.
+    #[cfg(unix)]
+    fn advise(&self, st: &State, agent: &crate::lease::Agent) {
+        for (ticket, key, _) in self.leased.lock().values() {
+            let at = st.table.distance(*key).map(|(step, pass, block)| u64::from(step) << 40 | u64::from(pass) << 20 | u64::from(block));
+            let (code, value) = match (st.table.class(*key), at) {
+                (Some(Class::P), _) => (6, 0),
+                (Some(Class::W), at) => (6, at.unwrap_or(0)),
+                (_, Some(at)) => (4, at),
+                _ => (3, st.used_ns.get(key).copied().unwrap_or(0)),
+            };
+            let _ = agent.hint(*ticket, code, value);
+        }
     }
 
     /// Leased pages whose fill's ready event completed: the manager hears they landed. Under
@@ -4057,4 +4223,13 @@ impl Drop for Pass {
             st.active.remove(&(self.req, self.set));
         }
     }
+}
+
+/// CLOCK_MONOTONIC in nanoseconds: one clock for every process on the machine.
+#[cfg(unix)]
+fn monotonic_ns() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid clock id and a writable timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    u64::try_from(t.tv_sec).unwrap_or(0).saturating_mul(1_000_000_000).saturating_add(u64::try_from(t.tv_nsec).unwrap_or(0))
 }

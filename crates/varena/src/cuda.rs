@@ -377,6 +377,13 @@ impl Backend for CudaBackend {
         Dst::Device { device: self.ordinal, ptr: va.base + offset, len: len as usize, stream: self.stream.raw() }
     }
 
+    fn copy_in(&self, va: Va, offset: u64, src: &[u8]) -> Result<()> {
+        crate::backend::inside(va, offset, src.len())?;
+        let _ctx = self.primary.enter()?;
+        call!("cuMemcpyHtoDAsync", memcpy_htod_async(va.base + offset, src.as_ptr().cast(), src.len(), self.stream.raw() as CUstream))?;
+        Ok(self.stream.drain()?)
+    }
+
     fn fence(&self) -> Result<Event> {
         self.record(self.stream.raw())
     }
@@ -458,6 +465,36 @@ impl Backend for CudaBackend {
     fn drain(&self) -> Result<()> {
         self.stream.drain()?;
         Ok(tensorfs::io::drain(self.ordinal)?)
+    }
+
+    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8], after: Event) -> Result<()> {
+        let _ctx = self.primary.enter()?;
+        let stream = self.stream.raw() as CUstream;
+        if after != Event::DONE {
+            call!("cuStreamWaitEvent", stream_wait_event(stream, self.raw(after)?, 0))?;
+        }
+        call!("cuMemcpyDtoHAsync", memcpy_dtoh_async(dst.as_mut_ptr().cast(), va.base + offset, dst.len(), stream))?;
+        Ok(call!("cuStreamSynchronize", stream_synchronize(stream))?)
+    }
+
+    fn capturing(&self, stream: usize) -> Result<bool> {
+        let _ctx = self.primary.enter()?;
+        let mut status: c_int = 0;
+        call!("cuStreamIsCapturing", stream_is_capturing(stream as CUstream, &mut status))?;
+        // CU_STREAM_CAPTURE_STATUS_NONE is 0; ACTIVE and INVALIDATED still capture.
+        Ok(status != 0)
+    }
+
+    fn relax(&self) {
+        // CU_STREAM_CAPTURE_MODE_RELAXED.
+        let mut mode: c_int = 2;
+        let rc = cuda::driver().map(|d| {
+            // SAFETY: an out-param on the stack; the call needs no context.
+            unsafe { (d.thread_exchange_stream_capture_mode)(&mut mode) }
+        });
+        if !matches!(rc, Ok(cuda::SUCCESS)) {
+            tracing::warn!("varena: this thread stays in its capture mode: cuThreadExchangeStreamCaptureMode failed");
+        }
     }
 }
 

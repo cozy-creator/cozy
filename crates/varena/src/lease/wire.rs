@@ -39,6 +39,22 @@ pub enum Kind {
     Cache,
 }
 
+/// A region as the manager's policy sees it (§5, §6): sent at its create and its changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionFacts {
+    pub id: u64,
+    pub kind: crate::region::Reclaimable,
+    /// The chunks it holds now: a cache region's arena chunks; a graph's weight pages and pool chunks.
+    pub slots: Vec<u32>,
+    /// Its measured production (or capture) time.
+    pub cost_ns: u64,
+    /// Its last use, in ns on the agent's clock.
+    pub last_use: u64,
+    /// Advice: when it is used next, ordered within the executor as its chunks' advice is
+    /// (`u64::MAX`: no use declared).
+    pub next_use: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ToManager {
     /// Attach. The peer's credentials name the process; `birth` (its start ticks) pins that
@@ -48,6 +64,8 @@ pub enum ToManager {
     Ask { id: u64, bytes: u64, kind: Kind, region: Option<Region> },
     /// Doorbell: slots moved to Mapped, Refused or Released.
     Answered,
+    Region(RegionFacts),
+    RegionGone { id: u64 },
     /// What it measured: a request's peaks at its end, a set's bytes at its load.
     Measured(Measured),
 }
@@ -72,6 +90,8 @@ pub enum ToAgent {
     Refuse { id: u64, code: Refusal, why: String },
     /// Doorbell: `ask` set on some slots.
     Revoke,
+    /// Reclaim region `region` whole: a graph drops; a cache region swaps (`swap`) or is discarded.
+    Reclaim { region: u64, swap: bool },
 }
 
 /// One side's end: sends serialized, receives on one thread.

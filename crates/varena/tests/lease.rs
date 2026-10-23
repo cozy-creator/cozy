@@ -302,8 +302,9 @@ mod cases {
     fn a_stranger_is_refused(dir: &Path) {
         let host = host(dir, "stranger", 64 * MIB);
         let stranger = End::new(dial(&host.uuid));
-        // Every answer, a refusal too, answers a Hello.
-        stranger.send(&ToManager::Hello { protocol: varena::lease::PROTOCOL, birth: 0 }, None).unwrap();
+        // Every answer follows a Hello, a refusal too.
+        let birth = platform::process::Birth::own().unwrap().start_ticks;
+        stranger.send(&ToManager::Hello { protocol: varena::lease::PROTOCOL, birth }, None).unwrap();
         match stranger.recv::<ToAgent>().unwrap() {
             Some((ToAgent::Refuse { code: Refusal::NotRegistered, .. }, None)) => {}
             other => panic!("a stranger was answered {:?}", other.map(|(m, h)| (m, h.is_some()))),
