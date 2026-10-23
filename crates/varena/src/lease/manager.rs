@@ -1,11 +1,14 @@
-//! The lease manager (varena-leases §1, §2, §2a, §11): it creates every physical chunk, grants
-//! chunks to executors' agents, revokes for room, and takes an exited executor's leases back
-//! once its pidfd shows the exit: landed weights are retained for the next executor of that
-//! trust domain and region (no copy), the rest destroyed. Only the manager exports.
+//! The lease manager (varena-leases §1, §2, §2a, §11, §12): it creates every physical chunk,
+//! allocates chunks to executors' agents, reclaims for room, and takes an exited executor's chunks
+//! back once its pidfd shows the exit: landed weights go to the GPU page cache for the next
+//! executor of that trust domain and region (no copy), the rest are destroyed. Only the manager
+//! exports. What to allocate, reclaim and refuse is [`policy::decide`]'s: the manager builds its
+//! snapshot from the page accounting and applies the answer.
 //!
-//! One manager per GPU: TensorD makes it where it made the ledger, hands it the GPU's listener,
-//! and reacts to its events fd. Until step 4 the admission and placement facts stay the ledger's,
-//! which the manager owns ([`Manager::ledger`]).
+//! One manager per GPU, TensorD's, with the GPU's listener; TensorD reacts to [`Manager::events`].
+//! It also holds what admission and placement read (its agents' facts, standalone executors'
+//! fixed bytes, foreign bytes, the measured peaks, the dispatches) and the allocation-wait spans
+//! PSI reads.
 //!
 //! The table is untrusted input: identity, pid, a chunk's index and whether it landed are the
 //! manager's own records (peer credentials, grant time, fill-ack time), never read back at exit.
@@ -19,13 +22,17 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
+use platform::contain::host_memory;
 use platform::handles::Peer;
+use platform::memory::{Signal, Waitable};
 use platform::process::Exact;
+use sha2::{Digest, Sha256};
 
+use super::policy::{self, Advice, Answer, Pick};
 use super::table::{self, Content, Figures, State, Table};
-use super::wire::{End, Kind, Refusal, Region, ToAgent, ToManager};
+use super::wire::{End, Facts, Kind, Measured, Refusal, Region, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
-use crate::ledger::{FixedRow, Ledger, Mode};
+use crate::decide::{self, Admitted};
 use crate::os::{self, Listener, Owned, Stream};
 use crate::{Error, GpuId, Result};
 
@@ -52,12 +59,15 @@ pub struct Identity {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Record {
-    Grant { pid: u32, ask: u64, chunks: usize, bytes: u64, adopted: bool, create_us: u64, export_us: u64, total_us: u64 },
-    Adopt { pid: u32, region: Region, chunks: usize, bytes: u64 },
+    Allocate { pid: u32, ask: u64, chunks: usize, bytes: u64, cached: bool, create_us: u64, export_us: u64, total_us: u64 },
+    /// An allocation served from the GPU page cache (no copy).
+    Cached { pid: u32, region: Region, chunks: usize, bytes: u64 },
     Refuse { pid: u32, ask: u64, code: Refusal, why: String },
-    Revoke { pid: u32, slots: Vec<u32> },
-    Answered { pid: u32, released: usize, us: u64 },
-    Reclaim { pid: u32, destroyed_bytes: u64, retained_bytes: u64, us: u64 },
+    /// Reclaim requests sent (cooperative: the agent's CAS decides).
+    Reclaim { pid: u32, slots: Vec<u32> },
+    Released { pid: u32, released: usize, us: u64 },
+    /// An executor's exit: its chunks destroyed, or kept in the page cache.
+    Exit { pid: u32, freed_bytes: u64, cached_bytes: u64, us: u64 },
     /// Judged stalled: `looks` looks with no release, no GPU progress and no GPU work running,
     /// its oldest unpinned ask `waited_ms` old.
     Stalled { pid: u32, looks: u32, waited_ms: u64 },
@@ -82,22 +92,80 @@ pub struct ExecutorHolding {
     pub executor: String,
     pub chunks: usize,
     pub bytes: u64,
-    /// Of `bytes`, what its fills acked landed: what its exit would retain.
+    /// Of `bytes`, what its fills acked landed: what its exit would keep in the page cache.
     pub landed: u64,
 }
 
+/// PSI `some` (§12): the share of wall time in which at least one allocation waited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+pub struct Pressure {
+    pub some_10s: f32,
+    pub some_60s: f32,
+}
+
 /// What a manager holds, for its host's status and the tests: free = capacity − created.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct Holdings {
     pub capacity: u64,
+    pub free: u64,
+    pub foreign: u64,
     pub created: u64,
     pub created_chunks: usize,
-    pub leased: u64,
-    pub retained: u64,
-    pub retained_chunks: usize,
+    pub allocated: u64,
+    pub page_cache: u64,
+    pub page_cache_chunks: usize,
     /// Chunks a previous manager created that agents still map (0 until re-attach exists).
     pub books_only: u64,
     pub executors: Vec<ExecutorHolding>,
+    /// Request id → `<package>|<shape>`.
+    pub dispatched: Vec<(String, String)>,
+    pub pressure: Pressure,
+}
+
+/// The machine's sharing mode, as TensorD sets it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub enum Mode {
+    /// Someone else uses the machine too.
+    #[default]
+    Shared,
+    Dedicated,
+}
+
+/// A measured peak, as TensorD persists it per GPU model: restored exactly as it was read.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Peak {
+    /// A request's largest working set at `<package>|<shape>`.
+    Request { key: String, bytes: u64 },
+    /// A request's largest allocations beside its weights at `<package>|<shape>`: what placement
+    /// keeps free on GPU 0.
+    Compute { key: String, bytes: u64 },
+    /// A set's resident bytes, by set name.
+    Set { key: String, bytes: u64 },
+    /// A request's anonymous host high-water at `<package>|<shape>`.
+    Host { key: String, bytes: u64 },
+}
+
+/// A process running requests on a GPU, as TensorD's host rule reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostCall {
+    pub pid: u32,
+    /// The anonymous peak its running requests were measured to reach; `None`: one is unmeasured.
+    pub peak: Option<u64>,
+    /// Its anonymous bytes now.
+    pub anon: u64,
+    /// Its requests running now.
+    pub running: u64,
+}
+
+/// The reserved pool H for a card: never allocated (cr-215).
+pub fn reserved_pool(card: u64) -> u64 {
+    (512 << 20).max(card / 16)
+}
+
+/// A family's id as agents publish it in [`Facts::yielded`] (never 0).
+pub fn family_id(family: &str) -> u64 {
+    let h = Sha256::digest(family.as_bytes());
+    u64::from_le_bytes(std::array::from_fn(|i| h.get(i).copied().unwrap_or(0))).max(1)
 }
 
 /// Opens the GPU's backend (TensorD's CUDA context), at the first ask.
@@ -109,7 +177,7 @@ struct Device {
     /// min(limit, card).
     card: u64,
     granularity: u64,
-    /// The driver's headroom, never leased in any mode (cr-215).
+    /// The reserved pool H, never allocated in any mode (cr-215).
     headroom: u64,
     /// This process's context.
     context: u64,
@@ -119,20 +187,21 @@ struct Device {
 const SLOT_UNIT: u64 = 2 << 20;
 
 pub struct Manager {
-    open: Opener,
+    /// None: a GPU with no VMM for us (exclusive compute mode): every agent runs standalone.
+    open: Option<Opener>,
     /// One open at a time (never under `books`).
     opening: Mutex<()>,
     gpu_memory: u64,
     limit: Option<u64>,
-    ledger: Ledger,
-    /// Its own bytes on the ledger: retained chunks no executor maps and its context, so no
-    /// executor counts them foreign.
-    row: FixedRow,
     hosting: Arc<dyn Hosting>,
     retired: AtomicBool,
     books: Mutex<Books>,
     /// Wakes the stall look when asks go out.
     looking: Condvar,
+    /// Set on every change TensorD reacts to.
+    events: Signal,
+    /// PSI's clock.
+    born: Instant,
 }
 
 #[derive(Default)]
@@ -149,8 +218,22 @@ struct Books {
     /// index, oldest first in `order`.
     retained: BTreeMap<Kept, BTreeMap<u32, Physical>>,
     order: VecDeque<Kept>,
-    /// Device bytes no process of ours holds, as TensorD last sampled them.
+    /// Device bytes no process of ours holds, as TensorD last sampled them, and whether that
+    /// reading saw a new foreign process (consumed by the next decision).
     foreign: u64,
+    new_foreign: bool,
+    mode: Mode,
+    /// Standalone executors' fixed bytes by pid, as TensorD measures them.
+    fixed: BTreeMap<u32, u64>,
+    /// Measured figures by `<kind>/<key>`: peak, compute and host by `<package>|<shape>`, set by
+    /// name.
+    figures: BTreeMap<String, u64>,
+    /// Dispatched request → `<package>|<shape>`.
+    dispatched: BTreeMap<String, String>,
+    /// PSI: spans (ns on `born`) in which an allocation waited, the last minute's, and the
+    /// start of the one open now.
+    waits: VecDeque<(u64, u64)>,
+    waiting: Option<u64>,
 }
 
 type Kept = (String, Region);
@@ -178,6 +261,8 @@ struct Exec {
     reported: BTreeSet<u32>,
     /// The executors whose pins its waiting ask waits on.
     waits_on: BTreeSet<u64>,
+    /// Its agent's admission facts, as last reported.
+    facts: Facts,
 }
 
 struct Leased {
@@ -241,15 +326,31 @@ fn sizes(ask: &Waiting, granularity: u64) -> Vec<u64> {
     }
 }
 
-enum Room {
-    /// Retained chunks dropped made the room now: the ask is answered again at once.
-    Freed,
-    /// Enough is coming: revokes of chunks still unpinned or already being revoked.
-    Coming,
-    /// Only other executors' pinned chunks could give it: asked now, they give when unpinned.
-    Pinned,
-    /// No room can come (the only room left is the asker's own pins).
-    Refused,
+/// A cache key's chunks when they serve an ask whole: every chunk, by index, the size it cuts.
+fn cached(b: &Books, domain: &str, region: Option<Region>, sizes: &[u64]) -> Option<Kept> {
+    let key = (domain.to_string(), region?);
+    let kept = b.retained.get(&key)?;
+    let whole = kept.len() == sizes.len() && kept.iter().zip(sizes).enumerate().all(|(i, ((index, p), len))| *index as usize == i && p.len == *len);
+    whole.then_some(key)
+}
+
+/// Every byte outside the page accounting: agents' contexts and torch's own, standalone pids'.
+fn fixed(b: &Books) -> u64 {
+    b.executors.values().map(|e| e.facts.context + e.facts.torch).sum::<u64>() + b.fixed.values().sum::<u64>()
+}
+
+/// A figure at `<kind>/<key>`; a key ending in `|` (no shape) means the widest measured.
+fn figure(b: &Books, kind: &str, key: &str) -> Option<u64> {
+    let full = format!("{kind}/{key}");
+    match key.ends_with('|') {
+        true => b.figures.range(full.clone()..).take_while(|(k, _)| k.starts_with(&full)).map(|(_, v)| *v).max(),
+        false => b.figures.get(&full).copied(),
+    }
+}
+
+fn larger(figures: &mut BTreeMap<String, u64>, key: String, bytes: u64) {
+    let v = figures.entry(key).or_insert(bytes);
+    *v = (*v).max(bytes);
 }
 
 fn micros(since: Instant) -> u64 {
@@ -257,15 +358,15 @@ fn micros(since: Instant) -> u64 {
 }
 
 impl Manager {
-    /// The GPU's manager: its ledger made, `listener` served on the manager's own thread until
-    /// [`Manager::retire`]. Its backend opens at the first ask (`open`); it then creates at most
-    /// [`Manager::capacity`]'s bytes: `limit` (a `--gpu-memory-limit`, else the card) less the
-    /// driver's headroom in every mode, its context, others' fixed bytes and foreign bytes.
-    pub fn create(gpu: &GpuId, limit: Option<u64>, mode: Mode, open: Opener, listener: Listener, hosting: Arc<dyn Hosting>) -> Result<Arc<Manager>> {
-        let ledger = Ledger::create(gpu, limit)?;
-        ledger.set_mode(mode)?;
-        let row = ledger.fixed(std::process::id())?;
-        let manager = Arc::new(Manager { open, opening: Mutex::new(()), gpu_memory: gpu.memory, limit, ledger, row, hosting, retired: AtomicBool::new(false), books: Mutex::new(Books::default()), looking: Condvar::new() });
+    /// The GPU's manager, `listener` served on the manager's own thread until
+    /// [`Manager::retire`]. Its backend opens at the first ask (`open`; `None`: no VMM for us,
+    /// every agent runs standalone); it then creates at most [`Manager::capacity`]'s bytes:
+    /// `limit` (a `--gpu-memory-limit`, else the card) less the reserved pool in every mode, its
+    /// context, every other fixed byte and foreign bytes.
+    pub fn create(gpu: &GpuId, limit: Option<u64>, mode: Mode, open: Option<Opener>, listener: Listener, hosting: Arc<dyn Hosting>) -> Result<Arc<Manager>> {
+        let events = Signal::new().map_err(|e| Error::Io(e.to_string()))?;
+        let books = Mutex::new(Books { mode, ..Books::default() });
+        let manager = Arc::new(Manager { open, opening: Mutex::new(()), gpu_memory: gpu.memory, limit, hosting, retired: AtomicBool::new(false), books, looking: Condvar::new(), events, born: Instant::now() });
         let weak = Arc::downgrade(&manager);
         std::thread::Builder::new().name("lease-look".into()).spawn(move || look_loop(&weak)).map_err(|e| Error::io("spawn lease-look", e))?;
         let serving = manager.clone();
@@ -286,26 +387,20 @@ impl Manager {
         Ok(manager)
     }
 
-    /// The admission and placement facts, the ledger's until step 4.
-    pub fn ledger(&self) -> &Ledger {
-        &self.ledger
-    }
-
-    /// Readable on any lease or ledger event; [`Manager::clear_events`] clears it.
-    pub fn events(&self) -> &Owned {
-        self.ledger.events()
+    /// Readable on every allocation, release, exit and figure; [`Manager::clear_events`] clears
+    /// it.
+    pub fn events(&self) -> Waitable<'_> {
+        self.events.waitable()
     }
 
     pub fn clear_events(&self) -> bool {
-        self.ledger.clear_events()
+        self.events.clear()
     }
 
-    /// The ledger's stalled rows, and executors the stall look judged stalled: an unpinned
-    /// chunk asked back, and neither a release nor any GPU progress of it across [`LOOKS`]
-    /// looks. A getter: any caller, any rate.
+    /// Executors the stall look judged stalled: an unpinned chunk asked back, and neither a
+    /// release nor any GPU progress of it across [`LOOKS`] looks. A getter: any caller, any rate.
     pub fn stalled(&self) -> Vec<u32> {
-        let mut pids = self.ledger.stalled();
-        pids.extend(self.books.lock().executors.values().filter(|e| e.stalled).map(|e| e.pid));
+        let mut pids: Vec<u32> = self.books.lock().executors.values().filter(|e| e.stalled).map(|e| e.pid).collect();
         pids.sort_unstable();
         pids.dedup();
         pids
@@ -356,20 +451,32 @@ impl Manager {
                 landed: e.leased.values().filter(|l| l.landed && l.region.is_some()).map(|l| l.phys.len).sum(),
             })
             .collect();
+        let (now, spans) = (self.now(), b.waits.iter().copied().collect::<Vec<_>>());
+        let pressure = Pressure { some_10s: policy::pressure(&spans, b.waiting, now, 10_000_000_000), some_60s: policy::pressure(&spans, b.waiting, now, 60_000_000_000) };
+        let capacity = self.capacity(&b);
         Holdings {
-            capacity: self.capacity(&b),
+            capacity,
+            free: capacity.saturating_sub(b.created),
+            foreign: b.foreign,
             created: b.created,
             created_chunks: b.created_chunks,
-            leased: executors.iter().map(|e| e.bytes).sum(),
-            retained: b.retained.values().flat_map(|v| v.values()).map(|p| p.len).sum(),
-            retained_chunks: b.retained.values().map(BTreeMap::len).sum(),
+            allocated: executors.iter().map(|e| e.bytes).sum(),
+            page_cache: b.retained.values().flat_map(|v| v.values()).map(|p| p.len).sum(),
+            page_cache_chunks: b.retained.values().map(BTreeMap::len).sum(),
             books_only: 0,
             executors,
+            dispatched: b.dispatched.iter().map(|(r, k)| (r.clone(), k.clone())).collect(),
+            pressure,
         }
     }
 
     pub fn set_mode(&self, mode: Mode) -> Result<()> {
-        self.ledger.set_mode(mode)
+        self.books.lock().mode = mode;
+        Ok(())
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.born.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
     /// Stops accepting agents; connected ones keep their leases until they exit.
@@ -401,6 +508,9 @@ impl Manager {
         let Some(identity) = self.hosting.identify(&peer) else {
             return end.send(&ToAgent::Refuse { id: 0, code: Refusal::NotRegistered, why: format!("pid {} is no executor of this machine", peer.pid) }, None);
         };
+        if self.open.is_none() {
+            return end.send(&ToAgent::Refuse { id: 0, code: Refusal::Incompatible, why: "this GPU has no VMM for leases (exclusive compute mode)".into() }, None);
+        }
         if protocol != PROTOCOL || again.is_some() {
             // A re-attach after a manager restart comes after slice 1: that agent runs standalone.
             let why = if again.is_some() { "re-attach is not served yet".into() } else { format!("lease protocol {protocol}; this manager speaks {PROTOCOL}") };
@@ -426,7 +536,7 @@ impl Manager {
             let mut b = self.books.lock();
             b.next += 1;
             let id = b.next;
-            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, seen: (0, 0), still: 0, stalled: false, reported: BTreeSet::new(), waits_on: BTreeSet::new() };
+            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, seen: (0, 0), still: 0, stalled: false, reported: BTreeSet::new(), waits_on: BTreeSet::new(), facts: Facts::default() };
             b.executors.insert(id, exec);
             id
         };
@@ -438,6 +548,8 @@ impl Manager {
                     let out = match message {
                         ToManager::Ask { id: ask, bytes, kind, region } => self.ask(id, Waiting { id: ask, bytes, kind, region }),
                         ToManager::Answered => self.answered(id),
+                        ToManager::Facts(facts) => self.facts(id, facts),
+                        ToManager::Measured(m) => self.measured(id, m),
                         ToManager::Hello { .. } => Out::default(),
                     };
                     self.emit(out);
@@ -492,7 +604,7 @@ impl Manager {
             self.hosting.record(record);
         }
         drop(out.idle);
-        self.ledger.ring();
+        self.events.set();
     }
 
     /// The backend, opened now if it is not (outside `books`); the open's failure refuses.
@@ -500,36 +612,224 @@ impl Manager {
         if let Some(d) = self.books.lock().device.clone() {
             return Ok(d);
         }
+        let Some(open) = &self.open else { return Err(Error::Invalid("this GPU has no VMM for leases".into())) };
         let _one = self.opening.lock();
         if let Some(d) = self.books.lock().device.clone() {
             return Ok(d);
         }
-        let backend = (self.open)()?;
+        let backend = open()?;
         let card = self.limit.unwrap_or(self.gpu_memory).min(backend.capacity());
         let device = Arc::new(Device { card, granularity: backend.granularity().max(1), headroom: backend.headroom(), context: backend.opened_context(), backend });
         self.books.lock().device = Some(device.clone());
         Ok(device)
     }
 
-    /// What the manager may create in all: the card (or limit) less the driver's headroom H in
-    /// every mode (cr-215), its own context, every other process's fixed bytes on the ledger
-    /// (contexts, torch's own allocations) and foreign bytes.
+    /// What the manager may create in all: the card (or limit) less the reserved pool H in every
+    /// mode (cr-215), its own context, every other fixed byte and foreign bytes.
     fn capacity(&self, b: &Books) -> u64 {
         let Some(d) = &b.device else { return 0 };
-        let me = std::process::id();
-        let fixed: u64 = self.ledger.status().rows.iter().filter(|r| r.live && r.pid != me).map(|r| r.context + r.torch).sum();
-        d.card.saturating_sub(d.headroom + d.context + fixed + b.foreign)
+        d.card.saturating_sub(d.headroom + d.context + fixed(b) + b.foreign)
     }
 
-    /// TensorD's sample of device bytes no process of ours holds (NVML, or the card less its
-    /// budget on Windows): the room shrinks by them, and the next settle revokes for them.
-    pub fn set_foreign(&self, bytes: u64) {
+    /// TensorD's reading of device bytes no process of ours holds (NVML, or the card less its
+    /// budget on Windows), and whether a new foreign process just crossed its threshold. Every
+    /// reading is also the background-reclaim tick: free under low reclaims cold pages up to
+    /// high (§12), and a new foreign process takes every cold page.
+    pub fn set_foreign(&self, bytes: u64, new_pid: bool) {
+        self.with(|b| {
+            b.foreign = bytes;
+            b.new_foreign = new_pid;
+        });
+    }
+
+    /// A standalone executor's fixed bytes (no lease table: never asked), on each reading.
+    pub fn fixed(&self, pid: u32, bytes: u64) {
+        self.with(|b| {
+            b.fixed.insert(pid, bytes);
+        });
+    }
+
+    /// After `waitpid`: a standalone executor's fixed bytes go.
+    pub fn reap(&self, pid: u32) {
+        self.with(|b| {
+            b.fixed.remove(&pid);
+        });
+    }
+
+    /// A GPU fault or sticky error: the page cache goes.
+    pub fn fault(&self) {
         let out = {
             let mut b = self.books.lock();
-            b.foreign = bytes;
+            for key in b.order.clone() {
+                self.drop_retained(&mut b, &key);
+            }
+            let mut out = self.settle(&mut b);
+            out.idle = Self::idle(&mut b);
+            out
+        };
+        self.emit(out);
+    }
+
+    /// Changes the books, then settles and reacts.
+    fn with(&self, change: impl FnOnce(&mut Books)) {
+        let out = {
+            let mut b = self.books.lock();
+            change(&mut b);
             self.settle(&mut b)
         };
         self.emit(out);
+    }
+
+    /// An agent's admission facts: its fixed bytes move the capacity.
+    fn facts(&self, exec: u64, facts: Facts) -> Out {
+        let mut b = self.books.lock();
+        if let Some(e) = b.executors.get_mut(&exec) {
+            e.facts = facts;
+        }
+        self.settle(&mut b)
+    }
+
+    /// What an agent measured: a request's peaks under its dispatch's key (the larger stays; the
+    /// compute bytes are the newest), a set's bytes (the larger).
+    fn measured(&self, exec: u64, m: Measured) -> Out {
+        let mut b = self.books.lock();
+        if !b.executors.contains_key(&exec) {
+            return Out::default();
+        }
+        match m {
+            Measured::Request { request, working, compute, host } => {
+                let Some(key) = b.dispatched.get(&request).cloned() else { return Out::default() };
+                larger(&mut b.figures, format!("peak/{key}"), working);
+                b.figures.insert(format!("compute/{key}"), compute);
+                larger(&mut b.figures, format!("host/{key}"), host);
+            }
+            Measured::Set { name, bytes } => larger(&mut b.figures, format!("set/{name}"), bytes),
+        }
+        Out::default()
+    }
+
+    // ---- Admission and placement (TensorD's): from the agents' facts, standalone pids' fixed
+    // bytes, foreign bytes and the measured peaks.
+
+    /// The bytes admission counts in: min(limit, card) less H and TensorD's context (before the
+    /// backend opens: the card less its H).
+    fn admittable(&self, b: &Books) -> u64 {
+        match &b.device {
+            Some(d) => d.card.saturating_sub(d.headroom + d.context),
+            None => {
+                let card = self.limit.unwrap_or(self.gpu_memory).min(self.gpu_memory);
+                card.saturating_sub(reserved_pool(card))
+            }
+        }
+    }
+
+    fn rows(b: &Books) -> Vec<Admitted> {
+        let agents = b.executors.values().map(|e| {
+            let f = &e.facts;
+            Admitted { context: f.context, outside: f.outside, remaining: f.remaining, running: f.running, unmeasured: f.unmeasured, yielded: f.yielded }
+        });
+        agents.chain(b.fixed.values().map(|&context| Admitted { context, ..Admitted::default() })).collect()
+    }
+
+    /// Whether a request of `package` at `shape` (empty: its widest measured shape) can start now
+    /// beside everything running and dispatched ([`decide::fits`]).
+    pub fn fits(&self, package: &str, shape: &str, family: Option<&str>) -> bool {
+        let b = self.books.lock();
+        let dispatched: Vec<Option<u64>> = b.dispatched.values().map(|key| figure(&b, "peak", key)).collect();
+        decide::fits(self.admittable(&b), b.foreign, &Self::rows(&b), &dispatched, figure(&b, "peak", &format!("{package}|{shape}")), family.map(family_id))
+    }
+
+    /// A multi-GPU group: dispatches `request` on every GPU of `group` if it fits on all, else
+    /// on none.
+    pub fn admit(group: &[&Manager], request: &str, package: &str, shape: &str, family: Option<&str>) -> Result<bool> {
+        if !group.iter().all(|m| m.fits(package, shape, family)) {
+            return Ok(false);
+        }
+        for m in group {
+            m.dispatch(request, package, shape)?;
+        }
+        Ok(true)
+    }
+
+    /// Names the `<package>|<shape>` a request's peaks are recorded under, before it runs.
+    pub fn dispatch(&self, request: &str, package: &str, shape: &str) -> Result<()> {
+        self.books.lock().dispatched.insert(request.to_string(), format!("{package}|{shape}"));
+        Ok(())
+    }
+
+    pub fn undispatch(&self, request: &str) {
+        self.books.lock().dispatched.remove(request);
+    }
+
+    /// The GPU of `group` (an index) that keeps each set of `package`'s request at `shape`
+    /// ([`decide::place`]). A set's bytes are its layout's when the caller has them, else as a
+    /// load measured them on any GPU of the group. Each GPU's room is what admission counts in,
+    /// less foreign bytes and every executor's unmovable bytes (fixed; torch and its running
+    /// sets, at least its running requests' peaks; a yielded parent's working set unless it waits
+    /// for `family`); GPU 0's less the package's measured compute bytes too.
+    pub fn place(group: &[&Manager], package: &str, shape: &str, family: Option<&str>, sets: &[(&str, Option<u64>)]) -> Result<Vec<u32>> {
+        let (family, key) = (family.map(family_id), format!("{package}|{shape}"));
+        let mut rooms = Vec::with_capacity(group.len());
+        for (g, m) in group.iter().enumerate() {
+            let b = m.books.lock();
+            let running = |e: &Exec| -> u64 {
+                let held = |(slot, l): (&u32, &Leased)| {
+                    let (class, value) = e.table.class(*slot);
+                    let pinned = e.table.word(*slot).is_some_and(|w| w.pins > 0);
+                    (pinned || !matches!(Advice::decode(class, value), Advice::FreeList { .. } | Advice::Free { .. } | Advice::Idle { .. })).then_some(l.phys.len)
+                };
+                e.leased.iter().filter_map(held).sum()
+            };
+            let unmovable: u64 = b.executors.values().map(|e| e.facts.context + (e.facts.torch + running(e)).max(e.facts.remaining) + decide::yielded_beside(&e.facts.yielded, family)).sum();
+            let working = if g == 0 { figure(&b, "compute", &key).unwrap_or(0) } else { 0 };
+            rooms.push(m.admittable(&b).saturating_sub(b.foreign + unmovable + b.fixed.values().sum::<u64>() + working));
+        }
+        let bytes: Vec<Option<u64>> = sets.iter().map(|(name, known)| known.or_else(|| group.iter().filter_map(|m| figure(&m.books.lock(), "set", name)).max())).collect();
+        Ok(decide::place(&rooms, &bytes))
+    }
+
+    /// The measured peaks, to persist per GPU model.
+    pub fn peaks(&self) -> Vec<Peak> {
+        let b = self.books.lock();
+        let peak = |(k, &bytes): (&String, &u64)| {
+            let (kind, key) = k.split_once('/')?;
+            let key = key.to_string();
+            Some(match kind {
+                "peak" => Peak::Request { key, bytes },
+                "compute" => Peak::Compute { key, bytes },
+                "set" => Peak::Set { key, bytes },
+                "host" => Peak::Host { key, bytes },
+                _ => return None,
+            })
+        };
+        b.figures.iter().filter_map(peak).collect()
+    }
+
+    /// Peaks saved earlier on this machine for this GPU model: what this run measured wins (sets
+    /// and host peaks: the larger).
+    pub fn restore(&self, peaks: &[Peak]) -> Result<()> {
+        let mut b = self.books.lock();
+        for p in peaks {
+            match p {
+                Peak::Request { key, bytes } => drop(b.figures.entry(format!("peak/{key}")).or_insert(*bytes)),
+                Peak::Compute { key, bytes } => drop(b.figures.entry(format!("compute/{key}")).or_insert(*bytes)),
+                Peak::Set { key, bytes } => larger(&mut b.figures, format!("set/{key}"), *bytes),
+                Peak::Host { key, bytes } => larger(&mut b.figures, format!("host/{key}"), *bytes),
+            }
+        }
+        Ok(())
+    }
+
+    /// The processes running requests on this GPU, as TensorD's host rule reads them.
+    pub fn host_calls(&self) -> Option<Vec<HostCall>> {
+        let b = self.books.lock();
+        let calls = b.executors.values().filter(|e| e.facts.running > 0).map(|e| HostCall {
+            pid: e.pid,
+            peak: (e.facts.host_unmeasured == 0).then_some(e.facts.host_peak),
+            anon: host_memory::resident(e.pid).map_or(0, |now| now.anon),
+            running: u64::from(e.facts.running),
+        });
+        Some(calls.collect())
     }
 
     /// The backend goes once nothing needs it; its drop (a context's destroy) runs unlocked.
@@ -579,13 +879,13 @@ impl Manager {
                 }
             }
             if !gone.is_empty() {
-                out.records.push(Record::Answered { pid: e.pid, released: gone.len(), us: 0 });
+                out.records.push(Record::Released { pid: e.pid, released: gone.len(), us: 0 });
             }
         }
         for phys in gone {
             self.destroy(&mut b, phys);
         }
-        if let Some(Record::Answered { us, .. }) = out.records.last_mut() {
+        if let Some(Record::Released { us, .. }) = out.records.last_mut() {
             *us = micros(start);
         }
         out.append(self.settle(&mut b));
@@ -622,7 +922,7 @@ impl Manager {
             self.destroy(&mut b, phys);
         }
         let mut out = self.settle(&mut b);
-        out.records.insert(0, Record::Reclaim { pid: e.pid, destroyed_bytes: destroyed, retained_bytes: retained, us: micros(start) });
+        out.records.insert(0, Record::Exit { pid: e.pid, freed_bytes: destroyed, cached_bytes: retained, us: micros(start) });
         out.idle = Self::idle(&mut b);
         out
     }
@@ -643,82 +943,141 @@ impl Manager {
         }
     }
 
-    /// Answers waiting asks in order while room allows; for the first that does not fit, makes
-    /// room and waits for it, or refuses it when none can come.
-    /// Each executor's asks in order (one waiting holds up only its own later asks): first
-    /// every ask that fits now, then room made for each executor's first that does not, which
-    /// then waits for it or is refused when none can come.
+    /// Decides and applies until nothing more can move at once, then records the wait spans and
+    /// publishes every table's figures.
     fn settle(&self, b: &mut Books) -> Out {
         let mut out = Out::default();
         while self.settle_once(b, &mut out) {}
+        self.waited(b);
         self.publish(b);
         out
     }
 
-    /// One round of [`Manager::settle`]: true when room was freed at once for an ask, which is
-    /// answered in another round.
+    /// The decision's snapshot: the page accounting, every waiting ask in each executor's
+    /// order, and the page cache's keys by the index the decision names them.
+    fn snapshot(&self, b: &Books) -> (policy::Snapshot, Vec<policy::Ask>, Vec<Kept>) {
+        let (card, reserved, granularity) = b.device.as_ref().map_or((0, 0, 1), |d| (d.card.saturating_sub(d.context), d.headroom, d.granularity));
+        let cache: Vec<Kept> = b.order.iter().cloned().collect();
+        let (mut asks, mut executors) = (vec![], vec![]);
+        for (id, e) in &b.executors {
+            for w in &e.waiting {
+                let sizes = sizes(w, granularity);
+                let hit = cached(b, &e.identity.domain, w.region, &sizes).and_then(|k| cache.iter().position(|c| *c == k));
+                asks.push(policy::Ask { executor: *id, bytes: sizes.iter().sum(), speculative: false, cached: hit });
+            }
+            let chunk = |(slot, l): (&u32, &Leased)| {
+                let w = e.table.word(*slot).filter(|w| w.seq == l.seq)?;
+                let (class, value) = e.table.class(*slot);
+                Some(policy::Chunk { slot: *slot, seq: l.seq, bytes: l.phys.len, state: w.state, pins: w.pins, asked: e.asked.contains_key(slot), advice: Advice::decode(class, value) })
+            };
+            let waits_on = if e.waiting.is_empty() { vec![] } else { e.waits_on.iter().copied().collect() };
+            executors.push(policy::Executor { id: *id, chunks: e.leased.iter().filter_map(chunk).collect(), regions: vec![], graphs: vec![], waits_on });
+        }
+        let page_cache = cache.iter().map(|k| b.retained.get(k).map_or(0, |v| v.values().map(|p| p.len).sum())).collect();
+        let snapshot = policy::Snapshot { card, reserved, fixed: fixed(b), foreign: b.foreign, new_foreign: b.new_foreign, created: b.created, page_cache, executors, host: policy::Host::default() };
+        (snapshot, asks, cache)
+    }
+
+    /// One decision applied: reclaim requests sent, page-cache entries dropped, asks allocated,
+    /// left waiting or refused. True when dropped entries freed room at once: another round
+    /// allocates it.
     fn settle_once(&self, b: &mut Books, out: &mut Out) -> bool {
-        let mut again = false;
-        let ids: Vec<u64> = b.executors.keys().copied().collect();
-        for exec in ids.iter().copied() {
-            while let Some(ask) = b.executors.get_mut(&exec).and_then(|e| e.waiting.pop_front()) {
-                match self.answer(b, exec, &ask) {
-                    Ok(Some(granted)) => {
-                        out.append(granted);
-                        if let Some(e) = b.executors.get_mut(&exec) {
-                            e.waits_on.clear();
-                        }
+        let (snapshot, asks, cache) = self.snapshot(b);
+        b.new_foreign = false;
+        let decision = policy::decide(&snapshot, &asks);
+        let (mut freed, mut asked) = (false, BTreeMap::<u64, Vec<u32>>::new());
+        for pick in decision.picks {
+            match pick {
+                Pick::Chunk { executor, slot, seq, .. } => {
+                    let Some(e) = b.executors.get_mut(&executor) else { continue };
+                    if e.table.request(slot, seq).is_ok() {
+                        e.asked.insert(slot, Instant::now());
+                        asked.entry(executor).or_default().push(slot);
                     }
-                    Ok(None) => {
-                        if let Some(e) = b.executors.get_mut(&exec) {
-                            e.waiting.push_front(ask);
-                        }
-                        break;
-                    }
-                    Err(error) => refuse(b, out, exec, ask.id, Refusal::Failed, error.to_string()),
                 }
+                Pick::PageCache { index, .. } => {
+                    if let Some(key) = cache.get(index) {
+                        self.drop_retained(b, key);
+                        freed = true;
+                    }
+                }
+                // Regions and graphs reach the manager with their frames (step 3).
+                Pick::Region { .. } | Pick::Graph { .. } => {}
             }
         }
-        for exec in ids {
-            let Some(ask) = b.executors.get_mut(&exec).and_then(|e| e.waiting.pop_front()) else { continue };
-            let (capacity, granularity) = (self.capacity(b), b.device.as_ref().map_or(1, |d| d.granularity));
-            let short = (b.created + sizes(&ask, granularity).iter().sum::<u64>()).saturating_sub(capacity);
-            match self.make_room(b, exec, short, out) {
-                Room::Freed => {
-                    if let Some(e) = b.executors.get_mut(&exec) {
-                        e.waiting.push_front(ask);
+        for (id, slots) in asked {
+            if let Some(e) = b.executors.get(&id) {
+                out.sends.push((e.end.clone(), ToAgent::Revoke, None));
+                out.records.push(Record::Reclaim { pid: e.pid, slots });
+            }
+        }
+        let mut stuck = BTreeSet::new();
+        for (a, answer) in asks.iter().zip(decision.answers) {
+            let exec = a.executor;
+            if stuck.contains(&exec) {
+                continue;
+            }
+            match answer {
+                Answer::Allocate => {
+                    let Some(ask) = b.executors.get_mut(&exec).and_then(|e| e.waiting.pop_front()) else { continue };
+                    match self.answer(b, exec, &ask) {
+                        Ok(Some(allocated)) => {
+                            out.append(allocated);
+                            if let Some(e) = b.executors.get_mut(&exec) {
+                                e.waits_on.clear();
+                            }
+                        }
+                        Ok(None) => {
+                            if let Some(e) = b.executors.get_mut(&exec) {
+                                e.waiting.push_front(ask);
+                            }
+                            stuck.insert(exec);
+                        }
+                        Err(error) => refuse(b, out, exec, ask.id, Refusal::Failed, error.to_string()),
                     }
-                    again = true;
                 }
-                Room::Coming | Room::Pinned => {
+                Answer::Wait { on } => {
                     if let Some(e) = b.executors.get_mut(&exec) {
-                        e.waiting.push_front(ask);
+                        e.waits_on = on.into_iter().collect();
                     }
                     // Starts the look's cadence if it slept; never makes a look early.
                     self.looking.notify_all();
                 }
-                Room::Refused => refuse(b, out, exec, ask.id, Refusal::NothingRevocable, format!("nothing revocable for {} bytes", ask.bytes)),
+                Answer::Refuse { room } => {
+                    if let Some(ask) = b.executors.get_mut(&exec).and_then(|e| e.waiting.pop_front()) {
+                        refuse(b, out, exec, ask.id, Refusal::NothingRevocable, format!("nothing reclaimable for {} bytes ({room} could come)", ask.bytes));
+                    }
+                }
+                Answer::Behind => {}
             }
         }
-        again
+        freed
     }
 
-    /// Every table's figures, and the manager's own row, as the books stand now.
-    fn publish(&self, b: &Books) {
-        let retained: u64 = b.retained.values().flat_map(|v| v.values()).map(|p| p.len).sum();
-        let free = self.capacity(b).saturating_sub(b.created);
-        let (headroom, context) = b.device.as_ref().map_or((0, 0), |d| (d.headroom, d.context));
-        let unpinned: BTreeMap<u64, u64> = b
-            .executors
-            .iter()
-            .map(|(id, e)| (*id, e.leased.iter().filter(|(s, l)| e.table.word(**s).is_some_and(|w| w.state == State::Mapped && w.pins == 0 && w.seq == l.seq)).map(|(_, l)| l.phys.len).sum()))
-            .collect();
-        let total: u64 = unpinned.values().sum();
-        for (id, e) in &b.executors {
-            let revocable = retained + total - unpinned.get(id).copied().unwrap_or(0);
-            e.table.set_figures(Figures { free, revocable, headroom, foreign: b.foreign });
+    /// PSI's spans: one opens when an ask starts waiting and closes when none does.
+    fn waited(&self, b: &mut Books) {
+        let now = self.now();
+        match (b.executors.values().any(|e| !e.waiting.is_empty()), b.waiting) {
+            (true, None) => b.waiting = Some(now),
+            (false, Some(start)) => {
+                b.waits.push_back((start, now));
+                b.waiting = None;
+            }
+            _ => {}
         }
-        self.row.set(retained + context);
+        while b.waits.front().is_some_and(|(_, end)| now.saturating_sub(*end) > 60_000_000_000) {
+            b.waits.pop_front();
+        }
+    }
+
+    /// Every table's figures: free bytes, and the cold room reclaim could give that executor.
+    fn publish(&self, b: &Books) {
+        let free = self.capacity(b).saturating_sub(b.created);
+        let headroom = b.device.as_ref().map_or(0, |d| d.headroom);
+        let (snapshot, _, _) = self.snapshot(b);
+        for (id, e) in &b.executors {
+            e.table.set_figures(Figures { free, revocable: policy::cold(&snapshot, *id), headroom, foreign: b.foreign });
+        }
     }
 
     /// The grants for `ask` when it fits now; `None` when room must be made first. A failure
@@ -729,9 +1088,7 @@ impl Manager {
         let sizes = sizes(ask, dev.granularity);
         let Some(pid) = b.executors.get(&exec).map(|e| e.pid) else { return Err(Error::Closed("the executor".into())) };
         let domain = b.executors.get(&exec).map(|e| e.identity.domain.clone()).unwrap_or_default();
-        // Adopted only whole: every chunk, by index, the size this ask cuts.
-        let whole = |kept: &BTreeMap<u32, Physical>| kept.len() == sizes.len() && kept.iter().zip(&sizes).enumerate().all(|(i, ((index, p), len))| *index as usize == i && p.len == *len);
-        let adopt = ask.region.map(|r| (domain, r)).filter(|k| b.retained.get(k).is_some_and(whole));
+        let adopt = cached(b, &domain, ask.region, &sizes);
         let phys: Vec<Physical> = if let Some(key) = &adopt {
             b.order.retain(|k| k != key);
             b.retained.remove(key).unwrap_or_default().into_values().collect()
@@ -802,9 +1159,9 @@ impl Manager {
         }
         let Some(error) = failed else {
             let adopted = adopt.is_some();
-            out.records.push(Record::Grant { pid, ask: ask.id, chunks: n, bytes, adopted, create_us, export_us: micros(exporting), total_us: micros(start) });
+            out.records.push(Record::Allocate { pid, ask: ask.id, chunks: n, bytes, cached: adopted, create_us, export_us: micros(exporting), total_us: micros(start) });
             if let (true, Some(region)) = (adopted, ask.region) {
-                out.records.push(Record::Adopt { pid, region, chunks: n, bytes });
+                out.records.push(Record::Cached { pid, region, chunks: n, bytes });
             }
             return Ok(Some(out));
         };
@@ -829,115 +1186,6 @@ impl Manager {
         Err(error)
     }
 
-    /// Room for `short` bytes: retained regions first (oldest), then asks back of unpinned
-    /// chunks (idle class first, then furthest next use). Asked slots count only while they can
-    /// still give (unpinned, or being revoked). When only other executors' pinned chunks could
-    /// give it, they are asked too and the ask waits for their unpin; when only the asker's own
-    /// pins could, it is refused.
-    fn make_room(&self, b: &mut Books, asker: u64, short: u64, out: &mut Out) -> Room {
-        let mut room = 0;
-        while room < short {
-            let Some(key) = b.order.front().cloned() else { break };
-            room += b.retained.get(&key).map_or(0, |v| v.values().map(|p| p.len).sum());
-            self.drop_retained(b, &key);
-        }
-        if room >= short {
-            return Room::Freed;
-        }
-        // An executor waiting (transitively) on the asker's pins is never waited on: a cycle.
-        let cyclic = waiting_on(b, asker);
-        let (mut later, mut unpinned, mut pinned) = (0, vec![], vec![]);
-        for (id, e) in &b.executors {
-            for (slot, l) in &e.leased {
-                let Some(w) = e.table.word(*slot) else { continue };
-                if w.seq != l.seq {
-                    continue;
-                }
-                let free_of_cycle = *id != asker && !cyclic.contains(id);
-                match (w.state, w.pins, e.asked.contains_key(slot)) {
-                    (State::Revoking, ..) | (State::Mapped, 0, true) => room += w_bytes(e, *slot),
-                    // A grant in flight is room to come: never asked back before its ack (L3); once
-                    // acked, the settle its Answered runs picks it like any other chunk.
-                    (State::Granted, ..) if *id != asker => later += w_bytes(e, *slot),
-                    (State::Mapped, _, true) if free_of_cycle => later += w_bytes(e, *slot),
-                    (State::Mapped, 0, false) => {
-                        let (class, next) = e.table.class(*slot);
-                        unpinned.push((class, std::cmp::Reverse(next), *id, *slot, l.seq));
-                    }
-                    (State::Mapped, _, false) if free_of_cycle => pinned.push((*id, *slot, l.seq)),
-                    _ => {}
-                }
-            }
-        }
-        unpinned.sort();
-        let mut asked: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-        let mut ask_back = |b: &mut Books, id: u64, slot: u32, seq: u32| -> u64 {
-            let Some(e) = b.executors.get_mut(&id) else { return 0 };
-            if e.table.request(slot, seq).is_err() {
-                return 0;
-            }
-            e.asked.insert(slot, Instant::now());
-            asked.entry(id).or_default().push(slot);
-            e.table.bytes_of(slot)
-        };
-        for (_, _, id, slot, seq) in unpinned {
-            if room >= short {
-                break;
-            }
-            room += ask_back(b, id, slot, seq);
-        }
-        let verdict = if room >= short {
-            Room::Coming
-        } else {
-            let mut on = BTreeSet::new();
-            for (id, slot, seq) in pinned {
-                if room + later >= short {
-                    break;
-                }
-                later += ask_back(b, id, slot, seq);
-                on.insert(id);
-            }
-            if room + later >= short {
-                // Whose pins it waits on: every executor holding an asked, still-pinned chunk.
-                for (id, e) in &b.executors {
-                    if *id != asker && e.asked.keys().any(|s| e.table.word(*s).is_some_and(|w| w.state == State::Mapped && w.pins > 0)) {
-                        on.insert(*id);
-                    }
-                }
-                if let Some(e) = b.executors.get_mut(&asker) {
-                    e.waits_on = on;
-                }
-                Room::Pinned
-            } else {
-                Room::Refused
-            }
-        };
-        for (id, slots) in asked {
-            if let Some(e) = b.executors.get(&id) {
-                out.sends.push((e.end.clone(), ToAgent::Revoke, None));
-                out.records.push(Record::Revoke { pid: e.pid, slots });
-            }
-        }
-        verdict
-    }
-}
-
-fn w_bytes(e: &Exec, slot: u32) -> u64 {
-    e.table.bytes_of(slot)
-}
-
-/// Every executor whose waiting ask waits, directly or through others, on `of`'s pins.
-fn waiting_on(b: &Books, of: u64) -> BTreeSet<u64> {
-    let mut found = BTreeSet::new();
-    let mut frontier = vec![of];
-    while let Some(x) = frontier.pop() {
-        for (id, e) in &b.executors {
-            if !e.waiting.is_empty() && e.waits_on.contains(&x) && found.insert(*id) {
-                frontier.push(*id);
-            }
-        }
-    }
-    found
 }
 
 fn refuse(b: &mut Books, out: &mut Out, exec: u64, ask: u64, code: Refusal, why: String) {

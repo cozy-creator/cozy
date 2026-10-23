@@ -15,7 +15,7 @@ use parking_lot::{Condvar, Mutex};
 use platform::process::Birth;
 
 use super::table::{State, Table};
-use super::wire::{End, Kind, Refusal, Region, ToAgent, ToManager};
+use super::wire::{End, Facts, Kind, Measured, Refusal, Region, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
 use crate::os::{self, Stream};
 use crate::{Error, Exhausted, Result};
@@ -351,6 +351,16 @@ impl Agent {
 
     pub fn table(&self) -> &Table {
         &self.table
+    }
+
+    /// Its admission facts changed.
+    pub fn report(&self, facts: Facts) -> Result<()> {
+        self.end.send(&ToManager::Facts(facts), None)
+    }
+
+    /// A request's peaks at its end, or a set's bytes at its load.
+    pub fn measured(&self, m: Measured) -> Result<()> {
+        self.end.send(&ToManager::Measured(m), None)
     }
 }
 
