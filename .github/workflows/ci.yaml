@@ -24,10 +24,9 @@ jobs:
     with:
       ref: ${{ github.sha }}
       build: tensorfs
-      # The Runtime integrator's TensorFS 0.13 class-record branch (xs053/runtime-classref,
-      # cozy-runtime #1646): Runtime 0.30 on the hard cut. Source pins distinguish development
-      # wheels of one version.
-      runtime_ref: 01966eb8d08b567eaae41f79673f40dee62adc7b
+      # Runtime master with its work told (cl-648, cozy-runtime #1718): TensorD judges a running
+      # call on it. Source pins distinguish development wheels of one version.
+      runtime_ref: 927a06c0b85aef0a64ab1bea3566c2d8c5262671
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below. varena's
       # placement under a declared plan runs first, on the wheel with CPU torch, then a
       # Diffusers model on the CPU (a host device).
