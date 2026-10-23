@@ -23,13 +23,14 @@ macro_rules! table {
 }
 
 /// The built-in tables.
-pub const TABLES: [&str; 6] = [
+pub const TABLES: [&str; 7] = [
     table!("sdxl.single_file"),
     table!("anima.single_file"),
     table!("h3.native"),
     table!("h3.lora"),
     table!("sdxl.lora"),
     table!("seedvr2"),
+    table!("ideogram4.fp8"),
 ];
 
 #[derive(Debug, Deserialize)]
@@ -656,9 +657,67 @@ fn cast_to(what: &str, from: &Dtype, to: Option<&Dtype>) -> Result<(Dtype, Optio
     }
 }
 
+/// The source rows a row's `ops` select from a `[rows, cols]` tensor, when its output is those
+/// whole rows (a fused projection's thirds), or why not.
+fn selected_rows(what: &str, shape: &[u64], ops: &Ops) -> Result<Vec<u64>> {
+    let [rows, cols] = shape else {
+        return refuse(Code::SEAM_UNBANKED, format!("{what}: rank {} rows", shape.len()));
+    };
+    let (out, _) = layout(what, shape, ops)?;
+    // The same ops over one element per row: each output element is the source row it takes.
+    let (picked, runs) = layout(what, &[*rows, 1], ops)?;
+    let selected: Vec<u64> = (0..runs.count())
+        .flat_map(|r| (0..runs.run).map(move |i| (r, i)))
+        .map(|(r, i)| runs.offset(r) + i)
+        .collect();
+    if ops.permute.is_some() || picked.last() != Some(&1) || out != [selected.len() as u64, *cols] {
+        return refuse(
+            Code::SEAM_UNBANKED,
+            format!("{what}: {ops:?} of {shape:?} is not a selection of whole rows"),
+        );
+    }
+    Ok(selected)
+}
+
+/// An encoded tensor's part cut to `rows` of its `count` rows: every part of a row-wise encoding
+/// leads with the rows.
+fn part_rows(
+    what: &str,
+    p: &super::carriers::FoldedPart,
+    count: u64,
+    rows: &[u64],
+) -> Result<(Vec<u64>, Reading)> {
+    let what = format!("{what} {}", p.role);
+    let bits = p.at.dtype.bits().filter(|b| b.is_multiple_of(8) && p.dtype == p.at.dtype);
+    let (Some(bits), None, None, Some(&count_here)) = (bits, &p.inline, &p.at.derive, p.shape.first()) else {
+        return refuse(Code::SEAM_UNBANKED, format!("{what}: a part that is not whole rows of bytes"));
+    };
+    if count_here != count {
+        return refuse(
+            Code::SHAPE_MISMATCH,
+            format!("{what}: {:?} does not lead with the tensor's {count} rows", p.shape),
+        );
+    }
+    let take = Ops { take: Some((0, rows.to_vec())), ..Ops::default() };
+    let (shape, runs) = layout(&what, &p.shape, &take)?;
+    let read = Reading {
+        file: p.at.file,
+        start: p.at.start,
+        len: p.at.len,
+        unit: bits / 8,
+        runs,
+        source: p.at.dtype.clone(),
+        cast: None,
+        inline: None,
+        derive: None,
+    };
+    Ok((shape, read))
+}
+
 /// `component/key` read from `t` through `ops` and `cast`. A tensor whose bytes do not
-/// move is one run of bytes, so it may be any dtype. An encoded tensor is only renamed: its
-/// parts are the producer's bytes, and `cast` names its logical dtype.
+/// move is one run of bytes, so it may be any dtype. An encoded tensor is renamed, or, for a
+/// row-wise encoding, cut into whole rows (each part's rows with them): its parts are the
+/// producer's bytes, and `cast` names its logical dtype.
 fn planned(
     component: &str,
     key: &str,
@@ -668,32 +727,39 @@ fn planned(
 ) -> Result<Planned> {
     let what = format!("{component}/{key}");
     if let Some(folded) = &t.encoded {
-        if ops.view.is_some() || ops.take.is_some() || ops.permute.is_some() || ops.shape.is_some()
-        {
-            return refuse(
-                Code::SEAM_UNBANKED,
-                format!(
-                    "{what}: a {} tensor; a table row may rename it, never cut or reshape it",
-                    folded.encoding.scheme
-                ),
-            );
+        let cut = ops.view.is_some() || ops.take.is_some() || ops.permute.is_some() || ops.shape.is_some();
+        let rows = match cut {
+            false => None,
+            true if folded.encoding.scheme.ends_with(".rowwise") => {
+                Some(selected_rows(&what, &t.shape, ops)?)
+            }
+            true => {
+                return refuse(
+                    Code::SEAM_UNBANKED,
+                    format!(
+                        "{what}: a {} tensor; a table row may rename it, never cut or reshape it",
+                        folded.encoding.scheme
+                    ),
+                )
+            }
+        };
+        let mut parts = Vec::new();
+        for p in &folded.parts {
+            let (shape, read) = match &rows {
+                None => (p.shape.clone(), Reading { inline: p.inline.clone(), ..Reading::whole(&p.at) }),
+                Some(rows) => part_rows(&what, p, t.shape[0], rows)?,
+            };
+            parts.push(PlannedPart { role: p.role.clone(), dtype: p.dtype.clone(), shape, read });
         }
-        let parts = (folded.parts.iter())
-            .map(|p| PlannedPart {
-                role: p.role.clone(),
-                dtype: p.dtype.clone(),
-                shape: p.shape.clone(),
-                read: Reading {
-                    inline: p.inline.clone(),
-                    ..Reading::whole(&p.at)
-                },
-            })
-            .collect();
+        let mut shape = t.shape.clone();
+        if let Some(rows) = &rows {
+            shape[0] = rows.len() as u64;
+        }
         return Ok(Planned {
             component: component.into(),
             key: key.into(),
             dtype: cast.unwrap_or(&t.dtype).clone(),
-            shape: t.shape.clone(),
+            shape,
             encoding: Some(folded.encoding.clone()),
             parts,
         });

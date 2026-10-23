@@ -2,7 +2,8 @@
   "declarations": [
     {"file": "quantize_config.json", "producer": "gptq"},
     {"file": "quant_config.json", "producer": "awq"},
-    {"metadata_prefix": "gptq_", "producer": "gptq"}
+    {"metadata_prefix": "gptq_", "producer": "gptq"},
+    {"source_flag": "ideogram_fp8_weight_only", "format": "fp8_weight_only", "producer": "ideogram"}
   ],
   "companions": [
     {"producer": "bitsandbytes", "keys": ["*.absmax", "*.quant_map", "*.nested_absmax", "*.nested_quant_map", "*.quant_state.*", "*.SCB", "*.weight_format"]},
@@ -333,6 +334,15 @@
       "encoding": {"scheme": "int4.convrot", "params": {"rotation": "kron_regular_h4"}},
       "marker_params": {"rotation_size": ["convrot_groupsize", 256]},
       "marker_values": {"quant_group_size": 64}
+    },
+    {
+      "producer": "ideogram",
+      "formats": ["fp8_weight_only"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32"], "shape": "rows"}
+      ],
+      "encoding": {"scheme": "fp8.rowwise", "params": {}}
     }
   ]
 }

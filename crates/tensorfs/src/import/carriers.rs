@@ -39,6 +39,8 @@ pub enum Producer {
     Bitsandbytes,
     /// Nunchaku's SVDQuant: `quantization_config` `method: svdquant`.
     Nunchaku,
+    /// Ideogram 4's weight-only fp8 (`ideogram_fp8_weight_only`).
+    Ideogram,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +172,12 @@ pub struct Declaration {
     pub file: Option<String>,
     #[serde(default)]
     pub metadata_prefix: Option<String>,
+    /// A flag any `config.json` of the source sets `true`: it declares `format` for every group
+    /// of that source (Ideogram 4 states its weight-only fp8 once, in its text encoder's config).
+    #[serde(default)]
+    pub source_flag: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
     pub producer: Producer,
 }
 
@@ -467,6 +475,19 @@ fn quantization_config(doc: &Json, what: &str) -> Result<Declared> {
     Ok(d)
 }
 
+/// The first `config.json` of the source that sets `flag` to `true`, as where it was found.
+fn source_flag(set: &SourceSet, flag: &str) -> Result<Option<String>> {
+    for p in &set.plain {
+        if p.path != "config.json" && !p.path.ends_with("/config.json") {
+            continue;
+        }
+        if read_json(set, &p.path)?.is_some_and(|doc| doc.get(flag) == Some(&Json::Bool(true))) {
+            return Ok(Some(format!("{} {flag}", p.path)));
+        }
+    }
+    Ok(None)
+}
+
 fn read_json(set: &SourceSet, path: &str) -> Result<Option<Json>> {
     let Some(plain) = set.plain.iter().find(|p| p.path == path) else {
         return Ok(None);
@@ -498,6 +519,14 @@ fn declared(set: &SourceSet, group: &Group) -> Result<Option<Declared>> {
         folder => format!("{folder}/{name}"),
     };
     for decl in &table().declarations {
+        if let Some(flag) = &decl.source_flag {
+            if let Some(what) = source_flag(set, flag)? {
+                let mut d = Declared::new(decl.producer, what);
+                d.formats.extend(decl.format.clone());
+                all.push(d);
+            }
+            continue;
+        }
         match (&decl.file, &decl.metadata_prefix) {
             (Some(file), _) => {
                 if let Some(doc) = read_json(set, &path(file))? {
