@@ -714,6 +714,8 @@ pub struct StatusFrame {
     pub toolchain: Toolchain,
     /// Each native kernel's verdict on this machine's cards, as the Runtime keeps it.
     pub kernels: Vec<KernelVerdict>,
+    /// The TensorD service's process (not its stable parent, a pod's PID 1).
+    pub tensord_pid: u32,
 }
 
 /// The machine's build toolchain: CUDA's compiler and a host C/C++ compiler.
@@ -799,6 +801,41 @@ pub struct Gpu {
     pub memory_class: String,
     /// The most of `memory_bytes` this machine uses (`machine.gpu_memory_limit`); 0: all of it.
     pub memory_limit_bytes: u64,
+    /// TensorD's books of the chunks it creates and leases on it; absent where it creates none
+    /// (its executors then run their own pages).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leases: Option<GpuLeases>,
+}
+
+/// A GPU's lease books, as its manager holds them now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct GpuLeases {
+    /// What it may create: the card or its limit, less its own context (and, shared, the
+    /// desktop's headroom).
+    pub capacity_bytes: u64,
+    pub created_bytes: u64,
+    pub created_chunks: u64,
+    pub leased_bytes: u64,
+    /// Landed weights of exited executors, kept for the next executor of their layout.
+    pub retained_bytes: u64,
+    pub retained_chunks: u64,
+    /// Bytes an executor holds that no live manager created (a previous TensorD's).
+    pub books_only_bytes: u64,
+    /// `capacity_bytes` less `created_bytes`.
+    pub free_bytes: u64,
+    pub executors: Vec<LeaseHolder>,
+}
+
+/// One executor process's leases on a GPU.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct LeaseHolder {
+    pub pid: u32,
+    /// Its executor group (plan and lane).
+    pub executor: String,
+    pub chunks: u64,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]

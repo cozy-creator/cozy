@@ -168,7 +168,7 @@ impl StandIn {
     /// this process.
     fn granted(gpu: &Gpu, id: &GpuId, level: &str, uid: Option<u32>) -> StandIn {
         let standin = StandIn::start(id, level, "granted", uid);
-        let grant = gpu.ledger.grant(standin.pid()).unwrap();
+        let grant = gpu.ledger().grant(standin.pid()).unwrap();
         platform::handles::send_fd(&standin.control, &grant.table).unwrap();
         platform::handles::send_fd(&standin.control, &grant.row).unwrap();
         standin
@@ -241,17 +241,17 @@ fn key(peak: &Peak) -> &str {
 
 /// Whether `pid`'s live row maps pages (classes S, N, D, W, P).
 fn maps(gpu: &Gpu, pid: u32) -> bool {
-    gpu.ledger.status().rows.iter().any(|row| row.pid == pid && row.live && row.classes.iter().skip(2).any(|bytes| *bytes > 0))
+    gpu.ledger().status().rows.iter().any(|row| row.pid == pid && row.live && row.classes.iter().skip(2).any(|bytes| *bytes > 0))
 }
 
 /// Whether a request runs on the GPU, by any row.
 fn running(gpu: &Gpu) -> bool {
-    gpu.ledger.status().rows.iter().any(|row| row.live && (row.remaining > 0 || row.unmeasured > 0))
+    gpu.ledger().status().rows.iter().any(|row| row.live && (row.remaining > 0 || row.unmeasured > 0))
 }
 
 /// Bytes the table holds as orphans (class O): kept pages no live process maps.
 fn orphans(gpu: &Gpu) -> u64 {
-    gpu.ledger.status().rows.iter().map(|row| row.classes[1]).sum()
+    gpu.ledger().status().rows.iter().map(|row| row.classes[1]).sum()
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("a");
-    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).expect("a ledger for an inventoried GPU"));
+    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, None, &peaks, &log).expect("a ledger for an inventoried GPU"));
     let (woke, wakes) = mpsc::channel();
     let _events = memory::react(vec![memory::Source::Ledger(gpu.clone())], move |_| {
         let _ = woke.send(());
@@ -274,31 +274,31 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
     assert!(maps(&gpu, first.pid()));
 
     // An unmeasured run fits nothing beside it.
-    assert!(varena::Ledger::admit(&[&gpu.ledger], "unmeasured", PACKAGE, "8", None).unwrap(), "an idle GPU admits it");
+    assert!(varena::Ledger::admit(&[gpu.ledger()], "unmeasured", PACKAGE, "8", None).unwrap(), "an idle GPU admits it");
     assert_eq!(first.ask("run unmeasured 8"), "passing");
     assert!(running(&gpu));
-    assert!(!gpu.ledger.fits(PACKAGE, "8", None));
-    assert!(!gpu.ledger.fits("s5/other@1", "4", None));
+    assert!(!gpu.ledger().fits(PACKAGE, "8", None));
+    assert!(!gpu.ledger().fits("s5/other@1", "4", None));
     while wakes.try_recv().is_ok() {}
     assert_eq!(first.ask(&format!("end {ROOM}")), "ended");
-    gpu.ledger.undispatch("unmeasured");
+    gpu.ledger().undispatch("unmeasured");
     wakes.recv_timeout(BACKSTOP).expect("a recorded peak signals");
-    assert!(gpu.ledger.peaks().iter().any(|peak| key(peak) == format!("{PACKAGE}|8")));
+    assert!(gpu.ledger().peaks().iter().any(|peak| key(peak) == format!("{PACKAGE}|8")));
 
     // Measured, a second request of that shape fits beside a running one.
-    assert!(varena::Ledger::admit(&[&gpu.ledger], "measured", PACKAGE, "8", None).unwrap());
+    assert!(varena::Ledger::admit(&[gpu.ledger()], "measured", PACKAGE, "8", None).unwrap());
     assert_eq!(first.ask("run measured 8"), "passing");
-    assert!(gpu.ledger.fits(PACKAGE, "8", None), "two measured requests fit on the card");
+    assert!(gpu.ledger().fits(PACKAGE, "8", None), "two measured requests fit on the card");
     assert_eq!(first.ask(&format!("end {ROOM}")), "ended");
-    gpu.ledger.undispatch("measured");
+    gpu.ledger().undispatch("measured");
 
     // kill -9, waitpid, reap: what it kept is the table's orphans, and the next executor of the
     // same weights imports them instead of copying.
     let pid = first.kill();
     while wakes.try_recv().is_ok() {}
-    gpu.ledger.reap(pid);
+    gpu.ledger().reap(pid);
     wakes.recv_timeout(BACKSTOP).expect("a reaped row signals");
-    assert!(!gpu.ledger.status().rows.iter().any(|row| row.pid == pid && row.live));
+    assert!(!gpu.ledger().status().rows.iter().any(|row| row.pid == pid && row.live));
     assert!(orphans(&gpu) >= set_bytes, "its kept pages are orphans");
     // One load path: its load imports what custody keeps, at any level; its binds are hits.
     let mut second = StandIn::spawn(&gpu, &id, "ram");
@@ -308,18 +308,18 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
 
     // Peaks persist per GPU model, whole: another GPU of the model, and every restart after,
     // starts with exactly what was measured (a room's start, delta, slack, context and sites).
-    peaks.save(&id.model, std::iter::once(&gpu.ledger));
+    peaks.save(&id.model, std::iter::once(gpu.ledger()));
     let sorted = |mut peaks: Vec<Peak>| {
         peaks.sort_by(|a, b| key(a).cmp(key(b)));
         peaks
     };
-    let measured = sorted(gpu.ledger.peaks());
+    let measured = sorted(gpu.ledger().peaks());
     assert!(measured.iter().any(|peak| matches!(peak, Peak::Compute { bytes, .. } if *bytes > 0)), "{measured:?}");
     for restart in ["b", "c"] {
         let other = gpu_id(restart);
-        let restored = Gpu::create("0", &[inventory(&other)], None, HostMode::Dedicated, &Peaks::at(dir.path().join("peaks")), &log).unwrap();
-        assert_eq!(sorted(restored.ledger.peaks()), measured, "restart {restart}: restored exactly");
-        Peaks::at(dir.path().join("peaks")).save(&id.model, std::iter::once(&restored.ledger));
+        let restored = Gpu::create("0", &[inventory(&other)], None, HostMode::Dedicated, None, &Peaks::at(dir.path().join("peaks")), &log).unwrap();
+        assert_eq!(sorted(restored.ledger().peaks()), measured, "restart {restart}: restored exactly");
+        Peaks::at(dir.path().join("peaks")).save(&id.model, std::iter::once(restored.ledger()));
     }
     drop(second);
 }
@@ -332,10 +332,10 @@ fn measure(a: &mut StandIn, request: &dyn Fn(&str) -> String, admit: &dyn Fn(&st
         assert!(admit(&id), "an idle GPU admits it");
         assert_eq!(a.ask(&format!("run {id} {BIG}")), "passing");
         assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
-        gpu.ledger.undispatch(&id);
+        gpu.ledger().undispatch(&id);
     }
     let at = format!("{PACKAGE}|{BIG}");
-    let peaks = gpu.ledger.peaks();
+    let peaks = gpu.ledger().peaks();
     let (mut set, mut compute) = (None, None);
     for peak in &peaks {
         match peak {
@@ -344,7 +344,7 @@ fn measure(a: &mut StandIn, request: &dyn Fn(&str) -> String, admit: &dyn Fn(&st
             _ => {}
         }
     }
-    assert!(set.is_some_and(|bytes| bytes > gpu.ledger.status().capacity / 2), "{peaks:?}");
+    assert!(set.is_some_and(|bytes| bytes > gpu.ledger().status().capacity / 2), "{peaks:?}");
     assert!(compute.is_some_and(|bytes| bytes > 0 && Some(bytes) < set), "{peaks:?}");
 }
 
@@ -355,21 +355,21 @@ fn a_request_that_does_not_fit_waits_until_the_running_one_ends() {
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("wait");
-    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap());
+    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, None, &peaks, &log).unwrap());
     let engine = Engine::open(&dir.path().join("engine")).unwrap();
     let woken = engine.clone();
     let _events = memory::react(vec![memory::Source::Ledger(gpu.clone())], move |_| woken.notify_activity()).unwrap();
     let request = |key: &str| engine.submit(key, Invocation::default()).unwrap().id;
-    let admit = |id: &str| memory::admit(&engine, &[&gpu.ledger], id, PACKAGE, BIG, None).unwrap();
+    let admit = |id: &str| memory::admit(&engine, &[gpu.ledger()], id, PACKAGE, BIG, None).unwrap();
     let mut a = StandIn::spawn(&gpu, &id, "gpu");
     let a_pid = a.pid();
-    let running = |gpu: &Gpu| gpu.ledger.status().rows.iter().any(|row| row.pid == a_pid && (row.remaining > 0 || row.unmeasured > 0));
+    let running = |gpu: &Gpu| gpu.ledger().status().rows.iter().any(|row| row.pid == a_pid && (row.remaining > 0 || row.unmeasured > 0));
 
     measure(&mut a, &request, &admit, &gpu);
     let second = request("second");
     assert!(admit(&second), "alone, it fits");
     assert_eq!(a.ask(&format!("run {second} {BIG}")), "passing");
-    assert!(!gpu.ledger.fits(PACKAGE, BIG, None), "two do not fit");
+    assert!(!gpu.ledger().fits(PACKAGE, BIG, None), "two do not fit");
 
     let third = request("third");
     std::thread::scope(|scope| {
@@ -385,7 +385,7 @@ fn a_request_that_does_not_fit_waits_until_the_running_one_ends() {
         let (ok, overlapped) = admitted.recv_timeout(BACKSTOP).expect("the second's end wakes it");
         assert!(ok && !overlapped, "admitted once the second ended, never beside it");
     });
-    gpu.ledger.undispatch(&third);
+    gpu.ledger().undispatch(&third);
 
     // Waiting again behind a running one, it leaves when canceled.
     let fourth = request("fourth");
@@ -398,7 +398,7 @@ fn a_request_that_does_not_fit_waits_until_the_running_one_ends() {
         engine.cancel(fifth, "test").unwrap();
         assert!(!waiting.join().unwrap(), "a cancel ends the wait, not admitted");
     });
-    assert!(!gpu.ledger.status().dispatched.iter().any(|(request, _)| *request == fifth));
+    assert!(!gpu.ledger().status().dispatched.iter().any(|(request, _)| *request == fifth));
     assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
 }
 
@@ -411,12 +411,12 @@ fn a_yielded_parents_child_is_admitted_and_a_stranger_waits() {
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("family");
-    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap());
+    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, None, &peaks, &log).unwrap());
     let engine = Engine::open(&dir.path().join("engine")).unwrap();
     let woken = engine.clone();
     let _events = memory::react(vec![memory::Source::Ledger(gpu.clone())], move |_| woken.notify_activity()).unwrap();
     let request = |key: &str| engine.submit(key, Invocation::default()).unwrap().id;
-    let admit = |id: &str, family: Option<&str>| memory::admit(&engine, &[&gpu.ledger], id, PACKAGE, BIG, family).unwrap();
+    let admit = |id: &str, family: Option<&str>| memory::admit(&engine, &[gpu.ledger()], id, PACKAGE, BIG, family).unwrap();
     let mut parent = StandIn::spawn(&gpu, &id, "gpu");
     measure(&mut parent, &request, &|id| admit(id, None), &gpu);
     let call = request("parent");
@@ -424,11 +424,11 @@ fn a_yielded_parents_child_is_admitted_and_a_stranger_waits() {
     assert_eq!(parent.ask(&format!("open {call}")), "open");
     assert_eq!(parent.ask(&format!("pass {BIG}")), "passing");
     assert_eq!(parent.ask(&format!("done {BIG_ROOM}")), "done");
-    assert!(!gpu.ledger.fits(PACKAGE, BIG, Some(FAMILY)), "not yielded yet: its working set counts for its family too");
+    assert!(!gpu.ledger().fits(PACKAGE, BIG, Some(FAMILY)), "not yielded yet: its working set counts for its family too");
 
     // It calls a child and waits on it, yielded.
     assert_eq!(parent.ask(&format!("yield {FAMILY}")), "yielding");
-    assert!(!gpu.ledger.fits(PACKAGE, BIG, None), "a stranger is refused while the parent waits");
+    assert!(!gpu.ledger().fits(PACKAGE, BIG, None), "a stranger is refused while the parent waits");
     let child = request("child");
     assert!(admit(&child, Some(FAMILY)), "its family's child is admitted beside it");
     let stranger = request("stranger");
@@ -439,17 +439,17 @@ fn a_yielded_parents_child_is_admitted_and_a_stranger_waits() {
         let mut runner = StandIn::spawn(&gpu, &id, "ram");
         assert_eq!(runner.ask(&format!("run {child} {BIG}")), "passing", "the child's room is made on the whole card");
         assert_eq!(runner.ask(&format!("end {BIG_ROOM}")), "ended");
-        gpu.ledger.undispatch(&child);
+        gpu.ledger().undispatch(&child);
         engine.notify_activity();
         assert!(admitted.try_recv().is_err(), "the stranger still waits: the parent does");
         assert_eq!(parent.ask("resume"), "resumed", "its room came back once the child ended");
         assert_eq!(parent.ask(&format!("pass {BIG}")), "passing");
         assert_eq!(parent.ask(&format!("done {BIG_ROOM}")), "done");
         assert_eq!(parent.ask("close"), "ended", "the parent completes");
-        gpu.ledger.undispatch(&call);
+        gpu.ledger().undispatch(&call);
         assert!(admitted.recv_timeout(BACKSTOP).expect("the parent's end wakes it"), "then the stranger is admitted");
     });
-    gpu.ledger.undispatch(&stranger);
+    gpu.ledger().undispatch(&stranger);
 }
 
 /// The events thread wakes on a ledger's event, by the GPU's named wake, and ends with its pool.
@@ -458,13 +458,13 @@ fn the_events_thread_wakes_on_a_ledgers_event_and_ends_with_its_pool() {
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("events");
-    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Shared, &peaks, &log).unwrap());
+    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Shared, None, &peaks, &log).unwrap());
     let (woke, wakes) = mpsc::channel();
     let events = memory::react(vec![memory::Source::Ledger(gpu.clone())], move |what| {
         let _ = woke.send(what);
     })
     .unwrap();
-    gpu.ledger.fault(); // its kept pages go: the ledger signals
+    gpu.ledger().fault(); // its kept pages go: the ledger signals
     assert_eq!(wakes.recv_timeout(BACKSTOP).unwrap(), memory::Woke::Ledger);
     drop(events);
     assert!(wakes.recv().is_err(), "the thread ended with its pool");
@@ -478,16 +478,16 @@ fn a_restarted_tensord_drops_the_dispatches_its_predecessor_left() {
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("stale");
-    let gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap();
+    let gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, None, &peaks, &log).unwrap();
     let mut alive = StandIn::spawn(&gpu, &id, "ram");
     alive.ask("load"); // its live row keeps the table past its TensorD
-    gpu.ledger.dispatch("left-behind", PACKAGE, BIG).unwrap();
-    assert!(!gpu.ledger.fits("s5/other@1", "4", None), "a dispatched, unmeasured request: not idle");
+    gpu.ledger().dispatch("left-behind", PACKAGE, BIG).unwrap();
+    assert!(!gpu.ledger().fits("s5/other@1", "4", None), "a dispatched, unmeasured request: not idle");
     drop(gpu); // ended without undispatching
-    let restarted = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap();
-    assert!(restarted.ledger.status().rows.iter().any(|row| row.pid == alive.pid() && row.live), "the same table");
-    assert!(restarted.ledger.status().dispatched.is_empty());
-    assert!(restarted.ledger.fits("s5/other@1", "4", None), "idle again: it admits");
+    let restarted = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, None, &peaks, &log).unwrap();
+    assert!(restarted.ledger().status().rows.iter().any(|row| row.pid == alive.pid() && row.live), "the same table");
+    assert!(restarted.ledger().status().dispatched.is_empty());
+    assert!(restarted.ledger().fits("s5/other@1", "4", None), "idle again: it admits");
 }
 
 /// Review 1, item 6: a standalone engine (no TensorD grant; its memory opens the GPU's table by
@@ -497,7 +497,7 @@ fn tensord_wakes_on_a_standalone_engines_events() {
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("standalone");
-    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Shared, &peaks, &log).unwrap());
+    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Shared, None, &peaks, &log).unwrap());
     let (woke, wakes) = mpsc::channel();
     let _events = memory::react(vec![memory::Source::Ledger(gpu.clone())], move |what| {
         let _ = woke.send(what);
@@ -509,7 +509,7 @@ fn tensord_wakes_on_a_standalone_engines_events() {
     assert_eq!(engine.ask(&format!("run standalone {BIG}")), "passing");
     assert_eq!(engine.ask(&format!("end {BIG_ROOM}")), "ended");
     assert_eq!(wakes.recv_timeout(BACKSTOP).expect("its peak and its freed room wake TensorD"), memory::Woke::Ledger);
-    assert!(gpu.ledger.status().rows.iter().any(|row| row.pid == engine.pid() && row.live), "its row is on TensorD's table");
+    assert!(gpu.ledger().status().rows.iter().any(|row| row.pid == engine.pid() && row.live), "its row is on TensorD's table");
 }
 
 /// The executor identity a root TensorD launches executors as (`config.identity`): `nobody`.
@@ -527,18 +527,18 @@ fn a_root_tensord_grants_executors_of_its_identity() {
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("identity");
-    let gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap();
+    let gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, None, &peaks, &log).unwrap();
     let mut first = StandIn::granted(&gpu, &id, "gpu", Some(IDENTITY));
     let set_bytes = spec(&id).layout.nbytes;
     assert_eq!(first.load(), ("Store,Store,Store,Hit,Hit,Hit".into(), 0, set_bytes), "warmed on its GPU");
     assert!(maps(&gpu, first.pid()), "its row is on TensorD's table");
-    assert!(varena::Ledger::admit(&[&gpu.ledger], "identity", PACKAGE, "8", None).unwrap());
+    assert!(varena::Ledger::admit(&[gpu.ledger()], "identity", PACKAGE, "8", None).unwrap());
     assert_eq!(first.ask("run identity 8"), "passing");
     assert_eq!(first.ask(&format!("end {ROOM}")), "ended");
-    gpu.ledger.undispatch("identity");
-    assert!(gpu.ledger.peaks().iter().any(|peak| key(peak) == format!("{PACKAGE}|8")), "its peak reached TensorD's table");
+    gpu.ledger().undispatch("identity");
+    assert!(gpu.ledger().peaks().iter().any(|peak| key(peak) == format!("{PACKAGE}|8")), "its peak reached TensorD's table");
     let pid = first.kill();
-    gpu.ledger.reap(pid);
+    gpu.ledger().reap(pid);
     assert!(orphans(&gpu) >= set_bytes, "its kept pages are in TensorD's custody");
     let mut second = StandIn::granted(&gpu, &id, "ram", Some(IDENTITY));
     assert_eq!(second.load(), ("Kept,Kept,Kept,Hit,Hit,Hit".into(), set_bytes, 0), "imported at load, not copied");
@@ -555,19 +555,19 @@ fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let (id0, id1) = (gpu_id("home-0"), gpu_id("home-1"));
-    let gpu0 = Gpu::create("0", &[inventory(&id0)], None, HostMode::Dedicated, &peaks, &log).unwrap();
-    let gpu1 = Gpu::create("0", &[inventory(&id1)], None, HostMode::Dedicated, &peaks, &log).unwrap();
+    let gpu0 = Gpu::create("0", &[inventory(&id0)], None, HostMode::Dedicated, None, &peaks, &log).unwrap();
+    let gpu1 = Gpu::create("0", &[inventory(&id1)], None, HostMode::Dedicated, None, &peaks, &log).unwrap();
     let set = format!("{PACKAGE}/c");
     let mut loader = StandIn::spawn(&gpu1, &id1, "ram");
     loader.ask("load");
     let pid = loader.kill();
-    gpu1.ledger.reap(pid);
-    assert!(gpu1.ledger.peaks().iter().any(|peak| matches!(peak, Peak::Set { key, .. } if *key == set)), "its load recorded its bytes");
+    gpu1.ledger().reap(pid);
+    assert!(gpu1.ledger().peaks().iter().any(|peak| matches!(peak, Peak::Set { key, .. } if *key == set)), "its load recorded its bytes");
 
     let engine = Engine::open(&dir.path().join("engine")).unwrap();
     let request = |key: &str| engine.submit(key, Invocation::default()).unwrap().id;
-    let admit = |id: &str| memory::admit(&engine, &[&gpu0.ledger], id, PACKAGE, BIG, None).unwrap();
-    let homes = || memory::homes(&[&gpu0.ledger, &gpu1.ledger], PACKAGE, "", None, &[set.as_str()], &log);
+    let admit = |id: &str| memory::admit(&engine, &[gpu0.ledger()], id, PACKAGE, BIG, None).unwrap();
+    let homes = || memory::homes(&[gpu0.ledger(), gpu1.ledger()], PACKAGE, "", None, &[set.as_str()], &log);
     let mut busy = StandIn::spawn(&gpu0, &id0, "gpu");
     assert_eq!(homes(), [0], "nothing measured runs on GPU 0: it keeps it");
     measure(&mut busy, &request, &admit, &gpu0);
@@ -577,7 +577,7 @@ fn a_placeable_set_is_homed_on_gpu_1_only_while_gpu_0_has_no_room() {
     assert_eq!(busy.ask(&format!("run {call} {BIG}")), "passing");
     assert_eq!(homes(), [1], "no room beside GPU 0's running request: GPU 1 keeps it");
     assert_eq!(busy.ask(&format!("end {BIG_ROOM}")), "ended");
-    gpu0.ledger.undispatch(&call);
+    gpu0.ledger().undispatch(&call);
     assert_eq!(homes(), [0], "with room on GPU 0 it stays there");
     assert_eq!(homes(), [0], "and the same placement answers the same");
 }
@@ -590,20 +590,20 @@ fn an_unmeasured_running_call_carries_no_host_peak() {
     let dir = tempfile::tempdir().unwrap();
     let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
     let id = gpu_id("need");
-    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap());
-    let need = || gpu.ledger.host_calls();
+    let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, None, &peaks, &log).unwrap());
+    let need = || gpu.ledger().host_calls();
     let engine = Engine::open(&dir.path().join("engine")).unwrap();
     let mut a = StandIn::spawn(&gpu, &id, "gpu");
     assert_eq!(need(), Some(vec![]), "nothing runs");
     for (key, measured) in [("first", false), ("again", true)] {
         let call = engine.submit(key, Invocation::default()).unwrap().id;
-        assert!(memory::admit(&engine, &[&gpu.ledger], &call, PACKAGE, BIG, None).unwrap());
+        assert!(memory::admit(&engine, &[gpu.ledger()], &call, PACKAGE, BIG, None).unwrap());
         assert_eq!(a.ask(&format!("run {call} {BIG}")), "passing");
         let calls = need().unwrap();
         assert!(calls.len() == 1 && calls[0].peak.is_some() == measured, "{key}: {calls:?}");
         assert_eq!(a.ask(&format!("end {BIG_ROOM}")), "ended");
-        gpu.ledger.undispatch(&call);
+        gpu.ledger().undispatch(&call);
         assert_eq!(need(), Some(vec![]), "{key} ended");
-        assert!(gpu.ledger.peaks().iter().any(|peak| matches!(peak, Peak::Host { key, .. } if *key == format!("{PACKAGE}|{BIG}"))));
+        assert!(gpu.ledger().peaks().iter().any(|peak| matches!(peak, Peak::Host { key, .. } if *key == format!("{PACKAGE}|{BIG}"))));
     }
 }

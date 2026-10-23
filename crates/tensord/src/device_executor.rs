@@ -59,14 +59,41 @@ pub struct Hello {
     pub torch_loaded: bool,
 }
 
+/// The lease protocol (design varena-leases), where varena serves one.
+#[cfg(unix)]
+const LEASES: Option<u32> = Some(varena::lease::PROTOCOL);
+#[cfg(not(unix))]
+const LEASES: Option<u32> = None;
+
+/// How an executor's GPU memory is served, by the memory protocol its Hello speaks. An executor
+/// is never refused for it: skew degrades to standalone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Contract {
+    /// Chunks leased over each GPU's listener, besides its ledger rows.
+    Leases,
+    /// Its ledger rows (protocol 1).
+    Rows,
+    /// Any other protocol: its own pages, its GPUs' tables by name.
+    Standalone,
+}
+
 impl Hello {
+    pub fn contract(&self) -> Contract {
+        match self.memory_protocol {
+            1 => Contract::Rows,
+            protocol if Some(protocol) == LEASES => Contract::Leases,
+            _ => Contract::Standalone,
+        }
+    }
+
+    /// Refuses a Start whose descriptors or leases the executor's protocol cannot read.
     fn accepts(&self, command: &DeviceCommand) -> io::Result<()> {
-        if matches!(command, DeviceCommand::Start { devices, ledgers, .. } if !devices.is_empty() || *ledgers != 0)
-            && self.memory_protocol != 1
-        {
+        let DeviceCommand::Start { ledgers, leases, .. } = command else { return Ok(()) };
+        let contract = self.contract();
+        if (*ledgers != 0 && contract == Contract::Standalone) || (leases.is_some() && contract != Contract::Leases) {
             return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
-                "GPU executor requires memory_protocol=1 (two ledger descriptors per GPU); Runtime {} advertises {}. Upgrade Runtime and TensorFS together",
-                self.runtime_version, self.memory_protocol,
+                "Runtime {} speaks memory protocol {}: it reads no {}",
+                self.runtime_version, self.memory_protocol, if leases.is_some() { "leases" } else { "ledger descriptors" },
             )));
         }
         Ok(())
@@ -188,6 +215,10 @@ pub enum DeviceCommand {
         /// memory with the first and hands follower r the r-th (design varena-slim §3).
         #[serde(skip_serializing_if = "is_zero")]
         ledgers: u32,
+        /// The namespace (TensorD's uid) each GPU's lease listener (`lease-<uuid>`) is named in,
+        /// for an executor speaking the lease protocol; a GPU nobody serves runs its own pages.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        leases: Option<u32>,
         memory_mode: MemoryMode,
     },
     Load {
@@ -713,10 +744,10 @@ impl Line {
 /// keep the token, every other field is scanned.
 fn command_bytes(command: &DeviceCommand, memo: bool) -> io::Result<Vec<u8>> {
     let mut value = serde_json::to_value(command)?;
-    if matches!(command, DeviceCommand::Start { .. }) {
+    if let DeviceCommand::Start { leases, .. } = command {
         // The receiver checks this before reading any ledger descriptors. Older TensorD
         // sends none, allowing a rebuilt Runtime to refuse its single-fd contract safely.
-        value["memory_protocol"] = 1.into();
+        value["memory_protocol"] = leases.and(LEASES).unwrap_or(1).into();
         if memo {
             value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
         }
@@ -2010,6 +2041,7 @@ mod codec_tests {
                 call_interfaces: vec![],
                 constructions: vec![],
                 ledgers: 0,
+                leases: None,
                 memory_mode: mode,
             };
             let frame: Value = serde_json::from_slice(&command_bytes(&start, false).unwrap()).unwrap();
@@ -2050,21 +2082,29 @@ mod codec_tests {
     }
 
     #[test]
-    fn gpu_start_requires_the_memory_descriptor_contract_not_a_patch_version() {
-        let legacy: Hello = serde_json::from_value(serde_json::json!({"runtime_version": "0.30.3"})).unwrap();
-        let mut start = DeviceCommand::Start {
-            devices: String::new(), application: String::new(), package_interface: PathBuf::new(),
+    fn each_memory_protocol_starts_on_what_it_reads_and_none_is_refused() {
+        let hello = |protocol: u32| -> Hello { serde_json::from_value(serde_json::json!({"runtime_version": "0.31.99", "memory_protocol": protocol})).unwrap() };
+        let start = |ledgers: u32, leases: Option<u32>| DeviceCommand::Start {
+            devices: "0".into(), application: String::new(), package_interface: PathBuf::new(),
             sequence_parallel_degree: 1, import_only: false, call_interfaces: vec![],
-            constructions: vec![], ledgers: 0, memory_mode: MemoryMode::Dedicated,
+            constructions: vec![], ledgers, leases, memory_mode: MemoryMode::Dedicated,
         };
-        legacy.accepts(&DeviceCommand::Hello).unwrap();
-        legacy.accepts(&start).unwrap();
-        if let DeviceCommand::Start { devices, ledgers, .. } = &mut start { *devices = "0".into(); *ledgers = 1; }
-        assert_eq!(legacy.accepts(&start).unwrap_err().kind(), io::ErrorKind::Unsupported);
-        let capable: Hello = serde_json::from_value(serde_json::json!({"runtime_version": "0.31.99", "memory_protocol": 1})).unwrap();
-        capable.accepts(&start).unwrap();
-        let incompatible: Hello = serde_json::from_value(serde_json::json!({"memory_protocol": 2})).unwrap();
-        assert!(incompatible.accepts(&start).is_err());
+        let (legacy, rows) = (hello(0), hello(1));
+        assert_eq!((legacy.contract(), rows.contract(), hello(9).contract()), (Contract::Standalone, Contract::Rows, Contract::Standalone));
+        // A GPU executor of any protocol starts: standalone, it is sent nothing it cannot read.
+        legacy.accepts(&start(0, None)).unwrap();
+        assert_eq!(legacy.accepts(&start(1, None)).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        rows.accepts(&start(1, None)).unwrap();
+        assert!(rows.accepts(&start(1, Some(1000))).is_err(), "rows read no leases");
+        let frame = |command: &DeviceCommand| serde_json::from_slice::<Value>(&command_bytes(command, false).unwrap()).unwrap()["memory_protocol"].clone();
+        assert_eq!(frame(&start(1, None)), 1);
+        #[cfg(unix)]
+        {
+            let leases = hello(varena::lease::PROTOCOL);
+            assert_eq!(leases.contract(), Contract::Leases);
+            leases.accepts(&start(1, Some(1000))).unwrap();
+            assert_eq!(frame(&start(1, Some(1000))), varena::lease::PROTOCOL);
+        }
     }
 
     /// A null in any optional field reads as its absence: a string, a flattened hello field,

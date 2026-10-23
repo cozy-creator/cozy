@@ -1,10 +1,11 @@
-//! TensorD on varena's ledger (design varena-slim §2–§4). Each envelope GPU the inventory names
-//! has a [`Ledger`] (capacity min(card, `gpu_memory_limit`)): an executor is granted it at spawn,
-//! its row is reaped once its exit is proven, and admission is [`admit`] (`Ledger::admit`: a
-//! group on all of its GPUs or none, waiting while refused). TensorD holds no byte count and
-//! decides no eviction: kept-page custody runs inside the ledger. Host RAM is the OS page cache;
+//! TensorD hosts varena's lease manager (design varena-leases): each envelope GPU the inventory
+//! names has one, which creates the GPU's chunks and leases them to its executors, and owns the
+//! GPU's [`Ledger`] (capacity min(card, `gpu_memory_limit`)) until the ledger folds into it. An
+//! executor is granted its row at spawn, its row is reaped once its exit is proven, and admission
+//! is [`admit`] (`Ledger::admit`: a group on all of its GPUs or none, waiting while refused).
+//! A GPU TensorD cannot create chunks on keeps the ledger alone. Host RAM is the OS page cache;
 //! [`Host`] watches what the running calls must keep free of it. One thread blocks on every
-//! ledger's events and the host's short event.
+//! GPU's events and the host's short event.
 use crate::{execution::Engine, machine::receipt};
 use platform::contain::host_memory;
 use platform::contain::host_pressure::{self, Growth, HostMode, Nudge};
@@ -20,42 +21,193 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use varena::{ledger::Mode, GpuId, HostCall, Ledger, Peak};
+use platform::{handles::Peer, process::Exact};
+use varena::lease::{Hosting, Identity, Manager, Record};
+use varena::{ledger::Mode, Backend, CudaBackend, GpuId, HostCall, Ledger, Peak};
 
 /// Past this the memory log rotates to `memory.log.1`, so it holds at most twice this.
 const ROTATE_BYTES: u64 = 4 << 20;
 
-/// One envelope GPU's ledger, and the GPU model its peaks are kept under.
+/// One envelope GPU: its lease manager, or its ledger alone; and the GPU model its peaks are
+/// kept under.
 pub struct Gpu {
-    pub ledger: Ledger,
+    held: Held,
     pub model: String,
 }
 
+enum Held {
+    Leases(Arc<Manager>),
+    Ledger(Ledger),
+}
+
+/// What hosting a GPU's leases takes: who the peers on its listener are, and its chunks.
+pub struct Leases {
+    pub hosting: Arc<dyn Hosting>,
+    pub backend: Arc<dyn Backend>,
+}
+
 impl Gpu {
-    /// `entry`'s ledger, sized by the inventory's memory (an integrated GPU's is the host's) and
+    /// `entry`'s memory, sized by the inventory's memory (an integrated GPU's is the host's) and
     /// never above `limit`, in the machine's sharing `mode`, with the peaks this machine measured
-    /// on its model. None when the inventory does not name it or its table cannot be made.
-    pub fn create(entry: &str, inventory: &[receipt::Gpu], limit: Option<u64>, mode: HostMode, peaks: &Peaks, log: &MemoryLog) -> Option<Gpu> {
-        let row = inventory.iter().find(|g| g.device_index.to_string() == entry || g.device_uuid == entry)?;
+    /// on its model: a lease manager serving `leases`, else (none given, or its listener or
+    /// manager cannot be made: a memory-log note says why) the ledger alone. None when the
+    /// inventory does not name it or its table cannot be made.
+    pub fn create(entry: &str, inventory: &[receipt::Gpu], limit: Option<u64>, mode: HostMode, leases: Option<Leases>, peaks: &Peaks, log: &MemoryLog) -> Option<Gpu> {
+        let row = row(entry, inventory)?;
         let id = GpuId { uuid: row.device_uuid.clone(), model: row.device_name.clone(), memory: row.memory_bytes };
-        let ledger = match Ledger::create(&id, limit) {
-            Ok(ledger) => ledger,
-            Err(error) => {
-                tracing::warn!("memory: GPU {entry} has no ledger: {error}");
-                return None;
-            }
-        };
         let mode = match mode {
             HostMode::Shared => Mode::Shared,
             HostMode::Dedicated => Mode::Dedicated,
         };
-        if let Err(error) = ledger.set_mode(mode) {
-            tracing::warn!("memory: GPU {entry} stays shared: {error}");
-        }
-        peaks.restore(&id.model, &ledger);
-        log.note(serde_json::json!({"event": "ledger", "gpu": entry, "card": id.memory, "capacity": ledger.status().capacity}));
-        Some(Gpu { ledger, model: id.model })
+        let held = match leases.map(|leases| manage(&id, limit, mode, leases)) {
+            Some(Ok(manager)) => Held::Leases(manager),
+            refused => {
+                if let Some(Err(why)) = refused {
+                    log.note(serde_json::json!({"event": "leases_off", "gpu": entry, "why": why}));
+                }
+                let ledger = match Ledger::create(&id, limit) {
+                    Ok(ledger) => ledger,
+                    Err(error) => {
+                        tracing::warn!("memory: GPU {entry} has no ledger: {error}");
+                        return None;
+                    }
+                };
+                if let Err(error) = ledger.set_mode(mode) {
+                    tracing::warn!("memory: GPU {entry} stays shared: {error}");
+                }
+                Held::Ledger(ledger)
+            }
+        };
+        let gpu = Gpu { held, model: id.model.clone() };
+        peaks.restore(&id.model, gpu.ledger());
+        let leased = gpu.manager().is_some();
+        log.note(serde_json::json!({"event": "ledger", "gpu": entry, "card": id.memory, "capacity": gpu.ledger().status().capacity, "leases": leased}));
+        Some(gpu)
     }
+
+    /// A GPU on `ledger` alone.
+    pub fn ledgered(ledger: Ledger, model: &str) -> Gpu {
+        Gpu { held: Held::Ledger(ledger), model: model.into() }
+    }
+
+    /// The GPU's admission and placement facts (the manager's ledger, until step 4).
+    pub fn ledger(&self) -> &Ledger {
+        match &self.held {
+            Held::Leases(manager) => manager.ledger(),
+            Held::Ledger(ledger) => ledger,
+        }
+    }
+
+    /// Its lease manager, where TensorD creates its chunks.
+    pub fn manager(&self) -> Option<&Arc<Manager>> {
+        match &self.held {
+            Held::Leases(manager) => Some(manager),
+            Held::Ledger(_) => None,
+        }
+    }
+
+    /// Executors to end: the ledger's stalled rows, and those answering no revoke.
+    pub fn stalled(&self) -> Vec<u32> {
+        match &self.held {
+            Held::Leases(manager) => manager.stalled(),
+            Held::Ledger(ledger) => ledger.stalled(),
+        }
+    }
+}
+
+/// The inventory's GPU `entry` names: an index, or a `GPU-…` UUID.
+pub fn row<'a>(entry: &str, inventory: &'a [receipt::Gpu]) -> Option<&'a receipt::Gpu> {
+    inventory.iter().find(|g| g.device_index.to_string() == entry || g.device_uuid == entry)
+}
+
+/// One GPU executor process: its plan, package generation and lane, and a handle that ends
+/// exactly it.
+pub struct Tenant {
+    pub plan: String,
+    pub generation: String,
+    pub start: usize,
+    pub exact: Exact,
+}
+
+/// Every live GPU executor process (leaders and followers) by pid.
+pub type Tenants = Arc<Mutex<BTreeMap<u32, Tenant>>>;
+
+/// Who a peer on a GPU's lease listener is: the tenant it is or descends from (a follower dials
+/// before rank 0 reports it), running as one of `uids` (this machine's, its launch identity's).
+/// Its executor is its group (plan and lane), its trust domain its package generation and user.
+/// Its grants, revokes, reclaims and adoptions are memory-log lines.
+pub struct Peers {
+    tenants: Tenants,
+    uids: Vec<u32>,
+    notes: MemoryLog,
+}
+
+impl Peers {
+    pub fn new(tenants: Tenants, uids: Vec<u32>, notes: MemoryLog) -> Peers {
+        Peers { tenants, uids, notes }
+    }
+}
+
+impl Hosting for Peers {
+    fn identify(&self, peer: &Peer) -> Option<Identity> {
+        if !self.uids.contains(&peer.uid) {
+            return None;
+        }
+        let machine = std::process::id();
+        let parent = |&pid: &u32| platform::process::parent_of(pid).ok().filter(|&parent| parent > 1 && parent != pid);
+        let lineage: Vec<u32> = std::iter::successors(Some(peer.pid), parent).take_while(|&pid| pid != machine).collect();
+        let tenants = self.tenants.lock().unwrap();
+        let tenant = lineage.iter().find_map(|pid| tenants.get(pid).filter(|tenant| !tenant.exact.ended()))?;
+        Some(Identity { executor: format!("{}#{}", tenant.plan, tenant.start), domain: format!("{}/{}", tenant.generation, peer.uid) })
+    }
+
+    fn record(&self, record: Record) {
+        match serde_json::to_value(&record) {
+            Ok(event) => self.notes.note(event),
+            Err(error) => tracing::warn!("memory: a lease record unwritten: {error}"),
+        }
+    }
+}
+
+/// `id`'s manager on its listener (`lease::listen`: named by its UUID in this user's namespace).
+fn manage(id: &GpuId, limit: Option<u64>, mode: Mode, leases: Leases) -> Result<Arc<Manager>, String> {
+    let listener = varena::lease::listen(id)
+        .map_err(|error| format!("its listener: {error}"))?
+        .ok_or_else(|| "another process serves its leases".to_string())?;
+    Manager::create(id, limit, mode, leases.backend, listener, leases.hosting).map_err(|error| error.to_string())
+}
+
+/// GPU `uuid`'s chunks, created in TensorD's own context. None (a memory-log note says why)
+/// where its compute mode admits one process at a time, whose context TensorD's would lock out,
+/// or CUDA cannot open it for shareable pages.
+pub fn chunks(uuid: &str, log: &MemoryLog) -> Option<Arc<dyn Backend>> {
+    let off = |why: String| log.note(serde_json::json!({"event": "leases_off", "gpu": uuid, "why": why}));
+    match platform::gpu::Device::open(uuid).and_then(|device| device.exclusive()) {
+        Ok(true) => {
+            off("its compute mode admits one process at a time".into());
+            return None;
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!("memory: GPU {uuid}'s compute mode is unread ({error}): CUDA decides"),
+    }
+    let opened = ordinal(uuid).and_then(|ordinal| CudaBackend::open(ordinal).map_err(|error| error.to_string()));
+    opened.map(|backend| Arc::new(backend) as Arc<dyn Backend>).inspect_err(|why| off(why.clone())).ok()
+}
+
+/// The CUDA ordinal of GPU `uuid` in this process, whose ordinals are neither NVML's indices
+/// nor an executor's (`CUDA_VISIBLE_DEVICES`).
+fn ordinal(uuid: &str) -> Result<i32, String> {
+    use tensorfs::io::cuda;
+    let driver = cuda::driver().map_err(|error| error.to_string())?;
+    let mut count = 0;
+    // SAFETY: cuDeviceGetCount's out-param, a live local.
+    cuda::check("cuDeviceGetCount", unsafe { (driver.device_get_count)(&mut count) }).map_err(|error| error.to_string())?;
+    let named = |ordinal: i32| {
+        let mut device = 0;
+        // SAFETY: cuDeviceGet's out-param, a live local, for an ordinal below the count.
+        cuda::check("cuDeviceGet", unsafe { (driver.device_get)(&mut device, ordinal) }).is_ok() && cuda::uuid(device).is_ok_and(|named| named == uuid)
+    };
+    (0..count).find(|&ordinal| named(ordinal)).ok_or_else(|| format!("CUDA has no device {uuid}"))
 }
 
 /// Admits request `id` of `family` at `<package>|<shape>` on every one of `ledgers` or none
@@ -169,7 +321,7 @@ pub enum Source {
 impl Source {
     fn fd(&self) -> RawFd {
         match self {
-            Source::Ledger(gpu) => gpu.ledger.events().as_raw_fd(),
+            Source::Ledger(gpu) => gpu.ledger().events().as_raw_fd(),
             Source::Host(host) => host.short.as_raw_fd(),
         }
     }
@@ -178,7 +330,7 @@ impl Source {
     fn clear(&self) -> Woke {
         match self {
             Source::Ledger(gpu) => {
-                gpu.ledger.clear_events();
+                gpu.ledger().clear_events();
                 Woke::Ledger
             }
             Source::Host(host) => {
@@ -260,7 +412,7 @@ impl Host {
             let mut signalled: Option<u64> = None;
             while pressure.wait().is_ok() {
                 looked.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
-                let need = keep.look(gpus.iter().map(|gpu| gpu.ledger.host_calls()).collect::<Option<Vec<_>>>().map(|calls| calls.concat()));
+                let need = keep.look(gpus.iter().map(|gpu| gpu.ledger().host_calls()).collect::<Option<Vec<_>>>().map(|calls| calls.concat()));
                 let budget = u64::try_from(host_memory::read().available).unwrap_or(u64::MAX);
                 if budget >= need {
                     signalled = None;
