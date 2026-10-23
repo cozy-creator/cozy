@@ -4,7 +4,7 @@
 #![allow(unsafe_code)]
 use super::clean;
 use super::unix::{Owned, Stream};
-use crate::{Error, Result, Seam};
+use crate::{Error, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::CStr;
