@@ -193,6 +193,7 @@ def run(mem: Memory, unet: UNet2DConditionModel, want: list[torch.Tensor], id: s
     stats = r.stats()
     print(f"STATS {id}: {stats.json()}", flush=True)
     check(f"{id}: leaves nothing behind", stats.leftover == 0, stats.leftover)
+    check(f"{id}: no torch block outlives it", not stats.outlived, stats.outlived)
     check(f"{id}: its record crosses as JSON", json.loads(stats.json())["request"] == id, stats.json())
     return stats, got
 
@@ -252,7 +253,7 @@ def shim() -> None:
     running = {"torch": ".".join(torch.__version__.split(".")[:2]), "cxx11_abi": int(torch._C._GLIBCXX_USE_CXX11_ABI)}
     check("shim: built for this torch", built == running, (built, running))
     lib, ext = ctypes.CDLL(str(adapter._SHIM)), ctypes.CDLL(tensorfs._ext.__file__)
-    hooks = [f"varena_torch_{h}" for h in ("bind", "malloc", "free", "record_stream", "begin_pool", "end_pool", "release_pool")]
+    hooks = [f"varena_torch_{h}" for h in ("bind", "malloc", "free", "record_stream", "begin_pool", "end_pool", "release_pool", "abandon_pool")]
     agent = [f"varena_agent_{f}" for f in ("alloc", "free", "record_stream", "pool_begin", "pool_end", "pool_release")]
     missing = [h for h in hooks if not hasattr(lib, h)] + [f for f in agent if not hasattr(ext, f)]
     check("shim: its hooks and the agent's C ABI resolve", not missing, missing)

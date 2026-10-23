@@ -111,6 +111,7 @@ def main():
                     static.copy_(x)
                     graph.replay()  # the exact instance captured before backing eviction
                     x = output.clone()
+                    mem.fence_pool(pool, stream)
                 if force_evict:
                     torch.cuda.synchronize()
                     mem.native.load(placed.set, Level.RAM)

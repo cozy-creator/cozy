@@ -40,16 +40,6 @@ class GpuId:
     @property
     def memory(self) -> int: ...
 
-class Grant:
-    """TensorD's descriptors (handles on Windows) for this process's memory: the table and its
-    row lock's own description; ownership passes."""
-
-    def __init__(self, table: int, row: int) -> None: ...
-    @staticmethod
-    def open(gpu: GpuId, limit: int | None = None) -> Grant:
-        """A standalone engine's grant: `gpu`'s table by name; `limit` lowers its capacity (the
-        first opener sets it, a later one can only lower it)."""
-
 class Fill:
     """What turns a page's stored bytes into its weights."""
 
@@ -124,12 +114,12 @@ class Set:
 
 class Memory:
     @staticmethod
-    def cuda(ordinal: int, grant: Grant | None = None, limit: int | None = None) -> Memory:
-        """CUDA device `ordinal`'s table through TensorD's `grant`, or by name (standalone, its
-        capacity lowered to `limit`). Open it before torch initializes CUDA."""
+    def cuda(ordinal: int, limit: int | None = None) -> Memory:
+        """CUDA device `ordinal`'s table by name, this process's row capped at `limit`. Open it
+        before torch initializes CUDA."""
 
     @staticmethod
-    def host(gpu: GpuId, grant: Grant | None = None, limit: int | None = None) -> Memory:
+    def host(gpu: GpuId, limit: int | None = None) -> Memory:
         """Host pages of `gpu.memory` bytes (CPU, MPS) on the table `gpu.uuid` names."""
 
     @property
@@ -172,9 +162,27 @@ class Memory:
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
 
-    def torch_stats(self) -> tuple[int, int, int, list[tuple[str, int, int]]]:
+    def torch_stats(self) -> tuple[int, int, int, list[tuple[str, int, int]], list[tuple[tuple[int, int], int, int]]]:
         """varena's figures for torch's blocks: (allocated, mapped, peak, per open request (id,
-        allocated, peak))."""
+        allocated, peak), per pool (pool, mapped, allocated))."""
+
+    def serve_torch(self, leased: bool) -> None:
+        """Serves torch's allocations here, before any: from the leased chunks (`leased`), else
+        standalone from the device's free bytes less twice the driver headroom."""
+
+    def region(self, owner: str, kind: str, sets: Sequence[int] = (), spill: bool = True) -> Region:
+        """A long-lived intermediate's region: kind kv, latent, conditioning, derived or workspace."""
+
+    def graph_region(self, pool: tuple[int, int], sets: Sequence[int] = (), retained: Sequence[int] = ()) -> GraphRegion:
+        """A component's graphs on this device, captured into `pool`."""
+
+    def room(self, step: int | None = None) -> tuple[int, int, int, int, int]:
+        """(free, cold, warm, granularity, floor) at plan step `step` (the cursor's when None)."""
+
+    def fence_pool(self, pool: tuple[int, int], stream: int) -> None:
+        """An event on `stream` after torch pool `pool`'s use there: its chunks leave, once
+        released, only after every fence completed."""
+
 
     def prepare_pool(self, pool: tuple[int, int], expected: int) -> None:
         """Maps `expected` bytes into torch pool `pool` before a capture into it begins."""
@@ -198,6 +206,38 @@ class Request:
     def stats(self) -> Stats: ...
     def end(self) -> Stats:
         """Ends it: its pins and caches go."""
+
+class Region:
+    """A long-lived intermediate in an arena of its own; `close` (or its drop) releases it."""
+
+    def pin(self) -> RegionPin:
+        """Pins it while in use."""
+    def allocating(self) -> Allocating:
+        """This thread's torch blocks go to its arena until the guard ends."""
+    def produced(self, ns: int) -> None: ...
+    def next_use(self, step: int | None = None) -> None: ...
+    def close(self) -> tuple[int, int, list[tuple[int, int, int]]]:
+        """(allocated, peak, its blocks still live (ptr, bytes, stream))."""
+
+class RegionPin:
+    @property
+    def fresh(self) -> bool:
+        """It was remapped empty since its last pin: recompute it."""
+    def end(self) -> None: ...
+
+class GraphRegion:
+    """A component's graphs on one device."""
+
+    @property
+    def pool(self) -> tuple[int, int]: ...
+    def prepare(self, expected: int | None = None) -> None: ...
+    def acquire(self) -> bool:
+        """Before a replay: False while it is being dropped."""
+    def release(self, stream: int) -> None:
+        """After the replay's launch on `stream`."""
+    @property
+    def dropping(self) -> bool: ...
+    def close(self) -> None: ...
 
 class Allocating:
     """A thread allocating into a request's arena (`Request.allocating`)."""
@@ -313,6 +353,9 @@ class Stats:
     @property
     def make_room(self) -> list[tuple[int, str, int, int, int]]:
         """Each make_room that took bytes: (step, trigger, need, freed, release events waited on)."""
+    @property
+    def outlived(self) -> list[tuple[int, int, int]]:
+        """Its torch blocks still live at its end (ptr, bytes, stream): the request-end audit."""
 
     def json(self) -> str:
         """The record as JSON, field for field (what a Runtime relays)."""

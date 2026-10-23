@@ -7,14 +7,13 @@ use std::ffi::{c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use platform::handles::Owned;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyBufferError, PyException};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use tensorfs::format::Body;
 use varena::layout::Layout;
-use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Memory, Origin, Pass, Pin, Plan, Request, Retained, SetId, SetSpec, Step};
+use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Memory, Origin, Pass, Pin, Plan, RegionKind, Request, Retained, SetId, SetSpec, Step};
 
 use crate::store::PyCheckpoint;
 
@@ -79,15 +78,6 @@ fn release<T: Send>(x: T) {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-/// A descriptor (Unix) or handle (Windows) the caller hands over.
-fn owned(raw: i64) -> Owned {
-    // SAFETY: the caller transfers ownership of an open descriptor or handle.
-    #[cfg(unix)]
-    return unsafe { std::os::fd::FromRawFd::from_raw_fd(raw as i32) };
-    #[cfg(windows)]
-    return unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(raw as isize as *mut c_void) };
 }
 
 // ---------------------------------------------------------------- records
@@ -166,6 +156,9 @@ pub struct PyStats {
     /// Each make_room that took bytes: (step, trigger, need, freed, release events waited on).
     #[pyo3(get)]
     make_room: Vec<(u32, &'static str, u64, u64, u32)>,
+    /// Its torch blocks still live at its end (ptr, bytes, stream): the request-end audit.
+    #[pyo3(get)]
+    outlived: Vec<Outlived>,
 }
 
 impl From<varena::Fills> for PyFills {
@@ -195,6 +188,7 @@ impl From<varena::Stats> for PyStats {
             compute: s.compute,
             leftover: s.leftover,
             make_room: s.make_room.into_iter().map(|m| (m.step, m.trigger, m.need, m.freed, m.waited)).collect(),
+            outlived: s.outlived.into_iter().map(|o| (o.ptr, o.bytes, o.stream)).collect(),
         }
     }
 }
@@ -222,29 +216,6 @@ pub enum PyLevel {
     Ram,
     #[pyo3(name = "GPU")]
     Gpu,
-}
-
-/// TensorD's descriptors for this process's memory: the table and its row lock's own description;
-/// `Memory.open` takes them.
-#[pyclass(name = "Grant", module = "tensorfs.varena", frozen)]
-pub struct PyGrant(Mutex<Option<Grant>>);
-
-#[pymethods]
-impl PyGrant {
-    /// Takes ownership of the table's and the row's descriptors (handles on Windows).
-    #[new]
-    fn new(table: i64, row: i64) -> Self {
-        PyGrant(Mutex::new(Some(Grant { table: owned(table), row: owned(row), limit: None })))
-    }
-
-    /// A standalone engine's grant: `gpu`'s table by name; `limit` caps only this opener's row.
-    #[staticmethod]
-    #[pyo3(signature = (gpu, limit = None))]
-    fn open(py: Python<'_>, gpu: PyGpuId, limit: Option<u64>) -> PyResult<Self> {
-        let id = GpuId { uuid: gpu.uuid, model: gpu.model, memory: gpu.memory };
-        let grant = detached(py, &id.uuid, || Grant::open(&id, limit))?;
-        Ok(PyGrant(Mutex::new(Some(grant))))
-    }
 }
 
 /// The fill a `Fill` names.
@@ -373,18 +344,11 @@ impl PyMemory {
         self.memory.as_ref().unwrap_or_else(|| unreachable!())
     }
 
-    /// `grant`, else `gpu`'s table by name with `limit`; the backend opens first.
-    fn open(py: Python<'_>, grant: Option<PyRef<'_, PyGrant>>, limit: Option<u64>, dl: (i32, i32), backend: impl Send + FnOnce() -> varena::Result<(GpuId, Box<dyn Backend>)>) -> PyResult<Self> {
-        let grant = match grant {
-            Some(g) => Some(lock(&g.0).take().ok_or_else(|| error(py, "", Error::Closed("grant already used".into())))?),
-            None => None,
-        };
+    /// `gpu`'s table by name, this opener's row capped at `limit`; the backend opens first.
+    fn open(py: Python<'_>, limit: Option<u64>, dl: (i32, i32), backend: impl Send + FnOnce() -> varena::Result<(GpuId, Box<dyn Backend>)>) -> PyResult<Self> {
         let (gpu, memory) = detached(py, "", || {
             let (gpu, backend) = backend()?;
-            let grant = match grant {
-                Some(g) => g,
-                None => Grant::open(&gpu, limit)?,
-            };
+            let grant = Grant::open(&gpu, limit)?;
             Ok((gpu.clone(), Memory::open(gpu, Some(grant), backend)?))
         })?;
         let gpu = PyGpuId { uuid: gpu.uuid, model: gpu.model, memory: gpu.memory };
@@ -394,12 +358,12 @@ impl PyMemory {
 
 #[pymethods]
 impl PyMemory {
-    /// CUDA device `ordinal`'s table through TensorD's `grant`, or by name without one
-    /// (standalone, its own row capped at `limit`). Open it before torch initializes CUDA.
+    /// CUDA device `ordinal`'s table by name, this process's row capped at `limit`. Open it
+    /// before torch initializes CUDA.
     #[staticmethod]
-    #[pyo3(signature = (ordinal, grant = None, limit = None))]
-    fn cuda(py: Python<'_>, ordinal: i32, grant: Option<PyRef<'_, PyGrant>>, limit: Option<u64>) -> PyResult<Self> {
-        let memory = PyMemory::open(py, grant, limit, (KDL_CUDA, ordinal), || {
+    #[pyo3(signature = (ordinal, limit = None))]
+    fn cuda(py: Python<'_>, ordinal: i32, limit: Option<u64>) -> PyResult<Self> {
+        let memory = PyMemory::open(py, limit, (KDL_CUDA, ordinal), || {
             let backend = CudaBackend::open(ordinal)?;
             Ok((backend.gpu()?, Box::new(backend) as Box<dyn Backend>))
         })?;
@@ -409,9 +373,50 @@ impl PyMemory {
     }
 
     /// varena's torch figures here: (allocated, mapped, peak, per open request (id, allocated,
-    /// peak)). torch's own memory statistics don't see a pluggable allocator.
+    /// peak), per pool (pool, mapped, allocated)). torch's own memory statistics don't see a
+    /// pluggable allocator.
     fn torch_stats(&self, py: Python<'_>) -> PyResult<TorchFigures> {
         detached(py, &self.gpu.uuid, || Ok(torch_stats(self.memory())))
+    }
+
+    /// An event on `stream` after torch pool `pool`'s use there (a replay and its readers): the
+    /// pool's chunks leave, once released, only after every fence completed.
+    fn fence_pool(&self, py: Python<'_>, pool: (u64, u64), stream: usize) -> PyResult<()> {
+        detached(py, &self.gpu.uuid, || self.memory().pool_fence(varena::PoolId(pool.0, pool.1), stream))
+    }
+
+    /// A long-lived intermediate's region (§6): `kind` is kv, latent, conditioning, derived or
+    /// workspace; `sets` the components it serves; `spill` false drops it for recompute on revoke.
+    #[pyo3(signature = (owner, kind, sets = Vec::new(), spill = true))]
+    fn region(&self, py: Python<'_>, owner: &str, kind: &str, sets: Vec<u32>, spill: bool) -> PyResult<PyRegion> {
+        let kind = match kind {
+            "kv" => RegionKind::Kv,
+            "latent" => RegionKind::Latent,
+            "conditioning" => RegionKind::Conditioning,
+            "derived" => RegionKind::Derived,
+            "workspace" => RegionKind::Workspace,
+            other => return Err(error(py, &self.gpu.uuid, Error::Invalid(format!("no region kind {other:?}")))),
+        };
+        let sets: Vec<SetId> = sets.into_iter().map(SetId).collect();
+        let region = detached(py, &self.gpu.uuid, || self.memory().region(owner, kind, &sets, spill))?;
+        Ok(PyRegion { region: Mutex::new(Some(region)), gpu: self.gpu.uuid.clone() })
+    }
+
+    /// A component's graph region on this device (§5): every graph of it captures into `pool`,
+    /// the device's one capture pool token.
+    #[pyo3(signature = (pool, sets = Vec::new(), retained = Vec::new()))]
+    fn graph_region(&self, py: Python<'_>, pool: (u64, u64), sets: Vec<u32>, retained: Vec<u32>) -> PyResult<PyGraphRegion> {
+        let (sets, retained): (Vec<SetId>, Vec<SetId>) = (sets.into_iter().map(SetId).collect(), retained.into_iter().map(SetId).collect());
+        let graph = detached(py, &self.gpu.uuid, || self.memory().graph_region(&sets, &retained, varena::PoolId(pool.0, pool.1)))?;
+        Ok(PyGraphRegion { graph: Mutex::new(Some(graph)), gpu: self.gpu.uuid.clone() })
+    }
+
+    /// The room a cut sizes from at plan step `step` (the request's cursor when None): (free,
+    /// cold, warm, granularity, floor). Lock-free: read with the GIL held.
+    #[pyo3(signature = (step = None))]
+    fn room(&self, step: Option<u32>) -> (u64, u64, u64, u64, u64) {
+        let r = self.memory().room(step);
+        (r.free, r.cold, r.warm, r.granularity, r.floor)
     }
 
     /// Before a capture into torch pool `pool` (a `graph_pool_handle()`) begins: maps `expected`
@@ -428,12 +433,19 @@ impl PyMemory {
         detached(py, &self.gpu.uuid, || lease(self.memory(), ns, &self.gpu.uuid))
     }
 
+    /// Serves torch's allocations here, before any is made: from the chunks this Memory leases
+    /// (`leased`, after `lease` returned None), else standalone from the device's own free
+    /// bytes less twice the driver headroom (no compatible manager, or none asked for).
+    fn serve_torch(&self, py: Python<'_>, leased: bool) -> PyResult<()> {
+        detached(py, &self.gpu.uuid, || serve_torch(self.memory(), leased))
+    }
+
     /// Host pages of `gpu.memory` bytes (CPU, MPS), on the table `gpu.uuid` names.
     #[staticmethod]
-    #[pyo3(signature = (gpu, grant = None, limit = None))]
-    fn host(py: Python<'_>, gpu: PyGpuId, grant: Option<PyRef<'_, PyGrant>>, limit: Option<u64>) -> PyResult<Self> {
+    #[pyo3(signature = (gpu, limit = None))]
+    fn host(py: Python<'_>, gpu: PyGpuId, limit: Option<u64>) -> PyResult<Self> {
         let id = GpuId { uuid: gpu.uuid, model: gpu.model, memory: gpu.memory };
-        PyMemory::open(py, grant, limit, (KDL_CPU, 0), || Ok((id.clone(), Box::new(HostBackend::new(id.memory)) as Box<dyn Backend>)))
+        PyMemory::open(py, limit, (KDL_CPU, 0), || Ok((id.clone(), Box::new(HostBackend::new(id.memory)) as Box<dyn Backend>)))
     }
 
     /// Registers `set` and brings it to `level`; returns its id.
@@ -571,6 +583,16 @@ impl Drop for PyRetained {
 
 // ---------------------------------------------------------------- requests and passes
 
+fn serve_torch(memory: &Memory, leased: bool) -> varena::Result<()> {
+    #[cfg(unix)]
+    if leased {
+        return memory.serve_leased_torch().map(drop);
+    }
+    #[cfg(not(unix))]
+    let _ = leased;
+    memory.serve_standalone_torch().map(drop)
+}
+
 #[cfg(unix)]
 fn lease(memory: &Memory, ns: u32, uuid: &str) -> varena::Result<Option<(String, String)>> {
     let Some(stream) = varena::lease::connect(ns, uuid)? else {
@@ -647,6 +669,128 @@ impl PyRequest {
                 Err(error(py, &self.gpu, Error::Invalid("a call is still running in the request".into())))
             }
         }
+    }
+}
+
+/// A long-lived intermediate (`Memory.region`); `close` (or its drop) releases its arena.
+#[pyclass(name = "Region", module = "tensorfs.varena", frozen)]
+pub struct PyRegion {
+    region: Mutex<Option<varena::Region>>,
+    gpu: String,
+}
+
+impl PyRegion {
+    fn with<T: Send>(&self, py: Python<'_>, f: impl Send + FnOnce(&varena::Region) -> varena::Result<T>) -> PyResult<T> {
+        let guard = lock(&self.region);
+        let region = guard.as_ref().ok_or_else(|| error(py, &self.gpu, Error::Closed("region closed".into())))?;
+        detached(py, &self.gpu, || f(region))
+    }
+}
+
+#[pymethods]
+impl PyRegion {
+    /// Pins it while in use; the pin's `fresh` says it was remapped empty (recompute it).
+    fn pin(&self, py: Python<'_>) -> PyResult<PyRegionPin> {
+        let pin = self.with(py, |r| r.pin())?;
+        Ok(PyRegionPin { fresh: pin.fresh(), pin: Mutex::new(Some(pin)) })
+    }
+
+    /// This thread's torch blocks go to the region's own arena until the guard ends.
+    fn allocating(&self, py: Python<'_>) -> PyResult<PyAllocating> {
+        Ok(PyAllocating(Mutex::new(Some(self.with(py, |r| Ok(r.allocating()))?))))
+    }
+
+    /// Its production time in nanoseconds, for the spill-versus-drop choice.
+    fn produced(&self, py: Python<'_>, ns: u64) -> PyResult<()> {
+        self.with(py, |r| {
+            r.produced(ns);
+            Ok(())
+        })
+    }
+
+    /// The plan step of its next use; None: no use declared.
+    #[pyo3(signature = (step = None))]
+    fn next_use(&self, py: Python<'_>, step: Option<u32>) -> PyResult<()> {
+        self.with(py, |r| {
+            r.next_use(step);
+            Ok(())
+        })
+    }
+
+    /// Releases it: (allocated, peak, its blocks still live (ptr, bytes, stream)).
+    fn close(&self, py: Python<'_>) -> PyResult<(u64, u64, Vec<Outlived>)> {
+        let Some(region) = lock(&self.region).take() else { return Ok((0, 0, Vec::new())) };
+        detached(py, &self.gpu, || {
+            let e = region.close();
+            Ok((e.allocated, e.peak, e.outlived.into_iter().map(|o| (o.ptr, o.bytes, o.stream)).collect()))
+        })
+    }
+}
+
+/// A region pinned for use (`Region.pin`); `end` unpins it.
+#[pyclass(name = "RegionPin", module = "tensorfs.varena", frozen)]
+pub struct PyRegionPin {
+    pin: Mutex<Option<varena::RegionPin>>,
+    /// It was remapped empty since its last pin: the owner recomputes it.
+    #[pyo3(get)]
+    fresh: bool,
+}
+
+#[pymethods]
+impl PyRegionPin {
+    fn end(&self) {
+        lock(&self.pin).take();
+    }
+}
+
+/// A component's graphs on one device (`Memory.graph_region`).
+#[pyclass(name = "GraphRegion", module = "tensorfs.varena", frozen)]
+pub struct PyGraphRegion {
+    graph: Mutex<Option<varena::GraphRegion>>,
+    gpu: String,
+}
+
+impl PyGraphRegion {
+    fn with<T: Send>(&self, py: Python<'_>, f: impl Send + FnOnce(&varena::GraphRegion) -> varena::Result<T>) -> PyResult<T> {
+        let guard = lock(&self.graph);
+        let graph = guard.as_ref().ok_or_else(|| error(py, &self.gpu, Error::Closed("graph region closed".into())))?;
+        detached(py, &self.gpu, || f(graph))
+    }
+}
+
+#[pymethods]
+impl PyGraphRegion {
+    /// The capture pool token its graphs capture into.
+    #[getter]
+    fn pool(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        self.with(py, |g| Ok((g.pool().0, g.pool().1)))
+    }
+
+    /// Maps `expected` bytes into the pool before capture begins (a shape's first capture: None).
+    #[pyo3(signature = (expected = None))]
+    fn prepare(&self, py: Python<'_>, expected: Option<u64>) -> PyResult<()> {
+        self.with(py, |g| g.prepare(expected))
+    }
+
+    /// Before each replay: False while it is being dropped (run eager, recapture off-path).
+    fn acquire(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, |g| Ok(g.acquire()))
+    }
+
+    /// After the replay's launch on `stream`: an event recorded there releases it.
+    fn release(&self, py: Python<'_>, stream: usize) -> PyResult<()> {
+        self.with(py, |g| g.release(stream))
+    }
+
+    #[getter]
+    fn dropping(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, |g| Ok(g.dropping()))
+    }
+
+    /// Drops its graphs' pins and its use of the pool.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let Some(graph) = lock(&self.graph).take() else { return Ok(()) };
+        done(py, &self.gpu, || graph.close())
     }
 }
 
@@ -906,11 +1050,14 @@ impl PyWindow {
 
 /// varena's torch allocator figures: (allocated, mapped, peak, per open request (id, allocated,
 /// peak)).
-type TorchFigures = (u64, u64, u64, Vec<(String, u64, u64)>);
+/// A torch block still live at its arena's end: (ptr, bytes, stream).
+type Outlived = (u64, u64, usize);
+
+type TorchFigures = (u64, u64, u64, Vec<(String, u64, u64)>, Vec<((u64, u64), u64, u64)>);
 
 fn torch_stats(memory: &Memory) -> TorchFigures {
     let s = memory.torch_stats();
-    (s.allocated, s.mapped, s.peak, s.requests)
+    (s.allocated, s.mapped, s.peak, s.requests, s.pools.into_iter().map(|(p, m, a)| ((p.0, p.1), m, a)).collect())
 }
 
 // ---------------------------------------------------------------- the module
@@ -920,7 +1067,6 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let m = PyModule::new(py, "varena")?;
     m.add_class::<PyGpuId>()?;
-    m.add_class::<PyGrant>()?;
     m.add_class::<PyFill>()?;
     m.add_class::<PyLevel>()?;
     m.add_class::<PyPart>()?;
@@ -928,6 +1074,9 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMemory>()?;
     m.add_class::<PyRequest>()?;
     m.add_class::<PyAllocating>()?;
+    m.add_class::<PyRegion>()?;
+    m.add_class::<PyRegionPin>()?;
+    m.add_class::<PyGraphRegion>()?;
     m.add_class::<PyPass>()?;
     m.add_class::<PyPin>()?;
     m.add_class::<PyRetained>()?;
