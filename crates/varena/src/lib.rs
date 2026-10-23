@@ -7,10 +7,13 @@
 //! page cache: TensorFS's `io` moves every byte, through its staging.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
+pub mod arena;
 pub mod backend;
 pub mod cuda;
 pub mod custody;
 pub mod decide;
+#[cfg(unix)]
+pub mod derived;
 #[cfg(feature = "faults")]
 pub mod faults;
 pub mod layout;
