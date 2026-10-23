@@ -147,7 +147,7 @@ impl Watch {
 
 fn watching_gpu(uuid: &str, manager: &Manager, tenants: &Tenants, watch: std::sync::Weak<Watch>, log: &MemoryLog) {
     let device = platform::gpu::Device::open(uuid).map_err(|error| error.to_string());
-    let (mut known, mut stale) = (None::<std::collections::BTreeSet<u32>>, false);
+    let (mut known, mut stale, mut drift) = (None::<std::collections::BTreeSet<u32>>, false, None);
     while let Some(watch) = watch.upgrade() {
         {
             let mut epoch = watch.epoch.lock().unwrap_or_else(|e| e.into_inner());
@@ -172,6 +172,7 @@ fn watching_gpu(uuid: &str, manager: &Manager, tenants: &Tenants, watch: std::sy
         stale = processes.is_err();
         let (foreign, new_pid) = match &processes {
             Ok(processes) => {
+                drift = books(processes, &manager.holdings(), drift, uuid, log);
                 let ours: std::collections::BTreeSet<u32> = tenants.book().keys().copied().chain([std::process::id()]).collect();
                 let others: BTreeMap<u32, u64> = processes.iter().filter(|(pid, _)| !ours.contains(pid)).map(|(pid, bytes)| (*pid, *bytes)).collect();
                 let seen = known.get_or_insert_with(|| others.keys().copied().collect());
@@ -336,6 +337,24 @@ impl Hosting for Peers {
             Err(error) => tracing::warn!("memory: a lease record unwritten: {error}"),
         }
     }
+}
+
+/// The books check (design varena-leases R2-6): NVML charges each chunk to its creator, so
+/// TensorD's own bytes are what its manager created plus its context. A gap past one chunk is a
+/// memory-log line when it starts, and again whenever it moves by another chunk; the gap is
+/// returned for the next reading.
+fn books(processes: &BTreeMap<u32, u64>, held: &varena::lease::Holdings, was: Option<i128>, uuid: &str, log: &MemoryLog) -> Option<i128> {
+    let own = processes.get(&std::process::id()).copied().unwrap_or(0);
+    let gap = i128::from(own) - i128::from(held.created + held.context);
+    let chunk = i128::from(varena::lease::CHUNK);
+    if gap.abs() <= chunk {
+        return None;
+    }
+    if was.is_none_or(|was| (gap - was).abs() > chunk) {
+        log.note(serde_json::json!({"event": "books_drift", "gpu": uuid, "own_bytes": own, "created_bytes": held.created, "context_bytes": held.context, "gap_bytes": gap}));
+        return Some(gap);
+    }
+    was
 }
 
 /// GPU `uuid`'s chunks, opened in TensorD's own context at its manager's first ask and released
@@ -742,5 +761,29 @@ impl MemoryLog {
         if let Err(error) = written {
             tracing::warn!("memory: {event} ({}: {error})", path.display());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_books_check_logs_a_gap_past_a_chunk_when_it_starts_and_when_it_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = MemoryLog::at(dir.path().to_path_buf());
+        let lines = || fs::read_to_string(dir.path().join("memory.log")).unwrap_or_default().lines().filter(|l| l.contains("books_drift")).count();
+        let chunk = varena::lease::CHUNK;
+        let held = varena::lease::Holdings { created: 10 * chunk, context: 100 << 20, ..Default::default() };
+        let own = |bytes: u64| BTreeMap::from([(std::process::id(), bytes)]);
+        let balanced = held.created + held.context;
+        assert_eq!(books(&own(balanced + chunk / 2), &held, None, "gpu", &log), None, "within a chunk");
+        let gap = books(&own(balanced + 3 * chunk), &held, None, "gpu", &log);
+        assert_eq!((gap, lines()), (Some(i128::from(3 * chunk)), 1), "a gap starts");
+        let still = books(&own(balanced + 3 * chunk + chunk / 2), &held, gap, "gpu", &log);
+        assert_eq!((still, lines()), (gap, 1), "the same gap is not written again");
+        let moved = books(&own(balanced + 5 * chunk), &held, still, "gpu", &log);
+        assert_eq!((moved, lines()), (Some(i128::from(5 * chunk)), 2), "it moved by another chunk");
+        assert_eq!(books(&own(balanced), &held, moved, "gpu", &log), None, "balanced again");
     }
 }
