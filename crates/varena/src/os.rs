@@ -1,16 +1,11 @@
-//! The OS mechanisms under the ledger and the services, as cozy-platform's `memory` seams give
-//! them on every OS (a named shared table, range locks that die with their holder, a local
-//! event, the GPU's named wake, local services whose bound name is their lock, host pages);
-//! which peers are served; and the typed messages varena sends over a service stream.
+//! The OS mechanisms under the lease socket, as cozy-platform's `memory` seams give them on every
+//! OS (local services whose bound name is their lock, mapped and sealed pages); which peers are
+//! served; and the typed messages varena sends over a service stream.
 
-use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::sync::atomic::AtomicBool;
-
-use parking_lot::Mutex;
 
 pub(crate) use platform::handles::Owned;
-pub(crate) use platform::memory::{euid, held, lock, own, resize, share, size, stalled, unlock, Endpoint, Listener, Map, Notifier, Stream};
+pub(crate) use platform::memory::{euid, size, Listener, Map, Stream};
 
 use crate::{Error, Result};
 
@@ -19,9 +14,8 @@ pub(crate) type Message = (Vec<u8>, Option<Owned>);
 
 static NAMESPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Tests only: a process-wide prefix for every table and service name (custody, the wake, the
-/// asks), so a test's never meet a machine's. Set once, before any open; false when
-/// another prefix was set first.
+/// Tests only: a process-wide prefix for every service name (the lease socket), so a test's
+/// never meet a machine's. Set once, before any open; false when another prefix was set first.
 pub fn namespace(prefix: &str) -> bool {
     NAMESPACE.get_or_init(|| prefix.to_string()) == prefix
 }
@@ -36,45 +30,14 @@ pub fn remove_table(gpu: &str) {
     platform::memory::unlink(&named(gpu));
 }
 
-/// The table named `name` for this user, created when absent.
-pub(crate) fn shared(name: &str, _create: bool) -> Result<Owned> {
-    Ok(platform::memory::table(&named(name))?)
-}
-
-pub(crate) fn unlink(name: &str) {
-    platform::memory::unlink(&named(name));
-}
-
-#[allow(dead_code, reason = "Memory left the ledger and custody (hard cut); both go with the lease manager's policy (step 4)")]
-pub(crate) fn tid() -> u32 {
-    platform::memory::thread_id()
-}
-
-/// Peers of these uids are served and served by, beside this process's own: the owners of the
-/// tables it adopted, and the executors its ledger granted.
-static ACCEPTED: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
-
-pub(crate) fn accept_uid(uid: u32) {
-    ACCEPTED.lock().insert(uid);
-}
-
+/// Peers of this user are served and served by.
 fn accepted(uid: u32) -> bool {
-    uid == euid() || ACCEPTED.lock().contains(&uid)
-}
-
-/// The effective uid of `pid`.
-pub(crate) fn uid_of(pid: u32) -> Result<u32> {
-    Ok(platform::memory::uid_of(pid)?)
+    uid == euid()
 }
 
 /// `len` bytes of `f` from its start.
 pub(crate) fn map(f: &Owned, len: usize, write: bool) -> Result<Map> {
     Ok(platform::memory::map(f, 0, len, write)?)
-}
-
-/// A new description of the same file (read-only unless `write`): its locks are its own.
-pub(crate) fn reopen(f: &Owned, write: bool) -> Result<Owned> {
-    Ok(platform::memory::reopen(f, write)?)
 }
 
 /// A shared page (a lease table) no holder can resize under another's mapping: a memfd sealed
@@ -87,49 +50,9 @@ pub(crate) fn sealed_page(len: u64) -> Result<Owned> {
     Ok(page)
 }
 
-pub(crate) fn linked(f: &Owned) -> Result<bool> {
-    Ok(platform::memory::linked(f)?)
-}
-
-/// Binds the GPU's wake in user `ns`'s namespace; `None` while another process holds it.
-pub(crate) fn wake_bind(ns: u32, name: &str) -> Result<Option<Endpoint>> {
-    Ok(Endpoint::bind(ns, &named(name))?)
-}
-
-pub(crate) fn wake_sender() -> Result<Notifier> {
-    Ok(Notifier::new()?)
-}
-
-/// Signals the GPU's wake in user `ns`'s namespace.
-pub(crate) fn wake(sender: &Notifier, ns: u32, name: &str) {
-    sender.notify(ns, &named(name));
-}
-
-/// Clears every wake so far; true when one came from an accepted user.
-pub(crate) fn wake_clear(endpoint: &Endpoint) -> bool {
-    endpoint.clear(accepted)
-}
-
-/// Blocks until an accepted user wakes the endpoint, clearing every wake so far.
-pub(crate) fn wake_await(endpoint: &Endpoint) -> Result<()> {
-    Ok(endpoint.wait(accepted)?)
-}
-
 /// Binds service `name` in user `ns`'s namespace: `None` while another process holds it.
 pub(crate) fn listen(ns: u32, name: &str) -> Result<Option<Listener>> {
     Ok(platform::memory::listen(ns, &named(name))?)
-}
-
-/// Every connection the service accepts, for its life.
-pub(crate) fn incoming(listener: Listener) -> impl Iterator<Item = Stream> {
-    std::iter::repeat_with(move || platform::memory::accept(&listener)).filter_map(|c| c.ok())
-}
-
-/// Serves every connection at once until `stop`: each one's message answered with `answer`'s
-/// bytes. Peers not accepted are dropped.
-#[allow(dead_code, reason = "Memory left the ledger and custody (hard cut); both go with the lease manager's policy (step 4)")]
-pub(crate) fn serve_all(listener: Listener, stop: &AtomicBool, answer: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static) {
-    platform::memory::serve_all(listener, stop, accepted, answer);
 }
 
 /// Connects to service `name` in user `ns`'s namespace; `None` when nobody serves it. A
@@ -153,10 +76,6 @@ pub(crate) fn peer(stream: &Stream) -> Result<u32> {
 /// A page (a lease table, a host chunk) for another process to map read and write, never resize.
 pub(crate) fn lend(page: &Owned) -> Result<Owned> {
     Ok(platform::memory::lend(page)?)
-}
-
-pub(crate) fn dup(h: &Owned) -> Result<Owned> {
-    h.try_clone().map_err(|e| Error::io("dup", e))
 }
 
 pub(crate) fn send(stream: &Stream, (bytes, handle): &Message) -> Result<()> {
@@ -201,14 +120,3 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T> {
     serde_json::from_slice(b).map_err(|e| Error::Invalid(format!("decode: {e}")))
 }
 
-/// Sends `m` with `handle` and reads the typed reply.
-pub(crate) fn call<T: serde::Serialize, R: serde::de::DeserializeOwned>(stream: &Stream, m: &T, handle: Option<Owned>) -> Result<(R, Option<Owned>)> {
-    send(stream, &(encode(m)?, handle))?;
-    let (bytes, handle) = recv(stream)?.ok_or_else(|| Error::Closed("the service".into()))?;
-    Ok((decode(&bytes)?, handle))
-}
-
-/// `f` is closing: the locks it holds go with it (on macOS, lock files held for it).
-pub(crate) fn closing(f: &Owned) {
-    platform::memory::closing(f)
-}
