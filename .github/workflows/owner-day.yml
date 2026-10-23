@@ -87,6 +87,9 @@ jobs:
           echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
       # Both native components run in Debian CI workers as well as on this Ubuntu host.
       # Match dev-build's manylinux floor for the extension and the bundled tfs binary.
+      - name: varena's torch allocator shim
+        if: inputs.runtime_ref != ''
+        run: docker run --rm -v "$PWD:/w" -w /w/.cozy-src/crates/tensorfs-py quay.io/pypa/manylinux_2_28_x86_64 shim/build.sh
       - name: The matching TensorFS wheel
         if: inputs.runtime_ref != ''
         uses: PyO3/maturin-action@v1

@@ -146,6 +146,9 @@ jobs:
           python-version: "3.11"
       - if: inputs.dev
         run: scripts/dev-version.sh
+      # varena's torch allocator shim, against torch's C++ ABI (glibc 2.28 like torch): in the wheel's package.
+      - if: runner.os == 'Linux'
+        run: docker run --rm -v "$GITHUB_WORKSPACE:/w" -w /w/crates/tensorfs-py "quay.io/pypa/manylinux_2_28_$(uname -m)" shim/build.sh
       # `tfs` ships in the wheel's data scripts beside the module. On Linux it is built INSIDE the
       # manylinux container, so its glibc floor matches the extension's (tfs-051).
       - if: runner.os == 'Linux'

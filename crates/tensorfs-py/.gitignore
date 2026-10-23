@@ -18,3 +18,4 @@ wheel-data/scripts/*
 .task-owner*.md
 .worktree-owner*.md
 .owner-agent/
+python/tensorfs/_varena_torch.json

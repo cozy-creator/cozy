@@ -1,0 +1,123 @@
+// varena's agent as torch's CUDA allocator (design/varena-leases.md §11, varena-slim step 6).
+//
+// torch's pluggable allocator calls these hooks; each forwards to the agent's C ABI in the
+// TensorFS extension, whose function table `varena_torch_bind` receives. The one part of TensorFS
+// built against torch's C++ ABI: a refusal must be thrown as c10::OutOfMemoryError (torch never
+// checks a NULL from the allocator), and graph capture hands over a std::function filter. It
+// includes no CUDA header: a stream is only a handle here.
+#include <c10/util/Exception.h>
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+using Stream = struct CUstream_st*;
+using MempoolId = std::pair<unsigned long long, unsigned long long>;  // c10::cuda::MempoolId_t
+using Filter = std::function<bool(Stream)>;
+
+namespace {
+
+// The agent's C ABI (tensorfs-py src/agent.rs). `alloc` returns 0 and writes its reason on a
+// refusal; none of them unwinds.
+struct Agent {
+    uint64_t (*alloc)(uint64_t bytes, int device, uintptr_t stream, int routed, uint64_t pool_a,
+                      uint64_t pool_b, char* why, size_t why_len);
+    void (*free)(uint64_t ptr, uint64_t bytes, int device, uintptr_t stream);
+    void (*record_stream)(uint64_t ptr, uintptr_t stream);
+    void (*pool_begin)(int device, uint64_t pool_a, uint64_t pool_b);
+    void (*pool_end)(int device, uint64_t pool_a, uint64_t pool_b);
+    void (*pool_release)(int device, uint64_t pool_a, uint64_t pool_b);
+};
+
+Agent agent;
+
+// A capture routing to a pool: torch's filter, kept until end_allocate_to_pool (the graph it
+// captures may be destroyed after that).
+struct Route {
+    int device;
+    MempoolId pool;
+    Filter filter;
+};
+
+std::mutex routes_mutex;
+std::vector<Route> routes;
+std::atomic<size_t> routing{0};  // routes.size(), read without the mutex on every allocation
+
+const Stream per_thread = reinterpret_cast<Stream>(0x2);  // cudaStreamPerThread
+
+[[noreturn]] void refuse(const char* why) {
+    TORCH_CHECK_WITH(OutOfMemoryError, false, why);
+    __builtin_unreachable();
+}
+
+}  // namespace
+
+extern "C" {
+
+void varena_torch_bind(const Agent* functions) { agent = *functions; }
+
+void* varena_torch_malloc(size_t bytes, int device, Stream stream) {
+    if (stream == per_thread) {
+        refuse("varena: cudaStreamPerThread (0x2) names another stream on every thread; allocate on a stream of its own");
+    }
+    int routed = 0;
+    MempoolId pool{0, 0};
+    if (routing.load(std::memory_order_acquire) != 0) {
+        std::lock_guard<std::mutex> lock(routes_mutex);
+        for (const Route& route : routes) {
+            if (route.device == device && route.filter(stream)) {
+                routed = 1;
+                pool = route.pool;
+                break;
+            }
+        }
+    }
+    char why[512] = {0};
+    uint64_t ptr = agent.alloc(bytes, device, reinterpret_cast<uintptr_t>(stream), routed, pool.first, pool.second, why, sizeof why - 1);
+    if (ptr == 0) {
+        refuse(why[0] != 0 ? why : "varena: refused");
+    }
+    return reinterpret_cast<void*>(ptr);
+}
+
+void varena_torch_free(void* ptr, size_t bytes, int device, Stream stream) {
+    agent.free(reinterpret_cast<uint64_t>(ptr), bytes, device, reinterpret_cast<uintptr_t>(stream));
+}
+
+void varena_torch_record_stream(void* ptr, Stream stream) {
+    if (stream == per_thread) {
+        refuse("varena: cudaStreamPerThread (0x2) names another stream on every thread; record a stream of its own");
+    }
+    agent.record_stream(reinterpret_cast<uint64_t>(ptr), reinterpret_cast<uintptr_t>(stream));
+}
+
+// Called by capture_begin on the capturing thread, before the capture starts.
+void varena_torch_begin_pool(int device, MempoolId pool, Filter filter) {
+    {
+        std::lock_guard<std::mutex> lock(routes_mutex);
+        routes.push_back({device, pool, std::move(filter)});
+        routing.store(routes.size(), std::memory_order_release);
+    }
+    agent.pool_begin(device, pool.first, pool.second);
+}
+
+void varena_torch_end_pool(int device, MempoolId pool) {
+    {
+        std::lock_guard<std::mutex> lock(routes_mutex);
+        for (auto route = routes.begin(); route != routes.end(); ++route) {
+            if (route->device == device && route->pool == pool) {
+                routes.erase(route);
+                break;
+            }
+        }
+        routing.store(routes.size(), std::memory_order_release);
+    }
+    agent.pool_end(device, pool.first, pool.second);
+}
+
+void varena_torch_release_pool(int device, MempoolId pool) { agent.pool_release(device, pool.first, pool.second); }
+
+}  // extern "C"

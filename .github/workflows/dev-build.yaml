@@ -159,6 +159,10 @@ jobs:
           path: crates/tensorfs/kernels/aot/
           if-no-files-found: error
           retention-days: 7
+      # varena's torch allocator shim, against torch's C++ ABI (glibc 2.28 like torch): in the wheel's package.
+      - name: Build varena's torch allocator shim
+        if: contains(inputs.build, 'tensorfs')
+        run: docker run --rm -v "$PWD:/w" -w /w/crates/tensorfs-py quay.io/pypa/manylinux_2_28_x86_64 shim/build.sh
       - name: Build the TensorFS wheel
         if: contains(inputs.build, 'tensorfs')
         uses: PyO3/maturin-action@v1
