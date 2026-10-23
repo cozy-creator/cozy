@@ -243,7 +243,7 @@ impl Backend for HostBackend {
     fn lend(&self, page: &Physical) -> Result<Owned> {
         let pages = self.pages.lock();
         let (handle, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
-        handle.try_clone().map_err(|e| Error::io("lend a host page", e))
+        memory::lend(handle).map_err(page_err)
     }
 
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> {
