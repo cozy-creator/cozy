@@ -99,6 +99,10 @@ class Rungs:
     def __init__(self, card: Card, frees: int = 0, lowers: int = 0, step: int = 0) -> None:
         self.card, self.frees, self.lowers, self.step = card, frees, lowers, step
         self.made = self.lowered = 0
+        self.notes: list[tuple[int, str]] = []
+
+    def noted(self, rung: int, why: str, nbytes: int) -> None:
+        self.notes.append((rung, why))
 
     def free(self, device: torch.device, need: int) -> bool:
         self.made += 1
@@ -716,8 +720,54 @@ def launches() -> None:
         check("another launch error is its own", "illegal" in str(exc) and memo.retries == 1, exc)
 
 
+class Fault(TorchDispatchMode):
+    """A device whose next matmul fails with `text`, a library's status as torch raises it."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text, self.left = text, 1
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
+        if func.overloadpacket.__name__ == "mm" and self.left:
+            self.left -= 1
+            raise RuntimeError(self.text)
+        return func(*args, **(kwargs or {}))
+
+
+def device_faults() -> None:
+    """cr-215: a cuBLAS or cuDNN status that is a device fault (EXECUTION_FAILED, INTERNAL_ERROR)
+    fails at once with its own text: no room made, no replay. An allocation status (ALLOC_FAILED)
+    runs again with room made, and the retry's note names the op and the failure."""
+    a, b = torch.randn(8, 8), torch.randn(8, 8)
+    for status in ("CUBLAS_STATUS_EXECUTION_FAILED", "CUDNN_STATUS_INTERNAL_ERROR"):
+        memo, _, room = fresh(1 << 60, frees=1 << 20)
+        try:
+            with Fault(f"CUDA error: {status} when calling `cublasGemmEx(...)`"), cuts.caught():
+                torch.mm(a, b)
+            check(f"{status} fails at once", False)
+        except RuntimeError as exc:
+            check(
+                f"{status} fails at once with its own text, no room made, no replay",
+                status in str(exc) and memo.retries == 0 and room.made == 0,
+                (exc, memo.retries, room.made),
+            )
+    memo, _, room = fresh(1 << 60, frees=1 << 20)
+    with Fault("CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`"), cuts.caught():
+        out = torch.mm(a, b)
+    check(
+        "an ALLOC_FAILED runs again with room made",
+        same(out, a @ b) and memo.retries == 1 and room.made == 1,
+        (memo.retries, room.made),
+    )
+    check(
+        "the retry's note names the op and the failure",
+        any("aten.mm" in why and "RuntimeError" in why and "ALLOC_FAILED" in why for _, why in room.notes),
+        room.notes,
+    )
+
+
 def main() -> int:
-    for test in (ffn_cut, relax, plans, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, launches, lattice):
+    for test in (ffn_cut, relax, plans, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, launches, lattice, device_faults):
         test()
     print(f"{sum(results)}/{len(results)} passed", flush=True)
     return 0 if all(results) else 1

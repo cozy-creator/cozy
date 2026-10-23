@@ -253,10 +253,11 @@ def _note(name: str, size: int) -> None:
 # ------------------------------------------------------------------------ out of memory
 
 
-def short(exc: BaseException, first: bool = False) -> int | None:
-    """The bytes a device allocation failure asked for (0: not said); None for any other. A
-    `first` failure counts a cuBLAS or cuDNN status too (its own allocation may be behind it): it
-    runs once more with room made, and a second is the library's own."""
+def short(exc: BaseException) -> int | None:
+    """The bytes a device allocation failure asked for (0: not said); None for any other. Of a
+    cuBLAS or cuDNN status, only an `_ALLOC_FAILED` is one: any other (EXECUTION_FAILED,
+    INTERNAL_ERROR) is a device fault, which fails at once with its own text, with no room made
+    and no replay (cr-215: its replay raised a sticky unknown error and lost the status)."""
     if isinstance(exc, torch.OutOfMemoryError):
         found = _ALLOCATE.search(str(exc))
         return int(float(found[1]) * _UNITS[found[2]]) if found else 0
@@ -264,8 +265,14 @@ def short(exc: BaseException, first: bool = False) -> int | None:
     if isinstance(exc, torch.AcceleratorError):
         return 0 if getattr(exc, "error_code", None) == 2 or "out of memory" in text else None
     failed = any(mark in text for mark in _REFUSED)
-    failed |= first and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
     return 0 if isinstance(exc, RuntimeError) and failed else None
+
+
+def _retried(exc: BaseException, op: str) -> None:
+    """The failure a retry answers, in the request's record before its frames go: every retry
+    names what it retried."""
+    text = next(iter(str(exc).strip().splitlines()), "")[:200]
+    _served.rungs.noted(0, f"retried {op}: {type(exc).__name__}: {text}", 0)
 
 
 def _clear(exc: BaseException) -> None:
@@ -326,6 +333,7 @@ def _settle(
                 need = short(exc)
                 if need is None or _capturing() or scope and size <= finest and not again:
                     raise
+                _retried(exc, name)
                 _clear(exc)
                 if not rungs.free(device, need + SLACK) and again:
                     again = False  # the same size again, with no room made, fails the same way
@@ -455,10 +463,11 @@ def run(site: Site, forward: Callable[..., object], args: Args, kwargs: Kwargs) 
             try:
                 out = forward(*args, **kwargs)
             except Exception as exc:  # out of memory where no op shows it (a kernel's launch)
-                need, drawn = short(exc, True), {id(g) for g, _ in states}
+                need, drawn = short(exc), {id(g) for g, _ in states}
                 changed = journal.wrote or set(journal.generators) - drawn
                 if need is None or _capturing() or changed or before != _attributes(site.block):
                     raise
+                _retried(exc, f"block {site.key}")
                 _clear(exc)
                 memo.retries += 1
                 for generator, state in states:
@@ -486,9 +495,10 @@ def _bare(
             _local.layer = None if pop else layer
             return forward(*args, **kwargs)
     except Exception as exc:
-        need = short(exc, True)
+        need = short(exc)
         if need is None or _capturing():
             raise
+        _retried(exc, f"block {site.key}")
         _clear(exc)
     finally:
         _local.layer = layer
@@ -654,9 +664,10 @@ class Layer(TorchDispatchMode):
         try:
             return func(*args, **kwargs)
         except Exception as exc:
-            need, device = short(exc, True), _device(args, kwargs)
+            need, device = short(exc), _device(args, kwargs)
             if need is None or device is None or _capturing():
                 raise
+            _retried(exc, name)
             _clear(exc)
         memo.retries += 1
         rungs.free(device, need + SLACK)
@@ -672,8 +683,9 @@ class Layer(TorchDispatchMode):
                 try:
                     return again(0)
                 except Exception as exc:
-                    if short(exc, True) is None:
+                    if short(exc) is None:
                         raise
+                    _retried(exc, name)
                     _clear(exc)
             for generator, state in states:
                 generator.set_state(state)
