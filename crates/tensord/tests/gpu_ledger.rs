@@ -454,6 +454,58 @@ fn inner_an_idle_executor_that_answers_asks_and_frees_nothing_is_ended() {
     assert_eq!(*ended.lock().unwrap(), [idle.pid], "the idle one ends; the running one is left");
 }
 
+/// cl-647: ending a refusing executor waits for a reading (its exit's, as the pool's retire
+/// does), so it must not run on the watch that answers readings. After it, the next placement's
+/// reading is answered. On candidate 73aa5617e the Anima run placed after the idle Klein
+/// executor was ended sat 20 min in `preparing`, every reading on the card unanswered.
+#[test]
+fn ending_a_refuser_leaves_the_ledger_answering_readings() {
+    under_fake_nvml("inner_ending_a_refuser_leaves_the_ledger_answering_readings", 8 * GIB, false);
+}
+
+#[test]
+#[ignore = "run under the fake NVML by its outer test"]
+fn inner_ending_a_refuser_leaves_the_ledger_answering_readings() {
+    let ledger = Arc::new(ledger(Liveness { sample: Duration::from_millis(50) }));
+    let mut idle = Tenant::start(&ledger, &charges(), "refuse");
+    idle.call(&format!("publish {} {} {} 0", GIB / 2, 6 * GIB, 6 * GIB));
+    let ended: Arc<Mutex<Vec<u32>>> = Arc::default();
+    let (seen, weak) = (ended.clone(), Arc::downgrade(&ledger));
+    ledger.on_refusing(Box::new(move |pid| {
+        // SAFETY: a signal to the tenant this test started, alive until its Tenant drops.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        release(pid);
+        // As the pool's retire does once the executor is gone: a reading after its exit.
+        if let Some(ledger) = weak.upgrade() {
+            ledger.now();
+        }
+        seen.lock().unwrap().push(pid);
+    }));
+    let [memfd, _] = ledger.grant().unwrap();
+    let asker = Ledger::adopt(std::os::fd::AsFd::as_fd(&memfd), None).unwrap();
+    let call = ledger.active();
+    // Asked again as an op retries, until the refusing one is gone; a hang bound only.
+    for _ in 0..2000 {
+        if !ended.lock().unwrap().is_empty() {
+            break;
+        }
+        for victim in asker.ask(None, 7 * GIB).unwrap() {
+            asker.wait(&victim).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(*ended.lock().unwrap(), [idle.pid], "the refuser ends, and its end's reading is answered");
+    drop(call);
+    // The next placement asks a reading: answered (a hang bound only).
+    let (done, answered) = std::sync::mpsc::channel();
+    let reader = ledger.clone();
+    std::thread::spawn(move || {
+        reader.now();
+        let _ = done.send(());
+    });
+    answered.recv_timeout(Duration::from_secs(30)).expect("a reading after the end is answered");
+}
+
 /// A group's ranks each hold a row in their own GPU's ledger (no rank cells): a follower that
 /// dies is reaped on its GPU alone. No NVML: each ledger's capacity is the configured one.
 #[test]

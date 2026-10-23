@@ -29,7 +29,8 @@ use varena::ledger::{Facts, Ledger, Row, RowFacts, State, Status};
 /// What a desktop keeps free on its GPU in shared mode, or a sixteenth of a larger card.
 const DISPLAY_FLOOR: u64 = 512 << 20;
 
-/// Ends a process the ledger names stalled (its pid).
+/// Ends a process the ledger names stalled (its pid). It runs on a thread of its own, never the
+/// watch thread: an end waits on the ledger (an exit's reading), which only the watch answers.
 pub type Ender = Box<dyn Fn(u32) + Send + Sync>;
 /// Told when bytes freed on the GPU.
 pub type Freed = Box<dyn Fn() + Send + Sync>;
@@ -48,9 +49,13 @@ struct Inner {
     /// TensorD restarts; executors refill from RAM (B8's fallback).
     refused: AtomicBool,
     log: MemoryLog,
-    end: OnceLock<Ender>,
+    end: OnceLock<Arc<Ender>>,
     /// Ends an idle process that answers asks and frees nothing (its pid).
-    refuse: OnceLock<Ender>,
+    refuse: OnceLock<Arc<Ender>>,
+    /// The pids an end was handed off for and has not returned from: each is ended once.
+    ending: Arc<Mutex<std::collections::HashSet<u32>>>,
+    /// The watch thread, which answers ticks and so never waits for one.
+    watcher: OnceLock<std::thread::ThreadId>,
     freed: OnceLock<Freed>,
     looked: Mutex<Instant>,
     liveness: Liveness,
@@ -178,6 +183,8 @@ impl GpuLedger {
             log,
             end: OnceLock::new(),
             refuse: OnceLock::new(),
+            ending: Arc::default(),
+            watcher: OnceLock::new(),
             freed: OnceLock::new(),
             looked: Mutex::new(Instant::now()),
             liveness,
@@ -189,6 +196,7 @@ impl GpuLedger {
         let wake = Arc::new(eventfd()?);
         let (watched, shared_ticks, woken) = (inner.clone(), ticks.clone(), wake.clone());
         std::thread::Builder::new().name("gpu-ledger".into()).spawn(move || {
+            let _ = watched.watcher.set(std::thread::current().id());
             watch(device, &watched, &shared_ticks, &woken)
         })?;
         let ledger = Self { inner, ticks, wake };
@@ -198,13 +206,13 @@ impl GpuLedger {
 
     /// What ends a stalled process; set once, after the pool exists.
     pub fn on_stalled(&self, end: Ender) {
-        let _ = self.inner.end.set(end);
+        let _ = self.inner.end.set(Arc::new(end));
     }
 
     /// What ends an idle process that answers asks for bytes it says it holds and frees none;
     /// set once, after the pool exists.
     pub fn on_refusing(&self, end: Ender) {
-        let _ = self.inner.refuse.set(end);
+        let _ = self.inner.refuse.set(Arc::new(end));
     }
 
     /// What is told when bytes free here (the dispatch queue's wake); set once.
@@ -226,6 +234,12 @@ impl GpuLedger {
 
     /// A tick taken after this call: NVML read, dead rows reaped, TensorD's row republished.
     pub fn now(&self) {
+        // The watch answers ticks: waiting for one on it would wait forever (cl-647: an end run
+        // on it hung every placement on the card behind it).
+        if self.inner.watcher.get() == Some(&std::thread::current().id()) {
+            tracing::error!("memory: GPU {} asked a reading of its own watch; none is waited for", self.inner.entry);
+            return;
+        }
         let (lock, changed) = &*self.ticks;
         let mut ticks = lock.lock().unwrap();
         ticks.asked += 1;
@@ -479,6 +493,23 @@ impl Inner {
         Ok(())
     }
 
+    /// Ends `pid` on a thread of its own, once while an end of it is under way: the watch goes on
+    /// answering the readings that end waits for.
+    fn hand_off(&self, end: &Arc<Ender>, pid: u32) {
+        if !self.ending.lock().unwrap().insert(pid) {
+            return;
+        }
+        let (end, ending) = (end.clone(), self.ending.clone());
+        let ended = std::thread::Builder::new().name(format!("end-{pid}")).spawn(move || {
+            end(pid);
+            ending.lock().unwrap().remove(&pid);
+        });
+        if let Err(error) = ended {
+            self.ending.lock().unwrap().remove(&pid);
+            tracing::warn!("memory: GPU {} could not end pid {pid}: {error}", self.entry);
+        }
+    }
+
     /// At each reading: idle rows asked for bytes they say they hold, that answered since the last
     /// reading and gave none, are ended. Their answer is the evidence; no window is waited out.
     fn refusals(&self) {
@@ -487,7 +518,7 @@ impl Inner {
                 for pid in pids.into_iter().filter(|pid| *pid != std::process::id()) {
                     self.log.note(serde_json::json!({"event": "refusing", "gpu": self.entry, "pid": pid}));
                     if let Some(end) = self.refuse.get() {
-                        end(pid);
+                        self.hand_off(end, pid);
                     }
                 }
             }
@@ -509,7 +540,7 @@ impl Inner {
                 for pid in pids {
                     self.log.note(serde_json::json!({"event": "stalled", "gpu": self.entry, "pid": pid}));
                     if let Some(end) = self.end.get() {
-                        end(pid);
+                        self.hand_off(end, pid);
                     }
                 }
             }
