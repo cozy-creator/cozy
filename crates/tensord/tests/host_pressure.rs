@@ -153,7 +153,7 @@ fn scenario(watch: bool) {
     let namespace = format!("host-pressure-{}-", std::process::id());
     assert!(varena::os::namespace(&namespace));
     let id = GpuId { uuid: format!("host-pressure-{}", std::process::id()), model: "host".into(), memory: 4 * LIMIT };
-    let gpu = Arc::new(Gpu { ledger: Ledger::create(&id, None).unwrap(), model: "host".into() });
+    let gpu = Arc::new(Gpu { ledger: Ledger::create(&id, None).unwrap(), model: "host".into(), uuid: id.uuid.clone() });
     let dir = tempfile::tempdir().unwrap();
     let host = watch.then(|| {
         let how = Pressure::arm(HostMode::Dedicated).unwrap().how().to_string();
@@ -215,7 +215,7 @@ fn futile() {
     let namespace = format!("host-pressure-{}-", std::process::id());
     assert!(varena::os::namespace(&namespace));
     let id = GpuId { uuid: format!("host-pressure-{}", std::process::id()), model: "host".into(), memory: 4 * LIMIT };
-    let gpu = Arc::new(Gpu { ledger: Ledger::create(&id, None).unwrap(), model: "host".into() });
+    let gpu = Arc::new(Gpu { ledger: Ledger::create(&id, None).unwrap(), model: "host".into(), uuid: id.uuid.clone() });
     let host = Host::watch(HostMode::Dedicated, vec![gpu.clone()], &MemoryLog::default()).expect("watched");
     gpu.ledger.restore(&[varena::Peak::Host { key: "pkg|s".into(), bytes: 2 * LIMIT }]).unwrap();
     gpu.ledger.dispatch("run", "pkg", "s").unwrap();

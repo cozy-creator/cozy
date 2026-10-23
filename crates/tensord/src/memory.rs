@@ -9,7 +9,7 @@ use crate::{execution::Engine, machine::receipt};
 use platform::contain::host_memory;
 use platform::contain::host_pressure::{self, Growth, HostMode, Nudge};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     os::{
@@ -17,18 +17,19 @@ use std::{
         unix::net::UnixStream,
     },
     path::PathBuf,
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use varena::{ledger::Mode, GpuId, HostCall, Ledger, Peak};
 
 /// Past this the memory log rotates to `memory.log.1`, so it holds at most twice this.
 const ROTATE_BYTES: u64 = 4 << 20;
 
-/// One envelope GPU's ledger, and the GPU model its peaks are kept under.
+/// One envelope GPU's ledger, the GPU model its peaks are kept under, and its UUID (NVML's name).
 pub struct Gpu {
     pub ledger: Ledger,
     pub model: String,
+    pub uuid: String,
 }
 
 impl Gpu {
@@ -54,7 +55,7 @@ impl Gpu {
         }
         peaks.restore(&id.model, &ledger);
         log.note(serde_json::json!({"event": "ledger", "gpu": entry, "card": id.memory, "capacity": ledger.status().capacity}));
-        Some(Gpu { ledger, model: id.model })
+        Some(Gpu { ledger, model: id.model, uuid: id.uuid })
     }
 }
 
@@ -342,6 +343,162 @@ impl Keep {
         }
         self.running = by.values().map(|call| (call.pid, call.running)).collect();
         need.saturating_add(self.growth.observe(unforeseen))
+    }
+}
+
+/// A foreign process absent when sampling began takes cozy's idle pages once it holds this much
+/// (vram-yield §3.2: the only demand proxy Linux offers).
+const NEW_PROCESS: u64 = 256 << 20;
+/// How often a GPU holding cozy's bytes is read (vram-yield §3.2); one holding none is not read.
+const SAMPLE: Duration = Duration::from_millis(500);
+
+/// One GPU's foreign use (vram-yield §3.2, Linux, shared mode). Each reading is spent once, by
+/// `Ledger::set_foreign`: the bytes no row accounts for (the device's used bytes less the rows'
+/// held, kept pages included). A foreign process absent when sampling began that crosses
+/// [`NEW_PROCESS`] takes cozy's idle pages, once (`fresh`). The largest foreign process is named
+/// for a refusal at the floor.
+#[derive(Default)]
+pub struct ForeignWatch {
+    began: Option<BTreeSet<u32>>,
+    crossed: BTreeSet<u32>,
+    holder: Option<(u32, u64)>,
+}
+
+/// What one reading did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Spent {
+    pub foreign: u64,
+    pub fresh: bool,
+    pub freed: u64,
+    pub holder: Option<(u32, u64)>,
+}
+
+impl ForeignWatch {
+    /// What the ledger's rows hold, kept pages included: 0, nothing to watch.
+    pub fn held(ledger: &Ledger) -> u64 {
+        ledger.status().rows.iter().map(|r| r.context + r.torch + r.classes.iter().sum::<u64>()).sum()
+    }
+
+    /// One NVML reading of the GPU. `own` (TensorD's pid) and every live row's process are
+    /// cozy's; the rest are foreign.
+    pub fn reading(&mut self, ledger: &Ledger, reading: &platform::gpu::Reading, own: u32) -> varena::Result<Spent> {
+        let status = ledger.status();
+        let held: u64 = status.rows.iter().map(|r| r.context + r.torch + r.classes.iter().sum::<u64>()).sum();
+        let cozy: BTreeSet<u32> = status.rows.iter().filter(|r| r.live).map(|r| r.pid).chain([own]).collect();
+        let foreign = reading.total.saturating_sub(reading.free).saturating_sub(held);
+        let others: BTreeMap<u32, u64> = reading.processes.iter().flatten().filter(|(pid, _)| !cozy.contains(pid)).map(|(p, b)| (*p, *b)).collect();
+        let began = self.began.get_or_insert_with(|| others.keys().copied().collect());
+        let new: Vec<u32> = others.iter().filter(|(pid, bytes)| !began.contains(pid) && **bytes >= NEW_PROCESS).map(|(pid, _)| *pid).collect();
+        let fresh = new.into_iter().fold(false, |fresh, pid| self.crossed.insert(pid) || fresh);
+        let freed = ledger.set_foreign(foreign, fresh)?;
+        let holder = others.iter().max_by_key(|(_, bytes)| **bytes).map(|(pid, bytes)| (*pid, *bytes));
+        if holder != self.holder {
+            let name = holder.map(|(pid, bytes)| (comm(pid), bytes));
+            ledger.set_foreign_holder(name.as_ref().map(|(n, b)| (n.as_str(), *b)))?;
+            self.holder = holder;
+        }
+        Ok(Spent { foreign, fresh, freed, holder })
+    }
+
+    /// Nothing held: sampling stops, and executors measure foreign bytes themselves again.
+    pub fn stop(&mut self, ledger: &Ledger) -> varena::Result<()> {
+        if self.began.take().is_some() {
+            self.crossed.clear();
+            self.holder = None;
+            ledger.stop_sampling()?;
+            ledger.set_foreign_holder(None)?;
+        }
+        Ok(())
+    }
+}
+
+/// A process's name, as the kernel keeps it (its pid where it cannot be read).
+fn comm(pid: u32) -> String {
+    fs::read_to_string(format!("/proc/{pid}/comm")).map_or_else(|_| format!("pid {pid}"), |name| name.trim().to_string())
+}
+
+/// The foreign-use watch over shared-mode GPUs (Linux): a GPU holding cozy's bytes is read every
+/// [`SAMPLE`]; with none held anywhere it sleeps until a ledger event (`poke`). It ends when the
+/// handle drops.
+pub struct Foreign {
+    state: Arc<(Mutex<(bool, bool)>, Condvar)>,
+}
+
+impl Foreign {
+    /// The watch's thread; None in dedicated mode (pods), or where NVML reads no GPU.
+    pub fn watch(mode: HostMode, gpus: Vec<Arc<Gpu>>, log: &MemoryLog) -> Option<Foreign> {
+        if mode != HostMode::Shared || gpus.is_empty() {
+            return None;
+        }
+        let devices: Vec<(Arc<Gpu>, platform::gpu::Device)> = gpus
+            .into_iter()
+            .filter_map(|gpu| match platform::gpu::Device::open(&gpu.uuid) {
+                Ok(device) => Some((gpu, device)),
+                Err(error) => {
+                    log.note(serde_json::json!({"event": "foreign_unwatched", "gpu": gpu.uuid, "why": error.to_string()}));
+                    None
+                }
+            })
+            .collect();
+        if devices.is_empty() {
+            return None;
+        }
+        let state = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let (shared, notes) = (state.clone(), log.clone());
+        let started = std::thread::Builder::new().name("memory-foreign".into()).spawn(move || {
+            let mut watches: Vec<ForeignWatch> = devices.iter().map(|_| ForeignWatch::default()).collect();
+            let own = std::process::id();
+            loop {
+                let mut sampling = false;
+                for ((gpu, device), watch) in devices.iter().zip(&mut watches) {
+                    if ForeignWatch::held(&gpu.ledger) == 0 {
+                        let _ = watch.stop(&gpu.ledger);
+                        continue;
+                    }
+                    sampling = true;
+                    let Ok(reading) = device.read() else { continue };
+                    match watch.reading(&gpu.ledger, &reading, own) {
+                        Ok(spent) if spent.freed > 0 || spent.fresh => notes.note(serde_json::json!({"event": "foreign", "gpu": gpu.uuid,
+                            "foreign": spent.foreign, "fresh": spent.fresh, "freed": spent.freed, "holder": spent.holder})),
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!("memory: foreign reading on {}: {error}", gpu.uuid),
+                    }
+                }
+                let (lock, cv) = &*shared;
+                let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+                if !sampling {
+                    while !s.0 && !s.1 {
+                        s = cv.wait(s).unwrap_or_else(|e| e.into_inner());
+                    }
+                } else if !s.1 {
+                    s = cv.wait_timeout(s, SAMPLE).unwrap_or_else(|e| e.into_inner()).0;
+                }
+                if s.1 {
+                    return;
+                }
+                s.0 = false;
+            }
+        });
+        if let Err(error) = started {
+            log.note(serde_json::json!({"event": "foreign_unwatched", "why": error.to_string()}));
+            return None;
+        }
+        Some(Foreign { state })
+    }
+
+    /// A ledger event: an idle watch looks again (a row may hold bytes now).
+    pub fn poke(&self) {
+        let (lock, cv) = &*self.state;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).0 = true;
+        cv.notify_all();
+    }
+}
+
+impl Drop for Foreign {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.state;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+        cv.notify_all();
     }
 }
 

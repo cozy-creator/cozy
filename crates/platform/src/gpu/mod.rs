@@ -120,8 +120,9 @@ pub struct Reading {
     pub free: u64,
     /// A desktop is initialized on it.
     pub display: bool,
-    /// Device bytes the driver charges each process (pid -> bytes); `None` where it cannot
-    /// account every one (a container whose pids are not the driver's, WDDM).
+    /// Device bytes the driver charges each process, compute and graphics (a desktop, a game):
+    /// pid -> bytes; `None` where it cannot account every one (a container whose pids are not
+    /// the driver's, WDDM).
     pub processes: Option<BTreeMap<u32, u64>>,
 }
 
@@ -155,13 +156,23 @@ impl Device {
             .device_by_index(self.index)
             .map_err(failed("open device"))?;
         let (total, free) = memory(device.memory_info())?;
-        let processes = device.running_compute_processes().ok().and_then(|rows| {
+        // A process in both lists (a compute and a graphics context) is charged once: its larger.
+        let listed = |rows: Vec<nvml_wrapper::struct_wrappers::device::ProcessInfo>| -> Option<Vec<(u32, u64)>> {
             rows.into_iter()
                 .map(|row| match row.used_gpu_memory {
                     UsedGpuMemory::Used(bytes) => Some((row.pid, bytes)),
                     UsedGpuMemory::Unavailable => None,
                 })
                 .collect()
+        };
+        let compute = device.running_compute_processes().ok().and_then(listed);
+        let graphics = device.running_graphics_processes().ok().and_then(listed);
+        let processes = compute.zip(graphics).map(|(compute, graphics)| {
+            compute.into_iter().chain(graphics).fold(BTreeMap::new(), |mut by, (pid, bytes)| {
+                let at: &mut u64 = by.entry(pid).or_default();
+                *at = (*at).max(bytes);
+                by
+            })
         });
         Ok(Reading {
             total,

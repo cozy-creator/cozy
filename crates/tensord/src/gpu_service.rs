@@ -624,6 +624,7 @@ pub struct Pool {
     stalled: Mutex<std::collections::BTreeSet<u32>>,
     /// The host rule's watcher, while the pool lives.
     _host: Option<Arc<memory::Host>>,
+    _foreign: Option<Arc<memory::Foreign>>,
     /// Held while the pool lives: the thread blocked on the ledgers' events ends with it.
     _events: Option<std::os::unix::net::UnixStream>,
     /// Memoized Model methods' results, shared by every run on this machine.
@@ -711,16 +712,22 @@ impl Pool {
             entry: entry.clone(),
             memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, &peaks, &notes).map(Arc::new),
         }).collect();
-        let gpus = devices.iter().filter_map(|d| d.memory.clone()).collect();
+        let gpus: Vec<Arc<memory::Gpu>> = devices.iter().filter_map(|d| d.memory.clone()).collect();
+        let foreign = memory::Foreign::watch(config.host.mode, gpus.clone(), &notes).map(Arc::new);
         let host = memory::Host::watch(config.host.mode, gpus, &notes);
         let launcher = crate::child_launcher::ChildLauncher::new()?;
         let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
         Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
             let ledgers = devices.iter().filter_map(|d| d.memory.clone()).map(memory::Source::Ledger);
             let sources: Vec<memory::Source> = ledgers.chain(host.clone().map(memory::Source::Host)).collect();
-            let pool = pool.clone();
+            let (pool, poked) = (pool.clone(), foreign.clone());
             let woke = move |woke| match (pool.upgrade(), woke) {
-                (Some(pool), memory::Woke::Ledger) => pool.memory_changed(),
+                (Some(pool), memory::Woke::Ledger) => {
+                    if let Some(foreign) = &poked {
+                        foreign.poke();
+                    }
+                    pool.memory_changed()
+                }
                 (Some(pool), memory::Woke::HostShort) => pool.host_short(),
                 (None, _) => {}
             };
@@ -740,6 +747,7 @@ impl Pool {
                 engine: Default::default(),
                 stalled: Mutex::default(),
                 _host: host,
+                _foreign: foreign,
                 _events: events,
                 incarnation,
                 config,
