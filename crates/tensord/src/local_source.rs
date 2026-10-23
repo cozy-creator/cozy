@@ -696,7 +696,7 @@ mod tests {
     fn requirement(wheel: &Path, name: &str) -> String {
         let mut archive = zip::ZipArchive::new(fs::File::open(wheel).unwrap()).unwrap();
         let metadata = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
             .find(|member| member.ends_with(".dist-info/METADATA"))
             .unwrap();
         let mut text = String::new();

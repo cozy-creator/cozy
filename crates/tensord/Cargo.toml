@@ -35,7 +35,7 @@ hyper-util = { workspace = true, features = ["server-auto", "service"] }
 http-body-util.workspace = true
 bytes.workspace = true
 webpki-roots.workspace = true
-zip = { version = "7", default-features = false, features = ["deflate-flate2"] }
+zip.workspace = true
 axum.workspace = true
 ed25519-dalek = { workspace = true, features = ["pem", "pkcs8"] }
 rcgen.workspace = true
@@ -58,6 +58,6 @@ tower.workspace = true
 x509-parser = "0.18"
 
 [build-dependencies]
-zip = { version = "7", default-features = false }
+zip.workspace = true
 sha2.workspace = true
 base64.workspace = true
