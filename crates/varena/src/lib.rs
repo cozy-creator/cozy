@@ -12,6 +12,8 @@ pub mod backend;
 pub mod cuda;
 pub mod custody;
 pub mod decide;
+#[cfg(unix)]
+pub mod derived;
 #[cfg(feature = "faults")]
 pub mod faults;
 pub mod layout;

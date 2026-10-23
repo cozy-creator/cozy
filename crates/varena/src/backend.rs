@@ -118,6 +118,11 @@ pub trait Backend: Send + Sync {
     fn capturing(&self, _stream: usize) -> Result<bool> {
         Ok(false)
     }
+    /// Copies `dst.len()` mapped bytes at `va + offset` to host memory once `after` completed;
+    /// returns once they landed. A writer's thread only (it waits on the device).
+    fn copy_out(&self, _va: Va, _offset: u64, _dst: &mut [u8], _after: Event) -> Result<()> {
+        Err(Error::Invalid("this backend copies nothing out".into()))
+    }
 }
 
 /// Pages in host memory (a memfd, an `shm_open` object or a pagefile section each), mapped into
@@ -277,6 +282,15 @@ impl Backend for HostBackend {
     fn retire(&self, _: Event) {}
 
     fn drain(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8], _: Event) -> Result<()> {
+        if offset.saturating_add(dst.len() as u64) > va.len {
+            return Err(Error::Invalid("a copy outside the reservation".into()));
+        }
+        // SAFETY: the range is mapped (the caller pins it) and host events are complete when made.
+        unsafe { std::ptr::copy_nonoverlapping((va.base + offset) as *const u8, dst.as_mut_ptr(), dst.len()) };
         Ok(())
     }
 }
