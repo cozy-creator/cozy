@@ -3,9 +3,12 @@
 //! and gives them back when asked once they are quiet (no pins, the stream epoch passed, fills
 //! landed). It never exports and makes no policy decision. Slice 1 leases weights only.
 //!
-//! Locks: `pending` only, a leaf; the reader thread imports outside it.
+//! An ask is answered on the reader thread ([`Agent::ask`]): the holder's mechanism thread never
+//! waits on the manager, which may be waiting on this process's own revokes.
+//!
+//! Locks: `pending` and `held` are leaves; the reader thread imports outside them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
@@ -17,27 +20,38 @@ use crate::backend::{Backend, Physical};
 use crate::os::{self, Stream};
 use crate::{Error, Exhausted, Result};
 
+/// One grant: its table slot and the sequence it was granted under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Ticket {
+    pub slot: u32,
+    pub seq: u32,
+}
+
 /// One imported chunk: the holder maps `phys` and answers it with [`Agent::mapped`] or
 /// [`Agent::refused`].
 #[derive(Debug)]
 pub struct Lease {
-    pub slot: u32,
-    pub seq: u32,
+    pub ticket: Ticket,
     pub phys: Physical,
     /// Its bytes are its region's already (retained by the manager): no fill.
     pub adopted: bool,
 }
 
-enum Answer {
-    Granting(Vec<Lease>),
-    Done(Vec<Lease>),
-    Refused(String),
+/// What runs on the reader thread once an ask is answered.
+pub type Done = Box<dyn FnOnce(Result<Vec<Lease>>) + Send>;
+
+struct Asking {
+    bytes: u64,
+    got: Vec<Lease>,
+    done: Done,
 }
 
 #[derive(Default)]
 struct Pending {
     next: u64,
-    asks: HashMap<u64, Answer>,
+    asks: HashMap<u64, Asking>,
+    /// Asks a failed import ended: their later chunks are refused unimported.
+    dead: HashSet<u64>,
     closed: bool,
 }
 
@@ -46,12 +60,15 @@ pub struct Agent {
     table: Arc<Table>,
     backend: Arc<dyn Backend>,
     pending: Mutex<Pending>,
-    answered: Condvar,
+    /// Mapped grants this process holds.
+    held: Mutex<BTreeSet<Ticket>>,
 }
 
 impl Agent {
     /// Attaches to the manager serving `stream`; `revoked` runs on the reader thread at every
-    /// Revoke doorbell (the holder wakes its mechanism thread, never works there).
+    /// Revoke doorbell (the holder wakes its mechanism thread, never works there). Refused (a
+    /// protocol this manager does not speak, not one of its executors), it is `Error::Closed`:
+    /// the caller runs that GPU standalone, never fails for it.
     pub fn attach(stream: Stream, backend: Arc<dyn Backend>, revoked: impl Fn() + Send + 'static) -> Result<Arc<Agent>> {
         let end = Arc::new(End::new(stream));
         let me = Birth::own().map_err(|e| Error::Io(e.to_string()))?;
@@ -64,7 +81,7 @@ impl Agent {
             Some((ToAgent::Refuse { why, .. }, _)) => return Err(Error::Closed(format!("the lease manager: {why}"))),
             _ => return Err(Error::Closed("the lease manager answered Hello with no table".into())),
         };
-        let agent = Arc::new(Agent { end, table, backend, pending: Mutex::new(Pending::default()), answered: Condvar::new() });
+        let agent = Arc::new(Agent { end, table, backend, pending: Mutex::new(Pending::default()), held: Mutex::new(BTreeSet::new()) });
         let reader = agent.clone();
         std::thread::Builder::new()
             .name("lease-agent".into())
@@ -72,8 +89,16 @@ impl Agent {
                 if let Err(error) = reader.read(&revoked) {
                     tracing::warn!("lease: the manager's connection failed: {error}");
                 }
-                reader.pending.lock().closed = true;
-                reader.answered.notify_all();
+                // Every ask still out fails: the manager is gone.
+                let asks: Vec<Asking> = {
+                    let mut p = reader.pending.lock();
+                    p.closed = true;
+                    p.asks.drain().map(|(_, a)| a).collect()
+                };
+                for a in asks {
+                    reader.give_back(a.got);
+                    (a.done)(Err(Error::Closed("the lease manager".into())));
+                }
             })
             .map_err(|e| Error::io("spawn lease-agent", e))?;
         Ok(agent)
@@ -82,32 +107,13 @@ impl Agent {
     fn read(&self, revoked: &dyn Fn()) -> Result<()> {
         while let Some((message, handle)) = self.end.recv::<ToAgent>()? {
             match message {
-                ToAgent::Grant { id, slot, seq, bytes, adopted, last } => {
-                    let imported = handle.ok_or_else(|| Error::Invalid("a grant with no handle".into())).and_then(|h| self.backend.import(h, bytes));
-                    let mut p = self.pending.lock();
-                    match imported {
-                        Ok(phys) => {
-                            let lease = Lease { slot, seq, phys, adopted };
-                            let answer = p.asks.remove(&id);
-                            let mut got = match answer {
-                                Some(Answer::Granting(got)) => got,
-                                _ => vec![],
-                            };
-                            got.push(lease);
-                            p.asks.insert(id, if last { Answer::Done(got) } else { Answer::Granting(got) });
-                        }
-                        Err(error) => {
-                            drop(p);
-                            self.table.answer(slot, seq, false)?;
-                            self.end.send(&ToManager::Answered, None)?;
-                            self.pending.lock().asks.insert(id, Answer::Refused(error.to_string()));
-                        }
-                    }
-                    self.answered.notify_all();
-                }
+                ToAgent::Grant { id, slot, seq, bytes, adopted, last } => self.granted(id, Ticket { slot, seq }, bytes, adopted, last, handle)?,
                 ToAgent::Refuse { id, why } => {
-                    self.pending.lock().asks.insert(id, Answer::Refused(why));
-                    self.answered.notify_all();
+                    let asking = self.pending.lock().asks.remove(&id);
+                    if let Some(a) = asking {
+                        self.give_back(a.got);
+                        (a.done)(Err(exhausted(a.bytes, &why)));
+                    }
                 }
                 ToAgent::Revoke => revoked(),
                 ToAgent::Welcome { .. } => {}
@@ -116,81 +122,172 @@ impl Agent {
         Ok(())
     }
 
-    /// `bytes` of weights for `region`, imported (the caller maps each and answers it). Waits for
-    /// the manager's answer, which comes once room is made; refused, the request ends Exhausted.
-    pub fn take(&self, bytes: u64, region: Option<Region>) -> Result<Vec<Lease>> {
+    fn granted(&self, id: u64, ticket: Ticket, bytes: u64, adopted: bool, last: bool, handle: Option<os::Owned>) -> Result<()> {
+        let dead = {
+            let mut p = self.pending.lock();
+            let dead = p.dead.contains(&id) || !p.asks.contains_key(&id);
+            if dead && last {
+                p.dead.remove(&id);
+            }
+            dead
+        };
+        if dead {
+            drop(handle);
+            self.table.answer(ticket.slot, ticket.seq, false)?;
+            return self.end.send(&ToManager::Answered, None);
+        }
+        match handle.ok_or_else(|| Error::Invalid("a grant with no handle".into())).and_then(|h| self.backend.import(h, bytes)) {
+            Ok(phys) => {
+                let done = {
+                    let mut p = self.pending.lock();
+                    let Some(a) = p.asks.get_mut(&id) else { return Ok(()) };
+                    a.got.push(Lease { ticket, phys, adopted });
+                    if last { p.asks.remove(&id) } else { None }
+                };
+                if let Some(a) = done {
+                    (a.done)(Ok(a.got));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // The whole ask fails: this chunk and every one imported for it go back.
+                let asking = {
+                    let mut p = self.pending.lock();
+                    if !last {
+                        p.dead.insert(id);
+                    }
+                    p.asks.remove(&id)
+                };
+                self.table.answer(ticket.slot, ticket.seq, false)?;
+                if let Some(a) = asking {
+                    self.give_back(a.got);
+                    (a.done)(Err(error));
+                }
+                self.end.send(&ToManager::Answered, None)
+            }
+        }
+    }
+
+    /// Imported leases nobody will map: refused, their imports gone.
+    fn give_back(&self, leases: Vec<Lease>) {
+        if leases.is_empty() {
+            return;
+        }
+        for lease in leases {
+            let _ = self.backend.destroy(lease.phys);
+            let _ = self.table.answer(lease.ticket.slot, lease.ticket.seq, false);
+        }
+        let _ = self.end.send(&ToManager::Answered, None);
+    }
+
+    /// Asks for `bytes` of weights for `region`; `done` runs on the reader thread with the
+    /// imported leases (the holder maps each and answers it) or the refusal (Exhausted), once
+    /// the manager answers: after room is made, which may take other processes' revokes.
+    pub fn ask(&self, bytes: u64, region: Option<Region>, done: Done) -> Result<()> {
         let id = {
             let mut p = self.pending.lock();
-            p.next += 1;
-            p.next
-        };
-        self.end.send(&ToManager::Ask { id, bytes, region }, None)?;
-        let mut p = self.pending.lock();
-        loop {
-            match p.asks.remove(&id) {
-                Some(Answer::Done(got)) => return Ok(got),
-                Some(Answer::Refused(why)) => {
-                    return Err(Error::Exhausted(Box::new(Exhausted { need: bytes, site: Some(format!("lease: {why}")), stats: crate::memory::Stats::default(), foreign: None })));
-                }
-                Some(granting) => {
-                    p.asks.insert(id, granting);
-                }
-                None => {}
-            }
             if p.closed {
-                return Err(Error::Closed("the lease manager".into()));
+                drop(p);
+                done(Err(Error::Closed("the lease manager".into())));
+                return Ok(());
             }
-            self.answered.wait(&mut p);
+            p.next += 1;
+            let id = p.next;
+            p.asks.insert(id, Asking { bytes, got: vec![], done });
+            id
+        };
+        self.end.send(&ToManager::Ask { id, bytes, region }, None)
+    }
+
+    /// [`Agent::ask`], waiting for the answer here: never on a thread that answers revokes.
+    pub fn take(&self, bytes: u64, region: Option<Region>) -> Result<Vec<Lease>> {
+        let answer = Arc::new((Mutex::new(None), Condvar::new()));
+        let set = answer.clone();
+        self.ask(
+            bytes,
+            region,
+            Box::new(move |r| {
+                *set.0.lock() = Some(r);
+                set.1.notify_all();
+            }),
+        )?;
+        let mut got = answer.0.lock();
+        loop {
+            if let Some(r) = got.take() {
+                return r;
+            }
+            answer.1.wait(&mut got);
         }
     }
 
     /// The holder mapped these: they are its to pin.
-    pub fn mapped(&self, leases: &[Lease]) -> Result<()> {
-        for lease in leases {
-            self.table.answer(lease.slot, lease.seq, true)?;
+    pub fn mapped(&self, tickets: &[Ticket]) -> Result<()> {
+        for t in tickets {
+            self.table.answer(t.slot, t.seq, true)?;
+            self.held.lock().insert(*t);
         }
         self.end.send(&ToManager::Answered, None)
     }
 
-    pub fn landed(&self, lease: &Lease) -> Result<()> {
-        self.table.set_landed(lease.slot)
+    /// The holder could not map it: its import goes, and the manager reclaims the chunk.
+    pub fn refused(&self, ticket: Ticket, phys: Physical) -> Result<()> {
+        self.backend.destroy(phys)?;
+        self.table.answer(ticket.slot, ticket.seq, false)?;
+        self.end.send(&ToManager::Answered, None)
     }
 
-    pub fn pin(&self, lease: &Lease) -> Result<bool> {
-        self.table.pin(lease.slot)
+    /// Its fill landed: the manager records it at this ack (a landed weights chunk outlives
+    /// this process in retention).
+    pub fn landed(&self, ticket: Ticket) -> Result<()> {
+        self.table.set_landed(ticket.slot)?;
+        self.end.send(&ToManager::Answered, None)
     }
 
-    pub fn unpin(&self, lease: &Lease) -> Result<()> {
-        self.table.unpin(lease.slot)
+    pub fn pin(&self, ticket: Ticket) -> Result<bool> {
+        self.table.pin(ticket.slot)
     }
 
-    pub fn hint(&self, lease: &Lease, class: u32, next_use: u64) -> Result<()> {
-        self.table.hint(lease.slot, class, next_use)
+    pub fn unpin(&self, ticket: Ticket) -> Result<()> {
+        self.table.unpin(ticket.slot)
+    }
+
+    pub fn hint(&self, ticket: Ticket, class: u32, next_use: u64) -> Result<()> {
+        self.table.hint(ticket.slot, class, next_use)
     }
 
     /// Whether the manager asked for this lease back.
-    pub fn asked(&self, lease: &Lease) -> bool {
-        self.table.ask(lease.slot) == lease.seq
+    pub fn asked(&self, ticket: Ticket) -> bool {
+        self.table.ask(ticket.slot) == ticket.seq
+    }
+
+    /// Every held lease the manager asked back.
+    pub fn asked_back(&self) -> Vec<Ticket> {
+        self.held.lock().iter().copied().filter(|t| self.asked(*t)).collect()
     }
 
     /// Commits a give-back (asked or not): false while pinned. The holder then unmaps and calls
     /// [`Agent::release`].
-    pub fn commit(&self, lease: &Lease) -> Result<bool> {
-        self.table.commit(lease.slot, lease.seq)
+    pub fn commit(&self, ticket: Ticket) -> Result<bool> {
+        self.table.commit(ticket.slot, ticket.seq)
     }
 
     /// The committed lease is unmapped: its import goes, and the manager frees the chunk.
-    pub fn release(&self, lease: Lease) -> Result<()> {
-        let mapped = self.table.word(lease.slot).is_some_and(|w| w.state == State::Revoking && w.seq == lease.seq);
-        if !mapped {
-            return Err(Error::Invalid(format!("lease slot {} released before its commit", lease.slot)));
+    pub fn release(&self, ticket: Ticket, phys: Physical) -> Result<()> {
+        let committed = self.table.word(ticket.slot).is_some_and(|w| w.state == State::Revoking && w.seq == ticket.seq);
+        if !committed {
+            return Err(Error::Invalid(format!("lease slot {} released before its commit", ticket.slot)));
         }
-        self.backend.destroy(lease.phys)?;
-        self.table.released(lease.slot, lease.seq)?;
+        self.held.lock().remove(&ticket);
+        self.backend.destroy(phys)?;
+        self.table.released(ticket.slot, ticket.seq)?;
         self.end.send(&ToManager::Answered, None)
     }
 
     pub fn table(&self) -> &Table {
         &self.table
     }
+}
+
+fn exhausted(bytes: u64, why: &str) -> Error {
+    Error::Exhausted(Box::new(Exhausted { need: bytes, site: Some(format!("lease: {why}")), stats: crate::memory::Stats::default(), foreign: None }))
 }
