@@ -399,10 +399,25 @@ impl PyMemory {
     #[staticmethod]
     #[pyo3(signature = (ordinal, grant = None, limit = None))]
     fn cuda(py: Python<'_>, ordinal: i32, grant: Option<PyRef<'_, PyGrant>>, limit: Option<u64>) -> PyResult<Self> {
-        PyMemory::open(py, grant, limit, (KDL_CUDA, ordinal), || {
+        let memory = PyMemory::open(py, grant, limit, (KDL_CUDA, ordinal), || {
             let backend = CudaBackend::open(ordinal)?;
             Ok((backend.gpu()?, Box::new(backend) as Box<dyn Backend>))
-        })
+        })?;
+        // torch's allocations on this device are this Memory's from now on (the shim's agent).
+        crate::agent::serve(ordinal, memory.memory().clone());
+        Ok(memory)
+    }
+
+    /// varena's torch figures here: (allocated, mapped, peak, per open request (id, allocated,
+    /// peak)). torch's own memory statistics don't see a pluggable allocator.
+    fn torch_stats(&self, py: Python<'_>) -> PyResult<TorchFigures> {
+        detached(py, &self.gpu.uuid, || Ok(torch_stats(self.memory())))
+    }
+
+    /// Before a capture into torch pool `pool` (a `graph_pool_handle()`) begins: maps `expected`
+    /// bytes into it, making room now, so the capture never needs to.
+    fn prepare_pool(&self, py: Python<'_>, pool: (u64, u64), expected: u64) -> PyResult<()> {
+        detached(py, &self.gpu.uuid, || self.memory().pool_prepare(varena::PoolId(pool.0, pool.1), expected))
     }
 
     /// Host pages of `gpu.memory` bytes (CPU, MPS), on the table `gpu.uuid` names.
@@ -433,9 +448,9 @@ impl PyMemory {
     /// use is its components' (`sets`, a graph pool's component; none: no declared use).
     #[pyo3(signature = (owner, shrink, sets = Vec::new()))]
     fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>, sets: Vec<u32>) -> PyResult<u32> {
-        // Inside torch's allocator a shrink would free through it under its own lock: none runs there.
+        // Inside torch's allocator a shrink would free through it, re-entering it: none runs there.
         let shrink = move |want: u64| {
-            if crate::allocator::inside() {
+            if crate::agent::inside() {
                 return 0;
             }
             Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0)
@@ -587,13 +602,13 @@ impl PyRequest {
         done(py, &self.gpu, || r.plan(steps(plan)))
     }
 
-    /// This thread's segments for torch's pool `pool` are this request's from now on: a
-    /// shortfall makes room in `memory`.
-    #[pyo3(signature = (memory, pool = (0, 0)))]
-    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, pool: (u64, u64)) -> PyResult<()> {
+    /// This thread's torch blocks go to this request's arena in `memory` until the guard ends
+    /// (on this thread).
+    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>) -> PyResult<PyAllocating> {
         let r = self.get(py)?;
-        crate::allocator::enter(memory.memory().clone(), r, memory.dl.1, pool);
-        Ok(())
+        let m = memory.memory().clone();
+        let guard = detached(py, &self.gpu, || Ok(m.allocating(&r)))?;
+        Ok(PyAllocating(Mutex::new(Some(guard))))
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<PyStats> {
@@ -611,6 +626,18 @@ impl PyRequest {
                 Err(error(py, &self.gpu, Error::Invalid("a call is still running in the request".into())))
             }
         }
+    }
+}
+
+/// A thread allocating into a request's arena (`Request.allocating`); `end` (on that thread)
+/// ends it.
+#[pyclass(name = "Allocating", module = "tensorfs.varena", frozen)]
+pub struct PyAllocating(Mutex<Option<varena::Allocating>>);
+
+#[pymethods]
+impl PyAllocating {
+    fn end(&self) {
+        lock(&self.0).take();
     }
 }
 
@@ -856,66 +883,14 @@ impl PyWindow {
 }
 
 
-/// This thread's pass is over for torch's pool (`Request.allocating`).
-#[pyfunction]
-fn allocated() {
-    crate::allocator::exit();
-}
+/// varena's torch allocator figures: (allocated, mapped, peak, per open request (id, allocated,
+/// peak)).
+type TorchFigures = (u64, u64, u64, Vec<(String, u64, u64)>);
 
-/// The pool's segments: (live bytes, segments made, make_room calls, NULLs for torch's release,
-/// refusals, nanoseconds making segments, segments freed).
-#[pyfunction]
-#[pyo3(signature = (device = None, pool = None))]
-fn allocator_stats(device: Option<i32>, pool: Option<(u64, u64)>) -> (u64, u64, u64, u64, u64, u64, u64) {
-    crate::allocator::stats(device, pool)
+fn torch_stats(memory: &Memory) -> TorchFigures {
+    let s = memory.torch_stats();
+    (s.allocated, s.mapped, s.peak, s.requests)
 }
-
-/// Last native allocation refusal per device and pool: device, pool, reason, size, the row's
-/// free bytes then.
-#[pyfunction]
-#[pyo3(signature = (device = None))]
-fn allocator_refusals(device: Option<i32>) -> Vec<crate::allocator::Refusal> {
-    crate::allocator::refusals(device)
-}
-
-/// Quarantined native segments: device, pool, bytes and the last reason. They stay charged and
-/// are never reused; the device goes on.
-#[pyfunction]
-#[pyo3(signature = (device = None))]
-fn allocator_quarantined(device: Option<i32>) -> Vec<(i32, (u64, u64), u64, &'static str)> {
-    crate::allocator::quarantined(device)
-}
-
-/// A lost completion/release quarantines its segment and retires this executor at a safe
-/// Python boundary; it must not masquerade as a recoverable capacity failure.
-#[pyfunction]
-fn allocator_check(py: Python<'_>, device: i32) -> PyResult<()> {
-    if let Some(reason) = crate::allocator::fault_message(device) {
-        let err = VarenaError::new_err(format!("native allocation ownership is unproven: {reason}"));
-        err.value(py).setattr("code", "OWNERSHIP")?;
-        err.value(py).setattr("sticky", true)?;
-        err.value(py).setattr("cuda_code", py.None())?;
-        return Err(err);
-    }
-    Ok(())
-}
-
-/// A CUDA graph capture opens (`open`) or closes on `device` (`Memory.capturing`).
-#[pyfunction]
-fn allocator_capture(device: i32, open: bool) {
-    crate::allocator::capture(device, open);
-}
-
-/// Torch dropped `pool` on `device` (a request's end): its segments come back as torch releases
-/// them, and an allocation short of room first lets torch's retry release them.
-#[pyfunction]
-fn allocator_retire(device: i32, pool: (u64, u64)) {
-    crate::allocator::retire(device, pool);
-}
-
-/// Native segments no longer in torch's counters, still physically held until GPU completion.
-#[pyfunction]
-fn allocator_pending(device: i32) -> u64 { crate::allocator::pending(device) }
 
 // ---------------------------------------------------------------- the module
 
@@ -931,6 +906,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySet>()?;
     m.add_class::<PyMemory>()?;
     m.add_class::<PyRequest>()?;
+    m.add_class::<PyAllocating>()?;
     m.add_class::<PyPass>()?;
     m.add_class::<PyPin>()?;
     m.add_class::<PyRetained>()?;
@@ -940,14 +916,6 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRef_>()?;
     m.add_class::<PyStepStats>()?;
     m.add_class::<PyStats>()?;
-    m.add_function(wrap_pyfunction!(allocated, &m)?)?;
-    m.add_function(wrap_pyfunction!(allocator_stats, &m)?)?;
-    m.add_function(wrap_pyfunction!(allocator_refusals, &m)?)?;
-    m.add_function(wrap_pyfunction!(allocator_pending, &m)?)?;
-    m.add_function(wrap_pyfunction!(allocator_check, &m)?)?;
-    m.add_function(wrap_pyfunction!(allocator_retire, &m)?)?;
-    m.add_function(wrap_pyfunction!(allocator_capture, &m)?)?;
-    m.add_function(wrap_pyfunction!(allocator_quarantined, &m)?)?;
     m.add_function(wrap_pyfunction!(pins_held, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;

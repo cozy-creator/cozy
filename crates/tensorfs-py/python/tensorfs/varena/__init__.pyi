@@ -1,8 +1,8 @@
 """varena: one process's memory for model weights on one device (design varena-slim.md).
 
-`Memory` places weight sets in pages its device's shared table shows free; torch's segments
-for a request come from its allocator, which makes room (`make_room`: idle pages, caches, then
-the request's own pages by furthest declared use) when the row's free bytes fall short.
+`Memory` places weight sets in pages its device's shared table shows free. On CUDA it is
+torch's only allocator: a request's torch blocks come from its arena, which makes room (idle
+pages, caches, then the request's own pages by furthest declared use) when free bytes fall short.
 A `Pin` is a block mapped and filled: a uint8 DLPack tensor that, with every tensor made from it,
 holds the block until the last one dies. Every call releases the GIL; a panic raises
 `VarenaError` with code `INTERNAL`.
@@ -172,6 +172,13 @@ class Memory:
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
 
+    def torch_stats(self) -> tuple[int, int, int, list[tuple[str, int, int]]]:
+        """varena's figures for torch's blocks: (allocated, mapped, peak, per open request (id,
+        allocated, peak))."""
+
+    def prepare_pool(self, pool: tuple[int, int], expected: int) -> None:
+        """Maps `expected` bytes into torch pool `pool` before a capture into it begins."""
+
 class Request:
     def pass_(self, set: int, key: str) -> Pass:
         """A pass of `set` keyed `key` (`entry|dims`): the plan's cursor moves to it."""
@@ -179,27 +186,19 @@ class Request:
     def plan(self, plan: list[tuple[list[str], int]]) -> None:
         """Replaces the plan; its cursor starts over."""
 
-    def allocating(self, memory: Memory, pool: tuple[int, int] = (0, 0)) -> None:
-        """This thread's segments for torch's pool `pool` are this request's from now on: a
-        shortfall makes room in `memory`."""
+    def allocating(self, memory: Memory) -> Allocating:
+        """This thread's torch blocks go to this request's arena in `memory` until the guard
+        ends (on this thread)."""
 
     def stats(self) -> Stats: ...
     def end(self) -> Stats:
         """Ends it: its pins and caches go."""
 
-def allocated() -> None:
-    """SPIKE: this thread's pass is over for torch's pool (`Request.allocating`)."""
+class Allocating:
+    """A thread allocating into a request's arena (`Request.allocating`)."""
 
-def allocator_stats(device: int | None = None, pool: tuple[int, int] | None = None) -> tuple[int, int, int, int, int, int, int]:
-    """The pool's segments: (live bytes, segments made, make_room calls, NULLs for torch's
-    release, refusals, nanoseconds making segments, segments freed)."""
-
-def allocator_capture(device: int, open: bool) -> None:
-    """A CUDA graph capture opens (`open`) or closes on `device` (`Memory.capturing`)."""
-
-def allocator_retire(device: int, pool: tuple[int, int]) -> None:
-    """Torch dropped `pool` (a request's end): its segments come back as torch releases them,
-    and an allocation short of room first lets torch's retry release them."""
+    def end(self) -> None:
+        """Ends it, on its thread."""
 
 class Pass:
     def end(self, peak: int) -> None:
@@ -324,16 +323,5 @@ class Retained:
 
 class StaleBinding(VarenaError): ...
 
-def allocator_pending(device: int) -> int: ...
-
-def allocator_check(device: int) -> None: ...
-
-def allocator_refusals(device: int | None = None) -> list[tuple[int, tuple[int, int], str, int, int]]:
-    """Each device and pool's last refusal: (device, pool, reason, size, the row's free bytes)."""
-
 def pins_held() -> int:
     """Pins the binding holds now: Python's pin objects and the tensors that keep one."""
-
-def allocator_quarantined(device: int | None = None) -> list[tuple[int, tuple[int, int], int, str]]:
-    """Quarantined segments by device and pool: (device, pool, bytes, last reason). They stay
-    charged and are never reused; the device goes on."""

@@ -7,24 +7,25 @@
         image = pipe(prompt)
 
 A block's params are views of its pin only while the block runs; placeholders (shape, dtype and
-device, no bytes) stand in otherwise, so no tensor outlives its page. A request's allocations go
-to this thread's torch pool, whose segments varena's allocator makes room for (`make_room`, in
-Rust); the pool is dropped when the request ends, which gives its unused segments back. A
-model's top-level forward is a pass: the plan's cursor, and torch's allocated peak.
+device, no bytes) stand in otherwise, so no tensor outlives its page. On CUDA varena is torch's
+only allocator: a request's torch blocks come from its arena, made room for in Rust. A model's
+top-level forward is a pass: the plan's cursor, and its arena's peak.
 """
 
 from __future__ import annotations
 
+import ctypes
+import json
 import os
 import sys
 import threading
-import time
 import warnings
 import weakref
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol, TypeAlias
 
 import tensorfs
@@ -34,11 +35,6 @@ from torch.utils._pytree import tree_leaves, tree_map
 
 from . import Exhausted, Fill, GpuId, Grant, Level, Pass, Pin, Stats, VarenaError, Window
 from . import Memory as Native
-from .._ext.varena import allocated as _allocated
-from .._ext.varena import allocator_capture as _allocator_capture
-from .._ext.varena import allocator_check as _allocator_check
-from .._ext.varena import allocator_retire as _allocator_retire
-from .._ext.varena import allocator_stats as _allocator_stats
 from .. import _ext
 from . import Request as NativeRequest
 from . import Set
@@ -207,10 +203,8 @@ class _Pass:
     request: Request
     #: `entry|dims`: the module its forward entered ("" the root) and its tensor arguments' dims
     key: str
-    #: the request's make_room calls when it opened
-    rooms: int = 0
     token: object = None
-    #: this thread's routing to the request's pool, when the pass runs off the request's thread
+    #: this thread's allocating into the request's arena, when the pass runs off the request's thread
     pooled: object = None
 
 
@@ -415,13 +409,41 @@ _opening = threading.Lock()
 #: The request a forward runs in, and the pass a site op runs in.
 _request: ContextVar[Request | None] = ContextVar("varena_request", default=None)
 _pass: ContextVar[_Pass | None] = ContextVar("varena_pass", default=None)
-_routes: ContextVar[frozenset[tuple[int, int]]] = ContextVar("varena_routes", default=frozenset())
+#: the request whose arena this thread's torch blocks go to (`Request.on_thread`)
+_arena: ContextVar[Request | None] = ContextVar("varena_arena", default=None)
+#: CUDA devices whose Memory is torch's allocator: held for the process, whose torch blocks it serves
+_serving: dict[int, Memory] = {}
+#: varena's torch allocator shim and its build record (shim/build.sh, shim/build.ps1)
+_SHIM = Path(_ext.__file__).parent / ("_varena_torch.dll" if os.name == "nt" else "_varena_torch.so")
+
+
+def _install() -> None:
+    """varena as torch's only CUDA allocator, once per process and before torch initializes CUDA:
+    the shim, built against torch's C++ ABI, bound to the agent's C ABI in the extension."""
+    if _serving:
+        return
+    built = json.loads(_SHIM.with_suffix(".json").read_text())
+    running = {"torch": ".".join(torch.__version__.split(".")[:2]), "cxx11_abi": int(torch._C._GLIBCXX_USE_CXX11_ABI)}
+    if built != running:
+        raise VarenaError(f"varena's torch allocator was built for {built}, and this process runs {running}: install the tensorfs wheel for this torch")
+    if torch.cuda.is_initialized():
+        raise VarenaError("torch initialized CUDA before Memory.open: open the Memory first, as varena becomes torch's only CUDA allocator")
+    shim, ext = ctypes.CDLL(str(_SHIM)), ctypes.CDLL(_ext.__file__)
+    agent = ("alloc", "free", "record_stream", "pool_begin", "pool_end", "pool_release")
+    shim.varena_torch_bind((ctypes.c_void_p * len(agent))(*(ctypes.cast(getattr(ext, f"varena_agent_{f}"), ctypes.c_void_p) for f in agent)))
+    hook = {name: ctypes.cast(getattr(shim, f"varena_torch_{name}"), ctypes.c_void_p).value for name in ("malloc", "free", "record_stream", "begin_pool", "end_pool", "release_pool")}
+    allocator = torch._C._cuda_customAllocator(hook["malloc"], hook["free"])
+    allocator.set_record_stream_fn(hook["record_stream"])
+    allocator.set_begin_allocate_to_pool(hook["begin_pool"])
+    allocator.set_end_allocate_to_pool_fn(hook["end_pool"])
+    allocator.set_release_pool(hook["release_pool"])
+    torch._C._cuda_changeCurrentAllocator(allocator)
 
 
 class Memory:
     """This process's memory on one device: its models, caches and requests."""
 
-    def __init__(self, native: Native, device: torch.device, pool: bool = True) -> None:
+    def __init__(self, native: Native, device: torch.device) -> None:
         self.native, self.device = native, device
         self.cuda = device.type == "cuda"
         self.models: dict[nn.Module, Model] = {}
@@ -430,35 +452,18 @@ class Memory:
         self.escaped: dict[tuple[str, str], int] = {}
         #: weights read outside their block's forward, bound on read: (reads, bytes) per block
         self.off_forward: dict[tuple[str, str], tuple[int, int]] = {}
-        #: each request thread's torch pool, whose segments varena's allocator makes room for
-        #: (torch rejects routing one pool from two threads at once)
-        self._pools: dict[int, torch.cuda.MemPool] = {}
-        self._pool_guard = threading.RLock()
-        #: Native pooling is the default; diagnostics may compare an explicit eager baseline.
-        self.pooling = pool
         #: Cross-stream consumers joined back into the binding stream.
         self.crossed = 0
 
-    @property
-    def pool(self) -> torch.cuda.MemPool | None:
-        """This thread's request pool (None off CUDA or unpooled)."""
-        if not self.cuda or not self.pooling:
-            return None
-        with self._pool_guard:
-            thread = threading.get_ident()
-            pool = self._pools.get(thread)
-            if pool is None:
-                pool = self._pools[thread] = self.new_pool()
-            return pool
-
     @classmethod
-    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = True) -> Memory:
+    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None) -> Memory:
         """A TensorD executor's memory (`grant`), or a standalone engine's: the device's table by
         name, its capacity lowered to `limit` (the first opener sets it, a later one can only
-        lower it). On CUDA the backend opens first and measures this process's context, so open
-        it before torch initializes CUDA, or torch's context counts as foreign bytes. CPU and MPS
-        use host pages on the machine's table `host` (its RAM); a `GpuId` names a host table.
-        A process has one Memory per device: while it lives, opening the device again returns it."""
+        lower it). On CUDA it is torch's only allocator from here on (`_install`), so open it
+        before any torch CUDA call; the backend opens first and measures this process's context.
+        CPU and MPS use host pages on the machine's table `host` (its RAM); a `GpuId` names a
+        host table. A process has one Memory per device: opening the device again returns it,
+        and a CUDA device's lives as long as the process (torch's blocks are its)."""
         device = torch.device("cpu") if isinstance(gpu, GpuId) else torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
         if device.type == "cuda":
             device = torch.device("cuda", device.index or 0)
@@ -469,11 +474,14 @@ class Memory:
                 if isinstance(gpu, GpuId):
                     native = Native.host(gpu, grant, limit)
                 elif device.type == "cuda":
+                    _install()
                     native = Native.cuda(device.index or 0, grant, limit)
                 else:
                     ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
                     native = Native.host(GpuId("host", device.type, ram), grant, limit)
-                memory = _memories[key] = cls(native, device, pool)
+                memory = _memories[key] = cls(native, device)
+                if device.type == "cuda":
+                    _serving[device.index or 0] = memory
         return memory
 
     @property
@@ -524,15 +532,14 @@ class Memory:
     @contextmanager
     def request(self, id: str, plan: Sequence[object] = (), *, idle: bool = False) -> Iterator[Request]:
         """Request `id` and its plan: its steps in order, each a model (`Model`, module or set
-        name) or a collection of models that run together. Its allocations on this thread go
-        to this thread's pool. An `idle` one (a capture or warm-up beside others' work) takes
-        free bytes only. Leaving ends it and drops the pool (`Request.flush_ms`)."""
+        name) or a collection of models that run together. torch's blocks on this thread go to
+        its arena (`Request.on_thread` for others). An `idle` one (a capture or warm-up beside
+        others' work) takes free bytes only."""
         r = Request(self, self.native.request(id, self._plan(plan), idle))
-        r.pool = self.pool
         self.requests[r] = None
         token = _request.set(r)
         try:
-            with self.allocating(r.pool):
+            with r.on_thread():
                 yield r
         except BaseException as failed:
             try:
@@ -546,63 +553,20 @@ class Memory:
             _request.reset(token)
 
     def _end(self, r: Request) -> None:
-        """The request's end, then its pool's: dropped (torch then frees its unused segments
-        through varena's allocator, syncing that pool's events) unless another request open
-        on this thread still routes to it."""
         self.requests.pop(r, None)
         r.ended = r.native.end()
-        pool, r.pool = r.pool, None
-        if pool is None or any(o.pool is pool for o in self.requests):
-            return
-        began = time.perf_counter()
-        with self._pool_guard:
-            for thread in [t for t, p in self._pools.items() if p is pool]:
-                del self._pools[thread]
-        _allocator_retire(self.device.index or 0, pool.id)
-        del pool
-        r.flush_ms = (time.perf_counter() - began) * 1e3
 
-    @contextmanager
-    def capturing(self) -> Iterator[None]:
-        """A CUDA graph capture is open on this device (on any thread): wrap `capture_begin` ...
-        `capture_end`. Meanwhile torch skips its release-and-retry after a refused allocation,
-        so varena's allocator makes room at once rather than first letting torch release a
-        dropped pool's segments."""
-        device = self.device.index or 0
-        _allocator_capture(device, True)
-        try:
-            yield
-        finally:
-            _allocator_capture(device, False)
+    def prepare_pool(self, pool: tuple[int, int], expected: int) -> None:
+        """Before a capture into torch pool `pool` (a `graph_pool_handle()`) begins: `expected`
+        bytes mapped into it now, making room here, so the capture never needs to (a capturing
+        thread is served from the pool's mapped bytes or its float, or refused)."""
+        self.native.prepare_pool(pool, expected)
 
-    def new_pool(self) -> torch.cuda.MemPool:
-        """A torch pool whose segments varena's allocator makes (a request's, or a graph's)."""
-        allocator = torch.cuda.memory.CUDAPluggableAllocator(_ext.__file__, "varena_torch_alloc", "varena_torch_free")
-        return torch.cuda.MemPool(allocator._allocator)
-
-    @contextmanager
-    def allocating(self, pool: torch.cuda.MemPool | None = None, *, route: bool = True) -> Iterator[None]:
-        """Route this thread's allocations to `pool` (this thread's request pool by default), its
-        segments counted for the current request. Warm and capture must name the same graph
-        pool: exit this before `torch.cuda.graph(pool=pool)`, or use `route=False` to keep the
-        accounting while the graph routes. Capture never grows its pool."""
-        selected = self.pool if pool is None and self.pooling else pool
-        r = _request.get()
-        if selected is None or r is None:
-            yield
-            return
-        if self.cuda and torch.cuda.is_current_stream_capturing():
-            raise Unbound("select and preseed the graph pool before capture")
-        r.native.allocating(self.native, selected.id)
-        route = route and selected.id not in _routes.get()
-        routed = _routes.set(_routes.get() | {selected.id}) if route else None
-        try:
-            with torch.cuda.use_mem_pool(selected, self.device) if route else nullcontext():
-                yield
-        finally:
-            if routed is not None:
-                _routes.reset(routed)
-            _allocated()
+    def torch_stats(self) -> dict[str, object]:
+        """varena's figures for torch's blocks here (torch's own memory statistics don't see a
+        pluggable allocator): allocated, mapped and peak bytes, and per open request."""
+        allocated, mapped, peak, requests = self.native.torch_stats()
+        return {"allocated": allocated, "mapped": mapped, "peak": peak, "requests": {r: (a, p) for r, a, p in requests}}
 
     def cache(self, owner: str, shrink: Callable[[int], int], sets: nn.Module | Model | Sequence[nn.Module | Model] = ()) -> Cache:
         """Bytes the caller holds that `shrink(want) -> freed` gives back when varena makes room
@@ -648,10 +612,6 @@ class Memory:
             model.identity = identity
             self.native.fill(model.id, _fill(model.fill))
 
-    def _rooms(self, r: Request) -> int:
-        """The make_room calls segments of the request's pool have made so far."""
-        return _allocator_stats(self.device.index or 0, r.pool.id)[2] if r.pool is not None else 0
-
     def _current(self) -> Request:
         r = _request.get()
         if r is None and len(self.requests) == 1:
@@ -674,14 +634,12 @@ class Memory:
         p: _Pass | None = None
         try:
             r = self._current()
-            if self.cuda:
-                _allocator_check(self.device.index or 0)
             self._declare(model)
             k = key()
-            p = _Pass(r.native.pass_(model.id, k), r, k, self._rooms(r))
-            # Off the request's thread its allocations go to the request's pool for the pass.
-            if r.pool is not None and r.pool.id not in _routes.get():
-                p.pooled = self.allocating(r.pool)
+            p = _Pass(r.native.pass_(model.id, k), r, k)
+            # Off the request's thread its torch blocks go to the request's arena for the pass.
+            if self.cuda and _arena.get() is not r:
+                p.pooled = r.on_thread()
                 p.pooled.__enter__()
             if model.common is not None:
                 self._enter(model.common)
@@ -693,8 +651,8 @@ class Memory:
             raise
 
     def _close(self, model: Model) -> None:
-        """A pass ends, failed or not. On CUDA varena reads what it held from the pool's segments;
-        MPS has none, so its allocated bytes then stand in for its peak."""
+        """A pass ends, failed or not. On CUDA varena reads its peak from the request's arena; MPS
+        has none, so its allocated bytes then stand in for it."""
         local = model.local
         local.depth -= 1
         p = getattr(local, "passing", None)
@@ -708,12 +666,7 @@ class Memory:
         finally:
             if p.pooled is not None:
                 p.pooled.__exit__(None, None, None)
-            peak = torch.mps.current_allocated_memory() if self.device.type == "mps" else 0
-            pool = p.request.pool
-            if pool is not None and self._rooms(p.request) > p.rooms:  # it made room: what torch kept free in its pool
-                free = [b["size"] for seg in pool.snapshot(include_traces=False) for b in seg["blocks"] if b["state"] == "inactive"]
-                p.request.pool_free.append((model.name, p.key, sum(free), max(free, default=0)))
-            p.native.end(peak)
+            p.native.end(torch.mps.current_allocated_memory() if self.device.type == "mps" else 0)
 
 
     # -- blocks
@@ -841,13 +794,6 @@ class Request:
     def __init__(self, memory: Memory, native: NativeRequest) -> None:
         self.memory, self.native = memory, native
         self.ended: Stats | None = None
-        #: this thread's pool, while the request routes to it
-        self.pool: torch.cuda.MemPool | None = None
-        #: milliseconds its pool's drop took at its end (torch syncs the pool's events)
-        self.flush_ms = 0.0
-        #: per pass that made room: (model, entry|dims, bytes in its pool's free blocks at the
-        #: pass's end, the largest of them)
-        self.pool_free: list[tuple[str, str, int, int]] = []
         #: (set, block) -> bytes kept bound in it for weight tensors that outlived their run
         self.escaped: dict[tuple[str, str], int] = {}
         #: (set, block) -> (reads, bytes) of weights read outside their block's forward
@@ -856,6 +802,22 @@ class Request:
     def plan(self, steps: Sequence[object]) -> None:
         """Replaces the plan (as `Memory.request` takes it); its cursor starts over."""
         self.native.plan(self.memory._plan(steps))
+
+    @contextmanager
+    def on_thread(self) -> Iterator[Request]:
+        """This thread's torch blocks go to this request's arena until it leaves: a Runtime
+        worker doing the request's work (R9). On this thread only."""
+        memory = self.memory
+        if not memory.cuda or _arena.get() is self:
+            yield self
+            return
+        guard = self.native.allocating(memory.native)
+        token = _arena.set(self)
+        try:
+            yield self
+        finally:
+            _arena.reset(token)
+            guard.end()
 
     def stats(self) -> Stats:
         return self.ended if self.ended is not None else self.native.stats()

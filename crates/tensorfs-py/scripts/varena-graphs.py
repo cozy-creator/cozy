@@ -2,8 +2,9 @@
 """Real-CUDA proof of cached graph addresses across physical weight eviction.
 
 Runs through varena-rental.py. A seeded linear network is larger than the imposed VRAM cap;
-its segments each use an explicit complete weight binding and a distinct preseeded Torch
-pool. The same CUDAGraph objects replay after backing eviction/refill. No compile, tuning,
+its segments each use an explicit complete weight binding and capture into the device's one
+Torch graph pool, mapped before each capture (`Memory.prepare_pool`). The same CUDAGraph
+objects replay after backing eviction/refill. No compile, tuning,
 or kernel selection occurs here. Every assertion/error propagates to the parent Cozy run.
 """
 from __future__ import annotations
@@ -19,7 +20,7 @@ from pathlib import Path
 import tensorfs
 import torch
 from torch import nn
-from tensorfs.varena import Fill, Level, VarenaError, allocator_stats
+from tensorfs.varena import Fill, Level, VarenaError
 from tensorfs.varena.torch import Declared, Memory, Weights
 
 WIDTH, DEPTH = 4096, 20
@@ -71,40 +72,40 @@ def main():
     print(json.dumps({"context_measurable": measurable}), flush=True)
     assert measurable, "a capped graph proof requires measured per-process driver/context bytes"
     stream = torch.cuda.Stream()
+    pool = torch.cuda.graph_pool_handle()  # the device's one capture pool
     records = []
     capture_ms = 0.0
     with torch.inference_mode(), mem.request("graph-capture", plan=[model] * DEPTH):
         for i, (layer, binding) in enumerate(zip(model.layers, bindings, strict=True)):
-            pool = mem.new_pool()
             graph = torch.cuda.CUDAGraph()
-            with binding.prepare(stream):
-                with mem.allocating(pool):
-                    static = source.to(mem.device)
-                    # Prewarm exactly the pool passed to capture, never the default request pool.
-                    warm = torch.nn.functional.linear(static, layer.weight)
-                    torch.cuda.synchronize()
-                    del warm
-                before = allocator_stats(0, pool.id)
+            with binding.prepare(stream), torch.cuda.stream(stream):
+                static = source.to(mem.device)
+                # Warm on the capture's stream (its cuBLAS workspace), in the request's arena.
+                warm = torch.nn.functional.linear(static, layer.weight)
+                torch.cuda.synchronize()
+                mem.prepare_pool(pool, warm.nbytes)
+                del warm
+                before = mem.torch_stats()["mapped"]
                 start = time.perf_counter()
-                with mem.allocating(pool, route=False), torch.cuda.graph(graph, pool=pool, stream=stream):
+                with torch.cuda.graph(graph, pool=pool, stream=stream):
                     output = torch.nn.functional.linear(static, layer.weight)
                 capture_ms += (time.perf_counter() - start) * 1000
-                assert allocator_stats(0, pool.id)[1] == before[1], "capture must not grow the preseeded pool"
+                assert mem.torch_stats()["mapped"] == before, "a capture maps nothing: its pool was prepared"
                 graph.replay()
                 wanted = torch.nn.functional.linear(static, layer.weight)
                 torch.testing.assert_close(output, wanted)
                 address = layer.weight.data_ptr()
-            records.append((binding, graph, pool, static, output, address))
+            records.append((binding, graph, static, output, address))
             torch.cuda.synchronize()
             mem.native.load(placed.set, Level.RAM)  # release backing; graph+VA stay live
-            print(f"CAPTURE {i + 1}/{DEPTH} ptr={address:#x} pool={pool.id}", flush=True)
+            print(f"CAPTURE {i + 1}/{DEPTH} ptr={address:#x}", flush=True)
 
     def run(label, value, force_evict):
         moved = None
         start = time.perf_counter()
         with torch.inference_mode(), mem.request(label, plan=[model]) as request, placed.passing():
             x = value.to(mem.device)
-            for i, (binding, graph, pool, static, output, address) in enumerate(records):
+            for i, (binding, graph, static, output, address) in enumerate(records):
                 with binding.prepare(stream):
                     assert model.layers[i].weight.data_ptr() == address
                     static.copy_(x)
@@ -123,7 +124,7 @@ def main():
     run("graph-streaming-automatic", source, False)
 
     # One graph instance's lock covers its input copies and output materialization too.
-    binding, graph, pool, static, output, address = records[0]
+    binding, graph, static, output, address = records[0]
     with binding.prepare(stream):
         reference = torch.nn.functional.linear(source.to(mem.device), model.layers[0].weight).cpu()
     def caller(scale):
@@ -139,18 +140,17 @@ def main():
         list(executor.map(caller, [1.0, 2.0]))
     print("PASS two concurrent callers serialize input, replay and output use", flush=True)
 
-    # An unprepared allocation must fail capture without native recovery or poisoning CUDA.
-    empty = mem.new_pool()
-    before = allocator_stats(0, empty.id)
+    # A capture short of its prepared pool is refused, making no room, and CUDA stays usable.
+    before = mem.torch_stats()["mapped"]
     failed = False
     with mem.request("capture-growth-refused"):
         try:
             bad = torch.cuda.CUDAGraph()
-            with mem.allocating(empty, route=False), torch.cuda.graph(bad, pool=empty, stream=stream):
+            with torch.cuda.graph(bad, pool=torch.cuda.graph_pool_handle(), stream=stream):
                 torch.empty(8 << 20, dtype=torch.uint8, device=mem.device)
         except (torch.OutOfMemoryError, RuntimeError):
             failed = True
-    assert failed and allocator_stats(0, empty.id)[2] == before[2], "capture must refuse growth without allocator recovery"
+    assert failed and mem.torch_stats()["mapped"] == before, "a capture's shortfall is refused, never made room for"
     torch.cuda.synchronize()
     assert torch.ones(1, device=mem.device).item() == 1
     print("PASS capture growth refused without recovery; CUDA remains usable", flush=True)
@@ -163,7 +163,7 @@ def main():
         assert error.code == "STALE_BINDING", f"stale identity raised the wrong refusal: {error}"
     for binding in bindings:
         binding.close()
-    print(json.dumps({"PASS": True, "graphs": len(records), "capture_ms": capture_ms, "weights": weight_bytes, "cap": CAP, "allocator": allocator_stats(0)}), flush=True)
+    print(json.dumps({"PASS": True, "graphs": len(records), "capture_ms": capture_ms, "weights": weight_bytes, "cap": CAP, "torch": mem.torch_stats()}), flush=True)
 
 
 if __name__ == "__main__":

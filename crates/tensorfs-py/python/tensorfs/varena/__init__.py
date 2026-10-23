@@ -2,6 +2,7 @@
 for model weights on one device. `tensorfs.varena.torch` is the adapter for torch modules."""
 
 from .._ext.varena import (
+    Allocating,
     Exhausted,
     Fill,
     Fills,
@@ -22,18 +23,11 @@ from .._ext.varena import (
     StepStats,
     VarenaError,
     Window,
-    allocated,
-    allocator_stats,
-    allocator_pending,
-    allocator_check,
-    allocator_quarantined,
-    allocator_refusals,
-    allocator_capture,
-    allocator_retire,
     pins_held,
 )
 
 __all__ = [
+    "Allocating",
     "Exhausted",
     "Fill",
     "Fills",
@@ -54,13 +48,5 @@ __all__ = [
     "StepStats",
     "VarenaError",
     "Window",
-    "allocated",
-    "allocator_stats",
-    "allocator_pending",
-    "allocator_check",
-    "allocator_quarantined",
-    "allocator_refusals",
-    "allocator_capture",
-    "allocator_retire",
     "pins_held",
 ]

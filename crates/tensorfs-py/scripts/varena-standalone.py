@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import ctypes
 import faulthandler
 import gc
 import json
@@ -137,7 +138,7 @@ def loaded(ck: tensorfs.Checkpoint, mem: Memory, fill: Scale | None = None, rele
 
 
 def concurrent(mem: Memory, ck: tensorfs.Checkpoint) -> None:
-    """Two threads run two models' passes interleaved, each request on its own thread's pool:
+    """Two threads run two models' passes interleaved, each request in its own arena:
     the first allocates and frees a buffer, then waits while the second runs its pass."""
     a, b = loaded(ck, mem, release="concurrent"), loaded(ck, mem, release="concurrent")
     big = 1 << 29  # far above the tiny model's own activations, so the peaks tell the passes apart
@@ -190,7 +191,7 @@ def run(mem: Memory, unet: UNet2DConditionModel, want: list[torch.Tensor], id: s
         print(f"EXHAUSTED {id}: {short}; STATS {short.stats.json()}", flush=True)
         raise
     stats = r.stats()
-    print(f"STATS {id}: {stats.json()}; pool free at make_room {r.pool_free}; flush {r.flush_ms:.1f} ms", flush=True)
+    print(f"STATS {id}: {stats.json()}", flush=True)
     check(f"{id}: leaves nothing behind", stats.leftover == 0, stats.leftover)
     check(f"{id}: its record crosses as JSON", json.loads(stats.json())["request"] == id, stats.json())
     return stats, got
@@ -244,6 +245,30 @@ def stub_matches() -> None:
     check("the compiled module matches its stub", got == want, {k: (got.get(k), want.get(k)) for k in got.keys() | want.keys() if got.get(k) != want.get(k)})
 
 
+def shim() -> None:
+    """varena's torch allocator shim as the wheel ships it: built for this torch, its hooks and
+    the agent's C ABI resolve, and a build for another torch is refused naming both."""
+    built = json.loads(adapter._SHIM.with_suffix(".json").read_text())
+    running = {"torch": ".".join(torch.__version__.split(".")[:2]), "cxx11_abi": int(torch._C._GLIBCXX_USE_CXX11_ABI)}
+    check("shim: built for this torch", built == running, (built, running))
+    lib, ext = ctypes.CDLL(str(adapter._SHIM)), ctypes.CDLL(tensorfs._ext.__file__)
+    hooks = [f"varena_torch_{h}" for h in ("bind", "malloc", "free", "record_stream", "begin_pool", "end_pool", "release_pool")]
+    agent = [f"varena_agent_{f}" for f in ("alloc", "free", "record_stream", "pool_begin", "pool_end", "pool_release")]
+    missing = [h for h in hooks if not hasattr(lib, h)] + [f for f in agent if not hasattr(ext, f)]
+    check("shim: its hooks and the agent's C ABI resolve", not missing, missing)
+    other = Path(tempfile.mkdtemp(prefix="varena-shim-")) / adapter._SHIM.name
+    other.with_suffix(".json").write_text(json.dumps({**built, "torch": "0.0"}))
+    shipped, adapter._SHIM = adapter._SHIM, other
+    try:
+        adapter._install()
+        refused = ""
+    except native.VarenaError as e:
+        refused = str(e)
+    finally:
+        adapter._SHIM = shipped
+    check("shim: a build for another torch is refused, naming both", "'0.0'" in refused and repr(running["torch"]) in refused, refused)
+
+
 def opened(table: str, capacity: int) -> Memory:
     """A standalone memory of `capacity` bytes: host pages on table `table`, or GPU 0's table
     lowered to it."""
@@ -264,21 +289,16 @@ def child(store: str, table: str, capacity: int, reference: str) -> int:
 
 
 def gone(memory: weakref.ref[Memory], phase: str) -> None:
-    """One Memory per device in a process: a phase's goes before the next opens (on a GPU they
-    share the card's table, and each would count the other's pages as its own context). On a
-    GPU its dropped pools' segments, torch's until it releases them, hold its row: released
-    (empty_cache) and retired first."""
+    """One Memory per device in a process: a phase's goes before the next opens. A CUDA
+    device's is torch's allocator and lives as long as the process: no request's arena is
+    left open."""
     gc.collect()
     if CUDA:
-        # cuBLAS keeps a workspace per handle and stream until cleared, made where its first
-        # matmul ran: in a request's pool, whose segment it keeps (and the memory with it).
         torch._C._cuda_clearCublasWorkspaces()
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        while native.allocator_pending(0):
-            time.sleep(1e-3)
-        live = native.allocator_stats(0)[0]
-        check(f"{phase}: its pools' segments all came back", live == 0, (live, native.allocator_stats(0)))
+        held = memory().torch_stats()["requests"]
+        check(f"{phase}: no request's arena outlives it", not held, held)
+        return
     check(f"{phase}: its memory is gone before the next phase opens one", memory() is None, gc.get_referrers(memory()) if memory() else "")
 
 
@@ -518,50 +538,6 @@ def capped(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, cap
     return weakref.ref(mem)
 
 
-def pools(tag: str) -> weakref.ref[Memory]:
-    """torch's handling of the request pool's segments (CUDA), which the allocator's NULL-once
-    rests on: a live pool keeps its cached segment through torch's OOM retry chain; a dropped
-    pool (a request's end) gives its unused segments back through varena's free at once; one
-    still in use comes back at the next retry chain after its tensor dies."""
-    mem, mib = opened(f"{tag}-pools", 1 << 31), 1 << 20
-    device = mem.device.index or 0
-
-    def segments(pool: tuple[int, int]) -> tuple[int, int]:
-        """The pool's live segment bytes and segments freed, once retirements in flight land."""
-        torch.cuda.synchronize(mem.device)
-        while native.allocator_pending(device):
-            time.sleep(1e-3)
-        live, *_, freed = native.allocator_stats(device, pool)
-        return live, freed
-
-    def retry_chain() -> None:
-        """An allocation over torch's fraction cap: torch runs its retry chain, then raises."""
-        torch.cuda.set_per_process_memory_fraction(1e-6, mem.device)
-        try:
-            torch.empty(64 * mib, dtype=torch.uint8, device=mem.device)
-        except torch.OutOfMemoryError:
-            pass
-        finally:
-            torch.cuda.set_per_process_memory_fraction(1.0, mem.device)
-
-    with mem.request("pools") as r:
-        pool = r.pool.id
-        cached = torch.empty(32 * mib, dtype=torch.uint8, device=mem.device)
-        del cached  # a cached, unused segment in the live pool
-        before = segments(pool)
-        retry_chain()
-        check("pools: a live pool keeps its cached segment through torch's retry chain", segments(pool) == before and before[0] >= 32 * mib, (before, segments(pool)))
-    check("pools: a request's end gives its pool's unused segments back through varena's free", segments(pool) == (0, before[1] + 1), (before, segments(pool), r.flush_ms))
-    with mem.request("pools kept") as r:
-        pool = r.pool.id
-        kept = torch.empty(32 * mib, dtype=torch.uint8, device=mem.device)
-    held = segments(pool)
-    del kept
-    retry_chain()
-    check("pools: a dropped pool's segment in use comes back at the retry chain after its tensor dies", held[0] >= 32 * mib and segments(pool)[0] == 0, (held, segments(pool)))
-    return weakref.ref(mem)
-
-
 def held_caches(tag: str) -> weakref.ref[Memory]:
     """A request's end asks the caches it owns for everything, unless one is held (a graph pool
     a replay still reads)."""
@@ -666,6 +642,7 @@ def baked(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, capa
 
 def main() -> int:
     stub_matches()
+    shim()
     store = Path(tempfile.mkdtemp(prefix="varena-standalone-")) / "store"
     plain, ck = build(store)
     tag = f"varena-standalone-{os.getpid()}"
@@ -674,8 +651,6 @@ def main() -> int:
     if not CUDA:
         gone(overhead(ck, plain, tag), "overhead")
     gone(held_caches(tag), "held caches")
-    if CUDA:
-        gone(pools(tag), "pools")
     ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
     blocks = sorted(spans[1:])
     # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.

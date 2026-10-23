@@ -23,7 +23,7 @@ mod resident_decode;
 #[cfg(feature = "store")]
 mod varena;
 #[cfg(feature = "store")]
-mod allocator;
+mod agent;
 
 use pyo3::prelude::*;
 
