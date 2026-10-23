@@ -11,7 +11,7 @@ use platform::handles::Owned;
 use tensorfs::io::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUdevice, CUevent, CUstream, CtxGuard};
 use tensorfs::io::Dst;
 
-use crate::backend::{Access, Backend, Event, Physical, Va};
+use crate::backend::{Access, Backend, Event, Physical, Retired, Va};
 use crate::{Error, GpuId, Result};
 
 #[cfg(unix)]
@@ -77,9 +77,8 @@ pub struct CudaBackend {
     nvml: Option<platform::gpu::Device>,
     /// The device's used bytes `open` measured across making the context.
     context: u64,
-    /// Events retired while still pending: destroyed once complete, never before (cuEventDestroy
-    /// of a pending event can block until it completes, behind any other stream's work).
-    retired: parking_lot::Mutex<Vec<Event>>,
+    /// Events given up: destroyed once, once complete.
+    retired: Retired,
     /// What `prop`'s WIN32 metadata points at, for as long as pages are created.
     #[cfg(windows)]
     _security: Box<SecurityAttributes>,
@@ -133,7 +132,7 @@ impl CudaBackend {
             capacity: total as u64,
             nvml,
             context,
-            retired: parking_lot::Mutex::new(Vec::new()),
+            retired: Retired::default(),
             #[cfg(windows)]
             _security: security,
         })
@@ -186,6 +185,17 @@ impl CudaBackend {
 fn used(nvml: Option<&platform::gpu::Device>) -> Option<u64> {
     let reading = nvml?.read().ok()?;
     Some(reading.total.saturating_sub(reading.free))
+}
+
+impl CudaBackend {
+    /// Complete, or unknowable (its query failed): nothing waits on it any more.
+    fn complete(&self, event: Event) -> bool {
+        self.query(event).unwrap_or(true)
+    }
+
+    fn destroy_event(&self, event: Event) {
+        self.logged("cuEventDestroy", || Ok(call!("cuEventDestroy", event_destroy(raw(event)))?));
+    }
 }
 
 fn raw(event: Event) -> CUevent {
@@ -387,20 +397,13 @@ impl Backend for CudaBackend {
         Ok(call!("cuEventSynchronize", event_synchronize(raw(event)))?)
     }
 
-    /// Never blocks: an event is destroyed once complete, here or at a later retire.
+    /// Queued only: destroyed by a sweep (the mechanism or trim thread) once complete.
     fn retire(&self, event: Event) {
-        if event == Event::DONE {
-            return;
-        }
-        let mut retired = self.retired.lock();
-        retired.push(event);
-        retired.retain(|e| match self.query(*e) {
-            Ok(false) => true,
-            Ok(true) | Err(_) => {
-                self.logged("cuEventDestroy", || Ok(call!("cuEventDestroy", event_destroy(raw(*e)))?));
-                false
-            }
-        });
+        self.retired.retire(event);
+    }
+
+    fn sweep(&self) {
+        self.retired.sweep(|e| self.complete(e), |e| self.destroy_event(e));
     }
 
     fn drain(&self) -> Result<()> {
