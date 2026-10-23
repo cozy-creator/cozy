@@ -262,70 +262,28 @@ mod tests {
         assert!(signed.contains(&("x-amz-date".into(), "20130524T000000Z".into())));
     }
 
-    /// The SDK's signer, which this one replaced (xs-067): every request signs the same.
+    /// The query as AWS's SDK signed it: decoded as a form, encoded again, the pairs sorted.
+    /// (Before it was replaced, the SDK's signer and this one agreed on 400 generated requests:
+    /// paths with escapes, repeated and transport headers, sessions, payload digests, ports.)
     #[test]
-    fn signs_as_the_aws_sdk_did() {
-        use aws_credential_types::Credentials;
-        use aws_sigv4::http_request::{sign, PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningSettings, UriPathNormalizationMode};
-        use aws_sigv4::sign::v4;
-        let sdk = |signer: &SigV4, r: &Request<'_>, now: u64| -> Vec<(String, String)> {
-            let credentials = Credentials::new(&signer.access_key, &signer.secret, signer.session.clone(), None, "tensorfs");
-            let identity = credentials.into();
-            let mut settings = SigningSettings::default();
-            settings.percent_encoding_mode = PercentEncodingMode::Single;
-            settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
-            settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-            let params = v4::SigningParams::builder().identity(&identity).region(&signer.region).name("s3")
-                .time(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now)).settings(settings).build().unwrap().into();
-            let body = r.payload.map_or(SignableBody::UnsignedPayload, |hex| SignableBody::Precomputed(hex.to_owned()));
-            let signable = SignableRequest::new(r.method, r.url, r.headers.iter().map(|(n, v)| (n.as_str(), v.as_str())), body).unwrap();
-            let (instructions, _) = sign(signable, &params).unwrap().into_parts();
-            let mut out: Vec<_> = instructions.headers().map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
-            out.sort();
-            out
-        };
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut pick = |n: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % n as u64) as usize
-        };
-        let urls = [
-            "https://s3.us-east-1.amazonaws.com/bucket/models/sdxl/unet.cozytensors",
-            "https://s3.eu-west-2.amazonaws.com:443/bucket/a%20b/c+d/~x_y-z.bin",
-            "http://localhost:9000/bucket/key?list-type=2&prefix=a%2Fb&delimiter=/",
-            "https://acct.r2.cloudflarestorage.com/b/k?continuation-token=AbC+d%3D%3D&empty=&flag&z=1&a=2&a=1",
-            "https://minio.example.test:9443/b/%E2%9C%93/obj?uploadId=x%2By&partNumber=7",
-            "http://127.0.0.1/b/o?x-id=GetObject&versionId=null&response-content-type=text%2Fplain%3Bcharset%3Dutf-8",
-        ];
-        let header_pool = [
-            ("Content-Type", "application/octet-stream"),
-            ("x-amz-meta-Origin", "  cozy   tensorfs  "),
-            ("X-Amz-Meta-Origin", "second"),
-            ("content-length", "1048576"),
-            ("If-None-Match", "\"etag-1\""),
-            ("x-amz-checksum-mode", "ENABLED"),
-            ("User-Agent", "cozy/0.11"),
-            ("transfer-encoding", "chunked"),
-        ];
-        let mut vectors = Vec::new();
-        for case in 0..400 {
-            let session = (pick(2) == 0).then(|| format!("session/token+{case}=="));
-            let signer = SigV4::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", session, ["us-east-1", "auto", "eu-west-2"][pick(3)]);
-            let headers: Vec<(String, String)> = (0..pick(4)).map(|_| header_pool[pick(header_pool.len())]).map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
-            let payload = (pick(2) == 0).then_some(EMPTY);
-            let r = request(["GET", "HEAD", "PUT", "POST", "DELETE"][pick(5)], urls[pick(urls.len())], &headers, payload);
-            let now = 1_700_000_000 + pick(400_000_000) as u64;
-            let mut ours = signer.sign(&r, now).unwrap();
-            ours.sort();
-            assert_eq!(ours, sdk(&signer, &r, now), "case {case}: {} {} {headers:?} {payload:?} at {now}", r.method, r.url);
-            if case % 100 == 0 {
-                vectors.push(format!("{} {} {headers:?} {payload:?} {:?} {} {now} => {ours:?}", r.method, r.url, signer.session, signer.region));
-            }
-        }
-        for vector in vectors {
-            println!("VECTOR {vector}");
-        }
+    fn canonical_query_sorts_and_reencodes_pairs() {
+        assert_eq!(
+            canonical_query("continuation-token=AbC+d%3D%3D&empty=&flag&z=1&a=2&a=1"),
+            "a=1&a=2&continuation-token=AbC%20d%3D%3D&empty=&flag=&z=1"
+        );
+        assert_eq!(canonical_query("prefix=a%2Fb&delimiter=/&list-type=2"), "delimiter=%2F&list-type=2&prefix=a%2Fb");
+        assert_eq!(canonical_query(""), "");
+    }
+
+    #[test]
+    fn a_session_is_signed_and_transport_headers_are_not() {
+        let signer = SigV4::new("AKIDEXAMPLE", "secret", Some("token".into()), "auto");
+        let headers = [("Range".to_owned(), "bytes=0-9".to_owned()), ("User-Agent".to_owned(), "cozy".to_owned())];
+        let get = request("GET", "https://acct.r2.cloudflarestorage.com/b/k", &headers, None);
+        let signed = signer.sign(&Request { headers: &headers[1..], ..get }, 1_700_000_000).unwrap();
+        let authorization = &signed.iter().find(|(name, _)| name == "authorization").unwrap().1;
+        assert!(authorization.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token,"), "{authorization}");
+        assert!(signed.contains(&("x-amz-security-token".into(), "token".into())));
+        assert!(signed.contains(&("x-amz-content-sha256".into(), "UNSIGNED-PAYLOAD".into())));
     }
 }

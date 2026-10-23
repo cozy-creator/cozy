@@ -65,9 +65,6 @@ name = "writer"
 required-features = ["faults"]
 
 [dev-dependencies]
-# xs-067: the SDK signer, only to prove ours signs the same; removed once proven.
-aws-sigv4 = { version = "1.4", default-features = false, features = ["sign-http", "http1"] }
-aws-credential-types = "1.2"
 libc.workspace = true
 rcgen.workspace = true
 
