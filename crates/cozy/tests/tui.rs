@@ -237,12 +237,18 @@ fn run_list_on_one_machine() {
     for run in [&first, &second, &elsewhere] {
         home.json(["run", "cancel", run, "--json"]);
     }
+    let listed = |args: &[&str]| home.json(["run", "list", "--json"].iter().chain(args));
     let numbers = |args: &[&str]| -> Vec<String> {
-        let listed = home.json(["run", "list", "--json"].iter().chain(args));
-        let runs = listed["runs"].as_array().unwrap().iter();
-        runs.map(|r| r["number"].to_string()).collect()
+        let runs = listed(args)["runs"].as_array().unwrap().clone();
+        runs.iter().map(|r| r["number"].to_string()).collect()
     };
-    let on_live = vec![second.clone(), first.clone()];
+    // Its own runs (its Runtime's update among them), as the whole list says where each ran.
+    let all = listed(&[])["runs"].as_array().unwrap().clone();
+    let on_live: Vec<String> = (all.iter().filter(|r| r["machine"] == "live"))
+        .map(|r| r["number"].to_string())
+        .collect();
+    assert!(on_live.contains(&first) && on_live.contains(&second), "{all:?}");
+    assert!(!on_live.contains(&elsewhere), "{all:?}");
     assert_eq!(numbers(&["--on", "live"]), on_live);
     let newest = numbers(&["--on", "live", "--state", "canceled", "--limit", "1"]);
     assert_eq!(newest, [second.clone()]);
