@@ -36,7 +36,7 @@ pub enum Kind {
 }
 
 /// How the manager may reclaim a region (the Region frame's kind).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Reclaimable {
     Graph,
     Swappable,
@@ -50,6 +50,8 @@ pub struct Record {
     pub kind: Reclaimable,
     /// Bytes it maps now (0 once reclaimed).
     pub bytes: u64,
+    /// The lease slots of the chunks it holds (none standalone).
+    pub slots: Vec<u32>,
     /// Its measured production (or capture) time.
     pub cost_ns: u64,
     /// Its last unpin, in ns since the process's first region.
@@ -168,6 +170,7 @@ impl Shared {
         if r.closed {
             return Err(Error::Closed(format!("region {} ({})", self.id, self.owner)));
         }
+        let remapped = r.evicted.is_some();
         let fresh = match r.evicted.as_mut() {
             Some(ev) => self.memory.torch()?.make_resident(Owner::Region(self.id), ev)?,
             None => false,
@@ -175,8 +178,30 @@ impl Shared {
         r.evicted = None;
         r.pins += 1;
         drop(r);
+        if remapped {
+            self.publish();
+        }
         let route = route.then(|| self.memory.region_allocating(self.id));
         Ok(RegionPin { sh: self.clone(), fresh, _route: route })
+    }
+
+    fn record(&self) -> Record {
+        let torch = self.memory.torch_if();
+        let owner = Owner::Region(self.id);
+        Record {
+            id: self.id,
+            kind: if self.spill { Reclaimable::Swappable } else { Reclaimable::Discardable },
+            bytes: torch.as_ref().map_or(0, |t| t.mapped_by(owner)),
+            slots: torch.as_ref().map_or_else(Vec::new, |t| t.slots(owner)),
+            cost_ns: self.produced_ns.load(Ordering::Acquire),
+            last_use: self.last_use.load(Ordering::Acquire),
+            next_use: u32::try_from(self.next_use.load(Ordering::Acquire)).ok(),
+        }
+    }
+
+    /// Its facts to the lease manager, at its create and its changes.
+    fn publish(&self) {
+        self.memory.region_facts(self.id, Some(&self.record()));
     }
 
     fn unpin(&self) {
@@ -217,6 +242,8 @@ impl Shared {
         self.asked.store(ASKED_NONE, Ordering::Release);
         let (bytes, swapped) = (ev.bytes, ev.swapped());
         r.evicted = Some(ev);
+        drop(r);
+        self.publish();
         Ok(if swapped { Reclaimed::Swapped(bytes) } else { Reclaimed::Discarded(bytes) })
     }
 
@@ -229,6 +256,7 @@ impl Shared {
         self.asked.store(ASKED_NONE, Ordering::Release);
         drop(r);
         LIVE.lock().remove(&self.id);
+        self.memory.region_facts(self.id, None);
         if let Some(t) = self.memory.torch_if() {
             t.forget_evicted(Owner::Region(self.id));
         }
@@ -258,6 +286,10 @@ impl RegionPin {
 impl Drop for RegionPin {
     fn drop(&mut self) {
         self.sh.unpin();
+        // Filled: its arena's chunks changed.
+        if self._route.is_some() {
+            self.sh.publish();
+        }
     }
 }
 
@@ -297,11 +329,13 @@ impl Region {
     /// Its production time, for the swap-versus-discard choice (§6).
     pub fn produced(&self, ns: u64) {
         self.sh.produced_ns.store(ns, Ordering::Release);
+        self.sh.publish();
     }
 
     /// The plan step of its next use; `None`: no use declared.
     pub fn next_use(&self, step: Option<u32>) {
         self.sh.next_use.store(step.map_or(u64::MAX, u64::from), Ordering::Release);
+        self.sh.publish();
     }
 
     /// Releases it: its spans leave as they come whole free. The record names the blocks still live.
@@ -422,7 +456,34 @@ impl Graph {
         h.pins.clear();
         h.bindings.clear();
         self.dropped.store(true, Ordering::Release);
+        drop(h);
+        if !self.closed.load(Ordering::Acquire) {
+            self.publish();
+        }
         Ok(Reclaimed::Dropped)
+    }
+
+    fn record(&self) -> Record {
+        let dropped = self.dropped.load(Ordering::Acquire);
+        let mut slots = Vec::new();
+        if !dropped {
+            let sets: Vec<SetId> = self.sets.iter().chain(&self.retained).copied().collect();
+            slots = self.memory.lease_slots(&sets);
+            slots.extend(self.memory.torch_if().map_or_else(Vec::new, |t| t.slots(Owner::Pool(self.pool))));
+        }
+        Record {
+            id: self.id,
+            kind: Reclaimable::Graph,
+            bytes: if dropped { 0 } else { self.held.lock().pins.iter().map(|p| p.len).sum() },
+            slots,
+            cost_ns: self.capture_ns.load(Ordering::Acquire),
+            last_use: self.last_use.load(Ordering::Acquire),
+            next_use: None,
+        }
+    }
+
+    fn publish(&self) {
+        self.memory.region_facts(self.id, Some(&self.record()));
     }
 
     fn end(&self) {
@@ -433,6 +494,7 @@ impl Graph {
         if let Err(e) = self.drop_now() {
             tracing::warn!("varena: dropping graph region {}: {e}", self.id);
         }
+        self.memory.region_facts(self.id, None);
         self.memory.pool_release(self.pool);
     }
 }
@@ -471,6 +533,7 @@ impl GraphRegion {
     /// A capture's measured time, for the manager's ranking.
     pub fn captured(&self, ns: u64) {
         self.g.capture_ns.store(ns, Ordering::Release);
+        self.g.publish();
     }
 
     /// Before each replay: false while the region is Dropping (run eager, recapture off-path).
@@ -535,6 +598,7 @@ impl Memory {
             last_use: AtomicU64::new(now_ns()),
         });
         LIVE.lock().insert(sh.id, Live::Cache(Arc::downgrade(&sh)));
+        sh.publish();
         Ok(Region { sh })
     }
 
@@ -562,6 +626,7 @@ impl Memory {
             last_use: AtomicU64::new(now_ns()),
         });
         LIVE.lock().insert(g.id, Live::Graph(Arc::downgrade(&g)));
+        g.publish();
         Ok(GraphRegion { g })
     }
 
@@ -571,37 +636,20 @@ impl Memory {
     pub fn region_reclaim(&self, id: u64, swap: bool) -> Result<Reclaimed> {
         let found = LIVE.lock().get(&id).and_then(Live::upgrade);
         match found {
-            Some(Found::Cache(sh)) if sh.memory.same(self) => sh.reclaim(Some(swap)),
-            Some(Found::Graph(g)) if g.memory.same(self) => g.drop_now(),
-            _ => Ok(Reclaimed::Gone),
+            Some(Found::Cache(sh)) if sh.memory.same(self) => {}
+            Some(Found::Graph(g)) if g.memory.same(self) => {}
+            _ => return Ok(Reclaimed::Gone),
         }
+        reclaim(id, swap)
     }
 
     /// This device's live regions, as the manager's policy sees them.
     pub fn region_records(&self) -> Vec<Record> {
-        let live: Vec<(u64, Found)> = LIVE.lock().iter().filter_map(|(id, l)| l.upgrade().map(|f| (*id, f))).collect();
-        let mapped = self.region_mapped();
+        let live: Vec<Found> = LIVE.lock().values().filter_map(Live::upgrade).collect();
         live.into_iter()
-            .filter_map(|(id, l)| match l {
-                Found::Cache(sh) if sh.memory.same(self) => {
-                    let next = sh.next_use.load(Ordering::Acquire);
-                    Some(Record {
-                        id,
-                        kind: if sh.spill { Reclaimable::Swappable } else { Reclaimable::Discardable },
-                        bytes: mapped.get(&id).copied().unwrap_or(0),
-                        cost_ns: sh.produced_ns.load(Ordering::Acquire),
-                        last_use: sh.last_use.load(Ordering::Acquire),
-                        next_use: u32::try_from(next).ok(),
-                    })
-                }
-                Found::Graph(g) if g.memory.same(self) => Some(Record {
-                    id,
-                    kind: Reclaimable::Graph,
-                    bytes: if g.dropped.load(Ordering::Acquire) { 0 } else { g.held.lock().pins.iter().map(|p| p.len).sum() },
-                    cost_ns: g.capture_ns.load(Ordering::Acquire),
-                    last_use: g.last_use.load(Ordering::Acquire),
-                    next_use: None,
-                }),
+            .filter_map(|l| match l {
+                Found::Cache(sh) if sh.memory.same(self) => Some(sh.record()),
+                Found::Graph(g) if g.memory.same(self) => Some(g.record()),
                 _ => None,
             })
             .collect()
@@ -612,33 +660,36 @@ impl Memory {
         let (warm, idle_pages, largest) = self.step_bytes(step);
         let torch = self.torch_if();
         let float = torch.as_ref().map_or(0, |t| t.idle().0);
-        let pinned: Vec<u64> = LIVE
+        let unpinned: Vec<u64> = LIVE
             .lock()
             .iter()
             .filter_map(|(id, l)| match l {
                 // Locked (a pin making it resident, a reclaim): not cold either way.
-                Live::Cache(w) => w.upgrade().filter(|s| s.memory.same(self) && s.res.try_lock().is_none_or(|r| r.pins > 0)).map(|_| *id),
+                Live::Cache(w) => w.upgrade().filter(|s| s.memory.same(self) && s.res.try_lock().is_some_and(|r| r.pins == 0)).map(|_| *id),
                 Live::Graph(_) => None,
             })
             .collect();
-        let regions: u64 = self.region_mapped().into_iter().filter(|(id, _)| !pinned.contains(id)).map(|(_, b)| b).sum();
+        let regions: u64 = torch.as_ref().map_or(0, |t| unpinned.iter().map(|id| t.mapped_by(Owner::Region(*id))).sum());
         let (free, others) = match self.figures() {
             Some(f) => (f.free, f.revocable),
             None => (self.standalone_free(), 0),
         };
         Room { free: free + float, cold: others + regions + idle_pages, warm, granularity: self.granularity(), floor: SLOTS * largest }
     }
+}
 
-    /// Bytes each region's arena maps now.
-    fn region_mapped(&self) -> HashMap<u64, u64> {
-        let Some(t) = self.torch_if() else { return HashMap::new() };
-        t.stats()
-            .arenas
-            .into_iter()
-            .filter_map(|(o, a)| match o {
-                Owner::Region(id) => Some((id, a.mapped)),
-                _ => None,
-            })
-            .collect()
+/// The manager's Reclaim of region `id`, whole: a cache region is swapped (`swap`, when it spills)
+/// or discarded once unpinned, a graph region dropped. Region ids are the process's, so the agent's
+/// mechanism thread finds it by id alone.
+pub(crate) fn reclaim(id: u64, swap: bool) -> Result<Reclaimed> {
+    // Bound first: the registry's lock is never held across a reclaim's wait.
+    let found = LIVE.lock().get(&id).and_then(Live::upgrade);
+    match found {
+        Some(Found::Cache(sh)) => sh.reclaim(Some(swap)),
+        Some(Found::Graph(g)) => g.drop_now(),
+        None => Ok(Reclaimed::Gone),
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;

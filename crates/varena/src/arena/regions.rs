@@ -181,6 +181,18 @@ impl Torch {
         self.sh.revive(&a, &mut st);
     }
 
+    /// The bytes `owner`'s arena maps now.
+    pub fn mapped_by(&self, owner: Owner) -> u64 {
+        self.sh.arenas.lock().get(&owner).cloned().map_or(0, |a| a.st.lock().mapped)
+    }
+
+    /// The source's slots of the chunks `owner`'s arena maps now.
+    pub fn slots(&self, owner: Owner) -> Vec<u32> {
+        let Some(a) = self.sh.arenas.lock().get(&owner).cloned() else { return Vec::new() };
+        let st = a.st.lock();
+        st.spans.values().flat_map(|s| s.chunks.iter()).filter_map(|c| self.sh.source.slot(c)).collect()
+    }
+
     /// Before a region's arena ends: its evicted spans with no live block give their addresses back.
     pub fn forget_evicted(&self, owner: Owner) {
         let Some(a) = self.sh.arenas.lock().get(&owner).cloned() else { return };

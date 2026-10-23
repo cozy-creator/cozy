@@ -109,6 +109,10 @@ pub trait Source: Send + Sync {
     /// Idle chunks' epochs passed: chunks asked back may go now ([`Torch::reclaim_chunks`]). The
     /// poller's, no lock held.
     fn quiet(&self) {}
+    /// The lease table slot a chunk is granted in, for the region facts the manager ranks.
+    fn slot(&self, _chunk: &Chunk) -> Option<u32> {
+        None
+    }
 }
 
 /// A block of a request's arena still live at the request's end.
@@ -244,6 +248,9 @@ struct State {
     held: Vec<u64>,
     allocated: u64,
     peak: u64,
+    /// The highest a section of the open pass reached ([`Torch::reset_peak`]): the pass's peak
+    /// covers it.
+    carried: u64,
     mapped: u64,
     /// The most it held: a request's spans that went idle mid-request are its next step's.
     peak_mapped: u64,
@@ -953,17 +960,39 @@ impl Torch {
         Stats { allocated, peak: sh.peak.load(Acquire), mapped, idle: quiet + pending, fragmentation: mapped.saturating_sub(allocated), arenas }
     }
 
-    /// An arena's peak since the last reset (a pass's compute peak); it restarts at what is live.
+    /// A section's peak: the arena's high-water since the last reset; it restarts at what is live,
+    /// and the open pass's peak still covers it.
     pub fn reset_peak(&self, owner: Owner) -> u64 {
+        self.peak_of(owner, |st| {
+            let peak = std::mem::replace(&mut st.peak, st.allocated);
+            st.carried = st.carried.max(peak);
+            peak
+        })
+    }
+
+    /// A pass opens: its peak starts at what is live.
+    pub fn pass_start(&self, owner: Owner) {
+        self.peak_of(owner, |st| {
+            (st.carried, st.peak) = (0, st.allocated);
+            0
+        });
+    }
+
+    /// A pass ends: its whole high-water, its sections' included; the next starts at what is live.
+    pub fn pass_peak(&self, owner: Owner) -> u64 {
+        self.peak_of(owner, |st| {
+            let peak = st.carried.max(st.peak);
+            (st.carried, st.peak) = (0, st.allocated);
+            peak
+        })
+    }
+
+    fn peak_of(&self, owner: Owner, f: impl FnOnce(&mut State) -> u64) -> u64 {
         let a = match owner {
             Owner::Process => Some(self.sh.process.clone()),
             o => self.sh.arenas.lock().get(&o).cloned(),
         };
-        a.map_or(0, |a| {
-            let mut st = a.st.lock();
-            let now = st.allocated;
-            std::mem::replace(&mut st.peak, now)
-        })
+        a.map_or(0, |a| f(&mut a.st.lock()))
     }
 
     /// Gives up to `want` bytes of quiet idle spans back through [`Source::unmap`], oldest first;
@@ -1568,23 +1597,24 @@ impl Shared {
         progress
     }
 
-    /// What idle may hold (leases rev 6: as little as hides allocation latency): the float, at least
-    /// the largest recent span, plus what open requests held at their peak beyond what they hold
-    /// now (their next step's spans).
-    fn keep(&self) -> u64 {
+    /// Quiet idle bytes beyond what idle may hold (leases rev 6: as little as hides allocation
+    /// latency): the float, at least the largest recent span, plus what open requests held at their
+    /// peak beyond what they hold now (their next step's spans). One snapshot: the requests' arenas
+    /// and the idle list are read together, so a span moving between them (adopted, or freed whole)
+    /// never looks spare. The poller's only; no other thread holds two arena locks.
+    fn excess(&self) -> u64 {
         let requests: Vec<Arc<Arena>> = self.arenas.lock().values().filter(|a| matches!(a.owner, Owner::Request(_))).cloned().collect();
-        let working: u64 = requests.iter().map(|a| {
-            let st = a.st.lock();
-            st.peak_mapped.saturating_sub(st.mapped)
-        }).sum();
-        FLOAT.max(self.taken.load(Acquire)).max(self.taken_before.load(Acquire)) + working
+        let held: Vec<_> = requests.iter().map(|a| a.st.lock()).collect();
+        let working: u64 = held.iter().map(|st| st.peak_mapped.saturating_sub(st.mapped)).sum();
+        let quiet = self.idle.lock().bytes().0;
+        drop(held);
+        quiet.saturating_sub(FLOAT.max(self.taken.load(Acquire)).max(self.taken_before.load(Acquire)) + working)
     }
 
-    /// Quiet idle spans beyond [`Shared::keep`] go back to the source now, oldest first.
+    /// Quiet idle spans beyond the float go back to the source now, oldest first.
     fn trim(&self) -> bool {
-        let quiet = self.idle.lock().bytes().0;
-        let keep = self.keep();
-        quiet > keep && self.reclaim(quiet - keep) > 0
+        let excess = self.excess();
+        excess > 0 && self.reclaim(excess) > 0
     }
 
     /// One round: record wanted epochs (no capture open), query those in flight, settle arenas.

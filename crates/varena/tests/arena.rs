@@ -210,7 +210,7 @@ fn r1_a_span_leaves_its_stream_only_after_its_epoch() {
     let r = rig(512 * MB, false);
     let p = r.torch.alloc(4 * MB, A, None).unwrap();
     r.torch.free(p, 4 * MB, A);
-    assert_eq!((r.torch.reset_peak(Owner::Process), r.torch.reset_peak(Owner::Process)), (4 * MB, 0), "a pass's peak, then what is live");
+    assert_eq!((r.torch.reset_peak(Owner::Process), r.torch.reset_peak(Owner::Process)), (4 * MB, 0), "a section's peak, then what is live");
     assert_eq!(r.torch.idle(), (0, CHUNK), "the whole-free span waits for A's epoch");
     assert_eq!(r.torch.alloc(4 * MB, A, None).unwrap(), p, "its own stream takes it back at once");
     r.torch.free(p, 4 * MB, A);
@@ -584,6 +584,25 @@ fn a_chunk_that_cannot_go_back_keeps_its_addresses_until_it_does() {
     others.iter().for_each(|o| r.torch.free(*o, 40 * MB, B));
 }
 
+/// A pass's peak covers the sections measured inside it; each section's peak is its own window.
+#[test]
+fn a_pass_peak_covers_its_sections() {
+    let r = rig(512 * MB, true);
+    let route = r.torch.route(Owner::Request(4));
+    let req = Owner::Request(4);
+    r.torch.pass_start(req);
+    let big = r.torch.alloc(10 * MB, A, None).unwrap();
+    r.torch.free(big, 10 * MB, A);
+    assert_eq!(r.torch.reset_peak(req), 10 * MB, "the first section");
+    let small = r.torch.alloc(4 * MB, A, None).unwrap();
+    assert_eq!(r.torch.reset_peak(req), 4 * MB, "the second section is its own window");
+    r.torch.free(small, 4 * MB, A);
+    assert_eq!(r.torch.pass_peak(req), 10 * MB, "the pass's peak lost a section's");
+    r.torch.pass_start(req);
+    assert_eq!(r.torch.pass_peak(req), 0, "the next pass starts at what is live");
+    drop(route);
+}
+
 /// The manager asks by chunk: exactly the asked idle chunk goes back, its spare split around
 /// it, and the rest stays idle for the arenas.
 #[test]
@@ -914,13 +933,9 @@ fn a_leased_memory_allocates_only_from_its_grants() {
     let gpu = Gpu::value(card, true);
     let creates = gpu.creates.clone();
     let mem = varena::Memory::open(g.clone(), None, Box::new(gpu)).unwrap();
+    // Leasing serves torch from the manager's grants at once: no page made outside the books.
     assert_eq!(mem.lease_over(UnixStream::connect(&socket).unwrap()).unwrap(), None, "the manager refused the lease");
-
-    let refused = mem.torch_alloc(4 * MB, A, None);
-    assert!(matches!(refused, Err(varena::Error::Invalid(_))), "{refused:?}");
     assert_eq!((manager.holdings().leased, creates.load(SeqCst)), (0, 0), "memory outside the books");
-
-    mem.serve_leased_torch().unwrap();
     let p = mem.torch_alloc(4 * MB, A, None).unwrap();
     until("the span is the manager's grant", || manager.holdings().leased == CHUNK);
     let floor = mem.torch_alloc(300 * MB, A, None);

@@ -170,17 +170,26 @@ impl Memory {
     }
 }
 
+impl Request {
+    /// A section's torch peak (a package split's window): the request arena's high-water since the
+    /// last section or pass start, which restarts here; the open pass's peak still covers it.
+    pub fn section_peak(&self) -> u64 {
+        self.inner.torch.get().map_or(0, |t| t.reset_peak(Owner::Request(self.id)))
+    }
+}
+
 impl super::Inner {
     /// A pass opens (`Request::pass`): its request arena's peak restarts at what is live.
     pub(super) fn torch_pass(&self, req: u64) {
         if let Some(t) = self.torch.get() {
-            t.reset_peak(Owner::Request(req));
+            t.pass_start(Owner::Request(req));
         }
     }
 
-    /// A pass ends (`Pass::end`): the most its request arena held since the pass opened.
+    /// A pass ends (`Pass::end`): the most its request arena held since the pass opened, the
+    /// sections measured inside it included.
     pub(super) fn torch_peak(&self, req: u64) -> u64 {
-        self.torch.get().map_or(0, |t| t.reset_peak(Owner::Request(req)))
+        self.torch.get().map_or(0, |t| t.pass_peak(Owner::Request(req)))
     }
 
     /// The manager asked these back (`Inner::revoke`, no state lock held): the torch chunks among
@@ -260,9 +269,13 @@ impl Leased {
 
 #[cfg(unix)]
 impl Source for Leased {
+    fn slot(&self, chunk: &Chunk) -> Option<u32> {
+        u32::try_from(chunk.id >> 32).ok()
+    }
+
     fn map(&self, va: Va, _: Kind, into: &mut Vec<Chunk>) -> Result<()> {
         let (mut tickets, mut off, mut failed) = (Vec::new(), 0, None);
-        for lease in self.agent.take(va.len, crate::lease::wire::Kind::Torch, None)? {
+        for lease in self.agent.take(va.len, crate::lease::Kind::Torch, None)? {
             let len = lease.phys.len;
             let mapped = if failed.is_some() || off + len > va.len {
                 Err(Error::Internal(format!("a grant of {len} bytes past its {}-byte span", va.len)))

@@ -9,13 +9,13 @@
 //! Locks: `pending` and `held` are leaves; the reader thread imports outside them.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Condvar, Mutex};
 use platform::process::Birth;
 
 use super::table::{State, Table};
-use super::wire::{End, Kind, Refusal, Region, ToAgent, ToManager};
+use super::wire::{End, Kind, Refusal, Region, RegionFacts, ToAgent, ToManager};
 use crate::backend::{Backend, Physical};
 use crate::os::{self, Stream};
 use crate::{Error, Exhausted, Result};
@@ -71,6 +71,8 @@ pub struct Agent {
     held: Mutex<BTreeSet<Ticket>>,
     /// The holder's wake for asks back (the doorbell's, and a grant asked back before its map).
     revoked: Box<dyn Fn() + Send + Sync>,
+    /// The holder's wake for a region's reclaim ([`Agent::on_reclaim`]).
+    reclaim: OnceLock<Box<dyn Fn(u64, bool) + Send + Sync>>,
 }
 
 impl Agent {
@@ -94,7 +96,7 @@ impl Agent {
             Some((ToAgent::Refuse { code, why, .. }, _)) => return Ok(Attach::Refused { code, why }),
             _ => return Err(Error::Closed("the lease manager answered Hello with no table".into())),
         };
-        let agent = Arc::new(Agent { end, table, backend, pending: Mutex::new(Pending::default()), held: Mutex::new(BTreeSet::new()), revoked: Box::new(revoked) });
+        let agent = Arc::new(Agent { end, table, backend, pending: Mutex::new(Pending::default()), held: Mutex::new(BTreeSet::new()), revoked: Box::new(revoked), reclaim: OnceLock::new() });
         let reader = agent.clone();
         std::thread::Builder::new()
             .name("lease-agent".into())
@@ -132,6 +134,10 @@ impl Agent {
                     }
                 }
                 ToAgent::Revoke => (self.revoked)(),
+                ToAgent::Reclaim { region, swap } => match self.reclaim.get() {
+                    Some(wake) => wake(region, swap),
+                    None => tracing::warn!("lease: region {region}'s reclaim reached an agent with no region holder"),
+                },
                 ToAgent::Welcome { .. } => {}
             }
         }
@@ -347,6 +353,21 @@ impl Agent {
         self.backend.destroy(phys)?;
         self.table.released(ticket.slot, ticket.seq)?;
         self.end.send(&ToManager::Answered, None)
+    }
+
+    /// The holder's wake for the manager's Reclaim of a region, on the reader thread (it posts to
+    /// its mechanism thread, never works there). Set once.
+    pub fn on_reclaim(&self, wake: Box<dyn Fn(u64, bool) + Send + Sync>) -> Result<()> {
+        self.reclaim.set(wake).map_err(|_| Error::Invalid("the agent's reclaim holder is set already".into()))
+    }
+
+    /// A region's facts for the manager's policy, at its create and its changes.
+    pub fn region(&self, facts: RegionFacts) -> Result<()> {
+        self.end.send(&ToManager::Region(facts), None)
+    }
+
+    pub fn region_gone(&self, id: u64) -> Result<()> {
+        self.end.send(&ToManager::RegionGone { id }, None)
     }
 
     pub fn table(&self) -> &Table {
