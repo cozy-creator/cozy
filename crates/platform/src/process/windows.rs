@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io, iter, mem,
     os::windows::{
-        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle},
         process::{CommandExt, ExitStatusExt},
     },
     path::Path,
@@ -400,7 +400,7 @@ fn resume(pid: u32) -> io::Result<()> {
 
 pub(super) fn usage(pid: u32) -> io::Result<super::Usage> {
     let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
-    let [_, _, kernel, user] = times(&process)?;
+    let [_, _, kernel, user] = times(raw(&process))?;
     Ok(super::Usage {
         cpu: ticks(kernel) + ticks(user),
         running: false,
@@ -522,15 +522,21 @@ fn open_process(pid: u32, access: u32) -> io::Result<OwnedHandle> {
 }
 
 fn created(process: &OwnedHandle) -> io::Result<u64> {
-    Ok(ticks(times(process)?[0]))
+    Ok(ticks(times(raw(process))?[0]))
+}
+
+/// The birth of process `pid` read from a handle the caller keeps to it (a pipe's peer), never
+/// from the pid again.
+pub(crate) fn birth_of_handle(pid: u32, process: BorrowedHandle<'_>) -> io::Result<Birth> {
+    Ok(Birth { pid, boot_id: String::new(), start_ticks: ticks(times(process.as_raw_handle())?[0]) })
 }
 
 /// Creation, exit, kernel and user times.
-fn times(process: &OwnedHandle) -> io::Result<[FILETIME; 4]> {
+fn times(process: HANDLE) -> io::Result<[FILETIME; 4]> {
     let mut times = [FILETIME::default(); 4];
     let [creation, exit, kernel, user] = &mut times;
     // SAFETY: a live handle with query rights and four writable FILETIMEs.
-    if unsafe { GetProcessTimes(raw(process), creation, exit, kernel, user) } == 0 {
+    if unsafe { GetProcessTimes(process, creation, exit, kernel, user) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(times)

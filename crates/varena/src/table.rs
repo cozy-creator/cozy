@@ -325,6 +325,8 @@ impl Remote {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Table {
     pub capacity: u64,
+    /// The driver's headroom (the backend's): never filled, in any mode (cr-215).
+    pub driver: u64,
     /// This row's own cap (a standalone opener's limit); the table's capacity is TensorD's.
     pub limit: Option<u64>,
     /// Bytes on the device no row accounts for, measured, beyond what the card leaves outside
@@ -471,9 +473,11 @@ impl Table {
         self.limit.map_or(room, |l| room.min(l))
     }
 
-    /// H, charged in shared mode while TensorD samples foreign bytes (its rule asks below it).
+    /// Bytes never filled: the driver's headroom always, and H in shared mode while TensorD
+    /// samples foreign bytes (its rule asks below it).
     pub fn headroom(&self) -> u64 {
-        if self.shared && self.sampled { headroom(self.card) } else { 0 }
+        let yielding = if self.shared && self.sampled { headroom(self.card) } else { 0 };
+        self.driver.max(yielding)
     }
 
     /// F: the budget less what this row holds.

@@ -51,6 +51,11 @@ pub const OUT_OF_MEMORY: i32 = 2;
 pub trait Backend: Send + Sync {
     /// The device's total bytes (the card, or a host device's limit).
     fn capacity(&self) -> u64;
+    /// Bytes the driver needs free at all times (its lazy kernel loads, cr-215): never leased,
+    /// never filled, in any mode.
+    fn headroom(&self) -> u64 {
+        crate::table::headroom(self.capacity())
+    }
     /// Free bytes as the driver measures them now. Only foreign bytes derive from it (the
     /// device's used bytes less every row's); placement never sizes from it.
     fn free(&self) -> Result<u64>;
@@ -84,6 +89,10 @@ pub trait Backend: Send + Sync {
     /// Where `io::read` writes `len` mapped bytes at `va + offset`: device memory ordered on the
     /// backend's copy stream, or host memory.
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst;
+    /// Copies `src` into mapped bytes at `va + offset`, waiting for the copy: a swapped region back in.
+    fn copy_in(&self, _va: Va, _offset: u64, _src: &[u8]) -> Result<()> {
+        Err(Error::Invalid("this backend cannot swap".into()))
+    }
     /// An event after everything the copy stream holds so far.
     fn fence(&self) -> Result<Event>;
     /// An event (with timing) after everything `stream` holds so far.
@@ -130,6 +139,7 @@ pub trait Backend: Send + Sync {
 /// are always complete.
 pub struct HostBackend {
     limit: u64,
+    headroom: u64,
     pages: Mutex<Pages>,
 }
 
@@ -153,8 +163,22 @@ impl Pages {
 }
 
 impl HostBackend {
+    /// Host pages load no kernels: no headroom.
     pub fn new(limit: u64) -> HostBackend {
-        HostBackend { limit, pages: Mutex::new(Pages::default()) }
+        HostBackend::with_headroom(limit, 0)
+    }
+
+    /// A host device that keeps `headroom` free, as a card's driver does.
+    pub fn with_headroom(limit: u64, headroom: u64) -> HostBackend {
+        HostBackend { limit, headroom, pages: Mutex::new(Pages::default()) }
+    }
+}
+
+/// `len` bytes at `offset` lie inside `va`.
+pub(crate) fn inside(va: Va, offset: u64, len: usize) -> Result<()> {
+    match offset.checked_add(len as u64) {
+        Some(end) if end <= va.len => Ok(()),
+        _ => Err(Error::Invalid(format!("{len} bytes at offset {offset} outside a {}-byte range", va.len))),
     }
 }
 
@@ -236,10 +260,14 @@ impl Backend for HostBackend {
         memory::export(handle).map_err(page_err)
     }
 
+    fn headroom(&self) -> u64 {
+        self.headroom
+    }
+
     fn lend(&self, page: &Physical) -> Result<Owned> {
         let pages = self.pages.lock();
         let (handle, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
-        handle.try_clone().map_err(|e| Error::io("lend a host page", e))
+        memory::lend(handle).map_err(page_err)
     }
 
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> {
@@ -248,6 +276,13 @@ impl Backend for HostBackend {
 
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
         Dst::Host { ptr: (va.base + offset) as *mut u8, len: len as usize }
+    }
+
+    fn copy_in(&self, va: Va, offset: u64, src: &[u8]) -> Result<()> {
+        inside(va, offset, src.len())?;
+        // SAFETY: a mapped read-write range of the caller's reservation, checked to hold `src.len()` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), (va.base + offset) as *mut u8, src.len()) };
+        Ok(())
     }
 
     fn fence(&self) -> Result<Event> {

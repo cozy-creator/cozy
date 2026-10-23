@@ -19,6 +19,8 @@ mod sys;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
+pub(crate) use sys::birth_of_handle;
+#[cfg(windows)]
 use sys as tree;
 #[cfg(unix)]
 use unix as tree;

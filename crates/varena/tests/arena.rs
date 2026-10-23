@@ -88,6 +88,8 @@ impl Backend for Gpu {
     fn export(&self, page: &Physical) -> varena::Result<Owned> { self.host.export(page) }
     fn import(&self, handle: Owned, len: u64) -> varena::Result<Physical> { self.host.import(handle, len) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.host.target(va, offset, len) }
+    fn copy_out(&self, va: Va, offset: u64, dst: &mut [u8], after: Event) -> varena::Result<()> { self.host.copy_out(va, offset, dst, after) }
+    fn copy_in(&self, va: Va, offset: u64, src: &[u8]) -> varena::Result<()> { self.host.copy_in(va, offset, src) }
     fn fence(&self) -> varena::Result<Event> { Ok(Event::DONE) }
     fn record(&self, stream: usize) -> varena::Result<Event> {
         self.records.fetch_add(1, SeqCst);
@@ -701,6 +703,122 @@ fn a_region_has_spans_of_its_own() {
     assert!(r.torch.end(Owner::Region(5)).outlived.is_empty());
     r.torch.free(live, 4096, A);
     drop(req);
+}
+
+/// Fills `len` bytes at `ptr` (host pages) with a pattern of `seed`.
+fn paint(ptr: u64, len: u64, seed: u8) {
+    // SAFETY: a live block of `len` mapped host bytes the test allocated.
+    let b = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+    b.iter_mut().enumerate().for_each(|(i, x)| *x = seed.wrapping_add(i as u8));
+}
+
+fn painted(ptr: u64, len: u64, seed: u8) -> bool {
+    // SAFETY: a live block of `len` mapped host bytes the test allocated.
+    let b = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    b.iter().enumerate().all(|(i, x)| *x == seed.wrapping_add(i as u8))
+}
+
+fn mapped(r: &Rig, o: Owner) -> u64 {
+    r.torch.stats().arenas.iter().find(|(x, _)| *x == o).map_or(0, |(_, s)| s.mapped)
+}
+
+/// §5 Evict/MakeResident: a swapped region's chunks go back to the source, and come again at the
+/// same addresses with its bytes; its blocks' pointers never change.
+#[test]
+fn a_swapped_region_comes_back_at_its_addresses_with_its_bytes() {
+    let r = rig(512 * MB, true);
+    let route = r.torch.route(Owner::Region(11));
+    let blocks: Vec<(u64, u64)> = [512, 40_000, 3 * MB, 80 * MB].iter().map(|&n| (r.torch.alloc(n, A, None).unwrap(), n)).collect();
+    drop(route);
+    blocks.iter().enumerate().for_each(|(i, &(p, n))| paint(p, n, i as u8));
+    let before = (mapped(&r, Owner::Region(11)), r.torch.stats().mapped, r.source.unmaps.load(SeqCst));
+    let mut ev = r.torch.evict(Owner::Region(11), true).unwrap().expect("no capture is open");
+    assert!(ev.swapped());
+    assert_eq!(ev.bytes, before.0, "every span of the region was evicted");
+    assert_eq!(mapped(&r, Owner::Region(11)), 0);
+    assert_eq!(r.torch.stats().mapped, before.1 - before.0, "the device's mapped bytes dropped once");
+    assert!(r.source.unmaps.load(SeqCst) > before.2, "its chunks went back to the source");
+    assert!(!r.torch.make_resident(Owner::Region(11), &mut ev).unwrap(), "swapped bytes are not fresh");
+    assert_eq!((mapped(&r, Owner::Region(11)), r.torch.stats().mapped), (before.0, before.1));
+    blocks.iter().enumerate().for_each(|(i, &(p, n))| assert!(painted(p, n, i as u8), "block {i} lost its bytes"));
+    let route = r.torch.route(Owner::Region(11));
+    let more = r.torch.alloc(512, A, None).unwrap();
+    drop(route);
+    assert!(blocks.iter().all(|&(p, n)| more >= p + n || more + 512 <= p), "a resident region's free bytes serve again");
+    blocks.iter().for_each(|&(p, n)| r.torch.free(p, n, A));
+    r.torch.free(more, 512, A);
+    assert!(r.torch.end(Owner::Region(11)).outlived.is_empty());
+}
+
+/// An evicted span is never carved: its free runs and slot pages stay out of the free lists even
+/// as its blocks free. One that comes whole free waits for the next residency, or gives its
+/// addresses back once its arena ended.
+#[test]
+fn an_evicted_span_is_never_carved_from() {
+    let r = rig(512 * MB, true);
+    let route = r.torch.route(Owner::Region(12));
+    let small: Vec<u64> = (0..4).map(|_| r.torch.alloc(4096, A, None).unwrap()).collect();
+    let run = r.torch.alloc(5 * MB, A, None).unwrap();
+    let mut ev = r.torch.evict(Owner::Region(12), false).unwrap().unwrap();
+    assert!(!ev.swapped());
+    r.torch.free(small[0], 4096, A);
+    r.torch.free(run, 5 * MB, A);
+    // The region's first blocks start its spans: a 2 MiB one for the slots, a chunk for the run.
+    let (slots, runs) = (small[0]..small[0] + 2 * MB, run..run + CHUNK);
+    let fresh: Vec<u64> = (0..3).map(|_| r.torch.alloc(4096, A, None).unwrap()).chain([r.torch.alloc(5 * MB, A, None).unwrap()]).collect();
+    for p in &fresh {
+        assert!(!slots.contains(p) && !runs.contains(p), "{p:#x} was carved from an evicted span");
+    }
+    assert!(r.torch.make_resident(Owner::Region(12), &mut ev).unwrap(), "discarded bytes are fresh");
+    let again = r.torch.alloc(4096, A, None).unwrap();
+    assert!(slots.contains(&again), "the resident span serves again");
+    drop(route);
+    for p in small.iter().skip(1).chain([&again]).chain(fresh.iter().take(3)) {
+        r.torch.free(*p, 4096, A);
+    }
+    if let Some(p) = fresh.get(3) {
+        r.torch.free(*p, 5 * MB, A);
+    }
+    assert_eq!(mapped(&r, Owner::Region(12)), 0);
+    // Evicted, whole free, then ended: its addresses go back and nothing stays mapped.
+    let route = r.torch.route(Owner::Region(13));
+    let p = r.torch.alloc(4096, A, None).unwrap();
+    drop(route);
+    let _gone = r.torch.evict(Owner::Region(13), false).unwrap().unwrap();
+    r.torch.free(p, 4096, A);
+    r.torch.forget_evicted(Owner::Region(13));
+    assert!(r.torch.end(Owner::Region(13)).outlived.is_empty());
+    assert_eq!(r.torch.stats().arenas.iter().filter(|(o, _)| *o == Owner::Region(13)).count(), 0);
+}
+
+/// R1 for an eviction: it waits for an epoch on the region's stream after everything enqueued
+/// so far, with no arena lock held (another stream allocates meanwhile); a capture open refuses it.
+#[test]
+fn an_eviction_waits_for_the_regions_stream_and_never_during_a_capture() {
+    let r = Arc::new(rig(512 * MB, false));
+    let route = r.torch.route(Owner::Region(14));
+    let p = r.torch.alloc(3 * MB, A, None).unwrap();
+    drop(route);
+    r.torch.pool_begin(PoolId(9, 9), Some(C));
+    assert!(r.torch.evict(Owner::Region(14), false).unwrap().is_none(), "evicted while a capture is open");
+    r.torch.pool_end(PoolId(9, 9));
+    let (tx, rx) = mpsc::channel();
+    let r2 = r.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(r2.torch.evict(Owner::Region(14), false).map(|e| e.map(|e| e.bytes)));
+    });
+    until("A's epoch is recorded", || r.gpu.events.lock().values().any(|(s, _)| *s == A));
+    let other = returns("an allocation beside a waiting eviction", {
+        let r = r.clone();
+        move || r.torch.alloc(4096, B, None).unwrap()
+    });
+    assert!(rx.try_recv().is_err(), "the eviction did not wait for A's epoch");
+    assert_eq!(mapped(&r, Owner::Region(14)), CHUNK);
+    r.gpu.complete(A);
+    let got = rx.recv_timeout(Duration::from_secs(20)).expect("the eviction never returned").unwrap();
+    assert_eq!(got, Some(CHUNK));
+    r.torch.free(other, 4096, B);
+    r.torch.free(p, 3 * MB, A);
 }
 
 /// Through Memory, as S3's shim calls it: nothing is served until a source is chosen; then a

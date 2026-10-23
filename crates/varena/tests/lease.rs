@@ -1,12 +1,12 @@
 //! Leases across real processes (varena-leases §8 P0): this process hosts the Manager over host
-//! pages (memfds, so grants cross by SCM_RIGHTS); each agent is this binary as a child that runs
-//! one command per stdin line and answers on stdout.
+//! pages (memfds crossing by SCM_RIGHTS; on Windows sections DuplicateHandle'd into the agent)
+//! on the GPU's own listener (an abstract socket, a named pipe); each agent is this binary as a
+//! child that runs one command per stdin line and answers on stdout.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod cases {
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
     use std::sync::Arc;
@@ -16,7 +16,8 @@ mod cases {
     use platform::handles::Peer;
     use tensorfs::io::Dst;
     use varena::backend::{Access, Backend, Va};
-    use varena::lease::{Agent, Attach, Holdings, Hosting, Identity, Lease, Manager, Region};
+    use varena::lease::wire::{End, ToAgent};
+    use varena::lease::{Agent, Attach, Holdings, Hosting, Identity, Kind, Lease, Manager, Refusal, Region};
     use varena::ledger::Mode;
     use varena::{GpuId, HostBackend};
 
@@ -33,19 +34,28 @@ mod cases {
 
     struct Host {
         manager: Arc<Manager>,
-        socket: PathBuf,
+        uuid: String,
         children: Arc<Children>,
     }
 
     fn host(dir: &Path, case: &str, capacity: u64) -> Host {
-        let socket = dir.join("lease.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        host_with(dir, case, capacity, 0)
+    }
+
+    /// A host whose device keeps `headroom` free, as a card's driver does.
+    fn host_with(_dir: &Path, case: &str, capacity: u64, headroom: u64) -> Host {
         let gpu = GpuId { uuid: format!("lease{}-{case}", std::process::id()), model: "host".into(), memory: capacity };
+        let listener = varena::lease::listen(&gpu).unwrap().unwrap();
         let children = Arc::new(Children(Mutex::new(vec![])));
-        let open = Box::new(move || Ok(Arc::new(HostBackend::new(capacity)) as Arc<dyn Backend>));
+        let open = Box::new(move || Ok(Arc::new(HostBackend::with_headroom(capacity, headroom)) as Arc<dyn Backend>));
         let manager = Manager::create(&gpu, Some(capacity), Mode::Dedicated, open, listener, children.clone()).unwrap();
         varena::os::remove_table(&gpu.uuid);
-        Host { manager, socket, children }
+        Host { manager, uuid: gpu.uuid, children }
+    }
+
+    /// The GPU's listener, as an agent dials it.
+    fn dial(uuid: &str) -> platform::memory::Stream {
+        varena::lease::connect(platform::memory::euid(), uuid).unwrap().unwrap()
     }
 
     struct Agentd {
@@ -57,7 +67,7 @@ mod cases {
     impl Agentd {
         fn start(host: &Host) -> Agentd {
             let mut child = Command::new(std::env::current_exe().unwrap())
-                .args(["agent", host.socket.to_str().unwrap()])
+                .args(["agent", &host.uuid])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
@@ -123,6 +133,29 @@ mod cases {
         assert_eq!(a.call(&format!("take {} {}", 400 * MIB, region(1))), "ok 1 fresh verified");
         let h = until(&host, |h| h.leased == 400 * MIB);
         assert_eq!(h.created_chunks, 1, "{h:?}");
+        // Undeclared (no region, never retainable): one chunk all the same.
+        let mut b = Agentd::start(&host);
+        assert_eq!(b.call(&format!("take {} none 0", 100 * MIB)), "ok 1 fresh verified");
+        let h = until(&host, |h| h.leased == 500 * MIB);
+        assert_eq!(h.created_chunks, 2, "{h:?}");
+    }
+
+    /// The driver's headroom is never leased, in any mode (cr-215): no sequence of grants leaves
+    /// less than H free, revokes make room inside capacity − H, and an ask only H could serve is
+    /// refused.
+    fn the_driver_headroom_is_never_leased(dir: &Path) {
+        let host = host_with(dir, "headroom", 128 * MIB, 32 * MIB);
+        let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
+        assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 1 fresh verified");
+        assert_eq!(host.manager.holdings().capacity, 96 * MIB);
+        b.send(&format!("take {} {}", 64 * MIB, region(2)));
+        a.wait_rang();
+        assert_eq!(a.call("revokes"), "released 1");
+        assert_eq!(b.answer(), "ok 1 fresh verified");
+        let h = until(&host, |h| h.leased == 64 * MIB);
+        assert!(h.created <= 96 * MIB, "{h:?}");
+        assert!(a.call(&format!("take {} {}", 100 * MIB, region(3))).starts_with("refused"), "only H could serve it");
+        assert!(host.manager.holdings().created <= 96 * MIB);
     }
 
     /// A running pass pins its chunks and asks for more: when only its own pins could give the
@@ -243,11 +276,24 @@ mod cases {
         assert_eq!((h.retained, h.created), (0, 80 * MIB), "adopted with no new chunk");
     }
 
+    /// A process the host never registered dials the GPU's listener: refused before it is
+    /// heard, and it holds nothing.
+    fn a_stranger_is_refused(dir: &Path) {
+        let host = host(dir, "stranger", 64 * MIB);
+        let stranger = End::new(dial(&host.uuid));
+        match stranger.recv::<ToAgent>().unwrap() {
+            Some((ToAgent::Refuse { code: Refusal::NotRegistered, .. }, None)) => {}
+            other => panic!("a stranger was answered {:?}", other.map(|(m, h)| (m, h.is_some()))),
+        }
+        assert!(stranger.recv::<ToAgent>().unwrap().is_none(), "the refused connection stays open");
+        assert!(host.manager.holdings().executors.is_empty());
+    }
+
     pub fn main() {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        if let [role, socket] = args.as_slice() {
+        if let [role, uuid] = args.as_slice() {
             if role == "agent" {
-                return agent(Path::new(socket));
+                return agent(uuid);
             }
         }
         let filter: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
@@ -255,6 +301,7 @@ mod cases {
         let cases: Vec<Case> = vec![
             ("grant_maps_and_writes", grant_maps_and_writes),
             ("a_weights_page_is_one_chunk_however_big", a_weights_page_is_one_chunk_however_big),
+            ("the_driver_headroom_is_never_leased", the_driver_headroom_is_never_leased),
             ("an_unpinned_lease_is_revoked_for_another", an_unpinned_lease_is_revoked_for_another),
             ("a_revoke_waits_for_the_pin", a_revoke_waits_for_the_pin),
             ("an_ask_waits_for_anothers_pins", an_ask_waits_for_anothers_pins),
@@ -262,6 +309,7 @@ mod cases {
             ("stalls_are_judged_on_the_looks_cadence", stalls_are_judged_on_the_looks_cadence),
             ("an_ask_against_its_own_pins_is_refused", an_ask_against_its_own_pins_is_refused),
             ("a_killed_agents_leases_return_and_landed_weights_are_adopted", a_killed_agents_leases_return_and_landed_weights_are_adopted),
+            ("a_stranger_is_refused", a_stranger_is_refused),
         ];
         let mut failed = vec![];
         for (name, case) in cases {
@@ -307,7 +355,7 @@ mod cases {
     }
 
     /// The child: an agent over host pages, mapping what it is granted at its own VAs.
-    fn agent(socket: &Path) {
+    fn agent(uuid: &str) {
         let backend: Arc<dyn Backend> = Arc::new(HostBackend::new(1 << 40));
         let rang = Arc::new(AtomicU64::new(0));
         let mut agent: Option<Arc<Agent>> = None;
@@ -319,7 +367,7 @@ mod cases {
             let out = match words.as_slice() {
                 ["attach"] => {
                     let r = rang.clone();
-                    let stream = UnixStream::connect(socket).unwrap();
+                    let stream = dial(uuid);
                     match Agent::attach(stream, backend.clone(), move || { r.fetch_add(1, SeqCst); }).unwrap() {
                         Attach::Leased(a) => {
                             agent = Some(a);
@@ -330,10 +378,12 @@ mod cases {
                 }
                 ["take", bytes, fingerprint, region, rest @ ..] => {
                     let unlanded = rest == ["unlanded"];
+                    // An undeclared page: no region, never retained, still one chunk.
+                    let undeclared = *fingerprint == "none";
                     let a = agent.as_ref().unwrap();
                     let region: u32 = region.parse().unwrap();
-                    let wanted = Region { fingerprint: fingerprint.parse().unwrap(), region };
-                    match a.take(bytes.parse().unwrap(), Some(wanted)) {
+                    let wanted = (!undeclared).then(|| Region { fingerprint: fingerprint.parse().unwrap(), region });
+                    match a.take(bytes.parse().unwrap(), Kind::Weights, wanted) {
                         Ok(leases) => {
                             let adopted = leases.iter().all(|l| l.adopted);
                             let n = leases.len();
@@ -403,12 +453,12 @@ mod cases {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn main() {
     cases::main();
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn main() {
-    println!("lease: the P0 cases pass memfds between Linux processes; skipped here");
+    println!("lease: macOS has no shareable host pages yet; skipped here");
 }
