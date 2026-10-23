@@ -1617,7 +1617,7 @@ mod v1_api {
         let named = v1::ModelChoice {
             repository: "acme/model".into(),
             release: "1.0.0".into(),
-            lane: "bf16".into(),
+            lane: "model.bf16.cozytensors".into(),
             ..Default::default()
         };
         let take = || std::mem::take(&mut *heard.lock().unwrap());
@@ -1628,7 +1628,7 @@ mod v1_api {
         let result: serde_json::Value = json(&done.result);
         let row = &result["models"][0];
         assert_eq!(result["release"], "1.0.0");
-        assert_eq!((&row["release"], &row["lane"], &row["checkpoint"]), (&"1.0.0".into(), &"bf16".into(), &manifest.id().into()));
+        assert_eq!((&row["release"], &row["lane"], &row["checkpoint"]), (&"1.0.0".into(), &"model.bf16.cozytensors".into(), &manifest.id().into()));
         let cold = take();
         let (blob, stored) = (format!("GET /{}", manifest.key()), format!("GET /o/{}", manifest.sha256));
         for asked in [
@@ -1665,7 +1665,7 @@ mod v1_api {
         let done = settle(&client, &all, "names-3", spec(None, bare, "r1")).await;
         assert_eq!(done.status, "succeeded", "{done:?}");
         let result: serde_json::Value = json(&done.result);
-        assert_eq!((&result["models"][0]["release"], &result["models"][0]["lane"]), (&"1.0.0".into(), &"bf16".into()));
+        assert_eq!((&result["models"][0]["release"], &result["models"][0]["lane"]), (&"1.0.0".into(), &"model.bf16.cozytensors".into()));
         assert_eq!(take(), ["GET /refs/acme/model.json"]);
 
         // A revision the caller moved resolves the name once more; the bytes are held.

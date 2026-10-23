@@ -1739,6 +1739,12 @@
             "description": "How far this stage is, when it says.",
             "default": null
           },
+          "step_avg_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "The mean of its steps after the first, which carries the stage's setup; 0 before one.",
+            "default": 0.0
+          },
           "step_ms": {
             "type": "number",
             "format": "double",
