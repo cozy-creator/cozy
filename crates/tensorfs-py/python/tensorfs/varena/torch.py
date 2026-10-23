@@ -49,9 +49,10 @@ progress = 0
 _AHEAD = 2
 #: A streamed model's scratch slots, in its largest blocks (the core keeps 2-3).
 _SLOTS = 3
-#: H's least (design/vram-yield.md §3.1), else a sixteenth of the card: what the driver maps beside
-#: us where no rung reaches (a kernel's module at its first launch, a library's handle).
-_FLOOR = 512 << 20
+#: What the driver maps beside us where no rung reaches, a fixed reserve per GPU: a kernel's module
+#: at its first launch, a library's handle. It grows with the kernels loaded, the SMs and the
+#: processes, not the card's memory (owner, 10-23).
+_RESERVE = 512 << 20
 #: TensorFS dtype names; an `F4` part is u8 pairs.
 DTYPES: dict[str, torch.dtype] = {
     name: getattr(torch, kind)
@@ -512,6 +513,8 @@ class Request:
     shapes: dict[tuple[str, str], cuts.Shape] = field(default_factory=dict)
     stats: RequestStats | None = None
     memory: Memory | None = None
+    #: this process's device bytes outside the books (`Memory._outside`) as it began, and the most
+    outside: tuple[int, int] = (0, 0)
 
     def plan(self, steps: Sequence[PlanStep] | None) -> None:
         """Replace its plan (`Memory.plan`)."""
@@ -572,9 +575,9 @@ class Memory:
         self.memo = cuts.Memo()
         cuts.serve(self.memo, self)
         self.row: tuple[Ledger, Row] | None = None
-        #: what this process plans within: the ledger's capacity (`gpu_memory_limit`, §5.6) less H,
-        #: so no prefetch maps into H (cr-215: on a card prefetched full a first launch got 999);
-        #: and the card's total
+        #: what this process plans within: the ledger's capacity (`gpu_memory_limit`, §5.6) less
+        #: the reserve, never below 0, so no prefetch maps into it (cr-215: on a card prefetched
+        #: full a kernel's first launch got 999); and the card's total
         self.limit: int | None = None
         self.total = 0
         #: TensorD's ledger, which takes host-tier deposits; standalone, one of its own (§2)
@@ -588,7 +591,7 @@ class Memory:
                 table = Ledger.create(uuid, min(self.total, limit or self.total))
             self.row = (table, table.claim())
             self.core.serve(self.row[1], self._answer)  # other processes' asks
-            self.limit = min(table.capacity, self.total) - max(_FLOOR, self.total // 16)
+            self.limit = max(min(table.capacity, self.total) - _RESERVE, 0)
 
     @classmethod
     def open(
@@ -1030,7 +1033,7 @@ class Memory:
             nxt = model.order[(at + ahead) % len(model.order)]
             if model.blocks[nxt].count or nxt in model.home and _resident(model, nxt):
                 continue
-            if self._free() < model.blocks[nxt].nbytes:  # never past the limit, into H
+            if self._free() < model.blocks[nxt].nbytes:  # never past the limit, into the reserve
                 return
             try:
                 for region in model.blocks[nxt].regions:
@@ -1219,6 +1222,8 @@ class Memory:
             core = self.core.stats()  # type: ignore[union-attr]
             held = torch.cuda.memory_reserved(self.gpu) + core.mapped + core.idle
             self.context = max(total - held, 0)
+            for request in list(self.active):
+                request.outside = (request.outside[0], max(request.outside[1], self.context))
 
     def _room(self) -> int | None:
         """Under a limit, what this process's torch may reserve: the limit less every byte the
@@ -1525,6 +1530,7 @@ class Memory:
         self._outside()
         key = self.row[0].dispatched(id) if self.row is not None else None
         request = Request(id, start, self._copies(), key, self.memo.retries, memory=self)
+        request.outside = (self.context, self.context)
         with self.lock:
             self.active[request] = None
             self.epoch, self.starved = self.epoch + 1, False
@@ -1563,6 +1569,10 @@ class Memory:
             tail = torch.cuda.max_memory_allocated(self.gpu) - request.start
             request.peak = max(request.peak, tail)
             leftover = ((self.gpu, max(torch.cuda.memory_allocated(self.gpu) - request.start, 0)),)
+        self._outside()  # what kernels and libraries mapped as it ran measures the reserve (cr-215)
+        start, most = request.outside
+        why = f"outside the books: {start} B as it began, {most} B at most"
+        request.evictions.append(Eviction("", self.gpu, 0, why, 0))
         copied = sum(n - request.copies.get(name, 0) for name, n in self._copies().items())
         retries = self.memo.retries - request.retried
         peaks = tuple(_peak(s) for s in request.shapes.values())
