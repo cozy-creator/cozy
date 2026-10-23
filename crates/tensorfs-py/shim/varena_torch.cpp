@@ -9,10 +9,17 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#define VARENA_EXPORT __declspec(dllexport)
+#else
+#define VARENA_EXPORT __attribute__((visibility("default")))
+#endif
 
 using Stream = struct CUstream_st*;
 using MempoolId = std::pair<unsigned long long, unsigned long long>;  // c10::cuda::MempoolId_t
@@ -50,16 +57,16 @@ const Stream per_thread = reinterpret_cast<Stream>(0x2);  // cudaStreamPerThread
 
 [[noreturn]] void refuse(const char* why) {
     TORCH_CHECK_WITH(OutOfMemoryError, false, why);
-    __builtin_unreachable();
+    std::abort();  // not reached: the check throws
 }
 
 }  // namespace
 
 extern "C" {
 
-void varena_torch_bind(const Agent* functions) { agent = *functions; }
+VARENA_EXPORT void varena_torch_bind(const Agent* functions) { agent = *functions; }
 
-void* varena_torch_malloc(size_t bytes, int device, Stream stream) {
+VARENA_EXPORT void* varena_torch_malloc(size_t bytes, int device, Stream stream) {
     if (stream == per_thread) {
         refuse("varena: cudaStreamPerThread (0x2) names another stream on every thread; allocate on a stream of its own");
     }
@@ -83,11 +90,11 @@ void* varena_torch_malloc(size_t bytes, int device, Stream stream) {
     return reinterpret_cast<void*>(ptr);
 }
 
-void varena_torch_free(void* ptr, size_t bytes, int device, Stream stream) {
+VARENA_EXPORT void varena_torch_free(void* ptr, size_t bytes, int device, Stream stream) {
     agent.free(reinterpret_cast<uint64_t>(ptr), bytes, device, reinterpret_cast<uintptr_t>(stream));
 }
 
-void varena_torch_record_stream(void* ptr, Stream stream) {
+VARENA_EXPORT void varena_torch_record_stream(void* ptr, Stream stream) {
     if (stream == per_thread) {
         refuse("varena: cudaStreamPerThread (0x2) names another stream on every thread; record a stream of its own");
     }
@@ -95,7 +102,7 @@ void varena_torch_record_stream(void* ptr, Stream stream) {
 }
 
 // Called by capture_begin on the capturing thread, before the capture starts.
-void varena_torch_begin_pool(int device, MempoolId pool, Filter filter) {
+VARENA_EXPORT void varena_torch_begin_pool(int device, MempoolId pool, Filter filter) {
     {
         std::lock_guard<std::mutex> lock(routes_mutex);
         routes.push_back({device, pool, std::move(filter)});
@@ -104,7 +111,7 @@ void varena_torch_begin_pool(int device, MempoolId pool, Filter filter) {
     agent.pool_begin(device, pool.first, pool.second);
 }
 
-void varena_torch_end_pool(int device, MempoolId pool) {
+VARENA_EXPORT void varena_torch_end_pool(int device, MempoolId pool) {
     {
         std::lock_guard<std::mutex> lock(routes_mutex);
         for (auto route = routes.begin(); route != routes.end(); ++route) {
@@ -118,6 +125,6 @@ void varena_torch_end_pool(int device, MempoolId pool) {
     agent.pool_end(device, pool.first, pool.second);
 }
 
-void varena_torch_release_pool(int device, MempoolId pool) { agent.pool_release(device, pool.first, pool.second); }
+VARENA_EXPORT void varena_torch_release_pool(int device, MempoolId pool) { agent.pool_release(device, pool.first, pool.second); }
 
 }  // extern "C"

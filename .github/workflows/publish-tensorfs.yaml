@@ -163,6 +163,9 @@ jobs:
           before-script-linux: |
             cargo build --release --locked -p tensorfs --bin tfs
             install -D -m 755 ../../target/release/tfs wheel-data/scripts/tfs
+      - if: runner.os == 'Windows' && matrix.cuda
+        shell: pwsh
+        run: shim/build.ps1
       - if: runner.os != 'Linux'
         run: |
           cargo build --release --locked -p tensorfs --bin tfs
