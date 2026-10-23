@@ -80,7 +80,7 @@ impl Runs {
     }
 
     pub(crate) fn rows(&self) -> Vec<Vec<String>> {
-        self.runs.iter().map(list::row).collect()
+        list::rows(&self.runs)
     }
 
     pub(crate) fn id(&self, selected: usize) -> Option<String> {

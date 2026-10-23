@@ -2022,6 +2022,13 @@
             "default": 0,
             "minimum": 0
           },
+          "started_at_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it began executing (`running`), Unix ms: its time counts from here, never its queue's.\n0 before it does, or from an older machine.",
+            "default": 0,
+            "minimum": 0
+          },
           "state": {
             "type": "string",
             "description": "queued, preparing, running, succeeded, failed, canceled",

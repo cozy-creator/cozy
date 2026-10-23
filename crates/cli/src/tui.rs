@@ -118,6 +118,8 @@ pub(crate) async fn live<B: Backend>(
             changed = screen.changed(ctx) => Next::Changed(changed),
             input = keys.next() => Next::Input(input),
             () = signals.next() => Next::Quit,
+            // Redrawn each second regardless: a running run's time ticks.
+            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => Next::Changed(Ok(())),
         };
         let key = match next {
             Next::Changed(changed) => {

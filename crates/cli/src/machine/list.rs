@@ -234,9 +234,9 @@ fn live_run(held: &LiveRun) -> (String, String) {
     let Some(run) = &held.run else {
         return (format!("run {}", held.id), format!("{}; no record of it here", held.state));
     };
-    let row = run::list::row(run);
-    let reason = Some(&row[6]).filter(|r| !r.is_empty()).unwrap_or(&held.waiting);
-    let cells = [&held.state, &row[1], &row[4], reason];
+    let row = run::list::rows(std::slice::from_ref(run)).remove(0);
+    let progress = Some(&row[4]).filter(|p| !p.is_empty()).unwrap_or(&held.waiting);
+    let cells = [&held.state, &row[1], progress];
     let mut cell = cells.into_iter().filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join(" · ");
     if run::settled(run) {
         cell += &format!("; {} here, left behind on the machine", row[3]);

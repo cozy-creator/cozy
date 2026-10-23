@@ -174,6 +174,8 @@ pub struct MachineExecutionState {
     pub execution_workspace_id: String,
     pub number: u64,
     pub accepted_at_ms: u64,
+    /// When it began executing (`running`); 0 before.
+    pub started_at_ms: u64,
     pub finished_at_ms: u64,
     pub target: Option<MachineExecutionTarget>,
 }
