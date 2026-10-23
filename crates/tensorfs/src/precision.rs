@@ -229,6 +229,15 @@ impl Constraints {
         }
         let ccs: Vec<&str> = self.gpus.iter().map(String::as_str).collect();
         let (gpus, bits) = (Gpus::of(&ccs), Slot::ANY.bits(self.bits.unwrap_or(0), false));
+        // The owner's rule (10-22): with no explicit lane, a sole variant is used, a GPU-less
+        // host included; GPUs present that cannot run it are an error. An explicit lane goes by
+        // the lane rule below (one it does not match is an error).
+        // A kind this reader cannot decode stays refused.
+        let known = |kind: &String| !matches!(Dtype::parse(kind), Dtype::Other(_)) || crate::format::SCHEMES.iter().any(|scheme| scheme.name == *kind);
+        if let ([(_, only)], None) = (variants, self.bits) {
+            let usable = only.kinds.iter().all(known) && (ccs.is_empty() || only.kinds.iter().all(|kind| runs(kind, &gpus)));
+            return Ok(usable.then(Vec::new).map(|reasons| (0, reasons)));
+        }
         Ok(Slot::ANY.select(bits, &gpus, variants).map(|at| (at, Slot::ANY.warnings(bits, &gpus, model, &variants[at].1.family))))
     }
 }
