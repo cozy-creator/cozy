@@ -28,7 +28,7 @@ mod cases {
     use varena::backend::{Access, Backend, Va};
     use varena::lease::table::{self, Table};
     use varena::lease::wire::{End, ToAgent, ToManager};
-    use varena::lease::{Agent, Attach, Hosting, Identity, Lease, Manager, Record, Region, PROTOCOL};
+    use varena::lease::{Agent, Attach, Hosting, Identity, Kind, Lease, Manager, Record, Region, PROTOCOL};
     use varena::ledger::Mode;
     use varena::{GpuId, HostBackend};
 
@@ -621,9 +621,6 @@ mod cases {
     /// Cases that fail today, and why: a full run reports them and stays green; a run naming one
     /// fails on it.
     const PENDING: &[(&str, &str)] = &[
-        ("room_from_dropped_retained_chunks_is_granted_at_once", "bug, sent to S1: the ask waits for another event"),
-        ("a_grant_in_flight_is_coming_room", "bug, sent to S1: refused NothingRevocable"),
-        ("a_stall_is_judged_on_the_looks_cadence", "bug, sent to S1: doorbells drive looks"),
         ("a_tensord_restart_rebuilds_the_books_from_the_agents", "re-attach (M7) is after slice 1"),
     ];
 
@@ -773,7 +770,7 @@ mod cases {
             ["take", size, region, rest @ ..] => {
                 let a = me.as_ref().unwrap();
                 let region: u32 = region.parse().unwrap();
-                match a.take(size.parse().unwrap(), Some(Region { fingerprint: FP, region })) {
+                match a.take(size.parse().unwrap(), Kind::Weights, Some(Region { fingerprint: FP, region })) {
                     Ok(leases) => {
                         let (n, adopted) = (leases.len(), leases.iter().all(|l| l.adopted));
                         let mut ok = true;
@@ -959,7 +956,7 @@ mod cases {
             }
             ["ask", id, size, region @ ..] => {
                 let region = region.first().map(|r| Region { fingerprint: FP, region: r.parse().unwrap() });
-                s.end.as_ref().unwrap().send(&ToManager::Ask { id: id.parse().unwrap(), bytes: size.parse().unwrap(), region }, None).unwrap();
+                s.end.as_ref().unwrap().send(&ToManager::Ask { id: id.parse().unwrap(), bytes: size.parse().unwrap(), kind: if region.is_some() { Kind::Weights } else { Kind::Torch }, region }, None).unwrap();
                 "sent".into()
             }
             ["next"] => s.next(),
