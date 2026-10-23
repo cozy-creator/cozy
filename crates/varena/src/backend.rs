@@ -79,10 +79,6 @@ pub trait Backend: Send + Sync {
     /// Where `io::read` writes `len` mapped bytes at `va + offset`: device memory ordered on the
     /// backend's copy stream, or host memory.
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst;
-    /// Copies `host.len()` mapped bytes at `va + offset` into `host`, after `after`, on a
-    /// low-priority stream of its own (the other copy direction: never ahead of a fill), and
-    /// returns once they are there.
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()>;
     /// An event after everything the copy stream holds so far.
     fn fence(&self) -> Result<Event>;
     /// An event (with timing) after everything `stream` holds so far.
@@ -98,15 +94,9 @@ pub trait Backend: Send + Sync {
     /// Blocks until `event` completes: only the mechanism thread, before it unmaps a page whose
     /// consumers may still read it, and a planned handover ([`crate::Memory::settle`]).
     fn finish(&self, event: Event) -> Result<()>;
-    /// Page-locks `len` bytes of read-only host memory at `ptr` for the copy engine
-    /// (`cuMemHostRegister`): a RAM-tier region, once, so every fill from it is a pinned copy.
-    fn register_host(&self, ptr: u64, len: u64) -> Result<()>;
-    fn unregister_host(&self, ptr: u64) -> Result<()>;
     fn retire(&self, event: Event);
     /// After a device error: proves the copy stream's work complete or fails.
     fn drain(&self) -> Result<()>;
-    /// After a failed save: proves the independent device-to-host stream complete or fails.
-    fn drain_save(&self) -> Result<()>;
 }
 
 /// Pages in host memory (a memfd, an `shm_open` object or a pagefile section each), mapped into
@@ -225,13 +215,6 @@ impl Backend for HostBackend {
         Dst::Host { ptr: (va.base + offset) as *mut u8, len: len as usize }
     }
 
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], _: Event) -> Result<()> {
-        // SAFETY: a mapped page of at least `host.len()` bytes, filled (fills here are
-        // synchronous); another mapping than `host`.
-        host.copy_from_slice(unsafe { std::slice::from_raw_parts((va.base + offset) as *const u8, host.len()) });
-        Ok(())
-    }
-
     fn fence(&self) -> Result<Event> {
         Ok(Event::DONE)
     }
@@ -261,22 +244,9 @@ impl Backend for HostBackend {
         Ok(())
     }
 
-    /// Host copies need no page lock.
-    fn register_host(&self, _: u64, _: u64) -> Result<()> {
-        Ok(())
-    }
-
-    fn unregister_host(&self, _: u64) -> Result<()> {
-        Ok(())
-    }
-
     fn retire(&self, _: Event) {}
 
     fn drain(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn drain_save(&self) -> Result<()> {
         Ok(())
     }
 }

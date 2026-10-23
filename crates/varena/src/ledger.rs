@@ -34,7 +34,7 @@ use crate::os::{self, Listener, Map};
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledgr13");
+const MAGIC: u64 = u64::from_le_bytes(*b"vledgr14");
 /// The header's page: the heap starts after it, and grows from there.
 const HEADER: u64 = 4096;
 /// The heap's unit: rows take two, a fact as many as its bytes need.
@@ -84,9 +84,6 @@ struct RowRec {
     asked: AtomicU64,
     /// Kept pages no live process maps (the custody service's row).
     orphans: AtomicU64,
-    /// Host layouts the RAM tier is asking this row back and it has not answered: the tier is
-    /// no row, so its asks are marked here.
-    host: AtomicU64,
     /// Its process waits for room elsewhere: every change of the table signals its endpoint.
     waiting: AtomicU64,
     /// Full heap generation, including the bits not carried by the compact row id.
@@ -162,7 +159,7 @@ pub(crate) struct Facts {
     /// never beside another family's (review 3, R4). Family 0: any, counted for every child.
     pub yielded: [(u64, u64); decide::YIELDED],
     /// Its running requests' largest measured anonymous host peak, and how many have none
-    /// measured: the RAM tier keeps their growth free, and fills nothing beside an unmeasured one.
+    /// measured: TensorD's host rule keeps their growth free.
     pub host_peak: u64,
     pub host_unmeasured: u64,
     /// Subset of P already retiring: charged until completion, then returned without an ask.
@@ -206,8 +203,6 @@ pub(crate) struct RowView {
     pub asking: u64,
     pub asked: u64,
     pub tid: u32,
-    /// Host layouts the tier is asking of it now.
-    pub host: u64,
     pub waiting: bool,
     physical: PhysicalStamp,
 }
@@ -223,8 +218,6 @@ impl RowView {
 pub(crate) enum Ask {
     /// Device bytes under a ceiling (Class::N or Class::D, as its index).
     Room { ceiling: usize, bytes: u64 },
-    /// The RAM tier gives back a host layout: unpin and unmap it.
-    Host { digest: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -243,7 +236,7 @@ pub(crate) struct Shared {
     heap: Mutex<()>,
     admission: Mutex<()>,
     pub name: String,
-    /// The table owner's uid: its services (custody, the tier, the wake, the asks) are named
+    /// The table owner's uid: its services (custody, the wake, the asks) are named
     /// in that user's namespace.
     pub ns: u32,
     /// Signals the GPU's wake endpoint (TensorD's, by name).
@@ -681,7 +674,7 @@ impl Shared {
                 r.physical_epoch.store(1, Relaxed);
                 r.physical_active.store(0, Relaxed);
                 r.orphan_epoch.store(0, Relaxed);
-                [&r.asking, &r.asked, &r.orphans, &r.host, &r.waiting, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
+                [&r.asking, &r.asked, &r.orphans, &r.waiting, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
                 r.latch.iter().flatten().for_each(|a| a.store(0, Relaxed));
             }
         })?;
@@ -713,7 +706,7 @@ impl Shared {
                 born: r.born.load(Acquire), epoch, facts: facts.physical_epoch, orphans: orphan_epoch,
                 clean: active == 0 && r.physical_active.load(SeqCst) == 0 && r.physical_epoch.load(SeqCst) == epoch,
             };
-            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans, physical, asking: r.asking.load(Acquire), asked: r.asked.load(Acquire), tid: r.tid.load(Acquire), host: r.host.load(Acquire), waiting: r.waiting.load(Acquire) > 0 })
+            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans, physical, asking: r.asking.load(Acquire), asked: r.asked.load(Acquire), tid: r.tid.load(Acquire), waiting: r.waiting.load(Acquire) > 0 })
         })?;
         views
             .into_iter()
@@ -739,20 +732,6 @@ impl Shared {
             self.ring();
         }
         Ok(any)
-    }
-
-    /// Counts a host ask in row `id`'s record (`by` is +1 or -1), if it still names it.
-    fn host_mark(&self, id: u64, by: i64) {
-        let at = (id >> 16) * CELL;
-        let Ok(m) = self.map() else { return };
-        let Some(r) = row(&m, at) else { return };
-        let w = r.word.load(Acquire);
-        if state(w) == READY && kind(w) == ROW && row_id(at, w) == id {
-            match by {
-                1.. => r.host.fetch_add(1, AcqRel),
-                _ => r.host.fetch_sub(1, AcqRel),
-            };
-        }
     }
 
     /// Whether `id` still names a live row record (a reused offset is another row).
@@ -845,7 +824,7 @@ pub(crate) fn record_host(shared: &Shared, key: &str, bytes: u64) -> Result<()> 
     record_peak(shared, &format!("host/{key}"), bytes)
 }
 
-/// A process running requests on a GPU, as the RAM tier's need reads it.
+/// A process running requests on a GPU, as TensorD's host rule reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostCall {
     pub pid: u32,
@@ -871,8 +850,8 @@ pub(crate) fn host_calls(shared: &Shared) -> Option<Vec<HostCall>> {
 
 /// This process's anonymous peak while it runs requests. Linux keeps only a resident high-water
 /// (`VmHWM`), so each look bounds the anonymous peak since the last as that high-water less the
-/// smaller of its file bytes then and now and less its shmem bytes now (the RAM tier's layouts
-/// and host pages it maps: counted once, in the budget, never as need), then starts it over.
+/// smaller of its file bytes then and now and less its shmem bytes now (the host pages it maps:
+/// counted once, in the budget, never as need), then starts it over.
 pub(crate) struct Window {
     peak: u64,
     file: u64,
@@ -947,36 +926,6 @@ fn row_wake(gpu: &str, id: u64) -> String {
 
 fn ask_name(gpu: &str, id: u64) -> String {
     format!("ask-{gpu}-{id}")
-}
-
-/// Asks the row whose ask socket is `name` to give back host layout `digest`; returns the bytes
-/// it unpinned and unmapped. Its reply or its death ends the wait. The ask is marked in the
-/// asked row meanwhile (the tier is no row), so TensorD sees a stopped user stalled.
-pub(crate) fn release_host(name: &str, digest: &str) -> u64 {
-    let marked = ask_row(name).and_then(|(gpu, id)| mark_host(&gpu, id, 1).map(|shared| (shared, id)));
-    let freed = match os::connect(os::euid(), name) {
-        Ok(Some(stream)) => os::call::<_, Answer>(&stream, &Ask::Host { digest: digest.into() }, None).map_or(0, |(a, _)| a.freed),
-        _ => 0,
-    };
-    if let Some((shared, id)) = marked {
-        shared.host_mark(id, -1);
-    }
-    freed
-}
-
-/// The (GPU, row id) an ask socket's name names.
-fn ask_row(name: &str) -> Option<(String, u64)> {
-    let (gpu, id) = name.strip_prefix("ask-")?.rsplit_once('-')?;
-    Some((gpu.to_string(), id.parse().ok()?))
-}
-
-/// The GPU's table, its row `id` marked `by` host asks; the table, for the unmark.
-fn mark_host(gpu: &str, id: u64, by: i64) -> Option<Shared> {
-    let shared = Shared::adopt(open_named(gpu).ok()?, &GpuId { uuid: gpu.to_string(), model: String::new(), memory: u64::MAX }, u64::MAX).ok()?;
-    shared.host_mark(id, by);
-    // TensorD looks at stalls on its events.
-    shared.ring();
-    Some(shared)
 }
 
 /// One process's row. Dropping it publishes zeros, closes its asks and frees it; a killed
@@ -1083,7 +1032,7 @@ impl Row {
         os::listen(self.shared.ns, &self.ask_name())?.ok_or_else(|| Error::Internal("a row's ask socket is taken".into()))
     }
 
-    /// Its ask socket's name, for services that ask it (the RAM tier).
+    /// Its ask socket's name.
     pub fn ask_name(&self) -> String {
         ask_name(&self.shared.name, self.id())
     }
@@ -1326,8 +1275,8 @@ pub enum Peak {
     Compute { key: String, bytes: u64 },
     /// A set's resident bytes (its layout's span), by set name.
     Set { key: String, bytes: u64 },
-    /// A request's host high-water at `<package>|<shape>` (anonymous bytes; the RAM tier's and
-    /// file mappings aside).
+    /// A request's host high-water at `<package>|<shape>` (anonymous bytes; file mappings
+    /// aside).
     Host { key: String, bytes: u64 },
 }
 
@@ -1486,13 +1435,8 @@ impl Ledger {
         Ok(decide::place(&rooms, &bytes))
     }
 
-    /// Its table, for a need source that outlives the borrow ([`crate::tier::need`]).
-    pub(crate) fn table(&self) -> Arc<Shared> {
-        self.shared.clone()
-    }
-
-    /// The processes running requests on this GPU, as the RAM tier's need reads them
-    /// ([`crate::tier::need`]); `None`: its table cannot be read.
+    /// The processes running requests on this GPU, as TensorD's host rule reads them; `None`:
+    /// its table cannot be read.
     pub fn host_calls(&self) -> Option<Vec<HostCall>> {
         host_calls(&self.shared)
     }
@@ -1577,7 +1521,7 @@ impl Ledger {
     /// nothing is reported. TensorD ends what it returns.
     pub fn stalled(&self) -> Vec<u32> {
         let rows = self.shared.rows().unwrap_or_default();
-        rows.iter().filter(|r| r.tid != 0 && (asked_of(&rows, r.id()) > 0 || r.host > 0) && os::stalled(r.pid, r.tid)).map(|r| r.pid).collect()
+        rows.iter().filter(|r| r.tid != 0 && asked_of(&rows, r.id()) > 0 && os::stalled(r.pid, r.tid)).map(|r| r.pid).collect()
     }
 
     /// Readable when room frees, a row dies, an ask goes out or a peak is recorded, in any

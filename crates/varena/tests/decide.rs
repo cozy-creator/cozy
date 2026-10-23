@@ -1,5 +1,5 @@
-//! `make_room`'s order over tables, pure: other sets' idle pages, caches nobody holds, then the
-//! plans' own pages furthest next use first; never a pinned page. A small simulator runs real
+//! `make_room`'s order over tables, pure: other sets' idle pages, then the current step's own
+//! pages and caches nobody holds, furthest next use first; never a pinned page. A small simulator runs real
 //! plans through it at real capacities (each bind takes its page's room, each block its
 //! activations'), plus an ask's answer, prefetch, admission and placement.
 
@@ -124,24 +124,33 @@ fn h3_and_sdxl_complete_at_24_12_and_8_gib() {
     }
 }
 
-/// The order: pages of sets no plan uses, least recently used first; then caches nobody holds,
-/// least recently used first; then the plan's pages, furthest next use first. Never a pinned
-/// or filling page, nor one being bound; a page whose release is pending is marked.
+/// The order: pages of sets no plan uses, least recently used first; then a later step's pages,
+/// furthest first; then the current step's pages and unheld caches together, furthest next use
+/// first, a cache's next use its components' (none: furthest), a page before a cache on a tie.
+/// Never a pinned or filling page, nor one being bound; a page whose release is pending is marked.
 #[test]
-fn victims_go_idle_pages_then_caches_then_the_plan_furthest_first() {
+fn victims_go_other_sets_pages_then_own_pages_and_caches_furthest_first() {
     let mut t = table(64 * MB, vec![set("now", 2, MB), set("later", 2, MB), set("idle", 2, MB)], vec![(vec![0], 1), (vec![1], 1)]);
     let mut clock = 0;
     for k in [(2, 1), (2, 0), (1, 0), (1, 1), (0, 0), (0, 1)] {
         map(&mut t, k, &mut clock);
     }
-    t.caches = vec![Cache { id: 7, bytes: MB, last_use: 9, ..Cache::default() }, Cache { id: 8, bytes: MB, last_use: 1, holds: 1, ..Cache::default() }];
+    t.caches = vec![
+        Cache { id: 7, bytes: MB, last_use: 9, ..Cache::default() },
+        Cache { id: 8, bytes: MB, last_use: 1, holds: 1, ..Cache::default() },
+        Cache { id: 9, sets: vec![0], bytes: MB, last_use: 2, ..Cache::default() },
+    ];
     t.requests[0].cursor.passes.insert(0, 1);
     t.requests[0].cursor.next.insert(0, 1);
     t.page_mut((0, 1)).unwrap().releasing = vec![3];
     let v = victims(&t, &[(1, 1)]);
-    assert_eq!(pages(&v), vec![(2, 1), (2, 0), (1, 0), (0, 0), (0, 1)], "idle by age; then later's; then now's block behind the cursor before the one ahead");
-    assert_eq!(v.get(2), Some(&Victim::Cache { id: 7, bytes: MB }), "the unheld cache after the idle pages; the held one never");
-    assert!(v.contains(&Victim::Page { key: (0, 1), bytes: MB, releasing: true }), "a page whose release is pending is taken once it completes");
+    let cache = |id| Victim::Cache { id, bytes: MB };
+    let page = |key, releasing| Victim::Page { key, bytes: MB, releasing };
+    assert_eq!(
+        v,
+        vec![page((2, 1), false), page((2, 0), false), page((1, 0), false), cache(7), page((0, 0), false), cache(9), page((0, 1), true)],
+        "idle by age; later's; then a cache of no set, now's block behind the cursor (next used a pass ahead, as its graph: the page first), its graph, the block ahead; the held cache never"
+    );
     t.page_mut((0, 0)).unwrap().pins = vec![1];
     t.page_mut((2, 1)).unwrap().filling = true;
     assert!(!pages(&victims(&t, &[])).iter().any(|k| *k == (0, 0) || *k == (2, 1)), "pinned and filling pages never go");
@@ -209,25 +218,6 @@ fn a_rows_yielded_slots_fold_only_past_their_count() {
     assert_eq!(t.yielded_by_family(), [(11, 8 * GB), (22, 6 * GB), (33, 4 * GB)], "three families, three slots");
     t.requests.push(yielded(4, 44, 2));
     assert_eq!(t.yielded_by_family(), [(11, 8 * GB), (22, 6 * GB), (0, 6 * GB)], "a fourth folds with the third");
-}
-
-/// The tier's order, pure: orphaned layouts first (least recently used), then unused, then the
-/// furthest declared; a region in flight is never given back.
-#[test]
-fn the_tier_never_releases_a_region_in_flight() {
-    use varena::tier::{host_decide, HostAction, HostLayout, HostTrigger};
-    let layout = |digest: &str, users: Vec<Option<u32>>, used: u64, regions: Vec<(u64, bool, bool)>| HostLayout { digest: digest.into(), regions, users, used };
-    let layouts = vec![
-        layout("near", vec![Some(1)], 1, vec![(MB, true, false)]),
-        layout("orphan", vec![], 9, vec![(MB, true, true), (MB, true, false)]),
-        layout("unused", vec![None], 5, vec![(MB, true, false)]),
-        layout("far", vec![Some(4)], 2, vec![(MB, true, false)]),
-    ];
-    let first = host_decide(&layouts, HostTrigger::Pressure);
-    assert_eq!(first, vec![HostAction::Release { digest: "orphan".into(), region: 1 }], "the region in flight stays, so the layout stays");
-    let room = host_decide(&layouts, HostTrigger::Room { bytes: 4 * MB, headroom: 0 });
-    let order: Vec<&str> = room.iter().map(|a| match a { HostAction::Release { digest, .. } | HostAction::Forget(digest) => digest.as_str() }).collect();
-    assert_eq!(order, vec!["orphan", "unused", "far", "near"]);
 }
 
 /// S5 r3: largest first; GPU 0 keeps what fits, else the GPU with the most room that holds it,

@@ -123,7 +123,6 @@ impl Backend for Driver {
     fn export(&self, page: &Physical) -> Result<Owned> { self.0.host.export(page) }
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> { self.0.host.import(handle, len) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.0.host.target(va, offset, len) }
-    fn save(&self, va: Va, offset: u64, host: &mut [u8], after: Event) -> Result<()> { self.0.host.save(va, offset, host, after) }
     fn fence(&self) -> Result<Event> { self.0.host.fence() }
     fn record(&self, _: usize) -> Result<Event> {
         Ok(if self.0.pending.load(Ordering::SeqCst) { Event(self.0.next.fetch_add(1, Ordering::SeqCst)) } else { Event::DONE })
@@ -140,11 +139,8 @@ impl Backend for Driver {
         }
         Ok(())
     }
-    fn register_host(&self, ptr: u64, len: u64) -> Result<()> { self.0.host.register_host(ptr, len) }
-    fn unregister_host(&self, ptr: u64) -> Result<()> { self.0.host.unregister_host(ptr) }
     fn retire(&self, _: Event) {}
     fn drain(&self) -> Result<()> { Ok(()) }
-    fn drain_save(&self) -> Result<()> { Ok(()) }
 }
 
 fn open(tag: &str, pages: u64) -> (tempfile::TempDir, String, Arc<Card>, Arc<Memory>) {
@@ -235,8 +231,8 @@ fn make_room_never_takes_a_pinned_page_and_an_impossible_need_takes_nothing() {
     assert!(possible.is_ok() && a_intact, "the need the idle pages cover failed, or a pinned page was taken");
 }
 
-/// The order: another set's idle page (N, least recently used), then caches nobody holds, then
-/// the plan's pages furthest next use first: a later step's (D) before the current step's (W).
+/// The order: another set's idle page (N, least recently used), then a later step's (D), then
+/// caches nobody holds, then the current step's (W), furthest next use first.
 #[test]
 fn make_room_takes_idle_then_caches_then_furthest_declared() {
     let (dir, uuid, card, mem) = open("order", 5);
@@ -244,7 +240,7 @@ fn make_room_takes_idle_then_caches_then_furthest_declared() {
     let b = mem.load(spec(dir.path(), &uuid, "b", 1), Level::Ram).unwrap();
     let n = mem.load(spec(dir.path(), &uuid, "n", 1), Level::Ram).unwrap();
     let shrunk = Arc::new(AtomicU64::new(0));
-    let cache = mem.cache("graphs", {
+    let cache = mem.cache("graphs", &[], {
         let shrunk = shrunk.clone();
         move |want| {
             shrunk.fetch_add(want, Ordering::SeqCst);
@@ -266,6 +262,75 @@ fn make_room_takes_idle_then_caches_then_furthest_declared() {
     drop(r);
     close(&uuid, mem);
     assert!(!after_first.0 && after_first.1 == 0 && after_first.2 && after_first.3, "the first page taken was not the idle N page");
+}
+
+/// The lead's ruling (S4's v14 graphs): a streaming set's room comes from another set's idle
+/// weight pages, though a later step uses them, before that set's graph cache. A page refills from
+/// the page cache; a graph recaptures far slower.
+#[test]
+fn a_streaming_sets_room_takes_another_sets_idle_pages_before_its_graph_cache() {
+    let (dir, uuid, card, mem) = open("graphorder", 5);
+    let dit = mem.load(spec(dir.path(), &uuid, "dit", 3), Level::Ram).unwrap();
+    let vae = mem.load(spec(dir.path(), &uuid, "vae", 2), Level::Ram).unwrap();
+    warm(&mem, vae, 2);
+    let shrunk = Arc::new(AtomicU64::new(0));
+    let cache = mem.cache("vae-graphs", &[vae], {
+        let shrunk = shrunk.clone();
+        move |want| {
+            shrunk.fetch_add(want, Ordering::SeqCst);
+            want
+        }
+    });
+    // The VAE's captured graphs: one page of torch's segments, touched after its weights.
+    assert!(card.take(P));
+    let _segment = mem.resident(P);
+    mem.cached(cache, P);
+    let r = mem.request("r", plan(&[&["dit"], &["vae"]])).unwrap();
+    let pass = r.pass(dit, "k").unwrap();
+    let pins: Vec<varena::Pin> = (0..3).map(|b| mem.bind(dit, b, 0).unwrap()).collect();
+    let shrunk = shrunk.load(Ordering::SeqCst);
+    drop(pins);
+    pass.end(0);
+    r.end();
+    let vae_left = (0..2).filter(|b| resident(&mem, vae, *b)).count();
+    close(&uuid, mem);
+    assert_eq!((shrunk, vae_left), (0, 1), "(cache bytes shrunk, VAE pages left): one VAE page goes, the graphs stay");
+}
+
+/// The lead's Belady ruling (S4's graph-leases eviction): one streaming set, nothing else
+/// loaded, its graph cache naming it. A bind short of room during its pass takes the set's
+/// already-run pages (next used a pass ahead, as the graph is: a tie goes to the page) before the
+/// graph.
+#[test]
+fn a_streaming_sets_room_takes_its_run_pages_before_its_own_graph() {
+    let (dir, uuid, card, mem) = open("owngraph", 4);
+    let dit = mem.load(spec(dir.path(), &uuid, "dit", 4), Level::Ram).unwrap();
+    let shrunk = Arc::new(AtomicU64::new(0));
+    let cache = mem.cache("dit-graphs", &[dit], {
+        let shrunk = shrunk.clone();
+        move |want| {
+            shrunk.fetch_add(want, Ordering::SeqCst);
+            want
+        }
+    });
+    assert!(card.take(P));
+    let _segment = mem.resident(P);
+    mem.cached(cache, P);
+    let r = mem.request("r", plan(&[&["dit"]])).unwrap();
+    let pass = r.pass(dit, "k").unwrap();
+    warm(&mem, dit, 3);
+    // The card is full: block 3's room comes from blocks already run, not from the graph.
+    let last = mem.bind(dit, 3, 0).map(|p| {
+        if p.fresh {
+            p.filled();
+        }
+    }).map_err(|e| e.code());
+    let shrunk = shrunk.load(Ordering::SeqCst);
+    pass.end(0);
+    r.end();
+    let first = resident(&mem, dit, 0);
+    close(&uuid, mem);
+    assert_eq!((last, shrunk, first), (Ok(()), 0, false), "(block 3 bound, graph bytes shrunk, block 0 resident)");
 }
 
 /// The bytes make_room freed are nobody's: another thread's bind maps into them before the
@@ -304,7 +369,7 @@ fn the_room_the_hook_made_is_not_held_for_its_segment() {
 fn make_room_runs_a_caches_shrink_inside_the_hook() {
     let (_dir, uuid, card, mem) = open("shrink", 2);
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let cache = mem.cache("graphs", {
+    let cache = mem.cache("graphs", &[], {
         let calls = calls.clone();
         move |want| {
             calls.lock().push(std::thread::current().name().unwrap_or("?").to_string());
@@ -336,7 +401,7 @@ fn a_bind_still_shrinks_a_cache_for_its_room() {
     // Torch's segments holding the cache: the shrink frees them (the driver and the token).
     let segments = Arc::new(Mutex::new(Some(mem.resident(2 * P))));
     let card2 = card.clone();
-    let cache = mem.cache("graphs", {
+    let cache = mem.cache("graphs", &[], {
         let (calls, segments) = (calls.clone(), segments.clone());
         move |want| {
             calls.lock().push(std::thread::current().name().unwrap_or("?").to_string());
@@ -396,6 +461,47 @@ fn the_hooks_unmap_waits_behind_an_unrelated_map() {
     println!("the hook's make_room with an unrelated Map stuck ahead: within 2 s {within:?}; after the map ran {after:?}");
     close(&uuid, mem);
     assert!(within.is_ok(), "the hook waited behind an unrelated mechanism map");
+}
+
+/// F1 on the watermark's path: the hook streams the running set's upper pages in place, on its own thread, so it never
+/// waits behind an unrelated mechanism map either. A request runs over a set that fills the card. Another thread's
+/// bind streams one of its pages out through the mechanism, then sticks in create. The hook's make_room is still
+/// served at once, from the set's next upper page.
+#[test]
+fn the_hooks_streaming_never_waits_behind_an_unrelated_map() {
+    let (dir, uuid, card, mem) = open("streammech", 6);
+    let x = mem.load(spec(dir.path(), &uuid, "x", 6), Level::Ram).unwrap();
+    let z = mem.load(spec(dir.path(), &uuid, "z", 1), Level::Ram).unwrap();
+    let r = mem.request("r", plan(&[&["x"]])).unwrap();
+    let pass = r.pass(x, "fwd|1").unwrap();
+    warm(&mem, x, 6);
+    *card.hold_create.lock() = true;
+    // Another thread binds z: its room comes from x streaming, then its Map is queued and stuck in create.
+    let binder = std::thread::spawn({
+        let mem = mem.clone();
+        move || drop(mem.bind(z, 0, 0).map(|p| {
+            if p.fresh {
+                p.filled();
+            }
+        }))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let hook = std::thread::spawn({
+        let mem = mem.clone();
+        move || tx.send(mem.make_room(P).map(drop).map_err(|e| e.code())).unwrap()
+    });
+    let within = rx.recv_timeout(Duration::from_secs(2));
+    *card.hold_create.lock() = false;
+    card.create_gate.notify_all();
+    let after = if within.is_err() { rx.recv_timeout(Duration::from_secs(5)).ok() } else { None };
+    hook.join().unwrap();
+    binder.join().unwrap();
+    println!("the hook's streaming make_room with an unrelated Map stuck ahead: within 2 s {within:?}; after the map ran {after:?}");
+    pass.end(0);
+    drop(r);
+    close(&uuid, mem);
+    assert!(matches!(within, Ok(Ok(()))), "the hook's streaming waited behind an unrelated mechanism map, or took nothing");
 }
 
 /// F3's rule: the hook never waits on, or takes, a page being filled. With nothing else to take

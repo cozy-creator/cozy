@@ -25,8 +25,7 @@ fn open(case: &str, memory: u64) -> (Scope, varena::Ledger, Memory, GpuId) {
 
 /// This binary's namespace for tables and service names (never a machine's), and the test's
 /// table removed when it ends.
-// Every test in this binary uses the same process-wide RAM-tier service and its headroom
-// source. Isolate fixtures from one another; concurrency inside a case remains unchanged.
+// Fixtures are isolated from one another; concurrency inside a case remains unchanged.
 static TEST_SCOPE: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
 struct Scope {
     uuid: String,
@@ -44,7 +43,6 @@ impl Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         varena::os::remove_table(&self.uuid);
-        varena::tier::remove_claims();
     }
 }
 
@@ -208,70 +206,6 @@ fn a_set_goes_where_it_fits_and_stays_on_gpu_0_when_it_can() {
     assert_eq!(varena::Ledger::place(&[&ledger, &second], "pkg", "", None, &[("pkg@1/te", Some(6 * MB))]).unwrap(), vec![0], "a layout's bytes, given");
 }
 
-/// A one-region set of `fill` (stored bytes 7).
-#[cfg(target_os = "linux")]
-fn one(dir: &Path, uuid: &str, name: &str, fill: Fill) -> SetSpec {
-    let mut spec = set(dir, name, 1, uuid);
-    std::fs::write(dir.join(format!("{name}.bin")), vec![7u8; REGION_ALIGN as usize]).unwrap();
-    spec.fingerprint = Fingerprint::new(&spec.layout, &[], fill, "release-1", "0/1", uuid);
-    spec
-}
-
-/// One page of room: binds `set`'s block in its own request (after `other` took the page),
-/// bakes it to `bake` when it comes back fresh, and returns (fresh, its first byte). Its
-/// requests are measured calls (a host peak recorded), so the RAM tier takes their copies.
-#[cfg(target_os = "linux")]
-fn rebind(ledger: &varena::Ledger, mem: &Memory, set: varena::SetId, other: varena::SetId, bake: u8) -> (bool, u8) {
-    ledger.restore(&[varena::Peak::Host { key: "pkg|1x1".into(), bytes: 0 }]).unwrap();
-    ledger.dispatch("other", "pkg", "1x1").unwrap();
-    let r = mem.request("other", Plan { steps: vec![Step { sets: vec!["pkg@1/other".into()], passes: 1 }] }).unwrap();
-    let pass = r.pass(other, "k").unwrap();
-    drop(mem.bind(other, 0, 0).unwrap());
-    pass.end(0);
-    r.end();
-    ledger.dispatch("lora", "pkg", "1x1").unwrap();
-    let r = mem.request("lora", plan("lora")).unwrap();
-    let pass = r.pass(set, "k").unwrap();
-    let pin = mem.bind(set, 0, 0).unwrap();
-    // SAFETY: a mapped page bound to this test alone; read, and written only when fresh.
-    let byte = unsafe { *(pin.ptr as *const u8) };
-    let fresh = pin.fresh;
-    if fresh {
-        // SAFETY: as above.
-        unsafe { std::ptr::write_bytes(pin.ptr as *mut u8, bake, pin.len as usize) };
-        pin.filled();
-    }
-    drop(pin);
-    pass.end(0);
-    // Its tier copy, and the eviction's withdraws and unmaps, are done.
-    mem.settle();
-    r.end();
-    (fresh, byte)
-}
-
-/// Review 4, N1 and N2 (the reviewer's probes, event-driven): a page whose bytes are the
-/// weights is never fresh, so a RAM-tier hit of a baked page is not baked again; and the tier
-/// holds bytes by identity: after LoRA a -> b, b's page comes from the store, fresh, and a's
-/// layout still gives a's baked bytes.
-// The RAM tier's files (a memfd with punched holes) are Linux's so far.
-#[cfg(target_os = "linux")]
-#[test]
-fn the_tier_keeps_baked_pages_by_identity_and_never_hands_them_out_fresh() {
-    let dir = tempfile::tempdir().unwrap();
-    let (_scope, ledger, mem, g) = open("baked", REGION_ALIGN);
-    let lora = mem.load(one(dir.path(), &g.uuid, "lora", Fill::Declared("a".into())), Level::Ram).unwrap();
-    let other = mem.load(one(dir.path(), &g.uuid, "other", Fill::Stored), Level::Ram).unwrap();
-    assert_eq!(rebind(&ledger, &mem, lora, other, 0x11), (true, 7), "first use: the store's bytes, baked to a");
-    assert!(mem.stats().unwrap().moved.saved.bytes > 0, "the baked page went to the tier");
-    assert_eq!(rebind(&ledger, &mem, lora, other, 0x11), (false, 0x11), "a tier hit holds a's weights: not baked again");
-    mem.fill(lora, Fill::Declared("b".into()));
-    mem.settle();
-    assert_eq!(rebind(&ledger, &mem, lora, other, 0x22), (true, 7), "b: the store's bytes, fresh, never a's");
-    mem.fill(lora, Fill::Declared("a".into()));
-    mem.settle();
-    assert_eq!(rebind(&ledger, &mem, lora, other, 0x33), (false, 0x11), "a's layout is untouched");
-}
-
 /// Review 4, L1: placement keeps only the package's compute room free on GPU 0, so measuring a
 /// run never moves a set the next run: place, run, place again, three times over.
 #[test]
@@ -322,8 +256,8 @@ fn an_impossible_need_is_exhausted_at_once() {
     pass.end(0);
 }
 
-/// Host-OOM, the varena side: a request records its anonymous host peak (Peak::Host; the tier's
-/// and file mappings aside). While it runs unmeasured its process is an unmeasured call, and once
+/// Host-OOM, the varena side: a request records its anonymous host peak (Peak::Host; file
+/// mappings aside). While it runs unmeasured its process is an unmeasured call, and once
 /// measured the call carries that peak. Linux: the peak is read from `/proc` (elsewhere a request
 /// is unmeasured).
 #[cfg(target_os = "linux")]
@@ -334,7 +268,6 @@ fn a_request_records_its_anonymous_host_peak() {
     let r = mem.request("first", Plan { steps: vec![] }).unwrap();
     let unmeasured = |calls: Option<Vec<varena::HostCall>>| calls.is_some_and(|c| c.len() == 1 && c[0].pid == std::process::id() && c[0].peak.is_none());
     assert!(unmeasured(ledger.host_calls()), "a running request with no host peak");
-    assert!(unmeasured(varena::tier::need(&[&ledger])()), "TensorD's over its GPUs");
     let held: Vec<u8> = vec![1; (64 * MB) as usize];
     let stats = r.end();
     assert!(stats.host.is_some_and(|h| h >= 64 * MB), "{:?}", stats.host);
@@ -439,14 +372,15 @@ fn idle_work_takes_free_bytes_only() {
     let (_scope, ledger, mem, g) = open("idle-work", 8 * MB);
     mem.load(set(dir.path(), "n", 3, &g.uuid), Level::Gpu).unwrap();
     let a = mem.load(set(dir.path(), "a", 2, &g.uuid), Level::Ram).unwrap();
-    let idle_pages = || ledger.status().rows.iter().map(|r| r.classes[varena::table::Class::N.index()]).sum::<u64>();
-    assert_eq!(idle_pages(), 3 * 2 * MB);
+    // Mapped pages, whatever their class (a Keep's protect pins one a moment).
+    let mapped = || ledger.status().rows.iter().map(|r| r.classes.iter().skip(varena::table::Class::S.index()).sum::<u64>()).sum::<u64>();
     let first = mem.bind_free(a, 0, 0).unwrap();
+    assert_eq!(mapped(), 4 * 2 * MB);
     assert!(matches!(mem.bind_free(a, 1, 0), Err(varena::Error::Exhausted(_))), "no free page left");
     let r = mem.request_idle("capture", plan("a")).unwrap();
     let pass = r.pass(a, "k").unwrap();
     assert!(matches!(mem.make_room(2 * MB), Err(varena::Error::Exhausted(_))), "an idle request's hook takes nothing");
-    assert_eq!(idle_pages(), 3 * 2 * MB, "nothing was taken");
+    assert_eq!(mapped(), 4 * 2 * MB, "nothing was taken");
     pass.end(0);
     drop((r, first));
     let r = mem.request("ordinary", plan("a")).unwrap();

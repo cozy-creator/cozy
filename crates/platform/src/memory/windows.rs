@@ -214,33 +214,6 @@ pub fn held(f: &Owned, start: u64, len: u64) -> Result<bool> {
     Ok(true)
 }
 
-/// A wake event: (the waiter's handle, the signaller's), one auto-reset event.
-pub fn event() -> Result<(Owned, Owned)> {
-    // SAFETY: an unnamed auto-reset event, not signalled.
-    let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
-    if h.is_null() {
-        return Err(last("create an event"));
-    }
-    // SAFETY: a handle we just made.
-    let reader = unsafe { Owned::from_raw_handle(h as _) };
-    let writer = reader.try_clone()?;
-    Ok((reader, writer))
-}
-
-pub fn signal(writer: &Owned) {
-    // SAFETY: an event we hold.
-    unsafe { SetEvent(raw(writer)) };
-}
-
-/// Blocks until the event is signalled; the wait resets it.
-pub fn await_event(reader: &Owned) -> Result<()> {
-    // SAFETY: an event we hold.
-    match unsafe { WaitForSingleObject(raw(reader), INFINITE) } {
-        WAIT_OBJECT_0 => Ok(()),
-        _ => Err(last("wait for a wake")),
-    }
-}
-
 /// A service's pipe, named under this user's temp directory (pipe names are machine-wide).
 fn pipe(name: &str) -> Result<PathBuf> {
     Ok(dir()?.join(format!("{}.pipe", clean(name))))
@@ -455,18 +428,6 @@ pub fn unmap_page(at: u64, _len: u64) -> Result<()> {
         return Err(last("unmap a page"));
     }
     Ok(())
-}
-
-pub fn tier_file(_: &str) -> Result<Owned> {
-    Err(Error::unsupported(Seam::SharedMemory))
-}
-
-pub fn punch(_: &Owned, _: u64, _: u64) -> Result<()> {
-    Err(Error::unsupported(Seam::SharedMemory))
-}
-
-pub fn allocated(_: &Owned) -> u64 {
-    0
 }
 
 /// The calling thread's id.
