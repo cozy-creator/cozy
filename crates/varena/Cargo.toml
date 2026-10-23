@@ -34,7 +34,7 @@ tracing-subscriber.workspace = true
 name = "processes"
 harness = false
 
-# Its own harness: the agents are this binary (`lease agent <socket>`).
+# Its own harness: the agents are this binary (`lease agent <gpu uuid>`).
 [[test]]
 name = "lease"
 harness = false
@@ -42,4 +42,9 @@ harness = false
 # Its own harness: TensorD and the executors are this binary (`lease_p0 tensord|agent|raw ...`).
 [[test]]
 name = "lease_p0"
+harness = false
+
+# Its own harness: GPU cases run only when named after --ignored; the agents are this binary.
+[[test]]
+name = "lease_gpu"
 harness = false
