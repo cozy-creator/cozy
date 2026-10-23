@@ -15,7 +15,6 @@ unmaintained = "all"
 yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: TensorD drops it (xs-067)" },
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml: replaced (xs-067)" },
 ]
 
 [licenses]
@@ -93,6 +92,7 @@ allow = [
     "anstyle-wincon",
     "anyhow",
     "approx",
+    "arraydeque",
     "arrayvec",
     "asn1-rs",
     "asn1-rs-derive",
@@ -300,6 +300,7 @@ allow = [
     "once_cell_polyfill",
     "openapiv3",
     "openssl-probe",
+    "ordered-float",
     "outref",
     "palette",
     "palette_derive",
@@ -371,6 +372,8 @@ allow = [
     "ryu",
     "ryu-js",
     "same-file",
+    "saphyr",
+    "saphyr-parser",
     "schannel",
     "schemars",
     "schemars_derive",
@@ -392,7 +395,6 @@ allow = [
     "serde_spanned",
     "serde_tokenstream",
     "serde_urlencoded",
-    "serde_yaml",
     "serial2",
     "sha2",
     "sharded-slab",
@@ -476,7 +478,6 @@ allow = [
     "unicode-truncate",
     "unicode-width",
     "unit-prefix",
-    "unsafe-libyaml",
     "unscanny",
     "untrusted",
     "url",
