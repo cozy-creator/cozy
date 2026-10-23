@@ -49,6 +49,9 @@ progress = 0
 _AHEAD = 2
 #: A streamed model's scratch slots, in its largest blocks (the core keeps 2-3).
 _SLOTS = 3
+#: H's least (design/vram-yield.md §3.1), else a sixteenth of the card: what the driver maps beside
+#: us where no rung reaches (a kernel's module at its first launch, a library's handle).
+_FLOOR = 512 << 20
 #: TensorFS dtype names; an `F4` part is u8 pairs.
 DTYPES: dict[str, torch.dtype] = {
     name: getattr(torch, kind)
@@ -569,7 +572,9 @@ class Memory:
         self.memo = cuts.Memo()
         cuts.serve(self.memo, self)
         self.row: tuple[Ledger, Row] | None = None
-        #: a ledger capacity below the card (`gpu_memory_limit`, §5.6), and the card's total
+        #: what this process plans within: the ledger's capacity (`gpu_memory_limit`, §5.6) less H,
+        #: so no prefetch maps into H (cr-215: on a card prefetched full a first launch got 999);
+        #: and the card's total
         self.limit: int | None = None
         self.total = 0
         #: TensorD's ledger, which takes host-tier deposits; standalone, one of its own (§2)
@@ -583,7 +588,7 @@ class Memory:
                 table = Ledger.create(uuid, min(self.total, limit or self.total))
             self.row = (table, table.claim())
             self.core.serve(self.row[1], self._answer)  # other processes' asks
-            self.limit = table.capacity if table.capacity < self.total else None
+            self.limit = min(table.capacity, self.total) - max(_FLOOR, self.total // 16)
 
     @classmethod
     def open(
@@ -1025,6 +1030,8 @@ class Memory:
             nxt = model.order[(at + ahead) % len(model.order)]
             if model.blocks[nxt].count or nxt in model.home and _resident(model, nxt):
                 continue
+            if self._free() < model.blocks[nxt].nbytes:  # never past the limit, into H
+                return
             try:
                 for region in model.blocks[nxt].regions:
                     model.ws.prefetch(region)
