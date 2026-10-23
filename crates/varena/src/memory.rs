@@ -722,6 +722,10 @@ struct State {
     /// The wake epoch read when this lock was taken, before its drain: a wait sleeps only while
     /// no change came after it.
     seen: u64,
+    /// Each page's last bind on the machine-wide clock (CLOCK_MONOTONIC ns): the manager
+    /// compares idle pages across processes by it.
+    #[cfg(unix)]
+    used_ns: HashMap<Key, u64>,
     table: Table,
     physical_epoch: u64,
     retired: HashMap<(Key, u64), Retirement>,
@@ -1062,8 +1066,9 @@ impl Memory {
     /// Leases this GPU's weight pages from the manager serving it (TensorD's, in the table
     /// owner's namespace), right after open, before any load: from then on its pages are the
     /// manager's chunks, retained by it across this process's exit (no Keep), and asked back by
-    /// it. `Some((Incompatible | Absent, why))`: it runs standalone. Any other refusal is an error
-    /// (TensorD parks a peer it has not registered yet, so the dial itself waits).
+    /// it. A refusal comes back typed, `Some((code, why))`: Incompatible or Absent runs standalone;
+    /// the caller fails on any other (TensorD parks a peer it has not registered yet, so the dial
+    /// itself waits).
     #[cfg(unix)]
     pub fn lease(&self) -> Result<Option<(crate::lease::Refusal, String)>> {
         let uuid = self.inner._device.0.clone();
@@ -1098,8 +1103,7 @@ impl Memory {
                 self.serve_leased_torch()?;
                 Ok(None)
             }
-            crate::lease::Attach::Refused { code: code @ (crate::lease::Refusal::Incompatible | crate::lease::Refusal::Absent), why } => Ok(Some((code, why))),
-            crate::lease::Attach::Refused { code, why } => Err(Error::Closed(format!("the lease manager refused this process ({code:?}): {why}"))),
+            crate::lease::Attach::Refused { code, why } => Ok(Some((code, why))),
         }
     }
 
@@ -1561,6 +1565,7 @@ impl Inner {
             agent.busy(st.events.values().any(|q| !q.is_empty()));
             self.redecline(st);
             self.land(st, agent);
+            self.advise(st, agent);
         }
         // A held cache's release completes on its stream: it is its class again.
         for c in &mut st.table.caches {
@@ -2958,6 +2963,8 @@ impl Inner {
         st.pins.insert(id, (key, req, std::thread::current().id()));
         if let Some(p) = st.table.page_mut(key) {
             p.last_use = now;
+            #[cfg(unix)]
+            st.used_ns.insert(key, monotonic_ns());
         }
         st.sync(key);
         if let Some(r) = req.and_then(|r| st.table.request_mut(r)) {
@@ -4107,6 +4114,24 @@ impl Inner {
         self.unlock(st);
     }
 
+    /// What each leased page is to its plan, for the manager's victim order (the policy's
+    /// advice codes): the current step's (6, memory.min, its distance: the nearest are its
+    /// streaming slots), a later step's (4, its distance), or idle (3, its last bind on the
+    /// machine-wide clock). Atomics only, under the state lock.
+    #[cfg(unix)]
+    fn advise(&self, st: &State, agent: &crate::lease::Agent) {
+        for (ticket, key, _) in self.leased.lock().values() {
+            let at = st.table.distance(*key).map(|(step, pass, block)| u64::from(step) << 40 | u64::from(pass) << 20 | u64::from(block));
+            let (code, value) = match (st.table.class(*key), at) {
+                (Some(Class::P), _) => (6, 0),
+                (Some(Class::W), at) => (6, at.unwrap_or(0)),
+                (_, Some(at)) => (4, at),
+                _ => (3, st.used_ns.get(key).copied().unwrap_or(0)),
+            };
+            let _ = agent.hint(*ticket, code, value);
+        }
+    }
+
     /// Leased pages whose fill's ready event completed: the manager hears they landed. Under
     /// the state lock.
     #[cfg(unix)]
@@ -4198,4 +4223,13 @@ impl Drop for Pass {
             st.active.remove(&(self.req, self.set));
         }
     }
+}
+
+/// CLOCK_MONOTONIC in nanoseconds: one clock for every process on the machine.
+#[cfg(unix)]
+fn monotonic_ns() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid clock id and a writable timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    u64::try_from(t.tv_sec).unwrap_or(0).saturating_mul(1_000_000_000).saturating_add(u64::try_from(t.tv_nsec).unwrap_or(0))
 }
