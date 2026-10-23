@@ -1,6 +1,6 @@
 //! `cozy uninstall`: removes what cozy put on this computer: its machine and Calcifer with their
-//! services, `~/.cozy` (this binary with it), the installer's `~/.config/cozy` and shell lines, and
-//! on Windows its PATH entry. The machine's model store stays unless `--all`.
+//! services, `~/.cozy` (this binary with it), the installer's `~/.config/cozy` and shell lines, its
+//! shell completion, and on Windows its PATH entry. The machine's model store stays unless `--all`.
 use std::{
     fs,
     io::{self, IsTerminal as _, Write as _},
@@ -83,9 +83,10 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     let rc: Vec<PathBuf> = (rc_files(ctx).into_iter())
         .filter(|file| unsourced(file).is_some())
         .collect();
+    let completions = crate::completion::installed(&ctx.user_home);
     if !ctx.yes {
         if !ctx.json {
-            plan(ctx, &removed, &kept, &rc);
+            plan(ctx, &removed, &kept, &rc, &completions);
         }
         confirm()?;
     }
@@ -112,6 +113,9 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             .map_err(|e| failed(file, e))?;
         }
     }
+    for file in &completions {
+        fs::remove_file(file).map_err(|e| failed(file, e))?;
+    }
     #[cfg(windows)]
     platform::paths::remove_from_user_path(&ctx.home.bin())
         .map_err(|e| Error::new(Kind::Internal, "path_unwritable", e.to_string()))?;
@@ -126,7 +130,9 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     }
 
     if ctx.json {
-        output::json(&serde_json::json!({"removed": removed, "kept": kept, "rc_files": rc}));
+        output::json(
+            &serde_json::json!({"removed": removed, "kept": kept, "rc_files": rc, "completions": completions}),
+        );
         return Ok(ExitCode::SUCCESS);
     }
     let total = removed.iter().map(|item| item.bytes).sum();
@@ -143,13 +149,16 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
 }
 
 /// What it removes and keeps, and their sizes, before it asks.
-fn plan(ctx: &Context, removed: &[Item], kept: &[Item], rc: &[PathBuf]) {
+fn plan(ctx: &Context, removed: &[Item], kept: &[Item], rc: &[PathBuf], completions: &[PathBuf]) {
     let mut table = output::Table::new(ctx, ["REMOVES", "SIZE"]);
     for item in removed {
         table = table.row([item.path.display().to_string(), output::bytes(item.bytes)]);
     }
     for file in rc {
         table = table.row([format!("its line in {}", file.display()), String::new()]);
+    }
+    for file in completions {
+        table = table.row([file.display().to_string(), String::new()]);
     }
     for item in kept {
         table = table.note(format!(
