@@ -75,7 +75,6 @@ def main() -> None:
     assert reply() == [GIB, GIB]
     theirs = row_of(ledger, proc.pid)
     assert (theirs.want, theirs.acked, theirs.cold, theirs.progress) == (0, GIB, 2 * GIB, 3)
-    assert ledger.stalled() == []
 
     os.kill(proc.pid, signal.SIGKILL)
     proc.wait()

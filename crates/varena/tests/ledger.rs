@@ -274,21 +274,22 @@ fn fits_reserves_remaining_peaks_and_never_admits_beside_the_unmeasured_or_the_d
 }
 
 /// A process whose main thread is busy in one long kernel still answers asks, from a Rust
-/// thread: the answer moves its progress, so it is never named stalled.
+/// thread: each answer moves its progress, which TensorD's stall rule reads.
 #[test]
-fn a_busy_process_answers_asks_from_its_own_thread_and_is_never_stalled() {
+fn a_busy_process_answers_asks_from_its_own_thread() {
     let (ledger, _fd) = Ledger::create("GPU-busy", 24 * GIB).unwrap();
     let mut busy = Proc::spawn(&ledger);
     busy.call("claim");
     busy.call(&publish(&Facts { resident: 4 * GIB, cold: 4 * GIB, last_use: 1, ..Facts::default() }));
     busy.call("busy");
-    assert!(ledger.stalled().unwrap().is_empty(), "the first look records");
     for ask in 0..3 {
+        let progress = row(&ledger, busy.pid()).progress;
         let victims = ledger.ask(None, GIB).unwrap();
         assert_eq!(victims.len(), 1, "ask {ask}");
         ledger.wait(&victims[0]).unwrap();
         assert!(ledger.answered(&victims[0]).unwrap());
-        assert!(ledger.stalled().unwrap().is_empty(), "ask {ask}: answered, so never stalled");
+        let answered = row(&ledger, busy.pid());
+        assert!(answered.progress > progress && answered.want == 0, "ask {ask}: answered, so progress moved");
     }
     assert_eq!(row(&ledger, busy.pid()).acked, 3 * GIB);
     busy.kill9();
@@ -463,7 +464,6 @@ fn a_killed_holder_is_dead_reaped_and_counted_until_its_bytes_return() {
     assert_eq!(ledger.admit(3 * GIB).unwrap(), Admit::After { victims: vec![], short: 512 * MIB });
     assert_eq!(ledger.admit(2 * GIB).unwrap(), Admit::Now);
     assert!(ledger.ask(None, GIB).unwrap().is_empty());
-    assert!(ledger.stalled().unwrap().is_empty());
 
     assert_eq!(ledger.reap(pid).unwrap(), held);
     let reaping = row(&ledger, pid);
@@ -490,8 +490,10 @@ fn a_killed_holder_is_dead_reaped_and_counted_until_its_bytes_return() {
     assert_eq!(row(&ledger, me.pid()).state, State::Live);
 }
 
+/// What TensorD's stall rule reads: a victim asked and not answering keeps its `want` and its
+/// progress; an answer or a publish moves its progress; asks signal the eventfd.
 #[test]
-fn a_victim_that_never_progresses_is_stalled() {
+fn a_victim_that_never_answers_keeps_its_want_and_progress() {
     let (ledger, _fd) = Ledger::create("GPU-stall", 8 * GIB).unwrap();
     let mut b = Proc::spawn(&ledger);
     b.call("claim");
@@ -499,25 +501,23 @@ fn a_victim_that_never_progresses_is_stalled() {
     let mut c = Proc::spawn(&ledger);
     c.call("claim");
     c.call(&publish(&Facts { resident: GIB, cold: GIB, last_use: 1, ..Facts::default() }));
-    assert!(ledger.stalled().unwrap().is_empty());
+    let events = ledger.events().unwrap().as_raw_fd();
+    let mut count = [0u8; 8];
+    // SAFETY: an 8-byte read from the nonblocking eventfd this ledger holds.
+    let mut signalled = || unsafe { libc::read(events, count.as_mut_ptr().cast(), 8) == 8 };
+    let (before_b, before_c) = (row(&ledger, b.pid()).progress, row(&ledger, c.pid()).progress);
 
     let victims = ledger.ask(None, 2 * GIB + 512 * MIB).unwrap();
+    assert!(signalled(), "an ask wakes TensorD's watch");
     let asked: Vec<_> = victims.iter().map(|v| (v.pid, v.bytes)).collect();
     assert_eq!(asked, [(c.pid(), GIB), (b.pid(), GIB + 512 * MIB)], "least recently used first");
     assert_eq!(c.call("serve"), [GIB, GIB]);
-
-    assert!(ledger.stalled().unwrap().is_empty(), "the first look records");
-    assert_eq!(ledger.stalled().unwrap(), [b.pid()]);
-    assert_eq!(ledger.stalled().unwrap(), [b.pid()]);
-    // Another handle looks for itself.
-    let other = Ledger::adopt(ledger.fd(), None).unwrap();
-    assert!(other.stalled().unwrap().is_empty());
-    // Any progress clears it until the next look without progress.
+    let (still, answered) = (row(&ledger, b.pid()), row(&ledger, c.pid()));
+    assert_eq!((still.want, still.progress), (GIB + 512 * MIB, before_b), "asked, silent");
+    assert!(answered.want == 0 && answered.progress > before_c);
     b.call(&publish(&Facts { resident: 2 * GIB, cold: 2 * GIB, last_use: 6, ..Facts::default() }));
-    assert!(ledger.stalled().unwrap().is_empty());
-    assert_eq!(ledger.stalled().unwrap(), [b.pid()]);
+    assert!(row(&ledger, b.pid()).progress > before_b, "a publish is progress too");
     assert_eq!(b.call("serve"), [GIB + 512 * MIB, GIB + 512 * MIB]);
-    assert!(ledger.stalled().unwrap().is_empty());
     assert!(victims.iter().all(|v| ledger.answered(v).unwrap()));
     b.kill9();
     c.kill9();

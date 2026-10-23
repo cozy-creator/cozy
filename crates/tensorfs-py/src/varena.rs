@@ -713,10 +713,6 @@ impl PyLedger {
         self.0.returned(pid).or_ledger(py)
     }
 
-    fn stalled(&self, py: Python<'_>) -> PyResult<Vec<u32>> {
-        py.detach(|| self.0.stalled()).or_ledger(py)
-    }
-
     fn snapshot(&self, py: Python<'_>) -> PyResult<Vec<PyRowFacts>> {
         Ok(py.detach(|| self.0.snapshot()).or_ledger(py)?.into_iter().map(Into::into).collect())
     }

@@ -3,15 +3,18 @@
 //! floor plus every byte NVML shows that no row explains (other programs, executors still dying).
 //! A watch thread blocks on the eventfd and wakes the pool the moment varena signals freed bytes.
 //! It reads NVML on demand (before a decision, after an executor's exit): it reaps dead rows and
-//! returns them once NVML shows their bytes back. Only while a call is in flight, or rows are
-//! reaping or asked for bytes, does it sample, at the wedge rule's resolution: their bytes coming
-//! back, or a stalled row (progress not moved for a wedge floor), which it ends. TensorD decides nothing from bytes: it
-//! asks `fits`.
+//! returns them once NVML shows their bytes back. An ask signals the eventfd too: only while rows
+//! are reaping or asked for bytes does it sample, at the wedge rule's resolution: their bytes coming
+//! back, or a stalled row (asked, and neither answering nor publishing for longer than its own
+//! measured pace allows), which it ends. TensorD decides nothing from bytes: it asks `fits`.
 use super::{MemoryLog, Sample};
-use crate::{device_executor::Page, process::Liveness};
+use crate::{
+    device_executor::Page,
+    process::{Liveness, Pace},
+};
 use platform::{gpu::Device, process::Birth};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io,
     os::{
@@ -19,7 +22,7 @@ use std::{
         unix::net::UnixStream,
     },
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex, OnceLock,
     },
     time::Instant,
@@ -57,10 +60,9 @@ struct Inner {
     /// The watch thread, which answers ticks and so never waits for one.
     watcher: OnceLock<std::thread::ThreadId>,
     freed: OnceLock<Freed>,
-    looked: Mutex<Instant>,
+    /// Each live row's answering pace, by (slot, gen): `look` ends an asked row stalled past it.
+    paces: Mutex<HashMap<(u32, u64), Pace>>,
     liveness: Liveness,
-    /// Calls TensorD has in flight on this GPU: executors ask each other for bytes then.
-    active: AtomicUsize,
 }
 
 /// GPU pages an executor kept of one layout, so its crash or restart leaves them on the GPU.
@@ -186,9 +188,8 @@ impl GpuLedger {
             ending: Arc::default(),
             watcher: OnceLock::new(),
             freed: OnceLock::new(),
-            looked: Mutex::new(Instant::now()),
+            paces: Mutex::default(),
             liveness,
-            active: AtomicUsize::new(0),
         });
         let server = inner.clone();
         inner.own.serve(move |want| server.evict_kept(want)).map_err(err)?;
@@ -246,14 +247,6 @@ impl GpuLedger {
         let ticket = ticks.asked;
         signal(&self.wake);
         drop(changed.wait_while(ticks, |t| t.answered < ticket && !t.stopped).unwrap());
-    }
-
-
-    /// A call in flight here until the guard drops: the watch samples meanwhile, for stalled asks.
-    pub fn active(&self) -> Active<'_> {
-        self.inner.active.fetch_add(1, Ordering::AcqRel);
-        signal(&self.wake);
-        Active(self)
     }
 
     /// Whether a request of `package` can start here now (`Ledger::fits`): at `shape`, or its
@@ -349,14 +342,6 @@ impl GpuLedger {
     }
 }
 
-pub struct Active<'a>(&'a GpuLedger);
-
-impl Drop for Active<'_> {
-    fn drop(&mut self) {
-        self.0.inner.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 impl Drop for GpuLedger {
     fn drop(&mut self) {
         let (lock, changed) = &*self.ticks;
@@ -371,11 +356,13 @@ fn read(device: &Device) -> Option<Sample> {
 }
 
 /// Blocks on the ledger's eventfd and the wake eventfd until the ledger's owner drops it: a
-/// freed signal reaches the pool at once; an asked tick reads NVML and settles the rows. While
-/// rows are reaping or asked for bytes, it also wakes at the wedge rule's sample to read again.
+/// freed signal reaches the pool at once; it, an executor's ask, or an asked tick reads NVML and
+/// settles the rows. While rows are reaping or asked for bytes, it also wakes at the wedge rule's
+/// sample to read again.
 fn watch(device: Option<Device>, inner: &Inner, ticks: &(Mutex<Ticks>, Condvar), wake: &OwnedFd) {
     let (lock, changed) = ticks;
     let events = inner.ledger.events().map(|e| e.as_raw_fd());
+    let mut freed = inner.ledger.freed_gen();
     loop {
         let asked = lock.lock().unwrap().asked;
         let reading = device.as_ref().and_then(read);
@@ -400,13 +387,15 @@ fn watch(device: Option<Device>, inner: &Inner, ticks: &(Mutex<Ticks>, Condvar),
             let mut fds = [wake.as_raw_fd(), events.unwrap_or(-1)].map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
             // SAFETY: poll on two descriptors this thread's owners keep open (-1 is ignored).
             let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) };
-            if fds[1].revents & libc::POLLIN != 0 && drain(fds[1].fd) {
+            let signalled = fds[1].revents & libc::POLLIN != 0 && drain(fds[1].fd);
+            if signalled && inner.ledger.freed_gen() != freed {
+                freed = inner.ledger.freed_gen();
                 if let Some(told) = inner.freed.get() {
                     told();
                 }
             }
             let woken = fds[0].revents & libc::POLLIN != 0 && drain(fds[0].fd);
-            if woken || ready == 0 {
+            if woken || signalled || ready == 0 {
                 break;
             }
         }
@@ -460,11 +449,10 @@ impl Inner {
         row.slot == self.own.id() && row.gen == self.own.gen()
     }
 
-    /// A call in flight, rows whose bytes are on their way back, or rows asked for bytes: what
-    /// the watch samples for.
+    /// Rows whose bytes are on their way back, or rows asked for bytes: what the watch samples for.
     fn pending(&self) -> bool {
         let rows = self.ledger.snapshot().unwrap_or_default();
-        self.active.load(Ordering::Acquire) > 0 || rows.iter().any(|r| r.state != State::Live || r.want > 0)
+        rows.iter().any(|r| r.state != State::Live || r.want > 0)
     }
 
     /// Dead rows whose process is gone are reaped; reaping rows whose bytes NVML no longer
@@ -526,25 +514,40 @@ impl Inner {
         }
     }
 
-    /// Once a wedge floor: rows asked for bytes whose progress did not move since the last look
-    /// are ended.
+    /// At each reading: a row asked for bytes whose progress (an answer, or its facts published)
+    /// has not moved for longer than its patience (eight times its slowest answer yet, at least a
+    /// wedge floor) is ended, and its asker's wait ends at its reap. Time not asked is not stillness.
     fn look(&self) {
-        let mut looked = self.looked.lock().unwrap();
-        if looked.elapsed() < self.liveness.floor() {
-            return;
-        }
-        *looked = Instant::now();
-        drop(looked);
-        match self.ledger.stalled() {
-            Ok(pids) => {
-                for pid in pids {
-                    self.log.note(serde_json::json!({"event": "stalled", "gpu": self.entry, "pid": pid}));
-                    if let Some(end) = self.end.get() {
-                        self.hand_off(end, pid);
-                    }
+        let rows = match self.ledger.snapshot() {
+            Ok(rows) => rows,
+            Err(error) => return tracing::warn!("memory: GPU {} stalls: {error}", self.entry),
+        };
+        let (now, floor) = (Instant::now(), self.liveness.floor());
+        let stalled: Vec<u32> = {
+            let mut paces = self.paces.lock().unwrap();
+            let live: Vec<&RowFacts> = rows.iter().filter(|r| r.state == State::Live && r.pid != std::process::id()).collect();
+            paces.retain(|key, _| live.iter().any(|r| (r.slot, r.gen) == *key));
+            let mut stalled = vec![];
+            for r in live {
+                let pace = paces.entry((r.slot, r.gen)).or_default();
+                if r.want == 0 {
+                    pace.excuse(now);
+                }
+                pace.observe(Some(r.progress), now);
+                if r.want > 0 && pace.still_since().is_some_and(|since| now - since > pace.patience(floor)) {
+                    stalled.push(((r.slot, r.gen), r.pid));
                 }
             }
-            Err(error) => tracing::warn!("memory: GPU {} stalls: {error}", self.entry),
+            stalled.into_iter().map(|(key, pid)| {
+                paces.remove(&key);
+                pid
+            }).collect()
+        };
+        for pid in stalled {
+            self.log.note(serde_json::json!({"event": "stalled", "gpu": self.entry, "pid": pid}));
+            if let Some(end) = self.end.get() {
+                self.hand_off(end, pid);
+            }
         }
     }
 }

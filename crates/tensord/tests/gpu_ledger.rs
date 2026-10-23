@@ -381,8 +381,8 @@ fn inner_a_killed_executors_bytes_stay_counted() {
     assert!(ledger.fits("plan", Some("s"), false));
 }
 
-/// A victim that never answers an ask is named stalled once its progress has not moved for a
-/// wedge floor, and ended; the asker's wait then returns.
+/// A victim that never answers an ask is ended once its progress has not moved for longer than
+/// its pace allows, and the asker's wait then returns. The ask alone wakes TensorD's watch.
 #[test]
 fn a_stalled_victim_is_ended_and_its_asker_goes_on() {
     under_fake_nvml("inner_a_stalled_victim_is_ended", 8 * GIB, false);
@@ -402,10 +402,8 @@ fn inner_a_stalled_victim_is_ended() {
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         release(pid);
     }));
-    let [memfd, _] = ledger.grant().unwrap();
-    let asker = Ledger::adopt(std::os::fd::AsFd::as_fd(&memfd), None).unwrap();
-    // A call in flight: executors ask each other for bytes, and TensorD watches for stalls.
-    let _call = ledger.active();
+    let [memfd, events] = ledger.grant().unwrap();
+    let asker = Ledger::adopt(memfd.as_fd(), Some(events.as_fd())).unwrap();
     for victim in asker.ask(None, 3 * GIB).unwrap() {
         asker.wait(&victim).unwrap();
     }
@@ -438,9 +436,8 @@ fn inner_an_idle_executor_that_answers_asks_and_frees_nothing_is_ended() {
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         release(pid);
     }));
-    let [memfd, _] = ledger.grant().unwrap();
-    let asker = Ledger::adopt(std::os::fd::AsFd::as_fd(&memfd), None).unwrap();
-    let _call = ledger.active();
+    let [memfd, events] = ledger.grant().unwrap();
+    let asker = Ledger::adopt(memfd.as_fd(), Some(events.as_fd())).unwrap();
     // Asked again as an op retries, until the refusing one is gone; a hang bound only.
     for _ in 0..2000 {
         if !ended.lock().unwrap().is_empty() {
@@ -481,9 +478,8 @@ fn inner_ending_a_refuser_leaves_the_ledger_answering_readings() {
         }
         seen.lock().unwrap().push(pid);
     }));
-    let [memfd, _] = ledger.grant().unwrap();
-    let asker = Ledger::adopt(std::os::fd::AsFd::as_fd(&memfd), None).unwrap();
-    let call = ledger.active();
+    let [memfd, events] = ledger.grant().unwrap();
+    let asker = Ledger::adopt(memfd.as_fd(), Some(events.as_fd())).unwrap();
     // Asked again as an op retries, until the refusing one is gone; a hang bound only.
     for _ in 0..2000 {
         if !ended.lock().unwrap().is_empty() {
@@ -495,7 +491,6 @@ fn inner_ending_a_refuser_leaves_the_ledger_answering_readings() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(*ended.lock().unwrap(), [idle.pid], "the refuser ends, and its end's reading is answered");
-    drop(call);
     // The next placement asks a reading: answered (a hang bound only).
     let (done, answered) = std::sync::mpsc::channel();
     let reader = ledger.clone();

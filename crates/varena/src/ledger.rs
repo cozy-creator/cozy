@@ -2,7 +2,8 @@
 //! by an OFD lock that dies with it; then measured peaks (`<package>|<shape>` → bytes) and
 //! TensorD's dispatches (request id → that key). Rows are atomics; facts are a two-copy latch,
 //! so readers never tear nor wait on a dead writer. Asks are cumulative counters, frees bump a
-//! futex generation and an eventfd. No CUDA, no clocks: stalls are progress that did not move.
+//! futex generation and an eventfd, which asks signal too so TensorD watches the asked rows'
+//! progress. No CUDA, no clocks: TensorD judges a stall by each row's own pace.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -501,8 +502,6 @@ impl Row {
 /// One GPU's table, mapped in this process, and the eventfd beside it.
 pub struct Ledger {
     t: Arc<Table>,
-    /// `stalled`'s last look: (slot, gen) -> progress.
-    looks: Mutex<HashMap<(u32, u64), u64>>,
     /// `refusing`'s last look: (slot, gen) -> (progress, bytes freed).
     answers: Mutex<HashMap<(u32, u64), (u64, u64)>>,
     events: Option<OwnedFd>,
@@ -512,7 +511,7 @@ pub struct Ledger {
 
 impl Ledger {
     fn new(t: Table, events: Option<OwnedFd>) -> Ledger {
-        Ledger { t: Arc::new(t), looks: Mutex::default(), answers: Mutex::default(), events, dispatching: Mutex::default() }
+        Ledger { t: Arc::new(t), answers: Mutex::default(), events, dispatching: Mutex::default() }
     }
 
     /// A new table and eventfd; returns it and the memfd to hand to other processes.
@@ -601,7 +600,8 @@ impl Ledger {
         (0..ROWS).filter_map(|i| self.t.read(i).transpose()).collect()
     }
 
-    /// Asks other live rows for up to `need` bytes, as `pick` orders them, and rings each.
+    /// Asks other live rows for up to `need` bytes, as `pick` orders them, rings each, and
+    /// signals the eventfd: TensorD then watches them answer, and ends one that stops.
     pub fn ask(&self, from: Option<u32>, need: u64) -> Result<Vec<Victim>> {
         let (mut victims, _) = pick(&self.snapshot()?, from, need);
         victims.retain_mut(|v| {
@@ -613,6 +613,9 @@ impl Ledger {
             s.ring();
             true
         });
+        if !victims.is_empty() {
+            self.signal();
+        }
         Ok(victims)
     }
 
@@ -622,7 +625,7 @@ impl Ledger {
         Ok(s.word.load(Acquire) != v.gen << 2 | LIVE || s.handled.load(Acquire) >= v.until || !self.t.alive(v.slot)?)
     }
 
-    /// Blocks until `answered`. A victim that dies without answering ends the wait when reaped.
+    /// Blocks until `answered`: TensorD ends a victim that stops answering, and its reap ends the wait.
     pub fn wait(&self, v: &Victim) -> Result<()> {
         until(&self.t.slot(v.slot).bell, || self.answered(v).map(|done| done.then_some(())).transpose())
     }
@@ -673,16 +676,6 @@ impl Ledger {
         Ok(())
     }
 
-    /// Asked rows whose progress has not moved since this handle's last look.
-    pub fn stalled(&self) -> Result<Vec<u32>> {
-        let rows = self.snapshot()?;
-        let mut looks = lock(&self.looks);
-        let asked: Vec<&RowFacts> = rows.iter().filter(|r| r.state == State::Live && r.want > 0).collect();
-        let stalled = asked.iter().filter(|r| looks.get(&(r.slot, r.gen)) == Some(&r.progress)).map(|r| r.pid).collect();
-        *looks = asked.iter().map(|r| ((r.slot, r.gen), r.progress)).collect();
-        Ok(stalled)
-    }
-
     /// Rows running nothing that answered asks since this handle's last look and freed nothing,
     /// though they still say they could: bytes no ask gets back, which only their exit returns.
     pub fn refusing(&self) -> Result<Vec<u32>> {
@@ -701,6 +694,11 @@ impl Ledger {
         let word = &self.t.header().freed;
         word.fetch_add(1, Release);
         wake(word);
+        self.signal();
+    }
+
+    /// Wakes the eventfd's reader (TensorD): bytes freed (`freed_gen` moved) or rows asked.
+    fn signal(&self) {
         if let Some(events) = &self.events {
             let one = 1u64.to_ne_bytes();
             // SAFETY: an 8-byte write to an eventfd we hold; a full counter (EAGAIN) is a signal already.
