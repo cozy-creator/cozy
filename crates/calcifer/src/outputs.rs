@@ -233,7 +233,13 @@ impl Calcifer {
                     }
                 }
             }
+            let offline = (run.machine.as_deref()).is_some_and(|m| self.offline(m).is_some());
             match again {
+                // Its machine is offline: tried again once it comes back or ends.
+                true if offline => tokio::select! {
+                    () = machine_changed(&mut changed) => {}
+                    () = wake.notified() => {}
+                },
                 true => pause.wait(wake, changed.as_mut()).await,
                 false => pause.reset(),
             }

@@ -744,6 +744,20 @@ impl Store {
         })
     }
 
+    /// Returns an unsent `any` run to the outbox, to be placed again.
+    pub fn unplace(&self, id: &str) -> Result<Vec<Event>> {
+        self.write(|tx| {
+            let unplaced = tx.execute(
+                "UPDATE runs SET machine = NULL WHERE id = ?1 AND state = 'queued' AND wants = 'any'",
+                [id],
+            )?;
+            Ok(match unplaced {
+                1 => vec![lifecycle(tx, id)?],
+                _ => vec![],
+            })
+        })
+    }
+
     /// The send boundary: the run may reach `machine` only if this wins against a cancel.
     pub fn mark_sent(&self, id: &str, machine: &str) -> Result<bool> {
         self.write(|tx| {
@@ -1482,8 +1496,8 @@ fn machine_kind(kind: MachineKind) -> &'static str {
 fn machine_state(state: MachineState) -> &'static str {
     match state {
         MachineState::Booting => "booting",
-        // Ending is the API's word for a machine whose end its Hub has not affirmed.
-        MachineState::Ready | MachineState::Ending => "ready",
+        // Ending and offline are the API's words for a ready machine its Hub says more of.
+        MachineState::Ready | MachineState::Ending | MachineState::Offline => "ready",
         MachineState::Ended => "ended",
     }
 }
@@ -1503,6 +1517,7 @@ impl From<&MachineRow> for Machine {
             rental: None,
             status: None,
             unreachable: None,
+            unreachable_since_ms: None,
             boot: None,
             running: 0,
             queued: 0,

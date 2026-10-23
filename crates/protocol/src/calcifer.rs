@@ -432,6 +432,9 @@ pub enum MachineState {
     Ready,
     /// Its end is asked of its Hub, which has not yet affirmed it.
     Ending,
+    /// Its Hub says its provider stopped it (or is ending it), and it has not answered since:
+    /// `reason` says why. Runs to it are refused; it is ready again once its provider resumes it.
+    Offline,
     Ended,
 }
 
@@ -452,7 +455,7 @@ pub struct Machine {
     /// The sha256 of its pinned TLS leaf: what `cozy machine add … --fingerprint` takes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<Digest>,
-    /// Why it ended.
+    /// Why it ended, or why it is offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// The Hub's word, for a rental.
@@ -461,9 +464,11 @@ pub struct Machine {
     /// The machine's own latest Status, once it answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<MachineStatus>,
-    /// Why its Status cannot be read now (`status` is then the last it read).
+    /// Why its Status cannot be read now (`status` is then the last it read), and since when.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreachable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable_since_ms: Option<i64>,
     /// A booting rental's phase, as its Hub says it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot: Option<String>,
@@ -482,6 +487,16 @@ pub struct Machine {
 
 fn yes() -> bool {
     true
+}
+
+/// A duration as a clock reads: `41s`, `14m`, `1h12m`.
+pub fn clock(ms: i64) -> String {
+    let s = (ms / 1000).max(0);
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
 }
 
 /// A rental as its Hub says it.

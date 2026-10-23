@@ -219,7 +219,8 @@ pub(crate) async fn follow(
             output::say(ctx, note);
         }
         match machine.state {
-            MachineState::Ready => return Ok(Some(machine)),
+            // Offline once up: a run sent to it is refused, saying why.
+            MachineState::Ready | MachineState::Offline => return Ok(Some(machine)),
             MachineState::Booting => {
                 let line = state_cell(&machine);
                 if line != said {
