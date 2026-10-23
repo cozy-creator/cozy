@@ -114,7 +114,7 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         .field("machine", &machine.name)
         .field("state", state_cell(&machine))
         .field("gpus", gpus)
-        .field("$/hour", usd(q.hourly()))
+        .field("$/hour", usd(q.gpu_usd_micros_per_hour))
         .note(format!(
             "billing continues until `cozy machine end {}` confirms its release",
             machine.name
@@ -161,29 +161,14 @@ impl Notices {
     }
 }
 
-/// The price the order is held to, in the catalog's terms: $/HOUR (the machine and its disk) and
-/// EXPECTED (the Hub's assumed hours and download, with its traffic).
+/// What a renter is charged: the GPUs and our price an hour (`1× L40S at $1.64/h`). Disk and
+/// traffic are never the renter's, whatever a provider charges us.
 pub(crate) fn price(sku: &str, gpus: u32, q: &Quote) -> String {
-    let mut line = format!(
-        "{sku} ×{gpus}: {}/h ({} GPU + {} for a {} GB disk)",
-        usd(q.hourly()),
-        usd(q.gpu_usd_micros_per_hour),
-        usd(q.storage_usd_micros_per_hour),
-        q.disk_gb
-    );
-    if let Some(per_gb) = q.bandwidth_usd_micros_per_gb.filter(|p| *p > 0) {
-        line += &format!(", traffic up to ${:.3}/GB", per_gb as f64 / 1e6);
-    }
-    line + &format!(
-        "; expected {} for {} h and a {} GB download",
-        usd(q.expected_total_usd_micros),
-        q.expected_hours,
-        q.expected_download_gb
-    )
+    format!("{gpus}× {} at {}/h", sku.to_ascii_uppercase(), usd(q.gpu_usd_micros_per_hour))
 }
 
 /// A run's quote as `price` says it, then why the Hub placed it there and the machines it would
-/// rent instead, each against the pick: its time and cost per run, its price an hour, its total.
+/// rent instead, each against the pick: its time and its price an hour.
 pub(crate) fn placed(q: &RunQuote) -> String {
     let mut said = price(&q.sku, q.gpus.unwrap_or(1), &q.quote);
     if let Some(why) = &q.why {
@@ -195,13 +180,11 @@ pub(crate) fn placed(q: &RunQuote) -> String {
             false => format!(" ({})", a.label),
         };
         said += &format!(
-            "\n  or {} ×{}{label}: {:.2}× the time, {:.2}× the cost per run, {}/h, expected {}",
-            a.sku,
+            "\n  or {}× {}{label}: {:.2}× the time, {}/h",
             a.gpus,
+            a.sku.to_ascii_uppercase(),
             a.time,
-            a.run_cost,
             usd(a.usd_micros_per_hour),
-            usd(a.expected_total_usd_micros)
         );
     }
     if !q.alternatives.is_empty() {
@@ -210,19 +193,26 @@ pub(crate) fn placed(q: &RunQuote) -> String {
     said
 }
 
-/// The renter's yes to the quote `said`: `--yes`, else a person's on a terminal (a no is `false`).
-/// With neither nothing is rented, and the refusal carries the quote, in text and JSON.
+/// The renter's yes to the quote `said` (its first line the offer, the rest why): `--yes`, else a
+/// person's on a terminal (a no is `false`). With neither nothing is rented, and the refusal
+/// carries the offer, in text and JSON.
 pub(crate) fn agree(ctx: &Context, said: &str) -> Result<bool, Error> {
+    let (offer, why) = said.split_once('\n').unwrap_or((said, ""));
     if ctx.yes {
-        output::say(ctx, said);
+        output::say(ctx, &format!("Renting {offer}"));
+        if !why.is_empty() {
+            output::say(ctx, why);
+        }
         return Ok(true);
     }
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        return Err(Error::new(Kind::Usage, "quote_unagreed", format!("{said}; nothing was rented"))
-            .remedy("to rent at this quote, run the same command with --yes"));
+        return Err(Error::new(Kind::Usage, "quote_unagreed", format!("{offer}: nothing was rented"))
+            .remedy("to rent at this price, run the same command with --yes"));
     }
-    anstream::eprintln!("{said}");
-    anstream::eprint!("Rent it? [Y/n] ");
+    if !why.is_empty() {
+        anstream::eprintln!("{why}");
+    }
+    anstream::eprint!("Rent {offer}? [Y/n] ");
     let _ = std::io::stderr().flush();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
@@ -376,23 +366,20 @@ fn sku_refusal(sku: &str, gpus: u32, status: &RentalSkuStatus) -> Error {
     error.next("cozy machine rent")
 }
 
-/// The catalog, cheapest expected total first: GPU, disk and traffic for the Hub's assumed hours and
-/// download.
+/// The catalog, cheapest first: each product's GPUs and what we charge for them an hour.
 async fn catalog(ctx: &Context, hub: &Hub) -> Result<ExitCode, Error> {
     let mut skus: Vec<RentalSku> =
         hub_answer(ctx.hub_anonymous(hub).list_rental_skus(None).await)?.0;
     skus.retain(|sku| !sku.widths.is_empty());
-    let total = |sku: &RentalSku| sku.widths[0].expected_price.total_usd_micros;
-    skus.sort_by(|a, b| total(a).cmp(&total(b)).then_with(|| a.name.cmp(&b.name)));
+    let hourly = |sku: &RentalSku| sku.widths[0].price_usd_micros_per_hour;
+    skus.sort_by(|a, b| hourly(a).cmp(&hourly(b)).then_with(|| a.name.cmp(&b.name)));
     if ctx.json {
         output::json(&skus);
         return Ok(ExitCode::SUCCESS);
     }
     let mut table = output::Table::new(
         ctx,
-        [
-            "NAME", "GPU", "GPUS", "COMPUTE", "VRAM", "$/HOUR", "EXPECTED",
-        ],
+        ["NAME", "GPU", "GPUS", "COMPUTE", "VRAM", "$/HOUR"],
     );
     for sku in &skus {
         let width = &sku.widths[0];
@@ -415,27 +402,16 @@ async fn catalog(ctx: &Context, hub: &Hub) -> Result<ExitCode, Error> {
             } else {
                 "—".into()
             },
-            usd(width.price_usd_micros_per_hour + width.storage_usd_micros_per_hour),
-            usd(width.expected_price.total_usd_micros),
+            usd(width.price_usd_micros_per_hour),
         ]);
     }
     table.print();
-    // The cheapest is often a CPU or free-traffic offer that assumes no download: say the most any
-    // row assumes, which is what makes EXPECTED exceed $/HOUR.
-    let download = skus.iter().map(|s| s.widths[0].expected_price.download_gb).max();
-    match skus.first().zip(download) {
-        Some((first, download)) => {
-            output::say(
-                ctx,
-                &format!(
-                    "Prices are for the fewest GPUs. EXPECTED is {} h and a {download} GB model download: \
-                     GPU, disk and the provider's traffic price.",
-                    first.widths[0].expected_price.hours
-                ),
-            );
+    match skus.is_empty() {
+        false => {
+            output::say(ctx, "Prices are for the fewest GPUs, an hour.");
             output::next(ctx, &["cozy machine rent <name> [--gpus N]"]);
         }
-        None => output::say(ctx, "No machine is for rent on this Hub right now."),
+        true => output::say(ctx, "No machine is for rent on this Hub right now."),
     }
     Ok(ExitCode::SUCCESS)
 }
