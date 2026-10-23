@@ -1,8 +1,10 @@
-//! The order `make_room` takes bytes in, pure (no device, clock, I/O or thread): pages of sets
-//! no open plan uses (least recently used first), then caches nobody holds (least recently
-//! used first), then the plans' own pages, furthest next use first (Belady). Never a pinned or
-//! filling page; a page whose release event is pending is taken once it completes. Also what an
-//! ask gives back, what prefetch maps, and admission ([`fits`]) and placement ([`place`]).
+//! The order `make_room` takes bytes in, pure (no device, clock, I/O or thread): other sets'
+//! idle pages (those no open plan uses, least recently used first; then those a later step uses,
+//! furthest first), then caches nobody holds (least recently used first: a page refills from the
+//! page cache, a graph recaptures far slower), then the current step's own pages, furthest next
+//! use first (Belady). Never a pinned or filling page; a page whose release event is pending is
+//! taken once it completes. Also what an ask gives back, what prefetch maps, and admission
+//! ([`fits`]) and placement ([`place`]).
 
 use crate::table::{Key, Table, SLOTS};
 
@@ -27,10 +29,12 @@ pub fn victims(t: &Table, keep: &[Key]) -> Vec<Victim> {
     caches.sort_by_key(|c| (c.last_use, c.id));
     let mut planned: Vec<((u32, u32, u32), Key, &crate::table::Page)> = pages().filter_map(|(k, p)| t.distance(k).map(|d| (d, k, p))).collect();
     planned.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let (own, later): (Vec<_>, Vec<_>) = planned.into_iter().partition(|(d, ..)| d.0 == 0);
     idle.into_iter()
+        .chain(later.into_iter().map(|(_, k, p)| (k, p)))
         .map(page)
         .chain(caches.into_iter().map(|c| Victim::Cache { id: c.id, bytes: c.bytes }))
-        .chain(planned.into_iter().map(|(_, k, p)| page((k, p))))
+        .chain(own.into_iter().map(|(_, k, p)| page((k, p))))
         .collect()
 }
 
