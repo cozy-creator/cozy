@@ -764,9 +764,13 @@ class Memory:
             if model.filled is not None:
                 for cache in [c for c in self.caches if model in c.holding]:
                     self._shrink(cache, cache.nbytes)
-                self._evict(model, "refill", 0)
+                if not model.host:
+                    self._evict(model, "refill", 0)
             model.filled = version
-            model.identity = self._identity(model)
+            if model.host:  # every weight is bound: bound again, filled under this version
+                _bind_host(model)
+            else:
+                model.identity = self._identity(model)
         if model.claimed is not None:  # pages filled under another identity, or none proven, go
             (regions, fingerprint), model.claimed = model.claimed, None
             proven = model.identity is not None and fingerprint == _fingerprint(
@@ -1945,7 +1949,11 @@ def _bound(block: Block, region: int, pinned: object) -> tuple[Tensor, dict[str,
 
 @torch.inference_mode(False)
 def _bind_host(model: Model) -> None:
-    """Every weight once: CPU params view the host pages; an Apple device's are copied in."""
+    """Every weight once: CPU params view the host pages; an Apple device's are copied in, its
+    fill (a LoRA bake) run on the copies, and the host's let go. Again under a new fill: the
+    bytes are read afresh."""
+    if model.fill is not None and model.device.type == "cpu":
+        raise Unbound(f"{model.name}: a fill (a LoRA bake) needs a GPU's own copy of the weights")
     for block in (model.common, *model.blocks):
         views: dict[str, dict[str, Tensor]] = {}
         for region in block.regions:
@@ -1953,6 +1961,8 @@ def _bind_host(model: Model) -> None:
             if model.device.type != "cpu":
                 parts = {k: {r: t.to(model.device) for r, t in v.items()} for k, v in parts.items()}
             views.update(parts)
+        if model.fill is not None and model.filled is not None:
+            model.fill(block, views)
         _write(block, views)
         block.written.clear()
 

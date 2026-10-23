@@ -563,6 +563,21 @@ fn the_gpu_probe_answers_without_a_driver() {
     gpu::memory_classes(&mut []).unwrap();
     let mut gpus = gpu::probe(None).unwrap();
     gpu::memory_classes(&mut gpus).unwrap();
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        // Metal's GPU, unified. A hosted runner's is virtual (no Apple family): offered before
+        // macOS 26 only.
+        assert!(gpus.len() <= 1, "one Apple GPU at most, yet {gpus:?}");
+        for apple in &gpus {
+            assert!(
+                apple.capability.starts_with("apple")
+                    && apple.memory_class == Some(gpu::MemoryClass::Unified)
+                    && apple.memory_bytes > 0
+                    && apple.driver.starts_with("macOS "),
+                "{apple:?}"
+            );
+        }
+        return;
+    }
     let driver = if cfg!(target_os = "linux") {
         Path::new("/dev/nvidiactl").exists()
     } else {
@@ -585,7 +600,7 @@ fn the_gpu_probe_answers_without_a_driver() {
             "{gpu:?}"
         );
         assert!(
-            gpu.compute_capability.is_some() && gpu.memory_class.is_some(),
+            !gpu.capability.is_empty() && gpu.memory_class.is_some(),
             "{gpu:?}"
         );
         let probed = gpu::Gpu {

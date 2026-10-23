@@ -87,6 +87,12 @@ fn a_checkpoint_binds_on_the_host_exactly_from_its_chunks() {
     assert_eq!(ws.weights.layout.regions.len(), rs.len());
     check(&ws);
     assert!(ws.bind(0).unwrap().writable);
+    // Pins share a region's copy while one lives; with none left it is gone, and a bind reads
+    // it again (an Apple GPU's copy is made and the host's let go).
+    let (pin, again) = (ws.bind(0).unwrap(), ws.bind(0).unwrap());
+    assert_eq!(pin.ptr, again.ptr);
+    drop((pin, again));
+    check(&ws);
     // One component alone is a weight set of its own tensors.
     let vae: Vec<Vec<String>> = rs.iter().filter(|r| r[0].starts_with("vae/")).cloned().collect();
     assert!(Host.register("vae", &fx.ck, &vae, None).unwrap().weights.parts.iter().all(|p| p.component == "vae"));

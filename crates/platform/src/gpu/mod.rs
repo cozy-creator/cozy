@@ -1,5 +1,8 @@
-//! The NVIDIA GPUs a machine reports in `StatusFrame.gpus[]`, read through NVML, which is opened
-//! at run time (`libnvidia-ml.so.1`, `nvml.dll`). No driver is "no NVIDIA GPU", never an error.
+//! The GPUs a machine reports in `StatusFrame.gpus[]`: NVIDIA's through NVML, which is opened at
+//! run time (`libnvidia-ml.so.1`, `nvml.dll`), and an Apple Silicon Mac's through Metal. No driver
+//! is "no GPU", never an error.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod apple;
 mod cuda;
 
 pub use cuda::memory_classes;
@@ -23,8 +26,9 @@ pub struct Gpu {
     pub pci_bus_id: String,
     pub memory_bytes: u64,
     pub driver: String,
-    /// (major, minor), `(9, 0)` on a Hopper; `None` when the driver does not say.
-    pub compute_capability: Option<(u32, u32)>,
+    /// The lane rule's row: an NVIDIA card's compute capability (`9.0` on a Hopper), an Apple
+    /// GPU's newest Metal family (`apple9`); empty when the driver does not say.
+    pub capability: String,
     /// [`memory_classes`] fills it from CUDA's device attributes; the probe leaves it `None`.
     pub memory_class: Option<MemoryClass>,
 }
@@ -67,6 +71,9 @@ pub fn probe(visible: Option<&str>) -> Result<Vec<Gpu>> {
     if visible.is_some_and(|visible| visible.trim().is_empty()) {
         return Ok(vec![]);
     }
+    if let Some(gpus) = apple() {
+        return Ok(gpus);
+    }
     let nvml = match Nvml::init() {
         Ok(nvml) => nvml,
         Err(
@@ -89,10 +96,9 @@ pub fn probe(visible: Option<&str>) -> Result<Vec<Gpu>> {
             pci_bus_id: device.pci_info().map_err(failed("PCI info"))?.bus_id,
             memory_bytes: memory(device.memory_info())?.0,
             driver: driver.clone(),
-            compute_capability: device
+            capability: device
                 .cuda_compute_capability()
-                .ok()
-                .map(|cc| (cc.major as u32, cc.minor as u32)),
+                .map_or(String::new(), |cc| format!("{}.{}", cc.major, cc.minor)),
             memory_class: None,
         });
     }
@@ -103,6 +109,16 @@ pub fn probe(visible: Option<&str>) -> Result<Vec<Gpu>> {
         });
     }
     Ok(gpus)
+}
+
+/// An Apple Silicon Mac's GPU; `None` elsewhere, where NVML answers.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn apple() -> Option<Vec<Gpu>> {
+    Some(apple::probe().into_iter().collect())
+}
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn apple() -> Option<Vec<Gpu>> {
+    None
 }
 
 /// One GPU opened for repeated reads (TensorD's memory sampler reads it every second). NVML

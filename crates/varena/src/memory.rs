@@ -1640,17 +1640,19 @@ impl Drop for Pinned {
 /// The host-only core, for CPU executors: regions as host bytes, never loading libcuda.
 pub struct Host;
 
-/// Regions in host memory: read-only views of a sealed layout, or private copies read once.
+/// Regions in host memory: read-only views of a sealed layout, or private copies read while a
+/// view of them lives. An Apple GPU's views live only until their device copy is made: unified
+/// memory then holds each weight once.
 pub struct HostSet {
     pub weights: Weights,
-    regs: Mutex<Vec<(Option<Arc<Anon>>, bool)>>,
+    regs: Mutex<Vec<(Weak<Anon>, bool)>>,
 }
 
 impl Host {
     #[cfg(feature = "store")]
     pub fn register(&self, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>) -> Result<Arc<HostSet>> {
         let weights = Weights::open(name, ck, regions, host_fd)?;
-        Ok(Arc::new(HostSet { regs: Mutex::new(vec![(None, false); weights.layout.regions.len()]), weights }))
+        Ok(Arc::new(HostSet { regs: Mutex::new(vec![(Weak::new(), false); weights.layout.regions.len()]), weights }))
     }
 
     /// `Gpu::adopt` on the host: a sealed layout registered from the regions it carries.
@@ -1666,18 +1668,16 @@ impl HostSet {
         let reg = w.layout.region(region)?;
         let (buf, bound) = &mut regs[region as usize];
         let sealed = w.host.as_ref().filter(|h| !h.hole(region) && h.wait_ready(region).is_ok());
-        let (ptr, buf) = match sealed {
-            Some(h) => {
-                (h.base() as u64 + reg.offset, None)
-            }
-            None => {
-                if buf.is_none() {
-                    *buf = Some(Arc::new(Anon::read(w, region)?));
-                }
-                (buf.as_ref().unwrap().ptr as u64, buf.clone())
+        // Fresh: a sealed view's first bind, a copy just read.
+        let (ptr, buf, fresh) = match (sealed, buf.upgrade()) {
+            (Some(h), _) => (h.base() as u64 + reg.offset, None, !std::mem::replace(bound, true)),
+            (None, Some(read)) => (read.ptr as u64, Some(read), false),
+            (None, None) => {
+                let read = Arc::new(Anon::read(w, region)?);
+                *buf = Arc::downgrade(&read);
+                (read.ptr as u64, Some(read), true)
             }
         };
-        let fresh = !std::mem::replace(bound, true);
         Ok(HostPinned { _set: self.clone(), _buf: buf, region, ptr, nbytes: reg.nbytes, fresh, writable: sealed.is_none() })
     }
 }

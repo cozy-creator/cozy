@@ -207,7 +207,7 @@ impl Client {
                 None if options.variant.is_some() || path.is_file() => vec![],
                 None => platform::gpu::probe(std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref())
                     .map_err(|e| Failure { kind: Kind::Invalid, detail: format!("query GPUs: {e}") })?
-                    .into_iter().map(|g| g.compute_capability.map(|(a,b)| format!("{a}.{b}")).unwrap_or_default()).collect(),
+                    .into_iter().map(|g| g.capability).collect(),
             },
             ..Default::default()
         };

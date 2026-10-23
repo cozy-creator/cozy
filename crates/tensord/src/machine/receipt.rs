@@ -211,7 +211,7 @@ fn row(g: platform::gpu::Gpu) -> io::Result<Gpu> {
         driver_version: g.driver,
         memory_bytes,
         pci_bus_id: g.pci_bus_id,
-        compute_cap: g.compute_capability.map(|(major, minor)| format!("{major}.{minor}")).unwrap_or_default(),
+        compute_cap: g.capability,
         memory_class: match g.memory_class {
             Some(MemoryClass::Discrete) => "discrete",
             Some(MemoryClass::Coherent) => "coherent",
@@ -413,7 +413,7 @@ mod tests {
             pci_bus_id: "00000000:01:00.0".into(),
             memory_bytes: (46068 << 20) + 12345,
             driver: "580.65.06".into(),
-            compute_capability: Some((8, 6)),
+            capability: "8.6".into(),
             memory_class: Some(platform::gpu::MemoryClass::Discrete),
         };
         let read = row(a40.clone()).unwrap();
