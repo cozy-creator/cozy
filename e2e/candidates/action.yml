@@ -1,0 +1,70 @@
+name: candidates
+description: >
+  The change's candidates, built on this runner and named for e2e/lib.sh in $CANDIDATES: the dev cozy
+  (<version>+dev.g<sha8>), the TensorFS wheel, the cozy-runtime wheel, a packages checkout. The change's
+  repo is checked out at .src; the e2e scripts are the caller's .creator checkout.
+inputs:
+  repo:
+    description: The repo whose change this is
+    required: true
+  ref:
+    description: Its change's commit
+    required: true
+  build:
+    description: Space-separated candidates (ci/affected's build:<artifact>)
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v7
+    - if: inputs.build != ''
+      uses: actions/checkout@v5
+      with:
+        repository: cozy-creator/${{ inputs.repo }}
+        ref: ${{ inputs.ref }}
+        path: .src
+    - if: contains(inputs.build, 'cozy') || contains(inputs.build, 'tensorfs')
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: .src -> target
+    - shell: bash
+      env:
+        BUILD: ${{ inputs.build }}
+        CARGO_PROFILE_RELEASE_LTO: "off"
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+        CARGO_INCREMENTAL: "0"
+      run: |
+        set -euo pipefail
+        out=$RUNNER_TEMP/candidates args=()
+        mkdir -p "$out"
+        exe=''; [ "$RUNNER_OS" != Windows ] || exe=.exe
+        if [[ " $BUILD " == *" cozy "* ]]; then
+          # The dev build `cozy machine update --tensord` takes: dev-build.yaml's stamp, this runner's target.
+          (cd .src
+            sha=$(git rev-parse HEAD)
+            cargo fetch --locked
+            uv run -q --no-project python -c 'import re,sys; p="Cargo.toml"; s=open(p).read(); open(p,"w").write(re.sub(r"(?m)^version = \"([^\"]+)\"$", lambda m: f"version = \"{m[1]}+dev.g{sys.argv[1][:8]}\"", s, count=1))' "$sha"
+            cargo update -w --offline
+            COZY_COMMIT=$sha cargo build --release --locked --offline -p cozy --bin cozy
+            git checkout -- Cargo.toml Cargo.lock)
+          cp ".src/target/release/cozy$exe" "$out/cozy$exe"
+          "$out/cozy$exe" --version
+          args+=(--cozy-bin "$out/cozy$exe")
+        fi
+        if [[ " $BUILD " == *" tensorfs "* ]]; then
+          (cd .src
+            cargo build --release --locked -p tensorfs --bin tfs
+            mkdir -p crates/tensorfs-py/wheel-data/scripts
+            cp "target/release/tfs$exe" crates/tensorfs-py/wheel-data/scripts/
+            cd crates/tensorfs-py && uvx -q maturin@1.15.0 build --release --locked --out "$out")
+          args+=(--tensorfs-wheel "$(ls "$out"/tensorfs-*.whl)")
+        fi
+        if [[ " $BUILD " == *" runtime "* ]]; then
+          (cd .src
+            uv run -q --no-project python scripts/stamp-build-provenance.py "$(git rev-parse HEAD)"
+            uv build -q --wheel --out-dir "$out")
+          args+=(--runtime-wheel "$(ls "$out"/cozy_runtime-*.whl)")
+        fi
+        [[ " $BUILD " != *" package "* ]] || args+=(--packages .src)
+        echo "CANDIDATES=${args[*]:-}" >> "$GITHUB_ENV"
+        echo "candidates: ${args[*]:-none (the released cozy, Runtime and TensorFS)}"

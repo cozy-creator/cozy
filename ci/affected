@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""What a change must run.
+
+    ci/affected <repo> <base> <head> [--json]
+    ci/affected --tokens "<token> <token> ..." [--json]
+
+repo: cozy-creator | cozy-runtime | packages | tensorhub. Run it inside a checkout of <repo> that holds
+both revisions (fetch-depth 0). The change is `git diff <base>...<head>`: a PR passes its base and head,
+the release gate the last release tag and the candidate. Rules: ci/suites.toml, beside this file.
+
+Prints one token per line: suites (cli, mps, gpu, gpu-datacenter, stress), os:<name>, build:<artifact>,
+pkg:<name> (pkg:* = every package). Nothing printed = nothing to run. --json prints
+{"suites", "os", "build", "cells", "why"}; "os" always holds linux; "why" names a path behind each token.
+--tokens takes a selection already made (the release gate's, a dispatch's) and prints it the same way.
+"""
+
+import json
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+RULES = tomllib.loads((Path(__file__).resolve().parent / "suites.toml").read_text())
+DEP_TABLES = ("dependencies", "build-dependencies", "dev-dependencies")
+
+
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+
+
+def show(rev: str, path: str) -> str | None:
+    p = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True, text=True)
+    return p.stdout if p.returncode == 0 else None
+
+
+def glob(pattern: str) -> re.Pattern[str]:
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pattern.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pattern[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        else:
+            out, i = out + re.escape(pattern[i]), i + 1
+    return re.compile(out + r"\Z")
+
+
+def crates(revs: list[str]) -> tuple[dict[str, str], dict[str, set[str]]]:
+    """Workspace crates at these revisions: {dir: name} and {name: names it depends on}."""
+    dirs, deps = {}, {}
+    for rev in revs:
+        root = show(rev, "Cargo.toml")
+        for member in tomllib.loads(root).get("workspace", {}).get("members", []) if root else []:
+            text = show(rev, f"{member}/Cargo.toml")
+            if text is None:
+                continue
+            manifest = tomllib.loads(text)
+            name = manifest["package"]["name"]
+            dirs[member] = name
+            tables = [manifest.get(t, {}) for t in DEP_TABLES]
+            tables += [t.get(k, {}) for t in manifest.get("target", {}).values() for k in DEP_TABLES]
+            deps.setdefault(name, set()).update(
+                (spec.get("package", key) if isinstance(spec, dict) else key) for table in tables for key, spec in table.items()
+            )
+    names = set(dirs.values())
+    return dirs, {n: d & names for n, d in deps.items()}
+
+
+def dependents(name: str, deps: dict[str, set[str]]) -> set[str]:
+    """`name` and every crate that depends on it, directly or not."""
+    found, frontier = {name}, [name]
+    while frontier:
+        current = frontier.pop()
+        for other, uses in deps.items():
+            if current in uses and other not in found:
+                found.add(other)
+                frontier.append(other)
+    return found
+
+
+def select(repo: str, base: str, head: str) -> dict[str, list[str]]:
+    conf = RULES[repo]
+    rules = [([glob(p) for p in r["paths"]], r["select"]) for r in conf.get("rules", [])]
+    paths = [p for p in git("diff", "--name-only", "--no-renames", f"{base}...{head}").splitlines() if p]
+    dirs, deps = crates([head, base]) if "crates" in conf else ({}, {})
+    package = conf.get("package")
+    why: dict[str, str] = {}
+
+    def take(tokens: list[str], path: str, dir_: str = "") -> None:
+        for token in tokens:
+            for t in RULES["everything"] if token == "everything" else [token]:
+                why.setdefault(t.replace("{dir}", dir_), path)
+
+    for path in paths:
+        hit = next((tokens for patterns, tokens in rules if any(p.match(path) for p in patterns)), None)
+        if hit is not None:
+            take(hit, path)
+            continue
+        member = next((d for d in dirs if path.startswith(d + "/")), None)
+        if member is not None:
+            for crate in dependents(dirs[member], deps):
+                take(conf["crates"].get(crate, ["everything"]), path)
+            continue
+        top = path.split("/", 1)[0]
+        if package is not None and "/" in path and any(show(rev, f"{top}/package.toml") is not None for rev in (head, base)):
+            take(package["select"] + package.get("extra", {}).get(top, []), path, top)
+            continue
+        take(conf["unmapped"], path)
+
+    return grouped(why)
+
+
+def grouped(why: dict[str, str]) -> dict[str, list[str]]:
+    tokens = sorted(why)
+    if "pkg:*" in tokens:
+        tokens = [t for t in tokens if not t.startswith("pkg:") or t == "pkg:*"]
+    group = lambda prefix: [t.split(":", 1)[1] for t in tokens if t.startswith(prefix)]
+    return {
+        "suites": [t for t in tokens if ":" not in t],
+        "os": ["linux", *group("os:")],
+        "build": group("build:"),
+        "cells": group("pkg:"),
+        "why": {t: why[t] for t in tokens},
+    }
+
+
+def main() -> None:
+    args = [a for a in sys.argv[1:] if a != "--json"]
+    if len(args) == 2 and args[0] == "--tokens":
+        given = args[1].replace(",", " ").split()
+        result = grouped({t: "given" for g in given for t in (RULES["everything"] if g == "everything" else [g])})
+    elif len(args) == 3 and isinstance(RULES.get(args[0]), dict):
+        result = select(*args)
+    else:
+        sys.exit(__doc__)
+    if "--json" in sys.argv:
+        print(json.dumps(result, separators=(",", ":")))
+    else:
+        print("\n".join(result["why"]), end="\n" if result["why"] else "")
+
+
+if __name__ == "__main__":
+    main()

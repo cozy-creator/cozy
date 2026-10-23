@@ -1,0 +1,180 @@
+name: e2e
+# CI v2 (tracker/design/ci-v2.md): cozy as a person runs it, on GitHub's runners, for the suites the change
+# selects (ci/affected, ci/suites.toml). `cli`: install, up, the local machine, real BiRefNet on the CPU, a
+# second executor, down, uninstall (Linux; macOS and Windows when selected). `mps`: real inference on the
+# macOS runner's Apple GPU. The GPU suites run in the release gate, not here. `e2e` always reports.
+#   Here: this repo's pull requests. Other repos and the release gate call it:
+#     uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@master
+#     with: {repo: cozy-runtime, ref: <head sha>, base: <base sha>}     # or select: "<tokens>" instead of base
+# Candidates are built from the change and go on through `cozy machine update local`; the rest is the
+# release a person would get from https://tensorhub.com/install.sh.
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      repo:
+        description: The repo whose change this is (cozy-creator, cozy-runtime, packages)
+        type: string
+        required: true
+      ref:
+        description: Its change's commit
+        type: string
+        required: true
+      base:
+        description: What the change is against (the PR's base, the last release tag)
+        type: string
+        default: ''
+      select:
+        description: Tokens instead of ci/affected's selection (ci/suites.toml)
+        type: string
+        default: ''
+      creator_ref:
+        description: The cozy-creator commit whose ci/ and e2e/ run
+        type: string
+        default: master
+  workflow_dispatch:
+    inputs:
+      repo:
+        type: string
+        default: cozy-creator
+      ref:
+        type: string
+        default: master
+      base:
+        type: string
+        default: ''
+      select:
+        type: string
+        default: cli
+      creator_ref:
+        type: string
+        default: master
+
+permissions:
+  contents: read
+
+jobs:
+  affected:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      selection: ${{ steps.select.outputs.selection }}
+      repo: ${{ steps.what.outputs.repo }}
+      ref: ${{ steps.what.outputs.ref }}
+      creator: ${{ steps.what.outputs.creator }}
+    steps:
+      - id: what
+        env:
+          REPO: ${{ inputs.repo }}
+          REF: ${{ inputs.ref }}
+          BASE: ${{ inputs.base }}
+          CREATOR: ${{ inputs.creator_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # No inputs: this repo's own pull request.
+          [ -n "$REPO" ] || { REPO=cozy-creator REF=$HEAD_SHA BASE=$BASE_SHA CREATOR=$HEAD_SHA; }
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"; echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"; echo "creator=$CREATOR" >> "$GITHUB_OUTPUT"
+          echo "github=cozy-creator/${REPO/#tensorhub/tensorhub-v2}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/cozy-creator
+          ref: ${{ steps.what.outputs.creator }}
+          path: .creator
+      - uses: actions/checkout@v5
+        if: inputs.select == ''
+        with:
+          repository: ${{ steps.what.outputs.github }}
+          ref: ${{ steps.what.outputs.ref }}
+          path: src
+          fetch-depth: 0
+      - id: select
+        env:
+          TOKENS: ${{ inputs.select }}
+          REPO: ${{ steps.what.outputs.repo }}
+          REF: ${{ steps.what.outputs.ref }}
+          BASE: ${{ steps.what.outputs.base }}
+        run: |
+          if [ -n "$TOKENS" ]; then s=$(.creator/ci/affected --tokens "$TOKENS" --json)
+          else s=$(cd src && ../.creator/ci/affected "$REPO" "$BASE" "$REF" --json); fi
+          echo "selection=$s" >> "$GITHUB_OUTPUT"
+          { echo "### e2e selection: $REPO ${REF:0:12}"; echo '```'; echo "$s" | jq .; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "$s" | jq .
+
+  cli:
+    needs: affected
+    if: contains(fromJSON(needs.affected.outputs.selection).suites, 'cli')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.affected.outputs.selection).os }}
+    runs-on: ${{ matrix.os == 'linux' && 'ubuntu-24.04' || matrix.os == 'macos' && 'macos-15' || 'windows-2025' }}
+    # Hang bound, not a work budget.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD: ${{ join(fromJSON(needs.affected.outputs.selection).build, ' ') }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/cozy-creator
+          ref: ${{ needs.affected.outputs.creator }}
+          path: .creator
+      - uses: ./.creator/e2e/candidates
+        with:
+          repo: ${{ needs.affected.outputs.repo }}
+          ref: ${{ needs.affected.outputs.ref }}
+          build: ${{ env.BUILD }}
+      - name: cli suite
+        run: bash .creator/e2e/cli/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cli-${{ matrix.os }}
+          path: ${{ runner.temp }}/e2e
+          retention-days: 14
+
+  mps:
+    needs: affected
+    if: contains(fromJSON(needs.affected.outputs.selection).suites, 'mps')
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD: ${{ join(fromJSON(needs.affected.outputs.selection).build, ' ') }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/cozy-creator
+          ref: ${{ needs.affected.outputs.creator }}
+          path: .creator
+      - uses: ./.creator/e2e/candidates
+        with:
+          repo: ${{ needs.affected.outputs.repo }}
+          ref: ${{ needs.affected.outputs.ref }}
+          build: ${{ env.BUILD }}
+      - name: mps suite
+        run: bash .creator/e2e/mps/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-mps
+          path: ${{ runner.temp }}/e2e
+          retention-days: 14
+
+  e2e:
+    if: always()
+    needs: [affected, cli, mps]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          ! echo "$NEEDS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null

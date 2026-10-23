@@ -79,8 +79,8 @@ pub struct RunQuote {
     pub alternatives: Vec<Alternative>,
 }
 
-/// Another machine a run could rent, against the pick: its time and cost per run as multiples of
-/// the pick's, its price an hour and its expected total. `label` says which way it trades.
+/// Another machine a run could rent, against the pick: its time as a multiple of the pick's, and
+/// the GPU's price an hour. `label` says which way it trades.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Alternative {
     pub sku: String,
@@ -88,9 +88,7 @@ pub struct Alternative {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
     pub time: f64,
-    pub run_cost: f64,
     pub usd_micros_per_hour: i64,
-    pub expected_total_usd_micros: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -761,14 +759,11 @@ pub struct Quote {
 }
 
 impl Quote {
-    /// The machine and its disk, an hour.
-    pub fn hourly(&self) -> i64 {
-        self.gpu_usd_micros_per_hour + self.storage_usd_micros_per_hour
-    }
-
+    /// The order's terms the Hub holds it to: the machine and its disk an hour, and traffic. A
+    /// user is shown only the GPU's price (`gpu_usd_micros_per_hour`): that is what we charge.
     pub fn agreed(&self) -> Agreed {
         Agreed {
-            usd_micros_per_hour: self.hourly(),
+            usd_micros_per_hour: self.gpu_usd_micros_per_hour + self.storage_usd_micros_per_hour,
             usd_micros_per_gb: self.bandwidth_usd_micros_per_gb.unwrap_or_default(),
         }
     }
