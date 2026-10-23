@@ -352,14 +352,14 @@ fn freer() -> &'static mpsc::Sender<Pending> {
                 }
                 // Detach this generation before the driver can reuse its address. A new
                 // allocation at the same pointer must never be removed by this old free.
-                let Some(a) = accounts().detach(p.ptr) else { continue };
+                let Some(mut a) = accounts().detach(p.ptr) else { continue };
                 let rc = unsafe { (d.mem_free)(p.ptr as cuda::CUdeviceptr) };
                 unsafe { (d.event_destroy)(p.event as cuda::CUevent); }
                 if rc == cuda::SUCCESS {
-                    {
-                        accounts().released(&a);
-                    }
-                    drop(a); // physical token/public owner drops outside the accounts lock
+                    // Its count (and its hold on the memory) goes before the accounts say it is
+                    // released, outside their lock: with nothing pending, no segment holds a memory.
+                    drop(a._resident.take());
+                    accounts().released(&a);
                 } else {
                     accounts().failed_release(a, format!("CUDA segment release failed ({rc})"));
                 }

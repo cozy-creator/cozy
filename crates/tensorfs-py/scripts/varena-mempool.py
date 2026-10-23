@@ -10,7 +10,7 @@ cap, interleaved:
   2. warm ms per step, pool against default, best of 3 each;
   3. the allocator's cost per new segment, and segments per warm forward;
   4. a forced exhaustion is torch's OutOfMemoryError at its call site, and the next pass runs;
-  5. the bytes torch holds outside the pool in a forward, by source;
+  5. the bytes a forward allocates outside the request's pool, by source;
   6. no deadlock while a second thread allocates on the device as varena evicts.
 torch's handling of the pool's segments (a live pool keeps its cache through torch's retry; a
 dropped pool's come back) is varena-standalone's `pools` phase.
@@ -181,25 +181,39 @@ def main() -> int:
     best = {pool: min(v) for pool, v in warm.items()}
     print(f"WARM best of 3: default {best[False]:.0f} ms, pool {best[True]:.0f} ms ({100 * (best[True] / best[False] - 1):+.1f}%)", flush=True)
 
-    # 5. what torch holds outside the pool in a forward, by source.
+    # 5. what the forward allocates outside the request's pool, by source. Blocks outside it from before (this
+    # script's inputs, a cuBLAS handle's workspace made by an earlier run) are listed by size, not counted.
+    def outside(snapshot: dict, pool: tuple | None) -> dict[int, dict]:
+        """Active blocks of segments not in `pool`, by address."""
+        found = {}
+        for segment in snapshot["segments"]:
+            if tuple(segment.get("segment_pool_id", ())) == tuple(pool or ()):
+                continue
+            at = segment["address"]
+            for block in segment["blocks"]:
+                if block["state"] == "active_allocated":
+                    found[at] = block
+                at += block["size"]
+        return found
+
     torch.cuda.memory._record_memory_history(max_entries=100000)
     with mem.request("sources", plan=[run.unet]) as r, torch.no_grad():
+        pool_id = r.pool.id if r.pool is not None else None
+        before = outside(torch.cuda.memory._snapshot(), pool_id)
         run.unet(run.x, 2, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
-        snapshot, pool_id = torch.cuda.memory._snapshot(), r.pool.id if r.pool is not None else None
+        after = outside(torch.cuda.memory._snapshot(), pool_id)
     torch.cuda.memory._record_memory_history(enabled=None)
-    outside: dict[str, int] = {}
-    for segment in snapshot["segments"]:
-        if tuple(segment.get("segment_pool_id", ())) == tuple(pool_id or ()):
+    made: dict[str, int] = {}
+    for at, block in after.items():
+        if at in before:
             continue
-        for block in segment["blocks"]:
-            if block["state"] != "active_allocated":
-                continue
-            frames = block.get("frames") or []
-            where = next((f"{f['filename'].rsplit('/', 1)[-1]}:{f['line']}" for f in frames if "torch/" not in f["filename"]), "unknown")
-            outside[where] = outside.get(where, 0) + block["size"]
-    print(f"OUTSIDE the pool: allocated outside by source {sorted(outside.items(), key=lambda kv: -kv[1])[:8]}", flush=True)
-    here = Path(__file__).name
-    check("5: the forward's own allocations are all in the pool (outside: this script's inputs, made before it)", all(k.startswith(here) for k in outside), outside)
+        frames = block.get("frames") or []
+        where = next((f"{f['filename'].rsplit('/', 1)[-1]}:{f['line']}" for f in frames if "torch/" not in f["filename"]), None)
+        where = where or next((f"{f['filename'].rsplit('/', 1)[-1]}:{f['name']}" for f in frames), "no frames")
+        made[where] = made.get(where, 0) + block["size"]
+    print(f"OUTSIDE the pool before the forward: {len(before)} blocks, {sum(b['size'] for b in before.values())} B, largest {sorted((b['size'] for b in before.values()), reverse=True)[:6]}", flush=True)
+    print(f"OUTSIDE the pool, made by the forward, by source: {sorted(made.items(), key=lambda kv: -kv[1])[:8]}", flush=True)
+    check("5: the forward allocates nothing outside the request's pool", not made, made)
 
     # 6. a second thread allocates on the device while varena evicts for the pool's passes.
     stop, count, errors = threading.Event(), [0], []

@@ -264,8 +264,15 @@ def child(store: str, table: str, capacity: int, reference: str) -> int:
 
 def gone(memory: weakref.ref[Memory], phase: str) -> None:
     """One Memory per device in a process: a phase's goes before the next opens (on a GPU they
-    share the card's table, and each would count the other's pages as its own context)."""
+    share the card's table, and each would count the other's pages as its own context). On a
+    GPU its dropped pools' segments, torch's until it releases them, hold its row: released
+    (empty_cache) and retired first."""
     gc.collect()
+    if CUDA:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        while native.allocator_pending(0):
+            time.sleep(1e-3)
     check(f"{phase}: its memory is gone before the next phase opens one", memory() is None, gc.get_referrers(memory()) if memory() else "")
 
 
