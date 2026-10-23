@@ -299,7 +299,10 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
     gpu.ledger().reap(pid);
     wakes.recv_timeout(BACKSTOP).expect("a reaped row signals");
     assert!(!gpu.ledger().status().rows.iter().any(|row| row.pid == pid && row.live));
-    assert!(orphans(&gpu) >= set_bytes, "its kept pages are orphans");
+    // Custody publishes the orphans once it sees the exporter's connection end, and signals then.
+    while orphans(&gpu) < set_bytes {
+        wakes.recv_timeout(BACKSTOP).expect("its kept pages are orphans");
+    }
     // One load path: its load imports what custody keeps, at any level; its binds are hits.
     let mut second = StandIn::spawn(&gpu, &id, "ram");
     assert_eq!(second.load(), ("Kept,Kept,Kept,Hit,Hit,Hit".into(), set_bytes, 0), "imported at load, not copied");

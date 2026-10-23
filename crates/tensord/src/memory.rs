@@ -9,14 +9,11 @@
 use crate::{execution::Engine, machine::receipt};
 use platform::contain::host_memory;
 use platform::contain::host_pressure::{self, Growth, HostMode, Nudge};
+use platform::memory::{wait_any, Signal, Waitable};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{self, Read, Write},
-    os::{
-        fd::{AsRawFd, RawFd},
-        unix::net::UnixStream,
-    },
+    io::{self, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -383,7 +380,11 @@ fn shareable(uuid: &str) -> Result<i32, String> {
         cuda::uuid(device).is_ok_and(|named| named == uuid).then_some((ordinal, device))
     };
     let (ordinal, device) = (0..count).find_map(device).ok_or_else(|| format!("CUDA has no device {uuid}"))?;
-    for (attribute, what) in [(cuda::ATTR_VMM_SUPPORTED, "virtual memory management"), (cuda::ATTR_POSIX_FD_SUPPORTED, "shareable handles")] {
+    #[cfg(unix)]
+    let handles = cuda::ATTR_POSIX_FD_SUPPORTED;
+    #[cfg(windows)]
+    let handles = cuda::ATTR_WIN32_HANDLE_SUPPORTED;
+    for (attribute, what) in [(cuda::ATTR_VMM_SUPPORTED, "virtual memory management"), (handles, "shareable handles")] {
         if cuda::attribute(device, attribute).map_err(|error| error.to_string())? == 0 {
             return Err(format!("CUDA device {uuid} has no {what}"));
         }
@@ -500,10 +501,10 @@ pub enum Source {
 }
 
 impl Source {
-    fn fd(&self) -> RawFd {
+    fn waitable(&self) -> Waitable<'_> {
         match self {
-            Source::Ledger(gpu) => gpu.ledger().events().as_raw_fd(),
-            Source::Host(host) => host.short.as_raw_fd(),
+            Source::Ledger(gpu) => waitable(gpu.ledger().events()),
+            Source::Host(host) => host.short.waitable(),
         }
     }
 
@@ -522,40 +523,37 @@ impl Source {
     }
 }
 
-/// Blocks on every source until the returned end drops; `wake` runs once per wake with what
+/// A GPU's events, as [`wait_any`] waits on them: an endpoint's descriptor or event handle.
+fn waitable(events: &platform::handles::Owned) -> Waitable<'_> {
+    #[cfg(unix)]
+    return std::os::fd::AsFd::as_fd(events);
+    #[cfg(windows)]
+    return std::os::windows::io::AsHandle::as_handle(events);
+}
+
+/// Blocks on every source until the returned guard drops; `wake` runs once per wake with what
 /// woke it. It never times out.
-pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::Result<UnixStream> {
-    let (held, end) = UnixStream::pair()?;
-    std::thread::Builder::new().name("memory-events".into()).spawn(move || {
-        let watched = std::iter::once(end.as_raw_fd()).chain(sources.iter().map(Source::fd));
-        let mut fds: Vec<libc::pollfd> = watched.map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
-        loop {
-            // SAFETY: poll on descriptors this thread owns; no timeout.
-            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
-                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return tracing::warn!("memory: events: {}", io::Error::last_os_error());
-            }
-            let (pool, events) = fds.split_at_mut(1);
-            if pool.iter().any(|fd| fd.revents != 0) {
-                return;
-            }
-            let mut woke = vec![];
-            for (fd, source) in events.iter_mut().zip(&sources).filter(|(fd, _)| fd.revents != 0) {
-                if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                    fd.fd = -1; // closed or failed: poll skips it from now on
-                    continue;
-                }
-                let what = source.clear();
-                if !woke.contains(&what) {
-                    woke.push(what);
-                }
-            }
-            woke.into_iter().for_each(&wake);
+pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::Result<Reacting> {
+    let stop = Arc::new(Signal::new().map_err(io::Error::other)?);
+    let stopped = stop.clone();
+    std::thread::Builder::new().name("memory-events".into()).spawn(move || loop {
+        let waitables: Vec<Waitable<'_>> = std::iter::once(stopped.waitable()).chain(sources.iter().map(Source::waitable)).collect();
+        match wait_any(&waitables) {
+            Ok(0) => return,
+            Ok(ready) => wake(sources[ready - 1].clear()),
+            Err(error) => return tracing::warn!("memory: events: {error}"),
         }
     })?;
-    Ok(held)
+    Ok(Reacting(stop))
+}
+
+/// The events thread's life: dropped, it ends.
+pub struct Reacting(Arc<Signal>);
+
+impl Drop for Reacting {
+    fn drop(&mut self) {
+        self.0.set();
+    }
 }
 
 /// The host rule (#1851) on the platform's watcher: each pressure event, or a nudge (TensorD's
@@ -567,7 +565,7 @@ pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::
 /// budget: when ending cannot help (a growing call alone exceeds the host), the call meets its
 /// own limit and the idle processes stay. A look that is not short starts over. No timer.
 pub struct Host {
-    short: UnixStream,
+    short: Arc<Signal>,
     nudge: Nudge,
     /// Looks begun and made so far, and a signal for each made.
     looks: Arc<(Mutex<(u64, u64)>, std::sync::Condvar)>,
@@ -577,16 +575,12 @@ impl Host {
     /// Watches while the process lives; None (a memory-log note says why) where the platform
     /// gives no pressure events.
     pub fn watch(mode: HostMode, gpus: Vec<Arc<Gpu>>, log: &MemoryLog) -> Option<Arc<Host>> {
-        let armed = host_pressure::Pressure::arm(mode).and_then(|pressure| {
-            let (short, signal) = UnixStream::pair()?;
-            short.set_nonblocking(true)?;
-            Ok((pressure, (short, signal)))
-        });
-        let (mut pressure, (short, mut signal)) = armed
+        let armed = host_pressure::Pressure::arm(mode).and_then(|pressure| Ok((pressure, Arc::new(Signal::new()?))));
+        let (mut pressure, short) = armed
             .inspect_err(|error| log.note(serde_json::json!({"event": "host_unwatched", "mode": format!("{mode:?}"), "why": error.to_string()})))
             .ok()?;
         let (nudge, looks) = (pressure.nudge(), Arc::new((Mutex::new((0, 0)), std::sync::Condvar::new())));
-        let looked = looks.clone();
+        let (looked, signal) = (looks.clone(), short.clone());
         let watching = std::thread::Builder::new().name("host-pressure".into()).spawn(move || {
             let mut keep = Keep::default();
             // The budget when short was last signalled: the next signal needs more than it.
@@ -598,9 +592,7 @@ impl Host {
                 if budget >= need {
                     signalled = None;
                 } else if signalled.is_none_or(|was| budget > was) {
-                    if signal.write_all(&[1]).is_err() {
-                        return;
-                    }
+                    signal.set();
                     signalled = Some(budget);
                 }
                 looked.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
@@ -642,8 +634,7 @@ impl Host {
 
     /// Whether a look found the host short since this was last asked (the events thread asks).
     pub fn short(&self) -> bool {
-        let mut buf = [0; 64];
-        (&self.short).read(&mut buf).is_ok_and(|n| n > 0)
+        self.short.clear()
     }
 }
 

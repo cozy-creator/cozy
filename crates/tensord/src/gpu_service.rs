@@ -642,7 +642,7 @@ pub struct Pool {
     /// executor's frame comes or a ledger signals.
     host: Option<Arc<memory::Host>>,
     /// Held while the pool lives: the thread blocked on the ledgers' events ends with it.
-    _events: Option<std::os::unix::net::UnixStream>,
+    _events: Option<memory::Reacting>,
     /// Memoized Model methods' results, shared by every run on this machine.
     memo: Arc<crate::memo::Memo>,
     // Drop session/resource custody before ending the actual spawning thread.
