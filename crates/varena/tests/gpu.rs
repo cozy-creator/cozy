@@ -2439,15 +2439,15 @@ fn an_activation_larger_than_free_memory_is_served_from_evictable_weights() {
     let (mem, timings) = timed_memory(b, &g);
     step!();
     let pages = 64;
-    let own = resident(&mem, "own", pages, &g.uuid, 0);
+    resident(&mem, "own", pages, &g.uuid, 0);
     step!();
     resident(&mem, "other", pages, &g.uuid, 0);
     step!();
-    let r = mem.request("r", plan(&[&["own"]])).unwrap();
+    // Both sets were bound with no request open: settled, they are kept. The request's open withdraws them for the
+    // hook, which makes no custody call itself.
+    mem.settle();
     step!();
-    // Both sets are kept (bound with no request open). The activation comes inside a pass: its start withdraws the
-    // kept pages the hook may take, which makes no custody call itself.
-    let pass = r.pass(own, "fwd|1").unwrap();
+    let r = mem.request("r", plan(&[&["own"]])).unwrap();
     step!();
     let (start_free, unmaps) = (driver_free(), timings.count("unmap"));
     step!();
@@ -2470,8 +2470,6 @@ fn an_activation_larger_than_free_memory_is_served_from_evictable_weights() {
     let gained = driver_free().saturating_sub(start_free);
     step!();
     assert!(gained.abs_diff(unmapped) <= REGION_ALIGN, "the driver gained {gained} B for {unmapped} B unmapped");
-    step!();
-    pass.end(0);
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
@@ -2497,10 +2495,10 @@ fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable()
     step!();
     resident(&mem, "idle", pages, &g.uuid, 0);
     step!();
-    let r = mem.request("r", plan(&[&["held"]])).unwrap();
+    // The idle set was bound with no request open: settled, it is kept. The request's open withdraws it for the hook.
+    mem.settle();
     step!();
-    // The idle set is kept (bound with no request open): the pass start withdraws it for the hook.
-    let pass = r.pass(held, "fwd|1").unwrap();
+    let r = mem.request("r", plan(&[&["held"]])).unwrap();
     step!();
     let mut pins: Vec<Pin> = (0..pages).map(|p| mem.bind(held, p, 0).unwrap()).collect();
     step!();
@@ -2536,8 +2534,6 @@ fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable()
     unsegment(&torch, served, one_more);
     step!();
     drop(pins);
-    step!();
-    pass.end(0);
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
