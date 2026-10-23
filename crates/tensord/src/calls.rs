@@ -55,12 +55,20 @@ struct Parent {
 }
 
 impl Parent {
-    /// The bytes done of the download the child call `request` is in now, of its total.
-    fn child_bytes(&self, engine: &Engine, request: &str) -> Option<(u64, u64)> {
+    /// What the child call `request` measured of where it is now: the bytes done of the download
+    /// it is in, of their total, and its stage's steady step time.
+    fn child_measured(&self, engine: &Engine, request: &str) -> Option<Value> {
         let child = self.calls.lock().unwrap().by_index.values().find(|c| c.request == request)?.child.clone();
         let progress: Value = serde_json::from_str(&engine.get(&child).ok()?.progress?).ok()?;
-        let total = progress["bytes_total"].as_u64().filter(|total| *total > 0)?;
-        Some((progress["bytes_done"].as_u64()?.min(total), total))
+        let total = progress["bytes_total"].as_u64().filter(|total| *total > 0);
+        let mut measured = json!({});
+        if let Some(total) = total {
+            (measured["bytes_done"], measured["bytes_total"]) = (progress["bytes_done"].as_u64()?.min(total).into(), total.into());
+        }
+        if let Some(steady) = progress.get("step_avg_ms") {
+            measured["step_avg_ms"] = steady.clone();
+        }
+        Some(measured)
     }
 
     fn callable(&self, frame: &Frame) -> Result<&(String, String), (&'static str, String)> {
@@ -532,9 +540,17 @@ fn cancel(engine: &Engine, child: &Execution) {
     }
 }
 
-/// One progress frame of run `id`'s executor: a package log line, or its stage (with the
-/// download bytes of the child call it relays, when it is one).
-pub(crate) fn observe(engine: &Engine, id: &str, completed: &mut u64, frame: &Frame, caller: Option<&Caller>) {
+/// What an attempt's progress frames told so far: its completed units, and its stage's steps after
+/// the first (which carries the stage's setup) and their time.
+#[derive(Default)]
+pub(crate) struct Seen {
+    pub completed: u64,
+    steps: (String, u32, f64),
+}
+
+/// One progress frame of run `id`'s executor: a package log line, or its stage, with its steady
+/// step time (the child call's it relays, when it is one, and that call's download bytes).
+pub(crate) fn observe(engine: &Engine, id: &str, seen: &mut Seen, frame: &Frame, caller: Option<&Caller>) {
     if !(frame.request_id.is_empty() || frame.request_id == id) {
         return;
     }
@@ -547,7 +563,7 @@ pub(crate) fn observe(engine: &Engine, id: &str, completed: &mut u64, frame: &Fr
     }
     // `advance` is the attempt's monotone position in completed units (Runtime
     // `Telemetry`); a zero one is telemetry, not work.
-    *completed = (*completed).max(frame.advance);
+    seen.completed = seen.completed.max(frame.advance);
     let mut payload = json!({"stage": frame.stage.chars().take(120).collect::<String>(), "step_ms": frame.step_ms.unwrap_or(0.0)});
     for (name, value) in [
         ("stage_fraction", frame.stage_fraction.map(Value::from)),
@@ -560,10 +576,27 @@ pub(crate) fn observe(engine: &Engine, id: &str, completed: &mut u64, frame: &Fr
         }
     }
     let call = frame.call_request.as_deref().filter(|call| !call.is_empty());
-    if let Some((done, total)) = caller.zip(call).and_then(|(caller, call)| caller.parent.child_bytes(engine, call)) {
-        (payload["bytes_done"], payload["bytes_total"]) = (done.into(), total.into());
+    match (call, frame.position, frame.step_ms.filter(|ms| *ms > 0.0)) {
+        (Some(call), ..) => {
+            let measured = caller.and_then(|caller| caller.parent.child_measured(engine, call));
+            for (name, value) in measured.as_ref().and_then(Value::as_object).into_iter().flatten() {
+                payload[name] = value.clone();
+            }
+        }
+        (None, Some(position), Some(ms)) => {
+            if seen.steps.0 != frame.stage {
+                seen.steps = (frame.stage.clone(), 0, 0.0);
+            }
+            if position > 1 {
+                (seen.steps.1, seen.steps.2) = (seen.steps.1 + 1, seen.steps.2 + ms);
+            }
+            if seen.steps.1 > 0 {
+                payload["step_avg_ms"] = (seen.steps.2 / f64::from(seen.steps.1)).into();
+            }
+        }
+        _ => {}
     }
-    let _ = engine.observe_progress(id, *completed, payload.to_string());
+    let _ = engine.observe_progress(id, seen.completed, payload.to_string());
 }
 
 /// `(module, export)` of every invocable of the environment declared `memoize=True`.

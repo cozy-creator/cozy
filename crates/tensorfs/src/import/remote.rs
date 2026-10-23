@@ -300,7 +300,7 @@ impl<'a> Scope<'a> {
     pub(super) fn list(&self, spec: &Spec) -> Result<Listing> {
         list_in(spec, self)
     }
-    pub(super) fn land(&self, member: &Member, dest: &Path, landed: &mut dyn FnMut(u64)) -> Result<PathBuf> {
+    pub(super) fn land(&self, member: &Member, dest: &Path, landed: &mut (dyn FnMut(u64) + Send)) -> Result<PathBuf> {
         land_in(member, dest, self, landed)
     }
     pub(super) fn read_small(&self, member: &Member) -> Result<Vec<u8>> {
@@ -888,7 +888,7 @@ pub fn land(m: &Member, dest: &Path, access: &Access) -> Result<PathBuf> {
 /// `m` landed at `dest`, telling `landed` how many of its bytes are here and verified as they
 /// are: a kept prefix as it is read again for the digest, then each frame as it arrives. The
 /// digest is taken as the bytes land, so nothing is read twice.
-fn land_in(m: &Member, dest: &Path, access: &Scope<'_>, landed: &mut dyn FnMut(u64)) -> Result<PathBuf> {
+fn land_in(m: &Member, dest: &Path, access: &Scope<'_>, landed: &mut (dyn FnMut(u64) + Send)) -> Result<PathBuf> {
     access.check()?;
     let (url, provider) = match &m.at {
         At::Local(path) => return Ok(path.clone()),
@@ -948,7 +948,7 @@ fn land_in(m: &Member, dest: &Path, access: &Scope<'_>, landed: &mut dyn FnMut(u
 
 /// The digest of the first `upto` bytes of `path` (none read unless `verify`), each MiB told to
 /// `landed` as it is read.
-fn prefix(path: &Path, upto: u64, verify: bool, access: &Scope<'_>, landed: &mut dyn FnMut(u64)) -> Result<crate::sha256::Sha256> {
+fn prefix(path: &Path, upto: u64, verify: bool, access: &Scope<'_>, landed: &mut (dyn FnMut(u64) + Send)) -> Result<crate::sha256::Sha256> {
     use std::io::Read;
     let mut hash = crate::sha256::Sha256::new();
     if upto == 0 || !verify {

@@ -840,6 +840,7 @@ impl Calcifer {
                             bytes_done: p.bytes_done,
                             bytes_total: p.bytes_total,
                             step_ms: p.step_ms,
+                            step_avg_ms: p.step_avg_ms,
                         },
                     );
                     continue;

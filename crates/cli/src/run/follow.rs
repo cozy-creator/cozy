@@ -169,8 +169,10 @@ async fn watch(
     // away: the Hub decides after it accepts the order.
     let mut placing: Option<Following> = None;
     let mut notices = Notices::default();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
+            _ = tick.tick() => view.tick(),
             next = next_of(&mut placing, &calcifer), if placing.is_some() => match next {
                 Ok(Some(machine)) if !placed(&view, &machine, &mut notices) => {}
                 _ => placing = None,
@@ -435,6 +437,9 @@ struct View {
     named: HashSet<String>,
     /// The stage moving bytes, and its last few seconds of (when, bytes moved): its rate.
     moving: (String, VecDeque<(Instant, u64)>),
+    /// The progress last shown, and when its step count last moved: a step running far past its
+    /// stage's pace says so.
+    last: Option<(Progress, Instant)>,
 }
 
 impl View {
@@ -459,6 +464,7 @@ impl View {
             status: None,
             named: HashSet::new(),
             moving: (String::new(), VecDeque::new()),
+            last: None,
         };
         view.lifecycle(run);
         view
@@ -562,6 +568,7 @@ impl View {
     }
 
     fn status(&mut self, text: &str) {
+        self.last = None; // a status says where the run is now, not its last progress
         match &self.bar {
             Some(bar) => {
                 bar.set_length(0);
@@ -576,8 +583,25 @@ impl View {
     }
 
     fn progress(&mut self, progress: &Progress) {
-        let fraction = fraction(progress);
-        let mut text = said(progress);
+        let stepped = match &self.last {
+            Some((last, at)) if (&last.stage, last.completed) == (&progress.stage, progress.completed) => *at,
+            _ => Instant::now(),
+        };
+        self.last = Some((progress.clone(), stepped));
+        self.show_progress();
+    }
+
+    /// The last progress again, as time passes: a step running long says so.
+    fn tick(&mut self) {
+        if self.bar.is_some() && self.last.is_some() {
+            self.show_progress();
+        }
+    }
+
+    fn show_progress(&mut self) {
+        let Some((progress, stepped)) = self.last.clone() else { return };
+        let fraction = fraction(&progress);
+        let mut text = said(&progress);
         // At what rate bytes move, and so how long is left: a download that crawls says so.
         let (done, total) = (progress.bytes_done, progress.bytes_total);
         if (done > 0 || total > 0)
@@ -589,8 +613,14 @@ impl View {
                 let _ = write!(text, ", {} left", output::span(left));
             }
         }
-        if progress.step_ms > 0.0 {
-            let _ = write!(text, " {:.2}s/step", progress.step_ms / 1000.0);
+        // A step running twice its stage's pace or more is named, with how long it has run.
+        let pace = if progress.step_avg_ms > 0.0 { progress.step_avg_ms } else { progress.step_ms };
+        let running = stepped.elapsed().as_secs_f64() * 1000.0;
+        if pace > 0.0 && progress.completed < progress.total && running > 2.0 * pace {
+            let _ = write!(text, " · step {} running {}", progress.completed + 1, took(running));
+        }
+        if let Some(waiting) = &self.waiting {
+            text = format!("{waiting} · {text}");
         }
         match &self.bar {
             Some(bar) => {
@@ -625,7 +655,8 @@ pub(crate) fn fraction(progress: &Progress) -> Option<f64> {
         .or_else(|| of(progress.bytes_done, progress.bytes_total))
 }
 
-/// Where a run is: its stage, its steps of their total, and its bytes of theirs.
+/// Where a run is: its stage, its steps of their total and their times, and its bytes of theirs.
+/// A stage's first step carries its setup: its time is said as the first's, never as the pace.
 pub(crate) fn said(progress: &Progress) -> String {
     let mut text = progress.stage.clone();
     if progress.total > 0 {
@@ -638,7 +669,22 @@ pub(crate) fn said(progress: &Progress) -> String {
             let _ = write!(text, "/{}", output::bytes(total));
         }
     }
+    let (last, steady) = (progress.step_ms, progress.step_avg_ms);
+    let _ = match (last > 0.0, progress.completed, steady > 0.0) {
+        (false, ..) => Ok(()),
+        (true, 1, _) => write!(text, " · first step {}", took(last)),
+        (true, _, true) => write!(text, " · {} last, {} avg", took(last), took(steady)),
+        (true, ..) => write!(text, " · {} last", took(last)),
+    };
     text
+}
+
+/// A step's time: tenths of a second under a minute, else minutes and seconds.
+fn took(ms: f64) -> String {
+    match ms < 60_000.0 {
+        true => format!("{:.1}s", ms / 1000.0),
+        false => output::span((ms / 1000.0) as i64),
+    }
 }
 
 /// A stage's bytes a second over its last 10 s (and at least its last two counts), once a second
@@ -688,6 +734,25 @@ mod tests {
             })
             .collect();
         run
+    }
+
+    /// A stage's first step carries its setup and is said as the first, never as the pace (run
+    /// 14615's 580 s first step read "551 s/step"); later, the latest step and the steady mean.
+    /// Weights arriving say their bytes.
+    #[test]
+    fn progress_says_steps_as_first_last_and_steady() {
+        let step = |completed, step_ms, step_avg_ms| Progress {
+            stage: "Generating original 768p video / denoise".into(), completed, total: 8, step_ms, step_avg_ms,
+            ..Default::default()
+        };
+        assert_eq!(said(&step(1, 580_400.0, 0.0)), "Generating original 768p video / denoise 1/8 · first step 9m40s");
+        assert_eq!(said(&step(3, 64_000.0, 65_300.0)), "Generating original 768p video / denoise 3/8 · 64.0s last, 65.3s avg");
+        let arriving = Progress {
+            stage: "Generating original 768p video · downloading fidika/minimax-h3 weights".into(),
+            bytes_done: 34 << 30, bytes_total: 61 << 30, ..Default::default()
+        };
+        assert_eq!(said(&arriving), "Generating original 768p video · downloading fidika/minimax-h3 weights 34 GiB/61 GiB");
+        assert_eq!(fraction(&arriving).map(|f| (f * 100.0).round()), Some(56.0));
     }
 
     #[test]

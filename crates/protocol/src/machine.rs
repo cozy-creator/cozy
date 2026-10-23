@@ -521,6 +521,8 @@ pub struct Progress {
     pub bytes_total: u64,
     /// The latest step's time, while a stage steps.
     pub step_ms: f64,
+    /// The mean of its steps after the first, which carries the stage's setup; 0 before one.
+    pub step_avg_ms: f64,
     /// How far this stage is, when it says.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage_fraction: Option<f64>,

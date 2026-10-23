@@ -355,6 +355,7 @@ impl Log {
                 let payload = &body["payload"];
                 v1::Event::Progress(v1::Progress {
                     step_ms: payload["step_ms"].as_f64().unwrap_or(0.0),
+                    step_avg_ms: payload["step_avg_ms"].as_f64().unwrap_or(0.0),
                     stage: payload["stage"].as_str().unwrap_or_default().into(),
                     fraction: payload["overall_fraction"].as_f64().unwrap_or(-1.0),
                     completed: payload["position"].as_u64().unwrap_or(0),
