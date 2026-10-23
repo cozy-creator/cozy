@@ -24,6 +24,7 @@ use crossbeam_channel::{select_biased, unbounded, Receiver, Sender};
 use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
+use platform::contain::host_memory;
 
 #[cfg(unix)]
 use tensorfs::io::source::Placement;
@@ -215,6 +216,9 @@ pub struct Stats {
     pub peak: u64,
     /// The most its passes allocated beside its weights, as they reported it: its compute bytes.
     pub compute: u64,
+    /// The process's anonymous host high-water over it (file mappings aside); `None` where it
+    /// cannot be read.
+    pub host: Option<u64>,
     /// Bytes the request still held when it ended (pins): 0.
     pub leftover: u64,
     /// Each `make_room` that had to take bytes for it, in order.
@@ -626,6 +630,42 @@ struct State {
     last_unmap: Option<u64>,
     /// Requests whose last step is one their plan did not declare.
     synthetic: HashSet<u64>,
+    /// This process's anonymous host peak while requests run.
+    window: Option<HostWindow>,
+}
+
+/// This process's anonymous host high-water since a start (file mappings aside): a request's
+/// host peak, for the manager's admission.
+struct HostWindow {
+    peak: u64,
+    file: u64,
+}
+
+impl HostWindow {
+    /// Measured from now; `None` where it cannot be read.
+    fn start() -> Option<HostWindow> {
+        let now = host_memory::resident(std::process::id()).ok()?;
+        HostWindow::restart();
+        Some(HostWindow { peak: now.anon, file: now.file })
+    }
+
+    /// The anonymous peak so far; `None` where it cannot be read.
+    fn look(&mut self) -> Option<u64> {
+        let now = host_memory::resident(std::process::id()).ok()?;
+        let bound = now.peak.saturating_sub(self.file.min(now.file) + now.shmem);
+        self.peak = self.peak.max(bound).max(now.anon);
+        self.file = now.file;
+        HostWindow::restart();
+        Some(self.peak)
+    }
+
+    /// The process's resident high-water starts over (where it may not, the next look bounds
+    /// from further back).
+    fn restart() {
+        if let Err(e) = host_memory::reset_peak(std::process::id()) {
+            tracing::debug!("varena: host high-water not reset: {e}");
+        }
+    }
 }
 
 impl State {
@@ -934,7 +974,12 @@ impl Memory {
     /// Leased, a page the manager retains comes back with no copy; the rest fill from the store,
     /// through the page cache.
     pub fn load(&self, set: SetSpec, level: Level) -> Result<SetId> {
-        self.inner.guard(|| self.inner.load(set, level))
+        let (name, bytes) = (set.name.clone(), set.layout.nbytes);
+        let id = self.inner.guard(|| self.inner.load(set, level))?;
+        if level == Level::Gpu {
+            self.inner.measured(crate::lease::Measured::Set { name, bytes });
+        }
+        Ok(id)
     }
 
     /// Unmaps the set's pages (each as its pin releases) and forgets it.
@@ -1901,6 +1946,11 @@ impl Inner {
         let mut st = self.lock();
         let rid = st.tick();
         let steps = Self::resolve(&st, plan);
+        // Its anonymous host peak is measured from its start (the process's, when it runs alone).
+        match st.window.as_mut() {
+            Some(window) => drop(window.look()),
+            None => st.window = HostWindow::start(),
+        }
         st.table.requests.push(Req { id: rid, name: id.to_string(), steps, idle, ..Req::default() });
         // A cold request's record carries the fills since the last one ended (its loads).
         let earlier = std::mem::take(&mut st.unclaimed);
@@ -2115,7 +2165,11 @@ impl Inner {
         st.synthetic.remove(&req);
         st.table.requests.retain(|r| r.id != req);
         let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
-        let stats = Stats { outlived, leftover, ..st.stats.remove(&req).unwrap_or_default() };
+        let host = st.window.as_mut().and_then(HostWindow::look);
+        if st.table.requests.is_empty() {
+            st.window = None;
+        }
+        let stats = Stats { outlived, leftover, host, ..st.stats.remove(&req).unwrap_or_default() };
         st.last = Some(stats.clone());
         self.unlock(st);
         stats
@@ -2410,7 +2464,9 @@ impl Request {
     pub fn end(mut self) -> Stats {
         self.ended = true;
         let id = self.id;
-        self.inner.guard(|| Ok(self.inner.end_request(id))).unwrap_or_default()
+        let stats = self.inner.guard(|| Ok(self.inner.end_request(id))).unwrap_or_default();
+        self.inner.measured(crate::lease::Measured::Request { request: stats.request.clone(), working: stats.peak, compute: stats.compute, host: stats.host.unwrap_or(0) });
+        stats
     }
 }
 
@@ -2659,6 +2715,17 @@ impl Inner {
                 }
                 drop(st);
                 self.landed.notify_all();
+            }
+        }
+    }
+
+    /// A figure for the lease manager's admission and placement (a request's peaks at its end,
+    /// a set's bytes at its load); nothing when not leased.
+    fn measured(&self, _m: crate::lease::Measured) {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            if let Err(error) = agent.measured(_m) {
+                tracing::debug!("varena: a measured figure for the lease manager: {error}");
             }
         }
     }

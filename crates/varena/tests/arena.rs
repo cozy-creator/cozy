@@ -926,7 +926,7 @@ fn a_leased_memory_allocates_only_from_its_grants() {
     let socket = dir.path().join("lease.sock");
     let host = varena::GpuId { uuid: format!("arena-host{pid}"), model: "host".into(), memory: card };
     let open = Box::new(move || Ok(Arc::new(HostBackend::new(card)) as Arc<dyn Backend>));
-    let manager = Manager::create(&host, Some(card), varena::ledger::Mode::Dedicated, open, UnixListener::bind(&socket).unwrap(), Arc::new(Me)).unwrap();
+    let manager = Manager::create(&host, Some(card), varena::lease::Mode::Dedicated, Some(open), UnixListener::bind(&socket).unwrap(), Arc::new(Me)).unwrap();
     varena::os::remove_table(&host.uuid);
     let g = varena::GpuId { uuid: format!("arena-leased{pid}"), model: "host".into(), memory: card };
     let gpu = Gpu::value(card, true);
@@ -934,16 +934,16 @@ fn a_leased_memory_allocates_only_from_its_grants() {
     let mem = varena::Memory::open(g.clone(), Box::new(gpu)).unwrap();
     // Leasing serves torch from the manager's grants at once: no page made outside the books.
     assert_eq!(mem.lease_over(UnixStream::connect(&socket).unwrap()).unwrap(), None, "the manager refused the lease");
-    assert_eq!((manager.holdings().leased, creates.load(SeqCst)), (0, 0), "memory outside the books");
+    assert_eq!((manager.holdings().allocated, creates.load(SeqCst)), (0, 0), "memory outside the books");
     let p = mem.torch_alloc(4 * MB, A, None).unwrap();
-    until("the span is the manager's grant", || manager.holdings().leased == CHUNK);
+    until("the span is the manager's grant", || manager.holdings().allocated == CHUNK);
     let floor = mem.torch_alloc(300 * MB, A, None);
     assert!(matches!(floor, Err(varena::Error::Exhausted(_))), "{floor:?}");
     mem.torch_free(p, 4 * MB, A);
     let torch = mem.torch().unwrap();
     until("the span is quiet", || torch.idle().0 == CHUNK);
     assert_eq!(torch.reclaim(u64::MAX), CHUNK);
-    until("the chunk leaves the books", || manager.holdings().leased == 0);
+    until("the chunk leaves the books", || manager.holdings().allocated == 0);
     assert_eq!(creates.load(SeqCst), 0, "the executor made a page itself");
     drop((torch, mem));
     varena::os::remove_table(&g.uuid);
