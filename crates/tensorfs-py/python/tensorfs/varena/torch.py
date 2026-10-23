@@ -41,8 +41,9 @@ from torch.utils.hooks import RemovableHandle
 from . import Copy as CopyRun
 from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, copies, cuts, seal
 
-#: Blocks entered (each forward of a bound block) or bound to a host device, process-wide: the
-#: work a call does in its models, which the Runtime tells the machine (cl-648).
+#: Blocks entered (each forward of a bound block, and of a host device's block) or bound to a host
+#: device, process-wide: the work a call does in its models, which the Runtime tells the machine
+#: (cl-648).
 progress = 0
 #: Blocks copied ahead of the one entered, in the recorded order.
 _AHEAD = 2
@@ -716,6 +717,8 @@ class Memory:
             self.landing[model] = {r for r in range(len(ws.spans)) if ws.resident(r)}
         if model.host:
             _bind_host(model)
+            for b in model.blocks:
+                _count(b)
             return model
         model.ws.home(_home_regions(model))
         for b in model.blocks:
@@ -1924,6 +1927,24 @@ def _hook(block: Block) -> None:
 
     bound._varena = True  # type: ignore[attr-defined]  # what a package's shape check allows
     module.forward = bound  # type: ignore[method-assign]
+
+
+def _count(block: Block) -> None:
+    """A host device's block (CPU, Apple), bound once at its load: each forward counts as work
+    (`progress`), as a bound block's does, and nothing else wraps it (cl-648)."""
+    module = block.module
+    assert module is not None
+    block.own_forward = "forward" in module.__dict__
+    block.forward = module.forward
+    forward = block.forward if block.own_forward else cuts.current(module)
+
+    def counted(*args: object, **kwargs: object) -> object:
+        global progress
+        progress += 1
+        return forward(*args, **kwargs)
+
+    counted._varena = True  # type: ignore[attr-defined]  # what a package's shape check allows
+    module.forward = counted  # type: ignore[method-assign]
 
 
 def _unhook(block: Block) -> None:

@@ -29,10 +29,12 @@ jobs:
       # wheels of one version.
       runtime_ref: 01966eb8d08b567eaae41f79673f40dee62adc7b
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below. varena's
-      # placement under a declared plan runs first, on the wheel with CPU torch.
+      # placement under a declared plan runs first, on the wheel with CPU torch, then a
+      # Diffusers model on the CPU (a host device).
       test: >-
-        uv pip install --python "$TENSORFS_TEST_PYTHON" torch &&
+        uv pip install --python "$TENSORFS_TEST_PYTHON" torch diffusers==0.35.1 &&
         "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/varena-plan.py &&
+        "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/varena-standalone.py &&
         python3 scripts/cargo-test-binaries.py --self-test &&
         python3 scripts/cargo-test-binaries.py
 

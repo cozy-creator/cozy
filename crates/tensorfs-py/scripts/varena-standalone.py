@@ -17,6 +17,7 @@ from pathlib import Path
 import tensorfs
 import torch
 from diffusers import UNet2DConditionModel
+from tensorfs.varena import torch as varena_torch
 from tensorfs.varena.torch import Exhausted, Memory, blocks_of
 
 CONFIG = dict(  # blocks of 16 MiB and more: a smaller one shares a pack, so its region is common
@@ -46,9 +47,13 @@ def run(device: torch.device, ck: tensorfs.Checkpoint, want: torch.Tensor, limit
     mem = Memory.open(device, limit=limit)
     model = mem.load(unet, ck=ck)
     x, text = (torch.randn(*s, generator=torch.Generator().manual_seed(1)) for s in ((1, 4, 8, 8), (1, 5, 768)))
+    worked = varena_torch.progress
     with torch.no_grad(), mem.request(f"limit {limit}") as r:
         got = unet(x.to(device), 3, encoder_hidden_states=text.to(device)).sample.cpu()
+    worked = varena_torch.progress - worked
     name = f"loaded from the store, limit {limit}"
+    # on a CPU its blocks are bound once at load; their forwards count still (cl-648)
+    check(f"{name}: each block's forward counts as work", worked >= len(model.blocks) > 0, worked)
     if limit is not None:  # the CUDA context is counted: measured from the driver each request
         check(f"{name}: outside bytes are measured", mem.context > 0, mem.context)
     owners = {p for p in blocks_of(unet) if any(k.startswith(p + ".") for k in ck.components["unet"].tensors)}
