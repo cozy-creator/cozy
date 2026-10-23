@@ -26,8 +26,6 @@ fn far(d: Option<(u32, u32, u32)>) -> Far {
 
 /// Everything `make_room` may take, in its order; `keep` (the pages being bound) never.
 pub fn victims(t: &Table, keep: &[Key]) -> Vec<Victim> {
-    #[cfg(feature = "faults")]
-    crate::faults::hit(crate::faults::Point::Decide);
     let pages = || t.pages().filter(|(k, p)| p.mapped && !p.filling && p.pins.is_empty() && !keep.contains(k));
     let page = |(key, p): (Key, &crate::table::Page)| Victim { key, bytes: p.bytes, releasing: !p.releasing.is_empty() };
     let mut idle: Vec<(Key, &crate::table::Page)> = pages().filter(|(k, _)| t.distance(*k).is_none()).collect();
@@ -47,8 +45,6 @@ pub fn victims(t: &Table, keep: &[Key]) -> Vec<Victim> {
 /// What prefetch maps for `req` into `free` bytes only: the next [`SLOTS`] unmapped blocks of its
 /// current step's sets past their cursors, nearest first, while they fit.
 pub fn prefetch(t: &Table, req: u64, free: u64) -> Vec<Key> {
-    #[cfg(feature = "faults")]
-    crate::faults::hit(crate::faults::Point::Decide);
     let Some(r) = t.request(req) else { return vec![] };
     let mut ahead: Vec<((u32, u32, u32), Key, u64)> = t
         .pages()

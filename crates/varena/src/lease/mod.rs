@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod manager;
 pub mod policy;
+#[allow(unsafe_code)]
 pub mod table;
 pub mod wire;
 

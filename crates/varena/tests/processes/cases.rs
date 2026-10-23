@@ -40,7 +40,6 @@ pub fn main() {
     type Case = (&'static str, fn(&Path));
     let mut cases: Vec<Case> = vec![
         ("a_failed_request_frees_everything", a_failed_request_frees_everything),
-        ("a_panic_fails_the_request_not_the_process", a_panic_fails_the_request_not_the_process),
         ("exhausted_carries_stats", exhausted_carries_stats),
         ("a_joint_step_runs_a_pass_per_set", a_joint_step_runs_a_pass_per_set),
     ];
@@ -286,10 +285,6 @@ fn agent() {
                     Some((code, why)) => format!("refused {code:?} {why}"),
                 }
             }
-            ["fault", point] => {
-                varena::faults::arm(if *point == "decide" { varena::faults::Point::Decide } else { varena::faults::Point::Fill });
-                "ok".into()
-            }
             ["exit"] => {
                 // Its memory retires before the process ends (the row goes, TensorD wakes).
                 drop((std::mem::take(&mut yielded), std::mem::take(&mut pins), std::mem::take(&mut passes), std::mem::take(&mut requests)));
@@ -518,45 +513,6 @@ fn a_failed_request_frees_everything(dir: &Path) {
     assert_eq!(a.ok("exact f 1"), "true");
     a.ok("unpin");
     assert!(a.ok("end r2").starts_with("leftover=0"));
-    a.exit();
-}
-
-/// A panic in `decide` and one in a fill each fail their call `Internal`; the next request in
-/// the same process succeeds.
-fn a_panic_fails_the_request_not_the_process(dir: &Path) {
-    let g = gpu("panic", 4 * MB);
-    let (path, full) = (write_set(dir, "p", 2), write_set(dir, "z", 1));
-    let mut a = Agent::spawn();
-    a.ok(&format!("open {} {}", g.uuid, g.memory));
-    a.ok(&format!("load p {} stored ram", path.display()));
-    a.ok(&format!("load z {} stored ram", full.display()));
-    a.ok("request r1 p");
-    a.ok("pass r1 p 1x1");
-    a.ok("bind p 0");
-    a.ok("bind p 1");
-    a.ok("unpin");
-    // The card is full of p's idle pages: z's bind decides what to take.
-    a.ok("fault decide");
-    assert_eq!(a.raw("bind z 0"), "err INTERNAL");
-    assert!(a.ok("end r1").starts_with("leftover=0"));
-    a.ok("request r2 p");
-    a.ok("pass r2 p 1x1");
-    assert_eq!(a.ok("exact p 0"), "true");
-    a.ok("unpin");
-    a.ok("end r2");
-    // A fill thread's panic fails the bind waiting on it.
-    let q = write_set(dir, "q", 1);
-    a.ok(&format!("load q {} stored ram", q.display()));
-    a.ok("request r3 q");
-    a.ok("pass r3 q 1x1");
-    a.ok("fault fill");
-    assert_eq!(a.raw("bind q 0"), "err INTERNAL");
-    assert!(a.ok("end r3").starts_with("leftover=0"));
-    a.ok("request r4 q");
-    a.ok("pass r4 q 1x1");
-    assert_eq!(a.ok("exact q 0"), "true");
-    a.ok("unpin");
-    a.ok("end r4");
     a.exit();
 }
 

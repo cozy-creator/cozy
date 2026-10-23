@@ -7,17 +7,20 @@
 //! holds a process's facts and [`decide`] orders its own pages. Host RAM is the OS page cache:
 //! TensorFS's `io` moves every byte.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![deny(unsafe_code)]
 
 pub mod arena;
+#[allow(unsafe_code)]
 pub mod backend;
+#[allow(unsafe_code)]
 pub mod cuda;
 pub mod decide;
 #[cfg(unix)]
+#[allow(unsafe_code)]
 pub mod derived;
-#[cfg(feature = "faults")]
-pub mod faults;
 pub mod layout;
 pub mod lease;
+#[allow(unsafe_code)]
 pub mod memory;
 pub mod os;
 pub mod region;

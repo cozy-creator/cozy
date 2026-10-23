@@ -1496,8 +1496,6 @@ impl Inner {
     /// The batch's copies from the store, through the page cache: one engine read per set.
     /// Each page's origin, or its error.
     fn copy(&self, sets: &BTreeMap<u32, SetSpec>, pages: &[(&Job, (Va, u64, u64))]) -> Vec<Result<Origin>> {
-        #[cfg(feature = "faults")]
-        crate::faults::hit(crate::faults::Point::Fill);
         let mut copies: Vec<Copying> = pages
             .iter()
             .map(|(job, (va, off, span))| {

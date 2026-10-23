@@ -36,6 +36,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use crate::backend::{Access, Backend, Event, Physical, Va, OUT_OF_MEMORY};
 use crate::{Error, Exhausted, Result};
 
+#[allow(unsafe_code)]
 mod regions;
 pub use regions::Evicted;
 

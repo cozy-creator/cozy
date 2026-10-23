@@ -2,6 +2,7 @@
 name = "varena"
 version = "0.14.0"
 edition = "2021"
+license.workspace = true
 publish.workspace = true
 description = "The memory of the processes computing with model weights: one GPU table, one decision procedure, kept pages and the RAM tier."
 
@@ -21,11 +22,8 @@ tracing.workspace = true
 # Store-backed sources (checkpoints from a TensorFS store).
 default = ["store"]
 store = ["tensorfs/store"]
-# Panic points for the recovery tests (`faults`); the tests turn it on through the dev-dependency below.
-faults = []
 
 [dev-dependencies]
-varena = { path = ".", features = ["faults"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 
@@ -48,3 +46,6 @@ harness = false
 [[test]]
 name = "lease_gpu"
 harness = false
+
+[lints]
+workspace = true
