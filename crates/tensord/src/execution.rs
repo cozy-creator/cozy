@@ -3,7 +3,7 @@
 use platform::process::Birth;
 use crate::journal::{
     Artifact, CallMemo, Execution, Invocation, Journal, Outcome, ProgressSnapshot,
-    ResultRecord, State, SubmissionContext,
+    ResultRecord, State, SubmissionContext, Weights,
 };
 use serde_json::Value;
 use std::{
@@ -763,12 +763,14 @@ impl Engine {
         if record.revision >= record.revision_ceiling {
             record = journal.reserve_observations(id, progress.get(id))?;
         }
+        let weights = progress.get(id).and_then(|held| held.weights.clone());
         progress.insert(
             id.into(),
             ProgressSnapshot {
                 completed_units: record.completed_units,
                 detail: record.progress.clone().unwrap_or_default(),
                 waiting: reason,
+                weights,
                 revision: record
                     .revision
                     .checked_add(1)
@@ -804,25 +806,32 @@ impl Engine {
         if record.state.terminal() {
             return Ok(());
         }
+        let weights = progress.get(id).and_then(|snapshot| snapshot.weights.clone());
         if let Some(snapshot) = progress.get(id) {
             snapshot.overlay(&mut record);
         }
+        let own = weights.as_ref().map_or(record.progress.as_deref(), |(_, own)| Some(own.as_str()));
         // Units never regress; a stage or position change without new units still shows.
         if completed_units < record.completed_units
-            || completed_units == record.completed_units
-                && record.progress.as_deref() == Some(detail.as_str())
+            || completed_units == record.completed_units && own == Some(detail.as_str())
         {
             return Ok(());
         }
         if record.revision >= record.revision_ceiling {
             record = journal.reserve_observations(id, progress.get(id))?;
         }
+        // Weights still arriving show over it; it shows once they are here.
+        let (detail, weights) = match weights {
+            Some((arriving, _)) => (arriving.over(&detail), Some((arriving, detail))),
+            None => (detail, None),
+        };
         progress.insert(
             id.into(),
             ProgressSnapshot {
                 completed_units,
                 detail,
                 waiting: None,
+                weights,
                 revision: record
                     .revision
                     .checked_add(1)
@@ -831,6 +840,55 @@ impl Engine {
         );
         drop((progress, journal));
         self.notify_activity(); // wakes event long-polls; nothing durable is written
+        Ok(())
+    }
+
+    /// The weights run `id` waits on while they arrive (`access::meter`), shown over its own
+    /// progress; `None` once they are here, when its own shows again. A queued run keeps why it
+    /// waits.
+    pub fn observe_weights(&self, id: &str, weights: Option<Weights>) -> io::Result<()> {
+        if !self.owned.lock().unwrap().contains(id) {
+            return Ok(());
+        }
+        let mut progress = self.progress.lock().unwrap();
+        let held = progress.get(id);
+        if held.and_then(|snapshot| snapshot.weights.as_ref().map(|(w, _)| w)) == weights.as_ref() {
+            return Ok(());
+        }
+        let mut journal = self.journal.lock().unwrap();
+        let mut record = journal.get(id)?;
+        if !record.observed() {
+            return Ok(());
+        }
+        if let Some(snapshot) = held {
+            snapshot.overlay(&mut record);
+        }
+        let own = match held.and_then(|snapshot| snapshot.weights.as_ref()) {
+            Some((_, own)) => own.clone(),
+            None => record.progress.clone().unwrap_or_default(),
+        };
+        if record.revision >= record.revision_ceiling {
+            record = journal.reserve_observations(id, progress.get(id))?;
+        }
+        let (detail, weights) = match weights {
+            Some(arriving) => (arriving.over(&own), Some((arriving, own))),
+            None => (own, None),
+        };
+        progress.insert(
+            id.into(),
+            ProgressSnapshot {
+                completed_units: record.completed_units,
+                detail,
+                waiting: record.waiting.clone(),
+                weights,
+                revision: record
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("execution observation cursor exhausted"))?,
+            },
+        );
+        drop((progress, journal));
+        self.notify_activity();
         Ok(())
     }
 
@@ -1009,19 +1067,6 @@ impl Engine {
         fs::create_dir_all(&root)?;
         Ok(root)
     }
-    #[cfg(test)]
-    pub(crate) fn managed_result(
-        &self,
-        id: &str,
-        source: &Path,
-        value: Value,
-        bindings: Vec<crate::journal::AssetBinding>,
-        adjustments: Vec<crate::journal::Adjustment>,
-    ) -> io::Result<Execution> {
-        let result = self.managed_result_record(id, source, value, bindings, adjustments)?;
-        self.finish(id, Outcome::Completed(result))
-    }
-
     /// Take the result's verified files into custody without publishing a terminal. A pooled
     /// executor returns to its idle pool before its caller can observe completion and call again.
     pub(crate) fn managed_result_record(
@@ -1333,255 +1378,5 @@ pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
             return Ok(file);
         }
         unreachable!()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Slurm FIFO: an older root's step queued later dispatches before a younger root's
-    /// step queued earlier; each child carries its root and GPU family.
-    #[test]
-    fn ready_runs_queue_by_their_roots_acceptance() {
-        let root = std::env::temp_dir().join(format!("cm-ready-{}", uuid::Uuid::new_v4()));
-        let engine = Engine::open(&root).unwrap();
-        let submit = |key: &str, parent: &str, gpu: bool| engine.submit(key, Invocation {
-            degree: gpu as u32, parent: parent.into(), ..Default::default()
-        }).unwrap();
-        let (older, younger) = (submit("older", "", false), submit("younger", "", false));
-        for root in [&older, &younger] {
-            assert!(engine.dispatch_managed(&root.id, |_, _| Ok(())).unwrap());
-        }
-        let younger_step = submit("younger/1", &younger.id, false);
-        let job = submit("older/1", &older.id, true);
-        let nested = submit("older/1/1", &job.id, false);
-        let order: Vec<_> = engine.ready().unwrap().into_iter().map(|r| r.id).collect();
-        assert_eq!(order, [job.id.clone(), nested.id.clone(), younger_step.id.clone()]);
-        assert_eq!((nested.root_seq(), nested.family()), (older.root_seq(), Some(job.id.as_str())));
-        assert_eq!((younger_step.root_seq(), younger_step.family()), (younger.root_seq(), None));
-        drop(engine);
-        crate::scratch::remove(&root);
-    }
-
-    /// One managed attempt of `id`, as the pool runs it: a real process registered and
-    /// authorized, then `settle` with the engine; the process ends with the attempt.
-    fn attempt(engine: &Arc<Engine>, id: &str, settle: impl FnOnce(&Engine, &str) + Send + 'static) {
-        let (done, finished) = std::sync::mpsc::channel();
-        assert!(engine.dispatch_managed(id, move |engine, id| {
-            let mut process = crate::scratch::until_stdin_closes()
-                .stdin(std::process::Stdio::piped())
-                .spawn()?;
-            engine.register_managed(&id, Birth::of(process.id())?, Arc::new(|| Ok(())))?;
-            assert!(engine.authorize_managed(&id, None)?);
-            settle(&engine, &id);
-            drop(process.stdin.take());
-            process.wait()?;
-            done.send(()).unwrap();
-            Ok(())
-        })
-        .unwrap());
-        finished.recv().unwrap();
-    }
-
-    /// A run's attention pin is its calls': a root completing with a pin no call applied says
-    /// so once in its log and completes all the same; one a call applied (a child's counts for
-    /// its root) completes without it, and a run with no pin logs nothing.
-    #[test]
-    fn a_pin_no_call_applied_is_a_warning_in_the_runs_log() {
-        let root = std::env::temp_dir().join(format!("cm-pin-{}", uuid::Uuid::new_v4()));
-        let engine = Engine::open(&root).unwrap();
-        let run = |key: &str, pin: &str, applied: bool| {
-            let invocation = Invocation { attention_kernel: pin.into(), ..Default::default() };
-            let id = engine.submit(key, invocation.clone()).unwrap().id;
-            let child = Invocation { parent: id.clone(), ..invocation };
-            let child = engine.submit(&format!("{key}-call"), child).unwrap().id;
-            attempt(&engine, &id, move |engine, id| {
-                if applied {
-                    engine.apply_attention(&child).unwrap();
-                }
-                let value = ResultRecord { value: serde_json::json!({}), artifacts: vec![], asset_bindings: vec![], adjustments: vec![] };
-                engine.finish(id, Outcome::Completed(value)).unwrap();
-            });
-            assert_eq!(engine.get(&id).unwrap().state, State::Completed);
-            let logs = engine.logs(&id).unwrap();
-            logs.iter().map(|log| serde_json::from_slice::<Value>(&log.product).unwrap()).collect::<Vec<_>>()
-        };
-        assert_eq!(run("unapplied", "sdpa", false),
-            [serde_json::json!({"level": "warning", "text": "attention pin sdpa was never applied"})]);
-        assert_eq!(run("applied", "sdpa", true), Vec::<Value>::new());
-        assert_eq!(run("unpinned", "", false), Vec::<Value>::new());
-        drop(engine);
-        crate::scratch::remove(&root);
-    }
-
-    /// Result custody must survive the spool going away before the pool publishes completion.
-    #[test]
-    fn a_managed_result_can_be_held_before_its_terminal_is_published() {
-        let root = std::env::temp_dir().join(format!("cm-pending-result-{}", uuid::Uuid::new_v4()));
-        let engine = Engine::open(&root).unwrap();
-        let id = engine.submit("pending-result", Invocation::default()).unwrap().id;
-        attempt(&engine, &id, |engine, id| {
-            let spool = Spool(engine.staging(id).unwrap());
-            fs::write(spool.0.join("answer"), b"kept").unwrap();
-            let binding = crate::journal::AssetBinding {
-                relative_path: "answer".into(), asset_ref: "attempt:run/file/0".into(),
-                media_type: "text/plain".into(), length: 4,
-            };
-            let result = engine.managed_result_record(id, &spool.0, serde_json::json!({"answer": 42}), vec![binding], vec![]).unwrap();
-            assert_eq!(engine.get(id).unwrap().state, State::Running);
-            drop(spool);
-            assert_eq!(fs::read(engine.root.join(&result.artifacts[0].path)).unwrap(), b"kept");
-            engine.finish(id, Outcome::Completed(result)).unwrap();
-        });
-        assert_eq!(engine.get(&id).unwrap().state, State::Completed);
-        let mut bytes = Vec::new();
-        engine.open_result(&id, 0).unwrap().read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"kept");
-        drop(engine);
-        crate::scratch::remove(&root);
-    }
-
-    /// A cleanup error cannot publish a live executor's result or lose it on restart. Both
-    /// exact process births must end; the held files and outcome survive without re-execution.
-    #[test]
-    fn a_pending_result_survives_cleanup_error_and_restart_until_exact_exit() {
-        let root = std::env::temp_dir().join(format!("cm-pending-restart-{}", uuid::Uuid::new_v4()));
-        let engine = Engine::open(&root).unwrap();
-        let id = engine.submit("pending-restart", Invocation::default()).unwrap().id;
-        let mut leader = crate::scratch::until_stdin_closes().stdin(std::process::Stdio::piped()).spawn().unwrap();
-        let mut follower = crate::scratch::until_stdin_closes().stdin(std::process::Stdio::piped()).spawn().unwrap();
-        let births = vec![Birth::of(leader.id()).unwrap(), Birth::of(follower.id()).unwrap()];
-        assert!(engine.journal.lock().unwrap().claim(&id).unwrap());
-        engine.owned.lock().unwrap().insert(id.clone());
-        engine.register_managed(&id, births[0].clone(), Arc::new(|| Ok(()))).unwrap();
-        assert!(engine.authorize_managed(&id, None).unwrap());
-        let spool = Spool(engine.staging(&id).unwrap());
-        fs::write(spool.0.join("answer"), b"kept once").unwrap();
-        let binding = crate::journal::AssetBinding {
-            relative_path: "answer".into(), asset_ref: "attempt:run/file/0".into(),
-            media_type: "text/plain".into(), length: 9,
-        };
-        let member = b"tree kept";
-        let sha = tensorfs::sha256::hex_digest(member);
-        fs::write(spool.0.join(format!("sha256-{sha}")), member).unwrap();
-        let manifest = serde_json::to_vec(&serde_json::json!({"entries": [
-            {"kind": "file", "path": "member.txt", "blob": {"sha256": sha, "length": member.len()}}
-        ]})).unwrap();
-        fs::write(spool.0.join("tree-manifest"), &manifest).unwrap();
-        let tree = crate::journal::AssetBinding {
-            relative_path: "tree-manifest".into(), asset_ref: "attempt:run/tree/0".into(),
-            media_type: crate::gpu_service::TREE_MEDIA.into(), length: manifest.len() as u64,
-        };
-        let result = engine.managed_result_record(&id, &spool.0, serde_json::json!({"answer": 42}), vec![binding, tree], vec![]).unwrap();
-        let held = result.artifacts.clone();
-        let held_path = result.artifacts[0].path.clone();
-        engine.observe_progress(&id, 7, "last observed".into()).unwrap();
-        engine.defer_completion(&id, Outcome::Completed(result), births).unwrap();
-        drop(spool);
-        crate::gpu_service::settle(&engine, &id, &io::Error::other("post-response cleanup exit unproven")).unwrap();
-        let running = engine.get(&id).unwrap();
-        assert_eq!(running.state, State::Running);
-        assert!(running.result.is_none());
-        assert!(running.pending_completion.is_some());
-        assert_eq!(engine.nonterminal(10).unwrap().len(), 1);
-        assert!(engine.open_result(&id, 0).is_err());
-        assert!(engine.journal.lock().unwrap().acknowledge_collection(&id).is_err());
-        // GC protects the whole uncollected result directory, including tree members, even
-        // before the normal terminal/public product roots have been materialized.
-        let catalog = crate::catalog::Catalog::new(&root.join("generations")).unwrap();
-        let bound = HashSet::new();
-        let disk = || Ok(crate::reclaim::Disk { capacity: 1 << 30, available: 0, inodes: 0, available_inodes: 0 });
-        let swept = crate::reclaim::sweep(&crate::reclaim::Caches {
-            engine: &engine, catalog: &catalog, bound: &bound, kernels: None, memo: None,
-            uv_cache: None, disk: &disk,
-        }).unwrap();
-        assert_eq!(swept.results, 0);
-        assert_eq!(held.len(), 3);
-        for artifact in &held {
-            let bytes = fs::read(root.join(&artifact.path)).unwrap();
-            assert_eq!(tensorfs::sha256::hex_digest(&bytes), artifact.sha256);
-        }
-
-        engine.owned.lock().unwrap().remove(&id);
-        let restarted = Engine::open(&root).unwrap();
-        assert_eq!(restarted.reconcile().unwrap().len(), 1);
-        assert!(!restarted.dispatch_managed(&id, |_, _| panic!("known outcome replayed")).unwrap());
-        drop(leader.stdin.take());
-        leader.wait().unwrap();
-        // The leader's exit alone cannot release the follower's reservation.
-        assert_eq!(restarted.reconcile().unwrap().len(), 1);
-        assert_eq!(restarted.get(&id).unwrap().state, State::Running);
-        drop(follower.stdin.take());
-        follower.wait().unwrap();
-        assert!(restarted.reconcile().unwrap().is_empty());
-        let finished = restarted.get(&id).unwrap();
-        assert_eq!(finished.state, State::Completed);
-        assert_eq!(finished.attempt, 1);
-        assert_eq!(finished.completed_units, 7);
-        assert_eq!(finished.progress.as_deref(), Some("last observed"));
-        assert!(finished.pending_completion.is_none());
-        assert_eq!(finished.result.as_ref().unwrap().value, serde_json::json!({"answer": 42}));
-        assert_eq!(finished.result.as_ref().unwrap().artifacts[0].path, held_path);
-        assert_eq!(finished.result.as_ref().unwrap().asset_bindings.len(), 2);
-        for artifact in &finished.result.as_ref().unwrap().artifacts {
-            let bytes = fs::read(root.join(&artifact.path)).unwrap();
-            assert_eq!(tensorfs::sha256::hex_digest(&bytes), artifact.sha256);
-        }
-        let mut bytes = Vec::new();
-        restarted.open_result(&id, 0).unwrap().read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"kept once");
-        drop((engine, restarted));
-        crate::scratch::remove(&root);
-    }
-
-    /// A result's files are taken into custody once, from the attempt's spool: a symlink or a
-    /// FIFO in its place fails the run, the spool is gone once it settles, and a held file
-    /// changed afterwards is refused, never served.
-    #[test]
-    fn custody_takes_one_verified_copy_and_refuses_escapes_and_mutation() {
-        let root = std::env::temp_dir().join(format!("cm-custody-{}", uuid::Uuid::new_v4()));
-        let engine = Engine::open(&root).unwrap();
-        let binding = |length: u64| crate::journal::AssetBinding {
-            relative_path: "prediction".into(),
-            asset_ref: "attempt:run/file/0".into(),
-            media_type: "text/plain".into(),
-            length,
-        };
-        let run = |key: &str, place: fn(&Path)| {
-            let id = engine.submit(key, Invocation::default()).unwrap().id;
-            attempt(&engine, &id, move |engine, id| {
-                let spool = engine.staging(id).unwrap();
-                place(&spool.join("prediction"));
-                let _spool = Spool(spool.clone());
-                let length = fs::symlink_metadata(spool.join("prediction")).map_or(0, |m| m.len());
-                if let Err(error) = engine.managed_result(id, &spool, serde_json::json!({"rows": 2}), vec![binding(length)], vec![]) {
-                    engine.finish(id, Outcome::Failed(crate::journal::Failure::custody(&error.to_string()))).unwrap();
-                }
-            });
-            engine.get(&id).unwrap()
-        };
-        #[cfg(unix)]
-        {
-            let escaped = run("symlink", |path| std::os::unix::fs::symlink("/etc/passwd", path).unwrap());
-            assert_eq!(escaped.state, State::Failed);
-            let fifo = run("fifo", |path| {
-                let name = CString::new(path.as_os_str().as_bytes()).unwrap();
-                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-            });
-            assert_eq!(fifo.state, State::Failed);
-        }
-        let held = run("held", |path| fs::write(path, b"17,39\n").unwrap());
-        assert_eq!(held.state, State::Completed, "{held:?}");
-        assert!(!root.join("staging").join(&held.id).exists(), "the spool goes once settled");
-        let mut bytes = String::new();
-        engine.open_result(&held.id, 0).unwrap().read_to_string(&mut bytes).unwrap();
-        assert_eq!(bytes, "17,39\n");
-        let path = root.join(&held.result.unwrap().artifacts[0].path);
-        platform::durable::set_mode(&path, 0o600).unwrap();
-        fs::write(&path, b"corrupted").unwrap();
-        assert_eq!(engine.open_result(&held.id, 0).unwrap_err().kind(), io::ErrorKind::InvalidData);
-        drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

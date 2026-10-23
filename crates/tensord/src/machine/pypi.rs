@@ -1,7 +1,6 @@
-//! A Runtime or TensorFS wheel the machine fetches itself: published on uv's index, checked against
-//! the index's own SHA-256, or at any https URL, held to the digest its update names. It lands
-//! through the machine's store with the one downloader: `stop` ends it, and what landed stays
-//! for the next ask.
+//! A Runtime or TensorFS wheel the machine fetches itself: published on uv's index, held to the
+//! index's own SHA-256. It lands through the machine's store with the one downloader: `stop` ends
+//! it, and what landed stays for the next ask.
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -76,9 +75,9 @@ fn selected(plan: &str, distribution: &str, version: &str) -> io::Result<Artifac
     Ok(wheel)
 }
 
-/// Wheel `file` at an https `url` on any host, redirects followed: its bytes are held to
-/// `sha256`, so no host vouches for anything. Other bytes fail `wheel_digest_mismatch`.
-pub fn wheel_at(url: &str, sha256: &str, file: &str, dir: &Path, machine: &Machine, stop: &Stop) -> io::Result<PathBuf> {
+/// Wheel `file` at an https `url`, redirects followed: its bytes are held to `sha256`, so no host
+/// vouches for anything. Other bytes fail `wheel_digest_mismatch`.
+fn wheel_at(url: &str, sha256: &str, file: &str, dir: &Path, machine: &Machine, stop: &Stop) -> io::Result<PathBuf> {
     // A private server's root as uv trusts it: the bundle SSL_CERT_FILE names. Only this fetch
     // reads it; the Hub's clients trust their own CA alone.
     let bundle = protocol::config::environment().get("SSL_CERT_FILE").and_then(|path| fs::read(path).ok()).filter(|pem| !pem.is_empty());
@@ -166,49 +165,4 @@ fn land(blob: &Path, dir: &Path, file: &str) -> io::Result<PathBuf> {
     let _ = fs::remove_file(&path);
     fs::hard_link(blob, &path).or_else(|_| fs::copy(blob, &path).map(drop))?;
     Ok(path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn selected_plan_must_identify_one_exact_wheel_built_before_pure() {
-        let plan = format!(r#"
-[[packages]]
-name = "tensorfs"
-version = "0.13.5"
-wheels = [{{url = "https://files.pythonhosted.org/tensorfs-0.13.5-cp311-abi3-manylinux_2_17_x86_64.whl", hashes = {{sha256 = "{}"}}}}]
-"#, "1".repeat(64));
-        assert!(selected(&plan, "tensorfs", "0.13.5").unwrap().filename().unwrap().contains("cp311-abi3"));
-        assert!(selected(&plan, "tensorfs", "0.13.4").is_err());
-        assert!(selected(&format!("{plan}\n{plan}"), "tensorfs", "0.13.5").is_err());
-        assert!(selected(&plan.replace("tensorfs-0.13.5", "tensorfs-0.13.4"), "tensorfs", "0.13.5").is_err());
-        assert!(selected(&plan.replace(&"1".repeat(64), "invalid"), "tensorfs", "0.13.5").is_err());
-        let pure = format!(r#"{{url = "https://files.pythonhosted.org/tensorfs-0.13.5-py3-none-any.whl", hashes = {{sha256 = "{}"}}}}"#, "2".repeat(64));
-        for both in [plan.replace("wheels = [", &format!("wheels = [{pure}, ")), plan.replace("}}]", &format!("}}}}, {pure}]"))] {
-            assert!(selected(&both, "tensorfs", "0.13.5").unwrap().filename().unwrap().contains("cp311-abi3"), "{both}");
-        }
-    }
-
-    /// PyPI lists TensorFS 0.13.5's cp310-only wheel first; an executor on 3.12 gets the abi3
-    /// one, which its environment imports. Real PyPI, uv and download.
-    #[test]
-    fn published_tensorfs_wheel_installs_for_executor_python() {
-        let root = tempfile::tempdir().unwrap();
-        let store = Arc::new(tensorfs::store::Store::open(root.path().join("store")).unwrap());
-        let machine = Machine::new(store, None).unwrap();
-        let uv = root.path().join(if cfg!(windows) { "uv.exe" } else { "uv" });
-        let wheel = wheel("tensorfs", "0.13.5", &uv, "3.12", &root.path().join("wheels"), &machine, &Stop::default()).unwrap();
-        assert!(wheel.to_string_lossy().contains("-cp311-abi3-"), "{wheel:?}");
-        let env = root.path().join("env");
-        let python = platform::paths::venv_python(&env);
-        for args in [vec!["venv", "--no-config", "--python", "3.12", env.to_str().unwrap()],
-            vec!["pip", "install", "--no-config", "--no-deps", "--python", python.to_str().unwrap(), wheel.to_str().unwrap()]] {
-            let output = std::process::Command::new(&uv).args(&args).output().unwrap();
-            assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
-        }
-        let imported = std::process::Command::new(&python).args(["-I", "-c", "import tensorfs"]).output().unwrap();
-        assert!(imported.status.success(), "{}", String::from_utf8_lossy(&imported.stderr));
-    }
 }

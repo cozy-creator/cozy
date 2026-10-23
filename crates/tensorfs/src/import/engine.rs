@@ -468,6 +468,8 @@ pub struct Reading {
     pub cast: Option<Dtype>,
     /// The bytes themselves, for a part no source tensor holds (`FoldedPart::inline`).
     pub inline: Option<Vec<u8>>,
+    /// The bytes computed from the source range (`Tensor::derive`).
+    pub derive: Option<super::source::Derive>,
 }
 
 impl Reading {
@@ -487,10 +489,11 @@ impl Reading {
             source,
             cast: None,
             inline: Some(bytes),
+            derive: None,
         }
     }
 
-    /// A source range read as it is.
+    /// A source range read as it is, or what its derive computes from it.
     fn whole(t: &Tensor) -> Reading {
         Reading {
             file: t.file,
@@ -498,13 +501,14 @@ impl Reading {
             len: t.len,
             unit: 1,
             runs: Runs {
-                run: t.len,
+                run: t.derive.as_ref().map_or(t.len, |d| d.len),
                 base: 0,
                 outer: vec![],
             },
             source: t.dtype.clone(),
             cast: None,
             inline: None,
+            derive: t.derive.clone(),
         }
     }
 }
@@ -697,6 +701,9 @@ fn planned(
     let (dtype, cast) = cast_to(&what, &t.dtype, cast)?;
     let (shape, runs) = layout(&what, &t.shape, ops)?;
     let moves = ops.view.is_some() || ops.take.is_some() || ops.permute.is_some();
+    if t.derive.is_some() && (moves || cast.is_some()) {
+        return refuse(Code::SEAM_UNBANKED, format!("{what}: a computed tensor; a table row may rename it, never cut or cast it"));
+    }
     let read = match (moves || cast.is_some(), t.dtype.bits()) {
         (true, Some(bits)) if bits.is_multiple_of(8) => Reading {
             file: t.file,
@@ -707,6 +714,7 @@ fn planned(
             source: t.dtype.clone(),
             cast,
             inline: None,
+            derive: None,
         },
         (true, _) => {
             return refuse(
@@ -846,6 +854,7 @@ fn plan_raw(set: &SourceSet, c: &Component, out: &mut Vec<Planned>) -> Result<()
             start: raw.offset,
             len: bytes,
             encoded: None,
+            derive: None,
         };
         out.push(planned(
             &c.name,
@@ -970,6 +979,16 @@ impl<'f> TensorReader<'f> {
     pub fn new(file: &'f File, r: &'f Reading, what: String) -> Result<TensorReader<'f>> {
         let whole = if let Some(bytes) = &r.inline {
             Some(bytes.clone())
+        } else if let Some(d) = &r.derive {
+            let read = |(start, len): (u64, u64)| -> Result<Vec<u8>> {
+                let mut buf = vec![0u8; len as usize];
+                file.read_exact_at(&mut buf, start).map_err(|e| io(&what, e))?;
+                Ok(buf)
+            };
+            let sources = [(r.start, r.len)].into_iter().chain(d.with.iter().copied()).map(read).collect::<Result<Vec<_>>>()?;
+            let out = (d.f)(&sources.iter().map(Vec::as_slice).collect::<Vec<_>>());
+            debug_assert_eq!(out.len() as u64, d.len, "{what}");
+            Some(out)
         } else if r.runs.count() > 1 && r.runs.run * r.unit < SHORT_RUN {
             let mut buf = vec![0u8; r.len as usize];
             file.read_exact_at(&mut buf, r.start)

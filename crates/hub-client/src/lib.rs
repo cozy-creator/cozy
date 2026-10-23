@@ -2,11 +2,10 @@
 //! pinned in `SOURCE`), with the credentials every cozy process speaks as: a user's device-key
 //! login and Bearer, a pod's worker capability. Bulk bytes (presigned GET/PUT) are not here:
 //! TensorFS moves them.
+#![forbid(unsafe_code)]
 mod auth;
 mod device;
 mod raw;
-#[cfg(feature = "testing")]
-pub mod testing;
 
 #[allow(clippy::all, unused_imports)]
 mod generated {

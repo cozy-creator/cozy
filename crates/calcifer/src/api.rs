@@ -405,6 +405,7 @@ struct Listing {
     status: Option<Status>,
     /// A prefix of the runs' target (`org/pkg`).
     package: Option<String>,
+    /// A machine's name, former name or rental id, as a run's `--on` names it.
     machine: Option<String>,
     before: Option<u64>,
     limit: Option<u64>,
@@ -416,18 +417,39 @@ async fn list(
     query: Result<Query<Listing>, QueryRejection>,
 ) -> Result<Json<RunList>, Refusal> {
     let Query(listing) = query?;
-    let (rows, older) = api.calcifer.store().runs(&RunFilter {
+    let store = api.calcifer.store();
+    let machine = match listing.machine {
+        Some(text) => Some(match store.find_machine(&text)? {
+            Some(row) => row.name,
+            // Its runs are listed while it is off.
+            None if text == "local" => text,
+            None => return Err(Refusal(machines::not_found(&text))),
+        }),
+        None => None,
+    };
+    let (rows, older, mut unreadable) = store.runs(&RunFilter {
         status: listing.status,
         target: listing.package,
-        machine: listing.machine,
+        machine: machine.clone(),
         before: listing.before,
         limit: listing.limit.unwrap_or(50).clamp(1, 1000),
     })?;
-    let runs = rows
-        .iter()
-        .map(|row| api.calcifer.record(row))
-        .collect::<Result<_, _>>()?;
-    Ok(Json(RunList { runs, older }))
+    let mut runs = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match api.calcifer.record(row) {
+            Ok(run) => runs.push(run),
+            Err(e) => unreadable.push(format!("run {}: {e}", row.number)),
+        }
+    }
+    if let Some(first) = unreadable.first() {
+        warn!("{} runs left out of a list, the first {first}", unreadable.len());
+    }
+    Ok(Json(RunList {
+        runs,
+        older,
+        machine,
+        unreadable,
+    }))
 }
 
 #[derive(Deserialize)]

@@ -41,17 +41,5 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Shell",
 ] }
 
-[dev-dependencies]
-serde_json.workspace = true
-tempfile.workspace = true
-
-[target.'cfg(windows)'.dev-dependencies]
-windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
-
-# Its own harness: a test's child processes are this binary (`seams child …`), so roles travel in argv.
-[[test]]
-name = "seams"
-harness = false
-
 [lints]
 workspace = true

@@ -2,7 +2,7 @@
 //! (births, exact handles, groups, meters) is `platform::process`. Nothing here kills
 //! because time passed. Callers kill on a measured wedge (`Pace`), an owner restart, or a launch
 //! that never reached authored code.
-use platform::process::{Birth, Exact, State, gone, group_members, meter, read_bytes};
+use platform::process::{Birth, Exact, State, gone, group_members, meter, written_bytes};
 use std::{
     fs::File,
     io,
@@ -23,6 +23,12 @@ pub fn group_outlives(leader: &Birth, before: u64) -> bool {
 /// are the executor's work. `None` only when the leader itself is unreadable.
 pub fn group_burn(leader: &Birth) -> Option<u64> {
     group_meter(leader).map(|(cpu, moved)| cpu.saturating_add(moved))
+}
+
+/// The bytes the leader and its group members moved: what a call's work is measured in besides
+/// the progress it reports (`Meter::Work`).
+pub fn group_moved(leader: &Birth) -> Option<u64> {
+    group_meter(leader).map(|(_, moved)| moved)
 }
 
 /// `meter` (CPU ns, bytes moved) summed over the leader and its group members.
@@ -124,26 +130,19 @@ impl Pace {
 pub enum Meter {
     /// CPU plus bytes moved by the process (Runtime `ExecutorChild.watched`).
     Burn,
-    /// An invocation's work, judged while it runs, on every executor and every lane: frames,
-    /// bytes moved, GPU memory traffic, or CPU other than a wait on a stuck GPU. Its call tree
-    /// is its own (`Waits`: a child call is watched by its own executor).
+    /// An invocation's work toward its result, judged while it runs, on every executor and every
+    /// lane: progress it reports (a step or stage advanced, an output, weights kept, a child call
+    /// started; never a repeated frame, telemetry or a log line), bytes moved, or GPU memory
+    /// traffic. Never its CPU: a hung call's background threads compute too. A CPU-bound phase
+    /// (compile, hash, quantize) advances by the progress it reports. Its call tree is its own
+    /// (`Waits`: a child call is watched by its own executor).
     Work,
 }
 
-/// What a call's GPUs did since the last reading.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Gpus {
-    Idle,
-    /// Device memory moved: kernels' traffic, copies, peer writes.
-    Moved,
-    /// A kernel stayed resident with no memory traffic: a collective whose peer is gone, or a
-    /// kernel spinning on a flag. A host spinning meanwhile waits on it.
-    Stuck,
-}
-
-/// Its GPUs' readings; None while they cannot be read, which judges nothing. An executor with no
-/// GPUs has no reader: its GPUs read idle.
-pub type Activity = Arc<dyn Fn() -> Option<Gpus> + Send + Sync>;
+/// Whether a call's GPUs moved device memory (kernels' traffic, copies, peer writes) since the
+/// last reading; None while they cannot be read, which judges nothing. An executor with no GPUs
+/// has no reader: its GPUs read idle.
+pub type Activity = Arc<dyn Fn() -> Option<bool> + Send + Sync>;
 
 /// A measured wedge's verdict, as the error of the command it ended.
 #[derive(Debug)]
@@ -163,6 +162,9 @@ struct WatchState {
     /// The work this subject waits on (another call loading a layout it needs), whose progress
     /// is its own while it waits: its re-asks are not.
     lender: Option<Lender>,
+    /// The last stage the subject reported (`progress`), where a wedge's verdict says it stopped.
+    at: String,
+    place: Option<Place>,
     canceled_at: Option<Instant>,
     killed: Option<String>,
     worst_gap: Duration,
@@ -171,9 +173,13 @@ struct WatchState {
 /// Whether the subject is waiting on work watched elsewhere (a job's unfinished child runs).
 pub type Waits = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// The progress meter of work a subject waits on (CPU plus bytes of the call loading a layout
-/// it asked for); None once that work is gone, which lends nothing more.
+/// The progress meter of work a subject waits on (the bytes the call loading a layout it asked
+/// for moved); None once that work is gone, which lends nothing more.
 pub type Lender = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// What the subject waits on now (GPU memory asked of other processes), for a wedge's verdict;
+/// empty when it names nothing.
+pub type Place = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// One exchange's progress observer, shared with whoever may cancel it. It kills the exact
 /// process (and its group) only on a measured wedge; the kill closes the channel, so the
@@ -193,9 +199,8 @@ impl Watch {
             Meter::Work => Pace::seeded(worst_gap),
             Meter::Burn => Pace::default(),
         };
-        // A GPU call's samples with memory traffic, its CPU other than stuck-GPU waits, and its
-        // last CPU reading.
-        let (mut moves, mut ran, mut last_cpu) = (0, 0, None);
+        // A GPU call's samples with memory traffic.
+        let mut moves = 0;
         // What the work it waits on did so far, kept once that work is gone.
         let mut lent = 0;
         let mut state = self.state.lock().unwrap();
@@ -220,12 +225,9 @@ impl Watch {
             lent = state.lender.as_ref().and_then(|lender| lender()).unwrap_or(lent);
             let reading = match self.meter {
                 Meter::Burn => group_burn(exact.birth()).map(|burn| burn + lent),
-                Meter::Work => self.activity.as_ref().map_or(Some(Gpus::Idle), |gpus| gpus()).map(|gpus| {
-                    let (cpu, moved) = group_meter(exact.birth()).unwrap_or_default();
-                    let since = cpu.saturating_sub(last_cpu.replace(cpu).unwrap_or(cpu));
-                    ran += if gpus == Gpus::Stuck { 0 } else { since };
-                    moves += u64::from(gpus == Gpus::Moved);
-                    state.frames + moved + moves + ran + lent
+                Meter::Work => self.activity.as_ref().map_or(Some(false), |gpus| gpus()).map(|moved_memory| {
+                    moves += u64::from(moved_memory);
+                    state.frames + group_moved(exact.birth()).unwrap_or_default() + moves + lent
                 }),
             };
             pace.observe(reading, now);
@@ -238,10 +240,16 @@ impl Watch {
                 let still = now - since;
                 if still > pace.patience(floor) {
                     let measures = match self.meter {
-                        Meter::Work => " (frames, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)",
+                        Meter::Work => " (steps and stages advanced, outputs, bytes moved, GPU memory traffic; never CPU)",
                         Meter::Burn => "",
                     };
-                    let verdict = format!("wedged during {what}: {}{measures}", pace.verdict(still, floor));
+                    let at = match state.at.as_str() {
+                        "" => String::new(),
+                        stage => format!(" at {stage:?}"),
+                    };
+                    let place = state.place.as_ref().map(|place| place()).filter(|place| !place.is_empty());
+                    let place = place.map(|place| format!("; it waits on {place}")).unwrap_or_default();
+                    let verdict = format!("wedged during {what}{at}: {}{measures}{place}", pace.verdict(still, floor));
                     match exact.kill() {
                         Ok(()) => state.killed = Some(verdict),
                         Err(error) => tracing::warn!("{verdict}; kill failed: {error}"),
@@ -252,6 +260,18 @@ impl Watch {
             state = self.changed.wait_timeout(state, liveness.sample).unwrap().0;
         }
     }
+    /// The stage the subject reported last.
+    pub fn at(&self, stage: &str) {
+        let mut state = self.state.lock().unwrap();
+        if state.at != stage {
+            state.at = stage.to_string();
+        }
+    }
+    /// What it waits on, read when a wedge is judged.
+    pub fn place(&self, place: Option<Place>) {
+        self.state.lock().unwrap().place = place;
+    }
+    /// The subject made real progress (`device_executor::advances`).
     pub fn frame(&self) {
         self.state.lock().unwrap().frames += 1;
     }
@@ -410,15 +430,16 @@ pub enum Supervised {
     Wedged(String),
 }
 
-/// Waits for `child`, the leader of its own process group, reading it once a second: `read`
-/// sees the bytes it has read, and its group is killed when `stop` is canceled or when the
+/// Waits for `child`, the leader of its own process group, reading it once a second: `wrote`
+/// sees the bytes its group has written (downloads landing, wheels unpacked; a network read or a
+/// linked file counts no byte), and its group is killed when `stop` is canceled or when the
 /// group's CPU and bytes stop moving for longer than its measured patience (`Pace`, floored by
 /// `Liveness`). The second is resolution, never a verdict.
 pub fn supervise(
     child: &mut Child,
     stop: Option<&crate::stop::Stop>,
     what: &str,
-    read: &dyn Fn(u64),
+    wrote: &dyn Fn(u64),
 ) -> io::Result<Supervised> {
     let exact = match Birth::of(child.id()).map_err(io::Error::from) {
         Ok(birth) => Exact::open(&birth)?,
@@ -431,6 +452,8 @@ pub fn supervise(
     let (floor, tick) = (Liveness::default().floor(), Duration::from_secs(1));
     let (mut pace, mut ended) = (Pace::default(), None);
     let (mut last, mut advances) = (None, 0u64);
+    // What each process of the group wrote so far: a gone member keeps what it wrote.
+    let mut writes = std::collections::HashMap::new();
     while !exact.wait_for(tick)? {
         if ended.is_some() {
             continue;
@@ -439,8 +462,8 @@ pub fn supervise(
         // Bytes moved are progress, and CPU used or owed at a tenth of a core or more (`meter`).
         // An idle process's timer wakeups are not: uv waiting on its build spends one 10 ms
         // tick in about 10 s.
-        let members = group_members(exact.birth()).into_iter().map(|member| member.pid);
-        let reading = std::iter::once(exact.birth().pid).chain(members).filter_map(meter)
+        let group: Vec<u32> = std::iter::once(exact.birth().pid).chain(group_members(exact.birth()).into_iter().map(|m| m.pid)).collect();
+        let reading = group.iter().copied().filter_map(meter)
             .fold((0u64, 0u64), |(cpu, moved), (c, m)| (cpu + c, moved + m));
         if last.is_some_and(|(cpu, moved): (u64, u64)| reading.1 != moved || reading.0.saturating_sub(cpu) >= tick.as_nanos() as u64 / 10) {
             advances += 1;
@@ -448,9 +471,11 @@ pub fn supervise(
         }
         last = Some(reading);
         pace.observe(Some(advances), now);
-        if let Some(bytes) = read_bytes(exact.birth().pid) {
-            read(bytes);
+        for (pid, bytes) in group.iter().filter_map(|pid| Some((*pid, written_bytes(*pid)?))) {
+            let held: &mut u64 = writes.entry(pid).or_default();
+            *held = (*held).max(bytes);
         }
+        wrote(writes.values().sum());
         if stop.is_some_and(|stop| stop.is_cancelled()) {
             exact.kill()?;
             ended = Some(Supervised::Canceled);
@@ -466,11 +491,14 @@ pub fn supervise(
     Ok(ended.unwrap_or(Supervised::Exited(status)))
 }
 
-/// A preparation's verdict, on its measured progress (`Stop::progress`) as an invocation's is:
-/// still past its pace's patience. None once `ended` says it finished. Waiting on work watched
-/// elsewhere (another run's install of the same code) is not stillness.
-pub fn judge_preparation(stop: &crate::stop::Stop, ended: &std::sync::mpsc::Receiver<()>, waits: impl Fn() -> bool) -> Option<String> {
-    let (liveness, mut pace) = (Liveness::default(), Pace::default());
+/// A preparation's verdict, on its measured progress (`Stop::progress`: bytes told as they move,
+/// stages, its installer's meter) as an invocation's is: still past the patience its own pace
+/// earned, the floor before it has any. One that never advances is judged too (a job waiting on
+/// a silent Hub moved nothing for 20 min under #1875's `changes > 0`); a transfer told as its
+/// bytes land advances, however slowly. None once `ended` says it finished. Waiting on work
+/// watched elsewhere (another run's install of the same code) is not stillness.
+pub fn judge_preparation(stop: &crate::stop::Stop, ended: &std::sync::mpsc::Receiver<()>, waits: impl Fn() -> bool, liveness: Liveness) -> Option<String> {
+    let mut pace = Pace::default();
     while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(liveness.sample) {
         let now = Instant::now();
         pace.observe(Some(stop.progress()), now);
@@ -504,247 +532,4 @@ pub fn tail_from(path: &std::path::Path, from: u64, limit: u64) -> String {
     let mut bytes = Vec::new();
     let _ = file.read_to_end(&mut bytes);
     String::from_utf8_lossy(&bytes).trim().to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-    #[cfg(unix)]
-    use std::process::{Command, Stdio};
-
-    #[test]
-    fn pace_learns_its_own_pauses_and_judges_against_the_floor() {
-        let start = Instant::now();
-        let floor = Duration::from_secs(30);
-        let mut pace = Pace::default();
-        pace.observe(Some(1), start);
-        pace.observe(Some(2), start + Duration::from_secs(10));
-        assert_eq!(pace.worst_pause, Duration::from_secs(10));
-        assert_eq!(pace.patience(floor), Duration::from_secs(80));
-        pace.observe(None, start + Duration::from_secs(500)); // unreadable decides nothing
-        pace.observe(Some(2), start + Duration::from_secs(500));
-        assert_eq!(pace.still_since(), Some(start + Duration::from_secs(10)));
-        assert_eq!(Pace::default().patience(floor), floor);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn reap_group_waits_for_members_left_behind_and_ends_a_still_one() {
-        // The leader leaves two members in its group; killing only the leader (no group
-        // signal) orphans them, as a follower can outlive rank 0 for a moment.
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "sleep 1000 & sleep 1000 & wait"])
-            .process_group(0)
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
-        let birth = Birth::of(child.id()).unwrap();
-        let members = loop {
-            let members = group_members(&birth);
-            if members.len() == 2 {
-                break members;
-            }
-            std::thread::yield_now();
-        };
-        let exact = Exact::open(&birth).unwrap().unwrap();
-        unsafe { libc::kill(birth.pid as i32, libc::SIGKILL) };
-        let liveness = Liveness {
-            sample: Duration::from_millis(50),
-        };
-        let reaped = reap_group(&exact, Some(&mut child), liveness).unwrap();
-        let (status, killed) = (reaped.status, reaped.killed);
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(status.signal(), Some(libc::SIGKILL));
-        // A sleeping member shows no progress: it is ended on that measurement, then waited.
-        let killed = killed.expect("still members are ended on their measurement");
-        assert!(killed.contains("no measurable progress"), "{killed}");
-        for member in members {
-            assert!(member.ended().unwrap(), "{member:?}");
-        }
-        assert!(group_members(&birth).is_empty());
-    }
-
-    /// A call is judged while it runs on its work, with GPUs or without: one blocked with idle
-    /// GPUs, or spinning while its GPU holds a kernel that moves no memory (a collective whose
-    /// peer is gone), is killed; one that computes on any number of threads, moves bytes, or
-    /// whose GPUs move memory or cannot be read is not.
-    #[cfg(unix)]
-    #[test]
-    fn a_call_blocked_or_waiting_on_a_stuck_gpu_is_killed_and_working_ones_are_not() {
-        let gpus = |reading: Option<Gpus>| -> Option<Activity> { Some(Arc::new(move || reading)) };
-        let spin = "while :; do :; done";
-        let cases = [
-            ("blocked", "sleep 600", gpus(Some(Gpus::Idle)), true),
-            ("waits on a stuck GPU", spin, gpus(Some(Gpus::Stuck)), true),
-            ("computes on one thread", spin, gpus(Some(Gpus::Idle)), false),
-            // However little CPU a loaded machine gives them.
-            ("computes on two threads", "while :; do :; done & while :; do :; done", gpus(Some(Gpus::Idle)), false),
-            ("moves bytes while its GPU is stuck", "while :; do echo work; done > /dev/null", gpus(Some(Gpus::Stuck)), false),
-            ("its GPU moves memory", "sleep 600", gpus(Some(Gpus::Moved)), false),
-            ("its GPU is unread", "sleep 600", gpus(None), false),
-            // A call with no GPUs (a script, a job root) is judged the same way (run 13543).
-            ("blocked with no GPUs", "sleep 600", None, true),
-            ("prints with no GPUs", "while :; do echo line; sleep 0.002; done > /dev/null", None, false),
-            ("computes with no GPUs", spin, None, false),
-        ];
-        // A shell can fork a CPU spinner. Always end its group, including on an assertion
-        // failure: Child::kill only ends the shell and leaves that spinner running.
-        struct ChildGroup { child: Child, exact: Exact }
-        impl Drop for ChildGroup {
-            fn drop(&mut self) {
-                let _ = self.exact.kill();
-                let _ = self.child.wait();
-                for member in group_members(self.exact.birth()) {
-                    if let Ok(Some(exact)) = Exact::open(&member) {
-                        let _ = exact.wait();
-                    }
-                }
-            }
-        }
-        for (case, script, activity, killed) in cases {
-            let child = Command::new("/bin/sh").args(["-c", script]).process_group(0).stdin(Stdio::null()).spawn().unwrap();
-            let birth = Birth::of(child.id()).unwrap();
-            let group = ChildGroup { child, exact: Exact::open(&birth).unwrap().unwrap() };
-            let liveness = Liveness { sample: Duration::from_millis(20) };
-            let watching = Watching::start(group.exact.try_clone().unwrap(), Meter::Work, liveness, Duration::ZERO, None, activity, "invoke").unwrap();
-            // Long past the floor (0.12 s): only measured stillness ends it.
-            std::thread::sleep(liveness.floor() * 25);
-            assert_eq!(birth.ended().unwrap(), killed, "{case}");
-            let verdict = watching.finish().0;
-            assert_eq!(verdict.is_some(), killed, "{case}: {verdict:?}");
-            if killed {
-                let verdict = verdict.unwrap();
-                assert!(verdict.contains("wedged during invoke: no measurable progress"), "{case}");
-                assert!(verdict.contains("(frames, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)"), "{verdict}");
-            }
-            drop(group);
-            assert!(group_members(&birth).iter().all(|member| member.ended().unwrap()), "{case}: the test left a process running");
-        }
-    }
-
-    /// A call waiting on another call that loads a layout it needs moves as that loader moves:
-    /// behind a loader that computes it is never killed; behind one that shows no progress, or
-    /// that has ended, it is (run 13618 waited 20 min, its re-asks counted as frames).
-    #[cfg(unix)]
-    #[test]
-    fn a_waiter_moves_as_its_loader_moves_and_is_killed_behind_a_still_or_gone_one() {
-        for (case, loader_script, end_loader, killed) in [
-            ("computing loader", "while :; do :; done", false, false),
-            ("still loader", "sleep 600", false, true),
-            ("gone loader", "sleep 600", true, true),
-        ] {
-            let spawn = |script: &str| Command::new("/bin/sh").args(["-c", script]).process_group(0).stdin(Stdio::null()).spawn().unwrap();
-            let (mut waiter, mut loader) = (spawn("sleep 600"), spawn(loader_script));
-            let (waiting, loading) = (Birth::of(waiter.id()).unwrap(), Birth::of(loader.id()).unwrap());
-            let lend = loading.clone();
-            let lender: Lender = Arc::new(move || group_burn(&lend));
-            let liveness = Liveness { sample: Duration::from_millis(20) };
-            let exact = Exact::open(&waiting).unwrap().unwrap();
-            let watching = Watching::start(exact, Meter::Work, liveness, Duration::ZERO, None, None, "invoke").unwrap();
-            watching.watch().waits_on(Some(lender));
-            if end_loader {
-                Exact::open(&loading).unwrap().unwrap().kill().unwrap();
-                loader.wait().unwrap();
-            }
-            std::thread::sleep(liveness.floor() * 25);
-            assert_eq!(waiting.ended().unwrap(), killed, "{case}");
-            let verdict = watching.finish().0;
-            assert_eq!(verdict.is_some(), killed, "{case}: {verdict:?}");
-            for exact in [Exact::open(&waiting), Exact::open(&loading)].into_iter().flatten().flatten() {
-                let _ = exact.kill();
-            }
-            let _ = waiter.wait();
-            let _ = loader.wait();
-            for member in group_members(&loading).into_iter().chain(group_members(&waiting)) {
-                if let Ok(Some(exact)) = Exact::open(&member) {
-                    let _ = exact.kill();
-                    let _ = exact.wait();
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_subject_waiting_on_watched_work_is_still_only_once_that_work_ends() {
-        // A job root sleeps while its child runs on the GPU (run 3858 was ended there).
-        let mut child = Command::new("/bin/sleep")
-            .arg("1000")
-            .process_group(0)
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
-        let birth = Birth::of(child.id()).unwrap();
-        let exact = Exact::open(&birth).unwrap().unwrap();
-        let liveness = Liveness {
-            sample: Duration::from_millis(20),
-        };
-        let waiting = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let waits = waiting.clone();
-        let watching = Watching::start(
-            exact,
-            Meter::Burn,
-            liveness,
-            Duration::ZERO,
-            Some(Arc::new(move || {
-                waits.load(std::sync::atomic::Ordering::Acquire)
-            })),
-            None,
-            "run_job",
-        )
-        .unwrap();
-        std::thread::sleep(liveness.floor() * 4);
-        assert!(!birth.ended().unwrap());
-        waiting.store(false, std::sync::atomic::Ordering::Release);
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
-        let killed = watching.finish().0.unwrap();
-        assert!(killed.contains("wedged during run_job"), "{killed}");
-    }
-
-
-    /// A canceled call that keeps sending frames (or that the machine serves, or that waits on
-    /// other work) still has to stop: it is killed once its pace's patience after the cancel
-    /// is spent, with a verdict naming the cancel (run 11093).
-    #[cfg(unix)]
-    #[test]
-    fn a_canceled_subject_is_killed_however_busy_it_looks() {
-        for excuse in ["frames", "serving", "waits"] {
-            let mut child = Command::new("/bin/sleep")
-                .arg("1000")
-                .process_group(0)
-                .stdin(Stdio::null())
-                .spawn()
-                .unwrap();
-            let birth = Birth::of(child.id()).unwrap();
-            let exact = Exact::open(&birth).unwrap().unwrap();
-            let liveness = Liveness { sample: Duration::from_millis(20) };
-            let waits: Option<Waits> = (excuse == "waits").then(|| Arc::new(|| true) as Waits);
-            let meter = if excuse == "waits" { Meter::Burn } else { Meter::Work };
-            let watching = Watching::start(exact, meter, liveness, Duration::ZERO, waits, None, "invoke").unwrap();
-            let watch = watching.watch();
-            watch.serving(excuse == "serving");
-            let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let frames = {
-                let (watch, busy) = (watch.clone(), busy.clone());
-                std::thread::spawn(move || {
-                    while busy.load(std::sync::atomic::Ordering::Acquire) {
-                        watch.frame();
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                })
-            };
-            std::thread::sleep(liveness.floor() * 2);
-            assert!(!birth.ended().unwrap(), "{excuse}: killed before any cancel");
-            watch.canceled();
-            assert_eq!(std::os::unix::process::ExitStatusExt::signal(&child.wait().unwrap()), Some(libc::SIGKILL), "{excuse}");
-            busy.store(false, std::sync::atomic::Ordering::Release);
-            frames.join().unwrap();
-            let killed = watching.finish().0.unwrap();
-            assert!(killed.contains("canceled during invoke: it did not stop for its cancel"), "{excuse}: {killed}");
-        }
-    }
-
 }

@@ -1,6 +1,7 @@
 //! Windows: named pipes, byte mode, opened overlapped so a read on one clone never waits behind a
 //! write on another (a synchronous pipe handle serializes them). Only this user may open them,
 //! and never from another computer. A path names its pipe by the hash of its text.
+#![allow(unsafe_code)]
 use crate::{Error, Result, process::Exact};
 use sha2::{Digest, Sha256};
 use std::{

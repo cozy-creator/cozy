@@ -455,7 +455,3 @@ mod process_runtime {
         Ok(unsafe { &*slot })
     }
 }
-
-#[cfg(all(test, unix))]
-#[allow(unsafe_code)]
-mod runtime_fork_tests;

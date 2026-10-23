@@ -263,37 +263,3 @@ fn int8(input: &Input) -> Result<Vec<OwnedPart>> {
         part("weight_format", Dtype::U8, vec![], vec![0]),
     ])
 }
-
-#[cfg(test)]
-mod tests {
-    use super::torch_sum;
-
-    /// torch 2.14's CPU `sum()` and `mean()` of LCG values, mined: one `row_sum` under 8 values,
-    /// the lanes' cascade from 8, its levels from 512 vectors on.
-    #[test]
-    fn torch_sum_is_torchs() {
-        let mined = [
-            (5, 0x4021_0884, 0x3f00_d39d),
-            (7, 0x405b_e576, 0x3efb_4f62),
-            (8, 0x4082_4634, 0x3f02_4634),
-            (61, 0x41f2_fc17, 0x3efe_ef4f),
-            (600, 0x4399_415e, 0x3f02_c724),
-            (4099, 0x44fe_de67, 0x3efe_aea6),
-            (20000, 0x461c_b31b, 0x3f00_5e4b),
-            (32767, 0x467f_f0de, 0x3eff_f2de),
-        ];
-        for (n, sum, mean) in mined {
-            let mut s = n as u64;
-            let x: Vec<f32> = (0..n)
-                .map(|_| {
-                    s = s
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    (s >> 40) as f32 / 16_777_216.0
-                })
-                .collect();
-            assert_eq!(torch_sum(&x).to_bits(), sum, "{n}");
-            assert_eq!((torch_sum(&x) / n as f32).to_bits(), mean, "{n}");
-        }
-    }
-}

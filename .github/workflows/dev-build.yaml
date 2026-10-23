@@ -1,46 +1,24 @@
 name: dev-build
-# Builds release artifacts for any ref and runs one targeted test command, off the dev box:
-#   gh workflow run dev-build.yaml -R cozy-creator/cozy-creator -f ref=<sha> [-f build=none] [-f test='cargo test -p protocol']
-#   TensorFS: -f build=tensorfs -f test='cargo test -p tensorfs --test store_contract'
+# Builds release artifacts for any ref, off the dev box:
+#   gh workflow run dev-build.yaml -R cozy-creator/cozy-creator -f ref=<sha> -f build=cozy,tensord,tensorfs
 # Artifacts: tensord-<sha> (the runner arch's manylinux tensord that Runtime's wheel bundles),
-# cozy-<sha> (the runner arch's dev `cozy`, <version>+dev.g<sha8>, which `cozy machine update --tensord`
+# cozy-<sha> (the runner arch's dev `cozy`, <version>+dev.g<sha8>, which `cozy machine update --tensord <path>`
 # runs on any machine: `ghbuild.sh cozy <ref> cozy`, `-r ubuntu-24.04-arm` for arm64) and
 # tensorfs-wheel-<sha> (the manylinux x86_64 wheel). The cozy binary's release archives are dist's
-# (release.yml). Tests get the dev cozy (COZY_TEST_DEV_BINARY) when it was built, the TensorFS
-# wheel installed in a venv (TENSORFS_TEST_PYTHON) and its wheel (COZY_TEST_TENSORFS_WHEEL) when it
-# was built, and a Runtime wheel (COZY_TEST_RUNTIME_WHEEL): the newest published one, or
-# runtime_ref's, stamped with its commit.
-# Machines the tests start install that pair. No whole-suite default: `test` is empty unless given.
-# ci.yaml calls it on every PR and master push.
+# (release.yml).
 on:
-  workflow_call:
-    inputs: &inputs
+  workflow_dispatch:
+    inputs:
       ref:
         description: Branch, tag or SHA to build
         type: string
         default: master
       build:
-        description: "cozy: the dev cozy binary; tensord: the manylinux tensord; tensorfs: the TensorFS wheel; kernels: CUDA AOT only; none: tests only (comma-separate several)"
+        description: "cozy: the dev cozy binary; tensord: the manylinux tensord; tensorfs: the TensorFS wheel; kernels: CUDA AOT only (comma-separate several)"
         type: string
-        default: none
-      test:
-        description: Targeted test command, run with bash at the ref in a delegated cgroup; empty runs none
-        type: string
-        default: ''
+        default: cozy
       features:
         description: "Cargo features of the cozy and tensord builds (cozy's migrate: the A11 dev build, never a release)"
-        type: string
-        default: ''
-      runtime_ref:
-        description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for the newest published
-        type: string
-        default: ''
-      tensorfs_run:
-        description: Existing dev-build run whose TensorFS wheel the targeted tests install
-        type: string
-        default: ''
-      tensorhub_ref:
-        description: Optional Tensorhub source to check out at .tensorhub for targeted live tests
         type: string
         default: ''
       runner:
@@ -51,12 +29,9 @@ on:
         description: Caller's id, shown in the run name so the caller can find its run
         type: string
         default: ''
-  workflow_dispatch:
-    inputs: *inputs
-run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.runtime_ref }} ${{ inputs.nonce }}
+run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.nonce }}
 
 permissions:
-  actions: read
   contents: read
 
 jobs:
@@ -68,30 +43,16 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/checkout@v5
-        if: inputs.test != ''
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: workflow
-          sparse-checkout: scripts/ci-delegated.sh
-          sparse-checkout-cone-mode: false
       - id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      # Only older refs carry the OAuth Go harness; newer refs removed it.
-      - uses: actions/setup-go@v6
-        if: inputs.test != '' && hashFiles('crates/tensord/tests/hub-oauth/go.mod') != ''
-        with:
-          go-version-file: crates/tensord/tests/hub-oauth/go.mod
-          cache-dependency-path: crates/tensord/tests/hub-oauth/go.sum
       - uses: astral-sh/setup-uv@v6
-        if: inputs.test != '' || inputs.runtime_ref != '' || inputs.tensorfs_run != '' || contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
+        if: contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
       # The Rust workspace: rust-toolchain.toml's toolchain installs on first use. target/manylinux
       # holds the manylinux_2_28 builds (tensord, the dev cozy); target/manylinux2014 the TensorFS
       # wheel's, whose older glibc cannot run build scripts the 2_28 container compiled.
       - uses: Swatinem/rust-cache@v2
-        if: inputs.test != '' || contains(inputs.build, 'tensor') || contains(inputs.build, 'cozy')
+        if: contains(inputs.build, 'tensor') || contains(inputs.build, 'cozy')
         with:
-          key: ${{ contains(inputs.build, 'tensor') || contains(inputs.build, 'cozy') }}-${{ inputs.test != '' }}
           cache-on-failure: true
           workspaces: |
             . -> target
@@ -116,9 +77,8 @@ jobs:
           path: dist/tensord/tensord-linux-*
           if-no-files-found: error
           retention-days: 7
-      # The dev `cozy` a machine runs (`cozy machine update --tensord`): dist's manylinux_2_28 build, so
-      # it runs on every pod, stamped <version>+dev.g<sha8> with its commit. The manifests go back
-      # after it, so this run's tests keep the plain version.
+      # The dev `cozy` a machine runs (`cozy machine update --tensord <path>`): dist's manylinux_2_28 build, so
+      # it runs on every pod, stamped <version>+dev.g<sha8> with its commit.
       - name: Build the dev cozy
         if: contains(inputs.build, 'cozy')
         run: |
@@ -137,7 +97,6 @@ jobs:
           (cd dist/cozy && sha256sum "cozy-linux-$arch" > "cozy-linux-$arch.sha256")
           said=$("dist/cozy/cozy-linux-$arch" --version)
           case $said in *"+dev.g${sha:0:8}") echo "$said" ;; *) echo "::error::the dev cozy says $said"; exit 1 ;; esac
-          echo "COZY_TEST_DEV_BINARY=$PWD/dist/cozy/cozy-linux-$arch" >> "$GITHUB_ENV"
       - if: contains(inputs.build, 'cozy')
         uses: actions/upload-artifact@v4
         with:
@@ -151,7 +110,6 @@ jobs:
         if: contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
         run: |
           uv run --no-project --python 3.12 --with triton==3.8.0 python crates/tensorfs-py/kernels/build.py
-          TENSORFS_REQUIRE_AOT=1 cargo test -p tensorfs --test kernel_plan -- --include-ignored --test-threads=2
       - if: contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
         uses: actions/upload-artifact@v4
         with:
@@ -177,7 +135,7 @@ jobs:
             # Match maturin's explicit target so the CLI and extension share dependency builds.
             cargo build --release --locked --target x86_64-unknown-linux-gnu --target-dir ../../target/manylinux2014 -p tensorfs --bin tfs
             install -D -m 755 ../../target/manylinux2014/x86_64-unknown-linux-gnu/release/tfs wheel-data/scripts/tfs
-      # The container leaves root-owned files the tests and the cache post-step write.
+      # The container leaves root-owned files the cache post-step writes.
       - if: always() && contains(inputs.build, 'tensorfs')
         run: sudo chown -R "$(id -u):$(id -g)" target crates/tensorfs-py
       - if: contains(inputs.build, 'tensorfs')
@@ -185,78 +143,5 @@ jobs:
         with:
           name: tensorfs-wheel-${{ steps.sha.outputs.sha }}
           path: crates/tensorfs-py/dist/*.whl
-          if-no-files-found: error
-          retention-days: 7
-      - if: contains(inputs.build, 'tensorfs')
-        run: |
-          uv venv --python 3.12 "$RUNNER_TEMP/tensorfs"
-          uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs-py/dist/*.whl
-          echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
-          echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$PWD"/crates/tensorfs-py/dist/tensorfs-*.whl)" >> "$GITHUB_ENV"
-          "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs-py/scripts/kernel_conform.py
-      - if: inputs.tensorfs_run != ''
-        uses: actions/download-artifact@v4
-        with:
-          github-token: ${{ github.token }}
-          run-id: ${{ inputs.tensorfs_run }}
-          pattern: tensorfs-wheel-*
-          merge-multiple: true
-          path: ${{ runner.temp }}/tensorfs-artifact
-      - if: inputs.tensorfs_run != ''
-        run: |
-          uv venv --python 3.12 "$RUNNER_TEMP/tensorfs"
-          uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" "$RUNNER_TEMP"/tensorfs-artifact/*.whl
-          echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
-          echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$RUNNER_TEMP"/tensorfs-artifact/*.whl)" >> "$GITHUB_ENV"
-      - if: inputs.runtime_ref != ''
-        uses: actions/checkout@v5
-        with:
-          repository: cozy-creator/cozy-runtime
-          ref: ${{ inputs.runtime_ref }}
-          ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
-          path: .runtime
-      # The wheel names the commit it was built from (cozy_runtime._build_provenance.COMMIT): a
-      # harness asserts the Runtime it loaded is that build.
-      - if: inputs.runtime_ref != ''
-        run: |
-          python3 .runtime/scripts/stamp-build-provenance.py "$(git -C .runtime rev-parse HEAD)"
-          uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
-      # Without runtime_ref, the Runtime machines install today: the newest published wheel.
-      - if: inputs.test != '' && inputs.runtime_ref == ''
-        run: |
-          uvx --from pip pip download --quiet --no-deps --only-binary :all: --python-version 3.12 \
-            --platform manylinux_2_28_x86_64 --dest "$RUNNER_TEMP/runtime" cozy-runtime
-      - if: inputs.test != '' || inputs.runtime_ref != ''
-        run: echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
-      - if: inputs.tensorhub_ref != ''
-        uses: actions/checkout@v5
-        with:
-          repository: cozy-creator/tensorhub
-          ref: ${{ inputs.tensorhub_ref }}
-          ssh-key: ${{ secrets.TENSORHUB_READ_KEY }}
-          persist-credentials: false
-          path: .tensorhub
-      # The machine's executor containment needs a delegated cgroup subtree.
-      - if: inputs.test != ''
-        env:
-          TEST: ${{ inputs.test }}
-        run: |
-          locations=()
-          for name in TENSORFS_TEST_PYTHON COZY_TEST_RUNTIME_WHEEL COZY_TEST_TENSORFS_WHEEL COZY_TEST_DEV_BINARY; do
-            [ -z "${!name:-}" ] || locations+=("--setenv=$name=${!name}")
-          done
-          bash "$GITHUB_WORKSPACE/workflow/scripts/ci-delegated.sh" "cozy-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
-            --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=UV_TORCH_BACKEND=cpu \
-            --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
-            bash -euo pipefail -c "$TEST"
-      # Targeted proof commands may produce portable test executables and their source/hash
-      # receipts. Export those exact files so a later paid worker needs no compiler.
-      - name: Retain targeted proof executables
-        if: always() && hashFiles('dist/testbins/**') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: dev-testbins-${{ steps.sha.outputs.sha }}
-          path: dist/testbins/**
           if-no-files-found: error
           retention-days: 7

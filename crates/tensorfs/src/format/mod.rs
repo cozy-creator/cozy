@@ -14,9 +14,10 @@ mod value;
 
 pub use decode::{check, decode, grid::ScaleLayout, PartBytes, SCHEMES};
 pub use doc::{
-    Body, ClassRef, Component, Encoding, Header, Location, Metadata, ObjectRef, Part, Span, Tensor,
+    Body, ClassRef, Component, Encoding, Header, Location, Metadata, ObjectRef, Part, Provenance,
+    Span, Tensor,
 };
-pub use repo::{fnmatch, newest, newest_by, repo_key, tag_name, Repo, Resolution, Tag, Tree, CHUNKS_DIR};
+pub use repo::{fnmatch, newest, newest_by, repo_key, tag_name, Repo, Resolution, Tag, Tree, CHUNKS_DIR, ROOT_ORG};
 #[cfg(feature = "store")]
 pub(crate) use doc::{is_digest, segment};
 #[cfg(feature = "store")]

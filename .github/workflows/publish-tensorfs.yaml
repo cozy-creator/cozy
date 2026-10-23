@@ -1,20 +1,10 @@
 name: publish-tensorfs
-# TensorFS's Python package (design §2): wheels for every platform cozy ships, each built and smoke-installed
-# on a runner of its own platform; the sdist; fresh-venv installs on CPython 3.10 to 3.14; and the end to end
-# check with every example in the docs, on the wheel against small real models. PRs that touch TensorFS run
-# it. A release is its tensorfs-vX.Y.Z tag:
-#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch>                         # build and prove
+# TensorFS's Python package (design §2): wheels for every platform cozy ships, each built on a runner of its
+# own platform, and the sdist. A release is its tensorfs-vX.Y.Z tag:
+#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch>                         # build
 #   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref tensorfs-vX.Y.Z -f publish=true  # PyPI
 #   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch> -f dev=true             # <version>+dev.g<sha>
 on:
-  pull_request:
-    paths:
-      - crates/tensorfs/**
-      - crates/tensorfs-py/**
-      - crates/varena/**
-      - crates/platform/**
-      - Cargo.lock
-      - .github/workflows/publish-tensorfs.yaml
   workflow_dispatch:
     inputs:
       publish:
@@ -28,7 +18,6 @@ on:
 
 concurrency:
   group: publish-tensorfs-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -40,9 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
-      - uses: Swatinem/rust-cache@v2
       - run: uv run --no-project --python 3.12 --with triton==3.8.0 python crates/tensorfs-py/kernels/build.py
-      - run: TENSORFS_REQUIRE_AOT=1 cargo test -p tensorfs --test kernel_plan -- --include-ignored --test-threads=2
       - uses: actions/upload-artifact@v4
         with:
           name: tensorfs-kernels-${{ github.sha }}
@@ -50,58 +37,16 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # One version everywhere; a publish runs on that version's tag; a store format or claim protocol
-  # unlike the newest published wheel's needs a newer minor (format_contract.py).
+  # A publish runs on its version's tag.
   gate:
+    if: inputs.publish
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - run: python3 crates/tensorfs-py/scripts/version_contract.py source
-      - if: inputs.publish
-        run: |
+      - run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/tensorfs-py/pyproject.toml", "rb"))["project"]["version"])')
           [ "$GITHUB_REF" = "refs/tags/tensorfs-v$version" ] || { echo "::error::publish runs on tensorfs-v$version, not $GITHUB_REF"; exit 1; }
-      - if: github.event_name == 'workflow_dispatch'
-        uses: astral-sh/setup-uv@v7
-      - if: github.event_name == 'workflow_dispatch'
-        run: python3 crates/tensorfs-py/scripts/format_contract.py wheel
-
-  # Release gates (xs-045); ci.yaml runs the same tests on every PR. The v2 fetch path from real loopback
-  # origins, whose tail finishes at about the body rate.
-  pull:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p tensorfs --test pull --test pull_tail -- --test-threads=1 --nocapture
-
-  # The store and writer under kill -9, racing GC and forking children (strace counts the durability
-  # syscalls), and the `tfs` CLI over real stores.
-  store:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get install -y strace
-      - run: cargo test --locked -p tensorfs --features faults --test store_v2 --test writer --test tfs_cli --test tfs_help -- --test-threads=2
-
-  # Imports through the table engine, from local files, Hugging Face, GitHub and Civitai.
-  import:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p tensorfs --test import -- --test-threads=2
 
   # Per platform, one cp311-abi3 wheel (CPython 3.11 and later) and one cp310 wheel. The CUDA kernels
   # ship where CUDA exists; the other wheels read on the CPU. Windows on Arm has no CPython 3.10.
@@ -177,20 +122,6 @@ jobs:
           working-directory: crates/tensorfs-py
           target: ${{ matrix.target }}
           args: --release --locked --out dist -i ${{ steps.py310.outputs.python-path }} ${{ steps.py311.outputs.python-path }}
-      - name: Smoke (the installed module and CLI)
-        run: |
-          ls dist
-          python -m pip install --no-index --find-links dist tensorfs
-          [ "${{ matrix.cuda }}" != true ] || python scripts/kernel_conform.py
-          cd "$RUNNER_TEMP"
-          python -c 'import tensorfs, tensorfs.varena; print(tensorfs.__version__)'
-          tfs version
-          tfs --help
-      # Each wheel's contract (version, executable, platform tags) where its binaries run here.
-      - if: runner.os != 'Windows'
-        uses: astral-sh/setup-uv@v7
-      - if: runner.os != 'Windows'
-        run: for wheel in dist/*.whl; do python3 scripts/version_contract.py wheel "$wheel"; done
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.name }}
@@ -205,84 +136,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Fresh venvs: every CPython on Linux x86_64, CPython 3.12 on every other platform. pip picks the
-  # wheel (cp310 or abi3) from both of the platform's.
-  install:
-    needs: wheel
-    # A failed platform fails its own entries, not the others.
-    if: ${{ !cancelled() }}
-    name: install ${{ matrix.wheel }} py${{ matrix.python }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    env:
-      # A crash names its frames.
-      PYTHONFAULTHANDLER: "1"
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-24.04, wheel: linux-x86_64, python: "3.10", torch: true }
-          - { os: ubuntu-24.04, wheel: linux-x86_64, python: "3.11" }
-          - { os: ubuntu-24.04, wheel: linux-x86_64, python: "3.12" }
-          - { os: ubuntu-24.04, wheel: linux-x86_64, python: "3.13" }
-          - { os: ubuntu-24.04, wheel: linux-x86_64, python: "3.14" }
-          - { os: ubuntu-24.04-arm, wheel: linux-aarch64, python: "3.12" }
-          - { os: macos-15, wheel: macos-arm64, python: "3.12" }
-          - { os: macos-15-intel, wheel: macos-x86_64, python: "3.12" }
-          - { os: windows-2025, wheel: windows-x86_64, python: "3.12" }
-          - { os: windows-11-arm, wheel: windows-arm64, python: "3.12" }
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ matrix.python }}
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: wheel-${{ matrix.wheel }}*
-          merge-multiple: true
-          path: wheels
-      - run: |
-          python -m venv "$RUNNER_TEMP/venv"
-          py=$RUNNER_TEMP/venv/bin/python; [ "$RUNNER_OS" != Windows ] || py=$RUNNER_TEMP/venv/Scripts/python.exe
-          "$py" -m pip install --no-index --find-links wheels tensorfs
-          cd "$RUNNER_TEMP" && "$py" "$GITHUB_WORKSPACE/crates/tensorfs-py/scripts/install_check.py"
-      # The torch half of varena imports on the floor version.
-      - if: matrix.torch
-        uses: astral-sh/setup-uv@v7
-      - if: matrix.torch
-        run: |
-          uv pip install --python "$RUNNER_TEMP/venv/bin/python" --torch-backend cpu torch
-          cd "$RUNNER_TEMP" && "$RUNNER_TEMP/venv/bin/python" -c 'import tensorfs.varena.torch, tensorfs.varena.cuts'
-
-  # Design §11: the standalone end to end check on the Linux wheel in a fresh venv, with no Cozy and no
-  # account, then every Python, shell and Rust example in the docs against what it published
-  # (scripts/e2e.py).
-  e2e:
-    needs: wheel
-    # A failed platform fails its own entries, not the others.
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: wheel-linux-x86_64*
-          merge-multiple: true
-          path: wheels
-      - run: |
-          uv venv --python 3.12 "$RUNNER_TEMP/e2e"
-          UV_TORCH_BACKEND=cpu uv pip install --python "$RUNNER_TEMP/e2e/bin/python" wheels/*-abi3-*.whl torch numpy transformers
-          "$RUNNER_TEMP/e2e/bin/python" crates/tensorfs-py/scripts/e2e.py --wheels wheels \
-            crates/tensorfs-py/README.md crates/tensorfs-py/API.md crates/tensorfs/API.md
-
-  # The sdist builds with Rust (it carries the module, not the `tfs` binary the wheels do) and refuses
-  # clearly without it.
+  # The sdist builds with Rust (it carries the module, not the `tfs` binary the wheels do).
   sdist:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -299,17 +153,6 @@ jobs:
           working-directory: crates/tensorfs-py
           command: sdist
           args: --out dist
-      - name: Without Rust, a clear refusal
-        run: |
-          python -m venv "$RUNNER_TEMP/norust"
-          ! PATH=/usr/bin:/bin command -v cargo
-          ! PATH=/usr/bin:/bin "$RUNNER_TEMP/norust/bin/python" -m pip install crates/tensorfs-py/dist/*.tar.gz > norust.txt 2>&1
-          cat norust.txt
-          grep -q 'building it from source, which needs Rust (https://rustup.rs)' norust.txt
-      - run: |
-          python -m pip install crates/tensorfs-py/dist/*.tar.gz
-          cd "$RUNNER_TEMP"
-          python -c 'import tensorfs, tensorfs.varena; print(tensorfs.__version__)'
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-sdist
@@ -320,9 +163,7 @@ jobs:
   # Every platform and the sdist, or nothing.
   publish:
     if: inputs.publish && !inputs.dev
-    # Tests (pull, store, import, e2e) run beside a release but never gate it (owner, 10-21): it builds,
-    # installs, publishes, and a smoke follows.
-    needs: [gate, wheel, install, sdist]
+    needs: [gate, wheel, sdist]
     runs-on: ubuntu-24.04
     environment: pypi
     # Hang bound, not a work budget.

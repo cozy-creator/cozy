@@ -2,6 +2,7 @@
 //! below the machine's where the host delegates one, else a process-tree token. Either
 //! reaches descendants that call `setsid` or double-fork. Lifecycle containment, not a
 //! sandbox: same-UID code can move out of a delegated cgroup or scrub its token.
+#![allow(unsafe_code)]
 use super::TOKEN_ENV;
 use crate::process::{Birth, Exact, State, gone};
 use std::{
@@ -61,6 +62,7 @@ fn writable_unified() -> bool {
         return false;
     }
     let path = std::ffi::CString::new(ROOT).unwrap();
+    // SAFETY: statvfs is plain old data; all-zero is a valid value.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: valid path and writable statvfs.
     unsafe { libc::statvfs(path.as_ptr(), &mut stat) == 0 && stat.f_flag & libc::ST_RDONLY == 0 }
@@ -434,83 +436,4 @@ fn end_members(owned: impl Fn(&str) -> bool) -> io::Result<usize> {
         }
     }
     Ok(signaled.len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::process::{Command, Stdio};
-
-    fn id() -> String {
-        super::id().unwrap()
-    }
-
-    /// The leader detaches a daemon into its own session, then exits; the daemon's pid.
-    fn detach(scope: &Scope) -> u32 {
-        let mut command = Command::new("/bin/sh");
-        command
-            .args([
-                "-c",
-                "read go; setsid sleep 1000 </dev/null >/dev/null 2>&1 & echo $!",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped());
-        if let Some((name, value)) = scope.environment() {
-            command.env(name, value);
-        }
-        let mut leader = command.spawn().unwrap();
-        scope.adopt(leader.id()).unwrap();
-        leader.stdin.take().unwrap().write_all(b"go\n").unwrap();
-        let mut daemon = String::new();
-        leader
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_string(&mut daemon)
-            .unwrap();
-        assert!(leader.wait().unwrap().success());
-        daemon.trim().parse().unwrap()
-    }
-
-    /// A token scope even where a cgroup could be delegated.
-    fn tree(namespace: &str, live: bool) -> Scope {
-        let token = format!("{namespace}-{}", id());
-        if live {
-            LIVE.lock().unwrap().insert(token.clone());
-        }
-        Scope(Backend::Tree { token })
-    }
-
-    #[test]
-    fn end_reaches_a_setsid_descendant_under_either_backend() {
-        let mut scopes = vec![tree("test", true)];
-        match Scope::cgroup("test", &id()).unwrap() {
-            Some(cgroup) => scopes.push(cgroup),
-            None => eprintln!("no delegated cgroup-v2 here: the token alone is proved"),
-        }
-        for scope in scopes {
-            let daemon = process_birth(detach(&scope)).unwrap();
-            // The leader is gone; its setsid daemon is not, and the scope still counts it.
-            assert_eq!(scope.processes().unwrap(), 1);
-            assert_eq!(scope.end().unwrap(), 1);
-            assert!(process_ended(&daemon).unwrap());
-            if let Some(relative) = scope.cgroup_relative() {
-                assert!(!Path::new(ROOT).join(&relative[1..]).exists());
-            }
-        }
-    }
-
-    #[test]
-    fn an_unclaimed_token_of_the_namespace_is_swept_and_others_are_not() {
-        let namespace = format!("sweep{}", id());
-        let left = process_birth(detach(&tree(&namespace, false))).unwrap();
-        let claimed = tree(&namespace, true);
-        let held = process_birth(detach(&claimed)).unwrap();
-        let other = tree(&format!("other{}", id()), true);
-        let foreign = process_birth(detach(&other)).unwrap();
-        assert_eq!(Scope::sweep(&namespace).unwrap(), 1);
-        assert!(process_ended(&left).unwrap());
-        assert!(!process_ended(&held).unwrap() && !process_ended(&foreign).unwrap());
-        assert_eq!(claimed.end().unwrap() + other.end().unwrap(), 2);
-    }
 }

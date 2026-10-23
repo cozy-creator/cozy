@@ -43,7 +43,7 @@ use crate::format::{
 use crate::import;
 use crate::store::retention::{self, Hold};
 use crate::sha256::{hex, Sha256};
-use crate::store::{fail, fault, is_name, sync_dir, Admission, Checkpoint, Error, Result, Store};
+use crate::store::{fail, is_name, sync_dir, Admission, Checkpoint, Error, Result, Store};
 
 const SPOOL: &str = "spool";
 const JOURNAL: &str = "journal";
@@ -583,6 +583,8 @@ impl Writer {
             .map(|c| c.expect("every chunk is laid"))
             .collect();
         let mut metadata = (self.base.as_ref()).map_or_else(Metadata::new, |b| b.header().metadata.clone());
+        // What wrote the base did not write this one.
+        metadata.remove(crate::format::Provenance::KEY);
         metadata.extend(self.metadata.clone());
         let pipeline = self.pipeline.clone().or_else(|| self.base.as_ref()?.pipeline().cloned());
         let header = Header::new(chunks, pipeline, components, metadata)?;
@@ -746,7 +748,6 @@ impl Writer {
                 Err(e) => break Err(e),
             }
             left -= n;
-            fault::point("writer.grid");
         };
         self.buffer = buffer;
         laid.map(|()| objects)
@@ -975,7 +976,6 @@ impl Writer {
             .map_err(fail("write", path))?;
         self.pending.clear();
         self.unflushed = 0;
-        fault::point("writer.journaled");
         Ok(())
     }
 

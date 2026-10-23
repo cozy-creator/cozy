@@ -1,4 +1,5 @@
 //! Windows: the global memory status, and a process's private commit.
+#![allow(unsafe_code)]
 use super::{HostMemory, ProcessMemory};
 use std::{io, mem};
 use windows_sys::Win32::{

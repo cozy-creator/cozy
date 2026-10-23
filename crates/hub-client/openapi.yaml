@@ -1016,11 +1016,14 @@ paths:
     post:
       operationId: place_rental
       tags: [rentals]
-      summary: The products that hold one run of a package function, cheapest expected rental first.
+      summary: The machines that hold one run of a package function, the pick first.
       description: |
-        Sizes the function's model slots as the machine loads them at the run's bits (each slot's default
-        release, its first published lane in the bit order) and keeps the products whose card holds the
-        weights in three quarters of its memory, at the asked GPU count (one by default). Nothing is bought.
+        Sizes the function's model slots on each card as its machine selects them (the selection rule for the
+        card's compute capability; the run's bits filter the main model) and keeps the products whose card holds
+        the weights in three quarters of its memory and serves the main model's narrowest lane, at the asked GPU
+        count, else one and every sequence-parallel degree the function declares. Each machine's speed comes from
+        its card's spec sheet; its cost per run is its expected total over its speed. The pick is the cheapest
+        per run of the machines fast enough, else the fastest (design/placement.md). Nothing is bought.
       security: []
       requestBody:
         required: true
@@ -2177,6 +2180,18 @@ components:
         assessment: {$ref: '#/components/schemas/CheckpointAssessment'}
         objects: {type: integer, format: int64}
         bytes: {type: integer, format: int64}
+        provenance: {$ref: '#/components/schemas/ModelLaneProvenance'}
+    ModelLaneProvenance:
+      type: object
+      description: "The recipe that wrote the lane: its header's `metadata.provenance`."
+      required: [package, release, recipe, fingerprint, source, plan]
+      properties:
+        package: {type: string}
+        release: {type: string}
+        recipe: {type: string}
+        fingerprint: {type: string, description: "The digest of the recipe's canonical plan; of a code hook, its identity with the release."}
+        source: {type: string, description: "The header digest of the checkpoint it was written from."}
+        plan: {type: object, additionalProperties: true, description: "The recipe's canonical plan."}
     ModelLaneRetarget:
       type: object
       required: [checkpoint_id]
@@ -2666,7 +2681,7 @@ components:
         accelerator_count: {type: integer, format: int64}
         code:
           type: string
-          description: placement.vram_short, placement.width_unavailable or placement.python_unsupported.
+          description: placement.vram_short, placement.width_unavailable, placement.lane_unsupported, placement.python_unsupported or placement.sku_unavailable.
         reason: {type: string}
     RentalPlacementMachine:
       type: object
@@ -2690,6 +2705,17 @@ components:
         storage_usd_micros_per_hour: {type: integer, format: int64}
         container_disk_gb: {type: integer, format: int64}
         expected_price: {$ref: '#/components/schemas/RentalPriceEstimate'}
+        lane: {type: string, description: The main model's lane family on this card.}
+        weight_bytes: {type: integer, format: int64, description: The weights this card's machine loads.}
+        speed:
+          type: number
+          format: double
+          description: Effective dense TOPS at the lane, from the card's spec sheet (memory GB/s for a decode model).
+        fast: {type: boolean, description: Whether the speed is fast enough to be picked.}
+        run_cost:
+          type: number
+          format: double
+          description: Cost per run against the cheapest machine's (1).
     RentalPlacementRequest:
       type: object
       required: [package, function]
@@ -2697,8 +2723,9 @@ components:
         package: {type: string, description: org/name}
         release: {type: string, description: Absent reads the newest release.}
         function: {type: string}
-        bits: {type: integer, format: int64, enum: [16, 8, 4], description: Absent runs at 8.}
-        gpus: {type: integer, format: int64, minimum: 1, description: Absent asks for one.}
+        bits: {type: integer, format: int64, enum: [16, 8, 4], description: "The main model's lane; absent: the lane rule's own (8 unless a slot declares otherwise)."}
+        gpus: {type: integer, format: int64, minimum: 1, description: Absent asks for one or a degree the function declares.}
+        sku: {type: string, description: "A product to place on (`--on new:<sku>`): only its GPU counts are ranked."}
     RentalPlacementWeights:
       type: object
       required: [slot, bytes]

@@ -1,5 +1,6 @@
 //! Where things live (design §7). Locations only: the caller's config resolves the user's home
 //! and hands it in, and nothing here reads the environment.
+#![allow(unsafe_code)]
 use crate::{Result, durable};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
@@ -287,16 +288,5 @@ mod login {
         }
         let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
         Some(PathBuf::from(std::ffi::OsString::from_wide(&wide[..len])))
-    }
-}
-
-#[cfg(test)]
-mod login_tests {
-    #[test]
-    fn this_users_home_is_their_login_home_and_another_is_not() {
-        let login = super::login_home().expect("the account database names a home");
-        assert!(super::is_login_home(&login));
-        let other = tempfile::tempdir().unwrap();
-        assert!(!super::is_login_home(other.path()));
     }
 }

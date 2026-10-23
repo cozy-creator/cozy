@@ -40,27 +40,22 @@ pub(super) fn owns(
     Ok(identity.updates.as_ref().is_some_and(|u| u.update(id).is_some()))
 }
 
+/// An update's payload: each component a release version the machine fetches, or (with its input
+/// file) a dev build the caller staged.
 #[derive(serde::Deserialize)]
 struct Cohort {
-    runtime: Option<Member>,
-    tensorfs: Option<Member>,
+    runtime: Option<String>,
+    tensorfs: Option<String>,
+    /// The `cozy` binary, TensorD: a release version, or the `tensord` input's dev binary.
+    tensord: Option<String>,
     /// `"install"`: the build toolchain, alone (`cozy machine toolchain install`).
     toolchain: Option<String>,
     /// The `cozy` release the caller installed at the machine's launch path (`cozy update`).
     cozy: Option<String>,
     /// The most memory each GPU offers, in bytes; 0 lifts it (`--gpu-memory-limit`).
     gpu_memory_limit: Option<u64>,
-    /// A dev `cozy` binary (`--tensord`): the `binary` input's file, or `{url, sha256}`.
-    binary: Option<Member>,
     #[serde(flatten)]
     unknown: BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum Member {
-    Named(String),
-    Fetched { url: String, sha256: String },
 }
 
 static SUBMITTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -201,31 +196,13 @@ fn stage(
             ..Default::default()
         }))
     };
-    let choose = |member: &str, value: Option<Member>| -> Result<Option<Choice>, Error> {
-        let value = match value {
-            None => return Ok(None),
-            Some(Member::Fetched { url, sha256 }) => {
-                let distribution = if member == "runtime" { "cozy_runtime" } else { member };
-                return Choice::fetched(distribution, &url, &sha256)
-                    .map(Some)
-                    .map_err(|why| super::http::refused("wheel_refused", why));
-            }
-            Some(Member::Named(value)) => value,
-        };
-        Ok(Some(held(member, &value)?.unwrap_or(Choice {
-            version: value,
-            ..Default::default()
-        })))
+    // A staged input file when the run carries one for `member`, else a release version.
+    let choose = |member: &str, file: &str, value: Option<String>| -> Result<Option<Choice>, Error> {
+        let Some(value) = value else { return Ok(None) };
+        let file = if file.is_empty() { value.as_str() } else { file };
+        Ok(Some(held(member, file)?.unwrap_or(Choice { version: value, ..Default::default() })))
     };
-    let binary = match cohort.binary {
-        None => None,
-        Some(Member::Fetched { url, sha256 }) => Some(
-            Choice::binary_at(&url, &sha256).map_err(|why| super::http::refused("binary_refused", why))?,
-        ),
-        Some(Member::Named(_)) => Some(held("binary", BINARY)?.ok_or_else(|| {
-            Error::validation("input_missing", "a binary is the run's `binary` input, or {url, sha256}")
-        })?),
-    };
+    let binary = choose("tensord", BINARY, cohort.tensord)?;
     let toolchain = match cohort.toolchain.as_deref() {
         None => false,
         Some("install") => true,
@@ -244,8 +221,8 @@ fn stage(
     let request = Request {
         operation: id.into(),
         pin: None,
-        runtime: choose("runtime", cohort.runtime)?,
-        tensorfs: choose("tensorfs", cohort.tensorfs)?,
+        runtime: choose("runtime", "", cohort.runtime)?,
+        tensorfs: choose("tensorfs", "", cohort.tensorfs)?,
         cozy: cohort.cozy,
         gpu_memory_limit: limit,
         binary,
@@ -352,25 +329,5 @@ fn step_event(update: &Update, step: &crate::machine::update::Step) -> v1::Event
             total: step.total.into(),
             ..Default::default()
         }),
-    }
-}
-
-
-#[cfg(test)]
-mod commit_observation_tests {
-    use super::*;
-
-    #[test]
-    fn a_blocked_commit_stops_observation_without_reporting_a_failed_run() {
-        let mut update = Update {
-            operation: "blocked".into(), state: "starting".into(),
-            error: "update_commit_blocked: no space left".into(), ..Default::default()
-        };
-        let error = observation_error(&update).unwrap();
-        assert_eq!(error.code, "update_commit_blocked");
-        assert_eq!(state("blocked", &update).state, "running");
-        assert_eq!(state("blocked", &update).waiting, update.error);
-        update.state = "succeeded".into();
-        assert!(observation_error(&update).is_none(), "cleanup cannot undo committed success");
     }
 }

@@ -1,6 +1,7 @@
 //! Windows: an executor's scope is a Job Object, which ends every member when it is ended or when
 //! its last handle closes, the machine's death included. No scope outlives its machine, so a new
 //! machine has none of an earlier one's to sweep.
+#![allow(unsafe_code)]
 use crate::{Error, Result};
 use std::{
     io, mem,

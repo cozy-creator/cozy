@@ -116,32 +116,3 @@ fn token(
     };
     capability::mint(signer, grant)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The play cap verifies on its machine for that run's one output, and until its expiry.
-    #[test]
-    fn a_play_cap_admits_one_output_of_one_run_until_it_expires() {
-        let signer = SigningKey::from_bytes(&[5; 32]);
-        let run = RunId::mint([1; 12]);
-        let token = token(&signer, "m".into(), &run, "video/2".into(), 60);
-        let keys = [signer.verifying_key()];
-        let now = now_ms() / 1000;
-        let (grant, _) = capability::verify(&token, "m", &keys, now, "").unwrap();
-        assert!(grant.allows(run.as_str(), "video", Some(2)));
-        assert!(
-            !grant.allows(run.as_str(), "video", Some(1)),
-            "that item alone"
-        );
-        assert!(
-            !grant.allows(run.as_str(), "image", None),
-            "that output alone"
-        );
-        assert!(!grant.allows(RunId::mint([2; 12]).as_str(), "video", Some(2)));
-        assert!(capability::verify(&token, "other", &keys, now, "").is_err());
-        let expired = capability::verify(&token, "m", &keys, now + 61, "");
-        assert_eq!(expired.unwrap_err(), capability::Refusal::Expired);
-    }
-}

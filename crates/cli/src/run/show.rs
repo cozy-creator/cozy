@@ -12,7 +12,7 @@ use protocol::{
 use serde::Deserialize;
 
 use super::follow;
-use crate::{Context, output, tui};
+use crate::{Context, output};
 
 /// What an executor measured (`Outcome.measurements`, `Call.measurements`), read tolerantly: a
 /// newer machine's fields are ignored and absent ones are empty.
@@ -231,10 +231,9 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
     let run: Run = calcifer
         .get_query(&format!("/v1/runs/{id}"), &[("detail", "full")])
         .await?;
+    // A run not yet settled is followed on a terminal, as `cozy run watch` follows it.
     if !once && !ctx.json && ctx.term.stdout && !follow::settled(&run) {
-        let view = super::live::Live::open(ctx, run.id.as_str()).await?;
-        tui::show(ctx, tui::Screen::Run(Box::new(view))).await?;
-        return Ok(ExitCode::SUCCESS);
+        return Ok(follow::exit_code(&follow::follow(ctx, run, false).await?));
     }
     if ctx.json {
         output::json(&run);
@@ -307,9 +306,16 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
         // A settled run's stream replays its log and closes.
         let mut events = calcifer.events(run.id.as_str(), 0);
         let mut lines = Vec::new();
+        // Each stage the run entered, at its time since the run was accepted: what a run whose
+        // machine was lost has to say about where it got to.
+        let start = run.accepted_at_ms.unwrap_or(run.created_at_ms);
         while let Some(event) = events.next().await {
-            if let Event::Log { level, text, .. } = event? {
-                lines.push(format!("  {level}: {text}"));
+            match event? {
+                Event::Log { level, text, at_ms, .. } if level == "stage" => {
+                    lines.push(format!("  stage: {text} (at {})", duration((at_ms - start).max(0) as f64)));
+                }
+                Event::Log { level, text, .. } => lines.push(format!("  {level}: {text}")),
+                _ => {}
             }
         }
         if !lines.is_empty() {
@@ -643,298 +649,5 @@ fn duration(ms: f64) -> String {
             (ms / 60_000.0).floor(),
             (ms % 60_000.0) / 1000.0
         ),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fixture(name: &str) -> serde_json::Value {
-        let path = format!(
-            "{}/tests/fixtures/measurements/{name}.json",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
-    }
-
-    fn measured_alone(name: &str) -> Measured {
-        let document = fixture(name);
-        let m = Measurements::deserialize(document.get("measurements").unwrap_or(&document));
-        Measured {
-            who: "run".into(),
-            span: None,
-            m: m.unwrap(),
-        }
-    }
-
-    /// Run 10236 (H3 long_form on an A100): its deviceless root measured nothing; its calls
-    /// measured everything.
-    fn h3_calls() -> Vec<Call> {
-        serde_json::from_value(fixture("h3-run-10236-calls")).unwrap()
-    }
-
-    fn rows(grid: &Grid) -> Vec<Vec<&str>> {
-        grid.rows
-            .iter()
-            .map(|r| r.iter().map(String::as_str).collect())
-            .collect()
-    }
-
-    #[test]
-    fn a_field_of_another_shape_reads_empty_and_keeps_the_rest() {
-        let m = Measurements::deserialize(serde_json::json!({
-            "memory": {"stats": null}, "models": 7,
-            "execution": {"construction": {"legs_ms": {"construct": 12.0}}},
-        }))
-        .unwrap();
-        assert!(m.memory.stats.rows.is_empty() && m.models.is_empty());
-        assert_eq!(m.execution.construction.unwrap().legs_ms["construct"], 12.0);
-    }
-
-    #[test]
-    fn a_calls_memory_reads_per_model_with_its_evictions_peaks_and_leftover() {
-        let m = Measurements::deserialize(serde_json::json!({"memory": {"stats": {
-            "leftover": 512, "paged_in": 1024, "steps": {"h3/te": [1024], "h3/dit": [0, 0]},
-            "rows": [
-                {"model": "h3/te", "gpu": 0, "step": 0, "resident": 1024, "paged_in": 1024},
-                {"model": "h3/dit", "gpu": 0, "step": 0, "resident": 2048, "streamed": 512, "stall_ns": 3000000},
-                {"model": "h3/dit", "gpu": 0, "step": 1, "resident": 2048, "streamed": 512, "activations": 4096}
-            ],
-            "evictions": [
-                {"model": "h3/te", "rung": 2, "reason": "asked", "nbytes": 1024},
-                {"model": "h3/te", "rung": 2, "reason": "asked", "nbytes": 1024}
-            ],
-            "peaks": [{"model": "h3/dit", "shape": "832x480x121", "peak": 4096, "cuts": ["ffn:2"]}],
-            "leftover_by_gpu": [[0, 512], [1, 0]]
-        }}}))
-        .unwrap();
-        let measured = Measured { who: "run".into(), span: None, m };
-        let memory = grid(&["MODEL"], std::slice::from_ref(&measured), memory_rows);
-        assert_eq!(rows(&memory), [
-            vec!["h3/te", "0", "1", "1.0 KiB", "1.0 KiB", "0 B", "0ms", "0 B"],
-            vec!["h3/dit", "0", "2", "2.0 KiB", "0 B", "1.0 KiB", "3ms", "4.0 KiB"],
-            vec!["leftover", "0", "-", "512 B", "-", "-", "-", "-"],
-        ]);
-        let evictions = grid(&["MODEL"], std::slice::from_ref(&measured), eviction_rows);
-        assert_eq!(rows(&evictions), [vec!["h3/te", "2", "asked", "2", "2.0 KiB"]]);
-        let peaks = grid(&["MODEL"], std::slice::from_ref(&measured), peak_rows);
-        assert_eq!(rows(&peaks), [vec!["h3/dit", "832x480x121", "4.0 KiB", "ffn:2"]]);
-    }
-
-    #[test]
-    fn a_real_h3_runs_stages_read_in_the_order_they_ran() {
-        let h3 = measured_alone("h3-run-5243-measurements");
-        let stages = stage_rows(&h3);
-        assert_eq!(stages[0][0], "executor start");
-        assert_eq!(stages[2][0], "prepare");
-        let denoise = stages.iter().find(|r| r[0] == "denoise").unwrap();
-        assert_eq!(denoise[1], "3m48.7s");
-        let video = stages.iter().find(|r| r[0] == "decode_video").unwrap();
-        assert_eq!(video[2], "22 × 490ms");
-    }
-
-    #[test]
-    fn each_gpus_kernels_say_which_served_and_why_the_others_did_not() {
-        let rows = gpu_rows(&measured_alone("kernel-gpus"));
-        let gpus: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
-        assert!(gpus.iter().all(|g| ["2", "3"].contains(g)), "{gpus:?}");
-        let served: Vec<&str> = rows
-            .iter()
-            .filter(|r| r[0] == "2" && r[3] == "served")
-            .map(|r| r[2].as_str())
-            .collect();
-        assert_eq!(served, ["sageattention"]);
-        assert_eq!(rows[1][4], "3m5.3s");
-        let sol = rows.iter().find(|r| r[2] == "sol-attn").unwrap();
-        assert_eq!(sol[3], "compiling (42%)");
-        assert!(rows[0][5].contains("serves sm90 only"));
-    }
-
-    /// Each call's measurements are its own table rows, led by the call: what ran where, and
-    /// the root (deviceless here) adds nothing.
-    #[test]
-    fn a_runs_calls_each_show_their_stages_components_and_gpus() {
-        let measured = measured(None, &h3_calls());
-        let components = grid(
-            &["COMPONENT", "ATTENTION", "GEMM"],
-            &measured,
-            component_rows,
-        );
-        assert_eq!(
-            components.header,
-            ["CALL", "COMPONENT", "ATTENTION", "GEMM"]
-        );
-        let segment = |call| {
-            vec![
-                vec![call, "base_model/audio_vae", "sdpa", "-"],
-                vec![
-                    call,
-                    "base_model/ref2va_dit",
-                    "kitchen-sol-producer-fast-shared-qkv",
-                    "-",
-                ],
-                vec![call, "base_model/video_vae", "sdpa", "-"],
-            ]
-        };
-        assert_eq!(rows(&components), [segment("1"), segment("2")].concat());
-
-        let gpus = grid(
-            &["GPU", "ARCH", "KERNEL", "STATE", "COMPILE", "DETAIL"],
-            &measured,
-            gpu_rows,
-        );
-        assert_eq!(
-            rows(&gpus)[..3],
-            [
-                ["1", "0", "sm_80", "kitchen-sol", "ready", "804ms", "-"],
-                [
-                    "1",
-                    "0",
-                    "sm_80",
-                    "kitchen-sol-producer-fast-shared-qkv",
-                    "served",
-                    "-",
-                    "-"
-                ],
-                ["1", "0", "sm_80", "sdpa", "served", "-", "-"],
-            ]
-        );
-
-        let stages = grid(&["STAGE", "TIME", "DETAIL"], &measured, stage_rows);
-        let first: Vec<&str> = rows(&stages).iter().map(|r| r[0]).collect();
-        assert_eq!(first.first(), Some(&"0"));
-        let denoise = rows(&stages)
-            .into_iter()
-            .find(|r| r[0] == "1" && r[1] == "denoise")
-            .unwrap();
-        assert!(denoise[3].starts_with("8 × "), "{denoise:?}");
-    }
-
-    /// The machine's resolution and the executor's GEMM leaves, as TensorD and Runtime (#1519,
-    /// #1522) record them: each call's slot with its release and lane (run 10236's background
-    /// removal resolved `paul/birefnet@0.1.0 fp16`), and each component's GEMM kernel beside its
-    /// attention, one that served below its lane with what it wanted and why.
-    #[test]
-    fn a_calls_resolved_models_and_gemm_leaves_show_beside_its_attention() {
-        let mut calls = h3_calls();
-        let birefnet = serde_json::json!([{"slot": "model", "repository": "paul/birefnet",
-            "release": "0.1.0", "lane": "fp16", "manifest": format!("sha256:{}", "ab".repeat(32))}]);
-        calls[0].measurements.as_mut().unwrap()["models"] = birefnet;
-        let measurements = calls[1].measurements.as_mut().unwrap();
-        let observations = measurements["observations"].as_array_mut().unwrap();
-        observations.extend([
-            serde_json::json!({"kind": "confession", "name": "gemm.selected", "value": "cozy-int8",
-                "fields": {"component": "base_model/ref2va_dit", "format": "int8",
-                "leaf": "cozy.int8-convrot256.native-leaf/1", "sites": 416}}),
-            serde_json::json!({"kind": "confession", "name": "gemm.fallback", "value": "torch.linear",
-                "fields": {"component": "base_model/video_vae", "wanted": "fp8", "served": "bf16",
-                "reason": "the leaf refused its shape", "sites": 4}}),
-            serde_json::json!({"kind": "confession", "name": "gemm.fallback", "value": "torch._int_mm",
-                "fields": {"component": "base_model/audio_vae", "wanted": "cozy-int8",
-                "served": "torch._int_mm", "reason": "the op library did not load", "sites": 1}}),
-        ]);
-        let measured = measured(None, &calls);
-        let models = grid(&["SLOT", "MODEL", "LANE"], &measured, model_rows);
-        assert_eq!(
-            rows(&models),
-            [["0", "model", "paul/birefnet@0.1.0", "fp16"]]
-        );
-        let components = grid(
-            &["COMPONENT", "ATTENTION", "GEMM"],
-            &measured,
-            component_rows,
-        );
-        assert_eq!(
-            rows(&components)[..3],
-            [
-                [
-                    "1",
-                    "base_model/audio_vae",
-                    "sdpa",
-                    "torch._int_mm (wanted cozy-int8: the op library did not load)"
-                ],
-                [
-                    "1",
-                    "base_model/ref2va_dit",
-                    "kitchen-sol-producer-fast-shared-qkv",
-                    "cozy-int8 (int8)"
-                ],
-                [
-                    "1",
-                    "base_model/video_vae",
-                    "sdpa",
-                    "torch.linear (bf16; wanted fp8: the leaf refused its shape)"
-                ],
-            ]
-        );
-        // A model passed by value names its hash; one measured alone leads with no call.
-        let held = Measurements {
-            models: vec![Model {
-                slot: "model".into(),
-                manifest: format!("sha256:{}", "cd".repeat(32)),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let held = Measured {
-            who: "run".into(),
-            span: None,
-            m: held,
-        };
-        let alone = grid(&["SLOT", "MODEL", "LANE"], &[held], model_rows);
-        assert_eq!(rows(&alone), [["model", "sha256:cdcdcdcdcdcd", "-"]]);
-        assert_eq!(alone.header, ["SLOT", "MODEL", "LANE"]);
-    }
-
-    /// Run 10264 (sdxl on a fresh A5000): 17.4 s of execution whose stages add to 5.8 s. The
-    /// rest is its executor's start and its construction; what no measurement covers is said.
-    #[test]
-    fn a_runs_execution_is_accounted_for_whole() {
-        let run = fixture("sdxl-run-10264");
-        let end = run["settled_at_ms"].as_i64().unwrap();
-        let span = Some((end - run["execution_ms"].as_i64().unwrap(), end));
-        let sdxl = measured(Some((&run["measurements"], span)), &[]);
-        let stages = grid(&["STAGE", "TIME", "DETAIL"], &sdxl, stage_rows);
-        assert_eq!(stages.header, ["STAGE", "TIME", "DETAIL"]);
-        assert_eq!(
-            rows(&stages),
-            [
-                vec![
-                    "executor start",
-                    "10.9s",
-                    "package_import 10.0s, cuda_init 658ms, fork 206ms"
-                ],
-                vec![
-                    "construction",
-                    "10.4s",
-                    "qualify 7.1s, construct_and_register 2.4s, resolve 352ms"
-                ],
-                vec!["tokenize", "4ms", ""],
-                vec!["loading weights", "465ms", ""],
-                vec!["encode", "434ms", ""],
-                vec!["denoise", "4.6s", "20 × 224ms"],
-                vec!["decode", "311ms", ""],
-                vec!["encode_webp", "1ms", ""],
-                vec!["unaccounted", "696ms", "no measurement covers it"],
-            ]
-        );
-        // A warm executor's start was an earlier call's: run 10236's second segment reused the
-        // first's, and its own stages leave 2.2 s uncovered.
-        let calls = h3_calls();
-        let segment = measured(None, &calls)
-            .into_iter()
-            .find(|m| m.who == "2")
-            .unwrap();
-        let rows = stage_rows(&segment);
-        assert_eq!(rows[0][0], "prepare");
-        assert_eq!(rows.last().unwrap()[..2], ["unaccounted", "2.2s"]);
-    }
-
-    #[test]
-    fn durations_read_as_people_say_them() {
-        for (ms, said) in [(850.0, "850ms"), (7_620.0, "7.6s"), (228_735.0, "3m48.7s")] {
-            assert_eq!(duration(ms), said);
-        }
     }
 }

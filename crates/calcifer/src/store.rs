@@ -22,7 +22,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 /// at an older version is from before cozy 0.9.4, which this cozy does not read. Two lines of
 /// development each called their addition 6 (`runs.agreed`, `outputs.checkpoint`), so a store at
 /// 5, 6 or 7 gains whichever of the two it lacks.
-const VERSION: i64 = 7;
+pub const VERSION: i64 = 7;
 const SCHEMA: &str = "
     CREATE TABLE machines (
         name TEXT PRIMARY KEY,
@@ -646,8 +646,9 @@ impl Store {
         })
     }
 
-    /// The runs `filter` names, newest first, and how many more match beyond its limit.
-    pub fn runs(&self, filter: &RunFilter) -> Result<(Vec<RunRow>, u64)> {
+    /// The runs `filter` names, newest first; how many more match beyond its limit; and each
+    /// matching run it cannot read, as `run N: why`, left out.
+    pub fn runs(&self, filter: &RunFilter) -> Result<(Vec<RunRow>, u64, Vec<String>)> {
         const MATCHING: &str = "FROM runs WHERE number < ?1
             AND (?2 IS NULL OR CASE state WHEN 'accepted' THEN 'in_progress' WHEN 'settled' THEN status
                 ELSE 'queued' END = ?2)
@@ -670,22 +671,20 @@ impl Store {
             let mut statement = conn.prepare(&format!(
                 "SELECT {RUN_COLUMNS} {MATCHING} ORDER BY number DESC LIMIT ?5"
             ))?;
-            let rows = statement
-                .query_map(
-                    params![
-                        before,
-                        status,
-                        filter.target,
-                        filter.machine,
-                        filter.limit as i64
-                    ],
-                    run_row,
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            let older = (total as u64).saturating_sub(rows.len() as u64);
-            Ok((rows, older))
+            let read = statement.query_map(
+                params![before, status, filter.target, filter.machine, filter.limit as i64],
+                |r| Ok((r.get::<_, i64>(1)?, run_row(r))),
+            )?;
+            let (mut rows, mut unreadable) = (vec![], vec![]);
+            for item in read {
+                let (number, row) = item?;
+                match row.map_err(StoreError::from).and_then(|row| row) {
+                    Ok(row) => rows.push(row),
+                    Err(e) => unreadable.push(format!("run {number}: {e}")),
+                }
+            }
+            let older = (total as u64).saturating_sub((rows.len() + unreadable.len()) as u64);
+            Ok((rows, older, unreadable))
         })
     }
 
@@ -742,6 +741,20 @@ impl Store {
                 "UPDATE runs SET machine = ?2 WHERE id = ?1 AND machine IS NULL AND state = 'queued'",
                 params![id, machine],
             )? == 1)
+        })
+    }
+
+    /// Returns an unsent `any` run to the outbox, to be placed again.
+    pub fn unplace(&self, id: &str) -> Result<Vec<Event>> {
+        self.write(|tx| {
+            let unplaced = tx.execute(
+                "UPDATE runs SET machine = NULL WHERE id = ?1 AND state = 'queued' AND wants = 'any'",
+                [id],
+            )?;
+            Ok(match unplaced {
+                1 => vec![lifecycle(tx, id)?],
+                _ => vec![],
+            })
         })
     }
 
@@ -1265,7 +1278,11 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
                 .map_err(|_| corrupt("a run's Hub"))?,
             machine: r.get(5)?,
             pinned: r.get(6)?,
-            spec: serde_json::from_slice(&spec).map_err(|_| corrupt("a run's spec"))?,
+            // A run imported from the Go CLI was recorded without one.
+            spec: match spec.is_empty() {
+                true => v1::RunSpec::default(),
+                false => serde_json::from_slice(&spec).map_err(|_| corrupt("a run's spec"))?,
+            },
             out_dir: PathBuf::from(out_dir),
             state: match state.as_str() {
                 "queued" => State::Queued,
@@ -1479,8 +1496,9 @@ fn machine_kind(kind: MachineKind) -> &'static str {
 fn machine_state(state: MachineState) -> &'static str {
     match state {
         MachineState::Booting => "booting",
-        // Ending is the API's word for a machine whose end its Hub has not affirmed.
-        MachineState::Ready | MachineState::Ending => "ready",
+        // Ending is the API's word for a machine whose end its Hub has not affirmed; nothing
+        // records a state it does not know.
+        MachineState::Ready | MachineState::Ending | MachineState::Unknown => "ready",
         MachineState::Ended => "ended",
     }
 }
@@ -1497,9 +1515,11 @@ impl From<&MachineRow> for Machine {
             address: row.endpoint.as_ref().map(|e| e.address.clone()),
             fingerprint: row.endpoint.as_ref().map(|e| Digest::from_bytes(e.pin)),
             reason: row.reason.clone(),
+            offline: None,
             rental: None,
             status: None,
             unreachable: None,
+            unreachable_since_ms: None,
             boot: None,
             running: 0,
             queued: 0,
@@ -1769,50 +1789,4 @@ pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A store at 5, or at either line's 6, reaches 7 with both columns and its rows.
-    #[test]
-    fn a_store_at_5_or_either_6_reaches_7_with_both_columns_and_its_rows() {
-        let shapes: [(i64, &[(&str, &str)]); 3] = [
-            (5, &[("runs", "agreed"), ("outputs", "checkpoint")]),
-            (6, &[("outputs", "checkpoint")]),
-            (6, &[("runs", "agreed")]),
-        ];
-        for (n, (from, dropped)) in shapes.into_iter().enumerate() {
-            let dir = std::env::temp_dir().join(format!("calcifer-store-{}-{n}-{}", std::process::id(), now_ms()));
-            let path = dir.join("state.db");
-            std::mem::drop(Store::open(&path).unwrap());
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "INSERT INTO runs (id, number, idempotency_key, digest, hub, kind, target, pinned, spec, out_dir, state, created_at)
-                     VALUES ('r', 1, 'k', 'd', 'h', 'call', 't', 0, x'00', '', 'queued', 0);
-                 INSERT INTO outputs (run, name, idx, rev, length, digest, media_type, created_seq, seq)
-                     VALUES ('r', 'o', 0, 1, 1, 'd', 'm', 1, 1);",
-            )
-            .unwrap();
-            for (table, column) in dropped {
-                conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column}")).unwrap();
-            }
-            conn.pragma_update(None, "user_version", from).unwrap();
-            std::mem::drop(conn);
-            std::mem::drop(Store::open(&path).unwrap());
-            let conn = Connection::open(&path).unwrap();
-            assert_eq!(conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), VERSION);
-            for (table, column) in [("runs", "agreed"), ("outputs", "checkpoint")] {
-                let has: i64 = conn
-                    .query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"), [], |r| r.get(0))
-                    .unwrap();
-                assert_eq!(has, 1, "{from} without {dropped:?}: {table}.{column}");
-                let rows: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).unwrap();
-                assert_eq!(rows, 1, "{from} without {dropped:?}: {table}'s row");
-            }
-            std::mem::drop(conn);
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
 }

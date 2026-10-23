@@ -123,14 +123,6 @@ code is still not sandboxed.
 | `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py`, `runtime_describe.py` | Static description and uv generation install (`python -m tensord_client.installer`) |
 | `device_codec.py` | Output encoder, embedded into `device_executor.rs` with `include_str!` |
 
-## Development tools (not proof; see PLAN decision 5)
-
-| Path | Use | Owner |
-|---|---|---|
-| `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
-| `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
-| `scripts/gate/` | Matched ComfyUI vs TensorD gate through ordinary `cozy run` | F |
-
 ## Contracts
 
 Runtime reads and writes weights directly through public TensorFS in the shared store
@@ -149,17 +141,11 @@ the checkpoint reference Runtime reports; failed uploads leave Runtime's local c
 - [Package bridge](PACKAGE-BRIDGE.md): generation description and install.
 - [Device executor](DEVICE-EXECUTOR.md): executor launch and control seam.
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.
-- [Matched gate](../scripts/gate/README.md): ComfyUI vs TensorD, ordinary CLI.
 
-## Build and test
+## Build
 
 ```sh
 export CARGO_TARGET_DIR=~/cozy/.cargo-target/tensord
 L=~/cozy_v2/outputs/cozy-machine-takeover-20261002/locks
 flock $L/rust-build.lock nice -n 19 cargo clippy --all-targets -j 2 -- -D warnings
-flock $L/rust-build.lock nice -n 19 cargo test -j 2 -- --test-threads=2
-nice -n 19 uv run --locked --extra test pytest -q
 ```
-
-The test extra installs cozy-runtime; tests fail without it. Ignored Rust tests need installed SDK
-generations (paths or `TENSORD_CPU_TEST_PYTHON`); run them with `--ignored` on purpose.

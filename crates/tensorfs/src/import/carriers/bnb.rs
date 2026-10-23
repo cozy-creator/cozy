@@ -229,6 +229,7 @@ fn four_bit(
                 start: 0,
                 len: 4,
                 encoded: None,
+                derive: None,
             },
             // bnb wrote the f32 offset as a JSON float, exactly.
             inline: Some((offset as f32).to_le_bytes().to_vec()),
@@ -253,6 +254,7 @@ fn four_bit(
             shape: qs.shape,
             parts,
         })),
+        derive: None,
     };
     Ok((consumed, tensor))
 }

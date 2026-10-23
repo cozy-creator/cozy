@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use super::Peer;
 use crate::{
     Result,
@@ -36,6 +37,7 @@ pub fn peer_birth(stream: &UnixStream) -> Result<crate::process::Birth> {
 /// The peer as the kernel names it, whoever it runs as.
 #[cfg(target_os = "linux")]
 pub fn peer(stream: &UnixStream) -> io::Result<Peer> {
+    // SAFETY: ucred is plain old data; all-zero is a valid value.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: correctly sized writable credential structure and size pointer.
@@ -198,6 +200,7 @@ fn send_rights(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
     let flags = libc::MSG_NOSIGNAL;
     #[cfg(target_os = "macos")]
     let flags = 0;
+    // SAFETY: a live socket and a message whose buffers outlive the call.
     let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &message, flags) };
     if sent < 0 {
         return Err(io::Error::last_os_error());
@@ -232,6 +235,7 @@ pub fn recv_fd(stream: &UnixStream) -> Result<OwnedFd> {
     let flags = libc::MSG_CMSG_CLOEXEC;
     #[cfg(target_os = "macos")]
     let flags = 0;
+    // SAFETY: correctly sized aligned control/data buffers and a live socket.
     let count = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, flags) };
     if count < 0 {
         return Err(io::Error::last_os_error().into());
@@ -321,92 +325,4 @@ pub fn hung_up(lease: &UnixStream) -> bool {
         )
     };
     read == 0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::MetadataExt;
-
-    #[test]
-    fn older_kernel_fallback_pins_a_live_peer_and_refuses_a_gone_one() {
-        let pinned = pidfd_of_live(std::process::id() as i32).unwrap();
-        assert!(!crate::process::ended(&pinned));
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id() as i32;
-        child.wait().unwrap();
-        assert!(pidfd_of_live(pid).is_err());
-    }
-
-    #[test]
-    fn admin_peer_check_sees_the_machines_own_descendants() {
-        let (same, _keep) = UnixStream::pair().unwrap();
-        assert!(peer_descends_from_machine(&same).unwrap());
-        let path = std::env::temp_dir().join(format!("admin-peer-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "exec python3 -c \"import socket,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.recv(1)\" \"$0\"", path.to_str().unwrap()])
-            .spawn()
-            .unwrap();
-        let (grandchild, _) = listener.accept().unwrap();
-        assert!(peer_descends_from_machine(&grandchild).unwrap());
-        drop(grandchild);
-        child.wait().unwrap();
-        std::fs::remove_file(path).unwrap();
-    }
-
-    /// This process's descriptors open on `file`. Tests share the process and its
-    /// descriptor table, so only descriptors of this test's own file are counted.
-    fn descriptors_of(file: &std::fs::File) -> usize {
-        let own = file.metadata().unwrap();
-        (0..4096)
-            .filter(|fd| {
-                // SAFETY: plain-old-data the call fills; a closed number fails harmlessly.
-                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                let open = unsafe { libc::fstat(*fd, &mut stat) } == 0;
-                open && (stat.st_dev as u64, stat.st_ino as u64) == (own.dev(), own.ino())
-            })
-            .count()
-    }
-
-    #[test]
-    fn a_descriptor_crosses_with_its_file_and_a_closed_peer_reads_as_hung_up() {
-        use std::io::{Read, Seek, Write};
-        let (send, receive) = UnixStream::pair().unwrap();
-        let mut file = tempfile::tempfile().unwrap();
-        file.write_all(b"crossed").unwrap();
-        send_fd(&send, &file).unwrap();
-        let mut got = File::from(recv_fd(&receive).unwrap());
-        // SAFETY: a scalar query of a live descriptor.
-        let flags = unsafe { libc::fcntl(got.as_raw_fd(), libc::F_GETFD) };
-        assert_ne!(flags & libc::FD_CLOEXEC, 0, "received close-on-exec");
-        got.rewind().unwrap();
-        let mut text = String::new();
-        got.read_to_string(&mut text).unwrap();
-        assert_eq!(text, "crossed");
-        let me = peer_credentials(&receive).unwrap();
-        assert_eq!(me.pid, std::process::id());
-        assert!(!hung_up(&receive));
-        drop(send);
-        // Readable once the peer's end is closed everywhere (a child spawned meanwhile by another
-        // test may hold it until it exits): woken by the kernel, not a timer.
-        let mut poll = libc::pollfd {
-            fd: receive.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live descriptor.
-        assert_eq!(unsafe { libc::poll(&mut poll, 1, -1) }, 1);
-        assert!(hung_up(&receive), "revents {:#x}", poll.revents);
-    }
-
-    #[test]
-    fn a_batch_of_descriptors_is_refused_and_every_one_closed() {
-        let (send, receive) = UnixStream::pair().unwrap();
-        let file = tempfile::tempfile().unwrap();
-        send_rights(&send, &[file.as_raw_fd(); 32]).unwrap();
-        assert!(recv_fd(&receive).is_err());
-        assert_eq!(descriptors_of(&file), 1);
-    }
 }

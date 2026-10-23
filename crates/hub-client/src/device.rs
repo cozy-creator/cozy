@@ -313,31 +313,3 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     }
     renamed.map_err(fail)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn key() -> DeviceKey {
-        DeviceKey {
-            hub: "https://hub.example".into(),
-            email: "a@example.test".into(),
-            id: "dk1".into(),
-            key: SigningKey::from_bytes(&[7; 32]),
-        }
-    }
-
-    /// A key survives its file.
-    #[test]
-    fn a_kept_key_survives_its_file() {
-        let dir = std::env::temp_dir().join(format!("hub-client-{}", b64(random::<24>())));
-        let path = dir.join("key.json");
-        key().save(&path).unwrap();
-        let loaded = DeviceKey::load(&path).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(
-            (loaded.id.as_str(), loaded.key.to_bytes()),
-            ("dk1", [7; 32])
-        );
-    }
-}

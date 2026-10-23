@@ -3,6 +3,9 @@
 //!
 //! Moved code keeps `io::Result` inside; the two conversions below let a moved body's `?` and a
 //! caller's `?` work across the boundary, an `io::Error` keeping its errno both ways.
+//!
+//! The workspace's FFI lives here: only its boundary files allow `unsafe`.
+#![deny(unsafe_code, clippy::undocumented_unsafe_blocks)]
 use std::{fmt, io, path::PathBuf};
 
 pub mod contain;

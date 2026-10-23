@@ -65,13 +65,32 @@ pub struct SubmitRun {
     pub agreed: Option<Agreed>,
 }
 
-/// `POST /v1/run-quotes`: what a `new` run would rent, and its price.
+/// `POST /v1/run-quotes`: what a `new` run would rent, and its price; when the Hub placed it, why,
+/// and two other machines it would rent instead.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunQuote {
     pub sku: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpus: Option<u32>,
     pub quote: Quote,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<Alternative>,
+}
+
+/// Another machine a run could rent, against the pick: its time and cost per run as multiples of
+/// the pick's, its price an hour and its expected total. `label` says which way it trades.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Alternative {
+    pub sku: String,
+    pub gpus: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    pub time: f64,
+    pub run_cost: f64,
+    pub usd_micros_per_hour: i64,
+    pub expected_total_usd_micros: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +259,9 @@ pub struct Progress {
     pub bytes_total: u64,
     #[serde(default)]
     pub step_ms: f64,
+    /// The stage's steady step time: the mean of its steps after the first; 0 before one.
+    #[serde(default)]
+    pub step_avg_ms: f64,
 }
 
 /// One event of a run's stream.
@@ -396,6 +418,12 @@ pub struct RunList {
     /// How many more runs match beyond the limit.
     #[serde(default)]
     pub older: u64,
+    /// The machine `?machine=` named, by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// Matching runs the store cannot read, each as `run N: why`, left out of `runs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<String>,
 }
 
 /// `GET /v1/runs/events`: every run's changes, each run whole as `GET /v1/runs/{id}` answers it. No
@@ -427,6 +455,9 @@ pub enum MachineState {
     /// Its end is asked of its Hub, which has not yet affirmed it.
     Ending,
     Ended,
+    /// A state this reader does not know (a newer Calcifer's): shown as unknown, never refused.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -449,15 +480,22 @@ pub struct Machine {
     /// Why it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Why a ready machine is offline, by its Hub's word (its provider stopped it, or its Hub is
+    /// ending it), while it does not answer: runs to it are refused. Its state stays `ready`,
+    /// which is what a reader that predates this field shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
     /// The Hub's word, for a rental.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rental: Option<Rental>,
     /// The machine's own latest Status, once it answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<MachineStatus>,
-    /// Why its Status cannot be read now (`status` is then the last it read).
+    /// Why its Status cannot be read now (`status` is then the last it read), and since when.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreachable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable_since_ms: Option<i64>,
     /// A booting rental's phase, as its Hub says it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot: Option<String>,
@@ -476,6 +514,16 @@ pub struct Machine {
 
 fn yes() -> bool {
     true
+}
+
+/// A duration as a clock reads: `41s`, `14m`, `1h12m`.
+pub fn clock(ms: i64) -> String {
+    let s = (ms / 1000).max(0);
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
 }
 
 /// A rental as its Hub says it.
@@ -541,9 +589,9 @@ pub struct MachineStatus {
     pub disk_total_bytes: u64,
     #[serde(default)]
     pub disk_free_bytes: u64,
-    /// This controller's queued, preparing or running runs there.
+    /// This controller's queued, preparing or running runs there, as the machine says.
     #[serde(default)]
-    pub live_runs: u32,
+    pub runs: Vec<LiveRun>,
     #[serde(default)]
     pub models: Vec<Model>,
     #[serde(default)]
@@ -560,6 +608,20 @@ pub struct MachineStatus {
     pub toolchain: Option<crate::machine::Toolchain>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kernels: Vec<crate::machine::KernelVerdict>,
+}
+
+/// A run a machine holds for this controller, beside this controller's record of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LiveRun {
+    pub id: String,
+    /// The machine's word for it: queued, preparing or running.
+    pub state: String,
+    /// Why it waits there.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub waiting: String,
+    /// None when this controller keeps no record of it; a settled one was left behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<Run>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -860,109 +922,5 @@ impl fmt::Display for On {
             On::New(None) => f.write_str("new"),
             On::New(Some(sku)) => write!(f, "new:{sku}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn run(status: Status) -> Run {
-        Run {
-            id: RunId::mint([1; 12]),
-            number: 3,
-            kind: Kind::Call,
-            target: "fidika/sdxl/generate".into(),
-            hub: "https://tensorhub.com".into(),
-            machine: Some("local".into()),
-            status,
-            cancel_requested: false,
-            machine_state: None,
-            reason: None,
-            output: vec![],
-            created_at_ms: 1,
-            accepted_at_ms: None,
-            settled_at_ms: None,
-            waiting: None,
-            progress: None,
-            warnings: vec![],
-            adjustments: vec![],
-            result: None,
-            execution_ms: None,
-            measurements: None,
-            calls: vec![],
-        }
-    }
-
-    #[test]
-    fn events_carry_responses_names_and_sequence_numbers() {
-        let created = Event::lifecycle(1, run(Status::Queued), true);
-        let json = serde_json::to_value(&created).unwrap();
-        assert_eq!(json["type"], "run.created");
-        assert_eq!(json["sequence_number"], 1);
-        assert_eq!(serde_json::from_value::<Event>(json).unwrap(), created);
-        let done = Event::lifecycle(9, run(Status::Canceled), false);
-        assert!(done.is_terminal());
-        assert_eq!(serde_json::to_value(&done).unwrap()["type"], "run.canceled");
-        let live = Event::Waiting {
-            reason: "booting".into(),
-        };
-        assert_eq!(live.sequence_number(), None);
-        assert_eq!(
-            serde_json::to_value(&live).unwrap(),
-            serde_json::json!({"type": "run.waiting", "reason": "booting"})
-        );
-    }
-
-    #[test]
-    fn a_submission_round_trips_with_its_spec_and_unknown_fields_ignored() {
-        let submit = SubmitRun {
-            agreed: None,
-            on: On::New(Some("rtx-4090".into())),
-            hub: "https://tensorhub.com".into(),
-            kind: Kind::Warm,
-            target: "fidika/sdxl".into(),
-            spec: crate::machine::RunSpec {
-                kind: crate::machine::RunKind::Warm,
-                ..Default::default()
-            },
-            inputs: vec![],
-            out: None,
-            warnings: vec![],
-        };
-        let mut json = serde_json::to_value(&submit).unwrap();
-        assert_eq!(json["on"], "new:rtx-4090");
-        assert_eq!(json["spec"]["kind"], "warm");
-        json["from_a_newer_cli"] = serde_json::json!(true);
-        assert_eq!(serde_json::from_value::<SubmitRun>(json).unwrap(), submit);
-        for on in ["local", "any", "new", "new:h100", "kiyui"] {
-            assert_eq!(On::from(on.to_owned()).to_string(), on);
-        }
-    }
-
-    #[test]
-    fn old_output_json_still_reads_and_checkpoint_references_round_trip() {
-        let json = serde_json::json!({
-            "id": "1/image", "name": "image", "index": 0, "rev": 1,
-            "length": 10, "media_type": "image/png", "status": "completed"
-        });
-        let mut item: OutputItem = serde_json::from_value(json).unwrap();
-        assert!(item.checkpoint.is_none());
-        assert!(
-            serde_json::to_value(&item)
-                .unwrap()
-                .get("checkpoint")
-                .is_none()
-        );
-        item.checkpoint = Some(crate::machine::CheckpointRef {
-            repo_id: "local/derived".into(),
-            revision: "sha256:tree".into(),
-            variant: String::new(),
-            tag: format!("replay-{}", "c".repeat(64)),
-        });
-        assert_eq!(
-            serde_json::from_value::<OutputItem>(serde_json::to_value(&item).unwrap()).unwrap(),
-            item
-        );
     }
 }

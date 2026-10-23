@@ -1,12 +1,13 @@
-//! `cozy model quantize`: the serving package's recipe (a conversion: never a function, so `cozy
-//! run` refuses it), run as a call with `<model> <org/name>`. A lane flag picks the recipe that
-//! writes that lane from this checkpoint; `--recipe` names one. The package owns the recipe;
-//! Runtime writes the lane through Runtime's TensorFS store and returns its checkpoint reference.
+//! `cozy model quantize`: the lane a named package's declared recipe writes from a checkpoint. A
+//! lane flag picks the package's recipe of that lane for this model; `--recipe` names one. The
+//! package is always named: packages that serve the same model can each declare a recipe for it.
+//! The package's `quantize` (the Runtime's) runs it on the machine, which writes the lane, its
+//! provenance in its header, and returns its checkpoint reference.
 use std::process::ExitCode;
 
 use hub_client::types::{ModelCard, ModelCatalogRelease};
-use protocol::calcifer::{On, Run, Status};
-use protocol::config::{Hub, Origin};
+use protocol::calcifer::{Run, Status};
+use protocol::config::Hub;
 use protocol::error::{Error, Kind};
 
 use super::Quantize;
@@ -14,30 +15,17 @@ use super::refs::{self, ModelRef, Repo};
 use crate::Context;
 use crate::context::hub_answer;
 use crate::output::{self, Record};
-use crate::run::interface::{Callable, Interface};
-
-/// The callables of `interface` that write `lane` from a checkpoint with `components`: a
-/// conversion whose one weights output is named for the lane and whose model slot reads only
-/// components the checkpoint carries.
-fn quantizers<'a>(interface: &'a Interface, lane: &str, components: &[String]) -> Vec<&'a Callable> {
-    interface
-        .callables
-        .iter()
-        .filter(|c| !c.internal && c.is_conversion())
-        .filter(|c| matches!(c.weights_outputs.as_slice(), [one] if one.output_id == lane))
-        .filter(|c| c.models[0].component_use.values().flatten().all(|need| components.contains(need)))
-        .collect()
-}
+use crate::run::interface::{Interface, Recipe, RECIPES};
 
 /// A 16-bit lane: original weights a 4-bit lane may be written from.
 const ORIGINAL: [&str; 3] = ["bf16", "fp16", "f32"];
 
 /// A 4-bit lane is written only from original weights (owner, 2026-10-22): from a release holding
-/// none, such as an ingested Q4_K GGUF or an nvfp4 or w4a8 checkpoint, it would stack two rounds
-/// of 4-bit error. Refused, naming the newest release that holds them.
+/// none, such as an ingested Q4_K GGUF or a 4-bit checkpoint, it would stack two rounds of 4-bit
+/// error. Refused, naming the newest release that holds them.
 fn original_weights(repo: &Repo, card: &ModelCard, source: &ModelCatalogRelease, lane: &str) -> Result<(), Error> {
     let original = |r: &ModelCatalogRelease| r.lanes.iter().any(|l| l.precision.as_deref().is_some_and(|p| ORIGINAL.contains(&p)));
-    if !matches!(lane, "nvfp4" | "w4a8") || original(source) {
+    if !matches!(lane, "nvfp4" | "w4a8" | "svdq-nvfp4") || original(source) {
         return Ok(());
     }
     let held: Vec<String> = source.lanes.iter()
@@ -83,163 +71,130 @@ async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef, lane: &str) -> R
             let components = each.fold(first, |held, next| held.into_iter().filter(|c| next.contains(c)).collect());
             Ok((format!("{repo}@{}", found.release), components, repo.clone()))
         }
-        ModelRef::Local(_) | ModelRef::Provider(_) => Err(Error::new(Kind::Usage, "model_quantize_source", format!("{model} is not on the Hub: quantize reads a Hub model"))
-            .next(format!("cozy model upload {model} <org/name>"))),
+        ModelRef::Local(_) | ModelRef::Provider(_) => Err(not_on_hub(model)),
     }
 }
 
-/// What a quantize runs: the recipe writing a lane from this checkpoint, or one by name.
-enum Wanted<'a> {
-    Lane(&'a str, &'a [String]),
-    Recipe(&'a str),
+fn not_on_hub(model: &ModelRef) -> Error {
+    Error::new(Kind::Usage, "model_quantize_source", format!("{model} is not on the Hub: quantize reads a Hub model"))
+        .next(format!("cozy model upload {model} <org/name>"))
 }
 
-impl Wanted<'_> {
-    fn recipes<'i>(&self, interface: &'i Interface) -> Vec<&'i Callable> {
-        let fold = |name: &str| name.replace('-', "_");
-        match self {
-            Wanted::Lane(lane, components) => quantizers(interface, lane, components),
-            Wanted::Recipe(name) => (interface.callables.iter())
-                .filter(|c| !c.internal && c.is_conversion() && fold(&c.name) == fold(name))
-                .collect(),
-        }
-    }
-}
-
-/// The recipe a quantize runs.
-struct Recipe {
-    package: String,
-    release: String,
-    name: String,
-    /// The weights outputs it writes.
-    outputs: Vec<String>,
-}
-
-/// The one recipe `wanted` names: `--package`'s, else among the published packages the target
-/// machine holds.
-async fn quantizer(ctx: &Context, hub: &Hub, args: &Quantize, wanted: &Wanted<'_>) -> Result<Recipe, Error> {
-    let candidates: Vec<(String, Option<String>)> = match &args.package {
-        Some(package) => {
-            let (name, release) = package.split_once('@').map_or((package.as_str(), None), |(n, r)| (n, Some(r.to_owned())));
-            vec![(Repo::parse(name)?.to_string(), release)]
-        }
-        None => {
-            let On::Machine(name) = args.placement.on() else {
-                return Err(Error::new(Kind::Usage, "model_quantizer_unnamed", "a new or any machine holds no packages yet: name the quantizer's package")
-                    .remedy("add --package org/name"));
-            };
-            let machines = ctx.calcifer().await?.machines().await?.machines;
-            let machine = machines.into_iter().find(|m| m.name == name).ok_or_else(|| {
-                Error::new(Kind::NotFound, "machine_not_found", format!("no machine named {name}")).next("cozy machine list")
-            })?;
-            let environments = machine.status.map(|s| s.environments).unwrap_or_default();
-            environments
-                .into_iter()
-                .filter(|e| Origin::parse(&e.hub).is_ok_and(|o| o == hub.origin) && !e.package.starts_with("local/"))
-                .map(|e| (e.package, Some(e.release).filter(|r| !r.is_empty())))
-                .collect()
-        }
+/// The package named for the recipe: `org/name` and the release asked for, if any.
+fn package(args: &Quantize) -> Result<(String, Option<String>), Error> {
+    let Some(named) = &args.package else {
+        return Err(Error::new(Kind::Usage, "model_quantize_package",
+            "name the package whose recipe writes the lane: packages that serve the same model can each declare one")
+            .remedy("add --package org/name[@release]"));
     };
-    let mut found: Vec<Recipe> = vec![];
-    for (package, release) in candidates {
-        let card = crate::run::resolve(ctx, hub, &package, release.as_deref()).await?.card;
-        for callable in wanted.recipes(&card.interface) {
-            if !found.iter().any(|r| r.package == package && r.release == card.release && r.name == callable.name) {
-                let outputs = callable.weights_outputs.iter().map(|o| o.output_id.clone()).collect();
-                found.push(Recipe { package: package.clone(), release: card.release.clone(), name: callable.name.clone(), outputs });
-            }
-        }
-    }
-    match (found.len(), wanted) {
-        (1, _) => Ok(found.remove(0)),
-        (0, Wanted::Lane(lane, components)) => Err(Error::new(Kind::NotFound, "model_quantizer_not_found", format!("no package here quantizes this model ({}) to {lane}", components.join(", ")))
-            .remedy(format!("a package's quantizer is a recipe that takes the model and declares one weights output named {lane}; name its package with --package org/name"))),
-        (0, Wanted::Recipe(name)) => Err(Error::new(Kind::NotFound, "model_recipe_not_found", format!("no package here has the recipe {name}"))
-            .remedy("name its package with --package org/name")),
-        (_, wanted) => {
-            let named: Vec<_> = found.iter().map(|r| format!("{}/{}@{}", r.package, r.name, r.release)).collect();
-            let what = match wanted {
-                Wanted::Lane(lane, _) => format!("quantize it to {lane}"),
-                Wanted::Recipe(name) => format!("have the recipe {name}"),
-            };
-            Err(Error::new(Kind::Usage, "model_quantizer_ambiguous", format!("{} all {what}", named.join(", ")))
-                .remedy("choose one with --package org/name[@release]"))
-        }
-    }
+    let named = crate::package::PackageRef::parse(named)?;
+    Ok((named.package(), named.release))
 }
 
-/// The destination among a quantize's terms (the one without `=`), and the recipe's other inputs.
-fn terms(terms: &[String]) -> Result<(Option<String>, Vec<String>), Error> {
-    let (bare, inputs): (Vec<&String>, Vec<&String>) = terms.iter().partition(|term| !term.contains('='));
-    let destination = match bare.as_slice() {
-        [] => None,
-        [one] => Some(refs::destination(one)?),
-        _ => return Err(Error::new(Kind::Usage, "model_quantize_terms", format!(
-            "one destination at most; got {}", bare.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")))
-            .remedy("name the recipe's other inputs as model.<slot>=<ref> or <field>=<value>")),
+/// `name` as recipe names fold: `drafter-head` is `drafter_head`.
+fn fold(name: &str) -> String {
+    name.replace('-', "_").to_lowercase()
+}
+
+/// The lane asked for: its flag's, or the named recipe's.
+fn lane(args: &Quantize, interface: &Interface, package: &str) -> Result<String, Error> {
+    if let Some(name) = &args.recipe {
+        return (interface.recipes.iter().find(|r| r.name == fold(name)))
+            .map(|r| r.lane.clone())
+            .ok_or_else(|| Error::new(Kind::NotFound, "model_recipe_not_found", format!("{package} declares no recipe {name}"))
+                .remedy(declared(interface)));
+    }
+    let lane = match (args.int8, args.fp8, args.w4a8, args.svdq_nvfp4) {
+        (true, ..) => "int8",
+        (_, true, ..) => "fp8",
+        (_, _, true, _) => "w4a8",
+        (.., true) => "svdq-nvfp4",
+        _ => "nvfp4",
     };
-    Ok((destination, inputs.into_iter().cloned().collect()))
+    Ok(lane.to_owned())
+}
+
+/// The recipes of `lane` (named `recipe` if given) that read a checkpoint holding `components`.
+fn recipes<'i>(interface: &'i Interface, lane: &str, recipe: Option<&str>, components: &[String]) -> Vec<&'i Recipe> {
+    (interface.recipes.iter())
+        .filter(|r| r.lane == lane && recipe.is_none_or(|n| r.name == fold(n)) && r.reads(components))
+        .collect()
+}
+
+/// When one of `found` calibrates on the model itself: `model.<slot>=<source>` for each model the
+/// package's `quantize` constructs (on demand). Else nothing: another recipe's model is never bound.
+fn calibration(interface: &Interface, found: &[&Recipe], source: &str) -> Vec<String> {
+    if found.iter().all(|r| r.calibrate.is_empty()) {
+        return vec![];
+    }
+    (interface.callables.iter()).filter(|c| c.name == RECIPES).flat_map(|c| &c.models)
+        .filter(|slot| !slot.weights).map(|slot| format!("model.{}={source}", slot.param)).collect()
+}
+
+/// What a package declares, for a refusal: each recipe's flag and the model it reads.
+fn declared(interface: &Interface) -> String {
+    if interface.recipes.is_empty() {
+        return "it declares no recipes; name the package that does with --package org/name".into();
+    }
+    let each: Vec<String> = (interface.recipes.iter())
+        .map(|r| {
+            let mut reads: Vec<&str> = r.model.component_use.values().flatten().map(String::as_str).collect();
+            reads.sort_unstable();
+            reads.dedup();
+            let reads = if reads.is_empty() { "any checkpoint".to_owned() } else { reads.join(", ") };
+            format!("{} ({}: {reads})", r.flag(), r.model.class)
+        })
+        .collect();
+    format!("its recipes: {}", each.join("; "))
 }
 
 pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, Error> {
+    let (package, release) = package(&args)?;
     let model = ModelRef::parse(&args.model)?;
-    let (destination, inputs) = terms(&args.terms)?;
+    if matches!(model, ModelRef::Local(_) | ModelRef::Provider(_)) {
+        return Err(not_on_hub(&model));
+    }
+    let destination = args.destination.as_deref().map(refs::destination).transpose()?;
     let hub = ctx.hub()?;
-    let (source, repo, recipe) = match &args.recipe {
-        Some(name) => {
-            let recipe = quantizer(ctx, &hub, &args, &Wanted::Recipe(name)).await?;
-            // A recipe writing one 4-bit lane takes original weights only, as the lane flag does.
-            let lane = match recipe.outputs.as_slice() {
-                [one] => one.as_str(),
-                _ => "",
-            };
-            let (source, _, repo) = checkpoint(ctx, &hub, &model, lane).await?;
-            (source, repo, recipe)
-        }
-        None => {
-            let lane = match (args.int8, args.fp8, args.w4a8) {
-                (true, ..) => "int8",
-                (_, true, _) => "fp8",
-                (.., true) => "w4a8",
-                _ => "nvfp4",
-            };
-            let (source, components, repo) = checkpoint(ctx, &hub, &model, lane).await?;
-            let recipe = quantizer(ctx, &hub, &args, &Wanted::Lane(lane, &components)).await?;
-            (source, repo, recipe)
-        }
-    };
+    let card = crate::run::resolve(ctx, &hub, &package, release.as_deref()).await?.card;
+    let lane = lane(&args, &card.interface, &package)?;
+    let (source, components, repo) = checkpoint(ctx, &hub, &model, &lane).await?;
+    let found = recipes(&card.interface, &lane, args.recipe.as_deref(), &components);
+    if found.is_empty() {
+        let what = args.recipe.as_deref().unwrap_or(&lane);
+        return Err(Error::new(Kind::NotFound, "model_quantizer_not_found", format!(
+            "{package}@{} has no {what} recipe for this model ({})", card.release, components.join(", ")))
+            .remedy(declared(&card.interface)));
+    }
     // The variant goes onto the tag's tree (main unless named): publishing the tag releases all.
     let destination = destination.unwrap_or_else(|| format!("{repo}@main"));
-    let mut terms = vec![source.clone(), destination.clone()];
-    terms.extend(inputs);
-    let run = crate::run::call(ctx, &recipe.package, Some(&recipe.release), &recipe.name, terms, &args.placement, args.detach).await?;
+    let mut terms = vec![source.clone(), destination.clone(), format!("lane={lane}"),
+        format!("package={package}"), format!("release={}", card.release)];
+    terms.extend(args.recipe.iter().map(|name| format!("recipe={name}")));
+    // A calibration reads the original weights, never an encoded lane: the run takes 16 bits.
+    let calibrated = calibration(&card.interface, &found, &source);
+    let bits = (!calibrated.is_empty()).then_some("16");
+    terms.extend(calibrated);
+    let run = crate::run::call(ctx, &package, Some(&card.release), RECIPES, terms, bits, &args.placement, args.detach).await?;
     if !ctx.json && run.status == Status::Completed {
-        let mut next = vec![];
-        for output in &recipe.outputs {
-            match written_checkpoint(&run, output) {
-                Some(WrittenCheckpoint::Reference(reference)) => {
-                    let (model, tree) = (&reference.repo_id, &reference.revision);
-                    let mut record = Record::new().field("checkpoint", format!("{model}@{tree}"));
-                    if !reference.variant.is_empty() {
-                        record = record.field("variant", &reference.variant);
-                    }
-                    record.print(ctx);
-                    // The release it was made from moves to the commit the machine wrote, which
-                    // holds its variant too: exactly that one, wherever its tag moves next.
-                    let into = destination.split_once('@').map_or(destination.as_str(), |(into, _)| into);
-                    let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
-                    let release = pinned.filter(|_| into == repo.to_string()).unwrap_or("<version>");
-                    next.push(format!("cozy model publish {model} --release {release} --commit {tree}"));
+        match written_checkpoint(&run, &lane) {
+            Some(WrittenCheckpoint::Reference(reference)) => {
+                let (model, tree) = (&reference.repo_id, &reference.revision);
+                let mut record = Record::new().field("checkpoint", format!("{model}@{tree}"));
+                if !reference.variant.is_empty() {
+                    record = record.field("variant", &reference.variant);
                 }
-                Some(WrittenCheckpoint::Header(header)) => {
-                    Record::new().field("checkpoint header", header).print(ctx);
-                    break;
-                }
-                None => {}
+                record.print(ctx);
+                // The release it was made from moves to the commit the machine wrote, which
+                // holds its variant too: exactly that one, wherever its tag moves next.
+                let into = destination.split_once('@').map_or(destination.as_str(), |(into, _)| into);
+                let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
+                let release = pinned.filter(|_| into == repo.to_string()).unwrap_or("<version>");
+                output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tree}")]);
             }
+            Some(WrittenCheckpoint::Header(header)) => Record::new().field("checkpoint header", header).print(ctx),
+            None => {}
         }
-        next.dedup();
-        output::next(ctx, &next.iter().map(String::as_str).collect::<Vec<_>>());
     }
     Ok(crate::run::exit_code(&run))
 }
@@ -257,88 +212,4 @@ fn written_checkpoint<'a>(run: &'a Run, lane: &str) -> Option<WrittenCheckpoint<
     }
     let result = run.result.as_ref()?;
     result["checkpoint"].as_str().map(WrittenCheckpoint::Header)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::run::interface::tests::interface;
-
-    fn names(found: Vec<&Callable>) -> Vec<&str> {
-        found.into_iter().map(|c| c.name.as_str()).collect()
-    }
-
-    #[test]
-    fn a_recipe_is_found_by_its_name_and_the_destination_among_the_terms() {
-        let klein = interface("flux-3-klein-0.5.0");
-        assert_eq!(names(Wanted::Recipe("upsampler-int8").recipes(&klein)), ["upsampler_int8"]);
-        assert!(Wanted::Recipe("generate").recipes(&klein).is_empty(), "a function is no recipe");
-        let terms = |raw: &[&str]| super::terms(&raw.iter().map(|t| t.to_string()).collect::<Vec<_>>());
-        let (destination, inputs) = terms(&["model.base=fidika/h3@1.0.0", "Paul/Tiny", "max_relative_frobenius=0.1"]).unwrap();
-        assert_eq!(destination.as_deref(), Some("paul/tiny@main"));
-        assert_eq!(inputs, ["model.base=fidika/h3@1.0.0", "max_relative_frobenius=0.1"]);
-        assert_eq!(terms(&["a/b", "c/d"]).unwrap_err().code, "model_quantize_terms");
-    }
-
-    #[test]
-    fn the_quantizer_is_the_conversion_named_for_the_lane_that_reads_the_checkpoint() {
-        let klein = interface("flux-3-klein-0.5.0");
-        let base: Vec<String> = ["text_encoder", "transformer", "vae"].map(String::from).into();
-        let upsampler = vec!["model".to_owned()];
-        assert_eq!(names(quantizers(&klein, "int8", &base)), ["int8"]);
-        assert_eq!(names(quantizers(&klein, "nvfp4", &upsampler)), ["upsampler_nvfp4"]);
-        assert!(quantizers(&klein, "fp8", &base).is_empty());
-        let sdxl = interface("sdxl-2.10.0");
-        let parts: Vec<String> = ["text_encoder", "text_encoder_2", "unet", "vae"].map(String::from).into();
-        assert_eq!(names(quantizers(&sdxl, "fp8", &parts)), ["fp8"]);
-        assert!(quantizers(&sdxl, "int8", &parts[..3]).is_empty(), "a checkpoint without its vae");
-    }
-
-    /// A 4-bit lane is written only from original weights: a release of 4-bit variants (an
-    /// ingested GGUF, an nvfp4 checkpoint) is refused, naming the newest release holding them.
-    #[test]
-    fn a_four_bit_lane_is_never_written_from_four_bit_weights() {
-        let lane = |path: &str, precision: &str| serde_json::json!({"lane": path, "precision": precision,
-            "manifest_id": "sha256:00", "manifest_length": 1, "components": ["transformer"], "objects": 1, "bytes": 1});
-        let card: ModelCard = serde_json::from_value(serde_json::json!({
-            "model": {"org": "acme", "name": "x", "created_at": "2026-10-22T00:00:00Z"}, "throughput": [],
-            "releases": [
-                {"release": "1.1.0", "lanes": [lane("model.q4_k_m.cozytensors", ""), lane("model.nvfp4.cozytensors", "nvfp4")]},
-                {"release": "1.0.0", "lanes": [lane("model.bf16.cozytensors", "bf16"), lane("model.int8.cozytensors", "int8")]},
-                {"release": "0.9.0", "lanes": [lane("model.bf16.cozytensors", "bf16")]}]})).unwrap();
-        let repo = Repo::parse("acme/x").unwrap();
-        let (gguf, original) = (&card.releases[0], &card.releases[1]);
-        for four in ["w4a8", "nvfp4"] {
-            let refused = original_weights(&repo, &card, gguf, four).unwrap_err();
-            assert_eq!(refused.code, "model_quantize_source_quantized");
-            assert!(refused.to_string().contains("stacks two rounds of 4-bit error"), "{refused}");
-            assert!(format!("{refused:?}").contains(&format!("cozy model quantize acme/x@1.0.0 --{four}")), "{refused:?}");
-            original_weights(&repo, &card, original, four).unwrap();
-        }
-        original_weights(&repo, &card, gguf, "int8").unwrap();
-        let only: ModelCard = serde_json::from_value(serde_json::json!({
-            "model": {"org": "acme", "name": "x", "created_at": "2026-10-22T00:00:00Z"}, "throughput": [],
-            "releases": [{"release": "1.0.0", "lanes": [lane("model.w4a8.cozytensors", "w4a8")]}]})).unwrap();
-        let refused = original_weights(&repo, &only, &only.releases[0], "nvfp4").unwrap_err();
-        assert!(format!("{refused:?}").contains("cozy model upload"), "{refused:?}");
-    }
-
-    #[test]
-    fn typed_output_trees_take_precedence_over_result_headers_and_old_manifests() {
-        let mut run: Run = serde_json::from_value(serde_json::json!({
-            "id": protocol::ids::RunId::mint([7; 12]), "number": 7, "kind": "call",
-            "target": "quantize", "hub": "https://tensorhub.com", "status": "completed",
-            "created_at_ms": 1,
-            "result": {"checkpoint": "sha256:header"},
-            "output": [{
-                "id": "7/fp8", "name": "fp8", "index": 0, "rev": 1, "length": 0,
-                "media_type": "", "status": "completed",
-                "checkpoint": {"repo_id": "actual/output", "revision": "sha256:tree", "variant": "fp8"}
-            }]
-        })).unwrap();
-        assert!(matches!(written_checkpoint(&run, "fp8"), Some(WrittenCheckpoint::Reference(reference))
-            if reference.repo_id == "actual/output" && reference.revision == "sha256:tree"));
-        run.output.clear();
-        assert!(matches!(written_checkpoint(&run, "fp8"), Some(WrittenCheckpoint::Header("sha256:header"))));
-    }
 }

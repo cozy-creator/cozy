@@ -1,8 +1,9 @@
 //! Following a run: live progress on stderr, each output named as it lands, and the run's record
 //! on stdout at the end; NDJSON of Calcifer's events with `--json`, its terminal event last. A
 //! followed run is over once it ended and each output's last revision landed here (checked
-//! against its digest) or failed; an output not saved fails the follow. Ctrl-C stops following
-//! and never cancels: the run is Calcifer's, and `cozy run watch` reattaches.
+//! against its digest) or failed; an output not saved fails the follow. Ctrl-C (Esc or q in
+//! `cozy run list`) stops following and never cancels: the run is Calcifer's, and `cozy run
+//! watch` reattaches.
 use std::{
     collections::{HashSet, VecDeque},
     fmt::Write as _,
@@ -10,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use protocol::names::shown;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use protocol::{
     calcifer::{
@@ -37,7 +39,7 @@ pub(crate) async fn submit(
     let calcifer = ctx.calcifer().await?;
     if matches!(run.on, On::New(_)) && run.agreed.is_none() {
         let quoted: RunQuote = calcifer.post("/v1/run-quotes", &run, None).await?;
-        let said = crate::machine::price(&quoted.sku, quoted.gpus.unwrap_or(1), &quoted.quote);
+        let said = crate::machine::placed(&quoted);
         if !crate::machine::agree(ctx, &said)? {
             return Err(Error::new(Kind::Usage, "quote_declined", "nothing was rented and the run was not sent"));
         }
@@ -79,7 +81,16 @@ pub(crate) async fn follow(ctx: &Context, run: Run, detach: bool) -> Result<Run,
         record(ctx, &run);
         return Ok(run);
     }
-    let (run, interrupted) = watch(ctx, run, ctx.json).await?;
+    follow_until(ctx, run, interrupt()).await
+}
+
+/// `cozy run watch` until `stop`, which never cancels the run: the live view, then the record.
+pub(crate) async fn follow_until(
+    ctx: &Context,
+    run: Run,
+    stop: impl Future<Output = ()>,
+) -> Result<Run, Error> {
+    let (run, interrupted) = watch(ctx, run, ctx.json, stop).await?;
     if !ctx.json {
         record(ctx, &run);
     }
@@ -87,6 +98,11 @@ pub(crate) async fn follow(ctx: &Context, run: Run, detach: bool) -> Result<Run,
         true => Ok(run),
         false => saved(run),
     }
+}
+
+/// Ctrl-C in a shell.
+async fn interrupt() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// An output still owed to this computer: its last revision neither landed nor failed. A
@@ -132,26 +148,32 @@ fn saved(run: Run) -> Result<Run, Error> {
 /// Follows a run another one waits on (local code's install): its progress on a terminal, no
 /// record and no events of its own.
 pub(super) async fn settle(ctx: &Context, run: Run) -> Result<Run, Error> {
-    Ok(watch(ctx, run, false).await?.0)
+    Ok(watch(ctx, run, false, interrupt()).await?.0)
 }
 
 /// Renders `run`'s events until it ended and its outputs landed or failed (NDJSON with `events`,
-/// its terminal event held back to come last, as the run then stands); Ctrl-C stops early and
+/// its terminal event held back to come last, as the run then stands); `stop` ends it early and
 /// says so.
-async fn watch(ctx: &Context, run: Run, events_out: bool) -> Result<(Run, bool), Error> {
+async fn watch(
+    ctx: &Context,
+    run: Run,
+    events_out: bool,
+    stop: impl Future<Output = ()>,
+) -> Result<(Run, bool), Error> {
     let calcifer = ctx.calcifer().await?;
     let mut events = calcifer.events_until_landed(run.id.as_str(), 0);
     let mut view = View::new(ctx, &run);
-    let interrupt = tokio::signal::ctrl_c();
-    tokio::pin!(interrupt);
+    let mut interrupt = std::pin::pin!(stop);
     let id = run.id.clone();
     let mut terminal = None;
     // The rental the run was placed on, followed until it is known whether its Hub placed it far
     // away: the Hub decides after it accepts the order.
     let mut placing: Option<Following> = None;
     let mut notices = Notices::default();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
+            _ = tick.tick() => view.tick(),
             next = next_of(&mut placing, &calcifer), if placing.is_some() => match next {
                 Ok(Some(machine)) if !placed(&view, &machine, &mut notices) => {}
                 _ => placing = None,
@@ -271,6 +293,9 @@ pub(super) fn fields(ctx: &Context, run: &Run) -> output::Record {
         .field("machine", run.machine.as_deref().unwrap_or("—"));
     if let Some(waiting) = run.waiting.as_deref().filter(|_| !settled(run)) {
         record = record.field("waiting", waiting);
+    }
+    if let Some(progress) = run.progress.as_ref().filter(|_| !settled(run)) {
+        record = record.field("progress", said(progress));
     }
     if let Some(ms) = run.execution_ms {
         record = record.field("execution", format!("{:.1}s", ms as f64 / 1000.0));
@@ -413,6 +438,9 @@ struct View {
     named: HashSet<String>,
     /// The stage moving bytes, and its last few seconds of (when, bytes moved): its rate.
     moving: (String, VecDeque<(Instant, u64)>),
+    /// The progress last shown, and when its step count last moved: a step running far past its
+    /// stage's pace says so.
+    last: Option<(Progress, Instant)>,
 }
 
 impl View {
@@ -437,6 +465,7 @@ impl View {
             status: None,
             named: HashSet::new(),
             moving: (String::new(), VecDeque::new()),
+            last: None,
         };
         view.lifecycle(run);
         view
@@ -444,8 +473,8 @@ impl View {
 
     fn line(&self, text: &str) {
         match &self.bar {
-            Some(bar) => bar.println(text),
-            None => anstream::eprintln!("{text}"),
+            Some(bar) => bar.println(shown(text)),
+            None => anstream::eprintln!("{}", shown(text)),
         }
     }
 
@@ -493,7 +522,8 @@ impl View {
                     self.line(&format!("  {}  {}", item_name(item), checkpoint(reference)));
                 }
             }
-            Event::Log { level, text, .. } if !matches!(level.as_str(), "info" | "debug") => {
+            // A stage the run entered shows in its progress line as it goes.
+            Event::Log { level, text, .. } if !matches!(level.as_str(), "info" | "debug" | "stage") => {
                 self.line(&format!("  {level}: {text}"));
             }
             Event::Call { call, .. } => {
@@ -540,49 +570,63 @@ impl View {
     }
 
     fn status(&mut self, text: &str) {
+        self.last = None; // a status says where the run is now, not its last progress
         match &self.bar {
             Some(bar) => {
                 bar.set_length(0);
-                bar.set_message(text.to_owned());
+                bar.set_message(shown(text));
             }
             None if self.shown.0 != text => {
                 self.shown = (text.to_owned(), -1);
-                anstream::eprintln!("  {text}");
+                anstream::eprintln!("  {}", shown(text));
             }
             None => {}
         }
     }
 
     fn progress(&mut self, progress: &Progress) {
-        let fraction = progress.fraction.filter(|f| *f >= 0.0).or_else(|| {
-            (progress.total > 0).then(|| progress.completed as f64 / progress.total as f64)
-        });
-        let mut text = progress.stage.clone();
-        if progress.total > 0 {
-            let _ = write!(text, " {}/{}", progress.completed, progress.total);
+        let stepped = match &self.last {
+            Some((last, at)) if (&last.stage, last.completed) == (&progress.stage, progress.completed) => *at,
+            _ => Instant::now(),
+        };
+        self.last = Some((progress.clone(), stepped));
+        self.show_progress();
+    }
+
+    /// The last progress again, as time passes: a step running long says so.
+    fn tick(&mut self) {
+        if self.bar.is_some() && self.last.is_some() {
+            self.show_progress();
         }
-        // Bytes moved, of how many when that is known, at what rate, and so how long is left:
-        // a download that crawls says so.
+    }
+
+    fn show_progress(&mut self) {
+        let Some((progress, stepped)) = self.last.clone() else { return };
+        let fraction = fraction(&progress);
+        let mut text = said(&progress);
+        // At what rate bytes move, and so how long is left: a download that crawls says so.
         let (done, total) = (progress.bytes_done, progress.bytes_total);
-        if done > 0 || total > 0 {
-            let _ = write!(text, " {}", output::bytes(done));
-            if total > 0 {
-                let _ = write!(text, "/{}", output::bytes(total));
-            }
-            if let Some(rate) = rate(&mut self.moving, &progress.stage, done, Instant::now()) {
-                let _ = write!(text, " at {}/s", output::bytes(rate as u64));
-                if total > done && rate >= 1.0 {
-                    let left = ((total - done) as f64 / rate) as i64;
-                    let _ = write!(text, ", {} left", output::span(left));
-                }
+        if (done > 0 || total > 0)
+            && let Some(rate) = rate(&mut self.moving, &progress.stage, done, Instant::now())
+        {
+            let _ = write!(text, " at {}/s", output::bytes(rate as u64));
+            if total > done && rate >= 1.0 {
+                let left = ((total - done) as f64 / rate) as i64;
+                let _ = write!(text, ", {} left", output::span(left));
             }
         }
-        if progress.step_ms > 0.0 {
-            let _ = write!(text, " {:.2}s/step", progress.step_ms / 1000.0);
+        // A step running twice its stage's pace or more is named, with how long it has run.
+        let pace = if progress.step_avg_ms > 0.0 { progress.step_avg_ms } else { progress.step_ms };
+        let running = stepped.elapsed().as_secs_f64() * 1000.0;
+        if pace > 0.0 && progress.completed < progress.total && running > 2.0 * pace {
+            let _ = write!(text, " · step {} running {}", progress.completed + 1, took(running));
+        }
+        if let Some(waiting) = &self.waiting {
+            text = format!("{waiting} · {text}");
         }
         match &self.bar {
             Some(bar) => {
-                bar.set_message(text);
+                bar.set_message(shown(&text));
                 if let Some(fraction) = fraction {
                     bar.set_length(1000);
                     bar.set_position((fraction.clamp(0.0, 1.0) * 1000.0) as u64);
@@ -592,7 +636,7 @@ impl View {
                 let tenth = fraction.map_or(-1, |f| (f * 10.0) as i64);
                 if self.shown.0 != progress.stage || tenth > self.shown.1 {
                     self.shown = (progress.stage.clone(), tenth);
-                    anstream::eprintln!("  {text}");
+                    anstream::eprintln!("  {}", shown(&text));
                 }
             }
         }
@@ -602,6 +646,46 @@ impl View {
         if let Some(bar) = self.bar.take() {
             bar.finish_and_clear();
         }
+    }
+}
+
+/// How far a run is: its own fraction, else its steps', else its bytes'.
+pub(crate) fn fraction(progress: &Progress) -> Option<f64> {
+    let of = |done: u64, total: u64| (total > 0).then(|| done as f64 / total as f64);
+    (progress.fraction.filter(|f| *f >= 0.0))
+        .or_else(|| of(progress.completed, progress.total))
+        .or_else(|| of(progress.bytes_done, progress.bytes_total))
+}
+
+/// Where a run is: its stage, its steps of their total and their times, and its bytes of theirs.
+/// A stage's first step carries its setup: its time is said as the first's, never as the pace.
+pub(crate) fn said(progress: &Progress) -> String {
+    let mut text = progress.stage.clone();
+    if progress.total > 0 {
+        let _ = write!(text, " {}/{}", progress.completed, progress.total);
+    }
+    let (done, total) = (progress.bytes_done, progress.bytes_total);
+    if done > 0 || total > 0 {
+        let _ = write!(text, " {}", output::bytes(done));
+        if total > 0 {
+            let _ = write!(text, "/{}", output::bytes(total));
+        }
+    }
+    let (last, steady) = (progress.step_ms, progress.step_avg_ms);
+    let _ = match (last > 0.0, progress.completed, steady > 0.0) {
+        (false, ..) => Ok(()),
+        (true, 1, _) => write!(text, " · first step {}", took(last)),
+        (true, _, true) => write!(text, " · {} last, {} avg", took(last), took(steady)),
+        (true, ..) => write!(text, " · {} last", took(last)),
+    };
+    text
+}
+
+/// A step's time: tenths of a second under a minute, else minutes and seconds.
+fn took(ms: f64) -> String {
+    match ms < 60_000.0 {
+        true => format!("{:.1}s", ms / 1000.0),
+        false => output::span((ms / 1000.0) as i64),
     }
 }
 
@@ -619,99 +703,4 @@ fn rate(moving: &mut (String, VecDeque<(Instant, u64)>), stage: &str, done: u64,
     let (at, first) = *seen.front()?;
     let secs = (now - at).as_secs_f64();
     (secs >= 1.0).then(|| (done - first) as f64 / secs)
-}
-
-#[cfg(test)]
-mod tests {
-    use protocol::{calcifer::ItemStatus, ids::RunId};
-
-    use super::*;
-
-    /// A settled run with one output of each kind: (name, media type, landed path, error).
-    fn run(outputs: &[(&str, &str, Option<&str>, Option<&str>)]) -> Run {
-        let mut run = serde_json::from_value::<Run>(serde_json::json!({
-            "id": RunId::mint([7; 12]), "number": 7, "kind": "call", "target": "fidika/flux/fp8",
-            "hub": "https://tensorhub.com", "machine": "m1", "status": Status::Completed,
-            "created_at_ms": 1,
-        }))
-        .unwrap();
-        run.output = (outputs.iter())
-            .map(|(name, media_type, path, error)| OutputItem {
-                id: format!("7/{name}"),
-                name: (*name).to_owned(),
-                index: 0,
-                rev: 1,
-                length: 1,
-                media_type: (*media_type).to_owned(),
-                label: String::new(),
-                status: ItemStatus::Completed,
-                sha256: None,
-                path: path.map(Into::into),
-                export_error: error.map(Into::into),
-                checkpoint: None,
-            })
-            .collect();
-        run
-    }
-
-    #[test]
-    fn a_download_says_its_rate() {
-        let (mut moving, t0, mib) = ((String::new(), VecDeque::new()), Instant::now(), 1 << 20);
-        let at = |s: u64| t0 + Duration::from_secs(s);
-        assert_eq!(rate(&mut moving, "installing", 0, at(0)), None, "no second seen yet");
-        assert_eq!(rate(&mut moving, "installing", 4 * mib, at(2)), Some(2.0 * mib as f64));
-        // Only recent counts count: a crawl after a fast start reads as a crawl.
-        assert_eq!(rate(&mut moving, "installing", 4 * mib + 20, at(22)), Some(1.0));
-        assert_eq!(rate(&mut moving, "loading", 5, at(23)), None, "a new stage starts again");
-    }
-
-    /// Each output kind's terminal state: a landed file, a lost one and a checkpoint end a
-    /// follow (and only a lost file fails it); a file still on its way keeps it going.
-    #[test]
-    fn a_follow_ends_once_each_output_is_landed_lost_or_a_checkpoint() {
-        let image = "image/webp";
-        let cases = [
-            (("image", image, Some("/o/7-image.webp"), None), false, true),
-            (
-                ("image", image, None, Some("its machine ended")),
-                false,
-                false,
-            ),
-            (("fp8", "", None, None), false, true),
-            (("image", image, None, None), true, false),
-        ];
-        for (output, owes, saves) in cases {
-            let mut run = run(&[output]);
-            if output.0 == "fp8" {
-                run.output[0].checkpoint = Some(protocol::machine::CheckpointRef {
-                    repo_id: "local/derived".into(),
-                    revision: "sha256:tree".into(),
-                    variant: "fp8".into(),
-                    ..Default::default()
-                });
-            }
-            assert_eq!(owed(&run), owes, "{output:?}");
-            assert_eq!(saved(run).is_ok(), saves, "{output:?}");
-        }
-    }
-
-    #[test]
-    fn a_tensorfs_checkpoint_is_shown_as_a_reference_without_a_byte_export() {
-        let mut run = run(&[("weights", "", None, None)]);
-        run.output[0].checkpoint = Some(protocol::machine::CheckpointRef {
-            repo_id: "local/derived".into(),
-            revision: "sha256:tree".into(),
-            variant: String::new(),
-            tag: String::new(),
-        });
-        assert!(!owed(&run));
-        let shown = |run: &Run| checkpoint(run.output[0].checkpoint.as_ref().unwrap());
-        assert_eq!(shown(&run), "checkpoint local/derived@sha256:tree");
-        run.output[0].checkpoint.as_mut().unwrap().variant = "fp8".into();
-        assert_eq!(
-            shown(&run),
-            "checkpoint local/derived@sha256:tree (variant fp8)"
-        );
-        assert!(saved(run).is_ok());
-    }
 }

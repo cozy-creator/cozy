@@ -27,7 +27,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::failure::{fail, Failure, Kind, Result};
-use crate::format::{is_digest, repo_name, ObjectRef};
+use crate::format::{is_digest, repo_name, ObjectRef, ROOT_ORG};
 use crate::store::Store;
 
 /// Locations and an ordinary supplied provider. Credentials are never formatted.
@@ -104,11 +104,16 @@ impl FromStr for Ref {
                 "a digest is sha256: followed by 64 lowercase hex digits",
             );
         }
-        if digest.is_none() && !repo_name(name) {
-            return fail(Kind::Invalid, "a repository is <org>/<name>");
+        // A name with no org is first-party, the root namespace's: `sdxl` is `_/sdxl`.
+        let name = match digest.is_some() || name.contains('/') {
+            true => name.to_owned(),
+            false => format!("{ROOT_ORG}/{name}"),
+        };
+        if digest.is_none() && !repo_name(&name) {
+            return fail(Kind::Invalid, "a repository is [<org>/]<name>");
         }
         Ok(Self {
-            repo_id: name.to_owned(),
+            repo_id: name,
             revision,
             variant,
             endpoint: None,

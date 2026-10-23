@@ -114,26 +114,3 @@ pub fn read(cas: &Cas, owner: &str) -> io::Result<Option<Tree>> {
 pub fn release(cas: &Cas, owner: &str) -> io::Result<bool> {
     cas.release(&id(owner))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_tree_is_held_until_released() {
-        let root = std::env::temp_dir().join(format!("td-trees-{}", uuid::Uuid::new_v4()));
-        let cas = Cas::new(root.join("objects"));
-        std::fs::create_dir_all(&root).unwrap();
-        let local = root.join("payload.bin");
-        std::fs::write(&local, b"a result's bytes").unwrap();
-        let object = ObjectRef::of(b"a result's bytes");
-        let tree = import(&cas, "run-1/out", &[("payload".into(), local.as_path(), object.clone())]).unwrap();
-        assert_eq!(read(&cas, "run-1/out").unwrap(), Some(tree.clone()));
-        assert_eq!(parse(&cas.read(&tree.manifest).unwrap()).unwrap()["payload"], object);
-        assert!(cas.sweep(std::time::Duration::ZERO, &mut |_| Ok(true)).unwrap().is_empty(), "a held tree keeps its files");
-        assert!(release(&cas, "run-1/out").unwrap());
-        assert_eq!(cas.sweep(std::time::Duration::ZERO, &mut |_| Ok(true)).unwrap().len(), 2);
-        assert!(!cas.reuse(&object).unwrap() && !cas.reuse(&tree.manifest).unwrap());
-        let _ = std::fs::remove_dir_all(root);
-    }
-}

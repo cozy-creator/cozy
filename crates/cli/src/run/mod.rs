@@ -12,7 +12,7 @@ use protocol::{
 use crate::{Context, output};
 use bind::Terms;
 pub(crate) use catalog::{Card, latest};
-pub(crate) use follow::{exit_code, follow, submit};
+pub(crate) use follow::{exit_code, follow, follow_until, settled, submit};
 use interface::{Callable, Interface};
 use target::Target;
 
@@ -22,7 +22,7 @@ mod describe;
 mod digests;
 mod follow;
 pub(crate) mod interface;
-mod list;
+pub(crate) mod list;
 pub(crate) mod live;
 pub(crate) mod local;
 mod play;
@@ -43,7 +43,8 @@ pub struct Args {
 
 #[derive(clap::Args, Debug)]
 struct RunArgs {
-    /// `org/pkg[/fn][@release]`, `./dir[/fn]` or `./script.py`; without a function, its functions.
+    /// `[org/]pkg[/fn][@release]` (no org: first-party), `./dir[/fn]` or `./script.py`; without a
+    /// function, its functions.
     #[arg(required = true, value_name = "TARGET", add = ArgValueCompleter::new(crate::completion::local))]
     target: Option<String>,
     /// `key=value`, `key:=json`, `model.<slot>=<ref>`, one positional value, input files.
@@ -126,6 +127,9 @@ enum Verb {
         /// Only this package's runs.
         #[arg(long)]
         package: Option<String>,
+        /// Only the runs on this machine: its name or alias, or `local`.
+        #[arg(long = "on", value_name = "MACHINE")]
+        on: Option<String>,
         /// At most N runs (default 50; 0 shows all).
         #[arg(long, value_name = "N")]
         limit: Option<u64>,
@@ -137,7 +141,7 @@ enum Verb {
     Show {
         /// The run's number or id.
         run: String,
-        /// One snapshot even on a terminal, instead of the live view of a run not yet settled.
+        /// One snapshot even on a terminal, instead of following a run not yet settled as `watch` does.
         #[arg(long)]
         once: bool,
     },
@@ -181,12 +185,14 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Some(Verb::List {
             state,
             package,
+            on,
             limit,
             once,
         }) => {
             let query = list::Query {
                 status: state,
                 package,
+                machine: on,
                 before: None,
                 limit,
             };
@@ -220,19 +226,21 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::new(Kind::Internal, "cwd", format!("the working directory: {e}")))?;
     let raw = args.target.as_deref().unwrap_or_default();
-    let (package, function, release) = match Target::parse(raw, &cwd)? {
+    let (package, function, release, owned) = match Target::parse(raw, &cwd)? {
         Target::Published {
             package,
             function,
             release,
-        } => (package, function, release),
+            owned,
+        } => (package, function, release, owned),
         Target::Directory { path, function } => {
             return local::run(ctx, &cwd.join(path), function, args).await;
         }
         Target::Script(path) => return local::run(ctx, &cwd.join(path), None, args).await,
     };
     let hub = ctx.hub()?;
-    let resolved = resolve(ctx, &hub, &package, release.as_deref()).await?;
+    let (package, function, resolved) =
+        target::resolve(ctx, &hub, package, function, release.as_deref(), owned).await?;
     let Some(function) = function else {
         unnamed(
             &package,
@@ -244,8 +252,8 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
         return Ok(ExitCode::SUCCESS);
     };
     let asked = callable(&package, &resolved.card.interface, &function)?;
-    if asked.is_conversion() {
-        return Err(recipe(&package, asked));
+    if resolved.card.interface.runs_recipes(asked) {
+        return Err(recipes(&package, &resolved.card.interface));
     }
     if args.describe {
         let card = &resolved.card;
@@ -259,7 +267,7 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
             let target = format!("{package}/{}", callable.name);
             let text = describe::contract(&target, &card.interface, callable);
             let release = format!("\n  release: {} ({})\n", card.release, resolved.from);
-            anstream::print!("{}", text.replacen('\n', &release, 1));
+            anstream::print!("{}", protocol::names::shown(&text.replacen('\n', &release, 1)));
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -306,15 +314,17 @@ pub(crate) async fn resolve(
     Ok(Resolved { card, from })
 }
 
-/// `cozy run <package>/<function>[@release] <inputs…> --on …` for another verb: `model
+/// `cozy run <package>/<function>[@release] <inputs…> [--lane …] --on …` for another verb: `model
 /// quantize` runs a package's conversion this way. The run as it settled, or as sent with
 /// `detach`; its record is printed either way.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call(
     ctx: &Context,
     package: &str,
     release: Option<&str>,
     function: &str,
     inputs: Vec<String>,
+    lane: Option<&str>,
     placement: &Placement,
     detach: bool,
 ) -> Result<Run, Error> {
@@ -325,7 +335,7 @@ pub(crate) async fn call(
         inputs,
         placement: placement.clone(),
         gpus: None,
-        lane: None,
+        lane: lane.map(str::to_owned),
         attention_kernel: None,
         input_file: None,
         assets: vec![],
@@ -565,15 +575,16 @@ fn callable<'a>(
     }
 }
 
-/// A recipe is not a function: `cozy model quantize` runs it, by its lane or by name.
-fn recipe(package: &str, recipe: &Callable) -> Error {
-    let how = match recipe.weights_outputs.as_slice() {
-        [one] if ["int8", "fp8", "nvfp4"].contains(&one.output_id.as_str()) => format!("--{}", one.output_id),
-        _ => format!("--recipe {}", recipe.name),
-    };
-    let source = &recipe.models[0].param;
-    Error::new(Kind::Usage, "callable_recipe", format!("{package}/{} is a recipe, not a function", recipe.name))
-        .next(format!("cozy model quantize <{source}> [<org/model>] {how} --package {package}"))
+/// A package's recipes are data, not functions: `cozy model quantize` runs them.
+fn recipes(package: &str, interface: &Interface) -> Error {
+    let flags: Vec<String> = (interface.recipes.iter().map(|r| r.flag()))
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let mut error = Error::new(Kind::Usage, "callable_recipe", format!("{package}/{} runs its recipes", interface::RECIPES))
+        .remedy(format!("its recipes: {}", flags.join(", ")));
+    for flag in flags.iter().take(2) {
+        error = error.next(format!("cozy model quantize <model> {flag} --package {package}"));
+    }
+    error
 }
 
 /// Refuses inputs given to a package instead of one of its functions, naming the command that
@@ -619,7 +630,7 @@ fn quoted(input: &str) -> String {
     format!("{key}'{}'", value.replace('\'', r"'\''"))
 }
 
-/// `cozy run org/pkg`: the package's public functions.
+/// `cozy run [org/]pkg`: the package's public functions.
 fn functions(ctx: &Context, package: &str, resolved: &Resolved) {
     let from = resolved.from.to_string();
     let card = &resolved.card;

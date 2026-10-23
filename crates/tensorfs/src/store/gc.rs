@@ -12,7 +12,7 @@ use std::io::{self, Read};
 use std::time::{Duration, SystemTime};
 
 use super::retention::{self, list, Use};
-use super::{fail, fault, invalid, is_digest, same_family, Result, Store};
+use super::{fail, invalid, is_digest, same_family, Result, Store};
 use crate::format::{self, variant_of, Header, ObjectRef, Tree, HEADER_FORMAT, TREE_FORMAT};
 
 /// Documents bigger than this are never read as trees or headers.
@@ -161,17 +161,14 @@ impl Store {
             marked.extend(kept.digests);
             marked.insert(kept.name);
         }
-        fault::point("gc.marked");
         let doomed = objects
             .iter()
             .filter(|(sha, (_, modified))| *modified < cutoff && !marked.contains(*sha));
         let doomed: Vec<&String> = doomed.map(|(sha, _)| sha).collect();
-        fault::point("gc.listed");
         for sha256 in doomed {
             if let Some(length) = self.discard(sha256, cutoff)? {
                 collected.objects += 1;
                 collected.bytes += length;
-                fault::point("gc.swept");
             }
         }
         for folder in list(&self.root.join("snapshots"))? {
@@ -249,7 +246,6 @@ impl Store {
         if fs::rename(&blob, &trash).is_err() {
             return Ok(None);
         }
-        fault::point("gc.trashed");
         // From here a put or reuse may take it back (`young`): gone from the trash is kept.
         let gone = |error: &io::Error| error.kind() == io::ErrorKind::NotFound;
         let metadata = match fs::metadata(&trash) {

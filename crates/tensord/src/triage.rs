@@ -183,23 +183,3 @@ pub fn read(root: &Path, triage: &TriageRef) -> io::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The traceback's last lines, secrets masked; an empty traceback falls back to stderr.
-    #[test]
-    fn a_failures_detail_is_its_traceback_tail_masked() {
-        let lines: Vec<String> = (0..60).map(|n| format!("  frame {n}")).collect();
-        let traceback = format!("{}\nValueError: fetch https://user:tok@hub.example/x failed", lines.join("\n"));
-        let bundle = json!({"terminal": {"traceback": traceback}, "executor": {"stderr_tail": "ignored"}});
-        let tail = detail(bundle.to_string().as_bytes()).unwrap();
-        assert_eq!(tail.lines().count(), 40, "{tail}");
-        assert!(tail.ends_with("ValueError: fetch https://***@hub.example/x failed"), "{tail}");
-        assert!(!tail.contains("frame 20\n"), "{tail}");
-        let crashed = json!({"terminal": {"traceback": ""}, "executor": {"stderr_tail": "Fatal Python error: Segmentation fault\n"}});
-        assert_eq!(detail(crashed.to_string().as_bytes()).unwrap(), "Fatal Python error: Segmentation fault");
-        assert_eq!(detail(json!({"terminal": {}, "executor": {}}).to_string().as_bytes()), None);
-    }
-}

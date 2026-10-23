@@ -4,6 +4,11 @@ use std::collections::BTreeMap;
 use protocol::error::Error;
 
 pub trait MachineBackend: Send + Sync + 'static {
+    /// A count that moves whenever what the engine records may have changed (runs,
+    /// installations, warm sets, held models); None when unknown: then read it all each time.
+    fn activity(&self) -> Option<u64> {
+        None
+    }
     /// `cozy.machine.v1` Run sources and Write (`runs`).
     fn runs(&self) -> Option<std::sync::Arc<crate::runs::Runs>> {
         None

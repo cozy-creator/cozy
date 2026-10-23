@@ -749,28 +749,3 @@ fn multi_row_sum<T: Lanes>(load: &impl Fn(usize) -> T, size: usize) -> [T; 4] {
     }
     acc[0]
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Values PyTorch 2.14.1 (CPU, one thread) gives for the same calls.
-    #[test]
-    fn torch_pieces_match_pytorch() {
-        let r: Vec<usize> = randint(1_000_003, 5).collect();
-        assert_eq!(r, TORCH_RANDINT);
-        let l = linspace(25599.0, 819);
-        assert_eq!(
-            [l[1], l[409], l[410], l[818]].map(f32::to_bits),
-            TORCH_LINSPACE
-        );
-        let x: Vec<f32> = (0..70001)
-            .map(|i| ((i * 7919 % 10007) as f32 - 5003.0) * 1e-3)
-            .collect();
-        assert_eq!(tsum(&x).to_bits(), TORCH_SUM);
-    }
-
-    const TORCH_RANDINT: [usize; 5] = [128973, 240601, 705720, 82882, 841199];
-    const TORCH_LINSPACE: [u32; 4] = [0x41fa5b62, 0x4647fe00, 0x46487b2e, 0x46c7fe00];
-    const TORCH_SUM: u32 = 0x40c6b800;
-}

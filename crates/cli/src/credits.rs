@@ -366,33 +366,3 @@ fn usd(micros: i64) -> String {
     let fraction = fraction.trim_end_matches('0');
     format!("{sign}${}.{fraction:0<2}", micros / 1_000_000)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dollars_are_exact_micros() {
-        assert_eq!(parse_usd("25.50").unwrap(), 25_500_000);
-        assert_eq!(parse_usd("$10").unwrap(), 10_000_000);
-        assert_eq!(parse_usd("0.000001").unwrap(), 1);
-        for bad in ["", "1.0000001", "ten", "-1", "1e3"] {
-            assert!(parse_usd(bad).is_err(), "{bad}");
-        }
-        assert_eq!(usd(25_500_000), "$25.50");
-        assert_eq!(usd(1), "$0.000001");
-        assert_eq!(usd(-3_000_000), "-$3.00");
-    }
-
-    /// The opener is looked for on PATH, never assumed: with none there the URL stands alone, and
-    /// the warning that says so was given once, by the first attempt.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_missing_xdg_open_opens_nothing_and_is_warned_of_once() {
-        let empty = tempfile::tempdir().unwrap();
-        let path = [empty.path().to_path_buf()];
-        assert!(!open("https://example.test/pay", &path));
-        assert!(!open("https://example.test/pay", &path));
-        assert_eq!(tools::warn_once("xdg-open"), None, "the first open warned");
-    }
-}

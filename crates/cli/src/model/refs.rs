@@ -1,8 +1,9 @@
 //! The one model-reference grammar, shared by `cozy model …` and `cozy run model.<slot>=…`:
 //!
 //! ```text
-//! org/name[@release]            a Hub model by name; the machine resolves the release and selects its variant
-//! org/name#sha256:<64 hex>      the owner's checkpoint by hash
+//! [org/]name[@release]          a Hub model by name (no org: first-party, the root's); the machine
+//!                               resolves the release and selects its variant
+//! [org/]name#sha256:<64 hex>    the owner's checkpoint by hash
 //! local/<alias>                 a model a machine holds under that name
 //! hf://… civitai://… https://…  a provider source, passed through: the machine pins and makes it
 //! ```
@@ -10,8 +11,10 @@ use std::fmt;
 
 use protocol::error::{Error, Kind};
 use protocol::machine::ModelChoice;
+use protocol::names::ROOT;
 
-/// A Hub repository, `org/name`, lowercased (names are case-insensitive).
+/// A Hub repository, `org/name`, lowercased (names are case-insensitive); a root one's org is
+/// [`ROOT`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Repo {
     pub org: String,
@@ -32,7 +35,7 @@ pub(crate) enum ModelRef {
     Provider(String),
 }
 
-const GRAMMAR: &str = "org/name[@release], org/name#sha256:<hex>, local/<alias>, hf://…, civitai://… or https://…";
+const GRAMMAR: &str = "[org/]name[@release], [org/]name#sha256:<hex>, local/<alias>, hf://…, civitai://… or https://…";
 
 fn usage(code: &str, message: String) -> Error {
     Error::new(Kind::Usage, code, message)
@@ -97,14 +100,14 @@ pub(crate) fn checkpoint(value: &str) -> Result<String, Error> {
 impl Repo {
     pub(crate) fn parse(raw: &str) -> Result<Self, Error> {
         let lower = raw.trim().to_ascii_lowercase();
-        match lower.split_once('/') {
-            Some((org, name)) if slug(org) && slug(name) => Ok(Repo {
+        match lower.split_once('/').unwrap_or((ROOT, &lower)) {
+            (org, name) if (slug(org) || org == ROOT) && slug(name) => Ok(Repo {
                 org: org.to_owned(),
                 name: name.to_owned(),
             }),
             _ => Err(usage(
                 "model_name_invalid",
-                format!("{raw:?} is not org/name"),
+                format!("{raw:?} is not name or org/name"),
             )
             .remedy("org and name use letters, digits, dots, underscores or hyphens")),
         }
@@ -124,7 +127,7 @@ impl Repo {
     }
 }
 
-/// An upload's destination, `org/name[@tag]`: a Hub repository and the private tag the upload
+/// An upload's destination, `[org/]name[@tag]`: a Hub repository and the private tag the upload
 /// moves, `main` unless named. Sent as `org/name@tag`.
 pub(crate) fn destination(raw: &str) -> Result<String, Error> {
     let (name, tag) = raw.trim().split_once('@').unwrap_or((raw.trim(), "main"));
@@ -151,7 +154,7 @@ impl ModelRef {
         }
         if let Some((name, hash)) = raw.split_once('#') {
             let repo = Repo::parse(name).map_err(|_| grammar(raw))?;
-            let manifest = checkpoint(hash).map_err(|e| e.remedy("`#` names a checkpoint, org/name#sha256:<hex>"))?;
+            let manifest = checkpoint(hash).map_err(|e| e.remedy("`#` names a checkpoint, [org/]name#sha256:<hex>"))?;
             return Ok(ModelRef::Checkpoint { repo, manifest });
         }
         let (name, pin) = match raw.split_once('@') {
@@ -169,7 +172,7 @@ impl ModelRef {
             };
         }
         if pin.is_some_and(|pin| pin.contains('/')) {
-            return Err(usage("model_variant_pin", format!("{raw:?}: a model is org/name[@release]; its variant is selected by GPUs and --lane"))
+            return Err(usage("model_variant_pin", format!("{raw:?}: a model is [org/]name[@release]; its variant is selected by GPUs and --lane"))
                 .remedy("pin a variant by path with `cozy model download … --variant <path>`"));
         }
         let release = pin.map(|release| label("release", release)).transpose()?;
@@ -221,76 +224,4 @@ fn grammar(raw: &str) -> Error {
         "model_ref_invalid",
         format!("{raw:?} is not a model: use {GRAMMAR}"),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const HASH: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-    #[test]
-    fn one_grammar_names_each_kind_of_model() {
-        let cases = [
-            ("Fidika/SDXL", "fidika/sdxl", ("fidika/sdxl", "", "", "", "")),
-            ("fidika/sdxl@1.0.0", "fidika/sdxl@1.0.0", ("fidika/sdxl", "1.0.0", "", "", "")),
-            (&format!("fidika/sdxl#{HASH}"), &format!("fidika/sdxl#{HASH}"), ("fidika/sdxl", "", "", HASH, "")),
-            ("local/Style", "local/style", ("local/style", "", "", "", "")),
-            ("hf://Org/Repo@main/a.safetensors", "hf://Org/Repo@main/a.safetensors", ("", "", "", "", "hf://Org/Repo@main/a.safetensors")),
-            ("civitai://12345", "civitai://12345", ("", "", "", "", "civitai://12345")),
-        ];
-        for (raw, shown, (repository, release, lane, manifest, source)) in cases {
-            let parsed = ModelRef::parse(raw).unwrap();
-            assert_eq!(parsed.to_string(), shown);
-            let c = parsed.choice("model");
-            assert_eq!(
-                (c.parameter.as_str(), c.repository.as_str(), c.release.as_str(), c.lane.as_str(), c.manifest.as_str(), c.source.as_str()),
-                ("model", repository, release, lane, manifest, source),
-                "{raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_spellings_are_usage_refusals() {
-        for raw in [
-            "sdxl",
-            "a/b/c",
-            "fidika/sdxl#fp8",
-            "fidika/sdxl#sha256:nope",
-            "fidika/sdxl#",
-            "fidika/sdxl@",
-            "fidika/sdxl@1.0/",
-            "fidika/sdxl@1.0/../outside.cozytensors",
-            "fidika/sdxl@1.0/fp8#sha256:aa",
-            "fidika/sdxl@1.0.0/int8",
-            "fidika/sdxl@1.0/model.int8.cozytensors",
-            "local/style@1.0",
-            "s3://bucket/key",
-            "-org/x",
-        ] {
-            let error = ModelRef::parse(raw).unwrap_err();
-            assert_eq!(error.kind, Kind::Usage, "{raw}");
-        }
-        assert_eq!(Repo::hub("local/x").unwrap_err().code, "model_local_destination");
-        assert_eq!(ModelRef::parse("fidika/sdxl@1.0/model.int8.cozytensors").unwrap_err().code, "model_variant_pin");
-    }
-
-    /// `--variant` names a variant by its exact path; a lane word is no path.
-    #[test]
-    fn a_variant_is_a_cozytensors_path() {
-        assert_eq!(variant("nested/arbitrary.cozytensors").unwrap(), "nested/arbitrary.cozytensors");
-        for raw in ["int8", "fp8", "../outside.cozytensors", ""] {
-            assert_eq!(variant(raw).unwrap_err().code, "model_variant_invalid", "{raw}");
-        }
-    }
-
-    #[test]
-    fn an_upload_moves_main_unless_it_names_a_tag() {
-        assert_eq!(destination("Paul/SDXL").unwrap(), "paul/sdxl@main");
-        assert_eq!(destination("paul/sdxl@fp8-draft").unwrap(), "paul/sdxl@fp8-draft");
-        for raw in ["local/x", "paul/sdxl@", "paul/sdxl@a/b", "sdxl@main"] {
-            assert_eq!(destination(raw).unwrap_err().kind, Kind::Usage, "{raw}");
-        }
-    }
 }

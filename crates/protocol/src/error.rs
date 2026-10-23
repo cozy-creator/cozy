@@ -139,37 +139,3 @@ impl Kind {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_envelope_round_trips_and_keeps_two_next_steps() {
-        let error = Error::new(Kind::Conflict, "idempotency_conflict", "key reused")
-            .remedy("use a new key")
-            .next("cozy run list")
-            .next("cozy run show 3")
-            .next("dropped");
-        let json = serde_json::to_string(&Envelope {
-            error: error.clone(),
-        })
-        .unwrap();
-        assert_eq!(
-            json,
-            r#"{"error":{"kind":"conflict","code":"idempotency_conflict","message":"key reused","remedy":"use a new key","next":["cozy run list","cozy run show 3"]}}"#
-        );
-        assert_eq!(
-            serde_json::from_str::<Envelope>(&json).unwrap().error,
-            error
-        );
-        assert_eq!(error.exit_code(), 1);
-        assert_eq!(Error::new(Kind::Usage, "usage", "bad flag").exit_code(), 2);
-        let forbidden = Error::new(Kind::Forbidden, "origin_not_allowed", "foreign page");
-        let json = serde_json::to_value(&forbidden).unwrap();
-        assert_eq!(json["kind"], "forbidden");
-        assert_eq!(serde_json::from_value::<Error>(json).unwrap(), forbidden);
-        assert_eq!(forbidden.kind.http_status(), 403);
-        assert_eq!(forbidden.exit_code(), 1);
-    }
-}

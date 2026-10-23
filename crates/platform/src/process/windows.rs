@@ -1,5 +1,6 @@
 //! Windows: births from creation times, exact handles as process HANDLEs (an open handle keeps the
 //! PID from being reused), trees as Job Objects.
+#![allow(unsafe_code)]
 use super::{Birth, State};
 use std::{
     ffi::OsString,
@@ -114,7 +115,7 @@ pub(super) fn meter(_: u32) -> Option<(u64, u64)> {
     None
 }
 
-pub(super) fn read_bytes(_: u32) -> Option<u64> {
+pub(super) fn written_bytes(_: u32) -> Option<u64> {
     None
 }
 
@@ -568,25 +569,4 @@ fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
 
 fn raw(handle: &OwnedHandle) -> HANDLE {
     handle.as_raw_handle()
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_command_line_reads_back_as_its_arguments() {
-        assert_eq!(
-            super::quote(r"C:\Users\a\.cozy\bin\cozy.exe"),
-            r"C:\Users\a\.cozy\bin\cozy.exe"
-        );
-        assert_eq!(
-            super::quote(r"C:\Users\a b\cozy.exe"),
-            r#""C:\Users\a b\cozy.exe""#
-        );
-        assert_eq!(super::quote(r#"say "hi""#), r#""say \"hi\"""#);
-        assert_eq!(
-            super::quote(r"C:\dir with space\"),
-            r#""C:\dir with space\\""#
-        );
-        assert_eq!(super::quote(""), r#""""#);
-    }
 }

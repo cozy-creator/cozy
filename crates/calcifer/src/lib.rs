@@ -7,8 +7,10 @@
 //! its acceptance. From then on, the task follows the run from the durable cursor to its outcome.
 //! A Calcifer that stops leaves accepted work running; the next one resumes each run from the
 //! cursor.
+#![forbid(unsafe_code)]
 mod access;
 pub mod api;
+mod kept;
 mod lanes;
 pub mod link;
 pub mod machines;
@@ -241,9 +243,9 @@ impl Calcifer {
             ))
         );
         if !self.store.recorded(key)?
-            && let Some(machines) = self.granting.get().and_then(Weak::upgrade)
+            && let Some(machines) = self.machines()
         {
-            machines.admit(&submit).map_err(Error::Refused)?;
+            machines.admit(&submit).await.map_err(Error::Refused)?;
         }
         let (machine, pinned, wants) = match &submit.on {
             On::Machine(name) => (Some(name.clone()), true, None),
@@ -339,11 +341,26 @@ impl Calcifer {
     /// Records or updates a machine and wakes the runs waiting on it.
     pub fn put_machine(&self, machine: &MachineRow) -> Result<(), Error> {
         self.store.put_machine(machine)?;
-        if let Some(entry) = lock(&self.machines).get(&machine.name) {
-            entry.changed.send_replace(());
-        }
+        self.touch(&machine.name);
         self.machine_changed();
         Ok(())
+    }
+
+    /// Wakes the runs and exports waiting on the machine: what is known of it changed.
+    pub(crate) fn touch(&self, name: &str) {
+        if let Some(entry) = lock(&self.machines).get(name) {
+            entry.changed.send_replace(());
+        }
+    }
+
+    /// The machines and their Hubs, once they serve this core.
+    fn machines(&self) -> Option<Arc<machines::Machines>> {
+        self.granting.get().and_then(Weak::upgrade)
+    }
+
+    /// Why the machine is offline by its Hub's word; None for one that answers or may.
+    pub(crate) fn offline(&self, name: &str) -> Option<String> {
+        self.machines()?.offline(name)
     }
 
     /// Records the machine as gone for good: its unconfirmed runs return to the outbox or fail,
@@ -397,7 +414,7 @@ impl Calcifer {
     /// What the send of `run` as `spec` carries besides it: its Hub access and model-source
     /// tokens, minted now. Without machines (a bare core) it carries the run's Hub origin only.
     async fn access(&self, run: &RunRow, spec: &v1::RunSpec) -> Result<access::Access, Stop> {
-        let Some(machines) = self.granting.get().and_then(Weak::upgrade) else {
+        let Some(machines) = self.machines() else {
             return Ok(access::Access::default());
         };
         machines
@@ -470,9 +487,16 @@ impl Calcifer {
         }
     }
 
-    fn progress(&self, id: &RunId, progress: Progress) {
-        lock(&self.live).entry(id.clone()).or_default().progress = Some(progress.clone());
+    /// Records the run's progress; whether it entered a stage it was not in.
+    fn progress(&self, id: &RunId, progress: Progress) -> bool {
+        let entered = {
+            let mut live = lock(&self.live);
+            let live = live.entry(id.clone()).or_default();
+            let was = live.progress.replace(progress.clone()).map(|p| p.stage);
+            !progress.stage.is_empty() && was.as_deref() != Some(progress.stage.as_str())
+        };
         let _ = self.events.send((id.clone(), Event::Progress { progress }));
+        entered
     }
 
     fn wake(&self, id: &RunId) {
@@ -541,6 +565,33 @@ impl Calcifer {
                 }
                 continue;
             }
+            // Offline by its Hub's word: an unsent run leaves it now (an `any` run to be placed
+            // again, any other fails), and a sent one waits for it to come back or end. Nothing
+            // dials it meanwhile.
+            if let Some(reason) = self.offline(&name) {
+                let message = format!("{name} is offline: {reason}");
+                if run.state == State::Queued {
+                    let left = match (run.pinned, run.wants.as_str()) {
+                        (false, "any") => self.store.unplace(id.as_str()),
+                        _ => self.store.fail(id.as_str(), Reason {
+                            code: "machine_offline".into(),
+                            message,
+                            ..Default::default()
+                        }),
+                    };
+                    match left {
+                        Ok(events) => self.publish(id, events),
+                        Err(e) => warn!(run = %id, "{e}"),
+                    }
+                    continue;
+                }
+                self.waiting(id, message);
+                tokio::select! {
+                    _ = changed.changed() => {}
+                    _ = wake.notified() => {}
+                }
+                continue;
+            }
             let Some(link) = link else {
                 self.waiting(id, format!("waiting for {name} to start"));
                 tokio::select! {
@@ -555,7 +606,11 @@ impl Calcifer {
             {
                 Ok(()) => {}
                 Err(Stop::Unreachable(message)) => {
-                    self.waiting(id, format!("{name} is unreachable: {message}"));
+                    let reason = match self.machines() {
+                        Some(machines) => machines.unanswered(&name, &message),
+                        None => format!("{name} is unreachable: {message}"),
+                    };
+                    self.waiting(id, reason);
                     pause.wait(wake, Some(&mut changed)).await;
                 }
                 // A run its machine accepted ends only with the machine's outcome.
@@ -784,7 +839,10 @@ impl Calcifer {
                 }
                 Frame::Gpu(_) => self.not_waiting(id),
                 Frame::Progress(p) => {
-                    self.progress(
+                    // Each stage it enters is kept with the run, so a run whose machine is lost
+                    // still says where it got to and when (run 14868, `encoding prompt`).
+                    let stage = p.stage.clone();
+                    let entered = self.progress(
                         id,
                         Progress {
                             stage: p.stage,
@@ -794,8 +852,12 @@ impl Calcifer {
                             bytes_done: p.bytes_done,
                             bytes_total: p.bytes_total,
                             step_ms: p.step_ms,
+                            step_avg_ms: p.step_avg_ms,
                         },
                     );
+                    if entered {
+                        batch.logs.push((frame.at_ms, "stage".into(), stage));
+                    }
                     continue;
                 }
                 Frame::State(state) => {

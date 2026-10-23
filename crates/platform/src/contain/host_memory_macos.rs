@@ -1,5 +1,6 @@
 //! macOS: physical memory from `hw.memsize`; available as free plus inactive pages (what
 //! psutil reports), from the host's VM statistics; a process's physical footprint.
+#![allow(unsafe_code)]
 use super::{HostMemory, ProcessMemory};
 use std::{io, mem};
 

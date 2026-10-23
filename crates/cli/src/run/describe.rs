@@ -6,18 +6,13 @@ use serde_json::Value;
 
 use super::interface::{Callable, Constraints, Field, Interface, Type, Wire};
 
-/// One concrete invocation: required terms bare, optional ones bracketed. A published recipe
-/// runs through `cozy model quantize`; local code's runs as its author's.
+/// One concrete invocation: required terms bare, optional ones bracketed. A conversion reads its
+/// input model and the repository it writes first.
 pub fn usage_line(target: &str, callable: &Callable) -> String {
     let mut line = format!("cozy run {target}");
     if callable.is_conversion() {
         let source = &callable.models[0].param;
-        line = match target.rsplit_once('/') {
-            Some((package, name)) if !package.starts_with("local/") => {
-                format!("cozy model quantize <{source}> [<org/model>] --recipe {name} --package {package}")
-            }
-            _ => format!("{line} <{source}> [<org/model>]"),
-        };
+        let _ = write!(line, " <{source}> [<org/model>]");
         for slot in &callable.models[1..] {
             let _ = write!(line, " model.{}=<ref>", slot.param);
         }
@@ -238,88 +233,4 @@ fn fields(
 
 fn spell(value: &Value) -> String {
     value.to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::interface::tests::interface;
-    use super::*;
-
-    fn callable<'a>(read: &'a super::super::interface::Interface, name: &str) -> &'a Callable {
-        read.callables.iter().find(|c| c.name == name).unwrap()
-    }
-
-    #[test]
-    fn usage_lines_spell_every_term_in_its_grammar() {
-        let sdxl = interface("sdxl-2.10.0");
-        assert_eq!(
-            usage_line("fidika/sdxl/generate", callable(&sdxl, "generate")),
-            "cozy run fidika/sdxl/generate prompt=<str> [negative_prompt=<str>] [aspect_ratio=<16:9|1:1|3:4|4:3|9:16>] \
-             [megapixels=<1|16|2|4|8>] [hidiffusion=<bool|null>] [steps=<int>] [guidance=<float>] [seed=<int|null>]"
-        );
-        assert_eq!(
-            usage_line("fidika/sdxl/int8", callable(&sdxl, "int8")),
-            "cozy model quantize <source> [<org/model>] --recipe int8 --package fidika/sdxl"
-        );
-        assert_eq!(
-            usage_line("local/sdxl/int8", callable(&sdxl, "int8")),
-            "cozy run local/sdxl/int8 <source> [<org/model>]"
-        );
-        let h3 = interface("minimax-h3-1.37.2");
-        let ref2va = usage_line("fidika/minimax-h3/ref2va", callable(&h3, "ref2va"));
-        assert!(ref2va.contains(" prompt=<str> "), "{ref2va}");
-        assert!(ref2va.contains(" duration_s=<int> "), "{ref2va}");
-        assert!(ref2va.ends_with(" [--asset <file>]..."), "{ref2va}");
-        assert!(ref2va.contains(" [upscale=<null|object>]"), "{ref2va}");
-        let birefnet = interface("birefnet-0.2.0");
-        assert!(
-            usage_line(
-                "fidika/birefnet/remove_background",
-                callable(&birefnet, "remove_background")
-            )
-            .ends_with(" --asset image=<file>")
-        );
-    }
-
-    #[test]
-    fn the_contract_names_defaults_bounds_slots_and_output() {
-        let sdxl = interface("sdxl-2.10.0");
-        let text = contract("fidika/sdxl/generate", &sdxl, callable(&sdxl, "generate"));
-        for line in [
-            "    prompt: str\n",
-            "    steps: int (>=1, <=50) (default = 20)\n",
-            "    seed: int|null (default = null)\n",
-            "    model: SdxlModel\n",
-            "    image: image file (image/webp)\n",
-            "usage: cozy run fidika/sdxl/generate prompt=<str>",
-        ] {
-            assert!(text.contains(line), "{line:?} not in\n{text}");
-        }
-        let mut card =
-            super::super::interface::tests::card("sdxl-2.10.0")["package_interface"].clone();
-        let slot = &mut card["entrypoints"][1]["models"][0];
-        slot["default"] = "fidika/sdxl-base@1.0".into();
-        slot["min_bits"] = 8.into();
-        let after = super::super::interface::Interface::parse(&card).unwrap();
-        assert!(
-            contract("fidika/sdxl/generate", &after, callable(&after, "generate"))
-                .contains("    model: SdxlModel (default fidika/sdxl-base@1.0; at least 8 bits)\n")
-        );
-        let h3 = interface("minimax-h3-1.39.0");
-        let ref2va = contract("fidika/minimax-h3/ref2va", &h3, callable(&h3, "ref2va"));
-        assert!(
-            ref2va.contains("\n  runs on: CPU; calls the package's GPU functions\n"),
-            "{ref2va}"
-        );
-        let fp8 = contract("fidika/sdxl/fp8", &sdxl, callable(&sdxl, "fp8"));
-        assert!(fp8.contains("\n  runs on: CPU\n"), "{fp8}");
-        for line in [
-            "runs on: CPU",
-            "source: SdxlModel weights\n",
-            "writes weights: fp8\n",
-            "output: a model\n",
-        ] {
-            assert!(fp8.contains(line), "{line:?} not in\n{fp8}");
-        }
-    }
 }

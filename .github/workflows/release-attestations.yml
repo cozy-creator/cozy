@@ -1,0 +1,38 @@
+name: release-attestations
+# dist global-artifacts job (dist-workspace.toml): each archive's attestation bundles ride in the release
+# as <archive>.sigstore.jsonl (one Sigstore bundle per line). `cozy update` verifies those, never GitHub's
+# rate-limited attestations API.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  attestations:
+    runs-on: ubuntu-24.04
+    # bash -eo pipefail: a failing command anywhere in a pipe fails the step.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-build-local-*
+          path: target/distrib/
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir attestations
+          for f in target/distrib/cozy-*.tar.gz target/distrib/cozy-*.zip; do
+            gh api "repos/$GITHUB_REPOSITORY/attestations/sha256:$(sha256sum "$f" | cut -d' ' -f1)" \
+              | jq -c '.attestations[].bundle | select(. != null)' > "attestations/${f#target/distrib/}.sigstore.jsonl"
+            [ -s "attestations/${f#target/distrib/}.sigstore.jsonl" ] || { echo "::error::$f has no attestation"; exit 1; }
+          done
+      # host releases every artifacts-* upload.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-attestations
+          path: attestations/

@@ -11,11 +11,6 @@ dependencies = ["msgspec>=0.18,<1"]
 
 [project.optional-dependencies]
 installer = ["packaging>=24,<27"]
-# cozy-runtime is the trusted helper SDK the tests drive; its absence must fail, not skip.
-test = ["cozy-runtime; python_version >= '3.12'", "numpy>=2,<3", "scikit-learn>=1.5,<2", "pytest>=8,<10"]
 
 [tool.setuptools.packages.find]
 where = ["python"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

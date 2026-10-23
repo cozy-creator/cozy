@@ -185,7 +185,7 @@ fn quantize(input: &Input) -> Result<Vec<OwnedPart>> {
 /// A calibrated producer's `codes` (`U8`, an E2M1 code per element, the logical shape), its
 /// row-major block `scale` (`F8_E4M3`, `[…lead, C/16]`) and `scale_2` (`F32`, one or one per
 /// matrix), with its `pre_quant_scale` and `input_scale` where it has them.
-fn pack(input: &Input) -> Result<Vec<OwnedPart>> {
+pub(super) fn pack(input: &Input) -> Result<Vec<OwnedPart>> {
     let v = view(input)?;
     let a = |role: &str| {
         input

@@ -24,7 +24,6 @@ Each reference is that order for one class, built on the meta device from pinned
 as the checkpoints store the keys, and kept as a tree: for each parent pattern (digit segments
 `#`), its children in order, merged over every instance of that parent and every config (a down
 block with attentions and one without agree on `attentions` < `resnets` < `downsamplers`).
-`vectors/orders/*.json` holds full key orders of models the tests import; never references.
 """
 
 from __future__ import annotations

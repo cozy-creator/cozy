@@ -2,15 +2,12 @@
 use std::process::ExitCode;
 
 use protocol::{
-    calcifer::{Machine, MachineKind, MachineList, MachineState, MachineStatus, Rental},
+    calcifer::{LiveRun, Machine, MachineKind, MachineList, MachineState, MachineStatus, Rental},
     error::Error,
 };
 
 use super::{Notices, clock, machine, now_ms, usd};
-use crate::{Context, output, tui};
-
-/// A Hub failure code: the provider stopped the pod. The Hub keeps the rental and never replaces it.
-const PROVIDER_STOPPED: &str = "readiness.provider_stopped";
+use crate::{Context, output, run, tui};
 
 const IDLE_RULE: &str = "Rentals end themselves after 15 minutes idle (no queued or running work).";
 
@@ -73,7 +70,7 @@ pub async fn list(ctx: &Context, once: bool) -> Result<ExitCode, Error> {
         table = table.row(row);
     }
     table.print();
-    for note in live().filter_map(provider_stopped) {
+    for note in live().filter_map(offline) {
         println!("{note}");
     }
     for m in live() {
@@ -225,10 +222,26 @@ pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
         }
         None => {}
     }
-    if let Some(note) = provider_stopped(m) {
+    if let Some(note) = offline(m) {
         record = record.note(note);
     }
     record
+}
+
+/// A run the machine holds: its state there, target, stage and why it waits. One whose record
+/// here ended is an executor left behind.
+fn live_run(held: &LiveRun) -> (String, String) {
+    let Some(run) = &held.run else {
+        return (format!("run {}", held.id), format!("{}; no record of it here", held.state));
+    };
+    let row = run::list::row(run);
+    let reason = Some(&row[6]).filter(|r| !r.is_empty()).unwrap_or(&held.waiting);
+    let cells = [&held.state, &row[1], &row[4], reason];
+    let mut cell = cells.into_iter().filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join(" · ");
+    if run::settled(run) {
+        cell += &format!("; {} here, left behind on the machine", row[3]);
+    }
+    (format!("run {}", run.number), cell)
 }
 
 /// What a machine reports of itself, one fact per line, GPUs by number.
@@ -283,7 +296,7 @@ pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
             ),
         ));
     }
-    fields.push(("live runs".into(), status.live_runs.to_string()));
+    fields.extend(status.runs.iter().map(live_run));
     if !status.driver_floor.is_empty() {
         let old: Vec<String> = status
             .gpus
@@ -354,7 +367,7 @@ fn kind(m: &Machine) -> &'static str {
 
 pub fn state_cell(m: &Machine) -> String {
     let mut cell = match m.state {
-        _ if provider_stopped(m).is_some() => "stopped by provider".to_string(),
+        _ if m.offline.is_some() => format!("offline: {}", m.offline.as_deref().unwrap_or_default()),
         MachineState::Booting => match &m.boot {
             Some(boot) => format!("booting · {boot}"),
             None => "booting".into(),
@@ -368,13 +381,14 @@ pub fn state_cell(m: &Machine) -> String {
         },
         MachineState::Ending => "ending".into(),
         MachineState::Ended => "ended".into(),
+        MachineState::Unknown => "unknown".into(),
     };
     if m.unverified {
         cell += " (unverified)";
     }
-    match m.unreachable.as_deref() {
-        Some(_) if m.state == MachineState::Ready && unreachable_since(m).is_none() => {
-            cell += " (unreachable)"
+    match m.unreachable_since_ms {
+        Some(at) if m.state == MachineState::Ready && m.offline.is_none() && unreachable_since(m).is_none() => {
+            cell += &format!(" (unreachable for {})", clock(now_ms() - at))
         }
         _ => {}
     }
@@ -474,15 +488,14 @@ fn unreachable_since(m: &Machine) -> Option<i64> {
     (m.state == MachineState::Ready).then_some(since)
 }
 
-fn provider_stopped(m: &Machine) -> Option<String> {
-    let r = m.rental.as_ref()?;
-    (r.failure.as_deref() == Some(PROVIDER_STOPPED)).then(|| {
-        format!(
-            "{} was stopped by its provider. The Hub keeps it but never replaces it: it returns if the \
-             provider resumes it, and ends after 15 minutes idle. To keep working: `cozy machine rent {}`.",
-            m.name, r.sku
-        )
-    })
+/// What an offline machine's owner can do: it is kept, never replaced, and refuses runs meanwhile.
+fn offline(m: &Machine) -> Option<String> {
+    let r = m.rental.as_ref().filter(|_| m.offline.is_some())?;
+    Some(format!(
+        "{} is offline and refuses runs: it returns if its provider resumes it, and ends after 15 \
+         minutes idle. To keep working: `cozy machine rent {}`, or `cozy run … --on new`.",
+        m.name, r.sku
+    ))
 }
 
 fn hub_label(ctx: &Context, origin: &str) -> String {

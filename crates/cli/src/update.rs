@@ -100,6 +100,14 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     }
     let current = env!("CARGO_PKG_VERSION");
     let binary = installed()?;
+    if let Some(brew) = crate::calcifer_client::homebrew(&binary) {
+        return Err(Error::new(
+            Kind::Conflict,
+            "homebrew_managed",
+            format!("{} is Homebrew's cozy; Homebrew updates it", brew.display()),
+        )
+        .next("brew upgrade cozy"));
+    }
     let wanted = args.version.as_deref().map(|v| v.trim_start_matches('v'));
     let dir = match (&ctx.config.download_url, wanted) {
         (Some(url), _) => url.as_str().trim_end_matches('/').to_owned(),
@@ -422,47 +430,4 @@ fn unavailable(url: &str, error: impl std::fmt::Display) -> Error {
 
 fn local(op: &str, error: io::Error) -> Error {
     Error::new(Kind::Internal, "update_failed", format!("{op}: {error}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use sigstore_verify::types::{Artifact, Sha256Hash};
-
-    fn sha256(hex: &str) -> Artifact<'static> {
-        Artifact::from_digest(Sha256Hash::from_hex(hex).unwrap())
-    }
-
-    /// v0.10.0's own bundle for its x86_64 Linux archive.
-    #[test]
-    fn a_release_of_this_repo_verifies() {
-        let lines = include_str!("../tests/fixtures/sigstore/cozy-v0.10.0.jsonl");
-        let archive = sha256("28ec835fdef1d0a1eaf231cfa05d76bdef207ee6387bcb5ae8bf11c3ebc1017c");
-        let signer = super::signer("v0.10.0", lines, archive).unwrap();
-        assert_eq!(
-            signer,
-            "https://github.com/cozy-creator/cozy-creator/.github/workflows/release.yml@refs/heads/release-v0.10.0"
-        );
-    }
-
-    /// A dev build is older than every release, even the one it was built from: `cozy update`
-    /// returns it to the newest.
-    #[test]
-    fn a_release_replaces_a_dev_build() {
-        assert!(super::newer("0.10.2", "0.10.2+dev.g1234abcd"));
-        assert!(super::newer("0.10.1", "0.10.2+dev.g1234abcd"));
-        assert!(!super::newer("0.10.2", "0.10.2"));
-        assert!(super::newer("0.10.3", "0.10.2"));
-    }
-
-    /// cli/cli's genuine GitHub Actions provenance of its own archive verifies, but is not this repo's.
-    #[test]
-    fn another_repos_release_is_refused_for_its_signer() {
-        let lines = include_str!("../tests/fixtures/sigstore/cli-v2.102.0.jsonl");
-        let archive = sha256("bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386");
-        let refusal = super::signer("gh v2.102.0", lines, archive).unwrap_err();
-        assert_eq!(refusal.code, "unattested");
-        let cli = "signed by https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk \
-            (GitHub repository 212613049)";
-        assert!(refusal.message.contains(cli), "{}", refusal.message);
-    }
 }

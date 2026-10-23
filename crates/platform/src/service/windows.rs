@@ -3,6 +3,7 @@
 //! unusable: it ends at its stdin's end, so a service started that way never runs. With no
 //! manager to ask, the service's birth is kept beside the home (`start` records it, and so does
 //! the service's own `announce`), and `stop` ends exactly that birth.
+#![allow(unsafe_code)]
 use super::ServiceSpec;
 use crate::{
     Error, Result,

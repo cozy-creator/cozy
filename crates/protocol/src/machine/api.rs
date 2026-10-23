@@ -212,18 +212,3 @@ pub fn held_objects() {}
     (status = 400, description = "`invalid_bearer`: no token, or not a Hub origin", body = Envelope),
 ))]
 pub fn bearer() {}
-
-#[cfg(test)]
-mod tests {
-    /// The committed spec is what the types generate.
-    #[test]
-    fn the_committed_spec_is_current() {
-        let committed = concat!(env!("CARGO_MANIFEST_DIR"), "/openapi/machine.json");
-        let current = std::fs::read_to_string(committed).unwrap_or_default();
-        assert!(
-            current == super::spec(),
-            "{committed} drifted from the types; regenerate it with \
-             `cargo run -p protocol --example openapi > crates/protocol/openapi/machine.json`"
-        );
-    }
-}

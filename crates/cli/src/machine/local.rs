@@ -106,7 +106,7 @@ pub async fn enable(ctx: &Context) -> Result<ExitCode, Error> {
         ctx,
         &[
             "cozy machine show local",
-            "cozy run <org/package> --on local",
+            "cozy run <[org/]package> --on local",
         ],
     );
     Ok(ExitCode::SUCCESS)

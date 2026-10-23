@@ -1,4 +1,5 @@
 //! Linux: inotify on the directory.
+#![allow(unsafe_code)]
 use crate::Result;
 use std::{path::Path, time::Duration};
 

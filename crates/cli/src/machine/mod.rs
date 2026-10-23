@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 use protocol::{
-    calcifer::{Machine, NewMachine},
+    calcifer::{Machine, NewMachine, clock},
     error::{Error, Kind},
     ids::Digest,
 };
@@ -20,7 +20,7 @@ mod rent;
 
 pub(crate) use list::status_fields;
 pub(crate) use live::Following;
-pub(crate) use rent::{Notices, agree, follow as until_ready, price};
+pub(crate) use rent::{Notices, agree, follow as until_ready, placed};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -65,23 +65,25 @@ enum Verb {
     },
     /// Reset a rental's 15-minute idle clock once.
     Keepalive { name: String },
-    /// Update a machine to its Hub's target software, or to named wheels, as a run.
+    /// Update a machine's Runtime, TensorFS and TensorD in one run and one restart: to the Hub's
+    /// target, or to the versions or local builds named.
     Update {
         name: String,
-        /// Install this cozy-runtime wheel instead of the Hub's target: a local file, or
-        /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself. Alone, the machine
-        /// keeps its tensorfs when the wheel accepts it, else installs PyPI's newest that it does.
-        #[arg(long, value_name = "FILE|URL")]
-        runtime_wheel: Option<std::path::PathBuf>,
-        /// Install this tensorfs wheel instead of the Hub's target: a local file, or
-        /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself.
-        #[arg(long, value_name = "FILE|URL")]
-        tensorfs_wheel: Option<std::path::PathBuf>,
-        /// Run this dev `cozy` binary as the machine (dev-build `build=cozy`): a local file, or
-        /// https://…#sha256=<hex>. The machine checks it runs there before its accepted runs drain;
-        /// on `local` it becomes this computer's cozy, which `cozy update` returns to a release.
-        #[arg(long, value_name = "FILE|URL")]
-        tensord: Option<std::path::PathBuf>,
+        /// The Runtime: a release (`0.30.16`) the machine fetches from PyPI, or a local wheel or
+        /// project to build, sent from here (dev). Alone, the machine keeps its TensorFS when the
+        /// Runtime accepts it, else installs PyPI's newest that it does.
+        #[arg(long, value_name = "VERSION|PATH")]
+        runtime: Option<String>,
+        /// TensorFS: a release (`0.13.13`) the machine fetches from PyPI, or a local wheel or
+        /// project to build, sent from here (dev).
+        #[arg(long, value_name = "VERSION|PATH")]
+        tensorfs: Option<String>,
+        /// TensorD, the machine's `cozy` binary: a release (`0.11.14`) the machine fetches from
+        /// its GitHub release, or a local binary or cozy-creator checkout to build, sent from
+        /// here (dev). On `local` a dev build becomes this computer's cozy, which `cozy update`
+        /// returns to a release.
+        #[arg(long, value_name = "VERSION|PATH")]
+        tensord: Option<String>,
         /// Use at most this much of each GPU's memory (`8GiB`), as a smaller card would; `off`
         /// lifts it. The machine keeps it in its config, across updates and restarts.
         #[arg(long, value_name = "SIZE|off", value_parser = gpu_memory_limit)]
@@ -134,11 +136,11 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         } => add(ctx, name, address, fingerprint).await,
         Verb::Update {
             name,
-            runtime_wheel,
-            tensorfs_wheel,
+            runtime,
+            tensorfs,
             tensord,
             gpu_memory_limit,
-        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel, tensord, gpu_memory_limit).await,
+        } => end::update(ctx, &name, runtime, tensorfs, tensord, gpu_memory_limit).await,
         Verb::Toolchain {
             verb: ToolchainVerb::Install { on },
         } => end::toolchain(ctx, &on).await,
@@ -214,7 +216,7 @@ async fn add(
     output::next(
         ctx,
         &[
-            &format!("cozy run <org/package/function> --on {}", added.name),
+            &format!("cozy run <[org/]package/function> --on {}", added.name),
             &format!("cozy machine show {}", added.name),
         ],
     );
@@ -226,44 +228,8 @@ fn usd(micros: i64) -> String {
     format!("${:.2}", micros as f64 / 1e6)
 }
 
-/// A duration as a clock reads: `41s`, `14m`, `1h12m`.
-fn clock(ms: i64) -> String {
-    let s = (ms / 1000).max(0);
-    match s {
-        0..60 => format!("{s}s"),
-        60..3600 => format!("{}m", s / 60),
-        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
-    }
-}
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_gpu_memory_limit_is_a_size_or_off_and_shows_beside_the_card() {
-        assert_eq!(gpu_memory_limit("8GiB"), Ok(8 << 30));
-        assert_eq!(gpu_memory_limit("off"), Ok(0));
-        assert!(gpu_memory_limit("0").is_err() && gpu_memory_limit("8GB").is_err());
-        let gpu = |limit| protocol::calcifer::Gpu {
-            index: 0,
-            name: "RTX 5070".into(),
-            memory_bytes: 12 << 30,
-            memory_limit_bytes: limit,
-            ..Default::default()
-        };
-        let field = |gpus| {
-            let status = protocol::calcifer::MachineStatus { gpus, ..Default::default() };
-            status_fields(&status).into_iter().find(|(k, _)| k == "gpu memory limit").map(|(_, v)| v)
-        };
-        assert_eq!(field(vec![gpu(8 << 30), protocol::calcifer::Gpu { index: 1, ..gpu(8 << 30) }]).as_deref(),
-            Some("8.0 GiB of GPU 0's 12 GiB, GPU 1's 12 GiB"));
-        assert_eq!(field(vec![gpu(0)]), None);
-    }
 }

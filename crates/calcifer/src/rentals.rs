@@ -14,7 +14,7 @@ use platform::paths::Home;
 use protocol::{
     calcifer::{
         Agreed, Ended, HubListing, HubProblem, Machine, MachineKind, MachineState, On, Quote,
-        Reason, Rental, Rented, RunQuote, SubmitRun, Warning,
+        Alternative, Reason, Rental, Rented, RunQuote, SubmitRun, Warning,
     },
     config,
     error::{Error, Kind},
@@ -89,6 +89,11 @@ impl Hubs {
         lock(&self.listings)
             .get(origin)
             .and_then(|listing| listing.rentals.get(id).cloned())
+    }
+
+    /// Why a rental cannot be reached, by its Hub's last word.
+    pub(crate) fn offline(&self, row: &MachineRow) -> Option<String> {
+        offline(&self.rental(&row.hub, row.rental_id.as_deref()?)?)
     }
 
     /// A rental's GPUs as its Hub last said them.
@@ -445,8 +450,9 @@ impl Machines {
     }
 
     /// Rents a machine for an unplaced run (`--on new[:<sku>]`) under a key the run names, so a
-    /// Calcifer that stops mid-ask asks again for the same rental. Without a product, the Hub
-    /// places the run: the cheapest expected rental that holds it, named on the run.
+    /// Calcifer that stops mid-ask asks again for the same rental. Unless the run names both the
+    /// product and its GPUs, the Hub places it (on the named product): the cheapest per run of the
+    /// machines fast enough, named on the run.
     pub(crate) fn rent_for(self: &Arc<Self>, run: &RunRow, sku: Option<&str>, gpus: u32) {
         if !lock(&self.renting).insert(run.id.clone()) {
             return;
@@ -459,8 +465,8 @@ impl Machines {
                     return Ok(ask);
                 }
                 let (sku, gpus) = match sku {
-                    Some(sku) => (sku, (gpus > 0).then_some(gpus)),
-                    None => me.placed(&run).await?,
+                    Some(sku) if gpus > 0 => (sku, Some(gpus)),
+                    sku => me.placed(&run, sku.as_deref()).await?,
                 };
                 let hub = run.hub.as_deref().unwrap_or_default();
                 let shape = Shape {
@@ -503,21 +509,42 @@ impl Machines {
         });
     }
 
-    /// Asks the run's Hub where to run it: the product to rent and its GPU count. The answer is
-    /// kept on the run as a warning naming the product, its price and why.
-    async fn placed(&self, run: &RunRow) -> Result<(String, Option<u32>), Error> {
+    /// Asks the run's Hub where to run it, on `sku` when the run names one: the product to rent and
+    /// its GPU count. The answer is kept on the run as a warning naming the product, its price and why.
+    async fn placed(&self, run: &RunRow, sku: Option<&str>) -> Result<(String, Option<u32>), Error> {
         let hub = run.hub.as_deref().unwrap_or_default();
-        let (sku, gpus, message) = self.placement(hub, &run.spec).await?;
-        let warning = Warning {
-            code: "placement".into(),
-            message,
-        };
-        self.calcifer.warn(&run.id, &warning).map_err(internal)?;
-        Ok((sku, gpus))
+        let placed = self.place(hub, &run.spec, sku).await?;
+        if !placed.why.is_empty() {
+            let warning = Warning {
+                code: "placement".into(),
+                message: placed.why,
+            };
+            self.calcifer.warn(&run.id, &warning).map_err(internal)?;
+        }
+        Ok((placed.sku, placed.gpus))
     }
 
-    /// What `hub` places a run of `spec` on: the product, its GPU count, and why, in words.
-    async fn placement(&self, hub: &str, spec: &v1::RunSpec) -> Result<(String, Option<u32>, String), Error> {
+    /// Where `hub` places a run of `spec`, on `sku` when the run names one. A named product the Hub
+    /// cannot place on (local code, weights it does not hold) is rented as named, at one GPU.
+    async fn place(&self, hub: &str, spec: &v1::RunSpec, sku: Option<&str>) -> Result<Placed, Error> {
+        match (self.placement(hub, spec, sku).await, sku) {
+            (Ok(placed), _) => Ok(placed),
+            (Err(e), Some(sku)) => Ok(Placed {
+                sku: sku.into(),
+                gpus: None,
+                why: match e.code.as_str() {
+                    "placement_needs_release" => String::new(),
+                    _ => format!("{sku} as asked, though {}", e.message),
+                },
+                alternatives: vec![],
+            }),
+            (Err(e), None) => Err(e),
+        }
+    }
+
+    /// What `hub` places a run of `spec` on: the pick, why in words, and the alternatives a quote
+    /// shows (the cheapest per run and the fastest, else the next machines in the Hub's order).
+    async fn placement(&self, hub: &str, spec: &v1::RunSpec, sku: Option<&str>) -> Result<Placed, Error> {
         let Some(v1::Source::Release(release)) = &spec.source else {
             return Err(Error::new(
                 Kind::Usage,
@@ -535,6 +562,7 @@ impl Machines {
                 .transpose()
                 .map_err(|e| Error::new(Kind::Validation, "bits_invalid", e.to_string()))?,
             gpus: std::num::NonZeroU64::new(spec.gpus.into()),
+            sku: sku.map(str::to_owned),
         };
         let client = self.hubs.client(hub)?;
         let placement = match client.place_rental(&request).await {
@@ -560,20 +588,30 @@ impl Machines {
                 ),
             ));
         };
-        let message = format!(
-            "the Hub placed it on {} ({}× {}, {} GB): ${:.2}/h, about ${:.2} expected, the \
-             cheapest of {} products holding {} GB of {}-bit weights",
+        let fast = placement.machines.iter().filter(|m| m.fast == Some(true)).count();
+        let rule = match (top.fast, top.speed) {
+            (_, None) => format!("the cheapest of {} products", placement.machines.len()),
+            (Some(true), _) => format!("the cheapest per run of {fast} machines fast enough"),
+            _ => format!("the fastest of {}: none is fast enough", placement.machines.len()),
+        };
+        let why = format!(
+            "the Hub placed it on {} ({}× {}, {} GB): ${:.2}/h, about ${:.2} expected, {rule} for \
+             {} GB of {}-bit weights",
             top.name,
             top.accelerator_count,
             top.accelerator_model,
             top.vram_gb,
             (top.price_usd_micros_per_hour + top.storage_usd_micros_per_hour) as f64 / 1e6,
             top.expected_price.total_usd_micros as f64 / 1e6,
-            placement.machines.len(),
             placement.weight_bytes / 1_000_000_000,
             placement.bits,
         );
-        Ok((top.name.clone(), u32::try_from(top.accelerator_count).ok(), message))
+        Ok(Placed {
+            sku: top.name.clone(),
+            gpus: u32::try_from(top.accelerator_count).ok(),
+            why,
+            alternatives: alternatives(&placement.machines),
+        })
     }
 
     /// What a `new` run would rent and its price, as `rent_for` would ask it: nothing is rented.
@@ -582,15 +620,19 @@ impl Machines {
             return Err(Error::new(Kind::Usage, "quote_needs_new", "only a run with `--on new` rents"));
         };
         let gpus = (submit.spec.gpus > 0).then_some(submit.spec.gpus);
-        let (sku, gpus) = match sku {
-            Some(sku) => (sku.clone(), gpus),
-            None => {
-                let (sku, gpus, _) = self.placement(&submit.hub, &submit.spec).await?;
-                (sku, gpus)
-            }
+        let placed = match (sku, gpus) {
+            (Some(sku), Some(_)) => Placed { sku: sku.clone(), gpus, why: String::new(), alternatives: vec![] },
+            (sku, _) => self.place(&submit.hub, &submit.spec, sku.as_deref()).await?,
         };
-        let quote = self.quote(&submit.hub, &sku, Shape { gpus, ..Shape::default() }).await?;
-        Ok(RunQuote { sku, gpus, quote })
+        let gpus = placed.gpus.or(gpus);
+        let quote = self.quote(&submit.hub, &placed.sku, Shape { gpus, ..Shape::default() }).await?;
+        Ok(RunQuote {
+            sku: placed.sku,
+            gpus,
+            quote,
+            why: Some(placed.why).filter(|w| !w.is_empty()),
+            alternatives: placed.alternatives,
+        })
     }
 
     /// Asks again what a Calcifer that stopped had asked a Hub and not heard back. A run asked
@@ -698,24 +740,43 @@ impl Machines {
         }
     }
 
-    /// Asks a rental's Hub whether it still exists; ends it here when the Hub says it does not.
-    pub(crate) async fn hub_says_gone(&self, name: &str) -> bool {
-        let Ok(Some(row)) = self.store().machine(name) else {
-            return false;
-        };
-        let Some(id) = row.rental_id.as_deref() else {
-            return false;
-        };
-        match self.hubs.read(&row.hub, id).await {
-            Ok(rental) if gone(&rental.state) => {
-                self.ended(name, &cause(&rental));
-                true
-            }
-            Ok(_) => false,
+    /// Asks a rental's Hub about it after it did not answer, and acts on the word: an ended
+    /// rental ends here, and one serving at a new address is recorded there and followed. None:
+    /// not a rental, or its Hub did not answer.
+    pub(crate) async fn hub_word(self: &Arc<Self>, name: &str) -> Option<Word> {
+        let mut row = self.store().machine(name).ok()??;
+        let id = row.rental_id.clone()?;
+        let rental = match self.hubs.read(&row.hub, &id).await {
+            Ok(rental) => rental,
             Err(e) => {
                 warn!(machine = name, "asking its Hub: {e}");
-                false
+                return None;
             }
+        };
+        self.calcifer.machine_changed();
+        if gone(&rental.state) {
+            let cause = cause(&rental);
+            self.ended(name, &cause);
+            return Some(Word::Gone(cause));
+        }
+        if let Some(reason) = offline(&rental) {
+            // Its runs hear it now rather than at their next try.
+            self.calcifer.touch(name);
+            return Some(Word::Offline(reason));
+        }
+        match endpoint(&rental) {
+            Some(endpoint) if row.endpoint.as_ref() != Some(&endpoint) => {
+                row.endpoint = Some(endpoint);
+                if let Err(e) = self.calcifer.put_machine(&row) {
+                    warn!(machine = name, "recording its new address: {e}");
+                    return Some(Word::Up);
+                }
+                self.watch(&row);
+                Some(Word::Moved)
+            }
+            Some(_) => Some(Word::Up),
+            None if matches!(rental.state.as_str(), "ready" | "degraded") => Some(Word::Up),
+            None => Some(Word::Booting),
         }
     }
 
@@ -736,7 +797,7 @@ impl Machines {
         self.calcifer.machine_changed();
     }
 
-    async fn list_hub(&self, origin: &str) {
+    async fn list_hub(self: &Arc<Self>, origin: &str) {
         let client = match self.hubs.client(origin) {
             Ok(client) => client,
             Err(_) => {
@@ -788,7 +849,7 @@ impl Machines {
                     .as_ref()
                     .is_some_and(|id| !listed.contains(id))
             {
-                self.hub_says_gone(&row.name).await;
+                self.hub_word(&row.name).await;
             }
         }
     }
@@ -927,6 +988,56 @@ impl Hubs {
     }
 }
 
+/// Where a Hub places a run: the product, its GPU count, why in words, and other machines.
+struct Placed {
+    sku: String,
+    gpus: Option<u32>,
+    why: String,
+    alternatives: Vec<Alternative>,
+}
+
+/// Two machines beside the pick, against it: the cheapest per run and the fastest, each when it
+/// is not the pick, filled from the Hub's order. None from a Hub that names no speeds.
+fn alternatives(machines: &[types::RentalPlacementMachine]) -> Vec<Alternative> {
+    let Some((top, rest)) = machines.split_first() else {
+        return vec![];
+    };
+    let (Some(speed), Some(cost)) = (top.speed, top.run_cost) else {
+        return vec![];
+    };
+    let by = |key: fn(&types::RentalPlacementMachine) -> f64| {
+        rest.iter().enumerate().min_by(|a, b| key(a.1).total_cmp(&key(b.1))).map(|(i, _)| i)
+    };
+    let cheapest = by(|m| m.run_cost.unwrap_or(f64::MAX)).filter(|&i| rest[i].run_cost < top.run_cost);
+    let fastest = by(|m| -m.speed.unwrap_or(0.0)).filter(|&i| rest[i].speed > top.speed);
+    let mut picked: Vec<(usize, &str)> = vec![];
+    for (i, label) in [(cheapest, "cheaper per run"), (fastest, "faster")] {
+        if let Some(i) = i.filter(|i| !picked.iter().any(|(p, _)| p == i)) {
+            picked.push((i, label));
+        }
+    }
+    for i in 0..rest.len() {
+        if picked.len() < 2 && !picked.iter().any(|(p, _)| *p == i) {
+            picked.push((i, ""));
+        }
+    }
+    picked
+        .into_iter()
+        .map(|(i, label)| {
+            let m = &rest[i];
+            Alternative {
+                sku: m.name.clone(),
+                gpus: u32::try_from(m.accelerator_count).unwrap_or(1),
+                label: label.into(),
+                time: m.speed.filter(|s| *s > 0.0).map_or(0.0, |s| speed / s),
+                run_cost: m.run_cost.map_or(0.0, |c| c / cost),
+                usd_micros_per_hour: m.price_usd_micros_per_hour + m.storage_usd_micros_per_hour,
+                expected_total_usd_micros: m.expected_price.total_usd_micros,
+            }
+        })
+        .collect()
+}
+
 /// A rent ask as recorded: the exact request the Hub gets, and the quote it is held to.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RentBody {
@@ -1006,6 +1117,38 @@ pub(crate) fn signed_out(origin: &str) -> Error {
         format!("this computer is not signed in to {origin}"),
     )
     .next(login)
+}
+
+/// What a rental's Hub said of a machine that did not answer, once acted on.
+pub(crate) enum Word {
+    /// It ended here, for this cause.
+    Gone(String),
+    /// Its provider stopped it, or its Hub is ending it: why.
+    Offline(String),
+    /// It serves at a new address, now recorded and followed.
+    Moved,
+    /// Its Hub says its provider has not stopped it.
+    Up,
+    /// Its Hub says it is on its way, with no address yet.
+    Booting,
+}
+
+/// Why a rental cannot be reached, by its Hub's word: its provider stopped it (the Hub keeps it,
+/// and it returns if the provider resumes it), or its Hub is ending it.
+fn offline(rental: &types::Rental) -> Option<String> {
+    let provider = rental.provider.as_deref().filter(|p| !p.is_empty());
+    let who = provider.unwrap_or("its provider");
+    let code = rental.failure.as_ref().map_or("", |f| f.code.as_str());
+    match rental.state.as_str() {
+        "degraded" if code == "readiness.provider_stopped.account_balance" => {
+            Some(format!("{who} stopped it (the Hub's balance there is spent)"))
+        }
+        "degraded" if code.starts_with("readiness.provider_stopped") => {
+            Some(format!("{who} stopped it"))
+        }
+        "release_requested" => Some(format!("its Hub is ending it ({})", cause(rental))),
+        _ => None,
+    }
 }
 
 /// The Hub has proven the pod gone.
@@ -1165,9 +1308,11 @@ fn other(origin: &str, rental: &types::Rental, unverified: bool) -> Machine {
             .and_then(pin_of)
             .map(protocol::ids::Digest::from_bytes),
         reason: None,
+        offline: None,
         rental: Some(view(rental, None)),
         status: None,
         unreachable: None,
+        unreachable_since_ms: None,
         boot: boot_phase(rental).filter(|_| rental.state != "ready"),
         running: 0,
         queued: 0,

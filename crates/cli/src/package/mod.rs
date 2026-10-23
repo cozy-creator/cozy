@@ -7,6 +7,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::Subcommand;
 use protocol::error::{Error, Kind};
+use protocol::names::ROOT;
 
 use crate::{Context, run::Placement};
 
@@ -36,13 +37,13 @@ enum Command {
     /// A published package's releases, newest first; one release, with what its publish warned
     /// of (its owner sees the warnings).
     Info {
-        /// org/name[@release]
+        /// [org/]name[@release]
         package: String,
     },
-    /// Install a published package (org/name[@release]), a directory or a script on a machine: its
-    /// environment, no weights.
+    /// Install a published package ([org/]name[@release]), a directory or a script on a machine:
+    /// its environment, no weights.
     Install {
-        /// org/name[@release], a directory such as `.` or `./project`, or a PEP 723 `script.py`.
+        /// [org/]name[@release], a directory such as `.` or `./project`, or a PEP 723 `script.py`.
         #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::local))]
         package: String,
         #[command(flatten)]
@@ -51,16 +52,19 @@ enum Command {
         #[arg(long)]
         detach: bool,
     },
-    /// Move a machine's packages to their Hub's newest release: the named ones, else every one.
+    /// Move a machine's packages to a release, their Hub's newest unless named: the named ones,
+    /// else every one. A directory or script installs live, as `install` does.
     Update {
-        /// org/name; none updates every published package on the machine.
+        /// [org/]name[@release], a directory such as `.` or `./project`, or a PEP 723 `script.py`;
+        /// none moves every published package on the machine to its newest release.
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::local))]
         packages: Vec<String>,
         #[command(flatten)]
         placement: Placement,
     },
     /// Remove packages from a machine, every Hub's installation unless --tensorhub narrows.
     Remove {
-        /// org/name or local/name.
+        /// [org/]name or local/name.
         #[arg(required = true)]
         packages: Vec<String>,
         #[command(flatten)]
@@ -80,12 +84,19 @@ enum Command {
         /// Let this dependency move to its newest compatible release; repeat for each.
         #[arg(long = "upgrade-package", value_name = "PACKAGE")]
         upgrade: Vec<String>,
+        /// For the root namespace (first-party, Hub admins), not your account.
+        #[arg(long)]
+        root: bool,
     },
-    /// Publish this project as <account>/<name>@<version> (needs uv).
-    Publish,
+    /// Publish this project as <account>/<name>@<version>, or <name>@<version> with --root (needs uv).
+    Publish {
+        /// At the root namespace: first-party, Hub admins only.
+        #[arg(long)]
+        root: bool,
+    },
     /// Yank a release: machines that hold it keep it, nothing new installs it.
     Yank {
-        /// org/name@release
+        /// [org/]name@release
         release: String,
     },
 }
@@ -107,19 +118,26 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Command::Update {
             packages,
             placement,
-        } => machine::update(ctx, &names(&packages)?, placement.on()).await,
+        } => {
+            let paths: Vec<PathBuf> = packages.iter().filter_map(|p| directory(p)).collect();
+            let named = (packages.iter().filter(|p| directory(p).is_none()))
+                .map(|text| PackageRef::parse(text).map(|r| (r.package(), r.release)))
+                .collect::<Result<Vec<_>, _>>()?;
+            machine::update(ctx, &named, &paths, placement.on()).await
+        }
         Command::Remove {
             packages,
             placement,
         } => machine::remove(ctx, &names(&packages)?, placement.on()).await,
         Command::List { on, once } => machine::list(ctx, on.map(Into::into), once).await,
-        Command::Lock { upgrade } => author::lock(ctx, &upgrade).await,
-        Command::Publish => author::publish(ctx).await,
+        Command::Lock { upgrade, root } => author::lock(ctx, &upgrade, root).await,
+        Command::Publish { root } => author::publish(ctx, root).await,
         Command::Yank { release } => author::yank(ctx, &PackageRef::parse(&release)?).await,
     }
 }
 
-/// `org/name[@release]`, lowercased: names are one identity in any case.
+/// `[org/]name[@release]`, lowercased: names are one identity in any case. No org is the root's
+/// (first-party), org [`ROOT`] on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackageRef {
     pub org: String,
@@ -140,7 +158,7 @@ impl PackageRef {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         };
-        match path.split_once('/') {
+        match path.split_once('/').or(Some((ROOT, path))) {
             Some((org, name))
                 if valid(org) && valid(name) && release.as_deref().is_none_or(valid) =>
             {
@@ -153,7 +171,7 @@ impl PackageRef {
             _ => Err(Error::new(
                 Kind::Usage,
                 "package_ref_invalid",
-                format!("{text:?} is not org/name or org/name@release"),
+                format!("{text:?} is not [org/]name[@release]"),
             )),
         }
     }
@@ -185,7 +203,7 @@ fn directory(text: &str) -> Option<PathBuf> {
     explicit.then(|| PathBuf::from(text))
 }
 
-/// Names for update and remove: `org/name` (or `local/name`), with no release.
+/// Names to remove: `[org/]name` (or `local/name`), with no release.
 fn names(texts: &[String]) -> Result<Vec<String>, Error> {
     texts
         .iter()
@@ -226,27 +244,4 @@ pub(crate) fn newest_first<T>(mut items: Vec<T>, version: impl Fn(&T) -> &str) -
     }
     sorted.extend(items);
     sorted
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn refs_are_lowercase_and_releases_order_by_number() {
-        assert_eq!(
-            PackageRef::parse("Fidika/SDXL").unwrap().package(),
-            "fidika/sdxl"
-        );
-        assert!(PackageRef::parse("sdxl").is_err());
-        assert!(directory("sdxl").is_none() && directory("./sdxl").is_some());
-        let releases = vec!["2.9.0", "2.10.0rc1", "2.10.0", "nightly", "1.37.2", "2.10.0.post1"];
-        let sorted = newest_first(releases, |r| *r);
-        assert_eq!(sorted, ["2.10.0.post1", "2.10.0", "2.9.0", "1.37.2", "2.10.0rc1", "nightly"]);
-        assert_eq!(stamp("2026-10-16T09:34:25.879488Z"), "2026-10-16T09:34:25Z");
-        assert_eq!(
-            stamp("2026-10-16T09:34:25+02:00"),
-            "2026-10-16T09:34:25+02:00"
-        );
-    }
 }

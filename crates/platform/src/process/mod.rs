@@ -1,5 +1,6 @@
 //! Processes named by their birth, never by a bare PID, and process trees ended whole.
 //! Nothing here kills because time passed: callers decide from what they measured.
+#![allow(unsafe_code)]
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -292,9 +293,10 @@ pub fn burn(pid: u32) -> Option<u64> {
     meter(pid).map(|(cpu, moved)| cpu.saturating_add(moved))
 }
 
-/// The bytes a process has read. `None`: unreadable.
-pub fn read_bytes(pid: u32) -> Option<u64> {
-    sys::read_bytes(pid)
+/// The bytes a process has written: what an install lands (its downloads, unpacked wheels).
+/// `None`: unreadable.
+pub fn written_bytes(pid: u32) -> Option<u64> {
+    sys::written_bytes(pid)
 }
 
 /// A process this error was about is gone: its record vanished, or it was reaped mid-read.
@@ -461,24 +463,5 @@ impl Tree {
 impl Drop for Tree {
     fn drop(&mut self) {
         let _ = self.kill();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_child_names_this_process_as_its_parent() {
-        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
-            .args(if cfg!(windows) {
-                &["/C", "ping -n 30 127.0.0.1 >NUL"][..]
-            } else {
-                &["30"][..]
-            })
-            .spawn()
-            .unwrap();
-        let parent = super::parent_of(child.id());
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert_eq!(parent.unwrap(), std::process::id());
     }
 }

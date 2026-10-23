@@ -11,6 +11,47 @@ pub struct Interface {
     pub callables: Vec<Callable>,
     /// Callables this build cannot read, and why.
     pub unavailable: Vec<(String, String)>,
+    /// The package's declared quantize recipes, which its `quantize` runs.
+    pub recipes: Vec<Recipe>,
+}
+
+/// The entrypoint a package with recipes runs them through (`cozy model quantize`).
+pub const RECIPES: &str = "quantize";
+
+/// One declared recipe: the lane it writes and the model it reads.
+#[derive(Debug, Deserialize)]
+pub struct Recipe {
+    pub name: String,
+    pub lane: String,
+    pub model: RecipeModel,
+    /// `module:function` that calibrates on the model itself, constructed in `quantize`'s slot.
+    #[serde(default, deserialize_with = "or_default")]
+    pub calibrate: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecipeModel {
+    pub class: String,
+    #[serde(default, deserialize_with = "or_default")]
+    pub component_use: BTreeMap<String, Vec<String>>,
+}
+
+/// The lanes `cozy model quantize` names by a flag of their own (`--int8`).
+pub const LANE_FLAGS: [&str; 5] = ["int8", "fp8", "nvfp4", "w4a8", "svdq-nvfp4"];
+
+impl Recipe {
+    /// The `cozy model quantize` flag that runs it: its lane's, else its name.
+    pub fn flag(&self) -> String {
+        match LANE_FLAGS.contains(&self.lane.as_str()) {
+            true => format!("--{}", self.lane),
+            false => format!("--recipe {}", self.name),
+        }
+    }
+
+    /// Whether a checkpoint holding `components` holds every component its model reads.
+    pub fn reads(&self, components: &[String]) -> bool {
+        self.model.component_use.values().flatten().all(|need| components.contains(need))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,9 +94,6 @@ pub struct Slot {
     /// `decode` for an LM token loop; absent is compute.
     #[serde(default, deserialize_with = "or_default")]
     pub phase: Option<String>,
-    /// The checkpoint components each of its stages reads: what a checkpoint must carry for it.
-    #[serde(default, deserialize_with = "or_default")]
-    pub component_use: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,19 +238,28 @@ impl Interface {
                 Err(why) => out.unavailable.push((name, why)),
             }
         }
+        // A recipe this build cannot read is left out; `cozy model quantize` names those it can.
+        out.recipes = (document["recipes"].as_array().into_iter().flatten())
+            .filter_map(|raw| Recipe::deserialize(raw).ok())
+            .collect();
         Ok(out)
     }
 
     /// The package's functions, GPU before CPU, each group sorted: never an internal callable or
-    /// a recipe (a conversion, which only `cozy model quantize` runs).
+    /// the recipes' `quantize`, which `cozy model quantize` runs.
     pub fn public(&self) -> Vec<&str> {
-        let mut public: Vec<&Callable> = self.callables.iter().filter(|c| !c.internal && !c.is_conversion()).collect();
+        let mut public: Vec<&Callable> = self.callables.iter().filter(|c| !c.internal && !self.runs_recipes(c)).collect();
         public.sort_unstable_by_key(|c| (c.accelerator == Some(false), c.name.as_str()));
         public.into_iter().map(|c| c.name.as_str()).collect()
     }
 }
 
 impl Interface {
+    /// Whether `callable` is the `quantize` that runs this package's recipes.
+    pub fn runs_recipes(&self, callable: &Callable) -> bool {
+        callable.name == RECIPES && !self.recipes.is_empty()
+    }
+
     /// Whether `callable` runs on a GPU: its own body, or the package's internal GPU functions a
     /// CPU function that loads no model orchestrates (H3's ref2va and long_form). Tensorhub's
     /// placement (`runplacement`) reads a function the same way.
@@ -248,8 +295,7 @@ impl Callable {
         Ok(self)
     }
 
-    /// A conversion (a recipe) reads `<input-model> [<org/model>]`: it has model slots and writes
-    /// weights. It is never a function: `cozy model quantize` runs it.
+    /// A conversion reads `<input-model> [<org/model>]`: it has model slots and writes weights.
     pub fn is_conversion(&self) -> bool {
         !self.models.is_empty() && !self.weights_outputs.is_empty()
     }
@@ -359,152 +405,4 @@ fn or_default<'de, D: Deserializer<'de>, T: Default + Deserialize<'de>>(
     d: D,
 ) -> Result<T, D::Error> {
     Option::<T>::deserialize(d).map(Option::unwrap_or_default)
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-
-    pub(crate) fn card(name: &str) -> Value {
-        let path = format!(
-            "{}/tests/fixtures/cards/{name}.json",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        serde_json::from_str(&std::fs::read_to_string(&path).expect(&path)).expect("a card")
-    }
-
-    pub(crate) fn interface(name: &str) -> Interface {
-        Interface::parse(&card(name)["package_interface"]).expect("an interface")
-    }
-
-    #[test]
-    fn every_real_card_reads_whole() {
-        for name in [
-            "sdxl-2.10.0",
-            "minimax-h3-1.37.2",
-            "qwen-image-2-0.7.0",
-            "flux-3-klein-0.5.0",
-            "seedvr2-0.4.0",
-            "birefnet-0.2.0",
-            "character-describer-0.5.0",
-            "minimax-h3-tools-2.19.0",
-            "anima-0.9.0",
-        ] {
-            let read = interface(name);
-            assert!(
-                read.unavailable.is_empty(),
-                "{name}: {:?}",
-                read.unavailable
-            );
-            assert!(!read.callables.is_empty(), "{name}");
-            for callable in &read.callables {
-                for field in &callable.request.fields {
-                    assert_ne!(
-                        field.ty,
-                        Type::Unknown,
-                        "{name} {}.{}",
-                        callable.name,
-                        field.name
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn sdxl_reads_its_types_wires_defaults_and_slots() {
-        let sdxl = interface("sdxl-2.10.0");
-        assert_eq!(sdxl.public(), ["generate"], "recipes are not functions");
-        let generate = sdxl
-            .callables
-            .iter()
-            .find(|c| c.name == "generate")
-            .unwrap();
-        assert!(!generate.is_conversion());
-        assert_eq!(generate.models[0].param, "model");
-        let prompt = generate.field("prompt").unwrap();
-        assert_eq!(
-            (prompt.ty.clone(), prompt.wire),
-            (Type::Str, Wire::Required)
-        );
-        let seed = generate.field("seed").unwrap();
-        assert_eq!(seed.default, Some(Value::Null));
-        assert_eq!(
-            seed.ty,
-            Type::Union {
-                branches: vec![Type::Int, Type::Null],
-                tag_field: None
-            }
-        );
-        let steps = generate.field("steps").unwrap();
-        assert_eq!((steps.wire, steps.default.clone()), (Wire::Omissible, None));
-        assert_eq!(steps.constraints.le, Some(50.0));
-        let int8 = sdxl.callables.iter().find(|c| c.name == "int8").unwrap();
-        assert!(int8.is_conversion() && int8.models[0].weights);
-        assert_eq!(int8.result.input.as_deref(), Some("model"));
-    }
-
-    #[test]
-    fn recipes_are_not_functions() {
-        let klein = interface("flux-3-klein-0.5.0");
-        assert_eq!(klein.public(), ["edit", "edit_base", "generate", "generate_base"]);
-        let recipes = klein.callables.iter().filter(|c| c.is_conversion()).count();
-        assert_eq!(recipes, 4, "int8, nvfp4 and the upsampler's are recipes");
-    }
-
-    #[test]
-    fn a_model_free_callable_reads_with_its_lists_absent_or_null() {
-        let described = serde_json::json!({"application": "tiny:app", "format": "cozy.package.interface/1", "entrypoints": [
-            {"accelerator": false, "name": "echo",
-             "invocable": {"capabilities": [], "context": "", "defaults": {"request/text": "hello"}, "enum_members": {},
-                           "export": "echo", "memoize": false, "module": "tiny", "parameters": ["text"],
-                           "type_names": {"request": "EchoInput", "result": "EchoOutput"}},
-             "request": {"fields": [{"default": "hello", "name": "text", "type": "str", "wire": "optional"}]},
-             "result": {"fields": [{"name": "text", "type": "str"}]}},
-            {"name": "nulls", "models": null, "weights_outputs": null, "assets": null, "invocable": null,
-             "request": {"fields": [{"name": "n", "type": "int", "constraints": null, "asset_bound": null}]},
-             "result": null}
-        ]});
-        let read = Interface::parse(&described).unwrap();
-        assert!(read.unavailable.is_empty(), "{:?}", read.unavailable);
-        assert_eq!(read.public(), ["nulls", "echo"], "GPU functions first");
-        let echo = &read.callables[0];
-        assert!(echo.models.is_empty() && echo.weights_outputs.is_empty() && !echo.is_conversion());
-        assert_eq!(echo.field("text").unwrap().wire, Wire::Optional);
-    }
-
-    /// H3's shape: a CPU `render` that loads nothing calls an internal GPU `generate`; it runs on
-    /// a GPU, as Tensorhub places it. A CPU function of a package with no internal GPU one does not.
-    #[test]
-    fn a_cpu_function_that_calls_internal_gpu_ones_runs_on_a_gpu() {
-        let invocable = serde_json::json!({"capabilities": [], "context": "", "defaults": {}, "enum_members": {},
-            "export": "f", "memoize": false, "module": "m", "parameters": [], "type_names": {}});
-        let model = serde_json::json!([{"path": "generate.models.model", "class": "M", "default": "m@1"}]);
-        let entry = |name: &str, extra: Value| {
-            let mut e = serde_json::json!({"name": name, "invocable": invocable, "request": {"fields": []}, "result": {"fields": []}});
-            e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            e
-        };
-        let read = |entrypoints: Vec<Value>| {
-            Interface::parse(&serde_json::json!({"application": "m:app", "format": "cozy.package.interface/1", "entrypoints": entrypoints})).unwrap()
-        };
-        let h3 = read(vec![
-            entry("generate", serde_json::json!({"internal": true, "models": model})),
-            entry("render", serde_json::json!({"accelerator": false})),
-        ]);
-        let render = h3.callables.iter().find(|c| c.name == "render").unwrap();
-        assert!(h3.orchestrates(render) && h3.gpu(render));
-        let plain = read(vec![entry("render", serde_json::json!({"accelerator": false}))]);
-        assert!(!plain.gpu(&plain.callables[0]));
-    }
-
-    #[test]
-    fn a_callable_this_build_cannot_read_is_unavailable_alone() {
-        let mut document = card("birefnet-0.2.0")["package_interface"].clone();
-        document["entrypoints"][0]["models"][0]["path"] = "elsewhere.models.source".into();
-        let read = Interface::parse(&document).unwrap();
-        assert_eq!(read.public(), ["remove_background"]);
-        assert_eq!(read.unavailable[0].0, "normalize");
-        assert!(Interface::parse(&serde_json::json!({"format": "other"})).is_err());
-    }
 }

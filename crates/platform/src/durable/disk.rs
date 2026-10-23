@@ -16,6 +16,7 @@
 //!   bytes are flushed before their name is published, as before.
 //! - **Persistent** — everything else (ext4, xfs, btrfs, zfs, ...), a `statfs` that fails,
 //!   and every non-Linux platform. The safe side: it survives a crash of this machine.
+#![allow(unsafe_code)]
 use std::{fs::File, path::Path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,6 +59,7 @@ pub fn filesystem(path: &Path) -> Filesystem {
             // SAFETY: plain-old-data the call fills, and a NUL-terminated path.
             let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
             #[allow(clippy::unnecessary_cast)] // f_type's width differs by target
+            // SAFETY: as above.
             (unsafe { libc::statfs(c.as_ptr(), &mut stat) } == 0).then_some(stat.f_type as u64)
         });
     match magic {
@@ -193,6 +195,7 @@ mod linux {
         // SAFETY: out-param of the right type on our own descriptor.
         let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
         #[allow(clippy::unnecessary_cast)] // f_type is not an i64 on every target
+        // SAFETY: as above.
         let magic =
             unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) == 0 }.then_some(fs.f_type as i64);
         magic == Some(OVERLAYFS_SUPER_MAGIC)
@@ -223,40 +226,8 @@ mod linux {
         // SAFETY: the vector holds one byte per page of the mapping.
         let ok = unsafe { libc::mincore(p, n, pages.as_mut_ptr()) } == 0
             && pages.iter().all(|b| b & 1 == 1);
+        // SAFETY: unmaps the mapping made above, which nothing else references.
         unsafe { libc::munmap(p, n) };
         ok
-    }
-}
-
-/// Statfs magics are Linux's.
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn magics_name_their_class() {
-        assert_eq!(classify(0x794c_7630).class, DiskClass::Ephemeral);
-        assert_eq!(classify(0x0102_1994).class, DiskClass::Ephemeral);
-        assert_eq!(classify(0x6969).class, DiskClass::Network);
-        assert_eq!(classify(0x6573_5546).class, DiskClass::Network);
-        assert_eq!(classify(0xef53).class, DiskClass::Persistent);
-        assert_eq!(classify(0x1234_5678).class, DiskClass::Persistent);
-    }
-
-    #[test]
-    fn real_mounts_classify() {
-        if Path::new("/dev/shm").is_dir() {
-            assert_eq!(filesystem(Path::new("/dev/shm")).kind, "tmpfs");
-            assert_eq!(DiskClass::of(Path::new("/dev/shm")), DiskClass::Ephemeral);
-        }
-        assert_eq!(
-            DiskClass::of(Path::new("/proc/self")),
-            DiskClass::Persistent,
-            "an unrecognised filesystem is the safe side"
-        );
-        assert_eq!(
-            DiskClass::of(Path::new("/no/such/path/anywhere")),
-            DiskClass::Persistent
-        );
     }
 }

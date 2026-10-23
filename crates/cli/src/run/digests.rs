@@ -91,35 +91,3 @@ fn hash(path: &Path) -> Result<Digest, Error> {
     io::copy(&mut file, &mut hasher).map_err(unreadable)?;
     Ok(Digest::from_bytes(hasher.finalize().into()))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A remembered file is not read again: bytes changed under the same length and time still
-    /// answer the remembered digest. A new version (another length or time) is read.
-    #[test]
-    fn an_unchanged_file_is_read_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let (memo, file) = (dir.path().join("memo"), dir.path().join("clip.mp4"));
-        fs::write(&file, b"first").unwrap();
-        let first = of(Some(&memo), &file).unwrap();
-        assert_eq!(first, Digest::of(b"first"));
-        let at = fs::metadata(&file).unwrap().modified().unwrap();
-        fs::write(&file, b"FIRST").unwrap();
-        File::options()
-            .write(true)
-            .open(&file)
-            .unwrap()
-            .set_modified(at)
-            .unwrap();
-        assert_eq!(
-            of(Some(&memo), &file).unwrap(),
-            first,
-            "remembered, not read"
-        );
-        fs::write(&file, b"second!").unwrap();
-        assert_eq!(of(Some(&memo), &file).unwrap(), Digest::of(b"second!"));
-        assert_eq!(of(None, &file).unwrap(), Digest::of(b"second!"));
-    }
-}

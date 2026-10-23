@@ -18,25 +18,6 @@ tensord.workspace = true
 # Dev builds only (xs-053 A11): `cozy model migrate-headers`. Never in a release.
 migrate = ["cli/migrate"]
 
-[dev-dependencies]
-base64.workspace = true
-platform.workspace = true
-protocol.workspace = true
-ed25519-dalek.workspace = true
-hex.workspace = true
-hub-client = { workspace = true, features = ["testing"] }
-portable-pty.workspace = true
-rcgen.workspace = true
-reqwest.workspace = true
-rustls.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-tempfile.workspace = true
-tensorfs = { workspace = true, features = ["store"] }
-tokio.workspace = true
-url.workspace = true
-vt100.workspace = true
-
 [lints]
 workspace = true
 

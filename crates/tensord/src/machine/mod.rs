@@ -13,6 +13,7 @@ pub mod player;
 pub mod probe;
 pub mod provider;
 pub mod pypi;
+pub mod release;
 pub mod receipt;
 pub mod ssh;
 pub mod supervise;

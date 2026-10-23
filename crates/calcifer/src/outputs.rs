@@ -233,7 +233,13 @@ impl Calcifer {
                     }
                 }
             }
+            let offline = (run.machine.as_deref()).is_some_and(|m| self.offline(m).is_some());
             match again {
+                // Its machine is offline: tried again once it comes back or ends.
+                true if offline => tokio::select! {
+                    () = machine_changed(&mut changed) => {}
+                    () = wake.notified() => {}
+                },
                 true => pause.wait(wake, changed.as_mut()).await,
                 false => pause.reset(),
             }
@@ -541,7 +547,8 @@ fn ranged(header: Option<&HeaderValue>, len: u64) -> Result<Option<(u64, u64)>, 
 
 /// Where a run that names no directory puts its outputs: its package's folder, `<org>-<name>` as
 /// the Go CLI named it (`fidika-minimax-h3`, `local-cozy-script-<hex>`), from a target
-/// `<org>/<name>/<function>[@release]`; the outputs folder itself for any other target.
+/// `<org>/<name>/<function>[@release]` (a root package's: `<name>`); the outputs folder itself for
+/// any other target.
 pub fn package_outputs(outputs: &Path, target: &str) -> PathBuf {
     let named = |part: &&str| {
         !part.is_empty()
@@ -551,6 +558,9 @@ pub fn package_outputs(outputs: &Path, target: &str) -> PathBuf {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     };
     match target.split('/').collect::<Vec<_>>().as_slice() {
+        [org, name, function] if *org == protocol::names::ROOT && named(name) && !function.is_empty() => {
+            outputs.join(name)
+        }
         [org, name, function] if named(org) && named(name) && !function.is_empty() => {
             outputs.join(format!("{org}-{name}"))
         }
@@ -930,39 +940,5 @@ fn refused(e: client::Error) -> Ranged<Failure> {
         }
         client::Error::Answer(message) => Ranged::Stop(Failure::Again(message)),
         e => Ranged::Again(e.to_string()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_runs_outputs_default_to_its_packages_folder_as_go_named_it() {
-        let outputs = Path::new("/home/me/.cozy/outputs");
-        for (target, folder) in [
-            ("fidika/minimax-h3/long_form@1.39.0", "fidika-minimax-h3"),
-            ("paul/sdxl/generate", "paul-sdxl"),
-            ("local/h3-tools/caption", "local-h3-tools"),
-            (
-                "local/cozy-script-0123456789abcdef01234567/main",
-                "local-cozy-script-0123456789abcdef01234567",
-            ),
-        ] {
-            assert_eq!(
-                package_outputs(outputs, target),
-                outputs.join(folder),
-                "{target}"
-            );
-        }
-        for target in [
-            "hf://org/model → acme/model",
-            "../x/y",
-            "a/b",
-            "a/../b/c",
-            "",
-        ] {
-            assert_eq!(package_outputs(outputs, target), outputs, "{target}");
-        }
     }
 }

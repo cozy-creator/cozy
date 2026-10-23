@@ -1,4 +1,5 @@
 //! macOS: births from `proc_pidinfo`, exact handles as a kqueue watching the process's exit.
+#![allow(unsafe_code)]
 use super::{Birth, State, unix};
 use std::{
     io, mem,
@@ -231,9 +232,9 @@ pub(super) fn meter(pid: u32) -> Option<(u64, u64)> {
     Some((cpu, usage.ri_diskio_bytesread.saturating_add(usage.ri_diskio_byteswritten)))
 }
 
-/// Disk bytes read.
-pub(super) fn read_bytes(pid: u32) -> Option<u64> {
-    Some(rusage(pid)?.ri_diskio_bytesread)
+/// Disk bytes written.
+pub(super) fn written_bytes(pid: u32) -> Option<u64> {
+    Some(rusage(pid)?.ri_diskio_byteswritten)
 }
 
 fn rusage(pid: u32) -> Option<libc::rusage_info_v2> {

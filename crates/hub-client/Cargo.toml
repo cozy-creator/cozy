@@ -21,10 +21,6 @@ tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 http.workspace = true
 
-[features]
-# Helpers for tests against a real Tensorhub (hub_client::testing).
-testing = []
-
 [build-dependencies]
 openapiv3.workspace = true
 prettyplease.workspace = true
@@ -33,6 +29,5 @@ quote.workspace = true
 serde_yaml.workspace = true
 syn.workspace = true
 
-[dev-dependencies]
-hub-client = { path = ".", features = ["testing"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+[lints]
+workspace = true

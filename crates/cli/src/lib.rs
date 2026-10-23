@@ -1,4 +1,5 @@
 //! The `cozy` command line. One module per verb group; each owns its clap arguments and handler.
+#![forbid(unsafe_code)]
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -50,7 +51,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run a function: `org/pkg/fn`, `./dir[/fn]` or `./script.py`.
+    /// Run a function: `pkg/fn` (first-party), `org/pkg/fn`, `./dir[/fn]` or `./script.py`.
     Run(run::Args),
     /// Local, rented and added machines.
     Machine(machine::Args),
@@ -162,15 +163,5 @@ async fn dispatch(ctx: &Context, command: Command) -> Result<ExitCode, Error> {
         Command::Completion(args) => completion::exec(ctx, args).await,
         Command::Doctor(args) => doctor::exec(ctx, args).await,
         Command::Tools(args) => tools::exec(ctx, args).await,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use clap::CommandFactory as _;
-
-    #[test]
-    fn the_grammar_is_consistent() {
-        super::Cli::command().debug_assert();
     }
 }

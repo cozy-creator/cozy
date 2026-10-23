@@ -1,4 +1,5 @@
 //! What Linux and macOS share: process groups, sessions, signals and readiness.
+#![allow(unsafe_code)]
 use std::{
     ffi::OsString,
     fs::File,
@@ -156,6 +157,7 @@ pub(super) fn readable(fd: BorrowedFd<'_>, period: Option<Duration>) -> io::Resu
 pub(super) fn raise_fd_limit() {
     // SAFETY: plain-old-data in and out.
     let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: a writable rlimit.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
         return;
     }
@@ -175,6 +177,7 @@ pub(super) fn raise_fd_limit() {
 pub(super) fn fd_limit() -> Option<u64> {
     // SAFETY: plain-old-data out-param.
     let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: a writable rlimit.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0
         || limit.rlim_cur == libc::RLIM_INFINITY
     {

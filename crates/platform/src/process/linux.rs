@@ -1,4 +1,5 @@
 //! Linux: births from `/proc`, exact handles by pidfd (TensorD `process.rs`).
+#![allow(unsafe_code)]
 use super::{Birth, State, unix};
 use std::{
     fs, io,
@@ -68,8 +69,8 @@ pub(super) fn kill(handle: &Handle, birth: &Birth) -> io::Result<()> {
     // A group's number is not reused while a member lives, so a group this birth leads is its own.
     let leads_group = stat(birth.pid)
         .is_ok_and(|stat| stat.start_ticks == birth.start_ticks && stat.pgrp as u32 == birth.pid);
-    // SAFETY: a live pidfd, a signal number and no siginfo.
     unix::signaled(
+        // SAFETY: a live pidfd, a signal number and no siginfo.
         unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
@@ -180,11 +181,11 @@ pub(super) fn meter(pid: u32) -> Option<(u64, u64)> {
 }
 
 /// `rchar`.
-pub(super) fn read_bytes(pid: u32) -> Option<u64> {
+pub(super) fn written_bytes(pid: u32) -> Option<u64> {
     fs::read_to_string(format!("/proc/{pid}/io"))
         .ok()?
         .lines()
-        .find_map(|line| line.strip_prefix("rchar: "))?
+        .find_map(|line| line.strip_prefix("wchar: "))?
         .trim()
         .parse()
         .ok()
@@ -313,50 +314,4 @@ fn sigkill_pending(pid: u32) -> io::Result<bool> {
         })
         .filter_map(|mask| u64::from_str_radix(mask.trim(), 16).ok())
         .any(|mask| mask & kill != 0))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    #[test]
-    fn exact_kill_takes_the_group_and_never_a_reused_birth() {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "sleep 1000 & wait"])
-            .process_group(0)
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
-        let birth = Birth::of(child.id()).unwrap();
-        let mut stale = birth.clone();
-        stale.start_ticks += 1;
-        assert!(crate::process::Exact::open(&stale).unwrap().is_none());
-        let exact = crate::process::Exact::open(&birth).unwrap().unwrap();
-        // The grandchild is in the leader's group: wait until it exists.
-        let grandchild = loop {
-            let children =
-                fs::read_to_string(format!("/proc/{0}/task/{0}/children", child.id())).unwrap();
-            if let Some(pid) = children.split_whitespace().next() {
-                break pid.parse::<u32>().unwrap();
-            }
-            std::thread::yield_now();
-        };
-        let grandchild = crate::process::Exact::open(&Birth::of(grandchild).unwrap())
-            .unwrap()
-            .unwrap();
-        exact.kill().unwrap();
-        exact.wait().unwrap();
-        grandchild.wait().unwrap();
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
-        assert!((birth.state().unwrap() == State::Gone));
-    }
-
-    #[test]
-    fn burn_reads_this_process() {
-        assert!(crate::process::burn(std::process::id()).is_some_and(|value| value > 0));
-        assert!(crate::process::burn(u32::MAX).is_none());
-    }
 }

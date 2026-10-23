@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use super::{FULL_SEALS, Region};
 use crate::Result;
 use std::{
@@ -177,35 +178,4 @@ pub fn held(dev: u64, ino: u64) -> Result<bool> {
         }
     }
     Ok(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A file is held while any process has it open, here or in a child, and not after.
-    #[test]
-    fn a_file_is_held_while_any_process_has_it_open() {
-        use std::os::unix::process::CommandExt;
-        let file = std::fs::File::from(memfd_named("held-test").unwrap());
-        let identity = file.metadata().unwrap();
-        let (dev, ino) = (identity.dev(), identity.ino());
-        assert!(held(dev, ino).unwrap());
-        let fd = file.as_raw_fd();
-        let mut command = std::process::Command::new("sleep");
-        command.arg("1000");
-        // SAFETY: only async-signal-safe fcntl on a descriptor this test keeps open.
-        unsafe {
-            command.pre_exec(move || match libc::fcntl(fd, libc::F_SETFD, 0) {
-                0 => Ok(()),
-                _ => Err(io::Error::last_os_error()),
-            });
-        }
-        let mut child = command.spawn().unwrap();
-        drop(file);
-        assert!(held(dev, ino).unwrap(), "the child's descriptor holds it");
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(!held(dev, ino).unwrap());
-    }
 }

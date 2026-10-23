@@ -120,8 +120,10 @@ impl Bytes {
         Ok(Bytes(PyBuffer::get(&view.call_method1("cast", ("B",))?)?))
     }
 
-    fn slice(&self) -> &[u8] {
-        // SAFETY: the buffer is held (and its exporter alive) for as long as `self`.
+    /// The bytes, only while the GIL is held: released, another thread may write them.
+    fn slice<'a>(&'a self, _py: Python<'a>) -> &'a [u8] {
+        // SAFETY: the buffer is held (and its exporter alive) for as long as `self`, and the
+        // caller holds the GIL, so no Python thread writes it while the slice lives.
         unsafe { std::slice::from_raw_parts(self.0.buf_ptr() as *const u8, self.0.len_bytes()) }
     }
 }
@@ -1696,6 +1698,19 @@ impl PyWriter {
         })
         .or_raise(py)
     }
+
+    /// As `with`, holding the GIL: `f` reads Python buffers ([`Bytes`]).
+    fn with_gil<T>(&self, py: Python<'_>, f: impl FnOnce(&mut Writer) -> tensorfs::Result<T>) -> PyResult<T> {
+        let mut guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(writer) => f(writer),
+            None => Err(Failure {
+                kind: Kind::Invalid,
+                detail: "the writer has committed or been abandoned".into(),
+            }),
+        }
+        .or_raise(py)
+    }
 }
 
 impl Drop for PyWriter {
@@ -1915,8 +1930,8 @@ impl PyComponentWriter {
     ) -> PyResult<()> {
         let bytes = Bytes::of(data)?;
         let dtype = Dtype::parse(&dtype);
-        self.w.get().with(py, |writer| {
-            let mut source = bytes.slice();
+        self.w.get().with_gil(py, |writer| {
+            let mut source = bytes.slice(py);
             writer
                 .component_writer(&self.name)?
                 .put(&key, dtype, &shape, &mut source)
@@ -1953,8 +1968,8 @@ impl PyComponentWriter {
             ));
         }
         let dtype = Dtype::parse(&dtype);
-        self.w.get().with(py, |writer| {
-            let mut slices: Vec<&[u8]> = held.iter().map(|held| held.3.slice()).collect();
+        self.w.get().with_gil(py, |writer| {
+            let mut slices: Vec<&[u8]> = held.iter().map(|held| held.3.slice(py)).collect();
             let parts = held
                 .iter()
                 .zip(slices.iter_mut())
@@ -1977,10 +1992,10 @@ impl PyComponentWriter {
 
     fn asset(&self, py: Python<'_>, name: String, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes = Bytes::of(data)?;
-        self.w.get().with(py, |writer| {
+        self.w.get().with_gil(py, |writer| {
             writer
                 .component_writer(&self.name)?
-                .asset(&name, bytes.slice())
+                .asset(&name, bytes.slice(py))
         })
     }
 
