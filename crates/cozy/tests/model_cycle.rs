@@ -251,8 +251,14 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let written = run["output"].as_array().into_iter().flatten().find(|item| item["name"] == "fp8");
     let fp8 = written.and_then(|item| item["checkpoint"]["revision"].as_str()).unwrap_or_else(|| panic!("no tree in {run}")).to_owned();
 
-    // A person sees the checkpoint the machine wrote and how to publish it.
-    let human = cozy(&home, None, &["model", "quantize", &pinned, "--fp8", "--package", &package, "--on", "m1"]);
+    // A recipe is no function: the package lists none, and `cozy run` names quantize instead.
+    let listed = json(&home, &["--json", "run", &package]);
+    assert_eq!(listed["functions"], serde_json::json!([]), "{listed}");
+    let refused = cozy(&home, None, &["--json", "run", &format!("{package}/fp8"), &pinned, "--on", "m1"]);
+    assert_eq!((refused.code, refused.refusal()["code"].as_str()), (1, Some("callable_recipe")), "{refused:?}");
+
+    // A person runs the recipe by name and sees the checkpoint the machine wrote and how to publish it.
+    let human = cozy(&home, None, &["model", "quantize", &pinned, "--recipe", "fp8", "--package", &package, "--on", "m1"]);
     assert_eq!(human.code, 0, "{human:?}");
     assert!(human.stdout.contains(&format!("{model}@{fp8}")), "{human:?}");
     let next = format!("cozy model publish {model} --release 1.0.0 --commit {fp8}");

@@ -203,11 +203,11 @@ impl Interface {
         Ok(out)
     }
 
-    /// The public callables' names: the package's own work first (GPU before CPU), then its
-    /// conversions, each group sorted.
+    /// The package's functions, GPU before CPU, each group sorted: never an internal callable or
+    /// a recipe (a conversion, which only `cozy model quantize` runs).
     pub fn public(&self) -> Vec<&str> {
-        let mut public: Vec<&Callable> = self.callables.iter().filter(|c| !c.internal).collect();
-        public.sort_unstable_by_key(|c| (c.is_conversion(), c.accelerator == Some(false), c.name.as_str()));
+        let mut public: Vec<&Callable> = self.callables.iter().filter(|c| !c.internal && !c.is_conversion()).collect();
+        public.sort_unstable_by_key(|c| (c.accelerator == Some(false), c.name.as_str()));
         public.into_iter().map(|c| c.name.as_str()).collect()
     }
 }
@@ -248,7 +248,8 @@ impl Callable {
         Ok(self)
     }
 
-    /// A conversion reads `<input-model> [<org/model>]`: it has model slots and writes weights.
+    /// A conversion (a recipe) reads `<input-model> [<org/model>]`: it has model slots and writes
+    /// weights. It is never a function: `cozy model quantize` runs it.
     pub fn is_conversion(&self) -> bool {
         !self.models.is_empty() && !self.weights_outputs.is_empty()
     }
@@ -413,7 +414,7 @@ pub(crate) mod tests {
     #[test]
     fn sdxl_reads_its_types_wires_defaults_and_slots() {
         let sdxl = interface("sdxl-2.10.0");
-        assert_eq!(sdxl.public(), ["generate", "fp8", "int8"]);
+        assert_eq!(sdxl.public(), ["generate"], "recipes are not functions");
         let generate = sdxl
             .callables
             .iter()
@@ -441,6 +442,14 @@ pub(crate) mod tests {
         let int8 = sdxl.callables.iter().find(|c| c.name == "int8").unwrap();
         assert!(int8.is_conversion() && int8.models[0].weights);
         assert_eq!(int8.result.input.as_deref(), Some("model"));
+    }
+
+    #[test]
+    fn recipes_are_not_functions() {
+        let klein = interface("flux-3-klein-0.5.0");
+        assert_eq!(klein.public(), ["edit", "edit_base", "generate", "generate_base"]);
+        let recipes = klein.callables.iter().filter(|c| c.is_conversion()).count();
+        assert_eq!(recipes, 4, "int8, nvfp4 and the upsampler's are recipes");
     }
 
     #[test]
