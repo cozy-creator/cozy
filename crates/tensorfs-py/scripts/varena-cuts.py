@@ -721,36 +721,65 @@ def launches() -> None:
 
 
 class Fault(TorchDispatchMode):
-    """A device whose next matmul fails with `text`, a library's status as torch raises it."""
+    """A device whose next matmuls fail, one per text: a library's status as torch raises it."""
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, *texts: str) -> None:
         super().__init__()
-        self.text, self.left = text, 1
+        self.texts = list(texts)
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
-        if func.overloadpacket.__name__ == "mm" and self.left:
-            self.left -= 1
-            raise RuntimeError(self.text)
+        if func.overloadpacket.__name__ == "mm" and self.texts:
+            raise RuntimeError(self.texts.pop(0))
         return func(*args, **(kwargs or {}))
 
 
 def device_faults() -> None:
-    """cr-215: a cuBLAS or cuDNN status that is a device fault (EXECUTION_FAILED, INTERNAL_ERROR)
-    fails at once with its own text: no room made, no replay. An allocation status (ALLOC_FAILED)
-    runs again with room made, and the retry's note names the op and the failure."""
+    """cr-215: a cuBLAS or cuDNN status other than ALLOC_FAILED is told apart by one device sync on
+    the failure path. On a dead context (the sync raises) the original fails at once, the sticky
+    error chained, with no room made and no replay. On a healthy one it is an allocation under
+    another name (run 3095): it runs again once with room made, and a second status raises the
+    original. ALLOC_FAILED runs again as before; every retry's note names the op and failure."""
     a, b = torch.randn(8, 8), torch.randn(8, 8)
-    for status in ("CUBLAS_STATUS_EXECUTION_FAILED", "CUDNN_STATUS_INTERNAL_ERROR"):
-        memo, _, room = fresh(1 << 60, frees=1 << 20)
-        try:
-            with Fault(f"CUDA error: {status} when calling `cublasGemmEx(...)`"), cuts.caught():
-                torch.mm(a, b)
-            check(f"{status} fails at once", False)
-        except RuntimeError as exc:
-            check(
-                f"{status} fails at once with its own text, no room made, no replay",
-                status in str(exc) and memo.retries == 0 and room.made == 0,
-                (exc, memo.retries, room.made),
-            )
+    status = "CUDA error: CUBLAS_STATUS_EXECUTION_FAILED when calling `cublasGemmEx(...)`"
+    synchronize = cuts._synchronize
+
+    def dead(device: torch.device) -> None:
+        raise RuntimeError("CUDA error: unknown error")
+
+    memo, _, room = fresh(1 << 60, frees=1 << 20)
+    cuts._synchronize = dead
+    try:
+        with Fault(status), cuts.caught():
+            torch.mm(a, b)
+        check("on a dead context a library status fails at once", False)
+    except RuntimeError as exc:
+        check(
+            "on a dead context a library status fails at once with its own text, the sticky error chained",
+            "EXECUTION_FAILED" in str(exc) and "unknown error" in str(exc.__cause__) and memo.retries == 0 and room.made == 0,
+            (exc, exc.__cause__, memo.retries, room.made),
+        )
+    finally:
+        cuts._synchronize = synchronize
+    memo, _, room = fresh(1 << 60, frees=1 << 20)
+    with Fault("CUDA error: CUDNN_STATUS_INTERNAL_ERROR"), cuts.caught():
+        out = torch.mm(a, b)
+    check(
+        "on a healthy context INTERNAL_ERROR runs again once with room made",
+        same(out, a @ b) and memo.retries == 1 and room.made == 1,
+        (memo.retries, room.made),
+    )
+    check(
+        "the retry's note names the op and the failure",
+        any("aten.mm" in why and "RuntimeError" in why and "INTERNAL_ERROR" in why for _, why in room.notes),
+        room.notes,
+    )
+    memo, _, room = fresh(1 << 60, frees=1 << 20)
+    try:
+        with Fault("CUDA error: CUDNN_STATUS_INTERNAL_ERROR (first)", status), cuts.caught():
+            torch.mm(a, b)
+        check("a second library status raises", False)
+    except RuntimeError as exc:
+        check("a second library status raises the original", "(first)" in str(exc), exc)
     memo, _, room = fresh(1 << 60, frees=1 << 20)
     with Fault("CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`"), cuts.caught():
         out = torch.mm(a, b)
@@ -758,11 +787,6 @@ def device_faults() -> None:
         "an ALLOC_FAILED runs again with room made",
         same(out, a @ b) and memo.retries == 1 and room.made == 1,
         (memo.retries, room.made),
-    )
-    check(
-        "the retry's note names the op and the failure",
-        any("aten.mm" in why and "RuntimeError" in why and "ALLOC_FAILED" in why for _, why in room.notes),
-        room.notes,
     )
 
 
