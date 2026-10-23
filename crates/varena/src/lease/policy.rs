@@ -195,7 +195,7 @@ pub fn decide(s: &Snapshot, asks: &[Ask]) -> Decision {
         run.cover(u64::MAX, None, Scope::Idle);
     }
     if free < h {
-        let (coming, _) = coming(s, None, &BTreeSet::new());
+        let (coming, _, _) = coming(s, None, &BTreeSet::new());
         let short = top - free - i128::from(coming) - i128::from(run.got);
         if short > 0 {
             run.cover(clamp(short), None, Scope::All);
@@ -224,12 +224,12 @@ pub fn decide(s: &Snapshot, asks: &[Ask]) -> Decision {
     for (i, a) in heads {
         waits.remove(&a.executor);
         let cyclic = waiting_on(&waits, a.executor);
-        let (coming, mut on) = coming(s, Some(a.executor), &cyclic);
+        let (coming, later, mut on) = coming(s, Some(a.executor), &cyclic);
         let projected = free - granted - h - owed + i128::from(coming) + i128::from(run.got);
         let bytes = new(a);
         let from = run.picks.len();
         let asker = s.executors.iter().position(|e| e.id == a.executor);
-        let covered = if bytes > projected { run.cover_all(clamp(bytes - projected), asker) } else { Ok(()) };
+        let covered = if bytes > projected { run.cover_all(clamp(bytes - projected), asker, clamp(i128::from(later))) } else { Ok(()) };
         let answer = match covered {
             Ok(()) => {
                 on.extend(run.picks.iter().skip(from).filter_map(|p| match p {
@@ -256,11 +256,14 @@ fn clamp(x: i128) -> u64 {
 
 /// Bytes already coming back (asked, being revoked, released) and whose pins they wait on. An
 /// asked chunk still pinned counts unless its executor waits, directly or not, on the asker.
-fn coming(s: &Snapshot, asker: Option<u64>, cyclic: &BTreeSet<u64>) -> (u64, BTreeSet<u64>) {
-    let (mut bytes, mut on) = (0, BTreeSet::new());
+/// Also, for an ask, other executors' grants not yet acked: never asked before their ack (L3),
+/// revocable after it.
+fn coming(s: &Snapshot, asker: Option<u64>, cyclic: &BTreeSet<u64>) -> (u64, u64, BTreeSet<u64>) {
+    let (mut bytes, mut later, mut on) = (0, 0, BTreeSet::new());
     for e in &s.executors {
         for c in &e.chunks {
             match c.state {
+                State::Granted if asker.is_some_and(|a| a != e.id) => later += c.bytes,
                 State::Revoking | State::Released | State::Refused => bytes += c.bytes,
                 State::Mapped if c.asked && c.pins == 0 => bytes += c.bytes,
                 State::Mapped if c.asked && Some(e.id) != asker && !cyclic.contains(&e.id) => {
@@ -271,7 +274,7 @@ fn coming(s: &Snapshot, asker: Option<u64>, cyclic: &BTreeSet<u64>) -> (u64, BTr
             }
         }
     }
-    (bytes, on)
+    (bytes, later, on)
 }
 
 /// Every executor whose waiting ask waits, directly or through others, on `of`'s pins.
@@ -547,10 +550,11 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// [`Run::cover`] over every stage, all or nothing: what it could get when short.
-    fn cover_all(&mut self, need: u64, asker: Option<usize>) -> Result<(), u64> {
+    /// [`Run::cover`] over every stage, all or nothing (`later` bytes, coming once acked, may
+    /// make up the rest): what it could get when short.
+    fn cover_all(&mut self, need: u64, asker: Option<usize>, later: u64) -> Result<(), u64> {
         let mut trial = self.clone();
-        if trial.cover(need, asker, Scope::All) {
+        if trial.cover(need, asker, Scope::All) || trial.got - self.got + later >= need {
             *self = trial;
             Ok(())
         } else {
@@ -923,6 +927,16 @@ mod tests {
         assert_eq!(decide(&s(vec![]), &[demand(1, 1)]).answers, vec![Answer::Wait { on: vec![2] }]);
         // Unless that executor waits on the asker's pins: a cycle.
         assert_eq!(decide(&s(vec![1]), &[demand(1, 1)]).answers, vec![Answer::Refuse { room: 0 }]);
+        // Another's grant not yet acked is never asked (L3) but makes up the rest: the ask
+        // takes what it can now and waits. The yield does not count it.
+        let granted = |mut ch: Chunk| {
+            ch.state = State::Granted;
+            ch
+        };
+        let s = snap(0, 0, vec![], vec![ex(1, vec![]), ex(2, vec![idle(1, 1), granted(next(2, 1))])]);
+        let d = decide(&s, &[demand(1, 2)]);
+        assert_eq!((show(&d), d.answers), (vec!["2:1".to_string()], vec![Answer::Wait { on: vec![] }]));
+        assert_eq!(decide(&s, &[demand(1, 3)]).answers, vec![Answer::Refuse { room: M }]);
     }
 
     /// Deterministic random books: no ask may pick a pinned chunk or the asker's float, stages
