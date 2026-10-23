@@ -689,15 +689,22 @@ impl PyRegion {
 
 #[pymethods]
 impl PyRegion {
-    /// Pins it while in use; the pin's `fresh` says it was remapped empty (recompute it).
+    #[getter]
+    fn id(&self, py: Python<'_>) -> PyResult<u64> {
+        self.with(py, |r| Ok(r.id()))
+    }
+
+    /// Pins it while in use, mapping it again first if it was reclaimed (which can raise
+    /// Exhausted); the pin's `fresh` says it came back empty (recompute it).
     fn pin(&self, py: Python<'_>) -> PyResult<PyRegionPin> {
         let pin = self.with(py, |r| r.pin())?;
         Ok(PyRegionPin { fresh: pin.fresh(), pin: Mutex::new(Some(pin)) })
     }
 
-    /// This thread's torch blocks go to the region's own arena until the guard ends.
-    fn allocating(&self, py: Python<'_>) -> PyResult<PyAllocating> {
-        Ok(PyAllocating(Mutex::new(Some(self.with(py, |r| Ok(r.allocating()))?))))
+    /// As `pin`, and this thread's torch blocks go to the region's own arena until it ends.
+    fn allocating(&self, py: Python<'_>) -> PyResult<PyRegionPin> {
+        let pin = self.with(py, |r| r.allocating())?;
+        Ok(PyRegionPin { fresh: pin.fresh(), pin: Mutex::new(Some(pin)) })
     }
 
     /// Its production time in nanoseconds, for the spill-versus-drop choice.
@@ -760,6 +767,19 @@ impl PyGraphRegion {
 
 #[pymethods]
 impl PyGraphRegion {
+    #[getter]
+    fn id(&self, py: Python<'_>) -> PyResult<u64> {
+        self.with(py, |g| Ok(g.id()))
+    }
+
+    /// What capturing its graphs took, in nanoseconds.
+    fn captured(&self, py: Python<'_>, ns: u64) -> PyResult<()> {
+        self.with(py, |g| {
+            g.captured(ns);
+            Ok(())
+        })
+    }
+
     /// The capture pool token its graphs capture into.
     #[getter]
     fn pool(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
@@ -772,7 +792,8 @@ impl PyGraphRegion {
         self.with(py, |g| g.prepare(expected))
     }
 
-    /// Before each replay: False while it is being dropped (run eager, recapture off-path).
+    /// Before each replay: False while it is being dropped (run eager, recapture off-path). A
+    /// True one is released exactly once, even when the replay raises.
     fn acquire(&self, py: Python<'_>) -> PyResult<bool> {
         self.with(py, |g| Ok(g.acquire()))
     }

@@ -210,10 +210,12 @@ class Request:
 class Region:
     """A long-lived intermediate in an arena of its own; `close` (or its drop) releases it."""
 
+    @property
+    def id(self) -> int: ...
     def pin(self) -> RegionPin:
-        """Pins it while in use."""
-    def allocating(self) -> Allocating:
-        """This thread's torch blocks go to its arena until the guard ends."""
+        """Pins it while in use, mapping it again first if it was reclaimed."""
+    def allocating(self) -> RegionPin:
+        """As `pin`, and this thread's torch blocks go to its arena until the pin ends."""
     def produced(self, ns: int) -> None: ...
     def next_use(self, step: int | None = None) -> None: ...
     def close(self) -> tuple[int, int, list[tuple[int, int, int]]]:
@@ -229,7 +231,10 @@ class GraphRegion:
     """A component's graphs on one device."""
 
     @property
+    def id(self) -> int: ...
+    @property
     def pool(self) -> tuple[int, int]: ...
+    def captured(self, ns: int) -> None: ...
     def prepare(self, expected: int | None = None) -> None: ...
     def acquire(self) -> bool:
         """Before a replay: False while it is being dropped."""

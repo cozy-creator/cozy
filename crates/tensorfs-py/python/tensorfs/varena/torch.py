@@ -919,7 +919,8 @@ class Region:
 
     @contextmanager
     def pin(self) -> Iterator[bool]:
-        """Holds it mapped while inside; yields True when it was remapped empty (recompute it)."""
+        """Holds it mapped while inside, mapping it again first if it was reclaimed; yields True
+        when it came back empty (recompute it)."""
         pin = self.native.pin()
         try:
             yield pin.fresh
@@ -927,13 +928,13 @@ class Region:
             pin.end()
 
     @contextmanager
-    def allocating(self) -> Iterator[Region]:
-        """This thread's torch blocks are the region's while inside."""
-        guard = self.native.allocating()
+    def allocating(self) -> Iterator[bool]:
+        """As `pin`, and this thread's torch blocks are the region's while inside."""
+        pin = self.native.allocating()
         try:
-            yield self
+            yield pin.fresh
         finally:
-            guard.end()
+            pin.end()
 
     def produced(self, ns: int) -> None:
         """What producing it took, in nanoseconds: the spill-versus-drop choice."""
@@ -952,8 +953,7 @@ class Region:
 
 class GraphRegion:
     """A component's CUDA graphs on one device (design varena-leases §5), captured into the
-    device's one pool (`Memory.graph_pool`): `acquire()` before each replay, `release(stream)`
-    after its launch."""
+    device's one pool (`Memory.graph_pool`); each replay runs inside `replaying(stream)`."""
 
     def __init__(self, memory: Memory, native: object) -> None:
         self.memory, self.native = memory, native
@@ -964,14 +964,23 @@ class GraphRegion:
         shape's first capture: None)."""
         self.native.prepare(expected)
 
-    def acquire(self) -> bool:
-        """Before a replay: False while it is being dropped (run eager, recapture off-path)."""
-        return self.native.acquire()
+    def captured(self, ns: int) -> None:
+        """What capturing its graphs took, in nanoseconds."""
+        self.native.captured(ns)
 
-    def release(self, stream: torch.cuda.Stream) -> None:
-        """After the replay's launch on `stream` and its outputs' readers there."""
-        self.native.release(stream.cuda_stream)
-        self.memory.fence_pool(self.pool, stream)
+    @contextmanager
+    def replaying(self, stream: torch.cuda.Stream) -> Iterator[bool]:
+        """Around a replay and its outputs' readers on `stream`: yields False while the region is
+        being dropped (run eager instead, recapture off-path); a True one is released at the
+        exit, by an event on `stream`, even when the replay raises."""
+        if not self.native.acquire():
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            self.native.release(stream.cuda_stream)
+            self.memory.fence_pool(self.pool, stream)
 
     @property
     def dropping(self) -> bool:
