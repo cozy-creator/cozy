@@ -9,7 +9,7 @@ import time
 import msgspec
 
 from cozy_runtime._build_provenance import COMMIT
-from cozy_runtime.author import App, Context, FileAsset, Outputs, Telemetry
+from cozy_runtime.author import App, Context, FileAsset, Outputs
 
 app = App()
 
@@ -39,15 +39,8 @@ class Napped(msgspec.Struct):
     seconds: float
 
 
-async def nap(ctx: Context, tel: Telemetry, *, payload: Nap) -> Napped:
-    # A call that takes its time says how far it got, as real work does: its watch counts only
-    # progress, never a process that merely lives.
-    slept = 0.0
-    while slept < payload.seconds:
-        step = min(1.0, payload.seconds - slept)
-        await asyncio.sleep(step)
-        slept += step
-        tel.progress(slept / payload.seconds, stage="napping")
+async def nap(ctx: Context, *, payload: Nap) -> Napped:
+    await asyncio.sleep(payload.seconds)
     return Napped(payload.seconds)
 
 

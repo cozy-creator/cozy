@@ -124,12 +124,11 @@ impl Pace {
 pub enum Meter {
     /// CPU plus bytes moved by the process (Runtime `ExecutorChild.watched`).
     Burn,
-    /// An invocation's work, judged while it runs, on every executor and every lane: its real
-    /// progress only (steps and stages advanced, outputs published, weights kept, child calls
-    /// started) and its GPUs' memory traffic. Its CPU time and the bytes its process moves are
-    /// not: a thread spinning or polling beside a hung call is no progress of it (S8 v15's hung
-    /// GPU suite showed 79 advances on them). Its call tree is its own (`Waits`: a child call is
-    /// watched by its own executor).
+    /// An invocation's work, judged while it runs, on every executor and every lane: progress it
+    /// reports (a step or stage advanced, an output, weights kept, a child call started; never a
+    /// repeated frame, telemetry or a log line), bytes moved, GPU memory traffic, or CPU other
+    /// than a wait on a stuck GPU. Its call tree is its own (`Waits`: a child call is watched by
+    /// its own executor).
     Work,
 }
 
@@ -203,8 +202,9 @@ impl Watch {
             Meter::Work => Pace::seeded(worst_gap),
             Meter::Burn => Pace::default(),
         };
-        // A call's samples with GPU memory traffic.
-        let mut moves = 0;
+        // A GPU call's samples with memory traffic, its CPU other than stuck-GPU waits, and its
+        // last CPU reading.
+        let (mut moves, mut ran, mut last_cpu) = (0, 0, None);
         // What the work it waits on did so far, kept once that work is gone.
         let mut lent = 0;
         let mut state = self.state.lock().unwrap();
@@ -230,8 +230,11 @@ impl Watch {
             let reading = match self.meter {
                 Meter::Burn => group_burn(exact.birth()).map(|burn| burn + lent),
                 Meter::Work => self.activity.as_ref().map_or(Some(Gpus::Idle), |gpus| gpus()).map(|gpus| {
+                    let (cpu, moved) = group_meter(exact.birth()).unwrap_or_default();
+                    let since = cpu.saturating_sub(last_cpu.replace(cpu).unwrap_or(cpu));
+                    ran += if gpus == Gpus::Stuck { 0 } else { since };
                     moves += u64::from(gpus == Gpus::Moved);
-                    state.frames + moves + lent
+                    state.frames + moved + moves + ran + lent
                 }),
             };
             pace.observe(reading, now);
@@ -244,7 +247,7 @@ impl Watch {
                 let still = now - since;
                 if still > pace.patience(floor) {
                     let measures = match self.meter {
-                        Meter::Work => " (steps and stages advanced, outputs, weights kept, child calls started, GPU memory traffic)",
+                        Meter::Work => " (steps and stages advanced, outputs, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)",
                         Meter::Burn => "",
                     };
                     let at = match state.at.as_str() {
@@ -597,30 +600,29 @@ mod tests {
         assert!(group_members(&birth).is_empty());
     }
 
-    /// A call is judged while it runs on its real progress, with GPUs or without: one that
-    /// reports advancing steps, or whose GPUs move memory or cannot be read, is not killed; one
-    /// blocked, spinning on any number of threads, or moving bytes or printing beside a hung
-    /// call, its GPUs idle or stuck on a kernel that moves no memory, is (S8 v15's hung GPU suite
-    /// read as 79 advances of CPU and bytes).
+    /// A call is judged while it runs on its work, with GPUs or without: one blocked with idle
+    /// GPUs, or spinning while its GPU holds a kernel that moves no memory (a collective whose
+    /// peer is gone), is killed; one that reports advancing steps, computes on any number of
+    /// threads, moves bytes, or whose GPUs move memory or cannot be read is not.
     #[cfg(unix)]
     #[test]
-    fn a_call_is_judged_on_its_real_progress_never_its_cpu_or_bytes() {
+    fn a_call_blocked_or_waiting_on_a_stuck_gpu_is_killed_and_working_ones_are_not() {
         let gpus = |reading: Option<Gpus>| -> Option<Activity> { Some(Arc::new(move || reading)) };
         let spin = "while :; do :; done";
         let cases = [
             ("blocked", "sleep 600", gpus(Some(Gpus::Idle)), false, true),
             ("waits on a stuck GPU", spin, gpus(Some(Gpus::Stuck)), false, true),
-            ("spins on one thread", spin, gpus(Some(Gpus::Idle)), false, true),
-            ("spins on two threads", "while :; do :; done & while :; do :; done", gpus(Some(Gpus::Idle)), false, true),
-            ("moves bytes while its GPU is stuck", "while :; do echo work; done > /dev/null", gpus(Some(Gpus::Stuck)), false, true),
             ("reports advancing steps", "sleep 600", gpus(Some(Gpus::Idle)), true, false),
+            ("computes on one thread", spin, gpus(Some(Gpus::Idle)), false, false),
+            // However little CPU a loaded machine gives them.
+            ("computes on two threads", "while :; do :; done & while :; do :; done", gpus(Some(Gpus::Idle)), false, false),
+            ("moves bytes while its GPU is stuck", "while :; do echo work; done > /dev/null", gpus(Some(Gpus::Stuck)), false, false),
             ("its GPU moves memory", "sleep 600", gpus(Some(Gpus::Moved)), false, false),
             ("its GPU is unread", "sleep 600", gpus(None), false, false),
             // A call with no GPUs (a script, a job root) is judged the same way (run 13543).
             ("blocked with no GPUs", "sleep 600", None, false, true),
-            ("prints with no GPUs", "while :; do echo line; sleep 0.002; done > /dev/null", None, false, true),
-            ("spins with no GPUs", spin, None, false, true),
-            ("reports advancing steps with no GPUs", spin, None, true, false),
+            ("prints with no GPUs", "while :; do echo line; sleep 0.002; done > /dev/null", None, false, false),
+            ("computes with no GPUs", spin, None, false, false),
         ];
         // A shell can fork a CPU spinner. Always end its group, including on an assertion
         // failure: Child::kill only ends the shell and leaves that spinner running.
@@ -657,7 +659,7 @@ mod tests {
             if killed {
                 let verdict = verdict.unwrap();
                 assert!(verdict.contains("wedged during invoke: no measurable progress"), "{case}");
-                assert!(verdict.contains("(steps and stages advanced, outputs, weights kept, child calls started, GPU memory traffic)"), "{verdict}");
+                assert!(verdict.contains("(steps and stages advanced, outputs, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)"), "{verdict}");
             }
             drop(group);
             assert!(group_members(&birth).iter().all(|member| member.ended().unwrap()), "{case}: the test left a process running");

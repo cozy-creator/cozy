@@ -3201,15 +3201,8 @@ fn gpu_place(gpus: &[Device], pid: u32) -> Option<crate::process::Place> {
 
 /// What `gpus` did since the last reading; None without GPUs or while NVML cannot tell.
 fn gpu_work(gpus: &[Device]) -> Option<crate::process::Activity> {
-    if gpus.is_empty() {
-        return None;
-    }
-    // GPUs NVML cannot open (an Apple GPU) read as unread, which judges nothing, never as idle:
-    // their work would otherwise count for nothing, now that a call's CPU does not count.
     let opened = gpus.iter().map(|gpu| platform::gpu::Device::open(&gpu.entry).ok());
-    let Some(devices) = opened.collect::<Option<Vec<_>>>() else {
-        return Some(Arc::new(|| None));
-    };
+    let devices: Vec<_> = opened.collect::<Option<_>>().filter(|devices: &Vec<_>| !devices.is_empty())?;
     let seen = Mutex::new(vec![0; devices.len()]);
     Some(Arc::new(move || {
         let (mut kernels, mut memory) = (false, false);
