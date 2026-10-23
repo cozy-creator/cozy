@@ -56,14 +56,6 @@ aws-credential-types = { version = "1.2", optional = true }
 libc.workspace = true
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "process"], optional = true }
 
-[[test]]
-name = "store_v2"
-required-features = ["faults"]
-
-[[test]]
-name = "writer"
-required-features = ["faults"]
-
 [dev-dependencies]
 libc.workspace = true
 rcgen.workspace = true
