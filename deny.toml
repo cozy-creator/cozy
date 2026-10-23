@@ -14,7 +14,6 @@ targets = [
 unmaintained = "all"
 yanked = "deny"
 ignore = [
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: TensorD drops it (xs-067)" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml: replaced (xs-067)" },
 ]
 
@@ -202,7 +201,6 @@ allow = [
     "fnv",
     "foldhash",
     "form_urlencoded",
-    "fs2",
     "fs_extra",
     "futures",
     "futures-channel",
@@ -362,7 +360,6 @@ allow = [
     "rustix",
     "rustls",
     "rustls-native-certs",
-    "rustls-pemfile",
     "rustls-pki-types",
     "rustls-platform-verifier",
     "rustls-platform-verifier-android",

@@ -16,7 +16,6 @@ crates/platform/src/lock.rs
 crates/platform/src/paths.rs
 crates/platform/src/process/linux.rs
 crates/platform/src/process/macos.rs
-crates/platform/src/process/mod.rs
 crates/platform/src/process/unix.rs
 crates/platform/src/process/windows.rs
 crates/platform/src/service/launchd.rs
@@ -27,19 +26,6 @@ crates/platform/src/watch/linux.rs
 crates/platform/src/watch/macos.rs
 crates/platform/src/watch/windows.rs
 crates/platform/tests/seams.rs
-crates/tensord/src/device_executor.rs
-crates/tensord/src/execution.rs
-crates/tensord/src/gpu_service.rs
-crates/tensord/src/launch_identity.rs
-crates/tensord/src/machine/binary.rs
-crates/tensord/src/machine/provider.rs
-crates/tensord/src/machine/supervise.rs
-crates/tensord/src/memory/gpu.rs
-crates/tensord/src/process.rs
-crates/tensord/src/serve.rs
-crates/tensord/tests/executor_lifecycle.rs
-crates/tensord/tests/gpu_ledger.rs
-crates/tensord/tests/launch_identity_cpu.rs
 crates/tensorfs-py/src/cleanup.rs
 crates/tensorfs-py/src/dlpack_source.rs
 crates/tensorfs-py/src/resident_decode.rs
