@@ -608,6 +608,18 @@ impl Space {
     }
 }
 
+/// An open capture: its thread, its pool, its streams (the begin's, then each routed
+/// allocation's), and whether one was seen capturing. torch calls the begin hook before
+/// cudaStreamBeginCapture and makes no allocator call between them, so an unseen capture is
+/// either about to start or its begin threw.
+#[derive(Clone)]
+struct Capture {
+    thread: ThreadId,
+    pool: PoolId,
+    streams: Vec<usize>,
+    seen: bool,
+}
+
 /// A thread's route into an arena: dropped on any thread, it stops routing.
 struct RouteTo {
     arena: Arc<Arena>,
@@ -646,8 +658,7 @@ struct Shared {
     /// Open captures. A stamp reads it before and after (R2): one a capture's begin could not
     /// record is held instead.
     captures: AtomicU32,
-    /// Each open capture: its thread, its pool, and the streams its routed allocations named.
-    capturers: Mutex<Vec<(ThreadId, PoolId, Vec<usize>)>>,
+    capturers: Mutex<Vec<Capture>>,
     /// Arenas with deferred frees, held spans or a released pool, for the poller.
     pending: Mutex<Vec<Arc<Arena>>>,
     wake: (Mutex<bool>, Condvar),
@@ -708,12 +719,16 @@ impl Torch {
                 sh.capturing_on(p, stream);
                 sh.alloc_in(&sh.arena(Owner::Pool(p)), size, stream, true)
             }
-            None => sh.alloc_in(&sh.routed(), size, stream, sh.capturing()),
+            None => {
+                sh.begun(stream);
+                sh.alloc_in(&sh.routed(), size, stream, sh.capturing())
+            }
         }
     }
 
     /// Never fails and never waits on the device; a pointer no arena holds is logged.
     pub fn free(&self, ptr: u64, bytes: u64, stream: usize) {
+        self.sh.begun(stream);
         let Some(a) = self.sh.owner_of(ptr) else {
             tracing::error!("varena: torch freed {ptr:#x} ({bytes} bytes, stream {stream:#x}), which no arena holds");
             return;
@@ -736,10 +751,11 @@ impl Torch {
         }
     }
 
-    /// torch's begin-allocate-to-pool hook, on the capturing thread before its capture starts:
-    /// one more use of `pool`, and this thread is served from mapped free bytes until its end. Every
-    /// epoch pending is recorded now, while nothing captures yet.
-    pub fn pool_begin(&self, pool: PoolId) {
+    /// torch's begin-allocate-to-pool hook, on the capturing thread before its capture starts on
+    /// `stream` (the thread's current stream, when the caller knows it): one more use of `pool`,
+    /// and this thread is served from mapped free bytes until its end. Every epoch pending is
+    /// recorded now, while nothing captures yet.
+    pub fn pool_begin(&self, pool: PoolId, stream: Option<usize>) {
         let sh = &self.sh;
         let me = std::thread::current().id();
         let clocks: Vec<Arc<Clock>> = sh.clocks.read().values().cloned().collect();
@@ -747,8 +763,8 @@ impl Torch {
             let _gate = sh.gate.write();
             let mut caps = sh.capturers.lock();
             // A capture this thread left open died (torch never ended it): this one replaces it.
-            caps.retain(|(t, p, _)| !(*t == me && *p == pool));
-            caps.push((me, pool, Vec::new()));
+            caps.retain(|c| !(c.thread == me && c.pool == pool));
+            caps.push(Capture { thread: me, pool, streams: stream.into_iter().collect(), seen: false });
             sh.captures.store(caps.len() as u32, SeqCst);
             drop(caps);
             clocks.iter().for_each(|c| sh.record(c));
@@ -759,12 +775,14 @@ impl Torch {
         sh.revive(&a, &mut st);
     }
 
-    /// torch's end-allocate-to-pool hook, after the capture ended, or a failed capture's cleanup
-    /// (torch ends none whose begin threw), on the capturing thread: frees deferred by it apply
-    /// once no capture is open. Again, or ended already ([`Shared::reap_captures`]): nothing.
+    /// torch's end-allocate-to-pool hook: after the capture ended, or from `reset` (on any thread,
+    /// a garbage collector's too) for one whose begin threw, or the Runtime's capture_failed. It
+    /// ends this thread's capture into `pool`, else the pool's open one (torch never captures two
+    /// graphs into one pool at once). Frees deferred by it apply once no capture is open. Again,
+    /// or ended already ([`Shared::reap_captures`]): nothing.
     pub fn pool_end(&self, pool: PoolId) {
         let me = std::thread::current().id();
-        self.sh.end_capture(|(t, p, _)| *t == me && *p == pool);
+        self.sh.end_capture(|c| c.thread == me && c.pool == pool, |c| c.pool == pool);
     }
 
     /// torch's release-pool hook (a graph's reset): one use fewer. At 0, the pool's spans leave once
@@ -955,23 +973,50 @@ impl Shared {
             return false;
         }
         let me = std::thread::current().id();
-        self.capturers.lock().iter().any(|(t, ..)| *t == me)
+        self.capturers.lock().iter().any(|c| c.thread == me)
     }
 
-    /// A routed allocation names a stream `pool`'s capture runs on.
+    /// A routed allocation: `pool`'s capture runs, on `stream` too.
     fn capturing_on(&self, pool: PoolId, stream: usize) {
-        for (_, p, streams) in self.capturers.lock().iter_mut() {
-            if *p == pool && !streams.contains(&stream) {
-                streams.push(stream);
+        for c in self.capturers.lock().iter_mut().filter(|c| c.pool == pool) {
+            c.seen = true;
+            if !c.streams.contains(&stream) {
+                c.streams.push(stream);
             }
         }
     }
 
-    /// Ends the first open capture `this` matches.
-    fn end_capture(&self, this: impl Fn(&(ThreadId, PoolId, Vec<usize>)) -> bool) {
+    /// This thread's allocator call on `on` while its capture is unseen. With the capture's stream
+    /// known: capturing, it began (seen); not, its begin threw, and it is ended. With none known:
+    /// `on` capturing names it. No lock held across the driver calls.
+    fn begun(&self, on: usize) {
+        if self.captures.load(SeqCst) == 0 {
+            return;
+        }
+        let me = std::thread::current().id();
+        let unseen: Vec<(PoolId, Option<usize>)> = self.capturers.lock().iter().filter(|c| c.thread == me && !c.seen).map(|c| (c.pool, c.streams.first().copied())).collect();
+        let mine = |c: &Capture, pool: PoolId| c.thread == me && c.pool == pool;
+        for (pool, known) in unseen {
+            match (known, self.backend.capturing(known.unwrap_or(on))) {
+                (Some(_), Ok(true)) => self.capturers.lock().iter_mut().filter(|c| mine(c, pool)).for_each(|c| c.seen = true),
+                (None, Ok(true)) => self.capturers.lock().iter_mut().filter(|c| mine(c, pool)).for_each(|c| {
+                    c.seen = true;
+                    c.streams.push(on);
+                }),
+                (Some(stream), Ok(false)) => {
+                    tracing::warn!("varena: pool {pool:?}'s capture never began on stream {stream:#x}: ended");
+                    self.end_capture(|c| mine(c, pool) && !c.seen, |_| false);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Ends the first open capture `this` matches, else the first `any` matches.
+    fn end_capture(&self, this: impl Fn(&Capture) -> bool, any: impl Fn(&Capture) -> bool) {
         let gate = self.gate.write();
         let mut caps = self.capturers.lock();
-        if let Some(i) = caps.iter().position(this) {
+        if let Some(i) = caps.iter().position(this).or_else(|| caps.iter().position(any)) {
             caps.remove(i);
         }
         self.captures.store(caps.len() as u32, SeqCst);
@@ -979,16 +1024,20 @@ impl Shared {
         self.kick();
     }
 
-    /// A capture whose every stream it allocated on has stopped capturing died with no end (its
-    /// begin threw, or its thread did): it is ended here, so frees and epochs resume. The poller's,
-    /// in relaxed capture mode, no lock held across the driver calls.
+    /// The poller's look at open captures, in relaxed capture mode with no lock held across the
+    /// driver calls: one capturing is seen; one seen whose streams all stopped capturing ended with
+    /// no end hook, and is ended here so frees and epochs resume.
     fn reap_captures(&self) -> bool {
-        let open: Vec<(ThreadId, PoolId, Vec<usize>)> = self.capturers.lock().iter().filter(|(.., s)| !s.is_empty()).cloned().collect();
+        let open: Vec<Capture> = self.capturers.lock().clone();
         let mut reaped = false;
-        for (thread, pool, streams) in open {
-            if streams.iter().all(|s| matches!(self.backend.capturing(*s), Ok(false))) {
-                tracing::warn!("varena: pool {pool:?}'s capture stopped with no end: ended");
-                self.end_capture(|(t, p, s)| *t == thread && *p == pool && *s == streams);
+        for c in open {
+            let live = c.streams.iter().any(|s| matches!(self.backend.capturing(*s), Ok(true)));
+            let same = |x: &Capture| x.thread == c.thread && x.pool == c.pool;
+            if live && !c.seen {
+                self.capturers.lock().iter_mut().filter(|x| same(x)).for_each(|x| x.seen = true);
+            } else if !live && c.seen {
+                tracing::warn!("varena: pool {:?}'s capture stopped with no end: ended", c.pool);
+                self.end_capture(|x| same(x) && x.seen, |_| false);
                 reaped = true;
             }
         }
@@ -1059,7 +1108,8 @@ impl Shared {
     /// begin and none has started.
     fn record(&self, c: &Clock) {
         let n = c.issued.load(SeqCst) + 1;
-        if c.lost.load(Acquire) || c.wanted.load(SeqCst) < n {
+        // Never into a capture, whatever the bookkeeping says.
+        if c.lost.load(Acquire) || c.wanted.load(SeqCst) < n || matches!(self.backend.capturing(c.stream), Ok(true)) {
             return;
         }
         // Announced before the event is recorded: a stamp that read the old value is covered.

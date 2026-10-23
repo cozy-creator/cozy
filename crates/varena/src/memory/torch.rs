@@ -108,16 +108,18 @@ impl Memory {
         self.torch()?.pool_prepare(pool, expected)
     }
 
-    /// torch's begin-allocate-to-pool hook, on the capturing thread before the capture starts.
-    pub fn pool_begin(&self, pool: PoolId) {
+    /// torch's begin-allocate-to-pool hook, on the capturing thread before the capture starts on
+    /// `stream` (its current stream, when the caller knows it; else the first routed allocation
+    /// names it).
+    pub fn pool_begin(&self, pool: PoolId, stream: Option<usize>) {
         match self.torch() {
-            Ok(t) => t.pool_begin(pool),
+            Ok(t) => t.pool_begin(pool, stream),
             Err(e) => tracing::error!("varena: a capture began with {e}"),
         }
     }
 
-    /// After the capture ended, or failed (torch never ends one whose begin threw: the Runtime
-    /// does), on the capturing thread.
+    /// After the capture ended, or failed: torch's reset (any thread) or the Runtime's
+    /// capture_failed ends one whose begin threw.
     pub fn pool_end(&self, pool: PoolId) {
         if let Some(t) = self.inner.torch.get() {
             t.pool_end(pool);
