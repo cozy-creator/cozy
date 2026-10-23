@@ -1179,10 +1179,17 @@ const CHUNK: u64 = 32 << 20;
 #[test]
 #[ignore = "native GPU: a role of the lease cases"]
 fn role_importer() {
-    let Some(mode) = role().filter(|r| r == "importer" || r == "reexport") else { return };
-    let (b, _) = gpu();
+    let Some(mode) = role().filter(|r| matches!(r.as_str(), "importer" | "reexport" | "charge")) else { return };
+    let (b, uuid) = gpu();
     let mut control = parent();
     let va = b.reserve(CHUNK).unwrap();
+    let nvml = platform::gpu::Device::open(&uuid).unwrap();
+    // NVML's bytes for this process and its parent (the manager), as a pair.
+    let charged = || {
+        let per = nvml.read().unwrap().processes.unwrap_or_default();
+        let at = |pid: u32| per.get(&pid).copied().unwrap_or(0);
+        (at(std::process::id()), at(std::os::unix::process::parent_id()))
+    };
     loop {
         let mut len = [0; 8];
         control.read_exact(&mut len).unwrap();
@@ -1191,6 +1198,7 @@ fn role_importer() {
             break;
         }
         let fd = platform::handles::recv_fd(&control).unwrap();
+        let before = (mode == "charge").then(charged);
         let t = std::time::Instant::now();
         let page = b.import(fd, len).unwrap();
         let import = t.elapsed();
@@ -1198,6 +1206,15 @@ fn role_importer() {
             let again = b.export(&page).map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string());
             println!("REEXPORT {again}");
             b.destroy(page).unwrap();
+        } else if mode == "charge" {
+            // NVML's per-process bytes (executor, manager) around each step of a lease's life here.
+            let imported = charged();
+            b.map(va, 0, &page, Access::ReadWrite).unwrap();
+            let mapped = charged();
+            b.unmap(va, 0, len).unwrap();
+            let unmapped = charged();
+            b.destroy(page).unwrap();
+            println!("CHARGE before {before:?} imported {imported:?} mapped {mapped:?} unmapped {unmapped:?} released {:?}", charged());
         } else {
             let t = std::time::Instant::now();
             b.map(va, 0, &page, Access::ReadWrite).unwrap();
@@ -1238,17 +1255,22 @@ fn an_imported_handle_exports_again_or_not() {
     let imported_here = b.export(&here).map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string());
     b.destroy(here).unwrap();
     step!();
+    // Printed before anything else can fail: the answers are the case's point.
+    println!("TIMINGS re-export: the creator's handle again: {again}; an import in this process: {imported_here}");
+    step!();
     let (mut control, theirs) = UnixStream::pair().unwrap();
     let mut other = child("role_importer", "reexport", Stdio::from(OwnedFd::from(theirs)));
     send(&mut control, &fd, len);
     control.read_exact(&mut [0]).unwrap();
     control.write_all(&0u64.to_le_bytes()).unwrap();
-    let elsewhere = marked(&mut other, "REEXPORT ");
-    assert!(other.wait().unwrap().success());
+    // The child's whole output, to its end: closing its pipe early fails its exit.
+    let mut out = String::new();
+    other.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    let elsewhere = out.lines().find_map(|l| l.split_once("REEXPORT ").map(|(_, r)| r.to_owned())).unwrap_or_else(|| "no answer".into());
+    let exit = other.wait().unwrap();
+    println!("TIMINGS re-export: an import in another process: {elsewhere} (its process ended {exit})");
     step!();
     b.destroy(page).unwrap();
-    step!();
-    println!("TIMINGS re-export: the creator's handle again: {again}; an import in this process: {imported_here}; an import in another process: {elsewhere}");
     step!();
     assert_eq!(again, "ok", "the creator's own handle exports again");
     step!();
@@ -1263,9 +1285,13 @@ fn quantiles(v: &mut [std::time::Duration]) -> String {
     format!("p50 {:?} p99 {:?} (n {})", at(0.5), at(0.99), v.len())
 }
 
-/// The lease cost per 32 MiB chunk across two processes (design/varena-leases.md): this process (TensorD's part) creates
-/// and exports each chunk and passes its fd; the other imports, maps, unmaps and releases it. A pass's worth of chunks,
-/// on an idle device, then while a spin kernel runs. It prints p50 and p99 of each step; a measurement.
+/// The lease cost per chunk across two processes (design/varena-leases.md): this process (TensorD's part) creates and
+/// exports each chunk and passes its fd; the other imports, maps, unmaps and releases it. A pass's worth of chunks:
+/// - at 2 MiB and at 32 MiB on an idle device, which tells a per-chunk cost from a per-byte one;
+/// - at 32 MiB while a spin kernel runs.
+///
+/// Then NVML's per-process charge for one imported 32 MiB chunk (S5's question): both processes' bytes before the
+/// import, after it, mapped, unmapped and released. It prints p50 and p99 of each step; a measurement.
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn lease_chunks_cost_across_two_processes() {
@@ -1277,7 +1303,7 @@ fn lease_chunks_cost_across_two_processes() {
     let (mut control, theirs) = UnixStream::pair().unwrap();
     let mut other = child("role_importer", "importer", Stdio::from(OwnedFd::from(theirs)));
     let mut out = BufReader::new(other.stdout.take().unwrap());
-    let mut round = |spin: Option<std::time::Duration>| {
+    let mut round = |len: u64, spin: Option<std::time::Duration>| {
         if let Some(spin) = spin {
             assert_eq!(launch(c"spin", &[spin.as_nanos() as u64], busy.raw()), cuda::SUCCESS);
         }
@@ -1286,13 +1312,13 @@ fn lease_chunks_cost_across_two_processes() {
         let mut theirs: [Vec<std::time::Duration>; 4] = Default::default();
         for _ in 0..CHUNKS {
             let t = std::time::Instant::now();
-            let page = b.create(CHUNK).unwrap();
+            let page = b.create(len).unwrap();
             create.push(t.elapsed());
             let t = std::time::Instant::now();
             let fd = b.export(&page).unwrap();
             export.push(t.elapsed());
             let t = std::time::Instant::now();
-            send(&mut control, &fd, CHUNK);
+            send(&mut control, &fd, len);
             pass.push(t.elapsed());
             control.read_exact(&mut [0]).unwrap();
             let mut line = String::new();
@@ -1315,21 +1341,42 @@ fn lease_chunks_cost_across_two_processes() {
         let [import, map, unmap, release] = &mut theirs;
         (
             format!(
-                "manager: cuMemCreate {}, export {}, fd passed {}, cuMemRelease {}; executor: import {}, map {}, unmap {}, release {}",
+                "{len} B: manager cuMemCreate {}, export {}, fd passed {}, cuMemRelease {}; executor import {}, map {}, unmap {}, release {}",
                 quantiles(&mut create), quantiles(&mut export), quantiles(&mut pass), quantiles(&mut destroy), quantiles(import), quantiles(map), quantiles(unmap), quantiles(release)
             ),
             took,
         )
     };
-    let (idle, took) = round(None);
+    let (small, _) = round(b.granularity(), None);
+    step!();
+    let (idle, took) = round(CHUNK, None);
     step!();
     // Ten times the idle round: every chunk's calls land while the kernel runs.
-    let (beside, _) = round(Some(took * 10));
+    let (beside, _) = round(CHUNK, Some(took * 10));
     step!();
     control.write_all(&0u64.to_le_bytes()).unwrap();
-    assert!(other.wait().unwrap().success());
+    let mut rest = String::new();
+    out.read_to_string(&mut rest).unwrap();
+    let exit = other.wait().unwrap();
     step!();
-    println!("TIMINGS lease chunks of {CHUNK} B across two processes: idle {idle} | beside a running kernel {beside}");
+    println!("TIMINGS lease chunks across two processes: idle {small} | idle {idle} | beside a running kernel {beside} (the importer ended {exit})");
+    step!();
+    // NVML's charge for one imported chunk: the manager's and the executor's per-process bytes.
+    let (mut control, theirs) = UnixStream::pair().unwrap();
+    let mut other = child("role_importer", "charge", Stdio::from(OwnedFd::from(theirs)));
+    let page = b.create(CHUNK).unwrap();
+    let fd = b.export(&page).unwrap();
+    send(&mut control, &fd, CHUNK);
+    control.read_exact(&mut [0]).unwrap();
+    control.write_all(&0u64.to_le_bytes()).unwrap();
+    let mut out = String::new();
+    other.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    let charge = out.lines().find_map(|l| l.split_once("CHARGE ").map(|(_, r)| r.to_owned())).unwrap_or_else(|| "no answer".into());
+    let exit = other.wait().unwrap();
+    drop(fd);
+    b.destroy(page).unwrap();
+    step!();
+    println!("TIMINGS NVML's per-process bytes (executor, manager) for one imported {CHUNK} B chunk: {charge} (the importer ended {exit})");
     step!();
     println!("PASS lease chunks measured across two processes {uuid}");
     step!();
