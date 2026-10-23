@@ -170,17 +170,25 @@ fn an_executor_that_ends_mid_call_fails_its_run_once() {
     assert_eq!((again.id, again.state, again.attempt), (failed.id, State::Failed, 1));
 }
 
-/// A run that shows no progress fails, with nobody's cancel: no frame, line, byte, CPU or GPU
-/// work for longer than the floor (run 13543, a script blocked for 3.3 h, held its rental).
-/// Slow runs that keep printing or computing past that floor end on their own. Production
-/// sampling: the floor is 30 s, so this takes about two minutes.
+/// A run that shows no progress fails, with nobody's cancel: no step, stage, output, byte moved
+/// or GPU work for longer than the floor (run 13543, a script blocked for 3.3 h, held its
+/// rental). Computing is not progress (cl-648): a silent CPU-bound call fails too, and one that
+/// tells the share of its work done, as a compile or quantize does, ends on its own past that
+/// floor, as one printing does. Production sampling: the floor is 30 s, so this takes about three
+/// minutes.
 #[test]
 fn a_run_that_shows_no_progress_fails_and_slow_working_runs_do_not() {
     let machine = Machine::open();
+    let no_progress = |failed: &journal::Execution| {
+        let failure = failed.failure.as_deref().unwrap_or_default();
+        assert!(failure.contains("no_progress") && failure.contains("no measurable progress"), "{failure}");
+    };
     let stuck = machine.run("wedge", "wedge", json!({}));
     assert_eq!(stuck.state, State::Failed, "{stuck:?}");
-    let failure = stuck.failure.as_deref().unwrap_or_default();
-    assert!(failure.contains("no_progress") && failure.contains("no measurable progress"), "{failure}");
+    no_progress(&stuck);
+    let spinning = machine.run("spin", "burn", json!({"seconds": 600.0, "silent": true}));
+    assert_eq!(spinning.state, State::Failed, "{spinning:?}");
+    no_progress(&spinning);
     let printing = machine.run("drip", "drip", json!({"steps": 5, "seconds": 9.0}));
     assert_eq!(printing.state, State::Completed, "{printing:?}");
     let computing = machine.run("burn", "burn", json!({"seconds": 40.0}));

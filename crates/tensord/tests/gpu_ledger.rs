@@ -554,10 +554,10 @@ fn an_idle_gpus_utilization_reads_idle_and_a_busy_ones_busy() {
 fn inner_an_idle_gpus_utilization_reads_idle() {
     let gpu = platform::gpu::Device::open("0").unwrap();
     let mut seen = 0;
-    assert_eq!(gpu.worked_since(&mut seen).unwrap(), (false, false), "idle");
+    assert!(!gpu.moved_since(&mut seen).unwrap(), "idle");
     // SAFETY: this child process is single-threaded here, and nothing else reads the environment.
     unsafe { std::env::set_var("FAKE_NVML_BUSY", "1") };
-    assert_eq!(gpu.worked_since(&mut seen).unwrap(), (true, true), "busy");
+    assert!(gpu.moved_since(&mut seen).unwrap(), "busy");
     assert_eq!(seen, 1, "the sample's time is the next reading's start");
 }
 

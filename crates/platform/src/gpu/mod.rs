@@ -171,29 +171,25 @@ impl Device {
         })
     }
 
-    /// Whether kernels ran, and whether device memory moved (kernels' traffic, copies, peer
-    /// writes), in NVML's samples after `seen` (its timestamp, µs), which it advances.
-    pub fn worked_since(&self, seen: &mut u64) -> Result<(bool, bool)> {
+    /// Whether device memory moved (kernels' traffic, copies, peer writes) in NVML's samples
+    /// after `seen` (its timestamp, µs), which it advances.
+    pub fn moved_since(&self, seen: &mut u64) -> Result<bool> {
         let device = self.nvml.device_by_index(self.index).map_err(failed("open device"))?;
-        let from = *seen;
-        let mut busy = |sampling| -> Result<bool> {
-            // No sample newer than `from` is no work seen: NVML answers NotFound while the GPU is
-            // idle, which is a reading, not an unreadable GPU: a call stuck there was never judged.
-            let samples = match device.samples(sampling, from) {
-                Err(NvmlError::NotFound) => return Ok(false),
-                samples => samples.map_err(failed("utilization samples"))?,
-            };
-            Ok(samples.iter().fold(false, |busy, sample| {
-                *seen = (*seen).max(sample.timestamp);
-                busy || match sample.value {
-                    SampleValue::U32(value) => value > 0,
-                    SampleValue::U64(value) => value > 0,
-                    SampleValue::I64(value) => value > 0,
-                    SampleValue::F64(value) => value > 0.0,
-                }
-            }))
+        // No sample newer than `seen` is no work seen: NVML answers NotFound while the GPU is idle,
+        // which is a reading, not an unreadable GPU: a call stuck there was never judged.
+        let samples = match device.samples(Sampling::MemoryUtilization, *seen) {
+            Err(NvmlError::NotFound) => return Ok(false),
+            samples => samples.map_err(failed("utilization samples"))?,
         };
-        Ok((busy(Sampling::GpuUtilization)?, busy(Sampling::MemoryUtilization)?))
+        Ok(samples.iter().fold(false, |moved, sample| {
+            *seen = (*seen).max(sample.timestamp);
+            moved || match sample.value {
+                SampleValue::U32(value) => value > 0,
+                SampleValue::U64(value) => value > 0,
+                SampleValue::I64(value) => value > 0,
+                SampleValue::F64(value) => value > 0.0,
+            }
+        }))
     }
 
     pub fn display_active(&self) -> Result<bool> {

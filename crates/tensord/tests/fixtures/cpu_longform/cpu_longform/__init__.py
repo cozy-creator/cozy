@@ -50,15 +50,22 @@ class SegmentOutput(msgspec.Struct):
 
 
 @invocable(memoize=True)
-async def render_segment(ctx: Context, *, payload: SegmentInput, out: Outputs) -> SegmentOutput:
-    """One segment: its bytes name the reference it saw and the context it continued."""
+async def render_segment(
+    ctx: Context, *, payload: SegmentInput, out: Outputs, tel: Telemetry
+) -> SegmentOutput:
+    """One segment: its bytes name the reference it saw and the context it continued. A held
+    one takes a step a second, as H3's denoise steps."""
     ctx.raise_if_cancelled()
     if payload.index == payload.fail_at:
         raise ValueError(f"segment {payload.index} cannot be rendered")
     held = payload.hold if payload.hold_at in (-1, payload.index) else 0.0
-    for _ in range(int(held * 20)):
+    if held:
+        on_step = tel.step_callback(max(int(held), 1), stage="denoise")
+    for tick in range(int(held * 20)):
         await asyncio.sleep(0.05)
         ctx.raise_if_cancelled()
+        if tick % 20 == 19:
+            on_step(tick // 20)
     seen = hashlib.sha256(payload.reference.read_bytes()).hexdigest()
     body = f"{payload.index}|{payload.prompt}|{seen}|{payload.context}\n".encode()
     return SegmentOutput(

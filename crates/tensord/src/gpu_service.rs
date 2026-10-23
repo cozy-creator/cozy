@@ -19,7 +19,6 @@ use crate::{
     },
     launch_identity::Seal,
     memory::{GpuLedger, MemoryConfig},
-    process::Gpus,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -3199,18 +3198,18 @@ fn gpu_place(gpus: &[Device], pid: u32) -> Option<crate::process::Place> {
     })
 }
 
-/// What `gpus` did since the last reading; None without GPUs or while NVML cannot tell.
+/// Whether `gpus` moved device memory since the last reading; None without GPUs or while NVML
+/// cannot tell.
 fn gpu_work(gpus: &[Device]) -> Option<crate::process::Activity> {
     let opened = gpus.iter().map(|gpu| platform::gpu::Device::open(&gpu.entry).ok());
     let devices: Vec<_> = opened.collect::<Option<_>>().filter(|devices: &Vec<_>| !devices.is_empty())?;
     let seen = Mutex::new(vec![0; devices.len()]);
     Some(Arc::new(move || {
-        let (mut kernels, mut memory) = (false, false);
+        let mut moved = false;
         for (device, seen) in devices.iter().zip(seen.lock().unwrap().iter_mut()) {
-            let (ran, moved) = device.worked_since(seen).ok()?;
-            (kernels, memory) = (kernels || ran, memory || moved);
+            moved |= device.moved_since(seen).ok()?;
         }
-        Some(if memory { Gpus::Moved } else if kernels { Gpus::Stuck } else { Gpus::Idle })
+        Some(moved)
     }))
 }
 
@@ -3654,7 +3653,7 @@ impl Services for Callbacks<'_> {
                         // once that call ends the next ask loads the layout itself.
                         let loader = self.engine.get(sealer.rsplit_once('#').map_or(&*sealer, |(call, _)| call)).ok();
                         let birth = loader.as_ref().and_then(|record| record.process.clone());
-                        self.sealer = Some(Arc::new(move || birth.as_ref().and_then(crate::process::group_burn)));
+                        self.sealer = Some(Arc::new(move || birth.as_ref().and_then(crate::process::group_moved)));
                         let rank = self.kept.get(frame.rank as usize).copied().flatten();
                         self.pool.notes.note(serde_json::json!({"event": "layout_sealing", "manifest": frame.manifest,
                             "layout": frame.layout, "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "call": self.id,
