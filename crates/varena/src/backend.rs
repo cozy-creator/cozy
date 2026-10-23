@@ -5,6 +5,7 @@
 //! pagefile section): CPU and MPS executors and the CPU tests use it; [`crate::CudaBackend`] is CUDA's.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use platform::handles::Owned;
@@ -75,6 +76,10 @@ pub trait Backend: Send + Sync {
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()>;
     /// A handle another process can import (a POSIX fd, a WIN32 handle).
     fn export(&self, page: &Physical) -> Result<Owned>;
+    /// A handle another process maps read-write: a lease (a host page's export is read-only).
+    fn lend(&self, page: &Physical) -> Result<Owned> {
+        self.export(page)
+    }
     fn import(&self, handle: Owned, len: u64) -> Result<Physical>;
     /// Where `io::read` writes `len` mapped bytes at `va + offset`: device memory ordered on the
     /// backend's copy stream, or host memory.
@@ -94,9 +99,16 @@ pub trait Backend: Send + Sync {
     /// Blocks until `event` completes: only the mechanism thread, before it unmaps a page whose
     /// consumers may still read it, and a planned handover ([`crate::Memory::settle`]).
     fn finish(&self, event: Event) -> Result<()>;
-    /// Gives `event` up, pending or not, from any thread (the allocator hook's too): never
-    /// blocks on its work.
+    /// Gives `event` up, pending or not, from any thread (the allocator hook's too): it only
+    /// queues it, no driver call. Retiring one event twice destroys it once.
     fn retire(&self, event: Event);
+    /// Destroys the retired events that completed (never waiting on one): the mechanism and
+    /// trim threads only, since a destroy can wait on a driver lock another thread holds.
+    fn sweep(&self) {}
+    /// This process's device budget, where the OS sets one (Windows); `None` elsewhere.
+    fn budget(&self) -> Option<Arc<dyn Budget>> {
+        None
+    }
     /// After a device error: proves the copy stream's work complete or fails.
     fn drain(&self) -> Result<()>;
 }
@@ -178,6 +190,9 @@ impl Backend for HostBackend {
             return Err(Error::Device { op: "create", code: OUT_OF_MEMORY, name: "out of memory".into() });
         }
         let page = memory::page(len).map_err(page_err)?;
+        // A holder's ftruncate must never SIGBUS another mapper (a lease's adopter).
+        #[cfg(target_os = "linux")]
+        platform::shm::seal_with(std::os::fd::AsFd::as_fd(&page), platform::shm::RESIZE_SEALS).map_err(page_err)?;
         Ok(pages.insert(page, len, len))
     }
 
@@ -207,6 +222,12 @@ impl Backend for HostBackend {
         let pages = self.pages.lock();
         let (handle, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
         memory::export(handle).map_err(page_err)
+    }
+
+    fn lend(&self, page: &Physical) -> Result<Owned> {
+        let pages = self.pages.lock();
+        let (handle, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
+        handle.try_clone().map_err(|e| Error::io("lend a host page", e))
     }
 
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> {
@@ -250,5 +271,104 @@ impl Backend for HostBackend {
 
     fn drain(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// This process's device budget where the OS sets one per process (Windows: DXCore/DXGI) and its
+/// changes; a game in front shrinks it.
+pub trait Budget: Send + Sync {
+    /// This process's budget and usage, bytes.
+    fn read(&self) -> Result<(u64, u64)>;
+    /// Blocks until the budget or usage changed (true) or [`Budget::close`] was called (false).
+    fn wait(&self) -> bool;
+    fn close(&self);
+}
+
+/// The driver's events behind varena's ids. An id is never reused, so retiring one twice, or a
+/// stale copy of it after the driver handed its handle out again, reaches nothing: a handle is
+/// queued for destruction once, by construction. Destroyed only once complete and only by a
+/// sweep, on a thread that may wait (a destroy can block on its work or on a driver lock another
+/// thread holds).
+pub struct Events<H> {
+    live: parking_lot::RwLock<HashMap<u64, H>>,
+    next: std::sync::atomic::AtomicU64,
+    retired: Mutex<Vec<H>>,
+}
+
+impl<H> Default for Events<H> {
+    fn default() -> Self {
+        Events { live: parking_lot::RwLock::new(HashMap::new()), next: std::sync::atomic::AtomicU64::new(Event::DONE.0 + 1), retired: Mutex::new(Vec::new()) }
+    }
+}
+
+impl<H: Copy> Events<H> {
+    /// A new id for `handle`.
+    pub fn add(&self, handle: H) -> Event {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.live.write().insert(id, handle);
+        Event(id)
+    }
+
+    /// The live handle of `event`; `None` once retired (or never made here).
+    pub fn get(&self, event: Event) -> Option<H> {
+        self.live.read().get(&event.0).copied()
+    }
+
+    /// Gives `event` up: its handle is queued for a sweep, no driver call. Again: nothing.
+    pub fn retire(&self, event: Event) {
+        if let Some(handle) = self.live.write().remove(&event.0) {
+            self.retired.lock().push(handle);
+        }
+    }
+
+    /// Destroys the queued handles `done` reports complete; the others stay queued. The queue is
+    /// not held across the driver calls, so a retire never waits on a sweep.
+    pub fn sweep(&self, done: impl Fn(H) -> bool, destroy: impl Fn(H)) {
+        let taken = std::mem::take(&mut *self.retired.lock());
+        let pending: Vec<H> = taken.into_iter().filter(|h| {
+            let complete = done(*h);
+            if complete {
+                destroy(*h);
+            }
+            !complete
+        }).collect();
+        if !pending.is_empty() {
+            self.retired.lock().extend(pending);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    use super::*;
+
+    /// A retire never destroys; an event given up twice, while pending and after, is destroyed
+    /// once by a sweep, when complete. A stale id retired after its handle was handed out again
+    /// (the driver reuses handles) reaches nothing: the new event lives on.
+    #[test]
+    fn a_retired_event_is_destroyed_once_and_only_once_complete() {
+        let (events, complete, destroyed) = (Events::<u64>::default(), RefCell::new(HashSet::new()), RefCell::new(Vec::new()));
+        let done = |h: u64| complete.borrow().contains(&h);
+        let destroy = |h: u64| destroyed.borrow_mut().push(h);
+        let first = events.add(7);
+        events.retire(first);
+        events.retire(first);
+        events.retire(Event::DONE);
+        assert!(destroyed.borrow().is_empty(), "a retire destroyed");
+        events.sweep(done, destroy);
+        assert!(destroyed.borrow().is_empty(), "a pending event was destroyed");
+        complete.borrow_mut().insert(7);
+        events.sweep(done, destroy);
+        events.sweep(done, destroy);
+        assert_eq!(*destroyed.borrow(), vec![7], "destroyed once, once complete");
+        // The driver hands handle 7 out again: a stale retire of the first id cannot reach it.
+        complete.borrow_mut().remove(&7);
+        let second = events.add(7);
+        events.retire(first);
+        events.sweep(done, destroy);
+        assert_eq!((events.get(second), destroyed.borrow().len()), (Some(7), 1), "a stale id reached a live handle");
     }
 }

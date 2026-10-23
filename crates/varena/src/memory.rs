@@ -15,6 +15,9 @@
 //! mappings, and the process keeps serving.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -30,7 +33,7 @@ use platform::handles::Owned;
 use tensorfs::io::source::Placement;
 use tensorfs::io::Dst;
 
-use crate::backend::{Access, Backend, Event, Physical, Va};
+use crate::backend::{Access, Backend, Budget, Event, Physical, Va};
 use crate::custody;
 use crate::decide::{self, Victim};
 use crate::ledger::{self, Facts, Grant, PhysicalChange, Row, Shared};
@@ -38,6 +41,8 @@ use crate::table::{Class, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table
 use crate::{Error, Exhausted, GpuId, Result};
 
 mod stream;
+mod torch;
+pub use torch::{Allocating, PoolId, TorchStats};
 use stream::{StreamIn, Streaming};
 
 /// A loaded set.
@@ -235,8 +240,11 @@ pub struct Fills {
 /// Bytes moved, by source: fill time over bytes against the measured ceiling gives the %.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Moved {
-    /// Kept pages imported by fingerprint (no copy; `ns` is the import).
+    /// Kept pages imported by fingerprint, or leased pages adopted from the manager's retention
+    /// (no copy; `ns` is the import and map).
     pub kept: Fills,
+    /// Pages leased from the manager and filled here (`ns`: the ask, import and map).
+    pub leased: Fills,
     pub store: Fills,
     /// Of the above, bytes filled speculatively.
     pub speculative: u64,
@@ -495,6 +503,9 @@ enum Mech {
     Move { key: Key, gen: u64, va: Va, from: u64, off: u64, span: u64, phys: Physical, after: Vec<Event>, job: Job },
     /// A closed set's reservation, after its pages' unmaps.
     Release(Va),
+    /// The lease manager asked pages back: the quiet ones go, the busy ones once idle.
+    #[cfg(unix)]
+    Revoke,
 }
 
 struct Active {
@@ -614,6 +625,9 @@ struct State {
     events: BTreeMap<usize, VecDeque<(Event, Key)>>,
     /// Sets streaming their upper blocks through slots (step 2's watermark), by set.
     streams: HashMap<u32, Streaming>,
+    /// Pages' backing between homes: taken in place (the hook unmaps and destroys it) or a slot
+    /// moving (a Move): still this process's created bytes, never context.
+    transit: u64,
     /// Ids and the logical clock.
     clock: u64,
     shrinks: HashMap<u32, Shrink>,
@@ -657,6 +671,7 @@ impl State {
         let Some(h) = self.homes.get_mut(&key).filter(|h| !h.keeping && !h.keep_after && !h.protecting && !h.reclaiming && !h.exported && !h.landing) else { return Ok(None) };
         let Some(phys) = h.phys.take() else { return Ok(None) };
         h.reclaiming = true;
+        self.transit += phys.len;
         let taking = (key, h.gen, class, place, phys, h.ready);
         self.sync(key);
         Ok(Some(taking))
@@ -785,7 +800,20 @@ impl Drop for Work {
 }
 
 struct Inner {
-    backend: Box<dyn Backend>,
+    backend: Arc<dyn Backend>,
+    /// The lease agent once attached (varena-leases): this GPU's pages are the manager's chunks.
+    #[cfg(unix)]
+    lease: std::sync::OnceLock<Arc<crate::lease::Agent>>,
+    /// Leased pages by physical id: their grant and their key.
+    #[cfg(unix)]
+    leased: Mutex<HashMap<u64, (crate::lease::Ticket, Key)>>,
+    /// Asked back while in use: pinned in the table until idle, then given.
+    #[cfg(unix)]
+    declined: Mutex<HashSet<crate::lease::Ticket>>,
+    /// Leased pages filled whose bytes the manager has not heard landed yet: acked once their
+    /// ready event completes (only landed bytes are retained).
+    #[cfg(unix)]
+    to_land: Mutex<Vec<Key>>,
     shared: Arc<Shared>,
     row: Arc<Row>,
     custody: Option<Arc<custody::Client>>,
@@ -810,6 +838,8 @@ struct Inner {
     stop: Arc<AtomicBool>,
     quiet: Arc<Quiet>,
     ownership_lost: AtomicBool,
+    /// This process's device budget (Windows): its changes give pages back; growth stays under it.
+    budget: Option<Arc<dyn Budget>>,
     public_owners: AtomicU64,
     /// The allocator hook's segments ([`Memory::resident`]), counted exactly, and the room its
     /// claims hold for segments not allocated yet.
@@ -823,8 +853,8 @@ struct Inner {
     _device: Device,
 }
 
-fn exhausted(need: u64, site: Option<&str>, stats: Stats) -> Box<Exhausted> {
-    Box::new(Exhausted { need, site: site.map(str::to_string), stats })
+fn exhausted(need: u64, site: Option<&str>, stats: Stats, foreign: Option<String>) -> Box<Exhausted> {
+    Box::new(Exhausted { need, site: site.map(str::to_string), stats, foreign })
 }
 
 impl Memory {
@@ -852,9 +882,18 @@ impl Memory {
             let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
             let holder = custody.as_ref().map_or(0, |c| c.holder());
             let context = backend.process_used().unwrap_or_else(|_| backend.opened_context());
-            let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, ..Table::default() };
+            let budget = backend.budget();
+            let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, card: backend.capacity(), ..Table::default() };
             let inner = Arc::new(Inner {
-                backend,
+                backend: Arc::from(backend),
+                #[cfg(unix)]
+                lease: std::sync::OnceLock::new(),
+                #[cfg(unix)]
+                leased: Mutex::default(),
+                #[cfg(unix)]
+                declined: Mutex::default(),
+                #[cfg(unix)]
+                to_land: Mutex::default(),
                 shared,
                 row: row.clone(),
                 _device: device,
@@ -872,6 +911,7 @@ impl Memory {
                 stop: Arc::new(AtomicBool::new(false)),
                 quiet: Arc::default(),
                 ownership_lost: AtomicBool::new(false),
+                budget,
                 public_owners: AtomicU64::new(0),
                 native_resident: AtomicU64::new(0),
                 claimed: AtomicU64::new(0),
@@ -894,11 +934,36 @@ impl Memory {
             std::thread::Builder::new().name("varena-ask".into()).spawn(move || ask_loop(listener, &row, &weak, &stop)).map_err(|e| Error::io("spawn ask", e))?;
             let (weak, wanted) = (Arc::downgrade(&inner), inner.wanted.clone());
             std::thread::Builder::new().name("varena-trim".into()).spawn(move || trim_loop(&wanted, &weak)).map_err(|e| Error::io("spawn trim", e))?;
+            if let Some(budget) = inner.budget.clone() {
+                let weak = Arc::downgrade(&inner);
+                std::thread::Builder::new().name("varena-budget".into()).spawn(move || budget_loop(&*budget, &weak)).map_err(|e| Error::io("spawn budget", e))?;
+            }
             let mut st = inner.lock();
             inner.publish(&mut st);
             inner.unlock(st);
             Ok(Memory { inner: inner.into() })
         })
+    }
+
+    /// Leases this GPU's weight pages from TensorD's manager over `stream` (varena-leases), right
+    /// after open, before any load: from then on its pages are the manager's chunks, retained by
+    /// it across this process's exit (no Keep), and asked back by it. Refused, it stays
+    /// standalone: `Some((code, why))`.
+    #[cfg(unix)]
+    pub fn lease(&self, stream: crate::os::Stream) -> Result<Option<(crate::lease::Refusal, String)>> {
+        let mech = self.inner.mech.clone();
+        let revoked = move || {
+            mech.post(Mech::Revoke, 0);
+        };
+        match crate::lease::Agent::attach(stream, self.inner.backend.clone(), revoked)? {
+            crate::lease::Attach::Leased(agent) => {
+                if self.inner.lease.set(agent).is_err() {
+                    return Err(Error::Invalid("this Memory is leased already".into()));
+                }
+                Ok(None)
+            }
+            crate::lease::Attach::Refused { code, why } => Ok(Some((code, why))),
+        }
     }
 
     /// Registers a set and brings it to `level`; a set loaded again is re-levelled in place. On
@@ -1350,6 +1415,14 @@ impl Inner {
 
     fn drain(&self, st: &mut State) {
         let mut wake = self.poll_releases(st, true);
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            if wake {
+                agent.progressed();
+            }
+            self.redecline(st);
+            self.land(st, agent);
+        }
         // A held cache's release completes on its stream: it is its class again.
         for c in &mut st.table.caches {
             let before = c.releasing.len();
@@ -1435,28 +1508,30 @@ impl Inner {
         }
     }
 
-    /// The other rows, orphans, capacity, mode and foreign bytes, read now.
+    /// What holds the device besides cozy, for a refusal: this process's budget and usage
+    /// (Windows), else the largest foreign process TensorD saw.
+    fn foreign(&self) -> Option<String> {
+        if let Some((budget, usage)) = self.budget.as_ref().and_then(|b| b.read().ok()) {
+            return Some(format!("other programs: this process's budget is {} MiB, its usage {} MiB", budget >> 20, usage >> 20));
+        }
+        self.shared.foreign_holder().ok().flatten().map(|(name, bytes)| format!("{name} ({} MiB)", bytes >> 20))
+    }
+
+    /// The device's figures (this process's context, the driver's free bytes) sampled, and the
+    /// rows read: only where they change a decision (a refusal, a peer ask, a request's open),
+    /// never per pass.
     fn refresh(&self, st: &mut State) -> Result<ledger::Admission<'_>> {
+        self.measure(st);
+        // TensorD samples foreign bytes while it has the table: the rows' read takes them.
+        if self.shared.sampled()? {
+            return self.rows(st);
+        }
         // Device queries are outside the shared metadata transaction. Revalidate their
         // physical attribution against the authoritative rows after taking admission.
         let sample = self.shared.physical_sample()?;
         let card = self.backend.capacity();
         let used = card.saturating_sub(self.backend.free()?);
-        let admission = self.shared.admission()?;
-        let mut rows = admission.rows()?;
-        if rows.iter().any(|r| !r.live) && self.shared.reap(None)? {
-            rows = admission.rows()?;
-        }
-        let (others, orphans) = ledger::remotes(&rows, self.row.at());
-        st.table.others = others;
-        st.table.orphans = orphans;
-        st.table.capacity = self.shared.capacity()?;
-        st.table.shared = self.shared.shared_mode()?;
-        st.table.pending = self.to_custody.pending();
-        self.physical(st);
-        // Unmaps in flight are this process's still (and already spent on the creates queued
-        // after them).
-        st.table.inflight = self.mech.pending();
+        let (admission, rows) = self.read_rows(st)?;
         // This row's own bytes are known under the state lock: a retiring page stays counted
         // (and held) until its unmap returns, so a driver free before that hides nothing; a
         // create not yet recorded is not counted, so it reads as foreign meanwhile.
@@ -1471,6 +1546,35 @@ impl Inner {
             self.shared.set_foreign(st.table.foreign)?;
         }
         Ok(admission)
+    }
+
+    /// The other rows, orphans, capacity and mode, read now (shared memory only); foreign bytes
+    /// and the context as last sampled.
+    fn rows(&self, st: &mut State) -> Result<ledger::Admission<'_>> {
+        self.read_rows(st).map(|(admission, _)| admission)
+    }
+
+    fn read_rows(&self, st: &mut State) -> Result<(ledger::Admission<'_>, Vec<ledger::RowView>)> {
+        let admission = self.shared.admission()?;
+        let mut rows = admission.rows()?;
+        if rows.iter().any(|r| !r.live) && self.shared.reap(None)? {
+            rows = admission.rows()?;
+        }
+        let (others, orphans) = ledger::remotes(&rows, self.row.at());
+        st.table.others = others;
+        st.table.orphans = orphans;
+        st.table.capacity = self.shared.capacity()?;
+        st.table.shared = self.shared.shared_mode()?;
+        st.table.sampled = self.shared.sampled()?;
+        if st.table.sampled {
+            st.table.foreign = self.shared.foreign()?;
+        }
+        st.table.pending = self.to_custody.pending();
+        self.physical(st);
+        // Unmaps in flight are this process's still (and already spent on the creates queued
+        // after them).
+        st.table.inflight = self.mech.pending();
+        Ok((admission, rows))
     }
 
     fn facts(st: &State) -> Facts {
@@ -1528,7 +1632,8 @@ impl Inner {
         st.table.context = match self.backend.process_used() {
             Ok(used) => {
                 let created: u64 = st.homes.values().filter(|h| h.origin != Origin::Kept).filter_map(|h| h.phys.as_ref()).map(|p| p.len).sum::<u64>()
-                    + st.retired.values().filter(|r| r.created).map(|r| r.bytes).sum::<u64>();
+                    + st.retired.values().filter(|r| r.created).map(|r| r.bytes).sum::<u64>()
+                    + st.transit;
                 used.saturating_sub(self.native_resident.load(Ordering::Acquire) + created)
             }
             // Not measurable here: the context as open measured it.
@@ -1547,6 +1652,9 @@ impl Inner {
         let custody = if home.exported && withdraw { self.withdraw(home.identity.clone(), key.1, span) } else { None };
         if custody.is_some() { st.table.pending += span; }
         let physical = home.phys.as_ref().map(|p| p.len);
+        if let Some(p) = &home.phys {
+            self.commit_page(p);
+        }
         let ticket = self.mech.post(Mech::Unmap { va, off, span, phys: home.phys, ready: home.ready }, span);
         if let Some(bytes) = physical {
             st.retired.insert((key, home.gen), Retirement { bytes, created: home.origin != Origin::Kept, mechanism: Some(ticket), custody, kept: home.exported && !withdraw });
@@ -1569,7 +1677,7 @@ impl Inner {
     /// and orphans are adopted before any demand could release them. The calls run unlocked;
     /// an import nobody needs any more goes back.
     fn adopt(&self, keys: Vec<Key>, req: Option<u64>) -> Result<u64> {
-        let Some(c) = &self.custody else { return Ok(0) };
+        let Some(c) = self.custody.as_ref().filter(|_| !self.leasing()) else { return Ok(0) };
         let wanted: Vec<(Key, String)> = {
             let st = self.lock();
             let w = keys
@@ -1661,13 +1769,18 @@ impl Inner {
             // its consumers are done.
             let custody = if exported { self.withdraw(old_identity, key.1, span) } else { None };
             if custody.is_some() { st.table.pending += span; }
-            self.backend.retire(old);
+            // A ready event still pending is among `after` (a Keep waited on it): retired with them.
+            if !after.contains(&old) {
+                self.backend.retire(old);
+            }
             let ticket = self.mech.post(Mech::Renew { key, gen, va, off, span, old: phys, after, job }, 0);
             st.retired.insert((key, old_gen), Retirement { bytes: span, created, mechanism: Some(ticket), custody, kept: false });
             return Ok(());
         }
         // Read-write and nobody else's: filled again in place, after its consumers in-stream.
-        self.backend.retire(old);
+        if !after.contains(&old) {
+            self.backend.retire(old);
+        }
         self.queue_fills(vec![Job { after, ..job }], false)
     }
 
@@ -1676,8 +1789,8 @@ impl Inner {
     /// process must not import a half-made one.
     fn keep(&self, st: &mut State, key: Key) {
         // While a request runs its pages stay the allocator hook's to take (it makes no custody
-        // call); they are kept when it ends.
-        if self.custody.is_none() || !st.table.requests.is_empty() {
+        // call); they are kept when it ends. Leased, the manager retains them: no Keep.
+        if self.custody.is_none() || !st.table.requests.is_empty() || self.leasing() {
             return;
         }
         let Ok(m) = st.mech(key.0) else { return };
@@ -1800,6 +1913,10 @@ impl Inner {
                     if let (Some(ready), Some(h)) = (ready, st.homes.get_mut(&job.key)) {
                         (h.ready, h.ready_on, h.filling, h.filled, h.origin) = (ready, COPY, false, filled, origin);
                         st.sync(job.key);
+                    }
+                    #[cfg(unix)]
+                    if filled && self.leasing() {
+                        self.to_land.lock().push(job.key);
                     }
                     let s = st.fills(job.req, job.key, span, origin);
                     let f = &mut s.moved.store;
@@ -2041,8 +2158,6 @@ impl Inner {
         let out = loop {
             let mut st = self.lock();
             let admission = self.refresh(&mut st)?;
-            self.measure(&mut st);
-            self.physical(&mut st);
             // The driver's free bytes bound the table's (its own slack, another tenant's churn).
             // A refused create says the driver had less than both: its free bytes count for
             // nothing, and the round takes the page's bytes itself.
@@ -2064,7 +2179,7 @@ impl Inner {
                 let stats = st.stats(req).cloned().unwrap_or_default();
                 drop(admission);
                 self.unlock(st);
-                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats)));
+                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats, self.foreign())));
             }
             // Beyond what it could ever have (the budget with orphans released, less its context,
             // the hook's segments but its caches', its pinned pages): Exhausted at once.
@@ -2076,7 +2191,7 @@ impl Inner {
                 let stats = st.stats(req).cloned().unwrap_or_default();
                 drop(admission);
                 self.unlock(st);
-                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats)));
+                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats, self.foreign())));
             }
             record.step = req.and_then(|r| st.table.request(r)).map_or(0, |r| r.cursor.step);
             // Kept pages no live process maps go first: nobody's.
@@ -2159,8 +2274,11 @@ impl Inner {
             // The hook's pages: unmapped and destroyed here, on its own thread.
             for (key, gen, class, (va, off, span), phys, ready) in taking {
                 let change = self.row.physical_change();
-                let given = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(phys));
+                let len = phys.len;
+                self.commit_page(&phys);
+                let given = self.backend.unmap(va, off, span).and_then(|()| self.give_page(phys));
                 let mut st = self.lock();
+                st.transit = st.transit.saturating_sub(len);
                 if st.homes.get(&key).is_some_and(|h| h.gen == gen) {
                     st.homes.remove(&key);
                     self.backend.retire(ready);
@@ -2216,7 +2334,7 @@ impl Inner {
                 let free = st.table.free();
                 let stats = st.stats(req).cloned().unwrap_or_default();
                 self.unlock(st);
-                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats)));
+                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats, self.foreign())));
             }
         };
         if record.freed > 0 || record.waited > 0 {
@@ -2252,6 +2370,56 @@ impl Inner {
             self.landed.notify_all();
         }
         total
+    }
+
+    /// Recovery, at a pass boundary only (a shrink is at once): a streaming set takes back the
+    /// blocks at its watermark, one by one, then refills its slots, into free bytes beyond 2H of
+    /// the device (shared: H more than the table leaves, which charges H; Windows: under budget −
+    /// 2H), mapped and filled on the copy stream, never evicting. The H..2H band is the
+    /// hysteresis: no timer.
+    fn regrow(&self, req: u64, set: u32) {
+        let mut st = self.lock();
+        let (Some(watermark), Ok(blocks)) = (st.streams.get(&set).map(|s| s.watermark), st.mech(set).map(|m| m.spec.layout.regions.len() as u32)) else {
+            return self.unlock(st);
+        };
+        let h = crate::table::headroom(self.backend.capacity());
+        let mut room = match self.budget.as_ref().and_then(|b| b.read().ok()) {
+            Some((budget, usage)) => budget.saturating_sub(2 * h + usage).min(st.table.free()),
+            None if st.table.shared => st.table.free().saturating_sub(h),
+            None => st.table.free(),
+        };
+        let mut w = watermark;
+        while let Some(bytes) = (w < blocks).then(|| st.table.page((set, w)).map(|p| p.bytes)).flatten().filter(|b| *b <= room) {
+            // A slot already there is resident now at no cost; a block with no page is mapped.
+            if !st.homes.contains_key(&(set, w)) {
+                if !self.map(&mut st, (set, w), Some(req), true).unwrap_or(false) {
+                    break;
+                }
+                room -= bytes;
+            }
+            w += 1;
+        }
+        if w >= blocks {
+            st.streams.remove(&set);
+        } else if let Some(s) = st.streams.get_mut(&set) {
+            s.watermark = w;
+        }
+        // Its slots, refilled here only (a bind mid-pass moves one, never makes one): the next
+        // upper blocks with no page.
+        let mut next = w;
+        for _ in st.slots(set, w)..stream::SLOTS {
+            while next < blocks && st.homes.contains_key(&(set, next)) {
+                next += 1;
+            }
+            let Some(bytes) = (next < blocks).then(|| st.table.page((set, next)).map(|p| p.bytes)).flatten().filter(|b| *b <= room) else { break };
+            if !self.map(&mut st, (set, next), Some(req), true).unwrap_or(false) {
+                break;
+            }
+            room -= bytes;
+            next += 1;
+        }
+        self.publish(&mut st);
+        self.unlock(st);
     }
 
     /// Maps the next blocks of `req`'s current step into free bytes only (never in shared mode,
@@ -2415,7 +2583,7 @@ impl Inner {
         self.publish(&mut st);
         self.unlock(st);
         if !idle {
-            self.coreside(rid)?;
+            self.coreside(rid, true)?;
             self.unkeep(rid);
         }
         Ok(rid)
@@ -2428,7 +2596,16 @@ impl Inner {
     /// as its recorded peak lacks beside the free bytes and what the hook could take already.
     /// They are kept again when no request is open.
     fn unkeep(&self, req: u64) {
-        let st = self.lock();
+        let mut st = self.lock();
+        // A Keep already protecting when the request opened ends kept: withdrawn below.
+        while st.homes.values().any(|h| h.protecting) {
+            if self.wait(&mut st).is_err() {
+                return self.unlock(st);
+            }
+        }
+        if !st.homes.values().any(|h| h.exported) {
+            return self.unlock(st);
+        }
         let Some(peak) = st.table.request(req).map(|r| r.peak) else { return self.unlock(st) };
         let victims = decide::victims(&st.table, &[]);
         let kept = |st: &State, key: Key| st.table.page(key).is_some_and(|p| p.kept);
@@ -2469,27 +2646,20 @@ impl Inner {
     /// recorded peak beside its free bytes and its own evictable ones, it asks the other rows
     /// for their idle pages (pages only, never caches); unmeasured, for every idle page they
     /// have.
-    fn coreside(&self, req: u64) -> Result<()> {
+    fn coreside(&self, req: u64, open: bool) -> Result<()> {
         let asks: Vec<(u64, u64)> = {
             let mut st = self.lock();
-            let admission = self.refresh(&mut st)?;
-            let Some(r) = st.table.request(req) else { return Ok(()) };
-            let own: u64 = decide::victims(&st.table, &[]).iter().map(|v| match v {
-                Victim::Page { bytes, .. } | Victim::Cache { bytes, .. } => *bytes,
-            }).sum();
-            let have = st.table.free() + own;
-            let mut short = r.peak.map_or(u64::MAX, |p| p.saturating_sub(have));
-            let mut asks = vec![];
-            for o in &st.table.others {
-                if short == 0 {
-                    break;
-                }
-                let bytes = short.min(o.idle());
-                if bytes > 0 {
-                    asks.push((o.row, bytes));
-                    short = short.saturating_sub(bytes);
-                }
+            // A request's open samples the device; a pass start reads the rows and the device as
+            // last sampled, and samples it again only before an ask.
+            let mut admission = if open { self.refresh(&mut st)? } else { self.rows(&mut st)? };
+            if !open && !Self::asks(&st, req).is_empty() {
+                drop(admission);
+                admission = self.refresh(&mut st)?;
             }
+            // Leased, room between processes is the manager's: its revokes, never row asks.
+            let asks = if self.leasing() { vec![] } else { Self::asks(&st, req) };
+            // The row shows what this sample measured (its context), not the last pass's figure.
+            self.publish(&mut st);
             drop(admission);
             self.unlock(st);
             asks
@@ -2500,6 +2670,33 @@ impl Inner {
         Ok(())
     }
 
+
+    /// The rows `req` asks for idle pages, and how many bytes each: short of its recorded peak
+    /// beside its free bytes and its own evictable ones; unmeasured, every idle byte.
+    fn asks(st: &State, req: u64) -> Vec<(u64, u64)> {
+        let Some(r) = st.table.request(req) else { return vec![] };
+        let mut short = match r.peak {
+            Some(p) => {
+                let own: u64 = decide::victims(&st.table, &[]).iter().map(|v| match v {
+                    Victim::Page { bytes, .. } | Victim::Cache { bytes, .. } => *bytes,
+                }).sum();
+                p.saturating_sub(st.table.free() + own)
+            }
+            None => u64::MAX,
+        };
+        let mut asks = vec![];
+        for o in &st.table.others {
+            if short == 0 {
+                break;
+            }
+            let bytes = short.min(o.idle());
+            if bytes > 0 {
+                asks.push((o.row, bytes));
+                short = short.saturating_sub(bytes);
+            }
+        }
+        asks
+    }
 
     /// Binds `block` of `set` for `stream`; `claims` are the caller's own preparation pins,
     /// which hold the page for this bind and never against it.
@@ -2679,8 +2876,7 @@ impl Inner {
         let (id, step_pages, orphans) = {
             let mut st = self.lock();
             st.mech(set)?;
-            self.measure(&mut st);
-            let _admission = self.refresh(&mut st)?;
+            let _admission = self.rows(&mut st)?;
             if Self::advance(&mut st, req, set)? {
                 let budget = st.table.budget();
                 if let Some(s) = st.step_stats(req) {
@@ -2700,9 +2896,10 @@ impl Inner {
             self.adopt(step_pages, Some(req))?;
         }
         if !self.state.lock().table.request(req).is_some_and(|r| r.idle) {
-            self.coreside(req)?;
+            self.coreside(req, false)?;
             self.unkeep(req);
         }
+        self.regrow(req, set);
         self.prefetch(req);
         Ok(id)
     }
@@ -2711,7 +2908,6 @@ impl Inner {
     /// holds now go into the request's record.
     fn end_pass(&self, req: u64, pass: u64, peak: u64) -> Result<()> {
         let mut st = self.lock();
-        self.measure(&mut st);
         self.physical(&mut st);
         st.active.retain(|(r, _), a| !(*r == req && a.id == pass));
         let compute = st.table.segments.max(peak);
@@ -2771,11 +2967,13 @@ impl Inner {
         stats
     }
 
-    /// The ask thread's answer: idle pages no plan of this row's uses ([`decide::answer`]),
-    /// never a cache, never waiting on anything but its own protects; it runs
-    /// no caller code. Kept pages' bytes come back once custody lets go: the trim thread
-    /// settles that after the reply and publishes them free.
-    fn answer(&self, bytes: u64) -> u64 {
+    /// The ask thread's answer, up to `bytes` under `ceiling`: idle pages no plan of this row's
+    /// uses ([`decide::answer`]); D: later steps' pages too, furthest first; W (foreign pressure):
+    /// then the running sets stream, their watermarks lowered. Never a cache, never a pinned page,
+    /// never waiting on anything but its own protects; it runs no caller code, and it never ends
+    /// a request. Kept pages' bytes come back once custody lets go: the trim thread settles that
+    /// after the reply and publishes them free.
+    fn answer(&self, ceiling: Class, bytes: u64) -> u64 {
         let out = crate::caught(|| {
             let mut st = self.lock();
             // A protect's page comes back with it: the answer counts it.
@@ -2786,6 +2984,31 @@ impl Inner {
             for key in decide::answer(&st.table, bytes) {
                 freed += st.table.page(key).map_or(0, |p| p.bytes);
                 self.unmap(&mut st, key, Class::N, None, true)?;
+            }
+            if ceiling >= Class::D && freed < bytes {
+                let later: Vec<(Key, u64)> = decide::victims(&st.table, &[])
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Victim::Page { key, bytes, releasing: false } if st.table.distance(key).is_some_and(|d| d.0 > 0) => Some((key, bytes)),
+                        _ => None,
+                    })
+                    .collect();
+                for (key, b) in later {
+                    if freed >= bytes {
+                        break;
+                    }
+                    self.unmap(&mut st, key, Class::D, None, true)?;
+                    freed += b;
+                }
+            }
+            if ceiling >= Class::W && freed < bytes {
+                let running: Vec<(u32, u64)> = st.table.requests.iter().flat_map(|r| r.steps.get(r.cursor.step as usize).map(|(sets, _)| sets.iter().map(|s| (*s, r.id)).collect::<Vec<_>>()).unwrap_or_default()).collect();
+                for (set, req) in running {
+                    if freed >= bytes {
+                        break;
+                    }
+                    freed += self.stream(&mut st, set, bytes - freed, Some(req), false)?.unmapped;
+                }
             }
             let settle = st.table.pending > 0;
             let unmapped = st.last_unmap.filter(|_| freed > 0);
@@ -2812,6 +3035,7 @@ impl Inner {
     /// The trim thread's work: the Keeps waiting on events, custody settled after an answer,
     /// then a ledger event.
     fn idle_trim(&self, wanted: Wanted) {
+        self.backend.sweep();
         if wanted.keep {
             // Only copies still landing: a consumer's release is never waited on under a pin
             // (a renewing bind would wait for its forward).
@@ -2977,6 +3201,9 @@ impl Drop for Inner {
         self.to_custody.close();
         self.row.knock();
         self.wanted.0.lock().closed = true;
+        if let Some(budget) = &self.budget {
+            budget.close();
+        }
         self.wanted.1.notify_all();
         self.burst.0.lock().closed = true;
         self.burst.1.notify_all();
@@ -2987,19 +3214,21 @@ impl Drop for Inner {
                 Mech::Unmap { va, off, span, phys, ready } => {
                     let _ = self.backend.finish(ready);
                     let _ = self.backend.unmap(va, off, span);
-                    phys.into_iter().for_each(|p| { let _ = self.backend.destroy(p); });
+                    phys.into_iter().for_each(|p| { let _ = self.give_page(p); });
                     self.backend.retire(ready);
                 }
                 Mech::Renew { va, off, span, old, .. } => {
                     let _ = self.backend.unmap(va, off, span);
-                    old.into_iter().for_each(|p| { let _ = self.backend.destroy(p); });
+                    old.into_iter().for_each(|p| { let _ = self.give_page(p); });
                 }
                 Mech::Move { va, from, span, phys, .. } => {
                     let _ = self.backend.unmap(va, from, span);
-                    let _ = self.backend.destroy(phys);
+                    let _ = self.give_page(phys);
                 }
                 Mech::Release(va) => self.backend.release(va),
                 Mech::Map { .. } | Mech::Adopt { .. } | Mech::Keep { .. } => {}
+                #[cfg(unix)]
+                Mech::Revoke => {}
             }
         }
         let mut st = self.state.lock();
@@ -3009,13 +3238,15 @@ impl Drop for Inner {
             if let Ok((va, off, span)) = st.place(key) {
                 let _ = self.backend.unmap(va, off, span);
             }
-            let _ = self.backend.destroy(phys);
+            let _ = self.give_page(phys);
         }
         let sets: Vec<SetMech> = st.sets.drain(..).flatten().collect();
         drop(st);
         for m in sets {
             self.backend.release(m.va);
         }
+        // Its retired events that completed go with it (one still pending, with the backend).
+        self.backend.sweep();
     }
 }
 
@@ -3038,6 +3269,19 @@ fn fill_loop(demand: &Receiver<Vec<Job>>, ahead: &Receiver<Vec<Job>>, inner: &We
     }
 }
 
+/// The budget's thread (Windows): each change over budget − H gives back what brings usage to
+/// budget − 2H, off any allocation.
+fn budget_loop(budget: &dyn Budget, inner: &Weak<Inner>) {
+    while budget.wait() {
+        let Some(me) = Work::of(inner) else { return };
+        let Ok((room, usage)) = budget.read() else { continue };
+        let h = crate::table::headroom(me.backend.capacity());
+        if usage > room.saturating_sub(h) {
+            me.answer(Class::W, usage - room.saturating_sub(2 * h));
+        }
+    }
+}
+
 fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>, stop: &AtomicBool) {
     if let Some(row) = row.upgrade() {
         row.ask_thread();
@@ -3047,7 +3291,7 @@ fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>,
         let Some(me) = Work::of(&inner) else { return 0 };
         // Never dies: a failed or panicking answer frees nothing, and the next ask is served.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ask {
-            ledger::Ask::Room { bytes, .. } => me.answer(bytes),
+            ledger::Ask::Room { ceiling, bytes } => me.answer(Class::ALL.get(ceiling).copied().unwrap_or(Class::N), bytes),
         }))
         .unwrap_or(0)
     });
@@ -3093,6 +3337,11 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
         // more.
         drop(me);
         queue.sent(ticket, 0);
+        // Retired events destroyed here (and on the trim thread), never on a caller's thread: a
+        // destroy can wait on a driver lock another thread's device sync holds.
+        if let Some(me) = Work::of(inner) {
+            me.backend.sweep();
+        }
     }
 }
 
@@ -3240,6 +3489,10 @@ impl Pin {
             }
             st.sync(self.key);
             self.inner.keep(&mut st, self.key);
+            #[cfg(unix)]
+            if self.inner.leasing() {
+                self.inner.to_land.lock().push(self.key);
+            }
             self.inner.publish(&mut st);
             self.inner.unlock(st);
             self.inner.landed.notify_all();
@@ -3297,6 +3550,8 @@ impl Inner {
         }
         match op {
             Mech::Map { key, gen, va, off, span, job, speculative, decided } => self.place_page(key, gen, va, off, span, job, (!speculative).then_some(decided)),
+            #[cfg(unix)]
+            Mech::Revoke => self.revoke(),
             Mech::Renew { key, gen, va, off, span, old, after, job } => {
                 // Its consumers finish before the unmap: this thread waits for their events.
                 let released = after.iter().try_for_each(|e| self.backend.finish(*e))
@@ -3311,7 +3566,7 @@ impl Inner {
                     return;
                 }
                 if let Some(old) = old {
-                    if let Err(error) = self.backend.destroy(old) {
+                    if let Err(error) = self.give_page(old) {
                         let mut st = self.state.lock();
                         self.lost_backing(&mut st, span, true, error);
                         return;
@@ -3348,7 +3603,7 @@ impl Inner {
                             }
                         }
                         if let Some(Some(p)) = home.map(|h| h.phys) {
-                            if let Err(error) = self.backend.destroy(p) {
+                            if let Err(error) = self.give_page(p) {
                                 let mut st = self.state.lock();
                                 self.lost_backing(&mut st, len, false, error);
                                 return;
@@ -3370,7 +3625,7 @@ impl Inner {
                     return;
                 }
                 if let Some(p) = phys {
-                    if let Err(error) = self.backend.destroy(p) {
+                    if let Err(error) = self.give_page(p) {
                         let mut st = self.state.lock();
                         self.lost_backing(&mut st, span, true, error);
                         return;
@@ -3394,6 +3649,18 @@ impl Inner {
             st.keep_queued.remove(&set);
             let Ok(va) = st.mech(set).map(|m| m.va) else { return };
             let due: Vec<Key> = st.keep_due.range((set, 0)..=(set, u32::MAX)).copied().collect();
+            // A request opened since this Keep was queued: the pages stay the hook's, and its
+            // end keeps them.
+            if !st.table.requests.is_empty() {
+                for key in due {
+                    st.keep_due.remove(&key);
+                    if let Some(h) = st.homes.get_mut(&key) {
+                        h.keeping = false;
+                    }
+                    st.sync(key);
+                }
+                return;
+            }
             let mut pages = vec![];
             for key in due {
                 let (place, idle) = (st.place(key), st.idle(key));
@@ -3440,11 +3707,35 @@ impl Inner {
 
     /// Creates and maps a page for `key` and queues its fill; a create the device cannot
     /// serve leaves the page unmapped, with the free bytes it was decided on (`decided`;
-    /// `None`: a speculative page, which goes quietly).
+    /// `None`: a speculative page, which goes quietly). Leased, the page is asked of the
+    /// manager and placed on the agent's thread when granted: this thread never waits on it.
     #[allow(clippy::too_many_arguments)]
     fn place_page(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: Option<u64>) {
-        let speculative = decided.is_none();
-        let made = self.backend.create(span).and_then(|p| match self.backend.map(va, off, &p, Access::ReadWrite) {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get().cloned() {
+            let (start, region) = (Instant::now(), self.lease_region(key));
+            let me = Arc::downgrade(self);
+            let asked = agent.ask(
+                span,
+                region,
+                Box::new(move |got| {
+                    if let Some(inner) = me.upgrade() {
+                        inner.leased_page(key, gen, va, off, span, job, decided, got, start);
+                    }
+                }),
+            );
+            if let Err(error) = asked {
+                tracing::warn!("varena: asking the lease manager for {key:?}: {error}");
+            }
+            return;
+        }
+        let made = self.backend.create(span).and_then(|p| self.map_rw(va, off, p));
+        self.placed(key, gen, va, off, span, job, decided, made.map(|p| (p, false, None)));
+    }
+
+    /// `p` mapped read-write at `va + off`; unmappable, it goes back.
+    fn map_rw(self: &Arc<Self>, va: Va, off: u64, p: Physical) -> Result<Physical> {
+        match self.backend.map(va, off, &p, Access::ReadWrite) {
             Ok(()) => Ok(p),
             Err(error @ Error::Ownership(_)) => {
                 let mut st = self.state.lock();
@@ -3452,7 +3743,7 @@ impl Inner {
             }
             Err(error) => {
                 let bytes = p.len;
-                match self.backend.destroy(p) {
+                match self.give_page(p) {
                     Ok(()) => Err(error),
                     Err(release) => {
                         let mut st = self.state.lock();
@@ -3460,12 +3751,20 @@ impl Inner {
                     }
                 }
             }
-        });
+        }
+    }
+
+    /// A page made (adopted: its bytes are the weights already; leased: the ask's time) or
+    /// refused, for `key` if it is still that page.
+    #[allow(clippy::too_many_arguments)]
+    fn placed(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: Option<u64>, made: Result<(Physical, bool, Option<u64>)>) {
+        let speculative = decided.is_none();
         let mut st = self.state.lock();
         if !st.homes.get(&key).is_some_and(|h| h.gen == gen) {
             drop(st);
-            if let Ok(p) = made {
-                let released = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(p));
+            if let Ok((p, ..)) = made {
+                self.commit_page(&p);
+                let released = self.backend.unmap(va, off, span).and_then(|()| self.give_page(p));
                 if let Err(error) = released {
                     let mut st = self.state.lock();
                     self.lost_backing(&mut st, span, false, error);
@@ -3474,9 +3773,27 @@ impl Inner {
             return;
         }
         match made {
-            Ok(p) => {
+            Ok((p, true, ns)) => {
+                // Adopted from the manager's retention: no copy, nothing to fill.
+                if let Some(h) = st.homes.get_mut(&key) {
+                    (h.phys, h.ready, h.ready_on, h.filling, h.filled, h.origin) = (Some(p), Event::DONE, COPY, false, true, Origin::Kept);
+                }
+                st.sync(key);
+                let s = st.fills(job.req, key, span, Origin::Kept);
+                s.moved.kept.bytes += span;
+                s.moved.kept.ns += ns.unwrap_or(0);
+                self.publish(&mut st);
+                self.unlock(st);
+                self.landed.notify_all();
+            }
+            Ok((p, false, ns)) => {
                 if let Some(h) = st.homes.get_mut(&key) {
                     h.phys = Some(p);
+                }
+                if let Some(ns) = ns {
+                    let s = st.fills(job.req, key, span, Origin::Store);
+                    s.moved.leased.bytes += span;
+                    s.moved.leased.ns += ns;
                 }
                 drop(st);
                 // Handed over with the pages mapped beside it (`flush_fills`).
@@ -3501,8 +3818,164 @@ impl Inner {
                         e => drop(st.failed.insert(key, e)),
                     }
                 }
+                drop(st);
+                self.landed.notify_all();
             }
         }
+    }
+
+    /// Pages come from the lease manager (no custody: its retention replaces Keep).
+    fn leasing(&self) -> bool {
+        #[cfg(unix)]
+        return self.lease.get().is_some();
+        #[cfg(not(unix))]
+        false
+    }
+
+    /// A page's physical memory goes: a leased page back to the manager (committed now if its
+    /// unmap's decision did not), any other destroyed.
+    fn give_page(&self, p: Physical) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            if let Some((ticket, _)) = self.leased.lock().remove(&p.id) {
+                self.declined.lock().remove(&ticket);
+                return agent.give(ticket, p);
+            }
+        }
+        self.backend.destroy(p)
+    }
+
+    /// The decision to give a leased page back, before its fence: the manager sees it
+    /// progressing (Revoking), never stalled.
+    fn commit_page(&self, _p: &Physical) {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            if let Some((ticket, _)) = self.leased.lock().get(&_p.id).copied() {
+                self.declined.lock().remove(&ticket);
+                if let Err(error) = agent.decide(ticket) {
+                    tracing::warn!("varena: committing a lease's return: {error}");
+                }
+            }
+        }
+    }
+
+    /// A leased page's bytes become `key`'s block (a streamed slot moving): no longer the
+    /// weights of the region it was asked for, it is never retained.
+    fn moved_page(&self, _p: &Physical, _key: Key) {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            let mut leased = self.leased.lock();
+            if let Some((ticket, at)) = leased.get_mut(&_p.id) {
+                *at = _key;
+                if let Err(error) = agent.unland(*ticket) {
+                    tracing::warn!("varena: a moved slot's lease: {error}");
+                }
+            }
+        }
+    }
+
+    /// What a leased page holds, for the manager's retention: a declared set's fill identity and
+    /// the page's index.
+    #[cfg(unix)]
+    fn lease_region(&self, key: Key) -> Option<crate::lease::Region> {
+        let st = self.state.lock();
+        let m = st.mech(key.0).ok().filter(|m| m.spec.fingerprint.declared())?;
+        let digest = Sha256::digest(m.key.as_bytes());
+        let fingerprint = digest.get(..8).and_then(|b| <[u8; 8]>::try_from(b).ok()).map(u64::from_le_bytes)?;
+        Some(crate::lease::Region { fingerprint, region: key.1 })
+    }
+
+    /// The manager's answer to a page's ask, on the agent's thread: one chunk mapped and placed,
+    /// or the refusal.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn leased_page(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: Option<u64>, got: Result<Vec<crate::lease::Lease>>, start: Instant) {
+        let Some(agent) = self.lease.get().cloned() else { return };
+        let made = got.and_then(|leases| {
+            let mut leases = leases.into_iter();
+            let (Some(lease), None) = (leases.next(), leases.next()) else {
+                return Err(Error::Invalid(format!("a page of {span} bytes leased as other than one chunk")));
+            };
+            let crate::lease::Lease { ticket, phys, adopted } = lease;
+            self.leased.lock().insert(phys.id, (ticket, key));
+            let p = self.map_rw(va, off, phys)?;
+            agent.mapped(&[ticket])?;
+            Ok((p, adopted, Some(start.elapsed().as_nanos() as u64)))
+        });
+        self.placed(key, gen, va, off, span, job, decided, made);
+        self.flush_fills();
+    }
+
+    /// The manager asked pages back: the quiet ones are unmapped (their return committed now,
+    /// given after their consumers); the busy ones are pinned in the table, so the manager looks
+    /// elsewhere, and go once idle.
+    #[cfg(unix)]
+    fn revoke(self: &Arc<Self>) {
+        let Some(agent) = self.lease.get().cloned() else { return };
+        let asked: HashSet<crate::lease::Ticket> = agent.asked_back().into_iter().collect();
+        if asked.is_empty() {
+            return;
+        }
+        let keys: Vec<(crate::lease::Ticket, Key)> = self.leased.lock().values().filter(|(t, _)| asked.contains(t)).copied().collect();
+        let mut st = self.lock();
+        for (ticket, key) in keys {
+            let quiet = st.idle(key) && st.homes.get(&key).is_some_and(|h| !h.reclaiming && !h.landing && !h.protecting && h.phys.is_some());
+            if quiet {
+                let class = st.table.class(key).unwrap_or(Class::N);
+                if let Err(error) = self.unmap(&mut st, key, class, None, false) {
+                    tracing::warn!("varena: giving back a lease of {key:?}: {error}");
+                }
+            } else if self.declined.lock().insert(ticket) {
+                let _ = agent.pin(ticket);
+            }
+        }
+        self.publish(&mut st);
+        self.unlock(st);
+    }
+
+    /// Leased pages whose fill's ready event completed: the manager hears they landed. Under
+    /// the state lock.
+    #[cfg(unix)]
+    fn land(&self, st: &State, agent: &crate::lease::Agent) {
+        let mut to_land = self.to_land.lock();
+        if to_land.is_empty() {
+            return;
+        }
+        let leased = self.leased.lock();
+        to_land.retain(|key| {
+            let Some(h) = st.homes.get(key).filter(|h| h.filled) else { return false };
+            let Some(ticket) = h.phys.as_ref().and_then(|p| leased.get(&p.id)).map(|(t, _)| *t) else { return false };
+            if !self.backend.query(h.ready).unwrap_or(false) {
+                return true;
+            }
+            if let Err(error) = agent.landed(ticket) {
+                tracing::warn!("varena: a lease's landed ack: {error}");
+            }
+            false
+        });
+    }
+
+    /// Pages asked back while busy that are idle now: unpinned in the table, and the revoke
+    /// runs again. Under the state lock.
+    #[cfg(unix)]
+    fn redecline(&self, st: &State) {
+        let Some(agent) = self.lease.get() else { return };
+        let idle: Vec<crate::lease::Ticket> = {
+            let leased = self.leased.lock();
+            let mut declined = self.declined.lock();
+            let idle: Vec<_> = declined.iter().copied().filter(|t| leased.values().find(|(x, _)| x == t).is_none_or(|(_, k)| st.idle(*k))).collect();
+            idle.iter().for_each(|t| {
+                declined.remove(t);
+            });
+            idle
+        };
+        if idle.is_empty() {
+            return;
+        }
+        for t in idle {
+            let _ = agent.unpin(t);
+        }
+        self.mech.post(Mech::Revoke, 0);
     }
 
     /// The wait on a child ended: its step is in use again, and peers are asked when it is
@@ -3516,7 +3989,7 @@ impl Inner {
             self.publish(&mut st);
             self.unlock(st);
         }
-        self.coreside(req)
+        self.coreside(req, false)
     }
 }
 

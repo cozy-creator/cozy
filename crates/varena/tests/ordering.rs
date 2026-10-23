@@ -112,6 +112,14 @@ impl Events {
         self.logged.notify_all();
     }
 
+    /// An event used after its retire is an error, as the CUDA backend's (its id is gone).
+    fn live(&self, event: Event, op: &'static str) -> Result<()> {
+        match event != Event::DONE && self.retired.lock().contains(&event.0) {
+            true => Err(varena::Error::Device { op, code: 400, name: format!("event {} used after its retire", event.0) }),
+            false => Ok(()),
+        }
+    }
+
     /// Blocks until the log of calls satisfies `until`.
     fn await_log(&self, until: impl Fn(&[&'static str]) -> bool) {
         let mut log = self.kept.lock();
@@ -272,6 +280,7 @@ impl Backend for Stream {
     }
     fn query(&self, event: Event) -> Result<bool> {
         self.events.queries.fetch_add(1, Ordering::SeqCst);
+        self.events.live(event, "query")?;
         Ok(event == Event::DONE || self.events.done.lock().contains(&event.0))
     }
     fn elapsed(&self, _: Event, _: Event) -> Result<Option<u64>> {
@@ -282,6 +291,7 @@ impl Backend for Stream {
         if stream != 0 && self.events.protecting.load(Ordering::SeqCst) {
             self.events.bound_while_protecting.fetch_add(1, Ordering::SeqCst);
         }
+        self.events.live(event, "wait")?;
         if event != Event::DONE {
             self.events.waits.lock().push((event.0, stream));
         }
@@ -297,6 +307,7 @@ impl Backend for Stream {
         if self.events.fail_finish.swap(false, Ordering::SeqCst) {
             return Err(varena::Error::Device { op: "finish", code: 999, name: "consumer completion unknown".into() });
         }
+        self.events.live(event, "finish")?;
         let mut done = self.events.done.lock();
         while event != Event::DONE && !done.contains(&event.0) {
             self.events.completed.wait(&mut done);
@@ -304,7 +315,8 @@ impl Backend for Stream {
         Ok(())
     }
     fn retire(&self, event: Event) {
-        self.events.retired.lock().insert(event.0);
+        let first = self.events.retired.lock().insert(event.0);
+        assert!(first || event == Event::DONE, "event {} retired twice", event.0);
         self.events.retiring.notify_all();
     }
     fn drain(&self) -> Result<()> {
