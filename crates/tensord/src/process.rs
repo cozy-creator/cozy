@@ -2,7 +2,7 @@
 //! (births, exact handles, groups, meters) is `platform::process`. Nothing here kills
 //! because time passed. Callers kill on a measured wedge (`Pace`), an owner restart, or a launch
 //! that never reached authored code.
-use platform::process::{Birth, Exact, State, gone, group_members, meter, read_bytes};
+use platform::process::{Birth, Exact, State, gone, group_members, meter, written_bytes};
 use std::{
     fs::File,
     io,
@@ -430,15 +430,16 @@ pub enum Supervised {
     Wedged(String),
 }
 
-/// Waits for `child`, the leader of its own process group, reading it once a second: `read`
-/// sees the bytes its group has read (its downloads, the cache it copies from), and its group is killed when `stop` is canceled or when the
+/// Waits for `child`, the leader of its own process group, reading it once a second: `wrote`
+/// sees the bytes its group has written (downloads landing, wheels unpacked; a network read or a
+/// linked file counts no byte), and its group is killed when `stop` is canceled or when the
 /// group's CPU and bytes stop moving for longer than its measured patience (`Pace`, floored by
 /// `Liveness`). The second is resolution, never a verdict.
 pub fn supervise(
     child: &mut Child,
     stop: Option<&crate::stop::Stop>,
     what: &str,
-    read: &dyn Fn(u64),
+    wrote: &dyn Fn(u64),
 ) -> io::Result<Supervised> {
     let exact = match Birth::of(child.id()).map_err(io::Error::from) {
         Ok(birth) => Exact::open(&birth)?,
@@ -451,8 +452,8 @@ pub fn supervise(
     let (floor, tick) = (Liveness::default().floor(), Duration::from_secs(1));
     let (mut pace, mut ended) = (Pace::default(), None);
     let (mut last, mut advances) = (None, 0u64);
-    // What each process of the group read so far: a gone member keeps what it read.
-    let mut reads = std::collections::HashMap::new();
+    // What each process of the group wrote so far: a gone member keeps what it wrote.
+    let mut writes = std::collections::HashMap::new();
     while !exact.wait_for(tick)? {
         if ended.is_some() {
             continue;
@@ -470,11 +471,11 @@ pub fn supervise(
         }
         last = Some(reading);
         pace.observe(Some(advances), now);
-        for (pid, bytes) in group.iter().filter_map(|pid| Some((*pid, read_bytes(*pid)?))) {
-            let held: &mut u64 = reads.entry(pid).or_default();
+        for (pid, bytes) in group.iter().filter_map(|pid| Some((*pid, written_bytes(*pid)?))) {
+            let held: &mut u64 = writes.entry(pid).or_default();
             *held = (*held).max(bytes);
         }
-        read(reads.values().sum());
+        wrote(writes.values().sum());
         if stop.is_some_and(|stop| stop.is_cancelled()) {
             exact.kill()?;
             ended = Some(Supervised::Canceled);
@@ -804,25 +805,42 @@ mod tests {
     }
 
 
-    /// A supervised installer is told the bytes its whole group reads as they move, a child's
-    /// included (the Runtime's installer runs uv as one): a slow install shows it moves (runs
-    /// 14747 and 14748 sat at "installing … on this machine" with no bytes for ten minutes).
+    /// A real install (uv, as the Runtime's installer and a release's sync run it) is supervised
+    /// from a cold cache and then a warm one: it is never judged stalled, and cold it is told the
+    /// bytes it lands as they move while its progress advances (runs 14747 and 14748 sat at
+    /// "installing … on this machine" with no bytes for ten minutes). uv's network reads and its
+    /// links from the cache count no byte; what it writes does, and so does its CPU.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_supervised_group_is_told_the_bytes_its_children_read() {
-        // The leader reads nothing itself; its children read 1 MB each fifth of a second, 20 times.
-        // dd moves them with read(2) and write(2): a newer coreutils `cat` or `head` splices a
-        // pipe, which /proc/<pid>/io never counts (the CI runners' did).
-        let script = "for i in $(seq 20); do dd if=/dev/zero bs=100000 count=10 status=none; sleep 0.2; done \
-            | dd of=/dev/null bs=65536 status=none";
-        let mut child = Command::new("/bin/sh").args(["-c", script]).process_group(0).spawn().unwrap();
-        let told = std::sync::Mutex::new(vec![]);
-        let ended = supervise(&mut child, None, "a reader", &|bytes| told.lock().unwrap().push(bytes)).unwrap();
-        assert!(matches!(ended, Supervised::Exited(status) if status.success()), "{ended:?}");
-        let told = told.into_inner().unwrap();
-        // Each sample more than the last, all of it read by children (the reader counts its pipe too).
-        assert!(told.len() >= 3 && told.windows(2).all(|w| w[0] < w[1]), "not told as they moved: {told:?}");
-        assert!(told[told.len() - 1] >= 20_000_000, "{told:?}");
+    fn a_real_install_is_told_the_bytes_it_lands_and_never_judged_stalled() {
+        let root = tempfile::tempdir().unwrap();
+        let uv = |args: &[&std::ffi::OsStr]| {
+            let mut command = Command::new("uv");
+            command.args(args).env("UV_CACHE_DIR", root.path().join("cache")).env("UV_CONCURRENT_DOWNLOADS", "1");
+            command
+        };
+        for cold in [true, false] {
+            let venv = root.path().join(if cold { "cold" } else { "warm" });
+            let made = uv(&["venv".as_ref(), "-q".as_ref(), "--python".as_ref(), "python3".as_ref(), venv.as_os_str()]).status();
+            assert!(made.expect("uv runs").success());
+            let python = venv.join("bin/python");
+            let wheels = ["numpy==2.3.4", "pillow==12.0.0", "pandas==2.3.3"].map(std::ffi::OsStr::new);
+            let mut install = uv(&[&["pip".as_ref(), "install".as_ref(), "-q".as_ref(), "--python".as_ref(), python.as_os_str()][..], &wheels[..]].concat());
+            let mut child = install.process_group(0).spawn().unwrap();
+            let (stop, told) = (crate::stop::Stop::default(), std::sync::Mutex::new(vec![]));
+            let ended = supervise(&mut child, Some(&stop), "uv", &|bytes| told.lock().unwrap().push(bytes)).unwrap();
+            assert!(matches!(ended, Supervised::Exited(status) if status.success()), "cold {cold}: {ended:?}");
+            let imported = Command::new(&python).args(["-c", "import numpy, PIL, pandas"]).status().unwrap();
+            assert!(imported.success(), "cold {cold}: not installed");
+            let told = told.into_inner().unwrap();
+            assert!(told.windows(2).all(|w| w[0] <= w[1]), "cold {cold}: {told:?}");
+            if cold {
+                // numpy, pandas and pillow unpack to about 150 MB, written as they land; read
+                // bytes would have told about 1 MB.
+                assert!(told.last().is_some_and(|bytes| *bytes >= 10 << 20), "{told:?}");
+                assert!(stop.progress() > 0, "its progress never advanced: {told:?}");
+            }
+        }
     }
 
     /// A safetensors file served from a real socket, `chunk` bytes each `pace`; with `stall`, its
