@@ -1,5 +1,5 @@
-//! `make_room`'s order over tables, pure: other sets' idle pages, caches nobody holds, then the
-//! current step's own pages furthest next use first; never a pinned page. A small simulator runs real
+//! `make_room`'s order over tables, pure: other sets' idle pages, then the current step's own
+//! pages and caches nobody holds, furthest next use first; never a pinned page. A small simulator runs real
 //! plans through it at real capacities (each bind takes its page's room, each block its
 //! activations'), plus an ask's answer, prefetch, admission and placement.
 
@@ -125,24 +125,32 @@ fn h3_and_sdxl_complete_at_24_12_and_8_gib() {
 }
 
 /// The order: pages of sets no plan uses, least recently used first; then a later step's pages,
-/// furthest first; then caches nobody holds, least recently used first; then the current step's
-/// pages, furthest next use first. Never a pinned or filling page, nor one being bound; a page
-/// whose release is pending is marked.
+/// furthest first; then the current step's pages and unheld caches together, furthest next use
+/// first, a cache's next use its components' (none: furthest), a page before a cache on a tie.
+/// Never a pinned or filling page, nor one being bound; a page whose release is pending is marked.
 #[test]
-fn victims_go_other_sets_pages_then_caches_then_the_current_step_furthest_first() {
+fn victims_go_other_sets_pages_then_own_pages_and_caches_furthest_first() {
     let mut t = table(64 * MB, vec![set("now", 2, MB), set("later", 2, MB), set("idle", 2, MB)], vec![(vec![0], 1), (vec![1], 1)]);
     let mut clock = 0;
     for k in [(2, 1), (2, 0), (1, 0), (1, 1), (0, 0), (0, 1)] {
         map(&mut t, k, &mut clock);
     }
-    t.caches = vec![Cache { id: 7, bytes: MB, last_use: 9, ..Cache::default() }, Cache { id: 8, bytes: MB, last_use: 1, holds: 1, ..Cache::default() }];
+    t.caches = vec![
+        Cache { id: 7, bytes: MB, last_use: 9, ..Cache::default() },
+        Cache { id: 8, bytes: MB, last_use: 1, holds: 1, ..Cache::default() },
+        Cache { id: 9, sets: vec![0], bytes: MB, last_use: 2, ..Cache::default() },
+    ];
     t.requests[0].cursor.passes.insert(0, 1);
     t.requests[0].cursor.next.insert(0, 1);
     t.page_mut((0, 1)).unwrap().releasing = vec![3];
     let v = victims(&t, &[(1, 1)]);
-    assert_eq!(pages(&v), vec![(2, 1), (2, 0), (1, 0), (0, 0), (0, 1)], "idle by age; then later's; then now's block behind the cursor before the one ahead");
-    assert_eq!(v.get(3), Some(&Victim::Cache { id: 7, bytes: MB }), "the unheld cache after the other sets' pages; the held one never");
-    assert!(v.contains(&Victim::Page { key: (0, 1), bytes: MB, releasing: true }), "a page whose release is pending is taken once it completes");
+    let cache = |id| Victim::Cache { id, bytes: MB };
+    let page = |key, releasing| Victim::Page { key, bytes: MB, releasing };
+    assert_eq!(
+        v,
+        vec![page((2, 1), false), page((2, 0), false), page((1, 0), false), cache(7), page((0, 0), false), cache(9), page((0, 1), true)],
+        "idle by age; later's; then a cache of no set, now's block behind the cursor (next used a pass ahead, as its graph: the page first), its graph, the block ahead; the held cache never"
+    );
     t.page_mut((0, 0)).unwrap().pins = vec![1];
     t.page_mut((2, 1)).unwrap().filling = true;
     assert!(!pages(&victims(&t, &[])).iter().any(|k| *k == (0, 0) || *k == (2, 1)), "pinned and filling pages never go");

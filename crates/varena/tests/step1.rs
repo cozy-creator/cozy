@@ -240,7 +240,7 @@ fn make_room_takes_idle_then_caches_then_furthest_declared() {
     let b = mem.load(spec(dir.path(), &uuid, "b", 1), Level::Ram).unwrap();
     let n = mem.load(spec(dir.path(), &uuid, "n", 1), Level::Ram).unwrap();
     let shrunk = Arc::new(AtomicU64::new(0));
-    let cache = mem.cache("graphs", {
+    let cache = mem.cache("graphs", &[], {
         let shrunk = shrunk.clone();
         move |want| {
             shrunk.fetch_add(want, Ordering::SeqCst);
@@ -274,7 +274,7 @@ fn a_streaming_sets_room_takes_another_sets_idle_pages_before_its_graph_cache() 
     let vae = mem.load(spec(dir.path(), &uuid, "vae", 2), Level::Ram).unwrap();
     warm(&mem, vae, 2);
     let shrunk = Arc::new(AtomicU64::new(0));
-    let cache = mem.cache("vae-graphs", {
+    let cache = mem.cache("vae-graphs", &[vae], {
         let shrunk = shrunk.clone();
         move |want| {
             shrunk.fetch_add(want, Ordering::SeqCst);
@@ -295,6 +295,75 @@ fn a_streaming_sets_room_takes_another_sets_idle_pages_before_its_graph_cache() 
     let vae_left = (0..2).filter(|b| resident(&mem, vae, *b)).count();
     close(&uuid, mem);
     assert_eq!((shrunk, vae_left), (0, 1), "(cache bytes shrunk, VAE pages left): one VAE page goes, the graphs stay");
+}
+
+/// The lead's Belady ruling (S4's graph-leases eviction): one streaming set, nothing else
+/// loaded, its graph cache naming it. A bind short of room during its pass takes the set's
+/// already-run pages (next used a pass ahead, as the graph is: a tie goes to the page) before the
+/// graph.
+#[test]
+fn a_streaming_sets_room_takes_its_run_pages_before_its_own_graph() {
+    let (dir, uuid, card, mem) = open("owngraph", 4);
+    let dit = mem.load(spec(dir.path(), &uuid, "dit", 4), Level::Ram).unwrap();
+    let shrunk = Arc::new(AtomicU64::new(0));
+    let cache = mem.cache("dit-graphs", &[dit], {
+        let shrunk = shrunk.clone();
+        move |want| {
+            shrunk.fetch_add(want, Ordering::SeqCst);
+            want
+        }
+    });
+    assert!(card.take(P));
+    let _segment = mem.resident(P);
+    mem.cached(cache, P);
+    let r = mem.request("r", plan(&[&["dit"]])).unwrap();
+    let pass = r.pass(dit, "k").unwrap();
+    warm(&mem, dit, 3);
+    // The card is full: block 3's room comes from blocks already run, not from the graph.
+    let last = mem.bind(dit, 3, 0).map(|p| {
+        if p.fresh {
+            p.filled();
+        }
+    }).map_err(|e| e.code());
+    let shrunk = shrunk.load(Ordering::SeqCst);
+    pass.end(0);
+    r.end();
+    let first = resident(&mem, dit, 0);
+    close(&uuid, mem);
+    assert_eq!((last, shrunk, first), (Ok(()), 0, false), "(block 3 bound, graph bytes shrunk, block 0 resident)");
+}
+
+/// Native a_bind_on_a_full_card_takes_idle_pages (S5's step-3 check on 581769ea8): an idle set
+/// loaded with no request open is custody's at once; a card then full of it and of foreign
+/// bytes still gives a bind its room, the kept page withdrawn and taken; then exhausted; then
+/// served once room returns.
+#[test]
+fn a_bind_on_a_full_card_withdraws_and_takes_a_kept_idle_page() {
+    assert!(varena::os::namespace(&format!("st1{}-", std::process::id())));
+    let uuid = format!("st1keptfull-{}", std::process::id());
+    let card = Card::new(4 * P);
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * P };
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let mem = Arc::new(Memory::open(g, None, Box::new(Driver(card.clone()))).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem.load(spec(dir.path(), &uuid, "m", 2), Level::Ram).unwrap();
+    mem.load(spec(dir.path(), &uuid, "idle", 1), Level::Gpu).unwrap();
+    let r = mem.request("r", plan(&[&["m"]])).unwrap();
+    let pass = r.pass(m, "k").unwrap();
+    // Everything else on the card is foreign.
+    let foreign = card.free();
+    assert!(card.take(foreign));
+    let first = mem.bind(m, 0, 0).map_err(|e| e.to_string());
+    let second = mem.bind(m, 1, 0).map(drop).map_err(|e| e.code());
+    card.used.fetch_sub(foreign, Ordering::SeqCst);
+    let third = mem.bind(m, 1, 0).map(drop).map_err(|e| e.code());
+    let first = first.map(drop);
+    pass.end(0);
+    let stats = r.end();
+    close(&uuid, mem);
+    assert!(first.is_ok(), "the kept idle page makes room: {first:?}");
+    assert_eq!((second, third), (Err("EXHAUSTED"), Ok(())), "then nothing is left; then room came back");
+    assert!(stats.evicted.iter().sum::<u64>() >= P, "{stats:?}");
 }
 
 /// The bytes make_room freed are nobody's: another thread's bind maps into them before the
@@ -333,7 +402,7 @@ fn the_room_the_hook_made_is_not_held_for_its_segment() {
 fn make_room_runs_a_caches_shrink_inside_the_hook() {
     let (_dir, uuid, card, mem) = open("shrink", 2);
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let cache = mem.cache("graphs", {
+    let cache = mem.cache("graphs", &[], {
         let calls = calls.clone();
         move |want| {
             calls.lock().push(std::thread::current().name().unwrap_or("?").to_string());
@@ -365,7 +434,7 @@ fn a_bind_still_shrinks_a_cache_for_its_room() {
     // Torch's segments holding the cache: the shrink frees them (the driver and the token).
     let segments = Arc::new(Mutex::new(Some(mem.resident(2 * P))));
     let card2 = card.clone();
-    let cache = mem.cache("graphs", {
+    let cache = mem.cache("graphs", &[], {
         let (calls, segments) = (calls.clone(), segments.clone());
         move |want| {
             calls.lock().push(std::thread::current().name().unwrap_or("?").to_string());
