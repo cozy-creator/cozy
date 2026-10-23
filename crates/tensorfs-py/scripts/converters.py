@@ -525,6 +525,65 @@ def seedvr2() -> dict[str, Any]:
     return {"name": "seedvr2", "files": {"config.json": {"architecture": "SeedVR2-7B"}}, "components": components}
 
 
+# ------------------------------------------------------------------ Ideogram 4
+
+# Diffusers #14126's `convert_ideogram4_transformer_checkpoint_to_diffusers` (`attention.o` ->
+# `to_out.0`, the fused `qkv` rows chunked into thirds), the single-file converter under review.
+IDEOGRAM_CONVERTER = (
+    "https://raw.githubusercontent.com/buffett0323/diffusers/1112a897779500cdefd36c4b5fec3bb83ac94db5/"
+    "src/diffusers/loaders/single_file_utils.py",
+    "0e334e75d6b539febc7ee8696bbf1a58434a9faf9c32cc646c303106c0cfc117",
+)
+# The transformer config of ideogram-ai/ideogram-4-fp8@ee79a72 (gated), read from an ungated copy whose
+# blob is the same (git oid da6e1e85).
+IDEOGRAM_CONFIG = (
+    "https://huggingface.co/cocktailpeanut/ideogram-4-fp8/resolve/e0a0fb243cbf458fde53e358e80e6640cc593fd0/"
+    "transformer/config.json",
+    "da6e1e852ff7973df0f36a20d20bc55b5300f69b",
+)
+
+
+def ideogram4() -> dict[str, Any]:
+    """Ideogram 4's official checkpoint: both DiTs in its original layout. Every linear's weight-only
+    fp8 carrier (`.weight` + `.weight_scale`) is folded into one fp8.rowwise tensor before a table
+    row reads it, so the scales are not rows here; `qkv`'s thirds are whole rows of it."""
+    import ast
+
+    tree = ast.parse(fetch(*IDEOGRAM_CONVERTER))
+    (node,) = [n for n in tree.body if getattr(n, "name", "") == "convert_ideogram4_transformer_checkpoint_to_diffusers"]
+    space: dict[str, Any] = {"torch": torch}
+    exec(compile(ast.Module([node], []), "single_file_utils.py", "exec"), space)
+    url, blob = IDEOGRAM_CONFIG
+    body = fetch(url)
+    assert hashlib.sha1(b"blob %d\0" % len(body) + body).hexdigest() == blob, "the config is not the official blob"
+    config = {k: v for k, v in json.loads(body).items() if not k.startswith("_")}
+    from diffusers import Ideogram4Transformer2DModel
+
+    with torch.device("meta"):
+        census = {k: tuple(v.shape) for k, v in Ideogram4Transformer2DModel(**config).state_dict().items()}
+    source = {k: s for k, (_, s) in header(VECTORS / "ideogram4-headers" / "transformer__diffusion_pytorch_model.safetensors").items()
+              if not k.endswith(".weight_scale")}
+    stand_ins = {k: h3_index(s[0]) if len(s) > 1 else torch.arange(s[0]) for k, s in source.items()}
+    origin = {id(t): k for k, t in stand_ins.items()}
+    converted = space["convert_ideogram4_transformer_checkpoint_to_diffusers"](dict(stand_ins))
+    mapped, expect = {}, {}
+    for target, tensor in converted.items():
+        key = origin.get(id(tensor)) or next(k for k, t in stand_ins.items() if tensor.untyped_storage().data_ptr()
+                                              == t.untyped_storage().data_ptr())
+        shape = source[key]
+        ops = row_ops(tensor.reshape(tensor.shape[0], -1)[:, 0].numpy(), shape)
+        if ops:
+            expect[key] = list(shape)
+        mapped[target] = row(target, key, ops)
+        got = apply(np.zeros(shape, np.int8), ops) if ops else np.zeros(shape, np.int8)
+        assert got.shape == census[target], (target, got.shape, census[target])
+    assert sorted(mapped) == sorted(census), "targets are not the transformer's census"
+    component = {"name": "transformer", "folders": {"transformer": "transformer",
+                                                    "unconditional_transformer": "unconditional_transformer"},
+                 "expect": dict(sorted(expect.items())), "rows": [mapped[k] for k in census]}
+    return {"name": "ideogram4.fp8", "components": [component]}
+
+
 def generate() -> dict[str, dict[str, Any]]:
     sdxl, shapes = single_file("sdxl.single_file")
     anima, _ = single_file("anima.single_file")
@@ -537,6 +596,7 @@ def generate() -> dict[str, dict[str, Any]]:
         "h3.lora": h3_lora(h3, source),
         "sdxl.lora": sdxl_lora(sdxl, shapes),
         "seedvr2": seedvr2(),
+        "ideogram4.fp8": ideogram4(),
     }
 
 
