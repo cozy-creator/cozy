@@ -38,3 +38,8 @@ harness = false
 [[test]]
 name = "lease"
 harness = false
+
+# Its own harness: TensorD and the executors are this binary (`lease_p0 tensord|agent|raw ...`).
+[[test]]
+name = "lease_p0"
+harness = false
