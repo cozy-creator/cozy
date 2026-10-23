@@ -329,6 +329,9 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
             return std::ptr::null_mut();
         }
         accounts().counts.entry(key).or_default().rooms += 1;
+        // Its unmaps and event waits run in relaxed capture mode, as the segment's allocation
+        // does: under another thread's global-mode capture they would be prohibited calls.
+        let _relaxed = RelaxedCapture::enter();
         match a.memory.make_room(need) {
             Ok(room) => claim = Some(room),
             Err(_) => return refuse("exhausted"),
