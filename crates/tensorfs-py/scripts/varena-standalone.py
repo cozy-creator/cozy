@@ -198,7 +198,7 @@ def run(mem: Memory, unet: UNet2DConditionModel, want: list[torch.Tensor], id: s
 def fills(stats: native.Stats, ceiling: tensorfs.Ceiling) -> None:
     """Each source's fills as GB/s and as % of the ceiling they run against: H2D for a GPU's
     fills (and the disk too for a store read); on the host only a store read has one."""
-    for source in ("kept", "tier", "store"):
+    for source in ("kept", "store"):
         f = getattr(stats.moved, source)
         if not f.bytes or not f.ns:
             continue
