@@ -20,6 +20,7 @@ its capacity is lowered by the standalone limit, and the uncapped GPU run is the
 from __future__ import annotations
 
 import ast
+import copy
 import faulthandler
 import gc
 import json
@@ -30,6 +31,7 @@ import tempfile
 import threading
 import time
 import weakref
+from collections.abc import Callable
 from pathlib import Path
 
 import tensorfs
@@ -135,9 +137,8 @@ def loaded(ck: tensorfs.Checkpoint, mem: Memory, fill: Scale | None = None, rele
 
 
 def concurrent(mem: Memory, ck: tensorfs.Checkpoint) -> None:
-    """Two threads run two models' passes interleaved: the first allocates and frees a buffer,
-    then waits while the second opens its pass (a device-wide peak reset) and ends it. The first
-    pass's peak must still hold its buffer, and the second's must not."""
+    """Two threads run two models' passes interleaved, each request on its own thread's pool:
+    the first allocates and frees a buffer, then waits while the second runs its pass."""
     a, b = loaded(ck, mem, release="concurrent"), loaded(ck, mem, release="concurrent")
     big = 1 << 29  # far above the tiny model's own activations, so the peaks tell the passes apart
     opened, done = threading.Event(), threading.Event()
@@ -174,10 +175,6 @@ def concurrent(mem: Memory, ck: tensorfs.Checkpoint) -> None:
         t.join()
     hook.remove()
     check("concurrent: two threads' passes both complete", not errors, errors)
-    pa, pb = mem.models[a].last, mem.models[b].last
-    if CUDA:
-        check("concurrent: the first pass keeps its buffer's peak across the other's reset", pa is not None and pa[1] >= big, pa)
-        check("concurrent: the second pass's peak is its own", pb is not None and pb[1] < big, pb)
 
 
 def run(mem: Memory, unet: UNet2DConditionModel, want: list[torch.Tensor], id: str, atol: float) -> tuple[native.Stats, list[torch.Tensor]]:
@@ -190,12 +187,10 @@ def run(mem: Memory, unet: UNet2DConditionModel, want: list[torch.Tensor], id: s
                 diff = (got[n] - expected).abs().max().item()
                 check(f"{id}: pass {n} equals its reference (max diff {diff:.2e})", diff <= atol, diff)
     except native.Exhausted as short:
-        # What varena saw: the request's steps (capacity, working set), torch's bytes and its cap.
-        print(f"EXHAUSTED {id}: {short}; torch_limit {mem.native.torch_limit()}, torch {mem.torch.now()}; STATS {short.stats.json()}", flush=True)
+        print(f"EXHAUSTED {id}: {short}; STATS {short.stats.json()}", flush=True)
         raise
     stats = r.stats()
-    # Each step's capacity and working set (weights plus its largest measured pass room).
-    print(f"STEPS {id}: " + " ".join(f"(capacity {t.capacity}, w {t.w})" for t in stats.steps) + f"; last pass {mem.models[unet].last}; churn {r.churn}", flush=True)
+    print(f"STATS {id}: {stats.json()}; pool free at make_room {r.pool_free}; flush {r.flush_ms:.1f} ms", flush=True)
     check(f"{id}: leaves nothing behind", stats.leftover == 0, stats.leftover)
     check(f"{id}: its record crosses as JSON", json.loads(stats.json())["request"] == id, stats.json())
     return stats, got
@@ -204,7 +199,7 @@ def run(mem: Memory, unet: UNet2DConditionModel, want: list[torch.Tensor], id: s
 def fills(stats: native.Stats, ceiling: tensorfs.Ceiling) -> None:
     """Each source's fills as GB/s and as % of the ceiling they run against: H2D for a GPU's
     fills (and the disk too for a store read); on the host only a store read has one."""
-    for source in ("kept", "tier", "store"):
+    for source in ("kept", "store"):
         f = getattr(stats.moved, source)
         if not f.bytes or not f.ns:
             continue
@@ -268,69 +263,32 @@ def child(store: str, table: str, capacity: int, reference: str) -> int:
     return 0 if all(results) else 1
 
 
-def attempts(mem: Memory, ck: tensorfs.Checkpoint) -> None:
-    """An op at a cut site fails (its attempt allocated `failed` bytes), varena answers, and the
-    retry allocates `retried`: the pass records the completed attempt's peak, not the failed one's."""
-    failed, retried = 1 << 30, 1 << 28  # apart by far more than the tiny model's own activations
-    unet = loaded(ck, mem, release="attempts")
-
-    def op(*_: object) -> None:
-        r = mem._current()
-        with r.site("probe"):
-            torch.empty(failed, dtype=torch.uint8, device=mem.device)
-            r.oom(None, "probe")
-            torch.empty(retried, dtype=torch.uint8, device=mem.device)
-
-    hook = unet.conv_in.register_forward_pre_hook(op)
-    with mem.request("attempts", plan=[unet]):
-        forward(unet, mem.device, 0)
-    hook.remove()
-    last = mem.models[unet].last
-    if CUDA:
-        check("attempts: a pass records the completed attempt's peak, not the failed one's", last is not None and retried <= last[1] < failed, last)
-
-
 def gone(memory: weakref.ref[Memory], phase: str) -> None:
     """One Memory per device in a process: a phase's goes before the next opens (on a GPU they
-    share the card's table, and each would count the other's pages as its own context)."""
+    share the card's table, and each would count the other's pages as its own context). On a
+    GPU its dropped pools' segments, torch's until it releases them, hold its row: released
+    (empty_cache) and retired first."""
     gc.collect()
+    if CUDA:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        while native.allocator_pending(0):
+            time.sleep(1e-3)
     check(f"{phase}: its memory is gone before the next phase opens one", memory() is None, gc.get_referrers(memory()) if memory() else "")
 
 
-def capping(mem: Memory, unet: UNet2DConditionModel) -> None:
-    """torch's cap: at each pass's start at least `torch_limit` (and the pass's measured room);
-    within the pass, oom answers only ever raise it."""
-    seen: list[tuple[str, int, int]] = []
-
-    def op(*_: object) -> None:
-        r = mem._current()
-        seen.append(("start", mem.capped or 0, mem.native.torch_limit()))
-        for _ in range(2):
-            r.oom(None, None)
-            seen.append(("oom", mem.capped or 0, mem.native.torch_limit()))
-
-    hook = unet.conv_in.register_forward_pre_hook(op)
-    with mem.request("capping", plan=[unet, unet]):
-        forward(unet, mem.device, 0)
-        forward(unet, mem.device, 1)
-    hook.remove()
-    starts = [cap >= limit for kind, cap, limit in seen if kind == "start"]
-    caps = [cap for _, cap, _ in seen]
-    rising = all(a <= b for pass_ in (caps[:3], caps[3:]) for a, b in zip(pass_, pass_[1:]))
-    check("cap: a pass starts at least at torch_limit", len(starts) == 2 and all(starts), seen)
-    check("cap: within a pass it never falls", len(caps) == 6 and rising, seen)
-
-
-def costs(mem: Memory, unet: UNet2DConditionModel) -> None:
+def costs(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel) -> None:
     """Microseconds per warm bind and per pass, varena's and the adapter's (a warm bind attaches
-    the views it kept; a pass is varena's pass_ and end, and the adapter's open and close)."""
+    the views it kept; a pass is varena's pass_ and end, and the adapter's open and close). The
+    adapter's own work in a forward (a bind per block and its pass) is held to the plain model's
+    forward on the same machine: a ratio, as host CPUs differ."""
     model, n = mem.models[unet], 200
     block = max(model.blocks.values(), key=lambda b: len(b.tensors))
     stream = torch.cuda.current_stream(mem.device).cuda_stream if CUDA else 0
     mem._enter(block)
     mem._exit(block)
 
-    def each(f: object) -> float:
+    def each(f: object, n: int = n) -> float:
         began = time.perf_counter_ns()
         for _ in range(n):
             f()  # type: ignore[operator]
@@ -340,33 +298,81 @@ def costs(mem: Memory, unet: UNet2DConditionModel) -> None:
     adapter_bind = each(lambda: (mem._enter(block), mem._exit(block)))
     with mem.request("costs", plan=[unet]) as r:
         def native_pass() -> None:
-            r.native.pass_(model.id, "costs", "1", *mem.torch.now()).end(0, 0, [], *mem.torch.now())
+            r.native.pass_(model.id, "costs|1").end(0)
 
         def adapter_pass() -> None:
-            mem._open(model, "costs", (), {})
+            mem._open(model, lambda: "costs")
             mem._close(model)
 
         varena_pass, open_close = each(native_pass), each(adapter_pass)
+    on = plain if mem.device.type == "cpu" else copy.deepcopy(plain).to(mem.device)
+    x, text = inputs(mem.device, 0)
+
+    def plain_forward() -> None:
+        with torch.no_grad():
+            on(x, 3, encoder_hidden_states=text)
+        if CUDA:
+            torch.cuda.synchronize(mem.device)
+
+    plain_forward()
+    forward = min(each(plain_forward, 1) for _ in range(10))  # the best of ten: the shared machine's load is not it
+    # Its own work a forward: the largest block's warm bind for every block, and its pass.
+    own = len(model.blocks) * (adapter_bind - native_bind) + (open_close - varena_pass)
     print(f"COST warm bind {native_bind:.0f} us varena, {adapter_bind:.0f} us through the adapter ({len(block.tensors)} tensors); "
-          f"pass {varena_pass:.0f} us varena, {open_close:.0f} us through the adapter (its common's bind included)", flush=True)
-    # The adapter's own part of a warm bind (kept views attached, the escape check at exit) is
-    # tens of microseconds at most: views made per bind cost about 100 more here.
-    check(f"cost: a warm bind adds {adapter_bind - native_bind:.0f} us to varena's (at most 30)", adapter_bind - native_bind <= 30, (native_bind, adapter_bind))
+          f"pass {varena_pass:.0f} us varena, {open_close:.0f} us through the adapter (its common's bind included); "
+          f"plain forward {forward:.0f} us", flush=True)
+    check(f"cost: the adapter's own work a forward ({len(model.blocks)} binds and its pass) is {own:.0f} us, "
+          f"{100 * own / forward:.1f}% of the plain model's forward (at most 10%)", own <= 0.10 * forward, (native_bind, adapter_bind, varena_pass, open_close, forward))
+
+
+def threads() -> dict[int, tuple[str, float]]:
+    """Each thread's name and CPU seconds (Linux), to say where a run's CPU went."""
+    out = {}
+    for tid in os.listdir("/proc/self/task"):
+        try:
+            stat = Path(f"/proc/self/task/{tid}/stat").read_text()
+        except OSError:
+            continue
+        fields = stat[stat.rindex(")") + 2:].split()
+        out[int(tid)] = (stat[stat.index("(") + 1:stat.rindex(")")], (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"))
+    return out
+
+
+def cpu_by_thread(before: dict[int, tuple[str, float]], after: dict[int, tuple[str, float]]) -> dict[str, float]:
+    """CPU ms between two `threads()` readings: the main thread, then the others by name."""
+    main, spent = threading.get_native_id(), {}
+    for tid, (name, cpu) in after.items():
+        key = "main" if tid == main else name
+        spent[key] = round(spent.get(key, 0.0) + 1e3 * (cpu - before.get(tid, (name, 0.0))[1]), 1)
+    return {k: v for k, v in sorted(spent.items(), key=lambda kv: -kv[1]) if v}
 
 
 def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> weakref.ref[Memory]:
-    """On host pages (the same bytes, the same kernels), a warm forward through the adapter costs
-    at most 10% more CPU than the plain model's. Its own table and model, every block a hit;
-    the best of several tries each, interleaved, so the shared machine's load is not the
-    measurement."""
+    """On host pages, a warm forward through the adapter costs at most 10% more CPU than the
+    plain model: what a user pays. Beside it, the split: the plain model on the same pages (the
+    same bytes and kernels) is placement's part, the rest the adapter's. Its own table and model,
+    every block a hit; the best of several tries each, interleaved, so the shared machine's load
+    is not the measurement. On one torch thread: torch's idle workers spin while the main thread
+    runs Python, so with N workers the adapter's own time counts up to N+1 times, and the ratio
+    would follow the machine's core count, not the adapter."""
+    threads_before = torch.get_num_threads()
+    torch.set_num_threads(1)
     mem = opened(f"{tag}-overhead", 1 << 31)
     unet = loaded(ck, mem)
     x, text = inputs(torch.device("cpu"), 0)
+    model = mem.models[unet]
+    regions = [b for b in (model.common, *model.blocks.values()) if b is not None]
+    pins = [mem.native.bind(model.id, b.region, 0) for b in regions]  # held: the pages stay put
+    with torch.device("meta"):
+        paged = UNet2DConditionModel(**CONFIG).eval()
+    paged.load_state_dict({k: v["value"] for b, pin in zip(regions, pins) for k, v in adapter._views(b, torch.from_dlpack(pin.window())).items()}, assign=True)
 
-    def plain_run() -> None:
-        with torch.no_grad():
-            for _ in range(3):
-                plain(x, 3, encoder_hidden_states=text)
+    def bare(m: UNet2DConditionModel) -> Callable[[], None]:
+        def run_() -> None:
+            with torch.no_grad():
+                for _ in range(3):
+                    m(x, 3, encoder_hidden_states=text)
+        return run_
 
     def served() -> None:
         with mem.request("overhead", plan=[unet] * 3) as r, torch.no_grad():
@@ -374,19 +380,29 @@ def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> 
                 unet(x, 3, encoder_hidden_states=text)
         origins.update(ref.origin for ref in r.stats().trace)
 
+    runs = {"plain": bare(plain), "paged": bare(paged), "served": served}
     origins: set[str] = set()
-    plain_run()
-    served()
+    for run_ in runs.values():
+        run_()
     origins.clear()
-    best = [float("inf"), float("inf")]
+    best = dict.fromkeys(runs, float("inf"))
+    # All runs' CPU by thread (clock ticks: too coarse for one run).
+    where: dict[str, dict[int, tuple[str, float]]] = {name: {} for name in runs}
     for _ in range(11):
-        for i, run_ in enumerate((plain_run, served)):
-            began = time.process_time()
+        for name, run_ in runs.items():
+            before, began = threads(), time.process_time()
             run_()
-            best[i] = min(best[i], time.process_time() - began)
-    costs(mem, unet)
-    ratio = best[1] / best[0]
-    check(f"overhead: a warm forward through the adapter costs {100 * (ratio - 1):+.1f}% CPU over plain (at most +10%)", ratio <= 1.10 and origins == {"hit"}, (best, origins))
+            best[name] = min(best[name], time.process_time() - began)
+            for tid, (thread, cpu) in threads().items():
+                where[name][tid] = (thread, where[name].get(tid, (thread, 0.0))[1] + cpu - before.get(tid, (thread, 0.0))[1])
+    del runs, paged, pins
+    costs(mem, unet, plain)
+    ratio, adapter_part, placement = best["served"] / best["plain"], best["served"] / best["paged"], best["paged"] / best["plain"]
+    torch.set_num_threads(threads_before)
+    print("OVERHEAD best CPU ms: " + ", ".join(f"{name} {1e3 * t:.1f}" for name, t in best.items()) + "; all 11 runs' CPU ms by thread: "
+          + "; ".join(f"{name} {cpu_by_thread({}, w)}" for name, w in where.items()), flush=True)
+    check(f"overhead: a warm forward through the adapter costs {100 * (ratio - 1):+.1f}% CPU over plain (at most +10%; "
+          f"adapter {100 * (adapter_part - 1):+.1f}%, placement {100 * (placement - 1):+.1f}%)", ratio <= 1.10 and origins == {"hit"}, (best, origins))
     return weakref.ref(mem)
 
 
@@ -408,30 +424,31 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
         del weight  # kept past the hold it would be an escaped weight (and reported as one)
         run(mem, unet, reference[:1], "held", SAME)
     check("hold: released, placeholders are back", isinstance(unet.down_blocks[0].attentions[0].proj_in.weight, Placeholder))
+    binding, pins = model.retain(), native.pins_held()
+    check("retained: a model just run is resident (a read: no pin, no fill)", binding.resident() and native.pins_held() == pins, (pins, native.pins_held()))
+    binding.close()
+    serving = mem.cache("ample graph pool", lambda want: 0, sets=unet)  # a graph pool names its component
+    check("cache: one serving a loaded model registers with its set", isinstance(serving, adapter.Cache), serving)
+    serving.close()
+    free = model.hold(free_only=True)
+    check("hold: free only, a model that fits beside what is resident is held", free is not None and not isinstance(unet.conv_in.weight, Placeholder), free)
+    if free is not None:
+        free.release()
     keys: list[str] = []
-    measured: list[bool] = []
     with mem.request("entries", plan=[unet, unet]) as r:
         def seen(*_: object) -> None:
-            keys.append(adapter._pass.get().entry)
-            measured.append(r.measured())
+            keys.append(adapter._pass.get().key.split("|")[0])
 
         probe = unet.conv_in.register_forward_pre_hook(seen)
-        with r.yielding("standalone"):  # a wait on a child call gives the request's room back meanwhile
-            x, _ = inputs(mem.device, 0)
+        x, _ = inputs(mem.device, 0)
         with torch.no_grad():
             got = unet.conv_in(x).cpu()
         forward(unet, mem.device, 0)
     probe.remove()
-    check("entries: a new entry's room is estimated, a measured shape's is measured", measured == [False, True], measured)
     diff = (got - plain.conv_in(x.cpu()).detach()).abs().max().item()
     check(f"entries: a direct child's forward runs bound (max diff {diff:.2e})", diff <= ACROSS, diff)
     check("entries: each entry is its own pass key", keys == ["conv_in", ""], keys)
     steps = r.stats().steps
-    with mem.request("between") as between:
-        level = between.cut("split", "1x4x8x8")  # package code between passes: the request's memo answers
-        answer = between.oom(None, None)  # and an OOM there has no pass to cut
-    check("between passes: a cut is answered from the request's memo", level == 0, level)
-    check("between passes: an OOM is answered, never refused", isinstance(answer, native.Next), answer)
     # The capacity varena ran a step against is the card less contexts (grown by now: cuDNN,
     # cuBLAS) and foreign bytes; the limits later are that much plus what they mean to hold.
     base = mem.gpu.memory - min(step.capacity for step in steps)
@@ -445,18 +462,15 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     run(mem, filled, scaled(plain, 3)[:1], "scaled x3", ACROSS if CUDA else SAME)
     check("identity: a pass under a new identity shed the hold of the old bake", shed == [True] and not mem.models[filled].holds, (shed, hold.blocks))
     concurrent(mem, ck)
-    attempts(mem, ck)
-    capping(mem, unet)
     if CUDA:
-        costs(mem, unet)
+        costs(mem, unet, plain)
     spans = model.set.spans
-    return reference, spans, stats.peak - sum(spans), base, weakref.ref(mem)
+    return reference, spans, stats.compute, base, weakref.ref(mem)
 
 
 def two(ck: tensorfs.Checkpoint, store: Path, table: str, capacity: int, reference: list[torch.Tensor]) -> tuple[int, weakref.ref[Memory]]:
-    """Two processes on one table, the idle first making room for the second. Returns the
-    working set varena measured for the model's step (its weights, torch's bytes at the pass's
-    start and its room) and the memory."""
+    """Two processes on one table, the idle first making room for the second. Returns the most
+    the request held at a pass end (pages and segments) and the memory."""
     saved = store.parent / "reference.pt"
     torch.save(reference, saved)  # the child runs two passes: its run blocks have a declared later use
     mem = opened(table, capacity)
@@ -469,7 +483,7 @@ def two(ck: tensorfs.Checkpoint, store: Path, table: str, capacity: int, referen
     check("two processes: the second completes beside the idle first", done.returncode == 0, done.returncode)
     stats, _ = run(mem, unet, reference[:1], "first again", SAME)
     check("two processes: the first gave room and reads again", any(r.origin != "hit" for r in stats.trace), [r.origin for r in stats.trace])
-    return stats.steps[0].w, weakref.ref(mem)
+    return stats.peak, weakref.ref(mem)
 
 
 def capped(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, capacity: int, base: int, spans: list[int], reference: list[torch.Tensor], ceiling: tensorfs.Ceiling) -> weakref.ref[Memory]:
@@ -479,11 +493,120 @@ def capped(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, cap
     unet = loaded(ck, mem)
     stats, _ = run(mem, unet, reference, "short", SAME)
     check(f"short: below its {sum(spans)} B it streams in {capacity - base} B", sum(stats.evicted) > 0, stats.evicted)
+    pins = native.pins_held()
+    binding = mem.models[unet].retain()
+    check("short: retained, a model bigger than its room is not all resident", not binding.resident(), "resident")
+    binding.close()
+    refused = mem.models[unet].hold(free_only=True)
+    check("short: free only, a model bigger than its room is not held, and nothing stays bound", refused is None and native.pins_held() == pins and isinstance(unet.conv_in.weight, Placeholder), (refused, pins, native.pins_held()))
     fills(stats, ceiling)
     print(f"STATS_JSON {stats.json()}", flush=True)
     for derived in (False, True):
         escapes(mem, unet, plain, reference, derived)
+    off_forward(mem, unet, plain)
     return weakref.ref(mem)
+
+
+def pools(tag: str) -> weakref.ref[Memory]:
+    """torch's handling of the request pool's segments (CUDA), which the allocator's NULL-once
+    rests on: a live pool keeps its cached segment through torch's OOM retry chain; a dropped
+    pool (a request's end) gives its unused segments back through varena's free at once; one
+    still in use comes back at the next retry chain after its tensor dies."""
+    mem, mib = opened(f"{tag}-pools", 1 << 31), 1 << 20
+    device = mem.device.index or 0
+
+    def segments(pool: tuple[int, int]) -> tuple[int, int]:
+        """The pool's live segment bytes and segments freed, once retirements in flight land."""
+        torch.cuda.synchronize(mem.device)
+        while native.allocator_pending(device):
+            time.sleep(1e-3)
+        live, *_, freed = native.allocator_stats(device, pool)
+        return live, freed
+
+    def retry_chain() -> None:
+        """An allocation over torch's fraction cap: torch runs its retry chain, then raises."""
+        torch.cuda.set_per_process_memory_fraction(1e-6, mem.device)
+        try:
+            torch.empty(64 * mib, dtype=torch.uint8, device=mem.device)
+        except torch.OutOfMemoryError:
+            pass
+        finally:
+            torch.cuda.set_per_process_memory_fraction(1.0, mem.device)
+
+    with mem.request("pools") as r:
+        pool = r.pool.id
+        cached = torch.empty(32 * mib, dtype=torch.uint8, device=mem.device)
+        del cached  # a cached, unused segment in the live pool
+        before = segments(pool)
+        retry_chain()
+        check("pools: a live pool keeps its cached segment through torch's retry chain", segments(pool) == before and before[0] >= 32 * mib, (before, segments(pool)))
+    check("pools: a request's end gives its pool's unused segments back through varena's free", segments(pool) == (0, before[1] + 1), (before, segments(pool), r.flush_ms))
+    with mem.request("pools kept") as r:
+        pool = r.pool.id
+        kept = torch.empty(32 * mib, dtype=torch.uint8, device=mem.device)
+    held = segments(pool)
+    del kept
+    retry_chain()
+    check("pools: a dropped pool's segment in use comes back at the retry chain after its tensor dies", held[0] >= 32 * mib and segments(pool)[0] == 0, (held, segments(pool)))
+    return weakref.ref(mem)
+
+
+def held_caches(tag: str) -> weakref.ref[Memory]:
+    """A request's end asks the caches it owns for everything, unless one is held (a graph pool
+    a replay still reads)."""
+    mem = opened(f"{tag}-held", 1 << 31)
+    asked: list[tuple[str, int]] = []
+    errors: list[object] = []
+    hook, sys.unraisablehook = sys.unraisablehook, errors.append
+
+    def answer(name: str, freed: int) -> Callable[[int], int]:
+        return lambda want: (asked.append((name, want)), freed)[1]
+
+    try:
+        held = mem.cache("held", answer("held", 1 << 20))
+        held.cached(4 << 20)
+        with held.holding():
+            with mem.request("held"):
+                pass
+        mem.cache("whole", answer("whole", 4 << 20)).cached(4 << 20)
+        with mem.request("whole"):
+            pass
+    finally:
+        sys.unraisablehook = hook
+    check("held: a held cache is not shrunk at its request's end", "held" not in dict(asked), asked)
+    check("held: an unheld one is asked for everything", asked == [("whole", (1 << 64) - 1)] and not errors, (asked, errors))
+    return weakref.ref(mem)
+
+
+def off_forward(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel) -> None:
+    """A weight read outside any forward (a package's table, an overlay's factor) binds on read:
+    it has its bytes, the tensor made of it holds the page's pin while it lives, the pin goes
+    when it dies, and the read is counted."""
+    held = native.pins_held()
+    weight = unet.down_blocks[1].resnets[0].conv1.weight  # a placeholder: no forward runs
+    want = plain.down_blocks[1].resnets[0].conv1.weight.detach()
+    row = weight[0]
+    check("off-forward: a weight read outside any forward has its bytes", torch.equal(row.cpu(), want[0]), (row.cpu() - want[0]).abs().max())
+    check("off-forward: the tensor read holds its page's pin while it lives", native.pins_held() == held + 1, (native.pins_held(), held))
+    total = weight.float().sum()  # a converted placeholder reads too
+    check("off-forward: a converted read has its bytes", torch.allclose(total.cpu(), want.float().sum(), rtol=1e-5), (total, want.float().sum()))
+    del row
+    gc.collect()
+    check("off-forward: the pin goes when the tensor dies", native.pins_held() == held, (native.pins_held(), held))
+    # The runtime's gateway for a read no op sees (a launch by pointer): Placeholder._varena_read.
+    bound = weight._varena_read()
+    check("off-forward: _varena_read is the bound tensor, its bytes", torch.equal(bound.detach().cpu(), want), "differs")
+    check("off-forward: it holds its page's pin while it lives", native.pins_held() == held + 1 and bound.data_ptr() != 0, native.pins_held())
+    del bound
+    gc.collect()
+    check("off-forward: the pin goes when it dies", native.pins_held() == held, native.pins_held())
+    try:
+        adapter.Placeholder((2,), torch.float32, torch.device("cpu"))._varena_read()
+        check("off-forward: a placeholder of no loaded model refuses", False, "read")
+    except adapter.Unbound:
+        check("off-forward: a placeholder of no loaded model refuses", True)
+    reads = {path: n for (_, path), n in mem.off_forward.items()}.get("down_blocks.1.resnets.0", (0, 0))
+    check("off-forward: the reads are counted with their bytes", reads[0] == 3 and reads[1] > 0, mem.off_forward)
 
 
 def escapes(mem: Memory, unet: UNet2DConditionModel, plain: UNet2DConditionModel, reference: list[torch.Tensor], derived: bool) -> None:
@@ -532,6 +655,9 @@ def main() -> int:
     gone(memory, "ample")
     if not CUDA:
         gone(overhead(ck, plain, tag), "overhead")
+    gone(held_caches(tag), "held caches")
+    if CUDA:
+        gone(pools(tag), "pools")
     ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
     blocks = sorted(spans[1:])
     # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.

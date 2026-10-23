@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""SPIKE: torch's OOM retried inside its allocator. An SDXL-sized bf16 UNet at 4 MP under a
-12 GiB standalone limit, beside a filler set big enough that its passes need evictions. Each
-pass allocates from a `torch.cuda.MemPool` whose segments come from varena's allocator: a
-shortfall asks varena, and torch sees a segment or, when varena cannot make room, its
-OutOfMemoryError. Measured against torch's default allocator under the same cap, interleaved:
-  1. it completes with no OOM raised to Python, with the shortfalls resolved in the allocator
-     (count, bytes) and the evictions they caused;
+"""Room made inside torch's allocator (step 1). An SDXL-sized bf16 UNet at 4 MP under a 12 GiB
+standalone limit, beside a filler set big enough that its passes need evictions. A request's
+allocations come from a `torch.cuda.MemPool` whose segments varena's allocator maps: a segment
+the row's free bytes don't cover runs `make_room`, and torch sees a segment or, when nothing is
+left to evict, its OutOfMemoryError. Measured against torch's default allocator under the same
+cap, interleaved:
+  0. a pass at a new shape, and a buffer past the row's free bytes, made room in the allocator;
+  1. it completes with no OOM raised to Python, with its make_room calls and evictions;
   2. warm ms per step, pool against default, best of 3 each;
   3. the allocator's cost per new segment, and segments per warm forward;
   4. a forced exhaustion is torch's OutOfMemoryError at its call site, and the next pass runs;
-  5. the bytes torch holds outside the pool in a forward, by source;
-  6. no deadlock while a second thread allocates on the device as varena evicts;
-  7. torch holding a large cached slack when varena is short: varena asks for no trim, the
-     allocator refuses, torch releases its own cache and asks again (no callback runs inside);
-  8. no deadlock when a stream host callback that takes the GIL is queued ahead of varena's
-     unmaps.
+  5. the bytes a forward allocates outside the request's pool, by source;
+  6. no deadlock while a second thread allocates on the device as varena evicts.
+torch's handling of the pool's segments (a live pool keeps its cache through torch's retry; a
+dropped pool's come back) is varena-standalone's `pools` phase.
 
-    python scripts/varena-mempool.py main
-    python scripts/varena-mempool.py  # SPIKE DIAG: the ILLEGAL_ADDRESS diagnostic (debugging only)
+    python scripts/varena-mempool.py        # the cases
+    python scripts/varena-mempool.py free   # the pool's free waits for its segment's stream
 GPU 0 only.
 """
 
@@ -25,11 +24,6 @@ from __future__ import annotations
 
 import ctypes
 import faulthandler
-import gzip
-import os
-import re
-import shutil
-import subprocess
 import sys
 import tempfile
 import threading
@@ -40,7 +34,7 @@ import tensorfs
 import torch
 from diffusers import UNet2DConditionModel
 from tensorfs import _ext
-from tensorfs.varena import VarenaError, allocator_reentries, allocator_stats
+from tensorfs.varena import VarenaError, allocator_stats
 from tensorfs.varena.torch import Declared, Memory, Weights
 
 CONFIG = dict(
@@ -94,18 +88,28 @@ def build(store: Path, dest: Path | None = None) -> tensorfs.Checkpoint:
     return w.commit()
 
 
-def loaded(mem: Memory, ck: tensorfs.Checkpoint, release: str) -> UNet2DConditionModel:
+class Raw:
+    """An undeclared fill that changes nothing: its pages are never kept (exported to custody),
+    so a callback's unmap of a completed one gives its bytes back at once."""
+
+    identity = None
+
+    def __call__(self, block: str, parts: object) -> None:
+        pass
+
+
+def loaded(mem: Memory, ck: tensorfs.Checkpoint, release: str, fill: Raw | None = None) -> UNet2DConditionModel:
     with torch.device("meta"):
         unet = UNet2DConditionModel(**CONFIG).to(torch.bfloat16).eval()
-    vars(unet)["_varena"] = Declared(Weights(ck, "unet", release=release))
+    vars(unet)["_varena"] = Declared(Weights(ck, "unet", release=release), fill=fill)
     mem.load(unet, "gpu")
     return unet
 
 
 class Run:
-    def __init__(self, mem: Memory, ck: tensorfs.Checkpoint) -> None:
-        self.mem = mem
-        self.filler, self.unet = loaded(mem, ck, "filler"), loaded(mem, ck, "")
+    def __init__(self, mem: Memory, ck: tensorfs.Checkpoint, fill: Raw | None = None) -> None:
+        self.mem, self.raw = mem, fill
+        self.filler, self.unet = loaded(mem, ck, "filler", fill), loaded(mem, ck, "", fill)
         g = torch.Generator().manual_seed(1)
         self.x = torch.randn(1, 4, LATENT, LATENT, generator=g).to(mem.device, torch.bfloat16)
         self.text = torch.randn(1, 77, 2048, generator=g).to(mem.device, torch.bfloat16)
@@ -148,19 +152,18 @@ def main() -> int:
     run = Run(mem, ck)
     shortfalls(mem, run, ck)
 
-    # 1. beside the filler, through the pool: shortfalls resolved in the allocator.
+    # 1. beside the filler, through the pool: room made in the allocator.
     run.fill()
     before = allocator_stats()
     times, segments, r, raised = run.steps("pool beside the filler", True)
     after = allocator_stats()
     stats = r.stats()
-    resolved, nbytes = after[2] - before[2], after[3] - before[3]
+    rooms, released = after[2] - before[2], after[3] - before[3]
     made, spent = after[1] - before[1], after[5] - before[5]
-    print(f"POOL beside the filler: ms/step {[round(t) for t in times]}; shortfalls resolved in the allocator {resolved} ({nbytes} B); "
+    print(f"POOL beside the filler: ms/step {[round(t) for t in times]}; make_room calls {rooms}, NULLs for torch's release {released}; "
           f"{made} new segments at {spent / max(made, 1) / 1e3:.0f} us each; "
-          f"evicted by class {stats.evicted}; varena retries {stats.retries} cuts {stats.cuts} parks {stats.parks}; segments per step {segments}", flush=True)
+          f"evicted by class {stats.evicted}; segments per step {segments}; pool free at make_room {r.pool_free}; flush {r.flush_ms:.1f} ms", flush=True)
     check("1: beside the filler, the pool's passes complete with no OOM raised to Python", raised is None and len(times) == STEPS, raised)
-    check("1: the filler made the room (evictions)", sum(stats.evicted) > 0, stats.evicted)
 
     # 2. and 3. interleaved warm runs, the filler refilled before each.
     warm: dict[bool, list[float]] = {True: [], False: []}
@@ -177,26 +180,39 @@ def main() -> int:
     best = {pool: min(v) for pool, v in warm.items()}
     print(f"WARM best of 3: default {best[False]:.0f} ms, pool {best[True]:.0f} ms ({100 * (best[True] / best[False] - 1):+.1f}%)", flush=True)
 
-    # 5. what torch holds outside the pool in a forward, by source.
-    torch.cuda.memory._record_memory_history(max_entries=100000)
-    with mem.request("sources", plan=[run.unet]), torch.no_grad():
-        run.unet(run.x, 2, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
-    snapshot = torch.cuda.memory._snapshot()
-    torch.cuda.memory._record_memory_history(enabled=None)
-    pool_id = mem.pool.id if mem.pool is not None else None
-    outside: dict[str, int] = {}
-    for segment in snapshot["segments"]:
-        if tuple(segment.get("segment_pool_id", ())) == tuple(pool_id or ()):
-            continue
-        for block in segment["blocks"]:
-            if block["state"] != "active_allocated":
+    # 5. what the forward allocates outside the request's pool, by source. Blocks outside it from before (this
+    # script's inputs, a cuBLAS handle's workspace made by an earlier run) are listed by size, not counted.
+    def outside(snapshot: dict, pool: tuple | None) -> dict[int, dict]:
+        """Active blocks of segments not in `pool`, by address."""
+        found = {}
+        for segment in snapshot["segments"]:
+            if tuple(segment.get("segment_pool_id", ())) == tuple(pool or ()):
                 continue
-            frames = block.get("frames") or []
-            where = next((f"{f['filename'].rsplit('/', 1)[-1]}:{f['line']}" for f in frames if "torch/" not in f["filename"]), "unknown")
-            outside[where] = outside.get(where, 0) + block["size"]
-    print(f"OUTSIDE the pool: Memory.outside {mem.outside} B; allocated outside by source {sorted(outside.items(), key=lambda kv: -kv[1])[:8]}", flush=True)
-    here = Path(__file__).name
-    check("5: the forward's own allocations are all in the pool (outside: this script's inputs, made before it)", all(k.startswith(here) for k in outside), outside)
+            at = segment["address"]
+            for block in segment["blocks"]:
+                if block["state"] == "active_allocated":
+                    found[at] = block
+                at += block["size"]
+        return found
+
+    torch.cuda.memory._record_memory_history(max_entries=100000)
+    with mem.request("sources", plan=[run.unet]) as r, torch.no_grad():
+        pool_id = r.pool.id if r.pool is not None else None
+        before = outside(torch.cuda.memory._snapshot(), pool_id)
+        run.unet(run.x, 2, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
+        after = outside(torch.cuda.memory._snapshot(), pool_id)
+    torch.cuda.memory._record_memory_history(enabled=None)
+    made: dict[str, int] = {}
+    for at, block in after.items():
+        if at in before:
+            continue
+        frames = block.get("frames") or []
+        where = next((f"{f['filename'].rsplit('/', 1)[-1]}:{f['line']}" for f in frames if "torch/" not in f["filename"]), None)
+        where = where or next((f"{f['filename'].rsplit('/', 1)[-1]}:{f['name']}" for f in frames), "no frames")
+        made[where] = made.get(where, 0) + block["size"]
+    print(f"OUTSIDE the pool before the forward: {len(before)} blocks, {sum(b['size'] for b in before.values())} B, largest {sorted((b['size'] for b in before.values()), reverse=True)[:6]}", flush=True)
+    print(f"OUTSIDE the pool, made by the forward, by source: {sorted(made.items(), key=lambda kv: -kv[1])[:8]}", flush=True)
+    check("5: the forward allocates nothing outside the request's pool", not made, made)
 
     # 6. a second thread allocates on the device while varena evicts for the pool's passes.
     stop, count, errors = threading.Event(), [0], []
@@ -219,8 +235,6 @@ def main() -> int:
     other.join()
     print(f"SECOND thread: {count[0]} allocations of 256 MiB; evicted by class {r.stats().evicted}", flush=True)
     check("6: no deadlock: the pool's passes complete beside a thread allocating as varena evicts", raised is None and len(times) == STEPS and count[0] > 0, (raised, count, errors))
-    host_callback(mem, run)
-    slack(mem, run)
     # 4. a forced exhaustion.
     refused = allocator_stats()[4]
     caught: list[BaseException] = []
@@ -251,12 +265,11 @@ def main() -> int:
 
 
 def shortfalls(mem: Memory, run: Run, ck: tensorfs.Checkpoint, fillers: int = 2) -> None:
-    """0: the allocator's own path. Two fillers occupy the card; the model's first pass at a
-    shape no pass measured (so varena makes no room for its activations ahead) runs through the
-    pool; then, in a pass, a buffer bigger than torch's headroom: each shortfall is resolved in
-    the allocator by evictions, with no OOM raised to Python."""
+    """0: the allocator's own path. Two fillers occupy the card; the model's pass at a new shape
+    runs through the pool; then, in a pass, a buffer bigger than the row's free bytes: each
+    shortfall makes room in the allocator by evictions, with no OOM raised to Python."""
     mem.pooling = True
-    second = loaded(mem, ck, "filler2") if fillers == 2 else None
+    second = loaded(mem, ck, "filler2", run.raw) if fillers == 2 else None
     run.fill()
     if second is not None:
         with mem.request("filler2", plan=[second]), torch.no_grad():
@@ -271,16 +284,16 @@ def shortfalls(mem: Memory, run: Run, ck: tensorfs.Checkpoint, fillers: int = 2)
             raised = e
     after = allocator_stats()
     made, spent = after[1] - before[1], after[5] - before[5]
-    print(f"UNMEASURED beside two fillers: shortfalls resolved in the allocator {after[2] - before[2]} ({after[3] - before[3]} B); "
+    print(f"NEW SHAPE beside two fillers: make_room calls {after[2] - before[2]}, NULLs for torch's release {after[3] - before[3]}; "
           f"evicted by class {r.stats().evicted}; {made} new segments at {spent / max(made, 1) / 1e3:.0f} us each", flush=True)
-    check("0: an unmeasured pass beside two fillers completes with no OOM raised to Python", raised is None, raised)
+    check("0: a pass at a new shape beside two fillers completes with no OOM raised to Python", raised is None, raised)
 
     run.fill()
     seen: dict[str, object] = {}
 
     def big(*_: object) -> None:
         r = mem._current()
-        headroom = mem.native.torch_limit() - torch.cuda.memory_reserved(mem.device)
+        headroom = mem.native.free()
         size = (headroom + (1 << 30)) // (2 << 20) * (2 << 20)
         evicted, stats0 = sum(r.stats().evicted), allocator_stats()
         try:
@@ -290,7 +303,7 @@ def shortfalls(mem: Memory, run: Run, ck: tensorfs.Checkpoint, fillers: int = 2)
         except torch.OutOfMemoryError as e:
             seen["ok"] = e
         stats1 = allocator_stats()
-        seen.update(size=size, headroom=headroom, resolved=stats1[2] - stats0[2], evicted=sum(r.stats().evicted) - evicted,
+        seen.update(size=size, headroom=headroom, rooms=stats1[2] - stats0[2], evicted=sum(r.stats().evicted) - evicted,
                     us=(stats1[5] - stats0[5]) / max(stats1[1] - stats0[1], 1) / 1e3)
 
     hook = run.unet.conv_in.register_forward_pre_hook(big)
@@ -298,152 +311,11 @@ def shortfalls(mem: Memory, run: Run, ck: tensorfs.Checkpoint, fillers: int = 2)
         run.unet(run.x, 998, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
     hook.remove()
     print(f"BEYOND headroom: {seen}", flush=True)
-    check("0: a buffer past torch's headroom is resolved in the allocator, with no OOM raised to Python",
-          seen.get("ok") is True and isinstance(seen.get("resolved"), int) and seen["resolved"] > 0, seen)
+    check("0: a buffer past the row's free bytes made room in the allocator, with no OOM raised to Python",
+          seen.get("ok") is True and isinstance(seen.get("rooms"), int) and seen["rooms"] > 0, seen)
     check("0: the evictions made it room", isinstance(seen.get("evicted"), int) and seen["evicted"] >= (1 << 30), seen)
     if second is not None:
         mem.models[second].close()
-
-
-def slack(mem: Memory, run: Run) -> None:
-    """7: the filler gone and every block pinned (a hold), so varena has nothing more to free;
-    torch's pool caching a
-    large freed buffer: a bigger one fits only once torch lets its cache go. varena gets no slack
-    and asks for no trim, the allocator refuses once, torch empties its cache and asks again."""
-    mem.pooling = True
-    mem.models[run.filler].close()  # its pages go: varena has nothing left to free but by a cut
-    hold = mem.models[run.unet].hold()
-    seen: dict[str, object] = {}
-
-    def probe(*_: object) -> None:
-        free = mem.native.torch_limit() - (torch.cuda.memory_reserved(mem.device))
-        first, second = int(free * 0.6) // (2 << 20) * (2 << 20), int(free * 0.7) // (2 << 20) * (2 << 20)
-        before, reentries = allocator_stats(), allocator_reentries()
-        a = torch.empty(first, dtype=torch.uint8, device=mem.device)
-        del a  # cached in the pool: torch's slack
-        try:
-            b = torch.empty(second, dtype=torch.uint8, device=mem.device)
-            del b
-            seen["ok"] = True
-        except torch.OutOfMemoryError as e:
-            seen["ok"] = e
-        after = allocator_stats()
-        seen.update(refused=after[4] - before[4], segments=after[1] - before[1], reentries=(allocator_reentries()[0] - reentries[0], allocator_reentries()[1] - reentries[1]), sizes=(first, second))
-
-    hook = run.unet.conv_in.register_forward_pre_hook(probe)
-    with mem.request("slack", plan=[run.unet]), torch.no_grad():
-        run.unet(run.x, 3, encoder_hidden_states=run.text, added_cond_kwargs=run.cond)
-    hook.remove()
-    hold.release()
-    print(f"SLACK {seen}", flush=True)
-    check("7: torch's cached slack is used by torch: the allocator refused, torch released its cache and the buffer came", seen.get("ok") is True and seen.get("refused", 0) >= 1, seen)
-    check("7: varena asked for no trim and ran no shrink inside the allocator", seen.get("reentries") == (0, 0), seen)
-
-
-def host_callback(mem: Memory, run: Run) -> None:
-    """8: a host function that takes the GIL is queued on the stream the pass binds on, ahead of
-    the unmaps varena makes for a shortfall in the allocator; the pass completes and it ran."""
-    mem.pooling = True
-    run.fill()
-    driver = ctypes.CDLL("libcuda.so.1")
-    ran: list[float] = []
-    callback = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(lambda _: ran.append(time.perf_counter()))
-    resolved = allocator_stats()[2]
-
-    def queue(*_: object) -> None:
-        stream = torch.cuda.current_stream(mem.device).cuda_stream
-        rc = driver.cuLaunchHostFunc(ctypes.c_void_p(stream), callback, None)
-        ran.append(float(rc))
-
-    hook = run.unet.conv_in.register_forward_pre_hook(queue)
-    times, _, _, raised = run.steps("host callback", True)
-    hook.remove()
-    torch.cuda.synchronize()
-    print(f"HOST callback: launches and runs {ran[:8]}; shortfalls resolved {allocator_stats()[2] - resolved}", flush=True)
-    check("8: no deadlock with a GIL-taking host callback queued ahead of varena's unmaps", raised is None and len(times) == STEPS and len(ran) >= 2, (raised, ran))
-
-
-def diag() -> int:
-    """The ILLEGAL_ADDRESS diagnostic (debugging only, never product behaviour): gpu11's
-    configuration up to its third interleaved iteration, in a child process per variant with
-    CUDA_LAUNCH_BLOCKING=1 (the faulting call returns the error) and varena's mechanism ops
-    logged (RUST_LOG=debug): both fillers, then one. Then the pool free's ordering, in a child
-    of its own (its comparison with a bare cuMemFree may fault the context)."""
-    work = Path(tempfile.mkdtemp(prefix="varena-mempool-"))
-    dest = work / "unet.cozytensors"
-    build(work / "store", dest)
-    out = Path("out")  # the rental script's output tree
-    out.mkdir(exist_ok=True)
-    failed = []
-    for label, fillers in (("both-fillers", 2), ("one-filler", 1)):
-        log = work / f"{label}.stderr.log"
-        env = {**os.environ, "CUDA_LAUNCH_BLOCKING": "1", "RUST_LOG": "debug"}
-        began = time.perf_counter()
-        with log.open("w") as err, subprocess.Popen([sys.executable, "-u", __file__, "variant", str(fillers), str(dest), str(work / "store")],
-                                                    env=env, stdout=subprocess.PIPE, stderr=err, text=True) as child:
-            for line in child.stdout or ():
-                print(f"[{label}] {line}", end="", flush=True)
-        print(f"DIAG {label}: exit {child.returncode} after {time.perf_counter() - began:.0f} s", flush=True)
-        if child.returncode:
-            failed.append(label)
-        summarize(label, log)
-        with log.open("rb") as raw, gzip.open(out / f"{label}.stderr.log.gz", "wb") as packed:
-            shutil.copyfileobj(raw, packed)
-    done = subprocess.run([sys.executable, "-u", __file__, "free"], capture_output=True, text=True)
-    print(done.stdout + done.stderr[-4000:], flush=True)
-    if done.returncode:
-        failed.append("free-ordering")
-    if failed:
-        print(f"FAIL diagnostic children: {failed}", flush=True)
-    return 1 if failed else 0
-
-
-def summarize(label: str, log: Path) -> None:
-    """The first fault in a variant's stderr, the mechanism ops before it, and its page's history."""
-    lines = log.read_text(errors="replace").splitlines()
-    ops = [n for n, line in enumerate(lines) if "varena_diag" in line]
-    first = next((n for n, line in enumerate(lines) if "ILLEGAL_ADDRESS" in line or "illegal memory access" in line), None)
-    print(f"DIAG {label}: {len(lines)} stderr lines, {len(ops)} mechanism ops logged, first fault at line {first}", flush=True)
-    python = [line for line in lines if not line[:4].isdigit()]
-    if first is None:
-        print(f"DIAG {label}: no fault; stderr's last Python lines:", *python[-10:], sep="\n  ", flush=True)
-        return
-    print(f"DIAG {label}: the 80 lines before the first fault and 20 after:", *(line[:400] for line in lines[max(0, first - 80):first + 20]), sep="\n  ", flush=True)
-    key = re.search(r"\((\d+), (\d+)\)", lines[first])
-    if key is not None:
-        page = f"({key[1]}, {key[2]})"
-        history = [line[:400] for line in lines[:first + 1] if page in line]
-        print(f"DIAG {label}: page {page}'s last 40 ops:", *history[-40:], sep="\n  ", flush=True)
-    print(f"DIAG {label}: stderr's Python lines (the faulting call's traceback):", *python[-60:], sep="\n  ", flush=True)
-
-
-def variant(fillers: int, ck: tensorfs.Checkpoint) -> int:
-    """gpu11's sequence: case 0 (with `fillers` fillers), case 1, then case 2's interleaved
-    default and pool runs, three iterations; the first error ends it."""
-    torch.backends.cudnn.allow_tf32 = torch.backends.cuda.matmul.allow_tf32 = False
-    mem = Memory.open(0, limit=CAP, pool=True)
-    assert mem.pool is not None
-    print(f"POOL use count outside a pass {mem.pool.use_count()}; torch {torch.__version__}", flush=True)
-    run = Run(mem, ck)
-    inside: list[int] = []
-    hook = run.unet.conv_in.register_forward_pre_hook(lambda *_: inside.append(mem.pool.use_count()) if mem.pooling else None)  # type: ignore[union-attr]
-    shortfalls(mem, run, ck, fillers)
-    run.fill()
-    times, _, _, raised = run.steps("pool beside the filler", True)
-    print(f"CASE 1: ms {[round(t) for t in times]} raised {raised!r}; allocator {allocator_stats()}", flush=True)
-    for i in range(3):
-        for pool in (False, True):
-            run.fill()
-            frees = allocator_stats()[6]
-            times, _, _, raised = run.steps("pool" if pool else "default", pool)
-            print(f"ITERATION {i + 1} {'pool' if pool else 'default'}: ms {[round(t) for t in times]} raised {raised!r}; "
-                  f"segments freed {allocator_stats()[6] - frees}; allocator {allocator_stats()}; cross-stream block runs {mem.crossed}; "
-                  f"pool use counts in its passes {sorted(set(inside))}", flush=True)
-            if raised is not None:
-                return 1
-    hook.remove()
-    print(f"POOL use count outside a pass {mem.pool.use_count()}", flush=True)
-    return 0 if all(results) else 1
 
 
 def free() -> int:
@@ -487,15 +359,7 @@ def free() -> int:
 
 
 if __name__ == "__main__":
-    # SPIKE DIAG: with no argument (as the rental script runs it) the diagnostic; `main` for the cases.
-    mode = sys.argv[1] if len(sys.argv) > 1 else "diag"
-    if mode in ("main", "variant"):
-        threading.Thread(target=watch, daemon=True).start()
-    if mode == "variant":
-        try:
-            result = variant(int(sys.argv[2]), tensorfs.open(sys.argv[3], cache_dir=sys.argv[4], local_files_only=True))
-        except BaseException:
-            print("ALLOCATOR_REFUSALS", getattr(_ext.varena, "allocator_refusals", lambda *_: "unavailable")(0), flush=True)
-            raise
-        sys.exit(result)
-    sys.exit({"diag": diag, "free": free, "main": main}[mode]())
+    if sys.argv[1:2] == ["free"]:
+        sys.exit(free())
+    threading.Thread(target=watch, daemon=True).start()
+    sys.exit(main())

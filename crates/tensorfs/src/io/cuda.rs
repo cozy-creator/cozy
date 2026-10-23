@@ -135,6 +135,8 @@ pub struct Driver {
     pub stream_destroy: F<CUstream>,
     pub stream_synchronize: F<CUstream>,
     pub stream_is_capturing: unsafe extern "C" fn(CUstream, *mut c_int) -> CUresult,
+    /// cuThreadExchangeStreamCaptureMode: this thread's capture mode in, its previous one out.
+    pub thread_exchange_stream_capture_mode: unsafe extern "C" fn(*mut c_int) -> CUresult,
     pub stream_wait_event: unsafe extern "C" fn(CUstream, CUevent, c_uint) -> CUresult,
     pub event_create: unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult,
     pub event_destroy: F<CUevent>,
@@ -267,6 +269,7 @@ impl Driver {
             stream_destroy: load!(lib, b"cuStreamDestroy_v2"),
             stream_synchronize: load!(lib, b"cuStreamSynchronize"),
             stream_is_capturing: load!(lib, b"cuStreamIsCapturing"),
+            thread_exchange_stream_capture_mode: load!(lib, b"cuThreadExchangeStreamCaptureMode"),
             stream_wait_event: load!(lib, b"cuStreamWaitEvent"),
             event_create: load!(lib, b"cuEventCreate"),
             event_destroy: load!(lib, b"cuEventDestroy_v2"),

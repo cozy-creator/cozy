@@ -1,36 +1,77 @@
-//! Torch pool segments, with recovery inside the failed allocation. All accounting is scoped
-//! by CUDA device and pool. Callbacks never enter Python, manipulate the GIL, or wait for CUDA
-//! events. Reclaim only touches completed Varena pages; other reclaim is done before execution.
-//! A capture can consume prewarmed pool segments, but cannot grow the pool or enter recovery.
+//! Torch pool segments, made room for inside the allocation. All accounting is scoped by CUDA
+//! device and pool. Callbacks never enter Python or manipulate the GIL. A segment the row's free
+//! bytes cover is mapped; otherwise torch's unused segments go first (a NULL lets torch's retry
+//! release a dropped pool's), then varena's `make_room` evicts pages and maps. A capture can
+//! consume prewarmed pool segments, but cannot grow the pool or make room.
+//! Driver calls run in relaxed capture mode, as torch's own capture-time cudaMalloc does: they
+//! never invalidate another thread's capture. A segment whose release cannot be ordered (freed
+//! during capture, or its completion unrecordable) is quarantined: it stays charged and is never
+//! reused. Only a sticky CUDA error or unprovable ownership faults the device.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Instant;
 
 use tensorfs::io::cuda;
-use varena::{Memory, Request, SetId, Torch, Workspace};
+use varena::{Memory, Request};
 
 type Pool = (u64, u64);
-pub type Refusal = (i32, Pool, &'static str, u64, u64, u64);
+pub type Refusal = (i32, Pool, &'static str, u64, u64);
 
 #[derive(Clone)]
 struct Active {
     memory: Arc<Memory>,
-    request: Arc<Request>,
-    set: Option<SetId>,
-    outside: u64,
+    _request: Arc<Request>,
     device: i32,
     pool: Pool,
+    /// Its one NULL for torch's retry to release dropped pools' segments has been spent.
+    released: Arc<AtomicBool>,
 }
 
 thread_local! {
     static ACTIVE: RefCell<Vec<Active>> = const { RefCell::new(Vec::new()) };
-    static WORKSPACES: RefCell<Vec<Arc<Workspace>>> = const { RefCell::new(Vec::new()) };
     static INSIDE: Cell<bool> = const { Cell::new(false) };
+    /// The size this thread's last allocation returned NULL for, to let torch release segments:
+    /// torch's retry of it (the same size, next on this thread) makes room.
+    static RELEASING: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// CU_STREAM_CAPTURE_MODE_RELAXED.
+const RELAXED: c_int = 2;
+
+/// CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED ..= CUDA_ERROR_STREAM_CAPTURE_WRONG_THREAD.
+fn capture_error(code: cuda::CUresult) -> bool {
+    (900..=908).contains(&code)
+}
+
+/// The context is gone (varena's classification of sticky CUDA errors).
+fn sticky(code: cuda::CUresult) -> bool {
+    matches!(code, 700 | 702 | 709 | 710 | 714..=719 | 721 | 911)
+}
+
+/// This thread in relaxed capture mode until dropped (its previous mode then comes back).
+struct RelaxedCapture(Option<c_int>);
+
+impl RelaxedCapture {
+    fn enter() -> Self {
+        let Ok(d) = cuda::driver() else { return Self(None) };
+        let mut mode = RELAXED;
+        // SAFETY: the driver ABI; `mode` is an in/out parameter on our stack.
+        Self((unsafe { (d.thread_exchange_stream_capture_mode)(&mut mode) } == cuda::SUCCESS).then_some(mode))
+    }
+}
+
+impl Drop for RelaxedCapture {
+    fn drop(&mut self) {
+        if let (Some(mut mode), Ok(d)) = (self.0, cuda::driver()) {
+            // SAFETY: as above; the mode this thread had before.
+            unsafe { (d.thread_exchange_stream_capture_mode)(&mut mode) };
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -38,12 +79,16 @@ struct Counters {
     live: u64,
     pending: u64,
     segments: u64,
-    resolved: u64,
-    resolved_bytes: u64,
     refused: u64,
     ns: u64,
     frees: u64,
-    refusal: Option<(&'static str, u64, u64, u64)>,
+    /// make_room calls, and NULLs returned for torch to release dropped pools' segments first
+    rooms: u64,
+    released: u64,
+    quarantined: u64,
+    /// why, size, this row's free bytes then
+    refusal: Option<(&'static str, u64, u64)>,
+    quarantine: Option<&'static str>,
 }
 
 struct Allocation {
@@ -61,6 +106,10 @@ struct Accounts {
     pointers: BTreeMap<usize, Allocation>,
     faults: BTreeMap<i32, String>,
     quarantined: Vec<Allocation>,
+    /// Pools torch dropped (`retire`): their segments come back through torch's release.
+    retired: BTreeSet<(i32, Pool)>,
+    /// CUDA graph captures open per device (`capture`): torch skips its release and retry then.
+    captures: BTreeMap<i32, u32>,
 }
 
 impl Accounts {
@@ -71,6 +120,14 @@ impl Accounts {
         c.live = c.live.saturating_sub(allocation.bytes);
         if allocation.pending { c.pending = c.pending.saturating_sub(allocation.bytes); }
         c.frees += 1;
+        if c.live == 0 {
+            self.retired.remove(&(allocation.device, allocation.pool));
+        }
+    }
+
+    /// Bytes in dropped pools' segments: torch's retry releases those it holds unused.
+    fn retired_live(&self, device: i32) -> u64 {
+        self.retired.iter().filter(|(d, _)| *d == device).filter_map(|k| self.counts.get(k)).map(|c| c.live - c.pending.min(c.live)).sum()
     }
 
     fn failed_release(&mut self, allocation: Allocation, reason: String) {
@@ -79,14 +136,10 @@ impl Accounts {
     }
 }
 
-static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new() });
+static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new(), retired: BTreeSet::new(), captures: BTreeMap::new() });
 
 fn accounts() -> std::sync::MutexGuard<'static, Accounts> {
     ACCOUNTS.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-fn live(device: i32) -> u64 {
-    accounts().counts.iter().filter(|((d, _), _)| *d == device).map(|(_, c)| c.live).sum()
 }
 
 /// Segments torch has logically freed but whose GPU retirement has not completed.
@@ -106,20 +159,31 @@ fn retiring(ptr: usize) -> Option<(i32, usize)> {
 
 pub fn fault_message(device: i32) -> Option<String> { accounts().faults.get(&device).cloned() }
 
-fn quarantine(ptr: usize, reason: String) {
+/// Ownership of the segment at `ptr` cannot be proved: the device's executor retires.
+fn fault(ptr: usize, reason: String) {
     let mut all = accounts();
     if let Some(device) = all.pointers.get(&ptr).map(|a| a.device) {
         all.faults.entry(device).or_insert(reason);
     }
 }
 
+/// The segment at `ptr` stays charged (pending) and is never freed or reused; the device goes on.
+fn quarantine(ptr: usize, reason: &'static str) {
+    let mut all = accounts();
+    let Some((device, pool, bytes)) = all.pointers.get(&ptr).map(|a| (a.device, a.pool, a.bytes)) else { return };
+    let c = all.counts.entry((device, pool)).or_default();
+    c.quarantined += bytes;
+    c.quarantine = Some(reason);
+}
+
+/// Per device and pool: bytes quarantined and the last reason.
+pub fn quarantined(device: Option<i32>) -> Vec<(i32, Pool, u64, &'static str)> {
+    accounts().counts.iter().filter(|((d, _), _)| device.is_none_or(|want| *d == want))
+        .filter_map(|((d, p), c)| c.quarantine.map(|why| (*d, *p, c.quarantined, why))).collect()
+}
+
+/// This thread is inside torch's allocator (its lock held): no Python runs here.
 pub fn inside() -> bool { INSIDE.with(Cell::get) }
-// Retained for diagnostics of attempts to enter Python hooks from a native callback.
-static TRIMS_INSIDE: AtomicU64 = AtomicU64::new(0);
-static SHRINKS_INSIDE: AtomicU64 = AtomicU64::new(0);
-pub fn trim_inside() { TRIMS_INSIDE.fetch_add(1, Relaxed); }
-pub fn shrink_inside() { SHRINKS_INSIDE.fetch_add(1, Relaxed); }
-pub fn reentries() -> (u64, u64) { (TRIMS_INSIDE.load(Relaxed), SHRINKS_INSIDE.load(Relaxed)) }
 
 struct Inside(bool);
 impl Inside {
@@ -129,26 +193,43 @@ impl Drop for Inside {
     fn drop(&mut self) { INSIDE.with(|v| v.set(self.0)); }
 }
 
-pub fn enter(memory: Arc<Memory>, request: Arc<Request>, set: Option<SetId>, reserved: u64, device: i32, pool: Pool) {
-    let outside = reserved.saturating_sub(live(device));
-    ACTIVE.with(|a| a.borrow_mut().push(Active { memory, request, set, outside, device, pool }));
+pub fn enter(memory: Arc<Memory>, request: Arc<Request>, device: i32, pool: Pool) {
+    ACTIVE.with(|a| a.borrow_mut().push(Active { memory, _request: request, device, pool, released: Arc::default() }));
 }
 pub fn exit() { ACTIVE.with(|a| a.borrow_mut().pop()); }
-pub fn workspace_enter(workspace: Arc<Workspace>) { WORKSPACES.with(|b| b.borrow_mut().push(workspace)); }
-pub fn workspace_exit() { WORKSPACES.with(|b| b.borrow_mut().pop()); }
 
+/// Torch dropped `pool` on `device` (a request's end): its segments come back as torch releases
+/// them, and until then an allocation that needs room lets torch's retry release them first.
+pub fn retire(device: i32, pool: Pool) {
+    let mut all = accounts();
+    if all.counts.get(&(device, pool)).is_some_and(|c| c.live > 0) {
+        all.retired.insert((device, pool));
+    }
+}
+
+/// A CUDA graph capture opens (`open`) or closes on `device`, on any thread. While one is open
+/// torch skips its release-and-retry after a refused allocation (v14 card probe), so the hook
+/// makes room at once instead of first letting torch release dropped pools' segments.
+pub fn capture(device: i32, open: bool) {
+    let mut all = accounts();
+    let n = all.captures.entry(device).or_default();
+    *n = if open { *n + 1 } else { n.saturating_sub(1) };
+}
+
+/// (live bytes, segments made, make_room calls, NULLs for torch's release, refusals,
+/// nanoseconds making segments, segments freed).
 pub fn stats(device: Option<i32>, pool: Option<Pool>) -> (u64, u64, u64, u64, u64, u64, u64) {
     let c = accounts().counts.iter().filter(|((d, p), _)| device.is_none_or(|want| *d == want) && pool.is_none_or(|want| *p == want)).fold(Counters::default(), |mut a, (_, c)| {
-        a.live += c.live; a.segments += c.segments; a.resolved += c.resolved;
-        a.resolved_bytes += c.resolved_bytes; a.refused += c.refused; a.ns += c.ns; a.frees += c.frees; a
+        a.live += c.live; a.segments += c.segments; a.rooms += c.rooms;
+        a.released += c.released; a.refused += c.refused; a.ns += c.ns; a.frees += c.frees; a
     });
-    (c.live, c.segments, c.resolved, c.resolved_bytes, c.refused, c.ns, c.frees)
+    (c.live, c.segments, c.rooms, c.released, c.refused, c.ns, c.frees)
 }
 
 /// Last refusal by device/pool. Collected outside the callback: no callback logging or Python.
 pub fn refusals(device: Option<i32>) -> Vec<Refusal> {
     accounts().counts.iter().filter(|((d, _), _)| device.is_none_or(|want| *d == want))
-        .filter_map(|((d, p), c)| c.refusal.map(|(why, size, held, limit)| (*d, *p, why, size, held, limit))).collect()
+        .filter_map(|((d, p), c)| c.refusal.map(|(why, size, free)| (*d, *p, why, size, free))).collect()
 }
 
 fn capturing(stream: *mut c_void) -> bool {
@@ -160,6 +241,7 @@ fn capturing(stream: *mut c_void) -> bool {
 
 fn segment(size: usize) -> Result<cuda::CUdeviceptr, cuda::CUresult> {
     let d = cuda::driver().map_err(|_| -1)?;
+    let _relaxed = RelaxedCapture::enter();
     let mut ptr = 0;
     // SAFETY: an allocation in torch's current context with an out parameter on our stack.
     let rc = unsafe { (d.mem_alloc)(&mut ptr, size) };
@@ -168,7 +250,23 @@ fn segment(size: usize) -> Result<cuda::CUdeviceptr, cuda::CUresult> {
 
 fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     let _inside = Inside::enter();
-    if fault_message(device).is_some() { return std::ptr::null_mut(); }
+    // Torch's retry of this thread's last NULL (the same size): make room now.
+    let retry = RELEASING.with(Cell::take) == Some(size);
+    let active = ACTIVE.with(|a| a.borrow().iter().rev().find(|p| p.device == device).cloned());
+    let key = (device, active.as_ref().map_or((0, 0), |a| a.pool));
+    let bytes = size as u64;
+    let free = || active.as_ref().map_or(u64::MAX, |a| a.memory.free());
+    let refuse = |why: &'static str| {
+        let free = free();
+        let mut all = accounts();
+        let c = all.counts.entry(key).or_default();
+        c.refused += 1;
+        c.refusal = Some((why, bytes, free));
+        std::ptr::null_mut()
+    };
+    if fault_message(device).is_some() {
+        return refuse("ownership_fault");
+    }
     let Ok(driver) = cuda::driver() else { return std::ptr::null_mut() };
     let mut context = std::ptr::null_mut();
     // Torch's allocation context belongs to the pointer, not to its eventual freeing thread.
@@ -176,72 +274,65 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
         accounts().faults.entry(device).or_insert_with(|| "allocation has no current CUDA context".into());
         return std::ptr::null_mut();
     }
-    let began = Instant::now();
-    let active = ACTIVE.with(|a| a.borrow().iter().rev().find(|p| p.device == device).cloned());
-    let budget = active.as_ref().and_then(|a| WORKSPACES.with(|b| b.borrow().iter().rev().find(|b| b.belongs_to(&a.memory)).cloned()));
-    let pool = active.as_ref().map_or((0, 0), |a| a.pool);
-    let key = (device, pool);
     if capturing(stream) {
-        let held = live(device);
-        let mut all = accounts();
-        let c = all.counts.entry(key).or_default();
-        c.refused += 1;
-        c.refusal = Some(("capture_growth", size as u64, held, 0));
-        return std::ptr::null_mut();
+        return refuse("capture_growth");
     }
-    let mut previous = None;
-    let mut reclaimed_total = 0;
-    let mut refusal;
+    let began = Instant::now();
+    // The room asked of make_room: the segment, and a page more each time the driver refuses
+    // what the row's figure says is free (bytes no row accounts for, or its fragments).
+    let mut need = bytes;
+    let mut claim = None;
     let ptr = loop {
-        let held = active.as_ref().map_or(live(device), |a| a.outside.saturating_add(live(device)));
-        let limit = match active.as_ref() {
-            None => u64::MAX,
-            Some(a) => match a.memory.allocator_limit() { Some(n) => n.saturating_add(budget.as_ref().map_or(0, |b| b.remaining())), None => { refusal = ("state_unavailable", size as u64, held, 0); break 0 } },
-        };
-        refusal = ("workspace", size as u64, held, limit);
-        if budget.as_ref().is_some_and(|b| b.remaining() < size as u64) { break 0; }
-        let result = if held.saturating_add(size as u64) <= limit {
-            let credit = match &budget {
-                Some(b) => match b.take(size as u64) { Some(c) => Some(c), None => { refusal = ("state_unavailable", size as u64, held, 0); break 0 } },
-                None => None,
-            };
-            let result = segment(size);
-            if result.is_ok() { if let Some(credit) = credit { credit.commit(); } }
-            result
-        } else { Err(cuda::ERROR_OUT_OF_MEMORY) };
-        match result {
-            Ok(ptr) => break ptr,
-            Err(cuda::ERROR_OUT_OF_MEMORY) => {
-                refusal = ("driver_capacity", size as u64, held, limit);
-                let Some(a) = active.as_ref() else { break 0 };
-                // Neither a changed watermark nor a stale free count can spin forever. A new
-                // attempt requires actual reclaimed bytes or a strictly larger available cap.
-                let state = (held, limit);
-                refusal.0 = "no_progress";
-                if previous == Some(state) { break 0; }
-                previous = Some(state);
-                let reclaimed = a.request.reclaim_allocation(size as u64).unwrap_or(0);
-                refusal.0 = "no_reclaim";
-                if reclaimed == 0 { break 0; }
-                reclaimed_total += reclaimed;
-            }
-            Err(code) => {
-                refusal = ("driver_error", size as u64, held, limit);
-                accounts().faults.entry(device).or_insert_with(|| format!("CUDA allocation failed with non-capacity error {code}"));
-                break 0;
+        if claim.is_some() || free() >= need {
+            match segment(size) {
+                Ok(ptr) => break ptr,
+                Err(cuda::ERROR_OUT_OF_MEMORY) if active.is_none() => return refuse("driver_capacity"),
+                Err(cuda::ERROR_OUT_OF_MEMORY) => {
+                    drop(claim.take());
+                    need += varena::layout::REGION_ALIGN;
+                }
+                Err(code) if capture_error(code) => return refuse("capture"),
+                Err(code) => {
+                    if sticky(code) {
+                        accounts().faults.entry(device).or_insert_with(|| format!("CUDA allocation failed with sticky error {code}"));
+                    }
+                    return refuse("driver_error");
+                }
             }
         }
+        let Some(a) = active.as_ref() else { return refuse("driver_capacity") };
+        // Torch's unused segments first: a dropped pool's come back through torch's retry, once
+        // per routing (it syncs the pool's events), only while one holds segments and no capture
+        // is open on the device (torch then skips the retry: the NULL would be an OOM).
+        let releasable = |all: &Accounts| all.retired_live(device) > 0 && all.captures.get(&device).is_none_or(|n| *n == 0);
+        if !retry && !a.released.load(Relaxed) && releasable(&accounts()) {
+            a.released.store(true, Relaxed);
+            RELEASING.with(|r| r.set(Some(size)));
+            accounts().counts.entry(key).or_default().released += 1;
+            return std::ptr::null_mut();
+        }
+        accounts().counts.entry(key).or_default().rooms += 1;
+        match a.memory.make_room(need) {
+            Ok(room) => claim = Some(room),
+            Err(_) => return refuse("exhausted"),
+        }
     };
-    let resident = (ptr != 0).then(|| active.as_ref().map(|a| a.memory.resident(size as u64))).flatten();
+    // The segment counts from now on: its claim's bytes when it asked for exactly them; else
+    // counted first, then the claim (pages more, after a driver refusal) goes.
+    let resident = match (claim, active.as_ref()) {
+        (Some(claim), _) if need == bytes => Some(claim.resident()),
+        (claim, a) => {
+            let resident = a.map(|a| a.memory.resident(bytes));
+            drop(claim);
+            resident
+        }
+    };
     let mut all = accounts();
     let c = all.counts.entry(key).or_default();
     c.ns += began.elapsed().as_nanos() as u64;
-    if ptr == 0 { c.refused += 1; c.refusal = Some(refusal); }
-    else {
-        c.live += size as u64; c.segments += 1;
-        if reclaimed_total != 0 { c.resolved += 1; c.resolved_bytes += reclaimed_total; }
-        all.pointers.insert(ptr as usize, Allocation { device, context: context as usize, pool, bytes: size as u64, pending: false, _resident: resident });
-    }
+    c.live += bytes;
+    c.segments += 1;
+    all.pointers.insert(ptr as usize, Allocation { device, context: context as usize, pool: key.1, bytes, pending: false, _resident: resident });
     ptr as *mut c_void
 }
 
@@ -260,22 +351,28 @@ fn freer() -> &'static mpsc::Sender<Pending> {
         // The worker owns waits; a CUDA host callback is free to acquire the GIL or torch's
         // lock while this thread waits. An allocating thread never waits for this worker.
         std::thread::spawn(move || {
+            // Its frees never invalidate another thread's capture.
+            let _relaxed = RelaxedCapture::enter();
             while let Ok(p) = rx.recv() {
-                let Ok(d) = cuda::driver() else { quarantine(p.ptr, "CUDA driver unavailable during retirement".into()); continue };
-                let Ok(_ctx) = cuda::CtxGuard::enter(p.context as cuda::CUcontext) else { quarantine(p.ptr, "CUDA context unavailable during retirement".into()); continue };
+                let Ok(d) = cuda::driver() else { quarantine(p.ptr, "retirement without a CUDA driver"); continue };
+                let Ok(_ctx) = cuda::CtxGuard::enter(p.context as cuda::CUcontext) else { quarantine(p.ptr, "retirement without its CUDA context"); continue };
                 // SAFETY: this worker owns the event and the segment is no longer torch's.
                 let ready = unsafe { (d.event_synchronize)(p.event as cuda::CUevent) };
-                if ready != cuda::SUCCESS { quarantine(p.ptr, format!("consumer completion could not be proven (CUDA {ready})")); continue; }
+                if ready != cuda::SUCCESS {
+                    if sticky(ready) { fault(p.ptr, format!("consumer completion could not be proven (CUDA {ready})")); }
+                    quarantine(p.ptr, "consumer completion unproven");
+                    continue;
+                }
                 // Detach this generation before the driver can reuse its address. A new
                 // allocation at the same pointer must never be removed by this old free.
-                let Some(a) = accounts().detach(p.ptr) else { continue };
+                let Some(mut a) = accounts().detach(p.ptr) else { continue };
                 let rc = unsafe { (d.mem_free)(p.ptr as cuda::CUdeviceptr) };
                 unsafe { (d.event_destroy)(p.event as cuda::CUevent); }
                 if rc == cuda::SUCCESS {
-                    {
-                        accounts().released(&a);
-                    }
-                    drop(a); // physical token/public owner drops outside the accounts lock
+                    // Its count (and its hold on the memory) goes before the accounts say it is
+                    // released, outside their lock: with nothing pending, no segment holds a memory.
+                    drop(a._resident.take());
+                    accounts().released(&a);
                 } else {
                     accounts().failed_release(a, format!("CUDA segment release failed ({rc})"));
                 }
@@ -293,23 +390,29 @@ pub extern "C" fn varena_torch_free(ptr: *mut c_void, _size: usize, device: c_in
         // record a real completion event into an in-progress capture.
         if ptr.is_null() { return; }
         let Some((owner_device, context)) = retiring(ptr as usize) else { return };
-        if device != owner_device { quarantine(ptr as usize, "free device differs from allocation owner".into()); return; }
-        let Ok(_ctx) = cuda::CtxGuard::enter(context as cuda::CUcontext) else { quarantine(ptr as usize, "allocation context unavailable during free".into()); return };
-        if capturing(stream) { quarantine(ptr as usize, "segment freed during capture or capture state unknown".into()); return; }
-        let Ok(d) = cuda::driver() else { quarantine(ptr as usize, "CUDA driver unavailable during free".into()); return };
+        if device != owner_device { fault(ptr as usize, "free device differs from allocation owner".into()); return; }
+        let Ok(_ctx) = cuda::CtxGuard::enter(context as cuda::CUcontext) else { quarantine(ptr as usize, "freed without its CUDA context"); return };
+        // An event recorded into a capture would be a graph node, not this segment's completion.
+        if capturing(stream) { quarantine(ptr as usize, "freed during capture"); return; }
+        let Ok(d) = cuda::driver() else { quarantine(ptr as usize, "freed without a CUDA driver"); return };
+        let _relaxed = RelaxedCapture::enter();
         let mut event = std::ptr::null_mut();
         // SAFETY: context/stream belong to torch; the newly-created event is ours.
         unsafe {
-            if (d.event_create)(&mut event, cuda::EVENT_DEFAULT) != cuda::SUCCESS {
-                quarantine(ptr as usize, "unable to create a retirement event".into()); return;
+            let rc = (d.event_create)(&mut event, cuda::EVENT_DEFAULT);
+            if rc != cuda::SUCCESS {
+                if sticky(rc) { fault(ptr as usize, format!("retirement event creation failed (CUDA {rc})")); }
+                quarantine(ptr as usize, "no retirement event"); return;
             }
-            if (d.event_record)(event, stream as cuda::CUstream) != cuda::SUCCESS {
+            let rc = (d.event_record)(event, stream as cuda::CUstream);
+            if rc != cuda::SUCCESS {
                 (d.event_destroy)(event);
-                quarantine(ptr as usize, "unable to record segment completion".into()); return;
+                if sticky(rc) { fault(ptr as usize, format!("segment completion unrecordable (CUDA {rc})")); }
+                quarantine(ptr as usize, "completion unrecordable"); return;
             }
         }
         if freer().send(Pending { ptr: ptr as usize, event: event as usize, context }).is_err() {
-            quarantine(ptr as usize, "native retirement worker stopped".into());
+            quarantine(ptr as usize, "retirement worker stopped");
         }
     }));
 }

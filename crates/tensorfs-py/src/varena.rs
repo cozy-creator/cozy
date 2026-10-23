@@ -14,7 +14,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use tensorfs::format::Body;
 use varena::layout::Layout;
-use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, Next, Origin, Pass, Pin, Plan, Request, Retained, SetId, SetSpec, Site, SitePeak, Step, Torch, Workspace, Yielded};
+use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Memory, Origin, Pass, Pin, Plan, Request, Retained, SetId, SetSpec, Step};
 
 use crate::store::PyCheckpoint;
 
@@ -119,7 +119,6 @@ pub struct PyFills {
 #[derive(Clone)]
 pub struct PyMoved {
     kept: PyFills,
-    tier: PyFills,
     store: PyFills,
     speculative: u64,
 }
@@ -139,7 +138,6 @@ pub struct PyRef_ {
 #[derive(Clone)]
 pub struct PyStepStats {
     capacity: u64,
-    w: u64,
     evicted: Vec<u64>,
 }
 
@@ -160,23 +158,14 @@ pub struct PyStats {
     #[pyo3(get)]
     evicted: Vec<u64>,
     #[pyo3(get)]
-    evicted_lowered: u64,
-    #[pyo3(get)]
-    speculative_evicted_d: u64,
-    #[pyo3(get)]
-    retries: u32,
-    #[pyo3(get)]
-    cuts: u32,
-    #[pyo3(get)]
-    parks: u32,
-    #[pyo3(get)]
-    parked: u64,
-    #[pyo3(get)]
-    lowered: bool,
-    #[pyo3(get)]
     peak: u64,
     #[pyo3(get)]
+    compute: u64,
+    #[pyo3(get)]
     leftover: u64,
+    /// Each make_room that took bytes: (step, trigger, need, freed, release events waited on).
+    #[pyo3(get)]
+    make_room: Vec<(u32, &'static str, u64, u64, u32)>,
 }
 
 impl From<varena::Fills> for PyFills {
@@ -192,26 +181,20 @@ impl From<varena::Stats> for PyStats {
         let origin = |o: Origin| match o {
             Origin::Hit => "hit",
             Origin::Kept => "kept",
-            Origin::Tier => "tier",
             Origin::Store => "store",
         };
         PyStats {
             raw,
             request: s.request,
-            moved: PyMoved { kept: m.kept.into(), tier: m.tier.into(), store: m.store.into(), speculative: m.speculative },
+            moved: PyMoved { kept: m.kept.into(), store: m.store.into(), speculative: m.speculative },
             trace: s.trace.into_iter().map(|r| PyRef_ { step: r.step, set: r.set, block: r.block, bytes: r.bytes, origin: origin(r.origin), speculative: r.speculative }).collect(),
-            steps: s.steps.into_iter().map(|t| PyStepStats { capacity: t.capacity, w: t.w, evicted: t.evicted.into() }).collect(),
+            steps: s.steps.into_iter().map(|t| PyStepStats { capacity: t.capacity, evicted: t.evicted.into() }).collect(),
             stall_ns: s.stall_ns,
             evicted: s.evicted.into(),
-            evicted_lowered: s.evicted_lowered,
-            speculative_evicted_d: s.speculative_evicted_d,
-            retries: s.retries,
-            cuts: s.cuts,
-            parks: s.parks,
-            parked: s.parked,
-            lowered: s.lowered,
             peak: s.peak,
+            compute: s.compute,
             leftover: s.leftover,
+            make_room: s.make_room.into_iter().map(|m| (m.step, m.trigger, m.need, m.freed, m.waited)).collect(),
         }
     }
 }
@@ -239,17 +222,6 @@ pub enum PyLevel {
     Ram,
     #[pyo3(name = "GPU")]
     Gpu,
-}
-
-/// `r.oom`'s answer.
-#[pyclass(name = "Next", module = "tensorfs.varena", frozen)]
-pub enum PyNext {
-    Retry(),
-    Cut { level: u32 },
-    /// Move idle activations, up to `budget` bytes, to the host; report them with `parked`.
-    Park { budget: u64 },
-    /// `error` is the `Exhausted` to raise.
-    Exhausted { error: Py<PyAny> },
 }
 
 /// TensorD's descriptors for this process's memory: the table and its row lock's own description;
@@ -451,59 +423,63 @@ impl PyMemory {
         done(py, &self.gpu.uuid, || self.memory().unload(SetId(set)))
     }
 
-    /// The allocator's trim (torch's `empty_cache`), returning the bytes it freed: a demand
-    /// trims before it evicts anything.
-    fn trim_with(&self, py: Python<'_>, trim: Py<PyAny>) -> PyResult<()> {
-        // Inside torch's allocator (a pool's segment) nothing calls back into torch.
-        let trim = move || {
-            if crate::allocator::inside() {
-                crate::allocator::trim_inside();
-                return 0;
-            }
-            Python::try_attach(|py| call(py, &trim, ())).unwrap_or(0)
-        };
-        done(py, &self.gpu.uuid, || self.memory().trim_with(trim))
-    }
-
     /// `set`'s current fill (a no-op when unchanged): pages filled under another come back fresh.
     fn fill(&self, py: Python<'_>, set: u32, fill: PyRef<'_, PyFill>) -> PyResult<()> {
         let fill = fill_of(&fill);
         done(py, &self.gpu.uuid, || self.memory().fill(SetId(set), fill))
     }
 
-    /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id.
-    fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>) -> PyResult<u32> {
+    /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id. Its next
+    /// use is its components' (`sets`, a graph pool's component; none: no declared use).
+    #[pyo3(signature = (owner, shrink, sets = Vec::new()))]
+    fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>, sets: Vec<u32>) -> PyResult<u32> {
         // Inside torch's allocator a shrink would free through it under its own lock: none runs there.
         let shrink = move |want: u64| {
             if crate::allocator::inside() {
-                crate::allocator::shrink_inside();
-                return varena::Shrunk::default();
+                return 0;
             }
-            varena::Shrunk { freed: Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0), coming: 0 }
+            Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0)
         };
-        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, &[], shrink))).map(|c| c.0)
+        let sets: Vec<SetId> = sets.into_iter().map(SetId).collect();
+        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, &sets, shrink))).map(|c| c.0)
     }
 
     fn cached(&self, py: Python<'_>, cache: u32, nbytes: u64) -> PyResult<()> {
         done(py, &self.gpu.uuid, || self.memory().cached(varena::CacheId(cache), nbytes))
     }
 
+    /// Holds `cache` (P, never shrunk) until `release_cache`; holds nest.
+    fn hold_cache(&self, py: Python<'_>, cache: u32) -> PyResult<u64> {
+        detached(py, &self.gpu.uuid, || Ok(self.memory().hold_cache(varena::CacheId(cache)).0))
+    }
+
+    /// Ends `hold` once the work queued on `stream` (a `CUstream`, 0 the default) so far completes.
+    #[pyo3(signature = (cache, hold, stream = 0))]
+    fn release_cache(&self, py: Python<'_>, cache: u32, hold: u64, stream: usize) -> PyResult<()> {
+        done(py, &self.gpu.uuid, || self.memory().release_cache(varena::CacheId(cache), varena::HoldId(hold), stream))
+    }
+
     fn uncache(&self, py: Python<'_>, cache: u32) -> PyResult<()> {
         done(py, &self.gpu.uuid, || self.memory().uncache(varena::CacheId(cache)))
     }
 
-    /// Opens request `id` with its plan: `(set names, passes)` per step.
-    fn request(&self, py: Python<'_>, id: &str, plan: Vec<(Vec<String>, u32)>) -> PyResult<PyRequest> {
-        let r = detached(py, &self.gpu.uuid, || self.memory().request(id, steps(plan)))?;
+    /// Opens request `id` with its plan: `(set names, passes)` per step. An `idle` one (a
+    /// capture or warm-up beside others' work) takes free bytes only: it evicts nothing.
+    #[pyo3(signature = (id, plan, idle = false))]
+    fn request(&self, py: Python<'_>, id: &str, plan: Vec<(Vec<String>, u32)>, idle: bool) -> PyResult<PyRequest> {
+        let m = self.memory();
+        let r = detached(py, &self.gpu.uuid, || if idle { m.request_idle(id, steps(plan)) } else { m.request(id, steps(plan)) })?;
         Ok(PyRequest { request: Mutex::new(Some(Arc::new(r))), gpu: self.gpu.uuid.clone() })
     }
 
     /// Block `block` of `set`, mapped and filled; `stream` (a `CUstream`, 0 the default) waits
-    /// on the fill and is the only stream a tensor made from it may be consumed on.
-    #[pyo3(signature = (set, block, stream = 0))]
-    fn bind(&self, py: Python<'_>, set: u32, block: u32, stream: usize) -> PyResult<PyPin> {
-        let pin = detached(py, &self.gpu.uuid, || self.memory().bind(SetId(set), block, stream))?;
-        Ok(PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.uuid.clone(), pin: Arc::new(Held(Some(pin))) })
+    /// on the fill and is the only stream a tensor made from it may be consumed on. With
+    /// `evict` false it maps into free bytes only, `Exhausted` at once when they are short.
+    #[pyo3(signature = (set, block, stream = 0, evict = true))]
+    fn bind(&self, py: Python<'_>, set: u32, block: u32, stream: usize, evict: bool) -> PyResult<PyPin> {
+        let m = self.memory();
+        let pin = detached(py, &self.gpu.uuid, || if evict { m.bind(SetId(set), block, stream) } else { m.bind_free(SetId(set), block, stream) })?;
+        Ok(PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.uuid.clone(), pin: Arc::new(Held::new(pin)) })
     }
 
     /// Graph address retention: no physical pin until `prepare`.
@@ -517,54 +493,16 @@ impl PyMemory {
         detached(py, &self.gpu.uuid, || Ok(self.memory().context_measurable()))
     }
 
-    fn observe(&self, py: Python<'_>, allocated: u64, reserved: u64) -> PyResult<()> {
-        detached(py, &self.gpu.uuid, || self.memory().observe(Torch { allocated, reserved }))
-    }
-
-    fn workspace(&self, py: Python<'_>, bytes: u64, allocated: u64, reserved: u64) -> PyResult<PyWorkspace> {
-        let workspace = detached(py, &self.gpu.uuid, || self.memory().workspace(bytes, Torch { allocated, reserved }))?;
-        Ok(PyWorkspace { workspace: Mutex::new(Some(Arc::new(workspace))), gpu: self.gpu.uuid.clone() })
-    }
-
-    fn workspace_available(&self, py: Python<'_>, allocated: u64, reserved: u64) -> PyResult<PyWorkspace> {
-        let workspace = detached(py, &self.gpu.uuid, || self.memory().workspace_available(Torch { allocated, reserved }))?;
-        Ok(PyWorkspace { workspace: Mutex::new(Some(Arc::new(workspace))), gpu: self.gpu.uuid.clone() })
-    }
-
-    /// Bytes torch's allocator may hold now.
-    fn torch_limit(&self, py: Python<'_>) -> PyResult<u64> {
-        detached(py, &self.gpu.uuid, || Ok(self.memory().torch_limit()))
+    /// The row's free bytes now: its budget less its context, pages, mappings and segments
+    /// (lock-free, the last published figure).
+    fn free(&self) -> u64 {
+        self.memory().free()
     }
 
     /// The record of the request that ended last.
     fn stats(&self, py: Python<'_>) -> PyResult<Option<PyStats>> {
         detached(py, &self.gpu.uuid, || Ok(self.memory().stats())).map(|s| s.map(Into::into))
     }
-}
-
-/// Future graph scratch/static/output bytes, consumed by native allocations in this scope.
-#[pyclass(name = "Workspace", module = "tensorfs.varena", frozen)]
-pub struct PyWorkspace {
-    workspace: Mutex<Option<Arc<Workspace>>>,
-    gpu: String,
-}
-
-#[pymethods]
-impl PyWorkspace {
-    fn __enter__(&self, py: Python<'_>) -> PyResult<()> {
-        let workspace = lock(&self.workspace).clone().ok_or_else(|| error(py, &self.gpu, Error::Closed("workspace reservation".into())))?;
-        crate::allocator::workspace_enter(workspace);
-        Ok(())
-    }
-    fn __exit__(&self, py: Python<'_>, _ty: &Bound<'_, PyAny>, _value: &Bound<'_, PyAny>, _trace: &Bound<'_, PyAny>) -> PyResult<()> {
-        crate::allocator::workspace_exit();
-        let workspace = lock(&self.workspace).take();
-        done(py, &self.gpu, || drop(workspace))
-    }
-}
-
-impl Drop for PyWorkspace {
-    fn drop(&mut self) { release(lock(&self.workspace).take()); }
 }
 
 /// A graph's address references; physical leases are acquired separately for each use.
@@ -584,12 +522,18 @@ impl PyRetained {
         detached(py, &self.gpu, || Ok(r.is_some_and(|r| r.valid())))
     }
 
+    /// Every block mapped and filled now: a read (no pin, no fill, no room made).
+    fn resident(&self, py: Python<'_>) -> PyResult<bool> {
+        let r = lock(&self.retained).clone();
+        detached(py, &self.gpu, || Ok(r.is_some_and(|r| r.resident())))
+    }
+
     #[pyo3(signature = (stream = 0, request = None))]
     fn prepare(&self, py: Python<'_>, stream: usize, request: Option<PyRef<'_, PyRequest>>) -> PyResult<Vec<PyPin>> {
         let r = lock(&self.retained).clone().ok_or_else(|| error(py, &self.gpu, Error::Closed("retained range".into())))?;
         let request = request.map(|r| r.get(py)).transpose()?;
         let pins = detached(py, &self.gpu, || r.prepare_for(stream, request.as_deref()))?;
-        Ok(pins.into_iter().map(|pin| PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.clone(), pin: Arc::new(Held(Some(pin))) }).collect())
+        Ok(pins.into_iter().map(|pin| PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.clone(), pin: Arc::new(Held::new(pin)) }).collect())
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -629,13 +573,11 @@ impl PyRequest {
 
 #[pymethods]
 impl PyRequest {
-    /// Starts a pass of `set` entered at `entry` (the module's path in the model, "" the root) at
-    /// `shape` (its tensors' dims joined by `x`), with torch's bytes now; returns once its
-    /// measured room is free.
+    /// Starts a pass of `set` keyed `key` (`entry|dims`): the plan's cursor moves to it.
     #[pyo3(name = "pass_")]
-    fn pass_(&self, py: Python<'_>, set: u32, entry: &str, shape: &str, allocated: u64, reserved: u64) -> PyResult<PyPass> {
+    fn pass_(&self, py: Python<'_>, set: u32, key: &str) -> PyResult<PyPass> {
         let r = self.get(py)?;
-        let pass = detached(py, &self.gpu, || r.pass(SetId(set), entry, shape, Torch { allocated, reserved }))?;
+        let pass = detached(py, &self.gpu, || r.pass(SetId(set), key))?;
         Ok(PyPass(Mutex::new(Some(pass))))
     }
 
@@ -645,52 +587,13 @@ impl PyRequest {
         done(py, &self.gpu, || r.plan(steps(plan)))
     }
 
-    /// An op of `set`'s pass (None: outside any pass) ran out of memory, `need` more bytes when
-    /// known, at cut site `site` (None: the op cannot be cut) whose op has shape key `shape`, cut
-    /// no finer than `finest`, with torch's bytes now; a `collective` site's finer level waits
-    /// for the next pass's agreement.
-    #[pyo3(signature = (set, allocated, reserved, need = None, site = None, collective = false, finest = 0, shape = ""))]
-    #[allow(clippy::too_many_arguments)]
-    fn oom(&self, py: Python<'_>, set: Option<u32>, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool, finest: u32, shape: &str) -> PyResult<PyNext> {
+    /// This thread's segments for torch's pool `pool` are this request's from now on: a
+    /// shortfall makes room in `memory`.
+    #[pyo3(signature = (memory, pool = (0, 0)))]
+    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, pool: (u64, u64)) -> PyResult<()> {
         let r = self.get(py)?;
-        let site = site.map(|name| Site { name, collective, finest, shape });
-        Ok(match detached(py, &self.gpu, || { let next = r.oom(set.map(SetId), need, site, Torch { allocated, reserved }); r.check()?; Ok(next) })? {
-            Next::Retry => PyNext::Retry(),
-            Next::Cut(level) => PyNext::Cut { level },
-            Next::Park(budget) => PyNext::Park { budget },
-            Next::Exhausted(x) => PyNext::Exhausted { error: error(py, &self.gpu, Error::Exhausted(x)).into_value(py).into_any() },
-        })
-    }
-
-    /// The bytes a `Park` answer moved to the host (0: none, and the next `oom` is Exhausted).
-    fn parked(&self, py: Python<'_>, nbytes: u64) -> PyResult<()> {
-        let r = self.get(py)?;
-        done(py, &self.gpu, || r.parked(nbytes))
-    }
-
-    /// The cut level of `set`'s current pass for op site `site` (0: whole); with no set (outside
-    /// any pass) the request's own memo of that site at the op's shape key `shape`.
-    #[pyo3(signature = (set, site, shape = ""))]
-    fn cut(&self, py: Python<'_>, set: Option<u32>, site: &str, shape: &str) -> PyResult<u32> {
-        let r = self.get(py)?;
-        detached(py, &self.gpu, || Ok(r.cut(set.map(SetId), site, shape)))
-    }
-
-    /// This thread's segments for torch's pool are `set`'s pass's (None: outside any pass) from
-    /// now on, torch's bytes now being `allocated` and `reserved`: a shortfall asks this request.
-    #[pyo3(signature = (memory, set, allocated, reserved, pool = (0, 0)))]
-    fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>, set: Option<u32>, allocated: u64, reserved: u64, pool: (u64, u64)) -> PyResult<()> {
-        let r = self.get(py)?;
-        let _ = allocated;
-        crate::allocator::enter(memory.memory().clone(), r, set.map(SetId), reserved, memory.dl.1, pool);
+        crate::allocator::enter(memory.memory().clone(), r, memory.dl.1, pool);
         Ok(())
-    }
-
-    /// The request waits on a call of its `family` (a child): until the guard ends it gives back
-    /// its reserved room to that family alone; ended, it waits for its room back.
-    fn yielding(&self, py: Python<'_>, family: &str) -> PyResult<PyYielded> {
-        let r = self.get(py)?;
-        Ok(PyYielded(Mutex::new(Some(detached(py, &self.gpu, || Ok(r.yielding(family)))?))))
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<PyStats> {
@@ -698,7 +601,7 @@ impl PyRequest {
         detached(py, &self.gpu, || Ok(r.stats())).map(Into::into)
     }
 
-    /// Ends the request: its pins, rooms and caches go. Refused while another call is in it.
+    /// Ends the request: its pins and caches go. Refused while another call is in it.
     fn end(&self, py: Python<'_>) -> PyResult<PyStats> {
         let r = lock(&self.request).take().ok_or_else(|| error(py, &self.gpu, Error::Closed("request ended".into())))?;
         match Arc::try_unwrap(r) {
@@ -711,7 +614,7 @@ impl PyRequest {
     }
 }
 
-/// A pass whose room is made; `end` records what it measured, dropping it records nothing.
+/// A pass: the plan's cursor at its set; `end` records torch's allocated peak.
 #[pyclass(name = "Pass", module = "tensorfs.varena", frozen)]
 pub struct PyPass(Mutex<Option<Pass>>);
 
@@ -721,64 +624,12 @@ impl Drop for PyPass {
     }
 }
 
-impl PyPass {
-    /// `f` on the open pass, off the GIL.
-    fn with<T: Send>(&self, py: Python<'_>, f: impl Send + FnOnce(&Pass) -> T) -> PyResult<T> {
-        let guard = lock(&self.0);
-        let pass = guard.as_ref().ok_or_else(|| error(py, "", Error::Closed("pass ended".into())))?;
-        detached(py, "", || Ok(f(pass)))
-    }
-}
-
 #[pymethods]
 impl PyPass {
-    /// torch's allocated peak (absolute), the allocator's slack at it and each cut site's own
-    /// `(name, allocated peak, collective, finest level)`; then torch's bytes now.
-    fn end(&self, py: Python<'_>, allocated_peak: u64, slack: u64, sites: Vec<(String, u64, bool, u32)>, allocated: u64, reserved: u64) -> PyResult<()> {
+    /// torch's allocated peak over it (absolute).
+    fn end(&self, py: Python<'_>, peak: u64) -> PyResult<()> {
         let Some(pass) = lock(&self.0).take() else { return Ok(()) };
-        let sites = sites.into_iter().map(|(name, peak, collective, finest)| SitePeak { name, peak, collective, finest }).collect();
-        done(py, "", || pass.end(Measured { allocated_peak, slack, sites }, Torch { allocated, reserved }))
-    }
-
-    /// Whether its room is the one measured for its set, shape and cut levels.
-    fn measured(&self, py: Python<'_>) -> PyResult<bool> {
-        self.with(py, Pass::measured)
-    }
-
-    /// Its collective sites' proposed `(site, level)`, for the ranks to agree before any exchange.
-    fn levels(&self, py: Python<'_>) -> PyResult<Vec<(String, u32)>> {
-        self.with(py, Pass::levels)
-    }
-
-    /// The levels the ranks agreed (the maximum of their proposals): in effect for this pass.
-    fn agree(&self, py: Python<'_>, levels: Vec<(String, u32)>) -> PyResult<()> {
-        self.with(py, |p| p.agree(levels))
-    }
-}
-
-/// A request waiting on a child call (`Request.yielding`); its end, or leaving its `with`, ends the wait.
-#[pyclass(name = "Yielded", module = "tensorfs.varena", frozen)]
-pub struct PyYielded(Mutex<Option<Yielded>>);
-
-impl Drop for PyYielded {
-    fn drop(&mut self) {
-        release(lock(&self.0).take());
-    }
-}
-
-#[pymethods]
-impl PyYielded {
-    fn end(&self) {
-        release(lock(&self.0).take());
-    }
-
-    fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
-        slf
-    }
-
-    #[pyo3(signature = (*_exc))]
-    fn __exit__(&self, _exc: &Bound<'_, pyo3::types::PyTuple>) {
-        self.end();
+        done(py, "", || pass.end(peak))
     }
 }
 
@@ -787,12 +638,31 @@ impl PyYielded {
 /// The pin a `Pin` and every tensor made from it share; its drop releases it.
 struct Held(Option<Pin>);
 
+/// Pins the binding holds now: Python's pin objects and the tensors that keep one.
+static HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Held {
+    fn new(pin: Pin) -> Self {
+        HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(Some(pin))
+    }
+}
+
 impl Drop for Held {
     /// Also run by the DLPack deleter, maybe on a thread without the GIL: never unwinds.
     fn drop(&mut self) {
         let pin = self.0.take();
+        if pin.is_some() {
+            HELD.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = catch_unwind(AssertUnwindSafe(|| drop(pin)));
     }
+}
+
+/// Pins the binding holds now (Python's pin objects and the tensors that keep one).
+#[pyfunction]
+fn pins_held() -> u64 {
+    HELD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A bound block: `len` bytes at `ptr`, mapped and filled (a fresh one awaits its fill).
@@ -992,7 +862,7 @@ fn allocated() {
     crate::allocator::exit();
 }
 
-/// The pool's segments: (live bytes, segments made, shortfalls varena resolved, their bytes,
+/// The pool's segments: (live bytes, segments made, make_room calls, NULLs for torch's release,
 /// refusals, nanoseconds making segments, segments freed).
 #[pyfunction]
 #[pyo3(signature = (device = None, pool = None))]
@@ -1000,11 +870,20 @@ fn allocator_stats(device: Option<i32>, pool: Option<(u64, u64)>) -> (u64, u64, 
     crate::allocator::stats(device, pool)
 }
 
-/// Last native allocation refusal: device, pool, reason, size, held bytes, admitted limit.
+/// Last native allocation refusal per device and pool: device, pool, reason, size, the row's
+/// free bytes then.
 #[pyfunction]
 #[pyo3(signature = (device = None))]
 fn allocator_refusals(device: Option<i32>) -> Vec<crate::allocator::Refusal> {
     crate::allocator::refusals(device)
+}
+
+/// Quarantined native segments: device, pool, bytes and the last reason. They stay charged and
+/// are never reused; the device goes on.
+#[pyfunction]
+#[pyo3(signature = (device = None))]
+fn allocator_quarantined(device: Option<i32>) -> Vec<(i32, (u64, u64), u64, &'static str)> {
+    crate::allocator::quarantined(device)
 }
 
 /// A lost completion/release quarantines its segment and retires this executor at a safe
@@ -1021,15 +900,22 @@ fn allocator_check(py: Python<'_>, device: i32) -> PyResult<()> {
     Ok(())
 }
 
+/// A CUDA graph capture opens (`open`) or closes on `device` (`Memory.capturing`).
+#[pyfunction]
+fn allocator_capture(device: i32, open: bool) {
+    crate::allocator::capture(device, open);
+}
+
+/// Torch dropped `pool` on `device` (a request's end): its segments come back as torch releases
+/// them, and an allocation short of room first lets torch's retry release them.
+#[pyfunction]
+fn allocator_retire(device: i32, pool: (u64, u64)) {
+    crate::allocator::retire(device, pool);
+}
+
 /// Native segments no longer in torch's counters, still physically held until GPU completion.
 #[pyfunction]
 fn allocator_pending(device: i32) -> u64 { crate::allocator::pending(device) }
-
-/// The trims and cache shrinks varena reached on a thread inside the allocator (answered 0).
-#[pyfunction]
-fn allocator_reentries() -> (u64, u64) {
-    crate::allocator::reentries()
-}
 
 // ---------------------------------------------------------------- the module
 
@@ -1046,12 +932,9 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMemory>()?;
     m.add_class::<PyRequest>()?;
     m.add_class::<PyPass>()?;
-    m.add_class::<PyYielded>()?;
     m.add_class::<PyPin>()?;
     m.add_class::<PyRetained>()?;
-    m.add_class::<PyWorkspace>()?;
     m.add_class::<PyWindow>()?;
-    m.add_class::<PyNext>()?;
     m.add_class::<PyFills>()?;
     m.add_class::<PyMoved>()?;
     m.add_class::<PyRef_>()?;
@@ -1062,7 +945,10 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(allocator_refusals, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_pending, &m)?)?;
     m.add_function(wrap_pyfunction!(allocator_check, &m)?)?;
-    m.add_function(wrap_pyfunction!(allocator_reentries, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_retire, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_capture, &m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_quarantined, &m)?)?;
+    m.add_function(wrap_pyfunction!(pins_held, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;
     m.add("StaleBinding", py.get_type::<StaleBinding>())?;

@@ -94,6 +94,8 @@ pub trait Backend: Send + Sync {
     /// Blocks until `event` completes: only the mechanism thread, before it unmaps a page whose
     /// consumers may still read it, and a planned handover ([`crate::Memory::settle`]).
     fn finish(&self, event: Event) -> Result<()>;
+    /// Gives `event` up, pending or not, from any thread (the allocator hook's too): never
+    /// blocks on its work.
     fn retire(&self, event: Event);
     /// After a device error: proves the copy stream's work complete or fails.
     fn drain(&self) -> Result<()>;
