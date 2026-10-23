@@ -7,6 +7,7 @@
 //! A GPU with no family on macOS 26 or later is not offered: there Torch's Metal 4 kernels
 //! compute wrong results on it (pytorch#196582; measured on hosted macOS 26 and 27), and Torch
 //! 2.15 drops it.
+#![allow(unsafe_code)]
 use super::{Gpu, MemoryClass};
 use libloading::Library;
 use std::ffi::{CStr, c_char, c_void};

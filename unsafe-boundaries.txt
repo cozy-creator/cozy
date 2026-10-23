@@ -7,6 +7,7 @@ crates/platform/src/contain/scope.rs
 crates/platform/src/contain/scope_windows.rs
 crates/platform/src/durable.rs
 crates/platform/src/durable/disk.rs
+crates/platform/src/gpu/apple.rs
 crates/platform/src/gpu/cuda.rs
 crates/platform/src/handles/unix.rs
 crates/platform/src/handles/windows.rs
