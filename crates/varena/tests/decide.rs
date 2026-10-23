@@ -1,10 +1,10 @@
 //! `make_room`'s order over tables, pure: other sets' idle pages, then the current step's own
-//! pages and caches nobody holds, furthest next use first; never a pinned page. A small simulator runs real
-//! plans through it at real capacities (each bind takes its page's room, each block its
-//! activations'), plus an ask's answer, prefetch, admission and placement.
+//! pages, furthest next use first; never a pinned page. A small simulator runs real plans through
+//! it at real capacities (each bind takes its page's room, each block its activations'), plus
+//! prefetch, and the ledger's admission and placement while they last.
 
-use varena::decide::{answer, fits, place, prefetch, victims, Admitted, Victim};
-use varena::table::{Cache, Key, Page, Req, Set, Table};
+use varena::decide::{fits, place, prefetch, victims, Admitted, Victim};
+use varena::table::{Key, Page, Req, Set, Table};
 
 const MB: u64 = 1 << 20;
 const GB: u64 = 1 << 30;
@@ -16,36 +16,31 @@ fn set(name: &str, pages: usize, bytes: u64) -> Option<Set> {
 /// A table with these sets and one request over `steps` (set indices, passes).
 fn table(capacity: u64, sets: Vec<Option<Set>>, steps: Vec<(Vec<u32>, u32)>) -> Table {
     let req = Req { id: 1, name: "r".into(), steps, ..Req::default() };
-    Table { capacity, sets, requests: vec![req], ..Table::default() }
-}
-
-/// What the mechanism derives from the pages: the backing mapped.
-fn backed(t: &mut Table) {
-    t.vmm = t.mapped();
+    Table { limit: capacity, sets, requests: vec![req] }
 }
 
 fn map(t: &mut Table, k: Key, clock: &mut u64) {
     *clock += 1;
     let p = t.page_mut(k).unwrap();
     (p.mapped, p.filled, p.last_use) = (true, true, *clock);
-    backed(t);
 }
 
 fn pages(v: &[Victim]) -> Vec<Key> {
-    v.iter().filter_map(|v| if let Victim::Page { key, .. } = v { Some(*key) } else { None }).collect()
+    v.iter().map(|v| v.key).collect()
+}
+
+fn free(t: &Table) -> u64 {
+    t.limit.saturating_sub(t.mapped())
 }
 
 /// Takes `bytes` as `make_room` does: victims in order until free covers them. Returns the
 /// pages taken; `None` when nothing is left to take.
 fn make_room(t: &mut Table, bytes: u64, keep: &[Key]) -> Option<Vec<Key>> {
     let mut taken = vec![];
-    while t.free() < bytes {
-        let v = victims(t, keep);
-        let Some(Victim::Page { key, .. }) = v.first() else { return None };
-        let key = *key;
+    while free(t) < bytes {
+        let key = victims(t, keep).first()?.key;
         let p = t.page_mut(key).unwrap();
         (p.mapped, p.filled) = (false, false);
-        backed(t);
         taken.push(key);
     }
     Some(taken)
@@ -58,9 +53,8 @@ struct Run {
     maps: u64,
 }
 
-/// Runs the plan: each pass binds its step's blocks in order, each block allocating `acts` as
-/// its activations while bound (the hook's segments), then frees them. The bound page is the
-/// one pin.
+/// Runs the plan: each pass binds its step's blocks in order, each block needing `acts` free as
+/// its activations while bound. The bound page is the one pin.
 fn play(t: &mut Table, acts: u64) -> Option<Run> {
     let (mut run, mut clock) = (Run::default(), 0);
     let steps = t.requests[0].steps.clone();
@@ -85,8 +79,6 @@ fn play(t: &mut Table, acts: u64) -> Option<Run> {
                     t.requests[0].cursor.next.insert(s, b + 1);
                     let taken = make_room(t, acts, &[k])?;
                     run.own += taken.iter().filter(|k| sets.contains(&k.0)).count() as u64;
-                    t.segments = acts;
-                    t.segments = 0;
                     t.page_mut(k).unwrap().pins.clear();
                 }
             }
@@ -125,50 +117,28 @@ fn h3_and_sdxl_complete_at_24_12_and_8_gib() {
 }
 
 /// The order: pages of sets no plan uses, least recently used first; then a later step's pages,
-/// furthest first; then the current step's pages and unheld caches together, furthest next use
-/// first, a cache's next use its components' (none: furthest), a page before a cache on a tie.
-/// Never a pinned or filling page, nor one being bound; a page whose release is pending is marked.
+/// furthest first; then the current step's pages, furthest next use first. Never a pinned or
+/// filling page, nor one being bound; a page whose release is pending is marked.
 #[test]
-fn victims_go_other_sets_pages_then_own_pages_and_caches_furthest_first() {
+fn victims_go_other_sets_pages_then_own_pages_furthest_first() {
     let mut t = table(64 * MB, vec![set("now", 2, MB), set("later", 2, MB), set("idle", 2, MB)], vec![(vec![0], 1), (vec![1], 1)]);
     let mut clock = 0;
     for k in [(2, 1), (2, 0), (1, 0), (1, 1), (0, 0), (0, 1)] {
         map(&mut t, k, &mut clock);
     }
-    t.caches = vec![
-        Cache { id: 7, bytes: MB, last_use: 9, ..Cache::default() },
-        Cache { id: 8, bytes: MB, last_use: 1, holds: 1, ..Cache::default() },
-        Cache { id: 9, sets: vec![0], bytes: MB, last_use: 2, ..Cache::default() },
-    ];
     t.requests[0].cursor.passes.insert(0, 1);
     t.requests[0].cursor.next.insert(0, 1);
     t.page_mut((0, 1)).unwrap().releasing = vec![3];
     let v = victims(&t, &[(1, 1)]);
-    let cache = |id| Victim::Cache { id, bytes: MB };
-    let page = |key, releasing| Victim::Page { key, bytes: MB, releasing };
+    let page = |key, releasing| Victim { key, bytes: MB, releasing };
     assert_eq!(
         v,
-        vec![page((2, 1), false), page((2, 0), false), page((1, 0), false), cache(7), page((0, 0), false), cache(9), page((0, 1), true)],
-        "idle by age; later's; then a cache of no set, now's block behind the cursor (next used a pass ahead, as its graph: the page first), its graph, the block ahead; the held cache never"
+        vec![page((2, 1), false), page((2, 0), false), page((1, 0), false), page((0, 0), false), page((0, 1), true)],
+        "idle by age; later's; then now's block behind the cursor (next used a pass ahead), then the block ahead"
     );
     t.page_mut((0, 0)).unwrap().pins = vec![1];
     t.page_mut((2, 1)).unwrap().filling = true;
     assert!(!pages(&victims(&t, &[])).iter().any(|k| *k == (0, 0) || *k == (2, 1)), "pinned and filling pages never go");
-}
-
-/// An ask takes this row's idle pages only (no plan uses them), oldest first, up to the bytes
-/// asked; never a planned page, one with a release pending, or a cache.
-#[test]
-fn an_answer_gives_idle_pages_only() {
-    let mut t = table(64 * MB, vec![set("run", 1, MB), set("idle", 3, MB)], vec![(vec![0], 1)]);
-    let mut clock = 0;
-    for k in [(1, 2), (1, 0), (1, 1), (0, 0)] {
-        map(&mut t, k, &mut clock);
-    }
-    t.page_mut((1, 1)).unwrap().releasing = vec![1];
-    t.caches = vec![Cache { id: 1, bytes: 8 * MB, ..Cache::default() }];
-    assert_eq!(answer(&t, MB + 1), vec![(1, 2), (1, 0)]);
-    assert_eq!(answer(&t, 64 * MB), vec![(1, 2), (1, 0)], "nothing planned, pending or cached");
 }
 
 /// Prefetch maps the next blocks past the cursor into free bytes only: never more than fits.
@@ -177,11 +147,11 @@ fn prefetch_maps_the_next_blocks_into_free_bytes_only() {
     let mut t = table(3 * MB, vec![set("s", 4, MB)], vec![(vec![0], 1)]);
     t.requests[0].cursor.passes.insert(0, 1);
     t.requests[0].cursor.next.insert(0, 1);
-    assert_eq!(prefetch(&t, 1), vec![(0, 1), (0, 2)], "the next two blocks");
+    assert_eq!(prefetch(&t, 1, free(&t)), vec![(0, 1), (0, 2)], "the next two blocks");
     let mut clock = 0;
     map(&mut t, (0, 0), &mut clock);
     map(&mut t, (0, 3), &mut clock);
-    assert_eq!(prefetch(&t, 1), vec![(0, 1)], "one block of room left");
+    assert_eq!(prefetch(&t, 1, free(&t)), vec![(0, 1)], "one block of room left");
 }
 
 #[test]
@@ -207,17 +177,6 @@ fn a_rows_yielded_w_is_per_family() {
     assert!(fits(24 * GB, 0, &rows, &[], Some(17 * GB), Some(a)) && !fits(24 * GB, 0, &rows, &[], Some(17 * GB + 1), Some(a)), "A's child: beside B's parent (6) only");
     assert!(fits(24 * GB, 0, &rows, &[], Some(15 * GB), Some(b)) && !fits(24 * GB, 0, &rows, &[], Some(15 * GB + 1), Some(b)), "B's child: beside A's parent (8) only");
     assert!(fits(24 * GB, 0, &rows, &[], Some(9 * GB), None) && !fits(24 * GB, 0, &rows, &[], Some(9 * GB + 1), None), "a stranger's child: beside both");
-}
-
-/// Review 6, R4 nit: a row's slots hold as many families apart as there are slots; only more
-/// than that fold the smallest together under family 0.
-#[test]
-fn a_rows_yielded_slots_fold_only_past_their_count() {
-    let yielded = |id: u64, family: u64, gb: u64| Req { id, family, yielded: true, peak: Some(gb * GB), ..Req::default() };
-    let mut t = Table { capacity: 64 * GB, requests: vec![yielded(1, 11, 8), yielded(2, 22, 6), yielded(3, 33, 4)], ..Table::default() };
-    assert_eq!(t.yielded_by_family(), [(11, 8 * GB), (22, 6 * GB), (33, 4 * GB)], "three families, three slots");
-    t.requests.push(yielded(4, 44, 2));
-    assert_eq!(t.yielded_by_family(), [(11, 8 * GB), (22, 6 * GB), (0, 6 * GB)], "a fourth folds with the third");
 }
 
 /// S5 r3: largest first; GPU 0 keeps what fits, else the GPU with the most room that holds it,

@@ -48,7 +48,7 @@ pub struct RegionFacts {
     pub slots: Vec<u32>,
     /// Its measured production (or capture) time.
     pub cost_ns: u64,
-    /// Its last use, in ns on the agent's clock.
+    /// Its last use, CLOCK_MONOTONIC ns: one clock for every process on the machine.
     pub last_use: u64,
     /// Advice: when it is used next, ordered within the executor as its chunks' advice is
     /// (`u64::MAX`: no use declared).

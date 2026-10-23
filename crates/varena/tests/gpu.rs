@@ -7,15 +7,13 @@ use std::ffi::c_void;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
-use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
 
 use tensorfs::io::source::Source;
 use tensorfs::io::{self, cuda, Copy, Dst, ItemSource, ReadOpts, Src};
 use varena::layout::{Item, Layout, Region, REGION_ALIGN};
-use varena::{Access, Backend, CudaBackend, Error, Event, Fill, Fingerprint, GpuId, Ledger, Level, Memory, Pass, Physical, Pin, Plan, Request, SetId, SetSpec, Stats, Step, Va};
+use varena::{Access, Backend, CudaBackend, Error, Event, Fill, Fingerprint, GpuId, Level, Memory, Pass, Physical, Pin, Plan, SetId, SetSpec, Step, Va};
 
 /// The role a child run of this binary plays.
 const ROLE: &str = "VARENA_GPU_ROLE";
@@ -561,10 +559,6 @@ impl Pressure {
         p
     }
 
-    fn bytes(&self) -> u64 {
-        self.taken.iter().map(|(_, n)| n).sum()
-    }
-
 }
 
 impl Drop for Pressure {
@@ -611,79 +605,6 @@ fn cuda_oom_is_recovered_in_process() {
     b.release(va);
     step!();
     println!("PASS real CUDA OOM recovered in process (free {left} at the OOM) {uuid}");
-    step!();
-}
-
-#[test]
-#[ignore = "native GPU: a role of kept_page_is_imported_bit_exact_after_its_holders_kill_9"]
-fn role_holder() {
-    if role().as_deref() != Some("holder") {
-        return;
-    }
-    let (b, uuid) = gpu();
-    step!();
-    let len = 4 * b.granularity();
-    step!();
-    let data = pattern(len, 5);
-    step!();
-    let va = b.reserve(len).unwrap();
-    step!();
-    let (page, ready) = filled(&b, va, 0, len, Src::Host(data.as_ptr()));
-    step!();
-    b.wait(ready, 0).unwrap();
-    step!();
-    let mut control = parent();
-    step!();
-    send(&mut control, &b.export(&page).unwrap(), len);
-    step!();
-    println!("HOLDER {uuid}");
-    step!();
-    std::io::stdout().flush().unwrap();
-    step!();
-    // Held until killed.
-    control.read_exact(&mut [0]).unwrap();
-    step!();
-    unreachable!("the holder is killed, never let go");
-}
-
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn kept_page_is_imported_bit_exact_after_its_holders_kill_9() {
-    let (mut control, theirs) = UnixStream::pair().unwrap();
-    step!();
-    let mut holder = child("role_holder", "holder", Stdio::from(OwnedFd::from(theirs)));
-    step!();
-    let (kept, len) = receive(&mut control);
-    step!();
-    let uuid = marked(&mut holder, "HOLDER ");
-    step!();
-    holder.kill().unwrap();
-    step!();
-    assert_eq!(holder.wait().unwrap().signal(), Some(libc::SIGKILL));
-    step!();
-    let (b, mine) = gpu();
-    step!();
-    assert_eq!(mine, uuid);
-    step!();
-    let page = b.import(kept, len).unwrap();
-    step!();
-    let va = b.reserve(len).unwrap();
-    step!();
-    b.map(va, 0, &page, Access::Read).unwrap();
-    step!();
-    assert_eq!(bytes(va.base, len, 0), pattern(len, 5), "the kept page is the holder's, bit-exact");
-    step!();
-    let before = b.free().unwrap();
-    step!();
-    unload(&b, va, 0, page);
-    step!();
-    b.release(va);
-    step!();
-    let after = b.free().unwrap();
-    step!();
-    assert!(after - before >= len, "the last reference gone, its {len} bytes are free (got {})", after - before);
-    step!();
-    println!("PASS a kept page is imported bit-exact after its holder's kill -9 {uuid}");
     step!();
 }
 
@@ -958,10 +879,6 @@ impl Timings {
         self.0.lock().get(op).map_or(0, |e| e.0)
     }
 
-    fn last(&self, op: &str) -> Option<std::time::Instant> {
-        self.1.lock().get(op).copied()
-    }
-
     /// The wall time since the previous lap (None on the first).
     fn lap(&self) -> Option<std::time::Duration> {
         self.1.lock().insert("lap", std::time::Instant::now()).map(|t| t.elapsed())
@@ -1015,6 +932,7 @@ struct Timed(CudaBackend, Arc<Timings>);
 
 impl Backend for Timed {
     fn capacity(&self) -> u64 { self.0.capacity() }
+    fn headroom(&self) -> u64 { self.0.headroom() }
     fn free(&self) -> varena::Result<u64> { self.1.time("free", || self.0.free()) }
     fn process_used(&self) -> varena::Result<u64> { self.1.time("process_used", || self.0.process_used()) }
     fn opened_context(&self) -> u64 { self.0.opened_context() }
@@ -1059,13 +977,13 @@ impl Backend for Timed {
 fn timed_memory(b: CudaBackend, g: &GpuId) -> (Memory, Arc<Timings>) {
     time_calls();
     let timings = Arc::new(Timings::default());
-    (Memory::open(g.clone(), None, Box::new(Timed(b, timings.clone()))).unwrap(), timings)
+    (Memory::open(g.clone(), Box::new(Timed(b, timings.clone()))).unwrap(), timings)
 }
 
 // ---- Memory over the CUDA backend
 
-/// The run's GPU under a name of this case's own, so its table, custody and kept pages are the
-/// case's (a machine's TensorD may run beside it); and the real UUID.
+/// The run's GPU under a name of this case's own (a machine's TensorD may run beside it); and the
+/// real UUID.
 fn card(case: &str) -> (CudaBackend, GpuId, String) {
     let (b, uuid) = gpu();
     step!();
@@ -1135,27 +1053,11 @@ fn plan(steps: &[&[&str]]) -> Plan {
 
 fn memory(b: CudaBackend, g: &GpuId) -> Memory {
     time_calls();
-    Memory::open(g.clone(), None, Box::new(b)).unwrap()
+    Memory::open(g.clone(), Box::new(b)).unwrap()
 }
 
 fn exact(pin: &Pin, want: &[u8], stream: usize) -> bool {
     bytes(pin.ptr, pin.len, stream) == want
-}
-
-/// An activation of `len` bytes taken as torch's hook takes one: on each real OOM, `make_room`
-/// (asking one page more each time the driver refuses). Returns its answers.
-fn activation(mem: &Memory, r: &Request, p: &mut Pressure, len: u64, pages: u32) -> Vec<String> {
-    let mut answers = vec![];
-    step!();
-    while let Err(code) = p.try_take(len) {
-        assert_eq!(code, cuda::ERROR_OUT_OF_MEMORY);
-        let next = mem.make_room(len + answers.len() as u64 * REGION_ALIGN);
-        answers.push(format!("{next:?}").split('(').next().unwrap_or_default().to_string());
-        eprintln!("OOM_DIAGNOSTIC need={len} driver_free={} allocated={} next={next:?} stats={:?}", driver_free(), p.bytes(), r.stats());
-        assert!(next.is_ok(), "idle pages make the room: {answers:?}");
-        assert!(answers.len() <= pages as usize + 2, "the hook's asks must end: {answers:?}");
-    }
-    answers
 }
 
 #[test]
@@ -1163,7 +1065,6 @@ fn activation(mem: &Memory, r: &Request, p: &mut Pressure, len: u64, pages: u32)
 fn concurrent_binds_of_one_block_fill_it_once() {
     let (b, g, uuid) = card("concurrent");
     step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
     let mem = memory(b, &g);
     step!();
     let s = mem.load(set("m", 1, Fill::Stored, &g.uuid, |b| block(1, b)), Level::Ram).unwrap();
@@ -1206,7 +1107,6 @@ fn concurrent_binds_of_one_block_fill_it_once() {
 fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishes() {
     let (b, g, uuid) = card("release");
     step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
     let mem = memory(b, &g);
     step!();
     // A declared fill: the bind is fresh, and a pin dropped untransformed sends its page away.
@@ -1237,7 +1137,7 @@ fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishe
     // The copy must read the original contents before the in-place refill lands: the refill's
     // copies wait for it in-stream. The rebind returns once they are issued (D), its page ready
     // in-stream, while the fill thread's read keeps its staging until they complete.
-    let _ = mem.free();
+    let _ = mem.classes();
     let (again, waited) = std::thread::scope(|t| {
         let (rebind, waited) = watch(t, first, || mem.bind(s, 0, 0));
         drop(gate);
@@ -1326,7 +1226,6 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     step!();
     let probe = CudaBackend::open(0).unwrap();
     step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
     let (mem, timings) = timed_memory(b, &g);
     step!();
     // 64 pages: 128 MiB of binds, each one evicting an idle page on the full card.
@@ -1388,7 +1287,7 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     time("pass start", &mut || passes.push(r.pass(c, "k").unwrap()));
     step!();
     time("torch_limit", &mut || {
-        mem.make_room(0).unwrap();
+        mem.classes();
     });
     step!();
     time("unload", &mut || mem.unload(b1));
@@ -1430,187 +1329,11 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     step!();
 }
 
-/// A kept page whose fill identity changed is renewed: a fresh page takes its place, and the old
-/// one is unmapped only once its consumers are done. A spin kernel holds it as its consumer; the
-/// unmap must come after the kernel's end (its launch plus its measured length on the GPU's clock).
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
-    let (b, g, uuid) = card("renew");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let (mem, timings) = timed_memory(b, &g);
-    step!();
-    let s = mem.load(set("t", 1, Fill::Declared("bake-1".into()), &g.uuid, |b| block(22, b)), Level::Ram).unwrap();
-    step!();
-    let r = mem.request("r", plan(&[&["t"]])).unwrap();
-    step!();
-    let pass = r.pass(s, "k").unwrap();
-    step!();
-    let first = std::time::Instant::now();
-    step!();
-    let pin = mem.bind(s, 0, 0).unwrap();
-    step!();
-    let first = first.elapsed();
-    step!();
-    assert!(pin.fresh);
-    step!();
-    pin.filled();
-    step!();
-    drop(pin);
-    step!();
-    assert_eq!(synchronize(), cuda::SUCCESS);
-    step!();
-    // The bake's event done, the page is kept (exported read-only) at the next look.
-    let _ = mem.free();
-    while timings.count("export") == 0 {
-        drop(mem.bind(s, 0, 0).unwrap());
-        assert_eq!(synchronize(), cuda::SUCCESS);
-        let _ = mem.free();
-    }
-    let consumer = cuda::Stream::new(0).unwrap();
-    step!();
-    let held = mem.bind(s, 0, consumer.raw()).unwrap();
-    step!();
-    // A consumer ten times as long as the first bind: an unmap that did not wait would land inside it.
-    let spin = first * 10;
-    step!();
-    let launched = std::time::Instant::now();
-    step!();
-    assert_eq!(launch(c"spin", &[spin.as_nanos() as u64], consumer.raw()), cuda::SUCCESS);
-    step!();
-    drop(held);
-    step!();
-    let unmaps = timings.count("unmap");
-    step!();
-    mem.fill(s, Fill::Declared("bake-2".into()));
-    step!();
-    let renewed = mem.bind(s, 0, 0).unwrap();
-    step!();
-    assert!(renewed.fresh, "a new identity is baked again");
-    step!();
-    consumer.drain().unwrap();
-    step!();
-    let ended = launched + spin;
-    step!();
-    while timings.count("unmap") == unmaps {
-        // The old page goes on the mechanism thread once its consumer is done.
-        let _ = mem.free();
-    }
-    let unmapped = timings.last("unmap").unwrap();
-    step!();
-    assert!(unmapped >= ended, "the old page was unmapped {:?} before its consumer's end", ended - unmapped);
-    step!();
-    renewed.filled();
-    step!();
-    drop(renewed);
-    step!();
-    pass.end(0);
-    step!();
-    assert_eq!(r.end().leftover, 0);
-    step!();
-    println!("RENEW the old page unmapped {:?} after its {spin:?} consumer ended; {}", unmapped - ended, timings.report());
-    step!();
-    println!("PASS a renewed page is unmapped only after its consumer ends {uuid}");
-    step!();
-}
-
-/// A pass of `m` (two pinned blocks) whose one-gibibyte activation meets a real OOM: the card is
-/// crowded and the rest full of an idle set. Returns the OOM answers and the record.
-fn first_run(mem: &Memory, m: SetId, idle: u32) -> (Vec<String>, Stats) {
-    let r = mem.request("first", plan(&[&["m"]])).unwrap();
-    step!();
-    let pass = r.pass(m, "k").unwrap();
-    step!();
-    let pins: Vec<Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
-    step!();
-    let mut p = Pressure::none();
-    step!();
-    let answers = activation(mem, &r, &mut p, ROOM / 2, idle);
-    step!();
-    for (b, pin) in pins.iter().enumerate() {
-        assert!(exact(pin, &block(3, b as u32), 0), "pins outlive the OOM");
-    }
-    pass.end(ROOM / 2);
-    step!();
-    drop((pins, p));
-    step!();
-    (answers, r.end())
-}
-
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn an_oom_in_a_pass_is_recovered_in_process() {
-    let (b, g, uuid) = card("oom");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let mem = memory(b, &g);
-    step!();
-    let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(3, b)), Level::Ram).unwrap();
-    step!();
-    let _crowd = crowd();
-    let idle = more_than_free();
-    step!();
-    mem.load(bulk("idle", idle, &g.uuid), Level::Gpu).unwrap();
-    step!();
-    let (answers, stats) = first_run(&mem, m, idle);
-    step!();
-    assert!(!answers.is_empty(), "the full card refused the activation");
-    step!();
-    assert!(!stats.make_room.is_empty() && stats.evicted.iter().sum::<u64>() >= ROOM / 2, "{stats:?}");
-    step!();
-    assert_eq!(stats.leftover, 0);
-    step!();
-    println!("PASS an OOM in a pass is recovered in process (answers {answers:?}) {uuid}");
-    step!();
-}
-
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_measured_pass_gets_its_room_before_it_runs() {
-    let (b, g, uuid) = card("room");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let mem = memory(b, &g);
-    step!();
-    let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(3, b)), Level::Ram).unwrap();
-    step!();
-    let _crowd = crowd();
-    let idle = more_than_free();
-    step!();
-    mem.load(bulk("idle", idle, &g.uuid), Level::Gpu).unwrap();
-    step!();
-    let (answers, _) = first_run(&mem, m, idle);
-    step!();
-    assert!(!answers.is_empty(), "the first run met a real OOM");
-    step!();
-    // The idle set takes the card again; the second run's pass makes its measured room first.
-    mem.load(bulk("idle", idle, &g.uuid), Level::Gpu).unwrap();
-    step!();
-    assert!(driver_free() < ROOM / 2, "the card is full before the second pass: {} free", driver_free());
-    step!();
-    let r = mem.request("second", plan(&[&["m"]])).unwrap();
-    step!();
-    let pass = r.pass(m, "k").unwrap();
-    step!();
-    let mut p = Pressure::none();
-    step!();
-    activation(&mem, &r, &mut p, ROOM / 2, idle);
-    step!();
-    pass.end(ROOM / 2);
-    step!();
-    assert_eq!(r.end().leftover, 0);
-    step!();
-    println!("PASS a measured pass gets its room before it runs {uuid}");
-    step!();
-}
-
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_again() {
     let (b, g, uuid) = card("huge");
     step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
     let span = (b.capacity() + REGION_ALIGN).next_multiple_of(REGION_ALIGN);
     step!();
     let mem = memory(b, &g);
@@ -1674,7 +1397,6 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
 fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_room_returns() {
     let (b, g, uuid) = card("full");
     step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
     let mem = memory(b, &g);
     step!();
     let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(5, b)), Level::Ram).unwrap();
@@ -1717,7 +1439,6 @@ fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_ro
 fn repeated_passes_of_a_set_keep_its_declared_step() {
     let (b, g, uuid) = card("steps");
     step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
     let mem = memory(b, &g);
     step!();
     let names = ["a", "vae", "audio", "dit", "lora"];
@@ -1757,7 +1478,6 @@ fn repeated_passes_of_a_set_keep_its_declared_step() {
 fn a_transform_binds_another_set_under_pressure_and_a_second_binder_waits_for_it() {
     let (b, g, uuid) = card("transform");
     step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
     let mem = memory(b, &g);
     step!();
     let base = mem.load(set("base", 1, Fill::Declared("lora-1".into()), &g.uuid, |b| block(7, b)), Level::Ram).unwrap();
@@ -1807,506 +1527,5 @@ fn a_transform_binds_another_set_under_pressure_and_a_second_binder_waits_for_it
     step!();
 }
 
-/// A request's trace as `trace` reports it (`Kept,Kept,Hit,...`): its load's fills, then its
-/// binds. How many of each origin.
-fn origins(trace: &str) -> std::collections::BTreeMap<&str, usize> {
-    let mut n = std::collections::BTreeMap::new();
-    trace.split(',').filter(|o| !o.is_empty()).for_each(|o| *n.entry(o).or_default() += 1);
-    n
-}
-
 // ---- several processes
 
-/// A child's Memory over the CUDA backend, one command per stdin line; each reply is a line
-/// `@ <reply>` on stdout.
-#[test]
-#[ignore = "native GPU: the agent of the multi-process cases"]
-fn role_agent() {
-    if role().as_deref() != Some("agent") {
-        return;
-    }
-    let mut mem: Option<Memory> = None;
-    step!();
-    let mut uuid = String::new();
-    step!();
-    let mut sets: HashMap<String, SetId> = HashMap::new();
-    step!();
-    let mut requests: HashMap<String, Request> = HashMap::new();
-    step!();
-    let mut passes: HashMap<String, Pass> = HashMap::new();
-    step!();
-    let mut pins: Vec<Pin> = vec![];
-    let mut crowded: Vec<Pressure> = vec![];
-    let mut timings: Option<Arc<Timings>> = None;
-    step!();
-    for line in std::io::stdin().lock().lines() {
-        let line = line.unwrap();
-        let w: Vec<&str> = line.split_whitespace().collect();
-        let m = || mem.as_ref().unwrap();
-        let bytes_of = |seed: &str, b: u32| if seed == "bulk" { bulk_block() } else { block(seed.parse().unwrap(), b) };
-        let reply = match w.as_slice() {
-            ["open", id] => {
-                let (b, real) = gpu();
-                uuid = id.to_string();
-                let g = GpuId { uuid: uuid.clone(), ..b.gpu().unwrap() };
-                let (m, t) = timed_memory(b, &g);
-                mem = Some(m);
-                timings = Some(t);
-                format!("ok {} {real}", std::process::id())
-            }
-            ["load", name, blocks, seed, fill, level] => {
-                let blocks = if *blocks == "more" { more_than_free() } else { blocks.parse().unwrap() };
-                let fill = match *fill {
-                    "stored" => Fill::Stored,
-                    other => Fill::Declared(other.into()),
-                };
-                let level = if *level == "gpu" { Level::Gpu } else { Level::Ram };
-                match m().load(set(name, blocks, fill, &uuid, |b| bytes_of(seed, b)), level) {
-                    Ok(id) => {
-                        sets.insert(name.to_string(), id);
-                        "ok".into()
-                    }
-                    Err(e) => format!("err {e}"),
-                }
-            }
-            ["request", id, steps] => {
-                let steps: Vec<Vec<&str>> = steps.split(';').map(|s| s.split(',').collect()).collect();
-                let steps: Vec<&[&str]> = steps.iter().map(Vec::as_slice).collect();
-                requests.insert(id.to_string(), m().request(id, plan(&steps)).unwrap());
-                "ok".into()
-            }
-            ["pass", req, set, shape] => match requests[*req].pass(sets[*set], shape) {
-                Ok(p) => {
-                    passes.insert(req.to_string(), p);
-                    "ok".into()
-                }
-                Err(e) => format!("err {e}"),
-            },
-            ["endpass", req, peak] => {
-                if let Some(p) = passes.remove(*req) {
-                    p.end(peak.parse().unwrap());
-                }
-                "ok".into()
-            }
-            ["bind", set, block] => match m().bind(sets[*set], block.parse().unwrap(), 0) {
-                Ok(pin) => {
-                    let fresh = pin.fresh;
-                    pins.push(pin);
-                    format!("ok {fresh}")
-                }
-                Err(e) => format!("err {e} sticky={}", e.is_sticky()),
-            },
-            ["exact", set, block, seed] => {
-                let b: u32 = block.parse().unwrap();
-                let pin = m().bind(sets[*set], b, 0).unwrap();
-                let ok = exact(&pin, &bytes_of(seed, b), 0);
-                pins.push(pin);
-                format!("ok {ok}")
-            }
-            ["filled"] => {
-                pins.iter().filter(|p| p.fresh).for_each(Pin::filled);
-                "ok".into()
-            }
-            ["stray"] => {
-                let code = stray_write(pins.last().unwrap().ptr);
-                let e: Error = cuda::check("the stray write", code).map_err(Error::from).err().unwrap();
-                format!("ok {code} sticky={}", e.is_sticky())
-            }
-            ["trace", req] => {
-                let origins: Vec<String> = requests[*req].stats().trace.iter().map(|t| format!("{:?}", t.origin)).collect();
-                format!("ok {}", origins.join(","))
-            }
-            // Takes the card down to ROOM free, as other allocations of this process would.
-            ["crowd"] => {
-                crowded.push(crowd());
-                "ok".into()
-            }
-            ["timings"] => format!("ok backend {} | driver {}", timings.as_ref().unwrap().report(), CALLS.report()),
-            ["unpin"] => {
-                pins.clear();
-                "ok".into()
-            }
-            ["settle"] => {
-                assert_eq!(synchronize(), cuda::SUCCESS);
-                m().free();
-                m().settle();
-                "ok".into()
-            }
-            ["end", req] => {
-                passes.remove(*req);
-                let s = requests.remove(*req).unwrap().end();
-                format!("ok leftover={} kept={} store={}", s.leftover, s.moved.kept.bytes, s.moved.store.bytes)
-            }
-            // A sticky error ends the process: no destructor runs against its context.
-            ["exit"] => std::process::exit(0),
-            _ => format!("err unknown {line}"),
-        };
-        println!("@ {reply}");
-        std::io::stdout().flush().unwrap();
-    }
-}
-
-/// A child running [`role_agent`].
-struct Agent {
-    child: Child,
-    to: std::process::ChildStdin,
-    from: BufReader<std::process::ChildStdout>,
-}
-
-impl Agent {
-    fn spawn() -> Agent {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", "role_agent", "--nocapture", "--test-threads=1"])
-            .env(ROLE, "agent")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let (to, from) = (child.stdin.take().unwrap(), BufReader::new(child.stdout.take().unwrap()));
-        Agent { child, to, from }
-    }
-
-    /// The reply to `line` (libtest may print its own text before it on the line).
-    fn say(&mut self, line: &str) -> String {
-        writeln!(self.to, "{line}").unwrap();
-        self.to.flush().unwrap();
-        loop {
-            let mut got = String::new();
-            assert!(self.from.read_line(&mut got).unwrap() > 0, "the agent ended at {line:?}");
-            if let Some((_, reply)) = got.split_once("@ ") {
-                return reply.trim().to_string();
-            }
-        }
-    }
-
-    fn ok(&mut self, line: &str) -> String {
-        let reply = self.say(line);
-        assert!(reply.starts_with("ok"), "{line} -> {reply}");
-        reply.trim_start_matches("ok").trim().to_string()
-    }
-
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
-    fn exit(mut self) {
-        writeln!(self.to, "exit").unwrap();
-        assert!(self.child.wait().unwrap().success());
-    }
-}
-
-/// The case's ledger in this process (TensorD's part: the table and custody), under a name of the
-/// case's own; no CUDA context stays in this process.
-fn tensord(case: &str) -> (Ledger, GpuId, String) {
-    let (b, g, uuid) = card(case);
-    step!();
-    drop(b);
-    step!();
-    (Ledger::create(&g, None).unwrap(), g, uuid)
-}
-
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_kept_set_is_imported_after_its_holders_kill_9_and_another_fill_refills() {
-    let (ledger, g, uuid) = tensord("kill");
-    step!();
-    let mut a = Agent::spawn();
-    step!();
-    a.ok(&format!("open {}", g.uuid));
-    step!();
-    a.ok("load k 4 10 stored gpu");
-    step!();
-    a.child.kill().unwrap();
-    step!();
-    assert_eq!(a.child.wait().unwrap().signal(), Some(libc::SIGKILL));
-    step!();
-    ledger.reap(a.pid());
-    step!();
-    let orphans: u64 = ledger.status().rows.iter().map(|r| r.classes[1]).sum();
-    step!();
-    // A filled page goes to custody asynchronously: those the holder had exported are orphans.
-    assert!(orphans > 0 && orphans <= 4 * REGION_ALIGN, "class O shows the orphans: {orphans}");
-    let kept = (orphans / REGION_ALIGN) as usize;
-    step!();
-    let mut s = Agent::spawn();
-    step!();
-    s.ok(&format!("open {}", g.uuid));
-    step!();
-    // One load path: the load imports what custody keeps, at any level.
-    s.ok("load k 4 10 stored ram");
-    step!();
-    s.ok("request r k");
-    step!();
-    s.ok("pass r k 1");
-    step!();
-    for b in 0..4 {
-        assert_eq!(s.ok(&format!("exact k {b} 10")), "true", "block {b} bit-exact");
-    }
-    let trace = s.ok("trace r");
-    step!();
-    let n = origins(&trace);
-    // The orphans' blocks bind as hits on the imported pages; the rest fill from the store (the
-    // load read it into the page cache).
-    let some = |k: usize| (k > 0).then_some(k);
-    assert_eq!(
-        (n.get("Kept").copied(), n.get("Hit").copied(), n.get("Store").copied()),
-        (Some(kept), Some(kept), some(4 - kept)),
-        "every orphan imported at load, never copied: {trace}"
-    );
-    step!();
-    s.ok("unpin");
-    step!();
-    let end = s.ok("end r");
-    step!();
-    assert!(end.contains(&format!("kept={orphans}")), "{end}");
-    step!();
-    s.exit();
-    let mut c = Agent::spawn();
-    step!();
-    c.ok(&format!("open {}", g.uuid));
-    step!();
-    c.ok("load k 4 10 lora-x ram");
-    step!();
-    c.ok("request r k");
-    step!();
-    c.ok("pass r k 1");
-    step!();
-    assert_eq!(c.ok("bind k 0"), "true", "another fill identity is fresh: the caller bakes it");
-    step!();
-    c.ok("filled");
-    step!();
-    let trace = c.ok("trace r");
-    step!();
-    assert!(!trace.contains("Kept"), "{trace}");
-    step!();
-    c.ok("unpin");
-    step!();
-    c.ok("end r");
-    step!();
-    c.exit();
-    println!("PASS a kept set is imported after its holder's kill -9, and another fill refills {uuid}");
-    step!();
-}
-
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn kept_pages_survive_a_holder_that_served() {
-    let (ledger, g, uuid) = tensord("served");
-    step!();
-    let mut a = Agent::spawn();
-    step!();
-    a.ok(&format!("open {}", g.uuid));
-    step!();
-    a.ok("load s 3 14 stored gpu");
-    step!();
-    a.ok("request r s");
-    step!();
-    a.ok("pass r s 1");
-    step!();
-    for b in 0..3 {
-        a.ok(&format!("bind s {b}"));
-    }
-    a.ok("unpin");
-    step!();
-    // A measured pass: the successor's pass needs room, and must not find it in its own kept pages.
-    a.ok(&format!("endpass r {}", 1u64 << 30));
-    step!();
-    a.ok("end r");
-    step!();
-    a.ok("settle");
-    step!();
-    a.child.kill().unwrap();
-    step!();
-    a.child.wait().unwrap();
-    step!();
-    ledger.reap(a.pid());
-    step!();
-    let mut b = Agent::spawn();
-    step!();
-    b.ok(&format!("open {}", g.uuid));
-    step!();
-    b.ok("load s 3 14 stored ram");
-    step!();
-    b.ok("request r s");
-    step!();
-    b.ok("pass r s 1");
-    step!();
-    for block in 0..3 {
-        assert_eq!(b.ok(&format!("exact s {block} 14")), "true");
-    }
-    let trace = b.ok("trace r");
-    step!();
-    let n = origins(&trace);
-    assert_eq!((n.get("Kept").copied(), n.get("Hit").copied(), n.get("Store")), (Some(3), Some(3), None), "every page kept, none copied: {trace}");
-    step!();
-    b.ok("unpin");
-    step!();
-    let end = b.ok("end r");
-    step!();
-    assert!(end.contains("store=0"), "{end}");
-    step!();
-    b.exit();
-    println!("PASS kept pages survive a holder that served {uuid}");
-    step!();
-}
-
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn binds_outlive_the_custody_holder() {
-    // No TensorD: the first participant serves custody, and it dies.
-    let (b, g, uuid) = card("holder");
-    step!();
-    drop(b);
-    step!();
-    let mut a = Agent::spawn();
-    step!();
-    a.ok(&format!("open {}", g.uuid));
-    step!();
-    a.ok("load hx 2 15 stored gpu");
-    step!();
-    let mut c = Agent::spawn();
-    step!();
-    c.ok(&format!("open {}", g.uuid));
-    step!();
-    c.ok("load hy 2 16 stored ram");
-    step!();
-    a.child.kill().unwrap();
-    step!();
-    a.child.wait().unwrap();
-    step!();
-    c.ok("request r hy");
-    step!();
-    c.ok("pass r hy 1");
-    step!();
-    assert_eq!(c.ok("exact hy 1 16"), "true", "binds go on: the next call serves custody itself");
-    step!();
-    c.ok("unpin");
-    step!();
-    c.ok("end r");
-    step!();
-    c.exit();
-    // The table goes with the last of its rows.
-    drop(Ledger::create(&g, None).unwrap());
-    step!();
-    println!("PASS binds outlive the custody holder {uuid}");
-    step!();
-}
-
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn two_processes_contend_and_an_idle_holder_gives_back_while_its_pins_stay() {
-    let (ledger, g, uuid) = tensord("contend");
-    step!();
-    let held = |pid: u32| ledger.status().rows.iter().find(|r| r.pid == pid).map(|r| r.classes.iter().sum::<u64>()).unwrap();
-    step!();
-    // Both contexts first: then the holder's idle set takes the rest of the card.
-    let mut demander = Agent::spawn();
-    step!();
-    demander.ok(&format!("open {}", g.uuid));
-    step!();
-    let mut holder = Agent::spawn();
-    step!();
-    holder.ok(&format!("open {}", g.uuid));
-    step!();
-    holder.ok("load h 1 11 stored ram");
-    step!();
-    // The card down to ROOM first: the holder's idle set is then ROOM's pages, not the whole card's.
-    holder.ok("crowd");
-    step!();
-    holder.ok("load idle more bulk stored gpu");
-    step!();
-    println!("TIMINGS holder load: {}", holder.ok("timings"));
-    step!();
-    holder.ok("request rh h");
-    step!();
-    holder.ok("pass rh h 1");
-    step!();
-    holder.ok("bind h 0");
-    step!();
-    let before = held(holder.pid());
-    step!();
-    demander.ok("load d 4 12 stored ram");
-    step!();
-    demander.ok("request r d");
-    step!();
-    demander.ok("pass r d 1");
-    step!();
-    for b in 0..4 {
-        assert_eq!(demander.ok(&format!("exact d {b} 12")), "true", "the demander binds block {b}");
-    }
-    // The holder's set took all but less than a page of the card: it gave back the rest.
-    let given = before.saturating_sub(held(holder.pid()));
-    step!();
-    assert!(given >= 3 * REGION_ALIGN, "the idle holder gave back {given} of the demander's {}", 4 * REGION_ALIGN);
-    step!();
-    assert_eq!(holder.ok("exact h 0 11"), "true", "the holder's live pin stayed");
-    step!();
-    demander.ok("unpin");
-    step!();
-    demander.ok("end r");
-    step!();
-    holder.ok("unpin");
-    step!();
-    holder.ok("end rh");
-    step!();
-    demander.exit();
-    holder.exit();
-    println!("PASS two processes contend; an idle holder gives back ({given} bytes) while its pins stay {uuid}");
-    step!();
-}
-
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_stray_write_to_a_kept_page_ends_only_its_writer() {
-    let (ledger, g, uuid) = tensord("sticky");
-    step!();
-    let mut w = Agent::spawn();
-    step!();
-    w.ok(&format!("open {}", g.uuid));
-    step!();
-    w.ok("load s 2 13 stored gpu");
-    step!();
-    w.ok("request r s");
-    step!();
-    w.ok("pass r s 1");
-    step!();
-    w.ok("bind s 0");
-    step!();
-    let fault = w.ok("stray");
-    step!();
-    assert!(fault.ends_with("sticky=true"), "a write to a kept, read-only page faults sticky: {fault}");
-    step!();
-    let pid = w.pid();
-    step!();
-    w.exit();
-    ledger.reap(pid);
-    step!();
-    let mut next = Agent::spawn();
-    step!();
-    next.ok(&format!("open {}", g.uuid));
-    step!();
-    next.ok("load s 2 13 stored ram");
-    step!();
-    next.ok("request r s");
-    step!();
-    next.ok("pass r s 1");
-    step!();
-    for b in 0..2 {
-        assert_eq!(next.ok(&format!("exact s {b} 13")), "true", "block {b} is the stored bytes: the write never landed");
-    }
-    let trace = next.ok("trace r");
-    step!();
-    let n = origins(&trace);
-    assert_eq!((n.get("Kept").copied(), n.get("Hit").copied(), n.get("Store")), (Some(2), Some(2), None), "both pages imported at load: {trace}");
-    step!();
-    next.ok("unpin");
-    step!();
-    let end = next.ok("end r");
-    step!();
-    assert!(end.contains("store=0"), "the kept pages came back, none copied: {end}");
-    step!();
-    next.exit();
-    println!("PASS a stray write to a kept page ends only its writer (fault {fault}; next process {trace}) {uuid}");
-    step!();
-}

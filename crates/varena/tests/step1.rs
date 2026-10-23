@@ -1,4 +1,4 @@
-//! Reviewer's probes, step 1 (one make_room loop). Host pages; run under `unshare --user --net`.
+//! Reviewer's probes, step 1 (one make_room loop), over binds and ranges. Host pages.
 use std::collections::HashSet;
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,7 +11,7 @@ use tensorfs::format::ObjectRef;
 use tensorfs::io::source::Source;
 use tensorfs::io::{Dst, ItemSource, ObjectRange};
 use varena::layout::{Item, Layout, Part, Region, REGION_ALIGN};
-use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Physical, Plan, Result, SetSpec, Step, Va};
+use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Physical, Result, SetSpec, Va};
 
 const P: u64 = REGION_ALIGN;
 
@@ -37,10 +37,6 @@ fn spec_filled(dir: &std::path::Path, uuid: &str, name: &str, pages: u64, fill: 
     let source = Source::files(vec![(obj, File::open(&path).unwrap())], false, 0);
     let fingerprint = Fingerprint::new(&layout, &[], fill, "release-1", "0/1", uuid);
     SetSpec { name: name.into(), layout: Arc::new(layout), source: Arc::new(source), fingerprint }
-}
-
-fn plan(steps: &[&[&str]]) -> Plan {
-    Plan { steps: steps.iter().map(|s| Step { sets: s.iter().map(|n| n.to_string()).collect(), passes: 1 }).collect() }
 }
 
 /// Binds every block of `set` once and lets it go (filled, idle).
@@ -102,6 +98,7 @@ struct Driver(Arc<Card>);
 
 impl Backend for Driver {
     fn capacity(&self) -> u64 { self.0.limit }
+    fn headroom(&self) -> u64 { self.0.host.headroom() }
     fn free(&self) -> Result<u64> { Ok(self.0.free()) }
     fn process_used(&self) -> Result<u64> { self.0.host.process_used() }
     fn opened_context(&self) -> u64 { 0 }
@@ -158,7 +155,7 @@ fn open(tag: &str, pages: u64) -> (tempfile::TempDir, String, Arc<Card>, Arc<Mem
     let uuid = format!("st1{tag}-{}", std::process::id());
     let card = Card::new(pages * P);
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: pages * P };
-    let mem = Arc::new(Memory::open(g, None, Box::new(Driver(card.clone()))).unwrap());
+    let mem = Arc::new(Memory::open(g, Box::new(Driver(card.clone()))).unwrap());
     (tempfile::tempdir().unwrap(), uuid, card, mem)
 }
 
@@ -167,13 +164,14 @@ fn close(uuid: &str, mem: Arc<Memory>) {
     varena::os::remove_table(uuid);
 }
 
-/// The hook waits on a page's release event, the state unlocked meanwhile: another thread's
-/// bind proceeds, and the hook returns once the event completes, never before.
+/// A bind's room waits on a page's release event, the state unlocked meanwhile: another
+/// thread's bind proceeds, and the bind returns once the event completes, never before.
 #[test]
 fn make_room_waits_on_a_release_event_without_holding_the_state() {
     let (dir, uuid, card, mem) = open("wait", 2);
     let x = mem.load(spec(dir.path(), &uuid, "x", 1), Level::Ram).unwrap();
     let y = mem.load(spec(dir.path(), &uuid, "y", 1), Level::Ram).unwrap();
+    let z = mem.load(spec(dir.path(), &uuid, "z", 1), Level::Ram).unwrap();
     // X let go with its release event pending (a kernel still reading it), Y idle after it.
     let pin = mem.bind(x, 0, 0).unwrap();
     if pin.fresh {
@@ -187,7 +185,7 @@ fn make_room_waits_on_a_release_event_without_holding_the_state() {
     let (tx, rx) = std::sync::mpsc::channel();
     let hook = std::thread::spawn({
         let mem = mem.clone();
-        move || tx.send(mem.make_room(P).map(drop).map_err(|e| e.code())).unwrap()
+        move || tx.send(mem.bind(z, 0, 0).map(drop).map_err(|e| e.code())).unwrap()
     });
     std::thread::sleep(Duration::from_millis(300));
     let early = rx.try_recv().ok();
@@ -228,9 +226,10 @@ fn make_room_never_takes_a_pinned_page_and_an_impossible_need_takes_nothing() {
         p
     }).collect();
     warm(&mem, b, 2);
-    let impossible = mem.make_room(3 * P).map(drop).map_err(|e| e.code());
+    let c = mem.load(spec(dir.path(), &uuid, "c", 3), Level::Ram).unwrap();
+    let impossible = mem.retain(c, &[0, 1, 2]).unwrap().prepare(0).map(drop).map_err(|e| e.code());
     let b_kept = (0..2).filter(|i| resident(&mem, b, *i)).count();
-    let possible = mem.make_room(2 * P).map(drop).map_err(|e| e.code());
+    let possible = mem.retain(c, &[0, 1]).unwrap().prepare(0).map(drop).map_err(|e| e.code());
     // SAFETY: mapped pages pinned by this test; read only.
     let a_intact = pins.iter().all(|p| unsafe { *(p.ptr as *const u8) } == 7);
     drop(pins);
@@ -241,367 +240,3 @@ fn make_room_never_takes_a_pinned_page_and_an_impossible_need_takes_nothing() {
     assert!(possible.is_ok() && a_intact, "the need the idle pages cover failed, or a pinned page was taken");
 }
 
-/// The order: another set's idle page (N, least recently used), then a later step's (D), then
-/// caches nobody holds, then the current step's (W), furthest next use first.
-#[test]
-fn make_room_takes_idle_then_caches_then_furthest_declared() {
-    let (dir, uuid, card, mem) = open("order", 5);
-    let a = mem.load(spec(dir.path(), &uuid, "a", 1), Level::Ram).unwrap();
-    let b = mem.load(spec(dir.path(), &uuid, "b", 1), Level::Ram).unwrap();
-    let n = mem.load(spec(dir.path(), &uuid, "n", 1), Level::Ram).unwrap();
-    let shrunk = Arc::new(AtomicU64::new(0));
-    let cache = mem.cache("graphs", &[], {
-        let shrunk = shrunk.clone();
-        move |want| {
-            shrunk.fetch_add(want, Ordering::SeqCst);
-            want
-        }
-    });
-    warm(&mem, n, 1);
-    warm(&mem, a, 1);
-    warm(&mem, b, 1);
-    let r = mem.request("r", plan(&[&["a"], &["b"]])).unwrap();
-    // The cache holds one page of torch's bytes (counted as a segment of this process).
-    assert!(card.take(P));
-    let _segment = mem.resident(P);
-    mem.cached(cache, P);
-    let free = card.free();
-    let first = mem.make_room(free + P).map(drop).map_err(|e| e.code());
-    let after_first = (resident(&mem, n, 0), shrunk.load(Ordering::SeqCst), resident(&mem, b, 0), resident(&mem, a, 0));
-    println!("free {free}; one page more: {first:?}; then (n resident, cache shrunk, b resident, a resident) = {after_first:?}");
-    drop(r);
-    close(&uuid, mem);
-    assert!(!after_first.0 && after_first.1 == 0 && after_first.2 && after_first.3, "the first page taken was not the idle N page");
-}
-
-/// The lead's ruling (S4's v14 graphs): a streaming set's room comes from another set's idle
-/// weight pages, though a later step uses them, before that set's graph cache. A page refills from
-/// the page cache; a graph recaptures far slower.
-#[test]
-fn a_streaming_sets_room_takes_another_sets_idle_pages_before_its_graph_cache() {
-    let (dir, uuid, card, mem) = open("graphorder", 5);
-    let dit = mem.load(spec(dir.path(), &uuid, "dit", 3), Level::Ram).unwrap();
-    let vae = mem.load(spec(dir.path(), &uuid, "vae", 2), Level::Ram).unwrap();
-    warm(&mem, vae, 2);
-    let shrunk = Arc::new(AtomicU64::new(0));
-    let cache = mem.cache("vae-graphs", &[vae], {
-        let shrunk = shrunk.clone();
-        move |want| {
-            shrunk.fetch_add(want, Ordering::SeqCst);
-            want
-        }
-    });
-    // The VAE's captured graphs: one page of torch's segments, touched after its weights.
-    assert!(card.take(P));
-    let _segment = mem.resident(P);
-    mem.cached(cache, P);
-    let r = mem.request("r", plan(&[&["dit"], &["vae"]])).unwrap();
-    let pass = r.pass(dit, "k").unwrap();
-    let pins: Vec<varena::Pin> = (0..3).map(|b| mem.bind(dit, b, 0).unwrap()).collect();
-    let shrunk = shrunk.load(Ordering::SeqCst);
-    drop(pins);
-    pass.end(0);
-    r.end();
-    let vae_left = (0..2).filter(|b| resident(&mem, vae, *b)).count();
-    close(&uuid, mem);
-    assert_eq!((shrunk, vae_left), (0, 1), "(cache bytes shrunk, VAE pages left): one VAE page goes, the graphs stay");
-}
-
-/// The lead's Belady ruling (S4's graph-leases eviction): one streaming set, nothing else
-/// loaded, its graph cache naming it. A bind short of room during its pass takes the set's
-/// already-run pages (next used a pass ahead, as the graph is: a tie goes to the page) before the
-/// graph.
-#[test]
-fn a_streaming_sets_room_takes_its_run_pages_before_its_own_graph() {
-    let (dir, uuid, card, mem) = open("owngraph", 4);
-    let dit = mem.load(spec(dir.path(), &uuid, "dit", 4), Level::Ram).unwrap();
-    let shrunk = Arc::new(AtomicU64::new(0));
-    let cache = mem.cache("dit-graphs", &[dit], {
-        let shrunk = shrunk.clone();
-        move |want| {
-            shrunk.fetch_add(want, Ordering::SeqCst);
-            want
-        }
-    });
-    assert!(card.take(P));
-    let _segment = mem.resident(P);
-    mem.cached(cache, P);
-    let r = mem.request("r", plan(&[&["dit"]])).unwrap();
-    let pass = r.pass(dit, "k").unwrap();
-    warm(&mem, dit, 3);
-    // The card is full: block 3's room comes from blocks already run, not from the graph.
-    let last = mem.bind(dit, 3, 0).map(|p| {
-        if p.fresh {
-            p.filled();
-        }
-    }).map_err(|e| e.code());
-    let shrunk = shrunk.load(Ordering::SeqCst);
-    pass.end(0);
-    r.end();
-    let first = resident(&mem, dit, 0);
-    close(&uuid, mem);
-    assert_eq!((last, shrunk, first), (Ok(()), 0, false), "(block 3 bound, graph bytes shrunk, block 0 resident)");
-}
-
-/// Native a_bind_on_a_full_card_takes_idle_pages (S5's step-3 check on 581769ea8): an idle set
-/// loaded with no request open is custody's at once; a card then full of it and of foreign
-/// bytes still gives a bind its room, the kept page withdrawn and taken; then exhausted; then
-/// served once room returns.
-#[test]
-fn a_bind_on_a_full_card_withdraws_and_takes_a_kept_idle_page() {
-    assert!(varena::os::namespace(&format!("st1{}-", std::process::id())));
-    let uuid = format!("st1keptfull-{}", std::process::id());
-    let card = Card::new(4 * P);
-    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * P };
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let mem = Arc::new(Memory::open(g, None, Box::new(Driver(card.clone()))).unwrap());
-    let dir = tempfile::tempdir().unwrap();
-    let m = mem.load(spec_filled(dir.path(), &uuid, "m", 2, Fill::Stored), Level::Ram).unwrap();
-    mem.load(spec_filled(dir.path(), &uuid, "idle", 1, Fill::Stored), Level::Gpu).unwrap();
-    assert_eq!(card.exports.load(Ordering::SeqCst), 1, "the idle load is kept at once");
-    let r = mem.request("r", plan(&[&["m"]])).unwrap();
-    let pass = r.pass(m, "k").unwrap();
-    // Everything else on the card is foreign.
-    let foreign = card.free();
-    assert!(card.take(foreign));
-    let first = mem.bind(m, 0, 0).map_err(|e| e.to_string());
-    let second = mem.bind(m, 1, 0).map(drop).map_err(|e| e.code());
-    card.used.fetch_sub(foreign, Ordering::SeqCst);
-    let third = mem.bind(m, 1, 0).map(drop).map_err(|e| e.code());
-    let first = first.map(drop);
-    pass.end(0);
-    let stats = r.end();
-    close(&uuid, mem);
-    assert!(first.is_ok(), "the kept idle page makes room: {first:?}");
-    assert_eq!((second, third), (Err("EXHAUSTED"), Ok(())), "then nothing is left; then room came back");
-    assert!(stats.evicted.iter().sum::<u64>() >= P, "{stats:?}");
-}
-
-/// The lead's ruling (S2's round 3: an activation larger than free memory, the hook never
-/// takes a pinned page): an idle model's pages are custody's (kept at load), and the hook never
-/// withdraws one. A request's open withdraws them, as a pass start does, so the hook inside the
-/// request, before any pass, takes them.
-#[test]
-fn a_requests_open_withdraws_kept_idle_pages_for_the_hook() {
-    assert!(varena::os::namespace(&format!("st1{}-", std::process::id())));
-    let uuid = format!("st1openkept-{}", std::process::id());
-    let card = Card::new(4 * P);
-    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * P };
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let mem = Arc::new(Memory::open(g, None, Box::new(Driver(card.clone()))).unwrap());
-    let dir = tempfile::tempdir().unwrap();
-    mem.load(spec_filled(dir.path(), &uuid, "idle", 4, Fill::Stored), Level::Gpu).unwrap();
-    let kept = card.exports.load(Ordering::SeqCst);
-    let outside = mem.make_room(P).map(drop).map_err(|e| e.code());
-    let r = mem.request("r", plan(&[&["m"]])).unwrap();
-    let inside = mem.make_room(P).map(|c| c.resident());
-    let took = inside.is_ok() && card.take(P);
-    drop(inside);
-    r.end();
-    close(&uuid, mem);
-    assert_eq!((kept, outside, took), (4, Err("EXHAUSTED"), true), "(pages kept at load, the hook with no request open, the hook inside the request took a page)");
-}
-
-/// The bytes make_room freed are nobody's: another thread's bind maps into them before the
-/// hook's segment, which the driver then refuses, though an idle page was left to take.
-#[test]
-fn the_room_the_hook_made_is_not_held_for_its_segment() {
-    let (dir, uuid, card, mem) = open("steal", 2);
-    let x = mem.load(spec(dir.path(), &uuid, "x", 1), Level::Ram).unwrap();
-    let y = mem.load(spec(dir.path(), &uuid, "y", 1), Level::Ram).unwrap();
-    let z = mem.load(spec(dir.path(), &uuid, "z", 1), Level::Ram).unwrap();
-    warm(&mem, x, 1);
-    warm(&mem, y, 1);
-    // The hook: room for one page of torch's, claimed for its segment.
-    let made = mem.make_room(P);
-    // Meanwhile (between the hook's make_room and its segment) another thread binds a page.
-    let bound = mem.bind(z, 0, 0).map(|p| {
-        if p.fresh {
-            p.filled();
-        }
-    });
-    let segment = card.take(P);
-    let _resident = match (&made, segment) {
-        (Ok(_), true) => made.ok().map(|c| c.resident()),
-        _ => None,
-    };
-    let made = _resident.as_ref().map(|_| ());
-    let evictable_left = resident(&mem, y, 0) || resident(&mem, z, 0);
-    println!("claim held: {made:?}; another bind {:?}; the hook's segment served: {segment}; an idle page was left to take: {evictable_left}", bound.is_ok());
-    close(&uuid, mem);
-    assert!(segment || !evictable_left, "the hook's segment was refused while an idle page was left");
-}
-
-/// The hook runs caches' shrinks (the caller's code: Python, the GIL, torch's frees) inside the
-/// allocation, on the allocating thread.
-#[test]
-fn make_room_runs_a_caches_shrink_inside_the_hook() {
-    let (_dir, uuid, card, mem) = open("shrink", 2);
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let cache = mem.cache("graphs", &[], {
-        let calls = calls.clone();
-        move |want| {
-            calls.lock().push(std::thread::current().name().unwrap_or("?").to_string());
-            want
-        }
-    });
-    assert!(card.take(2 * P));
-    let _segments = mem.resident(2 * P);
-    mem.cached(cache, 2 * P);
-    let hook = std::thread::Builder::new().name("torch-allocating-thread".into()).spawn({
-        let mem = mem.clone();
-        move || mem.make_room(P).map(drop).map_err(|e| e.code())
-    }).unwrap();
-    let made = hook.join().unwrap();
-    let calls = calls.lock().clone();
-    println!("make_room {made:?}; shrink callbacks run on: {calls:?}");
-    close(&uuid, mem);
-    assert!(calls.is_empty(), "the allocator hook ran a cache's shrink (caller code) inside the allocation");
-}
-
-/// Ruling 2's other half: caches still shrink at a bind (outside the hook), on the binding
-/// thread, so a bind short of room with only a cache to give is served.
-#[test]
-fn a_bind_still_shrinks_a_cache_for_its_room() {
-    let (dir, uuid, card, mem) = open("bindshrink", 2);
-    let x = mem.load(spec(dir.path(), &uuid, "x", 1), Level::Ram).unwrap();
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    assert!(card.take(2 * P));
-    // Torch's segments holding the cache: the shrink frees them (the driver and the token).
-    let segments = Arc::new(Mutex::new(Some(mem.resident(2 * P))));
-    let card2 = card.clone();
-    let cache = mem.cache("graphs", &[], {
-        let (calls, segments) = (calls.clone(), segments.clone());
-        move |want| {
-            calls.lock().push(std::thread::current().name().unwrap_or("?").to_string());
-            if segments.lock().take().is_some() {
-                card2.used.fetch_sub(2 * P, Ordering::SeqCst);
-            }
-            want
-        }
-    });
-    mem.cached(cache, 2 * P);
-    let bound = std::thread::Builder::new().name("binding-thread".into()).spawn({
-        let mem = mem.clone();
-        move || mem.bind(x, 0, 0).map(|p| {
-            if p.fresh {
-                p.filled();
-            }
-        }).map_err(|e| e.code())
-    }).unwrap().join().unwrap();
-    let calls = calls.lock().clone();
-    println!("bind with only a cache to give: {bound:?}; shrinks on {calls:?}");
-    segments.lock().take();
-    close(&uuid, mem);
-    assert!(bound.is_ok() && calls.iter().all(|t| t == "binding-thread") && !calls.is_empty(), "a bind no longer shrinks caches for its room");
-}
-
-/// The hook's unmap waits for the mechanism thread's queue up to it (`settle_to`): a Map queued
-/// before it for another thread's bind, stuck behind device work (as cuMemSetAccess can be),
-/// holds the allocation though the hook's own page is idle.
-#[test]
-fn the_hooks_unmap_waits_behind_an_unrelated_map() {
-    let (dir, uuid, card, mem) = open("mech", 2);
-    let x = mem.load(spec(dir.path(), &uuid, "x", 1), Level::Ram).unwrap();
-    let z = mem.load(spec(dir.path(), &uuid, "z", 1), Level::Ram).unwrap();
-    warm(&mem, x, 1);
-    *card.hold_create.lock() = true;
-    // Another thread binds z: its Map is queued and stuck in create.
-    let binder = std::thread::spawn({
-        let mem = mem.clone();
-        move || drop(mem.bind(z, 0, 0).map(|p| {
-            if p.fresh {
-                p.filled();
-            }
-        }))
-    });
-    std::thread::sleep(Duration::from_millis(200));
-    let (tx, rx) = std::sync::mpsc::channel();
-    let hook = std::thread::spawn({
-        let mem = mem.clone();
-        move || tx.send(mem.make_room(P).map(drop).map_err(|e| e.code())).unwrap()
-    });
-    let within = rx.recv_timeout(Duration::from_secs(2));
-    *card.hold_create.lock() = false;
-    card.create_gate.notify_all();
-    let after = if within.is_err() { rx.recv_timeout(Duration::from_secs(5)).ok() } else { None };
-    hook.join().unwrap();
-    binder.join().unwrap();
-    println!("the hook's make_room with an unrelated Map stuck ahead: within 2 s {within:?}; after the map ran {after:?}");
-    close(&uuid, mem);
-    assert!(within.is_ok(), "the hook waited behind an unrelated mechanism map");
-}
-
-/// F1 on the watermark's path: the hook streams the running set's upper pages in place, on its own thread, so it never
-/// waits behind an unrelated mechanism map either. A request runs over a set that fills the card. Another thread's
-/// bind streams one of its pages out through the mechanism, then sticks in create. The hook's make_room is still
-/// served at once, from the set's next upper page.
-#[test]
-fn the_hooks_streaming_never_waits_behind_an_unrelated_map() {
-    let (dir, uuid, card, mem) = open("streammech", 6);
-    let x = mem.load(spec(dir.path(), &uuid, "x", 6), Level::Ram).unwrap();
-    let z = mem.load(spec(dir.path(), &uuid, "z", 1), Level::Ram).unwrap();
-    let r = mem.request("r", plan(&[&["x"]])).unwrap();
-    let pass = r.pass(x, "fwd|1").unwrap();
-    warm(&mem, x, 6);
-    *card.hold_create.lock() = true;
-    // Another thread binds z: its room comes from x streaming, then its Map is queued and stuck in create.
-    let binder = std::thread::spawn({
-        let mem = mem.clone();
-        move || drop(mem.bind(z, 0, 0).map(|p| {
-            if p.fresh {
-                p.filled();
-            }
-        }))
-    });
-    std::thread::sleep(Duration::from_millis(200));
-    let (tx, rx) = std::sync::mpsc::channel();
-    let hook = std::thread::spawn({
-        let mem = mem.clone();
-        move || tx.send(mem.make_room(P).map(drop).map_err(|e| e.code())).unwrap()
-    });
-    let within = rx.recv_timeout(Duration::from_secs(2));
-    *card.hold_create.lock() = false;
-    card.create_gate.notify_all();
-    let after = if within.is_err() { rx.recv_timeout(Duration::from_secs(5)).ok() } else { None };
-    hook.join().unwrap();
-    binder.join().unwrap();
-    println!("the hook's streaming make_room with an unrelated Map stuck ahead: within 2 s {within:?}; after the map ran {after:?}");
-    pass.end(0);
-    drop(r);
-    close(&uuid, mem);
-    assert!(matches!(within, Ok(Ok(()))), "the hook's streaming waited behind an unrelated mechanism map, or took nothing");
-}
-
-/// F3's rule: the hook never waits on, or takes, a page being filled. With nothing else to take
-/// and another thread's page stuck filling (its map behind device work, its read on disk), the
-/// hook returns at once, refused.
-#[test]
-fn the_hook_never_waits_on_a_filling_page() {
-    let (dir, uuid, card, mem) = open("filling", 1);
-    let z = mem.load(spec(dir.path(), &uuid, "z", 1), Level::Ram).unwrap();
-    *card.hold_create.lock() = true;
-    let binder = std::thread::spawn({
-        let mem = mem.clone();
-        move || drop(mem.bind(z, 0, 0).map(|p| {
-            if p.fresh {
-                p.filled();
-            }
-        }))
-    });
-    std::thread::sleep(Duration::from_millis(200));
-    let (tx, rx) = std::sync::mpsc::channel();
-    let hook = std::thread::spawn({
-        let mem = mem.clone();
-        move || tx.send(mem.make_room(P).map(drop).map_err(|e| e.code())).unwrap()
-    });
-    let within = rx.recv_timeout(Duration::from_secs(2));
-    *card.hold_create.lock() = false;
-    card.create_gate.notify_all();
-    let after = if within.is_err() { rx.recv_timeout(Duration::from_secs(5)).ok() } else { None };
-    hook.join().unwrap();
-    binder.join().unwrap();
-    println!("the hook with only a filling page around: within 2 s {within:?}; after the fill {after:?}");
-    close(&uuid, mem);
-    assert!(within.is_ok(), "the hook waited on another thread's fill");
-}

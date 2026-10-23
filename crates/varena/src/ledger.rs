@@ -1825,24 +1825,6 @@ mod tests {
         os::unlink(&gpu.uuid);
     }
 
-    /// Review 2, finding 14: a standalone engine's table is unlinked when its last row leaves
-    /// (custody stops once nobody is connected and nothing is kept).
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_standalone_table_goes_with_its_last_row() {
-        let gpu = GpuId { uuid: format!("unit-{}-unlink", std::process::id()), model: "host".into(), memory: 1 << 30 };
-        // TensorD's wake, without a TensorD holding the table open.
-        let wake = os::wake_bind(os::euid(), &gpu.uuid).unwrap().unwrap();
-        let mem = crate::Memory::open(gpu.clone(), None, Box::new(crate::HostBackend::new(gpu.memory))).unwrap();
-        // SAFETY: geteuid reads a process attribute.
-        let path = format!("/dev/shm/cozy-varena-{}-{}", unsafe { libc::geteuid() }, gpu.uuid);
-        assert!(std::path::Path::new(&path).exists());
-        drop(mem);
-        while std::path::Path::new(&path).exists() {
-            os::wake_await(&wake).unwrap();
-        }
-    }
-
     #[test]
     fn physical_facts_are_published_without_turning_promises_into_device_usage() {
         let gpu = GpuId { uuid: format!("unit-{}-physical-facts", std::process::id()), model: "host".into(), memory: 64 << 20 };

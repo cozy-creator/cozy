@@ -179,6 +179,11 @@ impl Torch {
         self.sh.revive(&a, &mut st);
     }
 
+    /// Every span mapped now: the arenas' and the idle list's (an atomic read).
+    pub fn mapped(&self) -> u64 {
+        self.sh.mapped.load(Acquire)
+    }
+
     /// The bytes `owner`'s arena maps now.
     pub fn mapped_by(&self, owner: Owner) -> u64 {
         self.sh.arenas.lock().get(&owner).cloned().map_or(0, |a| a.st.lock().mapped)

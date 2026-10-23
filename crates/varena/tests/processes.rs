@@ -1,5 +1,4 @@
-//! The real Memory, ledger, custody and RAM tier over host pages, across real processes (Unix:
-//! the agents take their grants as descriptors).
+//! The real Memory over host pages, across real processes (Unix: the agents dial a lease socket).
 
 #[cfg(unix)]
 #[path = "processes/cases.rs"]
@@ -12,5 +11,5 @@ fn main() {
 
 #[cfg(not(unix))]
 fn main() {
-    println!("processes: the agents take their grants as Unix descriptors; skipped here");
+    println!("processes: the agents dial a Unix lease socket; skipped here");
 }

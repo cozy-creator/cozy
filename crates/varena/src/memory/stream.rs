@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use parking_lot::MutexGuard;
 
-use super::{Home, Inner, Job, Mech, State, COPY};
+use super::{Home, Inner, Job, Mech, State};
 use crate::backend::{Access, Event, Physical, Va};
 use crate::table::{Class, Key};
-use crate::{Origin, Result};
+use crate::Result;
 
 /// One being filled, one being read, one queued: the slots a forward needs to overlap its copies and its compute.
 pub(super) const SLOTS: usize = 3;
@@ -31,14 +31,11 @@ pub(super) struct Streamed {
     pub(super) unmapped: u64,
     pub(super) pending: u64,
     pub(super) events: Vec<u64>,
-    /// For the hook: pages it takes in place on its own thread (never through the mechanism queue), and their bytes.
-    pub(super) takes: Vec<Key>,
-    pub(super) taking: u64,
 }
 
 impl Streamed {
     fn covers(&self, want: u64) -> bool {
-        self.unmapped + self.taking + self.pending >= want
+        self.unmapped + self.pending >= want
     }
 }
 
@@ -53,19 +50,15 @@ pub(super) enum StreamIn {
 }
 
 impl State {
-    /// A page that is the set's slot now: mapped at an upper block, never custody's (its memory is overwritten next).
+    /// The set's slots now: its pages mapped at upper blocks (their memory is overwritten next).
     pub(super) fn slots(&self, set: u32, watermark: u32) -> usize {
-        self.homes.keys().filter(|k| k.0 == set && self.slot(**k, watermark)).count()
+        self.homes.keys().filter(|k| k.0 == set && k.1 >= watermark).count()
     }
 
-    fn slot(&self, key: Key, watermark: u32) -> bool {
-        key.1 >= watermark && self.homes.get(&key).is_some_and(|h| !h.exported && !h.keeping)
-    }
-
-    /// No pin, and nothing writes or protects it: a slot that may move.
+    /// No pin, and nothing writes it: a slot that may move.
     fn movable(&self, key: Key) -> bool {
         self.table.page(key).is_some_and(|p| p.pins.is_empty())
-            && self.homes.get(&key).is_some_and(|h| h.phys.is_some() && !h.filling && !h.landing && !h.transforming && !h.protecting)
+            && self.homes.get(&key).is_some_and(|h| h.phys.is_some() && !h.filling && !h.landing && !h.transforming)
     }
 
     fn last_use(&self, key: Key) -> u64 {
@@ -82,22 +75,22 @@ impl State {
 
 impl Inner {
     /// `make_room`'s rung before the running set's own pages. It lowers `set`'s watermark until the upper pages free
-    /// `want`, or until the whole set streams. It keeps the [`SLOTS`] most recently used upper pages that are not
-    /// custody's as slots, since a slot's memory is overwritten next. With the whole set streaming and still short, the
-    /// slots go too, least recently used first, down to one: the floor. Each page is taken once ([`Inner::give`]).
-    pub(super) fn stream(&self, st: &mut State, set: u32, want: u64, req: Option<u64>, hook: bool) -> Result<Streamed> {
+    /// `want`, or until the whole set streams. It keeps the [`SLOTS`] most recently used upper pages as slots. With the
+    /// whole set streaming and still short, the slots go too, least recently used first, down to one: the floor. Each
+    /// page is taken once ([`Inner::give`]).
+    pub(super) fn stream(&self, st: &mut State, set: u32, want: u64, req: Option<u64>) -> Result<Streamed> {
         let blocks = st.mech(set)?.spec.layout.regions.len() as u32;
         let mut watermark = st.streams.get(&set).map_or(blocks, |s| s.watermark);
         let (mut taken, mut seen) = (Streamed::default(), HashSet::new());
         let slots = loop {
             let upper = st.upper(set, watermark);
-            let slots: Vec<Key> = upper.iter().filter(|k| st.slot(**k, watermark)).take(SLOTS).copied().collect();
+            let slots: Vec<Key> = upper.iter().take(SLOTS).copied().collect();
             for key in upper.into_iter().filter(|k| !slots.contains(k)) {
                 if taken.covers(want) {
                     break;
                 }
                 if seen.insert(key) {
-                    self.give(st, key, req, hook, &mut taken)?;
+                    self.give(st, key, req, &mut taken)?;
                 }
             }
             if taken.covers(want) || watermark == 0 {
@@ -109,30 +102,26 @@ impl Inner {
             if taken.covers(want) {
                 break;
             }
-            self.give(st, key, req, hook, &mut taken)?;
+            self.give(st, key, req, &mut taken)?;
         }
         st.streams.insert(set, Streaming { watermark, req });
         Ok(taken)
     }
 
-    /// `key` toward `taken`: unmapped now; for the hook, taken in place on its own thread (`takes`); or once its pending
-    /// release events complete (`events`, waited on by the caller with no lock held). A page in use stays until its
-    /// release; the hook leaves custody's pages alone (it makes no custody call).
-    fn give(&self, st: &mut State, key: Key, req: Option<u64>, hook: bool, taken: &mut Streamed) -> Result<()> {
+    /// `key` toward `taken`: unmapped now, or once its pending release events complete (`events`, waited on by the
+    /// caller with no lock held). A page in use stays until its release.
+    fn give(&self, st: &mut State, key: Key, req: Option<u64>, taken: &mut Streamed) -> Result<()> {
         let Some(page) = st.table.page(key) else { return Ok(()) };
-        let busy = !page.pins.is_empty() || st.homes.get(&key).is_some_and(|h| h.filling || h.landing || h.transforming || h.protecting);
-        if busy || (hook && page.kept) {
+        let busy = !page.pins.is_empty() || st.homes.get(&key).is_some_and(|h| h.filling || h.landing || h.transforming);
+        if busy {
             return Ok(());
         }
         let (releasing, span) = (page.releasing.clone(), page.bytes);
         if !releasing.is_empty() {
             taken.events.extend(releasing);
             taken.pending += span;
-        } else if hook {
-            taken.takes.push(key);
-            taken.taking += span;
         } else {
-            self.unmap(st, key, Class::W, req, true)?;
+            self.unmap(st, key, Class::W, req)?;
             taken.unmapped += span;
         }
         Ok(())
@@ -146,7 +135,7 @@ impl Inner {
         if key.1 < watermark || st.homes.contains_key(&key) {
             return Ok(StreamIn::No);
         }
-        let slots: Vec<Key> = st.homes.keys().filter(|k| k.0 == key.0 && st.slot(**k, watermark)).copied().collect();
+        let slots: Vec<Key> = st.homes.keys().filter(|k| k.0 == key.0 && k.1 >= watermark).copied().collect();
         // Mid-pass a slot moves, never a new one made (`regrow` refills them at a boundary);
         // the first is made the usual way.
         if slots.is_empty() {
@@ -168,14 +157,13 @@ impl Inner {
         st.events.values_mut().for_each(|q| q.retain(|(_, k)| *k != from));
         let Some(Home { phys: Some(phys), ready, .. }) = st.homes.remove(&from) else { return Ok(StreamIn::Wait) };
         self.backend.retire(ready);
-        st.transit += phys.len;
         st.sync(from);
         let gen = st.tick();
         let identity = st.mech(key.0)?.key.clone();
         // Counted mapped, filling, now: the mechanism moves the slot (no new memory), then queues the fill.
-        st.homes.insert(key, Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, transforming: false, exported: false, origin: Origin::Store, speculative: false, identity, keep_after: false, keeping: false, protecting: false, reclaiming: false, landing: false });
+        st.homes.insert(key, Home::new(gen, false, identity));
         st.sync(key);
-        self.mech.post(Mech::Move { key, gen, va, from: from_off, off, span, phys, after, job: Job { key, gen, req, span, after: vec![] } }, 0);
+        self.mech.post(Mech::Move { key, gen, va, from: from_off, off, span, phys, after, job: Job { key, gen, req, span, after: vec![] } });
         Ok(StreamIn::Moved)
     }
 
@@ -194,11 +182,8 @@ impl Inner {
         let moved = after.iter().try_for_each(|e| self.backend.finish(*e))
             .and_then(|()| self.backend.unmap(va, from, span))
             .and_then(|()| self.backend.map(va, off, &phys, Access::ReadWrite));
-        let len = phys.len;
         if let Err(error) = moved {
-            let mut st = self.state.lock();
-            st.transit = st.transit.saturating_sub(len);
-            self.lost_backing(&mut st, span, false, error);
+            self.lost_backing(error);
             return;
         }
         after.into_iter().for_each(|e| self.backend.retire(e));
@@ -206,15 +191,11 @@ impl Inner {
         if !st.homes.get(&key).is_some_and(|h| h.gen == gen) {
             drop(st);
             self.commit_page(&phys);
-            let gone = self.backend.unmap(va, off, span).and_then(|()| self.give_page(phys));
-            let mut st = self.state.lock();
-            st.transit = st.transit.saturating_sub(len);
-            if let Err(error) = gone {
-                self.lost_backing(&mut st, span, false, error);
+            if let Err(error) = self.backend.unmap(va, off, span).and_then(|()| self.give_page(phys)) {
+                self.lost_backing(error);
             }
             return;
         }
-        st.transit = st.transit.saturating_sub(len);
         if let Some(h) = st.homes.get_mut(&key) {
             h.phys = Some(phys);
         }

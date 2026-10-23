@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -54,7 +53,7 @@ pub struct Record {
     pub slots: Vec<u32>,
     /// Its measured production (or capture) time.
     pub cost_ns: u64,
-    /// Its last unpin, in ns since the process's first region.
+    /// Its last use, CLOCK_MONOTONIC ns (machine-wide).
     pub last_use: u64,
     /// Its advice: the plan step of its next use.
     pub next_use: Option<u32>,
@@ -98,9 +97,16 @@ impl Live {
 /// Every live region of the process: the manager's Reclaim finds its victim here.
 static LIVE: Mutex<BTreeMap<u64, Live>> = Mutex::new(BTreeMap::new());
 
+/// The machine-wide clock the manager ranks regions by (CLOCK_MONOTONIC ns); elsewhere, this
+/// process's own.
 fn now_ns() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    #[cfg(unix)]
+    return crate::memory::monotonic_ns();
+    #[cfg(not(unix))]
+    {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
 }
 
 /// A reclaim deferred by a pin runs here at the last unpin: never on the unpinning thread, which
@@ -567,8 +573,8 @@ impl Drop for GraphRegion {
 /// What a cut site sizes from (§11; S4's plan §5).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Room {
-    /// Allocatable now: the manager's free bytes net of the reserved pool (standalone: the device's
-    /// free bytes less H), plus this process's free list (its idle spans).
+    /// Allocatable now: the manager's free bytes net of the reserved pool (standalone: the budget
+    /// left), plus this process's free list (its idle spans).
     pub free: u64,
     /// Reclaimable without touching the step's sets: the manager's figure for other tenants and its
     /// page cache, plus this process's unpinned regions and its idle pages outside the step's sets.
@@ -670,10 +676,7 @@ impl Memory {
             })
             .collect();
         let regions: u64 = torch.as_ref().map_or(0, |t| unpinned.iter().map(|id| t.mapped_by(Owner::Region(*id))).sum());
-        let (free, others) = match self.figures() {
-            Some(f) => (f.free, f.revocable),
-            None => (self.standalone_free(), 0),
-        };
+        let (free, others) = (self.spare(), self.figures().map_or(0, |f| f.revocable));
         Room { free: free + float, cold: others + regions + idle_pages, warm, granularity: self.granularity(), floor: SLOTS * largest }
     }
 }

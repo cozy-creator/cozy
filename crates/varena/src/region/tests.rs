@@ -92,8 +92,7 @@ fn a_managers_reclaim_reaches_the_region_and_its_facts_follow() {
     let uuid = format!("region-frames{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: card };
     assert!(os::namespace(&format!("test{}-", std::process::id())));
-    let _ledger = crate::Ledger::create(&g, None).unwrap();
-    let mem = Memory::open(g, None, Box::new(HostBackend::new(card))).unwrap();
+    let mem = Memory::open(g, Box::new(HostBackend::new(card))).unwrap();
     let (theirs, ours) = UnixStream::pair().unwrap();
     let (manager, heard) = standin(theirs);
     assert_eq!(mem.lease_over(ours).unwrap(), None, "leased, and torch served from grants");
