@@ -184,6 +184,8 @@ class Request:
     def plan(self, plan: list[tuple[list[str], int]]) -> None:
         """Replaces the plan; its cursor starts over."""
 
+    def yielding(self) -> Yielded:
+        """The request waits on a child call until the guard ends."""
     def reset_peak(self) -> int:
         """Its torch arena's high-water since the last call or pass start, restarting there."""
     def allocating(self, memory: Memory) -> Allocating:
@@ -193,6 +195,10 @@ class Request:
     def stats(self) -> Stats: ...
     def end(self) -> Stats:
         """Ends it: its pins and caches go."""
+
+class Yielded:
+    def end(self) -> None:
+        """The wait on the child call is over."""
 
 class Region:
     """A long-lived intermediate in an arena of its own; `close` (or its drop) releases it."""
