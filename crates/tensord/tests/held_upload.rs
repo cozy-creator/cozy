@@ -513,7 +513,7 @@ fn a_thin_folder_upload_keeps_the_warm_run_cancellation_gate() {
 fn a_failed_ref_update_retries_the_exact_held_tree_without_uploading_admitted_blobs() {
     let fixture = Fixture::new();
     let http = Http::new(3);
-    let failed = fixture.submit("first", &http.origin, "f32");
+    let failed = fixture.submit("first", &http.origin, "model.f32.cozytensors");
     let failure = fixture.settled(&failed);
     assert_eq!(failure.state, State::Failed);
     assert_eq!(
@@ -535,7 +535,7 @@ fn a_failed_ref_update_retries_the_exact_held_tree_without_uploading_admitted_bl
     let sent = http.state.puts.lock().unwrap().len();
     assert!(sent > 0);
     http.state.mode.store(0, Ordering::Release);
-    let retry = fixture.submit("retry", &http.origin, "f32");
+    let retry = fixture.submit("retry", &http.origin, "model.f32.cozytensors");
     let result = fixture.settled(&retry);
     assert_eq!(result.state, State::Completed, "{:?}", result.failure);
     assert_eq!(
@@ -581,7 +581,7 @@ fn a_failed_ref_update_retries_the_exact_held_tree_without_uploading_admitted_bl
         State::Failed,
         "retry does not rewrite the original failure"
     );
-    let repeat = fixture.submit("repeat", &http.origin, "f32");
+    let repeat = fixture.submit("repeat", &http.origin, "model.f32.cozytensors");
     let repeat = fixture.settled(&repeat);
     assert_eq!(repeat.state, State::Completed);
     assert_eq!(
@@ -624,7 +624,7 @@ fn held_tree_variant_errors_do_not_publish_or_fall_back_to_the_hub() {
         );
     }
     std::fs::remove_file(fixture.store.path(&fixture.tree).unwrap()).unwrap();
-    let absent = fixture.submit("missing-local-tree", &http.origin, "f32");
+    let absent = fixture.submit("missing-local-tree", &http.origin, "model.f32.cozytensors");
     let failure = fixture.settled(&absent);
     assert_eq!(failure.state, State::Failed);
     assert_eq!(
@@ -641,7 +641,7 @@ fn held_tree_variant_errors_do_not_publish_or_fall_back_to_the_hub() {
 fn cancellation_stops_before_ref_finalization_and_is_refused_after_commit() {
     let fixture = Fixture::new();
     let before = Http::new(1);
-    let run = fixture.submit("cancel-before", &before.origin, "f32");
+    let run = fixture.submit("cancel-before", &before.origin, "model.f32.cozytensors");
     before.wait();
     fixture.runs.service.engine.cancel(&run, "owner").unwrap();
     before.release();
@@ -649,7 +649,7 @@ fn cancellation_stops_before_ref_finalization_and_is_refused_after_commit() {
     assert!(!before.published());
 
     let after = Http::new(2);
-    let run = fixture.submit("cancel-after", &after.origin, "f32");
+    let run = fixture.submit("cancel-after", &after.origin, "model.f32.cozytensors");
     after.wait();
     assert_eq!(
         fixture
