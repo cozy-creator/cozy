@@ -4,9 +4,10 @@
 //! A watch thread blocks on the eventfd and wakes the pool the moment varena signals freed bytes.
 //! It reads NVML on demand (before a decision, after an executor's exit): it reaps dead rows and
 //! returns them once NVML shows their bytes back. An ask signals the eventfd too: only while rows
-//! are reaping or asked for bytes does it sample, at the wedge rule's resolution: their bytes coming
-//! back, or a stalled row (asked, and neither answering nor publishing for longer than its own
-//! measured pace allows), which it ends. TensorD decides nothing from bytes: it asks `fits`.
+//! are reaping, asked for bytes or running a request does it sample, at the wedge rule's
+//! resolution: their bytes coming back, or a stalled row (asked, and neither answering nor
+//! publishing for longer than its own measured pace allows), which it ends. TensorD decides
+//! nothing from bytes: it asks `fits`.
 use super::{MemoryLog, Sample};
 use crate::{
     device_executor::Page,
@@ -469,10 +470,11 @@ impl Inner {
         row.slot == self.own.id() && row.gen == self.own.gen()
     }
 
-    /// Rows whose bytes are on their way back, or rows asked for bytes: what the watch samples for.
+    /// Rows whose bytes are on their way back, asked for bytes, or running a request (an executor
+    /// on a TensorFS whose asks do not signal asks only then): what the watch samples for.
     fn pending(&self) -> bool {
         let rows = self.ledger.snapshot().unwrap_or_default();
-        rows.iter().any(|r| r.state != State::Live || r.want > 0)
+        rows.iter().any(|r| r.state != State::Live || r.want > 0 || !r.running.is_empty())
     }
 
     /// Dead rows whose process is gone are reaped; reaping rows whose bytes NVML no longer

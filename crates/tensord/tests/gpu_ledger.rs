@@ -419,6 +419,37 @@ fn inner_a_stalled_victim_is_ended() {
     assert_eq!(*ended.lock().unwrap(), [stalled.pid]);
 }
 
+/// Version skew: an executor on an older TensorFS asks without signalling. TensorD still watches
+/// while a row runs a request, so a victim that never answers is ended all the same.
+#[test]
+fn a_stalled_victim_asked_by_an_older_executor_is_ended() {
+    under_fake_nvml("inner_a_stalled_victim_asked_by_an_older_executor_is_ended", 8 * GIB, false);
+}
+
+#[test]
+#[ignore = "run under the fake NVML by its outer test"]
+fn inner_a_stalled_victim_asked_by_an_older_executor_is_ended() {
+    let ledger = ledger(Liveness { sample: Duration::from_millis(50) });
+    let mut stalled = Tenant::start(&ledger, &charges(), "stall");
+    stalled.call(&format!("publish {} {} {} 0", GIB / 2, 6 * GIB + GIB / 2, 6 * GIB));
+    stalled.call("running r1 -1");
+    let ended: Arc<Mutex<Vec<u32>>> = Arc::default();
+    let seen = ended.clone();
+    ledger.on_stalled(Box::new(move |pid| {
+        seen.lock().unwrap().push(pid);
+        // SAFETY: a signal to the tenant this test started, alive until its Tenant drops.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        release(pid);
+    }));
+    ledger.now();
+    let [memfd, _] = ledger.grant().unwrap();
+    let asker = Ledger::adopt(memfd.as_fd(), None).unwrap();
+    for victim in asker.ask(None, 3 * GIB).unwrap() {
+        asker.wait(&victim).unwrap();
+    }
+    assert_eq!(*ended.lock().unwrap(), [stalled.pid]);
+}
+
 /// An idle executor that answers every ask for the cold bytes it says it holds, and frees none,
 /// is ended at the next readings (only its exit gives them back), and its asker gets them; one
 /// running a request is left to finish it. Run 14820 failed `memory_exhausted` after asking the
