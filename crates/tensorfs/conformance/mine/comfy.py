@@ -218,7 +218,7 @@ def real(fmt):
 # ------------------------------------------------------------------ cases
 
 
-def refusals(lut, corr, w6, w4) -> list:
+def refusals(lut, corr, w6, w4, cv) -> list:
     reds = []
 
     def red(key, base, params=None, parts=None, shape=None):
@@ -263,6 +263,12 @@ def refusals(lut, corr, w6, w4) -> list:
     red("w4a4-scale-bf16", w4, parts=swap(w4, "scale", part("scale", "BF16", [n], z(2 * n))))
     red("w4a4-weight-scale-role", w4, parts=swap(w4, "scale", dict(next(p for p in w4["parts"] if p["role"] == "scale"),
                                                                    role="weight_scale")))
+    # w4a8.convrot admits kitchen's 4-bit scheme at one profile only: g16, E4M3 group scales, no correction.
+    n, k = cv["shape"]
+    red("w4a8-convrot-group-32", cv, dict(cv["encoding"]["params"], group_size=32),
+        parts=swap(cv, "group_scale", part("group_scale", "F8_E4M3", [n, k // 32], z(n * k // 32))))
+    red("w4a8-convrot-f32-scales", cv, parts=swap(cv, "group_scale", part("group_scale", "F32", [n, k // 16], z(n * k // 4))))
+    red("w4a8-convrot-correction", cv, parts=cv["parts"] + [part("correction", "F32", [k // 16, n], z(n * k // 4))])
     return reds
 
 
@@ -293,7 +299,14 @@ def main():
                grouped("w6a8-no-search-bf16", "BF16", 4, 256, 32, 256, bits=6, seed=12, scale_search=False),
                w4, w4a4("w4a4-f32", "F32", 4, 256, 64, 14)]
     greens += [real(f) for f in REAL]
-    cases = greens + refusals(lut, corr, w6, w4)
+    # w4a8.convrot is kitchen's 4-bit scheme at g16, E4M3 and no correction: the same parts and decode renamed.
+    greens += [dict(c, key=c["key"].replace("w4a8", "w4a8-convrot", 1), component="w4a8.convrot",
+                    encoding=dict(c["encoding"], scheme="w4a8.convrot"))
+               for c in greens if c["encoding"]["scheme"] == "comfy.asym_w4a8_int8"
+               and c["encoding"]["params"]["group_size"] == 16 and "kitchen" not in c
+               and all(p["role"] != "correction" and (p["role"] != "group_scale" or p["dtype"] == "F8_E4M3")
+                       for p in c["parts"])]
+    cases = greens + refusals(lut, corr, w6, w4, next(c for c in greens if c["key"] == "w4a8-convrot-lut-bf16"))
     CASES.write_text('{"cases":[\n' + ",\n".join(json.dumps(c, sort_keys=True, separators=(",", ":"))
                                                    for c in cases) + "\n]}\n")
     print(f"{len(greens)} cases and {len(cases) - len(greens)} refusals into {CASES.name}")

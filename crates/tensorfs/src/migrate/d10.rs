@@ -319,7 +319,7 @@ impl<'t> Migrator<'t> {
         let mut objects = Objects::new();
         let mut lanes: HashMap<ObjectRef, Lane> = HashMap::new();
         let put = |objects: &mut Objects, tree: &Tree| -> Result<ObjectRef> { Ok(add(objects, tree.to_json()?)) };
-        let (mut repo, mut released, mut unreleased) = (Repo::new(&name), Vec::new(), Vec::new());
+        let (mut repo, mut released, mut unreleased, mut relaid) = (Repo::new(&name), Vec::new(), Vec::new(), Vec::new());
         for t in tags {
             let what = t.name.clone().unwrap_or_default();
             let commit = match (&t.lanes, &t.commit) {
@@ -345,7 +345,13 @@ impl<'t> Migrator<'t> {
                     released.push(json!({"version": what, "tree": at.id(), "yanked": t.yanked, "lanes": report, "conflicts": conflicts}));
                     at
                 }
-                (None, Some(c)) if tree_at(c)? => c.clone(),
+                (None, Some(c)) if tree_at(c)? => {
+                    let (at, moved) = relayout(c, read, &mut objects)?;
+                    if let Some(moved) = moved {
+                        relaid.push(json!({"tag": what, "old": c.id(), "tree": at.id(), "moved": moved}));
+                    }
+                    at
+                }
                 (None, Some(c)) => {
                     if !lanes.contains_key(c) {
                         let lane = self.lane(&name, c, upstream, read, &mut objects)?;
@@ -382,7 +388,10 @@ impl<'t> Migrator<'t> {
             repo.tags.push(Tag { name: tag, commit, public: t.public, yanked: t.yanked });
         }
         repo.to_json().map_err(|e| invalid(format!("{name}: {e}")))?;
-        let report = json!({"model": name, "upstream": upstream.map(|u| u.from), "releases": released, "checkpoints": unreleased});
+        let mut report = json!({"model": name, "upstream": upstream.map(|u| u.from), "releases": released, "checkpoints": unreleased});
+        if !relaid.is_empty() {
+            report["relaid"] = json!(relaid);
+        }
         Ok(Migrated { repo, objects, report })
     }
 
@@ -573,6 +582,61 @@ impl<'t> Migrator<'t> {
         }
         Ok(out)
     }
+}
+
+/// A D10 tree whose repo files hold components [`layout`] now names (a modular index's
+/// config-only folders, a root config beside other components), each variant's header taking
+/// them and the tree no longer holding them as repo files: the new tree and, when it changed,
+/// what moved per variant. Chunks, tensors and the header's own components stay as they are.
+fn relayout(commit: &ObjectRef, read: Read, objects: &mut Objects) -> Result<(ObjectRef, Option<Json>)> {
+    let tree = Tree::from_json(&read(commit)?)?;
+    let headers: BTreeMap<String, ObjectRef> = tree.variants().map(|(p, h)| (p.to_owned(), h.clone())).collect();
+    let mut files = BTreeMap::new();
+    for (path, object) in tree.files.iter().filter(|(p, _)| !headers.contains_key(*p)) {
+        files.insert(path.clone(), read(object)?);
+    }
+    let (mut new, mut moved, mut consumed) = (tree.clone(), serde_json::Map::new(), BTreeSet::new());
+    for (path, at) in &headers {
+        let old = Header::from_cbor(&read(at)?)?;
+        let names: Vec<String> = old.components().iter().map(|c| c.name.clone()).collect();
+        let versions: Versions = (old.components().iter().map(|c| &c.class))
+            .filter(|c| !c.version.is_empty())
+            .map(|c| (c.library.clone(), c.version.clone()))
+            .collect();
+        let l = layout(files.clone(), &names, &versions)?;
+        let taken: BTreeSet<&String> = files.keys().filter(|p| !l.files.contains_key(*p)).collect();
+        let mut components = old.components().to_vec();
+        for f in l.components.into_iter().filter(|f| !names.contains(&f.name)) {
+            let mine = |p: &&&String| match f.name.as_str() {
+                crate::import::ROOT_COMPONENT => !p.contains('/'),
+                folder => p.strip_prefix(folder).is_some_and(|r| r.starts_with('/')),
+            };
+            consumed.extend(taken.iter().filter(mine).map(|p| (*p).clone()));
+            moved.entry(path.clone()).or_insert_with(|| json!([])).as_array_mut().expect("a list").push(json!(f.name));
+            components.push(Component {
+                assets: f.assets.into_iter().map(|(p, b)| (p, add(objects, b))).collect(),
+                name: f.name,
+                class: f.class,
+                config: f.config,
+                config_file: f.config_file,
+                tensors: Vec::new(),
+            });
+        }
+        if components.len() == names.len() {
+            continue;
+        }
+        let header = Header::new(old.chunks.clone(), old.pipeline().cloned(), components, old.metadata.clone())?;
+        if header.components()[..names.len()] != *old.components() {
+            return fail(Kind::Invalid, format!("{}: a relaid header changed an existing component", commit.id()));
+        }
+        new.files.insert(path.clone(), add(objects, header.to_cbor()?));
+    }
+    if moved.is_empty() {
+        return Ok((commit.clone(), None));
+    }
+    new.files.retain(|p, _| !consumed.contains(p));
+    let at = add(objects, new.to_json()?);
+    Ok((at, Some(json!({"components": moved, "files": consumed}))))
 }
 
 fn invalid(detail: String) -> Failure {
@@ -824,8 +888,9 @@ async fn old_objects(endpoint: &Arc<Endpoint>, client: &Client, scratch: &Store,
             v1_headers.push(m.header);
             continue;
         }
+        // A 0.12 manifest's files, or a D10 tree's headers and repo files (a relayout reads them).
         let doc: Option<Doc> = serde_json::from_slice(&raw).ok();
-        files.extend(doc.filter(|d| d.format.starts_with("tensorfs.manifest/")).into_iter().flat_map(|d| d.files.into_values()));
+        files.extend(doc.filter(|d| d.format.starts_with("tensorfs.manifest/") || d.format == TREE_FORMAT).into_iter().flat_map(|d| d.files.into_values()));
     }
     fetcher.objects(&origin, &files, &want).await?;
     // A v1 header's assets are objects of their own.

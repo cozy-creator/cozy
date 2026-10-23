@@ -34,7 +34,7 @@ enum Verb {
     Download(Download),
     /// Make a model on a machine and upload it as a private checkpoint.
     Upload(Upload),
-    /// Write a model's int8, fp8 or nvfp4 lane with the package that serves it.
+    /// Write a model's int8, fp8, nvfp4 or w4a8 lane, or run any recipe, with the package that serves it.
     Quantize(Quantize),
     /// Release a commit: a public tag named by a version, created, moved, or a private one made public.
     Publish(Publish),
@@ -110,6 +110,7 @@ pub(crate) struct Download {
 pub(crate) struct Upload {
     /// A provider source, local/<alias>, a Hub model or checkpoint, ./file.safetensors, or a
     /// CozyTensors folder (all variants and repo files; its chunks may already be at the Hub).
+    #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::local))]
     source: String,
     /// Where it goes: org/name[@tag], the Hub repository and the private tag the upload moves (main).
     destination: String,
@@ -124,12 +125,14 @@ pub(crate) struct Upload {
 }
 
 #[derive(clap::Args, Debug)]
-#[command(group(ArgGroup::new("lane").required(true).args(["int8", "fp8", "nvfp4"])))]
+#[command(group(ArgGroup::new("lane").required(true).args(["int8", "fp8", "nvfp4", "w4a8", "recipe"])))]
 pub(crate) struct Quantize {
     /// org/name[@release] or org/name#sha256:….
     model: String,
-    /// Where it goes: org/name[@tag], the tag whose tree takes the variant (main); default: the model's own.
-    destination: Option<String>,
+    /// Where it goes: org/name[@tag], the tag whose tree takes the variant (main); default: the
+    /// model's own. Then the recipe's other inputs: `model.<slot>=<ref>`, `<field>=<value>`.
+    #[arg(value_name = "DESTINATION | INPUT=VALUE")]
+    terms: Vec<String>,
     /// Write the int8 lane (int8-convrot).
     #[arg(long)]
     int8: bool,
@@ -139,7 +142,13 @@ pub(crate) struct Quantize {
     /// Write the nvfp4 lane (block-scaled FP4).
     #[arg(long)]
     nvfp4: bool,
-    /// The package (org/name[@release]) whose quantizer runs; default: the one the machine holds.
+    /// Write the w4a8 lane (4-bit ConvRot codes on int8 tensor cores: Ampere, Ada, Hopper).
+    #[arg(long)]
+    w4a8: bool,
+    /// Run the package's recipe of this name: a preparation step (`drafter_head`) or any lane's.
+    #[arg(long, value_name = "NAME")]
+    recipe: Option<String>,
+    /// The package (org/name[@release]) whose recipe runs; default: the one the machine holds.
     #[arg(long)]
     package: Option<String>,
     #[command(flatten)]

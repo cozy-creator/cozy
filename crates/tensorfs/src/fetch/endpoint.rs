@@ -532,7 +532,9 @@ impl Origin for Endpoint {
         constraints.check().map_err(|e| Refusal { code: Code::KEY_GRAMMAR, detail: e.detail })?;
         let At::Http(base) = &self.at else { return Ok(None) };
         let escaped = |value: &str| repo_url("", value).trim_start_matches('/').to_owned();
-        let mut url = format!("{}/select?revision={}&gpus={}", repo_url(base, &format!("v1/models/{name}")), escaped(revision), escaped(&constraints.gpus.join(",")));
+        // The rule names this reader: a Hub answers an older one in its own rule (spec §7).
+        let mut url = format!("{}/select?revision={}&gpus={}&rule={}", repo_url(base, &format!("v1/models/{name}")),
+            escaped(revision), escaped(&constraints.gpus.join(",")), crate::precision::RULE);
         for (key, bits) in [("bits", constraints.bits), ("prefer", constraints.prefer), ("min_bits", constraints.min_bits)] {
             if let Some(bits) = bits { url.push_str(&format!("&{key}={bits}")); }
         }
