@@ -61,6 +61,9 @@ pub const MEM_HANDLE_TYPE_WIN32: u32 = 2;
 pub const MEM_ACCESS_PROT_READ: u32 = 1;
 pub const MEM_ACCESS_PROT_READWRITE: u32 = 3;
 pub const MEM_GRANULARITY_MINIMUM: u32 = 0;
+pub const LIMIT_STACK_SIZE: c_int = 0;
+pub const LIMIT_PRINTF_FIFO_SIZE: c_int = 1;
+pub const LIMIT_MALLOC_HEAP_SIZE: c_int = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -127,6 +130,7 @@ pub struct Driver {
     pub ctx_get_current: F<*mut CUcontext>,
     pub ctx_set_current: F<CUcontext>,
     pub ctx_synchronize: unsafe extern "C" fn() -> CUresult,
+    pub ctx_set_limit: unsafe extern "C" fn(c_int, usize) -> CUresult,
     pub primary_ctx_release: F<CUdevice>,
     pub mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult,
     pub stream_create: unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult,
@@ -266,6 +270,7 @@ impl Driver {
             ctx_get_current: load!(lib, b"cuCtxGetCurrent"),
             ctx_set_current: load!(lib, b"cuCtxSetCurrent"),
             ctx_synchronize: load!(lib, b"cuCtxSynchronize"),
+            ctx_set_limit: load!(lib, b"cuCtxSetLimit"),
             primary_ctx_release: load!(lib, b"cuDevicePrimaryCtxRelease_v2"),
             mem_get_info: load!(lib, b"cuMemGetInfo_v2"),
             stream_create: load!(lib, b"cuStreamCreate"),
