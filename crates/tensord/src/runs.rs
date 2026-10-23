@@ -343,7 +343,7 @@ impl Runs {
             let (service, judged, stop) = (this.service.clone(), run.clone(), stoppable.stop.clone());
             let judge = std::thread::Builder::new().name(format!("judge-{run}")).spawn(move || {
                 let waits = || service.engine.get(&judged).is_ok_and(|record| record.waiting.is_some());
-                if let Some(verdict) = crate::process::judge_preparation(&stop, &finished, waits) {
+                if let Some(verdict) = crate::process::judge_preparation(&stop, &finished, waits, crate::process::Liveness::default()) {
                     let failure = Failure::machine("no_progress", verdict);
                     judge_stalled();
                     if let Err(error) = service.engine.end_preparation(&judged, Outcome::Failed(failure)) {
@@ -551,7 +551,7 @@ impl Runs {
         // most 4 times a second.
         let last = std::sync::Mutex::new((String::new(), std::time::Instant::now()));
         let observe = Arc::new(move |stage: &str, done: u64, total: u64| {
-            stop.moved();
+            stop.at(stage, done, total);
             let mut last = last.lock().unwrap();
             if last.0 == stage && last.1.elapsed() < std::time::Duration::from_millis(250) && (total == 0 || done < total) {
                 return;
@@ -653,8 +653,9 @@ impl Runs {
             ahead = plan.as_ref().map(|plan| {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
                 let fetch = crate::access::Fetch::new(self.publisher.machine().clone(), hub.clone(), order);
-                if let Err(error) = fetch.ahead(&plan.upfront()) {
-                    tracing::warn!("run {id}: its weights' early fetch: {error}");
+                match fetch.ahead(&plan.upfront()) {
+                    Ok(()) => crate::access::meter(self.service.engine.clone(), id.to_string(), &fetch),
+                    Err(error) => tracing::warn!("run {id}: its weights' early fetch: {error}"),
                 }
                 fetch
             });

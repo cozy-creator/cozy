@@ -135,11 +135,7 @@ pub(crate) fn row(run: &Run) -> Vec<String> {
     }
     let progress = match (&run.status, &run.progress) {
         (Status::InProgress, Some(p)) => {
-            let fraction = p
-                .fraction
-                .filter(|f| *f >= 0.0)
-                .or_else(|| (p.total > 0).then(|| p.completed as f64 / p.total as f64));
-            match fraction {
+            match follow::fraction(p) {
                 Some(f) => format!("{} {:.0}%", p.stage, f * 100.0),
                 None => p.stage.clone(),
             }

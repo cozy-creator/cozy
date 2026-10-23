@@ -3,7 +3,7 @@
 use platform::process::Birth;
 use crate::journal::{
     Artifact, CallMemo, Execution, Invocation, Journal, Outcome, ProgressSnapshot,
-    ResultRecord, State, SubmissionContext,
+    ResultRecord, State, SubmissionContext, Weights,
 };
 use serde_json::Value;
 use std::{
@@ -763,12 +763,14 @@ impl Engine {
         if record.revision >= record.revision_ceiling {
             record = journal.reserve_observations(id, progress.get(id))?;
         }
+        let weights = progress.get(id).and_then(|held| held.weights.clone());
         progress.insert(
             id.into(),
             ProgressSnapshot {
                 completed_units: record.completed_units,
                 detail: record.progress.clone().unwrap_or_default(),
                 waiting: reason,
+                weights,
                 revision: record
                     .revision
                     .checked_add(1)
@@ -804,25 +806,32 @@ impl Engine {
         if record.state.terminal() {
             return Ok(());
         }
+        let weights = progress.get(id).and_then(|snapshot| snapshot.weights.clone());
         if let Some(snapshot) = progress.get(id) {
             snapshot.overlay(&mut record);
         }
+        let own = weights.as_ref().map_or(record.progress.as_deref(), |(_, own)| Some(own.as_str()));
         // Units never regress; a stage or position change without new units still shows.
         if completed_units < record.completed_units
-            || completed_units == record.completed_units
-                && record.progress.as_deref() == Some(detail.as_str())
+            || completed_units == record.completed_units && own == Some(detail.as_str())
         {
             return Ok(());
         }
         if record.revision >= record.revision_ceiling {
             record = journal.reserve_observations(id, progress.get(id))?;
         }
+        // Weights still arriving show over it; it shows once they are here.
+        let (detail, weights) = match weights {
+            Some((arriving, _)) => (arriving.over(&detail), Some((arriving, detail))),
+            None => (detail, None),
+        };
         progress.insert(
             id.into(),
             ProgressSnapshot {
                 completed_units,
                 detail,
                 waiting: None,
+                weights,
                 revision: record
                     .revision
                     .checked_add(1)
@@ -831,6 +840,55 @@ impl Engine {
         );
         drop((progress, journal));
         self.notify_activity(); // wakes event long-polls; nothing durable is written
+        Ok(())
+    }
+
+    /// The weights run `id` waits on while they arrive (`access::meter`), shown over its own
+    /// progress; `None` once they are here, when its own shows again. A queued run keeps why it
+    /// waits.
+    pub fn observe_weights(&self, id: &str, weights: Option<Weights>) -> io::Result<()> {
+        if !self.owned.lock().unwrap().contains(id) {
+            return Ok(());
+        }
+        let mut progress = self.progress.lock().unwrap();
+        let held = progress.get(id);
+        if held.and_then(|snapshot| snapshot.weights.as_ref().map(|(w, _)| w)) == weights.as_ref() {
+            return Ok(());
+        }
+        let mut journal = self.journal.lock().unwrap();
+        let mut record = journal.get(id)?;
+        if !record.observed() {
+            return Ok(());
+        }
+        if let Some(snapshot) = held {
+            snapshot.overlay(&mut record);
+        }
+        let own = match held.and_then(|snapshot| snapshot.weights.as_ref()) {
+            Some((_, own)) => own.clone(),
+            None => record.progress.clone().unwrap_or_default(),
+        };
+        if record.revision >= record.revision_ceiling {
+            record = journal.reserve_observations(id, progress.get(id))?;
+        }
+        let (detail, weights) = match weights {
+            Some(arriving) => (arriving.over(&own), Some((arriving, own))),
+            None => (own, None),
+        };
+        progress.insert(
+            id.into(),
+            ProgressSnapshot {
+                completed_units: record.completed_units,
+                detail,
+                waiting: record.waiting.clone(),
+                weights,
+                revision: record
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("execution observation cursor exhausted"))?,
+            },
+        );
+        drop((progress, journal));
+        self.notify_activity();
         Ok(())
     }
 

@@ -291,6 +291,9 @@ pub(super) fn fields(ctx: &Context, run: &Run) -> output::Record {
     if let Some(waiting) = run.waiting.as_deref().filter(|_| !settled(run)) {
         record = record.field("waiting", waiting);
     }
+    if let Some(progress) = run.progress.as_ref().filter(|_| !settled(run)) {
+        record = record.field("progress", said(progress));
+    }
     if let Some(ms) = run.execution_ms {
         record = record.field("execution", format!("{:.1}s", ms as f64 / 1000.0));
     }
@@ -573,27 +576,17 @@ impl View {
     }
 
     fn progress(&mut self, progress: &Progress) {
-        let fraction = progress.fraction.filter(|f| *f >= 0.0).or_else(|| {
-            (progress.total > 0).then(|| progress.completed as f64 / progress.total as f64)
-        });
-        let mut text = progress.stage.clone();
-        if progress.total > 0 {
-            let _ = write!(text, " {}/{}", progress.completed, progress.total);
-        }
-        // Bytes moved, of how many when that is known, at what rate, and so how long is left:
-        // a download that crawls says so.
+        let fraction = fraction(progress);
+        let mut text = said(progress);
+        // At what rate bytes move, and so how long is left: a download that crawls says so.
         let (done, total) = (progress.bytes_done, progress.bytes_total);
-        if done > 0 || total > 0 {
-            let _ = write!(text, " {}", output::bytes(done));
-            if total > 0 {
-                let _ = write!(text, "/{}", output::bytes(total));
-            }
-            if let Some(rate) = rate(&mut self.moving, &progress.stage, done, Instant::now()) {
-                let _ = write!(text, " at {}/s", output::bytes(rate as u64));
-                if total > done && rate >= 1.0 {
-                    let left = ((total - done) as f64 / rate) as i64;
-                    let _ = write!(text, ", {} left", output::span(left));
-                }
+        if (done > 0 || total > 0)
+            && let Some(rate) = rate(&mut self.moving, &progress.stage, done, Instant::now())
+        {
+            let _ = write!(text, " at {}/s", output::bytes(rate as u64));
+            if total > done && rate >= 1.0 {
+                let left = ((total - done) as f64 / rate) as i64;
+                let _ = write!(text, ", {} left", output::span(left));
             }
         }
         if progress.step_ms > 0.0 {
@@ -622,6 +615,30 @@ impl View {
             bar.finish_and_clear();
         }
     }
+}
+
+/// How far a run is: its own fraction, else its steps', else its bytes'.
+pub(crate) fn fraction(progress: &Progress) -> Option<f64> {
+    let of = |done: u64, total: u64| (total > 0).then(|| done as f64 / total as f64);
+    (progress.fraction.filter(|f| *f >= 0.0))
+        .or_else(|| of(progress.completed, progress.total))
+        .or_else(|| of(progress.bytes_done, progress.bytes_total))
+}
+
+/// Where a run is: its stage, its steps of their total, and its bytes of theirs.
+pub(crate) fn said(progress: &Progress) -> String {
+    let mut text = progress.stage.clone();
+    if progress.total > 0 {
+        let _ = write!(text, " {}/{}", progress.completed, progress.total);
+    }
+    let (done, total) = (progress.bytes_done, progress.bytes_total);
+    if done > 0 || total > 0 {
+        let _ = write!(text, " {}", output::bytes(done));
+        if total > 0 {
+            let _ = write!(text, "/{}", output::bytes(total));
+        }
+    }
+    text
 }
 
 /// A stage's bytes a second over its last 10 s (and at least its last two counts), once a second

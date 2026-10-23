@@ -466,11 +466,13 @@ pub fn supervise(
     Ok(ended.unwrap_or(Supervised::Exited(status)))
 }
 
-/// A preparation's verdict, on its measured progress (`Stop::progress`) as an invocation's is:
-/// still past its pace's patience. None once `ended` says it finished. Waiting on work watched
+/// A preparation's verdict, on its measured progress (`Stop::progress`: bytes told as they move,
+/// stages, its installer's meter) as an invocation's is: still past the patience its own pace
+/// earned. It is judged once it advanced, never before: the wait for its first advance is its
+/// first pause, not an allowance. None once `ended` says it finished. Waiting on work watched
 /// elsewhere (another run's install of the same code) is not stillness.
-pub fn judge_preparation(stop: &crate::stop::Stop, ended: &std::sync::mpsc::Receiver<()>, waits: impl Fn() -> bool) -> Option<String> {
-    let (liveness, mut pace) = (Liveness::default(), Pace::default());
+pub fn judge_preparation(stop: &crate::stop::Stop, ended: &std::sync::mpsc::Receiver<()>, waits: impl Fn() -> bool, liveness: Liveness) -> Option<String> {
+    let mut pace = Pace::default();
     while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(liveness.sample) {
         let now = Instant::now();
         pace.observe(Some(stop.progress()), now);
@@ -478,7 +480,7 @@ pub fn judge_preparation(stop: &crate::stop::Stop, ended: &std::sync::mpsc::Rece
             pace.excuse(now);
         }
         let still = pace.still_since().map(|since| now - since).unwrap_or_default();
-        if still > pace.patience(liveness.floor()) {
+        if pace.changes > 0 && still > pace.patience(liveness.floor()) {
             return Some(format!("preparing: {}", pace.verdict(still, liveness.floor())));
         }
     }
@@ -747,4 +749,85 @@ mod tests {
         }
     }
 
+
+    /// A safetensors file served from a real socket, `chunk` bytes each `pace`; with `stall`, its
+    /// body stops halfway and the connection stays open, saying nothing more.
+    fn trickled_source(chunk: usize, pace: Duration, stall: bool) -> String {
+        use std::io::{Read, Write};
+        let data = vec![7u8; 64 << 10];
+        let header = serde_json::to_vec(&serde_json::json!({"weight": {"dtype": "U8", "shape": [data.len()], "data_offsets": [0, data.len()]}})).unwrap();
+        let mut body = (header.len() as u64).to_le_bytes().to_vec();
+        body.extend(header);
+        body.extend(data);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/model.safetensors", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let (mut asked, mut byte) = (vec![], [0u8]);
+                while !asked.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                    asked.push(byte[0]);
+                }
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-length:{}\r\nconnection:close\r\n\r\n", body.len());
+                for (n, part) in body.chunks(chunk).enumerate() {
+                    if stall && n * chunk >= body.len() / 2 {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    }
+                    std::thread::sleep(pace);
+                    if stream.write_all(part).and_then(|()| stream.flush()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        url
+    }
+
+    /// A provider import from a slow source is judged on what the import tells as its bytes land
+    /// (`Stop::at`), as a preparation's is: one moving far slower than its first floor is never
+    /// killed (runs 14517 and 14555 were, inside one silent shard), one whose bytes stop is.
+    #[test]
+    fn a_slow_moving_import_is_never_judged_and_a_stopped_one_is() {
+        let liveness = Liveness { sample: Duration::from_millis(50) };
+        for stall in [false, true] {
+            // 64 KiB a KiB per 25 ms: some 1.6 s, five floors.
+            let url = trickled_source(1 << 10, Duration::from_millis(25), stall);
+            let root = tempfile::tempdir().unwrap();
+            let store = tensorfs::store::Store::open(root.path().join("store")).unwrap();
+            let stop = crate::stop::Stop::default();
+            let (done, ended) = std::sync::mpsc::channel::<()>();
+            let judged = {
+                let stop = stop.clone();
+                std::thread::spawn(move || judge_preparation(&stop, &ended, || false, liveness))
+            };
+            let access = tensorfs::import::Access { allow_local: true, ..Default::default() };
+            let (sources, tmp, told) = (vec![url], store.root().join("tmp"), |stage: &str, done, total| stop.at(stage, done, total));
+            let stopped = || stop.is_cancelled();
+            let request = tensorfs::import::Request { sources: &sources, converter: None, source_variant: None, access: &access,
+                tmp: &tmp, progress: &told, stop: Some(&stopped) };
+            let mut writer = store.writer(None, None).unwrap();
+            let imported = match stall {
+                false => tensorfs::import::convert(&request, &mut writer).map(drop),
+                true => {
+                    // The judge ends a stopped transfer as `runs` does: by its stop.
+                    let judge = std::thread::spawn({
+                        let stop = stop.clone();
+                        move || {
+                            let verdict = judged.join().unwrap();
+                            stop.cancel();
+                            verdict
+                        }
+                    });
+                    let imported = tensorfs::import::convert(&request, &mut writer).map(drop);
+                    let verdict = judge.join().unwrap().expect("a transfer that stopped moving was never judged");
+                    assert!(verdict.contains("no measurable progress"), "{verdict}");
+                    assert!(imported.is_err(), "a judged import went on");
+                    continue;
+                }
+            };
+            imported.unwrap();
+            assert_eq!(writer.committed().map(|_| ()), Some(()));
+            drop(done);
+            assert_eq!(judged.join().unwrap(), None, "a slow but moving import was judged stalled");
+        }
+    }
 }

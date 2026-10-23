@@ -3,10 +3,13 @@
 //! reads them through TensorFS, at the run's Hub under its owner's newest bearer when its request
 //! carried one.
 //! Its checkpoints stay open, so the store keeps their bytes, until
-//! the call ends (or its run is canceled): then what it wanted drops.
+//! the call ends (or its run is canceled): then what it wanted drops. While what it wants is not
+//! all here, its run's progress says so (`meter`).
 use crate::{
+    execution::Engine,
     held_models::Pulled,
     hub,
+    journal::Weights,
     origin::{self, priority, Machine, Remote},
     stop::Stop,
     storage::{self, Store},
@@ -74,6 +77,9 @@ pub struct Fetch {
     held: Mutex<Vec<Checkpoint>>,
     /// What fetched for this call before it started: ended with it.
     replaced: Mutex<Option<Arc<Fetch>>>,
+    /// Each wanted checkpoint not all here when it was wanted: its repository, its bytes, and
+    /// its objects still absent.
+    arriving: Mutex<Vec<(String, u64, Vec<ObjectRef>)>>,
 }
 
 impl Fetch {
@@ -87,6 +93,7 @@ impl Fetch {
             kept: Mutex::default(),
             held: Mutex::default(),
             replaced: Mutex::default(),
+            arriving: Mutex::default(),
         })
     }
 
@@ -117,6 +124,17 @@ impl Fetch {
             let Some(remote) = self.source(checkpoint.id())? else {
                 continue;
             };
+            // What is absent now is what its run waits on (`meter`), under the repository it came
+            // from; a checkpoint known whole is looked at no more.
+            let objects = match components.is_empty() || whole(self.store(), header, components) {
+                true => vec![],
+                false => storage::chunks(&checkpoint, components),
+            };
+            let absent: Vec<_> = objects.iter().filter(|o| !storage::present(self.store(), o)).cloned().collect();
+            if let Some(pulled) = (!absent.is_empty()).then(|| Pulled::of(self.store(), checkpoint.id())).transpose()?.flatten() {
+                let bytes = objects.iter().map(|o| o.length).sum();
+                self.arriving.lock().unwrap().push((pulled.repository, bytes, absent));
+            }
             for component in components {
                 let objects = storage::chunks(&checkpoint, std::slice::from_ref(component));
                 let bytes: u64 = objects.iter().map(|o| o.length).sum();
@@ -169,6 +187,22 @@ impl Fetch {
         })
     }
 
+    /// The weights it wants that are not all here yet, while any are not: their repositories,
+    /// and the bytes here of all it found absent. An object here stays: its checkpoint is held.
+    pub fn arriving(&self) -> Option<Weights> {
+        let mut arriving = self.arriving.lock().unwrap();
+        let (mut models, mut done, mut total) = (vec![], 0, 0);
+        for (repository, bytes, absent) in arriving.iter_mut() {
+            absent.retain(|object| !storage::present(self.store(), object));
+            let missing: u64 = absent.iter().map(|o| o.length).sum();
+            if missing > 0 && !models.contains(repository) {
+                models.push(repository.clone());
+            }
+            (done, total) = (done + *bytes - missing, total + *bytes);
+        }
+        (!models.is_empty()).then(|| Weights { models: models.join(" and "), done, total })
+    }
+
     /// Whether it ended (`end`).
     pub fn ended(&self) -> bool {
         self.stop.is_cancelled()
@@ -184,6 +218,31 @@ impl Fetch {
         if let Some(replaced) = self.replaced.lock().unwrap().take() {
             replaced.end();
         }
+    }
+}
+
+/// While what `fetch` wants is not all here, run `id`'s progress says which weights it waits on
+/// and how many of their bytes are here, from a quarter-second look at the store; once they are,
+/// or the fetch ends, its own stage shows again. A run whose weights are here hears nothing.
+pub fn meter(engine: Arc<Engine>, id: String, fetch: &Arc<Fetch>) {
+    if fetch.arriving.lock().unwrap().is_empty() {
+        return;
+    }
+    let fetch = Arc::downgrade(fetch);
+    let started = std::thread::Builder::new().name("weights-meter".into()).spawn(move || loop {
+        let weights = fetch.upgrade().filter(|f| !f.ended()).and_then(|f| f.arriving());
+        let done = weights.is_none();
+        if let Err(error) = engine.observe_weights(&id, weights) {
+            tracing::warn!("run {id}: its weights' progress: {error}");
+            return;
+        }
+        if done || engine.get(&id).is_ok_and(|record| record.state.terminal()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    });
+    if let Err(error) = started {
+        tracing::warn!("its weights' progress: {error}");
     }
 }
 

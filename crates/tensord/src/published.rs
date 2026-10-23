@@ -2808,6 +2808,61 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(&bench.root);
     }
 
+    /// A run whose weights are still arriving says so as its progress: the repository, and the
+    /// bytes here of its absent ones as they land through a paced Hub, over its own stage's scope
+    /// and never its step. A frame of its own meanwhile is kept, and shows once they are all here.
+    /// A run whose weights are here hears nothing (cl-642: run 14608's watch said only "denoise").
+    #[test]
+    fn a_run_waiting_on_its_weights_shows_them_arriving_then_its_own_stage() {
+        let bench = Bench::new();
+        // Eighteen objects at a second each, sixteen at once: two seconds of arriving.
+        let manifest = checkpoint(&bench.source, 18, 8);
+        let (hub, named, _) = bench.hub("acme/arriving", &manifest, 1000);
+        bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
+        let service = crate::service::Service::open(&bench.root.join("state"), &bench.root.join("generations"), 1).unwrap();
+        let engine = service.engine.clone();
+        let accept = |id: &str| engine.accept_run("alice", id, id, crate::journal::Invocation::default()).unwrap().0.id;
+        let progress = |id: &str| -> serde_json::Value { serde_json::from_str(&engine.get(id).unwrap().progress.unwrap()).unwrap() };
+        let (run, total) = (accept("arriving"), chunks(bench.publisher.store(), &manifest).iter().map(|o| o.length).sum::<u64>());
+        let own = |position: u64| json!({"stage": "Generating original 768p video / denoise", "position": position, "total": 8, "step_ms": 0.0}).to_string();
+        engine.observe_progress(&run, 0, own(0)).unwrap();
+        let selected = [(manifest.id(), vec!["model".to_string()])];
+        let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub.clone()), 1);
+        fetch.ahead(&selected).unwrap();
+        crate::access::meter(engine.clone(), run.clone(), &fetch);
+        let (started, mut seen) = (Instant::now(), vec![]);
+        loop {
+            assert!(started.elapsed() < Duration::from_secs(60), "never landed: {seen:?}");
+            std::thread::sleep(Duration::from_millis(10));
+            let shown = progress(&run);
+            if shown["stage"] != "Generating original 768p video · downloading acme/arriving weights" {
+                match seen.is_empty() {
+                    true => continue, // the meter's first look is on its way
+                    false => break,
+                }
+            }
+            assert_eq!((shown["bytes_total"].as_u64(), shown.get("position")), (Some(total), None), "{shown}");
+            seen.push(shown["bytes_done"].as_u64().unwrap());
+            if seen.len() == 3 {
+                engine.observe_progress(&run, 0, own(1)).unwrap(); // its executor's frame meanwhile
+            }
+        }
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "bytes went back: {seen:?}");
+        seen.dedup();
+        assert!(seen.len() >= 2 && seen[0] == 0 && seen[seen.len() - 1] < total, "not seen arriving: {seen:?}");
+        assert_eq!(progress(&run), serde_json::from_str::<serde_json::Value>(&own(1)).unwrap(), "its own frame shows once they are here");
+        // Its weights here, a run's fetch meters nothing and its progress is its own.
+        let warm = accept("warm");
+        engine.observe_progress(&warm, 0, own(0)).unwrap();
+        let again = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub.clone()), 2);
+        again.ahead(&selected).unwrap();
+        assert!(again.arriving().is_none());
+        crate::access::meter(engine.clone(), warm.clone(), &again);
+        assert_eq!(progress(&warm), serde_json::from_str::<serde_json::Value>(&own(0)).unwrap());
+        drop(service);
+        let _ = fs::remove_dir_all(&bench.root);
+    }
+
     /// What a call wants downloads only while the call lives: its end (or its run's cancel)
     /// drops its tickets, and the fetcher stops. What landed stays.
     #[test]

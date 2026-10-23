@@ -451,6 +451,7 @@ fn cursor_reservation_renewal_never_reuses_old_cursors_and_accepts_older_records
         completed_units: 7,
         detail: "seven completed units".into(),
         waiting: None,
+        weights: None,
         revision: old_edge,
     };
     let renewed = journal.reserve_observations(&id, Some(&snapshot)).unwrap();
