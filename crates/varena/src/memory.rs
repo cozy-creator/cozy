@@ -614,6 +614,9 @@ struct State {
     events: BTreeMap<usize, VecDeque<(Event, Key)>>,
     /// Sets streaming their upper blocks through slots (step 2's watermark), by set.
     streams: HashMap<u32, Streaming>,
+    /// Pages' backing between homes: taken in place (the hook unmaps and destroys it) or a slot
+    /// moving (a Move): still this process's created bytes, never context.
+    transit: u64,
     /// Ids and the logical clock.
     clock: u64,
     shrinks: HashMap<u32, Shrink>,
@@ -657,6 +660,7 @@ impl State {
         let Some(h) = self.homes.get_mut(&key).filter(|h| !h.keeping && !h.keep_after && !h.protecting && !h.reclaiming && !h.exported && !h.landing) else { return Ok(None) };
         let Some(phys) = h.phys.take() else { return Ok(None) };
         h.reclaiming = true;
+        self.transit += phys.len;
         let taking = (key, h.gen, class, place, phys, h.ready);
         self.sync(key);
         Ok(Some(taking))
@@ -1566,7 +1570,8 @@ impl Inner {
         st.table.context = match self.backend.process_used() {
             Ok(used) => {
                 let created: u64 = st.homes.values().filter(|h| h.origin != Origin::Kept).filter_map(|h| h.phys.as_ref()).map(|p| p.len).sum::<u64>()
-                    + st.retired.values().filter(|r| r.created).map(|r| r.bytes).sum::<u64>();
+                    + st.retired.values().filter(|r| r.created).map(|r| r.bytes).sum::<u64>()
+                    + st.transit;
                 used.saturating_sub(self.native_resident.load(Ordering::Acquire) + created)
             }
             // Not measurable here: the context as open measured it.
@@ -2200,8 +2205,10 @@ impl Inner {
             // The hook's pages: unmapped and destroyed here, on its own thread.
             for (key, gen, class, (va, off, span), phys, ready) in taking {
                 let change = self.row.physical_change();
+                let len = phys.len;
                 let given = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(phys));
                 let mut st = self.lock();
+                st.transit = st.transit.saturating_sub(len);
                 if st.homes.get(&key).is_some_and(|h| h.gen == gen) {
                     st.homes.remove(&key);
                     self.backend.retire(ready);
@@ -2565,6 +2572,8 @@ impl Inner {
                 admission = self.refresh(&mut st)?;
             }
             let asks = Self::asks(&st, req);
+            // The row shows what this sample measured (its context), not the last pass's figure.
+            self.publish(&mut st);
             drop(admission);
             self.unlock(st);
             asks
@@ -3148,6 +3157,8 @@ impl Drop for Inner {
         for m in sets {
             self.backend.release(m.va);
         }
+        // Its retired events that completed go with it (one still pending, with the backend).
+        self.backend.sweep();
     }
 }
 

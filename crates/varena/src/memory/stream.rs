@@ -165,6 +165,7 @@ impl Inner {
         st.events.values_mut().for_each(|q| q.retain(|(_, k)| *k != from));
         let Some(Home { phys: Some(phys), ready, .. }) = st.homes.remove(&from) else { return Ok(StreamIn::Wait) };
         self.backend.retire(ready);
+        st.transit += phys.len;
         st.sync(from);
         let gen = st.tick();
         let identity = st.mech(key.0)?.key.clone();
@@ -188,8 +189,10 @@ impl Inner {
         let moved = after.iter().try_for_each(|e| self.backend.finish(*e))
             .and_then(|()| self.backend.unmap(va, from, span))
             .and_then(|()| self.backend.map(va, off, &phys, Access::ReadWrite));
+        let len = phys.len;
         if let Err(error) = moved {
             let mut st = self.state.lock();
+            st.transit = st.transit.saturating_sub(len);
             self.lost_backing(&mut st, span, false, error);
             return;
         }
@@ -197,12 +200,15 @@ impl Inner {
         let mut st = self.state.lock();
         if !st.homes.get(&key).is_some_and(|h| h.gen == gen) {
             drop(st);
-            if let Err(error) = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(phys)) {
-                let mut st = self.state.lock();
+            let gone = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(phys));
+            let mut st = self.state.lock();
+            st.transit = st.transit.saturating_sub(len);
+            if let Err(error) = gone {
                 self.lost_backing(&mut st, span, false, error);
             }
             return;
         }
+        st.transit = st.transit.saturating_sub(len);
         if let Some(h) = st.homes.get_mut(&key) {
             h.phys = Some(phys);
         }
