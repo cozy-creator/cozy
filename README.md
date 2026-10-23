@@ -31,7 +31,8 @@ cozy model search sdxl
 ```
 
 First-party packages and models have no owner (`sdxl/generate`, `flux-3-klein@0.1.0`); everyone
-else's are `owner/name` (`you/my-pack/generate`).
+else's are `owner/name` (`you/my-pack/generate`). cozy 0.11.13 and older need the old spelling,
+`fidika/sdxl/generate`; `cozy update` moves to a release that takes both.
 
 `cozy login` signs you up on first use, with a code it emails. Without an NVIDIA GPU here (a Mac,
 say), add `--on new` to run on a rented one. Outputs land in `~/.cozy/outputs`.
