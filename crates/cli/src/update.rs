@@ -100,6 +100,14 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     }
     let current = env!("CARGO_PKG_VERSION");
     let binary = installed()?;
+    if let Some(brew) = crate::calcifer_client::homebrew(&binary) {
+        return Err(Error::new(
+            Kind::Conflict,
+            "homebrew_managed",
+            format!("{} is Homebrew's cozy; Homebrew updates it", brew.display()),
+        )
+        .next("brew upgrade cozy"));
+    }
     let wanted = args.version.as_deref().map(|v| v.trim_start_matches('v'));
     let dir = match (&ctx.config.download_url, wanted) {
         (Some(url), _) => url.as_str().trim_end_matches('/').to_owned(),

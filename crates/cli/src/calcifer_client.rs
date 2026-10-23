@@ -683,9 +683,9 @@ pub fn path(segments: &[&str]) -> String {
 
 /// The home's installed `cozy`, the only one Calcifer and the machine run: the path the home
 /// records. With none recorded, or a recorded file gone (a package manager moved it), it is the
-/// installer's `<home>/bin/cozy` when that is there, else this cozy (Homebrew, winget, a distro
-/// package), and that is recorded. One rule for every installer; another cozy never replaces a
-/// recorded one that is there.
+/// installer's `<home>/bin/cozy` when that is there, else this cozy (Homebrew's stable path, winget,
+/// a distro package), and that is recorded. One rule for every installer; another cozy never
+/// replaces a recorded one that is there.
 pub(crate) fn installed(home: &Home) -> Result<PathBuf, Error> {
     let record = home.installed();
     let recorded = std::fs::read_to_string(&record).ok().map(|text| PathBuf::from(text.trim_end()));
@@ -695,12 +695,26 @@ pub(crate) fn installed(home: &Home) -> Result<PathBuf, Error> {
     let failed = |e: String| Error::new(Kind::Internal, "installed_unrecorded", e);
     let chosen = match home.binary() {
         binary if binary.is_file() => binary,
-        _ => std::env::current_exe().map_err(|e| failed(e.to_string()))?,
+        _ => {
+            let exe = std::env::current_exe().map_err(|e| failed(e.to_string()))?;
+            exe.canonicalize().ok().and_then(|exe| homebrew(&exe)).unwrap_or(exe)
+        }
     };
     home.open().map_err(|e| failed(e.to_string()))?;
     platform::durable::replace(&record, chosen.to_string_lossy().as_bytes(), 0o600)
         .map_err(|e| failed(e.to_string()))?;
     Ok(chosen)
+}
+
+/// Homebrew's `<prefix>/bin/cozy` for a cozy it installed at `<prefix>/Cellar/<formula>/<version>/bin/cozy`,
+/// a path every upgrade moves.
+pub(crate) fn homebrew(exe: &Path) -> Option<PathBuf> {
+    let bin = exe.parent()?;
+    let cellar = bin.parent()?.parent()?.parent()?;
+    if bin.file_name()? != "bin" || cellar.file_name()? != "Cellar" {
+        return None;
+    }
+    Some(cellar.parent()?.join("bin").join(exe.file_name()?))
 }
 
 /// The refusal a Calcifer that could not start left.
