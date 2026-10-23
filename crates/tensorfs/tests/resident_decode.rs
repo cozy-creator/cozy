@@ -59,6 +59,7 @@ fn resident_host_matches_all_frozen_u7_values_and_refuses_without_writing() {
             .collect();
         let len = case.dtype.byte_len(&case.shape).unwrap() as usize;
         let mut output = vec![0xA5; len];
+        // SAFETY: every part and `output` are live locals for the call.
         let result = unsafe {
             decode::into(
                 &case.encoding,
@@ -141,6 +142,7 @@ fn metadata_lengths_duplicates_output_and_overlap_are_checked_before_write() {
     } else {
         Dtype::F32
     };
+    // SAFETY: every part and the output are live locals for the call.
     let error = unsafe {
         decode::into(
             &case.encoding,
@@ -165,6 +167,7 @@ fn metadata_lengths_duplicates_output_and_overlap_are_checked_before_write() {
     let mut aliases = parts;
     aliases[0].src = Src::Host(storage.as_ptr());
     let before = storage.clone();
+    // SAFETY: every part, `storage` and the output are live locals for the call.
     let error = unsafe {
         decode::into(
             &case.encoding,
@@ -226,6 +229,7 @@ fn zero_logical_output_can_still_have_a_nonempty_codebook_owner() {
         },
     ];
     assert_eq!(parts.iter().map(|p| p.len).sum::<usize>(), 64);
+    // SAFETY: the parts and the output are live locals for the call.
     unsafe {
         decode::into(
             &encoding,

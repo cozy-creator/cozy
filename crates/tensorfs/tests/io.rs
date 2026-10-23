@@ -57,6 +57,7 @@ fn noise(seed: u64, n: usize) -> Vec<u8> {
 fn zero_source_changes_only_the_lent_host_gap() {
     let mut bytes = [0xa5; 37];
     let copy = Copy { src: Src::Zero, dst: Dst::host(&mut bytes[7..29]) };
+    // SAFETY: `bytes` outlives the call and nothing else touches it.
     let stats = unsafe { io::read(&[copy], &ReadOpts::default()) }.unwrap();
     assert_eq!(stats.bytes, 22);
     assert_eq!(&bytes[..7], &[0xa5; 7]);
@@ -75,8 +76,10 @@ fn cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes() {
         let gpu = io::DeviceBuffer::new(0, expected.len()).unwrap();
         let target = Target { component: &component, key: &key, role: &role, offset: 0,
             dst: Dst::Device { device: 0, ptr: gpu.ptr(), len: gpu.len(), stream: 0 } };
+        // SAFETY: `gpu` is a live device buffer for the call.
         unsafe { ck.read_into(&[target], &opts) }.unwrap();
         let mut bytes = vec![0; expected.len()];
+        // SAFETY: `gpu` and `bytes` are live for the call.
         unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: gpu.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) }], &opts) }.unwrap();
         assert_eq!(bytes, expected, "{component}/{key}#{role}");
     }
@@ -89,36 +92,52 @@ fn cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes() {
     let other = io::DeviceBuffer::new(0, host.len).unwrap();
     let source = host.bytes().as_ptr();
     let copy = Copy { src: Src::Host(source), dst: Dst::Device { device: 0, ptr: gpu.ptr(), len: gpu.len(), stream: 0 } };
+    // SAFETY: `host` and `gpu` are live for the calls.
     for _ in 0..2 { unsafe { io::read(&[copy], &opts) }.unwrap(); }
     let _context = io::cuda::CtxGuard::enter(gpu.context()).unwrap();
+    // SAFETY: `source` is live host memory.
     assert!(!unsafe { io::cuda::registered(source) }.unwrap(), "the completed reuse copy retained its temporary registration");
+    // SAFETY: `source` stays live for the registration's life.
     let mut pin = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
+    // SAFETY: as above.
     assert!(unsafe { io::cuda::registered(source) }.unwrap());
     // A second guard borrows the first registration. Neither explicit release nor an
     // unreleased borrowed guard's Drop may unregister the live owner's mapping.
+    // SAFETY: as above.
     let mut borrowed = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
     borrowed.release().unwrap();
     borrowed.release().unwrap();
+    // SAFETY: as above.
     assert!(unsafe { io::cuda::registered(source) }.unwrap(), "a borrowed release unregistered its owner's memory");
     drop(borrowed);
+    // SAFETY: as above.
     assert!(unsafe { io::cuda::registered(source) }.unwrap());
+    // SAFETY: as above.
     let borrowed = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
     drop(borrowed);
+    // SAFETY: as above.
     assert!(unsafe { io::cuda::registered(source) }.unwrap(), "a borrowed Drop unregistered its owner's memory");
+    // SAFETY: `host` and `gpu` are live for the call.
     unsafe { io::read(&[copy], &opts) }.unwrap();
+    // SAFETY: as above.
     assert!(unsafe { io::cuda::registered(source) }.unwrap());
+    // SAFETY: `gpu` and `other` are live device buffers for the call.
     unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: gpu.ptr(), stream: 0 }, dst: Dst::Device { device: 0, ptr: other.ptr(), len: other.len(), stream: 0 } }], &opts) }.unwrap();
     let mut bytes = vec![0; other.len()];
+    // SAFETY: `other` and `bytes` are live for the call.
     unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: other.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) }], &opts) }.unwrap();
     assert_eq!(bytes, expected);
     let zero = Copy { src: Src::Zero, dst: Dst::Device { device: 0, ptr: other.ptr() + 17, len: 9, stream: 0 } };
+    // SAFETY: as above.
     unsafe { io::read(&[zero], &opts) }.unwrap();
+    // SAFETY: as above.
     unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: other.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) }], &opts) }.unwrap();
     assert_eq!(&bytes[..17], &expected[..17]);
     assert_eq!(&bytes[17..26], &[0; 9]);
     assert_eq!(&bytes[26..], &expected[26..]);
     let assert_no_current_context = || {
         let mut current = std::ptr::null_mut();
+        // SAFETY: `current` is a writable out-pointer.
         io::cuda::check("cuCtxGetCurrent", unsafe { (io::cuda::driver().unwrap().ctx_get_current)(&mut current) }).unwrap();
         assert!(current.is_null(), "a HostPin release changed the caller's CUDA context");
     };
@@ -130,15 +149,19 @@ fn cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes() {
         pin.release().unwrap();
         assert_no_current_context();
     }
+    // SAFETY: `source` is live host memory.
     assert!(!unsafe { io::cuda::registered(source) }.unwrap());
     drop(pin);
+    // SAFETY: `source` stays live for the registration's life.
     let pin = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
+    // SAFETY: as above.
     assert!(unsafe { io::cuda::registered(source) }.unwrap());
     {
         let _unbound = io::cuda::CtxGuard::enter(std::ptr::null_mut()).unwrap();
         drop(pin);
         assert_no_current_context();
     }
+    // SAFETY: as above.
     assert!(!unsafe { io::cuda::registered(source) }.unwrap());
     println!("HostPin: owned explicit/implicit unregister, borrowed explicit/implicit preservation, engine preservation and context restoration passed");
 }

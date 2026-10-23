@@ -22,6 +22,7 @@ fn sealed(fx: &Fixture, tally: &IoTally) -> OwnedFd {
 fn resident(fd: i32) -> u64 {
     // SAFETY: fstat into a zeroed struct.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
     assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
     st.st_blocks as u64 * 512
 }
@@ -242,5 +243,6 @@ fn a_files_source_reads_exactly_the_verified_bytes_it_was_handed() {
     let other = Source::files(Vec::new(), true, 0);
     let it = layout.regions[1].items.iter().find(|it| matches!(it.source, varena::layout::ItemSource::Object(_))).unwrap();
     let mut buf = vec![0u8; layout.regions[1].span as usize];
+    // SAFETY: `buf` is a live, exclusive destination of the item's span.
     assert!(unsafe { other.read_item(it, buf.as_mut_ptr(), varena::io::Mode::Cache, &tally) }.is_err());
 }

@@ -189,6 +189,7 @@ fn state_magic(fd: RawFd) -> Result<u64> {
 fn file_size(fd: RawFd) -> Result<usize> {
     // SAFETY: fstat into a zeroed struct.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return Err(os("fstat host fd"));
     }
@@ -226,6 +227,7 @@ pub fn release_hold(hold: OwnedFd) -> Result<u64> {
     let locks = hold.as_fd();
     // SAFETY: fstat into a zeroed struct.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return Err(os("fstat held tier"));
     }
@@ -295,7 +297,9 @@ pub struct HostMem {
 
 // The mapping is shared memory addressed by offsets; all mutation goes through the plane's
 // books or through atomics.
+// SAFETY: the mapping is shared memory addressed by offsets; all mutation goes through the plane's books or atomics.
 unsafe impl Send for HostMem {}
+// SAFETY: as above.
 unsafe impl Sync for HostMem {}
 
 impl HostMem {
@@ -714,6 +718,7 @@ impl HostMem {
     pub fn resident_bytes(&self) -> u64 {
         // SAFETY: fstat into a zeroed struct.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
         if unsafe { libc::fstat(self.fd.as_raw_fd(), &mut st) } != 0 {
             return 0;
         }
@@ -926,6 +931,7 @@ impl OpenFill {
             let layout = &layout.regions[region as usize];
             // SAFETY: each selected region is exclusively owned by this fill until READY.
             let ptr = unsafe { self.host.base().add(layout.offset as usize) };
+            // SAFETY: the region is this fill's exclusive destination until READY, inside the live mapping.
             unsafe { source.read_items(&layout.items, layout.offset,
                 Dst::Host { ptr, len: layout.nbytes as usize }, threads, Mode::Cache, tally) }?;
             self.host.set_ready(region, true);

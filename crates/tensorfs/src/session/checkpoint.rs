@@ -356,6 +356,7 @@ impl Checkpoint {
         targets: &[Target<'_>],
         opts: &ReadOpts,
     ) -> Result<crate::io::ReadStats> {
+        // SAFETY: the caller's contract is `read_into`'s own (above).
         Ok(unsafe { self.data.raw.read_into(targets, opts) }?)
     }
 

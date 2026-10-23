@@ -133,6 +133,7 @@ fn child() {
     // SAFETY: as above; borrowed for the call.
     // SAFETY: as above; fd 10 is the eventfd when the parent passed one.
     let events = (unsafe { libc::fcntl(EVENTS, libc::F_GETFD) } >= 0).then(|| unsafe { BorrowedFd::borrow_raw(EVENTS) });
+    // SAFETY: fd 9 is the ledger the parent passed, open for this process's life.
     let ledger = Ledger::adopt(unsafe { BorrowedFd::borrow_raw(FD) }, events).unwrap();
     let (mut row, mut facts, mut created) = (None, Facts::default(), None);
     for line in std::io::stdin().lock().lines() {

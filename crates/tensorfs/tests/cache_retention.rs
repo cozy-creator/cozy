@@ -206,6 +206,7 @@ impl Owner {
     fn start(scratch: &Scratch, mode: &str) -> Self {
         let mut command = Command::new(std::env::current_exe().unwrap());
         // The harness owns this process group, including the real fork child, on timeout.
+        // SAFETY: the child only calls setpgid, which is async-signal-safe.
         unsafe {
             command.pre_exec(|| {
                 if libc::setpgid(0, 0) == 0 {
@@ -287,6 +288,7 @@ impl Owner {
 impl Drop for Owner {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
+            // SAFETY: a signal to the process group this owner started.
             unsafe {
                 libc::killpg(self.child.id() as i32, libc::SIGKILL);
             }
@@ -318,6 +320,7 @@ fn read_late(source: &Source, object: &ObjectRef) {
             len: object.length,
         }),
     };
+    // SAFETY: `bytes` is a live, exclusive destination for the call.
     unsafe {
         source
             .read_items(
@@ -486,6 +489,7 @@ fn native_owner_process() {
         "fork" => {
             let (mut parent, mut child) = UnixStream::pair().unwrap();
             // Fork occurs inside a fresh helper with no TensorFS background threads or activity.
+            // SAFETY: this helper process has no other threads when it forks.
             let pid = unsafe { libc::fork() };
             assert!(pid >= 0);
             if pid == 0 {
@@ -499,6 +503,7 @@ fn native_owner_process() {
                 assert_eq!(cmd, [b'q']);
                 drop(ck);
                 child.write_all(b"q").unwrap();
+                // SAFETY: the forked child ends without unwinding into the parent's state.
                 unsafe { libc::_exit(0) };
             }
             drop(child);
@@ -515,6 +520,7 @@ fn native_owner_process() {
             parent.read_exact(&mut reply).unwrap();
             assert_eq!(reply, [b'q']);
             let mut status = 0;
+            // SAFETY: `status` is a writable out-value for our own child.
             assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
             assert_eq!(status, 0);
             report("released");

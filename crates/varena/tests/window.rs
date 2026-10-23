@@ -81,6 +81,7 @@ fn serve_regions(fx: &Fixture, slots: usize, regions: &[Vec<String>]) -> (std::o
 fn resident(fd: i32) -> u64 {
     // SAFETY: fstat into a zeroed struct.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
     assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
     st.st_blocks as u64 * 512
 }

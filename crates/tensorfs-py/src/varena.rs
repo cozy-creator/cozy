@@ -519,6 +519,7 @@ unsafe extern "C" fn deleter(t: *mut DLManagedTensor) {
     if !t.is_null() {
         // SAFETY: both boxes were leaked by `__dlpack__` and are freed exactly once, here.
         let m = unsafe { Box::from_raw(t) };
+        // SAFETY: as above.
         drop(unsafe { Box::from_raw(m.manager_ctx as *mut Held) });
     }
 }
@@ -554,6 +555,7 @@ impl PyPinned {
         // SAFETY: `held` is live until the deleter runs.
         let dims = unsafe { (*held).dims.as_mut_ptr() };
         let (device, dtype) = (DLDevice { device_type: self.dl.0, device_id: self.dl.1 }, DLDataType { code: KDL_UINT, bits: 8, lanes: 1 });
+        // SAFETY: `dims` points at a two-element array in `held`; `add(1)` stays inside it.
         let dl_tensor = DLTensor { data: self.ptr as *mut c_void, device, ndim: 1, dtype, shape: dims, strides: unsafe { dims.add(1) }, byte_offset: 0 };
         let t = Box::into_raw(Box::new(DLManagedTensor { dl_tensor, manager_ctx: held as *mut c_void, deleter: Some(deleter) }));
         // SAFETY: the capsule takes the leaked tensor; on failure it is freed here.

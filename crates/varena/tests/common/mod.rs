@@ -111,6 +111,7 @@ impl Fixture {
             let mut v = vec![0u8; len.div_ceil(4096)];
             // SAFETY: vector sized for the page count.
             assert_eq!(unsafe { libc::mincore(p, len, v.as_mut_ptr()) }, 0);
+            // SAFETY: unmaps the mapping made above, which nothing else references.
             unsafe { libc::munmap(p, len) };
             n += v.iter().filter(|b| **b & 1 == 1).count();
         }

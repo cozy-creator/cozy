@@ -44,7 +44,9 @@ struct Ev {
     timing: bool,
     pool: Arc<Events>,
 }
+// SAFETY: an event handle used only with its pool's context entered; CUDA event calls are thread-safe.
 unsafe impl Send for Ev {}
+// SAFETY: as above.
 unsafe impl Sync for Ev {}
 type EvRef = Arc<Ev>;
 
@@ -81,7 +83,9 @@ struct Events {
     ctx: CUcontext,
     free: Mutex<[Vec<CUevent>; 2]>,
 }
+// SAFETY: the context handle and pooled events are used only under the pool's lock or with the context entered.
 unsafe impl Send for Events {}
+// SAFETY: as above.
 unsafe impl Sync for Events {}
 
 impl Events {
@@ -510,7 +514,9 @@ struct Inner {
     owner: Mutex<Weak<Gpu>>,
     custody: Mutex<Custody>,
 }
+// SAFETY: raw CUDA handles in here are used only with this GPU's context entered, under its locks.
 unsafe impl Send for Inner {}
+// SAFETY: as above.
 unsafe impl Sync for Inner {}
 
 /// One GPU of this process: its VA, chunk cache, copy stream and scratch slots.
@@ -865,6 +871,7 @@ impl Inner {
                 // SAFETY: source is complete inside the retained host layout; destination is the
                 // placement's exclusive mapped region until this fill is published.
                 let ptr = unsafe { host.base().add(layout.offset as usize) };
+                // SAFETY: as above.
                 unsafe { byte_io::read(&[Copy { src: Src::Host(ptr), dst }], &ReadOpts::default()) }?;
             }
             _ if layout.nbytes > 0 => {
@@ -1687,7 +1694,9 @@ struct Anon {
     ptr: *mut u8,
     len: usize,
 }
+// SAFETY: an anonymous mapping this value owns; access goes through `&self`/`&mut self` like any buffer.
 unsafe impl Send for Anon {}
+// SAFETY: as above.
 unsafe impl Sync for Anon {}
 
 impl Anon {

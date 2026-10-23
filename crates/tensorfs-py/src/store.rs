@@ -1228,6 +1228,7 @@ unsafe extern "C" fn deleter(t: *mut DLManagedTensor) {
     }
     // SAFETY: both boxes were leaked by `__dlpack__` and are freed exactly once, here.
     let m = unsafe { Box::from_raw(t) };
+    // SAFETY: as above.
     drop(unsafe { Box::from_raw(m.manager_ctx as *mut Held) });
 }
 
@@ -1275,6 +1276,7 @@ impl PyArray {
                     },
                     dst: Dst::host(&mut bytes),
                 };
+                // SAFETY: `bytes` is a live, exclusive host destination and `buffer` the live device source for the call.
                 if let Err(error) = unsafe { io::read(&[request], &ReadOpts::default()) } {
                     defer_failed_cuda(buffer.device(), (Arc::clone(buffer), bytes));
                     return Err(error.source.into());
@@ -1361,6 +1363,7 @@ impl PyArray {
                     bits,
                     lanes: 1,
                 },
+                // SAFETY: `held` was leaked just above and lives until the deleter runs.
                 shape: unsafe { (*held).shape.as_mut_ptr() },
                 strides: std::ptr::null_mut(),
                 byte_offset: 0,
@@ -1447,6 +1450,7 @@ impl Drop for DlpackRelease {
                 // SAFETY: successful capsule rename transferred this unique managed
                 // tensor to us; all uses have completed and it is released exactly once.
                 if let Some(deleter) = unsafe { (*managed).deleter } {
+                    // SAFETY: as above.
                     unsafe { deleter(managed) };
                 }
             }
@@ -1550,9 +1554,11 @@ impl Dlpack {
                 .as_ref()
                 .unwrap()
                 .bind(py);
+            // SAFETY: `capsule` is a live Python object, checked while the GIL is held.
             if unsafe { ffi::PyCapsule_IsValid(capsule.as_ptr(), DLTENSOR.as_ptr()) } != 1 {
                 return Err(invalid(py, "__dlpack__ did not return a dltensor capsule"));
             }
+            // SAFETY: a valid dltensor capsule (checked above) holds a DLManagedTensor pointer.
             let managed = unsafe {
                 ffi::PyCapsule_GetPointer(capsule.as_ptr(), DLTENSOR.as_ptr())
                     as *mut DLManagedTensor
@@ -1560,6 +1566,7 @@ impl Dlpack {
             if managed.is_null() {
                 return Err(PyErr::fetch(py));
             }
+            // SAFETY: non-null (checked above), and the capsule keeps the managed tensor alive.
             let tensor = unsafe { &(*managed).dl_tensor };
             if tensor.device.device_type != device.0
                 || (device.0 == KDL_CUDA && tensor.device.device_id != device.1)
@@ -1577,6 +1584,7 @@ impl Dlpack {
             let dims = if tensor.ndim == 0 {
                 &[][..]
             } else {
+                // SAFETY: the exporter's `shape` holds `ndim` dimensions while the capsule is alive.
                 unsafe { std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize) }
             };
             let inferred_shape: Vec<u64> = dims
@@ -1587,6 +1595,7 @@ impl Dlpack {
             for i in (0..dims.len()).rev() {
                 if !tensor.strides.is_null()
                     && dims[i] > 1
+                    // SAFETY: `strides`, when present, holds `ndim` entries while the capsule is alive; `i < ndim`.
                     && unsafe { *tensor.strides.add(i) } != stride
                 {
                     return Err(invalid(py, "expected a contiguous DLPack array"));

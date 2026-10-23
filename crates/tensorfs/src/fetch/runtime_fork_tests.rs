@@ -83,6 +83,7 @@ fn fork_request(url: &str) -> libc::pid_t {
     assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
     if pid == 0 {
         let ok = std::panic::catch_unwind(|| request(url)).unwrap_or(false);
+        // SAFETY: the forked child ends here without unwinding into the parent's state.
         unsafe { libc::_exit(if ok { 0 } else { 1 }) };
     }
     pid

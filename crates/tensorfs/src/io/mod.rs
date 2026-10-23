@@ -83,8 +83,11 @@ pub enum Dst {
 
 // SAFETY: sources and destinations are addresses; `read`'s contract lends them to the engine.
 unsafe impl Send for Dst {}
+// SAFETY: as above.
 unsafe impl Sync for Dst {}
+// SAFETY: as above.
 unsafe impl Send for Src<'_> {}
+// SAFETY: as above.
 unsafe impl Sync for Src<'_> {}
 
 impl Dst {
@@ -230,6 +233,7 @@ pub fn drain(device: i32) -> cuda::Result<()> {
 /// An error or best-effort destructor is not a proof that borrowed memory is reusable.
 /// Host destinations use joined CPU copies from owned staging, never asynchronous GPU writes.
 pub unsafe fn read(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats, Error> {
+    // SAFETY: the caller's contract is `read`'s own (above).
     unsafe { read_impl(copies, opts, false) }
 }
 
@@ -238,6 +242,7 @@ pub unsafe fn read(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats, Error>
 /// Device destination ownership still follows `read`'s checked error-completion contract.
 #[cfg(any(feature = "store", unix))]
 pub(crate) unsafe fn read_staged(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats, Error> {
+    // SAFETY: the caller's contract is `read`'s own, with host sources staged.
     unsafe { read_impl(copies, opts, true) }
 }
 
@@ -280,6 +285,7 @@ unsafe fn read_impl(
     } else {
         #[cfg(unix)]
         let host_start = Instant::now();
+        // SAFETY: host copies keep `read`'s contract.
         let stats = unsafe { host::fill(&host_copies, opts) }.map_err(|e| Error {
             copy: host[e.copy].0,
             source: e.source,
@@ -288,6 +294,7 @@ unsafe fn read_impl(
         disk_run(&host_copies, &stats, host_start.elapsed().as_nanos() as u64);
         stats
     };
+    // SAFETY: device copies keep `read`'s contract.
     let device = unsafe { device::fill(&devices, opts, staged_host) }?;
     stats.direct += device.direct;
     stats.cached += device.cached;
