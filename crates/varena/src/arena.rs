@@ -54,6 +54,8 @@ const ALIGN: u64 = 512;
 const CLASSES: [u64; 15] = [512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536];
 /// A pool span no stream has used yet: the capture stream that first needs it takes it.
 const ANY: usize = usize::MAX;
+/// The float: idle spans kept for allocation latency at least this big (leases §2).
+pub const FLOAT: u64 = 64 << 20;
 /// The poller's cadence while epochs are outstanding: it doubles to the longest while nothing lands.
 const NAP: Duration = Duration::from_micros(50);
 const NAP_MAX: Duration = Duration::from_millis(2);
@@ -137,6 +139,9 @@ pub struct Stats {
     /// Every span mapped: the arenas' and the idle list's.
     pub mapped: u64,
     pub idle: u64,
+    /// The allocator's own overhead: mapped less live torch bytes (the idle float, and free bytes
+    /// inside spans in use).
+    pub fragmentation: u64,
     pub arenas: Vec<(Owner, ArenaStats)>,
 }
 
@@ -236,6 +241,8 @@ struct State {
     allocated: u64,
     peak: u64,
     mapped: u64,
+    /// The most it held: a request's spans that went idle mid-request are its next step's.
+    peak_mapped: u64,
     /// A pool: captures begun less graphs released (torch's use count).
     users: u32,
     /// A pool released with no fence: its epoch fallback is stamped once no capture is open.
@@ -674,6 +681,10 @@ struct Shared {
     peak: AtomicU64,
     mapped: AtomicU64,
     stop: AtomicBool,
+    /// The largest span taken since the last request ended, and in the request before: the
+    /// float holds at least one of them.
+    taken: AtomicU64,
+    taken_before: AtomicU64,
 }
 
 /// One device's torch allocator: every arena, the idle list and the epoch poller.
@@ -709,6 +720,8 @@ impl Torch {
             peak: AtomicU64::new(0),
             mapped: AtomicU64::new(0),
             stop: AtomicBool::new(false),
+            taken: AtomicU64::new(0),
+            taken_before: AtomicU64::new(0),
         });
         let weak = Arc::downgrade(&sh);
         std::thread::Builder::new().name("varena-epochs".into()).spawn(move || poll(&weak)).map_err(|e| Error::io("spawn the epoch poller", e))?;
@@ -893,8 +906,16 @@ impl Torch {
         }
         let Some(a) = self.sh.arenas.lock().remove(&owner) else { return Ended::default() };
         a.ended.store(true, Release);
-        let st = a.st.lock();
-        Ended { allocated: st.allocated, peak: st.peak, outlived: st.live() }
+        if matches!(owner, Owner::Request(_)) {
+            self.sh.taken_before.store(self.sh.taken.swap(0, AcqRel), Release);
+        }
+        let ended = {
+            let st = a.st.lock();
+            Ended { allocated: st.allocated, peak: st.peak, outlived: st.live() }
+        };
+        // Its idle spans beyond the float go back now.
+        self.sh.kick();
+        ended
     }
 
     pub fn stats(&self) -> Stats {
@@ -909,7 +930,8 @@ impl Torch {
             })
             .collect();
         let (quiet, pending) = sh.idle.lock().bytes();
-        Stats { allocated: sh.allocated.load(Acquire), peak: sh.peak.load(Acquire), mapped: sh.mapped.load(Acquire), idle: quiet + pending, arenas }
+        let (allocated, mapped) = (sh.allocated.load(Acquire), sh.mapped.load(Acquire));
+        Stats { allocated, peak: sh.peak.load(Acquire), mapped, idle: quiet + pending, fragmentation: mapped.saturating_sub(allocated), arenas }
     }
 
     /// An arena's peak since the last reset (a pass's compute peak); it restarts at what is live.
@@ -1218,6 +1240,8 @@ impl Shared {
         st.blocks.insert(base, Block { len, span: base, free: true });
         st.free.insert((stream, tier, len, base));
         st.mapped += len;
+        st.peak_mapped = st.peak_mapped.max(st.mapped);
+        self.taken.fetch_max(len, AcqRel);
         self.dir.write().insert(base, (len, a.clone()));
     }
 
@@ -1463,6 +1487,25 @@ impl Shared {
         progress
     }
 
+    /// What idle may hold (leases rev 6: as little as hides allocation latency): the float, at least
+    /// the largest recent span, plus what open requests held at their peak beyond what they hold
+    /// now (their next step's spans).
+    fn keep(&self) -> u64 {
+        let requests: Vec<Arc<Arena>> = self.arenas.lock().values().filter(|a| matches!(a.owner, Owner::Request(_))).cloned().collect();
+        let working: u64 = requests.iter().map(|a| {
+            let st = a.st.lock();
+            st.peak_mapped.saturating_sub(st.mapped)
+        }).sum();
+        FLOAT.max(self.taken.load(Acquire)).max(self.taken_before.load(Acquire)) + working
+    }
+
+    /// Quiet idle spans beyond [`Shared::keep`] go back to the source now, oldest first.
+    fn trim(&self) -> bool {
+        let quiet = self.idle.lock().bytes().0;
+        let keep = self.keep();
+        quiet > keep && self.reclaim(quiet - keep) > 0
+    }
+
     /// One round: record wanted epochs (no capture open), query those in flight, settle arenas.
     /// Returns (progress, busy).
     fn tick(&self) -> (bool, bool) {
@@ -1482,6 +1525,7 @@ impl Shared {
             a.queued.store(false, Release);
             progress |= self.settle(&a);
         }
+        progress |= self.trim();
         self.backend.sweep();
         let busy = !self.pending.lock().is_empty() || clocks.iter().any(|c| !c.lost.load(Acquire) && c.wanted.load(Acquire) > c.done.load(Acquire));
         (progress, busy)

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 use platform::handles::Owned;
 use tensorfs::io::Dst;
-use varena::arena::{Chunk, Direct, Kind, Owner, PoolId, Source, Torch, CHUNK, OWN};
+use varena::arena::{Chunk, Direct, Kind, Owner, PoolId, Source, Torch, CHUNK, FLOAT, OWN};
 use varena::{Access, Backend, Event, HostBackend, Physical, Va};
 
 const MB: u64 = 1 << 20;
@@ -600,9 +600,8 @@ fn place(live: &mut BTreeMap<u64, u64>, at: u64, len: u64) {
     live.insert(at, len);
 }
 
-/// One request's mixed blocks on one stream, freed in a shuffled order but `keep`.
-fn request(r: &Rig, id: u64, seed: u64, keep: usize) -> (Vec<(u64, u64)>, varena::arena::Ended) {
-    let route = r.torch.route(Owner::Request(id));
+/// One round of mixed blocks on one stream, freed in a shuffled order but `keep`.
+fn round(r: &Rig, seed: u64, keep: usize) -> Vec<(u64, u64)> {
     let mut rng = Rng(seed);
     let mut live = BTreeMap::new();
     let mut blocks: Vec<(u64, u64)> = (0..600)
@@ -618,25 +617,55 @@ fn request(r: &Rig, id: u64, seed: u64, keep: usize) -> (Vec<(u64, u64)>, varena
     }
     let kept = blocks.split_off(blocks.len() - keep);
     blocks.iter().for_each(|(at, size)| r.torch.free(*at, *size, A));
+    kept
+}
+
+/// One request: a round in its own arena, then its end.
+fn request(r: &Rig, id: u64, seed: u64, keep: usize) -> (Vec<(u64, u64)>, varena::arena::Ended) {
+    let route = r.torch.route(Owner::Request(id));
+    let kept = round(r, seed, keep);
     drop(route);
     (kept, r.torch.end(Owner::Request(id)))
 }
 
-/// Fragmentation: a request's spans all come free whole at its end, whatever its order of frees;
-/// the next request of the same shapes runs on them with no new mapping.
+/// Fragmentation: a request's spans all come free whole, whatever its order of frees. Within the
+/// request they serve its next round with no new mapping; past its end, all but the float go
+/// back to the manager (leases rev 6: no idle hoarding), and what is mapped is the float alone.
 #[test]
-fn a_request_comes_free_whole_at_its_end() {
+fn a_request_comes_free_whole_and_gives_back_all_but_the_float() {
     let r = rig(8 << 30, true);
-    let (_, ended) = request(&r, 1, 0x9e3779b97f4a7c15, 0);
-    assert!(ended.outlived.is_empty(), "{:?}", ended.outlived);
-    let s = r.torch.stats();
-    assert_eq!((s.allocated, s.idle, s.mapped), (0, s.mapped, s.mapped), "a span stayed in an arena");
-    assert!(s.arenas.iter().all(|(o, _)| *o == Owner::Process), "the ended arena stayed registered");
-    until("every span is quiet", || r.torch.idle().1 == 0);
+    let route = r.torch.route(Owner::Request(1));
+    round(&r, 0x9e3779b97f4a7c15, 0);
     let maps = r.maps();
-    let (_, warm) = request(&r, 2, 0x9e3779b97f4a7c15, 0);
-    assert!(warm.outlived.is_empty());
-    assert_eq!(r.maps(), maps, "a warm request of the same shapes mapped new spans");
+    round(&r, 0x9e3779b97f4a7c15, 0);
+    assert_eq!(r.maps(), maps, "the request's second round mapped new spans");
+    drop(route);
+    let ended = r.torch.end(Owner::Request(1));
+    assert!(ended.outlived.is_empty(), "{:?}", ended.outlived);
+    until("idle trims to the float", || {
+        let s = r.torch.stats();
+        s.idle == s.mapped && s.mapped <= 2 * OWN && r.torch.idle().1 == 0
+    });
+    let s = r.torch.stats();
+    assert!(r.source.unmaps.load(SeqCst) > 0, "nothing went back");
+    assert_eq!((s.allocated, s.fragmentation), (0, s.mapped));
+    assert!(s.arenas.iter().all(|(o, _)| *o == Owner::Process), "the ended arena stayed registered");
+}
+
+/// Idle beyond the float goes back as soon as its epoch passed; fragmentation is what is mapped
+/// beyond the live bytes.
+#[test]
+fn idle_beyond_the_float_goes_back_promptly() {
+    let r = rig(512 * MB, true);
+    let live = r.torch.alloc(MB, B, None).unwrap();
+    let blocks: Vec<u64> = (0..3).map(|_| r.torch.alloc(40 * MB, A, None).unwrap()).collect();
+    blocks.iter().for_each(|b| r.torch.free(*b, 40 * MB, A));
+    until("idle trims to the float", || r.torch.idle().0 <= FLOAT && r.source.unmaps.load(SeqCst) >= 2);
+    let s = r.torch.stats();
+    assert_eq!(s.fragmentation, s.mapped - s.allocated);
+    assert_eq!(s.allocated, MB);
+    assert!(s.mapped <= FLOAT + 2 * MB, "{} mapped beyond the float and the live span", s.mapped);
+    r.torch.free(live, MB, B);
 }
 
 /// The request-end audit names a survivor; its span stays until it frees, then leaves too.
@@ -650,8 +679,10 @@ fn a_survivor_is_named_and_its_span_leaves_once_it_frees() {
     assert!(ended.outlived[0].bytes >= size);
     assert!(r.torch.stats().idle < r.torch.stats().mapped, "the survivor's span left");
     r.torch.free(ptr, size, A);
-    let s = r.torch.stats();
-    assert_eq!((s.allocated, s.idle), (0, s.mapped));
+    until("everything mapped is idle", || {
+        let s = r.torch.stats();
+        (s.allocated, s.idle) == (0, s.mapped)
+    });
 }
 
 /// M2/R11: a cache region's blocks never share a span with a request's, so the region's spans
@@ -874,6 +905,7 @@ fn a_leased_memory_allocates_only_from_its_grants() {
 
 /// `pairs` malloc+free pairs of `sizes` on `stream`, 32 to 64 blocks live: ns per pair.
 fn churn(torch: &Torch, sizes: &[u64], stream: usize, pairs: usize) -> f64 {
+    let _step = torch.route(Owner::Request(stream as u64));
     let mut held: Vec<(u64, u64)> = Vec::with_capacity(64);
     let start = Instant::now();
     for i in 0..pairs {
