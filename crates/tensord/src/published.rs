@@ -2989,8 +2989,8 @@ pub(crate) mod tests {
     }
 
     /// A machine on the GPUs its inventory names (compute capability, memory) holding `package`,
-    /// whose `render` declares `slots`, and a Hub publishing `acme/model@1.0.0` in `lanes` and the
-    /// LoRA `acme/lora@1.0.0`.
+    /// whose `render` declares `slots`, and a Hub publishing `_/model@1.0.0` in `lanes` and the
+    /// LoRA `_/lora@1.0.0`.
     pub(crate) struct Machine {
         pub root: PathBuf,
         pub service: Arc<Service>,
@@ -3077,11 +3077,11 @@ pub(crate) mod tests {
                     let (dtype,bytes) = if *lane == "bf16" { (Dtype::BF16,vec![0u8;256]) } else if *lane == "fp16" { (Dtype::F16,vec![0u8;256]) } else { (Dtype::F32,f32s(128,tag.into())) };
                     writer.get("unet").put("proj.weight",&dtype,&shape,Data::Plain(Source::Read(&mut bytes.as_slice()))).unwrap();
                 }
-                model("acme/model", lane, writer.commit().unwrap())
+                model("_/model", lane, writer.commit().unwrap())
             }).collect();
             let lanes = models.iter().map(|model| (model.header.id(), model.lane.clone())).collect();
             let lora = [("proj.lora_A.weight", vec![2, 32], f32s(64, 0.25)), ("proj.lora_B.weight", vec![4, 2], f32s(8, 0.75))];
-            models.push(model("acme/lora", "bf16", tensors(&source, "lora", "adapter", &lora)));
+            models.push(model("_/lora", "bf16", tensors(&source, "lora", "adapter", &lora)));
             let (origin, heard) = names_hub::models(&source, models);
             let hub = hub::Source::new(&origin, None, None).unwrap();
             Self { root, service, publisher, installation, hub, heard, lanes }
@@ -3112,7 +3112,7 @@ pub(crate) mod tests {
     }
 
     impl Machine {
-        /// The lanes of `acme/model` whose checkpoint the Hub served.
+        /// The lanes of `_/model` whose checkpoint the Hub served.
         fn landed(&self, asked: &[String]) -> std::collections::BTreeSet<&str> {
             let lane = |sha: &str| self.lanes.get(&format!("sha256:{sha}")).map(String::as_str);
             asked.iter().filter_map(|heard| heard.strip_prefix("GET /o/")).filter_map(lane).collect()
@@ -3267,19 +3267,19 @@ pub(crate) mod tests {
     fn a_fallback_warns_asked_bits_refuse_and_a_declined_encoding_warns() {
         let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
         let hopper = Machine::new("acme/pkg", &[("9.0", 80 * GIB)], slots.clone(), &["bf16"]);
-        let warned = ["precision 8: acme/model@1.0.0 has no int8 or fp8 lane for sm90; served bf16".to_string()];
+        let warned = ["precision 8: _/model@1.0.0 has no int8 or fp8 lane for sm90; served bf16".to_string()];
         let (lanes, warnings, asked) = hopper.run(0);
         assert_eq!((lanes, warnings), (vec!["bf16".to_string()], warned.to_vec()));
         assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["bf16"]));
         let (_, warnings, asked) = hopper.run(0);
         assert_eq!((warnings, asked), (warned.to_vec(), vec![]), "a warm run warns again and asks nothing");
         let ada = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], slots, &["int8", "bf16"]);
-        assert_eq!(ada.attempt(4, vec![]).err(), Some(("model_resolution_failed", "precision 4 on sm89: acme/model@1.0.0 has no variant \
+        assert_eq!(ada.attempt(4, vec![]).err(), Some(("model_resolution_failed", "precision 4 on sm89: _/model@1.0.0 has no variant \
             that works; it publishes model.bf16.cozytensors (bf16) is not 4-bit; model.int8.cozytensors (int8) is not 4-bit".to_string())));
         let declines = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "refuse"}]);
         let ada = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], declines, &["int8", "bf16"]);
         let (lanes, warnings, _) = ada.run(0);
-        assert_eq!((lanes, warnings), (vec!["bf16".to_string()], vec!["precision 8: acme/model@1.0.0 declines encoded leaves; served bf16".to_string()]));
+        assert_eq!((lanes, warnings), (vec!["bf16".to_string()], vec!["precision 8: _/model@1.0.0 declines encoded leaves; served bf16".to_string()]));
     }
 
     /// H3's nvfp4 variant keeps a sensitive layer int8, which holds most of its bytes and makes it
@@ -3311,7 +3311,7 @@ pub(crate) mod tests {
             assert_eq!(served, [("base_model", Some(lane), precision), ("turbo_lora", None, "f32")], "{bits}");
         }
         let (code, message) = blackwell.attempt(16, vec![]).err().unwrap();
-        assert!(code == "model_resolution_failed" && message.contains("acme/model@1.0.0 has no variant that works"), "{message}");
+        assert!(code == "model_resolution_failed" && message.contains("_/model@1.0.0 has no variant that works"), "{message}");
     }
 
     /// A function's main model is its first slot constructed up front: Klein's drafter is on
@@ -3332,7 +3332,7 @@ pub(crate) mod tests {
         let mixed = Machine::new("acme/pkg", &[("8.6", 24 * GIB), ("8.9", 24 * GIB)], slots, &["fp8", "bf16"]);
         let (lanes, warnings, _) = mixed.run(0);
         assert_eq!((lanes, warnings), (vec!["bf16".to_string()],
-            vec!["precision 8: acme/model@1.0.0 has no int8 lane for sm86+sm89; served bf16".to_string()]));
+            vec!["precision 8: _/model@1.0.0 has no int8 lane for sm86+sm89; served bf16".to_string()]));
     }
 
     /// `--lora` on a slot naming no model: the slot's default, in the rule's lane, under the
@@ -3341,18 +3341,18 @@ pub(crate) mod tests {
     fn an_adapter_only_choice_takes_the_slots_default() {
         let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
         let hopper = Machine::new("acme/pkg", &[("9.0", 80 * GIB)], slots, &["bf16", "int8"]);
-        let adapter = domain::DownloadAdapterRef { model: "acme/lora".into(), release: "1.0.0".into(), ..Default::default() };
+        let adapter = domain::DownloadAdapterRef { model: "_/lora".into(), release: "1.0.0".into(), ..Default::default() };
         let lora = domain::ModelChoice { parameter: "model".into(), adapters: vec![adapter], ..Default::default() };
         let plan = hopper.prepare(0, vec![lora]).plan.unwrap();
         let asked = std::mem::take(&mut *hopper.heard.lock().unwrap());
         assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["bf16", "int8"]));
-        assert!(asked.iter().any(|heard| heard == "GET /refs/acme/lora.json"), "{asked:?}");
+        assert!(asked.iter().any(|heard| heard == "GET /refs/_/lora.json"), "{asked:?}");
         assert!(plan.slots[0].binding.model.starts_with("view-"), "{:?}", plan.slots[0].binding);
     }
 
-    /// Unpublished code's org-less default is the run owner's model.
+    /// Unpublished code's org-less default is the root's model (xs-071), whoever runs it.
     #[test]
-    fn a_local_packages_default_is_its_owners() {
+    fn a_local_packages_bare_default_is_the_roots() {
         let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
         assert_eq!(Machine::new("local/script", &[("8.9", 24 * GIB)], slots, &["int8"]).run(0).0, ["int8"]);
     }

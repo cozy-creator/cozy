@@ -1415,7 +1415,7 @@ mod tests {
         let digest = tensorfs::sha256::digest(&store.read(&header).unwrap()).to_vec();
         let by_hash = domain::ModelChoice { manifest: Some(domain::Ref { digest, length: header.length }), ..Default::default() };
         assert_eq!(resolve(Some(by_hash)).unwrap().manifest, header.id());
-        let hub_model = domain::ModelChoice { repository: "acme/model".into(), release: "1.0.0".into(), ..Default::default() };
+        let hub_model = domain::ModelChoice { repository: "_/model".into(), release: "1.0.0".into(), ..Default::default() };
         assert_eq!(resolve(Some(hub_model)).err().unwrap().code, "hub_access_absent");
         assert!(machine.heard.lock().unwrap().is_empty(), "a run without Hub access asks no Hub");
     }
