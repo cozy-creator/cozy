@@ -36,7 +36,6 @@ jobs:
     env:
       CARGO_PROFILE_RELEASE_LTO: "off"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-      OUT: ${{ runner.temp }}/mps
     steps:
       - uses: actions/checkout@v5
       - uses: actions/checkout@v5
@@ -48,6 +47,7 @@ jobs:
 
       - name: Build cozy and the wheels
         run: |
+          echo "OUT=$RUNNER_TEMP/mps" >> "$GITHUB_ENV"; OUT=$RUNNER_TEMP/mps
           sysctl -n machdep.cpu.brand_string hw.memsize; sw_vers -productVersion
           cargo build --release --locked -p cozy -p tensorfs --bin cozy --bin tfs
           mkdir -p ~/.cozy/bin crates/tensorfs-py/wheel-data/scripts "$OUT"
@@ -96,6 +96,15 @@ jobs:
         run: |
           cozy machine logs local > "$OUT/machine.log" 2>&1 || true
           cozy --json run list --on local > "$OUT/runs.json" 2>&1 || true
+
+      # The builds a real Mac takes with `cozy machine update local --tensord … --runtime-wheel … --tensorfs-wheel …`.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mps-builds
+          path: |
+            target/release/cozy
+            ${{ runner.temp }}/wheels
+          retention-days: 30
 
       - uses: actions/upload-artifact@v4
         if: always()
