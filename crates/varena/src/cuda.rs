@@ -11,7 +11,7 @@ use platform::handles::Owned;
 use tensorfs::io::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUdevice, CUevent, CUstream, CtxGuard};
 use tensorfs::io::Dst;
 
-use crate::backend::{Access, Backend, Event, Events, Physical, Va};
+use crate::backend::{Access, Backend, Event, Events, Lazy, Physical, User, Va};
 use crate::{Error, GpuId, Result};
 
 #[cfg(unix)]
@@ -65,6 +65,79 @@ struct SecurityAttributes {
     inherit: i32,
 }
 
+/// What a page's `AllocationProp` points at, kept for as long as pages are created.
+#[cfg(windows)]
+type Security = Box<SecurityAttributes>;
+#[cfg(unix)]
+type Security = ();
+
+/// Device `ordinal`, when it has VMM and shareable handles.
+fn device(ordinal: i32) -> Result<CUdevice> {
+    let mut device: CUdevice = 0;
+    call!("cuDeviceGet", device_get(&mut device, ordinal))?;
+    for (attr, what) in [(cuda::ATTR_VMM_SUPPORTED, "virtual memory management"), (HANDLES_SUPPORTED, "shareable handles")] {
+        if cuda::attribute(device, attr)? == 0 {
+            return Err(Error::Invalid(format!("CUDA device {ordinal} has no {what}")));
+        }
+    }
+    Ok(device)
+}
+
+/// Exportable pages on `device`.
+fn pages(device: CUdevice) -> (AllocationProp, Security) {
+    #[allow(unused_mut)]
+    let mut prop = AllocationProp::device(device, HANDLES);
+    #[cfg(windows)]
+    let security = Box::new(SecurityAttributes { length: std::mem::size_of::<SecurityAttributes>() as u32, descriptor: std::ptr::null_mut(), inherit: 0 });
+    #[cfg(windows)]
+    {
+        prop.win32_handle_meta_data = (&*security as *const SecurityAttributes).cast_mut().cast();
+    }
+    #[cfg(unix)]
+    let security = ();
+    (prop, security)
+}
+
+fn nvml(device: CUdevice) -> Option<platform::gpu::Device> {
+    cuda::uuid(device)
+        .map_err(Error::from)
+        .and_then(|uuid| platform::gpu::Device::open(&uuid).map_err(Error::from))
+        .inspect_err(|e| tracing::warn!(target: "varena", "NVML: {e}: no process bytes measured"))
+        .ok()
+}
+
+/// NVML's figure for this pid. Where the driver names no process of ours (WDDM has no
+/// per-process numbers; a container whose pids are the host's) there is none: an error.
+fn process_used(nvml: Option<&platform::gpu::Device>) -> Result<u64> {
+    let nvml = nvml.ok_or_else(|| Error::Io("NVML is unavailable: no process bytes".into()))?;
+    let reading = nvml.read()?;
+    reading.processes.as_ref().and_then(|p| p.get(&std::process::id()).copied()).ok_or_else(|| Error::Device {
+        op: "process_used",
+        code: -1,
+        name: "the driver names no process of ours (WDDM, or another pid namespace)".into(),
+    })
+}
+
+/// A handle another process imports `page` by; its context is current.
+fn export(page: &Physical) -> Result<Owned> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+        let mut fd: c_int = -1;
+        call!("cuMemExportToShareableHandle", mem_export((&mut fd as *mut c_int).cast(), page.id, HANDLES, 0))?;
+        // SAFETY: the driver made this descriptor for us to own.
+        Ok(unsafe { Owned::from_raw_fd(fd) })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::FromRawHandle;
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        call!("cuMemExportToShareableHandle", mem_export((&mut handle as *mut *mut c_void).cast(), page.id, HANDLES, 0))?;
+        // SAFETY: the driver made this NT handle for us to own.
+        Ok(unsafe { Owned::from_raw_handle(handle) })
+    }
+}
+
 /// One CUDA device's VMM mechanism.
 pub struct CudaBackend {
     ordinal: i32,
@@ -79,9 +152,7 @@ pub struct CudaBackend {
     context: u64,
     /// varena's event ids over the driver's handles (`CUevent` as usize): never reused.
     events: Events<usize>,
-    /// What `prop`'s WIN32 metadata points at, for as long as pages are created.
-    #[cfg(windows)]
-    _security: Box<SecurityAttributes>,
+    _security: Security,
     /// This process's WDDM budget on the device's adapter (matched by LUID), where DXGI has one.
     #[cfg(windows)]
     budget: Option<std::sync::Arc<platform::gpu::Budget>>,
@@ -90,36 +161,22 @@ pub struct CudaBackend {
 // SAFETY: driver handles are opaque and every use enters their context; `prop`'s only pointer is
 // the WIN32 metadata, owned by the backend and never written.
 unsafe impl Send for CudaBackend {}
+// SAFETY: as above.
 unsafe impl Sync for CudaBackend {}
 
 impl CudaBackend {
     /// Device `ordinal` as CUDA enumerates it (after `CUDA_VISIBLE_DEVICES`), on its primary
     /// context, retained while the backend lives.
     pub fn open(ordinal: i32) -> Result<CudaBackend> {
-        let mut device: CUdevice = 0;
-        call!("cuDeviceGet", device_get(&mut device, ordinal))?;
-        for (attr, what) in [(cuda::ATTR_VMM_SUPPORTED, "virtual memory management"), (HANDLES_SUPPORTED, "shareable handles")] {
-            if cuda::attribute(device, attr)? == 0 {
-                return Err(Error::Invalid(format!("CUDA device {ordinal} has no {what}")));
-            }
-        }
-        let nvml = platform::gpu::Device::open(&cuda::uuid(device)?)
-            .inspect_err(|e| tracing::warn!(target: "varena", "NVML: {e}: no process bytes measured"))
-            .ok();
+        let device = device(ordinal)?;
+        let nvml = nvml(device);
         let before = used(nvml.as_ref());
         let (_, ctx) = cuda::primary_context(ordinal)?;
         let primary = Primary { device, ctx: ctx as usize };
         let stream = cuda::Stream::new(ordinal)?;
         // A context that existed before `open` (a framework made it) measures 0 here.
         let context = used(nvml.as_ref()).zip(before).map_or(0, |(after, before)| after.saturating_sub(before));
-        #[allow(unused_mut)]
-        let mut prop = AllocationProp::device(device, HANDLES);
-        #[cfg(windows)]
-        let security = Box::new(SecurityAttributes { length: std::mem::size_of::<SecurityAttributes>() as u32, descriptor: std::ptr::null_mut(), inherit: 0 });
-        #[cfg(windows)]
-        {
-            prop.win32_handle_meta_data = (&*security as *const SecurityAttributes).cast_mut().cast();
-        }
+        let (prop, security) = pages(device);
         #[cfg(windows)]
         let budget = budget(device);
         let _ctx = primary.enter()?;
@@ -138,7 +195,6 @@ impl CudaBackend {
             nvml,
             context,
             events: Events::default(),
-            #[cfg(windows)]
             _security: security,
             #[cfg(windows)]
             budget,
@@ -262,13 +318,7 @@ impl Backend for CudaBackend {
     /// per-process numbers; a container whose pids are the host's) there is none: an error, and
     /// the context stays as `open` measured it (`opened_context`).
     fn process_used(&self) -> Result<u64> {
-        let nvml = self.nvml.as_ref().ok_or_else(|| Error::Io("NVML is unavailable: no process bytes".into()))?;
-        let reading = nvml.read()?;
-        reading.processes.as_ref().and_then(|p| p.get(&std::process::id()).copied()).ok_or_else(|| Error::Device {
-            op: "process_used",
-            code: -1,
-            name: "the driver names no process of ours (WDDM, or another pid namespace)".into(),
-        })
+        process_used(self.nvml.as_ref())
     }
 
     /// The device's used bytes `open` measured across making the context (0 when a framework
@@ -335,22 +385,7 @@ impl Backend for CudaBackend {
 
     fn export(&self, page: &Physical) -> Result<Owned> {
         let _ctx = self.primary.enter()?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::FromRawFd;
-            let mut fd: c_int = -1;
-            call!("cuMemExportToShareableHandle", mem_export((&mut fd as *mut c_int).cast(), page.id, HANDLES, 0))?;
-            // SAFETY: the driver made this descriptor for us to own.
-            Ok(unsafe { Owned::from_raw_fd(fd) })
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::FromRawHandle;
-            let mut handle: *mut c_void = std::ptr::null_mut();
-            call!("cuMemExportToShareableHandle", mem_export((&mut handle as *mut *mut c_void).cast(), page.id, HANDLES, 0))?;
-            // SAFETY: the driver made this NT handle for us to own.
-            Ok(unsafe { Owned::from_raw_handle(handle) })
-        }
+        export(page)
     }
 
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> {
@@ -497,3 +532,186 @@ impl Backend for CudaBackend {
         }
     }
 }
+
+/// TensorD's chunks on one device. A chunk is created with no context current (P1); export and
+/// release run in [`minimal`]'s context, opened at the first export and kept while the device
+/// holds any chunk (design: closing it under live chunks is unproven on a card), none otherwise.
+/// It serves the manager's calls only: it maps nothing and orders no stream.
+pub struct CudaChunks {
+    ordinal: i32,
+    prop: AllocationProp,
+    _security: Security,
+    granularity: u64,
+    capacity: u64,
+    nvml: Option<platform::gpu::Device>,
+    context: Lazy<Primary>,
+    /// Live chunks, and the hold that keeps the context while there are any.
+    chunks: parking_lot::Mutex<(u64, Option<User<Primary>>)>,
+}
+
+// SAFETY: as `CudaBackend`'s: `prop`'s only pointer is the WIN32 metadata, owned and never written.
+unsafe impl Send for CudaChunks {}
+// SAFETY: as above.
+unsafe impl Sync for CudaChunks {}
+
+/// The device's primary context with its stack, printf FIFO and malloc heap at 0 (P1: 188 MiB
+/// becomes 102): the least a context costs, for export and release.
+fn minimal(ordinal: i32) -> Result<Primary> {
+    let (device, ctx) = cuda::primary_context(ordinal)?;
+    let primary = Primary { device, ctx: ctx as usize };
+    let _ctx = primary.enter()?;
+    for limit in [cuda::LIMIT_STACK_SIZE, cuda::LIMIT_PRINTF_FIFO_SIZE, cuda::LIMIT_MALLOC_HEAP_SIZE] {
+        call!("cuCtxSetLimit", ctx_set_limit(limit, 0))?;
+    }
+    Ok(primary)
+}
+
+impl CudaBackend {
+    /// TensorD's chunk backend for device `ordinal` ([`CudaChunks`]).
+    pub fn chunks(ordinal: i32) -> Result<CudaChunks> {
+        let device = device(ordinal)?;
+        let (prop, security) = pages(device);
+        let context = Lazy::new(move || minimal(ordinal));
+        let (mut granularity, mut free, mut total) = (0usize, 0usize, 0usize);
+        {
+            let open = context.enter()?;
+            let _ctx = open.enter()?;
+            call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut granularity, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
+            call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
+        }
+        Ok(CudaChunks { ordinal, prop, _security: security, granularity: granularity as u64, capacity: total as u64, nvml: nvml(device), context, chunks: Default::default() })
+    }
+}
+
+impl CudaChunks {
+    /// `f` in the minimal context, opened for it if it is not open.
+    fn inside<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        let open = self.context.enter()?;
+        let _ctx = open.enter()?;
+        f()
+    }
+}
+
+fn unserved<T>(what: &str) -> Result<T> {
+    Err(Error::Invalid(format!("{what}: TensorD's chunk backend only creates, lends and destroys chunks")))
+}
+
+impl Backend for CudaChunks {
+    fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// NVML's; the driver's (in the context) where NVML is unavailable.
+    fn free(&self) -> Result<u64> {
+        if let Some(nvml) = &self.nvml {
+            return Ok(nvml.read()?.free);
+        }
+        let (mut free, mut total) = (0usize, 0usize);
+        self.inside(|| Ok(call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?))?;
+        Ok(free as u64)
+    }
+
+    fn process_used(&self) -> Result<u64> {
+        process_used(self.nvml.as_ref())
+    }
+
+    /// None between calls.
+    fn opened_context(&self) -> u64 {
+        0
+    }
+
+    fn granularity(&self) -> u64 {
+        self.granularity
+    }
+
+    fn create(&self, len: u64) -> Result<Physical> {
+        if !len.is_multiple_of(self.granularity) {
+            return Err(Error::Invalid(format!("a page of {len} is not a multiple of the {} byte granularity", self.granularity)));
+        }
+        let mut id = 0;
+        call!("cuMemCreate", mem_create(&mut id, len as usize, &self.prop, 0))?;
+        let mut chunks = self.chunks.lock();
+        chunks.0 += 1;
+        if chunks.1.is_none() {
+            chunks.1 = Some(self.context.hold());
+        }
+        Ok(Physical { id, len })
+    }
+
+    /// The last chunk's release closes the context after it.
+    fn destroy(&self, page: Physical) -> Result<()> {
+        let released = self.inside(|| Ok(call!("cuMemRelease", mem_release(page.id))?));
+        let last = {
+            let mut chunks = self.chunks.lock();
+            chunks.0 = chunks.0.saturating_sub(1);
+            if chunks.0 == 0 { chunks.1.take() } else { None }
+        };
+        drop(last);
+        released
+    }
+
+    fn export(&self, page: &Physical) -> Result<Owned> {
+        self.inside(|| export(page))
+    }
+
+    fn reserve(&self, _: u64) -> Result<Va> {
+        unserved("reserve")
+    }
+
+    fn release(&self, _: Va) {}
+
+    fn map(&self, _: Va, _: u64, _: &Physical, _: Access) -> Result<()> {
+        unserved("map")
+    }
+
+    fn protect(&self, _: Va, _: u64, _: u64, _: Access) -> Result<()> {
+        unserved("protect")
+    }
+
+    fn unmap(&self, _: Va, _: u64, _: u64) -> Result<()> {
+        unserved("unmap")
+    }
+
+    fn import(&self, _: Owned, _: u64) -> Result<Physical> {
+        unserved("import")
+    }
+
+    fn target(&self, va: Va, offset: u64, len: u64) -> Dst {
+        Dst::Device { device: self.ordinal, ptr: va.base + offset, len: len as usize, stream: 0 }
+    }
+
+    fn fence(&self) -> Result<Event> {
+        Ok(Event::DONE)
+    }
+
+    fn record(&self, _: usize) -> Result<Event> {
+        unserved("record")
+    }
+
+    fn query(&self, event: Event) -> Result<bool> {
+        Ok(event == Event::DONE)
+    }
+
+    fn elapsed(&self, _: Event, _: Event) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn wait(&self, _: Event, _: usize) -> Result<()> {
+        unserved("wait")
+    }
+
+    fn synchronize(&self, _: usize) -> Result<()> {
+        unserved("synchronize")
+    }
+
+    fn finish(&self, _: Event) -> Result<()> {
+        Ok(())
+    }
+
+    fn retire(&self, _: Event) {}
+
+    fn drain(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
