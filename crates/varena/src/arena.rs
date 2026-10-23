@@ -97,6 +97,9 @@ pub trait Source: Send + Sync {
     /// A hint: the chunks went whole free (`idle`) or back into use. Atomics only: it is called
     /// under an arena lock.
     fn idle(&self, _chunks: &[Chunk], _idle: bool) {}
+    /// Idle chunks' epochs passed: chunks asked back may go now ([`Torch::reclaim_chunks`]). The
+    /// poller's, no lock held.
+    fn quiet(&self) {}
 }
 
 /// A block of a request's arena still live at the request's end.
@@ -511,6 +514,34 @@ impl Idle {
         out
     }
 
+    /// The asked chunks of quiet spares, each its own spare now; a spare's other chunks stay,
+    /// split around them.
+    fn asked(&mut self, ids: &[u64]) -> Vec<Spare> {
+        let hit: Vec<(u64, u64)> = self.spares.iter().filter(|(_, s)| s.quiet() && s.chunks.iter().any(|c| ids.contains(&c.id))).map(|(k, _)| *k).collect();
+        let mut out = Vec::new();
+        for k in hit {
+            let Some(s) = self.spares.remove(&k) else { continue };
+            let (mut at, mut run, mut run_at) = (s.base, Vec::new(), s.base);
+            for c in s.chunks {
+                let len = c.len;
+                if ids.contains(&c.id) {
+                    if !run.is_empty() {
+                        self.put(Spare { base: run_at, chunks: std::mem::take(&mut run), clock: s.clock.clone(), need: s.need, tier: s.tier, seq: 0 });
+                    }
+                    out.push(Spare { base: at, chunks: vec![c], clock: None, need: 0, tier: s.tier, seq: 0 });
+                    run_at = at + len;
+                } else {
+                    run.push(c);
+                }
+                at += len;
+            }
+            if !run.is_empty() {
+                self.put(Spare { base: run_at, chunks: run, clock: s.clock, need: s.need, tier: s.tier, seq: 0 });
+            }
+        }
+        out
+    }
+
     /// (quiet, pending) bytes; a spare on a lost stream is neither.
     fn bytes(&self) -> (u64, u64) {
         self.spares.values().fold((0, 0), |(q, p), s| match () {
@@ -615,7 +646,8 @@ struct Shared {
     /// Open captures. A stamp reads it before and after (R2): one a capture's begin could not
     /// record is held instead.
     captures: AtomicU32,
-    capturers: Mutex<Vec<(ThreadId, PoolId)>>,
+    /// Each open capture: its thread, its pool, and the streams its routed allocations named.
+    capturers: Mutex<Vec<(ThreadId, PoolId, Vec<usize>)>>,
     /// Arenas with deferred frees, held spans or a released pool, for the poller.
     pending: Mutex<Vec<Arc<Arena>>>,
     wake: (Mutex<bool>, Condvar),
@@ -672,7 +704,10 @@ impl Torch {
         let size = bytes.max(1).checked_next_multiple_of(ALIGN).filter(|s| *s < 1 << 50).ok_or_else(|| exhausted(bytes, "no device holds that much"))?;
         let sh = &self.sh;
         match pool {
-            Some(p) => sh.alloc_in(&sh.arena(Owner::Pool(p)), size, stream, true),
+            Some(p) => {
+                sh.capturing_on(p, stream);
+                sh.alloc_in(&sh.arena(Owner::Pool(p)), size, stream, true)
+            }
             None => sh.alloc_in(&sh.routed(), size, stream, sh.capturing()),
         }
     }
@@ -712,8 +747,8 @@ impl Torch {
             let _gate = sh.gate.write();
             let mut caps = sh.capturers.lock();
             // A capture this thread left open died (torch never ended it): this one replaces it.
-            caps.retain(|(t, p)| !(*t == me && *p == pool));
-            caps.push((me, pool));
+            caps.retain(|(t, p, _)| !(*t == me && *p == pool));
+            caps.push((me, pool, Vec::new()));
             sh.captures.store(caps.len() as u32, SeqCst);
             drop(caps);
             clocks.iter().for_each(|c| sh.record(c));
@@ -724,20 +759,12 @@ impl Torch {
         sh.revive(&a, &mut st);
     }
 
-    /// torch's end-allocate-to-pool hook, after the capture ended: frees deferred by it apply once
-    /// no capture is open. Again, or for a capture never begun: nothing.
+    /// torch's end-allocate-to-pool hook, after the capture ended, or a failed capture's cleanup
+    /// (torch ends none whose begin threw), on the capturing thread: frees deferred by it apply
+    /// once no capture is open. Again, or ended already ([`Shared::reap_captures`]): nothing.
     pub fn pool_end(&self, pool: PoolId) {
-        let sh = &self.sh;
         let me = std::thread::current().id();
-        let gate = sh.gate.write();
-        let mut caps = sh.capturers.lock();
-        let at = caps.iter().position(|(t, p)| *t == me && *p == pool).or_else(|| caps.iter().position(|(_, p)| *p == pool));
-        if let Some(i) = at {
-            caps.remove(i);
-        }
-        sh.captures.store(caps.len() as u32, SeqCst);
-        drop((caps, gate));
-        sh.kick();
+        self.sh.end_capture(|(t, p, _)| *t == me && *p == pool);
     }
 
     /// torch's release-pool hook (a graph's reset): one use fewer. At 0, the pool's spans leave once
@@ -880,6 +907,14 @@ impl Torch {
         self.sh.reclaim(want)
     }
 
+    /// Gives back exactly the asked chunks (`ids`, the source's) that are idle and quiet; the
+    /// rest of their spares stay idle. The manager asks by chunk: one in use stays pinned by its
+    /// source, one whose epoch is pending goes at a later call ([`Source::quiet`]).
+    pub fn reclaim_chunks(&self, ids: &[u64]) -> u64 {
+        let given = self.sh.idle.lock().asked(ids);
+        given.into_iter().map(|s| self.sh.give(s)).sum()
+    }
+
     /// Idle bytes: (quiet, waiting for their stream's epoch).
     pub fn idle(&self) -> (u64, u64) {
         self.sh.idle.lock().bytes()
@@ -920,7 +955,44 @@ impl Shared {
             return false;
         }
         let me = std::thread::current().id();
-        self.capturers.lock().iter().any(|(t, _)| *t == me)
+        self.capturers.lock().iter().any(|(t, ..)| *t == me)
+    }
+
+    /// A routed allocation names a stream `pool`'s capture runs on.
+    fn capturing_on(&self, pool: PoolId, stream: usize) {
+        for (_, p, streams) in self.capturers.lock().iter_mut() {
+            if *p == pool && !streams.contains(&stream) {
+                streams.push(stream);
+            }
+        }
+    }
+
+    /// Ends the first open capture `this` matches.
+    fn end_capture(&self, this: impl Fn(&(ThreadId, PoolId, Vec<usize>)) -> bool) {
+        let gate = self.gate.write();
+        let mut caps = self.capturers.lock();
+        if let Some(i) = caps.iter().position(this) {
+            caps.remove(i);
+        }
+        self.captures.store(caps.len() as u32, SeqCst);
+        drop((caps, gate));
+        self.kick();
+    }
+
+    /// A capture whose every stream it allocated on has stopped capturing died with no end (its
+    /// begin threw, or its thread did): it is ended here, so frees and epochs resume. The poller's,
+    /// in relaxed capture mode, no lock held across the driver calls.
+    fn reap_captures(&self) -> bool {
+        let open: Vec<(ThreadId, PoolId, Vec<usize>)> = self.capturers.lock().iter().filter(|(.., s)| !s.is_empty()).cloned().collect();
+        let mut reaped = false;
+        for (thread, pool, streams) in open {
+            if streams.iter().all(|s| matches!(self.backend.capturing(*s), Ok(false))) {
+                tracing::warn!("varena: pool {pool:?}'s capture stopped with no end: ended");
+                self.end_capture(|(t, p, s)| *t == thread && *p == pool && *s == streams);
+                reaped = true;
+            }
+        }
+        reaped
     }
 
     fn routed(&self) -> Arc<Arena> {
@@ -1158,15 +1230,16 @@ impl Shared {
 
     fn reclaim(&self, want: u64) -> u64 {
         let spares = self.idle.lock().quiet(want);
-        let mut given = 0;
-        for s in spares {
-            let len = s.len();
-            self.source.unmap(Va { base: s.base, len }, s.chunks);
-            self.space.lock().give(s.base, len);
-            self.mapped.fetch_sub(len.min(self.mapped.load(Acquire)), AcqRel);
-            given += len;
-        }
-        given
+        spares.into_iter().map(|s| self.give(s)).sum()
+    }
+
+    /// A spare back to the source, its address space freed: its bytes.
+    fn give(&self, s: Spare) -> u64 {
+        let len = s.len();
+        self.source.unmap(Va { base: s.base, len }, s.chunks);
+        self.space.lock().give(s.base, len);
+        self.mapped.fetch_sub(len.min(self.mapped.load(Acquire)), AcqRel);
+        len
     }
 
     fn reserve(&self, len: u64) -> Result<Va> {
@@ -1341,7 +1414,7 @@ impl Shared {
                 clocks.iter().for_each(|c| self.record(c));
             }
         }
-        let mut progress = false;
+        let mut progress = self.captures.load(SeqCst) > 0 && self.reap_captures();
         for c in &clocks {
             progress |= self.query(c);
         }
@@ -1371,6 +1444,7 @@ fn poll(weak: &Weak<Shared>) {
         let (progress, busy) = sh.tick();
         if progress {
             sh.progressed();
+            sh.source.quiet();
             nap = NAP;
         } else {
             nap = (nap * 2).min(NAP_MAX);

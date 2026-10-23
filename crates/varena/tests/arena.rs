@@ -2,7 +2,7 @@
 //! R11a), the no-learning-loop wait, fragmentation, and what a malloc+free pair costs. Events are
 //! the test's own: an epoch lands only when the test completes its stream.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -29,11 +29,19 @@ struct Gpu {
     queries: AtomicUsize,
     querying: AtomicBool,
     stall: Mutex<()>,
+    /// Streams capturing now.
+    capturing: Mutex<HashSet<usize>>,
+    /// Pages this process created itself.
+    creates: Arc<AtomicUsize>,
 }
 
 impl Gpu {
     fn new(limit: u64, instant: bool) -> Arc<Gpu> {
-        Arc::new(Gpu {
+        Arc::new(Gpu::value(limit, instant))
+    }
+
+    fn value(limit: u64, instant: bool) -> Gpu {
+        Gpu {
             host: HostBackend::new(limit),
             events: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
@@ -42,7 +50,14 @@ impl Gpu {
             queries: AtomicUsize::new(0),
             querying: AtomicBool::new(false),
             stall: Mutex::new(()),
-        })
+            capturing: Mutex::new(HashSet::new()),
+            creates: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn capture(&self, stream: usize, on: bool) {
+        let mut c = self.capturing.lock();
+        if on { c.insert(stream) } else { c.remove(&stream) };
     }
 
     /// Everything recorded on `stream` so far has run.
@@ -59,7 +74,10 @@ impl Backend for Gpu {
     fn granularity(&self) -> u64 { self.host.granularity() }
     fn reserve(&self, len: u64) -> varena::Result<Va> { self.host.reserve(len) }
     fn release(&self, va: Va) { self.host.release(va) }
-    fn create(&self, len: u64) -> varena::Result<Physical> { self.host.create(len) }
+    fn create(&self, len: u64) -> varena::Result<Physical> {
+        self.creates.fetch_add(1, SeqCst);
+        self.host.create(len)
+    }
     fn destroy(&self, page: Physical) -> varena::Result<()> { self.host.destroy(page) }
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> varena::Result<()> { self.host.map(va, offset, page, access) }
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> { self.host.protect(va, offset, len, access) }
@@ -89,6 +107,7 @@ impl Backend for Gpu {
     fn finish(&self, _: Event) -> varena::Result<()> { Ok(()) }
     fn retire(&self, _: Event) {}
     fn drain(&self) -> varena::Result<()> { Ok(()) }
+    fn capturing(&self, stream: usize) -> varena::Result<bool> { Ok(self.capturing.lock().contains(&stream)) }
 }
 
 /// [`Direct`], counted; while `closed`, a map waits for the test to open it.
@@ -96,6 +115,8 @@ struct Counted {
     inner: Direct,
     maps: AtomicUsize,
     unmaps: AtomicUsize,
+    /// Every chunk mapped, in order.
+    ids: Mutex<Vec<u64>>,
     entered: AtomicBool,
     closed: Mutex<bool>,
     opened: Condvar,
@@ -117,7 +138,9 @@ impl Source for Counted {
         }
         drop(closed);
         self.maps.fetch_add(1, SeqCst);
-        self.inner.map(va, kind)
+        let chunks = self.inner.map(va, kind)?;
+        self.ids.lock().extend(chunks.iter().map(|c| c.id));
+        Ok(chunks)
     }
 
     fn unmap(&self, va: Va, chunks: Vec<Chunk>) {
@@ -135,7 +158,7 @@ struct Rig {
 fn rig(limit: u64, instant: bool) -> Rig {
     let gpu = Gpu::new(limit, instant);
     let backend: Arc<dyn Backend> = gpu.clone();
-    let source = Arc::new(Counted { inner: Direct::new(backend.clone(), limit), maps: AtomicUsize::new(0), unmaps: AtomicUsize::new(0), entered: AtomicBool::new(false), closed: Mutex::new(false), opened: Condvar::new() });
+    let source = Arc::new(Counted { inner: Direct::new(backend.clone(), limit), maps: AtomicUsize::new(0), unmaps: AtomicUsize::new(0), ids: Mutex::new(Vec::new()), entered: AtomicBool::new(false), closed: Mutex::new(false), opened: Condvar::new() });
     let torch = Torch::new(backend, source.clone()).unwrap();
     Rig { gpu, source, torch }
 }
@@ -272,13 +295,15 @@ fn r4_r5_a_pool_keeps_its_spans_until_released_and_fenced() {
     let r = rig(512 * MB, false);
     let pool = PoolId(7, 1);
     r.torch.pool_prepare(pool, 8 * MB).unwrap();
-    let torch = r.torch.clone();
+    let (torch, gpu) = (r.torch.clone(), r.gpu.clone());
     let blocks = returns("a capture", move || {
+        gpu.capture(A, true);
         torch.pool_begin(pool);
         let mut got: Vec<u64> = (0..3).map(|_| torch.alloc(MB, A, Some(pool)).unwrap()).collect();
         let freed = got.pop().unwrap();
         torch.free(freed, MB, A);
         let again = torch.alloc(MB, A, Some(pool)).unwrap();
+        gpu.capture(A, false);
         torch.pool_end(pool);
         assert_eq!(again, freed, "a free during capture returns to the pool");
         got.push(again);
@@ -305,12 +330,14 @@ fn a_shared_pool_leaves_at_its_last_release() {
     let r = rig(512 * MB, false);
     let pool = PoolId(9, 9);
     r.torch.pool_prepare(pool, 4 * MB).unwrap();
-    let torch = r.torch.clone();
+    let (torch, gpu) = (r.torch.clone(), r.gpu.clone());
     returns("two captures", move || {
         for _ in 0..2 {
+            gpu.capture(A, true);
             torch.pool_begin(pool);
             let b = torch.alloc(MB, A, Some(pool)).unwrap();
             torch.free(b, MB, A);
+            gpu.capture(A, false);
             torch.pool_end(pool);
         }
     });
@@ -335,9 +362,10 @@ fn r6_a_capturing_thread_never_reaches_the_source() {
     r.torch.free(spare, 40 * MB, B);
     until("B's span is quiet", || r.torch.idle().0 == 40 * MB);
     let maps = r.maps();
-    let torch = r.torch.clone();
+    let (torch, gpu) = (r.torch.clone(), r.gpu.clone());
     returns("a capture", move || {
         let pool = PoolId(3, 3);
+        gpu.capture(A, true);
         torch.pool_begin(pool);
         let refused = torch.alloc(100 * MB, A, Some(pool));
         assert!(matches!(refused, Err(varena::Error::Exhausted(_))), "{refused:?}");
@@ -346,6 +374,7 @@ fn r6_a_capturing_thread_never_reaches_the_source() {
         let adopted = torch.alloc(30 * MB, A, None).unwrap();
         let bigger = torch.alloc(300 * MB, A, None);
         assert!(matches!(bigger, Err(varena::Error::Exhausted(_))), "{bigger:?}");
+        gpu.capture(A, false);
         torch.pool_end(pool);
         torch.free(adopted, 30 * MB, A);
     });
@@ -416,6 +445,87 @@ fn a_shortfall_waits_for_a_grant_and_is_refused_only_at_the_floor() {
         other => panic!("expected the floor's refusal, got {other:?}"),
     }
     r.torch.free(big, 100 * MB, B);
+}
+
+/// A capture whose begin threw gets no end from torch. Once every stream it allocated on has
+/// stopped capturing, the poller ends it: frees deferred by it apply, and a shortfall that waits
+/// on epochs completes (no hang). One that never allocated ends at the Runtime's pool_end.
+#[test]
+fn a_capture_that_died_without_an_end_is_reaped() {
+    let r = rig(512 * MB, false);
+    let pool = PoolId(4, 4);
+    r.torch.pool_prepare(pool, 2 * MB).unwrap();
+    let (p, keep) = (r.torch.alloc(4 * MB, B, None).unwrap(), r.torch.alloc(4 * MB, B, None).unwrap());
+    let (torch, gpu) = (r.torch.clone(), r.gpu.clone());
+    returns("a capture that dies", move || {
+        gpu.capture(A, true);
+        torch.pool_begin(pool);
+        torch.alloc(MB, A, Some(pool)).unwrap();
+        // cudaStreamBeginCapture's failure, or the thread's end: no pool_end.
+        gpu.capture(A, false);
+    });
+    r.torch.free(p, 4 * MB, B);
+    until("the dead capture is reaped and the free applies", || {
+        r.gpu.complete(B);
+        r.torch.stats().allocated == 4 * MB + MB
+    });
+    r.torch.free(keep, 4 * MB, B);
+    let torch = r.torch.clone();
+    returns("a capture that never allocated", move || {
+        torch.pool_begin(PoolId(5, 5));
+        torch.pool_end(PoolId(5, 5));
+        torch.pool_release(PoolId(5, 5));
+        let x = torch.alloc(4 * MB, C, None).unwrap();
+        torch.free(x, 4 * MB, C);
+    });
+    until("frees apply again", || r.torch.stats().allocated == MB);
+}
+
+/// A shortfall beside another thread's open capture still completes: the capture's begin recorded
+/// the pending epochs, and the poller queries them while the capture stays open.
+#[test]
+fn a_shortfall_beside_an_open_capture_completes() {
+    let r = rig(128 * MB, false);
+    let p = r.torch.alloc(30 * MB, A, None).unwrap();
+    r.torch.free(p, 30 * MB, A);
+    let (torch, gpu, (open_tx, open), (end_tx, end)) = (r.torch.clone(), r.gpu.clone(), mpsc::channel(), mpsc::channel::<()>());
+    let capture = std::thread::spawn(move || {
+        gpu.capture(B, true);
+        torch.pool_begin(PoolId(6, 6));
+        open_tx.send(()).unwrap();
+        end.recv().unwrap();
+        gpu.capture(B, false);
+        torch.pool_end(PoolId(6, 6));
+    });
+    open.recv().unwrap();
+    let (gpu, source) = (r.gpu.clone(), r.source.clone());
+    let lands = std::thread::spawn(move || {
+        until("the big allocation asks", || source.maps.load(SeqCst) >= 2);
+        gpu.complete(A);
+    });
+    let big = r.torch.alloc(100 * MB, C, None).unwrap();
+    lands.join().unwrap();
+    assert_eq!(r.source.unmaps.load(SeqCst), 1, "A's idle span went back while the capture stayed open");
+    end_tx.send(()).unwrap();
+    capture.join().unwrap();
+    r.torch.free(big, 100 * MB, C);
+}
+
+/// The manager asks by chunk: exactly the asked idle chunk goes back, its spare split around
+/// it, and the rest stays idle for the arenas.
+#[test]
+fn an_asked_chunk_goes_back_alone() {
+    let r = rig(512 * MB, true);
+    let big = r.torch.alloc(70 * MB, A, None).unwrap();
+    r.torch.free(big, 70 * MB, A);
+    until("the span is quiet", || r.torch.idle().0 == 70 * MB);
+    let asked = r.source.ids.lock()[1];
+    assert_eq!(r.torch.reclaim_chunks(&[asked]), CHUNK);
+    assert_eq!((r.torch.idle().0, r.source.unmaps.load(SeqCst)), (70 * MB - CHUNK, 1));
+    assert_eq!(r.torch.reclaim_chunks(&[asked]), 0, "a chunk given back twice");
+    let maps = r.maps();
+    let again = r.torch.alloc(30 * MB, A, None).unwrap();
+    assert_eq!((again, r.maps()), (big, maps), "the first chunk stayed idle and serves again");
 }
 
 /// A tiny xorshift: the same sequence every run.
@@ -522,14 +632,22 @@ fn a_region_has_spans_of_its_own() {
     drop(req);
 }
 
-/// Through Memory, as S3's shim calls it: a request's guard routes its thread (dropped on another
-/// thread, it stops), and the request's end record carries the audit.
+/// Through Memory, as S3's shim calls it: nothing is served until a source is chosen; then a
+/// request's guard routes its thread (dropped on another thread, it stops), and the request's
+/// end record carries the audit.
 #[test]
 fn memory_routes_a_request_and_audits_its_end() {
-    let g = varena::GpuId { uuid: format!("arena{}", std::process::id()), model: "host".into(), memory: 512 * MB };
+    let card = 4 << 30;
+    let g = varena::GpuId { uuid: format!("arena{}", std::process::id()), model: "host".into(), memory: card };
     assert!(varena::os::namespace(&format!("test{}-", std::process::id())));
     let _ledger = varena::Ledger::create(&g, None).unwrap();
-    let mem = varena::Memory::open(g.clone(), None, Box::new(HostBackend::new(512 * MB))).unwrap();
+    let gpu = Gpu::value(card, true);
+    let creates = gpu.creates.clone();
+    let mem = varena::Memory::open(g.clone(), None, Box::new(gpu)).unwrap();
+    let refused = mem.torch_alloc(4096, A, None);
+    assert!(matches!(refused, Err(varena::Error::Invalid(_))), "{refused:?}");
+    assert_eq!(creates.load(SeqCst), 0, "a page was made before torch was served");
+    mem.serve_standalone_torch().unwrap();
     let r = mem.request("audit", varena::Plan::default()).unwrap();
     let guard = mem.allocating(&r);
     let kept = mem.torch_alloc(5000, A, None).unwrap();
@@ -543,6 +661,56 @@ fn memory_routes_a_request_and_audits_its_end() {
     mem.torch_free(kept, 5000, A);
     mem.torch_free(process, 4096, A);
     drop(mem);
+    varena::os::remove_table(&g.uuid);
+}
+
+/// A leased Memory against a real manager in this process: torch is refused until served (no page
+/// made outside the books); then its spans are the manager's grants, it is refused only at the
+/// manager's floor, and what it gives back leaves the books.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_leased_memory_allocates_only_from_its_grants() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use varena::lease::{Hosting, Identity, Manager};
+
+    struct Me;
+    impl Hosting for Me {
+        fn identify(&self, peer: &platform::handles::Peer) -> Option<Identity> {
+            (peer.pid == std::process::id()).then(|| Identity { executor: "me".into(), domain: "test".into() })
+        }
+    }
+
+    let (pid, card) = (std::process::id(), 256 * MB);
+    assert!(varena::os::namespace(&format!("test{pid}-")));
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("lease.sock");
+    let host = varena::GpuId { uuid: format!("arena-host{pid}"), model: "host".into(), memory: card };
+    let open = Box::new(move || Ok(Arc::new(HostBackend::new(card)) as Arc<dyn Backend>));
+    let manager = Manager::create(&host, Some(card), varena::ledger::Mode::Dedicated, open, UnixListener::bind(&socket).unwrap(), Arc::new(Me)).unwrap();
+    varena::os::remove_table(&host.uuid);
+    let g = varena::GpuId { uuid: format!("arena-leased{pid}"), model: "host".into(), memory: card };
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let gpu = Gpu::value(card, true);
+    let creates = gpu.creates.clone();
+    let mem = varena::Memory::open(g.clone(), None, Box::new(gpu)).unwrap();
+    assert_eq!(mem.lease_over(UnixStream::connect(&socket).unwrap()).unwrap(), None, "the manager refused the lease");
+
+    let refused = mem.torch_alloc(4 * MB, A, None);
+    assert!(matches!(refused, Err(varena::Error::Invalid(_))), "{refused:?}");
+    assert_eq!((manager.holdings().leased, creates.load(SeqCst)), (0, 0), "memory outside the books");
+
+    mem.serve_leased_torch().unwrap();
+    let p = mem.torch_alloc(4 * MB, A, None).unwrap();
+    until("the span is the manager's grant", || manager.holdings().leased == CHUNK);
+    let floor = mem.torch_alloc(300 * MB, A, None);
+    assert!(matches!(floor, Err(varena::Error::Exhausted(_))), "{floor:?}");
+    mem.torch_free(p, 4 * MB, A);
+    let torch = mem.torch().unwrap();
+    until("the span is quiet", || torch.idle().0 == CHUNK);
+    assert_eq!(torch.reclaim(u64::MAX), CHUNK);
+    until("the chunk leaves the books", || manager.holdings().leased == 0);
+    assert_eq!(creates.load(SeqCst), 0, "the executor made a page itself");
+    drop((torch, mem));
     varena::os::remove_table(&g.uuid);
 }
 
