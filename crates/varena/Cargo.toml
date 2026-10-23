@@ -23,5 +23,9 @@ tracing.workspace = true
 default = ["store"]
 store = ["tensorfs/store"]
 
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
 [lints]
 workspace = true
