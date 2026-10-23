@@ -659,6 +659,7 @@ dependencies = [
  "protocol",
  "ratatui",
  "reqwest",
+ "rustix",
  "self-replace",
  "semver",
  "serde",

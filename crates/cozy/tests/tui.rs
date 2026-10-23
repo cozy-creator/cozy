@@ -129,9 +129,9 @@ fn runs_on(screen: &str) -> Option<u32> {
 }
 
 /// `cozy run list` and `cozy machine list` on a pseudo-terminal, as a person drives them: j/k move
-/// the selection, Enter opens the row's own live view (the run as `cozy run show` draws it, the
-/// machine as `cozy machine show` does), which is drawn again as Calcifer says it changed; Esc or q
-/// goes back to the list, and q there quits.
+/// the selection; Enter on a run is `cozy run watch` of it, live, and a run that ended stays on
+/// screen, its record and all; Enter on a machine opens its live `cozy machine show`. Esc or q goes
+/// back to the list, and q there quits. Leaving a run's watch never cancels the run.
 #[test]
 fn enter_opens_a_rows_live_view_and_esc_or_q_comes_back() {
     let Some(home) = Home::new() else { return };
@@ -157,21 +157,38 @@ fn enter_opens_a_rows_live_view_and_esc_or_q_comes_back() {
     });
     runs.key("j");
     runs.key("k");
+    let watching = format!("cozy run watch {first}  (Esc or q back)");
+    let opened = format!("run {first} · fidika/sdxl/generate");
+    let list = |s: &str| s.contains("TARGET") && !s.contains(&watching);
     runs.key("\r");
-    let opened = format!("run {first}");
-    runs.until("the run's live view", |s| {
-        s.contains(&opened) && s.contains("Esc or q back")
-    });
-    home.json(["run", "cancel", &first, "--json"]);
-    runs.until("its cancel, drawn live", |s| {
-        s.contains(&opened) && s.contains("canceled")
-    });
+    runs.until("the run's watch", |s| s.contains(&watching) && s.contains(&opened));
     runs.key("\x1b");
-    runs.until("the list again", |s| {
-        s.contains("TARGET") && !s.contains("Esc or q back")
+    runs.until("the list again", list);
+    let status = home.json(["run", "show", &first, "--json"])["status"].to_string();
+    assert!(!settled(&status), "leaving the watch left it running: {status}");
+
+    runs.key("\r");
+    runs.until("the run's watch again", |s| s.contains(&watching));
+    home.json(["run", "cancel", &first, "--json"]);
+    runs.until("its cancel and record, followed live", |s| {
+        s.contains(&watching) && s.contains("canceled") && s.contains("next:")
     });
     runs.key("q");
+    runs.until("the list again", list);
+    // A run that ended: the same screen `cozy run watch` leaves, under the way back.
+    runs.key("\r");
+    let ended = runs.until("the ended run's watch", |s| {
+        s.contains(&watching) && s.contains("next:")
+    });
+    runs.key("\x1b");
+    runs.until("the list again", list);
+    runs.key("q");
     assert!(runs.wait().success());
+    let mut watch = Pty::spawn(home.command().args(["run", "watch", &first]));
+    let alone = watch.until("cozy run watch", |s| s.contains("next:"));
+    watch.wait();
+    let trimmed = |screen: &str| screen.trim_end().replace(&format!("{watching}\n"), "");
+    assert_eq!(trimmed(&ended), trimmed(&alone));
 
     let mut machines = Pty::spawn(home.command().args(["machine", "list"]));
     machines.until("the machine list", |s| {

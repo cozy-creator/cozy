@@ -12,7 +12,7 @@ use protocol::{
 use crate::{Context, output};
 use bind::Terms;
 pub(crate) use catalog::{Card, latest};
-pub(crate) use follow::{exit_code, follow, submit};
+pub(crate) use follow::{exit_code, follow, follow_until, submit};
 use interface::{Callable, Interface};
 use target::Target;
 
