@@ -25,7 +25,7 @@ pub mod table;
 pub use backend::{Access, Backend, Budget, Event, HostBackend, Physical, Va};
 pub use cuda::CudaBackend;
 pub use ledger::{Grant, HostCall, Ledger, Peak, PhysicalChange, RowStatus, Status};
-pub use memory::{CacheId, Claim, Fills, HoldId, MakeRoom, Memory, Moved, Origin, Pass, Pin, Ref, Request, Retained, SetId, Stats, StepStats, Yielded};
+pub use memory::{Allocating, CacheId, Claim, Fills, HoldId, MakeRoom, Memory, Moved, Origin, Pass, Pin, PoolId, Ref, Request, Retained, SetId, Stats, StepStats, TorchStats, Yielded};
 pub use table::{headroom, Fill, Fingerprint, Level, PartId, Plan, SetSpec, Step};
 
 use thiserror::Error;
