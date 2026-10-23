@@ -153,10 +153,13 @@ pub fn materialize_uploaded(
     Ok(materialized)
 }
 
+/// `read`: the bytes the installer has read (its downloads, the cache it copies from), about
+/// once a second while it runs.
 pub fn prepare_uploaded(
     config: &InstallerConfig,
     uploaded: &UploadedPackage,
     stop: Option<&Stop>,
+    read: &dyn Fn(u64),
 ) -> Result<PreparedGeneration, Error> {
     let materialized = materialize_uploaded(uploaded, &config.staging_root)?;
     let mut command = installer(config, &materialized.root_set)?;
@@ -169,7 +172,7 @@ pub fn prepare_uploaded(
     if let Some(requirements) = &materialized.requirements {
         command.arg("--requirements").arg(requirements);
     }
-    publish(config, command, stop, None)
+    publish(config, command, stop, None, read)
 }
 
 /// A live project installed editable in `environment`, which is built when it is not there
@@ -184,6 +187,7 @@ pub fn prepare_editable(
     indexes: &std::collections::BTreeMap<String, String>,
     source_digest: &str,
     stop: Option<&Stop>,
+    read: &dyn Fn(u64),
 ) -> Result<PreparedGeneration, Error> {
     // A machine killed mid-install leaves its helper building here (its own process group
     // outlives it): that helper ends before another builds the same environment.
@@ -198,7 +202,7 @@ pub fn prepare_editable(
     for wheel in wheels {
         command.arg("--wheel").arg(wheel);
     }
-    publish(config, command, stop, Some(&claim))
+    publish(config, command, stop, Some(&claim), read)
 }
 
 /// Who builds at a claim: the helper, and the machine that started it.
@@ -283,7 +287,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
 /// Run the helper to its exit and hold the generation it published. Its process group ends
 /// with its run's cancel (`stop`), or when it stops moving past its measured patience
 /// (`process::supervise`); a long install that moves is never killed.
-fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>, claim: Option<&Path>) -> Result<PreparedGeneration, Error> {
+fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>, claim: Option<&Path>, read: &dyn Fn(u64)) -> Result<PreparedGeneration, Error> {
     let mut child = platform::process::own_group(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -305,7 +309,7 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>, 
         std::io::copy(&mut stdout, &mut std::io::sink())?;
         Ok::<_, std::io::Error>(output)
     });
-    let ended = crate::process::supervise(&mut child, stop, "the package installer", &|_| ()).map_err(storage)?;
+    let ended = crate::process::supervise(&mut child, stop, "the package installer", read).map_err(storage)?;
     if let Some(claim) = claim {
         let _ = fs::remove_file(claim);
     }
@@ -478,7 +482,7 @@ mod tests {
         let mut helper = std::process::Command::new("sh");
         helper.args(["-c", r#"echo '{"kind":"install_failed","code":"package_dependency_operation_failed","detail":"uv pip install"}'
             i=0; while [ $i -lt 40 ]; do echo "  uv line $i https://user:tok@hub.example/simple" >&2; i=$((i+1)); done; exit 1"#]);
-        let refused = super::publish(&config, helper, None, None).err().expect("the helper failed");
+        let refused = super::publish(&config, helper, None, None, &|_| ()).err().expect("the helper failed");
         let message = &refused.message;
         assert!(message.starts_with("package_dependency_operation_failed: uv pip install:\nuv line 0 "), "{message}");
         assert!(message.ends_with("uv line 39 https://***@hub.example/simple") && message.lines().count() == 41, "{message}");

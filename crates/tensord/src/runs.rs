@@ -600,7 +600,7 @@ impl Runs {
                 let local = self.local.as_ref().ok_or_else(|| {
                     refused("capability_unavailable", "this machine installs no local packages")
                 })?;
-                let stage = |stage: &str| observe(stage, 0, 0);
+                let stage = |stage: &str, read: u64| observe(stage, read, 0);
                 let installed = local.install(&self.service, actor, digest, Some(&stoppable.stop), id, &stage)?;
                 self.supersede(actor, &installed)?;
                 local.collect(actor, &installed.package);

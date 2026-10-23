@@ -411,7 +411,7 @@ pub enum Supervised {
 }
 
 /// Waits for `child`, the leader of its own process group, reading it once a second: `read`
-/// sees the bytes it has read, and its group is killed when `stop` is canceled or when the
+/// sees the bytes its group has read (its downloads, the cache it copies from), and its group is killed when `stop` is canceled or when the
 /// group's CPU and bytes stop moving for longer than its measured patience (`Pace`, floored by
 /// `Liveness`). The second is resolution, never a verdict.
 pub fn supervise(
@@ -431,6 +431,8 @@ pub fn supervise(
     let (floor, tick) = (Liveness::default().floor(), Duration::from_secs(1));
     let (mut pace, mut ended) = (Pace::default(), None);
     let (mut last, mut advances) = (None, 0u64);
+    // What each process of the group read so far: a gone member keeps what it read.
+    let mut reads = std::collections::HashMap::new();
     while !exact.wait_for(tick)? {
         if ended.is_some() {
             continue;
@@ -439,8 +441,8 @@ pub fn supervise(
         // Bytes moved are progress, and CPU used or owed at a tenth of a core or more (`meter`).
         // An idle process's timer wakeups are not: uv waiting on its build spends one 10 ms
         // tick in about 10 s.
-        let members = group_members(exact.birth()).into_iter().map(|member| member.pid);
-        let reading = std::iter::once(exact.birth().pid).chain(members).filter_map(meter)
+        let group: Vec<u32> = std::iter::once(exact.birth().pid).chain(group_members(exact.birth()).into_iter().map(|m| m.pid)).collect();
+        let reading = group.iter().copied().filter_map(meter)
             .fold((0u64, 0u64), |(cpu, moved), (c, m)| (cpu + c, moved + m));
         if last.is_some_and(|(cpu, moved): (u64, u64)| reading.1 != moved || reading.0.saturating_sub(cpu) >= tick.as_nanos() as u64 / 10) {
             advances += 1;
@@ -448,9 +450,11 @@ pub fn supervise(
         }
         last = Some(reading);
         pace.observe(Some(advances), now);
-        if let Some(bytes) = read_bytes(exact.birth().pid) {
-            read(bytes);
+        for (pid, bytes) in group.iter().filter_map(|pid| Some((*pid, read_bytes(*pid)?))) {
+            let held: &mut u64 = reads.entry(pid).or_default();
+            *held = (*held).max(bytes);
         }
+        read(reads.values().sum());
         if stop.is_some_and(|stop| stop.is_cancelled()) {
             exact.kill()?;
             ended = Some(Supervised::Canceled);
@@ -749,6 +753,24 @@ mod tests {
         }
     }
 
+
+    /// A supervised installer is told the bytes its whole group reads as they move, a child's
+    /// included (the Runtime's installer runs uv as one): a slow install shows it moves (runs
+    /// 14747 and 14748 sat at "installing … on this machine" with no bytes for ten minutes).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_supervised_group_is_told_the_bytes_its_children_read() {
+        // The leader reads nothing itself; its children read 1 MB each fifth of a second, 20 times.
+        let script = "for i in $(seq 20); do head -c 1000000 /dev/zero; sleep 0.2; done | cat > /dev/null";
+        let mut child = Command::new("/bin/sh").args(["-c", script]).process_group(0).spawn().unwrap();
+        let told = std::sync::Mutex::new(vec![]);
+        let ended = supervise(&mut child, None, "a reader", &|bytes| told.lock().unwrap().push(bytes)).unwrap();
+        assert!(matches!(ended, Supervised::Exited(status) if status.success()), "{ended:?}");
+        let told = told.into_inner().unwrap();
+        // Each sample more than the last, all of it read by children (`cat` counts its pipe too).
+        assert!(told.len() >= 3 && told.windows(2).all(|w| w[0] < w[1]), "not told as they moved: {told:?}");
+        assert!(told[told.len() - 1] >= 20_000_000, "{told:?}");
+    }
 
     /// A safetensors file served from a real socket, `chunk` bytes each `pace`; with `stall`, its
     /// body stops halfway and the connection stays open, saying nothing more.
