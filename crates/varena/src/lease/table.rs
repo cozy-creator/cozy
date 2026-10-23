@@ -68,9 +68,11 @@ struct Header {
     birth: AtomicU64,
     /// The manager bumps it at every attach: an agent re-attaches when it moves.
     epoch: AtomicU64,
-    /// Grants and revokes the agent answered: the progress a stall is judged by.
+    /// Grants and revokes the agent answered.
     acked: AtomicU64,
-    gpu: [AtomicU64; 2],
+    /// GPU work of this process seen complete (its streams' events): a fence its revoke waits
+    /// on moving counts as progress.
+    progress: AtomicU64,
 }
 
 /// What a chunk holds: a region of a set's layout (`fingerprint` its digest's first 8 bytes).
@@ -111,7 +113,7 @@ pub struct Table {
 
 impl Table {
     /// The manager's: a new table over `map` (zeroed, `bytes(slots)` long).
-    pub fn create(map: Map, slots: u32, pid: u32, birth: u64, gpu: [u64; 2]) -> Result<Table> {
+    pub fn create(map: Map, slots: u32, pid: u32, birth: u64) -> Result<Table> {
         if map.len < bytes(slots) {
             return Err(Error::Invalid(format!("a lease table of {slots} slots needs {} bytes", bytes(slots))));
         }
@@ -121,8 +123,6 @@ impl Table {
         h.slots.store(slots, Relaxed);
         h.pid.store(pid, Relaxed);
         h.birth.store(birth, Relaxed);
-        h.gpu[0].store(gpu[0], Relaxed);
-        h.gpu[1].store(gpu[1], Relaxed);
         h.magic.store(MAGIC, Release);
         Ok(table)
     }
@@ -184,6 +184,14 @@ impl Table {
 
     pub fn acked(&self) -> u64 {
         self.header().acked.load(Acquire)
+    }
+
+    pub fn progress(&self) -> u64 {
+        self.header().progress.load(Acquire)
+    }
+
+    pub fn progressed(&self) {
+        self.header().progress.fetch_add(1, Release);
     }
 
     fn ack(&self) {
@@ -317,7 +325,11 @@ impl Table {
     }
 
     pub fn set_landed(&self, i: u32) -> Result<()> {
-        self.slot_or(i)?.landed.store(1, Release);
+        self.set_landed_to(i, true)
+    }
+
+    pub fn set_landed_to(&self, i: u32, landed: bool) -> Result<()> {
+        self.slot_or(i)?.landed.store(u32::from(landed), Release);
         Ok(())
     }
 

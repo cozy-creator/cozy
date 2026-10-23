@@ -189,6 +189,8 @@ impl Inner {
     /// slot go.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn move_slot(self: &Arc<Self>, key: Key, gen: u64, va: Va, from: u64, off: u64, span: u64, phys: Physical, after: Vec<Event>, job: Job) {
+        // Its bytes become another block's: a leased slot is no region's weights any more.
+        self.moved_page(&phys, key);
         let moved = after.iter().try_for_each(|e| self.backend.finish(*e))
             .and_then(|()| self.backend.unmap(va, from, span))
             .and_then(|()| self.backend.map(va, off, &phys, Access::ReadWrite));
@@ -203,7 +205,8 @@ impl Inner {
         let mut st = self.state.lock();
         if !st.homes.get(&key).is_some_and(|h| h.gen == gen) {
             drop(st);
-            let gone = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(phys));
+            self.commit_page(&phys);
+            let gone = self.backend.unmap(va, off, span).and_then(|()| self.give_page(phys));
             let mut st = self.state.lock();
             st.transit = st.transit.saturating_sub(len);
             if let Err(error) = gone {

@@ -59,6 +59,7 @@ pub fn main() {
     // The kernel's list of sockets and stopped threads are Linux's.
     #[cfg(target_os = "linux")]
     cases.extend([
+        ("weights_by_lease_return_on_kill_and_are_adopted", weights_by_lease_return_on_kill_and_are_adopted as fn(&Path)),
         ("an_ask_to_a_stopped_victim_ends_when_it_dies", an_ask_to_a_stopped_victim_ends_when_it_dies as fn(&Path)),
         ("an_unmeasured_request_asks_peers_for_pages_never_caches", an_unmeasured_request_asks_peers_for_pages_never_caches),
         ("a_joiners_limit_leaves_its_peers_room", a_joiners_limit_leaves_its_peers_room),
@@ -308,7 +309,7 @@ fn agent() {
             ["end", req] => {
                 passes.remove(*req);
                 let s = requests.remove(*req).unwrap().end();
-                format!("ok leftover={} kept={} store={} evicted={:?} spec={}", s.leftover, s.moved.kept.bytes, s.moved.store.bytes, s.evicted, s.moved.speculative)
+                format!("ok leftover={} kept={} store={} evicted={:?} spec={} leased={}", s.leftover, s.moved.kept.bytes, s.moved.store.bytes, s.evicted, s.moved.speculative, s.moved.leased.bytes)
             }
             ["limit"] => {
                 let m = mem.as_ref().unwrap();
@@ -318,6 +319,14 @@ fn agent() {
             ["settle"] => {
                 mem.as_ref().unwrap().settle();
                 "ok".into()
+            }
+            #[cfg(target_os = "linux")]
+            ["lease", socket] => {
+                let stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+                match mem.as_ref().unwrap().lease(stream).unwrap() {
+                    None => "ok".into(),
+                    Some((code, why)) => format!("refused {code:?} {why}"),
+                }
             }
             ["fault", point] => {
                 varena::faults::arm(if *point == "decide" { varena::faults::Point::Decide } else { varena::faults::Point::Fill });
@@ -492,6 +501,79 @@ fn a_killed_holder_leaves_orphans_a_successor_imports(dir: &Path) {
     assert!(!trace.contains("Kept"), "{trace}");
     c.ok("unpin");
     c.ok("end r");
+    c.exit();
+}
+
+/// Slice 1's bar on CPU (varena-leases §8): two executors' Memories get their weights by lease
+/// from a manager this process hosts; kill -9 one and its leases return once its exit shows, its
+/// landed weights retained; its successor adopts them with no copy and no new chunk.
+#[cfg(target_os = "linux")]
+fn weights_by_lease_return_on_kill_and_are_adopted(dir: &Path) {
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+    use varena::lease::{Holdings, Hosting, Identity, Manager};
+    struct Ours;
+    impl Hosting for Ours {
+        fn identify(&self, peer: &platform::handles::Peer) -> Option<Identity> {
+            Some(Identity { executor: peer.pid.to_string(), domain: "test".into() })
+        }
+    }
+    let until = |m: &Manager, done: &dyn Fn(&Holdings) -> bool| -> Holdings {
+        let start = Instant::now();
+        loop {
+            let h = m.holdings();
+            if done(&h) {
+                return h;
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "the manager never reached it: {h:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let g = gpu("lease", 64 * MB);
+    let socket = dir.join("lease.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let open: varena::lease::Opener = Box::new(|| Ok(Arc::new(HostBackend::new(64 * MB)) as Arc<dyn varena::Backend>));
+    let manager = Manager::create(&g, None, varena::ledger::Mode::Dedicated, open, listener, Arc::new(Ours)).unwrap();
+    let (k, j) = (write_set(dir, "k", 4), write_set(dir, "j", 2));
+    let start = |set: &str, path: &Path| {
+        let mut x = Agent::spawn();
+        x.ok(&format!("open {} {}", g.uuid, g.memory));
+        x.ok(&format!("lease {}", socket.display()));
+        x.ok(&format!("load {set} {} stored gpu", path.display()));
+        x.ok(&format!("request r {set}"));
+        x.ok(&format!("pass r {set} 1x1"));
+        x
+    };
+    let mut a = start("k", &k);
+    for block in 0..4 {
+        assert_eq!(a.ok(&format!("exact k {block}")), "true", "a's block {block} bit-exact");
+    }
+    a.ok("unpin");
+    assert!(a.ok("end r").contains(&format!("leased={}", 8 * MB)), "a's weights came by lease");
+    let mut b = start("j", &j);
+    for block in 0..2 {
+        assert_eq!(b.ok(&format!("exact j {block}")), "true", "b's block {block} bit-exact");
+    }
+    b.ok("unpin");
+    b.ok("end r");
+    let a_pid = a.child.id();
+    let h = until(&manager, &|h| h.executors.len() == 2 && h.executors.iter().any(|e| e.pid == a_pid && e.landed == 8 * MB));
+    assert_eq!((h.leased, h.created), (12 * MB, 12 * MB), "{h:?}");
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    let h = until(&manager, &|h| h.executors.len() == 1);
+    assert_eq!((h.retained, h.leased, h.created), (8 * MB, 4 * MB, 12 * MB), "a's landed weights retained: {h:?}");
+    let mut c = start("k", &k);
+    for block in 0..4 {
+        assert_eq!(c.ok(&format!("exact k {block}")), "true", "c's adopted block {block} bit-exact");
+    }
+    assert_eq!(c.ok("trace r"), "Kept,Kept,Kept,Kept,Hit,Hit,Hit,Hit", "adopted at load, not copied");
+    c.ok("unpin");
+    let end = c.ok("end r");
+    assert!(end.contains("store=0"), "{end}");
+    let h = until(&manager, &|h| h.executors.len() == 2);
+    assert_eq!((h.retained, h.leased, h.created), (0, 12 * MB, 12 * MB), "adopted with no new chunk: {h:?}");
+    b.exit();
     c.exit();
 }
 

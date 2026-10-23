@@ -186,8 +186,9 @@ mod cases {
         assert_eq!(a.answer(), "ok 1 fresh verified");
     }
 
-    /// Stall verdicts come only from the look's cadence: any number of back-to-back reads names
-    /// no healthy executor; one that never answers its asks is named after enough looks.
+    /// Stall verdicts come only from the look's cadence and measured progress: back-to-back
+    /// reads name nobody; an agent whose GPU work keeps completing (its revoke behind a long
+    /// kernel's fence) is never named; one with neither a release nor GPU progress is.
     fn stalls_are_judged_on_the_looks_cadence(dir: &Path) {
         let host = host(dir, "stall", 128 * MIB);
         let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
@@ -196,6 +197,13 @@ mod cases {
         a.wait_rang();
         for _ in 0..10_000 {
             assert!(host.manager.stalled().is_empty(), "a healthy agent named between looks");
+        }
+        // Eight looks' worth of a long fence: its GPU work keeps completing.
+        let fenced = Instant::now();
+        while fenced.elapsed() < Duration::from_secs(4) {
+            assert_eq!(a.call("tick"), "ok");
+            assert!(host.manager.stalled().is_empty(), "an agent whose GPU work moves was named");
+            std::thread::sleep(Duration::from_millis(100));
         }
         let start = Instant::now();
         while !host.manager.stalled().contains(&a.child.id()) {
@@ -356,6 +364,10 @@ mod cases {
                     "ok".into()
                 }
                 ["rang"] => rang.load(SeqCst).to_string(),
+                ["tick"] => {
+                    agent.as_ref().unwrap().progressed();
+                    "ok".into()
+                }
                 ["revokes"] => {
                     let a = agent.as_ref().unwrap();
                     let mut released = 0;
