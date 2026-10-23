@@ -722,6 +722,10 @@ struct State {
     /// The wake epoch read when this lock was taken, before its drain: a wait sleeps only while
     /// no change came after it.
     seen: u64,
+    /// Each page's last bind on the machine-wide clock (CLOCK_MONOTONIC ns): the manager
+    /// compares idle pages across processes by it.
+    #[cfg(unix)]
+    used_ns: HashMap<Key, u64>,
     table: Table,
     physical_epoch: u64,
     retired: HashMap<(Key, u64), Retirement>,
@@ -2959,6 +2963,8 @@ impl Inner {
         st.pins.insert(id, (key, req, std::thread::current().id()));
         if let Some(p) = st.table.page_mut(key) {
             p.last_use = now;
+            #[cfg(unix)]
+            st.used_ns.insert(key, monotonic_ns());
         }
         st.sync(key);
         if let Some(r) = req.and_then(|r| st.table.request_mut(r)) {
@@ -4109,15 +4115,18 @@ impl Inner {
     }
 
     /// What each leased page is to its plan, for the manager's victim order (the policy's
-    /// advice codes): the current step's (6, memory.min), a later step's (4, its distance), or
-    /// idle (3, its last use). Atomics only, under the state lock.
+    /// advice codes): the current step's (6, memory.min, its distance: the nearest are its
+    /// streaming slots), a later step's (4, its distance), or idle (3, its last bind on the
+    /// machine-wide clock). Atomics only, under the state lock.
     #[cfg(unix)]
     fn advise(&self, st: &State, agent: &crate::lease::Agent) {
         for (ticket, key, _) in self.leased.lock().values() {
-            let (code, value) = match (st.table.class(*key), st.table.distance(*key)) {
-                (Some(Class::W | Class::P), _) => (6, 0),
-                (_, Some((step, pass, block))) => (4, u64::from(step) << 40 | u64::from(pass) << 20 | u64::from(block)),
-                _ => (3, st.table.page(*key).map_or(0, |p| p.last_use)),
+            let at = st.table.distance(*key).map(|(step, pass, block)| u64::from(step) << 40 | u64::from(pass) << 20 | u64::from(block));
+            let (code, value) = match (st.table.class(*key), at) {
+                (Some(Class::P), _) => (6, 0),
+                (Some(Class::W), at) => (6, at.unwrap_or(0)),
+                (_, Some(at)) => (4, at),
+                _ => (3, st.used_ns.get(key).copied().unwrap_or(0)),
             };
             let _ = agent.hint(*ticket, code, value);
         }
@@ -4214,4 +4223,13 @@ impl Drop for Pass {
             st.active.remove(&(self.req, self.set));
         }
     }
+}
+
+/// CLOCK_MONOTONIC in nanoseconds: one clock for every process on the machine.
+#[cfg(unix)]
+fn monotonic_ns() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid clock id and a writable timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    u64::try_from(t.tv_sec).unwrap_or(0).saturating_mul(1_000_000_000).saturating_add(u64::try_from(t.tv_nsec).unwrap_or(0))
 }
