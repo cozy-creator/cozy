@@ -1138,8 +1138,8 @@ impl Publisher {
         }
     }
 
-    /// `uv` with `read` told, about once a second, how many bytes the process has read so far
-    /// (its downloads and the cache it copies from), so a long install shows it moves. Its
+    /// `uv` with `read` told, about once a second, how many bytes the process has written so far
+    /// (its downloads and the wheels it unpacks), so a long install shows it moves. Its
     /// process group is killed when `stop` is canceled, or when its CPU and bytes stop moving
     /// past its measured patience (`process::supervise`).
     fn uv_observed(&self, args: &[&str], env: &[(&str, &std::ffi::OsStr)], stop: Option<&Stop>,

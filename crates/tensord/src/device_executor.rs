@@ -369,6 +369,9 @@ pub enum Kind {
     ModelPrefetch,
     /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
     Log,
+    /// A `progress` event telling the executor's work count (`work`): what its Runtime did for
+    /// its calls (blocks entered, graphs replayed, LM steps, construction legs).
+    Work,
     #[default]
     #[serde(other)]
     Unknown,
@@ -518,6 +521,8 @@ pub struct Frame {
     pub overall_fraction: Option<f64>,
     pub step_ms: Option<f64>,
     pub advance: u64,
+    /// `work`: the executor's work count, which moves while it works for its calls.
+    pub work: u64,
     /// `progress`: the child call whose stage a job relays (the Runtime sends null for none).
     pub call_request: Option<String>,
     /// A retained observation (`kind` log): `name` is its message, `value` its level and
@@ -1924,14 +1929,16 @@ impl Drop for DeviceExecutor {
 
 /// The last progress a call reported: its stage, its fractions (as bits), position, completed
 /// units and relayed call.
-type Advance = (String, Option<u64>, Option<u64>, Option<u64>, u64, Option<String>);
+type Advance = (String, Option<u64>, Option<u64>, Option<u64>, u64, Option<String>, u64);
 
 /// Whether `frame` is real progress of its call: a progress frame that moved its stage, position
-/// or completed units (`last` is the one before; a repeat, telemetry or a log line is not), or
-/// a request that makes something toward its output: a product or checkpoint published, weights
-/// kept, a child call started. A re-ask for a layout, a memo lookup, a poll is not.
+/// or completed units (`last` is the one before; a repeat, telemetry or a log line is not), a
+/// work count that moved, or a request that makes something toward its output: a product or
+/// checkpoint published, weights kept, a child call started. A re-ask for a layout, a memo
+/// lookup, a poll is not.
 fn advances(frame: &Frame, last: &mut Advance) -> bool {
     match frame.kind {
+        Kind::Work => std::mem::replace(&mut last.6, frame.work) != frame.work,
         Kind::Progress if matches!(frame.event, Some(Event::Progress)) && !frame.stage.is_empty() => {
             let fraction = |f: Option<f64>| f.map(f64::to_bits);
             let now = (
@@ -1941,6 +1948,7 @@ fn advances(frame: &Frame, last: &mut Advance) -> bool {
                 frame.position,
                 frame.advance,
                 frame.call_request.clone(),
+                last.6,
             );
             let moved = *last != now;
             *last = now;
@@ -2270,6 +2278,11 @@ mod codec_tests {
             (step("denoise", 1), false),
             (serde_json::json!({"event": "request", "kind": "publish", "seq": 5, "output": "image"}), true),
             (step("denoise", 2), true),
+            // The Runtime's work count (cl-648): moved is progress, told again is not.
+            (serde_json::json!({"event": "progress", "kind": "work", "work": 40}), true),
+            (serde_json::json!({"event": "progress", "kind": "work", "work": 40}), false),
+            (step("denoise", 2), false),
+            (serde_json::json!({"event": "progress", "kind": "work", "work": 52}), true),
         ];
         let mut last = Advance::default();
         for (sent, advanced) in frames {

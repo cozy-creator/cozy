@@ -9,6 +9,7 @@ import time
 import msgspec
 
 from cozy_runtime.author import App, Context, Telemetry
+from cozy_runtime.internal import work
 
 app = App()
 
@@ -16,6 +17,8 @@ app = App()
 class Steps(msgspec.Struct):
     steps: int = 3
     seconds: float = 0.05
+    #: `burn` says nothing of the work it does.
+    silent: bool = False
 
 
 class Done(msgspec.Struct):
@@ -51,11 +54,26 @@ def drip(payload: Steps, ctx: Context) -> Done:
 
 
 @app.entrypoint
-def burn(payload: Steps, ctx: Context) -> Done:
-    """Slow and silent: computes for `seconds`, with no step, frame or line."""
+def burn(payload: Steps, ctx: Context, tel: Telemetry) -> Done:
+    """Slow and CPU-bound, as a compile, hash or quantize is: computes for `seconds`, telling the
+    share done each second unless `silent`."""
+    start = time.monotonic()
+    told = start
+    while (now := time.monotonic()) < start + payload.seconds:
+        if not payload.silent and now - told >= 1.0:
+            tel.progress((now - start) / payload.seconds, stage="computing")
+            told = now
+    return Done(0)
+
+
+@app.entrypoint
+def runtime_work(payload: Steps, ctx: Context) -> Done:
+    """A phase of the Runtime's own (an LM's decode steps, graph replays) for `seconds`, with no
+    step, frame or line of its own: the Runtime tells its machine the work it does (cl-648)."""
     end = time.monotonic() + payload.seconds
     while time.monotonic() < end:
-        pass
+        work.done += 1
+        time.sleep(0.25)
     return Done(0)
 
 

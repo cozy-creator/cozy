@@ -115,7 +115,7 @@ pub(super) fn meter(_: u32) -> Option<(u64, u64)> {
     None
 }
 
-pub(super) fn read_bytes(_: u32) -> Option<u64> {
+pub(super) fn written_bytes(_: u32) -> Option<u64> {
     None
 }
 

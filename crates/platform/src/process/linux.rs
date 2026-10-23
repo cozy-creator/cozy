@@ -181,11 +181,11 @@ pub(super) fn meter(pid: u32) -> Option<(u64, u64)> {
 }
 
 /// `rchar`.
-pub(super) fn read_bytes(pid: u32) -> Option<u64> {
+pub(super) fn written_bytes(pid: u32) -> Option<u64> {
     fs::read_to_string(format!("/proc/{pid}/io"))
         .ok()?
         .lines()
-        .find_map(|line| line.strip_prefix("rchar: "))?
+        .find_map(|line| line.strip_prefix("wchar: "))?
         .trim()
         .parse()
         .ok()

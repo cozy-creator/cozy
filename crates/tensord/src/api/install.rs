@@ -153,7 +153,7 @@ pub fn materialize_uploaded(
     Ok(materialized)
 }
 
-/// `read`: the bytes the installer has read (its downloads, the cache it copies from), about
+/// `read`: the bytes the installer has written (its downloads, the wheels it unpacks), about
 /// once a second while it runs.
 pub fn prepare_uploaded(
     config: &InstallerConfig,

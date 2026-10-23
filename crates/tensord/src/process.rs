@@ -2,7 +2,7 @@
 //! (births, exact handles, groups, meters) is `platform::process`. Nothing here kills
 //! because time passed. Callers kill on a measured wedge (`Pace`), an owner restart, or a launch
 //! that never reached authored code.
-use platform::process::{Birth, Exact, State, gone, group_members, meter, read_bytes};
+use platform::process::{Birth, Exact, State, gone, group_members, meter, written_bytes};
 use std::{
     fs::File,
     io,
@@ -23,6 +23,12 @@ pub fn group_outlives(leader: &Birth, before: u64) -> bool {
 /// are the executor's work. `None` only when the leader itself is unreadable.
 pub fn group_burn(leader: &Birth) -> Option<u64> {
     group_meter(leader).map(|(cpu, moved)| cpu.saturating_add(moved))
+}
+
+/// The bytes the leader and its group members moved: what a call's work is measured in besides
+/// the progress it reports (`Meter::Work`).
+pub fn group_moved(leader: &Birth) -> Option<u64> {
+    group_meter(leader).map(|(_, moved)| moved)
 }
 
 /// `meter` (CPU ns, bytes moved) summed over the leader and its group members.
@@ -124,28 +130,19 @@ impl Pace {
 pub enum Meter {
     /// CPU plus bytes moved by the process (Runtime `ExecutorChild.watched`).
     Burn,
-    /// An invocation's work, judged while it runs, on every executor and every lane: progress it
-    /// reports (a step or stage advanced, an output, weights kept, a child call started; never a
-    /// repeated frame, telemetry or a log line), bytes moved, GPU memory traffic, or CPU other
-    /// than a wait on a stuck GPU. Its call tree is its own (`Waits`: a child call is watched by
-    /// its own executor).
+    /// An invocation's work toward its result, judged while it runs, on every executor and every
+    /// lane: progress it reports (a step or stage advanced, an output, weights kept, a child call
+    /// started; never a repeated frame, telemetry or a log line), bytes moved, or GPU memory
+    /// traffic. Never its CPU: a hung call's background threads compute too. A CPU-bound phase
+    /// (compile, hash, quantize) advances by the progress it reports. Its call tree is its own
+    /// (`Waits`: a child call is watched by its own executor).
     Work,
 }
 
-/// What a call's GPUs did since the last reading.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Gpus {
-    Idle,
-    /// Device memory moved: kernels' traffic, copies, peer writes.
-    Moved,
-    /// A kernel stayed resident with no memory traffic: a collective whose peer is gone, or a
-    /// kernel spinning on a flag. A host spinning meanwhile waits on it.
-    Stuck,
-}
-
-/// Its GPUs' readings; None while they cannot be read, which judges nothing. An executor with no
-/// GPUs has no reader: its GPUs read idle.
-pub type Activity = Arc<dyn Fn() -> Option<Gpus> + Send + Sync>;
+/// Whether a call's GPUs moved device memory (kernels' traffic, copies, peer writes) since the
+/// last reading; None while they cannot be read, which judges nothing. An executor with no GPUs
+/// has no reader: its GPUs read idle.
+pub type Activity = Arc<dyn Fn() -> Option<bool> + Send + Sync>;
 
 /// A measured wedge's verdict, as the error of the command it ended.
 #[derive(Debug)]
@@ -176,8 +173,8 @@ struct WatchState {
 /// Whether the subject is waiting on work watched elsewhere (a job's unfinished child runs).
 pub type Waits = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// The progress meter of work a subject waits on (CPU plus bytes of the call loading a layout
-/// it asked for); None once that work is gone, which lends nothing more.
+/// The progress meter of work a subject waits on (the bytes the call loading a layout it asked
+/// for moved); None once that work is gone, which lends nothing more.
 pub type Lender = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
 /// What the subject waits on now (GPU memory asked of other processes), for a wedge's verdict;
@@ -202,9 +199,8 @@ impl Watch {
             Meter::Work => Pace::seeded(worst_gap),
             Meter::Burn => Pace::default(),
         };
-        // A GPU call's samples with memory traffic, its CPU other than stuck-GPU waits, and its
-        // last CPU reading.
-        let (mut moves, mut ran, mut last_cpu) = (0, 0, None);
+        // A GPU call's samples with memory traffic.
+        let mut moves = 0;
         // What the work it waits on did so far, kept once that work is gone.
         let mut lent = 0;
         let mut state = self.state.lock().unwrap();
@@ -229,12 +225,9 @@ impl Watch {
             lent = state.lender.as_ref().and_then(|lender| lender()).unwrap_or(lent);
             let reading = match self.meter {
                 Meter::Burn => group_burn(exact.birth()).map(|burn| burn + lent),
-                Meter::Work => self.activity.as_ref().map_or(Some(Gpus::Idle), |gpus| gpus()).map(|gpus| {
-                    let (cpu, moved) = group_meter(exact.birth()).unwrap_or_default();
-                    let since = cpu.saturating_sub(last_cpu.replace(cpu).unwrap_or(cpu));
-                    ran += if gpus == Gpus::Stuck { 0 } else { since };
-                    moves += u64::from(gpus == Gpus::Moved);
-                    state.frames + moved + moves + ran + lent
+                Meter::Work => self.activity.as_ref().map_or(Some(false), |gpus| gpus()).map(|moved_memory| {
+                    moves += u64::from(moved_memory);
+                    state.frames + group_moved(exact.birth()).unwrap_or_default() + moves + lent
                 }),
             };
             pace.observe(reading, now);
@@ -247,7 +240,7 @@ impl Watch {
                 let still = now - since;
                 if still > pace.patience(floor) {
                     let measures = match self.meter {
-                        Meter::Work => " (steps and stages advanced, outputs, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)",
+                        Meter::Work => " (steps and stages advanced, outputs, bytes moved, GPU memory traffic; never CPU)",
                         Meter::Burn => "",
                     };
                     let at = match state.at.as_str() {
@@ -437,15 +430,16 @@ pub enum Supervised {
     Wedged(String),
 }
 
-/// Waits for `child`, the leader of its own process group, reading it once a second: `read`
-/// sees the bytes its group has read (its downloads, the cache it copies from), and its group is killed when `stop` is canceled or when the
+/// Waits for `child`, the leader of its own process group, reading it once a second: `wrote`
+/// sees the bytes its group has written (downloads landing, wheels unpacked; a network read or a
+/// linked file counts no byte), and its group is killed when `stop` is canceled or when the
 /// group's CPU and bytes stop moving for longer than its measured patience (`Pace`, floored by
 /// `Liveness`). The second is resolution, never a verdict.
 pub fn supervise(
     child: &mut Child,
     stop: Option<&crate::stop::Stop>,
     what: &str,
-    read: &dyn Fn(u64),
+    wrote: &dyn Fn(u64),
 ) -> io::Result<Supervised> {
     let exact = match Birth::of(child.id()).map_err(io::Error::from) {
         Ok(birth) => Exact::open(&birth)?,
@@ -458,8 +452,8 @@ pub fn supervise(
     let (floor, tick) = (Liveness::default().floor(), Duration::from_secs(1));
     let (mut pace, mut ended) = (Pace::default(), None);
     let (mut last, mut advances) = (None, 0u64);
-    // What each process of the group read so far: a gone member keeps what it read.
-    let mut reads = std::collections::HashMap::new();
+    // What each process of the group wrote so far: a gone member keeps what it wrote.
+    let mut writes = std::collections::HashMap::new();
     while !exact.wait_for(tick)? {
         if ended.is_some() {
             continue;
@@ -477,11 +471,11 @@ pub fn supervise(
         }
         last = Some(reading);
         pace.observe(Some(advances), now);
-        for (pid, bytes) in group.iter().filter_map(|pid| Some((*pid, read_bytes(*pid)?))) {
-            let held: &mut u64 = reads.entry(pid).or_default();
+        for (pid, bytes) in group.iter().filter_map(|pid| Some((*pid, written_bytes(*pid)?))) {
+            let held: &mut u64 = writes.entry(pid).or_default();
             *held = (*held).max(bytes);
         }
-        read(reads.values().sum());
+        wrote(writes.values().sum());
         if stop.is_some_and(|stop| stop.is_cancelled()) {
             exact.kill()?;
             ended = Some(Supervised::Canceled);
@@ -600,29 +594,27 @@ mod tests {
         assert!(group_members(&birth).is_empty());
     }
 
-    /// A call is judged while it runs on its work, with GPUs or without: one blocked with idle
-    /// GPUs, or spinning while its GPU holds a kernel that moves no memory (a collective whose
-    /// peer is gone), is killed; one that reports advancing steps, computes on any number of
-    /// threads, moves bytes, or whose GPUs move memory or cannot be read is not.
+    /// A call is judged while it runs on its work toward its result, with GPUs or without: one
+    /// that reports advancing steps, moves bytes, or whose GPUs move memory or cannot be read is
+    /// not killed; one blocked, or only computing on any number of threads, is (cl-648: a hung
+    /// suite's background threads computed, and it looked alive).
     #[cfg(unix)]
     #[test]
-    fn a_call_blocked_or_waiting_on_a_stuck_gpu_is_killed_and_working_ones_are_not() {
-        let gpus = |reading: Option<Gpus>| -> Option<Activity> { Some(Arc::new(move || reading)) };
+    fn a_call_is_judged_on_its_progress_never_its_cpu() {
+        let gpus = |reading: Option<bool>| -> Option<Activity> { Some(Arc::new(move || reading)) };
         let spin = "while :; do :; done";
         let cases = [
-            ("blocked", "sleep 600", gpus(Some(Gpus::Idle)), false, true),
-            ("waits on a stuck GPU", spin, gpus(Some(Gpus::Stuck)), false, true),
-            ("reports advancing steps", "sleep 600", gpus(Some(Gpus::Idle)), true, false),
-            ("computes on one thread", spin, gpus(Some(Gpus::Idle)), false, false),
-            // However little CPU a loaded machine gives them.
-            ("computes on two threads", "while :; do :; done & while :; do :; done", gpus(Some(Gpus::Idle)), false, false),
-            ("moves bytes while its GPU is stuck", "while :; do echo work; done > /dev/null", gpus(Some(Gpus::Stuck)), false, false),
-            ("its GPU moves memory", "sleep 600", gpus(Some(Gpus::Moved)), false, false),
+            ("blocked", "sleep 600", gpus(Some(false)), false, true),
+            ("only computes", spin, gpus(Some(false)), false, true),
+            ("only computes on two threads", "while :; do :; done & while :; do :; done", gpus(Some(false)), false, true),
+            ("reports advancing steps", spin, gpus(Some(false)), true, false),
+            ("moves bytes", "while :; do echo work; done > /dev/null", gpus(Some(false)), false, false),
+            ("its GPU moves memory", "sleep 600", gpus(Some(true)), false, false),
             ("its GPU is unread", "sleep 600", gpus(None), false, false),
             // A call with no GPUs (a script, a job root) is judged the same way (run 13543).
             ("blocked with no GPUs", "sleep 600", None, false, true),
+            ("only computes with no GPUs", spin, None, false, true),
             ("prints with no GPUs", "while :; do echo line; sleep 0.002; done > /dev/null", None, false, false),
-            ("computes with no GPUs", spin, None, false, false),
         ];
         // A shell can fork a CPU spinner. Always end its group, including on an assertion
         // failure: Child::kill only ends the shell and leaves that spinner running.
@@ -659,7 +651,7 @@ mod tests {
             if killed {
                 let verdict = verdict.unwrap();
                 assert!(verdict.contains("wedged during invoke: no measurable progress"), "{case}");
-                assert!(verdict.contains("(steps and stages advanced, outputs, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)"), "{verdict}");
+                assert!(verdict.contains("(steps and stages advanced, outputs, bytes moved, GPU memory traffic; never CPU)"), "{verdict}");
             }
             drop(group);
             assert!(group_members(&birth).iter().all(|member| member.ended().unwrap()), "{case}: the test left a process running");
@@ -674,7 +666,7 @@ mod tests {
         let mut child = Command::new("/bin/sh").args(["-c", "sleep 600"]).process_group(0).stdin(Stdio::null()).spawn().unwrap();
         let birth = Birth::of(child.id()).unwrap();
         let liveness = Liveness { sample: Duration::from_millis(20) };
-        let idle: Activity = Arc::new(|| Some(Gpus::Idle));
+        let idle: Activity = Arc::new(|| Some(false));
         let exact = Exact::open(&birth).unwrap().unwrap();
         let watching = Watching::start(exact, Meter::Work, liveness, Duration::ZERO, None, Some(idle), "invoke").unwrap();
         let asked = "bytes on GPU 0 asked of pid 7 (asked 2.00 GiB; gave 0.00 GiB in 3 answers)";
@@ -689,13 +681,14 @@ mod tests {
     }
 
     /// A call waiting on another call that loads a layout it needs moves as that loader moves:
-    /// behind a loader that computes it is never killed; behind one that shows no progress, or
-    /// that has ended, it is (run 13618 waited 20 min, its re-asks counted as frames).
+    /// behind a loader moving bytes it is never killed; behind one that only computes, shows no
+    /// progress, or has ended, it is (run 13618 waited 20 min, its re-asks counted as frames).
     #[cfg(unix)]
     #[test]
     fn a_waiter_moves_as_its_loader_moves_and_is_killed_behind_a_still_or_gone_one() {
         for (case, loader_script, end_loader, killed) in [
-            ("computing loader", "while :; do :; done", false, false),
+            ("loader moving bytes", "while :; do echo work; done > /dev/null", false, false),
+            ("loader only computing", "while :; do :; done", false, true),
             ("still loader", "sleep 600", false, true),
             ("gone loader", "sleep 600", true, true),
         ] {
@@ -703,7 +696,7 @@ mod tests {
             let (mut waiter, mut loader) = (spawn("sleep 600"), spawn(loader_script));
             let (waiting, loading) = (Birth::of(waiter.id()).unwrap(), Birth::of(loader.id()).unwrap());
             let lend = loading.clone();
-            let lender: Lender = Arc::new(move || group_burn(&lend));
+            let lender: Lender = Arc::new(move || group_moved(&lend));
             let liveness = Liveness { sample: Duration::from_millis(20) };
             let exact = Exact::open(&waiting).unwrap().unwrap();
             let watching = Watching::start(exact, Meter::Work, liveness, Duration::ZERO, None, None, "invoke").unwrap();
@@ -812,22 +805,44 @@ mod tests {
     }
 
 
-    /// A supervised installer is told the bytes its whole group reads as they move, a child's
-    /// included (the Runtime's installer runs uv as one): a slow install shows it moves (runs
-    /// 14747 and 14748 sat at "installing … on this machine" with no bytes for ten minutes).
+    /// A real install (uv, as the Runtime's installer and a release's sync run it) is supervised
+    /// from a cold cache and then a warm one: it is never judged stalled, and cold it is told the
+    /// bytes it lands as they move while its progress advances (runs 14747 and 14748 sat at
+    /// "installing … on this machine" with no bytes for ten minutes). uv's network reads and its
+    /// links from the cache count no byte; what it writes does, and so does its CPU.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_supervised_group_is_told_the_bytes_its_children_read() {
-        // The leader reads nothing itself; its children read 1 MB each fifth of a second, 20 times.
-        let script = "for i in $(seq 20); do head -c 1000000 /dev/zero; sleep 0.2; done | cat > /dev/null";
-        let mut child = Command::new("/bin/sh").args(["-c", script]).process_group(0).spawn().unwrap();
-        let told = std::sync::Mutex::new(vec![]);
-        let ended = supervise(&mut child, None, "a reader", &|bytes| told.lock().unwrap().push(bytes)).unwrap();
-        assert!(matches!(ended, Supervised::Exited(status) if status.success()), "{ended:?}");
-        let told = told.into_inner().unwrap();
-        // Each sample more than the last, all of it read by children (`cat` counts its pipe too).
-        assert!(told.len() >= 3 && told.windows(2).all(|w| w[0] < w[1]), "not told as they moved: {told:?}");
-        assert!(told[told.len() - 1] >= 20_000_000, "{told:?}");
+    fn a_real_install_is_told_the_bytes_it_lands_and_never_judged_stalled() {
+        let root = tempfile::tempdir().unwrap();
+        let uv = |args: &[&std::ffi::OsStr]| {
+            let mut command = Command::new("uv");
+            command.args(args).env("UV_CACHE_DIR", root.path().join("cache")).env("UV_CONCURRENT_DOWNLOADS", "1");
+            command
+        };
+        for cold in [true, false] {
+            let venv = root.path().join(if cold { "cold" } else { "warm" });
+            let made = uv(&["venv".as_ref(), "-q".as_ref(), "--python".as_ref(), "python3".as_ref(), venv.as_os_str()]).status();
+            assert!(made.expect("uv runs").success());
+            let python = venv.join("bin/python");
+            // A package's usual set: CPU torch, numpy, pandas and pillow (about 1 GB unpacked; on a
+            // runner's network the cold install takes seconds, so it is sampled as it lands).
+            let wheels = ["torch==2.9.0", "numpy==2.3.4", "pillow==12.0.0", "pandas==2.3.3"].map(std::ffi::OsStr::new);
+            let pip = ["pip", "install", "-q", "--torch-backend", "cpu", "--python"].map(std::ffi::OsStr::new);
+            let mut install = uv(&[&pip[..], &[python.as_os_str()], &wheels[..]].concat());
+            let mut child = install.process_group(0).spawn().unwrap();
+            let (stop, told) = (crate::stop::Stop::default(), std::sync::Mutex::new(vec![]));
+            let ended = supervise(&mut child, Some(&stop), "uv", &|bytes| told.lock().unwrap().push(bytes)).unwrap();
+            assert!(matches!(ended, Supervised::Exited(status) if status.success()), "cold {cold}: {ended:?}");
+            let imported = Command::new(&python).args(["-c", "import torch, numpy, PIL, pandas"]).status().unwrap();
+            assert!(imported.success(), "cold {cold}: not installed");
+            let told = told.into_inner().unwrap();
+            assert!(told.windows(2).all(|w| w[0] <= w[1]), "cold {cold}: {told:?}");
+            if cold {
+                // Written as they land; the bytes it read would have told about 1 MB.
+                assert!(told.len() >= 2 && told[told.len() - 1] > told[0] && told[told.len() - 1] >= 50 << 20, "{told:?}");
+                assert!(stop.progress() > 0, "its progress never advanced: {told:?}");
+            }
+        }
     }
 
     /// A safetensors file served from a real socket, `chunk` bytes each `pace`; with `stall`, its
