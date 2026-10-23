@@ -1496,8 +1496,9 @@ fn machine_kind(kind: MachineKind) -> &'static str {
 fn machine_state(state: MachineState) -> &'static str {
     match state {
         MachineState::Booting => "booting",
-        // Ending and offline are the API's words for a ready machine its Hub says more of.
-        MachineState::Ready | MachineState::Ending | MachineState::Offline => "ready",
+        // Ending is the API's word for a machine whose end its Hub has not affirmed; nothing
+        // records a state it does not know.
+        MachineState::Ready | MachineState::Ending | MachineState::Unknown => "ready",
         MachineState::Ended => "ended",
     }
 }
@@ -1514,6 +1515,7 @@ impl From<&MachineRow> for Machine {
             address: row.endpoint.as_ref().map(|e| e.address.clone()),
             fingerprint: row.endpoint.as_ref().map(|e| Digest::from_bytes(e.pin)),
             reason: row.reason.clone(),
+            offline: None,
             rental: None,
             status: None,
             unreachable: None,

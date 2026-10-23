@@ -219,8 +219,8 @@ pub(crate) async fn follow(
             output::say(ctx, note);
         }
         match machine.state {
-            // Offline once up: a run sent to it is refused, saying why.
-            MachineState::Ready | MachineState::Offline => return Ok(Some(machine)),
+            // Unknown: a newer Calcifer's word, shown as it is.
+            MachineState::Ready | MachineState::Unknown => return Ok(Some(machine)),
             MachineState::Booting => {
                 let line = state_cell(&machine);
                 if line != said {
