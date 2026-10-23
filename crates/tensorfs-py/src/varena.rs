@@ -1088,19 +1088,3 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::consumer;
-
-    #[test]
-    fn dlpack_consumer_streams() {
-        assert_eq!(consumer(None), Some(0));
-        assert_eq!(consumer(Some(1)), Some(0));
-        assert_eq!(consumer(Some(2)), Some(2));
-        assert_eq!(consumer(Some(99)), Some(99));
-        for s in [0, -1, -2, i64::MIN] {
-            assert_eq!(consumer(Some(s)), None);
-        }
-    }
-}

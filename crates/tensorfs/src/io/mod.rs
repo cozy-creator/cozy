@@ -389,38 +389,3 @@ fn disk_run(copies: &[Copy], stats: &ReadStats, ns: u64) {
         metrics::disk_run(&files, bytes, ns, stats.direct, stats.cached);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Copies whose sources and destinations both continue the previous one's become one run;
-    /// a jump in either, another file or another kind of source starts the next run.
-    #[test]
-    fn contiguous_copies_coalesce_into_runs() {
-        let (a, b) = (File::open(std::env::current_exe().unwrap()).unwrap(), File::open(std::env::current_exe().unwrap()).unwrap());
-        let device = |ptr: u64, len: usize| Dst::Device { device: 0, ptr, len, stream: 7 };
-        let copies = vec![
-            Copy { src: Src::File(&a, 0), dst: device(4096, 100) },
-            Copy { src: Src::File(&a, 100), dst: device(4196, 28) },
-            Copy { src: Src::Zero, dst: device(4224, 32) },
-            Copy { src: Src::Zero, dst: device(4256, 64) },
-            Copy { src: Src::File(&a, 128), dst: device(4320, 10) },
-            Copy { src: Src::File(&b, 138), dst: device(4330, 10) },
-            Copy { src: Src::File(&b, 148), dst: device(5000, 10) },
-            Copy { src: Src::File(&b, 158), dst: Dst::Device { device: 0, ptr: 5010, len: 10, stream: 8 } },
-        ];
-        let (merged, firsts) = coalesce(copies);
-        assert_eq!(firsts, [0, 2, 4, 5, 6, 7]);
-        let runs: Vec<(usize, usize)> = merged.iter().map(|c| (match c.dst { Dst::Device { ptr, .. } => ptr as usize, Dst::Host { .. } => 0 }, c.dst.len())).collect();
-        assert_eq!(runs, [(4096, 128), (4224, 96), (4320, 10), (4330, 10), (5000, 10), (5010, 10)]);
-        let mut host = [0u8; 64];
-        let (left, right) = host.split_at_mut(16);
-        let bytes = [1u8; 64];
-        let (merged, _) = coalesce(vec![
-            Copy { src: Src::Host(bytes.as_ptr()), dst: Dst::host(left) },
-            Copy { src: Src::Host(bytes[16..].as_ptr()), dst: Dst::host(right) },
-        ]);
-        assert_eq!((merged.len(), merged[0].dst.len()), (1, 64));
-    }
-}

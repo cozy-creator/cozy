@@ -1,7 +1,10 @@
 //! tensorfs-py: the `tensorfs` wheel's compiled half. It marshals; every byte-level fact comes
 //! from `tensorfs` and `varena`. Torch stays outside: tensors cross as DLPack.
 
+#![deny(unsafe_code)]
+
 mod ceiling;
+#[allow(unsafe_code)]
 mod cleanup;
 mod errors;
 #[cfg(feature = "store")]
@@ -9,20 +12,26 @@ mod classref;
 #[cfg(feature = "store")]
 mod file;
 #[cfg(feature = "store")]
+#[allow(unsafe_code)]
 mod store;
 #[cfg(feature = "store")]
+#[allow(unsafe_code)]
 mod tensors;
 #[cfg(feature = "store")]
 mod credentials;
 #[cfg(feature = "store")]
+#[allow(unsafe_code)]
 mod dlpack_source;
 #[cfg(feature = "store")]
 mod verification;
 #[cfg(feature = "store")]
+#[allow(unsafe_code)]
 mod resident_decode;
 #[cfg(feature = "store")]
+#[allow(unsafe_code)]
 mod varena;
 #[cfg(feature = "store")]
+#[allow(unsafe_code)]
 mod agent;
 
 use pyo3::prelude::*;

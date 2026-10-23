@@ -44,6 +44,9 @@ __all__ = [
     "NotRegistered", "GraphRegion", "Placeholder", "Region", "Request", "Room", "Stats", "Unbound", "VarenaError", "Weights", "blocks_of",
 ]
 
+#: Blocks entered, process-wide: the work a call does in its models, which the Runtime tells the
+#: machine (cl-648).
+progress = 0
 #: TensorFS dtype names; an `F4` part is u8 pairs.
 DTYPES: dict[str, torch.dtype] = {
     name: getattr(torch, kind)
@@ -760,6 +763,7 @@ class Memory:
         torch.cuda.ExternalStream(waiter, device=self.device).wait_stream(torch.cuda.ExternalStream(waited, device=self.device))
 
     def _enter(self, block: _Block, evict: bool = True) -> None:
+        global progress
         stream = self._stream()
         with block.model.lock:
             if block.count == 0:
@@ -769,6 +773,7 @@ class Memory:
             elif stream is not None and stream != block.stream and not torch.cuda.is_current_stream_capturing():
                 self._join(stream, block.stream)  # type: ignore[arg-type]  # a capture binds under a hold
             block.count += 1
+        progress += 1
 
     def _exit(self, block: _Block) -> None:
         stream = self._stream()
