@@ -1,6 +1,7 @@
 //! The region frames end to end on a real agent and a real Memory: a stand-in manager on a socket
-//! pair welcomes the agent with a table, reads the Region and RegionGone frames, and sends Reclaim,
-//! which reaches the region through the agent's reader and the mechanism thread.
+//! pair welcomes the agent with a table, grants torch's asks from host pages, reads the Region and
+//! RegionGone frames, and sends Reclaim, which reaches the region through the agent's reader and
+//! the mechanism thread.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::os::unix::net::UnixStream;
@@ -11,7 +12,7 @@ use crate::arena::CHUNK;
 use crate::lease::table::{self, Table};
 use crate::lease::wire::{End, RegionFacts, ToAgent, ToManager};
 use crate::region::{Kind, Reclaimable};
-use crate::{os, GpuId, HostBackend, Memory};
+use crate::{os, Backend, GpuId, HostBackend, Memory};
 
 const MB: u64 = 1 << 20;
 const A: usize = 0xa00;
@@ -21,18 +22,38 @@ enum Heard {
     Gone(u64),
 }
 
-/// Welcomes the agent, then forwards every region frame it reads.
+/// Slots of the stand-in's table: more than the test's chunks.
+const SLOTS: u32 = 64;
+
+/// Welcomes the agent, grants every ask from its own host pages (one chunk per slot, at most
+/// [`CHUNK`]), then forwards every region frame it reads.
 fn standin(stream: UnixStream) -> (std::sync::Arc<End>, mpsc::Receiver<Heard>) {
     let end = std::sync::Arc::new(End::new(stream));
     let (tx, rx) = mpsc::channel();
     let reader = end.clone();
     std::thread::spawn(move || {
         let Ok(Some((ToManager::Hello { birth, .. }, _))) = reader.recv::<ToManager>() else { return };
-        let file = os::sealed_page(table::bytes(1) as u64).unwrap();
-        let table = Table::create(os::map(&file, table::bytes(1), true).unwrap(), 1, std::process::id(), birth).unwrap();
+        let file = os::sealed_page(table::bytes(SLOTS) as u64).unwrap();
+        let table = Table::create(os::map(&file, table::bytes(SLOTS), true).unwrap(), SLOTS, std::process::id(), birth).unwrap();
         reader.send(&ToAgent::Welcome { epoch: table.attach() }, Some(os::lend(&file).unwrap())).unwrap();
+        let (pages, mut next) = (HostBackend::new(1 << 30), 0u32);
+        let mut made = Vec::new();
         while let Ok(Some((m, _))) = reader.recv::<ToManager>() {
             let heard = match m {
+                ToManager::Ask { id, bytes, .. } => {
+                    let mut left = bytes;
+                    while left > 0 {
+                        let len = left.min(CHUNK);
+                        let page = pages.create(len).unwrap();
+                        table.grant(next, 1, len, None, false).unwrap();
+                        left -= len;
+                        let grant = ToAgent::Grant { id, slot: next, seq: 1, bytes: len, adopted: false, last: left == 0 };
+                        reader.send(&grant, Some(pages.lend(&page).unwrap())).unwrap();
+                        made.push(page);
+                        next += 1;
+                    }
+                    continue;
+                }
                 ToManager::Region(f) => Heard::Region(f),
                 ToManager::RegionGone { id } => Heard::Gone(id),
                 _ => continue,
@@ -75,8 +96,7 @@ fn a_managers_reclaim_reaches_the_region_and_its_facts_follow() {
     let mem = Memory::open(g, None, Box::new(HostBackend::new(card))).unwrap();
     let (theirs, ours) = UnixStream::pair().unwrap();
     let (manager, heard) = standin(theirs);
-    assert_eq!(mem.lease_over(ours).unwrap(), None);
-    mem.serve_standalone_torch().unwrap();
+    assert_eq!(mem.lease_over(ours).unwrap(), None, "leased, and torch served from grants");
 
     let region = mem.region("kv", Kind::Kv, &[], false).unwrap();
     let id = region.id();
@@ -86,7 +106,8 @@ fn a_managers_reclaim_reaches_the_region_and_its_facts_follow() {
         let _filling = region.allocating().unwrap();
         mem.torch_alloc(3 * MB, A, None).unwrap()
     };
-    assert!(matches!(next(&heard, id), Heard::Region(_)), "no Region frame once filled");
+    let Heard::Region(filled) = next(&heard, id) else { panic!("no Region frame once filled") };
+    assert_eq!(filled.slots.len(), 1, "its one chunk's lease slot");
     region.next_use(Some(4));
     let Heard::Region(advised) = next(&heard, id) else { panic!("no Region frame for its advice") };
     assert_eq!(advised.next_use, 4);
@@ -96,7 +117,8 @@ fn a_managers_reclaim_reaches_the_region_and_its_facts_follow() {
     assert_eq!(bytes(), CHUNK);
     manager.send(&ToAgent::Reclaim { region: id, swap: false }, None).unwrap();
     until("the manager's reclaim discards the region", || bytes() == 0);
-    assert!(matches!(next(&heard, id), Heard::Region(_)), "no Region frame after the reclaim");
+    let Heard::Region(reclaimed) = next(&heard, id) else { panic!("no Region frame after the reclaim") };
+    assert!(reclaimed.slots.is_empty(), "its chunk went back: {:?}", reclaimed.slots);
     assert!(region.pin().unwrap().fresh());
     mem.torch_free(p, 3 * MB, A);
     drop(region);
