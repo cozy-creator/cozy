@@ -22,7 +22,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use platform::{handles::Peer, process::Exact};
-use varena::lease::{Hosting, Identity, Manager, Record};
+use varena::lease::{manager::{Opener, Record}, Hosting, Identity, Manager};
 use varena::{
     ledger::{FixedRow, Mode},
     Backend, CudaBackend, GpuId, HostCall, Ledger, Peak,
@@ -232,7 +232,8 @@ fn sample_fixed(uuid: &str, fixed: std::sync::Weak<Mutex<Fixed>>, log: &MemoryLo
         for (pid, row) in processes.iter().flat_map(|processes| held.rows.iter().map(move |(pid, row)| (processes.get(pid), row))) {
             row.set(pid.copied().unwrap_or(0));
         }
-        drop((held, fixed));
+        drop(held);
+        drop(fixed);
         std::thread::sleep(FIXED_SAMPLE);
     }
 }
@@ -242,16 +243,12 @@ fn manage(id: &GpuId, limit: Option<u64>, mode: Mode, leases: Leases) -> Result<
     let listener = varena::lease::listen(id)
         .map_err(|error| format!("its listener: {error}"))?
         .ok_or_else(|| "another process serves its leases".to_string())?;
-    let open = leases.open;
-    Manager::create(id, limit, mode, Box::new(move || open()), listener, leases.hosting).map_err(|error| error.to_string())
+    Manager::create(id, limit, mode, leases.open, listener, leases.hosting).map_err(|error| error.to_string())
 }
 
-/// Opens a GPU's chunks: TensorD's own context, made at its manager's first ask and released
+/// GPU `uuid`'s chunks, opened in TensorD's own context at its manager's first ask and released
 /// when the manager holds no chunk and serves no executor (a context costs VRAM, and keeps a
-/// laptop's GPU awake).
-pub type Opener = Arc<dyn Fn() -> varena::Result<Arc<dyn Backend>> + Send + Sync>;
-
-/// GPU `uuid`'s opener. None (a memory-log note says why) where its compute mode admits one
+/// laptop's GPU awake). None (a memory-log note says why) where its compute mode admits one
 /// process at a time, whose context TensorD's would lock out, or CUDA cannot share its pages.
 /// Only NVML and CUDA's driver are read here: no context is made.
 pub fn chunks(uuid: &str, log: &MemoryLog) -> Option<Opener> {
@@ -265,7 +262,7 @@ pub fn chunks(uuid: &str, log: &MemoryLog) -> Option<Opener> {
         Err(error) => tracing::warn!("memory: GPU {uuid}'s compute mode is unread ({error}): CUDA decides"),
     }
     let ordinal = shareable(uuid).inspect_err(|why| off(why.clone())).ok()?;
-    Some(Arc::new(move || CudaBackend::open(ordinal).map(|backend| Arc::new(backend) as Arc<dyn Backend>)))
+    Some(Box::new(move || CudaBackend::open(ordinal).map(|backend| Arc::new(backend) as Arc<dyn Backend>)))
 }
 
 /// The CUDA ordinal of GPU `uuid` in this process (neither NVML's index nor an executor's,

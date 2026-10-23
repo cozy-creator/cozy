@@ -71,6 +71,7 @@ fn start(generation: &Generation, interface: &Path, import_only: bool) -> Device
         call_interfaces: vec![],
         constructions: Vec::new(),
         ledgers: 0,
+        leases: None,
         memory_mode: tensord::device_executor::MemoryMode::Shared,
     }
 }
