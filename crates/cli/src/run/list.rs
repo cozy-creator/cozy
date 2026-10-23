@@ -43,6 +43,9 @@ pub async fn exec(ctx: &Context, mut query: Query, once: bool) -> Result<ExitCod
         return Ok(ExitCode::SUCCESS);
     }
     let list = runs(ctx, &query).await?;
+    for run in &list.unreadable {
+        output::warn(&format!("left out {run}"));
+    }
     if ctx.json {
         output::json(&list);
         return Ok(ExitCode::SUCCESS);
@@ -69,6 +72,7 @@ pub(crate) async fn runs(ctx: &Context, query: &Query) -> Result<RunList, Error>
         runs: vec![],
         older: 0,
         machine: None,
+        unreadable: vec![],
     };
     let mut page = Query {
         limit: Some(query.limit.unwrap_or(500).min(500)),
@@ -80,6 +84,7 @@ pub(crate) async fn runs(ctx: &Context, query: &Query) -> Result<RunList, Error>
         let more = list.older > 0;
         out.older = list.older;
         out.machine = list.machine;
+        out.unreadable.extend(list.unreadable);
         out.runs.extend(
             list.runs
                 .into_iter()

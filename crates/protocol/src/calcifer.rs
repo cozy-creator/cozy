@@ -399,6 +399,9 @@ pub struct RunList {
     /// The machine `?machine=` named, by its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
+    /// Matching runs the store cannot read, each as `run N: why`, left out of `runs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<String>,
 }
 
 /// `GET /v1/runs/events`: every run's changes, each run whole as `GET /v1/runs/{id}` answers it. No
@@ -544,9 +547,9 @@ pub struct MachineStatus {
     pub disk_total_bytes: u64,
     #[serde(default)]
     pub disk_free_bytes: u64,
-    /// This controller's queued, preparing or running runs there.
+    /// This controller's queued, preparing or running runs there, as the machine says.
     #[serde(default)]
-    pub live_runs: u32,
+    pub runs: Vec<LiveRun>,
     #[serde(default)]
     pub models: Vec<Model>,
     #[serde(default)]
@@ -563,6 +566,20 @@ pub struct MachineStatus {
     pub toolchain: Option<crate::machine::Toolchain>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kernels: Vec<crate::machine::KernelVerdict>,
+}
+
+/// A run a machine holds for this controller, beside this controller's record of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LiveRun {
+    pub id: String,
+    /// The machine's word for it: queued, preparing or running.
+    pub state: String,
+    /// Why it waits there.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub waiting: String,
+    /// None when this controller keeps no record of it; a settled one was left behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<Run>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
