@@ -651,6 +651,8 @@ pub struct Pool {
     memo: Arc<crate::memo::Memo>,
     /// The calls running on its GPUs, by request: the host rule reads them.
     running: memory::Running,
+    /// The derived-weights disk cache: entries TensorD keeps for the GPU page cache.
+    derived: crate::derived::Derived,
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
@@ -783,6 +785,7 @@ impl Pool {
                 levels: Mutex::new(BTreeMap::new()),
                 memo,
                 running,
+                derived: crate::derived::Derived::at(root.join("derived")),
             }
         }))
     }
@@ -943,6 +946,9 @@ impl Pool {
     }
     pub fn memo(&self) -> &crate::memo::Memo {
         &self.memo
+    }
+    pub fn derived(&self) -> &crate::derived::Derived {
+        &self.derived
     }
     pub fn config(&self) -> &GpuConfig {
         &self.config
