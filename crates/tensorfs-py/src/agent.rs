@@ -91,7 +91,7 @@ pub extern "C" fn varena_agent_record_stream(ptr: u64, stream: usize) {
 pub extern "C" fn varena_agent_pool_begin(device: c_int, pool_a: u64, pool_b: u64) {
     guarded("pool_begin", || {
         if let Some(memory) = serving(device) {
-            memory.pool_begin(PoolId(pool_a, pool_b));
+            memory.pool_begin(PoolId(pool_a, pool_b), None); // the shim cannot name the capture stream
         }
     });
 }
