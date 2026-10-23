@@ -1,0 +1,105 @@
+name: mps
+# Manual only (cr-021). The local path on an Apple GPU as a person takes it: this ref's cozy on
+# `local`, the Runtime and TensorFS built from their refs (`cozy machine update`), and real
+# packages from a packages ref run with `cozy run`: BiRefNet must serve and SDXL must serve or,
+# past the GPU's working set, be refused naming it.
+# GitHub's macOS VMs give torch 2.14 a working GPU on macOS 15 only (on 26+ its Metal 4 kernels
+# compute wrong there, pytorch#196582; torch 2.15+ refuses the virtual GPU).
+#   gh workflow run mps.yaml -R cozy-creator/cozy-creator --ref <branch> [-f runtime_ref=<ref>] [-f packages_ref=<ref>]
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_ref:
+        description: cozy-runtime branch, tag or SHA
+        type: string
+        default: master
+      packages_ref:
+        description: packages branch, tag or SHA
+        type: string
+        default: master
+      sdxl:
+        description: Also SDXL (6.5 GiB of weights)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  local:
+    runs-on: macos-15
+    # Hang bound, not a work budget.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      OUT: ${{ runner.temp }}/mps
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with: {repository: cozy-creator/cozy-runtime, ref: "${{ inputs.runtime_ref }}", path: .runtime}
+      - uses: actions/checkout@v5
+        with: {repository: cozy-creator/packages, ref: "${{ inputs.packages_ref }}", path: .packages}
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Build cozy and the wheels
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.memsize; sw_vers -productVersion
+          cargo build --release --locked -p cozy -p tensorfs --bin cozy --bin tfs
+          mkdir -p ~/.cozy/bin crates/tensorfs-py/wheel-data/scripts "$OUT"
+          cp target/release/cozy ~/.cozy/bin/ && echo ~/.cozy/bin >> "$GITHUB_PATH"
+          cp target/release/tfs crates/tensorfs-py/wheel-data/scripts/
+          (cd crates/tensorfs-py && uvx maturin@1.15.0 build --release --out "$RUNNER_TEMP/wheels")
+          uv run --no-project python .runtime/scripts/stamp-build-provenance.py "$(git -C .runtime rev-parse HEAD)"
+          uv build --wheel --out-dir "$RUNNER_TEMP/wheels" .runtime
+
+      - name: The local machine on these builds
+        run: |
+          if cozy machine enable --help >/dev/null 2>&1; then cozy machine enable; fi
+          cozy machine update local --runtime-wheel "$(ls "$RUNNER_TEMP"/wheels/cozy_runtime-*.whl)" \
+            --tensorfs-wheel "$(ls "$RUNNER_TEMP"/wheels/tensorfs-*.whl)" --yes
+          cozy --json machine show local | tee "$OUT/machine.json"
+          # An Apple GPU, unified.
+          grep -q '"family": *"apple' "$OUT/machine.json" && grep -q '"memory_class": *"unified"' "$OUT/machine.json"
+
+      - name: BiRefNet serves
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/dog.jpg" https://raw.githubusercontent.com/pytorch/vision/v0.24.0/gallery/assets/dog2.jpg
+          cozy --json run ./.packages/birefnet/remove_background --asset "image=$RUNNER_TEMP/dog.jpg" \
+            model.model=fidika/birefnet@0.1.0 --on local --output "$OUT/birefnet" | tee "$OUT/birefnet.jsonl"
+          # The dog stays and the background goes white: neither all of it nor none.
+          uv run --no-project --with pillow python - "$OUT/birefnet" <<'PY'
+          import pathlib, sys
+          from PIL import Image
+          image = Image.open(next(pathlib.Path(sys.argv[1]).rglob("*.webp"))).convert("RGB")
+          white = sum(1 for p in image.getdata() if min(p) > 245) / (image.width * image.height)
+          print(f"white {white:.2f}")
+          assert 0.1 < white < 0.9, white
+          PY
+
+      - name: SDXL serves, or is refused past the GPU's working set
+        if: inputs.sdxl
+        run: |
+          set +e
+          cozy --json run ./.packages/sdxl/generate prompt="a lighthouse on a basalt cliff at dusk, oil painting" \
+            seed=4021 steps=12 model.model=fidika/sdxl@1.0.0 --on local --output "$OUT/sdxl" | tee "$OUT/sdxl.jsonl"
+          code=$?
+          set -e
+          if [ "$code" != 0 ]; then grep -q memory_exhausted "$OUT/sdxl.jsonl"; else ls "$OUT"/sdxl/*; fi
+
+      - name: Logs
+        if: always()
+        run: |
+          cozy machine logs local > "$OUT/machine.log" 2>&1 || true
+          cozy --json run list --on local > "$OUT/runs.json" 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mps-local
+          path: ${{ runner.temp }}/mps
+          retention-days: 30
