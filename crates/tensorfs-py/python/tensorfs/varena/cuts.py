@@ -266,9 +266,16 @@ def short(exc: BaseException) -> int | None:
     return 0 if isinstance(exc, RuntimeError) and failed else None
 
 
-def _library(exc: BaseException) -> bool:
+def _refused(exc: BaseException) -> bool:
+    """A launch the driver refused with 999 (CUDA_ERROR_UNKNOWN): on a full card, a kernel whose
+    module could not load at its first launch (cr-215: cub's scan in masked_scatter)."""
+    return isinstance(exc, torch.AcceleratorError) and getattr(exc, "error_code", None) == 999
+
+
+def _disguised(exc: BaseException) -> bool:
     text = str(exc)
-    return isinstance(exc, RuntimeError) and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
+    library = isinstance(exc, RuntimeError) and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
+    return library or _refused(exc)
 
 
 def _synchronize(device: torch.device) -> None:
@@ -279,13 +286,14 @@ def _synchronize(device: torch.device) -> None:
 def _room(exc: BaseException, device: torch.device, first: BaseException | None = None) -> int | None:
     """The bytes to make room for before running again; None: not a memory failure, raise it.
     An allocation failure (out of memory, an `_ALLOC_FAILED` status) as its text says. Any other
-    cuBLAS or cuDNN status is a library's allocation under another name (its handle or workspace,
-    run 3095) or a device fault: the device synchronizes once to tell, on this failure path only.
-    A sticky error means the context is dead: the original raises at once with it chained, no
-    room made, no replay (cr-215). A clean device makes it an allocation failure, once: again
-    (`first`, the one already run again for), the original raises."""
+    cuBLAS or cuDNN status (a library's handle or workspace, run 3095) and a launch refused with
+    999 (a kernel's module, cr-215) are allocations under another name, or device faults: the
+    device synchronizes once to tell, on this failure path only. A sticky error means the context
+    is dead: the original raises at once with it chained, no room made, no replay. A clean device
+    makes it an allocation failure, once: again (`first`, the one already run again for), the
+    original raises."""
     need = short(exc)
-    if need is not None or not _library(exc):
+    if need is not None or not _disguised(exc):
         return need
     if first is not None:
         raise first
@@ -364,7 +372,7 @@ def _settle(
                 need = _room(exc, device, first)
                 if need is None or scope and size <= finest and not again:
                     raise
-                first = first or (exc if _library(exc) else None)
+                first = first or (exc if _disguised(exc) else None)
                 _retried(exc, name)
                 _clear(exc)
                 if not rungs.free(device, need + SLACK) and again:
@@ -502,7 +510,7 @@ def run(site: Site, forward: Callable[..., object], args: Args, kwargs: Kwargs) 
                 need = _room(exc, site.device)
                 if need is None:
                     raise
-                first = exc if _library(exc) else None
+                first = exc if _disguised(exc) else None
                 _retried(exc, f"block {site.key}")
                 _clear(exc)
                 memo.retries += 1
@@ -512,7 +520,7 @@ def run(site: Site, forward: Callable[..., object], args: Args, kwargs: Kwargs) 
                 try:
                     out = forward(*args, **kwargs)
                 except Exception as again:
-                    if first is not None and _library(again):
+                    if first is not None and _disguised(again):
                         raise first
                     raise
             finally:
@@ -541,7 +549,7 @@ def _bare(
         need = _room(exc, site.device)
         if need is None:
             raise
-        first = exc if _library(exc) else None
+        first = exc if _disguised(exc) else None
         _retried(exc, f"block {site.key}")
         _clear(exc)
     finally:
@@ -556,7 +564,7 @@ def _bare(
         try:
             out = forward(*args, **kwargs)
         except Exception as again:
-            if first is not None and _library(again):
+            if first is not None and _disguised(again):
                 raise first
             raise
     if layer.banded != banded:
@@ -719,7 +727,7 @@ class Layer(TorchDispatchMode):
             need = _room(exc, device)
             if need is None:
                 raise
-            first = exc if _library(exc) else None
+            first = exc if _disguised(exc) else None
             _retried(exc, name)
             _clear(exc)
         memo.retries += 1
