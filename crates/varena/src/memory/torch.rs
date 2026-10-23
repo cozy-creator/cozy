@@ -170,17 +170,26 @@ impl Memory {
     }
 }
 
+impl Request {
+    /// A section's torch peak (a package split's window): the request arena's high-water since the
+    /// last section or pass start, which restarts here; the open pass's peak still covers it.
+    pub fn section_peak(&self) -> u64 {
+        self.inner.torch.get().map_or(0, |t| t.reset_peak(Owner::Request(self.id)))
+    }
+}
+
 impl super::Inner {
     /// A pass opens (`Request::pass`): its request arena's peak restarts at what is live.
     pub(super) fn torch_pass(&self, req: u64) {
         if let Some(t) = self.torch.get() {
-            t.reset_peak(Owner::Request(req));
+            t.pass_start(Owner::Request(req));
         }
     }
 
-    /// A pass ends (`Pass::end`): the most its request arena held since the pass opened.
+    /// A pass ends (`Pass::end`): the most its request arena held since the pass opened, the
+    /// sections measured inside it included.
     pub(super) fn torch_peak(&self, req: u64) -> u64 {
-        self.torch.get().map_or(0, |t| t.reset_peak(Owner::Request(req)))
+        self.torch.get().map_or(0, |t| t.pass_peak(Owner::Request(req)))
     }
 
     /// The manager asked these back (`Inner::revoke`, no state lock held): the torch chunks among
@@ -207,10 +216,55 @@ fn id(t: Ticket) -> u64 {
 struct Leased {
     agent: Arc<Agent>,
     backend: Arc<dyn Backend>,
-    /// Chunk id → its grant, its import, and whether it is pinned.
-    held: Mutex<HashMap<u64, (Ticket, Physical, bool)>>,
+    held: Mutex<HashMap<u64, Held>>,
     /// Runs the mechanism thread's revoke.
     wake: Box<dyn Fn() + Send + Sync>,
+}
+
+/// A chunk's grant and import, whether it is pinned, and whether its give-back committed (a
+/// retry then only unmaps and releases).
+#[cfg(unix)]
+struct Held {
+    ticket: Ticket,
+    phys: Physical,
+    pinned: bool,
+    committed: bool,
+}
+
+#[cfg(unix)]
+impl Leased {
+    /// One chunk back: unpinned, committed, unmapped, released. Err leaves it mapped (still
+    /// pinned, or the unmap failed), its lease kept for the retry.
+    fn give(&self, at: u64, c: &Chunk) -> Result<()> {
+        let held = self.held.lock().remove(&c.id);
+        let Some(mut h) = held else { return Err(Error::Internal(format!("chunk {:#x} was never granted here", c.id))) };
+        let step = (|| {
+            if h.pinned {
+                self.agent.unpin(h.ticket)?;
+                h.pinned = false;
+            }
+            if !h.committed {
+                if !self.agent.commit(h.ticket)? {
+                    return Err(Error::Internal("still pinned".into()));
+                }
+                h.committed = true;
+            }
+            self.backend.unmap(Va { base: at, len: c.len }, 0, c.len)
+        })();
+        match step {
+            Ok(()) => {
+                // Unmapped: its addresses are safe to reuse whatever the release says.
+                if let Err(e) = self.agent.release(h.ticket, h.phys) {
+                    tracing::error!("varena: releasing torch chunk {:#x} failed: {e}", c.id);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.held.lock().insert(c.id, h);
+                Err(e)
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -219,8 +273,8 @@ impl Source for Leased {
         u32::try_from(chunk.id >> 32).ok()
     }
 
-    fn map(&self, va: Va, _: Kind) -> Result<Vec<Chunk>> {
-        let (mut chunks, mut tickets, mut off, mut failed) = (Vec::new(), Vec::new(), 0, None);
+    fn map(&self, va: Va, _: Kind, into: &mut Vec<Chunk>) -> Result<()> {
+        let (mut tickets, mut off, mut failed) = (Vec::new(), 0, None);
         for lease in self.agent.take(va.len, crate::lease::Kind::Torch, None)? {
             let len = lease.phys.len;
             let mapped = if failed.is_some() || off + len > va.len {
@@ -231,8 +285,8 @@ impl Source for Leased {
             match mapped {
                 Ok(()) => {
                     tickets.push(lease.ticket);
-                    chunks.push(Chunk { id: id(lease.ticket), len });
-                    self.held.lock().insert(id(lease.ticket), (lease.ticket, lease.phys, false));
+                    into.push(Chunk { id: id(lease.ticket), len });
+                    self.held.lock().insert(id(lease.ticket), Held { ticket: lease.ticket, phys: lease.phys, pinned: false, committed: false });
                     off += len;
                 }
                 Err(e) => {
@@ -246,47 +300,35 @@ impl Source for Leased {
             failed = Some(Error::Internal(format!("a grant of {off} bytes for a {}-byte span", va.len)));
         }
         if let Some(e) = failed {
-            self.unmap(Va { base: va.base, len: off }, chunks);
             return Err(e);
         }
-        self.idle(&chunks, false);
-        Ok(chunks)
+        self.idle(into, false);
+        Ok(())
     }
 
-    fn unmap(&self, va: Va, chunks: Vec<Chunk>) {
-        let mut off = 0;
+    fn unmap(&self, va: Va, chunks: Vec<Chunk>) -> Vec<(u64, Chunk)> {
+        let (mut at, mut stuck) = (va.base, Vec::new());
         for c in chunks {
-            let held = self.held.lock().remove(&c.id);
-            let Some((ticket, phys, pinned)) = held else {
-                tracing::error!("varena: torch gave back chunk {:#x}, which its lease never granted", c.id);
-                off += c.len;
-                continue;
-            };
-            if pinned {
-                let _ = self.agent.unpin(ticket);
+            let here = at;
+            at += c.len;
+            if let Err(e) = self.give(here, &c) {
+                tracing::error!("varena: torch chunk {:#x} could not go back yet: {e}", c.id);
+                stuck.push((here, c));
             }
-            let gone = match self.agent.commit(ticket) {
-                Ok(true) => self.backend.unmap(va, off, c.len).and_then(|()| self.agent.release(ticket, phys)),
-                Ok(false) => Err(Error::Internal("pinned at its give-back".into())),
-                Err(e) => Err(e),
-            };
-            if let Err(e) = gone {
-                tracing::error!("varena: giving torch chunk {:#x} back failed: {e}", c.id);
-            }
-            off += c.len;
         }
+        stuck
     }
 
     fn idle(&self, chunks: &[Chunk], idle: bool) {
         let mut held = self.held.lock();
         for c in chunks {
-            let Some((ticket, _, pinned)) = held.get_mut(&c.id) else { continue };
-            if idle && *pinned {
-                *pinned = self.agent.unpin(*ticket).is_err();
-            } else if !idle && !*pinned {
-                *pinned = self.agent.pin(*ticket).unwrap_or(false);
+            let Some(h) = held.get_mut(&c.id) else { continue };
+            if idle && h.pinned {
+                h.pinned = self.agent.unpin(h.ticket).is_err();
+            } else if !idle && !h.pinned {
+                h.pinned = self.agent.pin(h.ticket).unwrap_or(false);
             }
-            let _ = self.agent.hint(*ticket, if idle { IDLE } else { IN_USE }, 0);
+            let _ = self.agent.hint(h.ticket, if idle { IDLE } else { IN_USE }, 0);
         }
     }
 

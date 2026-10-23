@@ -886,6 +886,11 @@ class Request:
         """Replaces the plan (as `Memory.request` takes it); its cursor starts over."""
         self.native.plan(self.memory._plan(steps))
 
+    def reset_peak(self) -> int:
+        """Its torch arena's high-water since the last call or the pass's start, restarting
+        here: a section's peak (a split's window). The pass's own peak still covers it."""
+        return self.native.reset_peak()
+
     def room(self, step: int | None = None) -> Room:
         """What a cut sizes from at plan step `step` (the cursor's by default). Lock-free."""
         return Room(*self.memory.native.room(step))

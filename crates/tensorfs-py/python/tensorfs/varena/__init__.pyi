@@ -199,6 +199,8 @@ class Request:
     def plan(self, plan: list[tuple[list[str], int]]) -> None:
         """Replaces the plan; its cursor starts over."""
 
+    def reset_peak(self) -> int:
+        """Its torch arena's high-water since the last call or pass start, restarting there."""
     def allocating(self, memory: Memory) -> Allocating:
         """This thread's torch blocks go to this request's arena in `memory` until the guard
         ends (on this thread)."""

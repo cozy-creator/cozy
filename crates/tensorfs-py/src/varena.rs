@@ -635,6 +635,13 @@ impl PyRequest {
         done(py, &self.gpu, || r.plan(steps(plan)))
     }
 
+    /// Its torch arena's high-water since the last call or pass start, which restarts here (a
+    /// section of a pass, such as a split's window); the pass's own peak still covers it.
+    fn reset_peak(&self, py: Python<'_>) -> PyResult<u64> {
+        let r = self.get(py)?;
+        detached(py, &self.gpu, || Ok(r.section_peak()))
+    }
+
     /// This thread's torch blocks go to this request's arena in `memory` until the guard ends
     /// (on this thread).
     fn allocating(&self, py: Python<'_>, memory: PyRef<'_, PyMemory>) -> PyResult<PyAllocating> {
