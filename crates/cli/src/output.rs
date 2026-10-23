@@ -1,5 +1,5 @@
 //! Rendering every verb shares. With `--json` stdout carries one JSON document (NDJSON while
-//! following); otherwise tables and `key  value` records for a person. Warnings and prompts go to
+//! following); otherwise tables and `key  value` records for a person, root names without `_/`. Warnings and prompts go to
 //! stderr. Nothing is truncated when stdout is not a terminal; colors go through anstream, which
 //! drops them for pipes and `NO_COLOR`.
 use std::{
@@ -12,6 +12,7 @@ use std::{
 use anstyle::{AnsiColor, Style};
 use comfy_table::{ContentArrangement, presets};
 use protocol::error::{Envelope, Error, Kind};
+use protocol::names::shown;
 use serde::Serialize;
 
 use crate::Context;
@@ -72,12 +73,12 @@ pub(crate) fn refuse(json: bool, error: &Error) -> ExitCode {
             error: error.clone(),
         });
     } else {
-        anstream::println!("{FAIL}error{FAIL:#}: {} ({})", error.message, error.code);
+        anstream::println!("{FAIL}error{FAIL:#}: {} ({})", shown(&error.message), error.code);
         if let Some(remedy) = &error.remedy {
-            anstream::println!("  {remedy}");
+            anstream::println!("  {}", shown(remedy));
         }
         for next in &error.next {
-            anstream::println!("  {DIM}next:{DIM:#} {next}");
+            anstream::println!("  {DIM}next:{DIM:#} {}", shown(next));
         }
     }
     ExitCode::from(error.exit_code() as u8)
@@ -86,13 +87,13 @@ pub(crate) fn refuse(json: bool, error: &Error) -> ExitCode {
 /// What the command is doing, for a person on stderr; silent with `--json`.
 pub fn say(ctx: &Context, message: &str) {
     if !ctx.json {
-        anstream::eprintln!("{message}");
+        anstream::eprintln!("{}", shown(message));
     }
 }
 
 /// A warning on stderr: the command goes on.
 pub fn warn(message: &str) {
-    anstream::eprintln!("{WARN}warning{WARN:#}: {message}");
+    anstream::eprintln!("{WARN}warning{WARN:#}: {}", shown(message));
 }
 
 /// At most two commands to try next, for a person; a JSON document carries its own.
@@ -101,7 +102,7 @@ pub fn next(ctx: &Context, commands: &[&str]) {
         return;
     }
     for command in commands.iter().take(2) {
-        anstream::println!("{DIM}next:{DIM:#} {command}");
+        anstream::println!("{DIM}next:{DIM:#} {}", shown(command));
     }
 }
 
@@ -141,12 +142,12 @@ impl Record {
     }
 
     pub fn field(mut self, key: &str, value: impl Display) -> Self {
-        self.fields.push((key.to_owned(), value.to_string()));
+        self.fields.push((key.to_owned(), shown(&value.to_string())));
         self
     }
 
     pub fn note(mut self, note: impl Into<String>) -> Self {
-        self.notes.push(note.into());
+        self.notes.push(shown(&note.into()));
         self
     }
 
@@ -245,13 +246,13 @@ impl Table {
     }
 
     pub fn row<S: Display>(mut self, cells: impl IntoIterator<Item = S>) -> Self {
-        self.table.add_row(cells.into_iter().map(|c| c.to_string()));
+        self.table.add_row(cells.into_iter().map(|c| shown(&c.to_string())));
         self
     }
 
     /// A line under the table, such as "12 more: cozy run list --before 40".
     pub fn note(mut self, note: impl Into<String>) -> Self {
-        self.notes.push(note.into());
+        self.notes.push(shown(&note.into()));
         self
     }
 

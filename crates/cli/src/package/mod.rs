@@ -7,6 +7,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::Subcommand;
 use protocol::error::{Error, Kind};
+use protocol::names::ROOT;
 
 use crate::{Context, run::Placement};
 
@@ -36,13 +37,13 @@ enum Command {
     /// A published package's releases, newest first; one release, with what its publish warned
     /// of (its owner sees the warnings).
     Info {
-        /// org/name[@release]
+        /// [org/]name[@release]
         package: String,
     },
-    /// Install a published package (org/name[@release]), a directory or a script on a machine: its
-    /// environment, no weights.
+    /// Install a published package ([org/]name[@release]), a directory or a script on a machine:
+    /// its environment, no weights.
     Install {
-        /// org/name[@release], a directory such as `.` or `./project`, or a PEP 723 `script.py`.
+        /// [org/]name[@release], a directory such as `.` or `./project`, or a PEP 723 `script.py`.
         #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::local))]
         package: String,
         #[command(flatten)]
@@ -53,14 +54,14 @@ enum Command {
     },
     /// Move a machine's packages to their Hub's newest release: the named ones, else every one.
     Update {
-        /// org/name; none updates every published package on the machine.
+        /// [org/]name; none updates every published package on the machine.
         packages: Vec<String>,
         #[command(flatten)]
         placement: Placement,
     },
     /// Remove packages from a machine, every Hub's installation unless --tensorhub narrows.
     Remove {
-        /// org/name or local/name.
+        /// [org/]name or local/name.
         #[arg(required = true)]
         packages: Vec<String>,
         #[command(flatten)]
@@ -80,12 +81,19 @@ enum Command {
         /// Let this dependency move to its newest compatible release; repeat for each.
         #[arg(long = "upgrade-package", value_name = "PACKAGE")]
         upgrade: Vec<String>,
+        /// For the root namespace (first-party, Hub admins), not your account.
+        #[arg(long)]
+        root: bool,
     },
-    /// Publish this project as <account>/<name>@<version> (needs uv).
-    Publish,
+    /// Publish this project as <account>/<name>@<version>, or <name>@<version> with --root (needs uv).
+    Publish {
+        /// At the root namespace: first-party, Hub admins only.
+        #[arg(long)]
+        root: bool,
+    },
     /// Yank a release: machines that hold it keep it, nothing new installs it.
     Yank {
-        /// org/name@release
+        /// [org/]name@release
         release: String,
     },
 }
@@ -113,13 +121,14 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             placement,
         } => machine::remove(ctx, &names(&packages)?, placement.on()).await,
         Command::List { on, once } => machine::list(ctx, on.map(Into::into), once).await,
-        Command::Lock { upgrade } => author::lock(ctx, &upgrade).await,
-        Command::Publish => author::publish(ctx).await,
+        Command::Lock { upgrade, root } => author::lock(ctx, &upgrade, root).await,
+        Command::Publish { root } => author::publish(ctx, root).await,
         Command::Yank { release } => author::yank(ctx, &PackageRef::parse(&release)?).await,
     }
 }
 
-/// `org/name[@release]`, lowercased: names are one identity in any case.
+/// `[org/]name[@release]`, lowercased: names are one identity in any case. No org is the root's
+/// (first-party), org [`ROOT`] on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackageRef {
     pub org: String,
@@ -140,7 +149,7 @@ impl PackageRef {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         };
-        match path.split_once('/') {
+        match path.split_once('/').or(Some((ROOT, path))) {
             Some((org, name))
                 if valid(org) && valid(name) && release.as_deref().is_none_or(valid) =>
             {
@@ -153,7 +162,7 @@ impl PackageRef {
             _ => Err(Error::new(
                 Kind::Usage,
                 "package_ref_invalid",
-                format!("{text:?} is not org/name or org/name@release"),
+                format!("{text:?} is not [org/]name[@release]"),
             )),
         }
     }
@@ -185,7 +194,7 @@ fn directory(text: &str) -> Option<PathBuf> {
     explicit.then(|| PathBuf::from(text))
 }
 
-/// Names for update and remove: `org/name` (or `local/name`), with no release.
+/// Names for update and remove: `[org/]name` (or `local/name`), with no release.
 fn names(texts: &[String]) -> Result<Vec<String>, Error> {
     texts
         .iter()
@@ -238,7 +247,9 @@ mod tests {
             PackageRef::parse("Fidika/SDXL").unwrap().package(),
             "fidika/sdxl"
         );
-        assert!(PackageRef::parse("sdxl").is_err());
+        let root = PackageRef::parse("SDXL@2.12.1").unwrap();
+        assert_eq!((root.package(), root.release.as_deref()), ("_/sdxl".into(), Some("2.12.1")));
+        assert!(PackageRef::parse("a/b/c").is_err());
         assert!(directory("sdxl").is_none() && directory("./sdxl").is_some());
         let releases = vec!["2.9.0", "2.10.0rc1", "2.10.0", "nightly", "1.37.2", "2.10.0.post1"];
         let sorted = newest_first(releases, |r| *r);

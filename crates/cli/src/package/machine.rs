@@ -326,7 +326,7 @@ pub async fn list(ctx: &Context, on: Option<On>, once: bool) -> Result<ExitCode,
         println!("No packages installed.");
         output::next(
             ctx,
-            &["cozy package search", "cozy package install <org/name>"],
+            &["cozy package search", "cozy package install <[org/]name>"],
         );
         return Ok(ExitCode::SUCCESS);
     }

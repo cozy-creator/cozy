@@ -1234,7 +1234,7 @@ impl Publisher {
             job.stage(format!("choosing the model for {path}"));
             let asked = request.choices.iter().find(|c| c.parameter == path || c.parameter == parameter)
                 .filter(|c| !c.repository.is_empty() || c.manifest.is_some() || !c.source.is_empty());
-            let declared = default_choice(slot, &path, &installation.package, &request.owner);
+            let declared = default_choice(slot, &path);
             let choice = asked.or(declared.as_ref()).ok_or_else(|| choice_absent(&path, &installation.package))?;
             if !choice.source.is_empty() {
                 return Ok((self.source_grant(installation, &path, choice, &request.providers, job)?, None, vec![]));
@@ -1749,13 +1749,8 @@ fn io_failure(error: io::Error) -> Failure {
 
 /// A slot's declared default as a choice (its `default`: `[org/]model@release`, or a local
 /// model `local/<name>`, its newest): what a run that names no model for the slot gets, in the
-/// lane rule's lane. An org-relative model is the package's account's: the package's org, or
-/// for unpublished code the run's `owner`.
-pub(crate) fn default_choice(slot: &Value, path: &str, package: &str, owner: &str) -> Option<domain::ModelChoice> {
-    let account = match package.split_once('/') {
-        Some((org, _)) if org != "local" => org,
-        _ => owner,
-    };
+/// lane rule's lane. A model with no org is first-party, the root's (xs-071).
+pub(crate) fn default_choice(slot: &Value, path: &str) -> Option<domain::ModelChoice> {
     let default = slot.get("default")?.as_str()?;
     let (model, release) = match default.split_once('@') {
         Some(named) => named,
@@ -1763,8 +1758,7 @@ pub(crate) fn default_choice(slot: &Value, path: &str, package: &str, owner: &st
     };
     let repository = match model.contains('/') {
         true => model.into(),
-        false if account.is_empty() => return None,
-        false => format!("{account}/{model}"),
+        false => format!("{}/{model}", protocol::names::ROOT),
     };
     Some(domain::ModelChoice { parameter: path.into(), repository, release: release.into(), ..Default::default() })
 }
@@ -1776,7 +1770,7 @@ fn local_aliases(installation: &Installation, request: &Request) -> io::Result<b
         let parameter = path.rsplit('.').next().unwrap_or_default();
         let asked = request.choices.iter().find(|c| c.parameter == path || c.parameter == parameter)
             .filter(|c| !c.repository.is_empty() || c.manifest.is_some() || !c.source.is_empty());
-        let declared = default_choice(slot, path, &installation.package, &request.owner);
+        let declared = default_choice(slot, path);
         asked.or(declared.as_ref()).is_some_and(|choice| choice.source.is_empty()
             && choice.manifest.is_none() && choice.repository.starts_with("local/"))
     }))
@@ -2590,20 +2584,18 @@ pub(crate) mod tests {
     }
 
     /// A slot the run names no model for takes its declared default release (run 5327's
-    /// `generate_image.models.model` failed `model_choice_absent`). An org-relative model is
-    /// the package's account's: its org, or unpublished code's owner.
+    /// `generate_image.models.model` failed `model_choice_absent`). A model with no org is the
+    /// root's, whoever's package declares it (xs-071).
     #[test]
     fn an_unchosen_slot_takes_its_declared_default() {
         let path = "generate_image.models.model";
         let slot = json!({"path": path, "default": "qwen-image-2@1.0.0"});
-        let published = default_choice(&slot, path, "paul/qwen-image-2", "").unwrap();
+        let published = default_choice(&slot, path).unwrap();
         assert_eq!((published.parameter.as_str(), published.repository.as_str(), published.release.as_str(), published.lane.as_str()),
-            (path, "paul/qwen-image-2", "1.0.0", ""));
-        assert_eq!(default_choice(&slot, path, "local/qwen-copy", "fidika").unwrap().repository, "fidika/qwen-image-2");
-        assert!(default_choice(&slot, path, "local/qwen-copy", "").is_none(), "an org-relative default needs its account");
+            (path, "_/qwen-image-2", "1.0.0", ""));
         let explicit = json!({"default": "proof/probe@2.1"});
-        assert_eq!(default_choice(&explicit, path, "local/qwen-copy", "").unwrap().repository, "proof/probe");
-        assert!(default_choice(&json!({"path": path}), path, "paul/qwen-image-2", "").is_none());
+        assert_eq!(default_choice(&explicit, path).unwrap().repository, "proof/probe");
+        assert!(default_choice(&json!({"path": path}), path).is_none());
         assert_eq!(choice_absent(path, "paul/qwen-image-2").0, "model_choice_absent");
     }
 

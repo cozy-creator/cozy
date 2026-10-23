@@ -43,7 +43,8 @@ pub struct Args {
 
 #[derive(clap::Args, Debug)]
 struct RunArgs {
-    /// `org/pkg[/fn][@release]`, `./dir[/fn]` or `./script.py`; without a function, its functions.
+    /// `[org/]pkg[/fn][@release]` (no org: first-party), `./dir[/fn]` or `./script.py`; without a
+    /// function, its functions.
     #[arg(required = true, value_name = "TARGET", add = ArgValueCompleter::new(crate::completion::local))]
     target: Option<String>,
     /// `key=value`, `key:=json`, `model.<slot>=<ref>`, one positional value, input files.
@@ -225,19 +226,21 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::new(Kind::Internal, "cwd", format!("the working directory: {e}")))?;
     let raw = args.target.as_deref().unwrap_or_default();
-    let (package, function, release) = match Target::parse(raw, &cwd)? {
+    let (package, function, release, owned) = match Target::parse(raw, &cwd)? {
         Target::Published {
             package,
             function,
             release,
-        } => (package, function, release),
+            owned,
+        } => (package, function, release, owned),
         Target::Directory { path, function } => {
             return local::run(ctx, &cwd.join(path), function, args).await;
         }
         Target::Script(path) => return local::run(ctx, &cwd.join(path), None, args).await,
     };
     let hub = ctx.hub()?;
-    let resolved = resolve(ctx, &hub, &package, release.as_deref()).await?;
+    let (package, function, resolved) =
+        target::resolve(ctx, &hub, package, function, release.as_deref(), owned).await?;
     let Some(function) = function else {
         unnamed(
             &package,
@@ -264,7 +267,7 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
             let target = format!("{package}/{}", callable.name);
             let text = describe::contract(&target, &card.interface, callable);
             let release = format!("\n  release: {} ({})\n", card.release, resolved.from);
-            anstream::print!("{}", text.replacen('\n', &release, 1));
+            anstream::print!("{}", protocol::names::shown(&text.replacen('\n', &release, 1)));
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -624,7 +627,7 @@ fn quoted(input: &str) -> String {
     format!("{key}'{}'", value.replace('\'', r"'\''"))
 }
 
-/// `cozy run org/pkg`: the package's public functions.
+/// `cozy run [org/]pkg`: the package's public functions.
 fn functions(ctx: &Context, package: &str, resolved: &Resolved) {
     let from = resolved.from.to_string();
     let card = &resolved.card;
