@@ -26,6 +26,17 @@ pub enum Refusal {
     NothingRevocable,
     /// The manager failed serving the ask (its backend would not open, a chunk would not export).
     Failed,
+    /// Nobody serves this GPU's leases (no listener): never sent, an agent's own finding.
+    Absent,
+}
+
+/// What an ask is for: a weights page is one chunk sized to it (§3, never split, retainable or
+/// not); torch and cache bytes split at the largest chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Kind {
+    Weights,
+    Torch,
+    Cache,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,7 +45,7 @@ pub enum ToManager {
     /// birth. A re-attach after a manager restart sends its table's fd back with it.
     Hello { protocol: u32, birth: u64 },
     /// `bytes` of weights, for `region` when given (a retained region answers with no copy).
-    Ask { id: u64, bytes: u64, region: Option<Region> },
+    Ask { id: u64, bytes: u64, kind: Kind, region: Option<Region> },
     /// Doorbell: slots moved to Mapped, Refused or Released.
     Answered,
 }
