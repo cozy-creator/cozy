@@ -882,13 +882,9 @@ fn a_leased_memory_allocates_only_from_its_grants() {
     let gpu = Gpu::value(card, true);
     let creates = gpu.creates.clone();
     let mem = varena::Memory::open(g.clone(), None, Box::new(gpu)).unwrap();
+    // Leasing serves torch from the manager's grants at once: no page made outside the books.
     assert_eq!(mem.lease_over(UnixStream::connect(&socket).unwrap()).unwrap(), None, "the manager refused the lease");
-
-    let refused = mem.torch_alloc(4 * MB, A, None);
-    assert!(matches!(refused, Err(varena::Error::Invalid(_))), "{refused:?}");
     assert_eq!((manager.holdings().leased, creates.load(SeqCst)), (0, 0), "memory outside the books");
-
-    mem.serve_leased_torch().unwrap();
     let p = mem.torch_alloc(4 * MB, A, None).unwrap();
     until("the span is the manager's grant", || manager.holdings().leased == CHUNK);
     let floor = mem.torch_alloc(300 * MB, A, None);

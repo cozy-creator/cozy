@@ -424,6 +424,33 @@ impl Memory {
         (warm, cold, largest)
     }
 
+    /// A region's facts to the lease manager (`None`: it is gone), while leased.
+    pub(crate) fn region_facts(&self, id: u64, record: Option<&crate::region::Record>) {
+        #[cfg(unix)]
+        if let Some(agent) = self.inner.lease.get() {
+            let sent = match record {
+                Some(r) => agent.region(crate::lease::wire::RegionFacts { id, kind: r.kind, slots: r.slots.clone(), cost_ns: r.cost_ns, last_use: r.last_use, next_use: r.next_use.map_or(u64::MAX, u64::from) }),
+                None => agent.region_gone(id),
+            };
+            if let Err(e) = sent {
+                tracing::debug!("varena: region {id}'s facts did not reach the lease manager: {e}");
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (id, record);
+    }
+
+    /// The lease slots of `sets`' leased pages.
+    pub(crate) fn lease_slots(&self, sets: &[SetId]) -> Vec<u32> {
+        #[cfg(unix)]
+        return self.inner.leased.lock().values().filter(|(_, key, _)| sets.iter().any(|s| s.0 == key.0)).map(|(t, ..)| t.slot).collect();
+        #[cfg(not(unix))]
+        {
+            let _ = sets;
+            Vec::new()
+        }
+    }
+
     /// Every block of `set`.
     pub(crate) fn blocks(&self, set: SetId) -> Result<Vec<u32>> {
         let st = self.inner.state.lock();
@@ -587,6 +614,9 @@ enum Mech {
     /// The lease manager asked pages back: the quiet ones go, the busy ones once idle.
     #[cfg(unix)]
     Revoke,
+    /// The lease manager reclaims a region whole (crate::region).
+    #[cfg(unix)]
+    Reclaim { region: u64, swap: bool },
 }
 
 struct Active {
@@ -1057,9 +1087,15 @@ impl Memory {
         };
         match crate::lease::Agent::attach(stream, self.inner.backend.clone(), revoked)? {
             crate::lease::Attach::Leased(agent) => {
+                let mech = self.inner.mech.clone();
+                agent.on_reclaim(Box::new(move |region, swap| {
+                    mech.post(Mech::Reclaim { region, swap }, 0);
+                }))?;
                 if self.inner.lease.set(agent).is_err() {
                     return Err(Error::Invalid("this Memory is leased already".into()));
                 }
+                // torch's blocks come from leased chunks too: the agent is its only allocator.
+                self.serve_leased_torch()?;
                 Ok(None)
             }
             crate::lease::Attach::Refused { code: code @ (crate::lease::Refusal::Incompatible | crate::lease::Refusal::Absent), why } => Ok(Some((code, why))),
@@ -1732,6 +1768,12 @@ impl Inner {
     /// created (an imported page is not charged to the importer's process); torch's own pool
     /// outside the hook counts here.
     fn measure(&self, st: &mut State) {
+        // Leased, NVML may charge the chunks to their creator: the context is the open's
+        // measured one, never NVML pid − created.
+        if self.leasing() {
+            st.table.context = self.backend.opened_context();
+            return;
+        }
         st.table.context = match self.backend.process_used() {
             Ok(used) => {
                 let created: u64 = st.homes.values().filter(|h| h.origin != Origin::Kept).filter_map(|h| h.phys.as_ref()).map(|p| p.len).sum::<u64>()
@@ -3337,7 +3379,7 @@ impl Drop for Inner {
                 Mech::Release(va) => self.backend.release(va),
                 Mech::Map { .. } | Mech::Adopt { .. } | Mech::Keep { .. } => {}
                 #[cfg(unix)]
-                Mech::Revoke => {}
+                Mech::Revoke | Mech::Reclaim { .. } => {}
             }
         }
         let mut st = self.state.lock();
@@ -3533,6 +3575,7 @@ impl Request {
     pub fn pass(&self, set: SetId, key: &str) -> Result<Pass> {
         let _ = key;
         let id = self.inner.guard(|| self.inner.pass(self.id, set.0))?;
+        self.inner.torch_pass(self.id);
         Ok(Pass { inner: self.inner.clone().into(), req: self.id, set: set.0, id })
     }
 
@@ -3633,6 +3676,8 @@ impl Pass {
     /// Ends the pass: `peak`, the most the execution layer saw it allocate, goes into the
     /// request's record (its dispatch key's peak at the request's end).
     pub fn end(self, peak: u64) {
+        // The pass's torch peak is varena's own when torch allocates from it.
+        let peak = peak.max(self.inner.torch_peak(self.req));
         let _ = self.inner.guard(|| self.inner.end_pass(self.req, self.id, peak));
     }
 }
@@ -3661,6 +3706,12 @@ impl Inner {
             Mech::Map { key, gen, va, off, span, job, speculative, decided } => self.place_page(key, gen, va, off, span, job, (!speculative).then_some(decided)),
             #[cfg(unix)]
             Mech::Revoke => self.revoke(),
+            #[cfg(unix)]
+            Mech::Reclaim { region, swap } => {
+                if let Err(e) = crate::region::reclaim(region, swap) {
+                    tracing::warn!("varena: reclaiming region {region}: {e}");
+                }
+            }
             Mech::Renew { key, gen, va, off, span, old, after, job } => {
                 // Its consumers finish before the unmap: this thread waits for their events.
                 let released = after.iter().try_for_each(|e| self.backend.finish(*e))
@@ -4036,6 +4087,9 @@ impl Inner {
         if asked.is_empty() {
             return;
         }
+        // torch's chunks the manager asked back, given by the arena when idle and quiet (no
+        // state lock held: R10).
+        self.revoke_torch(&asked);
         let keys: Vec<(crate::lease::Ticket, Key)> = self.leased.lock().values().filter(|(t, ..)| asked.contains(t)).map(|(t, k, _)| (*t, *k)).collect();
         let mut st = self.lock();
         for (ticket, key) in keys {
