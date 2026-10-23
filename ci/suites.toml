@@ -8,8 +8,12 @@
 #   os:macos, os:windows                    the cli suite on that OS too (Linux always)
 #   build:<artifact>                        a candidate built from the change: cozy, tensorfs, runtime, package
 #   everything                              every suite, every package, every OS
+#
+# `mps` is chosen only explicitly (a dispatch's or the release gate's `select`) until it can pass:
+# cozy reports no Apple GPU before cr-021 (`gpus: []` on Apple silicon) and every package's uv.lock
+# is Linux-only. It joins `everything`, `platform` and the BiRefNet/SDXL extras when both land.
 
-everything = ["cli", "mps", "gpu", "gpu-datacenter", "stress", "pkg:*", "os:macos", "os:windows"]
+everything = ["cli", "gpu", "gpu-datacenter", "stress", "pkg:*", "os:macos", "os:windows"]
 
 [cozy-creator]
 unmapped = ["everything", "build:cozy", "build:tensorfs"]
@@ -17,7 +21,7 @@ rules = [
   { paths = ["**/*.md", "docs/**", "LICENSE", ".gitignore"], select = [] },
   # The browser player is GitHub Pages' site; pages.yaml deploys it.
   { paths = ["web/**"], select = [] },
-  { paths = ["ci/**", "e2e/**", ".github/workflows/e2e.yaml"], select = ["cli", "mps", "os:macos", "os:windows", "build:cozy"] },
+  { paths = ["ci/**", "e2e/**", ".github/workflows/e2e.yaml"], select = ["cli", "os:macos", "os:windows", "build:cozy"] },
   { paths = ["release-gate/**", ".github/workflows/release-gate.yaml"], select = ["gpu", "gpu-datacenter", "stress", "pkg:*"] },
   # Installers and release archives: the cli suite installs them on every OS at release.
   { paths = [".github/workflows/release.yml", ".github/workflows/release-attestations.yml", "dist-workspace.toml", "scripts/patch-installers.sh"], select = ["cli", "os:macos", "os:windows"] },
@@ -32,7 +36,7 @@ cli = ["cli", "gpu", "pkg:sdxl", "build:cozy"]
 calcifer = ["cli", "gpu", "pkg:sdxl", "build:cozy"]
 hub-client = ["cli", "gpu", "pkg:sdxl", "build:cozy"]
 protocol = ["cli", "gpu", "pkg:sdxl", "build:cozy"]
-platform = ["cli", "mps", "os:macos", "os:windows", "build:cozy"]
+platform = ["cli", "os:macos", "os:windows", "build:cozy"]
 tensord = ["everything", "build:cozy"]
 tensorfs = ["everything", "build:cozy"]
 varena = ["everything", "build:cozy"]
@@ -43,7 +47,7 @@ unmapped = ["everything", "build:runtime"]
 rules = [
   { paths = ["**/*.md", "docs/**", "changelog.d/**", "research/**", "examples/**", "LICENSE"], select = [] },
   { paths = ["scripts/build-benchmark-site.py"], select = [] },
-  { paths = [".github/workflows/e2e.yaml"], select = ["cli", "mps", "build:runtime"] },
+  { paths = [".github/workflows/e2e.yaml"], select = ["cli", "build:runtime"] },
   { paths = [".github/**"], select = [] },
   # `cozy-runtime describe` and `cozy new`: the author CLI.
   { paths = ["src/cozy_runtime/cli/**"], select = ["cli", "build:runtime"] },
@@ -55,16 +59,16 @@ rules = [
   { paths = ["**/*.md", "docs/**", "research/**", "examples/**", "LICENSE", "NOTICE"], select = [] },
   # Linting config and publish tasks: no package's behaviour.
   { paths = ["pyproject.toml", "Taskfile.yaml"], select = [] },
-  { paths = [".github/workflows/e2e.yaml"], select = ["cli", "mps", "pkg:birefnet", "build:package"] },
+  { paths = [".github/workflows/e2e.yaml"], select = ["cli", "pkg:birefnet", "build:package"] },
   { paths = [".github/**"], select = [] },
   { paths = ["scripts/h3*"], select = ["gpu", "pkg:minimax-h3"] },
 ]
 
 # A directory holding a package.toml is a package; `{dir}` is its name. SDXL rides along as the
-# shared-environment canary. `extra` adds the CPU (cli) and Apple GPU (mps) cells a package has.
+# shared-environment canary. `extra` adds the suites that run a package's own cells (cli: BiRefNet on the CPU).
 [packages.package]
 select = ["gpu", "stress", "pkg:{dir}", "pkg:sdxl", "build:package"]
-extra = { birefnet = ["cli", "mps"], sdxl = ["mps"] }
+extra = { birefnet = ["cli"] }
 
 [tensorhub]
 unmapped = []

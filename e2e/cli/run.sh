@@ -2,6 +2,7 @@
 # The `cli` suite: cozy as a person uses it on a computer with no GPU, Linux, macOS or Windows. Install, up,
 # status, the local machine, the candidates through `cozy machine update local`, a real BiRefNet removal on
 # the CPU, run list/show, a second executor (the machine restarted) with a new input, down, uninstall.
+# A broken step is recorded and the suite goes on, so one run reports all of them.
 #   e2e/cli/run.sh --out DIR [--cozy-bin F] [--tensorfs-wheel F] [--runtime-wheel F] [--packages DIR]
 . "$(dirname "$0")/../lib.sh"
 parse "$@"
@@ -15,22 +16,22 @@ step candidates; candidates
 
 step "BiRefNet on the CPU"
 dog=$(picture dog1.jpg)
-cell first "$(birefnet)" --asset "image=$dog"
-white_background "$(output first webp)" "$dog"
+if cell first "$(birefnet)" --asset "image=$dog"; then white_background "$(output first webp)" "$dog" || check "first: not a background removal"; fi
 first=$(cat "$OUT/first.number")
-grep -q '"status": *"completed"' "$OUT/first.json" || fail "cozy run show $first is not completed"
-cozy --json run list > "$OUT/runs.json"
-grep -Eq "\"number\": *$first([^0-9]|\$)" "$OUT/runs.json" || fail "cozy run list does not list run $first"
+if [ "$first" != none ]; then
+  grep -q '"number": *'"$first" "$OUT/first.json" || check "cozy run show $first does not show it"
+  cozy --json run list > "$OUT/runs.json" || check "cozy run list failed"
+  grep -Eq "\"number\": *$first([^0-9]|\$)" "$OUT/runs.json" || check "cozy run list does not list run $first"
+fi
 
 step "a second executor"
-cozy --json machine disable
-cozy --json machine enable; machine_ready
+cozy --json machine disable || check "cozy machine disable failed"
+cozy --json machine enable || check "cozy machine enable failed"
+machine_ready
 dog=$(picture dog2.jpg)
-cell second "$(birefnet)" --asset "image=$dog"
-white_background "$(output second webp)" "$dog"
+if cell second "$(birefnet)" --asset "image=$dog"; then white_background "$(output second webp)" "$dog" || check "second: not a background removal"; fi
 
-step down; cozy --json down
-step uninstall; cozy uninstall --yes
-[ ! -e "$COZY" ] || fail "cozy uninstall left $COZY"
-echo "::endgroup::"
-echo "cli: runs $first and $(cat "$OUT/second.number") completed"
+step down; cozy --json down || check "cozy down failed"
+step uninstall; cozy uninstall --yes || check "cozy uninstall failed"
+[ ! -e "$COZY" ] || check "cozy uninstall left $COZY"
+finish "cli: runs $first and $(cat "$OUT/second.number")"

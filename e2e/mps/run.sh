@@ -18,15 +18,14 @@ grep -q '"family": *"apple' "$OUT/machine.json" && grep -q '"memory_class": *"un
 
 step "BiRefNet on the Apple GPU"
 dog=$(picture dog1.jpg)
-cell birefnet "$(birefnet)" --asset "image=$dog"
-white_background "$(output birefnet webp)" "$dog"
+if cell birefnet "$(birefnet)" --asset "image=$dog"; then white_background "$(output birefnet webp)" "$dog" || check "birefnet: not a background removal"; fi
 
 step "SDXL on the Apple GPU, or refused past its working set"
 sdxl=sdxl/generate
 [ -z "$PACKAGES" ] || sdxl=./$PACKAGES/sdxl/generate
-ALLOW=memory_exhausted cell sdxl "$sdxl" prompt="a lighthouse on a basalt cliff at dusk, oil painting" seed:=4021 steps:=12
-[ -e "$OUT/sdxl.refused" ] || [ -n "$(output sdxl png)$(output sdxl webp)$(output sdxl jpg)" ] || fail "sdxl completed with no image"
+if ALLOW=memory_exhausted cell sdxl "$sdxl" prompt="a lighthouse on a basalt cliff at dusk, oil painting" seed:=4021 steps:=12; then
+  [ -e "$OUT/sdxl.refused" ] || [ -n "$(output sdxl png)$(output sdxl webp)$(output sdxl jpg)" ] || check "sdxl completed with no image"
+fi
 
 step logs; cozy machine logs local > "$OUT/machine.log" 2>&1 || true
-echo "::endgroup::"
-echo "mps: birefnet run $(cat "$OUT/birefnet.number"), sdxl run $(cat "$OUT/sdxl.number")$([ -e "$OUT/sdxl.refused" ] && echo ' (refused past the working set)')"
+finish "mps: birefnet run $(cat "$OUT/birefnet.number"), sdxl run $(cat "$OUT/sdxl.number")$([ -e "$OUT/sdxl.refused" ] && echo ' (refused past the working set)')"

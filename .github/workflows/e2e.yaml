@@ -90,15 +90,14 @@ jobs:
           path: src
           fetch-depth: 0
       - id: select
-        working-directory: src
         env:
           TOKENS: ${{ inputs.select }}
           REPO: ${{ steps.what.outputs.repo }}
           REF: ${{ steps.what.outputs.ref }}
           BASE: ${{ steps.what.outputs.base }}
         run: |
-          if [ -n "$TOKENS" ]; then s=$(../.creator/ci/affected --tokens "$TOKENS" --json)
-          else s=$(../.creator/ci/affected "$REPO" "$BASE" "$REF" --json); fi
+          if [ -n "$TOKENS" ]; then s=$(.creator/ci/affected --tokens "$TOKENS" --json)
+          else s=$(cd src && ../.creator/ci/affected "$REPO" "$BASE" "$REF" --json); fi
           echo "selection=$s" >> "$GITHUB_OUTPUT"
           { echo "### e2e selection: $REPO ${REF:0:12}"; echo '```'; echo "$s" | jq .; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           echo "$s" | jq .
@@ -122,7 +121,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: cozy-creator/cozy-creator
-          ref: ${{ needs.affected.outputs.repo == 'cozy-creator' && needs.affected.outputs.ref || needs.affected.outputs.creator }}
+          ref: ${{ needs.affected.outputs.creator }}
           path: .creator
       - uses: ./.creator/e2e/candidates
         with:
@@ -152,7 +151,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: cozy-creator/cozy-creator
-          ref: ${{ needs.affected.outputs.repo == 'cozy-creator' && needs.affected.outputs.ref || needs.affected.outputs.creator }}
+          ref: ${{ needs.affected.outputs.creator }}
           path: .creator
       - uses: ./.creator/e2e/candidates
         with:

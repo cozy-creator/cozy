@@ -30,7 +30,15 @@ parse() {
 }
 
 step() { echo "::endgroup::"; echo "::group::$*"; }
+# fail: the suite cannot go on. check: a failure the suite records and goes past, so one run reports
+# every broken step; `finish` exits non-zero when any was recorded.
 fail() { echo "::error::$*"; echo "$*" >> "$OUT/failures.txt"; exit 1; }
+check() { echo "::error::$*"; echo "$*" >> "$OUT/failures.txt"; }
+finish() {
+  echo "::endgroup::"
+  [ -s "$OUT/failures.txt" ] || { echo "$1: passed"; return 0; }
+  echo "$1: $(wc -l < "$OUT/failures.txt") failure(s):"; cat "$OUT/failures.txt"; exit 1
+}
 cozy() { "$COZY" "$@"; }
 
 # The install line from the README, as a person pastes it.
@@ -81,8 +89,9 @@ machine_ready() {
 
 # cell <name> <target> [inputs...]: one `cozy run` on local, followed to its end. Its events go to
 # $OUT/<name>.ndjson, its record (`cozy run show`) to $OUT/<name>.json, its number to $OUT/<name>.number,
-# its outputs under $OUT/<name>/. A run that does not complete fails the suite, unless ALLOW names a code
-# its refusal carries: then $OUT/<name>.refused holds that code.
+# its outputs under $OUT/<name>/. A run that does not complete is a recorded failure (`check`), unless
+# ALLOW names a code its refusal carries: then $OUT/<name>.refused holds that code. Returns 1 when the
+# run neither completed nor was refused as allowed.
 cell() {
   local name=$1 target=$2 code=0 n
   shift 2
@@ -101,7 +110,8 @@ cell() {
     echo "$name: run ${n:-none} refused with $ALLOW"
     return 0
   fi
-  fail "$name: cozy run $target did not complete (exit $code, run ${n:-none})"
+  check "$name: cozy run $target did not complete (exit $code, run ${n:-none}): $(grep -o '"message":"[^"]*"' "$OUT/$name.ndjson" | head -1)"
+  return 1
 }
 
 # The first output file of a cell with this extension.
