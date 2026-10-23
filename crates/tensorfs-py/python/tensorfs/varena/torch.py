@@ -902,6 +902,7 @@ class Memory:
             if block.count == 0:
                 _unbind(block)
 
+    @torch.inference_mode(False)  # what a route makes from the views is ordinary too (`_bound`)
     def _bind(self, block: Block, stream: torch.cuda.Stream) -> None:
         model, block.stream = block.model, stream
         views: dict[str, dict[str, Tensor]] = {}
@@ -910,9 +911,8 @@ class Memory:
         try:
             for region in block.regions:
                 pinned = self._pin(model, region, stream.cuda_stream)
-                base = torch.from_dlpack(pinned)
+                base, parts = _bound(block, region, pinned)
                 block.pins.append(base)
-                parts = block.parts(region, base)
                 views.update(parts)
                 if pinned.fresh:
                     fresh.update(parts)
@@ -1934,12 +1934,22 @@ def _unbind(block: Block) -> None:
     block.stream = None
 
 
+def _bound(block: Block, region: int, pinned: object) -> tuple[Tensor, dict[str, dict[str, Tensor]]]:
+    """A bound region's bytes and its stored tensors' views, ordinary tensors whatever mode the
+    caller is in: bound under `inference_mode` they would be inference tensors, and a view of a
+    placeholder outside its forward (`bn.running_mean.view(...)`) cannot alias one (se-074)."""
+    with torch.inference_mode(False):
+        base = torch.from_dlpack(pinned)
+        return base, block.parts(region, base)
+
+
+@torch.inference_mode(False)
 def _bind_host(model: Model) -> None:
     """Every weight once: CPU params view the host pages; an Apple device's are copied in."""
     for block in (model.common, *model.blocks):
         views: dict[str, dict[str, Tensor]] = {}
         for region in block.regions:
-            parts = block.parts(region, torch.from_dlpack(model.ws.bind(region, 0)))
+            parts = _bound(block, region, model.ws.bind(region, 0))[1]
             if model.device.type != "cpu":
                 parts = {k: {r: t.to(model.device) for r, t in v.items()} for k, v in parts.items()}
             views.update(parts)

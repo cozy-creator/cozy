@@ -206,6 +206,15 @@ def main() -> int:
         "the block is a placeholder again after the op",
         isinstance(net.blocks[3].lin.weight, Placeholder),
     )
+    with torch.inference_mode():  # Klein's VAE reads its batch norm's statistics this way (se-074)
+        view = net.blocks[3].lin.weight.view(-1)
+        scaled = view.view(1, -1) * 2
+    check(
+        "a view of a placeholder under inference_mode reads its bytes",
+        torch.equal(view, tensors["blocks.3.lin.weight"].to(dev).view(-1))
+        and torch.equal(scaled, tensors["blocks.3.lin.weight"].to(dev).view(1, -1) * 2),
+    )
+    del view, scaled
     held = net.blocks[3].lin.weight._varena_read()  # a kernel launched by pointer (cr-208)
     check(
         "a read no op sees binds its block: bytes behind the pointer",
