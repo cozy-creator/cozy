@@ -189,6 +189,12 @@ pub struct Set {
     pub declared: bool,
 }
 
+/// H: the device bytes a shared machine leaves to the display and other programs. A shrink
+/// leaves `2H` free, and growth stops at `2H`: the H..2H band is the hysteresis, with no timer.
+pub fn headroom(card: u64) -> u64 {
+    (512 << 20).max(card / 16)
+}
+
 /// Blocks ahead of a pass's cursor its prefetch maps (free bytes only): one bound while the next
 /// lands.
 pub const SLOTS: u64 = 2;
