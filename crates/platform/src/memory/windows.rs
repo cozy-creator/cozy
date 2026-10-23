@@ -4,7 +4,7 @@
 //! lock; host pages as pagefile-backed sections mapped into placeholders (`VirtualAlloc2`,
 //! `MapViewOfFile3`), exported as read-only duplicates.
 use super::{clean, Map};
-use crate::{Error, Result, Seam};
+use crate::{Error, Result};
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use windows_sys::Wdk::System::Threading::{NtQueryInformationThread, ThreadSuspendCount};
@@ -300,6 +300,15 @@ impl Endpoint {
         // SAFETY: as above.
         unsafe { ResetEvent(raw(&self.0)) };
         set
+    }
+}
+
+/// Blocks until `event` is signalled; an auto-reset event clears as the wait returns.
+fn await_event(event: &Owned) -> Result<()> {
+    // SAFETY: an event we hold.
+    match unsafe { WaitForSingleObject(raw(event), INFINITE) } {
+        WAIT_OBJECT_0 => Ok(()),
+        _ => Err(last("wait for the wake")),
     }
 }
 
