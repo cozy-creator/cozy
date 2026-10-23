@@ -71,6 +71,12 @@ impl Derived {
         entry.file.try_clone().ok()
     }
 
+    /// TensorD lets the entry go (its GPU page cache dropped the chunk): it is freed once every
+    /// process holding it closes it too.
+    pub fn forget(&self, domain: &str, key: &str) {
+        self.entries().remove(&(domain.into(), key.into()));
+    }
+
     /// Lets TensorD's holders go, least recently used first, until `bytes` are let go (a low
     /// disk): an entry is freed once the processes holding it close it too. What it let go.
     pub fn shrink(&self, bytes: u64) -> u64 {
@@ -165,7 +171,9 @@ mod tests {
         derived.open("gen/1000", "lora-a");
         assert_eq!(derived.shrink(1), 8, "the least recently used goes first");
         assert!(derived.open("gen/1000", "lora-b").is_none() && derived.open("gen/1000", "lora-a").is_some());
-        assert_eq!(derived.shrink(u64::MAX), 4);
+        derived.forget("gen/1000", "lora-a");
+        assert!(derived.open("gen/1000", "lora-a").is_none());
+        assert_eq!(derived.shrink(u64::MAX), 0);
         // A holder outlives TensorD's letting go: the bytes stay until it closes.
         reader.seek(SeekFrom::Start(0)).unwrap();
         let mut again = vec![];
