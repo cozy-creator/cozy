@@ -1,0 +1,3 @@
+[
+ {"cell": "h3 with a 3 s video reference", "issue": "cr-215", "sku": "l4", "what": "15 s ref2va_turbo, image + 3 s 1344x768 video reference: CUDA unknown error at condition (varena eviction without a stream fence); not run until fixed (lead 10-23)"}
+]

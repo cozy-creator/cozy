@@ -1,0 +1,131 @@
+#!/bin/bash
+# Release regression gate (tracker design ci-v2 §3): before every publish of cozy, the Runtime, TensorFS or a
+# first-party package. Any FAIL blocks the publish. Runs by hand through the default ~/.cozy, and from
+# .github/workflows/release-gate.yaml on a runner signed in with `cozy login --key`.
+#   gate.sh <SKU> [--out DIR] [--establish] [--publish] [--runtime-wheel F|URL] [--tensorfs-wheel F|URL]
+#           [--tensord BIN|URL] [--packages DIR] [--cells FILE]... [--only cell,cell] [--cli BIN] [--disk GB]
+# One FRESH rental. The candidate goes on with `cozy machine update` (a new executor), then each cell runs ONCE
+# with a scenario prompt from scenarios.tsv and fresh seeds: H3 first at the product shape (15 s ref2va_turbo,
+# cold executor), SeedVR2 on its first second, every image package's default call, then a restart and one SDXL
+# in the second executor. --packages runs a packages checkout's dirs in place of the published packages.
+# analyze.py holds each cell against the SKU's baseline, gate-<SKU>.json on the `release-gate-baselines`
+# release; a SKU with none needs --establish. --publish uploads a PASS as the SKU's new baseline.
+set -uo pipefail
+# Run from a private copy: editing this file while a gate runs must never change the running gate.
+if [ "${1:-}" != --copy ]; then
+  c=$(mktemp "${TMPDIR:-/tmp}/release-gate.XXXXXX.sh"); cp "$0" "$c"
+  exec bash "$c" --copy "$(cd "$(dirname "$0")" && pwd)" "$@"
+fi
+HERE=$2; shift 2
+REPO=cozy-creator/cozy-creator TAG=release-gate-baselines
+SKU=$1; shift; CAND=() ONLY= EXTRA=() CLI=cozy DISK=400 OUT= PKGS= ESTABLISH= PUBLISH=
+RT= TFS= BIN=
+ver() { basename "${1%%#*}" | cut -d- -f2; }
+while [ $# -gt 0 ]; do
+  case $1 in
+    --establish) ESTABLISH=1; shift; continue;;
+    --publish) PUBLISH=1; shift; continue;;
+    --out) OUT=$2;;
+    --only) ONLY=",$2,";;
+    --cells) EXTRA+=("$2");;
+    --cli) CLI=$2;;
+    --disk) DISK=$2;;
+    --packages) PKGS=$(cd "$2" && pwd);;
+    --runtime-wheel) RT=$(ver "$2"); CAND+=("$1" "$2");;
+    --tensorfs-wheel) TFS=$(ver "$2"); CAND+=("$1" "$2");;
+    --tensord) if [ -f "$2" ]; then BIN=$("$2" --version | awk '{print $2}'); else BIN=$2; fi; CAND+=("$1" "$2");;
+    *) echo "unknown argument $1" >&2; exit 2;;
+  esac; shift 2
+done
+SW=$(curl -sf https://tensorhub.com/v1/software | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["cozy"], d["runtime"], d["tensorfs"])')
+[ -n "$SW" ] || { echo "no /v1/software"; exit 1; }
+read -r C0 R0 T0 <<< "$SW"
+LABEL=cozy${BIN:-$C0}-rt${RT:-$R0}-tfs${TFS:-$T0}${PKGS:+-packages$(git -C "$PKGS" rev-parse --short HEAD)}
+OUT=${OUT:-$PWD/gate-$SKU-$LABEL-$(date -u +%Y%m%dT%H%MZ)}
+B=$OUT/baseline
+mkdir -p "$B"; cd "$OUT"; : > cells.tsv; echo "$LABEL" > label
+log() { echo "$(date -u +%H:%M:%SZ) $*" | tee -a gate.log; }
+gh release download "$TAG" -R "$REPO" -D "$B" -p "gate-$SKU.json" -p "ref-$SKU.*" -p "ref-$SKU-clip.mp4" 2>/dev/null
+if [ -f "$B/gate-$SKU.json" ]; then
+  [ -z "$ESTABLISH" ] || { log "$SKU already has a baseline; --establish is only for a SKU without one"; exit 1; }
+else
+  [ -n "$ESTABLISH" ] || { log "no baseline for $SKU on $REPO@$TAG: --establish starts one"; exit 1; }
+fi
+REF=$(ls "$B/ref-$SKU".* 2>/dev/null | grep -v -- -clip | head -1); REF=${REF:-$HERE/ref/seed.jpg}
+mapfile -t ROWS < <(grep -v '^#' "$HERE/scenarios.tsv")
+I=$(( $(date +%s) / 60 + $(cksum <<< "$SKU" | cut -d' ' -f1) ))
+IFS=$'\t' read -r NAME CHAR MOTION OBJECT SCENE <<< "${ROWS[$((I % ${#ROWS[@]}))]}"
+R=$(( $(date +%s%N) / 1000 % 4000000000 ))
+M=
+end_it() {
+  [ -n "$M" ] || return
+  "$CLI" machine end "$M" -y >end.log 2>&1
+  for _ in $(seq 1 30); do timeout 30 "$CLI" machine list --once 2>/dev/null | grep -q "^$M " || { log "ended $M, gone"; M=; return; }; sleep 10; done
+  log "WARNING $M still listed"
+}
+trap end_it EXIT
+trap 'exit 143' TERM INT
+# cell <name> <target> [args...]: runs on $M, keeps its record as <name>.json
+# --only names cells or packages.
+cell() {
+  local name=$1 target=$2 p; shift 2
+  p=${target%/*}; p=${p##*/}
+  [ -z "$ONLY" ] || [[ $ONLY == *",$name,"* || $ONLY == *",$p,"* ]] || return 0
+  "$CLI" run "$target" --on "$M" --json "$@" >"$name.ndjson" 2>"$name.err"
+  local n; n=$(grep -o '"number":[0-9]*' "$name.ndjson" | head -1 | cut -d: -f2)
+  [ -n "$n" ] && timeout 120 "$CLI" run show "$n" --json >"$name.json" 2>/dev/null
+  printf '%s\t%s\t%s\n' "$name" "$target" "${n:-none}" >> cells.tsv
+  log "$name run ${n:-none} $(grep -o '"status":"[a-z_]*"' "$name.ndjson" | tail -1)"
+}
+# pkg <package> <fn>: the published package's function, or the --packages checkout's directory of it.
+pkg() {
+  if [ -n "$PKGS" ] && [ -f "$PKGS/$1/package.toml" ]; then ln -sfn "$PKGS/$1" "$OUT/$1"; echo "./$1/$2"; else echo "fidika/$1/$2"; fi
+}
+output() { local n; n=$(awk -F'\t' -v c="$1" '$1==c{print $3}' cells.tsv); ls ~/.cozy/outputs/*/"$n"-* 2>/dev/null | grep -E "\.($2)$" | head -1; }
+log "gate $LABEL on $SKU: scenario $NAME, seeds from $R, candidate: ${CAND[*]:-released}${PKGS:+ packages $PKGS}, cli: $CLI"
+"$CLI" machine rent "$SKU" --disk-gb "$DISK" -y --json >rent.json 2>rent.err
+M=$(python3 -c 'import json,sys
+t = open(sys.argv[1]).read(); dec = json.JSONDecoder(); i = 0
+while i < len(t):
+    i = t.find("{", i)
+    if i < 0: break
+    d, i = dec.raw_decode(t, i)
+    m = d.get("machine")
+    if isinstance(m, dict) and m.get("name"): print(m["name"]); break' rent.json)
+[ -n "$M" ] || { log "rent failed: $(tail -c 300 rent.err) $(tail -c 300 rent.json)"; exit 1; }
+echo "$M" > machine
+log "rented $M"
+if [ ${#CAND[@]} -gt 0 ]; then
+  "$CLI" machine update "$M" "${CAND[@]}" -y >update.log 2>&1; log "candidate on $M: $(grep -E '^status' update.log)"
+fi
+timeout 60 "$CLI" machine show "$M" > machine.txt 2>&1
+# While cr-215 is open (lead 10-23) H3 takes the image reference only; the 3 s video reference returns with its fix.
+cell h3 "$(pkg minimax-h3 ref2va_turbo)" --asset ref="$REF" seed:=$((R + 1)) duration_s:=15 resolution=768p prompt="$MOTION"
+CLIP=$(output h3 mp4)
+[ -n "$CLIP" ] && nice -n 19 ffmpeg -v error -y -i "$CLIP" -t 1 -an -c:v libx264 -pix_fmt yuv420p clip-1s.mp4
+cell seedvr2 "$(pkg seedvr2 upscale)" --asset video="$OUT/clip-1s.mp4" resolution=1080p seed:=$((R + 2))
+cell sdxl "$(pkg sdxl generate)" prompt="$SCENE, photo" seed:=$((R + 3))
+cell klein "$(pkg flux-3-klein generate_turbo)" prompt="$CHAR" seed:=$((R + 4))
+cell qwen "$(pkg qwen-image-2 generate)" seed:=$((R + 5)) prompt="This is an RGBA image with transparency. $OBJECT, semi-transparent with soft reflections. The image has alpha channel and the background is transparent."
+cell anima "$(pkg anima generate)" prompt="masterpiece, best quality, anime illustration of $CHAR" seed:=$((R + 6))
+K=$(output klein 'png|webp|jpg')
+cell birefnet "$(pkg birefnet remove_background)" --asset image="$K"
+cell describer "$(pkg character-describer describe_character)" --asset image="$K"
+# More cells (`--cells FILE`): `name<TAB>target<TAB>args`, args expanded here ($SCENE, $CHAR, $R, $K, $M, $CLI ...).
+for f in "${EXTRA[@]}"; do
+  while IFS=$'\t' read -r name target args; do
+    [ -n "$name" ] && [ "${name:0:1}" != "#" ] && eval "cell \"\$name\" \"\$target\" $args"
+  done < "$f"
+done
+# Second executor process: a GPU memory limit write restarts the machine, so every executor is new.
+[ -z "$ONLY" ] || [[ $ONLY == *",sdxl-p2,"* || $ONLY == *",sdxl,"* ]] && { "$CLI" machine update "$M" --gpu-memory-limit off -y >restart.log 2>&1; log "restarted $M: $(grep -E '^status' restart.log)"; }
+cell sdxl-p2 "$(pkg sdxl generate)" prompt="$OBJECT on a wooden table, product photo" seed:=$((R + 7))
+end_it
+uv run -q --no-project --with pillow --with numpy python -I "$HERE/analyze.py" "$OUT" "$SKU" "$B/gate-$SKU.json" | tee verdict.txt
+[ "${PIPESTATUS[0]}" = 0 ] || exit 1
+# A PASS hands the next gate new references of the same shape: this Klein image and 3 s of this H3 video.
+if [ -z "$ONLY" ] && [ -n "$K" ] && [ -n "$CLIP" ]; then
+  rm -f "$B/ref-$SKU".* && cp "$K" "$B/ref-$SKU.${K##*.}"
+  nice -n 19 ffmpeg -v error -y -i "$CLIP" -t 3 -an -c:v libx264 -pix_fmt yuv420p "$B/ref-$SKU-clip.mp4"
+fi
+[ -z "$PUBLISH" ] || "$HERE/publish.sh" "$OUT" "$SKU" | tee -a gate.log
