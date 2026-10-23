@@ -269,6 +269,7 @@ fn state(id: &str, update: &Update) -> v1::RunState {
     v1::RunState {
         id: id.into(),
         number: 0,
+        started_at_ms: 0,
         state: match update.state.as_str() {
             "waiting" => "queued",
             "succeeded" => "succeeded",

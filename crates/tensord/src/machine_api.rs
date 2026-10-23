@@ -123,6 +123,7 @@ impl NativeBackend {
                 .parse()
                 .map_err(|_| Error::internal("internal", "invalid journal run number"))?,
             accepted_at_ms: record.accepted_at_ms,
+            started_at_ms: record.started_at_ms,
             finished_at_ms: record.finished_at_ms,
             target: Some(domain::MachineExecutionTarget {
                 package: record.invocation.package.clone(),

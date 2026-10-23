@@ -507,6 +507,9 @@ pub struct RunState {
     pub attempt: u32,
     /// Why a queued run waits, for people.
     pub waiting: String,
+    /// When it began executing (`running`), Unix ms: its time counts from here, never its queue's.
+    /// 0 before it does, or from an older machine.
+    pub started_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]

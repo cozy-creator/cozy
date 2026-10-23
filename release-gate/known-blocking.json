@@ -1,0 +1,6 @@
+[
+ {"pattern": "kernel build wait: cozy-*", "issue": "cr-217", "site": "kernel_compile.wait on the request thread: Runtime Triton sets (triton_kernels.py:252)"},
+ {"pattern": "kernel build wait: minimax-h3-*", "issue": "cr-217", "site": "kernel_compile.wait on the request thread: H3's Triton sets (triton_kernels.py:252)"},
+ {"pattern": "triton compile: *", "issue": "cr-217", "site": "cold Triton first launch: attention_fp8.py:108-109, sage2_fixed_mean.py:80/93, sage3_fixed.py:168/181/202, sol_fa4.py:127, decode_cores.py:172/235/285, Sol preprocess"},
+ {"pattern": "triton autotune: *", "issue": "cr-217", "site": "cold Triton autotune at first launch"}
+]

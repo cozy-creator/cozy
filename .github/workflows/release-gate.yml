@@ -1,0 +1,269 @@
+name: release-gate
+# CI v2 release gate (tracker design ci-v2 §3): every selected first-party model runs for real on fresh rentals and is
+# held against the SKU's last PASS (release-gate/gate.sh, analyze.py). Any FAIL blocks the publish. Callers:
+#   cozy: release.yml (a dist global-artifacts job: `plan` set, the candidate is this run's x86_64 cozy);
+#   Runtime: cozy-runtime publish.yaml (runtime_wheel: artifact:release-dist);
+#   packages: `task publish` dispatches it with packages_ref;
+#   by hand: gh workflow run release-gate.yml -R cozy-creator/cozy-creator -f runtime_wheel=https://…#sha256=… …
+# The runner signs in as the owner's account with the CI device key (environment release-gate, secret
+# COZY_CI_DEVICE_KEY; release-gate/README.md) and rents through tensorhub.com.
+on:
+  workflow_dispatch:
+    inputs:
+      cozy:
+        description: "cozy on the runner and the machine: released (the Hub's target), a release tag (v0.11.14) or a dev-build run id"
+        type: string
+        default: released
+      runtime_wheel:
+        description: "Candidate Runtime wheel: https://…/<wheel>#sha256=<hex>, or artifact:<name> of this run (empty: the Hub's target)"
+        type: string
+        default: ''
+      tensorfs_wheel:
+        description: "Candidate TensorFS wheel, as runtime_wheel"
+        type: string
+        default: ''
+      packages_ref:
+        description: "A cozy-creator/packages commit whose package directories run in place of the published packages"
+        type: string
+        default: ''
+      changed:
+        description: "For selection: '<repo> <base> <head>', or '<repo> <head>' (base: its previous release). Empty: everything"
+        type: string
+        default: ''
+      skus:
+        description: "Comma-separated SKUs (empty: by selection)"
+        type: string
+        default: ''
+      only:
+        description: "Comma-separated cells or packages (empty: by selection)"
+        type: string
+        default: ''
+      establish:
+        description: "Start the baseline of a SKU that has none"
+        type: boolean
+        default: false
+      publish:
+        description: "Publish a PASS as the SKU's new baseline"
+        type: boolean
+        default: true
+      nonce:
+        description: "Caller's id, shown in the run name"
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      plan: { type: string, default: '' }
+      cozy: { type: string, default: released }
+      runtime_wheel: { type: string, default: '' }
+      tensorfs_wheel: { type: string, default: '' }
+      packages_ref: { type: string, default: '' }
+      changed: { type: string, default: '' }
+      skus: { type: string, default: '' }
+      only: { type: string, default: '' }
+      establish: { type: boolean, default: false }
+      publish: { type: boolean, default: true }
+      nonce: { type: string, default: '' }
+run-name: release-gate ${{ inputs.cozy }} ${{ inputs.runtime_wheel }} ${{ inputs.tensorfs_wheel }} ${{ inputs.packages_ref }} ${{ inputs.nonce }}
+
+# Callers grant contents: write and actions: read; only the baseline job, in this repo, writes.
+jobs:
+  select:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      skus: ${{ steps.select.outputs.skus }}
+      only: ${{ steps.select.outputs.only }}
+    env:
+      CHANGED: ${{ inputs.changed || (inputs.plan && format('cozy-creator {0}', github.sha)) || '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/cozy-creator
+          ref: ${{ github.repository == 'cozy-creator/cozy-creator' && github.sha || 'master' }}
+          path: creator
+      # ci/affected reads the change inside a checkout of the changed repo that holds both revisions.
+      - if: ${{ env.CHANGED != '' && inputs.skus == '' && inputs.only == '' }}
+        uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/${{ startsWith(env.CHANGED, 'cozy-runtime') && 'cozy-runtime' || startsWith(env.CHANGED, 'packages') && 'packages' || startsWith(env.CHANGED, 'tensorhub') && 'tensorhub-v2' || 'cozy-creator' }}
+          fetch-depth: 0
+          path: changed
+      - id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SKUS: ${{ inputs.skus }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          # ci/affected prints suites and pkg:<name> tokens (tracker design ci-v2, build contract). No answer: everything.
+          words=gpu
+          if [ -z "$SKUS$ONLY" ] && [ -n "$CHANGED" ] && [ -d changed ]; then
+            read -r repo base head <<< "$CHANGED"
+            if [ -z "$head" ]; then
+              head=$base
+              slug=cozy-creator/$repo; [ "$repo" != tensorhub ] || slug=cozy-creator/tensorhub-v2
+              base=$(gh release list -R "$slug" --exclude-pre-releases -L 5 --json tagName -q '.[].tagName' | grep -vx "$head" | head -1)
+            fi
+            words=$(cd changed && ../creator/ci/affected "$repo" "$base" "$head") || words=gpu
+            echo "affected $repo $base...$head:" $words
+          fi
+          skus=$SKUS
+          if [ -z "$skus" ]; then
+            case " $(echo $words) " in *" gpu "* | *" gpu-datacenter "* | *" stress "*) skus=rtx-4090,rtx-5090 ;; esac
+            case " $(echo $words) " in *" gpu-datacenter "*) skus=$skus,h100-pcie,b200 ;; esac
+          fi
+          # pkg:<name> narrows the cells to those packages' (gate.sh --only takes package names); pkg:* or none: all.
+          only=$ONLY
+          if [ -z "$only" ] && ! printf '%s\n' $words | grep -qx 'pkg:\*'; then
+            only=$(printf '%s\n' $words | sed -n 's/^pkg://p' | paste -sd, -)
+          fi
+          echo "skus=$(printf '%s' "$skus" | jq -Rc 'split(",") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+          echo "only=$only" >> "$GITHUB_OUTPUT"
+          echo "skus: ${skus:-none}; cells: ${only:-all}"
+
+  gate:
+    needs: select
+    if: ${{ needs.select.outputs.skus != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        sku: ${{ fromJSON(needs.select.outputs.skus) }}
+    runs-on: ubuntu-24.04
+    environment: release-gate
+    permissions:
+      contents: read
+      actions: read  # a dev-build cozy, a wheel artifact of this run
+    # One gate per SKU at a time: its rental and its baseline.
+    concurrency:
+      group: release-gate-${{ matrix.sku }}
+      cancel-in-progress: false
+    # Hang bound, not a work budget: H3 at the product shape on a cold machine is the long cell.
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OUT: ${{ github.workspace }}/gate
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/cozy-creator
+          ref: ${{ github.repository == 'cozy-creator/cozy-creator' && github.sha || 'master' }}
+          path: creator
+      - if: ${{ inputs.packages_ref != '' }}
+        uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/packages
+          ref: ${{ inputs.packages_ref }}
+          path: packages
+      - uses: astral-sh/setup-uv@v7
+      - if: ${{ inputs.plan != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: artifacts-build-local-x86_64-unknown-linux-gnu
+          path: dist
+      - id: candidate
+        env:
+          COZY: ${{ inputs.cozy }}
+          PLAN: ${{ inputs.plan }}
+          RUNTIME_WHEEL: ${{ inputs.runtime_wheel }}
+          TENSORFS_WHEEL: ${{ inputs.tensorfs_wheel }}
+        run: |
+          command -v ffmpeg >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq ffmpeg; }
+          bin=$HOME/.cozy/bin; mkdir -p "$bin"; echo "$bin" >> "$GITHUB_PATH"
+          args=()
+          if [ -n "$PLAN" ]; then
+            tar -xzf dist/cozy-x86_64-unknown-linux-gnu.tar.gz -C dist
+            install -m 0755 dist/cozy-x86_64-unknown-linux-gnu/cozy "$bin/cozy"; args+=(--tensord "$bin/cozy")
+          elif [ "$COZY" = released ]; then
+            curl -LsSf https://tensorhub.com/install.sh | sh
+          elif [[ $COZY == v* ]]; then
+            curl -LsSf "https://github.com/cozy-creator/cozy-creator/releases/download/$COZY/cozy-installer.sh" | sh
+          else
+            gh run download "$COZY" -R cozy-creator/cozy-creator -p 'cozy-*' -D dev
+            install -m 0755 dev/cozy-*/cozy-linux-x86_64 "$bin/cozy"; args+=(--tensord "$bin/cozy")
+          fi
+          # A wheel is a URL the machine fetches, or an artifact of this run the CLI uploads.
+          for w in "runtime-wheel=$RUNTIME_WHEEL=cozy_runtime" "tensorfs-wheel=$TENSORFS_WHEEL=tensorfs"; do
+            IFS== read -r flag value dist <<< "$w"
+            case $value in
+              '') ;;
+              artifact:*)
+                gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n "${value#artifact:}" -D "wheels-$flag"
+                f=$(ls "wheels-$flag/$dist"-*manylinux*x86_64*.whl "wheels-$flag/$dist"-*-py3-none-any.whl 2>/dev/null | head -1)
+                [ -n "$f" ] || { echo "::error::no $dist x86_64 wheel in artifact ${value#artifact:}"; exit 1; }
+                args+=("--$flag" "$PWD/$f") ;;
+              *) args+=("--$flag" "$value") ;;
+            esac
+          done
+          "$bin/cozy" --version
+          echo "args=${args[*]}" >> "$GITHUB_OUTPUT"
+      - name: Sign in
+        env:
+          KEY: ${{ secrets.COZY_CI_DEVICE_KEY }}
+        run: |
+          [ -n "$KEY" ] || { echo "::error::the release-gate environment has no COZY_CI_DEVICE_KEY (release-gate/README.md)"; exit 1; }
+          # Calcifer and the local machine run as user services, as on a desktop login.
+          sudo loginctl enable-linger "$(id -un)"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          until [ -S "$XDG_RUNTIME_DIR/bus" ]; do sleep 1; done
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus" >> "$GITHUB_ENV"
+          export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
+          umask 077; printf '%s' "$KEY" > "$RUNNER_TEMP/key.json"
+          cozy login --key "$RUNNER_TEMP/key.json"; code=$?
+          rm -f "$RUNNER_TEMP/key.json"
+          [ "$code" = 0 ] && cozy up
+      - name: Gate ${{ matrix.sku }}
+        env:
+          ARGS: ${{ steps.candidate.outputs.args }}
+          ONLY: ${{ needs.select.outputs.only }}
+          ESTABLISH: ${{ inputs.establish }}
+          PACKAGES: ${{ inputs.packages_ref != '' && 'packages' || '' }}
+        run: |
+          read -ra args <<< "$ARGS"
+          [ -z "$ONLY" ] || args+=(--only "$ONLY")
+          [ -z "$PACKAGES" ] || args+=(--packages "$PACKAGES")
+          [ "$ESTABLISH" != true ] || args+=(--establish)
+          creator/release-gate/gate.sh "${{ matrix.sku }}" --out "$OUT" "${args[@]}"
+      # gate.sh ends its rental in a trap; a cancelled job can skip it, so end it here too and say so.
+      - if: always()
+        run: |
+          cp -r ~/.cozy/outputs "$OUT/outputs" 2>/dev/null || true
+          m=$(cat "$OUT/machine" 2>/dev/null) || exit 0
+          for _ in $(seq 1 30); do
+            timeout 30 cozy machine list --once 2>/dev/null | grep -q "^$m " || { echo "$m is gone"; exit 0; }
+            cozy machine end "$m" -y || true; sleep 10
+          done
+          echo "::error::$m is still listed: end it by hand (cozy machine end $m)"; exit 1
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-${{ matrix.sku }}
+          path: ${{ env.OUT }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # A passed SKU's numbers and references become its baseline. Only this repo's token can write them, so a gate
+  # another repo calls reads baselines but does not move them.
+  baseline:
+    needs: gate
+    if: ${{ always() && inputs.publish && github.repository == 'cozy-creator/cozy-creator' && needs.gate.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: gate-*
+          path: gates
+      - run: |
+          for d in gates/gate-*; do
+            sku=${d#gates/gate-}
+            grep -s '^VERDICT' "$d/verdict.txt" || { echo "$sku: no verdict"; continue; }
+            release-gate/publish.sh "$d" "$sku" || true
+          done

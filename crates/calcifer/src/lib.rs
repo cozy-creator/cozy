@@ -868,6 +868,9 @@ impl Calcifer {
                         }
                         waiting => self.waiting(id, format!("{}: {waiting}", state.state)),
                     }
+                    if state.started_at_ms > 0 {
+                        batch.started_at_ms = Some(state.started_at_ms as i64);
+                    }
                     batch.machine_state = Some(state.state);
                     continue;
                 }

@@ -70,7 +70,8 @@ const SCHEMA: &str = "
         warnings TEXT NOT NULL DEFAULT '[]',
         inputs TEXT NOT NULL DEFAULT '[]',
         wants TEXT,
-        agreed TEXT
+        agreed TEXT,
+        started_at INTEGER
     ) STRICT;
     CREATE INDEX runs_owed ON runs (machine) WHERE state <> 'settled';
     CREATE TABLE outputs (
@@ -169,6 +170,8 @@ pub struct RunRow {
     pub state_seq: u64,
     pub created_at_ms: i64,
     pub accepted_at_ms: Option<i64>,
+    /// When its machine began executing it: its time counts from here.
+    pub started_at_ms: Option<i64>,
     pub settled_at_ms: Option<i64>,
     pub warnings: Vec<Warning>,
     /// The staged objects its machine is written before the send.
@@ -242,6 +245,8 @@ pub struct Batch {
     pub logs: Vec<(i64, String, String)>,
     pub products: Vec<v1::Product>,
     pub machine_state: Option<String>,
+    /// When the machine says it began executing the run.
+    pub started_at_ms: Option<i64>,
 }
 
 impl Batch {
@@ -250,6 +255,7 @@ impl Batch {
             && self.logs.is_empty()
             && self.products.is_empty()
             && self.machine_state.is_none()
+            && self.started_at_ms.is_none()
     }
 }
 
@@ -319,13 +325,13 @@ impl Store {
             version @ 5..=VERSION => {
                 let tx = writer.transaction()?;
                 let mut changed = version != VERSION;
-                for (table, column) in [("runs", "agreed"), ("outputs", "checkpoint")] {
+                for (table, column, kind) in [("runs", "agreed", "TEXT"), ("outputs", "checkpoint", "TEXT"), ("runs", "started_at", "INTEGER")] {
                     let names: Vec<String> = tx
                         .prepare(&format!("PRAGMA table_info({table})"))?
                         .query_map([], |r| r.get(1))?
                         .collect::<rusqlite::Result<_>>()?;
                     if !names.iter().any(|name| name == column) {
-                        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"))?;
+                        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
                         changed = true;
                     }
                 }
@@ -780,9 +786,9 @@ impl Store {
                 return Ok(if row.state == State::Accepted { Acceptance::Again } else { Acceptance::Stale });
             }
             tx.execute(
-                "UPDATE runs SET state = 'accepted', machine_number = ?2, machine_state = ?3, accepted_at = ?4
-                 WHERE id = ?1",
-                params![id, state.number as i64, state.state, now_ms()],
+                "UPDATE runs SET state = 'accepted', machine_number = ?2, machine_state = ?3, accepted_at = ?4,
+                 started_at = ?5 WHERE id = ?1",
+                params![id, state.number as i64, state.state, now_ms(), (state.started_at_ms > 0).then_some(state.started_at_ms as i64)],
             )?;
             Ok(Acceptance::Fresh(vec![lifecycle(tx, id)?]))
         })
@@ -805,6 +811,9 @@ impl Store {
             }
             for product in &batch.products {
                 events.extend(put_output(tx, &row, product)?);
+            }
+            if let Some(at) = batch.started_at_ms.filter(|_| row.started_at_ms.is_none()) {
+                tx.execute("UPDATE runs SET started_at = ?2 WHERE id = ?1", params![id, at])?;
             }
             if let Some(state) = batch.machine_state.filter(|s| row.machine_state.as_ref() != Some(s)) {
                 tx.execute("UPDATE runs SET machine_state = ?2 WHERE id = ?1", params![id, state])?;
@@ -1248,7 +1257,7 @@ fn put_machine_in(tx: &Transaction, machine: &MachineRow) -> Result<()> {
 
 const RUN_COLUMNS: &str = "id, number, kind, target, hub, machine, pinned, spec, out_dir, state, cancel_requested,
     cursor, machine_state, status, reason_code, reason, state_seq, created_at, accepted_at, settled_at, warnings,
-    inputs, outcome, wants, agreed";
+    inputs, outcome, wants, agreed, started_at";
 
 fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let id: String = r.get(0)?;
@@ -1307,6 +1316,7 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
             state_seq: r.get::<_, i64>(16)? as u64,
             created_at_ms: r.get(17)?,
             accepted_at_ms: r.get(18)?,
+            started_at_ms: r.get(25)?,
             settled_at_ms: r.get(19)?,
             warnings: serde_json::from_str(&warnings).map_err(|_| corrupt("a run's warnings"))?,
             inputs: serde_json::from_str(&inputs).map_err(|_| corrupt("a run's inputs"))?,
@@ -1757,6 +1767,7 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
         output: items.collect::<rusqlite::Result<_>>()?,
         created_at_ms: row.created_at_ms,
         accepted_at_ms: row.accepted_at_ms,
+        started_at_ms: row.started_at_ms,
         settled_at_ms: row.settled_at_ms,
         waiting: None,
         progress: None,
