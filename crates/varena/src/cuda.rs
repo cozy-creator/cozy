@@ -415,6 +415,14 @@ impl Backend for CudaBackend {
         Ok(tensorfs::io::drain(self.ordinal)?)
     }
 
+    fn capturing(&self, stream: usize) -> Result<bool> {
+        let _ctx = self.primary.enter()?;
+        let mut status: c_int = 0;
+        call!("cuStreamIsCapturing", stream_is_capturing(stream as CUstream, &mut status))?;
+        // CU_STREAM_CAPTURE_STATUS_NONE is 0; ACTIVE and INVALIDATED still capture.
+        Ok(status != 0)
+    }
+
     fn relax(&self) {
         // CU_STREAM_CAPTURE_MODE_RELAXED.
         let mut mode: c_int = 2;

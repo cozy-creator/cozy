@@ -114,6 +114,10 @@ pub trait Backend: Send + Sync {
     /// This thread's driver calls never invalidate another thread's stream capture (relaxed
     /// capture mode): varena's own threads, which run beside captures.
     fn relax(&self) {}
+    /// Whether `stream` is capturing a graph now (a capture invalidated but not ended still is).
+    fn capturing(&self, _stream: usize) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Pages in host memory (a memfd, an `shm_open` object or a pagefile section each), mapped into
