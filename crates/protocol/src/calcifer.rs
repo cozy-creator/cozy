@@ -432,10 +432,10 @@ pub enum MachineState {
     Ready,
     /// Its end is asked of its Hub, which has not yet affirmed it.
     Ending,
-    /// Its Hub says its provider stopped it (or is ending it), and it has not answered since:
-    /// `reason` says why. Runs to it are refused; it is ready again once its provider resumes it.
-    Offline,
     Ended,
+    /// A state this reader does not know (a newer Calcifer's): shown as unknown, never refused.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -455,9 +455,14 @@ pub struct Machine {
     /// The sha256 of its pinned TLS leaf: what `cozy machine add … --fingerprint` takes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<Digest>,
-    /// Why it ended, or why it is offline.
+    /// Why it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Why a ready machine is offline, by its Hub's word (its provider stopped it, or its Hub is
+    /// ending it), while it does not answer: runs to it are refused. Its state stays `ready`,
+    /// which is what a reader that predates this field shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
     /// The Hub's word, for a rental.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rental: Option<Rental>,
@@ -973,6 +978,13 @@ mod tests {
         for on in ["local", "any", "new", "new:h100", "kiyui"] {
             assert_eq!(On::from(on.to_owned()).to_string(), on);
         }
+    }
+
+    #[test]
+    fn a_machine_state_this_reader_does_not_know_reads_as_unknown() {
+        let read = |state: &str| serde_json::from_value::<MachineState>(state.into()).unwrap();
+        assert_eq!(read("ending"), MachineState::Ending);
+        assert_eq!(read("hibernating"), MachineState::Unknown);
     }
 
     #[test]

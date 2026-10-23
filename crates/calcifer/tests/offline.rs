@@ -197,8 +197,8 @@ async fn a_rental_its_provider_stopped_is_refused_at_once_and_followed_back_at_a
     assert!(error.remedy.unwrap().contains("--on new"));
     assert!(!calcifer.store().recorded("k1").unwrap());
     let shown = machines.show("nemuri").await.unwrap();
-    assert_eq!(shown.state, MachineState::Offline);
-    assert_eq!(shown.reason.as_deref(), Some("vast stopped it (the Hub's balance there is spent)"));
+    assert_eq!(shown.state, MachineState::Ready, "what a CLI that predates offline shows");
+    assert_eq!(shown.offline.as_deref(), Some("vast stopped it (the Hub's balance there is spent)"));
 
     // A booting rental queues, as ever.
     let queued = calcifer.submit("k2", submit("kiyui", &run_hub.origin())).await.unwrap().run;
@@ -209,8 +209,7 @@ async fn a_rental_its_provider_stopped_is_refused_at_once_and_followed_back_at_a
     hub.says("r1", "ready", ready_at(&resumed));
     eventually("nemuri back at its new address", async || {
         let m = machines.list(false).await.ok()?.machines.into_iter().find(|m| m.name == "nemuri")?;
-        (m.state == MachineState::Ready && m.address.as_deref() == Some(&resumed.endpoint.address))
-            .then_some(())
+        (m.offline.is_none() && m.address.as_deref() == Some(&resumed.endpoint.address)).then_some(())
     })
     .await;
     let back = calcifer.submit("k3", submit("nemuri", &run_hub.origin())).await.unwrap().run.id;

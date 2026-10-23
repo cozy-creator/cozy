@@ -1221,6 +1221,7 @@ fn other(origin: &str, rental: &types::Rental, unverified: bool) -> Machine {
             .and_then(pin_of)
             .map(protocol::ids::Digest::from_bytes),
         reason: None,
+        offline: None,
         rental: Some(view(rental, None)),
         status: None,
         unreachable: None,

@@ -191,7 +191,7 @@ pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
             m.name
         ));
     }
-    if let Some(reason) = m.reason.as_ref().filter(|_| m.state != MachineState::Offline) {
+    if let Some(reason) = &m.reason {
         record = record.field("reason", reason);
     }
     if m.state != MachineState::Ended {
@@ -367,7 +367,7 @@ fn kind(m: &Machine) -> &'static str {
 
 pub fn state_cell(m: &Machine) -> String {
     let mut cell = match m.state {
-        MachineState::Offline => format!("offline: {}", m.reason.as_deref().unwrap_or("its Hub says so")),
+        _ if m.offline.is_some() => format!("offline: {}", m.offline.as_deref().unwrap_or_default()),
         MachineState::Booting => match &m.boot {
             Some(boot) => format!("booting · {boot}"),
             None => "booting".into(),
@@ -381,12 +381,13 @@ pub fn state_cell(m: &Machine) -> String {
         },
         MachineState::Ending => "ending".into(),
         MachineState::Ended => "ended".into(),
+        MachineState::Unknown => "unknown".into(),
     };
     if m.unverified {
         cell += " (unverified)";
     }
     match m.unreachable_since_ms {
-        Some(at) if m.state == MachineState::Ready && unreachable_since(m).is_none() => {
+        Some(at) if m.state == MachineState::Ready && m.offline.is_none() && unreachable_since(m).is_none() => {
             cell += &format!(" (unreachable for {})", clock(now_ms() - at))
         }
         _ => {}
@@ -489,7 +490,7 @@ fn unreachable_since(m: &Machine) -> Option<i64> {
 
 /// What an offline machine's owner can do: it is kept, never replaced, and refuses runs meanwhile.
 fn offline(m: &Machine) -> Option<String> {
-    let r = m.rental.as_ref().filter(|_| m.state == MachineState::Offline)?;
+    let r = m.rental.as_ref().filter(|_| m.offline.is_some())?;
     Some(format!(
         "{} is offline and refuses runs: it returns if its provider resumes it, and ends after 15 \
          minutes idle. To keep working: `cozy machine rent {}`, or `cozy run … --on new`.",

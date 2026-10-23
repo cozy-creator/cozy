@@ -427,7 +427,7 @@ impl Machines {
         } else if row.state == MachineState::Ready
             && let Some(reason) = self.offline(&row.name)
         {
-            (machine.state, machine.reason) = (MachineState::Offline, Some(reason));
+            machine.offline = Some(reason);
         }
         let mut held = vec![];
         if let Some(seen) = lock(&self.seen).get(&row.name) {
