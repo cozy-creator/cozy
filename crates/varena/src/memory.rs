@@ -30,7 +30,7 @@ use platform::handles::Owned;
 use tensorfs::io::source::Placement;
 use tensorfs::io::Dst;
 
-use crate::backend::{Access, Backend, Event, Physical, Va};
+use crate::backend::{Access, Backend, Budget, Event, Physical, Va};
 use crate::custody;
 use crate::decide::{self, Victim};
 use crate::ledger::{self, Facts, Grant, PhysicalChange, Row, Shared};
@@ -810,6 +810,8 @@ struct Inner {
     stop: Arc<AtomicBool>,
     quiet: Arc<Quiet>,
     ownership_lost: AtomicBool,
+    /// This process's device budget (Windows): its changes give pages back; growth stays under it.
+    budget: Option<Arc<dyn Budget>>,
     public_owners: AtomicU64,
     /// The allocator hook's segments ([`Memory::resident`]), counted exactly, and the room its
     /// claims hold for segments not allocated yet.
@@ -823,8 +825,8 @@ struct Inner {
     _device: Device,
 }
 
-fn exhausted(need: u64, site: Option<&str>, stats: Stats) -> Box<Exhausted> {
-    Box::new(Exhausted { need, site: site.map(str::to_string), stats })
+fn exhausted(need: u64, site: Option<&str>, stats: Stats, foreign: Option<String>) -> Box<Exhausted> {
+    Box::new(Exhausted { need, site: site.map(str::to_string), stats, foreign })
 }
 
 impl Memory {
@@ -852,6 +854,7 @@ impl Memory {
             let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
             let holder = custody.as_ref().map_or(0, |c| c.holder());
             let context = backend.process_used().unwrap_or_else(|_| backend.opened_context());
+            let budget = backend.budget();
             let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, ..Table::default() };
             let inner = Arc::new(Inner {
                 backend,
@@ -872,6 +875,7 @@ impl Memory {
                 stop: Arc::new(AtomicBool::new(false)),
                 quiet: Arc::default(),
                 ownership_lost: AtomicBool::new(false),
+                budget,
                 public_owners: AtomicU64::new(0),
                 native_resident: AtomicU64::new(0),
                 claimed: AtomicU64::new(0),
@@ -894,6 +898,10 @@ impl Memory {
             std::thread::Builder::new().name("varena-ask".into()).spawn(move || ask_loop(listener, &row, &weak, &stop)).map_err(|e| Error::io("spawn ask", e))?;
             let (weak, wanted) = (Arc::downgrade(&inner), inner.wanted.clone());
             std::thread::Builder::new().name("varena-trim".into()).spawn(move || trim_loop(&wanted, &weak)).map_err(|e| Error::io("spawn trim", e))?;
+            if let Some(budget) = inner.budget.clone() {
+                let weak = Arc::downgrade(&inner);
+                std::thread::Builder::new().name("varena-budget".into()).spawn(move || budget_loop(&*budget, &weak)).map_err(|e| Error::io("spawn budget", e))?;
+            }
             let mut st = inner.lock();
             inner.publish(&mut st);
             inner.unlock(st);
@@ -1435,11 +1443,24 @@ impl Inner {
         }
     }
 
+    /// What holds the device besides cozy, for a refusal: this process's budget and usage
+    /// (Windows), else the largest foreign process TensorD saw.
+    fn foreign(&self) -> Option<String> {
+        if let Some((budget, usage)) = self.budget.as_ref().and_then(|b| b.read().ok()) {
+            return Some(format!("other programs: this process's budget is {} MiB, its usage {} MiB", budget >> 20, usage >> 20));
+        }
+        self.shared.foreign_holder().ok().flatten().map(|(name, bytes)| format!("{name} ({} MiB)", bytes >> 20))
+    }
+
     /// The device's figures (this process's context, the driver's free bytes) sampled, and the
     /// rows read: only where they change a decision (a refusal, a peer ask, a request's open),
     /// never per pass.
     fn refresh(&self, st: &mut State) -> Result<ledger::Admission<'_>> {
         self.measure(st);
+        // TensorD samples foreign bytes while it has the table: the rows' read takes them.
+        if self.shared.sampled()? {
+            return self.rows(st);
+        }
         // Device queries are outside the shared metadata transaction. Revalidate their
         // physical attribution against the authoritative rows after taking admission.
         let sample = self.shared.physical_sample()?;
@@ -1479,6 +1500,9 @@ impl Inner {
         st.table.orphans = orphans;
         st.table.capacity = self.shared.capacity()?;
         st.table.shared = self.shared.shared_mode()?;
+        if self.shared.sampled()? {
+            st.table.foreign = self.shared.foreign()?;
+        }
         st.table.pending = self.to_custody.pending();
         self.physical(st);
         // Unmaps in flight are this process's still (and already spent on the creates queued
@@ -2081,7 +2105,7 @@ impl Inner {
                 let stats = st.stats(req).cloned().unwrap_or_default();
                 drop(admission);
                 self.unlock(st);
-                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats)));
+                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats, self.foreign())));
             }
             // Beyond what it could ever have (the budget with orphans released, less its context,
             // the hook's segments but its caches', its pinned pages): Exhausted at once.
@@ -2093,7 +2117,7 @@ impl Inner {
                 let stats = st.stats(req).cloned().unwrap_or_default();
                 drop(admission);
                 self.unlock(st);
-                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats)));
+                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats, self.foreign())));
             }
             record.step = req.and_then(|r| st.table.request(r)).map_or(0, |r| r.cursor.step);
             // Kept pages no live process maps go first: nobody's.
@@ -2233,7 +2257,7 @@ impl Inner {
                 let free = st.table.free();
                 let stats = st.stats(req).cloned().unwrap_or_default();
                 self.unlock(st);
-                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats)));
+                break Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, stats, self.foreign())));
             }
         };
         if record.freed > 0 || record.waited > 0 {
@@ -2273,6 +2297,41 @@ impl Inner {
 
     /// Maps the next blocks of `req`'s current step into free bytes only (never in shared mode,
     /// where the footprint never grows).
+    /// Recovery, at a pass boundary only (a shrink is at once): a streaming set takes back the
+    /// blocks at its watermark, one by one, into free bytes beyond 2H of the device (shared: H
+    /// more than the table leaves; Windows: under budget − 2H), mapped and filled on the copy
+    /// stream, never evicting. The H..2H band is the hysteresis: no timer.
+    fn regrow(&self, req: u64, set: u32) {
+        let mut st = self.lock();
+        let (Some(watermark), Ok(blocks)) = (st.streams.get(&set).map(|s| s.watermark), st.mech(set).map(|m| m.spec.layout.regions.len() as u32)) else {
+            return self.unlock(st);
+        };
+        let h = crate::table::headroom(self.backend.capacity());
+        let mut room = match self.budget.as_ref().and_then(|b| b.read().ok()) {
+            Some((budget, usage)) => budget.saturating_sub(2 * h + usage).min(st.table.free()),
+            None if st.table.shared => st.table.free().saturating_sub(h),
+            None => st.table.free(),
+        };
+        let mut w = watermark;
+        while let Some(bytes) = (w < blocks).then(|| st.table.page((set, w)).map(|p| p.bytes)).flatten().filter(|b| *b <= room) {
+            // A slot already there is resident now at no cost; a block with no page is mapped.
+            if !st.homes.contains_key(&(set, w)) {
+                if !self.map(&mut st, (set, w), Some(req), true).unwrap_or(false) {
+                    break;
+                }
+                room -= bytes;
+            }
+            w += 1;
+        }
+        if w >= blocks {
+            st.streams.remove(&set);
+        } else if let Some(s) = st.streams.get_mut(&set) {
+            s.watermark = w;
+        }
+        self.publish(&mut st);
+        self.unlock(st);
+    }
+
     fn prefetch(&self, req: u64) {
         let mut st = self.lock();
         if !st.table.shared {
@@ -2745,6 +2804,7 @@ impl Inner {
             self.coreside(req, false)?;
             self.unkeep(req);
         }
+        self.regrow(req, set);
         self.prefetch(req);
         Ok(id)
     }
@@ -2812,11 +2872,13 @@ impl Inner {
         stats
     }
 
-    /// The ask thread's answer: idle pages no plan of this row's uses ([`decide::answer`]),
-    /// never a cache, never waiting on anything but its own protects; it runs
-    /// no caller code. Kept pages' bytes come back once custody lets go: the trim thread
-    /// settles that after the reply and publishes them free.
-    fn answer(&self, bytes: u64) -> u64 {
+    /// The ask thread's answer, up to `bytes` under `ceiling`: idle pages no plan of this row's
+    /// uses ([`decide::answer`]); D: later steps' pages too, furthest first; W (foreign pressure):
+    /// then the running sets stream, their watermarks lowered. Never a cache, never a pinned page,
+    /// never waiting on anything but its own protects; it runs no caller code, and it never ends
+    /// a request. Kept pages' bytes come back once custody lets go: the trim thread settles that
+    /// after the reply and publishes them free.
+    fn answer(&self, ceiling: Class, bytes: u64) -> u64 {
         let out = crate::caught(|| {
             let mut st = self.lock();
             // A protect's page comes back with it: the answer counts it.
@@ -2827,6 +2889,31 @@ impl Inner {
             for key in decide::answer(&st.table, bytes) {
                 freed += st.table.page(key).map_or(0, |p| p.bytes);
                 self.unmap(&mut st, key, Class::N, None, true)?;
+            }
+            if ceiling >= Class::D && freed < bytes {
+                let later: Vec<(Key, u64)> = decide::victims(&st.table, &[])
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Victim::Page { key, bytes, releasing: false } if st.table.distance(key).is_some_and(|d| d.0 > 0) => Some((key, bytes)),
+                        _ => None,
+                    })
+                    .collect();
+                for (key, b) in later {
+                    if freed >= bytes {
+                        break;
+                    }
+                    self.unmap(&mut st, key, Class::D, None, true)?;
+                    freed += b;
+                }
+            }
+            if ceiling >= Class::W && freed < bytes {
+                let running: Vec<(u32, u64)> = st.table.requests.iter().flat_map(|r| r.steps.get(r.cursor.step as usize).map(|(sets, _)| sets.iter().map(|s| (*s, r.id)).collect::<Vec<_>>()).unwrap_or_default()).collect();
+                for (set, req) in running {
+                    if freed >= bytes {
+                        break;
+                    }
+                    freed += self.stream(&mut st, set, bytes - freed, Some(req), false)?.unmapped;
+                }
             }
             let settle = st.table.pending > 0;
             let unmapped = st.last_unmap.filter(|_| freed > 0);
@@ -3019,6 +3106,9 @@ impl Drop for Inner {
         self.to_custody.close();
         self.row.knock();
         self.wanted.0.lock().closed = true;
+        if let Some(budget) = &self.budget {
+            budget.close();
+        }
         self.wanted.1.notify_all();
         self.burst.0.lock().closed = true;
         self.burst.1.notify_all();
@@ -3080,6 +3170,19 @@ fn fill_loop(demand: &Receiver<Vec<Job>>, ahead: &Receiver<Vec<Job>>, inner: &We
     }
 }
 
+/// The budget's thread (Windows): each change over budget − H gives back what brings usage to
+/// budget − 2H, off any allocation.
+fn budget_loop(budget: &dyn Budget, inner: &Weak<Inner>) {
+    while budget.wait() {
+        let Some(me) = Work::of(inner) else { return };
+        let Ok((room, usage)) = budget.read() else { continue };
+        let h = crate::table::headroom(me.backend.capacity());
+        if usage > room.saturating_sub(h) {
+            me.answer(Class::W, usage - room.saturating_sub(2 * h));
+        }
+    }
+}
+
 fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>, stop: &AtomicBool) {
     if let Some(row) = row.upgrade() {
         row.ask_thread();
@@ -3089,7 +3192,7 @@ fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>,
         let Some(me) = Work::of(&inner) else { return 0 };
         // Never dies: a failed or panicking answer frees nothing, and the next ask is served.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match ask {
-            ledger::Ask::Room { bytes, .. } => me.answer(bytes),
+            ledger::Ask::Room { ceiling, bytes } => me.answer(Class::ALL.get(ceiling).copied().unwrap_or(Class::N), bytes),
         }))
         .unwrap_or(0)
     });

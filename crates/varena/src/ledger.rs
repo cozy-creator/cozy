@@ -34,7 +34,7 @@ use crate::os::{self, Listener, Map};
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledgr14");
+const MAGIC: u64 = u64::from_le_bytes(*b"vledgr15");
 /// The header's page: the heap starts after it, and grows from there.
 const HEADER: u64 = 4096;
 /// The heap's unit: rows take two, a fact as many as its bytes need.
@@ -66,10 +66,14 @@ struct Header {
     end: AtomicU64,
     /// Moves on every allocation or free; its low bits are a new record's generation.
     shape: AtomicU64,
-    /// Device bytes no row accounts for, as the last executor decision measured them.
+    /// Device bytes no row accounts for: TensorD's sample while it has the table (`sampled`),
+    /// else as the last executor decision measured them.
     foreign: AtomicU64,
     /// 0: shared (the machine's owner uses it too), 1: dedicated.
     mode: AtomicU32,
+    /// 1 once TensorD's ledger sampled foreign bytes, until it goes: executors read them, never
+    /// write them.
+    sampled: AtomicU32,
 }
 
 #[repr(C)]
@@ -216,7 +220,7 @@ impl RowView {
 /// What a row's ask thread is asked.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Ask {
-    /// Device bytes under a ceiling (Class::N or Class::D, as its index).
+    /// Device bytes under a ceiling (Class::N, D or W, as its index).
     Room { ceiling: usize, bytes: u64 },
 }
 
@@ -479,6 +483,25 @@ impl Shared {
         let m = self.map()?;
         header(&m).foreign.store(bytes, Release);
         Ok(())
+    }
+
+    /// TensorD samples foreign bytes (its ledger is live): an executor reads them.
+    pub fn sampled(&self) -> Result<bool> {
+        let m = self.map()?;
+        Ok(header(&m).sampled.load(Acquire) == 1)
+    }
+
+    fn set_sampled(&self, on: bool) -> Result<()> {
+        let m = self.map()?;
+        header(&m).sampled.store(u32::from(on), Release);
+        Ok(())
+    }
+
+    /// The largest foreign process on the device (its name and bytes), as TensorD last saw it.
+    pub fn foreign_holder(&self) -> Result<Option<(String, u64)>> {
+        let Some(v) = self.fact(FOREIGN_HOLDER)? else { return Ok(None) };
+        let (bytes, name) = v.split_at_checked(8).ok_or_else(|| Error::Internal("foreign holder fact".into()))?;
+        Ok(Some((String::from_utf8_lossy(name).into_owned(), u64::from_le_bytes(bytes.try_into().map_err(|_| Error::Internal("foreign holder fact".into()))?))))
     }
 
     pub fn shared_mode(&self) -> Result<bool> {
@@ -928,6 +951,21 @@ fn ask_name(gpu: &str, id: u64) -> String {
     format!("ask-{gpu}-{id}")
 }
 
+/// The fact naming the largest foreign process: its bytes (8, little-endian), then its name.
+const FOREIGN_HOLDER: &str = "foreign/holder";
+
+/// Asks row `id` for `bytes` under `ceiling` over its ask socket; what it freed (a dead or reused
+/// row frees nothing).
+fn ask_row(shared: &Shared, id: u64, ceiling: Class, bytes: u64) -> Result<u64> {
+    if !shared.names(id)? {
+        return Ok(0);
+    }
+    Ok(match os::connect(shared.ns, &ask_name(&shared.name, id)) {
+        Ok(Some(stream)) => os::call::<_, Answer>(&stream, &Ask::Room { ceiling: ceiling.index(), bytes }, None).map_or(0, |(a, _)| a.freed),
+        _ => 0,
+    })
+}
+
 /// One process's row. Dropping it publishes zeros, closes its asks and frees it; a killed
 /// process's row reads dead until reaped.
 pub(crate) struct Row {
@@ -1018,13 +1056,10 @@ impl Row {
         rec.asked.store(bytes, Release);
         rec.asking.store(id, Release);
         self.shared.ring();
-        let freed = match os::connect(self.shared.ns, &ask_name(&self.shared.name, id)) {
-            Ok(Some(stream)) => os::call::<_, Answer>(&stream, &Ask::Room { ceiling: ceiling.index(), bytes }, None).map_or(0, |(a, _)| a.freed),
-            _ => 0,
-        };
+        let freed = ask_row(&self.shared, id, ceiling, bytes);
         rec.asking.store(0, Release);
         rec.asked.store(0, Release);
-        Ok(freed)
+        freed
     }
 
     /// Binds this row's ask socket: its owner's ask thread serves it.
@@ -1293,6 +1328,7 @@ pub struct Ledger {
 impl Drop for Ledger {
     fn drop(&mut self) {
         let _ = self.shared.set_capacity(self.card);
+        let _ = self.shared.set_sampled(false);
     }
 }
 
@@ -1321,6 +1357,44 @@ impl Ledger {
     /// The machine's sharing mode (shared until TensorD says dedicated).
     pub fn set_mode(&self, mode: Mode) -> Result<()> {
         self.shared.set_mode(mode)
+    }
+
+    /// The largest foreign process on the device (TensorD's sample: its name and bytes; `None`
+    /// when none holds any): a request refused at its floor names it.
+    pub fn set_foreign_holder(&self, holder: Option<(&str, u64)>) -> Result<()> {
+        let value = holder.map(|(name, bytes)| [&bytes.to_le_bytes()[..], name.as_bytes()].concat());
+        self.shared.put(FOREIGN_HOLDER, value.as_deref())
+    }
+
+    /// TensorD's sample of the device bytes no row accounts for, once per new reading. Short
+    /// (the rows hold more than capacity − `foreign`), it wants the deficit and H more, from
+    /// orphans, then idle rows' pages (ceiling N), then running rows (ceiling W: they stream),
+    /// until met. `fresh` (a new foreign process crossed its threshold) also asks every idle row
+    /// for all its idle pages. What it freed; a run is never ended for it.
+    pub fn set_foreign(&self, foreign: u64, fresh: bool) -> Result<u64> {
+        self.shared.set_foreign(foreign)?;
+        self.shared.set_sampled(true)?;
+        let rows = self.shared.rows()?;
+        let deficit = held(&rows).saturating_sub(self.shared.capacity()?.saturating_sub(foreign));
+        let want = if deficit > 0 { deficit + crate::table::headroom(self.card) } else { 0 };
+        let mut freed = if want > 0 { self.custody.release(want) } else { 0 };
+        let (running, idle): (Vec<&RowView>, Vec<&RowView>) = rows.iter().filter(|r| r.live).partition(|r| r.facts.running > 0);
+        for r in idle {
+            if fresh || freed < want {
+                let ask = if fresh { u64::MAX } else { want - freed };
+                freed += ask_row(&self.shared, r.id(), Class::N, ask)?;
+            }
+        }
+        for r in running {
+            if freed >= want {
+                break;
+            }
+            freed += ask_row(&self.shared, r.id(), Class::W, want - freed)?;
+        }
+        if freed > 0 {
+            self.shared.ring();
+        }
+        Ok(freed)
     }
 
     /// The descriptors executor `pid` opens its memory with. Its uid joins the uids this

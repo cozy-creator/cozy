@@ -5,6 +5,7 @@
 //! pagefile section): CPU and MPS executors and the CPU tests use it; [`crate::CudaBackend`] is CUDA's.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use platform::handles::Owned;
@@ -100,6 +101,10 @@ pub trait Backend: Send + Sync {
     /// Destroys the retired events that completed (never waiting on one): the mechanism and
     /// trim threads only, since a destroy can wait on a driver lock another thread holds.
     fn sweep(&self) {}
+    /// This process's device budget, where the OS sets one (Windows); `None` elsewhere.
+    fn budget(&self) -> Option<Arc<dyn Budget>> {
+        None
+    }
     /// After a device error: proves the copy stream's work complete or fails.
     fn drain(&self) -> Result<()>;
 }
@@ -254,6 +259,16 @@ impl Backend for HostBackend {
     fn drain(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// This process's device budget where the OS sets one per process (Windows: DXCore/DXGI) and its
+/// changes; a game in front shrinks it.
+pub trait Budget: Send + Sync {
+    /// This process's budget and usage, bytes.
+    fn read(&self) -> Result<(u64, u64)>;
+    /// Blocks until the budget or usage changed (true) or [`Budget::close`] was called (false).
+    fn wait(&self) -> bool;
+    fn close(&self);
 }
 
 /// Events given up: each destroyed exactly once, and only once complete, on a thread that may
