@@ -26,6 +26,9 @@ pub(crate) fn open<'py>(py: Python<'py>, checkpoint: Checkpoint) -> PyResult<Bou
         .call1((native,))
 }
 
+/// `readinto`'s staging chunk.
+const READINTO_CHUNK: usize = 8 << 20;
+
 impl PyCheckpointFile {
     fn with<T: Send>(
         &self,
@@ -56,13 +59,25 @@ impl PyCheckpointFile {
             return Err(invalid(py, "readinto needs a writable C-contiguous buffer"));
         }
         let buf: PyBuffer<u8> = PyBuffer::get(&view.call_method1("cast", ("B",))?)?;
-        let (ptr, len) = (buf.buf_ptr() as usize, buf.len_bytes());
-        self.with(py, |file| {
-            // SAFETY: `buf` holds the writable buffer until this call returns.
-            #[allow(unsafe_code)]
-            let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len) };
-            file.read(out)
-        })
+        let Some(cells) = buf.as_mut_slice(py) else {
+            return Err(invalid(py, "readinto needs a writable C-contiguous buffer"));
+        };
+        // Read with the GIL released into our own chunk, copied in with it held: no Rust
+        // reference to Python's memory while another thread may touch it.
+        let mut chunk = vec![0u8; cells.len().min(READINTO_CHUNK)];
+        let mut filled = 0;
+        while filled < cells.len() {
+            let want = (cells.len() - filled).min(READINTO_CHUNK);
+            let n = self.with(py, |file| file.read(&mut chunk[..want]))?;
+            if n == 0 {
+                break;
+            }
+            for (cell, byte) in cells[filled..filled + n].iter().zip(&chunk[..n]) {
+                cell.set(*byte);
+            }
+            filled += n;
+        }
+        Ok(filled)
     }
 
     #[pyo3(signature = (offset, whence = 0))]

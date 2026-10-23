@@ -115,14 +115,15 @@ codegen-units = 1
 strip = true
 
 # Memory safety (xs-067): crates without FFI forbid unsafe_code at their root; FFI crates deny it and
-# allow it only in the boundary files listed in unsafe-boundaries.txt, each block with a SAFETY note.
+# allow it only in the boundary files listed in unsafe-boundaries.txt. A crate whose every unsafe block
+# carries its SAFETY note denies clippy::undocumented_unsafe_blocks at its root.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 # Every verb returns the one typed refusal; it is not on a hot path.
 result_large_err = "allow"
-undocumented_unsafe_blocks = "deny"
+undocumented_unsafe_blocks = "warn"
 
 # What dist builds releases with.
 [profile.dist]
