@@ -105,6 +105,38 @@ fn another_cozy_starts_the_installed_one() {
     assert_eq!(home.json(["down", "--json"])["changed"], true);
 }
 
+/// Homebrew's cozy is recorded as `<prefix>/bin/cozy`, never its keg in the Cellar: after `brew
+/// upgrade` moves that link (the old keg left until a cleanup), Calcifer runs the new keg.
+#[cfg(target_os = "linux")]
+#[test]
+fn homebrew_s_cozy_is_installed_by_its_stable_link() {
+    let Some(home) = Home::new() else { return };
+    let prefix = home.path().join("homebrew");
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    let prefix = prefix.canonicalize().unwrap();
+    let link = prefix.join("bin/cozy");
+    let kegs = ["1.0.0", "1.0.1"].map(|version| {
+        let keg = prefix.join("Cellar/cozy").join(version).join("bin/cozy");
+        std::fs::create_dir_all(keg.parent().unwrap()).unwrap();
+        std::fs::hard_link(home.installed(), &keg)
+            .or_else(|_| std::fs::copy(home.installed(), &keg).map(drop))
+            .unwrap();
+        keg.canonicalize().unwrap()
+    });
+    std::fs::remove_file(home.installed()).unwrap();
+    home.use_binary(&link);
+    for keg in &kegs {
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(keg, &link).unwrap();
+        let up = calcifer(&home, "up");
+        let runs = std::fs::read_link(format!("/proc/{}/exe", up["pid"])).unwrap();
+        assert_eq!(&runs, keg, "{up}");
+        let recorded = std::fs::read_to_string(home.root().join("installed")).unwrap();
+        assert_eq!(recorded, link.to_str().unwrap());
+        assert_eq!(home.json(["down", "--json"])["changed"], true);
+    }
+}
+
 /// Without systemctl, `cozy up` starts Calcifer detached and says once that no login will start
 /// it; an `up` that finds it running says nothing of it.
 #[cfg(target_os = "linux")]
