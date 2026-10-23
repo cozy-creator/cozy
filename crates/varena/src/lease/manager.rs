@@ -36,12 +36,9 @@ pub const CHUNK: u64 = 32 << 20;
 pub const PROTOCOL: u32 = 2;
 /// The stall look's cadence (TensorD's sampler's): a period, never a verdict.
 const LOOK: Duration = Duration::from_millis(500);
-/// Looks with no release before an executor with unpinned asks out can be stalled, and how many
-/// of its own measured release times its oldest ask must have waited.
+/// Looks in a row with neither a release nor any of its GPU work completing, while an unpinned
+/// ask of it waits, before an executor is stalled.
 const LOOKS: u32 = 3;
-const PACES: u32 = 4;
-/// Looks before a verdict where no release time was ever measured on this GPU.
-const LOOKS_UNPACED: u32 = 6;
 
 /// Who a connecting peer is, as its host knows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +59,9 @@ pub enum Record {
     Revoke { pid: u32, slots: Vec<u32> },
     Answered { pid: u32, released: usize, us: u64 },
     Reclaim { pid: u32, destroyed_bytes: u64, retained_bytes: u64, us: u64 },
+    /// Judged stalled: `looks` looks with no release and no GPU progress, its oldest unpinned
+    /// ask `waited_ms` old.
+    Stalled { pid: u32, looks: u32, waited_ms: u64 },
 }
 
 /// What TensorD answers for the manager.
@@ -80,6 +80,8 @@ pub struct ExecutorHolding {
     pub executor: String,
     pub chunks: usize,
     pub bytes: u64,
+    /// Of `bytes`, what its fills acked landed: what its exit would retain.
+    pub landed: u64,
 }
 
 /// What a manager holds, for its host's status and the tests: free = capacity − created.
@@ -138,9 +140,6 @@ struct Books {
     /// index, oldest first in `order`.
     retained: BTreeMap<Kept, BTreeMap<u32, Physical>>,
     order: VecDeque<Kept>,
-    /// The GPU's measured release time (an ask to its release), the pace of an executor that
-    /// has none of its own yet.
-    pace: Option<Duration>,
 }
 
 type Kept = (String, Region);
@@ -156,12 +155,12 @@ struct Exec {
     waiting: VecDeque<Waiting>,
     /// Slots asked back and not yet released, and when each was asked.
     asked: BTreeMap<u32, Instant>,
-    /// Releases the manager reclaimed itself: the progress a stall is judged by.
+    /// Releases the manager reclaimed itself, and with the agent's GPU progress, what a stall
+    /// is judged by.
     progress: u64,
-    /// Its measured release time (an ask to its release), smoothed.
-    pace: Option<Duration>,
-    /// The stall look's: `progress` at the last look that saw it move, and looks since.
-    seen: u64,
+    /// The stall look's: (releases, GPU progress) at the last look that saw either move, and
+    /// looks since.
+    seen: (u64, u64),
     still: u32,
     stalled: bool,
     /// The executors whose pins its waiting ask waits on.
@@ -269,9 +268,9 @@ impl Manager {
         self.ledger.clear_events()
     }
 
-    /// The ledger's stalled rows, and executors the stall look judged stalled: unpinned chunks
-    /// asked back, no release across [`LOOKS`] looks, the oldest ask older than [`PACES`] of its
-    /// measured release time. A getter: any caller, any rate.
+    /// The ledger's stalled rows, and executors the stall look judged stalled: an unpinned
+    /// chunk asked back, and neither a release nor any GPU progress of it across [`LOOKS`]
+    /// looks. A getter: any caller, any rate.
     pub fn stalled(&self) -> Vec<u32> {
         let mut pids = self.ledger.stalled();
         pids.extend(self.books.lock().executors.values().filter(|e| e.stalled).map(|e| e.pid));
@@ -280,29 +279,26 @@ impl Manager {
         pids
     }
 
-    /// One stall look (every [`LOOK`] while asks are out). True while any ask is out.
-    fn look(&self) -> bool {
+    /// One stall look (every [`LOOK`] while asks are out): whether any ask is out, and the
+    /// executors newly judged stalled.
+    fn look(&self) -> (bool, Vec<Record>) {
         let mut b = self.books.lock();
-        let gpu = b.pace;
-        let mut out = false;
+        let (mut out, mut records) = (false, vec![]);
         for e in b.executors.values_mut() {
-            let oldest = e.asked.iter().filter(|(s, _)| e.table.word(**s).is_some_and(|w| w.state == State::Mapped && w.pins == 0)).map(|(_, at)| *at).min();
             out |= !e.asked.is_empty();
-            let Some(oldest) = oldest else {
-                (e.seen, e.still, e.stalled) = (e.progress, 0, false);
+            let now = (e.progress, e.table.progress());
+            let oldest = e.asked.iter().filter(|(s, _)| e.table.word(**s).is_some_and(|w| w.state == State::Mapped && w.pins == 0)).map(|(_, at)| *at).min();
+            let Some(oldest) = oldest.filter(|_| now == e.seen) else {
+                (e.seen, e.still, e.stalled) = (now, 0, false);
                 continue;
             };
-            if e.progress != e.seen {
-                (e.seen, e.still, e.stalled) = (e.progress, 0, false);
-                continue;
-            }
             e.still += 1;
-            e.stalled = match e.pace.or(gpu) {
-                Some(pace) => e.still >= LOOKS && oldest.elapsed() >= pace * PACES,
-                None => e.still >= LOOKS_UNPACED,
-            };
+            if e.still >= LOOKS && !e.stalled {
+                e.stalled = true;
+                records.push(Record::Stalled { pid: e.pid, looks: e.still, waited_ms: u64::try_from(oldest.elapsed().as_millis()).unwrap_or(u64::MAX) });
+            }
         }
-        out
+        (out, records)
     }
 
     pub fn holdings(&self) -> Holdings {
@@ -310,7 +306,13 @@ impl Manager {
         let executors: Vec<ExecutorHolding> = b
             .executors
             .values()
-            .map(|e| ExecutorHolding { pid: e.pid, executor: e.identity.executor.clone(), chunks: e.leased.len(), bytes: e.leased.values().map(|l| l.phys.len).sum() })
+            .map(|e| ExecutorHolding {
+                pid: e.pid,
+                executor: e.identity.executor.clone(),
+                chunks: e.leased.len(),
+                bytes: e.leased.values().map(|l| l.phys.len).sum(),
+                landed: e.leased.values().filter(|l| l.landed && l.region.is_some()).map(|l| l.phys.len).sum(),
+            })
             .collect();
         Holdings {
             capacity: b.device.as_ref().map_or(0, |d| d.capacity),
@@ -370,13 +372,13 @@ impl Manager {
         // Sealed against resizing before the agent sees it: its ftruncate could SIGBUS us.
         let file = platform::memory::page(table::bytes(slots) as u64).map_err(|e| Error::Io(e.to_string()))?;
         platform::shm::seal_with(file.as_fd(), platform::shm::RESIZE_SEALS).map_err(|e| Error::Io(e.to_string()))?;
-        let table = Arc::new(Table::create(os::map(&file, table::bytes(slots), true)?, slots, peer.pid, birth, [0, 0])?);
+        let table = Arc::new(Table::create(os::map(&file, table::bytes(slots), true)?, slots, peer.pid, birth)?);
         let epoch = table.attach();
         let id = {
             let mut b = self.books.lock();
             b.next += 1;
             let id = b.next;
-            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, pace: None, seen: 0, still: 0, stalled: false, waits_on: BTreeSet::new() };
+            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, seen: (0, 0), still: 0, stalled: false, waits_on: BTreeSet::new() };
             b.executors.insert(id, exec);
             id
         };
@@ -467,12 +469,11 @@ impl Manager {
         let mut b = self.books.lock();
         let mut gone = vec![];
         let mut out = Out::default();
-        let mut paces = vec![];
         if let Some(e) = b.executors.get_mut(&exec) {
             let mut done = vec![];
             for (slot, l) in e.leased.iter_mut() {
                 match e.table.word(*slot).map(|w| (w.state, w.seq)) {
-                    Some((State::Mapped, seq)) if seq == l.seq && e.table.landed(*slot) => l.landed = true,
+                    Some((State::Mapped, seq)) if seq == l.seq => l.landed = e.table.landed(*slot),
                     Some((State::Released | State::Refused, seq)) if seq == l.seq => done.push(*slot),
                     _ => {}
                 }
@@ -480,11 +481,7 @@ impl Manager {
             for slot in done {
                 if let (Ok(Some(_)), Some(l)) = (e.table.reclaim(slot, false), e.leased.remove(&slot)) {
                     e.free.insert(slot);
-                    if let Some(at) = e.asked.remove(&slot) {
-                        let took = at.elapsed();
-                        e.pace = Some(e.pace.map_or(took, |p| (p * 3 + took) / 4));
-                        paces.push(took);
-                    }
+                    e.asked.remove(&slot);
                     e.progress += 1;
                     gone.push(l.phys);
                 }
@@ -492,9 +489,6 @@ impl Manager {
             if !gone.is_empty() {
                 out.records.push(Record::Answered { pid: e.pid, released: gone.len(), us: 0 });
             }
-        }
-        for took in paces {
-            b.pace = Some(b.pace.map_or(took, |p| (p * 3 + took) / 4));
         }
         for phys in gone {
             self.destroy(&mut b, phys);
@@ -825,7 +819,10 @@ fn refuse(b: &mut Books, out: &mut Out, exec: u64, ask: u64, code: Refusal, why:
 fn look_loop(manager: &Weak<Manager>) {
     loop {
         let Some(m) = manager.upgrade() else { return };
-        let out = m.look();
+        let (out, records) = m.look();
+        for record in records {
+            m.hosting.record(record);
+        }
         let mut b = m.books.lock();
         if out {
             m.looking.wait_for(&mut b, LOOK);
