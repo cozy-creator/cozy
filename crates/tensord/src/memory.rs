@@ -43,7 +43,7 @@ enum Held {
 /// What hosting a GPU's leases takes: who the peers on its listener are, and its chunks.
 pub struct Leases {
     pub hosting: Arc<dyn Hosting>,
-    pub backend: Arc<dyn Backend>,
+    pub open: Opener,
 }
 
 impl Gpu {
@@ -132,10 +132,11 @@ pub struct Tenant {
 /// Every live GPU executor process (leaders and followers) by pid.
 pub type Tenants = Arc<Mutex<BTreeMap<u32, Tenant>>>;
 
-/// Who a peer on a GPU's lease listener is: the tenant it is or descends from (a follower dials
-/// before rank 0 reports it), running as one of `uids` (this machine's, its launch identity's).
-/// Its executor is its group (plan and lane), its trust domain its package generation and user.
-/// Its grants, revokes, reclaims and adoptions are memory-log lines.
+/// Who a peer on a GPU's lease listener is: a live tenant (an executor, or a follower its rank 0
+/// reported), running as one of `uids` (this machine's, its launch identity's); anything else a
+/// package starts is refused, so every leased pid is one the health path can end. Its executor is
+/// its group (plan and lane), its trust domain its package generation and user. Its grants,
+/// revokes, reclaims and adoptions are memory-log lines.
 pub struct Peers {
     tenants: Tenants,
     uids: Vec<u32>,
@@ -153,11 +154,8 @@ impl Hosting for Peers {
         if !self.uids.contains(&peer.uid) {
             return None;
         }
-        let machine = std::process::id();
-        let parent = |&pid: &u32| platform::process::parent_of(pid).ok().filter(|&parent| parent > 1 && parent != pid);
-        let lineage: Vec<u32> = std::iter::successors(Some(peer.pid), parent).take_while(|&pid| pid != machine).collect();
         let tenants = self.tenants.lock().unwrap();
-        let tenant = lineage.iter().find_map(|pid| tenants.get(pid).filter(|tenant| !tenant.exact.ended()))?;
+        let tenant = tenants.get(&peer.pid).filter(|tenant| !tenant.exact.ended())?;
         Some(Identity { executor: format!("{}#{}", tenant.plan, tenant.start), domain: format!("{}/{}", tenant.generation, peer.uid) })
     }
 
@@ -174,13 +172,19 @@ fn manage(id: &GpuId, limit: Option<u64>, mode: Mode, leases: Leases) -> Result<
     let listener = varena::lease::listen(id)
         .map_err(|error| format!("its listener: {error}"))?
         .ok_or_else(|| "another process serves its leases".to_string())?;
-    Manager::create(id, limit, mode, leases.backend, listener, leases.hosting).map_err(|error| error.to_string())
+    let open = leases.open;
+    Manager::create(id, limit, mode, Box::new(move || open()), listener, leases.hosting).map_err(|error| error.to_string())
 }
 
-/// GPU `uuid`'s chunks, created in TensorD's own context. None (a memory-log note says why)
-/// where its compute mode admits one process at a time, whose context TensorD's would lock out,
-/// or CUDA cannot open it for shareable pages.
-pub fn chunks(uuid: &str, log: &MemoryLog) -> Option<Arc<dyn Backend>> {
+/// Opens a GPU's chunks: TensorD's own context, made at its manager's first ask and released
+/// when the manager holds no chunk and serves no executor (a context costs VRAM, and keeps a
+/// laptop's GPU awake).
+pub type Opener = Arc<dyn Fn() -> varena::Result<Arc<dyn Backend>> + Send + Sync>;
+
+/// GPU `uuid`'s opener. None (a memory-log note says why) where its compute mode admits one
+/// process at a time, whose context TensorD's would lock out, or CUDA cannot share its pages.
+/// Only NVML and CUDA's driver are read here: no context is made.
+pub fn chunks(uuid: &str, log: &MemoryLog) -> Option<Opener> {
     let off = |why: String| log.note(serde_json::json!({"event": "leases_off", "gpu": uuid, "why": why}));
     match platform::gpu::Device::open(uuid).and_then(|device| device.exclusive()) {
         Ok(true) => {
@@ -190,24 +194,31 @@ pub fn chunks(uuid: &str, log: &MemoryLog) -> Option<Arc<dyn Backend>> {
         Ok(false) => {}
         Err(error) => tracing::warn!("memory: GPU {uuid}'s compute mode is unread ({error}): CUDA decides"),
     }
-    let opened = ordinal(uuid).and_then(|ordinal| CudaBackend::open(ordinal).map_err(|error| error.to_string()));
-    opened.map(|backend| Arc::new(backend) as Arc<dyn Backend>).inspect_err(|why| off(why.clone())).ok()
+    let ordinal = shareable(uuid).inspect_err(|why| off(why.clone())).ok()?;
+    Some(Arc::new(move || CudaBackend::open(ordinal).map(|backend| Arc::new(backend) as Arc<dyn Backend>)))
 }
 
-/// The CUDA ordinal of GPU `uuid` in this process, whose ordinals are neither NVML's indices
-/// nor an executor's (`CUDA_VISIBLE_DEVICES`).
-fn ordinal(uuid: &str) -> Result<i32, String> {
+/// The CUDA ordinal of GPU `uuid` in this process (neither NVML's index nor an executor's,
+/// `CUDA_VISIBLE_DEVICES`), whose pages CUDA can create and share.
+fn shareable(uuid: &str) -> Result<i32, String> {
     use tensorfs::io::cuda;
     let driver = cuda::driver().map_err(|error| error.to_string())?;
     let mut count = 0;
     // SAFETY: cuDeviceGetCount's out-param, a live local.
     cuda::check("cuDeviceGetCount", unsafe { (driver.device_get_count)(&mut count) }).map_err(|error| error.to_string())?;
-    let named = |ordinal: i32| {
+    let device = |ordinal: i32| {
         let mut device = 0;
         // SAFETY: cuDeviceGet's out-param, a live local, for an ordinal below the count.
-        cuda::check("cuDeviceGet", unsafe { (driver.device_get)(&mut device, ordinal) }).is_ok() && cuda::uuid(device).is_ok_and(|named| named == uuid)
+        cuda::check("cuDeviceGet", unsafe { (driver.device_get)(&mut device, ordinal) }).ok()?;
+        cuda::uuid(device).is_ok_and(|named| named == uuid).then_some((ordinal, device))
     };
-    (0..count).find(|&ordinal| named(ordinal)).ok_or_else(|| format!("CUDA has no device {uuid}"))
+    let (ordinal, device) = (0..count).find_map(device).ok_or_else(|| format!("CUDA has no device {uuid}"))?;
+    for (attribute, what) in [(cuda::ATTR_VMM_SUPPORTED, "virtual memory management"), (cuda::ATTR_POSIX_FD_SUPPORTED, "shareable handles")] {
+        if cuda::attribute(device, attribute).map_err(|error| error.to_string())? == 0 {
+            return Err(format!("CUDA device {uuid} has no {what}"));
+        }
+    }
+    Ok(ordinal)
 }
 
 /// Admits request `id` of `family` at `<package>|<shape>` on every one of `ledgers` or none

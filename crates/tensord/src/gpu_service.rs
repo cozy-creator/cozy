@@ -707,7 +707,7 @@ impl Pool {
         let peers: Arc<dyn varena::lease::Hosting> = Arc::new(memory::Peers::new(tenants.clone(), uids.into_iter().flatten().collect(), notes.clone()));
         let leases = |entry: &str| {
             let uuid = memory::row(entry, &config.inventory)?.device_uuid.as_str();
-            memory::chunks(uuid, &notes).map(|backend| memory::Leases { hosting: peers.clone(), backend })
+            memory::chunks(uuid, &notes).map(|open| memory::Leases { hosting: peers.clone(), open })
         };
         let devices: Vec<Device> = envelope.iter().map(|entry| Device {
             entry: entry.clone(),

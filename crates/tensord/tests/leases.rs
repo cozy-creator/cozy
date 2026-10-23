@@ -1,8 +1,7 @@
 //! TensorD hosting varena's lease manager (design varena-leases), with real processes as
 //! executors: stand-ins (this binary's `lease_agent`, run as children) dial the GPU's listener and
-//! lease chunks of the host-page backend. TensorD knows its tenants and their followers, refuses
-//! strangers, keeps the books, logs every grant and exit, and retains landed weights only for
-//! the same trust domain.
+//! lease chunks of the host-page backend. TensorD leases to its tenants alone, keeps the books,
+//! logs every grant and exit, and retains landed weights only for the same trust domain.
 #![cfg(unix)]
 use std::{
     io::{BufRead, BufReader, Write},
@@ -11,7 +10,10 @@ use std::{
         unix::net::UnixStream,
     },
     process::{Child, Command, Stdio},
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant},
 };
 use platform::{
@@ -156,32 +158,33 @@ fn events(dir: &std::path::Path, kind: &str) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn a_peer_is_the_tenant_it_is_or_descends_from_running_as_a_machine_uid() {
+fn a_peer_is_a_live_tenant_running_as_a_machine_uid_and_nothing_its_package_starts() {
     let tenants = Tenants::default();
     let peers = Peers::new(tenants.clone(), vec![euid()], MemoryLog::default());
-    // A leader whose follower (its `cat`) lives until the leader's stdin closes.
-    let mut leader = Command::new("sh").args(["-c", "cat & wait"]).stdin(Stdio::piped()).spawn().unwrap();
+    // An executor and a process it started (its `cat`), alive until the executor's stdin closes.
+    let mut executor = Command::new("sh").args(["-c", "cat & wait"]).stdin(Stdio::piped()).spawn().unwrap();
     let started = Instant::now();
-    let follower = loop {
-        if let Some(&pid) = platform::process::descendants(leader.id()).first() {
+    let child = loop {
+        if let Some(&pid) = platform::process::descendants(executor.id()).first() {
             break pid;
         }
-        assert!(started.elapsed() < BACKSTOP, "the leader started no follower");
+        assert!(started.elapsed() < BACKSTOP, "the executor started nothing");
         std::thread::yield_now();
     };
     let peer = |pid: u32, uid: u32| Peer { pid, uid, gid: 0 };
-    assert_eq!(peers.identify(&peer(follower, euid())), None, "no tenant yet");
-    let exact = Exact::open(&Birth::of(leader.id()).unwrap()).unwrap().unwrap();
-    tenants.lock().unwrap().insert(leader.id(), Tenant { plan: "plan".into(), generation: "gen".into(), start: 2, exact });
+    assert_eq!(peers.identify(&peer(executor.id(), euid())), None, "no tenant yet");
+    let exact = Exact::open(&Birth::of(executor.id()).unwrap()).unwrap().unwrap();
+    tenants.lock().unwrap().insert(executor.id(), Tenant { plan: "plan".into(), generation: "gen".into(), start: 2, exact });
     let identity = Identity { executor: "plan#2".into(), domain: format!("gen/{}", euid()) };
-    assert_eq!(peers.identify(&peer(leader.id(), euid())), Some(identity.clone()));
-    assert_eq!(peers.identify(&peer(follower, euid())), Some(identity), "a follower dialing before rank 0 reports it");
-    let stranger = platform::process::parent_of(std::process::id()).unwrap();
-    assert_eq!(peers.identify(&peer(stranger, euid())), None, "a process no tenant started");
-    assert_eq!(peers.identify(&peer(leader.id(), euid() + 1)), None, "another user");
-    drop(leader.stdin.take());
-    leader.wait().unwrap();
-    assert_eq!(peers.identify(&peer(leader.id(), euid())), None, "an ended tenant");
+    assert_eq!(peers.identify(&peer(executor.id(), euid())), Some(identity.clone()));
+    assert_eq!(peers.identify(&peer(child, euid())), None, "a process its package started, never reported");
+    let exact = Exact::open(&Birth::of(child).unwrap()).unwrap().unwrap();
+    tenants.lock().unwrap().insert(child, Tenant { plan: "plan".into(), generation: "gen".into(), start: 2, exact });
+    assert_eq!(peers.identify(&peer(child, euid())), Some(identity), "a follower its rank 0 reported");
+    assert_eq!(peers.identify(&peer(executor.id(), euid() + 1)), None, "another user");
+    drop(executor.stdin.take());
+    executor.wait().unwrap();
+    assert_eq!(peers.identify(&peer(executor.id(), euid())), None, "an ended tenant");
 }
 
 /// One GPU's manager hosted as TensorD hosts it: two executors of one package and one of
@@ -194,7 +197,13 @@ fn tensord_leases_to_its_tenants_and_keeps_landed_weights_within_their_package()
     let (id, log) = (gpu_id(), MemoryLog::at(dir.path().to_path_buf()));
     let tenants = Tenants::default();
     let hosting: Arc<dyn Hosting> = Arc::new(Peers::new(tenants.clone(), vec![euid()], log.clone()));
-    let leases = Leases { hosting, backend: Arc::new(HostBackend::new(id.memory)) };
+    let (card, opened) = (id.memory, Arc::new(AtomicUsize::new(0)));
+    let opens = opened.clone();
+    let open = move || {
+        opens.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(HostBackend::new(card)) as Arc<dyn varena::Backend>)
+    };
+    let leases = Leases { hosting, open: Arc::new(open) };
     let peaks = Peaks::at(dir.path().join("peaks"));
     let gpu = Arc::new(Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, Some(leases), &peaks, &log).unwrap());
     let manager = gpu.manager().expect("TensorD manages the GPU's chunks").clone();
@@ -203,10 +212,12 @@ fn tensord_leases_to_its_tenants_and_keeps_landed_weights_within_their_package()
 
     let mut stranger = StandIn::start(&id.uuid);
     assert_eq!(stranger.ask("attach"), "standalone", "a process TensorD did not start is refused");
+    assert_eq!(opened.load(Ordering::Relaxed), 0, "no context before the first ask");
 
     let mut first = StandIn::tenant(&id.uuid, &tenants, "plan-a", "gen-a");
     assert_eq!(first.ask("attach"), "attached");
     assert_eq!(first.ask("take 8 7"), "1 0", "one fresh 8 MiB chunk");
+    assert_eq!(opened.load(Ordering::Relaxed), 1, "the first ask opens the context");
     let books = manager.holdings();
     assert_eq!((books.executors.len(), books.executors[0].pid, books.executors[0].bytes), (1, first.pid(), 8 * MIB), "{books:?}");
     assert_eq!(first.ask("land"), "landed");
