@@ -7,12 +7,12 @@ mod common;
 use common::Home;
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
     io::{BufRead, BufReader, Write},
     net::TcpListener,
-    process::Command,
     thread,
 };
+#[cfg(unix)]
+use std::{fs, process::Command};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ARCHIVE: &[u8] = b"not the release's archive";
