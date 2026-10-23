@@ -21,7 +21,10 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use platform::{handles::Peer, process::Exact};
+use platform::{
+    handles::Peer,
+    process::{Birth, Exact},
+};
 use varena::lease::{manager::{Opener, Record}, Hosting, Identity, Manager};
 use varena::{
     ledger::{FixedRow, Mode},
@@ -171,14 +174,84 @@ pub struct Tenant {
     pub exact: Exact,
 }
 
-/// Every live GPU executor process (leaders and followers) by pid.
-pub type Tenants = Arc<Mutex<BTreeMap<u32, Tenant>>>;
+/// Every live GPU executor process (leaders and followers).
+pub type Tenants = Arc<Registry>;
+
+/// The tenants by pid, and the groups whose Start is forming them: a follower that dials before
+/// its rank 0 reports it waits for its registration ([`Peers`]).
+#[derive(Default)]
+pub struct Registry {
+    book: Mutex<Book>,
+    changed: std::sync::Condvar,
+}
+
+/// What the registry holds: its tenants (the map it derefs to), the leaders whose groups form now,
+/// and how many peers wait on them.
+#[derive(Default)]
+pub struct Book {
+    tenants: BTreeMap<u32, Tenant>,
+    forming: BTreeMap<u32, Birth>,
+    parked: usize,
+}
+
+impl std::ops::Deref for Book {
+    type Target = BTreeMap<u32, Tenant>;
+    fn deref(&self) -> &Self::Target {
+        &self.tenants
+    }
+}
+
+impl std::ops::DerefMut for Book {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tenants
+    }
+}
+
+impl Registry {
+    pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Book>> {
+        self.book.lock()
+    }
+
+    /// Registers `tenants`; a peer waiting for one is admitted.
+    pub fn register(&self, tenants: impl IntoIterator<Item = (u32, Tenant)>) {
+        self.book.lock().unwrap().tenants.extend(tenants);
+        self.changed.notify_all();
+    }
+
+    /// `leader`'s Start forms its group until the returned guard drops: a member of its process
+    /// group that dials meanwhile waits to be registered, and is refused if the Start ends
+    /// without registering it.
+    pub fn forming(self: &Arc<Self>, leader: &Birth) -> Forming {
+        self.book.lock().unwrap().forming.insert(leader.pid, leader.clone());
+        Forming { registry: self.clone(), leader: leader.pid }
+    }
+
+    /// Peers waiting for their registration now.
+    pub fn parked(&self) -> usize {
+        self.book.lock().unwrap().parked
+    }
+}
+
+/// A group forming ([`Registry::forming`]).
+pub struct Forming {
+    registry: Arc<Registry>,
+    leader: u32,
+}
+
+impl Drop for Forming {
+    fn drop(&mut self) {
+        self.registry.book.lock().unwrap_or_else(|e| e.into_inner()).forming.remove(&self.leader);
+        self.registry.changed.notify_all();
+    }
+}
 
 /// Who a peer on a GPU's lease listener is: a live tenant (an executor, or a follower its rank 0
-/// reported), running as one of `uids` (this machine's, its launch identity's); anything else a
-/// package starts is refused, so every leased pid is one the health path can end. Its executor is
-/// its group (plan and lane), its trust domain its package generation and user. Its grants,
-/// revokes, reclaims and adoptions are memory-log lines.
+/// reported), running as one of `uids` (this machine's, its launch identity's). A member of a
+/// group whose Start forms it now waits until it is registered, or refused when that Start ends
+/// without it: TensorD knows the Start's state, so nothing redials or times out. Anything else a
+/// package starts is refused at once, so every leased pid is one the health path can end. Its
+/// executor is its group (plan and lane), its trust domain its package generation and user. Its
+/// grants, revokes, reclaims and adoptions are memory-log lines.
 pub struct Peers {
     tenants: Tenants,
     uids: Vec<u32>,
@@ -196,9 +269,20 @@ impl Hosting for Peers {
         if !self.uids.contains(&peer.uid) {
             return None;
         }
-        let tenants = self.tenants.lock().unwrap();
-        let tenant = tenants.get(&peer.pid).filter(|tenant| !tenant.exact.ended())?;
-        Some(Identity { executor: format!("{}#{}", tenant.plan, tenant.start), domain: format!("{}/{}", tenant.generation, peer.uid) })
+        let forming: Vec<Birth> = self.tenants.lock().unwrap().forming.values().cloned().collect();
+        let leader = forming.iter().find(|leader| platform::process::group_members(leader).iter().any(|m| m.pid == peer.pid)).map(|leader| leader.pid);
+        let mut book = self.tenants.lock().unwrap();
+        loop {
+            if let Some(tenant) = book.tenants.get(&peer.pid).filter(|tenant| !tenant.exact.ended()) {
+                return Some(Identity { executor: format!("{}#{}", tenant.plan, tenant.start), domain: format!("{}/{}", tenant.generation, peer.uid) });
+            }
+            if !leader.is_some_and(|leader| book.forming.contains_key(&leader)) {
+                return None;
+            }
+            book.parked += 1;
+            book = self.tenants.changed.wait(book).unwrap();
+            book.parked -= 1;
+        }
     }
 
     fn record(&self, record: Record) {

@@ -34,8 +34,10 @@ const MIB: u64 = 1 << 20;
 /// A failure backstop only: every wait below ends on the event it waits for.
 const BACKSTOP: Duration = Duration::from_secs(60);
 
+/// A card big enough that the driver headroom H (512 MiB at least, never leased) leaves room; the
+/// host backend takes only the pages it makes.
 fn gpu_id() -> GpuId {
-    GpuId { uuid: format!("GPU-s5-lease-{}", uuid::Uuid::new_v4()), model: "S5 Host Pages".into(), memory: 64 * MIB }
+    GpuId { uuid: format!("GPU-s5-lease-{}", uuid::Uuid::new_v4()), model: "S5 Host Pages".into(), memory: 8 << 30 }
 }
 
 fn inventory(id: &GpuId) -> receipt::Gpu {
@@ -103,14 +105,22 @@ struct StandIn {
 
 impl StandIn {
     fn start(uuid: &str) -> StandIn {
+        StandIn::grouped(uuid, None)
+    }
+
+    /// A stand-in in process group `group` (a rank 0's: its follower), or its own.
+    fn grouped(uuid: &str, group: Option<u32>) -> StandIn {
         let (control, theirs) = UnixStream::pair().unwrap();
-        let child = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", "lease_agent", "--ignored", "--nocapture"])
             .env("S5_LEASE_AGENT", uuid)
             .stdin(Stdio::from(OwnedFd::from(theirs)))
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::null());
+        if let Some(group) = group {
+            std::os::unix::process::CommandExt::process_group(&mut command, group as i32);
+        }
+        let child = command.spawn().unwrap();
         let replies = BufReader::new(control.try_clone().unwrap());
         StandIn { child, control, replies }
     }
@@ -120,7 +130,7 @@ impl StandIn {
         let standin = StandIn::start(uuid);
         let exact = Exact::open(&Birth::of(standin.pid()).unwrap()).unwrap().unwrap();
         let tenant = Tenant { plan: plan.into(), generation: generation.into(), start: 0, exact };
-        tenants.lock().unwrap().insert(standin.pid(), tenant);
+        tenants.register([(standin.pid(), tenant)]);
         standin
     }
 
@@ -129,7 +139,15 @@ impl StandIn {
     }
 
     fn ask(&mut self, command: &str) -> String {
+        self.send(command);
+        self.reply(command)
+    }
+
+    fn send(&mut self, command: &str) {
         writeln!(self.control, "{command}").unwrap();
+    }
+
+    fn reply(&mut self, command: &str) -> String {
         let mut reply = String::new();
         self.replies.read_line(&mut reply).unwrap();
         assert!(!reply.is_empty(), "the stand-in ended answering {command}");
@@ -177,12 +195,12 @@ fn a_peer_is_a_live_tenant_running_as_a_machine_uid_and_nothing_its_package_star
     let peer = |pid: u32, uid: u32| Peer { pid, uid, gid: 0 };
     assert_eq!(peers.identify(&peer(executor.id(), euid())), None, "no tenant yet");
     let exact = Exact::open(&Birth::of(executor.id()).unwrap()).unwrap().unwrap();
-    tenants.lock().unwrap().insert(executor.id(), Tenant { plan: "plan".into(), generation: "gen".into(), start: 2, exact });
+    tenants.register([(executor.id(), Tenant { plan: "plan".into(), generation: "gen".into(), start: 2, exact })]);
     let identity = Identity { executor: "plan#2".into(), domain: format!("gen/{}", euid()) };
     assert_eq!(peers.identify(&peer(executor.id(), euid())), Some(identity.clone()));
     assert_eq!(peers.identify(&peer(child, euid())), None, "a process its package started, never reported");
     let exact = Exact::open(&Birth::of(child).unwrap()).unwrap().unwrap();
-    tenants.lock().unwrap().insert(child, Tenant { plan: "plan".into(), generation: "gen".into(), start: 2, exact });
+    tenants.register([(child, Tenant { plan: "plan".into(), generation: "gen".into(), start: 2, exact })]);
     assert_eq!(peers.identify(&peer(child, euid())), Some(identity), "a follower its rank 0 reported");
     assert_eq!(peers.identify(&peer(executor.id(), euid() + 1)), None, "another user");
     for pid in [child, executor.id()] {
@@ -252,4 +270,55 @@ fn tensord_leases_to_its_tenants_and_keeps_landed_weights_within_their_package()
     let books = manager.holdings();
     assert_eq!((books.retained, books.executors.len()), (0, 2), "{books:?}");
     drop((stranger, other, next));
+}
+
+/// Waits until `count` peers wait for their registration.
+fn parked(tenants: &Tenants, count: usize) {
+    let started = Instant::now();
+    while tenants.parked() != count {
+        assert!(started.elapsed() < BACKSTOP, "{} parked, not {count}", tenants.parked());
+        std::thread::yield_now();
+    }
+}
+
+/// A follower that dials before its rank 0 reports it waits, parked, and is admitted the moment
+/// it is registered; one its group's Start ends without is refused with a typed reason. Nothing
+/// redials and nothing times out: the Start's state decides.
+#[test]
+fn a_follower_dialing_before_it_is_reported_waits_and_is_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (id, log) = (gpu_id(), MemoryLog::at(dir.path().to_path_buf()));
+    let tenants = Tenants::default();
+    let hosting: Arc<dyn Hosting> = Arc::new(Peers::new(tenants.clone(), vec![euid()], log.clone()));
+    let card = id.memory;
+    let leases = Leases { hosting, open: Box::new(move || Ok(Arc::new(HostBackend::new(card)) as Arc<dyn varena::Backend>)) };
+    let peaks = Peaks::at(dir.path().join("peaks"));
+    let _gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, Some(leases), &peaks, &log).unwrap();
+    // Rank 0: its own process group's leader, a registered executor whose Start forms the group.
+    let mut command = Command::new("sh");
+    command.args(["-c", "sleep 1000; :"]);
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut leader = command.spawn().unwrap();
+    let birth = Birth::of(leader.id()).unwrap();
+    let tenant = |exact: Exact| Tenant { plan: "plan-g".into(), generation: "gen-g".into(), start: 0, exact };
+    tenants.register([(leader.id(), tenant(Exact::open(&birth).unwrap().unwrap()))]);
+    let forming = tenants.forming(&birth);
+
+    let mut early = StandIn::grouped(&id.uuid, Some(leader.id()));
+    early.send("attach");
+    parked(&tenants, 1);
+    tenants.register([(early.pid(), tenant(Exact::open(&Birth::of(early.pid()).unwrap()).unwrap().unwrap()))]);
+    assert_eq!(early.reply("attach"), "attached", "admitted at its registration");
+    parked(&tenants, 0);
+
+    let mut late = StandIn::grouped(&id.uuid, Some(leader.id()));
+    late.send("attach");
+    parked(&tenants, 1);
+    drop(forming);
+    assert_eq!(late.reply("attach"), "NotRegistered", "the Start ended without it");
+    parked(&tenants, 0);
+    drop((early, late));
+    // SAFETY: a signal to the process group this test made (rank 0, its sleep, the stand-ins).
+    assert_eq!(unsafe { libc::kill(-(leader.id() as i32), libc::SIGKILL) }, 0);
+    leader.wait().unwrap();
 }
