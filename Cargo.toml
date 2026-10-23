@@ -29,7 +29,6 @@ calcifer = { path = "crates/calcifer" }
 cli = { path = "crates/cli" }
 hub-client = { path = "crates/hub-client" }
 platform = { path = "crates/platform" }
-portable-pty = "0.9.0"
 protocol = { path = "crates/protocol" }
 tensord = { path = "crates/tensord" }
 tensorfs = { path = "crates/tensorfs", default-features = false }
@@ -97,14 +96,13 @@ tokio-util = { version = "0.7", features = ["io"] }
 # figment's toml 0.8 already builds this one.
 toml = "0.8"
 toml_edit = "0.22.27"
-tower = { version = "0.5", default-features = false, features = ["util"] }
 tower-service = "0.3.3"
+tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 url = { version = "2.5.8", features = ["serde"] }
 utoipa = { version = "6.0.0", default-features = false, features = ["macros"] }
-vt100 = "0.16.2"
 webpki-roots = "1"
 windows-sys = "0.61"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
@@ -114,9 +112,16 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# Memory safety (xs-067): crates without FFI forbid unsafe_code at their root; FFI crates deny it and
+# allow it only in their boundary files. A crate whose every unsafe block
+# carries its SAFETY note denies clippy::undocumented_unsafe_blocks at its root.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
 [workspace.lints.clippy]
 # Every verb returns the one typed refusal; it is not on a hot path.
 result_large_err = "allow"
+undocumented_unsafe_blocks = "warn"
 
 # What dist builds releases with.
 [profile.dist]
