@@ -230,7 +230,9 @@ pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::
 /// must keep free, each process's measured anonymous peak less its anonymous bytes now plus
 /// the growth seen past it ([`Growth`]), against the live budget, page cache counted as room.
 /// Short, the events thread hears it ([`Woke::HostShort`]): the pool ends one idle process, and
-/// the next event looks again. No timer.
+/// the next event looks again. Another is ended only once the last end measurably raised the
+/// budget: when ending cannot help (a growing call alone exceeds the host), the call meets its
+/// own limit and the idle processes stay. A look that is not short starts over. No timer.
 pub struct Host {
     short: UnixStream,
     nudge: Nudge,
@@ -254,12 +256,19 @@ impl Host {
         let looked = looks.clone();
         let watching = std::thread::Builder::new().name("host-pressure".into()).spawn(move || {
             let mut keep = Keep::default();
+            // The budget when short was last signalled: the next signal needs more than it.
+            let mut signalled: Option<u64> = None;
             while pressure.wait().is_ok() {
                 looked.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
                 let need = keep.look(gpus.iter().map(|gpu| gpu.ledger.host_calls()).collect::<Option<Vec<_>>>().map(|calls| calls.concat()));
                 let budget = u64::try_from(host_memory::read().available).unwrap_or(u64::MAX);
-                if budget < need && signal.write_all(&[1]).is_err() {
-                    return;
+                if budget >= need {
+                    signalled = None;
+                } else if signalled.is_none_or(|was| budget > was) {
+                    if signal.write_all(&[1]).is_err() {
+                        return;
+                    }
+                    signalled = Some(budget);
                 }
                 looked.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
                 looked.1.notify_all();
