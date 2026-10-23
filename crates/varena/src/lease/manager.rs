@@ -513,14 +513,13 @@ impl Manager {
         Ok(device)
     }
 
-    /// What the manager may create in all: the card (or limit) less the driver's headroom H in
-    /// every mode (cr-215), its own context, every other process's fixed bytes on the ledger
-    /// (contexts, torch's own allocations) and foreign bytes.
+    /// What the manager may hold in all: what it created plus the device's actual free bytes
+    /// (the driver's measure: contexts, libraries and other processes count as used), less the
+    /// fixed reserve (design rev 6), within the card or its limit.
     fn capacity(&self, b: &Books) -> u64 {
         let Some(d) = &b.device else { return 0 };
-        let me = std::process::id();
-        let fixed: u64 = self.ledger.status().rows.iter().filter(|r| r.live && r.pid != me).map(|r| r.context + r.torch).sum();
-        d.card.saturating_sub(d.headroom + d.context + fixed + b.foreign)
+        let free = d.backend.free().unwrap_or(0);
+        (b.created + free).saturating_sub(d.headroom).min(d.card)
     }
 
     /// TensorD's sample of device bytes no process of ours holds (NVML, or the card less its

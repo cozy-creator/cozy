@@ -219,7 +219,7 @@ impl Source for Leased {
 
     fn map(&self, va: Va, _: Kind) -> Result<Vec<Chunk>> {
         let (mut chunks, mut tickets, mut off, mut failed) = (Vec::new(), Vec::new(), 0, None);
-        for lease in self.agent.take(va.len, crate::lease::wire::Kind::Torch, None)? {
+        for lease in self.agent.take(va.len, crate::lease::Kind::Torch, None)? {
             let len = lease.phys.len;
             let mapped = if failed.is_some() || off + len > va.len {
                 Err(Error::Internal(format!("a grant of {len} bytes past its {}-byte span", va.len)))

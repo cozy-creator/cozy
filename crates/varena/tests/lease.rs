@@ -16,7 +16,7 @@ mod cases {
     use platform::handles::Peer;
     use tensorfs::io::Dst;
     use varena::backend::{Access, Backend, Va};
-    use varena::lease::wire::{End, ToAgent};
+    use varena::lease::wire::{End, ToAgent, ToManager};
     use varena::lease::{Agent, Attach, Holdings, Hosting, Identity, Kind, Lease, Manager, Refusal, Region};
     use varena::ledger::Mode;
     use varena::{GpuId, HostBackend};
@@ -281,6 +281,9 @@ mod cases {
     fn a_stranger_is_refused(dir: &Path) {
         let host = host(dir, "stranger", 64 * MIB);
         let stranger = End::new(dial(&host.uuid));
+        // Every answer follows a Hello, a refusal too.
+        let birth = platform::process::Birth::own().unwrap().start_ticks;
+        stranger.send(&ToManager::Hello { protocol: varena::lease::PROTOCOL, birth }, None).unwrap();
         match stranger.recv::<ToAgent>().unwrap() {
             Some((ToAgent::Refuse { code: Refusal::NotRegistered, .. }, None)) => {}
             other => panic!("a stranger was answered {:?}", other.map(|(m, h)| (m, h.is_some()))),
