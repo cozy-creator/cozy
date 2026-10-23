@@ -1435,13 +1435,40 @@ impl Inner {
         }
     }
 
-    /// The other rows, orphans, capacity, mode and foreign bytes, read now.
+    /// The device's figures (this process's context, the driver's free bytes) sampled, and the
+    /// rows read: only where they change a decision (a refusal, a peer ask, a request's open),
+    /// never per pass.
     fn refresh(&self, st: &mut State) -> Result<ledger::Admission<'_>> {
+        self.measure(st);
         // Device queries are outside the shared metadata transaction. Revalidate their
         // physical attribution against the authoritative rows after taking admission.
         let sample = self.shared.physical_sample()?;
         let card = self.backend.capacity();
         let used = card.saturating_sub(self.backend.free()?);
+        let (admission, rows) = self.read_rows(st)?;
+        // This row's own bytes are known under the state lock: a retiring page stays counted
+        // (and held) until its unmap returns, so a driver free before that hides nothing; a
+        // create not yet recorded is not counted, so it reads as foreign meanwhile.
+        let own = st.table.physical;
+        let (known, proven) = (sample.known(&rows, self.row.id()) + own, sample.complete(&rows, self.row.id()));
+        // Foreign bytes take from the card, not from the table's cap: they count only beyond the
+        // card's room outside the cap (capacity = min(cap, card - foreign)).
+        st.table.foreign = st.table.foreign_from_known(card, used, known);
+        // A row's change in flight makes this figure conservative for this decision only: the
+        // shared figure (TensorD's admission) changes on proven samples alone.
+        if proven {
+            self.shared.set_foreign(st.table.foreign)?;
+        }
+        Ok(admission)
+    }
+
+    /// The other rows, orphans, capacity and mode, read now (shared memory only); foreign bytes
+    /// and the context as last sampled.
+    fn rows(&self, st: &mut State) -> Result<ledger::Admission<'_>> {
+        self.read_rows(st).map(|(admission, _)| admission)
+    }
+
+    fn read_rows(&self, st: &mut State) -> Result<(ledger::Admission<'_>, Vec<ledger::RowView>)> {
         let admission = self.shared.admission()?;
         let mut rows = admission.rows()?;
         if rows.iter().any(|r| !r.live) && self.shared.reap(None)? {
@@ -1457,20 +1484,7 @@ impl Inner {
         // Unmaps in flight are this process's still (and already spent on the creates queued
         // after them).
         st.table.inflight = self.mech.pending();
-        // This row's own bytes are known under the state lock: a retiring page stays counted
-        // (and held) until its unmap returns, so a driver free before that hides nothing; a
-        // create not yet recorded is not counted, so it reads as foreign meanwhile.
-        let own = st.table.physical;
-        let (known, proven) = (sample.known(&rows, self.row.id()) + own, sample.complete(&rows, self.row.id()));
-        // Foreign bytes take from the card, not from the table's cap: they count only beyond the
-        // card's room outside the cap (capacity = min(cap, card - foreign)).
-        st.table.foreign = st.table.foreign_from_known(card, used, known);
-        // A row's change in flight makes this figure conservative for this decision only: the
-        // shared figure (TensorD's admission) changes on proven samples alone.
-        if proven {
-            self.shared.set_foreign(st.table.foreign)?;
-        }
-        Ok(admission)
+        Ok((admission, rows))
     }
 
     fn facts(st: &State) -> Facts {
@@ -2041,8 +2055,6 @@ impl Inner {
         let out = loop {
             let mut st = self.lock();
             let admission = self.refresh(&mut st)?;
-            self.measure(&mut st);
-            self.physical(&mut st);
             // The driver's free bytes bound the table's (its own slack, another tenant's churn).
             // A refused create says the driver had less than both: its free bytes count for
             // nothing, and the round takes the page's bytes itself.
@@ -2415,7 +2427,7 @@ impl Inner {
         self.publish(&mut st);
         self.unlock(st);
         if !idle {
-            self.coreside(rid)?;
+            self.coreside(rid, true)?;
             self.unkeep(rid);
         }
         Ok(rid)
@@ -2429,6 +2441,9 @@ impl Inner {
     /// They are kept again when no request is open.
     fn unkeep(&self, req: u64) {
         let st = self.lock();
+        if !st.homes.values().any(|h| h.exported) {
+            return self.unlock(st);
+        }
         let Some(peak) = st.table.request(req).map(|r| r.peak) else { return self.unlock(st) };
         let victims = decide::victims(&st.table, &[]);
         let kept = |st: &State, key: Key| st.table.page(key).is_some_and(|p| p.kept);
@@ -2469,27 +2484,17 @@ impl Inner {
     /// recorded peak beside its free bytes and its own evictable ones, it asks the other rows
     /// for their idle pages (pages only, never caches); unmeasured, for every idle page they
     /// have.
-    fn coreside(&self, req: u64) -> Result<()> {
+    fn coreside(&self, req: u64, open: bool) -> Result<()> {
         let asks: Vec<(u64, u64)> = {
             let mut st = self.lock();
-            let admission = self.refresh(&mut st)?;
-            let Some(r) = st.table.request(req) else { return Ok(()) };
-            let own: u64 = decide::victims(&st.table, &[]).iter().map(|v| match v {
-                Victim::Page { bytes, .. } | Victim::Cache { bytes, .. } => *bytes,
-            }).sum();
-            let have = st.table.free() + own;
-            let mut short = r.peak.map_or(u64::MAX, |p| p.saturating_sub(have));
-            let mut asks = vec![];
-            for o in &st.table.others {
-                if short == 0 {
-                    break;
-                }
-                let bytes = short.min(o.idle());
-                if bytes > 0 {
-                    asks.push((o.row, bytes));
-                    short = short.saturating_sub(bytes);
-                }
+            // A request's open samples the device; a pass start reads the rows and the device as
+            // last sampled, and samples it again only before an ask.
+            let mut admission = if open { self.refresh(&mut st)? } else { self.rows(&mut st)? };
+            if !open && !Self::asks(&st, req).is_empty() {
+                drop(admission);
+                admission = self.refresh(&mut st)?;
             }
+            let asks = Self::asks(&st, req);
             drop(admission);
             self.unlock(st);
             asks
@@ -2500,6 +2505,33 @@ impl Inner {
         Ok(())
     }
 
+
+    /// The rows `req` asks for idle pages, and how many bytes each: short of its recorded peak
+    /// beside its free bytes and its own evictable ones; unmeasured, every idle byte.
+    fn asks(st: &State, req: u64) -> Vec<(u64, u64)> {
+        let Some(r) = st.table.request(req) else { return vec![] };
+        let mut short = match r.peak {
+            Some(p) => {
+                let own: u64 = decide::victims(&st.table, &[]).iter().map(|v| match v {
+                    Victim::Page { bytes, .. } | Victim::Cache { bytes, .. } => *bytes,
+                }).sum();
+                p.saturating_sub(st.table.free() + own)
+            }
+            None => u64::MAX,
+        };
+        let mut asks = vec![];
+        for o in &st.table.others {
+            if short == 0 {
+                break;
+            }
+            let bytes = short.min(o.idle());
+            if bytes > 0 {
+                asks.push((o.row, bytes));
+                short = short.saturating_sub(bytes);
+            }
+        }
+        asks
+    }
 
     /// Binds `block` of `set` for `stream`; `claims` are the caller's own preparation pins,
     /// which hold the page for this bind and never against it.
@@ -2679,8 +2711,7 @@ impl Inner {
         let (id, step_pages, orphans) = {
             let mut st = self.lock();
             st.mech(set)?;
-            self.measure(&mut st);
-            let _admission = self.refresh(&mut st)?;
+            let _admission = self.rows(&mut st)?;
             if Self::advance(&mut st, req, set)? {
                 let budget = st.table.budget();
                 if let Some(s) = st.step_stats(req) {
@@ -2700,7 +2731,7 @@ impl Inner {
             self.adopt(step_pages, Some(req))?;
         }
         if !self.state.lock().table.request(req).is_some_and(|r| r.idle) {
-            self.coreside(req)?;
+            self.coreside(req, false)?;
             self.unkeep(req);
         }
         self.prefetch(req);
@@ -2711,7 +2742,6 @@ impl Inner {
     /// holds now go into the request's record.
     fn end_pass(&self, req: u64, pass: u64, peak: u64) -> Result<()> {
         let mut st = self.lock();
-        self.measure(&mut st);
         self.physical(&mut st);
         st.active.retain(|(r, _), a| !(*r == req && a.id == pass));
         let compute = st.table.segments.max(peak);
@@ -3516,7 +3546,7 @@ impl Inner {
             self.publish(&mut st);
             self.unlock(st);
         }
-        self.coreside(req)
+        self.coreside(req, false)
     }
 }
 

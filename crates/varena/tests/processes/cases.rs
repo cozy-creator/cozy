@@ -534,8 +534,13 @@ fn a_panic_fails_the_request_not_the_process(dir: &Path) {
     a.ok(&format!("open {} {}", g.uuid, g.memory));
     a.ok(&format!("load p {} stored ram", path.display()));
     a.ok("request r1 p");
+    a.ok("pass r1 p 1x1");
+    a.ok("bind p 0");
+    a.ok("bind p 1");
+    a.ok("unpin");
+    // make_room beyond the free bytes decides what to take.
     a.ok("fault decide");
-    assert_eq!(a.raw("pass r1 p 1x1"), "err INTERNAL");
+    assert_eq!(a.raw(&format!("room {}", 8 * MB)), "err INTERNAL");
     assert!(a.ok("end r1").starts_with("leftover=0"));
     a.ok("request r2 p");
     a.ok("pass r2 p 1x1");
