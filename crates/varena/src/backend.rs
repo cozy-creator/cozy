@@ -43,6 +43,9 @@ pub enum Access {
     Read,
 }
 
+/// The reserve every GPU keeps free beyond its driver's measured use (design rev 6).
+pub const RESERVE: u64 = 512 << 20;
+
 /// The code [`Backend::create`] fails with when the device has no memory for the page
 /// (`CUDA_ERROR_OUT_OF_MEMORY`; the host backend answers the same at its limit).
 pub const OUT_OF_MEMORY: i32 = 2;
@@ -51,10 +54,10 @@ pub const OUT_OF_MEMORY: i32 = 2;
 pub trait Backend: Send + Sync {
     /// The device's total bytes (the card, or a host device's limit).
     fn capacity(&self) -> u64;
-    /// Bytes the driver needs free at all times (its lazy kernel loads, cr-215): never leased,
-    /// never filled, in any mode.
+    /// Bytes kept free beyond the driver's own measured use (its lazy kernel loads, cr-215): a
+    /// fixed reserve per GPU, never leased, never filled, in any mode (design rev 6).
     fn headroom(&self) -> u64 {
-        crate::table::headroom(self.capacity())
+        RESERVE
     }
     /// Free bytes as the driver measures them now. Only foreign bytes derive from it (the
     /// device's used bytes less every row's); placement never sizes from it.

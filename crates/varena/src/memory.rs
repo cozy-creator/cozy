@@ -980,6 +980,8 @@ impl Memory {
                 if self.inner.lease.set(agent).is_err() {
                     return Err(Error::Invalid("this Memory is leased already".into()));
                 }
+                // torch's blocks come from leased chunks too: the agent is its only allocator.
+                self.serve_leased_torch()?;
                 Ok(None)
             }
             crate::lease::Attach::Refused { code: code @ (crate::lease::Refusal::Incompatible | crate::lease::Refusal::Absent), why } => Ok(Some((code, why))),
@@ -1652,6 +1654,12 @@ impl Inner {
     /// created (an imported page is not charged to the importer's process); torch's own pool
     /// outside the hook counts here.
     fn measure(&self, st: &mut State) {
+        // Leased, NVML may charge the chunks to their creator: the context is the open's
+        // measured one, never NVML pid − created.
+        if self.leasing() {
+            st.table.context = self.backend.opened_context();
+            return;
+        }
         st.table.context = match self.backend.process_used() {
             Ok(used) => {
                 let created: u64 = st.homes.values().filter(|h| h.origin != Origin::Kept).filter_map(|h| h.phys.as_ref()).map(|p| p.len).sum::<u64>()
@@ -3450,6 +3458,7 @@ impl Request {
     pub fn pass(&self, set: SetId, key: &str) -> Result<Pass> {
         let _ = key;
         let id = self.inner.guard(|| self.inner.pass(self.id, set.0))?;
+        self.inner.torch_pass(self.id);
         Ok(Pass { inner: self.inner.clone().into(), req: self.id, set: set.0, id })
     }
 
@@ -3550,6 +3559,8 @@ impl Pass {
     /// Ends the pass: `peak`, the most the execution layer saw it allocate, goes into the
     /// request's record (its dispatch key's peak at the request's end).
     pub fn end(self, peak: u64) {
+        // The pass's torch peak is varena's own when torch allocates from it.
+        let peak = peak.max(self.inner.torch_peak(self.req));
         let _ = self.inner.guard(|| self.inner.end_pass(self.req, self.id, peak));
     }
 }
@@ -3953,6 +3964,9 @@ impl Inner {
         if asked.is_empty() {
             return;
         }
+        // torch's chunks the manager asked back, given by the arena when idle and quiet (no
+        // state lock held: R10).
+        self.revoke_torch(&asked);
         let keys: Vec<(crate::lease::Ticket, Key)> = self.leased.lock().values().filter(|(t, ..)| asked.contains(t)).map(|(t, k, _)| (*t, *k)).collect();
         let mut st = self.lock();
         for (ticket, key) in keys {
