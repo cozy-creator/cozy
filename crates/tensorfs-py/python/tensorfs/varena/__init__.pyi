@@ -10,7 +10,7 @@ libcuda.
 """
 
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Literal
 
 from .._ext import Checkpoint
@@ -288,11 +288,13 @@ class Gpu:
         """Frees up to `nbytes` in the order `serve` answers asks, and returns what each gave:
         idle chunks and slots under `""`, then each weight set by name. Sets that gave nothing
         are left out."""
-    def serve(self, row: Row) -> None:
-        """Answers other processes' asks of `row` from now on with `give`, on a Rust thread with
-        no Python: idle chunks and slots, then unpinned home pages of sets not busy, idle before
-        warm, least recently bound first. Each answer moves the row's progress, so a long kernel
-        is never a stall. Caches and torch's slack stay the control thread's to shed."""
+    def serve(self, row: Row, spare: Callable[[int], int]) -> None:
+        """Answers other processes' asks of `row` from now on, on a Rust thread. With no request
+        running there (`Row.running`), `spare(want)` (`Memory._answer`) first frees what only
+        that process holds (torch's slack, its caches); then `give` frees idle chunks and
+        unpinned home pages of sets not busy, idle before warm, least recently bound first. A busy
+        process answers from pages alone, never waiting on its interpreter. Each answer moves the
+        row's progress, so a long kernel is never a stall."""
     def step(self) -> None:
         """Ends a step: each set's `step` counters become its `last`."""
     def stats(self) -> GpuStats: ...
@@ -514,7 +516,6 @@ class Ledger:
     def admit(self, need: int) -> Admit: ...
     def reap(self, pid: int) -> int: ...
     def returned(self, pid: int) -> None: ...
-    def stalled(self) -> list[int]: ...
     def snapshot(self) -> list[RowFacts]: ...
     def freed(self) -> None:
         """Bytes freed on this GPU: the free generation moves and TensorD's eventfd is signalled."""
