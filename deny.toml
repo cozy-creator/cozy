@@ -16,9 +16,6 @@ yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: TensorD drops it (xs-067)" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml: replaced (xs-067)" },
-    { id = "RUSTSEC-2026-0367", reason = "zip 7 in TensorD: moving to 9 (xs-067)" },
-    { id = "RUSTSEC-2026-0368", reason = "zip 7 in TensorD: moving to 9 (xs-067)" },
-    { id = "RUSTSEC-2026-0369", reason = "zip 7 in TensorD: moving to 9 (xs-067)" },
 ]
 
 [licenses]
@@ -70,7 +67,6 @@ skip = [
     { crate = "thiserror-impl@1.0.69", reason = "thiserror 1" },
     { crate = "untrusted@0.7.1", reason = "aws-lc-rs" },
     { crate = "windows-sys@0.52.0", reason = "older Windows crates" },
-    { crate = "zip@7.4.0", reason = "tensord; vulnerable, moving to 9" },
 ]
 allow = [
     # The workspace.
