@@ -433,11 +433,11 @@ impl PyMemory {
         detached(py, &self.gpu.uuid, || lease(self.memory(), ns, &self.gpu.uuid))
     }
 
-    /// Serves torch's allocations here, before any is made: from the chunks this Memory leases
-    /// (`leased`, after `lease` returned None), else standalone from the device's own free
-    /// bytes less twice the driver headroom (no compatible manager, or none asked for).
-    fn serve_torch(&self, py: Python<'_>, leased: bool) -> PyResult<()> {
-        detached(py, &self.gpu.uuid, || serve_torch(self.memory(), leased))
+    /// Serves torch's allocations standalone, before any is made: from the device's own free
+    /// bytes less twice the driver headroom (no compatible manager, or none asked for). A leased
+    /// Memory's are served by its lease.
+    fn serve_standalone(&self, py: Python<'_>) -> PyResult<()> {
+        detached(py, &self.gpu.uuid, || self.memory().serve_standalone_torch().map(drop))
     }
 
     /// Host pages of `gpu.memory` bytes (CPU, MPS), on the table `gpu.uuid` names.
@@ -582,16 +582,6 @@ impl Drop for PyRetained {
 }
 
 // ---------------------------------------------------------------- requests and passes
-
-fn serve_torch(memory: &Memory, leased: bool) -> varena::Result<()> {
-    #[cfg(unix)]
-    if leased {
-        return memory.serve_leased_torch().map(drop);
-    }
-    #[cfg(not(unix))]
-    let _ = leased;
-    memory.serve_standalone_torch().map(drop)
-}
 
 #[cfg(unix)]
 fn lease(memory: &Memory, ns: u32, uuid: &str) -> varena::Result<Option<(String, String)>> {

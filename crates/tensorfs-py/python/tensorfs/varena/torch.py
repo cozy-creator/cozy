@@ -522,8 +522,9 @@ class Memory:
                 memory = cls(native, device)
                 if device.type == "cuda":
                     if leases is not None:
-                        memory.standalone = _lease(native, leases)
-                    native.serve_torch(leases is not None and memory.standalone is None)
+                        memory.standalone = _lease(native, leases)  # leased: torch is served from its grants
+                    if leases is None or memory.standalone is not None:
+                        native.serve_standalone()
                     _install()
                     _serving[device.index or 0] = memory
                 _memories[key] = memory

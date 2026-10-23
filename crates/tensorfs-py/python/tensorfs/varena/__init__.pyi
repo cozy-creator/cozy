@@ -166,9 +166,9 @@ class Memory:
         """varena's figures for torch's blocks: (allocated, mapped, peak, fragmentation (mapped
         less live), per open request (id, allocated, peak), per pool (pool, mapped, allocated))."""
 
-    def serve_torch(self, leased: bool) -> None:
-        """Serves torch's allocations here, before any: from the leased chunks (`leased`), else
-        standalone from the device's free bytes less twice the driver headroom."""
+    def serve_standalone(self) -> None:
+        """Serves torch's allocations standalone, before any: from the device's free bytes less
+        twice the driver headroom. A leased Memory's are served by its lease."""
 
     def region(self, owner: str, kind: str, sets: Sequence[int] = (), spill: bool = True) -> Region:
         """A long-lived intermediate's region: kind kv, latent, conditioning, derived or workspace."""
