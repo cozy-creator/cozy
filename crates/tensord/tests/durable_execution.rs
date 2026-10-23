@@ -174,8 +174,8 @@ fn an_executor_that_ends_mid_call_fails_its_run_once() {
 /// or GPU work for longer than the floor (run 13543, a script blocked for 3.3 h, held its
 /// rental). Computing is not progress (cl-648): a silent CPU-bound call fails too, and one that
 /// tells the share of its work done, as a compile or quantize does, ends on its own past that
-/// floor, as one printing does. Production sampling: the floor is 30 s, so this takes about three
-/// minutes.
+/// floor, as one printing does, and as one whose Runtime tells the work it does for it (an LM's
+/// decode steps). Production sampling: the floor is 30 s, so this takes about four minutes.
 #[test]
 fn a_run_that_shows_no_progress_fails_and_slow_working_runs_do_not() {
     let machine = Machine::open();
@@ -193,6 +193,8 @@ fn a_run_that_shows_no_progress_fails_and_slow_working_runs_do_not() {
     assert_eq!(printing.state, State::Completed, "{printing:?}");
     let computing = machine.run("burn", "burn", json!({"seconds": 40.0}));
     assert_eq!(computing.state, State::Completed, "{computing:?}");
+    let working = machine.run("work", "runtime_work", json!({"seconds": 40.0}));
+    assert_eq!(working.state, State::Completed, "{working:?}");
 }
 
 /// A cancel needs an actor, stops the call at its next safe point, and keeps the progress it

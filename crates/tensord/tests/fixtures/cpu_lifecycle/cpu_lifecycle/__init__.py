@@ -9,6 +9,7 @@ import time
 import msgspec
 
 from cozy_runtime.author import App, Context, Telemetry
+from cozy_runtime.internal import work
 
 app = App()
 
@@ -62,6 +63,17 @@ def burn(payload: Steps, ctx: Context, tel: Telemetry) -> Done:
         if not payload.silent and now - told >= 1.0:
             tel.progress((now - start) / payload.seconds, stage="computing")
             told = now
+    return Done(0)
+
+
+@app.entrypoint
+def runtime_work(payload: Steps, ctx: Context) -> Done:
+    """A phase of the Runtime's own (an LM's decode steps, graph replays) for `seconds`, with no
+    step, frame or line of its own: the Runtime tells its machine the work it does (cl-648)."""
+    end = time.monotonic() + payload.seconds
+    while time.monotonic() < end:
+        work.done += 1
+        time.sleep(0.25)
     return Done(0)
 
 
