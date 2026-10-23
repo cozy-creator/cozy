@@ -1,5 +1,5 @@
-//! `cozy machine`: this computer's machine, machines rented on any Hub, and other computers' machines
-//! added by address. Every machine is reached through Calcifer.
+//! `cozy machine`: this computer's machine (`local`, started when used), machines rented on any
+//! Hub, and other computers' machines added by address. Every machine is reached through Calcifer.
 use std::process::ExitCode;
 
 use clap::Subcommand;
@@ -103,10 +103,6 @@ enum Verb {
         #[arg(long)]
         fingerprint: Digest,
     },
-    /// Make this computer a machine.
-    Enable,
-    /// Stop this computer's machine.
-    Disable,
     /// On this computer: let the controller with this public key use this machine.
     Authorize { public_key: String },
 }
@@ -144,9 +140,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Verb::Toolchain {
             verb: ToolchainVerb::Install { on },
         } => end::toolchain(ctx, &on).await,
-        Verb::Enable => local::enable(ctx).await,
-        Verb::Disable => local::disable(ctx).await,
-        Verb::Authorize { public_key } => local::authorize(ctx, &public_key),
+        Verb::Authorize { public_key } => local::authorize(ctx, &public_key).await,
     }
 }
 

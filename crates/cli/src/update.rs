@@ -1,5 +1,5 @@
-//! `cozy update [VERSION]` (design §5): replaces this binary with a release's, restarts Calcifer on it and
-//! asks the local machine to update. The release's dist-manifest.json names this target's archive and its
+//! `cozy update [VERSION]` (design §5): replaces this binary with a release's and restarts Calcifer on
+//! it; the local machine moves to it once idle. The release's dist-manifest.json names this target's archive and its
 //! sha256; the release also carries the archive's GitHub attestations (`<archive>.sigstore.jsonl`, one
 //! Sigstore bundle per line), and one must verify as this repo's release workflow, pinned by GitHub
 //! repository id so a rename keeps verifying and a repo that takes an old name never does.
@@ -197,7 +197,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             });
         }
     };
-    let machine = crate::machine::adopt(ctx, &version).await;
+    let machine = crate::machine::adopt(ctx)?;
     let updated = Updated {
         from: current,
         to: version,
@@ -208,7 +208,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         calcifer,
         machine,
     };
-    let kept = matches!(updated.machine, Adopted::Kept { .. });
     if ctx.json {
         println!(
             "{}",
@@ -228,11 +227,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         println!("  calcifer: {}", step(&updated.calcifer));
         println!("  machine: {}", adopted(&updated.machine));
     }
-    Ok(if kept {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Keeps the binary being replaced beside it as `.cozy-previous`, a machine's rollback when the
@@ -393,18 +388,10 @@ fn newer(version: &str, current: &str) -> bool {
     }
 }
 
-fn adopted(adopted: &Adopted) -> String {
+fn adopted(adopted: &Adopted) -> &'static str {
     match adopted {
-        Adopted::NotEnabled => "not enabled".into(),
-        Adopted::NotRunning => "not running; it starts on the new binary".into(),
-        Adopted::Restarted { version } => format!("restarted on {version}"),
-        Adopted::Waits { runs, run } => {
-            format!("waits for its {runs} runs; restarts when idle (`cozy run watch {run}`)")
-        }
-        Adopted::Kept { code, message, run } => match run {
-            Some(run) => format!("{code}: {message} (`cozy run show {run}`)"),
-            None => format!("{code}: {message}"),
-        },
+        Adopted::NotRunning => "not running; it starts on the new binary when used",
+        Adopted::MovesWhenIdle => "running; it moves to the new binary once idle",
     }
 }
 

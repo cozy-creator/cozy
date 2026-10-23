@@ -91,19 +91,23 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         confirm()?;
     }
 
-    machine::end(ctx, &root)?;
+    // Calcifer first: it would start the machine again for a run that needs it.
     if let Some((calcifer, _)) = calcifer {
         let tree = calcifer.holder().map_or(vec![], |h| process::tree(h.pid));
         calcifer.stop().await?;
         process::end_tree(&tree)
             .map_err(|e| Error::new(Kind::Unavailable, "calcifer_stop_failed", e.to_string()))?;
     }
+    // An earlier `cozy machine enable`'s service too, before its machine ends: it would restart it.
     let services = Services::new(&ctx.home, &ctx.user_home);
     if services.available() {
-        services
-            .uninstall("calcifer")
-            .map_err(|e| Error::new(Kind::Unavailable, "calcifer_stop_failed", e.to_string()))?;
+        for name in ["calcifer", "machine"] {
+            services
+                .uninstall(name)
+                .map_err(|e| Error::new(Kind::Unavailable, "calcifer_stop_failed", e.to_string()))?;
+        }
     }
+    machine::end(&root)?;
     for file in &rc {
         if let Some(text) = unsourced(file) {
             match file.ends_with("cozy.env.fish") && text.trim().is_empty() {

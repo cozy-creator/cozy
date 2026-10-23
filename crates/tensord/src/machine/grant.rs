@@ -1,4 +1,4 @@
-//! The machine's launch grant: what a Hub (rental) or this computer's home (persistent) gives
+//! The machine's launch grant: what a Hub (rental) or this computer's home (local) gives
 //! it, judged once from [`crate::config`]'s load.
 use protocol::config::MachineConfig;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -15,8 +15,8 @@ use std::{
 pub enum Lifetime {
     /// A provider allocation: Hub lease of keys, readiness receipt, idle release.
     Rental,
-    /// This computer's machine: no Hub lifecycle.
-    Persistent,
+    /// This computer's machine: no Hub lifecycle; it exits after its idle window.
+    Local,
 }
 
 /// One Hub's worker registration of this machine.
@@ -49,7 +49,8 @@ pub struct Grant {
     /// The pod's own provider credential, which ends it when the Hub cannot. Never read from the
     /// environment here: [`super::provider::ProviderSelf::take`] keeps it from everything else.
     pub provider: Option<super::provider::ProviderSelf>,
-    /// How long a rental stays with no job before it releases itself (15 minutes).
+    /// How long the machine stays with no job before it releases itself (a rental) or exits
+    /// (this computer's): 15 minutes.
     pub idle_ms: i64,
     /// The user's cozy home, whose `keys/` this machine admits too.
     pub home: Home,
@@ -119,7 +120,7 @@ impl Grant {
         }
         let webrtc_port = raw.webrtc_port.filter(|p| *p > 0);
         let hub = match lifetime {
-            Lifetime::Persistent => None,
+            Lifetime::Local => None,
             Lifetime::Rental => {
                 let token = raw.worker_token.as_ref().map(|t| t.expose()).unwrap_or_default();
                 if URL_SAFE_NO_PAD.decode(token).map(|t| t.len()) != Ok(32) {
@@ -164,10 +165,10 @@ impl Grant {
             (None, false) => Some(tensorfs::home::resolve(None).map_err(|e| invalid(&e.to_string()))?),
             (named, _) => named.clone(),
         };
-        let idle_ms = match raw.rental_idle_seconds {
+        let idle_ms = match raw.idle_seconds {
             None => super::lifecycle::IDLE_GRACE_MS,
             Some(seconds) if seconds > 0 => i64::from(seconds) * 1000,
-            Some(_) => return Err(invalid("rental_idle_seconds must be a positive number of seconds")),
+            Some(_) => return Err(invalid("idle_seconds must be a positive number of seconds")),
         };
         Ok(Self {
             lifetime,
@@ -194,7 +195,7 @@ impl Grant {
         let admitted = move || Ok([named.clone(), home_keys(&home)?].concat());
         match self.lifetime {
             Lifetime::Rental => admitted().map(crate::api::auth::Keys::fixed),
-            Lifetime::Persistent => crate::api::auth::Keys::read(admitted),
+            Lifetime::Local => crate::api::auth::Keys::read(admitted),
         }
     }
 }
@@ -213,18 +214,25 @@ pub fn home_keys(home: &Home) -> io::Result<Vec<VerifyingKey>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
         Err(e) => return Err(e),
     };
-    match fs::read_to_string(home.keys().join("authorized")) {
-        Ok(text) => {
-            for line in text.lines().map(|l| l.split('#').next().unwrap_or_default().trim()) {
-                if !line.is_empty() {
-                    keys.push(public_key(line)?);
-                }
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-        Err(e) => return Err(e),
-    }
+    keys.extend(authorized_keys(home)?);
     Ok(keys)
+}
+
+/// The keys of `keys/authorized`: other computers' controllers.
+fn authorized_keys(home: &Home) -> io::Result<Vec<VerifyingKey>> {
+    let text = match fs::read_to_string(home.keys().join("authorized")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    let lines = text.lines().map(|l| l.split('#').next().unwrap_or_default().trim());
+    lines.filter(|line| !line.is_empty()).map(public_key).collect()
+}
+
+/// Whether another computer's controller is authorized to use this computer's machine, which
+/// then stays up when idle. An unreadable file authorizes nobody.
+pub fn authorized(home: &Home) -> bool {
+    authorized_keys(home).is_ok_and(|keys| !keys.is_empty())
 }
 
 fn public_key(spelled: &str) -> io::Result<VerifyingKey> {

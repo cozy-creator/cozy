@@ -52,6 +52,14 @@ impl Home {
         self.root.join("installed")
     }
 
+    /// The installed `cozy` as a file that is there: the one `installed` records, else the
+    /// installer's `binary`.
+    pub fn launcher(&self) -> Option<PathBuf> {
+        let recorded = std::fs::read_to_string(self.installed()).ok();
+        let recorded = recorded.map(|text| PathBuf::from(text.trim_end()));
+        recorded.into_iter().chain([self.binary()]).find(|path| path.is_file())
+    }
+
     pub fn config(&self) -> PathBuf {
         self.root.join("config.toml")
     }

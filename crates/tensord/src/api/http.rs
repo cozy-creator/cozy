@@ -302,7 +302,7 @@ struct After {
 }
 
 /// `GET /v1/runs/{id}/events`: the run's log as SSE after `Last-Event-ID` (or `?after=`), its
-/// snapshot first. Closing it never cancels; it holds no admission.
+/// snapshot first. Closing it never cancels; it holds no admission, only the idle clock.
 async fn events<B: MachineBackend>(
     State(m): State<Machine<B>>,
     Path(id): Path<String>,
@@ -317,11 +317,21 @@ async fn events<B: MachineBackend>(
     if m.call(move |backend| super::machine_update::owns(&identity, backend, actor, &owned)).await? {
         caller.machine()?;
         let events = super::machine_update::events(m.identity.clone(), id, after).await?;
-        return Ok(sse(m.authority(&caller), events.map(|e| e.and_then(|e| run_event(&e)))));
+        let events = followed(&m.identity, events.map(|e| e.and_then(|e| run_event(&e))));
+        return Ok(sse(m.authority(&caller), events));
     }
     let events = super::machine_runs::follow(m.backend.clone(), caller.actor, id, after, caller.limit()).await?;
     let events = tokio_stream::wrappers::ReceiverStream::new(events);
-    Ok(sse(m.authority(&caller), events.map(|e| e.and_then(|e| run_event(&e)))))
+    Ok(sse(m.authority(&caller), followed(&m.identity, events.map(|e| e.and_then(|e| run_event(&e))))))
+}
+
+/// `events` holding the machine's idle clock while a client follows them.
+fn followed<S: Stream + Send + 'static>(identity: &MachineIdentity, events: S) -> impl Stream<Item = S::Item> + Send + 'static {
+    let held = identity.lifecycle.as_ref().map(|lifecycle| lifecycle.follow());
+    events.map(move |event| {
+        let _held = &held;
+        event
+    })
 }
 
 /// A run event as SSE: named by its variant, its sequence as the id when it is durable.
@@ -563,7 +573,7 @@ async fn log<B: MachineBackend>(
         }
         Err(e) => Err(unreadable(e)),
     });
-    Ok(sse(m.authority(&caller), lines))
+    Ok(sse(m.authority(&caller), followed(&m.identity, lines)))
 }
 
 fn runs_of<B: MachineBackend>(m: &Machine<B>) -> Result<Arc<crate::runs::Runs>, Error> {

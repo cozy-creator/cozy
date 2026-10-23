@@ -1054,9 +1054,19 @@ impl Pool {
     /// installed generation read. One in a call ends with the call's tenancy, as any idle
     /// executor does.
     pub fn end_generation(&self, identity: &str) {
+        self.end_idle_of(|generation| generation == identity);
+    }
+    /// This computer's machine idle a while: every idle executor and import-only parent ends, so
+    /// their leases, CUDA contexts and RAM go back (a GPU's manager then closes its own context).
+    /// Warm sets stay declared: the next call's pass brings them back.
+    pub fn release_idle(&self) {
+        self.end_idle_of(|_| true);
+    }
+    /// Every idle executor and import-only parent of the generations `which` names ends.
+    fn end_idle_of(&self, which: impl Fn(&str) -> bool) {
         let lanes: Vec<(String, usize, u32)> = {
             let sessions = self.sessions.lock().unwrap();
-            let idle = sessions.values().filter(|s| s.generation == identity);
+            let idle = sessions.values().filter(|s| which(&s.generation));
             idle.map(|s| (s.plan.clone(), s.start, s.degree)).collect()
         };
         for (plan, start, degree) in lanes {
@@ -1066,12 +1076,12 @@ impl Pool {
             self.end_session(&session_key(&plan, start));
             drop(permit);
         }
-        while self.end_idle_deviceless(|session| session.generation == identity) {}
+        while self.end_idle_deviceless(|session| which(&session.generation)) {}
         let parents: Vec<Arc<Zygote>> = {
             let mut zygotes = self.zygotes.lock().unwrap();
             let ended: Vec<App> = zygotes
                 .iter()
-                .filter(|((generation, _), zygote)| generation == identity && zygote.childless())
+                .filter(|((generation, _), zygote)| which(generation) && zygote.childless())
                 .map(|(key, _)| key.clone())
                 .collect();
             ended.into_iter().filter_map(|key| zygotes.remove(&key)).collect()

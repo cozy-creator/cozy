@@ -189,6 +189,15 @@ impl Calcifer {
                     continue;
                 }
             };
+            // Outputs left on this computer's machine after it exited idle: it starts for them.
+            if run.machine.as_deref() == Some("local")
+                && let Some(machines) = self.machines()
+                && let Err(e) = machines.local_up().await
+            {
+                warn!(run = %id, "exporting its outputs: {}", e.message);
+                pause.wait(wake, None).await;
+                continue;
+            }
             let mut changed = None;
             let exported = match self.reach(&run, &mut changed) {
                 Ok(link) => {

@@ -77,7 +77,17 @@ candidates() {
   machine_ready
 }
 
-# The local machine is up and reports itself; its record lands in $OUT/machine.json.
+# The local machine ends, as its idle exit ends it: the holder of its root's lock. The next use starts it.
+machine_stop() {
+  local pid
+  pid=$(grep -o '"pid": *[0-9]*' "$HOME/.cozy/machine/var/lib/cozy/machine/agent.lock.holder" | grep -o '[0-9]*$') || return 1
+  if [ "$RUNNER_OS" = Windows ]; then taskkill //F //T //PID "$pid"; else kill "$pid"; fi
+  for _ in $(seq 60); do kill -0 "$pid" 2>/dev/null || return 0; sleep 1; done
+  return 1
+}
+
+# The local machine is up and reports itself (`machine show local` starts it); its record lands in
+# $OUT/machine.json.
 machine_ready() {
   for _ in $(seq 120); do
     cozy --json machine show local > "$OUT/machine.json" 2>/dev/null && grep -q '"state": *"ready"' "$OUT/machine.json" && return 0

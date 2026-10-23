@@ -238,7 +238,9 @@ pub(crate) async fn follow(
         }
         match machine.state {
             // Unknown: a newer Calcifer's word, shown as it is.
-            MachineState::Ready | MachineState::Unknown => return Ok(Some(machine)),
+            MachineState::Ready | MachineState::Stopped | MachineState::Unknown => {
+                return Ok(Some(machine));
+            }
             MachineState::Booting => {
                 let line = state_cell(&machine);
                 if line != said {

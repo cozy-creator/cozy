@@ -1,6 +1,6 @@
 # Architecture
 
-TensorD (executable `tensord`) is the persistent Rust daemon that owns the API, execution journal,
+TensorD (executable `tensord`) is the Rust daemon that owns the API, execution journal,
 node scheduling and executor supervision. Package code runs in Python executors (cozy-runtime)
 inside each package environment. TensorFS is a library embedded in TensorD and used inside
 Runtime; it is not a separate daemon. TensorD has no CUDA context: executors own device
@@ -96,7 +96,7 @@ code is still not sandboxed.
 | `runs.rs` | Run sources and preparation inside a run: accepted at once, install/download as its progress, its bearer kept as the owner's newest (`hub::Bearer`). A warm run with no entrypoint installs and fetches its choices; one with no code makes provider sources and uploads to its weights destination | `Runs`, `Spec`, `Source` | D1 |
 | `objects.rs` | Uploaded objects: byte ranges in any order, resumable, verified once whole into the store, per signer | `Objects`, `Upload` | D1 |
 | `local_source.rs` | A run's local source: each remote manifest owns its source tree and editable environment; explicit local paths read the directory in place | `LocalSources`, `Manifest` | D1 |
-| `machine/` | Launch grant, lifetime identity, readiness receipt, rental lifecycle, supervision, SSH, runtime update, the direct player endpoint (`player.rs`), the embedded Python client and installer helper (`client.rs`) | `Grant`, `Readiness`, `Lifecycle` | D2 |
+| `machine/` | Launch grant, lifetime identity, readiness receipt, idle lifecycle (a rental's release, this computer's exit), supervision, SSH, runtime update, the direct player endpoint (`player.rs`), the embedded Python client and installer helper (`client.rs`) | `Grant`, `Readiness`, `Lifecycle` | D2 |
 | `native_inputs.rs` | Native input custody into TensorFS + journal | `SourceIntake`, `IntakeJournal` | D1 |
 | `catalog.rs` | Immutable package environment generations and their holds | `Catalog`, `Generation`, `HeldGeneration` | D1 |
 | `service.rs` | Sole dispatch policy (CPU parallelism, one GPU slot, startup GPU fences) | `Service` | B2 |

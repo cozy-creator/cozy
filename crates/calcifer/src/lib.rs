@@ -13,6 +13,7 @@ pub mod api;
 mod kept;
 mod lanes;
 pub mod link;
+mod local;
 pub mod machines;
 pub mod outputs;
 pub mod play;
@@ -549,6 +550,24 @@ impl Calcifer {
                 wake.notified().await;
                 continue;
             };
+            // This computer's machine starts when a run needs it; a run it was never sent fails
+            // when it cannot start, saying why.
+            if name == "local"
+                && let Some(machines) = self.machines()
+                && let Err(e) = machines.local_up().await
+            {
+                if run.state != State::Queued {
+                    self.waiting(id, format!("local cannot start: {}", e.message));
+                    pause.wait(wake, None).await;
+                } else {
+                    let reason = Reason { code: e.code, message: e.message, ..Default::default() };
+                    match self.store.fail(id.as_str(), reason) {
+                        Ok(events) => self.publish(id, events),
+                        Err(e) => warn!(run = %id, "{e}"),
+                    }
+                }
+                continue;
+            }
             let (machine, link, mut changed, sending) = match self.machine(&name) {
                 Ok(found) => found,
                 Err(message) => {
@@ -628,6 +647,11 @@ impl Calcifer {
                     Ok(events) => self.publish(id, events),
                     Err(e) => warn!(run = %id, "{e}"),
                 },
+                // This computer's machine exiting idle as the run came: it starts again.
+                Err(Stop::Released(message)) if name == "local" => {
+                    self.waiting(id, format!("local is restarting: {message}"));
+                    pause.wait(wake, Some(&mut changed)).await;
+                }
                 Err(Stop::Released(message)) => {
                     if let Err(e) = self.machine_ended(&name, &message) {
                         warn!(run = %id, "{e}");

@@ -456,6 +456,8 @@ pub enum MachineState {
     /// Its end is asked of its Hub, which has not yet affirmed it.
     Ending,
     Ended,
+    /// `local` is not running: it starts when something uses it.
+    Stopped,
     /// A state this reader does not know (a newer Calcifer's): shown as unknown, never refused.
     #[serde(other)]
     Unknown,
@@ -580,8 +582,8 @@ pub struct MachineStatus {
     #[serde(default)]
     pub tensorfs: String,
     pub started_at_ms: i64,
-    /// When a rental releases itself if it stays idle; none while it works or for a machine
-    /// that never releases.
+    /// When a rental releases itself, or this computer's machine exits, if it stays idle; none
+    /// while it works or is kept up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_deadline_ms: Option<i64>,
     #[serde(default)]
@@ -838,8 +840,6 @@ pub enum NewMachine {
         /// `sha256:<hex>` of the machine's TLS leaf.
         fingerprint: Digest,
     },
-    /// This computer's machine, serving from `root` (`cozy machine enable`): recorded as `local`.
-    Local { root: std::path::PathBuf },
 }
 
 /// `GET /v1/machines/{name}/logs/{log}`: the logs a machine keeps.

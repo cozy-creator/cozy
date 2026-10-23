@@ -88,7 +88,7 @@ pub(super) fn stop(dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn uninstall(_: &Path, name: &str) -> Result<()> {
+pub(super) fn uninstall(_: &Path, name: &str) -> Result<bool> {
     // SAFETY: NUL-terminated wide strings.
     let status = unsafe {
         RegDeleteKeyValueW(
@@ -98,9 +98,14 @@ pub(super) fn uninstall(_: &Path, name: &str) -> Result<()> {
         )
     };
     if status == ERROR_FILE_NOT_FOUND {
-        return Ok(());
+        return Ok(false);
     }
-    registry("delete", status)
+    registry("delete", status).map(|()| true)
+}
+
+/// A detached process leaves its starter's console and job: nothing more is needed.
+pub(super) fn scope(_: &ServiceSpec) -> Option<(PathBuf, Vec<std::ffi::OsString>)> {
+    None
 }
 
 fn record(dir: &Path, name: &str, birth: &Birth) -> Result<()> {
@@ -149,9 +154,4 @@ fn registry(op: &'static str, status: u32) -> Result<()> {
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(iter::once(0)).collect()
-}
-
-/// Only a manager that restarts services can say one failed to start.
-pub(super) fn failed(_: &str) -> bool {
-    false
 }
