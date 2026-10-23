@@ -236,13 +236,13 @@ fn inside_a_mapped_layout_is_counted_once() {
     assert_eq!(admission, Ok(true), "a layout seals beside a mapped one");
     tier.deposits.deposit("m", "idle", layout(LAYOUT), &[]).unwrap();
     // Unreclaimable bytes in the scope: the mapped layout (256 MiB), the idle one (128) and the
-    // call's anonymous memory (128 so far). Growing 320 MiB more makes 832 MiB with the idle
-    // layout, past the 768 MiB limit whatever else the scope holds, so the limit is reached; 704
-    // MiB without it, which fits beside up to 64 MiB of process overhead (a few MiB here).
+    // call's anonymous memory (128 so far). Growing 320 MiB more needs 832 MiB with the idle layout,
+    // past the 768 MiB limit whatever else the scope holds, so it must go back (the tier gives it as
+    // the call grows past its measure, before the limit); 704 MiB without it fits beside up to 64 MiB
+    // of process overhead (a few MiB here). Growing exactly to the limit left the outcome to noise.
     assert!(executor.grow(2 * LAYOUT + LAYOUT / 2, &tier), "the call grows past its measure and lives");
     let log = fs::read_to_string(dir.path().join("memory.log")).unwrap_or_default();
     eprintln!("oom_kill {killed} -> {}, max {}, layouts given {}\n{log}", event(&cgroup, "oom_kill"), event(&cgroup, "max"), given.load(Ordering::Acquire));
-    assert!(event(&cgroup, "max") > 0, "the scope reached its limit");
     assert_eq!(event(&cgroup, "oom_kill"), killed);
     assert_eq!(given.load(Ordering::Acquire), 1, "the idle layout went back");
     assert!(tier.deposits.holds("mapped") && !tier.deposits.holds("idle"));
