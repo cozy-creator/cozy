@@ -541,6 +541,11 @@ impl<T> Lazy<T> {
         User(self.0.clone())
     }
 
+    /// The value while open; never opens it.
+    pub(crate) fn peek(&self) -> Option<Arc<T>> {
+        self.0.state.lock().0.clone()
+    }
+
     /// The value, opened now if no user has it open; a failed open leaves it closed.
     pub(crate) fn enter(&self) -> Result<Entered<T>> {
         let mut state = self.0.state.lock();

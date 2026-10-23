@@ -212,8 +212,6 @@ struct Device {
     granularity: u64,
     /// The reserved pool H, never allocated in any mode (cr-215).
     headroom: u64,
-    /// TensorD's own context, measured at open (the books check's: NVML charges it to us).
-    context: u64,
 }
 
 /// A table's slots: one per smallest chunk the card could hold.
@@ -516,7 +514,7 @@ impl Manager {
         let free = room(&b);
         Holdings {
             capacity: b.created + free,
-            context: b.device.as_ref().map_or(0, |d| d.context),
+            context: b.device.as_ref().map_or(0, |d| d.backend.opened_context()),
             free,
             foreign: b.foreign,
             created: b.created,
@@ -691,7 +689,7 @@ impl Manager {
         }
         let backend = open()?;
         let card = self.limit.unwrap_or(self.gpu_memory).min(backend.capacity());
-        let device = Arc::new(Device { card, granularity: backend.granularity().max(1), headroom: backend.headroom(), context: backend.opened_context(), backend });
+        let device = Arc::new(Device { card, granularity: backend.granularity().max(1), headroom: backend.headroom(), backend });
         let mut b = self.books.lock();
         (b.card, b.reserve) = (device.card, device.headroom);
         b.device = Some(device.clone());
