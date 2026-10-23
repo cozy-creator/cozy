@@ -52,6 +52,7 @@ struct Shared(Arc<Dev>);
 
 impl Backend for Shared {
     fn capacity(&self) -> u64 { self.0.host.capacity() }
+    fn headroom(&self) -> u64 { self.0.host.headroom() }
     fn free(&self) -> varena::Result<u64> { self.0.host.free() }
     fn process_used(&self) -> varena::Result<u64> { self.0.host.process_used() }
     fn opened_context(&self) -> u64 { 0 }
@@ -276,7 +277,8 @@ fn a_graph_drop_racing_a_replay_finishes_its_event() {
 fn room_counts_an_unpinned_region_cold() {
     let (mem, _dev, uuid) = open();
     let empty = mem.room(None);
-    assert!(empty.free > 0 && empty.granularity > 0);
+    assert_eq!(empty.free, 4 << 30, "a host device's free bytes, no reserve");
+    assert!(empty.granularity > 0);
     assert_eq!((empty.cold, empty.warm, empty.floor), (0, 0, 0));
     let region = mem.region("cond", RegionKind::Conditioning, &[], true).unwrap();
     let p = {
