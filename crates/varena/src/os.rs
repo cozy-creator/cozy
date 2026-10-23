@@ -148,6 +148,11 @@ pub(crate) fn peer(stream: &Stream) -> Result<u32> {
     Ok(pid)
 }
 
+/// A page (a lease table, a host chunk) for another process to map read and write, never resize.
+pub(crate) fn lend(page: &Owned) -> Result<Owned> {
+    Ok(platform::memory::lend(page)?)
+}
+
 pub(crate) fn dup(h: &Owned) -> Result<Owned> {
     h.try_clone().map_err(|e| Error::io("dup", e))
 }

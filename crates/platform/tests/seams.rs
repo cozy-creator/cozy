@@ -432,7 +432,9 @@ fn a_page_crosses_to_a_child_and_back() {
     let stream = listener.accept().unwrap();
     assert_eq!(platform::handles::peer(&stream).unwrap().pid, child.id());
     let page = platform::memory::page(PAGE).unwrap();
-    platform::handles::send_fd(&stream, &page).unwrap();
+    platform::handles::accepts_handles(&stream).unwrap();
+    // What a lease table's agent gets: map read and write, never resize.
+    platform::handles::send_fd(&stream, &platform::memory::lend(&page).unwrap()).unwrap();
     ready(child.stdout.take().unwrap());
     let map = platform::memory::map(&page, 0, PAGE as usize, false).unwrap();
     // SAFETY: this mapping, `PAGE` bytes.

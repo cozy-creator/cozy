@@ -68,8 +68,9 @@ pub struct LocalStream {
     closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// How long a read waits before it answers `TimedOut`; 0: for ever.
     read_timeout_ms: std::sync::atomic::AtomicU32,
-    /// The process on the other end, opened once ([`LocalStream::peer_process`]), shared by clones.
-    peer: std::sync::Arc<std::sync::OnceLock<OwnedHandle>>,
+    /// The process on the other end, opened once ([`LocalStream::peer_process`]), and whether
+    /// it was opened for duplication; shared by clones.
+    peer: std::sync::Arc<std::sync::OnceLock<(OwnedHandle, bool)>>,
 }
 
 impl LocalStream {
@@ -81,7 +82,7 @@ impl LocalStream {
         pipe: OwnedHandle,
         side: Side,
         closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        peer: std::sync::Arc<std::sync::OnceLock<OwnedHandle>>,
+        peer: std::sync::Arc<std::sync::OnceLock<(OwnedHandle, bool)>>,
     ) -> io::Result<Self> {
         Ok(Self {
             pipe,
@@ -165,13 +166,14 @@ impl LocalStream {
     pub fn peer_process(&self) -> io::Result<BorrowedHandle<'_>> {
         if self.peer.get().is_none() {
             let pid = self.peer_pid()?;
-            let opened = open_process(pid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
-                .or_else(|error| match error.kind() {
-                    io::ErrorKind::PermissionDenied => {
-                        open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
-                    }
-                    _ => Err(error),
-                })?;
+            let query = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+            let opened = match open_process(pid, PROCESS_DUP_HANDLE | query) {
+                Ok(process) => (process, true),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    (open_process(pid, query)?, false)
+                }
+                Err(error) => return Err(error),
+            };
             let mut waiting = 0u32;
             // SAFETY: a live pipe handle and a writable count; no buffer is read.
             let connected = unsafe {
@@ -195,8 +197,24 @@ impl LocalStream {
         }
         self.peer
             .get()
-            .map(AsHandle::as_handle)
+            .map(|(process, _)| process.as_handle())
             .ok_or_else(|| io::Error::other("the peer's process"))
+    }
+
+    /// Whether a handle can be duplicated into the peer; an error names a process of a higher
+    /// integrity level, which this one can identify but not write into.
+    pub fn peer_accepts_handles(&self) -> io::Result<()> {
+        self.peer_process()?;
+        if self.peer.get().is_some_and(|(_, dup)| *dup) {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "process {} runs at a higher integrity level than this one: it is identified, but no handle can be duplicated into it",
+                self.peer_pid()?
+            ),
+        ))
     }
 
     /// The user the process on the other end runs as: its token's user SID, as text.
@@ -740,6 +758,7 @@ fn token_user(process: HANDLE) -> io::Result<String> {
 /// Duplicates `handle` into the process at the other end of `stream`, through the process
 /// handle the stream keeps (never a pid looked up now); the value it has there.
 pub(crate) fn duplicate_into_peer(stream: &LocalStream, handle: RawHandle) -> io::Result<u64> {
+    stream.peer_accepts_handles()?;
     let process = stream.peer_process()?;
     let mut target: HANDLE = ptr::null_mut();
     // SAFETY: live source and target processes, a live handle and a writable target.

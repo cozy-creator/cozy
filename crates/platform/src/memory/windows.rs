@@ -11,7 +11,7 @@ use windows_sys::Wdk::System::Threading::{NtQueryInformationThread, ThreadSuspen
 use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, STATUS_OBJECT_TYPE_MISMATCH, STILL_ACTIVE, WAIT_ABANDONED_0, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{FileStandardInfo, GetFileInformationByHandleEx, LockFileEx, ReOpenFile, FILE_STANDARD_INFO, UnlockFileEx, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, MapViewOfFile3, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+    CreateFileMappingW, MapViewOfFile, MapViewOfFile3, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, SECTION_QUERY,
     MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -412,6 +412,18 @@ pub fn export(page: &Owned) -> Result<Owned> {
     // SAFETY: duplicating a handle we hold within this process.
     if unsafe { DuplicateHandle(GetCurrentProcess(), raw(page), GetCurrentProcess(), &mut out, FILE_MAP_READ, 0, 0) } == 0 {
         return Err(last("export a page"));
+    }
+    // SAFETY: a handle we just got.
+    Ok(unsafe { Owned::from_raw_handle(out as _) })
+}
+
+/// What another process maps read and write: a duplicate that can query and map the section,
+/// never extend it.
+pub fn lend(page: &Owned) -> Result<Owned> {
+    let mut out: HANDLE = std::ptr::null_mut();
+    // SAFETY: duplicating a handle we hold within this process.
+    if unsafe { DuplicateHandle(GetCurrentProcess(), raw(page), GetCurrentProcess(), &mut out, SECTION_QUERY | FILE_MAP_READ | FILE_MAP_WRITE, 0, 0) } == 0 {
+        return Err(last("lend a page"));
     }
     // SAFETY: a handle we just got.
     Ok(unsafe { Owned::from_raw_handle(out as _) })

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 use platform::handles::Peer;
-use platform::process::{Birth, Exact};
+use platform::process::Exact;
 
 use super::table::{self, Content, State, Table};
 use super::wire::{End, Refusal, Region, ToAgent, ToManager};
@@ -362,9 +362,15 @@ impl Manager {
             let why = if again.is_some() { "re-attach is not served yet".into() } else { format!("lease protocol {protocol}; this manager speaks {PROTOCOL}") };
             return end.send(&ToAgent::Refuse { id: 0, code: Refusal::Incompatible, why }, None);
         }
-        let found = Birth::of(peer.pid).map_err(|e| Error::Io(e.to_string()))?;
+        // The birth of the process handles will be duplicated into (Windows: the one the pipe
+        // keeps open), so a pid reused after the stream was handed on never passes.
+        let found = platform::handles::peer_birth(end.stream()).map_err(|e| Error::Io(e.to_string()))?;
         if found.start_ticks != birth {
             return Err(Error::Invalid(format!("lease Hello for birth {birth} from pid {} (birth {})", peer.pid, found.start_ticks)));
+        }
+        // A peer no handle can reach (Windows: of a higher integrity level) runs standalone.
+        if let Err(error) = platform::handles::accepts_handles(end.stream()) {
+            return end.send(&ToAgent::Refuse { id: 0, code: Refusal::Incompatible, why: error.to_string() }, None);
         }
         let process = Exact::open(&found).map_err(|e| Error::Io(e.to_string()))?.ok_or_else(|| Error::Closed(format!("process {}", peer.pid)))?;
         let slots = u32::try_from(self.limit.unwrap_or(self.gpu_memory) / SLOT_UNIT).unwrap_or(u32::MAX).max(1);
@@ -380,7 +386,7 @@ impl Manager {
             b.executors.insert(id, exec);
             id
         };
-        end.send(&ToAgent::Welcome { epoch }, Some(os::dup(&file)?))?;
+        end.send(&ToAgent::Welcome { epoch }, Some(os::lend(&file)?))?;
         drop(file);
         loop {
             match end.recv::<ToManager>() {

@@ -112,6 +112,12 @@ pub fn peer(stream: &Stream) -> Result<(u32, u32)> {
 
 pub type Stream = std::os::unix::net::UnixStream;
 
+/// What another process maps read and write: another descriptor of the page (sealing, where
+/// the OS has it, keeps its size).
+pub fn lend(page: &Owned) -> Result<Owned> {
+    Ok(page.try_clone()?)
+}
+
 /// Whether the file still has a name.
 pub fn linked(f: &Owned) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
