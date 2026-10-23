@@ -125,6 +125,8 @@ struct Counted {
     unmaps: AtomicUsize,
     /// Every chunk mapped, in order.
     ids: Mutex<Vec<u64>>,
+    /// Unmaps to refuse next, as a still-pinned chunk refuses.
+    refuse: AtomicUsize,
     entered: AtomicBool,
     closed: Mutex<bool>,
     opened: Condvar,
@@ -138,7 +140,7 @@ impl Counted {
 }
 
 impl Source for Counted {
-    fn map(&self, va: Va, kind: Kind) -> varena::Result<Vec<Chunk>> {
+    fn map(&self, va: Va, kind: Kind, into: &mut Vec<Chunk>) -> varena::Result<()> {
         self.entered.store(true, SeqCst);
         let mut closed = self.closed.lock();
         while *closed {
@@ -146,13 +148,19 @@ impl Source for Counted {
         }
         drop(closed);
         self.maps.fetch_add(1, SeqCst);
-        let chunks = self.inner.map(va, kind)?;
-        self.ids.lock().extend(chunks.iter().map(|c| c.id));
-        Ok(chunks)
+        let from = into.len();
+        let mapped = self.inner.map(va, kind, into);
+        self.ids.lock().extend(into.iter().skip(from).map(|c| c.id));
+        mapped
     }
 
-    fn unmap(&self, va: Va, chunks: Vec<Chunk>) {
+    fn unmap(&self, va: Va, chunks: Vec<Chunk>) -> Vec<(u64, Chunk)> {
         self.unmaps.fetch_add(1, SeqCst);
+        if self.refuse.try_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok() {
+            // Still pinned: nothing goes back.
+            let mut at = va.base;
+            return chunks.into_iter().map(|c| { let here = at; at += c.len; (here, c) }).collect();
+        }
         self.inner.unmap(va, chunks)
     }
 }
@@ -166,7 +174,7 @@ struct Rig {
 fn rig(limit: u64, instant: bool) -> Rig {
     let gpu = Gpu::new(limit, instant);
     let backend: Arc<dyn Backend> = gpu.clone();
-    let source = Arc::new(Counted { inner: Direct::new(backend.clone(), limit), maps: AtomicUsize::new(0), unmaps: AtomicUsize::new(0), ids: Mutex::new(Vec::new()), entered: AtomicBool::new(false), closed: Mutex::new(false), opened: Condvar::new() });
+    let source = Arc::new(Counted { inner: Direct::new(backend.clone(), limit), maps: AtomicUsize::new(0), unmaps: AtomicUsize::new(0), ids: Mutex::new(Vec::new()), refuse: AtomicUsize::new(0), entered: AtomicBool::new(false), closed: Mutex::new(false), opened: Condvar::new() });
     let torch = Torch::new(backend, source.clone()).unwrap();
     Rig { gpu, source, torch }
 }
@@ -448,7 +456,7 @@ fn a_shortfall_waits_for_a_grant_and_is_refused_only_at_the_floor() {
     });
     let big = r.torch.alloc(100 * MB, B, None).unwrap();
     lands.join().unwrap();
-    assert_eq!(r.source.unmaps.load(SeqCst), 1, "the idle span went back to the source");
+    assert_eq!(r.torch.idle(), (0, 0), "the idle span went back to the source");
     let refused = r.torch.alloc(30 * MB, B, None);
     match refused {
         Err(varena::Error::Exhausted(e)) => assert!(e.site.as_deref().unwrap_or_default().contains("budget"), "{e:?}"),
@@ -515,7 +523,7 @@ fn a_shortfall_beside_an_open_capture_completes() {
     });
     let big = r.torch.alloc(100 * MB, C, None).unwrap();
     lands.join().unwrap();
-    assert_eq!(r.source.unmaps.load(SeqCst), 1, "A's idle span went back while the capture stayed open");
+    assert_eq!(r.torch.idle(), (0, 0), "A's idle span went back while the capture stayed open");
     end_tx.send(()).unwrap();
     capture.join().unwrap();
     r.torch.free(big, 100 * MB, C);
@@ -551,6 +559,29 @@ fn a_begin_that_threw_is_ended() {
     assert_eq!(r.torch.stats().allocated, 4 * MB, "a free during the dead capture applied");
     r.torch.pool_end(PoolId(9, 1));
     until("torch's reset on another thread ended it", || r.torch.stats().allocated == 0);
+}
+
+/// A chunk the source cannot take back yet (still pinned, or its unmap failed) stays mapped: its
+/// addresses are never handed out again and it stays counted, and the next give-back pass returns
+/// it.
+#[test]
+fn a_chunk_that_cannot_go_back_keeps_its_addresses_until_it_does() {
+    let r = rig(512 * MB, true);
+    let p = r.torch.alloc(40 * MB, A, None).unwrap();
+    r.torch.free(p, 40 * MB, A);
+    until("the span is quiet", || r.torch.idle().0 == 40 * MB);
+    r.source.refuse.store(1, SeqCst);
+    assert_eq!(r.torch.reclaim(u64::MAX), 0, "a refused chunk counted as given back");
+    assert_eq!((r.torch.idle(), r.torch.stats().mapped), ((0, 0), 40 * MB), "the stuck span is no longer mapped in the books");
+    let others: Vec<u64> = (0..3).map(|_| r.torch.alloc(40 * MB, B, None).unwrap()).collect();
+    assert!(others.iter().all(|o| o + 40 * MB <= p || *o >= p + 40 * MB), "a stuck chunk's addresses were handed out: {others:x?} over {p:#x}");
+    assert_eq!(r.torch.stats().mapped, 160 * MB);
+    let unmaps = r.source.unmaps.load(SeqCst);
+    assert_eq!(r.torch.reclaim(0), 40 * MB, "the next give-back pass did not return it");
+    assert!(r.source.unmaps.load(SeqCst) > unmaps);
+    assert_eq!(r.torch.stats().mapped, 120 * MB);
+    assert_eq!(r.torch.reclaim(0), 0, "a returned chunk was retried again");
+    others.iter().for_each(|o| r.torch.free(*o, 40 * MB, B));
 }
 
 /// The manager asks by chunk: exactly the asked idle chunk goes back, its spare split around
@@ -677,7 +708,8 @@ fn a_survivor_is_named_and_its_span_leaves_once_it_frees() {
     assert_eq!(ended.outlived.len(), 1);
     assert_eq!((ended.outlived[0].ptr, ended.outlived[0].stream), (ptr, A));
     assert!(ended.outlived[0].bytes >= size);
-    assert!(r.torch.stats().idle < r.torch.stats().mapped, "the survivor's span left");
+    let s = r.torch.stats();
+    assert!(s.idle < s.mapped, "the survivor's span left");
     r.torch.free(ptr, size, A);
     until("everything mapped is idle", || {
         let s = r.torch.stats();

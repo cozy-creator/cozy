@@ -110,8 +110,8 @@ impl Torch {
             if chunks.is_empty() {
                 continue;
             }
-            sh.source.unmap(Va { base, len }, chunks);
-            sh.mapped.fetch_sub(len.min(sh.mapped.load(Acquire)), AcqRel);
+            // A chunk that cannot go back stays mapped and counted, its range the span's still.
+            sh.unmap(Va { base, len }, chunks, false, true);
             out.spans.push((base, len, out.bytes));
             out.bytes += len;
         }
@@ -140,7 +140,9 @@ impl Torch {
             match sh.map_again(Va { base, len }) {
                 Ok(chunks) => got.push((base, len, off, chunks)),
                 Err(e) => {
-                    got.into_iter().for_each(|(base, len, _, chunks)| sh.source.unmap(Va { base, len }, chunks));
+                    got.into_iter().for_each(|(base, len, _, chunks)| {
+                        sh.unmap(Va { base, len }, chunks, false, false);
+                    });
                     return Err(e);
                 }
             }
@@ -151,7 +153,7 @@ impl Torch {
                 let mut st = a.st.lock();
                 let Some(span) = st.spans.get_mut(&base) else {
                     drop(st);
-                    sh.source.unmap(Va { base, len }, chunks);
+                    sh.unmap(Va { base, len }, chunks, false, false);
                     continue;
                 };
                 span.chunks = chunks;
@@ -245,11 +247,23 @@ impl Shared {
 
     /// The source's chunks for an evicted span's addresses; a short source first gets idle spans back.
     fn map_again(&self, va: Va) -> Result<Vec<Chunk>> {
+        // Never over a chunk that could not go back: it is still mapped there.
+        if self.stuck_in(va) {
+            self.retry_stuck();
+            if self.stuck_in(va) {
+                return Err(Error::Internal(format!("a chunk of the span at {va:?} could not go back: it is not made resident over it")));
+            }
+        }
         loop {
-            match self.source.map(va, Kind::Torch) {
-                Ok(chunks) => return Ok(chunks),
-                Err(e) if matches!(e, Error::Exhausted(_)) && self.give_back() => {}
-                Err(e) => return Err(e),
+            let mut chunks = Vec::new();
+            match self.source.map(va, Kind::Torch, &mut chunks) {
+                Ok(()) => return Ok(chunks),
+                Err(e) => {
+                    self.unmap(va, chunks, false, false);
+                    if !(matches!(e, Error::Exhausted(_)) && self.give_back()) {
+                        return Err(e);
+                    }
+                }
             }
         }
     }
@@ -268,6 +282,6 @@ impl Shared {
         st.free.remove(&(span.stream(), span.tier, span.len, base));
         st.blocks.remove(&base);
         self.dir.write().remove(&base);
-        self.space.lock().give(base, span.len);
+        self.release_va(Va { base, len: span.len });
     }
 }

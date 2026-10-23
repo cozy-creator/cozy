@@ -92,13 +92,17 @@ pub struct Chunk {
 /// standalone budget ([`Direct`]).
 pub trait Source: Send + Sync {
     /// Maps chunks covering `va` (its length a multiple of [`UNIT`]; each chunk at most [`CHUNK`],
-    /// in address order) and returns them. It waits, with no lock of the caller's held, until they
-    /// are granted, and the wait never needs Python: the caller may hold the GIL. It is never called
-    /// on a capturing thread; its driver calls run in relaxed capture mode, since another thread may
-    /// be capturing. It errs only at the floor: `Exhausted` (nothing revocable) or `Closed`.
-    fn map(&self, va: Va, kind: Kind) -> Result<Vec<Chunk>>;
+    /// in address order), pushing each onto `into` once it is mapped: on Err the caller gives back
+    /// what `into` holds. It waits, with no lock of the caller's held, until they are granted, and
+    /// the wait never needs Python: the caller may hold the GIL. It is never called on a capturing
+    /// thread; its driver calls run in relaxed capture mode, since another thread may be
+    /// capturing. It errs only at the floor: `Exhausted` (nothing revocable) or `Closed`.
+    fn map(&self, va: Va, kind: Kind, into: &mut Vec<Chunk>) -> Result<()>;
     /// Unmaps chunks the arenas are done with (whole free, their epochs passed) and gives them back.
-    fn unmap(&self, va: Va, chunks: Vec<Chunk>);
+    /// Returns those it could not take back (still pinned, or an unmap failed), each at its
+    /// address: they stay mapped, the arena keeps their addresses reserved, and it calls again for
+    /// them at its next give-back pass.
+    fn unmap(&self, va: Va, chunks: Vec<Chunk>) -> Vec<(u64, Chunk)>;
     /// A hint: the chunks went whole free (`idle`) or back into use. Atomics only: it is called
     /// under an arena lock.
     fn idle(&self, _chunks: &[Chunk], _idle: bool) {}
@@ -621,6 +625,16 @@ impl Space {
     }
 }
 
+/// A chunk the source could not take back: still mapped at `at`, its address space reserved.
+/// `owned`: that range is the arena's to free at its return (an idle span's); else an evicted
+/// span keeps it. `counted`: `mapped` counts it.
+struct Stuck {
+    at: u64,
+    chunk: Chunk,
+    owned: bool,
+    counted: bool,
+}
+
 /// An open capture: its thread, its pool, its streams (the begin's, then each routed
 /// allocation's), and whether one was seen capturing. torch calls the begin hook before
 /// cudaStreamBeginCapture and makes no allocator call between them, so an unseen capture is
@@ -659,6 +673,8 @@ struct Shared {
     backend: Arc<dyn Backend>,
     source: Arc<dyn Source>,
     space: Mutex<Space>,
+    /// Chunks given back that the source could not take: retried at every give-back pass.
+    stuck: Mutex<Vec<Stuck>>,
     /// Span base → (length, its arena): where a free goes.
     dir: RwLock<BTreeMap<u64, (u64, Arc<Arena>)>>,
     idle: Mutex<Idle>,
@@ -705,6 +721,7 @@ impl Torch {
             backend,
             source,
             space: Mutex::new(space),
+            stuck: Mutex::new(Vec::new()),
             dir: RwLock::new(BTreeMap::new()),
             idle: Mutex::new(Idle::default()),
             arenas: Mutex::new(HashMap::new()),
@@ -870,14 +887,15 @@ impl Torch {
                 want
             };
             let va = sh.reserve(short)?;
-            match sh.source.map(va, Kind::Pool) {
-                Ok(chunks) => {
+            let mut chunks = Vec::new();
+            match sh.source.map(va, Kind::Pool, &mut chunks) {
+                Ok(()) => {
                     sh.mapped.fetch_add(va.len, AcqRel);
                     let mut st = a.st.lock();
                     sh.install(&a, &mut st, va.base, chunks, None, Tier::Pool);
                 }
                 Err(e) => {
-                    sh.space.lock().give(va.base, va.len);
+                    sh.unmap(va, chunks, true, false);
                     if !(matches!(e, Error::Exhausted(_)) && sh.give_back()) {
                         return Err(e);
                     }
@@ -929,8 +947,9 @@ impl Torch {
                 (a.owner, ArenaStats { allocated: st.allocated, peak: st.peak, mapped: st.mapped })
             })
             .collect();
-        let (quiet, pending) = sh.idle.lock().bytes();
+        // Mapped before idle: a give-back between them leaves mapped ≥ idle still.
         let (allocated, mapped) = (sh.allocated.load(Acquire), sh.mapped.load(Acquire));
+        let (quiet, pending) = sh.idle.lock().bytes();
         Stats { allocated, peak: sh.peak.load(Acquire), mapped, idle: quiet + pending, fragmentation: mapped.saturating_sub(allocated), arenas }
     }
 
@@ -957,8 +976,9 @@ impl Torch {
     /// rest of their spares stay idle. The manager asks by chunk: one in use stays pinned by its
     /// source, one whose epoch is pending goes at a later call ([`Source::quiet`]).
     pub fn reclaim_chunks(&self, ids: &[u64]) -> u64 {
+        let retried = self.sh.retry_stuck();
         let given = self.sh.idle.lock().asked(ids);
-        given.into_iter().map(|s| self.sh.give(s)).sum()
+        retried + given.into_iter().map(|s| self.sh.give(s)).sum::<u64>()
     }
 
     /// Idle bytes: (quiet, waiting for their stream's epoch).
@@ -1267,8 +1287,9 @@ impl Shared {
                 return Err(exhausted(size, "a capture is served from mapped free bytes only, and its arena has none that fit (R6)"));
             }
             let va = self.reserve(new)?;
-            match self.source.map(va, if a.pool() { Kind::Pool } else { Kind::Torch }) {
-                Ok(chunks) => {
+            let mut chunks = Vec::new();
+            match self.source.map(va, if a.pool() { Kind::Pool } else { Kind::Torch }, &mut chunks) {
+                Ok(()) => {
                     self.mapped.fetch_add(va.len, AcqRel);
                     let mut st = a.st.lock();
                     self.install(a, &mut st, va.base, chunks, Some(self.clock(stream)), t);
@@ -1277,7 +1298,7 @@ impl Shared {
                     }
                 }
                 Err(e) => {
-                    self.space.lock().give(va.base, va.len);
+                    self.unmap(va, chunks, true, false);
                     if !(matches!(e, Error::Exhausted(_)) && self.give_back()) {
                         return Err(e);
                     }
@@ -1309,17 +1330,77 @@ impl Shared {
     }
 
     fn reclaim(&self, want: u64) -> u64 {
+        let retried = self.retry_stuck();
         let spares = self.idle.lock().quiet(want);
-        spares.into_iter().map(|s| self.give(s)).sum()
+        retried + spares.into_iter().map(|s| self.give(s)).sum::<u64>()
     }
 
-    /// A spare back to the source, its address space freed: its bytes.
+    /// A spare back to the source, its address space freed where it went: the bytes given.
     fn give(&self, s: Spare) -> u64 {
         let len = s.len();
-        self.source.unmap(Va { base: s.base, len }, s.chunks);
-        self.space.lock().give(s.base, len);
-        self.mapped.fetch_sub(len.min(self.mapped.load(Acquire)), AcqRel);
-        len
+        self.unmap(Va { base: s.base, len }, s.chunks, true, true)
+    }
+
+    /// Gives `chunks` (mapped from `va.base` in address order) back to the source; the bytes it
+    /// took. A chunk it could not take stays mapped: its addresses stay reserved, off every free
+    /// list, and the next give-back pass retries it. `owned`: the range's addresses are freed here
+    /// as its chunks go (else an evicted span keeps them); `counted`: `mapped` counts the chunks.
+    pub(crate) fn unmap(&self, va: Va, chunks: Vec<Chunk>, owned: bool, counted: bool) -> u64 {
+        let stuck = if chunks.is_empty() { Vec::new() } else { self.source.unmap(va, chunks) };
+        let mut stuck: Vec<Stuck> = stuck.into_iter().map(|(at, chunk)| Stuck { at, chunk, owned, counted }).collect();
+        stuck.sort_unstable_by_key(|s| s.at);
+        let (mut at, mut given) = (va.base, 0);
+        for s in stuck.iter().map(|s| (s.at, s.chunk.len)).chain(std::iter::once((va.base + va.len, 0))) {
+            if s.0 > at {
+                self.returned(at, s.0 - at, owned, counted);
+                given += s.0 - at;
+            }
+            at = at.max(s.0 + s.1);
+        }
+        if !stuck.is_empty() {
+            tracing::warn!("varena: {} torch chunks at {va:?} could not go back: their addresses stay reserved until a retry returns them", stuck.len());
+            self.stuck.lock().extend(stuck);
+        }
+        given
+    }
+
+    fn returned(&self, at: u64, len: u64, owned: bool, counted: bool) {
+        if owned {
+            self.space.lock().give(at, len);
+        }
+        if counted {
+            self.mapped.fetch_sub(len.min(self.mapped.load(Acquire)), AcqRel);
+        }
+    }
+
+    /// The give-back pass's first step: chunks the source could not take before, again.
+    pub(crate) fn retry_stuck(&self) -> u64 {
+        let stuck = std::mem::take(&mut *self.stuck.lock());
+        stuck.into_iter().map(|s| self.unmap(Va { base: s.at, len: s.chunk.len }, vec![s.chunk], s.owned, s.counted)).sum()
+    }
+
+    /// Whether a chunk that could not go back still lies in `va`.
+    pub(crate) fn stuck_in(&self, va: Va) -> bool {
+        self.stuck.lock().iter().any(|s| s.at < va.base + va.len && va.base < s.at + s.chunk.len)
+    }
+
+    /// An evicted span's addresses leave it: freed, but where a chunk is still stuck; that range
+    /// is freed when its chunk goes back.
+    pub(crate) fn release_va(&self, va: Va) {
+        let mut stuck = self.stuck.lock();
+        let mut held: Vec<(u64, u64)> = stuck.iter_mut().filter(|s| s.at < va.base + va.len && va.base < s.at + s.chunk.len).map(|s| {
+            s.owned = true;
+            (s.at, s.chunk.len)
+        }).collect();
+        drop(stuck);
+        held.sort_unstable();
+        let mut at = va.base;
+        for (s, len) in held.into_iter().chain(std::iter::once((va.base + va.len, 0))) {
+            if s > at {
+                self.space.lock().give(at, s - at);
+            }
+            at = at.max(s + len);
+        }
     }
 
     fn reserve(&self, len: u64) -> Result<Va> {
@@ -1615,27 +1696,25 @@ impl Direct {
 }
 
 impl Source for Direct {
-    fn map(&self, va: Va, _: Kind) -> Result<Vec<Chunk>> {
-        let (mut chunks, mut off) = (Vec::new(), 0);
+    fn map(&self, va: Va, _: Kind, into: &mut Vec<Chunk>) -> Result<()> {
+        let mut off = 0;
         while off < va.len {
             let len = (va.len - off).min(CHUNK);
-            match self.one(va, off, len) {
-                Ok(c) => chunks.push(c),
-                Err(e) => {
-                    self.unmap(Va { base: va.base, len: off }, chunks);
-                    return Err(e);
-                }
-            }
+            into.push(self.one(va, off, len)?);
             off += len;
         }
-        Ok(chunks)
+        Ok(())
     }
 
-    fn unmap(&self, va: Va, chunks: Vec<Chunk>) {
-        let mut off = 0;
+    fn unmap(&self, va: Va, chunks: Vec<Chunk>) -> Vec<(u64, Chunk)> {
+        let (mut off, mut stuck) = (0, Vec::new());
         for c in chunks {
-            if let Err(e) = self.backend.unmap(va, off, c.len) {
-                tracing::error!("varena: unmapping a torch chunk at {:#x} failed: {e}", va.base + off);
+            let at = va.base + off;
+            off += c.len;
+            if let Err(e) = self.backend.unmap(Va { base: at, len: c.len }, 0, c.len) {
+                tracing::error!("varena: unmapping a torch chunk at {at:#x} failed: {e}");
+                stuck.push((at, c));
+                continue;
             }
             let page = {
                 let mut held = self.held.lock();
@@ -1645,7 +1724,7 @@ impl Source for Direct {
             if let Some(p) = page {
                 let _ = self.backend.destroy(p);
             }
-            off += c.len;
         }
+        stuck
     }
 }
