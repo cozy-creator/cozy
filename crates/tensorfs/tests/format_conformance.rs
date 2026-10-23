@@ -386,6 +386,7 @@ fn cuda_decodes_every_encoded_green_vector_and_logical_windows() {
     for (family, cases) in families() {
         for case in cases {
             let (Some(encoding), Some(expected)) = (&case.encoding, &case.expect) else { continue };
+            if tensorfs::kernels::HOST_SCHEMES.contains(&encoding.scheme.as_str()) { continue }
             let storage: Vec<_> = case.parts.iter().map(|p| b64(&p.bits)).collect();
             let parts = case.parts.iter().zip(&storage).map(|(p, bytes)| (
                 p.role.as_str(), PartBytes { dtype: &p.dtype, shape: &p.shape, bytes },

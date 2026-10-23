@@ -219,6 +219,7 @@ fn through_engine(shape: &[u64], ops: &Ops) -> Vec<u64> {
         source: Dtype::U32,
         cast: None,
         inline: None,
+        derive: None,
     };
     let file = fs::File::open(&path).unwrap();
     let mut bytes = Vec::new();
@@ -439,6 +440,7 @@ fn narrowing_is_numpys_and_refuses_overflow() {
             source: Dtype::F32,
             cast: Some(Dtype::F16),
             inline: None,
+            derive: None,
         };
         let file = fs::File::open(&path).unwrap();
         let mut out = Vec::new();

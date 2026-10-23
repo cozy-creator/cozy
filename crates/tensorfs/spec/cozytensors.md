@@ -445,6 +445,24 @@ A stack's `scale_2` is per matrix where the producer quantized each matrix on it
 compressed-tensors write experts as separate matrices, each with one `scale_2`. ModelOpt's fused Llama-4 and gpt-oss
 export (`[E, C/2, N]`, blocks along the second-to-last axis) is not this scheme.
 
+### `svdq.nvfp4`
+
+SVDQuant's weight (Nunchaku's svdq-fp4, in natural layout): an `nvfp4` residual of the smoothed weight, optionally a
+scale per row, and a 16-bit low-rank branch that holds the outliers. The logical weight is `[N, K]`; a stack is refused.
+- Params: `nvfp4`'s.
+- Parts: `nvfp4`'s `weight`, `scale`, `scale_2` (one element) and `input_scale` (optional, one element).
+  `pre_quant_scale`: `F32`, `BF16` or `F16` on the column grid. `channel_scale` (optional): `F32` or `F8_E4M3` on the
+  row grid. `lowrank_down`: `BF16`, `F16` or `F32`, `[R, K]` with `R ≥ 1`; `lowrank_up`: the same dtypes, `[N, R]`.
+- Decode, with `v` `nvfp4`'s value without `× p` (`(T[q] × s(i, j)) × g`, or `T[q] × (s(i, j) ÷ g)`), `c` the factor
+  `channel_scale[i]` and `p` `pre_quant_scale[j]`: `round_L((((v × c) × p) + up[i, 0] × down[0, j]) + … +
+  up[i, R−1] × down[R−1, j])`, the branch's terms added in order of `r`. Without a `channel_scale`, `× c` is left out.
+
+At run time `p` (the smoothing's reciprocal) multiplies the activations the residual takes, `input_scale` quantizes
+them, and the branch takes the activations as they are: `down` already holds the smoothing. Nunchaku's `qweight`,
+`wscales`, `wtscale`, `wcscales`, `smooth_factor`, `proj_down` and `proj_up` are `weight`, `scale`, `scale_2`,
+`channel_scale`, `1 / p`, `lowrank_down` transposed and `lowrank_up` here, out of its kernel's tiles. A reader of an
+older selection rule holds the name outside its lane table (§7), so it never reads such a variant as another lane.
+
 ### `fp8.blockwise`
 
 FP8 elements and one scale per tile of each matrix (DeepSeek-V3 and later, Qwen3-FP8, Kimi-K2, MiniMax-M2, GLM-5-FP8;
@@ -740,10 +758,11 @@ family is never read as its narrower or plain extras. Its family and bits:
 | int8.*, fp8.* | int8, fp8 | 8 |
 | nvfp4, mxfp4, int4.* | nvfp4, mxfp4, int4 | 4 |
 | w4a8.convrot | w4a8 | 4 |
+| svdq.nvfp4 | svdq-nvfp4 | 4 |
 | none of these | empty | 0 |
 
 Known plain dtypes run on any target. Encoded int8 and w4a8 require capability >=8.0 except 10.3; fp8 requires
->=8.9; nvfp4, mxfp4 and int4 require >=8.0 (weight-only below native FP4 capability 10.0). Another scheme
+>=8.9; nvfp4, mxfp4, int4 and svdq-nvfp4 require >=8.0 (weight-only below native FP4 capability 10.0). Another scheme
 this reader implements decodes on any GPU; an unknown one runs on none, even with a known family prefix.
 With no GPUs, no GPU requirement applies. A variant named by its path, or a header by its id, is the sole
 candidate: the rule validates it.
@@ -752,8 +771,9 @@ A variant works unless: `bits` is asked and its bits differ, or are 16 and it ho
 holds an encoded kind under `plain`; unasked, its bits are nonzero and below `min_bits`; or GPUs are given
 and no one of them runs one of its encoded kinds (every kind counts, even a small minority).
 
-At 4 bits the lane order is FP4 then w4a8 where every device runs FP4 natively or 4 is preferred unasked
-(a decode slot's, whose kernel is weight-only), else w4a8 then FP4; then int8, fp8, BF16, FP16 and F32. At 8 bits omit FP4 and w4a8; at 16 bits, or under
+At 4 bits the lane order is FP4, svdq-nvfp4 then w4a8 where 4 is preferred unasked (a decode slot's, whose kernel
+is weight-only); else svdq-nvfp4, FP4 then w4a8 where every device runs FP4 natively; else w4a8, FP4 then
+svdq-nvfp4; then int8, fp8, BF16, FP16 and F32. At 8 bits omit the 4-bit families; at 16 bits, or under
 `plain`, omit all encoded families. Remove families not every device runs natively; place FP16 before BF16
 only for a known pre-8.0 GPU. FP4 includes nvfp4, mxfp4 and int4. Of the variants that work, the first in
 that order wins, then none narrower than the width ranked first, then native over weight-only, then fewer stored
@@ -766,12 +786,12 @@ The Hub indexes profiles and the repo's ordered tag document transactionally wit
 It stages rows, performs the object store's conditional PUT inside that transaction, records the
 returned ETag, then commits. A failed PUT rolls back. A read detects a newer repo-file ETag and repairs
 that repository's index, including a process loss after PUT but before COMMIT. Its indexed endpoint
-is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8&rule=4` (and `prefer`, `min_bits`,
+is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8&rule=5` (and `prefer`, `min_bits`,
 `plain`); the response has `rule`, `release`, `commit`, `variant`, `header`, `profile` and `reasons`. A
-client takes only an answer of its own rule version (4), else reads the headers. A reader that names no
-`rule` is of rule 3: the Hub answers it as rule 3, choosing by its own rule among the variants whose every
-kind such a reader implements (none holding `w4a8.convrot`), since that reader would take a scheme it
-does not know on a CPU and fail to decode it. A refused selection is
+client takes only an answer of its own rule version (5), else reads the headers. A reader that names no
+`rule` is of rule 3. The Hub answers a reader of an older rule in that rule, choosing by its own rule among the
+variants whose every kind such a reader implements (rule 3: none holding `w4a8.convrot` or `svdq.nvfp4`; rule 4:
+none holding `svdq.nvfp4`), since that reader would take a scheme it does not know on a CPU and fail to decode it. A refused selection is
 HTTP200 with null fields and the refusal as its reason; the client applies the rule to the headers itself.
 Invalid bits is HTTP400; a model it has not indexed is HTTP404. Read permissions and explicit yanked-tag
 behavior match ordinary resolution. The current index covers commits named by repo tags; an untagged

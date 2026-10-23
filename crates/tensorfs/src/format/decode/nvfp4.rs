@@ -13,27 +13,10 @@ const F32: Dtypes = &["F32"];
 pub const NVFP4: Scheme = Scheme {
     name: "nvfp4",
     view: View::Matrix,
-    params: &[
-        Param {
-            key: "block_size",
-            allowed: Allowed::Uint(&[16]),
-        },
-        Param {
-            key: "global_scale",
-            allowed: Allowed::Text(&["multiply", "divide"]),
-        },
-        Param {
-            key: "nibble_order",
-            allowed: Allowed::Text(&["low_first", "high_first"]),
-        },
-        SCALE_LAYOUT,
-    ],
+    params: PARAMS,
     parts: &[
         Part::req("weight", &["F4"], logical),
-        Part::req("scale", &["F8_E4M3"], |c| {
-            whole_blocks(c)?;
-            blocks(c).shape(c)
-        }),
+        Part::req("scale", &["F8_E4M3"], scale),
         Part::req("scale_2", F32, |c| per_matrix(c, "scale_2")),
         Part::opt("input_scale", F32, |c| per_matrix(c, "input_scale")),
         Part::opt("pre_quant_scale", &["F32", "BF16", "F16"], |c| Grid::Col.shape(c)),
@@ -41,9 +24,26 @@ pub const NVFP4: Scheme = Scheme {
     decode,
 };
 
-fn whole_blocks(c: &Ctx) -> Result<()> {
+pub(super) const PARAMS: &[Param] = &[
+    Param {
+        key: "block_size",
+        allowed: Allowed::Uint(&[16]),
+    },
+    Param {
+        key: "global_scale",
+        allowed: Allowed::Text(&["multiply", "divide"]),
+    },
+    Param {
+        key: "nibble_order",
+        allowed: Allowed::Text(&["low_first", "high_first"]),
+    },
+    SCALE_LAYOUT,
+];
+
+/// E4M3 scales on row blocks of 16, stored `scale_layout`.
+pub(super) fn scale(c: &Ctx) -> Result<Shape> {
     match c.cols.is_multiple_of(16) {
-        true => Ok(()),
+        true => blocks(c).shape(c),
         false => Err(c.fail(format!("{} columns are not whole blocks of 16", c.cols))),
     }
 }
@@ -58,7 +58,7 @@ fn per_matrix(c: &Ctx, role: &str) -> Result<Shape> {
 
 /// Matrix by matrix with its own `g`: `multiply` `((table[q] × s) × g) × p`; `divide`
 /// `(table[q] × (s ÷ g)) × p`, `p` the `pre_quant_scale` of the column where there is one.
-fn decode<'a>(c: &Ctx<'a>) -> Result<Plan<'a>> {
+pub(super) fn decode<'a>(c: &Ctx<'a>) -> Result<Plan<'a>> {
     let order = match c.text("nibble_order") {
         "low_first" => Order::LowFirst,
         _ => Order::HighFirst,

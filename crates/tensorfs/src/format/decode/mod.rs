@@ -22,6 +22,7 @@ mod fp8;
 mod int8;
 mod mxfp8;
 mod nvfp4;
+mod svdq;
 
 // fp8.blockwise, mxfp4
 mod fp8_blockwise;
@@ -54,6 +55,7 @@ pub static SCHEMES: &[&Scheme] = &[
     &comfy::W4A8_CONVROT,
     &mxfp8::MXFP8,
     &nvfp4::NVFP4,
+    &svdq::SVDQ_NVFP4,
     // fp8.blockwise, mxfp4
     &fp8_blockwise::BLOCKWISE,
     &mxfp4::MXFP4,

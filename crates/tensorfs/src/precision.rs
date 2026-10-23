@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::format::{Body, Dtype, Header};
 
 /// The lanes the rule picks by name; any other is a release's only lane, served silently.
-const VOCABULARY: [&str; 6] = ["bf16", "fp16", "int8", "fp8", "nvfp4", "w4a8"];
+const VOCABULARY: [&str; 7] = ["bf16", "fp16", "int8", "fp8", "nvfp4", "w4a8", "svdq-nvfp4"];
 
 /// The GPUs a function runs on as the rule reads them (design §2.1, §2.7): the native formats
 /// every one runs (`mma`: cc 8.0 or later, where `nvfp4` serves at least weight-only; 10.3 has
@@ -91,18 +91,20 @@ impl Slot {
         }
     }
 
-    /// The lanes to ask for at `bits`, in order (§2.2): the width's native formats (4 bits: `nvfp4`
-    /// then `w4a8` where FP4 runs or for a decode slot's own 4 bits, whose kernel is weight-only;
-    /// `w4a8` then weight-only `nvfp4` elsewhere (xs-062); then the 8-bit order), then 16 bits:
-    /// `bf16`, and `fp16` first only where the GPUs run no bf16 (owner, 2026-10-16). Encoded lanes
-    /// go when the slot declines them.
+    /// The lanes to ask for at `bits`, in order (§2.2): the width's native formats (4 bits:
+    /// `svdq-nvfp4`, `nvfp4`, `w4a8` where FP4 runs natively (xs-066); `w4a8`, weight-only `nvfp4`,
+    /// `svdq-nvfp4` elsewhere (xs-062); `nvfp4`, `svdq-nvfp4`, `w4a8` for a decode slot's own 4
+    /// bits, whose kernel is weight-only; then the 8-bit order), then 16 bits: `bf16`, and `fp16`
+    /// first only where the GPUs run no bf16 (owner, 2026-10-16). Encoded lanes go when the slot
+    /// declines them.
     pub fn lanes(&self, bits: u32, gpus: &Gpus) -> Vec<&'static str> {
         let eight = [("int8", gpus.int8), ("fp8", gpus.fp8)];
-        let (nvfp4, w4a8) = (("nvfp4", gpus.mma), ("w4a8", gpus.int8));
+        let (svdq, nvfp4, w4a8) = (("svdq-nvfp4", gpus.mma), ("nvfp4", gpus.mma), ("w4a8", gpus.int8));
         let native: Vec<_> = match bits {
             16 => vec![],
-            4 if gpus.fp4 || self.decode => [nvfp4, w4a8].into_iter().chain(eight).collect(),
-            4 => [w4a8, nvfp4].into_iter().chain(eight).collect(),
+            4 if self.decode => [nvfp4, svdq, w4a8].into_iter().chain(eight).collect(),
+            4 if gpus.fp4 => [svdq, nvfp4, w4a8].into_iter().chain(eight).collect(),
+            4 => [w4a8, nvfp4, svdq].into_iter().chain(eight).collect(),
             _ => eight.to_vec(),
         };
         let native = native.into_iter().filter(|(_, runs)| *runs && self.encoded).map(|(lane, _)| lane);
@@ -158,6 +160,11 @@ pub struct Profile {
 
 impl Profile {
     pub fn of(header: &Header) -> Self {
+        Self::read(header, family)
+    }
+
+    /// `of` by a lane table: this rule's, or an older rule's (tests).
+    fn read(header: &Header, family: fn(&str) -> (&'static str, u32)) -> Self {
         let mut held: BTreeMap<String, u64> = BTreeMap::new();
         for (_, tensor) in header.tensors() {
             let kind = match &tensor.body {
@@ -191,6 +198,7 @@ fn family(kind: &str) -> (&'static str, u32) {
         k if k.starts_with("fp8.") => ("fp8", 8),
         k if k.starts_with("int4.") => ("int4", 4),
         "w4a8.convrot" => ("w4a8", 4),
+        "svdq.nvfp4" => ("svdq-nvfp4", 4),
         _ => ("", 0),
     }
 }
@@ -201,7 +209,7 @@ fn needs(kind: &str) -> &'static str {
         _ if !crate::format::SCHEMES.iter().any(|scheme| scheme.name == kind) => "a GPU reader",
         "int8" | "w4a8" => "sm80+ except sm103",
         "fp8" => "sm89+",
-        "nvfp4" | "mxfp4" | "int4" => "sm80+",
+        "nvfp4" | "mxfp4" | "int4" | "svdq-nvfp4" => "sm80+",
         _ => "a GPU reader",
     }
 }
@@ -213,7 +221,7 @@ fn runs(kind: &str, gpus: &Gpus) -> bool {
     match family(kind).0 {
         "int8" | "w4a8" => gpus.int8,
         "fp8" => gpus.fp8,
-        "nvfp4" | "mxfp4" | "int4" => gpus.mma,
+        "nvfp4" | "mxfp4" | "int4" | "svdq-nvfp4" => gpus.mma,
         _ => true,
     }
 }
@@ -260,7 +268,7 @@ impl Constraints {
             family => order.iter().position(|lane| *lane == family),
         };
         let native = |p: &Profile| match p.family.as_str() {
-            "nvfp4" | "mxfp4" => gpus.fp4,
+            "nvfp4" | "mxfp4" | "svdq-nvfp4" => gpus.fp4,
             "int4" => false,
             _ => true,
         };
@@ -328,9 +336,10 @@ mod tests {
         let compute = Slot::of(&json!({"encoded_leaves": "accept"}));
         let decode = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 4, "phase": "decode"}));
         let first = |slot: &Slot, asked, cc: &[&str]| slot.lanes(slot.bits(asked), &Gpus::of(cc))[0];
+        let svdq = "svdq-nvfp4";
         for (cc, eight, four) in [("8.0", "int8", "w4a8"), ("8.6", "int8", "w4a8"), ("8.9", "int8", "w4a8"),
-            ("9.0", "int8", "w4a8"), ("10.0", "int8", "nvfp4"), ("10.3", "fp8", "nvfp4"), ("12.0", "int8", "nvfp4"),
-            ("12.1", "int8", "nvfp4"), ("11.0", "int8", "nvfp4")] {
+            ("9.0", "int8", "w4a8"), ("10.0", "int8", svdq), ("10.3", "fp8", svdq), ("12.0", "int8", svdq),
+            ("12.1", "int8", svdq), ("11.0", "int8", svdq)] {
             assert_eq!(first(&compute, 0, &[cc]), eight, "{cc}");
             assert_eq!(first(&decode, 0, &[cc]), "nvfp4", "{cc}: decode's kernel is weight-only");
             assert_eq!(first(&compute, 4, &[cc]), four, "{cc}");
@@ -343,11 +352,13 @@ mod tests {
             }
         }
         assert_eq!(compute.lanes(8, &Gpus::of(&["9.0"])), ["int8", "fp8", "bf16", "fp16"]);
-        assert_eq!(compute.lanes(4, &Gpus::of(&["8.6"])), ["w4a8", "nvfp4", "int8", "bf16", "fp16"]);
-        assert_eq!(compute.lanes(4, &Gpus::of(&["9.0"])), ["w4a8", "nvfp4", "int8", "fp8", "bf16", "fp16"]);
-        assert_eq!(compute.lanes(4, &Gpus::of(&["12.0"])), ["nvfp4", "w4a8", "int8", "fp8", "bf16", "fp16"]);
-        assert_eq!(compute.lanes(4, &Gpus::of(&["12.1"])), ["nvfp4", "w4a8", "int8", "fp8", "bf16", "fp16"], "GB10 proved fp8");
-        assert_eq!(compute.lanes(4, &Gpus::of(&["10.3"])), ["nvfp4", "fp8", "bf16", "fp16"], "B300 has no int8: no w4a8");
+        assert_eq!(compute.lanes(4, &Gpus::of(&["8.6"])), ["w4a8", "nvfp4", svdq, "int8", "bf16", "fp16"]);
+        assert_eq!(compute.lanes(4, &Gpus::of(&["9.0"])), ["w4a8", "nvfp4", svdq, "int8", "fp8", "bf16", "fp16"]);
+        assert_eq!(compute.lanes(4, &Gpus::of(&["12.0"])), [svdq, "nvfp4", "w4a8", "int8", "fp8", "bf16", "fp16"]);
+        assert_eq!(compute.lanes(4, &Gpus::of(&["12.1"])), [svdq, "nvfp4", "w4a8", "int8", "fp8", "bf16", "fp16"], "GB10 proved fp8");
+        assert_eq!(compute.lanes(4, &Gpus::of(&["10.3"])), [svdq, "nvfp4", "fp8", "bf16", "fp16"], "B300 has no int8: no w4a8");
+        assert_eq!(decode.lanes(4, &Gpus::of(&["12.0"])), ["nvfp4", svdq, "w4a8", "int8", "fp8", "bf16", "fp16"],
+            "a decode slot's own 4 bits: weight-only first");
         let exact = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 16}));
         assert_eq!((exact.bits(0), exact.bits(8)), (16, 8), "the request's bits win");
         let compute4 = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 4}));
@@ -376,11 +387,14 @@ mod tests {
         let (hopper, ada) = (Gpus::of(&["9.0"]), Gpus::of(&["8.9"]));
         let slot = Slot::of(&json!({"encoded_leaves": "accept"}));
         assert_eq!(slot.warnings(4, &ada, "fidika/sdxl@1.0.0", "int8"),
-            ["precision 4: fidika/sdxl@1.0.0 has no w4a8 or nvfp4 lane for sm89; served int8"]);
+            ["precision 4: fidika/sdxl@1.0.0 has no w4a8, nvfp4 or svdq-nvfp4 lane for sm89; served int8"]);
         assert_eq!(slot.warnings(4, &ada, "x@1", "nvfp4"), ["precision 4: x@1 has no w4a8 lane for sm89; served nvfp4"]);
-        assert_eq!(slot.warnings(4, &Gpus::of(&["12.0"]), "x@1", "w4a8"), ["precision 4: x@1 has no nvfp4 lane for sm120; served w4a8"]);
+        assert_eq!(slot.warnings(4, &Gpus::of(&["12.0"]), "x@1", "w4a8"),
+            ["precision 4: x@1 has no svdq-nvfp4 or nvfp4 lane for sm120; served w4a8"]);
+        assert_eq!(slot.warnings(4, &Gpus::of(&["12.0"]), "x@1", "nvfp4"), ["precision 4: x@1 has no svdq-nvfp4 lane for sm120; served nvfp4"]);
         assert_eq!(slot.warnings(8, &hopper, "x@1", "bf16"), ["precision 8: x@1 has no int8 or fp8 lane for sm90; served bf16"]);
-        assert_eq!(slot.warnings(4, &ada, "x@1", "fp16"), ["precision 4: x@1 has no w4a8, nvfp4, int8, fp8 or bf16 lane for sm89; served fp16"]);
+        assert_eq!(slot.warnings(4, &ada, "x@1", "fp16"),
+            ["precision 4: x@1 has no w4a8, nvfp4, svdq-nvfp4, int8, fp8 or bf16 lane for sm89; served fp16"]);
         assert!(slot.warnings(8, &hopper, "x@1", "int8").is_empty());
         assert!(slot.warnings(8, &hopper, "x@1", "pdd8").is_empty());
         let declines = Slot::of(&json!({}));
@@ -395,11 +409,30 @@ mod tests {
         assert_eq!(slot.warnings(8, &turing, "x@1", "bf16"), ["precision 8: x@1 has no fp16 lane for sm75; served bf16"]);
         assert_eq!(slot.warnings(16, &hopper, "sdxl@1", "fp16"), ["precision 16: sdxl@1 has no bf16 lane for sm90; served fp16"]);
     }
+
+    /// Rule 4's readers (TensorFS 0.13.11) have no `svdq.nvfp4` row: a variant holding it (beside
+    /// its int8 extras) has no lane there, so they never take it for a lane they know.
+    #[test]
+    fn an_older_rule_reads_an_svdq_variant_as_no_lane() {
+        let select = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/vectors/select");
+        let read = |name: &str| Header::from_cbor(&std::fs::read(select.join(format!("{name}.cbor"))).unwrap()).unwrap();
+        let svdq = read("svdq-int8");
+        assert_eq!((Profile::of(&svdq).family.as_str(), Profile::of(&svdq).bits), ("svdq-nvfp4", 4));
+        let rule4 = |kind: &str| if kind == "svdq.nvfp4" { ("", 0) } else { family(kind) };
+        let old = Profile::read(&svdq, rule4);
+        assert_eq!((old.family.as_str(), old.bits), ("", 0), "untabled: no lane");
+        let [nvfp4, int8, bf16] = ["nvfp4-int8-heavy", "int8-convrot", "bf16"].map(|name| Profile::read(&read(name), rule4));
+        let variants = [("svdq", &old), ("nvfp4", &nvfp4), ("int8", &int8), ("bf16", &bf16)];
+        let blackwell = |bits| Constraints { gpus: vec!["12.0".into()], bits, ..Default::default() };
+        assert_eq!(blackwell(Some(4)).select("x@1", &variants).unwrap().0, 1, "asked 4 bits: nvfp4");
+        assert_eq!(blackwell(None).select("x@1", &variants).unwrap().0, 2, "unasked: int8");
+        assert_eq!(Constraints::default().select("x@1", &variants).unwrap().0, 3, "the CPU: bf16");
+    }
 }
 
 /// This rule's version. An index answer of another (a Hub whose profiles an older rule derived)
 /// is not taken: the headers are read instead.
-pub const RULE: u32 = 4;
+pub const RULE: u32 = 5;
 
 /// The Hub's indexed answer, with the same rule as local header selection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
