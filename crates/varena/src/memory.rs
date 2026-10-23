@@ -2465,7 +2465,7 @@ impl Request {
         self.ended = true;
         let id = self.id;
         let stats = self.inner.guard(|| Ok(self.inner.end_request(id))).unwrap_or_default();
-        self.inner.measured(crate::lease::Measured::Request { request: stats.request.clone(), working: stats.peak, compute: stats.compute, host: 0 });
+        self.inner.measured(crate::lease::Measured::Request { request: stats.request.clone(), working: stats.peak, compute: stats.compute, host: stats.host.unwrap_or(0) });
         stats
     }
 }
