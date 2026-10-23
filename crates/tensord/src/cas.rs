@@ -63,16 +63,7 @@ impl Cas {
     /// Whether `object` is here; a use renews it.
     pub fn reuse(&self, object: &ObjectRef) -> io::Result<bool> {
         let _gate = GATE.read().unwrap();
-        let file = match File::open(self.path(object)?) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        if file.metadata()?.len() != object.length {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("object {} has another length here", object.id())));
-        }
-        file.set_modified(SystemTime::now())?;
-        Ok(true)
+        self.reuse_held(object)
     }
 
     /// Admits what `src` yields. With `expect`, one already here is reused unread and other
@@ -171,10 +162,15 @@ impl Cas {
         platform::durable::replace(&path, &bytes, 0o600).map_err(io::Error::from)
     }
 
-    /// `reuse` under a gate the caller holds.
+    /// `reuse` under a gate the caller holds. The use is stamped through `set_times`: Windows
+    /// sets a time only through attribute-write access, which a read handle lacks.
     fn reuse_held(&self, object: &ObjectRef) -> io::Result<bool> {
-        match File::open(self.path(object)?) {
-            Ok(file) if file.metadata()?.len() == object.length => file.set_modified(SystemTime::now()).map(|_| true),
+        let path = self.path(object)?;
+        match fs::metadata(&path) {
+            Ok(meta) if meta.len() == object.length => {
+                platform::durable::set_times(&path, fs::FileTimes::new().set_modified(SystemTime::now()))?;
+                Ok(true)
+            }
             Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, format!("object {} has another length here", object.id()))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
