@@ -34,8 +34,10 @@ const MIB: u64 = 1 << 20;
 /// A failure backstop only: every wait below ends on the event it waits for.
 const BACKSTOP: Duration = Duration::from_secs(60);
 
+/// A card big enough that the driver headroom H (512 MiB at least, never leased) leaves room; the
+/// host backend takes only the pages it makes.
 fn gpu_id() -> GpuId {
-    GpuId { uuid: format!("GPU-s5-lease-{}", uuid::Uuid::new_v4()), model: "S5 Host Pages".into(), memory: 64 * MIB }
+    GpuId { uuid: format!("GPU-s5-lease-{}", uuid::Uuid::new_v4()), model: "S5 Host Pages".into(), memory: 8 << 30 }
 }
 
 fn inventory(id: &GpuId) -> receipt::Gpu {
