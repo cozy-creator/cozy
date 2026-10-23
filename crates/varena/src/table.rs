@@ -189,6 +189,12 @@ pub struct Set {
     pub declared: bool,
 }
 
+/// H: the device bytes a shared machine leaves to the display and other programs. A shrink
+/// leaves `2H` free, and growth stops at `2H`: the H..2H band is the hysteresis, with no timer.
+pub fn headroom(card: u64) -> u64 {
+    (512 << 20).max(card / 16)
+}
+
 /// Blocks ahead of a pass's cursor its prefetch maps (free bytes only): one bound while the next
 /// lands.
 pub const SLOTS: u64 = 2;
@@ -353,6 +359,11 @@ pub struct Table {
     /// Shared mode (a machine its owner also uses): prefetch never grows this process's
     /// footprint.
     pub shared: bool,
+    /// TensorD samples foreign bytes (`foreign` is its reading): in shared mode the budget then
+    /// leaves H to the display and other programs.
+    pub sampled: bool,
+    /// The card's bytes (H's basis).
+    pub card: u64,
     /// Indexed by set id; `None` once unloaded.
     pub sets: Vec<Option<Set>>,
     pub requests: Vec<Req>,
@@ -456,8 +467,13 @@ impl Table {
     /// The one budget: the ledger's capacity less foreign bytes, orphans and the other rows,
     /// within this row's own cap.
     pub fn budget(&self) -> u64 {
-        let room = self.capacity.saturating_sub(self.foreign + self.orphans + self.others_held());
+        let room = self.capacity.saturating_sub(self.foreign + self.orphans + self.others_held() + self.headroom());
         self.limit.map_or(room, |l| room.min(l))
+    }
+
+    /// H, charged in shared mode while TensorD samples foreign bytes (its rule asks below it).
+    pub fn headroom(&self) -> u64 {
+        if self.shared && self.sampled { headroom(self.card) } else { 0 }
     }
 
     /// F: the budget less what this row holds.

@@ -54,6 +54,10 @@ pub(super) enum StreamIn {
 
 impl State {
     /// A page that is the set's slot now: mapped at an upper block, never custody's (its memory is overwritten next).
+    pub(super) fn slots(&self, set: u32, watermark: u32) -> usize {
+        self.homes.keys().filter(|k| k.0 == set && self.slot(**k, watermark)).count()
+    }
+
     fn slot(&self, key: Key, watermark: u32) -> bool {
         key.1 >= watermark && self.homes.get(&key).is_some_and(|h| !h.exported && !h.keeping)
     }
@@ -143,11 +147,10 @@ impl Inner {
             return Ok(StreamIn::No);
         }
         let slots: Vec<Key> = st.homes.keys().filter(|k| k.0 == key.0 && st.slot(**k, watermark)).copied().collect();
-        if slots.len() < SLOTS {
-            let free = st.table.free().min(self.backend.free().unwrap_or(u64::MAX));
-            if slots.is_empty() || st.table.page(key).is_some_and(|p| p.bytes <= free) {
-                return Ok(StreamIn::No);
-            }
+        // Mid-pass a slot moves, never a new one made (`regrow` refills them at a boundary);
+        // the first is made the usual way.
+        if slots.is_empty() {
+            return Ok(StreamIn::No);
         }
         let Some(from) = slots.iter().filter(|k| st.movable(**k)).min_by_key(|k| st.last_use(**k)).copied() else {
             let me = std::thread::current().id();
@@ -165,6 +168,7 @@ impl Inner {
         st.events.values_mut().for_each(|q| q.retain(|(_, k)| *k != from));
         let Some(Home { phys: Some(phys), ready, .. }) = st.homes.remove(&from) else { return Ok(StreamIn::Wait) };
         self.backend.retire(ready);
+        st.transit += phys.len;
         st.sync(from);
         let gen = st.tick();
         let identity = st.mech(key.0)?.key.clone();
@@ -188,8 +192,10 @@ impl Inner {
         let moved = after.iter().try_for_each(|e| self.backend.finish(*e))
             .and_then(|()| self.backend.unmap(va, from, span))
             .and_then(|()| self.backend.map(va, off, &phys, Access::ReadWrite));
+        let len = phys.len;
         if let Err(error) = moved {
             let mut st = self.state.lock();
+            st.transit = st.transit.saturating_sub(len);
             self.lost_backing(&mut st, span, false, error);
             return;
         }
@@ -197,12 +203,15 @@ impl Inner {
         let mut st = self.state.lock();
         if !st.homes.get(&key).is_some_and(|h| h.gen == gen) {
             drop(st);
-            if let Err(error) = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(phys)) {
-                let mut st = self.state.lock();
+            let gone = self.backend.unmap(va, off, span).and_then(|()| self.backend.destroy(phys));
+            let mut st = self.state.lock();
+            st.transit = st.transit.saturating_sub(len);
+            if let Err(error) = gone {
                 self.lost_backing(&mut st, span, false, error);
             }
             return;
         }
+        st.transit = st.transit.saturating_sub(len);
         if let Some(h) = st.homes.get_mut(&key) {
             h.phys = Some(phys);
         }

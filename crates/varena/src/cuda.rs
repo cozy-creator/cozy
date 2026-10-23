@@ -11,7 +11,7 @@ use platform::handles::Owned;
 use tensorfs::io::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUdevice, CUevent, CUstream, CtxGuard};
 use tensorfs::io::Dst;
 
-use crate::backend::{Access, Backend, Event, Physical, Va};
+use crate::backend::{Access, Backend, Event, Events, Physical, Va};
 use crate::{Error, GpuId, Result};
 
 #[cfg(unix)]
@@ -77,9 +77,8 @@ pub struct CudaBackend {
     nvml: Option<platform::gpu::Device>,
     /// The device's used bytes `open` measured across making the context.
     context: u64,
-    /// Events retired while still pending: destroyed once complete, never before (cuEventDestroy
-    /// of a pending event can block until it completes, behind any other stream's work).
-    retired: parking_lot::Mutex<Vec<Event>>,
+    /// varena's event ids over the driver's handles (`CUevent` as usize): never reused.
+    events: Events<usize>,
     /// What `prop`'s WIN32 metadata points at, for as long as pages are created.
     #[cfg(windows)]
     _security: Box<SecurityAttributes>,
@@ -133,7 +132,7 @@ impl CudaBackend {
             capacity: total as u64,
             nvml,
             context,
-            retired: parking_lot::Mutex::new(Vec::new()),
+            events: Events::default(),
             #[cfg(windows)]
             _security: security,
         })
@@ -188,8 +187,23 @@ fn used(nvml: Option<&platform::gpu::Device>) -> Option<u64> {
     Some(reading.total.saturating_sub(reading.free))
 }
 
-fn raw(event: Event) -> CUevent {
-    event.0 as CUevent
+impl CudaBackend {
+    /// `event`'s live driver handle; a retired or unknown id is an error, never a stale handle.
+    fn raw(&self, event: Event) -> Result<CUevent> {
+        self.events.get(event).map(|h| h as CUevent).ok_or_else(|| Error::Internal(format!("event {} is not live", event.0)))
+    }
+
+    /// A queued handle is complete, or unknowable (its query failed): nothing waits on it.
+    fn complete(&self, handle: usize) -> bool {
+        let Ok(_ctx) = self.primary.enter() else { return false };
+        // SAFETY: a handle this backend made and has not destroyed.
+        let code = cuda::driver().map(|d| unsafe { (d.event_query)(handle as CUevent) });
+        !matches!(code, Ok(cuda::ERROR_NOT_READY))
+    }
+
+    fn destroy_event(&self, handle: usize) {
+        self.logged("cuEventDestroy", || Ok(call!("cuEventDestroy", event_destroy(handle as CUevent))?));
+    }
 }
 
 impl Backend for CudaBackend {
@@ -336,7 +350,7 @@ impl Backend for CudaBackend {
             unsafe { cuda::driver().map(|d| (d.event_destroy)(event)) }.ok();
             return Err(e.into());
         }
-        Ok(Event(event as u64))
+        Ok(self.events.add(event as usize))
     }
 
     fn query(&self, event: Event) -> Result<bool> {
@@ -346,7 +360,7 @@ impl Backend for CudaBackend {
         let _ctx = self.primary.enter()?;
         let _call = tracing::trace_span!("cuEventQuery").entered();
         // SAFETY: a live event of this context.
-        match unsafe { (cuda::driver()?.event_query)(raw(event)) } {
+        match unsafe { (cuda::driver()?.event_query)(self.raw(event)?) } {
             cuda::SUCCESS => Ok(true),
             cuda::ERROR_NOT_READY => Ok(false),
             code => Err(cuda::check("cuEventQuery", code).err().map_or_else(|| Error::Internal("cuEventQuery".into()), Error::from)),
@@ -362,7 +376,7 @@ impl Backend for CudaBackend {
         }
         let _ctx = self.primary.enter()?;
         let mut ms = 0f32;
-        call!("cuEventElapsedTime", event_elapsed_time(&mut ms, raw(from), raw(to)))?;
+        call!("cuEventElapsedTime", event_elapsed_time(&mut ms, self.raw(from)?, self.raw(to)?))?;
         Ok(Some((f64::from(ms.max(0.0)) * 1e6) as u64))
     }
 
@@ -371,7 +385,7 @@ impl Backend for CudaBackend {
             return Ok(());
         }
         let _ctx = self.primary.enter()?;
-        Ok(call!("cuStreamWaitEvent", stream_wait_event(stream as CUstream, raw(event), 0))?)
+        Ok(call!("cuStreamWaitEvent", stream_wait_event(stream as CUstream, self.raw(event)?, 0))?)
     }
 
     fn synchronize(&self, stream: usize) -> Result<()> {
@@ -384,23 +398,16 @@ impl Backend for CudaBackend {
             return Ok(());
         }
         let _ctx = self.primary.enter()?;
-        Ok(call!("cuEventSynchronize", event_synchronize(raw(event)))?)
+        Ok(call!("cuEventSynchronize", event_synchronize(self.raw(event)?))?)
     }
 
-    /// Never blocks: an event is destroyed once complete, here or at a later retire.
+    /// Queued only: destroyed by a sweep (the mechanism or trim thread) once complete.
     fn retire(&self, event: Event) {
-        if event == Event::DONE {
-            return;
-        }
-        let mut retired = self.retired.lock();
-        retired.push(event);
-        retired.retain(|e| match self.query(*e) {
-            Ok(false) => true,
-            Ok(true) | Err(_) => {
-                self.logged("cuEventDestroy", || Ok(call!("cuEventDestroy", event_destroy(raw(*e)))?));
-                false
-            }
-        });
+        self.events.retire(event);
+    }
+
+    fn sweep(&self) {
+        self.events.sweep(|h| self.complete(h), |h| self.destroy_event(h));
     }
 
     fn drain(&self) -> Result<()> {
