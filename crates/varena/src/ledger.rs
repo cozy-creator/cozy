@@ -497,6 +497,8 @@ pub struct Ledger {
     t: Arc<Table>,
     /// `stalled`'s last look: (slot, gen) -> progress.
     looks: Mutex<HashMap<(u32, u64), u64>>,
+    /// `refusing`'s last look: (slot, gen) -> (progress, bytes freed).
+    answers: Mutex<HashMap<(u32, u64), (u64, u64)>>,
     events: Option<OwnedFd>,
     /// One writer of the dispatch table in this process (TensorD is its only writer).
     dispatching: Mutex<()>,
@@ -504,7 +506,7 @@ pub struct Ledger {
 
 impl Ledger {
     fn new(t: Table, events: Option<OwnedFd>) -> Ledger {
-        Ledger { t: Arc::new(t), looks: Mutex::default(), events, dispatching: Mutex::default() }
+        Ledger { t: Arc::new(t), looks: Mutex::default(), answers: Mutex::default(), events, dispatching: Mutex::default() }
     }
 
     /// A new table and eventfd; returns it and the memfd to hand to other processes.
@@ -673,6 +675,19 @@ impl Ledger {
         let stalled = asked.iter().filter(|r| looks.get(&(r.slot, r.gen)) == Some(&r.progress)).map(|r| r.pid).collect();
         *looks = asked.iter().map(|r| ((r.slot, r.gen), r.progress)).collect();
         Ok(stalled)
+    }
+
+    /// Rows running nothing that answered asks since this handle's last look and freed nothing,
+    /// though they still say they could: bytes no ask gets back, which only their exit returns.
+    pub fn refusing(&self) -> Result<Vec<u32>> {
+        let rows = self.snapshot()?;
+        let mut answers = lock(&self.answers);
+        let idle: Vec<&RowFacts> =
+            rows.iter().filter(|r| r.state == State::Live && r.running.is_empty() && r.reclaimable() > 0).collect();
+        let refused = |r: &&&RowFacts| answers.get(&(r.slot, r.gen)).is_some_and(|&(p, f)| r.progress > p && r.acked == f);
+        let refusing = idle.iter().filter(refused).map(|r| r.pid).collect();
+        *answers = idle.iter().map(|r| ((r.slot, r.gen), (r.progress, r.acked))).collect();
+        Ok(refusing)
     }
 
     /// Bytes freed on this GPU: the free generation moves and the eventfd is signalled.
