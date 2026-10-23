@@ -11,7 +11,7 @@
 //! - **Liveness.** A read the Fetcher abandoned as stalled (a hung mount cannot be cancelled)
 //!   keeps the volume out of every fetch until it returns.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -88,9 +88,7 @@ impl VolumeOrigin {
 
     /// Its last use is now.
     pub(crate) fn touch(&self, object: &ObjectRef) {
-        if let Ok(file) = File::open(self.blob(object)) {
-            let _ = file.set_modified(SystemTime::now());
-        }
+        let _ = platform::durable::set_times(&self.blob(object), fs::FileTimes::new().set_modified(SystemTime::now()));
     }
 
     /// Copy `object` from `store` onto the volume, unless an entry of its length is there and

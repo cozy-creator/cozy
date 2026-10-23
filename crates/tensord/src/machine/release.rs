@@ -87,5 +87,6 @@ fn extract(archive: &[u8], out: &mut impl io::Write) -> io::Result<u64> {
 #[cfg(windows)]
 fn extract(archive: &[u8], out: &mut impl io::Write) -> io::Result<u64> {
     let mut zip = zip::ZipArchive::new(io::Cursor::new(archive))?;
-    io::copy(&mut zip.by_name("cozy.exe")?, out)
+    let mut cozy = zip.by_name("cozy.exe")?;
+    io::copy(&mut cozy, out)
 }
