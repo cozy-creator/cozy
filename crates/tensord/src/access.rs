@@ -228,18 +228,31 @@ pub fn meter(engine: Arc<Engine>, id: String, fetch: &Arc<Fetch>) {
     if fetch.arriving.lock().unwrap().is_empty() {
         return;
     }
-    let fetch = Arc::downgrade(fetch);
-    let started = std::thread::Builder::new().name("weights-meter".into()).spawn(move || loop {
-        let weights = fetch.upgrade().filter(|f| !f.ended()).and_then(|f| f.arriving());
-        let done = weights.is_none();
-        if let Err(error) = engine.observe_weights(&id, weights) {
-            tracing::warn!("run {id}: its weights' progress: {error}");
-            return;
+    let (store, fetch, began) = (fetch.store().clone(), Arc::downgrade(fetch), std::time::Instant::now());
+    let started = std::thread::Builder::new().name("weights-meter".into()).spawn(move || {
+        let mut last = None;
+        loop {
+            let live = fetch.upgrade().filter(|f| !f.ended());
+            let weights = live.as_ref().and_then(|f| f.arriving());
+            if let Err(error) = engine.observe_weights(&id, weights.clone()) {
+                tracing::warn!("run {id}: its weights' progress: {error}");
+                return;
+            }
+            // What the run waited for lands in the transport log, as a pull's does.
+            let Some(arriving) = weights else {
+                if let (Some(Weights { models, total, .. }), true) = (last, live.is_some()) {
+                    let waited = format!("bytes={total} seconds={:.1} run={id}", began.elapsed().as_secs_f64());
+                    storage::transport(&store, "arrived", &models, &waited);
+                }
+                return;
+            };
+            if engine.get(&id).is_ok_and(|record| record.state.terminal()) {
+                return;
+            }
+            drop(live);
+            last = Some(arriving);
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
-        if done || engine.get(&id).is_ok_and(|record| record.state.terminal()) {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
     });
     if let Err(error) = started {
         tracing::warn!("its weights' progress: {error}");
