@@ -60,6 +60,11 @@ fn main() {
             false,
         ),
         ("a_tree_dies_whole", a_tree_dies_whole, false),
+        (
+            "a_page_crosses_to_a_child_and_back",
+            a_page_crosses_to_a_child_and_back,
+            false,
+        ),
         #[cfg(any(target_os = "linux", windows))]
         (
             "a_scope_ends_the_tree_it_holds",
@@ -142,6 +147,23 @@ fn child(args: &[String]) {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args[..] {
         ["sleep"] => ready_and_wait(),
+        ["page", path] => {
+            // The parent's page: its handle duplicated (or its fd passed) into this process.
+            let stream = platform::ipc::connect(Path::new(path)).unwrap();
+            assert_eq!(
+                platform::handles::peer(&stream).unwrap().pid,
+                process::parent_of(std::process::id()).unwrap()
+            );
+            let page = platform::handles::recv_fd(&stream).unwrap();
+            let len = platform::memory::size(&page).unwrap();
+            assert_eq!(len, PAGE);
+            let map = platform::memory::map(&page, 0, len as usize, true).unwrap();
+            // SAFETY: this mapping, `len` bytes.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(map.base, map.len) };
+            bytes.iter_mut().enumerate().for_each(|(i, b)| *b = (i % 251) as u8);
+            println!("ready");
+            std::io::stdout().flush().unwrap();
+        }
         ["named", name] => {
             process::set_name(name).unwrap();
             ready_and_wait();
@@ -394,6 +416,32 @@ fn times_are_set_on_a_read_only_file_and_a_directory() {
     permissions.set_readonly(false);
     fs::set_permissions(&file, permissions).unwrap();
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A page's bytes: three allocation granules and a part, so a size read back is the exact one.
+const PAGE: u64 = (3 << 16) + 4096;
+
+/// A shared page (a lease table on Windows is a pagefile section, on Linux a memfd) crosses to a
+/// child over a local stream: the child names its parent as the peer, reads the page's size,
+/// maps it and writes it; the parent reads the child's bytes through its own mapping.
+fn a_page_crosses_to_a_child_and_back() {
+    let dir = scratch("page");
+    let path = dir.join("page.sock");
+    let listener = platform::ipc::LocalListener::bind(&path).unwrap();
+    let mut child = child_command(&["page", path.to_str().unwrap()]).spawn().unwrap();
+    let stream = listener.accept().unwrap();
+    assert_eq!(platform::handles::peer(&stream).unwrap().pid, child.id());
+    let page = platform::memory::page(PAGE).unwrap();
+    platform::handles::accepts_handles(&stream).unwrap();
+    // What a lease table's agent gets: map read and write, never resize.
+    platform::handles::send_fd(&stream, &platform::memory::lend(&page).unwrap()).unwrap();
+    ready(child.stdout.take().unwrap());
+    let map = platform::memory::map(&page, 0, PAGE as usize, false).unwrap();
+    // SAFETY: this mapping, `PAGE` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(map.base, map.len) };
+    assert!(bytes.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
+    assert!(child.wait().unwrap().success());
+    let _ = fs::remove_dir_all(dir);
 }
 
 fn a_tree_dies_whole() {

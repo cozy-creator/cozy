@@ -82,6 +82,9 @@ pub struct CudaBackend {
     /// What `prop`'s WIN32 metadata points at, for as long as pages are created.
     #[cfg(windows)]
     _security: Box<SecurityAttributes>,
+    /// This process's WDDM budget on the device's adapter (matched by LUID), where DXGI has one.
+    #[cfg(windows)]
+    budget: Option<std::sync::Arc<platform::gpu::Budget>>,
 }
 
 // SAFETY: driver handles are opaque and every use enters their context; `prop`'s only pointer is
@@ -117,6 +120,8 @@ impl CudaBackend {
         {
             prop.win32_handle_meta_data = (&*security as *const SecurityAttributes).cast_mut().cast();
         }
+        #[cfg(windows)]
+        let budget = budget(device);
         let _ctx = primary.enter()?;
         let mut granularity = 0usize;
         call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut granularity, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
@@ -135,6 +140,8 @@ impl CudaBackend {
             events: Events::default(),
             #[cfg(windows)]
             _security: security,
+            #[cfg(windows)]
+            budget,
         })
     }
 
@@ -178,6 +185,39 @@ impl CudaBackend {
         if let Err(e) = self.primary.enter().and_then(|_ctx| f()) {
             tracing::warn!(target: "varena", "{op}: {e}");
         }
+    }
+}
+
+/// The device's DXGI budget, its adapter found by the device's LUID. None (logged) where DXGI
+/// names no such adapter or will not register the change event: no budget signal then.
+#[cfg(windows)]
+fn budget(device: CUdevice) -> Option<std::sync::Arc<platform::gpu::Budget>> {
+    let opened = cuda::luid(device).map_err(Error::from).and_then(|luid| platform::gpu::Budget::open(luid).map_err(Error::from));
+    match opened {
+        Ok(Some(budget)) => Some(std::sync::Arc::new(budget)),
+        Ok(None) => {
+            tracing::warn!(target: "varena", "DXGI names no adapter with CUDA device {device}'s LUID: no budget signal");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(target: "varena", "DXGI budget: {e}: no budget signal");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+impl crate::backend::Budget for platform::gpu::Budget {
+    fn read(&self) -> Result<(u64, u64)> {
+        Ok(platform::gpu::Budget::read(self)?)
+    }
+
+    fn wait(&self) -> bool {
+        platform::gpu::Budget::wait(self)
+    }
+
+    fn close(&self) {
+        platform::gpu::Budget::close(self)
     }
 }
 
@@ -415,6 +455,11 @@ impl Backend for CudaBackend {
 
     fn sweep(&self) {
         self.events.sweep(|h| self.complete(h), |h| self.destroy_event(h));
+    }
+
+    #[cfg(windows)]
+    fn budget(&self) -> Option<std::sync::Arc<dyn crate::backend::Budget>> {
+        self.budget.clone().map(|b| b as std::sync::Arc<dyn crate::backend::Budget>)
     }
 
     fn drain(&self) -> Result<()> {

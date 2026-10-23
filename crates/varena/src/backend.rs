@@ -51,6 +51,11 @@ pub const OUT_OF_MEMORY: i32 = 2;
 pub trait Backend: Send + Sync {
     /// The device's total bytes (the card, or a host device's limit).
     fn capacity(&self) -> u64;
+    /// Bytes the driver needs free at all times (its lazy kernel loads, cr-215): never leased,
+    /// never filled, in any mode.
+    fn headroom(&self) -> u64 {
+        crate::table::headroom(self.capacity())
+    }
     /// Free bytes as the driver measures them now. Only foreign bytes derive from it (the
     /// device's used bytes less every row's); placement never sizes from it.
     fn free(&self) -> Result<u64>;
@@ -134,6 +139,7 @@ pub trait Backend: Send + Sync {
 /// are always complete.
 pub struct HostBackend {
     limit: u64,
+    headroom: u64,
     pages: Mutex<Pages>,
 }
 
@@ -157,8 +163,14 @@ impl Pages {
 }
 
 impl HostBackend {
+    /// Host pages load no kernels: no headroom.
     pub fn new(limit: u64) -> HostBackend {
-        HostBackend { limit, pages: Mutex::new(Pages::default()) }
+        HostBackend::with_headroom(limit, 0)
+    }
+
+    /// A host device that keeps `headroom` free, as a card's driver does.
+    pub fn with_headroom(limit: u64, headroom: u64) -> HostBackend {
+        HostBackend { limit, headroom, pages: Mutex::new(Pages::default()) }
     }
 }
 
@@ -248,10 +260,14 @@ impl Backend for HostBackend {
         memory::export(handle).map_err(page_err)
     }
 
+    fn headroom(&self) -> u64 {
+        self.headroom
+    }
+
     fn lend(&self, page: &Physical) -> Result<Owned> {
         let pages = self.pages.lock();
         let (handle, _) = pages.live.get(&page.id).ok_or_else(|| Error::Invalid(format!("no page {}", page.id)))?;
-        handle.try_clone().map_err(|e| Error::io("lend a host page", e))
+        memory::lend(handle).map_err(page_err)
     }
 
     fn import(&self, handle: Owned, len: u64) -> Result<Physical> {

@@ -966,7 +966,7 @@ impl Memory {
             let holder = custody.as_ref().map_or(0, |c| c.holder());
             let context = backend.process_used().unwrap_or_else(|_| backend.opened_context());
             let budget = backend.budget();
-            let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, card: backend.capacity(), ..Table::default() };
+            let table = Table { capacity: shared.capacity()?, limit: grant.limit, context, card: backend.capacity(), driver: backend.headroom(), ..Table::default() };
             let inner = Arc::new(Inner {
                 backend: Arc::from(backend),
                 #[cfg(unix)]
@@ -1032,13 +1032,14 @@ impl Memory {
     /// Leases this GPU's weight pages from the manager serving it (TensorD's, in the table
     /// owner's namespace), right after open, before any load: from then on its pages are the
     /// manager's chunks, retained by it across this process's exit (no Keep), and asked back by
-    /// it. Refused, or nobody serving, it stays standalone: `Some((code, why))`.
+    /// it. `Some((Incompatible | Absent, why))`: it runs standalone. Any other refusal is an error
+    /// (TensorD parks a peer it has not registered yet, so the dial itself waits).
     #[cfg(unix)]
     pub fn lease(&self) -> Result<Option<(crate::lease::Refusal, String)>> {
         let uuid = self.inner._device.0.clone();
         match crate::lease::connect(self.inner.shared.ns, &uuid)? {
             Some(stream) => self.lease_over(stream),
-            None => Ok(Some((crate::lease::Refusal::Incompatible, format!("no lease manager serves GPU {uuid}")))),
+            None => Ok(Some((crate::lease::Refusal::Absent, format!("no lease manager serves GPU {uuid}")))),
         }
     }
 
@@ -1061,7 +1062,8 @@ impl Memory {
                 }
                 Ok(None)
             }
-            crate::lease::Attach::Refused { code, why } => Ok(Some((code, why))),
+            crate::lease::Attach::Refused { code: code @ (crate::lease::Refusal::Incompatible | crate::lease::Refusal::Absent), why } => Ok(Some((code, why))),
+            crate::lease::Attach::Refused { code, why } => Err(Error::Closed(format!("the lease manager refused this process ({code:?}): {why}"))),
         }
     }
 
@@ -1519,6 +1521,8 @@ impl Inner {
             if wake {
                 agent.progressed();
             }
+            // Events still pending: its GPU work is running, never a stall.
+            agent.busy(st.events.values().any(|q| !q.is_empty()));
             self.redecline(st);
             self.land(st, agent);
         }
@@ -3822,6 +3826,7 @@ impl Inner {
             let me = Arc::downgrade(self);
             let asked = agent.ask(
                 span,
+                crate::lease::Kind::Weights,
                 region,
                 Box::new(move |got| {
                     if let Some(inner) = me.upgrade() {
