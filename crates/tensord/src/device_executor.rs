@@ -52,30 +52,49 @@ pub struct Hello {
     pub pgid: u32,
     pub runtime_version: String,
     pub tensorfs_version: String,
-    /// Executor memory wire contract: [`MEMORY_PROTOCOL`] receives table + row-lock descriptors
-    /// per GPU and uses varena's custody and RAM tier directly. Any other (a Runtime before
-    /// 0.31: 0) is given no ledger and runs its memory alone.
+    /// Executor memory wire contract ([`Contract`]): 2 leases chunks from each GPU's manager
+    /// besides its ledger rows, 1 receives table + row-lock descriptors per GPU, any other (a
+    /// Runtime before 0.31: 0) is given neither and runs its memory alone.
     pub memory_protocol: u32,
     pub sealed: BTreeMap<String, String>,
     pub torch_loaded: bool,
 }
 
-/// The executor memory wire contract this TensorD grants ledgers by.
-pub const MEMORY_PROTOCOL: u32 = 1;
+/// The lease protocol (design varena-leases), where varena serves one.
+#[cfg(unix)]
+const LEASES: Option<u32> = Some(varena::lease::PROTOCOL);
+#[cfg(not(unix))]
+const LEASES: Option<u32> = None;
+
+/// How an executor's GPU memory is served, by the memory protocol its Hello speaks. An executor
+/// is never refused for it: skew degrades to standalone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Contract {
+    /// Chunks leased over each GPU's listener, besides its ledger rows.
+    Leases,
+    /// Its ledger rows (protocol 1).
+    Rows,
+    /// Any other protocol: its own pages, its GPUs' tables by name.
+    Standalone,
+}
 
 impl Hello {
-    /// Whether it takes this TensorD's ledger descriptors: an executor of another memory
-    /// protocol runs on its GPUs with none (version skew degrades, it is not refused).
-    pub fn takes_ledgers(&self) -> bool {
-        self.memory_protocol == MEMORY_PROTOCOL
+    pub fn contract(&self) -> Contract {
+        match self.memory_protocol {
+            1 => Contract::Rows,
+            protocol if Some(protocol) == LEASES => Contract::Leases,
+            _ => Contract::Standalone,
+        }
     }
 
-    /// Ledger descriptors go only to an executor that reads them (the framing would break).
+    /// Refuses a Start whose descriptors or leases the executor's protocol cannot read.
     fn accepts(&self, command: &DeviceCommand) -> io::Result<()> {
-        if matches!(command, DeviceCommand::Start { ledgers, .. } if *ledgers != 0) && !self.takes_ledgers() {
-            return Err(io::Error::other(format!(
-                "ledger descriptors for an executor of memory protocol {} (Runtime {})",
-                self.memory_protocol, self.runtime_version,
+        let DeviceCommand::Start { ledgers, leases, .. } = command else { return Ok(()) };
+        let contract = self.contract();
+        if (*ledgers != 0 && contract == Contract::Standalone) || (leases.is_some() && contract != Contract::Leases) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
+                "Runtime {} speaks memory protocol {}: it reads no {}",
+                self.runtime_version, self.memory_protocol, if leases.is_some() { "leases" } else { "ledger descriptors" },
             )));
         }
         Ok(())
@@ -197,6 +216,10 @@ pub enum DeviceCommand {
         /// memory with the first and hands follower r the r-th (design varena-slim §3).
         #[serde(skip_serializing_if = "is_zero")]
         ledgers: u32,
+        /// The namespace (TensorD's uid) each GPU's lease listener (`lease-<uuid>`) is named in,
+        /// for an executor speaking the lease protocol; a GPU nobody serves runs its own pages.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        leases: Option<u32>,
         memory_mode: MemoryMode,
     },
     Load {
@@ -729,10 +752,10 @@ impl Line {
 /// keep the token, every other field is scanned.
 fn command_bytes(command: &DeviceCommand, memo: bool) -> io::Result<Vec<u8>> {
     let mut value = serde_json::to_value(command)?;
-    if matches!(command, DeviceCommand::Start { .. }) {
+    if let DeviceCommand::Start { leases, .. } = command {
         // The receiver checks this before reading any ledger descriptors. Older TensorD
         // sends none, allowing a rebuilt Runtime to refuse its single-fd contract safely.
-        value["memory_protocol"] = 1.into();
+        value["memory_protocol"] = leases.and(LEASES).unwrap_or(1).into();
         if memo {
             value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
         }
@@ -2046,6 +2069,7 @@ mod codec_tests {
                 call_interfaces: vec![],
                 constructions: vec![],
                 ledgers: 0,
+                leases: None,
                 memory_mode: mode,
             };
             let frame: Value = serde_json::from_slice(&command_bytes(&start, false).unwrap()).unwrap();
@@ -2089,22 +2113,29 @@ mod codec_tests {
     /// advertises none) starts on its GPUs with no ledger; ledger descriptors go only to one
     /// that reads them.
     #[test]
-    fn an_executor_of_another_memory_protocol_starts_on_its_gpus_without_ledgers() {
-        let start = |ledgers| DeviceCommand::Start {
+    fn each_memory_protocol_starts_on_what_it_reads_and_none_is_refused() {
+        let hello = |protocol: u32| -> Hello { serde_json::from_value(serde_json::json!({"runtime_version": "0.31.99", "memory_protocol": protocol})).unwrap() };
+        let start = |ledgers: u32, leases: Option<u32>| DeviceCommand::Start {
             devices: "0".into(), application: String::new(), package_interface: PathBuf::new(),
             sequence_parallel_degree: 1, import_only: false, call_interfaces: vec![],
-            constructions: vec![], ledgers, memory_mode: MemoryMode::Dedicated,
+            constructions: vec![], ledgers, leases, memory_mode: MemoryMode::Dedicated,
         };
-        for hello in [serde_json::json!({"runtime_version": "0.30.3"}), serde_json::json!({"memory_protocol": 2})] {
-            let other: Hello = serde_json::from_value(hello).unwrap();
-            assert!(!other.takes_ledgers());
-            other.accepts(&start(0)).unwrap();
-            assert!(other.accepts(&start(1)).is_err(), "{other:?}");
+        let (legacy, rows) = (hello(0), hello(1));
+        assert_eq!((legacy.contract(), rows.contract(), hello(9).contract()), (Contract::Standalone, Contract::Rows, Contract::Standalone));
+        // A GPU executor of any protocol starts: standalone, it is sent nothing it cannot read.
+        legacy.accepts(&start(0, None)).unwrap();
+        assert_eq!(legacy.accepts(&start(1, None)).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        rows.accepts(&start(1, None)).unwrap();
+        assert!(rows.accepts(&start(1, Some(1000))).is_err(), "rows read no leases");
+        let frame = |command: &DeviceCommand| serde_json::from_slice::<Value>(&command_bytes(command, false).unwrap()).unwrap()["memory_protocol"].clone();
+        assert_eq!(frame(&start(1, None)), 1);
+        #[cfg(unix)]
+        {
+            let leases = hello(varena::lease::PROTOCOL);
+            assert_eq!(leases.contract(), Contract::Leases);
+            leases.accepts(&start(1, Some(1000))).unwrap();
+            assert_eq!(frame(&start(1, Some(1000))), varena::lease::PROTOCOL);
         }
-        let capable: Hello = serde_json::from_value(serde_json::json!({"runtime_version": "0.31.99", "memory_protocol": 1})).unwrap();
-        assert!(capable.takes_ledgers());
-        capable.accepts(&start(1)).unwrap();
-        capable.accepts(&start(0)).unwrap();
     }
 
     /// An older Runtime's kept pages (`keep_pages`, its descriptors after the frame) are taken

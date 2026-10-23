@@ -61,19 +61,18 @@ pub(super) fn watch<B: MachineBackend>(
 }
 
 /// Disk use moves all the time; it alone is news once it moved by a hundredth of the disk.
+/// Lease books move with every grant: never news alone.
 fn changed(last: &v1::StatusFrame, next: &v1::StatusFrame) -> bool {
     let moved = match (&last.disk, &next.disk) {
         (Some(a), Some(b)) => a.free_bytes.abs_diff(b.free_bytes) >= b.total_bytes / 100,
         (a, b) => a != b,
     };
-    moved
-        || v1::StatusFrame {
-            disk: None,
-            ..last.clone()
-        } != v1::StatusFrame {
-            disk: None,
-            ..next.clone()
-        }
+    let still = |frame: &v1::StatusFrame| v1::StatusFrame {
+        disk: None,
+        gpus: frame.gpus.iter().map(|gpu| v1::Gpu { leases: None, ..gpu.clone() }).collect(),
+        ..frame.clone()
+    };
+    moved || still(last) != still(next)
 }
 
 pub(super) fn identity_frame(identity: &MachineIdentity) -> v1::StatusFrame {
@@ -105,10 +104,10 @@ pub(super) async fn frame<B: MachineBackend>(
     actor: VerifiedActor,
 ) -> Result<v1::StatusFrame, Error> {
     let store = identity.store.clone();
-    let ((runs, environments), warm, models) = blocking(backend, move |backend| {
+    let ((runs, environments), warm, models, mut leases) = blocking(backend, move |backend| {
         let models = store.as_deref().map(crate::held_models::listing);
         let held = held(backend, actor)?;
-        Ok((held, backend.warm_set(actor)?, models.unwrap_or_default()))
+        Ok((held, backend.warm_set(actor)?, models.unwrap_or_default(), backend.leases()))
     })
     .await?;
     let software = identity
@@ -144,6 +143,7 @@ pub(super) async fn frame<B: MachineBackend>(
                 },
                 memory_class: g.memory_class.clone(),
                 memory_limit_bytes: identity.gpu_memory_limit.filter(|&l| l < g.memory_bytes).unwrap_or(0),
+                leases: leases.remove(&g.device_uuid),
             })
             .collect(),
         hubs: identity
@@ -170,6 +170,7 @@ pub(super) async fn frame<B: MachineBackend>(
         },
         toolchain: identity.updates.as_ref().map(|u| u.toolchain()).unwrap_or_default(),
         kernels: identity.updates.as_ref().map(|u| u.kernels()).unwrap_or_default(),
+        tensord_pid: std::process::id(),
         ..identity_frame(identity)
     })
 }

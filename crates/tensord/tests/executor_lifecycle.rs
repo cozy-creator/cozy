@@ -85,6 +85,7 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
             call_interfaces: vec![],
             constructions: Vec::new(),
             ledgers: 0,
+            leases: None,
             memory_mode: tensord::device_executor::MemoryMode::Shared,
         },
         DeviceCommand::Load {
@@ -488,6 +489,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
             call_interfaces: vec![],
             constructions: Vec::new(),
             ledgers: 0,
+            leases: None,
             memory_mode: tensord::device_executor::MemoryMode::Shared,
         },
         DeviceCommand::Load {
