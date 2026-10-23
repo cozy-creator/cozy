@@ -2,12 +2,12 @@
 use std::process::ExitCode;
 
 use protocol::{
-    calcifer::{Machine, MachineKind, MachineList, MachineState, MachineStatus, Rental},
+    calcifer::{LiveRun, Machine, MachineKind, MachineList, MachineState, MachineStatus, Rental},
     error::Error,
 };
 
 use super::{Notices, clock, machine, now_ms, usd};
-use crate::{Context, output, tui};
+use crate::{Context, output, run, tui};
 
 /// A Hub failure code: the provider stopped the pod. The Hub keeps the rental and never replaces it.
 const PROVIDER_STOPPED: &str = "readiness.provider_stopped";
@@ -231,6 +231,22 @@ pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
     record
 }
 
+/// A run the machine holds: its state there, target, stage and why it waits. One whose record
+/// here ended is an executor left behind.
+fn live_run(held: &LiveRun) -> (String, String) {
+    let Some(run) = &held.run else {
+        return (format!("run {}", held.id), format!("{}; no record of it here", held.state));
+    };
+    let row = run::list::row(run);
+    let reason = Some(&row[6]).filter(|r| !r.is_empty()).unwrap_or(&held.waiting);
+    let cells = [&held.state, &row[1], &row[4], reason];
+    let mut cell = cells.into_iter().filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join(" · ");
+    if run::settled(run) {
+        cell += &format!("; {} here, left behind on the machine", row[3]);
+    }
+    (format!("run {}", run.number), cell)
+}
+
 /// What a machine reports of itself, one fact per line, GPUs by number.
 pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
     let mut fields = vec![
@@ -283,7 +299,7 @@ pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
             ),
         ));
     }
-    fields.push(("live runs".into(), status.live_runs.to_string()));
+    fields.extend(status.runs.iter().map(live_run));
     if !status.driver_floor.is_empty() {
         let old: Vec<String> = status
             .gpus

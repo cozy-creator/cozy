@@ -646,8 +646,9 @@ impl Store {
         })
     }
 
-    /// The runs `filter` names, newest first, and how many more match beyond its limit.
-    pub fn runs(&self, filter: &RunFilter) -> Result<(Vec<RunRow>, u64)> {
+    /// The runs `filter` names, newest first; how many more match beyond its limit; and each
+    /// matching run it cannot read, as `run N: why`, left out.
+    pub fn runs(&self, filter: &RunFilter) -> Result<(Vec<RunRow>, u64, Vec<String>)> {
         const MATCHING: &str = "FROM runs WHERE number < ?1
             AND (?2 IS NULL OR CASE state WHEN 'accepted' THEN 'in_progress' WHEN 'settled' THEN status
                 ELSE 'queued' END = ?2)
@@ -670,22 +671,20 @@ impl Store {
             let mut statement = conn.prepare(&format!(
                 "SELECT {RUN_COLUMNS} {MATCHING} ORDER BY number DESC LIMIT ?5"
             ))?;
-            let rows = statement
-                .query_map(
-                    params![
-                        before,
-                        status,
-                        filter.target,
-                        filter.machine,
-                        filter.limit as i64
-                    ],
-                    run_row,
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            let older = (total as u64).saturating_sub(rows.len() as u64);
-            Ok((rows, older))
+            let read = statement.query_map(
+                params![before, status, filter.target, filter.machine, filter.limit as i64],
+                |r| Ok((r.get::<_, i64>(1)?, run_row(r))),
+            )?;
+            let (mut rows, mut unreadable) = (vec![], vec![]);
+            for item in read {
+                let (number, row) = item?;
+                match row.map_err(StoreError::from).and_then(|row| row) {
+                    Ok(row) => rows.push(row),
+                    Err(e) => unreadable.push(format!("run {number}: {e}")),
+                }
+            }
+            let older = (total as u64).saturating_sub((rows.len() + unreadable.len()) as u64);
+            Ok((rows, older, unreadable))
         })
     }
 
@@ -1265,7 +1264,11 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
                 .map_err(|_| corrupt("a run's Hub"))?,
             machine: r.get(5)?,
             pinned: r.get(6)?,
-            spec: serde_json::from_slice(&spec).map_err(|_| corrupt("a run's spec"))?,
+            // A run imported from the Go CLI was recorded without one.
+            spec: match spec.is_empty() {
+                true => v1::RunSpec::default(),
+                false => serde_json::from_slice(&spec).map_err(|_| corrupt("a run's spec"))?,
+            },
             out_dir: PathBuf::from(out_dir),
             state: match state.as_str() {
                 "queued" => State::Queued,

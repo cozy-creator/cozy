@@ -81,7 +81,8 @@ fn a_key_names_one_submission_forever_across_a_reopen() {
         Err(StoreError::UnknownMachine(_))
     ));
     let listed = |filter: RunFilter| {
-        let (rows, older) = store.runs(&filter).unwrap();
+        let (rows, older, unreadable) = store.runs(&filter).unwrap();
+        assert!(unreadable.is_empty(), "{unreadable:?}");
         (rows.iter().map(|r| r.number).collect::<Vec<_>>(), older)
     };
     let all = || RunFilter {
@@ -146,6 +147,41 @@ fn a_key_names_one_submission_forever_across_a_reopen() {
 
 /// The send boundary and a cancel race on two threads over many runs: every run is either sent
 /// (and its cancel waits for its machine) or canceled having never been sent.
+/// A run imported from the Go CLI kept no spec, and lists; a row the store cannot read is left
+/// out of a list, named, and the runs around it still list.
+#[test]
+fn a_list_reads_imported_runs_and_names_a_row_it_cannot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    for n in 1..=3 {
+        store
+            .submit(&format!("key-{n}"), "d", new_run(n, None, false))
+            .unwrap();
+    }
+    drop(store);
+    let db = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+    db.execute("UPDATE runs SET spec = x'' WHERE number = 1", [])
+        .unwrap();
+    db.execute("UPDATE runs SET spec = x'7b' WHERE number = 2", [])
+        .unwrap();
+    drop(db);
+    let store = open(dir.path());
+    let all = RunFilter {
+        limit: 10,
+        ..Default::default()
+    };
+    let (rows, older, unreadable) = store.runs(&all).unwrap();
+    assert_eq!(rows.iter().map(|r| r.number).collect::<Vec<_>>(), [3, 1]);
+    assert_eq!(rows[1].spec, v1::RunSpec::default());
+    assert_eq!(older, 0);
+    assert_eq!(
+        unreadable,
+        ["run 2: Calcifer's store holds a row it cannot read: a run's spec"]
+    );
+    let (_, older, _) = store.runs(&RunFilter { limit: 1, ..all }).unwrap();
+    assert_eq!(older, 2);
+}
+
 #[test]
 fn the_send_boundary_and_a_cancel_never_both_win() {
     let dir = tempfile::tempdir().unwrap();
