@@ -24,7 +24,7 @@ mod follow;
 pub(crate) mod interface;
 pub(crate) mod list;
 pub(crate) mod live;
-mod local;
+pub(crate) mod local;
 mod play;
 mod show;
 mod spec;
