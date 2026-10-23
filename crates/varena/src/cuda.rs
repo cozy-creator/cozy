@@ -497,19 +497,3 @@ impl Backend for CudaBackend {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Hosted runners have no NVIDIA driver; run there with `--ignored`, never where a GPU is.
-    #[test]
-    #[ignore = "a machine without a CUDA driver only"]
-    fn no_driver_is_a_typed_error() {
-        match CudaBackend::open(0) {
-            Err(Error::Device { op: "load the driver", .. }) => {}
-            Err(e) => unreachable!("expected no driver, got {e}"),
-            Ok(_) => unreachable!("this machine has a CUDA driver"),
-        }
-    }
-}

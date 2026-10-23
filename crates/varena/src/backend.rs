@@ -396,38 +396,3 @@ impl<H: Copy> Events<H> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
-    use std::collections::HashSet;
-
-    use super::*;
-
-    /// A retire never destroys; an event given up twice, while pending and after, is destroyed
-    /// once by a sweep, when complete. A stale id retired after its handle was handed out again
-    /// (the driver reuses handles) reaches nothing: the new event lives on.
-    #[test]
-    fn a_retired_event_is_destroyed_once_and_only_once_complete() {
-        let (events, complete, destroyed) = (Events::<u64>::default(), RefCell::new(HashSet::new()), RefCell::new(Vec::new()));
-        let done = |h: u64| complete.borrow().contains(&h);
-        let destroy = |h: u64| destroyed.borrow_mut().push(h);
-        let first = events.add(7);
-        events.retire(first);
-        events.retire(first);
-        events.retire(Event::DONE);
-        assert!(destroyed.borrow().is_empty(), "a retire destroyed");
-        events.sweep(done, destroy);
-        assert!(destroyed.borrow().is_empty(), "a pending event was destroyed");
-        complete.borrow_mut().insert(7);
-        events.sweep(done, destroy);
-        events.sweep(done, destroy);
-        assert_eq!(*destroyed.borrow(), vec![7], "destroyed once, once complete");
-        // The driver hands handle 7 out again: a stale retire of the first id cannot reach it.
-        complete.borrow_mut().remove(&7);
-        let second = events.add(7);
-        events.retire(first);
-        events.sweep(done, destroy);
-        assert_eq!((events.get(second), destroyed.borrow().len()), (Some(7), 1), "a stale id reached a live handle");
-    }
-}

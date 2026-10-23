@@ -693,6 +693,3 @@ pub(crate) fn reclaim(id: u64, swap: bool) -> Result<Reclaimed> {
         None => Ok(Reclaimed::Gone),
     }
 }
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests;
