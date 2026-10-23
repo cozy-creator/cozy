@@ -746,7 +746,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(said(&step(1, 580_400.0, 0.0)), "Generating original 768p video / denoise 1/8 · first step 9m40s");
-        assert_eq!(said(&step(3, 64_000.0, 65_300.0)), "Generating original 768p video / denoise 3/8 · 64.0s last, 65.3s avg");
+        assert_eq!(said(&step(3, 54_000.0, 55_300.0)), "Generating original 768p video / denoise 3/8 · 54.0s last, 55.3s avg");
         let arriving = Progress {
             stage: "Generating original 768p video · downloading fidika/minimax-h3 weights".into(),
             bytes_done: 34 << 30, bytes_total: 61 << 30, ..Default::default()
