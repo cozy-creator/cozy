@@ -2416,11 +2416,13 @@ impl Inner {
         self.unlock(st);
         if !idle {
             self.coreside(rid)?;
+            self.unkeep(rid);
         }
         Ok(rid)
     }
 
-    /// At a pass start (never in the allocator hook, which makes no custody call): kept pages
+    /// At a request's open and its pass starts (never in the allocator hook, which makes no
+    /// custody call): kept pages
     /// the hook may need are withdrawn from custody and stay mapped, so its local work can take
     /// them, in [`decide::victims`]' order: all of them for an unmeasured request, else as many
     /// as its recorded peak lacks beside the free bytes and what the hook could take already.
@@ -2443,14 +2445,13 @@ impl Inner {
             }
             let Some(h) = st.homes.get(&key).filter(|h| h.exported) else { continue };
             let (fp, gen) = (h.identity.clone(), h.gen);
-            if let Some(ticket) = self.withdraw(fp, key.1, 0) {
-                withdrawn.push((key, gen, ticket));
-            }
+            // None: its Export was still queued and is cancelled; custody never had it.
+            withdrawn.push((key, gen, self.withdraw(fp, key.1, 0)));
             need = need.saturating_sub(bytes);
         }
         self.unlock(st);
         // Still kept (custody holds the memory, the hook never takes it) until custody let go.
-        if let Some(last) = withdrawn.iter().map(|(.., t)| *t).max() {
+        if let Some(last) = withdrawn.iter().filter_map(|(.., t)| *t).max() {
             self.to_custody.settle_to(last + 1);
         }
         let mut st = self.lock();
