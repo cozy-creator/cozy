@@ -2445,7 +2445,13 @@ impl Inner {
     /// as its recorded peak lacks beside the free bytes and what the hook could take already.
     /// They are kept again when no request is open.
     fn unkeep(&self, req: u64) {
-        let st = self.lock();
+        let mut st = self.lock();
+        // A Keep already protecting when the request opened ends kept: withdrawn below.
+        while st.homes.values().any(|h| h.protecting) {
+            if self.wait(&mut st).is_err() {
+                return self.unlock(st);
+            }
+        }
         if !st.homes.values().any(|h| h.exported) {
             return self.unlock(st);
         }
@@ -3435,6 +3441,18 @@ impl Inner {
             st.keep_queued.remove(&set);
             let Ok(va) = st.mech(set).map(|m| m.va) else { return };
             let due: Vec<Key> = st.keep_due.range((set, 0)..=(set, u32::MAX)).copied().collect();
+            // A request opened since this Keep was queued: the pages stay the hook's, and its
+            // end keeps them.
+            if !st.table.requests.is_empty() {
+                for key in due {
+                    st.keep_due.remove(&key);
+                    if let Some(h) = st.homes.get_mut(&key) {
+                        h.keeping = false;
+                    }
+                    st.sync(key);
+                }
+                return;
+            }
             let mut pages = vec![];
             for key in due {
                 let (place, idle) = (st.place(key), st.idle(key));
