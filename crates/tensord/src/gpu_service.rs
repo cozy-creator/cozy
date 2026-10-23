@@ -1001,7 +1001,7 @@ impl Pool {
         self.tenants.lock().unwrap().retain(|_, t|
             !(t.plan == plan && t.start == start && gone.contains(t.exact.birth())));
         for gpu in self.lane(start, degree).unwrap_or_default().iter().filter_map(|d| d.memory.as_ref()) {
-            gone.iter().for_each(|birth| gpu.ledger().reap(birth.pid));
+            gone.iter().for_each(|birth| gpu.reap(birth.pid));
         }
     }
     /// The engine's dispatch wakes whenever a ledger signals: a queued request asks `fits`
@@ -2568,9 +2568,13 @@ impl Pool {
             // exit reaps them. An executor speaking leases also dials each GPU's manager; one
             // speaking neither protocol runs standalone, never refused.
             let contract = session.executor.hello.contract();
-            if contract == device_executor::Contract::Standalone {
+            let standalone = contract == device_executor::Contract::Standalone;
+            if standalone {
                 self.notes.note(serde_json::json!({"event": "standalone", "pid": session.executor.birth.pid,
                     "memory_protocol": session.executor.hello.memory_protocol, "runtime": session.executor.hello.runtime_version}));
+                if let Some(gpu) = gpus.first().and_then(|d| d.memory.as_ref()) {
+                    gpu.fix(session.executor.birth.pid);
+                }
             }
             let leases = (contract == device_executor::Contract::Leases
                 && gpus.iter().any(|d| d.memory.as_ref().is_some_and(|m| m.manager().is_some())))
@@ -2613,6 +2617,12 @@ impl Pool {
                 }));
             }
             session.followers = callbacks.formation.as_ref().map_or(Ok(vec![]), |formation| formation.register(&started.follower_pids))?;
+            // A standalone group's rank r runs its own pages on the lane's GPU r.
+            for (follower, gpu) in session.followers.iter().zip(gpus.iter().skip(1)).filter(|_| standalone) {
+                if let Some(gpu) = gpu.memory.as_ref() {
+                    gpu.fix(follower.birth().pid);
+                }
+            }
             if session.followers.len() + 1 != ranks as usize {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),

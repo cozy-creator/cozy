@@ -23,7 +23,10 @@ use std::{
 };
 use platform::{handles::Peer, process::Exact};
 use varena::lease::{Hosting, Identity, Manager, Record};
-use varena::{ledger::Mode, Backend, CudaBackend, GpuId, HostCall, Ledger, Peak};
+use varena::{
+    ledger::{FixedRow, Mode},
+    Backend, CudaBackend, GpuId, HostCall, Ledger, Peak,
+};
 
 /// Past this the memory log rotates to `memory.log.1`, so it holds at most twice this.
 const ROTATE_BYTES: u64 = 4 << 20;
@@ -33,7 +36,19 @@ const ROTATE_BYTES: u64 = 4 << 20;
 pub struct Gpu {
     held: Held,
     pub model: String,
+    uuid: String,
+    fixed: Arc<Mutex<Fixed>>,
 }
+
+/// Standalone executors' fixed rows by pid (varena-leases R2-2), and whether their sampler runs.
+#[derive(Default)]
+struct Fixed {
+    rows: BTreeMap<u32, FixedRow>,
+    sampling: bool,
+}
+
+/// How often a fixed row's bytes are read again while one lives.
+const FIXED_SAMPLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 enum Held {
     Leases(Arc<Manager>),
@@ -78,7 +93,7 @@ impl Gpu {
                 Held::Ledger(ledger)
             }
         };
-        let gpu = Gpu { held, model: id.model.clone() };
+        let gpu = Gpu { held, model: id.model.clone(), uuid: id.uuid.clone(), fixed: Arc::default() };
         peaks.restore(&id.model, gpu.ledger());
         let leased = gpu.manager().is_some();
         log.note(serde_json::json!({"event": "ledger", "gpu": entry, "card": id.memory, "capacity": gpu.ledger().status().capacity, "leases": leased}));
@@ -87,7 +102,33 @@ impl Gpu {
 
     /// A GPU on `ledger` alone.
     pub fn ledgered(ledger: Ledger, model: &str) -> Gpu {
-        Gpu { held: Held::Ledger(ledger), model: model.into() }
+        Gpu { held: Held::Ledger(ledger), model: model.into(), uuid: String::new(), fixed: Arc::default() }
+    }
+
+    /// Standalone executor `pid` on it: a fixed row, never asked and never foreign, holding its
+    /// bytes as NVML charges its pid, read every half second while any fixed row lives (where
+    /// NVML names no pid of ours, a container's, they stay unmeasured).
+    pub fn fix(&self, pid: u32) {
+        let row = match self.ledger().fixed(pid) {
+            Ok(row) => row,
+            Err(error) => return tracing::warn!("memory: standalone executor {pid} has no fixed row: {error}"),
+        };
+        let mut fixed = self.fixed.lock().unwrap();
+        fixed.rows.insert(pid, row);
+        if !std::mem::replace(&mut fixed.sampling, true) {
+            let (uuid, rows) = (self.uuid.clone(), Arc::downgrade(&self.fixed));
+            let spawned = std::thread::Builder::new().name("fixed-rows".into()).spawn(move || sample_fixed(&uuid, rows));
+            if let Err(error) = spawned {
+                fixed.sampling = false;
+                tracing::warn!("memory: fixed rows unsampled: {error}");
+            }
+        }
+    }
+
+    /// After `waitpid`: `pid`'s rows go.
+    pub fn reap(&self, pid: u32) {
+        self.fixed.lock().unwrap().rows.remove(&pid);
+        self.ledger().reap(pid);
     }
 
     /// The GPU's admission and placement facts (the manager's ledger, until step 4).
@@ -164,6 +205,24 @@ impl Hosting for Peers {
             Ok(event) => self.notes.note(event),
             Err(error) => tracing::warn!("memory: a lease record unwritten: {error}"),
         }
+    }
+}
+
+/// Sets each fixed row's bytes from NVML's per-pid reading until none is left.
+fn sample_fixed(uuid: &str, fixed: std::sync::Weak<Mutex<Fixed>>) {
+    let device = platform::gpu::Device::open(uuid).inspect_err(|error| tracing::warn!("memory: fixed rows unmeasured: {error}")).ok();
+    while let Some(fixed) = fixed.upgrade() {
+        let processes = device.as_ref().and_then(|device| device.read().ok()).and_then(|reading| reading.processes);
+        let mut held = fixed.lock().unwrap();
+        if held.rows.is_empty() {
+            held.sampling = false;
+            return;
+        }
+        for (pid, row) in processes.iter().flat_map(|processes| held.rows.iter().map(move |(pid, row)| (processes.get(pid), row))) {
+            row.set(pid.copied().unwrap_or(0));
+        }
+        drop((held, fixed));
+        std::thread::sleep(FIXED_SAMPLE);
     }
 }
 
