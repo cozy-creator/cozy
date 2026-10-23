@@ -24,6 +24,9 @@ pub struct Recipe {
     pub name: String,
     pub lane: String,
     pub model: RecipeModel,
+    /// `module:function` that calibrates on the model itself, constructed in `quantize`'s slot.
+    #[serde(default, deserialize_with = "or_default")]
+    pub calibrate: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,7 +37,7 @@ pub struct RecipeModel {
 }
 
 /// The lanes `cozy model quantize` names by a flag of their own (`--int8`).
-pub const LANE_FLAGS: [&str; 4] = ["int8", "fp8", "nvfp4", "w4a8"];
+pub const LANE_FLAGS: [&str; 5] = ["int8", "fp8", "nvfp4", "w4a8", "svdq-nvfp4"];
 
 impl Recipe {
     /// The `cozy model quantize` flag that runs it: its lane's, else its name.

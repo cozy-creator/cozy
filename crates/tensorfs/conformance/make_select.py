@@ -15,7 +15,7 @@ ROOT = Path(__file__).parent / "vectors"
 HEADERS = ROOT / "select"
 HEADERS.mkdir(exist_ok=True)
 TABLE = {"BF16": ("bf16", 16), "F16": ("fp16", 16), "F32": ("f32", 16), "nvfp4": ("nvfp4", 4), "mxfp4": ("mxfp4", 4),
-         "w4a8.convrot": ("w4a8", 4)}
+         "w4a8.convrot": ("w4a8", 4), "svdq.nvfp4": ("svdq-nvfp4", 4)}
 profiles = {}
 
 
@@ -64,6 +64,9 @@ header("nvfp4-int8-heavy", [("int8.convrot", 96), ("nvfp4", 32), ("BF16", 16)])
 # kitchen's own scheme beside int8, which has no lane (a reader of rule 3 read it as int8).
 header("w4a8-int8", [("w4a8.convrot", 36), ("int8.convrot", 40), ("BF16", 16)])
 header("kitchen-int8", [("comfy.asym_w4a8_int8", 36), ("int8.convrot", 40), ("BF16", 16)])
+# An svdq-nvfp4 variant (xs-066): the blocks in svdq.nvfp4, its sensitive layers int8, as a lane recipe writes it.
+header("svdq-int8", [("svdq.nvfp4", 44), ("int8.convrot", 40), ("BF16", 16)])
+header("svdq-bf16", [("svdq.nvfp4", 44), ("BF16", 16)])
 for scheme in sorted(SCHEMES):
     header(f"scheme-{scheme}", [(scheme, 64)])
 
@@ -138,7 +141,8 @@ case("a misleading name carries no precision", {"int8.cozytensors": "bf16", "bf1
 case("equal family chooses smaller stored bytes", {"a.cozytensors": "fp8", "z.cozytensors": "fp8-small"}, ["9.0"], "z.cozytensors",
      ["precision 8: acme/model@1 has no int8 lane for sm90; served fp8"], bits=8)
 case("equal profiles choose lexicographic path", {"z.cozytensors": "int8", "a.cozytensors": "int8"}, ["9.0"], "a.cozytensors", bits=8)
-case("native FP4 precedes smaller weight-only int4", {"a.cozytensors": "int4", "z.cozytensors": "nvfp4"}, ["10.0"], "z.cozytensors", bits=4)
+case("native FP4 precedes smaller weight-only int4", {"a.cozytensors": "int4", "z.cozytensors": "nvfp4"}, ["10.0"], "z.cozytensors",
+     ["precision 4: acme/model@1 has no svdq-nvfp4 lane for sm100; served nvfp4"], bits=4)
 case("all weight-only ranks by bytes", {"a.cozytensors": "nvfp4", "z.cozytensors": "int4"}, ["8.6"], "z.cozytensors", bits=4)
 case("a sole 8-bit variant serves the CPU at bits 8", {"model.cozytensors": "int8"}, [], "model.cozytensors",
      ["precision 8: acme/model@1 has no bf16 or fp16 lane for no GPU; served int8"], bits=8)
@@ -158,16 +162,18 @@ case("invalid bits", paths, ["9.0"], None, bits=3, error="invalid")
 h3 = {"model.int8.cozytensors": "int8-convrot", "model.nvfp4.cozytensors": "nvfp4-int8-heavy"}
 case("a variant holding nvfp4 is 4-bit, however many int8 bytes it holds", h3, ["12.0"], "model.int8.cozytensors", bits=8)
 case("the default lane takes int8 over a smaller nvfp4 variant", h3, ["12.0"], "model.int8.cozytensors")
-case("four bits take the nvfp4 variant", h3, ["12.0"], "model.nvfp4.cozytensors", bits=4)
+case("four bits take the nvfp4 variant", h3, ["12.0"], "model.nvfp4.cozytensors",
+     ["precision 4: acme/model@1 has no svdq-nvfp4 lane for sm120; served nvfp4"], bits=4)
 case("the nvfp4 variant serves 4 bits before Blackwell, weight-only", h3, ["8.9"], "model.nvfp4.cozytensors",
      ["precision 4: acme/model@1 has no w4a8 lane for sm89; served nvfp4"], bits=4)
 # w4a8 (xs-062): 4 bits on int8 tensor cores, first before Blackwell, after nvfp4 on it.
 w4 = {**h3, "model.w4a8.cozytensors": "w4a8-int8"}
 case("four bits take w4a8 on Ampere", w4, ["8.6"], "model.w4a8.cozytensors", bits=4)
 case("four bits take w4a8 on Hopper", w4, ["9.0"], "model.w4a8.cozytensors", bits=4)
-case("four bits take nvfp4 on Blackwell", w4, ["12.0"], "model.nvfp4.cozytensors", bits=4)
+case("four bits take nvfp4 on Blackwell", w4, ["12.0"], "model.nvfp4.cozytensors",
+     ["precision 4: acme/model@1 has no svdq-nvfp4 lane for sm120; served nvfp4"], bits=4)
 case("Blackwell without nvfp4 takes w4a8", {k: v for k, v in w4.items() if "nvfp4" not in k}, ["10.0"], "model.w4a8.cozytensors",
-     ["precision 4: acme/model@1 has no nvfp4 lane for sm100; served w4a8"], bits=4)
+     ["precision 4: acme/model@1 has no svdq-nvfp4 or nvfp4 lane for sm100; served w4a8"], bits=4)
 case("the default lane takes int8 over a smaller w4a8 variant", w4, ["8.6"], "model.int8.cozytensors")
 kitchen = {**h3, "model.kitchen.cozytensors": "kitchen-int8"}
 case("kitchen's scheme beside int8 has no lane", kitchen, ["8.6"], "model.int8.cozytensors")
@@ -176,7 +182,8 @@ case("kitchen's scheme is not the w4a8 lane", kitchen, ["8.6"], "model.nvfp4.coz
 case("eight never takes a w4a8 variant", w4, ["9.0"], "model.int8.cozytensors", bits=8)
 case("a decode slot's own 4 bits take nvfp4 before w4a8", w4, ["8.9"], "model.nvfp4.cozytensors", prefer=4, min_bits=4)
 case("a decode slot takes w4a8 without nvfp4", {k: v for k, v in w4.items() if "nvfp4" not in k}, ["8.9"],
-     "model.w4a8.cozytensors", ["precision 4: acme/model@1 has no nvfp4 lane for sm89; served w4a8"], prefer=4, min_bits=4)
+     "model.w4a8.cozytensors", ["precision 4: acme/model@1 has no nvfp4 or svdq-nvfp4 lane for sm89; served w4a8"],
+     prefer=4, min_bits=4)
 case("asked 4 bits on a decode slot take w4a8", w4, ["8.9"], "model.w4a8.cozytensors", bits=4, min_bits=4)
 case("B300 has no int8, so no w4a8", {"model.w4a8.cozytensors": "w4a8-int8"}, ["10.3"], None, bits=4,
      refused=none(4, "sm103", "model.w4a8.cozytensors (w4a8) needs sm80+ except sm103 for int8.convrot "
@@ -187,6 +194,27 @@ case("the CPU takes int8 over a smaller nvfp4 variant unasked", h3, [], "model.i
      ["precision 8: acme/model@1 has no bf16 or fp16 lane for no GPU; served int8"])
 case("a sole w4a8 variant serves the CPU", {"model.w4a8.cozytensors": "w4a8-int8"}, [], "model.w4a8.cozytensors",
      ["precision 4: acme/model@1 has no bf16 or fp16 lane for no GPU; served w4a8"], bits=4)
+# svdq-nvfp4 (xs-066): first at 4 bits where FP4 runs natively, last elsewhere; a decode slot keeps nvfp4 first.
+sv = {**w4, "model.svdq.cozytensors": "svdq-int8"}
+case("four bits take svdq-nvfp4 on Blackwell", sv, ["12.0"], "model.svdq.cozytensors", bits=4)
+case("four bits take svdq-nvfp4 on Blackwell Ultra", {"model.svdq.cozytensors": "svdq-bf16", "model.nvfp4.cozytensors": "nvfp4"},
+     ["10.3"], "model.svdq.cozytensors", bits=4)
+case("four bits take w4a8 before svdq-nvfp4 on Ampere", sv, ["8.6"], "model.w4a8.cozytensors", bits=4)
+case("Hopper without w4a8 takes nvfp4 before svdq-nvfp4", {k: v for k, v in sv.items() if "w4a8" not in k}, ["9.0"],
+     "model.nvfp4.cozytensors", ["precision 4: acme/model@1 has no w4a8 lane for sm90; served nvfp4"], bits=4)
+case("Ada takes svdq-nvfp4 last, weight-only", {"model.svdq.cozytensors": "svdq-int8", "model.int8.cozytensors": "int8-convrot"},
+     ["8.9"], "model.svdq.cozytensors", ["precision 4: acme/model@1 has no w4a8 or nvfp4 lane for sm89; served svdq-nvfp4"],
+     bits=4)
+case("a decode slot keeps nvfp4 before svdq-nvfp4 on Blackwell", sv, ["12.0"], "model.nvfp4.cozytensors", prefer=4, min_bits=4)
+case("a decode slot takes svdq-nvfp4 before w4a8", {k: v for k, v in sv.items() if "nvfp4" not in k or "svdq" in k},
+     ["12.0"], "model.svdq.cozytensors", ["precision 4: acme/model@1 has no nvfp4 lane for sm120; served svdq-nvfp4"],
+     prefer=4, min_bits=4)
+case("the default lane takes int8 over a smaller svdq-nvfp4 variant", sv, ["12.0"], "model.int8.cozytensors")
+case("eight never takes an svdq-nvfp4 variant", sv, ["12.0"], "model.int8.cozytensors", bits=8)
+case("a sole svdq-nvfp4 variant serves the CPU", {"model.svdq.cozytensors": "svdq-bf16"}, [], "model.svdq.cozytensors",
+     ["precision 4: acme/model@1 has no bf16 or fp16 lane for no GPU; served svdq-nvfp4"], bits=4)
+case("Turing runs no svdq-nvfp4", {"model.svdq.cozytensors": "svdq-bf16"}, ["7.5"], None, bits=4,
+     refused=none(4, "sm75", "model.svdq.cozytensors (svdq-nvfp4) needs sm80+ for svdq.nvfp4"))
 case("a run's lane is its main model's: H3's 16-bit-only LoRA is asked nothing", {"lora.cozytensors": "bf16"}, ["12.0"],
      "lora.cozytensors", ["precision 8: acme/model@1 has no int8 or fp8 lane for sm120; served bf16"])
 # A slot: its lane first, never narrower than min_bits unasked, encoded weights only when it takes them.
@@ -205,7 +233,8 @@ case("a 16-bit slot prefers bf16 and refuses 8-bit unasked", {"a.cozytensors": "
 for scheme in sorted(SCHEMES):
     fam, width = family(scheme)
     reasons = {"fp8": ["precision 8: acme/model@1 has no int8 lane for sm100; served fp8"],
-               "w4a8": ["precision 4: acme/model@1 has no nvfp4 lane for sm100; served w4a8"]}.get(fam, [])
+               "w4a8": ["precision 4: acme/model@1 has no nvfp4 or svdq-nvfp4 lane for sm100; served w4a8"],
+               "svdq-nvfp4": ["precision 4: acme/model@1 has no nvfp4 lane for sm100; served svdq-nvfp4"]}.get(fam, [])
     chosen, reasons = ("s.cozytensors", reasons) if fam else ("f32.cozytensors", [])
     case(f"scheme {scheme}", {"s.cozytensors": f"scheme-{scheme}", "f32.cozytensors": "f32"}, ["10.0"], chosen, reasons,
          prefer=4 if width == 4 else 8)

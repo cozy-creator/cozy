@@ -1631,3 +1631,78 @@ fn comfy_empty_packed_rows_recover_large_widths_without_overflow() {
         assert!(e.detail.contains(why), "{format}: {}", e.detail);
     }
 }
+
+/// Nunchaku's svdq-fp4 single files (`fixtures/quantized/make_nunchaku.py`: v1's own packers over
+/// random parts) import into `svdq.nvfp4` in natural layout: every part byte for byte, a fused
+/// `to_qkv` as `to_q`, `to_k` and `to_v`, biases out of their lanes, `smooth_factor_orig` dropped,
+/// cozy's int8 low-rank branch dequantized; each decodes to v1's own logical weight.
+#[test]
+fn nunchaku_svdq_fp4_imports_in_natural_layout() {
+    // v1 rounds a dequantized int8 branch to BF16; the import keeps its exact f32 product.
+    for (case, weights, within) in [("nunchaku-svdq-fp4", 4, 1e-6), ("nunchaku-svdq-fp4-lr8", 1, 4e-3)] {
+        let dir = Scratch::new(case);
+        let store = Store::open(dir.0.join("store")).unwrap();
+        let ck = import(&store, &fixtures().join(case)).unwrap();
+        let expect: BTreeMap<String, Vec<u8>> =
+            read_safetensors(&fixtures().join(format!("{case}.expect.safetensors")))
+                .into_iter()
+                .map(|(k, _, _, b)| (k, b))
+                .collect();
+        let raw = |at: &tensorfs::format::Location| {
+            let mut buf = vec![0; at.length as usize];
+            ck.bytes_into(at, &mut buf).unwrap();
+            buf
+        };
+        let laws: Vec<(&str, &Vec<u8>)> = expect.iter().filter_map(|(k, v)| Some((k.strip_prefix("law.")?, v))).collect();
+        assert_eq!(laws.len(), weights, "{case}");
+        for (key, law) in laws {
+            let t = ck.tensor("model", key).unwrap();
+            let Body::Encoded { encoding, parts } = &t.body else { panic!("{key}: plain") };
+            assert_eq!((encoding.scheme.as_str(), &t.dtype), ("svdq.nvfp4", &Dtype::BF16), "{key}");
+            let bytes: Vec<Vec<u8>> = parts.iter().map(|p| raw(&p.at())).collect();
+            for (p, got) in parts.iter().zip(&bytes) {
+                assert_eq!(got, &expect[&format!("part.{key}.{}", p.role)], "{key} {}", p.role);
+            }
+            let held = (parts.iter().zip(&bytes))
+                .map(|(p, b)| (p.role.as_str(), PartBytes { dtype: &p.dtype, shape: &p.shape, bytes: b }))
+                .collect();
+            let f32s = |b: &[u8]| b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c) as f64).collect::<Vec<_>>();
+            let (got, law) = (f32s(&decode(&Dtype::F32, &t.shape, encoding, &held).unwrap()), f32s(law));
+            let top = law.iter().fold(0f64, |a, x| a.max(x.abs()));
+            let worst = got.iter().zip(&law).fold(0f64, |a, (x, y)| a.max((x - y).abs()));
+            assert!(worst <= within * top, "{key}: {worst} of {top}");
+        }
+        for (key, bias) in expect.iter().filter(|(k, _)| k.ends_with(".bias")) {
+            let Body::Data(at) = &ck.tensor("model", key).unwrap().body else { panic!("{key}: encoded") };
+            assert_eq!(&raw(at), bias, "{key}");
+        }
+        let keys: Vec<String> = ck.tensors().map(|(_, t)| t.key.clone()).collect();
+        assert!(keys.contains(&"proj_out.weight".to_string()), "{keys:?}");
+        assert!(!keys.iter().any(|k| k.contains("qweight") || k.contains("smooth") || k.contains("to_qkv")), "{keys:?}");
+    }
+}
+
+/// What has no lane is refused by name: svdq-int4, Nunchaku's AWQ W4A16 modulation layers, a
+/// linear without its low-rank branch, a tensor it does not read.
+#[test]
+fn nunchaku_files_it_cannot_serve_are_refused_by_name() {
+    let int4 = refused("nunchaku-svdq-fp4", &|_, meta, _| {
+        let qc = serde_json::json!({"method": "svdquant", "weight": {"dtype": "sint4", "group_size": 64}, "rank": 32});
+        meta.insert("quantization_config".into(), qc.to_string().into());
+    });
+    assert_eq!(int4.code, Code::UNREGISTERED_ENCODING, "{}", int4.detail);
+    assert!(int4.detail.contains("svdq-int4"), "{}", int4.detail);
+    let awq = refused("nunchaku-svdq-fp4", &|t, _, _| {
+        for (leaf, dtype, shape, n) in [("qweight", "I32", vec![32, 64], 4 * 32 * 64), ("wscales", "BF16", vec![8, 128], 2 * 8 * 128),
+            ("wzeros", "BF16", vec![8, 128], 2 * 8 * 128)] {
+            t.push((format!("norm1.linear.{leaf}"), dtype.into(), shape, vec![0; n]));
+        }
+    });
+    assert!(awq.detail.contains("norm1.linear") && awq.detail.contains("AWQ W4A16"), "{}", awq.detail);
+    let branchless = refused("nunchaku-svdq-fp4", &|t, _, _| t.retain(|(k, ..)| !k.ends_with("ff.net.0.proj.proj_up")));
+    assert!(branchless.detail.contains("low-rank branch"), "{}", branchless.detail);
+    let unread = refused("nunchaku-svdq-fp4", &|t, _, _| {
+        t.push(("transformer_blocks.0.ff.net.0.proj.lora_down".into(), "BF16".into(), vec![2], vec![0; 4]));
+    });
+    assert!(unread.detail.contains("lora_down"), "{}", unread.detail);
+}
