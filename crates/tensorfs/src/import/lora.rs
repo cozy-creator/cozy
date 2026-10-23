@@ -4,9 +4,15 @@
 //! else the config's `lora_alpha`, else `r`. The component's config is PEFT's
 //! `adapter_config.json`: the source's own (its file, or diffusers' `lora_adapter_metadata`) with
 //! `alpha_pattern`, `rank_pattern` and `use_rslora` folded into per-module `.alpha`, or kohya's
-//! training metadata mapped. Kohya's `.alpha` tensors stay as they are.
+//! training metadata mapped. A kohya `.alpha` is the α its loaders apply: it is stored as an F32
+//! scalar whatever its source dtype, a module without one in a file that has them takes α = r (as
+//! kohya does), and the config's `lora_alpha` is their commonest value, so a reader of PEFT's
+//! config alone scales as one of the factors does.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 
 use serde_json::{json, Value as Json};
 
@@ -102,11 +108,12 @@ pub struct Adapter {
 
 /// Normalizes, in `planned`, each component holding LoRA factors ([`peft_key`]), and returns its
 /// adapter. `sources` is each component's source group; an adapter config file read becomes the
-/// component's config and leaves `files`.
+/// component's config and leaves `files`. `paths` are the source files a reading names.
 pub fn normalize(
     planned: &mut Vec<Planned>,
     sources: &BTreeMap<String, &Group>,
     files: &mut BTreeMap<String, Vec<u8>>,
+    paths: &[PathBuf],
 ) -> Result<BTreeMap<String, Adapter>> {
     let (mut adapters, mut read, mut alphas) = (BTreeMap::new(), BTreeSet::new(), Vec::new());
     for (component, group) in sources {
@@ -144,12 +151,32 @@ pub fn normalize(
             (None, Some(text)) => Some(parse(DIFFUSERS_CONFIG, text.as_bytes())?),
             (None, None) => None,
         };
+        // Each `.alpha` the source holds, as the F32 scalar its loaders read.
+        let mut stated: BTreeMap<String, f64> = BTreeMap::new();
+        for i in &mine {
+            let Some(m) = planned[*i].key.strip_suffix(ALPHA).map(str::to_owned) else { continue };
+            let value = scalar(component, &planned[*i], paths)?;
+            stated.insert(m, value);
+            let p = &mut planned[*i];
+            let read = Reading::inline((value as f32).to_le_bytes().to_vec(), Dtype::F32);
+            (p.dtype, p.shape, p.encoding) = (Dtype::F32, vec![], None);
+            p.parts = vec![PlannedPart { role: String::new(), dtype: Dtype::F32, shape: vec![], read }];
+        }
         let source = match source {
             Some(source) => Some(fold(component, source, &modules, &kept, &mut alphas)?),
             None => None,
         };
+        if source.is_none() && !stated.is_empty() {
+            for (name, m) in modules.iter().filter(|(name, _)| !kept.contains(*name)) {
+                alphas.push((m.b, component.to_owned(), name.clone(), m.rank as f32));
+            }
+        }
         let ranks = modules.iter().map(|(m, v)| (m.clone(), v.rank));
-        let config = adapter_config(ranks, &group.metadata, source.as_ref(), None);
+        let mut config = adapter_config(ranks, &group.metadata, source.as_ref(), None);
+        let given = source.as_ref().is_some_and(|s| s.contains_key("lora_alpha"));
+        if let (false, Some(alpha)) = (given, commonest(&stated)) {
+            config.insert("lora_alpha".into(), number(alpha));
+        }
         let stated = source.is_some();
         adapters.insert(component.clone(), Adapter { config, stated });
     }
@@ -174,6 +201,74 @@ pub fn normalize(
         planned.insert(at + 1, p);
     }
     Ok(adapters)
+}
+
+/// The value of a one-element tensor, read from its source.
+fn scalar(component: &str, p: &Planned, paths: &[PathBuf]) -> Result<f64> {
+    let refused = |why: &str| refuse(Code::WRONG_TYPE, format!("{component}/{}: {why}", p.key));
+    let (Some(part), true) = (p.parts.first(), p.encoding.is_none() && p.shape.iter().product::<u64>() == 1) else {
+        return refused("a LoRA alpha is one plain element");
+    };
+    let read = &part.read;
+    let bytes = match &read.inline {
+        Some(bytes) => bytes.clone(),
+        None => {
+            let path = &paths[read.file];
+            let io = |e| crate::err::classify_io(format!("read {}", path.display()), e);
+            let mut file = File::open(path).map_err(io)?;
+            file.seek(SeekFrom::Start(read.start)).map_err(io)?;
+            let mut bytes = vec![0; read.len as usize];
+            file.read_exact(&mut bytes).map_err(io)?;
+            bytes
+        }
+    };
+    let word = |n: usize| {
+        let mut w = [0u8; 8];
+        w[..n].copy_from_slice(&bytes[..n]);
+        u64::from_le_bytes(w)
+    };
+    let value = match (&read.source, bytes.len()) {
+        (Dtype::F64, 8) => f64::from_bits(word(8)),
+        (Dtype::F32, 4) => f32::from_bits(word(4) as u32) as f64,
+        (Dtype::BF16, 2) => f32::from_bits((word(2) as u32) << 16) as f64,
+        (Dtype::F16, 2) => f16(word(2) as u16),
+        (Dtype::I64, 8) => word(8) as i64 as f64,
+        (Dtype::I32, 4) => word(4) as u32 as i32 as f64,
+        _ => return refused(&format!("a {} alpha of {} bytes is no number", read.source, bytes.len())),
+    };
+    if !value.is_finite() {
+        return refused("its alpha is not finite");
+    }
+    Ok(value)
+}
+
+/// An IEEE half's value.
+fn f16(bits: u16) -> f64 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let (exponent, fraction) = (((bits >> 10) & 0x1f) as i32, (bits & 0x3ff) as f64);
+    sign * match exponent {
+        0 => fraction * 2f64.powi(-24),
+        31 if fraction == 0.0 => f64::INFINITY,
+        31 => f64::NAN,
+        e => (1.0 + fraction / 1024.0) * 2f64.powi(e - 15),
+    }
+}
+
+/// The most frequent of `values` (the smallest among equals), or `None`.
+fn commonest(values: &BTreeMap<String, f64>) -> Option<f64> {
+    let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
+    for v in values.values() {
+        *counts.entry(v.to_bits()).or_default() += 1;
+    }
+    let most = counts.values().copied().max()?;
+    (counts.iter().filter(|(_, n)| **n == most))
+        .map(|(bits, _)| f64::from_bits(*bits))
+        .reduce(f64::min)
+}
+
+/// A JSON number: an integer when `value` is one.
+fn number(value: f64) -> Json {
+    if value.fract() == 0.0 && value.abs() < 9.0e15 { json!(value as i64) } else { json!(value) }
 }
 
 fn parse(what: &str, bytes: &[u8]) -> Result<Config> {

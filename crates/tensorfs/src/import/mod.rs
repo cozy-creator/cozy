@@ -734,7 +734,7 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         .map(|c| (c.name.clone(), &set.groups[c.group]))
         .chain((recognized.unclaimed.iter()).map(|g| (identity(&set.groups[*g]), &set.groups[*g])))
         .collect();
-    let mut adapters = lora::normalize(&mut planned, &sources, &mut files)?;
+    let mut adapters = lora::normalize(&mut planned, &sources, &mut files, &set.files)?;
     // A PEFT adapter's keys are its base model's module names: canonical once unwrapped.
     let peft = |g: &usize| adapters.get(&identity(&set.groups[*g])).is_some_and(|a| a.stated);
     if recognized.unclaimed.iter().any(peft) {

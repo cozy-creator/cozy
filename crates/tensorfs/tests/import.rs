@@ -976,7 +976,8 @@ fn lora_keys_and_adapter_configs_follow_one_rule() {
     assert_eq!(uniform["lora_alpha"], 2);
 }
 
-/// Kohya's training metadata is PEFT's config of each LoRA component; its `.alpha` stays.
+/// Kohya's training metadata is PEFT's config of each LoRA component; its `.alpha` stays, and
+/// is the config's `lora_alpha` (the α its loaders apply, over the metadata's).
 #[test]
 fn a_kohya_lora_maps_its_metadata_to_the_adapter_config() {
     let dir = scratch("kohya-config");
@@ -997,12 +998,49 @@ fn a_kohya_lora_maps_its_metadata_to_the_adapter_config() {
     assert_eq!(
         serde_json::Value::Object(unet.config.clone()),
         serde_json::json!({
-            "peft_type": "LORA", "r": 4, "lora_alpha": 2.5, "base_model_name_or_path": "sd_xl_base_1.0.safetensors",
+            "peft_type": "LORA", "r": 4, "lora_alpha": 2, "base_model_name_or_path": "sd_xl_base_1.0.safetensors",
             "target_modules": ["down_blocks.1.attentions.0.transformer_blocks.0.attn2.to_k"],
         })
     );
     let module = "down_blocks.1.attentions.0.transformer_blocks.0.attn2.to_k";
     assert_eq!(out.tensors[&("unet".into(), format!("{module}.alpha"))].2, 2f32.to_le_bytes().to_vec());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// lightx2v's Lightning LoRAs: kohya `lora_down`/`lora_up` under Diffusers' module names, each
+/// `.alpha` an I64 (the fp32 file) or BF16 (the bf16 file) 8 at rank 64. Diffusers and ComfyUI
+/// apply α/r = 1/8. Ingest stores every `.alpha` as the F32 its readers take, gives a module the
+/// file left without one α = r, and states the α in the config instead of defaulting it to r.
+#[test]
+fn a_kohya_lora_alpha_is_stored_as_the_f32_its_loaders_apply() {
+    let dir = scratch("kohya-alpha");
+    let file = dir.join("in/lightning.safetensors");
+    let module = |m: &str| format!("transformer_blocks.0.{m}");
+    let factors = |m: &str| {
+        [
+            (format!("{}.lora_down.weight", module(m)), "F32", vec![4, 8], f32s(32, 1)),
+            (format!("{}.lora_up.weight", module(m)), "F32", vec![8, 4], f32s(32, 2)),
+        ]
+    };
+    let mut tensors: Vec<(String, &str, Vec<u64>, Vec<u8>)> = Vec::new();
+    for m in ["attn.to_q", "attn.to_k", "img_mlp.net.2"] {
+        tensors.extend(factors(m));
+    }
+    tensors.push((format!("{}.alpha", module("attn.to_q")), "I64", vec![], 8i64.to_le_bytes().to_vec()));
+    tensors.push((format!("{}.alpha", module("attn.to_k")), "BF16", vec![], (8f32.to_bits() >> 16).to_le_bytes()[..2].to_vec()));
+    let views: Vec<(&str, &str, Vec<u64>, Vec<u8>)> =
+        tensors.iter().map(|(k, d, s, b)| (k.as_str(), *d, s.clone(), b.clone())).collect();
+    safetensors(&file, &views);
+    let out = run(&dir.join("tmp"), &[file.display().to_string()], None).unwrap();
+    let alpha = |m: &str| out.tensors[&("model".into(), format!("{}.alpha", module(m)))].clone();
+    assert_eq!(alpha("attn.to_q"), (Dtype::F32, vec![], 8f32.to_le_bytes().to_vec()));
+    assert_eq!(alpha("attn.to_k"), (Dtype::F32, vec![], 8f32.to_le_bytes().to_vec()));
+    assert_eq!(alpha("img_mlp.net.2"), (Dtype::F32, vec![], 4f32.to_le_bytes().to_vec()), "α = r");
+    let model = out.layout.components.iter().find(|c| c.name == "model").unwrap();
+    assert_eq!((&model.config["lora_alpha"], &model.config["r"]), (&8.into(), &4.into()));
+    let order: Vec<&str> = out.order.iter().map(|(_, k)| k.as_str()).collect();
+    let b = order.iter().position(|k| *k == format!("{}.lora_B.weight", module("img_mlp.net.2"))).unwrap();
+    assert_eq!(order[b + 1], format!("{}.alpha", module("img_mlp.net.2")), "an added α follows its lora_B");
     fs::remove_dir_all(&dir).unwrap();
 }
 
