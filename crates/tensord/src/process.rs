@@ -472,9 +472,10 @@ pub fn supervise(
 
 /// A preparation's verdict, on its measured progress (`Stop::progress`: bytes told as they move,
 /// stages, its installer's meter) as an invocation's is: still past the patience its own pace
-/// earned. It is judged once it advanced, never before: the wait for its first advance is its
-/// first pause, not an allowance. None once `ended` says it finished. Waiting on work watched
-/// elsewhere (another run's install of the same code) is not stillness.
+/// earned, the floor before it has any. One that never advances is judged too (a job waiting on
+/// a silent Hub moved nothing for 20 min under #1875's `changes > 0`); a transfer told as its
+/// bytes land advances, however slowly. None once `ended` says it finished. Waiting on work
+/// watched elsewhere (another run's install of the same code) is not stillness.
 pub fn judge_preparation(stop: &crate::stop::Stop, ended: &std::sync::mpsc::Receiver<()>, waits: impl Fn() -> bool, liveness: Liveness) -> Option<String> {
     let mut pace = Pace::default();
     while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(liveness.sample) {
@@ -484,7 +485,7 @@ pub fn judge_preparation(stop: &crate::stop::Stop, ended: &std::sync::mpsc::Rece
             pace.excuse(now);
         }
         let still = pace.still_since().map(|since| now - since).unwrap_or_default();
-        if pace.changes > 0 && still > pace.patience(liveness.floor()) {
+        if still > pace.patience(liveness.floor()) {
             return Some(format!("preparing: {}", pace.verdict(still, liveness.floor())));
         }
     }
@@ -802,6 +803,19 @@ mod tests {
             }
         });
         url
+    }
+
+    /// A preparation that never advances (a job waiting on a silent Hub) is judged once it has
+    /// been still past its floor; it is not left unjudged for want of a first advance.
+    #[test]
+    fn a_preparation_that_never_advances_is_judged_past_its_floor() {
+        let liveness = Liveness { sample: Duration::from_millis(20) };
+        let stop = crate::stop::Stop::default();
+        let (_running, ended) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        let verdict = judge_preparation(&stop, &ended, || false, liveness).expect("a silent preparation is judged");
+        assert!(started.elapsed() >= liveness.floor(), "judged before its floor");
+        assert!(verdict.starts_with("preparing: no measurable progress"), "{verdict}");
     }
 
     /// A provider import from a slow source is judged on what the import tells as its bytes land
