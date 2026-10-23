@@ -241,8 +241,13 @@ jobs:
           for name in TENSORFS_TEST_PYTHON COZY_TEST_RUNTIME_WHEEL COZY_TEST_TENSORFS_WHEEL COZY_TEST_DEV_BINARY; do
             [ -z "${!name:-}" ] || locations+=("--setenv=$name=${!name}")
           done
+          # The runner's own user manager (memory delegated to it), for tests that make memory-limited
+          # scopes (host_pressure).
+          sudo loginctl enable-linger "$(id -u)"
+          sudo systemctl start "user@$(id -u).service"
           bash "$GITHUB_WORKSPACE/workflow/scripts/ci-delegated.sh" "cozy-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
+            --setenv="XDG_RUNTIME_DIR=/run/user/$(id -u)" --setenv="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=UV_TORCH_BACKEND=cpu \
             --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
             bash -euo pipefail -c "$TEST"
