@@ -38,6 +38,8 @@ use crate::table::{Class, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table
 use crate::{Error, Exhausted, GpuId, Result};
 
 mod stream;
+mod torch;
+pub use torch::{Allocating, PoolId, TorchStats};
 use stream::{StreamIn, Streaming};
 
 /// A loaded set.

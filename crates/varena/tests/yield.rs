@@ -398,3 +398,26 @@ fn a_budget_change_gives_back_down_to_budget_less_2h() {
     assert!(e.to_string().contains("budget is"), "{e}");
     drop(r);
 }
+
+/// A standalone executor's fixed row (varena-leases R2-2): its bytes are held, so the card's free
+/// room counts them, and no reading asks them, however short the card is; dropped, the row goes.
+#[test]
+fn a_fixed_row_is_held_and_never_asked() {
+    let (_scope, g) = Scope::new("fixed");
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::create(&g, None).unwrap();
+    let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(CARD))).unwrap();
+    mem.load(set(dir.path(), "idle", 2, &g.uuid), Level::Gpu).unwrap();
+    let free = ledger.status().free;
+    let (pid, standalone) = (std::process::id() + 1, 4 << 30);
+    let fixed = ledger.fixed(pid).unwrap();
+    fixed.set(standalone);
+    let held = |ledger: &Ledger| ledger.status().rows.iter().find(|r| r.pid == pid && r.live).map(|r| r.context);
+    assert_eq!((held(&ledger), ledger.status().free), (Some(standalone), free - standalone));
+    let freed = ledger.set_foreign(CARD, false).unwrap();
+    assert_eq!((freed, row(&ledger).1, held(&ledger)), (2 * P, 0, Some(standalone)), "only the idle pages are asked");
+    ledger.set_foreign(0, false).unwrap();
+    drop(fixed);
+    assert_eq!((held(&ledger), ledger.status().free), (None, free + 2 * P));
+    drop(mem);
+}

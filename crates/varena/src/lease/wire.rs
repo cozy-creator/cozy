@@ -15,6 +15,19 @@ pub struct Region {
     pub region: u32,
 }
 
+/// Why the manager refused: an agent redials, runs standalone or fails the request by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Refusal {
+    /// The peer is no executor TensorD registered (yet: a follower may redial once it is).
+    NotRegistered,
+    /// No compatible manager (another protocol, or a re-attach it does not serve): standalone.
+    Incompatible,
+    /// No room can come for the ask.
+    NothingRevocable,
+    /// The manager failed serving the ask (its backend would not open, a chunk would not export).
+    Failed,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ToManager {
     /// Attach. The peer's credentials name the process; `birth` (its start ticks) pins that
@@ -33,7 +46,7 @@ pub enum ToAgent {
     /// One chunk of ask `id`, its handle attached; `last` closes the ask. `adopted`: its bytes are
     /// the region's already (retained), no fill.
     Grant { id: u64, slot: u32, seq: u32, bytes: u64, adopted: bool, last: bool },
-    Refuse { id: u64, why: String },
+    Refuse { id: u64, code: Refusal, why: String },
     /// Doorbell: `ask` set on some slots.
     Revoke,
 }
