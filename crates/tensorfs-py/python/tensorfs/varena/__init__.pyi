@@ -8,7 +8,7 @@ holds the block until the last one dies. Every call releases the GIL; a panic ra
 `VarenaError` with code `INTERNAL`.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Final, Literal
 
 from .._ext import Checkpoint
@@ -141,10 +141,11 @@ class Memory:
     def fill(self, set: int, fill: Fill) -> None:
         """`set`'s current fill (a no-op when unchanged): pages filled under another come back
         fresh."""
-    def cache(self, owner: str, shrink: Callable[[int], int]) -> int:
+    def cache(self, owner: str, shrink: Callable[[int], int], sets: Sequence[int] = ()) -> int:
         """Bytes the caller holds that `shrink(want) -> freed` gives back (from varena's thread,
-        never inside torch's allocator), after idle pages, least recently used first. A cache
-        owned by a request id ends with it."""
+        never inside torch's allocator): after other sets' idle pages, ranked with the current
+        step's pages by its components' next use (`sets`; none: no declared use), a page first
+        on a tie. A cache owned by a request id ends with it."""
 
     def cached(self, cache: int, nbytes: int) -> None: ...
     def hold_cache(self, cache: int) -> int:

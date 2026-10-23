@@ -404,6 +404,9 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     binding, pins = model.retain(), native.pins_held()
     check("retained: a model just run is resident (a read: no pin, no fill)", binding.resident() and native.pins_held() == pins, (pins, native.pins_held()))
     binding.close()
+    serving = mem.cache("ample graph pool", lambda want: 0, sets=unet)  # a graph pool names its component
+    check("cache: one serving a loaded model registers with its set", isinstance(serving, adapter.Cache), serving)
+    serving.close()
     free = model.hold(free_only=True)
     check("hold: free only, a model that fits beside what is resident is held", free is not None and not isinstance(unet.conv_in.weight, Placeholder), free)
     if free is not None:

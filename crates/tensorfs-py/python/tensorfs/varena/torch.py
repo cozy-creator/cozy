@@ -591,11 +591,14 @@ class Memory:
                 _routes.reset(routed)
             _allocated()
 
-    def cache(self, owner: str, shrink: Callable[[int], int]) -> Cache:
-        """Bytes the caller holds that `shrink(want) -> freed` gives back when varena makes room,
-        after idle pages, least recently used first (never while held: `Cache.holding`). A cache
-        owned by a request id ends with it."""
-        return Cache(self, self.native.cache(owner, shrink))
+    def cache(self, owner: str, shrink: Callable[[int], int], sets: nn.Module | Model | Sequence[nn.Module | Model] = ()) -> Cache:
+        """Bytes the caller holds that `shrink(want) -> freed` gives back when varena makes room
+        (never while held: `Cache.holding`): after other sets' idle pages, ranked with the
+        current step's pages by the next use of the loaded models it serves (`sets`: a graph
+        pool names its component; none, no declared use). A cache owned by a request id ends
+        with it."""
+        served = [sets] if isinstance(sets, (nn.Module, Model)) else list(sets)
+        return Cache(self, self.native.cache(owner, shrink, [(m if isinstance(m, Model) else self.models[m]).id for m in served]))
 
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
