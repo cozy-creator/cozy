@@ -13,4 +13,4 @@ $site, $abi, $minor = (& "$venv\Scripts\python.exe" -c 'import os, torch; print(
 cl /nologo /O2 /EHsc /MD /std:c++20 /DNOMINMAX /I"$site\include" shim\varena_torch.cpp /LD /Fe:python\tensorfs\_varena_torch.dll /link /LIBPATH:"$site\lib" c10.lib
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Remove-Item python\tensorfs\_varena_torch.lib, python\tensorfs\_varena_torch.exp, varena_torch.obj -ErrorAction SilentlyContinue
-Set-Content -NoNewline python\tensorfs\_varena_torch.json "{`"torch`": `"$minor`", `"cxx11_abi`": $abi}`n"
+Set-Content -Path python\tensorfs\_varena_torch.json -Value "{`"torch`": `"$minor`", `"cxx11_abi`": $abi}"
