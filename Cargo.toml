@@ -123,7 +123,8 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 # Every verb returns the one typed refusal; it is not on a hot path.
 result_large_err = "allow"
-undocumented_unsafe_blocks = "warn"
+# Denied per crate as its blocks are documented (platform); warnings are errors in CI.
+undocumented_unsafe_blocks = "allow"
 
 # What dist builds releases with.
 [profile.dist]

@@ -266,6 +266,7 @@ pub(super) fn detach(program: &Path, args: &[OsString], log: Option<File>) -> io
             // SAFETY: the new thread's handle, not needed; the process's is now ours.
             unsafe { CloseHandle(process.hThread) };
             return Ok(Detached {
+                // SAFETY: CreateProcessW's new process handle, owned by nothing else.
                 process: unsafe { OwnedHandle::from_raw_handle(process.hProcess) },
                 pid: process.dwProcessId,
             });
@@ -441,6 +442,7 @@ pub(super) fn peak_resident() -> io::Result<u64> {
     // SAFETY: plain-old-data the call fills, its size passed.
     let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { mem::zeroed() };
     let size = mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: a writable struct of the size passed.
     if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) } == 0 {
         return Err(io::Error::last_os_error());
     }
