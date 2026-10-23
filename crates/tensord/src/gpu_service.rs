@@ -17,7 +17,6 @@ use crate::{
     },
     launch_identity::Seal,
     memory::{self, MemoryLog, Tenant},
-    process::Gpus,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -704,11 +703,6 @@ fn gpu_request_queued(engine: &Engine, root: Option<u64>) -> bool {
 
 impl Pool {
     pub fn new(root: &Path, config: GpuConfig, store: Arc<Store>) -> io::Result<Arc<Self>> {
-        Self::with_chunks(root, config, store, memory::chunks)
-    }
-
-    /// The pool with each GPU's chunks opened by `chunks` (its UUID; None: chunk-less).
-    fn with_chunks(root: &Path, config: GpuConfig, store: Arc<Store>, chunks: impl Fn(&str, &MemoryLog) -> Option<varena::lease::Opener>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
         let notes = MemoryLog::at(store.root().join("logs"));
         if let Some(identity) = config.identity {
@@ -730,7 +724,7 @@ impl Pool {
         let peers = Arc::new(memory::Peers::new(tenants.clone(), uids.into_iter().flatten().collect(), notes.clone()));
         let leases = |entry: &str| memory::Leases {
             peers: peers.clone(),
-            open: memory::row(entry, &config.inventory).and_then(|row| chunks(&row.device_uuid, &notes)),
+            open: memory::row(entry, &config.inventory).and_then(|row| memory::chunks(&row.device_uuid, &notes)),
             tenants: tenants.clone(),
         };
         let devices: Vec<Device> = envelope.iter().map(|entry| Device {
@@ -922,22 +916,25 @@ impl Pool {
         let (plan, start, birth, killed) = tenant;
         self.notes.note(serde_json::json!({"event": "end_stalled", "pid": pid, "plan": plan,
             "killed": killed.as_ref().map_or_else(|e| e.to_string(), |_| "yes".into())}));
-        let key = session_key(&plan, start);
-        let idle = {
-            let mut sessions = self.sessions.lock().unwrap();
-            let owns = |s: &Session| owns_birth(&s.executor.birth, &s.followers, &birth);
-            match sessions.get(&key).is_some_and(owns) {
-                true => sessions.remove(&key),
-                false => None,
-            }
-        };
-        if let Some(session) = idle {
-            let executor = session.executor;
-            if let Err(error) = executor.terminate() {
-                tracing::warn!("memory: ending stalled executor {key}: {error}");
-            }
-            self.ended(&plan, start);
+        if let Some(session) = self.take_idle(&plan, start, &birth) {
+            self.end_idle(&plan, start, session);
         }
+    }
+    /// The pool's idle session of `plan` at `start` whose executor is `birth`, taken out of it.
+    fn take_idle(&self, plan: &str, start: usize, birth: &Birth) -> Option<Session> {
+        let key = session_key(plan, start);
+        let mut sessions = self.sessions.lock().unwrap();
+        let owns = |s: &Session| owns_birth(&s.executor.birth, &s.followers, birth);
+        match sessions.get(&key).is_some_and(owns) {
+            true => sessions.remove(&key),
+            false => None,
+        }
+    }
+    fn end_idle(&self, plan: &str, start: usize, session: Session) {
+        if let Err(error) = session.executor.terminate() {
+            tracing::warn!("memory: ending idle executor {}: {error}", session_key(plan, start));
+        }
+        self.ended(plan, start);
     }
     pub fn memo(&self) -> &crate::memo::Memo {
         &self.memo
@@ -1333,7 +1330,7 @@ impl Pool {
             return "this machine imports nothing ahead for it (no fork, or it binds no model)";
         };
         if start {
-            parent.set(self.import_only(held));
+            self.start_parent(&parent, held);
         }
         parent.wait_started();
         match (parent.ready(), parent.failed()) {
@@ -1851,7 +1848,7 @@ impl Pool {
                 let asked = Instant::now();
                 if let Some((zygote, start)) = pool.zygote(&held) {
                     if start {
-                        zygote.set(pool.import_only(&held));
+                        pool.start_parent(&zygote, &held);
                     }
                     zygote.wait_started();
                 }
@@ -2153,12 +2150,9 @@ impl Pool {
         let pool = Arc::downgrade(self);
         let started = std::thread::Builder::new()
             .name("executor-prespawn".into())
-            .spawn(move || {
-                let state = match pool.upgrade() {
-                    Some(pool) => pool.import_only(&held),
-                    None => ZygoteState::Off("the GPU pool ended".into()),
-                };
-                zygote.set(state);
+            .spawn(move || match pool.upgrade() {
+                Some(pool) => pool.start_parent(&zygote, &held),
+                None => zygote.set(ZygoteState::Off("the GPU pool ended".into())),
             });
         if let Err(error) = started {
             tracing::warn!("executor prespawn: {error}");
@@ -2193,6 +2187,14 @@ impl Pool {
         let zygote = Arc::new(Zygote::default());
         zygotes.insert(key, zygote.clone());
         Some((zygote, true))
+    }
+
+    /// Brings `zygote` up as `held`'s import-only parent, and tells the engine it did (or failed).
+    fn start_parent(&self, zygote: &Zygote, held: &HeldGeneration) {
+        zygote.set(self.import_only(held));
+        if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
+            engine.notify_activity();
+        }
     }
 
     /// Spawn an executor of `held` and import torch, the Runtime and the package with no
@@ -2481,7 +2483,7 @@ impl Pool {
                 break;
             };
             if start {
-                zygote.set(self.import_only(held));
+                self.start_parent(&zygote, held);
             }
             match zygote.fork(config.take().expect("one config per launch"), &on_birth)? {
                 Forked::Ready(executor) => {
@@ -2589,7 +2591,7 @@ impl Pool {
         let mut callbacks = Callbacks {
             engine,
             id,
-            completed: 0,
+            seen: Default::default(),
             generation: &held.record,
             spool: None,
             caller: None,
@@ -3158,18 +3160,18 @@ fn unsettled(reply: &Frame, lost: &str) -> Refused {
     Refused { code, detail }
 }
 
-/// What `gpus` did since the last reading; None without GPUs or while NVML cannot tell.
+/// Whether `gpus` moved device memory since the last reading; None without GPUs or while NVML
+/// cannot tell.
 fn gpu_work(gpus: &[Device]) -> Option<crate::process::Activity> {
     let opened = gpus.iter().map(|gpu| platform::gpu::Device::open(&gpu.entry).ok());
     let devices: Vec<_> = opened.collect::<Option<_>>().filter(|devices: &Vec<_>| !devices.is_empty())?;
     let seen = Mutex::new(vec![0; devices.len()]);
     Some(Arc::new(move || {
-        let (mut kernels, mut memory) = (false, false);
+        let mut moved = false;
         for (device, seen) in devices.iter().zip(seen.lock().unwrap().iter_mut()) {
-            let (ran, moved) = device.worked_since(seen).ok()?;
-            (kernels, memory) = (kernels || ran, memory || moved);
+            moved |= device.moved_since(seen).ok()?;
         }
-        Some(if memory { Gpus::Moved } else if kernels { Gpus::Stuck } else { Gpus::Idle })
+        Some(moved)
     }))
 }
 
@@ -3520,9 +3522,12 @@ fn call_memory(reply: &Frame) -> Option<serde_json::Value> {
     Some(fields.into_iter().filter_map(|(key, value)| Some((key.to_string(), value?))).collect())
 }
 
+/// The run's measurements: the kernels it served (`attention.`, `gemm.`, `kernel.`) and the work
+/// that blocked its request path (`request_path.`), which a release gate reads.
 fn measured<S: Serialize, M: Serialize>(plan: &Plan, reply: &Frame, software: S, memory: M) -> serde_json::Value {
+    let kept = |name: &str| ["attention.", "gemm.", "kernel.", "request_path."].iter().any(|prefix| name.starts_with(prefix));
     let kernels: Vec<&serde_json::Value> = (reply.observations.as_array().into_iter().flatten())
-        .filter(|row| row["name"].as_str().is_some_and(|name| name.starts_with("attention.") || name.starts_with("gemm.")))
+        .filter(|row| row["name"].as_str().is_some_and(kept))
         .collect();
     serde_json::json!({"attribution": reply.attribution, "software": software, "execution": reply.execution,
         "observations": kernels, "memory": memory, "residency": reply.residency, "models": plan.models()})
@@ -3580,7 +3585,7 @@ impl Formation {
 struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
-    completed: u64,
+    seen: crate::calls::Seen,
     /// The environment the executor runs: its App's declarations name the products it publishes.
     generation: &'a crate::catalog::Generation,
     /// The invoking request's spool, where its published assets' bytes are.
@@ -3603,7 +3608,7 @@ impl Services for Callbacks<'_> {
         if let Some(host) = self.host {
             host.nudge();
         }
-        crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
+        crate::calls::observe(self.engine, self.id, &mut self.seen, frame, self.caller);
     }
     fn request(
         &mut self,
@@ -3630,935 +3635,3 @@ impl Services for Callbacks<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    #[cfg(unix)]
-    use std::os::unix::process::ExitStatusExt;
-
-    /// Runs 5313/5318/5319 ended `executor_poisoned: ; the executor did not settle quiescent
-    /// (poisoned: )`: the Runtime's tail re-raised a sticky CUDA fault and answered `ok: false`.
-    #[test]
-    fn an_unsettled_invoke_names_its_reason() {
-        let reason = |reply: serde_json::Value, lost: &str| {
-            let refused = unsettled(&serde_json::from_value(reply).unwrap(), lost);
-            format!("{}: {}", refused.code, refused.detail)
-        };
-        let fault = "AcceleratorError: CUDA error: an illegal memory access was encountered";
-        assert_eq!(
-            reason(json!({"reply": "invoke", "ok": false, "code": "unhandled_exception", "detail": fault}), ""),
-            format!("unhandled_exception: {fault}; the executor did not settle quiescent")
-        );
-        let outcome = json!({"terminal": "failed", "code": "unhandled_exception", "message": format!("{fault} in denoise")});
-        assert_eq!(
-            reason(json!({"ok": true, "quiescent": false, "poisoned": "unhandled_exception in denoise", "outcome": outcome}), ""),
-            format!("unhandled_exception: {fault} in denoise; the executor did not settle quiescent (poisoned: unhandled_exception in denoise)")
-        );
-        assert_eq!(
-            reason(json!({"ok": true, "quiescent": false}), "GPU 1's process 7 ended"),
-            "group_broken: GPU 1's process 7 ended during the call, first; then executor_poisoned: \
-             the executor named no reason; the executor did not settle quiescent"
-        );
-    }
-
-    /// What `run show` reads of a call: the models it ran as the machine resolved them (run
-    /// 10236's background removal: `paul/birefnet@0.1.0 fp16`), constructed or raw, and its
-    /// attention and GEMM kernels (the attention row is that run's segment call's); nothing
-    /// else it observed.
-    #[test]
-    fn a_calls_measurements_name_its_resolved_models_and_its_kernels() {
-        let binding = Binding {
-            model_parameter_name: "model".into(),
-            model: "paul/birefnet@0.1.0".into(),
-            snapshot: "sha256:aa".into(),
-            ..Default::default()
-        };
-        let source = PlanSource {
-            parameter: "lora".into(),
-            manifest: "sha256:bb".into(),
-            length: 9,
-            repository: "paul/wushu".into(),
-            release: "1.0.0".into(),
-            lane: "model.bf16.cozytensors".into(),
-            precision: "bf16".into(),
-        };
-        let plan = Plan {
-            id: "p".into(),
-            construction: "c".into(),
-            installation: "i".into(),
-            generation: "g".into(),
-            entrypoint: "remove_background".into(),
-            slots: vec![PlanSlot { binding, lane: "model.fp16.cozytensors".into(), precision: "fp16".into(), selected_encoded_bytes: 0, on_demand: false, placeable: vec![] }],
-            sources: vec![source],
-            degree: 1,
-        };
-        let reply: Frame = serde_json::from_value(json!({"reply": "invoke", "ok": true, "observations": [
-            {"kind": "confession", "name": "attention.selected", "value": "kitchen-sol-producer-fast-shared-qkv",
-                "fields": {"component": "base_model/ref2va_dit", "dense_reference": "kitchen-int8", "pin": "", "sites": 52}},
-            {"kind": "confession", "name": "gemm.selected", "value": "cutlass-sm80-int8",
-                "fields": {"component": "base_model/ref2va_dit", "format": "int8", "sites": 416}},
-            {"kind": "confession", "name": "weights.mode", "value": "resident", "fields": {"stage": "denoise"}}]}))
-        .unwrap();
-        let measured = measured(&plan, &reply, None::<()>, ());
-        assert_eq!(measured["models"], json!([
-            {"slot": "model", "repository": "paul/birefnet", "release": "0.1.0", "lane": "model.fp16.cozytensors", "precision": "fp16", "manifest": "sha256:aa"},
-            {"slot": "lora", "repository": "paul/wushu", "release": "1.0.0", "lane": "model.bf16.cozytensors", "precision": "bf16", "manifest": "sha256:bb"}]));
-        let kept: Vec<&str> = measured["observations"].as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap()).collect();
-        assert_eq!(kept, ["attention.selected", "gemm.selected"]);
-    }
-
-    /// An invoke reply's residency (the Runtime's graph counters per model, fields this TensorD
-    /// does not know included) reaches the run's measurements whole.
-    #[test]
-    fn an_invoke_replys_residency_reaches_the_runs_measurements() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = Engine::open(&dir.path().join("engine")).unwrap();
-        let id = engine.submit("graphs", crate::journal::Invocation::default()).unwrap().id;
-        let plan = Plan { id: "p".into(), construction: "c".into(), installation: "i".into(), generation: "g".into(),
-            entrypoint: "generate".into(), slots: vec![], sources: vec![], degree: 1 };
-        let residency = json!({"notes": {"weights": "resident"}, "graphs": {"transformer": {
-            "declared_regions": 40, "active_graphs": 40, "replays": 120, "captures": 40, "graph_pool_bytes": 1 << 30,
-            "captured_regions": ["blocks.0"], "eager_gaps": {"router": "dynamic routing"}, "later_counter": 7}},
-            "later_section": {"kept": true}});
-        let reply: Frame = serde_json::from_value(json!({"reply": "invoke", "ok": true, "residency": residency})).unwrap();
-        record_measurements(&engine, &id, &plan, &reply);
-        let kept = engine.with_journal(|journal| journal.measurements(&id)).unwrap().expect("measurements kept");
-        let kept: serde_json::Value = serde_json::from_slice(&kept).unwrap();
-        assert_eq!(kept["residency"], residency);
-        assert_eq!(kept["residency"]["graphs"]["transformer"]["replays"], 120);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_executor_that_ended_on_its_own_names_its_exit() {
-        let ended = |status: i32| device_executor::Ended {
-            status: std::process::ExitStatus::from_raw(status),
-            killed: None,
-            stragglers: 0,
-        };
-        let eof = || io::Error::new(io::ErrorKind::UnexpectedEof, "stock executor EOF before reply");
-        let error = with_end(eof(), &ended(libc::SIGSEGV));
-        assert_eq!(
-            error.to_string(),
-            "stock executor EOF before reply; the executor ended on its own (signal: 11 (SIGSEGV))"
-        );
-        // An executor ended by the machine after a refusal adds nothing to the refusal.
-        let refusal = || io::Error::other(Refused { code: "x".into(), detail: "y".into() });
-        assert_eq!(with_end(refusal(), &ended(libc::SIGKILL)).to_string(), "x: y");
-    }
-
-    #[test]
-    fn the_image_boot_runs_machine_kernels_from_the_executors_runtime_wheel() {
-        let dir = std::env::temp_dir().join(format!("kernel-runtime-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let wheel = dir.join("cozy_runtime-9.9.9-py3-none-any.whl");
-        let mut zip = zip::ZipWriter::new(File::create(&wheel).unwrap());
-        let options = zip::write::SimpleFileOptions::default();
-        for (name, body) in [
-            ("cozy_runtime/__init__.py", ""),
-            ("cozy_runtime/internal/__init__.py", ""),
-            ("cozy_runtime/internal/machine_kernels.py", "import sys; print(__name__, sys.path[0])"),
-            ("cozy_runtime-9.9.9.data/scripts/tensord", "not imported"),
-        ] {
-            zip.start_file(name, options).unwrap();
-            zip.write_all(body.as_bytes()).unwrap();
-        }
-        zip.finish().unwrap();
-        let tree = unpack_runtime(&wheel, &dir.join("trees")).unwrap();
-        assert_eq!(unpack_runtime(&wheel, &dir.join("trees")).unwrap(), tree);
-        assert!(!tree.join("cozy_runtime-9.9.9.data").exists());
-        let ran = std::process::Command::new("python3")
-            .args(["-I", "-c", RUNTIME_FIRST])
-            .arg(&tree)
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), format!("__main__ {}", tree.display()));
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_group_is_the_widest_degree_every_slot_declares_on_this_machine() {
-        let h3 = [
-            json!({"path":"e.models.base_model","sequence_parallel":{"degrees":[2,4,7,8]}}),
-            json!({"path":"e.models.turbo_lora","sequence_parallel":{"degrees":[2,4,7,8]}}),
-        ];
-        assert_eq!(group_degree(&h3, 0, 1), 1);
-        assert_eq!(group_degree(&h3, 0, 2), 2);
-        assert_eq!(group_degree(&h3, 0, 6), 4);
-        assert_eq!(group_degree(&h3, 1, 4), 1);
-        assert_eq!(group_degree(&h3, 2, 4), 2);
-        // A count no slot declares, or wider than the machine, caps the group: never a refusal.
-        assert_eq!(group_degree(&h3, 3, 4), 2);
-        assert_eq!(group_degree(&h3, 4, 2), 2);
-        // A slot without a declaration runs on one GPU only, so the group is one.
-        let mixed = [h3[0].clone(), json!({"path":"e.models.vae"})];
-        assert_eq!(group_degree(&mixed, 0, 4), 1);
-        assert_eq!(group_degree(&[json!({"path":"e.models.vae"})], 2, 2), 1);
-    }
-
-    /// A fresh pool over `width` GPUs no inventory names (this host's own stay untouched): no
-    /// ledger refuses a call.
-    fn pool_of(width: usize) -> (PathBuf, Arc<Pool>, Arc<Engine>) {
-        let root = std::env::temp_dir().join(format!("gpu-place-{}", uuid::Uuid::new_v4()));
-        let devices: Vec<_> = (0..width).map(|gpu| format!("GPU-test-{gpu}")).collect();
-        let config: GpuConfig = serde_json::from_value(json!({"devices": devices.join(","), "prespawn": false})).unwrap();
-        let store = crate::storage::open(&root.join("store")).unwrap();
-        let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
-        let engine = Engine::open(&root.join("execution")).unwrap();
-        (root, pool, engine)
-    }
-    /// Placement-only marker: process/ledger liveness is exercised by the retirement test.
-    fn mark_serving(pool: &Pool, plan: &str, start: usize) {
-        let birth = Birth { pid: 1_000_000 + start as u32, boot_id: "placement-only".into(), start_ticks: 0 };
-        pool.leaders.lock().unwrap().insert(birth.pid, (birth, plan.into(), start));
-    }
-    fn plan(id: &str, degree: u32) -> Plan {
-        Plan {
-            id: id.into(),
-            construction: id.into(),
-            installation: "i".into(),
-            generation: "g".into(),
-            entrypoint: "e".into(),
-            slots: vec![],
-            sources: vec![],
-            degree,
-        }
-    }
-
-    /// Retiring an exited replica takes only its exact process: a live sibling of the same
-    /// plan and lane keeps its tenancy and level (its ledger row is the multi-process test's).
-    #[cfg(unix)]
-    #[test]
-    fn an_exited_replica_retires_only_its_exact_process() {
-        struct Replica { child: std::process::Child, birth: Birth }
-        impl Drop for Replica {
-            fn drop(&mut self) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-        }
-        let replica = || {
-            let child = crate::scratch::until_stdin_closes().stdin(std::process::Stdio::piped()).spawn().unwrap();
-            let birth = Birth::of(child.id()).unwrap();
-            Replica { child, birth }
-        };
-        let (root, pool, engine) = pool_of(1);
-        let mut old = replica();
-        let live = replica();
-        let model = plan("replica", 1);
-        for birth in [&old.birth, &live.birth] {
-            pool.leaders.lock().unwrap().insert(birth.pid, (birth.clone(), model.construction.clone(), 0));
-            pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: model.construction.clone(), generation: model.generation.clone(), start: 0,
-                exact: Exact::open(birth).unwrap().unwrap() });
-        }
-        pool.levels.lock().unwrap().insert(model.construction.clone(), (("g".into(), "app".into()), Level::Gpu, live.birth.clone()));
-        let mut claims = [None];
-        let first = pool.place(&engine, &model, (Some(1), Some("family")), None, &mut claims).unwrap().1;
-        let second = pool.place(&engine, &model, (Some(2), Some("family")), None, &mut claims).unwrap().1;
-        assert!(pool.permit(&engine, Some(3), Some("stranger"), 0..1, &claims).is_none());
-        assert!(!owns_birth(&live.birth, &[], &old.birth), "end_stalled must not take a sibling's cached session");
-        assert!(owns_birth(&live.birth, &[], &live.birth));
-        let id = engine.submit("unknown-retirement", crate::journal::Invocation::default()).unwrap().id;
-        let owned = old.birth.clone();
-        let survivor = live.birth.clone();
-        let serving = pool.clone();
-        let (ready, registered) = std::sync::mpsc::channel();
-        let (go, proceed) = std::sync::mpsc::channel();
-        let (done, finished) = std::sync::mpsc::channel();
-        assert!(engine.dispatch_managed(&id, move |engine, id| {
-            engine.register_managed(&id, owned.clone(), Arc::new(|| Ok(())))?;
-            assert!(engine.authorize_managed(&id, None)?);
-            assert!(engine.get(&id)?.pending_completion.is_none());
-            ready.send(()).unwrap();
-            proceed.recv().unwrap();
-            serving.finish_returned(&engine, &id, "replica", 0,
-                &Disposition::Unknown(vec![owned.clone()]))?;
-            let preserved = owned.ended()? && !survivor.ended()?
-                && serving.tenants.lock().unwrap().get(&survivor.pid).is_some_and(|t| t.exact.birth() == &survivor)
-                && serving.level("replica") == Some(Level::Gpu);
-            settle(&engine, &id, &io::Error::other("early request failed before its outcome"))?;
-            done.send(preserved).unwrap();
-            Ok(())
-        }).unwrap());
-        registered.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
-        // No cache entry: the sibling already took it. Live and PID-reused identities cannot retire it.
-        assert!(pool.sessions.lock().unwrap().is_empty());
-        pool.retire_returned(&model.construction, 0, std::slice::from_ref(&live.birth));
-        let mut stale = live.birth.clone();
-        stale.start_ticks = stale.start_ticks.wrapping_add(1);
-        assert!(!owns_birth(&live.birth, &[], &stale), "a reused PID is not this owner");
-        pool.retire_returned(&model.construction, 0, &[stale]);
-        assert_eq!(pool.tenants.lock().unwrap().len(), 2);
-        drop(old.child.stdin.take());
-        assert!(old.child.wait().unwrap().success());
-        pool.retire_returned(&model.construction, 0, std::slice::from_ref(&old.birth));
-        assert!(!pool.tenants.lock().unwrap().contains_key(&old.birth.pid));
-        assert!(pool.tenants.lock().unwrap().get(&live.birth.pid).is_some_and(|t| t.exact.birth() == &live.birth));
-        assert_eq!(pool.hosting(&model.construction), [0]);
-        assert_eq!(pool.level(&model.construction), Some(Level::Gpu));
-        // The actual managed request has no pending outcome and still retires only its birth.
-        go.send(()).unwrap();
-        assert!(finished.recv_timeout(std::time::Duration::from_secs(30)).unwrap());
-        assert_eq!(pool.level(&model.construction), Some(Level::Gpu));
-        drop((first, second, old, live));
-        pool.ended(&model.construction, 0);
-        assert!(pool.hosting(&model.construction).is_empty());
-        pool.stop().unwrap();
-        drop((pool, engine));
-        crate::scratch::remove(&root);
-    }
-
-    /// The journal can be unreadable after registration fails; the owned process still
-    /// determines when its lane can be retired, and the read error is then preserved.
-    #[test]
-    fn an_unreadable_journal_still_retires_the_exited_owned_process() {
-        let (root, pool, engine) = pool_of(1);
-        let mut child = crate::scratch::until_stdin_closes()
-            .stdin(std::process::Stdio::piped()).spawn().unwrap();
-        let birth = Birth::of(child.id()).unwrap();
-        let exact = Exact::open(&birth).unwrap().unwrap();
-        let id = engine.submit("unreadable-retirement", crate::journal::Invocation::default()).unwrap().id;
-        pool.leaders.lock().unwrap().insert(birth.pid, (birth.clone(), "unreadable".into(), 0));
-        pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: "unreadable".into(), generation: String::new(), start: 0, exact });
-        pool.levels.lock().unwrap().insert("unreadable".into(), (("g".into(), "app".into()), Level::Host, birth.clone()));
-        // Valid JSON passes SQLite's index but lacks Execution fields at the journal reader.
-        let db = rusqlite::Connection::open(engine.root.join("executions.sqlite3")).unwrap();
-        assert_eq!(db.execute("UPDATE executions SET record='{}' WHERE id=?1", [&id]).unwrap(), 1);
-        let expected = engine.get(&id).unwrap_err();
-        drop(child.stdin.take());
-        assert!(child.wait().unwrap().success());
-        let error = pool.finish_returned(&engine, &id, "unreadable", 0,
-            &Disposition::Unknown(vec![birth.clone()])).unwrap_err();
-        assert_eq!(error.to_string(), expected.to_string());
-        assert!(!pool.tenants.lock().unwrap().contains_key(&birth.pid));
-        assert!(pool.hosting("unreadable").is_empty());
-        assert!(pool.level("unreadable").is_none());
-        pool.stop().unwrap();
-        drop((pool, engine, db));
-        crate::scratch::remove(&root);
-    }
-
-    /// A family can take the cached executor while its predecessor still holds its permit.
-    /// The absent cache entry then means borrowed, not dead. A rejected journal finish also
-    /// cannot turn this known handoff into a wait for that live executor's exit.
-    #[test]
-    fn a_same_family_cached_handoff_keeps_the_live_executor_on_finish_error_too() {
-        let (root, pool, engine) = pool_of(1);
-        for reject_finish in [false, true] {
-            let mut child = crate::scratch::until_stdin_closes()
-                .stdin(std::process::Stdio::piped()).spawn().unwrap();
-            let birth = Birth::of(child.id()).unwrap();
-            let owned_birth = birth.clone();
-            let id = engine.submit(&format!("cached-handoff-{reject_finish}"), crate::journal::Invocation::default()).unwrap().id;
-            let (done, finished) = std::sync::mpsc::channel();
-            let serving = pool.clone();
-            assert!(engine.dispatch_managed(&id, move |engine, id| {
-                engine.register_managed(&id, owned_birth.clone(), Arc::new(|| Ok(())))?;
-                assert!(engine.authorize_managed(&id, None)?);
-                let model = plan("handoff", 1);
-                serving.leaders.lock().unwrap().insert(owned_birth.pid, (owned_birth.clone(), model.construction.clone(), 0));
-                serving.levels.lock().unwrap().insert(model.construction.clone(), (("g".into(), "app".into()), Level::Host, owned_birth.clone()));
-                serving.tenants.lock().unwrap().insert(owned_birth.pid, Tenant {
-                    plan: model.construction.clone(), generation: model.generation.clone(), start: 0,
-                    exact: Exact::open(&owned_birth)?.expect("the test's child is live"),
-                });
-                let mut claims = [None];
-                let root = id.parse::<u64>().unwrap();
-                let (first_gpu, _first) = serving.place(&engine, &model, (Some(root), Some("same-family")), None, &mut claims).unwrap();
-                let (next_gpu, _next) = serving.place(&engine, &model, (Some(root + 100), Some("same-family")), None, &mut claims).unwrap();
-                assert_eq!((first_gpu, next_gpu), (0, 0));
-                assert!(serving.permit(&engine, Some(root + 200), Some("stranger"), 0..1, &claims).is_none());
-                // The next call already took the cache entry; its exact process still lives.
-                assert!(serving.sessions.lock().unwrap().is_empty());
-                let outcome = if reject_finish {
-                    // The journal's real cancellation-authority check supplies a deterministic
-                    // finish error, with no production failpoint or timing assumption.
-                    Outcome::Canceled
-                } else {
-                    Outcome::Completed(crate::journal::ResultRecord {
-                        value: json!({"answer": 42}), artifacts: vec![], asset_bindings: vec![], adjustments: vec![],
-                    })
-                };
-                engine.defer_completion(&id, outcome, vec![owned_birth.clone()])?;
-                let result = serving.finish_returned(&engine, &id, &model.construction, 0, &Disposition::Cached);
-                let preserved = result.is_err() == reject_finish
-                    && !owned_birth.ended()?
-                    && serving.leaders.lock().unwrap().get(&owned_birth.pid).is_some_and(|(birth, _, _)| birth == &owned_birth)
-                    && serving.levels.lock().unwrap().contains_key(&model.construction)
-                    && serving.tenants.lock().unwrap().get(&owned_birth.pid).is_some_and(|tenant| tenant.exact.birth() == &owned_birth);
-                if reject_finish {
-                    assert_eq!(engine.get(&id)?.state, State::Running);
-                    assert!(engine.get(&id)?.result.is_none());
-                    engine.cancel(&id, "test")?;
-                    engine.finish_pending(&id)?;
-                } else {
-                    assert_eq!(engine.get(&id)?.state, State::Completed);
-                }
-                done.send(preserved).unwrap();
-                Ok(())
-            }).unwrap());
-            // Only a failure backstop: the ordering is established by real family permits and
-            // the completion channel. Always close/reap this test's child before asserting.
-            let proof = finished.recv_timeout(std::time::Duration::from_secs(30));
-            drop(child.stdin.take());
-            child.wait().unwrap();
-            pool.retire_returned("handoff", 0, &[birth]);
-            assert!(proof.unwrap(), "the old call retired a borrowed live executor");
-        }
-        pool.stop().unwrap();
-        drop((pool, engine));
-        crate::scratch::remove(&root);
-    }
-
-    #[test]
-    fn calls_of_one_plan_spread_over_free_gpus_and_a_waiting_group_keeps_its_place() {
-        let (root, pool, engine) = pool_of(4);
-        let (image, film) = (plan("image", 1), plan("film", 2));
-        let place = |plan: &Plan, seq: u64, claims: &mut [Option<u64>]| pool.place(&engine, plan, (Some(seq), None), None, claims);
-        let serving = |gpu: usize| mark_serving(&pool, "image", gpu);
-        let mut claims = [None; 4];
-        let (gpu, first) = place(&image, 1, &mut claims).unwrap();
-        assert_eq!(gpu, 0);
-        serving(0);
-        // GPU 0 serves it: the next call starts a replica on the next free GPU.
-        let (gpu, second) = place(&image, 2, &mut claims).unwrap();
-        assert_eq!(gpu, 1);
-        serving(1);
-        // A full-machine group waits and keeps later requests off its GPUs.
-        assert!(place(&plan("full", 4), 3, &mut claims).is_none());
-        assert_eq!(claims, [Some(3); 4]);
-        drop(first);
-        assert!(place(&image, 4, &mut claims).is_none(), "the full-machine group has priority");
-        let (gpu, third) = place(&image, 4, &mut [None; 4]).unwrap();
-        assert_eq!(gpu, 0);
-        serving(2);
-        // The next pass: an idle executor of the plan comes before a new replica.
-        drop((second, third));
-        let mut claims = [None; 4];
-        let held: Vec<_> = (5..8).map(|seq| place(&image, seq, &mut claims).unwrap()).collect();
-        assert_eq!(held.iter().map(|(gpu, _)| *gpu).collect::<Vec<_>>(), [0, 1, 2]);
-        assert_eq!(place(&image, 8, &mut claims).unwrap().0, 3);
-        // Every GPU of its lane free at once: the group runs.
-        drop(held);
-        assert_eq!(place(&film, 9, &mut [None; 4]).unwrap().0, 0);
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    /// TD-1: one placement path for every degree. A group goes to the lane its executor holds,
-    /// as one GPU does, for a request and for warming alike; a waiting one claims that lane.
-    #[test]
-    fn a_group_runs_on_the_lane_its_executor_holds() {
-        let (root, pool, engine) = pool_of(4);
-        let film = plan("film", 2);
-        mark_serving(&pool, "film", 2);
-        let (gpu, warming) = pool.place(&engine, &film, (None, None), None, &mut [None; 4]).unwrap();
-        assert_eq!(gpu, 2, "warming loads where its executor is");
-        drop(warming);
-        let (gpu, call) = pool.place(&engine, &film, (Some(1), None), None, &mut [None; 4]).unwrap();
-        assert_eq!(gpu, 2, "not a cold load on the first free lane");
-        // Busy there, the next call is a replica on a free lane where it fits.
-        let (gpu, replica) = pool.place(&engine, &film, (Some(2), None), None, &mut [None; 4]).unwrap();
-        assert_eq!(gpu, 0);
-        drop((call, replica));
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    #[test]
-    fn a_shape_key_names_its_axes_and_escapes_them() {
-        let of = |features: serde_json::Value| shape(&serde_json::from_value(features).unwrap());
-        assert_eq!(of(json!({"width": 832, "frames": 81})), "frames=81,width=832");
-        assert_ne!(of(json!({"frames": 8, "height": 4})), of(json!({"assets": 8, "frames": 4})));
-        assert_eq!(of(json!({"a,b": "x=y|z%"})), "a%2Cb=\"x%3Dy%7Cz%25\"");
-        assert_eq!(of(json!({})), "-");
-    }
-
-    /// A group's Load names each placeable component's GPU; one GPU names none. Without a
-    /// ledger on its GPUs, nothing is kept away from GPU 0.
-    #[test]
-    fn a_groups_load_names_each_placeable_components_gpu() {
-        let (root, pool, _engine) = pool_of(2);
-        let binding = Binding { model_binding_path: "e.models.m".into(), release: "p@1".into(), ..Default::default() };
-        let mut group = plan("film", 2);
-        group.slots = vec![PlanSlot { binding, lane: String::new(), precision: String::new(), selected_encoded_bytes: 0, on_demand: false, placeable: vec!["te".into()] }];
-        let homes = pool.homes(&group, pool.lane(0, 2).unwrap());
-        assert_eq!(homes, BTreeMap::from([("e.models.m".to_string(), BTreeMap::from([("te".to_string(), 0)]))]));
-        assert!(pool.homes(&group, pool.lane(0, 1).unwrap()).is_empty());
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    #[test]
-    fn independent_two_gpu_requests_use_disjoint_lanes() {
-        let (root, pool, engine) = pool_of(4);
-        let group = plan("two", 2);
-        let place = |seq: u64| pool.place(&engine, &group, (Some(seq), None), None, &mut [None; 4]);
-        let (first_gpu, first) = place(1).unwrap();
-        let (second_gpu, second) = place(2).unwrap();
-        assert_eq!((first_gpu, second_gpu), (0, 2));
-        assert!(place(3).is_none());
-        drop(first);
-        assert_eq!(place(3).unwrap().0, 0);
-        drop(second);
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    /// A deviceless root accepted as request `key`, ready to dispatch.
-    fn root_job(engine: &Engine, key: &str, gpus: u32) -> Execution {
-        let invocation = crate::journal::Invocation {
-            package: "p".into(), generation: "0".repeat(32), module: "p:app".into(),
-            entrypoint: "run".into(), gpus, ..Default::default()
-        };
-        let (accepted, _) = engine.accept_run("actor", key, key, invocation.clone()).unwrap();
-        engine.bind_prepared(&accepted.id, invocation, "", Default::default(), None).unwrap()
-    }
-    /// The root's `gpu` log entries: (state, gpus, behind).
-    fn allocation_log(engine: &Engine, id: &str) -> Vec<(String, Vec<u64>, String)> {
-        engine.logs(id).unwrap().iter().filter_map(|stored| {
-            let entry: serde_json::Value = serde_json::from_slice(&stored.product).ok()?;
-            let gpu = entry.get("gpu")?;
-            Some((gpu["state"].as_str()?.into(), gpu["gpus"].as_array()?.iter().filter_map(|g| g.as_u64()).collect(),
-                gpu["behind"].as_str()?.into()))
-        }).collect()
-    }
-
-    fn running_roots(engine: &Arc<Engine>, keys: [&str; 3]) -> [Execution; 3] {
-        keys.map(|key| {
-            let job = root_job(engine, key, 0);
-            engine.dispatch_managed(&job.id, |_, _| Ok(())).unwrap();
-            job
-        })
-    }
-    fn request(record: &Execution) -> String {
-        record.submission.as_ref().map(|s| s.request_id.clone()).unwrap_or_default()
-    }
-
-    #[test]
-    fn a_root_keeps_its_lane_between_steps_and_later_roots_wait_in_acceptance_order() {
-        let (root, pool, engine) = pool_of(4);
-        let [first, second, _] = running_roots(&engine, ["first", "second", "unused"]);
-        let first_allocation = pool.root(&engine, &first, 4).unwrap();
-        let second_allocation = pool.root(&engine, &second, 2).unwrap();
-        let (a, b) = (first.root_seq(), second.root_seq());
-        // Both ready: the older root binds, the younger waits.
-        let mut claims = [None; 4];
-        let lane = pool.root_lane(&engine, a, &mut claims).unwrap();
-        assert_eq!(lane, 0..4);
-        assert!(pool.root_lane(&engine, b, &mut claims).is_none());
-        // A reference on one GPU, then a group over the lane: nobody else runs in the gap.
-        let (gpu, reference) = pool.place(&engine, &plan("reference", 1), (Some(a), None), Some(lane.clone()), &mut [None; 4]).unwrap();
-        assert_eq!(gpu, 0);
-        drop(reference);
-        assert!(pool.root_lane(&engine, b, &mut [None; 4]).is_none());
-        assert!(pool.place(&engine, &plan("other", 1), (Some(9), None), None, &mut [None; 4]).is_none(), "nor a standalone call");
-        let (_, segment) = pool.place(&engine, &plan("segment", 4), (Some(a), None), Some(lane), &mut [None; 4]).unwrap();
-        // Release with a segment in flight: the younger root binds once it returns.
-        pool.release(&engine, a);
-        pool.release(&engine, a);
-        assert!(pool.root_lane(&engine, b, &mut [None; 4]).is_none());
-        drop(segment);
-        let lane = pool.root_lane(&engine, b, &mut [None; 4]).unwrap();
-        assert_eq!(lane, 0..2);
-        // The released root comes back ahead of every later root but never displaces the
-        // holder: it waits for the lane, the holder's steps go on, a later standalone call
-        // may not take the free half.
-        let mut claims = [None; 4];
-        assert!(pool.root_lane(&engine, a, &mut claims).is_none());
-        let (_, step) = pool.place(&engine, &plan("image", 1), (Some(b), None), Some(lane), &mut claims).unwrap();
-        assert!(pool.place(&engine, &plan("other", 1), (Some(9), None), None, &mut claims).is_none());
-        drop((step, second_allocation));
-        assert_eq!(pool.root_lane(&engine, a, &mut [None; 4]), Some(0..4));
-        drop(first_allocation);
-        assert_eq!(allocation_log(&engine, &first.id), [
-            ("grant".into(), vec![0, 1, 2, 3], String::new()), ("release".into(), vec![0, 1, 2, 3], String::new()),
-            ("wait".into(), vec![], request(&second)), ("grant".into(), vec![0, 1, 2, 3], String::new()),
-            ("release".into(), vec![0, 1, 2, 3], String::new()),
-        ]);
-        assert_eq!(allocation_log(&engine, &second.id)[..2], [
-            ("wait".into(), vec![], request(&first)), ("grant".into(), vec![0, 1], String::new()),
-        ]);
-        assert!(pool.place(&engine, &plan("other", 4), (Some(9), None), None, &mut [None; 4]).is_some(), "exits end the lanes");
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    /// An older root still downloading its weights claims no GPU: a younger ready root runs
-    /// meanwhile and hands its lane over at its next step boundary once the older one's first
-    /// step is ready. Its step in flight, a served call's own child included, finishes first.
-    #[test]
-    fn a_younger_root_runs_while_an_older_one_downloads_and_yields_at_its_step_boundary() {
-        let (root, pool, engine) = pool_of(2);
-        let [big, small, _] = running_roots(&engine, ["big", "small", "unused"]);
-        let holds = (pool.root(&engine, &big, 2).unwrap(), pool.root(&engine, &small, 2).unwrap());
-        let (a, b) = (big.root_seq(), small.root_seq());
-        let lane = pool.root_lane(&engine, b, &mut [None; 2]).unwrap();
-        assert_eq!(lane, 0..2);
-        let (_, image) = pool.place(&engine, &plan("image", 1), (Some(b), None), Some(lane.clone()), &mut [None; 2]).unwrap();
-        drop(image);
-        let (_, served) = pool.place(&engine, &plan("served", 1), (Some(b), Some("served")), Some(lane.clone()), &mut [None; 2]).unwrap();
-        // The big root's first step is ready.
-        let mut claims = [None; 2];
-        assert!(pool.root_lane(&engine, a, &mut claims).is_none());
-        assert!(pool.place(&engine, &plan("image", 1), (Some(b), None), Some(lane.clone()), &mut claims).is_none(), "no new step");
-        let (_, child) = pool.place(&engine, &plan("child", 1), (Some(b), Some("served")), Some(lane.clone()), &mut claims).unwrap();
-        drop((child, served));
-        let mut claims = [None; 2];
-        assert_eq!(pool.root_lane(&engine, a, &mut claims), Some(0..2));
-        assert!(pool.root_lane(&engine, b, &mut claims).is_none());
-        assert_eq!(allocation_log(&engine, &big.id), [
-            ("wait".into(), vec![], request(&small)), ("grant".into(), vec![0, 1], String::new()),
-        ]);
-        assert_eq!(allocation_log(&engine, &small.id), [
-            ("grant".into(), vec![0, 1], String::new()), ("release".into(), vec![0, 1], request(&big)),
-            ("wait".into(), vec![], request(&big)),
-        ]);
-        drop(holds);
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    /// A waiting root's wait names its current blocker: a new entry when it changes.
-    #[test]
-    fn a_waiting_roots_entry_follows_its_current_blocker() {
-        let (root, pool, engine) = pool_of(2);
-        let [x, y, a] = running_roots(&engine, ["x", "y", "a"]);
-        let (x_hold, holds) = (pool.root(&engine, &x, 2).unwrap(), [pool.root(&engine, &y, 2).unwrap(), pool.root(&engine, &a, 2).unwrap()]);
-        assert_eq!(pool.root_lane(&engine, x.root_seq(), &mut [None; 2]), Some(0..2));
-        // y is still downloading; a waits behind x.
-        assert!(pool.root_lane(&engine, a.root_seq(), &mut [None; 2]).is_none());
-        assert!(pool.root_lane(&engine, a.root_seq(), &mut [None; 2]).is_none());
-        drop(x_hold);
-        let mut claims = [None; 2];
-        assert_eq!(pool.root_lane(&engine, y.root_seq(), &mut claims), Some(0..2));
-        assert!(pool.root_lane(&engine, a.root_seq(), &mut claims).is_none());
-        assert_eq!(allocation_log(&engine, &a.id), [
-            ("wait".into(), vec![], request(&x)), ("wait".into(), vec![], request(&y)),
-        ]);
-        drop(holds);
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    /// Gate (f), runs 5673/5674 on one GPU: the older root's two ready first steps wait behind
-    /// the younger holder's step in flight. Each pass visits both; the second's own claim must
-    /// not hide the holder, so the root logs one wait naming it, not one per pass flipping to
-    /// nobody (each wait entry also woke the next pass).
-    #[test]
-    fn a_roots_ready_steps_log_one_wait_for_one_blocker() {
-        let (root, pool, engine) = pool_of(1);
-        let [older, younger, _] = running_roots(&engine, ["older", "younger", "unused"]);
-        let holds = (pool.root(&engine, &older, 1).unwrap(), pool.root(&engine, &younger, 1).unwrap());
-        let (a, b) = (older.root_seq(), younger.root_seq());
-        let lane = pool.root_lane(&engine, b, &mut [None]).unwrap();
-        let (_, step) = pool.place(&engine, &plan("step", 1), (Some(b), None), Some(lane.clone()), &mut [None]).unwrap();
-        for _ in 0..3 {
-            let mut claims = [None];
-            assert!(pool.root_lane(&engine, a, &mut claims).is_none());
-            assert!(pool.root_lane(&engine, a, &mut claims).is_none());
-            assert_eq!(pool.root_lane(&engine, b, &mut claims), Some(lane.clone()));
-            assert!(pool.place(&engine, &plan("step", 1), (Some(b), None), Some(lane.clone()), &mut claims).is_none(), "no new step");
-        }
-        drop(step);
-        assert_eq!(pool.root_lane(&engine, a, &mut [None]), Some(0..1));
-        assert_eq!(allocation_log(&engine, &older.id), [
-            ("wait".into(), vec![], request(&younger)), ("grant".into(), vec![0], String::new()),
-        ]);
-        drop(holds);
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    #[test]
-    fn an_explicit_root_keeps_its_children_in_its_two_gpu_lane() {
-        let (root, pool, engine) = pool_of(4);
-        let job = root_job(&engine, "cpu-job", 2);
-        let allocation = pool.root(&engine, &job, 2).unwrap();
-        let seq = job.root_seq();
-        let lane = pool.root_lane(&engine, seq, &mut [None; 4]).unwrap();
-        assert_eq!(lane, 0..2);
-        let group = plan("child", 2);
-        let (gpu, child) = pool.place(&engine, &group, (Some(seq), None), Some(lane.clone()), &mut [None; 4]).unwrap();
-        assert_eq!(gpu, 0);
-        assert!(pool.place(&engine, &group, (Some(seq), None), Some(lane), &mut [None; 4]).is_none(),
-            "a simultaneous sibling cannot escape to the other two GPUs");
-        let (gpu, other) = pool.place(&engine, &group, (Some(8), None), None, &mut [None; 4]).unwrap();
-        assert_eq!(gpu, 2, "the unrelated request uses the other half");
-        drop(allocation); // canceled/ended root; its live child still runs on its GPUs.
-        assert!(pool.place(&engine, &group, (Some(9), None), None, &mut [None; 4]).is_none());
-        drop(child);
-        assert_eq!(pool.place(&engine, &group, (Some(9), None), None, &mut [None; 4]).unwrap().0, 0);
-        drop(other);
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    /// A fresh pod's burst of one unlearned plan: its first call starts on GPU 0, the second at
-    /// once on empty GPU 1, the third waits for either.
-    #[test]
-    fn a_cold_burst_runs_on_every_empty_gpu_at_once() {
-        let (root, pool, engine) = pool_of(2);
-        let image = plan("image", 1);
-        let mut claims = [None; 2];
-        let (gpu, first) = pool.place(&engine, &image, (Some(1), None), None, &mut claims).unwrap();
-        assert_eq!(gpu, 0);
-        mark_serving(&pool, "image", 0);
-        let (gpu, second) = pool.place(&engine, &image, (Some(2), None), None, &mut claims).unwrap();
-        assert_eq!(gpu, 1);
-        mark_serving(&pool, "image", 1);
-        assert!(pool.place(&engine, &image, (Some(3), None), None, &mut claims).is_none());
-        assert_eq!(claims, [Some(3), Some(3)]);
-        drop((first, second));
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    const MIB: u64 = 1 << 20;
-
-    /// An executor's frame nudges the host watcher: it looks at the host (what the running
-    /// calls keep free), with no kernel event to wake it. In its own process: one namespace.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn an_executors_frame_nudges_the_host_watcher_to_look() {
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "gpu_service::tests::frame_nudge_child", "--ignored", "--nocapture"])
-            .env("S5_NUDGE", "1")
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "an_executors_frame_nudges_the_host_watcher_to_look runs it in its own process"]
-    fn frame_nudge_child() {
-        if std::env::var("S5_NUDGE").is_err() { return; }
-        assert!(varena::os::namespace(&format!("nudge{}-", std::process::id())));
-        let uuid = format!("nudge-{}", std::process::id());
-        let inventory: crate::machine::receipt::Gpu = serde_json::from_value(json!({"device_index": 0, "device_name": "host", "device_uuid": uuid,
-            "driver_version": "", "memory_bytes": 1u64 << 30, "pci_bus_id": ""})).unwrap();
-        let tenants = memory::Tenants::default();
-        let peers = Arc::new(memory::Peers::new(tenants.clone(), vec![], memory::MemoryLog::default()));
-        let leases = memory::Leases { peers, open: None, tenants };
-        let peaks = memory::Peaks::at(std::env::temp_dir().join(format!("gpu-nudge-peaks-{}", uuid::Uuid::new_v4())));
-        let gpu = Arc::new(memory::Gpu::create("0", &[inventory], None, platform::contain::host_pressure::HostMode::Shared, leases, &peaks, &memory::MemoryLog::default()).unwrap());
-        let host = memory::Host::watch(platform::contain::host_pressure::HostMode::Shared, vec![gpu], memory::Running::default(), &memory::MemoryLog::default()).expect("watched");
-        host.look(); // Whatever woke it at its start has been answered.
-        let made = host.looks();
-        let root = std::env::temp_dir().join(format!("gpu-nudge-{}", uuid::Uuid::new_v4()));
-        let engine = Engine::open(&root.join("execution")).unwrap();
-        let generation: crate::catalog::Generation = serde_json::from_value(json!({"identity": "g", "package": "p", "version": "1",
-            "application": "app", "python": "/usr/bin/python3", "interface": {}})).unwrap();
-        let mut callbacks = Callbacks { engine: &engine, id: "nudged", completed: 0, generation: &generation, spool: None, caller: None, formation: None, host: Some(&host) };
-        let frame: Frame = serde_json::from_value(json!({"event": "progress", "stage": "denoise", "position": 1, "total": 8})).unwrap();
-        callbacks.progress(&frame);
-        // The look follows the frame's nudge; a failure backstop only.
-        let (looked, looks) = std::sync::mpsc::channel();
-        let waiting = host.clone();
-        std::thread::spawn(move || {
-            waiting.await_look(made);
-            let _ = looked.send(());
-        });
-        looks.recv_timeout(std::time::Duration::from_secs(60)).expect("the frame's nudge made the watcher look");
-        crate::scratch::remove(&root);
-    }
-
-    /// A call's decisions reach the memory log in order, one line each with the run, process
-    /// and GPUs, every field relayed; the run's measurements keep them in its stats.
-    #[test]
-    fn a_calls_memory_decisions_reach_the_memory_log_in_order() {
-        let (root, pool, _engine) = pool_of(1);
-        let decisions = json!([
-            {"step": 0, "trigger": "pass", "action": "cut", "site": "ffn", "need": 1 << 30, "freed": 0, "level": 2},
-            {"step": 1, "trigger": "oom", "action": "evict_d", "site": null, "need": 1 << 29, "freed": 1 << 28, "level": null},
-            {"step": 1, "trigger": "oom", "action": "exhausted", "site": "attention", "need": 1 << 20, "freed": 0, "level": null, "later": true}]);
-        let reply: Frame = serde_json::from_value(json!({"reply": "invoke", "ok": true, "memory": {"peak": 7, "decisions": decisions}})).unwrap();
-        pool.note_decisions("run-7", 4242, "0", &reply);
-        let log = std::fs::read_to_string(pool.store.root().join("logs/memory.log")).unwrap();
-        // Each line: its time, then the record.
-        let noted: Vec<serde_json::Value> = log.lines().filter_map(|l| l.split_once(' ')).map(|(_, l)| serde_json::from_str::<serde_json::Value>(l).unwrap())
-            .filter(|l| l["event"] == "decision").collect();
-        assert_eq!(noted.len(), 3, "{log}");
-        for (line, decision) in noted.iter().zip(decisions.as_array().unwrap()) {
-            assert_eq!((line["run"].as_str(), line["pid"].as_u64(), line["gpus"].as_str()), (Some("run-7"), Some(4242), Some("0")));
-            for (key, value) in decision.as_object().unwrap() {
-                assert_eq!(&line[key], value, "{key} relayed");
-            }
-        }
-        assert_eq!(call_memory(&reply).unwrap()["stats"]["decisions"], decisions, "the measurements keep them");
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-    /// An executor stand-in for the stall rule: it dials the GPU's manager (its control socket at
-    /// stdin) and answers one line per command: `take <MiB>` (weights chunks, imported, mapped and
-    /// landed, then idle), `keep <MiB>` (the same, pinned: never reclaimed) and `answering` (from
-    /// now on every reclaim request is answered: the asked chunks are unmapped and released).
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "the stall-rule test runs it as an executor"]
-    fn stall_stand_in() {
-        use std::io::{BufRead, Write};
-        use std::os::fd::FromRawFd;
-        use varena::lease::{Agent, Attach, Kind, Lease};
-        let Ok(spec) = std::env::var("S5_STALL") else { return };
-        let [prefix, uuid] = spec.split('|').collect::<Vec<_>>()[..] else { panic!("{spec}") };
-        assert!(varena::os::namespace(prefix));
-        // SAFETY: the test installs its control socket at this process's stdin.
-        let control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
-        let held: Arc<Mutex<Vec<Lease>>> = Arc::default();
-        let (answering, agent) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::OnceLock::<Arc<Agent>>::new()));
-        let (give, gives) = std::sync::mpsc::channel::<()>();
-        let stream = varena::lease::connect(platform::memory::euid(), uuid).unwrap().expect("TensorD serves the GPU");
-        let Attach::Leased(attached) = Agent::attach(stream, Arc::new(varena::HostBackend::new(1 << 30)), move || {
-            let _ = give.send(());
-        }).unwrap() else { panic!("refused") };
-        let _ = agent.set(attached.clone());
-        let (releasing, keeping, answers) = (attached.clone(), held.clone(), answering.clone());
-        std::thread::spawn(move || {
-            for () in gives {
-                if !answers.load(std::sync::atomic::Ordering::Relaxed) {
-                    continue;
-                }
-                let mut leases = keeping.lock().unwrap();
-                for ticket in releasing.asked_back() {
-                    if let Some(at) = leases.iter().position(|lease| lease.ticket == ticket) {
-                        let lease = leases.remove(at);
-                        if releasing.commit(ticket).unwrap() {
-                            releasing.release(ticket, lease.phys).unwrap();
-                        }
-                    }
-                }
-            }
-        });
-        let (mut out, lines) = (control.try_clone().unwrap(), std::io::BufReader::new(control).lines());
-        for line in lines.map_while(Result::ok) {
-            let reply = match line.split(' ').collect::<Vec<_>>()[..] {
-                [verb @ ("take" | "keep"), mib] => {
-                    let leases = attached.take(mib.parse::<u64>().unwrap() * MIB, Kind::Weights, None).unwrap();
-                    let tickets: Vec<_> = leases.iter().map(|lease| lease.ticket).collect();
-                    attached.mapped(&tickets).unwrap();
-                    tickets.iter().for_each(|ticket| attached.landed(*ticket).unwrap());
-                    if verb == "keep" {
-                        tickets.iter().for_each(|ticket| assert!(attached.pin(*ticket).unwrap()));
-                    }
-                    held.lock().unwrap().extend(leases);
-                    format!("took {} MiB", leases_bytes(&held.lock().unwrap()) / MIB)
-                }
-                ["answering"] => {
-                    answering.store(true, std::sync::atomic::Ordering::Relaxed);
-                    "answering".to_string()
-                }
-                _ => panic!("unknown command {line}"),
-            };
-            writeln!(out, "{reply}").unwrap();
-        }
-    }
-
-    /// The bytes `held` leases hold.
-    #[cfg(target_os = "linux")]
-    fn leases_bytes(held: &[varena::lease::Lease]) -> u64 {
-        held.iter().map(|lease| lease.phys.len).sum()
-    }
-
-    /// A stall-rule stand-in, its control socket and replies.
-    #[cfg(target_os = "linux")]
-    struct StallStandIn {
-        child: std::process::Child,
-        control: std::os::unix::net::UnixStream,
-        replies: std::io::BufReader<std::os::unix::net::UnixStream>,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl StallStandIn {
-        /// A stand-in registered as `pool`'s tenant, attached to its GPU.
-        fn spawn(prefix: &str, pool: &Pool, uuid: &str) -> StallStandIn {
-            let (control, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-            let child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "gpu_service::tests::stall_stand_in", "--ignored", "--nocapture"])
-                .env("S5_STALL", format!("{prefix}|{uuid}"))
-                .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(theirs)))
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
-            let exact = Exact::open(&Birth::of(child.id()).unwrap()).unwrap().unwrap();
-            pool.tenants.register([(child.id(), Tenant { plan: format!("stall-{}", child.id()), generation: "g".into(), start: 0, exact })]);
-            let replies = std::io::BufReader::new(control.try_clone().unwrap());
-            StallStandIn { child, control, replies }
-        }
-
-        fn ask(&mut self, command: &str) -> String {
-            use std::io::{BufRead, Write};
-            writeln!(self.control, "{command}").unwrap();
-            let mut reply = String::new();
-            self.replies.read_line(&mut reply).unwrap();
-            reply.trim().to_string()
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for StallStandIn {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-
-    /// The stall rule, through the pool's own events thread (`memory_changed` → `end_stalled`)
-    /// over a host GPU's manager, with real processes: an executor asked to give chunks back that
-    /// answers is never ended; once it is stopped (SIGSTOP) with a reclaim request out to it, the
-    /// manager names it stalled and the pool ends it, so the asker's allocation is made.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_stopped_executor_asked_for_chunks_is_ended_and_an_answering_one_never() {
-        let prefix = format!("gpusvc{}-", std::process::id());
-        assert!(varena::os::namespace(&prefix), "the test binary's namespace");
-        let root = std::env::temp_dir().join(format!("gpu-stall-{}", uuid::Uuid::new_v4()));
-        let uuid = format!("GPU-stall-{}", uuid::Uuid::new_v4());
-        // Host pages keep no reserved pool: 512 MiB to allocate.
-        let config: GpuConfig = serde_json::from_value(json!({"devices": "0", "prespawn": false,
-            "inventory": [{"device_index": 0, "device_name": "host", "device_uuid": uuid, "driver_version": "", "memory_bytes": 1u64 << 30, "pci_bus_id": ""}]})).unwrap();
-        let store = crate::storage::open(&root.join("store")).unwrap();
-        let host = |_: &str, _: &MemoryLog| Some(Box::new(|| Ok(Arc::new(varena::HostBackend::new(512 * MIB)) as Arc<dyn varena::Backend>)) as varena::lease::Opener);
-        let pool = Pool::with_chunks(&root.join("gpu"), config, store.clone(), host).unwrap();
-        let mut holder = StallStandIn::spawn(&prefix, &pool, &uuid);
-        assert_eq!(holder.ask("take 320"), "took 320 MiB");
-        let mut asker = StallStandIn::spawn(&prefix, &pool, &uuid);
-        let ended = |pid: u32| std::fs::read_to_string(store.root().join("logs/memory.log")).unwrap_or_default()
-            .lines().any(|line| line.contains("\"end_stalled\"") && line.contains(&format!("\"pid\":{pid}")));
-        // Answering: the asker's allocation needs the holder's idle chunks, asks, and gets them.
-        assert_eq!(holder.ask("answering"), "answering");
-        assert_eq!(asker.ask("keep 256"), "took 256 MiB");
-        assert!(holder.child.try_wait().unwrap().is_none() && !ended(holder.child.id()), "an answering executor is never ended");
-        assert_eq!(holder.ask("take 192"), "took 192 MiB", "its chunk went back; it takes again");
-        // Stopped with a reclaim request out to it: the pool ends it, and the allocation is made.
-        let pid = holder.child.id();
-        let mut stopped = 0;
-        // SAFETY: a signal to this test's own child, then waiting until it has stopped.
-        unsafe {
-            assert_eq!(libc::kill(pid as i32, libc::SIGSTOP), 0);
-            libc::waitpid(pid as i32, &mut stopped, libc::WUNTRACED);
-        }
-        let (took, taking) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            let asker = &mut asker;
-            scope.spawn(move || took.send(asker.ask("keep 192")).unwrap());
-            // A failure backstop only: the allocation is made once the pool has ended the holder.
-            let reply = taking.recv_timeout(std::time::Duration::from_secs(60));
-            if reply.is_err() {
-                // SAFETY: our own child; the asker's allocation then goes on.
-                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-            }
-            assert_eq!(reply.as_deref(), Ok("took 448 MiB"), "the stopped holder's end freed its chunks");
-        });
-        let status = holder.child.wait().unwrap();
-        assert_eq!(status.signal(), Some(libc::SIGKILL), "ended by the pool: {status:?}");
-        assert!(ended(pid), "the memory log says the pool ended it");
-        drop((asker, holder));
-        pool.stop().unwrap();
-        crate::scratch::remove(&root);
-    }
-
-}

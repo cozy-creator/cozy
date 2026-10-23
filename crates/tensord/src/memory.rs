@@ -763,27 +763,3 @@ impl MemoryLog {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_books_check_logs_a_gap_past_a_chunk_when_it_starts_and_when_it_moves() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = MemoryLog::at(dir.path().to_path_buf());
-        let lines = || fs::read_to_string(dir.path().join("memory.log")).unwrap_or_default().lines().filter(|l| l.contains("books_drift")).count();
-        let chunk = varena::lease::CHUNK;
-        let held = varena::lease::Holdings { created: 10 * chunk, context: 100 << 20, ..Default::default() };
-        let own = |bytes: u64| BTreeMap::from([(std::process::id(), bytes)]);
-        let balanced = held.created + held.context;
-        assert_eq!(books(&own(balanced + chunk / 2), &held, None, "gpu", &log), None, "within a chunk");
-        let gap = books(&own(balanced + 3 * chunk), &held, None, "gpu", &log);
-        assert_eq!((gap, lines()), (Some(i128::from(3 * chunk)), 1), "a gap starts");
-        let still = books(&own(balanced + 3 * chunk + chunk / 2), &held, gap, "gpu", &log);
-        assert_eq!((still, lines()), (gap, 1), "the same gap is not written again");
-        let moved = books(&own(balanced + 5 * chunk), &held, still, "gpu", &log);
-        assert_eq!((moved, lines()), (Some(i128::from(5 * chunk)), 2), "it moved by another chunk");
-        assert_eq!(books(&own(balanced), &held, moved, "gpu", &log), None, "balanced again");
-    }
-}

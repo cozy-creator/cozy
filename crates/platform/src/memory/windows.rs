@@ -3,6 +3,7 @@
 //! covers); an auto-reset event as the wake; named pipes whose first instance is the service
 //! lock; host pages as pagefile-backed sections mapped into placeholders (`VirtualAlloc2`,
 //! `MapViewOfFile3`), exported as read-only duplicates.
+#![allow(unsafe_code)]
 use super::{clean, Map};
 use crate::{Error, Result};
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};

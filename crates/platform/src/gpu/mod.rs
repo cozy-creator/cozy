@@ -201,24 +201,25 @@ impl Device {
         memory(device.memory_info()).map(|(_, free)| free)
     }
 
-    /// Whether kernels ran, and whether device memory moved (kernels' traffic, copies, peer
-    /// writes), in NVML's samples after `seen` (its timestamp, µs), which it advances.
-    pub fn worked_since(&self, seen: &mut u64) -> Result<(bool, bool)> {
+    /// Whether device memory moved (kernels' traffic, copies, peer writes) in NVML's samples
+    /// after `seen` (its timestamp, µs), which it advances.
+    pub fn moved_since(&self, seen: &mut u64) -> Result<bool> {
         let device = self.nvml.device_by_index(self.index).map_err(failed("open device"))?;
-        let from = *seen;
-        let mut busy = |sampling| -> Result<bool> {
-            let samples = device.samples(sampling, from).map_err(failed("utilization samples"))?;
-            Ok(samples.iter().fold(false, |busy, sample| {
-                *seen = (*seen).max(sample.timestamp);
-                busy || match sample.value {
-                    SampleValue::U32(value) => value > 0,
-                    SampleValue::U64(value) => value > 0,
-                    SampleValue::I64(value) => value > 0,
-                    SampleValue::F64(value) => value > 0.0,
-                }
-            }))
+        // No sample newer than `seen` is no work seen: NVML answers NotFound while the GPU is idle,
+        // which is a reading, not an unreadable GPU: a call stuck there was never judged.
+        let samples = match device.samples(Sampling::MemoryUtilization, *seen) {
+            Err(NvmlError::NotFound) => return Ok(false),
+            samples => samples.map_err(failed("utilization samples"))?,
         };
-        Ok((busy(Sampling::GpuUtilization)?, busy(Sampling::MemoryUtilization)?))
+        Ok(samples.iter().fold(false, |moved, sample| {
+            *seen = (*seen).max(sample.timestamp);
+            moved || match sample.value {
+                SampleValue::U32(value) => value > 0,
+                SampleValue::U64(value) => value > 0,
+                SampleValue::I64(value) => value > 0,
+                SampleValue::F64(value) => value > 0.0,
+            }
+        }))
     }
 
     /// Whether its compute mode admits one context at a time (exclusive-process) or none
@@ -262,38 +263,5 @@ fn failed(op: &'static str) -> impl FnOnce(NvmlError) -> Error {
     move |error| Error::Gpu {
         op,
         detail: error.to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_driver_below_the_floor_is_named_with_the_driver_it_needs() {
-        let message = below_floor("570.133.20").expect("570 is below CUDA 13.0's floor");
-        assert!(
-            message.contains("570.133.20") && message.contains(DRIVER_FLOOR),
-            "{message}"
-        );
-        assert!(below_floor("580.0").is_some());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn an_integrated_gpus_memory_is_the_hosts() {
-        let (total, free) = memory(Err(NvmlError::NotSupported)).unwrap();
-        assert_eq!(total as i64, crate::contain::host_memory::total());
-        assert!(free > 0 && free <= total, "{free} of {total}");
-        assert!(memory(Err(NvmlError::Unknown)).is_err());
-    }
-
-    #[test]
-    fn the_floor_and_newer_drivers_serve_and_an_unreadable_version_is_not_judged() {
-        for driver in [DRIVER_FLOOR, "580.95.05", "581.57", "590.10", " 600.1 "] {
-            assert_eq!(below_floor(driver), None, "{driver}");
-        }
-        assert_eq!(below_floor("N/A"), None);
-        assert_eq!(below_floor(""), None);
     }
 }

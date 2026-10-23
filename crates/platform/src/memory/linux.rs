@@ -1,4 +1,5 @@
 //! Linux: the table in `/dev/shm`, OFD locks, eventfd, abstract sockets, memfd pages.
+#![allow(unsafe_code)]
 use super::clean;
 use super::unix::{Owned, Stream};
 use crate::shm::Region;

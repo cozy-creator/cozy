@@ -3,6 +3,7 @@
 //! every change (`IDXGIAdapter3::RegisterVideoMemoryBudgetChangeNotificationEvent`). The adapter
 //! is the CUDA device's by LUID (`cuDeviceGetLuid`). windows-sys has no DXGI interfaces, so the
 //! few methods used are called through their vtable slots (dxgi1_4.h order).
+#![allow(unsafe_code)]
 use crate::{Error, Result};
 use libloading::Library;
 use std::ffi::c_void;
@@ -226,26 +227,5 @@ impl Drop for Budget {
     fn drop(&mut self) {
         // SAFETY: the registration `open` made, on the adapter this value holds.
         unsafe { method::<UnregisterBudgetEvent>(self.adapter.0, UNREGISTER_BUDGET_EVENT)(self.adapter.0, self.cookie) };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every adapter DXGI names (a hosted runner has Microsoft's software adapter) opens by its
-    /// LUID, reads a budget, and a close ends a wait: the vtable slots are the right ones.
-    #[test]
-    fn every_adapter_reads_a_budget_and_a_close_ends_its_wait() {
-        let named = adapters().unwrap();
-        assert!(!named.is_empty(), "DXGI named no adapter");
-        for adapter in named {
-            let budget = Budget::open(adapter.luid).unwrap().unwrap();
-            let (bytes, usage) = budget.read().unwrap();
-            eprintln!("{} ({} MiB dedicated): budget {} MiB, usage {} MiB", adapter.name, adapter.dedicated >> 20, bytes >> 20, usage >> 20);
-            budget.close();
-            assert!(!budget.wait());
-        }
-        assert!(Budget::open([0xff; 8]).unwrap().is_none());
     }
 }

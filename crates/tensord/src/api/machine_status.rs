@@ -3,7 +3,10 @@
 //! An open stream is not activity: only `keepalive` resets the idle deadline, once.
 use super::{auth::VerifiedActor, backend::MachineBackend, domain, http::blocking, v1, MachineIdentity};
 use protocol::error::Error;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio_stream::{wrappers::IntervalStream, Stream, StreamExt};
 
 /// What this machine serves, for clients that adapt to it.
@@ -36,7 +39,10 @@ pub const CAPABILITIES: &[&str] = &[
 
 const LIVE: [&str; 3] = ["queued", "starting", "running"];
 
-/// The whole picture, sent again whenever it changes, until the caller leaves.
+/// The whole picture, sent again whenever it changes, until the caller leaves. What the engine
+/// records (runs, environments, the warm set, models) is read again only after engine activity;
+/// each tick otherwise reads what the process holds in memory and the disk's free space, so an
+/// idle machine watched does next to nothing.
 pub(super) fn watch<B: MachineBackend>(
     identity: Arc<MachineIdentity>,
     backend: Arc<B>,
@@ -45,10 +51,26 @@ pub(super) fn watch<B: MachineBackend>(
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last: Option<v1::StatusFrame> = None;
+    let read: Arc<Mutex<Option<(u64, Held)>>> = Arc::default();
     IntervalStream::new(tick)
         .then(move |_| {
-            let (identity, backend) = (identity.clone(), backend.clone());
-            async move { frame(&identity, &backend, actor).await }
+            let (identity, backend, read) = (identity.clone(), backend.clone(), read.clone());
+            async move {
+                // Read before the records: activity meanwhile is read again at the next tick.
+                let epoch = backend.activity();
+                let kept = read.lock().unwrap().clone();
+                let held = match kept.filter(|(at, _)| Some(*at) == epoch) {
+                    Some((_, held)) => held,
+                    None => {
+                        let held = held_now(&identity, &backend, actor).await?;
+                        if let Some(epoch) = epoch {
+                            *read.lock().unwrap() = Some((epoch, held.clone()));
+                        }
+                        held
+                    }
+                };
+                Ok::<_, Error>(picture(&identity, held))
+            }
         })
         .filter_map(move |next| match next {
             Ok(next) if last.as_ref().is_some_and(|last| !changed(last, &next)) => None,
@@ -98,25 +120,48 @@ pub(super) fn capabilities(identity: &MachineIdentity) -> Vec<String> {
         .collect()
 }
 
+/// What the engine records for the caller: its live runs, environments, warm set and models.
+#[derive(Clone)]
+struct Held {
+    runs: Vec<v1::RunState>,
+    environments: Vec<v1::Environment>,
+    warm: Vec<v1::WarmItem>,
+    models: crate::held_models::Listing,
+    /// Each GPU's page accounting by UUID.
+    memory: std::collections::BTreeMap<String, v1::GpuMemory>,
+}
+
+async fn held_now<B: MachineBackend>(
+    identity: &Arc<MachineIdentity>,
+    backend: &Arc<B>,
+    actor: VerifiedActor,
+) -> Result<Held, Error> {
+    let store = identity.store.clone();
+    blocking(backend, move |backend| {
+        let models = store.as_deref().map(crate::held_models::listing);
+        let (runs, environments) = held(backend, actor)?;
+        Ok(Held { runs, environments, warm: backend.warm_set(actor)?, models: models.unwrap_or_default(), memory: backend.memory() })
+    })
+    .await
+}
+
 pub(super) async fn frame<B: MachineBackend>(
     identity: &Arc<MachineIdentity>,
     backend: &Arc<B>,
     actor: VerifiedActor,
 ) -> Result<v1::StatusFrame, Error> {
-    let store = identity.store.clone();
-    let ((runs, environments), warm, models, mut memory) = blocking(backend, move |backend| {
-        let models = store.as_deref().map(crate::held_models::listing);
-        let held = held(backend, actor)?;
-        Ok((held, backend.warm_set(actor)?, models.unwrap_or_default(), backend.memory()))
-    })
-    .await?;
+    Ok(picture(identity, held_now(identity, backend, actor).await?))
+}
+
+fn picture(identity: &MachineIdentity, held: Held) -> v1::StatusFrame {
+    let Held { runs, environments, warm, models, mut memory } = held;
     let software = identity
         .updates
         .as_ref()
         .map(|updates| updates.software())
         .unwrap_or_default();
     let lifecycle = identity.lifecycle.as_ref();
-    Ok(v1::StatusFrame {
+    v1::StatusFrame {
         idle_deadline_unix_ms: lifecycle.map_or(0, |l| l.deadline_ms()),
         runs,
         phase: match lifecycle {
@@ -172,7 +217,7 @@ pub(super) async fn frame<B: MachineBackend>(
         kernels: identity.updates.as_ref().map(|u| u.kernels()).unwrap_or_default(),
         tensord_pid: std::process::id(),
         ..identity_frame(identity)
-    })
+    }
 }
 
 fn held(

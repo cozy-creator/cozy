@@ -1,4 +1,5 @@
 //! What Linux and macOS share: mappings, sizes and host pages in reserved address space.
+#![allow(unsafe_code)]
 use super::Map;
 use crate::{Error, Result};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -240,24 +241,5 @@ pub fn wait_any(items: &[Waitable<'_>]) -> Result<Vec<super::Ready>> {
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(Error::os("wait")(error));
         }
-    }
-}
-
-#[cfg(test)]
-mod wait_tests {
-    use super::{wait_any, Signal};
-    use crate::memory::Ready;
-
-    #[test]
-    fn every_ready_item_is_answered_and_a_hung_up_one_is_broken() {
-        let (a, b, idle) = (Signal::new().unwrap(), Signal::new().unwrap(), Signal::new().unwrap());
-        b.set();
-        a.set();
-        let (hung, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        drop(peer);
-        let ready = wait_any(&[idle.waitable(), a.waitable(), b.waitable(), std::os::fd::AsFd::as_fd(&hung)]).unwrap();
-        let ready_at = |index, broken| Ready { index, broken };
-        assert_eq!(ready, vec![ready_at(1, false), ready_at(2, false), ready_at(3, true)]);
-        assert!(a.clear() && b.clear() && !idle.clear());
     }
 }

@@ -15,6 +15,7 @@
 //! | serving | one poll over all | one poll over all | a thread per connection |
 //! | host page | memfd | anonymous `shm_open` | pagefile section in a placeholder |
 //! | stall | `/proc` thread state | `proc_pidinfo` status | suspend count, exit code |
+#![allow(unsafe_code)]
 
 /// A shared mapping; unmapped on drop.
 pub struct Map {

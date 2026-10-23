@@ -1,6 +1,7 @@
 //! macOS: the table, its range locks and the service sockets as files in a private directory
 //! under `/tmp` (`flock` on a file per range: macOS has no OFD byte-range locks); a datagram
 //! socket pair as the wake event; anonymous `shm_open` objects as host pages.
+#![allow(unsafe_code)]
 use super::clean;
 use super::unix::{Owned, Stream};
 use crate::{Error, Result, Seam};

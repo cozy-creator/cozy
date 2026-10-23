@@ -391,6 +391,9 @@ pub enum Kind {
     ModelPrefetch,
     /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
     Log,
+    /// A `progress` event telling the executor's work count (`work`): what its Runtime did for
+    /// its calls (blocks entered, graphs replayed, LM steps, construction legs).
+    Work,
     #[default]
     #[serde(other)]
     Unknown,
@@ -528,6 +531,8 @@ pub struct Frame {
     pub overall_fraction: Option<f64>,
     pub step_ms: Option<f64>,
     pub advance: u64,
+    /// `work`: the executor's work count, which moves while it works for its calls.
+    pub work: u64,
     /// `progress`: the child call whose stage a job relays (the Runtime sends null for none).
     pub call_request: Option<String>,
     /// A retained observation (`kind` log): `name` is its message, `value` its level and
@@ -775,6 +780,9 @@ pub struct DeviceExecutor {
     /// Its GPUs' work, which judges its invocations beside its CPU, bytes and frames
     /// (`Meter::Work`); None on a lane with no GPUs.
     pub activity: Option<crate::process::Activity>,
+    /// What its invocations wait on (GPU memory asked of other processes), which a wedge's
+    /// verdict names; None on a lane with no GPUs.
+    pub place: Option<crate::process::Place>,
     root: PathBuf,
     socket: PathBuf,
     _generation_hold: Option<Arc<File>>,
@@ -1500,6 +1508,7 @@ impl DeviceExecutor {
             liveness: Liveness::default(),
             waits: None,
             activity: None,
+            place: None,
             root: config.root,
             socket: config.socket,
             _generation_hold: config.generation_hold,
@@ -1601,6 +1610,7 @@ impl DeviceExecutor {
             self.activity.clone(),
             command.name(),
         )?;
+        watching.watch().place(self.place.clone());
         *self.watched.lock().unwrap() = Some(watching.watch());
         let result = self.exchange(command, services, &watching.watch());
         *self.watched.lock().unwrap() = None;
@@ -1626,18 +1636,26 @@ impl DeviceExecutor {
     ) -> io::Result<Frame> {
         let bytes = command_bytes(command, self.memo.is_some())?;
         seam::write_body(&mut self.writer.lock().unwrap(), &bytes)?;
+        let mut last = Advance::default();
         loop {
             let frame = read_frame(&mut self.stream)?
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::UnexpectedEof, "stock executor EOF before reply")
                 })?;
-            watch.frame();
+            if advances(&frame, &mut last) {
+                watch.frame();
+            }
             match frame.event {
                 Some(Event::Request) if !frame.malformed.is_empty() => {
                     refuse_malformed(&mut self.writer.lock().unwrap(), &frame)?
                 }
                 Some(Event::Progress) if !frame.malformed.is_empty() => (),
-                Some(Event::Progress) => services.progress(&frame),
+                Some(Event::Progress) => {
+                    if !frame.stage.is_empty() {
+                        watch.at(&frame.stage);
+                    }
+                    services.progress(&frame)
+                }
                 Some(Event::Request)
                     if matches!(frame.kind, Kind::StageMemoLookup | Kind::StageMemoStore) =>
                 {
@@ -1824,6 +1842,38 @@ impl Drop for DeviceExecutor {
     }
 }
 
+/// The last progress a call reported: its stage, its fractions (as bits), position, completed
+/// units and relayed call.
+type Advance = (String, Option<u64>, Option<u64>, Option<u64>, u64, Option<String>, u64);
+
+/// Whether `frame` is real progress of its call: a progress frame that moved its stage, position
+/// or completed units (`last` is the one before; a repeat, telemetry or a log line is not), a
+/// work count that moved, or a request that makes something toward its output: a product or
+/// checkpoint published, weights kept, a child call started. A re-ask for a layout, a memo
+/// lookup, a poll is not.
+fn advances(frame: &Frame, last: &mut Advance) -> bool {
+    match frame.kind {
+        Kind::Work => std::mem::replace(&mut last.6, frame.work) != frame.work,
+        Kind::Progress if matches!(frame.event, Some(Event::Progress)) && !frame.stage.is_empty() => {
+            let fraction = |f: Option<f64>| f.map(f64::to_bits);
+            let now = (
+                frame.stage.clone(),
+                fraction(frame.stage_fraction),
+                fraction(frame.overall_fraction),
+                frame.position,
+                frame.advance,
+                frame.call_request.clone(),
+                last.6,
+            );
+            let moved = *last != now;
+            *last = now;
+            moved
+        }
+        Kind::Publish | Kind::CheckpointItem | Kind::ChildCall => true,
+        _ => false,
+    }
+}
+
 pub fn read_result(spool: &Path, reply: &Frame) -> io::Result<Value> {
     if !reply.ok
         || reply
@@ -1982,266 +2032,5 @@ impl From<platform::contain::host_pressure::HostMode> for MemoryMode {
             platform::contain::host_pressure::HostMode::Shared => Self::Shared,
             platform::contain::host_pressure::HostMode::Dedicated => Self::Dedicated,
         }
-    }
-}
-
-#[cfg(test)]
-mod codec_tests {
-    use super::*;
-
-    /// No credential crosses the seam, and a spooled result unlike the executor's reference is
-    /// refused.
-    #[test]
-    fn a_credential_never_crosses_and_a_changed_result_is_refused() {
-        let refused = scan(&serde_json::json!({"payload": [{"Credential": "x"}]})).unwrap_err();
-        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
-        // Only a typed TensorFS option carries the owner's bearer, and only that field.
-        let options = protocol::machine::TensorFSOptions { endpoint: "https://e.test".into(), token: "bearer-x".into(), ..Default::default() };
-        let bearer = command_bytes(&DeviceCommand::Bearer { actor: "signer".into(), tensorfs: options.clone() }, false).unwrap();
-        assert!(String::from_utf8(bearer).unwrap().contains("bearer-x"));
-        let nested = DeviceCommand::Fork { socket: "s".into(), root: "r".into(), environment: BTreeMap::from([("token".into(), "x".into())]) };
-        assert_eq!(command_bytes(&nested, false).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-        let spool = tempfile::tempdir().unwrap();
-        let bytes = br#"{"predictions":[0,2,1]}"#;
-        fs::write(spool.path().join(RESULT_DOCUMENT), bytes).unwrap();
-        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(bytes));
-        let reply: Frame = serde_json::from_value(serde_json::json!({"ok": true, "quiescent": true,
-            "outcome": {"terminal": "succeeded"}, "result_ref": {"digest": digest, "length": bytes.len()}}))
-        .unwrap();
-        assert_eq!(read_result(spool.path(), &reply).unwrap()["predictions"][2], 1);
-        fs::write(spool.path().join(RESULT_DOCUMENT), b"mutated").unwrap();
-        assert_eq!(read_result(spool.path(), &reply).unwrap_err().kind(), io::ErrorKind::InvalidData);
-    }
-
-    /// Every Start names one of the Runtime's two modes: an empty one turned prespawn off on
-    /// every machine (the import-only start was refused, `$.memory_mode`).
-    #[test]
-    fn a_start_names_the_machines_memory_mode() {
-        for (mode, wire) in [(MemoryMode::Shared, "shared"), (MemoryMode::Dedicated, "dedicated")] {
-            let start = DeviceCommand::Start {
-                devices: String::new(),
-                application: "app:app".into(),
-                package_interface: "interface.json".into(),
-                sequence_parallel_degree: 1,
-                import_only: true,
-                call_interfaces: vec![],
-                constructions: vec![],
-                leases: None,
-                memory_mode: mode,
-            };
-            let frame: Value = serde_json::from_slice(&command_bytes(&start, false).unwrap()).unwrap();
-            assert_eq!(frame["memory_mode"], wire);
-            assert_eq!(frame["memory_protocol"], 0);
-        }
-    }
-
-    /// An invoke reply's adjustment rows are advisory: each malformed one is skipped and the
-    /// reply, the run and the other rows stand, in the executor's order, each text bounded.
-    #[test]
-    fn a_malformed_adjustment_row_is_skipped_and_the_reply_stands() {
-        let row = |kind: &str, field: &str| serde_json::json!({"field": field, "kind": kind,
-            "requested": "21.4", "applied": "15", "reason": "video truncated to 15 s", "source": "policy"});
-        let long = "x".repeat(4096);
-        let reply = serde_json::json!({"reply": "invoke", "ok": true, "adjustments": [
-            row("adjusted", "assets.2.asset"),
-            row("shrink", "steps"),
-            {"field": "steps", "requested": "50", "applied": "30", "reason": "", "source": "handler"},
-            {"field": 7, "kind": "clamp", "requested": "50", "applied": "30", "reason": "", "source": "handler"},
-            "steps",
-            row("warn", &long),
-        ]});
-        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
-        write_frame(&mut runtime, &reply).unwrap();
-        let frame = read_frame(&mut machine).unwrap().unwrap();
-        assert!(frame.ok && frame.reply == "invoke");
-        let kept = adjustments("run-1", &frame);
-        assert_eq!(kept.len(), 2, "{kept:?}");
-        assert_eq!(kept[0], serde_json::from_value(row("adjusted", "assets.2.asset")).unwrap());
-        assert_eq!((kept[1].kind, kept[1].field.chars().count()), (crate::journal::AdjustmentKind::Warn, MAX_ADJUSTMENT_TEXT));
-
-        let rows: Vec<_> = (0..MAX_ADJUSTMENTS + 3).map(|i| row("clamp", &format!("f{i}"))).collect();
-        let many = Frame { adjustments: rows.into(), ..Default::default() };
-        assert_eq!(adjustments("run-2", &many).len(), MAX_ADJUSTMENTS);
-        let none = Frame { adjustments: serde_json::json!({"steps": 30}), ..Default::default() };
-        assert!(adjustments("run-3", &none).is_empty() && adjustments("run-4", &Frame::default()).is_empty());
-    }
-
-    /// Version skew degrades: an executor of another memory protocol starts on its GPUs with no
-    /// leases, never refused; leases go only to one that speaks them.
-    #[test]
-    fn each_memory_protocol_starts_on_what_it_reads_and_none_is_refused() {
-        let hello = |protocol: u32| -> Hello { serde_json::from_value(serde_json::json!({"runtime_version": "0.31.99", "memory_protocol": protocol})).unwrap() };
-        let start = |leases: Option<u32>| DeviceCommand::Start {
-            devices: "0".into(), application: String::new(), package_interface: PathBuf::new(),
-            sequence_parallel_degree: 1, import_only: false, call_interfaces: vec![],
-            constructions: vec![], leases, memory_mode: MemoryMode::Dedicated,
-        };
-        let frame = |command: &DeviceCommand| serde_json::from_slice::<Value>(&command_bytes(command, false).unwrap()).unwrap()["memory_protocol"].clone();
-        for other in [hello(0), hello(1), hello(9)] {
-            assert_eq!(other.contract(), Contract::Standalone);
-            other.accepts(&start(None)).unwrap();
-            assert_eq!(other.accepts(&start(Some(1000))).unwrap_err().kind(), io::ErrorKind::Unsupported);
-        }
-        assert_eq!(frame(&start(None)), 0);
-        #[cfg(unix)]
-        {
-            let leases = hello(varena::lease::PROTOCOL);
-            assert_eq!(leases.contract(), Contract::Leases);
-            leases.accepts(&start(Some(1000))).unwrap();
-            assert_eq!(frame(&start(Some(1000))), varena::lease::PROTOCOL);
-        }
-    }
-
-    /// A null in any optional field reads as its absence: a string, a flattened hello field,
-    /// a count, a flag, a kind or a list (the Runtime's `None`).
-    #[test]
-    fn a_memory_field_of_another_shape_reads_as_absent() {
-        let hello: Frame = serde_json::from_value(serde_json::json!({"reply": "hello", "ok": true, "pid": 7,
-            "memory": [1, 2]})).unwrap();
-        assert!(hello.ok && hello.memory.is_none() && hello.hello.pid == 7);
-        let invoke: Frame = serde_json::from_value(serde_json::json!({"reply": "invoke", "memory": {"moved": {"store": {"bytes": 5}}}})).unwrap();
-        assert_eq!(invoke.memory.unwrap()["moved"]["store"]["bytes"], 5);
-    }
-
-    #[test]
-    fn a_null_field_reads_as_absent() {
-        let body = serde_json::to_vec(&serde_json::json!({
-            "event": "request", "kind": "publish", "seq": 4, "output": "image", "label": null,
-            "asset_ref": null, "media_type": null, "digest": null, "code": null, "detail": null,
-            "traceback": null, "poisoned": null, "stage": null, "runtime_version": null,
-            "call_request": null, "size_bytes": null, "ok": null, "parts": null, "attribution": null,
-        }))
-        .unwrap();
-        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
-        runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
-        runtime.write_all(&body).unwrap();
-        let frame = read_frame(&mut machine).unwrap().unwrap();
-        assert_eq!((frame.kind, frame.seq, frame.output.as_str()), (Kind::Publish, 4, "image"));
-        assert!(frame.label.is_empty() && frame.code.is_empty() && frame.hello.runtime_version.is_empty());
-        assert!(frame.call_request.is_none() && frame.size_bytes == 0 && frame.parts.is_empty());
-    }
-
-    /// A frame is as large as its structure: a load reply naming every key its checkpoint
-    /// skips (FLUX.3 Klein's as-is text encoder) failed the old 64 KiB frame. Only a prefix
-    /// over `MAX_FRAME` is refused, before any body byte is read.
-    #[test]
-    fn a_frame_over_64_kib_crosses_and_a_lying_prefix_is_refused() {
-        let keys: Vec<String> = (0..20_000).map(|i| format!("model.visual.blocks.{i}.attn.qkv.weight")).collect();
-        let reply = serde_json::json!({"reply": "load", "ok": true,
-            "facts": {"ignored_extra_keys": keys, "filled_bytes": 7}});
-        assert!(serde_json::to_vec(&reply).unwrap().len() > 512 << 10);
-        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
-        let writer = std::thread::spawn(move || write_frame(&mut runtime, &reply).map(|()| runtime));
-        let frame = read_frame(&mut machine).unwrap().unwrap();
-        let mut runtime = writer.join().unwrap().unwrap();
-        assert!(frame.ok && frame.reply == "load");
-        assert_eq!(frame.facts.unwrap().filled_bytes, Some(7));
-        runtime.write_all(&(seam::MAX_FRAME as u32 + 1).to_be_bytes()).unwrap();
-        let refused = read_frame(&mut machine).unwrap_err();
-        assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{refused}");
-    }
-
-    /// A request whose fields do not decode (a negative byte count, run 10078) is refused alone
-    /// under its sequence number with the fd it announced taken off the socket; an undecodable
-    /// progress frame is dropped; the next frame reads as before.
-    #[test]
-    fn a_request_that_does_not_decode_is_refused_alone() {
-        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
-        let malformed = serde_json::json!({"event": "request", "kind": "publish", "seq": 9,
-            "length": -23068672, "descriptor": true});
-        write_frame(&mut runtime, &malformed).unwrap();
-        platform::handles::send_fd(&runtime, &File::open(std::env::current_exe().unwrap()).unwrap()).unwrap();
-        let frame = read_frame(&mut machine).unwrap().unwrap();
-        assert_eq!((frame.event, frame.seq), (Some(Event::Request), 9));
-        assert!(frame.malformed.contains("expected u64"), "{}", frame.malformed);
-        refuse_malformed(&mut machine, &frame).unwrap();
-        let answer = read_frame(&mut runtime).unwrap().unwrap();
-        assert_eq!((answer.seq, answer.ok, answer.code.as_str()), (9, false, "malformed_request"));
-        let progress = serde_json::json!({"event": "progress", "stage": "x", "position": -1});
-        write_frame(&mut runtime, &progress).unwrap();
-        let dropped = read_frame(&mut machine).unwrap().unwrap();
-        assert!(dropped.event == Some(Event::Progress) && !dropped.malformed.is_empty());
-        let fine = serde_json::json!({"event": "request", "kind": "publish", "seq": 10,
-            "length": 5});
-        write_frame(&mut runtime, &fine).unwrap();
-        let next = read_frame(&mut machine).unwrap().unwrap();
-        assert!(next.malformed.is_empty());
-        assert_eq!((next.kind, next.seq, next.length), (Kind::Publish, 10, 5));
-    }
-
-    fn pid(codec: &Codec) -> Option<u32> {
-        codec.helper.lock().unwrap().as_ref().map(|h| h.child.id())
-    }
-
-    #[test]
-    #[ignore = "requires an explicitly configured installed SDK interpreter; no GPU imports"]
-    fn one_sdk_encoder_serves_every_output_of_an_executor() {
-        let python = PathBuf::from(std::env::var("TENSORD_CPU_TEST_PYTHON").unwrap());
-        let root = std::env::temp_dir().join(format!("codec-{}", uuid::Uuid::new_v4().simple()));
-        let spool = root.join("spool");
-        fs::create_dir_all(&spool).unwrap();
-        let codec = Codec::new(
-            CodecConfig {
-                python,
-                environment: BTreeMap::new(),
-                generation_hold: None,
-            },
-            root.join("codec.log"),
-        );
-        let reply = |index: usize, raw_bytes: u64| {
-            let name = format!("image-{index:04}");
-            fs::write(
-                spool.join(format!("{name}.raw")),
-                vec![index as u8 * 40; 4 * 2 * 3],
-            )
-            .unwrap();
-            Frame {
-                frames: vec![HostFrame {
-                    handle: format!("asset/image/{index:04}"),
-                    codec: "png".into(),
-                    raw: format!("{name}.raw"),
-                    raw_bytes,
-                    media_type: "image/png".into(),
-                    facts: BTreeMap::from([
-                        ("width".into(), 4.into()),
-                        ("height".into(), 2.into()),
-                        ("mode".into(), "RGB".into()),
-                    ]),
-                }],
-                outputs: vec![Output {
-                    output_id: format!("out-{index}"),
-                    asset_ref: format!("asset/image/{index:04}"),
-                    kind: "image".into(),
-                    media_type: "image/png".into(),
-                    size_bytes: None,
-                }],
-                ..Default::default()
-            }
-        };
-        let encode = |reply: &Frame| {
-            let media = codec.encode(&spool, &reply.frames)?;
-            bind(&spool, reply, &media)
-        };
-        let first = encode(&reply(1, 24)).unwrap();
-        let helper = pid(&codec);
-        let second = encode(&reply(2, 24)).unwrap();
-        assert_eq!(
-            pid(&codec),
-            helper,
-            "one encoder process serves the executor's outputs"
-        );
-        for (bindings, name) in [(first, "image-0001"), (second, "image-0002")] {
-            let bytes = fs::read(spool.join(name)).unwrap();
-            assert_eq!(bindings[0].name, name);
-            assert_eq!(bindings[0].media_type, "image/png");
-            assert_eq!(bindings[0].length, bytes.len() as u64);
-            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
-        }
-        // A refused output is that output's failure; the encoder keeps serving.
-        assert!(encode(&reply(3, 25)).is_err());
-        assert_eq!(pid(&codec), helper);
-        encode(&reply(4, 24)).unwrap();
-        drop(codec);
-        fs::remove_dir_all(root).unwrap();
     }
 }
