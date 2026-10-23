@@ -444,24 +444,30 @@ def _install() -> None:
     the shim, built against torch's C++ ABI, bound to the agent's C ABI in the extension."""
     if _serving:
         return
-    built = json.loads(_SHIM.with_suffix(".json").read_text())
+    try:
+        built = json.loads(_SHIM.with_suffix(".json").read_text())
+    except OSError as e:
+        raise VarenaError(f"this tensorfs wheel has no torch allocator for varena ({_SHIM.name}): {e}") from e
     running = {"torch": ".".join(torch.__version__.split(".")[:2]), "cxx11_abi": int(torch._C._GLIBCXX_USE_CXX11_ABI)}
     if built != running:
         raise VarenaError(f"varena's torch allocator was built for {built}, and this process runs {running}: install the tensorfs wheel for this torch")
     if torch.cuda.is_initialized():
         raise VarenaError("torch initialized CUDA before Memory.open: open the Memory first, as varena becomes torch's only CUDA allocator")
     global _shim
-    shim, ext = ctypes.CDLL(str(_SHIM)), ctypes.CDLL(_ext.__file__)
-    shim.varena_torch_abandon_pool.argtypes = (ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64)
-    agent = ("alloc", "free", "record_stream", "pool_begin", "pool_end", "pool_release")
-    shim.varena_torch_bind((ctypes.c_void_p * len(agent))(*(ctypes.cast(getattr(ext, f"varena_agent_{f}"), ctypes.c_void_p) for f in agent)))
-    hook = {name: ctypes.cast(getattr(shim, f"varena_torch_{name}"), ctypes.c_void_p).value for name in ("malloc", "free", "record_stream", "begin_pool", "end_pool", "release_pool")}
-    allocator = torch._C._cuda_customAllocator(hook["malloc"], hook["free"])
-    allocator.set_record_stream_fn(hook["record_stream"])
-    allocator.set_begin_allocate_to_pool(hook["begin_pool"])
-    allocator.set_end_allocate_to_pool_fn(hook["end_pool"])
-    allocator.set_release_pool(hook["release_pool"])
-    torch._C._cuda_changeCurrentAllocator(allocator)
+    try:
+        shim, ext = ctypes.CDLL(str(_SHIM)), ctypes.CDLL(_ext.__file__)
+        shim.varena_torch_abandon_pool.argtypes = (ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64)
+        agent = ("alloc", "free", "record_stream", "pool_begin", "pool_end", "pool_release")
+        shim.varena_torch_bind((ctypes.c_void_p * len(agent))(*(ctypes.cast(getattr(ext, f"varena_agent_{f}"), ctypes.c_void_p) for f in agent)))
+        hook = {name: ctypes.cast(getattr(shim, f"varena_torch_{name}"), ctypes.c_void_p).value for name in ("malloc", "free", "record_stream", "begin_pool", "end_pool", "release_pool")}
+        allocator = torch._C._cuda_customAllocator(hook["malloc"], hook["free"])
+        allocator.set_record_stream_fn(hook["record_stream"])
+        allocator.set_begin_allocate_to_pool(hook["begin_pool"])
+        allocator.set_end_allocate_to_pool_fn(hook["end_pool"])
+        allocator.set_release_pool(hook["release_pool"])
+        torch._C._cuda_changeCurrentAllocator(allocator)
+    except (OSError, AttributeError, RuntimeError) as e:  # a shim that won't load, a torch without the pluggable allocator
+        raise VarenaError(f"varena could not become torch's allocator ({_SHIM.name}): {e}") from e
     _shim = shim
 
 
@@ -526,6 +532,9 @@ class Memory:
                 if device.type == "cuda":
                     if leases is not None:
                         memory.standalone = _lease(native, leases)  # leased: torch is served from its grants
+                    elif os.name == "nt":
+                        memory.standalone = "TensorD leases Linux GPUs only so far"
+                        warnings.warn(f"varena: GPU {native.gpu.uuid} runs standalone on Windows, within its free bytes less the reserve: {memory.standalone}", stacklevel=2)
                     if leases is None or memory.standalone is not None:
                         native.serve_standalone()
                     _install()

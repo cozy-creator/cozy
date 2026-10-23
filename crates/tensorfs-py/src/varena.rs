@@ -546,7 +546,7 @@ fn lease(memory: &Memory, ns: u32, uuid: &str) -> varena::Result<Option<(String,
 
 #[cfg(not(unix))]
 fn lease(_: &Memory, _: u32, _: &str) -> varena::Result<Option<(String, String)>> {
-    Ok(Some(("Absent".into(), "leases serve Linux GPUs (slice 1)".into())))
+    Ok(Some(("Absent".into(), "TensorD leases Linux GPUs only so far".into())))
 }
 
 fn steps(plan: Vec<(Vec<String>, u32)>) -> Plan {
