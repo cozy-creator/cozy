@@ -846,177 +846,179 @@ fn a_graph_captured_at_a_blocks_va_replays_across_slot_remaps() {
     step!();
 }
 
-/// The driver calls the allocator hook makes on its own thread, and a bind's create and map, prepared before they are
-/// timed: what each one acts on.
-struct HookCalls {
-    /// A completed event: queried, then destroyed.
-    event: usize,
-    /// An idle page mapped at `va`: unmapped, then released.
-    page: Option<Physical>,
-    va: Va,
-    len: u64,
+type AllocAsync = unsafe extern "C" fn(*mut u64, usize, cuda::CUstream) -> cuda::CUresult;
+type FreeAsync = unsafe extern "C" fn(u64, cuda::CUstream) -> cuda::CUresult;
+
+/// The stream-ordered allocator's calls, which TensorFS's table does not carry.
+fn stream_ordered() -> (AllocAsync, FreeAsync) {
+    // SAFETY: libcuda is loaded already (TensorFS's driver); each symbol has the documented signature.
+    unsafe {
+        let lib = libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW);
+        assert!(!lib.is_null(), "libcuda.so.1");
+        let alloc = libc::dlsym(lib, c"cuMemAllocAsync".as_ptr());
+        let free = libc::dlsym(lib, c"cuMemFreeAsync".as_ptr());
+        assert!(!alloc.is_null() && !free.is_null(), "the stream-ordered allocator");
+        (std::mem::transmute::<*mut c_void, AllocAsync>(alloc), std::mem::transmute::<*mut c_void, FreeAsync>(free))
+    }
 }
 
-impl HookCalls {
-    fn prepare(b: &CudaBackend, stream: usize) -> HookCalls {
-        let (_, ctx) = cuda::primary_context(0).unwrap();
-        let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
-        let d = cuda::driver().unwrap();
-        let mut event = std::ptr::null_mut();
-        assert_eq!(unsafe { (d.event_create)(&mut event, cuda::EVENT_DISABLE_TIMING) }, cuda::SUCCESS);
-        assert_eq!(unsafe { (d.event_record)(event, stream as cuda::CUstream) }, cuda::SUCCESS);
-        assert_eq!(unsafe { (d.event_synchronize)(event) }, cuda::SUCCESS);
+/// This thread's id, as /proc names it.
+fn tid() -> i32 {
+    // SAFETY: gettid takes no arguments and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+}
+
+/// Whether thread `tid` of this process sleeps on a lock (a futex) now: a driver call waiting for another thread.
+fn on_a_lock(tid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/self/task/{tid}/wchan")).is_ok_and(|w| w.starts_with("futex"))
+}
+
+/// One driver call, its resources made beforehand (untimed), and what it leaves to clean up afterwards.
+type Trial<'a> = (&'static str, Box<dyn FnOnce() -> Box<dyn FnOnce() + Send + 'a> + 'a>);
+
+/// The calls the allocator hook makes on its own thread, a bind's create and map, and an allocator's segment calls.
+fn trials<'a>(b: &'a CudaBackend, stream: usize) -> Vec<Trial<'a>> {
+    let d = cuda::driver().unwrap();
+    let event = move || {
+        let mut e = std::ptr::null_mut();
+        assert_eq!(unsafe { (d.event_create)(&mut e, cuda::EVENT_DISABLE_TIMING) }, cuda::SUCCESS);
+        assert_eq!(unsafe { (d.event_record)(e, stream as cuda::CUstream) }, cuda::SUCCESS);
+        assert_eq!(unsafe { (d.event_synchronize)(e) }, cuda::SUCCESS);
+        e as usize
+    };
+    let page = move || {
         let len = b.granularity();
         let va = b.reserve(len).unwrap();
         let page = b.create(len).unwrap();
-        b.map(va, 0, &page, Access::ReadWrite).unwrap();
-        HookCalls { event: event as usize, page: Some(page), va, len }
-    }
-
-    /// Each call in the order the hook makes them, `at` set to its index while it runs; each call's time and when it
-    /// returned.
-    fn run(mut self, b: &CudaBackend, at: &std::sync::atomic::AtomicUsize) -> Vec<(&'static str, std::time::Duration, std::time::Instant)> {
-        let (_, ctx) = cuda::primary_context(0).unwrap();
-        let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
-        let d = cuda::driver().unwrap();
-        let event = self.event as cuda::CUevent;
-        let mut done = vec![];
-        let mut time = |name: &'static str, call: &mut dyn FnMut()| {
-            at.store(done.len(), std::sync::atomic::Ordering::Release);
-            let t = std::time::Instant::now();
-            call();
-            done.push((name, t.elapsed(), std::time::Instant::now()));
-        };
-        time("cuMemGetInfo", &mut || {
+        (va, len, page)
+    };
+    let segment = REGION_ALIGN as usize;
+    let (alloc_async, free_async) = stream_ordered();
+    vec![
+        ("cuMemGetInfo", Box::new(move || Box::new(move || {
             let (mut free, mut total) = (0, 0);
             assert_eq!(unsafe { (d.mem_get_info)(&mut free, &mut total) }, cuda::SUCCESS);
-        });
-        time("cuEventQuery", &mut || assert_eq!(unsafe { (d.event_query)(event) }, cuda::SUCCESS));
-        time("cuEventSynchronize", &mut || assert_eq!(unsafe { (d.event_synchronize)(event) }, cuda::SUCCESS));
-        time("cuEventDestroy", &mut || assert_eq!(unsafe { (d.event_destroy)(event) }, cuda::SUCCESS));
-        time("cuMemUnmap", &mut || b.unmap(self.va, 0, self.len).unwrap());
-        let mut page = self.page.take();
-        time("cuMemRelease", &mut || page.take().into_iter().for_each(|p| b.destroy(p).unwrap()));
-        // A bind's page, made and mapped (not the hook's own work: a comparison).
-        let mut made = None;
-        time("cuMemCreate", &mut || made = Some(b.create(self.len).unwrap()));
-        let made = made.unwrap();
-        time("cuMemMap", &mut || b.map(self.va, 0, &made, Access::ReadWrite).unwrap());
-        at.store(usize::MAX, std::sync::atomic::Ordering::Release);
-        b.unmap(self.va, 0, self.len).unwrap();
-        b.destroy(made).unwrap();
-        b.release(self.va);
-        done
-    }
+        }))),
+        ("cuEventQuery", Box::new(move || { let e = event(); Box::new(move || {
+            assert_eq!(unsafe { (d.event_query)(e as cuda::CUevent) }, cuda::SUCCESS);
+            unsafe { (d.event_destroy)(e as cuda::CUevent) };
+        }) })),
+        ("cuEventSynchronize", Box::new(move || { let e = event(); Box::new(move || {
+            assert_eq!(unsafe { (d.event_synchronize)(e as cuda::CUevent) }, cuda::SUCCESS);
+            unsafe { (d.event_destroy)(e as cuda::CUevent) };
+        }) })),
+        ("cuEventDestroy", Box::new(move || { let e = event(); Box::new(move || assert_eq!(unsafe { (d.event_destroy)(e as cuda::CUevent) }, cuda::SUCCESS)) })),
+        ("cuMemUnmap", Box::new(move || { let (va, len, p) = page(); b.map(va, 0, &p, Access::ReadWrite).unwrap(); Box::new(move || {
+            b.unmap(va, 0, len).unwrap();
+            b.destroy(p).unwrap();
+            b.release(va);
+        }) })),
+        ("cuMemRelease", Box::new(move || { let (va, _, p) = page(); Box::new(move || {
+            b.destroy(p).unwrap();
+            b.release(va);
+        }) })),
+        ("cuMemCreate", Box::new(move || Box::new(move || b.destroy(b.create(b.granularity()).unwrap()).unwrap()))),
+        ("cuMemMap", Box::new(move || { let (va, len, p) = page(); Box::new(move || {
+            b.map(va, 0, &p, Access::ReadWrite).unwrap();
+            b.unmap(va, 0, len).unwrap();
+            b.destroy(p).unwrap();
+            b.release(va);
+        }) })),
+        ("cuMemAlloc", Box::new(move || Box::new(move || {
+            let mut ptr = 0;
+            assert_eq!(unsafe { (d.mem_alloc)(&mut ptr, segment) }, cuda::SUCCESS);
+        }))),
+        ("cuMemAllocAsync+cuMemFreeAsync", Box::new(move || Box::new(move || {
+            let mut ptr = 0;
+            assert_eq!(unsafe { alloc_async(&mut ptr, segment, stream as cuda::CUstream) }, cuda::SUCCESS);
+            assert_eq!(unsafe { free_async(ptr, stream as cuda::CUstream) }, cuda::SUCCESS);
+        }))),
+    ]
 }
 
-/// Which of the allocator hook's own driver calls wait behind another thread's cuMemFree. Round 5's retire, which now
-/// destroys only completed events, still blocked 2.68 s beside a gated stream while the case's free worker freed a
-/// cuMemAlloc segment. The hook's calls (cuMemGetInfo; cuEventQuery, cuEventSynchronize and cuEventDestroy of a
-/// completed event; cuMemUnmap and cuMemRelease of an idle page) and a bind's cuMemCreate and cuMemMap are timed three
-/// ways:
-/// - idle: nothing else running;
-/// - gated: a stream held by a host function, as the round's gated stream is;
-/// - freeing: the same gate, while another thread is inside cuMemFree of a cuMemAlloc segment, which synchronizes the
-///   device and so returns only once the gate opens.
+/// Which driver calls wait behind another thread's cuMemFree (S1's question after round 6: cuEventDestroy did, and the
+/// case's cuMemAlloc held the hook for 3 s). A cuMemFree of a cuMemAlloc segment synchronizes the device, so behind a
+/// stream held by a host function it waits until the gate opens. Each call runs in its own trial, on its own thread,
+/// while another thread is inside such a cuMemFree:
+/// - The call is waiting when /proc shows its thread asleep on a lock (a futex) twice in a row while it is out; the
+///   gate then opens.
+/// - A call waited when it returned only after the gate opened. The trial says whether the free itself waited.
 ///
-/// The gate opens once the calls end, or after two looks (every interval of the whole idle sequence) in which no call
-/// returned. A call waited when it returned only after the gate opened.
+/// It judges the allocator hook's own calls (cuMemGetInfo, cuEventQuery, cuEventSynchronize, cuMemUnmap, cuMemRelease);
+/// the rest (cuEventDestroy, a bind's cuMemCreate and cuMemMap, an allocator's cuMemAlloc and the stream-ordered pair)
+/// are reported.
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn the_hooks_driver_calls_never_wait_behind_another_threads_free() {
     let (b, uuid) = gpu();
     step!();
-    let (gated, idle_stream) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
+    let (gated, own) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
     step!();
-    let at = std::sync::atomic::AtomicUsize::new(usize::MAX);
-    let idle = HookCalls::prepare(&b, idle_stream.raw()).run(&b, &at);
-    step!();
-    let interval = idle.iter().map(|(_, t, _)| *t).sum::<std::time::Duration>();
-    step!();
-    // The free's own time on an idle device: the freeing thread is inside cuMemFree once it has taken longer.
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    // The context as a plain value: each thread enters it.
+    let ctx = ctx as usize;
+    let d = cuda::driver().unwrap();
     let segment = REGION_ALIGN as usize;
-    let free_idle = {
-        let (_, ctx) = cuda::primary_context(0).unwrap();
-        let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
-        let d = cuda::driver().unwrap();
+    let (mut report, mut waited) = (vec![], vec![]);
+    for (name, prepare) in trials(&b, own.raw()) {
+        let call = prepare();
         let mut ptr = 0;
         assert_eq!(unsafe { (d.mem_alloc)(&mut ptr, segment) }, cuda::SUCCESS);
-        let t = std::time::Instant::now();
-        assert_eq!(unsafe { (d.mem_free)(ptr) }, cuda::SUCCESS);
-        t.elapsed()
-    };
-    step!();
-    let mut report = vec![format!("idle {}", idle.iter().map(|(n, t, _)| format!("{n} {t:?}")).collect::<Vec<_>>().join(", "))];
-    let mut waited = vec![];
-    for freeing in [false, true] {
-        let calls = HookCalls::prepare(&b, idle_stream.raw());
-        step!();
-        let mut ptr = 0;
-        if freeing {
-            let (_, ctx) = cuda::primary_context(0).unwrap();
-            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
-            assert_eq!(unsafe { (cuda::driver().unwrap().mem_alloc)(&mut ptr, segment) }, cuda::SUCCESS);
-        }
-        step!();
         let mut gate = Some(Gate::hold(gated.raw()));
-        step!();
-        let opened = parking_lot::Mutex::new(None::<std::time::Instant>);
-        let started = std::sync::atomic::AtomicBool::new(false);
-        let (timed, free_returned) = std::thread::scope(|t| {
-            let free = freeing.then(|| {
-                let thread = t.spawn(|| {
-                    let (_, ctx) = cuda::primary_context(0).unwrap();
-                    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
-                    started.store(true, std::sync::atomic::Ordering::Release);
-                    assert_eq!(unsafe { (cuda::driver().unwrap().mem_free)(ptr) }, cuda::SUCCESS);
-                    std::time::Instant::now()
-                });
-                // Inside cuMemFree: started, and still there after its idle time.
-                while !started.load(std::sync::atomic::Ordering::Acquire) {
-                    std::thread::yield_now();
-                }
-                std::thread::sleep(free_idle);
-                thread
+        let (in_free, hook_tid) = (std::sync::atomic::AtomicI32::new(0), std::sync::atomic::AtomicI32::new(0));
+        let (opened, out, free_returned) = std::thread::scope(|t| {
+            let free = t.spawn(|| {
+                let _ctx = cuda::CtxGuard::enter(ctx as cuda::CUcontext).unwrap();
+                in_free.store(tid(), std::sync::atomic::Ordering::Release);
+                assert_eq!(unsafe { (d.mem_free)(ptr) }, cuda::SUCCESS);
+                std::time::Instant::now()
             });
-            let hook = t.spawn(|| calls.run(&b, &at));
-            let (mut seen, mut quiet) = (usize::MAX - 1, 0);
+            // Inside cuMemFree: its thread is out of userspace in the driver (a lock or the device's wait).
+            loop {
+                let id = in_free.load(std::sync::atomic::Ordering::Acquire);
+                if id != 0 && std::fs::read_to_string(format!("/proc/self/task/{id}/syscall")).is_ok_and(|s| !s.starts_with("running")) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let hook = t.spawn(|| {
+                let _ctx = cuda::CtxGuard::enter(ctx as cuda::CUcontext).unwrap();
+                hook_tid.store(tid(), std::sync::atomic::Ordering::Release);
+                let start = std::time::Instant::now();
+                call();
+                (start.elapsed(), std::time::Instant::now())
+            });
+            let mut opened = None;
+            let mut asleep = 0;
             while !hook.is_finished() {
-                std::thread::sleep(interval);
-                let now = at.load(std::sync::atomic::Ordering::Acquire);
-                quiet = if now == seen { quiet + 1 } else { 0 };
-                seen = now;
-                if quiet == 2 && gate.is_some() {
-                    *opened.lock() = Some(std::time::Instant::now());
+                let id = hook_tid.load(std::sync::atomic::Ordering::Acquire);
+                asleep = if id != 0 && on_a_lock(id) { asleep + 1 } else { 0 };
+                if asleep == 2 && gate.is_some() {
+                    opened = Some(std::time::Instant::now());
                     gate.take();
                 }
+                std::thread::yield_now();
             }
-            let timed = hook.join().unwrap();
+            let out = hook.join().unwrap();
             if gate.is_some() {
-                *opened.lock() = Some(std::time::Instant::now());
+                opened = Some(std::time::Instant::now());
                 gate.take();
             }
-            (timed, free.map(|f| f.join().unwrap()))
+            (opened.unwrap_or_else(std::time::Instant::now), out, free.join().unwrap())
         });
-        step!();
         gated.drain().unwrap();
-        step!();
-        let opened = opened.lock().unwrap_or_else(std::time::Instant::now);
-        let mode = if freeing { "freeing" } else { "gated" };
-        let late: Vec<&str> = timed.iter().filter(|(_, _, returned)| *returned >= opened).map(|(n, ..)| *n).collect();
-        let free_waited = free_returned.map(|r| r >= opened);
-        report.push(format!(
-            "{mode} {}{}",
-            timed.iter().map(|(n, t, r)| format!("{n} {t:?}{}", if *r >= opened { " (after the gate)" } else { "" })).collect::<Vec<_>>().join(", "),
-            free_waited.map_or(String::new(), |w| format!("; cuMemFree {}", if w { "waited for the gate" } else { "did not wait for the gate" }))
-        ));
-        // A bind's create and map are reported, not judged: the hook makes neither.
-        waited.extend(late.into_iter().filter(|n| !matches!(*n, "cuMemCreate" | "cuMemMap")).map(|n| format!("{mode}: {n}")));
+        own.drain().unwrap();
+        let late = out.1 >= opened;
+        report.push(format!("{name} {:?}{}{}", out.0, if late { " (after the gate)" } else { "" }, if free_returned >= opened { "" } else { " [the free did not wait]" }));
+        if late && matches!(name, "cuMemGetInfo" | "cuEventQuery" | "cuEventSynchronize" | "cuMemUnmap" | "cuMemRelease") {
+            waited.push(name);
+        }
         step!();
     }
-    println!("TIMINGS the hook's driver calls: {}", report.join(" | "));
+    println!("TIMINGS each driver call beside another thread's cuMemFree behind a gated stream: {}", report.join(", "));
     step!();
-    assert!(waited.is_empty(), "the hook's driver calls waited behind the gate: {waited:?}");
+    assert!(waited.is_empty(), "the hook's driver calls waited behind another thread's free: {waited:?}");
     step!();
     println!("PASS the hook's driver calls never wait behind another thread's free {uuid}");
     step!();
@@ -3208,6 +3210,84 @@ fn origins(trace: &str) -> std::collections::BTreeMap<&str, usize> {
     let mut n = std::collections::BTreeMap::new();
     trace.split(',').filter(|o| !o.is_empty()).for_each(|o| *n.entry(o).or_default() += 1);
     n
+}
+
+// ---- VRAM yield (design/vram-yield.md §4): a stand-in game
+
+/// The stand-in game of the VRAM-yield proof: a CUDA process with no varena, so the ledger counts its bytes as foreign
+/// and NVML lists it as a compute process. One command per stdin line; each reply is a line `@ <reply>` on stdout, and
+/// every allocation is logged as `STANDIN alloc <n> ok|fail <ms since start>`.
+/// - `fill <percent>`: allocates 1 GiB blocks until it holds that share of the card (the game that takes memory).
+/// - `budget <percent>`: reads cuMemGetInfo's free bytes once, then allocates that share of them (the game that
+///   sizes itself from its budget at launch).
+/// - `sample`: NVML's bytes per compute process, `<ms> <pid>:<bytes> …`, and the device's free bytes.
+/// - `release`: frees every block. `exit`: ends.
+#[test]
+#[ignore = "native GPU: the VRAM-yield stand-in game"]
+fn role_standin() {
+    if role().as_deref() != Some("standin") {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    let d = cuda::driver().unwrap();
+    let mut device = 0;
+    cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut device, 0) }).unwrap();
+    let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
+    // A game's allocations: a gibibyte each, as the design's stand-in.
+    const BLOCK: usize = 1 << 30;
+    let mut blocks: Vec<u64> = vec![];
+    let ms = || start.elapsed().as_millis();
+    let allocate = |target: u64, blocks: &mut Vec<u64>| -> u32 {
+        let mut failed = 0;
+        while (blocks.len() as u64 + 1) * BLOCK as u64 <= target {
+            let mut ptr = 0;
+            let rc = unsafe { (d.mem_alloc)(&mut ptr, BLOCK) };
+            println!("STANDIN alloc {} {} {}", blocks.len(), if rc == cuda::SUCCESS { "ok" } else { "fail" }, ms());
+            if rc != cuda::SUCCESS {
+                failed += 1;
+                break;
+            }
+            blocks.push(ptr);
+        }
+        failed
+    };
+    println!("@ ready");
+    std::io::stdout().flush().unwrap();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.unwrap();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let (mut free, mut total) = (0usize, 0usize);
+        cuda::check("cuMemGetInfo", unsafe { (d.mem_get_info)(&mut free, &mut total) }).unwrap();
+        let reply = match words.as_slice() {
+            ["fill", percent] => {
+                let target = total as u64 * percent.parse::<u64>().unwrap() / 100;
+                let failed = allocate(target, &mut blocks);
+                format!("held {} failed {failed}", blocks.len() as u64 * BLOCK as u64)
+            }
+            ["budget", percent] => {
+                let target = free as u64 * percent.parse::<u64>().unwrap() / 100;
+                let failed = allocate(target, &mut blocks);
+                format!("free at launch {free}; held {} failed {failed}", blocks.len() as u64 * BLOCK as u64)
+            }
+            ["sample"] => {
+                let reading = nvml.read().unwrap();
+                let per: Vec<String> = reading.processes.unwrap_or_default().iter().map(|(pid, bytes)| format!("{pid}:{bytes}")).collect();
+                format!("{} free {} {}", ms(), reading.free, per.join(" "))
+            }
+            ["release"] => {
+                let t = std::time::Instant::now();
+                let bytes = blocks.len() as u64 * BLOCK as u64;
+                blocks.drain(..).for_each(|ptr| cuda::check("cuMemFree", unsafe { (d.mem_free)(ptr) }).unwrap());
+                format!("released {bytes} in {:?}", t.elapsed())
+            }
+            ["exit"] => break,
+            other => format!("unknown command {other:?}"),
+        };
+        println!("@ {reply}");
+        std::io::stdout().flush().unwrap();
+    }
 }
 
 // ---- several processes
