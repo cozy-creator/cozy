@@ -313,7 +313,7 @@ class Binding:
         with self.lock:
             if self.closed:
                 return False
-            self.model.memory.native.fill(self.model.id, _fill(self.model.fill))
+            self.model.memory._declare(self.model)
             return self.native.valid()
 
     def resident(self) -> bool:
@@ -339,7 +339,7 @@ class Binding:
                 scope.enter_context(torch.cuda.stream(stream) if memory.cuda else nullcontext())
                 if self.last is not None:
                     stream.wait_event(self.last)
-                memory.native.fill(self.model.id, _fill(self.model.fill))
+                memory._declare(self.model)
                 request = _request.get()
                 pins = self.native.prepare(stream.cuda_stream if stream is not None else 0, request.native if request is not None else None)
                 held: list[_Block] = []
@@ -434,9 +434,6 @@ class Memory:
         self._pool_guard = threading.RLock()
         #: Native pooling is the default; diagnostics may compare an explicit eager baseline.
         self.pooling = pool
-        #: open passes on the device: torch's peak resets when the first opens
-        self.passing = 0
-        self._peaks = threading.Lock()
         #: Cross-stream consumers joined back into the binding stream.
         self.crossed = 0
 
@@ -639,6 +636,16 @@ class Memory:
                 return model.name
         return str(step)
 
+    def _declare(self, model: Model) -> None:
+        """The model's fill, declared to varena when its identity changed (a LoRA set swapped):
+        holds of the old bake go first, as their pins would keep its pages."""
+        identity = model.fill.identity if model.fill is not None else None
+        if identity != model.identity:
+            for hold in list(model.holds):
+                hold.shed()
+            model.identity = identity
+            self.native.fill(model.id, _fill(model.fill))
+
     def _rooms(self, r: Request) -> int:
         """The make_room calls segments of the request's pool have made so far."""
         return _allocator_stats(self.device.index or 0, r.pool.id)[2] if r.pool is not None else 0
@@ -667,23 +674,15 @@ class Memory:
             r = self._current()
             if self.cuda:
                 _allocator_check(self.device.index or 0)
-            identity = model.fill.identity if model.fill is not None else None
-            if identity != model.identity:
-                for hold in list(model.holds):  # pins of the old bake would keep its pages
-                    hold.shed()
-                model.identity = identity
-            self.native.fill(model.id, _fill(model.fill))
+            self._declare(model)
             k = key()
             p = _Pass(r.native.pass_(model.id, k), r, k, self._rooms(r))
-            if r.pool is not None and not (self.cuda and torch.cuda.is_current_stream_capturing()):  # capture owns its exact pool
+            # Off the request's thread its allocations go to the request's pool for the pass.
+            if r.pool is not None and r.pool.id not in _routes.get():
                 p.pooled = self.allocating(r.pool)
                 p.pooled.__enter__()
             if model.common is not None:
                 self._enter(model.common)
-            with self._peaks:
-                if self.passing == 0 and self.cuda:
-                    torch.cuda.reset_peak_memory_stats(self.device)
-                self.passing += 1
             local.passing, p.token = p, _pass.set(p)
         except BaseException:
             local.depth -= 1
@@ -692,8 +691,8 @@ class Memory:
             raise
 
     def _close(self, model: Model) -> None:
-        """A pass ends with torch's allocated peak (the device's since the first open pass
-        opened: beside another pass, at most this one's), failed or not."""
+        """A pass ends, failed or not. On CUDA varena reads what it held from the pool's segments;
+        MPS has none, so its allocated bytes then stand in for its peak."""
         local = model.local
         local.depth -= 1
         p = getattr(local, "passing", None)
@@ -707,9 +706,7 @@ class Memory:
         finally:
             if p.pooled is not None:
                 p.pooled.__exit__(None, None, None)
-            with self._peaks:
-                self.passing -= 1
-            peak = torch.cuda.max_memory_allocated(self.device) if self.cuda else torch.mps.current_allocated_memory() if self.device.type == "mps" else 0
+            peak = torch.mps.current_allocated_memory() if self.device.type == "mps" else 0
             pool = p.request.pool
             if pool is not None and self._rooms(p.request) > p.rooms:  # it made room: what torch kept free in its pool
                 free = [b["size"] for seg in pool.snapshot(include_traces=False) for b in seg["blocks"] if b["state"] == "inactive"]
