@@ -5,10 +5,10 @@
 //! `MapViewOfFile3`), exported as read-only duplicates.
 use super::{clean, Map};
 use crate::{Error, Result, Seam};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use windows_sys::Wdk::System::Threading::{NtQueryInformationThread, ThreadSuspendCount};
-use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, STATUS_OBJECT_TYPE_MISMATCH, STILL_ACTIVE, WAIT_ABANDONED_0, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{FileStandardInfo, GetFileInformationByHandleEx, LockFileEx, ReOpenFile, FILE_STANDARD_INFO, UnlockFileEx, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, MapViewOfFile3, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
@@ -16,7 +16,7 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-use windows_sys::Win32::System::Threading::{CreateEventW, OpenEventW, ResetEvent, EVENT_MODIFY_STATE, GetCurrentProcess, GetCurrentThreadId, GetExitCodeProcess, OpenProcess, OpenThread, SetEvent, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, THREAD_QUERY_INFORMATION};
+use windows_sys::Win32::System::Threading::{CreateEventW, OpenEventW, ResetEvent, EVENT_MODIFY_STATE, GetCurrentProcess, GetCurrentThreadId, GetExitCodeProcess, OpenProcess, OpenThread, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION, THREAD_QUERY_INFORMATION};
 
 pub type Owned = OwnedHandle;
 pub type Stream = crate::ipc::LocalStream;
@@ -81,8 +81,37 @@ pub fn unlink(name: &str) {
     }
 }
 
+/// A file's length, or a section's (a lease table, a host page).
 pub fn size(f: &Owned) -> Result<u64> {
+    if let Some(len) = section(f)? {
+        return Ok(len);
+    }
     Ok(std::fs::File::from(f.try_clone()?).metadata()?.len())
+}
+
+/// `SECTION_BASIC_INFORMATION` (ntddk.h).
+#[repr(C)]
+struct SectionBasicInformation {
+    base: *mut std::ffi::c_void,
+    attributes: u32,
+    size: i64,
+}
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn NtQuerySection(section: HANDLE, class: i32, info: *mut std::ffi::c_void, len: usize, returned: *mut usize) -> i32;
+}
+
+/// A section's size; `None` when `h` names another kind of object (a file).
+fn section(h: &Owned) -> Result<Option<u64>> {
+    let mut info = SectionBasicInformation { base: std::ptr::null_mut(), attributes: 0, size: 0 };
+    // SAFETY: class 0 (SectionBasicInformation) into a buffer of its size, for a handle we hold.
+    let status = unsafe { NtQuerySection(raw(h), 0, (&mut info as *mut SectionBasicInformation).cast(), std::mem::size_of::<SectionBasicInformation>(), std::ptr::null_mut()) };
+    match status {
+        0.. => Ok(Some(info.size as u64)),
+        STATUS_OBJECT_TYPE_MISMATCH => Ok(None),
+        _ => Err(Error::os("query a section")(std::io::Error::other(format!("NTSTATUS {status:#x}")))),
+    }
 }
 
 /// Grows the file through a section of the new size: a mapped file's end cannot be set.
@@ -97,19 +126,28 @@ pub fn resize(f: &Owned, len: u64) -> Result<()> {
     Ok(())
 }
 
-/// `len` bytes of `f` from `offset` (a multiple of [`granularity`]).
+/// `len` bytes of `f` (a file, or a section such as a lease table) from `offset` (a multiple
+/// of [`granularity`]).
 pub fn map(f: &Owned, offset: u64, len: usize, write: bool) -> Result<Map> {
+    if section(f)?.is_some() {
+        return view(raw(f), offset, len, write);
+    }
     let protect = if write { PAGE_READWRITE } else { PAGE_READONLY };
     // SAFETY: a section over a file we hold, as large as the file.
     let section = unsafe { CreateFileMappingW(raw(f), std::ptr::null(), protect, 0, 0, std::ptr::null()) };
     if section.is_null() {
         return Err(last("map the table"));
     }
-    let access = if write { FILE_MAP_READ | FILE_MAP_WRITE } else { FILE_MAP_READ };
-    // SAFETY: a view of the section; the view keeps the section alive after its handle closes.
-    let view = unsafe { MapViewOfFile(section, access, (offset >> 32) as u32, offset as u32, len) };
-    // SAFETY: the section we just made.
+    let mapped = view(section, offset, len, write);
+    // SAFETY: the section we just made; the view keeps it alive.
     unsafe { CloseHandle(section) };
+    mapped
+}
+
+fn view(section: HANDLE, offset: u64, len: usize, write: bool) -> Result<Map> {
+    let access = if write { FILE_MAP_READ | FILE_MAP_WRITE } else { FILE_MAP_READ };
+    // SAFETY: a view of a live section; the view keeps the section alive after its handle closes.
+    let view = unsafe { MapViewOfFile(section, access, (offset >> 32) as u32, offset as u32, len) };
     if view.Value.is_null() {
         return Err(last("map the table"));
     }
@@ -462,3 +500,53 @@ pub fn stalled(pid: u32, tid: u32) -> bool {
 
 /// `f` is closing: its locks go with its handle, so nothing is released here.
 pub fn closing(_: &Owned) {}
+
+/// What [`wait_any`] waits on: an event, a process, any waitable handle.
+pub type Waitable<'a> = BorrowedHandle<'a>;
+
+/// A local wake one process sets and its own threads wait on: a manual-reset event, set until
+/// cleared.
+pub struct Signal(Owned);
+
+impl Signal {
+    pub fn new() -> Result<Signal> {
+        // SAFETY: an unnamed manual-reset event, not set, with default security.
+        let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if h.is_null() {
+            return Err(last("create a signal"));
+        }
+        // SAFETY: a handle we just made.
+        Ok(Signal(unsafe { Owned::from_raw_handle(h as _) }))
+    }
+
+    pub fn set(&self) {
+        // SAFETY: an event we hold.
+        unsafe { SetEvent(raw(&self.0)) };
+    }
+
+    /// Clears it; true when it was set.
+    pub fn clear(&self) -> bool {
+        // SAFETY: an event we hold; a zero wait only reads it.
+        let set = unsafe { WaitForSingleObject(raw(&self.0), 0) } == WAIT_OBJECT_0;
+        // SAFETY: as above.
+        unsafe { ResetEvent(raw(&self.0)) };
+        set
+    }
+
+    pub fn waitable(&self) -> Waitable<'_> {
+        self.0.as_handle()
+    }
+}
+
+/// Blocks until one of `items` is signalled; the lowest such index. No timeout.
+pub fn wait_any(items: &[Waitable<'_>]) -> Result<usize> {
+    let handles: Vec<HANDLE> = items.iter().map(|h| h.as_raw_handle() as HANDLE).collect();
+    // SAFETY: live handles the caller borrows for the call, and their count.
+    let woke = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
+    let n = handles.len() as u32;
+    match woke {
+        w if (WAIT_OBJECT_0..WAIT_OBJECT_0 + n).contains(&w) => Ok((w - WAIT_OBJECT_0) as usize),
+        w if (WAIT_ABANDONED_0..WAIT_ABANDONED_0 + n).contains(&w) => Ok((w - WAIT_ABANDONED_0) as usize),
+        _ => Err(last("wait")),
+    }
+}

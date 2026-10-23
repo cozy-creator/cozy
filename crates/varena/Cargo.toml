@@ -34,7 +34,7 @@ tracing-subscriber.workspace = true
 name = "processes"
 harness = false
 
-# Its own harness: the agents are this binary (`lease agent <socket>`).
+# Its own harness: the agents are this binary (`lease agent <gpu uuid>`).
 [[test]]
 name = "lease"
 harness = false

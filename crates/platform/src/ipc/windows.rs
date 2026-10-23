@@ -35,13 +35,14 @@ use windows_sys::Win32::{
         IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
         Pipes::{
             ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeInfo,
-            GetNamedPipeServerProcessId, NMPWAIT_WAIT_FOREVER, PIPE_READMODE_BYTE,
+            GetNamedPipeServerProcessId, NMPWAIT_WAIT_FOREVER, PIPE_READMODE_BYTE, PeekNamedPipe,
             PIPE_REJECT_REMOTE_CLIENTS, PIPE_SERVER_END, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
             PIPE_WAIT, WaitNamedPipeW,
         },
         Threading::{
-            CreateEventW, GetCurrentProcess, INFINITE, OpenProcessToken, WaitForMultipleObjects,
-            WaitForSingleObject,
+            CreateEventW, GetCurrentProcess, INFINITE, OpenProcess, OpenProcessToken,
+            PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            WaitForMultipleObjects, WaitForSingleObject,
         },
     },
 };
@@ -67,17 +68,20 @@ pub struct LocalStream {
     closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// How long a read waits before it answers `TimedOut`; 0: for ever.
     read_timeout_ms: std::sync::atomic::AtomicU32,
+    /// The process on the other end, opened once ([`LocalStream::peer_process`]), shared by clones.
+    peer: std::sync::Arc<std::sync::OnceLock<OwnedHandle>>,
 }
 
 impl LocalStream {
     fn new(pipe: OwnedHandle, side: Side) -> io::Result<Self> {
-        Self::sharing(pipe, side, std::sync::Arc::default())
+        Self::sharing(pipe, side, std::sync::Arc::default(), std::sync::Arc::default())
     }
 
     fn sharing(
         pipe: OwnedHandle,
         side: Side,
         closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        peer: std::sync::Arc<std::sync::OnceLock<OwnedHandle>>,
     ) -> io::Result<Self> {
         Ok(Self {
             pipe,
@@ -87,12 +91,18 @@ impl LocalStream {
             nonblocking: std::sync::atomic::AtomicBool::new(false),
             closed,
             read_timeout_ms: std::sync::atomic::AtomicU32::new(0),
+            peer,
         })
     }
 
     /// Another handle on the same pipe, for a reader thread while this one writes.
     pub fn try_clone(&self) -> io::Result<Self> {
-        Self::sharing(self.pipe.try_clone()?, self.side, self.closed.clone())
+        Self::sharing(
+            self.pipe.try_clone()?,
+            self.side,
+            self.closed.clone(),
+            self.peer.clone(),
+        )
     }
 
     /// Ends the stream as a socket's shutdown does, whatever `how`: the listener's end
@@ -146,6 +156,52 @@ impl LocalStream {
             0 => Err(io::Error::last_os_error()),
             _ => Ok(pid),
         }
+    }
+
+    /// The process on the other end, opened once and kept: the handle pins its pid, so every
+    /// handle sent later lands in the process whose token [`LocalStream::peer_user`] read. It
+    /// is opened for duplication where the OS allows that, else for queries only (a peer of
+    /// higher integrity), and refused if the pipe broke first: then the pid may name a successor.
+    pub fn peer_process(&self) -> io::Result<BorrowedHandle<'_>> {
+        if self.peer.get().is_none() {
+            let pid = self.peer_pid()?;
+            let opened = open_process(pid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
+                .or_else(|error| match error.kind() {
+                    io::ErrorKind::PermissionDenied => {
+                        open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
+                    }
+                    _ => Err(error),
+                })?;
+            let mut waiting = 0u32;
+            // SAFETY: a live pipe handle and a writable count; no buffer is read.
+            let connected = unsafe {
+                PeekNamedPipe(
+                    raw(&self.pipe),
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    &mut waiting,
+                    ptr::null_mut(),
+                )
+            } != 0;
+            if !connected {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("the peer (pid {pid}) left before it was named"),
+                ));
+            }
+            // A clone that opened it first wins; this one closes.
+            let _ = self.peer.set(opened);
+        }
+        self.peer
+            .get()
+            .map(AsHandle::as_handle)
+            .ok_or_else(|| io::Error::other("the peer's process"))
+    }
+
+    /// The user the process on the other end runs as: its token's user SID, as text.
+    pub fn peer_user(&self) -> io::Result<String> {
+        token_user(self.peer_process()?.as_raw_handle())
     }
 
     fn read_into(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -563,6 +619,11 @@ fn event() -> io::Result<OwnedHandle> {
     owned(unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) })
 }
 
+fn open_process(pid: u32, access: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: a plain call; a null handle is the failure.
+    owned(unsafe { OpenProcess(access, 0, pid) })
+}
+
 fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
@@ -586,7 +647,7 @@ unsafe impl Sync for Security {}
 
 impl Security {
     fn user_only() -> io::Result<Self> {
-        let sid = user_sid()?;
+        let sid = this_user()?;
         let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid})")
             .encode_utf16()
             .chain([0])
@@ -623,11 +684,22 @@ impl Drop for Security {
     }
 }
 
-/// This process's user, as an SID string.
-fn user_sid() -> io::Result<String> {
+/// The user this process runs as, as an SID string; read once.
+pub fn this_user() -> io::Result<String> {
+    static USER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(user) = USER.get() {
+        return Ok(user.clone());
+    }
+    // SAFETY: this process's pseudo-handle, valid for the call.
+    let user = token_user(unsafe { GetCurrentProcess() })?;
+    Ok(USER.get_or_init(|| user).clone())
+}
+
+/// The user `process` runs as, as an SID string, from its token.
+fn token_user(process: HANDLE) -> io::Result<String> {
     let mut token: HANDLE = ptr::null_mut();
-    // SAFETY: this process's pseudo-handle and a writable token handle.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+    // SAFETY: a live process handle and a writable token handle.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let token = owned(token)?;
@@ -665,19 +737,17 @@ fn user_sid() -> io::Result<String> {
     Ok(sid)
 }
 
-/// Duplicates `handle` into the process at the other end of `stream`; the value it has there.
+/// Duplicates `handle` into the process at the other end of `stream`, through the process
+/// handle the stream keeps (never a pid looked up now); the value it has there.
 pub(crate) fn duplicate_into_peer(stream: &LocalStream, handle: RawHandle) -> io::Result<u64> {
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_DUP_HANDLE};
-    let peer = stream.peer_pid()?;
-    // SAFETY: a plain call; a null handle is the failure.
-    let process = owned(unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, peer) })?;
+    let process = stream.peer_process()?;
     let mut target: HANDLE = ptr::null_mut();
     // SAFETY: live source and target processes, a live handle and a writable target.
     if unsafe {
         DuplicateHandle(
             GetCurrentProcess(),
             handle,
-            raw(&process),
+            process.as_raw_handle(),
             &mut target,
             0,
             0,

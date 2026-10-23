@@ -1,7 +1,11 @@
 //! The NVIDIA GPUs a machine reports in `StatusFrame.gpus[]`, read through NVML, which is opened
 //! at run time (`libnvidia-ml.so.1`, `nvml.dll`). No driver is "no NVIDIA GPU", never an error.
+#[cfg(windows)]
+mod budget;
 mod cuda;
 
+#[cfg(windows)]
+pub use budget::{Adapter, Budget, adapters};
 pub use cuda::memory_classes;
 
 use crate::{Error, Result};

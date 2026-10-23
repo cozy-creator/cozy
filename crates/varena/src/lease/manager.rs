@@ -14,7 +14,6 @@
 //! it drops).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -369,9 +368,8 @@ impl Manager {
         }
         let process = Exact::open(&found).map_err(|e| Error::Io(e.to_string()))?.ok_or_else(|| Error::Closed(format!("process {}", peer.pid)))?;
         let slots = u32::try_from(self.limit.unwrap_or(self.gpu_memory) / SLOT_UNIT).unwrap_or(u32::MAX).max(1);
-        // Sealed against resizing before the agent sees it: its ftruncate could SIGBUS us.
-        let file = platform::memory::page(table::bytes(slots) as u64).map_err(|e| Error::Io(e.to_string()))?;
-        platform::shm::seal_with(file.as_fd(), platform::shm::RESIZE_SEALS).map_err(|e| Error::Io(e.to_string()))?;
+        // Sealed against resizing before the agent sees it.
+        let file = os::sealed_page(table::bytes(slots) as u64)?;
         let table = Arc::new(Table::create(os::map(&file, table::bytes(slots), true)?, slots, peer.pid, birth)?);
         let epoch = table.attach();
         let id = {
