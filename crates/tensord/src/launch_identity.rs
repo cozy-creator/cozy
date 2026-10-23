@@ -14,7 +14,7 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{MetadataExt, OpenOptionsExt},
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
             process::CommandExt,
         },
     },
@@ -29,8 +29,7 @@ pub struct LaunchIdentity {
 impl LaunchIdentity {
     pub fn validate(self) -> io::Result<Self> {
         // A nonprivileged owner can only retain its existing identity.
-        if unsafe { libc::geteuid() } != 0
-            && (self.uid != unsafe { libc::geteuid() } || self.gid != unsafe { libc::getegid() })
+        if euid() != 0 && (self.uid != euid() || self.gid != egid())
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -40,7 +39,7 @@ impl LaunchIdentity {
         Ok(self)
     }
     pub(crate) fn traverse(self, path: &Path) -> io::Result<()> {
-        self.directory(path, unsafe { libc::geteuid() }, 0o710)
+        self.directory(path, euid(), 0o710)
     }
     pub(crate) fn own(self, path: &Path) -> io::Result<()> {
         self.directory(path, self.uid, 0o700)
@@ -52,18 +51,15 @@ impl LaunchIdentity {
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
             .open(path)?;
         let metadata = file.metadata()?;
-        if metadata.uid() != unsafe { libc::geteuid() } && metadata.uid() != self.uid {
+        if metadata.uid() != euid() && metadata.uid() != self.uid {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "launch path belongs to another owner",
             ));
         }
         // Exact opened directory only; never walk/chown an authored tree or generation.
-        if unsafe { libc::fchown(file.as_raw_fd(), uid, self.gid) } != 0
-            || unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        std::os::unix::fs::fchown(&file, Some(uid), Some(self.gid))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.sync_all()
     }
     pub(crate) fn socket(self, path: &Path) -> io::Result<()> {
@@ -86,19 +82,9 @@ impl LaunchIdentity {
                     "executor endpoint is not the owned socket",
                 ));
             }
-            if unsafe {
-                libc::fchownat(
-                    file.as_raw_fd(),
-                    c"".as_ptr(),
-                    self.uid,
-                    self.gid,
-                    libc::AT_EMPTY_PATH,
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
+            use nix::unistd::{fchownat, Gid, Uid};
+            let (uid, gid) = (Some(Uid::from_raw(self.uid)), Some(Gid::from_raw(self.gid)));
+            Ok(fchownat(&file, "", uid, gid, nix::fcntl::AtFlags::AT_EMPTY_PATH)?)
         }
     }
     pub(crate) fn readable(self, path: &Path) -> io::Result<()> {
@@ -106,17 +92,14 @@ impl LaunchIdentity {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
-        if !file.metadata()?.is_file() || file.metadata()?.uid() != unsafe { libc::geteuid() } {
+        if !file.metadata()?.is_file() || file.metadata()?.uid() != euid() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "launch metadata is not the owner's regular file",
             ));
         }
-        if unsafe { libc::fchown(file.as_raw_fd(), libc::geteuid(), self.gid) } != 0
-            || unsafe { libc::fchmod(file.as_raw_fd(), 0o440) } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        std::os::unix::fs::fchown(&file, Some(euid()), Some(self.gid))?;
+        file.set_permissions(fs::Permissions::from_mode(0o440))?;
         file.sync_all()
     }
 }
@@ -152,7 +135,7 @@ fn identity_unsupported() -> io::Error {
 /// This process's user: the effective uid, or 0 where there is none (Windows).
 pub(crate) fn euid() -> u32 {
     #[cfg(unix)]
-    return unsafe { libc::geteuid() };
+    return nix::unistd::geteuid().as_raw();
     #[cfg(windows)]
     0
 }
@@ -160,7 +143,7 @@ pub(crate) fn euid() -> u32 {
 /// This process's group: the effective gid, or 0 where there is none (Windows).
 pub(crate) fn egid() -> u32 {
     #[cfg(unix)]
-    return unsafe { libc::getegid() };
+    return nix::unistd::getegid().as_raw();
     #[cfg(windows)]
     0
 }
@@ -334,22 +317,7 @@ pub fn inherit(_: &mut Command, _: &[Option<&Arc<File>>]) {}
 /// The launched process keeps these shared locks open (not close-on-exec) until it exits.
 #[cfg(unix)]
 pub fn inherit(command: &mut Command, holds: &[Option<&Arc<File>>]) {
-    let descriptors: Vec<_> = holds
-        .iter()
-        .flatten()
-        .map(|hold| hold.as_raw_fd())
-        .collect();
-    // SAFETY: only async-signal-safe fcntl, on descriptors the caller keeps open through spawn.
-    unsafe {
-        command.pre_exec(move || {
-            for descriptor in &descriptors {
-                if libc::fcntl(*descriptor, libc::F_SETFD, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
+    platform::process::keep_open(command, holds.iter().flatten().map(|hold| hold.as_raw_fd()).collect());
 }
 
 pub const DEFAULT_THREADS: u32 = 4;
@@ -397,7 +365,7 @@ impl Seal {
             (owned(jit.join("kernels"))?, None)
         } else {
             let hold = crate::reclaim::kernel_hold(&root.join("kernels"), &namespace)?;
-            fs2::FileExt::lock_shared(&hold)?; // waits out a sweep deleting in this namespace
+            hold.lock_shared()?; // waits out a sweep deleting in this namespace
             let kernels = owned(root.join("kernels").join(&namespace))?;
             (kernels, Some(Arc::new(hold)))
         };
@@ -532,8 +500,8 @@ mod tests {
         let root = std::path::Path::new("/tmp").join(format!("ml-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
         fs::create_dir(&root).unwrap();
         let identity = LaunchIdentity {
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: euid(),
+            gid: egid(),
         };
         identity.traverse(&root).unwrap();
         let peer = root.join("peer");
@@ -560,7 +528,7 @@ mod tests {
         let alias = root.join("alias");
         std::os::unix::fs::symlink(&private, &alias).unwrap();
         assert!(identity.own(&alias).is_err());
-        if unsafe { libc::geteuid() } != 0 {
+        if euid() != 0 {
             assert!(LaunchIdentity {
                 uid: identity.uid + 1,
                 gid: identity.gid

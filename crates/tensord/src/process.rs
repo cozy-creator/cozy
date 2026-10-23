@@ -556,7 +556,7 @@ mod tests {
             std::thread::yield_now();
         };
         let exact = Exact::open(&birth).unwrap().unwrap();
-        unsafe { libc::kill(birth.pid as i32, libc::SIGKILL) };
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(birth.pid as i32), nix::sys::signal::Signal::SIGKILL);
         let liveness = Liveness {
             sample: Duration::from_millis(50),
         };

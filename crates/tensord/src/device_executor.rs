@@ -22,10 +22,7 @@ use std::{
     time::Duration,
 };
 #[cfg(unix)]
-use std::os::{
-    fd::AsRawFd,
-    unix::process::{CommandExt, ExitStatusExt},
-};
+use std::os::{fd::AsRawFd, unix::process::ExitStatusExt};
 
 pub const RESULT_DOCUMENT: &str = "result.canonical";
 
@@ -1039,18 +1036,9 @@ impl Codec {
                     .mode(0o600)
                     .open(&self.log)?,
             );
-        // SAFETY: only async-signal-safe fcntl on the retained generation hold.
+        // The retained generation hold stays open in the codec.
         #[cfg(unix)]
-        unsafe {
-            command.pre_exec(move || {
-                if let Some(descriptor) = hold {
-                    if libc::fcntl(descriptor, libc::F_SETFD, 0) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
-        }
+        platform::process::keep_open(&mut command, hold.into_iter().collect());
         let mut child = command.spawn()?;
         let input = child
             .stdin

@@ -147,7 +147,7 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
 
     // The readiness proof's observation can fail: a key this machine admits is not refused.
     let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
-    let leaf = rustls_pemfile::certs(&mut &pem[..]).next().unwrap().unwrap();
+    let leaf = <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(&pem[..]).next().unwrap().unwrap();
     for (key, refused) in [(OWNER, false), ([9; 32], true)] {
         let key = SigningKey::from_bytes(&key);
         assert_eq!(
@@ -273,7 +273,7 @@ async fn a_persistent_machine_reports_no_idle_deadline() {
     assert!(webrtc.addresses.contains(&local), "{:?}", webrtc.addresses);
     std::net::TcpStream::connect(&local).unwrap();
     let leaf = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
-    let der = rustls_pemfile::certs(&mut &leaf[..]).next().unwrap().unwrap();
+    let der = <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(&leaf[..]).next().unwrap().unwrap();
     assert_eq!(webrtc.fingerprint, tensorfs::sha256::hex_digest(&der));
     // A play link outlives a restart: the port is kept.
     drop(machine);

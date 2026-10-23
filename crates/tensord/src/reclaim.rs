@@ -10,7 +10,6 @@
 //! uncollected results (durable outputs), journal rows, a generation a run holds or an
 //! installation names, a kernel namespace a live executor or kernel boot holds.
 use crate::{catalog::Catalog, execution::Engine};
-use fs2::FileExt;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
@@ -165,7 +164,7 @@ impl Entry {
             let Ok(hold) = File::open(self.path.join(".hold")) else {
                 return Ok(false);
             };
-            if hold.try_lock_exclusive().is_err() {
+            if hold.try_lock().is_err() {
                 return Ok(false);
             }
             self.hold = Some(hold);
@@ -305,7 +304,7 @@ fn kernel_entries(caches: &KernelCaches) -> (Vec<PathBuf>, Vec<File>) {
             continue; // never through a link, and not a lock file
         }
         let lock = kernel_hold(&caches.root, &namespace.file_name().to_string_lossy());
-        let Some(lock) = lock.ok().filter(|lock| lock.try_lock_exclusive().is_ok()) else {
+        let Some(lock) = lock.ok().filter(|lock| lock.try_lock().is_ok()) else {
             continue;
         };
         locks.push(lock);
@@ -339,7 +338,7 @@ fn kernel_entries(caches: &KernelCaches) -> (Vec<PathBuf>, Vec<File>) {
 type UvEntry = (PathBuf, SystemTime, Vec<PathBuf>);
 fn uv_entries(cache: &Path) -> (Vec<UvEntry>, Option<File>) {
     let lock = File::options().write(true).open(cache.join(".lock"));
-    let Some(lock) = lock.ok().filter(|lock| lock.try_lock_exclusive().is_ok()) else {
+    let Some(lock) = lock.ok().filter(|lock| lock.try_lock().is_ok()) else {
         return (vec![], None);
     };
     let mut pointers = HashMap::new();
@@ -529,7 +528,7 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
             let Ok(hold) = File::open(entry.path.join(".hold")) else {
                 continue;
             };
-            if hold.try_lock_exclusive().is_err() {
+            if hold.try_lock().is_err() {
                 continue;
             }
             entry.hold = Some(hold);

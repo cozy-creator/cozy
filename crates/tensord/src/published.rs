@@ -14,7 +14,6 @@ use crate::{
     service::Service,
 };
 use base64::Engine as _;
-use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -863,13 +862,13 @@ impl Publisher {
         let locks = generations.join(".locks");
         fs::create_dir_all(&locks).map_err(io_failure)?;
         let lock = File::create(locks.join(format!("{identity}.lock"))).map_err(io_failure)?;
-        if lock.try_lock_exclusive().is_err() {
+        if lock.try_lock().is_err() {
             let holder = self.building.lock().unwrap().get(identity).cloned();
             job.waiting(Some(match holder {
                 Some(run) => format!("waiting for run {run} to install {package} {release}"),
                 None => format!("waiting for another run's install of {package} {release}"),
             }));
-            lock.lock_exclusive().map_err(io_failure)?;
+            lock.lock().map_err(io_failure)?;
             job.waiting(None);
         }
         self.building.lock().unwrap().insert(identity.into(), job.caller.clone());

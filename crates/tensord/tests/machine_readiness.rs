@@ -189,7 +189,7 @@ fn a_retained_root_keeps_its_boot_and_leaf() {
     let boot_id = std::fs::read_to_string(fixture.join("var/lib/cozy/machine/boot-id")).unwrap();
     assert_eq!(facts["pod_boot_id"], boot_id.as_str());
     let pem = std::fs::read(fixture.join("run/cozy/bootstrap/tls.crt")).unwrap();
-    let leaf = rustls_pemfile::certs(&mut pem.as_slice())
+    let leaf = <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(pem.as_slice())
         .next()
         .unwrap()
         .unwrap();

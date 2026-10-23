@@ -86,12 +86,14 @@ impl<B: MachineBackend> Media<B> {
                 format!("the machine leaf's {what} is unreadable"),
             )
         };
-        let certificate = rustls_pemfile::certs(&mut identity.cert_pem.as_bytes())
+        use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+        let certificate = CertificateDer::pem_slice_iter(identity.cert_pem.as_bytes())
             .next()
-            .ok_or_else(|| invalid("certificate"))??
+            .and_then(Result::ok)
+            .ok_or_else(|| invalid("certificate"))?
             .to_vec();
-        let private_key = rustls_pemfile::private_key(&mut identity.key_pem.as_bytes())?
-            .ok_or_else(|| invalid("key"))?
+        let private_key = PrivateKeyDer::from_pem_slice(identity.key_pem.as_bytes())
+            .map_err(|_| invalid("key"))?
             .secret_der()
             .to_vec();
         Ok(Arc::new(Self {

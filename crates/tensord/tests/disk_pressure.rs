@@ -215,7 +215,7 @@ fn held_linked_and_open_bytes_do_not_make_a_plan_cover() {
     // A generation a run holds, and one whose payload a cache outside it also links.
     let (held, linked) = (fixture.generation('a'), fixture.generation('b'));
     let run = fs::File::open(held.join(".hold")).unwrap();
-    fs2::FileExt::lock_shared(&run).unwrap();
+    run.lock_shared().unwrap();
     fs::hard_link(linked.join("weights"), fixture.root.join("uv-cache")).unwrap();
     // A collected result this process is still serving: Linux lists the files it holds open.
     let served = cfg!(target_os = "linux").then(|| {
@@ -227,7 +227,7 @@ fn held_linked_and_open_bytes_do_not_make_a_plan_cover() {
     // A kernel namespace a live executor holds, and one reached through a link.
     let kernel = fixture.kernel("u1", "in-use");
     let executor = reclaim::kernel_hold(&fixture.kernels.root, "u1").unwrap();
-    fs2::FileExt::lock_shared(&executor).unwrap();
+    executor.lock_shared().unwrap();
     let outside = fixture.root.join("outside/triton/foreign");
     fs::create_dir_all(&outside).unwrap();
     fs::write(outside.join("kernel"), vec![1u8; MIB as usize]).unwrap();
@@ -352,7 +352,7 @@ fn the_uv_cache_drops_wheels_no_environment_links_before_generations_and_never_m
     // An install holds the cache shared, as uv does for each command and the publisher for a
     // whole environment build: nothing of it goes, so the generation is what covers.
     let install = fs::File::open(fixture.root.join("uv-cache/.lock")).unwrap();
-    fs2::FileExt::lock_shared(&install).unwrap();
+    install.lock_shared().unwrap();
     let swept = fixture.sweep(&fixture.low(MIB / 8));
     assert_eq!((swept.uv_cache, swept.generations), (0, 1), "{swept:?}");
     assert_eq!(unpacked(), 2);

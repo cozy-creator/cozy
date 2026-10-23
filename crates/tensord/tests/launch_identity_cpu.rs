@@ -13,8 +13,8 @@ fn optional_same_uid_sdk_launch_seals_process_and_preserves_default_identity() {
             .expect("installed SDK interpreter configuration"),
     );
     let identity = LaunchIdentity {
-        uid: unsafe { libc::geteuid() },
-        gid: unsafe { libc::getegid() },
+        uid: nix::unistd::geteuid().as_raw(),
+        gid: nix::unistd::getegid().as_raw(),
     };
     for selected in [None, Some(identity)] {
         let output = trampoline(&python, selected, None).unwrap()
@@ -52,7 +52,7 @@ print(json.dumps({'uid':os.geteuid(),'gid':os.getegid(),'pid':os.getpid(),'paren
 fn retained_child_is_killed_when_the_temporary_creator_thread_exits() {
     use std::{
         io::{BufRead, BufReader},
-        os::{fd::FromRawFd, unix::process::ExitStatusExt},
+        os::unix::process::ExitStatusExt,
     };
     let python = PathBuf::from(std::env::var("TENSORD_CPU_TEST_PYTHON").unwrap());
     let mut child = std::thread::spawn(move || {
@@ -77,16 +77,10 @@ fn retained_child_is_killed_when_the_temporary_creator_thread_exits() {
     })
     .join()
     .unwrap();
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as i32;
-    assert!(raw >= 0);
-    let _fd = unsafe { std::fs::File::from_raw_fd(raw) };
-    let mut p = libc::pollfd {
-        fd: raw,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let observed = unsafe { libc::poll(&mut p, 1, 5000) };
-    if observed <= 0 {
+    let birth = platform::process::Birth::of(child.id()).unwrap();
+    let exact = platform::process::Exact::open(&birth).unwrap();
+    let observed = exact.is_none_or(|exact| exact.wait_for(std::time::Duration::from_secs(5)).unwrap());
+    if !observed {
         // Explicit teardown of this owned CPU fault probe; never a product timeout policy.
         child.kill().unwrap();
         child.wait().unwrap();

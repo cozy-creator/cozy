@@ -323,14 +323,72 @@ pub fn hand_on(handle: &impl std::os::windows::io::AsRawHandle) -> Result<u64> {
     sys::hand_on(handle).map_err(Error::os("hand on a handle"))
 }
 
-/// Windows: the handle `value` names, as [`hand_on`] handed it to this process; it goes no further.
-///
-/// # Safety
-/// `value` must name a handle this process inherited and nothing else owns.
+/// Windows: a copy of the handle `value` names, as [`hand_on`] handed it to this process. Neither
+/// goes further: the inherited handle is no longer inheritable.
 #[cfg(windows)]
-pub unsafe fn handed(value: u64) -> Result<std::os::windows::io::OwnedHandle> {
-    // SAFETY: the caller's promise.
-    unsafe { sys::handed(value) }.map_err(Error::os("take a handed handle"))
+pub fn take_handed(value: u64) -> Result<std::os::windows::io::OwnedHandle> {
+    sys::take_handed(value).map_err(Error::os("take a handed handle"))
+}
+
+/// Descriptors a process hands itself across an exec (Unix): the slots [`hand_on_exec`] fills
+/// and [`take_handed`] reads. After [`reserve_handed`] no owner in this process holds one.
+#[cfg(unix)]
+pub const HANDED: std::ops::RangeInclusive<std::os::fd::RawFd> = 3..=5;
+
+/// First thing in a process that hands descriptors on (Unix): every closed [`HANDED`] slot is
+/// held on `/dev/null`, so no file this process opens lands on one. Refused once a second
+/// thread exists.
+#[cfg(unix)]
+pub fn reserve_handed() -> Result<()> {
+    unix::reserve_handed().map_err(Error::os("reserve the handed descriptors"))
+}
+
+/// A copy of descriptor `fd` as its parent handed it (Unix), close-on-exec; `None` when it is
+/// not open. The slot itself is left as it was.
+#[cfg(unix)]
+pub fn take_handed(fd: std::os::fd::RawFd) -> Option<std::fs::File> {
+    unix::take_handed(fd)
+}
+
+/// `fd` at slot `at` of [`HANDED`] for the program this process execs next (Unix): inheritable
+/// there. Refused for any other slot, or before [`reserve_handed`].
+#[cfg(unix)]
+pub fn hand_on_exec(fd: &impl std::os::fd::AsRawFd, at: std::os::fd::RawFd) -> Result<()> {
+    unix::hand_on_exec(fd, at).map_err(Error::os("hand on a descriptor"))
+}
+
+/// The child `command` starts keeps `fds` open across its exec (Unix); run after
+/// [`inherit_nothing`]. A descriptor not open then fails the spawn.
+#[cfg(unix)]
+pub fn keep_open(command: &mut Command, fds: Vec<std::os::fd::RawFd>) {
+    unix::keep_open(command, fds)
+}
+
+/// Which side of a [`fork`] this is.
+#[cfg(unix)]
+pub enum Forked {
+    Child,
+    Parent(u32),
+}
+
+/// Forks this process (Unix), refused unless it has one thread: the child continues with
+/// nothing another thread held, so anything may run in it.
+#[cfg(unix)]
+pub fn fork() -> Result<Forked> {
+    unix::fork().map_err(Error::os("fork"))
+}
+
+/// A SIGCHLD stays pending for `sigwait` while blocked (Unix). macOS discards one nothing catches,
+/// blocked or not, so it gets a handler that does nothing; elsewhere there is nothing to do.
+#[cfg(unix)]
+pub fn keep_sigchld() -> Result<()> {
+    unix::keep_sigchld().map_err(Error::os("catch SIGCHLD"))
+}
+
+/// This machine's glibc version, as `gnu_get_libc_version` says it.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn glibc_version() -> String {
+    unix::glibc_version()
 }
 
 /// An OS shortage that may clear by itself; nothing else justifies requeueing a launch.

@@ -672,7 +672,7 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
     let named = make(&"c".repeat(32), 8);
     let recent = make(&"d".repeat(32), 0);
     let lease = fs::File::open(held.join(".hold")).unwrap();
-    fs2::FileExt::lock_shared(&lease).unwrap(); // a run or executor holding it
+    lease.lock_shared().unwrap(); // a run or executor holding it
     let bound = std::collections::HashSet::from(["c".repeat(32)]);
     let kernels = fixture.root.join("kernels");
     for (namespace, entry, days) in [("u1", "old", 9), ("u1", "new", 0), ("u2", "busy", 9)] {
@@ -687,7 +687,7 @@ fn caches_expire_but_held_named_and_uncollected_work_stays() {
     };
     // A live executor holds its namespace.
     let executor = reclaim::kernel_hold(&kernels, "u2").unwrap();
-    fs2::FileExt::lock_shared(&executor).unwrap();
+    executor.lock_shared().unwrap();
     let swept = reclaim::sweep(&reclaim::Caches {
         engine: fixture.engine(),
         catalog: &catalog,

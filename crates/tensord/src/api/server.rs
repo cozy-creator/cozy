@@ -134,8 +134,9 @@ const LIVENESS: Duration = Duration::from_secs(20);
 
 /// The machine's leaf, offering HTTP/2 for control and HTTP/1.1 for bulk lanes.
 fn tls(identity: &MachineIdentity) -> std::io::Result<rustls::ServerConfig> {
-    let key = rustls_pemfile::private_key(&mut identity.key_pem.as_bytes())?
-        .ok_or_else(|| std::io::Error::other("the machine leaf has no private key"))?;
+    use rustls::pki_types::{pem::PemObject, PrivateKeyDer};
+    let key = PrivateKeyDer::from_pem_slice(identity.key_pem.as_bytes())
+        .map_err(|e| std::io::Error::other(format!("the machine leaf's private key: {e}")))?;
     let leaf = rustls::pki_types::CertificateDer::from(identity.cert_der.clone());
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)

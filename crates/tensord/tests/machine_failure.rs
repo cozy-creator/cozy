@@ -55,7 +55,7 @@ async fn a_raising_calls_traceback_travels_with_its_run() {
         std::thread::sleep(Duration::from_millis(100));
     };
     let pem = ready["cert_pem"].as_str().unwrap();
-    let leaf = rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap();
+    let leaf = <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(pem.as_bytes()).next().unwrap().unwrap();
     let auth = Auth::Key { key: Arc::new(owner), worker: "local".into() };
     let client = Client::new(ready["address"].as_str().unwrap(), tensorfs::sha256::digest(&leaf), auth).unwrap();
 

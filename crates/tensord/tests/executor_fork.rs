@@ -38,7 +38,7 @@ fn generations() -> Vec<(Generation, File)> {
     for entry in fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
         let hold = File::open(path.join(".hold")).unwrap();
-        fs2::FileExt::lock_shared(&hold).unwrap();
+        hold.lock_shared().unwrap();
         let generation = serde_json::from_slice(&fs::read(path.join("generation.json")).unwrap());
         found.push((generation.unwrap(), hold));
     }

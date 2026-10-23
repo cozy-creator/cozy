@@ -41,7 +41,7 @@ fn generations() -> Vec<(Generation, File)> {
     for entry in fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
         let hold = File::open(path.join(".hold")).unwrap();
-        fs2::FileExt::lock_shared(&hold).unwrap();
+        hold.lock_shared().unwrap();
         let generation = serde_json::from_slice(&fs::read(path.join("generation.json")).unwrap());
         found.push((generation.unwrap(), hold));
     }
@@ -174,7 +174,7 @@ fn launch_is_sealed_grouped_and_reaped_after_cooperative_shutdown() {
         }
         assert_eq!(executor.hello.sealed["CUDA_VISIBLE_DEVICES"], "");
         assert!(executor.hello.sealed["COZY_HOME"]
-            .ends_with(&format!("home/u{}", unsafe { libc::geteuid() })));
+            .ends_with(&format!("home/u{}", nix::unistd::geteuid().as_raw())));
         let environ = fs::read(format!("/proc/{}/environ", executor.birth.pid)).unwrap();
         assert!(!String::from_utf8_lossy(&environ).contains("TOKEN"));
         let death = fs::read_to_string(format!("/proc/{}/status", executor.birth.pid)).unwrap();
@@ -414,7 +414,7 @@ fn pre_start_exit_is_a_typed_failure_with_its_stderr() {
 fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
     use tensord::launch_identity::LaunchIdentity;
     use std::os::unix::fs::{chown, PermissionsExt};
-    assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
+    assert_eq!(nix::unistd::geteuid().as_raw(), 0, "run as root");
     let identity = LaunchIdentity {
         uid: 64000,
         gid: 65533,

@@ -39,7 +39,7 @@ fn generation() -> (Generation, File) {
     );
     let path = fs::read_dir(root).unwrap().next().unwrap().unwrap().path();
     let hold = File::open(path.join(".hold")).unwrap();
-    fs2::FileExt::lock_shared(&hold).unwrap();
+    hold.lock_shared().unwrap();
     let generation = serde_json::from_slice(&fs::read(path.join("generation.json")).unwrap());
     (generation.unwrap(), hold)
 }
@@ -204,7 +204,7 @@ fn a_forked_rank_zero_takes_the_group_seal_and_spawns_its_follower() {
         .unwrap()
         .path();
     let hold = File::open(path.join(".hold")).unwrap();
-    fs2::FileExt::lock_shared(&hold).unwrap();
+    hold.lock_shared().unwrap();
     let generation: Generation =
         serde_json::from_slice(&fs::read(path.join("generation.json")).unwrap()).unwrap();
     let root = std::env::temp_dir().join(format!("machine-group-fork-{}", uuid::Uuid::new_v4()));

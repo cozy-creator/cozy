@@ -9,7 +9,7 @@ use tensord::api::v1::{
 /// The pin of the leaf a machine root's listener presents.
 pub fn pin(root: &Path) -> Option<[u8; 32]> {
     let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).ok()?;
-    let leaf = rustls_pemfile::certs(&mut pem.as_slice()).next()?.ok()?;
+    let leaf = <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(pem.as_slice()).next()?.ok()?;
     Some(tensorfs::sha256::digest(&leaf))
 }
 

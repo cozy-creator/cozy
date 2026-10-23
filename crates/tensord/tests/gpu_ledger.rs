@@ -10,8 +10,8 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
-        unix::{net::UnixStream, process::CommandExt},
+        fd::{AsFd, AsRawFd, OwnedFd},
+        unix::net::UnixStream,
     },
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -172,13 +172,7 @@ impl Tenant {
             .env("FAKE_NVML_DIR", charges)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
-        // SAFETY: only fcntl on descriptors this process keeps open through the spawn.
-        unsafe {
-            command.pre_exec(move || match (libc::fcntl(fd, libc::F_SETFD, 0), libc::fcntl(events_fd, libc::F_SETFD, 0)) {
-                (0, 0) => Ok(()),
-                _ => Err(std::io::Error::last_os_error()),
-            });
-        }
+        platform::process::keep_open(&mut command, vec![fd, events_fd]);
         let mut child = command.spawn().unwrap();
         drop((memfd, events));
         let (input, output) = (child.stdin.take().unwrap(), BufReader::new(child.stdout.take().unwrap()));
@@ -229,7 +223,8 @@ fn tenant() {
     let fd: i32 = std::env::var("LEDGER_FD").unwrap().parse().unwrap();
     let events: i32 = std::env::var("EVENTS_FD").unwrap().parse().unwrap();
     // SAFETY: the descriptors this process inherited, open for its whole life.
-    let ledger = Ledger::adopt(unsafe { BorrowedFd::borrow_raw(fd) }, Some(unsafe { BorrowedFd::borrow_raw(events) })).unwrap();
+    let (fd, events) = (platform::process::take_handed(fd).unwrap(), platform::process::take_handed(events).unwrap());
+    let ledger = Ledger::adopt(fd.as_fd(), Some(events.as_fd())).unwrap();
     let ledger = Arc::new(ledger);
     let row = Arc::new(ledger.claim(std::process::id()).unwrap());
     let facts = Arc::new(Mutex::new(Facts { last_use: 1, ..Facts::default() }));
@@ -398,8 +393,8 @@ fn inner_a_stalled_victim_is_ended() {
     let seen = ended.clone();
     ledger.on_stalled(Box::new(move |pid| {
         seen.lock().unwrap().push(pid);
-        // SAFETY: a signal to the tenant this test started, alive until its Tenant drops.
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // A signal to the tenant this test started, alive until its Tenant drops.
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL);
         release(pid);
     }));
     let [memfd, _] = ledger.grant().unwrap();

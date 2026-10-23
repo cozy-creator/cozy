@@ -15,7 +15,7 @@ use std::{
     fs::File,
     io,
     os::{
-        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsFd, BorrowedFd, OwnedFd},
         unix::net::UnixStream,
     },
     sync::{
@@ -117,27 +117,18 @@ fn gone(pid: u32) -> bool {
 }
 
 fn eventfd() -> io::Result<OwnedFd> {
-    // SAFETY: eventfd(2) with no shared state; a negative return is an error.
-    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a descriptor we just created and own.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    use nix::sys::eventfd::{EfdFlags, EventFd};
+    Ok(EventFd::from_flags(EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)?.into())
 }
 
 /// Adds one to an eventfd.
 fn signal(fd: &OwnedFd) {
-    let one = 1u64.to_ne_bytes();
-    // SAFETY: an 8-byte write to an eventfd we hold.
-    unsafe { libc::write(fd.as_raw_fd(), one.as_ptr().cast(), 8) };
+    let _ = nix::unistd::write(fd, &1u64.to_ne_bytes());
 }
 
 /// Reads an eventfd to zero; whether it was signalled.
-fn drain(fd: i32) -> bool {
-    let mut count = [0u8; 8];
-    // SAFETY: an 8-byte read from a nonblocking eventfd we hold.
-    unsafe { libc::read(fd, count.as_mut_ptr().cast(), 8) == 8 }
+fn drain(fd: BorrowedFd<'_>) -> bool {
+    nix::unistd::read(fd, &mut [0u8; 8]) == Ok(8)
 }
 
 impl GpuLedger {
@@ -375,7 +366,7 @@ fn read(device: &Device) -> Option<Sample> {
 /// rows are reaping or asked for bytes, it also wakes at the wedge rule's sample to read again.
 fn watch(device: Option<Device>, inner: &Inner, ticks: &(Mutex<Ticks>, Condvar), wake: &OwnedFd) {
     let (lock, changed) = ticks;
-    let events = inner.ledger.events().map(|e| e.as_raw_fd());
+    let events = inner.ledger.events();
     loop {
         let asked = lock.lock().unwrap().asked;
         let reading = device.as_ref().and_then(read);
@@ -397,15 +388,16 @@ fn watch(device: Option<Device>, inner: &Inner, ticks: &(Mutex<Ticks>, Condvar),
             false => -1,
         };
         loop {
-            let mut fds = [wake.as_raw_fd(), events.unwrap_or(-1)].map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
-            // SAFETY: poll on two descriptors this thread's owners keep open (-1 is ignored).
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) };
-            if fds[1].revents & libc::POLLIN != 0 && drain(fds[1].fd) {
+            use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+            let mut fds: Vec<PollFd> = std::iter::once(wake.as_fd()).chain(events).map(|fd| PollFd::new(fd, PollFlags::POLLIN)).collect();
+            let ready = poll(&mut fds, PollTimeout::try_from(timeout).unwrap_or(PollTimeout::NONE)).unwrap_or(-1);
+            let readable = |at: usize| fds.get(at).and_then(PollFd::revents).is_some_and(|r| r.contains(PollFlags::POLLIN));
+            if readable(1) && events.is_some_and(drain) {
                 if let Some(told) = inner.freed.get() {
                     told();
                 }
             }
-            let woken = fds[0].revents & libc::POLLIN != 0 && drain(fds[0].fd);
+            let woken = readable(0) && drain(wake.as_fd());
             if woken || ready == 0 {
                 break;
             }

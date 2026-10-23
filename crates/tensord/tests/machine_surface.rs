@@ -227,7 +227,7 @@ mod v1_api {
             serde_json::from_slice(&fs::read(machine.root.join("state/api-ready.json")).unwrap())
                 .unwrap();
         let pem = ready["cert_pem"].as_str().unwrap();
-        let leaf = rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap();
+        let leaf = <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(pem.as_bytes()).next().unwrap().unwrap();
         Client::new(&machine.address, tensorfs::sha256::digest(&leaf), Auth::None).unwrap()
     }
     fn by(client: &Client, cap: &str) -> Client {

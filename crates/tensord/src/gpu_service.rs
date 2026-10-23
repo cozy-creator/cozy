@@ -4017,11 +4017,11 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
     #[test]
     #[ignore = "an_exited_replica_retires_only_its_exact_process_and_ledger_owner runs this child"]
     fn retirement_ledger_child() {
-        use std::os::fd::{AsFd, FromRawFd};
+        use std::os::fd::AsFd;
         use std::io::Read;
         assert_eq!(std::env::var("COZY_RETIREMENT_HELPER").as_deref(), Ok("1"));
-        // SAFETY: the spawning test installs its private socket at the child's stdin.
-        let mut control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
+        // The spawning test installs its private socket at the child's stdin.
+        let mut control = std::os::unix::net::UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
         let fd = platform::handles::recv_fd(&control).unwrap();
         let events = platform::handles::recv_fd(&control).unwrap();
         let ledger = varena::ledger::Ledger::adopt(fd.as_fd(), Some(events.as_fd())).unwrap();

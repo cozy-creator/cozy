@@ -9,7 +9,6 @@ mod common;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
-use fs2::FileExt;
 use platform::durable::{self, FileId};
 use std::{
     path::{Path, PathBuf},
@@ -127,7 +126,7 @@ fn one_root_runs_one_machine() {
     // A stopped machine frees the root at once.
     child::stop(&mut first.0);
     let lock = std::fs::File::open(root.join("var/lib/cozy/machine/agent.lock")).unwrap();
-    lock.try_lock_exclusive()
+    lock.try_lock()
         .expect("the stopped machine still holds its root");
 
     // A holder that names no live machine (a launcher's guard) is waited out, never refused:
@@ -139,7 +138,7 @@ fn one_root_runs_one_machine() {
         assert!(!served(&root, port), "a machine served a guarded root");
         std::thread::sleep(Duration::from_millis(200));
     }
-    FileExt::unlock(&lock).unwrap();
+    lock.unlock().unwrap();
     ready(&mut again, &root, port);
     drop(again);
     std::fs::remove_dir_all(&root).unwrap();

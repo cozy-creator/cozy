@@ -59,7 +59,7 @@ fn ready(machine: &mut Machine, home: &Path) -> serde_json::Value {
 /// A client of the published endpoint, pinned to its leaf, signing with `key`.
 fn client(ready: &serde_json::Value, key: &SigningKey) -> Client {
     let pem = ready["cert_pem"].as_str().unwrap();
-    let leaf = rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap();
+    let leaf = <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::pem_slice_iter(pem.as_bytes()).next().unwrap().unwrap();
     let auth = Auth::Key { key: Arc::new(key.clone()), worker: "local".into() };
     Client::new(ready["address"].as_str().unwrap(), tensorfs::sha256::digest(&leaf), auth).unwrap()
 }
