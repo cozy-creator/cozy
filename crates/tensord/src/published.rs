@@ -1572,13 +1572,19 @@ fn apply_adapters(
 }
 
 /// A catalog read the Hub answered 404 to is the thing named absent there; any other failure
-/// is the read's.
+/// is the read's, naming what it read and the Hub's whole answer (run 14446 said only "internal:
+/// unexpected internal failure").
 /// The Hub's own 404 names an absence; one without its envelope (`http_404`: a tunnel or proxy
 /// in front of it) names nothing (tfs-101).
-fn absent(refusal: hub_client::Error, code: &'static str, named: impl FnOnce() -> String) -> Failure {
+fn absent(refusal: hub_client::Error, code: &'static str, read: &str, named: impl FnOnce() -> String) -> Failure {
+    let failed = |why: String| ("catalog_read_failed", format!("reading {read}: {why}"));
     match refusal {
         hub_client::Error::Hub { status: 404, code: hub, .. } if !hub.starts_with("http_") => (code, named()),
-        other => ("catalog_read_failed", other.to_string()),
+        hub_client::Error::Hub { status, code, message, remedy } => failed(match remedy.is_empty() {
+            true => format!("the Hub answered {status} {code}: {message}"),
+            false => format!("the Hub answered {status} {code}: {message} ({remedy})"),
+        }),
+        other => failed(other.to_string()),
     }
 }
 
@@ -1653,7 +1659,8 @@ const CARD: &str = "release.json";
 /// `release`'s install plan, read at its Hub.
 fn hub_card(catalog: &Catalog, package: &str, release: &str, python: &str) -> Result<Card, Failure> {
     let (org, name) = package.split_once('/').unwrap_or_default();
-    let plan = catalog.install_plan(org, name, release, None).map_err(|e| absent(e, "release_absent", || {
+    let read = format!("the install plan of {package}@{release} at {}", catalog.origin());
+    let plan = catalog.install_plan(org, name, release, None).map_err(|e| absent(e, "release_absent", &read, || {
         format!("{package} has no release {release} at {}", catalog.origin())
     }))?;
     if plan.release != release {
@@ -1697,7 +1704,8 @@ fn keep_card(generation: &Path, card: &Card) {
 fn newest_release(catalog: &Catalog, org: &str, name: &str) -> Result<String, Failure> {
     let card = catalog
         .package(org, name)
-        .map_err(|e| absent(e, "package_absent", || format!("{org}/{name} is not published at {}", catalog.origin())))?;
+        .map_err(|e| absent(e, "package_absent", &format!("the releases of {org}/{name} at {}", catalog.origin()),
+            || format!("{org}/{name} is not published at {}", catalog.origin())))?;
     let open = card.releases.iter().filter(|row| row.yanked != Some(true) && row.yanked_at.as_deref().is_none_or(str::is_empty));
     tensorfs::format::newest_by(open, |row| row.release.as_str())
         .map(|row| row.release.clone())
@@ -2047,16 +2055,20 @@ pub(crate) mod tests {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
                     reader.read_line(&mut line).unwrap();
-                    let (mut range, mut header) = (None, String::new());
+                    let (mut range, mut header, mut sent) = (None, String::new(), 0);
                     while reader.read_line(&mut header).unwrap_or(0) > 2 {
                         if let Some((name, value)) = header.split_once(':') {
                             if name.eq_ignore_ascii_case("range") {
                                 let (first, last) = value.trim().trim_start_matches("bytes=").split_once('-').unwrap();
                                 range = Some((first.parse::<usize>().unwrap(), last.parse::<usize>().unwrap_or(usize::MAX)));
                             }
+                            if name.eq_ignore_ascii_case("content-length") {
+                                sent = value.trim().parse().unwrap();
+                            }
                         }
                         header.clear();
                     }
+                    std::io::Read::read_exact(&mut reader, &mut vec![0; sent]).unwrap();
                     let mut words = line.split_whitespace();
                     let method = words.next().unwrap().to_string();
                     // An object store answers a presigned URL by its path; the query is its signature.
@@ -2102,6 +2114,11 @@ pub(crate) mod tests {
                             };
                             let body = format!(r#"{{"package":{{"org":"acme","name":"{name}","created_at":"2026-10-01T00:00:00Z"}},"releases":{releases}}}"#);
                             format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
+                        }
+                        // A Hub whose object store failed under it (run 14446): its opaque envelope.
+                        ["", "v1", "packages", "acme", "faulty", ..] => {
+                            let body = r#"{"error":{"code":"internal","message":"unexpected internal failure","remedy":"retry; if it persists inspect the server log"}}"#;
+                            format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
                         }
                         // The Hub's own refusal: its envelope names the absence.
                         _ => {
@@ -2267,6 +2284,18 @@ pub(crate) mod tests {
         let (code, message) = newest_release(&catalog, "acme", "nope").unwrap_err();
         assert_eq!(code, "package_absent");
         assert!(message.starts_with("acme/nope is not published at http://127.0.0.1:"), "{message}");
+    }
+
+    /// A catalog read the Hub failed names what it read, where, and the Hub's whole answer.
+    #[test]
+    fn a_failed_catalog_read_names_the_read_and_the_hubs_answer() {
+        let origin = file_door(HashMap::new(), Arc::new(Mutex::new(vec![])), None);
+        let catalog = Catalog::new(&hub::Source::new(&origin, None, None).unwrap()).unwrap();
+        let answer = "the Hub answered 500 internal: unexpected internal failure (retry; if it persists inspect the server log)";
+        let Err((code, message)) = hub_card(&catalog, "acme/faulty", "1.0.0", "3.12") else { panic!("a failed read") };
+        assert_eq!((code, message), ("catalog_read_failed", format!("reading the install plan of acme/faulty@1.0.0 at {origin}: {answer}")));
+        let (code, message) = newest_release(&catalog, "acme", "faulty").unwrap_err();
+        assert_eq!((code, message), ("catalog_read_failed", format!("reading the releases of acme/faulty at {origin}: {answer}")));
     }
 
     /// The newest release is a final before any pre-release, and never a yanked one.
