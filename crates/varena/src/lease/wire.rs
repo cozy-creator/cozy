@@ -48,31 +48,8 @@ pub enum ToManager {
     Ask { id: u64, bytes: u64, kind: Kind, region: Option<Region> },
     /// Doorbell: slots moved to Mapped, Refused or Released.
     Answered,
-    /// Its admission facts, whenever they change.
-    Facts(Facts),
     /// What it measured: a request's peaks at its end, a set's bytes at its load.
     Measured(Measured),
-}
-
-/// An agent's admission facts, as admission and the capacity read them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Facts {
-    /// Its context and modules, measured at open; torch's bytes outside its leases.
-    pub context: u64,
-    pub torch: u64,
-    /// Running requests, and how many have no measured working set.
-    pub running: u32,
-    pub unmeasured: u32,
-    /// Each running request's largest remaining working set, summed.
-    pub remaining: u64,
-    /// Pinned bytes outside any running working set.
-    pub outside: u64,
-    /// The remaining working set of its requests waiting on child calls, per family they wait
-    /// for ([`super::manager::family_id`], bytes); family 0: any.
-    pub yielded: [(u64, u64); crate::decide::YIELDED],
-    /// Its running requests' largest measured anonymous host peak, and how many have none.
-    pub host_peak: u64,
-    pub host_unmeasured: u32,
 }
 
 /// What an agent measured.
