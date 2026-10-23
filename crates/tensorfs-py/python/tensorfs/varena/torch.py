@@ -41,6 +41,9 @@ from torch.utils.hooks import RemovableHandle
 from . import Copy as CopyRun
 from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, copies, cuts, seal
 
+#: Blocks entered (each forward of a bound block) or bound to a host device, process-wide: the
+#: work a call does in its models, which the Runtime tells the machine (cl-648).
+progress = 0
 #: Blocks copied ahead of the one entered, in the recorded order.
 _AHEAD = 2
 #: A streamed model's scratch slots, in its largest blocks (the core keeps 2-3).
@@ -874,6 +877,7 @@ class Memory:
     ) -> None:
         """Bind the block (refcounted). Short of room while another request holds it, wait for
         bytes to free (`wait`: the caller holds no lock), else `Exhausted`."""
+        global progress
         model = block.model
         if model.host:
             raise Unbound(f"{model.name}: {block.path or 'common'} binds to nothing")
@@ -886,6 +890,7 @@ class Memory:
                     elif stream != block.stream and not torch.cuda.is_current_stream_capturing():
                         stream.wait_stream(block.stream)
                     block.count += 1
+                    progress += 1
                     if record and block.index >= 0:
                         self._passed(block, call)
                 break
@@ -1971,6 +1976,7 @@ def _bound(block: Block, region: int, pinned: object) -> tuple[Tensor, dict[str,
 @torch.inference_mode(False)
 def _bind_host(model: Model) -> None:
     """Every weight once: CPU params view the host pages; an Apple device's are copied in."""
+    global progress
     for block in (model.common, *model.blocks):
         views: dict[str, dict[str, Tensor]] = {}
         for region in block.regions:
@@ -1980,6 +1986,7 @@ def _bind_host(model: Model) -> None:
             views.update(parts)
         _write(block, views)
         block.written.clear()
+        progress += 1
 
 
 def _home_regions(model: Model) -> list[int]:

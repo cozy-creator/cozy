@@ -593,7 +593,7 @@ def case(name: str, card: Card, limit: int | None, orphans: int = 0, weights: bo
     dit, asks = models["transformer_ref"].ws.name, []
     for warm in (False, True):
         label, since, moved, retries = f"{name} {'warm' if warm else 'cold'}", len(core.events), core.moved(), mem.memo.retries
-        start = CARD.allocated
+        start, worked = CARD.allocated, vt.progress
         try:
             # warm: a prompt of another length, a DiT shape key never run (12163)
             stats = h3(mem, models, label, dit=40_000 + 8 * warm)
@@ -601,6 +601,8 @@ def case(name: str, card: Card, limit: int | None, orphans: int = 0, weights: bo
             check(f"{label}: completes", False, f"{type(exc).__name__}: {exc}")
             return
         check(f"{label}: completes", True)
+        dit_blocks = len(models["transformer_ref"].blocks)
+        check(f"{label}: every DiT block entered counts as work (cl-648)", vt.progress - worked >= 8 * dit_blocks, vt.progress - worked)
         asks += [e for e in stats.evictions if e.reason.startswith("asked") and e.nbytes > 0]
         plan_checks(label, mem, core, since, core.moved() - moved, stats)
         settled(label, mem, core, start)
