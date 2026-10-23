@@ -205,7 +205,9 @@ pub struct Driver {
 }
 
 // The table is immutable after load and the driver entry points are thread-safe.
+// SAFETY: the table holds only function pointers and the loaded library, immutable after load; the driver's entry points are thread-safe.
 unsafe impl Send for Driver {}
+// SAFETY: as above.
 unsafe impl Sync for Driver {}
 
 static DRIVER: OnceLock<Result<Driver>> = OnceLock::new();
@@ -241,6 +243,7 @@ impl Driver {
         let mut library = None;
         let mut failures = Vec::new();
         for name in names {
+            // SAFETY: loading the CUDA driver runs its initializers, which have no preconditions on this process.
             match unsafe { libloading::Library::new(name) } {
                 Ok(lib) => {
                     library = Some(lib);
@@ -442,7 +445,9 @@ pub struct Stream {
     raw: CUstream,
 }
 
+// SAFETY: a stream handle is used only with its own primary context entered; CUDA stream calls are thread-safe.
 unsafe impl Send for Stream {}
+// SAFETY: as above.
 unsafe impl Sync for Stream {}
 
 impl Stream {
@@ -451,12 +456,14 @@ impl Stream {
         let mut raw = std::ptr::null_mut();
         let result = (|| {
             let _ctx = CtxGuard::enter(ctx)?;
+            // SAFETY: `raw` is a writable out-pointer and the stream's context is current.
             check("cuStreamCreate", unsafe {
                 (driver()?.stream_create)(&mut raw, STREAM_NON_BLOCKING)
             })
         })();
         if let Err(error) = result {
             if let Ok(driver) = driver() {
+                // SAFETY: balances the retain `primary_context` made for this stream.
                 unsafe { (driver.primary_ctx_release)(device) };
             }
             return Err(error);
@@ -480,6 +487,7 @@ impl Stream {
         let _context = CtxGuard::enter(self.ctx)?;
         // A host wait: a trace span, so a subscriber can time each.
         let _wait = tracing::trace_span!("tensorfs cuStreamSynchronize").entered();
+        // SAFETY: a live stream of this context, which is current.
         check("cuStreamSynchronize", unsafe {
             (driver.stream_synchronize)(self.raw)
         })
@@ -494,11 +502,13 @@ impl Drop for Stream {
         if let Ok(driver) = driver() {
             if let Ok(_ctx) = CtxGuard::enter(self.ctx) {
                 let _wait = tracing::trace_span!("tensorfs cuStreamSynchronize (drop)").entered();
+                // SAFETY: the stream is live and its context current; it is destroyed once, here.
                 unsafe {
                     (driver.stream_synchronize)(self.raw);
                     (driver.stream_destroy)(self.raw);
                 }
             }
+            // SAFETY: balances the retain made when the stream was created.
             unsafe { (driver.primary_ctx_release)(self.device) };
         }
     }
@@ -511,7 +521,9 @@ pub struct HostPin {
     ctx: CUcontext,
     owned: bool,
 }
+// SAFETY: a registration handle and its context, used only with that context entered.
 unsafe impl Send for HostPin {}
+// SAFETY: as above.
 unsafe impl Sync for HostPin {}
 
 /// # Safety
@@ -520,6 +532,7 @@ unsafe impl Sync for HostPin {}
 pub unsafe fn pin_region(ptr: *mut u8, len: usize, read_only: bool) -> Result<HostPin> {
     let d = driver()?;
     let mut ctx = std::ptr::null_mut();
+    // SAFETY: `ctx` is a writable out-pointer.
     check("cuCtxGetCurrent", unsafe { (d.ctx_get_current)(&mut ctx) })?;
     let flags = MEMHOSTREGISTER_PORTABLE
         | if read_only {
@@ -529,6 +542,7 @@ pub unsafe fn pin_region(ptr: *mut u8, len: usize, read_only: bool) -> Result<Ho
         };
     let rc = {
         let _wait = tracing::trace_span!("tensorfs cuMemHostRegister").entered();
+        // SAFETY: the caller lends `[ptr, ptr+len)` as live host memory for the registration's life (contract above).
         unsafe { (d.mem_host_register)(ptr.cast(), len, flags) }
     };
     if rc != ERROR_HOST_MEMORY_ALREADY_REGISTERED {
@@ -546,6 +560,7 @@ pub unsafe fn pin_region(ptr: *mut u8, len: usize, read_only: bool) -> Result<Ho
 /// `ptr` is live host memory; its owner holds the registration during the copy.
 pub unsafe fn registered(ptr: *const u8) -> Result<bool> {
     let mut kind: c_int = 0;
+    // SAFETY: `kind` is a writable out-value; the query only reads the pointer's attributes.
     let rc = unsafe {
         (driver()?.pointer_get_attribute)((&mut kind as *mut c_int).cast(), 2, ptr as u64)
     };
@@ -571,6 +586,7 @@ impl HostPin {
             let _context = CtxGuard::enter(self.ctx)?;
             // It synchronizes the device: a host wait, a trace span like the others.
             let _wait = tracing::trace_span!("tensorfs cuMemHostUnregister").entered();
+            // SAFETY: this guard registered `ptr` and unregisters it once, with its context entered.
             check("cuMemHostUnregister", unsafe {
                 (driver.mem_host_unregister)(self.ptr)
             })?;
