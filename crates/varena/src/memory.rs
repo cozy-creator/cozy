@@ -1447,6 +1447,7 @@ impl Inner {
             agent.busy(st.events.values().any(|q| !q.is_empty()));
             self.redecline(st);
             self.land(st, agent);
+            self.advise(st, agent);
         }
         // A held cache's release completes on its stream: it is its class again.
         for c in &mut st.table.caches {
@@ -3982,6 +3983,21 @@ impl Inner {
         }
         self.publish(&mut st);
         self.unlock(st);
+    }
+
+    /// What each leased page is to its plan, for the manager's victim order (the policy's
+    /// advice codes): the current step's (6, memory.min), a later step's (4, its distance), or
+    /// idle (3, its last use). Atomics only, under the state lock.
+    #[cfg(unix)]
+    fn advise(&self, st: &State, agent: &crate::lease::Agent) {
+        for (ticket, key, _) in self.leased.lock().values() {
+            let (code, value) = match (st.table.class(*key), st.table.distance(*key)) {
+                (Some(Class::W | Class::P), _) => (6, 0),
+                (_, Some((step, pass, block))) => (4, u64::from(step) << 40 | u64::from(pass) << 20 | u64::from(block)),
+                _ => (3, st.table.page(*key).map_or(0, |p| p.last_use)),
+            };
+            let _ = agent.hint(*ticket, code, value);
+        }
     }
 
     /// Leased pages whose fill's ready event completed: the manager hears they landed. Under
