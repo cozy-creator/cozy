@@ -304,7 +304,8 @@ impl Backend for Stream {
         Ok(())
     }
     fn retire(&self, event: Event) {
-        self.events.retired.lock().insert(event.0);
+        let first = self.events.retired.lock().insert(event.0);
+        assert!(first || event == Event::DONE, "PROBE event {} retired twice", event.0);
         self.events.retiring.notify_all();
     }
     fn drain(&self) -> Result<()> {
