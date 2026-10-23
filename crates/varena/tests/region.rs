@@ -107,8 +107,6 @@ fn open() -> (Memory, Arc<Dev>, String) {
     let uuid = format!("region{}-{}", std::process::id(), OPENS.fetch_add(1, SeqCst));
     let g = varena::GpuId { uuid: uuid.clone(), model: "host".into(), memory: card };
     assert!(varena::os::namespace(&format!("test{}-", std::process::id())));
-    let ledger = varena::Ledger::create(&g, None).unwrap();
-    std::mem::forget(ledger);
     let dev = Arc::new(Dev {
         host: HostBackend::new(card),
         instant: AtomicBool::new(true),
@@ -119,7 +117,7 @@ fn open() -> (Memory, Arc<Dev>, String) {
         finished: Mutex::new(Vec::new()),
         waiting: Mutex::new(None),
     });
-    let mem = Memory::open(g, None, Box::new(Shared(dev.clone()))).unwrap();
+    let mem = Memory::open(g, Box::new(Shared(dev.clone()))).unwrap();
     mem.serve_standalone_torch().unwrap();
     (mem, dev, uuid)
 }

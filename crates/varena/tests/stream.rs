@@ -21,6 +21,7 @@ struct Counted(HostBackend, Arc<[AtomicU64; 3]>);
 
 impl Backend for Counted {
     fn capacity(&self) -> u64 { self.0.capacity() }
+    fn headroom(&self) -> u64 { self.0.headroom() }
     fn free(&self) -> varena::Result<u64> { Ok(self.0.free()?.saturating_sub(self.1[2].load(Relaxed))) }
     fn process_used(&self) -> varena::Result<u64> { self.0.process_used() }
     fn opened_context(&self) -> u64 { self.0.opened_context() }
@@ -109,9 +110,8 @@ fn a_running_set_bigger_than_the_card_streams_through_slots() {
     let memory = 8 * REGION_ALIGN;
     let g = GpuId { uuid: format!("stream-{}", std::process::id()), model: "host".into(), memory };
     let _scope = Scope::new(&g.uuid);
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
     let counts = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
-    let mem = Memory::open(g.clone(), None, Box::new(Counted(HostBackend::new(memory), counts.clone()))).unwrap();
+    let mem = Memory::open(g.clone(), Box::new(Counted(HostBackend::new(memory), counts.clone()))).unwrap();
     let blocks = 20;
     let s = mem.load(set(dir.path(), "big", blocks, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/big".into()], passes: 1 }] }).unwrap();
@@ -146,10 +146,8 @@ fn sweep(mem: &Memory, s: varena::SetId, blocks: u32) -> Result<(), String> {
 }
 
 /// The floor is the activations and one block (the verifier's W1). A 10-block set beside a 2-block activation (torch's
-/// segment, claimed through the hook), with 1 to 4 blocks of room beside it.
-/// - Three passes each bind every block with its own bytes, and nothing is refused.
-/// - Then the activation grows into all the room but one block (the hook takes the slots down to one), and a fourth
-///   pass still streams.
+/// blocks, standalone: they count against the same budget), with 1 to 4 blocks of room beside it: three passes each
+/// bind every block with its own bytes, and nothing is refused.
 #[test]
 fn the_floor_is_the_activations_and_one_block() {
     let dir = tempfile::tempdir().unwrap();
@@ -159,31 +157,27 @@ fn the_floor_is_the_activations_and_one_block() {
         let memory = (activation + spare) * REGION_ALIGN;
         let g = GpuId { uuid: format!("floor{spare}-{}", std::process::id()), model: "host".into(), memory };
         let _scope = Scope::new(&g.uuid);
-        let _ledger = varena::Ledger::create(&g, None).unwrap();
         let counts = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
-        let mem = Memory::open(g.clone(), None, Box::new(Counted(HostBackend::new(memory), counts.clone()))).unwrap();
+        let mem = Memory::open(g.clone(), Box::new(Counted(HostBackend::new(memory), counts.clone()))).unwrap();
+        mem.serve_standalone_torch().unwrap();
+        // Torch's blocks of at most 1 MiB share 2 MiB spans: the activation maps exactly its bytes.
+        let torch: Vec<u64> = (0..activation * REGION_ALIGN / MIB).map(|_| mem.torch_alloc(MIB, TORCH, None).unwrap()).collect();
         let s = mem.load(set(dir.path(), &format!("floor{spare}"), blocks, &g.uuid), Level::Ram).unwrap();
         let r = mem.request("r", Plan { steps: vec![Step { sets: vec![format!("pkg@1/floor{spare}")], passes: 1 }] }).unwrap();
-        let segment = |bytes: u64| {
-            let claim = mem.make_room(bytes).map_err(|e| format!("the hook, {bytes} B: {e}"))?;
-            counts[2].fetch_add(bytes, Relaxed);
-            Ok::<_, String>(claim.resident())
-        };
-        let pass = || -> Result<(), String> {
+        let outcome = (0..3).try_for_each(|_| {
             let p = r.pass(s, "fwd|1").map_err(|e| e.to_string())?;
             let swept = sweep(&mem, s, blocks as u32);
             p.end(0);
             swept
-        };
-        let outcome = (|| {
-            let _first = segment(activation * REGION_ALIGN)?;
-            (0..3).try_for_each(|_| pass())?;
-            let _grown = segment((spare - 1) * REGION_ALIGN)?;
-            pass()
-        })();
+        });
         results.push((spare, outcome));
         drop(r);
+        torch.into_iter().for_each(|p| mem.torch_free(p, MIB, TORCH));
     }
     println!("(blocks of room beside the activation, outcome): {results:?}");
     assert!(results.iter().all(|(_, r)| r.is_ok()), "weights were refused above the floor: {results:?}");
 }
+
+const MIB: u64 = 1 << 20;
+/// Torch's stream for the activation's blocks.
+const TORCH: usize = 0x70;

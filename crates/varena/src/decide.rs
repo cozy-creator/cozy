@@ -1,22 +1,20 @@
-//! The order `make_room` takes bytes in, pure (no device, clock, I/O or thread): other sets'
-//! idle pages (those no open plan uses, least recently used first; then those a later step uses,
-//! furthest first); then the current step's own pages and caches nobody holds together, furthest
-//! next use first (Belady), a cache's next use its components' (none: furthest). A tie goes to
-//! the page: it refills from the page cache, a graph recaptures far slower. Never a pinned or
-//! filling page; a page whose release event is pending is taken once it completes. Also what an
-//! ask gives back, what prefetch maps, and admission ([`fits`]) and placement ([`place`]).
+//! The order `make_room` takes a process's own pages in, pure (no device, clock, I/O or thread):
+//! other sets' idle pages (those no open plan uses, least recently used first; then those a
+//! later step uses, furthest first); then the current step's own pages, furthest next use first
+//! (Belady). Never a pinned or filling page; a page whose release event is pending is taken once
+//! it completes. Also what prefetch maps, and the ledger's admission ([`fits`]) and placement
+//! ([`place`]) until the lease manager's replace them.
 
 use std::cmp::Reverse;
 
 use crate::table::{Key, Table, SLOTS};
 
-/// What `make_room` may take, in its order.
+/// An own page `make_room` may take: its bytes, and whether a release event is still pending on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Victim {
-    /// An own page: its bytes, and whether a release event is still pending on it.
-    Page { key: Key, bytes: u64, releasing: bool },
-    /// An own cache: its bytes.
-    Cache { id: u32, bytes: u64 },
+pub struct Victim {
+    pub key: Key,
+    pub bytes: u64,
+    pub releasing: bool,
 }
 
 /// A next use, furthest first: none at all, then the most steps, passes, blocks ahead.
@@ -31,19 +29,13 @@ pub fn victims(t: &Table, keep: &[Key]) -> Vec<Victim> {
     #[cfg(feature = "faults")]
     crate::faults::hit(crate::faults::Point::Decide);
     let pages = || t.pages().filter(|(k, p)| p.mapped && !p.filling && p.pins.is_empty() && !keep.contains(k));
-    let page = |(key, p): (Key, &crate::table::Page)| Victim::Page { key, bytes: p.bytes, releasing: !p.releasing.is_empty() };
+    let page = |(key, p): (Key, &crate::table::Page)| Victim { key, bytes: p.bytes, releasing: !p.releasing.is_empty() };
     let mut idle: Vec<(Key, &crate::table::Page)> = pages().filter(|(k, _)| t.distance(*k).is_none()).collect();
     idle.sort_by_key(|(k, p)| (p.last_use, *k));
     let mut later: Vec<((u32, u32, u32), Key, &crate::table::Page)> = pages().filter_map(|(k, p)| t.distance(k).filter(|d| d.0 > 0).map(|d| (d, k, p))).collect();
     later.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    // The current step's pages and the caches, by (next use, a page before a cache, the oldest).
-    let mut own: Vec<((Far, bool, u64, Key), Victim)> = pages()
-        .filter_map(|(k, p)| t.distance(k).filter(|d| d.0 == 0).map(|d| ((far(Some(d)), false, 0, k), page((k, p)))))
-        .chain(t.caches.iter().filter(|c| c.bytes > 0 && !c.held()).map(|c| {
-            let next = c.sets.iter().filter_map(|s| t.distance((*s, 0))).min();
-            ((far(next), true, c.last_use, (c.id, 0)), Victim::Cache { id: c.id, bytes: c.bytes })
-        }))
-        .collect();
+    // The current step's pages, by (next use, the page).
+    let mut own: Vec<((Far, Key), Victim)> = pages().filter_map(|(k, p)| t.distance(k).filter(|d| d.0 == 0).map(|d| ((far(Some(d)), k), page((k, p))))).collect();
     own.sort_by_key(|(rank, _)| *rank);
     idle.into_iter()
         .chain(later.into_iter().map(|(_, k, p)| (k, p)))
@@ -52,36 +44,9 @@ pub fn victims(t: &Table, keep: &[Key]) -> Vec<Victim> {
         .collect()
 }
 
-/// What an ask from another row takes, up to `bytes`: pages no plan of this row's uses (least
-/// recently used first), then pages only a request waiting on a child call uses (furthest next
-/// use first: a blocked parent's working set goes to its child). Never a cache, never a page in
-/// use or with a release pending (an answer never waits).
-pub fn answer(t: &Table, bytes: u64) -> Vec<Key> {
-    #[cfg(feature = "faults")]
-    crate::faults::hit(crate::faults::Point::Decide);
-    let waiting = |k: Key| t.requests.iter().all(|r| r.yielded || r.distance(k).is_none());
-    // (No use, else the furthest; then least recently used; page; bytes.)
-    type Ordered = (Option<std::cmp::Reverse<(u32, u32, u32)>>, u64, Key, u64);
-    let mut idle: Vec<Ordered> = t
-        .pages()
-        .filter(|(k, p)| p.mapped && !p.filling && p.pins.is_empty() && p.releasing.is_empty() && waiting(*k))
-        .map(|(k, p)| (t.requests.iter().filter_map(|r| r.distance(k)).min().map(std::cmp::Reverse), p.last_use, k, p.bytes))
-        .collect();
-    idle.sort();
-    let mut got = 0;
-    idle.into_iter()
-        .take_while(|(.., b)| {
-            let more = got < bytes;
-            got += b;
-            more
-        })
-        .map(|(_, _, k, _)| k)
-        .collect()
-}
-
-/// What prefetch maps for `req` into free bytes only: the next [`SLOTS`] unmapped blocks of its
+/// What prefetch maps for `req` into `free` bytes only: the next [`SLOTS`] unmapped blocks of its
 /// current step's sets past their cursors, nearest first, while they fit.
-pub fn prefetch(t: &Table, req: u64) -> Vec<Key> {
+pub fn prefetch(t: &Table, req: u64, free: u64) -> Vec<Key> {
     #[cfg(feature = "faults")]
     crate::faults::hit(crate::faults::Point::Decide);
     let Some(r) = t.request(req) else { return vec![] };
@@ -91,7 +56,7 @@ pub fn prefetch(t: &Table, req: u64) -> Vec<Key> {
         .filter_map(|(k, p)| r.distance(k).filter(|d| d.0 == 0 && d.1 == 0 && u64::from(d.2) < SLOTS).map(|d| (d, k, p.bytes)))
         .collect();
     ahead.sort();
-    let mut free = t.free();
+    let mut free = free;
     ahead
         .into_iter()
         .take_while(|(.., b)| {

@@ -44,6 +44,7 @@ struct Hooked {
 
 impl Backend for Hooked {
     fn capacity(&self) -> u64 { self.host.capacity() }
+    fn headroom(&self) -> u64 { self.host.headroom() }
     fn free(&self) -> Result<u64> { self.host.free() }
     fn process_used(&self) -> Result<u64> { self.host.process_used() }
     fn opened_context(&self) -> u64 { self.host.opened_context() }
@@ -94,7 +95,7 @@ fn a_pin_dropped_before_the_binder_waits_wakes_it() {
     let (pending, armed) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
     let hook: Hook = Arc::new(Mutex::new(None));
     let backend = Hooked { host: HostBackend::new(g.memory), next: Default::default(), pending: pending.clone(), armed: armed.clone(), hook: hook.clone(), every: false };
-    let mem = Arc::new(Memory::open(g.clone(), None, Box::new(backend)).unwrap());
+    let mem = Arc::new(Memory::open(g.clone(), Box::new(backend)).unwrap());
     let k = mem.load(spec(dir.path(), &uuid, "kset", Fill::Undeclared), Level::Ram).unwrap();
     let j = mem.load(spec(dir.path(), &uuid, "jset", Fill::Undeclared), Level::Ram).unwrap();
     let l = mem.load(spec(dir.path(), &uuid, "lset", Fill::Undeclared), Level::Ram).unwrap();

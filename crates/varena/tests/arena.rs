@@ -71,6 +71,7 @@ impl Gpu {
 
 impl Backend for Gpu {
     fn capacity(&self) -> u64 { self.host.capacity() }
+    fn headroom(&self) -> u64 { self.host.headroom() }
     fn free(&self) -> varena::Result<u64> { self.host.free() }
     fn process_used(&self) -> varena::Result<u64> { self.host.process_used() }
     fn opened_context(&self) -> u64 { 0 }
@@ -880,10 +881,9 @@ fn memory_routes_a_request_and_audits_its_end() {
     let card = 4 << 30;
     let g = varena::GpuId { uuid: format!("arena{}", std::process::id()), model: "host".into(), memory: card };
     assert!(varena::os::namespace(&format!("test{}-", std::process::id())));
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
     let gpu = Gpu::value(card, true);
     let creates = gpu.creates.clone();
-    let mem = varena::Memory::open(g.clone(), None, Box::new(gpu)).unwrap();
+    let mem = varena::Memory::open(g.clone(), Box::new(gpu)).unwrap();
     let refused = mem.torch_alloc(4096, A, None);
     assert!(matches!(refused, Err(varena::Error::Invalid(_))), "{refused:?}");
     assert_eq!(creates.load(SeqCst), 0, "a page was made before torch was served");
@@ -929,10 +929,9 @@ fn a_leased_memory_allocates_only_from_its_grants() {
     let manager = Manager::create(&host, Some(card), varena::ledger::Mode::Dedicated, open, UnixListener::bind(&socket).unwrap(), Arc::new(Me)).unwrap();
     varena::os::remove_table(&host.uuid);
     let g = varena::GpuId { uuid: format!("arena-leased{pid}"), model: "host".into(), memory: card };
-    let _ledger = varena::Ledger::create(&g, None).unwrap();
     let gpu = Gpu::value(card, true);
     let creates = gpu.creates.clone();
-    let mem = varena::Memory::open(g.clone(), None, Box::new(gpu)).unwrap();
+    let mem = varena::Memory::open(g.clone(), Box::new(gpu)).unwrap();
     // Leasing serves torch from the manager's grants at once: no page made outside the books.
     assert_eq!(mem.lease_over(UnixStream::connect(&socket).unwrap()).unwrap(), None, "the manager refused the lease");
     assert_eq!((manager.holdings().leased, creates.load(SeqCst)), (0, 0), "memory outside the books");

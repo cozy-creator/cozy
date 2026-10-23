@@ -1,15 +1,18 @@
-//! varena: the memory of the processes computing with model weights (design `varena-slim.md`).
+//! varena: the memory of the processes computing with model weights (design `varena-leases.md`).
 //!
-//! [`table`] holds one process's facts and [`decide`] is the one pure decision procedure over
-//! them; [`Memory`] applies its actions in an executor over a [`Backend`] ([`CudaBackend`], or
-//! host pages). [`Ledger`] is the GPU's shared table, run by TensorD or opened by name by a
-//! standalone engine; [`custody`] keeps filled pages across a process's death. Host RAM is the OS
-//! page cache: TensorFS's `io` moves every byte, through its staging.
+//! [`lease`]'s manager, hosted by TensorD, allocates every GPU chunk and leases it to each model
+//! process's agent; [`Memory`] is a process's memory on one device over a [`Backend`]
+//! ([`CudaBackend`], or host pages): its weight pages, [`arena`]'s torch blocks and [`region`]'s
+//! regions, all leased, or standalone within a budget when no manager serves the GPU. [`table`]
+//! holds a process's facts and [`decide`] orders its own pages. Host RAM is the OS page cache:
+//! TensorFS's `io` moves every byte. [`ledger`] and [`custody`] go once the manager's policy
+//! replaces them.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 pub mod arena;
 pub mod backend;
 pub mod cuda;
+#[allow(dead_code, reason = "Memory left the ledger and custody (hard cut); both go with the lease manager's policy (step 4)")]
 pub mod custody;
 pub mod decide;
 #[cfg(unix)]
@@ -18,17 +21,17 @@ pub mod derived;
 pub mod faults;
 pub mod layout;
 pub mod lease;
+#[allow(dead_code, reason = "Memory left the ledger and custody (hard cut); both go with the lease manager's policy (step 4)")]
 pub mod ledger;
 pub mod memory;
 pub mod os;
 pub mod region;
-mod outbox;
 pub mod table;
 
 pub use backend::{Access, Backend, Budget, Event, HostBackend, Physical, Va};
 pub use cuda::CudaBackend;
 pub use ledger::{Grant, HostCall, Ledger, Peak, PhysicalChange, RowStatus, Status};
-pub use memory::{Allocating, CacheId, Claim, Fills, HoldId, MakeRoom, Memory, Moved, Origin, Pass, Pin, PoolId, Ref, Request, Retained, SetId, Stats, StepStats, TorchStats, Yielded};
+pub use memory::{Allocating, Fills, MakeRoom, Memory, Moved, Origin, Pass, Pin, PoolId, Ref, Request, Retained, SetId, Stats, StepStats, TorchStats, Yielded};
 pub use region::{GraphRegion, Kind as RegionKind, Reclaimable, Reclaimed, Record as RegionRecord, Region, RegionPin, Room, Word as GraphWord};
 pub use table::{headroom, Fill, Fingerprint, Level, PartId, Plan, SetSpec, Step};
 

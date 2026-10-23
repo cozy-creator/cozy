@@ -8,7 +8,7 @@ holds the block until the last one dies. Every call releases the GIL; a panic ra
 `VarenaError` with code `INTERNAL`.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Final, Literal
 
 from .._ext import Checkpoint
@@ -114,12 +114,11 @@ class Set:
 
 class Memory:
     @staticmethod
-    def cuda(ordinal: int, limit: int | None = None) -> Memory:
-        """CUDA device `ordinal`'s table by name, this process's row capped at `limit`. Open it
-        before torch initializes CUDA."""
+    def cuda(ordinal: int) -> Memory:
+        """CUDA device `ordinal`'s memory. Open it before torch initializes CUDA."""
 
     @staticmethod
-    def host(gpu: GpuId, limit: int | None = None) -> Memory:
+    def host(gpu: GpuId) -> Memory:
         """Host pages of `gpu.memory` bytes (CPU, MPS) on the table `gpu.uuid` names."""
 
     @property
@@ -131,20 +130,6 @@ class Memory:
     def fill(self, set: int, fill: Fill) -> None:
         """`set`'s current fill (a no-op when unchanged): pages filled under another come back
         fresh."""
-    def cache(self, owner: str, shrink: Callable[[int], int], sets: Sequence[int] = ()) -> int:
-        """Bytes the caller holds that `shrink(want) -> freed` gives back (from varena's thread,
-        never inside torch's allocator): after other sets' idle pages, ranked with the current
-        step's pages by its components' next use (`sets`; none: no declared use), a page first
-        on a tie. A cache owned by a request id ends with it."""
-
-    def cached(self, cache: int, nbytes: int) -> None: ...
-    def hold_cache(self, cache: int) -> int:
-        """Holds `cache` (never shrunk) until `release_cache`; holds nest."""
-
-    def release_cache(self, cache: int, hold: int, stream: int = 0) -> None:
-        """Ends `hold` once the work queued on `stream` so far completes."""
-
-    def uncache(self, cache: int) -> None: ...
     def request(self, id: str, plan: list[tuple[list[str], int]], idle: bool = False) -> Request:
         """Opens request `id`; `plan` is its steps, each `(set names, passes)`. An `idle` one (a
         capture or warm-up beside others' work) takes free bytes only: it evicts nothing."""
@@ -156,8 +141,8 @@ class Memory:
         waits on the fill, and tensors made from the pin are consumed on it only. With `evict`
         false it maps into free bytes only, `Exhausted` at once when they are short."""
 
-    def free(self) -> int:
-        """The row's free bytes now: its budget less its context, pages, mappings and segments."""
+    def classes(self) -> list[int]:
+        """Mapped bytes by class (F, O, S, N, D, W, P)."""
 
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
@@ -168,7 +153,7 @@ class Memory:
 
     def serve_standalone(self) -> None:
         """Serves torch's allocations standalone, before any: from the device's free bytes less
-        twice the driver headroom. A leased Memory's are served by its lease."""
+        the backend's reserve. A leased Memory's are served by its lease."""
 
     def region(self, owner: str, kind: str, sets: Sequence[int] = (), spill: bool = True) -> Region:
         """A long-lived intermediate's region: kind kv, latent, conditioning, derived or workspace."""

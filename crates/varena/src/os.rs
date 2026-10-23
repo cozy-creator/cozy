@@ -45,6 +45,7 @@ pub(crate) fn unlink(name: &str) {
     platform::memory::unlink(&named(name));
 }
 
+#[allow(dead_code, reason = "Memory left the ledger and custody (hard cut); both go with the lease manager's policy (step 4)")]
 pub(crate) fn tid() -> u32 {
     platform::memory::thread_id()
 }
@@ -126,6 +127,7 @@ pub(crate) fn incoming(listener: Listener) -> impl Iterator<Item = Stream> {
 
 /// Serves every connection at once until `stop`: each one's message answered with `answer`'s
 /// bytes. Peers not accepted are dropped.
+#[allow(dead_code, reason = "Memory left the ledger and custody (hard cut); both go with the lease manager's policy (step 4)")]
 pub(crate) fn serve_all(listener: Listener, stop: &AtomicBool, answer: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static) {
     platform::memory::serve_all(listener, stop, accepted, answer);
 }

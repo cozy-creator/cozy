@@ -2,7 +2,6 @@
 //! over each device's Memory (design/varena-leases.md §11). No Python and no GIL. Every entry
 //! catches a panic: an allocation refuses with its reason, anything else logs and returns.
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -12,16 +11,6 @@ use varena::{Memory, PoolId};
 
 /// The Memory serving each CUDA device's torch allocations, from `Memory.open` on.
 static SERVING: RwLock<BTreeMap<i32, Arc<Memory>>> = RwLock::new(BTreeMap::new());
-
-thread_local! {
-    static INSIDE: Cell<bool> = const { Cell::new(false) };
-}
-
-/// This thread is inside torch's allocator: a cache's Python shrink, which frees through torch,
-/// would re-enter it, so none runs here.
-pub fn inside() -> bool {
-    INSIDE.with(Cell::get)
-}
 
 /// `memory` serves torch's allocations on CUDA device `device` from now on.
 pub fn serve(device: i32, memory: Arc<Memory>) {
@@ -53,12 +42,10 @@ fn write(why: *mut c_char, len: usize, text: &str) {
 /// `c10::OutOfMemoryError`). `routed`: the stream's capture routes to pool `(pool_a, pool_b)`.
 #[no_mangle]
 pub extern "C" fn varena_agent_alloc(bytes: u64, device: c_int, stream: usize, routed: c_int, pool_a: u64, pool_b: u64, why: *mut c_char, why_len: usize) -> u64 {
-    let outer = INSIDE.with(|i| i.replace(true));
     let served = catch_unwind(AssertUnwindSafe(|| {
         let memory = serving(device).ok_or_else(|| format!("varena: no Memory is open on CUDA device {device}: open it before any torch CUDA allocation"))?;
         memory.torch_alloc(bytes, stream, (routed != 0).then_some(PoolId(pool_a, pool_b))).map_err(|e| e.to_string())
     }));
-    INSIDE.with(|i| i.set(outer));
     match served.unwrap_or_else(|_| Err("varena: the allocator panicked".into())) {
         Ok(ptr) => ptr,
         Err(reason) => {

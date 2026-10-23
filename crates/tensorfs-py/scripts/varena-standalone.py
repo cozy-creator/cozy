@@ -7,16 +7,15 @@ under `mem.request`:
   - with room for it all, against the plain model; held bound (a CUDA graph's hold); a direct
     child's forward is its own pass, keyed by its entry; a fill-identity change sheds a hold and
     bakes anew; two threads' passes measured apart;
-  - in two processes on one table, the idle one making room for the other;
   - with a capacity below its size, so it streams, its outputs the uncapped run's and its fills
     reported against `tensorfs.ceiling`; and so with a declared fill on fresh pages.
 First, the compiled `tensorfs._ext.varena` matches its stub name for name.
 
     python scripts/varena-standalone.py
 Runs on the CPU over host pages (each run names its own tables), or on GPU 0 when one is visible:
-its capacity is lowered by the standalone limit, and the uncapped GPU run is the reference. A
-CUDA Memory is torch's allocator for its process's life, so on a GPU each phase runs in a
-process of its own.
+the ample phase alone (a GPU's budget is TensorD's lease, or its free bytes at open; capped GPU
+proofs run through `cozy run`). A CUDA Memory is torch's allocator for its process's life, so
+on a GPU each phase runs in a process of its own.
 """
 
 from __future__ import annotations
@@ -273,22 +272,8 @@ def shim() -> None:
 
 
 def opened(table: str, capacity: int) -> Memory:
-    """A standalone memory of `capacity` bytes: host pages on table `table`, or GPU 0's table
-    lowered to it."""
-    if CUDA:
-        return Memory.open(0, limit=capacity)
-    return Memory.open(GpuId(table, "cpu", capacity))
-
-
-def child(store: str, table: str, capacity: int, reference: str) -> int:
-    """The second process: two passes, so a block it ran has a declared later use (D), which
-    varena keeps over another process's idle pages (N): the idle first gives room."""
-    _, ck = build(Path(store))
-    mem = opened(table, capacity)
-    # A set of its own: the first's kept pages of the same set would be imported, shared, not made room for.
-    stats, _ = run(mem, loaded(ck, mem, release="child"), torch.load(reference), "child", SAME)
-    print(json.dumps({"child origins": [r.origin for r in stats.trace], "evicted": stats.evicted}), flush=True)
-    return 0 if all(results) else 1
+    """A standalone memory: host pages of `capacity` bytes on table `table`, or GPU 0's."""
+    return Memory.open(0) if CUDA else Memory.open(GpuId(table, "cpu", capacity))
 
 
 def gone(memory: weakref.ref[Memory], phase: str) -> None:
@@ -436,8 +421,8 @@ def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> 
 
 def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tuple[list[torch.Tensor], list[int], int, int, weakref.ref[Memory]]:
     """Room for it all: against the plain model, held, entries, identity, concurrency, attempts.
-    Returns the reference outputs, the region spans, the measured room, the base (contexts and
-    foreign bytes) and the memory."""
+    Returns the reference outputs, the region spans, the measured room, the most its request
+    held at a pass end (pages and blocks) and the memory."""
     expected = [forward(plain, torch.device("cpu"), n) for n in range(2)]
     mem = Memory.open(0) if CUDA else opened(f"{tag}-ample", 1 << 31)
     again = Memory.open(0) if CUDA else opened(f"{tag}-ample", 1 << 31)
@@ -455,15 +440,12 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     binding, pins = model.retain(), native.pins_held()
     check("retained: a model just run is resident (a read: no pin, no fill)", binding.resident() and native.pins_held() == pins, (pins, native.pins_held()))
     binding.close()
-    serving = mem.cache("ample graph pool", lambda want: 0, sets=unet)  # a graph pool names its component
-    check("cache: one serving a loaded model registers with its set", isinstance(serving, adapter.Cache), serving)
-    serving.close()
     free = model.hold(free_only=True)
     check("hold: free only, a model that fits beside what is resident is held", free is not None and not isinstance(unet.conv_in.weight, Placeholder), free)
     if free is not None:
         free.release()
     keys: list[str] = []
-    with mem.request("entries", plan=[unet, unet]) as r:
+    with mem.request("entries", plan=[unet, unet]):
         def seen(*_: object) -> None:
             keys.append(adapter._pass.get().key.split("|")[0])
 
@@ -476,10 +458,6 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     diff = (got - plain.conv_in(x.cpu()).detach()).abs().max().item()
     check(f"entries: a direct child's forward runs bound (max diff {diff:.2e})", diff <= ACROSS, diff)
     check("entries: each entry is its own pass key", keys == ["conv_in", ""], keys)
-    steps = r.stats().steps
-    # The capacity varena ran a step against is the card less contexts (grown by now: cuDNN,
-    # cuBLAS) and foreign bytes; the limits later are that much plus what they mean to hold.
-    base = mem.gpu.memory - min(step.capacity for step in steps)
 
     shed: list[bool] = []
     scale = Scale(2)
@@ -493,25 +471,7 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     if CUDA:
         costs(mem, unet, plain)
     spans = model.set.spans
-    return reference, spans, stats.compute, base, weakref.ref(mem)
-
-
-def two(ck: tensorfs.Checkpoint, store: Path, table: str, capacity: int, reference: list[torch.Tensor]) -> tuple[int, weakref.ref[Memory]]:
-    """Two processes on one table, the idle first making room for the second. Returns the most
-    the request held at a pass end (pages and segments) and the memory."""
-    saved = store.parent / "reference.pt"
-    torch.save(reference, saved)  # the child runs two passes: its run blocks have a declared later use
-    mem = opened(table, capacity)
-    unet = loaded(ck, mem)
-    run(mem, unet, reference[:1], "first", SAME)
-    stats, _ = run(mem, unet, reference[:1], "first warm", SAME)
-    check("two processes: alone, the first reads nothing again", all(r.origin == "hit" for r in stats.trace), [r.origin for r in stats.trace])
-    done = subprocess.run([sys.executable, __file__, "child", str(store), table, str(capacity), str(saved)], capture_output=True, text=True)
-    print(done.stdout, done.stderr, sep="", end="", flush=True)
-    check("two processes: the second completes beside the idle first", done.returncode == 0, done.returncode)
-    stats, _ = run(mem, unet, reference[:1], "first again", SAME)
-    check("two processes: the first gave room and reads again", any(r.origin != "hit" for r in stats.trace), [r.origin for r in stats.trace])
-    return stats.peak, weakref.ref(mem)
+    return reference, spans, stats.compute, stats.peak, weakref.ref(mem)
 
 
 def capped(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, capacity: int, base: int, spans: list[int], reference: list[torch.Tensor], ceiling: tensorfs.Ceiling) -> weakref.ref[Memory]:
@@ -538,33 +498,6 @@ def capped(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, cap
     for derived in (False, True):
         escapes(mem, unet, plain, reference, derived)
     off_forward(mem, unet, plain)
-    return weakref.ref(mem)
-
-
-def held_caches(tag: str) -> weakref.ref[Memory]:
-    """A request's end asks the caches it owns for everything, unless one is held (a graph pool
-    a replay still reads)."""
-    mem = opened(f"{tag}-held", 1 << 31)
-    asked: list[tuple[str, int]] = []
-    errors: list[object] = []
-    hook, sys.unraisablehook = sys.unraisablehook, errors.append
-
-    def answer(name: str, freed: int) -> Callable[[int], int]:
-        return lambda want: (asked.append((name, want)), freed)[1]
-
-    try:
-        held = mem.cache("held", answer("held", 1 << 20))
-        held.cached(4 << 20)
-        with held.holding():
-            with mem.request("held"):
-                pass
-        mem.cache("whole", answer("whole", 4 << 20)).cached(4 << 20)
-        with mem.request("whole"):
-            pass
-    finally:
-        sys.unraisablehook = hook
-    check("held: a held cache is not shrunk at its request's end", "held" not in dict(asked), asked)
-    check("held: an unheld one is asked for everything", asked == [("whole", (1 << 64) - 1)] and not errors, (asked, errors))
     return weakref.ref(mem)
 
 
@@ -643,25 +576,19 @@ def baked(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, table: str, capa
     return weakref.ref(mem)
 
 
-PHASES = ("ample", "overhead", "held caches", "two processes", "short", "fill")
+PHASES = ("ample", "overhead", "short", "fill")
 
 
 def phase(name: str, state: dict[str, object], plain: UNet2DConditionModel, ck: tensorfs.Checkpoint) -> weakref.ref[Memory]:
     """One phase, from what the phases before it measured (`state`), adding its own."""
     store, tag = Path(state["store"]), state["tag"]
     if name == "ample":
-        state["reference"], state["spans"], state["room"], state["base"], memory = ample(ck, plain, tag)
+        state["reference"], state["spans"], state["room"], state["w"], memory = ample(ck, plain, tag)
         return memory
     if name == "overhead":
         return overhead(ck, plain, tag)
-    if name == "held caches":
-        return held_caches(tag)
-    spans, base, reference = state["spans"], state["base"], state["reference"]
-    if name == "two processes":
-        # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.
-        capacity = base * (2 if CUDA else 1) + sum(spans) * 3 // 2 + state["room"]
-        state["w"], memory = two(ck, store, f"{tag}-two", capacity, reference)
-        return memory
+    # Host pages carry no context: a phase's capacity is what it means to hold.
+    spans, base, reference = state["spans"], 0, state["reference"]
     # One block below the working set varena measured: it must stream, with room to spare for
     # what streaming needs (the pass's room, common and its slots).
     capacity = base + state["w"] - max(sorted(spans[1:]))
@@ -686,7 +613,7 @@ def main() -> int:
     shim()
     store = Path(tempfile.mkdtemp(prefix="varena-standalone-")) / "store"
     state: dict[str, object] = {"store": str(store), "tag": f"varena-standalone-{os.getpid()}"}
-    phases = [p for p in PHASES if not (CUDA and p == "overhead")]
+    phases = ["ample"] if CUDA else list(PHASES)
     if CUDA:
         saved = store.parent / "state.pt"
         torch.save(state, saved)
@@ -705,6 +632,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     threading.Thread(target=watch, daemon=True).start()
-    if sys.argv[1:2] == ["child"]:
-        sys.exit(child(*sys.argv[2:4], int(sys.argv[4]), sys.argv[5]))
     sys.exit(phase_process(*sys.argv[2:4]) if sys.argv[1:2] == ["phase"] else main())

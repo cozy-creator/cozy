@@ -1,6 +1,6 @@
 //! A pass's cost on the hot path (S3's census: 938 µs per pass on an L40S against 14 µs on CPU):
-//! a pass start and end read varena's own accounting and the ledger's rows, never the device's
-//! per-process figure (NVML) or its free bytes. Each case prints `PASSCOST <backend> <µs per
+//! a pass start and end read varena's own accounting, never the device's per-process figure
+//! (NVML) or its free bytes. Each case prints `PASSCOST <backend> <µs per
 //! pass> <driver calls per pass>`; the native one is for a card (`--ignored`).
 
 use std::collections::BTreeMap;
@@ -32,6 +32,7 @@ impl<B> Counted<B> {
 
 impl<B: Backend> Backend for Counted<B> {
     fn capacity(&self) -> u64 { self.inner.capacity() }
+    fn headroom(&self) -> u64 { self.inner.headroom() }
     fn free(&self) -> Result<u64> { self.count("free"); self.inner.free() }
     fn process_used(&self) -> Result<u64> { self.count("process_used"); self.inner.process_used() }
     fn opened_context(&self) -> u64 { self.inner.opened_context() }
@@ -77,13 +78,12 @@ fn set(dir: &std::path::Path, uuid: &str, pages: u64) -> SetSpec {
     SetSpec { name: "m".into(), layout: Arc::new(layout), source: Arc::new(source), fingerprint }
 }
 
-/// Opens `g` over `backend` beside its ledger (shared mode, as under TensorD), loads a 2-page set
+/// Opens `g` over `backend` (standalone), loads a 2-page set
 /// and opens a request; then times `PASSES` passes of it, each a start and an end, a bind of
 /// each block between. Returns µs per pass (start and end alone) and the device calls per pass.
 fn passes<B: Backend + 'static>(backend: B, g: &GpuId) -> (f64, BTreeMap<&'static str, f64>) {
     let calls = Arc::new(Mutex::new(BTreeMap::new()));
-    let _ledger = varena::Ledger::create(g, None).unwrap();
-    let mem = Memory::open(g.clone(), None, Box::new(Counted { inner: backend, calls: calls.clone() })).unwrap();
+    let mem = Memory::open(g.clone(), Box::new(Counted { inner: backend, calls: calls.clone() })).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let m = mem.load(set(dir.path(), &g.uuid, 2), Level::Gpu).unwrap();
     let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["m".into()], passes: 1 }] }).unwrap();

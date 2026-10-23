@@ -573,8 +573,8 @@ impl Drop for GraphRegion {
 /// What a cut site sizes from (§11; S4's plan §5).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Room {
-    /// Allocatable now: the manager's free bytes net of the reserved pool (standalone: the device's
-    /// free bytes less H), plus this process's free list (its idle spans).
+    /// Allocatable now: the manager's free bytes net of the reserved pool (standalone: the budget
+    /// left), plus this process's free list (its idle spans).
     pub free: u64,
     /// Reclaimable without touching the step's sets: the manager's figure for other tenants and its
     /// page cache, plus this process's unpinned regions and its idle pages outside the step's sets.
@@ -676,10 +676,7 @@ impl Memory {
             })
             .collect();
         let regions: u64 = torch.as_ref().map_or(0, |t| unpinned.iter().map(|id| t.mapped_by(Owner::Region(*id))).sum());
-        let (free, others) = match self.figures() {
-            Some(f) => (f.free, f.revocable),
-            None => (self.standalone_free(), 0),
-        };
+        let (free, others) = (self.spare(), self.figures().map_or(0, |f| f.revocable));
         Room { free: free + float, cold: others + regions + idle_pages, warm, granularity: self.granularity(), floor: SLOTS * largest }
     }
 }

@@ -40,7 +40,7 @@ from . import Request as NativeRequest
 from . import Set
 
 __all__ = [
-    "Bind", "Cache", "Declared", "Exhausted", "Filling", "GpuId", "Hold", "Level", "Memory", "Model",
+    "Bind", "Declared", "Exhausted", "Filling", "GpuId", "Hold", "Level", "Memory", "Model",
     "NotRegistered", "GraphRegion", "Placeholder", "Region", "Request", "Room", "Stats", "Unbound", "VarenaError", "Weights", "blocks_of",
 ]
 
@@ -478,7 +478,7 @@ def _lease(native: Native, ns: int) -> str | None:
 
 
 class Memory:
-    """This process's memory on one device: its models, caches and requests."""
+    """This process's memory on one device: its models, regions and requests."""
 
     def __init__(self, native: Native, device: torch.device) -> None:
         self.native, self.device = native, device
@@ -496,15 +496,15 @@ class Memory:
         self.crossed = 0
 
     @classmethod
-    def open(cls, gpu: int | str | torch.device | GpuId = 0, *, limit: int | None = None, leases: int | None = None) -> Memory:
-        """The device's memory: its table by name, this process's row capped at `limit`. On CUDA,
-        with `leases` (TensorD's namespace, from its Start), its pages and torch's are leased
-        from TensorD's manager (`_lease`); without, or with no compatible manager, torch's come
-        from the device's free bytes less twice the driver headroom. Then varena becomes torch's
-        only allocator (`_install`), so open it before any torch CUDA call. CPU and MPS use host pages on the machine's table `host` (its
-        RAM); a `GpuId` names a host table. A process has one Memory per device: opening the
-        device again returns it, and a CUDA device's lives as long as the process (torch's blocks
-        are its)."""
+    def open(cls, gpu: int | str | torch.device | GpuId = 0, *, leases: int | None = None) -> Memory:
+        """The device's memory. On CUDA, with `leases` (TensorD's namespace, from its Start), its
+        pages and torch's are leased from TensorD's manager (`_lease`); without, or with no
+        compatible manager, it runs standalone on the device's free bytes at open less the
+        backend's reserve. Then varena becomes torch's only allocator (`_install`), so open it
+        before any torch CUDA call. CPU and MPS use host pages of the machine's RAM; a `GpuId`
+        names a host table and its size. A process has one Memory per device: opening the device
+        again returns it, and a CUDA device's lives as long as the process (torch's blocks are
+        its)."""
         device = torch.device("cpu") if isinstance(gpu, GpuId) else torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
         if device.type == "cuda":
             device = torch.device("cuda", device.index or 0)
@@ -513,12 +513,12 @@ class Memory:
             memory = _memories.get(key)
             if memory is None:  # one Memory per device and process: a second open is the first
                 if isinstance(gpu, GpuId):
-                    native = Native.host(gpu, limit)
+                    native = Native.host(gpu)
                 elif device.type == "cuda":
-                    native = Native.cuda(device.index or 0, limit)
+                    native = Native.cuda(device.index or 0)
                 else:
                     ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-                    native = Native.host(GpuId("host", device.type, ram), limit)
+                    native = Native.host(GpuId("host", device.type, ram))
                 memory = cls(native, device)
                 if device.type == "cuda":
                     if leases is not None:
@@ -651,14 +651,10 @@ class Memory:
         many = models if isinstance(models, Sequence) else [models]
         return [(m if isinstance(m, Model) else self.models[m]).id for m in many]
 
-    def cache(self, owner: str, shrink: Callable[[int], int], sets: nn.Module | Model | Sequence[nn.Module | Model] = ()) -> Cache:
-        """Bytes the caller holds that `shrink(want) -> freed` gives back when varena makes room
-        (never while held: `Cache.holding`): after other sets' idle pages, ranked with the
-        current step's pages by the next use of the loaded models it serves (`sets`: a graph
-        pool names its component; none, no declared use). A cache owned by a request id ends
-        with it."""
-        served = [sets] if isinstance(sets, (nn.Module, Model)) else list(sets)
-        return Cache(self, self.native.cache(owner, shrink, [(m if isinstance(m, Model) else self.models[m]).id for m in served]))
+    def classes(self) -> dict[str, int]:
+        """Mapped bytes by class: F (fixed), O (other's), S (speculative), N (no declared use),
+        D (declared later use), W (working), P (pinned)."""
+        return dict(zip("FOSNDWP", self.native.classes(), strict=True))
 
     def stats(self) -> Stats | None:
         """The record of the request that ended last."""
@@ -995,32 +991,6 @@ class GraphRegion:
     def close(self) -> None:
         """Drops its graphs' pins and its use of the pool."""
         self.native.close()
-
-
-class Cache:
-    """Bytes held outside a forward (KV, graph pools); `cached` reports what it holds now."""
-
-    def __init__(self, memory: Memory, id: int) -> None:
-        self.memory, self.id = memory, id
-
-    def cached(self, nbytes: int) -> None:
-        self.memory.native.cached(self.id, nbytes)
-
-    @contextmanager
-    def holding(self, stream: torch.cuda.Stream | None = None) -> Iterator[None]:
-        """Never shrunk inside the block (a graph replay and its lent outputs' readers); after
-        it, until the work queued on `stream` (the current stream by default) completes."""
-        memory = self.memory
-        if stream is None and memory.cuda:
-            stream = torch.cuda.current_stream(memory.device)
-        hold = memory.native.hold_cache(self.id)
-        try:
-            yield
-        finally:
-            memory.native.release_cache(self.id, hold, stream.cuda_stream if stream is not None else 0)
-
-    def close(self) -> None:
-        self.memory.native.uncache(self.id)
 
 
 # ------------------------------------------------------------------------------ helpers

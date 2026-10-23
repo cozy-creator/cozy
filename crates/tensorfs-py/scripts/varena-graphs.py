@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real-CUDA proof of cached graph addresses across physical weight eviction.
 
-Runs through varena-rental.py. A seeded linear network is larger than the imposed VRAM cap;
+Runs through varena-rental.py. A seeded linear network larger than CAP, evicted explicitly;
 its segments each use an explicit complete weight binding and capture into the device's one
 Torch graph pool, mapped before each capture (`Memory.prepare_pool`). The same CUDAGraph
 objects replay after backing eviction/refill. No compile, tuning,
@@ -44,7 +44,7 @@ def main():
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
-    mem = Memory.open(0, limit=CAP)
+    mem = Memory.open(0)
     print(json.dumps({"torch": torch.__version__, "tensorfs": tensorfs.__version__, "gpu": torch.cuda.get_device_name(), "cap": CAP, "native_sha256": hashlib.sha256(Path(tensorfs._ext.__file__).read_bytes()).hexdigest()}), flush=True)
     torch.manual_seed(19)
     plain = Network().eval()

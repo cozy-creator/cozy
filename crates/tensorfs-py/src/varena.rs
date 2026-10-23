@@ -13,7 +13,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use tensorfs::format::Body;
 use varena::layout::Layout;
-use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Memory, Origin, Pass, Pin, Plan, RegionKind, Request, Retained, SetId, SetSpec, Step};
+use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Origin, Pass, Pin, Plan, RegionKind, Request, Retained, SetId, SetSpec, Step};
 
 use crate::store::PyCheckpoint;
 
@@ -52,14 +52,6 @@ fn caught<T>(f: impl FnOnce() -> varena::Result<T>) -> varena::Result<T> {
 /// `f` off the GIL, its panic an `INTERNAL` error.
 fn detached<T: Send>(py: Python<'_>, gpu: &str, f: impl Send + FnOnce() -> varena::Result<T>) -> PyResult<T> {
     py.detach(|| caught(f)).map_err(|e| error(py, gpu, e))
-}
-
-/// A Python callback's byte count, from varena's thread; its error is reported, never raised.
-fn call<'py>(py: Python<'py>, f: &Py<PyAny>, args: impl pyo3::call::PyCallArgs<'py>) -> u64 {
-    f.call1(py, args).and_then(|r| r.extract::<u64>(py)).unwrap_or_else(|e| {
-        e.write_unraisable(py, None);
-        0
-    })
 }
 
 /// `detached` for a call with nothing to return.
@@ -344,12 +336,11 @@ impl PyMemory {
         self.memory.as_ref().unwrap_or_else(|| unreachable!())
     }
 
-    /// `gpu`'s table by name, this opener's row capped at `limit`; the backend opens first.
-    fn open(py: Python<'_>, limit: Option<u64>, dl: (i32, i32), backend: impl Send + FnOnce() -> varena::Result<(GpuId, Box<dyn Backend>)>) -> PyResult<Self> {
+    /// `gpu`'s memory; the backend opens first.
+    fn open(py: Python<'_>, dl: (i32, i32), backend: impl Send + FnOnce() -> varena::Result<(GpuId, Box<dyn Backend>)>) -> PyResult<Self> {
         let (gpu, memory) = detached(py, "", || {
             let (gpu, backend) = backend()?;
-            let grant = Grant::open(&gpu, limit)?;
-            Ok((gpu.clone(), Memory::open(gpu, Some(grant), backend)?))
+            Ok((gpu.clone(), Memory::open(gpu, backend)?))
         })?;
         let gpu = PyGpuId { uuid: gpu.uuid, model: gpu.model, memory: gpu.memory };
         Ok(PyMemory { memory: Some(Arc::new(memory)), gpu, dl })
@@ -358,12 +349,10 @@ impl PyMemory {
 
 #[pymethods]
 impl PyMemory {
-    /// CUDA device `ordinal`'s table by name, this process's row capped at `limit`. Open it
-    /// before torch initializes CUDA.
+    /// CUDA device `ordinal`'s memory. Open it before torch initializes CUDA.
     #[staticmethod]
-    #[pyo3(signature = (ordinal, limit = None))]
-    fn cuda(py: Python<'_>, ordinal: i32, limit: Option<u64>) -> PyResult<Self> {
-        let memory = PyMemory::open(py, limit, (KDL_CUDA, ordinal), || {
+    fn cuda(py: Python<'_>, ordinal: i32) -> PyResult<Self> {
+        let memory = PyMemory::open(py, (KDL_CUDA, ordinal), || {
             let backend = CudaBackend::open(ordinal)?;
             Ok((backend.gpu()?, Box::new(backend) as Box<dyn Backend>))
         })?;
@@ -434,7 +423,7 @@ impl PyMemory {
     }
 
     /// Serves torch's allocations standalone, before any is made: from the device's own free
-    /// bytes less twice the driver headroom (no compatible manager, or none asked for). A leased
+    /// bytes less the backend's reserve (no compatible manager, or none asked for). A leased
     /// Memory's are served by its lease.
     fn serve_standalone(&self, py: Python<'_>) -> PyResult<()> {
         detached(py, &self.gpu.uuid, || self.memory().serve_standalone_torch().map(drop))
@@ -442,10 +431,9 @@ impl PyMemory {
 
     /// Host pages of `gpu.memory` bytes (CPU, MPS), on the table `gpu.uuid` names.
     #[staticmethod]
-    #[pyo3(signature = (gpu, limit = None))]
-    fn host(py: Python<'_>, gpu: PyGpuId, limit: Option<u64>) -> PyResult<Self> {
+    fn host(py: Python<'_>, gpu: PyGpuId) -> PyResult<Self> {
         let id = GpuId { uuid: gpu.uuid, model: gpu.model, memory: gpu.memory };
-        PyMemory::open(py, limit, (KDL_CPU, 0), || Ok((id.clone(), Box::new(HostBackend::new(id.memory)) as Box<dyn Backend>)))
+        PyMemory::open(py, (KDL_CPU, 0), || Ok((id.clone(), Box::new(HostBackend::new(id.memory)) as Box<dyn Backend>)))
     }
 
     /// Registers `set` and brings it to `level`; returns its id.
@@ -462,40 +450,6 @@ impl PyMemory {
     fn fill(&self, py: Python<'_>, set: u32, fill: PyRef<'_, PyFill>) -> PyResult<()> {
         let fill = fill_of(&fill);
         done(py, &self.gpu.uuid, || self.memory().fill(SetId(set), fill))
-    }
-
-    /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id. Its next
-    /// use is its components' (`sets`, a graph pool's component; none: no declared use).
-    #[pyo3(signature = (owner, shrink, sets = Vec::new()))]
-    fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>, sets: Vec<u32>) -> PyResult<u32> {
-        // Inside torch's allocator a shrink would free through it, re-entering it: none runs there.
-        let shrink = move |want: u64| {
-            if crate::agent::inside() {
-                return 0;
-            }
-            Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0)
-        };
-        let sets: Vec<SetId> = sets.into_iter().map(SetId).collect();
-        detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, &sets, shrink))).map(|c| c.0)
-    }
-
-    fn cached(&self, py: Python<'_>, cache: u32, nbytes: u64) -> PyResult<()> {
-        done(py, &self.gpu.uuid, || self.memory().cached(varena::CacheId(cache), nbytes))
-    }
-
-    /// Holds `cache` (P, never shrunk) until `release_cache`; holds nest.
-    fn hold_cache(&self, py: Python<'_>, cache: u32) -> PyResult<u64> {
-        detached(py, &self.gpu.uuid, || Ok(self.memory().hold_cache(varena::CacheId(cache)).0))
-    }
-
-    /// Ends `hold` once the work queued on `stream` (a `CUstream`, 0 the default) so far completes.
-    #[pyo3(signature = (cache, hold, stream = 0))]
-    fn release_cache(&self, py: Python<'_>, cache: u32, hold: u64, stream: usize) -> PyResult<()> {
-        done(py, &self.gpu.uuid, || self.memory().release_cache(varena::CacheId(cache), varena::HoldId(hold), stream))
-    }
-
-    fn uncache(&self, py: Python<'_>, cache: u32) -> PyResult<()> {
-        done(py, &self.gpu.uuid, || self.memory().uncache(varena::CacheId(cache)))
     }
 
     /// Opens request `id` with its plan: `(set names, passes)` per step. An `idle` one (a
@@ -528,10 +482,9 @@ impl PyMemory {
         detached(py, &self.gpu.uuid, || Ok(self.memory().context_measurable()))
     }
 
-    /// The row's free bytes now: its budget less its context, pages, mappings and segments
-    /// (lock-free, the last published figure).
-    fn free(&self) -> u64 {
-        self.memory().free()
+    /// Mapped bytes by class (F, O, S, N, D, W, P).
+    fn classes(&self) -> [u64; 7] {
+        self.memory().classes()
     }
 
     /// The record of the request that ended last.
