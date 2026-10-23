@@ -1024,6 +1024,317 @@ fn the_hooks_driver_calls_never_wait_behind_another_threads_free() {
     step!();
 }
 
+/// A segment path's alloc and free, each timed: on an idle device, then while a spin kernel runs on another stream.
+/// `alloc` makes one segment of `bytes` and returns what `free` takes.
+fn segment_path(alloc: &dyn Fn(usize) -> u64, free: &dyn Fn(u64), bytes: usize, stream: usize) -> String {
+    // A pass's worth of segments: round 6's hook case made 63.
+    const SEGMENTS: usize = 64;
+    let run = || {
+        let (mut a, mut f) = (vec![], vec![]);
+        for _ in 0..SEGMENTS {
+            let t = std::time::Instant::now();
+            let ptr = alloc(bytes);
+            a.push(t.elapsed());
+            let t = std::time::Instant::now();
+            free(ptr);
+            f.push(t.elapsed());
+        }
+        (a, f)
+    };
+    let figures = |(a, f): &(Vec<std::time::Duration>, Vec<std::time::Duration>)| {
+        let mean = |v: &[std::time::Duration]| v.iter().sum::<std::time::Duration>() / v.len() as u32;
+        let max = |v: &[std::time::Duration]| v.iter().max().copied().unwrap_or_default();
+        format!("alloc mean {:?} max {:?}, free mean {:?} max {:?}", mean(a), max(a), mean(f), max(f))
+    };
+    let idle = run();
+    let total: std::time::Duration = idle.0.iter().chain(&idle.1).sum();
+    // Ten times the idle sequence: every call lands while the kernel runs.
+    let spin = total * 10;
+    let launched = std::time::Instant::now();
+    assert_eq!(launch(c"spin", &[spin.as_nanos() as u64], stream), cuda::SUCCESS);
+    let busy = run();
+    let inside = launched.elapsed() < spin;
+    format!("idle {}; beside a {spin:?} kernel {}{}", figures(&idle), figures(&busy), if inside { "" } else { " (the calls outlasted the kernel: some waited for it)" })
+}
+
+/// What decides S1's segment path, and what varena does not account for (the lead, after round 6):
+/// - each path's alloc and free, a pass's worth of 2 MiB segments, on an idle device and beside a running kernel:
+///   cuMemAlloc/cuMemFree (today's), varena's own pages (cuMemCreate + cuMemMap / cuMemUnmap + cuMemRelease), and the
+///   stream-ordered cuMemAllocAsync/cuMemFreeAsync;
+/// - this process's bytes as NVML sees them less what its ledger row accounts for (context, classes, torch's), with a set
+///   resident and idle, then mid-run (a pass, every block pinned, a kernel running).
+///
+/// A measurement: it prints, and fails only when a call fails.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn segment_paths_and_the_unaccounted_bytes() {
+    let (b, g, uuid) = card("segments");
+    step!();
+    let ledger = Ledger::create(&g, None).unwrap();
+    step!();
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    let d = cuda::driver().unwrap();
+    let busy = cuda::Stream::new(0).unwrap();
+    let own = cuda::Stream::new(0).unwrap();
+    let bytes = REGION_ALIGN as usize;
+    let plain = segment_path(
+        &|n| {
+            let mut ptr = 0;
+            assert_eq!(unsafe { (d.mem_alloc)(&mut ptr, n) }, cuda::SUCCESS);
+            ptr
+        },
+        &|ptr| assert_eq!(unsafe { (d.mem_free)(ptr) }, cuda::SUCCESS),
+        bytes,
+        busy.raw(),
+    );
+    busy.drain().unwrap();
+    step!();
+    let va = b.reserve(bytes as u64).unwrap();
+    let held = parking_lot::Mutex::new(None::<Physical>);
+    let pages = segment_path(
+        &|n| {
+            let page = b.create(n as u64).unwrap();
+            b.map(va, 0, &page, Access::ReadWrite).unwrap();
+            *held.lock() = Some(page);
+            va.base
+        },
+        &|_| {
+            b.unmap(va, 0, bytes as u64).unwrap();
+            held.lock().take().into_iter().for_each(|p| b.destroy(p).unwrap());
+        },
+        bytes,
+        busy.raw(),
+    );
+    busy.drain().unwrap();
+    b.release(va);
+    step!();
+    let (alloc_async, free_async) = stream_ordered();
+    let ordered = segment_path(
+        &|n| {
+            let mut ptr = 0;
+            assert_eq!(unsafe { alloc_async(&mut ptr, n, own.raw() as cuda::CUstream) }, cuda::SUCCESS);
+            ptr
+        },
+        &|ptr| assert_eq!(unsafe { free_async(ptr, own.raw() as cuda::CUstream) }, cuda::SUCCESS),
+        bytes,
+        busy.raw(),
+    );
+    busy.drain().unwrap();
+    own.drain().unwrap();
+    step!();
+    println!("TIMINGS segment paths, {} segments of {bytes} B: cuMemAlloc/cuMemFree {plain} | varena pages (create+map / unmap+release) {pages} | cuMemAllocAsync/cuMemFreeAsync {ordered}", 64);
+    step!();
+    // This process's bytes: NVML's figure against its ledger row's.
+    let mut device = 0;
+    cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut device, 0) }).unwrap();
+    let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
+    let pid = std::process::id();
+    let reading = |when: &str| {
+        let used = nvml.read().unwrap().processes.unwrap_or_default().get(&pid).copied();
+        let row = ledger.status().rows.into_iter().find(|r| r.pid == pid);
+        let accounted = row.as_ref().map(|r| r.context + r.classes.iter().skip(1).sum::<u64>() + r.torch);
+        format!(
+            "{when}: NVML {used:?} B, accounted {accounted:?} B (row {:?}), unaccounted {:?} B",
+            row.map(|r| (r.context, r.classes, r.torch)),
+            used.zip(accounted).map(|(u, a)| u as i64 - a as i64)
+        )
+    };
+    let mem = memory(b, &g);
+    step!();
+    let blocks = 16;
+    let s = mem.load(set("resident", blocks, Fill::Stored, &g.uuid, |b| block(110, b)), Level::Ram).unwrap();
+    drop((0..blocks).map(|p| mem.bind(s, p, 0).unwrap()).collect::<Vec<Pin>>());
+    mem.settle();
+    step!();
+    let idle = reading("idle");
+    step!();
+    let r = mem.request("mid-run", plan(&[&["resident"]])).unwrap();
+    let pass = r.pass(s, "fwd|1").unwrap();
+    let pins: Vec<Pin> = (0..blocks).map(|p| mem.bind(s, p, busy.raw()).unwrap()).collect();
+    let spin = std::time::Duration::from_millis(1);
+    // A kernel running while the figures are read: as long as the idle reading took, ten times over.
+    let t = std::time::Instant::now();
+    let _ = reading("probe");
+    let read = t.elapsed().max(spin);
+    assert_eq!(launch(c"spin", &[(read * 10).as_nanos() as u64], busy.raw()), cuda::SUCCESS);
+    let mid = reading("mid-run");
+    busy.drain().unwrap();
+    drop(pins);
+    pass.end(0);
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("TIMINGS this process's bytes, NVML against its ledger row: {idle} | {mid}");
+    step!();
+    println!("PASS segment paths and the unaccounted bytes measured {uuid}");
+    step!();
+}
+
+/// Lease chunks (design/varena-leases.md): TensorD makes and exports them, an executor imports and maps them. 32 MiB.
+const CHUNK: u64 = 32 << 20;
+
+/// The leases' other process: per chunk received (a length, then its fd), it imports, maps at its own reservation, unmaps
+/// and releases, and prints `CHUNK <import ns> <map ns> <unmap ns> <release ns>`; a length of 0 ends it. With
+/// `reexport` it instead imports one handle, exports it again, and prints `REEXPORT <result>`.
+#[test]
+#[ignore = "native GPU: a role of the lease cases"]
+fn role_importer() {
+    let Some(mode) = role().filter(|r| r == "importer" || r == "reexport") else { return };
+    let (b, _) = gpu();
+    let mut control = parent();
+    let va = b.reserve(CHUNK).unwrap();
+    loop {
+        let mut len = [0; 8];
+        control.read_exact(&mut len).unwrap();
+        let len = u64::from_le_bytes(len);
+        if len == 0 {
+            break;
+        }
+        let fd = platform::handles::recv_fd(&control).unwrap();
+        let t = std::time::Instant::now();
+        let page = b.import(fd, len).unwrap();
+        let import = t.elapsed();
+        if mode == "reexport" {
+            let again = b.export(&page).map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string());
+            println!("REEXPORT {again}");
+            b.destroy(page).unwrap();
+        } else {
+            let t = std::time::Instant::now();
+            b.map(va, 0, &page, Access::ReadWrite).unwrap();
+            let map = t.elapsed();
+            let t = std::time::Instant::now();
+            b.unmap(va, 0, len).unwrap();
+            let unmap = t.elapsed();
+            let t = std::time::Instant::now();
+            b.destroy(page).unwrap();
+            println!("CHUNK {} {} {} {}", import.as_nanos(), map.as_nanos(), unmap.as_nanos(), t.elapsed().as_nanos());
+        }
+        std::io::stdout().flush().unwrap();
+        control.write_all(&[1]).unwrap();
+    }
+    b.release(va);
+}
+
+/// The leases' foundation, and round 6's INVALID_VALUE (keeping an imported page after a request withdrew it): can a
+/// handle that was imported be exported again? A page is made shareable (POSIX fd) and exported; then
+/// - the creator exports it again (the baseline);
+/// - this process imports the fd and exports the imported handle;
+/// - another process imports it and exports its imported handle.
+///
+/// It prints the driver's answer to each and fails only when the creator's own export fails.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn an_imported_handle_exports_again_or_not() {
+    let (b, uuid) = gpu();
+    step!();
+    let len = b.granularity();
+    let page = b.create(len).unwrap();
+    step!();
+    let fd = b.export(&page).unwrap();
+    step!();
+    let again = b.export(&page).map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string());
+    step!();
+    let here = b.import(b.export(&page).unwrap(), len).unwrap();
+    let imported_here = b.export(&here).map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string());
+    b.destroy(here).unwrap();
+    step!();
+    let (mut control, theirs) = UnixStream::pair().unwrap();
+    let mut other = child("role_importer", "reexport", Stdio::from(OwnedFd::from(theirs)));
+    send(&mut control, &fd, len);
+    control.read_exact(&mut [0]).unwrap();
+    control.write_all(&0u64.to_le_bytes()).unwrap();
+    let elsewhere = marked(&mut other, "REEXPORT ");
+    assert!(other.wait().unwrap().success());
+    step!();
+    b.destroy(page).unwrap();
+    step!();
+    println!("TIMINGS re-export: the creator's handle again: {again}; an import in this process: {imported_here}; an import in another process: {elsewhere}");
+    step!();
+    assert_eq!(again, "ok", "the creator's own handle exports again");
+    step!();
+    println!("PASS an imported handle exports again or not: the driver's answers printed {uuid}");
+    step!();
+}
+
+/// p50 and p99 of `v`, with its count.
+fn quantiles(v: &mut [std::time::Duration]) -> String {
+    v.sort();
+    let at = |q: f64| v.get(((v.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or_default();
+    format!("p50 {:?} p99 {:?} (n {})", at(0.5), at(0.99), v.len())
+}
+
+/// The lease cost per 32 MiB chunk across two processes (design/varena-leases.md): this process (TensorD's part) creates
+/// and exports each chunk and passes its fd; the other imports, maps, unmaps and releases it. A pass's worth of chunks,
+/// on an idle device, then while a spin kernel runs. It prints p50 and p99 of each step; a measurement.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn lease_chunks_cost_across_two_processes() {
+    let (b, uuid) = gpu();
+    step!();
+    // A pass's worth of chunks, as the segment paths case.
+    const CHUNKS: usize = 64;
+    let busy = cuda::Stream::new(0).unwrap();
+    let (mut control, theirs) = UnixStream::pair().unwrap();
+    let mut other = child("role_importer", "importer", Stdio::from(OwnedFd::from(theirs)));
+    let mut out = BufReader::new(other.stdout.take().unwrap());
+    let mut round = |spin: Option<std::time::Duration>| {
+        if let Some(spin) = spin {
+            assert_eq!(launch(c"spin", &[spin.as_nanos() as u64], busy.raw()), cuda::SUCCESS);
+        }
+        let started = std::time::Instant::now();
+        let (mut create, mut export, mut pass, mut destroy) = (vec![], vec![], vec![], vec![]);
+        let mut theirs: [Vec<std::time::Duration>; 4] = Default::default();
+        for _ in 0..CHUNKS {
+            let t = std::time::Instant::now();
+            let page = b.create(CHUNK).unwrap();
+            create.push(t.elapsed());
+            let t = std::time::Instant::now();
+            let fd = b.export(&page).unwrap();
+            export.push(t.elapsed());
+            let t = std::time::Instant::now();
+            send(&mut control, &fd, CHUNK);
+            pass.push(t.elapsed());
+            control.read_exact(&mut [0]).unwrap();
+            let mut line = String::new();
+            while !line.starts_with("CHUNK ") {
+                line.clear();
+                assert!(out.read_line(&mut line).unwrap() > 0, "the importer ended");
+            }
+            for (i, ns) in line.split_whitespace().skip(1).enumerate() {
+                if let Some(v) = theirs.get_mut(i) {
+                    v.push(std::time::Duration::from_nanos(ns.parse().unwrap()));
+                }
+            }
+            drop(fd);
+            let t = std::time::Instant::now();
+            b.destroy(page).unwrap();
+            destroy.push(t.elapsed());
+        }
+        let took = started.elapsed();
+        busy.drain().unwrap();
+        let [import, map, unmap, release] = &mut theirs;
+        (
+            format!(
+                "manager: cuMemCreate {}, export {}, fd passed {}, cuMemRelease {}; executor: import {}, map {}, unmap {}, release {}",
+                quantiles(&mut create), quantiles(&mut export), quantiles(&mut pass), quantiles(&mut destroy), quantiles(import), quantiles(map), quantiles(unmap), quantiles(release)
+            ),
+            took,
+        )
+    };
+    let (idle, took) = round(None);
+    step!();
+    // Ten times the idle round: every chunk's calls land while the kernel runs.
+    let (beside, _) = round(Some(took * 10));
+    step!();
+    control.write_all(&0u64.to_le_bytes()).unwrap();
+    assert!(other.wait().unwrap().success());
+    step!();
+    println!("TIMINGS lease chunks of {CHUNK} B across two processes: idle {idle} | beside a running kernel {beside}");
+    step!();
+    println!("PASS lease chunks measured across two processes {uuid}");
+    step!();
+}
+
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn release_events_order_consumers_without_a_host_wait() {
