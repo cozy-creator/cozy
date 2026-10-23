@@ -354,7 +354,7 @@ pub enum Level {
     Downloaded,
     /// A process with its imports done: no device, no VRAM.
     Imported,
-    /// An executor with the model constructed, its weights in the host tier.
+    /// An executor with the model constructed, its weights in host RAM (the page cache).
     Host,
     /// Its weights on the GPU.
     Gpu,
@@ -441,7 +441,7 @@ struct Session {
     executor: DeviceExecutor,
     /// When it last came back idle: idle executors end least recently used first.
     used: Instant,
-    /// This executor in the host tier and the layouts it may adopt.
+    /// This executor in host RAM and the layouts it may adopt.
     launch: Launch,
     /// It has served a call: its next one is not its first.
     invoked: bool,
@@ -637,9 +637,9 @@ pub struct Pool {
     engine: std::sync::OnceLock<Weak<Engine>>,
     /// Rows the ledgers named stalled at the last look: each is ended once.
     stalled: Mutex<std::collections::BTreeSet<u32>>,
-    /// The machine's RAM tier, served while the pool lives; nudged to look at the host when a
-    /// call begins, an executor's frame comes or a ledger signals.
-    tier: Option<Arc<varena::Tier>>,
+    /// The host rule's watcher, while the pool lives; nudged to look when a call begins, an
+    /// executor's frame comes or a ledger signals.
+    host: Option<Arc<memory::Host>>,
     /// Held while the pool lives: the thread blocked on the ledgers' events ends with it.
     _events: Option<std::os::unix::net::UnixStream>,
     /// Memoized Model methods' results, shared by every run on this machine.
@@ -727,14 +727,13 @@ impl Pool {
             entry: entry.clone(),
             memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, &peaks, &notes).map(Arc::new),
         }).collect();
-        // The RAM tier fills only beside what the calls running on these GPUs keep free.
-        let ledgers: Vec<&varena::Ledger> = devices.iter().filter_map(|d| d.memory.as_deref()).map(|gpu| &gpu.ledger).collect();
-        let tier = memory::serve_tier(config.host.mode, varena::tier::need(&ledgers), &notes);
+        let gpus = devices.iter().filter_map(|d| d.memory.clone()).collect();
+        let host = memory::Host::watch(config.host.mode, gpus, &notes);
         let launcher = crate::child_launcher::ChildLauncher::new()?;
         let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
         Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
             let ledgers = devices.iter().filter_map(|d| d.memory.clone()).map(memory::Source::Ledger);
-            let sources: Vec<memory::Source> = ledgers.chain(tier.clone().map(memory::Source::Tier)).collect();
+            let sources: Vec<memory::Source> = ledgers.chain(host.clone().map(memory::Source::Host)).collect();
             let pool = pool.clone();
             let woke = move |woke| match (pool.upgrade(), woke) {
                 (Some(pool), memory::Woke::Ledger) => pool.memory_changed(),
@@ -756,7 +755,7 @@ impl Pool {
                 peaks,
                 engine: Default::default(),
                 stalled: Mutex::default(),
-                tier,
+                host,
                 _events: events,
                 incarnation,
                 config,
@@ -801,7 +800,7 @@ impl Pool {
             self.peaks.save(model, gpus.iter().filter(|(_, gpu)| gpu.model == model).map(|(_, gpu)| &gpu.ledger));
         }
     }
-    /// The RAM tier gave back all it may and the host is still short: one idle process ends,
+    /// The host is short of what its running calls must keep free: one idle process ends,
     /// least recently used first: a deviceless executor, else an import-only parent with no live
     /// child, else an executor on a GPU no call holds (outside every warm set first).
     fn host_short(&self) {
@@ -1724,7 +1723,7 @@ impl Pool {
             result
         })
     }
-    /// One line per Load in `loads.jsonl`: the executor's load facts, the host tier's, and
+    /// One line per Load in `loads.jsonl`: the executor's load facts, and
     /// the machine's and executor's RSS/PSS.
     fn record_load(
         &self,
@@ -1784,10 +1783,10 @@ impl Pool {
         }
     }
 
-    /// The RAM tier's watcher looks at the host now (a nudge; the host's own events wake it too).
+    /// The host watcher looks now (a nudge; the host's own events wake it too).
     fn nudge_host(&self) {
-        if let Some(tier) = &self.tier {
-            tier.nudge();
+        if let Some(host) = &self.host {
+            host.nudge();
         }
     }
 
@@ -2564,7 +2563,7 @@ impl Pool {
             generation: &held.record,
             spool: None,
             caller: None,
-            tier: self.tier.as_deref(),
+            host: self.host.as_deref(),
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -3536,14 +3535,14 @@ struct Callbacks<'a> {
     spool: Option<PathBuf>,
     /// The invoking request as a caller: its child-call frames.
     caller: Option<&'a crate::calls::Caller>,
-    /// The machine's RAM tier: each frame nudges it to look at the host (the only wakeup where
-    /// the kernel gives none, cgroup v1 with PSI denied).
-    tier: Option<&'a varena::Tier>,
+    /// The host watcher: each frame nudges it to look (the only wakeup where the kernel gives
+    /// none, cgroup v1 with PSI denied).
+    host: Option<&'a memory::Host>,
 }
 impl Services for Callbacks<'_> {
     fn progress(&mut self, frame: &Frame) {
-        if let Some(tier) = self.tier {
-            tier.nudge();
+        if let Some(host) = self.host {
+            host.nudge();
         }
         crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
     }
@@ -4279,8 +4278,8 @@ mod tests {
     /// An executor stand-in for the stall rule: granted the GPU's ledger over its control socket
     /// (stdin), it loads its set to the GPU and answers one line per command: `warm` (a request
     /// binding every block, ended: its pages stay idle on the GPU), `run <id> <shape>` (a request
-    /// and its pass, which makes the pass's measured room first) and `end <room>` (the pass
-    /// measured at `room`, the request ended).
+    /// and its pass, which asks its peers for every idle byte: no peak is recorded for it) and
+    /// `end <room>` (the pass ended at peak `room`, the request ended).
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "the stall-rule test runs it as an executor"]
@@ -4304,21 +4303,21 @@ mod tests {
             let reply = match line.split(' ').collect::<Vec<_>>()[..] {
                 ["warm"] => {
                     let warm = memory.request(&format!("warm-{}", uuid::Uuid::new_v4()), plan()).unwrap();
-                    let binding = warm.pass(set, "warm", "1", varena::Torch::default()).unwrap();
+                    let binding = warm.pass(set, "warm").unwrap();
                     drop((0..parts as u32).map(|block| memory.bind(set, block, 0).unwrap()).collect::<Vec<_>>());
-                    binding.end(varena::Measured::default(), varena::Torch::default());
+                    binding.end(0);
                     warm.end();
                     "warm".to_string()
                 }
                 ["run", id, shape] => {
                     let opened = memory.request(id, plan()).unwrap();
-                    pass = Some(opened.pass(set, "run", shape, varena::Torch::default()).unwrap());
+                    pass = Some(opened.pass(set, &format!("run|{shape}")).unwrap());
                     request = Some(opened);
                     "passing".to_string()
                 }
                 ["end", room] => {
                     let room: u64 = room.parse().unwrap();
-                    pass.take().unwrap().end(varena::Measured { allocated_peak: room, slack: room / 8, ..Default::default() }, varena::Torch::default());
+                    pass.take().unwrap().end(room);
                     request.take().unwrap().end();
                     "ended".to_string()
                 }
@@ -4371,12 +4370,11 @@ mod tests {
         }
     }
 
-    /// An executor's frame nudges the machine's RAM tier: its watcher looks at the host (it
-    /// reads what the running calls keep free), with no kernel event to wake it. In its own
-    /// process: one tier per namespace, and this binary's other pools serve theirs.
+    /// An executor's frame nudges the host watcher: it looks at the host (what the running
+    /// calls keep free), with no kernel event to wake it. In its own process: one namespace.
     #[cfg(target_os = "linux")]
     #[test]
-    fn an_executors_frame_nudges_the_host_tier_to_look() {
+    fn an_executors_frame_nudges_the_host_watcher_to_look() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "gpu_service::tests::frame_nudge_child", "--ignored", "--nocapture"])
             .env("S5_NUDGE", "1")
@@ -4387,33 +4385,30 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "an_executors_frame_nudges_the_host_tier_to_look runs it in its own process"]
+    #[ignore = "an_executors_frame_nudges_the_host_watcher_to_look runs it in its own process"]
     fn frame_nudge_child() {
         if std::env::var("S5_NUDGE").is_err() { return; }
         assert!(varena::os::namespace(&format!("nudge{}-", std::process::id())));
-        let (looked, looks) = std::sync::mpsc::channel();
-        let (looked, armed) = (std::sync::Mutex::new(looked), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let watching = armed.clone();
-        let need: varena::Need = Arc::new(move || {
-            if watching.load(Ordering::SeqCst) {
-                let _ = looked.lock().unwrap().send(());
-            }
-            Some(vec![])
-        });
-        let pressure = platform::contain::host_pressure::Pressure::arm(platform::contain::host_pressure::HostMode::Shared).unwrap();
-        let tier = varena::Tier::serve(Some(pressure), need).unwrap().expect("this namespace's tier");
-        tier.look(); // Whatever woke it at its start has been answered.
-        armed.store(true, Ordering::SeqCst);
+        let id = varena::GpuId { uuid: format!("nudge-{}", std::process::id()), model: "host".into(), memory: 64 << 20 };
+        let gpu = Arc::new(memory::Gpu { ledger: varena::Ledger::create(&id, None).unwrap(), model: "host".into() });
+        let host = memory::Host::watch(platform::contain::host_pressure::HostMode::Shared, vec![gpu], &memory::MemoryLog::default()).expect("watched");
+        host.look(); // Whatever woke it at its start has been answered.
+        let made = host.looks();
         let root = std::env::temp_dir().join(format!("gpu-nudge-{}", uuid::Uuid::new_v4()));
         let engine = Engine::open(&root.join("execution")).unwrap();
         let generation: crate::catalog::Generation = serde_json::from_value(json!({"identity": "g", "package": "p", "version": "1",
             "application": "app", "python": "/usr/bin/python3", "interface": {}})).unwrap();
-        let mut callbacks = Callbacks { engine: &engine, id: "nudged", completed: 0, generation: &generation, spool: None, caller: None, tier: Some(&tier) };
+        let mut callbacks = Callbacks { engine: &engine, id: "nudged", completed: 0, generation: &generation, spool: None, caller: None, host: Some(&host) };
         let frame: Frame = serde_json::from_value(json!({"event": "progress", "stage": "denoise", "position": 1, "total": 8})).unwrap();
         callbacks.progress(&frame);
-        // A failure backstop only: the look follows the frame's nudge.
-        looks.recv_timeout(std::time::Duration::from_secs(60)).expect("the frame's nudge made the tier look");
-        drop(tier);
+        // The look follows the frame's nudge; a failure backstop only.
+        let (looked, looks) = std::sync::mpsc::channel();
+        let waiting = host.clone();
+        std::thread::spawn(move || {
+            waiting.await_look(made);
+            let _ = looked.send(());
+        });
+        looks.recv_timeout(std::time::Duration::from_secs(60)).expect("the frame's nudge made the watcher look");
         crate::scratch::remove(&root);
     }
 
