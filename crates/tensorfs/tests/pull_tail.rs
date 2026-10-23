@@ -24,7 +24,7 @@ async fn pull(server: &Server, name: &str, config: Config) -> (Duration, Fetcher
     let origin: Arc<dyn Origin> = Arc::new(Endpoint::new(&client(), &server.base, None).unwrap().anonymous());
     let started = Instant::now();
     let pulled = fetcher
-        .pull(&origin, name, None, Some("int8"), &Want::default())
+        .pull(&origin, name, None, Some("model.int8.cozytensors"), &Want::default())
         .await;
     pulled.unwrap_or_else(|refusal| panic!("{name}: {refusal}"));
     (started.elapsed(), fetcher, root)

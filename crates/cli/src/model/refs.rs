@@ -1,7 +1,7 @@
 //! The one model-reference grammar, shared by `cozy model …` and `cozy run model.<slot>=…`:
 //!
 //! ```text
-//! org/name[@release[/lane]]     a Hub model by name; the machine resolves the release and picks the lane
+//! org/name[@release]            a Hub model by name; the machine resolves the release and selects its variant
 //! org/name#sha256:<64 hex>      the owner's checkpoint by hash
 //! local/<alias>                 a model a machine holds under that name
 //! hf://… civitai://… https://…  a provider source, passed through: the machine pins and makes it
@@ -23,7 +23,6 @@ pub(crate) enum ModelRef {
     Hub {
         repo: Repo,
         release: Option<String>,
-        lane: Option<String>,
     },
     Checkpoint {
         repo: Repo,
@@ -33,7 +32,7 @@ pub(crate) enum ModelRef {
     Provider(String),
 }
 
-const GRAMMAR: &str = "org/name[@release[/lane]], org/name#sha256:<hex>, local/<alias>, hf://…, civitai://… or https://…";
+const GRAMMAR: &str = "org/name[@release], org/name#sha256:<hex>, local/<alias>, hf://…, civitai://… or https://…";
 
 fn usage(code: &str, message: String) -> Error {
     Error::new(Kind::Usage, code, message)
@@ -66,11 +65,16 @@ pub(crate) fn label(flag: &str, value: &str) -> Result<String, Error> {
     }
 }
 
-/// A variant's arbitrary tree path or legacy shorthand, checked by TensorFS's path grammar.
-fn variant(value: &str) -> Result<String, Error> {
+/// A variant's exact tree path (`--variant`): a `.cozytensors` file by TensorFS's path grammar.
+pub(crate) fn variant(value: &str) -> Result<String, Error> {
     let tree = tensorfs::format::Tree { files: std::collections::BTreeMap::from([(value.to_owned(),tensorfs::format::ObjectRef::of(b""))]) };
     let valid = tree.to_json().and_then(|bytes| tensorfs::format::Tree::from_json(&bytes));
-    valid.map(|_| value.to_owned()).map_err(|e| usage("model_variant_invalid",format!("variant {value:?}: {e}")))
+    match valid {
+        Ok(tree) if tree.variants().next().is_some() => Ok(value.to_owned()),
+        Ok(_) => Err(usage("model_variant_invalid", format!("variant {value:?} is no .cozytensors path"))
+            .remedy("name the variant's path, e.g. model.int8.cozytensors (`cozy model info` lists them)")),
+        Err(e) => Err(usage("model_variant_invalid", format!("variant {value:?}: {e}"))),
+    }
 }
 
 /// A checkpoint id: `sha256:` and 64 lowercase hex digits.
@@ -147,9 +151,7 @@ impl ModelRef {
         }
         if let Some((name, hash)) = raw.split_once('#') {
             let repo = Repo::parse(name).map_err(|_| grammar(raw))?;
-            let manifest = checkpoint(hash).map_err(|e| {
-                e.remedy("`#` names a checkpoint, org/name#sha256:<hex>; a lane is org/name@release/lane")
-            })?;
+            let manifest = checkpoint(hash).map_err(|e| e.remedy("`#` names a checkpoint, org/name#sha256:<hex>"))?;
             return Ok(ModelRef::Checkpoint { repo, manifest });
         }
         let (name, pin) = match raw.split_once('@') {
@@ -166,16 +168,12 @@ impl ModelRef {
                 )),
             };
         }
-        let (release, lane) = match pin.map(|p| p.split_once('/').ok_or(p)) {
-            None => (None, None),
-            Some(Err(release)) => (Some(label("release", release)?), None),
-            Some(Ok((release, lane))) => (Some(label("release", release)?), Some(variant(lane)?)),
-        };
-        Ok(ModelRef::Hub {
-            repo,
-            release,
-            lane,
-        })
+        if pin.is_some_and(|pin| pin.contains('/')) {
+            return Err(usage("model_variant_pin", format!("{raw:?}: a model is org/name[@release]; its variant is selected by GPUs and --lane"))
+                .remedy("pin a variant by path with `cozy model download … --variant <path>`"));
+        }
+        let release = pin.map(|release| label("release", release)).transpose()?;
+        Ok(ModelRef::Hub { repo, release })
     }
 
     /// The machine's choice for `parameter`.
@@ -185,14 +183,9 @@ impl ModelRef {
             ..Default::default()
         };
         match self {
-            ModelRef::Hub {
-                repo,
-                release,
-                lane,
-            } => {
+            ModelRef::Hub { repo, release } => {
                 choice.repository = repo.to_string();
                 choice.release = release.clone().unwrap_or_default();
-                choice.lane = lane.clone().unwrap_or_default();
             }
             ModelRef::Checkpoint { repo, manifest } => {
                 choice.repository = repo.to_string();
@@ -209,17 +202,10 @@ impl ModelRef {
 impl fmt::Display for ModelRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ModelRef::Hub {
-                repo,
-                release,
-                lane,
-            } => {
+            ModelRef::Hub { repo, release } => {
                 write!(f, "{repo}")?;
                 if let Some(release) = release {
                     write!(f, "@{release}")?;
-                }
-                if let Some(lane) = lane {
-                    write!(f, "/{lane}")?;
                 }
                 Ok(())
             }
@@ -248,8 +234,6 @@ mod tests {
         let cases = [
             ("Fidika/SDXL", "fidika/sdxl", ("fidika/sdxl", "", "", "", "")),
             ("fidika/sdxl@1.0.0", "fidika/sdxl@1.0.0", ("fidika/sdxl", "1.0.0", "", "", "")),
-            ("fidika/sdxl@1.0.0/int8", "fidika/sdxl@1.0.0/int8", ("fidika/sdxl", "1.0.0", "int8", "", "")),
-            ("fidika/sdxl@1.0/nested/arbitrary.cozytensors", "fidika/sdxl@1.0/nested/arbitrary.cozytensors", ("fidika/sdxl", "1.0", "nested/arbitrary.cozytensors", "", "")),
             (&format!("fidika/sdxl#{HASH}"), &format!("fidika/sdxl#{HASH}"), ("fidika/sdxl", "", "", HASH, "")),
             ("local/Style", "local/style", ("local/style", "", "", "", "")),
             ("hf://Org/Repo@main/a.safetensors", "hf://Org/Repo@main/a.safetensors", ("", "", "", "", "hf://Org/Repo@main/a.safetensors")),
@@ -279,6 +263,8 @@ mod tests {
             "fidika/sdxl@1.0/",
             "fidika/sdxl@1.0/../outside.cozytensors",
             "fidika/sdxl@1.0/fp8#sha256:aa",
+            "fidika/sdxl@1.0.0/int8",
+            "fidika/sdxl@1.0/model.int8.cozytensors",
             "local/style@1.0",
             "s3://bucket/key",
             "-org/x",
@@ -287,6 +273,16 @@ mod tests {
             assert_eq!(error.kind, Kind::Usage, "{raw}");
         }
         assert_eq!(Repo::hub("local/x").unwrap_err().code, "model_local_destination");
+        assert_eq!(ModelRef::parse("fidika/sdxl@1.0/model.int8.cozytensors").unwrap_err().code, "model_variant_pin");
+    }
+
+    /// `--variant` names a variant by its exact path; a lane word is no path.
+    #[test]
+    fn a_variant_is_a_cozytensors_path() {
+        assert_eq!(variant("nested/arbitrary.cozytensors").unwrap(), "nested/arbitrary.cozytensors");
+        for raw in ["int8", "fp8", "../outside.cozytensors", ""] {
+            assert_eq!(variant(raw).unwrap_err().code, "model_variant_invalid", "{raw}");
+        }
     }
 
     #[test]

@@ -248,14 +248,14 @@ fn model_choices_and_loras_keep_their_slots_and_order() {
             "model:unet=fidika/detail-lora,0.80".into(),
             "model:text_encoder=fidika/style@1.0,0".into(),
         ],
-        ..sdxl.terms(&["prompt=x", "model.model=fidika/sdxl-base@1.0/int8"])
+        ..sdxl.terms(&["prompt=x", "model.model=fidika/sdxl-base@1.0"])
     };
     let bound = sdxl.bind("generate", &terms).unwrap();
     assert_eq!(
         bound.models,
         [Choice {
             slot: "model".into(),
-            reference: Some("fidika/sdxl-base@1.0/int8".into()),
+            reference: Some("fidika/sdxl-base@1.0".into()),
             adapters: vec![
                 Adapter {
                     component: None,

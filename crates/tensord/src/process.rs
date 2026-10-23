@@ -124,10 +124,9 @@ impl Pace {
 pub enum Meter {
     /// CPU plus bytes moved by the process (Runtime `ExecutorChild.watched`).
     Burn,
-    /// Frames of the running invocation; a canceled one must stop within its pace's patience.
-    Frames,
-    /// A GPU invocation's work, judged while it runs: frames, bytes moved, GPU memory traffic,
-    /// or CPU other than a wait on a stuck GPU.
+    /// An invocation's work, judged while it runs, on every executor and every lane: frames,
+    /// bytes moved, GPU memory traffic, or CPU other than a wait on a stuck GPU. Its call tree
+    /// is its own (`Waits`: a child call is watched by its own executor).
     Work,
 }
 
@@ -142,7 +141,8 @@ pub enum Gpus {
     Stuck,
 }
 
-/// Its GPUs' readings; None while they cannot be read, which judges nothing.
+/// Its GPUs' readings; None while they cannot be read, which judges nothing. An executor with no
+/// GPUs has no reader: its GPUs read idle.
 pub type Activity = Arc<dyn Fn() -> Option<Gpus> + Send + Sync>;
 
 /// A measured wedge's verdict, as the error of the command it ended.
@@ -181,9 +181,9 @@ pub struct Watch {
 impl Watch {
     fn run(&self, exact: Exact, liveness: Liveness, worst_gap: Duration, what: &str) {
         let floor = liveness.floor();
-        // Frame gaps teach only the frame meter; CPU-plus-bytes starts its own pace.
+        // An invocation's gaps teach the next invocation; CPU-plus-bytes starts its own pace.
         let mut pace = match self.meter {
-            Meter::Frames | Meter::Work => Pace::seeded(worst_gap),
+            Meter::Work => Pace::seeded(worst_gap),
             Meter::Burn => Pace::default(),
         };
         // A GPU call's samples with memory traffic, its CPU other than stuck-GPU waits, and its
@@ -210,8 +210,7 @@ impl Watch {
             }
             let reading = match self.meter {
                 Meter::Burn => group_burn(exact.birth()),
-                Meter::Frames => Some(state.frames),
-                Meter::Work => self.activity.as_ref().and_then(|activity| activity()).map(|gpus| {
+                Meter::Work => self.activity.as_ref().map_or(Some(Gpus::Idle), |gpus| gpus()).map(|gpus| {
                     let (cpu, moved) = group_meter(exact.birth()).unwrap_or_default();
                     let since = cpu.saturating_sub(last_cpu.replace(cpu).unwrap_or(cpu));
                     ran += if gpus == Gpus::Stuck { 0 } else { since };
@@ -225,14 +224,12 @@ impl Watch {
                 pace.excuse(now);
             }
             state.worst_gap = pace.worst_pause;
-            // Frames alone are judged only after a cancel (above); CPU and bytes, and a GPU
-            // call's work, always.
-            if let (Meter::Burn | Meter::Work, Some(since)) = (self.meter, pace.still_since()) {
+            if let Some(since) = pace.still_since() {
                 let still = now - since;
                 if still > pace.patience(floor) {
                     let measures = match self.meter {
                         Meter::Work => " (frames, bytes moved, GPU memory traffic, CPU other than a wait on a stuck GPU)",
-                        _ => "",
+                        Meter::Burn => "",
                     };
                     let verdict = format!("wedged during {what}: {}{measures}", pace.verdict(still, floor));
                     match exact.kill() {
@@ -555,13 +552,13 @@ mod tests {
         assert!(group_members(&birth).is_empty());
     }
 
-    /// A GPU call is judged while it runs on its work: one blocked with idle GPUs, or spinning
-    /// while its GPU holds a kernel that moves no memory (a collective whose peer is gone), is
-    /// killed; one that computes on any number of threads, moves bytes, or whose GPUs move
-    /// memory or cannot be read is not.
+    /// A call is judged while it runs on its work, with GPUs or without: one blocked with idle
+    /// GPUs, or spinning while its GPU holds a kernel that moves no memory (a collective whose
+    /// peer is gone), is killed; one that computes on any number of threads, moves bytes, or
+    /// whose GPUs move memory or cannot be read is not.
     #[cfg(unix)]
     #[test]
-    fn a_gpu_call_blocked_or_waiting_on_a_stuck_gpu_is_killed_and_working_ones_are_not() {
+    fn a_call_blocked_or_waiting_on_a_stuck_gpu_is_killed_and_working_ones_are_not() {
         let gpus = |reading: Option<Gpus>| -> Option<Activity> { Some(Arc::new(move || reading)) };
         let spin = "while :; do :; done";
         let cases = [
@@ -573,6 +570,10 @@ mod tests {
             ("moves bytes while its GPU is stuck", "while :; do echo work; done > /dev/null", gpus(Some(Gpus::Stuck)), false),
             ("its GPU moves memory", "sleep 600", gpus(Some(Gpus::Moved)), false),
             ("its GPU is unread", "sleep 600", gpus(None), false),
+            // A call with no GPUs (a script, a job root) is judged the same way (run 13543).
+            ("blocked with no GPUs", "sleep 600", None, true),
+            ("prints with no GPUs", "while :; do echo line; sleep 0.002; done > /dev/null", None, false),
+            ("computes with no GPUs", spin, None, false),
         ];
         // A shell can fork a CPU spinner. Always end its group, including on an assertion
         // failure: Child::kill only ends the shell and leaves that spinner running.
@@ -665,7 +666,7 @@ mod tests {
             let exact = Exact::open(&birth).unwrap().unwrap();
             let liveness = Liveness { sample: Duration::from_millis(20) };
             let waits: Option<Waits> = (excuse == "waits").then(|| Arc::new(|| true) as Waits);
-            let meter = if excuse == "waits" { Meter::Burn } else { Meter::Frames };
+            let meter = if excuse == "waits" { Meter::Burn } else { Meter::Work };
             let watching = Watching::start(exact, meter, liveness, Duration::ZERO, waits, None, "invoke").unwrap();
             let watch = watching.watch();
             watch.serving(excuse == "serving");

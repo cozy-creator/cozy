@@ -780,7 +780,11 @@ pub struct Model {
 pub struct Checkpoint {
     /// Empty for a local alias.
     pub release: String,
+    /// The variant, by its path.
     pub lane: String,
+    /// Its header's precision lane (`int8`, `bf16`, …).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub precision: String,
     /// `sha256:<hex>`
     pub manifest: String,
     pub yanked: bool,

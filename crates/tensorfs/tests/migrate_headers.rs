@@ -171,9 +171,9 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     let tags: Vec<(&str, bool, bool)> = tiny.tags.iter().map(|t| (t.name.as_str(), t.public, t.yanked)).collect();
     assert_eq!(tags, [("0.9.0", true, true), ("1.0.0", true, false), ("1.1.0", true, false)]);
     let (tree, headers) = variants(&tiny.tags[1].commit);
-    assert_eq!(headers.keys().collect::<Vec<_>>(), ["ft", "full"]);
-    let full = same(&fixture, &store, FULL, &headers["full"], &tree);
-    let ft = same(&fixture, &store, FT, &headers["ft"], &tree);
+    assert_eq!(headers.keys().collect::<Vec<_>>(), ["model.ft.cozytensors", "model.full.cozytensors"]);
+    let full = same(&fixture, &store, FULL, &headers["model.full.cozytensors"], &tree);
+    let ft = same(&fixture, &store, FT, &headers["model.ft.cozytensors"], &tree);
     assert_eq!(full.metadata.get("source"), Some(&Value::Str(SDXL.into())));
     assert_eq!(filled(&full), None, "the whole pipe lacks nothing");
     // ft lacked its pipeline, tokenizers and README: the upstream's, recorded.
@@ -209,9 +209,9 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     assert_eq!(gpt2.tags.len(), 1);
     assert_eq!((gpt2.tags[0].name.clone(), gpt2.tags[0].public), (format!("v2-{}", &old[..12]), false));
     let (tree, headers) = variants(&gpt2.tags[0].commit);
-    assert_eq!(headers.keys().collect::<Vec<_>>(), [""]);
+    assert_eq!(headers.keys().collect::<Vec<_>>(), ["model.cozytensors"]);
     let (gpt2_files, _) = manifest(&fixture, GPT2_FULL);
-    let h = Header::from_cbor(&store.read(&headers[""]).unwrap()).unwrap();
+    let h = Header::from_cbor(&store.read(&headers["model.cozytensors"]).unwrap()).unwrap();
     assert_eq!(h.component("model").unwrap().assets["special_tokens_map.json"], gpt2_files["special_tokens_map.json"]);
     assert_eq!(filled(&h).unwrap().1, BTreeSet::from(["special_tokens_map.json".to_owned()]));
     assert!(tree.repo_files().next().is_none());
@@ -220,12 +220,12 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     let local = &repos["local/tiny-sdxl"];
     assert_eq!((local.tags[0].name.as_str(), local.tags[0].public), ("1", true));
     let (tree, headers) = variants(&local.tags[0].commit);
-    let h = same(&fixture, &store, FULL, &headers["f32"], &tree);
+    let h = same(&fixture, &store, FULL, &headers["model.f32.cozytensors"], &tree);
     assert_eq!(h.metadata.get("source"), Some(&Value::Str(SDXL.into())));
     assert_eq!(filled(&h), None);
     let local = &repos["local/tiny-gpt2"];
     let (tree, headers) = variants(&local.tags[0].commit);
-    let h = same(&fixture, &store, GPT2_FULL, &headers["f32"], &tree);
+    let h = same(&fixture, &store, GPT2_FULL, &headers["model.f32.cozytensors"], &tree);
     assert_eq!(h.component("model").unwrap().config["model_type"], "gpt2");
 
     // Again: nothing changes.
@@ -267,7 +267,7 @@ fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
     let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
     let tree = Tree::from_json(&read(&migrated.repo.tags[0].commit)).unwrap();
-    let header = Header::from_cbor(&read(tree.variant(Some("full")).unwrap().1)).unwrap();
+    let header = Header::from_cbor(&read(tree.variant(Some("model.full.cozytensors")).unwrap().1)).unwrap();
     assert_eq!(header.component("tokenizer").unwrap().assets["vocab.json"], expected);
     assert_eq!(filled(&header).unwrap().1, BTreeSet::from([missing.to_owned(), "unet/config.json".to_owned()]));
     assert_eq!(header.component("unet").unwrap().config, parse(&std::fs::read(dir.join(config.key())).unwrap()));
@@ -312,7 +312,7 @@ fn migrate_lane(dir: &Path, name: &str, files: BTreeMap<String, ObjectRef>) -> (
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
     let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
     let tree = Tree::from_json(&read(&migrated.repo.tags[0].commit)).unwrap();
-    let header = Header::from_cbor(&read(tree.variant(Some("lane")).unwrap().1)).unwrap();
+    let header = Header::from_cbor(&read(tree.variant(Some("model.lane.cozytensors")).unwrap().1)).unwrap();
     (header, tree, migrated.report["releases"][0]["lanes"]["lane"].clone())
 }
 

@@ -148,9 +148,9 @@ def commits(work: pathlib.Path, folder: pathlib.Path, store: pathlib.Path) -> No
                            endpoint=url, cache_dir=store)
     got = pathlib.Path(tensorfs.download_file("me/commits", "NOTES.md", revision="main", endpoint=url, cache_dir=fresh))
     assert got.read_text() == "notes\n"
-    assert tensorfs.open("me/commits", revision="main", variant="bf16", endpoint=url, cache_dir=fresh, lazy=False).verify().ok
+    assert tensorfs.open("me/commits", revision="main", variant="model.bf16.cozytensors", endpoint=url, cache_dir=fresh, lazy=False).verify().ok
     try:
-        tensorfs.open("me/commits", revision="main", variant="int8", endpoint=url, cache_dir=fresh)
+        tensorfs.open("me/commits", revision="main", variant="model.int8.cozytensors", endpoint=url, cache_dir=fresh)
         raise AssertionError("delete_patterns left the int8 variant")
     except tensorfs.NotFoundError:
         pass

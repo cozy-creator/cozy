@@ -465,6 +465,8 @@ impl Stream {
     pub fn drain(&self) -> Result<()> {
         let driver = driver()?;
         let _context = CtxGuard::enter(self.ctx)?;
+        // A host wait: a trace span, so a subscriber can time each.
+        let _wait = tracing::trace_span!("tensorfs cuStreamSynchronize").entered();
         check("cuStreamSynchronize", unsafe {
             (driver.stream_synchronize)(self.raw)
         })
@@ -478,6 +480,7 @@ impl Drop for Stream {
     fn drop(&mut self) {
         if let Ok(driver) = driver() {
             if let Ok(_ctx) = CtxGuard::enter(self.ctx) {
+                let _wait = tracing::trace_span!("tensorfs cuStreamSynchronize (drop)").entered();
                 unsafe {
                     (driver.stream_synchronize)(self.raw);
                     (driver.stream_destroy)(self.raw);
@@ -511,7 +514,10 @@ pub unsafe fn pin_region(ptr: *mut u8, len: usize, read_only: bool) -> Result<Ho
         } else {
             0
         };
-    let rc = unsafe { (d.mem_host_register)(ptr.cast(), len, flags) };
+    let rc = {
+        let _wait = tracing::trace_span!("tensorfs cuMemHostRegister").entered();
+        unsafe { (d.mem_host_register)(ptr.cast(), len, flags) }
+    };
     if rc != ERROR_HOST_MEMORY_ALREADY_REGISTERED {
         check("cuMemHostRegister", rc)?;
     }
@@ -550,6 +556,8 @@ impl HostPin {
         if self.owned {
             let driver = driver()?;
             let _context = CtxGuard::enter(self.ctx)?;
+            // It synchronizes the device: a host wait, a trace span like the others.
+            let _wait = tracing::trace_span!("tensorfs cuMemHostUnregister").entered();
             check("cuMemHostUnregister", unsafe {
                 (driver.mem_host_unregister)(self.ptr)
             })?;

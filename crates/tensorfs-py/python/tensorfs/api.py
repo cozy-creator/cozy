@@ -34,9 +34,9 @@ def _client(cache_dir=None, endpoint=None, token=None, *, configured_token=True)
     return _ext._Client(_cache(cache_dir), endpoint=_endpoint(endpoint), token=credential, ca_der=_settings.get("ca_der"))
 
 
-def open(name_or_path, *, revision=None, variant=None, bits=None, gpus=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, lazy=True):
+def open(name_or_path, *, revision=None, variant=None, lane=None, gpus=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, lazy=True):
     return _client(cache_dir, endpoint, token).open(
-        os.fspath(name_or_path), revision=revision, variant=variant, bits=bits, gpus=gpus, local_files_only=local_files_only, lazy=lazy
+        os.fspath(name_or_path), revision=revision, variant=variant, lane=lane, gpus=gpus, local_files_only=local_files_only, lazy=lazy
     )
 
 

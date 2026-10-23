@@ -92,7 +92,7 @@ async fn normal_open_read_and_fetch_do_not_create_compatibility_directories() {
     let raw = store.checkpoint(&header).unwrap();
     assert_eq!(raw.read("model", "weight").unwrap(), b"shared bytes");
     no_compatibility_directories(&store);
-    let variant = store.variant(&tree, Some("main")).unwrap();
+    let variant = store.variant(&tree, Some("model.main.cozytensors")).unwrap();
     assert_eq!(
         variant.asset("model", "tokenizer.json").unwrap(),
         b"{\"tokenizer\":true}"
@@ -109,7 +109,7 @@ async fn normal_open_read_and_fetch_do_not_create_compatibility_directories() {
         .open(
             &tree.id(),
             &Open {
-                variant: Some("main".into()),
+                variant: Some("model.main.cozytensors".into()),
                 local_files_only: true,
                 lazy: false,
                 ..Default::default()
@@ -142,7 +142,7 @@ fn an_open_snapshot_folder_is_held_and_goes_when_closed() {
     store.put_bytes(README).unwrap();
     let directory = store.root().join("snapshots").join(&tree.sha256);
     store.snapshot(&tree, &directory, None).unwrap();
-    let checkpoint = Checkpoint::folder(&directory, Some("main"), Some(&store)).unwrap();
+    let checkpoint = Checkpoint::folder(&directory, Some("model.main.cozytensors"), Some(&store)).unwrap();
     store.collect(u64::MAX, Duration::ZERO).unwrap();
     assert!(directory.join("model.main.cozytensors").is_file(), "an open folder was swept");
     assert_eq!(checkpoint.read("model", "weight").unwrap(), b"shared bytes");
@@ -338,7 +338,7 @@ async fn explicit_export_fetches_known_repo_files_and_never_omits_refused_files(
             .open(
                 &tree.id(),
                 &Open {
-                    variant: Some("main".into()),
+                    variant: Some("model.main.cozytensors".into()),
                     lazy: false,
                     ..Default::default()
                 },
@@ -414,7 +414,7 @@ async fn explicit_export_fetches_known_repo_files_and_never_omits_refused_files(
         let reference = Ref {
             repo_id: tree.id(),
             revision: None,
-            variant: Some("main".into()),
+            variant: Some("model.main.cozytensors".into()),
             endpoint: None,
         };
         client

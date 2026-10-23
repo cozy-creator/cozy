@@ -518,12 +518,22 @@ impl Host {
 
     /// Nudges the watcher and blocks until a look begun since has been made.
     pub fn look(&self) {
-        let (count, made) = &*self.looks;
-        let mut looks = count.lock().unwrap_or_else(|e| e.into_inner());
-        let begun = looks.0;
+        let begun = self.looks.0.lock().unwrap_or_else(|e| e.into_inner()).0;
         self.nudge();
-        while looks.1 <= begun {
-            looks = made.wait(looks).unwrap_or_else(|e| e.into_inner());
+        self.await_look(begun);
+    }
+
+    /// Looks made so far.
+    pub fn looks(&self) -> u64 {
+        self.looks.0.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+
+    /// Blocks until more than `made` looks have been made.
+    pub fn await_look(&self, made: u64) {
+        let (count, signal) = &*self.looks;
+        let mut looks = count.lock().unwrap_or_else(|e| e.into_inner());
+        while looks.1 <= made {
+            looks = signal.wait(looks).unwrap_or_else(|e| e.into_inner());
         }
     }
 

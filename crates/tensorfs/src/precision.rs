@@ -80,13 +80,13 @@ impl Slot {
     }
 
     /// Its bits (§2.2): the request's; else 16 at `min_bits=16`; else 4 at `min_bits=4` for a
-    /// decode slot or a function whose 8-bit weights exceed the budget (`short`); else 8.
-    pub fn bits(&self, asked: u32, short: bool) -> u32 {
+    /// decode slot; else 8. Memory never lowers them: paging fits weights (owner, 2026-10-22).
+    pub fn bits(&self, asked: u32) -> u32 {
         match asked {
             _ if self.raw => 16,
             4 | 8 | 16 => asked,
             _ if self.min_bits == 16 => 16,
-            _ if self.min_bits == 4 && (self.decode || short) => 4,
+            _ if self.min_bits == 4 && self.decode => 4,
             _ => 8,
         }
     }
@@ -126,35 +126,24 @@ impl Slot {
 }
 
 impl Slot {
-    /// A reader's slot (`open`, `cozy model download`): 8 bits by default, encoded leaves taken.
-    pub const ANY: Slot = Slot { min_bits: 8, decode: false, encoded: true, raw: false };
-
-    /// The variant this slot takes at `bits` (spec §7 "Selection"): of those whose family the
-    /// order of `lanes` places and whose every kind runs on `gpus`, the first by that place, then
-    /// native over weight-only, then fewer bytes, then name; a commit's only variant otherwise.
-    pub fn select(&self, bits: u32, gpus: &Gpus, variants: &[(&str, &Profile)]) -> Option<usize> {
-        let order = self.lanes(bits, gpus);
-        let place = |p: &Profile| match p.family.as_str() {
-            "f32" => Some(order.len()),
-            "mxfp4" | "int4" => order.iter().position(|lane| *lane == "nvfp4"),
-            family => order.iter().position(|lane| *lane == family),
-        };
-        let native = |p: &Profile| match p.family.as_str() {
-            "nvfp4" | "mxfp4" => gpus.fp4,
-            "int4" => false,
-            _ => true,
-        };
-        let ranked = variants.iter().enumerate().filter(|(_, (_, p))| p.kinds.iter().all(|kind| runs(kind, gpus) && ((bits != 16 && self.encoded) || !matches!(Dtype::parse(kind), Dtype::Other(_)))));
-        let ranked = ranked.filter_map(|(at, (name, p))| Some(((place(p)?, !native(p), p.bytes, *name), at)));
-        ranked.min().map(|(_, at)| at).or_else(|| {
-            (variants.len() == 1 && variants[0].1.family.is_empty() && variants[0].1.kinds.iter().all(|kind| runs(kind, gpus) && ((bits != 16 && self.encoded) || !matches!(Dtype::parse(kind), Dtype::Other(_))))).then_some(0)
-        })
+    /// What it asks of a variant at the request's bits (`asked`, 0: none): that lane only when
+    /// asked (raw weights are data and ask none), else its own lane first; never narrower than
+    /// `min_bits` unasked; no encoded weights unless it takes encoded leaves.
+    pub fn constraints(&self, gpus: &Gpus, asked: u32) -> Constraints {
+        let bits = (!self.raw && matches!(asked, 4 | 8 | 16)).then_some(asked);
+        Constraints {
+            gpus: gpus.capabilities.clone(),
+            bits,
+            prefer: bits.is_none().then(|| self.bits(asked)),
+            min_bits: u32::try_from(self.min_bits).ok(),
+            plain: !self.encoded,
+        }
     }
 }
 
 /// A variant as the rule reads it, from its header alone (spec §7): every kind it holds (an
-/// encoded tensor's scheme, a plain one's dtype), its stored bytes, and the family and width of
-/// the kind holding most of them (`""`, 0 outside the table).
+/// encoded tensor's scheme, a plain one's dtype), its stored bytes, and its lane: the family and
+/// width of the narrowest kind of the table it holds (`""`, 0 when it holds none).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     pub bits: u32,
@@ -173,12 +162,12 @@ impl Profile {
             };
             *held.entry(kind).or_default() += tensor.locations().iter().map(|(_, at)| at.length).sum::<u64>();
         }
-        // The most bytes; of equal ones, the first name.
-        let dominant = held.iter().fold(None, |most: Option<(&String, u64)>, (kind, &n)| match most {
-            Some((_, m)) if m >= n => most,
-            _ => Some((kind, n)),
-        });
-        let (family, bits) = dominant.map_or(("", 0), |(kind, _)| family(kind));
+        // Its lane is the narrowest of the table's widths it holds: an nvfp4 variant that keeps
+        // its sensitive layers int8 is 4 bits, however many bytes those layers hold. Of that
+        // width, the kind with the most bytes; of equal ones, the first name.
+        let lane = held.iter().filter(|(kind, _)| family(kind).1 > 0)
+            .min_by_key(|(kind, n)| (family(kind).1, std::cmp::Reverse(**n), kind.as_str()));
+        let (family, bits) = lane.map_or(("", 0), |(kind, _)| family(kind));
         Self { bits, family: family.into(), bytes: held.values().sum(), kinds: held.into_keys().collect() }
     }
 }
@@ -198,47 +187,120 @@ fn family(kind: &str) -> (&'static str, u32) {
     }
 }
 
+/// The GPUs a scheme of the table needs (spec §7), for a refusal to name.
+fn needs(kind: &str) -> &'static str {
+    match family(kind).0 {
+        _ if !crate::format::SCHEMES.iter().any(|scheme| scheme.name == kind) => "a GPU reader",
+        "int8" => "sm80+ except sm103",
+        "fp8" => "sm89+",
+        "nvfp4" | "mxfp4" | "int4" => "sm80+",
+        _ => "a GPU reader",
+    }
+}
+
 /// Whether every GPU runs `kind`: a §5 dtype always; an encoding of the table where its family
-/// does; any other never.
+/// does; another scheme this reader implements always (it decodes anywhere); an unknown one never.
 fn runs(kind: &str, gpus: &Gpus) -> bool {
     if matches!(Dtype::parse(kind), Dtype::Other(_)) && !crate::format::SCHEMES.iter().any(|scheme| scheme.name == kind) { return false; }
     match family(kind).0 {
         "int8" => gpus.int8,
         "fp8" => gpus.fp8,
         "nvfp4" | "mxfp4" | "int4" => gpus.mma,
-        _ => !matches!(Dtype::parse(kind), Dtype::Other(_)),
+        _ => true,
     }
 }
 
-/// What a reader asks of a variant (spec §7): the GPUs it runs on, by compute capability
-/// (`"8.9"`; none is the CPU), and its bits (4, 8 or 16; none: 8).
+/// What a reader or a slot asks of a variant (spec §7): the GPUs it runs on, by compute
+/// capability (`"8.9"`; none is the CPU); `bits`, asked explicitly, which only that lane answers;
+/// else `prefer` (none: 8), the lane ranked first. A slot adds `min_bits`, the narrowest it takes
+/// unasked, and `plain`, that it takes no encoded weights.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Constraints {
     #[serde(default)]
     pub gpus: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bits: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_bits: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plain: bool,
 }
 
 impl Constraints {
+    /// Refused unless each width they name is 4, 8 or 16.
+    pub fn check(&self) -> crate::Result<()> {
+        match [self.bits, self.prefer, self.min_bits].into_iter().flatten().find(|bits| ![4, 8, 16].contains(bits)) {
+            Some(bits) => crate::failure::fail(crate::Kind::Invalid, format!("bits {bits} is not 4, 8 or 16")),
+            None => Ok(()),
+        }
+    }
+
     /// The variant these take among `variants` and the reasons it is not their first choice,
-    /// naming `model` (`org/name@release`); `None` when none is selectable.
-    pub fn select(&self, model: &str, variants: &[(&str, &Profile)]) -> crate::Result<Option<(usize, Vec<String>)>> {
-        if self.bits.is_some_and(|bits| ![4, 8, 16].contains(&bits)) {
-            return crate::failure::fail(crate::Kind::Invalid, format!("bits {} is not 4, 8 or 16", self.bits.unwrap_or_default()));
+    /// naming `model` (`org/name@release`): of those that work, the first in the lane order,
+    /// then native over weight-only, then fewer bytes, then path; one outside the order only
+    /// when none in it works. Refused when none works, naming each variant and why.
+    pub fn select(&self, model: &str, variants: &[(&str, &Profile)]) -> crate::Result<(usize, Vec<String>)> {
+        self.check()?;
+        let (gpus, slot, bits) = self.rule();
+        let order = slot.lanes(bits, &gpus);
+        let place = |p: &Profile| match p.family.as_str() {
+            "f32" => Some(order.len()),
+            "mxfp4" | "int4" => order.iter().position(|lane| *lane == "nvfp4"),
+            family => order.iter().position(|lane| *lane == family),
+        };
+        let native = |p: &Profile| match p.family.as_str() {
+            "nvfp4" | "mxfp4" => gpus.fp4,
+            "int4" => false,
+            _ => true,
+        };
+        let works = variants.iter().enumerate().filter(|(_, (_, p))| self.refusal(p).is_none());
+        let ranked = works.map(|(at, (name, p))| ((place(p).unwrap_or(order.len() + 1), !native(p), p.bytes, *name), at));
+        if let Some((_, at)) = ranked.min() {
+            return Ok((at, slot.warnings(bits, &gpus, model, &variants[at].1.family)));
         }
+        let mut each: Vec<_> = variants.iter().map(|(name, p)| {
+            let label = if p.family.is_empty() { p.kinds.join("+") } else { p.family.clone() };
+            (*name, format!("{name} ({label}) {}", self.refusal(p).unwrap_or_default()))
+        }).collect();
+        each.sort();
+        let published = if each.is_empty() { "none".into() } else { each.into_iter().map(|(_, said)| said).collect::<Vec<_>>().join("; ") };
+        crate::failure::fail(crate::Kind::NotFound,
+            format!("precision {bits} on {}: {model} has no variant that works; it publishes {published}", gpus.name))
+    }
+
+    /// The reasons `served`, which these selected, is not their first choice.
+    pub fn warnings(&self, model: &str, served: &Profile) -> Vec<String> {
+        let (gpus, slot, bits) = self.rule();
+        slot.warnings(bits, &gpus, model, &served.family)
+    }
+
+    /// Their GPUs, the slot the lane order reads, and the bits it ranks first.
+    fn rule(&self) -> (Gpus, Slot, u32) {
         let ccs: Vec<&str> = self.gpus.iter().map(String::as_str).collect();
-        let (gpus, bits) = (Gpus::of(&ccs), Slot::ANY.bits(self.bits.unwrap_or(0), false));
-        // The owner's rule (10-22): with no explicit lane, a sole variant is used, a GPU-less
-        // host included; GPUs present that cannot run it are an error. An explicit lane goes by
-        // the lane rule below (one it does not match is an error).
-        // A kind this reader cannot decode stays refused.
-        let known = |kind: &String| !matches!(Dtype::parse(kind), Dtype::Other(_)) || crate::format::SCHEMES.iter().any(|scheme| scheme.name == *kind);
-        if let ([(_, only)], None) = (variants, self.bits) {
-            let usable = only.kinds.iter().all(known) && (ccs.is_empty() || only.kinds.iter().all(|kind| runs(kind, &gpus)));
-            return Ok(usable.then(Vec::new).map(|reasons| (0, reasons)));
+        let slot = Slot { min_bits: 4, decode: false, encoded: !self.plain, raw: false };
+        (Gpus::of(&ccs), slot, self.bits.or(self.prefer).unwrap_or(8))
+    }
+
+    /// Why a variant of profile `p` does not work under these (spec §7), or `None`: another lane
+    /// than the one asked, encoded weights where none are taken, narrower than `min_bits`
+    /// unasked, or an encoding no one of the GPUs runs (with none, the CPU reads every one).
+    fn refusal(&self, p: &Profile) -> Option<String> {
+        let encoded: Vec<&str> = p.kinds.iter().map(String::as_str).filter(|kind| matches!(Dtype::parse(kind), Dtype::Other(_))).collect();
+        let holds = || format!("holds encoded {}", encoded.join(", "));
+        match self.bits {
+            Some(bits) if p.bits != bits => return Some(format!("is not {bits}-bit")),
+            Some(16) if !encoded.is_empty() => return Some(holds()),
+            _ if self.plain && !encoded.is_empty() => return Some(holds()),
+            None if self.min_bits.is_some_and(|min| p.bits > 0 && p.bits < min) => {
+                return Some(format!("is {}-bit, under {}", p.bits, self.min_bits.unwrap_or_default()));
+            }
+            _ => {}
         }
-        Ok(Slot::ANY.select(bits, &gpus, variants).map(|at| (at, Slot::ANY.warnings(bits, &gpus, model, &variants[at].1.family))))
+        let unrun: Vec<String> = encoded.iter().filter(|kind| !self.gpus.is_empty() && !self.gpus.iter().any(|cc| runs(kind, &Gpus::of(&[cc]))))
+            .map(|kind| format!("{} for {kind}", needs(kind))).collect();
+        (!unrun.is_empty()).then(|| format!("needs {}", unrun.join(" and ")))
     }
 }
 
@@ -247,13 +309,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Each row's lane for a compute slot, a `min_bits=4` decode slot, `--bits=4` and
-    /// `--bits=16` (design §2.2's derived table).
+    /// Each row's lane for a compute slot, a `min_bits=4` decode slot, `--lane 4` and
+    /// `--lane 16` (design §2.2's derived table).
     #[test]
     fn one_lane_per_row() {
         let compute = Slot::of(&json!({"encoded_leaves": "accept"}));
         let decode = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 4, "phase": "decode"}));
-        let first = |slot: &Slot, asked, cc: &[&str]| slot.lanes(slot.bits(asked, false), &Gpus::of(cc))[0];
+        let first = |slot: &Slot, asked, cc: &[&str]| slot.lanes(slot.bits(asked), &Gpus::of(cc))[0];
         for (cc, eight) in [("8.0", "int8"), ("8.6", "int8"), ("8.9", "int8"), ("9.0", "int8"), ("10.0", "int8"),
             ("10.3", "fp8"), ("12.0", "int8"), ("12.1", "int8"), ("11.0", "int8")] {
             assert_eq!(first(&compute, 0, &[cc]), eight, "{cc}");
@@ -272,9 +334,11 @@ mod tests {
         assert_eq!(compute.lanes(4, &Gpus::of(&["12.0"])), ["nvfp4", "int8", "fp8", "bf16", "fp16"]);
         assert_eq!(compute.lanes(4, &Gpus::of(&["12.1"])), ["nvfp4", "int8", "fp8", "bf16", "fp16"], "GB10 proved fp8");
         let exact = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 16}));
-        assert_eq!((exact.bits(0, true), exact.bits(8, false)), (16, 8), "the request's bits win");
+        assert_eq!((exact.bits(0), exact.bits(8)), (16, 8), "the request's bits win");
+        let compute4 = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 4}));
+        assert_eq!(compute4.bits(0), 8, "only a decode slot prefers 4 bits; memory never lowers them");
         let raw = Slot::of(&json!({"encoded_leaves": "accept", "min_bits": 4, "phase": "decode", "weights": true}));
-        assert_eq!((raw.bits(4, true), raw.lanes(raw.bits(8, false), &Gpus::of(&["10.0"]))), (16, vec!["bf16", "fp16"]), "raw weights are data");
+        assert_eq!((raw.bits(4), raw.lanes(raw.bits(8), &Gpus::of(&["10.0"]))), (16, vec!["bf16", "fp16"]), "raw weights are data");
         assert!(raw.warnings(16, &Gpus::of(&["9.0"]), "x@1", "fp16").is_empty());
     }
 
@@ -316,9 +380,15 @@ mod tests {
     }
 }
 
+/// This rule's version. An index answer of another (a Hub whose profiles an older rule derived)
+/// is not taken: the headers are read instead.
+pub const RULE: u32 = 3;
+
 /// The Hub's indexed answer, with the same rule as local header selection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Selection {
+    #[serde(default)]
+    pub rule: u32,
     pub release: String,
     pub commit: crate::format::ObjectRef,
     pub variant: Option<String>,

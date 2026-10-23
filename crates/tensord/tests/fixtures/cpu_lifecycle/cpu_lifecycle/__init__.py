@@ -1,4 +1,4 @@
-"""Executor lifecycle fixture: cooperative steps, an uncooperative wedge, an abrupt exit."""
+"""Executor lifecycle fixture: cooperative steps, slow work, an uncooperative wedge, an abrupt exit."""
 from __future__ import annotations
 
 import os
@@ -38,6 +38,24 @@ def wedge(payload: Steps, ctx: Context, tel: Telemetry) -> Done:
     """Reports one step, then blocks forever without checking cancellation."""
     tel.step_callback(1, stage="wedge")(0)
     threading.Event().wait()
+    return Done(0)
+
+
+@app.entrypoint
+def drip(payload: Steps, ctx: Context) -> Done:
+    """Slow and saying so: a line on stderr, then a sleep, at every step."""
+    for index in range(payload.steps):
+        print(f"step {index}", file=sys.stderr, flush=True)
+        time.sleep(payload.seconds)
+    return Done(payload.steps)
+
+
+@app.entrypoint
+def burn(payload: Steps, ctx: Context) -> Done:
+    """Slow and silent: computes for `seconds`, with no step, frame or line."""
+    end = time.monotonic() + payload.seconds
+    while time.monotonic() < end:
+        pass
     return Done(0)
 
 

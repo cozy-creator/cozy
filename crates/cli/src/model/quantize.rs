@@ -27,10 +27,9 @@ fn quantizers<'a>(interface: &'a Interface, lane: &str, components: &[String]) -
         .collect()
 }
 
-/// The exact checkpoint to quantize spelled for the run, the components it carries and its
-/// repository. A Hub
-/// model names one lane: the newest available release when none is named, and its only lane
-/// unless one is named.
+/// The checkpoint to quantize spelled for the run, the components it carries and its repository.
+/// A Hub model is its release (the newest available when none is named): the quantizer's slot
+/// selects its variant by the one rule, as any run's does; the components are every variant's.
 async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef) -> Result<(String, Vec<String>, Repo), Error> {
     let client = ctx.hub_client(hub)?;
     match model {
@@ -38,7 +37,7 @@ async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef) -> Result<(Strin
             let resolved = hub_answer(client.resolve_model(None, &format!("{repo}@{manifest}")).await)?;
             Ok((model.to_string(), resolved.components.unwrap_or_default(), repo.clone()))
         }
-        ModelRef::Hub { repo, release, lane } => {
+        ModelRef::Hub { repo, release } => {
             let card = hub_answer(client.get_model(&repo.org, &repo.name).await)?;
             let found = match release {
                 Some(want) => card.releases.iter().find(|r| &r.release == want),
@@ -51,21 +50,12 @@ async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef) -> Result<(Strin
                 Error::new(Kind::NotFound, "model_release_not_found", format!("{repo} has no release {}", release.as_deref().unwrap_or("available")))
                     .next(format!("cozy model info {repo}"))
             })?;
-            let lanes: Vec<_> = found.lanes.iter().filter(|l| lane.as_ref().is_none_or(|want| &l.lane == want)).collect();
-            let names: Vec<_> = found.lanes.iter().map(|l| format!("{:?}", l.lane)).collect();
-            let [one] = lanes.as_slice() else {
-                let (kind, code, why) = match lane {
-                    Some(want) => (Kind::NotFound, "model_lane_not_found", format!("has no lane {want:?}; its lanes: {}", names.join(", "))),
-                    None => (Kind::Usage, "model_lane_unnamed", format!("has lanes {}: name the one to quantize", names.join(", "))),
-                };
-                return Err(Error::new(kind, code, format!("{repo}@{} {why}", found.release)).next(format!("cozy model info {repo}@{}", found.release)));
-            };
-            // The unnamed lane (a model's only variant) is the release itself.
-            let target = match one.lane.as_str() {
-                "" => format!("{repo}@{}", found.release),
-                named => format!("{repo}@{}/{named}", found.release),
-            };
-            Ok((target, one.components.clone().unwrap_or_default(), repo.clone()))
+            let mut each = found.lanes.iter().map(|l| l.components.clone().unwrap_or_default());
+            let first = each.next().ok_or_else(|| {
+                Error::new(Kind::NotFound, "model_lane_not_found", format!("{repo}@{} has no variant", found.release))
+            })?;
+            let components = each.fold(first, |held, next| held.into_iter().filter(|c| next.contains(c)).collect());
+            Ok((format!("{repo}@{}", found.release), components, repo.clone()))
         }
         ModelRef::Local(_) | ModelRef::Provider(_) => Err(Error::new(Kind::Usage, "model_quantize_source", format!("{model} is not on the Hub: quantize reads a Hub model"))
             .next(format!("cozy model upload {model} <org/name>"))),

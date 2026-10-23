@@ -170,6 +170,23 @@ fn an_executor_that_ends_mid_call_fails_its_run_once() {
     assert_eq!((again.id, again.state, again.attempt), (failed.id, State::Failed, 1));
 }
 
+/// A run that shows no progress fails, with nobody's cancel: no frame, line, byte, CPU or GPU
+/// work for longer than the floor (run 13543, a script blocked for 3.3 h, held its rental).
+/// Slow runs that keep printing or computing past that floor end on their own. Production
+/// sampling: the floor is 30 s, so this takes about two minutes.
+#[test]
+fn a_run_that_shows_no_progress_fails_and_slow_working_runs_do_not() {
+    let machine = Machine::open();
+    let stuck = machine.run("wedge", "wedge", json!({}));
+    assert_eq!(stuck.state, State::Failed, "{stuck:?}");
+    let failure = stuck.failure.as_deref().unwrap_or_default();
+    assert!(failure.contains("no_progress") && failure.contains("no measurable progress"), "{failure}");
+    let printing = machine.run("drip", "drip", json!({"steps": 5, "seconds": 9.0}));
+    assert_eq!(printing.state, State::Completed, "{printing:?}");
+    let computing = machine.run("burn", "burn", json!({"seconds": 40.0}));
+    assert_eq!(computing.state, State::Completed, "{computing:?}");
+}
+
 /// A cancel needs an actor, stops the call at its next safe point, and keeps the progress it
 /// had made; nothing is killed for time.
 #[test]

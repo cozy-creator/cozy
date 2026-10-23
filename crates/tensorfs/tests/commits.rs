@@ -104,9 +104,9 @@ async fn writer_variants_accumulate_on_a_tag_and_publish_as_one_release() {
     });
     published.await.unwrap();
     for (variant, weight) in [("bf16", b"bf16"), ("int8", b"int8")] {
-        assert_eq!(read(&scratch.0.join(format!("r-{variant}")), &endpoint, &format!("acme/two@0.2.0/{variant}")).await, weight);
+        assert_eq!(read(&scratch.0.join(format!("r-{variant}")), &endpoint, &format!("acme/two@0.2.0/model.{variant}.cozytensors")).await, weight);
     }
-    let latest = client.open("acme/two", &Open { variant: Some("int8".into()), ..Open::default() }).await.unwrap();
+    let latest = client.open("acme/two", &Open { variant: Some("model.int8.cozytensors".into()), ..Open::default() }).await.unwrap();
     assert_eq!(latest.tree(), Some(&main), "the default is 0.2.0, main's commit");
 }
 
@@ -134,9 +134,9 @@ async fn an_upload_keeps_the_tags_other_files_and_deletes_only_by_pattern() {
         assert_eq!(after.files["README.md"], ObjectRef::of(b"c"));
         assert_eq!(after.files["model.bf16.cozytensors"], both.files["model.bf16.cozytensors"]);
     }
-    let bf16 = read(&scratch.0.join("reader"), &endpoint, "acme/up@main/bf16").await;
+    let bf16 = read(&scratch.0.join("reader"), &endpoint, "acme/up@main/model.bf16.cozytensors").await;
     assert_eq!(bf16, b"bf16");
-    let gone = client.open("acme/up@main/int8", &Open::default()).await.unwrap_err();
+    let gone = client.open("acme/up@main/model.int8.cozytensors", &Open::default()).await.unwrap_err();
     assert_eq!(gone.kind, Kind::NotFound, "{}", gone.detail);
 }
 

@@ -89,8 +89,9 @@ impl Client {
         if !crate::format::tag_name(tag) {
             return fail(Kind::Invalid, format!("{tag:?} is not a tag name"));
         }
-        let variant = options.variant.unwrap_or("").to_owned();
-        crate::format::check_file(&crate::format::variant_path(&variant))?;
+        // A variant is its path: a bare name is written as `model.<name>.cozytensors`.
+        let variant = crate::format::variant_path(options.variant.unwrap_or(""));
+        crate::format::check_file(&variant)?;
         let store = self.store.clone();
         let declared = options
             .base

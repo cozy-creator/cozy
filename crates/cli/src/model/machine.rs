@@ -162,7 +162,12 @@ fn made(ctx: &Context, run: &Run) {
     let text = |key: &str| model[key].as_str().filter(|s| !s.is_empty());
     let mut record = Record::new();
     for key in ["repository", "release", "lane", "checkpoint", "resolved"] {
-        if let Some(value) = text(key) {
+        // A variant is its path; its header names its precision lane (int8, fp8, …).
+        let value = match (key, text(key), text("precision")) {
+            ("lane", Some(path), Some(precision)) => Some(format!("{path} ({precision})")),
+            (_, value, _) => value.map(str::to_owned),
+        };
+        if let Some(value) = value {
             record = record.field(key, value);
         }
     }
@@ -187,11 +192,18 @@ pub(crate) async fn download(ctx: &Context, args: Download) -> Result<ExitCode, 
         Some(_) => return Err(usage("model_alias_invalid", "the name a machine keeps a model under is local/<name>")),
         None => String::new(),
     };
-    let made = source(&args.model, &[])?;
+    let mut made = source(&args.model, &[])?;
     if made.1.is_some() && destination.is_empty() {
         return Err(usage("model_alias_missing", "a local file is kept under a name: add local/<name>"));
     }
-    warm(ctx, &args.placement, args.detach, args.model.clone(), made.into(), destination, args.bits.as_deref().map_or(0, |b| b.parse().expect("clap checked bits"))).await
+    if let Some(variant) = &args.variant {
+        if made.0.repository.is_empty() || made.0.repository.starts_with("local/") {
+            return Err(usage("model_variant_pin", "--variant names a variant of a Hub model or checkpoint"));
+        }
+        made.0.lane = refs::variant(variant)?;
+    }
+    let lane = args.lane.as_deref().map_or(0, |b| b.parse().expect("clap admits 16, 8 or 4"));
+    warm(ctx, &args.placement, args.detach, args.model.clone(), made.into(), destination, lane).await
 }
 
 pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Error> {
@@ -218,6 +230,8 @@ struct Held {
     model: String,
     release: String,
     lane: String,
+    /// Its header's precision lane (`int8`, …).
+    precision: String,
     checkpoint: String,
     yanked: bool,
     bytes: u64,
@@ -239,20 +253,21 @@ pub(crate) async fn list(ctx: &Context, args: List) -> Result<ExitCode, Error> {
         };
         stores.push(format!("{}: {} in {} models", machine.name, output::bytes(status.models_bytes), status.models.len()));
         for model in &status.models {
-            let held = |release: &str, lane: &str, checkpoint: &str, yanked| Held {
+            let held = |release: &str, lane: (&str, &str), checkpoint: &str, yanked| Held {
                 machine: machine.name.clone(),
                 model: model.repository.clone(),
                 release: release.into(),
-                lane: lane.into(),
+                lane: lane.0.into(),
+                precision: lane.1.into(),
                 checkpoint: checkpoint.into(),
                 yanked,
                 bytes: model.total_bytes,
                 shared_bytes: model.total_bytes.saturating_sub(model.unique_bytes),
             };
             if model.checkpoints.is_empty() {
-                rows.push(held("", "", "", false));
+                rows.push(held("", ("", ""), "", false));
             }
-            rows.extend(model.checkpoints.iter().map(|c| held(&c.release, &c.lane, &c.manifest, c.yanked)));
+            rows.extend(model.checkpoints.iter().map(|c| held(&c.release, (&c.lane, &c.precision), &c.manifest, c.yanked)));
         }
     }
     if ctx.json {
@@ -261,7 +276,13 @@ pub(crate) async fn list(ctx: &Context, args: List) -> Result<ExitCode, Error> {
     }
     let mut table = Table::new(ctx, ["machine", "model", "release", "lane", "size", "shared"]);
     for row in &rows {
-        let lane = if row.yanked { format!("{} (yanked)", row.lane) } else { row.lane.clone() };
+        let mut lane = match row.precision.is_empty() {
+            true => row.lane.clone(),
+            false => format!("{} ({})", row.lane, row.precision),
+        };
+        if row.yanked {
+            lane.push_str(" (yanked)");
+        }
         let (size, shared) = (output::bytes(row.bytes), output::bytes(row.shared_bytes));
         table = table.row([row.machine.as_str(), &row.model, &row.release, &lane, &size, &shared]);
     }
