@@ -49,7 +49,8 @@ fn found(card: &ModelCard) -> Found {
 pub(crate) async fn search(ctx: &Context, args: Search) -> Result<ExitCode, Error> {
     let client = ctx.hub_anonymous(&ctx.hub()?);
     let exact = match (&args.family, args.query.as_slice()) {
-        (None, [one]) => Repo::parse(one).ok(),
+        // A single word is search text (a root name among its matches, first); org/name is one model.
+        (None, [one]) if one.contains('/') => Repo::parse(one).ok(),
         _ => None,
     };
     let (cards, total) = match exact {
