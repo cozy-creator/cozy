@@ -236,7 +236,7 @@ mod tests {
             .iter()
             .find(|c| c.name == "generate")
             .unwrap();
-        let mut with = terms(&["a cat", "steps=8", "model.model=Fidika/SDXL-Base@1.0/int8"]);
+        let mut with = terms(&["a cat", "steps=8", "model.model=Fidika/SDXL-Base@1.0"]);
         with.loras = vec!["model:unet=fidika/detail#sha256:".to_owned() + &"a".repeat(64) + ",0.5"];
         let bound = bind("fidika/sdxl/generate", None, generate, &with).unwrap();
         let call = Call {
@@ -273,7 +273,7 @@ mod tests {
                 model.release.as_str(),
                 model.lane.as_str()
             ),
-            ("model", "fidika/sdxl-base", "1.0", "int8")
+            ("model", "fidika/sdxl-base", "1.0", "")
         );
         let adapter = &model.adapters[0];
         assert_eq!(

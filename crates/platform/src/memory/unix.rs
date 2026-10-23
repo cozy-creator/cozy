@@ -112,6 +112,12 @@ pub fn peer(stream: &Stream) -> Result<(u32, u32)> {
 
 pub type Stream = std::os::unix::net::UnixStream;
 
+/// What another process maps read and write: another descriptor of the page (sealing, where
+/// the OS has it, keeps its size).
+pub fn lend(page: &Owned) -> Result<Owned> {
+    Ok(page.try_clone()?)
+}
+
 /// Whether the file still has a name.
 pub fn linked(f: &Owned) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
@@ -171,5 +177,62 @@ pub(super) fn serve_listener(listener: &std::os::unix::net::UnixListener, stop: 
             }
         }
         conns = next;
+    }
+}
+
+/// What [`wait_any`] waits on: a descriptor that turns readable.
+pub type Waitable<'a> = std::os::fd::BorrowedFd<'a>;
+
+/// A local wake one process sets and its own threads wait on: a socket pair whose read end is
+/// readable from a set until it is cleared.
+pub struct Signal {
+    read: std::os::unix::net::UnixStream,
+    write: std::os::unix::net::UnixStream,
+}
+
+impl Signal {
+    pub fn new() -> Result<Signal> {
+        let (read, write) = std::os::unix::net::UnixStream::pair()?;
+        read.set_nonblocking(true)?;
+        write.set_nonblocking(true)?;
+        Ok(Signal { read, write })
+    }
+
+    /// A full pair is set already: the byte that did not fit is not needed.
+    pub fn set(&self) {
+        let _ = std::io::Write::write(&mut &self.write, &[1]);
+    }
+
+    /// Clears it; true when it was set.
+    pub fn clear(&self) -> bool {
+        let mut buf = [0u8; 64];
+        let mut set = false;
+        while let Ok(1..) = std::io::Read::read(&mut &self.read, &mut buf) {
+            set = true;
+        }
+        set
+    }
+
+    pub fn waitable(&self) -> Waitable<'_> {
+        std::os::fd::AsFd::as_fd(&self.read)
+    }
+}
+
+/// Blocks until one of `items` is readable, or hung up or failed (then it stays ready: the
+/// caller drops it); the lowest such index. No timeout.
+pub fn wait_any(items: &[Waitable<'_>]) -> Result<usize> {
+    let mut fds: Vec<libc::pollfd> = items.iter().map(|fd| libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
+    loop {
+        // SAFETY: descriptors the caller borrows for the call; no timeout.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } >= 0 {
+            if let Some(i) = fds.iter().position(|fd| fd.revents != 0) {
+                return Ok(i);
+            }
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(Error::os("wait")(error));
+        }
     }
 }

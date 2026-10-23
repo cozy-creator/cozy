@@ -934,12 +934,12 @@ fn a_two_variant_repo_shares_chunks_and_files_and_gc_keeps_its_closure() {
         assert!(intact(&store, o), "{} is kept", o.sha256);
     }
 
-    assert_eq!(store.variant(&at, Some("int8")).unwrap().id(), int8.id());
-    let ck = store.variant(&at, Some("bf16")).unwrap();
+    assert_eq!(store.variant(&at, Some("model.int8.cozytensors")).unwrap().id(), int8.id());
+    let ck = store.variant(&at, Some("model.bf16.cozytensors")).unwrap();
     for (key, bytes) in &tensors {
         assert!(ck.read("unet", key).unwrap() == *bytes, "{key}");
     }
-    assert!(store.variant(&at, Some("int8")).unwrap().missing(None).unwrap().is_empty());
+    assert!(store.variant(&at, Some("model.int8.cozytensors")).unwrap().missing(None).unwrap().is_empty());
 }
 
 /// Every file under `dir`, by relative path.
@@ -1011,16 +1011,16 @@ fn a_plain_folder_round_trips_through_the_store() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(own.len(), 1, "only the new pack: {own:?}");
-    let alone = Checkpoint::folder(&thin, Some("int8"), None).unwrap();
+    let alone = Checkpoint::folder(&thin, Some("model.int8.cozytensors"), None).unwrap();
     assert_eq!(alone.id(), &int8);
     assert_eq!(alone.missing(None).unwrap().len(), 3, "big.weight's two objects and the asset are the store's");
-    let cached = Checkpoint::folder(&thin, Some("int8"), Some(&store)).unwrap();
+    let cached = Checkpoint::folder(&thin, Some("model.int8.cozytensors"), Some(&store)).unwrap();
     assert!(cached.read("unet", "big.weight").unwrap() == tensors[0].1);
     let (_, absent) = scratch.store("empty").admit_folder(&thin).unwrap();
     assert_eq!(absent.len(), 3, "big.weight's two objects and the asset are in neither place");
     let (thin_tree, absent) = store.admit_folder(&thin).unwrap();
     assert!(absent.is_empty());
-    assert!(store.variant(&thin_tree, Some("int8")).unwrap().missing(None).unwrap().is_empty());
+    assert!(store.variant(&thin_tree, Some("model.int8.cozytensors")).unwrap().missing(None).unwrap().is_empty());
 
     let resumed = scratch.0.join("resumed");
     let mut w = Writer::folder(&resumed, "", None, true).unwrap();

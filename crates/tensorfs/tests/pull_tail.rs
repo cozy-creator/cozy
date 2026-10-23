@@ -24,7 +24,7 @@ async fn pull(server: &Server, name: &str, config: Config) -> (Duration, Fetcher
     let origin: Arc<dyn Origin> = Arc::new(Endpoint::new(&client(), &server.base, None).unwrap().anonymous());
     let started = Instant::now();
     let pulled = fetcher
-        .pull(&origin, name, None, Some("int8"), &Want::default())
+        .pull(&origin, name, None, Some("model.int8.cozytensors"), &Want::default())
         .await;
     pulled.unwrap_or_else(|refusal| panic!("{name}: {refusal}"));
     (started.elapsed(), fetcher, root)
@@ -215,4 +215,76 @@ async fn streams_grow_while_more_of_them_pay() {
     eprintln!("{:.2} s; {:?}", took.as_secs_f64(), fetcher.stats());
     assert!(fetcher.stats().streams > 4, "{:?}", fetcher.stats());
     assert_eq!(blobs(&root), blobs(&origin_dir));
+}
+
+/// What R2 answers a range that starts past the object's end.
+fn refused_range() -> String {
+    let body = r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>InvalidRange</Code><Message>The requested range is not satisfiable</Message></Error>"#;
+    format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/xml\r\ncontent-length: {}\r\n\r\n{body}", body.len())
+}
+
+/// An answer whose last byte came but whose end never did (a chunked body left open) is dropped
+/// as silent; its bytes are then committed without asking past the end, which R2 refuses (400
+/// for `bytes=N-(N-1)`, v9's H3 pull).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_whose_end_never_comes_is_committed_without_asking_past_it() {
+    let origin_dir = temporary("open-end-origin");
+    let model = model(&origin_dir, "acme/open-end", &[("unet", &[4 * MIB; 8])], 15);
+    let open = format!("/{}", model.chunks["unet"][0].key());
+    let watched = open.clone();
+    let server = Server::serve(
+        &origin_dir,
+        Arc::new(move |ask, body, socket| {
+            if ask.path != open {
+                return false;
+            }
+            if ask.first >= body.len() {
+                let _ = std::io::Write::write_all(socket, refused_range().as_bytes());
+                return true;
+            }
+            if ask.n > 1 {
+                return false;
+            }
+            let start = format!("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n", body.len());
+            let _ = std::io::Write::write_all(socket, start.as_bytes())
+                .and_then(|()| std::io::Write::write_all(socket, body))
+                .and_then(|()| std::io::Write::write_all(socket, b"\r\n"));
+            hold(socket);
+            true
+        }),
+    );
+    let (_, fetcher, root) = pull(&server, "acme/open-end", config(Duration::from_millis(20))).await;
+    assert_eq!(blobs(&root), blobs(&origin_dir));
+    let asks: Vec<Ask> = server.blob_asks().into_iter().filter(|a| a.path == watched).collect();
+    assert!(asks.iter().all(|a| a.first < 4 * MIB), "asked past the end: {asks:?}");
+    assert!(fetcher.stats().restarts >= 1, "the open answer was judged silent: {:?}", fetcher.stats());
+}
+
+/// An origin's error answer is refused with what the origin said and the range asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_error_answer_is_refused_with_what_the_origin_said_and_the_range_asked() {
+    let origin_dir = temporary("said-origin");
+    let model = model(&origin_dir, "acme/said", &[("unet", &[MIB; 2])], 16);
+    let refused = format!("/{}", model.chunks["unet"][0].key());
+    let server = Server::serve(
+        &origin_dir,
+        Arc::new(move |ask, _, socket| {
+            if ask.path != refused {
+                return false;
+            }
+            let body = r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>InvalidArgument</Code><Message>Invalid Argument: Credential access key has length 0, should be 32</Message></Error>"#;
+            let answer = format!("HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+            let _ = std::io::Write::write_all(socket, answer.as_bytes());
+            true
+        }),
+    );
+    let root = temporary("said-store");
+    let fetcher = Fetcher::new(open_store(&root) as Arc<dyn ObjectStore>, client(), None, config(Duration::from_millis(20)));
+    let origin: Arc<dyn Origin> = Arc::new(Endpoint::new(&client(), &server.base, None).unwrap().anonymous());
+    let refusal = fetcher
+        .pull(&origin, "acme/said", None, Some("model.int8.cozytensors"), &Want::default())
+        .await
+        .expect_err("the origin refused a chunk");
+    let said = refusal.to_string();
+    assert!(said.contains("400") && said.contains("<Code>InvalidArgument</Code>") && said.contains("range none"), "{said}");
 }

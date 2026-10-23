@@ -76,6 +76,16 @@ pub(crate) fn reopen(f: &Owned, write: bool) -> Result<Owned> {
     Ok(platform::memory::reopen(f, write)?)
 }
 
+/// A shared page (a lease table) no holder can resize under another's mapping: a memfd sealed
+/// against resizing (an agent's ftruncate would SIGBUS the manager), or on Windows a pagefile
+/// section, which no holder can shrink.
+pub(crate) fn sealed_page(len: u64) -> Result<Owned> {
+    let page = platform::memory::page(len)?;
+    #[cfg(unix)]
+    platform::shm::seal_with(std::os::fd::AsFd::as_fd(&page), platform::shm::RESIZE_SEALS)?;
+    Ok(page)
+}
+
 pub(crate) fn linked(f: &Owned) -> Result<bool> {
     Ok(platform::memory::linked(f)?)
 }
@@ -136,6 +146,11 @@ pub(crate) fn peer(stream: &Stream) -> Result<u32> {
         return Err(Error::Invalid(format!("a peer of uid {uid} is not accepted")));
     }
     Ok(pid)
+}
+
+/// A page (a lease table, a host chunk) for another process to map read and write, never resize.
+pub(crate) fn lend(page: &Owned) -> Result<Owned> {
+    Ok(platform::memory::lend(page)?)
 }
 
 pub(crate) fn dup(h: &Owned) -> Result<Owned> {

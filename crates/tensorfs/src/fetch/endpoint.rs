@@ -35,6 +35,7 @@ use super::policy::is_loopback_origin;
 use super::token::{default_for, s3_base, Request, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::{is_digest, repo_key, repo_name, Header, ObjectRef, Repo, Tree};
+use crate::precision::{Constraints, Selection};
 use crate::sha256::{digest, hex, hex_digest};
 use crate::store::Store;
 
@@ -290,23 +291,6 @@ impl Endpoint {
         }
     }
 
-    /// Optional indexed variant selection. Static origins and older Hubs fall back to the
-    /// same pure rule over their headers; their lack of this route is not a protocol failure.
-    pub async fn select(&self, name: &str, revision: &str, constraints: &crate::precision::Constraints) -> Result<Option<crate::precision::Selection>> {
-        check_repo_name(name)?;
-        constraints.select(name, &[]).map_err(|e| Refusal { code: Code::KEY_GRAMMAR, detail: e.to_string() })?;
-        let At::Http(base) = &self.at else { return Ok(None) };
-        let escaped = |value: &str| repo_url("", value).trim_start_matches('/').to_owned();
-        let mut url = format!("{}/select?revision={}&gpus={}", repo_url(base, &format!("v1/models/{name}")), escaped(revision), escaped(&constraints.gpus.join(",")));
-        if let Some(bits) = constraints.bits { url.push_str(&format!("&bits={bits}")); }
-        let reply = self.exchange(Ask { method: "GET", url: &url, headers: vec![], body: None, payload: None, auth: true }).await?;
-        match reply.status {
-            404 | 405 => Ok(None),
-            200 => serde_json::from_slice(&reply.body).map(Some).map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() }),
-            _ => Err(refusal(&reply, "GET")),
-        }
-    }
-
     /// An object named by digest, including its length, or `None` when absent or unreadable.
     pub async fn object(&self, sha256: &str) -> Result<Option<ObjectRef>> {
         let sha256 = sha256.strip_prefix("sha256:").unwrap_or(sha256);
@@ -539,6 +523,30 @@ impl Origin for Endpoint {
         match self.repo(name).await? {
             Some((repo, _)) => Ok(repo),
             None => refuse(Code::REF_NOT_FOUND, format!("no repo {name} at {}", self.url)),
+        }
+    }
+
+    /// The Hub's indexed selection; `None` from a directory or an origin without the route.
+    async fn select(&self, name: &str, revision: &str, constraints: &Constraints) -> Result<Option<Selection>> {
+        check_repo_name(name)?;
+        constraints.check().map_err(|e| Refusal { code: Code::KEY_GRAMMAR, detail: e.detail })?;
+        let At::Http(base) = &self.at else { return Ok(None) };
+        let escaped = |value: &str| repo_url("", value).trim_start_matches('/').to_owned();
+        // The rule names this reader: a Hub answers an older one in its own rule (spec §7).
+        let mut url = format!("{}/select?revision={}&gpus={}&rule={}", repo_url(base, &format!("v1/models/{name}")),
+            escaped(revision), escaped(&constraints.gpus.join(",")), crate::precision::RULE);
+        for (key, bits) in [("bits", constraints.bits), ("prefer", constraints.prefer), ("min_bits", constraints.min_bits)] {
+            if let Some(bits) = bits { url.push_str(&format!("&{key}={bits}")); }
+        }
+        if constraints.plain { url.push_str("&plain=true"); }
+        let reply = self.exchange(Ask { method: "GET", url: &url, headers: vec![], body: None, payload: None, auth: true }).await?;
+        match reply.status {
+            404 | 405 => Ok(None),
+            // Another rule's answer (an older Hub's) is no answer: the headers decide.
+            200 => serde_json::from_slice::<Selection>(&reply.body)
+                .map(|answer| (answer.rule == crate::precision::RULE).then_some(answer))
+                .map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() }),
+            _ => Err(refusal(&reply, "GET")),
         }
     }
 

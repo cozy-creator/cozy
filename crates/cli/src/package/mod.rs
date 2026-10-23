@@ -43,6 +43,7 @@ enum Command {
     /// environment, no weights.
     Install {
         /// org/name[@release], a directory such as `.` or `./project`, or a PEP 723 `script.py`.
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::local))]
         package: String,
         #[command(flatten)]
         placement: Placement,

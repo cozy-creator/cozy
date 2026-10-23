@@ -9,7 +9,9 @@ use async_trait::async_trait;
 
 use super::token::TokenProvider;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{ObjectRef, Repo, Resolution, Tag, Tree};
+use crate::format::{Header, ObjectRef, Repo, Resolution, Tag, Tree};
+use crate::precision::{Constraints, Profile, Selection};
+use crate::store::Store;
 
 #[async_trait]
 pub trait Origin: Send + Sync {
@@ -24,6 +26,12 @@ pub trait Origin: Send + Sync {
     /// Whether anyone may read these objects: only then are they written back to a shared
     /// volume.
     fn public(&self) -> bool;
+
+    /// The variant its index selects for `constraints` in commit `revision` of `name`; `None`
+    /// when it keeps no index (the reader applies the same rule to the headers).
+    async fn select(&self, _name: &str, _revision: &str, _constraints: &Constraints) -> Result<Option<Selection>> {
+        Ok(None)
+    }
 }
 
 /// Where one object can be read.
@@ -155,4 +163,56 @@ pub fn pick_variant(tree: &Tree, revision: Option<&str>, cited: Option<String>, 
         }
         (cited, asked) => Ok(cited.or(asked)),
     }
+}
+
+/// A variant selected in a commit: its path, its header and why it is not the first choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selected {
+    pub variant: String,
+    pub header: ObjectRef,
+    pub reasons: Vec<String>,
+}
+
+/// The variant of commit `root` (its tree `tree`) of `repo` that `constraints` take: every client's
+/// one selection (spec §7). Over the variants' headers when `store` holds them all; else `origin`'s
+/// indexed answer when it keeps one; else over the headers `fetch` lands in `store`. `model` names
+/// the commit in reasons and refusals.
+#[allow(clippy::too_many_arguments)]
+pub async fn select(
+    origin: Option<&dyn Origin>,
+    store: &Store,
+    repo: &str,
+    model: &str,
+    root: &ObjectRef,
+    tree: &Tree,
+    constraints: &Constraints,
+    fetch: impl AsyncFnOnce(&[ObjectRef]) -> crate::Result<()>,
+) -> crate::Result<Selected> {
+    constraints.check()?;
+    let headers: Vec<ObjectRef> = tree.variants().map(|(_, header)| header.clone()).collect();
+    let mut held = true;
+    for header in &headers {
+        held &= store.reuse(header)?;
+    }
+    if !held {
+        let indexed = match origin {
+            Some(origin) => origin.select(repo, &root.id(), constraints).await?,
+            None => None,
+        };
+        // A null answer (an older index's) is the rule's to give, from the headers.
+        if let Some(Selection { commit, variant: Some(variant), header, reasons, .. }) = indexed {
+            let (path, held) = tree.variant(Some(&variant))?;
+            if commit != *root || header.as_ref() != Some(held) {
+                return crate::failure::fail(crate::Kind::Integrity, format!("{repo}'s index selected {variant} of another commit"));
+            }
+            return Ok(Selected { variant: path.to_owned(), header: held.clone(), reasons });
+        }
+        fetch(&headers).await?;
+    }
+    let profiles = tree.variants().map(|(name, header)| Ok((name, Profile::of(&Header::from_cbor(&store.read(header)?)?))));
+    let profiles = profiles.collect::<crate::Result<Vec<_>>>()?;
+    let candidates: Vec<_> = profiles.iter().map(|(name, profile)| (*name, profile)).collect();
+    let (at, reasons) = constraints.select(model, &candidates)?;
+    let (variant, header) = tree.variant(Some(profiles[at].0))?;
+    Ok(Selected { variant: variant.to_owned(), header: header.clone(), reasons })
 }

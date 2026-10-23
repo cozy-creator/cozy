@@ -88,32 +88,6 @@ fn unload(b: &CudaBackend, va: Va, offset: u64, page: Physical) {
     step!();
 }
 
-/// The native runner's GPU monitor: one line per look on stdin, answered `@ <kernels> <memory>`:
-/// whether kernels ran, and whether device memory moved, on the run's GPU since the last look
-/// (NVML's samples). It makes no CUDA context.
-#[test]
-#[ignore = "native GPU: the runner's GPU monitor"]
-fn role_monitor() {
-    if role().as_deref() != Some("monitor") {
-        return;
-    }
-    let mut device = 0;
-    cuda::check("cuDeviceGet", unsafe { (cuda::driver().unwrap().device_get)(&mut device, 0) }).unwrap();
-    let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
-    let mut seen = 0;
-    let _ = nvml.worked_since(&mut seen);
-    println!("@ ready");
-    std::io::stdout().flush().unwrap();
-    for _ in std::io::stdin().lock().lines() {
-        // NVML answers "not found" when it has taken no sample since the last look: no signal.
-        match nvml.worked_since(&mut seen) {
-            Ok((kernels, memory)) => println!("@ {kernels} {memory}"),
-            Err(e) => println!("@ unknown {e}"),
-        }
-        std::io::stdout().flush().unwrap();
-    }
-}
-
 /// This binary again, running `test` as `role`, with `stdin` (a socket to pass handles on).
 fn child(test: &str, role: &str, stdin: Stdio) -> Child {
     Command::new(std::env::current_exe().unwrap())
@@ -330,7 +304,9 @@ fn pages_fill_protect_unmap_and_survive_a_clean_owner_exit() {
 
 /// `stray`: one `st.global.u8` of 7 at its argument. `spin`: busy for `ns` nanoseconds of the
 /// GPU's clock (a forward). `copy`: `words` u64s from `src` to `dst`, one thread (a consumer that
-/// reads a page).
+/// reads a page). `sweep`: reads `words` u64s at `src` again and again for at least `ns`, one
+/// thread (a forward that reads a page throughout); `out` gets their XOR over all passes and the
+/// pass count.
 const KERNELS: &std::ffi::CStr = c"
 .version 7.0
 .target sm_70
@@ -373,20 +349,51 @@ LOOP:
 DONE:
     ret;
 }
+.visible .entry sweep(.param .u64 src, .param .u64 words, .param .u64 ns, .param .u64 out) {
+    .reg .b64 %s, %at, %n, %i, %v, %acc, %passes, %start, %now, %d, %lim, %o;
+    .reg .pred %p;
+    ld.param.u64 %s, [src];
+    ld.param.u64 %n, [words];
+    ld.param.u64 %lim, [ns];
+    ld.param.u64 %o, [out];
+    mov.u64 %acc, 0;
+    mov.u64 %passes, 0;
+    mov.u64 %start, %globaltimer;
+PASS:
+    mov.u64 %at, %s;
+    mov.u64 %i, %n;
+WORD:
+    setp.eq.u64 %p, %i, 0;
+    @%p bra PASSED;
+    ld.volatile.global.u64 %v, [%at];
+    xor.b64 %acc, %acc, %v;
+    add.u64 %at, %at, 8;
+    sub.u64 %i, %i, 1;
+    bra WORD;
+PASSED:
+    add.u64 %passes, %passes, 1;
+    mov.u64 %now, %globaltimer;
+    sub.u64 %d, %now, %start;
+    setp.lt.u64 %p, %d, %lim;
+    @%p bra PASS;
+    st.global.u64 [%o], %acc;
+    st.global.u64 [%o+8], %passes;
+    ret;
+}
 ";
 
 /// Prepare each diagnostic kernel before a deliberately blocked consumer stream exists.
 /// CUDA module/function loading can wait on that stream; doing it inside launch would make
 /// the fixture deadlock before it ever exercised Varena's consumer ordering.
-fn kernels() -> &'static [usize; 3] {
-    static FUNCTIONS: std::sync::OnceLock<[usize; 3]> = std::sync::OnceLock::new();
+fn kernels() -> &'static [usize; 4] {
+    static FUNCTIONS: std::sync::OnceLock<[usize; 4]> = std::sync::OnceLock::new();
     FUNCTIONS.get_or_init(|| {
         let d = cuda::driver().unwrap();
         let (_, ctx) = cuda::primary_context(0).unwrap();
         let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
         let mut module = std::ptr::null_mut();
         cuda::check("cuModuleLoadData", unsafe { (d.module_load_data)(&mut module, KERNELS.as_ptr().cast()) }).unwrap();
-        [c"stray", c"spin", c"copy"].map(|name| {
+        [c"stray", c"spin", c"copy", c"sweep"].map(|name| {
             let mut function = std::ptr::null_mut();
             cuda::check("cuModuleGetFunction", unsafe { (d.module_get_function)(&mut function, module, name.as_ptr()) }).unwrap();
             function as usize
@@ -396,7 +403,7 @@ fn kernels() -> &'static [usize; 3] {
 
 /// Launches a prepared diagnostic kernel on `stream` with u64 arguments.
 fn launch(name: &std::ffi::CStr, args: &[u64], stream: usize) -> cuda::CUresult {
-    let index = match name.to_bytes() { b"stray" => 0, b"spin" => 1, b"copy" => 2, _ => panic!("unknown diagnostic kernel") };
+    let index = match name.to_bytes() { b"stray" => 0, b"spin" => 1, b"copy" => 2, b"sweep" => 3, _ => panic!("unknown diagnostic kernel") };
     let kernel = kernels()[index] as cuda::CUfunction;
     let d = cuda::driver().unwrap();
     let (_, ctx) = cuda::primary_context(0).unwrap();
@@ -722,6 +729,818 @@ impl Drop for Gate {
     }
 }
 
+type BeginCapture = unsafe extern "C" fn(cuda::CUstream, std::ffi::c_int) -> cuda::CUresult;
+type EndCapture = unsafe extern "C" fn(cuda::CUstream, *mut *mut c_void) -> cuda::CUresult;
+type Instantiate = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u64) -> cuda::CUresult;
+type GraphLaunch = unsafe extern "C" fn(*mut c_void, cuda::CUstream) -> cuda::CUresult;
+
+/// The driver's graph calls, which TensorFS's table does not carry, loaded for the cases that capture.
+struct Graphs {
+    begin: BeginCapture,
+    end: EndCapture,
+    instantiate: Instantiate,
+    launch: GraphLaunch,
+}
+
+fn graphs() -> &'static Graphs {
+    static GRAPHS: std::sync::OnceLock<Graphs> = std::sync::OnceLock::new();
+    GRAPHS.get_or_init(|| {
+        // SAFETY: libcuda is loaded already (TensorFS's driver); each symbol has the documented signature.
+        unsafe {
+            let lib = libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW);
+            assert!(!lib.is_null(), "libcuda.so.1");
+            let sym = |name: &std::ffi::CStr| {
+                let f = libc::dlsym(lib, name.as_ptr());
+                assert!(!f.is_null(), "{name:?}");
+                f
+            };
+            Graphs {
+                begin: std::mem::transmute::<*mut c_void, BeginCapture>(sym(c"cuStreamBeginCapture_v2")),
+                end: std::mem::transmute::<*mut c_void, EndCapture>(sym(c"cuStreamEndCapture")),
+                instantiate: std::mem::transmute::<*mut c_void, Instantiate>(sym(c"cuGraphInstantiateWithFlags")),
+                launch: std::mem::transmute::<*mut c_void, GraphLaunch>(sym(c"cuGraphLaunch")),
+            }
+        }
+    })
+}
+
+/// A graph of one `copy` from `src` to `dst` (`words` u64s), captured on `stream`, instantiated. The graph calls take
+/// the current context: the primary one, entered here.
+fn captured_copy(dst: u64, src: u64, words: u64, stream: usize) -> usize {
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    let g = graphs();
+    // Relaxed: other threads may call the driver meanwhile.
+    const RELAXED: std::ffi::c_int = 2;
+    assert_eq!(unsafe { (g.begin)(stream as cuda::CUstream, RELAXED) }, cuda::SUCCESS);
+    assert_eq!(launch(c"copy", &[dst, src, words], stream), cuda::SUCCESS);
+    let mut graph = std::ptr::null_mut();
+    assert_eq!(unsafe { (g.end)(stream as cuda::CUstream, &mut graph) }, cuda::SUCCESS);
+    let mut exec = std::ptr::null_mut();
+    assert_eq!(unsafe { (g.instantiate)(&mut exec, graph, 0) }, cuda::SUCCESS);
+    exec as usize
+}
+
+/// Replays an instantiated graph on `stream`, in the primary context.
+fn replay(exec: usize, stream: usize) -> cuda::CUresult {
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    unsafe { (graphs().launch)(exec as *mut c_void, stream as cuda::CUstream) }
+}
+
+/// Step 2's mechanism on the driver: two physical slots stream four blocks, each slot remapped (cuMemUnmap, then
+/// cuMemMap) at the block's own VA in turn. One graph is captured per block against the block's VA, before any slot
+/// is mapped there. Over three rounds, every replay reads the block's own bytes through whichever slot backs it.
+/// The graphs stay valid across the remaps.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_graph_captured_at_a_blocks_va_replays_across_slot_remaps() {
+    let (b, uuid) = gpu();
+    step!();
+    let gran = b.granularity();
+    let blocks: u64 = 4;
+    let va = b.reserve(blocks * gran).unwrap();
+    step!();
+    let slots: Vec<Physical> = (0..2).map(|_| b.create(gran).unwrap()).collect();
+    step!();
+    let stream = cuda::Stream::new(0).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, (blocks * gran) as usize).unwrap();
+    step!();
+    let execs: Vec<usize> = (0..blocks).map(|i| captured_copy(out.ptr() + i * gran, va.base + i * gran, gran / 8, stream.raw())).collect();
+    step!();
+    let data: Vec<Vec<u8>> = (0..blocks).map(|i| pattern(gran, 60 + i as u8)).collect();
+    // Which block each slot backs, and the event after its last replay.
+    let mut at: Vec<Option<(u64, Event)>> = vec![None, None];
+    let mut remaps = 0;
+    for round in 0..3 {
+        for i in 0..blocks {
+            let s = (i % 2) as usize;
+            if let Some((old, done)) = at[s].take() {
+                // The slot's last replay finished before its VA goes.
+                b.finish(done).unwrap();
+                b.unmap(va, old * gran, gran).unwrap();
+                remaps += 1;
+            }
+            b.map(va, i * gran, &slots[s], Access::ReadWrite).unwrap();
+            // SAFETY: the slot is mapped at the block's VA and nothing else uses it until the replay.
+            unsafe { io::read(&[Copy { src: Src::Host(data[i as usize].as_ptr()), dst: b.target(va, i * gran, gran) }], &ReadOpts::default()) }.unwrap();
+            assert_eq!(replay(execs[i as usize], stream.raw()), cuda::SUCCESS);
+            at[s] = Some((i, b.record(stream.raw()).unwrap()));
+        }
+        stream.drain().unwrap();
+        for i in 0..blocks {
+            assert!(bytes(out.ptr() + i * gran, gran, 0) == data[i as usize], "round {round}: block {i}'s replay read other bytes");
+        }
+        step!();
+    }
+    for (old, done) in at.into_iter().flatten() {
+        b.finish(done).unwrap();
+        b.unmap(va, old * gran, gran).unwrap();
+    }
+    step!();
+    slots.into_iter().for_each(|p| b.destroy(p).unwrap());
+    b.release(va);
+    step!();
+    println!("PASS a graph captured at a block's VA replays across {remaps} slot remaps {uuid}");
+    step!();
+}
+
+type AllocAsync = unsafe extern "C" fn(*mut u64, usize, cuda::CUstream) -> cuda::CUresult;
+type FreeAsync = unsafe extern "C" fn(u64, cuda::CUstream) -> cuda::CUresult;
+
+/// The stream-ordered allocator's calls, which TensorFS's table does not carry.
+fn stream_ordered() -> (AllocAsync, FreeAsync) {
+    // SAFETY: libcuda is loaded already (TensorFS's driver); each symbol has the documented signature.
+    unsafe {
+        let lib = libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW);
+        assert!(!lib.is_null(), "libcuda.so.1");
+        let alloc = libc::dlsym(lib, c"cuMemAllocAsync".as_ptr());
+        let free = libc::dlsym(lib, c"cuMemFreeAsync".as_ptr());
+        assert!(!alloc.is_null() && !free.is_null(), "the stream-ordered allocator");
+        (std::mem::transmute::<*mut c_void, AllocAsync>(alloc), std::mem::transmute::<*mut c_void, FreeAsync>(free))
+    }
+}
+
+/// This thread's id, as /proc names it.
+fn tid() -> i32 {
+    // SAFETY: gettid takes no arguments and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+}
+
+/// Whether thread `tid` of this process sleeps on a lock (a futex) now: a driver call waiting for another thread.
+fn on_a_lock(tid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/self/task/{tid}/wchan")).is_ok_and(|w| w.starts_with("futex"))
+}
+
+/// One driver call, its resources made beforehand (untimed), and what it leaves to clean up afterwards.
+type Trial<'a> = (&'static str, Box<dyn FnOnce() -> Box<dyn FnOnce() + Send + 'a> + 'a>);
+
+/// The calls the allocator hook makes on its own thread, a bind's create and map, and an allocator's segment calls.
+fn trials<'a>(b: &'a CudaBackend, stream: usize) -> Vec<Trial<'a>> {
+    let d = cuda::driver().unwrap();
+    let event = move || {
+        let mut e = std::ptr::null_mut();
+        assert_eq!(unsafe { (d.event_create)(&mut e, cuda::EVENT_DISABLE_TIMING) }, cuda::SUCCESS);
+        assert_eq!(unsafe { (d.event_record)(e, stream as cuda::CUstream) }, cuda::SUCCESS);
+        assert_eq!(unsafe { (d.event_synchronize)(e) }, cuda::SUCCESS);
+        e as usize
+    };
+    let page = move || {
+        let len = b.granularity();
+        let va = b.reserve(len).unwrap();
+        let page = b.create(len).unwrap();
+        (va, len, page)
+    };
+    let segment = REGION_ALIGN as usize;
+    let (alloc_async, free_async) = stream_ordered();
+    vec![
+        ("cuMemGetInfo", Box::new(move || Box::new(move || {
+            let (mut free, mut total) = (0, 0);
+            assert_eq!(unsafe { (d.mem_get_info)(&mut free, &mut total) }, cuda::SUCCESS);
+        }))),
+        ("cuEventQuery", Box::new(move || { let e = event(); Box::new(move || {
+            assert_eq!(unsafe { (d.event_query)(e as cuda::CUevent) }, cuda::SUCCESS);
+            unsafe { (d.event_destroy)(e as cuda::CUevent) };
+        }) })),
+        ("cuEventSynchronize", Box::new(move || { let e = event(); Box::new(move || {
+            assert_eq!(unsafe { (d.event_synchronize)(e as cuda::CUevent) }, cuda::SUCCESS);
+            unsafe { (d.event_destroy)(e as cuda::CUevent) };
+        }) })),
+        ("cuEventDestroy", Box::new(move || { let e = event(); Box::new(move || assert_eq!(unsafe { (d.event_destroy)(e as cuda::CUevent) }, cuda::SUCCESS)) })),
+        ("cuMemUnmap", Box::new(move || { let (va, len, p) = page(); b.map(va, 0, &p, Access::ReadWrite).unwrap(); Box::new(move || {
+            b.unmap(va, 0, len).unwrap();
+            b.destroy(p).unwrap();
+            b.release(va);
+        }) })),
+        ("cuMemRelease", Box::new(move || { let (va, _, p) = page(); Box::new(move || {
+            b.destroy(p).unwrap();
+            b.release(va);
+        }) })),
+        ("cuMemCreate", Box::new(move || Box::new(move || b.destroy(b.create(b.granularity()).unwrap()).unwrap()))),
+        ("cuMemMap", Box::new(move || { let (va, len, p) = page(); Box::new(move || {
+            b.map(va, 0, &p, Access::ReadWrite).unwrap();
+            b.unmap(va, 0, len).unwrap();
+            b.destroy(p).unwrap();
+            b.release(va);
+        }) })),
+        ("cuMemAlloc", Box::new(move || Box::new(move || {
+            let mut ptr = 0;
+            assert_eq!(unsafe { (d.mem_alloc)(&mut ptr, segment) }, cuda::SUCCESS);
+        }))),
+        ("cuMemAllocAsync+cuMemFreeAsync", Box::new(move || Box::new(move || {
+            let mut ptr = 0;
+            assert_eq!(unsafe { alloc_async(&mut ptr, segment, stream as cuda::CUstream) }, cuda::SUCCESS);
+            assert_eq!(unsafe { free_async(ptr, stream as cuda::CUstream) }, cuda::SUCCESS);
+        }))),
+    ]
+}
+
+/// Which driver calls wait behind another thread's cuMemFree (S1's question after round 6: cuEventDestroy did, and the
+/// case's cuMemAlloc held the hook for 3 s). A cuMemFree of a cuMemAlloc segment synchronizes the device, so behind a
+/// stream held by a host function it waits until the gate opens. Each call runs in its own trial, on its own thread,
+/// while another thread is inside such a cuMemFree:
+/// - The call is waiting when /proc shows its thread asleep on a lock (a futex) twice in a row while it is out; the
+///   gate then opens.
+/// - A call waited when it returned only after the gate opened. The trial says whether the free itself waited.
+///
+/// It judges the allocator hook's own calls (cuMemGetInfo, cuEventQuery, cuEventSynchronize, cuMemUnmap, cuMemRelease);
+/// the rest (cuEventDestroy, a bind's cuMemCreate and cuMemMap, an allocator's cuMemAlloc and the stream-ordered pair)
+/// are reported.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn the_hooks_driver_calls_never_wait_behind_another_threads_free() {
+    let (b, uuid) = gpu();
+    step!();
+    let (gated, own) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
+    step!();
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    // The context as a plain value: each thread enters it.
+    let ctx = ctx as usize;
+    let d = cuda::driver().unwrap();
+    let segment = REGION_ALIGN as usize;
+    let (mut report, mut waited) = (vec![], vec![]);
+    for (name, prepare) in trials(&b, own.raw()) {
+        let call = prepare();
+        let mut ptr = 0;
+        assert_eq!(unsafe { (d.mem_alloc)(&mut ptr, segment) }, cuda::SUCCESS);
+        let mut gate = Some(Gate::hold(gated.raw()));
+        let (in_free, hook_tid) = (std::sync::atomic::AtomicI32::new(0), std::sync::atomic::AtomicI32::new(0));
+        let (opened, out, free_returned) = std::thread::scope(|t| {
+            let free = t.spawn(|| {
+                let _ctx = cuda::CtxGuard::enter(ctx as cuda::CUcontext).unwrap();
+                in_free.store(tid(), std::sync::atomic::Ordering::Release);
+                assert_eq!(unsafe { (d.mem_free)(ptr) }, cuda::SUCCESS);
+                std::time::Instant::now()
+            });
+            // Inside cuMemFree: its thread is out of userspace in the driver (a lock or the device's wait).
+            loop {
+                let id = in_free.load(std::sync::atomic::Ordering::Acquire);
+                if id != 0 && std::fs::read_to_string(format!("/proc/self/task/{id}/syscall")).is_ok_and(|s| !s.starts_with("running")) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let hook = t.spawn(|| {
+                let _ctx = cuda::CtxGuard::enter(ctx as cuda::CUcontext).unwrap();
+                hook_tid.store(tid(), std::sync::atomic::Ordering::Release);
+                let start = std::time::Instant::now();
+                call();
+                (start.elapsed(), std::time::Instant::now())
+            });
+            let mut opened = None;
+            let mut asleep = 0;
+            while !hook.is_finished() {
+                let id = hook_tid.load(std::sync::atomic::Ordering::Acquire);
+                asleep = if id != 0 && on_a_lock(id) { asleep + 1 } else { 0 };
+                if asleep == 2 && gate.is_some() {
+                    opened = Some(std::time::Instant::now());
+                    gate.take();
+                }
+                std::thread::yield_now();
+            }
+            let out = hook.join().unwrap();
+            if gate.is_some() {
+                opened = Some(std::time::Instant::now());
+                gate.take();
+            }
+            (opened.unwrap_or_else(std::time::Instant::now), out, free.join().unwrap())
+        });
+        gated.drain().unwrap();
+        own.drain().unwrap();
+        let late = out.1 >= opened;
+        report.push(format!("{name} {:?}{}{}", out.0, if late { " (after the gate)" } else { "" }, if free_returned >= opened { "" } else { " [the free did not wait]" }));
+        if late && matches!(name, "cuMemGetInfo" | "cuEventQuery" | "cuEventSynchronize" | "cuMemUnmap" | "cuMemRelease") {
+            waited.push(name);
+        }
+        step!();
+    }
+    println!("TIMINGS each driver call beside another thread's cuMemFree behind a gated stream: {}", report.join(", "));
+    step!();
+    assert!(waited.is_empty(), "the hook's driver calls waited behind another thread's free: {waited:?}");
+    step!();
+    println!("PASS the hook's driver calls never wait behind another thread's free {uuid}");
+    step!();
+}
+
+/// A segment path's alloc and free, each timed: on an idle device, then while a spin kernel runs on another stream.
+/// `alloc` makes one segment of `bytes` and returns what `free` takes.
+fn segment_path(alloc: &dyn Fn(usize) -> u64, free: &dyn Fn(u64), bytes: usize, stream: usize) -> String {
+    // A pass's worth of segments: round 6's hook case made 63.
+    const SEGMENTS: usize = 64;
+    let run = || {
+        let (mut a, mut f) = (vec![], vec![]);
+        for _ in 0..SEGMENTS {
+            let t = std::time::Instant::now();
+            let ptr = alloc(bytes);
+            a.push(t.elapsed());
+            let t = std::time::Instant::now();
+            free(ptr);
+            f.push(t.elapsed());
+        }
+        (a, f)
+    };
+    let figures = |(a, f): &(Vec<std::time::Duration>, Vec<std::time::Duration>)| {
+        let mean = |v: &[std::time::Duration]| v.iter().sum::<std::time::Duration>() / v.len() as u32;
+        let max = |v: &[std::time::Duration]| v.iter().max().copied().unwrap_or_default();
+        format!("alloc mean {:?} max {:?}, free mean {:?} max {:?}", mean(a), max(a), mean(f), max(f))
+    };
+    let idle = run();
+    let total: std::time::Duration = idle.0.iter().chain(&idle.1).sum();
+    // Ten times the idle sequence: every call lands while the kernel runs.
+    let spin = total * 10;
+    let launched = std::time::Instant::now();
+    assert_eq!(launch(c"spin", &[spin.as_nanos() as u64], stream), cuda::SUCCESS);
+    let busy = run();
+    let inside = launched.elapsed() < spin;
+    format!("idle {}; beside a {spin:?} kernel {}{}", figures(&idle), figures(&busy), if inside { "" } else { " (the calls outlasted the kernel: some waited for it)" })
+}
+
+/// What decides S1's segment path, and what varena does not account for (the lead, after round 6):
+/// - each path's alloc and free, a pass's worth of 2 MiB segments, on an idle device and beside a running kernel:
+///   cuMemAlloc/cuMemFree (today's), varena's own pages (cuMemCreate + cuMemMap / cuMemUnmap + cuMemRelease), and the
+///   stream-ordered cuMemAllocAsync/cuMemFreeAsync;
+/// - this process's bytes as NVML sees them less what its ledger row accounts for (context, classes, torch's), with a set
+///   resident and idle, then mid-run (a pass, every block pinned, a kernel running).
+///
+/// A measurement: it prints, and fails only when a call fails.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn segment_paths_and_the_unaccounted_bytes() {
+    let (b, g, uuid) = card("segments");
+    step!();
+    let ledger = Ledger::create(&g, None).unwrap();
+    step!();
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    let d = cuda::driver().unwrap();
+    let busy = cuda::Stream::new(0).unwrap();
+    let own = cuda::Stream::new(0).unwrap();
+    let bytes = REGION_ALIGN as usize;
+    let plain = segment_path(
+        &|n| {
+            let mut ptr = 0;
+            assert_eq!(unsafe { (d.mem_alloc)(&mut ptr, n) }, cuda::SUCCESS);
+            ptr
+        },
+        &|ptr| assert_eq!(unsafe { (d.mem_free)(ptr) }, cuda::SUCCESS),
+        bytes,
+        busy.raw(),
+    );
+    busy.drain().unwrap();
+    step!();
+    let va = b.reserve(bytes as u64).unwrap();
+    let held = parking_lot::Mutex::new(None::<Physical>);
+    let pages = segment_path(
+        &|n| {
+            let page = b.create(n as u64).unwrap();
+            b.map(va, 0, &page, Access::ReadWrite).unwrap();
+            *held.lock() = Some(page);
+            va.base
+        },
+        &|_| {
+            b.unmap(va, 0, bytes as u64).unwrap();
+            held.lock().take().into_iter().for_each(|p| b.destroy(p).unwrap());
+        },
+        bytes,
+        busy.raw(),
+    );
+    busy.drain().unwrap();
+    b.release(va);
+    step!();
+    let (alloc_async, free_async) = stream_ordered();
+    let ordered = segment_path(
+        &|n| {
+            let mut ptr = 0;
+            assert_eq!(unsafe { alloc_async(&mut ptr, n, own.raw() as cuda::CUstream) }, cuda::SUCCESS);
+            ptr
+        },
+        &|ptr| assert_eq!(unsafe { free_async(ptr, own.raw() as cuda::CUstream) }, cuda::SUCCESS),
+        bytes,
+        busy.raw(),
+    );
+    busy.drain().unwrap();
+    own.drain().unwrap();
+    step!();
+    println!("TIMINGS segment paths, {} segments of {bytes} B: cuMemAlloc/cuMemFree {plain} | varena pages (create+map / unmap+release) {pages} | cuMemAllocAsync/cuMemFreeAsync {ordered}", 64);
+    step!();
+    // This process's bytes: NVML's figure against its ledger row's.
+    let mut device = 0;
+    cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut device, 0) }).unwrap();
+    let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
+    let pid = std::process::id();
+    let reading = |when: &str| {
+        let used = nvml.read().unwrap().processes.unwrap_or_default().get(&pid).copied();
+        let row = ledger.status().rows.into_iter().find(|r| r.pid == pid);
+        let accounted = row.as_ref().map(|r| r.context + r.classes.iter().skip(1).sum::<u64>() + r.torch);
+        format!(
+            "{when}: NVML {used:?} B, accounted {accounted:?} B (row {:?}), unaccounted {:?} B",
+            row.map(|r| (r.context, r.classes, r.torch)),
+            used.zip(accounted).map(|(u, a)| u as i64 - a as i64)
+        )
+    };
+    let mem = memory(b, &g);
+    step!();
+    let blocks = 16;
+    let s = mem.load(set("resident", blocks, Fill::Stored, &g.uuid, |b| block(110, b)), Level::Ram).unwrap();
+    drop((0..blocks).map(|p| mem.bind(s, p, 0).unwrap()).collect::<Vec<Pin>>());
+    mem.settle();
+    step!();
+    let idle = reading("idle");
+    step!();
+    let r = mem.request("mid-run", plan(&[&["resident"]])).unwrap();
+    let pass = r.pass(s, "fwd|1").unwrap();
+    let pins: Vec<Pin> = (0..blocks).map(|p| mem.bind(s, p, busy.raw()).unwrap()).collect();
+    let spin = std::time::Duration::from_millis(1);
+    // A kernel running while the figures are read: as long as the idle reading took, ten times over.
+    let t = std::time::Instant::now();
+    let _ = reading("probe");
+    let read = t.elapsed().max(spin);
+    assert_eq!(launch(c"spin", &[(read * 10).as_nanos() as u64], busy.raw()), cuda::SUCCESS);
+    let mid = reading("mid-run");
+    busy.drain().unwrap();
+    drop(pins);
+    pass.end(0);
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("TIMINGS this process's bytes, NVML against its ledger row: {idle} | {mid}");
+    step!();
+    println!("PASS segment paths and the unaccounted bytes measured {uuid}");
+    step!();
+}
+
+/// Lease chunks (design/varena-leases.md): TensorD makes and exports them, an executor imports and maps them. 32 MiB.
+const CHUNK: u64 = 32 << 20;
+
+/// The leases' other process: per chunk received (a length, then its fd), it imports, maps at its own reservation, unmaps
+/// and releases, and prints `CHUNK <import ns> <map ns> <unmap ns> <release ns>`; a length of 0 ends it. With
+/// `reexport` it instead imports one handle, exports it again, and prints `REEXPORT <result>`.
+#[test]
+#[ignore = "native GPU: a role of the lease cases"]
+fn role_importer() {
+    let Some(mode) = role().filter(|r| matches!(r.as_str(), "importer" | "reexport" | "charge")) else { return };
+    let (b, uuid) = gpu();
+    let mut control = parent();
+    let va = b.reserve(CHUNK).unwrap();
+    let nvml = platform::gpu::Device::open(&uuid).unwrap();
+    // NVML's bytes for this process and its parent (the manager), as a pair.
+    let charged = || {
+        let per = nvml.read().unwrap().processes.unwrap_or_default();
+        let at = |pid: u32| per.get(&pid).copied().unwrap_or(0);
+        (at(std::process::id()), at(std::os::unix::process::parent_id()))
+    };
+    loop {
+        let mut len = [0; 8];
+        control.read_exact(&mut len).unwrap();
+        let len = u64::from_le_bytes(len);
+        if len == 0 {
+            break;
+        }
+        let fd = platform::handles::recv_fd(&control).unwrap();
+        // This process's open descriptors: the driver's own fd use for an imported chunk (design §10, M6).
+        let fds = || std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
+        let fds_held = fds();
+        let before = (mode == "charge").then(charged);
+        let t = std::time::Instant::now();
+        let page = b.import(fd, len).unwrap();
+        let import = t.elapsed();
+        if mode == "reexport" {
+            let again = b.export(&page).map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string());
+            println!("REEXPORT {again}");
+            b.destroy(page).unwrap();
+        } else if mode == "charge" {
+            // NVML's per-process bytes (executor, manager) around each step of a lease's life here.
+            let (imported, fds_imported) = (charged(), fds());
+            b.map(va, 0, &page, Access::ReadWrite).unwrap();
+            let (mapped, fds_mapped) = (charged(), fds());
+            b.unmap(va, 0, len).unwrap();
+            let unmapped = charged();
+            b.destroy(page).unwrap();
+            println!(
+                "CHARGE before {before:?} imported {imported:?} mapped {mapped:?} unmapped {unmapped:?} released {:?}; open fds with the received one {fds_held}, imported {fds_imported}, mapped {fds_mapped}, released {}",
+                charged(),
+                fds()
+            );
+        } else {
+            let t = std::time::Instant::now();
+            b.map(va, 0, &page, Access::ReadWrite).unwrap();
+            let map = t.elapsed();
+            let t = std::time::Instant::now();
+            b.unmap(va, 0, len).unwrap();
+            let unmap = t.elapsed();
+            let t = std::time::Instant::now();
+            b.destroy(page).unwrap();
+            println!("CHUNK {} {} {} {}", import.as_nanos(), map.as_nanos(), unmap.as_nanos(), t.elapsed().as_nanos());
+        }
+        std::io::stdout().flush().unwrap();
+        control.write_all(&[1]).unwrap();
+    }
+    b.release(va);
+}
+
+/// The leases' foundation, and round 6's INVALID_VALUE (keeping an imported page after a request withdrew it): can a
+/// handle that was imported be exported again? A page is made shareable (POSIX fd) and exported; then
+/// - the creator exports it again (the baseline);
+/// - this process imports the fd and exports the imported handle;
+/// - another process imports it and exports its imported handle.
+///
+/// It prints the driver's answer to each and fails only when the creator's own export fails.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn an_imported_handle_exports_again_or_not() {
+    let (b, uuid) = gpu();
+    step!();
+    let len = b.granularity();
+    let page = b.create(len).unwrap();
+    step!();
+    let fd = b.export(&page).unwrap();
+    step!();
+    let again = b.export(&page).map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string());
+    step!();
+    let here = b.import(b.export(&page).unwrap(), len).unwrap();
+    let imported_here = b.export(&here).map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string());
+    b.destroy(here).unwrap();
+    step!();
+    // Printed before anything else can fail: the answers are the case's point.
+    println!("TIMINGS re-export: the creator's handle again: {again}; an import in this process: {imported_here}");
+    step!();
+    let (mut control, theirs) = UnixStream::pair().unwrap();
+    let mut other = child("role_importer", "reexport", Stdio::from(OwnedFd::from(theirs)));
+    send(&mut control, &fd, len);
+    control.read_exact(&mut [0]).unwrap();
+    control.write_all(&0u64.to_le_bytes()).unwrap();
+    // The child's whole output, to its end: closing its pipe early fails its exit.
+    let mut out = String::new();
+    other.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    let elsewhere = out.lines().find_map(|l| l.split_once("REEXPORT ").map(|(_, r)| r.to_owned())).unwrap_or_else(|| "no answer".into());
+    let exit = other.wait().unwrap();
+    println!("TIMINGS re-export: an import in another process: {elsewhere} (its process ended {exit})");
+    step!();
+    b.destroy(page).unwrap();
+    step!();
+    assert_eq!(again, "ok", "the creator's own handle exports again");
+    step!();
+    println!("PASS an imported handle exports again or not: the driver's answers printed {uuid}");
+    step!();
+}
+
+/// p50 and p99 of `v`, with its count.
+fn quantiles(v: &mut [std::time::Duration]) -> String {
+    v.sort();
+    let at = |q: f64| v.get(((v.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or_default();
+    format!("p50 {:?} p99 {:?} (n {})", at(0.5), at(0.99), v.len())
+}
+
+/// The lease cost per chunk across two processes (design/varena-leases.md): this process (TensorD's part) creates and
+/// exports each chunk and passes its fd; the other imports, maps, unmaps and releases it. A pass's worth of chunks:
+/// - at 2 MiB and at 32 MiB on an idle device, which tells a per-chunk cost from a per-byte one;
+/// - at 32 MiB while a spin kernel runs.
+///
+/// Then NVML's per-process charge for one imported 32 MiB chunk (S5's question): both processes' bytes before the
+/// import, after it, mapped, unmapped and released. It prints p50 and p99 of each step; a measurement.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn lease_chunks_cost_across_two_processes() {
+    let (b, uuid) = gpu();
+    step!();
+    // A pass's worth of chunks, as the segment paths case.
+    const CHUNKS: usize = 64;
+    let busy = cuda::Stream::new(0).unwrap();
+    let (mut control, theirs) = UnixStream::pair().unwrap();
+    let mut other = child("role_importer", "importer", Stdio::from(OwnedFd::from(theirs)));
+    let mut out = BufReader::new(other.stdout.take().unwrap());
+    let mut round = |len: u64, spin: Option<std::time::Duration>| {
+        if let Some(spin) = spin {
+            assert_eq!(launch(c"spin", &[spin.as_nanos() as u64], busy.raw()), cuda::SUCCESS);
+        }
+        let started = std::time::Instant::now();
+        let (mut create, mut export, mut pass, mut destroy) = (vec![], vec![], vec![], vec![]);
+        let mut theirs: [Vec<std::time::Duration>; 4] = Default::default();
+        for _ in 0..CHUNKS {
+            let t = std::time::Instant::now();
+            let page = b.create(len).unwrap();
+            create.push(t.elapsed());
+            let t = std::time::Instant::now();
+            let fd = b.export(&page).unwrap();
+            export.push(t.elapsed());
+            let t = std::time::Instant::now();
+            send(&mut control, &fd, len);
+            pass.push(t.elapsed());
+            control.read_exact(&mut [0]).unwrap();
+            let mut line = String::new();
+            while !line.starts_with("CHUNK ") {
+                line.clear();
+                assert!(out.read_line(&mut line).unwrap() > 0, "the importer ended");
+            }
+            for (i, ns) in line.split_whitespace().skip(1).enumerate() {
+                if let Some(v) = theirs.get_mut(i) {
+                    v.push(std::time::Duration::from_nanos(ns.parse().unwrap()));
+                }
+            }
+            drop(fd);
+            let t = std::time::Instant::now();
+            b.destroy(page).unwrap();
+            destroy.push(t.elapsed());
+        }
+        let took = started.elapsed();
+        busy.drain().unwrap();
+        let [import, map, unmap, release] = &mut theirs;
+        (
+            format!(
+                "{len} B: manager cuMemCreate {}, export {}, fd passed {}, cuMemRelease {}; executor import {}, map {}, unmap {}, release {}",
+                quantiles(&mut create), quantiles(&mut export), quantiles(&mut pass), quantiles(&mut destroy), quantiles(import), quantiles(map), quantiles(unmap), quantiles(release)
+            ),
+            took,
+        )
+    };
+    let (small, _) = round(b.granularity(), None);
+    step!();
+    let (idle, took) = round(CHUNK, None);
+    step!();
+    // Ten times the idle round: every chunk's calls land while the kernel runs.
+    let (beside, _) = round(CHUNK, Some(took * 10));
+    step!();
+    control.write_all(&0u64.to_le_bytes()).unwrap();
+    let mut rest = String::new();
+    out.read_to_string(&mut rest).unwrap();
+    let exit = other.wait().unwrap();
+    step!();
+    println!("TIMINGS lease chunks across two processes: idle {small} | idle {idle} | beside a running kernel {beside} (the importer ended {exit})");
+    step!();
+    // NVML's charge for one imported chunk: the manager's and the executor's per-process bytes.
+    let (mut control, theirs) = UnixStream::pair().unwrap();
+    let mut other = child("role_importer", "charge", Stdio::from(OwnedFd::from(theirs)));
+    let page = b.create(CHUNK).unwrap();
+    let fd = b.export(&page).unwrap();
+    send(&mut control, &fd, CHUNK);
+    control.read_exact(&mut [0]).unwrap();
+    control.write_all(&0u64.to_le_bytes()).unwrap();
+    let mut out = String::new();
+    other.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    let charge = out.lines().find_map(|l| l.split_once("CHARGE ").map(|(_, r)| r.to_owned())).unwrap_or_else(|| "no answer".into());
+    let exit = other.wait().unwrap();
+    drop(fd);
+    b.destroy(page).unwrap();
+    step!();
+    println!("TIMINGS NVML's per-process bytes (executor, manager) for one imported {CHUNK} B chunk: {charge} (the importer ended {exit})");
+    step!();
+    println!("PASS lease chunks measured across two processes {uuid}");
+    step!();
+}
+
+/// TensorD's own context (design §2a): a fresh process with no context. In order: NVML's bytes for it after cuInit;
+/// whether cuMemCreate works with no current context; the bytes the primary context adds; the stack, printf and
+/// malloc-heap limits set to 0 (the driver's answers, and the bytes after); then the context destroyed (the last
+/// release) while a page lives, and whether that page maps and keeps its bytes in a new context.
+#[test]
+#[ignore = "native GPU: a role of a_managers_context_costs_and_pages_outlive_it"]
+fn role_context() {
+    if role().as_deref() != Some("context") {
+        return;
+    }
+    type SetLimit = unsafe extern "C" fn(std::ffi::c_int, usize) -> cuda::CUresult;
+    let d = cuda::driver().unwrap();
+    let mut device = 0;
+    cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut device, 0) }).unwrap();
+    let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
+    let pid = std::process::id();
+    let used = || nvml.read().unwrap().processes.unwrap_or_default().get(&pid).copied().unwrap_or(0);
+    let mut report = vec![format!("after cuInit {} B", used())];
+    let prop = cuda::AllocationProp::device(device, cuda::MEM_HANDLE_TYPE_POSIX_FD);
+    let len = REGION_ALIGN;
+    let mut handle = 0;
+    let no_context = unsafe { (d.mem_create)(&mut handle, len as usize, &prop, 0) };
+    report.push(format!("cuMemCreate with no current context: {no_context}; then {} B", used()));
+    let mut ctx = std::ptr::null_mut();
+    cuda::check("cuDevicePrimaryCtxRetain", unsafe { (d.primary_ctx_retain)(&mut ctx, device) }).unwrap();
+    cuda::check("cuCtxSetCurrent", unsafe { (d.ctx_set_current)(ctx) }).unwrap();
+    report.push(format!("with the primary context {} B", used()));
+    // SAFETY: libcuda is loaded (TensorFS's driver); cuCtxSetLimit has this documented signature.
+    let set_limit = unsafe {
+        let f = libc::dlsym(libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW), c"cuCtxSetLimit".as_ptr());
+        assert!(!f.is_null(), "cuCtxSetLimit");
+        std::mem::transmute::<*mut c_void, SetLimit>(f)
+    };
+    // CU_LIMIT_STACK_SIZE, CU_LIMIT_PRINTF_FIFO_SIZE, CU_LIMIT_MALLOC_HEAP_SIZE.
+    let limits: Vec<String> = [(0, "stack"), (1, "printf"), (2, "malloc heap")].iter().map(|(limit, name)| format!("{name} {}", unsafe { set_limit(*limit, 0) })).collect();
+    report.push(format!("limits to 0: {}; then {} B", limits.join(", "), used()));
+    if no_context != cuda::SUCCESS {
+        cuda::check("cuMemCreate", unsafe { (d.mem_create)(&mut handle, len as usize, &prop, 0) }).unwrap();
+    }
+    cuda::check("cuCtxSetCurrent", unsafe { (d.ctx_set_current)(std::ptr::null_mut()) }).unwrap();
+    let released = unsafe { (d.primary_ctx_release)(device) };
+    report.push(format!("the last release {released}; then {} B with a page alive", used()));
+    // A new context: does the page map and hold bytes?
+    let b = CudaBackend::open(0).unwrap();
+    let page = Physical { id: handle, len };
+    let va = b.reserve(len).unwrap();
+    let survived = b.map(va, 0, &page, Access::ReadWrite).map(|()| {
+        let data = pattern(len, 9);
+        // SAFETY: the page is mapped read-write at va; data outlives the read.
+        unsafe { io::read(&[Copy { src: Src::Host(data.as_ptr()), dst: b.target(va, 0, len) }], &ReadOpts::default()) }.unwrap();
+        let exact = bytes(va.base, len, 0) == data;
+        b.unmap(va, 0, len).unwrap();
+        exact
+    });
+    report.push(format!("in a new context the page maps and holds its bytes: {survived:?}"));
+    b.destroy(page).unwrap();
+    b.release(va);
+    println!("CONTEXT {}", report.join("; "));
+}
+
+/// TensorD's context (design §2a, P1): its VRAM at idle with the limits at their minimum, whether cuMemCreate needs a
+/// current context, and whether VMM pages outlive the context, all measured in a fresh process (role_context). It
+/// prints the answers; a measurement.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_managers_context_costs_and_pages_outlive_it() {
+    let (_, uuid) = gpu();
+    step!();
+    let mut other = child("role_context", "context", Stdio::null());
+    let mut out = String::new();
+    other.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    let exit = other.wait().unwrap();
+    step!();
+    let answers = out.lines().find_map(|l| l.split_once("CONTEXT ").map(|(_, r)| r.to_owned())).unwrap_or_else(|| "no answer".into());
+    println!("TIMINGS a manager's context: {answers} (its process ended {exit})");
+    step!();
+    println!("PASS a manager's context measured {uuid}");
+    step!();
+}
+
+/// The lender of a_kill_9_of_the_manager_leaves_an_executors_kernel_correct: it makes and exports one chunk, sends it,
+/// and holds it until killed.
+#[test]
+#[ignore = "native GPU: a role of a_kill_9_of_the_manager_leaves_an_executors_kernel_correct"]
+fn role_lender() {
+    if role().as_deref() != Some("lender") {
+        return;
+    }
+    let (b, _) = gpu();
+    let page = b.create(CHUNK).unwrap();
+    let mut control = parent();
+    send(&mut control, &b.export(&page).unwrap(), CHUNK);
+    println!("LENDER ready");
+    std::io::stdout().flush().unwrap();
+    // Held until killed.
+    control.read_exact(&mut [0]).unwrap();
+    unreachable!("the lender is killed, never let go");
+}
+
+/// P1 (S5): kill -9 the manager while an executor runs kernels on a chunk it leased. This process imports the
+/// lender's chunk, fills it, and launches a sweep that reads it for ten times its import and map; the lender is
+/// killed -9 while the sweep runs. The sweep's result must be the chunk's, and the chunk still unmaps and releases.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_kill_9_of_the_manager_leaves_an_executors_kernel_correct() {
+    let (b, uuid) = gpu();
+    step!();
+    let (mut control, theirs) = UnixStream::pair().unwrap();
+    let mut lender = child("role_lender", "lender", Stdio::from(OwnedFd::from(theirs)));
+    let (fd, len) = receive(&mut control);
+    step!();
+    let t = std::time::Instant::now();
+    let page = b.import(fd, len).unwrap();
+    let va = b.reserve(len).unwrap();
+    b.map(va, 0, &page, Access::ReadWrite).unwrap();
+    let setup = t.elapsed();
+    step!();
+    let data = pattern(len, 13);
+    // SAFETY: the page is mapped read-write at va; data outlives the read.
+    unsafe { io::read(&[Copy { src: Src::Host(data.as_ptr()), dst: b.target(va, 0, len) }], &ReadOpts::default()) }.unwrap();
+    step!();
+    let (stream, out) = (cuda::Stream::new(0).unwrap(), io::DeviceBuffer::new(0, 16).unwrap());
+    // Ten times the import and map: the kill, a signal, lands well inside it.
+    let long = setup * 10;
+    let launched = std::time::Instant::now();
+    assert_eq!(launch(c"sweep", &[va.base, len / 8, long.as_nanos() as u64, out.ptr()], stream.raw()), cuda::SUCCESS);
+    lender.kill().unwrap();
+    let killed = launched.elapsed();
+    assert_eq!(lender.wait().unwrap().signal(), Some(libc::SIGKILL));
+    step!();
+    let swept = stream.drain();
+    step!();
+    let read = bytes(out.ptr(), 16, 0);
+    let (acc, passes) = (u64::from_ne_bytes(read[..8].try_into().unwrap()), u64::from_ne_bytes(read[8..].try_into().unwrap()));
+    let once = data.chunks(8).fold(0u64, |a, w| a ^ u64::from_ne_bytes(w.try_into().unwrap()));
+    step!();
+    let unmapped = b.unmap(va, 0, len);
+    let released = b.destroy(page);
+    b.release(va);
+    step!();
+    println!("TIMINGS kill -9 of the manager {killed:?} into a {long:?} sweep: the sweep {swept:?}, {passes} passes; unmap {unmapped:?}, release {released:?}");
+    step!();
+    swept.unwrap();
+    assert!(killed < long, "the kill landed after the sweep ({killed:?} of {long:?})");
+    assert_eq!(acc, if passes % 2 == 1 { once } else { 0 }, "the sweep read other bytes than the chunk's ({passes} passes)");
+    unmapped.unwrap();
+    released.unwrap();
+    step!();
+    println!("PASS a kill -9 of the manager leaves an executor's kernel correct {uuid}");
+    step!();
+}
+
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn release_events_order_consumers_without_a_host_wait() {
@@ -924,20 +1743,62 @@ fn maps_beside_a_fill_in_flight_are_timed_against_maps_on_an_idle_card() {
 
 // ---- the backend's calls, timed
 
-/// Each backend call's count, total and longest time, by name, and when the last one ended.
 #[derive(Default)]
-struct Timings(parking_lot::Mutex<std::collections::BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>>, parking_lot::Mutex<std::collections::BTreeMap<&'static str, std::time::Instant>>);
+struct Timings {
+    /// Each call's count, total and longest time, by name.
+    calls: parking_lot::Mutex<std::collections::BTreeMap<&'static str, (u64, std::time::Duration, std::time::Duration)>>,
+    /// When each call last ended.
+    last: parking_lot::Mutex<std::collections::BTreeMap<&'static str, std::time::Instant>>,
+    /// The stream whose next `record` fails (0: none): an injected completion-record failure.
+    fail_record: std::sync::atomic::AtomicUsize,
+    /// Each protect's start and end.
+    protects: parking_lot::Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
+    /// TensorFS copy runs taken from its log as pages are made (the log keeps only its latest): runs, bytes, ns,
+    /// GPU-busy ns.
+    fills: parking_lot::Mutex<[u64; 4]>,
+}
 
 impl Timings {
     const fn new() -> Timings {
-        Timings(parking_lot::const_mutex(std::collections::BTreeMap::new()), parking_lot::const_mutex(std::collections::BTreeMap::new()))
+        Timings {
+            calls: parking_lot::const_mutex(std::collections::BTreeMap::new()),
+            last: parking_lot::const_mutex(std::collections::BTreeMap::new()),
+            fail_record: std::sync::atomic::AtomicUsize::new(0),
+            protects: parking_lot::const_mutex(Vec::new()),
+            fills: parking_lot::const_mutex([0; 4]),
+        }
+    }
+
+    /// TensorFS's copy runs since the last look, added to `fills`.
+    fn absorb(&self) {
+        let runs = io::metrics::take();
+        let mut f = self.fills.lock();
+        for c in runs {
+            *f = [f[0] + 1, f[1] + c.bytes, f[2] + c.ns, f[3] + c.busy_ns];
+        }
+    }
+
+    /// The copy runs so far, and a fresh start.
+    fn take_fills(&self) -> [u64; 4] {
+        self.absorb();
+        std::mem::take(&mut *self.fills.lock())
+    }
+
+    /// The next event recorded on `stream` fails, as a driver's record can.
+    fn fail_record(&self, stream: usize) {
+        self.fail_record.store(stream, std::sync::atomic::Ordering::Release);
     }
 
     fn add(&self, op: &'static str, took: std::time::Duration) {
-        let mut t = self.0.lock();
+        let mut t = self.calls.lock();
         let e = t.entry(op).or_default();
         *e = (e.0 + 1, e.1 + took, e.2.max(took));
-        self.1.lock().insert(op, std::time::Instant::now());
+        self.last.lock().insert(op, std::time::Instant::now());
+    }
+
+    /// Every call's time together.
+    fn total(&self) -> std::time::Duration {
+        self.calls.lock().values().map(|e| e.1).sum()
     }
 
     fn time<T>(&self, op: &'static str, f: impl FnOnce() -> T) -> T {
@@ -950,32 +1811,33 @@ impl Timings {
     /// The report, and a fresh start.
     fn take(&self) -> String {
         let report = self.report();
-        self.0.lock().clear();
+        self.calls.lock().clear();
         report
     }
 
     fn count(&self, op: &str) -> u64 {
-        self.0.lock().get(op).map_or(0, |e| e.0)
+        self.calls.lock().get(op).map_or(0, |e| e.0)
     }
 
     fn last(&self, op: &str) -> Option<std::time::Instant> {
-        self.1.lock().get(op).copied()
+        self.last.lock().get(op).copied()
     }
 
     /// The wall time since the previous lap (None on the first).
     fn lap(&self) -> Option<std::time::Duration> {
-        self.1.lock().insert("lap", std::time::Instant::now()).map(|t| t.elapsed())
+        self.last.lock().insert("lap", std::time::Instant::now()).map(|t| t.elapsed())
     }
 
     /// `op n total max`, the costliest first.
     fn report(&self) -> String {
-        let mut rows: Vec<_> = self.0.lock().iter().map(|(op, (n, total, max))| (*op, *n, *total, *max)).collect();
+        let mut rows: Vec<_> = self.calls.lock().iter().map(|(op, (n, total, max))| (*op, *n, *total, *max)).collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.2));
         rows.iter().map(|(op, n, total, max)| format!("{op} {n}x {total:?} (max {max:?})")).collect::<Vec<_>>().join(", ")
     }
 }
 
-/// Every driver call of this process's CUDA backends (their trace spans), by name.
+/// Every driver call of this process's CUDA backends and every host wait in TensorFS's engine (their trace spans), by
+/// name.
 static CALLS: Timings = Timings::new();
 
 /// Times each of the backend's driver spans into [`CALLS`].
@@ -1003,7 +1865,7 @@ fn time_calls() {
     ONCE.call_once(|| {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Layer;
-        let only = tracing_subscriber::filter::Targets::new().with_target("varena::cuda", tracing::Level::TRACE);
+        let only = tracing_subscriber::filter::Targets::new().with_target("varena::cuda", tracing::Level::TRACE).with_target("tensorfs::io", tracing::Level::TRACE);
         let errors = tracing_subscriber::filter::Targets::new().with_target("varena::memory", tracing::Level::DEBUG);
         tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Calls.with_filter(only))
             .with(tracing_subscriber::fmt::layer().with_ansi(false).with_filter(errors))).unwrap();
@@ -1023,6 +1885,7 @@ impl Backend for Timed {
     fn release(&self, va: Va) { self.1.time("release", || self.0.release(va)) }
     fn create(&self, len: u64) -> varena::Result<Physical> {
         let page = self.1.time("create", || self.0.create(len));
+        self.1.absorb();
         // Every 1,000 pages a process says where their time goes (stderr: the case log).
         let n = self.1.count("create");
         if n == 1 || n.is_multiple_of(1000) {
@@ -1039,13 +1902,23 @@ impl Backend for Timed {
     }
     fn destroy(&self, page: Physical) -> varena::Result<()> { self.1.time("destroy", || self.0.destroy(page)) }
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> varena::Result<()> { self.1.time("map", || self.0.map(va, offset, page, access)) }
-    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> { self.1.time("protect", || self.0.protect(va, offset, len, access)) }
+    fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> varena::Result<()> {
+        let start = std::time::Instant::now();
+        let out = self.1.time("protect", || self.0.protect(va, offset, len, access));
+        self.1.protects.lock().push((start, std::time::Instant::now()));
+        out
+    }
     fn unmap(&self, va: Va, offset: u64, len: u64) -> varena::Result<()> { self.1.time("unmap", || self.0.unmap(va, offset, len)) }
     fn export(&self, page: &Physical) -> varena::Result<platform::handles::Owned> { self.1.time("export", || self.0.export(page)) }
     fn import(&self, handle: platform::handles::Owned, len: u64) -> varena::Result<Physical> { self.1.time("import", || self.0.import(handle, len)) }
     fn target(&self, va: Va, offset: u64, len: u64) -> Dst { self.0.target(va, offset, len) }
     fn fence(&self) -> varena::Result<Event> { self.1.time("fence", || self.0.fence()) }
-    fn record(&self, stream: usize) -> varena::Result<Event> { self.1.time("record", || self.0.record(stream)) }
+    fn record(&self, stream: usize) -> varena::Result<Event> {
+        if stream != 0 && self.1.fail_record.compare_exchange(stream, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_ok() {
+            return Err(Error::Device { op: "cuEventRecord", code: 999, name: "CUDA_ERROR_UNKNOWN (injected)".into() });
+        }
+        self.1.time("record", || self.0.record(stream))
+    }
     fn query(&self, event: Event) -> varena::Result<bool> { self.1.time("query", || self.0.query(event)) }
     fn elapsed(&self, from: Event, to: Event) -> varena::Result<Option<u64>> { self.1.time("elapsed", || self.0.elapsed(from, to)) }
     fn wait(&self, event: Event, stream: usize) -> varena::Result<()> { self.1.time("wait", || self.0.wait(event, stream)) }
@@ -1237,7 +2110,7 @@ fn an_untransformed_refill_preserves_the_last_consumer_until_preparation_finishe
     // The copy must read the original contents before the in-place refill lands: the refill's
     // copies wait for it in-stream. The rebind returns once they are issued (D), its page ready
     // in-stream, while the fill thread's read keeps its staging until they complete.
-    let _ = mem.free();
+    poke(&mem);
     let (again, waited) = std::thread::scope(|t| {
         let (rebind, waited) = watch(t, first, || mem.bind(s, 0, 0));
         drop(gate);
@@ -1314,6 +2187,56 @@ fn watch<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, budget: std::time:
     }
 }
 
+/// The cost of an evicting bind, alone, for an A/B of cores on one card. It uses the forward case's setup: a card
+/// crowded to ROOM and full of an idle kept set, and a request over four sets. Its three pass starts and its 64 binds
+/// (each needing an idle page's room) are timed apart, each window with its backend and driver calls and the request's
+/// evictions.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn evicting_binds_on_a_full_card_are_timed_apart_from_their_pass_starts() {
+    let (b, g, uuid) = card("evict");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    // 64 pages: 128 MiB of binds, as the forward case.
+    let pages = 64;
+    let a = mem.load(set("a", 4, Fill::Stored, &g.uuid, |b| block(20, b)), Level::Ram).unwrap();
+    step!();
+    let (b1, b2) = (mem.load(bulk("b1", pages, &g.uuid), Level::Ram).unwrap(), mem.load(bulk("b2", pages, &g.uuid), Level::Ram).unwrap());
+    step!();
+    mem.load(set("c", 1, Fill::Stored, &g.uuid, |b| block(21, b)), Level::Ram).unwrap();
+    step!();
+    let _crowd = crowd();
+    mem.load(bulk("idle", more_than_free(), &g.uuid), Level::Gpu).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["a", "b1", "b2", "c"]])).unwrap();
+    step!();
+    let (_, _) = (timings.take(), CALLS.take());
+    let t = std::time::Instant::now();
+    let passes: Vec<Pass> = [a, b1, b2].iter().map(|s| r.pass(*s, "main|1").unwrap()).collect();
+    let starts = t.elapsed();
+    step!();
+    let (start_backend, start_driver, start_evicted) = (timings.take(), CALLS.take(), r.stats().evicted);
+    step!();
+    let t = std::time::Instant::now();
+    let pins: Vec<Pin> = (0..pages).map(|b| mem.bind(b1, b, 0).unwrap()).collect();
+    drop(pins);
+    let binds = t.elapsed();
+    step!();
+    let (bind_backend, bind_driver, evicted) = (timings.take(), CALLS.take(), r.stats().evicted);
+    step!();
+    println!("TIMINGS AB pass starts {starts:?}, evicted by then {start_evicted:?} | backend {start_backend} | driver {start_driver}");
+    println!("TIMINGS AB {pages} binds {binds:?}, {:?} each, evicted by then {evicted:?} | backend {bind_backend} | driver {bind_driver}", binds / pages);
+    step!();
+    drop(passes);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS evicting binds timed apart from their pass starts ({:?} each) {uuid}", binds / pages);
+    step!();
+}
+
 /// While a forward runs on the card (a kernel on a stream that reads a set's pages), the bind and
 /// pass paths run on the host: binds that evict idle pages, releases, a pass start, the torch cap,
 /// an unload, and the backend's own calls (free, process bytes, events). None may wait for the
@@ -1370,6 +2293,8 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     step!();
     assert_eq!(launch(c"spin", &[forward.as_nanos() as u64], stream.raw()), cuda::SUCCESS);
     step!();
+    // The driver calls from here on are those made while the forward runs.
+    CALLS.take();
     drop(pins);
     step!();
     let mut times: Vec<(&str, std::time::Duration)> = vec![];
@@ -1401,12 +2326,16 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
         let _ = probe.process_used();
     });
     step!();
-    time("record+query+wait", &mut || {
-        let e = probe.record(stream.raw()).unwrap();
-        running = !probe.query(e).unwrap();
-        probe.wait(e, other.raw()).unwrap();
-        probe.retire(e);
-    });
+    let mut event = Event::DONE;
+    time("record", &mut || event = probe.record(stream.raw()).unwrap());
+    step!();
+    time("query", &mut || running = !probe.query(event).unwrap());
+    step!();
+    time("wait", &mut || probe.wait(event, other.raw()).unwrap());
+    step!();
+    time("retire", &mut || probe.retire(event));
+    step!();
+    let during = CALLS.take();
     step!();
     stream.drain().unwrap();
     step!();
@@ -1416,7 +2345,8 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
     step!();
     let report: Vec<String> = times.iter().map(|(w, t)| format!("{w} {t:?}")).collect();
     step!();
-    println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}), still running at the last call: {running}: {}", report.join(", "));
+    println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}), still running at the query: {running}: {}", report.join(", "));
+    println!("TIMINGS driver calls while the forward ran: {during}");
     println!("TIMINGS in all: {}", timings.report());
     step!();
     for (what, took) in &times {
@@ -1433,6 +2363,8 @@ fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
 /// A kept page whose fill identity changed is renewed: a fresh page takes its place, and the old
 /// one is unmapped only once its consumers are done. A spin kernel holds it as its consumer; the
 /// unmap must come after the kernel's end (its launch plus its measured length on the GPU's clock).
+/// A page is kept with no request open (D9), and the renewal runs outside one too: a request's pass
+/// start withdraws the Keep, and a page not kept refills in place.
 #[test]
 #[ignore = "native GPU: a rental only"]
 fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
@@ -1459,15 +2391,15 @@ fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
     step!();
     drop(pin);
     step!();
-    assert_eq!(synchronize(), cuda::SUCCESS);
+    pass.end(0);
     step!();
-    // The bake's event done, the page is kept (exported read-only) at the next look.
-    let _ = mem.free();
-    while timings.count("export") == 0 {
-        drop(mem.bind(s, 0, 0).unwrap());
-        assert_eq!(synchronize(), cuda::SUCCESS);
-        let _ = mem.free();
-    }
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    // The request ended: the baked page is kept (exported read-only) once its bake's event is done.
+    mem.settle();
+    step!();
+    assert!(timings.count("export") > 0, "the baked page was kept once its request ended");
+    step!();
     let consumer = cuda::Stream::new(0).unwrap();
     step!();
     let held = mem.bind(s, 0, consumer.raw()).unwrap();
@@ -1489,25 +2421,22 @@ fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
     step!();
     assert!(renewed.fresh, "a new identity is baked again");
     step!();
-    consumer.drain().unwrap();
-    step!();
-    let ended = launched + spin;
-    step!();
-    while timings.count("unmap") == unmaps {
-        // The old page goes on the mechanism thread once its consumer is done.
-        let _ = mem.free();
-    }
-    let unmapped = timings.last("unmap").unwrap();
-    step!();
-    assert!(unmapped >= ended, "the old page was unmapped {:?} before its consumer's end", ended - unmapped);
-    step!();
     renewed.filled();
     step!();
     drop(renewed);
     step!();
-    pass.end(0);
+    consumer.drain().unwrap();
     step!();
-    assert_eq!(r.end().leftover, 0);
+    let ended = launched + spin;
+    step!();
+    // The old page goes on the mechanism thread once its consumer is done; settle waits for it.
+    mem.settle();
+    step!();
+    assert!(timings.count("unmap") > unmaps, "the old page was never unmapped");
+    step!();
+    let unmapped = timings.last("unmap").unwrap();
+    step!();
+    assert!(unmapped >= ended, "the old page was unmapped {:?} before its consumer's end", ended - unmapped);
     step!();
     println!("RENEW the old page unmapped {:?} after its {spin:?} consumer ended; {}", unmapped - ended, timings.report());
     step!();
@@ -1515,8 +2444,1029 @@ fn a_renewed_page_is_unmapped_only_after_its_consumer_ends() {
     step!();
 }
 
-/// A pass of `m` (two pinned blocks) whose one-gibibyte activation meets a real OOM: the card is
-/// crowded and the rest full of an idle set. Returns the OOM answers and the record.
+/// Where a load's `wall` went: its copy runs (`fills`: runs, bytes, ns, GPU-busy ns), their rate against the GPU's H2D
+/// ceiling, and the driver calls. The sets' sources are host memory, so no disk ceiling applies. Fills and driver
+/// calls run on different threads at once: the parts can overlap.
+fn split(wall: std::time::Duration, driver: std::time::Duration, [runs, bytes, ns, busy]: [u64; 4]) -> String {
+    let gbps = bytes as f64 / ns.max(1) as f64;
+    let ceiling = io::metrics::h2d(0).map_or(0.0, |(c, _)| c);
+    format!(
+        "SPLIT load {wall:?}: {runs} copy runs, {bytes} B in {:?} ({gbps:.2} GB/s, {:.1}% of the {ceiling:.2} GB/s H2D ceiling; GPU copying {:?}); driver calls {driver:?}",
+        std::time::Duration::from_nanos(ns),
+        100.0 * gbps / ceiling.max(f64::MIN_POSITIVE),
+        std::time::Duration::from_nanos(busy)
+    )
+}
+
+/// `bytes` in a device buffer of their own.
+fn device(bytes: &[u8]) -> io::DeviceBuffer {
+    let buffer = io::DeviceBuffer::new(0, bytes.len()).unwrap();
+    let copy = [Copy { src: Src::Host(bytes.as_ptr()), dst: Dst::Device { device: 0, ptr: buffer.ptr(), len: bytes.len(), stream: 0 } }];
+    unsafe { io::read(&copy, &ReadOpts::default()) }.unwrap();
+    buffer
+}
+
+/// Design §5 card check, a delayed transform on a non-current stream: a bake queued on stream X behind a gate, the
+/// page marked filled at once. A second caller prepares the same range on stream Y: preparation returns without a
+/// host wait, and the consumer it queues on Y reads the baked bytes once X runs, never the bytes before the bake.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_delayed_transform_on_another_stream_orders_the_next_consumer_in_stream() {
+    let (b, g, uuid) = card("delayed");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let mem = memory(b, &g);
+    step!();
+    let base = mem.load(set("base", 1, Fill::Declared("lora-1".into()), &g.uuid, |b| block(50, b)), Level::Ram).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["base"]])).unwrap();
+    step!();
+    let pass = r.pass(base, "main|1").unwrap();
+    step!();
+    let (x, y) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
+    step!();
+    let (baked, out) = (device(&block(51, 0)), io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap());
+    step!();
+    let range = mem.retain(base, &[0]).unwrap();
+    step!();
+    let first = std::time::Instant::now();
+    let pin = range.prepare_for(x.raw(), Some(&r)).unwrap().remove(0);
+    let first = first.elapsed();
+    step!();
+    assert!(pin.fresh, "the caller bakes it");
+    step!();
+    let mut gate = Some(Gate::hold(x.raw()));
+    step!();
+    assert_eq!(launch(c"copy", &[pin.ptr, baked.ptr(), REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    pin.filled();
+    step!();
+    drop(pin);
+    step!();
+    let (second, waited) = std::thread::scope(|t| {
+        let (prepared, waited) = watch(t, first, || range.prepare_for(y.raw(), Some(&r)));
+        if waited != Waited::Returned {
+            gate.take();
+        }
+        (prepared.join().unwrap().unwrap().remove(0), waited)
+    });
+    step!();
+    assert!(!second.fresh, "the second caller gets the bake, not a bake of its own");
+    step!();
+    assert_eq!(launch(c"copy", &[out.ptr(), second.ptr, REGION_ALIGN / 8], y.raw()), cuda::SUCCESS);
+    step!();
+    gate.take();
+    step!();
+    y.drain().unwrap();
+    step!();
+    assert!(bytes(out.ptr(), REGION_ALIGN, 0) == *block(51, 0), "the consumer on Y read the page before X's bake landed");
+    step!();
+    assert_eq!(waited, Waited::Returned, "preparing a range whose bake is queued on another stream waited on the host");
+    step!();
+    drop(second);
+    step!();
+    drop(range);
+    step!();
+    pass.end(0);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS a delayed transform on another stream orders the next consumer in-stream {uuid}");
+    step!();
+}
+
+/// Design §5 card check, cancel with a pending output copy: a prepared range's consumer copies the page out on stream
+/// X behind a gate; then the request is cancelled (dropped unended), the pin and the range dropped and the set
+/// unloaded, all while the copy is still queued. The page is unmapped only after the gate opens, and the copy reads
+/// the page's own bytes.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_cancelled_request_keeps_its_page_until_its_pending_output_copy_ends() {
+    let (b, g, uuid) = card("cancel");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let s = mem.load(set("w", 1, Fill::Stored, &g.uuid, |b| block(60, b)), Level::Ram).unwrap();
+    step!();
+    let x = cuda::Stream::new(0).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap();
+    step!();
+    let range = mem.retain(s, &[0]).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["w"]])).unwrap();
+    step!();
+    let pass = r.pass(s, "main|1").unwrap();
+    step!();
+    let first = std::time::Instant::now();
+    let pin = range.prepare_for(x.raw(), Some(&r)).unwrap().remove(0);
+    let first = first.elapsed();
+    step!();
+    let mut gate = Some(Gate::hold(x.raw()));
+    step!();
+    assert_eq!(launch(c"copy", &[out.ptr(), pin.ptr, REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    let unmaps = timings.count("unmap");
+    step!();
+    // The cancel, watched: if any of it waits on the host for the queued copy, the gate opens.
+    let waited = std::thread::scope(|t| {
+        let (cancelled, waited) = watch(t, first, || {
+            drop(pass);
+            drop(r);
+            drop(pin);
+            drop(range);
+            mem.unload(s);
+        });
+        if waited != Waited::Returned {
+            gate.take();
+        }
+        cancelled.join().unwrap();
+        waited
+    });
+    step!();
+    let early = timings.count("unmap") > unmaps;
+    step!();
+    let opened = std::time::Instant::now();
+    gate.take();
+    step!();
+    let drained = x.drain();
+    step!();
+    assert!(!early, "the page was unmapped while its output copy was still queued (the cancel {waited:?})");
+    step!();
+    drained.unwrap();
+    step!();
+    assert!(bytes(out.ptr(), REGION_ALIGN, 0) == *block(60, 0), "the output copy read other bytes than the page's");
+    step!();
+    while timings.count("unmap") == unmaps {
+        poke(&mem);
+    }
+    let unmapped = timings.last("unmap").unwrap();
+    step!();
+    assert!(unmapped >= opened, "unmapped {:?} before the copy could run", opened - unmapped);
+    step!();
+    println!("CANCEL the cancel {waited:?}; the page unmapped {:?} after the gate opened", unmapped - opened);
+    step!();
+    println!("PASS a cancelled request keeps its page until its pending output copy ends {uuid}");
+    step!();
+}
+
+/// Design §5 card check, old and new fill identity at once: a consumer of identity v1 queued on stream X behind a gate;
+/// the set's fill becomes v2. The v1 range is refused as stale, a v2 range is retained and prepared while the v1
+/// consumer is still queued. The v1 consumer reads v1's bytes, the v2 consumer v2's: neither sees the other's.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn old_and_new_fill_identities_at_once_each_read_their_own_bytes() {
+    let (b, g, uuid) = card("identity");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let t = mem.load(set("t", 1, Fill::Declared("v1".into()), &g.uuid, |b| block(70, b)), Level::Ram).unwrap();
+    step!();
+    let (x, y) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
+    step!();
+    let (v1, v2) = (device(&block(71, 0)), device(&block(72, 0)));
+    step!();
+    let (out1, out2) = (io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap(), io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap());
+    step!();
+    let r = mem.request("r", plan(&[&["t"]])).unwrap();
+    step!();
+    let pass = r.pass(t, "main|1").unwrap();
+    step!();
+    let old = mem.retain(t, &[0]).unwrap();
+    step!();
+    let first = std::time::Instant::now();
+    let pin = old.prepare_for(x.raw(), Some(&r)).unwrap().remove(0);
+    let first = first.elapsed();
+    step!();
+    assert!(pin.fresh, "v1 is baked by its caller");
+    step!();
+    assert_eq!(launch(c"copy", &[pin.ptr, v1.ptr(), REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    pin.filled();
+    step!();
+    // The bake done (the gate synchronizes X first), the v1 consumer is queued behind the gate.
+    let mut gate = Some(Gate::hold(x.raw()));
+    step!();
+    assert_eq!(launch(c"copy", &[out1.ptr(), pin.ptr, REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    let address = pin.ptr;
+    drop(pin);
+    step!();
+    let unmaps = timings.count("unmap");
+    step!();
+    let changed = std::thread::scope(|s| {
+        let (changed, waited) = watch(s, first, || mem.fill(t, Fill::Declared("v2".into())));
+        if waited != Waited::Returned {
+            gate.take();
+        }
+        changed.join().unwrap();
+        waited
+    });
+    step!();
+    assert!(!old.valid(), "the v1 range is stale once the fill is v2");
+    step!();
+    assert!(matches!(old.prepare_for(y.raw(), Some(&r)), Err(Error::StaleBinding(_))), "a stale range is refused, never prepared");
+    step!();
+    let new = mem.retain(t, &[0]).unwrap();
+    step!();
+    assert_ne!(new.identity(), old.identity());
+    step!();
+    let (pin2, waited) = std::thread::scope(|s| {
+        let (prepared, waited) = watch(s, first, || new.prepare_for(y.raw(), Some(&r)));
+        if waited != Waited::Returned {
+            gate.take();
+        }
+        (prepared.join().unwrap().unwrap().remove(0), waited)
+    });
+    step!();
+    let early = gate.is_some() && timings.count("unmap") > unmaps;
+    step!();
+    assert!(pin2.fresh, "v2 is baked by its caller");
+    step!();
+    assert_eq!(launch(c"copy", &[pin2.ptr, v2.ptr(), REGION_ALIGN / 8], y.raw()), cuda::SUCCESS);
+    step!();
+    pin2.filled();
+    step!();
+    assert_eq!(launch(c"copy", &[out2.ptr(), pin2.ptr, REGION_ALIGN / 8], y.raw()), cuda::SUCCESS);
+    step!();
+    gate.take();
+    step!();
+    let (dx, dy) = (x.drain(), y.drain());
+    step!();
+    assert!(!early, "the v1 page was unmapped while its consumer was still queued");
+    step!();
+    dx.unwrap();
+    dy.unwrap();
+    step!();
+    assert!(bytes(out1.ptr(), REGION_ALIGN, 0) == *block(71, 0), "the v1 consumer read other bytes than v1's");
+    step!();
+    assert!(bytes(out2.ptr(), REGION_ALIGN, 0) == *block(72, 0), "the v2 consumer read other bytes than v2's");
+    step!();
+    println!("IDENTITY the fill change {changed:?}, v2's preparation {waited:?} while v1's consumer was queued; at v1's address: {}", pin2.ptr == address);
+    step!();
+    drop(pin2);
+    step!();
+    drop((old, new));
+    step!();
+    pass.end(0);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS old and new fill identities at once each read their own bytes {uuid}");
+    step!();
+}
+
+/// Design §3 and §5 card check, a completion-record failure without reuse: a consumer copies a page out on stream X
+/// behind a gate, then the pin's release event cannot be recorded (an injected driver failure). Memory must assume
+/// the page may still be read: binds fail as ownership errors, and nothing — the unload, the request's end, Memory's
+/// drop — unmaps or frees it. The consumer reads the page's own bytes once the gate opens.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_failed_completion_record_quarantines_the_page_and_nothing_reuses_it() {
+    let (b, g, uuid) = card("record");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let s = mem.load(set("q", 1, Fill::Stored, &g.uuid, |b| block(80, b)), Level::Ram).unwrap();
+    step!();
+    let x = cuda::Stream::new(0).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["q"]])).unwrap();
+    step!();
+    let pass = r.pass(s, "main|1").unwrap();
+    step!();
+    let first = std::time::Instant::now();
+    let pin = mem.bind(s, 0, x.raw()).unwrap();
+    let first = first.elapsed();
+    step!();
+    let gate = Gate::hold(x.raw());
+    step!();
+    assert_eq!(launch(c"copy", &[out.ptr(), pin.ptr, REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    let (unmaps, destroys) = (timings.count("unmap"), timings.count("destroy"));
+    step!();
+    timings.fail_record(x.raw());
+    step!();
+    drop(pin);
+    step!();
+    let mut gate = Some(gate);
+    // The quarantine, watched: nothing after it may wait for the queued copy, but if it does the gate opens.
+    let (refused, waited) = std::thread::scope(|t| {
+        let (refused, waited) = watch(t, first, || {
+            let refused = mem.bind(s, 0, 0).err();
+            drop(pass);
+            drop(r);
+            mem.unload(s);
+            drop(mem);
+            refused
+        });
+        if waited != Waited::Returned {
+            gate.take();
+        }
+        (refused.join().unwrap(), waited)
+    });
+    step!();
+    assert!(matches!(refused, Some(Error::Ownership(_))), "a bind after an unproven release: {refused:?}");
+    step!();
+    gate.take();
+    step!();
+    x.drain().unwrap();
+    step!();
+    assert!(bytes(out.ptr(), REGION_ALIGN, 0) == *block(80, 0), "the consumer read other bytes than the page's");
+    step!();
+    assert_eq!((timings.count("unmap"), timings.count("destroy")), (unmaps, destroys), "a page whose completion is unknown was unmapped or freed");
+    step!();
+    println!("RECORD after the failure, the bind, the request's end, the unload and Memory's drop: {waited:?}");
+    step!();
+    println!("PASS a failed completion record quarantines the page and nothing reuses it ({refused:?}) {uuid}");
+    step!();
+}
+
+/// S3's ILLEGAL_ADDRESS (gpu12): a Keep (the protect of a filled page to read-only, on the mechanism thread) ran while
+/// the page's pin was handed out and its kernels read it. Here the baker marks its page filled while it still holds the
+/// pin and a kernel sweeps the page for ten times the first bind. No fault, the sweep reads the baked bytes throughout,
+/// and the page is protected only after the pin is dropped, which is after the sweep has ended.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_keep_protects_a_page_only_after_its_pin_and_the_kernels_reading_it_end() {
+    let (b, g, uuid) = card("keep");
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let t = mem.load(set("t", 1, Fill::Declared("bake-1".into()), &g.uuid, |b| block(90, b)), Level::Ram).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["t"]])).unwrap();
+    step!();
+    let pass = r.pass(t, "main|1").unwrap();
+    step!();
+    let x = cuda::Stream::new(0).unwrap();
+    step!();
+    let (baked, out) = (device(&block(91, 0)), io::DeviceBuffer::new(0, 16).unwrap());
+    step!();
+    let first = std::time::Instant::now();
+    let pin = mem.bind(t, 0, x.raw()).unwrap();
+    let first = first.elapsed();
+    step!();
+    assert!(pin.fresh, "the caller bakes it");
+    step!();
+    assert_eq!(launch(c"copy", &[pin.ptr, baked.ptr(), REGION_ALIGN / 8], x.raw()), cuda::SUCCESS);
+    step!();
+    let long = first * 10;
+    step!();
+    assert_eq!(launch(c"sweep", &[pin.ptr, REGION_ALIGN / 8, long.as_nanos() as u64, out.ptr()], x.raw()), cuda::SUCCESS);
+    step!();
+    let protects = timings.protects.lock().len();
+    step!();
+    // The Keep is queued now, with the pin held and the sweep running.
+    pin.filled();
+    step!();
+    let swept = x.drain();
+    step!();
+    let unpinned = std::time::Instant::now();
+    drop(pin);
+    step!();
+    swept.unwrap();
+    step!();
+    let read = bytes(out.ptr(), 16, 0);
+    step!();
+    let (acc, passes) = (u64::from_ne_bytes(read[..8].try_into().unwrap()), u64::from_ne_bytes(read[8..].try_into().unwrap()));
+    step!();
+    let once = block(91, 0).chunks(8).fold(0u64, |a, w| a ^ u64::from_ne_bytes(w.try_into().unwrap()));
+    step!();
+    assert_eq!(acc, if passes % 2 == 1 { once } else { 0 }, "the sweep read other bytes than the bake's ({passes} passes)");
+    step!();
+    pass.end(0);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    // A Keep runs with no request open (D9), on the mechanism thread once the page is free of pins and consumers;
+    // settle waits for it.
+    mem.settle();
+    step!();
+    let (start, end) = *timings.protects.lock().get(protects).expect("the page was kept once its request ended");
+    step!();
+    assert!(start >= unpinned, "the page was protected {:?} while its pin was held", unpinned - start);
+    step!();
+    println!("KEEP protect {:?} after the unpin, for {:?}; the sweep {passes} passes over {long:?}", start - unpinned, end - start);
+    step!();
+    println!("PASS a keep protects a page only after its pin and the kernels reading it end {uuid}");
+    step!();
+}
+
+/// Drives the state (its releases and events) with no room asked: a lock of it, as a bind takes.
+fn poke(mem: &Memory) {
+    drop(mem.make_room(0));
+}
+
+/// The native allocator's hook (tensorfs-py's allocator.rs) on raw driver calls, under `torch` (torch's allocator
+/// lock, holding the bytes its segments hold). A segment that fits Memory's free bytes is cut with cuMemAlloc.
+/// Otherwise `make_room` makes the room and holds it for the segment (a [`varena::memory::Claim`]); a driver that
+/// still refuses gets one page more asked, until `make_room` takes nothing. None: refused.
+fn segment(mem: &Memory, torch: &parking_lot::Mutex<u64>, size: u64, callbacks: &Timings) -> Option<(u64, varena::memory::Resident)> {
+    // Torch's allocation context is current in the allocator.
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    let mut held = torch.lock();
+    let d = cuda::driver().unwrap();
+    let mut more = 0;
+    loop {
+        let claim = if more == 0 && size <= mem.free() { None } else { Some(callbacks.time("make_room", || mem.make_room(size + more)).ok()?) };
+        let change = mem.physical_change();
+        let mut ptr = 0;
+        let rc = unsafe { (d.mem_alloc)(&mut ptr, size as usize) };
+        if rc == cuda::SUCCESS {
+            let resident = claim.map_or_else(|| mem.resident(size), |c| c.resident());
+            change.finish();
+            *held += size;
+            return Some((ptr, resident));
+        }
+        assert_eq!(rc, cuda::ERROR_OUT_OF_MEMORY, "cuMemAlloc");
+        change.finish();
+        more += REGION_ALIGN;
+    }
+}
+
+/// Frees a segment as the native allocator's worker does: after its stream's work, outside the allocator lock, then
+/// gives its bytes back to the lock's count.
+fn unsegment(torch: &parking_lot::Mutex<u64>, (ptr, resident): (u64, varena::memory::Resident), size: u64) {
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    assert_eq!(unsafe { (cuda::driver().unwrap().mem_free)(ptr) }, cuda::SUCCESS, "cuMemFree");
+    drop(resident);
+    *torch.lock() -= size;
+}
+
+// ---- step 1: one make_room(need) loop, called by the allocator hook (audit §4, owner 10-22)
+
+/// A set of `pages` pages of [`bulk_block`], bound on `stream` and released: resident own weights with no pin left.
+fn resident(mem: &Memory, name: &str, pages: u32, uuid: &str, stream: usize) -> SetId {
+    let one = bulk_block();
+    let set = mem.load(set(name, pages, Fill::Stored, uuid, |_| one.clone()), Level::Ram).unwrap();
+    drop((0..pages).map(|p| mem.bind(set, p, stream).unwrap()).collect::<Vec<Pin>>());
+    set
+}
+
+/// The hook evicts the request's own pages under a 1 GiB cap, with review 6's F4 folded in. Two threads allocate
+/// under one lock (torch's), as the native allocator does.
+/// - Setup: the request's own pages are released behind a kernel still running on their stream. An unrelated stream
+///   is gated. A kernel sweeps a pinned page throughout.
+/// - Thread A needs half the own set beyond the budget, then keeps allocating until refused. Its first allocation must
+///   wait for the running kernel, the pages' own release, and only for that.
+/// - Thread B allocates, writes and frees through a free worker; cuMemFree waits on the device outside the lock.
+/// - Pass conditions:
+///   - No thread on the lock's path waits for the gate (no deadlock).
+///   - No page is unmapped before its consumer ended.
+///   - The pinned page is never taken and keeps its bytes. Nothing faults.
+///   - The driver gains exactly the evicted bytes.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn the_hook_waits_on_its_pages_release_events_never_on_unrelated_work() {
+    let (b, g, uuid) = card("hook");
+    step!();
+    // 1 GiB: a card small enough that the threads need the request's own pages.
+    let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let pages = 64;
+    let one = bulk_block();
+    let w = mem.load(set("w", pages, Fill::Stored, &g.uuid, |_| one.clone()), Level::Ram).unwrap();
+    step!();
+    let p = mem.load(set("p", 1, Fill::Stored, &g.uuid, |b| block(95, b)), Level::Ram).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["w", "p"]])).unwrap();
+    step!();
+    let (x, y, swept, gated) = (cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap());
+    step!();
+    let first = std::time::Instant::now();
+    let pins: Vec<Pin> = (0..pages).map(|b| mem.bind(w, b, x.raw()).unwrap()).collect();
+    let first = first.elapsed();
+    step!();
+    // The longest single call the threads make, measured before them: thread A's big allocation, cut and freed once.
+    let near = mem.free().saturating_sub(2 * REGION_ALIGN);
+    let warm = {
+        let (_, ctx) = cuda::primary_context(0).unwrap();
+        let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+        let d = cuda::driver().unwrap();
+        let t = std::time::Instant::now();
+        let mut ptr = 0;
+        assert_eq!(unsafe { (d.mem_alloc)(&mut ptr, near as usize) }, cuda::SUCCESS);
+        assert_eq!(unsafe { (d.mem_free)(ptr) }, cuda::SUCCESS);
+        t.elapsed().max(first)
+    };
+    step!();
+    // The own pages' consumer: ten times their binds, on their stream; each pin's release event lands behind it.
+    let spin = first * 10;
+    let launched = std::time::Instant::now();
+    assert_eq!(launch(c"spin", &[spin.as_nanos() as u64], x.raw()), cuda::SUCCESS);
+    step!();
+    drop(pins);
+    step!();
+    let pinned = mem.bind(p, 0, swept.raw()).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, 16).unwrap();
+    step!();
+    assert_eq!(launch(c"sweep", &[pinned.ptr, REGION_ALIGN / 8, (spin * 2).as_nanos() as u64, out.ptr()], swept.raw()), cuda::SUCCESS);
+    step!();
+    poke(&mem);
+    step!();
+    let (start_free, unmaps) = (driver_free(), timings.count("unmap"));
+    step!();
+    let mut gate = Some(Gate::hold(gated.raw()));
+    step!();
+    let torch = parking_lot::Mutex::new(0u64);
+    let callbacks = Timings::default();
+    // One call may wait for the own pages' release (the kernel), on top of its own time.
+    let (calls, longest, done) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new((spin + warm).as_nanos() as u64), std::sync::atomic::AtomicBool::new(false));
+    // Where each thread is: 0 between calls, 1 allocating (the allocator lock's path), 2 writing and handing to the
+    // free worker.
+    let phase = [std::sync::atomic::AtomicU8::new(0), std::sync::atomic::AtomicU8::new(0)];
+    let at = |thread: usize, where_: u8| phase[thread].store(where_, std::sync::atomic::Ordering::Release);
+    let timed = |t: std::time::Instant| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        longest.fetch_max(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::AcqRel);
+    };
+    // The native allocator's free: an event on the segment's stream, handed to a worker that waits for it and frees
+    // outside the lock (a cuMemFree may wait for the device).
+    let (hand, frees) = mpsc::channel::<((u64, varena::memory::Resident), usize)>();
+    let (kept, churned, waited, first_returned) = std::thread::scope(|s| {
+        let worker = s.spawn(|| {
+            let (_, ctx) = cuda::primary_context(0).unwrap();
+            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+            let d = cuda::driver().unwrap();
+            for (seg, event) in frees {
+                assert_eq!(unsafe { (d.event_synchronize)(event as cuda::CUevent) }, cuda::SUCCESS);
+                unsafe { (d.event_destroy)(event as cuda::CUevent) };
+                unsegment(&torch, seg, REGION_ALIGN);
+            }
+        });
+        let a = s.spawn(|| {
+            let mut kept = vec![];
+            // Half the own set beyond the budget: make_room must take own pages, waiting for their release.
+            let need = near + u64::from(pages / 2) * REGION_ALIGN;
+            let t = std::time::Instant::now();
+            at(0, 1);
+            kept.extend(segment(&mem, &torch, need, &callbacks).map(|seg| (seg, need)));
+            at(0, 0);
+            let first_returned = std::time::Instant::now();
+            timed(t);
+            loop {
+                let t = std::time::Instant::now();
+                at(0, 1);
+                let got = segment(&mem, &torch, REGION_ALIGN, &callbacks);
+                at(0, 0);
+                timed(t);
+                let Some(seg) = got else { break };
+                kept.push((seg, REGION_ALIGN));
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+            (kept, first_returned)
+        });
+        let b = s.spawn(|| {
+            let (_, ctx) = cuda::primary_context(0).unwrap();
+            let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+            let d = cuda::driver().unwrap();
+            let mut churned = (0u64, 0u64);
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                let t = std::time::Instant::now();
+                at(1, 1);
+                match segment(&mem, &torch, REGION_ALIGN, &callbacks) {
+                    Some(seg) => {
+                        at(1, 2);
+                        assert_eq!(unsafe { (d.memset_d8_async)(seg.0, 9, REGION_ALIGN as usize, y.raw() as cuda::CUstream) }, cuda::SUCCESS);
+                        let mut event = std::ptr::null_mut();
+                        assert_eq!(unsafe { (d.event_create)(&mut event, cuda::EVENT_DEFAULT) }, cuda::SUCCESS);
+                        assert_eq!(unsafe { (d.event_record)(event, y.raw() as cuda::CUstream) }, cuda::SUCCESS);
+                        hand.send((seg, event as usize)).unwrap();
+                        churned.0 += 1;
+                    }
+                    None => churned.1 += 1,
+                }
+                at(1, 0);
+                timed(t);
+            }
+            // The worker ends once B, the one sender, is done.
+            drop(hand);
+            churned
+        });
+        // Looks every interval of the longest call so far: two with no call done mean a thread waits, and where each
+        // thread is says on what. Then the gate opens, so the case ends either way.
+        let (mut seen, mut quiet, mut waited) = (0, 0, None);
+        while !(a.is_finished() && b.is_finished()) {
+            std::thread::sleep(std::time::Duration::from_nanos(longest.load(std::sync::atomic::Ordering::Acquire)));
+            let now = calls.load(std::sync::atomic::Ordering::Acquire);
+            quiet = if now == seen { quiet + 1 } else { 0 };
+            seen = now;
+            if quiet == 2 && gate.is_some() {
+                waited = Some([0, 1].map(|t| phase[t].load(std::sync::atomic::Ordering::Acquire)));
+                gate.take();
+            }
+        }
+        let ((kept, first_returned), churned) = (a.join().unwrap(), b.join().unwrap());
+        // B's frees wait on the device in the worker, outside the lock: they finish once the gate opens.
+        gate.take();
+        worker.join().unwrap();
+        (kept, churned, waited, first_returned)
+    });
+    step!();
+    gate.take();
+    step!();
+    let (sx, sy, ss, sg) = (x.drain(), y.drain(), swept.drain(), gated.drain());
+    step!();
+    let served = !kept.is_empty();
+    for (seg, size) in kept {
+        unsegment(&torch, seg, size);
+    }
+    step!();
+    let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
+    step!();
+    let gained = driver_free().saturating_sub(start_free);
+    step!();
+    println!(
+        "HOOK the first allocation returned {:?} after the kernel's launch (its {spin:?}); make_room {}; B churned {} segments, refused {}; unmapped {unmapped} B; driver gained {gained} B; waited on the gated stream (phases A, B: 1 allocating, 2 writing): {waited:?}",
+        first_returned - launched, callbacks.report(), churned.0, churned.1
+    );
+    // Which backend call a slow make_room spent its time in.
+    println!("TIMINGS hook backend calls: {}", timings.report());
+    step!();
+    assert!(waited.is_none(), "a thread waited for the gated stream (on the allocator lock's path at 1): {waited:?}");
+    step!();
+    sx.unwrap();
+    sy.unwrap();
+    ss.unwrap();
+    sg.unwrap();
+    step!();
+    assert!(served, "make_room served A's allocation from the request's own pages");
+    step!();
+    assert!(timings.last("unmap").is_some_and(|t| t >= launched + spin), "a page was unmapped before its consumer ended");
+    step!();
+    assert!(exact(&pinned, &block(95, 0), 0), "the pinned page was never taken");
+    step!();
+    assert!(unmapped >= u64::from(pages / 2) * REGION_ALIGN && unmapped <= u64::from(pages) * REGION_ALIGN, "own pages only: {unmapped} B");
+    step!();
+    assert!(gained.abs_diff(unmapped) <= REGION_ALIGN, "the driver gained {gained} B for {unmapped} B unmapped");
+    step!();
+    drop(pinned);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS the hook waits on its pages' release events, never on unrelated work {uuid}");
+    step!();
+}
+
+/// An activation larger than the free memory is served from evictable weights under a 1 GiB cap, never refused. The
+/// card holds the request's own resident set and an idle set of another; the activation needs more than free memory
+/// plus the idle set.
+/// - make_room takes the other set's idle pages first.
+/// - Then it takes the request's own pages.
+/// - The driver gets exactly what was evicted back.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn an_activation_larger_than_free_memory_is_served_from_evictable_weights() {
+    let (b, g, uuid) = card("serve");
+    step!();
+    let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let pages = 64;
+    resident(&mem, "own", pages, &g.uuid, 0);
+    step!();
+    resident(&mem, "other", pages, &g.uuid, 0);
+    step!();
+    // Both sets were bound with no request open: settled, they are kept. The request's open withdraws them for the
+    // hook, which makes no custody call itself.
+    mem.settle();
+    step!();
+    let r = mem.request("r", plan(&[&["own"]])).unwrap();
+    step!();
+    let (start_free, unmaps) = (driver_free(), timings.count("unmap"));
+    step!();
+    // Free memory, the other set, and half of the request's own.
+    let need = mem.free() + u64::from(pages + pages / 2) * REGION_ALIGN;
+    let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
+    let got = segment(&mem, &torch, need, &callbacks).expect("the activation was served from evictable weights");
+    step!();
+    let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
+    step!();
+    // By class: the other set's idle pages (no declared use) before the request's own (declared use).
+    let evicted = r.stats().evicted;
+    step!();
+    println!("SERVE {need} B served; make_room {}; unmapped {unmapped} B; evicted by class {evicted:?}", callbacks.report());
+    step!();
+    assert!(unmapped >= u64::from(pages + pages / 2) * REGION_ALIGN);
+    step!();
+    unsegment(&torch, got, need);
+    step!();
+    let gained = driver_free().saturating_sub(start_free);
+    step!();
+    assert!(gained.abs_diff(unmapped) <= REGION_ALIGN, "the driver gained {gained} B for {unmapped} B unmapped");
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS an activation larger than free memory is served from evictable weights {uuid}");
+    step!();
+}
+
+/// Under a 1 GiB cap, the hook never takes a pinned page, and fails only when the need exceeds every evictable byte.
+/// - Of two sets, one is pinned throughout (its bytes checked) and one is idle.
+/// - Half a page more than free memory and the idle set together is refused at once, with nothing evicted.
+/// - Half a page less is served from the idle set, every page of it, and no pinned page.
+/// - Once two pinned pages are released, half a page more than free is served: the floor keeps one as the running
+///   set's slot, and the other goes.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn the_hook_never_takes_a_pinned_page_and_fails_only_when_nothing_is_evictable() {
+    let (b, g, uuid) = card("pinned-hook");
+    step!();
+    let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let pages = 16;
+    let held = mem.load(set("held", pages, Fill::Stored, &g.uuid, |b| block(97, b)), Level::Ram).unwrap();
+    step!();
+    resident(&mem, "idle", pages, &g.uuid, 0);
+    step!();
+    // The idle set was bound with no request open: settled, it is kept. The request's open withdraws it for the hook.
+    mem.settle();
+    step!();
+    let r = mem.request("r", plan(&[&["held"]])).unwrap();
+    step!();
+    let mut pins: Vec<Pin> = (0..pages).map(|p| mem.bind(held, p, 0).unwrap()).collect();
+    step!();
+    let unmaps = timings.count("unmap");
+    step!();
+    let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
+    // Pinned pages never count: beyond free memory and the idle set, the allocation is refused before any eviction.
+    let beyond = mem.free() + u64::from(pages) * REGION_ALIGN + REGION_ALIGN / 2;
+    let refused = segment(&mem, &torch, beyond, &callbacks);
+    step!();
+    assert!(refused.is_none(), "an allocation beyond every evictable byte was served");
+    step!();
+    assert_eq!(timings.count("unmap"), unmaps, "a refused allocation evicted weights");
+    step!();
+    let within = mem.free() + u64::from(pages) * REGION_ALIGN - REGION_ALIGN / 2;
+    let served = segment(&mem, &torch, within, &callbacks).expect("the idle set made the room");
+    step!();
+    let unmapped = (timings.count("unmap") - unmaps) * REGION_ALIGN;
+    step!();
+    assert_eq!(unmapped, u64::from(pages) * REGION_ALIGN, "the idle set went, every page of it, and nothing else");
+    step!();
+    for (p, pin) in pins.iter().enumerate() {
+        assert!(exact(pin, &block(97, p as u32), 0), "pinned page {p} kept its bytes");
+    }
+    step!();
+    // Two pinned pages released: the floor keeps one as the running set's slot (its other pages are pinned), and half
+    // a page more than free is served from the other.
+    drop(pins.pop());
+    drop(pins.pop());
+    step!();
+    poke(&mem);
+    step!();
+    let half = mem.free() + REGION_ALIGN / 2;
+    let more = segment(&mem, &torch, half, &callbacks).expect("a released page made the room");
+    step!();
+    println!("PINNED {beyond} B refused with nothing evicted; {within} B served from the idle set ({unmapped} B); then {half} B served; make_room {}", callbacks.report());
+    step!();
+    unsegment(&torch, more, half);
+    unsegment(&torch, served, within);
+    step!();
+    drop(pins);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS the hook never takes a pinned page and fails only when nothing is evictable {uuid}");
+    step!();
+}
+
+/// A deadlock reproduction, out of the suite's runs: a documented unsupported condition, not a requirement on the hook.
+/// The lead ruled (10-22) that the hook waits on its pages' release events. Nothing in our stack may enqueue a
+/// GIL-taking host function on a stream whose work those events follow; S4's architecture check rejects it. Here
+/// third-party code does: the allocating thread holds a stand-in GIL, and a host function on the pages' stream waits
+/// for it, ahead of their release events. The hook then waits on its own thread's GIL.
+/// - Budget: ten times the case's own binds.
+/// - Past the budget the host function gives up, so a manual run always ends.
+/// - It reports what the hook did.
+#[test]
+#[ignore = "a deadlock reproduction of an unsupported condition (a GIL-taking host function ahead of varena's release events); never in a run"]
+fn repro_the_hook_waits_behind_a_gil_taking_host_function() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    static GIL_HELD: AtomicBool = AtomicBool::new(false);
+    static ABORT: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn takes_the_gil(_: *mut c_void) {
+        // As PyGILState_Ensure: it waits while the allocating thread holds the GIL.
+        while GIL_HELD.load(SeqCst) && !ABORT.load(SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+    let (b, g, uuid) = card("gil");
+    step!();
+    let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
+    let (mem, _timings) = timed_memory(b, &g);
+    step!();
+    let pages = 64;
+    let one = bulk_block();
+    let w = mem.load(set("w", pages, Fill::Stored, &g.uuid, |_| one.clone()), Level::Ram).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["w"]])).unwrap();
+    step!();
+    let x = cuda::Stream::new(0).unwrap();
+    step!();
+    let first = std::time::Instant::now();
+    let pins: Vec<Pin> = (0..pages).map(|p| mem.bind(w, p, x.raw()).unwrap()).collect();
+    let first = first.elapsed();
+    step!();
+    // The allocating thread holds the GIL from now on; the host function, then the pins' release events, queue on
+    // the pages' stream.
+    GIL_HELD.store(true, SeqCst);
+    let d = cuda::driver().unwrap();
+    cuda::check("cuLaunchHostFunc", unsafe { (d.launch_host_func)(x.raw() as cuda::CUstream, takes_the_gil, std::ptr::null_mut()) }).unwrap();
+    drop(pins);
+    step!();
+    let need = mem.free() + u64::from(pages / 2) * REGION_ALIGN;
+    let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
+    let (got, waited) = std::thread::scope(|s| {
+        let (h, waited) = watch(s, first * 10, || {
+            let out = segment(&mem, &torch, need, &callbacks);
+            GIL_HELD.store(false, SeqCst);
+            out
+        });
+        if waited != Waited::Returned {
+            ABORT.store(true, SeqCst);
+        }
+        (h.join().unwrap(), waited)
+    });
+    step!();
+    GIL_HELD.store(false, SeqCst);
+    let _ = x.drain();
+    step!();
+    println!("GIL hook {waited:?}: served {:?}; make_room {}", got.as_ref().map(|_| need), callbacks.report());
+    if let Some(got) = got {
+        unsegment(&torch, got, need);
+    }
+    drop(r);
+    println!("REPRO the hook {} behind a GIL-taking host function {uuid}", if waited == Waited::Returned { "returned" } else { "waited" });
+    step!();
+}
+
+// ---- step 2: the watermark (audit §4): a running set too big for the card streams its upper blocks through slots
+
+/// A set of `blocks` pages, each its own bytes ([`block`] of `seed`): a streamed set's contents are checked per block.
+fn distinct(mem: &Memory, name: &str, blocks: u32, seed: u8, uuid: &str) -> SetId {
+    mem.load(set(name, blocks, Fill::Stored, uuid, |b| block(seed, b)), Level::Ram).unwrap()
+}
+
+/// A request's passes over every block of `s` in order, each block bound, checked and released; per pass, the
+/// creates, maps and unmaps it made.
+fn passes(mem: &Memory, timings: &Timings, s: SetId, blocks: u32, seed: u8, n: u32) -> Vec<(u64, u64, u64)> {
+    let r = mem.request("stream", plan(&[&["big"]])).unwrap();
+    step!();
+    let mut made = vec![];
+    for _ in 0..n {
+        let (c, m, u) = (timings.count("create"), timings.count("map"), timings.count("unmap"));
+        let pass = r.pass(s, "fwd|1").unwrap();
+        for b in 0..blocks {
+            let pin = mem.bind(s, b, 0).unwrap_or_else(|e| panic!("block {b} of a set bigger than the card: {e}"));
+            assert!(exact(&pin, &block(seed, b), 0), "block {b} streamed in with other bytes");
+        }
+        pass.end(0);
+        made.push((timings.count("create") - c, timings.count("map") - m, timings.count("unmap") - u));
+        step!();
+    }
+    assert_eq!(r.end().leftover, 0);
+    made
+}
+
+/// A set larger than the card (a 512 MiB cap) streams. Two passes over its blocks in order:
+/// - every bind is served with the block's own bytes, and nothing raises an OOM;
+/// - in the second pass the upper blocks move through the slots, with no new page per block (slot moves, not
+///   creates), and the lower blocks stay resident.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_set_bigger_than_the_card_streams_through_the_slots() {
+    let (b, g, uuid) = card("stream");
+    step!();
+    // 512 MiB: a card a 400 MiB set does not fit beside the context.
+    let _ledger = Ledger::create(&g, Some(512 << 20)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let blocks = 200;
+    let s = distinct(&mem, "big", blocks, 98, &g.uuid);
+    step!();
+    let made = passes(&mem, &timings, s, blocks, 98, 2);
+    step!();
+    println!("STREAM {blocks} blocks over a 512 MiB card; per pass (creates, maps, unmaps): {made:?}");
+    step!();
+    let (creates, maps, _) = made[1];
+    assert!(maps > 0, "the second pass streamed nothing");
+    step!();
+    assert!(creates < maps, "the second pass made a new page per block ({creates} creates, {maps} maps): no slots");
+    step!();
+    println!("PASS a set bigger than the card streams through the slots {uuid}");
+    step!();
+}
+
+/// A graph captured against a streamed block's VA replays across the slot moves. The set is larger than the card.
+/// - First pass: one graph is captured per block (a copy of the block), while the block is bound.
+/// - Second pass: each block is bound again, through whichever slot backs it now, and its graph replays.
+/// - Every replay reads the block's own bytes.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_graph_replays_across_a_streamed_sets_slot_moves() {
+    let (b, g, uuid) = card("stream-graph");
+    step!();
+    let _ledger = Ledger::create(&g, Some(512 << 20)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let blocks = 200;
+    let s = distinct(&mem, "big", blocks, 99, &g.uuid);
+    step!();
+    let stream = cuda::Stream::new(0).unwrap();
+    step!();
+    let out = io::DeviceBuffer::new(0, REGION_ALIGN as usize).unwrap();
+    step!();
+    let r = mem.request("graphs", plan(&[&["big"]])).unwrap();
+    step!();
+    let mut execs = vec![];
+    let pass = r.pass(s, "fwd|1").unwrap();
+    for b in 0..blocks {
+        let pin = mem.bind(s, b, stream.raw()).unwrap();
+        execs.push((pin.ptr, captured_copy(out.ptr(), pin.ptr, REGION_ALIGN / 8, stream.raw())));
+    }
+    pass.end(0);
+    step!();
+    let unmaps = timings.count("unmap");
+    let pass = r.pass(s, "fwd|1").unwrap();
+    for b in 0..blocks {
+        let pin = mem.bind(s, b, stream.raw()).unwrap();
+        let (ptr, exec) = execs[b as usize];
+        assert_eq!(pin.ptr, ptr, "block {b} moved off its own VA");
+        assert_eq!(replay(exec, stream.raw()), cuda::SUCCESS);
+        assert!(bytes(out.ptr(), REGION_ALIGN, stream.raw()) == *block(99, b), "block {b}'s graph read other bytes");
+    }
+    pass.end(0);
+    step!();
+    let moved = timings.count("unmap") - unmaps;
+    step!();
+    assert!(moved > 0, "the second pass moved no slot");
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS a graph replays across a streamed set's slot moves ({moved} unmaps in the second pass) {uuid}");
+    step!();
+}
+
+/// The floor is the activations and one block, under a 1 GiB cap. Activations (through the allocator hook) take all
+/// but four blocks' room, and a set bigger than the rest streams. Then they grow by three blocks: the hook takes the
+/// set's slots in place, down to one, and a second pass streams through that last slot. Every block is exact, and
+/// weights never cause an OOM.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn the_floor_is_the_activations_and_one_block() {
+    let (b, g, uuid) = card("floor");
+    step!();
+    let _ledger = Ledger::create(&g, Some(1 << 30)).unwrap();
+    let (mem, timings) = timed_memory(b, &g);
+    step!();
+    let blocks = 64;
+    let s = distinct(&mem, "big", blocks, 100, &g.uuid);
+    step!();
+    let r = mem.request("floor", plan(&[&["big"]])).unwrap();
+    step!();
+    let (torch, callbacks) = (parking_lot::Mutex::new(0u64), Timings::default());
+    let (mut held, mut passes) = (vec![], vec![]);
+    for (room, more) in [(4, mem.free().saturating_sub(4 * REGION_ALIGN)), (1, 3 * REGION_ALIGN)] {
+        let seg = segment(&mem, &torch, more, &callbacks).unwrap_or_else(|| panic!("activations leaving {room} blocks of room: refused"));
+        held.push((seg, more));
+        step!();
+        let (c, m) = (timings.count("create"), timings.count("map"));
+        let pass = r.pass(s, "fwd|1").unwrap();
+        for b in 0..blocks {
+            let pin = mem.bind(s, b, 0).unwrap_or_else(|e| panic!("block {b} beside activations leaving {room} blocks of room: {e}"));
+            assert!(exact(&pin, &block(100, b), 0), "block {b} streamed in with other bytes");
+        }
+        pass.end(0);
+        passes.push((room, timings.count("create") - c, timings.count("map") - m));
+        step!();
+    }
+    println!("FLOOR {} B of activations; per pass (blocks of room, creates, maps): {passes:?}; make_room {}", *torch.lock(), callbacks.report());
+    step!();
+    for (seg, size) in held {
+        unsegment(&torch, seg, size);
+    }
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS the floor is the activations and one block {uuid}");
+    step!();
+}
+
+/// A pass of `m` (two pinned blocks), measured smaller than its one-gibibyte activation, which meets a real OOM:
+/// the card is crowded and the rest full of an idle set. Returns the OOM answers and the record.
 fn first_run(mem: &Memory, m: SetId, idle: u32) -> (Vec<String>, Stats) {
     let r = mem.request("first", plan(&[&["m"]])).unwrap();
     step!();
@@ -1562,46 +3512,6 @@ fn an_oom_in_a_pass_is_recovered_in_process() {
     assert_eq!(stats.leftover, 0);
     step!();
     println!("PASS an OOM in a pass is recovered in process (answers {answers:?}) {uuid}");
-    step!();
-}
-
-#[test]
-#[ignore = "native GPU: a rental only"]
-fn a_measured_pass_gets_its_room_before_it_runs() {
-    let (b, g, uuid) = card("room");
-    step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
-    let mem = memory(b, &g);
-    step!();
-    let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(3, b)), Level::Ram).unwrap();
-    step!();
-    let _crowd = crowd();
-    let idle = more_than_free();
-    step!();
-    mem.load(bulk("idle", idle, &g.uuid), Level::Gpu).unwrap();
-    step!();
-    let (answers, _) = first_run(&mem, m, idle);
-    step!();
-    assert!(!answers.is_empty(), "the first run met a real OOM");
-    step!();
-    // The idle set takes the card again; the second run's pass makes its measured room first.
-    mem.load(bulk("idle", idle, &g.uuid), Level::Gpu).unwrap();
-    step!();
-    assert!(driver_free() < ROOM / 2, "the card is full before the second pass: {} free", driver_free());
-    step!();
-    let r = mem.request("second", plan(&[&["m"]])).unwrap();
-    step!();
-    let pass = r.pass(m, "k").unwrap();
-    step!();
-    let mut p = Pressure::none();
-    step!();
-    activation(&mem, &r, &mut p, ROOM / 2, idle);
-    step!();
-    pass.end(ROOM / 2);
-    step!();
-    assert_eq!(r.end().leftover, 0);
-    step!();
-    println!("PASS a measured pass gets its room before it runs {uuid}");
     step!();
 }
 
@@ -1674,21 +3584,25 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
 fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_room_returns() {
     let (b, g, uuid) = card("full");
     step!();
-    let _ledger = Ledger::create(&g, None).unwrap();
+    let ledger = Ledger::create(&g, None).unwrap();
     let mem = memory(b, &g);
     step!();
     let m = mem.load(set("m", 2, Fill::Stored, &g.uuid, |b| block(5, b)), Level::Ram).unwrap();
     step!();
     mem.load(set("idle", 1, Fill::Stored, &g.uuid, |b| block(6, b)), Level::Gpu).unwrap();
     step!();
+    // Everything else on the card is an allocation varena cannot free; then the pass starts. An unmeasured pass takes
+    // every idle byte before it runs, so a fill after it would take the room the idle page gave.
+    let full = Pressure::fill(64 << 10);
+    step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
     let pass = r.pass(m, "k").unwrap();
     step!();
-    // Everything else on the card is an allocation varena cannot free.
-    let full = Pressure::fill(64 << 10);
+    // S1's probe: the row's figures just before the bind that must take the idle page.
+    println!("PROBE free {} rows {:?}", mem.free(), ledger.status().rows.iter().map(|r| (r.pid, r.live, r.context, r.classes, r.torch, r.returning)).collect::<Vec<_>>());
     step!();
-    let first = mem.bind(m, 0, 0).expect("the idle page makes room");
+    let first = mem.bind(m, 0, 0).unwrap_or_else(|e| panic!("the idle page makes room: {e:?}"));
     step!();
     let e = mem.bind(m, 1, 0).err().expect("nothing is left to free");
     step!();
@@ -1815,6 +3729,84 @@ fn origins(trace: &str) -> std::collections::BTreeMap<&str, usize> {
     n
 }
 
+// ---- VRAM yield (design/vram-yield.md §4): a stand-in game
+
+/// The stand-in game of the VRAM-yield proof: a CUDA process with no varena, so the ledger counts its bytes as foreign
+/// and NVML lists it as a compute process. One command per stdin line; each reply is a line `@ <reply>` on stdout, and
+/// every allocation is logged as `STANDIN alloc <n> ok|fail <ms since start>`.
+/// - `fill <percent>`: allocates 1 GiB blocks until it holds that share of the card (the game that takes memory).
+/// - `budget <percent>`: reads cuMemGetInfo's free bytes once, then allocates that share of them (the game that
+///   sizes itself from its budget at launch).
+/// - `sample`: NVML's bytes per compute process, `<ms> <pid>:<bytes> …`, and the device's free bytes.
+/// - `release`: frees every block. `exit`: ends.
+#[test]
+#[ignore = "native GPU: the VRAM-yield stand-in game"]
+fn role_standin() {
+    if role().as_deref() != Some("standin") {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let (_, ctx) = cuda::primary_context(0).unwrap();
+    let _ctx = cuda::CtxGuard::enter(ctx).unwrap();
+    let d = cuda::driver().unwrap();
+    let mut device = 0;
+    cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut device, 0) }).unwrap();
+    let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
+    // A game's allocations: a gibibyte each, as the design's stand-in.
+    const BLOCK: usize = 1 << 30;
+    let mut blocks: Vec<u64> = vec![];
+    let ms = || start.elapsed().as_millis();
+    let allocate = |target: u64, blocks: &mut Vec<u64>| -> u32 {
+        let mut failed = 0;
+        while (blocks.len() as u64 + 1) * BLOCK as u64 <= target {
+            let mut ptr = 0;
+            let rc = unsafe { (d.mem_alloc)(&mut ptr, BLOCK) };
+            println!("STANDIN alloc {} {} {}", blocks.len(), if rc == cuda::SUCCESS { "ok" } else { "fail" }, ms());
+            if rc != cuda::SUCCESS {
+                failed += 1;
+                break;
+            }
+            blocks.push(ptr);
+        }
+        failed
+    };
+    println!("@ ready");
+    std::io::stdout().flush().unwrap();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.unwrap();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let (mut free, mut total) = (0usize, 0usize);
+        cuda::check("cuMemGetInfo", unsafe { (d.mem_get_info)(&mut free, &mut total) }).unwrap();
+        let reply = match words.as_slice() {
+            ["fill", percent] => {
+                let target = total as u64 * percent.parse::<u64>().unwrap() / 100;
+                let failed = allocate(target, &mut blocks);
+                format!("held {} failed {failed}", blocks.len() as u64 * BLOCK as u64)
+            }
+            ["budget", percent] => {
+                let target = free as u64 * percent.parse::<u64>().unwrap() / 100;
+                let failed = allocate(target, &mut blocks);
+                format!("free at launch {free}; held {} failed {failed}", blocks.len() as u64 * BLOCK as u64)
+            }
+            ["sample"] => {
+                let reading = nvml.read().unwrap();
+                let per: Vec<String> = reading.processes.unwrap_or_default().iter().map(|(pid, bytes)| format!("{pid}:{bytes}")).collect();
+                format!("{} free {} {}", ms(), reading.free, per.join(" "))
+            }
+            ["release"] => {
+                let t = std::time::Instant::now();
+                let bytes = blocks.len() as u64 * BLOCK as u64;
+                blocks.drain(..).for_each(|ptr| cuda::check("cuMemFree", unsafe { (d.mem_free)(ptr) }).unwrap());
+                format!("released {bytes} in {:?}", t.elapsed())
+            }
+            ["exit"] => break,
+            other => format!("unknown command {other:?}"),
+        };
+        println!("@ {reply}");
+        std::io::stdout().flush().unwrap();
+    }
+}
+
 // ---- several processes
 
 /// A child's Memory over the CUDA backend, one command per stdin line; each reply is a line
@@ -1838,6 +3830,7 @@ fn role_agent() {
     let mut pins: Vec<Pin> = vec![];
     let mut crowded: Vec<Pressure> = vec![];
     let mut timings: Option<Arc<Timings>> = None;
+    let mut loaded = std::time::Duration::ZERO;
     step!();
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
@@ -1861,7 +3854,12 @@ fn role_agent() {
                     other => Fill::Declared(other.into()),
                 };
                 let level = if *level == "gpu" { Level::Gpu } else { Level::Ram };
-                match m().load(set(name, blocks, fill, &uuid, |b| bytes_of(seed, b)), level) {
+                let spec = set(name, blocks, fill, &uuid, |b| bytes_of(seed, b));
+                timings.as_ref().unwrap().take_fills();
+                let started = std::time::Instant::now();
+                let out = m().load(spec, level);
+                loaded = started.elapsed();
+                match out {
                     Ok(id) => {
                         sets.insert(name.to_string(), id);
                         "ok".into()
@@ -1921,7 +3919,10 @@ fn role_agent() {
                 crowded.push(crowd());
                 "ok".into()
             }
-            ["timings"] => format!("ok backend {} | driver {}", timings.as_ref().unwrap().report(), CALLS.report()),
+            ["timings"] => {
+                let t = timings.as_ref().unwrap();
+                format!("ok {} | backend {} | driver {}", split(loaded, CALLS.total(), t.take_fills()), t.report(), CALLS.report())
+            }
             ["unpin"] => {
                 pins.clear();
                 "ok".into()
@@ -2017,6 +4018,7 @@ fn a_kept_set_is_imported_after_its_holders_kill_9_and_another_fill_refills() {
     step!();
     a.ok("load k 4 10 stored gpu");
     step!();
+    // A GPU load with no request open returns with its pages custody's: all four are orphans after the kill.
     a.child.kill().unwrap();
     step!();
     assert_eq!(a.child.wait().unwrap().signal(), Some(libc::SIGKILL));
@@ -2025,8 +4027,7 @@ fn a_kept_set_is_imported_after_its_holders_kill_9_and_another_fill_refills() {
     step!();
     let orphans: u64 = ledger.status().rows.iter().map(|r| r.classes[1]).sum();
     step!();
-    // A filled page goes to custody asynchronously: those the holder had exported are orphans.
-    assert!(orphans > 0 && orphans <= 4 * REGION_ALIGN, "class O shows the orphans: {orphans}");
+    assert_eq!(orphans, 4 * REGION_ALIGN, "class O shows the four kept pages as orphans");
     let kept = (orphans / REGION_ALIGN) as usize;
     step!();
     let mut s = Agent::spawn();
@@ -2265,11 +4266,9 @@ fn a_stray_write_to_a_kept_page_ends_only_its_writer() {
     step!();
     w.ok(&format!("open {}", g.uuid));
     step!();
+    // An idle GPU load returns with its pages kept (read-only, custody's). The bind runs outside a request: a pass
+    // start would withdraw the Keep.
     w.ok("load s 2 13 stored gpu");
-    step!();
-    w.ok("request r s");
-    step!();
-    w.ok("pass r s 1");
     step!();
     w.ok("bind s 0");
     step!();

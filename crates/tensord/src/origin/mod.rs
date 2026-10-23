@@ -16,12 +16,12 @@ use std::{
 
 use tensorfs::{
     err::{refuse, Code, Refusal, Result},
-    fetch::{Client, Config, Fetcher, Landed, Origin, Progress, Pulled, SourcePolicy, VolumeOrigin, Want},
+    fetch::{Client, Config, Fetcher, Landed, Origin, Progress, Pulled, Selected, SourcePolicy, VolumeOrigin, Want},
     format::{ObjectRef, Tree},
     store::Store,
 };
 
-pub use hub::{object, release, remote, select};
+pub use hub::{object, release, remote};
 
 use crate::stop::Stop;
 
@@ -168,6 +168,22 @@ impl Machine {
         let objects = objects.to_vec();
         self.block(stop, async move {
             fetcher.objects(&origin, &objects, &Want { priority, ..Want::default() }).await
+        })
+    }
+
+    /// The variant `constraints` take in `tree` (commit `root` of `repository`, `model` in reasons),
+    /// by TensorFS's one selection: the origin's index when it keeps one, else the headers, landed
+    /// here. The outer error is the fetch runtime's, the inner the selection's.
+    pub fn select(&self, remote: &Remote, repository: &str, model: &str, root: &ObjectRef, tree: &Tree,
+        constraints: &tensorfs::precision::Constraints) -> Result<tensorfs::Result<Selected>> {
+        let (fetcher, origin, store) = (self.of(remote)?, remote.origin.clone(), self.store.clone());
+        let (repository, model, root, tree, constraints) = (repository.to_owned(), model.to_owned(), root.clone(), tree.clone(), constraints.clone());
+        self.block(&Stop::default(), async move {
+            let fetch = async |headers: &[ObjectRef]| {
+                let want = Want { priority: priority::NOW, ..Want::default() };
+                fetcher.objects(&origin, headers, &want).await.map(drop).map_err(tensorfs::Failure::from)
+            };
+            Ok(tensorfs::fetch::select(Some(&*origin), &store, &repository, &model, &root, &tree, &constraints, fetch).await)
         })
     }
 

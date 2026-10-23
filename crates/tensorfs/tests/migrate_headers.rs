@@ -171,9 +171,9 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     let tags: Vec<(&str, bool, bool)> = tiny.tags.iter().map(|t| (t.name.as_str(), t.public, t.yanked)).collect();
     assert_eq!(tags, [("0.9.0", true, true), ("1.0.0", true, false), ("1.1.0", true, false)]);
     let (tree, headers) = variants(&tiny.tags[1].commit);
-    assert_eq!(headers.keys().collect::<Vec<_>>(), ["ft", "full"]);
-    let full = same(&fixture, &store, FULL, &headers["full"], &tree);
-    let ft = same(&fixture, &store, FT, &headers["ft"], &tree);
+    assert_eq!(headers.keys().collect::<Vec<_>>(), ["model.ft.cozytensors", "model.full.cozytensors"]);
+    let full = same(&fixture, &store, FULL, &headers["model.full.cozytensors"], &tree);
+    let ft = same(&fixture, &store, FT, &headers["model.ft.cozytensors"], &tree);
     assert_eq!(full.metadata.get("source"), Some(&Value::Str(SDXL.into())));
     assert_eq!(filled(&full), None, "the whole pipe lacks nothing");
     // ft lacked its pipeline, tokenizers and README: the upstream's, recorded.
@@ -209,9 +209,9 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     assert_eq!(gpt2.tags.len(), 1);
     assert_eq!((gpt2.tags[0].name.clone(), gpt2.tags[0].public), (format!("v2-{}", &old[..12]), false));
     let (tree, headers) = variants(&gpt2.tags[0].commit);
-    assert_eq!(headers.keys().collect::<Vec<_>>(), [""]);
+    assert_eq!(headers.keys().collect::<Vec<_>>(), ["model.cozytensors"]);
     let (gpt2_files, _) = manifest(&fixture, GPT2_FULL);
-    let h = Header::from_cbor(&store.read(&headers[""]).unwrap()).unwrap();
+    let h = Header::from_cbor(&store.read(&headers["model.cozytensors"]).unwrap()).unwrap();
     assert_eq!(h.component("model").unwrap().assets["special_tokens_map.json"], gpt2_files["special_tokens_map.json"]);
     assert_eq!(filled(&h).unwrap().1, BTreeSet::from(["special_tokens_map.json".to_owned()]));
     assert!(tree.repo_files().next().is_none());
@@ -220,12 +220,12 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     let local = &repos["local/tiny-sdxl"];
     assert_eq!((local.tags[0].name.as_str(), local.tags[0].public), ("1", true));
     let (tree, headers) = variants(&local.tags[0].commit);
-    let h = same(&fixture, &store, FULL, &headers["f32"], &tree);
+    let h = same(&fixture, &store, FULL, &headers["model.f32.cozytensors"], &tree);
     assert_eq!(h.metadata.get("source"), Some(&Value::Str(SDXL.into())));
     assert_eq!(filled(&h), None);
     let local = &repos["local/tiny-gpt2"];
     let (tree, headers) = variants(&local.tags[0].commit);
-    let h = same(&fixture, &store, GPT2_FULL, &headers["f32"], &tree);
+    let h = same(&fixture, &store, GPT2_FULL, &headers["model.f32.cozytensors"], &tree);
     assert_eq!(h.component("model").unwrap().config["model_type"], "gpt2");
 
     // Again: nothing changes.
@@ -267,7 +267,7 @@ fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
     let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
     let tree = Tree::from_json(&read(&migrated.repo.tags[0].commit)).unwrap();
-    let header = Header::from_cbor(&read(tree.variant(Some("full")).unwrap().1)).unwrap();
+    let header = Header::from_cbor(&read(tree.variant(Some("model.full.cozytensors")).unwrap().1)).unwrap();
     assert_eq!(header.component("tokenizer").unwrap().assets["vocab.json"], expected);
     assert_eq!(filled(&header).unwrap().1, BTreeSet::from([missing.to_owned(), "unet/config.json".to_owned()]));
     assert_eq!(header.component("unet").unwrap().config, parse(&std::fs::read(dir.join(config.key())).unwrap()));
@@ -312,7 +312,7 @@ fn migrate_lane(dir: &Path, name: &str, files: BTreeMap<String, ObjectRef>) -> (
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
     let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
     let tree = Tree::from_json(&read(&migrated.repo.tags[0].commit)).unwrap();
-    let header = Header::from_cbor(&read(tree.variant(Some("lane")).unwrap().1)).unwrap();
+    let header = Header::from_cbor(&read(tree.variant(Some("model.lane.cozytensors")).unwrap().1)).unwrap();
     (header, tree, migrated.report["releases"][0]["lanes"]["lane"].clone())
 }
 
@@ -453,5 +453,94 @@ fn a_release_that_is_no_version_stays_public() {
     let migrated = migrator.repo(&doc("fidika/minimax-h3-turbo-lora"), &read).unwrap();
     let tag = &migrated.repo.tags[0];
     assert_eq!((tag.name.as_str(), tag.public, tag.yanked), ("1.0.0-audit.1", true, true));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// tfs-132: a D10 tree whose repo files hold config-only components, as A11 left Anima's
+/// (`modular_model_index.json` was no index then) and SeedVR2's root config, is relaid: every
+/// variant's header takes them, with its own components, chunks and tensors as they were, and
+/// the tree keeps only its other repo files. The tag keeps its name and flags; again, nothing
+/// changes.
+#[test]
+fn a_tree_holding_config_only_components_as_repo_files_is_relaid() {
+    use tensorfs::format::{Body, ClassRef, Component, Dtype, Location, Tag, Tensor};
+    let dir = scratch("relayout");
+    let header = |weight: &[u8], names: &[&str]| {
+        let components = names.iter().map(|name| Component {
+            name: name.to_string(),
+            class: ClassRef::new("test", "1.0", "Tiny"),
+            config: if *name == "transformer" { serde_json::from_str(r#"{"width":4}"#).unwrap() } else { Config::new() },
+            tensors: vec![Tensor { key: "w".into(), dtype: Dtype::U8, shape: vec![4], body: Body::Data(Location { chunk: 0, offset: 0, length: 4 }) }],
+            ..Component::default()
+        });
+        Header::new(vec![ObjectRef::of(weight)], None, components.collect(), Default::default()).unwrap()
+    };
+    let json = |v: Json| serde_json::to_vec(&v).unwrap();
+    let anima = [
+        ("modular_model_index.json", json(json!({"_class_name": "AnimaModularPipeline",
+            "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler", {"subfolder": "scheduler"}],
+            "tokenizer": ["transformers", "Qwen2Tokenizer", {"subfolder": "tokenizer"}],
+            "transformer": ["diffusers", "Tiny", {"subfolder": "transformer"}]}))),
+        ("scheduler/scheduler_config.json", json(json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "_diffusers_version": "0.39.0", "shift": 3.0}))),
+        ("tokenizer/tokenizer_config.json", json(json!({"tokenizer_class": "Qwen2Tokenizer"}))),
+        ("tokenizer/tokenizer.json", b"{}".to_vec()),
+        ("README.md", b"# Anima\n".to_vec()),
+    ];
+    let seedvr2 = [("config.json", json(json!({"architecture": "SeedVR2-7B"}))), ("README.md", b"# SeedVR2\n".to_vec())];
+    // (model, its tensored components, its repo files, the components added, the repo files kept)
+    type Case<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, Vec<u8>)], &'a [&'a str], &'a [&'a str]);
+    let cases: [Case; 2] = [
+        ("acme/anima", &["transformer"], &anima, &["scheduler", "tokenizer"], &["README.md", "modular_model_index.json"]),
+        ("acme/seedvr2", &["dit", "vae"], &seedvr2, &["model"], &["README.md"]),
+    ];
+    for (name, tensored, files, added, kept) in cases {
+        let mut tree = Tree::default();
+        let olds: Vec<Header> = [b"aaaa", b"qqqq"].iter().map(|w| header(*w, tensored)).collect();
+        for (path, h) in ["model.bf16.cozytensors", "lanes/q.cozytensors"].iter().zip(&olds) {
+            tree.files.insert(path.to_string(), put(&dir, &h.to_cbor().unwrap()));
+        }
+        for (path, bytes) in files {
+            tree.files.insert(path.to_string(), put(&dir, bytes));
+        }
+        let commit = put(&dir, &tree.to_json().unwrap());
+        let mut repo = Repo::new(name);
+        repo.tags.push(Tag { name: "1.0.0".into(), commit: commit.clone(), public: true, yanked: true });
+        let mut migrator = Migrator::new(Access::from_env(), TABLE);
+        let read = |o: &ObjectRef| Ok(std::fs::read(dir.join(o.key()))?);
+        let migrated = migrator.repo(&repo.to_json().unwrap(), &read).unwrap();
+        let tag = &migrated.repo.tags[0];
+        assert_eq!((tag.name.as_str(), tag.public, tag.yanked), ("1.0.0", true, true), "{name}");
+        assert_ne!(tag.commit, commit, "{name}");
+        let object = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
+        let relaid = Tree::from_json(&object(&tag.commit)).unwrap();
+        let repo_files: Vec<&String> = relaid.files.keys().filter(|p| !p.ends_with(".cozytensors")).collect();
+        assert_eq!(repo_files, kept, "{name}");
+        for (path, old) in ["model.bf16.cozytensors", "lanes/q.cozytensors"].iter().zip(&olds) {
+            let new = Header::from_cbor(&object(relaid.header(path).unwrap())).unwrap();
+            assert_eq!(new.components()[..tensored.len()], *old.components(), "{name} {path}");
+            assert_eq!((&new.chunks, &new.metadata), (&old.chunks, &old.metadata), "{name} {path}");
+            let names: Vec<&str> = new.components()[tensored.len()..].iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, added, "{name} {path}");
+        }
+        if name == "acme/anima" {
+            let h = Header::from_cbor(&object(relaid.header("model.bf16.cozytensors").unwrap())).unwrap();
+            let scheduler = &h.components()[1];
+            assert_eq!((scheduler.config["shift"].clone(), scheduler.config_file.as_deref()), (json!(3.0), Some("scheduler_config.json")));
+            assert_eq!(scheduler.class, ClassRef::new("diffusers", "0.39.0", "FlowMatchEulerDiscreteScheduler"));
+            assert_eq!(h.components()[2].assets["tokenizer.json"], ObjectRef::of(b"{}"));
+        } else {
+            let h = Header::from_cbor(&object(relaid.header("lanes/q.cozytensors").unwrap())).unwrap();
+            assert_eq!(h.components()[2].config["architecture"], json!("SeedVR2-7B"));
+        }
+        assert!(migrated.report["relaid"][0]["moved"].is_object(), "{}", migrated.report);
+        // Again: the relaid tree is what layout makes, so nothing changes.
+        for (o, bytes) in &migrated.objects {
+            std::fs::create_dir_all(dir.join(o.key()).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(o.key()), bytes).unwrap();
+        }
+        let again = Migrator::new(Access::from_env(), TABLE).repo(&migrated.repo.to_json().unwrap(), &read).unwrap();
+        assert_eq!(again.repo.tags[0].commit, tag.commit, "{name}");
+        assert!(again.report.get("relaid").is_none(), "{name}");
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }

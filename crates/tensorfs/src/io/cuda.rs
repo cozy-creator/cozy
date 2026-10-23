@@ -121,6 +121,7 @@ pub struct Driver {
     pub device_get_count: F<*mut c_int>,
     pub device_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, CUdevice) -> CUresult,
     pub device_get_uuid: unsafe extern "C" fn(*mut [u8; 16], CUdevice) -> CUresult,
+    pub device_get_luid: unsafe extern "C" fn(*mut [u8; 8], *mut c_uint, CUdevice) -> CUresult,
     pub device_get_name: unsafe extern "C" fn(*mut c_char, c_int, CUdevice) -> CUresult,
     pub primary_ctx_retain: unsafe extern "C" fn(*mut CUcontext, CUdevice) -> CUresult,
     pub ctx_get_current: F<*mut CUcontext>,
@@ -256,6 +257,7 @@ impl Driver {
             device_get_count: load!(lib, b"cuDeviceGetCount"),
             device_get_attribute: load!(lib, b"cuDeviceGetAttribute"),
             device_get_uuid: load!(lib, b"cuDeviceGetUuid_v2"),
+            device_get_luid: load!(lib, b"cuDeviceGetLuid"),
             device_get_name: load!(lib, b"cuDeviceGetName"),
             primary_ctx_retain: load!(lib, b"cuDevicePrimaryCtxRetain"),
             ctx_get_current: load!(lib, b"cuCtxGetCurrent"),
@@ -403,6 +405,17 @@ pub fn attribute(dev: CUdevice, attr: c_int) -> Result<i32> {
     Ok(v)
 }
 
+/// The device's LUID: the one its DXGI adapter has (Windows; the driver refuses it elsewhere).
+pub fn luid(dev: CUdevice) -> Result<[u8; 8]> {
+    let d = driver()?;
+    let (mut luid, mut nodes) = ([0u8; 8], 0 as c_uint);
+    // SAFETY: an 8-byte and a node-mask out-param.
+    check("cuDeviceGetLuid", unsafe {
+        (d.device_get_luid)(&mut luid, &mut nodes, dev)
+    })?;
+    Ok(luid)
+}
+
 pub fn uuid(dev: CUdevice) -> Result<String> {
     let d = driver()?;
     let mut u = [0u8; 16];
@@ -465,6 +478,8 @@ impl Stream {
     pub fn drain(&self) -> Result<()> {
         let driver = driver()?;
         let _context = CtxGuard::enter(self.ctx)?;
+        // A host wait: a trace span, so a subscriber can time each.
+        let _wait = tracing::trace_span!("tensorfs cuStreamSynchronize").entered();
         check("cuStreamSynchronize", unsafe {
             (driver.stream_synchronize)(self.raw)
         })
@@ -478,6 +493,7 @@ impl Drop for Stream {
     fn drop(&mut self) {
         if let Ok(driver) = driver() {
             if let Ok(_ctx) = CtxGuard::enter(self.ctx) {
+                let _wait = tracing::trace_span!("tensorfs cuStreamSynchronize (drop)").entered();
                 unsafe {
                     (driver.stream_synchronize)(self.raw);
                     (driver.stream_destroy)(self.raw);
@@ -511,7 +527,10 @@ pub unsafe fn pin_region(ptr: *mut u8, len: usize, read_only: bool) -> Result<Ho
         } else {
             0
         };
-    let rc = unsafe { (d.mem_host_register)(ptr.cast(), len, flags) };
+    let rc = {
+        let _wait = tracing::trace_span!("tensorfs cuMemHostRegister").entered();
+        unsafe { (d.mem_host_register)(ptr.cast(), len, flags) }
+    };
     if rc != ERROR_HOST_MEMORY_ALREADY_REGISTERED {
         check("cuMemHostRegister", rc)?;
     }
@@ -550,6 +569,8 @@ impl HostPin {
         if self.owned {
             let driver = driver()?;
             let _context = CtxGuard::enter(self.ctx)?;
+            // It synchronizes the device: a host wait, a trace span like the others.
+            let _wait = tracing::trace_span!("tensorfs cuMemHostUnregister").entered();
             check("cuMemHostUnregister", unsafe {
                 (driver.mem_host_unregister)(self.ptr)
             })?;

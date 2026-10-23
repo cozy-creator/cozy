@@ -16,7 +16,7 @@ use crate::{
         AssetBinding, Execution, Failure, Outcome, Preparation, State,
     },
     launch_identity::Seal,
-    memory::{self, MemoryLog},
+    memory::{self, MemoryLog, Tenant},
     process::Gpus,
 };
 use serde::{Deserialize, Serialize};
@@ -156,6 +156,9 @@ pub struct PlanSlot {
     /// The Hub lane its checkpoint was resolved in (`run show`); empty for one held here.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lane: String,
+    /// Its header's precision lane (`int8`, `bf16`, …; `run show` beside its path).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub precision: String,
     /// Native selected encoded source bytes; not a GPU-fit or full-memory charge.
     pub selected_encoded_bytes: u64,
     /// Built and fetched when the function first uses it (`on_demand`): nothing of it is
@@ -181,6 +184,8 @@ pub struct PlanSource {
     pub release: String,
     #[serde(default)]
     pub lane: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub precision: String,
 }
 
 /// A prepared call: its construction (the package's generation, App, entrypoint, constructed
@@ -246,14 +251,18 @@ impl Plan {
     }
     /// Each model it runs as the machine resolved it, constructed or raw (`run show`).
     pub fn models(&self) -> Vec<serde_json::Value> {
-        let row = |slot: &str, model: (&str, &str), lane: &str, manifest: &str| {
-            serde_json::json!({"slot": slot, "repository": model.0, "release": model.1, "lane": lane, "manifest": manifest})
+        let row = |slot: &str, model: (&str, &str), lane: (&str, &str), manifest: &str| {
+            let mut row = serde_json::json!({"slot": slot, "repository": model.0, "release": model.1, "lane": lane.0, "manifest": manifest});
+            if !lane.1.is_empty() {
+                row["precision"] = lane.1.into();
+            }
+            row
         };
         let constructed = self.slots.iter().map(|s| {
             let model = s.binding.model.rsplit_once('@').unwrap_or_default();
-            row(&s.binding.model_parameter_name, model, &s.lane, &s.binding.snapshot)
+            row(&s.binding.model_parameter_name, model, (&s.lane, &s.precision), &s.binding.snapshot)
         });
-        let raw = self.sources.iter().map(|s| row(&s.parameter, (&s.repository, &s.release), &s.lane, &s.manifest));
+        let raw = self.sources.iter().map(|s| row(&s.parameter, (&s.repository, &s.release), (&s.lane, &s.precision), &s.manifest));
         constructed.chain(raw).collect()
     }
     /// What a call reads before its function runs: every slot's components but an on-demand
@@ -261,6 +270,12 @@ impl Plan {
     pub fn upfront(&self) -> Vec<(String, Vec<String>)> {
         merged(self.slots.iter().filter(|slot| !slot.on_demand)).into_iter().map(|s| (s.manifest, s.components)).collect()
     }
+}
+
+/// The precision lane the header of checkpoint `manifest` holds (`int8`, `bf16`, …); empty when
+/// it holds none of the table's or is not here.
+fn precision(store: &Store, manifest: &str) -> String {
+    crate::storage::checkpoint(store, manifest).map(|c| crate::precision::Profile::of(c.header()).family).unwrap_or_default()
 }
 
 /// `components` of the checkpoint `manifest`: their encoded bytes, and its header's length.
@@ -601,8 +616,9 @@ pub struct Pool {
     /// Exact live executor lane leaders by PID, including sessions taken out for a call.
     leaders: Mutex<BTreeMap<u32, (Birth, String, usize)>>,
     /// Every live GPU executor process (leaders and followers) by pid: its plan, lane and
-    /// handle, so a process the ledger names stalled can be ended and a row read as a plan's.
-    tenants: Mutex<BTreeMap<u32, Tenant>>,
+    /// handle, so a process the ledger names stalled can be ended, a row read as a plan's, and a
+    /// lease peer known ([`Peers`]).
+    tenants: memory::Tenants,
     /// Per generation, the import-only executor sessions fork from. Declared after
     /// `sessions`: executors end before the parent they were forked from.
     zygotes: Mutex<BTreeMap<(String, String), Arc<Zygote>>>,
@@ -622,8 +638,9 @@ pub struct Pool {
     engine: std::sync::OnceLock<Weak<Engine>>,
     /// Rows the ledgers named stalled at the last look: each is ended once.
     stalled: Mutex<std::collections::BTreeSet<u32>>,
-    /// The host rule's watcher, while the pool lives.
-    _host: Option<Arc<memory::Host>>,
+    /// The host rule's watcher, while the pool lives; nudged to look when a call begins, an
+    /// executor's frame comes or a ledger signals.
+    host: Option<Arc<memory::Host>>,
     /// Held while the pool lives: the thread blocked on the ledgers' events ends with it.
     _events: Option<std::os::unix::net::UnixStream>,
     /// Memoized Model methods' results, shared by every run on this machine.
@@ -637,12 +654,6 @@ struct Device {
     memory: Option<Arc<memory::Gpu>>,
 }
 
-/// One GPU executor process: its plan and lane, and a handle that ends exactly it.
-struct Tenant {
-    plan: String,
-    start: usize,
-    exact: Exact,
-}
 
 pub(crate) struct Permit {
     pool: Arc<Pool>,
@@ -707,9 +718,16 @@ impl Pool {
         crate::launch_identity::remove_stale_jit(root, &incarnation);
         remove_old_executor_roots(root);
         let peaks = memory::Peaks::at(root.join("peaks"));
+        let tenants = memory::Tenants::default();
+        let uids = [Some(platform::memory::euid()), config.identity.map(|identity| identity.uid)];
+        let peers: Arc<dyn varena::lease::Hosting> = Arc::new(memory::Peers::new(tenants.clone(), uids.into_iter().flatten().collect(), notes.clone()));
+        let leases = |entry: &str| {
+            let uuid = memory::row(entry, &config.inventory)?.device_uuid.as_str();
+            memory::chunks(uuid, &notes).map(|open| memory::Leases { hosting: peers.clone(), open })
+        };
         let devices: Vec<Device> = envelope.iter().map(|entry| Device {
             entry: entry.clone(),
-            memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, &peaks, &notes).map(Arc::new),
+            memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, leases(entry), &peaks, &notes).map(Arc::new),
         }).collect();
         let gpus = devices.iter().filter_map(|d| d.memory.clone()).collect();
         let host = memory::Host::watch(config.host.mode, gpus, &notes);
@@ -739,7 +757,7 @@ impl Pool {
                 peaks,
                 engine: Default::default(),
                 stalled: Mutex::default(),
-                _host: host,
+                host,
                 _events: events,
                 incarnation,
                 config,
@@ -749,7 +767,7 @@ impl Pool {
                 deviceless: Mutex::new(Vec::new()),
                 stopped: Default::default(),
                 leaders: Mutex::default(),
-                tenants: Mutex::default(),
+                tenants,
                 zygotes: Mutex::new(BTreeMap::new()),
                 kernel_boots: Mutex::new(BTreeMap::new()),
                 members: Mutex::new(BTreeMap::new()),
@@ -759,15 +777,36 @@ impl Pool {
             }
         }))
     }
+    /// Each GPU's lease books by UUID, where TensorD creates its chunks.
+    pub fn leases(&self) -> BTreeMap<String, protocol::machine::GpuLeases> {
+        let books = |device: &Device| {
+            let held = device.memory.as_ref()?.manager()?.holdings();
+            let uuid = memory::row(&device.entry, &self.config.inventory)?.device_uuid.clone();
+            let executors = held.executors.into_iter().map(|e| protocol::machine::LeaseHolder { pid: e.pid, executor: e.executor, chunks: e.chunks as u64, bytes: e.bytes }).collect();
+            Some((uuid, protocol::machine::GpuLeases {
+                capacity_bytes: held.capacity,
+                created_bytes: held.created,
+                created_chunks: held.created_chunks as u64,
+                leased_bytes: held.leased,
+                retained_bytes: held.retained,
+                retained_chunks: held.retained_chunks as u64,
+                books_only_bytes: held.books_only,
+                free_bytes: held.capacity.saturating_sub(held.created),
+                executors,
+            }))
+        };
+        self.devices.iter().filter_map(books).collect()
+    }
     /// A ledger signalled (room freed, a row died, a peak was recorded): the dispatch queue asks
     /// `fits` again, each row the ledger newly names stalled ends (once), and changed peaks are
     /// saved.
     fn memory_changed(&self) {
+        self.nudge_host();
         if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
             engine.notify_activity();
         }
         let gpus: Vec<(&str, &memory::Gpu)> = self.devices.iter().filter_map(|d| Some((d.entry.as_str(), d.memory.as_deref()?))).collect();
-        let stalled: Vec<(&str, u32)> = gpus.iter().flat_map(|(entry, gpu)| gpu.ledger.stalled().into_iter().map(move |pid| (*entry, pid))).collect();
+        let stalled: Vec<(&str, u32)> = gpus.iter().flat_map(|(entry, gpu)| gpu.stalled().into_iter().map(move |pid| (*entry, pid))).collect();
         let fresh: Vec<(&str, u32)> = {
             let mut seen = self.stalled.lock().unwrap();
             let fresh = stalled.iter().filter(|(_, pid)| !seen.contains(pid)).copied().collect();
@@ -780,7 +819,7 @@ impl Pool {
         }
         let models: std::collections::BTreeSet<&str> = gpus.iter().map(|(_, gpu)| gpu.model.as_str()).collect();
         for model in models {
-            self.peaks.save(model, gpus.iter().filter(|(_, gpu)| gpu.model == model).map(|(_, gpu)| &gpu.ledger));
+            self.peaks.save(model, gpus.iter().filter(|(_, gpu)| gpu.model == model).map(|(_, gpu)| gpu.ledger()));
         }
     }
     /// The host is short of what its running calls must keep free: one idle process ends,
@@ -917,14 +956,6 @@ impl Pool {
             .map(|d| self.inventory(&d.entry).map_or("", |g| g.compute_cap.as_str())).collect();
         crate::precision::Gpus::of(&ccs)
     }
-    /// The lane rule's budget on the first `degree` GPUs (design §2.1): the smallest one's memory
-    /// less a quarter of it for activations. None when the inventory names no memory.
-    pub fn budget(&self, degree: u32) -> Option<u64> {
-        let lane = &self.devices[..self.devices.len().min(degree as usize)];
-        let memory = lane.iter().map(|d| self.inventory(&d.entry).map(|g| g.memory_bytes)).min()??;
-        let memory = self.config.gpu_memory_limit.map_or(memory, |limit| memory.min(limit));
-        Some(memory - memory / 4)
-    }
     fn inventory(&self, entry: &str) -> Option<&crate::machine::receipt::Gpu> {
         self.config.inventory.iter().find(|g| g.device_index.to_string() == entry || g.device_uuid == entry)
     }
@@ -979,7 +1010,7 @@ impl Pool {
         self.tenants.lock().unwrap().retain(|_, t|
             !(t.plan == plan && t.start == start && gone.contains(t.exact.birth())));
         for gpu in self.lane(start, degree).unwrap_or_default().iter().filter_map(|d| d.memory.as_ref()) {
-            gone.iter().for_each(|birth| gpu.ledger.reap(birth.pid));
+            gone.iter().for_each(|birth| gpu.reap(birth.pid));
         }
     }
     /// The engine's dispatch wakes whenever a ledger signals: a queued request asks `fits`
@@ -1424,6 +1455,7 @@ impl Pool {
                     repository: grant.repository.clone(),
                     release: grant.release.clone(),
                     lane: grant.lane.clone(),
+                    precision: precision(&self.store, &grant.manifest),
                 });
                 continue;
             }
@@ -1505,6 +1537,7 @@ impl Pool {
             planned.push(PlanSlot {
                 binding,
                 lane: grant.lane.clone(),
+                precision: precision(&self.store, &grant.manifest),
                 selected_encoded_bytes,
                 on_demand: model.get("on_demand").and_then(serde_json::Value::as_bool) == Some(true),
                 placeable,
@@ -1606,7 +1639,7 @@ impl Pool {
     /// before its shape is known (`fits`). A GPU without a ledger has nothing to refuse it with.
     fn fits(&self, plan: &str, start: usize, degree: u32, family: Option<&str>) -> bool {
         let lane = self.lane(start, degree).unwrap_or_default();
-        lane.iter().filter_map(|d| d.memory.as_ref()).all(|m| m.ledger.fits(plan, UNPREPARED, family))
+        lane.iter().filter_map(|d| d.memory.as_ref()).all(|m| m.ledger().fits(plan, UNPREPARED, family))
     }
     /// Where `plan` runs now, with its lane's call slots: inside its root's `lane` when it has
     /// one, else (a standalone call, or warming with no root) on GPUs no root holds or older
@@ -1769,6 +1802,27 @@ impl Pool {
             .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()));
         if let Err(error) = written {
             tracing::warn!("invokes.jsonl: {error}");
+        }
+    }
+
+    /// The host watcher looks now (a nudge; the host's own events wake it too).
+    fn nudge_host(&self) {
+        if let Some(host) = &self.host {
+            host.nudge();
+        }
+    }
+
+    /// The call's memory decisions (varena's record of its request, in order: lowering, cuts,
+    /// parks, exhaustion, evictions of declared or working pages, each with its trigger, site,
+    /// need, freed bytes and level), one memory-log line each: why a run lowered, cut or failed.
+    /// Each record is relayed whole; the run's measurements keep them with the rest of its stats.
+    fn note_decisions(&self, run: &str, pid: u32, gpus: &str, reply: &Frame) {
+        let decisions = reply.memory.as_ref().and_then(|stats| stats.get("decisions")).and_then(serde_json::Value::as_array);
+        for decision in decisions.into_iter().flatten() {
+            let mut line = serde_json::Map::from_iter([("event".to_string(), "decision".into()), ("run".to_string(), run.into()),
+                ("pid".to_string(), pid.into()), ("gpus".to_string(), gpus.into())]);
+            line.extend(decision.as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())));
+            self.notes.note(serde_json::Value::Object(line));
         }
     }
 
@@ -2155,6 +2209,7 @@ impl Pool {
                     sequence_parallel_degree: 1,
                     import_only: true,
                     ledgers: 0,
+                    leases: None,
                     memory_mode: self.config.host.mode.into(),
                 },
                 &mut device_executor::Baseline,
@@ -2464,7 +2519,7 @@ impl Pool {
         executor.keep_memo(self.memo.clone());
         if plan.degree > 0 {
             let exact = Exact::open(&executor.birth)?.ok_or_else(|| io::Error::other("executor exited before its start"))?;
-            let tenant = Tenant { plan: plan.construction.clone(), start, exact };
+            let tenant = Tenant { plan: plan.construction.clone(), generation: plan.generation.clone(), start, exact };
             self.tenants.lock().unwrap().insert(executor.birth.pid, tenant);
             self.leaders.lock().unwrap().insert(executor.birth.pid,
                 (executor.birth.clone(), plan.construction.clone(), start));
@@ -2514,6 +2569,8 @@ impl Pool {
         let (start, degree) = (session.start, plan.degree);
         let construction = plan.construction.clone();
         let gpus = self.lane(start, degree)?;
+        // A call begins: the host is looked at before it grows.
+        self.nudge_host();
         let retained = session.loaded;
         if retained {
             session.executor.begin_request();
@@ -2529,22 +2586,29 @@ impl Pool {
             generation: &held.record,
             spool: None,
             caller: None,
+            formation: Some(Formation {
+                tenants: self.tenants.clone(),
+                leader: session.executor.birth.clone(),
+                plan: construction.clone(),
+                generation: plan.generation.clone(),
+                start,
+            }),
+            host: self.host.as_deref(),
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
             let starting = Instant::now();
-            // Each GPU's grant (its table, and a description for its row's lock) follows the
-            // Start, in lane order: every rank claims its own row. Granted to the executor, whose
-            // exit reaps them.
-            let grants = match gpus.iter().all(|d| d.memory.is_some()) {
-                true => gpus.iter().filter_map(|d| d.memory.as_ref())
-                    .map(|m| m.ledger.grant(session.executor.birth.pid).map_err(io::Error::other))
-                    .collect::<io::Result<Vec<_>>>()?,
-                false => vec![],
-            };
-            let ledgers: Vec<File> = grants.into_iter().flat_map(|grant| [File::from(grant.table), File::from(grant.row)]).collect();
+            // An executor speaking leases also dials each GPU's manager.
+            let contract = session.executor.hello.contract();
+            let standalone = contract == device_executor::Contract::Standalone;
+            let ledgers = self.grants(gpus, &session.executor)?;
+            let leases = (contract == device_executor::Contract::Leases
+                && gpus.iter().any(|d| d.memory.as_ref().is_some_and(|m| m.manager().is_some())))
+                .then(platform::memory::euid);
             // Rank 0 spawns and forms every follower inside this command; its watch meters
-            // the whole group's work, so formation ends only on measured lack of progress.
+            // the whole group's work, so formation ends only on measured lack of progress. A
+            // follower that dials its lease listener meanwhile waits for its registration.
+            let forming = self.tenants.forming(&session.executor.birth, ranks.saturating_sub(1) as usize);
             let started = command_ok(session.executor.command_with(
                 &DeviceCommand::Start {
                     devices: lane.clone(),
@@ -2555,6 +2619,7 @@ impl Pool {
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions: constructions(&plan),
                     ledgers: (ledgers.len() / 2) as u32,
+                    leases,
                     memory_mode: self.config.host.mode.into(),
                 },
                 &ledgers,
@@ -2572,24 +2637,20 @@ impl Pool {
                     ),
                 }));
             }
-            // Only processes in rank 0's own group are taken as its followers: each is its own
-            // GPU's tenant, named in that GPU's ledger by its own pid.
-            let members = platform::process::group_members(&session.executor.birth);
-            session.followers = started
-                .follower_pids
-                .iter()
-                .filter_map(|pid| members.iter().find(|m| m.pid == *pid))
-                .filter_map(|birth| Exact::open(birth).ok().flatten())
-                .collect();
-            for follower in &session.followers {
-                let tenant = Tenant { plan: construction.clone(), start, exact: follower.try_clone()? };
-                self.tenants.lock().unwrap().insert(follower.birth().pid, tenant);
-            }
+            session.followers = callbacks.formation.as_ref().map_or(Ok(vec![]), |formation| formation.register(&started.follower_pids))?;
+            drop(forming);
             if session.followers.len() + 1 != ranks as usize {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
                     detail: "a follower exited before its GPU ledger could be associated".into(),
                 }));
+            }
+            // A formed standalone group's rank r (reported rank 1 first) runs its own pages on
+            // the lane's GPU r.
+            for (pid, gpu) in started.follower_pids.iter().zip(gpus.iter().skip(1)).filter(|_| standalone) {
+                if let Some(gpu) = gpu.memory.as_ref() {
+                    gpu.fix(*pid);
+                }
             }
             // The request's signer, whose bearer the Runtime keeps apart.
             let actor = engine.get(id).ok().and_then(|record| record.submission).map(|s| s.actor).unwrap_or_default();
@@ -2734,7 +2795,7 @@ impl Pool {
         // none, waiting while it does not fit. In its family, a yielded parent's working set is
         // left out: the parent waits on it.
         let shape = shape(&prepared.features);
-        let ledgers: Vec<&varena::Ledger> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &m.ledger).collect();
+        let ledgers: Vec<&varena::Ledger> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| m.ledger()).collect();
         let admitted = memory::admit(engine, &ledgers, id, &construction, &shape, record.family());
         let _dispatched = Dispatched { gpus, id: id.into() };
         if !admitted? {
@@ -2804,6 +2865,7 @@ impl Pool {
         let reply = reply?;
         session.level = Level::Gpu;
         self.record_invoke(&construction, &lane, first, invoked.elapsed(), &reply);
+        self.note_decisions(id, session.executor.birth.pid, &lane, &reply);
         record_measurements(engine, id, &plan, &reply);
         if reply.attention_applied {
             if let Err(error) = engine.apply_attention(id) {
@@ -2814,7 +2876,7 @@ impl Pool {
         let lost = self.lost_followers(start, degree, &session.followers);
         if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
             // It may have faulted on its GPUs: their kept pages go.
-            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.ledger.fault());
+            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.ledger().fault());
             // The author's failure keeps its traceback and origin in triage; the executor's
             // end would record only "executor_ended".
             if let Some(outcome) = reply.outcome.as_ref().filter(|o| !o.traceback.is_empty()) {
@@ -2858,6 +2920,32 @@ impl Pool {
         Ok(true)
     }
 
+    /// Each GPU's grant for `executor`, in lane order (its table, and a description for its
+    /// row's lock), which follow its Start: every rank claims its own row, reaped at its exit.
+    /// An executor of neither memory protocol (a Runtime before 0.31) gets none and runs its
+    /// memory alone, unshared with the others on these GPUs, its bytes a fixed row on its first
+    /// GPU: version skew degrades, with a note.
+    fn grants(&self, gpus: &[Device], executor: &DeviceExecutor) -> io::Result<Vec<File>> {
+        if !gpus.iter().all(|d| d.memory.is_some()) {
+            return Ok(vec![]);
+        }
+        let hello = &executor.hello;
+        if hello.contract() == device_executor::Contract::Standalone {
+            tracing::warn!("executor {} (Runtime {}, TensorFS {}) speaks memory protocol {}, neither 1 nor 2: its GPU memory runs without this machine's ledger",
+                executor.birth.pid, hello.runtime_version, hello.tensorfs_version, hello.memory_protocol);
+            self.notes.note(serde_json::json!({"event": "no_ledger", "pid": executor.birth.pid, "runtime": hello.runtime_version,
+                "tensorfs": hello.tensorfs_version, "memory_protocol": hello.memory_protocol}));
+            if let Some(gpu) = gpus.first().and_then(|d| d.memory.as_ref()) {
+                gpu.fix(executor.birth.pid);
+            }
+            return Ok(vec![]);
+        }
+        let grants = gpus.iter().filter_map(|d| d.memory.as_ref())
+            .map(|m| m.ledger().grant(executor.birth.pid).map_err(io::Error::other))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(grants.into_iter().flat_map(|grant| [File::from(grant.table), File::from(grant.row)]).collect())
+    }
+
     /// For a group, each slot's placeable components and the GPU of the group that keeps each
     /// (`memory::homes`), by slot path. A GPU with no ledger keeps nothing away from GPU 0.
     fn homes(&self, plan: &Plan, gpus: &[Device], family: Option<&str>) -> BTreeMap<String, BTreeMap<String, u32>> {
@@ -2867,7 +2955,7 @@ impl Pool {
         if gpus.len() < 2 || placeable.is_empty() {
             return BTreeMap::new();
         }
-        let ledgers: Option<Vec<&varena::Ledger>> = gpus.iter().map(|d| d.memory.as_ref().map(|m| &m.ledger)).collect();
+        let ledgers: Option<Vec<&varena::Ledger>> = gpus.iter().map(|d| d.memory.as_ref().map(|m| m.ledger())).collect();
         let sets: Vec<&str> = placeable.iter().map(|(_, _, set)| set.as_str()).collect();
         let gpu = match ledgers {
             Some(ledgers) => memory::homes(&ledgers, &plan.construction, UNPREPARED, family, &sets, &self.notes),
@@ -3027,7 +3115,7 @@ struct Dispatched<'a> {
 }
 impl Drop for Dispatched<'_> {
     fn drop(&mut self) {
-        self.gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.ledger.undispatch(&self.id));
+        self.gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.ledger().undispatch(&self.id));
     }
 }
 
@@ -3420,7 +3508,8 @@ fn refused(error: &io::Error) -> Option<&Refused> {
 
 /// What the call's executor measured, kept as the run's (`run show`): its stage and step
 /// tracks, its ranks' execution records, its kernel observations (the attention and GEMM
-/// kernels that served, Sol's dense and sparse calls) and the models it ran, as resolved.
+/// kernels that served, Sol's dense and sparse calls), its residency (graph counters) and the
+/// models it ran, as resolved.
 pub(crate) fn record_measurements(engine: &Engine, id: &str, plan: &Plan, reply: &Frame) {
     let software = engine.get(id).ok().and_then(|run| run.executor.map(|executor| executor.software(run.attempt)));
     let measurements = measured(plan, reply, software, call_memory(reply));
@@ -3452,7 +3541,7 @@ fn measured<S: Serialize, M: Serialize>(plan: &Plan, reply: &Frame, software: S,
         .filter(|row| row["name"].as_str().is_some_and(|name| name.starts_with("attention.") || name.starts_with("gemm.")))
         .collect();
     serde_json::json!({"attribution": reply.attribution, "software": software, "execution": reply.execution,
-        "observations": kernels, "memory": memory, "models": plan.models()})
+        "observations": kernels, "memory": memory, "residency": reply.residency, "models": plan.models()})
 }
 
 pub(crate) fn command_ok(frame: Frame) -> io::Result<Frame> {
@@ -3475,6 +3564,35 @@ fn constructions(plan: &Plan) -> Vec<Construction> {
     plan.slots.iter().map(slot).collect()
 }
 
+/// A group's formation: rank 0 reports each follower it spawned (a progress frame's
+/// `follower_pids`, before the follower opens memory, then Start's reply), and each becomes its
+/// GPU's tenant at once, so its lease peer is known when it dials.
+struct Formation {
+    tenants: memory::Tenants,
+    leader: Birth,
+    plan: String,
+    generation: String,
+    start: usize,
+}
+
+impl Formation {
+    /// The reported followers in rank 0's own process group, each registered as its tenant.
+    fn register(&self, pids: &[u32]) -> io::Result<Vec<Exact>> {
+        let members = platform::process::group_members(&self.leader);
+        let followers: Vec<Exact> = pids
+            .iter()
+            .filter_map(|pid| members.iter().find(|m| m.pid == *pid))
+            .filter_map(|birth| Exact::open(birth).ok().flatten())
+            .collect();
+        let tenant = |follower: &Exact| -> io::Result<(u32, Tenant)> {
+            let tenant = Tenant { plan: self.plan.clone(), generation: self.generation.clone(), start: self.start, exact: follower.try_clone()? };
+            Ok((follower.birth().pid, tenant))
+        };
+        self.tenants.register(followers.iter().map(tenant).collect::<io::Result<Vec<_>>>()?);
+        Ok(followers)
+    }
+}
+
 struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
@@ -3485,9 +3603,22 @@ struct Callbacks<'a> {
     spool: Option<PathBuf>,
     /// The invoking request as a caller: its child-call frames.
     caller: Option<&'a crate::calls::Caller>,
+    /// Its executor's group, forming at Start.
+    formation: Option<Formation>,
+    /// The host watcher: each frame nudges it to look (the only wakeup where the kernel gives
+    /// none, cgroup v1 with PSI denied).
+    host: Option<&'a memory::Host>,
 }
 impl Services for Callbacks<'_> {
     fn progress(&mut self, frame: &Frame) {
+        if let (Some(formation), false) = (&self.formation, frame.follower_pids.is_empty()) {
+            if let Err(error) = formation.register(&frame.follower_pids) {
+                tracing::warn!("run {}: followers {:?} unregistered: {error}", self.id, frame.follower_pids);
+            }
+        }
+        if let Some(host) = self.host {
+            host.nudge();
+        }
         crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
     }
     fn request(
@@ -3565,7 +3696,8 @@ mod tests {
             length: 9,
             repository: "paul/wushu".into(),
             release: "1.0.0".into(),
-            lane: "bf16".into(),
+            lane: "model.bf16.cozytensors".into(),
+            precision: "bf16".into(),
         };
         let plan = Plan {
             id: "p".into(),
@@ -3573,7 +3705,7 @@ mod tests {
             installation: "i".into(),
             generation: "g".into(),
             entrypoint: "remove_background".into(),
-            slots: vec![PlanSlot { binding, lane: "fp16".into(), selected_encoded_bytes: 0, on_demand: false, placeable: vec![] }],
+            slots: vec![PlanSlot { binding, lane: "model.fp16.cozytensors".into(), precision: "fp16".into(), selected_encoded_bytes: 0, on_demand: false, placeable: vec![] }],
             sources: vec![source],
             degree: 1,
         };
@@ -3586,10 +3718,31 @@ mod tests {
         .unwrap();
         let measured = measured(&plan, &reply, None::<()>, ());
         assert_eq!(measured["models"], json!([
-            {"slot": "model", "repository": "paul/birefnet", "release": "0.1.0", "lane": "fp16", "manifest": "sha256:aa"},
-            {"slot": "lora", "repository": "paul/wushu", "release": "1.0.0", "lane": "bf16", "manifest": "sha256:bb"}]));
+            {"slot": "model", "repository": "paul/birefnet", "release": "0.1.0", "lane": "model.fp16.cozytensors", "precision": "fp16", "manifest": "sha256:aa"},
+            {"slot": "lora", "repository": "paul/wushu", "release": "1.0.0", "lane": "model.bf16.cozytensors", "precision": "bf16", "manifest": "sha256:bb"}]));
         let kept: Vec<&str> = measured["observations"].as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap()).collect();
         assert_eq!(kept, ["attention.selected", "gemm.selected"]);
+    }
+
+    /// An invoke reply's residency (the Runtime's graph counters per model, fields this TensorD
+    /// does not know included) reaches the run's measurements whole.
+    #[test]
+    fn an_invoke_replys_residency_reaches_the_runs_measurements() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("engine")).unwrap();
+        let id = engine.submit("graphs", crate::journal::Invocation::default()).unwrap().id;
+        let plan = Plan { id: "p".into(), construction: "c".into(), installation: "i".into(), generation: "g".into(),
+            entrypoint: "generate".into(), slots: vec![], sources: vec![], degree: 1 };
+        let residency = json!({"notes": {"weights": "resident"}, "graphs": {"transformer": {
+            "declared_regions": 40, "active_graphs": 40, "replays": 120, "captures": 40, "graph_pool_bytes": 1 << 30,
+            "captured_regions": ["blocks.0"], "eager_gaps": {"router": "dynamic routing"}, "later_counter": 7}},
+            "later_section": {"kept": true}});
+        let reply: Frame = serde_json::from_value(json!({"reply": "invoke", "ok": true, "residency": residency})).unwrap();
+        record_measurements(&engine, &id, &plan, &reply);
+        let kept = engine.with_journal(|journal| journal.measurements(&id)).unwrap().expect("measurements kept");
+        let kept: serde_json::Value = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(kept["residency"], residency);
+        assert_eq!(kept["residency"]["graphs"]["transformer"]["replays"], 120);
     }
 
     #[cfg(unix)]
@@ -3712,7 +3865,7 @@ mod tests {
         let model = plan("replica", 1);
         for birth in [&old.birth, &live.birth] {
             pool.leaders.lock().unwrap().insert(birth.pid, (birth.clone(), model.construction.clone(), 0));
-            pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: model.construction.clone(), start: 0,
+            pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: model.construction.clone(), generation: model.generation.clone(), start: 0,
                 exact: Exact::open(birth).unwrap().unwrap() });
         }
         pool.levels.lock().unwrap().insert(model.construction.clone(), (("g".into(), "app".into()), Level::Gpu, live.birth.clone()));
@@ -3783,7 +3936,7 @@ mod tests {
         let exact = Exact::open(&birth).unwrap().unwrap();
         let id = engine.submit("unreadable-retirement", crate::journal::Invocation::default()).unwrap().id;
         pool.leaders.lock().unwrap().insert(birth.pid, (birth.clone(), "unreadable".into(), 0));
-        pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: "unreadable".into(), start: 0, exact });
+        pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: "unreadable".into(), generation: String::new(), start: 0, exact });
         pool.levels.lock().unwrap().insert("unreadable".into(), (("g".into(), "app".into()), Level::Host, birth.clone()));
         // Valid JSON passes SQLite's index but lacks Execution fields at the journal reader.
         let db = rusqlite::Connection::open(engine.root.join("executions.sqlite3")).unwrap();
@@ -3823,7 +3976,7 @@ mod tests {
                 serving.leaders.lock().unwrap().insert(owned_birth.pid, (owned_birth.clone(), model.construction.clone(), 0));
                 serving.levels.lock().unwrap().insert(model.construction.clone(), (("g".into(), "app".into()), Level::Host, owned_birth.clone()));
                 serving.tenants.lock().unwrap().insert(owned_birth.pid, Tenant {
-                    plan: model.construction.clone(), start: 0,
+                    plan: model.construction.clone(), generation: model.generation.clone(), start: 0,
                     exact: Exact::open(&owned_birth)?.expect("the test's child is live"),
                 });
                 let mut claims = [None];
@@ -3945,7 +4098,7 @@ mod tests {
         let (root, pool, _engine) = pool_of(2);
         let binding = Binding { model_binding_path: "e.models.m".into(), release: "p@1".into(), ..Default::default() };
         let mut group = plan("film", 2);
-        group.slots = vec![PlanSlot { binding, lane: String::new(), selected_encoded_bytes: 0, on_demand: false, placeable: vec!["te".into()] }];
+        group.slots = vec![PlanSlot { binding, lane: String::new(), precision: String::new(), selected_encoded_bytes: 0, on_demand: false, placeable: vec!["te".into()] }];
         let homes = pool.homes(&group, pool.lane(0, 2).unwrap(), None);
         assert_eq!(homes, BTreeMap::from([("e.models.m".to_string(), BTreeMap::from([("te".to_string(), 0)]))]));
         assert!(pool.homes(&group, pool.lane(0, 1).unwrap(), None).is_empty());
@@ -4174,6 +4327,251 @@ mod tests {
         assert!(pool.place(&engine, &image, (Some(3), None), None, &mut claims).is_none());
         assert_eq!(claims, [Some(3), Some(3)]);
         drop((first, second));
+        pool.stop().unwrap();
+        crate::scratch::remove(&root);
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    /// `parts` one-MiB regions named `name` on `gpu`, filled inline: a set a stand-in holds.
+    #[cfg(target_os = "linux")]
+    fn stall_set(gpu: &varena::GpuId, name: &str, parts: usize) -> varena::SetSpec {
+        use varena::layout::Layout;
+        let names: Vec<String> = (0..parts).map(|i| format!("{name}/w{i}")).collect();
+        let spans: Vec<tensorfs::io::Span> = names.iter().enumerate().map(|(i, tensor)| tensorfs::io::Span {
+            what: format!("{tensor}#data"),
+            len: MIB,
+            source: tensorfs::io::ItemSource::Inline(Arc::from(vec![i as u8 + 1; MIB as usize])),
+        }).collect();
+        let regions: Vec<Vec<String>> = names.iter().map(|n| vec![n.clone()]).collect();
+        let layout = Layout::build(&spans, &regions).unwrap();
+        let ids: Vec<varena::PartId> = names.iter().map(|n| varena::PartId { name: format!("{n}#data"), encoding: "raw".into(), dtype: "u8".into() }).collect();
+        let fingerprint = varena::Fingerprint::new(&layout, &ids, varena::Fill::Stored, "stall/pkg@1", "0/1", &gpu.uuid);
+        varena::SetSpec { name: name.into(), layout: Arc::new(layout), source: Arc::new(tensorfs::io::source::Source::files(vec![], false, 0)), fingerprint }
+    }
+
+    /// An executor stand-in for the stall rule: granted the GPU's ledger over its control socket
+    /// (stdin), it loads its set to the GPU and answers one line per command: `warm` (a request
+    /// binding every block, ended: its pages stay idle on the GPU), `run <id> <shape>` (a request
+    /// and its pass, which asks its peers for every idle byte: no peak is recorded for it) and
+    /// `end <room>` (the pass ended at peak `room`, the request ended).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "the stall-rule test runs it as an executor"]
+    fn stall_stand_in() {
+        use std::io::{BufRead, Write};
+        use std::os::fd::FromRawFd;
+        let Ok(spec) = std::env::var("S5_STALL") else { return };
+        let [prefix, uuid, bytes, name, parts] = spec.split('|').collect::<Vec<_>>()[..] else { panic!("{spec}") };
+        assert!(varena::os::namespace(prefix));
+        let gpu = varena::GpuId { uuid: uuid.into(), model: "host".into(), memory: bytes.parse().unwrap() };
+        // SAFETY: the test installs its control socket at this process's stdin.
+        let control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
+        let grant = varena::Grant { table: platform::handles::recv_fd(&control).unwrap(), row: platform::handles::recv_fd(&control).unwrap(), limit: None };
+        let memory = varena::Memory::open(gpu.clone(), Some(grant), Box::new(varena::HostBackend::new(gpu.memory))).unwrap();
+        let parts: usize = parts.parse().unwrap();
+        let set = memory.load(stall_set(&gpu, name, parts), varena::Level::Gpu).unwrap();
+        let plan = || varena::Plan { steps: vec![varena::Step { sets: vec![name.to_string()], passes: 2 }] };
+        let (mut out, lines) = (control.try_clone().unwrap(), std::io::BufReader::new(control).lines());
+        let (mut request, mut pass) = (None, None);
+        for line in lines.map_while(Result::ok) {
+            let reply = match line.split(' ').collect::<Vec<_>>()[..] {
+                ["warm"] => {
+                    let warm = memory.request(&format!("warm-{}", uuid::Uuid::new_v4()), plan()).unwrap();
+                    let binding = warm.pass(set, "warm").unwrap();
+                    drop((0..parts as u32).map(|block| memory.bind(set, block, 0).unwrap()).collect::<Vec<_>>());
+                    binding.end(0);
+                    warm.end();
+                    "warm".to_string()
+                }
+                ["run", id, shape] => {
+                    let opened = memory.request(id, plan()).unwrap();
+                    pass = Some(opened.pass(set, &format!("run|{shape}")).unwrap());
+                    request = Some(opened);
+                    "passing".to_string()
+                }
+                ["end", room] => {
+                    let room: u64 = room.parse().unwrap();
+                    pass.take().unwrap().end(room);
+                    request.take().unwrap().end();
+                    "ended".to_string()
+                }
+                _ => panic!("unknown command {line}"),
+            };
+            writeln!(out, "{reply}").unwrap();
+        }
+    }
+
+    /// A stall-rule stand-in, its control socket and replies.
+    #[cfg(target_os = "linux")]
+    struct StallStandIn {
+        child: std::process::Child,
+        control: std::os::unix::net::UnixStream,
+        replies: std::io::BufReader<std::os::unix::net::UnixStream>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl StallStandIn {
+        fn spawn(prefix: &str, gpu: &memory::Gpu, uuid: &str, name: &str, parts: usize) -> StallStandIn {
+            let (control, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gpu_service::tests::stall_stand_in", "--ignored", "--nocapture"])
+                .env("S5_STALL", format!("{prefix}|{uuid}|{}|{name}|{parts}", 64 * MIB))
+                .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let grant = gpu.ledger().grant(child.id()).unwrap();
+            platform::handles::send_fd(&control, &grant.table).unwrap();
+            platform::handles::send_fd(&control, &grant.row).unwrap();
+            let replies = std::io::BufReader::new(control.try_clone().unwrap());
+            StallStandIn { child, control, replies }
+        }
+
+        fn ask(&mut self, command: &str) -> String {
+            use std::io::{BufRead, Write};
+            writeln!(self.control, "{command}").unwrap();
+            let mut reply = String::new();
+            self.replies.read_line(&mut reply).unwrap();
+            reply.trim().to_string()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for StallStandIn {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// An executor's frame nudges the host watcher: it looks at the host (what the running
+    /// calls keep free), with no kernel event to wake it. In its own process: one namespace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_executors_frame_nudges_the_host_watcher_to_look() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gpu_service::tests::frame_nudge_child", "--ignored", "--nocapture"])
+            .env("S5_NUDGE", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "an_executors_frame_nudges_the_host_watcher_to_look runs it in its own process"]
+    fn frame_nudge_child() {
+        if std::env::var("S5_NUDGE").is_err() { return; }
+        assert!(varena::os::namespace(&format!("nudge{}-", std::process::id())));
+        let id = varena::GpuId { uuid: format!("nudge-{}", std::process::id()), model: "host".into(), memory: 64 << 20 };
+        let gpu = Arc::new(memory::Gpu::ledgered(varena::Ledger::create(&id, None).unwrap(), "host"));
+        let host = memory::Host::watch(platform::contain::host_pressure::HostMode::Shared, vec![gpu], &memory::MemoryLog::default()).expect("watched");
+        host.look(); // Whatever woke it at its start has been answered.
+        let made = host.looks();
+        let root = std::env::temp_dir().join(format!("gpu-nudge-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root.join("execution")).unwrap();
+        let generation: crate::catalog::Generation = serde_json::from_value(json!({"identity": "g", "package": "p", "version": "1",
+            "application": "app", "python": "/usr/bin/python3", "interface": {}})).unwrap();
+        let mut callbacks = Callbacks { engine: &engine, id: "nudged", completed: 0, generation: &generation, spool: None, caller: None, formation: None, host: Some(&host) };
+        let frame: Frame = serde_json::from_value(json!({"event": "progress", "stage": "denoise", "position": 1, "total": 8})).unwrap();
+        callbacks.progress(&frame);
+        // The look follows the frame's nudge; a failure backstop only.
+        let (looked, looks) = std::sync::mpsc::channel();
+        let waiting = host.clone();
+        std::thread::spawn(move || {
+            waiting.await_look(made);
+            let _ = looked.send(());
+        });
+        looks.recv_timeout(std::time::Duration::from_secs(60)).expect("the frame's nudge made the watcher look");
+        crate::scratch::remove(&root);
+    }
+
+    /// A call's decisions reach the memory log in order, one line each with the run, process
+    /// and GPUs, every field relayed; the run's measurements keep them in its stats.
+    #[test]
+    fn a_calls_memory_decisions_reach_the_memory_log_in_order() {
+        let (root, pool, _engine) = pool_of(1);
+        let decisions = json!([
+            {"step": 0, "trigger": "pass", "action": "cut", "site": "ffn", "need": 1 << 30, "freed": 0, "level": 2},
+            {"step": 1, "trigger": "oom", "action": "evict_d", "site": null, "need": 1 << 29, "freed": 1 << 28, "level": null},
+            {"step": 1, "trigger": "oom", "action": "exhausted", "site": "attention", "need": 1 << 20, "freed": 0, "level": null, "later": true}]);
+        let reply: Frame = serde_json::from_value(json!({"reply": "invoke", "ok": true, "memory": {"peak": 7, "decisions": decisions}})).unwrap();
+        pool.note_decisions("run-7", 4242, "0", &reply);
+        let log = std::fs::read_to_string(pool.store.root().join("logs/memory.log")).unwrap();
+        // Each line: its time, then the record.
+        let noted: Vec<serde_json::Value> = log.lines().filter_map(|l| l.split_once(' ')).map(|(_, l)| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|l| l["event"] == "decision").collect();
+        assert_eq!(noted.len(), 3, "{log}");
+        for (line, decision) in noted.iter().zip(decisions.as_array().unwrap()) {
+            assert_eq!((line["run"].as_str(), line["pid"].as_u64(), line["gpus"].as_str()), (Some("run-7"), Some(4242), Some("0")));
+            for (key, value) in decision.as_object().unwrap() {
+                assert_eq!(&line[key], value, "{key} relayed");
+            }
+        }
+        assert_eq!(call_memory(&reply).unwrap()["stats"]["decisions"], decisions, "the measurements keep them");
+        pool.stop().unwrap();
+        crate::scratch::remove(&root);
+    }
+
+    /// The stall rule, through the pool's own events thread (`memory_changed` → `end_stalled`)
+    /// over a host GPU's real ledger, with real processes: a row asked for room whose ask thread
+    /// still runs answers and is never ended, however its asker waits; once that row is stopped
+    /// (SIGSTOP: state T) with an ask out to it, the ledger names it stalled and the pool ends
+    /// it, so the asker's pass gets its room.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_row_asked_for_room_is_ended_and_an_answering_one_never() {
+        let prefix = format!("gpusvc{}-", std::process::id());
+        assert!(varena::os::namespace(&prefix), "the test binary's namespace");
+        let root = std::env::temp_dir().join(format!("gpu-stall-{}", uuid::Uuid::new_v4()));
+        let uuid = format!("GPU-stall-{}", uuid::Uuid::new_v4());
+        let config: GpuConfig = serde_json::from_value(json!({"devices": "0", "prespawn": false,
+            "inventory": [{"device_index": 0, "device_name": "host", "device_uuid": uuid, "driver_version": "", "memory_bytes": 64 * MIB, "pci_bus_id": ""}]})).unwrap();
+        let store = crate::storage::open(&root.join("store")).unwrap();
+        let pool = Pool::new(&root.join("gpu"), config, store.clone()).unwrap();
+        let gpu = pool.devices[0].memory.clone().expect("the host GPU's ledger");
+        const ROOM: u64 = 40 * MIB;
+        let mut asker = StallStandIn::spawn(&prefix, &gpu, &uuid, "asker", 2);
+        assert_eq!(asker.ask("warm"), "warm");
+        // Its pass at `big` measures its room while the card is free.
+        assert_eq!(asker.ask("run measure big"), "passing");
+        assert_eq!(asker.ask(&format!("end {ROOM}")), "ended");
+        let mut holder = StallStandIn::spawn(&prefix, &gpu, &uuid, "holder", 24);
+        assert_eq!(holder.ask("warm"), "warm");
+        let birth = Birth::of(holder.child.id()).unwrap();
+        pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: "holder".into(), generation: String::new(), start: 0, exact: Exact::open(&birth).unwrap().unwrap() });
+        let ended = || std::fs::read_to_string(store.root().join("logs/memory.log")).unwrap_or_default()
+            .lines().any(|line| line.contains("\"end_stalled\"") && line.contains(&format!("\"pid\":{}", birth.pid)));
+        // Answering: the asker's pass needs the holder's idle pages, asks, and gets them.
+        assert_eq!(asker.ask("run answered big"), "passing");
+        assert_eq!(asker.ask(&format!("end {ROOM}")), "ended");
+        assert!(holder.child.try_wait().unwrap().is_none() && !ended(), "an answering row is never ended");
+        assert_eq!(holder.ask("warm"), "warm");
+        // Stopped with an ask out to it: the pool ends it, and the pass gets its room.
+        let mut stopped = 0;
+        // SAFETY: a signal to this test's own child, then waiting until it has stopped.
+        unsafe {
+            assert_eq!(libc::kill(birth.pid as i32, libc::SIGSTOP), 0);
+            libc::waitpid(birth.pid as i32, &mut stopped, libc::WUNTRACED);
+        }
+        let (passed, passing) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let asker = &mut asker;
+            scope.spawn(move || passed.send(asker.ask("run stalled big")).unwrap());
+            // A failure backstop only: the pass returns once the pool has ended the holder.
+            let reply = passing.recv_timeout(std::time::Duration::from_secs(60));
+            if reply.is_err() {
+                // SAFETY: our own child; the asker's pass then goes on.
+                unsafe { libc::kill(birth.pid as i32, libc::SIGKILL) };
+            }
+            assert_eq!(reply.as_deref(), Ok("passing"), "the stopped holder's end freed its pages");
+        });
+        let status = holder.child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "ended by the pool: {status:?}");
+        assert!(ended(), "the memory log says the pool ended it");
+        assert_eq!(asker.ask(&format!("end {ROOM}")), "ended");
+        drop((asker, holder));
         pool.stop().unwrap();
         crate::scratch::remove(&root);
     }

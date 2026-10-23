@@ -1,13 +1,16 @@
 //! `cozy update` installs only what it can prove: a release whose archive matches the sha256 its
 //! manifest names and carries an attestation of this repo's release workflow. Anything else is
 //! refused before the binary is touched. The happy path runs in release-smoke.yml on every OS.
+//! It keeps the shell completion in place too.
 mod common;
 
 use common::Home;
 use sha2::{Digest, Sha256};
 use std::{
+    fs,
     io::{BufRead, BufReader, Write},
     net::TcpListener,
+    process::Command,
     thread,
 };
 
@@ -97,4 +100,94 @@ fn an_archive_without_its_own_attestation_is_refused() {
         return;
     };
     assert_eq!(refusal["code"], "unattested", "{refusal}");
+}
+
+/// After `cozy update`, a new bash completes a path wherever cozy takes one, as bash completes
+/// any path: `~` and relative, after `name=`, a directory with `/` and no space, `--out` only
+/// directories. Values still come from the grammar.
+#[cfg(unix)]
+#[test]
+fn after_an_update_tab_completes_paths_as_bash_does() {
+    let Some(home) = Home::new() else { return };
+    let user = home.path();
+    let data = user.join(".local/share");
+    for dir in ["r/images", "my dir"] {
+        fs::create_dir_all(user.join(dir)).unwrap();
+    }
+    for file in ["r/qwen-edit.yaml", "r/qwen-edit2.yaml", "my dir/a b.yaml"] {
+        fs::write(user.join(file), "").unwrap();
+    }
+    let stub = data.join("bash-completion/completions/cozy");
+    // What the Go CLI left there: a protocol this binary never answered.
+    fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    fs::write(&stub, "complete -F _cozy cozy\n").unwrap();
+    let out = common::out(
+        home.command()
+            .env("XDG_DATA_HOME", &data)
+            .env("COZY_DOWNLOAD_URL", release(&"0".repeat(64), ANOTHER))
+            .arg("update")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(out.code, 0, "{out:?}");
+    assert!(out.stdout.contains("is the newest release"), "{out:?}");
+
+    let mut bash = Command::new("bash");
+    bash.args(["--norc", "--noprofile", "-i"])
+        .current_dir(user)
+        .env("HOME", user)
+        .env("XDG_DATA_HOME", &data)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                home.root().join("bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("PS1", "$ ")
+        .env("INPUTRC", "/dev/null")
+        .env_remove("COMPLETE");
+    let mut shell = common::pty::Pty::spawn(&bash);
+    // As bash-completion loads it on the first <TAB>.
+    shell.key(&format!("source {}\r", stub.display()));
+    // `#` after the <TAB> shows what it left: a space, or none after a directory.
+    for (typed, completed) in [
+        (
+            "cozy run o/p/f --input ~/r/qwen-ed",
+            "cozy run o/p/f --input ~/r/qwen-edit#",
+        ),
+        (
+            "cozy run o/p/f --input ~/r/im",
+            "cozy run o/p/f --input ~/r/images/#",
+        ),
+        (
+            "cozy run o/p/f --asset p=~/r/im",
+            "cozy run o/p/f --asset p=~/r/images/#",
+        ),
+        (
+            "cozy run o/p/f --input=./r/qwen-edit2",
+            "cozy run o/p/f --input=./r/qwen-edit2.yaml #",
+        ),
+        (
+            "cozy run o/p/f image=r/qwen-edit2",
+            "cozy run o/p/f image=r/qwen-edit2.yaml #",
+        ),
+        ("cozy run o/p/f ./my", r"cozy run o/p/f ./my\ dir/#"),
+        (
+            "cozy run o/p/f --out ~/r/",
+            "cozy run o/p/f --out ~/r/images/#",
+        ),
+        ("cozy run o/p/f --la", "cozy run o/p/f --lane #"),
+        ("cozy run ./r/im", "cozy run ./r/images/#"),
+        ("cozy model upload ~/my", r"cozy model upload ~/my\ dir/#"),
+        ("cozy --tensorhub tens", "cozy --tensorhub tensorhub #"),
+        ("cozy hub us", "cozy hub use #"),
+    ] {
+        shell.key(&format!("{typed}\t#"));
+        let want = format!("$ {completed}");
+        shell.until(&want, |screen| screen.lines().any(|l| l.trim_end() == want));
+        // Ctrl-U: the next line starts empty.
+        shell.key("\x15");
+    }
 }

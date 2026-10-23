@@ -52,21 +52,49 @@ pub struct Hello {
     pub pgid: u32,
     pub runtime_version: String,
     pub tensorfs_version: String,
-    /// Executor memory wire contract: 1 receives table + row-lock descriptors per GPU
-    /// and uses Varena custody/RAM services directly. Zero is the legacy single-fd contract.
+    /// Executor memory wire contract ([`Contract`]): 2 leases chunks from each GPU's manager
+    /// besides its ledger rows, 1 receives table + row-lock descriptors per GPU, any other (a
+    /// Runtime before 0.31: 0) is given neither and runs its memory alone.
     pub memory_protocol: u32,
     pub sealed: BTreeMap<String, String>,
     pub torch_loaded: bool,
 }
 
+/// The lease protocol (design varena-leases), where varena serves one.
+#[cfg(unix)]
+const LEASES: Option<u32> = Some(varena::lease::PROTOCOL);
+#[cfg(not(unix))]
+const LEASES: Option<u32> = None;
+
+/// How an executor's GPU memory is served, by the memory protocol its Hello speaks. An executor
+/// is never refused for it: skew degrades to standalone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Contract {
+    /// Chunks leased over each GPU's listener, besides its ledger rows.
+    Leases,
+    /// Its ledger rows (protocol 1).
+    Rows,
+    /// Any other protocol: its own pages, its GPUs' tables by name.
+    Standalone,
+}
+
 impl Hello {
+    pub fn contract(&self) -> Contract {
+        match self.memory_protocol {
+            1 => Contract::Rows,
+            protocol if Some(protocol) == LEASES => Contract::Leases,
+            _ => Contract::Standalone,
+        }
+    }
+
+    /// Refuses a Start whose descriptors or leases the executor's protocol cannot read.
     fn accepts(&self, command: &DeviceCommand) -> io::Result<()> {
-        if matches!(command, DeviceCommand::Start { devices, ledgers, .. } if !devices.is_empty() || *ledgers != 0)
-            && self.memory_protocol != 1
-        {
+        let DeviceCommand::Start { ledgers, leases, .. } = command else { return Ok(()) };
+        let contract = self.contract();
+        if (*ledgers != 0 && contract == Contract::Standalone) || (leases.is_some() && contract != Contract::Leases) {
             return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
-                "GPU executor requires memory_protocol=1 (two ledger descriptors per GPU); Runtime {} advertises {}. Upgrade Runtime and TensorFS together",
-                self.runtime_version, self.memory_protocol,
+                "Runtime {} speaks memory protocol {}: it reads no {}",
+                self.runtime_version, self.memory_protocol, if leases.is_some() { "leases" } else { "ledger descriptors" },
             )));
         }
         Ok(())
@@ -188,6 +216,10 @@ pub enum DeviceCommand {
         /// memory with the first and hands follower r the r-th (design varena-slim §3).
         #[serde(skip_serializing_if = "is_zero")]
         ledgers: u32,
+        /// The namespace (TensorD's uid) each GPU's lease listener (`lease-<uuid>`) is named in,
+        /// for an executor speaking the lease protocol; a GPU nobody serves runs its own pages.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        leases: Option<u32>,
         memory_mode: MemoryMode,
     },
     Load {
@@ -487,6 +519,9 @@ pub struct Frame {
     pub seq: u64,
     pub kind: Kind,
     pub descriptor: bool,
+    /// A request's descriptors that follow it (a Runtime before 0.31's `keep_pages`): taken
+    /// off the channel and closed unserved.
+    pub descriptors: u64,
     pub name: String,
     pub sha256: String,
     pub length: u64,
@@ -496,6 +531,10 @@ pub struct Frame {
     /// of another shape (an older Hello's list) reads as absent.
     #[serde(deserialize_with = "lenient")]
     pub memory: Option<serde_json::Map<String, Value>>,
+    /// `invoke`: the Runtime's residency report, relayed into the run's measurements; one of
+    /// another shape reads as absent.
+    #[serde(deserialize_with = "lenient")]
+    pub residency: Option<Residency>,
     pub stage: String,
     pub position: Option<u64>,
     pub total: Option<u64>,
@@ -713,10 +752,10 @@ impl Line {
 /// keep the token, every other field is scanned.
 fn command_bytes(command: &DeviceCommand, memo: bool) -> io::Result<Vec<u8>> {
     let mut value = serde_json::to_value(command)?;
-    if matches!(command, DeviceCommand::Start { .. }) {
+    if let DeviceCommand::Start { leases, .. } = command {
         // The receiver checks this before reading any ledger descriptors. Older TensorD
         // sends none, allowing a rebuilt Runtime to refuse its single-fd contract safely.
-        value["memory_protocol"] = 1.into();
+        value["memory_protocol"] = leases.and(LEASES).unwrap_or(1).into();
         if memo {
             value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
         }
@@ -748,7 +787,8 @@ pub struct DeviceExecutor {
     /// Stillness while this answers true is not this executor's: it waits on runs watched
     /// by their own executors (a job's unfinished children).
     pub waits: Option<crate::process::Waits>,
-    /// Its GPUs' work: a GPU executor's invocations are judged while they run (`Meter::Work`).
+    /// Its GPUs' work, which judges its invocations beside its CPU, bytes and frames
+    /// (`Meter::Work`); None on a lane with no GPUs.
     pub activity: Option<crate::process::Activity>,
     root: PathBuf,
     socket: PathBuf,
@@ -765,7 +805,7 @@ pub struct DeviceExecutor {
 }
 
 /// Cooperative first: the executor stops at its next safe point. The running invocation's
-/// frame meter then decides whether it stopped moving and must be killed.
+/// pace then decides whether it stopped and must be killed.
 #[derive(Clone)]
 pub struct Cancellation {
     root: PathBuf,
@@ -1574,9 +1614,8 @@ impl DeviceExecutor {
         // Refuse incompatible descriptor framing before writing the command or any handle.
         // CPU/import-only baseline commands do not need the GPU memory capability.
         self.hello.accepts(command)?;
-        let meter = match (command, &self.activity) {
-            (DeviceCommand::Invoke { .. }, Some(_)) => Meter::Work,
-            (DeviceCommand::Invoke { .. }, None) => Meter::Frames,
+        let meter = match command {
+            DeviceCommand::Invoke { .. } => Meter::Work,
             _ => Meter::Burn,
         };
         let watching = Watching::start(
@@ -1596,7 +1635,7 @@ impl DeviceExecutor {
             memo.release(run);
         }
         let (killed, worst_gap) = watching.finish();
-        if meter != Meter::Burn {
+        if meter == Meter::Work {
             self.worst_gap = self.worst_gap.max(worst_gap);
         }
         match killed {
@@ -1661,11 +1700,7 @@ impl DeviceExecutor {
     }
 
     fn answer(&mut self, frame: &Frame, services: &mut impl Services) -> io::Result<()> {
-        let descriptor = if frame.descriptor {
-            Some(File::from(platform::handles::recv_fd(&self.stream)?))
-        } else {
-            None
-        };
+        let descriptor = take_descriptors(&self.stream, frame)?;
         let (mut answer, descriptor) = services.request(frame, descriptor)?;
         answer.event = "answer";
         answer.seq = frame.seq;
@@ -1852,6 +1887,30 @@ pub fn read_result(spool: &Path, reply: &Frame) -> io::Result<Value> {
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 /// A field of the shape this machine reads, else absent: never a reason to refuse the frame.
+/// The Runtime's residency report on an invoke reply: its notes and, per model, its graph
+/// regions' counters (captures, replays, pool bytes, eager gaps). Relayed whole: fields this
+/// TensorD does not know are kept.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Residency {
+    pub notes: serde_json::Map<String, Value>,
+    pub graphs: BTreeMap<String, serde_json::Map<String, Value>>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
+}
+
+/// A request's descriptor, if one follows it; descriptors this TensorD serves none of (an
+/// older Runtime's kept pages) are received and closed, so the channel stays in step.
+fn take_descriptors(stream: &LocalStream, frame: &Frame) -> io::Result<Option<File>> {
+    for _ in 0..frame.descriptors {
+        drop(platform::handles::recv_fd(stream)?);
+    }
+    Ok(match frame.descriptor {
+        true => Some(File::from(platform::handles::recv_fd(stream)?)),
+        false => None,
+    })
+}
+
 fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
     Ok(serde_json::from_value(Value::deserialize(d)?).ok())
 }
@@ -2010,6 +2069,7 @@ mod codec_tests {
                 call_interfaces: vec![],
                 constructions: vec![],
                 ledgers: 0,
+                leases: None,
                 memory_mode: mode,
             };
             let frame: Value = serde_json::from_slice(&command_bytes(&start, false).unwrap()).unwrap();
@@ -2049,22 +2109,55 @@ mod codec_tests {
         assert!(adjustments("run-3", &none).is_empty() && adjustments("run-4", &Frame::default()).is_empty());
     }
 
+    /// Version skew degrades: an executor of another memory protocol (a Runtime before 0.31
+    /// advertises none) starts on its GPUs with no ledger; ledger descriptors go only to one
+    /// that reads them.
     #[test]
-    fn gpu_start_requires_the_memory_descriptor_contract_not_a_patch_version() {
-        let legacy: Hello = serde_json::from_value(serde_json::json!({"runtime_version": "0.30.3"})).unwrap();
-        let mut start = DeviceCommand::Start {
-            devices: String::new(), application: String::new(), package_interface: PathBuf::new(),
+    fn each_memory_protocol_starts_on_what_it_reads_and_none_is_refused() {
+        let hello = |protocol: u32| -> Hello { serde_json::from_value(serde_json::json!({"runtime_version": "0.31.99", "memory_protocol": protocol})).unwrap() };
+        let start = |ledgers: u32, leases: Option<u32>| DeviceCommand::Start {
+            devices: "0".into(), application: String::new(), package_interface: PathBuf::new(),
             sequence_parallel_degree: 1, import_only: false, call_interfaces: vec![],
-            constructions: vec![], ledgers: 0, memory_mode: MemoryMode::Dedicated,
+            constructions: vec![], ledgers, leases, memory_mode: MemoryMode::Dedicated,
         };
-        legacy.accepts(&DeviceCommand::Hello).unwrap();
-        legacy.accepts(&start).unwrap();
-        if let DeviceCommand::Start { devices, ledgers, .. } = &mut start { *devices = "0".into(); *ledgers = 1; }
-        assert_eq!(legacy.accepts(&start).unwrap_err().kind(), io::ErrorKind::Unsupported);
-        let capable: Hello = serde_json::from_value(serde_json::json!({"runtime_version": "0.31.99", "memory_protocol": 1})).unwrap();
-        capable.accepts(&start).unwrap();
-        let incompatible: Hello = serde_json::from_value(serde_json::json!({"memory_protocol": 2})).unwrap();
-        assert!(incompatible.accepts(&start).is_err());
+        let (legacy, rows) = (hello(0), hello(1));
+        assert_eq!((legacy.contract(), rows.contract(), hello(9).contract()), (Contract::Standalone, Contract::Rows, Contract::Standalone));
+        // A GPU executor of any protocol starts: standalone, it is sent nothing it cannot read.
+        legacy.accepts(&start(0, None)).unwrap();
+        assert_eq!(legacy.accepts(&start(1, None)).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        rows.accepts(&start(1, None)).unwrap();
+        assert!(rows.accepts(&start(1, Some(1000))).is_err(), "rows read no leases");
+        let frame = |command: &DeviceCommand| serde_json::from_slice::<Value>(&command_bytes(command, false).unwrap()).unwrap()["memory_protocol"].clone();
+        assert_eq!(frame(&start(1, None)), 1);
+        #[cfg(unix)]
+        {
+            let leases = hello(varena::lease::PROTOCOL);
+            assert_eq!(leases.contract(), Contract::Leases);
+            leases.accepts(&start(1, Some(1000))).unwrap();
+            assert_eq!(frame(&start(1, Some(1000))), varena::lease::PROTOCOL);
+        }
+    }
+
+    /// An older Runtime's kept pages (`keep_pages`, its descriptors after the frame) are taken
+    /// off the channel and closed unserved, and its `read_grant` reads as a request this TensorD
+    /// does not serve: the next frame reads in step.
+    #[test]
+    fn an_older_runtimes_kept_pages_are_taken_off_the_channel() {
+        let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
+        let keep = serde_json::json!({"event": "request", "kind": "keep_pages", "seq": 4, "layout": "l",
+            "fingerprint": "f", "rank": 0, "pages": [{"region": 0, "nbytes": 1}, {"region": 1, "nbytes": 1}], "descriptors": 2});
+        write_frame(&mut runtime, &keep).unwrap();
+        for _ in 0..2 {
+            platform::handles::send_fd(&runtime, &File::open(std::env::current_exe().unwrap()).unwrap()).unwrap();
+        }
+        write_frame(&mut runtime, &serde_json::json!({"event": "request", "kind": "read_grant", "seq": 5, "manifest": "m", "layout": "l", "rank": 0})).unwrap();
+        let kept = read_frame(&mut machine).unwrap().unwrap();
+        assert_eq!((kept.kind, kept.seq, kept.descriptors), (Kind::Unknown, 4, 2));
+        assert!(take_descriptors(&machine, &kept).unwrap().is_none());
+        let grant = read_frame(&mut machine).unwrap().unwrap();
+        assert_eq!((grant.kind, grant.seq), (Kind::Unknown, 5));
+        // Refused and nothing held: the older executor reads the checkpoint itself.
+        assert!(!Answer::unavailable(grant.seq).ok);
     }
 
     /// A null in any optional field reads as its absence: a string, a flattened hello field,

@@ -177,10 +177,20 @@ fn the_grammar_refuses_what_it_cannot_run() {
             &[
                 "run",
                 "fidika/sdxl/generate@2.10.0",
-                "--bits",
+                "--lane",
                 "3",
                 "--json",
             ],
+            "usage",
+            2,
+        ),
+        (
+            &["run", "fidika/sdxl/generate@2.10.0", "--lane", "fp8", "--json"],
+            "usage",
+            2,
+        ),
+        (
+            &["run", "fidika/sdxl/generate@2.10.0", "--bits", "8", "--json"],
             "usage",
             2,
         ),

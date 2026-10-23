@@ -778,7 +778,7 @@ mod tests {
         let store = crate::storage::open(&m.root.join("sdk-store")).unwrap();
         let machine = crate::origin::Machine::new(store, None).unwrap();
         let directory = m.root.join("default-sdk");
-        let default = crate::machine::update::DefaultSdk::new(directory.clone(), m.root.join("must-not-execute"), machine);
+        let default = crate::machine::update::DefaultSdk::new(directory.clone(), m.root.join("must-not-execute"), "3.12".into(), machine);
         let sources = LocalSources::new(m.objects.clone(), InstallerConfig { default_sdk: Some(default.clone()), ..m.installer.clone() });
         let manifest = write(&m.objects, "alice", br#"{"package":"local/example","release":"1"}"#);
         assert_eq!(sources.install(&m.service, "bob", &manifest.digest, None, "", &|_| ()).err().unwrap().code, "local_source_incomplete");
@@ -797,7 +797,7 @@ mod tests {
             .collect();
         let store = crate::storage::open(&m.root.join("sdk-store")).unwrap();
         let machine = crate::origin::Machine::new(store, None).unwrap();
-        let default = crate::machine::update::DefaultSdk::new(m.root.join("default-sdk"), "uv".into(), machine);
+        let default = crate::machine::update::DefaultSdk::new(m.root.join("default-sdk"), "uv".into(), "3.12".into(), machine);
         default.seed_verified(&wheels).unwrap(); // Uses production metadata/floor/content checks.
         let config = InstallerConfig { default_sdk: Some(default.clone()), ..m.installer.clone() };
         assert!(config.sdk.is_empty() && config.runtime_build.is_empty());

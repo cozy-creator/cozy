@@ -204,33 +204,16 @@ impl Named {
         Ok(self)
     }
 
-    /// Select by header profile, or by an explicit path, without reading tensor payloads.
-    fn landed(mut self, machine: &Machine, source: &hub::Source, constraints: Option<&precision::Constraints>) -> Result<Self, Failure> {
+    /// Its variant in its tree (TensorFS's one selection, header profiles only): its lane when
+    /// it names one, else the one `constraints` take; and that variant's header.
+    fn landed(mut self, machine: &Machine, source: &hub::Source, constraints: &precision::Constraints) -> Result<Self, Failure> {
         let failed = |e| refused("model_resolution_failed", e);
         let remote = origin::remote(machine, source).map_err(failed)?;
         let tree = machine.tree(&remote, self.tree()?, &Stop::default()).map_err(failed)?;
         if self.lane.is_empty() {
-            let default = precision::Constraints::default();
-            let constraints = constraints.unwrap_or(&default);
-            if let Some(answer) = origin::select(machine, source, &self.repository, &self.tree()?.id(), constraints).map_err(failed)? {
-                if answer.commit != *self.tree()? { return Err(unresolved(&self)); }
-                let path = answer.variant.ok_or_else(|| ("model_resolution_failed", "no variant fits the requested GPUs and bits".into()))?;
-                if tree.header(&path) != answer.header.as_ref() { return Err(unresolved(&self)); }
-                self.lane = path;
-            } else {
-                let headers: Vec<_> = tree.variants().map(|(_,h)| h.clone()).collect();
-                machine.objects(&remote, &headers, priority::NOW, &Stop::default()).map_err(failed)?;
-                let profiles = tree.variants().map(|(name,h)| {
-                    let header = tensorfs::format::Header::from_cbor(&machine.store().read(h).map_err(|e| ("model_resolution_failed",e.to_string()))?)
-                        .map_err(|e| ("model_resolution_failed",e.to_string()))?;
-                    Ok((name,precision::Profile::of(&header)))
-                }).collect::<Result<Vec<_>,Failure>>()?;
-                let candidates: Vec<_> = profiles.iter().map(|(n,p)| (*n,p)).collect();
-                let Some((at,_)) = constraints.select(&self.repository,&candidates).map_err(|e| ("model_resolution_failed",e.to_string()))? else {
-                    return Err(("model_resolution_failed","no variant fits the requested GPUs and bits".into()));
-                };
-                self.lane = profiles[at].0.to_owned();
-            }
+            let model = format!("{}@{}", self.repository, self.release);
+            let selected = machine.select(&remote, &self.repository, &model, self.tree()?, &tree, constraints).map_err(failed)?;
+            self.lane = selected.map_err(|e| ("model_resolution_failed", e.detail))?.variant;
         }
         let (path,header) = tree.variant(Some(&self.lane)).map_err(|e| ("model_resolution_failed",e.to_string()))?;
         self.lane = path.to_owned(); self.header = Some(header.clone());
@@ -562,12 +545,12 @@ impl Publisher {
     /// Hub; then the header there of its lane, else of the first of `lanes` the tree has, else of
     /// its only lane. Journaled per catalog revision so a warm run, across restarts too,
     /// asks the Hub nothing (th-245).
-    pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, constraints: Option<&precision::Constraints>, revision: &str) -> Result<Named, Failure> {
+    pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, constraints: &precision::Constraints, revision: &str) -> Result<Named, Failure> {
         if named.tree.is_some() {
             return measured(&self.machine, service, source, named, constraints);
         }
         let origin = hub::origin_key(&source.origin).unwrap_or_default();
-        let name = json!(["profiles-v1", origin, named.repository, named.release, named.lane, constraints]).to_string();
+        let name = json!(["profiles-v2", origin, named.repository, named.release, named.lane, constraints]).to_string();
         let held = service.engine.with_journal(|j| j.named(&name, revision)).map_err(io_failure)?;
         if let Some((release, lane, tree, header)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
             return Ok(Named { release, lane, tree: Some(tree), header: Some(header), ..named });
@@ -587,7 +570,7 @@ impl Publisher {
         service: &Service,
         source: &hub::Source,
         named: Named,
-        constraints: Option<&precision::Constraints>,
+        constraints: &precision::Constraints,
         revision: &str,
         stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync),
@@ -1263,8 +1246,9 @@ impl Publisher {
             ))?;
         let degree = crate::gpu_service::group_degree(&slots, request.gpus, gpu.width());
         let gpus = gpu.gpus(degree);
-        // One slot's grant, its Hub checkpoint and its warnings, `short` of memory or not.
-        let pick = |slot: &Value, short: bool| -> Result<(ModelGrant, Option<Named>, Vec<String>), Failure> {
+        let main = main_model(&slots);
+        // One slot's grant, its Hub checkpoint and its warnings.
+        let pick = |slot: &Value| -> Result<(ModelGrant, Option<Named>, Vec<String>), Failure> {
             let path = slot.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
             let parameter = path.rsplit('.').next().unwrap_or_default().to_string();
             job.stage(format!("choosing the model for {path}"));
@@ -1300,16 +1284,18 @@ impl Publisher {
             }
             let named = choose(choice, &path)?;
             let tolerances = precision::Slot::of(slot);
-            let bits = tolerances.bits(request.bits, short);
+            // The asked lane is the main model's; every other slot takes the no-flag rule.
+            let asked = if Some(slot) == main { request.bits } else { 0 };
             let ruled = named.lane.is_empty() && named.tree.is_none();
-            let constraints = precision::Constraints { gpus: gpus.capabilities.clone(), bits: Some(if tolerances.encoded { bits } else { 16 }) };
-            let named = self.resolve(service, request.hub(&format!("the model for {path}"))?, named, Some(&constraints), &request.catalog_revision)?;
+            let constraints = tolerances.constraints(&gpus, asked);
+            let named = self.resolve(service, request.hub(&format!("the model for {path}"))?, named, &constraints, &request.catalog_revision)?;
             let model = format!("{}@{}", named.repository, named.release);
             let warnings = if ruled {
                 let remote = origin::remote(&self.machine, request.hub("selected header")?).map_err(|e| refused("model_resolution_failed",e))?;
                 self.machine.objects(&remote, std::slice::from_ref(named.header()?), priority::NOW, &Stop::default()).map_err(|e| refused("model_resolution_failed",e))?;
                 let header = tensorfs::format::Header::from_cbor(&self.store.read(named.header()?).map_err(|e| ("model_resolution_failed",e.to_string()))?).map_err(|e| ("model_resolution_failed",e.to_string()))?;
-                tolerances.warnings(bits, &gpus, &model, &precision::Profile::of(&header).family)
+                // Raw weights are data and ask no lane; else the rule's own reasons, as it selected.
+                if tolerances.raw { vec![] } else { constraints.warnings(&model, &precision::Profile::of(&header)) }
             } else { vec![] };
             let grant = ModelGrant {
                 package: installation.package.clone(),
@@ -1331,25 +1317,8 @@ impl Publisher {
                 false => self.structure(request.hub("a Hub model")?, &named, job),
             }
         };
-        let mut picked: Vec<_> = slots.iter().map(|slot| pick(slot, false)).collect::<Result<_, _>>()?;
+        let picked: Vec<_> = slots.iter().map(pick).collect::<Result<_, _>>()?;
         land(&picked)?;
-        // Memory short (design §2.2): a `min_bits=4` compute slot takes 4 bits when the weights it
-        // constructs exceed the budget (the GPU less a quarter for activations).
-        let shrinks = |slot: &Value| {
-            let tolerances = precision::Slot::of(slot);
-            request.bits == 0 && tolerances.min_bits == 4 && !tolerances.decode && !tolerances.raw
-        };
-        if slots.iter().any(&shrinks) {
-            let constructed = slots.iter().zip(&picked).filter(|(slot, _)| crate::gpu_service::constructed(slot));
-            let checkpoints = distinct(constructed.filter_map(|(_, (_, named, _))| named.as_ref()));
-            let bytes: u64 = checkpoints.iter().map(|named| self.bytes(named)).sum();
-            if gpu.budget(degree).is_some_and(|budget| bytes > budget) {
-                for (slot, chosen) in slots.iter().zip(&mut picked).filter(|(slot, _)| shrinks(slot)) {
-                    *chosen = pick(slot, true)?;
-                }
-                land(&picked)?;
-            }
-        }
         let (mut grants, mut warnings) = (vec![], vec![]);
         for (grant, _, said) in picked {
             grants.push(grant);
@@ -1370,7 +1339,9 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                let resolve = |source: &hub::Source, named| self.resolve(service, source, named, None, &request.catalog_revision);
+                // An adapter is selected for the run's GPUs by the no-flag rule: `--lane` is the main model's.
+                let constraints = precision::Constraints { gpus: gpus.capabilities.clone(), ..Default::default() };
+                let resolve = |source: &hub::Source, named| self.resolve(service, source, named, &constraints, &request.catalog_revision);
                 apply_adapters(self, request.source.as_ref(), &resolve, choice, grant, &request.providers, job)?;
             }
         }
@@ -1404,14 +1375,13 @@ impl Publisher {
             .map_err(io_failure)?;
         Ok((plan, warnings))
     }
+}
 
-    /// A landed checkpoint's bytes: its header and every chunk and asset it names.
-    fn bytes(&self, named: &Named) -> u64 {
-        let Ok(header) = named.header() else {
-            return 0;
-        };
-        self.store.closure(header).map_or(header.length, |objects| objects.iter().map(|o| o.length).sum())
-    }
+/// A function's main model, the one a run's `--lane` filters (owner, 10-22): its first slot
+/// constructed up front, neither raw weights nor on demand. Its LoRAs and auxiliary models take
+/// the no-flag rule.
+fn main_model(slots: &[Value]) -> Option<&Value> {
+    slots.iter().find(|slot| crate::gpu_service::constructed(slot) && slot["on_demand"] != true)
 }
 
 /// Each checkpoint once.
@@ -1622,13 +1592,19 @@ fn apply_adapters(
 }
 
 /// A catalog read the Hub answered 404 to is the thing named absent there; any other failure
-/// is the read's.
+/// is the read's, naming what it read and the Hub's whole answer (run 14446 said only "internal:
+/// unexpected internal failure").
 /// The Hub's own 404 names an absence; one without its envelope (`http_404`: a tunnel or proxy
 /// in front of it) names nothing (tfs-101).
-fn absent(refusal: hub_client::Error, code: &'static str, named: impl FnOnce() -> String) -> Failure {
+fn absent(refusal: hub_client::Error, code: &'static str, read: &str, named: impl FnOnce() -> String) -> Failure {
+    let failed = |why: String| ("catalog_read_failed", format!("reading {read}: {why}"));
     match refusal {
         hub_client::Error::Hub { status: 404, code: hub, .. } if !hub.starts_with("http_") => (code, named()),
-        other => ("catalog_read_failed", other.to_string()),
+        hub_client::Error::Hub { status, code, message, remedy } => failed(match remedy.is_empty() {
+            true => format!("the Hub answered {status} {code}: {message}"),
+            false => format!("the Hub answered {status} {code}: {message} ({remedy})"),
+        }),
+        other => failed(other.to_string()),
     }
 }
 
@@ -1660,12 +1636,12 @@ fn newest_key(request: &Request) -> String {
 /// its format; a tree (a commit) resolves to its lane's header, a header is the checkpoint itself.
 /// Read once under the run's access (its request's bearer for the owner's) and kept, since a hash
 /// never names other bytes.
-fn measured(machine: &Machine, service: &Service, source: &hub::Source, named: Named, constraints: Option<&precision::Constraints>) -> Result<Named, Failure> {
+fn measured(machine: &Machine, service: &Service, source: &hub::Source, named: Named, constraints: &precision::Constraints) -> Result<Named, Failure> {
     if named.header.is_some() {
         return Ok(named);
     }
     let tree = named.tree()?.clone();
-    let key = json!([hub::origin_key(&source.origin).unwrap_or_default(), named.repository, tree.id(), named.lane, constraints]).to_string();
+    let key = json!(["profiles-v2", hub::origin_key(&source.origin).unwrap_or_default(), named.repository, tree.id(), named.lane, constraints]).to_string();
     let held = service.engine.with_journal(|j| j.named(&key, "")).map_err(io_failure)?;
     if let Some((tree, lane, header)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
         return Ok(Named { tree, lane, header: Some(header), ..named });
@@ -1703,7 +1679,8 @@ const CARD: &str = "release.json";
 /// `release`'s install plan, read at its Hub.
 fn hub_card(catalog: &Catalog, package: &str, release: &str, python: &str) -> Result<Card, Failure> {
     let (org, name) = package.split_once('/').unwrap_or_default();
-    let plan = catalog.install_plan(org, name, release, None).map_err(|e| absent(e, "release_absent", || {
+    let read = format!("the install plan of {package}@{release} at {}", catalog.origin());
+    let plan = catalog.install_plan(org, name, release, None).map_err(|e| absent(e, "release_absent", &read, || {
         format!("{package} has no release {release} at {}", catalog.origin())
     }))?;
     if plan.release != release {
@@ -1747,7 +1724,8 @@ fn keep_card(generation: &Path, card: &Card) {
 fn newest_release(catalog: &Catalog, org: &str, name: &str) -> Result<String, Failure> {
     let card = catalog
         .package(org, name)
-        .map_err(|e| absent(e, "package_absent", || format!("{org}/{name} is not published at {}", catalog.origin())))?;
+        .map_err(|e| absent(e, "package_absent", &format!("the releases of {org}/{name} at {}", catalog.origin()),
+            || format!("{org}/{name} is not published at {}", catalog.origin())))?;
     let open = card.releases.iter().filter(|row| row.yanked != Some(true) && row.yanked_at.as_deref().is_none_or(str::is_empty));
     tensorfs::format::newest_by(open, |row| row.release.as_str())
         .map(|row| row.release.clone())
@@ -2097,16 +2075,20 @@ pub(crate) mod tests {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
                     reader.read_line(&mut line).unwrap();
-                    let (mut range, mut header) = (None, String::new());
+                    let (mut range, mut header, mut sent) = (None, String::new(), 0);
                     while reader.read_line(&mut header).unwrap_or(0) > 2 {
                         if let Some((name, value)) = header.split_once(':') {
                             if name.eq_ignore_ascii_case("range") {
                                 let (first, last) = value.trim().trim_start_matches("bytes=").split_once('-').unwrap();
                                 range = Some((first.parse::<usize>().unwrap(), last.parse::<usize>().unwrap_or(usize::MAX)));
                             }
+                            if name.eq_ignore_ascii_case("content-length") {
+                                sent = value.trim().parse().unwrap();
+                            }
                         }
                         header.clear();
                     }
+                    std::io::Read::read_exact(&mut reader, &mut vec![0; sent]).unwrap();
                     let mut words = line.split_whitespace();
                     let method = words.next().unwrap().to_string();
                     // An object store answers a presigned URL by its path; the query is its signature.
@@ -2152,6 +2134,11 @@ pub(crate) mod tests {
                             };
                             let body = format!(r#"{{"package":{{"org":"acme","name":"{name}","created_at":"2026-10-01T00:00:00Z"}},"releases":{releases}}}"#);
                             format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
+                        }
+                        // A Hub whose object store failed under it (run 14446): its opaque envelope.
+                        ["", "v1", "packages", "acme", "faulty", ..] => {
+                            let body = r#"{"error":{"code":"internal","message":"unexpected internal failure","remedy":"retry; if it persists inspect the server log"}}"#;
+                            format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
                         }
                         // The Hub's own refusal: its envelope names the absence.
                         _ => {
@@ -2317,6 +2304,18 @@ pub(crate) mod tests {
         let (code, message) = newest_release(&catalog, "acme", "nope").unwrap_err();
         assert_eq!(code, "package_absent");
         assert!(message.starts_with("acme/nope is not published at http://127.0.0.1:"), "{message}");
+    }
+
+    /// A catalog read the Hub failed names what it read, where, and the Hub's whole answer.
+    #[test]
+    fn a_failed_catalog_read_names_the_read_and_the_hubs_answer() {
+        let origin = file_door(HashMap::new(), Arc::new(Mutex::new(vec![])), None);
+        let catalog = Catalog::new(&hub::Source::new(&origin, None, None).unwrap()).unwrap();
+        let answer = "the Hub answered 500 internal: unexpected internal failure (retry; if it persists inspect the server log)";
+        let Err((code, message)) = hub_card(&catalog, "acme/faulty", "1.0.0", "3.12") else { panic!("a failed read") };
+        assert_eq!((code, message), ("catalog_read_failed", format!("reading the install plan of acme/faulty@1.0.0 at {origin}: {answer}")));
+        let (code, message) = newest_release(&catalog, "acme", "faulty").unwrap_err();
+        assert_eq!((code, message), ("catalog_read_failed", format!("reading the releases of acme/faulty at {origin}: {answer}")));
     }
 
     /// The newest release is a final before any pre-release, and never a yanked one.
@@ -2527,7 +2526,7 @@ pub(crate) mod tests {
         tiny_wheel(&image, "tensorfs", "1.0", &[]);
         let named = tiny_wheel(&dev, "cozy-runtime", "2.1", &[]);
         let paths = Paths::new(&root.join("engine"), &root);
-        let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+        let updates = Updates::open(paths.clone(), "3.12".into(), Box::new(|| true), None, None).unwrap();
         let file = named.file_name().unwrap().to_string_lossy().to_string();
         let (digest, _) = updates.stage(&file, &mut File::open(&named).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256: digest.clone(), ..Default::default() });
@@ -2746,7 +2745,7 @@ pub(crate) mod tests {
             };
             let tree = names_hub::trees(&self.source, std::slice::from_ref(&model)).remove(0);
             let (origin, heard) = names_hub::paced(&self.source, model, None, Duration::from_millis(pace));
-            let named = Named { repository: repository.into(), release: "1.0.0".into(), lane: "bf16".into(),
+            let named = Named { repository: repository.into(), release: "1.0.0".into(), lane: "model.bf16.cozytensors".into(),
                 tree: Some(tree), header: Some(header.clone()) };
             (hub::Source::new(&origin, None, None).unwrap(), named, heard)
         }
@@ -2770,7 +2769,7 @@ pub(crate) mod tests {
         assert_eq!(count(&heard, "GET /o/"), 2, "the header and its tree: {heard:?}");
         assert_eq!(count(&heard, "GET /blobs/"), 2, "{heard:?}");
         assert!(!crate::access::whole(store, &manifest.id(), &[]));
-        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "bf16".into(), tree: named.tree.clone().unwrap() };
+        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "model.bf16.cozytensors".into(), tree: named.tree.clone().unwrap() };
         assert_eq!(Pulled::of(store, &manifest).unwrap(), Some(pulled));
         let asked = heard.lock().unwrap().len();
         bench.publisher.structure(&hub, &[named], &job).unwrap();
@@ -2787,15 +2786,15 @@ pub(crate) mod tests {
         let (hub, held, _) = bench.hub("acme/pinned", &manifest, 0);
         let service = Service::open(&bench.root.join("state"), &bench.root.join("generations"), 1).unwrap();
         let pin = |object: &ObjectRef| Named {
-            repository: "acme/pinned".into(), lane: "bf16".into(),
+            repository: "acme/pinned".into(), lane: "model.bf16.cozytensors".into(),
             tree: Some(ObjectRef { sha256: object.sha256.clone(), length: 0 }), ..Default::default()
         };
         let tree = held.tree.unwrap();
-        let commit = bench.publisher.resolve(&service, &hub, pin(&tree), None, "").unwrap();
+        let commit = bench.publisher.resolve(&service, &hub, pin(&tree), &Default::default(), "").unwrap();
         assert_eq!((commit.tree.as_ref(), commit.header.as_ref()), (Some(&tree), Some(&manifest)));
-        let header = bench.publisher.resolve(&service, &hub, pin(&manifest), None, "").unwrap();
-        assert_eq!((header.tree.as_ref(), header.header.as_ref(), header.lane.as_str()), (None, Some(&manifest), "bf16"));
-        assert_eq!(bench.publisher.resolve(&service, &hub, pin(&manifest), None, "").unwrap().header, Some(manifest.clone()));
+        let header = bench.publisher.resolve(&service, &hub, pin(&manifest), &Default::default(), "").unwrap();
+        assert_eq!((header.tree.as_ref(), header.header.as_ref(), header.lane.as_str()), (None, Some(&manifest), "model.bf16.cozytensors"));
+        assert_eq!(bench.publisher.resolve(&service, &hub, pin(&manifest), &Default::default(), "").unwrap().header, Some(manifest.clone()));
         bench.publisher.structure(&hub, std::slice::from_ref(&header), &Job::default()).unwrap();
         let store = bench.publisher.store();
         let pulled = Pulled::of(store, &manifest).unwrap().unwrap();
@@ -2913,7 +2912,7 @@ pub(crate) mod tests {
         fs::write(dir.join("generation.json"), json!({"identity": identity, "package": "acme/pkg", "version": "1.0.0",
             "application": "pkg:app", "python": python, "interface": interface}).to_string()).unwrap();
         let held = generations.resolve(&identity).unwrap();
-        let slot = |manifest: &ObjectRef, on_demand| PlanSlot { selected_encoded_bytes: 0, on_demand, lane: String::new(), placeable: vec![],
+        let slot = |manifest: &ObjectRef, on_demand| PlanSlot { selected_encoded_bytes: 0, on_demand, lane: String::new(), precision: String::new(), placeable: vec![],
             binding: crate::device_executor::Binding { snapshot: manifest.id(), components: vec!["model".into()], ..Default::default() } };
         let plan = Plan { id: "warm".into(), construction: "warm".into(), installation: "i".into(), generation: identity.clone(),
             entrypoint: "render".into(), slots: vec![slot(&manifest, false), slot(&later, true)], sources: vec![], degree: 1 };
@@ -3020,7 +3019,25 @@ pub(crate) mod tests {
                 use tensorfs::{format::{encode, Dtype, Encoding, PartBytes}, writer::{Data, PartData, Source}};
                 let mut writer = source.writer(None, None).unwrap();
                 let shape = [4, 32];
-                if matches!(*lane, "int8" | "fp8" | "nvfp4") {
+                if *lane == "nvfp4-int8" {
+                    // H3's layout: its nvfp4 variant keeps a sensitive layer int8, which holds
+                    // most of its bytes; smaller than the int8 variant all the same.
+                    let shape = [4, 16];
+                    let int8 = Encoding { scheme: "int8.rowwise".into(), params: Default::default() };
+                    let parts = [encode::OwnedPart {role:"weight".into(),dtype:Dtype::I8,shape:shape.to_vec(),bytes:vec![1;64]},
+                        encode::OwnedPart {role:"scale".into(),dtype:Dtype::F32,shape:vec![4],bytes:f32s(4,tag.into())}];
+                    let mut readers: Vec<_> = parts.iter().map(|part| std::io::Cursor::new(&part.bytes)).collect();
+                    let parts = parts.iter().zip(&mut readers).map(|(part,reader)| PartData {role:part.role.clone(),dtype:part.dtype.clone(),shape:part.shape.clone(),data:Source::Read(reader)}).collect();
+                    writer.get("unet").put("proj.weight",&Dtype::BF16,&shape,Data::Encoded{encoding:int8,parts}).unwrap();
+                    let fp4 = Encoding { scheme: "nvfp4".into(),
+                        params: serde_json::from_value(json!({"block_size":16,"global_scale":"multiply","nibble_order":"low_first","scale_layout":"row_major"})).unwrap() };
+                    let values = f32s(64, tag.into());
+                    let arrays = BTreeMap::from([("values", PartBytes {dtype:&Dtype::F32,shape:&shape,bytes:&values})]);
+                    let encoded = encode::quantize(&encode::Input {dtype:&Dtype::BF16,shape:&shape,encoding:&fp4,arrays:&arrays}).unwrap();
+                    let mut readers: Vec<_> = encoded.iter().map(|part| std::io::Cursor::new(&part.bytes)).collect();
+                    let parts = encoded.iter().zip(&mut readers).map(|(part,reader)| PartData {role:part.role.clone(),dtype:part.dtype.clone(),shape:part.shape.clone(),data:Source::Read(reader)}).collect();
+                    writer.get("unet").put("out.weight",&Dtype::BF16,&shape,Data::Encoded{encoding:fp4,parts}).unwrap();
+                } else if matches!(*lane, "int8" | "fp8" | "nvfp4") {
                     let encoding = Encoding { scheme: match *lane { "int8" => "int8.rowwise", "fp8" => "fp8.rowwise", _ => "nvfp4" }.into(),
                         params: if *lane == "nvfp4" { serde_json::from_value(json!({"block_size":16,"global_scale":"multiply","nibble_order":"low_first","scale_layout":"row_major"})).unwrap() } else { Default::default() } };
                     let values = f32s(128, tag.into());
@@ -3051,10 +3068,15 @@ pub(crate) mod tests {
 
         /// `render` prepared for `acme`'s run at `bits` with `choices`.
         fn prepare(&self, bits: u32, choices: Vec<domain::ModelChoice>) -> Prepared {
+            self.attempt(bits, choices).unwrap()
+        }
+
+        /// `prepare`, or its refusal.
+        fn attempt(&self, bits: u32, choices: Vec<domain::ModelChoice>) -> Result<Prepared, Failure> {
             let request = Request { run: String::new(), source: Some(self.hub.clone()), package: self.installation.package.clone(), release: "1.0.0".into(),
                 installed: Some(self.installation.clone()), owner: "acme".into(), catalog_revision: "r1".into(),
                 providers: Providers::default(), entrypoint: "render".into(), choices, gpus: 0, bits, imports: false };
-            self.publisher.prepare_now(&self.service, "alice", &request, None, None).unwrap()
+            self.publisher.prepare_now(&self.service, "alice", &request, None, None)
         }
 
         /// A run of `render` at `bits`: each slot's lane (constructed, then raw), the run's
@@ -3155,7 +3177,7 @@ pub(crate) mod tests {
         let tree = store.put_tree(&tree).unwrap();
         store.update_ref("local/multi", |old| Some(tensorfs::fetch::with_tag(old, "local/multi", "v1", &tree))).unwrap();
         let mut request = local_alias_request(&machine, vec![domain::ModelChoice {
-            parameter: "source".into(), repository: "local/multi".into(), release: "v1".into(), lane: "f32".into(),
+            parameter: "source".into(), repository: "local/multi".into(), release: "v1".into(), lane: "model.f32.cozytensors".into(),
             ..Default::default() }]);
         let a = machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
         assert_eq!(a.sources[0].manifest, first.id());
@@ -3185,8 +3207,8 @@ pub(crate) mod tests {
     const GIB: u64 = 1 << 30;
 
     /// A compute slot takes its row's 8-bit lane and a `min_bits=4` decode slot `nvfp4`, only
-    /// those lanes' checkpoints read; a warm run asks the Hub nothing; `--bits=16` is another
-    /// resolution.
+    /// those lanes' checkpoints read; a warm run asks the Hub nothing; `--lane 16` is another
+    /// resolution of the main model only.
     #[test]
     fn each_slot_takes_its_rows_lane_and_a_warm_run_asks_the_hub_nothing() {
         let slots = json!([
@@ -3200,42 +3222,85 @@ pub(crate) mod tests {
         let (lanes, _, asked) = hopper.run(0);
         assert_eq!((lanes, asked), (vec!["int8".to_string(), "nvfp4".into()], vec![]), "a warm run asks the Hub nothing");
         let (lanes, warnings, _) = hopper.run(16);
-        assert_eq!((lanes, warnings), (vec!["bf16".to_string(), "bf16".into()], vec![]));
+        assert_eq!((lanes, warnings), (vec!["bf16".to_string(), "nvfp4".into()], vec![]), "the lane is the main model's alone");
         let blackwell_ultra = Machine::new("acme/pkg", &[("10.3", 288 * GIB)], slots, &["bf16", "fp8", "int8", "nvfp4"]);
         assert_eq!(blackwell_ultra.run(0).0, ["fp8", "nvfp4"]);
     }
 
-    /// Only a `min_bits=4` compute slot drops to 4 bits, and only when the function's 8-bit
-    /// weights exceed the GPU's memory less its activations (a quarter before any measured).
+    /// Memory never lowers a lane: a `min_bits=4` compute slot on a GPU its 8-bit weights
+    /// overflow still takes 8 bits; paging fits them (owner, 2026-10-22). 4 bits are asked.
     #[test]
-    fn a_memory_short_function_drops_to_4_bits_only_where_min_bits_allows() {
+    fn memory_never_drops_a_slot_to_4_bits() {
         let slots = json!([
             {"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept", "min_bits": 4},
             {"path": "render.models.other", "class": "O", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
-        let lanes = ["int8", "nvfp4", "bf16"];
-        let short = Machine::new("acme/pkg", &[("8.9", 64)], slots.clone(), &lanes);
-        assert_eq!(short.run(0).0, ["nvfp4", "int8"]);
-        assert_eq!(short.run(8).0, ["int8", "int8"], "the request's bits win");
-        let ample = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], slots, &lanes);
-        assert_eq!(ample.run(0).0, ["int8", "int8"]);
+        let short = Machine::new("acme/pkg", &[("8.9", 64)], slots, &["int8", "nvfp4", "bf16"]);
+        assert_eq!(short.run(0).0, ["int8", "int8"]);
+        assert_eq!(short.run(4).0, ["nvfp4", "int8"], "asked 4 bits, for the main model alone");
     }
 
-    /// A release without the wanted lane serves the next with one warning per step; a slot
-    /// declining encoded leaves skips them with one warning; a warm run says the same again.
+    /// Unasked, a release without the preferred lane serves the next with one warning, again on a
+    /// warm run; asked bits are a filter, refused naming what the release publishes; a slot
+    /// declining encoded leaves skips them with one warning.
     #[test]
-    fn a_fallback_and_a_declined_encoding_each_warn() {
+    fn a_fallback_warns_asked_bits_refuse_and_a_declined_encoding_warns() {
         let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
-        let ada = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], slots, &["int8", "bf16"]);
-        let warned = ["precision 4: acme/model@1.0.0 has no nvfp4 lane for sm89; served int8".to_string()];
-        let (lanes, warnings, asked) = ada.run(4);
-        assert_eq!((lanes, warnings), (vec!["int8".to_string()], warned.to_vec()));
-        assert_eq!(ada.landed(&asked), std::collections::BTreeSet::from(["bf16", "int8"]));
-        let (_, warnings, asked) = ada.run(4);
+        let hopper = Machine::new("acme/pkg", &[("9.0", 80 * GIB)], slots.clone(), &["bf16"]);
+        let warned = ["precision 8: acme/model@1.0.0 has no int8 or fp8 lane for sm90; served bf16".to_string()];
+        let (lanes, warnings, asked) = hopper.run(0);
+        assert_eq!((lanes, warnings), (vec!["bf16".to_string()], warned.to_vec()));
+        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["bf16"]));
+        let (_, warnings, asked) = hopper.run(0);
         assert_eq!((warnings, asked), (warned.to_vec(), vec![]), "a warm run warns again and asks nothing");
+        let ada = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], slots, &["int8", "bf16"]);
+        assert_eq!(ada.attempt(4, vec![]).err(), Some(("model_resolution_failed", "precision 4 on sm89: acme/model@1.0.0 has no variant \
+            that works; it publishes model.bf16.cozytensors (bf16) is not 4-bit; model.int8.cozytensors (int8) is not 4-bit".to_string())));
         let declines = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "refuse"}]);
         let ada = Machine::new("acme/pkg", &[("8.9", 24 * GIB)], declines, &["int8", "bf16"]);
         let (lanes, warnings, _) = ada.run(0);
         assert_eq!((lanes, warnings), (vec!["bf16".to_string()], vec!["precision 8: acme/model@1.0.0 declines encoded leaves; served bf16".to_string()]));
+    }
+
+    /// H3's nvfp4 variant keeps a sensitive layer int8, which holds most of its bytes and makes it
+    /// smaller than the int8 variant: it is the 4-bit lane all the same. The 8-bit default takes
+    /// the int8 variant (runs 13145 and 13148 bound its nvfp4 leaves into a slot built for int8:
+    /// `KeyError: 'scale'`); 4 bits take it.
+    #[test]
+    fn a_variant_holding_nvfp4_is_the_4_bit_lane_however_many_int8_bytes() {
+        let slots = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "accept"}]);
+        let blackwell = Machine::new("acme/pkg", &[("12.0", 24 * GIB)], slots, &["int8", "nvfp4-int8"]);
+        assert_eq!(blackwell.run(0).0, ["int8"]);
+        assert_eq!(blackwell.run(8).0, ["int8"], "asked 8 bits, as a run's children inherit them");
+        assert_eq!(blackwell.run(4).0, ["nvfp4-int8"]);
+    }
+
+    /// `--lane` is the main model's alone (owner, 10-22): H3 turbo's DiT takes the asked lane and
+    /// its 16-bit-only LoRA slot the no-flag rule (runs 13781–13783 refused it); only the main
+    /// model lacking the lane is refused.
+    #[test]
+    fn an_asked_lane_is_the_main_models_alone() {
+        let slots = json!([
+            {"path": "render.models.base_model", "class": "B", "default": "model@1.0.0", "encoded_leaves": "accept"},
+            {"path": "render.models.turbo_lora", "class": "L", "default": "lora@1.0.0", "encoded_leaves": "accept"}]);
+        let blackwell = Machine::new("acme/pkg", &[("12.0", 24 * GIB)], slots, &["int8", "nvfp4-int8"]);
+        for (bits, lane, precision) in [(8, "int8", "int8"), (4, "nvfp4-int8", "nvfp4")] {
+            let plan = blackwell.attempt(bits, vec![]).unwrap_or_else(|e| panic!("{bits}: {e:?}")).plan.unwrap();
+            let served: Vec<_> = plan.slots.iter().map(|slot| (slot.binding.model_parameter_name.as_str(),
+                blackwell.lanes.get(&slot.binding.snapshot).map(String::as_str), slot.precision.as_str())).collect();
+            assert_eq!(served, [("base_model", Some(lane), precision), ("turbo_lora", None, "f32")], "{bits}");
+        }
+        let (code, message) = blackwell.attempt(16, vec![]).err().unwrap();
+        assert!(code == "model_resolution_failed" && message.contains("acme/model@1.0.0 has no variant that works"), "{message}");
+    }
+
+    /// A function's main model is its first slot constructed up front: Klein's drafter is on
+    /// demand, so its `model` is the main one; raw weights are never it.
+    #[test]
+    fn the_main_model_is_the_first_constructed_up_front() {
+        let klein = [json!({"path": "g.models.drafter", "on_demand": true}), json!({"path": "g.models.model"}),
+            json!({"path": "g.models.upsampler", "on_demand": true, "min_bits": 4, "phase": "decode"})];
+        assert_eq!(main_model(&klein).map(|slot| &slot["path"]), Some(&json!("g.models.model")));
+        assert_eq!(main_model(&[json!({"path": "c.models.source", "weights": true})]), None);
     }
 
     /// A mixed local set runs what every GPU in it runs: an Ampere and an Ada card share no fp8.
@@ -3278,8 +3343,8 @@ pub(crate) mod tests {
         let source = json!({"path": "render.models.source", "class": "M", "weights": true, "default": "model@1.0.0",
             "encoded_leaves": "accept", "min_bits": 4, "phase": "decode"});
         let blackwell = Machine::new("acme/pkg", &[("10.0", 180 * GIB)], json!([source]), &["nvfp4", "int8", "fp16"]);
-        assert_eq!(blackwell.run(4).0, ["fp16"]);
+        assert_eq!(blackwell.run(4).0, ["model.fp16.cozytensors"]);
         let (lanes, warnings, _) = Machine::new("acme/pkg", &[("10.0", 180 * GIB)], json!([source]), &["nvfp4"]).run(0);
-        assert_eq!((lanes, warnings), (vec!["nvfp4".to_string()], vec![]));
+        assert_eq!((lanes, warnings), (vec!["model.nvfp4.cozytensors".to_string()], vec![]));
     }
 }

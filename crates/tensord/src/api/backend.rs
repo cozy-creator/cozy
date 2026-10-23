@@ -24,6 +24,10 @@ pub trait MachineBackend: Send + Sync + 'static {
     fn warm_set(&self, _: VerifiedActor) -> Result<Vec<v1::WarmItem>, Error> {
         Ok(vec![])
     }
+    /// Each GPU's lease books by UUID (`StatusFrame.gpus[].leases`).
+    fn leases(&self) -> BTreeMap<String, v1::GpuLeases> {
+        BTreeMap::new()
+    }
     fn workspace(
         &self,
         _: VerifiedActor,

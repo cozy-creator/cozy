@@ -101,7 +101,7 @@ impl Drop for HttpServer {
 /// Pulls `name@1.0` variant `bf16` from `origin` into `store` and checks every tensor.
 async fn pull_and_check(origin: Arc<dyn Origin>, store: &Store, header: &ObjectRef, tensors: &BTreeMap<(String, String), Vec<u8>>) {
     let fetcher = Fetcher::new(Arc::new(store.clone()) as Arc<dyn ObjectStore>, client(), None, Config::default());
-    let pulled = fetcher.pull(&origin, "Acme/Tiny", Some("1.0"), Some("bf16"), &Want::default()).await.unwrap();
+    let pulled = fetcher.pull(&origin, "Acme/Tiny", Some("1.0"), Some("model.bf16.cozytensors"), &Want::default()).await.unwrap();
     fetcher.settled().await;
     assert_eq!(pulled.header, *header);
     let ck = store.checkpoint(header).unwrap();
@@ -247,7 +247,7 @@ fn a_streaming_writer_tees_to_the_store_before_publishing() {
         let origin: Arc<dyn Origin> = endpoint.clone();
         let pulled = fetcher.pull(&origin, "acme/streamed", Some(&header.id()), None, &Want::default()).await.unwrap();
         fetcher.settled().await;
-        assert_eq!((pulled.header, pulled.variant.as_str()), (header.clone(), "int8"));
+        assert_eq!((pulled.header, pulled.variant.as_str()), (header.clone(), "model.int8.cozytensors"));
     });
     assert!(into.checkpoint(&header).unwrap().read("unet", "big").unwrap() == big);
 }
@@ -427,4 +427,54 @@ async fn a_confirming_head_that_names_another_place_gets_the_bytes_there() {
     let endpoint = Endpoint::new(&client(), &stuck.1, None).unwrap();
     let refused = endpoint.upload(&object, &payload).await.unwrap_err();
     assert_eq!(refused.code, Code::REF_NOT_FOUND, "the same place twice: {refused}");
+}
+
+/// Mixed versions (xs-062): a Hub of another rule answers by that rule (a rule-3 Hub read kitchen's
+/// 4-bit scheme by its int8 extras, as the 8-bit lane). A reader of this rule takes no answer of
+/// another rule: the headers decide, so 8 bits take int8 and 4 bits w4a8. Its own rule's answer is
+/// taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_of_another_rule_is_not_taken_and_the_headers_decide() {
+    use tensorfs::precision::{Selection, RULE};
+    let scratch = Scratch::new("rule-skew");
+    let dir = scratch.0.join("hub");
+    let store = Store::open(&dir).unwrap();
+    let vectors = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/vectors/select");
+    let mut tree = Tree::default();
+    for (path, vector) in [("model.bf16.cozytensors", "bf16"), ("model.int8.cozytensors", "int8-convrot"),
+        ("model.w4a8.cozytensors", "w4a8-int8")] {
+        let header = std::fs::read(vectors.join(format!("{vector}.cbor"))).unwrap();
+        tree.files.insert(path.into(), store.put_bytes(&header).unwrap());
+    }
+    let root = store.put_tree(&tree).unwrap();
+    let mut repo = tensorfs::format::Repo::new("acme/w4");
+    repo.tags.push(tensorfs::format::Tag { name: "1.0".into(), commit: root.clone(), public: true, yanked: false });
+    let at = store.root().join(repo.key());
+    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+    std::fs::write(at, repo.to_json().unwrap()).unwrap();
+    let route = dir.join("v1/models/acme/w4/select");
+    std::fs::create_dir_all(route.parent().unwrap()).unwrap();
+    let answer = |rule: u32, variant: &str| serde_json::to_vec(&Selection {
+        rule, release: "1.0".into(), commit: root.clone(), variant: Some(variant.into()),
+        header: Some(tree.files[variant].clone()), profile: None, reasons: vec![],
+    }).unwrap();
+    std::fs::write(&route, answer(3, "model.w4a8.cozytensors")).unwrap();
+    let server = HttpServer::start(&dir);
+    let reader = |cache: &str| {
+        let mut config = tensorfs::Config::from_env();
+        config.cache_dir = scratch.0.join(cache);
+        config.endpoint = server.1.clone();
+        config.token = None;
+        config.mirror = None;
+        tensorfs::Client::new(config).unwrap()
+    };
+    let ask = |lane: Option<u32>| tensorfs::Open { lane, gpus: Some(vec!["8.6".into()]), ..Default::default() };
+    let client = reader("cache");
+    assert_eq!(client.open("acme/w4", &ask(None)).await.unwrap().variant(), Some("model.int8.cozytensors"));
+    assert_eq!(client.open("acme/w4", &ask(Some(8))).await.unwrap().variant(), Some("model.int8.cozytensors"));
+    assert_eq!(client.open("acme/w4", &ask(Some(4))).await.unwrap().variant(), Some("model.w4a8.cozytensors"));
+    std::fs::write(&route, answer(RULE, "model.bf16.cozytensors")).unwrap();
+    let client = reader("cache-own-rule");
+    assert_eq!(client.open("acme/w4", &ask(None)).await.unwrap().variant(), Some("model.bf16.cozytensors"),
+        "its own rule's answer is taken");
 }

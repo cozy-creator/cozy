@@ -161,8 +161,9 @@ fn writer_is_deterministic_and_reader_round_trips() {
     assert!(tb.ends_with(br#"}},"format":"cozytensors.tree/1"}"#));
     let back = Tree::from_json(&tb).unwrap();
     assert_eq!(back, t);
-    assert_eq!(back.variant(Some("bf16")).unwrap(), ("bf16", &ObjectRef::of(&bytes)));
-    assert_eq!(back.header(""), Some(&ObjectRef::of(&wb)));
+    assert_eq!(back.variant(Some("model.bf16.cozytensors")).unwrap(), ("model.bf16.cozytensors", &ObjectRef::of(&bytes)));
+    assert_eq!(back.header("model.cozytensors"), Some(&ObjectRef::of(&wb)));
+    assert!(back.variant(Some("bf16")).is_err(), "a lane word names no variant");
     assert!(back.variant(None).is_err(), "two variants: name one");
     let files: Vec<&str> = back.repo_files().map(|(p, _)| p).collect();
     assert_eq!(files, ["README.md"]);
@@ -182,7 +183,8 @@ fn writer_is_deterministic_and_reader_round_trips() {
     assert_eq!(r.default_tag().map(|t| &t.commit), Some(&ObjectRef::of(&tb)));
     assert_eq!(r.roots().count(), 2);
     r.tags[1].public = true;
-    assert!(r.to_json().is_err(), "a public tag is a version");
+    assert!(r.to_json().is_ok(), "a public tag may have any tag name");
+    assert_eq!(r.default_tag().map(|t| t.name.as_str()), Some("1.0"), "only a version is the default");
 }
 
 /// Later versions append fields to the root and to records, and add dtypes and schemes: this
@@ -332,11 +334,14 @@ fn red_documents_are_refused() {
         assert!(Tree::from_json(doc.to_string().as_bytes()).is_err(), "{path:?}");
     }
     let tree = json!({"sha256": "0".repeat(64), "length": 0});
+    // A tag a client cannot read (here a repeat) is read around: kept as it was, written back.
     let repo = json!({"format": "cozytensors.repo/1", "name": "acme/tiny", "tags": [
         {"name": "1", "commit": tree}, {"name": "1", "commit": tree, "public": true}]});
-    assert!(Repo::from_json(repo.to_string().as_bytes()).is_err());
+    let read = Repo::from_json(repo.to_string().as_bytes()).unwrap();
+    assert_eq!((read.tags.len(), read.unread.len(), read.tags[0].public), (1, 1, false));
     let lanes = json!({"format": "cozytensors.repo/1", "name": "acme/tiny", "tags": [{"name": "1", "lanes": {}}]});
-    assert!(Repo::from_json(lanes.to_string().as_bytes()).is_err(), "a tag names a commit");
+    let read = Repo::from_json(lanes.to_string().as_bytes()).unwrap();
+    assert_eq!((read.tags.len(), read.unread.len()), (0, 1), "a tag names a commit: one with lanes is read around");
 }
 
 fn tweak(f: impl FnOnce(&mut Vec<Tensor>)) -> Vec<Tensor> {
@@ -473,11 +478,15 @@ fn config_floats_take_their_shortest_exact_form() {
 
 #[test]
 fn variants_name_their_files() {
-    for (path, variant) in [("model.cozytensors", Some("")), ("model.fp8.cozytensors", Some("fp8"))] {
-        assert_eq!(variant_of(path), variant);
-        assert_eq!(variant_path(variant.unwrap()), path);
+    // A variant is its path: every `.cozytensors` file, at any depth.
+    for path in ["model.cozytensors", "model.fp8.cozytensors", "a/model.cozytensors", "nested/x.cozytensors"] {
+        assert_eq!(variant_of(path), Some(path));
     }
-    for path in ["model..cozytensors", "models.cozytensors", "a/model.cozytensors", "model.a/b.cozytensors", "README.md"] {
+    // A writer's bare name is written as `model.<name>.cozytensors`; a path stays itself.
+    for (name, path) in [("", "model.cozytensors"), ("fp8", "model.fp8.cozytensors"), ("a/b.cozytensors", "a/b.cozytensors")] {
+        assert_eq!(variant_path(name), path);
+    }
+    for path in ["models.cozytensor", "README.md", "a/b"] {
         assert_eq!(variant_of(path), None, "{path}");
     }
 }

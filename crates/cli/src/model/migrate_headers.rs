@@ -28,10 +28,10 @@ pub(crate) struct Args {
     #[arg(required_unless_present = "local", conflicts_with = "local")]
     models: Vec<String>,
     /// Instead: the TensorFS 0.12 store at this path, in place.
-    #[arg(long, value_name = "STORE")]
+    #[arg(long, value_name = "STORE", value_hint = clap::ValueHint::DirPath)]
     local: Option<PathBuf>,
     /// Where each model's report, and its document as it was, are written.
-    #[arg(long, value_name = "DIR", default_value = "migrate-headers-audit")]
+    #[arg(long, value_name = "DIR", default_value = "migrate-headers-audit", value_hint = clap::ValueHint::DirPath)]
     audit: PathBuf,
     /// Convert and report only: no object is sent and no document replaced.
     #[arg(long, conflicts_with = "local")]
