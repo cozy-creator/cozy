@@ -1,13 +1,14 @@
 //! `cozy login|logout|whoami`: this computer's device key at each Hub. Login enrolls a key by
 //! an emailed code; every later call signs in with it silently. Codes and names are read from
-//! stdin, never from argv.
-use std::{io::Write as _, process::ExitCode, sync::Arc};
+//! stdin, never from argv. `--export` enrolls a key for another computer (CI) into a file, which
+//! that computer installs with `--key`.
+use std::{io::Write as _, path::PathBuf, process::ExitCode, sync::Arc};
 
+use hub_client::{Credential, DeviceKey, Enrollment, UserSession, types};
 use protocol::{
     config::Hub,
     error::{Error, Kind},
 };
-use hub_client::{Credential, DeviceKey, Enrollment, UserSession, types};
 use serde_json::json;
 
 use crate::{
@@ -16,20 +17,35 @@ use crate::{
     output,
 };
 
-/// The label a Hub shows for this computer's key.
+/// The label a Hub shows for this computer's key, and for a key `--export` writes.
 const LABEL: &str = "cozy";
+const EXPORT_LABEL: &str = "cozy-export";
 
 #[derive(clap::Args, Debug)]
 pub struct Login {
     /// Your Tensorhub account's email.
-    email: String,
+    #[arg(required_unless_present = "key")]
+    email: Option<String>,
+    /// Enroll a new key for another computer, such as CI, and write it to FILE (owner-only);
+    /// this computer's own key is untouched
+    #[arg(long, value_name = "FILE", conflicts_with = "key")]
+    export: Option<PathBuf>,
+    /// Sign this computer in with a key `--export` wrote
+    #[arg(long, value_name = "FILE", conflicts_with = "email")]
+    key: Option<PathBuf>,
 }
 
 /// Enrolls this computer's key by the code the Hub emails, then names the account if it has
 /// no name yet. A key already accepted for this email is kept.
 pub async fn login(ctx: &Context, args: Login) -> Result<ExitCode, Error> {
     let hub = ctx.hub()?;
-    let email = args.email.trim();
+    if let Some(file) = &args.key {
+        return install(ctx, &hub, file).await;
+    }
+    let email = args.email.as_deref().unwrap_or_default().trim();
+    if let Some(file) = &args.export {
+        return export(ctx, &hub, email, file).await;
+    }
     if ctx.signed_in(&hub)
         && let Ok(session) = ctx.hub_session(&hub)
         && session.key().email.eq_ignore_ascii_case(email)
@@ -46,13 +62,66 @@ pub async fn login(ctx: &Context, args: Login) -> Result<ExitCode, Error> {
         .finish(&anonymous, &code)
         .await
         .map_err(hub_error)?;
-    let keep =
-        |e: platform::Error| Error::new(Kind::Internal, "key_unwritable", e.to_string());
+    let keep = |e: platform::Error| Error::new(Kind::Internal, "key_unwritable", e.to_string());
     platform::durable::private_dir(&ctx.home.keys()).map_err(keep)?;
     key.save(&hub.device_key(&ctx.home)).map_err(hub_error)?;
     let bearer = serde_json::to_vec(&bearer).expect("a bearer serializes");
     platform::durable::replace(&hub.bearer(&ctx.home), &bearer, 0o600).map_err(keep)?;
     signed_in(ctx, &hub, ctx.hub_session(&hub)?, "signed in").await
+}
+
+/// Enrolls a new key by the emailed code and writes it to `file`, for another computer.
+async fn export(
+    ctx: &Context,
+    hub: &Hub,
+    email: &str,
+    file: &std::path::Path,
+) -> Result<ExitCode, Error> {
+    let anonymous = ctx.hub_anonymous(hub);
+    let enrollment = Enrollment::begin(&anonymous, email, EXPORT_LABEL, None)
+        .await
+        .map_err(hub_error)?;
+    let code = ask(ctx, &format!("A code was sent to {email}. Code: "), "code")?;
+    let (key, _) = enrollment
+        .finish(&anonymous, &code)
+        .await
+        .map_err(hub_error)?;
+    key.save(file).map_err(hub_error)?;
+    if ctx.json {
+        output::json(&json!({
+            "status": "exported", "hub": hub, "email": key.email, "device_key": key.id, "file": file,
+        }));
+    } else {
+        output::Record::new()
+            .field("status", "exported")
+            .field("hub", hub)
+            .field("email", &key.email)
+            .field("device key", &key.id)
+            .field("file", file.display())
+            .print(ctx);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Makes the key in `file` this computer's key at `hub`, and proves it by naming its account.
+async fn install(ctx: &Context, hub: &Hub, file: &std::path::Path) -> Result<ExitCode, Error> {
+    let key = DeviceKey::load(file).map_err(hub_error)?;
+    if key.hub.trim_end_matches('/') != hub.origin.as_str().trim_end_matches('/') {
+        return Err(Error::new(
+            Kind::Usage,
+            "key_other_hub",
+            format!("{} holds a key for {}, not {hub}", file.display(), key.hub),
+        ));
+    }
+    let keep = |e: platform::Error| Error::new(Kind::Internal, "key_unwritable", e.to_string());
+    platform::durable::private_dir(&ctx.home.keys()).map_err(keep)?;
+    key.save(&hub.device_key(&ctx.home)).map_err(hub_error)?;
+    if let Err(e) = std::fs::remove_file(hub.bearer(&ctx.home))
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(Error::new(Kind::Internal, "key_unwritable", e.to_string()));
+    }
+    signed_in(ctx, hub, ctx.hub_session(hub)?, "signed in").await
 }
 
 /// Reports the account `session` signs in as, naming it first when it has no name yet.
