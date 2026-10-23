@@ -560,14 +560,18 @@ impl Signal {
 }
 
 /// Blocks until one of `items` is signalled; the lowest such index. No timeout.
-pub fn wait_any(items: &[Waitable<'_>]) -> Result<usize> {
+pub fn wait_any(items: &[Waitable<'_>]) -> Result<Vec<super::Ready>> {
     let handles: Vec<HANDLE> = items.iter().map(|h| h.as_raw_handle() as HANDLE).collect();
     // SAFETY: live handles the caller borrows for the call, and their count.
     let woke = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
     let n = handles.len() as u32;
-    match woke {
-        w if (WAIT_OBJECT_0..WAIT_OBJECT_0 + n).contains(&w) => Ok((w - WAIT_OBJECT_0) as usize),
-        w if (WAIT_ABANDONED_0..WAIT_ABANDONED_0 + n).contains(&w) => Ok((w - WAIT_ABANDONED_0) as usize),
-        _ => Err(last("wait")),
-    }
+    let first = match woke {
+        w if (WAIT_OBJECT_0..WAIT_OBJECT_0 + n).contains(&w) => (w - WAIT_OBJECT_0) as usize,
+        w if (WAIT_ABANDONED_0..WAIT_ABANDONED_0 + n).contains(&w) => (w - WAIT_ABANDONED_0) as usize,
+        _ => return Err(last("wait")),
+    };
+    // The answer names the lowest only: every later one signalled now is ready too.
+    // SAFETY: as above, one handle at a time, not waiting.
+    let later = (first + 1..handles.len()).filter(|&i| unsafe { WaitForSingleObject(handles[i], 0) } == WAIT_OBJECT_0);
+    Ok(std::iter::once(first).chain(later).map(|index| super::Ready { index, broken: false }).collect())
 }

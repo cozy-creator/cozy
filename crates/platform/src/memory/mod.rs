@@ -39,6 +39,14 @@ mod imp;
 
 pub use imp::*;
 
+/// One item [`wait_any`] found ready: its index, and whether it is broken (hung up or failed with
+/// nothing left to read: it stays ready, so the caller drops it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ready {
+    pub index: usize,
+    pub broken: bool,
+}
+
 /// A name made safe for a file, a socket or a pipe.
 fn clean(name: &str) -> String {
     name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()

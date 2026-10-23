@@ -532,16 +532,32 @@ fn waitable(events: &platform::handles::Owned) -> Waitable<'_> {
 }
 
 /// Blocks on every source until the returned guard drops; `wake` runs once per wake with what
-/// woke it. It never times out.
+/// woke it. Every ready source is cleared on each wake, so none starves; one that broke (hung up,
+/// failed) is dropped, never spun on. It never times out.
 pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::Result<Reacting> {
     let stop = Arc::new(Signal::new().map_err(io::Error::other)?);
     let stopped = stop.clone();
-    std::thread::Builder::new().name("memory-events".into()).spawn(move || loop {
-        let waitables: Vec<Waitable<'_>> = std::iter::once(stopped.waitable()).chain(sources.iter().map(Source::waitable)).collect();
-        match wait_any(&waitables) {
-            Ok(0) => return,
-            Ok(ready) => wake(sources[ready - 1].clear()),
-            Err(error) => return tracing::warn!("memory: events: {error}"),
+    std::thread::Builder::new().name("memory-events".into()).spawn(move || {
+        let mut live: Vec<&Source> = sources.iter().collect();
+        loop {
+            let waitables: Vec<Waitable<'_>> = std::iter::once(stopped.waitable()).chain(live.iter().map(|source| source.waitable())).collect();
+            let ready = match wait_any(&waitables) {
+                Ok(ready) => ready,
+                Err(error) => return tracing::warn!("memory: events: {error}"),
+            };
+            if ready.iter().any(|ready| ready.index == 0) {
+                return;
+            }
+            let mut woke = vec![];
+            for ready in ready.iter().filter(|ready| !ready.broken) {
+                let what = live[ready.index - 1].clear();
+                if !woke.contains(&what) {
+                    woke.push(what);
+                }
+            }
+            let broken: Vec<usize> = ready.iter().filter(|ready| ready.broken).map(|ready| ready.index - 1).collect();
+            live = live.into_iter().enumerate().filter(|(i, _)| !broken.contains(i)).map(|(_, source)| source).collect();
+            woke.into_iter().for_each(&wake);
         }
     })?;
     Ok(Reacting(stop))
