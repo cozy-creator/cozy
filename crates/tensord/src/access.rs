@@ -115,18 +115,37 @@ impl Fetch {
     }
 
     /// Want each of `selected`'s (header, components) components next, before the call's
-    /// executor reads them, in Runtime's Start-pass order: the smallest component first. Held
-    /// until the call ends.
-    pub fn ahead(&self, selected: &[(String, Vec<String>)]) -> io::Result<()> {
+    /// executor reads them, in Runtime's Start-pass order: the smallest component first; then
+    /// `later`'s (its on-demand models, built when a stage first uses one) the same way, right
+    /// behind them. Held until the call ends. Its run's progress waits on `selected` only.
+    pub fn ahead(&self, selected: &[(String, Vec<String>)], later: &[(String, Vec<String>)]) -> io::Result<()> {
+        let mut wanted = self.components(selected, true)?;
+        // A model the call may never read must not cost it the ones it reads first.
+        let mut behind = self.components(later, false).unwrap_or_else(|error| {
+            tracing::warn!("its on-demand models' early fetch: {error}");
+            vec![]
+        });
+        wanted.sort_by_key(|(bytes, ..)| *bytes);
+        behind.sort_by_key(|(bytes, ..)| *bytes);
+        let mut kept = self.kept.lock().unwrap();
+        for (rank, (_, remote, objects)) in wanted.into_iter().chain(behind).enumerate() {
+            kept.push(self.machine.want(&remote, objects, priority::next(self.order, rank as u32)).map_err(failed)?);
+        }
+        Ok(())
+    }
+
+    /// Each component of `selected` (header, components) from a Hub: its bytes, origin and
+    /// chunks, its checkpoint held until the call ends. With `metered`, what is absent now is
+    /// what its run waits on (`meter`), under the repository it came from.
+    fn components(&self, selected: &[(String, Vec<String>)], metered: bool) -> io::Result<Vec<(u64, Remote, Vec<ObjectRef>)>> {
         let mut wanted = vec![];
         for (header, components) in selected {
             let checkpoint = checkpoint(self.store(), header)?;
             let Some(remote) = self.source(checkpoint.id())? else {
                 continue;
             };
-            // What is absent now is what its run waits on (`meter`), under the repository it came
-            // from; a checkpoint known whole is looked at no more.
-            let objects = match components.is_empty() || whole(self.store(), header, components) {
+            // A checkpoint known whole is looked at no more.
+            let objects = match !metered || components.is_empty() || whole(self.store(), header, components) {
                 true => vec![],
                 false => storage::chunks(&checkpoint, components),
             };
@@ -142,12 +161,7 @@ impl Fetch {
             }
             self.held.lock().unwrap().push(checkpoint);
         }
-        wanted.sort_by_key(|(bytes, ..)| *bytes);
-        let mut kept = self.kept.lock().unwrap();
-        for (rank, (_, remote, objects)) in wanted.into_iter().enumerate() {
-            kept.push(self.machine.want(&remote, objects, priority::next(self.order, rank as u32)).map_err(failed)?);
-        }
-        Ok(())
+        Ok(wanted)
     }
 
     /// Want `components` of each of `selected` (header, components) behind everything, held

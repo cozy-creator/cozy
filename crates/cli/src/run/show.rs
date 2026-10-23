@@ -115,6 +115,8 @@ struct Execution {
     executor: Option<Legs>,
     /// Its construction's preparation (qualifying, constructing, registering its models).
     construction: Option<Legs>,
+    /// Each on-demand model's build, by slot, made inside the stage that first used it.
+    on_demand: BTreeMap<String, Legs>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -412,17 +414,21 @@ fn stage_rows(measured: &Measured) -> Vec<Vec<String>> {
     // Each row by its start, and the times it covers: a stage met twice covers its first and
     // its last occurrence; those between are counted, not placed.
     let (mut rows, mut covers, mut unplaced) = (vec![], vec![], 0.0);
-    for (name, legs) in [
-        ("executor start", &execution.executor),
-        ("construction", &execution.construction),
-    ] {
+    let built = execution
+        .on_demand
+        .iter()
+        .map(|(slot, legs)| (format!("loading {slot}"), Some(legs)));
+    let prepared = [
+        ("executor start".to_string(), execution.executor.as_ref()),
+        ("construction".to_string(), execution.construction.as_ref()),
+    ];
+    for (name, legs) in prepared.into_iter().chain(built) {
         if let Some((legs, span)) = legs
-            .as_ref()
             .and_then(|l| Some((l, l.span()?)))
             .filter(|(_, s)| inside(*s))
         {
             covers.push(span);
-            let row = vec![name.into(), duration(span.1 - span.0), legs.longest()];
+            let row = vec![name, duration(span.1 - span.0), legs.longest()];
             rows.push((span.0, row));
         }
     }
