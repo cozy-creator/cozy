@@ -1,8 +1,12 @@
-//! The order `make_room` takes bytes in, pure (no device, clock, I/O or thread): pages of sets
-//! no open plan uses (least recently used first), then caches nobody holds (least recently
-//! used first), then the plans' own pages, furthest next use first (Belady). Never a pinned or
+//! The order `make_room` takes bytes in, pure (no device, clock, I/O or thread): other sets'
+//! idle pages (those no open plan uses, least recently used first; then those a later step uses,
+//! furthest first); then the current step's own pages and caches nobody holds together, furthest
+//! next use first (Belady), a cache's next use its components' (none: furthest). A tie goes to
+//! the page: it refills from the page cache, a graph recaptures far slower. Never a pinned or
 //! filling page; a page whose release event is pending is taken once it completes. Also what an
 //! ask gives back, what prefetch maps, and admission ([`fits`]) and placement ([`place`]).
+
+use std::cmp::Reverse;
 
 use crate::table::{Key, Table, SLOTS};
 
@@ -15,6 +19,13 @@ pub enum Victim {
     Cache { id: u32, bytes: u64 },
 }
 
+/// A next use, furthest first: none at all, then the most steps, passes, blocks ahead.
+type Far = Reverse<(bool, Option<(u32, u32, u32)>)>;
+
+fn far(d: Option<(u32, u32, u32)>) -> Far {
+    Reverse((d.is_none(), d))
+}
+
 /// Everything `make_room` may take, in its order; `keep` (the pages being bound) never.
 pub fn victims(t: &Table, keep: &[Key]) -> Vec<Victim> {
     #[cfg(feature = "faults")]
@@ -23,14 +34,21 @@ pub fn victims(t: &Table, keep: &[Key]) -> Vec<Victim> {
     let page = |(key, p): (Key, &crate::table::Page)| Victim::Page { key, bytes: p.bytes, releasing: !p.releasing.is_empty() };
     let mut idle: Vec<(Key, &crate::table::Page)> = pages().filter(|(k, _)| t.distance(*k).is_none()).collect();
     idle.sort_by_key(|(k, p)| (p.last_use, *k));
-    let mut caches: Vec<&crate::table::Cache> = t.caches.iter().filter(|c| c.bytes > 0 && !c.held()).collect();
-    caches.sort_by_key(|c| (c.last_use, c.id));
-    let mut planned: Vec<((u32, u32, u32), Key, &crate::table::Page)> = pages().filter_map(|(k, p)| t.distance(k).map(|d| (d, k, p))).collect();
-    planned.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut later: Vec<((u32, u32, u32), Key, &crate::table::Page)> = pages().filter_map(|(k, p)| t.distance(k).filter(|d| d.0 > 0).map(|d| (d, k, p))).collect();
+    later.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    // The current step's pages and the caches, by (next use, a page before a cache, the oldest).
+    let mut own: Vec<((Far, bool, u64, Key), Victim)> = pages()
+        .filter_map(|(k, p)| t.distance(k).filter(|d| d.0 == 0).map(|d| ((far(Some(d)), false, 0, k), page((k, p)))))
+        .chain(t.caches.iter().filter(|c| c.bytes > 0 && !c.held()).map(|c| {
+            let next = c.sets.iter().filter_map(|s| t.distance((*s, 0))).min();
+            ((far(next), true, c.last_use, (c.id, 0)), Victim::Cache { id: c.id, bytes: c.bytes })
+        }))
+        .collect();
+    own.sort_by_key(|(rank, _)| *rank);
     idle.into_iter()
+        .chain(later.into_iter().map(|(_, k, p)| (k, p)))
         .map(page)
-        .chain(caches.into_iter().map(|c| Victim::Cache { id: c.id, bytes: c.bytes }))
-        .chain(planned.into_iter().map(|(_, k, p)| page((k, p))))
+        .chain(own.into_iter().map(|(_, v)| v))
         .collect()
 }
 

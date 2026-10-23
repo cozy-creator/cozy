@@ -890,7 +890,8 @@ impl Memory {
 
     /// Registers a set and brings it to `level`; a set loaded again is re-levelled in place. On
     /// every start, first or restart, its pages kept under its fingerprint are imported, and
-    /// the rest fill from the store, through the page cache.
+    /// the rest fill from the store, through the page cache. A GPU load with no request open
+    /// returns with its pages custody's ([`Memory::settle`]).
     pub fn load(&self, set: SetSpec, level: Level) -> Result<SetId> {
         self.inner.guard(|| self.inner.load(set, level))
     }
@@ -909,17 +910,20 @@ impl Memory {
     }
 
     /// Registers bytes the caller holds (torch tensors) that `shrink(want) -> freed` gives back:
-    /// `make_room` takes caches nobody holds after other sets' idle pages, least recently used
-    /// first (never inside the allocator: its shrink frees through it). A cache whose `owner`
-    /// is a request id ends with that request.
-    pub fn cache(&self, owner: &str, shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
+    /// `make_room` takes a cache nobody holds after other sets' idle pages, ranked with the
+    /// current step's pages by next use, its components' (`sets`: a graph pool names its
+    /// component; none, no declared use), a page before it on a tie (never inside the
+    /// allocator: its shrink frees through it). A cache whose `owner` is a request id ends with
+    /// that request.
+    pub fn cache(&self, owner: &str, sets: &[SetId], shrink: impl Fn(u64) -> u64 + Send + Sync + 'static) -> CacheId {
         let shrink: Shrink = Arc::new(shrink);
         self.inner
             .guard(|| {
                 let mut st = self.inner.lock();
                 let id = st.tick() as u32;
                 let last_use = st.clock;
-                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), last_use, ..Default::default() });
+                let sets = sets.iter().map(|s| s.0).collect();
+                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), sets, last_use, ..Default::default() });
                 st.shrinks.insert(id, shrink);
                 self.inner.unlock(st);
                 Ok(CacheId(id))
@@ -1096,9 +1100,7 @@ impl Memory {
     /// pages are custody's (a planned handover), and a dropped Memory's row is gone when the drop
     /// returns.
     pub fn settle(&self) {
-        self.inner.hand_over();
-        self.inner.mech.settle();
-        self.inner.to_custody.settle();
+        self.inner.settle();
     }
 
     /// The record of the request that ended last.
@@ -1240,6 +1242,13 @@ impl Inner {
             }
             self.keep(st, key);
         }
+    }
+
+    /// [`Memory::settle`].
+    fn settle(&self) {
+        self.hand_over();
+        self.mech.settle();
+        self.to_custody.settle();
     }
 
     /// A planned handover ([`Memory::settle`]): every Keep due so far is queued. A due page
@@ -2303,7 +2312,14 @@ impl Inner {
                 while st.table.pages().any(|(k, p)| k.0 == id && p.filling) || st.homes.iter().any(|(k, h)| k.0 == id && h.landing) {
                     self.wait(&mut st)?;
                 }
+                let idle = st.table.requests.is_empty();
                 self.unlock(st);
+                // Warm-phase work, off any request's path: an idle load returns once its copies
+                // landed and its pages are custody's, safe from a crash at once. Inside a request
+                // its pages are kept when the last request ends.
+                if idle {
+                    self.settle();
+                }
             }
         }
         Ok(SetId(id))
