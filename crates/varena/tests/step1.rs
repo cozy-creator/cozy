@@ -333,6 +333,39 @@ fn a_streaming_sets_room_takes_its_run_pages_before_its_own_graph() {
     assert_eq!((last, shrunk, first), (Ok(()), 0, false), "(block 3 bound, graph bytes shrunk, block 0 resident)");
 }
 
+/// Native a_bind_on_a_full_card_takes_idle_pages (S5's step-3 check on 581769ea8): an idle set
+/// loaded with no request open is custody's at once; a card then full of it and of foreign
+/// bytes still gives a bind its room, the kept page withdrawn and taken; then exhausted; then
+/// served once room returns.
+#[test]
+fn a_bind_on_a_full_card_withdraws_and_takes_a_kept_idle_page() {
+    assert!(varena::os::namespace(&format!("st1{}-", std::process::id())));
+    let uuid = format!("st1keptfull-{}", std::process::id());
+    let card = Card::new(4 * P);
+    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * P };
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let mem = Arc::new(Memory::open(g, None, Box::new(Driver(card.clone()))).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem.load(spec(dir.path(), &uuid, "m", 2), Level::Ram).unwrap();
+    mem.load(spec(dir.path(), &uuid, "idle", 1), Level::Gpu).unwrap();
+    let r = mem.request("r", plan(&[&["m"]])).unwrap();
+    let pass = r.pass(m, "k").unwrap();
+    // Everything else on the card is foreign.
+    let foreign = card.free();
+    assert!(card.take(foreign));
+    let first = mem.bind(m, 0, 0).map_err(|e| e.to_string());
+    let second = mem.bind(m, 1, 0).map(drop).map_err(|e| e.code());
+    card.used.fetch_sub(foreign, Ordering::SeqCst);
+    let third = mem.bind(m, 1, 0).map(drop).map_err(|e| e.code());
+    let first = first.map(drop);
+    pass.end(0);
+    let stats = r.end();
+    close(&uuid, mem);
+    assert!(first.is_ok(), "the kept idle page makes room: {first:?}");
+    assert_eq!((second, third), (Err("EXHAUSTED"), Ok(())), "then nothing is left; then room came back");
+    assert!(stats.evicted.iter().sum::<u64>() >= P, "{stats:?}");
+}
+
 /// The bytes make_room freed are nobody's: another thread's bind maps into them before the
 /// hook's segment, which the driver then refuses, though an idle page was left to take.
 #[test]

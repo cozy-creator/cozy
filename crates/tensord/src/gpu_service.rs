@@ -441,7 +441,7 @@ struct Session {
     executor: DeviceExecutor,
     /// When it last came back idle: idle executors end least recently used first.
     used: Instant,
-    /// This executor in host RAM and the layouts it may adopt.
+    /// How this executor was launched (fork or spawn) and its start's timings.
     launch: Launch,
     /// It has served a call: its next one is not its first.
     invoked: bool,

@@ -1,4 +1,4 @@
-//! Sealed shared memory for weight layouts and the plane's host tier: a Linux memfd with file
+//! Sealed shared memory for weight layouts and host pages: a Linux memfd with file
 //! seals, handed between processes by descriptor and claimed region by region with
 //! open-file-description locks. macOS has neither memfd nor seals; the Apple tier (AP) designs its
 //! own, and until then every call answers `Unsupported`.
@@ -18,7 +18,7 @@ const SEAL_FUTURE_WRITE: i32 = 0x10;
 
 /// What makes a memfd immutable to everyone else: no write, resize, punch or unsealing.
 /// Future-write (Linux 5.1) refuses new writable mappings and writes; the filler's own mapping
-/// may finish (TensorFS's host tier).
+/// may finish.
 pub const FULL_SEALS: i32 = SEAL_SEAL | SEAL_SHRINK | SEAL_GROW | SEAL_FUTURE_WRITE;
 /// What an adopter of a sealed memfd requires besides one of [`WRITE_SEALS`].
 pub const RESIZE_SEALS: i32 = SEAL_SEAL | SEAL_SHRINK | SEAL_GROW;
