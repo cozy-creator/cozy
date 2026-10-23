@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 use crate::stop::Stop as Cancel;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
 /// The most text one package log line keeps.

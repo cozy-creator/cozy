@@ -303,7 +303,7 @@ pub(super) fn keep_sigchld() -> io::Result<()> {
         extern "C" fn noted(_: libc::c_int) {}
         // SAFETY: sigaction is plain old data; all-zero is a valid value.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = noted as usize;
+        action.sa_sigaction = noted as extern "C" fn(libc::c_int) as usize;
         // SAFETY: a handler that does nothing is async-signal-safe; `action` outlives the call.
         if unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) } != 0 {
             return Err(io::Error::last_os_error());
