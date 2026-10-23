@@ -347,9 +347,34 @@ impl Drop for Owner {
     }
 }
 
-/// One process's memory on one device.
+/// One process's memory on one device. A clone is another public handle on it.
 pub struct Memory {
     inner: Owner,
+}
+
+impl Clone for Memory {
+    fn clone(&self) -> Memory {
+        Memory { inner: Arc::clone(&*self.inner).into() }
+    }
+}
+
+/// region.rs's hooks: events on the device's streams, and its granularity.
+impl Memory {
+    pub(crate) fn record_event(&self, stream: usize) -> Result<Event> {
+        self.inner.backend.record(stream)
+    }
+
+    pub(crate) fn finish_event(&self, event: Event) -> Result<()> {
+        self.inner.backend.finish(event)
+    }
+
+    pub(crate) fn retire_event(&self, event: Event) {
+        self.inner.backend.retire(event)
+    }
+
+    pub(crate) fn granularity(&self) -> u64 {
+        self.inner.backend.granularity()
+    }
 }
 
 /// A request in flight; dropping it ends it: its pins and its caches go, and the leftover is
