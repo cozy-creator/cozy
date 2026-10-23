@@ -438,6 +438,8 @@ impl Manager {
                     let out = match message {
                         ToManager::Ask { id: ask, bytes, kind, region } => self.ask(id, Waiting { id: ask, bytes, kind, region }),
                         ToManager::Answered => self.answered(id),
+                        // The policy builder's: Exec.regions, ranked in decide.
+                        ToManager::Region(_) | ToManager::RegionGone { .. } => Out::default(),
                         ToManager::Hello { .. } => Out::default(),
                     };
                     self.emit(out);

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[cfg(unix)]
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use crossbeam_channel::{select_biased, unbounded, Receiver, Sender};
@@ -347,9 +347,116 @@ impl Drop for Owner {
     }
 }
 
-/// One process's memory on one device.
+/// One process's memory on one device. A clone is another public handle on it.
 pub struct Memory {
     inner: Owner,
+    /// Memory handles (clones): the last one's drop closes it.
+    handles: Arc<AtomicUsize>,
+}
+
+impl Clone for Memory {
+    fn clone(&self) -> Memory {
+        self.handles.fetch_add(1, Ordering::AcqRel);
+        Memory { inner: Arc::clone(&*self.inner).into(), handles: self.handles.clone() }
+    }
+}
+
+/// region.rs's hooks: the device's events, its free bytes, the manager's figures, and the plan.
+impl Memory {
+    pub(crate) fn record_event(&self, stream: usize) -> Result<Event> {
+        self.inner.backend.record(stream)
+    }
+
+    pub(crate) fn finish_event(&self, event: Event) -> Result<()> {
+        self.inner.backend.finish(event)
+    }
+
+    pub(crate) fn retire_event(&self, event: Event) {
+        self.inner.backend.retire(event)
+    }
+
+    pub(crate) fn synchronize(&self, stream: usize) -> Result<()> {
+        self.inner.backend.synchronize(stream)
+    }
+
+    pub(crate) fn granularity(&self) -> u64 {
+        self.inner.backend.granularity()
+    }
+
+    /// With no manager: the device's free bytes less H, the display's headroom.
+    pub(crate) fn standalone_free(&self) -> u64 {
+        let b = &self.inner.backend;
+        b.free().unwrap_or(0).saturating_sub(crate::table::headroom(b.capacity()))
+    }
+
+    /// The device's torch allocator, if anything allocated through it yet.
+    pub(crate) fn torch_if(&self) -> Option<Arc<crate::arena::Torch>> {
+        self.inner.torch.get().cloned()
+    }
+
+    /// The same device memory: two handles of one open.
+    pub(crate) fn same(&self, other: &Memory) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The manager's figures for this executor, while its pages are leased.
+    pub(crate) fn figures(&self) -> Option<crate::lease::Figures> {
+        #[cfg(unix)]
+        return self.inner.lease.get().map(|a| a.table().figures());
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Plan step `step`'s sets (each open request's current step when `None`): this process's
+    /// mapped bytes in them, its idle mapped bytes outside them, and their largest block.
+    pub(crate) fn step_bytes(&self, step: Option<u32>) -> (u64, u64, u64) {
+        let st = self.inner.state.lock();
+        let sets: BTreeSet<u32> = st.table.requests.iter().filter_map(|r| r.steps.get(step.unwrap_or(r.cursor.step) as usize)).flat_map(|(s, _)| s.iter().copied()).collect();
+        let (mut warm, mut cold, mut largest) = (0, 0, 0);
+        for ((set, _), p) in st.table.pages() {
+            if sets.contains(&set) {
+                largest = largest.max(p.bytes);
+                warm += if p.mapped { p.bytes } else { 0 };
+            } else if p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.filling {
+                cold += p.bytes;
+            }
+        }
+        (warm, cold, largest)
+    }
+
+    /// A region's facts to the lease manager (`None`: it is gone), while leased.
+    pub(crate) fn region_facts(&self, id: u64, record: Option<&crate::region::Record>) {
+        #[cfg(unix)]
+        if let Some(agent) = self.inner.lease.get() {
+            let sent = match record {
+                Some(r) => agent.region(crate::lease::wire::RegionFacts { id, kind: r.kind, slots: r.slots.clone(), cost_ns: r.cost_ns, last_use: r.last_use, next_use: r.next_use.map_or(u64::MAX, u64::from) }),
+                None => agent.region_gone(id),
+            };
+            if let Err(e) = sent {
+                tracing::debug!("varena: region {id}'s facts did not reach the lease manager: {e}");
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (id, record);
+    }
+
+    /// The lease slots of `sets`' leased pages.
+    pub(crate) fn lease_slots(&self, sets: &[SetId]) -> Vec<u32> {
+        #[cfg(unix)]
+        return self.inner.leased.lock().values().filter(|(_, key, _)| sets.iter().any(|s| s.0 == key.0)).map(|(t, ..)| t.slot).collect();
+        #[cfg(not(unix))]
+        {
+            let _ = sets;
+            Vec::new()
+        }
+    }
+
+    /// Every block of `set`.
+    pub(crate) fn blocks(&self, set: SetId) -> Result<Vec<u32>> {
+        let st = self.inner.state.lock();
+        let n = st.table.sets.get(set.0 as usize).and_then(|s| s.as_ref()).map(|s| s.pages.len()).ok_or_else(|| Error::Closed(format!("set {}", set.0)))?;
+        Ok((0..n as u32).collect())
+    }
 }
 
 /// A request in flight; dropping it ends it: its pins and its caches go, and the leftover is
@@ -507,6 +614,9 @@ enum Mech {
     /// The lease manager asked pages back: the quiet ones go, the busy ones once idle.
     #[cfg(unix)]
     Revoke,
+    /// The lease manager reclaims a region whole (crate::region).
+    #[cfg(unix)]
+    Reclaim { region: u64, swap: bool },
 }
 
 struct Active {
@@ -945,7 +1055,7 @@ impl Memory {
             let mut st = inner.lock();
             inner.publish(&mut st);
             inner.unlock(st);
-            Ok(Memory { inner: inner.into() })
+            Ok(Memory { inner: inner.into(), handles: Arc::new(AtomicUsize::new(1)) })
         })
     }
 
@@ -977,6 +1087,10 @@ impl Memory {
         };
         match crate::lease::Agent::attach(stream, self.inner.backend.clone(), revoked)? {
             crate::lease::Attach::Leased(agent) => {
+                let mech = self.inner.mech.clone();
+                agent.on_reclaim(Box::new(move |region, swap| {
+                    mech.post(Mech::Reclaim { region, swap }, 0);
+                }))?;
                 if self.inner.lease.set(agent).is_err() {
                     return Err(Error::Invalid("this Memory is leased already".into()));
                 }
@@ -3157,6 +3271,9 @@ impl Drop for Memory {
     /// Final physical retirement is transferred by Owner, so a Python/DLPack destructor never
     /// waits for a CUDA consumer or a host callback.
     fn drop(&mut self) {
+        if self.handles.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
         self.inner.burst.0.lock().closed = true;
         self.inner.burst.1.notify_all();
         self.inner.landed.notify_all();
@@ -3263,7 +3380,7 @@ impl Drop for Inner {
                 Mech::Release(va) => self.backend.release(va),
                 Mech::Map { .. } | Mech::Adopt { .. } | Mech::Keep { .. } => {}
                 #[cfg(unix)]
-                Mech::Revoke => {}
+                Mech::Revoke | Mech::Reclaim { .. } => {}
             }
         }
         let mut st = self.state.lock();
@@ -3590,6 +3707,12 @@ impl Inner {
             Mech::Map { key, gen, va, off, span, job, speculative, decided } => self.place_page(key, gen, va, off, span, job, (!speculative).then_some(decided)),
             #[cfg(unix)]
             Mech::Revoke => self.revoke(),
+            #[cfg(unix)]
+            Mech::Reclaim { region, swap } => {
+                if let Err(e) = crate::region::reclaim(region, swap) {
+                    tracing::warn!("varena: reclaiming region {region}: {e}");
+                }
+            }
             Mech::Renew { key, gen, va, off, span, old, after, job } => {
                 // Its consumers finish before the unmap: this thread waits for their events.
                 let released = after.iter().try_for_each(|e| self.backend.finish(*e))

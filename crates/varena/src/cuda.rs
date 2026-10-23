@@ -377,6 +377,13 @@ impl Backend for CudaBackend {
         Dst::Device { device: self.ordinal, ptr: va.base + offset, len: len as usize, stream: self.stream.raw() }
     }
 
+    fn copy_in(&self, va: Va, offset: u64, src: &[u8]) -> Result<()> {
+        crate::backend::inside(va, offset, src.len())?;
+        let _ctx = self.primary.enter()?;
+        call!("cuMemcpyHtoDAsync", memcpy_htod_async(va.base + offset, src.as_ptr().cast(), src.len(), self.stream.raw() as CUstream))?;
+        Ok(self.stream.drain()?)
+    }
+
     fn fence(&self) -> Result<Event> {
         self.record(self.stream.raw())
     }
