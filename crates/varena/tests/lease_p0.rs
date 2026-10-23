@@ -160,8 +160,12 @@ mod cases {
 
         fn until_stalled(&mut self, pid: u32) -> Instant {
             let start = Instant::now();
-            while !self.stalled().contains(&pid) {
-                assert!(start.elapsed() < BOUND, "a stalled executor was never named");
+            loop {
+                let named = self.stalled();
+                if named.contains(&pid) {
+                    break;
+                }
+                assert!(start.elapsed() < BOUND, "{pid} was never named stalled; named: {named:?}");
                 std::thread::sleep(Duration::from_millis(10));
             }
             Instant::now()
@@ -699,7 +703,9 @@ mod cases {
         let listener = UnixListener::bind(socket).unwrap();
         let gpu = GpuId { uuid: format!("p0-{}", std::process::id()), model: "host".into(), memory: capacity };
         let admitted = Arc::new(Admitted::default());
-        let open = Box::new(move || Ok(Arc::new(HostBackend::new(capacity)) as Arc<dyn Backend>));
+        // The card is twice the manager's limit (a --gpu-memory-limit): a books error shows in
+        // NVML, not as the device's own out-of-memory.
+        let open = Box::new(move || Ok(Arc::new(HostBackend::new(capacity * 2)) as Arc<dyn Backend>));
         let manager = Manager::create(&gpu, Some(capacity), Mode::Dedicated, open, listener, admitted.clone()).unwrap();
         varena::os::remove_table(&gpu.uuid);
         serve(Some("ready"), |words| match words {
