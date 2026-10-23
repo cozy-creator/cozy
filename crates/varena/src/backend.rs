@@ -190,6 +190,9 @@ impl Backend for HostBackend {
             return Err(Error::Device { op: "create", code: OUT_OF_MEMORY, name: "out of memory".into() });
         }
         let page = memory::page(len).map_err(page_err)?;
+        // A holder's ftruncate must never SIGBUS another mapper (a lease's adopter).
+        #[cfg(target_os = "linux")]
+        platform::shm::seal_with(std::os::fd::AsFd::as_fd(&page), platform::shm::RESIZE_SEALS).map_err(page_err)?;
         Ok(pages.insert(page, len, len))
     }
 

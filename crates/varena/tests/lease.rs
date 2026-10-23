@@ -111,9 +111,18 @@ mod cases {
     fn grant_maps_and_writes(dir: &Path) {
         let host = host(dir, "grant", 256 * MIB);
         let mut a = Agentd::start(&host);
-        assert_eq!(a.call(&format!("take {} {}", 80 * MIB, region(1))), "ok 3 fresh verified");
+        assert_eq!(a.call(&format!("take {} {}", 80 * MIB, region(1))), "ok 1 fresh verified");
         let h = until(&host, |h| h.leased == 80 * MIB);
         assert_eq!((h.created, h.retained, h.executors.len()), (80 * MIB, 0, 1));
+    }
+
+    /// A weights region leases as one chunk sized to its page, however big (§3): never split.
+    fn a_weights_page_is_one_chunk_however_big(dir: &Path) {
+        let host = host(dir, "big", 512 * MIB);
+        let mut a = Agentd::start(&host);
+        assert_eq!(a.call(&format!("take {} {}", 400 * MIB, region(1))), "ok 1 fresh verified");
+        let h = until(&host, |h| h.leased == 400 * MIB);
+        assert_eq!(h.created_chunks, 1, "{h:?}");
     }
 
     /// A running pass pins its chunks and asks for more: when only its own pins could give the
@@ -121,7 +130,7 @@ mod cases {
     fn an_ask_against_its_own_pins_is_refused(dir: &Path) {
         let host = host(dir, "own", 64 * MIB);
         let mut a = Agentd::start(&host);
-        assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 2 fresh verified");
+        assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 1 fresh verified");
         assert_eq!(a.call("pin"), "ok");
         assert!(a.call(&format!("take {} {}", 32 * MIB, region(2))).starts_with("refused"));
         assert_eq!(host.manager.holdings().leased, 64 * MIB);
@@ -130,19 +139,19 @@ mod cases {
     fn an_unpinned_lease_is_revoked_for_another(dir: &Path) {
         let host = host(dir, "revoke", 128 * MIB);
         let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
-        assert_eq!(a.call(&format!("take {} {}", 96 * MIB, region(1))), "ok 3 fresh verified");
+        assert_eq!(a.call(&format!("take {} {}", 96 * MIB, region(1))), "ok 1 fresh verified");
         b.send(&format!("take {} {}", 64 * MIB, region(2)));
         a.wait_rang();
-        // 32 MiB were free: one chunk of A's is asked back.
+        // 32 MiB were free: A's one chunk is asked back.
         assert_eq!(a.call("revokes"), "released 1");
-        assert_eq!(b.answer(), "ok 2 fresh verified");
-        until(&host, |h| h.leased == 128 * MIB && h.created == 128 * MIB);
+        assert_eq!(b.answer(), "ok 1 fresh verified");
+        until(&host, |h| h.leased == 64 * MIB && h.created == 64 * MIB);
     }
 
     fn a_revoke_waits_for_the_pin(dir: &Path) {
         let host = host(dir, "pin", 128 * MIB);
         let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
-        assert_eq!(a.call(&format!("take {} {}", 96 * MIB, region(1))), "ok 3 fresh verified");
+        assert_eq!(a.call(&format!("take {} {}", 96 * MIB, region(1))), "ok 1 fresh verified");
         b.send(&format!("take {} {}", 64 * MIB, region(2)));
         a.wait_rang();
         // Pinned after the ask went out: the agent's CAS refuses the revoke, the asker waits.
@@ -151,7 +160,7 @@ mod cases {
         assert_eq!(host.manager.holdings().leased, 96 * MIB);
         assert_eq!(a.call("unpin"), "ok");
         assert_eq!(a.call("revokes"), "released 1");
-        assert_eq!(b.answer(), "ok 2 fresh verified");
+        assert_eq!(b.answer(), "ok 1 fresh verified");
     }
 
     /// Only another executor's pinned chunks could give the room: they are asked, and the ask
@@ -159,7 +168,7 @@ mod cases {
     fn an_ask_waits_for_anothers_pins(dir: &Path) {
         let host = host(dir, "others", 64 * MIB);
         let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
-        assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 2 fresh verified");
+        assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 1 fresh verified");
         assert_eq!(a.call("pin"), "ok");
         b.send(&format!("take {} {}", 32 * MIB, region(2)));
         a.wait_rang();
@@ -174,8 +183,8 @@ mod cases {
     fn a_wait_cycle_is_refused(dir: &Path) {
         let host = host(dir, "cycle", 128 * MIB);
         let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
-        assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 2 fresh verified");
-        assert_eq!(b.call(&format!("take {} {}", 64 * MIB, region(2))), "ok 2 fresh verified");
+        assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 1 fresh verified");
+        assert_eq!(b.call(&format!("take {} {}", 64 * MIB, region(2))), "ok 1 fresh verified");
         assert_eq!(a.call("pin"), "ok");
         assert_eq!(b.call("pin"), "ok");
         a.send(&format!("take {} {}", 32 * MIB, region(3)));
@@ -186,16 +195,24 @@ mod cases {
         assert_eq!(a.answer(), "ok 1 fresh verified");
     }
 
-    /// Stall verdicts come only from the look's cadence: any number of back-to-back reads names
-    /// no healthy executor; one that never answers its asks is named after enough looks.
+    /// Stall verdicts come only from the look's cadence and measured progress: back-to-back
+    /// reads name nobody; an agent whose GPU work keeps completing (its revoke behind a long
+    /// kernel's fence) is never named; one with neither a release nor GPU progress is.
     fn stalls_are_judged_on_the_looks_cadence(dir: &Path) {
         let host = host(dir, "stall", 128 * MIB);
         let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
-        assert_eq!(a.call(&format!("take {} {}", 96 * MIB, region(1))), "ok 3 fresh verified");
+        assert_eq!(a.call(&format!("take {} {}", 96 * MIB, region(1))), "ok 1 fresh verified");
         b.send(&format!("take {} {}", 64 * MIB, region(2)));
         a.wait_rang();
         for _ in 0..10_000 {
             assert!(host.manager.stalled().is_empty(), "a healthy agent named between looks");
+        }
+        // Eight looks' worth of a long fence: its GPU work keeps completing.
+        let fenced = Instant::now();
+        while fenced.elapsed() < Duration::from_secs(4) {
+            assert_eq!(a.call("tick"), "ok");
+            assert!(host.manager.stalled().is_empty(), "an agent whose GPU work moves was named");
+            std::thread::sleep(Duration::from_millis(100));
         }
         let start = Instant::now();
         while !host.manager.stalled().contains(&a.child.id()) {
@@ -203,7 +220,7 @@ mod cases {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(a.call("revokes"), "released 1");
-        assert_eq!(b.answer(), "ok 2 fresh verified");
+        assert_eq!(b.answer(), "ok 1 fresh verified");
         let start = Instant::now();
         while !host.manager.stalled().is_empty() {
             assert!(start.elapsed() < Duration::from_secs(20), "a release clears the verdict");
@@ -214,14 +231,14 @@ mod cases {
     fn a_killed_agents_leases_return_and_landed_weights_are_adopted(dir: &Path) {
         let host = host(dir, "kill", 256 * MIB);
         let mut a = Agentd::start(&host);
-        assert_eq!(a.call(&format!("take {} {}", 80 * MIB, region(7))), "ok 3 fresh verified");
+        assert_eq!(a.call(&format!("take {} {}", 80 * MIB, region(7))), "ok 1 fresh verified");
         assert_eq!(a.call(&format!("take {} {} unlanded", 16 * MIB, region(8))), "ok 1 fresh verified");
         a.kill();
         // Its landed region is retained; the region whose fill never landed is destroyed.
         let h = until(&host, |h| h.executors.is_empty());
         assert_eq!((h.leased, h.retained, h.created), (0, 80 * MIB, 80 * MIB));
         let mut c = Agentd::start(&host);
-        assert_eq!(c.call(&format!("take {} {}", 80 * MIB, region(7))), "ok 3 adopted verified");
+        assert_eq!(c.call(&format!("take {} {}", 80 * MIB, region(7))), "ok 1 adopted verified");
         let h = until(&host, |h| h.leased == 80 * MIB);
         assert_eq!((h.retained, h.created), (0, 80 * MIB), "adopted with no new chunk");
     }
@@ -237,6 +254,7 @@ mod cases {
         type Case = (&'static str, fn(&Path));
         let cases: Vec<Case> = vec![
             ("grant_maps_and_writes", grant_maps_and_writes),
+            ("a_weights_page_is_one_chunk_however_big", a_weights_page_is_one_chunk_however_big),
             ("an_unpinned_lease_is_revoked_for_another", an_unpinned_lease_is_revoked_for_another),
             ("a_revoke_waits_for_the_pin", a_revoke_waits_for_the_pin),
             ("an_ask_waits_for_anothers_pins", an_ask_waits_for_anothers_pins),
@@ -356,6 +374,10 @@ mod cases {
                     "ok".into()
                 }
                 ["rang"] => rang.load(SeqCst).to_string(),
+                ["tick"] => {
+                    agent.as_ref().unwrap().progressed();
+                    "ok".into()
+                }
                 ["revokes"] => {
                     let a = agent.as_ref().unwrap();
                     let mut released = 0;

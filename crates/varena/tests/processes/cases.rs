@@ -59,6 +59,8 @@ pub fn main() {
     // The kernel's list of sockets and stopped threads are Linux's.
     #[cfg(target_os = "linux")]
     cases.extend([
+        ("weights_by_lease_return_on_kill_and_are_adopted", weights_by_lease_return_on_kill_and_are_adopted as fn(&Path)),
+        ("a_refill_in_place_is_never_adopted_under_its_old_identity", a_refill_in_place_is_never_adopted_under_its_old_identity),
         ("an_ask_to_a_stopped_victim_ends_when_it_dies", an_ask_to_a_stopped_victim_ends_when_it_dies as fn(&Path)),
         ("an_unmeasured_request_asks_peers_for_pages_never_caches", an_unmeasured_request_asks_peers_for_pages_never_caches),
         ("a_joiners_limit_leaves_its_peers_room", a_joiners_limit_leaves_its_peers_room),
@@ -308,7 +310,7 @@ fn agent() {
             ["end", req] => {
                 passes.remove(*req);
                 let s = requests.remove(*req).unwrap().end();
-                format!("ok leftover={} kept={} store={} evicted={:?} spec={}", s.leftover, s.moved.kept.bytes, s.moved.store.bytes, s.evicted, s.moved.speculative)
+                format!("ok leftover={} kept={} store={} evicted={:?} spec={} leased={}", s.leftover, s.moved.kept.bytes, s.moved.store.bytes, s.evicted, s.moved.speculative, s.moved.leased.bytes)
             }
             ["limit"] => {
                 let m = mem.as_ref().unwrap();
@@ -318,6 +320,14 @@ fn agent() {
             ["settle"] => {
                 mem.as_ref().unwrap().settle();
                 "ok".into()
+            }
+            #[cfg(target_os = "linux")]
+            ["lease", socket] => {
+                let stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+                match mem.as_ref().unwrap().lease_over(stream).unwrap() {
+                    None => "ok".into(),
+                    Some((code, why)) => format!("refused {code:?} {why}"),
+                }
             }
             ["fault", point] => {
                 varena::faults::arm(if *point == "decide" { varena::faults::Point::Decide } else { varena::faults::Point::Fill });
@@ -490,6 +500,131 @@ fn a_killed_holder_leaves_orphans_a_successor_imports(dir: &Path) {
     c.ok("filled");
     let trace = c.ok("trace r");
     assert!(!trace.contains("Kept"), "{trace}");
+    c.ok("unpin");
+    c.ok("end r");
+    c.exit();
+}
+
+#[cfg(target_os = "linux")]
+struct Leases {
+    gpu: GpuId,
+    socket: PathBuf,
+    manager: Arc<varena::lease::Manager>,
+}
+
+#[cfg(target_os = "linux")]
+impl Leases {
+    /// This process as TensorD: the GPU's manager over host pages, on a socket in `dir`.
+    fn host(dir: &Path, case: &str, capacity: u64) -> Leases {
+        struct Ours;
+        impl varena::lease::Hosting for Ours {
+            fn identify(&self, peer: &platform::handles::Peer) -> Option<varena::lease::Identity> {
+                Some(varena::lease::Identity { executor: peer.pid.to_string(), domain: "test".into() })
+            }
+        }
+        let gpu = gpu(case, capacity);
+        let socket = dir.join("lease.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let open: varena::lease::Opener = Box::new(move || Ok(Arc::new(HostBackend::new(capacity)) as Arc<dyn varena::Backend>));
+        let manager = varena::lease::Manager::create(&gpu, None, varena::ledger::Mode::Dedicated, open, listener, Arc::new(Ours)).unwrap();
+        Leases { gpu, socket, manager }
+    }
+
+    /// A child whose Memory leases its pages, `set` loaded on the GPU and a request `r` open
+    /// with a pass over it.
+    fn agent(&self, set: &str, path: &Path) -> Agent {
+        let mut x = Agent::spawn();
+        x.ok(&format!("open {} {}", self.gpu.uuid, self.gpu.memory));
+        x.ok(&format!("lease {}", self.socket.display()));
+        x.ok(&format!("load {set} {} stored gpu", path.display()));
+        x.ok(&format!("request r {set}"));
+        x.ok(&format!("pass r {set} 1x1"));
+        x
+    }
+
+    fn until(&self, done: &dyn Fn(&varena::lease::Holdings) -> bool) -> varena::lease::Holdings {
+        let start = std::time::Instant::now();
+        loop {
+            let h = self.manager.holdings();
+            if done(&h) {
+                return h;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(20), "the manager never reached it: {h:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+/// Slice 1's bar on CPU (varena-leases §8): two executors' Memories get their weights by lease
+/// from a manager this process hosts; kill -9 one and its leases return once its exit shows, its
+/// landed weights retained; its successor adopts them with no copy and no new chunk.
+#[cfg(target_os = "linux")]
+fn weights_by_lease_return_on_kill_and_are_adopted(dir: &Path) {
+    let leases = Leases::host(dir, "lease", 64 * MB);
+    let (k, j) = (write_set(dir, "k", 4), write_set(dir, "j", 2));
+    let mut a = leases.agent("k", &k);
+    for block in 0..4 {
+        assert_eq!(a.ok(&format!("exact k {block}")), "true", "a's block {block} bit-exact");
+    }
+    a.ok("unpin");
+    assert!(a.ok("end r").contains(&format!("leased={}", 8 * MB)), "a's weights came by lease");
+    let mut b = leases.agent("j", &j);
+    for block in 0..2 {
+        assert_eq!(b.ok(&format!("exact j {block}")), "true", "b's block {block} bit-exact");
+    }
+    b.ok("unpin");
+    b.ok("end r");
+    let a_pid = a.child.id();
+    let h = leases.until(&|h| h.executors.len() == 2 && h.executors.iter().any(|e| e.pid == a_pid && e.landed == 8 * MB));
+    assert_eq!((h.leased, h.created), (12 * MB, 12 * MB), "{h:?}");
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    let h = leases.until(&|h| h.executors.len() == 1);
+    assert_eq!((h.retained, h.leased, h.created), (8 * MB, 4 * MB, 12 * MB), "a's landed weights retained: {h:?}");
+    let mut c = leases.agent("k", &k);
+    for block in 0..4 {
+        assert_eq!(c.ok(&format!("exact k {block}")), "true", "c's adopted block {block} bit-exact");
+    }
+    assert_eq!(c.ok("trace r"), "Kept,Kept,Kept,Kept,Hit,Hit,Hit,Hit", "adopted at load, not copied");
+    c.ok("unpin");
+    let end = c.ok("end r");
+    assert!(end.contains("store=0"), "{end}");
+    let h = leases.until(&|h| h.executors.len() == 2);
+    assert_eq!((h.retained, h.leased, h.created), (0, 12 * MB, 12 * MB), "adopted with no new chunk: {h:?}");
+    b.exit();
+    c.exit();
+}
+
+/// A grant's identity never changes (varena-leases review M-1): a set refilled in place under
+/// another fill identity takes new grants for its pages, so an executor killed after it leaves
+/// nothing an adopter of the first identity could take for its own.
+#[cfg(target_os = "linux")]
+fn a_refill_in_place_is_never_adopted_under_its_old_identity(dir: &Path) {
+    let leases = Leases::host(dir, "refill", 64 * MB);
+    let k = write_set(dir, "k", 4);
+    let mut a = leases.agent("k", &k);
+    for block in 0..4 {
+        assert_eq!(a.ok(&format!("exact k {block}")), "true");
+    }
+    a.ok("unpin");
+    a.ok("end r");
+    // The same set under another fill identity: its pages refill, each under a new grant.
+    a.ok(&format!("load k {} lora-x gpu", k.display()));
+    a.ok("request s k");
+    a.ok("pass s k 1x1");
+    assert_eq!(a.ok("bind k 0"), "true", "fresh: the caller bakes it");
+    a.ok("filled");
+    a.ok("unpin");
+    a.ok("end s");
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    leases.until(&|h| h.executors.is_empty());
+    let mut c = leases.agent("k", &k);
+    for block in 0..4 {
+        assert_eq!(c.ok(&format!("exact k {block}")), "true", "block {block} is the stored weights, never the baked ones");
+    }
+    let trace = c.ok("trace r");
+    assert!(!trace.contains("Kept"), "adopted under its old identity: {trace}");
     c.ok("unpin");
     c.ok("end r");
     c.exit();
