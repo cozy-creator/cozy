@@ -422,10 +422,15 @@ impl Machines {
         if ending && row.state != MachineState::Ended {
             machine.state = MachineState::Ending;
         }
+        let mut held = vec![];
         if let Some(seen) = lock(&self.seen).get(&row.name) {
             machine.status = seen.frame.as_ref().map(|frame| status(frame, &self.hubs));
+            held = seen.frame.as_ref().map(|f| f.runs.clone()).unwrap_or_default();
             machine.unreachable.clone_from(&seen.unreachable);
             machine.boot.clone_from(&seen.boot);
+        }
+        if let Some(status) = &mut machine.status {
+            status.runs = held.into_iter().map(|run| self.held(run)).collect();
         }
         let asked = match row.kind {
             MachineKind::Rental => store.rent_ask(&row.name).map_err(internal)?,
@@ -433,6 +438,17 @@ impl Machines {
         };
         self.hubs.describe(&mut machine, asked.as_ref());
         Ok(machine)
+    }
+
+    /// A run the machine holds for this controller, with this controller's record of it.
+    fn held(&self, run: v1::RunState) -> wire::LiveRun {
+        let row = self.store().run(&run.id).ok().flatten();
+        wire::LiveRun {
+            run: row.and_then(|row| self.calcifer.record(&row).ok()),
+            id: run.id,
+            state: run.state,
+            waiting: run.waiting,
+        }
     }
 
     /// Keeps one `Status` stream open to the machine while it has an endpoint and has not ended.
@@ -1140,7 +1156,7 @@ fn status(frame: &v1::StatusFrame, hubs: &Hubs) -> MachineStatus {
         kernels: frame.kernels.clone(),
         disk_total_bytes: frame.disk.as_ref().map_or(0, |d| d.total_bytes),
         disk_free_bytes: frame.disk.as_ref().map_or(0, |d| d.free_bytes),
-        live_runs: frame.runs.len() as u32,
+        runs: vec![],
         models: frame
             .models
             .iter()

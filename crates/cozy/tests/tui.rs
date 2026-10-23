@@ -212,6 +212,7 @@ fn enter_opens_a_rows_live_view_and_esc_or_q_comes_back() {
 
 /// `cozy run list --on <machine>`: only that machine's runs, live and as JSON, with the other
 /// filters; a machine that ended still lists them, and a machine never known is refused by name.
+/// `cozy machine show` lists the runs the machine holds.
 #[test]
 fn run_list_on_one_machine() {
     let Some(home) = Home::new() else { return };
@@ -233,6 +234,14 @@ fn run_list_on_one_machine() {
     runs.until("its new run, drawn live", |s| row(s, &second) && !row(s, &elsewhere));
     runs.key("q");
     assert!(runs.wait().success());
+
+    // `machine show` lists the runs the machine holds, each by number with what it does there.
+    let shown = home.cozy(["machine", "show", "live", "--once"]);
+    let held = |n: &str| {
+        let line = format!("run {n} ");
+        shown.stdout.lines().any(|l| l.starts_with(&line) && l.contains("fidika/sdxl/generate"))
+    };
+    assert!(held(&first) && held(&second) && !held(&elsewhere), "{shown:?}");
 
     for run in [&first, &second, &elsewhere] {
         home.json(["run", "cancel", run, "--json"]);

@@ -427,21 +427,28 @@ async fn list(
         }),
         None => None,
     };
-    let (rows, older) = store.runs(&RunFilter {
+    let (rows, older, mut unreadable) = store.runs(&RunFilter {
         status: listing.status,
         target: listing.package,
         machine: machine.clone(),
         before: listing.before,
         limit: listing.limit.unwrap_or(50).clamp(1, 1000),
     })?;
-    let runs = rows
-        .iter()
-        .map(|row| api.calcifer.record(row))
-        .collect::<Result<_, _>>()?;
+    let mut runs = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match api.calcifer.record(row) {
+            Ok(run) => runs.push(run),
+            Err(e) => unreadable.push(format!("run {}: {e}", row.number)),
+        }
+    }
+    if let Some(first) = unreadable.first() {
+        warn!("{} runs left out of a list, the first {first}", unreadable.len());
+    }
     Ok(Json(RunList {
         runs,
         older,
         machine,
+        unreadable,
     }))
 }
 
