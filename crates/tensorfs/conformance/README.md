@@ -84,3 +84,7 @@ real ComfyUI files (AX1Y2JP W4A8, Comfy-Org W6A8, Merserk W4A4 of MiniMax-H3). E
 kitchen's own dequantize is within 2.5·10^−3 relative at `BF16` (it rotates back in `L`) and f32 rounding at `F32`.
 Cases kitchen quantized with its defaults carry `source`; those with other options carry `kitchen` (source and
 options), which `tests/encode_comfy.rs` reproduces.
+
+**svdq.** `mine/svdq.py` writes `svdq.nvfp4`'s parts in natural layout and their decode by the spec's formula (checked
+against the same formula in f64). Nunchaku's own swizzled files are covered by `tests/quantized_import.rs`: files
+packed by v1's `svdq_layout.py` packers import to these parts byte for byte and decode to v1's logical weight.

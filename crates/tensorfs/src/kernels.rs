@@ -36,6 +36,9 @@ const _: () = assert!(
         == FAMILIES.len() * (crate::format::decode::gguf::STRUCTS.len() + CORE_KINDS.len()) * 3
 );
 
+/// Schemes whose plans no device core runs: `prepare` gives their values from the host.
+pub const HOST_SCHEMES: [&str; 1] = ["svdq.nvfp4"];
+
 pub enum Prepared<'a> {
     Kernel(Box<Launch<'a>>),
     /// A scheme with a host-only plan: rounded bytes, ready for the engine's host source.
@@ -173,6 +176,14 @@ pub fn prepare<'a>(
         index: vec![0],
         params: [0; 32],
     };
+    // No device core adds a low-rank branch: the host computes its values (`svdq.nvfp4`).
+    let plan = match matches!(plan.post, Post::LowRank { .. }) {
+        true => Plan {
+            core: Core::Values(plan.values(g.rows, g.cols, g.height)?),
+            post: Post::None,
+        },
+        false => plan,
+    };
     launch.params[..7].copy_from_slice(&[
         total,
         g.rows as u64,
@@ -192,6 +203,7 @@ pub fn prepare<'a>(
             launch.params[27] = 2;
             launch.post = f.try_into()?;
         }
+        Post::LowRank { .. } => unreachable!("computed on the host above"),
     }
     let codes = match plan.core {
         Core::Codes(c) => c,

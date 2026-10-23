@@ -34,7 +34,7 @@ enum Verb {
     Download(Download),
     /// Make a model on a machine and upload it as a private checkpoint.
     Upload(Upload),
-    /// Write a model's int8, fp8, nvfp4 or w4a8 lane, or any lane, by the recipe a named package declares.
+    /// Write a model's int8, fp8, nvfp4, w4a8 or svdq-nvfp4 lane, or any lane, by the recipe a named package declares.
     Quantize(Quantize),
     /// Release a commit: a public tag named by a version, created, moved, or a private one made public.
     Publish(Publish),
@@ -125,7 +125,7 @@ pub(crate) struct Upload {
 }
 
 #[derive(clap::Args, Debug)]
-#[command(group(ArgGroup::new("lane").required(true).args(["int8", "fp8", "nvfp4", "w4a8", "recipe"])))]
+#[command(group(ArgGroup::new("lane").required(true).args(["int8", "fp8", "nvfp4", "w4a8", "svdq_nvfp4", "recipe"])))]
 pub(crate) struct Quantize {
     /// org/name[@release] or org/name#sha256:….
     model: String,
@@ -145,6 +145,9 @@ pub(crate) struct Quantize {
     /// Write the w4a8 lane (4-bit ConvRot codes on int8 tensor cores: Ampere, Ada, Hopper).
     #[arg(long)]
     w4a8: bool,
+    /// Write the svdq-nvfp4 lane (SVDQuant: an nvfp4 residual and a 16-bit low-rank branch, Blackwell).
+    #[arg(long)]
+    svdq_nvfp4: bool,
     /// Run the package's recipe of this name: any lane's (`drafter_head` writes a drafter).
     #[arg(long, value_name = "NAME")]
     recipe: Option<String>,

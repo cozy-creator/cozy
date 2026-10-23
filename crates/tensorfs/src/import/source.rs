@@ -24,6 +24,25 @@ pub struct Tensor {
     /// A quantized carrier's tensors folded into one (`carriers`): `dtype` and `shape` are then
     /// the logical ones, and the location is the data part's.
     pub encoded: Option<Box<super::carriers::Folded>>,
+    /// Bytes computed from its source range as it is read (Nunchaku's tiles, unswizzled).
+    pub derive: Option<Derive>,
+}
+
+/// The computation of a derived tensor's bytes from its source ranges' bytes.
+pub type Compute = std::sync::Arc<dyn Fn(&[&[u8]]) -> Vec<u8> + Send + Sync>;
+
+/// `len` bytes computed from a tensor's source range and the further ranges `with` of its file.
+#[derive(Clone)]
+pub struct Derive {
+    pub with: Vec<(u64, u64)>,
+    pub len: u64,
+    pub f: Compute,
+}
+
+impl std::fmt::Debug for Derive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Derive({} bytes)", self.len)
+    }
 }
 
 #[derive(Debug)]
@@ -136,6 +155,7 @@ pub fn read_header(path: &Path, file: usize) -> Result<Header> {
                 start: data + begin,
                 len,
                 encoded: None,
+                derive: None,
             },
         );
     }

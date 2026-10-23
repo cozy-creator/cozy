@@ -18,6 +18,7 @@ use crate::format::{check, Dtype, Encoding, PartBytes, Value};
 use super::source::{Group, SourceSet, Tensor};
 
 mod bnb;
+mod nunchaku;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -36,6 +37,8 @@ pub enum Producer {
     Awq,
     /// bitsandbytes: `quant_method: bitsandbytes`, or its own `quant_state` documents.
     Bitsandbytes,
+    /// Nunchaku's SVDQuant: `quantization_config` `method: svdquant`.
+    Nunchaku,
 }
 
 #[derive(Debug, Deserialize)]
@@ -445,6 +448,11 @@ fn quantization_config(doc: &Json, what: &str) -> Result<Declared> {
             d
         }
         Some("quark") => quark(doc, what)?,
+        None if doc.get("method").and_then(Json::as_str) == Some("svdquant") => {
+            let mut d = Declared::new(Producer::Nunchaku, what.to_owned());
+            d.configs.push((what.to_owned(), doc.clone()));
+            d
+        }
         other => {
             return refuse(
                 Code::UNREGISTERED_ENCODING,
@@ -1221,16 +1229,18 @@ pub fn fold(set: &mut SourceSet) -> Result<()> {
             Producer::Bitsandbytes => {
                 bnb::fold_group(set, group, &|c| logical_dtype(group, &d, c))?
             }
+            Producer::Nunchaku => nunchaku::fold_group(group, &d, &|c| logical_dtype(group, &d, c))?,
             _ => fold_group(set, group, &d)?,
         };
         let group = &mut set.groups[g];
         for key in &d.markers {
             group.tensors.remove(key);
         }
-        for (key, (consumed, t)) in folded {
-            for c in consumed {
-                group.tensors.remove(&c);
-            }
+        // Every consumed key goes before any folded one lands (Nunchaku's bias keeps its key).
+        for c in folded.values().flat_map(|(consumed, _)| consumed) {
+            group.tensors.remove(c);
+        }
+        for (key, (_, t)) in folded {
             group.tensors.insert(key, t);
         }
         companions(group)?;
@@ -1490,6 +1500,7 @@ fn fold_group(set: &SourceSet, group: &Group, d: &Declared) -> Result<Folds> {
             start: data.at.start,
             len: data.at.len,
             encoded: Some(Box::new(folded)),
+            derive: None,
         };
         out.insert(key, (consumed, tensor));
     }

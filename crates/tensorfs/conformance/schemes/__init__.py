@@ -10,6 +10,7 @@ from . import fp8
 from . import int8
 from . import mxfp8
 from . import nvfp4
+from . import svdq
 
 # fp8.blockwise, mxfp4
 from . import fp8_blockwise
@@ -35,6 +36,7 @@ FAMILIES = (
     int8,
     mxfp8,
     nvfp4,
+    svdq,
 
     # fp8.blockwise, mxfp4
     fp8_blockwise,

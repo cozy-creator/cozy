@@ -22,7 +22,8 @@ def per_matrix(role):
     return shape
 
 
-def decode(c):
+def core(c):
+    """((T[q] x s) x g), or (T[q] x (s / g)), matrix by matrix."""
     nibbles = affine.Packing(4, 8, order=c.p("nibble_order"))
     q = nibbles.unpack(c.raw("weight"), c.rows, c.cols)
     g = c.values("scale_2")
@@ -34,13 +35,18 @@ def decode(c):
             out.append(table.decode(qm, elem.E2M1, s, blocks(c), n, c.cols) * gm)
         else:
             out.append(table.decode(qm, elem.E2M1, s / gm, blocks(c), n, c.cols))
-    out = np.concatenate(out).reshape(c.rows, c.cols) if out else np.zeros((0, c.cols), np.float32)
+    return np.concatenate(out).reshape(c.rows, c.cols) if out else np.zeros((0, c.cols), np.float32)
+
+
+def decode(c):
+    out = core(c)
     return out * c.values("pre_quant_scale") if c.has("pre_quant_scale") else out
 
 
+PARAMS = {"block_size": (16,), "global_scale": ("multiply", "divide"), "nibble_order": ("low_first", "high_first"),
+          "scale_layout": LAYOUTS}
 SCHEMES = (
-    Scheme("nvfp4", {"block_size": (16,), "global_scale": ("multiply", "divide"),
-                     "nibble_order": ("low_first", "high_first"), "scale_layout": LAYOUTS},
+    Scheme("nvfp4", PARAMS,
            (Part("weight", ("F4",), logical), Part("scale", ("F8_E4M3",), scale_shape),
             Part("scale_2", ("F32",), per_matrix("scale_2")),
             Part("input_scale", ("F32",), per_matrix("input_scale"), required=False),

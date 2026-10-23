@@ -95,11 +95,14 @@ fn every_encoded_green_vector_prepares_a_kernel_without_host_fallback() {
                     &parts,
                     true,
                     |plan, geometry| {
-                        assert!(
+                        // A host scheme's values are the host's, never a device core's.
+                        let host = kernels::HOST_SCHEMES.contains(&encoding.scheme.as_str());
+                        assert_eq!(
                             matches!(
                                 kernels::prepare(plan, geometry, &case.dtype, 0, count)?,
                                 Prepared::Kernel(_)
                             ),
+                            !host,
                             "{label}: CPU decode plus upload is not kernel evidence"
                         );
                         Ok(())
@@ -114,10 +117,10 @@ fn every_encoded_green_vector_prepares_a_kernel_without_host_fallback() {
     let digest = format!("{:x}", corpus.finalize());
     assert_eq!(
         digest,
-        "bc1579bcfcc195ab5fc9d89fa14a9a5f5ae771373b86cff370bd1e6854ed6cad"
+        "28ec3bd25b46fa3d99156d4c42667d357fa0653828549fbd860851069fdae664"
     );
-    assert_eq!(checked, 234);
-    assert_eq!(schemes.len(), 45);
+    assert_eq!(checked, 240);
+    assert_eq!(schemes.len(), 46);
     println!("kernel routing: {checked} full + {checked} odd-byte windows, {} schemes, 0 host fallbacks; corpus {digest}", schemes.len());
 }
 

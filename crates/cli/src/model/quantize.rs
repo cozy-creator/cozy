@@ -21,11 +21,11 @@ use crate::run::interface::{Interface, Recipe, RECIPES};
 const ORIGINAL: [&str; 3] = ["bf16", "fp16", "f32"];
 
 /// A 4-bit lane is written only from original weights (owner, 2026-10-22): from a release holding
-/// none, such as an ingested Q4_K GGUF or an nvfp4 or w4a8 checkpoint, it would stack two rounds
-/// of 4-bit error. Refused, naming the newest release that holds them.
+/// none, such as an ingested Q4_K GGUF or a 4-bit checkpoint, it would stack two rounds of 4-bit
+/// error. Refused, naming the newest release that holds them.
 fn original_weights(repo: &Repo, card: &ModelCard, source: &ModelCatalogRelease, lane: &str) -> Result<(), Error> {
     let original = |r: &ModelCatalogRelease| r.lanes.iter().any(|l| l.precision.as_deref().is_some_and(|p| ORIGINAL.contains(&p)));
-    if !matches!(lane, "nvfp4" | "w4a8") || original(source) {
+    if !matches!(lane, "nvfp4" | "w4a8" | "svdq-nvfp4") || original(source) {
         return Ok(());
     }
     let held: Vec<String> = source.lanes.iter()
@@ -104,13 +104,31 @@ fn lane(args: &Quantize, interface: &Interface, package: &str) -> Result<String,
             .ok_or_else(|| Error::new(Kind::NotFound, "model_recipe_not_found", format!("{package} declares no recipe {name}"))
                 .remedy(declared(interface)));
     }
-    let lane = match (args.int8, args.fp8, args.w4a8) {
+    let lane = match (args.int8, args.fp8, args.w4a8, args.svdq_nvfp4) {
         (true, ..) => "int8",
-        (_, true, _) => "fp8",
-        (.., true) => "w4a8",
+        (_, true, ..) => "fp8",
+        (_, _, true, _) => "w4a8",
+        (.., true) => "svdq-nvfp4",
         _ => "nvfp4",
     };
     Ok(lane.to_owned())
+}
+
+/// The recipes of `lane` (named `recipe` if given) that read a checkpoint holding `components`.
+fn recipes<'i>(interface: &'i Interface, lane: &str, recipe: Option<&str>, components: &[String]) -> Vec<&'i Recipe> {
+    (interface.recipes.iter())
+        .filter(|r| r.lane == lane && recipe.is_none_or(|n| r.name == fold(n)) && r.reads(components))
+        .collect()
+}
+
+/// When one of `found` calibrates on the model itself: `model.<slot>=<source>` for each model the
+/// package's `quantize` constructs (on demand). Else nothing: another recipe's model is never bound.
+fn calibration(interface: &Interface, found: &[&Recipe], source: &str) -> Vec<String> {
+    if found.iter().all(|r| r.calibrate.is_empty()) {
+        return vec![];
+    }
+    (interface.callables.iter()).filter(|c| c.name == RECIPES).flat_map(|c| &c.models)
+        .filter(|slot| !slot.weights).map(|slot| format!("model.{}={source}", slot.param)).collect()
 }
 
 /// What a package declares, for a refusal: each recipe's flag and the model it reads.
@@ -141,8 +159,8 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
     let card = crate::run::resolve(ctx, &hub, &package, release.as_deref()).await?.card;
     let lane = lane(&args, &card.interface, &package)?;
     let (source, components, repo) = checkpoint(ctx, &hub, &model, &lane).await?;
-    let wanted = |r: &&Recipe| r.lane == lane && args.recipe.as_deref().is_none_or(|n| r.name == fold(n));
-    if !card.interface.recipes.iter().filter(wanted).any(|r| r.reads(&components)) {
+    let found = recipes(&card.interface, &lane, args.recipe.as_deref(), &components);
+    if found.is_empty() {
         let what = args.recipe.as_deref().unwrap_or(&lane);
         return Err(Error::new(Kind::NotFound, "model_quantizer_not_found", format!(
             "{package}@{} has no {what} recipe for this model ({})", card.release, components.join(", ")))
@@ -153,7 +171,11 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
     let mut terms = vec![source.clone(), destination.clone(), format!("lane={lane}"),
         format!("package={package}"), format!("release={}", card.release)];
     terms.extend(args.recipe.iter().map(|name| format!("recipe={name}")));
-    let run = crate::run::call(ctx, &package, Some(&card.release), RECIPES, terms, &args.placement, args.detach).await?;
+    // A calibration reads the original weights, never an encoded lane: the run takes 16 bits.
+    let calibrated = calibration(&card.interface, &found, &source);
+    let bits = (!calibrated.is_empty()).then_some("16");
+    terms.extend(calibrated);
+    let run = crate::run::call(ctx, &package, Some(&card.release), RECIPES, terms, bits, &args.placement, args.detach).await?;
     if !ctx.json && run.status == Status::Completed {
         match written_checkpoint(&run, &lane) {
             Some(WrittenCheckpoint::Reference(reference)) => {
@@ -239,7 +261,7 @@ mod tests {
                 {"release": "0.9.0", "lanes": [lane("model.bf16.cozytensors", "bf16")]}]})).unwrap();
         let repo = Repo::parse("acme/x").unwrap();
         let (gguf, original) = (&card.releases[0], &card.releases[1]);
-        for four in ["w4a8", "nvfp4"] {
+        for four in ["w4a8", "nvfp4", "svdq-nvfp4"] {
             let refused = original_weights(&repo, &card, gguf, four).unwrap_err();
             assert_eq!(refused.code, "model_quantize_source_quantized");
             assert!(refused.to_string().contains("stacks two rounds of 4-bit error"), "{refused}");
@@ -252,6 +274,31 @@ mod tests {
             "releases": [{"release": "1.0.0", "lanes": [lane("model.w4a8.cozytensors", "w4a8")]}]})).unwrap();
         let refused = original_weights(&repo, &only, &only.releases[0], "nvfp4").unwrap_err();
         assert!(format!("{refused:?}").contains("cozy model upload"), "{refused:?}");
+    }
+
+    /// A recipe that calibrates on the model itself reads the source in the model `quantize`
+    /// constructs (on demand); the same package's plain lanes, and its other models' recipes,
+    /// bind nothing.
+    #[test]
+    fn only_a_calibrated_recipe_binds_the_source() {
+        let slot = |name: &str, class: &str, weights: bool| serde_json::json!(
+            {"path": format!("quantize.models.{name}"), "class": class, "weights": weights, "on_demand": !weights});
+        let recipe = |name: &str, lane: &str, class: &str, reads: &str, calibrate: &str| serde_json::json!({
+            "name": name, "lane": lane, "calibrate": calibrate, "plan": {"kind": "quantization"},
+            "model": {"class": class, "component_use": {"run": [reads]}}});
+        let klein = Interface::parse(&serde_json::json!({"format": "cozy.package.interface/1", "application": "k:app",
+            "entrypoints": [{"name": "quantize", "models": [slot("source", "Any", true), slot("model", "Klein", false)],
+                "weights_outputs": [{"output_id": "svdq-nvfp4"}, {"output_id": "int8"}], "request": {"fields": []}}],
+            "recipes": [recipe("svdq_nvfp4", "svdq-nvfp4", "Klein", "transformer", "flux_3_klein.quantize:calibrate"),
+                recipe("int8", "int8", "Klein", "transformer", ""), recipe("upsampler_int8", "int8", "Upsampler", "model", "")]}))
+        .unwrap();
+        let bound = |lane: &str, held: &str| {
+            calibration(&klein, &recipes(&klein, lane, None, &[held.to_owned()]), "acme/klein@1.0.0")
+        };
+        assert_eq!(bound("svdq-nvfp4", "transformer"), ["model.model=acme/klein@1.0.0"]);
+        assert!(bound("int8", "transformer").is_empty() && bound("int8", "model").is_empty());
+        assert!(bound("svdq-nvfp4", "model").is_empty(), "no recipe reads that checkpoint");
+        assert_eq!(klein.recipes[0].flag(), "--svdq-nvfp4");
     }
 
     #[test]

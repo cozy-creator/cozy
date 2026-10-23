@@ -314,15 +314,17 @@ pub(crate) async fn resolve(
     Ok(Resolved { card, from })
 }
 
-/// `cozy run <package>/<function>[@release] <inputs…> --on …` for another verb: `model
+/// `cozy run <package>/<function>[@release] <inputs…> [--lane …] --on …` for another verb: `model
 /// quantize` runs a package's conversion this way. The run as it settled, or as sent with
 /// `detach`; its record is printed either way.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call(
     ctx: &Context,
     package: &str,
     release: Option<&str>,
     function: &str,
     inputs: Vec<String>,
+    lane: Option<&str>,
     placement: &Placement,
     detach: bool,
 ) -> Result<Run, Error> {
@@ -333,7 +335,7 @@ pub(crate) async fn call(
         inputs,
         placement: placement.clone(),
         gpus: None,
-        lane: None,
+        lane: lane.map(str::to_owned),
         attention_kernel: None,
         input_file: None,
         assets: vec![],

@@ -47,11 +47,19 @@ pub struct Struct {
     pub decode: fn(&[u8], &mut [f32]),
 }
 
-/// A factor on every value: none, one, or one per column.
+/// A factor on every value: none, one, or one per column; or a low-rank branch (`svdq.nvfp4`):
+/// `× rows[i]` where given, `× cols[j]`, then `+ up[i, r] × down[r, j]` for each `r` in order,
+/// `down` `[R, C]` and `up` `[rows, R]`. No device core adds a branch: its values are the host's.
 pub enum Post<'a> {
     None,
     One(Elems<'a>),
     Cols(Elems<'a>),
+    LowRank {
+        rows: Option<Elems<'a>>,
+        cols: Elems<'a>,
+        down: Elems<'a>,
+        up: Elems<'a>,
+    },
 }
 
 /// Elements as stored: a part's bytes in its dtype (`F32`, `BF16`, `F16`, an 8-bit format), or
@@ -406,6 +414,26 @@ impl Plan<'_> {
             Post::Cols(f) => {
                 let f = f.floats()?;
                 (v.iter_mut().enumerate()).for_each(|(k, x)| *x *= f[k % cols]);
+            }
+            Post::LowRank { rows: c, cols: p, down, up } => {
+                let (p, down, up) = (p.floats()?, down.floats()?, up.floats()?);
+                let c = c.as_ref().map(Elems::floats).transpose()?;
+                let r = down.len() / cols.max(1);
+                if p.len() != cols || down.len() != r * cols || up.len() != rows * r
+                    || c.as_ref().is_some_and(|c| c.len() != rows)
+                {
+                    return Err(Error::Decode("low-rank factors have a wrong length".into()));
+                }
+                for (k, x) in v.iter_mut().enumerate() {
+                    let (i, j) = (k / cols, k % cols);
+                    if let Some(c) = &c {
+                        *x *= c[i];
+                    }
+                    *x *= p[j];
+                    for t in 0..r {
+                        *x += up[i * r + t] * down[t * cols + j];
+                    }
+                }
             }
         }
         Ok(v)

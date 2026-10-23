@@ -12,6 +12,8 @@ def family(kind):
         return kind, 4
     if kind == "w4a8.convrot":
         return "w4a8", 4
+    if kind == "svdq.nvfp4":
+        return "svdq-nvfp4", 4
     for prefix, width in (("int8", 8), ("fp8", 8), ("int4", 4)):
         if kind.startswith(prefix + "."):
             return prefix, width
@@ -52,7 +54,7 @@ def gpus(devices):
 
 
 NEEDS = {"int8": "sm80+ except sm103", "w4a8": "sm80+ except sm103", "fp8": "sm89+", "nvfp4": "sm80+", "mxfp4": "sm80+",
-         "int4": "sm80+"}
+         "int4": "sm80+", "svdq-nvfp4": "sm80+"}
 
 
 def runs(kind, device):
@@ -90,9 +92,10 @@ def select(profiles, constraints, model, plain):
         return None
 
     def lanes(encoded):
-        four = [lane for lane, runs in (("nvfp4", g["mma"]), ("w4a8", g["int8"])) if runs]
         decode = asked is None and constraints.get("prefer") == 4
-        native = (four if g["fp4"] or decode else four[::-1]) if width == 4 else []
+        four = (["nvfp4", "svdq-nvfp4", "w4a8"] if decode else ["svdq-nvfp4", "nvfp4", "w4a8"] if g["fp4"]
+                else ["w4a8", "nvfp4", "svdq-nvfp4"])
+        native = [lane for lane in four if g["int8" if lane == "w4a8" else "mma"]] if width == 4 else []
         native += (["int8"] if width <= 8 and g["int8"] else []) + (["fp8"] if width <= 8 and g["fp8"] else [])
         return (native if encoded else []) + (["bf16", "fp16"] if g["bf16"] else ["fp16", "bf16"])
 
@@ -103,7 +106,7 @@ def select(profiles, constraints, model, plain):
             continue
         group = "nvfp4" if p["family"] in ("mxfp4", "int4") else p["family"]
         place = len(order) if group == "f32" else order.index(group) if group in order else len(order) + 1
-        weight_only = p["family"] == "int4" or (p["family"] in ("nvfp4", "mxfp4") and not g["fp4"])
+        weight_only = p["family"] == "int4" or (p["family"] in ("nvfp4", "mxfp4", "svdq-nvfp4") and not g["fp4"])
         ranked.append((place, 0 < p["bits"] < width, weight_only, p["bytes"], path))
     if not ranked:
         each = [f"{path} ({p['family'] or '+'.join(p['kinds'])}) {refusal(p)}" for path, p in sorted(profiles.items())]
@@ -111,7 +114,7 @@ def select(profiles, constraints, model, plain):
     chosen = min(ranked)[-1]
     served = profiles[chosen]["family"]
     reasons = []
-    if served not in ("bf16", "fp16", "int8", "fp8", "nvfp4", "w4a8"):
+    if served not in ("bf16", "fp16", "int8", "fp8", "nvfp4", "w4a8", "svdq-nvfp4"):
         return chosen, reasons
     if not takes and len(lanes(True)) > 2:
         reasons.append(f"precision {width}: {model} declines encoded leaves; served {served}")
