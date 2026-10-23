@@ -16,7 +16,7 @@ mod cases {
     use platform::handles::Peer;
     use tensorfs::io::Dst;
     use varena::backend::{Access, Backend, Va};
-    use varena::lease::{Agent, Holdings, Hosting, Identity, Lease, Manager, Region};
+    use varena::lease::{Agent, Attach, Holdings, Hosting, Identity, Lease, Manager, Region};
     use varena::ledger::Mode;
     use varena::{GpuId, HostBackend};
 
@@ -42,8 +42,8 @@ mod cases {
         let listener = UnixListener::bind(&socket).unwrap();
         let gpu = GpuId { uuid: format!("lease{}-{case}", std::process::id()), model: "host".into(), memory: capacity };
         let children = Arc::new(Children(Mutex::new(vec![])));
-        let backend: Arc<dyn Backend> = Arc::new(HostBackend::new(capacity));
-        let manager = Manager::create(&gpu, Some(capacity), Mode::Dedicated, backend, listener, children.clone()).unwrap();
+        let open = Box::new(move || Ok(Arc::new(HostBackend::new(capacity)) as Arc<dyn Backend>));
+        let manager = Manager::create(&gpu, Some(capacity), Mode::Dedicated, open, listener, children.clone()).unwrap();
         varena::os::remove_table(&gpu.uuid);
         Host { manager, socket, children }
     }
@@ -133,9 +133,10 @@ mod cases {
         assert_eq!(a.call(&format!("take {} {}", 96 * MIB, region(1))), "ok 3 fresh verified");
         b.send(&format!("take {} {}", 64 * MIB, region(2)));
         a.wait_rang();
-        assert_eq!(a.call("revokes"), "released 2");
+        // 32 MiB were free: one chunk of A's is asked back.
+        assert_eq!(a.call("revokes"), "released 1");
         assert_eq!(b.answer(), "ok 2 fresh verified");
-        until(&host, |h| h.leased == 96 * MIB && h.created == 96 * MIB);
+        until(&host, |h| h.leased == 128 * MIB && h.created == 128 * MIB);
     }
 
     fn a_revoke_waits_for_the_pin(dir: &Path) {
@@ -149,16 +150,65 @@ mod cases {
         assert_eq!(a.call("revokes"), "released 0");
         assert_eq!(host.manager.holdings().leased, 96 * MIB);
         assert_eq!(a.call("unpin"), "ok");
-        assert_eq!(a.call("revokes"), "released 2");
+        assert_eq!(a.call("revokes"), "released 1");
         assert_eq!(b.answer(), "ok 2 fresh verified");
     }
 
-    fn nothing_revocable_is_refused(dir: &Path) {
-        let host = host(dir, "refuse", 64 * MIB);
+    /// Only another executor's pinned chunks could give the room: they are asked, and the ask
+    /// waits for their unpin.
+    fn an_ask_waits_for_anothers_pins(dir: &Path) {
+        let host = host(dir, "others", 64 * MIB);
         let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
         assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 2 fresh verified");
         assert_eq!(a.call("pin"), "ok");
-        assert!(b.call(&format!("take {} {}", 32 * MIB, region(2))).starts_with("refused"));
+        b.send(&format!("take {} {}", 32 * MIB, region(2)));
+        a.wait_rang();
+        assert_eq!(a.call("revokes"), "released 0");
+        assert_eq!(a.call("unpin"), "ok");
+        assert_eq!(a.call("revokes"), "released 1");
+        assert_eq!(b.answer(), "ok 1 fresh verified");
+    }
+
+    /// Two running passes, each pinned, each asking for the other's room: the second ask would
+    /// close a wait cycle and is refused; the first is served once the second unpins.
+    fn a_wait_cycle_is_refused(dir: &Path) {
+        let host = host(dir, "cycle", 128 * MIB);
+        let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
+        assert_eq!(a.call(&format!("take {} {}", 64 * MIB, region(1))), "ok 2 fresh verified");
+        assert_eq!(b.call(&format!("take {} {}", 64 * MIB, region(2))), "ok 2 fresh verified");
+        assert_eq!(a.call("pin"), "ok");
+        assert_eq!(b.call("pin"), "ok");
+        a.send(&format!("take {} {}", 32 * MIB, region(3)));
+        b.wait_rang();
+        assert!(b.call(&format!("take {} {}", 32 * MIB, region(4))).starts_with("refused"));
+        assert_eq!(b.call("unpin"), "ok");
+        assert_eq!(b.call("revokes"), "released 1");
+        assert_eq!(a.answer(), "ok 1 fresh verified");
+    }
+
+    /// Stall verdicts come only from the look's cadence: any number of back-to-back reads names
+    /// no healthy executor; one that never answers its asks is named after enough looks.
+    fn stalls_are_judged_on_the_looks_cadence(dir: &Path) {
+        let host = host(dir, "stall", 128 * MIB);
+        let (mut a, mut b) = (Agentd::start(&host), Agentd::start(&host));
+        assert_eq!(a.call(&format!("take {} {}", 96 * MIB, region(1))), "ok 3 fresh verified");
+        b.send(&format!("take {} {}", 64 * MIB, region(2)));
+        a.wait_rang();
+        for _ in 0..10_000 {
+            assert!(host.manager.stalled().is_empty(), "a healthy agent named between looks");
+        }
+        let start = Instant::now();
+        while !host.manager.stalled().contains(&a.child.id()) {
+            assert!(start.elapsed() < Duration::from_secs(20), "an agent that never answers is never named");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(a.call("revokes"), "released 1");
+        assert_eq!(b.answer(), "ok 2 fresh verified");
+        let start = Instant::now();
+        while !host.manager.stalled().is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(20), "a release clears the verdict");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn a_killed_agents_leases_return_and_landed_weights_are_adopted(dir: &Path) {
@@ -189,7 +239,9 @@ mod cases {
             ("grant_maps_and_writes", grant_maps_and_writes),
             ("an_unpinned_lease_is_revoked_for_another", an_unpinned_lease_is_revoked_for_another),
             ("a_revoke_waits_for_the_pin", a_revoke_waits_for_the_pin),
-            ("nothing_revocable_is_refused", nothing_revocable_is_refused),
+            ("an_ask_waits_for_anothers_pins", an_ask_waits_for_anothers_pins),
+            ("a_wait_cycle_is_refused", a_wait_cycle_is_refused),
+            ("stalls_are_judged_on_the_looks_cadence", stalls_are_judged_on_the_looks_cadence),
             ("an_ask_against_its_own_pins_is_refused", an_ask_against_its_own_pins_is_refused),
             ("a_killed_agents_leases_return_and_landed_weights_are_adopted", a_killed_agents_leases_return_and_landed_weights_are_adopted),
         ];
@@ -250,8 +302,13 @@ mod cases {
                 ["attach"] => {
                     let r = rang.clone();
                     let stream = UnixStream::connect(socket).unwrap();
-                    agent = Some(Agent::attach(stream, backend.clone(), move || { r.fetch_add(1, SeqCst); }).unwrap());
-                    "ok".to_string()
+                    match Agent::attach(stream, backend.clone(), move || { r.fetch_add(1, SeqCst); }).unwrap() {
+                        Attach::Leased(a) => {
+                            agent = Some(a);
+                            "ok".to_string()
+                        }
+                        Attach::Refused { code, why } => format!("refused {code:?} {why}"),
+                    }
                 }
                 ["take", bytes, fingerprint, region, rest @ ..] => {
                     let unlanded = rest == ["unlanded"];
