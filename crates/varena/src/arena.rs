@@ -103,6 +103,10 @@ pub trait Source: Send + Sync {
     /// Idle chunks' epochs passed: chunks asked back may go now ([`Torch::reclaim_chunks`]). The
     /// poller's, no lock held.
     fn quiet(&self) {}
+    /// The lease table slot a chunk is granted in, for the region facts the manager ranks.
+    fn slot(&self, _chunk: &Chunk) -> Option<u32> {
+        None
+    }
 }
 
 /// A block of a request's arena still live at the request's end.

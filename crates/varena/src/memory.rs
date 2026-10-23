@@ -424,6 +424,33 @@ impl Memory {
         (warm, cold, largest)
     }
 
+    /// A region's facts to the lease manager (`None`: it is gone), while leased.
+    pub(crate) fn region_facts(&self, id: u64, record: Option<&crate::region::Record>) {
+        #[cfg(unix)]
+        if let Some(agent) = self.inner.lease.get() {
+            let sent = match record {
+                Some(r) => agent.region(crate::lease::wire::RegionFacts { id, kind: r.kind, slots: r.slots.clone(), cost_ns: r.cost_ns, last_use: r.last_use, next_use: r.next_use.map_or(u64::MAX, u64::from) }),
+                None => agent.region_gone(id),
+            };
+            if let Err(e) = sent {
+                tracing::debug!("varena: region {id}'s facts did not reach the lease manager: {e}");
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (id, record);
+    }
+
+    /// The lease slots of `sets`' leased pages.
+    pub(crate) fn lease_slots(&self, sets: &[SetId]) -> Vec<u32> {
+        #[cfg(unix)]
+        return self.inner.leased.lock().values().filter(|(_, key, _)| sets.iter().any(|s| s.0 == key.0)).map(|(t, ..)| t.slot).collect();
+        #[cfg(not(unix))]
+        {
+            let _ = sets;
+            Vec::new()
+        }
+    }
+
     /// Every block of `set`.
     pub(crate) fn blocks(&self, set: SetId) -> Result<Vec<u32>> {
         let st = self.inner.state.lock();
@@ -587,6 +614,9 @@ enum Mech {
     /// The lease manager asked pages back: the quiet ones go, the busy ones once idle.
     #[cfg(unix)]
     Revoke,
+    /// The lease manager reclaims a region whole (crate::region).
+    #[cfg(unix)]
+    Reclaim { region: u64, swap: bool },
 }
 
 struct Active {
@@ -1057,6 +1087,10 @@ impl Memory {
         };
         match crate::lease::Agent::attach(stream, self.inner.backend.clone(), revoked)? {
             crate::lease::Attach::Leased(agent) => {
+                let mech = self.inner.mech.clone();
+                agent.on_reclaim(Box::new(move |region, swap| {
+                    mech.post(Mech::Reclaim { region, swap }, 0);
+                }))?;
                 if self.inner.lease.set(agent).is_err() {
                     return Err(Error::Invalid("this Memory is leased already".into()));
                 }
@@ -3337,7 +3371,7 @@ impl Drop for Inner {
                 Mech::Release(va) => self.backend.release(va),
                 Mech::Map { .. } | Mech::Adopt { .. } | Mech::Keep { .. } => {}
                 #[cfg(unix)]
-                Mech::Revoke => {}
+                Mech::Revoke | Mech::Reclaim { .. } => {}
             }
         }
         let mut st = self.state.lock();
@@ -3661,6 +3695,12 @@ impl Inner {
             Mech::Map { key, gen, va, off, span, job, speculative, decided } => self.place_page(key, gen, va, off, span, job, (!speculative).then_some(decided)),
             #[cfg(unix)]
             Mech::Revoke => self.revoke(),
+            #[cfg(unix)]
+            Mech::Reclaim { region, swap } => {
+                if let Err(e) = crate::region::reclaim(region, swap) {
+                    tracing::warn!("varena: reclaiming region {region}: {e}");
+                }
+            }
             Mech::Renew { key, gen, va, off, span, old, after, job } => {
                 // Its consumers finish before the unmap: this thread waits for their events.
                 let released = after.iter().try_for_each(|e| self.backend.finish(*e))

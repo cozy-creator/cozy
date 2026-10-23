@@ -213,6 +213,10 @@ struct Leased {
 
 #[cfg(unix)]
 impl Source for Leased {
+    fn slot(&self, chunk: &Chunk) -> Option<u32> {
+        u32::try_from(chunk.id >> 32).ok()
+    }
+
     fn map(&self, va: Va, _: Kind) -> Result<Vec<Chunk>> {
         let (mut chunks, mut tickets, mut off, mut failed) = (Vec::new(), Vec::new(), 0, None);
         for lease in self.agent.take(va.len, crate::lease::wire::Kind::Torch, None)? {
