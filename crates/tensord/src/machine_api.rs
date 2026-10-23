@@ -449,6 +449,9 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 impl MachineBackend for NativeBackend {
+    fn activity(&self) -> Option<u64> {
+        Some(self.service.engine.activity_epoch())
+    }
     fn runs(&self) -> Option<Arc<crate::runs::Runs>> {
         self.runs.clone()
     }
@@ -615,14 +618,13 @@ impl MachineBackend for NativeBackend {
             .installations(&actor_id(actor))
             .map_err(problem)?
         {
-            let held = match self.service.catalog.resolve(&installed.generation) {
-                Ok(held) => held,
+            let record = match self.service.catalog.record(&installed.generation) {
+                Ok(record) => record,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(problem(error)),
             };
-            let warning = held.record.sdk_fallback.clone();
-            let sdk = held
-                .record
+            let warning = record.sdk_fallback.clone();
+            let sdk = record
                 .dependencies
                 .into_iter()
                 .filter(|d| matches!(d.name.as_str(), "cozy-runtime" | "tensorfs"))
@@ -684,8 +686,8 @@ impl MachineBackend for NativeBackend {
             let application = self
                 .service
                 .catalog
-                .resolve(&installed.generation)
-                .map(|g| g.record.application)
+                .record(&installed.generation)
+                .map(|record| record.application)
                 .unwrap_or_default();
             let level = held
                 .get(&(installed.generation.clone(), application))
