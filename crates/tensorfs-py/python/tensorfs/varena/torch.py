@@ -418,12 +418,30 @@ _pass: ContextVar[_Pass | None] = ContextVar("varena_pass", default=None)
 _routes: ContextVar[frozenset[tuple[int, int]]] = ContextVar("varena_routes", default=frozenset())
 
 
+def _lease(native: Native, ns: int, redial: Callable[[], bool] | None) -> str | None:
+    """The GPU's weight pages leased from the manager TensorD serves in namespace `ns`
+    (varena-leases §11), or why not. A follower can dial before rank 0's progress registers it:
+    `NotRegistered` calls `redial`, which waits and says whether to dial again; with none, or
+    False, it raises: never a fallback. Only no compatible manager runs standalone, warned."""
+    while (refused := native.lease(ns)) is not None:
+        code, why = refused
+        if code == "NotRegistered" and redial is not None and redial():
+            continue
+        if code in ("Incompatible", "Absent"):
+            warnings.warn(f"varena: GPU {native.gpu.uuid} runs standalone, with no lease from TensorD: {why}", stacklevel=3)
+            return why
+        raise VarenaError(f"varena: GPU {native.gpu.uuid}'s lease was refused ({code}): {why}")
+    return None
+
+
 class Memory:
     """This process's memory on one device: its models, caches and requests."""
 
     def __init__(self, native: Native, device: torch.device, pool: bool = True) -> None:
         self.native, self.device = native, device
         self.cuda = device.type == "cuda"
+        #: why this GPU runs standalone though TensorD asked it to lease (`Memory.open(leases=)`)
+        self.standalone: str | None = None
         self.models: dict[nn.Module, Model] = {}
         self.requests: dict[Request, None] = {}
         #: (set, block) -> bytes kept bound for tensors that outlived their block's run
@@ -452,13 +470,15 @@ class Memory:
             return pool
 
     @classmethod
-    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = True) -> Memory:
+    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None, pool: bool = True, leases: int | None = None, redial: Callable[[], bool] | None = None) -> Memory:
         """A TensorD executor's memory (`grant`), or a standalone engine's: the device's table by
         name, its capacity lowered to `limit` (the first opener sets it, a later one can only
         lower it). On CUDA the backend opens first and measures this process's context, so open
-        it before torch initializes CUDA, or torch's context counts as foreign bytes. CPU and MPS
-        use host pages on the machine's table `host` (its RAM); a `GpuId` names a host table.
-        A process has one Memory per device: while it lives, opening the device again returns it."""
+        it before torch initializes CUDA, or torch's context counts as foreign bytes. With
+        `leases` (TensorD's namespace, from its Start) its weight pages are leased from TensorD's
+        manager (`_lease`). CPU and MPS use host pages on the machine's table `host` (its RAM); a
+        `GpuId` names a host table. A process has one Memory per device: while it lives, opening
+        the device again returns it."""
         device = torch.device("cpu") if isinstance(gpu, GpuId) else torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
         if device.type == "cuda":
             device = torch.device("cuda", device.index or 0)
@@ -473,7 +493,10 @@ class Memory:
                 else:
                     ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
                     native = Native.host(GpuId("host", device.type, ram), grant, limit)
-                memory = _memories[key] = cls(native, device, pool)
+                memory = cls(native, device, pool)
+                if device.type == "cuda" and leases is not None:
+                    memory.standalone = _lease(native, leases, redial)
+                _memories[key] = memory
         return memory
 
     @property
