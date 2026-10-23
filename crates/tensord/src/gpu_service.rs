@@ -631,6 +631,8 @@ pub struct Pool {
     /// Per generation, the import-only executor sessions fork from. Declared after
     /// `sessions`: executors end before the parent they were forked from.
     zygotes: Mutex<BTreeMap<(String, String), Arc<Zygote>>>,
+    /// The engine, told when an import-only parent comes up or fails (`Status` levels).
+    activity: std::sync::OnceLock<Weak<Engine>>,
     /// Each generation's kernel boot of this machine run: its process while it runs.
     kernel_boots: Mutex<BTreeMap<String, Option<platform::process::Exact>>>,
     /// Each caller's warm set, in the order it sent it.
@@ -758,6 +760,7 @@ impl Pool {
             leaders: Mutex::default(),
             tenants: Mutex::default(),
             zygotes: Mutex::new(BTreeMap::new()),
+            activity: Default::default(),
             kernel_boots: Mutex::new(BTreeMap::new()),
             members: Mutex::new(BTreeMap::new()),
             keeping: Mutex::new(()),
@@ -973,6 +976,7 @@ impl Pool {
     /// The engine's dispatch wakes whenever bytes free on a GPU: a queued request asks `fits`
     /// again then, and never polls.
     pub fn wake_on_freed(&self, engine: &Arc<Engine>) {
+        let _ = self.activity.set(Arc::downgrade(engine));
         for ledger in self.devices.iter().filter_map(|d| d.memory.as_ref()) {
             let engine = Arc::downgrade(engine);
             ledger.on_freed(Box::new(move || engine.upgrade().iter().for_each(|e| e.notify_activity())));
@@ -1291,7 +1295,7 @@ impl Pool {
             return "this machine imports nothing ahead for it (no fork, or it binds no model)";
         };
         if start {
-            parent.set(self.import_only(held));
+            self.start_parent(&parent, held);
         }
         parent.wait_started();
         match (parent.ready(), parent.failed()) {
@@ -1817,7 +1821,7 @@ impl Pool {
                 let asked = Instant::now();
                 if let Some((zygote, start)) = pool.zygote(&held) {
                     if start {
-                        zygote.set(pool.import_only(&held));
+                        pool.start_parent(&zygote, &held);
                     }
                     zygote.wait_started();
                 }
@@ -2132,12 +2136,9 @@ impl Pool {
         let pool = Arc::downgrade(self);
         let started = std::thread::Builder::new()
             .name("executor-prespawn".into())
-            .spawn(move || {
-                let state = match pool.upgrade() {
-                    Some(pool) => pool.import_only(&held),
-                    None => ZygoteState::Off("the GPU pool ended".into()),
-                };
-                zygote.set(state);
+            .spawn(move || match pool.upgrade() {
+                Some(pool) => pool.start_parent(&zygote, &held),
+                None => zygote.set(ZygoteState::Off("the GPU pool ended".into())),
             });
         if let Err(error) = started {
             tracing::warn!("executor prespawn: {error}");
@@ -2212,6 +2213,14 @@ impl Pool {
         let zygote = Arc::new(Zygote::default());
         zygotes.insert(key, zygote.clone());
         Some((zygote, true))
+    }
+
+    /// Brings `zygote` up as `held`'s import-only parent, and tells the engine it did (or failed).
+    fn start_parent(&self, zygote: &Zygote, held: &HeldGeneration) {
+        zygote.set(self.import_only(held));
+        if let Some(engine) = self.activity.get().and_then(Weak::upgrade) {
+            engine.notify_activity();
+        }
     }
 
     /// Spawn an executor of `held` and import torch, the Runtime and the package with no
@@ -2502,7 +2511,7 @@ impl Pool {
                 break;
             };
             if start {
-                zygote.set(self.import_only(held));
+                self.start_parent(&zygote, held);
             }
             match zygote.fork(config.take().expect("one config per launch"), &on_birth)? {
                 Forked::Ready(executor) => {

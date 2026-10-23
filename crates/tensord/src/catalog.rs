@@ -119,16 +119,7 @@ impl Catalog {
         })
     }
     pub fn resolve(&self, identity: &str) -> io::Result<HeldGeneration> {
-        if identity.len() != 32
-            || !identity
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        {
-            return Err(invalid(
-                "generation must name a published 32-hex installation",
-            ));
-        }
-        let directory = self.root.join(identity);
+        let directory = self.directory(identity)?;
         if directory.symlink_metadata()?.file_type().is_symlink()
             || platform::durable::canonical(&directory)? != directory
         {
@@ -142,11 +133,7 @@ impl Catalog {
         let now = SystemTime::now();
         let times = fs::FileTimes::new().set_accessed(now).set_modified(now);
         let _ = platform::durable::set_times(&directory.join(".hold"), times);
-        let manifest = platform::durable::open_nofollow(&directory.join("generation.json"), OpenOptions::new().read(true))?;
-        let record: Generation = serde_json::from_reader(manifest).map_err(io::Error::other)?;
-        if record.identity != identity {
-            return Err(invalid("generation identity differs from its installation"));
-        }
+        let record = self.read(&directory, identity)?;
         let expected = platform::paths::venv_python(&directory.join("env"));
         // The venv's interpreter may be a symlink into uv's immutable interpreter store.
         if record.python != expected {
@@ -169,6 +156,31 @@ impl Catalog {
             record,
             hold: Arc::new(hold),
         })
+    }
+    /// The generation's record, read only: no hold is taken and it is not marked used.
+    pub fn record(&self, identity: &str) -> io::Result<Generation> {
+        self.read(&self.directory(identity)?, identity)
+    }
+    fn directory(&self, identity: &str) -> io::Result<PathBuf> {
+        if identity.len() != 32
+            || !identity
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return Err(invalid(
+                "generation must name a published 32-hex installation",
+            ));
+        }
+        Ok(self.root.join(identity))
+    }
+    fn read(&self, directory: &Path, identity: &str) -> io::Result<Generation> {
+        let manifest = platform::durable::open_nofollow(&directory.join("generation.json"), OpenOptions::new().read(true))?;
+        let record: Generation =
+            serde_json::from_reader(io::BufReader::new(manifest)).map_err(io::Error::other)?;
+        if record.identity != identity {
+            return Err(invalid("generation identity differs from its installation"));
+        }
+        Ok(record)
     }
     pub fn root(&self) -> &Path {
         &self.root

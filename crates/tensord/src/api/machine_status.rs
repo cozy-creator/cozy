@@ -3,7 +3,10 @@
 //! An open stream is not activity: only `keepalive` resets the idle deadline, once.
 use super::{auth::VerifiedActor, backend::MachineBackend, domain, http::blocking, v1, MachineIdentity};
 use protocol::error::Error;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio_stream::{wrappers::IntervalStream, Stream, StreamExt};
 
 /// What this machine serves, for clients that adapt to it.
@@ -36,7 +39,10 @@ pub const CAPABILITIES: &[&str] = &[
 
 const LIVE: [&str; 3] = ["queued", "starting", "running"];
 
-/// The whole picture, sent again whenever it changes, until the caller leaves.
+/// The whole picture, sent again whenever it changes, until the caller leaves. What the engine
+/// records (runs, environments, the warm set, models) is read again only after engine activity;
+/// each tick otherwise reads what the process holds in memory and the disk's free space, so an
+/// idle machine watched does next to nothing.
 pub(super) fn watch<B: MachineBackend>(
     identity: Arc<MachineIdentity>,
     backend: Arc<B>,
@@ -45,10 +51,26 @@ pub(super) fn watch<B: MachineBackend>(
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last: Option<v1::StatusFrame> = None;
+    let read: Arc<Mutex<Option<(u64, Held)>>> = Arc::default();
     IntervalStream::new(tick)
         .then(move |_| {
-            let (identity, backend) = (identity.clone(), backend.clone());
-            async move { frame(&identity, &backend, actor).await }
+            let (identity, backend, read) = (identity.clone(), backend.clone(), read.clone());
+            async move {
+                // Read before the records: activity meanwhile is read again at the next tick.
+                let epoch = backend.activity();
+                let kept = read.lock().unwrap().clone();
+                let held = match kept.filter(|(at, _)| Some(*at) == epoch) {
+                    Some((_, held)) => held,
+                    None => {
+                        let held = held_now(&identity, &backend, actor).await?;
+                        if let Some(epoch) = epoch {
+                            *read.lock().unwrap() = Some((epoch, held.clone()));
+                        }
+                        held
+                    }
+                };
+                Ok::<_, Error>(picture(&identity, held))
+            }
         })
         .filter_map(move |next| match next {
             Ok(next) if last.as_ref().is_some_and(|last| !changed(last, &next)) => None,
@@ -99,25 +121,46 @@ pub(super) fn capabilities(identity: &MachineIdentity) -> Vec<String> {
         .collect()
 }
 
+/// What the engine records for the caller: its live runs, environments, warm set and models.
+#[derive(Clone)]
+struct Held {
+    runs: Vec<v1::RunState>,
+    environments: Vec<v1::Environment>,
+    warm: Vec<v1::WarmItem>,
+    models: crate::held_models::Listing,
+}
+
+async fn held_now<B: MachineBackend>(
+    identity: &Arc<MachineIdentity>,
+    backend: &Arc<B>,
+    actor: VerifiedActor,
+) -> Result<Held, Error> {
+    let store = identity.store.clone();
+    blocking(backend, move |backend| {
+        let models = store.as_deref().map(crate::held_models::listing);
+        let (runs, environments) = held(backend, actor)?;
+        Ok(Held { runs, environments, warm: backend.warm_set(actor)?, models: models.unwrap_or_default() })
+    })
+    .await
+}
+
 pub(super) async fn frame<B: MachineBackend>(
     identity: &Arc<MachineIdentity>,
     backend: &Arc<B>,
     actor: VerifiedActor,
 ) -> Result<v1::StatusFrame, Error> {
-    let store = identity.store.clone();
-    let ((runs, environments), warm, models) = blocking(backend, move |backend| {
-        let models = store.as_deref().map(crate::held_models::listing);
-        let held = held(backend, actor)?;
-        Ok((held, backend.warm_set(actor)?, models.unwrap_or_default()))
-    })
-    .await?;
+    Ok(picture(identity, held_now(identity, backend, actor).await?))
+}
+
+fn picture(identity: &MachineIdentity, held: Held) -> v1::StatusFrame {
+    let Held { runs, environments, warm, models } = held;
     let software = identity
         .updates
         .as_ref()
         .map(|updates| updates.software())
         .unwrap_or_default();
     let lifecycle = identity.lifecycle.as_ref();
-    Ok(v1::StatusFrame {
+    v1::StatusFrame {
         idle_deadline_unix_ms: lifecycle.map_or(0, |l| l.deadline_ms()),
         runs,
         phase: match lifecycle {
@@ -171,7 +214,7 @@ pub(super) async fn frame<B: MachineBackend>(
         toolchain: identity.updates.as_ref().map(|u| u.toolchain()).unwrap_or_default(),
         kernels: identity.updates.as_ref().map(|u| u.kernels()).unwrap_or_default(),
         ..identity_frame(identity)
-    })
+    }
 }
 
 fn held(
@@ -228,4 +271,51 @@ fn disk(path: &std::path::Path) -> Option<v1::Disk> {
         total_bytes: space.total,
         free_bytes: space.free,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+
+    /// A backend that counts each read of its records; the test moves its activity.
+    #[derive(Default)]
+    struct Counted {
+        activity: AtomicU64,
+        reads: AtomicUsize,
+    }
+    impl MachineBackend for Counted {
+        fn activity(&self) -> Option<u64> {
+            Some(self.activity.load(SeqCst))
+        }
+        fn list_packages(&self, _: VerifiedActor, _: domain::PackageListQuery) -> Result<domain::PackageList, Error> {
+            self.reads.fetch_add(1, SeqCst);
+            Ok(Default::default())
+        }
+        fn workspace(
+            &self,
+            _: VerifiedActor,
+            _: domain::MachineExecutionWorkspaceQuery,
+        ) -> Result<domain::MachineExecutionWorkspace, Error> {
+            Ok(Default::default())
+        }
+    }
+
+    /// An idle machine watched reads its engine's records once, not at every tick (the owner's
+    /// local machine spent half a core on it, 10-23); activity has them read again.
+    #[tokio::test]
+    async fn an_idle_watch_reads_the_engine_once_and_again_after_activity() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let identity = Arc::new(MachineIdentity::ephemeral("m".into(), vec![key], vec![7; 32]).unwrap());
+        let backend = Arc::new(Counted::default());
+        let actor = VerifiedActor { public_key: key.to_bytes() };
+        let mut frames = Box::pin(watch(identity, backend.clone(), actor));
+        frames.next().await.unwrap().unwrap();
+        let idle = tokio::time::timeout(Duration::from_millis(3500), frames.next()).await;
+        assert!(idle.is_err(), "an unchanged picture is not sent again");
+        assert_eq!(backend.reads.load(SeqCst), 1, "three idle ticks read nothing");
+        backend.activity.fetch_add(1, SeqCst);
+        let _ = tokio::time::timeout(Duration::from_millis(1500), frames.next()).await;
+        assert_eq!(backend.reads.load(SeqCst), 2, "activity is read once");
+    }
 }
