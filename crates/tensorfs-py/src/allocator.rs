@@ -110,6 +110,10 @@ struct Accounts {
     retired: BTreeSet<(i32, Pool)>,
     /// CUDA graph captures open per device (`capture`): torch skips its release and retry then.
     captures: BTreeMap<i32, u32>,
+    /// Per device, dropped pools' live bytes after torch's last release: what it could not
+    /// release (a cuBLAS workspace a request's first matmul made in its pool lives on). A NULL
+    /// is worth torch's release (a sync of its events) only once more is retired than that.
+    floor: BTreeMap<i32, u64>,
 }
 
 impl Accounts {
@@ -130,13 +134,22 @@ impl Accounts {
         self.retired.iter().filter(|(d, _)| *d == device).filter_map(|k| self.counts.get(k)).map(|c| c.live - c.pending.min(c.live)).sum()
     }
 
+    /// Whether a NULL would let torch release something: more retired than its last release
+    /// left, and no capture open (torch then skips the release, so the NULL would be an OOM).
+    fn releasable(&mut self, device: i32) -> bool {
+        let live = self.retired_live(device);
+        let floor = self.floor.entry(device).or_default();
+        *floor = (*floor).min(live);
+        live > *floor && self.captures.get(&device).is_none_or(|n| *n == 0)
+    }
+
     fn failed_release(&mut self, allocation: Allocation, reason: String) {
         self.faults.entry(allocation.device).or_insert(reason);
         self.quarantined.push(allocation);
     }
 }
 
-static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new(), retired: BTreeSet::new(), captures: BTreeMap::new() });
+static ACCOUNTS: Mutex<Accounts> = Mutex::new(Accounts { counts: BTreeMap::new(), pointers: BTreeMap::new(), faults: BTreeMap::new(), quarantined: Vec::new(), retired: BTreeSet::new(), captures: BTreeMap::new(), floor: BTreeMap::new() });
 
 fn accounts() -> std::sync::MutexGuard<'static, Accounts> {
     ACCOUNTS.lock().unwrap_or_else(|p| p.into_inner())
@@ -250,8 +263,14 @@ fn segment(size: usize) -> Result<cuda::CUdeviceptr, cuda::CUresult> {
 
 fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
     let _inside = Inside::enter();
-    // Torch's retry of this thread's last NULL (the same size): make room now.
+    // Torch's retry of this thread's last NULL (the same size): make room now. What its release
+    // left in dropped pools is the floor a NULL must beat from now on.
     let retry = RELEASING.with(Cell::take) == Some(size);
+    if retry {
+        let mut all = accounts();
+        let left = all.retired_live(device);
+        all.floor.insert(device, left);
+    }
     let active = ACTIVE.with(|a| a.borrow().iter().rev().find(|p| p.device == device).cloned());
     let key = (device, active.as_ref().map_or((0, 0), |a| a.pool));
     let bytes = size as u64;
@@ -302,10 +321,8 @@ fn alloc(size: usize, device: i32, stream: *mut c_void) -> *mut c_void {
         }
         let Some(a) = active.as_ref() else { return refuse("driver_capacity") };
         // Torch's unused segments first: a dropped pool's come back through torch's retry, once
-        // per routing (it syncs the pool's events), only while one holds segments and no capture
-        // is open on the device (torch then skips the retry: the NULL would be an OOM).
-        let releasable = |all: &Accounts| all.retired_live(device) > 0 && all.captures.get(&device).is_none_or(|n| *n == 0);
-        if !retry && !a.released.load(Relaxed) && releasable(&accounts()) {
+        // per routing (it syncs the pool's events), only while it could release something.
+        if !retry && !a.released.load(Relaxed) && accounts().releasable(device) {
             a.released.store(true, Relaxed);
             RELEASING.with(|r| r.set(Some(size)));
             accounts().counts.entry(key).or_default().released += 1;

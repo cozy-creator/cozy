@@ -184,7 +184,8 @@ class _Block:
     region: int
     tensors: dict[str, dict[str, _At]] = field(default_factory=dict)
     count: int = 0
-    stream: torch.cuda.Stream | None = None
+    #: the raw CUstream it was bound on (None off CUDA)
+    stream: int | None = None
     pin: Pin | None = None
     written: list[tuple[_Site, Tensor | None]] = field(default_factory=list)
     #: its mapping's address, the part views of it and the module tensors made of them: kept
@@ -346,10 +347,11 @@ class Binding:
                 try:
                     with self.model.lock:
                         for block, pin in zip(self.blocks, pins, strict=True):
+                            raw = stream.cuda_stream if stream is not None else None
                             if block.count == 0:
-                                memory._bind(block, stream, pin)
-                            elif stream is not None and block.stream != stream:
-                                stream.wait_stream(block.stream)
+                                memory._bind(block, raw, pin)
+                            elif raw is not None and block.stream != raw:
+                                memory._join(raw, block.stream)  # type: ignore[arg-type]
                             block.count += 1
                             held.append(block)
                     yield self
@@ -716,24 +718,31 @@ class Memory:
 
     # -- blocks
 
+    def _stream(self) -> int | None:
+        """The current raw CUstream (None off CUDA): an int, not a Stream object, per block."""
+        return torch._C._cuda_getCurrentRawStream(self.device.index or 0) if self.cuda else None
+
+    def _join(self, waiter: int, waited: int) -> None:
+        """`waiter` waits for the work queued on `waited` so far (two raw CUstreams)."""
+        self.crossed += 1
+        torch.cuda.ExternalStream(waiter, device=self.device).wait_stream(torch.cuda.ExternalStream(waited, device=self.device))
+
     def _enter(self, block: _Block, evict: bool = True) -> None:
-        stream = torch.cuda.current_stream(self.device) if self.cuda else None
+        stream = self._stream()
         with block.model.lock:
             if block.count == 0:
                 if self.cuda and torch.cuda.is_current_stream_capturing():
                     raise Unbound(f"block {block.path!r} was not prepared before capture")
                 self._bind(block, stream, evict=evict)
             elif stream is not None and stream != block.stream and not torch.cuda.is_current_stream_capturing():
-                self.crossed += 1
-                stream.wait_stream(block.stream)  # type: ignore[arg-type]  # a capture binds under a hold
+                self._join(stream, block.stream)  # type: ignore[arg-type]  # a capture binds under a hold
             block.count += 1
 
     def _exit(self, block: _Block) -> None:
-        stream = torch.cuda.current_stream(self.device) if self.cuda else None
+        stream = self._stream()
         with block.model.lock:
             if stream is not None and block.stream not in (None, stream) and not torch.cuda.is_current_stream_capturing():
-                self.crossed += 1
-                block.stream.wait_stream(stream)  # type: ignore[union-attr]
+                self._join(block.stream, stream)  # type: ignore[arg-type]
             block.count -= 1
             if block.count == 0:
                 pin = block.pin
@@ -762,8 +771,7 @@ class Memory:
         owns the pin, so the page stays bound while it lives (the escaped-view rule). Counted as
         an off-forward read."""
         model = block.model
-        stream = torch.cuda.current_stream(self.device) if self.cuda else None
-        pin = self.native.bind(model.id, block.region, stream.cuda_stream if stream is not None else 0)
+        pin = self.native.bind(model.id, block.region, self._stream() or 0)
         if self.device.type in ("cpu", "cuda"):
             window = pin.window()
             window.keep(pin)
@@ -787,10 +795,10 @@ class Memory:
             counts[key] = (reads + 1, nbytes + pin.len)
         return value
 
-    def _bind(self, block: _Block, stream: torch.cuda.Stream | None, pin: Pin | None = None, evict: bool = True) -> None:
+    def _bind(self, block: _Block, stream: int | None, pin: Pin | None = None, evict: bool = True) -> None:
         model = block.model
         if pin is None:
-            pin = self.native.bind(model.id, block.region, stream.cuda_stream if stream is not None else 0, evict)
+            pin = self.native.bind(model.id, block.region, stream or 0, evict)
         if self.device.type in ("cpu", "cuda"):
             if block.views is None or block.at != pin.ptr:  # a new mapping: its views once
                 window = pin.window()

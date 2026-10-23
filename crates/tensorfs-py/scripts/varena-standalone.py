@@ -270,10 +270,15 @@ def gone(memory: weakref.ref[Memory], phase: str) -> None:
     (empty_cache) and retired first."""
     gc.collect()
     if CUDA:
+        # cuBLAS keeps a workspace per handle and stream until cleared, made where its first
+        # matmul ran: in a request's pool, whose segment it keeps (and the memory with it).
+        torch._C._cuda_clearCublasWorkspaces()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         while native.allocator_pending(0):
             time.sleep(1e-3)
+        live = native.allocator_stats(0)[0]
+        check(f"{phase}: its pools' segments all came back", live == 0, (live, native.allocator_stats(0)))
     check(f"{phase}: its memory is gone before the next phase opens one", memory() is None, gc.get_referrers(memory()) if memory() else "")
 
 
