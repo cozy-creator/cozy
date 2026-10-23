@@ -151,6 +151,7 @@ async fn a_user_at_a_real_hub() {
         function: "generate".into(),
         bits: None,
         gpus: None,
+        sku: None,
     };
     let (status, _) = refused(
         anonymous
