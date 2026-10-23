@@ -94,9 +94,12 @@ pub trait Backend: Send + Sync {
     /// Blocks until `event` completes: only the mechanism thread, before it unmaps a page whose
     /// consumers may still read it, and a planned handover ([`crate::Memory::settle`]).
     fn finish(&self, event: Event) -> Result<()>;
-    /// Gives `event` up, pending or not, from any thread (the allocator hook's too): never
-    /// blocks on its work.
+    /// Gives `event` up, pending or not, from any thread (the allocator hook's too): it only
+    /// queues it, no driver call. Retiring one event twice destroys it once.
     fn retire(&self, event: Event);
+    /// Destroys the retired events that completed (never waiting on one): the mechanism and
+    /// trim threads only, since a destroy can wait on a driver lock another thread holds.
+    fn sweep(&self) {}
     /// After a device error: proves the copy stream's work complete or fails.
     fn drain(&self) -> Result<()>;
 }
@@ -250,5 +253,78 @@ impl Backend for HostBackend {
 
     fn drain(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Events given up: each destroyed exactly once, and only once complete, on a thread that may
+/// wait (destroying one can block on its work or on a driver lock another thread holds).
+#[derive(Default)]
+pub struct Retired(Mutex<Queue>);
+
+#[derive(Default)]
+struct Queue {
+    queued: Vec<Event>,
+    /// Taken by a sweep running now: a retire meanwhile does not queue them again.
+    sweeping: Vec<Event>,
+}
+
+impl Retired {
+    /// Gives `event` up, once however often it is given: queued, no driver call.
+    pub fn retire(&self, event: Event) {
+        let mut q = self.0.lock();
+        if event != Event::DONE && !q.queued.contains(&event) && !q.sweeping.contains(&event) {
+            q.queued.push(event);
+        }
+    }
+
+    /// Destroys the retired events `done` reports complete; the others stay queued. The queue
+    /// is not held across the driver calls, so a retire never waits on a sweep.
+    pub fn sweep(&self, done: impl Fn(Event) -> bool, destroy: impl Fn(Event)) {
+        let taken = {
+            let mut q = self.0.lock();
+            let taken = std::mem::take(&mut q.queued);
+            q.sweeping.extend(&taken);
+            taken
+        };
+        if taken.is_empty() {
+            return;
+        }
+        let pending: Vec<Event> = taken.iter().copied().filter(|e| !done(*e)).collect();
+        taken.iter().filter(|e| !pending.contains(e)).for_each(|e| destroy(*e));
+        let mut q = self.0.lock();
+        q.sweeping.retain(|e| !taken.contains(e));
+        for e in pending {
+            if !q.queued.contains(&e) {
+                q.queued.push(e);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    use super::*;
+
+    /// A retire never destroys; an event given up twice, while pending and after, is destroyed
+    /// once by a sweep, when complete.
+    #[test]
+    fn a_retired_event_is_destroyed_once_and_only_once_complete() {
+        let (retired, complete, destroyed) = (Retired::default(), RefCell::new(HashSet::new()), RefCell::new(Vec::new()));
+        let done = |e: Event| complete.borrow().contains(&e.0);
+        let destroy = |e: Event| destroyed.borrow_mut().push(e.0);
+        retired.retire(Event(7));
+        retired.retire(Event(7));
+        retired.retire(Event::DONE);
+        assert!(destroyed.borrow().is_empty(), "a retire destroyed");
+        retired.sweep(done, destroy);
+        assert!(destroyed.borrow().is_empty(), "a pending event was destroyed");
+        complete.borrow_mut().insert(7);
+        retired.retire(Event(7));
+        retired.sweep(done, destroy);
+        retired.sweep(done, destroy);
+        assert_eq!(*destroyed.borrow(), vec![7], "destroyed once, once complete");
     }
 }

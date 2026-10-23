@@ -1675,13 +1675,18 @@ impl Inner {
             // its consumers are done.
             let custody = if exported { self.withdraw(old_identity, key.1, span) } else { None };
             if custody.is_some() { st.table.pending += span; }
-            self.backend.retire(old);
+            // A ready event still pending is among `after` (a Keep waited on it): retired with them.
+            if !after.contains(&old) {
+                self.backend.retire(old);
+            }
             let ticket = self.mech.post(Mech::Renew { key, gen, va, off, span, old: phys, after, job }, 0);
             st.retired.insert((key, old_gen), Retirement { bytes: span, created, mechanism: Some(ticket), custody, kept: false });
             return Ok(());
         }
         // Read-write and nobody else's: filled again in place, after its consumers in-stream.
-        self.backend.retire(old);
+        if !after.contains(&old) {
+            self.backend.retire(old);
+        }
         self.queue_fills(vec![Job { after, ..job }], false)
     }
 
@@ -2842,6 +2847,7 @@ impl Inner {
     /// The trim thread's work: the Keeps waiting on events, custody settled after an answer,
     /// then a ledger event.
     fn idle_trim(&self, wanted: Wanted) {
+        self.backend.sweep();
         if wanted.keep {
             // Only copies still landing: a consumer's release is never waited on under a pin
             // (a renewing bind would wait for its forward).
@@ -3123,6 +3129,11 @@ fn mech_loop(queue: &Outbox<Mech>, inner: &Weak<Inner>) {
         // more.
         drop(me);
         queue.sent(ticket, 0);
+        // Retired events destroyed here (and on the trim thread), never on a caller's thread: a
+        // destroy can wait on a driver lock another thread's device sync holds.
+        if let Some(me) = Work::of(inner) {
+            me.backend.sweep();
+        }
     }
 }
 
