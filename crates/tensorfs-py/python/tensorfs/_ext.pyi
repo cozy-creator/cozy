@@ -66,6 +66,23 @@ class ConflictError(Error):
 class UnsupportedError(Error):
     """A source or target this build cannot represent (`unsupported`)."""
 
+class Ceiling:
+    """What reads can reach: the volume's sequential GB/s (past the page cache when `disk_direct`)
+    and, when a CUDA device was asked, pinned host-to-device GB/s over `streams` streams."""
+
+    @property
+    def disk_gbps(self) -> float: ...
+    @property
+    def disk_direct(self) -> bool: ...
+    @property
+    def h2d_gbps(self) -> float | None: ...
+    @property
+    def streams(self) -> int | None: ...
+
+def ceiling(device: int | None = None, path: StrPath | None = None) -> Ceiling:
+    """`path`'s volume (default: the TensorFS home) and, with `device`, pinned H2D to that GPU;
+    measured unless kept this boot."""
+
 class VerificationReport:
     """Local object references found missing or corrupt; verification never repairs them."""
 

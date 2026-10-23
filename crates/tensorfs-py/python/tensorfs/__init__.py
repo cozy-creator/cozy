@@ -12,6 +12,7 @@ from collections.abc import Mapping
 
 from ._ext import (
     Array,
+    Ceiling,
     Checkpoint,
     ClassRef,
     Component,
@@ -35,6 +36,7 @@ from ._ext import (
     UnsupportedError,
     VerificationReport,
     __version__,
+    ceiling,
 )
 from . import raw
 from .api import CheckpointFile, ComponentWriter, Endpoint, Writer, configure, convert_to_cozytensors, download_file, open, materialize, upload_folder
@@ -43,6 +45,7 @@ Mapping.register(Tensors)
 
 __all__ = [
     "Array",
+    "Ceiling",
     "Checkpoint",
     "CheckpointFile",
     "ClassRef",
@@ -70,6 +73,7 @@ __all__ = [
     "VerificationReport",
     "Writer",
     "__version__",
+    "ceiling",
     "configure",
     "convert_to_cozytensors",
     "download_file",

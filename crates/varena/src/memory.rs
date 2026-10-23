@@ -1,1760 +1,2970 @@
-//! Weights on one GPU, for the process computing with them (design memory-varena §5.1): a VA
-//! range per weight set, its home regions mapped in chunks, the rest streamed through scratch
-//! slots. A `Pinned` keeps its pages mapped and records a release event when it drops; eviction
-//! takes only unpinned pages whose fill and release events completed. Copies run on our own
-//! stream; consumers wait on events, the host never syncs.
+//! One executor's memory on one device (varena-leases). Leased, every page is a chunk the
+//! manager allocates, and room between processes is its reclaim. Standalone (no compatible
+//! manager), pages come from the device within a budget fixed at open (its free bytes less the
+//! reserve):
+//! `make_room` takes its own pages in [`crate::decide::victims`]' order, and a shortfall is
+//! `Exhausted`. One `parking_lot` mutex guards the table and the mechanism's state; it is never
+//! held across a fill, a wait on an event or a caller's callback.
+//!
+//! Lock order: none. The state lock is only ever taken alone; every other lock (the release
+//! receiver, the fill queue) is taken alone or inside the state lock and never takes another,
+//! and the state lock is never taken while one of them is held. Fills run on fill threads
+//! (demand misses before prefetches); pin releases arrive through a channel. A panic is caught at
+//! every public call and on every thread: the call fails `Internal`, the table is derived again
+//! from the mappings, and the process keeps serving.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::ffi::{c_int, c_void};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-#[cfg(feature = "store")]
-use std::os::fd::RawFd;
-use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
-use std::thread::JoinHandle;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
+
+use crossbeam_channel::{select_biased, unbounded, Receiver, Sender};
 use std::time::Instant;
 
-#[cfg(feature = "store")]
-use tensorfs::Checkpoint;
-use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream, CtxGuard, Handle};
-use crate::host::HostMem;
-use crate::io::{IoTally, Mode, Source};
-use crate::layout::{align_up, Layout, PART_ALIGN, REGION_ALIGN};
-use tensorfs::io::{self as byte_io, Copy, Dst, ReadOpts, Src};
-use crate::{lock, Error, Result};
+use parking_lot::{Condvar, Mutex, MutexGuard};
+use platform::contain::host_memory;
 
-/// Scratch slots kept while a region streams; more exist only while every one is pinned.
-const SLOTS: usize = 3;
-/// Idle chunks kept after an eviction for the next map; the rest go back to the driver.
-const IDLE_KEEP: u64 = 64 << 20;
+#[cfg(unix)]
+use tensorfs::io::source::Placement;
+use tensorfs::io::Dst;
 
-/// A checked driver call on handles this core made, in its context.
-macro_rules! call {
-    ($op:literal, $f:ident($($a:expr),* $(,)?)) => {
-        // SAFETY: live handles of our context; out-params point at live locals.
-        cuda::check($op, unsafe { (cuda::driver()?.$f)($($a),*) }).map_err(Error::from)
-    };
+use crate::backend::{Access, Allowance, Backend, Event, Physical, Va};
+use crate::decide::{self, Victim};
+use crate::table::{Class, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
+use crate::{Error, Exhausted, GpuId, Result};
+
+mod stream;
+mod torch;
+pub use torch::{Allocating, PoolId, TorchStats};
+use stream::{StreamIn, Streaming};
+
+/// A loaded set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SetId(pub u32);
+
+/// A graph's immutable address/layout/fill binding. Retention keeps the virtual reservation,
+/// never its physical pages. `prepare` leases the complete declared range before launch.
+pub struct Retained {
+    inner: Owner,
+    set: u32,
+    blocks: Vec<u32>,
+    identity: String,
 }
 
-struct Ev {
-    raw: CUevent,
-    timing: bool,
-    pool: Arc<Events>,
-}
-unsafe impl Send for Ev {}
-unsafe impl Sync for Ev {}
-type EvRef = Arc<Ev>;
-
-impl Ev {
-    fn done(&self) -> Result<bool> {
-        // SAFETY: a live event of our context.
-        match unsafe { (cuda::driver()?.event_query)(self.raw) } {
-            cuda::SUCCESS => Ok(true),
-            cuda::ERROR_NOT_READY => Ok(false),
-            rc => cuda::check("cuEventQuery", rc).map(|_| false).map_err(Error::from),
-        }
-    }
-
-    fn sync(&self) -> Result<()> {
-        call!("cuEventSynchronize", event_synchronize(self.raw))
-    }
-
-    /// Nanoseconds from `start` to this event, both completed timing events.
-    fn since(&self, start: &Ev) -> Result<u64> {
-        let mut ms = 0f32;
-        call!("cuEventElapsedTime", event_elapsed_time(&mut ms, start.raw, self.raw))?;
-        Ok((ms as f64 * 1e6) as u64)
-    }
+/// Preparation's claims prevent eviction of any dependency while all its pages are admitted.
+/// On failure they unwind without launching a consumer; completed fills may remain cached.
+struct Preparing {
+    inner: Owner,
+    pins: Vec<(u64, Key)>,
 }
 
-impl Drop for Ev {
+impl Drop for Preparing {
     fn drop(&mut self) {
-        lock(&self.pool.free)[self.timing as usize].push(self.raw);
+        let mut st = self.inner.lock();
+        for (id, key) in &self.pins {
+            st.pins.remove(id);
+            st.sync(*key);
+        }
+        self.inner.close_sets(&mut st);
+        self.inner.landed.notify_all();
     }
 }
 
-/// Reused events: a dropped one's waits are already enqueued, so reuse is safe.
-struct Events {
-    ctx: CUcontext,
-    free: Mutex<[Vec<CUevent>; 2]>,
-}
-unsafe impl Send for Events {}
-unsafe impl Sync for Events {}
+impl Retained {
+    pub fn identity(&self) -> &str { &self.identity }
 
-impl Events {
-    /// An event recorded on `stream` now.
-    fn record(self: &Arc<Self>, stream: CUstream, timing: bool) -> Result<EvRef> {
-        let raw = match lock(&self.free)[timing as usize].pop() {
-            Some(raw) => raw,
-            None => {
-                let _c = CtxGuard::enter(self.ctx)?;
-                let mut e: CUevent = std::ptr::null_mut();
-                call!("cuEventCreate", event_create(&mut e, if timing { cuda::EVENT_DEFAULT } else { cuda::EVENT_DISABLE_TIMING }))?;
-                e
+    pub fn valid(&self) -> bool {
+        let st = self.inner.state.lock();
+        st.mech(self.set).is_ok_and(|m| retained_identity(self.set, m, &self.blocks) == self.identity)
+    }
+
+    /// Every block is mapped and filled now: a read (no pin, no room made), for a capture that
+    /// may only run into what is resident.
+    pub fn resident(&self) -> bool {
+        let st = self.inner.state.lock();
+        self.blocks.iter().all(|b| st.table.page((self.set, *b)).is_some_and(|p| p.mapped && p.filled && !p.filling))
+    }
+
+    /// Acquires all physical dependencies atomically against eviction. The returned pins hold
+    /// them until completion on `stream`, including a cancelled caller's queued work. Callers
+    /// join every additional consumer stream back into `stream` before releasing these pins.
+    pub fn prepare(&self, stream: usize) -> Result<Vec<Pin>> { self.prepare_for(stream, None) }
+
+    pub fn prepare_for(&self, stream: usize, request: Option<&Request>) -> Result<Vec<Pin>> {
+        if request.is_some_and(|r| !Arc::ptr_eq(&self.inner, &r.inner)) {
+            return Err(Error::Invalid("range and request use different devices".into()));
+        }
+        self.inner.guard(|| {
+            let (preparing, req) = {
+                let mut st = self.inner.lock();
+                let m = st.mech(self.set)?;
+                if retained_identity(self.set, m, &self.blocks) != self.identity {
+                    return Err(Error::StaleBinding("retained range identity changed; recapture required".into()));
+                }
+                let req = request.map(|r| r.id).or_else(|| st.binding(self.set));
+                let mut pins = Vec::with_capacity(self.blocks.len());
+                for &block in &self.blocks {
+                    let key = (self.set, block);
+                    let id = st.tick();
+                    st.pins.insert(id, (key, req, std::thread::current().id()));
+                    st.sync(key);
+                    pins.push((id, key));
+                }
+                (Preparing { inner: self.inner.clone().into(), pins }, req)
+            };
+            // Every missing page's room together, before any consumer launches.
+            let (missing, keep): (u64, Vec<Key>) = {
+                let st = self.inner.lock();
+                let keys: Vec<Key> = self.blocks.iter().map(|b| (self.set, *b)).collect();
+                (keys.iter().filter_map(|k| st.table.page(*k)).filter(|p| !p.mapped).map(|p| p.bytes).sum(), keys)
+            };
+            if missing > 0 {
+                self.inner.make_room(missing, &keep, "prepare", req, false)?;
             }
-        };
-        let e = Arc::new(Ev { raw, timing, pool: self.clone() });
-        call!("cuEventRecord", event_record(e.raw, stream))?;
-        Ok(e)
+            let claims: Vec<u64> = preparing.pins.iter().map(|(id, _)| *id).collect();
+            let pins = self.blocks.iter().map(|b| self.inner.bind_for(self.set, *b, stream, req, &claims, false)).collect::<Result<Vec<_>>>()?;
+            let st = self.inner.lock();
+            if retained_identity(self.set, st.mech(self.set)?, &self.blocks) != self.identity {
+                return Err(Error::StaleBinding("retained range identity changed during preparation".into()));
+            }
+            drop(st);
+            drop(preparing);
+            Ok(pins)
+        })
     }
 }
 
-impl Drop for Events {
+impl Drop for Retained {
     fn drop(&mut self) {
-        if let Ok(d) = cuda::driver() {
-            for e in self.free.get_mut().unwrap().iter_mut().flat_map(|v| v.drain(..)) {
-                // SAFETY: our events.
-                unsafe { (d.event_destroy)(e) };
-            }
+        let mut st = self.inner.lock();
+        if let Some(Some(m)) = st.sets.get_mut(self.set as usize) {
+            m.retained = m.retained.saturating_sub(1);
         }
+        self.inner.close_sets(&mut st);
     }
 }
 
-/// Wait on `ev` in `stream` (enqueued; the host does not wait).
-fn wait_in(stream: CUstream, ev: &Ev) -> Result<()> {
-    call!("cuStreamWaitEvent", stream_wait_event(stream, ev.raw, 0))
+/// Where a bound block's bytes came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum Origin {
+    /// Already mapped and filled.
+    Hit,
+    /// Adopted from the lease manager's retention: no copy.
+    Kept,
+    /// The store, through the page cache.
+    Store,
 }
 
-/// Keeps the events not yet passed; true when none is left.
-fn passed(events: &mut Vec<EvRef>) -> Result<bool> {
-    let mut err = None;
-    events.retain(|e| match e.done() {
-        Ok(done) => !done,
-        Err(x) => {
-            err.get_or_insert(x);
-            true
-        }
-    });
-    err.map_or(Ok(events.is_empty()), Err)
+/// One bind: the page-reference trace the gate computes Belady MIN from.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Ref {
+    pub step: u32,
+    pub set: String,
+    pub block: u32,
+    pub bytes: u64,
+    pub origin: Origin,
+    /// It was prefetched before this bind.
+    pub speculative: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Counters {
-    pub binds: u64,
-    pub faults: u64,
-    pub paged_in: u64,
-    pub streamed_bytes: u64,
-    pub evicted: u64,
-    pub copy_ns: u64,
+/// Bytes filled from one source and the time the fills took, summed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Fills {
+    pub bytes: u64,
+    pub ns: u64,
+}
+
+/// Bytes moved, by source: fill time over bytes against the measured ceiling gives the %.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Moved {
+    /// Leased pages adopted from the manager's retention (no copy; `ns` is the ask, import and map).
+    pub kept: Fills,
+    /// Pages leased from the manager and filled here (`ns`: the ask, import and map).
+    pub leased: Fills,
+    pub store: Fills,
+    /// Of the above, bytes filled speculatively.
+    pub speculative: u64,
+}
+
+/// One step of a request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct StepStats {
+    /// The free bytes at its start: the manager's figure, or the standalone budget's.
+    pub capacity: u64,
+    /// Bytes `make_room` took during the step, by class (F, O, S, N, D, W, P).
+    pub evicted: [u64; 7],
+}
+
+/// One request's record (the design's §5 bar).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Stats {
+    pub request: String,
+    /// Every fill since the previous request ended (loads included) and during this one.
+    pub moved: Moved,
+    /// One entry per bind, after one per fill made before it opened (its loads: step 0, with
+    /// the fill's origin).
+    pub trace: Vec<Ref>,
+    pub steps: Vec<StepStats>,
+    /// Time binds waited on fills in flight (a demand miss, or a prefetch not yet landed).
     pub stall_ns: u64,
-    pub map_ns: u64,
+    /// Bytes `make_room` took for this request, by class (F, O, S, N, D, W, P).
+    pub evicted: [u64; 7],
+    /// The most it held at a pass end: pages and torch's bytes (the peak its passes reported,
+    /// when more).
+    pub peak: u64,
+    /// The most its passes allocated beside its weights, as they reported it: its compute bytes.
+    pub compute: u64,
+    /// The process's anonymous host high-water over it (file mappings aside); `None` where it
+    /// cannot be read.
+    pub host: Option<u64>,
+    /// Bytes the request still held when it ended (pins): 0.
+    pub leftover: u64,
+    /// Each `make_room` that had to take bytes for it, in order.
+    pub make_room: Vec<MakeRoom>,
+    pub outlived: Vec<crate::arena::Outlived>, // its torch blocks live at its end (the audit)
 }
 
-#[derive(Debug, Clone)]
-pub struct SetStats {
-    pub name: String,
-    pub nbytes: u64,
-    pub regions: u32,
-    pub home: u64,
-    pub resident: u64,
-    pub pinned: u64,
-    pub pins: u32,
-    pub slot_bytes: u64,
-    pub step: Counters,
-    pub last: Counters,
-    pub total: Counters,
+/// One `make_room` that had to take bytes: what asked, how many bytes, what it took.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MakeRoom {
+    /// The request's plan step then.
+    pub step: u32,
+    /// A bind or a range's preparation.
+    pub trigger: &'static str,
+    /// The free bytes asked for.
+    pub need: u64,
+    /// The bytes its rounds took (pages unmapped).
+    pub freed: u64,
+    /// Release events it waited on before taking their pages.
+    pub waited: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct GpuStats {
-    pub device: i32,
-    pub chunk: u64,
-    pub steps: u64,
-    pub mapped: u64,
-    pub idle: u64,
-    pub slots: u32,
-    pub slot_bytes: u64,
-    pub slot_span: u64,
-    pub driver_free: u64,
-    pub driver_total: u64,
-    pub sets: Vec<SetStats>,
-}
+/// Public handles count explicitly; internal worker references are not public ownership.
+/// The final public handle transfers its actual Arc, never a racing temporary clone.
+struct Owner(std::mem::ManuallyDrop<Arc<Inner>>);
 
-/// One stored part, `offset` bytes into its region; `role` is `""` for a plain tensor's data.
-#[derive(Debug, Clone)]
-pub struct Part {
-    pub component: String,
-    pub key: String,
-    pub role: String,
-    pub dtype: String,
-    pub shape: Vec<u64>,
-    pub region: u32,
-    pub offset: u64,
-    pub nbytes: u64,
+impl From<Arc<Inner>> for Owner {
+    fn from(inner: Arc<Inner>) -> Self {
+        inner.public_owners.fetch_add(1, Ordering::Relaxed);
+        Self(std::mem::ManuallyDrop::new(inner))
+    }
 }
-
-/// A registered checkpoint's regions, and what copies read: chunk files or a sealed host layout.
-pub struct Weights {
-    pub name: String,
-    pub layout: Layout,
-    pub parts: Vec<Part>,
-    source: Source,
-    host: Option<HostMem>,
+impl std::ops::Deref for Owner {
+    type Target = Arc<Inner>;
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
-
-#[cfg(feature = "store")]
-impl Weights {
-    /// Copies come from `host_fd`'s sealed layout if given, else the checkpoint's chunks.
-    fn open(name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>) -> Result<Weights> {
-        let (layout, source) = open_checkpoint(ck, regions, false)?;
-        let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
-        if host.as_ref().is_some_and(|h| h.window().is_some()) {
-            return Err(Error::Invalid("a streamed host layout: register takes a whole sealed layout".into()));
+impl Drop for Owner {
+    fn drop(&mut self) {
+        // SAFETY: Owner always contains one initialized Arc; only this Drop moves it out,
+        // and ManuallyDrop prevents a second release after the transfer.
+        let inner = unsafe { std::mem::ManuallyDrop::take(&mut self.0) };
+        if inner.public_owners.fetch_sub(1, Ordering::AcqRel) != 1 { return; }
+        inner._device.retiring(inner.ownership_lost.load(Ordering::Acquire));
+        // Its retirement waits on the work it needs done, on a thread of its own: no caller
+        // (Python, a DLPack destructor, the allocator) waits for it.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Arc<Inner>>(1);
+        let spawned = std::thread::Builder::new().name("varena-retire".into()).spawn(move || {
+            if let Ok(inner) = rx.recv() {
+                inner.retire();
+            }
+        });
+        let unsent = match spawned {
+            Ok(_) => tx.send(inner).err().map(|e| e.0),
+            Err(_) => Some(inner),
+        };
+        if let Some(inner) = unsent {
+            inner._device.retiring(true);
+            std::mem::forget(inner);
         }
-        Ok(Weights { name: name.into(), parts: parts(ck, &layout), layout, source, host })
     }
 }
 
-/// Each part of `layout` with its stored dtype and shape.
-#[cfg(feature = "store")]
-fn parts(ck: &Checkpoint, layout: &Layout) -> Vec<Part> {
-    layout.parts.iter().filter_map(|part| {
-        let info = ck.stored_part(&part.what)?;
-        Some(Part { component: info.component, key: info.key, role: info.role, dtype: info.dtype,
-            shape: info.shape, region: part.region,
-            offset: part.offset - layout.regions[part.region as usize].offset, nbytes: part.nbytes })
-    }).collect()
+/// One process's memory on one device. A clone is another public handle on it.
+pub struct Memory {
+    inner: Owner,
+    /// Memory handles (clones): the last one's drop closes it.
+    handles: Arc<AtomicUsize>,
 }
 
-#[derive(Clone)]
-enum Filled {
-    Ready(EvRef),
-    Failed(Error),
-    Unknown(Error),
+impl Clone for Memory {
+    fn clone(&self) -> Memory {
+        self.handles.fetch_add(1, Ordering::AcqRel);
+        Memory { inner: Arc::clone(&*self.inner).into(), handles: self.handles.clone() }
+    }
 }
 
-/// A failed fill is reclaimable only after its producer stream completed.
-struct Fill {
-    state: Mutex<Option<Filled>>,
+/// region.rs's hooks: the device's events, its free bytes, the manager's figures, and the plan.
+impl Memory {
+    pub(crate) fn record_event(&self, stream: usize) -> Result<Event> {
+        self.inner.backend.record(stream)
+    }
+
+    pub(crate) fn finish_event(&self, event: Event) -> Result<()> {
+        self.inner.backend.finish(event)
+    }
+
+    pub(crate) fn retire_event(&self, event: Event) {
+        self.inner.backend.retire(event)
+    }
+
+    pub(crate) fn synchronize(&self, stream: usize) -> Result<()> {
+        self.inner.backend.synchronize(stream)
+    }
+
+    pub(crate) fn granularity(&self) -> u64 {
+        self.inner.backend.granularity()
+    }
+
+    /// Free bytes nothing else needs reclaimed for ([`Inner::spare`]).
+    pub(crate) fn spare(&self) -> u64 {
+        let st = self.inner.state.lock();
+        self.inner.spare(&st)
+    }
+
+    /// The device's torch allocator, if anything allocated through it yet.
+    pub(crate) fn torch_if(&self) -> Option<Arc<crate::arena::Torch>> {
+        self.inner.torch.get().cloned()
+    }
+
+    /// The same device memory: two handles of one open.
+    pub(crate) fn same(&self, other: &Memory) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The manager's figures for this executor, while its pages are leased.
+    pub(crate) fn figures(&self) -> Option<crate::lease::Figures> {
+        #[cfg(unix)]
+        return self.inner.lease.get().map(|a| a.table().figures());
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Plan step `step`'s sets (each open request's current step when `None`): this process's
+    /// mapped bytes in them, its idle mapped bytes outside them, and their largest block.
+    pub(crate) fn step_bytes(&self, step: Option<u32>) -> (u64, u64, u64) {
+        let st = self.inner.state.lock();
+        let sets: BTreeSet<u32> = st.table.requests.iter().filter_map(|r| r.steps.get(step.unwrap_or(r.cursor.step) as usize)).flat_map(|(s, _)| s.iter().copied()).collect();
+        let (mut warm, mut cold, mut largest) = (0, 0, 0);
+        for ((set, _), p) in st.table.pages() {
+            if sets.contains(&set) {
+                largest = largest.max(p.bytes);
+                warm += if p.mapped { p.bytes } else { 0 };
+            } else if p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.filling {
+                cold += p.bytes;
+            }
+        }
+        (warm, cold, largest)
+    }
+
+    /// A region's facts to the lease manager (`None`: it is gone), while leased.
+    pub(crate) fn region_facts(&self, id: u64, record: Option<&crate::region::Record>) {
+        #[cfg(unix)]
+        if let Some(agent) = self.inner.lease.get() {
+            let sent = match record {
+                Some(r) => agent.region(crate::lease::wire::RegionFacts { id, kind: r.kind, slots: r.slots.clone(), cost_ns: r.cost_ns, last_use: r.last_use, next_use: r.next_use.map_or(u64::MAX, u64::from) }),
+                None => agent.region_gone(id),
+            };
+            if let Err(e) = sent {
+                tracing::debug!("varena: region {id}'s facts did not reach the lease manager: {e}");
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (id, record);
+    }
+
+    /// The lease slots of `sets`' leased pages.
+    pub(crate) fn lease_slots(&self, sets: &[SetId]) -> Vec<u32> {
+        #[cfg(unix)]
+        return self.inner.leased.lock().values().filter(|(_, key, _)| sets.iter().any(|s| s.0 == key.0)).map(|(t, ..)| t.slot).collect();
+        #[cfg(not(unix))]
+        {
+            let _ = sets;
+            Vec::new()
+        }
+    }
+
+    /// Every block of `set`.
+    pub(crate) fn blocks(&self, set: SetId) -> Result<Vec<u32>> {
+        let st = self.inner.state.lock();
+        let n = st.table.sets.get(set.0 as usize).and_then(|s| s.as_ref()).map(|s| s.pages.len()).ok_or_else(|| Error::Closed(format!("set {}", set.0)))?;
+        Ok((0..n as u32).collect())
+    }
+}
+
+/// A request in flight; dropping it ends it: its pins go, and the leftover is measured.
+pub struct Request {
+    inner: Owner,
+    id: u64,
+    ended: bool,
+}
+
+/// A block bound for use: mapped, and filled once `ready` completes (the binding stream already
+/// waits on it). Dropping it releases the block after the binding stream's work so far.
+pub struct Pin {
+    pub ptr: u64,
+    pub len: u64,
+    pub ready: Event,
+    /// Run the transform now: the page's bytes are not the weights yet (a declared or
+    /// undeclared fill's store bytes); [`Pin::filled`] after it. Never for bytes that are the
+    /// weights (stored, kept, or transformed).
+    pub fresh: bool,
+    inner: Owner,
+    key: Key,
+    id: u64,
+    stream: usize,
+    /// Fresh bytes of a set with a transform: refilled on release unless [`Pin::filled`].
+    transform: bool,
+    transformed: AtomicBool,
+}
+
+/// A pass of a set: the plan's cursor moves to it. Dropping it without [`Pass::end`] records
+/// no peak.
+pub struct Pass {
+    inner: Owner,
+    req: u64,
+    set: u32,
+    id: u64,
+}
+
+struct SetMech {
+    spec: SetSpec,
+    /// Its fingerprint's key at its current fill (derived once: a hash).
+    key: String,
+    va: Va,
+    closing: bool,
+    /// Graph/address references, independent of physical residency.
+    retained: u64,
+}
+
+fn retained_identity(set: u32, m: &SetMech, blocks: &[u32]) -> String {
+    format!("{set}:{}:{}:{}:{blocks:?}", m.va.base, m.va.len, m.key)
+}
+
+struct Home {
+    /// `None` while the mechanism thread creates and maps it.
+    phys: Option<Physical>,
+    ready: Event,
+    /// The stream `ready` is on ([`COPY`] for a fill's).
+    ready_on: usize,
+    /// Tells a fill whether its page is still the one it was queued for.
+    gen: u64,
+    filled: bool,
+    filling: bool,
+    /// Read ready at issue (`issued`), its batch not ended yet: the fill thread still accounts
+    /// for it and its copies may still land.
+    landing: bool,
+    /// A binder holds it fresh ([`Home::fresh`]) and runs the set's transform.
+    transforming: bool,
+    origin: Origin,
+    speculative: bool,
+    /// The fill identity its bytes were made under ([`crate::Fingerprint::key`]); empty: its
+    /// bytes are not the weights (a transform released undone), so it goes once unpinned.
+    identity: String,
+}
+
+impl Home {
+    /// A page the mechanism maps now, filling for `identity`.
+    fn new(gen: u64, speculative: bool, identity: String) -> Home {
+        Home { phys: None, ready: Event::DONE, ready_on: COPY, gen, filled: false, filling: true, landing: false, transforming: false, origin: Origin::Store, speculative, identity }
+    }
+}
+
+impl Home {
+    /// Its bytes landed and are not the weights yet: its binder runs the transform.
+    fn fresh(&self) -> bool {
+        !self.filled && !self.filling && !self.transforming
+    }
+}
+
+/// Wakes for state waiters: an epoch under a leaf mutex. A producer bumps it after its change
+/// (with the state lock or without: the allocator callback, a pin's drop); a waiter sleeps only
+/// while the epoch is the one it read before its last check, so no wake is lost between them.
+#[derive(Default)]
+struct Wakes {
+    epoch: Mutex<u64>,
     cv: Condvar,
 }
 
-impl Fill {
-    fn set(&self, r: Filled) {
-        *lock(&self.state) = Some(r);
+impl Wakes {
+    fn notify_all(&self) {
+        *self.epoch.lock() += 1;
         self.cv.notify_all();
     }
 
-    /// Until the copies are enqueued: the host waits only for reads that feed them.
-    fn wait(&self) -> Result<EvRef> {
-        match self.completion() {
-            Filled::Ready(ev) => Ok(ev),
-            Filled::Failed(e) | Filled::Unknown(e) => Err(e),
+    fn seen(&self) -> u64 {
+        *self.epoch.lock()
+    }
+
+    fn wait_past(&self, seen: u64) {
+        let mut epoch = self.epoch.lock();
+        while *epoch == seen {
+            self.cv.wait(&mut epoch);
         }
     }
+}
 
-    fn completion(&self) -> Filled {
-        self.cv.wait_while(lock(&self.state), |s| s.is_none()).unwrap_or_else(PoisonError::into_inner).clone().unwrap()
-    }
+/// A call to the device's virtual-memory mechanism (`cuMemCreate`, `cuMemMap`, `cuMemUnmap`):
+/// each may wait on the host for queued device work, so none runs under the state lock. One
+/// thread runs them in the order decided (an eviction's unmap before the create its bytes go
+/// to); each result re-enters the state.
+enum Mech {
+    /// Create (or lease) a page, map it read-write, then queue its fill; `decided`: the bind's
+    /// (none: a speculative page, which goes quietly when refused).
+    Map { key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: bool },
+    /// Unmap a page (the driver lets its consumers finish) and give it back.
+    Unmap { va: Va, off: u64, span: u64, phys: Option<Physical>, ready: Event },
+    /// A leased page whose fill identity changed (a grant's identity never changes): unmapped
+    /// after its consumers and given back, and a new page filled in its place.
+    Renew { key: Key, gen: u64, va: Va, off: u64, span: u64, old: Option<Physical>, after: Vec<Event>, job: Job },
+    /// A streamed set's slot moves from the block at `from` to `key`'s block, after the old block's consumers
+    /// (`after`); then `key`'s fill is queued.
+    Move { key: Key, gen: u64, va: Va, from: u64, off: u64, span: u64, phys: Physical, after: Vec<Event>, job: Job },
+    /// A closed set's reservation, after its pages' unmaps.
+    Release(Va),
+    /// The lease manager asked pages back: the quiet ones go, the busy ones once idle.
+    #[cfg(unix)]
+    Revoke,
+    /// The lease manager reclaims a region whole (crate::region).
+    #[cfg(unix)]
+    Reclaim { region: u64, swap: bool },
+    /// The Memory went: its thread ends.
+    Close,
+}
 
-    fn busy(&self) -> bool {
-        matches!(&*lock(&self.state), None | Some(Filled::Unknown(_)))
-    }
-
-    /// Nothing of it is in flight on the device.
-    fn landed(&self) -> Result<bool> {
-        match &*lock(&self.state) {
-            Some(Filled::Ready(ready)) => {
-                ready.done()
-            }
-            Some(Filled::Failed(_)) => Ok(true),
-            Some(Filled::Unknown(_)) => Ok(false),
-            None => Ok(false),
-        }
-    }
+struct Active {
+    id: u64,
+    thread: std::thread::ThreadId,
 }
 
 struct Job {
-    set: usize,
-    w: Arc<Weights>,
-    region: u32,
-    dst: u64,
-    waits: Vec<EvRef>,
-    fill: Arc<Fill>,
-}
-
-/// The copy stream busy from its first job to its last copy landing.
-#[derive(Default)]
-struct Run {
-    copies: Vec<(EvRef, EvRef)>,
-}
-
-#[derive(Default)]
-struct Jobs {
-    q: VecDeque<Job>,
-    stop: bool,
-}
-
-#[derive(Clone, Copy)]
-struct Chunk {
-    handle: Handle,
-    size: u64,
-    /// One region's whole allocation, which another process may hold by fd: never reused.
-    shared: bool,
-}
-
-/// Chunks mapped at `va`, the fill that put bytes there, and the pins on them.
-#[derive(Default)]
-struct Mapping {
-    va: u64,
+    key: Key,
+    gen: u64,
+    req: Option<u64>,
+    /// The page's bytes: a batch is cut by them.
     span: u64,
-    chunks: Vec<Chunk>,
-    fill: Option<Arc<Fill>>,
-    /// Filled and not yet bound.
-    fresh: bool,
-    pins: u32,
-    released: Vec<EvRef>,
-    /// Kept pages: a socket whose queue holds the allocation's fd, a dup of which TensorD holds,
-    /// so the pages outlive this process. Unmapping drains it; only our death leaves it full.
-    kept: Option<UnixStream>,
-    /// `kept` was handed out (`WeightSet::kept`).
-    deposited: bool,
-    read_only: bool,
+    /// The page's earlier consumers (release events) a refill in place writes after: the copy
+    /// stream waits on them in-stream, and they are retired once the fill's event follows them.
+    after: Vec<Event>,
 }
 
-impl Mapping {
-    fn settled(&self) -> bool {
-        self.pins == 0 && self.fill.as_ref().is_none_or(|f| !f.busy())
-    }
-
-    /// Nothing pins it and nothing is in flight on it.
-    fn quiet(&mut self) -> Result<bool> {
-        Ok(self.settled() && self.fill.as_ref().map_or(Ok(true), |f| f.landed())? && passed(&mut self.released)?)
-    }
-
-    /// A fill that failed, which nothing pins: it holds no bytes.
-    fn dead(&self) -> bool {
-        self.pins == 0 && self.fill.as_ref().is_some_and(|f| matches!(*lock(&f.state), Some(Filled::Failed(_))))
-    }
-
-    /// A new fill of it, and the releases its copies must wait for.
-    fn refill(&mut self) -> (Arc<Fill>, Vec<EvRef>) {
-        let fill = Arc::new(Fill { state: Mutex::new(None), cv: Condvar::new() });
-        (self.fill, self.fresh) = (Some(fill.clone()), true);
-        (fill, std::mem::take(&mut self.released))
-    }
-
-    fn pin(&mut self) -> (u64, Arc<Fill>, bool) {
-        self.pins += 1;
-        (self.va, self.fill.clone().expect("a bound mapping has a fill"), std::mem::take(&mut self.fresh))
-    }
+/// Fill jobs, in groups: the pages the mechanism mapped together (a bind's block) reach a fill
+/// thread as one, so they read as one run. A demand miss goes before any prefetch.
+struct Jobs {
+    demand: Sender<Vec<Job>>,
+    ahead: Sender<Vec<Job>>,
 }
 
-struct Reg {
-    home: bool,
-    map: Option<Mapping>,
+/// The backend's copy stream, where fills' ready events are ([`Backend::fence`]); no caller's
+/// stream is this.
+const COPY: usize = usize::MAX;
+
+/// One page of a fill batch: where it goes, and how its copy ended.
+struct Copying {
+    key: Key,
+    gen: u64,
+    dst: Dst,
+    out: Option<Result<Origin>>,
 }
 
-struct Set {
-    w: Arc<Weights>,
-    /// Every submitted source read until positively completed, independent of slot reassignment.
-    pending: Vec<Arc<Fill>>,
-    base: u64,
-    regs: Vec<Reg>,
-    step: Counters,
-    last: Counters,
-    total: Counters,
-    /// Asks take idle sets before warm ones, least recently bound (`used`) first, and never a
-    /// busy one (a forward in flight).
-    used: u64,
-    warm: bool,
-    busy: bool,
-    /// Home regions map as one shareable allocation each, whose pages can be kept.
-    shared: bool,
+/// The fill threads' work: jobs queued, batches running, the bytes filled since they were last
+/// all idle, and whether the Memory is gone. Its lock is a leaf; its condvar wakes the
+/// copies when the fills are idle.
+#[derive(Default)]
+struct Burst {
+    queued: u64,
+    batches: u32,
+    bytes: u64,
+    closed: bool,
 }
 
-impl Set {
-    fn track_fill(&mut self, fill: Arc<Fill>) {
-        self.pending.push(fill);
-    }
-
-    fn reap_fills(&mut self) -> Result<()> {
-        let mut error = None;
-        self.pending.retain(|fill| match fill.landed() {
-            Ok(done) => !done,
-            Err(e) => { error.get_or_insert(e); true }
-        });
-        error.map_or(Ok(()), Err)
-    }
-
-    fn count(&mut self, f: impl Fn(&mut Counters)) {
-        f(&mut self.step);
-        f(&mut self.total);
+impl Burst {
+    fn idle(&self) -> bool {
+        self.queued == 0 && self.batches == 0
     }
 }
 
-struct Slot {
-    m: Mapping,
-    /// (set, region) whose bytes it holds or is filling.
-    holds: Option<(usize, u32)>,
-    /// Prefetched and not yet bound.
-    pending: bool,
-    used: u64,
-}
-
-/// A GPU-timed interval, read into `field` once both events completed.
-struct Timing {
-    set: usize,
-    step: u64,
-    field: fn(&mut Counters) -> &mut u64,
-    a: EvRef,
-    b: EvRef,
+struct Release {
+    key: Key,
+    pin: u64,
+    event: Event,
+    /// The stream it was recorded on.
+    stream: usize,
+    /// Released fresh without its transform: its bytes are not the weights.
+    untransformed: bool,
 }
 
 #[derive(Default)]
 struct State {
-    idle: BTreeMap<u64, Vec<Handle>>,
-    mapped: u64,
-    sets: Vec<Option<Set>>,
-    slots: Vec<Option<Slot>>,
-    /// The largest streamed region's span: what a new slot maps.
-    slot_span: u64,
+    /// The wake epoch read when this lock was taken, before its drain: a wait sleeps only while
+    /// no change came after it.
+    seen: u64,
+    /// Each page's last bind on the machine-wide clock (CLOCK_MONOTONIC ns): the manager
+    /// compares idle pages across processes by it.
+    #[cfg(unix)]
+    used_ns: HashMap<Key, u64>,
+    table: Table,
+    sets: Vec<Option<SetMech>>,
+    homes: HashMap<Key, Home>,
+    /// Pin → (page, request, the thread that holds it).
+    pins: HashMap<u64, (Key, Option<u64>, std::thread::ThreadId)>,
+    /// Each stream's pending release events, in the order recorded: one stream's events complete
+    /// in order, so a drain queries only each stream's oldest.
+    events: BTreeMap<usize, VecDeque<(Event, Key)>>,
+    /// Sets streaming their upper blocks through slots (step 2's watermark), by set.
+    streams: HashMap<u32, Streaming>,
+    /// Ids and the logical clock.
     clock: u64,
-    steps: u64,
-    timings: Vec<Timing>,
+    /// Pages whose create the driver refused, with the driver's free bytes measured at the
+    /// refusal: the truth over the table's figure for the bind's next round.
+    short: HashMap<Key, u64>,
+    stats: HashMap<u64, Stats>,
+    /// Fills no open request made (loads): the next request's record opens with them.
+    unclaimed: Stats,
+    last: Option<Stats>,
+    /// Passes running, per (request, set): a joint step's sets each have their own.
+    active: HashMap<(u64, u32), Active>,
+    failed: HashMap<Key, Error>,
+    /// The latest unmap's mechanism ticket: whoever counts on its bytes settles up to it.
+    last_unmap: Option<u64>,
+    /// Requests whose last step is one their plan did not declare.
+    synthetic: HashSet<u64>,
+    /// This process's anonymous host peak while requests run.
+    window: Option<HostWindow>,
+}
+
+/// This process's anonymous host high-water since a start (file mappings aside): a request's
+/// host peak, for the manager's admission.
+struct HostWindow {
+    peak: u64,
+    file: u64,
+}
+
+impl HostWindow {
+    /// Measured from now; `None` where it cannot be read.
+    fn start() -> Option<HostWindow> {
+        let now = host_memory::resident(std::process::id()).ok()?;
+        HostWindow::restart();
+        Some(HostWindow { peak: now.anon, file: now.file })
+    }
+
+    /// The anonymous peak so far; `None` where it cannot be read.
+    fn look(&mut self) -> Option<u64> {
+        let now = host_memory::resident(std::process::id()).ok()?;
+        let bound = now.peak.saturating_sub(self.file.min(now.file) + now.shmem);
+        self.peak = self.peak.max(bound).max(now.anon);
+        self.file = now.file;
+        HostWindow::restart();
+        Some(self.peak)
+    }
+
+    /// The process's resident high-water starts over (where it may not, the next look bounds
+    /// from further back).
+    fn restart() {
+        if let Err(e) = host_memory::reset_peak(std::process::id()) {
+            tracing::debug!("varena: host high-water not reset: {e}");
+        }
+    }
 }
 
 impl State {
-    fn close_fences(&self, id: usize) -> Option<(Vec<Arc<Fill>>, Vec<EvRef>)> {
-        let set = self.sets.get(id)?.as_ref()?;
-        let maps = set.regs.iter().filter_map(|r| r.map.as_ref()).chain(
-            self.slots.iter().flatten().filter(|s| s.holds.is_some_and(|(set, _)| set == id)).map(|s| &s.m));
-        let mut fills = set.pending.clone();
-        let mut releases = vec![];
-        for m in maps {
-            if let Some(fill) = m.fill.as_ref().filter(|fill| !fills.iter().any(|held| Arc::ptr_eq(held, fill))) {
-                fills.push(fill.clone());
+    /// No work can touch the page: unpinned, no release event pending, not filling or being
+    /// transformed.
+    fn idle(&self, key: Key) -> bool {
+        self.table.page(key).is_some_and(|p| p.pins.is_empty() && p.releasing.is_empty())
+            && self.homes.get(&key).is_some_and(|h| !h.filling && !h.transforming)
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn mech(&self, set: u32) -> Result<&SetMech> {
+        self.sets.get(set as usize).and_then(Option::as_ref).ok_or_else(|| Error::Invalid(format!("no set {set}")))
+    }
+
+    /// Where a page lives: its set's VA, its offset and span.
+    fn place(&self, (set, block): Key) -> Result<(Va, u64, u64)> {
+        let m = self.mech(set)?;
+        let r = m.spec.layout.region(block)?;
+        Ok((m.va, r.offset, r.span))
+    }
+
+    /// The table's page facts from the mechanism's.
+    fn sync(&mut self, key: Key) {
+        let home = self.homes.get(&key).map(|h| (h.filled, h.filling, h.speculative));
+        let pins: Vec<u64> = self.pins.iter().filter(|(_, (k, ..))| *k == key).map(|(id, _)| *id).collect();
+        if let Some(p) = self.table.page_mut(key) {
+            p.mapped = home.is_some();
+            p.filled = home.is_some_and(|h| h.0);
+            p.filling = home.is_some_and(|h| h.1);
+            p.pins = pins;
+            if home.is_none_or(|h| !h.2) {
+                p.speculative = None;
             }
-            releases.extend(m.released.iter().cloned());
         }
-        Some((fills, releases))
     }
 
-    fn set(&mut self, id: usize) -> &mut Set {
-        self.sets[id].as_mut().expect("a live weight set")
+    fn stats(&mut self, req: Option<u64>) -> Option<&mut Stats> {
+        self.stats.get_mut(&req?)
     }
 
-    fn reg(&mut self, id: usize, r: u32) -> Result<&mut Reg> {
-        let regs = &mut self.set(id).regs;
-        let n = regs.len();
-        regs.get_mut(r as usize).ok_or_else(|| Error::Invalid(format!("region {r} of {n}")))
-    }
-
-    fn slot(&mut self, i: usize) -> &mut Slot {
-        self.slots[i].as_mut().expect("a live slot")
-    }
-
-    fn idle_bytes(&self) -> u64 {
-        self.idle.iter().map(|(s, v)| s * v.len() as u64).sum()
-    }
-
-    /// An idle chunk of `size`. An emptied size leaves the map, so `keep_idle`'s largest entry
-    /// always holds a chunk.
-    fn take_idle(&mut self, size: u64) -> Option<Handle> {
-        let std::collections::btree_map::Entry::Occupied(mut e) = self.idle.entry(size) else { return None };
-        let h = e.get_mut().pop();
-        if e.get().is_empty() {
-            e.remove();
+    /// Where a fill is recorded: its request's record, else (a load's, or one with no request
+    /// open) the next request's, which opens with them.
+    fn fills(&mut self, req: Option<u64>, key: Key, bytes: u64, origin: Origin) -> &mut Stats {
+        match req.filter(|r| self.stats.contains_key(r)) {
+            Some(r) => self.stats.entry(r).or_default(),
+            None => {
+                let set = self.sets.get(key.0 as usize).and_then(Option::as_ref).map(|m| m.spec.name.clone()).unwrap_or_default();
+                self.unclaimed.trace.push(Ref { step: 0, set, block: key.1, bytes, origin, speculative: false });
+                &mut self.unclaimed
+            }
         }
-        h
     }
 
-    fn resolve(&mut self) {
-        let (sets, steps) = (&mut self.sets, self.steps);
-        self.timings.retain(|t| {
-            match t.b.done() {
-                Ok(true) => {}
-                Ok(false) => return true,
-                Err(_) => return false,
-            }
-            let ns = t.b.since(&t.a).unwrap_or(0);
-            if let Some(Some(s)) = sets.get_mut(t.set) {
-                *(t.field)(&mut s.total) += ns;
-                if t.step == steps {
-                    *(t.field)(&mut s.step) += ns;
-                } else if t.step + 1 == steps {
-                    *(t.field)(&mut s.last) += ns;
-                }
-            }
-            false
-        });
+    fn step_stats(&mut self, req: u64) -> Option<&mut StepStats> {
+        let step = self.table.request(req)?.cursor.step as usize;
+        let s = self.stats.get_mut(&req)?;
+        if s.steps.len() <= step {
+            s.steps.resize(step + 1, StepStats::default());
+        }
+        s.steps.get_mut(step)
+    }
+
+    /// The request whose current pass runs `set`.
+    fn binding(&self, set: u32) -> Option<u64> {
+        self.active.iter().filter(|((_, s), a)| *s == set && a.thread == std::thread::current().id()).map(|((r, _), _)| *r).max()
     }
 }
 
-// ---------------------------------------------------------------- the GPU
-
+/// Signalled each time a worker thread lets go of its reference to the Memory: a retirement
+/// waits on it for the last to go.
 #[derive(Default)]
-struct Custody {
-    error: Option<Error>,
-    gpu: Option<Arc<Gpu>>,
-    pins: BTreeMap<usize, Arc<WeightSet>>,
-    releases: Vec<EvRef>,
+struct Quiet {
+    lock: Mutex<()>,
+    gone: Condvar,
+}
+
+/// A worker thread's reference to the Memory for one item; letting go of it wakes a retirement.
+struct Work {
+    inner: std::mem::ManuallyDrop<Arc<Inner>>,
+    quiet: Arc<Quiet>,
+}
+
+impl Work {
+    fn of(inner: &Weak<Inner>) -> Option<Work> {
+        let inner = inner.upgrade()?;
+        let quiet = inner.quiet.clone();
+        Some(Work { inner: std::mem::ManuallyDrop::new(inner), quiet })
+    }
+}
+
+impl std::ops::Deref for Work {
+    type Target = Arc<Inner>;
+    fn deref(&self) -> &Arc<Inner> {
+        &self.inner
+    }
+}
+
+impl Drop for Work {
+    fn drop(&mut self) {
+        // SAFETY: taken once, here; ManuallyDrop never drops it again.
+        drop(unsafe { std::mem::ManuallyDrop::take(&mut self.inner) });
+        let _quiet = self.quiet.lock.lock();
+        self.quiet.gone.notify_all();
+    }
 }
 
 struct Inner {
-    ordinal: i32,
-    ctx: CUcontext,
-    prop: AllocationProp,
-    /// Allocations exportable as POSIX fds, where the device supports them.
-    shared: Option<AllocationProp>,
-    chunk: u64,
-    events: Arc<Events>,
-    copy: CUstream,
-    tally: IoTally,
-    jobs: (Mutex<Jobs>, Condvar),
-    st: Mutex<State>,
-    owner: Mutex<Weak<Gpu>>,
-    custody: Mutex<Custody>,
+    backend: Arc<dyn Backend>,
+    /// Standalone, every page's and torch chunk's: the device's free bytes at open less its
+    /// reserve.
+    allowance: Arc<Allowance>,
+    /// The lease agent once attached (varena-leases): this GPU's pages are the manager's chunks.
+    #[cfg(unix)]
+    lease: std::sync::OnceLock<Arc<crate::lease::Agent>>,
+    /// Leased pages by physical id: their grant, their key, and whether their bytes are still
+    /// the region they were granted for (a moved slot's never are again).
+    #[cfg(unix)]
+    leased: Mutex<HashMap<u64, (crate::lease::Ticket, Key, bool)>>,
+    /// Asked back while in use: pinned in the table until idle, then given.
+    #[cfg(unix)]
+    declined: Mutex<HashSet<crate::lease::Ticket>>,
+    /// Leased pages filled whose bytes the manager has not heard landed yet: acked once their
+    /// ready event completes (only landed bytes are retained).
+    #[cfg(unix)]
+    to_land: Mutex<Vec<Key>>,
+    state: Mutex<State>,
+    /// Every change a state waiter may test, from any thread (a pin's drop holds no state lock):
+    /// an epoch the waiter read before its last check.
+    landed: Wakes,
+    /// The device's mechanism calls, for its one thread.
+    mech: Arc<Mechs>,
+    release_tx: Sender<Release>,
+    releases: Receiver<Release>,
+    /// Fill jobs; the fill threads hold the receiving ends and a weak reference to the rest,
+    /// so dropping the Memory ends them.
+    jobs: Jobs,
+    /// Pages the mechanism thread mapped and has not handed to the fill threads yet (demand,
+    /// ahead): it hands them over together once its queue is empty or they make a batch.
+    grouped: Mutex<(Vec<Job>, Vec<Job>)>,
+    burst: Arc<(Mutex<Burst>, Condvar)>,
+    quiet: Arc<Quiet>,
+    ownership_lost: AtomicBool,
+    public_owners: AtomicU64,
+    #[cfg(unix)]
+    tally: tensorfs::io::source::IoTally,
+    torch: std::sync::OnceLock<Arc<crate::arena::Torch>>,
+    _device: Device,
 }
-unsafe impl Send for Inner {}
-unsafe impl Sync for Inner {}
 
-/// One GPU of this process: its VA, chunk cache, copy stream and scratch slots.
-pub struct Gpu {
-    inner: Arc<Inner>,
-    mover: Option<JoinHandle<()>>,
+/// The mechanism's queue: its calls in the order decided, each with a ticket, so a caller waits
+/// for the calls up to one ([`Mechs::settle_to`]).
+struct Mechs {
+    tx: Sender<(u64, Mech)>,
+    rx: Receiver<(u64, Mech)>,
+    /// Tickets are taken and sent under it: the channel's order is the tickets'.
+    sending: Mutex<()>,
+    posted: AtomicU64,
+    done: AtomicU64,
+    wakes: Wakes,
 }
 
-impl Gpu {
-    /// CUDA device `ordinal`, mapping in physical chunks of `chunk` bytes (a multiple of 2 MiB).
-    pub fn open(ordinal: i32, chunk: u64) -> Result<Arc<Gpu>> {
-        if chunk == 0 || !chunk.is_multiple_of(REGION_ALIGN) {
-            return Err(Error::Invalid(format!("chunks of {chunk} bytes: a multiple of {REGION_ALIGN}")));
+impl Mechs {
+    fn new() -> Mechs {
+        let (tx, rx) = unbounded();
+        Mechs { tx, rx, sending: Mutex::new(()), posted: AtomicU64::new(0), done: AtomicU64::new(0), wakes: Wakes::default() }
+    }
+
+    /// Queues `op`; its ticket.
+    fn post(&self, op: Mech) -> u64 {
+        let _one = self.sending.lock();
+        let ticket = self.posted.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.tx.send((ticket, op)).is_err() {
+            self.finished(ticket);
         }
-        let (dev, ctx) = cuda::primary_context(ordinal)?;
-        let _c = CtxGuard::enter(ctx)?;
-        if cuda::attribute(dev, cuda::ATTR_VMM_SUPPORTED)? != 1 {
-            return Err(Error::Invalid(format!("device {ordinal} has no virtual memory management")));
+        ticket
+    }
+
+    fn finished(&self, ticket: u64) {
+        self.done.fetch_max(ticket, Ordering::AcqRel);
+        self.wakes.notify_all();
+    }
+
+    /// Blocks until the calls up to `ticket` ran.
+    fn settle_to(&self, ticket: u64) {
+        loop {
+            let seen = self.wakes.seen();
+            if self.done.load(Ordering::Acquire) >= ticket {
+                return;
+            }
+            self.wakes.wait_past(seen);
         }
-        let prop = AllocationProp::device(dev, cuda::MEM_HANDLE_TYPE_NONE);
-        let fds = cuda::attribute(dev, cuda::ATTR_POSIX_FD_SUPPORTED)? == 1;
-        let shared = fds.then(|| AllocationProp::device(dev, cuda::MEM_HANDLE_TYPE_POSIX_FD));
-        let mut g = 0usize;
-        call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut g, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
-        if g == 0 || !REGION_ALIGN.is_multiple_of(g as u64) {
-            return Err(Error::Invalid(format!("device {ordinal}: granularity {g} does not divide {REGION_ALIGN}")));
+    }
+
+    /// Blocks until every call posted so far ran.
+    fn settle(&self) {
+        self.settle_to(self.posted.load(Ordering::Acquire));
+    }
+
+    fn idle(&self) -> bool {
+        self.done.load(Ordering::Acquire) >= self.posted.load(Ordering::Acquire)
+    }
+}
+
+fn exhausted(need: u64, site: Option<&str>, stats: Stats) -> Box<Exhausted> {
+    Box::new(Exhausted { need, site: site.map(str::to_string), stats, foreign: None })
+}
+
+impl Memory {
+    /// Opens `gpu` for this process: one Memory per device per process. Its pages are leased
+    /// once [`Memory::lease`] attaches it to a manager; until then (or with none) they come from
+    /// the device within the standalone budget: its free bytes now less the reserve (rev 6).
+    pub fn open(gpu: GpuId, backend: Box<dyn Backend>) -> Result<Memory> {
+        crate::caught(|| {
+            if !crate::layout::REGION_ALIGN.is_multiple_of(backend.granularity().max(1)) {
+                return Err(Error::Invalid(format!("granularity {} does not divide a region", backend.granularity())));
+            }
+            let device = Device::open(&gpu.uuid)?;
+            let (release_tx, releases) = unbounded();
+            let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
+            let allowance = Arc::new(Allowance::of(&*backend)?);
+            let inner = Arc::new(Inner {
+                allowance,
+                backend: Arc::from(backend),
+                #[cfg(unix)]
+                lease: std::sync::OnceLock::new(),
+                #[cfg(unix)]
+                leased: Mutex::default(),
+                #[cfg(unix)]
+                declined: Mutex::default(),
+                #[cfg(unix)]
+                to_land: Mutex::default(),
+                _device: device,
+                state: Mutex::default(),
+                landed: Wakes::default(),
+                mech: Arc::new(Mechs::new()),
+                release_tx,
+                releases,
+                jobs: Jobs { demand, ahead },
+                grouped: Mutex::default(),
+                burst: Arc::new((Mutex::new(Burst::default()), Condvar::new())),
+                quiet: Arc::default(),
+                ownership_lost: AtomicBool::new(false),
+                public_owners: AtomicU64::new(0),
+                #[cfg(unix)]
+                tally: Default::default(),
+                torch: Default::default(),
+            });
+            let (weak, queue) = (Arc::downgrade(&inner), inner.mech.clone());
+            std::thread::Builder::new().name("varena-mechanism".into()).spawn(move || mech_loop(&queue, &weak)).map_err(|e| Error::io("spawn mechanism", e))?;
+            // One fill thread per copy stream TensorFS runs per device: a fill waits on its
+            // streams, so this many keep them busy.
+            for _ in 0..tensorfs::io::ReadOpts::default().streams.max(1) {
+                let (weak, demand, ahead) = (Arc::downgrade(&inner), demanded.clone(), wanted_ahead.clone());
+                std::thread::Builder::new().name("varena-fill".into()).spawn(move || fill_loop(&demand, &ahead, &weak)).map_err(|e| Error::io("spawn fill", e))?;
+            }
+            Ok(Memory { inner: inner.into(), handles: Arc::new(AtomicUsize::new(1)) })
+        })
+    }
+
+    /// Leases this GPU's pages from the manager serving it (TensorD's, in this user's
+    /// namespace), right after open, before any load: from then on its pages are the manager's
+    /// chunks, retained by it across this process's exit, and asked back by it. A refusal comes
+    /// back typed, `Some((code, why))`: Incompatible or Absent runs standalone; the caller fails
+    /// on any other (TensorD parks a peer it has not registered yet, so the dial itself waits).
+    #[cfg(unix)]
+    pub fn lease(&self) -> Result<Option<(crate::lease::Refusal, String)>> {
+        let uuid = self.inner._device.0.clone();
+        match crate::lease::connect(crate::os::euid(), &uuid)? {
+            Some(stream) => self.lease_over(stream),
+            None => Ok(Some((crate::lease::Refusal::Absent, format!("no lease manager serves GPU {uuid}")))),
         }
-        let mut s: CUstream = std::ptr::null_mut();
-        call!("cuStreamCreate", stream_create(&mut s, cuda::STREAM_NON_BLOCKING))?;
-        let inner = Arc::new(Inner {
-            ordinal,
-            ctx,
-            prop,
-            shared,
-            chunk,
-            events: Arc::new(Events { ctx, free: Mutex::default() }),
-            copy: s,
-            tally: IoTally::default(),
-            jobs: Default::default(),
-            st: Mutex::default(),
-            owner: Mutex::default(),
-            custody: Mutex::default(),
+    }
+
+    /// Whether its pages are leased ([`Memory::lease`]).
+    pub fn leased(&self) -> bool {
+        self.inner.leasing()
+    }
+
+    /// [`Memory::lease`] over a stream its host connected.
+    #[cfg(unix)]
+    pub fn lease_over(&self, stream: crate::os::Stream) -> Result<Option<(crate::lease::Refusal, String)>> {
+        let mech = self.inner.mech.clone();
+        let revoked = move || {
+            mech.post(Mech::Revoke);
+        };
+        match crate::lease::Agent::attach(stream, self.inner.backend.clone(), revoked)? {
+            crate::lease::Attach::Leased(agent) => {
+                let mech = self.inner.mech.clone();
+                agent.on_reclaim(Box::new(move |region, swap| {
+                    mech.post(Mech::Reclaim { region, swap });
+                }))?;
+                if self.inner.lease.set(agent).is_err() {
+                    return Err(Error::Invalid("this Memory is leased already".into()));
+                }
+                // torch's blocks come from leased chunks too: the agent is its only allocator.
+                self.serve_leased_torch()?;
+                Ok(None)
+            }
+            crate::lease::Attach::Refused { code, why } => Ok(Some((code, why))),
+        }
+    }
+
+    /// Registers a set and brings it to `level`; a set loaded again is re-levelled in place.
+    /// Leased, a page the manager retains comes back with no copy; the rest fill from the store,
+    /// through the page cache.
+    pub fn load(&self, set: SetSpec, level: Level) -> Result<SetId> {
+        let (name, bytes) = (set.name.clone(), set.layout.nbytes);
+        let id = self.inner.guard(|| self.inner.load(set, level))?;
+        if level == Level::Gpu {
+            self.inner.measured(crate::lease::Measured::Set { name, bytes });
+        }
+        Ok(id)
+    }
+
+    /// Unmaps the set's pages (each as its pin releases) and forgets it.
+    pub fn unload(&self, set: SetId) {
+        let _ = self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            if let Some(Some(m)) = st.sets.get_mut(set.0 as usize) {
+                m.closing = true;
+            }
+            self.inner.close_sets(&mut st);
+            self.inner.unlock(st);
+            Ok(())
         });
-        let m = inner.clone();
-        let mover = std::thread::Builder::new().name(format!("varena-copy-{ordinal}")).spawn(move || m.mover());
-        let gpu = Arc::new(Gpu { inner: inner.clone(), mover: Some(mover.map_err(|e| Error::Io(format!("spawn copy thread: {e}")))?) });
-        *lock(&inner.owner) = Arc::downgrade(&gpu);
-        Ok(gpu)
     }
 
-    pub fn device(&self) -> i32 {
-        self.inner.ordinal
+    /// Sets the set's current fill identity (a no-op when unchanged). Pages filled under another
+    /// one are unmapped (a pinned one when it is released), so each next bind fills again, from
+    /// kept pages of the new identity or the store, and comes back `fresh`.
+    pub fn fill(&self, set: SetId, fill: Fill) {
+        let _ = self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            let r = self.inner.refill(&mut st, set.0, fill);
+            self.inner.unlock(st);
+            r
+        });
     }
 
-    pub fn chunk(&self) -> u64 {
-        self.inner.chunk
+    /// Opens a request with its plan; Belady runs over the open requests' plans.
+    pub fn request(&self, id: &str, plan: Plan) -> Result<Request> {
+        let rid = self.inner.guard(|| self.inner.open_request(id, &plan, false))?;
+        Ok(Request { inner: self.inner.clone().into(), id: rid, ended: false })
     }
 
-    /// `regions` (`tensorfs::raw::regions`) of a checkpoint as one weight set.
-    #[cfg(feature = "store")]
-    pub fn register(self: &Arc<Self>, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>) -> Result<Arc<WeightSet>> {
-        let weights = Arc::new(Weights::open(name, ck, regions, host_fd)?);
-        let g = &self.inner;
-        g.check()?;
-        let _c = CtxGuard::enter(g.ctx)?;
-        let mut st = g.lock();
-        g.check()?;
-        let base = reserve_va(weights.layout.nbytes.max(REGION_ALIGN))?;
-        let regs = weights.layout.regions.iter().map(|_| Reg { home: true, map: None }).collect();
-        let (w, z) = (weights.clone(), Counters::default());
-        st.sets.push(Some(Set { w, pending: vec![], base, regs, step: z, last: z, total: z, used: 0, warm: true, busy: false, shared: false }));
-        Ok(Arc::new(WeightSet { gpu: self.clone(), id: st.sets.len() - 1, base, weights }))
+    /// Opens a request for idle work (a graph capture off the request path): its binds, its
+    /// ranges' preparation and its allocator hook's room take free bytes only, `Exhausted` at
+    /// once when they lack them; it asks no peer and withdraws no kept page, so it never holds
+    /// up another request.
+    pub fn request_idle(&self, id: &str, plan: Plan) -> Result<Request> {
+        let rid = self.inner.guard(|| self.inner.open_request(id, &plan, true))?;
+        Ok(Request { inner: self.inner.clone().into(), id: rid, ended: false })
     }
 
-    /// A sealed host layout (TensorD's deposit) registered from the regions it carries: no
-    /// module needed, so its copy to the GPU (`WeightSet::prefetch`) runs while the module is
-    /// still being built. A module whose regions differ (`WeightSet::regions`) cannot use it.
-    #[cfg(feature = "store")]
-    pub fn adopt(self: &Arc<Self>, name: &str, ck: &Checkpoint, host_fd: RawFd) -> Result<Arc<WeightSet>> {
-        self.register(name, ck, &crate::host::sealed_regions(host_fd)?, Some(host_fd))
+    /// Maps and fills block `block` of `set`; `stream` (a `CUstream`, 0 the default) waits on
+    /// the fill in-stream, and the release is ordered after its work.
+    pub fn bind(&self, set: SetId, block: u32, stream: usize) -> Result<Pin> {
+        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, None, &[], false))
     }
 
-    pub fn trim(&self) -> Result<u64> {
-        let g = &self.inner;
-        g.with(|st| {
-            g.shed(st, SLOTS)?;
-            g.keep_idle(st, 0)
+    /// [`Memory::bind`] into free bytes only: `Exhausted` at once when they lack the block's,
+    /// nothing taken.
+    pub fn bind_free(&self, set: SetId, block: u32, stream: usize) -> Result<Pin> {
+        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, None, &[], true))
+    }
+
+    /// Retains stable virtual addresses for exactly these blocks, without making them resident.
+    pub fn retain(&self, set: SetId, blocks: &[u32]) -> Result<Retained> {
+        self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            let blocks: Vec<u32> = blocks.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
+            let m = st.mech(set.0)?;
+            if m.closing {
+                return Err(Error::Closed(format!("set {}", set.0)));
+            }
+            for &b in &blocks { m.spec.layout.region(b)?; }
+            let identity = retained_identity(set.0, m, &blocks);
+            if let Some(Some(m)) = st.sets.get_mut(set.0 as usize) { m.retained += 1; }
+            Ok(Retained { inner: self.inner.clone().into(), set: set.0, blocks, identity })
         })
     }
 
-    /// Frees up to `want` for an ask (design §5.2): idle chunks and slots (under ""), then home
-    /// pages of sets as `Set::used` orders them, then the slots no bound block uses, which the
-    /// next streamed block maps again. Returns what each gave.
-    pub fn give(&self, want: u64) -> Result<Vec<(String, u64)>> {
-        let trimmed = self.trim()?;
-        let g = &self.inner;
-        g.with(|st| {
-            let (mut gave, mut freed) = (vec![], trimmed);
-            if trimmed > 0 {
-                gave.push((String::new(), trimmed));
-            }
-            let live = st.sets.iter().enumerate().filter_map(|(id, s)| Some((id, s.as_ref().filter(|s| !s.busy)?)));
-            let mut order: Vec<(bool, u64, usize)> = live.map(|(id, s)| (s.warm, s.used, id)).collect();
-            order.sort_unstable();
-            for (_, _, id) in order {
-                if freed >= want {
-                    break;
-                }
-                let n = g.evict(st, id, None, want - freed)?;
-                if n > 0 {
-                    gave.push((st.set(id).w.name.clone(), n));
-                    freed += n;
-                }
-            }
-            if freed < want {
-                let n = g.shed(st, 0)?;
-                if n > 0 {
-                    gave.push((String::new(), n));
-                }
-            }
-            g.keep_idle(st, IDLE_KEEP)?;
-            Ok(gave)
-        })
+    /// Whether driver-owned context growth has a measurable per-process owner. A graph
+    /// capacity proof must report this; the opening-context fallback alone cannot prove it.
+    pub fn context_measurable(&self) -> bool { self.inner.backend.process_used().is_ok() }
+
+    /// Blocks until every mechanism call decided so far was made (maps, unmaps, give-backs).
+    pub fn settle(&self) {
+        self.inner.mech.settle();
     }
 
-    pub fn step(&self) {
-        let mut st = self.inner.lock();
-        st.resolve();
-        st.steps += 1;
-        for s in st.sets.iter_mut().flatten() {
-            s.last = std::mem::take(&mut s.step);
+    /// The record of the request that ended last.
+    pub fn stats(&self) -> Option<Stats> {
+        let st = self.inner.state.lock();
+        st.last.clone()
+    }
+
+    /// This process's mapped page bytes by class ([`Class::index`]).
+    pub fn classes(&self) -> [u64; 7] {
+        let st = self.inner.lock();
+        let mut out = [0u64; 7];
+        for (key, page) in st.table.pages() {
+            if let Some(slot) = st.table.class(key).and_then(|c| out.get_mut(c.index())) {
+                *slot += page.bytes;
+            }
         }
-    }
-
-    pub fn stats(&self) -> Result<GpuStats> {
-        let g = &self.inner;
-        g.with(|st| {
-            let (mut free, mut total) = (0usize, 0usize);
-            call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
-            st.resolve();
-            let held: Vec<(usize, u32, u64)> = st.slots.iter().flatten().filter_map(|s| s.holds.map(|(set, _)| (set, s.m.pins, s.m.span))).collect();
-            let set = |(id, s): (usize, &Set)| {
-                let regions = &s.w.layout.regions;
-                let sum = |f: &dyn Fn(&Reg) -> bool| s.regs.iter().zip(regions).filter(|(r, _)| f(r)).map(|(_, x)| x.span).sum();
-                let mine = || held.iter().filter(move |h| h.0 == id);
-                SetStats {
-                    name: s.w.name.clone(),
-                    nbytes: s.w.layout.nbytes,
-                    regions: regions.len() as u32,
-                    home: sum(&|r| r.home),
-                    resident: sum(&|r| r.map.is_some()),
-                    pinned: sum(&|r| r.map.as_ref().is_some_and(|m| m.pins > 0)),
-                    pins: s.regs.iter().filter_map(|r| r.map.as_ref()).map(|m| m.pins).sum::<u32>() + mine().map(|h| h.1).sum::<u32>(),
-                    slot_bytes: mine().map(|h| h.2).sum(),
-                    step: s.step,
-                    last: s.last,
-                    total: s.total,
-                }
-            };
-            let sets = st.sets.iter().enumerate().filter_map(|(id, s)| Some((id, s.as_ref()?))).map(set).collect();
-            Ok(GpuStats {
-                device: g.ordinal,
-                chunk: g.chunk,
-                steps: st.steps,
-                mapped: st.mapped,
-                idle: st.idle_bytes(),
-                slots: st.slots.iter().flatten().count() as u32,
-                slot_bytes: st.slots.iter().flatten().map(|s| s.m.span).sum(),
-                slot_span: st.slot_span,
-                driver_free: free as u64,
-                driver_total: total as u64,
-                sets,
-            })
-        })
-    }
-}
-
-impl Drop for Gpu {
-    fn drop(&mut self) {
-        lock(&self.inner.jobs.0).stop = true;
-        self.inner.jobs.1.notify_all();
-        if let Some(t) = self.mover.take() {
-            let _ = t.join();
-        }
+        out
     }
 }
 
 impl Inner {
-    fn reap_fills(&self, st: &mut State, id: usize) -> Result<()> {
-        st.set(id).reap_fills().map_err(|e| self.poison(e))
-    }
-
-    fn check(&self) -> Result<()> {
-        lock(&self.custody).error.clone().map_or(Ok(()), Err)
-    }
-
-    /// One retained owner graph per failed GPU, not one leak per later accessor.
-    fn poison(&self, error: Error) -> Error {
-        let (error, first) = {
-            let mut c = lock(&self.custody);
-            let first = c.error.is_none();
-            if first {
-                c.error = Some(error);
-                c.gpu = lock(&self.owner).upgrade();
-            }
-            (c.error.as_ref().unwrap().clone(), first)
-        };
-        if first {
-            tracing::warn!("varena: GPU {} completion is unknown; retaining its owners: {error}", self.ordinal);
+    /// `f`, a panic in it caught: the call fails `Internal` and the table is derived again.
+    fn guard<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.check_ownership()?;
+        let out = crate::caught(f);
+        if out.as_ref().err().is_some_and(Error::is_sticky) { self.ownership_lost.store(true, Ordering::Release); }
+        if matches!(&out, Err(Error::Internal(m)) if m.starts_with("panic")) {
+            self.recover();
         }
-        error
+        out
     }
 
-    fn retain_pin(&self, ws: &Arc<WeightSet>, error: Error) {
-        self.poison(error);
-        lock(&self.custody).pins.entry(ws.id).or_insert_with(|| ws.clone());
+    fn check_ownership(&self) -> Result<()> {
+        if self.ownership_lost.load(Ordering::Acquire) {
+            Err(Error::Ownership("consumer completion failed; retire this executor".into()))
+        } else { Ok(()) }
     }
 
-    fn retain_waits(&self, waits: &[EvRef]) {
-        let mut c = lock(&self.custody);
-        for ev in waits {
-            if !c.releases.iter().any(|held| Arc::ptr_eq(held, ev)) {
-                c.releases.push(ev.clone());
-            }
+    /// After a panic: the table's pages derived again from the homes (each recorded in the same
+    /// statement as its mapping, so they are the mappings).
+    fn recover(&self) {
+        let mut st = self.state.lock();
+        let keys: Vec<Key> = st.table.pages().map(|(k, _)| k).collect();
+        for key in keys {
+            st.sync(key);
         }
+        self.unlock(st);
+        self.landed.notify_all();
     }
 
+    /// The state, with pin releases applied and completed events acted on.
     fn lock(&self) -> MutexGuard<'_, State> {
-        lock(&self.st)
+        let mut st = self.state.lock();
+        st.seen = self.landed.seen();
+        self.drain(&mut st);
+        st
     }
 
-    /// `f` on the books, with our context current.
-    fn with<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        self.check()?;
-        let _c = CtxGuard::enter(self.ctx)?;
+    fn unlock(&self, st: MutexGuard<'_, State>) {
+        drop(st);
+    }
+
+    /// Waits, the state unlocked, for a change after the caller's last check (a fill, a release,
+    /// a reclaim), then reconciles and drains.
+    fn wait(&self, st: &mut MutexGuard<'_, State>) -> Result<()> {
+        self.check_ownership()?;
+        let seen = st.seen;
+        MutexGuard::unlocked(st, || self.landed.wait_past(seen));
+        st.seen = self.landed.seen();
+        self.check_ownership()?;
+        self.drain(st);
+        Ok(())
+    }
+
+    fn poll_releases(&self, st: &mut State) -> bool {
+        let released: Vec<Release> = self.releases.try_iter().collect();
+        let mut wake = false;
+        for r in released {
+            st.pins.remove(&r.pin);
+            if r.event != Event::DONE {
+                if let Some(p) = st.table.page_mut(r.key) {
+                    p.releasing.push(r.event.0);
+                }
+                st.events.entry(r.stream).or_default().push_back((r.event, r.key));
+            }
+            if r.untransformed {
+                // Its bytes are not the weights: it goes once unpinned and its release event
+                // completed, and the next bind fills again.
+                if let Some(h) = st.homes.get_mut(&r.key) {
+                    h.transforming = false;
+                    h.identity.clear();
+                }
+                wake = true;
+            }
+            st.sync(r.key);
+        }
+        // Completed events, oldest first on each stream: the first not yet complete ends that
+        // stream's turn, so a drain costs a query per stream, not per pending event.
+        let streams: Vec<usize> = st.events.keys().copied().collect();
+        for stream in streams {
+            while let Some((event, key)) = st.events.get(&stream).and_then(|q| q.front()).copied() {
+                if !self.backend.query(event).unwrap_or(false) {
+                    break;
+                }
+                if let Some(q) = st.events.get_mut(&stream) {
+                    q.pop_front();
+                }
+                self.completed(st, event, key);
+            }
+        }
+        st.events.retain(|_, q| !q.is_empty());
+        wake
+    }
+
+    /// `key`'s pending `event` completed: it leaves the page's releases (retired unless it is
+    /// the page's ready event).
+    fn completed(&self, st: &mut State, event: Event, key: Key) {
+        let ready = st.homes.get(&key).map(|h| h.ready);
+        if let Some(i) = st.table.page(key).and_then(|p| p.releasing.iter().position(|e| *e == event.0)) {
+            if let Some(p) = st.table.page_mut(key) {
+                p.releasing.swap_remove(i);
+            }
+            if Some(event) != ready {
+                self.backend.retire(event);
+            }
+        }
+    }
+
+    /// Waits for every pending event, ready events included (a retirement; host waits), and
+    /// completes them as a drain would. Their pages are pinned meanwhile, so nothing retires the
+    /// events or evicts the pages.
+    fn finish_pending(&self) -> Result<()> {
+        let (pins, taken, ready) = {
+            let mut st = self.lock();
+            let taken: Vec<(usize, Event, Key)> = std::mem::take(&mut st.events).into_iter().flat_map(|(stream, q)| q.into_iter().map(move |(e, k)| (stream, e, k))).collect();
+            let ready: Vec<(Key, Event)> = st.homes.iter().filter(|(_, h)| !self.backend.query(h.ready).unwrap_or(false)).map(|(k, h)| (*k, h.ready)).collect();
+            let me = std::thread::current().id();
+            let keys: BTreeSet<Key> = taken.iter().map(|(.., k)| *k).chain(ready.iter().map(|(k, _)| *k)).collect();
+            let pins: Vec<u64> = keys
+                .into_iter()
+                .map(|key| {
+                    let pin = st.tick();
+                    st.pins.insert(pin, (key, None, me));
+                    st.sync(key);
+                    pin
+                })
+                .collect();
+            self.unlock(st);
+            (pins, taken, ready)
+        };
+        // A page's own ready event stays its home's: waited on, never retired here.
+        let ready: Result<()> = ready.iter().try_for_each(|(_, event)| self.backend.finish(*event));
+        let done: Vec<bool> = taken.iter().map(|(_, event, _)| self.backend.finish(*event).is_ok()).collect();
         let mut st = self.lock();
-        self.check()?;
-        f(&mut st)
-    }
-
-    fn submit(&self, job: Job, urgent: bool) {
-        let mut j = lock(&self.jobs.0);
-        if urgent { j.q.push_front(job) } else { j.q.push_back(job) }
-        self.jobs.1.notify_all();
-    }
-
-    /// A queued fill someone now waits for goes first.
-    fn hurry(&self, fill: &Arc<Fill>) {
-        let mut j = lock(&self.jobs.0);
-        if let Some(i) = j.q.iter().position(|job| Arc::ptr_eq(&job.fill, fill)) {
-            let job = j.q.remove(i).unwrap();
-            j.q.push_front(job);
+        for pin in pins {
+            if let Some((key, ..)) = st.pins.remove(&pin) {
+                st.sync(key);
+            }
+        }
+        let unproven = done.iter().filter(|d| !**d).count();
+        for ((stream, event, key), done) in taken.into_iter().zip(done) {
+            match done {
+                true => self.completed(&mut st, event, key),
+                // Unproven: still pending, for the drain.
+                false => st.events.entry(stream).or_default().push_back((event, key)),
+            }
+        }
+        self.drain(&mut st);
+        self.landed.notify_all();
+        self.unlock(st);
+        match unproven {
+            0 => ready,
+            n => Err(Error::Ownership(format!("{n} pending events could not be waited on"))),
         }
     }
 
-    /// One fill at a time, so fills of one destination land in the order they were asked.
-    fn mover(self: Arc<Self>) {
-        if let Ok(d) = cuda::driver() {
-            // SAFETY: binding this thread to our retained primary context.
-            unsafe { (d.ctx_set_current)(self.ctx) };
+    fn drain(&self, st: &mut State) {
+        let wake = self.poll_releases(st);
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            if wake {
+                agent.progressed();
+            }
+            // Events still pending: its GPU work is running, never a stall.
+            agent.busy(st.events.values().any(|q| !q.is_empty()));
+            self.redecline(st);
+            self.land(st, agent);
+            self.advise(st, agent);
         }
-        let mut run: Option<Run> = None;
-        loop {
-            let j = lock(&self.jobs.0);
-            if j.q.is_empty() && run.is_some() {
-                drop(j);
-                run = self.land(run.take().unwrap());
+        self.drop_stale(st);
+        self.close_sets(st);
+        if wake {
+            self.landed.notify_all();
+        }
+    }
+
+    /// Unmaps unpinned pages whose bytes are not their set's weights now (another fill identity,
+    /// or a transform released undone), once no release event is pending.
+    fn drop_stale(&self, st: &mut State) {
+        let stale: Vec<Key> = st
+            .homes
+            .iter()
+            .filter(|(k, h)| !h.filling && st.mech(k.0).is_ok_and(|m| m.key != h.identity))
+            .filter(|(k, _)| st.table.page(**k).is_some_and(|p| p.pins.is_empty() && p.releasing.is_empty()))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in stale {
+            let _ = self.unmap(st, key, Class::N, None);
+        }
+    }
+
+    /// The set's fill identity becomes `fill`; pages of another identity go as they unpin.
+    fn refill(&self, st: &mut State, set: u32, fill: Fill) -> Result<()> {
+        let m = st.sets.get_mut(set as usize).and_then(Option::as_mut).ok_or_else(|| Error::Invalid(format!("no set {set}")))?;
+        if m.spec.fingerprint.fill == fill {
+            return Ok(());
+        }
+        m.spec.fingerprint.fill = fill;
+        m.key = m.spec.fingerprint.key();
+        let declared = m.spec.fingerprint.declared();
+        if let Some(Some(s)) = st.table.sets.get_mut(set as usize) {
+            s.declared = declared;
+        }
+        self.drop_stale(st);
+        Ok(())
+    }
+
+    /// Unmaps the unpinned pages of closing sets; a set goes once it has none. Its slot stays
+    /// empty: open plans name it by index.
+    fn close_sets(&self, st: &mut State) {
+        let closing: Vec<u32> = st.sets.iter().enumerate().filter(|(_, m)| m.as_ref().is_some_and(|m| m.closing)).map(|(i, _)| i as u32).collect();
+        for set in closing {
+            let keys: Vec<Key> = st.table.pages().filter(|(k, p)| k.0 == set && p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.filling).map(|(k, _)| k).collect();
+            for key in keys {
+                let _ = self.unmap(st, key, Class::N, None);
+            }
+            if st.table.pages().any(|(k, p)| k.0 == set && p.mapped) {
                 continue;
             }
-            let job = match self.jobs.1.wait_while(j, |j| j.q.is_empty() && !j.stop).unwrap_or_else(PoisonError::into_inner).q.pop_front() {
-                Some(job) => job,
-                None => return,
-            };
-            let r = run.get_or_insert_with(Run::default);
-            // A panic is this job's failure, never the thread's end.
-            let filled = crate::caught(|| self.check().and_then(|_| self.run(&job, r)).map(|(a, b)| {
-                r.copies.push((a.clone(), b.clone()));
-                let mut st = self.lock();
-                let step = st.steps;
-                st.timings.push(Timing { set: job.set, step, field: |c| &mut c.copy_ns, a, b: b.clone() });
-                b
-            }));
-            let filled = match filled {
-                Ok(ready) => Filled::Ready(ready),
-                Err(e) => self.drained(e),
-            };
-            if matches!(&filled, Filled::Unknown(_)) {
-                self.retain_waits(&job.waits);
+            if st.mech(set).is_ok_and(|m| m.retained != 0) {
+                continue;
             }
-            job.fill.set(filled);
-        }
-    }
-
-    /// Retire completed placement events once the queue becomes idle.
-    fn land(&self, r: Run) -> Option<Run> {
-        if self.check().is_err() {
-            return None;
-        }
-        if let Some((_, last)) = r.copies.last() {
-            if let Err(e) = last.sync() {
-                self.poison(e);
-                return None;
+            if let Some(m) = st.sets.get_mut(set as usize).and_then(Option::take) {
+                self.mech.post(Mech::Release(m.va));
             }
-        }
-        if !lock(&self.jobs.0).q.is_empty() {
-            return Some(r);
-        }
-        None
-    }
-
-    /// A failure is reported once nothing it queued is in flight.
-    fn drained(&self, e: Error) -> Filled {
-        if let Err(error) = self.check() {
-            return Filled::Unknown(error);
-        }
-        self.failed_fill(e, self.drain_copy())
-    }
-
-    fn drain_copy(&self) -> Result<()> {
-        self.check()?;
-        let _c = CtxGuard::enter(self.ctx)?;
-        call!("cuStreamSynchronize", stream_synchronize(self.copy))
-    }
-
-    fn failed_fill(&self, e: Error, drained: Result<()>) -> Filled {
-        if let Err(error) = self.check() {
-            return Filled::Unknown(error);
-        }
-        match drained {
-            Ok(()) => Filled::Failed(e),
-            Err(s) => Filled::Unknown(self.poison(Error::Io(format!("{e}; and the copy stream could not drain: {s}")))),
-        }
-    }
-
-    fn run(self: &Arc<Self>, job: &Job, _run: &mut Run) -> Result<(EvRef, EvRef)> {
-        let s = self.copy;
-        for w in &job.waits {
-            if let Err(e) = wait_in(s, w) {
-                let completed = job.waits.iter().try_for_each(|ev| ev.sync());
-                return Err(self.failed_dependencies(e, &job.waits, completed));
-            }
-        }
-        let start = self.events.record(s, true)?;
-        let (region, layout) = (job.region, job.w.layout.region(job.region)?);
-        let dst = Dst::Device { device: self.ordinal, ptr: job.dst, len: layout.nbytes as usize, stream: s as usize };
-        // a region its sealer failed or died filling reads the chunks instead
-        let ready = |host: &&HostMem| !host.hole(region) && host.wait_ready(region).inspect_err(|e| tracing::warn!("varena: {}: {e}", job.w.name)).is_ok();
-        match job.w.host.as_ref().filter(ready) {
-            Some(host) if layout.nbytes > 0 => {
-                host.pin_region(region, layout.offset, align_up(layout.nbytes, PART_ALIGN));
-                // SAFETY: source is complete inside the retained host layout; destination is the
-                // placement's exclusive mapped region until this fill is published.
-                let ptr = unsafe { host.base().add(layout.offset as usize) };
-                unsafe { byte_io::read(&[Copy { src: Src::Host(ptr), dst }], &ReadOpts::default()) }?;
-            }
-            _ if layout.nbytes > 0 => {
-                // SAFETY: layout items are disjoint ranges of this exclusive device mapping.
-                unsafe { job.w.source.read_items(&layout.items, layout.offset, dst, 8, Mode::Buffered, &self.tally) }?;
-            }
-            _ => {}
-        }
-        Ok((start, self.events.record(s, true)?))
-    }
-
-    fn failed_dependencies(&self, error: Error, waits: &[EvRef], completed: Result<()>) -> Error {
-        match completed {
-            Ok(()) => error,
-            Err(e) => {
-                self.retain_waits(waits);
-                self.poison(Error::Io(format!("consumer wait failed: {error}; prior consumer completion is unknown: {e}")))
+            if let Some(slot) = st.table.sets.get_mut(set as usize) {
+                *slot = None;
             }
         }
     }
 
-    /// A new chunk, releasing idle chunks first if the device is full; None if it still is.
-    fn create(&self, st: &mut State, size: u64, prop: &AllocationProp) -> Result<Option<Handle>> {
-        let mut h: Handle = 0;
-        loop {
-            // SAFETY: out-param; device memory of our context's device.
-            match unsafe { (cuda::driver()?.mem_create)(&mut h, size as usize, prop, 0) } {
-                cuda::SUCCESS => return Ok(Some(h)),
-                cuda::ERROR_OUT_OF_MEMORY if st.idle_bytes() > 0 => {
-                    self.keep_idle(st, 0)?;
-                }
-                cuda::ERROR_OUT_OF_MEMORY => return Ok(None),
-                rc => return cuda::check("cuMemCreate", rc).map(|_| None).map_err(Error::from),
+    // ---- the mechanism
+
+    /// Unmaps a page and gives it back (an eviction, a revoke or an unload).
+    fn unmap(&self, st: &mut State, key: Key, class: Class, req: Option<u64>) -> Result<()> {
+        let Some(home) = st.homes.remove(&key) else { return Ok(()) };
+        let (va, off, span) = st.place(key)?;
+        if let Some(p) = &home.phys {
+            self.commit_page(p);
+        }
+        st.last_unmap = Some(self.mech.post(Mech::Unmap { va, off, span, phys: home.phys, ready: home.ready }));
+        st.sync(key);
+        if let Some(s) = st.stats(req) {
+            if let Some(e) = s.evicted.get_mut(class.index()) {
+                *e += span;
             }
         }
-    }
-
-    /// Maps `span` bytes at `va`, idle chunks first, or as one exportable allocation.
-    /// Under pressure, a shareable allocation falls back to ordinary chunks, then 2 MiB pages.
-    fn map(&self, st: &mut State, va: u64, span: u64, shared: bool) -> Result<Mapping> {
-        let mut m = Mapping { va, ..Default::default() };
-        let mut prop = self.shared.filter(|_| shared);
-        let mut chunk = self.chunk;
-        let mapped = (|| {
-            while m.span < span {
-                let size = if prop.is_some() { span } else { chunk.min(span - m.span) };
-                let idle = if prop.is_none() { st.take_idle(size) } else { None };
-                let handle = match idle {
-                    Some(h) => h,
-                    None => match self.create(st, size, prop.as_ref().unwrap_or(&self.prop))? {
-                        Some(h) => h,
-                        None if prop.is_some() => {
-                            prop = None;
-                            continue;
-                        }
-                        None if size > REGION_ALIGN => {
-                            chunk = REGION_ALIGN;
-                            continue;
-                        }
-                        None => return Err(Error::DeviceFull { need: span, deficit: span - m.span }),
-                    },
-                };
-                m.chunks.push(Chunk { handle, size, shared: prop.is_some() });
-                call!("cuMemMap", mem_map(va + m.span, size as usize, 0, handle, 0))?;
-                m.span += size;
-            }
-            let desc = AccessDesc { location: self.prop.location, flags: cuda::MEM_ACCESS_PROT_READWRITE };
-            call!("cuMemSetAccess", mem_set_access(va, span as usize, &desc, 1))
-        })();
-        if let Err(e) = mapped {
-            if m.span > 0 {
-                call!("cuMemUnmap", mem_unmap(va, m.span as usize))?;
-            }
-            self.give_back(st, m.chunks)?;
-            return Err(e);
-        }
-        st.mapped += span;
-        Ok(m)
-    }
-
-    /// Imports kept pages `fd` and maps them at `va`; the handle, or nothing mapped. Mapped
-    /// read-write, as this process's own pages are: it is their one user now, and every request
-    /// that read imported pages through a read-only mapping faulted (12166, 12172, 12176).
-    fn import(&self, va: u64, span: u64, fd: &OwnedFd) -> Result<Handle> {
-        let mut h: Handle = 0;
-        call!("cuMemImportFromShareableHandle", mem_import(&mut h, fd.as_raw_fd() as usize as *mut c_void, cuda::MEM_HANDLE_TYPE_POSIX_FD))?;
-        let desc = AccessDesc { location: self.prop.location, flags: cuda::MEM_ACCESS_PROT_READWRITE };
-        let mapped = call!("cuMemMap", mem_map(va, span as usize, 0, h, 0));
-        let access = match &mapped {
-            Ok(()) => call!("cuMemSetAccess", mem_set_access(va, span as usize, &desc, 1)),
-            Err(e) => Err(e.clone()),
-        };
-        if let Err(e) = access {
-            if mapped.is_ok() {
-                call!("cuMemUnmap", mem_unmap(va, span as usize))?;
-            }
-            call!("cuMemRelease", mem_release(h))?;
-            return Err(e);
-        }
-        Ok(h)
-    }
-
-    /// Kept pages mapped at `va` read back what the host layout at `host` holds, at their first,
-    /// middle and last bytes: else (a stale or foreign page, a mapping that reads nothing) they
-    /// unmap and the region fills from the host. Without a host copy they are taken on trust.
-    fn holds(&self, h: Handle, va: u64, span: u64, nbytes: u64, host: Option<usize>) -> Result<Handle> {
-        let Some(host) = host.filter(|_| nbytes > 0) else { return Ok(h) };
-        let n = nbytes.min(4096);
-        let mut got = vec![0u8; n as usize];
-        let read = [0, nbytes / 2 / 4096 * 4096, nbytes - n].iter().try_for_each(|&at| {
-            call!("cuMemcpyDtoH", memcpy_dtoh(got.as_mut_ptr() as *mut c_void, va + at, n as usize))?;
-            // SAFETY: inside the host layout's live mapping; the region is Ready.
-            let want = unsafe { std::slice::from_raw_parts((host + at as usize) as *const u8, n as usize) };
-            match got == want {
-                true => Ok(()),
-                false => Err(Error::Invalid(format!("byte {at} differs from the host layout"))),
-            }
-        });
-        if let Err(e) = read {
-            call!("cuMemUnmap", mem_unmap(va, span as usize))?;
-            call!("cuMemRelease", mem_release(h))?;
-            return Err(e);
-        }
-        Ok(h)
-    }
-
-    /// Unmaps a mapping nothing in flight touches; its chunks go idle, its kept pages too.
-    fn unmap(&self, st: &mut State, m: Mapping) -> Result<()> {
-        call!("cuMemUnmap", mem_unmap(m.va, m.span as usize))?;
-        st.mapped -= m.span;
-        if let Some(kept) = &m.kept {
-            drop(platform::handles::recv_fd(kept)); // empty: TensorD already let it go
-        }
-        self.give_back(st, m.chunks)
-    }
-
-    fn give_back(&self, st: &mut State, chunks: Vec<Chunk>) -> Result<()> {
-        for c in chunks {
-            match c.shared {
-                true => call!("cuMemRelease", mem_release(c.handle))?,
-                false => st.idle.entry(c.size).or_default().push(c.handle),
-            }
+        if let Some(e) = req.and_then(|r| st.step_stats(r)).and_then(|s| s.evicted.get_mut(class.index())) {
+            *e += span;
         }
         Ok(())
     }
 
-    /// Unmaps quiet home regions of set `id` (all when None) until `budget`; returns the bytes.
-    fn evict(&self, st: &mut State, id: usize, regions: Option<&[u32]>, budget: u64) -> Result<u64> {
-        let all: Vec<u32> = (0..st.set(id).regs.len() as u32).collect();
-        let mut freed = 0;
-        for &r in regions.unwrap_or(&all) {
-            if freed >= budget {
-                break;
-            }
-            let reg = st.reg(id, r)?;
-            if !reg.map.as_mut().map_or(Ok(false), Mapping::quiet)? {
-                continue;
-            }
-            let m = reg.map.take().unwrap();
-            let span = m.span;
-            self.unmap(st, m)?;
-            st.set(id).count(|c| c.evicted += span);
-            freed += span;
+    /// Maps a page read-write and queues its fill. A speculative map that finds no device
+    /// memory stops softly (false).
+    fn map(&self, st: &mut State, key: Key, req: Option<u64>, speculative: bool) -> Result<bool> {
+        if st.homes.contains_key(&key) {
+            return Ok(true);
         }
-        Ok(freed)
+        let (va, off, span) = st.place(key)?;
+        let gen = st.tick();
+        let identity = st.mech(key.0)?.key.clone();
+        // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
+        // the unmaps decided before it, then queues its fill.
+        st.homes.insert(key, Home::new(gen, speculative, identity));
+        st.sync(key);
+        self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, decided: !speculative });
+        Ok(true)
     }
 
-    /// Releases idle chunks, largest first, until at most `keep` bytes are idle.
-    fn keep_idle(&self, st: &mut State, keep: u64) -> Result<u64> {
-        let mut freed = 0;
-        while st.idle_bytes() > keep {
-            let mut last = st.idle.last_entry().unwrap();
-            let (size, h) = (*last.key(), last.get_mut().pop().unwrap());
-            if last.get().is_empty() {
-                last.remove();
+    /// A stale page (another fill identity, or a transform released undone) nobody pins is
+    /// filled again in place: its mapping stays and the copy waits in-stream on its pending
+    /// release events. Preparation may wait outside capture/replay for the source/staging
+    /// owners' copy completion; resident replay never performs this preparation.
+    fn refill_in_place(&self, st: &mut State, key: Key, req: Option<u64>) -> Result<()> {
+        let (va, off, span) = st.place(key)?;
+        let identity = st.mech(key.0)?.key.clone();
+        let gen = st.tick();
+        let after = st.table.page_mut(key).map(|p| std::mem::take(&mut p.releasing)).unwrap_or_default();
+        // Its events are the refill's now (it waits on them, then retires them).
+        st.events.values_mut().for_each(|q| q.retain(|(_, k)| *k != key));
+        let Some(h) = st.homes.get_mut(&key) else { return Ok(()) };
+        let old = std::mem::replace(&mut h.ready, Event::DONE);
+        // Leased: a grant's identity never changes, so new content takes a new grant.
+        let phys = if self.leased_page_of(h.phys.as_ref()) { h.phys.take() } else { None };
+        let renew = phys.is_some();
+        *h = Home { phys: h.phys.take(), ..Home::new(gen, false, identity) };
+        st.sync(key);
+        let after: Vec<Event> = after.into_iter().map(Event).collect();
+        let job = Job { key, gen, req, span, after: vec![] };
+        if renew {
+            // A new grant takes its place once its consumers are done.
+            if !after.contains(&old) {
+                self.backend.retire(old);
             }
-            call!("cuMemRelease", mem_release(h))?;
-            freed += size;
+            self.mech.post(Mech::Renew { key, gen, va, off, span, old: phys, after, job });
+            return Ok(());
         }
-        Ok(freed)
+        // Read-write and nobody else's: filled again in place, after its consumers in-stream.
+        if !after.contains(&old) {
+            self.backend.retire(old);
+        }
+        self.queue_fills(vec![Job { after, ..job }], false)
     }
 
-    /// Unmaps quiet slots: undersized ones, all once nothing streams, else beyond `keep` live.
-    fn shed(&self, st: &mut State, keep: usize) -> Result<u64> {
-        let span = st.slot_span;
-        let (mut live, mut freed) = (st.slots.iter().flatten().count(), 0);
-        for i in 0..st.slots.len() {
-            let Some(s) = st.slots[i].as_mut() else { continue };
-            if (span == 0 || s.m.span < span || live > keep) && s.m.quiet()? {
-                freed += s.m.span;
-                self.drop_slot(st, i)?;
-                live -= 1;
-            }
-        }
-        Ok(freed)
+    /// A fill thread's batch: each page from the store through the page cache, in as few engine
+    /// reads as its sets allow; then each page's ready event.
+    fn fill(self: &Arc<Self>, jobs: &[Job]) {
+        self.fill_batch(jobs);
+        // Their fills' events follow them in-stream (or were dropped): nobody needs them now.
+        jobs.iter().flat_map(|j| &j.after).for_each(|e| self.backend.retire(*e));
     }
 
-    fn new_slot(&self, st: &mut State, span: u64) -> Result<usize> {
-        for i in 0..st.slots.len() {
-            if st.slots[i].as_ref().is_some_and(|s| s.m.span < span) && st.slot(i).m.quiet()? {
-                self.drop_slot(st, i)?;
-            }
-        }
-        let va = reserve_va(span)?;
-        let m = self.map(st, va, span, false).inspect_err(|_| drop(free_va(va, span)))?;
-        let slot = Some(Slot { m, holds: None, pending: false, used: 0 });
-        match st.slots.iter().position(Option::is_none) {
-            Some(i) => st.slots[i] = slot,
-            None => st.slots.push(slot),
-        }
-        Ok(st.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.m.va == va)).unwrap())
-    }
-
-    fn drop_slot(&self, st: &mut State, i: usize) -> Result<()> {
-        let m = st.slots[i].take().expect("a live slot").m;
-        let (va, span) = (m.va, m.span);
-        self.unmap(st, m)?;
-        free_va(va, span)
-    }
-
-    /// A slot for streamed region `r`: the one holding it, else a settled one (empty, consumed,
-    /// then for a bind an unbound prefetch), else a new one; a prefetch adds none past `SLOTS`.
-    fn slot_for(&self, st: &mut State, set: usize, r: u32, urgent: bool) -> Result<Option<usize>> {
-        let (w, span) = (st.set(set).w.clone(), st.slot_span);
-        let x = w.layout.region(r)?;
-        let held = st.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.holds == Some((set, r))));
-        if let Some(i) = held {
-            if !st.slot(i).m.dead() {
-                return Ok(Some(i));
-            }
-        }
-        self.reap_fills(st, set)?;
-        let i = match held {
-            Some(i) => i,
-            None => {
-                let live = st.slots.iter().enumerate().filter_map(|(i, s)| Some((i, s.as_ref()?)));
-                let settled = live.filter(|(_, s)| s.m.settled() && s.m.span >= x.span && (urgent || !s.pending));
-                match settled.min_by_key(|(_, s)| (s.holds.is_some(), s.pending, s.used)).map(|(i, _)| i) {
-                    Some(i) => i,
-                    None if urgent || st.slots.iter().flatten().count() < SLOTS => self.new_slot(st, x.span.max(span))?,
-                    None => return Ok(None),
+    fn fill_batch(self: &Arc<Self>, jobs: &[Job]) {
+        // Under one lock: each live job's place, and its set's spec.
+        let (sets, pages) = {
+            let st = self.state.lock();
+            let mut sets: BTreeMap<u32, SetSpec> = BTreeMap::new();
+            let mut pages = vec![];
+            for job in jobs {
+                let (Some(h), Ok(m), Ok(place)) = (st.homes.get(&job.key), st.mech(job.key.0), st.place(job.key)) else { continue };
+                if h.gen == job.gen {
+                    sets.entry(job.key.0).or_insert_with(|| m.spec.clone());
+                    pages.push((job, place));
                 }
             }
+            (sets, pages)
         };
-        let clock = st.clock;
-        let s = st.slot(i);
-        (s.holds, s.pending, s.used) = (Some((set, r)), !urgent, clock);
-        let ((fill, waits), dst) = (s.m.refill(), s.m.va);
-        st.set(set).count(|c| {
-            c.streamed_bytes += x.nbytes;
-            c.faults += urgent as u64;
-        });
-        st.set(set).track_fill(fill.clone());
-        self.submit(Job { set, w, region: r, dst, waits, fill }, urgent);
-        Ok(Some(i))
+        if pages.is_empty() {
+            return;
+        }
+        let start = Instant::now();
+        let copied = crate::caught(|| Ok(self.copy(&sets, &pages))).unwrap_or_else(|e| vec![Err(e); pages.len()]);
+        // An event per page, after every copy so far.
+        let landed: Vec<Result<(Origin, Event)>> = copied.into_iter().map(|c| c.and_then(|origin| Ok((origin, self.backend.fence()?)))).collect();
+        let (ns, bytes) = (start.elapsed().as_nanos() as u64, pages.iter().map(|(_, (.., span))| span).sum::<u64>().max(1));
+        // After a copy error the engine's copies may still run: a failed page is unmapped only
+        // once the copy stream is proven drained.
+        let ownership_lost = landed.iter().any(|out| matches!(out, Err(Error::Ownership(_))));
+        let drained = !ownership_lost && (landed.iter().all(Result::is_ok) || self.backend.drain().is_ok());
+        let mut sticky = false;
+        let mut st = self.state.lock();
+        if !drained {
+            self.ownership_lost.store(true, Ordering::Release);
+            std::mem::forget(self.clone());
+        }
+        for ((job, (.., span)), landed) in pages.iter().zip(landed) {
+            let span = *span;
+            if st.homes.get(&job.key).is_none_or(|h| h.gen != job.gen) {
+                // The page changed under the fill: its event is nobody's.
+                if let Ok((_, ready)) = landed {
+                    self.backend.retire(ready);
+                }
+                continue;
+            }
+            // Read ready at issue (`issued`): its own copies all went out, whatever the batch's end.
+            let early = st.homes.get_mut(&job.key).is_some_and(|h| std::mem::take(&mut h.landing));
+            let landed = match (early, landed) {
+                (true, Ok((_, ready))) => {
+                    self.backend.retire(ready);
+                    Ok((Origin::Store, None))
+                }
+                (true, Err(e)) => {
+                    sticky |= e.is_sticky();
+                    Ok((Origin::Store, None))
+                }
+                (false, landed) => landed.map(|(origin, ready)| (origin, Some(ready))),
+            };
+            match landed {
+                Ok((origin, ready)) => {
+                    // Stored bytes are the weights; a declared set's are once transformed.
+                    let filled = sets.get(&job.key.0).is_some_and(|spec| matches!(spec.fingerprint.fill, Fill::Stored));
+                    let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
+                    // A page read ready at issue is its binders' since: a transform may have
+                    // filled it already, so only its accounting is left.
+                    if let (Some(ready), Some(h)) = (ready, st.homes.get_mut(&job.key)) {
+                        (h.ready, h.ready_on, h.filling, h.filled, h.origin) = (ready, COPY, false, filled, origin);
+                        st.sync(job.key);
+                    }
+                    #[cfg(unix)]
+                    if filled && self.leasing() {
+                        self.to_land.lock().push(job.key);
+                    }
+                    let s = st.fills(job.req, job.key, span, origin);
+                    let f = &mut s.moved.store;
+                    f.bytes += span;
+                    // The batch's time, shared by its bytes.
+                    f.ns += (u128::from(ns) * u128::from(span) / u128::from(bytes)) as u64;
+                    if speculative {
+                        s.moved.speculative += span;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("varena: filling {:?} failed: {e}", job.key);
+                    sticky |= e.is_sticky();
+                    let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
+                    // Undrained, it stays filling (P) for good: never unmapped under a copy.
+                    if drained {
+                        if let Some(h) = st.homes.get_mut(&job.key) {
+                            h.filling = false;
+                        }
+                        let _ = self.unmap(&mut st, job.key, Class::P, None);
+                    }
+                    if !speculative || !drained {
+                        let error = if drained { e } else { Error::Ownership(format!("fill failed ({e}); its copies did not drain")) };
+                        st.failed.insert(job.key, error);
+                    }
+                }
+            }
+        }
+        if sticky { self.ownership_lost.store(true, Ordering::Release); }
+        self.unlock(st);
+        self.landed.notify_all();
     }
 
-    /// Maps region `r` at home and queues its fill.
-    fn map_home(&self, st: &mut State, set: usize, r: u32, urgent: bool) -> Result<()> {
-        self.reap_fills(st, set)?;
-        let (w, base) = (st.set(set).w.clone(), st.set(set).base);
-        let x = w.layout.region(r)?;
-        let t = Instant::now();
-        let shared = st.set(set).shared;
-        let mut m = self.map(st, base + x.offset, x.span, shared)?;
-        let ns = t.elapsed().as_nanos() as u64;
-        let ((fill, waits), dst) = (m.refill(), m.va);
-        st.reg(set, r)?.map = Some(m);
-        st.set(set).count(|c| {
-            c.map_ns += ns;
-            c.paged_in += x.nbytes;
-            c.faults += urgent as u64;
+    /// The batch's copies from the store, through the page cache: one engine read per set.
+    /// Each page's origin, or its error.
+    fn copy(&self, sets: &BTreeMap<u32, SetSpec>, pages: &[(&Job, (Va, u64, u64))]) -> Vec<Result<Origin>> {
+        let mut copies: Vec<Copying> = pages
+            .iter()
+            .map(|(job, (va, off, span))| {
+                let dst = self.backend.target(*va, *off, *span);
+                // A refill in place writes after the page's last consumers, in-stream (a host
+                // page has no stream: 0).
+                let stream = match dst {
+                    Dst::Device { stream, .. } => stream,
+                    Dst::Host { .. } => 0,
+                };
+                let out = job.after.iter().try_for_each(|e| self.backend.wait(*e, stream)).err().map(Err);
+                Copying { key: job.key, gen: job.gen, dst, out }
+            })
+            .collect();
+        for (set, spec) in sets {
+            let todo = |c: &Copying| c.key.0 == *set && c.out.is_none();
+            let direct: Vec<(u32, Dst)> = copies.iter().filter(|c| todo(c)).map(|c| (c.key.1, c.dst)).collect();
+            if !direct.is_empty() {
+                let owners: Vec<(Key, u64, usize)> = copies.iter().filter(|c| todo(c)).map(|c| {
+                    (c.key, c.gen, match c.dst { Dst::Device { stream, .. } => stream, Dst::Host { .. } => 0 })
+                }).collect();
+                let filled = matches!(spec.fingerprint.fill, Fill::Stored);
+                let issued = |i: usize, streams: &[usize]| owners.get(i).into_iter().for_each(|o| self.issued(*o, streams, filled));
+                let stored = self.store(spec, &direct, Some(&issued)).map(|()| Origin::Store);
+                copies.iter_mut().filter(|c| todo(c)).for_each(|c| c.out = Some(stored.clone()));
+            }
+        }
+        copies.into_iter().map(|c| c.out.unwrap_or_else(|| Err(Error::Internal("a page left unfilled".into())))).collect()
+    }
+
+    /// A fill thread's batch failed outside its copies (a panic): its pages go, their binders fail.
+    fn fail(self: &Arc<Self>, jobs: &[Job], e: Error) {
+        // Its copies may have been issued: unmapped only once the copy stream is drained.
+        let drained = self.backend.drain().is_ok();
+        let mut st = self.state.lock();
+        let e = if drained { e } else {
+            self.ownership_lost.store(true, Ordering::Release);
+            std::mem::forget(self.clone());
+            Error::Ownership(format!("fill panicked ({e}); its copies did not drain"))
+        };
+        for job in jobs {
+            // A page read ready at issue had all its copies go out: its binders keep it.
+            if let Some(h) = st.homes.get_mut(&job.key).filter(|h| h.gen == job.gen) {
+                h.landing = false;
+            }
+            if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen && h.filling) {
+                if drained {
+                    if let Some(h) = st.homes.get_mut(&job.key) {
+                        h.filling = false;
+                    }
+                    let _ = self.unmap(&mut st, job.key, Class::P, None);
+                }
+                st.failed.insert(job.key, e.clone());
+            }
+        }
+        self.unlock(st);
+        self.landed.notify_all();
+    }
+
+    /// `first` and the jobs queued behind it (demand misses first), up to the burst's bytes so
+    /// far: batches double, so the first pages are ready soonest and a few reads carry the
+    /// rest. Never less than the engine keeps in flight (its threads' requests): a smaller read
+    /// leaves its threads idle. Groups stay whole.
+    fn batch(&self, first: Vec<Job>, demand: &Receiver<Vec<Job>>, ahead: &Receiver<Vec<Job>>) -> Vec<Job> {
+        let budget = self.fill_budget();
+        self.burst.0.lock().batches += 1;
+        let mut jobs = first;
+        let mut bytes: u64 = jobs.iter().map(|j| j.span).sum();
+        while bytes < budget {
+            let Ok(group) = demand.try_recv().or_else(|_| ahead.try_recv()) else { break };
+            bytes += group.iter().map(|j| j.span).sum::<u64>();
+            jobs.extend(group);
+        }
+        let mut b = self.burst.0.lock();
+        b.queued = b.queued.saturating_sub(jobs.len() as u64);
+        jobs
+    }
+
+    /// A batch's bytes: what this burst filled so far, at least one engine round of requests.
+    fn fill_budget(&self) -> u64 {
+        let engine = tensorfs::io::ReadOpts::default();
+        self.burst.0.lock().bytes.max((engine.threads * engine.request) as u64)
+    }
+
+    /// Queues pages' fills as one group: demand misses, or `ahead` of their use.
+    fn queue_fills(&self, jobs: Vec<Job>, ahead: bool) -> Result<()> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let n = jobs.len() as u64;
+        self.burst.0.lock().queued += n;
+        let queue = if ahead { &self.jobs.ahead } else { &self.jobs.demand };
+        queue.send(jobs).map_err(|_| {
+            self.burst.0.lock().queued -= n;
+            Error::Closed("the fill threads".into())
+        })
+    }
+
+    /// The mechanism thread's mapped pages go to the fill threads, demand first.
+    fn flush_fills(&self) {
+        let (demand, ahead) = std::mem::take(&mut *self.grouped.lock());
+        if self.queue_fills(demand, false).and_then(|()| self.queue_fills(ahead, true)).is_err() {
+            tracing::warn!("varena: the fill threads are gone");
+        }
+    }
+
+    /// Bytes the mechanism thread holds for the fill threads.
+    fn grouped_bytes(&self) -> u64 {
+        let g = self.grouped.lock();
+        g.0.iter().chain(&g.1).map(|j| j.span).sum()
+    }
+
+    /// A batch is done: its bytes count for its burst, which ends when nothing is queued or
+    /// filling.
+    fn batched(&self, jobs: &[Job]) {
+        let mut b = self.burst.0.lock();
+        b.batches = b.batches.saturating_sub(1);
+        b.bytes += jobs.iter().map(|j| j.span).sum::<u64>();
+        if b.idle() {
+            b.bytes = 0;
+            self.burst.1.notify_all();
+        }
+    }
+
+    /// The set's regions from its store into their destinations, in one engine read, in
+    /// region order: neighbours in the file and the reservation read as one run. `issued`
+    /// hears of each device region (its index in `regions`) once its copies are all issued.
+    #[cfg(unix)]
+    fn store(&self, spec: &SetSpec, regions: &[(u32, Dst)], issued: Option<tensorfs::io::Issued>) -> Result<()> {
+        let mut order: Vec<(usize, &(u32, Dst))> = regions.iter().enumerate().collect();
+        order.sort_unstable_by_key(|(_, (r, _))| *r);
+        let placements = order.iter().map(|(_, (r, dst))| spec.layout.region(*r).map(|region| Placement { items: &region.items, origin: region.offset, dst: *dst })).collect::<Result<Vec<_>>>()?;
+        let threads = tensorfs::io::ReadOpts::default().threads;
+        let placed = |p: usize, streams: &[usize]| {
+            if let (Some(issued), Some((i, _))) = (issued, order.get(p)) {
+                issued(*i, streams);
+            }
+        };
+        // SAFETY: each `dst` is a mapped page only this fill writes.
+        unsafe { spec.source.read_placements(&placements, threads, tensorfs::io::source::Mode::Buffered, &self.tally, issued.map(|_| &placed as tensorfs::io::Issued)) }?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn store(&self, spec: &SetSpec, _: &[(u32, Dst)], _: Option<tensorfs::io::Issued>) -> Result<()> {
+        match *spec.source {}
+    }
+
+    /// A store fill's copies of page `key` are all issued: it reads ready now, its event after
+    /// them on the copy stream, so its binders wait in-stream instead of for the whole batch.
+    fn issued(&self, (key, gen, copy): (Key, u64, usize), streams: &[usize], filled: bool) {
+        let ready = streams.iter().try_for_each(|&s| {
+            let e = self.backend.record(s)?;
+            let waited = self.backend.wait(e, copy);
+            self.backend.retire(e);
+            waited
         });
-        st.set(set).track_fill(fill.clone());
-        self.submit(Job { set, w, region: r, dst, waits, fill }, urgent);
+        // A failed record leaves the page to the batch's end.
+        let Ok(ready) = ready.and_then(|()| self.backend.fence()) else { return };
+        let mut st = self.state.lock();
+        match st.homes.get_mut(&key) {
+            Some(h) if h.gen == gen && h.filling => {
+                (h.ready, h.ready_on, h.filling, h.landing, h.filled, h.origin) = (ready, COPY, false, true, filled, Origin::Store);
+            }
+            _ => {
+                self.unlock(st);
+                return self.backend.retire(ready);
+            }
+        }
+        st.sync(key);
+        self.unlock(st);
+        self.landed.notify_all();
+    }
+
+    // ---- demands
+
+    /// Free bytes for a page now, from varena's own figures (never the device's: a pass reads
+    /// none). Leased: what the manager can allocate and reclaim from others. Standalone: what
+    /// the budget its pages and torch's share has left (a refused create says the device has
+    /// less).
+    fn free(&self, _st: &State) -> u64 {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            let f = agent.table().figures();
+            return f.free.saturating_add(f.revocable);
+        }
+        self.allowance.left()
+    }
+
+    /// Free bytes speculative work (prefetch, a streamed set's regrowth) may take: never another
+    /// tenant's (leased, the manager's free bytes alone).
+    fn spare(&self, st: &State) -> u64 {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            return agent.table().figures().free;
+        }
+        self.free(st)
+    }
+
+    /// Makes `bytes` free for a bind or a range's preparation, taking its own pages in
+    /// [`decide::victims`]' order, never `keep` (the pages being bound): idle pages unmapped, a
+    /// running set streamed through slots, pages whose last consumers still run taken once their
+    /// release events complete (waited on here). `Exhausted` at once beyond what it could ever
+    /// have, else only when a round takes nothing and nothing of its own is about to come back
+    /// (a fill: waited for). `why` and `req` name it in the request's record.
+    fn make_room(&self, bytes: u64, keep: &[Key], why: &'static str, req: Option<u64>, free_only: bool) -> Result<u64> {
+        let mut record = MakeRoom { step: 0, trigger: why, need: bytes, freed: 0, waited: 0 };
+        let out = loop {
+            let mut st = self.lock();
+            // A refused create, or a manager's refusal, says there is less than the figures: the
+            // round takes the page's bytes itself. Leased, a page is asked of the manager first
+            // (its reclaim makes room across processes, this one's idle pages too). Standalone, a
+            // miss bounds the budget by the driver's free bytes (another tenant's churn); a pass
+            // never reads them.
+            let refused = keep.iter().any(|k| st.short.remove(k).is_some());
+            let free = match (refused, self.leasing()) {
+                (true, _) => 0,
+                (false, true) => u64::MAX,
+                (false, false) => self.free(&st).min(self.backend.free().unwrap_or(u64::MAX)),
+            };
+            let req = req.or_else(|| st.active.iter().find(|(_, a)| a.thread == std::thread::current().id()).map(|((r, _), _)| *r));
+            let short = |st: &State| -> Result<u64> { Err(Error::Exhausted(exhausted(bytes.saturating_sub(free), None, req.and_then(|r| st.stats.get(&r)).cloned().unwrap_or_default()))) };
+            if free >= bytes {
+                self.unlock(st);
+                break Ok(free);
+            }
+            // Idle work (a request opened idle, a free-only bind) takes free bytes only; nothing
+            // takes more than it could ever have (its pinned pages stay).
+            let pinned: u64 = st.table.pages().filter(|(k, p)| p.mapped && (!p.pins.is_empty() || p.filling) && !keep.contains(k)).map(|(_, p)| p.bytes).sum();
+            let idle = free_only || req.and_then(|r| st.table.request(r)).is_some_and(|r| r.idle);
+            if idle || bytes > (free + st.table.mapped()).saturating_sub(pinned) {
+                let out = short(&st);
+                self.unlock(st);
+                break out;
+            }
+            record.step = req.and_then(|r| st.table.request(r)).map_or(0, |r| r.cursor.step);
+            let mut want = bytes - free;
+            let (mut unmapped, mut events, mut streamed) = (0, vec![], HashSet::new());
+            for Victim { key, bytes: b, releasing } in decide::victims(&st.table, keep) {
+                if want == 0 {
+                    break;
+                }
+                // Step 2: a running set's own pages are not evicted one by one; the set streams its upper blocks
+                // through slots instead, once per round, and its other pages stay.
+                if st.table.distance(key).is_some_and(|d| d.0 == 0) {
+                    if streamed.insert(key.0) {
+                        let taken = self.stream(&mut st, key.0, want, req)?;
+                        (unmapped, want) = (unmapped + taken.unmapped, want.saturating_sub(taken.unmapped + taken.pending));
+                        events.extend(taken.events);
+                    }
+                    continue;
+                }
+                if releasing {
+                    events.extend(st.table.page(key).map(|p| p.releasing.clone()).unwrap_or_default());
+                } else {
+                    let class = st.table.class(key).unwrap_or(Class::N);
+                    self.unmap(&mut st, key, class, req)?;
+                    unmapped += b;
+                }
+                want = want.saturating_sub(b);
+            }
+            let coming = st.homes.iter().any(|(k, h)| (h.filling || h.landing) && !keep.contains(k));
+            let last = st.last_unmap;
+            self.unlock(st);
+            // The unmaps done before the bytes count.
+            if let Some(t) = last.filter(|_| unmapped > 0) {
+                self.mech.settle_to(t);
+            }
+            for e in &events {
+                self.backend.finish(Event(*e))?;
+            }
+            record.waited += events.len() as u32;
+            record.freed += unmapped;
+            if unmapped == 0 && events.is_empty() {
+                let mut st = self.lock();
+                if coming {
+                    self.wait(&mut st)?;
+                    self.unlock(st);
+                    continue;
+                }
+                let out = short(&st);
+                self.unlock(st);
+                break out;
+            }
+        };
+        if record.freed > 0 || record.waited > 0 {
+            let mut st = self.state.lock();
+            let req = req.or_else(|| st.active.iter().find(|(_, a)| a.thread == std::thread::current().id()).map(|((r, _), _)| *r));
+            if let Some(s) = st.stats(req) {
+                s.make_room.push(record);
+            }
+        }
+        out
+    }
+
+    /// Recovery, at a pass boundary only (a shrink is at once): a streaming set takes back the
+    /// blocks at its watermark, one by one, then refills its slots, into spare bytes only, mapped
+    /// and filled on the copy stream, never evicting.
+    fn regrow(&self, req: u64, set: u32) {
+        let mut st = self.lock();
+        let (Some(watermark), Ok(blocks)) = (st.streams.get(&set).map(|s| s.watermark), st.mech(set).map(|m| m.spec.layout.regions.len() as u32)) else {
+            return self.unlock(st);
+        };
+        let mut room = self.spare(&st);
+        let mut w = watermark;
+        while let Some(bytes) = (w < blocks).then(|| st.table.page((set, w)).map(|p| p.bytes)).flatten().filter(|b| *b <= room) {
+            // A slot already there is resident now at no cost; a block with no page is mapped.
+            if !st.homes.contains_key(&(set, w)) {
+                if !self.map(&mut st, (set, w), Some(req), true).unwrap_or(false) {
+                    break;
+                }
+                room -= bytes;
+            }
+            w += 1;
+        }
+        if w >= blocks {
+            st.streams.remove(&set);
+        } else if let Some(s) = st.streams.get_mut(&set) {
+            s.watermark = w;
+        }
+        // Its slots, refilled here only (a bind mid-pass moves one, never makes one): the next
+        // upper blocks with no page.
+        let mut next = w;
+        for _ in st.slots(set, w)..stream::SLOTS {
+            while next < blocks && st.homes.contains_key(&(set, next)) {
+                next += 1;
+            }
+            let Some(bytes) = (next < blocks).then(|| st.table.page((set, next)).map(|p| p.bytes)).flatten().filter(|b| *b <= room) else { break };
+            if !self.map(&mut st, (set, next), Some(req), true).unwrap_or(false) {
+                break;
+            }
+            room -= bytes;
+            next += 1;
+        }
+        self.unlock(st);
+    }
+
+    /// Maps the next blocks of `req`'s current step into spare bytes only.
+    fn prefetch(&self, req: u64) {
+        let mut st = self.lock();
+        let spare = self.spare(&st);
+        for key in decide::prefetch(&st.table, req, spare) {
+            if self.map(&mut st, key, Some(req), true).unwrap_or(false) {
+                let step = st.table.request(req).map_or(0, |r| r.cursor.step);
+                if let Some(p) = st.table.page_mut(key) {
+                    p.speculative = Some((req, step));
+                }
+            }
+        }
+        self.unlock(st);
+    }
+
+    // ---- the calls
+
+    fn load(self: &Arc<Self>, spec: SetSpec, level: Level) -> Result<SetId> {
+        let (id, again) = {
+            let mut st = self.lock();
+            let existing = st.sets.iter().position(|m| m.as_ref().is_some_and(|m| m.spec.name == spec.name && !m.closing));
+            let out = match existing {
+                Some(i) if st.mech(i as u32)?.spec.fingerprint.digest == spec.fingerprint.digest => {
+                    self.refill(&mut st, i as u32, spec.fingerprint.fill)?;
+                    (i as u32, true)
+                }
+                Some(_) => return Err(Error::Invalid(format!("set {} is loaded with another layout or release", spec.name))),
+                None => {
+                    let layout = &spec.layout;
+                    let va = self.backend.reserve(layout.nbytes)?;
+                    let pages = layout.regions.iter().map(|r| Page { bytes: r.span, ..Page::default() }).collect();
+                    let set = Set { name: spec.name.clone(), pages, declared: spec.fingerprint.declared() };
+                    let i = st.sets.len() as u32;
+                    st.sets.push(Some(SetMech { key: spec.fingerprint.key(), spec, va, closing: false, retained: 0 }));
+                    st.table.sets.push(Some(set));
+                    (i, false)
+                }
+            };
+            self.unlock(st);
+            out
+        };
+        match level {
+            Level::Ram => {
+                if again {
+                    // Down to RAM: its unpinned device pages go.
+                    let mut st = self.lock();
+                    let keys: Vec<Key> = st.table.pages().filter(|(k, p)| k.0 == id && p.mapped && p.pins.is_empty() && p.releasing.is_empty() && !p.filling).map(|(k, _)| k).collect();
+                    for key in keys {
+                        self.unmap(&mut st, key, Class::N, None)?;
+                    }
+                    self.unlock(st);
+                }
+                self.readahead(id)?
+            }
+            Level::Gpu => {
+                // In block order, evicting nothing of its own: standalone into spare bytes;
+                // leased, every page is asked of the manager (retained ones come back with no
+                // copy), and one it refuses stays unmapped quietly.
+                {
+                    let mut st = self.lock();
+                    let leased = self.leasing();
+                    let mut free = if leased { u64::MAX } else { self.spare(&st) };
+                    let keys: Vec<(Key, u64)> = st.table.pages().filter(|(k, p)| k.0 == id && !p.mapped).map(|(k, p)| (k, p.bytes)).collect();
+                    for (key, bytes) in keys {
+                        if bytes > free {
+                            break;
+                        }
+                        self.map(&mut st, key, None, leased)?;
+                        free -= bytes;
+                    }
+                    self.unlock(st);
+                }
+                let mut st = self.lock();
+                // Until its fills' batches end (landed and accounted for), not only issued.
+                while st.table.pages().any(|(k, p)| k.0 == id && p.filling) || st.homes.iter().any(|(k, h)| k.0 == id && h.landing) {
+                    self.wait(&mut st)?;
+                }
+                self.unlock(st);
+            }
+        }
+        Ok(SetId(id))
+    }
+
+    /// Brings the set's stored bytes into host RAM, the page cache, ahead of its fills.
+    #[cfg(unix)]
+    fn readahead(&self, set: u32) -> Result<()> {
+        let spec = {
+            let st = self.lock();
+            let spec = st.mech(set)?.spec.clone();
+            self.unlock(st);
+            spec
+        };
+        let items: Vec<tensorfs::io::source::Item> = spec.layout.regions.iter().flat_map(|r| r.items.iter().cloned()).collect();
+        Ok(spec.source.readahead(&items)?)
+    }
+
+    #[cfg(windows)]
+    fn readahead(&self, set: u32) -> Result<()> {
+        let st = self.lock();
+        match *st.mech(set)?.spec.source {}
+    }
+
+    fn resolve(st: &State, plan: &Plan) -> Vec<(Vec<u32>, u32)> {
+        let index = |name: &String| st.sets.iter().position(|m| m.as_ref().is_some_and(|m| &m.spec.name == name && !m.closing)).map(|i| i as u32);
+        plan.steps.iter().map(|s| (s.sets.iter().filter_map(index).collect(), s.passes.max(1))).collect()
+    }
+
+    fn open_request(&self, id: &str, plan: &Plan, idle: bool) -> Result<u64> {
+        let mut st = self.lock();
+        let rid = st.tick();
+        let steps = Self::resolve(&st, plan);
+        // Its anonymous host peak is measured from its start (the process's, when it runs alone).
+        match st.window.as_mut() {
+            Some(window) => drop(window.look()),
+            None => st.window = HostWindow::start(),
+        }
+        st.table.requests.push(Req { id: rid, name: id.to_string(), steps, idle, ..Req::default() });
+        // A cold request's record carries the fills since the last one ended (its loads).
+        let earlier = std::mem::take(&mut st.unclaimed);
+        st.stats.insert(rid, Stats { request: id.to_string(), moved: earlier.moved, trace: earlier.trace, ..Stats::default() });
+        self.unlock(st);
+        Ok(rid)
+    }
+
+    /// Binds `block` of `set` for `stream`; `claims` are the caller's own preparation pins,
+    /// which hold the page for this bind and never against it.
+    fn bind_for(self: &Arc<Self>, set: u32, block: u32, stream: usize, request: Option<u64>, claims: &[u64], free_only: bool) -> Result<Pin> {
+        let key = (set, block);
+        let start = Instant::now();
+        let mut st = self.lock();
+        let req = request.or_else(|| st.binding(set));
+        if st.table.page(key).is_none() {
+            return Err(Error::Invalid(format!("no block {block} in set {set}")));
+        }
+        let (mut hit, mut waited, mut speculative) = (true, false, false);
+        loop {
+            if let Some(e) = st.failed.get(&key).cloned() {
+                // A page whose failed copies could not be proven drained keeps failing.
+                if !st.homes.get(&key).is_some_and(|h| h.filling) {
+                    st.failed.remove(&key);
+                }
+                return Err(e);
+            }
+            let identity = st.mech(set)?.key.clone();
+            let pinned = st.table.page(key).is_some_and(|p| p.pins.iter().any(|id| !claims.contains(id)));
+            // Waiting on pins only this thread holds would wait on itself.
+            let me = std::thread::current().id();
+            let mine = pinned && st.pins.iter().filter(|(id, (k, ..))| *k == key && !claims.contains(id)).all(|(_, (.., t))| *t == me);
+            // A streamed set's upper block takes a slot rather than a new page (step 2's watermark).
+            match self.stream_in(&mut st, key, req)? {
+                StreamIn::Moved => {
+                    hit = false;
+                    continue;
+                }
+                StreamIn::Wait => {
+                    (hit, waited) = (false, true);
+                    self.wait(&mut st)?;
+                    continue;
+                }
+                StreamIn::No => {}
+            }
+            match st.homes.get(&key) {
+                // Not the set's weights now, and unpinned: filled again in place.
+                Some(h) if h.identity != identity && !h.filling && !pinned => {
+                    hit = false;
+                    self.refill_in_place(&mut st, key, req)?;
+                }
+                Some(h) if (h.identity != identity || h.transforming) && !h.filling && mine => {
+                    return Err(Error::Held(format!("block {block} of set {set} is pinned by this thread alone")));
+                }
+                // Still pinned or filling: its pin's drop or its fill wakes the binder.
+                Some(h) if h.identity != identity => {
+                    hit = false;
+                    waited = true;
+                    self.wait(&mut st)?;
+                }
+                Some(h) if h.filled || !(h.filling || h.transforming) => {
+                    speculative |= h.speculative;
+                    break;
+                }
+                Some(h) => {
+                    speculative |= h.speculative;
+                    hit = false;
+                    waited = true;
+                    self.wait(&mut st)?;
+                }
+                None => {
+                    hit = false;
+                    let bytes = st.table.page(key).map_or(0, |p| p.bytes);
+                    self.unlock(st);
+                    let refused = match self.make_room(bytes, &[key], if free_only { "bind_free" } else { "bind" }, req, free_only) {
+                        Err(e @ Error::Exhausted(_)) if !free_only => Some(e),
+                        made => made.map(|_| None)?,
+                    };
+                    st = self.lock();
+                    if let Some(e) = refused {
+                        // A streamed set with only its slots left: one of them moves to the block (the floor: one block).
+                        match self.stream_in(&mut st, key, req)? {
+                            StreamIn::Moved => continue,
+                            StreamIn::Wait => {
+                                waited = true;
+                                self.wait(&mut st)?;
+                                continue;
+                            }
+                            StreamIn::No => return Err(e),
+                        }
+                    }
+                    if !st.homes.contains_key(&key) {
+                        self.map(&mut st, key, req, false)?;
+                    }
+                }
+            }
+        }
+        let (va, off, span) = st.place(key)?;
+        let id = st.tick();
+        let now = st.clock;
+        let Some(h) = st.homes.get_mut(&key) else { return Err(Error::Internal("a bound page lost its home".into())) };
+        let fresh = h.fresh();
+        let transform = fresh;
+        if transform {
+            h.transforming = true;
+        }
+        let (ready, origin) = (h.ready, if hit { Origin::Hit } else { h.origin });
+        st.pins.insert(id, (key, req, std::thread::current().id()));
+        if let Some(p) = st.table.page_mut(key) {
+            p.last_use = now;
+            #[cfg(unix)]
+            st.used_ns.insert(key, monotonic_ns());
+        }
+        st.sync(key);
+        if let Some(r) = req.and_then(|r| st.table.request_mut(r)) {
+            r.cursor.next.insert(set, block + 1);
+        }
+        let name = st.mech(set)?.spec.name.clone();
+        let step = req.and_then(|r| st.table.request(r)).map_or(0, |r| r.cursor.step);
+        if let Some(s) = st.stats(req) {
+            s.trace.push(Ref { step, set: name, block, bytes: span, origin, speculative });
+            if waited || !hit {
+                s.stall_ns += start.elapsed().as_nanos() as u64;
+            }
+        }
+        self.unlock(st);
+        if let Some(r) = req {
+            self.prefetch(r);
+        }
+        let pin = Pin { ptr: va.base + off, len: span, ready, fresh, inner: self.clone().into(), key, id, stream, transform, transformed: AtomicBool::new(false) };
+        self.backend.wait(ready, stream)?;
+        Ok(pin)
+    }
+    /// Moves the request's cursor to the pass of `set`; true when a step began. A pass the plan
+    /// does not declare takes one synthetic step at the end, reused by the next such pass.
+    fn advance(st: &mut State, req: u64, set: u32) -> Result<bool> {
+        let synthetic = st.synthetic.contains(&req);
+        let r = st.table.request_mut(req).ok_or_else(|| Error::Closed("the request".into()))?;
+        let i = r.cursor.step;
+        let current = r.steps.get(i as usize).is_some_and(|(s, _)| s.contains(&set));
+        let begun = r.cursor.passes.get(&set).copied().unwrap_or(0);
+        let later = (i + 1..r.steps.len() as u32).find(|j| r.steps.get(*j as usize).is_some_and(|(s, _)| s.contains(&set)));
+        let first = begun == 0 && r.cursor.passes.is_empty();
+        // A set of the current step stays in it, however many passes it runs; only a set the
+        // step lacks moves the cursor, to the first later step that has it.
+        if current {
+            r.cursor.passes.insert(set, begun + 1);
+            r.cursor.next.insert(set, 0);
+            return Ok(first);
+        }
+        let j = match later {
+            Some(j) => j,
+            None if synthetic => {
+                let last = r.steps.len().saturating_sub(1);
+                if let Some(step) = r.steps.get_mut(last) {
+                    *step = (vec![set], 1);
+                }
+                last as u32
+            }
+            None => {
+                r.steps.push((vec![set], 1));
+                st.synthetic.insert(req);
+                return Self::advance(st, req, set);
+            }
+        };
+        r.cursor = crate::table::Cursor { step: j, passes: BTreeMap::from([(set, 1)]), next: BTreeMap::from([(set, 0)]) };
+        Ok(true)
+    }
+
+    /// A pass of `set` for `req` (its dispatch key's `key`): the plan's cursor moves to it, the
+    /// kept pages of its step are adopted, peers are asked when it is short (co-residency), and
+    /// its first blocks are prefetched into free bytes.
+    fn pass(&self, req: u64, set: u32) -> Result<u64> {
+        let id = {
+            let mut st = self.lock();
+            st.mech(set)?;
+            if Self::advance(&mut st, req, set)? {
+                let free = self.free(&st);
+                if let Some(s) = st.step_stats(req) {
+                    s.capacity = free;
+                }
+            }
+            let id = st.tick();
+            st.active.insert((req, set), Active { id, thread: std::thread::current().id() });
+            self.unlock(st);
+            id
+        };
+        self.regrow(req, set);
+        self.prefetch(req);
+        Ok(id)
+    }
+
+    /// A pass ends: `peak` (what torch allocated at most) and the pages held now go into the
+    /// request's record.
+    fn end_pass(&self, req: u64, pass: u64, peak: u64) -> Result<()> {
+        let mut st = self.lock();
+        st.active.retain(|(r, _), a| !(*r == req && a.id == pass));
+        let held = st.table.mapped() + peak;
+        if let Some(s) = st.stats(Some(req)) {
+            s.peak = s.peak.max(held);
+            s.compute = s.compute.max(peak);
+        }
+        self.unlock(st);
+        Ok(())
+    }
+
+    fn end_request(&self, req: u64) -> Stats {
+        let outlived = self.torch.get().map(|t| t.end(crate::arena::Owner::Request(req)).outlived).unwrap_or_default();
+        let mut st = self.lock();
+        self.unstream(&mut st, req);
+        st.active.retain(|(r, _), _| *r != req);
+        st.synthetic.remove(&req);
+        st.table.requests.retain(|r| r.id != req);
+        let leftover: u64 = st.pins.values().filter(|(_, r, _)| *r == Some(req)).filter_map(|(k, ..)| st.table.page(*k)).map(|p| p.bytes).sum();
+        let host = st.window.as_mut().and_then(HostWindow::look);
+        if st.table.requests.is_empty() {
+            st.window = None;
+        }
+        let stats = Stats { outlived, leftover, host, ..st.stats.remove(&req).unwrap_or_default() };
+        st.last = Some(stats.clone());
+        self.unlock(st);
+        stats
+    }
+
+}
+
+/// This process's open devices: one Memory each.
+#[derive(Clone, Copy)]
+enum DeviceState { Active, Retiring, Quarantined }
+static OPEN: Mutex<BTreeMap<String, DeviceState>> = Mutex::new(BTreeMap::new());
+static CLOSED: Condvar = Condvar::new();
+
+/// A device this process has open, given back only after its prior owner has retired.
+struct Device(String);
+
+impl Device {
+    fn open(uuid: &str) -> Result<Device> {
+        let mut open = OPEN.lock();
+        loop {
+            match open.get(uuid) {
+                Some(DeviceState::Active) => return Err(Error::Invalid(format!("{uuid} is already open in this process"))),
+                Some(DeviceState::Quarantined) => return Err(Error::Ownership(format!("{uuid} has quarantined device ownership; retire this executor"))),
+                // Opening is preparation, outside Python/allocator locks. Existing public
+                // owners still refuse immediately; only their completed handoff is awaited.
+                Some(DeviceState::Retiring) => CLOSED.wait(&mut open),
+                None => break,
+            }
+        }
+        open.insert(uuid.to_string(), DeviceState::Active);
+        Ok(Device(uuid.to_string()))
+    }
+
+    fn retiring(&self, quarantined: bool) {
+        let mut open = OPEN.lock();
+        if let Some(state) = open.get_mut(&self.0) {
+            if quarantined { *state = DeviceState::Quarantined; }
+            else if !matches!(state, DeviceState::Quarantined) { *state = DeviceState::Retiring; }
+        }
+        drop(open);
+        CLOSED.notify_all();
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        OPEN.lock().remove(&self.0);
+        CLOSED.notify_all();
+    }
+}
+
+impl Memory {
+    /// Drops this handle and, once every public handle of it is gone (requests, pins,
+    /// passes), waits until its memory has retired: its pages given back. A process ends after
+    /// it; ending without it leaves its leases to the manager's reap.
+    pub fn retire(self) -> Result<()> {
+        let uuid = self.inner._device.0.clone();
+        drop(self);
+        let mut open = OPEN.lock();
+        loop {
+            match open.get(&uuid) {
+                None => return Ok(()),
+                Some(DeviceState::Quarantined) => return Err(Error::Ownership(format!("{uuid} retired with quarantined device ownership"))),
+                Some(_) => CLOSED.wait(&mut open),
+            }
+        }
+    }
+}
+
+impl Drop for Memory {
+    /// Final physical retirement is transferred by Owner, so a Python/DLPack destructor never
+    /// waits for a CUDA consumer or a host callback.
+    fn drop(&mut self) {
+        if self.handles.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        self.inner.burst.0.lock().closed = true;
+        self.inner.burst.1.notify_all();
+        self.inner.landed.notify_all();
+    }
+}
+
+impl Inner {
+    /// Only the last public owner is queued here. Internal references may still finish work;
+    /// their count is a quiescence check, never the ownership-transfer decision.
+    fn retire_public(self: &Arc<Self>) -> Result<bool> {
+        self.check_ownership()?;
+        if Arc::strong_count(self) != 1 { return Ok(false); }
+        let mut st = self.state.lock();
+        self.drain(&mut st);
+        for (event, _) in st.events.values().flatten() {
+            if !self.backend.query(*event)? { return Ok(false); }
+        }
+        for home in st.homes.values() {
+            if home.filling || home.transforming || !self.backend.query(home.ready)? { return Ok(false); }
+        }
+        // Leased pages go back to the manager, which retains the landed ones.
+        let keys: Vec<Key> = st.homes.keys().copied().collect();
+        for key in keys { self.unmap(&mut st, key, Class::N, None)?; }
+        let empty = st.homes.is_empty();
+        drop(st);
+        Ok(empty && self.mech.idle())
+    }
+}
+
+impl Inner {
+    /// The last public owner went: retires once nothing is left to finish. Each round waits on
+    /// the work it found unfinished, never on a clock; a failure quarantines it.
+    fn retire(self: Arc<Self>) {
+        loop {
+            let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.retire_public().and_then(|done| if done { Ok(true) } else { self.quiesce().map(|()| false) })));
+            match round {
+                Ok(Ok(true)) => return,
+                Ok(Ok(false)) => {}
+                Ok(Err(_)) | Err(_) => {
+                    self.ownership_lost.store(true, Ordering::Release);
+                    self._device.retiring(true);
+                    self.landed.notify_all();
+                    std::mem::forget(self);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Blocks until the work a retirement waits on is done: fills, every pending event and
+    /// ready event (a host wait, on the retirer's own thread), mechanism calls, and every
+    /// worker's reference.
+    fn quiesce(self: &Arc<Self>) -> Result<()> {
+        {
+            let mut st = self.lock();
+            while st.homes.values().any(|h| h.filling) {
+                self.wait(&mut st)?;
+            }
+            self.unlock(st);
+        }
+        self.finish_pending()?;
+        self.mech.settle();
+        let mut alone = self.quiet.lock.lock();
+        while Arc::strong_count(self) > 1 {
+            self.quiet.gone.wait(&mut alone);
+        }
         Ok(())
     }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if self.check().is_err() {
-            self.retain_resources();
-            return;
-        }
-        let Ok(d) = cuda::driver().map_err(Error::from) else { self.retain_resources(); return };
-        let Ok(_c) = CtxGuard::enter(self.ctx) else { self.retain_resources(); return };
-        // SAFETY: our live stream in its current context. Drop cannot use the fallible macro.
-        if self.check().is_err() || cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(self.copy) }).is_err() {
-            self.retain_resources();
-            return;
-        }
-        let releases_failed = self.st.get_mut().unwrap().slots.iter().flatten().any(|s| s.m.released.iter().any(|e| e.sync().is_err()));
-        if releases_failed {
-            self.retain_resources();
-            return;
-        }
-        // SAFETY: our stream, drained before anything it wrote to goes.
-        let mut st = std::mem::take(self.st.get_mut().unwrap());
-        for i in 0..st.slots.len() {
-            if st.slots[i].is_some() {
-                let _ = self.drop_slot(&mut st, i);
+        self.burst.0.lock().closed = true;
+        self.burst.1.notify_all();
+        // The mechanism's thread ends with the Memory: what it was still to do happens here,
+        // then its Close (taken by it alone) ends it.
+        let left: Vec<(u64, Mech)> = self.mech.rx.try_iter().collect();
+        self.mech.post(Mech::Close);
+        for (_, op) in left {
+            match op {
+                Mech::Unmap { va, off, span, phys, ready } => {
+                    let _ = self.backend.finish(ready);
+                    let _ = self.backend.unmap(va, off, span);
+                    phys.into_iter().for_each(|p| { let _ = self.give_page(p); });
+                    self.backend.retire(ready);
+                }
+                Mech::Renew { va, off, span, old, .. } => {
+                    let _ = self.backend.unmap(va, off, span);
+                    old.into_iter().for_each(|p| { let _ = self.give_page(p); });
+                }
+                Mech::Move { va, from, span, phys, .. } => {
+                    let _ = self.backend.unmap(va, from, span);
+                    let _ = self.give_page(phys);
+                }
+                Mech::Release(va) => self.backend.release(va),
+                Mech::Map { .. } | Mech::Close => {}
+                #[cfg(unix)]
+                Mech::Revoke | Mech::Reclaim { .. } => {}
             }
         }
-        let _ = self.keep_idle(&mut st, 0);
-        // SAFETY: our drained stream.
-        unsafe { (d.stream_destroy)(self.copy) };
+        let mut st = self.state.lock();
+        let homes: Vec<(Key, Home)> = st.homes.drain().collect();
+        for (key, home) in homes {
+            let Some(phys) = home.phys else { continue };
+            if let Ok((va, off, span)) = st.place(key) {
+                let _ = self.backend.unmap(va, off, span);
+            }
+            let _ = self.give_page(phys);
+        }
+        let sets: Vec<SetMech> = st.sets.drain(..).flatten().collect();
+        drop(st);
+        for m in sets {
+            self.backend.release(m.va);
+        }
+        // Its retired events that completed go with it (one still pending, with the backend).
+        self.backend.sweep();
+    }
+}
+
+fn fill_loop(demand: &Receiver<Vec<Job>>, ahead: &Receiver<Vec<Job>>, inner: &Weak<Inner>) {
+    loop {
+        // A demand miss first; both queues close with the Memory.
+        let group = select_biased! {
+            recv(demand) -> j => j,
+            recv(ahead) -> j => j,
+        };
+        let Ok(group) = group else { return };
+        let Some(me) = Work::of(inner) else { return };
+        let batch = me.batch(group, demand, ahead);
+        // A panic outside the copies fails the batch's binders; the thread keeps serving.
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.fill(&batch))) {
+            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
+            me.fail(&batch, Error::Internal(format!("panic: {}", msg.unwrap_or_default())));
+        }
+        me.batched(&batch);
+    }
+}
+
+/// The mechanism thread: the device's VMM calls, in the order decided, off the state lock.
+fn mech_loop(queue: &Mechs, inner: &Weak<Inner>) {
+    while let Ok((ticket, op)) = queue.rx.recv() {
+        if matches!(op, Mech::Close) {
+            queue.finished(ticket);
+            return;
+        }
+        let Some(me) = Work::of(inner) else { return };
+        // Consecutive maps (a bind's block) reach the fill threads as one group: handed over
+        // before any other call, once nothing waits for this thread, or once they make a batch.
+        if !matches!(op, Mech::Map { .. }) {
+            me.flush_fills();
+        }
+        me.mechanism(op);
+        if queue.rx.is_empty() || me.grouped_bytes() >= me.fill_budget() {
+            me.flush_fills();
+        }
+        me.landed.notify_all();
+        // Done with the Memory before it reads as done: a settled Memory is this thread's no
+        // more.
+        drop(me);
+        queue.finished(ticket);
+        // Retired events destroyed here, never on a caller's thread: a destroy can wait on a
+        // driver lock another thread's device sync holds.
+        if let Some(me) = Work::of(inner) {
+            me.backend.sweep();
+        }
+    }
+}
+
+impl Request {
+    pub fn check(&self) -> Result<()> { self.inner.check_ownership() }
+
+    /// Replaces the plan (packages declare it after the request opened); the cursor starts over.
+    pub fn plan(&self, plan: Plan) {
+        let _ = self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            let steps = Inner::resolve(&st, &plan);
+            if let Some(r) = st.table.request_mut(self.id) {
+                r.steps = steps;
+                r.cursor = Default::default();
+            }
+            st.synthetic.remove(&self.id);
+            self.inner.unlock(st);
+            Ok(())
+        });
+    }
+
+    /// Starts a pass of `set` (`key`: the execution layer's name for its entry and shape): the
+    /// plan's cursor moves to it, peers are asked when the request is short, and its first
+    /// blocks are prefetched into free bytes.
+    pub fn pass(&self, set: SetId, key: &str) -> Result<Pass> {
+        let _ = key;
+        let id = self.inner.guard(|| self.inner.pass(self.id, set.0))?;
+        self.inner.torch_pass(self.id);
+        Ok(Pass { inner: self.inner.clone().into(), req: self.id, set: set.0, id })
+    }
+
+    /// The request waits on a child call: until the guard drops, its step's pages are a later
+    /// use (taken before the child's own).
+    pub fn yielding(&self) -> Yielded {
+        let _ = self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            if let Some(r) = st.table.request_mut(self.id) {
+                r.yielded = true;
+            }
+            self.inner.unlock(st);
+            Ok(())
+        });
+        Yielded { wait: Some((self.inner.clone().into(), self.id)) }
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.inner.state.lock().stats.get(&self.id).cloned().unwrap_or_default()
+    }
+
+    /// Ends the request, returning its record.
+    pub fn end(mut self) -> Stats {
+        self.ended = true;
+        let id = self.id;
+        let stats = self.inner.guard(|| Ok(self.inner.end_request(id))).unwrap_or_default();
+        self.inner.measured(crate::lease::Measured::Request { request: stats.request.clone(), working: stats.peak, compute: stats.compute, host: stats.host.unwrap_or(0) });
+        stats
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if !self.ended {
+            let id = self.id;
+            let _ = self.inner.guard(|| Ok(self.inner.end_request(id)));
+        }
+    }
+}
+
+impl Pin {
+    /// The caller enqueued its fill transform on the bind stream: the block's bytes are the
+    /// weights once the stream's work so far completes. Other binders wait on that in-stream.
+    pub fn filled(&self) {
+        self.transformed.store(true, Ordering::Release);
+        let _ = self.inner.guard(|| {
+            let event = self.inner.backend.record(self.stream)?;
+            let mut st = self.inner.lock();
+            if let Some(h) = st.homes.get_mut(&self.key) {
+                let old = std::mem::replace(&mut h.ready, event);
+                h.ready_on = self.stream;
+                h.filled = true;
+                h.transforming = false;
+                if old != event {
+                    self.inner.backend.retire(old);
+                }
+            }
+            st.sync(self.key);
+            #[cfg(unix)]
+            if self.inner.leasing() {
+                self.inner.to_land.lock().push(self.key);
+            }
+            self.inner.unlock(st);
+            self.inner.landed.notify_all();
+            Ok(())
+        });
+    }
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        // A DLPack deleter may hold the GIL or an allocator lock. A failed event record
+        // cannot be rescued by synchronizing here: a CUDA host callback may need that lock.
+        let event = match self.inner.backend.record(self.stream) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::error!("varena: release completion is unknown; quarantining pin {}: {error}", self.id);
+                self.inner.lost_backing(error);
+                return;
+            }
+        };
+        let untransformed = self.transform && !self.transformed.load(Ordering::Acquire);
+        let _ = self.inner.release_tx.send(Release { key: self.key, pin: self.id, event, stream: self.stream, untransformed });
+        self.inner.landed.notify_all();
+    }
+}
+
+impl Pass {
+    /// Ends the pass: `peak`, the most the execution layer saw it allocate, goes into the
+    /// request's record (its dispatch key's peak at the request's end).
+    pub fn end(self, peak: u64) {
+        // The pass's torch peak is varena's own when torch allocates from it.
+        let peak = peak.max(self.inner.torch_peak(self.req));
+        let _ = self.inner.guard(|| self.inner.end_pass(self.req, self.id, peak));
     }
 }
 
 impl Inner {
-    /// The final owner cannot manufacture completion from a destructor error. Keep the actual
-    /// source/mapping/buffer/event objects until process exit; the primary context lives as long.
-    fn retain_resources(&mut self) {
-        let state = std::mem::take(self.st.get_mut().unwrap());
-        let jobs = std::mem::take(self.jobs.0.get_mut().unwrap());
-        std::mem::forget((state, jobs, self.events.clone()));
-    }
-}
-
-/// One weight set on one GPU. Dropping it waits for its copies and releases, then unmaps it.
-pub struct WeightSet {
-    gpu: Arc<Gpu>,
-    id: usize,
-    base: u64,
-    pub weights: Arc<Weights>,
-}
-
-impl WeightSet {
-    pub fn device(&self) -> i32 {
-        self.gpu.inner.ordinal
+    /// Memory whose release could not be proved: this executor is quarantined, and it leaks
+    /// rather than reuse what another may still hold.
+    fn lost_backing(self: &Arc<Self>, why: impl std::fmt::Display) -> Error {
+        self.ownership_lost.store(true, Ordering::Release);
+        self._device.retiring(true);
+        self.landed.notify_all();
+        std::mem::forget(self.clone());
+        Error::Ownership(format!("physical release could not be proved: {why}"))
     }
 
-    /// The regions it was registered with.
-    pub fn regions(&self) -> &[Vec<String>] {
-        &self.weights.layout.names
-    }
-
-    /// The watermark: `regions` live at home, the rest stream (a mapped one serves until evicted).
-    pub fn home(&self, regions: &[u32]) -> Result<()> {
-        self.gpu.inner.check()?;
-        let n = self.weights.layout.regions.len() as u32;
-        if let Some(r) = regions.iter().find(|&&r| r >= n) {
-            return Err(Error::Invalid(format!("region {r} of {n}")));
+    /// Runs one mechanism call (the state lock free), then applies its result under it.
+    fn mechanism(self: &Arc<Self>, op: Mech) {
+        if self.check_ownership().is_err() {
+            std::mem::forget(op);
+            return;
         }
-        let mut st = self.gpu.inner.lock();
-        self.gpu.inner.check()?;
-        for (r, reg) in st.set(self.id).regs.iter_mut().enumerate() {
-            reg.home = regions.contains(&(r as u32));
-        }
-        let streamed = st.sets.iter().flatten().flat_map(|s| s.regs.iter().zip(&s.w.layout.regions).filter(|(r, _)| !r.home));
-        st.slot_span = streamed.map(|(_, x)| x.span).max().unwrap_or(0);
-        Ok(())
-    }
-
-    /// Region `r` for use on `stream`, at home or in a slot; `stream` waits for the bytes, the
-    /// host only for reads that feed a copy.
-    pub fn bind(self: &Arc<Self>, region: u32, stream: u64) -> Result<Pinned> {
-        let g = &self.gpu.inner;
-        g.check()?;
-        let _c = CtxGuard::enter(g.ctx)?;
-        let (at, ptr, fill, fresh, writable) = {
-            let mut st = g.lock();
-            g.check()?;
-            st.clock += 1;
-            if st.timings.len() > 256 {
-                st.resolve();
-            }
-            let clock = st.clock;
-            let set = st.set(self.id);
-            set.used = clock;
-            set.count(|c| c.binds += 1);
-            let reg = st.reg(self.id, region)?;
-            if reg.map.as_ref().is_some_and(Mapping::dead) {
-                let m = reg.map.take().unwrap();
-                g.unmap(&mut st, m)?;
-            }
-            let reg = st.reg(self.id, region)?;
-            if reg.map.is_some() || reg.home {
-                if reg.map.is_none() {
-                    g.map_home(&mut st, self.id, region, true)?;
-                }
-                let m = st.reg(self.id, region)?.map.as_mut().unwrap();
-                let (ptr, fill, fresh) = m.pin();
-                (At::Home, ptr, fill, fresh, !m.read_only)
-            } else {
-                let i = g.slot_for(&mut st, self.id, region, true)?.expect("a bind always gets a slot");
-                let s = st.slot(i);
-                s.pending = false;
-                let (ptr, fill, fresh) = s.m.pin();
-                (At::Slot(i), ptr, fill, fresh, !s.m.read_only)
-            }
-        };
-        g.hurry(&fill);
-        let ready = fill.wait().inspect_err(|_| self.release(at, region, None))?;
-        if let Err(e) = g.check() {
-            self.release(at, region, None);
-            return Err(e);
-        }
-        let nbytes = self.weights.layout.regions[region as usize].nbytes;
-        let admitted = (|| {
-            if !ready.done()? {
-                let s = stream as CUstream;
-                let a = g.events.record(s, true)?;
-                wait_in(s, &ready)?;
-                let b = g.events.record(s, true)?;
-                let mut st = g.lock();
-                let step = st.steps;
-                st.timings.push(Timing { set: self.id, step, field: |c| &mut c.stall_ns, a, b });
-            }
-            g.check()
-        })();
-        if let Err(e) = admitted {
-            // No user received this temporary pin, so no consumer work uses its mapping.
-            self.release(at, region, None);
-            return Err(e);
-        }
-        let stream = ConsumerStream::current(stream);
-        Ok(Pinned { ws: self.clone(), at, region, ptr, nbytes, fresh, writable, stream, consumers: Mutex::new(vec![stream]), ready })
-    }
-
-    /// Start filling region `r` ahead of its bind: at home, or into a free slot. Never waits.
-    pub fn prefetch(&self, region: u32) -> Result<()> {
-        let g = &self.gpu.inner;
-        g.with(|st| {
-            let reg = st.reg(self.id, region)?;
-            if reg.map.is_none() {
-                if reg.home {
-                    g.map_home(st, self.id, region, false)?;
-                } else {
-                    g.slot_for(st, self.id, region, false)?;
+        match op {
+            Mech::Map { key, gen, va, off, span, job, decided } => self.place_page(key, gen, va, off, span, job, decided),
+            #[cfg(unix)]
+            Mech::Revoke => self.revoke(),
+            #[cfg(unix)]
+            Mech::Reclaim { region, swap } => {
+                if let Err(e) = crate::region::reclaim(region, swap) {
+                    tracing::warn!("varena: reclaiming region {region}: {e}");
                 }
             }
-            Ok(())
-        })
-    }
-
-    /// Unmaps quiet home regions (all when None); returns the bytes.
-    pub fn evict(&self, regions: Option<&[u32]>) -> Result<u64> {
-        let g = &self.gpu.inner;
-        g.with(|st| {
-            let freed = g.evict(st, self.id, regions, u64::MAX)?;
-            g.keep_idle(st, IDLE_KEEP)?;
-            Ok(freed)
-        })
-    }
-
-    /// Region `r` is mapped at home with bytes there or on their way.
-    pub fn resident(&self, region: u32) -> Result<bool> {
-        Ok(self.gpu.inner.lock().reg(self.id, region)?.map.as_ref().is_some_and(|m| !m.dead()))
-    }
-
-    pub fn warm(&self, warm: bool) {
-        self.gpu.inner.lock().set(self.id).warm = warm;
-    }
-
-    /// Its home regions map from now on as one shareable allocation each, so their pages can be
-    /// kept (`kept`) past this process. False where the device cannot share them.
-    pub fn shareable(&self) -> bool {
-        let g = &self.gpu.inner;
-        let ok = g.shared.is_some();
-        g.lock().set(self.id).shared = ok;
-        ok
-    }
-
-    /// Home regions whose pages landed and were not handed out yet, each kept for TensorD:
-    /// `(region, span, container)`, a socket whose queue holds the allocation's fd. The pages
-    /// outlive this process while TensorD holds the container; unmapping them here drains it.
-    /// `filled`: only pages a page-in transform already filled (bound since they landed), for
-    /// a set whose fill writes its pages (a LoRA bake): a page still fresh would be kept unfilled.
-    pub fn kept(&self, filled: bool) -> Result<Vec<(u32, u64, OwnedFd)>> {
-        self.keep(false, filled)
-    }
-
-    /// Exports after the caller has stopped admission and drained every use of these weights.
-    /// Lifetime address pins (cached graphs) may remain; no work may read or write them now.
-    /// Their addresses and pins stay intact, and incomplete copies still cannot be exported.
-    pub fn kept_quiescent(&self, filled: bool) -> Result<Vec<(u32, u64, OwnedFd)>> {
-        self.keep(true, filled)
-    }
-
-    fn keep(&self, quiescent: bool, filled: bool) -> Result<Vec<(u32, u64, OwnedFd)>> {
-        let g = &self.gpu.inner;
-        g.with(|st| {
-            let mut out = vec![];
-            for (r, reg) in st.set(self.id).regs.iter_mut().enumerate() {
-                let Some(m) = reg.map.as_mut().filter(|m| m.chunks.len() == 1 && m.chunks[0].shared && !m.deposited && !(filled && m.fresh)) else { continue };
-                let ready = if quiescent {
-                    m.fill.as_ref().map_or(Ok(false), |f| f.landed())? && passed(&mut m.released)?
-                } else {
-                    m.quiet()?
-                };
-                if !ready {
-                    continue;
+            Mech::Renew { key, gen, va, off, span, old, after, job } => {
+                // Its consumers finish before the unmap: this thread waits for their events.
+                let released = after.iter().try_for_each(|e| self.backend.finish(*e))
+                    .and_then(|()| self.backend.unmap(va, off, span));
+                if let Err(error) = released {
+                    tracing::warn!("varena: renewed page ownership could not be released: {error}");
+                    let st = self.state.lock();
+                    self.ownership_lost.store(true, Ordering::Release);
+                    drop(st);
+                    self.landed.notify_all();
+                    std::mem::forget((self.clone(), old, after));
+                    return;
                 }
-                let filled = m.fill.as_ref().and_then(|f| lock(&f.state).clone());
-                let landed = match filled {
-                    Some(Filled::Ready(ev)) => ev.done()?,
-                    _ => false,
-                };
-                if m.kept.is_none() && landed {
-                    let desc = AccessDesc { location: g.prop.location, flags: cuda::MEM_ACCESS_PROT_READ };
-                    call!("cuMemSetAccess", mem_set_access(m.va, m.span as usize, &desc, 1))?;
-                    m.read_only = true;
-                    let mut fd: c_int = -1;
-                    call!("cuMemExportToShareableHandle", mem_export(&mut fd as *mut c_int as *mut c_void, m.chunks[0].handle, cuda::MEM_HANDLE_TYPE_POSIX_FD, 0))?;
-                    // SAFETY: the driver just opened this descriptor for us.
-                    m.kept = Some(contain(unsafe { OwnedFd::from_raw_fd(fd) })?);
-                }
-                if let Some(kept) = &m.kept {
-                    let dup = kept.try_clone().map_err(|e| Error::Io(format!("dup a kept container: {e}")))?;
-                    out.push((r as u32, m.span, dup.into()));
-                    m.deposited = true;
-                }
-            }
-            Ok(out)
-        })
-    }
-
-    /// Home regions mapped from pages another process kept (`kept`'s fds, taken out of their
-    /// containers): imported and mapped, no copy. A page that will not import or map is skipped
-    /// and fills as usual. `filled`: pages a page-in transform filled, which no host layout holds
-    /// (the caller proved what filled them): they map filled, never filled again. Returns the
-    /// regions adopted.
-    pub fn adopt_pages(&self, pages: Vec<(u32, OwnedFd)>, filled: bool) -> Result<Vec<u32>> {
-        let g = &self.gpu.inner;
-        g.with(|st| {
-            let (base, w, mut adopted) = (st.set(self.id).base, st.set(self.id).w.clone(), vec![]);
-            for (r, fd) in pages {
-                let x = w.layout.region(r)?;
-                if !st.set(self.id).shared || st.reg(self.id, r)?.map.is_some() || !st.reg(self.id, r)?.home {
-                    continue;
-                }
-                let host = w.host.as_ref().filter(|m| !filled && m.ready(r)).map(|m| m.base() as usize + x.offset as usize);
-                let va = base + x.offset;
-                match g.import(va, x.span, &fd).and_then(|h| g.holds(h, va, x.span, x.nbytes, host)) {
-                    Ok(handle) => {
-                        let ready = match g.events.record(g.copy, false) {
-                            Ok(ev) => Filled::Ready(ev),
-                            Err(e) => g.drained(e),
-                        };
-                        let fill = Arc::new(Fill { state: Mutex::new(Some(ready)), cv: Condvar::new() });
-                        let chunks = vec![Chunk { handle, size: x.span, shared: true }];
-                        let m = Mapping { va: base + x.offset, span: x.span, chunks, fill: Some(fill), fresh: !filled, kept: Some(contain(fd)?), ..Default::default() };
-                        st.reg(self.id, r)?.map = Some(m);
-                        st.mapped += x.span;
-                        adopted.push(r);
+                if let Some(old) = old {
+                    if let Err(error) = self.give_page(old) {
+                        self.lost_backing(error);
+                        return;
                     }
-                    Err(e) => tracing::warn!("varena: kept region {r} of {} did not map, it fills: {e}", w.name),
+                }
+                after.into_iter().for_each(|e| self.backend.retire(e));
+                self.place_page(key, gen, va, off, span, job, true);
+            }
+            Mech::Unmap { va, off, span, phys, ready } => {
+                // A page read ready at issue may still be landing: its copies end first.
+                if let Err(error) = self.backend.finish(ready).and_then(|()| self.backend.unmap(va, off, span)) {
+                    tracing::warn!("varena: page ownership could not be released: {error}");
+                    let st = self.state.lock();
+                    self.ownership_lost.store(true, Ordering::Release);
+                    drop(st);
+                    self.landed.notify_all();
+                    std::mem::forget((self.clone(), phys, ready));
+                    return;
+                }
+                if let Some(p) = phys {
+                    if let Err(error) = self.give_page(p) {
+                        self.lost_backing(error);
+                        return;
+                    }
+                }
+                self.backend.retire(ready);
+            }
+            Mech::Move { key, gen, va, from, off, span, phys, after, job } => self.move_slot(key, gen, va, from, off, span, phys, after, job),
+            Mech::Release(va) => self.backend.release(va),
+            Mech::Close => {}
+        }
+    }
+
+    /// Creates and maps a page for `key` and queues its fill; a create the device cannot serve
+    /// leaves the page unmapped (`decided` false: a speculative page, which goes quietly).
+    /// Leased, the page is asked of the manager and placed on the agent's thread when granted:
+    /// this thread never waits on it.
+    #[allow(clippy::too_many_arguments)]
+    fn place_page(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: bool) {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get().cloned() {
+            let (start, region) = (Instant::now(), self.lease_region(key));
+            let me = Arc::downgrade(self);
+            let asked = agent.ask(
+                span,
+                crate::lease::Kind::Weights,
+                region,
+                Box::new(move |got| {
+                    if let Some(inner) = me.upgrade() {
+                        inner.leased_page(key, gen, va, off, span, job, decided, got, start, region.is_some());
+                    }
+                }),
+            );
+            if let Err(error) = asked {
+                tracing::warn!("varena: asking the lease manager for {key:?}: {error}");
+            }
+            return;
+        }
+        let made = self.allowance.create(&*self.backend, span).and_then(|p| self.map_rw(va, off, p));
+        self.placed(key, gen, va, off, span, job, decided, made.map(|p| (p, false, None)));
+    }
+
+    /// `p` mapped read-write at `va + off`; unmappable, it goes back.
+    fn map_rw(self: &Arc<Self>, va: Va, off: u64, p: Physical) -> Result<Physical> {
+        match self.backend.map(va, off, &p, Access::ReadWrite) {
+            Ok(()) => Ok(p),
+            Err(error @ Error::Ownership(_)) => Err(self.lost_backing(error)),
+            Err(error) => match self.give_page(p) {
+                Ok(()) => Err(error),
+                Err(release) => Err(self.lost_backing(release)),
+            },
+        }
+    }
+
+    /// A page made (adopted: its bytes are the weights already; leased: the ask's time) or
+    /// refused, for `key` if it is still that page.
+    #[allow(clippy::too_many_arguments)]
+    fn placed(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: bool, made: Result<(Physical, bool, Option<u64>)>) {
+        let speculative = !decided;
+        let mut st = self.state.lock();
+        if !st.homes.get(&key).is_some_and(|h| h.gen == gen) {
+            drop(st);
+            if let Ok((p, ..)) = made {
+                self.commit_page(&p);
+                let released = self.backend.unmap(va, off, span).and_then(|()| self.give_page(p));
+                if let Err(error) = released {
+                    self.lost_backing(error);
                 }
             }
-            Ok(adopted)
-        })
-    }
-
-    pub fn busy(&self, busy: bool) {
-        self.gpu.inner.lock().set(self.id).busy = busy;
-    }
-
-    fn release(&self, at: At, region: u32, ev: Option<EvRef>) {
-        self.release_events(at, region, ev.into_iter().collect());
-    }
-
-    fn release_events(&self, at: At, region: u32, events: Vec<EvRef>) {
-        let mut st = self.gpu.inner.lock();
-        let m = match at {
-            At::Home => match st.reg(self.id, region) {
-                Ok(Reg { map: Some(m), .. }) => m,
-                _ => return,
-            },
-            At::Slot(i) => &mut st.slot(i).m,
-        };
-        m.pins -= 1;
-        if !events.is_empty() {
-            let _ = passed(&mut m.released);
-            m.released.extend(events);
-        }
-    }
-
-    fn finish_pin(self: &Arc<Self>, at: At, region: u32, events: Vec<EvRef>, failed: Option<Error>, drain: impl FnOnce() -> Result<()>) {
-        if let Some(record) = failed {
-            if let Err(e) = drain() {
-                // Successful partial records remain owned until every consumer is fenced.
-                self.gpu.inner.retain_waits(&events);
-                self.gpu.inner.retain_pin(self, Error::Io(format!("release event failed: {record}; consumer completion is unknown: {e}")));
-                return;
-            }
-            self.release(at, region, None);
-        } else {
-            self.release_events(at, region, events);
-        }
-    }
-
-    fn unregister_host(&self) -> bool {
-        let released = self.weights.host.as_ref().map_or(Ok(()), HostMem::unpin_all);
-        match released {
-            Ok(()) => true,
-            Err(e) => { self.gpu.inner.poison(e); false }
-        }
-    }
-}
-
-impl Drop for WeightSet {
-    fn drop(&mut self) {
-        let g = &self.gpu.inner;
-        if g.check().is_err() {
             return;
         }
-        let _c = match CtxGuard::enter(g.ctx).map_err(Error::from) {
-            Ok(c) => c,
-            Err(e) => { g.poison(e); return; }
-        };
-        // Leave the source and mappings in State until every copy and consumer fence is proven.
-        let Some((fills, releases)) = g.lock().close_fences(self.id) else { return };
-        for fill in fills {
-            let completed = match fill.completion() {
-                Filled::Ready(ev) => ev.sync(),
-                Filled::Failed(_) => Ok(()),
-                Filled::Unknown(e) => Err(e),
+        match made {
+            Ok((p, true, ns)) => {
+                // Adopted from the manager's retention: no copy, nothing to fill.
+                if let Some(h) = st.homes.get_mut(&key) {
+                    (h.phys, h.ready, h.ready_on, h.filling, h.filled, h.origin) = (Some(p), Event::DONE, COPY, false, true, Origin::Kept);
+                }
+                st.sync(key);
+                let s = st.fills(job.req, key, span, Origin::Kept);
+                s.moved.kept.bytes += span;
+                s.moved.kept.ns += ns.unwrap_or(0);
+                self.unlock(st);
+                self.landed.notify_all();
+            }
+            Ok((p, false, ns)) => {
+                if let Some(h) = st.homes.get_mut(&key) {
+                    h.phys = Some(p);
+                }
+                if let Some(ns) = ns {
+                    let s = st.fills(job.req, key, span, Origin::Store);
+                    s.moved.leased.bytes += span;
+                    s.moved.leased.ns += ns;
+                }
+                drop(st);
+                // Handed over with the pages mapped beside it (`flush_fills`).
+                let mut g = self.grouped.lock();
+                if speculative { g.1.push(job) } else { g.0.push(job) }
+            }
+            Err(e) => {
+                st.homes.remove(&key);
+                st.sync(key);
+                if !speculative {
+                    match e {
+                        // The manager could make no room: the bind takes this process's own
+                        // pages (a running set streams) and asks again.
+                        Error::Exhausted(_) => drop(st.short.insert(key, 0)),
+                        // The device had less than the figures showed: the bind decides again,
+                        // taking the page's bytes itself.
+                        error @ Error::Device { code: crate::backend::OUT_OF_MEMORY, .. } => {
+                            let driver_free = self.backend.free().unwrap_or(0);
+                            tracing::debug!(target: "varena::memory", ?key, ?error, span, driver_free, mapped = st.table.mapped(), "physical allocation refused; the bind decides again");
+                            st.short.insert(key, driver_free);
+                        }
+                        e => drop(st.failed.insert(key, e)),
+                    }
+                }
+                drop(st);
+                self.landed.notify_all();
+            }
+        }
+    }
+
+    /// A figure for the lease manager's admission and placement (a request's peaks at its end,
+    /// a set's bytes at its load); nothing when not leased.
+    fn measured(&self, _m: crate::lease::Measured) {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            if let Err(error) = agent.measured(_m) {
+                tracing::debug!("varena: a measured figure for the lease manager: {error}");
+            }
+        }
+    }
+
+    /// Pages come from the lease manager.
+    fn leasing(&self) -> bool {
+        #[cfg(unix)]
+        return self.lease.get().is_some();
+        #[cfg(not(unix))]
+        false
+    }
+
+    /// A page's physical memory goes: a leased page back to the manager (committed now if its
+    /// unmap's decision did not), any other destroyed.
+    fn give_page(&self, p: Physical) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            if let Some((ticket, ..)) = self.leased.lock().remove(&p.id) {
+                self.declined.lock().remove(&ticket);
+                return agent.give(ticket, p);
+            }
+        }
+        self.allowance.destroy(&*self.backend, p)
+    }
+
+    /// The decision to give a leased page back, before its fence: the manager sees it
+    /// progressing (Revoking), never stalled.
+    fn commit_page(&self, _p: &Physical) {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            if let Some((ticket, ..)) = self.leased.lock().get(&_p.id).copied() {
+                self.declined.lock().remove(&ticket);
+                if let Err(error) = agent.decide(ticket) {
+                    tracing::warn!("varena: committing a lease's return: {error}");
+                }
+            }
+        }
+    }
+
+    /// A leased page's bytes become `key`'s block (a streamed slot moving): no longer the
+    /// weights of the region it was granted for, it is never retained again (a grant's identity
+    /// never changes).
+    fn moved_page(&self, _p: &Physical, _key: Key) {
+        #[cfg(unix)]
+        if let Some(agent) = self.lease.get() {
+            let mut leased = self.leased.lock();
+            if let Some((ticket, at, retainable)) = leased.get_mut(&_p.id) {
+                (*at, *retainable) = (_key, false);
+                if let Err(error) = agent.unland(*ticket) {
+                    tracing::warn!("varena: a moved slot's lease: {error}");
+                }
+            }
+        }
+    }
+
+    /// Whether `p` is a leased page.
+    fn leased_page_of(&self, _p: Option<&Physical>) -> bool {
+        #[cfg(unix)]
+        return _p.is_some_and(|p| self.leased.lock().contains_key(&p.id));
+        #[cfg(not(unix))]
+        false
+    }
+
+    /// What a leased page holds, for the manager's retention: a declared set's fill identity and
+    /// the page's index.
+    #[cfg(unix)]
+    fn lease_region(&self, key: Key) -> Option<crate::lease::Region> {
+        let st = self.state.lock();
+        let m = st.mech(key.0).ok().filter(|m| m.spec.fingerprint.declared())?;
+        let digest = Sha256::digest(m.key.as_bytes());
+        let fingerprint = digest.get(..8).and_then(|b| <[u8; 8]>::try_from(b).ok()).map(u64::from_le_bytes)?;
+        Some(crate::lease::Region { fingerprint, region: key.1 })
+    }
+
+    /// The manager's answer to a page's ask, on the agent's thread: one chunk mapped and placed,
+    /// or the refusal.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn leased_page(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: bool, got: Result<Vec<crate::lease::Lease>>, start: Instant, region: bool) {
+        let Some(agent) = self.lease.get().cloned() else { return };
+        let retainable = region;
+        let made = got.and_then(|leases| {
+            let mut leases = leases.into_iter();
+            let (Some(lease), None) = (leases.next(), leases.next()) else {
+                return Err(Error::Invalid(format!("a page of {span} bytes leased as other than one chunk")));
             };
-            if let Err(e) = completed {
-                g.poison(e);
-                return;
-            }
-        }
-        for release in releases {
-            if let Err(e) = release.sync() {
-                g.poison(e);
-                return;
-            }
-        }
-        if g.check().is_err() {
+            let crate::lease::Lease { ticket, phys, adopted } = lease;
+            self.leased.lock().insert(phys.id, (ticket, key, retainable));
+            let p = self.map_rw(va, off, phys)?;
+            agent.mapped(&[ticket])?;
+            Ok((p, adopted, Some(start.elapsed().as_nanos() as u64)))
+        });
+        self.placed(key, gen, va, off, span, job, decided, made);
+        self.flush_fills();
+    }
+
+    /// The manager asked pages back: the quiet ones are unmapped (their return committed now,
+    /// given after their consumers); the busy ones are pinned in the table, so the manager looks
+    /// elsewhere, and go once idle.
+    #[cfg(unix)]
+    fn revoke(self: &Arc<Self>) {
+        let Some(agent) = self.lease.get().cloned() else { return };
+        let asked: HashSet<crate::lease::Ticket> = agent.asked_back().into_iter().collect();
+        if asked.is_empty() {
             return;
         }
-        if !self.unregister_host() {
+        // torch's chunks the manager asked back, given by the arena when idle and quiet (no
+        // state lock held: R10).
+        self.revoke_torch(&asked);
+        let keys: Vec<(crate::lease::Ticket, Key)> = self.leased.lock().values().filter(|(t, ..)| asked.contains(t)).map(|(t, k, _)| (*t, *k)).collect();
+        let mut st = self.lock();
+        for (ticket, key) in keys {
+            let quiet = st.idle(key) && st.homes.get(&key).is_some_and(|h| !h.landing && h.phys.is_some());
+            if quiet {
+                let class = st.table.class(key).unwrap_or(Class::N);
+                if let Err(error) = self.unmap(&mut st, key, class, None) {
+                    tracing::warn!("varena: giving back a lease of {key:?}: {error}");
+                }
+            } else if self.declined.lock().insert(ticket) {
+                let _ = agent.pin(ticket);
+            }
+        }
+        self.unlock(st);
+    }
+
+    /// What each leased page is to its plan, for the manager's victim order: the current
+    /// step's (memory.min, its distance: the nearest are its streaming slots), a later step's
+    /// (its distance), or idle (its last bind on the machine-wide clock). Atomics only, under
+    /// the state lock.
+    #[cfg(unix)]
+    fn advise(&self, st: &State, agent: &crate::lease::Agent) {
+        use crate::lease::Advice;
+        for (ticket, key, _) in self.leased.lock().values() {
+            let at = st.table.distance(*key).map(|(step, pass, block)| u64::from(step) << 40 | u64::from(pass) << 20 | u64::from(block));
+            let advice = match (st.table.class(*key), at) {
+                (Some(Class::P), _) => Advice::Step { at: 0 },
+                (Some(Class::W), at) => Advice::Step { at: at.unwrap_or(0) },
+                (_, Some(at)) => Advice::Later { at },
+                _ => Advice::Idle { last_use: st.used_ns.get(key).copied().unwrap_or(0) },
+            };
+            let _ = agent.advise(*ticket, advice);
+        }
+    }
+
+    /// Leased pages whose fill's ready event completed: the manager hears they landed. Under
+    /// the state lock.
+    #[cfg(unix)]
+    fn land(&self, st: &State, agent: &crate::lease::Agent) {
+        let mut to_land = self.to_land.lock();
+        if to_land.is_empty() {
             return;
         }
-        let set = {
-            let mut st = g.lock();
-            if g.check().is_err() {
-                return;
+        let leased = self.leased.lock();
+        to_land.retain(|key| {
+            let Some(h) = st.homes.get(key).filter(|h| h.filled) else { return false };
+            let Some(ticket) = h.phys.as_ref().and_then(|p| leased.get(&p.id)).filter(|(.., retainable)| *retainable).map(|(t, ..)| *t) else { return false };
+            if !self.backend.query(h.ready).unwrap_or(false) {
+                return true;
             }
-            for s in st.slots.iter_mut().flatten().filter(|s| s.holds.is_some_and(|(set, _)| set == self.id)) {
-                s.holds = None;
+            if let Err(error) = agent.landed(ticket) {
+                tracing::warn!("varena: a lease's landed ack: {error}");
             }
-            st.sets[self.id].take()
+            false
+        });
+    }
+
+    /// Pages asked back while busy that are idle now: unpinned in the table, and the revoke
+    /// runs again. Under the state lock.
+    #[cfg(unix)]
+    fn redecline(&self, st: &State) {
+        let Some(agent) = self.lease.get() else { return };
+        let idle: Vec<crate::lease::Ticket> = {
+            let leased = self.leased.lock();
+            let mut declined = self.declined.lock();
+            let idle: Vec<_> = declined.iter().copied().filter(|t| leased.values().find(|(x, ..)| x == t).is_none_or(|(_, k, _)| st.idle(*k))).collect();
+            idle.iter().for_each(|t| {
+                declined.remove(t);
+            });
+            idle
         };
-        let Some(set) = set else { return };
-        let maps: Vec<Mapping> = set.regs.into_iter().filter_map(|r| r.map).collect();
-        let mut st = g.lock();
-        for m in maps {
-            let _ = g.unmap(&mut st, m);
+        if idle.is_empty() {
+            return;
         }
-        let _ = g.keep_idle(&mut st, IDLE_KEEP);
-        let _ = free_va(self.base, self.weights.layout.nbytes.max(REGION_ALIGN));
-    }
-}
-
-#[derive(Clone, Copy)]
-enum At {
-    Home,
-    Slot(usize),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ConsumerStream {
-    raw: u64,
-    /// CUDA's per-thread default handle means a different stream on another host thread.
-    origin: Option<std::thread::ThreadId>,
-}
-
-impl ConsumerStream {
-    fn current(raw: u64) -> Self {
-        Self { raw, origin: (raw == 2).then(|| std::thread::current().id()) }
+        for t in idle {
+            let _ = agent.unpin(t);
+        }
+        self.mech.post(Mech::Revoke);
     }
 
-    fn here(self) -> Result<()> {
-        if self.origin.is_some_and(|origin| origin != std::thread::current().id()) {
-            return Err(Error::Io("per-thread consumer stream completion is unknown on another host thread".into()));
+    /// The wait on a child ended: its step is in use again.
+    fn unyield(&self, req: u64) -> Result<()> {
+        let mut st = self.lock();
+        if let Some(r) = st.table.request_mut(req) {
+            r.yielded = false;
         }
+        self.unlock(st);
         Ok(())
     }
 }
 
-/// A bound region: its pages stay mapped while it lives; dropping it fences every admitted stream.
-pub struct Pinned {
-    ws: Arc<WeightSet>,
-    at: At,
-    pub region: u32,
-    pub ptr: u64,
-    pub nbytes: u64,
-    /// This bind is the first since a copy put the bytes there.
-    pub fresh: bool,
-    pub writable: bool,
-    stream: ConsumerStream,
-    consumers: Mutex<Vec<ConsumerStream>>,
-    ready: EvRef,
+/// A request waiting on a child call ([`Request::yielding`]); dropped, the wait is over.
+pub struct Yielded {
+    wait: Option<(Owner, u64)>,
 }
 
-impl Pinned {
-    pub fn home(&self) -> bool {
-        matches!(self.at, At::Home)
-    }
-
-    pub fn device(&self) -> i32 {
-        self.ws.device()
-    }
-
-    /// Make `stream` wait for the bytes too (a consumer other than the bind stream).
-    pub fn wait_on(&self, stream: u64) -> Result<()> {
-        self.admit_stream(stream, || {
-            let _c = CtxGuard::enter(self.ws.gpu.inner.ctx)?;
-            self.ready.done()
-        }, || {
-            let _c = CtxGuard::enter(self.ws.gpu.inner.ctx)?;
-            wait_in(stream as CUstream, &self.ready)
-        })
-    }
-
-    fn admit_stream(&self, stream: u64, ready: impl FnOnce() -> Result<bool>, wait: impl FnOnce() -> Result<()>) -> Result<()> {
-        let g = &self.ws.gpu.inner;
-        g.check()?;
-        // Serialize admission through its wait. Completion of the fill does not complete a
-        // consumer's later work, so even the ready fast path must retain its stream.
-        let mut consumers = lock(&self.consumers);
-        g.check()?;
-        let stream = ConsumerStream::current(stream);
-        if !consumers.contains(&stream) {
-            consumers.push(stream);
+impl Yielded {
+    /// The wait is over (dropping it does the same, quietly).
+    pub fn end(mut self) -> Result<()> {
+        match self.wait.take() {
+            Some((inner, req)) => inner.guard(|| inner.unyield(req)),
+            None => Ok(()),
         }
-        if stream != self.stream && !ready()? {
-            wait()?;
-        }
-        g.check()
-    }
-
-    fn finish_streams(&self, mut record: impl FnMut(u64) -> Result<EvRef>, mut drain: impl FnMut(u64) -> Result<()>) {
-        let streams = lock(&self.consumers).clone();
-        let mut events = vec![];
-        let failed = streams.iter().try_for_each(|&stream| stream.here().and_then(|_| record(stream.raw)).map(|ev| events.push(ev))).err();
-        self.ws.finish_pin(self.at, self.region, events, failed, || {
-            let mut failed = None;
-            for stream in streams {
-                if let Err(e) = stream.here().and_then(|_| drain(stream.raw)) {
-                    failed.get_or_insert(e);
-                }
-            }
-            failed.map_or(Ok(()), Err)
-        });
     }
 }
 
-impl Drop for Pinned {
+impl Drop for Yielded {
     fn drop(&mut self) {
-        let g = &self.ws.gpu.inner;
-        if let Err(e) = g.check() {
-            g.retain_pin(&self.ws, e);
-            return;
+        if let Some((inner, req)) = self.wait.take() {
+            let _ = inner.guard(|| inner.unyield(req));
         }
-        self.finish_streams(|stream| {
-            let _c = CtxGuard::enter(g.ctx).map_err(Error::from)?;
-            g.events.record(stream as CUstream, false)
-        }, |stream| {
-            let _c = CtxGuard::enter(g.ctx)?;
-            call!("cuStreamSynchronize", stream_synchronize(stream as CUstream))
-        });
     }
 }
 
-/// The host-only core, for CPU executors: regions as host bytes, never loading libcuda.
-pub struct Host;
-
-/// Regions in host memory: read-only views of a sealed layout, or private copies read once.
-pub struct HostSet {
-    pub weights: Weights,
-    regs: Mutex<Vec<(Option<Arc<Anon>>, bool)>>,
-}
-
-impl Host {
-    #[cfg(feature = "store")]
-    pub fn register(&self, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>) -> Result<Arc<HostSet>> {
-        let weights = Weights::open(name, ck, regions, host_fd)?;
-        Ok(Arc::new(HostSet { regs: Mutex::new(vec![(None, false); weights.layout.regions.len()]), weights }))
-    }
-
-    /// `Gpu::adopt` on the host: a sealed layout registered from the regions it carries.
-    #[cfg(feature = "store")]
-    pub fn adopt(&self, name: &str, ck: &Checkpoint, host_fd: RawFd) -> Result<Arc<HostSet>> {
-        self.register(name, ck, &crate::host::sealed_regions(host_fd)?, Some(host_fd))
-    }
-}
-
-impl HostSet {
-    pub fn bind(self: &Arc<Self>, region: u32) -> Result<HostPinned> {
-        let (w, mut regs) = (&self.weights, lock(&self.regs));
-        let reg = w.layout.region(region)?;
-        let (buf, bound) = &mut regs[region as usize];
-        let sealed = w.host.as_ref().filter(|h| !h.hole(region) && h.wait_ready(region).is_ok());
-        let (ptr, buf) = match sealed {
-            Some(h) => {
-                (h.base() as u64 + reg.offset, None)
-            }
-            None => {
-                if buf.is_none() {
-                    *buf = Some(Arc::new(Anon::read(w, region)?));
-                }
-                (buf.as_ref().unwrap().ptr as u64, buf.clone())
-            }
-        };
-        let fresh = !std::mem::replace(bound, true);
-        Ok(HostPinned { _set: self.clone(), _buf: buf, region, ptr, nbytes: reg.nbytes, fresh, writable: sealed.is_none() })
-    }
-}
-
-/// A region read from the chunk files into private anonymous memory.
-struct Anon {
-    ptr: *mut u8,
-    len: usize,
-}
-unsafe impl Send for Anon {}
-unsafe impl Sync for Anon {}
-
-impl Anon {
-    fn read(w: &Weights, r: u32) -> Result<Anon> {
-        let reg = w.layout.region(r)?;
-        let len = align_up(reg.nbytes.max(1), PART_ALIGN) as usize;
-        // SAFETY: a fresh private anonymous mapping.
-        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
-        if ptr == libc::MAP_FAILED {
-            return Err(Error::Io(format!("map {len} bytes: {}", std::io::Error::last_os_error())));
-        }
-        let a = Anon { ptr: ptr as *mut u8, len };
-        // SAFETY: all items lie in this fresh exclusive mapping.
-        unsafe { w.source.read_items(&reg.items, reg.offset,
-            Dst::Host { ptr: a.ptr, len }, 8, Mode::Buffered, &IoTally::default()) }?;
-        Ok(a)
-    }
-}
-
-impl Drop for Anon {
+impl Drop for Pass {
+    /// Ends only its own pass: a newer one of the same request keeps its state.
     fn drop(&mut self) {
-        // SAFETY: our mapping, no view of it left.
-        unsafe { libc::munmap(self.ptr as *mut c_void, self.len) };
+        let mut st = self.inner.state.lock();
+        if st.active.get(&(self.req, self.set)).is_some_and(|a| a.id == self.id) {
+            st.active.remove(&(self.req, self.set));
+        }
     }
 }
 
-/// A region's host bytes; they live as long as this does.
-pub struct HostPinned {
-    _set: Arc<HostSet>,
-    _buf: Option<Arc<Anon>>,
-    pub region: u32,
-    pub ptr: u64,
-    pub nbytes: u64,
-    pub fresh: bool,
-    /// False for a view of a sealed host layout, mapped read-only.
-    pub writable: bool,
-}
-
-/// The one layout of `regions` of `ck` and its chunks: what `register` maps and a sealed host
-/// layout holds, the same by construction.
-#[cfg(feature = "store")]
-fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool) -> Result<(Layout, Source)> {
-    Ok((Layout::build(&ck.spans(regions)?, regions)?, ck.source(direct_io)))
-}
-
-/// `regions` of `ck` in a sealed host layout filled here: the memfd `register(host_fd=)` adopts.
-#[cfg(feature = "store")]
-pub fn seal(ck: &Checkpoint, regions: &[Vec<String>], name: &str, threads: usize) -> Result<OwnedFd> {
-    let (layout, source) = open_checkpoint(ck, regions, true)?;
-    let (fd, fill) = crate::host::open_sealed(name, &layout, None, None)?;
-    let named = name.to_string();
-    let run = move || {
-        if let Err(e) = fill.run(&layout, &source, threads, &IoTally::default()) {
-            tracing::warn!("varena: sealing {named} failed; its adopters read the chunks: {e}");
-        }
-    };
-    std::thread::Builder::new().name(format!("varena-seal-{name}")).spawn(run).map_err(|e| Error::Io(format!("spawn a seal: {e}")))?;
-    Ok(fd)
-}
-
-/// `fd` in a socket's queue, the sending end closed: whoever holds the other end can take it
-/// once, and it lives while any holder does.
-fn contain(fd: OwnedFd) -> Result<UnixStream> {
-    let io = |e: std::io::Error| Error::Io(format!("contain kept pages: {e}"));
-    let (tx, rx) = UnixStream::pair().map_err(io)?;
-    platform::handles::send_fd(&tx, &fd).map_err(|e| io(e.into()))?;
-    Ok(rx)
-}
-
-fn reserve_va(size: u64) -> Result<u64> {
-    let mut base = 0u64;
-    call!("cuMemAddressReserve", mem_address_reserve(&mut base, size as usize, REGION_ALIGN as usize, 0, 0))?;
-    Ok(base)
-}
-
-fn free_va(base: u64, size: u64) -> Result<()> {
-    call!("cuMemAddressFree", mem_address_free(base, size as usize))
+/// CLOCK_MONOTONIC in nanoseconds: one clock for every process on the machine.
+#[cfg(unix)]
+pub(crate) fn monotonic_ns() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid clock id and a writable timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    u64::try_from(t.tv_sec).unwrap_or(0).saturating_mul(1_000_000_000).saturating_add(u64::try_from(t.tv_nsec).unwrap_or(0))
 }

@@ -289,7 +289,7 @@ fn write(buffer: &DeviceBuffer, bytes: &[u8], stream: usize) -> Result<()> {
         },
     };
     // SAFETY: source and exclusive destination remain live until the engine has drained.
-    unsafe { super::read_staged(&[copy], &ReadOpts::default()) }.map_err(io_error)?;
+    unsafe { super::read_staged(&[copy], &ReadOpts::default(), None) }.map_err(io_error)?;
     Ok(())
 }
 

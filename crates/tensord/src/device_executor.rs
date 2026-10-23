@@ -52,30 +52,47 @@ pub struct Hello {
     pub pgid: u32,
     pub runtime_version: String,
     pub tensorfs_version: String,
+    /// Executor memory wire contract ([`Contract`]): the lease protocol leases chunks from each
+    /// GPU's manager; any other runs its memory alone.
+    pub memory_protocol: u32,
     pub sealed: BTreeMap<String, String>,
     pub torch_loaded: bool,
 }
 
-impl Hello {
-    /// Whether its Runtime and TensorFS seal a host layout only where `read_grant` says `seal`
-    /// (Runtime 0.30.3 and TensorFS 0.13.3 on); an older pair seals every one it is not granted.
-    pub fn admits(&self) -> bool {
-        release(&self.runtime_version) >= vec![0, 30, 3] && release(&self.tensorfs_version) >= vec![0, 13, 3]
-    }
+/// The lease protocol (design varena-leases), where varena serves one.
+#[cfg(unix)]
+const LEASES: Option<u32> = Some(varena::lease::PROTOCOL);
+#[cfg(not(unix))]
+const LEASES: Option<u32> = None;
+
+/// How an executor's GPU memory is served, by the memory protocol its Hello speaks. An executor
+/// is never refused for it: skew degrades to standalone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Contract {
+    /// Chunks leased over each GPU's listener.
+    Leases,
+    /// Any other protocol: its own pages, a fixed, never-asked charge on its GPU.
+    Standalone,
 }
 
-/// A version's leading release numbers: `0.30.3+e9baf7a4` and `0.30.3.dev1` are `[0, 30, 3]`.
-fn release(version: &str) -> Vec<u64> {
-    let mut numbers = vec![];
-    for part in version.split('.') {
-        let digits = &part[..part.bytes().take_while(u8::is_ascii_digit).count()];
-        let Ok(number) = digits.parse() else { break };
-        numbers.push(number);
-        if digits.len() < part.len() {
-            break;
+impl Hello {
+    pub fn contract(&self) -> Contract {
+        match Some(self.memory_protocol) == LEASES {
+            true => Contract::Leases,
+            false => Contract::Standalone,
         }
     }
-    numbers
+
+    /// Refuses a Start naming leases to an executor that does not speak them.
+    fn accepts(&self, command: &DeviceCommand) -> io::Result<()> {
+        if matches!(command, DeviceCommand::Start { leases: Some(_), .. }) && self.contract() != Contract::Leases {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
+                "Runtime {} speaks memory protocol {}: it reads no leases",
+                self.runtime_version, self.memory_protocol,
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -128,6 +145,11 @@ pub struct Binding {
     pub package: String,
     pub model: String,
     pub adapters: Vec<Adapter>,
+    /// A group's placeable components and the GPU that keeps each, an index within the group
+    /// (0: GPU 0, the serial scope's; g: GPU g keeps it resident for the group), decided by
+    /// TensorD at Load (`memory::homes`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub homes: BTreeMap<String, u32>,
 }
 impl Default for Binding {
     fn default() -> Self {
@@ -153,6 +175,7 @@ impl Default for Binding {
             package: String::new(),
             model: String::new(),
             adapters: Vec::new(),
+            homes: BTreeMap::new(),
         }
     }
 }
@@ -182,10 +205,10 @@ pub enum DeviceCommand {
         /// Each constructed slot's checkpoint, so Runtime schedules fetches before it imports.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         constructions: Vec<Construction>,
-        /// One ledger memfd per GPU of `devices`, in order, follows the frame: rank 0 claims its
-        /// row in the first and hands follower r the r-th (design memory-varena §5.5).
-        #[serde(skip_serializing_if = "is_zero")]
-        ledgers: u32,
+        /// The namespace (TensorD's uid) each GPU's lease listener (`lease-<uuid>`) is named in,
+        /// for an executor speaking the lease protocol; a GPU nobody serves runs its own pages.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        leases: Option<u32>,
         memory_mode: MemoryMode,
     },
     Load {
@@ -256,9 +279,14 @@ pub enum DeviceCommand {
         actor: String,
         #[serde(skip_serializing_if = "String::is_empty")]
         operation: String,
+        /// The family whose GPUs its calls share (`Execution::family`): while it waits on a
+        /// child call it yields under this name (varena `Request::yielding`), so the child is
+        /// admitted beside it.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        family: String,
     },
-    /// Warming: the loaded construction's models are loaded at `level` (`gpu` or `ram`, varena
-    /// filling them), nothing run.
+    /// Warming: the loaded construction's models are loaded at `level` (`gpu` or `ram`; varena
+    /// places them), nothing run.
     Map {
         construction: String,
         level: &'static str,
@@ -347,12 +375,6 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    /// One weight set's held bytes: the sealed host layout deposited for it, else nothing.
-    ReadGrant,
-    /// A sealed host layout the executor filled, for the next executor of its weights.
-    Deposit,
-    /// GPU pages of weight regions the executor kept, held past its end (`descriptors` follow).
-    KeepPages,
     Publish,
     /// A weights output's TensorFS reference, which Runtime committed or uploaded.
     CheckpointItem,
@@ -489,27 +511,15 @@ pub struct Frame {
     pub seq: u64,
     pub kind: Kind,
     pub descriptor: bool,
-    /// `keep_pages`: the fds that follow, one per page.
-    pub descriptors: u64,
     pub name: String,
-    /// `read_grant`/`deposit`: the sealed host layout's digest.
-    pub layout: String,
-    /// `keep_pages`: what its pages hold, checked by the executor that maps them.
-    pub fingerprint: String,
-    pub pages: Vec<Page>,
-    /// GPU rank within this executor group for weight page grants and deposits.
-    pub rank: u32,
-    pub manifest: String,
     pub sha256: String,
     pub length: u64,
     pub facts: Option<LoadFacts>,
-    /// `map`: whether every weight of the construction is on its GPU after it.
-    pub complete: Option<bool>,
     pub metrics: Option<Metrics>,
-    /// `invoke`: the request's memory per model per step (varena's `RequestStats`); another
-    /// frame's `memory` of another shape (an older Hello's list) reads as absent.
+    /// `invoke`: varena's record of the request (`Stats`), kept whole; another frame's `memory`
+    /// of another shape (an older Hello's list) reads as absent.
     #[serde(deserialize_with = "lenient")]
-    pub memory: Option<crate::memory::call::Stats>,
+    pub memory: Option<serde_json::Map<String, Value>>,
     /// `invoke`: the Runtime's residency report, relayed into the run's measurements; one of
     /// another shape reads as absent.
     #[serde(deserialize_with = "lenient")]
@@ -598,14 +608,6 @@ impl Frame {
     }
 }
 
-/// One kept GPU page: a home region and the bytes its allocation spans.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct Page {
-    pub region: u32,
-    pub nbytes: u64,
-}
-
 /// One part of a composite product: a spool file and the media time it adds.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -621,19 +623,11 @@ pub struct Answer {
     pub ok: bool,
     pub code: String,
     pub detail: String,
-    pub held: bool,
-    /// `read_grant` with nothing held: the asker may seal the layout (it fits in measured host
-    /// surplus); else it reads the checkpoint.
-    #[serde(skip_serializing_if = "is_false")]
-    pub seal: bool,
-    /// One fd follows the answer. Sent only when true: a `Tier` answer types it as the fd.
+    /// One fd follows the answer. Sent only when true.
     #[serde(skip_serializing_if = "is_false")]
     pub descriptor: bool,
     pub sha256: String,
     pub length: u64,
-    /// `read_grant`: the fds that follow the answer.
-    #[serde(skip_serializing_if = "is_zero")]
-    pub descriptors: u64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub digest: String,
     #[serde(skip_serializing_if = "is_zero")]
@@ -665,11 +659,6 @@ pub struct Answer {
     pub stored: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
-    /// A held `read_grant`: GPU pages kept for it, whose fds follow the layout's.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub fingerprint: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub pages: Vec<Page>,
 }
 fn is_zero_ms(value: &f64) -> bool {
     *value == 0.0
@@ -682,12 +671,9 @@ impl Answer {
             ok: false,
             code: "capability_unavailable".into(),
             detail: "owner has not qualified this operation".into(),
-            held: false,
-            seal: false,
             descriptor: false,
             sha256: String::new(),
             length: 0,
-            descriptors: 0,
             digest: String::new(),
             sequence: 0,
             state: String::new(),
@@ -701,8 +687,6 @@ impl Answer {
             disputed: false,
             stored: false,
             reason: String::new(),
-            fingerprint: String::new(),
-            pages: Vec::new(),
         }
     }
     pub fn ok(seq: u64) -> Self {
@@ -732,26 +716,6 @@ pub trait Services {
         drop(descriptor);
         Ok((Answer::unavailable(frame.seq), None))
     }
-    /// `read_grant`: the plan's memfd, when one came with the request; the fds returned follow
-    /// the answer (`descriptors`).
-    fn read_grant(
-        &mut self,
-        frame: &Frame,
-        plan: Option<File>,
-    ) -> io::Result<(Answer, Vec<File>)> {
-        drop(plan);
-        Ok((Answer::unavailable(frame.seq), Vec::new()))
-    }
-    /// After a `read_grant` refused `layout_sealing`: the progress of the call loading that
-    /// layout, which the asker waits on.
-    fn sealer(&mut self) -> Option<crate::process::Lender> {
-        None
-    }
-    /// `keep_pages`: its fds, one per page.
-    fn keep_pages(&mut self, frame: &Frame, pages: Vec<File>) -> Answer {
-        drop(pages);
-        Answer::unavailable(frame.seq)
-    }
 }
 
 pub struct Baseline;
@@ -779,9 +743,12 @@ impl Line {
 /// keep the token, every other field is scanned.
 fn command_bytes(command: &DeviceCommand, memo: bool) -> io::Result<Vec<u8>> {
     let mut value = serde_json::to_value(command)?;
-    // The executor's memoized stages go to the machine tier.
-    if matches!(command, DeviceCommand::Start { .. }) && memo {
-        value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
+    if let DeviceCommand::Start { leases, .. } = command {
+        // The memory contract this Start serves: leases, or none (standalone).
+        value["memory_protocol"] = leases.and(LEASES).unwrap_or(0).into();
+        if memo {
+            value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
+        }
     }
     let bytes = serde_json::to_vec(&value)?;
     if let (true, Some(options)) = (
@@ -1628,16 +1595,8 @@ impl DeviceExecutor {
         command: &DeviceCommand,
         services: &mut impl Services,
     ) -> io::Result<Frame> {
-        self.command_with(command, &[], services)
-    }
-
-    /// `command` with `fds` following its frame (`Start`'s ledgers).
-    pub fn command_with(
-        &mut self,
-        command: &DeviceCommand,
-        fds: &[File],
-        services: &mut impl Services,
-    ) -> io::Result<Frame> {
+        // Refuse leases to an executor that does not speak them before writing the command.
+        self.hello.accepts(command)?;
         let meter = match command {
             DeviceCommand::Invoke { .. } => Meter::Work,
             _ => Meter::Burn,
@@ -1653,7 +1612,7 @@ impl DeviceExecutor {
         )?;
         watching.watch().place(self.place.clone());
         *self.watched.lock().unwrap() = Some(watching.watch());
-        let result = self.exchange(command, fds, services, &watching.watch());
+        let result = self.exchange(command, services, &watching.watch());
         *self.watched.lock().unwrap() = None;
         // Whatever the run was computing when its exchange ended, its waiters compute themselves.
         if let (Some(memo), Some((run, _))) = (&self.memo, command.spool()) {
@@ -1672,18 +1631,11 @@ impl DeviceExecutor {
     fn exchange(
         &mut self,
         command: &DeviceCommand,
-        fds: &[File],
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
         let bytes = command_bytes(command, self.memo.is_some())?;
-        {
-            let mut writer = self.writer.lock().unwrap();
-            seam::write_body(&mut writer, &bytes)?;
-            for fd in fds {
-                platform::handles::send_fd(&writer, fd)?;
-            }
-        }
+        seam::write_body(&mut self.writer.lock().unwrap(), &bytes)?;
         let mut last = Advance::default();
         loop {
             let frame = read_frame(&mut self.stream)?
@@ -1716,42 +1668,6 @@ impl DeviceExecutor {
                     watch.serving(false);
                     write_frame(&mut self.writer.lock().unwrap(), &answer)?;
                 }
-                Some(Event::Request) if frame.kind == Kind::ReadGrant => {
-                    let plan = if frame.descriptor {
-                        Some(File::from(platform::handles::recv_fd(&self.stream)?))
-                    } else {
-                        None
-                    };
-                    watch.serving(true);
-                    let answered = services.read_grant(&frame, plan);
-                    watch.serving(false);
-                    let (mut answer, out) = answered?;
-                    // Waiting on the call that loads the layout, the asker moves as it moves.
-                    match answer.code.as_str() {
-                        "layout_sealing" => watch.waits_on(services.sealer()),
-                        _ => {
-                            watch.waits_on(None);
-                            watch.frame();
-                        }
-                    }
-                    answer.event = "answer";
-                    answer.seq = frame.seq;
-                    answer.descriptor = false;
-                    answer.descriptors = out.len() as u64;
-                    let mut writer = self.writer.lock().unwrap();
-                    write_frame(&mut writer, &answer)?;
-                    for file in &out {
-                        platform::handles::send_fd(&writer, file)?;
-                    }
-                }
-                Some(Event::Request) if frame.kind == Kind::KeepPages => {
-                    watch.serving(true);
-                    let pages = (0..frame.descriptors).map(|_| platform::handles::recv_fd(&self.stream).map(File::from));
-                    let pages = pages.collect::<Result<Vec<_>, _>>()?;
-                    let answer = services.keep_pages(&frame, pages);
-                    watch.serving(false);
-                    write_frame(&mut self.writer.lock().unwrap(), &answer)?;
-                }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.
                     watch.serving(true);
@@ -1769,10 +1685,9 @@ impl DeviceExecutor {
     }
 
     fn answer(&mut self, frame: &Frame, services: &mut impl Services) -> io::Result<()> {
-        let descriptor = if frame.descriptor {
-            Some(File::from(platform::handles::recv_fd(&self.stream)?))
-        } else {
-            None
+        let descriptor = match frame.descriptor {
+            true => Some(File::from(platform::handles::recv_fd(&self.stream)?)),
+            false => None,
         };
         let (mut answer, descriptor) = services.request(frame, descriptor)?;
         answer.event = "answer";
@@ -1954,7 +1869,7 @@ fn advances(frame: &Frame, last: &mut Advance) -> bool {
             *last = now;
             moved
         }
-        Kind::Publish | Kind::CheckpointItem | Kind::Deposit | Kind::KeepPages | Kind::ChildCall => true,
+        Kind::Publish | Kind::CheckpointItem | Kind::ChildCall => true,
         _ => false,
     }
 }

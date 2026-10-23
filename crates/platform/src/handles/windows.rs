@@ -1,5 +1,5 @@
-//! Windows: a handle crosses by being duplicated into the peer's process; the stream carries a
-//! zero marker byte and its value there.
+//! Windows: a handle crosses by being duplicated into the peer's process, through the process
+//! handle the stream keeps; the stream carries a zero marker byte and its value there.
 #![allow(unsafe_code)]
 use super::Peer;
 use crate::{Error, Result, ipc::LocalStream};
@@ -8,16 +8,35 @@ use std::{
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
 };
 
-/// The peer as the pipe names it. Only this user can open these pipes.
+/// The peer as the pipe names it (`GetNamedPipe{Client,Server}ProcessId`), checked by its
+/// process token: it runs as this user (uid 0, which is [`crate::memory::euid`] here), or it
+/// is refused. The pipes' access list admits only this user; the token check also refuses a
+/// squatter's pipe to a dialer, and holds once a pipe admits more.
 pub fn peer(stream: &LocalStream) -> io::Result<Peer> {
-    Ok(Peer {
-        pid: stream.peer_pid()?,
-        uid: 0,
-        gid: 0,
-    })
+    let pid = stream.peer_pid()?;
+    let (user, me) = (stream.peer_user()?, crate::ipc::this_user()?);
+    if user != me {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("process {pid} runs as {user}, not as this user ({me})"),
+        ));
+    }
+    Ok(Peer { pid, uid: 0, gid: 0 })
 }
 
-/// The peer, always this user: the pipe's own access list admits nobody else.
+/// The peer's birth, read from the process handle the stream keeps (the one handles are
+/// duplicated into), so a pid reused after the pipe was handed on is never taken for it.
+pub fn peer_birth(stream: &LocalStream) -> Result<crate::process::Birth> {
+    Ok(crate::process::birth_of_handle(stream.peer_pid()?, stream.peer_process()?)?)
+}
+
+/// Whether [`send_fd`] can reach the peer; the error says why not (a peer of a higher
+/// integrity level), before anything is written to the stream.
+pub fn accepts_handles(stream: &LocalStream) -> io::Result<()> {
+    stream.peer_accepts_handles()
+}
+
+/// The peer, always this user (see [`peer`]).
 pub fn peer_credentials(stream: &LocalStream) -> Result<Peer> {
     Ok(peer(stream)?)
 }

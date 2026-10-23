@@ -719,6 +719,8 @@ pub struct StatusFrame {
     pub toolchain: Toolchain,
     /// Each native kernel's verdict on this machine's cards, as the Runtime keeps it.
     pub kernels: Vec<KernelVerdict>,
+    /// The TensorD service's process (not its stable parent, a pod's PID 1).
+    pub tensord_pid: u32,
 }
 
 /// The machine's build toolchain: CUDA's compiler and a host C/C++ compiler.
@@ -808,6 +810,45 @@ pub struct Gpu {
     pub memory_class: String,
     /// The most of `memory_bytes` this machine uses (`machine.gpu_memory_limit`); 0: all of it.
     pub memory_limit_bytes: u64,
+    /// TensorD's page accounting of its memory manager on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<GpuMemory>,
+}
+
+/// A GPU's page accounting, as its memory manager holds it now.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct GpuMemory {
+    /// What it may allocate: the card or its limit, less its own context and the reserved pool.
+    pub capacity_bytes: u64,
+    /// `capacity_bytes` less what it allocated.
+    pub free_bytes: u64,
+    /// Bytes no cozy process holds (another app's), as its last reading measured them.
+    pub foreign_bytes: u64,
+    pub created_bytes: u64,
+    pub created_chunks: u64,
+    /// Allocated to live processes.
+    pub allocated_bytes: u64,
+    /// The GPU page cache: landed weights of exited processes, kept for the next of their layout.
+    pub page_cache_bytes: u64,
+    pub page_cache_chunks: u64,
+    /// Bytes a process holds that no live manager created (a previous TensorD's).
+    pub books_only_bytes: u64,
+    /// The share of wall time at least one allocation waited (`some` pressure), over 10 s and 60 s.
+    pub pressure_some_10s: f32,
+    pub pressure_some_60s: f32,
+    pub processes: Vec<ProcessMemory>,
+}
+
+/// One process's allocated memory on a GPU.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ProcessMemory {
+    pub pid: u32,
+    /// Its executor group (plan and lane).
+    pub executor: String,
+    pub chunks: u64,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]

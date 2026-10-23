@@ -23,6 +23,17 @@ pub fn peer_credentials(stream: &UnixStream) -> Result<Peer> {
     Ok(peer)
 }
 
+/// Whether [`send_fd`] can reach the peer: any connected peer can receive descriptors.
+pub fn accepts_handles(_: &UnixStream) -> io::Result<()> {
+    Ok(())
+}
+
+/// The peer's birth, its pid's read now (the caller holds the stream, so the peer is alive or
+/// its pid is not yet reused before the caller opens it).
+pub fn peer_birth(stream: &UnixStream) -> Result<crate::process::Birth> {
+    crate::process::Birth::of(peer(stream)?.pid)
+}
+
 /// The peer as the kernel names it, whoever it runs as.
 #[cfg(target_os = "linux")]
 pub fn peer(stream: &UnixStream) -> io::Result<Peer> {

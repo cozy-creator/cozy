@@ -50,11 +50,14 @@ pub const ATTR_PCI_BUS_ID: c_int = 33;
 pub const ATTR_PCI_DEVICE_ID: c_int = 34;
 pub const ATTR_PCI_DOMAIN_ID: c_int = 50;
 pub const ATTR_POSIX_FD_SUPPORTED: c_int = 103;
+pub const ATTR_WIN32_HANDLE_SUPPORTED: c_int = 104;
+pub const ATTR_READ_ONLY_HOST_REGISTER_SUPPORTED: c_int = 113;
 
 pub const MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const MEM_LOCATION_TYPE_DEVICE: u32 = 1;
 pub const MEM_HANDLE_TYPE_NONE: u32 = 0;
 pub const MEM_HANDLE_TYPE_POSIX_FD: u32 = 1;
+pub const MEM_HANDLE_TYPE_WIN32: u32 = 2;
 pub const MEM_ACCESS_PROT_READ: u32 = 1;
 pub const MEM_ACCESS_PROT_READWRITE: u32 = 3;
 pub const MEM_GRANULARITY_MINIMUM: u32 = 0;
@@ -118,6 +121,8 @@ pub struct Driver {
     pub device_get_count: F<*mut c_int>,
     pub device_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, CUdevice) -> CUresult,
     pub device_get_uuid: unsafe extern "C" fn(*mut [u8; 16], CUdevice) -> CUresult,
+    pub device_get_luid: unsafe extern "C" fn(*mut [u8; 8], *mut c_uint, CUdevice) -> CUresult,
+    pub device_get_name: unsafe extern "C" fn(*mut c_char, c_int, CUdevice) -> CUresult,
     pub primary_ctx_retain: unsafe extern "C" fn(*mut CUcontext, CUdevice) -> CUresult,
     pub ctx_get_current: F<*mut CUcontext>,
     pub ctx_set_current: F<CUcontext>,
@@ -125,8 +130,14 @@ pub struct Driver {
     pub primary_ctx_release: F<CUdevice>,
     pub mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult,
     pub stream_create: unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult,
+    pub stream_create_with_priority:
+        unsafe extern "C" fn(*mut CUstream, c_uint, c_int) -> CUresult,
+    pub ctx_get_stream_priority_range: unsafe extern "C" fn(*mut c_int, *mut c_int) -> CUresult,
     pub stream_destroy: F<CUstream>,
     pub stream_synchronize: F<CUstream>,
+    pub stream_is_capturing: unsafe extern "C" fn(CUstream, *mut c_int) -> CUresult,
+    /// cuThreadExchangeStreamCaptureMode: this thread's capture mode in, its previous one out.
+    pub thread_exchange_stream_capture_mode: unsafe extern "C" fn(*mut c_int) -> CUresult,
     pub stream_wait_event: unsafe extern "C" fn(CUstream, CUevent, c_uint) -> CUresult,
     pub event_create: unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult,
     pub event_destroy: F<CUevent>,
@@ -246,6 +257,8 @@ impl Driver {
             device_get_count: load!(lib, b"cuDeviceGetCount"),
             device_get_attribute: load!(lib, b"cuDeviceGetAttribute"),
             device_get_uuid: load!(lib, b"cuDeviceGetUuid_v2"),
+            device_get_luid: load!(lib, b"cuDeviceGetLuid"),
+            device_get_name: load!(lib, b"cuDeviceGetName"),
             primary_ctx_retain: load!(lib, b"cuDevicePrimaryCtxRetain"),
             ctx_get_current: load!(lib, b"cuCtxGetCurrent"),
             ctx_set_current: load!(lib, b"cuCtxSetCurrent"),
@@ -253,8 +266,12 @@ impl Driver {
             primary_ctx_release: load!(lib, b"cuDevicePrimaryCtxRelease_v2"),
             mem_get_info: load!(lib, b"cuMemGetInfo_v2"),
             stream_create: load!(lib, b"cuStreamCreate"),
+            stream_create_with_priority: load!(lib, b"cuStreamCreateWithPriority"),
+            ctx_get_stream_priority_range: load!(lib, b"cuCtxGetStreamPriorityRange"),
             stream_destroy: load!(lib, b"cuStreamDestroy_v2"),
             stream_synchronize: load!(lib, b"cuStreamSynchronize"),
+            stream_is_capturing: load!(lib, b"cuStreamIsCapturing"),
+            thread_exchange_stream_capture_mode: load!(lib, b"cuThreadExchangeStreamCaptureMode"),
             stream_wait_event: load!(lib, b"cuStreamWaitEvent"),
             event_create: load!(lib, b"cuEventCreate"),
             event_destroy: load!(lib, b"cuEventDestroy_v2"),
@@ -388,6 +405,17 @@ pub fn attribute(dev: CUdevice, attr: c_int) -> Result<i32> {
     Ok(v)
 }
 
+/// The device's LUID: the one its DXGI adapter has (Windows; the driver refuses it elsewhere).
+pub fn luid(dev: CUdevice) -> Result<[u8; 8]> {
+    let d = driver()?;
+    let (mut luid, mut nodes) = ([0u8; 8], 0 as c_uint);
+    // SAFETY: an 8-byte and a node-mask out-param.
+    check("cuDeviceGetLuid", unsafe {
+        (d.device_get_luid)(&mut luid, &mut nodes, dev)
+    })?;
+    Ok(luid)
+}
+
 pub fn uuid(dev: CUdevice) -> Result<String> {
     let d = driver()?;
     let mut u = [0u8; 16];
@@ -450,6 +478,8 @@ impl Stream {
     pub fn drain(&self) -> Result<()> {
         let driver = driver()?;
         let _context = CtxGuard::enter(self.ctx)?;
+        // A host wait: a trace span, so a subscriber can time each.
+        let _wait = tracing::trace_span!("tensorfs cuStreamSynchronize").entered();
         check("cuStreamSynchronize", unsafe {
             (driver.stream_synchronize)(self.raw)
         })
@@ -463,6 +493,7 @@ impl Drop for Stream {
     fn drop(&mut self) {
         if let Ok(driver) = driver() {
             if let Ok(_ctx) = CtxGuard::enter(self.ctx) {
+                let _wait = tracing::trace_span!("tensorfs cuStreamSynchronize (drop)").entered();
                 unsafe {
                     (driver.stream_synchronize)(self.raw);
                     (driver.stream_destroy)(self.raw);
@@ -496,7 +527,10 @@ pub unsafe fn pin_region(ptr: *mut u8, len: usize, read_only: bool) -> Result<Ho
         } else {
             0
         };
-    let rc = unsafe { (d.mem_host_register)(ptr.cast(), len, flags) };
+    let rc = {
+        let _wait = tracing::trace_span!("tensorfs cuMemHostRegister").entered();
+        unsafe { (d.mem_host_register)(ptr.cast(), len, flags) }
+    };
     if rc != ERROR_HOST_MEMORY_ALREADY_REGISTERED {
         check("cuMemHostRegister", rc)?;
     }
@@ -535,6 +569,8 @@ impl HostPin {
         if self.owned {
             let driver = driver()?;
             let _context = CtxGuard::enter(self.ctx)?;
+            // It synchronizes the device: a host wait, a trace span like the others.
+            let _wait = tracing::trace_span!("tensorfs cuMemHostUnregister").entered();
             check("cuMemHostUnregister", unsafe {
                 (driver.mem_host_unregister)(self.ptr)
             })?;

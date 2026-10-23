@@ -697,6 +697,9 @@ impl MachineBackend for NativeBackend {
         }
         Ok(levels)
     }
+    fn memory(&self) -> BTreeMap<String, v1::GpuMemory> {
+        self.service.gpu().map(|gpu| gpu.memory()).unwrap_or_default()
+    }
     fn warm_set(&self, actor: VerifiedActor) -> Result<Vec<v1::WarmItem>, Error> {
         let actor = actor_id(actor);
         let kept = self

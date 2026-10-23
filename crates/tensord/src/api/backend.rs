@@ -29,6 +29,10 @@ pub trait MachineBackend: Send + Sync + 'static {
     fn warm_set(&self, _: VerifiedActor) -> Result<Vec<v1::WarmItem>, Error> {
         Ok(vec![])
     }
+    /// Each GPU's page accounting by UUID (`StatusFrame.gpus[].memory`).
+    fn memory(&self) -> BTreeMap<String, v1::GpuMemory> {
+        BTreeMap::new()
+    }
     fn workspace(
         &self,
         _: VerifiedActor,

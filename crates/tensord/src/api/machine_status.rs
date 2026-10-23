@@ -83,19 +83,18 @@ pub(super) fn watch<B: MachineBackend>(
 }
 
 /// Disk use moves all the time; it alone is news once it moved by a hundredth of the disk.
+/// Page accounting moves with every allocation: never news alone.
 fn changed(last: &v1::StatusFrame, next: &v1::StatusFrame) -> bool {
     let moved = match (&last.disk, &next.disk) {
         (Some(a), Some(b)) => a.free_bytes.abs_diff(b.free_bytes) >= b.total_bytes / 100,
         (a, b) => a != b,
     };
-    moved
-        || v1::StatusFrame {
-            disk: None,
-            ..last.clone()
-        } != v1::StatusFrame {
-            disk: None,
-            ..next.clone()
-        }
+    let still = |frame: &v1::StatusFrame| v1::StatusFrame {
+        disk: None,
+        gpus: frame.gpus.iter().map(|gpu| v1::Gpu { memory: None, ..gpu.clone() }).collect(),
+        ..frame.clone()
+    };
+    moved || still(last) != still(next)
 }
 
 pub(super) fn identity_frame(identity: &MachineIdentity) -> v1::StatusFrame {
@@ -128,6 +127,8 @@ struct Held {
     environments: Vec<v1::Environment>,
     warm: Vec<v1::WarmItem>,
     models: crate::held_models::Listing,
+    /// Each GPU's page accounting by UUID.
+    memory: std::collections::BTreeMap<String, v1::GpuMemory>,
 }
 
 async fn held_now<B: MachineBackend>(
@@ -139,7 +140,7 @@ async fn held_now<B: MachineBackend>(
     blocking(backend, move |backend| {
         let models = store.as_deref().map(crate::held_models::listing);
         let (runs, environments) = held(backend, actor)?;
-        Ok(Held { runs, environments, warm: backend.warm_set(actor)?, models: models.unwrap_or_default() })
+        Ok(Held { runs, environments, warm: backend.warm_set(actor)?, models: models.unwrap_or_default(), memory: backend.memory() })
     })
     .await
 }
@@ -153,7 +154,7 @@ pub(super) async fn frame<B: MachineBackend>(
 }
 
 fn picture(identity: &MachineIdentity, held: Held) -> v1::StatusFrame {
-    let Held { runs, environments, warm, models } = held;
+    let Held { runs, environments, warm, models, mut memory } = held;
     let software = identity
         .updates
         .as_ref()
@@ -187,6 +188,7 @@ fn picture(identity: &MachineIdentity, held: Held) -> v1::StatusFrame {
                 },
                 memory_class: g.memory_class.clone(),
                 memory_limit_bytes: identity.gpu_memory_limit.filter(|&l| l < g.memory_bytes).unwrap_or(0),
+                memory: memory.remove(&g.device_uuid),
             })
             .collect(),
         hubs: identity
@@ -213,6 +215,7 @@ fn picture(identity: &MachineIdentity, held: Held) -> v1::StatusFrame {
         },
         toolchain: identity.updates.as_ref().map(|u| u.toolchain()).unwrap_or_default(),
         kernels: identity.updates.as_ref().map(|u| u.kernels()).unwrap_or_default(),
+        tensord_pid: std::process::id(),
         ..identity_frame(identity)
     }
 }

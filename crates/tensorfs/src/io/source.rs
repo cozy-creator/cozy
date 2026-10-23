@@ -3,11 +3,11 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::{AcqRel, Relaxed}};
 use std::sync::{Arc, Mutex};
 
 pub use super::{ItemSource, ObjectRange};
-use super::{Copy, Dst, ReadOpts, ReadStats, Src};
+use super::{Copy, Dst, Issued, ReadOpts, ReadStats, Src};
 use crate::failure::{Failure, Kind};
 use crate::format::ObjectRef;
 
@@ -17,6 +17,14 @@ pub struct Item {
     pub len: u64,
     pub source: ItemSource,
     pub part_end: bool,
+}
+
+/// One destination's items, each at its offset less `origin`.
+#[derive(Clone, Copy, Debug)]
+pub struct Placement<'a> {
+    pub items: &'a [Item],
+    pub origin: u64,
+    pub dst: Dst,
 }
 
 #[derive(Debug, Default)]
@@ -120,12 +128,37 @@ impl Source {
         Ok(platform::durable::cached(&file, 0, obj.length).unwrap_or(false))
     }
 
+    /// Asks the kernel to read `items`' object bytes into the page cache ahead of their fills
+    /// (`POSIX_FADV_WILLNEED`, Linux; elsewhere nothing): host RAM is the page cache. Best effort.
+    pub fn readahead(&self, items: &[Item]) -> Result<()> {
+        #[cfg(feature = "store")]
+        {
+            let objects: std::collections::BTreeMap<_, _> = items.iter().filter_map(|i| match &i.source {
+                ItemSource::Object(range) => Some((range.obj.sha256.clone(), range.obj.clone())),
+                ItemSource::Inline(_) => None,
+            }).collect();
+            self.load(&objects.into_values().collect::<Vec<_>>())?;
+        }
+        for item in items {
+            if let ItemSource::Object(range) = &item.source {
+                let file = self.file(&range.obj)?;
+                #[cfg(target_os = "linux")]
+                // SAFETY: advice on a descriptor this source holds open.
+                unsafe {
+                    use std::os::fd::AsRawFd;
+                    libc::posix_fadvise(file.as_raw_fd(), range.off as libc::off_t, range.len as libc::off_t, libc::POSIX_FADV_WILLNEED);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = file;
+            }
+        }
+        Ok(())
+    }
+
     /// Transfer a placement range. Uncovered padding is zeroed through the same engine.
     ///
     /// # Safety
-    /// `dst` is exclusively writable for its length; the selected item ranges lie inside it.
-    /// On CUDA error, retain device destination owners until `super::drain` proves completion.
-    /// Inline host bytes use owned engine staging and are not borrowed by pending GPU work.
+    /// As [`Source::read_placements`].
     pub unsafe fn read_items(
         &self,
         items: &[Item],
@@ -135,59 +168,34 @@ impl Source {
         mode: Mode,
         tally: &IoTally,
     ) -> Result<ReadStats> {
-        let mut intervals = items
-            .iter()
-            .map(|item| {
-                if let ItemSource::Object(range) = &item.source {
-                    if range.len != item.len
-                        || range
-                            .off
-                            .checked_add(range.len)
-                            .is_none_or(|n| n > range.obj.length)
-                    {
-                        return Err(invalid("object range exceeds its verified source"));
-                    }
-                }
-                if let ItemSource::Inline(bytes) = &item.source {
-                    if bytes.len() as u64 != item.len {
-                        return Err(invalid("inline length differs from item"));
-                    }
-                }
-                let start = item
-                    .offset
-                    .checked_sub(origin)
-                    .ok_or_else(|| invalid("item begins before destination"))?;
-                let end = start
-                    .checked_add(item.len)
-                    .ok_or_else(|| invalid("item range overflows"))?;
-                if end > dst.len() as u64 {
-                    return Err(invalid("item exceeds destination"));
-                }
-                Ok((start, end))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        intervals.sort_unstable();
-        let mut gaps = Vec::new();
-        let mut cursor = 0;
-        for (start, end) in intervals {
-            if start == end {
-                continue;
-            }
-            if start < cursor {
-                return Err(invalid("placement items overlap"));
-            }
-            if start > cursor {
-                gaps.push((cursor, start - cursor));
-            }
-            cursor = end;
+        // SAFETY: inherited from caller.
+        unsafe {
+            self.read_placements(&[Placement { items, origin, dst }], threads, mode, tally, None)
         }
-        if cursor < dst.len() as u64 {
-            gaps.push((cursor, dst.len() as u64 - cursor));
-        }
+    }
+
+    /// Transfer many placement ranges in one engine read, so it pipelines across all of them.
+    /// Uncovered padding is zeroed through the same engine. `issued` hears of each device
+    /// placement (its index and the engine's streams) once all its copies are issued, before
+    /// the read returns.
+    ///
+    /// # Safety
+    /// Each `dst` is exclusively writable for its length; its selected item ranges lie inside it.
+    /// On CUDA error, retain device destination owners until `super::drain` proves completion.
+    /// Inline host bytes use owned engine staging and are not borrowed by pending GPU work.
+    pub unsafe fn read_placements(
+        &self,
+        placements: &[Placement],
+        threads: usize,
+        mode: Mode,
+        tally: &IoTally,
+        issued: Option<Issued>,
+    ) -> Result<ReadStats> {
         #[cfg(feature = "store")]
         {
-            let wanted = items
+            let wanted = placements
                 .iter()
+                .flat_map(|p| p.items)
                 .filter_map(|item| match &item.source {
                     ItemSource::Object(range) => {
                         Some((range.obj.sha256.clone(), range.obj.clone()))
@@ -200,52 +208,116 @@ impl Source {
             self.load(&wanted)?;
         }
         let mut files = HashMap::new();
-        for item in items {
+        for item in placements.iter().flat_map(|p| p.items) {
             if let ItemSource::Object(range) = &item.source {
                 files
                     .entry(range.obj.sha256.clone())
                     .or_insert(self.file(&range.obj)?);
             }
         }
-        let mut copies = Vec::with_capacity(items.len());
+        let mut copies = Vec::new();
+        // Each copy's placement.
+        let mut of = Vec::new();
         let mut inline = 0;
-        for item in items {
-            let offset = item
-                .offset
-                .checked_sub(origin)
-                .ok_or_else(|| invalid("item begins before destination"))?;
-            let end = offset
-                .checked_add(item.len)
-                .ok_or_else(|| invalid("item range overflows"))?;
-            if end > dst.len() as u64 {
-                return Err(invalid("item exceeds destination"));
-            }
-            let src = match &item.source {
-                ItemSource::Object(range) => Src::File(&files[&range.obj.sha256], range.off),
-                ItemSource::Inline(bytes) => {
-                    inline += item.len;
-                    Src::Host(bytes.as_ptr())
+        for (p, &Placement { items, origin, dst }) in placements.iter().enumerate() {
+            // Each placement's copies in destination order, gaps included, so contiguous runs
+            // merge (`coalesce`).
+            let mut ordered: Vec<(u64, Copy)> = Vec::with_capacity(items.len() + 1);
+            let mut intervals = Vec::with_capacity(items.len());
+            for item in items {
+                if let ItemSource::Object(range) = &item.source {
+                    if range.len != item.len
+                        || range
+                            .off
+                            .checked_add(range.len)
+                            .is_none_or(|n| n > range.obj.length)
+                    {
+                        return Err(invalid("object range exceeds its verified source"));
+                    }
                 }
-            };
-            copies.push(Copy {
-                src,
-                dst: dst.slice(offset as usize, item.len as usize),
-            });
+                let start = item
+                    .offset
+                    .checked_sub(origin)
+                    .ok_or_else(|| invalid("item begins before destination"))?;
+                let end = start
+                    .checked_add(item.len)
+                    .ok_or_else(|| invalid("item range overflows"))?;
+                if end > dst.len() as u64 {
+                    return Err(invalid("item exceeds destination"));
+                }
+                intervals.push((start, end));
+                let src = match &item.source {
+                    ItemSource::Object(range) => Src::File(&files[&range.obj.sha256], range.off),
+                    ItemSource::Inline(bytes) => {
+                        if bytes.len() as u64 != item.len {
+                            return Err(invalid("inline length differs from item"));
+                        }
+                        inline += item.len;
+                        Src::Host(bytes.as_ptr())
+                    }
+                };
+                ordered.push((start, Copy {
+                    src,
+                    dst: dst.slice(start as usize, item.len as usize),
+                }));
+            }
+            intervals.sort_unstable();
+            let mut cursor = 0;
+            for (start, end) in intervals {
+                if start == end {
+                    continue;
+                }
+                if start < cursor {
+                    return Err(invalid("placement items overlap"));
+                }
+                if start > cursor {
+                    ordered.push((cursor, Copy {
+                        src: Src::Zero,
+                        dst: dst.slice(cursor as usize, (start - cursor) as usize),
+                    }));
+                }
+                cursor = end;
+            }
+            if cursor < dst.len() as u64 {
+                ordered.push((cursor, Copy {
+                    src: Src::Zero,
+                    dst: dst.slice(cursor as usize, dst.len() - cursor as usize),
+                }));
+            }
+            ordered.sort_by_key(|(at, _)| *at);
+            of.resize(of.len() + ordered.len(), p);
+            copies.extend(ordered.into_iter().map(|(_, c)| c));
         }
-        for (start, len) in gaps {
-            copies.push(Copy {
-                src: Src::Zero,
-                dst: dst.slice(start as usize, len as usize),
-            });
-        }
+        let (copies, firsts) = super::coalesce(copies);
+        // Each run's placements, and the runs each placement waits for.
+        let runs: Vec<Vec<usize>> = (0..firsts.len())
+            .map(|r| {
+                let mut ps = of[firsts[r]..firsts.get(r + 1).copied().unwrap_or(of.len())].to_vec();
+                ps.dedup();
+                ps
+            })
+            .collect();
+        let left: Vec<AtomicUsize> = (0..placements.len()).map(|_| AtomicUsize::new(0)).collect();
+        runs.iter().flatten().for_each(|&p| _ = left[p].fetch_add(1, Relaxed));
+        let run_issued = |r: usize, streams: &[usize]| {
+            for &p in &runs[r] {
+                if left[p].fetch_sub(1, AcqRel) == 1 {
+                    issued.expect("only asked with a listener")(p, streams);
+                }
+            }
+        };
         let opts = ReadOpts {
             threads,
             direct: self.direct_io && mode == Mode::Cache,
             ..ReadOpts::default()
         };
         // SAFETY: item ranges and destination bounds checked above; caller supplies exclusivity.
-        let mut stats = unsafe { super::read_staged(&copies, &opts) }?;
-        stats.bytes = items.iter().map(|item| item.len).sum();
+        let mut stats = unsafe { super::read_staged(&copies, &opts, issued.map(|_| &run_issued as Issued)) }?;
+        stats.bytes = placements
+            .iter()
+            .flat_map(|p| p.items)
+            .map(|item| item.len)
+            .sum();
         tally.direct_bytes.fetch_add(stats.direct, Relaxed);
         tally.inline_bytes.fetch_add(inline, Relaxed);
         if mode == Mode::Buffered {

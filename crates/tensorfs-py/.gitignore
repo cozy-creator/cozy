@@ -2,6 +2,8 @@ target/
 __pycache__/
 *.pyc
 *.so
+# varena's torch allocator shim (shim/build.sh, CI only): maturin packages what git doesn't ignore.
+!python/tensorfs/_varena_torch.so
 .venv/
 /uv.lock
 dist/

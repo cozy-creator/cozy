@@ -1,8 +1,8 @@
 //! The pool runs every call on a retained executor of its plan: deviceless (degree 0), on one
-//! GPU, or on a group of K (rank 0 forms followers). It supplies weight sources and host
-//! layouts and each GPU's ledger; Runtime constructs models and varena in each executor decides
-//! its bytes (design memory-varena §1). TensorD admits starts, reaps and ends stalled processes.
-//! Engine owns acceptance and run custody.
+//! GPU, or on a group of K (rank 0 forms followers). It grants each executor its GPUs' ledgers;
+//! Runtime constructs models and varena in each executor decides its bytes (design varena-slim
+//! §2). TensorD places and admits calls (`fits`), reaps and ends stalled processes. Engine owns
+//! acceptance and run custody.
 use platform::process::{Birth, Exact};
 use crate::{
     catalog::HeldGeneration,
@@ -12,13 +12,11 @@ use crate::{
     },
     execution::Engine,
     gpu_allocation::Claims,
-    deposits::Deposits,
-    host_tier::HostTier,
     journal::{
         AssetBinding, Execution, Failure, Outcome, Preparation, State,
     },
     launch_identity::Seal,
-    memory::{GpuLedger, MemoryConfig},
+    memory::{self, MemoryLog, Tenant},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -69,18 +67,15 @@ pub struct GpuConfig {
     pub identity: Option<crate::launch_identity::LaunchIdentity>,
     /// The GPU envelope, `"0"` or `"0,1,..."`: a degree-K plan occupies K contiguous devices.
     pub devices: String,
-    /// The receipt's inventory (`nvidia-smi`): each GPU's compute capability and memory, matched
-    /// to envelope entries by index or UUID, for the lane rule (`precision`).
+    /// The receipt's inventory (NVML): each GPU's UUID, model, compute capability and memory,
+    /// matched to envelope entries by index or UUID, for its ledger and the lane rule
+    /// (`precision`). A GPU it does not name has no ledger.
     #[serde(default)]
     pub inventory: Vec<crate::machine::receipt::Gpu>,
-    /// Load's device limit where NVML cannot read the device total.
-    pub authorized_device_limit_bytes: Option<u64>,
     /// The most memory each GPU offers (`machine.gpu_memory_limit`): its ledger's capacity and the
     /// lane rule's memory are never more.
     #[serde(default)]
     pub gpu_memory_limit: Option<u64>,
-    #[serde(default)]
-    pub memory: MemoryConfig,
     /// Explicitly configured locations; the executor seal is imposed on top of them.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
@@ -169,6 +164,10 @@ pub struct PlanSlot {
     /// the up-front set's (`Plan::on_demand`), so that build reads them from the store.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub on_demand: bool,
+    /// Components the model class declares placeable (`@placeable`): in a group, TensorD names
+    /// the GPU that keeps each at Load (`Binding::homes`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placeable: Vec<String>,
 }
 
 /// One `Weights[M]` argument: the checkpoint a call reads raw (never constructed), and the
@@ -358,7 +357,7 @@ pub enum Level {
     Downloaded,
     /// A process with its imports done: no device, no VRAM.
     Imported,
-    /// An executor with the model constructed, its weights in the host tier.
+    /// An executor with the model constructed, its weights in host RAM (the page cache).
     Host,
     /// Its weights on the GPU.
     Gpu,
@@ -445,10 +444,13 @@ struct Session {
     executor: DeviceExecutor,
     /// When it last came back idle: idle executors end least recently used first.
     used: Instant,
-    /// This executor in the host tier and the layouts it may adopt.
+    /// How this executor was launched (fork or spawn) and its start's timings.
     launch: Launch,
     /// It has served a call: its next one is not its first.
     invoked: bool,
+    /// Where TensorD last had its models brought (varena places them): `host` once loaded,
+    /// `gpu` after a call or a `gpu` warming.
+    level: Level,
 }
 
 /// What this call proved about the executor it returned. A cache handoff is never inferred
@@ -557,22 +559,10 @@ impl Zygote {
         children.retain(|birth| !birth.ended().unwrap_or(true));
         children.is_empty()
     }
-    /// Its private host bytes (PSS less shared memory), 0 when not running.
-    fn private_bytes(&self) -> u64 {
-        match &*self.state.lock().unwrap() {
-            ZygoteState::Ready(parent) => platform::contain::host_memory::process(parent.birth.pid)
-                .map_or(0, |memory| memory.pss.saturating_sub(memory.pss_shmem)),
-            _ => 0,
-        }
-    }
 }
 
 /// A parent that died (killed, out of memory): the pool starts a new one.
 const ENDED: &str = "import-only executor ended";
-
-/// What a parent costs before any is measured: an import-only SDXL or Anima executor is
-/// 0.78 GiB RSS (J/RESULTS.md).
-const UNMEASURED_PARENT: u64 = 1 << 30;
 
 /// The `sessions` key of `plan`'s executor whose lane starts at GPU `start`.
 fn session_key(plan: &str, start: usize) -> String {
@@ -615,27 +605,26 @@ pub struct Pool {
     config: GpuConfig,
     store: Arc<Store>,
     /// This machine's memory log, in its store's `logs`.
-    notes: crate::memory::MemoryLog,
+    notes: MemoryLog,
     /// Each root's lane and each GPU's call (`gpu_allocation`).
     allocations: Arc<crate::gpu_allocation::Allocations>,
     /// Idle GPU executors by `session_key`: a call takes its own out for its run. One per
-    /// construction and lane; the memory policy decides which keep weights mapped.
+    /// construction and lane; varena decides which keep weights mapped.
     sessions: Mutex<BTreeMap<String, Session>>,
     /// Idle deviceless executors, least recently used first: any number per construction, as
-    /// many as ran at once. Host pressure ends them, before any GPU executor.
+    /// many as ran at once. They end with their generation.
     deviceless: Mutex<Vec<Session>>,
     /// Set (under `sessions`) once the pool stops: an executor coming back then is ended.
     stopped: std::sync::atomic::AtomicBool,
     /// Exact live executor lane leaders by PID, including sessions taken out for a call.
     leaders: Mutex<BTreeMap<u32, (Birth, String, usize)>>,
     /// Every live GPU executor process (leaders and followers) by pid: its plan, lane and
-    /// handle, so a process the ledger names stalled can be ended and a row read as a plan's.
-    tenants: Mutex<BTreeMap<u32, Tenant>>,
+    /// handle, so a process the ledger names stalled can be ended, a row read as a plan's, and a
+    /// lease peer known ([`Peers`]).
+    tenants: memory::Tenants,
     /// Per generation, the import-only executor sessions fork from. Declared after
     /// `sessions`: executors end before the parent they were forked from.
     zygotes: Mutex<BTreeMap<(String, String), Arc<Zygote>>>,
-    /// The engine, told when an import-only parent comes up or fails (`Status` levels).
-    activity: std::sync::OnceLock<Weak<Engine>>,
     /// Each generation's kernel boot of this machine run: its process while it runs.
     kernel_boots: Mutex<BTreeMap<String, Option<platform::process::Exact>>>,
     /// Each caller's warm set, in the order it sent it.
@@ -646,26 +635,30 @@ pub struct Pool {
     levels: Mutex<BTreeMap<String, (App, Level, Birth)>>,
     /// Each envelope GPU and its ledger, in envelope order.
     devices: Vec<Device>,
-    /// Host layouts executors deposited, granted to the next executor of the same weights, and
-    /// the host room they may take (`host_tier`).
-    host: Arc<HostTier>,
+    /// Measured peaks, persisted per GPU model.
+    peaks: memory::Peaks,
+    /// Woken by the ledgers' events: a queued request asks `fits` again then.
+    engine: std::sync::OnceLock<Weak<Engine>>,
+    /// Rows the ledgers named stalled at the last look: each is ended once.
+    stalled: Mutex<std::collections::BTreeSet<u32>>,
+    /// The host rule's watcher, while the pool lives; nudged to look when a call begins, an
+    /// executor's frame comes or a ledger signals.
+    host: Option<Arc<memory::Host>>,
+    /// Held while the pool lives: the thread blocked on the ledgers' events ends with it.
+    _events: Option<memory::Reacting>,
     /// Memoized Model methods' results, shared by every run on this machine.
     memo: Arc<crate::memo::Memo>,
+    /// The calls running on its GPUs, by request: the host rule reads them.
+    running: memory::Running,
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
 struct Device {
     entry: String,
-    /// Its ledger; None where neither NVML nor the configuration says its memory.
-    memory: Option<GpuLedger>,
+    /// Its ledger; None where the inventory does not name its memory.
+    memory: Option<Arc<memory::Gpu>>,
 }
 
-/// One GPU executor process: its plan and lane, and a handle that ends exactly it.
-struct Tenant {
-    plan: String,
-    start: usize,
-    exact: Exact,
-}
 
 pub(crate) struct Permit {
     pool: Arc<Pool>,
@@ -715,7 +708,7 @@ fn gpu_request_queued(engine: &Engine, root: Option<u64>) -> bool {
 impl Pool {
     pub fn new(root: &Path, config: GpuConfig, store: Arc<Store>) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
-        let notes = crate::memory::MemoryLog::at(store.root().join("logs"));
+        let notes = MemoryLog::at(store.root().join("logs"));
         if let Some(identity) = config.identity {
             identity.traverse(root)?;
             identity.traverse(
@@ -729,69 +722,165 @@ impl Pool {
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
         crate::launch_identity::remove_stale_jit(root, &incarnation);
         remove_old_executor_roots(root);
-        let shared = config.host.mode == platform::contain::host_pressure::HostMode::Shared;
-        let mut devices = vec![];
-        for entry in &envelope {
-            let capacity = config
-                .inventory
-                .iter()
-                .find(|g| g.device_index.to_string() == *entry || g.device_uuid == *entry)
-                .map(|g| g.memory_bytes)
-                .or(config.authorized_device_limit_bytes);
-            let limit = config.gpu_memory_limit;
-            let memory = GpuLedger::start(entry, shared, config.memory.floor_bytes, capacity, limit, Default::default(), notes.clone())
-                .unwrap_or_else(|error| {
-                    tracing::warn!("memory: GPU {entry} has no ledger: {error}");
-                    None
-                });
-            devices.push(Device { entry: entry.clone(), memory });
-        }
-        let host = Arc::new(HostTier::new(root, config.host.mode, notes.clone()));
-        let pool = Arc::new(Self {
-            launcher: crate::child_launcher::ChildLauncher::new()?,
-            root: root.to_path_buf(),
-            serving: Arc::default(),
-            devices,
-            incarnation,
-            config,
-            store,
-            notes,
-            allocations: crate::gpu_allocation::Allocations::new(envelope.len()),
-            sessions: Mutex::new(BTreeMap::new()),
-            deviceless: Mutex::new(Vec::new()),
-            stopped: Default::default(),
-            leaders: Mutex::default(),
-            tenants: Mutex::default(),
-            zygotes: Mutex::new(BTreeMap::new()),
-            activity: Default::default(),
-            kernel_boots: Mutex::new(BTreeMap::new()),
-            members: Mutex::new(BTreeMap::new()),
-            keeping: Mutex::new(()),
-            levels: Mutex::new(BTreeMap::new()),
-            host,
-            memo: Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?),
-        });
-        for device in &pool.devices {
-            let weak = Arc::downgrade(&pool);
-            let end = move |pid| if let Some(pool) = weak.upgrade() { pool.end_stalled(pid) };
-            device.memory.iter().for_each(|ledger| ledger.on_stalled(Box::new(end.clone())));
-            let weak = Arc::downgrade(&pool);
-            let refusing = move |pid| if let Some(pool) = weak.upgrade() { pool.end_refusing(pid) };
-            device.memory.iter().for_each(|ledger| ledger.on_refusing(Box::new(refusing.clone())));
-        }
-        let weak = Arc::downgrade(&pool);
-        pool.host.watch(move || weak.upgrade().map(|pool| pool.give_back_one()));
-        Ok(pool)
+        let peaks = memory::Peaks::at(root.join("peaks"));
+        let tenants = memory::Tenants::default();
+        let uids = [Some(platform::memory::euid()), config.identity.map(|identity| identity.uid)];
+        let peers = Arc::new(memory::Peers::new(tenants.clone(), uids.into_iter().flatten().collect(), notes.clone()));
+        let leases = |entry: &str| memory::Leases {
+            peers: peers.clone(),
+            open: memory::row(entry, &config.inventory).and_then(|row| memory::chunks(&row.device_uuid, &notes)),
+            tenants: tenants.clone(),
+        };
+        let devices: Vec<Device> = envelope.iter().map(|entry| Device {
+            entry: entry.clone(),
+            memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, leases(entry), &peaks, &notes).map(Arc::new),
+        }).collect();
+        let gpus = devices.iter().filter_map(|d| d.memory.clone()).collect();
+        let running = memory::Running::default();
+        let host = memory::Host::watch(config.host.mode, gpus, running.clone(), &notes);
+        let launcher = crate::child_launcher::ChildLauncher::new()?;
+        let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
+        Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
+            let gpus = devices.iter().filter_map(|d| d.memory.clone()).map(memory::Source::Gpu);
+            let sources: Vec<memory::Source> = gpus.chain(host.clone().map(memory::Source::Host)).collect();
+            let pool = pool.clone();
+            let woke = move |woke| match (pool.upgrade(), woke) {
+                (Some(pool), memory::Woke::Gpu) => pool.memory_changed(),
+                (Some(pool), memory::Woke::HostShort) => pool.host_short(),
+                (None, _) => {}
+            };
+            let events = match sources.is_empty() {
+                true => None,
+                false => memory::react(sources, woke)
+                    .map_err(|error| tracing::warn!("memory: no ledger events: {error}"))
+                    .ok(),
+            };
+            Self {
+                launcher,
+                root: root.to_path_buf(),
+                serving: Arc::default(),
+                allocations: crate::gpu_allocation::Allocations::new(envelope.len()),
+                devices,
+                peaks,
+                engine: Default::default(),
+                stalled: Mutex::default(),
+                host,
+                _events: events,
+                incarnation,
+                config,
+                store,
+                notes,
+                sessions: Mutex::new(BTreeMap::new()),
+                deviceless: Mutex::new(Vec::new()),
+                stopped: Default::default(),
+                leaders: Mutex::default(),
+                tenants,
+                zygotes: Mutex::new(BTreeMap::new()),
+                kernel_boots: Mutex::new(BTreeMap::new()),
+                members: Mutex::new(BTreeMap::new()),
+                keeping: Mutex::new(()),
+                levels: Mutex::new(BTreeMap::new()),
+                memo,
+                running,
+            }
+        }))
     }
-    /// One rung back to the host, in the agreed order: sealed layouts no live executor maps, an
-    /// import-only parent with no live child, an idle deviceless executor, then an idle
-    /// executor (outside every warm set first) on a GPU no call holds. Whether anything went
-    /// back.
-    pub fn give_back_one(&self) -> bool {
-        self.host.deposits.release_one()
-            || self.end_idle_parent(false) > 0
-            || self.end_idle_deviceless(|_| true)
-            || self.end_lru_idle("", false, 0..0)
+    /// Each GPU's page accounting by UUID.
+    pub fn memory(&self) -> BTreeMap<String, protocol::machine::GpuMemory> {
+        let accounting = |device: &Device| {
+            let held = device.memory.as_ref()?.manager.holdings();
+            let uuid = memory::row(&device.entry, &self.config.inventory)?.device_uuid.clone();
+            let processes = held.executors.into_iter().map(|e| protocol::machine::ProcessMemory { pid: e.pid, executor: e.executor, chunks: e.chunks as u64, bytes: e.bytes }).collect();
+            Some((uuid, protocol::machine::GpuMemory {
+                capacity_bytes: held.capacity,
+                free_bytes: held.free,
+                foreign_bytes: held.foreign,
+                created_bytes: held.created,
+                created_chunks: held.created_chunks as u64,
+                allocated_bytes: held.allocated,
+                page_cache_bytes: held.page_cache,
+                page_cache_chunks: held.page_cache_chunks as u64,
+                books_only_bytes: held.books_only,
+                pressure_some_10s: held.pressure.some_10s,
+                pressure_some_60s: held.pressure.some_60s,
+                processes,
+            }))
+        };
+        self.devices.iter().filter_map(accounting).collect()
+    }
+    /// A manager signalled (room freed, an executor exited, a peak was recorded): the dispatch queue asks
+    /// `fits` again, each row the ledger newly names stalled ends (once), and changed peaks are
+    /// saved.
+    fn memory_changed(&self) {
+        self.nudge_host();
+        if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
+            engine.notify_activity();
+        }
+        let gpus: Vec<(&str, &memory::Gpu)> = self.devices.iter().filter_map(|d| Some((d.entry.as_str(), d.memory.as_deref()?))).collect();
+        gpus.iter().for_each(|(_, gpu)| gpu.changed());
+        let stalled: Vec<(&str, u32)> = gpus.iter().flat_map(|(entry, gpu)| gpu.stalled().into_iter().map(move |pid| (*entry, pid))).collect();
+        let fresh: Vec<(&str, u32)> = {
+            let mut seen = self.stalled.lock().unwrap();
+            let fresh = stalled.iter().filter(|(_, pid)| !seen.contains(pid)).copied().collect();
+            *seen = stalled.iter().map(|(_, pid)| *pid).collect();
+            fresh
+        };
+        for (entry, pid) in fresh {
+            self.notes.note(serde_json::json!({"event": "stalled", "gpu": entry, "pid": pid}));
+            self.end_stalled(pid);
+        }
+        let models: std::collections::BTreeSet<&str> = gpus.iter().map(|(_, gpu)| gpu.model.as_str()).collect();
+        for model in models {
+            self.peaks.save(model, gpus.iter().filter(|(_, gpu)| gpu.model == model).map(|(_, gpu)| &*gpu.manager));
+        }
+    }
+    /// The host is short of what its running calls must keep free: one idle process ends,
+    /// least recently used first: a deviceless executor, else an import-only parent with no live
+    /// child, else an executor on a GPU no call holds (outside every warm set first).
+    fn host_short(&self) {
+        let ended = match () {
+            () if self.end_idle_deviceless(|_| true) => "deviceless",
+            () if self.end_idle_parent() => "parent",
+            () if self.end_lru_idle() => "gpu",
+            () => "",
+        };
+        self.notes.note(serde_json::json!({"event": "host_short", "ended": ended}));
+    }
+    /// End the least recently used import-only parent with no live child; whether one ended.
+    fn end_idle_parent(&self) -> bool {
+        let victim = {
+            let mut zygotes = self.zygotes.lock().unwrap();
+            let chosen = zygotes.iter().filter(|(_, zygote)| zygote.childless())
+                .min_by_key(|(_, zygote)| *zygote.used.lock().unwrap()).map(|(app, _)| app.clone());
+            chosen.and_then(|app| zygotes.remove(&app))
+        };
+        let Some(zygote) = victim else {
+            return false;
+        };
+        if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
+            if let Err(error) = parent.shutdown() {
+                tracing::warn!("ending an idle import-only executor: {error}");
+            }
+        }
+        true
+    }
+    /// End the least recently used idle GPU executor (outside every warm set first) whose lane's
+    /// call slots are free meanwhile; whether one ended.
+    fn end_lru_idle(&self) -> bool {
+        let members: std::collections::BTreeSet<String> = {
+            let sets = self.members.lock().unwrap();
+            sets.values().flatten().filter_map(|m| m.plan.as_ref().map(|p| p.construction.clone())).collect()
+        };
+        let mut idle: Vec<(bool, Instant, String, std::ops::Range<usize>)> = {
+            let sessions = self.sessions.lock().unwrap();
+            let lane = |s: &Session| s.start..s.start + s.degree as usize;
+            sessions.iter().map(|(key, s)| (members.contains(&s.plan), s.used, key.clone(), lane(s))).collect()
+        };
+        idle.sort_by_key(|(member, used, _, _)| (*member, *used));
+        idle.into_iter().any(|(_, _, key, lane)| {
+            let Some(_upkeep) = self.allocations.upkeep(lane) else { return false };
+            self.end_session(&key)
+        })
     }
     /// End the least recently used idle deviceless executor `which` picks; whether one ended.
     fn end_idle_deviceless(&self, which: impl Fn(&Session) -> bool) -> bool {
@@ -806,42 +895,8 @@ impl Pool {
         if let Err(error) = session.executor.shutdown() {
             tracing::warn!("ending idle deviceless executor of {plan}: {error}");
         }
-        self.ended(&plan, start, 0);
+        self.ended(&plan, start);
         true
-    }
-    /// End one idle executor other than `plan`'s, the first GPU's least recently used first:
-    /// on the caller's own GPUs (`own`), or on a GPU whose call slot is free meanwhile.
-    fn end_lru_idle(&self, plan: &str, spare: bool, own: std::ops::Range<usize>) -> bool {
-        (0..self.devices.len()).any(|device| {
-            let held = match own.contains(&device) {
-                true => None,
-                false => match self.allocations.upkeep(device..device + 1) {
-                    Some(permit) => Some(permit),
-                    None => return false,
-                },
-            };
-            let ended = self.end_idle_on(device, plan, spare);
-            drop(held);
-            ended
-        })
-    }
-    /// End the least recently used idle executor on GPU `device` other than `plan`'s: outside
-    /// every warm set first, and never a member's when `spare`. The caller holds its call slot.
-    fn end_idle_on(&self, device: usize, plan: &str, spare: bool) -> bool {
-        let members: std::collections::BTreeSet<String> = {
-            let sets = self.members.lock().unwrap();
-            sets.values().flatten().filter_map(|m| m.plan.as_ref().map(|p| p.construction.clone())).collect()
-        };
-        let victim = {
-            let sessions = self.sessions.lock().unwrap();
-            let on = |s: &Session| (s.start..s.start + s.degree as usize).contains(&device);
-            sessions
-                .iter()
-                .filter(|(_, s)| on(s) && s.plan != plan && !(spare && members.contains(&s.plan)))
-                .min_by_key(|(_, s)| (members.contains(&s.plan), s.used))
-                .map(|(key, _)| key.clone())
-        };
-        victim.is_some_and(|key| self.end_session(&key))
     }
     /// End idle executor `key` and observe its exit: what it held goes back. Whether it was idle.
     fn end_session(&self, key: &str) -> bool {
@@ -853,7 +908,7 @@ impl Pool {
         if let Err(error) = session.executor.shutdown() {
             tracing::warn!("memory: ending idle executor {key}: {error}");
         }
-        self.ended(&plan, start, degree);
+        self.ended(&plan, start);
         true
     }
     /// A process the ledger names stalled (asked for bytes, its progress still): it ends now.
@@ -869,19 +924,6 @@ impl Pool {
             self.end_idle(&plan, start, session);
         }
     }
-    /// An idle executor the ledger names refusing (asked for bytes it says it holds, it gave
-    /// none, cr-216): it leaves the pool and ends, and its exit gives them back. Only process exit
-    /// frees all of a CUDA context's bytes. One running a call is left to finish it.
-    fn end_refusing(&self, pid: u32) {
-        let tenant = self.tenants.lock().unwrap().get(&pid).map(|t| (t.plan.clone(), t.start, t.exact.birth().clone()));
-        let Some((plan, start, birth)) = tenant else {
-            return tracing::warn!("memory: refusing pid {pid} is no executor of this machine");
-        };
-        if let Some(session) = self.take_idle(&plan, start, &birth) {
-            self.notes.note(serde_json::json!({"event": "end_refusing", "pid": pid, "plan": plan}));
-            self.end_idle(&plan, start, session);
-        }
-    }
     /// The pool's idle session of `plan` at `start` whose executor is `birth`, taken out of it.
     fn take_idle(&self, plan: &str, start: usize, birth: &Birth) -> Option<Session> {
         let key = session_key(plan, start);
@@ -893,11 +935,10 @@ impl Pool {
         }
     }
     fn end_idle(&self, plan: &str, start: usize, session: Session) {
-        let (degree, executor) = (session.degree, session.executor);
-        if let Err(error) = executor.terminate() {
+        if let Err(error) = session.executor.terminate() {
             tracing::warn!("memory: ending idle executor {}: {error}", session_key(plan, start));
         }
-        self.ended(plan, start, degree);
+        self.ended(plan, start);
     }
     pub fn memo(&self) -> &crate::memo::Memo {
         &self.memo
@@ -956,19 +997,18 @@ impl Pool {
             .collect::<Vec<_>>()
             .join(","))
     }
-    /// `plan`'s executor on the lane from `start` is gone, its processes with it: each GPU of
-    /// the lane reads NVML now, so their rows are reaped and their bytes returned (which wakes
-    /// the dispatch).
-    fn ended(&self, plan: &str, start: usize, degree: u32) {
+    /// `plan`'s executor on the lane from `start` is gone, its processes with it: once their
+    /// exits are proven, each GPU of the lane reaps their rows.
+    fn ended(&self, plan: &str, start: usize) {
         let mut births: Vec<Birth> = self.leaders.lock().unwrap().values()
             .filter(|(_, p, s)| p.as_str() == plan && *s == start).map(|(birth, _, _)| birth.clone()).collect();
         births.extend(self.tenants.lock().unwrap().values()
             .filter(|t| t.plan == plan && t.start == start).map(|t| t.exact.birth().clone()));
-        self.retire(plan, start, degree, &births);
+        self.retire(plan, start, &births);
     }
     /// Retire only proven exited incarnations. Another same-plan/lane session may already
     /// be running or cached; neither its row nor its most recent measured level is ours.
-    fn retire(&self, plan: &str, start: usize, degree: u32, births: &[Birth]) {
+    fn retire(&self, plan: &str, start: usize, births: &[Birth]) {
         let gone: std::collections::HashSet<&Birth> = births.iter()
             .filter(|birth| birth.ended().unwrap_or(false)).collect();
         if gone.is_empty() {
@@ -984,26 +1024,11 @@ impl Pool {
             !(p.as_str() == plan && *s == start && gone.contains(birth)));
         self.tenants.lock().unwrap().retain(|_, t|
             !(t.plan == plan && t.start == start && gone.contains(t.exact.birth())));
-        for ledger in self.lane(start, degree).unwrap_or_default().iter().filter_map(|d| d.memory.as_ref()) {
-            ledger.now();
-        }
     }
-    /// A loaded executor's level from its leader's ledger row: `gpu` while its weights are
-    /// resident there, else `host`.
-    fn loaded_level(&self, start: usize, pid: u32) -> Level {
-        match self.devices.get(start).and_then(|d| d.memory.as_ref()).is_some_and(|m| m.resident(pid)) {
-            true => Level::Gpu,
-            false => Level::Host,
-        }
-    }
-    /// The engine's dispatch wakes whenever bytes free on a GPU: a queued request asks `fits`
+    /// The engine's dispatch wakes whenever a ledger signals: a queued request asks `fits`
     /// again then, and never polls.
     pub fn wake_on_freed(&self, engine: &Arc<Engine>) {
-        let _ = self.activity.set(Arc::downgrade(engine));
-        for ledger in self.devices.iter().filter_map(|d| d.memory.as_ref()) {
-            let engine = Arc::downgrade(engine);
-            ledger.on_freed(Box::new(move || engine.upgrade().iter().for_each(|e| e.notify_activity())));
-        }
+        let _ = self.engine.set(Arc::downgrade(engine));
     }
 
     /// Replace `actor`'s warm set; `keep` then brings its members up. A member dropped from
@@ -1064,7 +1089,6 @@ impl Pool {
     /// from another member or a running call, and keeps the reason when it stops short.
     pub fn keep(self: &Arc<Self>, engine: &Arc<Engine>, actor: &str) {
         let _pass = self.keeping.lock().unwrap();
-        self.host.quiet();
         for member in self.warm_set(actor) {
             // From `downloaded` up, what its constructions read comes behind every call's.
             if let (Some(plan), Some(fetch), true) = (&member.plan, &member.fetch, member.level >= Level::Downloaded) {
@@ -1101,13 +1125,14 @@ impl Pool {
             tracing::warn!("warm set: {error}");
         }
     }
-    /// A member's executor loaded when the call slot is free: empty once it is, else why not.
+    /// A member's executor loaded on the lane a call of it is placed on (`place`), once that
+    /// lane's call slots are free: empty once it is, else why not.
     fn load_member(self: &Arc<Self>, engine: &Arc<Engine>, member: &Member, plan: &Plan) -> &'static str {
         let (held, level) = (&member.held, member.level);
         if self.level(&plan.construction).is_some_and(|holds| holds >= level) {
             return "";
         }
-        let Some(_permit) = self.permit(engine, None, None, 0..plan.degree as usize, &[]) else {
+        let Some((start, _permit)) = self.place(engine, plan, (None, None), None, &mut vec![None; self.width()]) else {
             return "a request holds the GPU; it loads when that ends";
         };
         // A request queued for the GPU goes first; the member comes back after it.
@@ -1115,9 +1140,9 @@ impl Pool {
             return "a request is queued; it loads after";
         }
         let asked = Instant::now();
-        let mut result = self.prewarm(engine, held, plan.clone(), 0, true, member.fetch.clone());
+        let mut result = self.prewarm(engine, held, plan.clone(), start, member.fetch.clone());
         if let (Ok("loaded" | "already loaded"), Level::Gpu | Level::Host) = (&result, level) {
-            result = self.map_member(engine, plan, level);
+            result = self.map_member(engine, plan, start, level);
         }
         self.note_prewarm(&plan.construction, Default::default(), asked.elapsed(), &result);
         match result {
@@ -1129,17 +1154,15 @@ impl Pool {
             }
         }
     }
-    /// Warming a loaded member: its executor loads its models at `level` (`gpu`, or `host` in
-    /// RAM) and varena fills them: "mapped", or why they stay lower.
-    fn map_member(&self, engine: &Arc<Engine>, plan: &Plan, level: Level) -> io::Result<&'static str> {
-        let holds = self.levels.lock().unwrap().get(&plan.construction).map(|(_, level, _)| *level);
+    /// Warming a loaded member: its executor, on the lane from `start`, loads its models at
+    /// `level` (`gpu`, or `host` in RAM; varena places them): "mapped", or why not.
+    fn map_member(&self, engine: &Arc<Engine>, plan: &Plan, start: usize, level: Level) -> io::Result<&'static str> {
+        let key = session_key(&plan.construction, start);
+        let holds = self.levels.lock().unwrap().get(&key).map(|(_, level, _)| *level);
         if holds == Some(level) {
             return Ok("mapped");
         }
-        if plan.degree != 1 {
-            return Ok("a group of GPUs maps its weights at its first call");
-        }
-        let Some(mut session) = self.sessions.lock().unwrap().remove(&plan.construction) else {
+        let Some(mut session) = self.sessions.lock().unwrap().remove(&key) else {
             return Ok("its executor ended");
         };
         let reply = session.executor.command(
@@ -1149,17 +1172,16 @@ impl Pool {
             },
             &mut device_executor::Baseline,
         );
-        let complete = reply.as_ref().is_ok_and(|reply| reply.ok && reply.complete.unwrap_or(true));
+        if reply.as_ref().is_ok_and(|reply| reply.ok) {
+            session.level = level;
+        }
         self.keep_idle(engine, session)?;
         let reply = reply?;
         if !reply.ok {
             tracing::warn!("warm set: mapping {}: {} {}", plan.construction, reply.code, reply.detail);
             return Ok("its weights could not be mapped (the machine's log says why)");
         }
-        match complete {
-            true => Ok("mapped"),
-            false => Ok("part of its weights stay in host memory: the GPU has no room for them all"),
-        }
+        Ok("mapped")
     }
     /// What each of `actor`'s members holds now, and why that is lower than it asked.
     pub fn members(&self, actor: &str) -> Vec<(Level, &'static str)> {
@@ -1208,9 +1230,9 @@ impl Pool {
             }
             drop(idle);
             let births = executor_births(&session.executor.birth, &session.followers);
-            let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+            let (plan, start) = (session.plan.clone(), session.start);
             session.executor.shutdown()?;
-            self.retire_returned(&plan, start, degree, &births);
+            self.retire_returned(&plan, start, &births);
             return Ok(Disposition::ProvenEnded(births));
         }
         let mut session = session;
@@ -1218,46 +1240,45 @@ impl Pool {
             let mut sessions = self.sessions.lock().unwrap();
             if self.stopped.load(Ordering::Acquire) {
                 drop(sessions);
-                let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+                let (plan, start) = (session.plan.clone(), session.start);
                 let births = executor_births(&session.executor.birth, &session.followers);
                 session.executor.shutdown()?;
-                self.retire_returned(&plan, start, degree, &births);
+                self.retire_returned(&plan, start, &births);
                 return Ok(Disposition::ProvenEnded(births));
             }
             if let Some(replaced) = sessions.remove(&key) {
                 drop(sessions);
                 let births = executor_births(&replaced.executor.birth, &replaced.followers);
-                let (plan, start, degree) = (replaced.plan.clone(), replaced.start, replaced.degree);
+                let (plan, start) = (replaced.plan.clone(), replaced.start);
                 if let Err(error) = replaced.executor.shutdown() {
                     tracing::warn!("ending replaced executor {key}: {error}");
                 }
                 await_executor_exit(engine, &births);
-                self.retire_returned(&plan, start, degree, &births);
+                self.retire_returned(&plan, start, &births);
                 continue;
             }
             session.used = Instant::now();
             if session.loaded {
-                let level = self.loaded_level(session.start, session.executor.birth.pid);
-                let noted = ((session.generation.clone(), session.application.clone()), level, session.executor.birth.clone());
+                let noted = ((session.generation.clone(), session.application.clone()), session.level, session.executor.birth.clone());
                 self.levels.lock().unwrap().insert(key.clone(), noted);
             }
             sessions.insert(key, session);
             return Ok(Disposition::Cached);
         }
     }
-    fn retire_returned(&self, plan: &str, start: usize, degree: u32, births: &[Birth]) {
-        self.retire(plan, start, degree, births);
+    fn retire_returned(&self, plan: &str, start: usize, births: &[Birth]) {
+        self.retire(plan, start, births);
     }
 
     /// Complete the old call's bookkeeping before publishing, using its explicit return fact.
     /// In particular a Cached executor may already be running for another family member.
     fn finish_returned(
-        &self, engine: &Arc<Engine>, id: &str, plan: &str, start: usize, degree: u32,
+        &self, engine: &Arc<Engine>, id: &str, plan: &str, start: usize,
         disposition: &Disposition,
     ) -> io::Result<()> {
         match disposition {
             Disposition::Cached => (),
-            Disposition::ProvenEnded(births) => self.retire_returned(plan, start, degree, births),
+            Disposition::ProvenEnded(births) => self.retire_returned(plan, start, births),
             Disposition::Unknown(owned) => {
                 // Registration may have failed before persisting these owned processes.
                 // A second journal error cannot authorize releasing their live lane.
@@ -1272,7 +1293,7 @@ impl Pool {
                     }
                 }
                 await_executor_exit(engine, &births);
-                self.retire_returned(plan, start, degree, &births);
+                self.retire_returned(plan, start, &births);
                 record?;
             }
         }
@@ -1307,13 +1328,8 @@ impl Pool {
         }
         highest
     }
-    /// `held`'s import-only parent, started here when the host has room for it: empty once
-    /// it is up, else why it is not.
+    /// `held`'s import-only parent, started here: empty once it is up, else why it is not.
     fn import(&self, held: &HeldGeneration) -> &'static str {
-        let known = self.zygotes.lock().unwrap().contains_key(&parent_app(held));
-        if !known && !self.parent_fits(held) {
-            return "no host memory free for its imports";
-        }
         let Some((parent, start)) = self.zygote(held) else {
             return "this machine imports nothing ahead for it (no fork, or it binds no model)";
         };
@@ -1331,32 +1347,6 @@ impl Pool {
             }
         }
     }
-    /// Room for a request of `plan` on every GPU of the lane, in device order (so two groups
-    /// never wait on each other), at `shape` once it is known (`spawn`: it starts a process too):
-    /// while it does not fit and no request runs there, the bytes of exited executors are waited
-    /// for while they come back, then idle executors end, least recently used first (never
-    /// `plan`'s, nor a warm member's when `spare`). Whether it fits everywhere; a request starts
-    /// either way, and varena in its executor makes what room it can.
-    fn make_room(&self, plan: &str, start: usize, degree: u32, shape: Option<&str>, spawn: bool, spare: bool) -> io::Result<bool> {
-        self.reap();
-        let mut fit = true;
-        for (gpu, device) in (start..).zip(self.lane(start, degree)?) {
-            let Some(ledger) = &device.memory else { continue };
-            loop {
-                ledger.settle();
-                if ledger.fits(plan, shape, spawn) {
-                    break;
-                }
-                if ledger.running() || !self.end_idle_on(gpu, plan, spare) {
-                    self.notes.note(serde_json::json!({"event": "short", "plan": plan, "gpu": device.entry,
-                        "shape": shape, "running": ledger.running()}));
-                    fit = false;
-                    break;
-                }
-            }
-        }
-        Ok(fit)
-    }
     /// Idle executors that exited leave the pool.
     fn reap(&self) {
         let gone: Vec<Session> = {
@@ -1367,15 +1357,12 @@ impl Pool {
         };
         for session in gone {
             let births = executor_births(&session.executor.birth, &session.followers);
-            self.retire_returned(&session.plan, session.start, session.degree, &births);
+            self.retire_returned(&session.plan, session.start, &births);
         }
         let gone: Vec<_> = self.tenants.lock().unwrap().values().filter(|t| t.exact.ended())
             .map(|t| (t.plan.clone(), t.start, t.exact.birth().clone())).collect();
         for (plan, start, birth) in gone {
-            // A vanished uncached group may have occupied any later GPU; sampling does not
-            // release a row until its exact owner and driver charge have both gone.
-            let width = self.devices.len().saturating_sub(start) as u32;
-            self.retire_returned(&plan, start, width, &[birth]);
+            self.retire_returned(&plan, start, &[birth]);
         }
     }
     /// A call's degree as its declaration and this machine set it: 0 for `accelerator=False`
@@ -1550,12 +1537,19 @@ impl Pool {
                 model: format!("{}@{}", grant.repository, grant.release),
                 ..Default::default()
             };
+            let placeable = model.get("placeable").and_then(serde_json::Value::as_array).into_iter().flatten()
+                .map(|c| c.as_str().map(str::to_owned).ok_or_else(|| invalid("declared placeable component is not a name")))
+                .collect::<io::Result<Vec<_>>>()?;
+            if placeable.iter().any(|c| !binding.components.contains(c)) {
+                return Err(invalid(&format!("a placeable component of {path} is not one it loads")));
+            }
             planned.push(PlanSlot {
                 binding,
                 lane: grant.lane.clone(),
                 precision: precision(&self.store, &grant.manifest),
                 selected_encoded_bytes,
                 on_demand: model.get("on_demand").and_then(serde_json::Value::as_bool) == Some(true),
+                placeable,
             });
         }
         let digest = |value: serde_json::Value| -> io::Result<String> {
@@ -1650,61 +1644,54 @@ impl Pool {
         let leaders = self.leaders.lock().unwrap();
         leaders.values().filter(|(_, p, _)| p.as_str() == plan).map(|(_, _, start)| *start).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
     }
-    /// Whether a replica of `plan` fits on GPU `device` now (`fits`, its widest measured shape,
-    /// a new process). Without a ledger, when no executor is there.
-    fn fits(&self, plan: &str, device: usize) -> bool {
-        match &self.devices[device].memory {
-            Some(ledger) => ledger.fits(plan, None, true),
-            None => !self.leaders.lock().unwrap().values().any(|(_, _, start)| *start == device),
-        }
+    /// Whether a call of `plan` fits on every GPU of the lane from `start` now, before its shape
+    /// is known (`fits`). A GPU without a manager has nothing to refuse it with.
+    fn fits(&self, plan: &str, start: usize, degree: u32) -> bool {
+        let lane = self.lane(start, degree).unwrap_or_default();
+        lane.iter().filter_map(|d| d.memory.as_ref()).all(|m| m.manager.fits(plan, UNPREPARED))
     }
-    /// Where `plan` runs now, with its GPUs' call slots: inside its root's `lane` when it has
-    /// one, else (a standalone call) on GPUs no root holds or older root claims. A group takes
-    /// a free contiguous lane; one GPU, in order: a free one with its idle executor, a free one
-    /// where its learned call fits beside the tenants there (a replica when it runs elsewhere
-    /// too), or, when it runs nowhere or inside its root's lane, any free one. None: it waits,
-    /// and a standalone call claims the GPUs it waits for from later requests.
+    /// Where `plan` runs now, with its lane's call slots: inside its root's `lane` when it has
+    /// one, else (a standalone call, or warming with no root) on GPUs no root holds or older
+    /// request claims. One path for every degree, over the lanes of its width in order: one
+    /// hosting its executor; one where it fits (a replica when it runs elsewhere too); or, when
+    /// it runs nowhere or inside its root's lane, any free one. None: it waits, and a standalone
+    /// call claims the GPUs it waits for from later requests.
     fn place(
         self: &Arc<Self>,
         engine: &Arc<Engine>,
         plan: &Plan,
-        (root, family): (u64, Option<&str>),
+        (root, family): (Option<u64>, Option<&str>),
         lane: Option<std::ops::Range<usize>>,
         claims: &mut Claims,
     ) -> Option<(usize, Permit)> {
         let range = lane.clone().unwrap_or(0..self.devices.len());
         let degree = plan.degree as usize;
+        let starts = range.start..(range.end + 1).saturating_sub(degree);
         let take = |start: usize, claims: &Claims| {
-            self.permit(engine, Some(root), family, start..start + degree, claims).map(|permit| (start, permit))
+            self.permit(engine, root, family, start..start + degree, claims).map(|permit| (start, permit))
         };
-        if degree > 1 {
-            let placed = (range.start..=range.end.saturating_sub(degree)).find_map(|start| take(start, claims));
-            if placed.is_none() && lane.is_none() {
-                self.allocations.claim(root, degree, claims);
-            }
-            return placed;
-        }
-        let hosts: Vec<usize> = self.hosting(&plan.construction).into_iter().filter(|d| range.contains(d)).collect();
+        let hosts: Vec<usize> = self.hosting(&plan.construction).into_iter().filter(|s| starts.contains(s)).collect();
         let placed = hosts
             .iter()
-            .find_map(|device| take(*device, claims))
+            .find_map(|start| take(*start, claims))
             .or_else(|| {
-                let fit = |device: &usize| !hosts.contains(device) && self.fits(&plan.construction, *device);
-                range.clone().filter(fit).find_map(|device| take(device, claims))
+                let fit = |start: &usize| !hosts.contains(start) && self.fits(&plan.construction, *start, plan.degree);
+                starts.clone().filter(fit).find_map(|start| take(start, claims))
             })
-            .or_else(|| {
-                (hosts.is_empty() || lane.is_some()).then(|| range.clone().find_map(|device| take(device, claims))).flatten()
-            });
-        match &placed {
-            None if lane.is_some() => {}
-            None if hosts.is_empty() => claims.iter_mut().for_each(|claim| { claim.get_or_insert(root); }),
-            None => hosts.iter().for_each(|device| { claims[*device].get_or_insert(root); }),
-            Some((device, _)) if !hosts.contains(device) => {
+            .or_else(|| (hosts.is_empty() || lane.is_some()).then(|| starts.clone().find_map(|start| take(start, claims))).flatten());
+        match (&placed, root) {
+            (None, Some(root)) if lane.is_none() && hosts.is_empty() => {
+                self.allocations.claim(root, degree, claims);
+            }
+            (None, Some(root)) if lane.is_none() => hosts.iter().flat_map(|start| *start..start + degree).for_each(|d| {
+                claims[d].get_or_insert(root);
+            }),
+            (Some((start, _)), _) if !hosts.contains(start) => {
                 self.notes.note(serde_json::json!({"event": "place", "plan": plan.construction,
-                    "gpu": self.devices[*device].entry, "running_on": hosts.iter()
+                    "gpus": self.lane_devices(*start, plan.degree).unwrap_or_default(), "running_on": hosts.iter()
                         .map(|d| &self.devices[*d].entry).collect::<Vec<_>>()}));
             }
-            Some(_) => {}
+            _ => {}
         }
         placed
     }
@@ -1749,7 +1736,7 @@ impl Pool {
             },
             false => None,
         };
-        let Some((start, permit)) = self.place(engine, &plan, (root, record.family()), lane, claims) else {
+        let Some((start, permit)) = self.place(engine, &plan, (Some(root), record.family()), lane, claims) else {
             return Ok(false);
         };
         engine.dispatch_managed(&record.id, move |engine, id| {
@@ -1767,7 +1754,7 @@ impl Pool {
             result
         })
     }
-    /// One line per Load in `loads.jsonl`: the executor's load facts, the host tier's, and
+    /// One line per Load in `loads.jsonl`: the executor's load facts, and
     /// the machine's and executor's RSS/PSS.
     fn record_load(
         &self,
@@ -1827,6 +1814,27 @@ impl Pool {
         }
     }
 
+    /// The host watcher looks now (a nudge; the host's own events wake it too).
+    fn nudge_host(&self) {
+        if let Some(host) = &self.host {
+            host.nudge();
+        }
+    }
+
+    /// The call's memory decisions (varena's record of its request, in order: lowering, cuts,
+    /// parks, exhaustion, evictions of declared or working pages, each with its trigger, site,
+    /// need, freed bytes and level), one memory-log line each: why a run lowered, cut or failed.
+    /// Each record is relayed whole; the run's measurements keep them with the rest of its stats.
+    fn note_decisions(&self, run: &str, pid: u32, gpus: &str, reply: &Frame) {
+        let decisions = reply.memory.as_ref().and_then(|stats| stats.get("decisions")).and_then(serde_json::Value::as_array);
+        for decision in decisions.into_iter().flatten() {
+            let mut line = serde_json::Map::from_iter([("event".to_string(), "decision".into()), ("run".to_string(), run.into()),
+                ("pid".to_string(), pid.into()), ("gpus".to_string(), gpus.into())]);
+            line.extend(decision.as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())));
+            self.notes.note(serde_json::Value::Object(line));
+        }
+    }
+
     /// A running parent's hint that it will call `plan` next (`model_prefetch`, H3 long-form's
     /// `prefetch(motion_segment)`): load it in the background where it fits beside the tenants
     /// already there (it never makes room), without waiting for the parent's own run to end.
@@ -1861,7 +1869,7 @@ impl Pool {
                         Some(None) => return,
                         Some(Some(lane)) if !gpu_request_queued(&engine, Some(root)) => {
                             let mut claims = vec![None; pool.width()];
-                            if let Some(placed) = pool.place(&engine, &plan, (root, family.as_deref()), Some(lane), &mut claims) {
+                            if let Some(placed) = pool.place(&engine, &plan, (Some(root), family.as_deref()), Some(lane), &mut claims) {
                                 break placed;
                             }
                         }
@@ -1871,7 +1879,7 @@ impl Pool {
                 };
                 if !active() { return; }
                 let waited = asked.elapsed();
-                let result = pool.prewarm(&engine, &held, plan, start, false, Some(fetch));
+                let result = pool.prewarm(&engine, &held, plan, start, Some(fetch));
                 pool.note_prewarm(&key, waited, asked.elapsed() - waited, &result);
             });
         if let Err(error) = started {
@@ -1910,19 +1918,13 @@ impl Pool {
         held: &HeldGeneration,
         plan: Plan,
         start: usize,
-        member: bool,
         fetch: Option<Arc<crate::access::Fetch>>,
     ) -> io::Result<&'static str> {
         if self.sessions.lock().unwrap().contains_key(&session_key(&plan.construction, start)) {
             return Ok("already loaded");
         }
-        // A warm set member may end idle executors outside every set; a prefetch only starts
-        // where it fits. Neither touches a member or a running call.
-        let fits = match member {
-            true => self.make_room(&plan.construction, start, plan.degree, None, true, true)?,
-            false => self.lane(start, plan.degree)?.iter().all(|d| d.memory.as_ref().is_none_or(|m| m.fits(&plan.construction, None, true))),
-        };
-        if !fits {
+        // A warm member or a prefetch starts only where it fits: it never takes a running call's room.
+        if !self.fits(&plan.construction, start, plan.degree) {
             return Ok("no GPU room beside the warm set and the running call");
         }
         let born = Mutex::new(vec![]);
@@ -1935,18 +1937,18 @@ impl Pool {
             Err(error) => {
                 let births = born.into_inner().unwrap();
                 await_executor_exit(engine, &births);
-                self.retire_returned(&plan.construction, start, plan.degree, &births);
+                self.retire_returned(&plan.construction, start, &births);
                 return Err(error);
             }
         };
-        let (key, degree) = (plan.construction.clone(), plan.degree);
+        let key = plan.construction.clone();
         let result = self.call(engine, "", held, plan, &mut session, true, None, fetch);
         match result {
             Ok(_) => {
                 let births = executor_births(&session.executor.birth, &session.followers);
                 if let Err(error) = self.keep_idle(engine, session) {
                     await_executor_exit(engine, &births);
-                    self.retire_returned(&key, start, degree, &births);
+                    self.retire_returned(&key, start, &births);
                     return Err(error);
                 }
                 Ok("loaded")
@@ -1955,7 +1957,7 @@ impl Pool {
                 let births = executor_births(&session.executor.birth, &session.followers);
                 let error = ended_with(engine, "", error, session.executor);
                 await_executor_exit(engine, &births);
-                self.retire_returned(&key, start, degree, &births);
+                self.retire_returned(&key, start, &births);
                 Err(error)
             }
         }
@@ -1969,9 +1971,9 @@ impl Pool {
         };
         let deviceless = std::mem::take(&mut *self.deviceless.lock().unwrap());
         for session in sessions.into_values().chain(deviceless) {
-            let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+            let (plan, start) = (session.plan.clone(), session.start);
             session.executor.shutdown()?;
-            self.ended(&plan, start, degree);
+            self.ended(&plan, start);
         }
         for zygote in std::mem::take(&mut *self.zygotes.lock().unwrap()).into_values() {
             if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
@@ -2145,13 +2147,6 @@ impl Pool {
         if self.zygotes.lock().unwrap().contains_key(&parent_app(&held)) {
             return;
         }
-        if !self.parent_fits(&held) {
-            tracing::info!(
-                "executor prespawn skipped for {}: no host room",
-                held.record.identity
-            );
-            return;
-        }
         let Some((zygote, true)) = self.zygote(&held) else {
             return;
         };
@@ -2168,15 +2163,6 @@ impl Pool {
         }
     }
 
-    /// Whether the host has room for `held`'s parent beside what it holds now: the largest
-    /// private bytes a live parent measures. A prespawn never makes room; a request that needs
-    /// a parent always gets one.
-    fn parent_fits(&self, _held: &HeldGeneration) -> bool {
-        let parents: Vec<Arc<Zygote>> = self.zygotes.lock().unwrap().values().cloned().collect();
-        let need = parents.iter().map(|parent| parent.private_bytes()).max().filter(|b| *b > 0);
-        self.host.room().is_none_or(|room| room >= need.unwrap_or(UNMEASURED_PARENT))
-    }
-
     /// Drop a dead parent, if it is still the generation's: the next launch starts another.
     fn forget_parent(&self, held: &HeldGeneration, dead: &Arc<Zygote>) {
         let mut zygotes = self.zygotes.lock().unwrap();
@@ -2187,37 +2173,6 @@ impl Pool {
         {
             zygotes.remove(&key);
         }
-    }
-
-    /// End a parent with no live child, for host room: one of a generation outside every
-    /// warm set before a member's (`spare`: never a member's), least recently used first.
-    /// Returns the bytes it held privately (at least 1 when one ended unmeasured), 0 when
-    /// there is none to end.
-    fn end_idle_parent(&self, spare: bool) -> u64 {
-        let kept: std::collections::BTreeSet<(String, String)> = {
-            let sets = self.members.lock().unwrap();
-            let members = sets.values().flatten().filter(|member| member.level >= Level::Imported);
-            members.map(|member| parent_app(&member.held)).collect()
-        };
-        let victim = {
-            let mut zygotes = self.zygotes.lock().unwrap();
-            let chosen = zygotes
-                .iter()
-                .filter(|(generation, zygote)| zygote.childless() && !(spare && kept.contains(*generation)))
-                .min_by_key(|(generation, zygote)| (kept.contains(*generation), *zygote.used.lock().unwrap()))
-                .map(|(generation, _)| generation.clone());
-            chosen.and_then(|generation| zygotes.remove(&generation))
-        };
-        let Some(zygote) = victim else {
-            return 0;
-        };
-        let freed = zygote.private_bytes();
-        if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
-            if let Err(error) = parent.shutdown() {
-                tracing::warn!("ending an idle import-only executor: {error}");
-            }
-        }
-        freed.max(1)
     }
 
     /// The generation's import-only executor, and whether the caller must start it. None
@@ -2241,7 +2196,7 @@ impl Pool {
     /// Brings `zygote` up as `held`'s import-only parent, and tells the engine it did (or failed).
     fn start_parent(&self, zygote: &Zygote, held: &HeldGeneration) {
         zygote.set(self.import_only(held));
-        if let Some(engine) = self.activity.get().and_then(Weak::upgrade) {
+        if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
             engine.notify_activity();
         }
     }
@@ -2267,7 +2222,7 @@ impl Pool {
                     package_interface: interface,
                     sequence_parallel_degree: 1,
                     import_only: true,
-                    ledgers: 0,
+                    leases: None,
                     memory_mode: self.config.host.mode.into(),
                 },
                 &mut device_executor::Baseline,
@@ -2376,10 +2331,10 @@ impl Pool {
         start: usize,
         calls: Option<&Arc<crate::calls::Calls>>,
     ) -> io::Result<()> {
-        let (key, degree) = (plan.construction.clone(), plan.degree);
+        let key = plan.construction.clone();
         let mut disposition = Disposition::default();
         let result = self.run_on(engine, id, held, plan, start, calls, &mut disposition);
-        self.finish_returned(engine, id, &key, start, degree, &disposition)?;
+        self.finish_returned(engine, id, &key, start, &disposition)?;
         result
     }
 
@@ -2431,8 +2386,6 @@ impl Pool {
                 session
             }
             None => {
-                // Room for its process and its widest measured request before it exists.
-                self.make_room(&plan.construction, start, degree, None, true, false)?;
                 let born = Mutex::new(vec![]);
                 let on_birth = |birth: &Birth, cancel: &Cancellation| {
                     born.lock().unwrap().extend(executor_births(birth, &[]));
@@ -2502,7 +2455,7 @@ impl Pool {
         }
         tracing::warn!("execution {id}: {error}; starting it on a fresh executor");
         if let Disposition::Unknown(births) = disposition {
-            self.retire_returned(&fresh.construction, start, fresh.degree, births);
+            self.retire_returned(&fresh.construction, start, births);
         }
         if !engine.redeliver(id)? {
             return Ok(()); // canceled meanwhile
@@ -2576,11 +2529,10 @@ impl Pool {
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
         executor.activity = gpu_work(self.lane(start, plan.degree)?);
-        executor.place = gpu_place(self.lane(start, plan.degree)?, executor.birth.pid);
         executor.keep_memo(self.memo.clone());
         if plan.degree > 0 {
             let exact = Exact::open(&executor.birth)?.ok_or_else(|| io::Error::other("executor exited before its start"))?;
-            let tenant = Tenant { plan: plan.construction.clone(), start, exact };
+            let tenant = Tenant { plan: plan.construction.clone(), generation: plan.generation.clone(), start, exact };
             self.tenants.lock().unwrap().insert(executor.birth.pid, tenant);
             self.leaders.lock().unwrap().insert(executor.birth.pid,
                 (executor.birth.clone(), plan.construction.clone(), start));
@@ -2609,6 +2561,7 @@ impl Pool {
             used: Instant::now(),
             launch,
             invoked: false,
+            level: Level::Host,
         })
     }
 
@@ -2629,6 +2582,8 @@ impl Pool {
         let (start, degree) = (session.start, plan.degree);
         let construction = plan.construction.clone();
         let gpus = self.lane(start, degree)?;
+        // A call begins: the host is looked at before it grows.
+        self.nudge_host();
         let retained = session.loaded;
         if retained {
             session.executor.begin_request();
@@ -2637,40 +2592,36 @@ impl Pool {
         // process (the Runtime refuses a group without constructed models).
         let ranks = if plan.slots.is_empty() { 1 } else { degree.max(1) };
         let lane = self.lane_devices(start, degree)?;
-        let _sealing = Sealing(&self.host.deposits, id);
-        let live = self.host.begin(id, &construction, group(session).iter().map(|b| b.pid).collect());
         let mut callbacks = Callbacks {
             engine,
             id,
             seen: Default::default(),
-            deposits: &self.host.deposits,
-            holders: group(session),
             generation: &held.record,
-            pool: self,
             spool: None,
             caller: None,
-            kept: gpus.iter().enumerate().map(|(rank, d)| {
-                let pid = if rank == 0 { Some(session.executor.birth.pid) } else { session.followers.get(rank - 1).map(|f| f.birth().pid) };
-                d.memory.as_ref().zip(pid).map(|(memory, pid)| (memory, pid, d.entry.as_str()))
-            }).collect(),
-            selections: plan.selections(),
-            adopted: false,
-            admits: session.executor.hello.admits(),
-            sealer: None,
+            formation: Some(Formation {
+                tenants: self.tenants.clone(),
+                leader: session.executor.birth.clone(),
+                plan: construction.clone(),
+                generation: plan.generation.clone(),
+                start,
+            }),
+            host: self.host.as_deref(),
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
             let starting = Instant::now();
-            // Each GPU's ledger and its eventfd follow the Start, in lane order: every rank claims
-            // its own row.
-            let grants = match gpus.iter().all(|d| d.memory.is_some()) {
-                true => gpus.iter().filter_map(|d| d.memory.as_ref()).map(GpuLedger::grant).collect::<io::Result<Vec<_>>>()?,
-                false => vec![],
-            };
-            let ledgers: Vec<File> = grants.into_iter().flatten().collect();
+            // An executor speaking leases dials each GPU's manager; any other runs standalone.
+            let standalone = session.executor.hello.contract() == device_executor::Contract::Standalone;
+            if standalone {
+                self.standalone(&session.executor);
+            }
+            let leases = (!standalone && gpus.iter().any(|d| d.memory.is_some())).then(platform::memory::euid);
             // Rank 0 spawns and forms every follower inside this command; its watch meters
-            // the whole group's work, so formation ends only on measured lack of progress.
-            let started = command_ok(session.executor.command_with(
+            // the whole group's work, so formation ends only on measured lack of progress. A
+            // follower that dials its lease listener meanwhile waits for its registration.
+            let forming = self.tenants.forming(&session.executor.birth, ranks.saturating_sub(1) as usize);
+            let started = command_ok(session.executor.command(
                 &DeviceCommand::Start {
                     devices: lane.clone(),
                     application: held.record.application.clone(),
@@ -2679,10 +2630,9 @@ impl Pool {
                     import_only: false,
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions: constructions(&plan),
-                    ledgers: (ledgers.len() / 2) as u32,
+                    leases,
                     memory_mode: self.config.host.mode.into(),
                 },
-                &ledgers,
                 &mut callbacks,
             )?)?;
             session.launch.start_ms = starting.elapsed().as_secs_f64() * 1e3;
@@ -2697,31 +2647,14 @@ impl Pool {
                     ),
                 }));
             }
-            // Only processes in rank 0's own group are taken as its followers: each is its own
-            // GPU's tenant, named in that GPU's ledger by its own pid.
-            let members = platform::process::group_members(&session.executor.birth);
-            session.followers = started
-                .follower_pids
-                .iter()
-                .filter_map(|pid| members.iter().find(|m| m.pid == *pid))
-                .filter_map(|birth| Exact::open(birth).ok().flatten())
-                .collect();
-            for follower in &session.followers {
-                let tenant = Tenant { plan: construction.clone(), start, exact: follower.try_clone()? };
-                self.tenants.lock().unwrap().insert(follower.birth().pid, tenant);
-            }
+            session.followers = callbacks.formation.as_ref().map_or(Ok(vec![]), |formation| formation.register(&started.follower_pids))?;
+            drop(forming);
             if session.followers.len() + 1 != ranks as usize {
                 return Err(io::Error::other(Refused {
                     code: "group_unformed".into(),
                     detail: "a follower exited before its GPU ledger could be associated".into(),
                 }));
             }
-            callbacks.kept = gpus.iter().enumerate().map(|(rank, d)| {
-                let pid = if rank == 0 { Some(session.executor.birth.pid) } else { session.followers.get(rank - 1).map(|f| f.birth().pid) };
-                d.memory.as_ref().zip(pid).map(|(memory, pid)| (memory, pid, d.entry.as_str()))
-            }).collect();
-            callbacks.holders = group(session);
-            live.pids(callbacks.holders.iter().map(|b| b.pid).collect());
             // The request's signer, whose bearer the Runtime keeps apart.
             let actor = engine.get(id).ok().and_then(|record| record.submission).map(|s| s.actor).unwrap_or_default();
             let load = match plan.slots.first() {
@@ -2742,10 +2675,12 @@ impl Pool {
                 },
                 Some(first) => {
                     let store = self.store.root().to_string_lossy().into_owned();
+                    let homes = self.homes(&plan, gpus);
                     let load = |slot: &PlanSlot| {
                         let mut binding = slot.binding.clone();
                         binding.package_interface = interface_path.to_string_lossy().into();
                         binding.store = store.clone();
+                        binding.homes = homes.get(&slot.binding.model_binding_path).cloned().unwrap_or_default();
                         ModelLoad { binding }
                     };
                     let first = load(first);
@@ -2857,11 +2792,20 @@ impl Pool {
             return Ok(true);
         }
         let prepared = command_ok(prepared)?;
-        // Its measured peak is recorded under its shape: room for it, and the key named to varena.
+        // Admitted at its shape, the key its peak is recorded under, on every GPU of its lane or
+        // none, waiting while it does not fit. In its family, a yielded parent's working set is
+        // left out: the parent waits on it.
         let shape = shape(&prepared.features);
-        live.shape(&shape);
-        self.make_room(&construction, start, degree, Some(&shape), false, false)?;
-        let _dispatched = Dispatched::new(gpus, id, &format!("{construction}|{shape}"));
+        let managers: Vec<&varena::lease::Manager> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &*m.manager).collect();
+        let admitted = memory::admit(engine, &managers, id, &construction, &shape);
+        let call = memory::Call { pid: session.executor.birth.pid, package: construction.clone(), shape: shape.clone() };
+        let _dispatched = Dispatched { gpus, id: id.into(), running: self.running.clone() };
+        self.running.lock().unwrap().insert(id.into(), call);
+        if !admitted? {
+            // Canceled while it waited for room: it never started.
+            defer_completion(engine, id, &session.executor.birth, &session.followers, Outcome::Canceled)?;
+            return Ok(true);
+        }
         let spool = if let Some(identity) = self.config.identity {
             // Keep Journal/results/admin paths private to the core. A separate peer-owned
             // spool lives only inside this executor's already authorized output directory.
@@ -2904,6 +2848,7 @@ impl Pool {
                 destination: calls.map(|calls| calls.destination(id)).unwrap_or_default(),
                 actor: record.submission.as_ref().map(|submission| submission.actor.clone()).unwrap_or_default(),
                 operation,
+                family: record.family().unwrap_or_default().into(),
                 max_output_bytes: crate::output_capacity::for_callable(document, "entrypoints", &plan.entrypoint)?,
                 request_id: id.into(),
                 construction: construction.clone(),
@@ -2921,8 +2866,9 @@ impl Pool {
         );
         session.executor.waits = None;
         let reply = reply?;
-        live.measured();
+        session.level = Level::Gpu;
         self.record_invoke(&construction, &lane, first, invoked.elapsed(), &reply);
+        self.note_decisions(id, session.executor.birth.pid, &lane, &reply);
         record_measurements(engine, id, &plan, &reply);
         if reply.attention_applied {
             if let Err(error) = engine.apply_attention(id) {
@@ -2932,11 +2878,8 @@ impl Pool {
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
         let lost = self.lost_followers(start, degree, &session.followers);
         if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
-            // It may have faulted on its GPU: what it or any process kept there is not trusted,
-            // and after a fault in a request that mapped kept pages none is kept again (B8).
-            let refuse = callbacks.adopted && !(reply.ok && reply.poisoned.is_empty());
-            let ledgers = gpus.iter().filter_map(|d| d.memory.as_ref());
-            ledgers.for_each(if refuse { GpuLedger::refuse_kept } else { GpuLedger::forget_kept });
+            // It may have faulted on its GPUs: their kept pages go.
+            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.fault());
             // The author's failure keeps its traceback and origin in triage; the executor's
             // end would record only "executor_ended".
             if let Some(outcome) = reply.outcome.as_ref().filter(|o| !o.traceback.is_empty()) {
@@ -2949,10 +2892,6 @@ impl Pool {
             .outcome
             .as_ref()
             .ok_or_else(|| io::Error::other("device outcome absent"))?;
-        // Nothing a run that did not succeed kept outlives it.
-        if outcome.terminal != "succeeded" {
-            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(GpuLedger::forget_kept);
-        }
         match outcome.terminal.as_str() {
             "succeeded" => {
                 let result = (|| {
@@ -2982,6 +2921,39 @@ impl Pool {
             }
         }
         Ok(true)
+    }
+
+    /// An executor of another memory protocol runs its memory alone, unshared with the others on
+    /// these GPUs (the driver's free bytes count it): version skew degrades, with a note.
+    fn standalone(&self, executor: &DeviceExecutor) {
+        let hello = &executor.hello;
+        tracing::warn!("executor {} (Runtime {}, TensorFS {}) speaks memory protocol {}, not leases: its GPU memory runs on its own",
+            executor.birth.pid, hello.runtime_version, hello.tensorfs_version, hello.memory_protocol);
+        self.notes.note(serde_json::json!({"event": "standalone", "pid": executor.birth.pid, "runtime": hello.runtime_version,
+            "tensorfs": hello.tensorfs_version, "memory_protocol": hello.memory_protocol}));
+    }
+
+    /// For a group, each slot's placeable components and the GPU of the group that keeps each
+    /// (`memory::homes`), by slot path. A GPU with no ledger keeps nothing away from GPU 0.
+    fn homes(&self, plan: &Plan, gpus: &[Device]) -> BTreeMap<String, BTreeMap<String, u32>> {
+        let placeable: Vec<(&str, &str, String)> = plan.slots.iter()
+            .flat_map(|slot| slot.placeable.iter().map(move |c| (slot.binding.model_binding_path.as_str(), c.as_str(), format!("{}/{c}", slot.binding.release))))
+            .collect();
+        if gpus.len() < 2 || placeable.is_empty() {
+            return BTreeMap::new();
+        }
+        let managers: Option<Vec<&varena::lease::Manager>> = gpus.iter().map(|d| d.memory.as_ref().map(|m| &*m.manager)).collect();
+        let sets: Vec<&str> = placeable.iter().map(|(_, _, set)| set.as_str()).collect();
+        let gpu = match managers {
+            Some(managers) => memory::homes(&managers, &plan.construction, UNPREPARED, &sets, &self.notes),
+            None => vec![0; sets.len()],
+        };
+        let mut homes: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+        for ((path, component, _), gpu) in placeable.iter().zip(gpu) {
+            homes.entry((*path).into()).or_default().insert((*component).into(), gpu);
+        }
+        self.notes.note(serde_json::json!({"event": "homes", "plan": plan.construction, "homes": homes}));
+        homes
     }
 
     /// Followers whose process has ended, as people name their GPUs ("GPU 1's process 3224
@@ -3092,11 +3064,6 @@ fn owns_birth(leader: &Birth, followers: &[platform::process::Exact], candidate:
     leader == candidate || followers.iter().any(|f| f.birth() == candidate)
 }
 
-/// A session's executor processes: its leader and each follower.
-fn group(session: &Session) -> Vec<Birth> {
-    std::iter::once(session.executor.birth.clone()).chain(session.followers.iter().map(|f| f.birth().clone())).collect()
-}
-
 fn executor_births(leader: &Birth, followers: &[platform::process::Exact]) -> Vec<Birth> {
     let mut processes = platform::process::group_members(leader);
     processes.extend(followers.iter().map(|exact| exact.birth().clone()));
@@ -3111,31 +3078,34 @@ fn defer_completion(
     engine.defer_completion(id, outcome, executor_births(leader, followers))
 }
 
-/// A request's shape key: its normalized features (PrepareRequest's), hashed to 16 hex digits.
+/// A request's shape key: its normalized features (PrepareRequest's axes, in name order) as
+/// `axis=value` joined by `,`, with `%`, `,`, `=` and `|` escaped, so two feature sets never
+/// share a key and none splits the ledger's `<package>|<shape>`; `-` when it has none.
 fn shape(features: &BTreeMap<String, serde_json::Value>) -> String {
-    let canonical = crate::boundary_json::exact(&serde_json::json!(features));
-    tensorfs::sha256::hex_digest(&canonical)[..16].to_string()
+    let escape = |text: &str| text.replace('%', "%25").replace(',', "%2C").replace('=', "%3D").replace('|', "%7C");
+    let value = |v: &serde_json::Value| v.as_u64().map_or_else(|| v.to_string(), |n| n.to_string());
+    let axes: Vec<String> = features.iter().map(|(axis, v)| format!("{}={}", escape(axis), escape(&value(v)))).collect();
+    match axes.is_empty() {
+        true => "-".into(),
+        false => axes.join(","),
+    }
 }
 
-/// A request named to varena on every GPU of its lane (`<package>|<shape>`, the key its peak is
-/// recorded under), until it ends.
+/// The shape a call is placed at before its executor normalizes its request: the ledger reads it
+/// as the package's widest measured shape; none measured, it fits only on an idle GPU.
+const UNPREPARED: &str = "";
+
+/// A request admitted on every GPU of its lane (`memory::admit`), undispatched when it ends.
+/// A request admitted on its lane's GPUs: running, as the host rule reads it, until it drops.
 struct Dispatched<'a> {
     gpus: &'a [Device],
     id: String,
-}
-impl<'a> Dispatched<'a> {
-    fn new(gpus: &'a [Device], id: &str, key: &str) -> Self {
-        for ledger in gpus.iter().filter_map(|d| d.memory.as_ref()) {
-            if let Err(error) = ledger.dispatch(id, key) {
-                tracing::warn!("memory: request {id} runs unrecorded: {error}");
-            }
-        }
-        Self { gpus, id: id.into() }
-    }
+    running: memory::Running,
 }
 impl Drop for Dispatched<'_> {
     fn drop(&mut self) {
-        self.gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|ledger| ledger.undispatch(&self.id));
+        self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+        self.gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.undispatch(&self.id));
     }
 }
 
@@ -3192,14 +3162,6 @@ fn unsettled(reply: &Frame, lost: &str) -> Refused {
         poisoned => format!("{message}; the executor did not settle quiescent (poisoned: {poisoned})"),
     };
     Refused { code, detail }
-}
-
-/// What executor `pid` waits on across `gpus`' ledgers, for a wedge's verdict; None without one.
-fn gpu_place(gpus: &[Device], pid: u32) -> Option<crate::process::Place> {
-    let places: Vec<_> = gpus.iter().filter_map(|gpu| gpu.memory.as_ref().map(|ledger| ledger.place(pid))).collect();
-    (!places.is_empty()).then(|| -> crate::process::Place {
-        Arc::new(move || places.iter().map(|place| place()).filter(|p| !p.is_empty()).collect::<Vec<_>>().join("; "))
-    })
 }
 
 /// Whether `gpus` moved device memory since the last reading; None without GPUs or while NVML
@@ -3540,7 +3502,7 @@ fn refused(error: &io::Error) -> Option<&Refused> {
 /// models it ran, as resolved.
 pub(crate) fn record_measurements(engine: &Engine, id: &str, plan: &Plan, reply: &Frame) {
     let software = engine.get(id).ok().and_then(|run| run.executor.map(|executor| executor.software(run.attempt)));
-    let measurements = measured(plan, reply, software, crate::memory::call::CallMemory::of(reply));
+    let measurements = measured(plan, reply, software, call_memory(reply));
     let recorded = serde_json::to_vec(&measurements)
         .map_err(io::Error::other)
         .and_then(|bytes| engine.with_journal(|journal| journal.record_measurements(id, &bytes)));
@@ -3549,6 +3511,20 @@ pub(crate) fn record_measurements(engine: &Engine, id: &str, plan: &Plan, reply:
     }
 }
 
+
+/// The call's memory as its executor measured it: torch's high-water marks over the call, and
+/// varena's record of the request kept whole as `stats` (what `run show` and the gate read).
+/// None when it measured nothing.
+fn call_memory(reply: &Frame) -> Option<serde_json::Value> {
+    if reply.memory.is_none() && reply.metrics.is_none() {
+        return None;
+    }
+    let metrics = reply.metrics.clone().unwrap_or_default();
+    let known = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok()).map(serde_json::Value::from);
+    let fields = [("peak_allocated_bytes", known(metrics.peak_vram_bytes)),
+        ("peak_reserved_bytes", known(metrics.peak_reserved_bytes)), ("stats", reply.memory.clone().map(serde_json::Value::Object))];
+    Some(fields.into_iter().filter_map(|(key, value)| Some((key.to_string(), value?))).collect())
+}
 
 /// The run's measurements: the kernels it served (`attention.`, `gemm.`, `kernel.`) and the work
 /// that blocked its request path (`request_path.`), which a release gate reads.
@@ -3581,136 +3557,61 @@ fn constructions(plan: &Plan) -> Vec<Construction> {
     plan.slots.iter().map(slot).collect()
 }
 
-/// A `read_grant`'s answer: `held`, the one layout deposited for it, its fd following; else
-/// nothing (the Runtime reads the checkpoint through TensorFS). Runtime's
-/// `tests/tensord_peer.py` (`answer_read_grants`) sends this very shape.
-fn granted(seq: u64, layout: Option<File>) -> (Answer, Vec<File>) {
-    let mut answer = Answer::ok(seq);
-    let files: Vec<File> = layout.into_iter().collect();
-    (answer.held, answer.descriptors) = (!files.is_empty(), files.len() as u64);
-    (answer, files)
+/// A group's formation: rank 0 reports each follower it spawned (a progress frame's
+/// `follower_pids`, before the follower opens memory, then Start's reply), and each becomes its
+/// GPU's tenant at once, so its lease peer is known when it dials.
+struct Formation {
+    tenants: memory::Tenants,
+    leader: Birth,
+    plan: String,
+    generation: String,
+    start: usize,
+}
+
+impl Formation {
+    /// The reported followers in rank 0's own process group, each registered as its tenant.
+    fn register(&self, pids: &[u32]) -> io::Result<Vec<Exact>> {
+        let members = platform::process::group_members(&self.leader);
+        let followers: Vec<Exact> = pids
+            .iter()
+            .filter_map(|pid| members.iter().find(|m| m.pid == *pid))
+            .filter_map(|birth| Exact::open(birth).ok().flatten())
+            .collect();
+        let tenant = |follower: &Exact| -> io::Result<(u32, Tenant)> {
+            let tenant = Tenant { plan: self.plan.clone(), generation: self.generation.clone(), start: self.start, exact: follower.try_clone()? };
+            Ok((follower.birth().pid, tenant))
+        };
+        self.tenants.register(followers.iter().map(tenant).collect::<io::Result<Vec<_>>>()?);
+        Ok(followers)
+    }
 }
 
 struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
     seen: crate::calls::Seen,
-    deposits: &'a Deposits,
-    /// The executor processes a layout granted or deposited here is mapped by.
-    holders: Vec<Birth>,
     /// The environment the executor runs: its App's declarations name the products it publishes.
     generation: &'a crate::catalog::Generation,
-    pool: &'a Pool,
     /// The invoking request's spool, where its published assets' bytes are.
     spool: Option<PathBuf>,
     /// The invoking request as a caller: its child-call frames.
     caller: Option<&'a crate::calls::Caller>,
-    /// Each rank's GPU ledger, corresponding executor process and physical lane entry.
-    kept: Vec<Option<(&'a GpuLedger, u32, &'a str)>>,
-    /// The checkpoints the call reads and their components: what a missed grant seals.
-    selections: Vec<SelectedManifest>,
-    /// A rank mapped GPU pages a gone executor kept (`read_grant`).
-    adopted: bool,
-    /// Its Runtime and TensorFS seal only where `read_grant` says `seal` (`Hello::admits`).
-    admits: bool,
-    /// The last `layout_sealing` answer's loader: its progress is the asker's while it waits.
-    sealer: Option<crate::process::Lender>,
-}
-/// A call's end: a layout it was sealing and never deposited is nobody's to wait for.
-struct Sealing<'a>(&'a Deposits, &'a str);
-impl Drop for Sealing<'_> {
-    fn drop(&mut self) {
-        self.0.ended(self.1);
-    }
+    /// Its executor's group, forming at Start.
+    formation: Option<Formation>,
+    /// The host watcher: each frame nudges it to look (the only wakeup where the kernel gives
+    /// none, cgroup v1 with PSI denied).
+    host: Option<&'a memory::Host>,
 }
 impl Services for Callbacks<'_> {
-    /// A weight set's held bytes: the sealed host layout an executor deposited for its manifest
-    /// and layout (whole, or still filling: a region its filler leaves unfilled reads the
-    /// checkpoint), else nothing, and the Runtime reads the checkpoint through TensorFS (TensorD
-    /// never fills). Without one, the asker seals it only when admitted (`seal`): a layout is
-    /// speculation, so it takes only measured surplus (`HostTier::admit`). Another asker
-    /// meanwhile is told to ask again once that deposit lands. An older Runtime or TensorFS seals
-    /// unadmitted too, so it is the layout's one sealer either way.
-    fn read_grant(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
-        drop(plan);
-        self.pool.host.nudge();
-        let (manifest, layout) = (&frame.manifest, &frame.layout);
-        let (file, filling, seal, admission) = match self.deposits.grant(manifest, layout, &self.holders) {
-            Some((file, filling)) => (Some(file), filling, false, None),
-            None if layout.is_empty() => (None, false, false, None),
-            None => {
-                let id = |m: &str| m.trim_start_matches("sha256:").to_string();
-                let selected = self.selections.iter().find(|s| id(&s.manifest) == id(manifest));
-                let bytes = selected.and_then(|s| selected_bytes(&self.pool.store, &s.manifest, &s.components).ok());
-                let mut admission = None;
-                let who = format!("{}#{}", self.id, frame.rank);
-                match self.deposits.seal(manifest, layout, &who, bytes.map_or(0, |(b, _)| b), !self.admits, |reserved| {
-                    admission = bytes.map(|(bytes, _)| self.pool.host.admit(bytes, reserved));
-                    admission.as_ref().is_some_and(|a| a.seal)
-                }) {
-                    Ok(seal) => {
-                        // A concurrent deposit may have landed after the first grant lookup.
-                        let granted = (!seal).then(|| self.deposits.grant(manifest, layout, &self.holders)).flatten();
-                        let (file, filling) = granted.map_or((None, false), |(file, filling)| (Some(file), filling));
-                        let why = |a: &crate::host_tier::Admission| if self.admits || a.seal { a.why } else { "an older Runtime or TensorFS seals regardless" };
-                        (file, filling, seal, admission.map(|a| crate::host_tier::Admission { seal, why: why(&a), ..a }))
-                    }
-                    Err(sealer) => {
-                        // The asker waits on the loading call: it moves as that call moves, and
-                        // once that call ends the next ask loads the layout itself.
-                        let loader = self.engine.get(sealer.rsplit_once('#').map_or(&*sealer, |(call, _)| call)).ok();
-                        let birth = loader.as_ref().and_then(|record| record.process.clone());
-                        self.sealer = Some(Arc::new(move || birth.as_ref().and_then(crate::process::group_moved)));
-                        let rank = self.kept.get(frame.rank as usize).copied().flatten();
-                        self.pool.notes.note(serde_json::json!({"event": "layout_sealing", "manifest": frame.manifest,
-                            "layout": frame.layout, "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "call": self.id,
-                            "sealer": sealer, "sealer_state": loader.as_ref().map(|r| format!("{:?}", r.state)),
-                            "sealer_doing": loader.and_then(|r| r.progress)}));
-                        let detail = format!("{sealer} is sealing {layout}; ask again once it deposits");
-                        return Ok((Answer::refused(frame.seq, "layout_sealing", &detail), vec![]));
-                    }
-                }
-            }
-        };
-        let (mut answer, mut fds) = granted(frame.seq, file);
-        answer.seal = seal;
-        let held = answer.held;
-        // GPU pages a gone executor kept of this layout follow its host layout.
-        let rank = self.kept.get(frame.rank as usize).copied().flatten();
-        if let Some((fingerprint, pages)) = rank.filter(|_| held && !filling).and_then(|(m, _, _)| m.take_kept(&frame.layout)) {
-            for (page, fd) in pages {
-                answer.pages.push(page);
-                fds.push(fd);
-            }
-            self.adopted = true;
-            (answer.fingerprint, answer.descriptors) = (fingerprint, fds.len() as u64);
-        }
-        self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
-            "layout": frame.layout, "held": held, "filling": filling, "admission": admission, "pages": answer.pages.len(),
-            "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "gpu": rank.map(|(_, _, gpu)| gpu)}));
-        Ok((answer, fds))
-    }
-    fn sealer(&mut self) -> Option<crate::process::Lender> {
-        self.sealer.take()
-    }
-    /// GPU pages the executor kept: held past its end, for the next executor of the layout.
-    fn keep_pages(&mut self, frame: &Frame, pages: Vec<File>) -> Answer {
-        let Some((ledger, pid, gpu)) = self.kept.get(frame.rank as usize).copied().flatten().filter(|_| pages.len() == frame.pages.len()) else {
-            return Answer::refused(frame.seq, "keep_pages_refused", "kept pages name one existing GPU rank, one fd per page");
-        };
-        // Kept pages go only to an asker granted the layout's host layout: with none held they
-        // could never be adopted, and holding them pins the GPU memory their executor gives back.
-        if !self.deposits.holds(&frame.layout) {
-            return Answer::refused(frame.seq, "keep_pages_refused", "no host layout is held for it");
-        }
-        let bytes: u64 = frame.pages.iter().map(|p| p.nbytes).sum();
-        ledger.keep(&frame.layout, &frame.fingerprint, pid, frame.pages.iter().copied().zip(pages).collect());
-        self.pool.notes.note(serde_json::json!({"event": "keep_pages", "layout": frame.layout, "pages": frame.pages.len(), "bytes": bytes,
-            "rank": frame.rank, "pid": pid, "gpu": gpu}));
-        Answer::ok(frame.seq)
-    }
     fn progress(&mut self, frame: &Frame) {
-        self.pool.host.nudge();
+        if let (Some(formation), false) = (&self.formation, frame.follower_pids.is_empty()) {
+            if let Err(error) = formation.register(&frame.follower_pids) {
+                tracing::warn!("run {}: followers {:?} unregistered: {error}", self.id, frame.follower_pids);
+            }
+        }
+        if let Some(host) = self.host {
+            host.nudge();
+        }
         crate::calls::observe(self.engine, self.id, &mut self.seen, frame, self.caller);
     }
     fn request(
@@ -3718,18 +3619,6 @@ impl Services for Callbacks<'_> {
         frame: &Frame,
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
-        if frame.kind == Kind::Deposit {
-            // A layout varena sealed in the executor, kept for the next executor of its weights.
-            let layout = descriptor.ok_or_else(|| io::Error::other("a deposit omitted its layout"))?;
-            let kept = self.deposits.deposit(&frame.manifest, &frame.layout, layout, &self.holders);
-            self.pool.host.nudge();
-            self.pool.notes.note(serde_json::json!({"event": "deposit", "manifest": frame.manifest,
-                "layout": frame.layout, "kept": kept.as_ref().map_or_else(ToString::to_string, |()| "yes".into())}));
-            return Ok(match kept {
-                Ok(()) => (Answer::ok(frame.seq), None),
-                Err(error) => (Answer::refused(frame.seq, "deposit_refused", error.to_string()), None),
-            });
-        }
         if frame.kind == Kind::Publish {
             drop(descriptor);
             let answer = match &self.spool {
@@ -3749,3 +3638,4 @@ impl Services for Callbacks<'_> {
         }
     }
 }
+
