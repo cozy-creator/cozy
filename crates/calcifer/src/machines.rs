@@ -1159,6 +1159,7 @@ pub(crate) async fn quote(
         gpus,
         disk_gb,
         image,
+        provider,
         agreed: _,
     } = parse::<NewMachine>(&body)?
     else {
@@ -1172,6 +1173,7 @@ pub(crate) async fn quote(
         gpus,
         disk_gb,
         image,
+        provider,
         agreed: None,
         ..Shape::default()
     };
@@ -1205,6 +1207,7 @@ pub(crate) async fn create(
             gpus,
             disk_gb,
             image,
+            provider,
             agreed,
         } => {
             let key = headers
@@ -1226,6 +1229,7 @@ pub(crate) async fn create(
                 gpus,
                 disk_gb,
                 image,
+                provider,
                 agreed,
                 ..Shape::default()
             };
