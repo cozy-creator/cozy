@@ -536,7 +536,7 @@ impl Origin for Endpoint {
         let escaped = |value: &str| repo_url("", value).trim_start_matches('/').to_owned();
         // The rule names this reader: a Hub answers an older one in its own rule (spec §7).
         let mut url = format!("{}/select?revision={}&gpus={}&rule={}", repo_url(base, &format!("v1/models/{name}")),
-            escaped(revision), escaped(&constraints.gpus.join(",")), crate::precision::RULE);
+            escaped(revision), escaped(&constraints.gpus.join(",")), crate::precision::rule());
         for (key, bits) in [("bits", constraints.bits), ("prefer", constraints.prefer), ("min_bits", constraints.min_bits)] {
             if let Some(bits) = bits { url.push_str(&format!("&{key}={bits}")); }
         }
@@ -546,7 +546,7 @@ impl Origin for Endpoint {
             404 | 405 => Ok(None),
             // Another rule's answer (an older Hub's) is no answer: the headers decide.
             200 => serde_json::from_slice::<Selection>(&reply.body)
-                .map(|answer| (answer.rule == crate::precision::RULE).then_some(answer))
+                .map(|answer| (answer.rule == crate::precision::rule()).then_some(answer))
                 .map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: format!("GET {url}: {e}") }),
             _ => Err(refusal(&reply, "GET")),
         }

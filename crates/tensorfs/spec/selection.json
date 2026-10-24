@@ -1,0 +1,56 @@
+{
+ "rule": 5,
+ "features": {
+  "mma": {"min": "8.0"},
+  "int8": {"min": "8.0", "except": ["10.3"]},
+  "fp8": {"min": "8.9"},
+  "fp4": {"min": "10.0"},
+  "bf16": {"min": "8.0", "unread": true, "cpu": true},
+  "apple": {"prefix": "apple"}
+ },
+ "kinds": [
+  {"kind": "BF16", "family": "bf16"},
+  {"kind": "F16", "family": "fp16"},
+  {"kind": "F32", "family": "f32"},
+  {"prefix": "int8.", "family": "int8"},
+  {"prefix": "fp8.", "family": "fp8"},
+  {"kind": "nvfp4", "family": "nvfp4"},
+  {"kind": "mxfp4", "family": "mxfp4"},
+  {"prefix": "int4.", "family": "int4"},
+  {"kind": "w4a8.convrot", "family": "w4a8", "since": 4},
+  {"kind": "svdq.nvfp4", "family": "svdq-nvfp4", "since": 5}
+ ],
+ "families": {
+  "bf16": {"bits": 16},
+  "fp16": {"bits": 16},
+  "f32": {"bits": 16, "rank": "after"},
+  "int8": {"bits": 8, "needs": "int8", "compute": [{"width": 8}]},
+  "fp8": {"bits": 8, "needs": "fp8", "compute": [{"width": 8}]},
+  "nvfp4": {"bits": 4, "needs": "mma", "compute": [{"when": "fp4", "width": 4}]},
+  "mxfp4": {"bits": 4, "needs": "mma", "compute": [{"when": "fp4", "width": 4}], "rank": "nvfp4"},
+  "int4": {"bits": 4, "needs": "mma", "rank": "nvfp4"},
+  "w4a8": {"bits": 4, "needs": "int8", "compute": [{"width": 8}]},
+  "svdq-nvfp4": {"bits": 4, "needs": "mma", "compute": [{"when": "fp4", "width": 4}]}
+ },
+ "order": [
+  {"bits": 4, "decode": true, "lanes": ["nvfp4", "svdq-nvfp4", "w4a8", "int8", "fp8"]},
+  {"bits": 4, "when": "fp4", "lanes": ["svdq-nvfp4", "nvfp4", "w4a8", "int8", "fp8"]},
+  {"bits": 4, "lanes": ["w4a8", "nvfp4", "svdq-nvfp4", "int8", "fp8"]},
+  {"bits": 8, "lanes": ["int8", "fp8"]},
+  {"bits": 16, "lanes": []}
+ ],
+ "plain": [
+  {"when": "bf16", "lanes": ["bf16", "fp16"]},
+  {"lanes": ["fp16", "bf16"]}
+ ],
+ "schemes": [
+  "awq.int4", "bnb.fp4", "bnb.int8", "bnb.nf4", "comfy.asym_w4a8_int8", "comfy.w6a8_int8",
+  "ct.int1", "ct.int2", "ct.int3", "ct.int4", "ct.int5", "ct.int6", "ct.int7", "ct.int8",
+  "fp8.blockwise", "fp8.columnwise", "fp8.rowwise", "fp8.tensorwise",
+  "gguf.mxfp4", "gguf.nvfp4", "gguf.q1_0", "gguf.q2_0", "gguf.q2_k", "gguf.q3_k", "gguf.q4_0", "gguf.q4_1",
+  "gguf.q4_k", "gguf.q5_0", "gguf.q5_1", "gguf.q5_k", "gguf.q6_k", "gguf.q8_0",
+  "gptq.int2", "gptq.int3", "gptq.int4", "gptq.int8",
+  "int4.convrot", "int8.columnwise", "int8.convrot", "int8.rowwise", "int8.tensorwise",
+  "mxfp4", "mxfp8", "nvfp4", "svdq.nvfp4", "w4a8.convrot"
+ ]
+}

@@ -739,33 +739,28 @@ reader, copier or collector to discover a new kind of reference edge.
 
 ### Variant selection
 
-Rust and Hub readers MUST agree. Selection reads headers, never tensor payloads.
+Rust and Hub readers MUST agree. Selection reads headers, never tensor payloads. The rule's table is data:
+[`selection.json`](selection.json) holds its version (`rule`), the GPU features by compute capability, the kinds and
+their families, each family's width, needed feature, compute width and rank, the lane orders and every scheme a reader
+implements. The Hub vendors it byte for byte; each reader evaluates it as below and ignores fields it does not know.
 Consumers pass `{gpus: ["major.minor", ...], bits?, prefer?, min_bits?, plain?}` (widths 4, 8 or 16).
 No GPUs means the CPU. `bits` is asked: only that lane answers. Otherwise `prefer` (8 when omitted) is
 the lane ranked first. A slot adds `min_bits`, the narrowest it takes unasked, and `plain`, that it takes
-no encoded weights. The lane order reads what every device runs natively. Unread capabilities have no
-encoded GPU formats. BF16 is preferred unless a known GPU is below compute capability 8.0.
+no encoded weights. The lane order reads what every device runs natively: a feature holds for a set of GPUs when
+each one's capability starts with its `prefix`, or is a number from `min` on and not an `except`; a capability that is
+not a number has it only when `unread`; no GPUs have it only when `cpu`. GPUs with the `apple` feature run 16 bits
+only: a slot prefers 16 there, and asked 4 or 8 is refused.
 
 A header's profile is `{family, bits, bytes, kinds}`. A tensor's kind is its encoding scheme or,
 for plain tensors, its dtype. Sum the lengths of all tensor locations (including encoded parts)
-by kind. `bytes` is their total, `kinds` their sorted unique names. Its lane kind is the kind of the
-table below with the fewest bits (an nvfp4 variant that keeps sensitive layers in int8 is 4 bits, however
-many bytes those hold); of equal bits, the most stored bytes, then lexical kind order. A header holding an
-encoded kind the table does not name has no lane kind: its width is not the rule's to guess, so a newer
-family is never read as its narrower or plain extras. Its family and bits:
+by kind. `bytes` is their total, `kinds` their sorted unique names. Its lane kind is the kind with a family
+(`kinds`: an exact `kind` or a `prefix`) with the fewest bits (an nvfp4 variant that keeps sensitive layers in int8 is
+4 bits, however many bytes those hold); of equal bits, the most stored bytes, then lexical kind order. A header holding
+an encoded kind with no family has no lane kind (family empty, bits 0): its width is not the rule's to guess, so a
+newer family is never read as its narrower or plain extras.
 
-| Lane kind | family | bits |
-| --- | --- | --- |
-| BF16, F16, F32 | bf16, fp16, f32 respectively | 16 (the unquantized preference) |
-| int8.*, fp8.* | int8, fp8 | 8 |
-| nvfp4, mxfp4, int4.* | nvfp4, mxfp4, int4 | 4 |
-| w4a8.convrot | w4a8 | 4 |
-| svdq.nvfp4 | svdq-nvfp4 | 4 |
-| none of these | empty | 0 |
-
-Known plain dtypes run on any target. Encoded int8 and w4a8 require capability >=8.0 except 10.3; fp8 requires
->=8.9; nvfp4, mxfp4, int4 and svdq-nvfp4 require >=8.0 (weight-only below native FP4 capability 10.0). Another scheme
-this reader implements decodes on any GPU; an unknown one runs on none, even with a known family prefix.
+Known plain dtypes run on any target. An encoded kind runs where every GPU has its family's `needs` feature; another
+scheme a reader implements (`schemes`) decodes on any GPU; an unknown one runs on none, even with a known family prefix.
 With no GPUs, no GPU requirement applies. A variant named by its path, or a header by its id, is the sole
 candidate: the rule validates it.
 
@@ -773,11 +768,10 @@ A variant works unless: `bits` is asked and its bits differ, or are 16 and it ho
 holds an encoded kind under `plain`; unasked, its bits are nonzero and below `min_bits`; or GPUs are given
 and no one of them runs one of its encoded kinds (every kind counts, even a small minority).
 
-At 4 bits the lane order is FP4, svdq-nvfp4 then w4a8 where 4 is preferred unasked (a decode slot's, whose kernel
-is weight-only); else svdq-nvfp4, FP4 then w4a8 where every device runs FP4 natively; else w4a8, FP4 then
-svdq-nvfp4; then int8, fp8, BF16, FP16 and F32. At 8 bits omit the 4-bit families; at 16 bits, or under
-`plain`, omit all encoded families. Remove families not every device runs natively; place FP16 before BF16
-only for a known pre-8.0 GPU. FP4 includes nvfp4, mxfp4 and int4. Of the variants that work, the first in
+The lane order at the asked or preferred width is the first `order` row whose `bits` match, whose `decode` (a
+slot preferring 4 bits unasked) holds if set, and whose `when` feature holds; its lanes every GPU runs, omitted under
+`plain`; then the first `plain` row whose `when` holds. A family ranks as its `rank` lane (`after`: just after the
+order). A 4-bit family whose `compute` width here is 16 is weight-only. Of the variants that work, the first in
 that order wins, then none narrower than the width ranked first, then native over weight-only, then fewer stored
 bytes, then lexical full path. A variant
 outside the order serves only when none in it works. When none works, selection is refused, naming each
@@ -790,10 +784,9 @@ returned ETag, then commits. A failed PUT rolls back. A read detects a newer rep
 that repository's index, including a process loss after PUT but before COMMIT. Its indexed endpoint
 is `GET /v1/models/{org}/{name}/select?revision=&gpus=8.9,8.9&bits=8&rule=5` (and `prefer`, `min_bits`,
 `plain`); the response has `rule`, `release`, `commit`, `variant`, `header`, `profile` and `reasons`. A
-client takes only an answer of its own rule version (5), else reads the headers. A reader that names no
+client takes only an answer of its own rule version (`rule` in the table), else reads the headers. A reader that names no
 `rule` is of rule 3. The Hub answers a reader of an older rule in that rule, choosing by its own rule among the
-variants whose every kind such a reader implements (rule 3: none holding `w4a8.convrot` or `svdq.nvfp4`; rule 4:
-none holding `svdq.nvfp4`), since that reader would take a scheme it does not know on a CPU and fail to decode it. A refused selection is
+variants whose every kind such a reader implements (a kind's `since` is the first rule whose readers implement it), since that reader would take a scheme it does not know on a CPU and fail to decode it. A refused selection is
 HTTP200 with null fields and the refusal as its reason; the client applies the rule to the headers itself.
 Invalid bits is HTTP400; a model it has not indexed is HTTP404. Read permissions and explicit yanked-tag
 behavior match ordinary resolution. The current index covers commits named by repo tags; an untagged
