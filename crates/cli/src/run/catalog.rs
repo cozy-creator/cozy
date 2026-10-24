@@ -33,19 +33,7 @@ impl Card {
     /// A callable's request struct as its card spells it, with `accelerator: false` for a CPU
     /// function: what `--describe --json` prints.
     pub fn request(&self, name: &str) -> Value {
-        let entrypoints = self.document["package_interface"]["entrypoints"].as_array();
-        let Some(entry) = entrypoints
-            .into_iter()
-            .flatten()
-            .find(|e| e["name"] == name)
-        else {
-            return Value::Null;
-        };
-        let mut request = entry["request"].clone();
-        if entry["accelerator"] == Value::Bool(false) {
-            request["accelerator"] = Value::Bool(false);
-        }
-        request
+        request(&self.document["package_interface"], name)
     }
 }
 
@@ -204,4 +192,19 @@ pub fn read(document: &Value) -> Result<Card, Error> {
         interface,
         document: document.clone(),
     })
+}
+
+
+/// `name`'s request contract in a package interface document (`cozy run … --describe --json`): a
+/// release's card and local code's kept interface answer the same.
+pub fn request(interface: &Value, name: &str) -> Value {
+    let entrypoints = interface["entrypoints"].as_array();
+    let Some(entry) = entrypoints.into_iter().flatten().find(|e| e["name"] == name) else {
+        return Value::Null;
+    };
+    let mut request = entry["request"].clone();
+    if entry["accelerator"] == Value::Bool(false) {
+        request["accelerator"] = Value::Bool(false);
+    }
+    request
 }

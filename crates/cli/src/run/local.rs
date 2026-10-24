@@ -120,6 +120,12 @@ pub(super) async fn run(
     };
     if args.describe {
         let callable = super::callable(package, interface, &function)?;
+        if ctx.json {
+            let document = std::fs::read(file(&ctx.home, &prepared.local)).ok();
+            let document: serde_json::Value = document.and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+            crate::output::json(&super::catalog::request(&document, &callable.name));
+            return Ok(ExitCode::SUCCESS);
+        }
         let target = format!("{package}/{}", callable.name);
         let contract = describe::contract(&target, interface, callable);
         anstream::print!("{contract}");
