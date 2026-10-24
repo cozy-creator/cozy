@@ -126,7 +126,7 @@ impl Retained {
                 self.inner.make_room(missing, &keep, "prepare", req, false)?;
             }
             let claims: Vec<u64> = preparing.pins.iter().map(|(id, _)| *id).collect();
-            let pins = self.blocks.iter().map(|b| self.inner.bind_for(self.set, *b, stream, req, &claims, false)).collect::<Result<Vec<_>>>()?;
+            let pins = self.blocks.iter().map(|b| self.inner.bind_for(self.set, *b, stream, req, None, &claims, false)).collect::<Result<Vec<_>>>()?;
             let st = self.inner.lock();
             if retained_identity(self.set, st.mech(self.set)?, &self.blocks) != self.identity {
                 return Err(Error::StaleBinding("retained range identity changed during preparation".into()));
@@ -1068,19 +1068,19 @@ impl Memory {
     }
 
     /// Maps and fills block `block` of `set`; `stream` (a `CUstream`, 0 the default) waits on
-    /// the fill in-stream, and the release is ordered after its work. Its fill and trace go to
-    /// `request` (a hold taken before its pass opens), else to the request whose pass on this
-    /// thread runs `set`.
+    /// the fill in-stream, and the release is ordered after its work. Its pin is the request's
+    /// whose pass on this thread runs `set`, else no request's (a hold's outlives requests); its
+    /// fill and trace go to that request, else to `request` (a hold taken before its pass opens).
     pub fn bind(&self, set: SetId, block: u32, stream: usize, request: Option<&Request>) -> Result<Pin> {
-        let req = self.request_id(request)?;
-        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, req, &[], false))
+        let account = self.request_id(request)?;
+        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, None, account, &[], false))
     }
 
     /// [`Memory::bind`] into free bytes only: `Exhausted` at once when they lack the block's,
     /// nothing taken.
     pub fn bind_free(&self, set: SetId, block: u32, stream: usize, request: Option<&Request>) -> Result<Pin> {
-        let req = self.request_id(request)?;
-        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, req, &[], true))
+        let account = self.request_id(request)?;
+        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, None, account, &[], true))
     }
 
     fn request_id(&self, request: Option<&Request>) -> Result<Option<u64>> {
@@ -2032,12 +2032,16 @@ impl Inner {
     }
 
     /// Binds `block` of `set` for `stream`; `claims` are the caller's own preparation pins,
-    /// which hold the page for this bind and never against it.
-    fn bind_for(self: &Arc<Self>, set: u32, block: u32, stream: usize, request: Option<u64>, claims: &[u64], free_only: bool) -> Result<Pin> {
+    /// which hold the page for this bind and never against it. The pin is `request`'s, else the
+    /// request whose pass on this thread runs `set`; its fill and trace go to that request, else
+    /// to `account`.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_for(self: &Arc<Self>, set: u32, block: u32, stream: usize, request: Option<u64>, account: Option<u64>, claims: &[u64], free_only: bool) -> Result<Pin> {
         let key = (set, block);
         let start = Instant::now();
         let mut st = self.lock();
         let req = request.or_else(|| st.binding(set));
+        let acct = req.or(account);
         if st.table.page(key).is_none() {
             return Err(Error::Invalid(format!("no block {block} in set {set}")));
         }
@@ -2056,7 +2060,7 @@ impl Inner {
             let me = std::thread::current().id();
             let mine = pinned && st.pins.iter().filter(|(id, (k, ..))| *k == key && !claims.contains(id)).all(|(_, (.., t))| *t == me);
             // A streamed set's upper block takes a slot rather than a new page (step 2's watermark).
-            match self.stream_in(&mut st, key, req)? {
+            match self.stream_in(&mut st, key, acct)? {
                 StreamIn::Moved => {
                     hit = false;
                     continue;
@@ -2072,7 +2076,7 @@ impl Inner {
                 // Not the set's weights now, and unpinned: filled again in place.
                 Some(h) if h.identity != identity && !h.filling && !pinned => {
                     hit = false;
-                    self.refill_in_place(&mut st, key, req)?;
+                    self.refill_in_place(&mut st, key, acct)?;
                 }
                 Some(h) if (h.identity != identity || h.transforming) && !h.filling && mine => {
                     return Err(Error::Held(format!("block {block} of set {set} is pinned by this thread alone")));
@@ -2104,7 +2108,7 @@ impl Inner {
                     st = self.lock();
                     if let Some(e) = refused {
                         // A streamed set with only its slots left: one of them moves to the block (the floor: one block).
-                        match self.stream_in(&mut st, key, req)? {
+                        match self.stream_in(&mut st, key, acct)? {
                             StreamIn::Moved => continue,
                             StreamIn::Wait => {
                                 waited = true;
@@ -2115,7 +2119,7 @@ impl Inner {
                         }
                     }
                     if !st.homes.contains_key(&key) {
-                        self.map(&mut st, key, req, false)?;
+                        self.map(&mut st, key, acct, false)?;
                     }
                 }
             }
@@ -2141,8 +2145,8 @@ impl Inner {
             r.cursor.next.insert(set, block + 1);
         }
         let name = st.mech(set)?.spec.name.clone();
-        let step = req.and_then(|r| st.table.request(r)).map_or(0, |r| r.cursor.step);
-        if let Some(s) = st.stats(req) {
+        let step = acct.and_then(|r| st.table.request(r)).map_or(0, |r| r.cursor.step);
+        if let Some(s) = st.stats(acct) {
             s.trace.push(Ref { step, set: name, block, bytes: span, origin, speculative });
             if waited || !hit {
                 s.stall_ns += start.elapsed().as_nanos() as u64;

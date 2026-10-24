@@ -363,7 +363,8 @@ impl PyMemory {
     /// Block `block` of `set`, mapped and filled; `stream` (a `CUstream`, 0 the default) waits
     /// on the fill and is the only stream a tensor made from it may be consumed on. With
     /// `evict` false it maps into free bytes only, `Exhausted` at once when they are short. Its
-    /// fill and trace go to `request`, else to the request whose pass on this thread runs `set`.
+    /// fill and trace go to the request whose pass on this thread runs `set`, else to `request`
+    /// (a hold taken before its pass opens); the pin is no request's then.
     #[pyo3(signature = (set, block, stream = 0, evict = true, request = None))]
     fn bind(&self, py: Python<'_>, set: u32, block: u32, stream: usize, evict: bool, request: Option<PyRef<'_, PyRequest>>) -> PyResult<PyPin> {
         let m = self.memory();
