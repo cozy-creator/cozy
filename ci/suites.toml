@@ -64,7 +64,7 @@ rules = [
   { paths = ["scripts/h3*"], select = ["gpu", "pkg:minimax-h3"] },
 ]
 
-# A directory holding a package.toml is a package; `{dir}` is its name. SDXL rides along as the
+# A directory whose pyproject.toml declares a cozy.application entry point is a package; `{dir}` is its name. SDXL rides along as the
 # shared-environment canary. `extra` adds the suites that run a package's own cells (cli: BiRefNet on the CPU).
 [packages.package]
 select = ["gpu", "stress", "pkg:{dir}", "pkg:sdxl", "build:package"]

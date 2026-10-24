@@ -97,7 +97,7 @@ cell() {
 pkg() {
   local pin; pin=$(tr , '\n' <<< "$PINS" | grep -m1 "^$1@" | cut -d@ -f2)
   if [ -n "$pin" ]; then echo "$1/$2@$pin"
-  elif [ -n "$PKGS" ] && [ -f "$PKGS/$1/package.toml" ]; then ln -sfn "$PKGS/$1" "$OUT/$1"; echo "./$1/$2"
+  elif [ -n "$PKGS" ] && grep -qs cozy.application "$PKGS/$1/pyproject.toml"; then ln -sfn "$PKGS/$1" "$OUT/$1"; echo "./$1/$2"
   else echo "$1/$2"; fi
 }
 output() { local n; n=$(awk -F'\t' -v c="$1" '$1==c{print $3}' cells.tsv); ls ~/.cozy/outputs/*/"$n"-* 2>/dev/null | grep -E "\.($2)$" | head -1; }
