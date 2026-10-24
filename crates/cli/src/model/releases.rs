@@ -217,11 +217,23 @@ pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Erro
     }
     let model = repo.to_string();
     let edit = Edit::Delete { tag: tag.clone() };
-    let (_, removed) = edit_repo(&endpoint(ctx, &hub).await?, &model, |old| edit.apply(&model, old)).await?;
+    let tags = edit_repo(&endpoint(ctx, &hub).await?, &model, |old| edit.apply(&model, old)).await;
+    let removed = match (&tag, tags) {
+        (Some(_), tags) => tags?.1,
+        // The whole model: with no tag left no release is live, and the Hub then deletes the model.
+        (None, tags) => {
+            match tags {
+                Err(e) if e.code != "model_not_found" => return Err(e),
+                _ => {}
+            }
+            hub_answer(ctx.hub_signed_in(&hub)?.delete_model(&repo.org, &repo.name).await)?;
+            true
+        }
+    };
     let view = Deleted { model, tag, removed };
     match ctx.json {
         true => output::json(&view),
-        false => Record::of(&view).note("The Hub's GC reclaims the commits no tag names.").print(ctx),
+        false => Record::of(&view).note("The Hub's GC reclaims the objects nothing else names.").print(ctx),
     }
     Ok(ExitCode::SUCCESS)
 }
