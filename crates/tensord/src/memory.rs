@@ -40,18 +40,22 @@ pub struct Gpu {
 }
 
 /// What hosting a GPU's leases takes: who the peers on its listener are, its chunks (none where
-/// TensorD cannot create them: its executors run standalone), and which processes are cozy's.
+/// TensorD cannot create them: its executors run standalone), which processes are cozy's, and
+/// the derived-weights disk cache every GPU's managers share.
 pub struct Leases {
     pub peers: Arc<Peers>,
     pub open: Option<Opener>,
     pub tenants: Tenants,
+    pub derived: Arc<crate::derived::Derived>,
 }
 
-/// One GPU's hosting: its peers, and its free bytes as NVML reads them, which needs no CUDA
-/// context (none where NVML does not open it: the manager reads its open backend's then).
+/// One GPU's hosting: its peers, its free bytes as NVML reads them, which needs no CUDA
+/// context (none where NVML does not open it: the manager reads its open backend's then), and
+/// the derived-weights disk cache.
 struct Hosted {
     peers: Arc<Peers>,
     device: Option<platform::gpu::Device>,
+    derived: Arc<crate::derived::Derived>,
 }
 
 impl Hosting for Hosted {
@@ -85,7 +89,7 @@ impl Gpu {
             .map_err(|error| format!("its listener: {error}"))
             .and_then(|listener| listener.ok_or_else(|| "another process serves its leases".to_string()))
             .and_then(|listener| {
-                let hosting = Arc::new(Hosted { peers: leases.peers, device: platform::gpu::Device::open(&id.uuid).ok() });
+                let hosting = Arc::new(Hosted { peers: leases.peers, device: platform::gpu::Device::open(&id.uuid).ok(), derived: leases.derived });
                 Manager::create(&id, limit, mode, leases.open, listener, hosting).map_err(|error| error.to_string())
             });
         let manager = match manager {

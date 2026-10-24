@@ -652,7 +652,7 @@ pub struct Pool {
     /// The calls running on its GPUs, by request: the host rule reads them.
     running: memory::Running,
     /// The derived-weights disk cache: entries TensorD keeps for the GPU page cache.
-    derived: crate::derived::Derived,
+    derived: Arc<crate::derived::Derived>,
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
@@ -729,10 +729,12 @@ impl Pool {
         let tenants = memory::Tenants::default();
         let uids = [Some(platform::memory::euid()), config.identity.map(|identity| identity.uid)];
         let peers = Arc::new(memory::Peers::new(tenants.clone(), uids.into_iter().flatten().collect(), notes.clone()));
+        let derived = Arc::new(crate::derived::Derived::at(root.join("derived")));
         let leases = |entry: &str| memory::Leases {
             peers: peers.clone(),
             open: memory::row(entry, &config.inventory).and_then(|row| memory::chunks(&row.device_uuid, &notes)),
             tenants: tenants.clone(),
+            derived: derived.clone(),
         };
         let devices: Vec<Device> = envelope.iter().map(|entry| Device {
             entry: entry.clone(),
@@ -785,7 +787,7 @@ impl Pool {
                 levels: Mutex::new(BTreeMap::new()),
                 memo,
                 running,
-                derived: crate::derived::Derived::at(root.join("derived")),
+                derived,
             }
         }))
     }

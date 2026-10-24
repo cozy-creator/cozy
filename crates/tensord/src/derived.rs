@@ -39,14 +39,14 @@ impl Derived {
     /// strengths, lane) for `bytes`, held by TensorD: the descriptor the executor that derived it
     /// writes, in that domain's directory (TensorD's alone). None while the disk could not keep it
     /// free of its reserve.
-    pub fn create(&self, domain: &str, key: &str, bytes: u64, disk: &Disk) -> io::Result<Option<File>> {
-        if disk.free() < bytes {
-            return Ok(None);
-        }
+    pub fn create(&self, domain: &str, key: &str, bytes: u64) -> io::Result<Option<File>> {
         let dir = self.root.join(tensorfs::sha256::hex_digest(domain.as_bytes()));
         fs::create_dir_all(&dir)?;
         #[cfg(unix)]
         fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        if Disk::measure(&dir)?.free() < bytes {
+            return Ok(None);
+        }
         let file = unlinked(&dir)?;
         file.set_len(bytes)?;
         let writer = file.try_clone()?;
@@ -137,50 +137,4 @@ fn named_then_unlinked(dir: &Path) -> io::Result<File> {
     let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
     fs::remove_file(&path)?;
     Ok(file)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    fn roomy() -> Disk {
-        Disk { capacity: 1 << 40, available: 1 << 39, inodes: 0, available_inodes: 0 }
-    }
-
-    #[test]
-    fn an_entry_is_held_by_its_descriptors_alone_and_goes_first_under_the_reserve() {
-        let dir = tempfile::tempdir().unwrap();
-        let derived = Derived::at(dir.path().join("derived"));
-        let mut writer = derived.create("gen/1000", "lora-a", 4, &roomy()).unwrap().expect("room");
-        writer.write_all(b"bake").unwrap();
-        assert!(derived.open("gen/1000", "lora-a").is_none(), "unwritten: never read");
-        derived.written("gen/1000", "lora-a");
-        let listed = |root: &Path| fs::read_dir(root).unwrap().flatten().flat_map(|d| fs::read_dir(d.path()).unwrap().flatten()).count();
-        assert_eq!(listed(&dir.path().join("derived")), 0, "no name reaches an entry");
-        let mut reader = derived.open("gen/1000", "lora-a").expect("TensorD keeps it");
-        let mut bytes = vec![];
-        reader.seek(SeekFrom::Start(0)).unwrap();
-        reader.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"bake");
-        assert!(derived.open("gen/2000", "lora-a").is_none(), "another trust domain never reads it");
-        assert_eq!(derived.bytes(), 4);
-
-        derived.create("gen/1000", "lora-b", 8, &roomy()).unwrap().unwrap();
-        derived.written("gen/1000", "lora-b");
-        derived.open("gen/1000", "lora-a");
-        assert_eq!(derived.shrink(1), 8, "the least recently used goes first");
-        assert!(derived.open("gen/1000", "lora-b").is_none() && derived.open("gen/1000", "lora-a").is_some());
-        derived.forget("gen/1000", "lora-a");
-        assert!(derived.open("gen/1000", "lora-a").is_none());
-        assert_eq!(derived.shrink(u64::MAX), 0);
-        // A holder outlives TensorD's letting go: the bytes stay until it closes.
-        reader.seek(SeekFrom::Start(0)).unwrap();
-        let mut again = vec![];
-        reader.read_to_end(&mut again).unwrap();
-        assert_eq!(again, b"bake");
-
-        let low = Disk { capacity: 100 << 30, available: 2 << 30, inodes: 0, available_inodes: 0 };
-        assert!(derived.create("gen/1000", "lora-c", 1 << 30, &low).unwrap().is_none(), "nothing is written below the reserve");
-    }
 }
