@@ -1129,12 +1129,12 @@ impl Inner {
         self.check_ownership()?;
         let out = crate::caught(f);
         if out.as_ref().err().is_some_and(Error::is_sticky) {
-            self.ownership_lost.store(true, Ordering::Release);
-            self.landed.notify_all();
+            self.lose_ownership();
         }
         if matches!(&out, Err(Error::Internal(m)) if m.starts_with("panic")) {
             self.recover();
         }
+        if !out.as_ref().err().is_some_and(Error::is_sticky) { self.check_ownership()?; }
         out
     }
 
@@ -1142,6 +1142,14 @@ impl Inner {
         if self.ownership_lost.load(Ordering::Acquire) {
             Err(Error::Ownership("consumer completion failed; retire this executor".into()))
         } else { Ok(()) }
+    }
+
+    fn lose_ownership(&self) {
+        self.ownership_lost.store(true, Ordering::Release);
+        if let Some(torch) = self.torch.get() {
+            torch.poison(&Error::Ownership("weight or region ownership is unproven".into()));
+        }
+        self.landed.notify_all();
     }
 
     /// After a panic: the table's pages derived again from the homes (each recorded in the same
@@ -1478,7 +1486,7 @@ impl Inner {
         let mut sticky = false;
         let mut st = self.state.lock();
         if !drained {
-            self.ownership_lost.store(true, Ordering::Release);
+            self.lose_ownership();
             std::mem::forget(self.clone());
         }
         for ((job, (.., span)), landed) in pages.iter().zip(landed) {
@@ -1546,7 +1554,7 @@ impl Inner {
                 }
             }
         }
-        if sticky { self.ownership_lost.store(true, Ordering::Release); }
+        if sticky { self.lose_ownership(); }
         self.unlock(st);
         self.landed.notify_all();
     }
@@ -1598,7 +1606,7 @@ impl Inner {
         let drained = self.backend.drain().is_ok();
         let mut st = self.state.lock();
         let e = if drained { e } else {
-            self.ownership_lost.store(true, Ordering::Release);
+            self.lose_ownership();
             std::mem::forget(self.clone());
             Error::Ownership(format!("fill panicked ({e}); its copies did not drain"))
         };
@@ -2355,7 +2363,7 @@ impl Inner {
                 Ok(Ok(true)) => return,
                 Ok(Ok(false)) => {}
                 Ok(Err(_)) | Err(_) => {
-                    self.ownership_lost.store(true, Ordering::Release);
+                    self.lose_ownership();
                     self._device.retiring(true);
                     self.landed.notify_all();
                     std::mem::forget(self);
@@ -2619,7 +2627,7 @@ impl Inner {
     /// Memory whose release could not be proved: this executor is quarantined, and it leaks
     /// rather than reuse what another may still hold.
     fn lost_backing(self: &Arc<Self>, why: impl std::fmt::Display) -> Error {
-        self.ownership_lost.store(true, Ordering::Release);
+        self.lose_ownership();
         self._device.retiring(true);
         self.landed.notify_all();
         std::mem::forget(self.clone());
@@ -2649,7 +2657,7 @@ impl Inner {
                 if let Err(error) = released {
                     tracing::warn!("varena: renewed page ownership could not be released: {error}");
                     let st = self.state.lock();
-                    self.ownership_lost.store(true, Ordering::Release);
+                    self.lose_ownership();
                     drop(st);
                     self.landed.notify_all();
                     std::mem::forget((self.clone(), old, after));
@@ -2669,7 +2677,7 @@ impl Inner {
                 if let Err(error) = self.backend.finish(ready).and_then(|()| self.backend.unmap(va, off, span)) {
                     tracing::warn!("varena: page ownership could not be released: {error}");
                     let st = self.state.lock();
-                    self.ownership_lost.store(true, Ordering::Release);
+                    self.lose_ownership();
                     drop(st);
                     self.landed.notify_all();
                     std::mem::forget((self.clone(), phys, ready));

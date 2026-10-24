@@ -44,6 +44,10 @@ pub struct Allocating {
 }
 
 impl Memory {
+    /// An allocator callback could not preserve its invariants. No resource on this device
+    /// may be reused; the next operation reports Ownership so the executor retires.
+    pub fn quarantine_allocator(&self) { self.inner.lose_ownership(); }
+
     /// Serves torch's allocations from `source`, once, before any is made.
     pub fn serve_torch(&self, source: Arc<dyn Source>) -> Result<Arc<Torch>> {
         let weak = Arc::downgrade(&self.inner);
