@@ -63,7 +63,7 @@ tfs_straggler() {
   TENSORFS_HOME=$T/$1-store uv tool run -q --from "${TWF:-tensorfs}" tfs --endpoint "http://127.0.0.1:$port" --json \
     download birefnet --dir "$T/$1-out" >"$T/$1.out" 2>"$T/$1.err"
   printf '%s\t%s\t%s\n' "$1" "$?" "$(( $(date +%s%3N) - t0 ))" >> "$T/straggler.tsv"
-  kill "$pid"; wait "$pid" 2>/dev/null
+  kill "$pid"; wait "$pid" 2>/dev/null || true  # the proxy ends on TERM
   rm -rf "$T/$1-store" "$T/$1-out"
   log "tensorfs $1: $(tail -n 1 "$T/straggler.tsv")"
 }
