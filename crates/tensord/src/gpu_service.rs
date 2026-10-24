@@ -642,6 +642,8 @@ pub struct Pool {
     engine: std::sync::OnceLock<Weak<Engine>>,
     /// Rows the ledgers named stalled at the last look: each is ended once.
     stalled: Mutex<std::collections::BTreeSet<u32>>,
+    /// Idle executors a GPU's manager asked TensorD to end (`end_asked_idle`).
+    ending: Arc<memory::Ending>,
     /// The host rule's watcher, while the pool lives; nudged to look when a call begins, an
     /// executor's frame comes or a ledger signals.
     host: Option<Arc<memory::Host>>,
@@ -730,11 +732,13 @@ impl Pool {
         let uids = [Some(platform::memory::euid()), config.identity.map(|identity| identity.uid)];
         let peers = Arc::new(memory::Peers::new(tenants.clone(), uids.into_iter().flatten().collect(), notes.clone()));
         let derived = Arc::new(crate::derived::Derived::at(root.join("derived")));
+        let ending = memory::Ending::new()?;
         let leases = |entry: &str| memory::Leases {
             peers: peers.clone(),
             open: memory::row(entry, &config.inventory).and_then(|row| memory::chunks(&row.device_uuid, &notes)),
             tenants: tenants.clone(),
             derived: derived.clone(),
+            ending: ending.clone(),
         };
         let devices: Vec<Device> = envelope.iter().map(|entry| Device {
             entry: entry.clone(),
@@ -747,11 +751,12 @@ impl Pool {
         let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
         Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
             let gpus = devices.iter().filter_map(|d| d.memory.clone()).map(memory::Source::Gpu);
-            let sources: Vec<memory::Source> = gpus.chain(host.clone().map(memory::Source::Host)).collect();
+            let sources: Vec<memory::Source> = gpus.chain(host.clone().map(memory::Source::Host)).chain([memory::Source::Ending(ending.clone())]).collect();
             let pool = pool.clone();
             let woke = move |woke| match (pool.upgrade(), woke) {
                 (Some(pool), memory::Woke::Gpu) => pool.memory_changed(),
                 (Some(pool), memory::Woke::HostShort) => pool.host_short(),
+                (Some(pool), memory::Woke::Ending) => pool.end_asked_idle(),
                 (None, _) => {}
             };
             let events = match sources.is_empty() {
@@ -769,6 +774,7 @@ impl Pool {
                 peaks,
                 engine: Default::default(),
                 stalled: Mutex::default(),
+                ending,
                 host,
                 _events: events,
                 incarnation,
@@ -928,6 +934,23 @@ impl Pool {
             "killed": killed.as_ref().map_or_else(|e| e.to_string(), |_| "yes".into())}));
         if let Some(session) = self.take_idle(&plan, start, &birth) {
             self.end_idle(&plan, start, session);
+        }
+    }
+    /// Each executor a GPU's manager asked to end (its pins hold room a waiting ask needs) whose
+    /// session is still idle is killed (its scope with it) and reaped: its exit releases the
+    /// room. One handed a request meanwhile is never ended (the ask waits on it running); one
+    /// that is not an idle session is left, and the manager refuses the ask at its stall looks.
+    fn end_asked_idle(&self) {
+        for pid in self.ending.take() {
+            let tenant = self.tenants.lock().unwrap().get(&pid).map(|t| (t.plan.clone(), t.start, t.exact.birth().clone()));
+            let session = tenant.as_ref().and_then(|(plan, start, birth)| self.take_idle(plan, *start, birth).map(|s| (plan, *start, s)));
+            self.notes.note(serde_json::json!({"event": "end_idle", "pid": pid, "ended": session.is_some()}));
+            if let Some((plan, start, session)) = session {
+                if let Err(error) = session.executor.kill() {
+                    tracing::warn!("memory: killing idle executor {pid}: {error}");
+                }
+                self.end_idle(plan, start, session);
+            }
         }
     }
     /// The pool's idle session of `plan` at `start` whose executor is `birth`, taken out of it.
@@ -2904,17 +2927,19 @@ impl Pool {
         }
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
         let lost = self.lost_followers(start, degree, &session.followers);
-        if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
-            // Its GPU state lost, it is killed now: a graceful end could spin on that state and
-            // keep its leases from every later call.
-            if !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
+        let lost_state = !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty();
+        if !reply.ok || lost_state {
+            // Its GPU state lost: it may have faulted on its GPUs, so their kept pages go and its
+            // own are destroyed at its exit, never kept for another; and it is killed now, since
+            // a graceful end could spin on that state and keep its leases from every later call.
+            // A plain failure (quiescent) is the package's on a healthy GPU: its pages stay.
+            if lost_state {
+                let pids: Vec<u32> = std::iter::once(session.executor.birth.pid).chain(session.followers.iter().map(|f| f.birth().pid)).collect();
+                gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.fault(&pids));
                 if let Err(error) = session.executor.kill() {
                     tracing::warn!("run {id}: killing its unsettled executor: {error}");
                 }
             }
-            // It may have faulted on its GPUs: their kept pages go.
-            let pids: Vec<u32> = std::iter::once(session.executor.birth.pid).chain(session.followers.iter().map(|f| f.birth().pid)).collect();
-            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.fault(&pids));
             // The author's failure keeps its traceback and origin in triage; the executor's
             // end would record only "executor_ended".
             if let Some(outcome) = reply.outcome.as_ref().filter(|o| !o.traceback.is_empty()) {
