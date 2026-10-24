@@ -322,6 +322,7 @@ impl Shared {
     fn quiesce(&self, streams: &[usize]) -> Result<bool> {
         let Some(need) = self.stamps(streams) else { return Ok(false) };
         loop {
+            self.check_ownership()?;
             let seen = *self.progress.0.lock();
             if let Some((c, _)) = need.iter().find(|(c, n)| !c.passed(*n) && c.lost.load(Acquire)) {
                 return Err(Error::Internal(format!("stream {:#x} lost its epochs: a region on it cannot be proven idle", c.stream)));
@@ -332,6 +333,7 @@ impl Shared {
             self.kick();
             let mut p = self.progress.0.lock();
             while *p == seen {
+                self.check_ownership()?;
                 self.progress.1.wait(&mut p);
             }
         }

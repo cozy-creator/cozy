@@ -407,3 +407,30 @@ fn a_free_during_eviction_is_deferred_until_copying_finishes() {
     assert_eq!(contents, [124; 16]);
     t.free(pointers[1], 1 << 20, 2);
 }
+
+#[test]
+fn standalone_reclaims_small_idle_spans_before_cold_weights() {
+    let (memory, _) = loaded_memory("standalone-idle-before-weights");
+    let torch = memory.torch().unwrap();
+    let blocks: Vec<_> = (1..=16)
+        .map(|stream| (stream, memory.torch_alloc(1 << 20, stream, None).unwrap()))
+        .collect();
+    for (stream, pointer) in blocks {
+        memory.torch_free(pointer, 1 << 20, stream);
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while torch.idle().0 < 32 << 20 {
+        assert!(
+            std::time::Instant::now() < until,
+            "the host backend's epochs did not complete"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let pointer = memory.torch_alloc(31 << 20, 0, None).unwrap();
+    assert_eq!(
+        memory.classes()[3],
+        32 << 20,
+        "cold weights should survive reclaimable idle torch chunks"
+    );
+    memory.torch_free(pointer, 31 << 20, 0);
+}

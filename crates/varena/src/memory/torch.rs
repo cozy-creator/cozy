@@ -179,6 +179,12 @@ impl Source for Standalone {
         let memory = self.memory.upgrade().ok_or_else(|| Error::Closed("standalone memory".into()))?;
         memory.guard(|| {
             memory.check_ownership()?;
+            // Individually small idle spans may not fit this allocation together. Return
+            // their chunks before evicting weights to obtain a contiguous virtual span.
+            let short = va.len.saturating_sub(memory.allowance.left());
+            if short > 0 {
+                if let Some(torch) = memory.torch.get() { torch.reclaim(short); }
+            }
             memory.make_room(va.len, &[], "torch", None, false)?;
             self.direct.map(va, kind, into)
         })
