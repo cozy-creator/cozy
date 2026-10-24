@@ -80,6 +80,8 @@ pub struct Executor {
     pub graphs: Vec<Graph>,
     /// Executors whose pins its waiting ask counts on (its last [`Answer::Wait`]).
     pub waits_on: Vec<u64>,
+    /// Its GPU work is running (its agent's busy flag): pins it holds go at its step's end.
+    pub busy: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -92,8 +94,9 @@ pub struct Chunk {
     pub pins: u32,
     /// A reclaim request is out for it.
     pub asked: bool,
-    /// Asked back across the stall look's looks and still held: its own executor's ask never
-    /// counts on it (its return waits on that process's own progress, a cycle of one).
+    /// Asked back across the stall look's looks and still held. Its own executor's ask never
+    /// counts on it (its return waits on that process's own progress, a cycle of one), nor does
+    /// any ask while its holder runs no GPU work (an idle executor's long-lived pins).
     pub overdue: bool,
     pub advice: Advice,
 }
@@ -300,10 +303,15 @@ fn coming(s: &Snapshot, asker: Option<u64>, cyclic: &BTreeSet<u64>) -> (u64, u64
     let (mut bytes, mut later, mut on) = (0, 0, BTreeSet::new());
     for e in &s.executors {
         for c in &e.chunks {
+            // Held past the stall look by the asker itself, or by an executor running nothing:
+            // never coming.
+            if c.asked && c.overdue && (asker == Some(e.id) || !e.busy) && c.state == State::Mapped {
+                continue;
+            }
             match c.state {
                 State::Granted if asker.is_some_and(|a| a != e.id) => later += c.bytes,
                 State::Revoking | State::Released | State::Refused => bytes += c.bytes,
-                State::Mapped if c.asked && c.pins == 0 && !(c.overdue && asker == Some(e.id)) => bytes += c.bytes,
+                State::Mapped if c.asked && c.pins == 0 => bytes += c.bytes,
                 State::Mapped if c.asked && Some(e.id) != asker && !cyclic.contains(&e.id) => {
                     bytes += c.bytes;
                     on.insert(e.id);

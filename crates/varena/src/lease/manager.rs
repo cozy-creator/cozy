@@ -474,7 +474,7 @@ impl Manager {
         let (mut out, mut records, mut again) = (false, vec![], false);
         for e in b.executors.values_mut() {
             out |= !e.asked.is_empty();
-            again |= !e.waiting.is_empty() && e.asked.values().any(|at| at.elapsed() >= LOOK * LOOKS);
+            again |= e.asked.values().any(|at| at.elapsed() >= LOOK * LOOKS);
             // An ask a pin holds is reported once it waited the looks, never judged.
             for (slot, at) in &e.asked {
                 let held = e.table.word(*slot).filter(|w| w.state == State::Mapped && w.pins > 0);
@@ -497,7 +497,8 @@ impl Manager {
                 records.push(Record::Stalled { pid: e.pid, looks: e.still, waited_ms: u64::try_from(oldest.elapsed().as_millis()).unwrap_or(u64::MAX) });
             }
         }
-        (out, records, again)
+        let waiting = b.executors.values().any(|e| !e.waiting.is_empty());
+        (out, records, again && waiting)
     }
 
     /// A decision with no event behind it (the look found a waiting ask's own chunks overdue).
@@ -1088,7 +1089,7 @@ impl Manager {
                     kind => regions.push(policy::Region { id: *rid, chunks: f.slots.clone(), swappable: kind == crate::region::Reclaimable::Swappable, last_use: f.last_use, next_use, produce_ns: f.cost_ns }),
                 }
             }
-            executors.push(policy::Executor { id: *id, chunks: e.leased.iter().filter_map(chunk).collect(), regions, graphs, waits_on });
+            executors.push(policy::Executor { id: *id, chunks: e.leased.iter().filter_map(chunk).collect(), regions, graphs, waits_on, busy: e.table.busy() });
         }
         let page_cache = cache.iter().map(|k| b.retained.get(k).map_or(0, |v| v.values().map(|p| p.len).sum())).collect();
         let host = b.sample.map(|s| s.host).unwrap_or_default();
