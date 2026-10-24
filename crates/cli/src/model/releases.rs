@@ -127,7 +127,7 @@ async fn edit_repo(
 }
 
 /// TensorFS's refusal as the CLI's; its detail carries the endpoint's own code and message.
-fn failed(failure: Failure) -> Error {
+pub(super) fn failed(failure: Failure) -> Error {
     use tensorfs::Kind as T;
     let kind = match failure.kind {
         T::Conflict => Kind::Conflict,
@@ -142,7 +142,7 @@ fn failed(failure: Failure) -> Error {
 
 /// `hub`'s distribution endpoint as this computer's signed-in user, trusting the private CA the
 /// Hub names (a test Hub's).
-async fn endpoint(ctx: &Context, hub: &Hub) -> Result<Endpoint, Error> {
+pub(super) async fn endpoint(ctx: &Context, hub: &Hub) -> Result<Endpoint, Error> {
     let client = ctx.hub_signed_in(hub)?;
     let hub_client::Credential::User(session) = client.credential() else {
         unreachable!("a signed-in client");

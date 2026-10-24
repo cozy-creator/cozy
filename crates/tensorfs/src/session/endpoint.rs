@@ -71,6 +71,11 @@ impl Endpoint {
         self.inner.repo(repo_id).await.map_err(from_native)
     }
 
+    /// A small object read whole and verified, never cached: a commit's tree or a variant's header.
+    pub async fn document(&self, object: &ObjectRef) -> Result<Vec<u8>> {
+        self.inner.document(object).await.map_err(from_native)
+    }
+
     /// `revision` of `repo_id` as a commit, without opening a variant or filling a cache: a tag,
     /// a tag's commit or a header's commit (spec §7), else (`sha256:<hex>`) a commit the endpoint
     /// holds that no tag names. The tag it resolved through, if any.
