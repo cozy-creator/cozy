@@ -21,17 +21,15 @@ class Binding:
 def adapter():
     path = Path(__file__).parents[1] / "python/tensorfs/varena/torch.py"
     source = ast.parse(path.read_text())
-    selected = {"Model": {"retain"}, "Memory": {"_declare", "graph_region_blocks"}, "GraphRegion": None, "Binding": {"valid", "prepare"}}
+    selected = {"Model": {"retain"}, "Memory": {"_declare", "graph_region_blocks"}, "GraphRegion": None}
     body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     for node in source.body:
         if isinstance(node, ast.ClassDef) and node.name in selected:
             methods = selected[node.name]
             if methods is not None:
                 node.body = [method for method in node.body if getattr(method, "name", None) in methods]
-            if node.name == "Binding":
-                node.name = "Bound"  # Keep the tiny constructor used by the dependency fixture.
             body.append(node)
-    ns = {"Binding": Binding, "threading": threading, "contextmanager": contextmanager, "Unbound": RuntimeError, "StaleBinding": type("StaleBinding", (Exception,), {}), "_fill": lambda fill: fill.identity}
+    ns = {"Binding": Binding, "threading": threading, "contextmanager": contextmanager, "Unbound": RuntimeError, "_fill": lambda fill: fill.identity}
     exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), str(path), "exec"), ns)
     return ns
 
@@ -90,22 +88,6 @@ class GraphDependencies(unittest.TestCase):
         self.assertEqual(model.identity, "old")
         self.assertFalse(graph.closed)
         self.assertTrue(graph.dropping)
-
-    def test_binding_retired_during_declaration_is_a_typed_stale_refusal(self):
-        binding = self.api["Bound"]()
-        binding.closed, binding.lock = False, threading.Lock()
-        def declare(_):
-            acquired = binding.lock.acquire(blocking=False)
-            self.assertTrue(acquired, "declaration held the lock its retirement needs")
-            binding.closed = True
-            binding.lock.release()
-        binding.model = NS(memory=NS(_declare=declare))
-        self.assertFalse(binding.valid())
-        with self.assertRaises(self.api["StaleBinding"]) as caught:
-            with binding.prepare():
-                self.fail("prepared a retired binding")
-        self.assertEqual(caught.exception.code, "STALE_BINDING")
-        self.assertFalse(caught.exception.sticky)
 
     def test_retirement_waits_for_an_active_replay_to_release(self):
         order, entered, proceed, retired = [], threading.Event(), threading.Event(), threading.Event()

@@ -345,8 +345,6 @@ class Binding:
     def valid(self) -> bool:
         # Retirement may close other bindings of this model. Declare before taking this
         # binding's lock, so concurrent validators cannot each hold a lock retirement needs.
-        if self.closed:
-            return False
         self.model.memory._declare(self.model)
         with self.lock:
             if self.closed:
@@ -365,9 +363,7 @@ class Binding:
         memory._declare(self.model)
         with self.lock:
             if self.closed:
-                error = StaleBinding("graph binding retired before its fill changed")
-                error.code, error.sticky, error.cuda_code = "STALE_BINDING", False, None
-                raise error
+                raise StaleBinding("graph binding retired before its fill changed")
             if memory.cuda:
                 if torch.cuda.is_current_stream_capturing():
                     raise Unbound("graph residency must be prepared before capture")
