@@ -73,6 +73,14 @@ pub struct Identity {
     pub domain: String,
 }
 
+/// A request waiting on this descendant, as TensorD's call tree establishes it. Its future
+/// working set may yield; the chunks its participating processes still pin do not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ancestor {
+    pub request: String,
+    pub pids: Vec<u32>,
+}
+
 /// What the manager did, for its host's memory log.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -756,9 +764,7 @@ impl Manager {
         match m {
             Measured::Request { request, working, compute, host } => {
                 let Some(key) = b.dispatched.get(&request).cloned() else { return Out::default() };
-                larger(&mut b.figures, format!("peak/{key}"), working);
-                b.figures.insert(format!("compute/{key}"), compute);
-                larger(&mut b.figures, format!("host/{key}"), host);
+                Self::record_request(&mut b, &key, working, compute, host);
             }
             Measured::Set { name, bytes } => larger(&mut b.figures, format!("set/{name}"), bytes),
         }
@@ -806,24 +812,43 @@ impl Manager {
         b.dispatched.values().map(|key| figure(b, "peak", key)).collect()
     }
 
-    /// Whether a request of `package` at `shape` (empty: its widest measured shape) can start now
-    /// beside every request dispatched here ([`decide::fits`]): their measured peaks and its own
-    /// within the usable bytes; anything unmeasured only on an idle GPU. A request that does not
-    /// fit queues before it starts, so two never wait on each other's protected steps.
+    /// Whether a request of `package` at `shape` (empty: its widest measured shape) can start now.
     pub fn fits(&self, package: &str, shape: &str) -> bool {
         self.refresh();
-        let b = self.books.lock();
-        decide::fits(Self::usable(&b), 0, &[], &Self::dispatched_peaks(&b), figure(&b, "peak", &format!("{package}|{shape}")), None)
+        Self::fits_with(&self.books.lock(), &format!("{package}|{shape}"), &[])
     }
 
-    /// A multi-GPU group: dispatches `request` on every GPU of `group` if it fits on all, else
-    /// on none.
-    pub fn admit(group: &[&Manager], request: &str, package: &str, shape: &str) -> Result<bool> {
-        if !group.iter().all(|m| m.fits(package, shape)) {
+    fn fits_with(b: &Books, key: &str, ancestors: &[Ancestor]) -> bool {
+        let yielding: BTreeSet<&str> = ancestors.iter().map(|a| a.request.as_str()).collect();
+        let pids: BTreeSet<u32> = ancestors.iter().flat_map(|a| a.pids.iter().copied()).collect();
+        let pinned: u64 = b.executors.values().filter(|e| pids.contains(&e.pid)).flat_map(|e| {
+            e.leased.iter().filter(|(slot, lease)| {
+                e.table.word(**slot).is_none_or(|w| w.seq != lease.seq || w.state != State::Mapped || w.pins > 0)
+            }).map(|(_, lease)| lease.phys.len)
+        }).sum();
+        let peaks: Vec<Option<u64>> = b.dispatched.iter().filter(|(id, _)| !yielding.contains(id.as_str()))
+            .map(|(_, key)| figure(b, "peak", key)).collect();
+        // Only a waiting ancestor's future peak yields. Its still-held pins remain charged.
+        // Alone, an unmeasured child may try its allocations (and fail for capacity); waiting
+        // for its ancestor to finish would deadlock the call tree.
+        decide::fits(Self::usable(b).saturating_sub(pinned), 0, &[], &peaks, figure(b, "peak", key), None)
+    }
+
+    /// A multi-GPU group: checks and reserves every GPU atomically. `ancestors` are only the
+    /// waiting ancestors of this request, never its siblings or unrelated calls. Lock order is
+    /// process-local manager address order, independent of the caller's device order.
+    pub fn admit(group: &[&Manager], request: &str, package: &str, shape: &str, ancestors: &[Ancestor]) -> Result<bool> {
+        let mut group = group.to_vec();
+        group.sort_unstable_by_key(|m| *m as *const Manager as usize);
+        group.dedup_by_key(|m| *m as *const Manager as usize);
+        group.iter().for_each(|m| m.refresh());
+        let mut books: Vec<_> = group.iter().map(|m| m.books.lock()).collect();
+        let key = format!("{package}|{shape}");
+        if !books.iter().all(|b| Self::fits_with(b, &key, ancestors)) {
             return Ok(false);
         }
-        for m in group {
-            m.dispatch(request, package, shape)?;
+        for b in &mut books {
+            b.dispatched.insert(request.to_string(), key.clone());
         }
         Ok(true)
     }
@@ -835,7 +860,27 @@ impl Manager {
     }
 
     pub fn undispatch(&self, request: &str) {
-        self.books.lock().dispatched.remove(request);
+        self.complete(request, None);
+    }
+
+    /// TensorD's settled Invoke reply carries each rank's final stats on the same path as its
+    /// completion. Record them before removing the dispatch key, so a delayed lease-socket
+    /// measurement cannot lose the request's peaks. No completed-request tombstones are needed.
+    pub fn complete(&self, request: &str, stats: Option<&crate::Stats>) {
+        let mut b = self.books.lock();
+        if let Some(key) = b.dispatched.remove(request) {
+            if let Some(stats) = stats.filter(|stats| stats.request == request) {
+                Self::record_request(&mut b, &key, stats.peak, stats.compute, stats.host.unwrap_or(0));
+            }
+        }
+        drop(b);
+        self.events.set();
+    }
+
+    fn record_request(b: &mut Books, key: &str, working: u64, compute: u64, host: u64) {
+        larger(&mut b.figures, format!("peak/{key}"), working);
+        b.figures.insert(format!("compute/{key}"), compute);
+        larger(&mut b.figures, format!("host/{key}"), host);
     }
 
     /// The GPU of `group` (an index) that keeps each set of `package`'s request at `shape`
@@ -879,14 +924,14 @@ impl Manager {
         b.figures.iter().filter_map(peak).collect()
     }
 
-    /// Peaks saved earlier on this machine for this GPU model: what this run measured wins (sets
-    /// and host peaks: the larger).
+    /// Peaks saved earlier for this GPU model: merge every card's records conservatively.
+    /// Neither iteration order nor a smaller duplicate may erase a measured high-water mark.
     pub fn restore(&self, peaks: &[Peak]) -> Result<()> {
         let mut b = self.books.lock();
         for p in peaks {
             match p {
-                Peak::Request { key, bytes } => drop(b.figures.entry(format!("peak/{key}")).or_insert(*bytes)),
-                Peak::Compute { key, bytes } => drop(b.figures.entry(format!("compute/{key}")).or_insert(*bytes)),
+                Peak::Request { key, bytes } => larger(&mut b.figures, format!("peak/{key}"), *bytes),
+                Peak::Compute { key, bytes } => larger(&mut b.figures, format!("compute/{key}"), *bytes),
                 Peak::Set { key, bytes } => larger(&mut b.figures, format!("set/{key}"), *bytes),
                 Peak::Host { key, bytes } => larger(&mut b.figures, format!("host/{key}"), *bytes),
             }
@@ -1347,3 +1392,7 @@ fn look_loop(manager: &Weak<Manager>) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "manager_tests.rs"]
+mod tests;

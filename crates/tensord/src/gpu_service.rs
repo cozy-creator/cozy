@@ -2824,9 +2824,15 @@ impl Pool {
         // left out: the parent waits on it.
         let shape = shape(&prepared.features);
         let managers: Vec<&varena::lease::Manager> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &*m.manager).collect();
-        let admitted = memory::admit(engine, &managers, id, &construction, &shape);
-        let call = memory::Call { pid: session.executor.birth.pid, package: construction.clone(), shape: shape.clone() };
-        let _dispatched = Dispatched { gpus, id: id.into(), running: self.running.clone() };
+        let ancestors = memory::ancestors(engine, &self.running, &record, calls.map(Arc::as_ref))?;
+        let admitted = memory::admit(engine, &managers, id, &construction, &shape, &ancestors);
+        let pids: Vec<u32> = std::iter::once(session.executor.birth.pid).chain(session.followers.iter().map(|f| f.birth().pid)).collect();
+        let ranks = gpus.iter().enumerate().map(|(rank, gpu)| memory::Rank {
+            pid: pids.get(rank).copied().unwrap_or(session.executor.birth.pid),
+            gpu: memory::row(&gpu.entry, &self.config.inventory).map_or_else(|| gpu.entry.clone(), |row| row.device_uuid.clone()),
+        }).collect();
+        let call = memory::Call { ranks, package: construction.clone(), shape: shape.clone() };
+        let mut dispatched = Dispatched { gpus, id: id.into(), running: self.running.clone(), measured: vec![None; gpus.len()] };
         self.running.lock().unwrap().insert(id.into(), call);
         if !admitted? {
             // Canceled while it waited for room: it never started.
@@ -2893,6 +2899,7 @@ impl Pool {
         );
         session.executor.waits = None;
         let reply = reply?;
+        dispatched.record(&reply, &self.config.inventory);
         session.level = Level::Gpu;
         self.record_invoke(&construction, &lane, first, invoked.elapsed(), &reply);
         self.note_decisions(id, session.executor.birth.pid, &lane, &reply);
@@ -3128,11 +3135,51 @@ struct Dispatched<'a> {
     gpus: &'a [Device],
     id: String,
     running: memory::Running,
+    measured: Vec<Option<varena::Stats>>,
 }
+
+#[derive(Deserialize)]
+struct GpuMeasurement {
+    gpu: u32,
+    stats: RequestFigures,
+}
+
+/// Only the figures admission learns, without copying a request's potentially large trace.
+#[derive(Deserialize)]
+struct RequestFigures {
+    request: String,
+    peak: u64,
+    #[serde(default)]
+    compute: u64,
+    #[serde(default)]
+    host: Option<u64>,
+}
+
+impl Dispatched<'_> {
+    fn record(&mut self, reply: &Frame, inventory: &[crate::machine::receipt::Gpu]) {
+        let Some(value) = reply.memory.as_ref().and_then(|m| m.get("varena")) else { return };
+        let rows: Vec<GpuMeasurement> = match serde_json::from_value(value.clone()) {
+            Ok(rows) => rows,
+            Err(error) => return tracing::warn!("memory: request {}'s final figures unread: {error}", self.id),
+        };
+        for (gpu, measured) in self.gpus.iter().zip(&mut self.measured) {
+            let Some(index) = memory::row(&gpu.entry, inventory).map(|row| row.device_index) else { continue };
+            *measured = rows.iter().find(|row| row.gpu == index && row.stats.request == self.id).map(|row| varena::Stats {
+                request: row.stats.request.clone(), peak: row.stats.peak, compute: row.stats.compute,
+                host: row.stats.host, ..Default::default()
+            });
+        }
+    }
+}
+
 impl Drop for Dispatched<'_> {
     fn drop(&mut self) {
         self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
-        self.gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.undispatch(&self.id));
+        for (gpu, stats) in self.gpus.iter().zip(&self.measured) {
+            if let Some(memory) = &gpu.memory {
+                memory.manager.complete(&self.id, stats.as_ref());
+            }
+        }
     }
 }
 

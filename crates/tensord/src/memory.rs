@@ -24,7 +24,7 @@ use platform::{
 };
 use varena::lease::{
     manager::{Opener, Record},
-    Hosting, Identity, Manager, Mode, Peak,
+    Ancestor, Hosting, Identity, Manager, Mode, Peak,
 };
 use varena::{Backend, CudaBackend, GpuId};
 
@@ -36,6 +36,7 @@ const ROTATE_BYTES: u64 = 4 << 20;
 pub struct Gpu {
     pub manager: Arc<Manager>,
     pub model: String,
+    pub uuid: String,
     watch: Arc<Watch>,
 }
 
@@ -124,7 +125,7 @@ impl Gpu {
         peaks.restore(&id.model, &manager);
         log.note(serde_json::json!({"event": "manager", "gpu": entry, "card": id.memory, "chunks": chunks}));
         let watch = Watch::start(&id.uuid, manager.clone(), leases.tenants, log);
-        Some(Gpu { manager, model: id.model, watch })
+        Some(Gpu { manager, model: id.model, uuid: id.uuid, watch })
     }
 
     /// Executors to end: those answering no revoke.
@@ -429,10 +430,10 @@ fn shareable(uuid: &str) -> Result<i32, String> {
 /// engine's activity, which every manager event and every cancel bumps, and asks again: running
 /// requests end, and a GPU nothing runs on always admits. False: it was canceled meanwhile. A
 /// manager that cannot answer lets it run unrecorded.
-pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, shape: &str) -> io::Result<bool> {
+pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, shape: &str, ancestors: &[Ancestor]) -> io::Result<bool> {
     loop {
         let seen = engine.activity_epoch();
-        match Manager::admit(managers, id, package, shape) {
+        match Manager::admit(managers, id, package, shape, ancestors) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(error) => {
@@ -496,12 +497,7 @@ impl Peaks {
     /// hold, when it changed.
     pub fn save<'a>(&self, model: &str, managers: impl Iterator<Item = &'a Manager>) {
         let mut saved = self.saved.lock().unwrap();
-        let mut held: Vec<Peak> = vec![];
-        for peak in managers.flat_map(Manager::peaks) {
-            if !held.contains(&peak) {
-                held.push(peak);
-            }
-        }
+        let held = merge_peaks(managers.flat_map(Manager::peaks));
         if saved.get(model).is_some_and(|before| before.len() == held.len() && held.iter().all(|peak| before.contains(peak))) {
             return;
         }
@@ -515,20 +511,67 @@ impl Peaks {
     }
 }
 
-/// One call running on the machine's GPUs: its executor and its `<package>|<shape>`.
+/// Canonical high-water marks across every GPU of a model, independent of iteration order.
+fn merge_peaks(peaks: impl Iterator<Item = Peak>) -> Vec<Peak> {
+    let mut merged = BTreeMap::<(u8, String), u64>::new();
+    for peak in peaks {
+        let (kind, key, bytes) = match peak {
+            Peak::Request { key, bytes } => (0, key, bytes),
+            Peak::Compute { key, bytes } => (1, key, bytes),
+            Peak::Set { key, bytes } => (2, key, bytes),
+            Peak::Host { key, bytes } => (3, key, bytes),
+        };
+        let held = merged.entry((kind, key)).or_insert(bytes);
+        *held = (*held).max(bytes);
+    }
+    merged.into_iter().map(|((kind, key), bytes)| match kind {
+        0 => Peak::Request { key, bytes },
+        1 => Peak::Compute { key, bytes },
+        2 => Peak::Set { key, bytes },
+        _ => Peak::Host { key, bytes },
+    }).collect()
+}
+
+/// One process on a call's GPU. A single process may own several GPUs; a group has one per rank.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rank {
+    pub pid: u32,
+    pub gpu: String,
+}
+
+/// One call running on the machine's GPUs: every participant and its `<package>|<shape>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Call {
-    pub pid: u32,
+    pub ranks: Vec<Rank>,
     pub package: String,
     pub shape: String,
 }
 
-/// The calls running now, by request: TensorD's own record (admitted until they end), which the
-/// host rule reads beside each GPU's measured host peaks.
+/// TensorD's calls admitted until they end, including each follower the host rule must watch.
 pub type Running = Arc<Mutex<BTreeMap<String, Call>>>;
 
-/// A process running calls, as the host rule reads it: its calls' measured anonymous peak (none
-/// while one is unmeasured), its anonymous bytes now, and how many calls it runs.
+/// Waiting ancestors established by TensorD's own call tree. Siblings are never discounted.
+pub fn ancestors(engine: &Engine, running: &Running, record: &crate::journal::Execution, calls: Option<&crate::calls::Calls>) -> io::Result<Vec<Ancestor>> {
+    let active = running.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut next = record.invocation.parent.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ancestors = vec![];
+    while !next.is_empty() && seen.insert(next.clone()) {
+        let parent = engine.get(&next)?;
+        if parent.family() != record.family() {
+            break;
+        }
+        if calls.is_some_and(|calls| calls.waiting(engine, &parent.id)) {
+            if let Some(call) = active.get(&parent.id) {
+                ancestors.push(Ancestor { request: parent.id.clone(), pids: call.ranks.iter().map(|rank| rank.pid).collect() });
+            }
+        }
+        next = parent.invocation.parent;
+    }
+    Ok(ancestors)
+}
+
+/// A process running calls: measured anonymous peak, anonymous bytes now, and call count.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostCall {
     pub pid: u32,
@@ -537,19 +580,28 @@ pub struct HostCall {
     pub running: u64,
 }
 
-/// The running calls as the host rule reads them: each call's host peak is the largest any GPU
-/// measured for its `<package>|<shape>`.
+impl Call {
+    /// A GPU's figure is process-local: followers add separate headroom, while one process
+    /// using multiple GPUs is charged once (the largest figure any of its GPUs measured).
+    fn host(&self, peak: impl Fn(&str) -> Option<u64>, anon: impl Fn(u32) -> u64) -> Vec<HostCall> {
+        let mut processes = BTreeMap::<u32, Option<u64>>::new();
+        for rank in &self.ranks {
+            let measured = peak(&rank.gpu);
+            let held = processes.entry(rank.pid).or_default();
+            *held = (*held).max(measured);
+        }
+        processes.into_iter().map(|(pid, peak)| HostCall { pid, peak, anon: anon(pid), running: 1 }).collect()
+    }
+}
+
+/// Every process of every call, joined to the peak measured on its own GPU. The host rule
+/// deduplicates a process shared by calls; file-backed model pages remain in the OS budget.
 pub fn host_calls(running: &Running, gpus: &[Arc<Gpu>]) -> Vec<HostCall> {
     let calls: Vec<Call> = running.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
-    calls
-        .into_iter()
-        .map(|call| HostCall {
-            pid: call.pid,
-            peak: gpus.iter().filter_map(|gpu| gpu.manager.host_peak(&call.package, &call.shape)).max(),
-            anon: host_memory::resident(call.pid).map_or(0, |now| now.anon),
-            running: 1,
-        })
-        .collect()
+    calls.into_iter().flat_map(|call| call.host(
+        |uuid| gpus.iter().find(|gpu| gpu.uuid == uuid).and_then(|gpu| gpu.manager.host_peak(&call.package, &call.shape)),
+        |pid| host_memory::resident(pid).map_or(0, |now| now.anon),
+    )).collect()
 }
 
 /// What woke the events thread.
@@ -784,3 +836,6 @@ impl MemoryLog {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
