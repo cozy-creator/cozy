@@ -611,9 +611,6 @@ fn invocables(
 ) -> (Vec<CallInterface>, Callables) {
     let mut rows = vec![];
     let mut callables: Callables = HashMap::new();
-    // A callee module's typed callers need only its own callables: its first row carries that
-    // part of its App's interface, so the whole App travels once, not once per export.
-    let mut documented = std::collections::HashSet::new();
     let apps = std::iter::once((application, own, false))
         .chain(std::iter::once((generation.application.as_str(), &generation.interface, false)))
         .chain(generation.callees.iter().map(|c| {
@@ -644,8 +641,10 @@ fn invocables(
                 export: export.into(),
                 interface_path: if own { path.into() } else { PathBuf::new() },
                 self_call: own,
-                // The Runtime binds its own operations from its own code, not a document.
-                interface_document: (!own && !builtin && documented.insert(module.to_string()))
+                // Each row carries its owner's callables in its module: two Apps may export from
+                // one module (`cozy_runtime.derive.recipes`). The Runtime binds its own
+                // operations from its own code, not a document.
+                interface_document: (!own && !builtin)
                     .then(|| protocol::executor::Json(module_interface(interface, module))),
                 builtin: (builtin && !own).then(|| "operations".into()),
             });
