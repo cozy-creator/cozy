@@ -13,7 +13,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use tensorfs::format::Body;
 use varena::layout::Layout;
-use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Origin, Pass, Pin, Plan, RegionKind, Request, Retained, SetId, SetSpec, Step};
+use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, HostBackend, Level, Memory, Pass, Pin, Plan, RegionKind, Request, Retained, SetId, SetSpec, Step};
 
 use crate::store::PyCheckpoint;
 
