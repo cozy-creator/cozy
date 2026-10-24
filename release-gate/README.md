@@ -6,8 +6,9 @@ the same SKU. Any FAIL blocks the publish. Design: tracker `design/ci-v2.md` §3
 ## What a gate does
 
 1. Rents one fresh machine of the SKU.
-2. Puts the candidate on it: `--runtime-wheel`, `--tensorfs-wheel`, `--tensord` (a cozy binary), or `--packages`
-   (a packages checkout whose directories run in place of the published packages).
+2. Puts the candidate on it: `--runtime-wheel`, `--tensorfs-wheel`, `--tensord` (a cozy binary), `--pins`
+   (exact package releases, `sdxl@2.13.0,…`: a package candidate is published and yanked, and installs only by its pin),
+   or `--packages` (a packages checkout whose directories run). Unpinned cells run the root package users get.
 3. Runs each cell once, with new prompts and seeds.
 4. Ends the rental and checks that it is gone.
 5. Runs `analyze.py`. A cell passes when it completed, served the last PASS's kernels (with no fallback), produced
@@ -26,6 +27,15 @@ A SKU with no baseline needs `--establish` once.
 - **From Actions:** `gh workflow run release-gate.yml -R cozy-creator/cozy-creator -f runtime_wheel=… -f changed='cozy-runtime v0.30.16'`.
   - Selection (`ci/affected`) picks the SKUs and cells; `skus` and `only` override it.
   - `release.yml` (cozy), cozy-runtime's `publish.yaml` and packages' `task publish` run it before they publish.
+
+## Promotion
+
+Nothing reaches users before a PASS. Candidates wait where users don't look: cozy as a GitHub prerelease (`cozy update`,
+the installer and Homebrew follow latest), TensorFS and the Runtime as GitHub prerelease assets (not on PyPI), and
+packages as yanked releases. `candidate.json` in each gate's output names the exact set. `verify.sh <run|dir>...` prints it
+only when every SKU passed. `promote.sh <run|dir>...` then hands that set to users in one step: the same files go to
+PyPI, the cozy prerelease becomes latest plus Homebrew, and the packages are un-yanked (`cozy package yank --undo`).
+The worker image and the Hub pin follow, by the release owner.
 
 ## CI sign-in
 
