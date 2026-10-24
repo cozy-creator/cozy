@@ -174,6 +174,15 @@ for f in "${BEFORE[@]}"; do . "$f"; done
 if [ -n "$BIN" ] && [ "$(timeout 60 "$CLI" --json machine show "$M" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["version"])' 2>/dev/null)" = "$BIN" ]; then
   for ((i = 0; i < ${#CAND[@]}; i += 2)); do [ "${CAND[i]}" = --tensord ] && CAND=("${CAND[@]:0:i}" "${CAND[@]:i+2}") && break; done
 fi
+# --install-cli's URL payload reaches a TensorD before 0.11.16 only (a later one refuses it, invalid_payload): a machine
+# already past that (a suite's before.sh moved it) is sent the candidate's files by --cli.
+mv=$(timeout 60 "$CLI" --json machine show "$M" 2>/dev/null | jq -r '.status.version // ""')
+if [ "$ICLI" != "$CLI" ] && [ -n "$mv" ] && [ "$(printf '%s\n' 0.11.16 "$mv" | sort -V | head -1)" = 0.11.16 ]; then
+  ICLI=$CLI CAND=()
+  if [ -n "$RW" ]; then RWF=$(fetch "$RW") || exit 1; CAND+=(--runtime "$RWF"); fi
+  if [ -n "$TW" ]; then TWF=$(fetch "$TW") || exit 1; CAND+=(--tensorfs "$TWF"); fi
+  [ -z "$TD" ] || [ "$mv" = "$BIN" ] || { TDF=$(fetch "$TD") || exit 1; CAND+=(--tensord "$TDF"); }
+fi
 if [ ${#CAND[@]} -gt 0 ]; then
   "$ICLI" machine update "$M" "${CAND[@]}" -y >update.log 2>&1; code=$?
   log "candidate on $M: exit $code $(grep -E '^status' update.log)"
