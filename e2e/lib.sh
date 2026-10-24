@@ -174,6 +174,22 @@ calcifer_restart_adopts() {
   done
 }
 
+# cl-646: an idle executor that is killed leaves TensorD's pool and is reaped at once: gone from ps within a
+# second, never left a zombie until the next call. Linux and macOS (Windows has no zombies).
+executor_reaped() {
+  [ "$RUNNER_OS" != Windows ] || return 0
+  local executor
+  executor=$(pgrep -n -f "cozy_runtime.internal.executor")
+  [ -n "$executor" ] || { check "no idle executor to end"; return 1; }
+  kill -9 "$executor"
+  sleep 1
+  if ps -o stat= -p "$executor" > /dev/null 2>&1; then
+    check "the killed idle executor (pid $executor) is still in ps a second later: $(ps -o stat= -p "$executor")"
+    return 1
+  fi
+  echo "the killed idle executor (pid $executor) was gone from ps within a second"
+}
+
 # The local machine is up and reports itself (`machine show local` starts it); its record lands in
 # $OUT/machine.json. A cozy before cl-646 (#1883; the installer's release until one carries it) makes its
 # machine with `cozy machine enable`; a later one starts it on first use.
