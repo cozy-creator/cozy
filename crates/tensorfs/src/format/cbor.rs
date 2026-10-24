@@ -1,4 +1,4 @@
-//! The header's bytes (spec §9, `conformance/schema/header.cddl`): RFC 8949 core deterministic
+//! The header's bytes (spec §9, `spec/schema/header.cddl`): RFC 8949 core deterministic
 //! CBOR, read strictly. Allowed: unsigned and negative integers, byte and text strings, arrays,
 //! maps with text keys, `true`, `false`, and inside configs only finite floats (in their
 //! shortest exact form) and `null`; every head in its shortest form, definite lengths only, map keys in
