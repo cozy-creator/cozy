@@ -317,6 +317,58 @@ fn ours(result: &VerificationResult) -> Result<String, String> {
     }
 }
 
+/// cozy `version`'s binary for another machine's dist `target` (`x86_64-unknown-linux-gnu`),
+/// fetched as `cozy update` fetches this one's (its sha256 from the release's manifest, its
+/// attestation verified) and unpacked to a temporary file: what a machine whose TensorD fetches
+/// no release itself is sent.
+pub(crate) async fn release_binary(version: &str, target: &str) -> Result<tempfile::TempPath, Error> {
+    let dir = format!("{RELEASES}/download/v{version}");
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("cozy/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| Error::new(Kind::Internal, "http_client", e.to_string()))?;
+    let manifest: Manifest = get(&http, &format!("{dir}/dist-manifest.json"))
+        .await?
+        .json()
+        .await
+        .map_err(|e| unavailable(&dir, e))?;
+    let (name, artifact) = (manifest.artifacts.iter())
+        .find(|(_, a)| a.kind == "executable-zip" && a.target_triples.iter().any(|t| t == target))
+        .ok_or_else(|| not_found(format!("cozy {version} has no build for {target}")))?;
+    let url = format!("{RELEASES}/download/{}/{name}", manifest.announcement_tag);
+    let archive = get(&http, &url).await?.bytes().await.map_err(|e| unavailable(&url, e))?;
+    let sha256 = hex::encode(Sha256::digest(&archive));
+    if artifact.checksums.get("sha256") != Some(&sha256) {
+        return Err(Error::new(
+            Kind::Validation,
+            "checksum_mismatch",
+            format!("{url} has sha256 {sha256}, not the one its release names"),
+        ));
+    }
+    attested(&http, &url, &archive).await?;
+    let mut file = tempfile::Builder::new().prefix(".cozy-release-").tempfile().map_err(|e| local("stage the binary", e))?;
+    let copied = match name.ends_with(".zip") {
+        true => zip::ZipArchive::new(io::Cursor::new(&archive[..]))
+            .and_then(|mut zip| Ok(io::copy(&mut zip.by_name("cozy.exe")?, &mut file)?))
+            .map_err(io::Error::other),
+        false => untar(&archive, &mut file),
+    };
+    copied.map_err(|e| local("unpack the binary", e))?;
+    Ok(file.into_temp_path())
+}
+
+/// dist's `.tar.gz`, whatever this computer runs: one top directory holding `cozy`.
+fn untar(archive: &[u8], out: &mut impl io::Write) -> io::Result<u64> {
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.file_name() == Some("cozy".as_ref()) {
+            return io::copy(&mut entry, out);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "the archive holds no cozy"))
+}
+
 /// Writes the archive's `cozy` beside `binary` (a file there can run, and the swap stays on one disk).
 fn unpack(archive: &[u8], binary: &Path) -> io::Result<tempfile::TempPath> {
     let mut file = tempfile::Builder::new()
@@ -337,17 +389,7 @@ fn unpack(archive: &[u8], binary: &Path) -> io::Result<tempfile::TempPath> {
 /// dist's `.tar.gz`: one top directory holding `cozy`.
 #[cfg(unix)]
 fn extract(archive: &[u8], out: &mut impl io::Write) -> io::Result<u64> {
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
-    for entry in tar.entries()? {
-        let mut entry = entry?;
-        if entry.path()?.file_name() == Some("cozy".as_ref()) {
-            return io::copy(&mut entry, out);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "the archive holds no cozy",
-    ))
+    untar(archive, out)
 }
 
 /// dist's `.zip`: `cozy.exe` at its root.
