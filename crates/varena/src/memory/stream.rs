@@ -163,7 +163,7 @@ impl Inner {
         // Counted mapped, filling, now: the mechanism moves the slot (no new memory), then queues the fill.
         st.homes.insert(key, Home::new(gen, false, identity));
         st.sync(key);
-        self.mech.post(Mech::Move { key, gen, va, from: from_off, off, span, phys, after, job: Job { key, gen, req, span, after: vec![] } });
+        self.mech.post(Mech::Move { key, gen, va, from: from_off, off, span, phys, after, job: Job { key, gen, req, span, after: vec![], speculative: false } });
         Ok(StreamIn::Moved)
     }
 

@@ -187,7 +187,7 @@ pub struct Ref {
     pub block: u32,
     pub bytes: u64,
     pub origin: Origin,
-    /// It was prefetched before this bind.
+    /// It was prefetched, and this is its first bind since.
     pub speculative: bool,
 }
 
@@ -584,6 +584,8 @@ struct Job {
     /// The page's earlier consumers (release events) a refill in place writes after: the copy
     /// stream waits on them in-stream, and they are retired once the fill's event follows them.
     after: Vec<Event>,
+    /// Issued ahead of any bind (a prefetch or a regrowth): its bytes count as speculative.
+    speculative: bool,
 }
 
 /// Fill jobs, in groups: the pages the mechanism mapped together (a bind's block) reach a fill
@@ -1399,7 +1401,7 @@ impl Inner {
         // the unmaps decided before it, then queues its fill.
         st.homes.insert(key, Home::new(gen, speculative, identity));
         st.sync(key);
-        self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, decided: !speculative });
+        self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![], speculative }, decided: !speculative });
         Ok(true)
     }
 
@@ -1422,7 +1424,7 @@ impl Inner {
         *h = Home { phys: h.phys.take(), ..Home::new(gen, false, identity) };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
-        let job = Job { key, gen, req, span, after: vec![] };
+        let job = Job { key, gen, req, span, after: vec![], speculative: false };
         if renew {
             // A new grant takes its place once its consumers are done.
             if !after.contains(&old) {
@@ -1515,7 +1517,6 @@ impl Inner {
                     // Stored bytes are the weights; a declared set's are once transformed, or
                     // refilled from their derived entry.
                     let filled = origin == Origin::Derived || sets.get(&job.key.0).is_some_and(|spec| matches!(spec.fingerprint.fill, Fill::Stored));
-                    let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
                     // A page read ready at issue is its binders' since: a transform may have
                     // filled it already, so only its accounting is left.
                     if let (Some(ready), Some(h)) = (ready, st.homes.get_mut(&job.key)) {
@@ -1531,7 +1532,7 @@ impl Inner {
                     f.bytes += span;
                     // The batch's time, shared by its bytes.
                     f.ns += (u128::from(ns) * u128::from(span) / u128::from(bytes)) as u64;
-                    if speculative {
+                    if job.speculative {
                         s.moved.speculative += span;
                     }
                 }
@@ -2137,6 +2138,8 @@ impl Inner {
         let id = st.tick();
         let now = st.clock;
         let Some(h) = st.homes.get_mut(&key) else { return Err(Error::Internal("a bound page lost its home".into())) };
+        // Its first bind ends the speculation: later binds are demands.
+        h.speculative = false;
         let fresh = h.fresh();
         let transform = fresh;
         if transform {
