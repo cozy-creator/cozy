@@ -34,6 +34,7 @@ pub const SUCCESS: CUresult = 0;
 pub const ERROR_INVALID_VALUE: CUresult = 1;
 pub const ERROR_OUT_OF_MEMORY: CUresult = 2;
 pub const ERROR_HOST_MEMORY_ALREADY_REGISTERED: CUresult = 712;
+pub const ERROR_INVALID_CONTEXT: CUresult = 201;
 pub const ERROR_NOT_READY: CUresult = 600;
 pub const ERROR_NOT_SUPPORTED: CUresult = 801;
 

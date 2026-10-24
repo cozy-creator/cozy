@@ -535,23 +535,27 @@ impl Backend for CudaBackend {
 
 /// TensorD's chunks on one device, with no context of its own: the driver creates, exports and
 /// releases a chunk with no context current, and a chunk outlives every context (P1; P1b runs
-/// 15862, 15911). [`minimal`]'s context opens only to read the granularity and capacity, and
-/// stays only where NVML is unavailable, for the driver's free bytes. It serves the manager's
-/// calls only: it maps nothing and orders no stream.
+/// 15862, 15911). A driver that answers a chunk call with CUDA_ERROR_INVALID_CONTEXT gets
+/// [`minimal`]'s context for it from then on, kept while any chunk lives. The context also opens
+/// at open, to read the granularity and capacity, and stays where NVML is unavailable, for the
+/// driver's free bytes. It serves the manager's calls only: it maps nothing and orders no stream.
 pub struct CudaChunks {
     ordinal: i32,
     prop: AllocationProp,
     _security: Security,
     granularity: u64,
     capacity: u64,
-    free: Free,
+    nvml: Option<Box<platform::gpu::Device>>,
+    kept: parking_lot::Mutex<Kept>,
 }
 
-/// Where the device's free bytes are read.
-enum Free {
-    Nvml(Box<platform::gpu::Device>),
-    /// No NVML: the driver's, in a minimal context kept for it.
-    Driver(Primary),
+#[derive(Default)]
+struct Kept {
+    context: Option<Primary>,
+    /// Live chunks.
+    chunks: u64,
+    /// This driver answered a chunk call with CUDA_ERROR_INVALID_CONTEXT.
+    needs: bool,
 }
 
 // SAFETY: as `CudaBackend`'s: `prop`'s only pointer is the WIN32 metadata, owned and never written.
@@ -583,9 +587,47 @@ impl CudaBackend {
             call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut granularity, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
             call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
         }
+        let nvml = nvml(device).map(Box::new);
         // With NVML the context goes here: its last release destroys it.
-        let free = nvml(device).map_or(Free::Driver(context), |nvml| Free::Nvml(Box::new(nvml)));
-        Ok(CudaChunks { ordinal, prop, _security: security, granularity: granularity as u64, capacity: total as u64, free })
+        let kept = Kept { context: nvml.is_none().then_some(context), ..Kept::default() };
+        Ok(CudaChunks { ordinal, prop, _security: security, granularity: granularity as u64, capacity: total as u64, nvml, kept: parking_lot::Mutex::new(kept) })
+    }
+}
+
+impl CudaChunks {
+    /// `f`, a chunk call, with no context current; in the minimal context where this driver
+    /// needs one. `counted` moves the live chunks on success.
+    fn chunk<R>(&self, counted: i64, f: impl Fn() -> Result<R>) -> Result<R> {
+        if !self.kept.lock().needs {
+            match f() {
+                Err(Error::Device { code: cuda::ERROR_INVALID_CONTEXT, .. }) => {}
+                done => return done.inspect(|_| self.count(&mut self.kept.lock(), counted)),
+            }
+        }
+        let mut kept = self.kept.lock();
+        if !kept.needs {
+            kept.needs = true;
+            tracing::warn!(target: "varena", "CUDA device {}'s driver needs a context for chunks: a minimal one is kept while any lives", self.ordinal);
+        }
+        if kept.context.is_none() {
+            kept.context = Some(minimal(self.ordinal)?);
+        }
+        let done = match &kept.context {
+            Some(context) => context.enter().and_then(|_ctx| f()),
+            None => Err(Error::Internal("the minimal context is not open".into())),
+        };
+        if done.is_ok() {
+            self.count(&mut kept, counted);
+        }
+        done
+    }
+
+    /// The last chunk takes the context with it, unless NVML is unavailable (the free bytes).
+    fn count(&self, kept: &mut Kept, counted: i64) {
+        kept.chunks = kept.chunks.saturating_add_signed(counted);
+        if kept.chunks == 0 && self.nvml.is_some() {
+            kept.context = None;
+        }
     }
 }
 
@@ -598,26 +640,24 @@ impl Backend for CudaChunks {
         self.capacity
     }
 
+    /// NVML's; the driver's where NVML is unavailable (its context is kept for this).
     fn free(&self) -> Result<u64> {
-        match &self.free {
-            Free::Nvml(nvml) => Ok(nvml.read()?.free),
-            Free::Driver(context) => {
-                let _ctx = context.enter()?;
-                let (mut free, mut total) = (0usize, 0usize);
-                call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
-                Ok(free as u64)
-            }
+        if let Some(nvml) = &self.nvml {
+            return Ok(nvml.read()?.free);
         }
+        let kept = self.kept.lock();
+        let context = kept.context.as_ref().ok_or_else(|| Error::Internal("no NVML and no context".into()))?;
+        let _ctx = context.enter()?;
+        let (mut free, mut total) = (0usize, 0usize);
+        call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
+        Ok(free as u64)
     }
 
     fn process_used(&self) -> Result<u64> {
-        match &self.free {
-            Free::Nvml(nvml) => process_used(Some(nvml)),
-            Free::Driver(_) => process_used(None),
-        }
+        process_used(self.nvml.as_deref())
     }
 
-    /// None: chunks need no context (NVML-less, the kept context is unmeasured).
+    /// Unmeasured: 0 on the drivers that need no context for chunks.
     fn opened_context(&self) -> u64 {
         0
     }
@@ -630,17 +670,20 @@ impl Backend for CudaChunks {
         if !len.is_multiple_of(self.granularity) {
             return Err(Error::Invalid(format!("a page of {len} is not a multiple of the {} byte granularity", self.granularity)));
         }
-        let mut id = 0;
-        call!("cuMemCreate", mem_create(&mut id, len as usize, &self.prop, 0))?;
+        let id = self.chunk(1, || {
+            let mut id = 0;
+            call!("cuMemCreate", mem_create(&mut id, len as usize, &self.prop, 0))?;
+            Ok(id)
+        })?;
         Ok(Physical { id, len })
     }
 
     fn destroy(&self, page: Physical) -> Result<()> {
-        Ok(call!("cuMemRelease", mem_release(page.id))?)
+        self.chunk(-1, || Ok(call!("cuMemRelease", mem_release(page.id))?))
     }
 
     fn export(&self, page: &Physical) -> Result<Owned> {
-        export(page)
+        self.chunk(0, || export(page))
     }
 
     fn reserve(&self, _: u64) -> Result<Va> {
