@@ -463,8 +463,25 @@ impl Updates {
     }
 
     /// Each kernel's verdict on this machine, as the Runtime keeps them under its kernel store.
-    pub fn kernels(&self) -> Vec<protocol::machine::KernelVerdict> {
-        super::toolchain::verdicts(&self.paths.engine.join("gpu/kernels"))
+    /// A kernel no prebuilt served (a verdict that failed) is the build toolchain's first need: on
+    /// a machine without one, it is fetched now, once, in the background, as an update of its own.
+    pub fn kernels(self: &Arc<Self>) -> Vec<protocol::machine::KernelVerdict> {
+        let verdicts = super::toolchain::verdicts(&self.paths.engine.join("gpu/kernels"));
+        if verdicts.iter().any(|v| !v.ok) && self.toolchain().nvcc.is_empty() {
+            let fetch = Request {
+                operation: "toolchain-on-first-need".into(),
+                pin: None,
+                runtime: None,
+                tensorfs: None,
+                cozy: None,
+                gpu_memory_limit: None,
+                binary: None,
+                toolchain: true,
+            };
+            // One already answered (installed, failed or another update running) asks nothing.
+            let _ = self.request(fetch, |code| std::process::exit(code));
+        }
+        verdicts
     }
 
     /// Where the machine's toolchain lives, which executors find through their environment.

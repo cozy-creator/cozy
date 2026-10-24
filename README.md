@@ -23,9 +23,28 @@ the installer prints. `cozy update` moves to the newest release.
 
 ## Use
 
+Write the request in a YAML file, `request.yaml`:
+
+```yaml
+prompt: a lighthouse on a basalt cliff at dusk, oil painting
+aspect_ratio: "16:9"
+steps: 30
+seed: 7
+```
+
 ```sh
 cozy login you@example.com
-cozy run sdxl/generate prompt='a lighthouse at dusk' seed=7
+cozy run sdxl/generate --input request.yaml
+cozy run sdxl/generate --input request.yaml seed=8      # an inline input overrides the file
+cozy run birefnet/remove_background --asset image=./character.png
+cozy run sdxl/generate --describe                       # the fields a function takes
+```
+
+Inline `key=value` inputs are the quick form: `cozy run sdxl/generate prompt='a fox in fresh snow'`.
+Files go in with `--asset` (or by path inside the YAML, relative to it). A run is followed to its end;
+Ctrl-C stops following, never the run, and `cozy run show <N>` picks it up again.
+
+```sh
 cozy machine rent            # what is for rent; then cozy machine rent <sku>
 cozy model search sdxl
 ```
@@ -40,14 +59,43 @@ add `--on new` to run on a rented one. Outputs land in `~/.cozy/outputs`.
 
 `cozy --help` and `cozy <verb> --help` are the reference.
 
-## Uninstall
+`cozy doctor` diagnoses this computer's cozy (Calcifer, its service, the machine, tools, GPUs) and
+restarts a Calcifer that is stuck or runs an older cozy.
+
+## Remove cozy
+
+End your rentals first (`cozy machine list`, `cozy machine end <name>`). Then:
+
+Linux:
 
 ```sh
-cozy uninstall        # lists what it removes, with sizes, and asks; --yes skips the question
+systemctl --user disable --now cozy-calcifer cozy-machine
+pkill -f ~/.cozy/bin/cozy      # what they started (a machine, its executors)
+rm -rf ~/.cozy ~/.config/cozy ~/.local/share/bash-completion/completions/cozy ~/.config/fish/completions/cozy.fish
 ```
 
-It stops Calcifer and the machine and removes their services, `~/.cozy`, `~/.config/cozy` and the
-installer's PATH lines. Downloaded models stay unless `--all`.
+macOS:
+
+```sh
+launchctl bootout gui/$(id -u)/com.cozy-creator.calcifer; launchctl bootout gui/$(id -u)/com.cozy-creator.machine
+pkill -f ~/.cozy/bin/cozy
+rm -rf ~/.cozy ~/.config/cozy ~/Library/LaunchAgents/com.cozy-creator.*.plist
+```
+
+Windows (PowerShell):
+
+```powershell
+Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run cozy-calcifer, cozy-machine -ErrorAction SilentlyContinue
+Get-Process cozy -ErrorAction SilentlyContinue | Stop-Process
+Remove-Item -Recurse -Force ~\.cozy, $env:LOCALAPPDATA\cozy
+$path = ([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') -ne "$HOME\.cozy\bin"
+[Environment]::SetEnvironmentVariable('Path', $path -join ';', 'User')
+```
+
+On Linux and macOS, delete the line that sources `~/.config/cozy/env.sh` (or `env.fish`) from `.profile`,
+`.bashrc`, `.zshrc` or fish's `conf.d`. `~/.cozy` holds the machine's model store, which can be large;
+a store set elsewhere in `~/.cozy/config.toml` stays until you delete it. Homebrew: `brew uninstall
+cozy`, then the same steps.
 
 ## Build
 

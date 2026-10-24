@@ -1,10 +1,9 @@
-//! `cozy tools`: the tools this computer has of those cozy uses and never bundles, and installing
-//! the ones cozy fetches itself (pinned builds held to their sha256) into `~/.cozy/tools`. The
-//! lookups features call (`ffmpeg`, `uv`) live here too.
+//! The tools this computer has of those cozy runs and never bundles, as `cozy doctor` shows them,
+//! and the ones cozy fetches itself on first need (pinned builds held to their sha256) into
+//! `~/.cozy/tools`: the lookups features call (`ffmpeg`, `uv`).
 use std::{
     io::{self, Write as _},
     path::{Path, PathBuf},
-    process::ExitCode,
 };
 
 use platform::tools::{self, Archive, Class, Found, Install, Side, TOOLS, Tool};
@@ -15,83 +14,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{Context, output};
 
-#[derive(clap::Args, Debug)]
-pub struct Args {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(clap::Subcommand, Debug)]
-enum Command {
-    /// Each tool cozy uses on this computer: found where, or what its absence costs.
-    List,
-    /// Fetch a tool's pinned build into ~/.cozy/tools, held to its sha256.
-    Install {
-        tool: Fetched,
-        /// Do nothing when a usable one is already here.
-        #[arg(long)]
-        if_missing: bool,
-    },
-}
-
-/// The tools cozy fetches itself.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-enum Fetched {
-    Ffmpeg,
-    Uv,
-}
-
-pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
-    match args.command {
-        Command::List => list(ctx),
-        Command::Install { tool, if_missing } => {
-            let (name, found) = match tool {
-                Fetched::Ffmpeg => {
-                    let found = (if_missing).then(|| usable_ffmpeg(ctx)).flatten();
-                    let found = match found {
-                        Some(found) => (found.ffmpeg, found.build, false),
-                        None => {
-                            let ffmpeg = install_ffmpeg(ctx).await?;
-                            (ffmpeg.ffmpeg, ffmpeg.build, true)
-                        }
-                    };
-                    ("ffmpeg", found)
-                }
-                Fetched::Uv => {
-                    let found = if_missing
-                        .then(|| tools::uv(&ctx.home.tools(), &path()))
-                        .flatten();
-                    let found = match found {
-                        Some(found) => (found.path, found.version, false),
-                        None => {
-                            let uv = install_uv(ctx).await?;
-                            (uv.path, uv.version, true)
-                        }
-                    };
-                    ("uv", found)
-                }
-            };
-            let (path, version, installed) = found;
-            if ctx.json {
-                output::json(&serde_json::json!({
-                    "tool": name, "path": path, "version": version, "installed": installed,
-                }));
-            } else {
-                output::Record::new()
-                    .field(name, version)
-                    .field("path", path.display().to_string())
-                    .note(match installed {
-                        true => "installed",
-                        false => "already here: nothing changed",
-                    })
-                    .print(ctx);
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-    }
-}
-
-/// One tool as `cozy tools list` and `cozy doctor` show it.
+/// One tool as `cozy doctor` shows it.
 #[derive(Serialize)]
 pub(crate) struct Row {
     pub name: &'static str,
@@ -141,14 +64,14 @@ pub(crate) fn rows(ctx: &Context, side: Side) -> Vec<Row> {
 /// The words that install `tool` here.
 fn install_hint(tool: &Tool, path: &[PathBuf]) -> String {
     match tool.install {
-        Install::Cozy(verb) => verb.into(),
+        Install::Fetched => "cozy fetches it when a feature first needs it".into(),
         Install::System(package) => tools::system_install(package, path)
             .unwrap_or_else(|| format!("install {package} with this computer's package manager")),
         Install::Note(text) => format!("install {text}"),
     }
 }
 
-/// A row as a line of `cozy doctor` and `cozy tools list`.
+/// A row as a line of `cozy doctor`.
 pub(crate) fn cells(row: &Row) -> [String; 3] {
     match row.found {
         true => [
@@ -168,20 +91,6 @@ pub(crate) fn cells(row: &Row) -> [String; 3] {
             row.install.clone(),
         ],
     }
-}
-
-fn list(ctx: &Context) -> Result<ExitCode, Error> {
-    let rows = rows(ctx, Side::Computer);
-    if ctx.json {
-        output::json(&serde_json::json!({ "tools": rows }));
-        return Ok(ExitCode::SUCCESS);
-    }
-    let mut table = output::Table::new(ctx, ["TOOL", "STATE", "PATH OR INSTALL"]);
-    for row in &rows {
-        table = table.row(cells(row));
-    }
-    table.print();
-    Ok(ExitCode::SUCCESS)
 }
 
 /// This process's PATH, as the probes take it.
@@ -211,23 +120,10 @@ fn usable_ffmpeg(ctx: &Context) -> Option<Ffmpeg> {
 }
 
 /// ffmpeg for a feature that needs it: the pinned build, else PATH's when it encodes libx264,
-/// else the pinned build fetched now. With `--json` nothing is fetched: the refusal names the
-/// command that installs it.
+/// else the pinned build fetched now, on this first need.
 pub async fn ffmpeg(ctx: &Context) -> Result<Ffmpeg, Error> {
     if let Some(found) = usable_ffmpeg(ctx) {
         return Ok(found);
-    }
-    let path = path();
-    let without = tools::ffmpeg(&ctx.home.tools(), &path).is_some();
-    if ctx.json {
-        let (code, why) = match without {
-            true => (
-                "ffmpeg_without_libx264",
-                "this computer's ffmpeg cannot encode libx264",
-            ),
-            false => ("ffmpeg_unavailable", "this computer has no ffmpeg"),
-        };
-        return Err(Error::new(Kind::Unavailable, code, why).next("cozy tools install ffmpeg"));
     }
     install_ffmpeg(ctx).await
 }
@@ -319,7 +215,7 @@ fn unpinned(ctx: &Context, name: &'static str) -> Error {
 async fn fetch(ctx: &Context, name: &str, archives: &[Archive], dir: &Path) -> Result<(), Error> {
     let failed = |e: String| {
         Error::new(Kind::Unavailable, format!("{name}_unavailable"), e)
-            .next(format!("cozy tools install {name}"))
+            .remedy("the next command that needs it fetches it again")
             .next(doctor(ctx))
     };
     let parent = dir.parent().expect("a tool's directory has a parent");

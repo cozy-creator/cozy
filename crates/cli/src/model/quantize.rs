@@ -146,22 +146,17 @@ fn fold(name: &str) -> String {
     name.replace('-', "_").to_lowercase()
 }
 
-/// The lane asked for: its flag's, or the named recipe's.
-fn lane(args: &Quantize, interface: &Interface, package: &str) -> Result<String, Error> {
+/// The lanes asked for, in order: `--format`'s, or the named recipe's one.
+fn lanes(args: &Quantize, interface: &Interface, package: &str) -> Result<Vec<String>, Error> {
     if let Some(name) = &args.recipe {
         return (interface.recipes.iter().find(|r| r.name == fold(name)))
-            .map(|r| r.lane.clone())
+            .map(|r| vec![r.lane.clone()])
             .ok_or_else(|| Error::new(Kind::NotFound, "model_recipe_not_found", format!("{package} declares no recipe {name}"))
                 .remedy(declared(interface)));
     }
-    let lane = match (args.int8, args.fp8, args.w4a8, args.svdq_nvfp4) {
-        (true, ..) => "int8",
-        (_, true, ..) => "fp8",
-        (_, _, true, _) => "w4a8",
-        (.., true) => "svdq-nvfp4",
-        _ => "nvfp4",
-    };
-    Ok(lane.to_owned())
+    let mut lanes = args.format.clone();
+    lanes.dedup();
+    Ok(lanes)
 }
 
 /// The recipes of `lane` (named `recipe` if given) that read a checkpoint holding `components`.
@@ -218,11 +213,33 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
         }
     };
     let interface = callee.interface();
-    let lane = lane(&args, interface, callee.package())?;
-    let source = checkpoint(ctx, &hub, &model, &lane).await?;
-    let found = recipes(interface, &lane, args.recipe.as_deref(), &source.components);
+    // One run per lane, in the order asked; the first that does not complete ends the rest.
+    let mut code = ExitCode::SUCCESS;
+    for lane in lanes(&args, interface, callee.package())? {
+        code = write(ctx, &args, &hub, &model, destination.as_deref(), &callee, &lane).await?;
+        if code != ExitCode::SUCCESS {
+            break;
+        }
+    }
+    Ok(code)
+}
+
+/// One lane of `model`, written by `callee`'s recipe into `destination` (the model's own tag tree
+/// when none), as one run.
+async fn write(
+    ctx: &Context,
+    args: &Quantize,
+    hub: &Hub,
+    model: &ModelRef,
+    destination: Option<&str>,
+    callee: &Callee<'_>,
+    lane: &str,
+) -> Result<ExitCode, Error> {
+    let interface = callee.interface();
+    let source = checkpoint(ctx, hub, model, lane).await?;
+    let found = recipes(interface, lane, args.recipe.as_deref(), &source.components);
     if found.is_empty() {
-        let what = args.recipe.as_deref().unwrap_or(&lane);
+        let what = args.recipe.as_deref().unwrap_or(lane);
         return Err(Error::new(Kind::NotFound, "model_quantizer_not_found", format!(
             "{callee} has no {what} recipe for this model ({})", source.components.join(", ")))
             .remedy(declared(interface)));
@@ -230,7 +247,7 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
     // The variant goes onto the tag's tree (main unless named): publishing the tag releases all.
     // Local code's lane records its package as `local/<name>` and its release as the source's
     // manifest digest: an unpublished recipe, exactly.
-    let destination = destination.unwrap_or_else(|| format!("{}@main", source.repo));
+    let destination = destination.map_or_else(|| format!("{}@main", source.repo), str::to_owned);
     let mut terms = vec![source.spelled.clone(), destination.clone(), format!("lane={lane}"),
         format!("package={}", callee.package()), format!("release={}", callee.release())];
     terms.extend(args.recipe.iter().map(|name| format!("recipe={name}")));
@@ -238,9 +255,9 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
     let calibrated = calibration(interface, &found, &source.spelled);
     let bits = (!calibrated.is_empty()).then_some("16");
     terms.extend(calibrated);
-    let run = crate::run::call(ctx, &callee, RECIPES, terms, bits, &args.placement, args.detach).await?;
+    let run = crate::run::call(ctx, callee, RECIPES, terms, bits, &args.placement).await?;
     if !ctx.json && run.status == Status::Completed {
-        match written_checkpoint(&run, &lane) {
+        match written_checkpoint(&run, lane) {
             Some(WrittenCheckpoint::Reference(reference)) => {
                 let (model, tree) = (&reference.repo_id, &reference.revision);
                 let mut record = Record::new().field("checkpoint", format!("{model}@{tree}"));

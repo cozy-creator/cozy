@@ -389,7 +389,7 @@ impl Runs {
     }
 
     /// A warm run's model choices made present when it names no entrypoint (`cozy package
-    /// install`, `cozy model download`) or no code (`cozy model upload`, `cozy run upload`): a
+    /// install`, `cozy model download`) or no code (`cozy model upload`, of a file or a run's output): a
     /// Hub checkpoint downloaded, a provider source or a written file (`object://`) made, a
     /// checkpoint this machine holds (a run's weights output, a `local/` alias) found. With a
     /// weights destination the one choice is put there: a `local/` alias held by name, or a

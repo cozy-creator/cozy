@@ -348,11 +348,3 @@ pub fn install(user_home: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-
-/// The completion files `cozy uninstall` removes.
-pub fn installed(user_home: &Path) -> Vec<PathBuf> {
-    (stubs(user_home).into_iter())
-        .map(|(file, _)| file)
-        .filter(|file| file.is_file())
-        .collect()
-}

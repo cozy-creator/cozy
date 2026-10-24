@@ -79,13 +79,66 @@ candidates() {
   if [ -n "$CAND_COZY" ]; then
     want=$("$CAND_COZY" --version)
     [ "$(cozy --version)" = "$want" ] || fail "cozy is $(cozy --version), not the candidate $want"
-    # The installer's Calcifer keeps running until restarted (`cozy update` does that for a person): the
-    # candidate's Calcifer is the one that starts this computer's machine from here on.
-    cozy --json down > "$OUT/down-candidate.json" || check "cozy down failed"
-    cozy --json up > "$OUT/up-candidate.json" || fail "the candidate's cozy up failed"
-    grep -q "\"version\": *\"${want#cozy }\"" "$OUT/up-candidate.json" || check "Calcifer is not the candidate ${want#cozy }"
+    # The installer's Calcifer keeps running an older cozy until restarted (`cozy update` does that for
+    # a person): `cozy doctor` finds it and restarts it on the candidate.
+    cozy --json doctor > "$OUT/doctor-candidate.json" || check "cozy doctor is not healthy after the candidates"
+    grep -q "cozy ${want#cozy }," "$OUT/doctor-candidate.json" || check "Calcifer is not the candidate ${want#cozy }"
   fi
   machine_ready
+}
+
+# Calcifer stuck: its process stopped (SIGSTOP), so it answers nothing and makes no progress. `cozy doctor`
+# must say so, end it and start another, and the next run must go. Windows cannot stop a process this way.
+calcifer_stuck() {
+  [ "$RUNNER_OS" != Windows ] || return 0
+  local pid
+  pid=$(grep -o '"pid": *[0-9]*' "$HOME/.cozy/calcifer/calcifer.lock.holder" 2> /dev/null | grep -o '[0-9]*$')
+  [ -n "$pid" ] || pid=$(cozy --json status | grep -o '"pid": *[0-9]*' | head -1 | grep -o '[0-9]*$')
+  [ -n "$pid" ] || { check "no Calcifer pid to stop"; return 1; }
+  kill -STOP "$pid" || { check "SIGSTOP $pid failed"; return 1; }
+  cozy --json doctor > "$OUT/doctor-stuck.json" || check "cozy doctor did not fix a stuck Calcifer"
+  grep -q '"fixed": *"restarted' "$OUT/doctor-stuck.json" || check "cozy doctor did not restart the stuck Calcifer"
+  local stat; stat=$(ps -o stat= -p "$pid" 2> /dev/null || true)
+  # Gone, or a zombie its service manager has yet to reap.
+  [ -z "$stat" ] || [ "${stat#Z}" != "$stat" ] || check "the stuck Calcifer $pid still runs ($stat)"
+}
+
+# Calcifer stopped while the machine it started runs on (run 40071937261: the next Calcifer could not take
+# the home until that machine idled out, 15 min). `cozy doctor` must recover at once: name what holds
+# Calcifer's lock, end it, start Calcifer, and the next run must go.
+calcifer_orphaned() {
+  [ "$RUNNER_OS" != Windows ] || return 0
+  local pid began
+  machine_ready
+  pid=$(grep -o '"pid": *[0-9]*' "$HOME/.cozy/calcifer/calcifer.lock.holder" 2> /dev/null | grep -o '[0-9]*$')
+  [ -n "$pid" ] || { check "no Calcifer pid to stop"; return 1; }
+  kill -TERM "$pid"
+  for _ in $(seq 60); do kill -0 "$pid" 2> /dev/null || break; sleep 1; done
+  ls -l /proc/*/fd 2> /dev/null | grep -c calcifer.lock > "$OUT/orphan-fds.txt" || true
+  began=$(date +%s)
+  timeout 600 "$COZY" --json doctor > "$OUT/doctor-orphaned.json" || check "cozy doctor did not recover Calcifer after an orphaned machine ($(( $(date +%s) - began )) s)"
+  [ $(( $(date +%s) - began )) -lt 120 ] || check "cozy doctor took $(( $(date +%s) - began )) s to recover Calcifer"
+  grep -o '"fixed": *"[^"]*"' "$OUT/doctor-orphaned.json" || true
+}
+
+# Removing cozy as the README's "Remove cozy" says, for this OS: nothing of cozy is left.
+remove_cozy() {
+  case $RUNNER_OS in
+    Linux)
+      systemctl --user disable --now cozy-calcifer cozy-machine > "$OUT/remove.log" 2>&1 || true
+      pkill -f "$HOME/.cozy/bin/cozy" || true; sleep 2
+      rm -rf ~/.cozy ~/.config/cozy ~/.local/share/bash-completion/completions/cozy ~/.config/fish/completions/cozy.fish ;;
+    macOS)
+      launchctl bootout "gui/$(id -u)/com.cozy-creator.calcifer" > "$OUT/remove.log" 2>&1 || true
+      launchctl bootout "gui/$(id -u)/com.cozy-creator.machine" >> "$OUT/remove.log" 2>&1 || true
+      pkill -f "$HOME/.cozy/bin/cozy" || true; sleep 2
+      rm -rf ~/.cozy ~/.config/cozy ~/Library/LaunchAgents/com.cozy-creator.*.plist ;;
+    Windows)
+      powershell -NoProfile -c 'Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run cozy-calcifer, cozy-machine -ErrorAction SilentlyContinue; Get-Process cozy -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep 2; Remove-Item -Recurse -Force ~\.cozy, $env:LOCALAPPDATA\cozy -ErrorAction SilentlyContinue; $path = ([Environment]::GetEnvironmentVariable("Path", "User") -split ";") -ne "$HOME\.cozy\bin"; [Environment]::SetEnvironmentVariable("Path", $path -join ";", "User")' > "$OUT/remove.log" 2>&1 || true ;;
+  esac
+  [ ! -e "$COZY" ] || check "removing cozy left $COZY"
+  [ ! -e "$HOME/.cozy" ] || check "removing cozy left ~/.cozy"
+  ! pgrep -f "$HOME/.cozy/bin/cozy" > /dev/null 2>&1 || check "a cozy process still runs after removal"
 }
 
 # Whether this computer's cozy has `cozy machine <verb>`.

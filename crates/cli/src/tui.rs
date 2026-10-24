@@ -1,6 +1,6 @@
 //! Live full-screen views over Calcifer's event streams. A view is drawn again when its data
 //! changes or a key is pressed, never on a timer: ↑/↓ or k/j select, Enter opens the selected
-//! row's own view (a run as `cozy run watch` follows it, a machine as `cozy machine show` draws
+//! row's own view (a run as `cozy run show` follows it, a machine as `cozy machine show` draws
 //! it), Esc or q goes back to the list as it was left, and q there quits. The terminal is restored
 //! on every way out: q, Ctrl-C, a signal, an error, and (ratatui's hook) a panic.
 use std::io;
@@ -174,7 +174,7 @@ enum Next {
     Quit,
 }
 
-/// Enter on a run: `cozy run watch` itself, on the terminal the list lends it, until Esc or q goes
+/// Enter on a run: `cozy run show` itself, on the terminal the list lends it, until Esc or q goes
 /// back; true when Ctrl-C quit. Leaving stops watching, never the run; a run that ended stays on
 /// screen, its record and all, until then.
 async fn watch(
@@ -188,7 +188,7 @@ async fn watch(
     let mut left = None;
     let watched = async {
         let run = ctx.calcifer().await?.run(id).await?;
-        output::say(ctx, &format!("cozy run watch {}  (Esc or q back)", run.number));
+        output::say(ctx, &format!("cozy run show {}  (Esc or q back)", run.number));
         let stop = async { left = Some(leave(&mut *keys, &mut *signals).await) };
         run::follow_until(ctx, run, stop).await
     };
@@ -226,7 +226,7 @@ async fn leave(
 }
 
 /// Raw mode keeps keys coming; on Unix it also stops a newline returning the carriage, which the
-/// lines `cozy run watch` writes need (`on`) and ratatui's frames do not.
+/// lines `cozy run show` writes need (`on`) and ratatui's frames do not.
 #[cfg(unix)]
 fn lines(on: bool) -> io::Result<()> {
     let mut mode = tcgetattr(io::stdout())?;

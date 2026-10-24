@@ -36,6 +36,17 @@ const REPORT: Duration = Duration::from_secs(5);
 /// row is a Calcifer that is not going to answer.
 const AGAIN: u32 = 3;
 
+/// This home's Calcifer lock as `cozy doctor` reads it.
+pub(crate) enum Lock {
+    /// Nobody holds the home; `stale`: a record names a Calcifer killed before it erased it.
+    Free { stale: bool },
+    /// A Calcifer holds the home and its record names it, alive.
+    Held(Holder),
+    /// The home's lock is held, but by no live Calcifer its record names: a process another one
+    /// started keeps it open (a machine a previous Calcifer started, before cl-646's fix).
+    Captive,
+}
+
 /// One command's connection to Calcifer. Cheap to clone; clones share the connection.
 #[derive(Clone)]
 pub struct Client(Arc<Inner>);
@@ -77,6 +88,43 @@ impl Client {
             json: ctx.json,
             holder: Mutex::new(None),
         })))
+    }
+
+    /// A client that reaches nothing yet (`cozy doctor`, which looks before it starts anything).
+    pub(crate) fn unconnected(ctx: &Context) -> Result<Self, Error> {
+        Self::new(ctx)
+    }
+
+    /// What this home's lock says of its Calcifer, starting nothing.
+    pub(crate) fn lock_state(&self) -> Lock {
+        let free = self.lock_free();
+        let raw = LockFile::new(self.0.home.calcifer_lock()).holder().ok().flatten();
+        let alive = |pid: u32| {
+            process::Birth::of(pid).and_then(|birth| birth.state()).is_ok_and(|s| s != process::State::Gone)
+        };
+        match (free, raw.map(|raw| serde_json::from_slice::<Holder>(&raw))) {
+            (true, record) => Lock::Free { stale: record.is_some() },
+            (false, Some(Ok(holder))) if alive(holder.pid) => Lock::Held(holder),
+            (false, _) => Lock::Captive,
+        }
+    }
+
+    /// Whether the Calcifer `holder` names answers one request: any reply is an answer. Waits as
+    /// long as the request does; the caller judges a silence by the process's progress.
+    pub(crate) async fn answers(&self, holder: &Holder) -> bool {
+        let probe = format!("http://{}/v1/runs", holder.address);
+        let request = self.0.http.get(probe).query(&[("limit", 1)]);
+        request.bearer_auth(&holder.token).send().await.is_ok()
+    }
+
+    /// Calcifer's service manager for this home, its definition for the installed cozy, and
+    /// whether this process is that cozy (only it writes the definition).
+    pub(crate) fn service(&self) -> Result<(Services, ServiceSpec, bool), Error> {
+        let installed = installed(&self.0.home)?;
+        let exe = std::env::current_exe().and_then(|exe| exe.canonicalize());
+        let ours = matches!((exe, installed.canonicalize()), (Ok(exe), Ok(it)) if exe == it);
+        let services = Services::new(&self.0.home, &self.0.user_home);
+        Ok((services, self.spec(installed), ours))
     }
 
     /// The record of the Calcifer this client last reached.
@@ -351,7 +399,7 @@ impl Client {
                             "calcifer_start_failed",
                             format!("Calcifer exited ({status}) before it served"),
                         )
-                        .next("cozy logs calcifer")
+                        .next("cozy machine logs local calcifer")
                     }));
                 }
                 // Another Calcifer held the lock: wait for its record, or for it to let go.
@@ -360,7 +408,7 @@ impl Client {
             if reported.elapsed() >= REPORT {
                 reported = Instant::now();
                 self.say(&format!(
-                    "waiting for Calcifer to start ({}s so far); `cozy logs calcifer` shows what it is doing",
+                    "waiting for Calcifer to start ({}s so far); `cozy machine logs local calcifer` shows what it is doing",
                     began.elapsed().as_secs()
                 ));
             }
@@ -774,7 +822,7 @@ async fn envelope(answer: Response) -> Error {
     }
 }
 
-/// The steps of a start, each with its time, appended to Calcifer's log (`cozy logs calcifer`)
+/// The steps of a start, each with its time, appended to Calcifer's log (`cozy machine logs local calcifer`)
 /// beside Calcifer's own: a slow start names its slow step.
 struct Steps {
     log: PathBuf,

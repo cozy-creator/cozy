@@ -494,7 +494,7 @@ pub async fn serve(
         };
         let message = format!("output {name} of run {number} has not landed yet; the run {state}");
         let refusal = api::refuse(Kind::Conflict, "output_not_ready", message);
-        return Err(Refusal(refusal.0.next(format!("cozy run watch {number}"))));
+        return Err(Refusal(refusal.0.next(format!("cozy run show {number}"))));
     };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let octets = HeaderValue::from_static("application/octet-stream");

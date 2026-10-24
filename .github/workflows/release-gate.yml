@@ -203,7 +203,7 @@ jobs:
           umask 077; printf '%s' "$KEY" > "$RUNNER_TEMP/key.json"
           cozy login --key "$RUNNER_TEMP/key.json"; code=$?
           rm -f "$RUNNER_TEMP/key.json"
-          [ "$code" = 0 ] && cozy up
+          exit $code
       - name: Gate ${{ matrix.sku }} (${{ matrix.suite }})
         env:
           ARGS: ${{ steps.candidate.outputs.args }}
@@ -228,7 +228,7 @@ jobs:
           cp -r ~/.cozy/outputs "$OUT/outputs" 2>/dev/null || true
           m=$(cat "$OUT/machine" 2>/dev/null) || exit 0
           for _ in $(seq 1 30); do
-            timeout 30 cozy machine list --once 2>/dev/null | grep -q "^$m " || { echo "$m is gone"; exit 0; }
+            timeout 30 cozy machine list 2>/dev/null | grep -q "^$m " || { echo "$m is gone"; exit 0; }
             cozy machine end "$m" -y || true; sleep 10
           done
           echo "::error::$m is still listed: end it by hand (cozy machine end $m)"; exit 1

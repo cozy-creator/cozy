@@ -7,6 +7,7 @@ use protocol::error::Error;
 use crate::Context;
 
 mod catalog;
+mod from_run;
 mod machine;
 #[cfg(feature = "migrate")]
 mod migrate_headers;
@@ -30,11 +31,13 @@ enum Verb {
     Family(Family),
     /// The models machines hold.
     List(List),
-    /// Make a model present in a machine's store.
+    /// Make a model present in a machine's store. Follows it to its end; Ctrl-C stops following, never the work.
     Download(Download),
-    /// Make a model on a machine and upload it as a private checkpoint.
+    /// Make a model on a machine, or take a run's weights output (run:N), and upload it as a private
+    /// checkpoint. Follows it to its end; Ctrl-C stops following, never the work.
     Upload(Upload),
-    /// Write a model's int8, fp8, nvfp4, w4a8 or svdq-nvfp4 lane, or any lane, by the recipe a named package declares.
+    /// Write a model's lanes (--format int8,fp8,…), or any lane, by the recipe a named package
+    /// declares. Follows it to its end; Ctrl-C stops following, never the work.
     Quantize(Quantize),
     /// Release a commit: a public tag named by a version, created, moved, or a private one made public.
     Publish(Publish),
@@ -101,15 +104,13 @@ pub(crate) struct Download {
     alias: Option<String>,
     #[command(flatten)]
     placement: crate::run::Placement,
-    /// Print the run and return at once instead of following it.
-    #[arg(long)]
-    detach: bool,
 }
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Upload {
-    /// A provider source, local/<alias>, a Hub model or checkpoint, ./file.safetensors, or a
-    /// CozyTensors folder (all variants and repo files; its chunks may already be at the Hub).
+    /// A provider source, local/<alias>, a Hub model or checkpoint, ./file.safetensors, a
+    /// CozyTensors folder (all variants and repo files; its chunks may already be at the Hub), or
+    /// run:N[#output], a run's weights output, uploaded from the machine that holds it.
     #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::local))]
     source: String,
     /// Where it goes: org/name[@tag], the Hub repository and the private tag the upload moves (main).
@@ -119,13 +120,10 @@ pub(crate) struct Upload {
     profiles: Vec<String>,
     #[command(flatten)]
     placement: crate::run::Placement,
-    /// Print the run and return at once instead of following it.
-    #[arg(long)]
-    detach: bool,
 }
 
 #[derive(clap::Args, Debug)]
-#[command(group(ArgGroup::new("lane").required(true).args(["int8", "fp8", "nvfp4", "w4a8", "svdq_nvfp4", "recipe"])))]
+#[command(group(ArgGroup::new("lane").required(true).args(["format", "recipe"])))]
 pub(crate) struct Quantize {
     /// org/name[@release-or-tag] (main after an upload; none: its default) or org/name#sha256:….
     model: String,
@@ -133,21 +131,13 @@ pub(crate) struct Quantize {
     /// model's own.
     #[arg(value_name = "DESTINATION")]
     destination: Option<String>,
-    /// Write the int8 lane (int8-convrot).
-    #[arg(long)]
-    int8: bool,
-    /// Write the fp8 lane (row-scaled FP8).
-    #[arg(long)]
-    fp8: bool,
-    /// Write the nvfp4 lane (block-scaled FP4).
-    #[arg(long)]
-    nvfp4: bool,
-    /// Write the w4a8 lane (4-bit ConvRot codes on int8 tensor cores: Ampere, Ada, Hopper).
-    #[arg(long)]
-    w4a8: bool,
-    /// Write the svdq-nvfp4 lane (SVDQuant: an nvfp4 residual and a 16-bit low-rank branch, Blackwell).
-    #[arg(long)]
-    svdq_nvfp4: bool,
+    /// The lanes to write, comma-separated, one run each: int8 (int8-convrot), fp8 (row-scaled
+    /// FP8), nvfp4 (block-scaled FP4), w4a8 (4-bit ConvRot codes on int8 tensor cores: Ampere,
+    /// Ada, Hopper), svdq-nvfp4 (SVDQuant: an nvfp4 residual and a 16-bit low-rank branch,
+    /// Blackwell).
+    #[arg(long, value_name = "FORMAT,...", value_delimiter = ',', conflicts_with = "recipe",
+        value_parser = crate::run::interface::LANE_FLAGS)]
+    format: Vec<String>,
     /// Run the package's recipe of this name: any lane's (`drafter_head` writes a drafter).
     #[arg(long, value_name = "NAME")]
     recipe: Option<String>,
@@ -157,9 +147,6 @@ pub(crate) struct Quantize {
     package: Option<String>,
     #[command(flatten)]
     placement: crate::run::Placement,
-    /// Print the run and return at once instead of following it.
-    #[arg(long)]
-    detach: bool,
 }
 
 #[derive(clap::Args, Debug)]

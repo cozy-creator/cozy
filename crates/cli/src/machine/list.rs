@@ -16,8 +16,8 @@ pub(crate) const HEADERS: [&str; 12] = [
     "ENDS", "HUB",
 ];
 
-pub async fn list(ctx: &Context, once: bool) -> Result<ExitCode, Error> {
-    if !once && !ctx.json && ctx.term.stdout {
+pub async fn list(ctx: &Context) -> Result<ExitCode, Error> {
+    if !ctx.json && ctx.term.stdout {
         let view = super::live::Machines::open(ctx).await?;
         crate::tui::show(ctx, crate::tui::Screen::Machines(view)).await?;
         return Ok(ExitCode::SUCCESS);
@@ -120,9 +120,9 @@ pub(crate) fn rows(ctx: &Context, list: &MachineList) -> Vec<Vec<String>> {
 }
 
 /// One machine: a live view on a terminal while it lives, else its record once (or JSON).
-pub async fn show(ctx: &Context, name: &str, once: bool) -> Result<ExitCode, Error> {
+pub async fn show(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
     let m = machine(ctx, name).await?;
-    if !once && !ctx.json && ctx.term.stdout && m.state != MachineState::Ended {
+    if !ctx.json && ctx.term.stdout && m.state != MachineState::Ended {
         let view = super::live::Shown::open(ctx, name).await?;
         tui::show(ctx, tui::Screen::Machine(Box::new(view))).await?;
         return Ok(ExitCode::SUCCESS);
@@ -327,7 +327,7 @@ pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
                 if !toolchain.detail.is_empty() {
                     cell += &format!(" ({})", toolchain.detail);
                 }
-                cell += "; cozy machine toolchain install";
+                cell += "; it is fetched when a kernel first needs it";
                 if !toolchain.install.is_empty() {
                     cell += &format!(", and for a host compiler: {}", toolchain.install);
                 }

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# The `cli` suite: cozy as a person uses it on a computer with no GPU, Linux, macOS or Windows. Install, up,
-# status, the local machine, the candidates through `cozy machine update local`, a weightless request through
-# them, a real BiRefNet removal on the CPU, run list/show, a second executor (the machine restarted) with a new
-# input, down, uninstall.
+# The `cli` suite: cozy as a person uses it on a computer with no GPU, Linux, macOS or Windows. Install,
+# status, the local machine, the candidates through `cozy machine update local` (cozy doctor restarts the
+# installer's Calcifer on them and must find everything healthy), a weightless request through them, a real
+# BiRefNet removal on the CPU from a YAML request, run list/show, a second executor (the machine restarted)
+# with an --asset input, a stuck Calcifer that cozy doctor restarts, and removal as the README says.
 # A broken step is recorded and the suite goes on, so one run reports all of them.
 #   e2e/cli/run.sh --out DIR [--cozy-bin F] [--tensorfs-wheel F] [--runtime-wheel F] [--packages DIR]
 . "$(dirname "$0")/../lib.sh"
@@ -10,10 +11,10 @@ parse "$@"
 
 step install; install_cozy
 user_services
-step up; cozy --json up
 step status; cozy --json status | tee "$OUT/status.json"
 step "the local machine"; machine_ready
 step candidates; candidates
+step doctor; cozy --json doctor > "$OUT/doctor.json" || check "cozy doctor is not healthy: $(grep -o '"state": *"PROBLEM[^"]*"' "$OUT/doctor.json" | head -3)"
 
 # The candidate set end to end: a request through TensorD, the Runtime and TensorFS to the reply, no model.
 step "a weightless request"
@@ -31,9 +32,12 @@ if executor_reaped; then
   fi
 fi
 
-step "BiRefNet on the CPU"
+step "BiRefNet on the CPU, from a YAML request"
 dog=$(picture dog1.jpg)
-if cell first "$(birefnet)" --asset "image=$dog"; then white_background "$(output first webp)" "$dog" || check "first: not a background removal"; fi
+# The request file names its image relative to itself, as a person writes one beside their files.
+cp "$dog" "$OUT/request-dog.jpg"
+printf 'image: request-dog.jpg\n' > "$OUT/request.yaml"
+if cell first "$(birefnet)" --input "$OUT/request.yaml"; then white_background "$(output first webp)" "$dog" || check "first: not a background removal"; fi
 first=$(cat "$OUT/first.number")
 if [ "$first" != none ]; then
   grep -q '"number": *'"$first" "$OUT/first.json" || check "cozy run show $first does not show it"
@@ -50,7 +54,15 @@ if cell second "$(birefnet)" --asset "image=$dog"; then white_background "$(outp
 step "Calcifer reaps the machine it started"; machine_reaped
 step "a restarted Calcifer adopts the machine"; calcifer_restart_adopts
 
-step down; cozy --json down || check "cozy down failed"
-step uninstall; cozy uninstall --yes || check "cozy uninstall failed"
-[ ! -e "$COZY" ] || check "cozy uninstall left $COZY"
+step "Calcifer stopped under the machine it started"
+if calcifer_orphaned; then
+  (cd "$(dirname "$0")" && cell after-orphan ./weightless/reverse "text=orphan$RANDOM") || check "no run went after cozy doctor recovered Calcifer"
+fi
+
+step "a stuck Calcifer"
+if calcifer_stuck; then
+  (cd "$(dirname "$0")" && cell after-stuck ./weightless/reverse "text=after$RANDOM") || check "no run went after cozy doctor restarted Calcifer"
+fi
+
+step "remove cozy"; remove_cozy
 finish "cli: runs $first and $(cat "$OUT/second.number")"

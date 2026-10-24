@@ -30,10 +30,22 @@ mod show;
 mod spec;
 pub(crate) mod target;
 pub(crate) mod tree;
-mod upload;
+
+/// `cozy run --help`'s examples: a YAML request file first, inline inputs as overrides.
+const EXAMPLES: &str = "Examples:
+  cozy run sdxl/generate --input request.yaml
+      request.yaml:  prompt: a lighthouse at dusk, oil painting
+                     aspect_ratio: \"16:9\"
+                     seed: 7
+  cozy run sdxl/generate --input request.yaml seed=8   (an inline input overrides the file)
+  cozy run birefnet/remove_background --asset image=./character.png
+  cozy run sdxl/generate prompt='a fox in fresh snow'  (inline, for quick runs)
+  cozy run sdxl/generate --describe                    (the fields it takes)
+
+A run is followed to its end: Ctrl-C stops following, never the run; `cozy run show N` follows it again.";
 
 #[derive(clap::Args, Debug)]
-#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true, after_help = EXAMPLES)]
 pub struct Args {
     #[command(subcommand)]
     verb: Option<Verb>,
@@ -78,18 +90,12 @@ struct RunArgs {
     /// Where the outputs land (default ~/.cozy/outputs).
     #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
     out: Option<PathBuf>,
-    /// Print the run's record at once instead of following it.
-    #[arg(long)]
-    detach: bool,
     /// Keep the function ready instead of running it.
     #[arg(long, value_enum, value_name = "LEVEL")]
     warm: Option<Warm>,
     /// Print the function's request contract instead of running it.
     #[arg(long)]
     describe: bool,
-    /// Names one submission forever: a retry with it never runs twice.
-    #[arg(long, value_name = "KEY")]
-    idempotency_key: Option<String>,
 }
 
 /// Where a run goes; shared by every verb that submits one.
@@ -133,22 +139,15 @@ enum Verb {
         /// At most N runs (default 50; 0 shows all).
         #[arg(long, value_name = "N")]
         limit: Option<u64>,
-        /// One snapshot even on a terminal, instead of the live view.
-        #[arg(long)]
-        once: bool,
     },
-    /// One run: its result, outputs, calls, logs and how it ran.
+    /// One run: its result, outputs, calls, logs and how it ran. A run not yet settled is
+    /// followed to its end (Ctrl-C stops following, never the run); its exit code is the run's.
     Show {
         /// The run's number or id.
         run: String,
-        /// One snapshot even on a terminal, instead of following a run not yet settled as `watch` does.
+        /// A snapshot of a run still going, instead of following it.
         #[arg(long)]
         once: bool,
-    },
-    /// Follow a run until it ends; Ctrl-C stops watching, never the run.
-    Watch {
-        /// The run's number or id.
-        run: String,
     },
     /// Cancel a queued or running run.
     Cancel {
@@ -166,18 +165,6 @@ enum Verb {
         #[arg(long, default_value = "24h")]
         expires: String,
     },
-    /// Upload a run's weights output as a private checkpoint in org/model, from its machine.
-    Upload {
-        /// The run's number or id, and `#output` when it wrote more than one.
-        #[arg(value_name = "RUN[#OUTPUT]")]
-        run: String,
-        /// Where it goes: org/model[@tag], the repository and the private tag it moves (main).
-        #[arg(value_name = "ORG/MODEL[@TAG]")]
-        model: String,
-        /// Print the upload's run record at once instead of following it.
-        #[arg(long)]
-        detach: bool,
-    },
 }
 
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
@@ -187,7 +174,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             package,
             on,
             limit,
-            once,
         }) => {
             let query = list::Query {
                 status: state,
@@ -196,13 +182,9 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
                 before: None,
                 limit,
             };
-            list::exec(ctx, query, once).await
+            list::exec(ctx, query).await
         }
         Some(Verb::Show { run, once }) => show::exec(ctx, &run, once).await,
-        Some(Verb::Watch { run }) => {
-            let run = ctx.calcifer().await?.run(&run).await?;
-            Ok(exit_code(&follow(ctx, run, false).await?))
-        }
         Some(Verb::Cancel { run }) => {
             let calcifer = ctx.calcifer().await?;
             let mut run = calcifer.run(&run).await?;
@@ -217,7 +199,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             output,
             expires,
         }) => play::exec(ctx, &run, &output, &expires).await,
-        Some(Verb::Upload { run, model, detach }) => upload::exec(ctx, &run, &model, detach).await,
         None => run(ctx, *args.run).await,
     }
 }
@@ -355,8 +336,8 @@ impl std::fmt::Display for Callee<'_> {
 }
 
 /// `cozy run <package>/<function> <inputs…> [--lane …] --on …` for another verb: `model quantize`
-/// runs a package's recipes this way. The run as it settled, or as sent with `detach`; its record
-/// is printed either way.
+/// runs a package's recipes this way. The run as it settled, or as it was when Ctrl-C stopped
+/// following it; its record is printed either way.
 pub(crate) async fn call(
     ctx: &Context,
     callee: &Callee<'_>,
@@ -364,7 +345,6 @@ pub(crate) async fn call(
     inputs: Vec<String>,
     lane: Option<&str>,
     placement: &Placement,
-    detach: bool,
 ) -> Result<Run, Error> {
     let args = RunArgs {
         target: None,
@@ -378,10 +358,8 @@ pub(crate) async fn call(
         fidelities: vec![],
         loras: vec![],
         out: None,
-        detach,
         warm: None,
         describe: false,
-        idempotency_key: None,
     };
     match callee {
         Callee::Release { package, card } => invoke(ctx, package, function, card, args).await,
@@ -465,10 +443,10 @@ async fn call_code(
     };
     let mut submission = call.submission(on, &hub.origin, &spec, bound.as_ref(), out);
     submission.inputs.extend(code.files.iter().cloned());
-    send(ctx, submission, &terms.key, args.detach).await
+    send(ctx, submission, &terms.key).await
 }
 
-/// The terms a run was given; an omitted key is minted, as the seed derives from it.
+/// The terms a run was given, under a key minted for this request (its seed derives from it).
 fn terms(ctx: &Context, args: &RunArgs) -> Result<Terms, Error> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::new(Kind::Internal, "cwd", format!("the working directory: {e}")))?;
@@ -478,10 +456,7 @@ fn terms(ctx: &Context, args: &RunArgs) -> Result<Terms, Error> {
         assets: args.assets.clone(),
         fidelities: args.fidelities.clone(),
         loras: args.loras.clone(),
-        key: args
-            .idempotency_key
-            .clone()
-            .unwrap_or_else(follow::mint_key),
+        key: follow::mint_key(),
         cwd,
         user_home: ctx.user_home.clone(),
         digests: Some(ctx.home.root().join("cache").join("digests")),
@@ -530,10 +505,10 @@ fn fidelity(term: &str) -> Result<String, String> {
     }
 }
 
-/// Submits, then follows the run (or prints it at once with `detach`).
-async fn send(ctx: &Context, submission: SubmitRun, key: &str, detach: bool) -> Result<Run, Error> {
+/// Submits, then follows the run.
+async fn send(ctx: &Context, submission: SubmitRun, key: &str) -> Result<Run, Error> {
     let submitted = submit(ctx, submission, Some(key)).await?;
-    follow(ctx, submitted.run, detach).await
+    follow(ctx, submitted.run).await
 }
 
 /// Warns that a GPU function sent to a ready machine with no supported GPU (an NVIDIA GPU, or an

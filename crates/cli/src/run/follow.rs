@@ -3,7 +3,7 @@
 //! followed run is over once it ended and each output's last revision landed here (checked
 //! against its digest) or failed; an output not saved fails the follow. Ctrl-C (Esc or q in
 //! `cozy run list`) stops following and never cancels: the run is Calcifer's, and `cozy run
-//! watch` reattaches.
+//! show` reattaches.
 use std::{
     collections::{HashSet, VecDeque},
     fmt::Write as _,
@@ -64,7 +64,7 @@ pub(crate) fn mint_key() -> String {
     format!("idem-{}", hex::encode(bytes))
 }
 
-/// 0 for a run that completed or goes on (detached), 1 for one that failed or was canceled.
+/// 0 for a run that completed or goes on (no longer followed), 1 for one that failed or was canceled.
 pub(crate) fn exit_code(run: &Run) -> ExitCode {
     match run.status {
         Status::Failed | Status::Canceled => ExitCode::FAILURE,
@@ -72,18 +72,14 @@ pub(crate) fn exit_code(run: &Run) -> ExitCode {
     }
 }
 
-/// Follows `run` to its end and its outputs to this computer, or prints it at once with
-/// `detach`; answers the run as it ended, or as it was when following stopped. An output that
-/// was not saved is a refusal naming it, after the record.
-pub(crate) async fn follow(ctx: &Context, run: Run, detach: bool) -> Result<Run, Error> {
-    if detach {
-        record(ctx, &run);
-        return Ok(run);
-    }
+/// Follows `run` to its end and its outputs to this computer, until Ctrl-C, which stops following
+/// and never the run; answers the run as it ended, or as it was when following stopped. An output
+/// that was not saved is a refusal naming it, after the record.
+pub(crate) async fn follow(ctx: &Context, run: Run) -> Result<Run, Error> {
     follow_until(ctx, run, interrupt()).await
 }
 
-/// `cozy run watch` until `stop`, which never cancels the run: the live view, then the record.
+/// `cozy run show` until `stop`, which never cancels the run: the live view, then the record.
 pub(crate) async fn follow_until(
     ctx: &Context,
     run: Run,
@@ -138,7 +134,7 @@ fn saved(run: Run) -> Result<Run, Error> {
         ),
     )
     .remedy(format!(
-        "`cozy run watch {}` saves what its machine still holds",
+        "`cozy run show {}` saves what its machine still holds",
         run.number
     ))
     .next(&show))
@@ -182,8 +178,8 @@ async fn watch(
                 let run = calcifer.run(id.as_str()).await?;
                 let n = run.number;
                 output::say(ctx, &match settled(&run) {
-                    true => format!("detached: run {n} ended and its outputs are still being saved; `cozy run watch {n}` follows them"),
-                    false => format!("detached: run {n} keeps running; `cozy run watch {n}` follows it again, `cozy run cancel {n}` cancels it"),
+                    true => format!("stopped following: run {n} ended and its outputs are still being saved; `cozy run show {n}` follows them"),
+                    false => format!("stopped following: run {n} keeps running; `cozy run show {n}` follows it again, `cozy run cancel {n}` cancels it"),
                 });
                 return Ok((run, true));
             }
@@ -355,40 +351,14 @@ fn adjustment(row: &Adjustment) -> String {
     line
 }
 
-/// The Runtime's warnings a local compile would answer (K's codes): the toolchain is offered,
-/// never installed on its own.
-const TOOLCHAIN_WOULD_HELP: [&str; 4] = [
-    "kernel_prebuilt_missing",
-    "kernel_verify_failed",
-    "extension_needs_toolchain",
-    "triton_no_compiler",
-];
-
-/// What to do next with `run`: watch it while it goes on, show it when it did not succeed, and
-/// the machine's toolchain when a warning says a local compile would have served it.
+/// What to do next with `run`: follow it while it goes on, show it when it did not succeed.
 pub(super) fn next(ctx: &Context, run: &Run) {
-    let watch = format!("cozy run watch {}", run.number);
+    let watch = format!("cozy run show {}", run.number);
     let show = format!("cozy run show {}", run.number);
     match run.status {
         Status::Completed => {}
         Status::Failed | Status::Canceled => output::next(ctx, &[&show]),
         _ => output::next(ctx, &[&watch]),
-    }
-    toolchain_offer(ctx, run);
-}
-
-/// `cozy machine toolchain install` when a warning of `run` says a local compile would have
-/// served it.
-pub(super) fn toolchain_offer(ctx: &Context, run: &Run) {
-    let compile = run
-        .warnings
-        .iter()
-        .any(|w| TOOLCHAIN_WOULD_HELP.contains(&w.code.as_str()));
-    if let (true, Some(machine)) = (compile, &run.machine) {
-        output::next(
-            ctx,
-            &[&format!("cozy machine toolchain install --on {machine}")],
-        );
     }
 }
 

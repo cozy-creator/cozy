@@ -15,7 +15,7 @@ mod end;
 mod list;
 pub(crate) mod live;
 mod local;
-pub(crate) use local::{Adopted, adopt, end, root_and_store};
+pub(crate) use local::{Adopted, adopt};
 mod rent;
 
 pub(crate) use list::status_fields;
@@ -32,19 +32,12 @@ pub struct Args {
 #[allow(dead_code)]
 #[derive(Subcommand, Debug)]
 enum Verb {
-    /// Every machine: this computer's, rentals on every Hub, and added ones.
-    List {
-        /// One snapshot even on a terminal, instead of the live view.
-        #[arg(long)]
-        once: bool,
-    },
-    /// One machine and what it reports of itself.
+    /// Every machine: this computer's, rentals on every Hub, and added ones; live on a terminal.
+    List,
+    /// One machine and what it reports of itself; live on a terminal while it lives.
     Show {
         /// A machine name or rental id.
         name: String,
-        /// One snapshot even on a terminal, instead of the live view.
-        #[arg(long)]
-        once: bool,
     },
     /// Print a machine's log: its own, or the tensorfs or memory log it keeps.
     Logs {
@@ -53,7 +46,8 @@ enum Verb {
         #[command(flatten)]
         query: crate::daemon::LogQuery,
     },
-    /// Rent a machine; with no SKU, list what is for rent.
+    /// Rent a machine; with no SKU, list what is for rent. Follows its boot; Ctrl-C stops following,
+    /// never the order.
     Rent(rent::Rent),
     /// End a rental (billing stops once its Hub confirms), or remove an added machine, once
     /// its runs' outputs have landed here.
@@ -89,11 +83,6 @@ enum Verb {
         #[arg(long, value_name = "SIZE|off", value_parser = gpu_memory_limit)]
         gpu_memory_limit: Option<u64>,
     },
-    /// A machine's build toolchain, for cards no prebuilt kernel serves.
-    Toolchain {
-        #[command(subcommand)]
-        verb: ToolchainVerb,
-    },
     /// Add another computer's machine by its address and TLS fingerprint.
     Add {
         name: String,
@@ -107,20 +96,10 @@ enum Verb {
     Authorize { public_key: String },
 }
 
-#[derive(Subcommand, Debug)]
-enum ToolchainVerb {
-    /// Install CUDA's compiler, its headers and ninja on the machine (about 130 MB), as a run.
-    Install {
-        /// The machine.
-        #[arg(long, default_value = "local")]
-        on: String,
-    },
-}
-
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     match args.verb {
-        Verb::List { once } => list::list(ctx, once).await,
-        Verb::Show { name, once } => list::show(ctx, &name, once).await,
+        Verb::List => list::list(ctx).await,
+        Verb::Show { name } => list::show(ctx, &name).await,
         Verb::Logs { name, query } => crate::daemon::machine_log(ctx, &name, &query).await,
         Verb::Rent(rent) => rent::exec(ctx, rent).await,
         Verb::End { name, force } => end::end(ctx, &name, force).await,
@@ -137,9 +116,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             tensord,
             gpu_memory_limit,
         } => end::update(ctx, &name, runtime, tensorfs, tensord, gpu_memory_limit).await,
-        Verb::Toolchain {
-            verb: ToolchainVerb::Install { on },
-        } => end::toolchain(ctx, &on).await,
         Verb::Authorize { public_key } => local::authorize(ctx, &public_key).await,
     }
 }

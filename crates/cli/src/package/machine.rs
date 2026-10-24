@@ -1,10 +1,6 @@
-//! `cozy package install|update|remove|list`: runs on a machine through Calcifer. The machine
-//! resolves releases from the Hub and owns its environments; the CLI reads nothing from the Hub.
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    process::ExitCode,
-};
+//! `cozy package install|remove|list`: runs on a machine through Calcifer. The machine resolves
+//! releases from the Hub and owns its environments; the CLI reads nothing from the Hub.
+use std::{path::Path, process::ExitCode};
 
 use protocol::{
     calcifer::{self, Environment, Machine, MachineState, On, Run, Status, SubmitRun},
@@ -95,7 +91,6 @@ pub async fn install(
     ctx: &Context,
     package: &PackageRef,
     on: On,
-    detach: bool,
 ) -> Result<ExitCode, Error> {
     let hub = ctx.hub()?;
     let name = package.package();
@@ -106,7 +101,7 @@ pub async fn install(
     let warm = spec(v1::RunKind::Warm, release(&name, &chosen), String::new());
     let target = format!("{name}@{chosen}");
     let submitted = submit(ctx, on, &hub.origin, calcifer::Kind::Warm, target, warm).await?;
-    installed(ctx, submitted, &name, detach).await
+    installed(ctx, submitted, &name).await
 }
 
 /// A directory or a PEP 723 script, installed live: the next run reads its files as they are
@@ -115,12 +110,11 @@ pub async fn install_directory(
     ctx: &Context,
     path: &Path,
     on: On,
-    detach: bool,
 ) -> Result<ExitCode, Error> {
     let local = super::local::source(ctx, path, &on).await?;
     let ask = run::local::install_run(&ctx.home, &ctx.hub()?.origin, on, &local);
     let submitted = run::submit(ctx, ask, None).await?.run;
-    installed(ctx, submitted, &local.package, detach).await
+    installed(ctx, submitted, &local.package).await
 }
 
 /// Follows an install to its outcome and says what the machine holds now.
@@ -128,10 +122,9 @@ async fn installed(
     ctx: &Context,
     submitted: Run,
     package: &str,
-    detach: bool,
 ) -> Result<ExitCode, Error> {
-    let settled = run::follow(ctx, submitted, detach).await?;
-    if detach || ctx.json || settled.status != Status::Completed {
+    let settled = run::follow(ctx, submitted).await?;
+    if ctx.json || settled.status != Status::Completed {
         return Ok(run::exit_code(&settled));
     }
     let installed: Option<Installed> = settled
@@ -146,17 +139,7 @@ async fn installed(
             &format!("{package}@{} is installed on {machine}", installed.release),
         );
         if !package.starts_with("local/") {
-            let on = On::Machine(machine.clone());
-            let held = machines(ctx, Some(&on)).await?.remove(0);
-            let older: Vec<&str> = (environments(ctx, &held)?.into_iter())
-                .filter(|env| env.package == package && env.release != installed.release)
-                .map(|env| env.release.as_str())
-                .collect();
-            if !older.is_empty() {
-                let older = older.join(", ");
-                output::say(ctx, &format!("{machine} also holds {package}@{older}"));
-                next.insert(0, format!("cozy package update {package} --on {machine}"));
-            }
+            retire(ctx, &machine, package, &installed.release).await?;
         }
         let first = run::interface::Interface::parse(&installed.interface)
             .ok()
@@ -167,6 +150,36 @@ async fn installed(
     }
     output::next(ctx, &next.iter().map(String::as_str).collect::<Vec<_>>());
     Ok(ExitCode::SUCCESS)
+}
+
+/// Installing over an installed package updates it: the machine's older releases of `package` on
+/// the same Hub go once `release` is in. A newer one stays (a pre-release, or one the Hub yanked
+/// since), and one that will not go is said, never a failure of the install.
+async fn retire(ctx: &Context, machine: &str, package: &str, release: &str) -> Result<(), Error> {
+    let on = On::Machine(machine.to_owned());
+    let held = machines(ctx, Some(&on)).await?.remove(0);
+    let envs = environments(ctx, &held)?;
+    let hub = envs
+        .iter()
+        .find(|env| env.package == package && env.release == release)
+        .map(|env| canonical(&env.hub));
+    let Some(hub) = hub else { return Ok(()) };
+    for env in envs.iter().filter(|env| {
+        env.package == package
+            && canonical(&env.hub) == hub
+            && env.release != release
+            && tensorfs::format::newest_by([env.release.as_str(), release], |r| *r) == Some(release)
+    }) {
+        let source = Source::Installation(env.installation.clone());
+        let target = format!("{package}@{}", env.release);
+        let removal = spec(v1::RunKind::Remove, source, String::new());
+        let ran = settle(ctx, submit(ctx, on.clone(), &hub, calcifer::Kind::Remove, target, removal).await?).await?;
+        match ran.status {
+            Status::Completed => output::say(ctx, &format!("{package}@{} left {machine}", env.release)),
+            _ => output::say(ctx, &format!("{package}@{} stays on {machine}: {}", env.release, failure(&ran))),
+        }
+    }
+    Ok(())
 }
 
 /// The machines this command reads: `on` alone, read from the machine now (so a run that just
@@ -314,8 +327,8 @@ impl Held<'_> {
     }
 }
 
-pub async fn list(ctx: &Context, on: Option<On>, once: bool) -> Result<ExitCode, Error> {
-    if !once && !ctx.json && ctx.term.stdout {
+pub async fn list(ctx: &Context, on: Option<On>) -> Result<ExitCode, Error> {
+    if !ctx.json && ctx.term.stdout {
         let view = super::live::Packages::open(ctx, on).await?;
         crate::tui::show(ctx, crate::tui::Screen::Packages(view)).await?;
         return Ok(ExitCode::SUCCESS);
@@ -443,146 +456,3 @@ pub async fn remove(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
     })
 }
 
-#[derive(Serialize)]
-struct Updated {
-    package: String,
-    hub: String,
-    from: Vec<String>,
-    to: String,
-    status: &'static str,
-    detail: String,
-}
-
-/// Each published (package, Hub) the machine holds moves to that Hub's newest release, then its
-/// older releases leave. A newer one stays (a pre-release, or one the Hub yanked since).
-/// Moves packages on a machine: each directory or script installs live; each named package goes
-/// to the release named, else its Hub's newest, and its other releases there go. With nothing
-/// named, every published package moves to its newest.
-pub async fn update(ctx: &Context, named: &[(String, Option<String>)], paths: &[PathBuf], on: On) -> Result<ExitCode, Error> {
-    for path in paths {
-        let code = install_directory(ctx, path, on.clone(), false).await?;
-        if code != ExitCode::SUCCESS {
-            return Ok(code);
-        }
-    }
-    if !paths.is_empty() && named.is_empty() {
-        return Ok(ExitCode::SUCCESS);
-    }
-    let names: Vec<String> = named.iter().map(|(name, _)| name.clone()).collect();
-    let wanted = |package: &str| named.iter().find(|(name, _)| name == package).and_then(|(_, r)| r.clone()).unwrap_or_default();
-    let machine = machines(ctx, Some(&on)).await?.remove(0);
-    let envs = environments(ctx, &machine)?;
-    held(&names, &envs, &machine.name)?;
-    let mut groups: BTreeMap<(&str, String), Vec<&Environment>> = BTreeMap::new();
-    for env in envs
-        .iter()
-        .filter(|env| names.is_empty() || names.contains(&env.package))
-    {
-        groups
-            .entry((&env.package, canonical(&env.hub)))
-            .or_default()
-            .push(env);
-    }
-    let on = || On::Machine(machine.name.clone());
-    let mut rows = vec![];
-    for ((package, hub), held) in groups {
-        let hub = hub.as_str();
-        let mut row = Updated {
-            package: package.to_owned(),
-            hub: hub_label(ctx, hub),
-            from: held.iter().map(|env| env.release.clone()).collect(),
-            to: String::new(),
-            status: "skipped",
-            detail: String::new(),
-        };
-        if hub.is_empty() || package.starts_with("local/") {
-            row.detail = "local code: install its directory again to change it".into();
-            rows.push(row);
-            continue;
-        }
-        // A catalog revision no ask used before makes the machine read the Hub's newest again.
-        let chosen = wanted(package);
-        let warm = spec(v1::RunKind::Warm, release(package, &chosen), fresh());
-        let ran = settle(
-            ctx,
-            submit(
-                ctx,
-                on(),
-                hub,
-                calcifer::Kind::Warm,
-                package.to_owned(),
-                warm,
-            )
-            .await?,
-        )
-        .await?;
-        if ran.status != Status::Completed {
-            (row.status, row.detail) = ("failed", failure(&ran));
-            rows.push(row);
-            continue;
-        }
-        row.to = ran
-            .result
-            .and_then(|r| r["release"].as_str().map(str::to_owned))
-            .unwrap_or_default();
-        row.status = if row.from.contains(&row.to) {
-            "current"
-        } else {
-            "updated"
-        };
-        for env in held
-            .iter()
-            .filter(|env| {
-                let older = [env.release.as_str(), row.to.as_str()];
-                env.release != row.to
-                    && (!chosen.is_empty() || tensorfs::format::newest_by(older, |r| *r) == Some(row.to.as_str()))
-            })
-        {
-            let source = Source::Installation(env.installation.clone());
-            let target = format!("{package}@{}", env.release);
-            let removal = spec(v1::RunKind::Remove, source, String::new());
-            let ran = settle(
-                ctx,
-                submit(ctx, on(), hub, calcifer::Kind::Remove, target, removal).await?,
-            )
-            .await?;
-            row.status = "updated";
-            if ran.status != Status::Completed {
-                row.detail = format!("{package}@{} stays: {}", env.release, failure(&ran));
-            }
-        }
-        rows.push(row);
-    }
-    let failed = rows.iter().any(|row| row.status == "failed");
-    if ctx.json {
-        output::json(&serde_json::json!({ "machine": machine.name, "packages": rows }));
-    } else {
-        let mut table = Table::new(ctx, ["PACKAGE", "FROM", "TO", "STATUS", "HUB", "DETAIL"]);
-        for row in &rows {
-            let from = row.from.join(", ");
-            let cells = [
-                &row.package,
-                &from,
-                &row.to,
-                row.status,
-                &row.hub,
-                &row.detail,
-            ];
-            table = table.row(cells.map(|cell| cell.to_string()));
-        }
-        table.note("Model downloads: skipped.").print();
-    }
-    Ok(if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
-}
-
-/// A catalog revision no earlier ask used.
-fn fresh() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("update-{:x}-{:x}", now.as_nanos(), std::process::id())
-}

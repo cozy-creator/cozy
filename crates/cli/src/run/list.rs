@@ -32,10 +32,10 @@ pub struct Query {
     pub limit: Option<u64>,
 }
 
-pub async fn exec(ctx: &Context, mut query: Query, once: bool) -> Result<ExitCode, Error> {
+pub async fn exec(ctx: &Context, mut query: Query) -> Result<ExitCode, Error> {
     let limit = query.limit.unwrap_or(SHOWN);
     query.limit = (limit > 0).then_some(limit);
-    if !once && !ctx.json && ctx.term.stdout {
+    if !ctx.json && ctx.term.stdout {
         let view = live::Runs::open(ctx, query, limit).await?;
         tui::show(ctx, tui::Screen::Runs(view)).await?;
         return Ok(ExitCode::SUCCESS);

@@ -1,6 +1,6 @@
 //! The machine's build toolchain on demand (xs-043 TC): CUDA's compiler, its headers and runtime
-//! pieces, and ninja, as pip wheels in `<engine>/toolchain`, installed only when asked (`cozy
-//! machine toolchain install`, an update run). Executors then find them through `CUDA_HOME` and
+//! pieces, and ninja, as pip wheels in `<engine>/toolchain`, installed on a kernel's first need
+//! (a verdict no prebuilt served, `Updates::kernels`), as an update run. Executors then find them through `CUDA_HOME` and
 //! `PATH`, locations only. A host C/C++ compiler is the OS's: its absence is said with the command
 //! that installs it. Images that bake a toolchain read as ready with nothing installed.
 use std::{

@@ -48,7 +48,7 @@ pub(super) fn run(command: &mut Command, code: &str) -> Result<String, Error> {
             "uv_unavailable",
             format!("{} is gone", command.get_program().to_string_lossy()),
         )
-        .next("cozy tools install uv")
+        .remedy("run it again: cozy fetches uv when it is missing")
         .next("cozy doctor"),
         _ => refuse(code, e),
     })?;

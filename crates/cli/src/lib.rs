@@ -24,7 +24,6 @@ mod package;
 mod run;
 pub mod tools;
 pub mod tui;
-mod uninstall;
 mod update;
 
 pub use context::Context;
@@ -42,7 +41,7 @@ struct Cli {
     /// The Hub to use instead of the current one (`cozy hub use`).
     #[arg(long, global = true, value_name = "HUB", add = ArgValueCompleter::new(completion::hubs))]
     tensorhub: Option<String>,
-    /// Agree without being asked: to a rental's quote, an uninstall, a deletion.
+    /// Agree without being asked: to a rental's quote, a deletion.
     #[arg(long, short = 'y', global = true)]
     yes: bool,
     #[command(subcommand)]
@@ -69,24 +68,15 @@ enum Command {
     Hub(hub::Args),
     /// Rental credit: balance, history, buy.
     Credits(credits::Args),
-    /// Start Calcifer.
-    Up(daemon::Up),
-    /// Stop Calcifer. Runs on machines continue.
-    Down(daemon::Down),
     /// Calcifer, machines and runs at a glance.
     Status(daemon::Status),
-    /// Calcifer's or a machine's log.
-    Logs(daemon::Logs),
     /// Replace this binary with the newest release.
     Update(update::Args),
-    /// Remove cozy from this computer: its services, ~/.cozy and its PATH lines.
-    Uninstall(uninstall::Args),
     /// Print a shell completion script.
     Completion(completion::Args),
-    /// Check a machine: driver, GPUs, toolchain, kernels.
+    /// Diagnose this computer's cozy (Calcifer, its service, the machine) and fix a stuck Calcifer;
+    /// then a machine's driver, GPUs, toolchain and kernels.
     Doctor(doctor::Args),
-    /// The tools cozy uses on this computer, and installing the ones it fetches itself.
-    Tools(tools::Args),
 }
 
 /// Parses the command line, loads the config once, runs the verb and renders its refusal. Exit
@@ -154,14 +144,9 @@ async fn dispatch(ctx: &Context, command: Command) -> Result<ExitCode, Error> {
         Command::Whoami(args) => account::whoami(ctx, args).await,
         Command::Hub(args) => hub::exec(ctx, args).await,
         Command::Credits(args) => credits::exec(ctx, args).await,
-        Command::Up(args) => daemon::up(ctx, args).await,
-        Command::Down(args) => daemon::down(ctx, args).await,
         Command::Status(args) => daemon::status(ctx, args).await,
-        Command::Logs(args) => daemon::logs(ctx, args).await,
         Command::Update(args) => update::exec(ctx, args).await,
-        Command::Uninstall(args) => uninstall::exec(ctx, args).await,
         Command::Completion(args) => completion::exec(ctx, args).await,
         Command::Doctor(args) => doctor::exec(ctx, args).await,
-        Command::Tools(args) => tools::exec(ctx, args).await,
     }
 }

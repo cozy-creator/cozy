@@ -1,4 +1,4 @@
-//! `cozy run upload N[#output] org/model`: a run's weights output as a private checkpoint in
+//! `cozy model upload run:N[#output] org/model`: a run's weights output as a private checkpoint in
 //! the owner's repository, uploaded by the machine that holds it, without running it again.
 use std::process::ExitCode;
 
@@ -8,20 +8,17 @@ use protocol::{
     machine::{self as v1, ModelChoice},
 };
 
-use super::{exit_code, follow, submit};
-use crate::{Context, model::refs};
+use crate::{
+    Context,
+    run::{exit_code, follow, submit},
+};
 
-pub async fn exec(
-    ctx: &Context,
-    reference: &str,
-    model: &str,
-    detach: bool,
-) -> Result<ExitCode, Error> {
+/// `reference` is `N[#output]`, after `run:`; `destination` is already parsed.
+pub(crate) async fn upload(ctx: &Context, reference: &str, destination: &str) -> Result<ExitCode, Error> {
     let (number, output) = match reference.split_once('#') {
         Some((number, output)) => (number, Some(output)),
         None => (reference, None),
     };
-    let destination = refs::destination(model)?;
     let run = ctx.calcifer().await?.run(number).await?;
     let item = weights(&run, output)?;
     let machine = run.machine.clone().ok_or_else(|| {
@@ -43,9 +40,9 @@ pub async fn exec(
         )
         .next("cozy login <email>"));
     }
-    let submission = submission(&run, item, machine, &destination);
+    let submission = submission(&run, item, machine, destination);
     let submitted = submit(ctx, submission, None).await?;
-    Ok(exit_code(&follow(ctx, submitted.run, detach).await?))
+    Ok(exit_code(&follow(ctx, submitted.run).await?))
 }
 
 /// The weights output named `output`, else the run's only one.
