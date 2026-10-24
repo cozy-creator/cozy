@@ -751,13 +751,18 @@ impl State {
     /// Where a fill is recorded: its request's record, else (a load's, or one with no request
     /// open) the next request's, which opens with them.
     fn fills(&mut self, req: Option<u64>, key: Key, bytes: u64, origin: Origin) -> &mut Stats {
+        if !req.is_some_and(|r| self.stats.contains_key(&r)) {
+            let set = self.sets.get(key.0 as usize).and_then(Option::as_ref).map(|m| m.spec.name.clone()).unwrap_or_default();
+            self.unclaimed.trace.push(Ref { step: 0, set, block: key.1, bytes, origin, speculative: false });
+        }
+        self.record(req)
+    }
+
+    /// The record a page's bytes count in: its request's, else the unclaimed one.
+    fn record(&mut self, req: Option<u64>) -> &mut Stats {
         match req.filter(|r| self.stats.contains_key(r)) {
             Some(r) => self.stats.entry(r).or_default(),
-            None => {
-                let set = self.sets.get(key.0 as usize).and_then(Option::as_ref).map(|m| m.spec.name.clone()).unwrap_or_default();
-                self.unclaimed.trace.push(Ref { step: 0, set, block: key.1, bytes, origin, speculative: false });
-                &mut self.unclaimed
-            }
+            None => &mut self.unclaimed,
         }
     }
 
@@ -847,6 +852,9 @@ struct Inner {
     /// Pages the mechanism thread mapped and has not handed to the fill threads yet (demand,
     /// ahead): it hands them over together once its queue is empty or they make a batch.
     grouped: Mutex<(Vec<Job>, Vec<Job>)>,
+    /// Leased pages asked of the manager and not answered yet: their grants reach the fill
+    /// threads as one batch once the last is in (or the batch's bytes are reached).
+    asking: AtomicU64,
     burst: Arc<(Mutex<Burst>, Condvar)>,
     quiet: Arc<Quiet>,
     ownership_lost: AtomicBool,
@@ -949,6 +957,7 @@ impl Memory {
                 releases,
                 jobs: Jobs { demand, ahead },
                 grouped: Mutex::default(),
+                asking: AtomicU64::new(0),
                 burst: Arc::new((Mutex::new(Burst::default()), Condvar::new())),
                 quiet: Arc::default(),
                 ownership_lost: AtomicBool::new(false),
@@ -1462,6 +1471,7 @@ impl Inner {
         let (ns, bytes) = (start.elapsed().as_nanos() as u64, pages.iter().map(|(_, (.., span))| span).sum::<u64>().max(1));
         #[cfg(unix)]
         self.read_measured(bytes, ns);
+        tracing::debug!(target: "varena::fill", pages = pages.len(), bytes, ns, "fill batch");
         // After a copy error the engine's copies may still run: a failed page is unmapped only
         // once the copy stream is proven drained.
         let ownership_lost = landed.iter().any(|out| matches!(out, Err(Error::Ownership(_))));
@@ -2696,6 +2706,9 @@ impl Inner {
         if let Some(agent) = self.lease.get().cloned() {
             let (start, region) = (Instant::now(), self.lease_region(key));
             let me = Arc::downgrade(self);
+            // Answered exactly once (granted, refused, or failed when the manager goes):
+            // `leased_page` counts it out.
+            self.asking.fetch_add(1, Ordering::AcqRel);
             let asked = agent.ask(
                 span,
                 crate::lease::Kind::Weights,
@@ -2762,8 +2775,9 @@ impl Inner {
                 if let Some(h) = st.homes.get_mut(&key) {
                     h.phys = Some(p);
                 }
+                // The lease's time only: the fill itself is traced once, by its batch.
                 if let Some(ns) = ns {
-                    let s = st.fills(job.req, key, span, Origin::Store);
+                    let s = st.record(job.req);
                     s.moved.leased.bytes += span;
                     s.moved.leased.ns += ns;
                 }
@@ -2899,7 +2913,11 @@ impl Inner {
             Ok((p, adopted, Some(start.elapsed().as_nanos() as u64)))
         });
         self.placed(key, gen, va, off, span, job, decided, made);
-        self.flush_fills();
+        // One fill batch for a burst of grants: the fill threads read them as one run.
+        let left = self.asking.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        if left == 0 || self.grouped_bytes() >= self.fill_budget() {
+            self.flush_fills();
+        }
     }
 
     /// The manager asked pages back: the quiet ones are unmapped (their return committed now,

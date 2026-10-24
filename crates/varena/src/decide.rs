@@ -7,7 +7,7 @@
 
 use std::cmp::Reverse;
 
-use crate::table::{Key, Table, SLOTS};
+use crate::table::{Key, Table, AHEAD, SLOTS};
 
 /// An own page `make_room` may take: its bytes, and whether a release event is still pending on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,22 +42,23 @@ pub fn victims(t: &Table, keep: &[Key]) -> Vec<Victim> {
         .collect()
 }
 
-/// What prefetch maps for `req` into `free` bytes only: the next [`SLOTS`] unmapped blocks of its
-/// current step's sets past their cursors, nearest first, while they fit.
+/// What prefetch maps for `req` into `free` bytes only: the unmapped blocks of its current step's
+/// sets past their cursors, nearest first, up to [`AHEAD`] bytes (at least [`SLOTS`] blocks),
+/// while they fit.
 pub fn prefetch(t: &Table, req: u64, free: u64) -> Vec<Key> {
     let Some(r) = t.request(req) else { return vec![] };
     let mut ahead: Vec<((u32, u32, u32), Key, u64)> = t
         .pages()
         .filter(|(_, p)| !p.mapped)
-        .filter_map(|(k, p)| r.distance(k).filter(|d| d.0 == 0 && d.1 == 0 && u64::from(d.2) < SLOTS).map(|d| (d, k, p.bytes)))
+        .filter_map(|(k, p)| r.distance(k).filter(|d| d.0 == 0 && d.1 == 0).map(|d| (d, k, p.bytes)))
         .collect();
     ahead.sort();
-    let mut free = free;
+    let (mut free, mut taken, mut blocks) = (free, 0u64, 0u64);
     ahead
         .into_iter()
         .take_while(|(.., b)| {
-            let fits = *b <= free;
-            free = free.saturating_sub(*b);
+            let fits = *b <= free && (taken < AHEAD || blocks < SLOTS);
+            (free, taken, blocks) = (free.saturating_sub(*b), taken + b, blocks + 1);
             fits
         })
         .map(|(_, k, _)| k)
