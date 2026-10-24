@@ -48,6 +48,8 @@ struct Cohort {
     tensorfs: Option<String>,
     /// The `cozy` binary, TensorD: a release version, or the `tensord` input's dev binary.
     tensord: Option<String>,
+    /// The `cozy` binary as a CLI before 0.11.16 sends it: the `binary` input's file.
+    binary: Option<String>,
     /// `"install"`: the build toolchain, alone (`cozy machine toolchain install`).
     toolchain: Option<String>,
     /// The `cozy` release the caller installed at the machine's launch path (`cozy update`).
@@ -202,7 +204,10 @@ fn stage(
         let file = if file.is_empty() { value.as_str() } else { file };
         Ok(Some(held(member, file)?.unwrap_or(Choice { version: value, ..Default::default() })))
     };
-    let binary = choose("tensord", BINARY, cohort.tensord)?;
+    let binary = match cohort.tensord {
+        Some(named) => choose("tensord", BINARY, Some(named))?,
+        None => choose("binary", BINARY, cohort.binary)?,
+    };
     let toolchain = match cohort.toolchain.as_deref() {
         None => false,
         Some("install") => true,

@@ -214,55 +214,22 @@ pub async fn update(
 ) -> Result<ExitCode, Error> {
     let mut payload = serde_json::Map::new();
     let (mut staged, mut inputs, mut named, mut want) = (vec![], vec![], vec![], vec![]);
-    let restarts = tensord.is_some();
+    let mut asked = vec![];
     for (member, distribution, value) in [
         ("runtime", "cozy_runtime", runtime),
         ("tensorfs", "tensorfs", tensorfs),
         ("tensord", "", tensord),
     ] {
-        let Some(value) = value else { continue };
-        match Component::of(&value, distribution)? {
-            Component::Release(version) => {
-                want.push(reports(member, &version));
-                named.push(format!("{member} {version}"));
-                payload.insert(member.into(), version.into());
-            }
-            Component::Build(path) => {
-                let (file, input) = wheel(&path, distribution)?;
-                want.push(match member {
-                    "tensord" => ("dev", true.into()),
-                    _ => reports(member, &file),
-                });
-                named.push(format!("{member} {file} (dev)"));
-                inputs.push(v1::InputFile {
-                    field: member.into(),
-                    digest: input.digest.to_string(),
-                    length: input.length,
-                    media_type: match distribution {
-                        "" => "application/octet-stream",
-                        _ => "application/zip",
-                    }
-                    .into(),
-                    order: 0,
-                });
-                payload.insert(member.into(), file.into());
-                staged.push(input);
-            }
+        if let Some(value) = value {
+            asked.push((member, distribution, Component::of(&value, distribution)?));
         }
-    }
-    if let Some(limit) = gpu_memory_limit {
-        named.push(match limit {
-            0 => "no GPU memory limit".into(),
-            bytes => format!("a GPU memory limit of {}", output::bytes(bytes)),
-        });
-        payload.insert("gpu_memory_limit".into(), limit.into());
     }
     let m = machine(ctx, name).await?;
     let hub = match m.hub.as_str() {
         "" => ctx.hub()?,
         origin => ctx.config.resolve(origin)?,
     };
-    if payload.is_empty() {
+    if asked.is_empty() && gpu_memory_limit.is_none() {
         let Some(status) = &m.status else {
             return Err(Error::new(
                 Kind::Unavailable,
@@ -275,30 +242,82 @@ pub async fn update(
         // An unpinned target older than the machine's software is no reason to go back.
         let moves = |running: &str, wanted: &str| running != wanted && (target.pinned || newer(wanted, running));
         let cozy = target.cozy.as_deref().filter(|cozy| moves(&status.version, cozy));
-        for (member, running, wanted) in [
-            ("runtime", status.runtime.as_str(), Some(target.runtime.as_str())),
-            ("tensorfs", status.tensorfs.as_str(), Some(target.tensorfs.as_str())),
-            ("tensord", status.version.as_str(), cozy),
+        for (member, distribution, running, wanted) in [
+            ("runtime", "cozy_runtime", status.runtime.as_str(), Some(target.runtime.as_str())),
+            ("tensorfs", "tensorfs", status.tensorfs.as_str(), Some(target.tensorfs.as_str())),
+            ("tensord", "", status.version.as_str(), cozy),
         ] {
             if let Some(wanted) = wanted.filter(|wanted| moves(running, wanted)) {
-                want.push(reports(member, wanted));
-                named.push(format!("{member} {wanted}"));
-                payload.insert(member.into(), wanted.into());
+                asked.push((member, distribution, Component::Release(wanted.into())));
             }
         }
-        if payload.is_empty() {
+        if asked.is_empty() {
             return up_to_date(ctx, &m, status);
         }
     }
+    // A TensorD before 0.11.16 takes its binary as `binary`, a file it is sent: a release is
+    // fetched here for it (version skew).
+    let status = m.status.clone().unwrap_or_default();
+    let older = !names_tensord(&status.version);
+    // A dev `cozy` built or picked here, which `local` then runs (Calcifer too).
+    let mut dev = false;
+    for (member, distribution, component) in asked {
+        let key = if member == "tensord" && older { "binary" } else { member };
+        let (path, version) = match component {
+            Component::Release(version) if member == "tensord" && older => {
+                let target = dist_target(&status.platform)?;
+                let fetched = crate::update::release_binary(&version, &target).await?;
+                (kept(ctx, fetched, &format!("cozy-{version}-{target}"))?, Some(version))
+            }
+            Component::Release(version) => {
+                want.push(reports(member, &version));
+                named.push(format!("{member} {version}"));
+                payload.insert(key.into(), version.into());
+                continue;
+            }
+            Component::Build(path) => (path, None),
+        };
+        let (file, input) = wheel(&path, distribution)?;
+        dev |= member == "tensord" && version.is_none();
+        want.push(match (member, &version) {
+            ("tensord", Some(version)) => ("version", version.as_str().into()),
+            ("tensord", None) => built_version(&path).map_or(("dev", true.into()), |v| ("version", v.into())),
+            _ => reports(member, &file),
+        });
+        named.push(match &version {
+            Some(version) => format!("{member} {version}"),
+            None => format!("{member} {file} (dev)"),
+        });
+        inputs.push(v1::InputFile {
+            field: key.into(),
+            digest: input.digest.to_string(),
+            length: input.length,
+            media_type: match distribution {
+                "" => "application/octet-stream",
+                _ => "application/zip",
+            }
+            .into(),
+            order: 0,
+        });
+        payload.insert(key.into(), file.into());
+        staged.push(input);
+    }
+    let restarts = payload.contains_key("tensord") || payload.contains_key("binary");
+    if let Some(limit) = gpu_memory_limit {
+        named.push(match limit {
+            0 => "no GPU memory limit".into(),
+            bytes => format!("a GPU memory limit of {}", output::bytes(bytes)),
+        });
+        payload.insert("gpu_memory_limit".into(), limit.into());
+    }
     // A new binary or a limit restarts the machine: either way its warm models reload.
-    if (restarts || payload.contains_key("tensord") || gpu_memory_limit.is_some())
+    if (restarts || gpu_memory_limit.is_some())
         && m.status
             .as_ref()
             .is_some_and(|s| s.warm.iter().any(|w| !w.level.is_empty()))
     {
         output::warn(&format!("{}'s warm models reload after it restarts", m.name));
     }
-    let dev = inputs.iter().any(|i| i.field == "tensord");
     let spec = v1::RunSpec {
         kind: v1::RunKind::Update,
         payload: Some(
@@ -333,6 +352,42 @@ pub async fn update(
         ));
     }
     Ok(crate::run::exit_code(&run))
+}
+
+/// Whether a TensorD at `version` names its binary `tensord` and fetches a release itself
+/// (0.11.16 on); one that does not parse is taken as current.
+fn names_tensord(version: &str) -> bool {
+    semver::Version::parse(version).map_or(true, |v| (v.major, v.minor, v.patch) >= (0, 11, 16))
+}
+
+/// The dist target of a machine's `platform` (`linux/x86_64`).
+fn dist_target(platform: &str) -> Result<String, Error> {
+    let target = match platform {
+        "linux/x86_64" => "x86_64-unknown-linux-gnu",
+        "linux/aarch64" => "aarch64-unknown-linux-gnu",
+        "macos/aarch64" => "aarch64-apple-darwin",
+        "macos/x86_64" => "x86_64-apple-darwin",
+        "windows/x86_64" => "x86_64-pc-windows-msvc",
+        "windows/aarch64" => "aarch64-pc-windows-msvc",
+        other => return Err(Error::new(Kind::Unavailable, "platform_unknown", format!("no cozy release is built for {other:?}"))),
+    };
+    Ok(target.into())
+}
+
+/// A fetched release kept under this computer's cozy home until the run sends it.
+fn kept(ctx: &Context, fetched: tempfile::TempPath, name: &str) -> Result<PathBuf, Error> {
+    let dir = ctx.home.root().join("tmp");
+    let path = dir.join(name);
+    std::fs::create_dir_all(&dir)
+        .and_then(|()| fetched.persist(&path).map_err(|e| e.error))
+        .map_err(|e| Error::new(Kind::Internal, "update_failed", format!("keep {}: {e}", path.display())))?;
+    Ok(path)
+}
+
+/// The release a `cozy` binary built here says it is, when it runs here.
+fn built_version(path: &Path) -> Option<String> {
+    let out = std::process::Command::new(path).arg("--version").stdin(std::process::Stdio::null()).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().strip_prefix("cozy ").map(str::to_owned).filter(|_| out.status.success())
 }
 
 /// What `cozy machine update` installs of one component: a release version, or a local path.
