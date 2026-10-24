@@ -60,7 +60,11 @@ pub(super) fn watch<B: MachineBackend>(
                 let epoch = backend.activity();
                 let kept = read.lock().unwrap().clone();
                 let held = match kept.filter(|(at, _)| Some(*at) == epoch) {
-                    Some((_, held)) => held,
+                    // Page accounting is read every tick: the books TensorD keeps, no hot-path work.
+                    Some((_, mut held)) => {
+                        held.memory = blocking(&backend, |backend| Ok(backend.memory())).await?;
+                        held
+                    }
                     None => {
                         let held = held_now(&identity, &backend, actor).await?;
                         if let Some(epoch) = epoch {
@@ -83,7 +87,7 @@ pub(super) fn watch<B: MachineBackend>(
 }
 
 /// Disk use moves all the time; it alone is news once it moved by a hundredth of the disk.
-/// Page accounting moves with every allocation: never news alone.
+/// Page accounting is news at each tick it moved (its pressure figures decay on their own: not).
 fn changed(last: &v1::StatusFrame, next: &v1::StatusFrame) -> bool {
     let moved = match (&last.disk, &next.disk) {
         (Some(a), Some(b)) => a.free_bytes.abs_diff(b.free_bytes) >= b.total_bytes / 100,
@@ -91,7 +95,10 @@ fn changed(last: &v1::StatusFrame, next: &v1::StatusFrame) -> bool {
     };
     let still = |frame: &v1::StatusFrame| v1::StatusFrame {
         disk: None,
-        gpus: frame.gpus.iter().map(|gpu| v1::Gpu { memory: None, ..gpu.clone() }).collect(),
+        gpus: frame.gpus.iter().map(|gpu| v1::Gpu {
+            memory: gpu.memory.clone().map(|m| v1::GpuMemory { pressure_some_10s: 0.0, pressure_some_60s: 0.0, ..m }),
+            ..gpu.clone()
+        }).collect(),
         ..frame.clone()
     };
     moved || still(last) != still(next)

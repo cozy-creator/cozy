@@ -828,6 +828,8 @@ pub struct GpuMemory {
     pub foreign_bytes: u64,
     pub created_bytes: u64,
     pub created_chunks: u64,
+    /// TensorD's own CUDA context on it (0 where its chunks need none).
+    pub context_bytes: u64,
     /// Allocated to live processes.
     pub allocated_bytes: u64,
     /// The GPU page cache: landed weights of exited processes, kept for the next of their layout.
@@ -848,6 +850,8 @@ pub struct ProcessMemory {
     pub pid: u32,
     /// Its executor group (plan and lane).
     pub executor: String,
+    /// Its package, `name@version`.
+    pub package: String,
     pub chunks: u64,
     pub bytes: u64,
 }
