@@ -29,7 +29,8 @@ if [ -z "$TDF" ]; then expect cl650-b-update-from-0.11.15 FAIL "no --tensord can
   --tensorfs-wheel "$(pypi tensorfs "$tfs")" -y > "$C/old.log" 2>&1
 read -r v rt tfs <<< "$(pair)"
 [ "$v" = "$OLDV" ] || expect cl650-old-pod FAIL "cozy $OLDV's update left $M on cozy ${v:-?}: $(tail -c 300 "$C/old.log")"
-"$CLI" machine update "$M" --tensord "$TDF" -y > "$C/b.log" 2>&1; code=$?
+tdf=$TDF; case $tdf in *://*) tdf=$(fetch "$tdf") || tdf=;; esac  # cozy 0.11.16+ sends a file
+"$CLI" machine update "$M" --tensord "$tdf" -y > "$C/b.log" 2>&1; code=$?
 read -r v2 rt tfs <<< "$(pair)"
 if [ "$code" = 0 ] && [ "$v2" = "$BIN" ]; then
   expect "cl650-b-update-from-$v" PASS "cozy $BIN's machine update reached TensorD $v; the machine verified $v2"

@@ -56,7 +56,8 @@ fi
 if [ -n "$RWF$TWF" ]; then
   "$CLI" machine update "$M" --runtime 0.31.0 --tensorfs 0.14.0 -y > "$T/runtime-back.log" 2>&1; back=$?
   n=$(submit "sdxl/generate@$NEW" prompt="$CHAR, the Runtime back" seed:=$((R + 32))); until_status "$n" terminal; s1=$(get "$n" status)
-  "$CLI" machine update "$M" ${RWF:+--runtime "$RWF"} ${TWF:+--tensorfs "$TWF"} -y > "$T/runtime-forward.log" 2>&1; fwd=$?
+  rw=$RWF tw=$TWF; case $rw in *://*) rw=$(fetch "$rw");; esac; case $tw in *://*) tw=$(fetch "$tw");; esac
+  "$CLI" machine update "$M" ${rw:+--runtime "$rw"} ${tw:+--tensorfs "$tw"} -y > "$T/runtime-forward.log" 2>&1; fwd=$?
   m=$(submit "sdxl/generate@$NEW" prompt="$CHAR, the Runtime forward" seed:=$((R + 33))); until_status "$m" terminal; s2=$(get "$m" status)
   [ "$back$fwd" = 00 ] && [ "$s1$s2" = completedcompleted ] \
     && expect tensord-runtime-rollback PASS "Runtime back to 0.31.0 (run $n) and forward to the candidate (run $m)" \

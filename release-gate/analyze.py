@@ -18,7 +18,7 @@ from tensorfs import check as tensorfs  # noqa: E402  (release-gate/suites/tenso
 from varena import check as varena  # noqa: E402
 # A suite's check runs when gate.sh ran the suite (--suite: the names in <gate dir>/suites).
 SUITES = open(os.path.join(out, 'suites')).read().split() if os.path.exists(os.path.join(out, 'suites')) else []
-SUITE_CHECKS = {'tensorfs': tensorfs.check, 'varena': varena.check}  # runtime, packages: quality, lm and swap; hub: its expect rows
+SUITE_CHECKS = {'tensorfs': tensorfs.check, 'varena': varena.check}  # runtime, packages: quality, lm and swap; hub, tensord: their expect rows
 CHECKS = [quality.check, lm.check, swap.check] + [SUITE_CHECKS[s] for s in SUITES if s in SUITE_CHECKS]
 # Allowed rise over the worst known-good number, unless the good numbers' own spread is wider.
 SLACK = {'execution_ms': 0.25, 'step1_ms': 0.5, 'steady_ms': 0.10, 'peak_vram_mb': 0.10}
