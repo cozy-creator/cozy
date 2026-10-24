@@ -2906,7 +2906,8 @@ impl Pool {
         let lost = self.lost_followers(start, degree, &session.followers);
         if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
             // It may have faulted on its GPUs: their kept pages go.
-            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.fault());
+            let pids: Vec<u32> = std::iter::once(session.executor.birth.pid).chain(session.followers.iter().map(|f| f.birth().pid)).collect();
+            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.fault(&pids));
             // The author's failure keeps its traceback and origin in triage; the executor's
             // end would record only "executor_ended".
             if let Some(outcome) = reply.outcome.as_ref().filter(|o| !o.traceback.is_empty()) {
