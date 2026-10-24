@@ -9,7 +9,7 @@ pub mod policy;
 pub mod table;
 pub mod wire;
 
-pub use agent::{Agent, Attach, Done, Lease, Ticket};
+pub use agent::{Agent, Attach, Deriving, Done, Lease, Ticket};
 pub use policy::Advice;
 pub use manager::{chunks, ExecutorHolding, Holdings, Hosting, Identity, Manager, Mode, Opener, Peak, Pressure, Record, CHUNK, PROTOCOL};
 pub use table::{Content, Figures, State, Table, Word};
@@ -17,6 +17,13 @@ pub use wire::{Kind, Measured, Refusal, Region};
 
 use crate::os::{self, Listener, Stream};
 use crate::{GpuId, Result};
+
+/// A derived-weights disk entry to write (§6): its own id, which [`Agent::derived`] names back
+/// (a second writer of one key gets its own: neither marks the other's written), and its file.
+pub struct DerivedEntry {
+    pub id: u64,
+    pub file: std::fs::File,
+}
 
 fn service(uuid: &str) -> String {
     format!("lease-{uuid}")

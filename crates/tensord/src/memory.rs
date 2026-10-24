@@ -71,7 +71,7 @@ impl Hosting for Hosted {
         self.device.as_ref()?.free().ok()
     }
 
-    fn derive(&self, domain: &str, key: &str, bytes: u64) -> Option<std::fs::File> {
+    fn derive(&self, domain: &str, key: &str, bytes: u64) -> Option<varena::lease::DerivedEntry> {
         match self.derived.create(domain, key, bytes) {
             Ok(entry) => entry,
             Err(error) => {
@@ -81,8 +81,8 @@ impl Hosting for Hosted {
         }
     }
 
-    fn derived(&self, domain: &str, key: &str) {
-        self.derived.written(domain, key);
+    fn derived(&self, domain: &str, key: &str, entry: u64) {
+        self.derived.written(domain, key, entry);
     }
 
     fn read_derived(&self, domain: &str, key: &str) -> Option<std::fs::File> {

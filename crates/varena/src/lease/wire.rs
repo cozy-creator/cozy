@@ -79,8 +79,13 @@ pub enum ToManager {
     },
     /// A disk entry for derived weights of `key`, `bytes` long: answered by [`ToAgent::Entry`].
     Derive { key: String, bytes: u64 },
-    /// The entry for `key` is written whole: from now on grants refill from it.
-    Derived { key: String },
+    /// Entry `entry` (its [`ToAgent::Entry`] id) for `key` is written whole: from now on grants
+    /// refill from it. Another entry of `key` stays unread.
+    Derived {
+        key: String,
+        #[serde(default)]
+        entry: u64,
+    },
     /// Doorbell: slots moved to Mapped, Refused or Released.
     Answered,
     Region(RegionFacts),
@@ -113,8 +118,13 @@ pub enum ToAgent {
     Reclaim { region: u64, swap: bool },
     /// A derived entry for `key`, its file attached, or none kept (no handle). For ask `id`
     /// it comes before the ask's grants, to refill from; `id` 0 answers [`ToManager::Derive`],
-    /// to write.
-    Entry { id: u64, key: String },
+    /// to write, and `entry` is that entry's own id, which [`ToManager::Derived`] names back.
+    Entry {
+        id: u64,
+        key: String,
+        #[serde(default)]
+        entry: u64,
+    },
 }
 
 /// A side's messages: their kinds as the wire tags them.
