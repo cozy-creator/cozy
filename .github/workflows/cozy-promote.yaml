@@ -1,9 +1,9 @@
-name: release-promote
-# A cozy candidate is a GitHub prerelease, which `cozy update`, the tensorhub.com installer and Homebrew don't follow.
-# Once its gate passed it becomes what users get: GitHub's latest and Homebrew's formula, the same files, nothing
-# rebuilt (tracker design ci-v2, pre-release and promotion). release.yml calls it after its own gate; promote.sh
-# dispatches it for a set gated together:
-#   gh workflow run release-promote.yml -R cozy-creator/cozy-creator -f tag=v0.11.17 -f gate=<run id | hand>
+name: cozy-promote
+# A cozy candidate (cozy-publish.yaml) is a GitHub prerelease, which `cozy update`, the tensorhub.com installer and
+# Homebrew don't follow. Once the release agent's chosen suites passed (release testing is manual, recorded), it
+# becomes what users get: GitHub's latest and Homebrew's formula, the same files, nothing rebuilt (tracker design
+# ci-v2, pre-release and promotion). By hand, or from release-gate/promote.sh:
+#   gh workflow run cozy-promote.yaml -R cozy-creator/cozy-creator -f tag=v0.11.17 -f gate=<release-gate run id | record URL>
 on:
   workflow_dispatch:
     inputs:
@@ -12,20 +12,16 @@ on:
         type: string
         required: true
       gate:
-        description: "The release-gate run that passed it (its id), or hand: a lead's hand gate, the dispatcher vouches"
+        description: "The passing gate: a release-gate.yml run id (verified), or the URL of a recorded hand gate"
         type: string
         required: true
-  workflow_call:
-    inputs:
-      tag: { type: string, required: true }
-      gate: { type: string, required: true }
 
 permissions:
   contents: write
   actions: read
 
 concurrency:
-  group: release-promote
+  group: cozy-promote
 
 jobs:
   promote:
@@ -44,7 +40,10 @@ jobs:
         run: |
           [ "$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)" = true ] \
             || { echo "::error::$TAG is not a candidate (a prerelease)"; exit 1; }
-          if [ "$GATE" = hand ]; then echo "$TAG: gated by hand, the dispatcher vouches"; exit 0; fi
+          case $GATE in
+            https://*) echo "$TAG: gated by hand, recorded at $GATE" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+            *[!0-9]* | '') echo "::error::gate is a release-gate run id or a record URL, not '$GATE'"; exit 1 ;;
+          esac
           set_=$(creator/release-gate/verify.sh "$GATE")
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p cozy-x86_64-unknown-linux-gnu.tar.gz -D c
           tar -xzf c/cozy-x86_64-unknown-linux-gnu.tar.gz -C c

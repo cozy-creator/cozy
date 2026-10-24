@@ -1,4 +1,4 @@
-name: release-attestations
+name: cozy-attestations
 # dist global-artifacts job (dist-workspace.toml): each archive's attestation bundles ride in the release
 # as <archive>.sigstore.jsonl (one Sigstore bundle per line). `cozy update` verifies those, never GitHub's
 # rate-limited attestations API.

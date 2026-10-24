@@ -5,7 +5,7 @@ name: dev-build
 # cozy-<sha> (the runner arch's dev `cozy`, <version>+dev.g<sha8>, which `cozy machine update --tensord <path>`
 # runs on any machine: `ghbuild.sh cozy <ref> cozy`, `-r ubuntu-24.04-arm` for arm64) and
 # tensorfs-wheel-<sha> (the manylinux x86_64 wheel). The cozy binary's release archives are dist's
-# (release.yml).
+# (cozy-publish.yaml).
 on:
   workflow_dispatch:
     inputs:

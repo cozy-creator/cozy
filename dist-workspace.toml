@@ -3,14 +3,14 @@ members = ["cargo:."]
 
 [dist]
 cargo-dist-version = "0.33.0"
-# release.yml is dist's output plus hand edits, each marked HAND-EDITED there: the `must_contain`
-# dispatch input and the plan job's first step, which refuses a release missing any
-# must_contain commit, the global job's step running scripts/patch-installers.sh, and the homebrew job's
-# checkout with the tap's deploy key (secret HOMEBREW_TAP_DEPLOY_KEY) in place of dist's token. And CI v2's
-# pre-release: the `promote` input, host's `--prerelease --latest=false`, the custom-release-gate and
-# custom-release-promote jobs (release-gate.yml, release-promote.yml) in place of dist's homebrew job, and
-# announce's need of the promotion.
-# After `dist generate` (or a dist upgrade), put them back.
+# .github/workflows/cozy-publish.yaml is dist's release.yml, renamed, plus hand edits, each marked HAND-EDITED
+# there: the `must_contain` dispatch input and the plan job's first step, which refuses a release missing any
+# must_contain commit; the global job's step running scripts/patch-installers.sh; host's `--prerelease
+# --latest=false` (every release is a candidate, CI v2); no homebrew job: cozy-promote.yaml pushes the formula the
+# release carries, with the tap's deploy key (secret HOMEBREW_TAP_DEPLOY_KEY), once a recorded gate passed it; and
+# the attestations job at cozy-attestations.yaml. After `dist generate` (or a dist upgrade), move release.yml to
+# cozy-publish.yaml and put them back. `cozy update` verifies a release's signer is cozy-publish.yaml: renaming this
+# file again is a hard cut for every installed cozy.
 allow-dirty = ["ci"]
 ci = "github"
 installers = ["shell", "powershell", "homebrew"]
@@ -34,8 +34,9 @@ github-attestations = true
 tap = "cozy-creator/homebrew-tap"
 # A published release pushes its Formula/cozy.rb to the tap.
 publish-jobs = ["homebrew"]
-# Each archive's attestation bundles, which `cozy update` verifies, ride in the release.
-global-artifacts-jobs = ["./release-attestations"]
+# Each archive's attestation bundles, which `cozy update` verifies, ride in the release (.github/workflows/
+# cozy-attestations.yaml; dist writes the path as .yml).
+global-artifacts-jobs = ["./cozy-attestations"]
 unix-archive = ".tar.gz"
 
 [dist.github-custom-runners]

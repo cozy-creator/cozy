@@ -23,9 +23,9 @@ rules = [
   # The browser player is GitHub Pages' site; pages.yaml deploys it.
   { paths = ["web/**"], select = [] },
   { paths = ["ci/**", "e2e/**", ".github/workflows/e2e.yaml"], select = ["cli", "os:macos", "os:windows", "build:cozy"] },
-  { paths = ["release-gate/**", ".github/workflows/release-gate.yaml"], select = ["gpu", "gpu-datacenter", "stress", "stress-host", "pkg:*"] },
+  { paths = ["release-gate/**", ".github/workflows/release-gate.yml"], select = ["gpu", "gpu-datacenter", "stress", "stress-host", "pkg:*"] },
   # Installers and release archives: the cli suite installs them on every OS at release.
-  { paths = [".github/workflows/release.yml", ".github/workflows/release-attestations.yml", "dist-workspace.toml", "scripts/patch-installers.sh"], select = ["cli", "os:macos", "os:windows"] },
+  { paths = [".github/workflows/cozy-publish.yaml", ".github/workflows/cozy-attestations.yaml", ".github/workflows/cozy-promote.yaml", "dist-workspace.toml", "scripts/patch-installers.sh"], select = ["cli", "os:macos", "os:windows"] },
   { paths = [".github/**"], select = [] },
 ]
 

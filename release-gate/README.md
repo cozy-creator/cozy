@@ -26,16 +26,18 @@ A SKU with no baseline needs `--establish` once.
   `~/.cozy`, signed in as you.
 - **From Actions:** `gh workflow run release-gate.yml -R cozy-creator/cozy-creator -f runtime_wheel=… -f changed='cozy-runtime v0.30.16'`.
   - Selection (`ci/affected`) picks the SKUs and cells; `skus` and `only` override it.
-  - `release.yml` (cozy), cozy-runtime's `publish.yaml` and packages' `task publish` run it before they publish.
+  - Testing is manual (Paul 10-24): only the release agent dispatches it, with the suites it chose. No workflow calls it.
 
 ## Promotion
 
-Nothing reaches users before a PASS. Candidates wait where users don't look: cozy as a GitHub prerelease (`cozy update`,
-the installer and Homebrew follow latest), TensorFS and the Runtime as GitHub prerelease assets (not on PyPI), and
-packages as yanked releases. `candidate.json` in each gate's output names the exact set. `verify.sh <run|dir>...` prints it
-only when every SKU passed. `promote.sh <run|dir>...` then hands that set to users in one step: the same files go to
-PyPI, the cozy prerelease becomes latest plus Homebrew, and the packages are un-yanked (`cozy package yank --undo`).
-The worker image and the Hub pin follow, by the release owner.
+Nothing reaches users before a recorded PASS. Candidates wait where users don't look: cozy as a GitHub prerelease
+(cozy-publish.yaml; `cozy update`, the installer and Homebrew follow latest), TensorFS and the Runtime as GitHub
+prerelease assets (publish-tensorfs.yaml `candidate=true`, cozy-runtime publish.yaml `mode=source`), and packages
+as yanked releases (`task publish`). The release agent picks the suites, runs the gate by hand or from Actions, and
+records the result. `candidate.json` in each gate's output names the exact set; `verify.sh <run|dir>...` prints it only
+when every SKU passed. `promote.sh <run id>` (or `--record <URL> <dirs>...` for a hand gate) hands that set to users in
+one step: the same files to PyPI, the cozy prerelease latest plus Homebrew (cozy-promote.yaml), the packages un-yanked
+(`cozy package yank --undo`). The worker image and the Hub pin follow, by the release owner.
 
 ## CI sign-in
 
