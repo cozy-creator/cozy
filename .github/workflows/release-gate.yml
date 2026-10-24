@@ -10,6 +10,10 @@ name: release-gate
 on:
   workflow_dispatch:
     inputs:
+      suites:
+        description: "Comma-separated suites (release-gate/README.md): the release agent picks them; there is no default"
+        type: string
+        required: true
       cozy:
         description: "cozy on the runner and the machine: released (the Hub's target), a release tag (v0.11.14) or a dev-build run id"
         type: string
@@ -30,10 +34,6 @@ on:
         description: "Exact package releases the cells run, name@release,… (a candidate is published and yanked)"
         type: string
         default: ''
-      changed:
-        description: "For selection: '<repo> <base> <head>', or '<repo> <head>' (base: its previous release). Empty: everything"
-        type: string
-        default: ''
       skus:
         description: "Comma-separated SKUs (empty: by selection)"
         type: string
@@ -46,10 +46,6 @@ on:
         description: "Start the baseline of a SKU that has none"
         type: boolean
         default: false
-      varena:
-        description: "Run the varena suite (release-gate/suites/varena) on its SKUs whatever the selection says"
-        type: boolean
-        default: false
       publish:
         description: "Publish a PASS as the SKU's new baseline"
         type: boolean
@@ -60,17 +56,16 @@ on:
         default: ''
   workflow_call:
     inputs:
+      suites: { type: string, required: true }
       plan: { type: string, default: '' }
       cozy: { type: string, default: released }
       runtime_wheel: { type: string, default: '' }
       tensorfs_wheel: { type: string, default: '' }
       packages_ref: { type: string, default: '' }
       pins: { type: string, default: '' }
-      changed: { type: string, default: '' }
       skus: { type: string, default: '' }
       only: { type: string, default: '' }
       establish: { type: boolean, default: false }
-      varena: { type: boolean, default: false }
       publish: { type: boolean, default: true }
       nonce: { type: string, default: '' }
 run-name: release-gate ${{ inputs.cozy }} ${{ inputs.runtime_wheel }} ${{ inputs.tensorfs_wheel }} ${{ inputs.packages_ref }} ${{ inputs.pins }} ${{ inputs.nonce }}
@@ -83,66 +78,38 @@ jobs:
       contents: read
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
-      only: ${{ steps.select.outputs.only }}
-    env:
-      CHANGED: ${{ inputs.changed || (inputs.plan && format('cozy-creator {0}', github.sha)) || '' }}
     steps:
       - uses: actions/checkout@v5
         with:
           repository: cozy-creator/cozy-creator
           ref: ${{ github.repository == 'cozy-creator/cozy-creator' && github.sha || 'master' }}
           path: creator
-      # ci/affected reads the change inside a checkout of the changed repo that holds both revisions.
-      - if: ${{ env.CHANGED != '' && inputs.skus == '' && inputs.only == '' }}
-        uses: actions/checkout@v5
-        with:
-          repository: cozy-creator/${{ startsWith(env.CHANGED, 'cozy-runtime') && 'cozy-runtime' || startsWith(env.CHANGED, 'packages') && 'packages' || startsWith(env.CHANGED, 'tensorhub') && 'tensorhub-v2' || 'cozy-creator' }}
-          fetch-depth: 0
-          path: changed
       - id: select
         env:
-          GH_TOKEN: ${{ github.token }}
+          SUITES: ${{ inputs.suites }}
           SKUS: ${{ inputs.skus }}
-          ONLY: ${{ inputs.only }}
-          VARENA: ${{ inputs.varena }}
         run: |
-          # ci/affected prints suites and pkg:<name> tokens (tracker design ci-v2, build contract). No answer: everything.
-          words=gpu
-          if [ -z "$SKUS$ONLY" ] && [ -n "$CHANGED" ] && [ -d changed ]; then
-            read -r repo base head <<< "$CHANGED"
-            if [ -z "$head" ]; then
-              head=$base
-              slug=cozy-creator/$repo; [ "$repo" != tensorhub ] || slug=cozy-creator/tensorhub-v2
-              base=$(gh release list -R "$slug" --exclude-pre-releases -L 5 --json tagName -q '.[].tagName' | grep -vx "$head" | head -1)
-            fi
-            words=$(cd changed && ../creator/ci/affected "$repo" "$base" "$head") || words=gpu
-            echo "affected $repo $base...$head:" $words
-          fi
-          skus=$SKUS
-          if [ -z "$skus" ]; then
-            case " $(echo $words) " in *" gpu "* | *" gpu-datacenter "*) skus=rtx-4090,rtx-5090 ;; esac
-            case " $(echo $words) " in *" gpu-datacenter "*) skus=$skus,h100-pcie,b200 ;; esac
-          fi
-          # pkg:<name> narrows the cells to those packages' (gate.sh --only takes package names); pkg:* or none: all.
-          only=$ONLY
-          if [ -z "$only" ] && ! printf '%s\n' $words | grep -qx 'pkg:\*'; then
-            only=$(printf '%s\n' $words | sed -n 's/^pkg://p' | paste -sd, -)
-          fi
-          # One job per SKU for the product cells, and one per SKU of release-gate/suites/varena/skus for the varena suite.
-          matrix=$(printf '%s\n' ${skus//,/ } | jq -Rnc '[inputs | select(. != "") | {sku: ., suite: ""}]')
-          case " $(echo $words) " in *" varena "*) VARENA=true ;; esac
-          if [ "$VARENA" = true ]; then
-            v=$(grep -v '^#' creator/release-gate/suites/varena/skus | awk 'NF {print $1}' | jq -Rnc '[inputs | {sku: ., suite: "varena"}]')
-            matrix=$(jq -nc --argjson a "$matrix" --argjson b "$v" '$a + $b')
-          fi
+          # One job per SKU, running every chosen suite whose `skus` (`<sku> [disk GB] [gpus]` per line) names it;
+          # `skus` gives every chosen suite those SKUs instead. key names the job's baseline, gate-<sku>-<key>.json.
+          d=creator/release-gate/suites
+          [ -n "$SUITES" ] || { echo "::error::pick suites: $(ls $d | paste -sd, -) (release-gate/README.md)"; exit 1; }
+          rows=()
+          for s in ${SUITES//,/ }; do
+            [ -f "$d/$s/cells.sh" ] || { echo "::error::no suite $s: $(ls $d | paste -sd, -)"; exit 1; }
+            if [ -n "$SKUS" ]; then for k in ${SKUS//,/ }; do rows+=("$k 0 0 $s"); done; continue; fi
+            while read -r k disk gpus; do [ -z "$k" ] || rows+=("$k ${disk:-0} ${gpus:-0} $s"); done < <(sed 's/#.*//' "$d/$s/skus")
+          done
+          matrix=$(printf '%s\n' "${rows[@]}" | jq -Rsc '[split("\n")[] | select(. != "") | split(" ") | map(select(. != ""))]
+            | group_by(.[0]) | map((reduce map(.[3])[] as $s ([]; if index([$s]) then . else . + [$s] end)) as $suites
+              | {sku: .[0][0], disk: (map(.[1] | tonumber) | max), gpus: (map(.[2] | tonumber) | max),
+                 suite: ($suites | join(",")), key: ($suites | join("-"))})')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          echo "only=$only" >> "$GITHUB_OUTPUT"
-          echo "gates: $(jq -r 'map(.sku + (if .suite != "" then " (" + .suite + ")" else "" end)) | join(", ")' <<< "$matrix"); cells: ${only:-all}"
+          echo "gates: $(jq -r 'map(.sku + " (" + .suite + ")") | join(", ")' <<< "$matrix")"
 
   gate:
     needs: select
     if: ${{ needs.select.outputs.matrix != '[]' }}
-    name: gate ${{ matrix.sku }}${{ matrix.suite && ' ' || '' }}${{ matrix.suite }}
+    name: gate ${{ matrix.sku }} ${{ matrix.suite }}
     strategy:
       fail-fast: false
       matrix:
@@ -154,7 +121,7 @@ jobs:
       actions: read  # a dev-build cozy, a wheel artifact of this run
     # One gate per SKU and suite at a time: its rental and its baseline.
     concurrency:
-      group: release-gate-${{ matrix.sku }}${{ matrix.suite && '-' || '' }}${{ matrix.suite }}
+      group: release-gate-${{ matrix.sku }}-${{ matrix.key }}
       cancel-in-progress: false
     # Hang bound, not a work budget: H3 at the product shape on a cold machine is the long cell.
     timeout-minutes: 300
@@ -237,26 +204,24 @@ jobs:
           cozy login --key "$RUNNER_TEMP/key.json"; code=$?
           rm -f "$RUNNER_TEMP/key.json"
           [ "$code" = 0 ] && cozy up
-      - name: Gate ${{ matrix.sku }}
+      - name: Gate ${{ matrix.sku }} (${{ matrix.suite }})
         env:
           ARGS: ${{ steps.candidate.outputs.args }}
-          ONLY: ${{ needs.select.outputs.only }}
-          SUITE: ${{ matrix.suite }}
+          ONLY: ${{ inputs.only }}
           ESTABLISH: ${{ inputs.establish }}
           PACKAGES: ${{ inputs.packages_ref != '' && 'packages' || '' }}
           PINS: ${{ inputs.pins }}
+          DISK: ${{ matrix.disk }}
+          GPUS: ${{ matrix.gpus }}
         run: |
           read -ra args <<< "$ARGS"
-          [ -z "$ONLY" ] || [ -n "$SUITE" ] || args+=(--only "$ONLY")
+          [ -z "$ONLY" ] || args+=(--only "$ONLY")
           [ -z "$PINS" ] || args+=(--pins "$PINS")
           [ -z "$PACKAGES" ] || args+=(--packages "$PACKAGES")
           [ "$ESTABLISH" != true ] || args+=(--establish)
-          if [ -n "$SUITE" ]; then  # a suite's skus file may give a SKU its disk (GB) beside it
-            args+=(--suite "$SUITE")
-            disk=$(awk -v s="${{ matrix.sku }}" '$1 == s && $2 ~ /^[0-9]+$/ {print $2}' "creator/release-gate/suites/$SUITE/skus")
-            [ -z "$disk" ] || args+=(--disk "$disk")
-          fi
-          creator/release-gate/gate.sh "${{ matrix.sku }}" --out "$OUT" "${args[@]}"
+          [ "$DISK" = 0 ] || args+=(--disk "$DISK")
+          [ "$GPUS" = 0 ] || args+=(--gpus "$GPUS")
+          creator/release-gate/gate.sh "${{ matrix.sku }}" --suite "${{ matrix.suite }}" --out "$OUT" "${args[@]}"
       # gate.sh ends its rental in a trap; a cancelled job can skip it, so end it here too and say so.
       - if: always()
         run: |
@@ -270,7 +235,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-${{ matrix.sku }}${{ matrix.suite && '-' || '' }}${{ matrix.suite }}
+          name: gate-${{ matrix.sku }}-${{ matrix.key }}
           path: ${{ env.OUT }}
           if-no-files-found: ignore
           retention-days: 30

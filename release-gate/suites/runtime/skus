@@ -1,0 +1,3 @@
+# The consumer cards every first-party package runs on (SKU, then its disk in GB when not the default 400).
+rtx-4090
+rtx-5090
