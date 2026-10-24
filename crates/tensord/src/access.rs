@@ -183,11 +183,11 @@ impl Fetch {
     }
 
     /// Every chunk of `selected` (header, components) here, reporting its bytes (a warm run
-    /// of a function): the bytes that came from the Hub and from the datacenter volume.
-    pub fn download(&self, selected: &[(String, Vec<String>)], stop: &Stop, progress: &(dyn Fn(u64, u64) + Sync)) -> io::Result<(u64, u64)> {
+    /// of a function): those that came from the Hub and from the datacenter volume, and those held.
+    pub fn download(&self, selected: &[(String, Vec<String>)], stop: &Stop, progress: &(dyn Fn(u64, u64) + Sync)) -> io::Result<tensorfs::fetch::Landed> {
         let counted = Arc::new(tensorfs::fetch::Progress::default());
         origin::watched(&counted, progress, || {
-            let mut landed = (0, 0);
+            let mut landed = tensorfs::fetch::Landed::default();
             for (header, components) in selected {
                 let held = storage::held(self.store(), header)?;
                 let Some(remote) = self.source(&held)? else {
@@ -195,7 +195,8 @@ impl Fetch {
                 };
                 let components = (!components.is_empty()).then_some(components.as_slice());
                 let pulled = self.machine.pull(&remote, &held, components, priority::BEHIND, Some(counted.clone()), stop).map_err(failed)?;
-                landed = (landed.0 + pulled.landed.origin, landed.1 + pulled.landed.volume);
+                (landed.origin, landed.volume, landed.local) =
+                    (landed.origin + pulled.landed.origin, landed.volume + pulled.landed.volume, landed.local + pulled.landed.local);
             }
             Ok(landed)
         })

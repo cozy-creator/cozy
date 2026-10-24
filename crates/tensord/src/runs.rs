@@ -502,7 +502,7 @@ impl Runs {
                     bits: (spec.bits != 0).then_some(spec.bits), ..Default::default() };
                 let ruled = named.lane.is_empty() && named.tree.is_none();
                 let stage = format!("downloading {}", choice.repository);
-                let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &constraints, &spec.catalog_revision, stop, &|done, total| {
+                let (named, landed) = publisher.download(&self.service, hub_access()?, named, &constraints, &spec.catalog_revision, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
                 let header = named.header().map_err(|(code, message)| refused(code, message))?.clone();
@@ -522,7 +522,7 @@ impl Runs {
                 let tree = named.tree.as_ref().map(ObjectRef::id);
                 let row = json!({"parameter": choice.parameter, "repository": named.repository,
                     "release": named.release, "lane": named.lane, "precision": profile.family, "tree": tree,
-                    "checkpoint": header.id(), "bytes": {"hub": hub, "volume": volume}});
+                    "checkpoint": header.id(), "bytes": {"hub": landed.origin, "volume": landed.volume, "local": landed.local}});
                 (header, None, row)
             };
             if let Some(name) = destination.strip_prefix("local/") {
@@ -735,7 +735,7 @@ impl Runs {
             };
             // A function's warm run ends holding what its constructions read (`downloaded`), its
             // on-demand models' too.
-            let mut moved = (0, 0);
+            let mut moved = tensorfs::fetch::Landed::default();
             if let Some(plan) = &plan {
                 let fetch = crate::access::Fetch::new(self.publisher.machine().clone(), hub.clone(), u64::MAX);
                 let report = |done, total| observe("downloading its weights", done, total);
@@ -751,7 +751,7 @@ impl Runs {
             // warm run's result.
             let installed = json!({"package": installation.package, "release": installation.release,
                 "installation": installation.alias, "interface": interface,
-                "bytes": {"hub": moved.0, "volume": moved.1}});
+                "bytes": {"hub": moved.origin, "volume": moved.volume, "local": moved.local}});
             return warm_result(installed, models);
         }
         let entry = declared.expect("checked above");

@@ -32,7 +32,7 @@ use crate::{
 };
 use tensorfs::{
     err::Refusal,
-    fetch::Progress as Counted,
+    fetch::{Landed, Progress as Counted},
     format::ObjectRef,
     sha256,
 };
@@ -441,10 +441,11 @@ impl Publisher {
     }
 
     /// `named` from its Hub into the store, its ref recording the pull: its tree and header, then
-    /// the `components` given (all when `None`, none when empty). Answers the bytes that came from the Hub and
-    /// from the datacenter volume. Whatever is here moves nothing.
+    /// the `components` given (all when `None`, none when empty). Answers the bytes that came from
+    /// the Hub and from the datacenter volume, and those the store held already (`local`, as the
+    /// components' walk found them). Whatever is here moves nothing.
     fn pull(&self, source: &hub::Source, named: &Named, components: Option<&[String]>, stop: Option<&Stop>,
-        bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
+        bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<Landed, Failure> {
         let header = named.header()?;
         let remote = origin::remote(&self.machine, source).map_err(|e| refused("model_download_failed", e))?;
         let stop = stop.cloned().unwrap_or_default();
@@ -463,6 +464,7 @@ impl Publisher {
             Some(tree) => {
                 let landed = self.machine.objects(&remote, std::slice::from_ref(tree), priority::NOW, &stop).map_err(failed)?;
                 (structure.landed.origin, structure.landed.volume) = (structure.landed.origin + landed.origin, structure.landed.volume + landed.volume);
+                structure.landed.local += landed.local;
                 tree.clone()
             }
             None => storage::tree_of(&self.store, header).map_err(io_failure)?,
@@ -478,7 +480,7 @@ impl Publisher {
         pulled.record(&self.store).map_err(io_failure)?;
         if components == Some(&[]) {
             logged(&structure);
-            return Ok((structure.landed.origin, structure.landed.volume));
+            return Ok(structure.landed);
         }
         let progress = Arc::new(Counted::default());
         let pulled = origin::watched(&progress, bytes, || {
@@ -487,13 +489,13 @@ impl Publisher {
         let pulled = pulled.map_err(failed)?;
         logged(&pulled);
         let landed = pulled.landed;
-        Ok((structure.landed.origin + landed.origin, structure.landed.volume + landed.volume))
+        Ok(Landed { origin: structure.landed.origin + landed.origin, volume: structure.landed.volume + landed.volume, local: landed.local })
     }
 
     /// `named` downloaded whole, as a request's weights are: what a caller asked for whole
     /// (`cozy model download`, an adapter).
     fn ensure(&self, source: &hub::Source, named: &Named, stop: Option<&Stop>,
-        bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
+        bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<Landed, Failure> {
         self.pull(source, named, None, stop, bytes)
     }
 
@@ -544,8 +546,8 @@ impl Publisher {
     }
 
     /// A Hub checkpoint resolved (`resolve`) and downloaded whole into the store (a warm run's
-    /// model choice: `cozy model download`); answers what the Hub named and the bytes that came
-    /// from the Hub and from the datacenter volume.
+    /// model choice: `cozy model download`); answers what the Hub named and its bytes by where
+    /// they came from (`pull`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn download(
         &self,
@@ -556,7 +558,7 @@ impl Publisher {
         revision: &str,
         stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync),
-    ) -> Result<(Named, (u64, u64)), Refused> {
+    ) -> Result<(Named, Landed), Refused> {
         let failed = |(code, message)| Refused { code, message };
         let named = self.resolve(service, source, named, constraints, revision).map_err(failed)?;
         // A checkpoint this store already holds whole moves nothing and asks the Hub nothing.
