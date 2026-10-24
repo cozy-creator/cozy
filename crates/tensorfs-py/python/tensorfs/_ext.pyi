@@ -20,6 +20,8 @@ varena: ModuleType
 
 #: Physical format inspection for storage integrations.
 raw: ModuleType
+#: `tensorfs._ext.executor`, typed in `executor.pyi` (the public module).
+executor: ModuleType
 
 StrPath = str | PathLike[str]
 _T = TypeVar("_T")

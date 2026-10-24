@@ -7,6 +7,7 @@ mod ceiling;
 #[allow(unsafe_code)]
 mod cleanup;
 mod errors;
+mod executor;
 #[cfg(feature = "store")]
 mod classref;
 #[cfg(feature = "store")]
@@ -53,6 +54,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::install(m)?;
     cleanup::install(m)?;
     ceiling::install(m)?;
+    executor::install(m)?;
     m.add("__version__", python_distribution_version())?;
     // The store format every process on the machine shares.
     m.add("STORE_FORMAT", tensorfs::STORE_FORMAT)?;

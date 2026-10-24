@@ -318,6 +318,7 @@ pub struct ProviderAccess {
 
 /// Public TensorFS transport options. TensorD forwards a supplied token without acquiring one.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 #[serde(default)]
 pub struct TensorFSOptions {
     pub endpoint: String,

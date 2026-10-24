@@ -2753,7 +2753,7 @@ impl Pool {
                 request_id: id.into(),
                 construction: construction.clone(),
                 entrypoint: plan.entrypoint.clone(),
-                payload: record.invocation.input.clone(),
+                payload: protocol::executor::Json(record.invocation.input.clone()),
                 attention_kernel: record.invocation.attention_kernel.clone(),
                 bits: record.invocation.bits,
                 input_metadata: record

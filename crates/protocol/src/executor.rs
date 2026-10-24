@@ -39,6 +39,37 @@ pub enum Command {
 }
 
 impl Command {
+    /// Every `cmd` TensorD sends.
+    pub const NAMES: [&'static str; 12] = [
+        "hello", "shutdown", "start", "load", "activate", "prepare_request", "invoke", "map", "unload",
+        "probe", "fork", "bearer",
+    ];
+
+    /// One command from its wire bytes. An unknown member is ignored and a missing one takes its
+    /// default; the error names a needed member's path (`spool`, `bits`) or an unknown `cmd`.
+    pub fn decode(data: &[u8]) -> Result<Command, String> {
+        fn one<T: serde::de::DeserializeOwned>(fields: Value) -> Result<T, String> {
+            serde_path_to_error::deserialize(fields).map_err(|e| e.to_string())
+        }
+        let fields: Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+        let cmd = fields.get("cmd").and_then(Value::as_str).unwrap_or_default().to_owned();
+        Ok(match cmd.as_str() {
+            "hello" => Command::Hello,
+            "shutdown" => Command::Shutdown,
+            "start" => Command::Start(one(fields)?),
+            "load" => Command::Load(Box::new(one(fields)?)),
+            "activate" => Command::Activate(one(fields)?),
+            "prepare_request" => Command::PrepareRequest(one(fields)?),
+            "invoke" => Command::Invoke(Box::new(one(fields)?)),
+            "map" => Command::Map(one(fields)?),
+            "unload" => Command::Unload(one(fields)?),
+            "probe" => Command::Probe(one(fields)?),
+            "fork" => Command::Fork(one(fields)?),
+            "bearer" => Command::Bearer(one(fields)?),
+            other => return Err(format!("unknown command `{other}`")),
+        })
+    }
+
     /// Its `cmd`: what its reply names.
     pub fn name(&self) -> &'static str {
         match self {
@@ -59,6 +90,7 @@ impl Command {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct Start {
     /// The session's GPUs; empty runs on the CPU and never opens CUDA.
     #[serde(default)]
@@ -92,6 +124,7 @@ pub struct Start {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct Load {
     pub construction: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,17 +147,19 @@ pub struct Load {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct Activate {
     pub construction: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct PrepareRequest {
     pub request_id: String,
     #[serde(default)]
     pub construction: String,
     pub entrypoint: String,
-    pub payload: Value,
+    pub payload: Json,
     /// Checked before entry, so a bad pin is the request's refusal, not a fault.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub attention_kernel: String,
@@ -137,6 +172,7 @@ pub struct PrepareRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct Invoke {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tensorfs: Option<TensorFSOptions>,
@@ -180,6 +216,7 @@ pub struct Invoke {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct Map {
     pub construction: String,
     #[serde(default)]
@@ -197,11 +234,13 @@ pub enum Level {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct Unload {
     pub construction: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct Probe {
     /// Collect cyclic garbage first: a cycle holding a device tensor is not a leak.
     #[serde(default)]
@@ -209,6 +248,7 @@ pub struct Probe {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct Fork {
     pub socket: PathBuf,
     pub root: PathBuf,
@@ -217,6 +257,7 @@ pub struct Fork {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct Bearer {
     #[serde(default)]
     pub actor: String,
@@ -224,6 +265,7 @@ pub struct Bearer {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 #[serde(default)]
 pub struct Adapter {
     pub model_id: String,
@@ -251,6 +293,7 @@ impl Default for Adapter {
 /// One model's construction: its class, where its weights are, and how to fill them. A
 /// weightless binding names only its release and an empty `model_class`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 #[serde(default)]
 pub struct Binding {
     pub application: String,
@@ -309,6 +352,7 @@ impl Default for Binding {
 
 /// One model of a many-model construction (an entrypoint with several model slots).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct ModelLoad {
     #[serde(default)]
     pub binding: Binding,
@@ -317,6 +361,7 @@ pub struct ModelLoad {
 /// An executor's stage memo tiers (`memo: stage/1`): its in-memory tier (-1: its own default;
 /// 0: off) and the largest entry the machine keeps (0: that tier off).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 #[serde(default)]
 pub struct MemoSettings {
     pub process_bytes: i64,
@@ -330,6 +375,7 @@ impl Default for MemoSettings {
 
 /// One constructed model slot of a session: its checkpoint and the components it uses.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct Construction {
     /// `<fn>.models.<param>`
     pub path: String,
@@ -342,6 +388,7 @@ pub struct Construction {
 
 /// One callable an attempt may call: its own package's, or another App's of its environment.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct CallInterface {
     pub module: String,
     pub export: String,
@@ -351,7 +398,7 @@ pub struct CallInterface {
     pub self_call: bool,
     /// Another package's interface: the Runtime installs its typed callers from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interface_document: Option<Value>,
+    pub interface_document: Option<Json>,
     /// A Runtime built-in surface (`operations`): the Runtime binds it from its own code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin: Option<String>,
@@ -359,6 +406,7 @@ pub struct CallInterface {
 
 /// One file input's identity, before its bytes are granted.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct InputMetadata {
     pub input_id: String,
     pub media_type: String,
@@ -370,6 +418,7 @@ pub struct InputMetadata {
 
 /// One verified input file in the attempt's own spool.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct InputFile {
     pub local: PathBuf,
     pub media_type: String,
@@ -668,9 +717,11 @@ impl Frame {
 // --------------------------------------------------------------------------- TensorD's answers
 
 /// TensorD's answer to one executor request, under its `seq`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[serde(default)]
 pub struct Answer {
-    pub event: &'static str,
+    pub event: String,
     pub seq: u64,
     pub ok: bool,
     pub code: String,
@@ -713,14 +764,14 @@ pub struct Answer {
     pub reason: String,
 }
 
-impl Answer {
-    pub fn unavailable(seq: u64) -> Self {
+impl Default for Answer {
+    fn default() -> Self {
         Self {
-            event: "answer",
-            seq,
+            event: "answer".into(),
+            seq: 0,
             ok: false,
-            code: "capability_unavailable".into(),
-            detail: "owner has not qualified this operation".into(),
+            code: String::new(),
+            detail: String::new(),
             descriptor: false,
             sha256: String::new(),
             length: 0,
@@ -739,6 +790,17 @@ impl Answer {
             reason: String::new(),
         }
     }
+}
+
+impl Answer {
+    pub fn unavailable(seq: u64) -> Self {
+        Self {
+            seq,
+            code: "capability_unavailable".into(),
+            detail: "owner has not qualified this operation".into(),
+            ..Self::default()
+        }
+    }
     pub fn ok(seq: u64) -> Self {
         Self { ok: true, code: String::new(), detail: String::new(), ..Self::unavailable(seq) }
     }
@@ -750,6 +812,7 @@ impl Answer {
 /// A child's result byte, granted into the caller's spool: what the caller checks against the
 /// result's own record before it hands out a handle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct ByteGrant {
     pub output_id: String,
     pub kind: String,
@@ -763,9 +826,10 @@ pub struct ByteGrant {
 
 /// A managed call's newest progress: its sequence and the child's progress frame.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
 pub struct CallProgress {
     pub sequence: u64,
-    pub payload: Value,
+    pub payload: Json,
 }
 
 // --------------------------------------------------------------------------- helpers
@@ -789,4 +853,129 @@ fn one() -> u32 {
 /// The Runtime's own default retained-output capacity (`MAX_OUTPUT_BYTES`).
 fn max_output_bytes() -> u64 {
     256 << 20
+}
+
+/// A JSON document carried as it is (a request's payload, an interface): Python reads it as plain
+/// dicts, lists and scalars.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Json(pub Value);
+
+#[cfg(feature = "python")]
+mod python {
+    use pyo3::{
+        exceptions::PyValueError,
+        prelude::*,
+        types::{PyDict, PyList},
+        IntoPyObjectExt,
+    };
+    use serde_json::Value;
+
+    use super::*;
+
+    fn value<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
+        Ok(match value {
+            Value::Null => py.None().into_bound(py),
+            Value::Bool(b) => b.into_bound_py_any(py)?,
+            Value::Number(n) => match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => i.into_bound_py_any(py)?,
+                (_, Some(u)) => u.into_bound_py_any(py)?,
+                _ => n.as_f64().unwrap_or(f64::NAN).into_bound_py_any(py)?,
+            },
+            Value::String(s) => s.into_bound_py_any(py)?,
+            Value::Array(items) => {
+                let list = PyList::empty(py);
+                for item in items {
+                    list.append(self::value(py, item)?)?;
+                }
+                list.into_any()
+            }
+            Value::Object(fields) => {
+                let dict = PyDict::new(py);
+                for (key, item) in fields {
+                    dict.set_item(key, self::value(py, item)?)?;
+                }
+                dict.into_any()
+            }
+        })
+    }
+
+    impl<'py> IntoPyObject<'py> for &Json {
+        type Target = PyAny;
+        type Output = Bound<'py, PyAny>;
+        type Error = PyErr;
+        fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+            value(py, &self.0)
+        }
+    }
+
+    impl<'py> IntoPyObject<'py> for Json {
+        type Target = PyAny;
+        type Output = Bound<'py, PyAny>;
+        type Error = PyErr;
+        fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+            value(py, &self.0)
+        }
+    }
+
+    /// A level reads as its wire name, `gpu` or `ram`.
+    impl<'py> IntoPyObject<'py> for &Level {
+        type Target = PyAny;
+        type Output = Bound<'py, PyAny>;
+        type Error = PyErr;
+        fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+            match self {
+                Level::Gpu => "gpu",
+                Level::Ram => "ram",
+            }
+            .into_bound_py_any(py)
+        }
+    }
+
+    macro_rules! methods {
+        ($($t:ty),*) => {$(
+            #[pymethods]
+            impl $t {
+                fn __repr__(&self) -> String {
+                    format!("{self:?}")
+                }
+                /// Its wire JSON.
+                fn json(&self) -> PyResult<String> {
+                    serde_json::to_string(self).map_err(|e| PyValueError::new_err(e.to_string()))
+                }
+            }
+        )*};
+    }
+    methods!(
+        Adapter, Binding, ModelLoad, MemoSettings, Construction, CallInterface, InputMetadata, InputFile,
+        ByteGrant, CallProgress, Answer
+    );
+
+    macro_rules! command_methods {
+        ($($t:ident => $wrap:expr),*) => {$(
+            #[pymethods]
+            impl $t {
+                fn __repr__(&self) -> String {
+                    format!("{self:?}")
+                }
+                /// Its frame, `cmd` included.
+                fn json(&self) -> PyResult<String> {
+                    let wrap: fn($t) -> Command = $wrap;
+                    serde_json::to_string(&wrap(self.clone())).map_err(|e| PyValueError::new_err(e.to_string()))
+                }
+            }
+        )*};
+    }
+    command_methods!(
+        Start => Command::Start,
+        Load => |c| Command::Load(Box::new(c)),
+        Activate => Command::Activate,
+        PrepareRequest => Command::PrepareRequest,
+        Invoke => |c| Command::Invoke(Box::new(c)),
+        Map => Command::Map,
+        Unload => Command::Unload,
+        Probe => Command::Probe,
+        Fork => Command::Fork,
+        Bearer => Command::Bearer
+    );
 }
