@@ -19,7 +19,7 @@ step candidates; candidates
 step "a weightless request"
 text=e2e-$RANDOM$RANDOM back=''
 for ((i = ${#text} - 1; i >= 0; i--)); do back+=${text:i:1}; done
-if (cd "$(dirname "$0")" && cell weightless ./echo.py "text=$text"); then
+if (cd "$(dirname "$0")" && cell weightless ./weightless/reverse "text=$text"); then
   grep -q "$back" "$OUT/weightless.ndjson" || check "weightless: the reply is not $back"
 fi
 
