@@ -2,7 +2,7 @@ name: release-gate
 # CI v2 release gate (tracker design ci-v2 §3): every selected first-party model runs for real on fresh rentals and is
 # held against the SKU's last PASS (release-gate/gate.sh, analyze.py). Release testing is manual (Paul 10-24): only the
 # release agent dispatches it, with the suites it chose for the candidate set, and its passing run id is what a
-# promotion requires (cozy-promote.yaml, publish-tensorfs.yaml, cozy-runtime publish.yaml, packages
+# promotion requires (cozy-promote.yaml, tensorfs-publish.yaml, cozy-runtime runtime-publish.yaml, packages
 # `task promote`). No workflow calls it.
 #   gh workflow run release-gate.yml -R cozy-creator/cozy-creator -f cozy=v0.11.17 -f runtime_wheel=https://…#sha256=… -f pins=…
 # The runner signs in as the owner's account with the CI device key (environment release-gate, secret
