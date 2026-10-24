@@ -458,7 +458,7 @@ def _install() -> None:
         shim, ext = ctypes.CDLL(str(_SHIM)), ctypes.CDLL(_ext.__file__)
         shim.varena_torch_abandon_pool.argtypes = (ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64)
         agent = ("alloc", "free", "record_stream", "pool_begin", "pool_end", "pool_release")
-        shim.varena_torch_bind((ctypes.c_void_p * len(agent))(*(ctypes.cast(getattr(ext, f"varena_agent_{f}"), ctypes.c_void_p) for f in agent)))
+        shim.varena_torch_bind_v2((ctypes.c_void_p * len(agent))(*(ctypes.cast(getattr(ext, f"varena_agent_{f}"), ctypes.c_void_p) for f in agent)))
         hook = {name: ctypes.cast(getattr(shim, f"varena_torch_{name}"), ctypes.c_void_p).value for name in ("malloc", "free", "record_stream", "begin_pool", "end_pool", "release_pool")}
         allocator = torch._C._cuda_customAllocator(hook["malloc"], hook["free"])
         allocator.set_record_stream_fn(hook["record_stream"])

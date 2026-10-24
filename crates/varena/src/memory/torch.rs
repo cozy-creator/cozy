@@ -79,7 +79,7 @@ impl Memory {
     /// thread's routed arena (a request's or a region's), else the process's. Err is
     /// `Error::Exhausted`, whose text is torch's OOM reason, or `Invalid` before torch is served.
     pub fn torch_alloc(&self, bytes: u64, stream: usize, pool: Option<PoolId>) -> Result<u64> {
-        self.torch()?.alloc(bytes, stream, pool)
+        self.device_call(|| self.torch()?.alloc(bytes, stream, pool))
     }
 
     /// Never fails and never waits on the device.
@@ -98,7 +98,7 @@ impl Memory {
 
     /// Before capture begins: maps `expected` bytes into `pool`, making room here.
     pub fn pool_prepare(&self, pool: PoolId, expected: u64) -> Result<()> {
-        self.torch()?.pool_prepare(pool, expected)
+        self.device_call(|| self.torch()?.pool_prepare(pool, expected))
     }
 
     /// torch's begin-allocate-to-pool hook, on the capturing thread before the capture starts on
@@ -128,7 +128,7 @@ impl Memory {
 
     /// An event on `stream` after the pool's use there (a replay and its readers).
     pub fn pool_fence(&self, pool: PoolId, stream: usize) -> Result<()> {
-        self.torch()?.pool_fence(pool, stream)
+        self.device_call(|| self.torch()?.pool_fence(pool, stream))
     }
 
     pub fn torch_stats(&self) -> TorchStats {

@@ -332,6 +332,20 @@ impl Clone for Memory {
 
 /// region.rs's hooks: the device's events, its free bytes, the manager's figures, and the plan.
 impl Memory {
+    /// The common device-error boundary for weights, torch and local region operations.
+    /// Uses the existing ownership flag and retirement path; no second allocator health state.
+    pub(crate) fn device_call<T>(&self, call: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.inner.check_ownership()?;
+        let result = crate::caught(call);
+        if let Some(error) = result.as_ref().err().filter(|e| e.is_sticky() || matches!(e, Error::Internal(_) | Error::Closed(_))) {
+            self.inner.lost_backing(error);
+        }
+        result
+    }
+
+    /// A non-unwinding allocator hook panicked: retain uncertain backing until executor exit.
+    pub fn allocator_failed(&self) { self.inner.lost_backing("allocator hook panicked"); }
+
     pub(crate) fn record_event(&self, stream: usize) -> Result<Event> {
         self.inner.backend.record(stream)
     }
