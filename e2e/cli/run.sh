@@ -23,6 +23,14 @@ if (cd "$(dirname "$0")" && cell weightless ./weightless/reverse "text=$text"); 
   grep -q "$back" "$OUT/weightless.ndjson" || check "weightless: the reply is not $back"
 fi
 
+# An idle executor killed is reaped at once (gone from ps, no zombie), and the next request works.
+step "a killed idle executor"
+if executor_reaped; then
+  if (cd "$(dirname "$0")" && cell reaped ./weightless/reverse "text=$text"); then
+    grep -q "$back" "$OUT/reaped.ndjson" || check "reaped: the reply is not $back"
+  fi
+fi
+
 step "BiRefNet on the CPU"
 dog=$(picture dog1.jpg)
 if cell first "$(birefnet)" --asset "image=$dog"; then white_background "$(output first webp)" "$dog" || check "first: not a background removal"; fi

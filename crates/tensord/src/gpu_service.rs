@@ -647,6 +647,8 @@ pub struct Pool {
     host: Option<Arc<memory::Host>>,
     /// Held while the pool lives: the thread blocked on the ledgers' events ends with it.
     _events: Option<memory::Reacting>,
+    /// Idle executors watched for their exit (none where it cannot watch).
+    exits: Option<Exits>,
     /// Memoized Model methods' results, shared by every run on this machine.
     memo: Arc<crate::memo::Memo>,
     /// The calls running on its GPUs, by request: the host rule reads them.
@@ -656,6 +658,48 @@ pub struct Pool {
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
+/// While the pool lives, its idle executors are watched for their exit: one killed or crashed
+/// while idle leaves the pool and is reaped at once, never left a zombie until the next call.
+/// Dropped with the pool, its thread ends.
+struct Exits(Arc<platform::memory::Signal>);
+impl Exits {
+    fn watch(pool: Weak<Pool>) -> io::Result<Exits> {
+        let changed = Arc::new(platform::memory::Signal::new().map_err(io::Error::other)?);
+        let woken = changed.clone();
+        std::thread::Builder::new().name("executor-exits".into()).spawn(move || loop {
+            let Some(handles) = pool.upgrade().map(|pool| pool.idle_handles()) else { return };
+            let waitables: Vec<_> = std::iter::once(woken.waitable()).chain(handles.iter().map(waitable)).collect();
+            let ready = match platform::memory::wait_any(&waitables) {
+                Ok(ready) => ready,
+                Err(error) => return tracing::warn!("executor exits: {error}"),
+            };
+            woken.clear();
+            if ready.iter().any(|ready| ready.index > 0) {
+                let Some(pool) = pool.upgrade() else { return };
+                pool.reap();
+            }
+        })?;
+        Ok(Exits(changed))
+    }
+    /// The idle executors changed: watch the new set.
+    fn changed(&self) {
+        self.0.set();
+    }
+}
+impl Drop for Exits {
+    fn drop(&mut self) {
+        self.0.set();
+    }
+}
+#[cfg(unix)]
+fn waitable(file: &std::fs::File) -> platform::memory::Waitable<'_> {
+    std::os::fd::AsFd::as_fd(file)
+}
+#[cfg(windows)]
+fn waitable(file: &std::fs::File) -> platform::memory::Waitable<'_> {
+    std::os::windows::io::AsHandle::as_handle(file)
+}
+
 struct Device {
     entry: String,
     /// Its ledger; None where the inventory does not name its memory.
@@ -749,7 +793,8 @@ impl Pool {
             let gpus = devices.iter().filter_map(|d| d.memory.clone()).map(memory::Source::Gpu);
             let sources: Vec<memory::Source> = gpus.chain(host.clone().map(memory::Source::Host)).collect();
             let pool = pool.clone();
-            let woke = move |woke| match (pool.upgrade(), woke) {
+            let ledger = pool.clone();
+            let woke = move |woke| match (ledger.upgrade(), woke) {
                 (Some(pool), memory::Woke::Gpu) => pool.memory_changed(),
                 (Some(pool), memory::Woke::HostShort) => pool.host_short(),
                 (None, _) => {}
@@ -760,7 +805,11 @@ impl Pool {
                     .map_err(|error| tracing::warn!("memory: no ledger events: {error}"))
                     .ok(),
             };
+            let exits = Exits::watch(pool.clone())
+                .map_err(|error| tracing::warn!("executor exits are not watched: {error}"))
+                .ok();
             Self {
+                exits,
                 launcher,
                 root: root.to_path_buf(),
                 serving: Arc::default(),
@@ -1245,6 +1294,8 @@ impl Pool {
             let mut idle = self.deviceless.lock().unwrap();
             if !self.stopped.load(Ordering::Acquire) {
                 idle.push(session);
+                drop(idle);
+                self.exits.iter().for_each(Exits::changed);
                 return Ok(Disposition::Cached);
             }
             drop(idle);
@@ -1282,6 +1333,8 @@ impl Pool {
                 self.levels.lock().unwrap().insert(key.clone(), noted);
             }
             sessions.insert(key, session);
+            drop(sessions);
+            self.exits.iter().for_each(Exits::changed);
             return Ok(Disposition::Cached);
         }
     }
@@ -1366,11 +1419,18 @@ impl Pool {
             }
         }
     }
-    /// Idle executors that exited leave the pool.
+    /// Every idle executor's exit handle, for [`Exits`].
+    fn idle_handles(&self) -> Vec<std::fs::File> {
+        let mut handles: Vec<_> = self.sessions.lock().unwrap().values().filter_map(|s| s.executor.observer_pidfd().ok()).collect();
+        handles.extend(self.deviceless.lock().unwrap().iter().filter_map(|s| s.executor.observer_pidfd().ok()));
+        handles
+    }
+    /// Idle executors that exited leave the pool, and their processes are reaped as they go.
     fn reap(&self) {
+        let ended = |s: &Session| s.executor.birth.ended().unwrap_or(false);
+        drop(self.deviceless.lock().unwrap().extract_if(.., |s| ended(s)).collect::<Vec<_>>());
         let gone: Vec<Session> = {
             let mut sessions = self.sessions.lock().unwrap();
-            let ended = |s: &Session| s.executor.birth.ended().unwrap_or(false);
             let keys: Vec<String> = sessions.iter().filter(|(_, s)| ended(s)).map(|(key, _)| key.clone()).collect();
             keys.iter().filter_map(|key| sessions.remove(key)).collect()
         };
