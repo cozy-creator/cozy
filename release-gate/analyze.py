@@ -17,7 +17,8 @@ import lm, quality, swap  # noqa: E402
 from varena import check as varena  # noqa: E402
 # A suite's check runs when gate.sh ran the suite (--suite: the names in <gate dir>/suites).
 SUITES = open(os.path.join(out, 'suites')).read().split() if os.path.exists(os.path.join(out, 'suites')) else []
-CHECKS = [quality.check, lm.check, swap.check] + [{'varena': varena.check}[s] for s in SUITES if s == 'varena']
+SUITE_CHECKS = {'varena': varena.check}  # runtime and packages: quality, lm and swap, which every gate runs
+CHECKS = [quality.check, lm.check, swap.check] + [SUITE_CHECKS[s] for s in SUITES if s in SUITE_CHECKS]
 # Allowed rise over the worst known-good number, unless the good numbers' own spread is wider.
 SLACK = {'execution_ms': 0.25, 'step1_ms': 0.5, 'steady_ms': 0.10, 'peak_vram_mb': 0.10}
 # A step may cost at most 2x its reference plus 5 s: step 1 against step 2 (known-good fresh H3 executors 0.9-1.8x; the
@@ -219,6 +220,7 @@ for check in CHECKS:
     fails += f; notes += n
 for n in notes: print('note', n)
 for f in fails: print('FAIL', f)
+print('SUITES', ','.join(SUITES) or 'none')
 print('VERDICT', 'FAIL' if fails else 'PASS', f'({len(cells)} cells)', '' if not fails or not accept else '(accepted by the lead)')
 if not fails or accept:
     label = open(os.path.join(out, 'label')).read().strip()

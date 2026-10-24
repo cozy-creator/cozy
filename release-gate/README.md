@@ -1,32 +1,49 @@
 # Release gate
 
-Every first-party model runs for real on a fresh rental, and its numbers are held against the last passed gate on
-the same SKU. Any FAIL blocks the publish. Design: tracker `design/ci-v2.md` §3.
+Release testing is manual: the release agent picks the suites a release needs (`--suite`, no default), runs them, and
+the promotion names the passing run (`verify.sh`). Every cell is a real run held against the last passed gate on the
+same SKU and suites; any FAIL blocks the promotion. Design: tracker `design/ci-v2.md` §3.
+
+## Suites
+
+| Suite | Proves | Rentals (`skus`) | Cost · time | Pick it for |
+|---|---|---|---|---|
+| `runtime` | every first-party package's default call (H3 15 s with a described reference, SeedVR2, SDXL, Klein, Qwen, Anima, BiRefNet, the Qwen3.5 describer, Fibo, HiDream, MOSS, Qwen-Image and its one-release swap), then SDXL in a second executor: kernels, times, VRAM, quality, LM coverage | rtx-4090, rtx-5090 | ~$6 · ~75 min, in parallel | a Runtime, TensorFS, varena or TensorD change; any rewrite |
+| `packages` | the packages `--pins` (or `--only`) names, plus the SDXL smoke | rtx-4090, rtx-5090 | ~$1–3 · 15–30 min | a package bump |
+| `varena` | the memory manager: cold load, co-residency, reload, 8/6/3 GiB caps, a real 8 GB card, host RAM (below) | its `skus` | | a varena or memory change |
+| `tensord` | the machine agent through `cozy`: generations, run and executor lifecycle, leases, multi-GPU, no re-execution, output delivery, cl-650 (building) | a cheap 2-GPU pod | | a TensorD or cozy change |
+| `tensorfs`, `hub`, `cli` | (building) | | | a TensorFS, Hub or CLI change |
+
+A rewrite picks every suite. Suites stack on one rental per SKU (`--suite runtime,packages` runs each cell once,
+against `gate-<SKU>-runtime-packages.json`). A suite is `suites/<name>/`: `cells.sh` (sourced in gate.sh: `cell`,
+`pkg`, `product`, `expect`, `log`, `$CLI`, `$M`, `$R`, `$REF` and the scenario), optional `before.sh` (the fresh pod,
+before the candidate goes on), optional `check.py` (`check(gate) -> (fails, notes)`, listed in analyze.py), and `skus`
+(`<sku> [disk GB] [gpus]` per line, the workflow's rentals). The verdict's `SUITES` line names what ran.
 
 ## What a gate does
 
 1. Rents one fresh machine of the SKU.
-2. Puts the candidate on it: `--runtime-wheel`, `--tensorfs-wheel`, `--tensord` (a cozy binary), `--pins`
+2. Puts the candidate on it: `--runtime`, `--tensorfs`, `--tensord` (a cozy binary; each a file or `URL#sha256=`), `--pins`
    (exact package releases, `sdxl@2.13.0,…`: a package candidate is published and yanked, and installs only by its pin),
    or `--packages` (a packages checkout whose directories run). Unpinned cells run the root package users get.
-3. Runs each cell once, with new prompts and seeds.
+3. Runs the chosen suites' cells, each once, with new prompts and seeds.
 4. Ends the rental and checks that it is gone.
 5. Runs `analyze.py`. A cell passes when it completed, served the last PASS's kernels (with no fallback), produced
    a sane output, and kept execution / step 1 / steady s/step / peak reserved VRAM within the last PASS's spread.
 
 ## Baselines
 
-Assets of the `release-gate-baselines` release: `gate-<SKU>.json`, plus the reference image and clip the next gate's H3
+Assets of the `release-gate-baselines` release: `gate-<SKU>-<suites>.json`, plus the reference image and clip the next gate's H3
 cell starts from. Every gate reads them. A PASS (with `--publish`, or the workflow's `baseline` job) replaces them.
-A SKU with no baseline needs `--establish` once.
+A SKU and suites with no baseline need `--establish` once.
 
 ## Running it
 
-- **By hand:** `release-gate/gate.sh rtx-4090 --runtime-wheel <url#sha256=…> --publish`. It runs through the default
-  `~/.cozy`, signed in as you.
-- **From Actions:** `gh workflow run release-gate.yml -R cozy-creator/cozy-creator -f runtime_wheel=… -f changed='cozy-runtime v0.30.16'`.
-  - Selection (`ci/affected`) picks the SKUs and cells; `skus` and `only` override it.
-  - `release.yml` (cozy), cozy-runtime's `publish.yaml` and packages' `task publish` run it before they publish.
+- **By hand:** `release-gate/gate.sh rtx-4090 --suite runtime --runtime <url#sha256=…> --publish`, through the
+  default `~/.cozy`, signed in as you.
+- **From Actions:** `gh workflow run release-gate.yml -R cozy-creator/cozy-creator -f suites=runtime,packages -f pins=…`.
+  The suites' `skus` pick the rentals; `skus` overrides them, `only` narrows the cells. `release.yml -f suites=…`
+  gates a cozy candidate before it is promoted.
 
 ## Promotion
 
@@ -55,14 +72,12 @@ The runner signs in as the owner's account with its own device key: secret `COZY
 - **One release, two checkpoints** (`swap.py`): Qwen-Image text → edit → text and its two Lightning LoRAs in turn, each group on one executor with no restart (run 15744: TFS 0.15.0's `{release}/{component}` set names collided). No first-party SDXL LoRA exists to swap.
 - **LM coverage** (`lm.py`, every gate): Fibo's and Klein's prompt upsamplers and H3's reference describer ran their
   greedy token loops (H3's cell gives a character reference, which BiRefNet cleans and Qwen3.5 describes).
-- **Suites** (`--suite <name>`): a suite runs instead of the product cells, from `suites/<name>/cells.sh`, judged by its
-  `check.py`, against its own baseline `gate-<SKU>-<name>.json`. Its `skus` lists the SKUs the workflow rents for it.
 - **varena** (`suites/varena`): the memory manager through its paces on SDXL, Klein and 5 s H3 on Ampere, Ada,
   Blackwell and a CPU rental (Hopper/B200 on request): cold load, co-residency, unload and reload, 8/6/3 GiB caps with
   SDXL and Klein alternating at 6, a real 8 GB card, and host RAM under the rental's cgroup with page/spill to disk.
   `check.py` holds each load and refill to a share of the machine's measured ceiling (`ceiling.py`), checks caps,
   alternation and host RAM; `analyze.py`, time and peak VRAM. Selected by `varena` (varena, TensorFS, TensorD, the
-  Runtime) or `-f varena=true`; a SKU new to it needs `-f skus=<sku> -f varena=true -f establish=true` once.
+  Runtime); a SKU new to it needs `-f suites=varena -f skus=<sku> -f establish=true` once.
 - **Quality** (`quality.py`, every gate): CLIP prompt adherence of every render against its prompt (floor 0.25), and
   the gate's median CLIP-IQA sharpness against the last passed gates. Never a same-seed pixel diff.
 - **Checks:** `analyze.py` runs every `check(gate) -> (fails, notes)` in `CHECKS` (quality, lm, swap, and a suite's).

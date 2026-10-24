@@ -60,6 +60,12 @@ on:
         required: false
         default: true
         type: boolean
+      # HAND-EDITED: the release agent picks the gate's suites (release-gate/README.md); promote needs them.
+      suites:
+        description: The release gate's suites, comma-separated (release-gate/README.md); required to promote
+        required: false
+        default: ''
+        type: string
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -346,7 +352,7 @@ jobs:
     uses: ./.github/workflows/release-gate.yml
     with:
       cozy: ${{ needs.plan.outputs.tag }}
-      changed: cozy-creator ${{ github.sha }}
+      suites: ${{ inputs.suites }}
       nonce: release-${{ needs.plan.outputs.tag }}
     secrets: inherit
 
