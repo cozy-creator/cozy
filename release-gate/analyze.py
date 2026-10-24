@@ -1,5 +1,5 @@
 """Verdict for one release-gate directory. Each cell ran once on a fresh pod; its execution time, denoise step 1,
-steady s/step and peak reserved VRAM are held against the SKU's last known-good numbers (the baseline file,
+steady s/step and peak VRAM (the most it needed at once: record.working) are held against the SKU's last known-good numbers (the baseline file,
 gate-<SKU>.json, which gate.sh fetches from and publishes to the `release-gate-baselines` release). A PASS is recorded
 in the baseline file; `--accept` records a FAIL the lead accepted. Exit 1 on any failure: the publish is blocked.
     analyze.py <gate dir> <SKU> <baseline file> [--accept]
@@ -13,7 +13,7 @@ accept = '--accept' in sys.argv
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, 'suites'))
-import lm, quality, swap  # noqa: E402
+import lm, quality, record, swap  # noqa: E402
 from tensorfs import check as tensorfs  # noqa: E402  (release-gate/suites/tensorfs, never the tensorfs library)
 from varena import check as varena  # noqa: E402
 # A suite's check runs when gate.sh ran the suite (--suite: the names in <gate dir>/suites).
@@ -52,9 +52,10 @@ def observations(rec):
     return [o for m in measurements(rec) for o in m.get('observations') or []]
 
 
-def peak_vram_mb(rec):
-    """The largest peak reserved device memory of the run and its calls, in MiB."""
-    peaks = [(m.get('memory') or {}).get('peak_reserved_bytes') or 0 for m in measurements(rec)]
+def peak_vram_mb(rec, figure=record.working):
+    """The most the run and its calls needed at once (`record.working`: 0.32's varena working set, 0.30's reserved
+    peak), in MiB; with `record.held`, what they held."""
+    peaks = [figure(m.get('memory') or {}) for m in measurements(rec)]
     return round(max(peaks) / 2**20) if any(peaks) else None
 
 
@@ -111,7 +112,7 @@ for name, target, number in cells:
     host_legs[name] = legs
     c = summary[name] = {'blocking': blocking, 'run': rec['number'], 'target': canonical(target), 'gemm': gemm, 'attention': attn,
                          'execution_ms': rec.get('execution_ms'), 'step1_ms': round(s[0]) if s else None,
-                         'peak_vram_mb': peak_vram_mb(rec),
+                         'peak_vram_mb': peak_vram_mb(rec), 'held_vram_mb': peak_vram_mb(rec, record.held),
                          'steady_ms': round(sum(s[1:]) / len(s[1:])) if len(s) > 1 else None,
                          'files': sorted(glob.glob(os.path.expanduser(f"~/.cozy/outputs/*/{rec['number']}-*")))}
     if len(s) > 2:
@@ -187,6 +188,8 @@ for name, c in summary.items():
         else:
             notes.append(f'{name}: known blocking {work} {ms / 1000:.1f} s ({site["issue"]}, {site["site"]})')
 for name, c in summary.items():
+    if c.get('held_vram_mb'):
+        notes.append(f'{name} held: {c["held_vram_mb"] / 1024:.1f} GiB (pages and torch at its fullest; not compared)')
     good = [g for g in base['cells'].get(name, {}).get('good', []) if canonical(g['target']) == c['target']]
     if not good:
         notes.append(f'{name}: no known-good numbers for {c["target"]} on {sku}: this run starts them'); continue

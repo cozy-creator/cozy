@@ -1,7 +1,7 @@
 """The varena suite's verdict (cells.sh), one of analyze.py's CHECKS; analyze.py already holds every cell to completion,
 kernels, time and peak VRAM against the last pass.
-  - bandwidth: each load (disk) and refill (host to device) of 1 GiB or more, as a share of the `ceiling` cell's
-    measured ceiling, may not fall under 80% of its last passes' lowest share;
+  - bandwidth: each copy kind of 1 GiB or more (0.32's store and derived fills, 0.30's load and refill: record.py), as
+    a share of the `ceiling` cell's measured ceiling, may not fall under 80% of its last passes' lowest share;
   - caps (`s<N>-<model>[-<i>]`, N GiB): the ledger took the cap; no step held more than it (resident weights plus
     torch's allocation, and torch's reserved peak); the kernels match `cold-<model>` (another kernel under pressure is
     a slow fallback); no bytes left behind; the third alternation costs at most CHURN more than the second;
@@ -10,6 +10,9 @@ kernels, time and peak VRAM against the last pass.
   - every H3 cell produced its whole video.
     check.py <gate dir> <SKU>     the same verdict alone"""
 import json, os, re, subprocess, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+import record  # noqa: E402  (release-gate/record.py: 0.30's and 0.32's memory records alike)
 
 GIB = 1 << 30
 CHURN = 0.25
@@ -54,11 +57,12 @@ def bandwidth(recs, base):
     now = {}
     for name, rec in recs.items():
         moved = {}
-        for c in (c for m in memories(rec) for c in (m.get('stats') or {}).get('copies') or []):
-            b, s = moved.get(c['kind'], (0, 0.0))
-            moved[c['kind']] = (b + c['bytes'], s + c['seconds'])
-        for kind, key, what in (('disk', 'disk_gbps', 'load'), ('h2d', 'h2d_gbps', 'refill')):
-            b, s = moved.get(kind, (0, 0.0))
+        for m in memories(rec):
+            for kind, (b, s) in record.copies(m).items():
+                mb, ms = moved.get(kind, (0, 0.0))
+                moved[kind] = (mb + b, ms + s)
+        for what, (b, s) in sorted(moved.items()):
+            key = record.CEILING[what]
             if b < GIB or not s or not ceiling.get(key):
                 continue
             share = b / s / 1e9 / ceiling[key]
@@ -84,10 +88,9 @@ def host(recs):
         return [f'host-cap: no host cap below the host RAM ({cap}): the host cells prove nothing here'], notes
     notes.append(f'host cap {cap["cap"] / GIB:.1f} GiB of {cap["mem_total"] / GIB:.1f} GiB RAM, swap {(cap.get("swap_total") or 0) / GIB:.1f} GiB')
     for name in cells:
-        stats = [m.get('stats') or {} for m in memories(recs[name])]
-        moved = sum((st.get('paged_in') or 0) + sum(r.get('streamed', 0) for r in st.get('rows') or [])
-                    + sum(e.get('nbytes', 0) for e in st.get('evictions') or []) for st in stats)
-        anon = max((st['host'] for st in stats if st.get('host')), default=None)
+        mems = memories(recs[name])
+        moved = sum(record.paged(m) for m in mems)
+        anon = max((h for m in mems if (h := record.host(m))), default=None)
         line = f'{name}: paged/spilled {moved / GIB:.1f} GiB' + (f', anonymous host high-water {anon / GIB:.1f} GiB' if anon else '')
         if not moved:
             fails.append(f'{name}: no page or spill bytes recorded under the {cap["cap"] / GIB:.1f} GiB host cap')
@@ -111,13 +114,12 @@ def caps(out, recs):
     execs = {}
     for name, gib, model, i in capped:
         rec, mems = recs[name], memories(recs[name])
-        rows = [r for m in mems for r in (m.get('stats') or {}).get('rows') or []]
-        held = max((r.get('resident', 0) + r.get('allocated', 0) for r in rows), default=0)
+        held = max((record.step_held(m) for m in mems), default=0)
         reserved = max((m.get('peak_reserved_bytes') or 0 for m in mems), default=0)
-        moved = sum(r.get('streamed', 0) + r.get('paged_in', 0) for r in rows)
+        moved = sum(record.paged(m) for m in mems)
         line = f'{name}: held {held / GIB:.2f} GiB at its fullest step, torch reserved {reserved / GIB:.2f} GiB, streamed + paged {moved / GIB:.1f} GiB'
         (fails if held > gib * GIB or reserved > gib * GIB else notes).append(line + f', cap {gib} GiB')
-        left = sum((m.get('stats') or {}).get('leftover') or 0 for m in mems)
+        left = sum(record.leftover(m) for m in mems)
         if left:
             fails.append(f'{name}: left {left / GIB:.2f} GiB behind')
         ref = recs.get(f'cold-{model}')
