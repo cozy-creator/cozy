@@ -415,5 +415,9 @@ class Retained:
 
 class StaleBinding(VarenaError): ...
 
+def host_limit() -> int | None:
+    """The most this process's memory can reach: physical memory, or less under a cgroup limit;
+    None when unreadable."""
+
 def pins_held() -> int:
     """Pins the binding holds now: Python's pin objects and the tensors that keep one."""

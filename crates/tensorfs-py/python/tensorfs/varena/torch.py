@@ -33,7 +33,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
-from . import Ended, Exhausted, Fill, GpuId, Level, Pass, Pin, Stats, VarenaError, Window
+from . import Ended, Exhausted, Fill, GpuId, Level, Pass, Pin, Stats, VarenaError, Window, host_limit
 from . import Memory as Native
 from .. import _ext
 from . import Request as NativeRequest
@@ -526,7 +526,9 @@ class Memory:
                 elif device.type == "cuda":
                     native = Native.cuda(device.index or 0)
                 else:
-                    ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                    ram = host_limit()  # past it the kernel kills: a cgroup's limit, not physical memory
+                    if ram is None:
+                        raise VarenaError("this process's memory limit is unreadable: the host table has no size")
                     native = Native.host(GpuId("host", device.type, ram))
                 memory = cls(native, device)
                 if device.type == "cuda":
