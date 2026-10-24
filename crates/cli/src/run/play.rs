@@ -12,7 +12,7 @@ use protocol::{
 use crate::{Context, output};
 
 /// The static player page (GitHub Pages' build of `web/player`).
-const PLAYER: &str = "https://cozy-creator.github.io/cozy/play/";
+const PLAYER: &str = "https://cozy-creator.github.io/cozy-creator/play/";
 
 pub async fn exec(
     ctx: &Context,
