@@ -830,6 +830,10 @@ pub enum NewMachine {
         /// one; the Hub refuses anyone else.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image: Option<String>,
+        /// A Hub admin's provider (`runpod`, `vast`), in place of every provider; the Hub refuses
+        /// anyone else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
         /// The quote the renter agreed to (`POST /v1/rental-quotes`): a dearer one rents nothing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agreed: Option<Agreed>,

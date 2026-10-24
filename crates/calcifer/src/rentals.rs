@@ -1252,6 +1252,8 @@ pub struct Shape {
     pub gpus: Option<u32>,
     pub disk_gb: Option<u32>,
     pub image: Option<String>,
+    /// A Hub admin's provider; the Hub refuses anyone else.
+    pub provider: Option<String>,
     pub agreed: Option<Agreed>,
     /// Machines the Hub may buy instead, in order, at or below the asked one's price.
     pub fallbacks: Vec<types::RentalFallback>,
@@ -1277,7 +1279,7 @@ fn request(sku: &str, shape: Shape) -> Result<(types::RentalRequest, String, Sig
         media_token_sha256: hex::encode(Sha256::digest(&random[4..36])),
         name: alias.clone(),
         planned_source_bytes: None,
-        provider: None,
+        provider: shape.provider,
         serving_models: vec![],
         sku: sku.to_owned(),
     };
