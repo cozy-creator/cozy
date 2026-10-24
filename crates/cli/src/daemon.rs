@@ -1,5 +1,6 @@
-//! `cozy up|down|status|logs`: Calcifer's lifecycle. Stopping Calcifer never stops work: machines
-//! run what they accepted, and the next Calcifer resumes what it owed.
+//! `cozy status|logs`, and Calcifer's restart (`cozy update`, `cozy doctor`). Any cozy command starts
+//! Calcifer; restarting it never stops work: machines run what they accepted, and the next Calcifer
+//! resumes what it owed.
 use std::process::ExitCode;
 
 use clap::ValueEnum;
@@ -13,51 +14,6 @@ use serde_json::json;
 use platform::tail::{Log, Start};
 
 use crate::{Context, calcifer_client::Client, output};
-
-#[derive(clap::Args, Debug)]
-pub struct Up {}
-
-pub async fn up(ctx: &Context, _args: Up) -> Result<ExitCode, Error> {
-    let client = ctx.calcifer().await?;
-    let holder = client.holder().expect("a connected client has a record");
-    if ctx.json {
-        output::json(&json!({ "calcifer": running(ctx, &holder) }));
-    } else {
-        calcifer_record(ctx, &holder).print(ctx);
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-#[derive(clap::Args, Debug)]
-pub struct Down {}
-
-pub async fn down(ctx: &Context, _args: Down) -> Result<ExitCode, Error> {
-    let Some(client) = Client::running(ctx).await? else {
-        if ctx.json {
-            output::json(&json!({ "calcifer": { "running": false }, "changed": false }));
-        } else {
-            output::Record::new()
-                .field("calcifer", "not running")
-                .print(ctx);
-        }
-        return Ok(ExitCode::SUCCESS);
-    };
-    let down = client.stop().await?;
-    if ctx.json {
-        output::json(
-            &json!({ "calcifer": { "running": false }, "changed": true, "owed": down.owed }),
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
-    let mut record = output::Record::new().field("calcifer", "stopped");
-    if !down.owed.is_empty() {
-        record = record
-            .field("owed", down.owed.join(", "))
-            .note("Machines keep running it; the next cozy command resumes it.");
-    }
-    record.print(ctx);
-    Ok(ExitCode::SUCCESS)
-}
 
 /// Stops a running Calcifer and starts the installed `cozy`'s in its place, after something
 /// replaced that binary. `false`: none was running, and none is started.
@@ -82,7 +38,7 @@ pub async fn status(ctx: &Context, _args: Status) -> Result<ExitCode, Error> {
             output::Record::new()
                 .field("calcifer", "not running")
                 .print(ctx);
-            output::next(ctx, &["cozy up"]);
+            output::next(ctx, &["cozy doctor"]);
         }
         return Ok(ExitCode::SUCCESS);
     };
@@ -306,7 +262,7 @@ async fn calcifer_log(ctx: &Context, follow: bool) -> Result<ExitCode, Error> {
                 path.display()
             ),
         )
-        .next("cozy up"));
+        .next("cozy doctor"));
     }
     let unreadable = |e: &dyn std::fmt::Display| {
         Error::new(

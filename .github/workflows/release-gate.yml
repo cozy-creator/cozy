@@ -203,7 +203,7 @@ jobs:
           umask 077; printf '%s' "$KEY" > "$RUNNER_TEMP/key.json"
           cozy login --key "$RUNNER_TEMP/key.json"; code=$?
           rm -f "$RUNNER_TEMP/key.json"
-          [ "$code" = 0 ] && cozy up
+          exit $code
       - name: Gate ${{ matrix.sku }} (${{ matrix.suite }})
         env:
           ARGS: ${{ steps.candidate.outputs.args }}

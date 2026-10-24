@@ -482,7 +482,7 @@ pub fn spawn(mut command: Command) -> Result<Tree> {
 /// A process that outlives its spawner: its own session (Unix); no console, out of the spawner's
 /// job when allowed (Windows). It reads null and appends stdout and stderr to `log` (null without
 /// one), and inherits nothing else: a caller reading the spawner's output to its end, as
-/// `out=$(cozy up)` does, gets that end when the spawner exits.
+/// `out=$(cozy status)` does, gets that end when the spawner exits.
 pub fn detach(program: &Path, args: &[OsString], log: Option<&Path>) -> Result<Detached> {
     let log = log
         .map(|path| {

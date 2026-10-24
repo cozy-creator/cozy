@@ -24,7 +24,7 @@ targets = [
 ]
 install-path = "~/.cozy/bin"
 # Embedded in the installers' double-quoted strings (sh, PowerShell): no backticks, $ or double quotes.
-install-success-msg = "cozy is installed. Optional: run 'cozy tools install ffmpeg' to trim video uploads; 'cozy tools list' shows each tool and what it adds."
+install-success-msg = "cozy is installed in ~/.cozy/bin. It keeps its machine, models and outputs in ~/.cozy, and its PATH lines source ~/.config/cozy; the README's 'Remove cozy' lists everything to delete. 'cozy doctor' checks this computer's cozy."
 install-updater = false
 dispatch-releases = true
 precise-builds = true

@@ -220,7 +220,7 @@ impl Detached {
 }
 
 /// std's spawn hands a child every inheritable handle this process holds, a pipe its caller reads
-/// to the end among them (`out=$(cozy up)`): a child that outlives this process would hold that
+/// to the end among them (`out=$(cozy status)`): a child that outlives this process would hold that
 /// end open forever. So CreateProcessW here, with a handle list of exactly the child's own.
 pub(super) fn detach(program: &Path, args: &[OsString], log: Option<File>) -> io::Result<Detached> {
     let null = File::options().read(true).write(true).open("NUL")?;

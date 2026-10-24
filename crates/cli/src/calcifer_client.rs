@@ -36,6 +36,16 @@ const REPORT: Duration = Duration::from_secs(5);
 /// row is a Calcifer that is not going to answer.
 const AGAIN: u32 = 3;
 
+/// This home's Calcifer lock as `cozy doctor` reads it.
+pub(crate) enum Lock {
+    /// Nobody holds the home; `stale`: a record names a Calcifer killed before it erased it.
+    Free { stale: bool },
+    /// A Calcifer holds the home and its record names it.
+    Held(Holder),
+    /// The home is held, but its record does not read as a Calcifer's.
+    Unreadable,
+}
+
 /// One command's connection to Calcifer. Cheap to clone; clones share the connection.
 #[derive(Clone)]
 pub struct Client(Arc<Inner>);
@@ -77,6 +87,40 @@ impl Client {
             json: ctx.json,
             holder: Mutex::new(None),
         })))
+    }
+
+    /// A client that reaches nothing yet (`cozy doctor`, which looks before it starts anything).
+    pub(crate) fn unconnected(ctx: &Context) -> Result<Self, Error> {
+        Self::new(ctx)
+    }
+
+    /// What this home's lock says of its Calcifer, starting nothing.
+    pub(crate) fn lock_state(&self) -> Lock {
+        let free = self.lock_free();
+        let raw = LockFile::new(self.0.home.calcifer_lock()).holder().ok().flatten();
+        match (free, raw.map(|raw| serde_json::from_slice::<Holder>(&raw))) {
+            (true, record) => Lock::Free { stale: record.is_some() },
+            (false, Some(Ok(holder))) => Lock::Held(holder),
+            (false, _) => Lock::Unreadable,
+        }
+    }
+
+    /// Whether the Calcifer `holder` names answers one request: any reply is an answer. Waits as
+    /// long as the request does; the caller judges a silence by the process's progress.
+    pub(crate) async fn answers(&self, holder: &Holder) -> bool {
+        let probe = format!("http://{}/v1/runs", holder.address);
+        let request = self.0.http.get(probe).query(&[("limit", 1)]);
+        request.bearer_auth(&holder.token).send().await.is_ok()
+    }
+
+    /// Calcifer's service manager for this home, its definition for the installed cozy, and
+    /// whether this process is that cozy (only it writes the definition).
+    pub(crate) fn service(&self) -> Result<(Services, ServiceSpec, bool), Error> {
+        let installed = installed(&self.0.home)?;
+        let exe = std::env::current_exe().and_then(|exe| exe.canonicalize());
+        let ours = matches!((exe, installed.canonicalize()), (Ok(exe), Ok(it)) if exe == it);
+        let services = Services::new(&self.0.home, &self.0.user_home);
+        Ok((services, self.spec(installed), ours))
     }
 
     /// The record of the Calcifer this client last reached.

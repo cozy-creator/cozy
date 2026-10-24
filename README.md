@@ -40,14 +40,41 @@ add `--on new` to run on a rented one. Outputs land in `~/.cozy/outputs`.
 
 `cozy --help` and `cozy <verb> --help` are the reference.
 
-## Uninstall
+`cozy doctor` diagnoses this computer's cozy (Calcifer, its service, the machine, tools, GPUs) and
+restarts a Calcifer that is stuck or runs an older cozy.
+
+## Remove cozy
+
+End your rentals first (`cozy machine list`, `cozy machine end <name>`). Then:
+
+Linux:
 
 ```sh
-cozy uninstall        # lists what it removes, with sizes, and asks; --yes skips the question
+systemctl --user disable --now cozy-calcifer cozy-machine
+rm -rf ~/.cozy ~/.config/cozy ~/.local/share/bash-completion/completions/cozy ~/.config/fish/completions/cozy.fish
 ```
 
-It stops Calcifer and the machine and removes their services, `~/.cozy`, `~/.config/cozy` and the
-installer's PATH lines. Downloaded models stay unless `--all`.
+macOS:
+
+```sh
+launchctl bootout gui/$(id -u)/com.cozy-creator.calcifer; launchctl bootout gui/$(id -u)/com.cozy-creator.machine
+rm -rf ~/.cozy ~/.config/cozy ~/Library/LaunchAgents/com.cozy-creator.*.plist
+```
+
+Windows (PowerShell):
+
+```powershell
+Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run cozy-calcifer, cozy-machine -ErrorAction SilentlyContinue
+Get-Process cozy -ErrorAction SilentlyContinue | Stop-Process
+Remove-Item -Recurse -Force ~\.cozy, $env:LOCALAPPDATA\cozy
+$path = ([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') -ne "$HOME\.cozy\bin"
+[Environment]::SetEnvironmentVariable('Path', $path -join ';', 'User')
+```
+
+On Linux and macOS, delete the line that sources `~/.config/cozy/env.sh` (or `env.fish`) from `.profile`,
+`.bashrc`, `.zshrc` or fish's `conf.d`. `~/.cozy` holds the machine's model store, which can be large;
+a store set elsewhere in `~/.cozy/config.toml` stays until you delete it. Homebrew: `brew uninstall
+cozy`, then the same steps.
 
 ## Build
 

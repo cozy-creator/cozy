@@ -190,7 +190,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Err(e) => {
             return Err(Error {
                 remedy: Some(format!(
-                    "{} is cozy {version} now; restart Calcifer with `cozy down` and `cozy up`",
+                    "{} is cozy {version} now; `cozy doctor` restarts Calcifer on it",
                     binary.display()
                 )),
                 ..e

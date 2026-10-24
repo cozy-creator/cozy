@@ -36,7 +36,7 @@ pub(super) fn current(dir: &Path, spec: &ServiceSpec) -> bool {
 pub(super) fn start(dir: &Path, spec: &ServiceSpec) -> Result<()> {
     // launchd holds a loaded job's next spawn until 10 s after its last (`ThrottleInterval`), and
     // keeps the definition it loaded: a job loaded but not running (it exited, as Calcifer does on
-    // `cozy down`) is booted out, so the bootstrap loads the definition kept here and spawns it at
+    // a restart) is booted out, so the bootstrap loads the definition kept here and spawns it at
     // once. A running one is left as it is.
     if !running(&spec.name) {
         let _ = launchctl(&["bootout", &target(&spec.name)]).output();

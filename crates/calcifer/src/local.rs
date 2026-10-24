@@ -1,6 +1,6 @@
 //! This computer's machine, `local`: always recorded, never enabled. Anything that uses it starts
 //! its TensorD (`cozy machine serve`) when none runs, detached from Calcifer and from Calcifer's
-//! service, so a Calcifer restart or `cozy down` never ends it. TensorD exits by itself after 15
+//! service, so a Calcifer restart never ends it. TensorD exits by itself after 15
 //! minutes idle; its executors give their memory back after 5. One start at a time here, and
 //! TensorD's lock on its root keeps one machine per root whoever starts it.
 use std::{
