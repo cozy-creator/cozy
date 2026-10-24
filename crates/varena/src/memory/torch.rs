@@ -295,6 +295,11 @@ impl Source for Leased {
                 }
             }
         }
+        // A failed map rollback is already fatal. An acknowledgement error must not replace
+        // it with ordinary I/O and hide ownership loss; leave these grants held until exit.
+        if let Some(error) = failed.as_ref().filter(|error| error.is_sticky()) {
+            return Err(error.clone());
+        }
         self.agent.mapped(&tickets)?;
         if off < va.len && failed.is_none() {
             failed = Some(Error::Internal(format!("a grant of {off} bytes for a {}-byte span", va.len)));
