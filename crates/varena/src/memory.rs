@@ -257,6 +257,8 @@ pub struct Stats {
     /// Each `make_room` that had to take bytes for it, in order.
     pub make_room: Vec<MakeRoom>,
     pub outlived: Vec<crate::arena::Outlived>, // its torch blocks live at its end (the audit)
+    /// The most torch's blocks in its arena held over it (its passes' compute and what outlived them).
+    pub torch_peak: u64,
 }
 
 /// One `make_room` that had to take bytes: what asked, how many bytes, what it took.
@@ -2223,7 +2225,7 @@ impl Inner {
     }
 
     fn end_request(&self, req: u64) -> Stats {
-        let outlived = self.torch.get().map(|t| t.end(crate::arena::Owner::Request(req)).outlived).unwrap_or_default();
+        let torch = self.torch.get().map(|t| t.end(crate::arena::Owner::Request(req))).unwrap_or_default();
         let mut st = self.lock();
         self.unstream(&mut st, req);
         st.active.retain(|(r, _), _| *r != req);
@@ -2236,7 +2238,7 @@ impl Inner {
             #[cfg(unix)]
             self.derived_idle();
         }
-        let stats = Stats { outlived, leftover, host, ..st.stats.remove(&req).unwrap_or_default() };
+        let stats = Stats { outlived: torch.outlived, torch_peak: torch.peak, leftover, host, ..st.stats.remove(&req).unwrap_or_default() };
         st.last = Some(stats.clone());
         self.unlock(st);
         stats
