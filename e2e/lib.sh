@@ -57,6 +57,7 @@ cozy() { printf '%s\x1f' "$@" >> "$OUT/argv.log"; printf '\x1e' >> "$OUT/argv.lo
 # The coverage guard (e2e/coverage.py check) over this run's calls, for the tiers it ran.
 coverage() {
   uv run -q --no-project python -I "$E2E/coverage.py" check "$1" "$E2E/coverage.toml" --tiers "$2" --log "$OUT/argv.log" \
+    --source "$E2E/../crates/cli/src" \
     || check "coverage: a command or flag has no test, or its test did not run (above)"
 }
 

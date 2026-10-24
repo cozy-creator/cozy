@@ -116,7 +116,8 @@ if [ -z "$n" ]; then check "the waiting run never got a number"; else
   wait "$following" || true
   wait "$waiting" || true
   grep -qE '"status": *"canceled"' "$OUT/followed.ndjson" || check "run show $n did not follow it to canceled"
-  cozy --json run show "$n" --once | J '.status == "canceled"' || check "run cancel: run $n is not canceled"
+  cozy --json run show "$n" --once > "$OUT/canceled.json" || true
+  J '.status == "canceled"' "$OUT/canceled.json" || check "run cancel: run $n is $(jq -r '.status, .reason.code? // empty' "$OUT/canceled.json" | paste -sd' ' -), not canceled"
 fi
 
 step "run list filters"

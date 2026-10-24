@@ -5,6 +5,7 @@
 #            a throwaway fidika/ci-e2e-<run> package and model
 #   gate     the release gate's GPU pod (release-gate/cells/cli.sh, the stress cells)
 #   manual   a person does it, on a path named here      none   not tested: why
+#   pending  its tier's test exists or is planned, but no run requires it yet: why
 # A new command or flag fails `coverage.py check` until it has a line here and its test runs.
 
 [global]
@@ -176,3 +177,9 @@ test = "pr: a run followed, a snapshot, a cancel"
 test = "pr: run play, its link serves the output, then expires"
 "--output" = "pr: run play"
 "--expires" = "pr: run play"
+
+# Hidden (`hide = true`, in no --help): probed in the binary; `coverage.py --source` finds any not listed here.
+[hidden]
+"machine rent --provider" = "pending: release tier, one cheapest-CPU rental per provider, ended and checked gone (release-gate/suites/hub); Hub-admin only; its live proof waits for the CI key or a cozy release that carries it"
+"machine rent --image-digest" = "pending: release tier, a Hub admin's gated worker-image bake; waits for the CI key"
+"model migrate-headers" = "none: dev builds only (cargo feature migrate), never in a release"

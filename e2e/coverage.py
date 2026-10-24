@@ -1,7 +1,7 @@
 """Every cozy command and flag has a test, and every test ran.
 
     coverage.py tree    <cozy>                                  the command tree, one id per line
-    coverage.py check   <cozy> <coverage.toml> --tiers T[,T] [--log ARGV.LOG]...
+    coverage.py check   <cozy> <coverage.toml> --tiers T[,T] [--log ARGV.LOG]... [--source CLI_SRC]
 
 The tree is read from the binary under test (`--help` of every command), so a new command or flag
 is seen the moment it exists. An id is `cozy <command path>` or `cozy <command path> --flag`; a flag
@@ -11,6 +11,10 @@ every command takes (`--json`, `--tensorhub`, `--yes`) is the root's: `cozy --js
 tree no longer has, or (with --log) when an id mapped to one of --tiers was not exercised: no logged
 invocation named that command with that flag. A log holds one record per call, its words separated by
 \x1f and ended by \x1e (e2e/lib.sh's `cozy`, e2e/bin/cozy), so a word may hold any text.
+
+Hidden commands and flags (`hide = true`: Hub-admin and dev-only) are in no --help. coverage.toml's [hidden]
+table lists them; each is probed in the binary (clap refuses an unknown one), and with --source every
+`hide = true` in the CLI's clap definitions must be listed there.
 """
 
 import subprocess
@@ -18,7 +22,9 @@ import sys
 import tomllib
 from dataclasses import dataclass, field
 
-TIERS = {"pr", "release", "gate", "manual", "none"}
+TIERS = {"pr", "release", "gate", "manual", "none", "pending"}
+# Tiers no run requires: listed and shown, each with its why.
+UNREQUIRED = ("manual", "none", "pending")
 # Shown by every --help, exercised by the walk itself.
 WALKED = {"--help", "--version"}
 
@@ -125,6 +131,36 @@ def exercised(root: Command, words: list[str]) -> set[str]:
     return out
 
 
+def probe(cozy: str, hidden: str) -> bool:
+    """Whether this binary has the hidden command or flag `hidden` (`machine rent --provider`)."""
+    words = hidden.split()
+    p = subprocess.run([cozy, *words, "--help"], capture_output=True, text=True)
+    said = (p.stdout + p.stderr).lower()
+    return p.returncode == 0 or not any(w in said for w in ("unexpected argument", "unrecognized subcommand"))
+
+
+def hidden_in_source(src: str) -> set[str]:
+    """Every `hide = true` clap item under `src` (the CLI's crates/cli/src), as its flag (`--provider`) or
+    subcommand (`migrate-headers`) name."""
+    import pathlib
+    import re
+
+    names = set()
+    for path in pathlib.Path(src).rglob("*.rs"):
+        lines = path.read_text().splitlines()
+        for i, line in enumerate(lines):
+            if not re.search(r"#\[(arg|command)\(.*hide\s*=\s*true", line):
+                continue
+            named = re.search(r'long\s*=\s*"([^"]+)"', line)
+            field = next((l.strip() for l in lines[i + 1:] if l.strip() and not l.strip().startswith(("#", "///"))), "")
+            if line.lstrip().startswith("#[arg"):
+                names.add("--" + (named.group(1) if named else field.split(":")[0].strip().replace("_", "-")))
+            else:
+                variant = re.match(r"(\w+)", field.removeprefix("pub ")).group(1)
+                names.add(re.sub(r"(?<!^)(?=[A-Z])", "-", variant).lower())
+    return names
+
+
 def manifest(path: str) -> dict[str, tuple[str, str]]:
     """coverage.toml: `[command]` tables (`"run list"`), `test` for the command itself and one key per
     flag, each `"tier: the step that tests it"`; `[global]` for the root's flags."""
@@ -132,7 +168,10 @@ def manifest(path: str) -> dict[str, tuple[str, str]]:
         doc = tomllib.load(f)
     out = {}
     for command, entries in doc.items():
-        prefix = "cozy" if command == "global" else f"cozy {command}"
+        if command == "hidden":
+            prefix = "cozy"
+        else:
+            prefix = "cozy" if command == "global" else f"cozy {command}"
         for key, value in entries.items():
             tier, _, step = value.partition(":")
             tier, step = tier.strip(), step.strip()
@@ -142,11 +181,24 @@ def manifest(path: str) -> dict[str, tuple[str, str]]:
     return out
 
 
-def check(cozy: str, toml: str, tiers: set[str], logs: list[str]) -> int:
+def check(cozy: str, toml: str, tiers: set[str], logs: list[str], source: str = "") -> int:
     root, mapped = tree(cozy), manifest(toml)
+    with open(toml, "rb") as f:
+        hidden = {f"cozy {k}" for k in tomllib.load(f).get("hidden", {})}
     have = ids(root)
+    absent: list[str] = []
+    for h in sorted(hidden):
+        if probe(cozy, h.removeprefix("cozy ")):
+            have.add(h)
+        elif mapped[h][0] in UNREQUIRED:
+            absent.append(h)
+    hidden_problems = []
+    if source:
+        listed = {h.split()[-1] for h in hidden}
+        hidden_problems = [f"no test: hidden {n} (`hide = true` in {source}; list it in [hidden])" for n in sorted(hidden_in_source(source) - listed)]
     problems = [f"no test: {i} (map it in e2e/coverage.toml)" for i in sorted(have - set(mapped))]
-    problems += [f"stale: {i} is in e2e/coverage.toml but not in this cozy" for i in sorted(set(mapped) - have)]
+    problems += [f"stale: {i} is in e2e/coverage.toml but not in this cozy" for i in sorted(set(mapped) - have - set(absent))]
+    problems += hidden_problems
     seen: set[str] = set()
     for log in logs:
         for words in calls(log):
@@ -154,11 +206,11 @@ def check(cozy: str, toml: str, tiers: set[str], logs: list[str]) -> int:
     due = {i for i, (tier, _) in mapped.items() if tier in tiers and i in have}
     if logs:
         problems += [f"did not run: {i} ({mapped[i][0]}: {mapped[i][1]})" for i in sorted(due - seen)]
-    untested = sorted((i, t, s) for i, (t, s) in mapped.items() if t in ("manual", "none") and i in have)
+    untested = sorted((i, t, s) for i, (t, s) in mapped.items() if t in UNREQUIRED and (i in have or i in absent))
     print(f"{len(have)} commands and flags; {len(due)} due in tier(s) {','.join(sorted(tiers))}; "
           f"{len(due & seen)} exercised; {len(untested)} not automated")
     for i, tier, step in untested:
-        print(f"  {tier}: {i}: {step}")
+        print(f"  {tier}: {i}: {step}{' (not in this build)' if i in absent else ''}")
     for p in problems:
         print(f"::error::coverage: {p}")
     return 1 if problems else 0
@@ -171,7 +223,8 @@ def main() -> int:
         return 0
     if args[:1] == ["check"] and len(args) >= 5 and args[3] == "--tiers":
         logs = [args[i + 1] for i in range(5, len(args) - 1) if args[i] == "--log"]
-        return check(args[1], args[2], set(args[4].split(",")), logs)
+        source = next((args[i + 1] for i in range(5, len(args) - 1) if args[i] == "--source"), "")
+        return check(args[1], args[2], set(args[4].split(",")), logs, source)
     print(__doc__, file=sys.stderr)
     return 2
 
