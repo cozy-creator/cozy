@@ -8,6 +8,8 @@ cell, these included, to completion, kernels, times and peak VRAM against the ba
     fallback); H3's capped cell is 5 s against the product's 15 s, so analyze.py's baseline holds its kernels;
   - leave no bytes behind; the alternating SDXL/Anima runs must not slow down as they evict each other;
   - for H3, produce the whole 5 s video.
+On a CPU rental (cells/stress-host.sh) `host-klein` and `host-qwen` ran under the container's cgroup, which `host-cap`
+measured; the cap must sit below the host's RAM, and each run must record the bytes it paged or spilled under it.
     stress.py <gate dir>     the same verdict alone"""
 import json, os, re, subprocess, sys
 
@@ -30,9 +32,46 @@ def memories(rec):
     return [m for m in [((r.get('measurements') or {}).get('memory') or {}) for r in [rec] + (rec.get('calls') or [])] if m]
 
 
+def walk(o):
+    if isinstance(o, dict):
+        for v in o.values():
+            yield from walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from walk(v)
+    else:
+        yield o
+
+
+def host(recs):
+    fails, notes = [], []
+    cells = [n for n in ('host-klein', 'host-qwen') if n in recs]
+    if not cells and 'host-cap' not in recs:
+        return fails, notes
+    cap = next((d for v in walk((recs.get('host-cap') or {}).get('result')) if isinstance(v, str) and '"cap"' in v
+                for d in [json.loads(v)]), None)
+    if not cap or not cap.get('cap') or not cap.get('mem_total') or cap['cap'] >= cap['mem_total']:
+        return [f'host-cap: no host cap below the host RAM ({cap}): the host cells prove nothing here'], notes
+    notes.append(f'host cap {cap["cap"] / GIB:.1f} GiB of {cap["mem_total"] / GIB:.1f} GiB RAM, swap {(cap.get("swap_total") or 0) / GIB:.1f} GiB')
+    for name in cells:
+        mems = memories(recs[name])
+        stats = [m.get('stats') or {} for m in mems]
+        moved = sum((st.get('paged_in') or 0) + sum(r.get('streamed', 0) for r in st.get('rows') or [])
+                    + sum(e.get('nbytes', 0) for e in st.get('evictions') or []) for st in stats)
+        anon = max((st['host'] for st in stats if st.get('host')), default=None)
+        line = f'{name}: paged/spilled {moved / GIB:.1f} GiB' + (f', anonymous host high-water {anon / GIB:.1f} GiB' if anon else '')
+        if not moved:
+            fails.append(f'{name}: no page or spill bytes recorded under the {cap["cap"] / GIB:.1f} GiB host cap')
+        elif anon and anon > cap['cap']:
+            fails.append(line + f' over the {cap["cap"] / GIB:.1f} GiB cap')
+        else:
+            notes.append(line)
+    return fails, notes
+
+
 def check(gate):
     out, recs = gate['out'], gate['records']
-    fails, notes = [], []
+    fails, notes = host(recs)
     capped = [(n, int(m.group(1)), m.group(2), m.group(3)) for n in recs for m in [CELL.fullmatch(n)] if m]
     for gib in sorted({c[1] for c in capped}, reverse=True):
         log = os.path.join(out, f'cap-{gib}GiB.memory.log')

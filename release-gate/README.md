@@ -53,6 +53,9 @@ The runner signs in as the owner's account with its own device key: secret `COZY
   `stress.py` checks each cap took, nothing held more than its cap, the kernels match the uncapped cells, no bytes
   are left behind, and the alternation does not slow down. Dispatch with `-f stress=true` to force it. A new SKU
   (the rtx-3070) needs `-f skus=rtx-3070 -f establish=true` once.
+- **Host RAM** (`cells/stress-host.sh`, suite `stress-host`): Klein and Qwen on a CPU rental under its cgroup
+  `memory.max`, which `cells/host-cap.py` measures; `stress.py` wants the cap below the RAM and page/spill bytes in
+  each record. The CLI caps no host memory, so the rental's container is the cap. Parked (known-failing, xs-058).
 - **Quality** (`quality.py`, every gate): CLIP prompt adherence of every render against its prompt (floor 0.25), and
   the gate's median CLIP-IQA sharpness against the last passed gates. Never a same-seed pixel diff.
 - **Checks:** `analyze.py` runs every `check(gate) -> (fails, notes)` in `CHECKS` (`stress.check`, `quality.check`).

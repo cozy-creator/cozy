@@ -131,11 +131,13 @@ jobs:
           fi
           echo "skus=$(printf '%s' "$skus" | jq -Rc 'split(",") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
           # stress: release-gate/cells/stress.sh on one consumer pod, and the product image cells on a real 8 GB card.
+          # stress-host: cells/stress-host.sh on its CPU SKU (none while it is parked).
+          HOST=$STRESS
           case " $(echo $words) " in *" stress "*) STRESS=true ;; esac
-          if [ "$STRESS" = true ]; then
-            eval "$(grep '^STRESS_' creator/release-gate/cells/stress.sh)"
-            skus=$(printf '%s\n' ${skus//,/ } "$STRESS_SKU" "$STRESS_REAL_SKU" | awk 'NF && !seen[$0]++' | paste -sd, -)
-          fi
+          case " $(echo $words) " in *" stress-host "*) HOST=true ;; esac
+          eval "$(grep -h '^STRESS_' creator/release-gate/cells/stress.sh creator/release-gate/cells/stress-host.sh)"
+          [ "$STRESS" = true ] && skus=$(printf '%s\n' ${skus//,/ } "$STRESS_SKU" "$STRESS_REAL_SKU" | awk 'NF && !seen[$0]++' | paste -sd, -)
+          [ "$HOST" = true ] && [ -n "$STRESS_HOST_SKU" ] && skus=$(printf '%s\n' ${skus//,/ } "$STRESS_HOST_SKU" | awk 'NF && !seen[$0]++' | paste -sd, -)
           echo "stress=${STRESS/false/}" >> "$GITHUB_OUTPUT"
           echo "only=$only" >> "$GITHUB_OUTPUT"
           echo "skus: ${skus:-none}; cells: ${only:-all}"
@@ -251,13 +253,12 @@ jobs:
           [ -z "$PINS" ] || args+=(--pins "$PINS")
           [ -z "$PACKAGES" ] || args+=(--packages "$PACKAGES")
           [ "$ESTABLISH" != true ] || args+=(--establish)
-          if [ -n "$STRESS" ]; then
-            eval "$(grep '^STRESS_' creator/release-gate/cells/stress.sh)"
-            case "${{ matrix.sku }}" in
-              "$STRESS_SKU") args+=(--cells "$PWD/creator/release-gate/cells/stress.sh") ;;
-              "$STRESS_REAL_SKU") args+=(--only "$STRESS_REAL_CELLS" --disk "$STRESS_REAL_DISK") ;;
-            esac
-          fi
+          eval "$(grep -h '^STRESS_' creator/release-gate/cells/stress.sh creator/release-gate/cells/stress-host.sh)"
+          case "${{ matrix.sku }}" in
+            "$STRESS_SKU") [ -z "$STRESS" ] || args+=(--cells "$PWD/creator/release-gate/cells/stress.sh") ;;
+            "$STRESS_REAL_SKU") [ -z "$STRESS" ] || args+=(--only "$STRESS_REAL_CELLS" --disk "$STRESS_REAL_DISK") ;;
+            "${STRESS_HOST_SKU:-none}") args+=(--only "$STRESS_HOST_CELLS" --disk "$STRESS_HOST_DISK" --cells "$PWD/creator/release-gate/cells/stress-host.sh") ;;
+          esac
           creator/release-gate/gate.sh "${{ matrix.sku }}" --out "$OUT" "${args[@]}"
       # gate.sh ends its rental in a trap; a cancelled job can skip it, so end it here too and say so.
       - if: always()
