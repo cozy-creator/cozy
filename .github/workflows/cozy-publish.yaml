@@ -13,7 +13,10 @@
 # Note that the GitHub Release will be created with a generated
 # title/body based on your changelogs.
 
-name: Release
+name: cozy-publish
+# HAND-EDITED (dist-workspace.toml): dist names this file release.yml. A release here is a CANDIDATE only, a GitHub
+# prerelease users don't get; the release agent tests it by hand (release-gate.yml) and cozy-promote.yaml promotes it
+# with that recorded gate run (tracker design ci-v2, pre-release and promotion).
 permissions:
   "contents": "write"
 
@@ -52,14 +55,6 @@ on:
         required: false
         default: ''
         type: string
-      # HAND-EDITED: a release is a candidate (a prerelease) until its gate passes (release-gate.yml), then
-      # release-promote.yml makes it latest and Homebrew's. false hosts the candidate only, for a set gated together
-      # (release-gate/promote.sh promotes it).
-      promote:
-        description: Gate this candidate and promote it on PASS (false - host the prerelease only)
-        required: false
-        default: true
-        type: boolean
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -258,7 +253,7 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
-    uses: ./.github/workflows/release-attestations.yml
+    uses: ./.github/workflows/cozy-attestations.yaml
     with:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
@@ -330,51 +325,17 @@ jobs:
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
-          # HAND-EDITED: always a candidate (prerelease, never latest) until release-promote.yml promotes it.
+          # HAND-EDITED: always a candidate (prerelease, never latest) until cozy-promote.yaml promotes it.
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" --prerelease --latest=false --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
-
-  # HAND-EDITED: the candidate's release gate (release-gate.yml), on the prerelease's own cozy: the runner's and
-  # the pod's TensorD. A FAIL leaves it a prerelease, so users are untouched.
-  custom-release-gate:
-    needs:
-      - plan
-      - host
-    if: ${{ needs.plan.outputs.publishing == 'true' && inputs.promote }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/release-gate.yml
-    with:
-      cozy: ${{ needs.plan.outputs.tag }}
-      changed: cozy-creator ${{ github.sha }}
-      nonce: release-${{ needs.plan.outputs.tag }}
-    secrets: inherit
-
-  # HAND-EDITED: dist's homebrew job is release-promote.yml's, after the gate: latest, then Homebrew's formula.
-  custom-release-promote:
-    needs:
-      - plan
-      - custom-release-gate
-    if: ${{ needs.custom-release-gate.result == 'success' }}
-    permissions:
-      contents: write
-      actions: read
-    uses: ./.github/workflows/release-promote.yml
-    with:
-      tag: ${{ needs.plan.outputs.tag }}
-      gate: ${{ github.run_id }}
-    secrets: inherit
 
   announce:
     needs:
       - plan
       - host
-      - custom-release-promote
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    # HAND-EDITED: a candidate only announces once promoted.
-    if: ${{ always() && needs.host.result == 'success' && needs.custom-release-promote.result == 'success' }}
+    if: ${{ always() && needs.host.result == 'success' }}
     runs-on: "ubuntu-24.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

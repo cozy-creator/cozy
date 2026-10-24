@@ -1,10 +1,10 @@
 name: release-gate
 # CI v2 release gate (tracker design ci-v2 §3): every selected first-party model runs for real on fresh rentals and is
-# held against the SKU's last PASS (release-gate/gate.sh, analyze.py). Any FAIL blocks the publish. Callers:
-#   cozy: release.yml (a dist global-artifacts job: `plan` set, the candidate is this run's x86_64 cozy);
-#   Runtime: cozy-runtime publish.yaml (runtime_wheel: artifact:release-dist);
-#   packages: `task publish` dispatches it with packages_ref;
-#   by hand: gh workflow run release-gate.yml -R cozy-creator/cozy-creator -f runtime_wheel=https://…#sha256=… …
+# held against the SKU's last PASS (release-gate/gate.sh, analyze.py). Release testing is manual (Paul 10-24): only the
+# release agent dispatches it, with the suites it chose for the candidate set, and its passing run id is what a
+# promotion requires (cozy-promote.yaml, tensorfs-publish.yaml, cozy-runtime runtime-publish.yaml, packages
+# `task promote`). No workflow calls it.
+#   gh workflow run release-gate.yml -R cozy-creator/cozy-creator -f cozy=v0.11.17 -f runtime_wheel=https://…#sha256=… -f pins=…
 # The runner signs in as the owner's account with the CI device key (environment release-gate, secret
 # COZY_CI_DEVICE_KEY; release-gate/README.md) and rents through tensorhub.com.
 on:
@@ -58,24 +58,9 @@ on:
         description: "Caller's id, shown in the run name"
         type: string
         default: ''
-  workflow_call:
-    inputs:
-      plan: { type: string, default: '' }
-      cozy: { type: string, default: released }
-      runtime_wheel: { type: string, default: '' }
-      tensorfs_wheel: { type: string, default: '' }
-      packages_ref: { type: string, default: '' }
-      pins: { type: string, default: '' }
-      changed: { type: string, default: '' }
-      skus: { type: string, default: '' }
-      only: { type: string, default: '' }
-      establish: { type: boolean, default: false }
-      stress: { type: boolean, default: false }
-      publish: { type: boolean, default: true }
-      nonce: { type: string, default: '' }
 run-name: release-gate ${{ inputs.cozy }} ${{ inputs.runtime_wheel }} ${{ inputs.tensorfs_wheel }} ${{ inputs.packages_ref }} ${{ inputs.pins }} ${{ inputs.nonce }}
 
-# Callers grant contents: write and actions: read; only the baseline job, in this repo, writes.
+# Only the baseline job writes (contents: write).
 jobs:
   select:
     runs-on: ubuntu-24.04
@@ -86,7 +71,7 @@ jobs:
       only: ${{ steps.select.outputs.only }}
       stress: ${{ steps.select.outputs.stress }}
     env:
-      CHANGED: ${{ inputs.changed || (inputs.plan && format('cozy-creator {0}', github.sha)) || '' }}
+      CHANGED: ${{ inputs.changed }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -181,24 +166,15 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       # ffmpeg and ffprobe for the H3 and SeedVR2 cells, from the tool cache (apt took 34 min).
       - uses: AnimMouse/setup-ffmpeg@v1
-      - if: ${{ inputs.plan != '' }}
-        uses: actions/download-artifact@v8
-        with:
-          name: artifacts-build-local-x86_64-unknown-linux-gnu
-          path: dist
       - id: candidate
         env:
           COZY: ${{ inputs.cozy }}
-          PLAN: ${{ inputs.plan }}
           RUNTIME_WHEEL: ${{ inputs.runtime_wheel }}
           TENSORFS_WHEEL: ${{ inputs.tensorfs_wheel }}
         run: |
           bin=$HOME/.cozy/bin; mkdir -p "$bin"; echo "$bin" >> "$GITHUB_PATH"
           args=()
-          if [ -n "$PLAN" ]; then
-            tar -xzf dist/cozy-x86_64-unknown-linux-gnu.tar.gz -C dist
-            install -m 0755 dist/cozy-x86_64-unknown-linux-gnu/cozy "$bin/cozy"; args+=(--tensord "$bin/cozy")
-          elif [ "$COZY" = released ]; then
+          if [ "$COZY" = released ]; then
             curl -LsSf https://tensorhub.com/install.sh | sh
           elif [[ $COZY == v* ]]; then
             # A release tag, a prerelease candidate's too: its binary is this runner's cozy and the pod's TensorD.
@@ -278,8 +254,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-  # A passed SKU's numbers and references become its baseline. Only this repo's token can write them, so a gate
-  # another repo calls reads baselines but does not move them.
+  # A passed SKU's numbers and references become its baseline.
   baseline:
     needs: gate
     if: ${{ always() && inputs.publish && github.repository == 'cozy-creator/cozy-creator' && needs.gate.result != 'skipped' }}

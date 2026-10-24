@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# patch-installers.sh <dir>: dist's installers in <dir>, as the release ships them (release.yml's
+# patch-installers.sh <dir>: dist's installers in <dir>, as the release ships them (cozy-publish.yaml's
 # global job runs it). A computer with no download (musl, glibc
 # before 2.28) is told what cozy runs on, and `irm … | iex` puts cozy on that PowerShell's PATH at
 # once. Fails when dist's text moved and a patch no longer applies.
