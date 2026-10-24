@@ -14,7 +14,7 @@ required-features = ["store"]
 # The store, fetch, convert and everything that opens one. Without it: the format and the
 # read engine only.
 default = ["store"]
-store = ["dep:aws-sigv4", "dep:aws-credential-types", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:tokio", "dep:tokio-rustls", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:async-trait", "dep:http-body-util", "dep:bytes", "dep:futures", "dep:tracing-subscriber"]
+store = ["dep:hmac", "dep:rustix", "dep:rustls", "dep:webpki-roots", "dep:tokio", "dep:tokio-rustls", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:async-trait", "dep:http-body-util", "dep:bytes", "dep:futures", "dep:tracing-subscriber"]
 
 [dependencies]
 base64.workspace = true
@@ -47,8 +47,7 @@ futures = { version = "0.3.31", default-features = false, features = ["std", "ex
 tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
 # Endpoint credentials (src/fetch/token.rs): S3 SigV4.
-aws-sigv4 = { version = "1.4", default-features = false, features = ["sign-http", "http1"], optional = true }
-aws-credential-types = { version = "1.2", optional = true }
+hmac = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
