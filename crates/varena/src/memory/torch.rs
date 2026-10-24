@@ -46,7 +46,10 @@ pub struct Allocating {
 impl Memory {
     /// Serves torch's allocations from `source`, once, before any is made.
     pub fn serve_torch(&self, source: Arc<dyn Source>) -> Result<Arc<Torch>> {
-        let torch = Torch::new(self.inner.backend.clone(), source)?;
+        let weak = Arc::downgrade(&self.inner);
+        let torch = Torch::with_ownership(self.inner.backend.clone(), source, self.inner.ownership_lost.clone(), Box::new(move || {
+            if let Some(inner) = weak.upgrade() { inner.landed.notify_all(); }
+        }))?;
         self.inner.torch.set(torch.clone()).map_err(|_| Error::Invalid("torch's allocations are served already".into()))?;
         Ok(torch)
     }
@@ -79,7 +82,7 @@ impl Memory {
     /// thread's routed arena (a request's or a region's), else the process's. Err is
     /// `Error::Exhausted`, whose text is torch's OOM reason, or `Invalid` before torch is served.
     pub fn torch_alloc(&self, bytes: u64, stream: usize, pool: Option<PoolId>) -> Result<u64> {
-        self.torch()?.alloc(bytes, stream, pool)
+        self.inner.guard(|| self.torch()?.alloc(bytes, stream, pool))
     }
 
     /// Never fails and never waits on the device.
