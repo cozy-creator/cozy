@@ -2819,14 +2819,11 @@ impl Pool {
             return Ok(true);
         }
         let prepared = command_ok(prepared)?;
-        // Admitted at its shape, the key its peak is recorded under, on every GPU of its lane or
-        // none, waiting while it does not fit. In its family, a yielded parent's working set is
-        // left out: the parent waits on it.
+        // Admitted at its shape, the key its peak is recorded under, on every GPU of its lane
+        // or none, waiting while it does not fit.
         let shape = shape(&prepared.features);
         let managers: Vec<&varena::lease::Manager> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &*m.manager).collect();
-        let admitted = memory::admit(engine, &managers, id, &construction, &shape, || {
-            memory::ancestors(engine, &self.running, &record, calls.map(Arc::as_ref))
-        });
+        let admitted = memory::admit(engine, &managers, id, &construction, &shape);
         let pids: Vec<u32> = std::iter::once(session.executor.birth.pid).chain(session.followers.iter().map(|f| f.birth().pid)).collect();
         let ranks = gpus.iter().enumerate().map(|(rank, gpu)| memory::Rank {
             pid: pids.get(rank).copied().unwrap_or(session.executor.birth.pid),

@@ -73,14 +73,6 @@ pub struct Identity {
     pub domain: String,
 }
 
-/// A request waiting on this descendant, as TensorD's call tree establishes it. Its future
-/// working set may yield; the chunks its participating processes still pin do not.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Ancestor {
-    pub request: String,
-    pub pids: Vec<u32>,
-}
-
 /// What the manager did, for its host's memory log.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -815,36 +807,23 @@ impl Manager {
     /// Whether a request of `package` at `shape` (empty: its widest measured shape) can start now.
     pub fn fits(&self, package: &str, shape: &str) -> bool {
         self.refresh();
-        Self::fits_with(&self.books.lock(), &format!("{package}|{shape}"), &[])
+        Self::fits_with(&self.books.lock(), &format!("{package}|{shape}"))
     }
 
-    fn fits_with(b: &Books, key: &str, ancestors: &[Ancestor]) -> bool {
-        let yielding: BTreeSet<&str> = ancestors.iter().map(|a| a.request.as_str()).collect();
-        let pids: BTreeSet<u32> = ancestors.iter().flat_map(|a| a.pids.iter().copied()).collect();
-        let pinned: u64 = b.executors.values().filter(|e| pids.contains(&e.pid)).flat_map(|e| {
-            e.leased.iter().filter(|(slot, lease)| {
-                e.table.word(**slot).is_none_or(|w| w.seq != lease.seq || w.state != State::Mapped || w.pins > 0)
-            }).map(|(_, lease)| lease.phys.len)
-        }).sum();
-        let peaks: Vec<Option<u64>> = b.dispatched.iter().filter(|(id, _)| !yielding.contains(id.as_str()))
-            .map(|(_, key)| figure(b, "peak", key)).collect();
-        // Only a waiting ancestor's future peak yields. Its still-held pins remain charged.
-        // Alone, an unmeasured child may try its allocations (and fail for capacity); waiting
-        // for its ancestor to finish would deadlock the call tree.
-        decide::fits(Self::usable(b).saturating_sub(pinned), 0, &[], &peaks, figure(b, "peak", key), None)
+    fn fits_with(b: &Books, key: &str) -> bool {
+        decide::fits(Self::usable(b), 0, &[], &Self::dispatched_peaks(b), figure(b, "peak", key), None)
     }
 
-    /// A multi-GPU group: checks and reserves every GPU atomically. `ancestors` are only the
-    /// waiting ancestors of this request, never its siblings or unrelated calls. Lock order is
-    /// process-local manager address order, independent of the caller's device order.
-    pub fn admit(group: &[&Manager], request: &str, package: &str, shape: &str, ancestors: &[Ancestor]) -> Result<bool> {
+    /// A multi-GPU group: checks and reserves every GPU atomically. Lock order is process-local
+    /// manager address order, independent of the caller's device order.
+    pub fn admit(group: &[&Manager], request: &str, package: &str, shape: &str) -> Result<bool> {
         let mut group = group.to_vec();
         group.sort_unstable_by_key(|m| *m as *const Manager as usize);
         group.dedup_by_key(|m| *m as *const Manager as usize);
         group.iter().for_each(|m| m.refresh());
         let mut books: Vec<_> = group.iter().map(|m| m.books.lock()).collect();
         let key = format!("{package}|{shape}");
-        if !books.iter().all(|b| Self::fits_with(b, &key, ancestors)) {
+        if !books.iter().all(|b| Self::fits_with(b, &key)) {
             return Ok(false);
         }
         for b in &mut books {

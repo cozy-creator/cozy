@@ -24,7 +24,7 @@ use platform::{
 };
 use varena::lease::{
     manager::{Opener, Record},
-    Ancestor, Hosting, Identity, Manager, Mode, Peak,
+    Hosting, Identity, Manager, Mode, Peak,
 };
 use varena::{Backend, CudaBackend, GpuId};
 
@@ -430,12 +430,10 @@ fn shareable(uuid: &str) -> Result<i32, String> {
 /// engine's activity, which every manager event and every cancel bumps, and asks again: running
 /// requests end, and a GPU nothing runs on always admits. False: it was canceled meanwhile. A
 /// manager that cannot answer lets it run unrecorded.
-pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, shape: &str, mut ancestors: impl FnMut() -> io::Result<Vec<Ancestor>>) -> io::Result<bool> {
+pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, shape: &str) -> io::Result<bool> {
     loop {
         let seen = engine.activity_epoch();
-        // A parent can begin waiting after its child reached this queue, or resume while the
-        // child waits behind a sibling. Never keep the first admission's yield snapshot.
-        match Manager::admit(managers, id, package, shape, &ancestors()?) {
+        match Manager::admit(managers, id, package, shape) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(error) => {
@@ -551,27 +549,6 @@ pub struct Call {
 
 /// TensorD's calls admitted until they end, including each follower the host rule must watch.
 pub type Running = Arc<Mutex<BTreeMap<String, Call>>>;
-
-/// Waiting ancestors established by TensorD's own call tree. Siblings are never discounted.
-pub fn ancestors(engine: &Engine, running: &Running, record: &crate::journal::Execution, calls: Option<&crate::calls::Calls>) -> io::Result<Vec<Ancestor>> {
-    let active = running.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let mut next = record.invocation.parent.clone();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut ancestors = vec![];
-    while !next.is_empty() && seen.insert(next.clone()) {
-        let parent = engine.get(&next)?;
-        if parent.family() != record.family() {
-            break;
-        }
-        if calls.is_some_and(|calls| calls.waiting(engine, &parent.id)) {
-            if let Some(call) = active.get(&parent.id) {
-                ancestors.push(Ancestor { request: parent.id.clone(), pids: call.ranks.iter().map(|rank| rank.pid).collect() });
-            }
-        }
-        next = parent.invocation.parent;
-    }
-    Ok(ancestors)
-}
 
 /// A process running calls: measured anonymous peak, anonymous bytes now, and call count.
 #[derive(Clone, Debug, PartialEq, Eq)]
