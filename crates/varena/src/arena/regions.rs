@@ -70,6 +70,45 @@ impl Evicted {
     }
 }
 
+/// Frees never wait on a residency copy: they stay deferred until this transaction ends.
+struct Changing<'a> {
+    shared: &'a Shared,
+    arena: &'a Arc<Arena>,
+}
+
+impl<'a> Changing<'a> {
+    fn new(shared: &'a Shared, arena: &'a Arc<Arena>) -> Result<Self> {
+        let mut st = arena.st.lock();
+        if st.changing {
+            return Err(Error::Held("the region is changing residency".into()));
+        }
+        st.changing = true;
+        Ok(Self { shared, arena })
+    }
+}
+
+impl Drop for Changing<'_> {
+    fn drop(&mut self) {
+        self.arena.st.lock().changing = false;
+        self.shared.queue(self.arena, true);
+    }
+}
+
+/// New mappings are not published until all saved bytes have been restored. An early return
+/// gives every one back; an unmap failure remains owned in the shared stuck list for retry.
+struct Restoring<'a> {
+    shared: &'a Shared,
+    spans: Vec<(Va, Vec<Chunk>)>,
+}
+
+impl Drop for Restoring<'_> {
+    fn drop(&mut self) {
+        for (va, chunks) in std::mem::take(&mut self.spans) {
+            self.shared.unmap(va, chunks, false, true);
+        }
+    }
+}
+
 impl Torch {
     /// Evicts region `owner`'s spans once their streams passed everything enqueued so far: their
     /// chunks go back to the source, and with `swap` their bytes go to a RAM file first. The caller
@@ -81,6 +120,7 @@ impl Torch {
         }
         let sh = &self.sh;
         let Some(a) = sh.arenas.lock().get(&owner).cloned() else { return Ok(Some(Evicted::default())) };
+        let _changing = Changing::new(sh, &a)?;
         let streams: Vec<usize> = {
             let st = a.st.lock();
             let spans = st.spans.values().filter_map(|s| s.clock.as_ref().map(|c| c.stream));
@@ -90,13 +130,21 @@ impl Torch {
             return Ok(None);
         }
         let spans: Vec<(u64, u64)> = a.st.lock().spans.iter().filter(|(_, s)| !s.chunks.is_empty()).map(|(b, s)| (*b, s.len)).collect();
-        let mut file = if swap { Some(SwapFile::new(spans.iter().map(|(_, l)| l).sum())?) } else { None };
-        let mut out = Evicted::default();
-        for (base, len) in spans {
-            if let Some(f) = file.as_mut() {
-                // The region's streams passed their epochs: nothing to order the copy after.
-                sh.backend.copy_out(Va { base, len }, 0, f.at(out.bytes, len)?, Event::DONE)?;
+        let mut out = Evicted { bytes: spans.iter().map(|(_, len)| len).sum(), ..Evicted::default() };
+        if swap {
+            out.swap = Some(SwapFile::new(out.bytes)?);
+        }
+        // Complete every fallible copy before giving back any original mapping. A failed
+        // later copy leaves the entire original region resident and usable.
+        let mut off = 0;
+        for &(base, len) in &spans {
+            if let Some(file) = out.swap.as_mut() {
+                sh.backend.copy_out(Va { base, len }, 0, file.at(off, len)?, Event::DONE)?;
             }
+            out.spans.push((base, len, off));
+            off += len;
+        }
+        for (base, len) in spans {
             let chunks = {
                 let mut st = a.st.lock();
                 let Some(span) = st.spans.get_mut(&base) else { continue };
@@ -107,15 +155,10 @@ impl Torch {
                 }
                 chunks
             };
-            if chunks.is_empty() {
-                continue;
-            }
-            // A chunk that cannot go back stays mapped and counted, its range the span's still.
+            // An unmap that fails stays owned and counted in `stuck`; the eviction record
+            // still owns its saved bytes, and restoration retries the unmap before mapping.
             sh.unmap(Va { base, len }, chunks, false, true);
-            out.spans.push((base, len, out.bytes));
-            out.bytes += len;
         }
-        out.swap = file;
         Ok(Some(out))
     }
 
@@ -132,43 +175,41 @@ impl Torch {
             *evicted = Evicted::default();
             return Ok(fresh);
         };
-        let mut got: Vec<(u64, u64, u64, Vec<Chunk>)> = Vec::new();
+        let _changing = Changing::new(sh, &a)?;
+        let mut staged = Restoring { shared: sh, spans: Vec::new() };
         for &(base, len, off) in &evicted.spans {
             if !a.st.lock().spans.get(&base).is_some_and(|s| s.chunks.is_empty()) {
                 continue;
             }
-            match sh.map_again(Va { base, len }) {
-                Ok(chunks) => got.push((base, len, off, chunks)),
-                Err(e) => {
-                    got.into_iter().for_each(|(base, len, _, chunks)| {
-                        sh.unmap(Va { base, len }, chunks, false, false);
-                    });
-                    return Err(e);
+            let va = Va { base, len };
+            let chunks = sh.map_again(va)?;
+            staged.spans.push((va, chunks));
+            if let Some(file) = evicted.swap.as_mut() {
+                if let Err(error) = sh.backend.copy_in(va, 0, file.at(off, len)?) {
+                    // The copy may have been queued before its failure. No rollback may
+                    // unmap its destination until the copy stream is proven complete.
+                    sh.backend.drain()?;
+                    return Err(error);
                 }
             }
         }
-        let Evicted { mut swap, .. } = std::mem::take(evicted);
-        for (base, len, off, chunks) in got {
-            {
-                let mut st = a.st.lock();
-                let Some(span) = st.spans.get_mut(&base) else {
-                    drop(st);
-                    sh.unmap(Va { base, len }, chunks, false, false);
-                    continue;
-                };
-                span.chunks = chunks;
-                st.mapped += len;
-                st.show(base);
-                sh.mapped.fetch_add(len, AcqRel);
-            }
-            if let Some(f) = swap.as_mut() {
-                sh.backend.copy_in(Va { base, len }, 0, f.at(off, len)?)?;
-            }
+        // Every new mapping and saved byte is ready. Publish them together, retaining the
+        // swap and rollback ownership until the last fallible operation has succeeded.
+        for (va, chunks) in std::mem::take(&mut staged.spans) {
             let mut st = a.st.lock();
-            if st.spans.get(&base).is_some_and(|s| s.live == 0) {
-                sh.whole(&a, &mut st, base);
+            let Some(span) = st.spans.get_mut(&va.base) else {
+                drop(st);
+                sh.unmap(va, chunks, false, true);
+                continue;
+            };
+            span.chunks = chunks;
+            st.mapped += va.len;
+            st.show(va.base);
+            if st.spans.get(&va.base).is_some_and(|s| s.live == 0) {
+                sh.whole(&a, &mut st, va.base);
             }
         }
+        *evicted = Evicted::default();
         Ok(fresh)
     }
 
@@ -274,9 +315,14 @@ impl Shared {
         loop {
             let mut chunks = Vec::new();
             match self.source.map(va, Kind::Torch, &mut chunks) {
-                Ok(()) => return Ok(chunks),
+                Ok(()) => {
+                    self.mapped.fetch_add(va.len, AcqRel);
+                    return Ok(chunks);
+                }
                 Err(e) => {
-                    self.unmap(va, chunks, false, false);
+                    let len = chunks.iter().map(|c| c.len).sum();
+                    self.mapped.fetch_add(len, AcqRel);
+                    self.unmap(Va { base: va.base, len }, chunks, false, true);
                     if !(matches!(e, Error::Exhausted(_)) && self.give_back()) {
                         return Err(e);
                     }

@@ -250,6 +250,8 @@ struct State {
     deferred: Vec<Deferred>,
     /// Whole-free spans kept while a capture is open: they leave once it ends.
     held: Vec<u64>,
+    /// A region residency transaction holds every span until copying and mapping finish.
+    changing: bool,
     allocated: u64,
     peak: u64,
     /// The highest a section of the open pass reached ([`Torch::reset_peak`]): the pass's peak
@@ -1304,6 +1306,9 @@ impl Shared {
         loop {
             {
                 let mut st = a.st.lock();
+                if st.changing {
+                    return Err(Error::Held("the region is changing residency".into()));
+                }
                 if let Some(ptr) = self.carve(a, &mut st, size, stream) {
                     return Ok(ptr);
                 }
@@ -1448,7 +1453,7 @@ impl Shared {
 
     fn free_in(&self, a: &Arc<Arena>, st: &mut State, ptr: u64, bytes: u64) {
         let uses = if st.uses.is_empty() { None } else { st.uses.remove(&ptr) };
-        let capture = !a.pool() && self.captures.load(Acquire) > 0;
+        let capture = st.changing || (!a.pool() && self.captures.load(Acquire) > 0);
         if !capture && uses.is_none() {
             return self.release(a, st, ptr, bytes);
         }
@@ -1554,6 +1559,10 @@ impl Shared {
             progress = true;
         }
         let mut st = a.st.lock();
+        if st.changing {
+            self.queue(a, false);
+            return progress;
+        }
         if st.unfenced && a.released.load(Acquire) {
             let streams: Vec<usize> = self.clocks.read().keys().copied().collect();
             if let Some(stamps) = self.stamps(&streams) {
