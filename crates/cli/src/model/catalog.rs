@@ -117,7 +117,6 @@ struct Lane {
 #[derive(Serialize)]
 struct Release {
     release: String,
-    revision: Option<i64>,
     created_at: Option<String>,
     yanked: bool,
     lanes: Vec<Lane>,
@@ -146,7 +145,6 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
         .filter(|r| selected.as_ref().is_none_or(|s| *s == r.release))
         .map(|r| Release {
             release: r.release.clone(),
-            revision: r.revision,
             created_at: r.cut_at.clone().filter(|t| !t.is_empty()),
             yanked: !available(r),
             lanes: r
@@ -182,9 +180,8 @@ pub(crate) async fn info(ctx: &Context, args: Info) -> Result<ExitCode, Error> {
     record = record.field("created", &view.created_at);
     record.print(ctx);
     for release in &view.releases {
-        let yanked = if release.yanked { ", yanked" } else { "" };
-        let revision = release.revision.map(|r| format!("revision {r}")).unwrap_or_default();
-        anstream::println!("\n{}@{} ({revision}{yanked})", protocol::names::shown(&repo.to_string()), release.release);
+        let yanked = if release.yanked { " (yanked)" } else { "" };
+        anstream::println!("\n{}@{}{yanked}", protocol::names::shown(&repo.to_string()), release.release);
         let mut table = Table::new(ctx, ["lane", "precision", "bytes", "commit", "recipe"]);
         for lane in &release.lanes {
             let precision = lane.precision.clone().unwrap_or_else(|| "-".into());

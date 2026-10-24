@@ -15,7 +15,7 @@ progenitor-client.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
+serde_path_to_error.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
@@ -28,7 +28,7 @@ progenitor.workspace = true
 quote.workspace = true
 saphyr.workspace = true
 serde_json.workspace = true
-syn.workspace = true
+syn = { workspace = true, features = ["full", "visit-mut"] }
 
 [lints]
 workspace = true
