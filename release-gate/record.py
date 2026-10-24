@@ -28,8 +28,11 @@ def held(memory):
 
 
 def working(memory):
-    """The most it needed at once: varena's `working`, else the reserved peak (0.30 paged per step, so it is that)."""
-    return max((_num(s.get('working')) for s in rows(memory)), default=0) or _num((memory or {}).get('peak_reserved_bytes'))
+    """The most it needed at once: varena's `working`; 0.30's reserved peak (it paged per step, so it is that); 0 for a
+    0.32 record from before `working` (its reserved figure is torch's alone, or the held peak: neither compares)."""
+    if rows(memory):
+        return max((_num(s.get('working')) for s in rows(memory)), default=0)
+    return _num((memory or {}).get('peak_reserved_bytes'))
 
 
 #: The ceiling a copy kind is held against.
