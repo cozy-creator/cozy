@@ -3,8 +3,9 @@ steady s/step and peak reserved VRAM are held against the SKU's last known-good 
 gate-<SKU>.json, which gate.sh fetches from and publishes to the `release-gate-baselines` release). A PASS is recorded
 in the baseline file; `--accept` records a FAIL the lead accepted. Exit 1 on any failure: the publish is blocked.
     analyze.py <gate dir> <SKU> <baseline file> [--accept]
-More checks (stress, quality) are modules imported here and listed in CHECKS: check(gate) -> (fails, notes)."""
-import fnmatch, glob, json, os, re, subprocess, sys, time
+Checks are check(gate) -> (fails, notes): quality, LM coverage and the one-release swap for every gate (they pass
+over a gate without their cells), and each suite's suites/<name>/check.py for the suites in <gate dir>/suites."""
+import fnmatch, glob, importlib.util, json, os, re, subprocess, sys, time
 import numpy as np
 from PIL import Image
 
@@ -14,6 +15,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import lm, quality, stress, swap  # noqa: E402
 CHECKS = [stress.check, quality.check, lm.check, swap.check]
+SUITES = [l.strip() for l in open(os.path.join(out, 'suites')) if l.strip()] if os.path.exists(os.path.join(out, 'suites')) else []
+for s_ in SUITES:
+    p_ = os.path.join(HERE, 'suites', s_, 'check.py')
+    if os.path.exists(p_):
+        spec_ = importlib.util.spec_from_file_location(f'suite_{s_}', p_)
+        mod_ = importlib.util.module_from_spec(spec_)
+        spec_.loader.exec_module(mod_)
+        CHECKS.append(mod_.check)
 # Allowed rise over the worst known-good number, unless the good numbers' own spread is wider.
 SLACK = {'execution_ms': 0.25, 'step1_ms': 0.5, 'steady_ms': 0.10, 'peak_vram_mb': 0.10}
 # A step may cost at most 2x its reference plus 5 s: step 1 against step 2 (known-good fresh H3 executors 0.9-1.8x; the
@@ -215,6 +224,7 @@ for check in CHECKS:
     fails += f; notes += n
 for n in notes: print('note', n)
 for f in fails: print('FAIL', f)
+print('SUITES', ','.join(SUITES) or 'none')
 print('VERDICT', 'FAIL' if fails else 'PASS', f'({len(cells)} cells)', '' if not fails or not accept else '(accepted by the lead)')
 if not fails or accept:
     label = open(os.path.join(out, 'label')).read().strip()

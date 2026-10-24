@@ -10,6 +10,10 @@ name: release-gate
 on:
   workflow_dispatch:
     inputs:
+      suites:
+        description: "Comma-separated suites (release-gate/README.md: the release agent picks them; no default)"
+        type: string
+        required: true
       cozy:
         description: "cozy on the runner and the machine: released (the Hub's target), a release tag (v0.11.14) or a dev-build run id"
         type: string
@@ -30,10 +34,6 @@ on:
         description: "Exact package releases the cells run, name@release,… (a candidate is published and yanked)"
         type: string
         default: ''
-      changed:
-        description: "For selection: '<repo> <base> <head>', or '<repo> <head>' (base: its previous release). Empty: everything"
-        type: string
-        default: ''
       skus:
         description: "Comma-separated SKUs (empty: by selection)"
         type: string
@@ -46,10 +46,6 @@ on:
         description: "Start the baseline of a SKU that has none"
         type: boolean
         default: false
-      stress:
-        description: "Run the memory stress suite (release-gate/cells/stress.sh) whatever the selection says"
-        type: boolean
-        default: false
       publish:
         description: "Publish a PASS as the SKU's new baseline"
         type: boolean
@@ -60,17 +56,16 @@ on:
         default: ''
   workflow_call:
     inputs:
+      suites: { type: string, required: true }
       plan: { type: string, default: '' }
       cozy: { type: string, default: released }
       runtime_wheel: { type: string, default: '' }
       tensorfs_wheel: { type: string, default: '' }
       packages_ref: { type: string, default: '' }
       pins: { type: string, default: '' }
-      changed: { type: string, default: '' }
       skus: { type: string, default: '' }
       only: { type: string, default: '' }
       establish: { type: boolean, default: false }
-      stress: { type: boolean, default: false }
       publish: { type: boolean, default: true }
       nonce: { type: string, default: '' }
 run-name: release-gate ${{ inputs.cozy }} ${{ inputs.runtime_wheel }} ${{ inputs.tensorfs_wheel }} ${{ inputs.packages_ref }} ${{ inputs.pins }} ${{ inputs.nonce }}
@@ -82,73 +77,40 @@ jobs:
     permissions:
       contents: read
     outputs:
-      skus: ${{ steps.select.outputs.skus }}
-      only: ${{ steps.select.outputs.only }}
-      stress: ${{ steps.select.outputs.stress }}
-    env:
-      CHANGED: ${{ inputs.changed || (inputs.plan && format('cozy-creator {0}', github.sha)) || '' }}
+      matrix: ${{ steps.select.outputs.matrix }}
     steps:
       - uses: actions/checkout@v5
         with:
           repository: cozy-creator/cozy-creator
           ref: ${{ github.repository == 'cozy-creator/cozy-creator' && github.sha || 'master' }}
           path: creator
-      # ci/affected reads the change inside a checkout of the changed repo that holds both revisions.
-      - if: ${{ env.CHANGED != '' && inputs.skus == '' && inputs.only == '' }}
-        uses: actions/checkout@v5
-        with:
-          repository: cozy-creator/${{ startsWith(env.CHANGED, 'cozy-runtime') && 'cozy-runtime' || startsWith(env.CHANGED, 'packages') && 'packages' || startsWith(env.CHANGED, 'tensorhub') && 'tensorhub-v2' || 'cozy-creator' }}
-          fetch-depth: 0
-          path: changed
       - id: select
         env:
-          GH_TOKEN: ${{ github.token }}
+          SUITES: ${{ inputs.suites }}
           SKUS: ${{ inputs.skus }}
-          ONLY: ${{ inputs.only }}
-          STRESS: ${{ inputs.stress }}
         run: |
-          # ci/affected prints suites and pkg:<name> tokens (tracker design ci-v2, build contract). No answer: everything.
-          words=gpu
-          if [ -z "$SKUS$ONLY" ] && [ -n "$CHANGED" ] && [ -d changed ]; then
-            read -r repo base head <<< "$CHANGED"
-            if [ -z "$head" ]; then
-              head=$base
-              slug=cozy-creator/$repo; [ "$repo" != tensorhub ] || slug=cozy-creator/tensorhub-v2
-              base=$(gh release list -R "$slug" --exclude-pre-releases -L 5 --json tagName -q '.[].tagName' | grep -vx "$head" | head -1)
-            fi
-            words=$(cd changed && ../creator/ci/affected "$repo" "$base" "$head") || words=gpu
-            echo "affected $repo $base...$head:" $words
-          fi
-          skus=$SKUS
-          if [ -z "$skus" ]; then
-            case " $(echo $words) " in *" gpu "* | *" gpu-datacenter "* | *" stress "*) skus=rtx-4090,rtx-5090 ;; esac
-            case " $(echo $words) " in *" gpu-datacenter "*) skus=$skus,h100-pcie,b200 ;; esac
-          fi
-          # pkg:<name> narrows the cells to those packages' (gate.sh --only takes package names); pkg:* or none: all.
-          only=$ONLY
-          if [ -z "$only" ] && ! printf '%s\n' $words | grep -qx 'pkg:\*'; then
-            only=$(printf '%s\n' $words | sed -n 's/^pkg://p' | paste -sd, -)
-          fi
-          echo "skus=$(printf '%s' "$skus" | jq -Rc 'split(",") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
-          # stress: release-gate/cells/stress.sh on one consumer pod, and the product image cells on a real 8 GB card.
-          # stress-host: cells/stress-host.sh on its CPU SKU (none while it is parked).
-          HOST=$STRESS
-          case " $(echo $words) " in *" stress "*) STRESS=true ;; esac
-          case " $(echo $words) " in *" stress-host "*) HOST=true ;; esac
-          eval "$(grep -h '^STRESS_' creator/release-gate/cells/stress.sh creator/release-gate/cells/stress-host.sh)"
-          [ "$STRESS" = true ] && skus=$(printf '%s\n' ${skus//,/ } "$STRESS_SKU" "$STRESS_REAL_SKU" | awk 'NF && !seen[$0]++' | paste -sd, -)
-          [ "$HOST" = true ] && [ -n "$STRESS_HOST_SKU" ] && skus=$(printf '%s\n' ${skus//,/ } "$STRESS_HOST_SKU" | awk 'NF && !seen[$0]++' | paste -sd, -)
-          echo "stress=${STRESS/false/}" >> "$GITHUB_OUTPUT"
-          echo "only=$only" >> "$GITHUB_OUTPUT"
-          echo "skus: ${skus:-none}; cells: ${only:-all}"
+          # Each suite's `skus` (`<sku> [gpus]` per line) are the rentals it runs on; `skus` overrides them all.
+          d=creator/release-gate/suites
+          [ -n "$SUITES" ] || { echo "::error::pick suites: $(ls $d | paste -sd, -) (release-gate/README.md)"; exit 1; }
+          rows=()
+          for s in ${SUITES//,/ }; do
+            [ -f "$d/$s/cells.sh" ] || { echo "::error::no suite $s: $(ls $d | paste -sd, -)"; exit 1; }
+            if [ -n "$SKUS" ]; then for k in ${SKUS//,/ }; do rows+=("$k 0 $s"); done
+            else while read -r k g; do [ -z "$k" ] || [ "${k:0:1}" = '#' ] || rows+=("$k ${g:-0} $s"); done < "$d/$s/skus"; fi
+          done
+          matrix=$(printf '%s\n' "${rows[@]}" | jq -Rsc '[split("\n")[] | select(. != "") | split(" ")]
+            | group_by(.[0]) | map({sku: .[0][0], gpus: (map(.[1] | tonumber) | max),
+              suites: (reduce map(.[2])[] as $s ([]; if index([$s]) then . else . + [$s] end) | join(","))})')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$matrix"
 
   gate:
     needs: select
-    if: ${{ needs.select.outputs.skus != '[]' }}
+    if: ${{ needs.select.outputs.matrix != '[]' }}
     strategy:
       fail-fast: false
       matrix:
-        sku: ${{ fromJSON(needs.select.outputs.skus) }}
+        include: ${{ fromJSON(needs.select.outputs.matrix) }}
     runs-on: ubuntu-24.04
     environment: release-gate
     permissions:
@@ -239,27 +201,22 @@ jobs:
           cozy login --key "$RUNNER_TEMP/key.json"; code=$?
           rm -f "$RUNNER_TEMP/key.json"
           [ "$code" = 0 ] && cozy up
-      - name: Gate ${{ matrix.sku }}
+      - name: Gate ${{ matrix.sku }} (${{ matrix.suites }})
         env:
           ARGS: ${{ steps.candidate.outputs.args }}
-          ONLY: ${{ needs.select.outputs.only }}
-          STRESS: ${{ needs.select.outputs.stress }}
+          ONLY: ${{ inputs.only }}
           ESTABLISH: ${{ inputs.establish }}
           PACKAGES: ${{ inputs.packages_ref != '' && 'packages' || '' }}
           PINS: ${{ inputs.pins }}
+          GPUS: ${{ matrix.gpus }}
         run: |
           read -ra args <<< "$ARGS"
           [ -z "$ONLY" ] || args+=(--only "$ONLY")
           [ -z "$PINS" ] || args+=(--pins "$PINS")
           [ -z "$PACKAGES" ] || args+=(--packages "$PACKAGES")
+          [ "$GPUS" = 0 ] || args+=(--gpus "$GPUS")
           [ "$ESTABLISH" != true ] || args+=(--establish)
-          eval "$(grep -h '^STRESS_' creator/release-gate/cells/stress.sh creator/release-gate/cells/stress-host.sh)"
-          case "${{ matrix.sku }}" in
-            "$STRESS_SKU") [ -z "$STRESS" ] || args+=(--cells "$PWD/creator/release-gate/cells/stress.sh") ;;
-            "$STRESS_REAL_SKU") [ -z "$STRESS" ] || args+=(--only "$STRESS_REAL_CELLS" --disk "$STRESS_REAL_DISK") ;;
-            "${STRESS_HOST_SKU:-none}") args+=(--only "$STRESS_HOST_CELLS" --disk "$STRESS_HOST_DISK" --cells "$PWD/creator/release-gate/cells/stress-host.sh") ;;
-          esac
-          creator/release-gate/gate.sh "${{ matrix.sku }}" --out "$OUT" "${args[@]}"
+          creator/release-gate/gate.sh "${{ matrix.sku }}" --suite "${{ matrix.suites }}" --out "$OUT" "${args[@]}"
       # gate.sh ends its rental in a trap; a cancelled job can skip it, so end it here too and say so.
       - if: always()
         run: |

@@ -1,15 +1,38 @@
 # Release gate
 
-Every first-party model runs for real on a fresh rental, and its numbers are held against the last passed gate on
-the same SKU. Any FAIL blocks the publish. Design: tracker `design/ci-v2.md` §3.
+Release testing is manual: the release agent picks the suites a release needs (`--suite`, no default), runs them, and
+promotion needs the passing run (`verify.sh`). Every cell is a real run held against the last passed gate on the same
+SKU; any FAIL blocks the promotion. Design: tracker `design/ci-v2.md` §3.
+
+## Suites
+
+| Suite | Proves | Rentals (`skus`) | Rough cost · time | Pick it for |
+|---|---|---|---|---|
+| `runtime` | every first-party package's default call (H3 15 s with a described reference, SeedVR2, SDXL, Klein, Qwen, Anima, BiRefNet, the Qwen3.5 describer, Fibo, HiDream, MOSS, Qwen-Image + its one-release swap), then SDXL in a second executor: kernels, times, VRAM, quality, LM coverage | rtx-4090, rtx-5090 | ~$6 · ~75 min (in parallel) | a Runtime, TensorFS, varena or TensorD change; any rewrite |
+| `packages` | the packages `--pins` (or `--only`) names, plus the SDXL smoke | rtx-4090, rtx-5090 | ~$1–3 · 15–30 min | a package bump |
+| `tensord` | the machine agent through `cozy`: generations installed, updated and rolled back; run and executor lifecycle; GPU leases across co-resident models; multi-GPU placement; no re-execution; output delivery; cl-650's update and floor checks | one cheap 2-GPU pod | ~$1 · ~45 min | a TensorD or cozy change (building) |
+| `varena` | memory under hard limits (STRESS agent, building) | see its `skus` | | a memory-manager change |
+| `tensorfs`, `hub` | TensorFS and the Hub (TFS-HUB agent, building) | see their `skus` | | a TensorFS or Hub change |
+| `cli` | the CLI as users drive it (COVERAGE agent, building) | see its `skus` | | a CLI or Calcifer change |
+
+A rewrite picks every suite. Suites stack: `--suite runtime,packages` runs each cell once.
+
+A suite is `suites/<name>/`:
+- `cells.sh`, sourced in gate.sh: `cell`, `pkg`, `product`, `expect`, `log`, `$CLI`, `$M`, `$R`, `$REF` and the scenario;
+- optional `before.sh`, sourced on the fresh pod before the candidate goes on;
+- optional `check.py` with `check(gate) -> (fails, notes)`, which analyze.py runs for that suite;
+- `skus`, a `<sku> [gpus]` per line, which the workflow rents.
+
+`$OUT/suites` and the verdict's `SUITES` line name what ran. A known-failing.json entry's `"cells"` (exact names) parks
+those cells on its SKU; deleting the entry un-parks them.
 
 ## What a gate does
 
 1. Rents one fresh machine of the SKU.
-2. Puts the candidate on it: `--runtime-wheel`, `--tensorfs-wheel`, `--tensord` (a cozy binary), `--pins`
+2. Puts the candidate on it: `--runtime`, `--tensorfs`, `--tensord` (a cozy binary; each a file or `URL#sha256=`), `--pins`
    (exact package releases, `sdxl@2.13.0,…`: a package candidate is published and yanked, and installs only by its pin),
    or `--packages` (a packages checkout whose directories run). Unpinned cells run the root package users get.
-3. Runs each cell once, with new prompts and seeds.
+3. Runs the chosen suites' cells, each once, with new prompts and seeds.
 4. Ends the rental and checks that it is gone.
 5. Runs `analyze.py`. A cell passes when it completed, served the last PASS's kernels (with no fallback), produced
    a sane output, and kept execution / step 1 / steady s/step / peak reserved VRAM within the last PASS's spread.
@@ -22,11 +45,10 @@ A SKU with no baseline needs `--establish` once.
 
 ## Running it
 
-- **By hand:** `release-gate/gate.sh rtx-4090 --runtime-wheel <url#sha256=…> --publish`. It runs through the default
-  `~/.cozy`, signed in as you.
-- **From Actions:** `gh workflow run release-gate.yml -R cozy-creator/cozy-creator -f runtime_wheel=… -f changed='cozy-runtime v0.30.16'`.
-  - Selection (`ci/affected`) picks the SKUs and cells; `skus` and `only` override it.
-  - `release.yml` (cozy), cozy-runtime's `publish.yaml` and packages' `task publish` run it before they publish.
+- **By hand:** `release-gate/gate.sh rtx-4090 --suite runtime --runtime <url#sha256=…> --publish`. It runs through the
+  default `~/.cozy`, signed in as you.
+- **From Actions:** `gh workflow run release-gate.yml -R cozy-creator/cozy-creator -f suites=runtime,packages -f pins=… -f runtime_wheel=…`.
+  The suites' `skus` pick the rentals; `skus` and `only` override them. `release.yml -f suites=…` gates a cozy candidate.
 
 ## Promotion
 
