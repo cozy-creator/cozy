@@ -8,7 +8,7 @@
 use crate::{
     api::domain,
     catalog::Generation,
-    device_executor::{Answer, Frame},
+    device_executor::{Answer, CheckpointItem, Publish},
     execution::Engine,
     journal::StoredProduct,
 };
@@ -170,9 +170,9 @@ pub fn decode(stored: &StoredProduct) -> io::Result<domain::RunProduct> {
 }
 
 /// The SDK's `publish` request during a running attempt: answers `Published`.
-pub fn publish(engine: &Engine, generation: &Generation, id: &str, spool: &Path, frame: &Frame) -> Answer {
-    let mut answer = Answer::unavailable(frame.seq);
-    match commit(engine, generation, id, spool, frame) {
+pub fn publish(engine: &Engine, generation: &Generation, id: &str, spool: &Path, seq: u64, publish: &Publish) -> Answer {
+    let mut answer = Answer::unavailable(seq);
+    match commit(engine, generation, id, spool, publish) {
         Ok((content, sequence)) => {
             answer.ok = true;
             answer.code.clear();
@@ -214,24 +214,24 @@ fn declared(engine: &Engine, generation: &Generation, id: &str) -> io::Result<(c
 
 /// Record Runtime's checkpoint reference. A later upload replaces the local reference;
 /// a published remote tree need not be present in TensorD's cache.
-pub fn checkpoint(engine: &Engine, generation: &Generation, id: &str, frame: &Frame) -> Answer {
+pub fn checkpoint(engine: &Engine, generation: &Generation, id: &str, seq: u64, item: &CheckpointItem) -> Answer {
     let record = || -> io::Result<u64> {
         let (_, entry) = declared(engine, generation, id)?;
         if !entry["weights_outputs"].as_array().into_iter().flatten()
-            .any(|row| row["output_id"].as_str() == Some(frame.output.as_str())) {
+            .any(|row| row["output_id"].as_str() == Some(item.output.as_str())) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("{:?} is not a declared weights output", frame.output)));
+                format!("{:?} is not a declared weights output", item.output)));
         }
-        if frame.repo_id.is_empty() {
+        if item.repo_id.is_empty() {
             return Err(storage("a checkpoint reference needs its repository"));
         }
-        crate::storage::check_digest("checkpoint revision", &frame.revision, true).map_err(storage)?;
+        crate::storage::check_digest("checkpoint revision", &item.revision, true).map_err(storage)?;
         let reference = protocol::machine::CheckpointRef {
-            repo_id: frame.repo_id.clone(), revision: frame.revision.clone(), variant: frame.variant.clone(),
-            tag: frame.tag.clone(),
+            repo_id: item.repo_id.clone(), revision: item.revision.clone(), variant: item.variant.clone(),
+            tag: item.tag.clone(),
         };
         let product = domain::RunProduct {
-            output: frame.output.clone(), checkpoint: Some(reference.clone()),
+            output: item.output.clone(), checkpoint: Some(reference.clone()),
             op: domain::RunProductOp::Set as i32, ..Default::default()
         };
         engine.append_product(id, |prior| {
@@ -242,8 +242,8 @@ pub fn checkpoint(engine: &Engine, generation: &Generation, id: &str, frame: &Fr
         })
     };
     match record() {
-        Ok(sequence) => { let mut answer = Answer::ok(frame.seq); answer.sequence = sequence; answer }
-        Err(error) => crate::device_executor::refused(frame.seq,
+        Ok(sequence) => { let mut answer = Answer::ok(seq); answer.sequence = sequence; answer }
+        Err(error) => crate::device_executor::refused(seq,
             if error.kind() == io::ErrorKind::InvalidInput { "output_undeclared" } else { "checkpoint_refused" },
             error.to_string()),
     }
@@ -254,20 +254,20 @@ fn commit(
     generation: &Generation,
     id: &str,
     spool: &Path,
-    frame: &Frame,
+    publish: &Publish,
 ) -> io::Result<(domain::Ref, u64)> {
     let (context, entry) = declared(engine, generation, id)?;
     let result = entry.get("result").ok_or_else(|| io::Error::other("declared result schema absent"))?;
-    let op = output_op(result, &frame.output).ok_or_else(|| {
+    let op = output_op(result, &publish.output).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "{:?} is not an asset field of this function's result",
-                frame.output
+                publish.output
             ),
         )
     })?;
-    if frame.parts.len() > MAX_PARTS {
+    if publish.parts.len() > MAX_PARTS {
         return Err(storage(format!("a product has at most {MAX_PARTS} parts")));
     }
     let retain_file = |path: &Path| -> io::Result<(domain::Ref, domain::NativeByteRetentionRequest)> {
@@ -296,21 +296,21 @@ fn commit(
         ))
     };
     let mut product = domain::RunProduct {
-        output: frame.output.clone(),
+        output: publish.output.clone(),
         op: op as i32,
-        media_type: frame.media_type.clone(),
-        label: frame.label.clone(),
+        media_type: publish.media_type.clone(),
+        label: publish.label.clone(),
         ..Default::default()
     };
-    if frame.parts.is_empty() {
-        let path = spool_file(spool, &spool_name(&frame.asset_ref))?;
+    if publish.parts.is_empty() {
+        let path = spool_file(spool, &spool_name(&publish.asset_ref))?;
         let (content, source) = retain_file(&path)?;
         product.content = Some(content);
         product.source = Some(source);
     } else {
         let mut whole = Sha256::new();
         let mut length = 0;
-        for part in &frame.parts {
+        for part in &publish.parts {
             let path = spool_file(spool, &part.local)?;
             let mut file = File::open(&path)?;
             length += io::copy(&mut file, &mut whole)?;

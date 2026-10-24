@@ -443,20 +443,8 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    Publish,
-    /// A weights output's TensorFS reference, which the Runtime committed or uploaded.
-    CheckpointItem,
-    StageMemoLookup,
-    StageMemoStore,
     Progress,
     ExecutionActivity,
-    ChildCall,
-    ChildPoll,
-    ChildCancel,
-    ChildForget,
-    ChildEvents,
-    GpuRelease,
-    ModelPrefetch,
     /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
     Log,
     /// A `progress` event telling the executor's work count (`work`): what its Runtime did for
@@ -573,7 +561,8 @@ pub struct Residency {
 }
 
 /// One part of a composite product: a spool file and the media time it adds.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 #[serde(default)]
 pub struct PublishPart {
     pub local: String,
@@ -590,6 +579,9 @@ pub struct Frame {
     /// under its own sequence number and a progress frame is dropped; the executor goes on.
     #[serde(skip)]
     pub malformed: String,
+    /// A `request` frame's request, decoded from the same members (`Request::decode`).
+    #[serde(skip)]
+    pub request: Option<Request>,
     pub reply: String,
     pub ok: bool,
     pub code: String,
@@ -616,8 +608,6 @@ pub struct Frame {
     pub kind: Kind,
     pub descriptor: bool,
     pub name: String,
-    pub sha256: String,
-    pub length: u64,
     /// `load` and `invoke` telemetry: one of a shape this side does not read is absent, never the
     /// reply's failure.
     #[serde(deserialize_with = "lenient")]
@@ -649,15 +639,6 @@ pub struct Frame {
     pub fields: Value,
     /// PrepareRequest: the request's normalized features (its shape).
     pub features: BTreeMap<String, Value>,
-    // `publish` (Outputs.publish): one product of a declared output.
-    pub output: String,
-    pub label: String,
-    pub asset_ref: String,
-    pub asset_kind: String,
-    pub media_type: String,
-    pub size_bytes: u64,
-    pub digest: String,
-    pub parts: Vec<PublishPart>,
     /// `start`: the executor's legs, `[[name, ms], ...]`; read leniently.
     pub stages: Value,
     /// `invoke`: the executor's stage and step tracks, its ranks' execution records and its
@@ -669,23 +650,6 @@ pub struct Frame {
     pub attention_applied: bool,
     /// `invoke`: the rows of how the request was served other than as sent; read row by row.
     pub adjustments: Value,
-    // `child_*` (a job's managed calls): the call's index, callee and canonical request.
-    pub call_index: u64,
-    pub module: String,
-    pub export: String,
-    pub payload: String,
-    pub progress_label: String,
-    // `stage_memo_*` (a memoized Model method): its key and scope, and on a store the spool file
-    // it offers with what producing it cost.
-    pub key: String,
-    pub numerics: String,
-    pub local: String,
-    pub cost_ms: f64,
-    /// `checkpoint_item`: the immutable TensorFS reference the Runtime committed or uploaded.
-    pub repo_id: String,
-    pub revision: String,
-    pub variant: String,
-    pub tag: String,
 }
 
 impl Frame {
@@ -711,6 +675,166 @@ impl Frame {
             }
         }
         Some((level, text))
+    }
+}
+
+// --------------------------------------------------------------------------- the executor's requests
+
+/// One request an executor makes of TensorD during a call, tagged by `kind`, sent as
+/// `{"event": "request", "seq": N, **request}` and answered under its `seq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Request {
+    /// The socket TensorD nudges when one of this attempt's calls moves (an fd follows the answer).
+    ChildEvents(ChildEvents),
+    ChildCall(ChildCall),
+    ChildPoll(ChildPoll),
+    ChildCancel(ChildCancel),
+    ChildForget(ChildForget),
+    /// A deviceless root's GPUs end (`Context.release_gpus()`).
+    GpuRelease(GpuRelease),
+    /// A hint about a future call: TensorD may prepare its weights.
+    ModelPrefetch(ModelPrefetch),
+    /// Show one asset to the run's owner now, as a product of a declared output.
+    Publish(Publish),
+    /// A weights output's TensorFS reference, which the Runtime committed or uploaded.
+    CheckpointItem(CheckpointItem),
+    /// A memoized method's key, before its scope opens.
+    StageMemoLookup(StageMemoLookup),
+    /// The outcome of a looked-up miss.
+    StageMemoStore(StageMemoStore),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct ChildEvents {}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct ChildCall {
+    pub call_index: u64,
+    pub module: String,
+    pub export: String,
+    /// The callee's canonical request document.
+    pub payload: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub progress_label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct ChildPoll {
+    pub call_index: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct ChildCancel {
+    pub call_index: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct ChildForget {
+    pub call_index: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct GpuRelease {}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct ModelPrefetch {
+    pub module: String,
+    pub export: String,
+    /// The canonical `{slot: ModelArtifact | None}` document.
+    #[serde(default)]
+    pub payload: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct Publish {
+    pub output: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    pub asset_ref: String,
+    pub asset_kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub digest: String,
+    /// A composite product: its bytes are these parts concatenated in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<PublishPart>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct CheckpointItem {
+    pub output: String,
+    pub repo_id: String,
+    /// The commit (its tree id).
+    pub revision: String,
+    /// The private tag the Runtime moved there.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub variant: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct StageMemoLookup {
+    pub key: String,
+    pub stage: String,
+    pub numerics: String,
+}
+
+/// `local` names the entry's spool file; empty means nothing is stored and `reason` says why.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
+pub struct StageMemoStore {
+    pub key: String,
+    pub stage: String,
+    pub numerics: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub local: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub length: u64,
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub cost_ms: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+impl Request {
+    /// One request from a request frame's members (`event` and `seq` beside them are ignored);
+    /// the error names a needed member's path or an unknown `kind`.
+    pub fn decode(fields: Value) -> Result<Request, String> {
+        fn one<T: serde::de::DeserializeOwned>(fields: Value) -> Result<T, String> {
+            serde_path_to_error::deserialize(fields).map_err(|e| e.to_string())
+        }
+        let kind = fields.get("kind").and_then(Value::as_str).unwrap_or_default().to_owned();
+        Ok(match kind.as_str() {
+            "child_events" => Request::ChildEvents(one(fields)?),
+            "child_call" => Request::ChildCall(one(fields)?),
+            "child_poll" => Request::ChildPoll(one(fields)?),
+            "child_cancel" => Request::ChildCancel(one(fields)?),
+            "child_forget" => Request::ChildForget(one(fields)?),
+            "gpu_release" => Request::GpuRelease(one(fields)?),
+            "model_prefetch" => Request::ModelPrefetch(one(fields)?),
+            "publish" => Request::Publish(one(fields)?),
+            "checkpoint_item" => Request::CheckpointItem(one(fields)?),
+            "stage_memo_lookup" => Request::StageMemoLookup(one(fields)?),
+            "stage_memo_store" => Request::StageMemoStore(one(fields)?),
+            other => return Err(format!("unknown request `{other}`")),
+        })
     }
 }
 
@@ -1035,7 +1159,38 @@ mod python {
     }
     methods!(
         Adapter, Binding, ModelLoad, MemoSettings, Construction, CallInterface, InputMetadata, InputFile,
-        ByteGrant, CallProgress, Answer
+        ByteGrant, CallProgress, Answer, PublishPart
+    );
+
+    macro_rules! request_methods {
+        ($($t:ident),*) => {$(
+            #[pymethods]
+            impl $t {
+                fn __repr__(&self) -> String {
+                    format!("{self:?}")
+                }
+                /// Its request's members, `kind` included.
+                fn json(&self) -> PyResult<String> {
+                    serde_json::to_string(&Request::$t(self.clone())).map_err(|e| PyValueError::new_err(e.to_string()))
+                }
+                /// A copy with `changes` in place of its fields.
+                #[pyo3(signature = (**changes))]
+                fn replace(&self, changes: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+                    replaced(self, changes)
+                }
+                /// One built from `fields` by name: a field left out takes its default; a needed one
+                /// left out is refused by its name.
+                #[new]
+                #[pyo3(signature = (**fields))]
+                fn new(fields: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+                    merged(serde_json::Map::new(), fields)
+                }
+            }
+        )*};
+    }
+    request_methods!(
+        ChildEvents, ChildCall, ChildPoll, ChildCancel, ChildForget, GpuRelease, ModelPrefetch, Publish,
+        CheckpointItem, StageMemoLookup, StageMemoStore
     );
 
     macro_rules! command_methods {

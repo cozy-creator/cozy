@@ -7,7 +7,7 @@
 //! its finished calls answered.
 use crate::{
     catalog::HeldGeneration,
-    device_executor::{Answer, ByteGrant, CallInterface, CallProgress, Frame, Kind},
+    device_executor::{Answer, ByteGrant, CallInterface, CallProgress, Frame, ModelPrefetch, Request},
     execution::Engine,
     journal::{Execution, Failure, InputFile, State},
     launch_identity::LaunchIdentity,
@@ -71,23 +71,17 @@ impl Parent {
         Some(measured)
     }
 
-    fn callable(&self, frame: &Frame) -> Result<&(String, String), (&'static str, String)> {
+    fn callable(&self, module: &str, export: &str) -> Result<&(String, String), (&'static str, String)> {
         self.callables
-            .get(&(frame.module.clone(), frame.export.clone()))
+            .get(&(module.to_owned(), export.to_owned()))
             .ok_or((
                 "child_undeclared",
-                format!(
-                    "{}.{} is not an invocable of this package or its environment's",
-                    frame.module, frame.export
-                ),
+                format!("{module}.{export} is not an invocable of this package or its environment's"),
             ))?
             .as_ref()
             .ok_or((
                 "child_ambiguous",
-                format!(
-                    "{}.{} is registered by more than one App in this environment",
-                    frame.module, frame.export
-                ),
+                format!("{module}.{export} is registered by more than one App in this environment"),
             ))
     }
 
@@ -293,23 +287,23 @@ impl Calls {
     }
 
     /// `child_call`: the call's run, accepted once per index (its intent must not change).
-    fn child_call(&self, parent: &Parent, frame: &Frame) -> Result<Answer, (&'static str, String)> {
+    fn child_call(&self, parent: &Parent, seq: u64, call: &protocol::executor::ChildCall) -> Result<Answer, (&'static str, String)> {
         let service = self
             .service
             .upgrade()
             .ok_or(("child_call_refused", "machine is stopping".into()))?;
-        let (application, entrypoint) = parent.callable(frame)?;
-        let callable = (frame.module.clone(), frame.export.clone());
+        let (application, entrypoint) = parent.callable(&call.module, &call.export)?;
+        let callable = (call.module.clone(), call.export.clone());
         if parent.pure && !parent.pure_callables.contains(&callable) {
             return Err((
                 "child_impure",
                 format!(
                     "a memoized function cannot call {}.{}, which is not memoized",
-                    frame.module, frame.export
+                    call.module, call.export
                 ),
             ));
         }
-        let input: Value = crate::boundary_json::parse(frame.payload.as_bytes()).map_err(|e| {
+        let input: Value = crate::boundary_json::parse(call.payload.as_bytes()).map_err(|e| {
             (
                 "child_call_refused",
                 format!("call request is not JSON: {e}"),
@@ -324,8 +318,8 @@ impl Calls {
             .ok_or(("child_call_refused", "machine is stopping".into()))?;
         let mut calls = parent.calls.lock().unwrap();
         let inputs = child_inputs(&request_input, parent, &calls.received);
-        let request = format!("{}/{}", parent.request, frame.call_index);
-        let intent = child_intent(&frame.module, &frame.export, &input);
+        let request = format!("{}/{}", parent.request, call.call_index);
+        let intent = child_intent(&call.module, &call.export, &input);
         let caller = service
             .engine
             .get(&parent.id)
@@ -339,22 +333,22 @@ impl Calls {
                 ),
                 code => (code, refusal.message),
             })?;
-        calls.by_index.entry(frame.call_index).or_insert(ChildCall {
+        calls.by_index.entry(call.call_index).or_insert(ChildCall {
             child: record.id.clone(),
-            module: frame.module.clone(),
-            function: frame.export.clone(),
-            label: frame.progress_label.clone(),
+            module: call.module.clone(),
+            function: call.export.clone(),
+            label: call.progress_label.clone(),
             recorded: false,
             request: request.clone(),
             settled: None,
             progress: (0, None),
         });
         drop(calls);
-        self.state(parent, frame)
+        self.state(parent, seq, call.call_index)
     }
 
     /// `child_poll`: the call's state; a success carries its result and the parent's grants.
-    fn state(&self, parent: &Parent, frame: &Frame) -> Result<Answer, (&'static str, String)> {
+    fn state(&self, parent: &Parent, seq: u64, call_index: u64) -> Result<Answer, (&'static str, String)> {
         let service = self
             .service
             .upgrade()
@@ -363,7 +357,7 @@ impl Calls {
         let CallTable {
             by_index, received, ..
         } = &mut *calls;
-        let call = by_index.get_mut(&frame.call_index).ok_or((
+        let call = by_index.get_mut(&call_index).ok_or((
             "child_call_refused",
             "parent call has not been activated".into(),
         ))?;
@@ -371,7 +365,7 @@ impl Calls {
             .engine
             .get(&call.child)
             .map_err(|e| ("child_call_refused", e.to_string()))?;
-        let mut answer = Answer::ok(frame.seq);
+        let mut answer = Answer::ok(seq);
         answer.child_request_id = call.request.clone();
         if record.progress != call.progress.1 && record.progress.is_some() {
             call.progress = (call.progress.0 + 1, record.progress.clone());
@@ -394,7 +388,7 @@ impl Calls {
                     let directory = parent
                         .spool
                         .join("child-results")
-                        .join(frame.call_index.to_string());
+                        .join(call_index.to_string());
                     let (text, rows, held) = receive(&service.engine.root, result, &parent.spool, &directory, self.identity)
                         .map_err(|e| ("child_result_unavailable", e.to_string()))?;
                     let settled = (text, rows);
@@ -437,22 +431,22 @@ impl Calls {
             _ => answer.state = "pending".into(),
         }
         if record.state.terminal() && !call.recorded {
-            call.recorded = record_call(&service.engine, parent, frame.call_index, call, &record);
+            call.recorded = record_call(&service.engine, parent, call_index, call, &record);
         }
         Ok(answer)
     }
 
     fn seam(&self, parent: &Parent, frame: &Frame) -> io::Result<(Answer, Option<File>)> {
-        let answered = match frame.kind {
-            Kind::ChildCall => self.child_call(parent, frame),
-            Kind::ChildPoll => self.state(parent, frame),
-            Kind::ChildCancel => {
+        let answered = match &frame.request {
+            Some(Request::ChildCall(call)) => self.child_call(parent, frame.seq, call),
+            Some(Request::ChildPoll(poll)) => self.state(parent, frame.seq, poll.call_index),
+            Some(Request::ChildCancel(stop)) => {
                 let call = parent
                     .calls
                     .lock()
                     .unwrap()
                     .by_index
-                    .get(&frame.call_index)
+                    .get(&stop.call_index)
                     .map(|c| c.child.clone());
                 if let (Some(child), Some(service)) = (call, self.service.upgrade()) {
                     if let Ok(record) = service.engine.get(&child) {
@@ -463,18 +457,18 @@ impl Calls {
                 answer.state = "pending".into();
                 Ok(answer)
             }
-            Kind::ChildForget => {
+            Some(Request::ChildForget(forget)) => {
                 let mut calls = parent.calls.lock().unwrap();
-                let settled = calls.by_index.get(&frame.call_index).and_then(|c| {
+                let settled = calls.by_index.get(&forget.call_index).and_then(|c| {
                     let record = self.service.upgrade()?.engine.get(&c.child).ok()?;
                     Some(record.state.terminal())
                 });
                 if settled == Some(true) {
-                    calls.by_index.remove(&frame.call_index);
+                    calls.by_index.remove(&forget.call_index);
                 }
                 Ok(Answer::ok(frame.seq))
             }
-            Kind::ChildEvents => {
+            Some(Request::ChildEvents(_)) => {
                 let (ours, theirs) = platform::ipc::pair()?;
                 ours.set_nonblocking(true)?;
                 parent.calls.lock().unwrap().watcher = Some(ours);
@@ -485,8 +479,8 @@ impl Calls {
             }
             // A hint about a future call: TensorD may prepare its weights and ask Runtime
             // to build the construction. This answer does not promise completed loading.
-            Kind::ModelPrefetch => self.model_prefetch(parent, frame),
-            Kind::GpuRelease => {
+            Some(Request::ModelPrefetch(prefetch)) => self.model_prefetch(parent, frame.seq, prefetch),
+            Some(Request::GpuRelease(_)) => {
                 let service = self.service.upgrade()
                     .ok_or_else(|| io::Error::other("the machine is stopping"))?;
                 let record = service.engine.get(&parent.id)?;
@@ -505,11 +499,11 @@ impl Calls {
         ))
     }
 
-    fn model_prefetch(&self, parent: &Parent, frame: &Frame) -> Result<Answer, (&'static str, String)> {
-        let (application, entrypoint) = parent.callable(frame)?;
+    fn model_prefetch(&self, parent: &Parent, seq: u64, prefetch: &ModelPrefetch) -> Result<Answer, (&'static str, String)> {
+        let (application, entrypoint) = parent.callable(&prefetch.module, &prefetch.export)?;
         // Explicit choices use the ordinary child-call decoder and selection path; a hint
         // cannot turn a model name into byte authority.
-        let raw = if frame.payload.is_empty() { "{}" } else { &frame.payload };
+        let raw = if prefetch.payload.is_empty() { "{}" } else { &prefetch.payload };
         let models = crate::boundary_json::parse(raw.as_bytes())
             .map_err(|error| ("child_call_refused", format!("prefetch choices are not JSON: {error}")))?;
         let choices = model_choices(&models, entrypoint)?;
@@ -523,7 +517,7 @@ impl Calls {
             .map_err(|error| ("child_call_refused", error.to_string()))?;
         runs.prefetch(&caller, application, entrypoint, choices)
             .map_err(|error| (error.code, error.message))?;
-        Ok(Answer::ok(frame.seq))
+        Ok(Answer::ok(seq))
     }
 }
 
