@@ -111,6 +111,8 @@ impl Local {
         loop {
             if served_at(&self.ready()) > before && self.running() {
                 info!(ms = began.elapsed().as_millis() as u64, "this computer's machine serves");
+                // Calcifer started it: Calcifer reaps it when it exits, idle or ended.
+                tokio::task::spawn_blocking(move || drop(child.wait()));
                 return self.endpoint();
             }
             match child.try_wait() {

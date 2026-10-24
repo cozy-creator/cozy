@@ -79,6 +79,10 @@ impl Detached {
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.0.try_wait()
     }
+
+    pub(super) fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.0.wait()
+    }
 }
 
 /// A session of its own: no terminal's hangup reaches it, and it leads its own group.

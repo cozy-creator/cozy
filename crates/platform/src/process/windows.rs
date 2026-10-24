@@ -212,6 +212,11 @@ impl Detached {
         }
         Ok(Some(ExitStatus::from_raw(code)))
     }
+
+    pub(super) fn wait(&mut self) -> io::Result<ExitStatus> {
+        signaled(&self.process, None)?;
+        self.try_wait()?.ok_or_else(|| io::Error::other("the process has not exited"))
+    }
 }
 
 /// std's spawn hands a child every inheritable handle this process holds, a pipe its caller reads
