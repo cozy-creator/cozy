@@ -434,3 +434,25 @@ fn standalone_reclaims_small_idle_spans_before_cold_weights() {
     );
     memory.torch_free(pointer, 31 << 20, 0);
 }
+
+#[test]
+fn repeated_unmap_failure_keeps_the_region_retryable() {
+    for fail in [1, 2] {
+        let (b, t) = allocator();
+        let pointers = populated(&b, &t);
+        b.fail_unmap_at.store(fail, Ordering::SeqCst);
+        let mut saved = t.evict(Owner::Region(1), true).unwrap().unwrap();
+        b.fail_unmap_at
+            .store(b.unmaps.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        assert!(matches!(
+            t.make_resident(Owner::Region(1), &mut saved),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(saved.bytes, 4 << 20);
+        assert!(saved.swapped());
+        assert_eq!(t.mapped(), 2 << 20);
+        assert_eq!(b.process_used().unwrap(), 2 << 20);
+        assert!(!t.make_resident(Owner::Region(1), &mut saved).unwrap());
+        assert_contents(&b, &pointers);
+    }
+}

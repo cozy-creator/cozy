@@ -345,7 +345,7 @@ impl Shared {
         if self.stuck_in(va) {
             self.retry_stuck();
             if self.stuck_in(va) {
-                return Err(Error::Internal(format!("a chunk of the span at {va:?} could not go back: it is not made resident over it")));
+                return Err(Error::Io(format!("a chunk of the span at {va:?} could not be unmapped; restoration keeps its saved bytes for retry")));
             }
         }
         loop {
