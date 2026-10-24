@@ -430,10 +430,12 @@ fn shareable(uuid: &str) -> Result<i32, String> {
 /// engine's activity, which every manager event and every cancel bumps, and asks again: running
 /// requests end, and a GPU nothing runs on always admits. False: it was canceled meanwhile. A
 /// manager that cannot answer lets it run unrecorded.
-pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, shape: &str, ancestors: &[Ancestor]) -> io::Result<bool> {
+pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, shape: &str, mut ancestors: impl FnMut() -> io::Result<Vec<Ancestor>>) -> io::Result<bool> {
     loop {
         let seen = engine.activity_epoch();
-        match Manager::admit(managers, id, package, shape, ancestors) {
+        // A parent can begin waiting after its child reached this queue, or resume while the
+        // child waits behind a sibling. Never keep the first admission's yield snapshot.
+        match Manager::admit(managers, id, package, shape, &ancestors()?) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(error) => {

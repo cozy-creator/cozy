@@ -2824,8 +2824,9 @@ impl Pool {
         // left out: the parent waits on it.
         let shape = shape(&prepared.features);
         let managers: Vec<&varena::lease::Manager> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &*m.manager).collect();
-        let ancestors = memory::ancestors(engine, &self.running, &record, calls.map(Arc::as_ref))?;
-        let admitted = memory::admit(engine, &managers, id, &construction, &shape, &ancestors);
+        let admitted = memory::admit(engine, &managers, id, &construction, &shape, || {
+            memory::ancestors(engine, &self.running, &record, calls.map(Arc::as_ref))
+        });
         let pids: Vec<u32> = std::iter::once(session.executor.birth.pid).chain(session.followers.iter().map(|f| f.birth().pid)).collect();
         let ranks = gpus.iter().enumerate().map(|(rank, gpu)| memory::Rank {
             pid: pids.get(rank).copied().unwrap_or(session.executor.birth.pid),
@@ -3719,3 +3720,7 @@ impl Services for Callbacks<'_> {
     }
 }
 
+
+#[cfg(test)]
+#[path = "gpu_service_memory_tests.rs"]
+mod memory_tests;
