@@ -37,7 +37,7 @@ fn error(py: Python<'_>, gpu: &str, e: Error) -> PyErr {
     let _ = v.setattr("cuda_code", cuda);
     if let Error::Exhausted(x) = e {
         let _ = (v.setattr("gpu", gpu), v.setattr("need", x.need), v.setattr("site", x.site));
-        let _ = Py::new(py, PyStats::from(x.stats)).and_then(|s| v.setattr("stats", s));
+        let _ = Py::new(py, x.stats).and_then(|s| v.setattr("stats", s));
     }
     err
 }
@@ -87,109 +87,6 @@ impl PyGpuId {
     #[new]
     fn new(uuid: String, model: String, memory: u64) -> Self {
         PyGpuId { uuid, model, memory }
-    }
-}
-
-#[pyclass(name = "Fills", module = "tensorfs.varena", frozen, get_all, skip_from_py_object)]
-#[derive(Clone)]
-pub struct PyFills {
-    bytes: u64,
-    ns: u64,
-}
-
-#[pyclass(name = "Moved", module = "tensorfs.varena", frozen, get_all, skip_from_py_object)]
-#[derive(Clone)]
-pub struct PyMoved {
-    kept: PyFills,
-    store: PyFills,
-    speculative: u64,
-}
-
-#[pyclass(name = "Ref", module = "tensorfs.varena", frozen, get_all, skip_from_py_object)]
-#[derive(Clone)]
-pub struct PyRef_ {
-    step: u32,
-    set: String,
-    block: u32,
-    bytes: u64,
-    origin: &'static str,
-    speculative: bool,
-}
-
-#[pyclass(name = "StepStats", module = "tensorfs.varena", frozen, get_all, skip_from_py_object)]
-#[derive(Clone)]
-pub struct PyStepStats {
-    capacity: u64,
-    evicted: Vec<u64>,
-}
-
-#[pyclass(name = "Stats", module = "tensorfs.varena", frozen, skip_from_py_object)]
-#[derive(Clone)]
-pub struct PyStats {
-    raw: varena::Stats,
-    #[pyo3(get)]
-    request: String,
-    #[pyo3(get)]
-    moved: PyMoved,
-    #[pyo3(get)]
-    trace: Vec<PyRef_>,
-    #[pyo3(get)]
-    steps: Vec<PyStepStats>,
-    #[pyo3(get)]
-    stall_ns: u64,
-    #[pyo3(get)]
-    evicted: Vec<u64>,
-    #[pyo3(get)]
-    peak: u64,
-    #[pyo3(get)]
-    compute: u64,
-    #[pyo3(get)]
-    leftover: u64,
-    /// Each make_room that took bytes: (step, trigger, need, freed, release events waited on).
-    #[pyo3(get)]
-    make_room: Vec<(u32, &'static str, u64, u64, u32)>,
-    /// Its torch blocks still live at its end (ptr, bytes, stream): the request-end audit.
-    #[pyo3(get)]
-    outlived: Vec<Outlived>,
-}
-
-impl From<varena::Fills> for PyFills {
-    fn from(f: varena::Fills) -> Self {
-        PyFills { bytes: f.bytes, ns: f.ns }
-    }
-}
-
-impl From<varena::Stats> for PyStats {
-    fn from(s: varena::Stats) -> Self {
-        let raw = s.clone();
-        let m = s.moved;
-        let origin = |o: Origin| match o {
-            Origin::Hit => "hit",
-            Origin::Kept => "kept",
-            Origin::Store => "store",
-        };
-        PyStats {
-            raw,
-            request: s.request,
-            moved: PyMoved { kept: m.kept.into(), store: m.store.into(), speculative: m.speculative },
-            trace: s.trace.into_iter().map(|r| PyRef_ { step: r.step, set: r.set, block: r.block, bytes: r.bytes, origin: origin(r.origin), speculative: r.speculative }).collect(),
-            steps: s.steps.into_iter().map(|t| PyStepStats { capacity: t.capacity, evicted: t.evicted.into() }).collect(),
-            stall_ns: s.stall_ns,
-            evicted: s.evicted.into(),
-            peak: s.peak,
-            compute: s.compute,
-            leftover: s.leftover,
-            make_room: s.make_room.into_iter().map(|m| (m.step, m.trigger, m.need, m.freed, m.waited)).collect(),
-            outlived: s.outlived.into_iter().map(|o| (o.ptr, o.bytes, o.stream)).collect(),
-        }
-    }
-}
-
-#[pymethods]
-impl PyStats {
-    /// The record as JSON, field for field (what a Runtime relays).
-    fn json(&self) -> PyResult<String> {
-        serde_json::to_string(&self.raw).map_err(|e| VarenaError::new_err(e.to_string()))
     }
 }
 
@@ -488,8 +385,8 @@ impl PyMemory {
     }
 
     /// The record of the request that ended last.
-    fn stats(&self, py: Python<'_>) -> PyResult<Option<PyStats>> {
-        detached(py, &self.gpu.uuid, || Ok(self.memory().stats())).map(|s| s.map(Into::into))
+    fn stats(&self, py: Python<'_>) -> PyResult<Option<varena::Stats>> {
+        detached(py, &self.gpu.uuid, || Ok(self.memory().stats()))
     }
 }
 
@@ -612,16 +509,16 @@ impl PyRequest {
         Ok(PyAllocating(Mutex::new(Some(guard))))
     }
 
-    fn stats(&self, py: Python<'_>) -> PyResult<PyStats> {
+    fn stats(&self, py: Python<'_>) -> PyResult<varena::Stats> {
         let r = self.get(py)?;
-        detached(py, &self.gpu, || Ok(r.stats())).map(Into::into)
+        detached(py, &self.gpu, || Ok(r.stats()))
     }
 
     /// Ends the request: its pins and caches go. Refused while another call is in it.
-    fn end(&self, py: Python<'_>) -> PyResult<PyStats> {
+    fn end(&self, py: Python<'_>) -> PyResult<varena::Stats> {
         let r = lock(&self.request).take().ok_or_else(|| error(py, &self.gpu, Error::Closed("request ended".into())))?;
         match Arc::try_unwrap(r) {
-            Ok(r) => detached(py, &self.gpu, || Ok(r.end())).map(Into::into),
+            Ok(r) => detached(py, &self.gpu, || Ok(r.end())),
             Err(r) => {
                 *lock(&self.request) = Some(r);
                 Err(error(py, &self.gpu, Error::Invalid("a call is still running in the request".into())))
@@ -697,13 +594,10 @@ impl PyRegion {
         })
     }
 
-    /// Releases it: (allocated, peak, its blocks still live (ptr, bytes, stream)).
-    fn close(&self, py: Python<'_>) -> PyResult<(u64, u64, Vec<Outlived>)> {
-        let Some(region) = lock(&self.region).take() else { return Ok((0, 0, Vec::new())) };
-        detached(py, &self.gpu, || {
-            let e = region.close();
-            Ok((e.allocated, e.peak, e.outlived.into_iter().map(|o| (o.ptr, o.bytes, o.stream)).collect()))
-        })
+    /// Releases it: its arena's record (allocated, peak, its blocks still live).
+    fn close(&self, py: Python<'_>) -> PyResult<varena::arena::Ended> {
+        let Some(region) = lock(&self.region).take() else { return Ok(varena::arena::Ended::default()) };
+        detached(py, &self.gpu, || Ok(region.close()))
     }
 }
 
@@ -1043,11 +937,6 @@ impl PyWindow {
 }
 
 
-/// varena's torch allocator figures: (allocated, mapped, peak, per open request (id, allocated,
-/// peak)).
-/// A torch block still live at its arena's end: (ptr, bytes, stream).
-type Outlived = (u64, u64, usize);
-
 type TorchFigures = (u64, u64, u64, u64, Vec<(String, u64, u64)>, Vec<((u64, u64), u64, u64)>);
 
 fn torch_stats(memory: &Memory) -> TorchFigures {
@@ -1077,11 +966,15 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPin>()?;
     m.add_class::<PyRetained>()?;
     m.add_class::<PyWindow>()?;
-    m.add_class::<PyFills>()?;
-    m.add_class::<PyMoved>()?;
-    m.add_class::<PyRef_>()?;
-    m.add_class::<PyStepStats>()?;
-    m.add_class::<PyStats>()?;
+    m.add_class::<varena::Fills>()?;
+    m.add_class::<varena::Moved>()?;
+    m.add_class::<varena::Ref>()?;
+    m.add_class::<varena::Origin>()?;
+    m.add_class::<varena::StepStats>()?;
+    m.add_class::<varena::MakeRoom>()?;
+    m.add_class::<varena::Stats>()?;
+    m.add_class::<varena::arena::Outlived>()?;
+    m.add_class::<varena::arena::Ended>()?;
     m.add_function(wrap_pyfunction!(pins_held, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;

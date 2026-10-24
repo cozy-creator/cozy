@@ -17,11 +17,14 @@ sha2.workspace = true
 tensorfs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# The records' Python classes (`python`): tensorfs-py exposes these structs themselves.
+pyo3 = { version = "0.29.2", optional = true }
 
 [features]
 # Store-backed sources (checkpoints from a TensorFS store).
 default = ["store"]
 store = ["tensorfs/store"]
+python = ["dep:pyo3"]
 
 [lints]
 workspace = true

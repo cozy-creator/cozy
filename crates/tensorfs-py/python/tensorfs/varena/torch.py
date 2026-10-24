@@ -33,7 +33,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
-from . import Exhausted, Fill, GpuId, Level, Pass, Pin, Stats, VarenaError, Window
+from . import Ended, Exhausted, Fill, GpuId, Level, Pass, Pin, Stats, VarenaError, Window
 from . import Memory as Native
 from .. import _ext
 from . import Request as NativeRequest
@@ -970,11 +970,9 @@ class Region:
         """The plan step of its next use; None: none declared."""
         self.native.next_use(step)
 
-    def close(self) -> dict[str, object]:
-        """Its arena ends; its record: allocated and peak bytes, and its blocks still live (ptr,
-        bytes, stream)."""
-        allocated, peak, outlived = self.native.close()
-        return {"allocated": allocated, "peak": peak, "outlived": outlived}
+    def close(self) -> Ended:
+        """Its arena ends; its record (allocated and peak bytes, its blocks still live)."""
+        return self.native.close()
 
 
 class GraphRegion:
