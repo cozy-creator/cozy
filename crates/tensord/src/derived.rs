@@ -13,13 +13,20 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
     time::Instant,
 };
+use varena::lease::DerivedEntry;
 
 pub struct Derived {
     root: PathBuf,
-    entries: Mutex<BTreeMap<(String, String), Entry>>,
+    /// By domain, key and entry id: a key's writers each write their own entry.
+    entries: Mutex<BTreeMap<(String, String, u64), Entry>>,
+    /// The last entry id given (0 names none).
+    last: AtomicU64,
 }
 
 struct Entry {
@@ -32,14 +39,14 @@ struct Entry {
 
 impl Derived {
     pub fn at(root: PathBuf) -> Derived {
-        Derived { root, entries: Mutex::default() }
+        Derived { root, entries: Mutex::default(), last: AtomicU64::new(0) }
     }
 
     /// A new entry of `domain` named `key` (its base content, transform and parameters, LoRAs and
-    /// strengths, lane) for `bytes`, held by TensorD: the descriptor the executor that derived it
-    /// writes, in that domain's directory (TensorD's alone). None while the disk could not keep it
-    /// free of its reserve.
-    pub fn create(&self, domain: &str, key: &str, bytes: u64) -> io::Result<Option<File>> {
+    /// strengths, lane) for `bytes`, held by TensorD: its own id and the descriptor the executor
+    /// that derived it writes, in that domain's directory (TensorD's alone). Another writer of
+    /// `key` gets another entry. None while the disk could not keep it free of its reserve.
+    pub fn create(&self, domain: &str, key: &str, bytes: u64) -> io::Result<Option<DerivedEntry>> {
         let dir = self.root.join(tensorfs::sha256::hex_digest(domain.as_bytes()));
         fs::create_dir_all(&dir)?;
         #[cfg(unix)]
@@ -50,38 +57,41 @@ impl Derived {
         let file = unlinked(&dir)?;
         file.set_len(bytes)?;
         let writer = file.try_clone()?;
+        let id = self.last.fetch_add(1, Ordering::Relaxed) + 1;
         let entry = Entry { file, bytes, used: Instant::now(), written: false };
-        self.entries().insert((domain.into(), key.into()), entry);
-        Ok(Some(writer))
+        self.entries().insert((domain.into(), key.into(), id), entry);
+        Ok(Some(DerivedEntry { id, file: writer }))
     }
 
-    /// Its writer wrote it whole: from now on it is read.
-    pub fn written(&self, domain: &str, key: &str) {
-        if let Some(entry) = self.entries().get_mut(&(domain.into(), key.into())) {
-            entry.written = true;
-        }
+    /// Entry `id` of `key` was written whole: from now on it is read, and an older written entry
+    /// of `key` is let go. A stale or unknown id marks nothing.
+    pub fn written(&self, domain: &str, key: &str, id: u64) {
+        let mut entries = self.entries();
+        let Some(entry) = entries.get_mut(&(domain.into(), key.into(), id)) else { return };
+        entry.written = true;
+        entries.retain(|(d, k, other), entry| !(d == domain && k == key && *other != id && entry.written));
     }
 
-    /// A written entry's descriptor for a process of its domain that reads it, while TensorD
-    /// keeps it.
+    /// `key`'s written entry's descriptor for a process of its domain that reads it, while
+    /// TensorD keeps it.
     pub fn open(&self, domain: &str, key: &str) -> Option<File> {
         let mut entries = self.entries();
-        let entry = entries.get_mut(&(domain.into(), key.into())).filter(|entry| entry.written)?;
+        let entry = entries.range_mut(Self::of(domain, key)).map(|(_, entry)| entry).find(|entry| entry.written)?;
         entry.used = Instant::now();
         entry.file.try_clone().ok()
     }
 
-    /// TensorD lets the entry go (its GPU page cache dropped the chunk): it is freed once every
-    /// process holding it closes it too.
+    /// TensorD lets `key`'s entries go (its GPU page cache dropped the chunk): each is freed
+    /// once every process holding it closes it too.
     pub fn forget(&self, domain: &str, key: &str) {
-        self.entries().remove(&(domain.into(), key.into()));
+        self.entries().retain(|(d, k, _), _| !(d == domain && k == key));
     }
 
     /// Lets TensorD's holders go, least recently used first, until `bytes` are let go (a low
     /// disk): an entry is freed once the processes holding it close it too. What it let go.
     pub fn shrink(&self, bytes: u64) -> u64 {
         let mut entries = self.entries();
-        let mut oldest: Vec<((String, String), Instant)> = entries.iter().map(|(key, entry)| (key.clone(), entry.used)).collect();
+        let mut oldest: Vec<((String, String, u64), Instant)> = entries.iter().map(|(key, entry)| (key.clone(), entry.used)).collect();
         oldest.sort_by_key(|(_, used)| *used);
         let mut let_go = 0;
         for (key, _) in oldest {
@@ -98,7 +108,12 @@ impl Derived {
         self.entries().values().map(|entry| entry.bytes).sum()
     }
 
-    fn entries(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), Entry>> {
+    /// Every entry id of `domain`'s `key`.
+    fn of(domain: &str, key: &str) -> std::ops::RangeInclusive<(String, String, u64)> {
+        (domain.into(), key.into(), 0)..=(domain.into(), key.into(), u64::MAX)
+    }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String, u64), Entry>> {
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

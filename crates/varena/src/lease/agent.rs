@@ -45,7 +45,7 @@ pub struct Lease {
 pub type Done = Box<dyn FnOnce(Result<Vec<Lease>>) + Send>;
 
 /// What runs on the reader thread once a derive is answered: the entry to write, or none kept.
-pub type Deriving = Box<dyn FnOnce(Option<std::fs::File>) + Send>;
+pub type Deriving = Box<dyn FnOnce(Option<super::DerivedEntry>) + Send>;
 
 struct Asking {
     bytes: u64,
@@ -149,10 +149,10 @@ impl Agent {
                     Some(wake) => wake(region, swap),
                     None => tracing::warn!("lease: region {region}'s reclaim reached an agent with no region holder"),
                 },
-                ToAgent::Entry { id: 0, key } => {
+                ToAgent::Entry { id: 0, key, entry } => {
                     let deriving = self.pending.lock().derives.get_mut(&key).and_then(|d| (!d.is_empty()).then(|| d.remove(0)));
                     match deriving {
-                        Some(done) => done(handle.map(std::fs::File::from)),
+                        Some(done) => done(handle.map(|h| super::DerivedEntry { id: entry, file: std::fs::File::from(h) })),
                         None => tracing::warn!("lease: an entry for {key} nobody derives"),
                     }
                 }
@@ -262,9 +262,10 @@ impl Agent {
         self.end.send(&ToManager::Derive { key, bytes }, None)
     }
 
-    /// `key`'s entry is written whole: grants refill from it from now on.
-    pub fn derived(&self, key: String) -> Result<()> {
-        self.end.send(&ToManager::Derived { key }, None)
+    /// Entry `entry` (its [`super::DerivedEntry::id`]) of `key` is written whole: grants refill
+    /// from it from now on.
+    pub fn derived(&self, key: String, entry: u64) -> Result<()> {
+        self.end.send(&ToManager::Derived { key, entry }, None)
     }
 
     /// [`Agent::ask`], waiting for the answer here: never on a thread that answers revokes.

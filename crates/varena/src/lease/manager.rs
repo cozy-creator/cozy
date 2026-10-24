@@ -88,14 +88,15 @@ pub trait Hosting: Send + Sync {
     /// A record of what the manager did, after its books dropped.
     fn record(&self, _record: Record) {}
 
-    /// The derived-weights disk cache (§6): an unlinked entry of `domain` for `bytes`, for the
-    /// agent that derived it to write. None: none kept (low disk, unhosted).
-    fn derive(&self, _domain: &str, _key: &str, _bytes: u64) -> Option<std::fs::File> {
+    /// The derived-weights disk cache (§6): a new unlinked entry of `domain` for `bytes`, its
+    /// own, for the agent that derived it to write. None: none kept (low disk, unhosted).
+    fn derive(&self, _domain: &str, _key: &str, _bytes: u64) -> Option<super::DerivedEntry> {
         None
     }
 
-    /// Its agent wrote it whole: from now on it is read.
-    fn derived(&self, _domain: &str, _key: &str) {}
+    /// Entry `entry` of `key` was written whole by its agent: from now on it is read. Another
+    /// id (a stale or unknown one) marks nothing.
+    fn derived(&self, _domain: &str, _key: &str, _entry: u64) {}
 
     /// A written entry a grant refills from instead of deriving again.
     fn read_derived(&self, _domain: &str, _key: &str) -> Option<std::fs::File> {
@@ -593,9 +594,9 @@ impl Manager {
                     let out = match message {
                         ToManager::Ask { id: ask, bytes, kind, region, fill } => self.ask(id, Waiting { id: ask, bytes, kind, region, fill, entry: None }),
                         ToManager::Derive { key, bytes } => self.derive(id, key, bytes),
-                        ToManager::Derived { key } => {
+                        ToManager::Derived { key, entry } => {
                             if let Some(domain) = self.domain(id) {
-                                self.hosting.derived(&domain, &key);
+                                self.hosting.derived(&domain, &key, entry);
                             }
                             Out::default()
                         }
@@ -891,9 +892,9 @@ impl Manager {
     /// call, outside the books.
     fn derive(&self, exec: u64, key: String, bytes: u64) -> Out {
         let Some((domain, end)) = self.books.lock().executors.get(&exec).map(|e| (e.identity.domain.clone(), e.end.clone())) else { return Out::default() };
-        let entry = self.hosting.derive(&domain, &key, bytes);
+        let (entry, file) = self.hosting.derive(&domain, &key, bytes).map_or((0, None), |e| (e.id, Some(Owned::from(e.file))));
         let mut out = Out::default();
-        out.sends.push((end, ToAgent::Entry { id: 0, key }, entry.map(Owned::from)));
+        out.sends.push((end, ToAgent::Entry { id: 0, key, entry }, file));
         out
     }
 
@@ -1219,7 +1220,7 @@ impl Manager {
         // Not adopted, with a derived entry kept for its fill: the entry first, to refill from.
         if let (None, Some(key), Some(entry), Some(e)) = (&adopt, &ask.fill, &ask.entry, b.executors.get(&exec)) {
             match entry.try_clone() {
-                Ok(entry) => out.sends.push((e.end.clone(), ToAgent::Entry { id: ask.id, key: key.clone() }, Some(Owned::from(entry)))),
+                Ok(entry) => out.sends.push((e.end.clone(), ToAgent::Entry { id: ask.id, key: key.clone(), entry: 0 }, Some(Owned::from(entry)))),
                 Err(error) => tracing::debug!("lease: a derived entry for {key}: {error}"),
             }
         }
