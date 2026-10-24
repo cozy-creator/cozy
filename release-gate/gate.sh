@@ -170,6 +170,10 @@ timeout 60 "$CLI" machine show "$M" > machine-fresh.txt 2>&1
 # Sourced on the fresh pod, before the candidate goes on: each suite's before.sh, then `--before FILE`s.
 for s in ${SUITES//,/ }; do [ ! -f "$HERE/suites/$s/before.sh" ] || . "$HERE/suites/$s/before.sh"; done
 for f in "${BEFORE[@]}"; do . "$f"; done
+# A machine already on the candidate cozy (a suite's before.sh moved it) keeps it: no second upload or restart.
+if [ -n "$BIN" ] && [ "$(timeout 60 "$CLI" --json machine show "$M" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["version"])' 2>/dev/null)" = "$BIN" ]; then
+  for ((i = 0; i < ${#CAND[@]}; i += 2)); do [ "${CAND[i]}" = --tensord ] && CAND=("${CAND[@]:0:i}" "${CAND[@]:i+2}") && break; done
+fi
 if [ ${#CAND[@]} -gt 0 ]; then
   "$ICLI" machine update "$M" "${CAND[@]}" -y >update.log 2>&1; code=$?
   log "candidate on $M: exit $code $(grep -E '^status' update.log)"
