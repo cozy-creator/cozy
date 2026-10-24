@@ -90,7 +90,7 @@ impl Hosting for Hosted {
     }
 
     fn forget_derived(&self, domain: &str, key: &str) {
-        self.derived.forget(domain, key);
+        self.derived.touch(domain, key);
     }
 }
 
