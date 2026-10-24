@@ -297,6 +297,14 @@ impl PyMemory {
         Ok(PyGraphRegion { graph: Mutex::new(Some(graph)), gpu: self.gpu.uuid.clone() })
     }
 
+    /// A graph region pinning exactly the declared (set, block IDs), including aliases and
+    /// common weights. Repeated dependencies pin their pages once.
+    fn graph_region_blocks(&self, py: Python<'_>, pool: (u64, u64), dependencies: Vec<(u32, Vec<u32>)>) -> PyResult<PyGraphRegion> {
+        let dependencies = dependencies.into_iter().map(|(set, blocks)| (SetId(set), blocks)).collect::<Vec<_>>();
+        let graph = detached(py, &self.gpu.uuid, || self.memory().graph_region_blocks(&dependencies, varena::PoolId(pool.0, pool.1)))?;
+        Ok(PyGraphRegion { graph: Mutex::new(Some(graph)), gpu: self.gpu.uuid.clone() })
+    }
+
     /// The room a cut sizes from at plan step `step` (the request's cursor when None): (free,
     /// cold, warm, granularity, floor). Lock-free: read with the GIL held.
     #[pyo3(signature = (step = None))]

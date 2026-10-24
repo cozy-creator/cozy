@@ -33,8 +33,9 @@ import torch
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
-from . import Ended, Exhausted, Fill, GpuId, Level, Pass, Pin, Stats, VarenaError, Window, host_limit
+from . import Ended, Exhausted, Fill, GpuId, Level, Pass, Pin, StaleBinding, Stats, VarenaError, Window, host_limit
 from . import Memory as Native
+from . import GraphRegion as NativeGraphRegion
 from .. import _ext
 from . import Request as NativeRequest
 from . import Set
@@ -243,6 +244,8 @@ class Model:
         #: per thread: its forwards' depth, and the pass the outermost opened
         self.local = threading.local()
         self.holds: list[Hold] = []
+        #: Graph owners retire their executables and pins before this model changes fill.
+        self.graphs: weakref.WeakSet[GraphRegion] = weakref.WeakSet()
         #: the fill identity its pages were last declared under
         self.identity: str | None = declared.fill.identity if declared.fill is not None else None
 
@@ -268,6 +271,19 @@ class Model:
         # Common weights can be read by any child block, so include them conservatively.
         if self.common is not None and self.common not in blocks:
             blocks.insert(0, self.common)
+        # Tied tensors can be named from another block. Include its owner too, transitively,
+        # so the retained range and the native graph region describe the same dependencies.
+        sites = {
+            b: {id(self.sites[key]) for key in b.tensors if key in self.sites}
+            for b in all_blocks
+        }
+        requested = {id(group) for name, group in self.sites.items() if any(not p or name == p or name.startswith(p + ".") for p in paths)}
+        while True:
+            used = requested.union(*(sites[b] for b in blocks))
+            aliases = [b for b in all_blocks if b not in blocks and sites[b] & used]
+            if not aliases:
+                break
+            blocks.extend(aliases)
         return Binding(self, sorted(blocks, key=lambda b: b.region))
 
     def hold(self, shed: Callable[[], None] | None = None, *, free_only: bool = False) -> Hold | None:
@@ -299,6 +315,8 @@ class Model:
 
     def close(self) -> None:
         """Unhooks the module and unloads its set."""
+        for graph in list(self.graphs):
+            graph.retire()
         for h in self.handles:
             h.remove()
         self.handles.clear()
@@ -325,10 +343,12 @@ class Binding:
             self.last.record(torch.cuda.current_stream(model.memory.device))
 
     def valid(self) -> bool:
+        # Retirement may close other bindings of this model. Declare before taking this
+        # binding's lock, so concurrent validators cannot each hold a lock retirement needs.
+        self.model.memory._declare(self.model)
         with self.lock:
             if self.closed:
                 return False
-            self.model.memory._declare(self.model)
             return self.native.valid()
 
     def resident(self) -> bool:
@@ -339,10 +359,11 @@ class Binding:
 
     @contextmanager
     def prepare(self, stream: torch.cuda.Stream | int | None = None) -> Iterator[Binding]:
+        memory = self.model.memory
+        memory._declare(self.model)
         with self.lock:
             if self.closed:
-                raise Unbound("graph binding is closed")
-            memory = self.model.memory
+                raise StaleBinding("graph binding retired before its fill changed")
             if memory.cuda:
                 if torch.cuda.is_current_stream_capturing():
                     raise Unbound("graph residency must be prepared before capture")
@@ -354,7 +375,6 @@ class Binding:
                 scope.enter_context(torch.cuda.stream(stream) if memory.cuda else nullcontext())
                 if self.last is not None:
                     stream.wait_event(self.last)
-                memory._declare(self.model)
                 request = _request.get()
                 pins = self.native.prepare(stream.cuda_stream if stream is not None else 0, request.native if request is not None else None)
                 held: list[_Block] = []
@@ -659,7 +679,20 @@ class Memory:
     def graph_region(self, sets: nn.Module | Model | Sequence[nn.Module | Model] = (), retained: nn.Module | Model | Sequence[nn.Module | Model] = ()) -> GraphRegion:
         """One component's graphs on this device: `sets` the models they read, `retained` those
         held bound across replays."""
-        return GraphRegion(self, self.native.graph_region(self.graph_pool, self._set_ids(sets), self._set_ids(retained)))
+        ids = {*self._set_ids(sets), *self._set_ids(retained)}
+        models = [m for m in self.models.values() if m.id in ids]
+        return GraphRegion(self, self.native.graph_region(self.graph_pool, sorted(ids)), models)
+
+    def graph_region_blocks(self, bindings: Binding | Sequence[Binding], *, retire: Callable[[], None] | None = None) -> GraphRegion:
+        """A graph's exact retained dependencies (common weights and aliases included), pinned
+        for its life. `retire` drains and discards its executable before a fill identity changes;
+        it must close this region. Without it the region closes itself and rejects later replays."""
+        many = [bindings] if isinstance(bindings, Binding) else list(bindings)
+        if any(b.model.memory is not self or b.closed for b in many):
+            raise Unbound("graph dependencies must be live bindings of this memory")
+        dependencies = [(b.model.id, [block.region for block in b.blocks]) for b in many]
+        native = self.native.graph_region_blocks(self.graph_pool, dependencies)
+        return GraphRegion(self, native, [b.model for b in many], retire)
 
     def _set_ids(self, models: nn.Module | Model | Sequence[nn.Module | Model]) -> list[int]:
         many = models if isinstance(models, Sequence) else [models]
@@ -700,6 +733,10 @@ class Memory:
         holds of the old bake go first, as their pins would keep its pages."""
         identity = model.fill.identity if model.fill is not None else None
         if identity != model.identity:
+            # A graph still pins the old fill. Retire it BEFORE publishing the new identity:
+            # otherwise a common-weight bind waits on pins that only later dispatch releases.
+            for graph in list(model.graphs):
+                graph.retire()
             for hold in list(model.holds):
                 hold.shed()
             model.identity = identity
@@ -981,9 +1018,29 @@ class GraphRegion:
     """A component's CUDA graphs on one device (design varena-leases §5), captured into the
     device's one pool (`Memory.graph_pool`); each replay runs inside `replaying(stream)`."""
 
-    def __init__(self, memory: Memory, native: object) -> None:
+    def __init__(self, memory: Memory, native: NativeGraphRegion, models: Sequence[Model] = (), retire: Callable[[], None] | None = None) -> None:
         self.memory, self.native = memory, native
         self.pool: tuple[int, int] = native.pool
+        self.models = set(models)
+        self._retire = retire
+        self.lock = threading.RLock()
+        self.closed = False
+        self.uses = 0
+        self.retiring = False
+        for model in self.models:
+            model.graphs.add(self)
+
+    def retire(self) -> None:
+        """The dependent owner drains its readers before these old-fill pins are released."""
+        with self.lock:
+            if self.closed:
+                return
+            if self.uses:
+                raise Unbound("a graph's fill cannot change during its own replay")
+            self.retiring = True
+        if self._retire is not None:
+            self._retire()
+        self.close()
 
     def prepare(self, expected: int | None) -> None:
         """Before `capture_begin`: maps `expected` bytes into the pool, making room now (a
@@ -999,22 +1056,37 @@ class GraphRegion:
         """Around a replay and its outputs' readers on `stream`: yields False while the region is
         being dropped (run eager instead, recapture off-path); a True one is released at the
         exit, by an event on `stream`, even when the replay raises."""
-        if not self.native.acquire():
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            self.native.release(stream.cuda_stream)
-            self.memory.fence_pool(self.pool, stream)
+        with self.lock:
+            if self.closed or self.retiring or not self.native.acquire():
+                yield False
+                return
+            self.uses += 1
+            try:
+                yield True
+            finally:
+                try:
+                    self.native.release(stream.cuda_stream)
+                    self.memory.fence_pool(self.pool, stream)
+                finally:
+                    self.uses -= 1
 
     @property
     def dropping(self) -> bool:
-        return self.native.dropping
+        return self.closed or self.retiring or self.native.dropping
 
     def close(self) -> None:
         """Drops its graphs' pins and its use of the pool."""
-        self.native.close()
+        with self.lock:
+            if self.closed:
+                return
+            if self.uses:
+                raise Unbound("a graph's fill cannot change during its own replay")
+            self.native.close()
+            self.closed = True
+            for model in self.models:
+                model.graphs.discard(self)
+            self.models.clear()
+            self._retire = None
 
 
 # ------------------------------------------------------------------------------ helpers
