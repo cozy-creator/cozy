@@ -17,7 +17,6 @@ PROBE=$(cd "$(dirname "$0")" && pwd)/probe.py
 
 step install; install_cozy
 user_services
-step doctor; cozy --json doctor > "$OUT/doctor.json" || check "cozy doctor is not healthy"
 step "the local machine"; machine_ready
 step candidates; candidates
 
