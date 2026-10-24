@@ -547,7 +547,7 @@ impl Origin for Endpoint {
             // Another rule's answer (an older Hub's) is no answer: the headers decide.
             200 => serde_json::from_slice::<Selection>(&reply.body)
                 .map(|answer| (answer.rule == crate::precision::RULE).then_some(answer))
-                .map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() }),
+                .map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: format!("GET {url}: {e}") }),
             _ => Err(refusal(&reply, "GET")),
         }
     }
