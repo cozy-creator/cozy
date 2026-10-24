@@ -258,17 +258,17 @@ impl Device {
 }
 
 /// A GPU's (total, free) memory from NVML's answer. An integrated GPU (GB10) has no
-/// framebuffer, so NVML answers NotSupported: its memory is the host's (`MemTotal`,
-/// `MemAvailable`).
+/// framebuffer, so NVML answers NotSupported: its memory is what this process may hold of the
+/// host's (`host_memory::limit`, and the live budget under it).
 fn memory(answer: std::result::Result<MemoryInfo, NvmlError>) -> Result<(u64, u64)> {
     match answer {
         Ok(memory) => Ok((memory.total, memory.free)),
         Err(NvmlError::NotSupported) => {
-            let total = crate::contain::host_memory::total();
-            let free = crate::contain::host_memory::read().mem_available;
-            match total > 0 && free >= 0 {
-                true => Ok((total as u64, free as u64)),
-                false => Err(failed("memory info")(NvmlError::NotSupported)),
+            let total = crate::contain::host_memory::limit();
+            let free = u64::try_from(crate::contain::host_memory::read().available).ok();
+            match total.zip(free) {
+                Some((total, free)) => Ok((total, free.min(total))),
+                None => Err(failed("memory info")(NvmlError::NotSupported)),
             }
         }
         Err(error) => Err(failed("memory info")(error)),

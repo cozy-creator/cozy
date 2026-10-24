@@ -53,11 +53,19 @@ fn stat(cgroup: &Path) -> Option<(u64, u64)> {
     Some((row(&["inactive_file"]).saturating_sub(unwritten), row(&["shmem"])))
 }
 
-/// This process's memory cgroup and every parent up to the controller root, innermost first,
-/// with the limit files and the usage file of its version.
-pub(crate) fn cgroups() -> Option<(Vec<PathBuf>, &'static [&'static str], &'static str)> {
-    let root = Path::new("/sys/fs/cgroup");
+/// A process's memory cgroup and every parent up to the controller root, innermost first, with
+/// the limit files and the usage file of its version.
+pub(crate) type Cgroups = (Vec<PathBuf>, &'static [&'static str], &'static str);
+
+/// This process's [`Cgroups`].
+pub(crate) fn cgroups() -> Option<Cgroups> {
     let memberships = fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroups_in(Path::new("/sys/fs/cgroup"), &memberships, || fs::read_to_string("/proc/self/mountinfo").ok())
+}
+
+/// The [`Cgroups`] of `memberships` (a `/proc/<pid>/cgroup`) under the cgroup mount `root`;
+/// v1's memory controller is found in `mounts` (a `/proc/<pid>/mountinfo`).
+fn cgroups_in(root: &Path, memberships: &str, mounts: impl FnOnce() -> Option<String>) -> Option<Cgroups> {
     let (leaf, top, limits, usage): (PathBuf, PathBuf, &[&str], &str) =
         if root.join("cgroup.controllers").is_file() {
             let relative = memberships.lines().find_map(|l| l.strip_prefix("0::"))?;
@@ -75,7 +83,7 @@ pub(crate) fn cgroups() -> Option<(Vec<PathBuf>, &'static [&'static str], &'stat
             })?;
             // The memory controller's mount: its root (mountinfo field 4) is the part of the
             // membership path the mount hides (a container sees its own cgroup at the mount).
-            let mounts = fs::read_to_string("/proc/self/mountinfo").ok()?;
+            let mounts = mounts()?;
             let (mount_root, point) = mounts.lines().find_map(|l| {
                 let fields: Vec<&str> = l.split(' ').collect();
                 let dash = fields.iter().position(|f| *f == "-")?;
@@ -105,9 +113,20 @@ pub(crate) fn cgroups() -> Option<(Vec<PathBuf>, &'static [&'static str], &'stat
     Some((path, limits, usage))
 }
 
+/// The tightest limit set on any cgroup of `path`: None where none is.
+fn tightest(path: &[PathBuf], limits: &[&str]) -> Option<u64> {
+    path.iter().flat_map(|cgroup| limits.iter().filter_map(|name| number(&cgroup.join(name)))).min()
+}
+
+/// The tightest cgroup limit on this process's path.
+pub(super) fn limit() -> Option<u64> {
+    cgroups().and_then(|(path, limits, _)| tightest(&path, limits))
+}
+
 /// The live budget: the tightest of every cgroup on this process's path (each `memory.high`
 /// and `memory.max`, less what that cgroup uses and cannot give back; inactive page cache is
-/// reclaimable; a missing file is no limit) and the host's `MemAvailable`.
+/// reclaimable; a missing limit file is no limit, and a limit whose use is unreadable is all
+/// room) and the host's `MemAvailable`.
 pub(super) fn read() -> HostMemory {
     let mem_available = meminfo("MemAvailable");
     let mut best = HostMemory {
@@ -120,17 +139,11 @@ pub(super) fn read() -> HostMemory {
         return best;
     };
     for cgroup in path {
-        let Some(bound) = limits
-            .iter()
-            .filter_map(|name| number(&cgroup.join(name)))
-            .min()
-        else {
+        let Some(bound) = tightest(std::slice::from_ref(&cgroup), limits) else {
             continue;
         };
-        let (Some(used), Some((cache, shmem))) = (number(&cgroup.join(usage)), stat(&cgroup))
-        else {
-            continue;
-        };
+        let used = number(&cgroup.join(usage)).unwrap_or(0);
+        let (cache, shmem) = stat(&cgroup).unwrap_or((0, 0));
         let room = bound.saturating_sub(used.saturating_sub(cache)) as i64;
         if best.available < 0 || room < best.available {
             best = HostMemory {

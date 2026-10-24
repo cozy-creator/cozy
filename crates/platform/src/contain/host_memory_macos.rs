@@ -20,6 +20,11 @@ pub(super) fn total() -> i64 {
     if read == 0 { bytes as i64 } else { -1 }
 }
 
+/// No limit below physical memory is read here.
+pub(super) fn limit() -> Option<u64> {
+    None
+}
+
 pub(super) fn read() -> HostMemory {
     let available = available();
     HostMemory {
