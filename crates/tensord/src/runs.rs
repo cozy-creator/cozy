@@ -341,9 +341,11 @@ impl Runs {
             };
             let judge_stalled = stalled.clone();
             let (service, judged, stop) = (this.service.clone(), run.clone(), stoppable.stop.clone());
+            let (start, thread) = ((stop.progress(), std::time::Instant::now()), std::thread::current().id());
             let judge = std::thread::Builder::new().name(format!("judge-{run}")).spawn(move || {
                 let waits = || service.engine.get(&judged).is_ok_and(|record| record.waiting.is_some());
-                if let Some(verdict) = crate::process::judge_preparation(&stop, &finished, waits, crate::process::Liveness::default()) {
+                let liveness = crate::process::Liveness::default();
+                if let Some(verdict) = crate::process::judge_preparation(&stop, &finished, waits, liveness, start, thread) {
                     let failure = Failure::machine("no_progress", verdict);
                     judge_stalled();
                     if let Err(error) = service.engine.end_preparation(&judged, Outcome::Failed(failure)) {
@@ -526,6 +528,7 @@ impl Runs {
                     endpoint = endpoint.anonymous();
                 }
                 let runtime = tensorfs::fetch::runtime().map_err(|error| refused("upload_failed", error.to_string()))?;
+                let asking = tensorfs::fetch::asking::begin();
                 let uploaded = runtime.block_on(upload_tree_with(&endpoint, repository, &tree, upload_store, tag, &[], &UploadControl {
                     cancelled: &|| stoppable.stop.is_cancelled(),
                     progress: &|done, total| observe(&stage, done, total),
@@ -534,6 +537,7 @@ impl Runs {
                     true => refused(crate::published::CANCELED, "the upload was canceled before its ref update; admitted objects remain available"),
                     false => refused("upload_failed", error.to_string()),
                 })?;
+                drop(asking);
                 row["published"] = json!({"destination": destination, "tree": uploaded.commit.id(), "tag": tag,
                     "checkpoint": header.id(), "converged": uploaded.converged});
             }

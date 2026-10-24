@@ -331,8 +331,12 @@ impl<'a> Scope<'a> {
             None => Client::new(self.policy(p)),
         };
         let patience = Patience::default();
+        // Until its answer moves, this thread waits on the provider, whose silence the stall
+        // rule judges; then what lands is told as it lands.
+        let mut asking = Some(crate::fetch::asking::begin());
         let work = self.until(async {
             let mut sink = |at, frame: &[u8]| {
+                asking.take();
                 self.check()?;
                 sink(at, frame)
             };

@@ -492,22 +492,32 @@ pub fn supervise(
 }
 
 /// A preparation's verdict, on its measured progress (`Stop::progress`: bytes told as they move,
-/// stages, its installer's meter) as an invocation's is: still past the patience its own pace
-/// earned, the floor before it has any. One that never advances is judged too (a job waiting on
-/// a silent Hub moved nothing for 20 min under #1875's `changes > 0`); a transfer told as its
-/// bytes land advances, however slowly. None once `ended` says it finished. Waiting on work
-/// watched elsewhere (another run's install of the same code) is not stillness.
-pub fn judge_preparation(stop: &crate::stop::Stop, ended: &std::sync::mpsc::Receiver<()>, waits: impl Fn() -> bool, liveness: Liveness) -> Option<String> {
+/// stages, its installer's meter) as an invocation's is: still past eight times the longest pause
+/// its own pace has shown, measured from `start` (its progress when it began), with no floor. One
+/// that never advances is judged too (a job waiting on a silent Hub moved nothing for 20 min under
+/// #1875's `changes > 0`); a transfer told as its bytes land advances, however slowly. None once
+/// `ended` says it finished. Waiting on work watched elsewhere (another run's install of the same
+/// code) is not stillness, nor is `thread` waiting on a TensorFS exchange, which the transport
+/// judges by what it moves (a provider's first byte, run 15327).
+pub fn judge_preparation(
+    stop: &crate::stop::Stop,
+    ended: &std::sync::mpsc::Receiver<()>,
+    waits: impl Fn() -> bool,
+    liveness: Liveness,
+    start: (u64, Instant),
+    thread: std::thread::ThreadId,
+) -> Option<String> {
     let mut pace = Pace::default();
+    pace.observe(Some(start.0), start.1);
     while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(liveness.sample) {
         let now = Instant::now();
         pace.observe(Some(stop.progress()), now);
-        if waits() {
+        if waits() || tensorfs::fetch::asking::waits(thread) {
             pace.excuse(now);
         }
         let still = pace.still_since().map(|since| now - since).unwrap_or_default();
-        if still > pace.patience(liveness.floor()) {
-            return Some(format!("preparing: {}", pace.verdict(still, liveness.floor())));
+        if still > pace.patience(Duration::ZERO) {
+            return Some(format!("preparing: {}", pace.verdict(still, Duration::ZERO)));
         }
     }
     None
