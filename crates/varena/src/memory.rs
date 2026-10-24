@@ -909,6 +909,13 @@ impl Memory {
     /// once [`Memory::lease`] attaches it to a manager; until then (or with none) they come from
     /// the device within the standalone budget: its free bytes now less the reserve (rev 6).
     pub fn open(gpu: GpuId, backend: Box<dyn Backend>) -> Result<Memory> {
+        Self::open_with_limit(gpu, backend, None)
+    }
+
+    /// Opens standalone memory with an optional physical-byte cap shared by weight pages and
+    /// torch chunks. The effective allowance is the smaller of this cap and current free bytes
+    /// less the backend's reserve. An explicit zero cap is honored.
+    pub fn open_with_limit(gpu: GpuId, backend: Box<dyn Backend>, limit: Option<u64>) -> Result<Memory> {
         crate::caught(|| {
             if !crate::layout::REGION_ALIGN.is_multiple_of(backend.granularity().max(1)) {
                 return Err(Error::Invalid(format!("granularity {} does not divide a region", backend.granularity())));
@@ -916,7 +923,11 @@ impl Memory {
             let device = Device::open(&gpu.uuid)?;
             let (release_tx, releases) = unbounded();
             let ((demand, demanded), (ahead, wanted_ahead)) = (unbounded(), unbounded());
-            let allowance = Arc::new(Allowance::of(&*backend)?);
+            let allowance = Allowance::of(&*backend)?;
+            let allowance = Arc::new(match limit {
+                Some(limit) => Allowance::new(limit.min(allowance.left())),
+                None => allowance,
+            });
             let inner = Arc::new(Inner {
                 allowance,
                 backend: Arc::from(backend),
