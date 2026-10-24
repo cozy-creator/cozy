@@ -24,3 +24,5 @@ never `--admin`. A direct push to master (admins) skips CI. Required checks:
 - cozy-creator: `build`, `e2e`
 - cozy-runtime, packages: `build`, `e2e / e2e`
 - tensorhub: `build`, required once Actions runs there again (the org's budget)
+- An RC branch gets its own queue: `ci/rc <repo> <name>` (GitHub refuses a merge queue on `rc/*`).
+- tensorhub has no merge queue: it is private, and GitHub offers merge queues on private repos only with Enterprise Cloud.
