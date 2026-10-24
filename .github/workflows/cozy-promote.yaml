@@ -21,7 +21,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: release-promote
+  group: cozy-promote
 
 jobs:
   promote:

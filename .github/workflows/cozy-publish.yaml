@@ -249,7 +249,7 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
-  custom-release-attestations:
+  custom-cozy-attestations:
     needs:
       - plan
       - build-local-artifacts
@@ -265,9 +265,9 @@ jobs:
       - build-local-artifacts
       - build-global-artifacts
       # The attestation bundles `cozy update` verifies; host releases them.
-      - custom-release-attestations
+      - custom-cozy-attestations
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-release-attestations.result == 'skipped' || needs.custom-release-attestations.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-cozy-attestations.result == 'skipped' || needs.custom-cozy-attestations.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-24.04"
