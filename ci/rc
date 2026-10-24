@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# ci/rc <repo> <name> [base]: a release-candidate branch rc/<name> (from base, default master) in
+# cozy-creator/<repo>, and its own ruleset: the merge queue and required checks of master's. GitHub refuses
+# a merge queue on a wildcard ref, so each RC gets an exact one, made with its branch.
+set -euo pipefail
+[ $# -ge 2 ] || { sed -n '2,4s/^# \{0,1\}//p' "$0" >&2; exit 2; }
+R=cozy-creator/$1 ref=refs/heads/rc/$2
+sha=$(gh api "repos/$R/commits/${3:-master}" --jq .sha)
+gh api -X POST "repos/$R/git/refs" -f ref="$ref" -f sha="$sha" > /dev/null
+master=$(gh api "repos/$R/rulesets" --jq '.[] | select(.name == "merge queue (master)") | .id')
+[ -n "$master" ] || { echo "$R has no \"merge queue (master)\" ruleset" >&2; exit 1; }
+gh api "repos/$R/rulesets/$master" \
+  | jq --arg ref "$ref" --arg name "merge queue (rc/$2)" '{name: $name, target, enforcement, bypass_actors, rules, conditions: {ref_name: {include: [$ref], exclude: []}}}' \
+  | gh api -X POST "repos/$R/rulesets" --input - --jq '"rc/\(.conditions.ref_name.include[0] | ltrimstr("refs/heads/rc/")) at '"${sha:0:12}"': ruleset \(.id)"'

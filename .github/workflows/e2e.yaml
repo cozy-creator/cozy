@@ -47,15 +47,15 @@ on:
         type: string
         default: master
       tensord:
-        description: A cozy release to take as TensorD instead of building it (Linux)
+        description: TensorD (cozy) to take instead of building it, each OS's own (a version, a release tag such as a prerelease's, or URL#sha256=)
         type: string
         default: ''
       tensorfs:
-        description: A TensorFS release (PyPI) to take instead of building it (Linux)
+        description: The TensorFS wheel to take instead of building it, each OS's own (a PyPI version, a release tag such as tensorfs-v0.15.1, or URL#sha256=)
         type: string
         default: ''
       runtime:
-        description: A cozy-runtime release (PyPI) to take instead of building it (Linux)
+        description: The cozy-runtime wheel to take instead of building it, each OS's own (a PyPI version, a release tag such as v0.32.0, or URL#sha256=)
         type: string
         default: ''
       pins:
