@@ -70,6 +70,7 @@ Linux:
 
 ```sh
 systemctl --user disable --now cozy-calcifer cozy-machine
+pkill -f ~/.cozy/bin/cozy      # what they started (a machine, its executors)
 rm -rf ~/.cozy ~/.config/cozy ~/.local/share/bash-completion/completions/cozy ~/.config/fish/completions/cozy.fish
 ```
 
@@ -77,6 +78,7 @@ macOS:
 
 ```sh
 launchctl bootout gui/$(id -u)/com.cozy-creator.calcifer; launchctl bootout gui/$(id -u)/com.cozy-creator.machine
+pkill -f ~/.cozy/bin/cozy
 rm -rf ~/.cozy ~/.config/cozy ~/Library/LaunchAgents/com.cozy-creator.*.plist
 ```
 
