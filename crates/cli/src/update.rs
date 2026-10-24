@@ -165,7 +165,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         ));
     }
     let signer = attested(&http, &url, &archive).await?;
-    let new = unpack(&archive, &binary).map_err(|e| local("unpack", e))?;
+    let new = unpack(&name, &archive, &binary).map_err(|e| local("unpack", e))?;
     let runs = std::process::Command::new(&new)
         .arg("--version")
         .output()
@@ -347,35 +347,17 @@ pub(crate) async fn release_binary(version: &str, target: &str) -> Result<tempfi
     }
     attested(&http, &url, &archive).await?;
     let mut file = tempfile::Builder::new().prefix(".cozy-release-").tempfile().map_err(|e| local("stage the binary", e))?;
-    let copied = match name.ends_with(".zip") {
-        true => zip::ZipArchive::new(io::Cursor::new(&archive[..]))
-            .and_then(|mut zip| Ok(io::copy(&mut zip.by_name("cozy.exe")?, &mut file)?))
-            .map_err(io::Error::other),
-        false => untar(&archive, &mut file),
-    };
-    copied.map_err(|e| local("unpack the binary", e))?;
+    extract(name, &archive, &mut file).map_err(|e| local("unpack the binary", e))?;
     Ok(file.into_temp_path())
 }
 
-/// dist's `.tar.gz`, whatever this computer runs: one top directory holding `cozy`.
-fn untar(archive: &[u8], out: &mut impl io::Write) -> io::Result<u64> {
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
-    for entry in tar.entries()? {
-        let mut entry = entry?;
-        if entry.path()?.file_name() == Some("cozy".as_ref()) {
-            return io::copy(&mut entry, out);
-        }
-    }
-    Err(io::Error::new(io::ErrorKind::NotFound, "the archive holds no cozy"))
-}
-
 /// Writes the archive's `cozy` beside `binary` (a file there can run, and the swap stays on one disk).
-fn unpack(archive: &[u8], binary: &Path) -> io::Result<tempfile::TempPath> {
+fn unpack(name: &str, archive: &[u8], binary: &Path) -> io::Result<tempfile::TempPath> {
     let mut file = tempfile::Builder::new()
         .prefix(".cozy-update-")
         .suffix(std::env::consts::EXE_SUFFIX)
         .tempfile_in(binary.parent().unwrap_or(Path::new(".")))?;
-    extract(archive, &mut file)?;
+    extract(name, archive, &mut file)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -386,17 +368,22 @@ fn unpack(archive: &[u8], binary: &Path) -> io::Result<tempfile::TempPath> {
     Ok(file.into_temp_path())
 }
 
-/// dist's `.tar.gz`: one top directory holding `cozy`.
-#[cfg(unix)]
-fn extract(archive: &[u8], out: &mut impl io::Write) -> io::Result<u64> {
-    untar(archive, out)
-}
-
-/// dist's `.zip`: `cozy.exe` at its root.
-#[cfg(windows)]
-fn extract(archive: &[u8], out: &mut impl io::Write) -> io::Result<u64> {
-    let mut zip = zip::ZipArchive::new(io::Cursor::new(archive))?;
-    io::copy(&mut zip.by_name("cozy.exe")?, out)
+/// The `cozy` in dist's archive `name`, for this computer or another: a `.zip` holds `cozy.exe` at
+/// its root, a `.tar.gz` one top directory holding `cozy`.
+fn extract(name: &str, archive: &[u8], out: &mut impl io::Write) -> io::Result<u64> {
+    if name.ends_with(".zip") {
+        let mut zip = zip::ZipArchive::new(io::Cursor::new(archive))?;
+        let mut cozy = zip.by_name("cozy.exe")?;
+        return io::copy(&mut cozy, out);
+    }
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.file_name() == Some("cozy".as_ref()) {
+            return io::copy(&mut entry, out);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "the archive holds no cozy"))
 }
 
 async fn get(http: &reqwest::Client, url: &str) -> Result<reqwest::Response, Error> {
