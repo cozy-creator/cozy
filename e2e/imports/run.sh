@@ -44,7 +44,12 @@ import_release() {
 install() {
   cozy --json package install "$2" --on local -y > "$OUT/install-$1.ndjson" 2> "$OUT/install-$1.err" && return 0
   local msg want have
-  msg=$(grep -ho '"message":"[^"]*"' "$OUT/install-$1.ndjson" "$OUT/install-$1.err" | head -1)
+  msg=$(grep -ho '"message": *"[^"]*"' "$OUT/install-$1.ndjson" "$OUT/install-$1.err" | head -1)
+  # A checkout whose dependencies are Hub-hosted packages needs a signed-in computer for the Hub's index;
+  # these runners are anonymous (the signed-in release gate covers it).
+  if grep -q '"not_logged_in"' "$OUT/install-$1.ndjson" "$OUT/install-$1.err"; then
+    echo "::notice::$1: skipped, its dependencies come from the Hub's index and this runner is not signed in"; return 1
+  fi
   if grep -q runtime_floor_unmet "$OUT/install-$1.ndjson" "$OUT/install-$1.err"; then
     # "… this machine runs Runtime A and TensorFS B: update it first (… --runtime C --tensorfs D)"
     have=$(sed -n 's/.*runs Runtime \([0-9.]*\) and TensorFS \([0-9.]*\).*/\1 \2/p' <<< "$msg")
@@ -54,7 +59,7 @@ install() {
       echo "$1: skipped, needs a newer set (Runtime/TensorFS $want) than the candidates ($have)"; return 1
     fi
   fi
-  check "$1: cozy package install $2 failed: $(grep -o '"message":"[^"]*"' "$OUT/install-$1.ndjson" | head -1)$(tail -c 300 "$OUT/install-$1.err")"
+  check "$1: cozy package install $2 failed: $msg$(tail -c 300 "$OUT/install-$1.err")"
   return 1
 }
 
