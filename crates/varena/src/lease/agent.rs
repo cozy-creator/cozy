@@ -36,14 +36,21 @@ pub struct Lease {
     pub phys: Physical,
     /// Its bytes are its region's already (retained by the manager): no fill.
     pub adopted: bool,
+    /// A derived entry kept for the ask's fill key (on its first lease): the bytes refill from
+    /// it, with no transform.
+    pub entry: Option<std::fs::File>,
 }
 
 /// What runs on the reader thread once an ask is answered.
 pub type Done = Box<dyn FnOnce(Result<Vec<Lease>>) + Send>;
 
+/// What runs on the reader thread once a derive is answered: the entry to write, or none kept.
+pub type Deriving = Box<dyn FnOnce(Option<std::fs::File>) + Send>;
+
 struct Asking {
     bytes: u64,
     got: Vec<Lease>,
+    entry: Option<std::fs::File>,
     done: Done,
 }
 
@@ -53,6 +60,8 @@ struct Pending {
     asks: HashMap<u64, Asking>,
     /// Asks a failed import ended: their later chunks are refused unimported.
     dead: HashSet<u64>,
+    /// Derives by key, oldest first.
+    derives: HashMap<String, Vec<Deriving>>,
     closed: bool,
 }
 
@@ -105,16 +114,17 @@ impl Agent {
                 if let Err(error) = reader.read() {
                     tracing::warn!("lease: the manager's connection failed: {error}");
                 }
-                // Every ask still out fails: the manager is gone.
-                let asks: Vec<Asking> = {
+                // Every ask still out fails, every derive keeps nothing: the manager is gone.
+                let (asks, derives): (Vec<Asking>, Vec<Deriving>) = {
                     let mut p = reader.pending.lock();
                     p.closed = true;
-                    p.asks.drain().map(|(_, a)| a).collect()
+                    (p.asks.drain().map(|(_, a)| a).collect(), p.derives.drain().flat_map(|(_, d)| d).collect())
                 };
                 for a in asks {
                     reader.give_back(a.got);
                     (a.done)(Err(Error::Closed("the lease manager".into())));
                 }
+                derives.into_iter().for_each(|d| d(None));
             })
             .map_err(|e| Error::io("spawn lease-agent", e))?;
         Ok(Attach::Leased(agent))
@@ -139,6 +149,18 @@ impl Agent {
                     Some(wake) => wake(region, swap),
                     None => tracing::warn!("lease: region {region}'s reclaim reached an agent with no region holder"),
                 },
+                ToAgent::Entry { id: 0, key } => {
+                    let deriving = self.pending.lock().derives.get_mut(&key).and_then(|d| (!d.is_empty()).then(|| d.remove(0)));
+                    match deriving {
+                        Some(done) => done(handle.map(std::fs::File::from)),
+                        None => tracing::warn!("lease: an entry for {key} nobody derives"),
+                    }
+                }
+                ToAgent::Entry { id, .. } => {
+                    if let Some(a) = self.pending.lock().asks.get_mut(&id) {
+                        a.entry = handle.map(std::fs::File::from);
+                    }
+                }
                 ToAgent::Welcome { .. } => {}
             }
         }
@@ -164,7 +186,8 @@ impl Agent {
                 let done = {
                     let mut p = self.pending.lock();
                     let Some(a) = p.asks.get_mut(&id) else { return Ok(()) };
-                    a.got.push(Lease { ticket, phys, adopted });
+                    let entry = a.entry.take();
+                    a.got.push(Lease { ticket, phys, adopted, entry });
                     if last { p.asks.remove(&id) } else { None }
                 };
                 if let Some(a) = done {
@@ -203,10 +226,11 @@ impl Agent {
         let _ = self.end.send(&ToManager::Answered, None);
     }
 
-    /// Asks for `bytes` of weights for `region`; `done` runs on the reader thread with the
-    /// imported leases (the holder maps each and answers it) or the refusal (Exhausted), once
-    /// the manager answers: after room is made, which may take other processes' revokes.
-    pub fn ask(&self, bytes: u64, kind: Kind, region: Option<Region>, done: Done) -> Result<()> {
+    /// Asks for `bytes` of weights for `region` (`fill`: its declared fill key); `done` runs on
+    /// the reader thread with the imported leases (the holder maps each and answers it) or the
+    /// refusal (Exhausted), once the manager answers: after room is made, which may take other
+    /// processes' revokes.
+    pub fn ask(&self, bytes: u64, kind: Kind, region: Option<Region>, fill: Option<String>, done: Done) -> Result<()> {
         let id = {
             let mut p = self.pending.lock();
             if p.closed {
@@ -216,10 +240,31 @@ impl Agent {
             }
             p.next += 1;
             let id = p.next;
-            p.asks.insert(id, Asking { bytes, got: vec![], done });
+            p.asks.insert(id, Asking { bytes, got: vec![], entry: None, done });
             id
         };
-        self.end.send(&ToManager::Ask { id, bytes, kind, region }, None)
+        self.end.send(&ToManager::Ask { id, bytes, kind, region, fill }, None)
+    }
+
+    /// Asks the host for a disk entry to write `key`'s derived bytes into; `done` runs on the
+    /// reader thread with it, or with none (none kept, or a manager that keeps none). Once it
+    /// is written whole, [`Agent::derived`].
+    pub fn derive(&self, key: String, bytes: u64, done: Deriving) -> Result<()> {
+        {
+            let mut p = self.pending.lock();
+            if p.closed {
+                drop(p);
+                done(None);
+                return Ok(());
+            }
+            p.derives.entry(key.clone()).or_default().push(done);
+        }
+        self.end.send(&ToManager::Derive { key, bytes }, None)
+    }
+
+    /// `key`'s entry is written whole: grants refill from it from now on.
+    pub fn derived(&self, key: String) -> Result<()> {
+        self.end.send(&ToManager::Derived { key }, None)
     }
 
     /// [`Agent::ask`], waiting for the answer here: never on a thread that answers revokes.
@@ -230,6 +275,7 @@ impl Agent {
             bytes,
             kind,
             region,
+            None,
             Box::new(move |r| {
                 *set.0.lock() = Some(r);
                 set.1.notify_all();
