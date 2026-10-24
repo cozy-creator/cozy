@@ -1,4 +1,4 @@
-# CLI behaviour, tracker cl-650 (`gate.sh --before cells/cl650.sh`): on the fresh pod, before the candidate goes on.
+# Suite tensord, tracker cl-650: on the fresh pod, before the candidate goes on (gate.sh sources a suite's before.sh).
 # Uses gate.sh's $CLI (cozy 0.11.17 or later), $M, $OUT, $TDF and $BIN (the candidate cozy), expect, log and the scenario.
 #  (b) cozy #1925: $CLI updates a real 0.11.15 TensorD. The 0.11.15 CLI moves the pod there first, in one call (its
 #      --tensord, --runtime-wheel, --tensorfs-wheel, the pod's own pair); then `$CLI machine update --tensord <candidate>`
@@ -24,6 +24,7 @@ OLD=$C/cozy-x86_64-unknown-linux-gnu/cozy
 read -r v rt tfs <<< "$(pair)"
 log "cl650: fresh $M runs cozy $v, Runtime $rt, TensorFS $tfs"
 
+if [ -z "$TDF" ]; then expect cl650-b-update-from-0.11.15 FAIL "no --tensord candidate to update a 0.11.15 TensorD to"; else
 "$OLD" machine update "$M" --tensord "$OLD" --runtime-wheel "$(pypi cozy-runtime "$rt")" \
   --tensorfs-wheel "$(pypi tensorfs "$tfs")" -y > "$C/old.log" 2>&1
 read -r v rt tfs <<< "$(pair)"
@@ -36,6 +37,7 @@ elif grep -q update_unapplied "$C/b.log"; then
   expect "cl650-b-update-from-$v" FAIL "update_unapplied, loudly as designed, but $M runs ${v2:-?}, not $BIN"
 else
   expect "cl650-b-update-from-$v" FAIL "exit $code, $M runs ${v2:-?}: $(tail -c 300 "$C/b.log")"
+fi
 fi
 
 "$CLI" run "$FLOORED" --on "$M" --json prompt="$SCENE, a floor check" seed:=$((R + 20)) > "$C/a-refused.ndjson" 2> "$C/a-refused.err"
