@@ -21,6 +21,7 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
         service_ready: Option<u64>,
         /// What a machine `cozy machine enable` started (0.11.16 and older) was given: its update
         /// execs this binary in its place with its own arguments. It means this computer's machine.
+        /// Upgrade safety only: remove once no machine runs 0.11.16 or older (tracker cl-646).
         #[arg(long = "persistent", hide = true)]
         _persistent: bool,
     }
