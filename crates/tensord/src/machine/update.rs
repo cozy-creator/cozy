@@ -926,19 +926,22 @@ impl Updates {
 
     /// Stages and verifies the pair in `candidate`: what the update's `to` names.
     fn prepare(&self, request: &Request, candidate: &Path) -> io::Result<Pair> {
-        let runtime = match &request.runtime {
-            Some(choice) => self.resolve("cozy_runtime", choice)?,
-            None => existing_wheel(&self.paths.sdk(), "cozy_runtime")?,
+        let tensorfs = request.tensorfs.as_ref().map(|choice| self.resolve("tensorfs", choice)).transpose()?;
+        let runtime = match (&request.runtime, existing_wheel(&self.paths.sdk(), "cozy_runtime"), &tensorfs) {
+            (Some(choice), ..) => self.resolve("cozy_runtime", choice)?,
+            (None, Ok(installed), _) => installed,
+            (None, Err(_), Some(tensorfs)) => self.runtime_for(tensorfs)?,
+            (None, Err(error), None) => return Err(error),
         };
         let runtime = stage(candidate, &runtime, "cozy_runtime")?;
         if let Some(file) = request.runtime.as_ref().filter(|c| !c.file.is_empty()) {
             fs::write(candidate.join(RUNTIME_BUILD), build(&runtime, &file.sha256)?)?;
         }
-        match &request.tensorfs {
+        match tensorfs {
             None if request.runtime.is_some() => self.pair(candidate, &runtime)?,
-            choice => {
-                let tensorfs = match choice {
-                    Some(choice) => self.resolve("tensorfs", choice)?,
+            tensorfs => {
+                let tensorfs = match tensorfs {
+                    Some(tensorfs) => tensorfs,
                     None => existing_wheel(&self.paths.sdk(), "tensorfs")?,
                 };
                 let tensorfs = stage(candidate, &tensorfs, "tensorfs")?;
@@ -977,13 +980,36 @@ impl Updates {
         stage(candidate, &self.resolve("tensorfs", &choice)?, "tensorfs").map(drop)
     }
 
+    /// A TensorFS named alone on a machine with no Runtime takes the newest Runtime uv resolves
+    /// for it over the index, fetched from PyPI held to its digest. One that resolves none names
+    /// `--runtime`.
+    fn runtime_for(&self, tensorfs: &Path) -> io::Result<PathBuf> {
+        let name = tensorfs.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let unresolved = |why: String| {
+            io::Error::other(Coded {
+                code: "runtime_unresolved",
+                message: format!("no Runtime is installed and {name} resolves none over the index ({why}); name one with --runtime <version>"),
+            })
+        };
+        let resolved = self.compile_input(&format!("cozy-runtime\n{}\n", tensorfs.display()))?.map_err(unresolved)?;
+        let version = resolved
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("cozy-runtime=="))
+            .ok_or_else(|| unresolved("it resolves none".into()))?;
+        self.resolve("cozy_runtime", &Choice { version: version.into(), ..Default::default() })
+    }
+
     /// Resolves `wheels` as a package environment installs them (uv, over the index): the pinned
     /// requirements, or uv's reason they do not resolve. The machine never selects a pair its
     /// environments would set aside for a release's locked Runtime.
     fn compile(&self, wheels: &[PathBuf]) -> io::Result<Result<String, String>> {
-        let input: String = wheels.iter().map(|p| p.display().to_string() + "\n").collect();
+        self.compile_input(&wheels.iter().map(|p| p.display().to_string() + "\n").collect::<String>())
+    }
+
+    /// [`compile_sdk`] of requirement lines for the executors' Python.
+    fn compile_input(&self, input: &str) -> io::Result<Result<String, String>> {
         let stop = self.stop.lock().unwrap().clone();
-        compile_sdk(&self.paths.uv, &self.python, &input, &stop, false)
+        compile_sdk(&self.paths.uv, &self.python, input, &stop, false)
     }
 
     /// A staged {file, sha256}, or a release {version} the machine fetches: a wheel from PyPI,
