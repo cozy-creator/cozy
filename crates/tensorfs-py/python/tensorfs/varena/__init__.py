@@ -30,6 +30,7 @@ from .._ext.varena import (
     VarenaError,
     Window,
     Yielded,
+    document,
     host_limit,
     pins_held,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "VarenaError",
     "Window",
     "Yielded",
+    "document",
     "host_limit",
     "pins_held",
 ]

@@ -956,6 +956,14 @@ fn torch_stats(memory: &Memory) -> TorchFigures {
 // ---------------------------------------------------------------- the module
 
 /// `tensorfs._ext.varena`, importable as such (the package `tensorfs.varena` re-exports it).
+/// A request's record as plain dicts, lists and scalars, written by serde from the record itself
+/// (one definition: what a Runtime relays in its reply and `cozy run show` reads back).
+#[pyfunction]
+fn document<'py>(py: Python<'py>, stats: PyRef<'py, varena::Stats>) -> PyResult<Bound<'py, PyAny>> {
+    let value = serde_json::to_value(&*stats).map_err(|e| PyException::new_err(e.to_string()))?;
+    protocol::executor::to_python(py, &value)
+}
+
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let m = PyModule::new(py, "varena")?;
@@ -987,6 +995,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<varena::arena::Outlived>()?;
     m.add_class::<varena::arena::Ended>()?;
     m.add_function(wrap_pyfunction!(pins_held, &m)?)?;
+    m.add_function(wrap_pyfunction!(document, &m)?)?;
     m.add_function(wrap_pyfunction!(host_limit, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;

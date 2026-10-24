@@ -419,5 +419,9 @@ def host_limit() -> int | None:
     """The most this process's memory can reach: physical memory, or less under a cgroup limit;
     None when unreadable."""
 
+def document(stats: Stats) -> dict[str, object]:
+    """A request's record as plain dicts, lists and scalars, written by serde from the record
+    itself: what a Runtime relays in its reply."""
+
 def pins_held() -> int:
     """Pins the binding holds now: Python's pin objects and the tensors that keep one."""
