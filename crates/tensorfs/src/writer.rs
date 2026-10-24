@@ -508,6 +508,12 @@ impl Writer {
     /// with the repo files; or into the folder, last. The journal and spool go; the writer is
     /// spent.
     pub fn commit(&mut self) -> Result<ObjectRef> {
+        self.commit_with(&|_, _| {})
+    }
+
+    /// [`Writer::commit`], telling `progress(done, total)` the spooled bytes packed into chunks so
+    /// far: packing a model of many small tensors copies most of its bytes.
+    pub fn commit_with(&mut self, progress: &dyn Fn(u64, u64)) -> Result<ObjectRef> {
         self.live()?;
         let base = self.base.take();
         let built = self.assemble(base.as_ref());
@@ -542,6 +548,9 @@ impl Writer {
                 At::Spool(_) => {}
             }
         }
+        let total: u64 = packs.values().flatten().map(|i| list[*i].2.length).sum();
+        let mut packed = 0;
+        progress(packed, total);
         for (chunk, mut members) in packs {
             members.sort_by_key(|i| plan.places[*i].offset);
             let mut admit = self.dest.admit(&self.dir, self.hold.as_ref())?;
@@ -560,10 +569,12 @@ impl Writer {
                 let what = format!("{}/{}", list[i].0.component, list[i].0.key);
                 pour(&mut spool, &mut admit, stored.length, &mut self.buffer, &what)?;
                 end = place.offset + stored.length;
+                packed += stored.length;
             }
             let object = admit.finish()?;
             debug_assert_eq!(object.length, plan.chunks[chunk as usize]);
             chunks[chunk as usize] = Some(object);
+            progress(packed, total);
         }
 
         let mut places = plan.places.iter();

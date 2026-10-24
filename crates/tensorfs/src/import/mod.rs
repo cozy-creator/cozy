@@ -64,8 +64,9 @@ pub trait Sink {
         encoding: Option<&Encoding>,
         parts: Vec<Part>,
     ) -> Result<()>;
-    /// Commits with the header's loading metadata ([`Imported::metadata`]).
-    fn commit(&mut self, metadata: Metadata) -> Result<()>;
+    /// Commits with the header's loading metadata ([`Imported::metadata`]), telling `progress`
+    /// the bytes it lays out ([`Writer::commit_with`]).
+    fn commit(&mut self, metadata: Metadata, progress: &dyn Fn(u64, u64)) -> Result<()>;
 }
 
 /// A convert writes through the writer; tensors an interrupted convert journaled are skipped.
@@ -116,11 +117,11 @@ impl Sink for Writer {
         (self.get(component).put(key, dtype, shape, data)).map_err(Error::refusal)
     }
 
-    fn commit(&mut self, metadata: Metadata) -> Result<()> {
+    fn commit(&mut self, metadata: Metadata, progress: &dyn Fn(u64, u64)) -> Result<()> {
         for (key, value) in metadata {
             self.set_metadata(&key, value);
         }
-        Writer::commit(self).map(drop).map_err(Error::refusal)
+        Writer::commit_with(self, progress).map(drop).map_err(Error::refusal)
     }
 }
 
@@ -151,8 +152,8 @@ pub fn convert_folder(req: &Request, dir: &Path) -> Result<ObjectRef> {
             self.writer()
                 .put(component, key, dtype, shape, encoding, parts)
         }
-        fn commit(&mut self, metadata: Metadata) -> Result<()> {
-            Sink::commit(self.writer(), metadata)
+        fn commit(&mut self, metadata: Metadata, progress: &dyn Fn(u64, u64)) -> Result<()> {
+            Sink::commit(self.writer(), metadata, progress)
         }
     }
     let mut folder = Folder(dir, None);
@@ -880,7 +881,7 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     // dropped future cannot promise to undo the writer's atomic finalization.
     progress("imported", total, total);
     stopped(req)?;
-    sink.commit(imported.metadata())?;
+    sink.commit(imported.metadata(), &|done, total| progress("committing", done, total))?;
     drop(opened);
     match std::fs::remove_dir_all(&area) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
