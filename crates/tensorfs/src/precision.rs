@@ -1,29 +1,153 @@
 //! The lane rule (xs-042, design `precision-tiers.md` §2.2, §2.7, §2.8; spec §7 "Selection"): a
 //! variant from what its header holds, its GPUs' native formats, the request's bits and a
-//! slot's declared tolerances. Nothing is keyed by a card's name or a file's.
-use std::collections::BTreeMap;
+//! slot's declared tolerances. Nothing is keyed by a card's name or a file's. The rule's table (kinds,
+//! families, GPU features, lane orders) is data, `spec/selection.json`, which the Hub vendors byte for
+//! byte and evaluates the same way; this file is the evaluator.
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::LazyLock,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::format::{Body, Dtype, Header};
 
-/// The lanes the rule picks by name; any other is a release's only lane, served silently.
-const VOCABULARY: [&str; 7] = ["bf16", "fp16", "int8", "fp8", "nvfp4", "w4a8", "svdq-nvfp4"];
+/// `spec/selection.json`. Unknown fields are ignored.
+#[derive(Deserialize)]
+struct Table {
+    rule: u32,
+    features: BTreeMap<String, Feature>,
+    kinds: Vec<Kind>,
+    families: BTreeMap<String, Family>,
+    order: Vec<Order>,
+    plain: Vec<Order>,
+    schemes: Vec<String>,
+}
 
-/// The GPUs a function runs on as the rule reads them (design §2.1, §2.7): the native formats
-/// every one runs (`mma`: cc 8.0 or later, where `nvfp4` serves at least weight-only; 10.3 has
-/// no int8; `bf16`: unless a GPU is known below cc 8.0; `fp4`: FP4 tensor cores, cc 10.0 or later)
-/// and how a warning names them (`sm90`, `sm86+sm89`). An Apple GPU's row is its Metal family
-/// (`apple9`): it runs bf16 and fp16 and no encoded format until Metal kernels exist.
+/// A feature every GPU of a set has: its capability starts with `prefix`, or is from `min` on and
+/// not at an `except`.
+#[derive(Deserialize)]
+struct Feature {
+    #[serde(default)]
+    prefix: String,
+    #[serde(default)]
+    min: String,
+    #[serde(default)]
+    except: Vec<String>,
+    /// Whether a GPU whose capability is not a number has it.
+    #[serde(default)]
+    unread: bool,
+    /// Whether no GPU (the CPU) has it.
+    #[serde(default)]
+    cpu: bool,
+}
+
+/// A kind (`kind` exactly, or any starting with `prefix`) and its family.
+#[derive(Deserialize)]
+struct Kind {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    prefix: String,
+    family: String,
+}
+
+#[derive(Default, Deserialize)]
+struct Family {
+    bits: u32,
+    /// The feature every GPU needs to run it; empty: any.
+    #[serde(default)]
+    needs: String,
+    /// The width its matmuls run at: the first row whose feature the GPUs have, else 16.
+    #[serde(default)]
+    compute: Vec<Compute>,
+    /// The lane it ranks as; `after`: just after the order.
+    #[serde(default)]
+    rank: String,
+}
+
+#[derive(Deserialize)]
+struct Compute {
+    #[serde(default)]
+    when: String,
+    width: u32,
+}
+
+/// A lane order: the first row whose bits, slot and feature match.
+#[derive(Deserialize)]
+struct Order {
+    #[serde(default)]
+    bits: Option<u32>,
+    /// Only a decode slot's.
+    #[serde(default)]
+    decode: bool,
+    #[serde(default)]
+    when: String,
+    lanes: Vec<String>,
+}
+
+static TABLE: LazyLock<Table> = LazyLock::new(|| {
+    let table: Table = serde_json::from_str(include_str!("../spec/selection.json")).expect("spec/selection.json is the rule's table");
+    debug_assert!(
+        {
+            let mut implemented: Vec<&str> = crate::format::SCHEMES.iter().map(|scheme| scheme.name).collect();
+            implemented.sort_unstable();
+            implemented == table.schemes.iter().map(String::as_str).collect::<Vec<_>>()
+        },
+        "spec/selection.json's schemes are not the ones this reader implements"
+    );
+    table
+});
+
+/// A compute capability `"major.minor"` as one number (`"8.9"`: 89); `None` when it is not one.
+fn capability(cc: &str) -> Option<u32> {
+    let (major, minor) = cc.split_once('.')?;
+    if major.is_empty() || minor.is_empty() || major.len() > 4 || minor.len() > 4 || !major.bytes().chain(minor.bytes()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(major.parse::<u32>().ok()? * 10 + minor.parse::<u32>().ok()?)
+}
+
+impl Feature {
+    fn held(&self, ccs: &[&str]) -> bool {
+        let min = capability(&self.min).unwrap_or(u32::MAX);
+        let except: Vec<u32> = self.except.iter().filter_map(|cc| capability(cc)).collect();
+        let one = |cc: &&str| match self.prefix.is_empty() {
+            false => cc.starts_with(&self.prefix),
+            true => capability(cc).map_or(self.unread, |n| n >= min && !except.contains(&n)),
+        };
+        if ccs.is_empty() { self.cpu } else { ccs.iter().all(one) }
+    }
+
+    /// How a refusal names the GPUs that have it: `sm80+ except sm103`.
+    fn named(&self) -> String {
+        let sm = |cc: &String| format!("sm{}", cc.replace('.', ""));
+        match self.except.is_empty() {
+            true => format!("{}+", sm(&self.min)),
+            false => format!("{}+ except {}", sm(&self.min), self.except.iter().map(sm).collect::<Vec<_>>().join(", ")),
+        }
+    }
+}
+
+/// The table's row for a family (the empty row for none).
+fn row(family: &str) -> &'static Family {
+    static NONE: LazyLock<Family> = LazyLock::new(Family::default);
+    TABLE.families.get(family).unwrap_or(&NONE)
+}
+
+/// Whether the rule picks `lane` by name; any other is a release's only lane, served silently.
+fn named_lane(lane: &str) -> bool {
+    TABLE.order.iter().chain(&TABLE.plain).any(|order| order.lanes.iter().any(|l| l == lane))
+}
+
+/// The GPUs a function runs on as the rule reads them (design §2.1, §2.7): the table's features
+/// every one has (`mma`, `int8`, `fp8`, `fp4`, `bf16`, `apple`) and how a warning names them (`sm90`,
+/// `sm86+sm89`). An Apple GPU's capability is its Metal family (`apple9`): it runs bf16 and fp16
+/// and no encoded format until Metal kernels exist.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gpus {
-    pub mma: bool,
-    pub bf16: bool,
-    pub int8: bool,
-    pub fp8: bool,
-    pub fp4: bool,
-    pub apple: bool,
+    pub features: BTreeSet<String>,
     pub name: String,
     pub capabilities: Vec<String>,
 }
@@ -36,14 +160,8 @@ impl Default for Gpus {
 }
 
 impl Gpus {
-    /// From each GPU's compute capability (`"9.0"`); one below 8.0 or unread runs none.
+    /// From each GPU's compute capability (`"9.0"`, `"apple9"`).
     pub fn of(ccs: &[&str]) -> Self {
-        let number = |cc: &str| cc.split_once('.').and_then(|(major, minor)| {
-            if major.is_empty() || minor.is_empty() || major.len() > 4 || minor.len() > 4 || !major.bytes().chain(minor.bytes()).all(|c| c.is_ascii_digit()) { return None; }
-            Some(major.parse::<u32>().ok()? * 10 + minor.parse::<u32>().ok()?)
-        });
-        let all = |runs: fn(u32) -> bool| !ccs.is_empty() && ccs.iter().all(|cc| runs(number(cc).unwrap_or(0)));
-        let apple = !ccs.is_empty() && ccs.iter().all(|cc| cc.starts_with("apple"));
         let named = |cc: &&str| match cc.starts_with("apple") {
             true => cc.to_string(),
             false => format!("sm{}", cc.replace('.', "")),
@@ -53,16 +171,21 @@ impl Gpus {
         names.dedup();
         let name = if names.is_empty() { "no GPU".into() } else { names.join("+") };
         Self {
-            mma: all(|cc| cc >= 80),
-            // fp16 first only where a GPU is known to run no bf16: an unread cc, or no GPU, runs bf16.
-            bf16: !ccs.iter().any(|cc| matches!(number(cc), Some(n) if n < 80)),
-            int8: all(|cc| cc >= 80 && cc != 103),
-            fp8: all(|cc| cc >= 89),
-            fp4: all(|cc| cc >= 100),
-            apple,
+            features: TABLE.features.iter().filter(|(_, feature)| feature.held(ccs)).map(|(name, _)| name.clone()).collect(),
             name,
             capabilities: ccs.iter().map(|cc| cc.to_string()).collect(),
         }
+    }
+
+    /// Whether every one has `feature` (the empty feature: always).
+    pub fn has(&self, feature: &str) -> bool {
+        feature.is_empty() || self.features.contains(feature)
+    }
+
+    /// The width a family's matmuls run at here (the table's `compute`): 4 where FP4 tensor cores
+    /// run it, 8 for int8, fp8 and w4a8, else 16 (16-bit, and 4-bit weight-only).
+    pub fn compute(&self, family: &str) -> u32 {
+        row(family).compute.iter().find(|c| self.has(&c.when)).map_or(16, |c| c.width)
     }
 }
 
@@ -99,31 +222,22 @@ impl Slot {
         }
     }
 
-    /// The lanes to ask for at `bits`, in order (§2.2): the width's native formats (4 bits:
-    /// `svdq-nvfp4`, `nvfp4`, `w4a8` where FP4 runs natively (xs-066); `w4a8`, weight-only `nvfp4`,
-    /// `svdq-nvfp4` elsewhere (xs-062); `nvfp4`, `svdq-nvfp4`, `w4a8` for a decode slot's own 4
-    /// bits, whose kernel is weight-only; then the 8-bit order), then 16 bits: `bf16`, and `fp16`
-    /// first only where the GPUs run no bf16 (owner, 2026-10-16). Encoded lanes go when the slot
-    /// declines them.
+    /// The lanes to ask for at `bits`, in order (§2.2, the table's `order`): the width's encoded
+    /// lanes every GPU runs, unless the slot declines encoded lanes, then the table's `plain` order
+    /// (`fp16` first only where the GPUs run no bf16, owner 2026-10-16).
     pub fn lanes(&self, bits: u32, gpus: &Gpus) -> Vec<&'static str> {
-        let eight = [("int8", gpus.int8), ("fp8", gpus.fp8)];
-        let (svdq, nvfp4, w4a8) = (("svdq-nvfp4", gpus.mma), ("nvfp4", gpus.mma), ("w4a8", gpus.int8));
-        let native: Vec<_> = match bits {
-            16 => vec![],
-            4 if self.decode => [nvfp4, svdq, w4a8].into_iter().chain(eight).collect(),
-            4 if gpus.fp4 => [svdq, nvfp4, w4a8].into_iter().chain(eight).collect(),
-            4 => [w4a8, nvfp4, svdq].into_iter().chain(eight).collect(),
-            _ => eight.to_vec(),
+        let first = |orders: &'static [Order], bits: Option<u32>| {
+            orders.iter().find(|o| o.bits == bits && (!o.decode || self.decode) && gpus.has(&o.when)).map_or(&[][..], |o| &o.lanes[..])
         };
-        let native = native.into_iter().filter(|(_, runs)| *runs && self.encoded).map(|(lane, _)| lane);
-        native.chain(if gpus.bf16 { ["bf16", "fp16"] } else { ["fp16", "bf16"] }).collect()
+        let encoded = first(&TABLE.order, Some(bits)).iter().filter(|lane| self.encoded && gpus.has(&row(lane).needs));
+        encoded.chain(first(&TABLE.plain, None)).map(String::as_str).collect()
     }
 
     /// The run's warnings for `model` served in `served` (§2.8): one when it declined encoded
     /// lanes the GPUs run, one naming every lane asked before the one served, and fp16 served
     /// because the GPUs run no bf16 says so.
     pub fn warnings(&self, bits: u32, gpus: &Gpus, model: &str, served: &str) -> Vec<String> {
-        if self.raw || !VOCABULARY.contains(&served) {
+        if self.raw || !named_lane(served) {
             return vec![];
         }
         let declined = !self.encoded && Self { encoded: true, ..*self }.lanes(bits, gpus).len() > 2;
@@ -134,7 +248,7 @@ impl Slot {
             false => format!("{} or {last}", missing.join(", ")),
         });
         let missing = missing.map(|lanes| format!("precision {bits}: {model} has no {lanes} lane for {}; served {served}", gpus.name));
-        let no_bf16 = (served == "fp16" && !gpus.bf16).then(|| format!("precision {bits}: {} runs no bf16; served fp16", gpus.name));
+        let no_bf16 = (served == "fp16" && !gpus.has("bf16")).then(|| format!("precision {bits}: {} runs no bf16; served fp16", gpus.name));
         declined.into_iter().chain(missing).chain(no_bf16).collect()
     }
 }
@@ -146,7 +260,7 @@ impl Slot {
     pub fn constraints(&self, gpus: &Gpus, asked: u32) -> Constraints {
         let bits = (!self.raw && matches!(asked, 4 | 8 | 16)).then_some(asked);
         // An Apple GPU's only width is 16 bits: its lanes are named so.
-        let width = if gpus.apple { 16 } else { self.bits(asked) };
+        let width = if gpus.has("apple") { 16 } else { self.bits(asked) };
         Constraints {
             gpus: gpus.capabilities.clone(),
             bits,
@@ -170,11 +284,6 @@ pub struct Profile {
 
 impl Profile {
     pub fn of(header: &Header) -> Self {
-        Self::read(header, family)
-    }
-
-    /// `of` by a lane table: this rule's, or an older rule's (tests).
-    fn read(header: &Header, family: fn(&str) -> (&'static str, u32)) -> Self {
         let mut held: BTreeMap<String, u64> = BTreeMap::new();
         for (_, tensor) in header.tensors() {
             let kind = match &tensor.body {
@@ -196,44 +305,26 @@ impl Profile {
     }
 }
 
-/// A kind's family and width (spec §7's table); `("", 0)` outside it.
+/// A kind's family and width (the table's `kinds`); `("", 0)` outside it.
 fn family(kind: &str) -> (&'static str, u32) {
-    match kind {
-        "BF16" => ("bf16", 16),
-        "F16" => ("fp16", 16),
-        "F32" => ("f32", 16),
-        "nvfp4" => ("nvfp4", 4),
-        "mxfp4" => ("mxfp4", 4),
-        k if k.starts_with("int8.") => ("int8", 8),
-        k if k.starts_with("fp8.") => ("fp8", 8),
-        k if k.starts_with("int4.") => ("int4", 4),
-        "w4a8.convrot" => ("w4a8", 4),
-        "svdq.nvfp4" => ("svdq-nvfp4", 4),
-        _ => ("", 0),
-    }
+    let found = TABLE.kinds.iter().find(|k| !k.kind.is_empty() && k.kind == kind || !k.prefix.is_empty() && kind.starts_with(&k.prefix));
+    found.map_or(("", 0), |k| (k.family.as_str(), row(&k.family).bits))
 }
 
-/// The GPUs a scheme of the table needs (spec §7), for a refusal to name.
-fn needs(kind: &str) -> &'static str {
-    match family(kind).0 {
-        _ if !crate::format::SCHEMES.iter().any(|scheme| scheme.name == kind) => "a GPU reader",
-        "int8" | "w4a8" => "sm80+ except sm103",
-        "fp8" => "sm89+",
-        "nvfp4" | "mxfp4" | "int4" | "svdq-nvfp4" => "sm80+",
-        _ => "a GPU reader",
-    }
+/// The GPUs a scheme of the table needs (its family's feature), for a refusal to name.
+fn needs(kind: &str) -> String {
+    let implemented = TABLE.schemes.iter().any(|scheme| scheme == kind);
+    let feature = implemented.then(|| TABLE.features.get(&row(family(kind).0).needs)).flatten();
+    feature.map_or_else(|| "a GPU reader".into(), Feature::named)
 }
 
-/// Whether every GPU runs `kind`: a §5 dtype always; an encoding of the table where its family
-/// does; another scheme this reader implements always (it decodes anywhere); an unknown one never.
+/// Whether every GPU runs `kind`: a §5 dtype always; a scheme this reader implements where its
+/// family's feature holds (one outside the families decodes anywhere); an unknown one never.
 fn runs(kind: &str, gpus: &Gpus) -> bool {
-    if matches!(Dtype::parse(kind), Dtype::Other(_)) && !crate::format::SCHEMES.iter().any(|scheme| scheme.name == kind) { return false; }
-    match family(kind).0 {
-        "int8" | "w4a8" => gpus.int8,
-        "fp8" => gpus.fp8,
-        "nvfp4" | "mxfp4" | "int4" | "svdq-nvfp4" => gpus.mma,
-        _ => true,
+    if matches!(Dtype::parse(kind), Dtype::Other(_)) && !TABLE.schemes.iter().any(|scheme| scheme == kind) {
+        return false;
     }
+    gpus.has(&row(family(kind).0).needs)
 }
 
 /// What a reader or a slot asks of a variant (spec §7): the GPUs it runs on, by compute
@@ -261,7 +352,7 @@ impl Constraints {
             return crate::failure::fail(crate::Kind::Invalid, format!("bits {bits} is not 4, 8 or 16"));
         }
         match self.bits {
-            Some(bits @ (4 | 8)) if self.rule().0.apple => crate::failure::fail(crate::Kind::Invalid, format!(
+            Some(bits @ (4 | 8)) if self.rule().0.has("apple") => crate::failure::fail(crate::Kind::Invalid, format!(
                 "precision {bits}: Apple GPUs run 16-bit weights until Metal kernels exist; run without --lane, or with --lane 16")),
             _ => Ok(()),
         }
@@ -276,16 +367,13 @@ impl Constraints {
         self.check()?;
         let (gpus, slot, bits) = self.rule();
         let order = slot.lanes(bits, &gpus);
-        let place = |p: &Profile| match p.family.as_str() {
-            "f32" => Some(order.len()),
-            "mxfp4" | "int4" => order.iter().position(|lane| *lane == "nvfp4"),
-            family => order.iter().position(|lane| *lane == family),
+        let place = |p: &Profile| match row(&p.family).rank.as_str() {
+            "after" => Some(order.len()),
+            "" => order.iter().position(|lane| *lane == p.family),
+            rank => order.iter().position(|lane| *lane == rank),
         };
-        let native = |p: &Profile| match p.family.as_str() {
-            "nvfp4" | "mxfp4" | "svdq-nvfp4" => gpus.fp4,
-            "int4" => false,
-            _ => true,
-        };
+        // Weight-only: a 4-bit lane whose matmuls run at 16 bits here.
+        let native = |p: &Profile| !(p.bits == 4 && gpus.compute(&p.family) == 16);
         let works = variants.iter().enumerate().filter(|(_, (_, p))| self.refusal(p).is_none());
         let narrower = |p: &Profile| p.bits > 0 && p.bits < bits;
         let ranked = works.map(|(at, (name, p))| ((place(p).unwrap_or(order.len() + 1), narrower(p), !native(p), p.bytes, *name), at));
@@ -338,9 +426,11 @@ impl Constraints {
     }
 }
 
-/// This rule's version. An index answer of another (a Hub whose profiles an older rule derived)
-/// is not taken: the headers are read instead.
-pub const RULE: u32 = 5;
+/// This rule's version (the table's `rule`). An index answer of another (a Hub whose profiles an
+/// older rule derived) is not taken: the headers are read instead.
+pub fn rule() -> u32 {
+    TABLE.rule
+}
 
 /// The Hub's indexed answer, with the same rule as local header selection. Only what selection
 /// reads is decoded: the answer's other members (its release, the variant's profile) can change
