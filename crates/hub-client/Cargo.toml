@@ -26,7 +26,8 @@ openapiv3.workspace = true
 prettyplease.workspace = true
 progenitor.workspace = true
 quote.workspace = true
-serde_yaml.workspace = true
+saphyr.workspace = true
+serde_json.workspace = true
 syn.workspace = true
 
 [lints]
