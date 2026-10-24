@@ -161,9 +161,6 @@ class Memory:
     def graph_region(self, pool: tuple[int, int], sets: Sequence[int] = (), retained: Sequence[int] = ()) -> GraphRegion:
         """A component's graphs on this device, captured into `pool`."""
 
-    def graph_region_blocks(self, pool: tuple[int, int], dependencies: Sequence[tuple[int, Sequence[int]]]) -> GraphRegion:
-        """Pin the graph's exact set/block dependencies once, including common weights and aliases."""
-
     def room(self, step: int | None = None) -> tuple[int, int, int, int, int]:
         """(free, cold, warm, granularity, floor) at plan step `step` (the cursor's when None)."""
 

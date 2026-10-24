@@ -409,13 +409,13 @@ impl Memory {
         let _ = (id, record);
     }
 
-    /// Only the lease slots actually pinned by a graph's declared blocks.
-    pub(crate) fn lease_block_slots(&self, dependencies: &[(SetId, Vec<u32>)]) -> Vec<u32> {
+    /// The lease slots of `sets`' leased pages.
+    pub(crate) fn lease_slots(&self, sets: &[SetId]) -> Vec<u32> {
         #[cfg(unix)]
-        return self.inner.leased.lock().values().filter(|(_, key, _)| dependencies.iter().any(|(set, blocks)| set.0 == key.0 && blocks.contains(&key.1))).map(|(t, ..)| t.slot).collect();
+        return self.inner.leased.lock().values().filter(|(_, key, _)| sets.iter().any(|s| s.0 == key.0)).map(|(t, ..)| t.slot).collect();
         #[cfg(not(unix))]
         {
-            let _ = dependencies;
+            let _ = sets;
             Vec::new()
         }
     }

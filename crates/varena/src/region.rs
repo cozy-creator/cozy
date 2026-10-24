@@ -11,7 +11,7 @@
 //! - [`Memory::room`] is what a cut site sizes from: free, cold and warm bytes, and the streaming floor.
 //! - [`Memory::region_reclaim`] is the manager's Reclaim of one region, whole; [`Memory::region_records`] its view.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, OnceLock, Weak};
@@ -404,7 +404,6 @@ struct Graph {
     memory: Memory,
     sets: Vec<SetId>,
     retained: Vec<SetId>,
-    dependencies: Vec<(SetId, Vec<u32>)>,
     pool: PoolId,
     word: Arc<Word>,
     held: Mutex<Held>,
@@ -413,14 +412,6 @@ struct Graph {
     closed: AtomicBool,
     capture_ns: AtomicU64,
     last_use: AtomicU64,
-}
-
-fn graph_dependencies(dependencies: &[(SetId, Vec<u32>)]) -> Vec<(SetId, Vec<u32>)> {
-    let mut blocks: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
-    for (set, selected) in dependencies {
-        blocks.entry(set.0).or_default().extend(selected);
-    }
-    blocks.into_iter().map(|(set, blocks)| (SetId(set), blocks.into_iter().collect())).collect()
 }
 
 impl Graph {
@@ -482,7 +473,8 @@ impl Graph {
         let dropped = self.dropped.load(Ordering::Acquire);
         let mut slots = Vec::new();
         if !dropped {
-            slots = self.memory.lease_block_slots(&self.dependencies);
+            let sets: Vec<SetId> = self.sets.iter().chain(&self.retained).copied().collect();
+            slots = self.memory.lease_slots(&sets);
             slots.extend(self.memory.torch_if().map_or_else(Vec::new, |t| t.slots(Owner::Pool(self.pool))));
         }
         Record {
@@ -619,24 +611,9 @@ impl Memory {
     /// A component's graph region on this device (§5): `pool` is the device's one capture pool
     /// token. Every block of `sets` and `retained` is pinned (made resident now) for its life.
     pub fn graph_region(&self, sets: &[SetId], retained: &[SetId], pool: PoolId) -> Result<GraphRegion> {
-        let dependencies = sets.iter().chain(retained).map(|&set| Ok((set, self.blocks(set)?))).collect::<Result<Vec<_>>>()?;
-        self.graph_region_inner(sets.to_vec(), retained.to_vec(), &dependencies, pool)
-    }
-
-    /// A graph's exact dependencies. Blocks shared by declarations are pinned once; callers
-    /// include common weights and aliases read by any captured operation. Pins still last for
-    /// the graph region's lifetime, independently of its retained virtual addresses.
-    pub fn graph_region_blocks(&self, dependencies: &[(SetId, Vec<u32>)], pool: PoolId) -> Result<GraphRegion> {
-        let dependencies = graph_dependencies(dependencies);
-        let sets = dependencies.iter().map(|(set, _)| *set).collect();
-        self.graph_region_inner(sets, Vec::new(), &dependencies, pool)
-    }
-
-    fn graph_region_inner(&self, sets: Vec<SetId>, retained: Vec<SetId>, dependencies: &[(SetId, Vec<u32>)], pool: PoolId) -> Result<GraphRegion> {
-        let dependencies = graph_dependencies(dependencies);
         let mut held = Held::default();
-        for (set, blocks) in &dependencies {
-            let binding = self.retain(*set, blocks)?;
+        for &set in sets.iter().chain(retained) {
+            let binding = self.retain(set, &self.blocks(set)?)?;
             held.pins.extend(binding.prepare(0)?);
             held.bindings.push(binding);
         }
@@ -644,9 +621,8 @@ impl Memory {
         let g = Arc::new(Graph {
             id: IDS.fetch_add(1, Ordering::Relaxed),
             memory: self.clone(),
-            sets,
-            retained,
-            dependencies,
+            sets: sets.to_vec(),
+            retained: retained.to_vec(),
             pool,
             word: Arc::default(),
             held: Mutex::new(held),
