@@ -7,6 +7,9 @@
 #   e2e/cli/run.sh --out DIR [--cozy-bin F] [--tensorfs-wheel F] [--runtime-wheel F] [--packages DIR]
 . "$(dirname "$0")/../lib.sh"
 parse "$@"
+# cl-646 reap proof only (this branch): master's Runtime and TensorFS candidates do not install together
+# (cozy-runtime 0.31.0 wants tensorfs<0.15), so the candidate TensorD goes on alone.
+CAND_TFS="" CAND_RT=""
 
 step install; install_cozy
 user_services
