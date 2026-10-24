@@ -342,16 +342,16 @@ impl Constraints {
 /// is not taken: the headers are read instead.
 pub const RULE: u32 = 5;
 
-/// The Hub's indexed answer, with the same rule as local header selection.
+/// The Hub's indexed answer, with the same rule as local header selection. Only what selection
+/// reads is decoded: the answer's other members (its release, the variant's profile) can change
+/// shape without failing a fetch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Selection {
     #[serde(default)]
     pub rule: u32,
-    pub release: String,
     pub commit: crate::format::ObjectRef,
     pub variant: Option<String>,
     pub header: Option<crate::format::ObjectRef>,
-    pub profile: Option<Profile>,
     #[serde(default)]
     pub reasons: Vec<String>,
 }
