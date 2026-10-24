@@ -201,35 +201,42 @@ async fn calcifer(ctx: &Context) -> Vec<Check> {
             checks.push(Check::bad("calcifer", format!("{why}, and stopping it failed: {}", e.message)));
             return checks;
         }
+        // A stopped Calcifer that lingers holding the home would keep the next one out.
+        if let Lock::Captive = client.lock_state()
+            && captive(ctx, &mut checks).is_none()
+        {
+            return checks;
+        }
     }
     start(ctx, checks, why).await
 }
 
-/// This home's Calcifer lock held by no live Calcifer: the processes holding it that are not a
-/// Calcifer (a machine an earlier Calcifer started) are named and ended, with what they started:
-/// why, for the start that follows. `None` (and a problem said) when one could not be ended. A
-/// lock only a stopping Calcifer holds, or one this OS cannot name a holder of, is waited for.
+/// This home's Calcifer lock held by no live Calcifer's record. A Calcifer still holding it has
+/// erased its record: it is stopping, and only its own process is ended (the machine it started
+/// runs on, for the next Calcifer to adopt). Anything else holding it (a machine an earlier
+/// Calcifer started) is ended with what it started. Each is named: why, for the start that
+/// follows. `None` (and a problem said) when one could not be ended. A lock this OS cannot name a
+/// holder of (Windows) is waited for.
 fn captive(ctx: &Context, checks: &mut Vec<Check>) -> Option<String> {
     let lock = ctx.home.calcifer_lock();
-    let held: Vec<(u32, String)> = holders(&lock)
-        .into_iter()
-        .filter(|(pid, command)| *pid != std::process::id() && !command.contains(" calcifer"))
-        .collect();
+    let held: Vec<(u32, String)> =
+        holders(&lock).into_iter().filter(|(pid, _)| *pid != std::process::id()).collect();
     let Some((pid, command)) = held.first().cloned() else {
         checks.push(Check::ok("lock record", format!("{} is held by no live Calcifer", lock.display())));
         return Some("a Calcifer was stopping".into());
     };
-    checks.push(Check::ok(
-        "lock record",
-        format!("{} is held by pid {pid} ({command}), not a Calcifer", lock.display()),
-    ));
-    for (pid, _) in &held {
-        if let Err(e) = platform::process::end_tree(&platform::process::tree(*pid)) {
+    checks.push(Check::ok("lock record", format!("{} is held by pid {pid} ({command})", lock.display())));
+    for (pid, command) in &held {
+        let ended = match command.contains(" calcifer") {
+            true => end(*pid),
+            false => platform::process::end_tree(&platform::process::tree(*pid)).map_err(|e| e.to_string()),
+        };
+        if let Err(e) = ended {
             checks.push(Check::bad("calcifer", format!("pid {pid} holds Calcifer's lock, and ending it failed: {e}")));
             return None;
         }
     }
-    Some(format!("pid {pid} ({command}), started by an earlier Calcifer, held its lock; ended it"))
+    Some(format!("pid {pid} ({command}) held its lock after its Calcifer stopped; ended it"))
 }
 
 /// Starts Calcifer (or waits for the one starting), said as what fixed `why`.
