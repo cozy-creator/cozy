@@ -189,7 +189,14 @@ fn watching_gpu(uuid: &str, manager: &Manager, tenants: &Tenants, watch: std::sy
         }
         drop(watch);
         let reading = device.as_ref().map_err(Clone::clone).and_then(|device| device.read().map_err(|error| error.to_string()));
-        let processes = reading.and_then(|reading| reading.processes.ok_or_else(|| "NVML names no process of this machine".to_string()));
+        // TensorD holding chunks holds their context: a list without it is another namespace's.
+        let created = manager.holdings().created;
+        let processes = reading
+            .and_then(|reading| reading.processes.ok_or_else(|| "NVML names no process of this machine".to_string()))
+            .and_then(|by| match created > 0 && !by.contains_key(&std::process::id()) {
+                true => Err("NVML names no process of this machine".to_string()),
+                false => Ok(by),
+            });
         match (&processes, stale) {
             (Err(why), false) => log.note(serde_json::json!({"event": "gpu_unmeasured", "gpu": uuid, "why": why})),
             (Ok(_), true) => log.note(serde_json::json!({"event": "gpu_measured", "gpu": uuid})),
