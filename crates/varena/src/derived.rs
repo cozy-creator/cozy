@@ -65,15 +65,17 @@ pub trait Hold: Send + Sync {
     fn pin(&self, key: &Key) -> Option<Box<dyn Send>>;
     /// No request runs: writes go only now.
     fn idle(&self) -> bool;
-    /// Written whole: the holder keeps `entry` for refills and tells TensorD.
-    fn written(&self, key: Key, entry: File);
+    /// Written whole: the holder keeps `entry` for refills and tells TensorD which entry it was
+    /// (`entry_id`, TensorD's, so a writer marks only its own).
+    fn written(&self, key: Key, entry_id: u64, entry: File);
 }
 
-/// One page to write: TensorD's entry for it, where its bytes are mapped, and the event its
-/// transform completed by.
+/// One page to write: TensorD's entry for it (and its id), where its bytes are mapped, and the
+/// event its transform completed by.
 pub struct Job {
     pub key: Key,
     pub entry: File,
+    pub entry_id: u64,
     pub va: Va,
     pub ready: Event,
 }
@@ -197,7 +199,7 @@ impl Shared {
         let now = (job.va.len as f64 / secs) as u64;
         let was = self.bps.load(Relaxed);
         self.bps.store(if was == 0 { now } else { (was * 3 + now) / 4 }, Relaxed);
-        self.hold.written(job.key, job.entry);
+        self.hold.written(job.key, job.entry_id, job.entry);
         Ok(())
     }
 }

@@ -263,12 +263,12 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
     );
     gpus.print(ctx, "attention kernels");
     let memory = grid(
-        &["GPU", "KEPT", "LEASED", "STORE", "STALL", "PEAK", "TORCH", "COMPUTE", "EVICTED", "LEFTOVER"],
+        &["GPU", "KEPT", "LEASED", "STORE", "DERIVED", "STALL", "PEAK", "TORCH", "COMPUTE", "EVICTED", "LEFTOVER"],
         &measured,
         memory_rows,
     );
     memory.print(ctx, "memory");
-    let steps = grid(&["GPU", "STEP", "CAPACITY", "HIT", "KEPT", "STORE", "PREFETCHED", "EVICTED"], &measured, step_rows);
+    let steps = grid(&["GPU", "STEP", "CAPACITY", "HIT", "KEPT", "STORE", "DERIVED", "PREFETCHED", "EVICTED"], &measured, step_rows);
     steps.print(ctx, "memory by step");
     grid(&["GPU", "STEP", "FOR", "NEED", "FREED", "WAITED"], &measured, make_room_rows).print(ctx, "make room");
     if !run.calls.is_empty() {
@@ -579,7 +579,7 @@ fn gpu_rows(measured: &Measured) -> Vec<Vec<String>> {
 }
 
 /// Each GPU's whole request: the bytes moved by source (kept from the manager's retention, leased
-/// and filled, read from the store) at their rate against the measured ceiling, the stall, the
+/// and filled, read from the store, refilled from a derived entry) at their rate against the measured ceiling, the stall, the
 /// most it held (pages and torch's bytes), torch's own peak, the compute bytes, what make_room took
 /// and what it still held at the end.
 fn memory_rows(measured: &Measured) -> Vec<Vec<String>> {
@@ -593,6 +593,7 @@ fn memory_rows(measured: &Measured) -> Vec<Vec<String>> {
             moved(&s.moved.kept, None),
             moved(&s.moved.leased, h2d),
             moved(&s.moved.store, disk),
+            moved(&s.moved.derived, disk),
             duration(s.stall_ns as f64 / 1e6),
             output::bytes(s.peak),
             output::bytes(g.torch_peak),
@@ -632,27 +633,29 @@ fn evicted(by_class: &[u64; 7]) -> String {
 }
 
 /// Each GPU's steps: the free bytes at its start, the bytes its binds found mapped (hit), adopted
-/// (kept) and read (store), how many were prefetched, and what make_room took in it.
+/// (kept), read (store) and refilled from a derived entry, how many were prefetched, and what
+/// make_room took in it.
 fn step_rows(measured: &Measured) -> Vec<Vec<String>> {
     let mut rows = vec![];
     for g in &measured.m.memory.stats.varena {
-        let mut by_step: BTreeMap<u32, [u64; 4]> = BTreeMap::new();
+        let mut by_step: BTreeMap<u32, [u64; 5]> = BTreeMap::new();
         for r in &g.stats.trace {
             let cell = by_step.entry(r.step).or_default();
             let at = match r.origin {
                 varena::memory::Origin::Hit => 0,
                 varena::memory::Origin::Kept => 1,
                 varena::memory::Origin::Store => 2,
+                varena::memory::Origin::Derived => 3,
             };
             cell[at] += r.bytes;
             if r.speculative {
-                cell[3] += r.bytes;
+                cell[4] += r.bytes;
             }
         }
         for step in 0..g.stats.steps.len() as u32 {
             by_step.entry(step).or_default();
         }
-        for (step, [hit, kept, store, prefetched]) in by_step {
+        for (step, [hit, kept, store, derived, prefetched]) in by_step {
             let stats = g.stats.steps.get(step as usize);
             let bytes = |n: u64| if n == 0 { "-".to_string() } else { output::bytes(n) };
             rows.push(vec![
@@ -662,6 +665,7 @@ fn step_rows(measured: &Measured) -> Vec<Vec<String>> {
                 bytes(hit),
                 bytes(kept),
                 bytes(store),
+                bytes(derived),
                 bytes(prefetched),
                 stats.map_or("-".into(), |s| evicted(&s.evicted)),
             ]);
