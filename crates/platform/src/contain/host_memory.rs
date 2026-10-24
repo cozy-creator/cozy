@@ -32,6 +32,16 @@ pub fn total() -> i64 {
     sys::total()
 }
 
+/// The most this process's memory can reach: physical memory, or less where a limit on it is
+/// (Linux: the tightest cgroup on its path, `memory.max` and a set `memory.high`, v1's
+/// `memory.limit_in_bytes`). What is sized to the host (a host table, the RAM a policy may swap
+/// to) is sized from this, never from physical memory: past it the kernel kills. None when
+/// unreadable.
+pub fn limit() -> Option<u64> {
+    let physical = u64::try_from(total()).ok().filter(|&n| n > 0);
+    physical.into_iter().chain(sys::limit()).min()
+}
+
 /// The live budget: the tightest of the host's available memory and, on Linux, every cgroup
 /// on this process's path.
 pub fn read() -> HostMemory {
