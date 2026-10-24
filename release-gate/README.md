@@ -55,16 +55,16 @@ The runner signs in as the owner's account with its own device key: secret `COZY
 - **One release, two checkpoints** (`swap.py`): Qwen-Image text → edit → text and its two Lightning LoRAs in turn, each group on one executor with no restart (run 15744: TFS 0.15.0's `{release}/{component}` set names collided). No first-party SDXL LoRA exists to swap.
 - **LM coverage** (`lm.py`, every gate): Fibo's and Klein's prompt upsamplers and H3's reference describer ran their
   greedy token loops (H3's cell gives a character reference, which BiRefNet cleans and Qwen3.5 describes).
-- **Stress** (`cells/stress.sh`, suite `stress`): SDXL, Anima and 5 s H3 under 8, 6 and 3 GiB caps on one
-  rtx-5090, with SDXL and Anima alternating three times at 6 GiB, plus SDXL and Anima on a real 8 GB rtx-3070.
-  `stress.py` checks each cap took, nothing held more than its cap, the kernels match the uncapped cells, no bytes
-  are left behind, and the alternation does not slow down. Dispatch with `-f stress=true` to force it. A new SKU
-  (the rtx-3070) needs `-f skus=rtx-3070 -f establish=true` once.
-- **Host RAM** (`cells/stress-host.sh`, suite `stress-host`): Klein and Qwen on a CPU rental under its cgroup
-  `memory.max`, which `cells/host-cap.py` measures; `stress.py` wants the cap below the RAM and page/spill bytes in
-  each record. The CLI caps no host memory, so the rental's container is the cap. Parked (known-failing, xs-058).
+- **Suites** (`--suite <name>`): a suite runs instead of the product cells, from `suites/<name>/cells.sh`, judged by its
+  `check.py`, against its own baseline `gate-<SKU>-<name>.json`. Its `skus` lists the SKUs the workflow rents for it.
+- **varena** (`suites/varena`): the memory manager through its paces on SDXL, Klein and 5 s H3 on Ampere, Ada,
+  Blackwell and a CPU rental (Hopper/B200 on request): cold load, co-residency, unload and reload, 8/6/3 GiB caps with
+  SDXL and Klein alternating at 6, a real 8 GB card, and host RAM under the rental's cgroup with page/spill to disk.
+  `check.py` holds each load and refill to a share of the machine's measured ceiling (`ceiling.py`), checks caps,
+  alternation and host RAM; `analyze.py`, time and peak VRAM. Selected by `varena` (varena, TensorFS, TensorD, the
+  Runtime) or `-f varena=true`; a SKU new to it needs `-f skus=<sku> -f varena=true -f establish=true` once.
 - **Quality** (`quality.py`, every gate): CLIP prompt adherence of every render against its prompt (floor 0.25), and
   the gate's median CLIP-IQA sharpness against the last passed gates. Never a same-seed pixel diff.
-- **Checks:** `analyze.py` runs every `check(gate) -> (fails, notes)` in `CHECKS` (`stress.check`, `quality.check`).
+- **Checks:** `analyze.py` runs every `check(gate) -> (fails, notes)` in `CHECKS` (quality, lm, swap, and a suite's).
 - **Known lists:** `known-blocking.json` and `known-failing.json` hold request-path blocking and lead-ruled skips;
-  both may only shrink.
+  both may only shrink. A known-failing entry's `cells` names the suite cells it parks (`sku` "*": every SKU).

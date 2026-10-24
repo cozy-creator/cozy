@@ -3,7 +3,7 @@ steady s/step and peak reserved VRAM are held against the SKU's last known-good 
 gate-<SKU>.json, which gate.sh fetches from and publishes to the `release-gate-baselines` release). A PASS is recorded
 in the baseline file; `--accept` records a FAIL the lead accepted. Exit 1 on any failure: the publish is blocked.
     analyze.py <gate dir> <SKU> <baseline file> [--accept]
-More checks (stress, quality) are modules imported here and listed in CHECKS: check(gate) -> (fails, notes)."""
+More checks (quality, lm, swap, a suite's check.py) are modules imported here and listed in CHECKS: check(gate) -> (fails, notes)."""
 import fnmatch, glob, json, os, re, subprocess, sys, time
 import numpy as np
 from PIL import Image
@@ -12,8 +12,12 @@ out, sku, BASE = sys.argv[1].rstrip('/'), sys.argv[2], sys.argv[3]
 accept = '--accept' in sys.argv
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import lm, quality, stress, swap  # noqa: E402
-CHECKS = [stress.check, quality.check, lm.check, swap.check]
+sys.path.insert(0, os.path.join(HERE, 'suites'))
+import lm, quality, swap  # noqa: E402
+from varena import check as varena  # noqa: E402
+# A suite's check runs when gate.sh ran the suite (--suite: the names in <gate dir>/suites).
+SUITES = open(os.path.join(out, 'suites')).read().split() if os.path.exists(os.path.join(out, 'suites')) else []
+CHECKS = [quality.check, lm.check, swap.check] + [{'varena': varena.check}[s] for s in SUITES if s == 'varena']
 # Allowed rise over the worst known-good number, unless the good numbers' own spread is wider.
 SLACK = {'execution_ms': 0.25, 'step1_ms': 0.5, 'steady_ms': 0.10, 'peak_vram_mb': 0.10}
 # A step may cost at most 2x its reference plus 5 s: step 1 against step 2 (known-good fresh H3 executors 0.9-1.8x; the
