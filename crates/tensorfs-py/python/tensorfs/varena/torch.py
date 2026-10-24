@@ -657,9 +657,9 @@ class Memory:
         return self._graph_pool
 
     def graph_region(self, sets: nn.Module | Model | Sequence[nn.Module | Model] = (), retained: nn.Module | Model | Sequence[nn.Module | Model] = ()) -> GraphRegion:
-        """One component's graphs on this device: `sets` the models they read, `retained` those
-        held bound across replays."""
-        return GraphRegion(self, self.native.graph_region(self.graph_pool, self._set_ids(sets), self._set_ids(retained)))
+        """A capture pool and its replay/drop word. Weights are prepared by Binding around
+        capture/replay only. `sets` and `retained` are ignored compatibility keywords."""
+        return GraphRegion(self, self.native.graph_region(self.graph_pool))
 
     def _set_ids(self, models: nn.Module | Model | Sequence[nn.Module | Model]) -> list[int]:
         many = models if isinstance(models, Sequence) else [models]
@@ -1013,7 +1013,7 @@ class GraphRegion:
         return self.native.dropping
 
     def close(self) -> None:
-        """Drops its graphs' pins and its use of the pool."""
+        """Drains its graphs and releases its use of the pool."""
         self.native.close()
 
 
