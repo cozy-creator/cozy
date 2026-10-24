@@ -62,6 +62,10 @@ on:
         description: Package releases the imports suite takes instead of the latest unyanked (name@release,...)
         type: string
         default: ''
+      published:
+        description: The imports suite loads the published releases instead of the packages checkout (a release's question)
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       repo:
@@ -97,6 +101,9 @@ on:
       pins:
         type: string
         default: ''
+      published:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -232,7 +239,9 @@ jobs:
       - name: imports suite
         env:
           PINS: ${{ inputs.pins }}
-        run: bash .creator/e2e/imports/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES ${PINS:+--pins "$PINS"}
+          PUBLISHED: ${{ inputs.published && '1' || '' }}
+        # The packages: the change's checkout, packages master, or (a release's dispatch) the published ones.
+        run: bash .creator/e2e/imports/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES ${PINS:+--pins "$PINS"} ${PUBLISHED:+--published} $(case " $CANDIDATES " in *" --packages "*) ;; *) echo ${PACKAGES_MASTER:+--packages "$PACKAGES_MASTER"} ;; esac)
       - if: always()
         uses: actions/upload-artifact@v4
         with:

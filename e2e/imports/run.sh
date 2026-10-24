@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # The `imports` suite: every first-party package still loads on the candidate set. The local machine takes
-# the candidates (`cozy machine update local`), installs each root package's latest unyanked release, or the
-# release --pins names (a gated candidate, published yanked; a yanked release looks the same as a retired
-# one, so only a pin makes it a candidate), and a package with neither is skipped by name
-# (`cozy package install`: its environment with the machine's own Runtime and TensorFS, no weights),
+# the candidates (`cozy machine update local`) and installs each package (`cozy package install`: its
+# environment with the machine's own Runtime and TensorFS, no weights): on a PR, every package directory of
+# the packages checkout (packages master, the RC's package source, or the change's own); with --published or
+# --pins, each root package's latest unyanked release or the pinned one (a gated candidate is published
+# yanked and looks like a retired release, so only a pin makes it a candidate; one with neither is skipped),
 # and imports it there as an executor does: its entry points and every module under them. A Runtime that
 # moves or drops what a published package imports fails here, before the Runtime reaches PyPI. A release
 # whose Runtime floor the candidate does not meet is refused by name and skipped. With --packages, the
 # checkout's package directories are installed and imported the same way.
 #   e2e/imports/run.sh --out DIR [--cozy-bin F] [--tensorfs-wheel F] [--runtime-wheel F] [--packages DIR]
-#                      [--pins name@release,...]
+#                      [--published] [--pins name@release,...]
 . "$(dirname "$0")/../lib.sh"
 parse "$@"
 PROBE=$(cd "$(dirname "$0")" && pwd)/probe.py
@@ -59,33 +60,41 @@ install() {
   return 1
 }
 
-step "published packages"
-cozy --json package search --limit 200 > "$OUT/search.json" || fail "cozy package search failed"
-releases=''
-for name in $(jq -r '.packages[] | select(.package | contains("/") | not) | .package' "$OUT/search.json"); do
-  pin=$(tr ',' '\n' <<< "$PINS" | sed -n "s/^$name@//p" | head -1)
-  latest=$(jq -r --arg n "$name" '.packages[] | select(.package == $n) | .latest_release // empty' "$OUT/search.json")
-  if [ -n "$pin" ]; then releases+="$name $pin pinned"$'\n'
-  elif [ -n "$latest" ]; then releases+="$name $latest release"$'\n'
-  else echo "::notice::$name: no unyanked release and no pin: skipped (retired, or a candidate not pinned)"; fi
-done
-[ -n "$releases" ] || fail "the Hub lists no first-party package release"
-while read -r name release kind; do
-  [ -n "$name" ] || continue
-  echo "::group::$name $release ($kind)"
-  if install "$name" "$name@$release"; then import_release "$name" "$name" "$release"; fi
-  echo "::endgroup::"
-done <<< "$releases"
-
-if [ -n "$PACKAGES" ]; then
+count=0
+if [ -n "$PUBLISHED" ] || [ -n "$PINS" ]; then
+  # A release's question: the published releases (or the pinned candidates) on the candidate set.
+  step "published packages"
+  cozy --json package search --limit 200 > "$OUT/search.json" || fail "cozy package search failed"
+  releases=''
+  for name in $(jq -r '.packages[] | select(.package | contains("/") | not) | .package' "$OUT/search.json"); do
+    pin=$(tr ',' '\n' <<< "$PINS" | sed -n "s/^$name@//p" | head -1)
+    latest=$(jq -r --arg n "$name" '.packages[] | select(.package == $n) | .latest_release // empty' "$OUT/search.json")
+    if [ -n "$pin" ]; then releases+="$name $pin pinned"$'\n'
+    elif [ -n "$latest" ]; then releases+="$name $latest release"$'\n'
+    else echo "::notice::$name: no unyanked release and no pin: skipped (retired, or a candidate not pinned)"; fi
+  done
+  [ -n "$releases" ] || fail "the Hub lists no first-party package release"
+  while read -r name release kind; do
+    [ -n "$name" ] || continue
+    echo "::group::$name $release ($kind)"
+    if install "$name" "$name@$release"; then import_release "$name" "$name" "$release"; fi
+    echo "::endgroup::"
+    count=$((count + 1))
+  done <<< "$releases"
+else
+  # A PR's question: the RC's own packages (packages master, or the change's checkout) on the candidate set.
+  [ -n "$PACKAGES" ] || fail "no packages checkout and no --published/--pins: nothing to import"
   step "the checkout's packages"
   # A package is a directory whose pyproject declares a cozy.application entry point.
   for toml in $(grep -l 'cozy.application' "$PACKAGES"/*/pyproject.toml); do
     dir=$(dirname "$toml") name=$(sed -n 's/^name = "\(.*\)"/\1/p' "$toml" | head -1)
     version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$toml" | head -1)
+    echo "::group::$name $version (checkout)"
     if install "checkout-$name" "./$dir"; then import_release "checkout-$name" "$name" "$version"; fi
+    echo "::endgroup::"
+    count=$((count + 1))
   done
 fi
 
 step down; cozy --json down || check "cozy down failed"
-finish "imports: $(grep -c . <<< "$releases") packages"
+finish "imports: $count packages"
