@@ -988,6 +988,9 @@ fn max_output_bytes() -> u64 {
 pub struct Json(pub Value);
 
 #[cfg(feature = "python")]
+pub use python::value as to_python;
+
+#[cfg(feature = "python")]
 mod python {
     use pyo3::{
         exceptions::PyValueError,
@@ -999,7 +1002,8 @@ mod python {
 
     use super::*;
 
-    fn value<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
+    /// A JSON value as plain Python dicts, lists and scalars.
+    pub fn value<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
         Ok(match value {
             Value::Null => py.None().into_bound(py),
             Value::Bool(b) => b.into_bound_py_any(py)?,
