@@ -1,6 +1,5 @@
 //! Deployed resumable package carriers, scoped by verified owner key. No execution journal.
 use super::{auth::VerifiedActor, domain};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use platform::durable::Mode;
 use std::{
@@ -562,7 +561,7 @@ fn validate_archive(file: &File) -> Result<(), Error> {
 fn lock(directory: &Path) -> Result<File, Error> {
     let file = platform::durable::open_nofollow(&directory.join("operation.lock"), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)
         .map_err(disk)?;
-    file.try_lock_exclusive()
+    file.try_lock()
         .map_err(|_| Error::conflict("aborted", "this owner operation already has a live uploader"))?;
     Ok(file)
 }

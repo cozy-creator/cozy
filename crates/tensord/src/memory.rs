@@ -380,14 +380,9 @@ pub fn chunks(uuid: &str, log: &MemoryLog) -> Option<Opener> {
 /// `CUDA_VISIBLE_DEVICES`), whose pages CUDA can create and share.
 fn shareable(uuid: &str) -> Result<i32, String> {
     use tensorfs::io::cuda;
-    let driver = cuda::driver().map_err(|error| error.to_string())?;
-    let mut count = 0;
-    // SAFETY: cuDeviceGetCount's out-param, a live local.
-    cuda::check("cuDeviceGetCount", unsafe { (driver.device_get_count)(&mut count) }).map_err(|error| error.to_string())?;
+    let count = cuda::device_count().map_err(|error| error.to_string())?;
     let device = |ordinal: i32| {
-        let mut device = 0;
-        // SAFETY: cuDeviceGet's out-param, a live local, for an ordinal below the count.
-        cuda::check("cuDeviceGet", unsafe { (driver.device_get)(&mut device, ordinal) }).ok()?;
+        let device = cuda::device_at(ordinal).ok()?;
         cuda::uuid(device).is_ok_and(|named| named == uuid).then_some((ordinal, device))
     };
     let (ordinal, device) = (0..count).find_map(device).ok_or_else(|| format!("CUDA has no device {uuid}"))?;

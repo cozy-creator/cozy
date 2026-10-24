@@ -18,7 +18,7 @@ use nix::{
         signal::{kill, SigSet, Signal},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{fork, ForkResult, Pid},
+    unistd::Pid,
 };
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -39,8 +39,7 @@ pub fn supervise(
     service_ready: Option<u64>,
 ) -> io::Result<Ready> {
     if let Some(handle) = service_ready {
-        // SAFETY: the stable parent handed this pipe end to this process alone.
-        let pipe = unsafe { platform::process::handed(handle) }?;
+        let pipe = platform::process::take_handed(handle)?;
         return Ok(Ready(Some(File::from(pipe))));
     }
     let program = std::env::current_exe()?;
@@ -95,16 +94,7 @@ pub fn supervise(paths: &super::update::Paths, provider: Option<ProviderSelf>) -
     for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD] {
         signals.add(signal);
     }
-    // macOS discards a signal whose default is to be ignored (SIGCHLD) as it is raised, blocked
-    // or not, unless something catches it: a handler that does nothing keeps it for sigwait.
-    #[cfg(target_os = "macos")]
-    {
-        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler};
-        extern "C" fn noted(_: nix::libc::c_int) {}
-        let action = SigAction::new(SigHandler::Handler(noted), SaFlags::empty(), SigSet::empty());
-        // SAFETY: the handler does nothing, so it is async-signal-safe.
-        unsafe { sigaction(Signal::SIGCHLD, &action) }.map_err(io::Error::from)?;
-    }
+    platform::process::keep_sigchld()?;
     signals.thread_block().map_err(io::Error::from)?;
     // Orphans of the service reparent here, not to a PID 1 that may not reap them. Elsewhere
     // (macOS) they reparent to launchd, which reaps them, and executor trees end by group.
@@ -119,9 +109,10 @@ pub fn supervise(paths: &super::update::Paths, provider: Option<ProviderSelf>) -
             exec(paths, &launch, provider.as_ref(), &signals)?;
         }
         let (read, write) = cloexec_pipe()?;
-        // SAFETY: no thread exists yet in this process; the child continues single-threaded.
-        let child = match unsafe { fork() }.map_err(io::Error::from)? {
-            ForkResult::Child => {
+        // Refused unless this process still has one thread: the child continues with no lock
+        // another thread held.
+        let child = match platform::process::fork()? {
+            platform::process::Forked::Child => {
                 drop(read);
                 // The service never outlives its supervisor.
                 if !platform::process::die_with_parent(parent.as_raw() as u32)? {
@@ -130,7 +121,7 @@ pub fn supervise(paths: &super::update::Paths, provider: Option<ProviderSelf>) -
                 SigSet::empty().thread_set_mask().map_err(io::Error::from)?;
                 return Ok(Ready(Some(File::from(write))));
             }
-            ForkResult::Parent { child } => child,
+            platform::process::Forked::Parent(child) => Pid::from_raw(child as i32),
         };
         drop(write);
         let (status, stopping) = wait_service(child, &signals)?;
@@ -184,21 +175,14 @@ fn exec(paths: &super::update::Paths, launch: &std::path::Path, provider: Option
     super::update::rollback_pending(paths, &cause).map(drop)
 }
 
-/// Places `fd` at `at` for the re-executed machine to inherit (dup2 clears close-on-exec on the copy).
+/// Places `fd` at `at` for the re-executed machine to inherit.
 #[cfg(target_os = "linux")]
 pub(super) fn inherit(fd: std::os::fd::OwnedFd, at: i32) -> bool {
-    // SAFETY: plain fd calls in a single-threaded child.
-    let placed = unsafe {
-        if fd.as_raw_fd() == at {
-            libc::fcntl(at, libc::F_SETFD, 0)
-        } else {
-            libc::dup2(fd.as_raw_fd(), at)
-        }
-    };
+    let placed = platform::process::hand_on_exec(&fd, at).is_ok();
     if fd.as_raw_fd() == at {
         std::mem::forget(fd);
     }
-    placed >= 0
+    placed
 }
 
 /// Waits for the service to end, reaping every orphan meanwhile and forwarding stop signals.

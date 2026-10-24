@@ -15,14 +15,8 @@ use std::{
     time::Duration,
 };
 use crate::stop::Stop as Cancel;
-#[cfg(unix)]
-use std::{
-    ffi::CString,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
-    },
-};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 
 /// The most text one package log line keeps.
 const PACKAGE_LOG_LINE: usize = 2 << 10;
@@ -1310,30 +1304,24 @@ pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
     }
     #[cfg(unix)]
     {
+        use nix::{fcntl::OFlag, sys::stat::Mode};
         let mut directory = File::open(root)?;
         for (index, name) in parts.iter().enumerate() {
-            let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
             let final_component = index + 1 == parts.len();
             // O_PATH inspects the final inode without opening devices or blocking on FIFOs; where
             // there is none, O_NONBLOCK keeps a FIFO from blocking and only a regular file is kept.
             #[cfg(target_os = "linux")]
-            let last = libc::O_PATH;
+            let last = OFlag::O_PATH;
             #[cfg(not(target_os = "linux"))]
-            let last = libc::O_RDONLY | libc::O_NONBLOCK;
-            let flags = libc::O_CLOEXEC
-                | libc::O_NOFOLLOW
+            let last = OFlag::O_RDONLY | OFlag::O_NONBLOCK;
+            let flags = OFlag::O_CLOEXEC
+                | OFlag::O_NOFOLLOW
                 | if final_component {
                     last
                 } else {
-                    libc::O_RDONLY | libc::O_DIRECTORY
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY
                 };
-            // SAFETY: live directory descriptor and NUL-terminated component, no pointer outputs.
-            let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: openat returned a new owned descriptor.
-            let file = unsafe { File::from_raw_fd(fd) };
+            let file = File::from(nix::fcntl::openat(&directory, *name, flags, Mode::empty())?);
             if final_component {
                 if !file.metadata()?.is_file() {
                     return Err(io::Error::new(

@@ -17,8 +17,8 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE,
-        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
+        FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
         WAIT_TIMEOUT,
     },
     System::{
@@ -456,18 +456,22 @@ pub(super) fn hand_on(handle: &impl AsRawHandle) -> io::Result<u64> {
     Ok(handle.as_raw_handle() as usize as u64)
 }
 
-/// Takes a handle this process inherited, no longer inheritable: it goes no further.
-///
-/// # Safety
-/// `value` must name a handle this process inherited and nothing else owns.
-pub(super) unsafe fn handed(value: u64) -> io::Result<OwnedHandle> {
-    // SAFETY: the caller's promise.
-    let handle = unsafe { OwnedHandle::from_raw_handle(value as usize as _) };
-    // SAFETY: a live handle this process owns.
-    if unsafe { SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+/// A copy of a handle this process inherited; neither is inheritable, so it goes no further.
+/// The inherited handle is left open: a copy needs no promise that nothing else owns it.
+pub(super) fn take_handed(value: u64) -> io::Result<OwnedHandle> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let inherited = value as usize as HANDLE;
+    // SAFETY: a flag change on a handle value; an invalid one fails.
+    if unsafe { SetHandleInformation(inherited, HANDLE_FLAG_INHERIT, 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(handle)
+    let mut copy: HANDLE = ptr::null_mut();
+    // SAFETY: duplicates a live handle into `copy`, a new handle only this function holds.
+    if unsafe { DuplicateHandle(GetCurrentProcess(), inherited, GetCurrentProcess(), &mut copy, 0, 0, DUPLICATE_SAME_ACCESS) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: DuplicateHandle made `copy` for this process alone.
+    Ok(unsafe { OwnedHandle::from_raw_handle(copy) })
 }
 
 pub(super) fn parent_of(pid: u32) -> io::Result<u32> {

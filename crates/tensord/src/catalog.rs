@@ -1,6 +1,5 @@
 //! Trusted immutable environment selection, independent of request-supplied paths.
 use crate::journal::Invocation;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -128,7 +127,7 @@ impl Catalog {
             ));
         }
         let hold = platform::durable::open_nofollow(&directory.join(".hold"), OpenOptions::new().read(true))?;
-        FileExt::lock_shared(&hold)?;
+        hold.lock_shared()?;
         // Last use, for least-recently-used eviction of unheld generations.
         let now = SystemTime::now();
         let times = fs::FileTimes::new().set_accessed(now).set_modified(now);
