@@ -35,6 +35,8 @@ use crate::decide::{self, Victim};
 use crate::table::{Class, Fill, Key, Level, Page, Plan, Req, Set, SetSpec, Table};
 use crate::{Error, Exhausted, GpuId, Result};
 
+#[cfg(unix)]
+mod derived;
 mod stream;
 mod torch;
 pub use torch::{Allocating, PoolId, TorchStats};
@@ -158,6 +160,8 @@ pub enum Origin {
     Kept,
     /// The store, through the page cache.
     Store,
+    /// This page's derived entry on disk (§6), through the page cache: no transform.
+    Derived,
 }
 
 #[cfg(feature = "python")]
@@ -168,6 +172,7 @@ impl Origin {
             Origin::Hit => "hit",
             Origin::Kept => "kept",
             Origin::Store => "store",
+            Origin::Derived => "derived",
         }
     }
 }
@@ -205,6 +210,8 @@ pub struct Moved {
     /// Pages leased from the manager and filled here (`ns`: the ask, import and map).
     pub leased: Fills,
     pub store: Fills,
+    /// Pages refilled from their derived entry on disk, no transform run (§6).
+    pub derived: Fills,
     /// Of the above, bytes filled speculatively.
     pub speculative: u64,
 }
@@ -445,6 +452,8 @@ pub struct Pin {
     /// Fresh bytes of a set with a transform: refilled on release unless [`Pin::filled`].
     transform: bool,
     transformed: AtomicBool,
+    /// Its transform's start on the bind stream, measured for the derived cache (else DONE).
+    started: Event,
 }
 
 /// A pass of a set: the plan's cursor moves to it. Dropping it without [`Pass::end`] records
@@ -845,6 +854,8 @@ struct Inner {
     #[cfg(unix)]
     tally: tensorfs::io::source::IoTally,
     torch: std::sync::OnceLock<Arc<crate::arena::Torch>>,
+    #[cfg(unix)]
+    derived: derived::Cache,
     _device: Device,
 }
 
@@ -945,6 +956,8 @@ impl Memory {
                 #[cfg(unix)]
                 tally: Default::default(),
                 torch: Default::default(),
+                #[cfg(unix)]
+                derived: Default::default(),
             });
             let (weak, queue) = (Arc::downgrade(&inner), inner.mech.clone());
             std::thread::Builder::new().name("varena-mechanism".into()).spawn(move || mech_loop(&queue, &weak)).map_err(|e| Error::io("spawn mechanism", e))?;
@@ -995,6 +1008,7 @@ impl Memory {
                 }
                 // torch's blocks come from leased chunks too: the agent is its only allocator.
                 self.serve_leased_torch()?;
+                self.start_derived()?;
                 Ok(None)
             }
             crate::lease::Attach::Refused { code, why } => Ok(Some((code, why))),
@@ -1276,6 +1290,7 @@ impl Inner {
             agent.busy(st.events.values().any(|q| !q.is_empty()));
             self.redecline(st);
             self.land(st, agent);
+            self.offer_derived(st, agent);
             self.advise(st, agent);
         }
         self.drop_stale(st);
@@ -1445,6 +1460,8 @@ impl Inner {
         // An event per page, after every copy so far.
         let landed: Vec<Result<(Origin, Event)>> = copied.into_iter().map(|c| c.and_then(|origin| Ok((origin, self.backend.fence()?)))).collect();
         let (ns, bytes) = (start.elapsed().as_nanos() as u64, pages.iter().map(|(_, (.., span))| span).sum::<u64>().max(1));
+        #[cfg(unix)]
+        self.read_measured(bytes, ns);
         // After a copy error the engine's copies may still run: a failed page is unmapped only
         // once the copy stream is proven drained.
         let ownership_lost = landed.iter().any(|out| matches!(out, Err(Error::Ownership(_))));
@@ -1485,8 +1502,9 @@ impl Inner {
             };
             match landed {
                 Ok((origin, ready)) => {
-                    // Stored bytes are the weights; a declared set's are once transformed.
-                    let filled = sets.get(&job.key.0).is_some_and(|spec| matches!(spec.fingerprint.fill, Fill::Stored));
+                    // Stored bytes are the weights; a declared set's are once transformed, or
+                    // refilled from their derived entry.
+                    let filled = origin == Origin::Derived || sets.get(&job.key.0).is_some_and(|spec| matches!(spec.fingerprint.fill, Fill::Stored));
                     let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
                     // A page read ready at issue is its binders' since: a transform may have
                     // filled it already, so only its accounting is left.
@@ -1499,7 +1517,7 @@ impl Inner {
                         self.to_land.lock().push(job.key);
                     }
                     let s = st.fills(job.req, job.key, span, origin);
-                    let f = &mut s.moved.store;
+                    let f = if origin == Origin::Derived { &mut s.moved.derived } else { &mut s.moved.store };
                     f.bytes += span;
                     // The batch's time, shared by its bytes.
                     f.ns += (u128::from(ns) * u128::from(span) / u128::from(bytes)) as u64;
@@ -1543,7 +1561,15 @@ impl Inner {
                     Dst::Device { stream, .. } => stream,
                     Dst::Host { .. } => 0,
                 };
-                let out = job.after.iter().try_for_each(|e| self.backend.wait(*e, stream)).err().map(Err);
+                let mut out = job.after.iter().try_for_each(|e| self.backend.wait(*e, stream)).err().map(Err);
+                // A grant that brought its derived entry: read it, not the store (§6).
+                #[cfg(unix)]
+                if out.is_none() {
+                    if let Some(refill) = self.derived_refill(job.key, job.gen) {
+                        // SAFETY: a mapped page only this fill writes, as long as the entry.
+                        out = Some(unsafe { refill.read(dst, &self.tally) }.map(|()| Origin::Derived));
+                    }
+                }
                 Copying { key: job.key, gen: job.gen, dst, out }
             })
             .collect();
@@ -2115,9 +2141,13 @@ impl Inner {
         if let Some(r) = req {
             self.prefetch(r);
         }
-        let pin = Pin { ptr: va.base + off, len: span, ready, fresh, inner: self.clone().into(), key, id, stream, transform, transformed: AtomicBool::new(false) };
         self.backend.wait(ready, stream)?;
-        Ok(pin)
+        // The transform runs next on this stream: its start, for the derived cache's M4.
+        #[cfg(unix)]
+        let started = if transform && self.measures() { self.backend.record(stream).unwrap_or(Event::DONE) } else { Event::DONE };
+        #[cfg(not(unix))]
+        let started = Event::DONE;
+        Ok(Pin { ptr: va.base + off, len: span, ready, fresh, inner: self.clone().into(), key, id, stream, transform, transformed: AtomicBool::new(false), started })
     }
     /// Moves the request's cursor to the pass of `set`; true when a step began. A pass the plan
     /// does not declare takes one synthetic step at the end, reused by the next such pass.
@@ -2203,6 +2233,8 @@ impl Inner {
         let host = st.window.as_mut().and_then(HostWindow::look);
         if st.table.requests.is_empty() {
             st.window = None;
+            #[cfg(unix)]
+            self.derived_idle();
         }
         let stats = Stats { outlived, leftover, host, ..st.stats.remove(&req).unwrap_or_default() };
         st.last = Some(stats.clone());
@@ -2531,6 +2563,11 @@ impl Pin {
                 if old != event {
                     self.inner.backend.retire(old);
                 }
+                // Measured once both events complete; the cache retires the start.
+                #[cfg(unix)]
+                if self.started != Event::DONE {
+                    self.inner.transformed(self.key, self.started, event);
+                }
             }
             st.sync(self.key);
             #[cfg(unix)]
@@ -2557,6 +2594,9 @@ impl Drop for Pin {
             }
         };
         let untransformed = self.transform && !self.transformed.load(Ordering::Acquire);
+        if untransformed {
+            self.inner.backend.retire(self.started);
+        }
         let _ = self.inner.release_tx.send(Release { key: self.key, pin: self.id, event, stream: self.stream, untransformed });
         self.inner.landed.notify_all();
     }
@@ -2660,7 +2700,7 @@ impl Inner {
                 span,
                 crate::lease::Kind::Weights,
                 region,
-                None,
+                self.fill_key(key),
                 Box::new(move |got| {
                     if let Some(inner) = me.upgrade() {
                         inner.leased_page(key, gen, va, off, span, job, decided, got, start, region.is_some());
@@ -2849,10 +2889,13 @@ impl Inner {
             let (Some(lease), None) = (leases.next(), leases.next()) else {
                 return Err(Error::Invalid(format!("a page of {span} bytes leased as other than one chunk")));
             };
-            let crate::lease::Lease { ticket, phys, adopted, .. } = lease;
+            let crate::lease::Lease { ticket, phys, adopted, entry } = lease;
             self.leased.lock().insert(phys.id, (ticket, key, retainable));
             let p = self.map_rw(va, off, phys)?;
             agent.mapped(&[ticket])?;
+            if !adopted {
+                self.granted(key, gen, span, entry);
+            }
             Ok((p, adopted, Some(start.elapsed().as_nanos() as u64)))
         });
         self.placed(key, gen, va, off, span, job, decided, made);
