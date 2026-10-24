@@ -2,7 +2,7 @@
 # verify.sh <gate run id | gate dir>...: prints the candidate set that passed (candidate.json) and exits 0 only when
 # every SKU's gate passed (or the lead accepted its FAIL) and all of them gated the same set. A run id is a
 # cozy-creator Actions run that ran release-gate.yml (its gate-<SKU> artifacts); a dir is a hand gate's --out.
-# Promotions (promote.sh, cozy-promote.yaml, publish-tensorfs.yaml, cozy-runtime publish.yaml) check what they
+# Promotions (promote.sh, cozy-promote.yaml, tensorfs-publish.yaml, cozy-runtime runtime-publish.yaml) check what they
 # publish against this output.
 set -euo pipefail
 [ $# -gt 0 ] || { sed -n '2,6s/^# \{0,1\}//p' "$0" >&2; exit 2; }

@@ -1,11 +1,11 @@
-name: publish-tensorfs
+name: tensorfs-publish
 # TensorFS's Python package (design §2): wheels for every platform cozy ships, each built on a runner of its
 # own platform, and the sdist. A release is its tensorfs-vX.Y.Z tag, and nothing reaches PyPI before its gate
 # passed (tracker design ci-v2, pre-release and promotion):
-#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch>                           # build
-#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref tensorfs-vX.Y.Z -f candidate=true  # prerelease
-#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref tensorfs-vX.Y.Z -f gate_run=<id>   # PyPI
-#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch> -f dev=true               # <version>+dev.g<sha>
+#   gh workflow run tensorfs-publish.yaml -R cozy-creator/cozy-creator --ref <branch>                           # build
+#   gh workflow run tensorfs-publish.yaml -R cozy-creator/cozy-creator --ref tensorfs-vX.Y.Z -f candidate=true  # prerelease
+#   gh workflow run tensorfs-publish.yaml -R cozy-creator/cozy-creator --ref tensorfs-vX.Y.Z -f gate_run=<id>   # PyPI
+#   gh workflow run tensorfs-publish.yaml -R cozy-creator/cozy-creator --ref <branch> -f dev=true               # <version>+dev.g<sha>
 # The candidate is the tag's GitHub prerelease (never latest: `cozy update` follows latest): the wheels, the sdist and
 # SHA256SUMS. The release agent tests it by hand (release-gate.yml takes its Linux x86_64 wheel by URL#sha256);
 # gate_run (that passing release-gate run's id, or the URL of a recorded hand gate) uploads that prerelease's exact
@@ -27,7 +27,7 @@ on:
         default: false
 
 concurrency:
-  group: publish-tensorfs-${{ github.ref }}
+  group: tensorfs-publish-${{ github.ref }}
 
 permissions:
   contents: read

@@ -32,7 +32,7 @@ A SKU with no baseline needs `--establish` once.
 
 Nothing reaches users before a recorded PASS. Candidates wait where users don't look: cozy as a GitHub prerelease
 (cozy-publish.yaml; `cozy update`, the installer and Homebrew follow latest), TensorFS and the Runtime as GitHub
-prerelease assets (publish-tensorfs.yaml `candidate=true`, cozy-runtime publish.yaml `mode=source`), and packages
+prerelease assets (tensorfs-publish.yaml `candidate=true`, cozy-runtime runtime-publish.yaml `mode=source`), and packages
 as yanked releases (`task publish`). The release agent picks the suites, runs the gate by hand or from Actions, and
 records the result. `candidate.json` in each gate's output names the exact set; `verify.sh <run|dir>...` prints it only
 when every SKU passed. `promote.sh <run id>` (or `--record <URL> <dirs>...` for a hand gate) hands that set to users in
