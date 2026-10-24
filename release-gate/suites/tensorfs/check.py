@@ -43,8 +43,27 @@ def stage_seconds(evs, stage):
 
 
 def hub_bytes(rec):
-    """What the run fetched from the Hub: every `bytes: {hub, volume}` its result carries."""
+    """What the run fetched from the Hub and the volume: every `bytes: {hub, volume}` its result carries."""
+    found = landed_bytes(rec)
+    return (sum(b.get('hub') or 0 for b in found), sum(b.get('volume') or 0 for b in found)) if found else (None, None)
+
+
+def landed_bytes(rec):
+    """Every `bytes: {hub, volume, local}` the run's result carries."""
     found = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            b = o.get('bytes')
+            if isinstance(b, dict) and 'hub' in b:
+                found.append(b)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk((rec or {}).get('result'))
+    return found
 
     def walk(o):
         if isinstance(o, dict):
@@ -150,18 +169,28 @@ def check(gate):
         if hub:
             fails.append(f'tensorfs download-again: {hub / 2**20:.0f} MiB came from the Hub again: the store did not hold it')
     if done('download-cut', cancelled=True) and done('download-resume'):
+        # Judged against the model, not against what the resume fetched: it must find what the cut run
+        # landed (`local`) and fetch only the rest of the model's bytes.
         cut = os.path.join(t, 'download-cut.cut')
         moved = int(open(cut).read()) if os.path.exists(cut) else 0
-        hub, vol = hub_bytes(rows['download-resume']['rec'])
-        total = (hub or 0) + (vol or 0)
+        rec = rows['download-resume']['rec']
+        hub, vol = hub_bytes(rec)
+        found = landed_bytes(rec)
+        local = sum(b.get('local') or 0 for b in found) if found and all('local' in b for b in found) else None
+        _, total = stage_progress(rows['download-resume']['evs'], 'downloading')
+        fetched = (hub or 0) + (vol or 0)
+        mib = lambda n: f'{(n or 0) / 2**20:.0f} MiB'
         if not moved:
             fails.append('tensorfs download-resume: the first download was never cut part-way: nothing was resumed')
-        elif hub is None or hub > max(0, total - 0.8 * min(moved, total)) + 2**20:
-            fails.append(f'tensorfs download-resume: {(hub or 0) / 2**20:.0f} MiB fetched from the Hub of {total / 2**20:.0f} MiB '
-                         f'after {moved / 2**20:.0f} MiB had landed: it started over')
+        elif local is None or not total:
+            fails.append('tensorfs download-resume: its record carries no held (`local`) bytes or no total: not judged')
+        elif local < 0.8 * min(moved, total) or fetched > total - local + 64 * 2**20:
+            fails.append(f'tensorfs download-resume: held {mib(local)} of {mib(total)} after {mib(moved)} had landed, '
+                         f'then fetched {mib(fetched)}: it started over')
         else:
-            notes.append(f'tensorfs download-resume: {hub / 2**20:.0f} MiB from the Hub, {(vol or 0) / 2**20:.0f} MiB from the volume, '
-                         f'after {moved / 2**20:.0f} MiB had landed' + ('' if hub else ' (the cache served it: the Hub path was not exercised)'))
+            notes.append(f'tensorfs download-resume: held {mib(local)} of {mib(total)} ({mib(moved)} had landed by the cut), '
+                         f'fetched only the rest: {mib(hub)} from the Hub, {mib(vol)} from the volume'
+                         + ('' if hub else ' (the cache served it: the Hub path was not exercised)'))
     up = None
     if done('upload'):
         evs = rows['upload']['evs']
