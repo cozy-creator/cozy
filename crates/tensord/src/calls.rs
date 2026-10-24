@@ -382,7 +382,7 @@ impl Calls {
                 fields.insert("call_request".into(), call.request.clone().into());
                 fields.insert("call_attempt".into(), record.attempt.into());
             }
-            answer.progress = Some(CallProgress { sequence: call.progress.0, payload });
+            answer.progress = Some(CallProgress { sequence: call.progress.0, payload: protocol::executor::Json(payload) });
         }
         match record.state {
             State::Completed => {
@@ -664,7 +664,7 @@ fn invocables(
                 self_call: own,
                 // The Runtime binds its own operations from its own code, not a document.
                 interface_document: (!own && !builtin && documented.insert(module.to_string()))
-                    .then(|| module_interface(interface, module)),
+                    .then(|| protocol::executor::Json(module_interface(interface, module))),
                 builtin: (builtin && !own).then(|| "operations".into()),
             });
         }

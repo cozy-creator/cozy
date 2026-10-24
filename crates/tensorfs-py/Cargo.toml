@@ -12,7 +12,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+serde_path_to_error.workspace = true
+protocol = { workspace = true, features = ["python"] }
 tokio.workspace = true
 platform.workspace = true
 tensorfs.workspace = true

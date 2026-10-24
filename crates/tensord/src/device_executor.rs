@@ -1074,7 +1074,7 @@ impl DeviceExecutor {
             false => None,
         };
         let (mut answer, descriptor) = services.request(frame, descriptor)?;
-        answer.event = "answer";
+        answer.event = "answer".into();
         answer.seq = frame.seq;
         answer.descriptor = descriptor.is_some();
         let mut writer = self.writer.lock().unwrap();
