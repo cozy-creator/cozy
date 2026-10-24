@@ -2,8 +2,8 @@
 //
 // torch's pluggable allocator calls these hooks; each forwards to the agent's C ABI in the
 // TensorFS extension, whose function table `varena_torch_bind` receives. The one part of TensorFS
-// built against torch's C++ ABI: a refusal must throw (torch never checks a NULL), and its type
-// preserves capacity versus device/ownership failure. Graph capture hands over a std::function filter. It
+// built against torch's C++ ABI: a refusal must be thrown as c10::OutOfMemoryError (torch never
+// checks a NULL from the allocator), and graph capture hands over a std::function filter. It
 // includes no CUDA header: a stream is only a handle here.
 #include <c10/util/Exception.h>
 
@@ -30,14 +30,9 @@ namespace {
 
 // The agent's C ABI (tensorfs-py src/agent.rs). `alloc` returns 0 and writes its reason on a
 // refusal; none of them unwinds.
-struct Failure {
-    int kind;
-    int cuda_code;
-};
-
 struct Agent {
     uint64_t (*alloc)(uint64_t bytes, int device, uintptr_t stream, int routed, uint64_t pool_a,
-                      uint64_t pool_b, char* why, size_t why_len, Failure* failure);
+                      uint64_t pool_b, char* why, size_t why_len);
     void (*free)(uint64_t ptr, uint64_t bytes, int device, uintptr_t stream);
     void (*record_stream)(uint64_t ptr, uintptr_t stream);
     void (*pool_begin)(int device, uint64_t pool_a, uint64_t pool_b);
@@ -80,20 +75,8 @@ std::vector<Route>::iterator find_route(int device, const MempoolId& pool, bool 
 
 const Stream per_thread = reinterpret_cast<Stream>(0x2);  // cudaStreamPerThread
 
-[[noreturn]] void refuse(Failure failure, const char* why) {
-    switch (failure.kind) {
-        case 1:  // capacity only
-            TORCH_CHECK_WITH(OutOfMemoryError, false, why);
-        case 2:  // a real CUDA error: preserve its code across Python translation
-            throw c10::AcceleratorError({__func__, __FILE__, __LINE__}, failure.cuda_code, why);
-        case 3:  // ownership unknown: device fault, never a recoverable OOM
-        case 4:  // allocator invariant failed: the executor cannot safely keep serving
-            throw c10::AcceleratorError({__func__, __FILE__, __LINE__}, -1, why);
-        case 5:
-            TORCH_CHECK_WITH(ValueError, false, why);
-        default:
-            TORCH_CHECK(false, why);
-    }
+[[noreturn]] void refuse(const char* why) {
+    TORCH_CHECK_WITH(OutOfMemoryError, false, why);
     std::abort();  // not reached: the check throws
 }
 
@@ -101,13 +84,11 @@ const Stream per_thread = reinterpret_cast<Stream>(0x2);  // cudaStreamPerThread
 
 extern "C" {
 
-// A distinct symbol makes an old shim fail at installation instead of calling the new ABI
-// with a missing output pointer. The Python adapter, native extension and shim ship together.
-VARENA_EXPORT void varena_torch_bind_v2(const Agent* functions) { agent = *functions; }
+VARENA_EXPORT void varena_torch_bind(const Agent* functions) { agent = *functions; }
 
 VARENA_EXPORT void* varena_torch_malloc(size_t bytes, int device, Stream stream) {
     if (stream == per_thread) {
-        refuse({5, -1}, "varena: cudaStreamPerThread (0x2) names another stream on every thread; allocate on a stream of its own");
+        refuse("varena: cudaStreamPerThread (0x2) names another stream on every thread; allocate on a stream of its own");
     }
     int routed = 0;
     MempoolId pool{0, 0};
@@ -122,10 +103,9 @@ VARENA_EXPORT void* varena_torch_malloc(size_t bytes, int device, Stream stream)
         }
     }
     char why[512] = {0};
-    Failure failure{4, -1};
-    uint64_t ptr = agent.alloc(bytes, device, reinterpret_cast<uintptr_t>(stream), routed, pool.first, pool.second, why, sizeof why - 1, &failure);
+    uint64_t ptr = agent.alloc(bytes, device, reinterpret_cast<uintptr_t>(stream), routed, pool.first, pool.second, why, sizeof why - 1);
     if (ptr == 0) {
-        refuse(failure, why[0] != 0 ? why : "varena: refused");
+        refuse(why[0] != 0 ? why : "varena: refused");
     }
     return reinterpret_cast<void*>(ptr);
 }
@@ -136,7 +116,7 @@ VARENA_EXPORT void varena_torch_free(void* ptr, size_t bytes, int device, Stream
 
 VARENA_EXPORT void varena_torch_record_stream(void* ptr, Stream stream) {
     if (stream == per_thread) {
-        refuse({5, -1}, "varena: cudaStreamPerThread (0x2) names another stream on every thread; record a stream of its own");
+        refuse("varena: cudaStreamPerThread (0x2) names another stream on every thread; record a stream of its own");
     }
     agent.record_stream(reinterpret_cast<uint64_t>(ptr), reinterpret_cast<uintptr_t>(stream));
 }

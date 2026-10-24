@@ -687,8 +687,6 @@ struct Shared {
     ownership_lost: Arc<AtomicBool>,
     /// Wakes Memory's waiters when an allocator or epoch failure poisons the device.
     notify_poisoned: Box<dyn Fn() + Send + Sync>,
-    myself: Weak<Shared>,
-    quarantined: AtomicBool,
     space: Mutex<Space>,
     /// Chunks given back that the source could not take: retried at every give-back pass.
     stuck: Mutex<Vec<Stuck>>,
@@ -737,14 +735,12 @@ impl Torch {
         let first = backend.reserve((2 * backend.capacity()).max(4 * CHUNK).div_ceil(CHUNK) * CHUNK)?;
         let mut space = Space::default();
         space.add(first);
-        let sh = Arc::new_cyclic(|myself| Shared {
+        let sh = Arc::new(Shared {
             id: TORCHES.fetch_add(1, AcqRel),
             backend,
             source,
             ownership_lost,
             notify_poisoned,
-            myself: myself.clone(),
-            quarantined: AtomicBool::new(false),
             space: Mutex::new(space),
             stuck: Mutex::new(Vec::new()),
             dir: RwLock::new(BTreeMap::new()),
@@ -786,10 +782,6 @@ impl Torch {
             }
         })
     }
-
-    /// A weight/region failure poisoned the device too: wake allocator waits and retain its
-    /// uncertain resources. No driver call and no Memory state lock is acquired here.
-    pub(crate) fn poison(&self, error: &Error) { self.sh.poison(error); }
 
     /// Never fails and never waits on the device; a pointer no arena holds is logged.
     pub fn free(&self, ptr: u64, bytes: u64, stream: usize) {
@@ -1059,7 +1051,7 @@ impl Drop for Torch {
         if sh.check_ownership().is_err() {
             // Driver mappings/consumers are unproven. Keep the backend, handles and reservations
             // alive until process exit; dropping the last Rust handle must not make them reusable.
-            sh.poison(&Error::Ownership("device closed with unproven memory ownership".into()));
+            std::mem::forget(self.sh.clone());
             return;
         }
         sh.reclaim(u64::MAX);
@@ -1081,11 +1073,6 @@ impl Shared {
 
     pub(crate) fn poison(&self, error: &Error) {
         if error.is_sticky() || matches!(error, Error::Internal(_)) {
-            // Retain at the transition, including when a poller discovers the fault during
-            // teardown. A one-time check in Torch::drop would race that last poll.
-            if !self.quarantined.swap(true, AcqRel) {
-                if let Some(held) = self.myself.upgrade() { std::mem::forget(held); }
-            }
             if !self.ownership_lost.swap(true, AcqRel) {
                 tracing::error!("varena: torch memory quarantined: {error}");
             }
@@ -1102,8 +1089,7 @@ impl Shared {
         match out {
             Err(Error::Internal(e)) => Err(Error::Ownership(format!("torch allocator invariant failed: {e}"))),
             Ok(value) => { self.check_ownership()?; Ok(value) }
-            Err(error) if error.is_sticky() => Err(error),
-            Err(error) => { self.check_ownership()?; Err(error) }
+            out => out,
         }
     }
 
@@ -1627,13 +1613,7 @@ impl Shared {
                     Ok(done) => done,
                     Err(why) => {
                         tracing::warn!("varena: a pool fence's query failed ({why}); synchronizing its stream");
-                        match self.backend.synchronize(*stream) {
-                            Ok(()) => true,
-                            Err(failed) => {
-                                self.poison(&Error::Ownership(format!("pool completion failed: {why}; fallback: {failed}")));
-                                false
-                            }
-                        }
+                        self.backend.synchronize(*stream).is_ok()
                     }
                 },
             })
