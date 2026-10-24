@@ -6,7 +6,10 @@ cargo-dist-version = "0.33.0"
 # release.yml is dist's output plus hand edits, each marked HAND-EDITED there: the `must_contain`
 # dispatch input and the plan job's first step, which refuses a release missing any
 # must_contain commit, the global job's step running scripts/patch-installers.sh, and the homebrew job's
-# checkout with the tap's deploy key (secret HOMEBREW_TAP_DEPLOY_KEY) in place of dist's token.
+# checkout with the tap's deploy key (secret HOMEBREW_TAP_DEPLOY_KEY) in place of dist's token. And CI v2's
+# pre-release: the `promote` input, host's `--prerelease --latest=false`, the custom-release-gate and
+# custom-release-promote jobs (release-gate.yml, release-promote.yml) in place of dist's homebrew job, and
+# announce's need of the promotion.
 # After `dist generate` (or a dist upgrade), put them back.
 allow-dirty = ["ci"]
 ci = "github"

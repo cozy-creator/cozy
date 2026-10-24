@@ -1,16 +1,25 @@
 name: publish-tensorfs
 # TensorFS's Python package (design §2): wheels for every platform cozy ships, each built on a runner of its
-# own platform, and the sdist. A release is its tensorfs-vX.Y.Z tag:
-#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch>                         # build
-#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref tensorfs-vX.Y.Z -f publish=true  # PyPI
-#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch> -f dev=true             # <version>+dev.g<sha>
+# own platform, and the sdist. A release is its tensorfs-vX.Y.Z tag, and nothing reaches PyPI before its gate
+# passed (tracker design ci-v2, pre-release and promotion):
+#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch>                           # build
+#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref tensorfs-vX.Y.Z -f candidate=true  # prerelease
+#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref tensorfs-vX.Y.Z -f gate_run=<id>   # PyPI
+#   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch> -f dev=true               # <version>+dev.g<sha>
+# The candidate is the tag's GitHub prerelease (never latest: `cozy update` follows latest): the wheels, the sdist and
+# SHA256SUMS. The gate takes its Linux x86_64 wheel by URL#sha256; gate_run (a passed release-gate run, or `hand`)
+# uploads that prerelease's exact files to PyPI, nothing rebuilt.
 on:
   workflow_dispatch:
     inputs:
-      publish:
-        description: Publish to PyPI (runs only on a tensorfs-vX.Y.Z tag)
+      candidate:
+        description: Put this tag's wheels and sdist on its GitHub prerelease, the gate's candidate (no PyPI)
         type: boolean
         default: false
+      gate_run:
+        description: "Publish the tag's prerelease to PyPI: the release-gate run that passed it (its id), or hand"
+        type: string
+        default: ''
       dev:
         description: Build <version>+dev.g<sha>, a development wheel PyPI never accepts (artifacts only)
         type: boolean
@@ -24,6 +33,7 @@ permissions:
 
 jobs:
   kernels:
+    if: inputs.gate_run == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -37,9 +47,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # A publish runs on its version's tag.
-  gate:
-    if: inputs.publish
+  # A candidate or a publish runs on its version's tag.
+  tag:
+    if: inputs.candidate || inputs.gate_run != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -160,21 +170,56 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Every platform and the sdist, or nothing.
-  publish:
-    if: inputs.publish && !inputs.dev
-    needs: [gate, wheel, sdist]
+  # The candidate: every platform and the sdist, or nothing, on the tag's prerelease.
+  candidate:
+    if: inputs.candidate && !inputs.dev
+    needs: [tag, wheel, sdist]
     runs-on: ubuntu-24.04
-    environment: pypi
-    # Hang bound, not a work budget.
-    timeout-minutes: 30
+    timeout-minutes: 15
     permissions:
-      id-token: write  # PyPI trusted publishing (OIDC)
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: wheel-*
           merge-multiple: true
           path: dist
-      - run: ls -l dist
+      - run: |
+          cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+          ! gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || { echo "::error::$GITHUB_REF_NAME already has a release: a candidate's files never change"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --verify-tag --prerelease --latest=false \
+            --title "TensorFS ${GITHUB_REF_NAME#tensorfs-v} (candidate)" --notes "Gate, then publish: release-gate/README.md" -- *
+          w=$(grep -E 'cp311-abi3-manylinux[^ ]*x86_64\.whl$' SHA256SUMS | head -1)
+          echo "gate with: tensorfs_wheel=https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/${w##* }#sha256=${w%% *}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The prerelease's exact files, once their gate passed.
+  publish:
+    if: inputs.gate_run != '' && !inputs.dev
+    needs: tag
+    runs-on: ubuntu-24.04
+    environment: pypi
+    # Hang bound, not a work budget.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      id-token: write  # PyPI trusted publishing (OIDC)
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GATE: ${{ inputs.gate_run }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: creator
+      - run: |
+          gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -D dist
+          cd dist && sha256sum --check --strict SHA256SUMS && rm SHA256SUMS && ls -l
+          if [ "$GATE" = hand ]; then echo "gated by hand, the dispatcher vouches"; exit 0; fi
+          set_=$(../creator/release-gate/verify.sh "$GATE")
+          sha=$(jq -r .tensorfs_sha256 <<< "$set_")
+          [ -n "$sha" ] && sha256sum -- * | grep -q "^$sha " || { echo "::error::gate $GATE ran no wheel of $GITHUB_REF_NAME"; exit 1; }
       - uses: pypa/gh-action-pypi-publish@release/v1

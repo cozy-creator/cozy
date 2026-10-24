@@ -52,6 +52,14 @@ on:
         required: false
         default: ''
         type: string
+      # HAND-EDITED: a release is a candidate (a prerelease) until its gate passes (release-gate.yml), then
+      # release-promote.yml makes it latest and Homebrew's. false hosts the candidate only, for a set gated together
+      # (release-gate/promote.sh promotes it).
+      promote:
+        description: Gate this candidate and promote it on PASS (false - host the prerelease only)
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -322,64 +330,51 @@ jobs:
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          # HAND-EDITED: always a candidate (prerelease, never latest) until release-promote.yml promotes it.
+          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" --prerelease --latest=false --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
-  # HAND-EDITED: dist's homebrew job, pushing over SSH with the tap's write deploy key
-  # (secret HOMEBREW_TAP_DEPLOY_KEY) instead of a token, as Paul Fidika.
-  publish-homebrew-formula:
+  # HAND-EDITED: the candidate's release gate (release-gate.yml), on the prerelease's own cozy: the runner's and
+  # the pod's TensorD. A FAIL leaves it a prerelease, so users are untouched.
+  custom-release-gate:
     needs:
       - plan
       - host
-    runs-on: "ubuntu-24.04"
-    env:
-      PLAN: ${{ needs.plan.outputs.val }}
-      GITHUB_USER: "Paul Fidika"
-      GITHUB_EMAIL: "paul@fidika.com"
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: true
-          repository: "cozy-creator/homebrew-tap"
-          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
-      # So we have access to the formula
-      - name: Fetch homebrew formulae
-        uses: actions/download-artifact@v8
-        with:
-          pattern: artifacts-*
-          path: Formula/
-          merge-multiple: true
-      # This is extra complex because you can make your Formula name not match your app name
-      # so we need to find releases with a *.rb file, and publish with that filename.
-      - name: Commit formula files
-        run: |
-          git config --global user.name "${GITHUB_USER}"
-          git config --global user.email "${GITHUB_EMAIL}"
+    if: ${{ needs.plan.outputs.publishing == 'true' && inputs.promote }}
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/release-gate.yml
+    with:
+      cozy: ${{ needs.plan.outputs.tag }}
+      changed: cozy-creator ${{ github.sha }}
+      nonce: release-${{ needs.plan.outputs.tag }}
+    secrets: inherit
 
-          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
-            filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
-            name=$(echo "$filename" | sed "s/\.rb$//")
-            version=$(echo "$release" | jq .app_version --raw-output)
-
-            export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
-            brew update
-            # We avoid reformatting user-provided data such as the app description and homepage.
-            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
-
-            git add "Formula/${filename}"
-            git commit -m "${name} ${version}"
-          done
-          git push
+  # HAND-EDITED: dist's homebrew job is release-promote.yml's, after the gate: latest, then Homebrew's formula.
+  custom-release-promote:
+    needs:
+      - plan
+      - custom-release-gate
+    if: ${{ needs.custom-release-gate.result == 'success' }}
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/release-promote.yml
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+      gate: ${{ github.run_id }}
+    secrets: inherit
 
   announce:
     needs:
       - plan
       - host
-      - publish-homebrew-formula
+      - custom-release-promote
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
+    # HAND-EDITED: a candidate only announces once promoted.
+    if: ${{ always() && needs.host.result == 'success' && needs.custom-release-promote.result == 'success' }}
     runs-on: "ubuntu-24.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
