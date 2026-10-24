@@ -336,7 +336,14 @@ impl Memory {
     /// Uses the existing ownership flag and retirement path; no second allocator health state.
     pub(crate) fn device_call<T>(&self, call: impl FnOnce() -> Result<T>) -> Result<T> {
         self.inner.check_ownership()?;
-        let result = crate::caught(call);
+        let result = crate::caught(|| {
+            if let Some(torch) = self.inner.torch.get() { torch.check_completion()?; }
+            let result = call();
+            if !result.as_ref().err().is_some_and(|e| e.is_sticky() || matches!(e, Error::Internal(_) | Error::Closed(_))) {
+                if let Some(torch) = self.inner.torch.get() { torch.check_completion()?; }
+            }
+            result
+        });
         if let Some(error) = result.as_ref().err().filter(|e| e.is_sticky() || matches!(e, Error::Internal(_) | Error::Closed(_))) {
             self.inner.lost_backing(error);
         }

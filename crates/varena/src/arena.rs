@@ -759,9 +759,7 @@ impl Torch {
     /// A torch block on `stream`: in `pool`'s arena while a capture routes there, else the thread's
     /// routed arena, else the process's. Err is `Exhausted`, whose text is torch's OOM reason.
     pub fn alloc(&self, bytes: u64, stream: usize, pool: Option<PoolId>) -> Result<u64> {
-        if self.sh.clocks.read().values().any(|clock| clock.lost.load(Acquire)) {
-            return Err(Error::Ownership("an allocator stream's completion is unproven".into()));
-        }
+        self.check_completion()?;
         let size = bytes.max(1).checked_next_multiple_of(ALIGN).filter(|s| *s < 1 << 50).ok_or_else(|| exhausted(bytes, "no device holds that much"))?;
         let sh = &self.sh;
         let result = match pool {
@@ -774,11 +772,14 @@ impl Torch {
                 sh.alloc_in(&sh.routed(), size, stream, sh.capturing())
             }
         };
-        if !result.as_ref().err().is_some_and(Error::is_sticky)
-            && sh.clocks.read().values().any(|clock| clock.lost.load(Acquire)) {
-            return Err(Error::Ownership("an allocator stream's completion is unproven".into()));
-        }
+        if !result.as_ref().err().is_some_and(Error::is_sticky) { self.check_completion()?; }
         result
+    }
+
+    pub(crate) fn check_completion(&self) -> Result<()> {
+        if self.sh.clocks.read().values().any(|clock| clock.lost.load(Acquire)) {
+            Err(Error::Ownership("an allocator stream's completion is unproven".into()))
+        } else { Ok(()) }
     }
 
     /// Never fails and never waits on the device; a pointer no arena holds is logged.
