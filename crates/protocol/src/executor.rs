@@ -744,7 +744,9 @@ pub struct Answer {
     pub result: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub byte_grants: Vec<ByteGrant>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Advisory: a progress of a shape this side does not read is absent, never the answer's
+    /// failure.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
     pub progress: Option<CallProgress>,
     /// A failed child call's raising traceback, whole (its triage's).
     #[serde(skip_serializing_if = "String::is_empty")]
