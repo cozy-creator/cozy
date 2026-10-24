@@ -2,16 +2,13 @@
 //! method, URL, headers and payload digest, so a bearer token and S3 SigV4 both fit.
 //! [`default_for`] picks the provider an endpoint gets when the caller gives none, by host.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{
-    sign, PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningSettings,
-    UriPathNormalizationMode,
-};
-use aws_sigv4::sign::v4;
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 
 pub use super::net::HeaderMap;
 use super::policy::base_host;
@@ -90,16 +87,17 @@ fn env(var: &str) -> Option<String> {
 }
 
 /// AWS Signature Version 4 for S3 and its kin (R2, MinIO): every header but `range` signed, the
-/// payload by its digest when known.
+/// payload by its digest when known, the path as sent (S3's is encoded once, never normalized).
 pub struct SigV4 {
-    credentials: Credentials,
+    access_key: String,
+    secret: String,
+    session: Option<String>,
     region: String,
 }
 
 impl SigV4 {
     pub fn new(access_key: &str, secret: &str, session: Option<String>, region: &str) -> SigV4 {
-        let credentials = Credentials::new(access_key, secret, session, None, "tensorfs");
-        SigV4 { credentials, region: region.to_owned() }
+        SigV4 { access_key: access_key.into(), secret: secret.into(), session, region: region.into() }
     }
 
     /// From `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_REGION`
@@ -108,34 +106,120 @@ impl SigV4 {
         let region = env("AWS_REGION").or_else(|| env("AWS_DEFAULT_REGION")).unwrap_or_else(|| "us-east-1".into());
         Some(SigV4::new(&env("AWS_ACCESS_KEY_ID")?, &env("AWS_SECRET_ACCESS_KEY")?, env("AWS_SESSION_TOKEN"), &region))
     }
+
+    /// The headers that sign `request` (all of its headers) at `now`, seconds since the epoch.
+    fn sign(&self, request: &Request<'_>, now: u64) -> Result<Vec<(String, String)>> {
+        let failed = |detail: String| Refusal { code: Code::CREDENTIAL_REQUIRED, detail: format!("SigV4: {detail}") };
+        let uri: hyper::Uri = request.url.parse().map_err(|e| failed(format!("{}: {e}", request.url)))?;
+        let authority = uri.authority().ok_or_else(|| failed(format!("{} names no host", request.url)))?;
+        let default_port = matches!((uri.scheme_str(), authority.port_u16()), (Some("https"), Some(443)) | (Some("http"), Some(80)));
+        let stamp = utc_stamp(now);
+        let scope = format!("{}/{}/s3/aws4_request", &stamp[..8], self.region);
+        let payload = request.payload.unwrap_or("UNSIGNED-PAYLOAD");
+        let mut own = vec![("x-amz-date".to_owned(), stamp.clone()), ("x-amz-content-sha256".to_owned(), payload.to_owned())];
+        if let Some(token) = &self.session {
+            own.push(("x-amz-security-token".into(), token.clone()));
+        }
+        // Names lowercased and sorted; a repeated header's trimmed values joined by commas.
+        let mut headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        // What a proxy or the transport may change is never signed (as AWS's SDKs leave it).
+        const UNSIGNED: [&str; 4] = ["authorization", "user-agent", "x-amzn-trace-id", "transfer-encoding"];
+        for (name, value) in request.headers.iter().filter(|(name, _)| !UNSIGNED.iter().any(|u| name.eq_ignore_ascii_case(u))) {
+            headers.entry(name.to_ascii_lowercase()).or_default().push(value.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" "));
+        }
+        let host = if default_port { authority.host() } else { authority.as_str() };
+        headers.entry("host".into()).or_insert_with(|| vec![host.to_owned()]);
+        for (name, value) in &own {
+            headers.insert(name.clone(), vec![value.clone()]);
+        }
+        let signed = headers.keys().map(String::as_str).collect::<Vec<_>>().join(";");
+        let mut canonical = format!("{}\n{}\n{}\n", request.method, uri.path(), canonical_query(uri.query().unwrap_or("")));
+        for (name, values) in &headers {
+            canonical += &format!("{name}:{}\n", values.join(","));
+        }
+        canonical += &format!("\n{signed}\n{payload}");
+        let to_sign = format!("AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{:x}", Sha256::digest(canonical.as_bytes()));
+        let mut key = hmac(format!("AWS4{}", self.secret).as_bytes(), &stamp.as_bytes()[..8]);
+        for part in [self.region.as_str(), "s3", "aws4_request"] {
+            key = hmac(&key, part.as_bytes());
+        }
+        let signature = hmac(&key, to_sign.as_bytes());
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={}",
+            self.access_key,
+            signature.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        own.push(("authorization".into(), authorization));
+        Ok(own)
+    }
 }
 
 #[async_trait]
 impl TokenProvider for SigV4 {
     async fn headers(&self, request: &Request<'_>) -> Result<Vec<(String, String)>> {
-        let failed = |e: &dyn std::fmt::Display| Refusal { code: Code::CREDENTIAL_REQUIRED, detail: format!("SigV4: {e}") };
-        let identity = self.credentials.clone().into();
-        let mut settings = SigningSettings::default();
-        settings.percent_encoding_mode = PercentEncodingMode::Single;
-        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
-        settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-        let params = v4::SigningParams::builder()
-            .identity(&identity)
-            .region(&self.region)
-            .name("s3")
-            .time(SystemTime::now())
-            .settings(settings)
-            .build()
-            .map_err(|e| failed(&e))?
-            .into();
-        let body = request.payload.map_or(SignableBody::UnsignedPayload, |hex| SignableBody::Precomputed(hex.to_owned()));
-        let signed = (request.headers.iter())
-            .filter(|(name, _)| !name.eq_ignore_ascii_case("range"))
-            .map(|(name, value)| (name.as_str(), value.as_str()));
-        let signable = SignableRequest::new(request.method, request.url, signed, body).map_err(|e| failed(&e))?;
-        let (instructions, _) = sign(signable, &params).map_err(|e| failed(&e))?.into_parts();
-        Ok(instructions.headers().map(|(n, v)| (n.to_owned(), v.to_owned())).collect())
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let headers: Vec<_> = request.headers.iter().filter(|(name, _)| !name.eq_ignore_ascii_case("range")).cloned().collect();
+        self.sign(&Request { headers: &headers, ..*request }, now)
     }
+}
+
+fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes a key of any size");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
+}
+
+/// `YYYYMMDDTHHMMSSZ` for `secs` since the Unix epoch (days to the civil date, proleptic Gregorian).
+fn utc_stamp(secs: u64) -> String {
+    let (days, time) = ((secs / 86_400) as i64 + 719_468, secs % 86_400);
+    let (era, day_of_era) = (days.div_euclid(146_097), days.rem_euclid(146_097));
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 { shifted_month + 3 } else { shifted_month - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z", time / 3600, time / 60 % 60, time % 60)
+}
+
+/// The query as SigV4 signs it: each pair decoded as a form, encoded again with only the
+/// unreserved characters bare, the pairs sorted.
+fn canonical_query(query: &str) -> String {
+    let mut pairs: Vec<(String, String)> = (query.split('&').filter(|pair| !pair.is_empty()))
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (encode(&decode(key)), encode(&decode(value)))
+        })
+        .collect();
+    pairs.sort();
+    pairs.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>().join("&")
+}
+
+/// Form decoding: `+` is a space, `%XX` a byte, anything else itself.
+fn decode(text: &str) -> String {
+    let (bytes, mut out, mut at) = (text.as_bytes(), Vec::with_capacity(text.len()), 0);
+    while at < bytes.len() {
+        let hex = |i: usize| bytes.get(i).and_then(|b| (*b as char).to_digit(16));
+        match (bytes[at], hex(at + 1), hex(at + 2)) {
+            (b'+', ..) => out.push(b' '),
+            (b'%', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                at += 2;
+            }
+            (byte, ..) => out.push(byte),
+        }
+        at += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// The HTTP base of `s3://<bucket>[/<prefix>]`, path-style: at `AWS_ENDPOINT_URL_S3`, else

@@ -41,7 +41,7 @@ axum.workspace = true
 ed25519-dalek = { workspace = true, features = ["pem", "pkcs8"] }
 rcgen.workspace = true
 base64.workspace = true
-hmac = "0.12"
+hmac.workspace = true
 sha2.workspace = true
 tar.workspace = true
 flate2.workspace = true
