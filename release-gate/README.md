@@ -48,6 +48,12 @@ The runner signs in as the owner's account with its own device key: secret `COZY
 
 - **Cells:** `--cells FILE` adds rows of `name<TAB>target<TAB>args`. The args are expanded in gate.sh, which defines
   `$SCENE`, `$CHAR`, `$R`, `$K`, `$M` and `$CLI`. A FILE ending in `.sh` is sourced after the last product cell.
+- **CLI behaviour** (`--before cells/cl650.sh`, sourced on the fresh pod before the candidate goes on): cozy #1925
+  updates a real 0.11.15 TensorD and verifies the version, and a release whose cozy-runtime floor the pair misses
+  refuses `runtime_floor_unmet` until `cozy machine update --runtime <v> --tensorfs <v>`. Each check is a gate.sh
+  `expect` row in `expect.tsv`, which `analyze.py` fails on.
+- **LM coverage** (`lm.py`, every gate): Fibo's and Klein's prompt upsamplers and H3's reference describer ran their
+  greedy token loops (H3's cell gives a character reference, which BiRefNet cleans and Qwen3.5 describes).
 - **Stress** (`cells/stress.sh`, suite `stress`): SDXL, Anima and 5 s H3 under 8, 6 and 3 GiB caps on one
   rtx-5090, with SDXL and Anima alternating three times at 6 GiB, plus SDXL and Anima on a real 8 GB rtx-3070.
   `stress.py` checks each cap took, nothing held more than its cap, the kernels match the uncapped cells, no bytes
