@@ -17,11 +17,10 @@ pub(crate) struct Packages {
 impl Packages {
     pub(crate) async fn open(ctx: &Context, on: Option<On>) -> Result<Self, Error> {
         ctx.narrowed()?;
-        let on = on
-            .as_ref()
-            .map(named)
-            .transpose()?
-            .map(str::to_ascii_lowercase);
+        let on = match on.as_ref().map(named).transpose()? {
+            Some(text) => Some(crate::machine::machine(ctx, &text.to_ascii_lowercase()).await?.name),
+            None => None,
+        };
         let machines = Machines::open(ctx).await?;
         Ok(Self { on, machines })
     }
@@ -43,7 +42,7 @@ impl Packages {
 
     pub(crate) fn rows(&self, ctx: &Context) -> Vec<Vec<String>> {
         let shown = |m: &&Machine| match &self.on {
-            Some(name) => m.name.eq_ignore_ascii_case(name) || m.alias.as_deref() == Some(name),
+            Some(name) => m.name == *name,
             // A stopped `local` shows what it held when it last ran.
             None => matches!(m.state, MachineState::Ready | MachineState::Stopped),
         };

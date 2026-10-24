@@ -241,12 +241,13 @@ struct Held {
 
 /// What every machine holds (or the one `--on` names), from its latest Status through Calcifer.
 pub(crate) async fn list(ctx: &Context, args: List) -> Result<ExitCode, Error> {
+    let on = match &args.on {
+        Some(on) => Some(crate::machine::machine(ctx, on).await?.name),
+        None => None,
+    };
     let machines = ctx.calcifer().await?.machines().await?.machines;
-    if let Some(on) = args.on.as_ref().filter(|on| !machines.iter().any(|m| m.name == **on)) {
-        return Err(Error::new(Kind::NotFound, "machine_not_found", format!("no machine named {on}")).next("cozy machine list"));
-    }
     let (mut rows, mut stores, mut silent) = (vec![], vec![], vec![]);
-    for machine in machines.iter().filter(|m| args.on.as_ref().is_none_or(|on| *on == m.name)) {
+    for machine in machines.iter().filter(|m| on.as_ref().is_none_or(|on| *on == m.name)) {
         let Some(status) = &machine.status else {
             silent.push(machine.name.as_str());
             continue;

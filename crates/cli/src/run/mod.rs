@@ -543,17 +543,10 @@ pub(crate) async fn gpuless(ctx: &Context, on: &On, interface: &Interface, calla
     if !interface.gpu(callable) {
         return;
     }
-    let Ok(calcifer) = ctx.calcifer().await else {
+    let Ok(machine) = crate::machine::machine(ctx, name).await else {
         return;
     };
-    let Ok(listed) = calcifer.machines().await else {
-        return;
-    };
-    let none = listed.machines.iter().any(|m| {
-        (m.name == *name || m.alias.as_deref() == Some(name))
-            && (m.status.as_ref()).is_some_and(|s| s.phase == "ready" && s.gpus.is_empty())
-    });
-    if none {
+    if (machine.status.as_ref()).is_some_and(|s| s.phase == "ready" && s.gpus.is_empty()) {
         output::warn(&format!(
             "{name} has no supported GPU, so {target} runs on its CPU, slowly, or not at all if it loads a model; `--on new` rents one: cozy run {target} … --on new"
         ));
