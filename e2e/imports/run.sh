@@ -58,9 +58,10 @@ done <<< "$releases"
 
 if [ -n "$PACKAGES" ]; then
   step "the checkout's packages"
-  for toml in "$PACKAGES"/*/package.toml; do
-    dir=$(dirname "$toml") name=$(basename "$(dirname "$toml")")
-    version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$dir/pyproject.toml" | head -1)
+  # A package is a directory whose pyproject declares a cozy.application entry point.
+  for toml in $(grep -l 'cozy.application' "$PACKAGES"/*/pyproject.toml); do
+    dir=$(dirname "$toml") name=$(sed -n 's/^name = "\(.*\)"/\1/p' "$toml" | head -1)
+    version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$toml" | head -1)
     if install "checkout-$name" "./$dir"; then import_release "checkout-$name" "$name" "$version"; fi
   done
 fi
