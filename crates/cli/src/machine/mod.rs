@@ -173,8 +173,10 @@ pub(crate) fn route(name: &str) -> Result<String, Error> {
     Ok(format!("/v1/machines/{name}"))
 }
 
-async fn machine(ctx: &Context, name: &str) -> Result<Machine, Error> {
-    ctx.calcifer().await?.get(&route(name)?).await
+/// The machine `text` names, by Calcifer's one resolver: its name, the name it had before, or its
+/// rental id. Every `--on` that reads a machine resolves it here.
+pub(crate) async fn machine(ctx: &Context, text: &str) -> Result<Machine, Error> {
+    ctx.calcifer().await?.get(&route(text)?).await
 }
 
 async fn add(
