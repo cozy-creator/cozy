@@ -9,10 +9,11 @@
 OLDV=0.11.15 FLOORED=sdxl/generate@2.13.1 MEETS=(--runtime 0.31.0 --tensorfs 0.14.0)
 pair() { timeout 60 "$CLI" --json machine show "$M" 2>/dev/null \
   | python3 -c 'import json,sys; s=json.load(sys.stdin)["status"]; print(s["version"], s["runtime"], s["tensorfs"])'; }
-# pypi <dist> <version>: its manylinux x86_64 (else pure) wheel, as URL#sha256=<hex>.
+# pypi <dist> <version>: its wheel for the pod's CPython 3.12 on manylinux x86_64 (else pure), as URL#sha256=<hex>.
 pypi() { curl -sf "https://pypi.org/pypi/$1/$2/json" | python3 -c 'import json,sys
 w = [f for f in json.load(sys.stdin)["urls"] if f["filename"].endswith(".whl")]
-w = [f for f in w if "manylinux" in f["filename"] and "x86_64" in f["filename"]] or [f for f in w if "-none-any" in f["filename"]]
+w = [f for f in w if "manylinux" in f["filename"] and "x86_64" in f["filename"] and ("-cp312-" in f["filename"] or "-abi3-" in f["filename"])] \
+    or [f for f in w if "-none-any" in f["filename"]]
 print(w[0]["url"] + "#sha256=" + w[0]["digests"]["sha256"])'; }
 number() { grep -ho '"number":[0-9]*' "$@" 2>/dev/null | head -1 | cut -d: -f2; }
 mkdir -p "$OUT/cl650"; C=$OUT/cl650
