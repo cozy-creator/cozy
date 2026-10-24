@@ -489,10 +489,9 @@ def _lease(native: Native, ns: int) -> str | None:
 class Memory:
     """This process's memory on one device: its models, regions and requests."""
 
-    def __init__(self, native: Native, device: torch.device, limit: int | None = None) -> None:
+    def __init__(self, native: Native, device: torch.device) -> None:
         self.native, self.device = native, device
         self.cuda = device.type == "cuda"
-        self.limit = limit
         #: why this GPU runs standalone though TensorD asked it to lease (`Memory.open(leases=)`)
         self.standalone: str | None = None
         self._graph_pool: tuple[int, int] | None = None
@@ -506,44 +505,32 @@ class Memory:
         self.crossed = 0
 
     @classmethod
-    def open(cls, gpu: int | str | torch.device | GpuId = 0, *, leases: int | None = None, limit: int | None = None) -> Memory:
+    def open(cls, gpu: int | str | torch.device | GpuId = 0, *, leases: int | None = None) -> Memory:
         """The device's memory. On CUDA, with `leases` (TensorD's namespace, from its Start), its
         pages and torch's are leased from TensorD's manager (`_lease`); without, or with no
         compatible manager, it runs standalone on the device's free bytes at open less the
-        backend's reserve, capped by `limit` bytes when configured (zero is honored). A cap
-        requires standalone mode and a native binding supporting it; it is never ignored.
-        Then varena becomes torch's only allocator (`_install`), so open it
+        backend's reserve. Then varena becomes torch's only allocator (`_install`), so open it
         before any torch CUDA call. CPU and MPS use host pages of the machine's RAM; a `GpuId`
         names a host table and its size. A process has one Memory per device: opening the device
         again returns it, and a CUDA device's lives as long as the process (torch's blocks are
         its)."""
         device = torch.device("cpu") if isinstance(gpu, GpuId) else torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
-        if limit is not None and (type(limit) is not int or not 0 <= limit < 1 << 64 or device.type != "cuda" or leases is not None):
-            raise VarenaError("a GPU memory limit requires standalone CUDA and an unsigned byte count")
         if device.type == "cuda":
             device = torch.device("cuda", device.index or 0)
         key = gpu.uuid if isinstance(gpu, GpuId) else str(device)
         with _opening:
             memory = _memories.get(key)
-            if memory is not None and limit is not None and memory.limit != limit:
-                raise VarenaError("this device's memory already opened with a different limit")
             if memory is None:  # one Memory per device and process: a second open is the first
                 if isinstance(gpu, GpuId):
                     native = Native.host(gpu)
                 elif device.type == "cuda":
-                    if limit is None:
-                        native = Native.cuda(device.index or 0)
-                    else:
-                        try:
-                            native = Native.cuda(device.index or 0, limit=limit)
-                        except TypeError as exc:
-                            raise VarenaError("the native TensorFS binding cannot honor the configured GPU memory limit") from exc
+                    native = Native.cuda(device.index or 0)
                 else:
                     ram = host_limit()  # past it the kernel kills: a cgroup's limit, not physical memory
                     if ram is None:
                         raise VarenaError("this process's memory limit is unreadable: the host table has no size")
                     native = Native.host(GpuId("host", device.type, ram))
-                memory = cls(native, device, limit)
+                memory = cls(native, device)
                 if device.type == "cuda":
                     if leases is not None:
                         memory.standalone = _lease(native, leases)  # leased: torch is served from its grants

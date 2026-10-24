@@ -114,8 +114,8 @@ class Set:
 
 class Memory:
     @staticmethod
-    def cuda(ordinal: int, *, limit: int | None = None) -> Memory:
-        """CUDA device memory, optionally capped in bytes (including zero), before torch CUDA init."""
+    def cuda(ordinal: int) -> Memory:
+        """CUDA device `ordinal`'s memory. Open it before torch initializes CUDA."""
 
     @staticmethod
     def host(gpu: GpuId) -> Memory:

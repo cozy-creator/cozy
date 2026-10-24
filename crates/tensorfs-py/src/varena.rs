@@ -234,10 +234,10 @@ impl PyMemory {
     }
 
     /// `gpu`'s memory; the backend opens first.
-    fn open(py: Python<'_>, dl: (i32, i32), limit: Option<u64>, backend: impl Send + FnOnce() -> varena::Result<(GpuId, Box<dyn Backend>)>) -> PyResult<Self> {
+    fn open(py: Python<'_>, dl: (i32, i32), backend: impl Send + FnOnce() -> varena::Result<(GpuId, Box<dyn Backend>)>) -> PyResult<Self> {
         let (gpu, memory) = detached(py, "", || {
             let (gpu, backend) = backend()?;
-            Ok((gpu.clone(), Memory::open_with_limit(gpu, backend, limit)?))
+            Ok((gpu.clone(), Memory::open(gpu, backend)?))
         })?;
         let gpu = PyGpuId { uuid: gpu.uuid, model: gpu.model, memory: gpu.memory };
         Ok(PyMemory { memory: Some(Arc::new(memory)), gpu, dl })
@@ -246,11 +246,10 @@ impl PyMemory {
 
 #[pymethods]
 impl PyMemory {
-    /// CUDA device `ordinal`'s memory, optionally capped in bytes. Open before torch initializes CUDA.
+    /// CUDA device `ordinal`'s memory. Open it before torch initializes CUDA.
     #[staticmethod]
-    #[pyo3(signature = (ordinal, *, limit = None))]
-    fn cuda(py: Python<'_>, ordinal: i32, limit: Option<u64>) -> PyResult<Self> {
-        let memory = PyMemory::open(py, (KDL_CUDA, ordinal), limit, || {
+    fn cuda(py: Python<'_>, ordinal: i32) -> PyResult<Self> {
+        let memory = PyMemory::open(py, (KDL_CUDA, ordinal), || {
             let backend = CudaBackend::open(ordinal)?;
             Ok((backend.gpu()?, Box::new(backend) as Box<dyn Backend>))
         })?;
@@ -333,7 +332,7 @@ impl PyMemory {
     fn host(py: Python<'_>, gpu: PyGpuId) -> PyResult<Self> {
         let memory = platform::contain::host_memory::limit().map_or(gpu.memory, |limit| limit.min(gpu.memory));
         let id = GpuId { uuid: gpu.uuid, model: gpu.model, memory };
-        PyMemory::open(py, (KDL_CPU, 0), None, || Ok((id.clone(), Box::new(host_backend(id.memory)) as Box<dyn Backend>)))
+        PyMemory::open(py, (KDL_CPU, 0), || Ok((id.clone(), Box::new(host_backend(id.memory)) as Box<dyn Backend>)))
     }
 
     /// Registers `set` and brings it to `level`; returns its id.
