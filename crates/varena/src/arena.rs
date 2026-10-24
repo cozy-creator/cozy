@@ -55,8 +55,6 @@ const ALIGN: u64 = 512;
 const CLASSES: [u64; 15] = [512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536];
 /// A pool span no stream has used yet: the capture stream that first needs it takes it.
 const ANY: usize = usize::MAX;
-/// The float: idle spans kept for allocation latency at least this big (leases §2).
-pub const FLOAT: u64 = 64 << 20;
 /// The poller's cadence while epochs are outstanding: it doubles to the longest while nothing lands.
 const NAP: Duration = Duration::from_micros(50);
 const NAP_MAX: Duration = Duration::from_millis(2);
@@ -151,8 +149,8 @@ pub struct Stats {
     /// Every span mapped: the arenas' and the idle list's.
     pub mapped: u64,
     pub idle: u64,
-    /// The allocator's own overhead: mapped less live torch bytes (the idle float, and free bytes
-    /// inside spans in use).
+    /// The allocator's own overhead: mapped less live torch bytes (idle spans, kept until TensorD
+    /// reclaims them, and free bytes inside spans in use).
     pub fragmentation: u64,
     pub arenas: Vec<(Owner, ArenaStats)>,
 }
@@ -256,8 +254,6 @@ struct State {
     /// covers it.
     carried: u64,
     mapped: u64,
-    /// The most it held: a request's spans that went idle mid-request are its next step's.
-    peak_mapped: u64,
     /// A pool: captures begun less graphs released (torch's use count).
     users: u32,
     /// A pool released with no fence: its epoch fallback is stamped once no capture is open.
@@ -708,10 +704,6 @@ struct Shared {
     peak: AtomicU64,
     mapped: AtomicU64,
     stop: AtomicBool,
-    /// The largest span taken since the last request ended, and in the request before: the
-    /// float holds at least one of them.
-    taken: AtomicU64,
-    taken_before: AtomicU64,
 }
 
 /// One device's torch allocator: every arena, the idle list and the epoch poller.
@@ -748,8 +740,6 @@ impl Torch {
             peak: AtomicU64::new(0),
             mapped: AtomicU64::new(0),
             stop: AtomicBool::new(false),
-            taken: AtomicU64::new(0),
-            taken_before: AtomicU64::new(0),
         });
         let weak = Arc::downgrade(&sh);
         std::thread::Builder::new().name("varena-epochs".into()).spawn(move || poll(&weak)).map_err(|e| Error::io("spawn the epoch poller", e))?;
@@ -935,16 +925,8 @@ impl Torch {
         }
         let Some(a) = self.sh.arenas.lock().remove(&owner) else { return Ended::default() };
         a.ended.store(true, Release);
-        if matches!(owner, Owner::Request(_)) {
-            self.sh.taken_before.store(self.sh.taken.swap(0, AcqRel), Release);
-        }
-        let ended = {
-            let st = a.st.lock();
-            Ended { allocated: st.allocated, peak: st.peak, outlived: st.live() }
-        };
-        // Its idle spans beyond the float go back now.
-        self.sh.kick();
-        ended
+        let st = a.st.lock();
+        Ended { allocated: st.allocated, peak: st.peak, outlived: st.live() }
     }
 
     pub fn stats(&self) -> Stats {
@@ -1293,8 +1275,6 @@ impl Shared {
         st.blocks.insert(base, Block { len, span: base, free: true });
         st.free.insert((stream, tier, len, base));
         st.mapped += len;
-        st.peak_mapped = st.peak_mapped.max(st.mapped);
-        self.taken.fetch_max(len, AcqRel);
         self.dir.write().insert(base, (len, a.clone()));
     }
 
@@ -1601,26 +1581,6 @@ impl Shared {
         progress
     }
 
-    /// Quiet idle bytes beyond what idle may hold (leases rev 6: as little as hides allocation
-    /// latency): the float, at least the largest recent span, plus what open requests held at their
-    /// peak beyond what they hold now (their next step's spans). One snapshot: the requests' arenas
-    /// and the idle list are read together, so a span moving between them (adopted, or freed whole)
-    /// never looks spare. The poller's only; no other thread holds two arena locks.
-    fn excess(&self) -> u64 {
-        let requests: Vec<Arc<Arena>> = self.arenas.lock().values().filter(|a| matches!(a.owner, Owner::Request(_))).cloned().collect();
-        let held: Vec<_> = requests.iter().map(|a| a.st.lock()).collect();
-        let working: u64 = held.iter().map(|st| st.peak_mapped.saturating_sub(st.mapped)).sum();
-        let quiet = self.idle.lock().bytes().0;
-        drop(held);
-        quiet.saturating_sub(FLOAT.max(self.taken.load(Acquire)).max(self.taken_before.load(Acquire)) + working)
-    }
-
-    /// Quiet idle spans beyond the float go back to the source now, oldest first.
-    fn trim(&self) -> bool {
-        let excess = self.excess();
-        excess > 0 && self.reclaim(excess) > 0
-    }
-
     /// One round: record wanted epochs (no capture open), query those in flight, settle arenas.
     /// Returns (progress, busy).
     fn tick(&self) -> (bool, bool) {
@@ -1640,7 +1600,6 @@ impl Shared {
             a.queued.store(false, Release);
             progress |= self.settle(&a);
         }
-        progress |= self.trim();
         self.backend.sweep();
         let busy = !self.pending.lock().is_empty() || clocks.iter().any(|c| !c.lost.load(Acquire) && c.wanted.load(Acquire) > c.done.load(Acquire));
         (progress, busy)
@@ -1688,15 +1647,26 @@ pub struct Direct {
     backend: Arc<dyn Backend>,
     allowance: Arc<Allowance>,
     held: Mutex<HashMap<u64, Physical>>,
+    /// The Memory's room for `bytes` (its weight pages give way in its victim order, as a
+    /// manager's revoke would): true when it made some.
+    room: Room,
 }
 
+/// A standalone Memory's make_room for torch's chunks.
+pub type Room = Box<dyn Fn(u64) -> bool + Send + Sync>;
+
 impl Direct {
-    pub fn new(backend: Arc<dyn Backend>, allowance: Arc<Allowance>) -> Direct {
-        Direct { backend, allowance, held: Mutex::new(HashMap::new()) }
+    pub fn new(backend: Arc<dyn Backend>, allowance: Arc<Allowance>, room: Room) -> Direct {
+        Direct { backend, allowance, held: Mutex::new(HashMap::new()), room }
     }
 
     fn one(&self, va: Va, off: u64, len: u64) -> Result<Chunk> {
-        let p = self.allowance.create(&*self.backend, len).map_err(|e| match e {
+        let made = match self.allowance.create(&*self.backend, len) {
+            // Short: the weights it shares the allowance with give way, then once more.
+            Err(_) if (self.room)(len) => self.allowance.create(&*self.backend, len),
+            made => made,
+        };
+        let p = made.map_err(|e| match e {
             Error::Device { code: OUT_OF_MEMORY, .. } => exhausted(len, "the device is out of memory"),
             e => e,
         })?;

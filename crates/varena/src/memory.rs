@@ -187,7 +187,7 @@ pub struct Ref {
     pub block: u32,
     pub bytes: u64,
     pub origin: Origin,
-    /// It was prefetched before this bind.
+    /// It was prefetched, and this is its first bind since.
     pub speculative: bool,
 }
 
@@ -584,6 +584,8 @@ struct Job {
     /// The page's earlier consumers (release events) a refill in place writes after: the copy
     /// stream waits on them in-stream, and they are retired once the fill's event follows them.
     after: Vec<Event>,
+    /// Issued ahead of any bind (a prefetch or a regrowth): its bytes count as speculative.
+    speculative: bool,
 }
 
 /// Fill jobs, in groups: the pages the mechanism mapped together (a bind's block) reach a fill
@@ -751,13 +753,18 @@ impl State {
     /// Where a fill is recorded: its request's record, else (a load's, or one with no request
     /// open) the next request's, which opens with them.
     fn fills(&mut self, req: Option<u64>, key: Key, bytes: u64, origin: Origin) -> &mut Stats {
+        if !req.is_some_and(|r| self.stats.contains_key(&r)) {
+            let set = self.sets.get(key.0 as usize).and_then(Option::as_ref).map(|m| m.spec.name.clone()).unwrap_or_default();
+            self.unclaimed.trace.push(Ref { step: 0, set, block: key.1, bytes, origin, speculative: false });
+        }
+        self.record(req)
+    }
+
+    /// The record a page's bytes count in: its request's, else the unclaimed one.
+    fn record(&mut self, req: Option<u64>) -> &mut Stats {
         match req.filter(|r| self.stats.contains_key(r)) {
             Some(r) => self.stats.entry(r).or_default(),
-            None => {
-                let set = self.sets.get(key.0 as usize).and_then(Option::as_ref).map(|m| m.spec.name.clone()).unwrap_or_default();
-                self.unclaimed.trace.push(Ref { step: 0, set, block: key.1, bytes, origin, speculative: false });
-                &mut self.unclaimed
-            }
+            None => &mut self.unclaimed,
         }
     }
 
@@ -847,6 +854,9 @@ struct Inner {
     /// Pages the mechanism thread mapped and has not handed to the fill threads yet (demand,
     /// ahead): it hands them over together once its queue is empty or they make a batch.
     grouped: Mutex<(Vec<Job>, Vec<Job>)>,
+    /// Leased pages asked of the manager and not answered yet: their grants reach the fill
+    /// threads as one batch once the last is in (or the batch's bytes are reached).
+    asking: AtomicU64,
     burst: Arc<(Mutex<Burst>, Condvar)>,
     quiet: Arc<Quiet>,
     ownership_lost: AtomicBool,
@@ -949,6 +959,7 @@ impl Memory {
                 releases,
                 jobs: Jobs { demand, ahead },
                 grouped: Mutex::default(),
+                asking: AtomicU64::new(0),
                 burst: Arc::new((Mutex::new(Burst::default()), Condvar::new())),
                 quiet: Arc::default(),
                 ownership_lost: AtomicBool::new(false),
@@ -1390,7 +1401,7 @@ impl Inner {
         // the unmaps decided before it, then queues its fill.
         st.homes.insert(key, Home::new(gen, speculative, identity));
         st.sync(key);
-        self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, decided: !speculative });
+        self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![], speculative }, decided: !speculative });
         Ok(true)
     }
 
@@ -1413,7 +1424,7 @@ impl Inner {
         *h = Home { phys: h.phys.take(), ..Home::new(gen, false, identity) };
         st.sync(key);
         let after: Vec<Event> = after.into_iter().map(Event).collect();
-        let job = Job { key, gen, req, span, after: vec![] };
+        let job = Job { key, gen, req, span, after: vec![], speculative: false };
         if renew {
             // A new grant takes its place once its consumers are done.
             if !after.contains(&old) {
@@ -1462,6 +1473,7 @@ impl Inner {
         let (ns, bytes) = (start.elapsed().as_nanos() as u64, pages.iter().map(|(_, (.., span))| span).sum::<u64>().max(1));
         #[cfg(unix)]
         self.read_measured(bytes, ns);
+        tracing::debug!(target: "varena::fill", pages = pages.len(), bytes, ns, "fill batch");
         // After a copy error the engine's copies may still run: a failed page is unmapped only
         // once the copy stream is proven drained.
         let ownership_lost = landed.iter().any(|out| matches!(out, Err(Error::Ownership(_))));
@@ -1505,7 +1517,6 @@ impl Inner {
                     // Stored bytes are the weights; a declared set's are once transformed, or
                     // refilled from their derived entry.
                     let filled = origin == Origin::Derived || sets.get(&job.key.0).is_some_and(|spec| matches!(spec.fingerprint.fill, Fill::Stored));
-                    let speculative = st.homes.get(&job.key).is_some_and(|h| h.speculative);
                     // A page read ready at issue is its binders' since: a transform may have
                     // filled it already, so only its accounting is left.
                     if let (Some(ready), Some(h)) = (ready, st.homes.get_mut(&job.key)) {
@@ -1521,7 +1532,7 @@ impl Inner {
                     f.bytes += span;
                     // The batch's time, shared by its bytes.
                     f.ns += (u128::from(ns) * u128::from(span) / u128::from(bytes)) as u64;
-                    if speculative {
+                    if job.speculative {
                         s.moved.speculative += span;
                     }
                 }
@@ -1785,9 +1796,23 @@ impl Inner {
                 self.unlock(st);
                 break Ok(free);
             }
+            // Torch's quiet idle spans first, in both modes: the cheapest bytes (the policy's stage
+            // 1, this process's free list), before any weight page. Leased they go back to the
+            // manager the ask is retried with; standalone, to the allowance weights share. No
+            // state lock across them (R10).
+            if let Some(torch) = self.torch.get().cloned() {
+                self.unlock(st);
+                let given = torch.reclaim(bytes - free);
+                if given > 0 {
+                    record.freed += given;
+                    continue;
+                }
+                st = self.lock();
+            }
             // Idle work (a request opened idle, a free-only bind) takes free bytes only; nothing
-            // takes more than it could ever have (its pinned pages stay).
-            let pinned: u64 = st.table.pages().filter(|(k, p)| p.mapped && (!p.pins.is_empty() || p.filling) && !keep.contains(k)).map(|(_, p)| p.bytes).sum();
+            // takes more than it could ever have (its pinned pages stay; a page still filling is
+            // the round's once it lands, waited for below).
+            let pinned: u64 = st.table.pages().filter(|(k, p)| p.mapped && !p.pins.is_empty() && !keep.contains(k)).map(|(_, p)| p.bytes).sum();
             let idle = free_only || req.and_then(|r| st.table.request(r)).is_some_and(|r| r.idle);
             if idle || bytes > (free + st.table.mapped()).saturating_sub(pinned) {
                 let out = short(&st);
@@ -2113,6 +2138,8 @@ impl Inner {
         let id = st.tick();
         let now = st.clock;
         let Some(h) = st.homes.get_mut(&key) else { return Err(Error::Internal("a bound page lost its home".into())) };
+        // Its first bind ends the speculation: later binds are demands.
+        h.speculative = false;
         let fresh = h.fresh();
         let transform = fresh;
         if transform {
@@ -2696,6 +2723,9 @@ impl Inner {
         if let Some(agent) = self.lease.get().cloned() {
             let (start, region) = (Instant::now(), self.lease_region(key));
             let me = Arc::downgrade(self);
+            // Answered exactly once (granted, refused, or failed when the manager goes):
+            // `leased_page` counts it out.
+            self.asking.fetch_add(1, Ordering::AcqRel);
             let asked = agent.ask(
                 span,
                 crate::lease::Kind::Weights,
@@ -2762,8 +2792,9 @@ impl Inner {
                 if let Some(h) = st.homes.get_mut(&key) {
                     h.phys = Some(p);
                 }
+                // The lease's time only: the fill itself is traced once, by its batch.
                 if let Some(ns) = ns {
-                    let s = st.fills(job.req, key, span, Origin::Store);
+                    let s = st.record(job.req);
                     s.moved.leased.bytes += span;
                     s.moved.leased.ns += ns;
                 }
@@ -2899,7 +2930,11 @@ impl Inner {
             Ok((p, adopted, Some(start.elapsed().as_nanos() as u64)))
         });
         self.placed(key, gen, va, off, span, job, decided, made);
-        self.flush_fills();
+        // One fill batch for a burst of grants: the fill threads read them as one run.
+        let left = self.asking.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        if left == 0 || self.grouped_bytes() >= self.fill_budget() {
+            self.flush_fills();
+        }
     }
 
     /// The manager asked pages back: the quiet ones are unmapped (their return committed now,

@@ -193,8 +193,10 @@ pub fn headroom(card: u64) -> u64 {
     (512 << 20).max(card / 16)
 }
 
-/// Blocks ahead of a pass's cursor its prefetch maps (free bytes only): one bound while the next
-/// lands.
+/// Bytes ahead of a pass's cursor its prefetch maps (free bytes only, at least [`SLOTS`] blocks):
+/// enough that the fill engine reads them in large batches, not block by block.
+pub const AHEAD: u64 = 1 << 30;
+/// Blocks ahead a prefetch maps however big they are: one bound while the next lands.
 pub const SLOTS: u64 = 2;
 
 /// Where a request is in its plan.
