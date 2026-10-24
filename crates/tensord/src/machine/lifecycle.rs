@@ -6,8 +6,8 @@
 //! nor lose it. This computer's machine counts the same clock from its start: after 5 minutes its
 //! executors exit and give back every byte they held, after 15 it exits itself (Calcifer starts
 //! it again when something uses it), unless another computer's controller is authorized to use
-//! it. A client following a run or a log, or reading an output, holds either clock. Also the Hub
-//! lease of authorized keys.
+//! it. A client following a run or a log, reading an output or uploading an object, holds either
+//! clock. Also the Hub lease of authorized keys.
 use super::hub::{Hub, Refusal};
 use crate::api::auth::Keys;
 use std::{
@@ -62,7 +62,7 @@ pub struct Lifecycle {
     following: AtomicUsize,
     /// This computer's machine stays up: another computer's controller is authorized to use it.
     kept: AtomicBool,
-    /// When an output read last moved bytes (unix ms).
+    /// When an output read or an object upload last moved bytes (unix ms).
     transferred: AtomicI64,
     /// Called when an activation starts or ends without its restart (the runs it holds change),
     /// and when an admission or a follower lets go: the idle clock may start.
@@ -141,14 +141,15 @@ impl Lifecycle {
     }
 
     /// When the idle clock runs out: 15 minutes after the latest of its start, the last job's end
-    /// and the last bytes an output read moved.
+    /// and the last bytes an output read or an upload moved.
     fn idle_end(&self, state: &State) -> i64 {
         let used = state.jobs.ended_ms.max(self.transferred.load(Ordering::Acquire));
         state.ledger.idle_since_ms.max(used) + self.grace
     }
 
-    /// An output read moved bytes: the rental is in use, and its idle clock starts again now. A
-    /// read that stalls moves nothing, so it never holds the rental past one window.
+    /// An output read or an object upload moved bytes: the rental is in use, and its idle clock
+    /// starts again now. A transfer that stalls moves nothing, so it never holds the rental past one
+    /// window.
     pub fn transferred(&self) {
         self.transferred.fetch_max(now_ms(), Ordering::AcqRel);
     }

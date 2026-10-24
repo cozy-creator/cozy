@@ -706,6 +706,10 @@ async fn put_object<B: MachineBackend>(
         match frame {
             // A refused writer drops its receiver; its refusal is the answer.
             Ok(data) => {
+                // An upload moving bytes holds the idle clock, as an output read does; a stalled one does not.
+                if let Some(lifecycle) = &m.identity.lifecycle {
+                    lifecycle.transferred();
+                }
                 if sender.send(data).await.is_err() {
                     break;
                 }
