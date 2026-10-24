@@ -8,7 +8,7 @@ repo: cozy-creator | cozy-runtime | packages | tensorhub. Run it inside a checko
 both revisions (fetch-depth 0). The change is `git diff <base>...<head>`: a PR passes its base and head,
 the release gate the last release tag and the candidate. Rules: ci/suites.toml, beside this file.
 
-Prints one token per line: suites (cli, mps, gpu, gpu-datacenter, stress), os:<name>, build:<artifact>,
+Prints one token per line: suites (cli, mps, gpu, gpu-datacenter, varena), os:<name>, build:<artifact>,
 pkg:<name> (pkg:* = every package). Nothing printed = nothing to run. --json prints
 {"suites", "os", "build", "cells", "why"}; "os" always holds linux; "why" names a path behind each token.
 --tokens takes a selection already made (the release gate's, a dispatch's) and prints it the same way.

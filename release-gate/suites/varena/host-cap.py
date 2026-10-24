@@ -4,7 +4,7 @@
 # accelerator = false
 # ///
 """The host memory this machine's executors may use: the tightest memory.max/high (cgroup v2) or memory.limit_in_bytes
-(v1) on this process's cgroup path, with MemTotal and SwapTotal. The host-RAM cap of cells/stress-host.sh."""
+(v1) on this process's cgroup path, with MemTotal and SwapTotal. The varena suite's host-RAM cap."""
 import json
 from pathlib import Path
 

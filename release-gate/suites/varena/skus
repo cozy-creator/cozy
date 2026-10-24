@@ -1,0 +1,6 @@
+# The architectures a varena release runs on: SKU, then its disk in GB when not the default 400 (Hopper and B200 when
+# the release owner asks: --skus h100-pcie,b200). cells.sh picks the flow from the machine: CPU, ≤ 8 GB or larger.
+rtx-3070  150   # Ampere, a real 8 GB card (its offers hold at most 270 GB)
+rtx-4090        # Ada
+rtx-5090        # Blackwell
+cpu       160   # host RAM under the rental's cgroup
