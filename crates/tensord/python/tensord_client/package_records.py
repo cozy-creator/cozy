@@ -33,12 +33,9 @@ class Generation(msgspec.Struct, frozen=True):
     sdk_fallback: str = ""
 
 
-class ApplicationEntry(msgspec.Struct, frozen=True):
-    default: str
-
-
 class EntryPoints(msgspec.Struct, frozen=True):
-    application: ApplicationEntry = msgspec.field(name="cozy.application")
+    #: The App by entry-point name; the Runtime reads the one entry whatever its name.
+    application: dict[str, str] = msgspec.field(name="cozy.application")
 
 
 class Project(msgspec.Struct, frozen=True):

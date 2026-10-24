@@ -45,8 +45,12 @@ def read_metadata(project: Path) -> PackageMetadata:
     parsed = msgspec.convert(tomllib.loads((project / "pyproject.toml").read_text()),
                              type=Pyproject)
     metadata = parsed.project
-    return PackageMetadata(metadata.name, metadata.version,
-                           metadata.entry_points.application.default)
+    applications = list(metadata.entry_points.application.values())
+    if len(applications) != 1:
+        raise PackageError("application_entrypoint_count",
+                           f"{project / 'pyproject.toml'} names {len(applications)} cozy.application "
+                           "entry points; exactly one is required")
+    return PackageMetadata(metadata.name, metadata.version, applications[0])
 
 
 # -S prevents authored .pth startup code; only the owned venv's regular site-packages paths
