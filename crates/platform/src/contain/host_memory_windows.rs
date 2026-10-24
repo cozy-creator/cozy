@@ -25,6 +25,11 @@ pub(super) fn total() -> i64 {
     status().map_or(-1, |status| status.ullTotalPhys as i64)
 }
 
+/// No limit below physical memory is read here.
+pub(super) fn limit() -> Option<u64> {
+    None
+}
+
 pub(super) fn read() -> HostMemory {
     let available = status().map_or(-1, |status| status.ullAvailPhys as i64);
     HostMemory {
