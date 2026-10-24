@@ -480,6 +480,35 @@ paths:
         4XX: {$ref: '#/components/responses/Error'}
         5XX: {$ref: '#/components/responses/Error'}
 
+  /v1/models/{org}/{name}/select:
+    get:
+      operationId: select_model_variant
+      tags: [models]
+      summary: Selects a canonical variant path from indexed header profiles.
+      description: |
+        Reads metadata only. A refused selection (no variant works) returns 200 with null variant,
+        header and profile and the refusal as its reason. A model never indexed is 404.
+        The index covers tagged commits. A retained untagged hash can return 404 here while its
+        objects remain readable; clients retain the immutable hash and constraints and select
+        from its headers using the shared TensorFS rule.
+      security: [{}, {bearer: []}, {dpop: []}]
+      parameters:
+      - {name: org, in: path, required: true, schema: {type: string}}
+      - {name: name, in: path, required: true, schema: {type: string}}
+      - {name: revision, in: query, schema: {type: string}, description: 'A tag, commit or header digest; omitted uses the default revision.'}
+      - {name: gpus, in: query, schema: {type: string}, description: 'Comma-separated compute capabilities, e.g. 8.9,8.9. Empty means CPU.'}
+      - {name: bits, in: query, schema: {type: integer, enum: [4, 8, 16]}, description: 'Precision asked; only that lane answers.'}
+      - {name: prefer, in: query, schema: {type: integer, enum: [4, 8, 16]}, description: 'Lane ranked first when bits is omitted; omitted means 8.'}
+      - {name: min_bits, in: query, schema: {type: integer, enum: [4, 8, 16]}, description: "A slot's narrowest lane when bits is omitted."}
+      - {name: plain, in: query, schema: {type: boolean}, description: 'A slot that takes no encoded weights.'}
+      responses:
+        '200':
+          description: The selected revision and variant, or null when none works.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelSelection'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
   /v1/models/{org}/{name}:
     get:
       operationId: get_model
@@ -531,91 +560,6 @@ paths:
         4XX: {$ref: '#/components/responses/Error'}
         5XX: {$ref: '#/components/responses/Error'}
 
-  /v1/models/{org}/{name}/checkpoints/{checkpoint}/assessments:
-    get:
-      operationId: list_checkpoint_assessments
-      tags: [models]
-      summary: A checkpoint's attached assessment reports, newest first (at most 128).
-      security: [{bearer: []}]
-      parameters:
-      - {$ref: '#/components/parameters/Org'}
-      - {$ref: '#/components/parameters/Name'}
-      - {name: checkpoint, in: path, required: true, schema: {type: string}}
-      responses:
-        '200':
-          description: The assessments.
-          content:
-            application/json: {schema: {$ref: '#/components/schemas/CheckpointAssessmentList'}}
-        4XX: {$ref: '#/components/responses/Error'}
-        5XX: {$ref: '#/components/responses/Error'}
-
-  /v1/models/{org}/{name}/checkpoints/{checkpoint}/assessments/{report}:
-    put:
-      operationId: attach_checkpoint_assessment
-      tags: [models]
-      summary: Attaches one cozy-eval assessment report to its candidate checkpoint (eval-system, th-190).
-      description: |
-        The body is the report's exact canonical bytes; `report` is their sha256 digest. The Hub's
-        inspector re-derives the verdict. A generator may skip this operation (`x-raw-body`): a client
-        sends the bytes as they are, never re-encoded.
-      security: [{bearer: []}]
-      x-raw-body: true
-      parameters:
-      - {$ref: '#/components/parameters/Org'}
-      - {$ref: '#/components/parameters/Name'}
-      - {name: checkpoint, in: path, required: true, schema: {type: string}}
-      - name: report
-        in: path
-        required: true
-        schema: {type: string}
-        description: sha256:<hex> of the report bytes.
-      requestBody:
-        required: true
-        content:
-          application/json: {schema: {$ref: '#/components/schemas/AssessmentReport'}}
-      responses:
-        '200':
-          description: The attached assessment.
-          content:
-            application/json: {schema: {$ref: '#/components/schemas/CheckpointAssessmentAttached'}}
-        4XX: {$ref: '#/components/responses/Error'}
-        5XX: {$ref: '#/components/responses/Error'}
-    get:
-      operationId: get_checkpoint_assessment
-      tags: [models]
-      summary: One attached report's exact bytes.
-      security: [{bearer: []}]
-      x-raw-body: true
-      parameters:
-      - {$ref: '#/components/parameters/Org'}
-      - {$ref: '#/components/parameters/Name'}
-      - {name: checkpoint, in: path, required: true, schema: {type: string}}
-      - {name: report, in: path, required: true, schema: {type: string}}
-      responses:
-        '200':
-          description: The report as attached.
-          content:
-            application/json: {schema: {$ref: '#/components/schemas/AssessmentReport'}}
-        4XX: {$ref: '#/components/responses/Error'}
-        5XX: {$ref: '#/components/responses/Error'}
-    delete:
-      operationId: remove_checkpoint_assessment
-      tags: [models]
-      summary: Removes one attached report.
-      security: [{bearer: []}]
-      parameters:
-      - {$ref: '#/components/parameters/Org'}
-      - {$ref: '#/components/parameters/Name'}
-      - {name: checkpoint, in: path, required: true, schema: {type: string}}
-      - {name: report, in: path, required: true, schema: {type: string}}
-      responses:
-        '200':
-          description: Whether a report was removed.
-          content:
-            application/json: {schema: {$ref: '#/components/schemas/CheckpointAssessmentRemoval'}}
-        4XX: {$ref: '#/components/responses/Error'}
-        5XX: {$ref: '#/components/responses/Error'}
-
   /v1/models/{org}/{name}/checkpoints/{manifest}:
     get:
       operationId: get_model_checkpoint
@@ -637,7 +581,7 @@ paths:
     delete:
       operationId: remove_model_checkpoint
       tags: [models]
-      summary: Removes a checkpoint no release lane names.
+      summary: Removes a tree no release names.
       security: [{bearer: []}]
       parameters:
       - {$ref: '#/components/parameters/Org'}
@@ -648,6 +592,25 @@ paths:
           description: The removal.
           content:
             application/json: {schema: {$ref: '#/components/schemas/CheckpointRemoval'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
+  /v1/models/{org}/{name}/rows:
+    get:
+      operationId: read_model_rows
+      tags: [models]
+      summary: 'A model''s own index rows, to its owner: every release lane, a yanked release''s too, and every
+        unreleased checkpoint (release and lane empty), each saying whether its checkpoint predates the format cut
+        (v1). It goes with the post-A11 cleanup.'
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      responses:
+        '200':
+          description: The rows.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/ModelRows'}}
         4XX: {$ref: '#/components/responses/Error'}
         5XX: {$ref: '#/components/responses/Error'}
 
@@ -761,7 +724,7 @@ paths:
     post:
       operationId: update_model_release
       tags: [models]
-      summary: Sets or removes release lanes at an expected revision.
+      summary: Points a release at a retained tree.
       security: [{bearer: []}]
       parameters:
       - {$ref: '#/components/parameters/Org'}
@@ -792,46 +755,6 @@ paths:
           description: The yanked release.
           content:
             application/json: {schema: {$ref: '#/components/schemas/ModelRelease'}}
-        4XX: {$ref: '#/components/responses/Error'}
-        5XX: {$ref: '#/components/responses/Error'}
-
-  /v1/models/{org}/{name}/releases/{release}/lanes/{lane}:
-    put:
-      operationId: retarget_model_lane
-      tags: [models]
-      summary: Points one existing release lane at another retained checkpoint.
-      security: [{bearer: []}]
-      parameters:
-      - {$ref: '#/components/parameters/Org'}
-      - {$ref: '#/components/parameters/Name'}
-      - {$ref: '#/components/parameters/Release'}
-      - {$ref: '#/components/parameters/Lane'}
-      requestBody:
-        required: true
-        content:
-          application/json: {schema: {$ref: '#/components/schemas/ModelLaneRetarget'}}
-      responses:
-        '200':
-          description: The release.
-          content:
-            application/json: {schema: {$ref: '#/components/schemas/ModelRelease'}}
-        4XX: {$ref: '#/components/responses/Error'}
-        5XX: {$ref: '#/components/responses/Error'}
-
-  /v1/models/{org}/{name}/throughput:
-    get:
-      operationId: get_model_throughput
-      tags: [models]
-      summary: The newest throughput measurement per release, lane and SKU.
-      security: []
-      parameters:
-      - {$ref: '#/components/parameters/Org'}
-      - {$ref: '#/components/parameters/Name'}
-      responses:
-        '200':
-          description: Measurements.
-          content:
-            application/json: {schema: {$ref: '#/components/schemas/ModelThroughputs'}}
         4XX: {$ref: '#/components/responses/Error'}
         5XX: {$ref: '#/components/responses/Error'}
 
@@ -1356,8 +1279,6 @@ components:
       type: object
       required: [digest, length]
       properties: {digest: {type: string}, length: {type: integer, format: int64}}
-    AssessmentReport:
-      description: A cozy-eval AssessmentReport (cozy-eval/checkpoint-validation@4), in its canonical bytes.
     AuthAccountRecoveryConfirmation:
       type: object
       required: [token, expires_at, purge_at]
@@ -2016,53 +1937,28 @@ components:
       properties:
         release: {type: string}
         cut_at: {type: string, format: date-time}
-        revision:
-          type: integer
-          format: int64
-          description: Absent before the release's first revision.
         yanked: {type: boolean}
         yanked_at: {type: string, format: date-time}
-    CheckpointAssessment:
-      type: object
-      required: [report_digest, created_at]
-      properties:
-        report_digest: {type: string}
-        created_at: {type: string, format: date-time}
-        categories: {type: object, additionalProperties: {type: string}}
-        kernel_symbol: {type: string}
-    CheckpointAssessmentAttached:
-      type: object
-      required: [assessment, publisher_reported_verdict]
-      properties:
-        assessment: {$ref: '#/components/schemas/CheckpointAssessmentRow'}
-        publisher_reported_verdict: {type: string}
-    CheckpointAssessmentList:
-      type: object
-      required: [assessments, limit, at_limit]
-      properties:
-        assessments:
-          type: array
-          nullable: true
-          items: {$ref: '#/components/schemas/CheckpointAssessmentRow'}
-        limit: {type: integer, format: int64}
-        at_limit: {type: boolean}
-    CheckpointAssessmentRemoval:
-      type: object
-      required: [removed, report_digest]
-      properties: {removed: {type: boolean}, report_digest: {type: string}}
-    CheckpointAssessmentRow:
-      type: object
-      required: [checkpoint_id, report, actor, created_at, scope, verdict]
-      properties:
-        checkpoint_id: {type: string}
-        report: {$ref: '#/components/schemas/ArtifactRef'}
-        actor: {type: string}
-        created_at: {type: string, format: date-time}
-        scope: {type: string}
-        verdict: {type: string, description: The inspector's verdict.}
     CheckpointDocument:
       type: object
       description: A CozyTensors manifest document, or {"held":true} to a publishing run.
+    ModelRows:
+      type: object
+      required: [model, rows]
+      properties:
+        model: {type: string}
+        rows:
+          type: array
+          items:
+            type: object
+            required: [release, lane, yanked, checkpoint_id, manifest_length, v1]
+            properties:
+              release: {type: string}
+              lane: {type: string}
+              yanked: {type: boolean}
+              checkpoint_id: {type: string}
+              manifest_length: {type: integer, format: int64}
+              v1: {type: boolean}
     CheckpointRemoval:
       type: object
       required: [checkpoint_id, repository_sha256, removed]
@@ -2162,7 +2058,6 @@ components:
       properties:
         release: {type: string}
         cut_at: {type: string, format: date-time}
-        revision: {type: integer, format: int64}
         yanked: {type: boolean}
         yanked_at: {type: string, format: date-time}
         lanes: {type: array, items: {$ref: '#/components/schemas/ModelLane'}}
@@ -2198,7 +2093,6 @@ components:
         manifest_length: {type: integer, format: int64}
         components: {type: array, nullable: true, items: {type: string}}
         component_bytes: {type: object, additionalProperties: {type: integer, format: int64}}
-        assessment: {$ref: '#/components/schemas/CheckpointAssessment'}
         objects: {type: integer, format: int64}
         bytes: {type: integer, format: int64}
         provenance: {$ref: '#/components/schemas/ModelLaneProvenance'}
@@ -2213,20 +2107,17 @@ components:
         fingerprint: {type: string, description: "The digest of the recipe's canonical plan; of a code hook, its identity with the release."}
         source: {type: string, description: "The header digest of the checkpoint it was written from."}
         plan: {type: object, additionalProperties: true, description: "The recipe's canonical plan."}
-    ModelLaneRetarget:
-      type: object
-      required: [checkpoint_id]
-      properties: {checkpoint_id: {type: string}}
     ModelRelease:
       type: object
-      required: [release, revision, yanked, lanes, changed, repository_sha256]
+      required: [release, yanked, lanes, changed, repository_sha256]
       properties:
         release: {type: string}
-        revision: {type: integer, format: int64}
         yanked: {type: boolean}
+        tree: {type: string, description: 'The tree the release names; absent for a pre-cut release of lanes.'}
         lanes:
           type: array
           nullable: true
+          description: Each variant of the tree by canonical full path.
           items: {$ref: '#/components/schemas/ModelReleaseLane'}
         changed: {type: boolean}
         repository_sha256: {type: string}
@@ -2240,14 +2131,36 @@ components:
         bytes: {type: integer, format: int64}
     ModelReleaseUpdate:
       type: object
-      required: [expected_revision]
+      required: [tree]
       properties:
-        expected_revision: {type: integer, format: int64, minimum: 0}
-        set_lanes:
+        tree: {type: string, description: 'A tree the model retains, sha256:<hex>; its variants are the lanes.'}
+    ModelSelection:
+      type: object
+      required: [rule, release, commit, variant, header, profile, reasons]
+      properties:
+        rule: {type: integer, description: "The selection rule's version (2); a client takes only an answer of its own rule."}
+        release: {type: string}
+        commit:
           type: object
-          description: Lane name to checkpoint id.
-          additionalProperties: {type: string}
-        remove_lanes: {type: array, items: {type: string}}
+          required: [sha256, length]
+          properties: {sha256: {type: string}, length: {type: integer, format: int64}}
+        variant: {type: string, nullable: true, description: The canonical full .cozytensors path.}
+        header:
+          type: object
+          nullable: true
+          required: [sha256, length]
+          properties: {sha256: {type: string}, length: {type: integer, format: int64}}
+        profile:
+          type: object
+          nullable: true
+          required: [family, bits, bytes, kinds]
+          properties:
+            family: {type: string}
+            bits: {type: integer}
+            bytes: {type: integer, format: int64}
+            kinds: {type: array, items: {type: string}}
+            provenance: {$ref: '#/components/schemas/ModelLaneProvenance'}
+        reasons: {type: array, items: {type: string}}
     ModelResolution:
       type: object
       required: [model, manifest_id, header_digest, encodings, components, objects, bytes]
@@ -2258,10 +2171,9 @@ components:
         manifest_id: {type: string}
         manifest_length: {type: integer, format: int64}
         header_digest: {type: string}
-        encodings: {type: array, nullable: true, items: {type: string}}
+        encodings: {type: array, nullable: true, items: {type: string}, description: 'Each encoding as tfs inspect prints it, in header order, e.g. "fp8.rowwise {axis: 0}".'}
         components: {type: array, nullable: true, items: {type: string}}
         component_bytes: {type: object, additionalProperties: {type: integer, format: int64}}
-        assessment: {$ref: '#/components/schemas/CheckpointAssessment'}
         objects: {type: integer, format: int64}
         bytes: {type: integer, format: int64}
     ModelSearch:
@@ -2318,12 +2230,6 @@ components:
         worker_image_digest: {type: string}
         measured_at: {type: string, format: date-time}
         operator: {type: string}
-    ModelThroughputs:
-      type: object
-      required: [model, throughput]
-      properties:
-        model: {type: string}
-        throughput: {type: array, items: {$ref: '#/components/schemas/ModelThroughput'}}
     OAuthError:
       type: object
       description: The authorization server's OAuth error (RFC 6749 section 5.2).
@@ -2397,6 +2303,7 @@ components:
         requirements: {type: array, items: {type: string}}
         requires_python: {type: string}
         python_version: {type: string}
+        summary: {type: string, description: "What the package does in a line: its pyproject description (empty when it gives none)."}
     PackageReleaseDeclaration:
       type: object
       required: [files]
@@ -3076,6 +2983,9 @@ components:
           minItems: 1
           description: SHA-256 digests (bare hex, any case or order, sha256 prefix allowed); at most presign_max_digests.
           items: {type: string}
+        manifest:
+          type: string
+          description: The manifest of the closure the digests belong to (bare hex); without it only v1 objects presign.
     WorkerAuthorizedKeys:
       type: object
       required: [worker_id, authorized_keys, lease_seconds]
@@ -3106,9 +3016,8 @@ components:
       properties:
         worker_id: {type: string, description: Equal to the X-Cozy-Worker-ID header.}
   parameters:
-    Org: {name: org, in: path, required: true, schema: {type: string}}
+    Org: {name: org, in: path, required: true, schema: {type: string}, description: 'An account, or `_` for the root namespace (first-party models and packages).'}
     Name: {name: name, in: path, required: true, schema: {type: string}}
     Release: {name: release, in: path, required: true, schema: {type: string}}
-    Lane: {name: lane, in: path, required: true, schema: {type: string}}
     Operation: {name: operation, in: path, required: true, schema: {type: string}}
     Manifest: {name: manifest, in: path, required: true, schema: {type: string}}

@@ -1410,7 +1410,7 @@ dependencies = [
  "saphyr",
  "serde",
  "serde_json",
- "sha2",
+ "serde_path_to_error",
  "syn 2.0.119",
  "thiserror 2.0.21",
  "tokio",
