@@ -166,6 +166,17 @@ cell fibo "$(pkg fibo-2 generate)" prompt="$SCENE" prompt_upsampling:=true seed:
 cell hidream "$(pkg hidream-o1 generate)" prompt="$CHAR, cinematic portrait" seed:=$((R + 9))
 cell moss "$(pkg moss-image generate)" prompt="$OBJECT, studio shot" seed:=$((R + 10))
 cell qwen-image "$(pkg qwen-image generate)" prompt="$SCENE at dusk, wide shot" seed:=$((R + 11))
+# Two checkpoints of one release that share a component, in turn on one executor with no restart between them (swap.py;
+# TFS 0.15.0 keyed varena's weight sets by release/component, run 15744): Qwen-Image-2512 for text, Qwen-Image-Edit-2511
+# for an edit, text again; then the Lightning LoRAs, turbo_lora for text and edit_turbo_lora for an edit. No first-party
+# SDXL LoRA exists to swap.
+QI=$(output qwen-image 'png|webp|jpg')
+cell qwen-image-edit "$(pkg qwen-image generate)" prompt="$SCENE at dusk, covered in fresh snow, wide shot" \
+  --asset reference_images.0="$QI" seed:=$((R + 12))
+cell qwen-image-t2i "$(pkg qwen-image generate)" prompt="$OBJECT on a beach at noon, photo" seed:=$((R + 13))
+cell qwen-image-turbo "$(pkg qwen-image generate_turbo)" prompt="$CHAR on a rainy street at night, photo" seed:=$((R + 14))
+cell qwen-image-turbo-edit "$(pkg qwen-image generate_turbo)" prompt="$SCENE in bright morning sun, wide shot" \
+  --asset reference_images.0="$QI" seed:=$((R + 15))
 # More cells (`--cells FILE`): `name<TAB>target<TAB>args`, args expanded here ($SCENE, $CHAR, $R, $K, $M, $CLI ...).
 for f in "${EXTRA[@]}"; do
   [[ $f == *.sh ]] && continue
