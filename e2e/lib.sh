@@ -150,6 +150,30 @@ machine_reaped() {
   echo "the local machine Calcifer started (pid $top) was reaped; the next one is pid $(machine_pid)"
 }
 
+# cl-646: a Calcifer that stops (a service manager's SIGTERM, or killed) leaves the local machine it started
+# running, and the next one adopts it at once: the next `cozy` command answers within seconds with the same
+# machine.
+calcifer_restart_adopts() {
+  local pid how calcifer began took
+  machine_ready
+  pid=$(machine_pid) || { check "no process holds the local machine's root"; return; }
+  for how in term kill; do
+    [ $how = kill ] || [ "$RUNNER_OS" != Windows ] || continue
+    calcifer=$(cozy --json status | grep -o '"pid": *[0-9]*' | head -1 | grep -o '[0-9]*$')
+    case $how in
+      term) kill -TERM "$calcifer" ;;
+      kill) if [ "$RUNNER_OS" = Windows ]; then taskkill //F //PID "$calcifer"; else kill -9 "$calcifer"; fi ;;
+    esac
+    for _ in $(seq 30); do gone "$calcifer" && break; sleep 1; done
+    began=$(date +%s)
+    cozy --json machine show local > "$OUT/adopted-$how.json" 2>&1 || check "after $how: cozy machine show local failed"
+    took=$(($(date +%s) - began))
+    [ "$took" -le 30 ] || check "after $how: the next cozy command took ${took}s"
+    [ "$(machine_pid)" = "$pid" ] || check "after $how: Calcifer started another machine, not adopting pid $pid"
+    echo "after $how: the next Calcifer answered in ${took}s with the same machine (pid $pid)"
+  done
+}
+
 # The local machine is up and reports itself (`machine show local` starts it); its record lands in
 # $OUT/machine.json. A cozy before cl-646 (#1883; the installer's release until one carries it) makes its
 # machine with `cozy machine enable`; a later one starts it on first use.

@@ -52,7 +52,13 @@ pub fn main() -> ExitCode {
     }
     let served = match config::load(Flags::default()) {
         Ok(loaded) => match tokio::runtime::Runtime::new() {
-            Ok(runtime) => runtime.block_on(serve(&loaded)),
+            // Stopped, Calcifer exits now: nothing left on the runtime holds the process (or its
+            // service) past `down`.
+            Ok(runtime) => {
+                let served = runtime.block_on(serve(&loaded));
+                runtime.shutdown_background();
+                served
+            }
             Err(e) => Err(refuse(
                 &loaded.home,
                 Error::new(Kind::Internal, "calcifer_runtime", e.to_string()),
@@ -143,6 +149,16 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     let machines = Machines::start(calcifer.clone(), home.clone(), &loaded.user_home, &loaded.config);
     steps.done("machines");
     let api = Api::new(calcifer.clone(), machines.clone(), address.port(), &token);
+    // A service manager's stop (SIGTERM) is `down`, as graceful: the machine runs on.
+    #[cfg(unix)]
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        let stopping = api.clone();
+        tokio::spawn(async move {
+            term.recv().await;
+            info!("SIGTERM: stopping as down does");
+            stopping.down().await;
+        });
+    }
     let app = api::router(api.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let server = tokio::spawn(
         axum::serve(listener, app)
