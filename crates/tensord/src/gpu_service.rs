@@ -1,7 +1,7 @@
 //! The pool runs every call on a retained executor of its plan: deviceless (degree 0), on one
 //! GPU, or on a group of K (rank 0 forms followers). It grants each executor its GPUs' ledgers;
 //! Runtime constructs models and varena in each executor decides its bytes (design varena-slim
-//! §2). TensorD places and admits calls (`fits`), reaps and ends stalled processes. Engine owns
+//! §2). TensorD schedules calls with GPU permits, reaps and ends stalled processes. Engine owns
 //! acceptance and run custody.
 use platform::process::{Birth, Exact};
 use crate::{
@@ -638,7 +638,7 @@ pub struct Pool {
     devices: Vec<Device>,
     /// Measured peaks, persisted per GPU model.
     peaks: memory::Peaks,
-    /// Woken by the ledgers' events: a queued request asks `fits` again then.
+    /// Woken by memory events alongside the GPU permits' scheduling events.
     engine: std::sync::OnceLock<Weak<Engine>>,
     /// Rows the ledgers named stalled at the last look: each is ended once.
     stalled: Mutex<std::collections::BTreeSet<u32>>,
@@ -814,9 +814,8 @@ impl Pool {
         };
         self.devices.iter().filter_map(accounting).collect()
     }
-    /// A manager signalled (room freed, an executor exited, a peak was recorded): the dispatch queue asks
-    /// `fits` again, each row the ledger newly names stalled ends (once), and changed peaks are
-    /// saved.
+    /// A manager signalled: wake scheduling, end newly stalled processes once, and save changed
+    /// measurements.
     fn memory_changed(&self) {
         self.nudge_host();
         if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
@@ -1034,8 +1033,7 @@ impl Pool {
         self.tenants.lock().unwrap().retain(|_, t|
             !(t.plan == plan && t.start == start && gone.contains(t.exact.birth())));
     }
-    /// The engine's dispatch wakes whenever a ledger signals: a queued request asks `fits`
-    /// again then, and never polls.
+    /// Wake the engine on memory events as well as GPU permit changes.
     pub fn wake_on_freed(&self, engine: &Arc<Engine>) {
         let _ = self.engine.set(Arc::downgrade(engine));
     }
@@ -1663,18 +1661,11 @@ impl Pool {
         let leaders = self.leaders.lock().unwrap();
         leaders.values().filter(|(_, p, _)| p.as_str() == plan).map(|(_, _, start)| *start).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
     }
-    /// Whether a call of `plan` fits on every GPU of the lane from `start` now, before its shape
-    /// is known (`fits`). A GPU without a manager has nothing to refuse it with.
-    fn fits(&self, plan: &str, start: usize, degree: u32) -> bool {
-        let lane = self.lane(start, degree).unwrap_or_default();
-        lane.iter().filter_map(|d| d.memory.as_ref()).all(|m| m.manager.fits(plan, UNPREPARED))
-    }
     /// Where `plan` runs now, with its lane's call slots: inside its root's `lane` when it has
     /// one, else (a standalone call, or warming with no root) on GPUs no root holds or older
-    /// request claims. One path for every degree, over the lanes of its width in order: one
-    /// hosting its executor; one where it fits (a replica when it runs elsewhere too); or, when
-    /// it runs nowhere or inside its root's lane, any free one. None: it waits, and a standalone
-    /// call claims the GPUs it waits for from later requests.
+    /// request claims. Prefer a lane hosting its executor, then any lane whose call permits
+    /// are available. None: it waits, and a standalone call claims those GPUs from later requests.
+    /// Actual allocations decide capacity; measured peaks never block a permitted family call.
     fn place(
         self: &Arc<Self>,
         engine: &Arc<Engine>,
@@ -1693,11 +1684,7 @@ impl Pool {
         let placed = hosts
             .iter()
             .find_map(|start| take(*start, claims))
-            .or_else(|| {
-                let fit = |start: &usize| !hosts.contains(start) && self.fits(&plan.construction, *start, plan.degree);
-                starts.clone().filter(fit).find_map(|start| take(start, claims))
-            })
-            .or_else(|| (hosts.is_empty() || lane.is_some()).then(|| starts.clone().find_map(|start| take(start, claims))).flatten());
+            .or_else(|| starts.clone().filter(|start| !hosts.contains(start)).find_map(|start| take(start, claims)));
         match (&placed, root) {
             (None, Some(root)) if lane.is_none() && hosts.is_empty() => {
                 self.allocations.claim(root, degree, claims);
@@ -1855,8 +1842,8 @@ impl Pool {
     }
 
     /// A running parent's hint that it will call `plan` next (`model_prefetch`, H3 long-form's
-    /// `prefetch(motion_segment)`): load it in the background where it fits beside the tenants
-    /// already there (it never makes room), without waiting for the parent's own run to end.
+    /// `prefetch(motion_segment)`): load it in the background once its GPU permits are available,
+    /// without waiting for the parent's own run to end.
     /// It takes the GPU's call slot like any call, so a child call in flight finishes first, and
     /// loads only inside its root's lane: once bound, until released.
     pub fn prefetch(self: &Arc<Self>, engine: &Arc<Engine>, held: HeldGeneration, plan: Plan, (root, family): (u64, Option<String>), owner: String, fetch: Arc<crate::access::Fetch>) {
@@ -1941,10 +1928,6 @@ impl Pool {
     ) -> io::Result<&'static str> {
         if self.sessions.lock().unwrap().contains_key(&session_key(&plan.construction, start)) {
             return Ok("already loaded");
-        }
-        // A warm member or a prefetch starts only where it fits: it never takes a running call's room.
-        if !self.fits(&plan.construction, start, plan.degree) {
-            return Ok("no GPU room beside the warm set and the running call");
         }
         let born = Mutex::new(vec![]);
         let created = self.new_session(engine, held, &plan, start, |birth, _| {
@@ -2819,20 +2802,16 @@ impl Pool {
             return Ok(true);
         }
         let prepared = command_ok(prepared)?;
-        // Admitted at its shape, the key its peak is recorded under, on every GPU of its lane or
-        // none, waiting while it does not fit. In its family, a yielded parent's working set is
-        // left out: the parent waits on it.
+        // The GPU permits already scheduled this call. Its shape names only its measurements.
         let shape = shape(&prepared.features);
-        let managers: Vec<&varena::lease::Manager> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &*m.manager).collect();
-        let admitted = memory::admit(engine, &managers, id, &construction, &shape);
-        let call = memory::Call { pid: session.executor.birth.pid, package: construction.clone(), shape: shape.clone() };
-        let _dispatched = Dispatched { gpus, id: id.into(), running: self.running.clone() };
+        let pids: Vec<u32> = std::iter::once(session.executor.birth.pid).chain(session.followers.iter().map(|f| f.birth().pid)).collect();
+        let ranks = gpus.iter().enumerate().map(|(rank, gpu)| memory::Rank {
+            pid: pids.get(rank).copied().unwrap_or(session.executor.birth.pid),
+            gpu: memory::row(&gpu.entry, &self.config.inventory).map_or_else(|| gpu.entry.clone(), |row| row.device_uuid.clone()),
+        }).collect();
+        let call = memory::Call { ranks, package: construction.clone(), shape: shape.clone() };
+        let dispatched = Dispatched::new(gpus, id, &construction, &shape, self.running.clone());
         self.running.lock().unwrap().insert(id.into(), call);
-        if !admitted? {
-            // Canceled while it waited for room: it never started.
-            defer_completion(engine, id, &session.executor.birth, &session.followers, Outcome::Canceled)?;
-            return Ok(true);
-        }
         let spool = if let Some(identity) = self.config.identity {
             // Keep Journal/results/admin paths private to the core. A separate peer-owned
             // spool lives only inside this executor's already authorized output directory.
@@ -2893,6 +2872,7 @@ impl Pool {
         );
         session.executor.waits = None;
         let reply = reply?;
+        dispatched.record(&reply, &self.config.inventory);
         session.level = Level::Gpu;
         self.record_invoke(&construction, &lane, first, invoked.elapsed(), &reply);
         self.note_decisions(id, session.executor.birth.pid, &lane, &reply);
@@ -2972,7 +2952,7 @@ impl Pool {
         let managers: Option<Vec<&varena::lease::Manager>> = gpus.iter().map(|d| d.memory.as_ref().map(|m| &*m.manager)).collect();
         let sets: Vec<&str> = placeable.iter().map(|(_, _, set)| set.as_str()).collect();
         let gpu = match managers {
-            Some(managers) => memory::homes(&managers, &plan.construction, UNPREPARED, &sets, &self.notes),
+            Some(managers) => memory::homes(&managers, &plan.construction, "", &sets, &self.notes),
             None => vec![0; sets.len()],
         };
         let mut homes: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
@@ -3118,21 +3098,65 @@ fn shape(features: &BTreeMap<String, serde_json::Value>) -> String {
     }
 }
 
-/// The shape a call is placed at before its executor normalizes its request: the ledger reads it
-/// as the package's widest measured shape; none measured, it fits only on an idle GPU.
-const UNPREPARED: &str = "";
-
-/// A request admitted on every GPU of its lane (`memory::admit`), undispatched when it ends.
-/// A request admitted on its lane's GPUs: running, as the host rule reads it, until it drops.
+/// A call's measurement keys on its lane's GPUs, and its host accounting until it ends.
 struct Dispatched<'a> {
     gpus: &'a [Device],
     id: String,
     running: memory::Running,
 }
+
+#[derive(Deserialize)]
+struct GpuMeasurement {
+    gpu: u32,
+    stats: RequestFigures,
+}
+
+/// Only the measured figures, without copying a request's potentially large trace.
+#[derive(Deserialize)]
+struct RequestFigures {
+    request: String,
+    peak: u64,
+    #[serde(default)]
+    compute: u64,
+    #[serde(default)]
+    host: Option<u64>,
+}
+
+impl<'a> Dispatched<'a> {
+    fn new(gpus: &'a [Device], id: &str, package: &str, shape: &str, running: memory::Running) -> Self {
+        for memory in gpus.iter().filter_map(|gpu| gpu.memory.as_ref()) {
+            if let Err(error) = memory.manager.dispatch(id, package, shape) {
+                tracing::warn!("memory: request {id}'s measurement key unwritten: {error}");
+            }
+        }
+        Self { gpus, id: id.into(), running }
+    }
+
+    fn record(&self, reply: &Frame, inventory: &[crate::machine::receipt::Gpu]) {
+        let Some(value) = reply.memory.as_ref().and_then(|m| m.get("varena")) else { return };
+        let rows = match Vec::<GpuMeasurement>::deserialize(value) {
+            Ok(rows) => rows,
+            Err(error) => return tracing::warn!("memory: request {}'s final figures unread: {error}", self.id),
+        };
+        for gpu in self.gpus {
+            let Some(memory) = &gpu.memory else { continue };
+            let Some(index) = memory::row(&gpu.entry, inventory).map(|row| row.device_index) else { continue };
+            if let Some(row) = rows.iter().find(|row| row.gpu == index && row.stats.request == self.id) {
+                memory.manager.record_request(&varena::Stats {
+                    request: row.stats.request.clone(), peak: row.stats.peak, compute: row.stats.compute,
+                    host: row.stats.host, ..Default::default()
+                });
+            }
+        }
+    }
+}
+
 impl Drop for Dispatched<'_> {
     fn drop(&mut self) {
         self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
-        self.gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|m| m.manager.undispatch(&self.id));
+        for memory in self.gpus.iter().filter_map(|gpu| gpu.memory.as_ref()) {
+            memory.manager.undispatch(&self.id);
+        }
     }
 }
 
@@ -3671,4 +3695,3 @@ impl Services for Callbacks<'_> {
         }
     }
 }
-
