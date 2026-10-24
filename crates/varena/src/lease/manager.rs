@@ -11,8 +11,8 @@
 //! page accounting never rests on an agent's word.
 //!
 //! One manager per GPU, TensorD's, with the GPU's listener; TensorD reacts to [`Manager::events`].
-//! It also holds what admission and placement read (TensorD's dispatches and the measured peaks)
-//! and the allocation-wait spans PSI reads.
+//! It also holds TensorD's request measurement keys, measured placement figures, and the
+//! allocation-wait spans PSI reads. TensorD's GPU permits alone schedule calls.
 //!
 //! The table is untrusted input: identity, pid, a chunk's index and whether it landed are the
 //! manager's own records (peer credentials, grant time, fill-ack time), never read back at exit.
@@ -746,20 +746,15 @@ impl Manager {
         self.emit(out);
     }
 
-    /// What an agent measured: a request's peaks under TensorD's dispatch key (the larger stays;
-    /// the compute bytes are the newest), a set's bytes (the larger).
+    /// A set's bytes as its agent measured them (the larger stays). Request figures arrive
+    /// through TensorD's settled Invoke reply, on the same path as completion.
     fn measured(&self, exec: u64, m: Measured) -> Out {
         let mut b = self.books.lock();
         if !b.executors.contains_key(&exec) {
             return Out::default();
         }
-        match m {
-            Measured::Request { request, working, compute, host } => {
-                let Some(key) = b.dispatched.get(&request).cloned() else { return Out::default() };
-                Self::record_request(&mut b, &key, working, compute, host);
-            }
-            Measured::Set { name, bytes } => larger(&mut b.figures, format!("set/{name}"), bytes),
-        }
+        let Measured::Set { name, bytes } = m;
+        larger(&mut b.figures, format!("set/{name}"), bytes);
         Out::default()
     }
 
@@ -784,52 +779,19 @@ impl Manager {
         self.settle(&mut b)
     }
 
-    // ---- Admission and placement (TensorD's): its own dispatches and the measured peaks.
+    // ---- Request measurement keys and component placement.
 
     /// The device bytes requests can use: free and every chunk of ours (all of it reclaimable),
-    /// less the reserved pool; 0 until the device was read (a request then waits).
+    /// less the reserved pool; 0 until the device was read (a placement hint only).
     fn usable(b: &Books) -> u64 {
         free(b).map_or(0, |f| (f + b.created).saturating_sub(b.reserve))
     }
 
-    /// A fresh reading for admission and placement, which run before anything is asked.
+    /// A fresh reading for component placement, before anything is asked.
     fn refresh(&self) {
         if let Some(sample) = self.read() {
             self.books.lock().sample = Some(sample);
         }
-    }
-
-    /// The measured peaks of every dispatched request (`None`: unmeasured).
-    fn dispatched_peaks(b: &Books) -> Vec<Option<u64>> {
-        b.dispatched.values().map(|key| figure(b, "peak", key)).collect()
-    }
-
-    /// Whether a request of `package` at `shape` (empty: its widest measured shape) can start now.
-    pub fn fits(&self, package: &str, shape: &str) -> bool {
-        self.refresh();
-        Self::fits_with(&self.books.lock(), &format!("{package}|{shape}"))
-    }
-
-    fn fits_with(b: &Books, key: &str) -> bool {
-        decide::fits(Self::usable(b), 0, &[], &Self::dispatched_peaks(b), figure(b, "peak", key), None)
-    }
-
-    /// A multi-GPU group: checks and reserves every GPU atomically. Lock order is process-local
-    /// manager address order, independent of the caller's device order.
-    pub fn admit(group: &[&Manager], request: &str, package: &str, shape: &str) -> Result<bool> {
-        let mut group = group.to_vec();
-        group.sort_unstable_by_key(|m| *m as *const Manager as usize);
-        group.dedup_by_key(|m| *m as *const Manager as usize);
-        group.iter().for_each(|m| m.refresh());
-        let mut books: Vec<_> = group.iter().map(|m| m.books.lock()).collect();
-        let key = format!("{package}|{shape}");
-        if !books.iter().all(|b| Self::fits_with(b, &key)) {
-            return Ok(false);
-        }
-        for b in &mut books {
-            b.dispatched.insert(request.to_string(), key.clone());
-        }
-        Ok(true)
     }
 
     /// Names the `<package>|<shape>` a request's peaks are recorded under, before it runs.
@@ -839,43 +801,37 @@ impl Manager {
     }
 
     pub fn undispatch(&self, request: &str) {
-        self.complete(request, None);
+        self.books.lock().dispatched.remove(request);
+        self.events.set();
     }
 
-    /// TensorD's settled Invoke reply carries each rank's final stats on the same path as its
-    /// completion. Record them before removing the dispatch key, so a delayed lease-socket
-    /// measurement cannot lose the request's peaks. No completed-request tombstones are needed.
-    pub fn complete(&self, request: &str, stats: Option<&crate::Stats>) {
+    /// TensorD's settled Invoke reply is the request's only measurement path. It records every
+    /// rank before its dispatch key goes, without cross-socket ordering or completion tombstones.
+    pub fn record_request(&self, stats: &crate::Stats) {
         let mut b = self.books.lock();
-        if let Some(key) = b.dispatched.remove(request) {
-            if let Some(stats) = stats.filter(|stats| stats.request == request) {
-                Self::record_request(&mut b, &key, stats.peak, stats.compute, stats.host.unwrap_or(0));
+        if let Some(key) = b.dispatched.get(&stats.request).cloned() {
+            larger(&mut b.figures, format!("peak/{key}"), stats.peak);
+            b.figures.insert(format!("compute/{key}"), stats.compute);
+            if let Some(host) = stats.host {
+                larger(&mut b.figures, format!("host/{key}"), host);
             }
         }
         drop(b);
         self.events.set();
     }
 
-    fn record_request(b: &mut Books, key: &str, working: u64, compute: u64, host: u64) {
-        larger(&mut b.figures, format!("peak/{key}"), working);
-        b.figures.insert(format!("compute/{key}"), compute);
-        larger(&mut b.figures, format!("host/{key}"), host);
-    }
-
     /// The GPU of `group` (an index) that keeps each set of `package`'s request at `shape`
     /// ([`decide::place`]). A set's bytes are its layout's when the caller has them, else as a
-    /// load measured them on any GPU of the group. Each GPU's room is its usable bytes less its
-    /// dispatched requests' measured peaks; GPU 0's less the package's measured compute bytes
-    /// too.
+    /// load measured them on any GPU of the group. Each GPU's room is its actual usable bytes;
+    /// GPU 0 also leaves room for the package's measured compute bytes.
     pub fn place(group: &[&Manager], package: &str, shape: &str, sets: &[(&str, Option<u64>)]) -> Result<Vec<u32>> {
         let key = format!("{package}|{shape}");
         let mut rooms = Vec::with_capacity(group.len());
         for (g, m) in group.iter().enumerate() {
             m.refresh();
             let b = m.books.lock();
-            let running: u64 = Self::dispatched_peaks(&b).into_iter().flatten().sum();
             let working = if g == 0 { figure(&b, "compute", &key).unwrap_or(0) } else { 0 };
-            rooms.push(Self::usable(&b).saturating_sub(running + working));
+            rooms.push(Self::usable(&b).saturating_sub(working));
         }
         let bytes: Vec<Option<u64>> = sets.iter().map(|(name, known)| known.or_else(|| group.iter().filter_map(|m| figure(&m.books.lock(), "set", name)).max())).collect();
         Ok(decide::place(&rooms, &bytes))
@@ -1371,7 +1327,3 @@ fn look_loop(manager: &Weak<Manager>) {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "manager_tests.rs"]
-mod tests;

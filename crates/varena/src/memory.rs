@@ -2531,9 +2531,7 @@ impl Request {
     pub fn end(mut self) -> Stats {
         self.ended = true;
         let id = self.id;
-        let stats = self.inner.guard(|| Ok(self.inner.end_request(id))).unwrap_or_default();
-        self.inner.measured(crate::lease::Measured::Request { request: stats.request.clone(), working: stats.peak, compute: stats.compute, host: stats.host.unwrap_or(0) });
-        stats
+        self.inner.guard(|| Ok(self.inner.end_request(id))).unwrap_or_default()
     }
 }
 
@@ -2796,8 +2794,7 @@ impl Inner {
         }
     }
 
-    /// A figure for the lease manager's admission and placement (a request's peaks at its end,
-    /// a set's bytes at its load); nothing when not leased.
+    /// A set's size for the lease manager's placement; nothing when not leased.
     fn measured(&self, _m: crate::lease::Measured) {
         #[cfg(unix)]
         if let Some(agent) = self.lease.get() {

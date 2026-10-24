@@ -422,7 +422,7 @@ impl Agent {
         &self.table
     }
 
-    /// A request's peaks at its end, or a set's bytes at its load.
+    /// A set's bytes at its load.
     pub fn measured(&self, m: Measured) -> Result<()> {
         self.end.send(&ToManager::Measured(m), None)
     }

@@ -2,8 +2,7 @@
 //! other sets' idle pages (those no open plan uses, least recently used first; then those a
 //! later step uses, furthest first); then the current step's own pages, furthest next use first
 //! (Belady). Never a pinned or filling page; a page whose release event is pending is taken once
-//! it completes. Also what prefetch maps, and the ledger's admission ([`fits`]) and placement
-//! ([`place`]) until the lease manager's replace them.
+//! it completes. Also what prefetch maps and where a group's sets are placed ([`place`]).
 
 use std::cmp::Reverse;
 
@@ -62,47 +61,6 @@ pub fn prefetch(t: &Table, req: u64, free: u64) -> Vec<Key> {
         })
         .map(|(_, k, _)| k)
         .collect()
-}
-
-/// A row's facts as admission reads them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Admitted {
-    pub context: u64,
-    /// Pinned bytes outside any running W.
-    pub outside: u64,
-    /// Each running request's largest remaining W, summed.
-    pub remaining: u64,
-    pub running: u32,
-    /// Running requests with an unmeasured step left.
-    pub unmeasured: u32,
-    /// The remaining W of its requests waiting on child calls, per family they wait for
-    /// (family, W); family 0: any (beyond the slots), counted for every child.
-    pub yielded: [(u64, u64); YIELDED],
-}
-
-/// Families a row publishes yielded W for, each apart; more fold into one counted for all.
-pub const YIELDED: usize = 3;
-
-/// A row's yielded W as a child of `family` sees it: all but its own family's parents'.
-pub fn yielded_beside(yielded: &[(u64, u64); YIELDED], family: Option<u64>) -> u64 {
-    yielded.iter().filter(|(f, _)| family != Some(*f) || *f == 0).map(|(_, w)| w).sum()
-}
-
-/// Whether a request whose W is `w` (its recorded peak; `None`: unmeasured) fits beside `rows`
-/// and the dispatched requests not yet running: contexts + pins outside a running W + each
-/// running request's peak + this one's ≤ capacity less foreign bytes. An idle GPU always fits (a
-/// request larger than the card streams); anything unmeasured fits only there. A request
-/// waiting on a child call counts too, except for its own family's child (`family`).
-pub fn fits(capacity: u64, foreign: u64, rows: &[Admitted], dispatched: &[Option<u64>], w: Option<u64>, family: Option<u64>) -> bool {
-    if rows.iter().all(|r| r.running == 0) && dispatched.is_empty() {
-        return true;
-    }
-    if w.is_none() || rows.iter().any(|r| r.unmeasured > 0) || dispatched.iter().any(Option::is_none) {
-        return false;
-    }
-    let rows: u64 = rows.iter().map(|r| r.context + r.outside + r.remaining + yielded_beside(&r.yielded, family)).sum();
-    let dispatched: u64 = dispatched.iter().flatten().sum();
-    rows + dispatched + w.unwrap_or(0) <= capacity.saturating_sub(foreign)
 }
 
 /// Where each set of a group's package lives, as an index into the group's GPUs. `rooms[g]` is

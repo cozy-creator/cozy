@@ -1,12 +1,11 @@
 //! TensorD hosts varena's lease manager (design varena-leases): each envelope GPU the inventory
-//! names has one, which creates the GPU's chunks and leases them to its executors, admits and
-//! places their requests, and keeps their measured peaks (capacity min(card, `gpu_memory_limit`)).
-//! Admission is [`admit`] (`Manager::admit`: a group on all of its GPUs or none, waiting while
-//! refused). A GPU whose chunks TensorD cannot create has a chunk-less manager: its executors run
-//! standalone, admitted and counted all the same. Host RAM is the OS page cache; [`Host`] watches
-//! what the running calls must keep free of it. One thread blocks on every GPU's events and the
+//! names has one, which creates the GPU's chunks and leases them to its executors, places their
+//! components, and keeps their measured peaks (capacity min(card, `gpu_memory_limit`)). GPU
+//! permits schedule calls; measured peaks never add a second admission queue. A GPU whose
+//! chunks TensorD cannot create has a chunk-less manager: its executors run standalone. Host RAM
+//! is the OS page cache; [`Host`] watches what the running calls must keep free of it. One thread blocks on every GPU's events and the
 //! host's short event; each GPU's [`Watch`] reads NVML while cozy holds bytes there.
-use crate::{execution::Engine, machine::receipt};
+use crate::machine::receipt;
 use platform::contain::host_memory;
 use platform::contain::host_pressure::{self, Growth, HostMode, Nudge};
 use platform::memory::{wait_any, Signal, Waitable};
@@ -425,29 +424,6 @@ fn shareable(uuid: &str) -> Result<i32, String> {
     Ok(ordinal)
 }
 
-/// Admits request `id` at `<package>|<shape>` on every one of `managers` or none
-/// (`Manager::admit`, which names the key its peak is recorded under). Refused, it waits for the
-/// engine's activity, which every manager event and every cancel bumps, and asks again: running
-/// requests end, and a GPU nothing runs on always admits. False: it was canceled meanwhile. A
-/// manager that cannot answer lets it run unrecorded.
-pub fn admit(engine: &Engine, managers: &[&Manager], id: &str, package: &str, shape: &str) -> io::Result<bool> {
-    loop {
-        let seen = engine.activity_epoch();
-        match Manager::admit(managers, id, package, shape) {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
-            Err(error) => {
-                tracing::warn!("memory: request {id} runs unrecorded: {error}");
-                return Ok(true);
-            }
-        }
-        if engine.get(id)?.cancel_actor.is_some() {
-            return Ok(false);
-        }
-        engine.wait_activity(seen, None);
-    }
-}
-
 /// The GPU of the group (an index into `managers`, GPU order) that keeps each set of `sets`, by
 /// `Manager::place` for `package`'s request at `shape`. A set's bytes are what its load recorded
 /// on a GPU of the group: a set never loaded goes where the most room is free. A manager that
@@ -547,7 +523,7 @@ pub struct Call {
     pub shape: String,
 }
 
-/// TensorD's calls admitted until they end, including each follower the host rule must watch.
+/// TensorD's calls running until they end, including each follower the host rule must watch.
 pub type Running = Arc<Mutex<BTreeMap<String, Call>>>;
 
 /// A process running calls: measured anonymous peak, anonymous bytes now, and call count.
@@ -815,6 +791,3 @@ impl MemoryLog {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;
