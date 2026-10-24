@@ -19,9 +19,10 @@ pub(crate) const TICK: Duration = Duration::from_millis(250);
 const STILL_TICKS: u32 = 120;
 const STALL_FACTOR: u32 = 8;
 
-/// An answer that means "not now". 501 and 505 say the ask can never be answered.
+/// An answer that means "not now": 499 is a proxy's own dropped exchange (the Hub's blobs, run
+/// 15391). 501 and 505 say the ask can never be answered.
 pub(crate) fn weather(status: u16) -> bool {
-    matches!(status, 408 | 425 | 429 | 500..=599) && !matches!(status, 501 | 505)
+    matches!(status, 408 | 425 | 429 | 499 | 500..=599) && !matches!(status, 501 | 505)
 }
 
 /// What the stall rule scales: its tick, and the slowest answer seen.
