@@ -221,7 +221,14 @@ jobs:
           [ "$ESTABLISH" != true ] || args+=(--establish)
           [ "$DISK" = 0 ] || args+=(--disk "$DISK")
           [ "$GPUS" = 0 ] || args+=(--gpus "$GPUS")
+          if [[ ",${{ matrix.suite }}," == *,cli,* ]]; then  # every call logged, for the gate tier's coverage check below
+            args+=(--cli "$PWD/creator/e2e/bin/cozy")
+            export COZY_E2E_LOG=$OUT/argv.log COZY_E2E_BIN=$HOME/.cozy/bin/cozy
+          fi
           creator/release-gate/gate.sh "${{ matrix.sku }}" --suite "${{ matrix.suite }}" --out "$OUT" "${args[@]}"
+      # Every gate-tier command and flag ran (e2e/coverage.py), in the gate that ran the cli suite.
+      - if: ${{ !cancelled() && contains(format(',{0},', matrix.suite), ',cli,') }}
+        run: uv run -q --no-project python -I creator/e2e/coverage.py check "$HOME/.cozy/bin/cozy" creator/e2e/coverage.toml --tiers gate --log "$OUT/argv.log"
       # gate.sh ends its rental in a trap; a cancelled job can skip it, so end it here too and say so.
       - if: always()
         run: |

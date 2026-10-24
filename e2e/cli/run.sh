@@ -64,5 +64,8 @@ if calcifer_stuck; then
   (cd "$(dirname "$0")" && cell after-stuck ./weightless/reverse "text=after$RANDOM") || check "no run went after cozy doctor restarted Calcifer"
 fi
 
+. "$(dirname "$0")/commands.sh"
+
 step "remove cozy"; remove_cozy
+step coverage; coverage "$OUT/cozy-under-test" pr
 finish "cli: runs $first and $(cat "$OUT/second.number")"

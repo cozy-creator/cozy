@@ -9,9 +9,13 @@
 #   --packages DIR        a packages checkout: its package directories run instead of the published releases
 #   --pins N@R,...        package releases to take instead of the latest unyanked ones (gated candidates)
 #   --published           the imports suite loads published releases, not the packages checkout
+#   --key FILE            sign in with this device key (`cozy login --key`; release suite)
+#   --sku SKU             what the release suite rents (default cpu)
+#   --installed           this computer's cozy as it is, signed in: no installer (the release suite by hand)
 
 set -euo pipefail
-OUT='' CAND_COZY='' CAND_TFS='' CAND_RT='' PACKAGES='' PINS='' PUBLISHED=''
+E2E=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+OUT='' CAND_COZY='' CAND_TFS='' CAND_RT='' PACKAGES='' PINS='' PUBLISHED='' KEY='' SKU=cpu INSTALLED=''
 COZY=$HOME/.cozy/bin/cozy
 [ "${RUNNER_OS:-}" != Windows ] || COZY=$HOME/.cozy/bin/cozy.exe
 
@@ -25,11 +29,16 @@ parse() {
       --packages) PACKAGES=$2 ;;
       --pins) PINS=$2 ;;
       --published) PUBLISHED=1; shift; continue ;;
+      --key) KEY=$2 ;;
+      --sku) SKU=$2 ;;
+      --installed) INSTALLED=1; shift; continue ;;
       *) echo "unknown argument $1" >&2; exit 2 ;;
     esac
     shift 2
   done
   [ -n "$OUT" ] || { echo "--out is required" >&2; exit 2; }
+  # By hand (--installed), a --cozy-bin is the CLI as it is: nothing is installed over this computer's cozy.
+  [ -z "$INSTALLED" ] || [ -z "$CAND_COZY" ] || { COZY=$CAND_COZY; CAND_COZY=''; }
   mkdir -p "$OUT"
 }
 
@@ -43,7 +52,13 @@ finish() {
   [ -s "$OUT/failures.txt" ] || { echo "$1: passed"; return 0; }
   echo "$1: $(wc -l < "$OUT/failures.txt") failure(s):"; cat "$OUT/failures.txt"; exit 1
 }
-cozy() { "$COZY" "$@"; }
+# Every call is logged for e2e/coverage.py: its words \x1f-separated, each call ended by \x1e.
+cozy() { printf '%s\x1f' "$@" >> "$OUT/argv.log"; printf '\x1e' >> "$OUT/argv.log"; "$COZY" "$@"; }
+# The coverage guard (e2e/coverage.py check) over this run's calls, for the tiers it ran.
+coverage() {
+  uv run -q --no-project python -I "$E2E/coverage.py" check "$1" "$E2E/coverage.toml" --tiers "$2" --log "$OUT/argv.log" \
+    || check "coverage: a command or flag has no test, or its test did not run (above)"
+}
 
 # The install line from the README, as a person pastes it.
 install_cozy() {
@@ -309,6 +324,8 @@ picture() {
 }
 
 # The BiRefNet target: a pinned release, the packages checkout's directory, or the published release.
+# The BiRefNet package as installed by name: a pinned candidate when PINS holds one.
+birefnet_package() { tr , '\n' <<< "$PINS" | grep -m1 '^birefnet@' || echo birefnet; }
 birefnet() {
   local pin
   pin=$(tr ',' '\n' <<< "$PINS" | sed -n 's/^birefnet@//p' | head -1)
