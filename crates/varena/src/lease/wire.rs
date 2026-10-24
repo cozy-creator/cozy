@@ -67,7 +67,20 @@ pub enum ToManager {
     /// birth. A re-attach after a manager restart sends its table's fd back with it.
     Hello { protocol: u32, birth: u64 },
     /// `bytes` of weights, for `region` when given (a retained region answers with no copy).
-    Ask { id: u64, bytes: u64, kind: Kind, region: Option<Region> },
+    /// `fill`: a weights region's declared fill key: a derived entry kept for it comes first
+    /// ([`ToAgent::Entry`]), and the agent refills from it instead of deriving again.
+    Ask {
+        id: u64,
+        bytes: u64,
+        kind: Kind,
+        region: Option<Region>,
+        #[serde(default)]
+        fill: Option<String>,
+    },
+    /// A disk entry for derived weights of `key`, `bytes` long: answered by [`ToAgent::Entry`].
+    Derive { key: String, bytes: u64 },
+    /// The entry for `key` is written whole: from now on grants refill from it.
+    Derived { key: String },
     /// Doorbell: slots moved to Mapped, Refused or Released.
     Answered,
     Region(RegionFacts),
@@ -98,6 +111,10 @@ pub enum ToAgent {
     Revoke,
     /// Reclaim region `region` whole: a graph drops; a cache region swaps (`swap`) or is discarded.
     Reclaim { region: u64, swap: bool },
+    /// A derived entry for `key`, its file attached, or none kept (no handle). For ask `id`
+    /// it comes before the ask's grants, to refill from; `id` 0 answers [`ToManager::Derive`],
+    /// to write.
+    Entry { id: u64, key: String },
 }
 
 /// A side's messages: their kinds as the wire tags them.
@@ -108,12 +125,12 @@ pub trait Message: Serialize + serde::de::DeserializeOwned {
 }
 
 impl Message for ToManager {
-    const KINDS: &'static [&'static str] = &["Hello", "Ask", "Answered", "Region", "RegionGone", "Measured"];
+    const KINDS: &'static [&'static str] = &["Hello", "Ask", "Answered", "Region", "RegionGone", "Measured", "Derive", "Derived"];
     const LOAD_BEARING: &'static [&'static str] = &["Hello", "Ask"];
 }
 
 impl Message for ToAgent {
-    const KINDS: &'static [&'static str] = &["Welcome", "Grant", "Refuse", "Revoke", "Reclaim"];
+    const KINDS: &'static [&'static str] = &["Welcome", "Grant", "Refuse", "Revoke", "Reclaim", "Entry"];
     const LOAD_BEARING: &'static [&'static str] = &["Welcome", "Grant", "Refuse"];
 }
 

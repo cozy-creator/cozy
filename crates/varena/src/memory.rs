@@ -2644,6 +2644,7 @@ impl Inner {
                 span,
                 crate::lease::Kind::Weights,
                 region,
+                None,
                 Box::new(move |got| {
                     if let Some(inner) = me.upgrade() {
                         inner.leased_page(key, gen, va, off, span, job, decided, got, start, region.is_some());
@@ -2832,7 +2833,7 @@ impl Inner {
             let (Some(lease), None) = (leases.next(), leases.next()) else {
                 return Err(Error::Invalid(format!("a page of {span} bytes leased as other than one chunk")));
             };
-            let crate::lease::Lease { ticket, phys, adopted } = lease;
+            let crate::lease::Lease { ticket, phys, adopted, .. } = lease;
             self.leased.lock().insert(phys.id, (ticket, key, retainable));
             let p = self.map_rw(va, off, phys)?;
             agent.mapped(&[ticket])?;

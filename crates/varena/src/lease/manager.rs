@@ -87,6 +87,24 @@ pub trait Hosting: Send + Sync {
     /// A record of what the manager did, after its books dropped.
     fn record(&self, _record: Record) {}
 
+    /// The derived-weights disk cache (§6): an unlinked entry of `domain` for `bytes`, for the
+    /// agent that derived it to write. None: none kept (low disk, unhosted).
+    fn derive(&self, _domain: &str, _key: &str, _bytes: u64) -> Option<std::fs::File> {
+        None
+    }
+
+    /// Its agent wrote it whole: from now on it is read.
+    fn derived(&self, _domain: &str, _key: &str) {}
+
+    /// A written entry a grant refills from instead of deriving again.
+    fn read_derived(&self, _domain: &str, _key: &str) -> Option<std::fs::File> {
+        None
+    }
+
+    /// The page cache dropped the chunk it filled: the host lets its entry go (after the
+    /// manager's books dropped).
+    fn forget_derived(&self, _domain: &str, _key: &str) {}
+
     /// The device's free bytes now as the driver counts them, needing no CUDA context of
     /// TensorD's (NVML's memory info; Windows: the DXGI budget less its usage). `None`: unread
     /// here, and the manager falls back to its open backend's (cuMemGetInfo), if it has one.
@@ -214,6 +232,8 @@ struct Books {
     /// index, oldest first in `order`.
     retained: BTreeMap<Kept, BTreeMap<u32, Physical>>,
     order: VecDeque<Kept>,
+    /// A retained region's fill key: its derived entry, forgotten when the region goes.
+    fills: BTreeMap<Kept, String>,
     /// Every byte ever created and destroyed: what changed since a sample is these less its own.
     created_total: u64,
     destroyed_total: u64,
@@ -275,6 +295,8 @@ struct Leased {
     index: u32,
     /// The agent acked its fill (recorded at that ack, never read at exit).
     landed: bool,
+    /// Its ask's fill key.
+    fill: Option<String>,
 }
 
 struct Waiting {
@@ -282,6 +304,9 @@ struct Waiting {
     bytes: u64,
     kind: Kind,
     region: Option<Region>,
+    fill: Option<String>,
+    /// The derived entry kept for `fill`, read before the books were taken.
+    entry: Option<std::fs::File>,
 }
 
 /// What to send and record once `books` dropped, and a backend nothing needs any more.
@@ -291,6 +316,8 @@ struct Out {
     /// Of the sends, the grants: (executor, slot), to roll back if their send fails.
     grants: Vec<(usize, u64, u32)>,
     records: Vec<Record>,
+    /// Derived entries whose retained region went: (domain, fill key).
+    forgets: Vec<(String, String)>,
     idle: Option<Arc<Device>>,
 }
 
@@ -300,6 +327,7 @@ impl Out {
         self.grants.extend(other.grants.drain(..).map(|(i, e, s)| (i + at, e, s)));
         self.sends.append(&mut other.sends);
         self.records.append(&mut other.records);
+        self.forgets.append(&mut other.forgets);
         self.idle = self.idle.take().or(other.idle);
     }
 }
@@ -560,7 +588,14 @@ impl Manager {
             match end.recv::<ToManager>() {
                 Ok(Some((message, _))) => {
                     let out = match message {
-                        ToManager::Ask { id: ask, bytes, kind, region } => self.ask(id, Waiting { id: ask, bytes, kind, region }),
+                        ToManager::Ask { id: ask, bytes, kind, region, fill } => self.ask(id, Waiting { id: ask, bytes, kind, region, fill, entry: None }),
+                        ToManager::Derive { key, bytes } => self.derive(id, key, bytes),
+                        ToManager::Derived { key } => {
+                            if let Some(domain) = self.domain(id) {
+                                self.hosting.derived(&domain, &key);
+                            }
+                            Out::default()
+                        }
                         ToManager::Answered => self.answered(id),
                         ToManager::Region(facts) => self.region(id, facts.id, Some(facts)),
                         ToManager::RegionGone { id: region } => self.region(id, region, None),
@@ -617,6 +652,9 @@ impl Manager {
         }
         for record in out.records {
             self.hosting.record(record);
+        }
+        for (domain, key) in out.forgets {
+            self.hosting.forget_derived(&domain, &key);
         }
         drop(out.idle);
         self.events.set();
@@ -676,10 +714,11 @@ impl Manager {
     pub fn fault(&self) {
         let out = {
             let mut b = self.books.lock();
+            let mut out = Out::default();
             for key in b.order.clone() {
-                self.drop_retained(&mut b, &key);
+                self.drop_retained(&mut b, &key, &mut out);
             }
-            let mut out = self.settle(&mut b);
+            out.append(self.settle(&mut b));
             out.idle = Self::idle(&mut b);
             out
         };
@@ -839,7 +878,25 @@ impl Manager {
         (b.created == 0 && b.executors.is_empty()).then(|| b.device.take()).flatten()
     }
 
-    fn ask(&self, exec: u64, ask: Waiting) -> Out {
+    fn domain(&self, exec: u64) -> Option<String> {
+        self.books.lock().executors.get(&exec).map(|e| e.identity.domain.clone())
+    }
+
+    /// A disk entry for the agent to write `key`'s derived bytes into, or none kept: the host's
+    /// call, outside the books.
+    fn derive(&self, exec: u64, key: String, bytes: u64) -> Out {
+        let Some((domain, end)) = self.books.lock().executors.get(&exec).map(|e| (e.identity.domain.clone(), e.end.clone())) else { return Out::default() };
+        let entry = self.hosting.derive(&domain, &key, bytes);
+        let mut out = Out::default();
+        out.sends.push((end, ToAgent::Entry { id: 0, key }, entry.map(Owned::from)));
+        out
+    }
+
+    fn ask(&self, exec: u64, mut ask: Waiting) -> Out {
+        // A derived entry kept for its fill, read outside the books (a grant that adopts drops it).
+        if let (Kind::Weights, Some(key), Some(domain)) = (ask.kind, &ask.fill, self.domain(exec)) {
+            ask.entry = self.hosting.read_derived(&domain, key);
+        }
         if let Err(error) = self.device() {
             let b = self.books.lock();
             let mut out = Out::default();
@@ -915,6 +972,9 @@ impl Manager {
                 Some(region) if l.landed && e.table.landed(slot) && e.table.word(slot).is_some_and(|w| w.seq == l.seq) => {
                     retained += l.phys.len;
                     let key = (e.identity.domain.clone(), region);
+                    if let Some(fill) = l.fill {
+                        b.fills.insert(key.clone(), fill);
+                    }
                     let kept = b.retained.entry(key.clone()).or_default();
                     let first = kept.is_empty();
                     gone.extend(kept.insert(l.index, l.phys));
@@ -945,10 +1005,13 @@ impl Manager {
         }
     }
 
-    fn drop_retained(&self, b: &mut Books, key: &Kept) {
+    fn drop_retained(&self, b: &mut Books, key: &Kept, out: &mut Out) {
         b.order.retain(|k| k != key);
         for phys in b.retained.remove(key).unwrap_or_default().into_values() {
             self.destroy(b, phys);
+        }
+        if let Some(fill) = b.fills.remove(key) {
+            out.forgets.push((key.0.clone(), fill));
         }
     }
 
@@ -1018,7 +1081,7 @@ impl Manager {
                 }
                 Pick::PageCache { index, .. } => {
                     if let Some(key) = cache.get(index) {
-                        self.drop_retained(b, key);
+                        self.drop_retained(b, key, out);
                         freed = true;
                     }
                 }
@@ -1119,6 +1182,7 @@ impl Manager {
         let Some(pid) = b.executors.get(&exec).map(|e| e.pid) else { return Err(Error::Closed("the executor".into())) };
         let domain = b.executors.get(&exec).map(|e| e.identity.domain.clone()).unwrap_or_default();
         let adopt = cached(b, &domain, ask.region, &sizes);
+        let kept_fill = adopt.as_ref().and_then(|key| b.fills.remove(key));
         let phys: Vec<Physical> = if let Some(key) = &adopt {
             b.order.retain(|k| k != key);
             b.retained.remove(key).unwrap_or_default().into_values().collect()
@@ -1146,6 +1210,14 @@ impl Manager {
         let n = phys.len();
         let bytes: u64 = phys.iter().map(|p| p.len).sum();
         let mut out = Out::default();
+        // Not adopted, with a derived entry kept for its fill: the entry first, to refill from.
+        if let (None, Some(key), Some(entry), Some(e)) = (&adopt, &ask.fill, &ask.entry, b.executors.get(&exec)) {
+            match entry.try_clone() {
+                Ok(entry) => out.sends.push((e.end.clone(), ToAgent::Entry { id: ask.id, key: key.clone() }, Some(Owned::from(entry)))),
+                Err(error) => tracing::debug!("lease: a derived entry for {key}: {error}"),
+            }
+        }
+        let fill = ask.fill.clone().or_else(|| kept_fill.clone());
         let mut granted: Vec<u32> = vec![];
         let mut failed = None;
         let mut spare = vec![];
@@ -1172,7 +1244,7 @@ impl Manager {
                 Ok(Some(handle)) => {
                     out.grants.push((out.sends.len(), exec, slot));
                     out.sends.push((e.end.clone(), ToAgent::Grant { id: ask.id, slot, seq, bytes: p.len, adopted: adopt.is_some(), last: index + 1 == n }, Some(handle)));
-                    e.leased.insert(slot, Leased { phys: p, seq, region: ask.region, index: index as u32, landed: adopt.is_some() });
+                    e.leased.insert(slot, Leased { phys: p, seq, region: ask.region, index: index as u32, landed: adopt.is_some(), fill: fill.clone() });
                     granted.push(slot);
                 }
                 Ok(None) => {
@@ -1210,6 +1282,9 @@ impl Manager {
             // Adopted chunks go back to retention whole, by index: nothing was copied.
             Some(key) if spare.len() == n => {
                 b.retained.insert(key.clone(), spare.into_iter().enumerate().map(|(i, p)| (i as u32, p)).collect());
+                if let Some(fill) = kept_fill {
+                    b.fills.insert(key.clone(), fill);
+                }
                 b.order.push_front(key);
             }
             _ => spare.into_iter().for_each(|p| self.destroy(b, p)),
