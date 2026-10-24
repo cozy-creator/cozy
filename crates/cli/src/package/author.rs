@@ -173,7 +173,8 @@ impl Project {
                 });
         Ok(Self {
             root,
-            name: normalize(&name),
+            // The package keeps its name as written (`qwen3.5`); the Hub resolves PEP 503 spellings.
+            name: name.trim().to_ascii_lowercase(),
             version,
             requires_python: text(&["project", "requires-python"]).unwrap_or_default(),
             account_index,
@@ -252,19 +253,6 @@ struct Python {
     request: String,
     /// The exact version a release records (`3.12.12`).
     full: String,
-}
-
-/// PEP 503: lowercase, runs of `-_.` become one `-`.
-fn normalize(name: &str) -> String {
-    let mut out = String::new();
-    for c in name.trim().chars() {
-        match c {
-            '-' | '_' | '.' if out.ends_with('-') => {}
-            '-' | '_' | '.' => out.push('-'),
-            c => out.push(c.to_ascii_lowercase()),
-        }
-    }
-    out
 }
 
 /// A private copy of the project to lock and build in.
