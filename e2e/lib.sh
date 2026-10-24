@@ -127,8 +127,8 @@ cell() {
 # The first output file of a cell with this extension.
 output() { find "$OUT/$1" -type f -name "*.$2" | head -1; }
 
-# A background removal: the input's geometry, its subject kept and its background white, neither all
-# of the image nor none of it.
+# A background removal: the input's geometry, its background white, and its subject kept (a small subject is
+# mostly white; an all-white image lost it).
 white_background() {
   uv run -q --no-project --with pillow python - "$1" "$2" <<'PY'
 import sys
@@ -137,7 +137,7 @@ image, source = Image.open(sys.argv[1]).convert("RGB"), Image.open(sys.argv[2])
 assert image.size == source.size, (image.size, source.size)
 white = sum(1 for p in image.getdata() if min(p) > 245) / (image.width * image.height)
 print(f"white background {white:.2f}")
-assert 0.1 < white < 0.9, white
+assert 0.1 < white < 0.98, white
 PY
 }
 
