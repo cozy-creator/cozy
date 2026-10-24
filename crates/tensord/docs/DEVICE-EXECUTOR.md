@@ -58,9 +58,8 @@ it holds, making room in other executors through the GPU's ledger (design memory
   TensorD sends it to each executor a Load or Invoke gave that signer's token for that endpoint,
   whenever it holds a newer one. Load and Invoke name `actor`. A Runtime without the handler
   answers `reply: bearer`, which TensorD ignores.
-- `start` names `ledgers: N` and `memory_mode` (`shared` or `dedicated`); 2N fds follow the
-  frame, each GPU of `devices` in order its ledger memfd then its eventfd. Rank 0 claims its row
-  in the first and hands follower r its pair.
+- `start` names `memory_protocol` (the lease protocol, or 0: the executor runs its own memory)
+  and, with leases, `leases`: the namespace each GPU's lease listener is named in.
 - While waiting for a reply, `event=progress` frames go to `Services::progress`. `event=request`
   frames (optionally with an `SCM_RIGHTS` fd) go to `Services::request`. The reply must name the
   command, otherwise it is an error. Unknown events and fields are ignored.
